@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """The fused attention prologue must equal the six steps it replaces.
 
 ``fused_qkv_norm_rope`` collapses split, per-head RMSNorm of Q and K, RoPE on
@@ -16,13 +16,14 @@ import pytest
 import torch
 from vllm.triton_utils import HAS_TRITON
 
+from tests.helpers.mark import hardware_marks
 from vllm_omni.model_executor.models.omnivoice.fused_qkv_rope import (
     _eager_qkv_norm_rope,
     fused_cuda_supported,
     fused_qkv_norm_rope,
 )
 
-pytestmark = [pytest.mark.core_model, pytest.mark.cuda]
+pytestmark = [pytest.mark.core_model, *hardware_marks(res={"cuda": "L4"}, num_cards=1)]
 
 cuda_only = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 triton_only = pytest.mark.skipif(not HAS_TRITON, reason="Triton required")

@@ -19,6 +19,7 @@ from vllm_omni.diffusion.forward_context import (
     get_ulysses_mode,
     is_forward_context_available,
 )
+from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
 
@@ -157,8 +158,6 @@ def _ulysses_all_to_all_any_qkv(
         group=pg,
     )
     if use_sync:
-        from vllm_omni.platforms import current_omni_platform
-
         current_omni_platform.synchronize()
 
     # (S_global, B, H_local, D) -> (B, S_global, H_local, D)
@@ -198,8 +197,6 @@ def _ulysses_all_to_all_any_o(
         group=pg,
     )
     if use_sync:
-        from vllm_omni.platforms import current_omni_platform
-
         current_omni_platform.synchronize()
 
     # (world_size * S_local, B, H_local, D) -> (B, S_local, H, D)
@@ -542,12 +539,19 @@ class UlyssesParallelAttention:
                 self._gather_idx,
                 ulysses_world_size,
             ):
+                # Keep this optional backend lazy: qkv_a2a defines Triton kernels
+                # unconditionally and a2a_permute imports CUDA symmetric memory.
+                # Default/other-platform Ulysses must not require either backend.
                 from vllm_omni.diffusion.distributed.a2a_permute import ulysses_qkv_fwd
+                from vllm_omni.diffusion.distributed.qkv_a2a import eligible, qkv_fwd_batched
 
                 group_name = self._ulysses_pg.group_name
-                query = ulysses_qkv_fwd(query, group_name, ulysses_world_size)
-                key = ulysses_qkv_fwd(key, group_name, ulysses_world_size)
-                value = ulysses_qkv_fwd(value, group_name, ulysses_world_size)
+                if eligible(query, key, value, ulysses_world_size):
+                    query, key, value = qkv_fwd_batched(query, key, value, group_name, ulysses_world_size)
+                else:
+                    query = ulysses_qkv_fwd(query, group_name, ulysses_world_size)
+                    key = ulysses_qkv_fwd(key, group_name, ulysses_world_size)
+                    value = ulysses_qkv_fwd(value, group_name, ulysses_world_size)
                 if gate_compress is not None:
                     gate_compress = ulysses_qkv_fwd(gate_compress, group_name, ulysses_world_size)
             else:

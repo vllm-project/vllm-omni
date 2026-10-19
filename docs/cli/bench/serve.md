@@ -4,7 +4,7 @@ The vllm bench command launches the vLLM-Omni benchmark to evaluate the performa
 
 ## Notes
 
-vLLM-Omni registers the `openai-chat-omni`, `openai-audio-speech`, `openai-image-edits-omni`, `daily-omni`, and `openai-realtime-duplex` serving benchmark backends. It also adds the `omniinteract` dataset.
+vLLM-Omni registers the `openai-chat-omni`, `openai-audio-speech`, `openai-image-edits-omni`, `daily-omni`, `openai-realtime-duplex`, `openai-realtime-tts`, and `openai-realtime-chat` serving benchmark backends. It also adds the `omniinteract` dataset.
 
 ## Basic Parameter Description
 
@@ -14,7 +14,16 @@ You can use `vllm bench serve --omni --help=all` to get descriptions of all para
   Enable Omni (multimodal) mode, supporting multimodal inputs and outputs such as images, videos, and audio.
 
 - `--backend`
-  Specify the backend adapter. vLLM-Omni adds `openai-chat-omni`, `openai-audio-speech`, `openai-image-edits-omni`, `daily-omni`, and `openai-realtime-duplex` to the upstream vLLM backend choices.
+  Specify the backend adapter. vLLM-Omni adds `openai-chat-omni`, `openai-audio-speech`, `openai-image-edits-omni`, `daily-omni`, `openai-realtime-duplex`, `openai-realtime-tts`, and `openai-realtime-chat` to the upstream vLLM backend choices.
+
+  The three WebSocket backends all talk to `/v1/realtime`, but they drive different turn shapes:
+
+  | Backend | Turn shape |
+  | --- | --- |
+  | `openai-realtime-duplex` / `openai-realtime-tts` | One session per utterance; the target text rides the session context (`duplex_initial_user_text`) and the client streams silence so a model-native duplex session has audio units to speak on. Reports server-side `ttft_ms`/`ttfp_ms` when the server returns them, and Stage-0 engine TPOT. |
+  | `openai-realtime-chat` | One session per utterance; the target text is a `conversation.item.create` message and real reference speech is streamed as an ordinary audio turn. Reports client-observed timings measured from the end of that speech. Requires `--seed-tts-reference-as-input`. |
+
+  Because those two report from different origins, their TTFT/TTFP/RTF numbers are not comparable with each other.
 
 - `--model`
   The model identifier to load, filled according to the models supported by vLLM-Omni.
@@ -279,6 +288,181 @@ We use audio generation time / audio duration to calculate RTF.
 
 </details>
 
+### Omni-DuplexEval Realtime Benchmark
+
+Omni-DuplexEval uses the same serving-benchmark lifecycle as OmniInteract. Each
+selected video is one session/request, not one request per model response:
+
+```bash
+vllm bench serve --omni \
+  --backend openai-realtime-duplex \
+  --dataset-name omni-duplex-eval \
+  --dataset-path Hothan/Omni-DuplexEval \
+  --model openbmb/MiniCPM-o-4_5 \
+  --base-url http://127.0.0.1:8000 --endpoint /v1/realtime \
+  --duplex-eval-ref-audio /path/to/reference.wav \
+  --duplex-eval-response-root ./duplex-eval-runs \
+  --duplex-eval-split PR_correction \
+  --num-prompts 3 --disable-shuffle --max-concurrency 1 --num-warmups 0 \
+  --ready-check-timeout-sec 0 --save-result
+```
+
+`--dataset-path` accepts the existing loader's HF dataset ID, local dataset mirror,
+Parquet file or JSON/JSONL manifest. It defaults to `Hothan/Omni-DuplexEval`.
+Use `--duplex-eval-family`, `--duplex-eval-ids` and `--duplex-eval-media-root` for
+filtering and local media. The default is three samples and single concurrency;
+`--num-prompts 0` selects all, and oversized counts use every available sample
+without repeating it. `--seed` controls shuffling; `--disable-shuffle` preserves
+dataset order.
+
+For a Qwen3-Omni server started with `vllm_omni/deploy/qwen3_omni_duplex.yaml`,
+use the same entrypoint with server-detected turns and no reference audio:
+
+```bash
+vllm bench serve --omni \
+  --backend openai-realtime-duplex --endpoint /v1/realtime \
+  --base-url http://127.0.0.1:8000 \
+  --model Qwen/Qwen3-Omni-30B-A3B-Instruct \
+  --dataset-name omni-duplex-eval --dataset-path Hothan/Omni-DuplexEval \
+  --duplex-eval-split PR_correction --duplex-eval-turn-detection server_vad \
+  --duplex-eval-instructions "Reply briefly to the user's latest request." \
+  --duplex-eval-response-root ./duplex-eval-qwen3 \
+  --num-prompts 3 --disable-shuffle --max-concurrency 1 --num-warmups 0 \
+  --ready-check-timeout-sec 0 --save-result
+```
+
+`--duplex-eval-turn-detection` defaults to `none`, preserving the native duplex
+runner's explicit commit. With `server_vad`, the runner sends audio in 32 ms appends
+(one 512-sample detector frame at 16 kHz), appends trailing silence, and waits for
+observed speech/responses to settle. A larger append can span the end of one turn
+and the start of the next, hiding the earlier endpoint. Video sampling still uses
+`--duplex-eval-fps`; native duplex retains its 1000 ms default audio units. The
+sample metadata records the effective `unit_ms`. Audio pacing uses a cumulative
+monotonic deadline so sending and frame processing do not add a full extra sleep
+to every append. The standalone `generate` command rejects `server_vad` combined
+with `--pace as-fast-as-possible`, which compresses turn and playback timing.
+Settling is not an acknowledgement
+that all final input has been processed. Frames use the transport advertised by
+the server: native video frames or bounded image conversation items for Qwen3.
+`--duplex-eval-instructions` defaults to the native duplex prompt; passing an empty
+string uses the server's default instructions. `--duplex-eval-ref-audio` is optional
+for Qwen3 and remains available for models that require a reference voice.
+
+The CUDA nightly configuration
+`tests/dfx/perf/tests/test_qwen3_omni_duplex_omni_duplex_eval.json` uses the common
+performance runner on three GPUs (two for Qwen3-Omni, one for the text judge).
+It measures three `PR_correction` sessions with post-run judging and two
+`RTD_counting` sessions without judging, preserving dataset order. The checks require
+complete artifacts, completed observed responses and measured text/audio latency
+for every session; judging must cover every selected PR sample. Scores are reported
+without a quality threshold. RTD scoring requires a vision-capable judge and is
+outside this configuration. No hardware latency baseline is configured.
+These nightly checks do not establish that every input utterance produced a
+response. The dataset provides no expected VAD turn count, and a `PR_correction`
+sample can contain a single user statement, so a blanket two-response minimum is
+not valid. Deterministic CPU tests cover adjacent speech boundaries separately.
+
+Inputs retain the standalone runner's real-time pacing, question audio, media
+clock and 1 FPS default (`--duplex-eval-fps`). Each session decodes its media in a
+worker thread after acquiring a concurrency slot, and releases the decoded input
+when the request finishes. `--max-concurrency` therefore bounds the number of
+decoded clips held in memory; the reference audio is encoded once and shared.
+Preparation is excluded from individual session latency, but any preparation
+stalls are included in the total benchmark duration and throughput.
+`--omni-request-timeout-s` bounds each complete session after preparation (default
+900 seconds). Readiness and warmups replay complete
+sessions but do not contribute metrics or judge artifacts; the example disables
+both to avoid that extra runtime.
+
+The terminal and `--save-result` output report standard serving metrics plus the
+shared `duplex_request_metrics`, `duplex_session_metrics` and `duplex_stream_*`
+fields. TTFT/Audio TTFP/RTF follow the same per-response definitions as
+OmniInteract; stream metrics include concurrent real-time input. TPOT/ITL require
+engine token timings and are unavailable when those timings are absent. E2EL
+includes the whole session, including input streaming and drain, so it is not a
+model-only generation latency.
+
+A video can produce several responses. Normal barge-in cancellation ends one
+response without failing the sample; its collected text remains available to the
+judge. The runner drains active responses before closing the session. Responses
+created during close are recorded in `unfinished_response_ids` in the metadata;
+server errors, failed responses, and drain/close timeouts still fail the sample.
+
+`--duplex-eval-response-root` is a **parent directory** and may already exist.
+Each invocation creates an exclusive `run-*` subdirectory, so repeated runs and
+concurrency/QPS sweeps do not overwrite or reuse earlier responses. The actual
+run path is logged and returned in `omni_duplex_eval.response_root` in the saved
+benchmark result. Only successful measured sessions publish `<split>/<id>.json`
+and `<id>.meta.json`, using the existing judge format. Publication occurs after benchmark timing, alongside
+`duplex_metrics.json`; artifact errors are recorded in the saved result's
+`omni_duplex_eval` summary without discarding service measurements.
+
+Accuracy scoring is optional. To score immediately after the performance run,
+add these flags to the `vllm bench serve` command above:
+
+```bash
+  --duplex-eval-evaluate \
+  --duplex-eval-judge-base-url http://127.0.0.1:8001/v1 \
+  --duplex-eval-judge-model your-judge-model
+```
+
+The judge must already be running; the benchmark does not launch it. Proactive
+reminder (PR) tasks use a text judge, while real-time description (RTD) tasks
+require a vision-capable judge. The default `--duplex-eval-judge-video-mode video_url`
+requires the judge to support video inputs and access the same local video paths.
+Use `--duplex-eval-judge-video-mode frame-sample` for a remote image-capable judge;
+this changes content evaluation to the existing sampled-frame variant, not full-video judging.
+
+Scoring reuses the standalone evaluator and runs **after performance timing**.
+The terminal and saved benchmark result (`omni_duplex_eval.accuracy`) report scores
+and coverage: total measured sessions, evaluated sessions, skipped failed/unpublished
+sessions, and judge errors. Partial coverage is marked `partial`; no evaluated
+sessions is `failed`, not a zero-error accuracy result. Scores are conditional on
+the evaluated subset, not an accuracy score for all attempted sessions. Warmups
+are never scored. Judge failures do not discard completed performance measurements.
+The saved `omni_duplex_eval.published_with_unfinished_responses` counts published
+samples with non-empty `unfinished_response_ids` in their metadata. A nonzero count
+also emits a warning. These samples remain eligible for scoring using their collected
+text, so interpret accuracy alongside this count. It only covers observed responses;
+zero does not establish that every final input triggered a completed reply.
+Per-sample scores and `evaluation_summary.json` are saved under the run's
+`evaluation/` directory. `--duplex-eval-eval-workers` controls scoring concurrency
+(default 1), and `--duplex-eval-judge-timeout-s` bounds each judge request (default 600).
+
+The independent scoring commands remain available to retry scoring or change
+judges without repeating inference. The `--limit 3` example below matches the
+serving command above when `--disable-shuffle` is used and all three measured
+samples succeed and publish their artifacts. Replace `run-XXXXXXXX` below with
+the reported run directory:
+
+```bash
+vllm bench omni-duplex-eval --omni evaluate \
+  --dataset Hothan/Omni-DuplexEval --split PR_correction --limit 3 \
+  --response-root ./duplex-eval-runs/run-XXXXXXXX --score-root ./duplex-eval-scores-1 \
+  --judge-base-url http://127.0.0.1:8001/v1 --judge-model your-judge-model
+vllm bench omni-duplex-eval --omni summarize --score-root ./duplex-eval-scores-1
+```
+
+`evaluate --limit N` selects the first N matching samples in dataset order. It
+does not reproduce the shuffle from `bench serve` or filter out failed or
+unpublished sessions. To automatically score the actual successfully published
+samples, including shuffled or partially successful runs, use
+`--duplex-eval-evaluate` during `bench serve`.
+
+The standalone `generate` command remains available, including its existing
+skip-existing/overwrite behavior. This integration does not change scoring rules
+or enable new nightly jobs.
+
+For shuffled runs, use `evaluate --ids` with the successful selected sample IDs
+instead of `--limit`. Failed sessions have no judge input; do not silently drop
+them when reporting coverage or accuracy.
+
+This adapter retains the standalone runner's completion policy: it waits for a
+`response.done`, not an independently correlated final-input acknowledgment.
+A successful transport/session result is therefore not proof that every final
+input produced a response, nor an accuracy score. Final-input lifecycle
+hardening is separate from this entrypoint integration.
+
 ### OmniInteract Realtime Benchmark
 
 OmniInteract runs each video as one native-duplex WebSocket sample in the standard serving-benchmark lifecycle:
@@ -299,8 +483,64 @@ vllm bench serve --omni \
 
 `--dataset-path` accepts an extracted directory, `data.tar[.gz]`, or a Hugging Face dataset ID; omitting it uses
 `lucky-lance/OmniInteract`. `--num-prompts` is the total across subsets and defaults to 3 for OmniInteract; explicit `0`
-selects all and oversize values use all available cases. Reference audio is required, and OmniInteract uses the
-`/v1/realtime` endpoint.
+selects all and oversize values use all available cases. OmniInteract uses the `/v1/realtime` endpoint. Pass
+`--omniinteract-ref-audio` for models that clone a reference voice (MiniCPM-o); models that refuse one (Qwen3-Omni) run
+without it. `--omniinteract-instructions` sets the session system prompt; by default none is sent.
+
+For comparable MiniCPM-o scores, explicitly pass the same reference WAV in every run, even though ordinary sessions
+can use the model-bundled default when `ref_audio` is omitted. Pass the model's `assets/HT_ref_audio.wav` to benchmark
+that default voice. The Qwen3-Omni examples omit reference audio because that model does not accept it.
+
+#### Turn-based duplex models (Qwen3-Omni)
+
+A model-native duplex model decides on its own when to speak, so each clip is streamed and committed once at the end.
+A turn-based model only answers committed turns. `--omniinteract-turn-detection server_vad` lets the server's VAD cut the
+soundtrack into turns. It sends 32 ms audio appends so each detector frame's endpoint is processed before the next onset;
+native duplex keeps its 200 ms appends, and video sampling is unchanged. The client never commits in `server_vad` mode,
+appends 1.5 s of trailing silence so a question at the very end still
+closes, and waits until no speech or response is open. Frames follow the session capabilities: a model that does not
+accept `video_frames` on audio appends but accepts images gets each frame as an `input_image` conversation item, with the
+oldest deleted so at most 8 stay in the session (frames too large for the server's 4 MiB image budget are downscaled).
+Serve with the duplex deployment, which needs the Silero VAD artifact in the Hugging Face cache (see
+[Qwen3-Omni duplex](https://github.com/vllm-project/vllm-omni/blob/main/examples/online_serving/qwen3_omni/README.md)):
+
+```bash
+vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
+  --deploy-config vllm_omni/deploy/qwen3_omni_duplex.yaml
+
+vllm bench serve --omni \
+  --backend openai-realtime-duplex \
+  --endpoint /v1/realtime \
+  --base-url http://127.0.0.1:8091 \
+  --model Qwen/Qwen3-Omni-30B-A3B-Instruct \
+  --dataset-name omniinteract \
+  --omniinteract-turn-detection server_vad \
+  --omniinteract-instructions "You are a real-time video assistant. Reply to the user's latest request briefly, in one or two spoken sentences, in the language the user speaks." \
+  --omniinteract-output-dir ./omniinteract-qwen3 \
+  --num-prompts 3
+```
+
+The deployment serves one session at a time unless `duplex_session.max_sessions` is raised, so keep
+`--max-concurrency 1`.
+
+Latency is reported per response in the `Duplex Per-Response Latency` block and as flat result keys
+(`num_/mean_/median_/p99_` + name), where every response counts once however many a session had. The standard
+`Mean TTFT` / `audio TTFP` rows instead average each session first, and E2EL and request throughput follow the video
+length because input is paced in real time.
+
+| Result key suffix | Starts at | Ends at |
+| --- | --- | --- |
+| `duplex_response_ttft_ms` / `duplex_response_ttfp_ms` | server: request accepted by the engine | first text / audio output |
+| `duplex_client_ttft_ms` / `duplex_client_ttfp_ms` | client: `response.created` received | first text / audio delta received |
+
+The server timer starts only after the model plugin prepared the prompt and the engine accepted it, so it leaves out
+prompt preparation; for Qwen3-Omni that is decoding the retained images, the chat template, and multimodal
+preprocessing. The client timer starts when `response.created` is received, after the server detects the end of the
+turn. It excludes VAD silence detection and any delay before that event arrives, so it does not measure the full
+user-speech-end to first-output latency. The server start point differs between model plugins, so compare server
+keys only within one model. VAD uses `silence_duration_ms: 500` by default.
+Qwen3-Omni duplex reports no per-token timing, so TPOT and ITL are unavailable. A turn-based model acknowledges a proactive request right away but does not speak again when the
+event later happens, so proactive and 1QnA scenarios score low by construction.
 
 To replay an existing sample set (for example `sampled_cases.jsonl` from a prior run), pass
 `--omniinteract-video-list` instead of discovering cases. List order is preserved; `--num-prompts` takes the prefix of
@@ -331,9 +571,11 @@ OmniInteract `batch_inference_minicpmo.py --video_list`); failed cases write
 not answer accuracy. Transcript timestamps are serialized playback-queue times. Playback ACKs report cumulative progress
 incrementally along that serialized clock, like a live listener; the first ack for a response goes out as soon as its audio
 arrives, checkpointing the response's history position so a later committed user input updates it in place. A residual
-`playback_ack_too_late` rejection is recorded as an artifact warning rather than failing the case. Clipped or cancelled
-outputs are ineligible and omitted from the official manifest; `audio_clipped_bytes` records output beyond the rounded video
-horizon.
+`playback_ack_too_late` rejection is recorded as an artifact warning rather than failing the case. When a barge-in model
+sends `output_audio_buffer.cleared`, the client flushes that response's unplayed audio from the serialized clock, as a live
+speaker would. Clipped, cancelled, or cleared-before-played outputs are ineligible and omitted from the official manifest
+(`audio_clipped`, `cancelled_response`, `cleared_response`), because their transcript holds more than the listener heard;
+`audio_clipped_bytes` records output beyond the rounded video horizon.
 
 Accuracy evaluation is opt-in and requires an already-running text judge with an OpenAI-compatible Chat Completions API. The
 benchmark does not launch or stop the judge server. Add the following options to the command above:
@@ -408,6 +650,143 @@ chunks. Official-manifest eligibility is reported separately because clipped or 
 signal, not a transport failure. Accuracy must finish with `status=ok` on every subset. After all three subsets finish,
 All Global IA-QTF1 is recomputed from pooled `Global_TP` / `Global_FP` / `Global_FN` and must be at or above
 `omniinteract_aggregate_min_ia_qtf1` (checked in as `0.2`).
+
+`test_qwen3_omni_duplex_omniinteract.json` runs Qwen3-Omni on `vllm_omni/deploy/qwen3_omni_duplex.yaml` with server VAD
+turns (see [Turn-based duplex models](#turn-based-duplex-models-qwen3-omni)). It is an L4 CUDA nightly performance job
+on H100 and the B200 mirror. It needs three visible GPUs: the Qwen3-Omni stages take the first two and the text judge
+the third (`cuda_visible_devices: "2"`). Run the same job locally with:
+
+```bash
+bash tools/nightly/run_nightly_jobs.sh \
+  --test-type perf \
+  --model-type omni \
+  --label-substr "Duplex OmniInteract"
+```
+
+The job uploads benchmark JSONs and per-case audio, transcripts, events, and evaluation artifacts. It records performance
+metrics without a hardware latency baseline; response validity and the math accuracy floor still gate the result.
+It differs from the MiniCPM-o configuration in three ways:
+
+- **Cold start.** The first request after the server starts compiles Triton kernels (rotary embedding, fused MoE) and
+  answers seconds late. The first subset (`1q1a_math`) therefore replays its first case once, unmeasured
+  (`num_warmups: 1`); later subsets reuse the warmed server and do not warm up again.
+- **Interrupted responses are not scored.** The official eligibility rule is kept: a case with a cancelled, cleared, or
+  clipped response is left out of accuracy, because its transcript holds text the listener never heard, and scoring it
+  would make the result incomparable with MiniCPM-o and the paper. Qwen3-Omni stops speaking when the next question
+  starts, so overlapping questions can make a case ineligible. A scored subset must keep at least one eligible case.
+  This configuration measures latency only for `1q1a` and `1qna` (no `omniinteract_evaluate`); individual cases may
+  still be eligible. Both subsets require at least one completed response with audio and transcript per case
+  (`omniinteract_require_response: true`). Accuracy covers `1q1a_math` only, so it is not comparable with the
+  three-subset MiniCPM-o score. Its
+  IA-QTF1 must be at or above `omniinteract_aggregate_min_ia_qtf1` (checked in as `0.3`); a single run on four cases
+  measured `0.50`, so the floor catches a lost correct answer or more, not small judge noise.
+- **Latency.** Compare Qwen3-Omni runs on the per-response keys, primarily `mean_duplex_client_ttfp_ms`
+  (`response.created` received to first audio, including prompt preparation); the standard TTFT rows average sessions
+  first, and TPOT is unavailable.
+
+### Seed-TTS reference speech as real audio input
+
+By default the Seed-TTS dataset sends its reference clip as voice-cloning metadata: `ref_audio` / `ref_text` ride the
+request body and the model is asked to synthesize the target text in that voice.
+
+`--seed-tts-reference-as-input` changes the request shape instead of the request contents. The reference clip becomes an
+ordinary **user audio turn**, `ref_audio` / `ref_text` are dropped entirely, and the system prompt asks the model to read
+the accompanying text rather than transcribe or answer the audio. This is what makes the workload exercise a real duplex
+conversation turn rather than a TTS call. It requires `--backend openai-realtime-chat`.
+
+For Qwen3-Omni, use a server running the
+[`qwen3_omni_duplex.yaml` deployment](gh-file:vllm_omni/deploy/qwen3_omni_duplex.yaml) with async chunking enabled.
+Each dataset entry uses an independent WebSocket session at `/v1/realtime?duplex=1` with one audio turn and one response.
+
+```bash
+vllm bench serve --omni \
+  --backend openai-realtime-chat \
+  --endpoint /v1/realtime \
+  --dataset-name seed-tts \
+  --dataset-path zhaochenyang20/seed-tts-eval \
+  --seed-tts-reference-as-input \
+  --seed-tts-locale en \
+  --model Qwen/Qwen3-Omni-30B-A3B-Instruct \
+  --base-url http://127.0.0.1:8000 \
+  --num-prompts 4 --max-concurrency 1 --output-len 256 \
+  --percentile-metrics ttft,e2el,audio_ttfp,audio_rtf,audio_duration \
+  --extra-body '{"realtime_trigger": "vad"}'
+```
+
+Each clip is normalized once to mono 24 kHz PCM16 and a one-second silent tail is appended. Both cases send the same
+speech samples in chunks of at most 200 ms. A chunk is sent at the end of its simulated capture interval, using absolute
+deadlines to avoid accumulated pacing drift. A partial chunk is split at the speech/silence boundary so the speech-end
+timestamp stays exact even when the clip length is not a multiple of 200 ms. `realtime_trigger` selects how the turn ends:
+
+- `explicit` — the client streams the speech at real-time speed and then sends `input_audio_buffer.commit` plus
+  `response.create`. The silent tail is **not** sent: an explicit client ends the turn when the speaker stops, so
+  streaming silence first would charge it for latency no real caller pays.
+- `vad` — the client streams the speech *and* the tail, and server VAD ends the turn on its own, without a client commit
+  or `response.create`. Its 800 ms silence threshold must stay shorter than the one-second tail or the turn never ends.
+
+#### Run the matched nightly workload
+
+The [performance configuration](gh-file:tests/dfx/perf/tests/test_qwen3_omni_seed_tts.json) runs both triggers using the
+first 32 English Seed-TTS entries in fixed order, concurrency 1, temperature 0, and a 256-token output limit. It asks
+the model to read the target text rather than answer or transcribe the accompanying audio. Each trigger runs two
+unmeasured warmup requests before its 32 measured requests. The CUDA nightly job runs this configuration on two H100/B200 GPUs.
+
+Run from the repository environment after reserving two GPUs according to your host's scheduling rules:
+
+```bash
+uv run --no-sync pytest -s -v tests/dfx/perf/scripts/run_benchmark.py \
+  --test-config-file tests/dfx/perf/tests/test_qwen3_omni_seed_tts.json \
+  --run-level full_model
+```
+
+`BENCHMARK_DIR` selects the result directory (default `tests/dfx/perf/results`). For cached local weights or data, copy the
+JSON and replace `server_params.model` and each `benchmark_params[].dataset_path` with local paths. Preserve sample
+count, order, system prompt, and generation settings across the two cases.
+
+#### Read the reported metrics
+
+TTFT, audio TTFP, E2EL, and audio RTF share one client-side origin: the end of reference-speech capture, immediately before
+the last speech chunk is sent. They exclude session setup and the capture/upload intervals preceding that boundary.
+Timing from session start would fold the client's real-time input upload into the reported wait.
+
+- **TTFT / audio TTFP:** origin to the first non-empty text delta / first audio packet received. They include transport
+  and response processing after the speech-end boundary and, for VAD, endpoint detection during the silent tail.
+- **E2EL:** origin to `response.done` reception.
+- **Audio RTF:** origin to the last audio packet divided by generated audio duration. It includes post-speech waiting
+  and endpoint detection; it is not model-only compute RTF.
+- **Audio duration:** generated audio length, received as PCM16.
+
+The per-request rows in `duplex_request_metrics` retain `measurement_origin`, utterance identity, trigger, and these
+diagnostic fields:
+
+- `input_audio_ms`: prepared clip duration, including the silent tail.
+- `input_content_ms`: reference-speech duration, excluding the tail.
+- `input_uploaded_ms`: audio duration actually sent; only VAD includes the tail.
+- `input_upload_ms` / `session_setup_ms`: client wall-clock upload / setup time.
+- `session_start_to_first_audio_ms` / `session_start_to_response_done_ms`: timings from before text submission and audio
+  upload, retained for diagnosis.
+- `explicit_commit_to_first_audio_ms` (explicit only): sending the explicit trigger to receiving the first audio packet.
+- `vad_stop_received_ms` (VAD only): speech-end origin to the client's receipt of `speech_stopped`.
+- `vad_stop_to_first_audio_ms` (VAD only): that event's receipt to the first audio packet. Both VAD fields use client
+  event timestamps, not server GPU timestamps.
+
+The MiniCPM-o Seed-TTS Realtime backend prefers server-provided request timings from a different origin. Its
+TTFT/TTFP/RTF values are not directly comparable with this Qwen3-Omni workload. This Qwen3 path provides no Stage-0 engine
+token timing, so TPOT/ITL are unavailable. The backend explicitly disables derived TPOT even if a tokenizer counts
+transcript tokens; `num_tpot_samples` remains zero and a configured TPOT baseline rejects the missing measurement.
+
+#### Scope and limits
+
+The test requires every request to complete with exactly one response containing text and audio. VAD cases must emit
+speech-start and speech-stop events; a response before the reference speech ends is rejected. Although the server-VAD
+contract requires interruption flags, this workload sends no overlapping speech. It does not measure interruptions,
+multi-turn context, or concurrency scaling.
+
+The job currently collects latency measurements and checks request completion; no performance regression baseline is set.
+Even with 32 requests, p99 is a diagnostic rather than a stable regression threshold. After collecting repeated successful
+H100 nightly runs with this configuration, a follow-up can set a separate baseline for each trigger. B200 requires its own
+measurements. Results from before the capture-pacing fix could understate VAD latency by up to one 200 ms chunk and must
+not be used as the corrected workload's performance reference.
 
 ### Video-MME Benchmark
 

@@ -29,7 +29,6 @@ from vllm.v1.engine.utils import (
     CoreEngine,
     CoreEngineLaunch,
     EngineZmqAddresses,
-    wait_for_engine_startup,
 )
 from vllm.v1.utils import shutdown
 
@@ -44,6 +43,7 @@ from vllm_omni.distributed.omni_connectors.utils.serialization import (
     OmniMsgpackEncoder,
 )
 from vllm_omni.distributed.omni_coordinator import OmniCoordClientForStage
+from vllm_omni.engine.stage_init_deadline import wait_for_engine_startup_with_deadline
 from vllm_omni.engine.stage_init_utils import set_death_signal
 from vllm_omni.errors import client_error_metadata
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -261,17 +261,33 @@ class StageDiffusionProc:
         LoRA methods remap arguments and post-process results to match
         the contract that ``AsyncOmni`` provides.
         """
+        # Feedback only changes condition-protected host state and must not
+        # wait behind an executor RPC for the current GPU chunk.
+        if method in ("update_streaming_playback", "track_streaming_interaction", "release_streaming_output"):
+            assert self._engine is not None
+            return getattr(self._engine, method)(*args, **(kwargs or {}))
+
         loop = asyncio.get_running_loop()
+
+        async def run_executor(method: Callable[..., Any], *method_args: Any) -> Any:
+            """Finish a worker-thread RPC before propagating task cancellation."""
+            future = loop.run_in_executor(self._executor, method, *method_args)
+            try:
+                return await asyncio.shield(future)
+            except asyncio.CancelledError:
+                # Cancelling the asyncio wrapper does not cancel the thread.
+                # Drain the shielded future before run_loop closes the engine
+                # and executor, so teardown cannot race a live collective RPC.
+                try:
+                    await asyncio.shield(future)
+                except BaseException:
+                    pass
+                raise
 
         if method == "profile":
             is_start = args[0] if args else True
             profile_prefix = args[1] if len(args) > 1 else None
-            return await loop.run_in_executor(
-                self._executor,
-                self._engine.profile,
-                is_start,
-                profile_prefix,
-            )
+            return await run_executor(self._engine.profile, is_start, profile_prefix)
 
         if method == "add_lora":
             # Reconstruct LoRARequest after IPC if needed.
@@ -281,8 +297,7 @@ class StageDiffusionProc:
 
                 if not isinstance(lora_request, LoRARequest):
                     lora_request = msgspec.convert(lora_request, LoRARequest)
-            results = await loop.run_in_executor(
-                self._executor,
+            results = await run_executor(
                 self._engine.collective_rpc,
                 "add_lora",
                 timeout,
@@ -293,8 +308,7 @@ class StageDiffusionProc:
             return all(results) if isinstance(results, list) else results
 
         if method == "remove_lora":
-            results = await loop.run_in_executor(
-                self._executor,
+            results = await run_executor(
                 self._engine.collective_rpc,
                 "remove_lora",
                 timeout,
@@ -305,8 +319,7 @@ class StageDiffusionProc:
             return all(results) if isinstance(results, list) else results
 
         if method == "list_loras":
-            results = await loop.run_in_executor(
-                self._executor,
+            results = await run_executor(
                 self._engine.collective_rpc,
                 "list_loras",
                 timeout,
@@ -323,8 +336,7 @@ class StageDiffusionProc:
 
         if method == "pin_lora":
             lora_id = args[0] if args else kwargs.get("adapter_id")
-            results = await loop.run_in_executor(
-                self._executor,
+            results = await run_executor(
                 self._engine.collective_rpc,
                 "pin_lora",
                 timeout,
@@ -336,8 +348,7 @@ class StageDiffusionProc:
 
         # Fall back to DiffusionEngine.collective_rpc for all other methods
         # (e.g. worker extension RPCs like "test_extension_name").
-        return await loop.run_in_executor(
-            self._executor,
+        return await run_executor(
             self._engine.collective_rpc,
             method,
             timeout,
@@ -455,6 +466,50 @@ class StageDiffusionProc:
             finally:
                 tasks.pop(request_id, None)
 
+        async def _dispatch_rpc(msg: dict[str, Any]) -> None:
+            rpc_id = msg["rpc_id"]
+            try:
+                result = await self._handle_collective_rpc(
+                    msg["method"],
+                    msg.get("timeout"),
+                    tuple(msg.get("args", ())),
+                    msg.get("kwargs", {}),
+                )
+                await response_socket.send(
+                    encoder.encode(
+                        {
+                            "type": "rpc_result",
+                            "rpc_id": rpc_id,
+                            "result": result,
+                        }
+                    )
+                )
+            except Exception as e:
+                logger.exception("Collective RPC %s failed: %s", msg["method"], e)
+                await response_socket.send(
+                    encoder.encode(
+                        {
+                            "type": "error",
+                            "rpc_id": rpc_id,
+                            "error": str(e),
+                        }
+                    )
+                )
+                # Collective RPCs run through the same multiproc
+                # executor — a closed executor means every future
+                # RPC fails the same way, so tear down promptly.
+                if self._is_executor_dead():
+                    self._signal_fatal_engine_failure(f"collective_rpc {msg['method']} (rpc_id={rpc_id}): {e!s}")
+
+        rpc_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=64)
+
+        async def _rpc_worker() -> None:
+            while True:
+                await _dispatch_rpc(await rpc_queue.get())
+
+        # Preserve ordinary RPC order while recv handles playback and aborts.
+        rpc_task = asyncio.create_task(_rpc_worker(), name="diffusion-rpc-worker")
+
         try:
             while True:
                 # Await recv and fatal_event concurrently so the loop wakes
@@ -464,7 +519,7 @@ class StageDiffusionProc:
                 fatal_task: asyncio.Task = asyncio.ensure_future(fatal_event.wait())
                 try:
                     done, pending = await asyncio.wait(
-                        [recv_task, fatal_task],
+                        [recv_task, fatal_task, rpc_task],
                         return_when=asyncio.FIRST_COMPLETED,
                     )
                 finally:
@@ -473,6 +528,8 @@ class StageDiffusionProc:
                             waiter.cancel()
                             with contextlib.suppress(asyncio.CancelledError, Exception):
                                 await waiter
+                if rpc_task in done:
+                    await rpc_task
                 if fatal_event.is_set():
                     raise RuntimeError(
                         "StageDiffusionProc executor reported permanent failure; tearing down the diffusion subprocess."
@@ -502,40 +559,24 @@ class StageDiffusionProc:
                         self._engine.abort(rid)
 
                 elif msg_type == "collective_rpc":
-                    rpc_id = msg["rpc_id"]
-                    try:
-                        result = await self._handle_collective_rpc(
-                            msg["method"],
-                            msg.get("timeout"),
-                            tuple(msg.get("args", ())),
-                            msg.get("kwargs", {}),
-                        )
-                        await response_socket.send(
-                            encoder.encode(
-                                {
-                                    "type": "rpc_result",
-                                    "rpc_id": rpc_id,
-                                    "result": result,
-                                }
-                            )
-                        )
-                    except Exception as e:
-                        logger.exception("Collective RPC %s failed: %s", msg["method"], e)
-                        await response_socket.send(
-                            encoder.encode(
-                                {
-                                    "type": "error",
-                                    "rpc_id": rpc_id,
-                                    "error": str(e),
-                                }
-                            )
-                        )
-                        # Collective RPCs run through the same multiproc
-                        # executor — a closed executor means every future
-                        # RPC fails the same way, so tear down promptly.
-                        if self._is_executor_dead():
-                            self._signal_fatal_engine_failure(
-                                f"collective_rpc {msg['method']} (rpc_id={rpc_id}): {e!s}"
+                    if msg["method"] in (
+                        "update_streaming_playback",
+                        "track_streaming_interaction",
+                        "release_streaming_output",
+                    ):
+                        await _dispatch_rpc(msg)
+                    else:
+                        try:
+                            rpc_queue.put_nowait(msg)
+                        except asyncio.QueueFull:
+                            await response_socket.send(
+                                encoder.encode(
+                                    {
+                                        "type": "error",
+                                        "rpc_id": msg["rpc_id"],
+                                        "error": "Too many pending collective RPCs",
+                                    }
+                                )
                             )
 
                 elif msg_type == "shutdown":
@@ -552,10 +593,10 @@ class StageDiffusionProc:
             raise
 
         finally:
+            rpc_task.cancel()
             for task in tasks.values():
                 task.cancel()
-            if tasks:
-                await asyncio.gather(*tasks.values(), return_exceptions=True)
+            await asyncio.gather(rpc_task, *tasks.values(), return_exceptions=True)
 
             self._active_tasks = None
             self._fatal_event = None
@@ -827,7 +868,7 @@ class StageDiffusionProcManager:
     def _wait_until_started(self, handshake_address: str, stage_init_timeout: int) -> None:
         try:
             with zmq_socket_ctx(handshake_address, zmq.ROUTER, bind=True) as handshake_socket:
-                wait_for_engine_startup(
+                wait_for_engine_startup_with_deadline(
                     handshake_socket,
                     [CoreEngine(index=0, local=True)],
                     SimpleNamespace(
@@ -848,6 +889,9 @@ class StageDiffusionProcManager:
                         # during handshake is still detected.
                         watched_frontend_processes=[self.proc],
                     ),
+                    timeout=stage_init_timeout,
+                    kill_processes=lambda: shutdown([self.proc]),
+                    stage_label=f"Diffusion stage process {self.proc.name}",
                 )
         except Exception:
             shutdown([self.proc])

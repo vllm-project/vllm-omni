@@ -8,6 +8,7 @@ import pytest
 import torch
 from torch import nn
 
+from tests.helpers.mark import hardware_test
 from vllm_omni.model_executor.models.moss_tts.modeling_moss_tts_codec import MossTTSCodecDecoder
 from vllm_omni.model_executor.output_snapshot import PackedOutputSnapshot
 
@@ -123,7 +124,7 @@ def test_gpu_output_requires_local_streaming_mrv2_and_cuda(v2, streaming, model_
     assert session.step({slot: torch.ones(2, 3)})[slot].device.type == "cpu"
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("v2", [False, True])
 @pytest.mark.parametrize("channels", [1, 2])
 @pytest.mark.parametrize("graph", [False, True])
@@ -194,7 +195,7 @@ def test_replays_terminal_tails_and_slot_reuse_preserve_pending_waveforms(v2, ch
             assert rows[index]["sr"].item() == 48_000
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @torch.no_grad()
 def test_owned_input_copy_clamps_entire_ragged_batch():
     from vllm_omni.worker_v2.omni_ar_model_runner import _async_copy_mm
@@ -216,7 +217,7 @@ def test_owned_input_copy_clamps_entire_ragged_batch():
     decoder.on_requests_finished(["a", "b"])
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @torch.no_grad()
 def test_pinned_metadata_reuse_waits_for_dma_and_preserves_mixed_terminals():
     decoder = make_decoder(device="cuda")
@@ -238,7 +239,7 @@ def test_pinned_metadata_reuse_waits_for_dma_and_preserves_mixed_terminals():
         assert tails.cpu().tolist() == expected_tails
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @torch.no_grad()
 def test_mixed_terminal_reset_does_not_reset_live_slot():
     decoder = make_decoder(device="cuda", channels=1)
@@ -253,7 +254,7 @@ def test_mixed_terminal_reset_does_not_reset_live_slot():
     session.close()
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("explicit_copy_stream", [False, True])
 @torch.no_grad()
 def test_output_copy_waits_for_private_codec_stream(explicit_copy_stream):
@@ -282,7 +283,7 @@ def test_output_copy_waits_for_private_codec_stream(explicit_copy_stream):
     torch.testing.assert_close(cpu["model_outputs"][0], torch.tensor([2.0, 4.0, 6.0]), rtol=0, atol=0)
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("channels", [1, 2])
 @torch.no_grad()
 def test_short_terminal_row_crops_each_channel_into_output_slab(channels):
@@ -304,7 +305,7 @@ def test_short_terminal_row_crops_each_channel_into_output_slab(channels):
     session.close()
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("channels", [1, 2])
 @pytest.mark.parametrize("layout", ["adjacent", "strided", "gapped"])
 @torch.no_grad()

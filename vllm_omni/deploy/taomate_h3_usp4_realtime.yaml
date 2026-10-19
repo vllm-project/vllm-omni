@@ -1,0 +1,41 @@
+# TaoMate-H3 streaming: USP4, tensor parallel 1, BF16 weights.
+# Launch commands, startup timeouts and benchmarks: recipes/TaoLiveAIGC/TaoMate-H3.md.
+# Warmup runs four five-second windows before serving.
+
+pipeline: taomate_h3
+async_chunk: false
+distributed_executor_backend: mp
+dtype: bfloat16
+
+stages:
+  - stage_id: 0
+    devices: "0,1,2,3"
+    max_num_seqs: 1
+    # Avoid recompilation across prompt lengths.
+    enforce_eager: true
+    model_class_name: TaoMateH3Pipeline
+    engine_backend: vllm_omni.experimental.ar_diffusion.engine.ARDiffusionEngine
+    step_execution: true
+    streaming_output: true
+    parallel_config:
+      tensor_parallel_size: 1
+      sequence_parallel_size: 4
+      ulysses_degree: 4
+      ring_degree: 1
+      text_encoder_tp_size: 4
+      vae_patch_parallel_size: 4
+      vae_parallel_mode: tile
+    default_sampling_params:
+      num_inference_steps: 3
+      output_type: np
+      fps: 24
+    model_config:
+      taomate_h3_width: 480
+      taomate_h3_height: 864
+      taomate_h3_seed: 8301
+      taomate_h3_audio_kv_reset_requests: 12
+      # AR-Diffusion owns persistent AV pages and contiguous attention staging.
+      ar_diffusion_kv_config:
+        # Limit extra residency; the complete session budget must still fit.
+        gpu_memory_fraction: 0.02
+        warmup_cudagraph: true

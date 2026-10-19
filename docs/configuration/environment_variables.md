@@ -92,8 +92,9 @@ environment variables.
 | `SPEAKER_SAMPLES_DIR` | Filesystem path; default `~/.cache/vllm-omni/speakers` | Speech server; read when speaker storage initializes | Environment-only setting. The directory is created; filesystem errors propagate. | Stable |
 | `SPEAKER_MAX_UPLOADED` | Integer; default `1000` | Speech server; read when speaker storage initializes | Environment-only setting. A non-integer logs a warning and uses `1000`; range is not otherwise validated. | Stable |
 | `VLLM_OMNI_ABORT_TIMEOUT` | Float seconds; default `2` | Engine abort wait for Videos DELETE and `generate()` cancel/error cleanup; read when `async_omni` imports | Environment-only setting. A non-float raises `ValueError` during import. | Experimental |
+| `VLLM_OMNI_API_SERVER_TORCH_THREADS` | Non-negative integer; default `4`; `0` disables the cap | Process-wide Torch intra-op pool; read at API worker startup, including inline diffusion stages | Caps the existing count without increasing a lower count (e.g. from `OMP_NUM_THREADS`). Set a higher cap for CPU-heavy preprocessing or postprocessing; `0` preserves the existing count. A non-integer or negative value raises `ValueError` at startup. Separate stage processes are unaffected. | Stable operational control |
 | `VLLM_OMNI_ASYNC_OUTPUT_TIMEOUT` | Float seconds; default `600` | Diffusion engine async-output wait in `step_streaming`; resolved per call on the request path, not at import | Environment-only setting. A non-float or `<=0` value warns once and uses the default. | Experimental |
-| `VLLM_OMNI_EVENT_DRIVEN_ORCH` | `1`, `true`, `yes` or `on` enables; defaults to on for Qwen3-TTS and off for other pipelines | Pipeline default computed from `pipeline_config.model_type` at engine initialization; env override resolved at `Orchestrator` construction and separately when the serving-side final-output drain starts | An explicit env value wins; otherwise both consumers use the engine's pipeline default. Values are stripped and case-normalized; any unrecognized value selects the legacy poll loop. Set before server startup. | Experimental |
+| `VLLM_OMNI_EVENT_DRIVEN_ORCH` | Defaults to on; `0`, `false`, `no` or `off` selects the legacy poll loop | Orchestrator stage-output loop; resolved at `Orchestrator` construction | Unset selects event-driven orchestration for every pipeline. Values are stripped and case-normalized; `1`, `true`, `yes` or `on` keep it enabled and any other value selects the legacy poll loop. The serving-side final-output loop always wakes on orchestrator output, independent of this setting. Set before server startup. | Experimental |
 | `VLLM_OMNI_INPUT_WAIT_TIMEOUT_S` | Float seconds; default `600`; `<=0` disables | Full-payload input coordinator, not async-chunk transfer; read when the scheduler module imports in each worker | Environment-only setting. A non-float logs a warning and uses `600`. | Stable operational control |
 | `VLLM_OMNI_ORCH_MONITOR_PATH` | Filesystem path; default `<current-working-directory>/vllm_omni_orch_monitor_<timestamp>.json` | Orchestrator monitor enabled by `--enable-orch-monitor`; read when the monitor is created | Environment-only path override. Parent directories are created; write errors are logged. | Diagnostic |
 | `VLLM_OMNI_SPEAKER_REGISTRATION_POLICY` | `overwrite` or `immutable`; default `overwrite` | Speech server; read when speaker storage initializes | Environment-only setting. `immutable` rejects re-registering an existing uploaded voice name until it is deleted; any other value raises `ValueError` at startup. | Experimental |
@@ -214,7 +215,7 @@ collection, examples, bug reports, or logs.
 
 ## Model-specific variables
 
-The inventory includes 93 variables read by a single model or pipeline family. They are
+The inventory includes 96 variables read by a single model or pipeline family. They are
 not listed as public usage options here because doing so would turn implementation
 escape hatches into an accidental compatibility contract.
 
@@ -223,10 +224,10 @@ Every audited model-specific name has a migration disposition in the
 
 | Disposition | Count | Required outcome |
 | --- | ---: | --- |
-| Promote | 64 | Move a stable setting into typed stage or model configuration. |
+| Promote | 68 | Move a stable setting into typed stage or model configuration. |
 | Request scope | 5 | Move request-varying behavior into a declared request-option schema. |
 | External | 0 | Retain only when a supported third-party library owns the contract. |
-| Internalize | 17 | Keep a debug or diagnostic switch out of public documentation and configuration. |
+| Internalize | 16 | Keep a debug or diagnostic switch out of public documentation and configuration. |
 | Deprecate/remove | 7 | Remove a compatibility escape hatch that has no continuing contract. |
 
 The disposition is a migration target, not a statement that the existing

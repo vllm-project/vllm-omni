@@ -8,6 +8,7 @@ import pytest
 import torch
 
 import vllm_omni.diffusion.models.magi2.mh_moe as moe
+from tests.helpers.mark import hardware_marks
 from vllm_omni.diffusion.models.magi2 import fused_moe_kernels
 from vllm_omni.diffusion.models.magi2.parallel import Magi2ParallelGroup
 from vllm_omni.platforms import current_omni_platform
@@ -132,8 +133,8 @@ def test_align_bf16_routes_preserves_routes_and_pads_expert_blocks(route_ids):
 @pytest.mark.parametrize(
     "device_type",
     [
-        pytest.param("cuda", marks=[pytest.mark.cuda, pytest.mark.gpu]),
-        pytest.param("musa", marks=[pytest.mark.musa, pytest.mark.gpu]),
+        pytest.param("cuda", marks=hardware_marks(res={"cuda": "L4"}, num_cards=1)),
+        pytest.param("musa", marks=hardware_marks(res={"musa": "S5000"}, num_cards=1)),
     ],
 )
 def test_align_bf16_routes_on_device_matches_host(device_type):
@@ -398,8 +399,8 @@ def _gpu_device(device_type: str) -> torch.device:
 @pytest.mark.parametrize(
     "device_type",
     [
-        pytest.param("cuda", marks=[pytest.mark.cuda, pytest.mark.gpu]),
-        pytest.param("musa", marks=[pytest.mark.musa, pytest.mark.gpu]),
+        pytest.param("cuda", marks=hardware_marks(res={"cuda": "L4"}, num_cards=1)),
+        pytest.param("musa", marks=hardware_marks(res={"musa": "S5000"}, num_cards=1)),
     ],
 )
 @pytest.mark.parametrize(
@@ -439,7 +440,10 @@ def test_bf16_forward_real_kernel_parity(
 
 @pytest.mark.parametrize(
     "device_type",
-    [pytest.param("cuda", marks=pytest.mark.cuda), pytest.param("musa", marks=pytest.mark.musa)],
+    [
+        pytest.param("cuda", marks=hardware_marks(res={"cuda": "L4"}, num_cards=1)),
+        pytest.param("musa", marks=hardware_marks(res={"musa": "S5000"}, num_cards=1)),
+    ],
 )
 @pytest.mark.parametrize("seed", [419, 420])
 @pytest.mark.parametrize(
@@ -488,7 +492,8 @@ def test_bf16_forward_matches_reference_routes_and_fp32_reduction(
     moe.triton_mh_moe_forward(x, gather_ids, sorted_probs, offsets, gate, up, down, deterministic=True)
     actual = moe._bf16_fused_moe_forward(x, probabilities, indices, moe._pack_bf16_w13(gate, up), down).cpu()
     assert len(reference_routes) == len(new_routes) == 1
-    flat_experts = (inputs[2] + torch.arange(num_heads).view(-1, 1, 1) * num_experts).reshape(-1)
+    # The fused path stores its routes token-major.
+    flat_experts = (inputs[2] + torch.arange(num_heads).view(-1, 1, 1) * num_experts).transpose(0, 1).reshape(-1)
     order = flat_experts.argsort(stable=True)
     new_sorted = new_routes[0].index_select(0, order)
     scatter_ids = gather_ids.cpu().long() * num_heads + flat_experts[order] // num_experts
@@ -506,8 +511,8 @@ def test_bf16_forward_matches_reference_routes_and_fp32_reduction(
 @pytest.mark.parametrize(
     "device_type",
     [
-        pytest.param("cuda", marks=[pytest.mark.cuda, pytest.mark.gpu]),
-        pytest.param("musa", marks=[pytest.mark.musa, pytest.mark.gpu]),
+        pytest.param("cuda", marks=hardware_marks(res={"cuda": "L4"}, num_cards=1)),
+        pytest.param("musa", marks=hardware_marks(res={"musa": "S5000"}, num_cards=1)),
     ],
 )
 def test_bf16_reference_atomic_add_capability(device_type):

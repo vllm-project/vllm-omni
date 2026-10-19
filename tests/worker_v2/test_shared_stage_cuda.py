@@ -7,10 +7,11 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tests.helpers.mark import hardware_marks
 from vllm_omni.worker.gpu_generation_model_runner import _HostCopyBatch
 from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
 
-pytestmark = [pytest.mark.core_model, pytest.mark.cuda]
+pytestmark = [pytest.mark.core_model, *hardware_marks(res={"cuda": "L4"}, num_cards=1)]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
