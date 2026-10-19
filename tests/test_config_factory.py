@@ -2733,3 +2733,50 @@ class TestPipelineConfigResolvers:
             pass
 
         assert resolver(NotTheRightHfConfig()) is None
+def test_engine_extras_multi_step_decode_steps_reaches_stage1_only(tmp_path):
+    """A per-stage window size must reach that stage's model config.
+
+    The field is deliberately per-stage rather than pipeline-wide (the thinker
+    must not inherit the talker's K), and it has to be declared on both
+    ``_ModelEngineOverrides`` (the typed engine-arg projection) and
+    ``OmniStageModelConfig`` (built from that projection) or the value is
+    silently dropped between the deploy YAML and the engine.
+    """
+    import yaml
+
+    from vllm_omni.config.omni_config import _build_model_config, _stage_engine_values
+
+    deploy_dir = Path(__file__).parent.parent / "vllm_omni" / "deploy"
+    raw = yaml.safe_load((deploy_dir / "minicpmo_4_5_duplex.yaml").read_text())
+    assert raw["stages"][1]["stage_id"] == 1
+    # Pin the inherited base by absolute path so the overlay stays loadable
+    # from the temporary directory.
+    raw["base_config"] = str(deploy_dir / raw["base_config"])
+    raw["stages"][1].setdefault("engine_extras", {})["multi_step_decode_steps"] = 12
+    deploy_path = tmp_path / "deploy.yaml"
+    deploy_path.write_text(yaml.safe_dump(raw))
+
+    deploy = load_deploy_config(deploy_path)
+    pipeline = resolve_pipeline_config("minicpmo_4_5")
+    stages = merge_pipeline_deploy(pipeline, deploy)
+    topology = {stage.stage_id: stage for stage in pipeline.stages}
+
+    # Flat engine args (what feeds OmniEngineArgs).
+    assert stages[1].yaml_engine_args["multi_step_decode_steps"] == 12
+
+    # Typed projection + stage model config: the value is silently dropped
+    # here without the two declarations.
+    stage1_engine = _stage_engine_values(deploy.stages[1]).model
+    assert stage1_engine["multi_step_decode_steps"] == 12
+    assert (
+        _build_model_config(topology[1], deploy.stages[1], stage1_engine).multi_step_decode_steps
+        == 12
+    )
+
+    # Only the opted-in stage carries it; the thinker keeps the default.
+    stage0_engine = _stage_engine_values(deploy.stages[0]).model
+    assert "multi_step_decode_steps" not in stage0_engine
+    assert (
+        _build_model_config(topology[0], deploy.stages[0], stage0_engine).multi_step_decode_steps
+        == 0
+    )
