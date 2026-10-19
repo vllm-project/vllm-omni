@@ -39,12 +39,30 @@ def _kill_worker(model: FaultModel, server: Any, signal_name: str) -> None:
     )(server)
 
 
+_DEFAULT_HTTP_200_STATUS = "expected HTTP 200 when no error expectation is set, got "
+
+
 def _response_status(result: Any) -> int | None:
     if result is None:
         return None
     response = result[0] if isinstance(result, (list, tuple)) else result
     status = getattr(response, "status_code", None)
     return status if isinstance(status, int) else None
+
+
+def _status_from_default_http_200_assertion(exc: BaseException) -> int | None:
+    text = str(exc)
+    index = text.find(_DEFAULT_HTTP_200_STATUS)
+    if index < 0:
+        return None
+    digits: list[str] = []
+    for char in text[index + len(_DEFAULT_HTTP_200_STATUS) :]:
+        if not char.isdigit():
+            break
+        digits.append(char)
+    if not digits:
+        return None
+    return int("".join(digits))
 
 
 def _assert_concurrent_all_fail(model: FaultModel, client: Any, server: Any) -> None:
@@ -65,6 +83,9 @@ def _assert_concurrent_all_fail(model: FaultModel, client: Any, server: Any) -> 
         try:
             result = future.result()
         except Exception as exc:
+            status = _status_from_default_http_200_assertion(exc)
+            if status is not None and status >= 400:
+                continue
             assert_fault_exception(exc, model.process_kill_error_keywords)
             continue
         status = _response_status(result)

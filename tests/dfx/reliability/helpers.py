@@ -33,13 +33,14 @@ import sys
 import tempfile
 import time
 import uuid
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypedDict
 
 import psutil
 import pytest
+import yaml
 
 if TYPE_CHECKING:
     from tests.helpers.runtime import OmniServerParams
@@ -450,6 +451,56 @@ def stop_gpu_oom_hog(handle: OomHandle, *, timeout_sec: int = 5) -> None:
         proc.wait(timeout=timeout_sec)
 
 
+def _stage_devices_text(stage: Mapping[str, Any]) -> str | None:
+    devices = stage.get("devices")
+    if devices is None:
+        runtime = stage.get("runtime")
+        if isinstance(runtime, Mapping):
+            devices = runtime.get("devices")
+    if not isinstance(devices, str):
+        return None
+    text = devices.strip()
+    return text or None
+
+
+def stage_config_device_spec(stage_config_path: str | Path, platform: str | None) -> str:
+    """Devices after applying only ``platforms.<platform>``.
+
+    Other platform blocks stay out of the result. A CUDA run of a file that
+    also lists an XPU 8-GPU override keeps the base stage devices.
+    """
+    raw = yaml.safe_load(Path(stage_config_path).read_text(encoding="utf-8"))
+    if not isinstance(raw, dict):
+        raise ValueError(f"stage config must be a mapping: {stage_config_path}")
+    by_stage: dict[int, str] = {}
+    for stage in raw.get("stages") or []:
+        if not isinstance(stage, Mapping):
+            continue
+        stage_id = stage.get("stage_id")
+        devices = _stage_devices_text(stage)
+        if isinstance(stage_id, int) and devices is not None:
+            by_stage[stage_id] = devices
+    platforms = raw.get("platforms")
+    section = platforms.get(platform) if platform and isinstance(platforms, Mapping) else None
+    if isinstance(section, Mapping):
+        for stage in section.get("stages") or []:
+            if not isinstance(stage, Mapping):
+                continue
+            stage_id = stage.get("stage_id")
+            devices = _stage_devices_text(stage)
+            if isinstance(stage_id, int) and devices is not None and stage_id in by_stage:
+                by_stage[stage_id] = devices
+    device_ids: set[int] = set()
+    for spec in by_stage.values():
+        for token in spec.split(","):
+            token = token.strip()
+            if token:
+                device_ids.add(int(token))
+    if not device_ids:
+        raise ValueError(f"No runtime.devices found in stage config: {stage_config_path}")
+    return ",".join(str(device_id) for device_id in sorted(device_ids))
+
+
 def inject_gpu_oom(
     *,
     device: int | str | list[int] = 0,
@@ -478,17 +529,22 @@ def inject_gpu_oom(
     if not devices:
         raise ValueError("device must not be empty.")
 
-    handles = [
-        start_gpu_oom_hog(
-            device=dev,
-            target_mem_ratio=target_mem_ratio,
-            hold_seconds=hold_seconds,
-            startup_timeout_sec=startup_timeout_sec,
-            strict=strict,
-            max_free_bytes=max_free_bytes,
-        )
-        for dev in devices
-    ]
+    handles: list[OomHandle] = []
+    try:
+        for dev in devices:
+            handles.append(
+                start_gpu_oom_hog(
+                    device=dev,
+                    target_mem_ratio=target_mem_ratio,
+                    hold_seconds=hold_seconds,
+                    startup_timeout_sec=startup_timeout_sec,
+                    strict=strict,
+                    max_free_bytes=max_free_bytes,
+                )
+            )
+    except BaseException:
+        stop_gpu_oom_hogs(handles)
+        raise
     if len(handles) == 1:
         return handles[0]
     return handles
