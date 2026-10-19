@@ -1522,19 +1522,16 @@ class MiniCPMO45Code2Wav(nn.Module):
             # CAM++ speaker embedding on device via torch (weights loaded from
             # the same campplus.onnx) — replaces the per-request CPU
             # onnxruntime run that blocks the host ~120-155ms per request.
-            # "token2wav_device_spk": false in the stage extra config (or
-            # env MINICPMO_TOKEN2WAV_DEVICE_SPK=0) falls back to the CPU onnxruntime
-            # path (accuracy triage).
-            device_spk = bool(extra.get("token2wav_device_spk", True)) and (
-                os.environ.get("MINICPMO_TOKEN2WAV_DEVICE_SPK", "1") != "0"
-            )
+            # "token2wav_device_spk": false in the stage extra config falls
+            # back to the CPU onnxruntime path (accuracy triage).
+            device_spk = bool(extra.get("token2wav_device_spk", True))
             if device_spk:
                 token2wav.enable_device_spk_embedding()
                 logger.info("MiniCPM-o Code2Wav: campplus speaker embedding running on device (torch)")
             else:
                 logger.info(
                     "MiniCPM-o Code2Wav: campplus speaker embedding falling back to CPU onnxruntime "
-                    "(token2wav_device_spk=false or MINICPMO_TOKEN2WAV_DEVICE_SPK=0)"
+                    "(token2wav_device_spk=false)"
                 )
         self.backend = BatchedToken2Wav(
             token2wav,
