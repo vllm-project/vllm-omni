@@ -17,7 +17,12 @@ from vllm_omni.diffusion.models.mammoth_moda2.pipeline_mammothmoda2_dit import M
 
 from .test_dit_attention import _SDPA_CONFIG
 
-pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
+pytestmark = [
+    pytest.mark.core_model,
+    pytest.mark.diffusion,
+    pytest.mark.cpu,
+    pytest.mark.usefixtures("mock_tp1"),
+]
 
 
 def test_dit_norms_are_shared_rmsnorm_with_their_eps():

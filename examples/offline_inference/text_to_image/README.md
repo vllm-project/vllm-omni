@@ -35,7 +35,6 @@ This folder provides several entrypoints for experimenting with text-to-image di
 | `black-forest-labs/FLUX.2-klein-9B` | 1024 x 1024 | 37.1 | 32.3 |
 | `black-forest-labs/FLUX.2-dev` | 1024 x 1024 | 65.7 | >80 (CPU offload required) |
 | `HunyuanImage-3.0` | 1024 x 1024 | 80.0 (TP≥3) | 160 |
-| `HiDream-I1-Full` | 1024 x 1024 | 63.7 | 57.7 |
 | `krea/Krea-2-Raw`, `krea/Krea-2-Turbo` | 1024 (Raw) / 2048 (Turbo) | — | ~30 |
 
 !!! info
@@ -115,7 +114,6 @@ python text_to_image.py \
 | `--lora-backend` | str | `"peft"` | LoRA backend for loading LoRA adapters. Default: peft. Available options: peft, distill |
 | `--use-system-prompt` | str | `None` | System prompt preset: `en_unified`, `en_vanilla`, `en_recaption`, `en_think_recaption`, `dynamic`, `None`, or custom text. Recommended: `en_unified`. Only for HunyuanImage-3.0. |
 | `--system-prompt` | str | `None` | Custom system prompt text. Only used when `--use-system-prompt` is set to `custom`. Only for HunyuanImage-3.0. |
-| `--auxiliary-text-encoder` | str | `None` | Supplementary auxiliary text encoder parameters model name or path (especially for Hidream-l1-full). |
 
 **NextStep-1.1 specific arguments:**
 
@@ -197,23 +195,6 @@ python examples/offline_inference/text_to_image/text_to_image.py \
   --width 1024 \
   --enable-cpu-offload \
   --output flux2-dev.png
-```
-
-### HiDream-I1-Full Models
-
-The `--auxiliary-text-encoder` parameter is required when running HiDream‑I1‑Full:
-
-```bash
-python examples/offline_inference/text_to_image/text_to_image.py \
-  --model HiDream-ai/HiDream-I1-Full \
-  --prompt "The setting sun of late autumn dyes the riverside with a warm orange hue" \
-  --seed 42 \
-  --guidance-scale 5.0 \
-  --tensor-parallel-size 1 \
-  --num-images-per-prompt 1 \
-  --num-inference-steps 50 \
-  --auxiliary-text-encoder meta-llama/Meta-Llama-3.1-8B-Instruct \
-  --output /output.png
 ```
 
 ### Anima Single-File Checkpoints
