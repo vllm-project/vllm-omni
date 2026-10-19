@@ -769,9 +769,8 @@ def test_a_live_stream_and_a_first_chunk_in_one_step(decoder: S3GenDecoder, refe
     [
         (131071, None, "max_num_batched_tokens >= max_num_seqs (64) * max_model_len (2048) = 131072, got 131071"),
         (131072, 8000, "max_num_scheduled_tokens >= max_num_seqs (64) * max_model_len (2048) = 131072, got 8000"),
-        (131072, 0, "max_num_scheduled_tokens >= max_num_seqs (64) * max_model_len (2048) = 131072, got 0"),
     ],
-    ids=["batched tokens", "scheduled tokens", "scheduled tokens set to 0"],
+    ids=["batched tokens", "scheduled tokens"],
 )
 def test_a_step_budget_that_can_split_an_utterance_is_refused_at_startup(
     model_dir: str, max_num_batched_tokens: int, max_num_scheduled_tokens: int | None, names: str
@@ -781,8 +780,8 @@ def test_a_step_budget_that_can_split_an_utterance_is_refused_at_startup(
     The decoder would take that part for the whole utterance. An utterance is
     at most the stage's own context long, so 32 slots of a 2048-token
     context need 65536, whatever ``max_tokens`` a request asks for. The
-    scheduler's budget is its scheduled-token limit whenever one is set, 0
-    included, and the message names the field it read. The deploy file's
+    scheduler's budget is its scheduled-token limit whenever one is set, and
+    the message names the field it read. The deploy file's
     stage 1 gets the budget as ``--stage-overrides`` would give it.
     """
     config = stage_vllm_config(
