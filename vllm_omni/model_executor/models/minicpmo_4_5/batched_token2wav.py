@@ -1607,9 +1607,15 @@ class BatchedToken2Wav(nn.Module):
 
         Lifetime: each row's cache is a view into that chunk's B-row buffer,
         so the buffer stays alive until every sibling row has been replaced by
-        a later chunk. Serving steps the live rows of a chunk together, so at
-        most one extra chunk's buffers are pinned per generation; the
-        conformer_cnn rows are contiguous (whole-tensor clone) and the
+        a later chunk. When a chunk's rows advance together (the uniform case,
+        e.g. the 128x8 run), serving steps all of them in the same decode
+        call, so at most one extra chunk's buffers are pinned per generation.
+        A request that drops out of the next batch (its next token chunk is
+        not ready while its siblings advance) is not stepped with them, so it
+        keeps its whole B-row cnn/att/estimator_cnn buffers alive until it
+        steps again; scheduling changes that can strand rows across batches
+        must re-check this bound. The conformer_cnn rows are contiguous
+        (whole-tensor clone) and the
         conformer_att/estimator_cnn rows stay strided views. Both consumers
         accept the strided views without an extra copy: ``_stack_flow_cache``
         concatenates them, and ``FlowEncoderGraphs.run`` copies rows into its
