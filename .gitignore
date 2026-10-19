@@ -281,11 +281,10 @@ vllm_omni/_version.py
 *.wav
 # Vendored test reference audio (small, intentionally checked in)
 !tests/assets/**/*.wav
-# Temporary default Omni reference, bundled with its source metadata.
+# Bundled Ming IP voice catalog.
 !vllm_omni/model_executor/models/ming_flash_omni/data/
 vllm_omni/model_executor/models/ming_flash_omni/data/*
-!vllm_omni/model_executor/models/ming_flash_omni/data/default_reference.json
-!vllm_omni/model_executor/models/ming_flash_omni/data/default_reference.wav
+!vllm_omni/model_executor/models/ming_flash_omni/data/ip_voices.json
 .worktrees/
 # CI overlay yamls materialized from tests/utils.py:_CI_OVERLAYS at test time
 tests/.ci_generated/

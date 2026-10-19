@@ -411,9 +411,11 @@ def test_ming3_talker_bridge_uses_generated_text_and_default_voice(
     assert info["ming_task"] == "omni"
     assert info["text"] == "abc def"
     assert info["voice_name"] is None
-    assert info["voice_mode"] == "reference"
-    assert Path(info["prompt_wav"]).is_file()
-    assert info["speaker_conditioning"] == "prompt"
+    assert info["voice_mode"] == "ip"
+    assert info["ip_name"] == "灵小柔"
+    assert info["prompt_wav"] is None
+    assert info["reference_audio"] is None
+    assert info["speaker_conditioning"] == "mute"
     assert "Target language: English." in info["prompt"]
     assert info["max_text_length"] == 42
 
@@ -464,7 +466,7 @@ def test_ming3_async_chunk_emits_stable_sentences_and_terminal_tail(mocker: Mock
     request = mocker.Mock(spec=["external_req_id", "prompt_token_ids", "all_token_ids", "additional_information"])
     request.external_req_id = "r1"
     request.prompt_token_ids = [99]
-    request.additional_information = {"max_text_length": 42, "voice_name": "lingguang"}
+    request.additional_information = {"max_text_length": 42, "voice_name": "test_voice_b"}
 
     request.all_token_ids = [99, 1]
     assert thinker2talker_async_chunk(manager, None, request) is None
@@ -473,7 +475,7 @@ def test_ming3_async_chunk_emits_stable_sentences_and_terminal_tail(mocker: Mock
     assert first is not None
     assert first.additional_information["text"] == "这是一段包含足够多汉字的正常回答。"
     assert first.additional_information["ming_task"] == "omni"
-    assert first.additional_information["voice_name"] == "lingguang"
+    assert first.additional_information["voice_name"] == "test_voice_b"
     assert first.additional_information["max_text_length"] == 42
     assert first.codes.audio.tolist() == [0]
     assert first.meta.replace_runtime_additional_information is True

@@ -41,16 +41,18 @@ def test_async_preserves_serialized_talker_controls():
         "scrub_markup": True,
         "stream_decode": False,
         "seed": 123,
-        "voice_mode": "ip",
-        "ip_name": "灵小柔",
+        "voice_name": "灵小柔",
     }
     info = serialize_additional_information(controls)
     output = thinker2talker_async_chunk(_manager(), None, _request("Chinese\t你好。", info), is_finished=True)
     assert output is not None
     assert output.additional_information["text"] == "你好。"
     assert output.additional_information["ming_text_fragments"] == ["你好。"]
+    assert output.additional_information["ip_name"] == "灵小柔"
+    assert output.additional_information["reference_audio"] is None
     for key, value in controls.items():
-        assert output.additional_information[key] == value
+        if key != "voice_name":
+            assert output.additional_information[key] == value
 
 
 @pytest.mark.parametrize("text", ["  Chinese\t  ", "<script>secret()</script>"])
@@ -92,9 +94,9 @@ def test_incremental_input_keeps_numeric_url_and_abbreviation_context():
     assert manager._ming3_chunk_state == {}
 
 
-def test_prompt_and_automatic_ip_remain_stable_after_first_speakable_fragment():
+def test_prompt_and_selected_ip_remain_stable_after_first_speakable_fragment():
     manager = _manager()
-    controls = serialize_additional_information({"voice_mode": "ip"})
+    controls = serialize_additional_information({"voice_name": "US_Stella"})
     text = "This is a long enough answer with many ordinary English words for speech!"
     first = thinker2talker_async_chunk(manager, None, _request(text, controls))
     assert first is not None

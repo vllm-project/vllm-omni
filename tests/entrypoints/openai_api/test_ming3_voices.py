@@ -12,12 +12,16 @@ from unittest.mock import AsyncMock, Mock
 import numpy as np
 import pytest
 import soundfile as sf
+from starlette.datastructures import Headers, UploadFile
 
 from vllm_omni.config.speech_cache import SpeechCacheConfig
 from vllm_omni.entrypoints.openai.ming3_realtime import Ming3RealtimeConnection
 from vllm_omni.entrypoints.openai.ming3_voices import register_model_voice_presets, resolve_stored_voice, voice_id
+from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
 from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
+from vllm_omni.entrypoints.openai.tts_adapters.base import SpeechServingContext
+from vllm_omni.entrypoints.openai.tts_adapters.ming3_audio_tts import Ming3AudioTTSAdapter
 from vllm_omni.model_executor.stage_input_processors.ming_talker import build_ming_talker_additional_info
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.asyncio]
@@ -44,8 +48,8 @@ def model(tmp_path):
     (presets / "voice_prompts.json").write_text(
         json.dumps(
             {
-                "DB30": {"text": "感谢你的认可。", "audio": "voice_audio/a.wav"},
-                "lingguang": {"text": "你好", "audio": "voice_audio/b.wav"},
+                "TEST_VOICE_A": {"text": "感谢你的认可。", "audio": "voice_audio/a.wav"},
+                "test_voice_b": {"text": "你好", "audio": "voice_audio/b.wav"},
             },
             ensure_ascii=False,
         )
@@ -68,8 +72,8 @@ def chat_for(store):
 async def test_model_import_persists_audio_text_and_reuses_on_restart(store, model):
     before = {str(p.relative_to(model)): p.read_bytes() for p in model.rglob("*") if p.is_file()}
     await register_model_voice_presets(store, str(model))
-    assert set(store.uploaded_speakers) == {"db30", "lingguang"}
-    assert store.uploaded_speakers["db30"]["ref_text"] == "感谢你的认可。"
+    assert set(store.uploaded_speakers) == {"test_voice_a", "test_voice_b"}
+    assert store.uploaded_speakers["test_voice_a"]["ref_text"] == "感谢你的认可。"
     files = sorted(store.uploaded_speakers_dir.glob("*.safetensors"))
     assert len(files) == 2
     timestamps = {p: p.stat().st_mtime_ns for p in files}
@@ -79,7 +83,7 @@ async def test_model_import_persists_audio_text_and_reuses_on_restart(store, mod
     restored._adapter = None
     await register_model_voice_presets(restored, str(model))
     assert {p: p.stat().st_mtime_ns for p in files} == timestamps
-    audio, sr = restored._load_uploaded_audio("DB30")
+    audio, sr = restored._load_uploaded_audio("TEST_VOICE_A")
     assert sr == 16000
     np.testing.assert_allclose(audio, 0.125)
     assert {str(p.relative_to(model)): p.read_bytes() for p in model.rglob("*") if p.is_file()} == before
@@ -87,22 +91,22 @@ async def test_model_import_persists_audio_text_and_reuses_on_restart(store, mod
 
 async def test_manifest_change_refreshes_existing_preset(store, model):
     await register_model_voice_presets(store, str(model))
-    previous = store.uploaded_speakers["db30"]["file_path"]
+    previous = store.uploaded_speakers["test_voice_a"]["file_path"]
     manifest = model / "voice_presets/voice_prompts.json"
     data = json.loads(manifest.read_text())
-    data["DB30"]["text"] = "新文本"
+    data["TEST_VOICE_A"]["text"] = "新文本"
     manifest.write_text(json.dumps(data))
     await register_model_voice_presets(store, str(model))
-    assert store.uploaded_speakers["db30"]["ref_text"] == "新文本"
+    assert store.uploaded_speakers["test_voice_a"]["ref_text"] == "新文本"
     assert not Path(previous).exists()
     assert len(list(store.uploaded_speakers_dir.glob("*.safetensors"))) == 2
 
 
 async def test_runtime_upload_takes_precedence(store, model):
-    store.uploaded_speakers["db30"] = {"name": "DB30", "ref_text": "user"}
+    store.uploaded_speakers["test_voice_a"] = {"name": "TEST_VOICE_A", "ref_text": "user"}
     await register_model_voice_presets(store, str(model))
-    assert store.uploaded_speakers["db30"]["ref_text"] == "user"
-    assert "lingguang" in store.uploaded_speakers
+    assert store.uploaded_speakers["test_voice_a"]["ref_text"] == "user"
+    assert "test_voice_b" in store.uploaded_speakers
 
 
 @pytest.mark.parametrize(
@@ -140,10 +144,10 @@ async def test_named_chat_voice_reaches_talker_with_audio_and_text(store, model)
     await register_model_voice_presets(store, str(model))
     chat = chat_for(store)
     prompt: dict = {}
-    request = SimpleNamespace(audio={"voice": {"id": "DB30"}})
+    request = SimpleNamespace(audio={"voice": {"id": "TEST_VOICE_A"}})
     await chat._attach_ming3_reference_audio(prompt, request)
     info = build_ming_talker_additional_info("你好", prompt)
-    assert info["voice_name"] == "db30"
+    assert info["voice_name"] == "test_voice_a"
     assert info["prompt_text"] == "感谢你的认可。"
     assert info["prompt_audio_mode"] == "continuation"
     assert info["speaker_conditioning"] == "prompt"
@@ -152,10 +156,10 @@ async def test_named_chat_voice_reaches_talker_with_audio_and_text(store, model)
     assert info["instruction"] is None
 
 
-async def test_ip_mode_ignores_stored_selection(store):
+async def test_ip_voice_takes_precedence_over_stored_selection(store):
     chat = chat_for(store)
-    prompt = {"additional_information": {"voice_mode": "ip", "ip_name": "灵小柔"}}
-    await chat._attach_ming3_reference_audio(prompt, SimpleNamespace(audio={"voice": "not-registered"}))
+    prompt: dict = {}
+    await chat._attach_ming3_reference_audio(prompt, SimpleNamespace(audio={"voice": {"id": "灵小柔"}}))
     info = build_ming_talker_additional_info("你好", prompt)
     assert json.loads(info["instruction"])["audio_sequence"][0]["IP"] == "灵小柔"
     assert info["reference_audio"] is None
@@ -186,7 +190,7 @@ def sent(conn):
     return [json.loads(call.args[0]) for call in conn.websocket.send_text.call_args_list]
 
 
-async def update(conn, voice="DB30", **extra):
+async def update(conn, voice="TEST_VOICE_A", **extra):
     await conn.handle_event(
         {
             "type": "session.update",
@@ -200,27 +204,27 @@ async def update(conn, voice="DB30", **extra):
 
 async def test_realtime_official_session_voice_and_unknown_error(realtime, store, model):
     await register_model_voice_presets(store, str(model))
-    await update(realtime, {"id": "DB30"})
+    await update(realtime, {"id": "TEST_VOICE_A"})
     assert sent(realtime)[-1]["type"] == "session.updated"
-    assert realtime._session["audio"]["output"]["voice"] == "db30"
+    assert realtime._session["audio"]["output"]["voice"] == "test_voice_a"
     await update(realtime, "unknown")
     assert sent(realtime)[-1]["type"] == "error"
-    assert realtime._session["audio"]["output"]["voice"] == "db30"
+    assert realtime._session["audio"]["output"]["voice"] == "test_voice_a"
 
 
 async def test_realtime_voice_locked_after_audio(realtime, store, model):
     await register_model_voice_presets(store, str(model))
     await update(realtime)
     realtime._audio_started = True
-    realtime._spoken_voice = ("reference", "db30")
-    await update(realtime, {"id": "DB30"})
+    realtime._spoken_voice = ("reference", "test_voice_a")
+    await update(realtime, {"id": "TEST_VOICE_A"})
     assert sent(realtime)[-1]["type"] == "session.updated"
-    await update(realtime, "lingguang")
+    await update(realtime, "test_voice_b")
     assert sent(realtime)[-1]["type"] == "error"
 
 
 async def test_realtime_ip_mode_needs_no_reference(realtime):
-    await update(realtime, "not-stored", additional_information={"voice_mode": "ip", "ip_name": "灵小柔"})
+    await update(realtime, {"id": "US_Stella"})
     assert sent(realtime)[-1]["type"] == "session.updated"
 
 
@@ -369,12 +373,13 @@ async def test_realtime_audio_locks_voice_once_after_first_nonempty_chunk(realti
     for _ in range(3):
         assert await realtime._emit_audio(np.zeros(10), {}, realtime._session)
     key.assert_called_once_with(realtime._session)
-    assert realtime._spoken_voice == ("reference", None)
+    assert realtime._spoken_voice == ("reference", "灵小柔")
 
 
-async def test_realtime_response_uses_selected_voice_and_emits_pcm24(realtime, store, model):
+@pytest.mark.parametrize("selected", [None, "TEST_VOICE_A", "US_Stella", "灵小柔"])
+async def test_realtime_response_uses_selected_voice_and_emits_pcm24(realtime, store, model, selected):
     await register_model_voice_presets(store, str(model))
-    await update(realtime)
+    await update(realtime, {"id": selected} if selected is not None else None)
     await realtime.handle_event(
         {
             "type": "conversation.item.create",
@@ -402,13 +407,19 @@ async def test_realtime_response_uses_selected_voice_and_emits_pcm24(realtime, s
         # Exercise actual voice lookup and thinker-to-talker handoff too.
         prompt = {"additional_information": dict(request.additional_information)}
         await chat_for(store)._attach_ming3_reference_audio(prompt, request)
-        assert build_ming_talker_additional_info("你好", prompt)["prompt_text"] == "感谢你的认可。"
+        info = build_ming_talker_additional_info("你好", prompt)
+        if selected == "TEST_VOICE_A":
+            assert info["prompt_text"] == "感谢你的认可。"
+        else:
+            assert json.loads(info["instruction"])["audio_sequence"][0]["IP"] == (selected or "灵小柔")
+            assert info["reference_audio"] is None
+            assert info["prompt_audio_mode"] == "none"
         return events()
 
     realtime.serving.create_chat_completion = create
     await realtime.handle_event({"type": "response.create"})
     await realtime.generation_task
-    assert captured[0].additional_information["voice_name"] == "db30"
+    assert captured[0].additional_information.get("voice_name") == (selected.lower() if selected else None)
     events_sent = sent(realtime)
     delta = next(e for e in events_sent if e["type"] == "response.output_audio.delta")
     assert "audio" not in delta  # Official event uses delta.
@@ -422,21 +433,19 @@ async def test_realtime_response_uses_selected_voice_and_emits_pcm24(realtime, s
 
 
 async def test_voice_id_shapes():
-    assert voice_id("DB30") == voice_id({"id": "DB30"}) == "db30"
+    assert voice_id("TEST_VOICE_A") == voice_id({"id": "TEST_VOICE_A"}) == "test_voice_a"
     for value in (None, {}, {"id": ""}, 1):
         with pytest.raises(ValueError):
             voice_id(value)
 
 
 async def test_registered_voice_works_with_speech_api_adapter(store, model):
-    from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
-    from vllm_omni.entrypoints.openai.tts_adapters.base import SpeechServingContext
-    from vllm_omni.entrypoints.openai.tts_adapters.ming3_audio_tts import Ming3AudioTTSAdapter
-
+    store.engine_client = SimpleNamespace()
+    store._diffusion_mode = False
+    adapter = store._get_tts_adapter()
     await register_model_voice_presets(store, str(model))
     store._max_instructions_length = 500
-    adapter = Ming3AudioTTSAdapter(SpeechServingContext(server=store))
-    request = OpenAICreateSpeechRequest(input="你好", voice={"id": "DB30"})
+    request = OpenAICreateSpeechRequest(input="你好", voice={"id": "TEST_VOICE_A"})
     assert adapter.validate(request) is None
     assert request.voice is None  # Stored voice must not turn into an IP caption.
     assert request.ref_audio.startswith("data:audio/wav;base64,")
@@ -463,13 +472,13 @@ async def test_realtime_websocket_route(store, model):
                 {
                     "type": "session.update",
                     "session": {
-                        "audio": {"output": {"voice": {"id": "DB30"}}},
+                        "audio": {"output": {"voice": {"id": "TEST_VOICE_A"}}},
                     },
                 }
             )
             updated = socket.receive_json()
             assert updated["type"] == "session.updated"
-            assert updated["session"]["audio"]["output"]["voice"] == "db30"
+            assert updated["session"]["audio"]["output"]["voice"] == "test_voice_a"
 
 
 async def test_realtime_response_override_cannot_bypass_voice_lock(realtime, store, model):
@@ -477,12 +486,12 @@ async def test_realtime_response_override_cannot_bypass_voice_lock(realtime, sto
     await update(realtime)
     realtime._messages = [{"role": "user", "content": "hello"}]
     realtime._audio_started = True
-    realtime._spoken_voice = ("reference", "db30")
+    realtime._spoken_voice = ("reference", "test_voice_a")
     await realtime.handle_event(
         {
             "type": "response.create",
             "response": {
-                "audio": {"output": {"voice": {"id": "lingguang"}}},
+                "audio": {"output": {"voice": {"id": "test_voice_b"}}},
             },
         }
     )
@@ -507,7 +516,7 @@ async def test_hf_snapshot_audio_symlinks_are_supported(store, model, tmp_path):
     audio.rename(blob)
     audio.symlink_to(blob)
     await register_model_voice_presets(store, str(model))
-    assert "db30" in store.uploaded_speakers
+    assert "test_voice_a" in store.uploaded_speakers
 
 
 async def test_hf_preset_download_uses_model_revision(store, model, monkeypatch):
@@ -533,7 +542,7 @@ async def test_realtime_pcm_format_defaults_and_invalid_format(realtime, store, 
         {
             "type": "session.update",
             "session": {
-                "audio": {"output": {"voice": "DB30", "format": {"type": "audio/pcm"}}},
+                "audio": {"output": {"voice": "TEST_VOICE_A", "format": {"type": "audio/pcm"}}},
             },
         }
     )
@@ -666,3 +675,108 @@ async def test_realtime_failed_send_marks_connection_disconnected(realtime):
     with pytest.raises(RuntimeError, match="client disconnected"):
         await realtime.send_json({"type": "response.done"})
     assert realtime._is_connected is False
+
+
+@pytest.mark.parametrize("controls", [{"voice_mode": "ip"}, {"ip_name": "灵小柔"}])
+async def test_legacy_ip_controls_rejected(realtime, store, controls):
+    await update(realtime, {"id": "灵小柔"}, additional_information=controls)
+    assert sent(realtime)[-1]["type"] == "error"
+    with pytest.raises(ValueError, match="voice_mode only supports reference"):
+        await chat_for(store)._attach_ming3_reference_audio({"additional_information": controls})
+
+
+async def test_ip_voice_caption_preserves_case_and_overrides_registered_audio(store):
+    store.uploaded_speakers["us_stella"] = {"name": "US_Stella"}
+    prompt: dict = {}
+    await chat_for(store)._attach_ming3_reference_audio(prompt, SimpleNamespace(audio={"voice": {"id": "us_stella"}}))
+    info = build_ming_talker_additional_info("Hello", prompt)
+    assert json.loads(info["instruction"])["audio_sequence"][0]["IP"] == "US_Stella"
+    assert info["reference_audio"] is None
+
+
+@pytest.mark.parametrize("name", ["US_Stella", "us_stella", "灵小柔"])
+async def test_ip_names_are_reserved_for_uploads_and_listed(store, model, name):
+    store.engine_client = SimpleNamespace()
+    store._diffusion_mode = False
+    store._get_tts_adapter()
+    sample = UploadFile(
+        io.BytesIO((model / "voice_presets/voice_audio/a.wav").read_bytes()),
+        filename="voice.wav",
+        headers=Headers({"content-type": "audio/wav"}),
+    )
+    try:
+        with pytest.raises(ValueError, match="reserved"):
+            await store.upload_voice(sample, "consent", name)
+    finally:
+        await sample.close()
+    assert not store.uploaded_speakers
+    assert name.lower() in store._get_available_voices()
+    assert store._adapter.capabilities.default_speaker == "灵小柔"
+
+
+async def test_restored_ip_collision_uses_shared_guard_without_deleting_audio(store, model):
+    sample = UploadFile(
+        io.BytesIO((model / "voice_presets/voice_audio/a.wav").read_bytes()),
+        filename="voice.wav",
+        headers=Headers({"content-type": "audio/wav"}),
+    )
+    try:
+        await store.upload_voice(sample, "consent", "US_Stella")
+    finally:
+        await sample.close()
+    saved = Path(store.uploaded_speakers["us_stella"]["file_path"])
+    original = saved.read_bytes()
+    await register_model_voice_presets(store, str(model))
+    store.engine_client = SimpleNamespace()
+    store._diffusion_mode = False
+    store._get_tts_adapter()
+    assert "us_stella" not in store.uploaded_speakers
+    assert "test_voice_a" in store.uploaded_speakers
+    assert saved.read_bytes() == original
+
+
+@pytest.mark.parametrize("selected", ["us_stella", {"id": "uS_StElLa"}])
+async def test_standalone_ip_matches_chat_even_with_legacy_collision(store, selected):
+    # A legacy entry must never replace the IP caption in just one endpoint.
+    store.uploaded_speakers["us_stella"] = {"name": "US_Stella"}
+    adapter = Ming3AudioTTSAdapter(SpeechServingContext(server=store))
+    request = OpenAICreateSpeechRequest(input="Hello", voice=selected)
+    assert adapter.validate(request) is None
+    assert request.voice == "US_Stella"
+    prepared = await adapter.build(request, [], False)
+    prompt: dict = {}
+    await chat_for(store)._attach_ming3_reference_audio(prompt, SimpleNamespace(audio={"voice": selected}))
+    chat_info = build_ming_talker_additional_info("Hello", prompt)
+    speech_info = prepared.prompt["additional_information"]
+    assert speech_info["instruction"] == chat_info["instruction"]
+    assert speech_info["prompt_audio_mode"] == chat_info["prompt_audio_mode"] == "none"
+    assert speech_info.get("reference_audio") is None
+
+
+async def test_reserved_model_voice_fails_before_any_registration(store, model):
+    entry = {"text": "reference", "audio": "voice_audio/a.wav"}
+    (model / "voice_presets/voice_prompts.json").write_text(json.dumps({"my_voice": entry, "US_Stella": entry}))
+    with pytest.raises(ValueError, match="reserved"):
+        await register_model_voice_presets(store, str(model))
+    assert not store.uploaded_speakers
+
+
+async def test_realtime_ip_voice_locked_after_audio(realtime):
+    await update(realtime, {"id": "US_Stella"})
+    realtime._audio_started = True
+    realtime._spoken_voice = realtime._voice_key(realtime._session)
+    await update(realtime, {"id": "us_stella"})
+    assert sent(realtime)[-1]["type"] == "session.updated"
+    await update(realtime, {"id": "灵小柔"})
+    assert sent(realtime)[-1]["type"] == "error"
+
+
+async def test_realtime_implicit_default_matches_explicit_voice_after_audio(realtime):
+    await realtime.handle_event({"type": "session.update", "session": {}})
+    assert sent(realtime)[-1]["type"] == "session.updated"
+    realtime._audio_started = True
+    realtime._spoken_voice = realtime._voice_key(realtime._session)
+    await update(realtime, {"id": "灵小柔"})
+    assert sent(realtime)[-1]["type"] == "session.updated"
+    await update(realtime, {"id": "US_Stella"})
+    assert sent(realtime)[-1]["type"] == "error"

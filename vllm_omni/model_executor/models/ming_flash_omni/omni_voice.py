@@ -7,24 +7,47 @@ import os
 from pathlib import Path
 from typing import Any
 
-from .prompt_utils import create_instruction, infer_omni_language
+from .prompt_utils import create_instruction
 
-_REFERENCE_DIR = Path(__file__).parent / "data"
-_DEFAULT_IP = {"Chinese": "灵小柔", "English": "US_Stella"}
+DEFAULT_IP_VOICE = "灵小柔"
+_DATA_DIR = Path(__file__).parent / "data"
+_IP_VOICES = {name.lower(): name for name in json.loads((_DATA_DIR / "ip_voices.json").read_text(encoding="utf-8"))}
+
+
+def ip_voice_names() -> tuple[str, ...]:
+    """Expose built-in captions, with the default first for serving metadata."""
+    return (DEFAULT_IP_VOICE, *(name for name in _IP_VOICES.values() if name != DEFAULT_IP_VOICE))
+
+
+def ip_voice_name(value: str) -> str | None:
+    """Return the model's canonical IP caption, preserving its case."""
+    return _IP_VOICES.get(value.strip().lower())
+
+
+def validate_voice_controls(controls: dict[str, Any]) -> None:
+    """Legacy IP controls are no longer a public voice selection interface."""
+    if controls.get("voice_mode") not in (None, "reference") or controls.get("ip_name") is not None:
+        raise ValueError('Use audio.output.voice: {"id": "voice name"}; voice_mode only supports reference')
 
 
 def resolve_omni_voice(text: str, controls: dict[str, Any]) -> dict[str, Any]:
-    mode = controls.get("voice_mode") or "reference"
-    if mode not in {"reference", "ip"}:
-        raise ValueError("voice_mode must be 'reference' or 'ip'")
-    if mode == "ip":
-        name = controls.get("ip_name") or _DEFAULT_IP[infer_omni_language(text)]
-        if not isinstance(name, str) or not name.strip():
-            raise ValueError("ip_name must be a nonempty string")
+    validate_voice_controls(controls)
+    selected = controls.get("voice_name")
+    name = ip_voice_name(selected) if isinstance(selected, str) else None
+    reference = {key: controls.get(key) for key in ("prompt_wav", "reference_audio", "prompt_text", "voice_name")}
+    has_reference = (
+        bool(reference["prompt_wav"])
+        or bool(reference["reference_audio"])
+        or bool(reference["voice_name"])
+        or controls.get("spk_emb") is not None
+    )
+    if name is None and not has_reference and controls.get("voice_mode") != "reference":
+        name = DEFAULT_IP_VOICE
+    if name is not None:
         # An IP supplies voice identity through the caption. References and
         # cached features from an earlier request must not affect that voice.
         return {
-            "voice_mode": mode,
+            "voice_mode": "ip",
             "ip_name": name,
             "instruction": create_instruction({"IP": name}),
             "speaker_conditioning": "mute",
@@ -43,20 +66,12 @@ def resolve_omni_voice(text: str, controls: dict[str, Any]) -> dict[str, Any]:
             ),
         }
 
-    reference = {key: controls.get(key) for key in ("prompt_wav", "reference_audio", "prompt_text", "voice_name")}
-    has_reference = (
-        bool(reference["prompt_wav"])
-        or bool(reference["reference_audio"])
-        or bool(reference["voice_name"])
-        or controls.get("spk_emb") is not None
-    )
     if not has_reference:
         override = os.getenv("MING_TTS_REFERENCE_WAV")
         if override:
             reference.update(prompt_wav=override, prompt_text=os.getenv("MING_TTS_REFERENCE_TEXT") or None)
         else:
-            manifest = json.loads((_REFERENCE_DIR / "default_reference.json").read_text())
-            reference.update(prompt_wav=str(_REFERENCE_DIR / manifest["filename"]), prompt_text=manifest["text"])
+            raise ValueError("reference voice_mode requires reference audio, a stored voice, or a speaker embedding")
     audio_mode = controls.get("prompt_audio_mode") or (
         "continuation" if reference["prompt_text"] or reference["voice_name"] else "speaker_only"
     )
@@ -64,7 +79,7 @@ def resolve_omni_voice(text: str, controls: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("reference voice_mode requires continuation or speaker_only prompt_audio_mode")
     return {
         **reference,
-        "voice_mode": mode,
+        "voice_mode": "reference",
         "ip_name": None,
         "instruction": None,
         "speaker_conditioning": "prompt",

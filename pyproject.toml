@@ -189,7 +189,7 @@ include = ["vllm_omni*"]
     "model_executor/models/step_audio2/assets/*.wav",
     "transformers_utils/chat_templates/*.jinja",
 ]
-"vllm_omni.model_executor.models.ming_flash_omni" = ["data/*.json", "data/*.wav", "LICENSE.Ming", "NOTICE"]
+"vllm_omni.model_executor.models.ming_flash_omni" = ["data/*.json", "LICENSE.Ming", "NOTICE"]
 "vllm_omni.model_executor.models.ming_flash_omni.talker_tn" = ["*.fst", "talker_re.json"]
 
 [tool.setuptools_scm]

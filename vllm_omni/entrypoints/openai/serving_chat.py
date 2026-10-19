@@ -294,26 +294,31 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         if not self._has_ming3_talker_stage():
             return
         info = self._ensure_prompt_additional_information(engine_prompt)
-        if info.get("voice_mode") != "ip":
-            # Chat uses audio.voice; Realtime's session.audio.output.voice is
-            # resolved into the same controls before the request reaches here.
-            audio = getattr(request, "audio", None)
-            selected = audio.get("voice") if isinstance(audio, dict) else getattr(audio, "voice", None)
-            selected = selected or info.get("voice_name") or info.get("voice")
-            if selected is not None:
-                if any(info.get(k) is not None for k in ("ref_audio", "reference_audio", "prompt_wav", "spk_emb")):
-                    raise ValueError("Choose either a stored voice or reference audio/speaker embedding")
-                from vllm_omni.entrypoints.openai.ming3_voices import resolve_stored_voice
+        from vllm_omni.model_executor.models.ming_flash_omni.omni_voice import (
+            ip_voice_name,
+            validate_voice_controls,
+        )
 
-                store = getattr(self, "_ming3_speech_service", None)
-                if store is None:
-                    raise ValueError("Ming3 voice storage is not initialized")
-                info.update(await resolve_stored_voice(store, selected))
+        validate_voice_controls(info)
+        audio = getattr(request, "audio", None)
+        selected = audio.get("voice") if isinstance(audio, dict) else getattr(audio, "voice", None)
+        selected = selected or info.get("voice_name") or info.get("voice")
+        if selected is not None:
+            if any(info.get(k) is not None for k in ("ref_audio", "reference_audio", "prompt_wav", "spk_emb")):
+                raise ValueError("Choose either a stored voice or reference audio/speaker embedding")
+            from vllm_omni.entrypoints.openai.ming3_voices import resolve_stored_voice, voice_id
+
+            name = ip_voice_name(voice_id(selected))
+            if name is not None:
+                info["voice_name"] = name
                 return
+            store = getattr(self, "_ming3_speech_service", None)
+            if store is None:
+                raise ValueError("Ming3 voice storage is not initialized")
+            info.update(await resolve_stored_voice(store, selected))
+            return
         if "ref_audio" not in info:
             return
-        if info.get("voice_mode") == "ip" or info.get("ip_name") or info.get("voice_name"):
-            raise ValueError("Choose either an IP voice or ref_audio for voice cloning")
         sources = info["ref_audio"]
         if isinstance(sources, str):
             sources = [sources]

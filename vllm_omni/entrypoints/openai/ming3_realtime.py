@@ -25,6 +25,11 @@ from vllm.entrypoints.serve.engine.protocol import ErrorResponse
 from vllm.entrypoints.speech_to_text.realtime.connection import RealtimeConnection
 
 from vllm_omni.entrypoints.openai.ming3_voices import resolve_stored_voice, voice_id
+from vllm_omni.model_executor.models.ming_flash_omni.omni_voice import (
+    DEFAULT_IP_VOICE,
+    ip_voice_name,
+    validate_voice_controls,
+)
 from vllm_omni.utils.audio_resample import StreamingAudioResampler
 
 if TYPE_CHECKING:
@@ -193,8 +198,6 @@ class Ming3RealtimeConnection(RealtimeConnection):
     @staticmethod
     def _voice_key(session):
         controls = session.get("additional_information") or {}
-        if controls.get("voice_mode") == "ip":
-            return ("ip", controls.get("ip_name"))
         selected = session["audio"]["output"].get("voice")
         if selected is None:
             selected = controls.get("voice_name", controls.get("voice"))
@@ -215,6 +218,8 @@ class Ming3RealtimeConnection(RealtimeConnection):
         if references:
             fingerprint = hashlib.sha256(json.dumps(references, sort_keys=True).encode()).hexdigest()
             return ("reference", voice_id(selected) if selected is not None else None, fingerprint)
+        if selected is None and controls.get("voice_mode") != "reference":
+            selected = DEFAULT_IP_VOICE
         return ("reference", voice_id(selected) if selected is not None else None)
 
     async def _validate_voice(self, session):
@@ -222,6 +227,7 @@ class Ming3RealtimeConnection(RealtimeConnection):
         selected = session["audio"]["output"].get("voice")
         if selected is None:
             selected = controls.get("voice_name", controls.get("voice"))
+        validate_voice_controls(controls)
         key = self._voice_key(session)
         if self._audio_started and key != self._spoken_voice:
             raise ValueError("Voice cannot be changed after the session has emitted audio")
@@ -234,12 +240,13 @@ class Ming3RealtimeConnection(RealtimeConnection):
         session["audio"]["output"]["format"] = self._pcm_format(session["audio"]["output"]["format"])
         if session.get("output_modalities") not in (["audio"], ["text"]):
             raise ValueError("output_modalities must be ['audio'] or ['text']")
-        if selected is not None and controls.get("voice_mode") != "ip":
+        if selected is not None:
             if any(controls.get(k) is not None for k in ("ref_audio", "reference_audio", "prompt_wav", "spk_emb")):
                 raise ValueError("Choose either a stored voice or reference audio/speaker embedding")
             selected = voice_id(selected)
             # Validate before acknowledging session.updated, including missing samples.
-            await resolve_stored_voice(self.serving._ming3_speech_service, selected)
+            if ip_voice_name(selected) is None:
+                await resolve_stored_voice(self.serving._ming3_speech_service, selected)
             session["audio"]["output"]["voice"] = selected
 
     async def _add_item(self, item):
@@ -319,7 +326,7 @@ class Ming3RealtimeConnection(RealtimeConnection):
                 raise ValueError("Send session.update before response.create")
             controls = dict(session.get("additional_information") or {})
             voice = session["audio"]["output"].get("voice")
-            if voice is not None and controls.get("voice_mode") != "ip":
+            if voice is not None:
                 controls["voice_name"] = voice_id(voice)
             if session.get("instructions"):
                 messages.insert(0, {"role": "system", "content": session["instructions"]})

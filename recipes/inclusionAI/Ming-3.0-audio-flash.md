@@ -265,7 +265,7 @@ base64 -w0 "$MING3_AUDIO_FILE" | jq -Rs '{
     }
   ],
   modalities: ["text", "audio"],
-  additional_information: {voice_mode: "ip", ip_name: "灵小柔"},
+  audio: {voice: {id: "灵小柔"}, format: "wav"},
   temperature: 0.6,
   max_tokens: 128
 }' | curl --fail-with-body http://localhost:8091/v1/chat/completions \
@@ -280,8 +280,8 @@ jq -r '.choices[0].message.audio.data' response.json \
 
 - The ASR prompt requests `language<TAB>transcription`, but raw Chat Completions output can contain a literal `\t` separator instead. Clients that need only the transcript should accept either separator when removing the leading language field.
 - Speech QA returns a direct answer rather than a transcript. It uses Chat Completions and is not passed through the ASR language-prefix postprocessor.
-- Ming3 IP voices use `additional_information: {"voice_mode": "ip", "ip_name": "灵小柔"}`. IP captions and Ming2 registered presets such as `DB30`/`lingguang` are different controls.
-- Ming3-audio accepts voice registration request following the OpenAI Realtime protocol. Choose either registered voice or IP controls. Omitting the controls retains the configured reference fallback.
+- Select Ming3 IP voices with Realtime `session.audio.output.voice: {"id": "灵小柔"}` (or Chat `audio.voice`). IDs in [the Ming3 IP voice list](../../vllm_omni/model_executor/models/ming_flash_omni/data/ip_voices.json) use IP captions without reference audio, before checking registered voices. Other IDs must be registered, including any model-provided `voice_presets`; unknown IDs fail.
+- Ming3 reference mode accepts per-request `ref_audio` (a URL, data URL, or base64 audio) and optional `prompt_text`. Choose either reference audio or a voice ID. Omitting voice selection and reference inputs uses the IP voice `灵小柔`, without reference audio. Explicit `voice_mode: "reference"` requires reference audio, a registered voice, or a speaker embedding; the legacy `MING_TTS_REFERENCE_WAV` / `MING_TTS_REFERENCE_TEXT` override applies only when reference mode is explicitly requested.
 - `normalize_text` controls linguistic text normalization. `scrub_markup` independently removes HTML, code fences and math markup before synthesis and defaults to `true`. Set both fields to `false` to disable markup scrubbing and linguistic normalization. Streaming segmentation and language-prefix handling still apply. Keep these controls fixed for the duration of a streaming request.
 - The talker emits mono 44.1 kHz audio.
 - Use Chat Completions for transcription; the `/v1/audio/transcriptions` endpoint is not currently available with `--omni`.
@@ -318,6 +318,7 @@ requests share a step. `max_num_seqs: 1` keeps the single-request path. In the
 speech-output pipeline the same applies to the Talker stage: set stage 1
 `max_num_seqs` above one to batch concurrent replies.
 
+Omitting `voice` and reference inputs defaults to the IP voice `灵小柔`.
 For voice cloning, pass `ref_audio` instead of `voice`, with optional `ref_text`.
 A registered `voice` name selects its stored reference audio and transcript.
 An unregistered string is interpreted as an IP caption by this standalone endpoint.
@@ -331,9 +332,8 @@ that Ming2 profile must select `ming3_audio_tts.yaml`.
 Checkpoints may provide `voice_presets/voice_prompts.json`, mapping each name
 to `{"audio": "voice_audio/example.wav", "text": "reference transcript"}`.
 Paths are relative to `voice_presets/`. These presets are imported into the
-existing Speech API voice store at startup. Names such as `DB30` and
-`lingguang` are available only when included in the selected checkpoint or
-registered by the user. Query the running server before choosing a voice:
+existing Speech API voice store at startup. A registered voice is available
+only when included in the selected checkpoint or registered by the user. Query the running server before choosing a voice:
 
 ```bash
 curl http://localhost:8091/v1/audio/voices
@@ -347,11 +347,20 @@ curl --fail-with-body http://localhost:8091/v1/audio/voices \
 
 Use the returned `id` in Chat Completions as
 `"audio": {"format": "wav", "voice": {"id": "my_voice"}}`, or as `voice` in
-`/v1/audio/speech`. Chat and Realtime require a registered name for this form;
-use the explicit IP controls documented above for an IP caption.
+`/v1/audio/speech`. Chat and Realtime match IDs against the Ming3 IP voice list first; all other
+IDs must be registered. Realtime accepts `session.audio.output.voice: {"id": "my_voice"}`.
 Do not combine a stored voice with per-request reference audio or a speaker
 embedding. Runtime uploads take precedence over model presets with the same
 name.
+
+IP names are reserved (case insensitive): uploads and checkpoint presets must
+use different names. `GET /v1/audio/voices` includes these built-in IDs.
+After an upgrade, restored uploads with reserved names are excluded from the
+voice registry with a warning; their files remain on disk. Re-register those
+samples under different names to select them through any speech endpoint.
+Checkpoint manifests containing reserved names fail validation before any
+preset is imported. Standalone TTS, Chat and Realtime all prefer the built-in
+IP and preserve its canonical caption, such as `US_Stella`.
 
 Set `SPEAKER_SAMPLES_DIR` to a writable directory to persist uploaded voices
 and imported presets across restarts. Voice registrations are loaded into each

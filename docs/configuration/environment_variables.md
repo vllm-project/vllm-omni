@@ -234,6 +234,8 @@ Ming's existing `MING_TTS_CONFIG_CACHE` belongs to the typed-configuration
 migration, while `MING_TTS_REFERENCE_WAV` and `MING_TTS_REFERENCE_TEXT` belong
 to request-scoped voice controls. Their classification preserves current
 compatibility behavior without promoting them to public process-wide options.
+The reference overrides apply only to explicitly requested reference mode;
+omitting Ming3 voice selection and reference inputs defaults to the IP voice `灵小柔`.
 
 The disposition is a migration target, not a statement that the existing
 environment switch is stable. Promote or request-scope work should land in

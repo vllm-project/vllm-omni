@@ -840,12 +840,12 @@ def test_ming2_rejects_new_reference_api():
 
 def test_ming3_tts_does_not_reinterpret_ip_voice_as_ming2_preset():
     adapter = Ming3AudioTTSAdapter(SpeechServingContext(server=SimpleNamespace(uploaded_speakers={})))
-    request = OpenAICreateSpeechRequest(input="hello", voice="DB30")
+    request = OpenAICreateSpeechRequest(input="hello", voice="TEST_VOICE_A")
     assert adapter.validate(request) is None
     prepared = asyncio.run(adapter.build(request, [], False))
     info = prepared.prompt["additional_information"]
     assert info["voice_name"] is None
-    assert json.loads(info["instruction"])["audio_sequence"][0]["IP"] == "DB30"
+    assert json.loads(info["instruction"])["audio_sequence"][0]["IP"] == "TEST_VOICE_A"
     assert info["speaker_conditioning"] == "mute"
     assert prepared.model_type == "ming3_audio_tts"
 
@@ -1369,3 +1369,16 @@ def test_registered_voice_salt_preserves_resolved_conditioning(key):
     first = conditioning_cache_salt(request, {key: "a"}, registered_voice=("speaker", 123))
     second = conditioning_cache_salt(request, {key: "b"}, registered_voice=("speaker", 123))
     assert first != second
+
+
+def test_ming3_tts_defaults_to_ip_voice_without_reference():
+    adapter = Ming3AudioTTSAdapter(SpeechServingContext(server=SimpleNamespace(uploaded_speakers={})))
+    request = OpenAICreateSpeechRequest(input="hello")
+    assert adapter.validate(request) is None
+    assert request.voice == "灵小柔"
+    prepared = asyncio.run(adapter.build(request, [], False))
+    info = prepared.prompt["additional_information"]
+    assert json.loads(info["instruction"])["audio_sequence"][0]["IP"] == "灵小柔"
+    assert info["prompt_audio_mode"] == "none"
+    assert info["speaker_conditioning"] == "mute"
+    assert "reference_audio" not in info

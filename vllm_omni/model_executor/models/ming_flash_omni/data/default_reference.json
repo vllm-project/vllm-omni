@@ -1,9 +1,0 @@
-{
-  "filename": "default_reference.wav",
-  "text": "在此奉劝大家别乱打美白针。",
-  "source_dataset": "Seed-TTS testset zh",
-  "source_file": "multimodal_data/zh/prompt-wavs/10002287-00000094.wav",
-  "source_case": "seed_original_zh/seed_original_zh_10002287-00000095",
-  "sha256": "778fa20747b858f7d5ea479e2ff9b9a24b5b9312979e203a498d9e3eed871967",
-  "temporary_default": true
-}

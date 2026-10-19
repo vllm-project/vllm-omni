@@ -58,12 +58,15 @@ async def register_model_voice_presets(
     if not isinstance(entries, dict):
         raise ValueError(f"Expected a voice-name mapping in {manifest}")
     from vllm_omni.entrypoints.openai.serving_speech import _validate_speaker_name
+    from vllm_omni.model_executor.models.ming_flash_omni.omni_voice import ip_voice_name
 
     pending = []
     names = set()
     for name, entry in entries.items():
         name = _validate_speaker_name(name)
         key = voice_id(name)
+        if ip_voice_name(key) is not None:
+            raise ValueError(f"Ming3 voice name {name!r} is reserved by an IP voice; choose a different name")
         if key in names:
             raise ValueError(f"Duplicate Ming3 voice name (case insensitive): {name}")
         names.add(key)
