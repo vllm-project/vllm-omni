@@ -321,6 +321,158 @@ def test_frame_sample_content_passes_frames(tmp_path, monkeypatch):
     assert score["content"]["frame_count"] == 2
 
 
+def _write_rtd_response(tmp_path):
+    response = tmp_path / "response.json"
+    response.write_text(json.dumps([{"sentence": "A person moves.", "start": 1, "end": 2}]), encoding="utf-8")
+    response.with_name("response.meta.json").write_text(json.dumps({"clock": "media"}), encoding="utf-8")
+    video = tmp_path / "video.mp4"
+    video.write_bytes(b"video")
+    return response, video
+
+
+def test_content_prompt_falls_back_to_frame_sample_on_judge_context_overflow(tmp_path, monkeypatch):
+    # #9089: in video_url mode a long clip can exceed the judge model's context
+    # window and the judge answers HTTP 400. The content call must degrade to
+    # the bounded frame-sample path (and record the fallback) instead of failing
+    # the whole evaluation run.
+    import requests
+
+    monkeypatch.setattr(eval_module, "extract_jpeg", lambda *args, **kwargs: b"\xff\xd8jpeg")
+    response, video = _write_rtd_response(tmp_path)
+
+    modes = []
+
+    class Judge:
+        def temporal(self, *args, **kwargs):
+            return '{"temporal_score": 3, "is_relevant": 1}'
+
+        def content(self, prompt, video, frames=None, *, mode="video_url"):
+            modes.append(mode)
+            if mode == "video_url":
+                raise requests.HTTPError(
+                    '400 response from judge: {"error":{"message":"Input length (83158) exceeds '
+                    "model's maximum context length (65536).\"}}",
+                    response=SimpleNamespace(status_code=400, text="Input length (83158) exceeds context length"),
+                )
+            assert frames == [b"\xff\xd8jpeg", b"\xff\xd8jpeg"]
+            return '{"content_score": 3}'
+
+    sample = DuplexSample(
+        id="rtd",
+        split="RTD_counting",
+        family="rtd",
+        task_type=None,
+        video=video,
+        video_duration=4,
+    )
+    score = eval_module.evaluate_sample(
+        sample,
+        response,
+        tmp_path / "score.json",
+        Judge(),
+        judge_video_mode="video_url",
+    )
+    assert modes == ["video_url", "frame-sample"]
+    assert score["content"]["judge_input_fallback"] == "frame-sample"
+    assert score["content"]["frame_count"] == 2
+    assert score["content"]["content_score"] == 3
+
+
+def test_judge_context_length_error_detection():
+    import requests
+
+    def error(status_code, text):
+        return requests.HTTPError("judge error", response=SimpleNamespace(status_code=status_code, text=text))
+
+    # vLLM's exact wording from the CI run.
+    assert eval_module._is_judge_context_length_error(
+        error(400, "Input length (83158) exceeds model's maximum context length (65536).")
+    )
+    assert eval_module._is_judge_context_length_error(error(400, "Input length exceeds the limit"))
+    # Unrelated 400s and non-HTTP errors must not trigger the fallback.
+    assert not eval_module._is_judge_context_length_error(error(400, "input length must be positive"))
+    assert not eval_module._is_judge_context_length_error(error(500, "maximum context length"))
+    assert not eval_module._is_judge_context_length_error(RuntimeError("maximum context length"))
+
+
+def test_content_prompt_context_overflow_without_decodable_frames_reraises(tmp_path, monkeypatch):
+    # If no frame can be decoded there is nothing to fall back to; the original
+    # judge error must surface so the sample stays failed.
+    import requests
+
+    def no_frames(*args, **kwargs):
+        raise OSError("undecodable clip")
+
+    monkeypatch.setattr(eval_module, "extract_jpeg", no_frames)
+    response, video = _write_rtd_response(tmp_path)
+    calls = []
+
+    class Judge:
+        def temporal(self, *args, **kwargs):
+            return '{"temporal_score": 3, "is_relevant": 1}'
+
+        def content(self, prompt, video, frames=None, *, mode="video_url"):
+            calls.append(mode)
+            raise requests.HTTPError(
+                "400 response from judge",
+                response=SimpleNamespace(status_code=400, text="Input length exceeds the maximum context length"),
+            )
+
+    sample = DuplexSample(
+        id="rtd",
+        split="RTD_counting",
+        family="rtd",
+        task_type=None,
+        video=video,
+        video_duration=4,
+    )
+    with pytest.raises(requests.HTTPError):
+        eval_module.evaluate_sample(
+            sample,
+            response,
+            tmp_path / "score.json",
+            Judge(),
+            judge_video_mode="video_url",
+        )
+    assert calls == ["video_url"]
+
+
+def test_content_prompt_judge_errors_other_than_context_overflow_propagate(tmp_path, monkeypatch):
+    # A 400 that is not a context-length overflow (or any other HTTP error)
+    # must keep failing the sample so the run stays "partial" and CI stays loud.
+    import requests
+
+    monkeypatch.setattr(eval_module, "extract_jpeg", lambda *args, **kwargs: b"\xff\xd8jpeg")
+    response, video = _write_rtd_response(tmp_path)
+
+    class Judge:
+        def temporal(self, *args, **kwargs):
+            return '{"temporal_score": 3, "is_relevant": 1}'
+
+        def content(self, prompt, video, frames=None, *, mode="video_url"):
+            raise requests.HTTPError(
+                "400 response from judge: bad request",
+                response=SimpleNamespace(status_code=400, text="invalid request body"),
+            )
+
+    sample = DuplexSample(
+        id="rtd",
+        split="RTD_counting",
+        family="rtd",
+        task_type=None,
+        video=video,
+        video_duration=4,
+    )
+    with pytest.raises(requests.HTTPError):
+        eval_module.evaluate_sample(
+            sample,
+            response,
+            tmp_path / "score.json",
+            Judge(),
+            judge_video_mode="video_url",
+        )
+
+
 def test_local_directory_collapsed_train_with_row_identity_and_split_filter(tmp_path):
     # Reviewer-pointed gap: a collapsed local mirror (data/train-*.parquet)
     # whose rows carry their own split identity must correctly filter by

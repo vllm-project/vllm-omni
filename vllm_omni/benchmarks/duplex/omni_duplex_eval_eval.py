@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +25,8 @@ from .omni_duplex_eval_metrics import (
     summarize_temporal_results,
     temporal_window,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def _read(path: Path) -> Any:
@@ -105,14 +108,32 @@ def evaluate_sample(
         content_frames = None
         if judge_video_mode == "frame-sample":
             content_frames = _extract_frames(video_path, _content_frame_times(duration))
-        content = parse_judge_json(
-            judge.content(
-                build_content_prompt(_text(items), sample.question_text, [sample.answer1, sample.answer2]),
-                video_path,
-                frames=content_frames,
-                mode=judge_video_mode,
+        content_prompt = build_content_prompt(_text(items), sample.question_text, [sample.answer1, sample.answer2])
+        try:
+            content = parse_judge_json(
+                judge.content(content_prompt, video_path, frames=content_frames, mode=judge_video_mode)
             )
-        )
+        except Exception as exc:
+            # A long clip can overflow the judge model's context window when the
+            # whole video is passed through (video_url mode): the judge answers
+            # HTTP 400 "Input length (83158) exceeds model's maximum context
+            # length (65536)" (#9089).  Degrade that single content call to the
+            # bounded frame-sample path instead of failing the whole run.
+            if judge_video_mode != "video_url" or not _is_judge_context_length_error(exc):
+                raise
+            logger.warning(
+                "Judge rejected the full video for %s (context length exceeded); "
+                "retrying the content prompt in frame-sample mode",
+                sample.id,
+            )
+            content_frames = _extract_frames(video_path, _content_frame_times(duration))
+            if not content_frames:
+                # Nothing to fall back to: keep the original judge error.
+                raise
+            content = parse_judge_json(
+                judge.content(content_prompt, video_path, frames=content_frames, mode="frame-sample")
+            )
+            content["judge_input_fallback"] = "frame-sample"
         if content_frames is not None:
             content["frame_count"] = len(content_frames)
         result.update(
@@ -159,6 +180,23 @@ def _times(start: float, end: float, *, fps: int) -> list[float]:
     return (
         [start + (end - start) / 2] if count == 1 else [start + i * (end - start) / (count - 1) for i in range(count)]
     )
+
+
+def _is_judge_context_length_error(exc: BaseException) -> bool:
+    """True when the judge rejected the request because its input was too long.
+
+    The judge client raises ``requests.HTTPError`` with the HTTP response
+    attached, e.g. HTTP 400
+    ``Input length (83158) exceeds model's maximum context length (65536)``.
+    """
+    response = getattr(exc, "response", None)
+    if getattr(response, "status_code", None) != 400:
+        return False
+    text = str(getattr(response, "text", "") or "").lower()
+    if "context length" in text:
+        return True
+    # Other OpenAI-compatible judges phrase the same rejection differently.
+    return "input length" in text and "exceed" in text
 
 
 def _extract_frames(path: str | Path, timestamps: list[float]) -> list[bytes]:
