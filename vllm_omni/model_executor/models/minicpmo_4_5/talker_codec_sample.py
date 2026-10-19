@@ -24,12 +24,62 @@ no-op at its default value.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 
 import torch
 
 VOCAB_SIZE = 6562
 HISTORY_WINDOW = 16
+
+# TALKER_CODEC_FUSED_PRELUDE=1 (default, adopted 2026-10-17 after a 200-case
+# bit-exact verification on NPU) routes engine steps 6a+7b through one Triton
+# kernel; =0 falls back to the eager chain.
+_FUSED_PRELUDE_ENV = os.environ.get("TALKER_CODEC_FUSED_PRELUDE", "1") == "1"
+_PRELUDE_BLOCK = 1024
+
+try:  # Triton is NPU-only; other backends keep the eager prologue.
+    import triton
+    import triton.language as tl
+
+    @triton.jit
+    def _rep_pen_temp_kernel(
+        x_ptr,
+        hist_ptr,
+        hlen_ptr,
+        pen_ptr,
+        temp_ptr,
+        out_ptr,
+        vocab_size: tl.constexpr,
+        hist_len: tl.constexpr,
+        block_size: tl.constexpr,
+    ):
+        """One pass over the vocab: history-count rep penalty, then /temp.
+
+        Bit-for-bit twin of the eager pair `_repetition_penalty_scaling`
+        plus `logits / temperature`: integer counts, the same exp2/log2 pow
+        form the eager torch.pow compiles to, and the same op order
+        (sign-dependent penalty first, temperature division last).
+        """
+        pid = tl.program_id(0)
+        offs = pid * block_size + tl.arange(0, block_size)
+        mask = offs < vocab_size
+        pen = tl.load(pen_ptr)
+        temp = tl.load(temp_ptr)
+        hlen = tl.load(hlen_ptr)
+        count = tl.zeros([block_size], dtype=tl.int32)
+        for h in tl.static_range(hist_len):
+            tok = tl.load(hist_ptr + h).to(tl.int32)
+            count += tl.where((offs == tok) & (h < hlen), 1, 0)
+        x = tl.load(x_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+        alpha = tl.exp2(tl.log2(pen) * count.to(tl.float32))
+        x = tl.where(x < 0, x * alpha, x / alpha)
+        x = x / temp
+        tl.store(out_ptr + offs, x, mask=mask)
+
+    _HAS_TRITON = True
+except Exception:  # pragma: no cover - triton missing/CPU
+    _HAS_TRITON = False
 
 
 @dataclass(frozen=True)
@@ -205,6 +255,34 @@ def _apply_stream_penalties(
     return logits
 
 
+def _rep_pen_temp_fused(
+    logits: torch.Tensor,
+    state: TalkerCodecDeviceState,
+    repetition_penalty: torch.Tensor,
+    temperature: torch.Tensor,
+) -> torch.Tensor | None:
+    """Fused rep-penalty + temperature prologue on NPU; None if unsupported."""
+    if not _HAS_TRITON or logits.device.type != "npu":
+        return None
+    vocab = logits.shape[-1]
+    flat = logits.reshape(1, vocab)
+    out = torch.empty_like(flat)
+    grid = (triton.cdiv(vocab, _PRELUDE_BLOCK),)
+    _rep_pen_temp_kernel[grid](
+        flat,
+        state.history,
+        state.history_len,
+        repetition_penalty.reshape(1, 1),
+        temperature.reshape(1, 1),
+        out,
+        vocab_size=vocab,
+        hist_len=HISTORY_WINDOW,
+        block_size=_PRELUDE_BLOCK,
+        num_warps=4,
+    )
+    return out.reshape(logits.shape)
+
+
 def prepare_codec_logits(
     raw_logits: torch.Tensor,
     state: TalkerCodecDeviceState,
@@ -239,13 +317,25 @@ def prepare_codec_logits(
         stop_ids=stop_ids,
         eos_window_masked=eos_window_masked,
     )
-    # Engine step 6a: repetition penalty over the codec history window.
-    logits = _repetition_penalty_scaling(logits, state, repetition_penalty)
-    # Engine steps 6b/6c: frequency and presence penalties over the whole stream.
-    logits = _apply_stream_penalties(logits, state, frequency_penalty, presence_penalty)
-    # Engine step 7b: temperature is applied after the penalties. The division
-    # also gives the in-place masks below a tensor of their own.
-    logits = logits / temperature.reshape(1, 1)
+    # Engine step 6a + 7b: repetition penalty then temperature. On NPU the
+    # pair runs as one fused Triton kernel when the whole-stream penalties
+    # are no-ops (they sit between the two in the eager order, so non-zero
+    # penalty requests fall back to the eager chain below).
+    fused = (
+        _rep_pen_temp_fused(logits, state, repetition_penalty, temperature)
+        if (_FUSED_PRELUDE_ENV and not frequency_penalty and not presence_penalty)
+        else None
+    )
+    if fused is not None:
+        logits = fused
+    else:
+        # Engine step 6a: repetition penalty over the codec history window.
+        logits = _repetition_penalty_scaling(logits, state, repetition_penalty)
+        # Engine steps 6b/6c: frequency and presence penalties over the whole stream.
+        logits = _apply_stream_penalties(logits, state, frequency_penalty, presence_penalty)
+        # Engine step 7b: temperature is applied after the penalties. The division
+        # also gives the in-place masks below a tensor of their own.
+        logits = logits / temperature.reshape(1, 1)
     # Engine step 7c: min_p. The engine runs it as an argmax-invariant
     # processor, i.e. after temperature and before top-k/top-p, and the greedy
     # branch never sees it -- which is why greedy_codec_sample has no min_p.

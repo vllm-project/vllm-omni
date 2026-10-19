@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import base64
 import logging
+import os
 import random
 from dataclasses import dataclass
 from pathlib import Path
@@ -222,6 +223,8 @@ class SeedTTSDataset(BenchmarkDataset):
         self.locale = locale
         self.inline_ref_audio = inline_ref_audio
         self._explicit_root = seed_tts_root
+        if os.environ.get("VLLM_SEED_TTS_DISABLE_SHUFFLE", "") == "1":
+            disable_shuffle = True
         sp = (system_prompt or "").strip()
         self._system_prompt = sp if sp else SEED_TTS_DEFAULT_OMNI_SYSTEM_PROMPT
         super().__init__(
