@@ -50,6 +50,7 @@ from vllm_omni.diffusion.layers.fused_qk_norm_rope import (
     _fused_cuda_supported,
     fused_joint_qkv_norm_rope,
     fused_qk_norm_rope,
+    fused_qk_norm_rope_min_tokens,
     pack_qk_norm_rope_table,
 )
 from vllm_omni.diffusion.layers.qwen_select01_modulation import (
@@ -62,8 +63,15 @@ from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 
 logger = init_logger(__name__)
 
-# Fuse only when B*S >= this; below it host launch overhead dominates (#7780).
+# Default token gate: fuse only when B*S >= this; below it host launch overhead
+# dominates (#7780). VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS overrides it for both
+# the joint and the per-stream path (0 = always fuse; a very large value disables
+# fusion), read at forward time.
 _FUSED_MIN_TOKENS = 2048
+
+
+def _fused_min_tokens() -> int:
+    return fused_qk_norm_rope_min_tokens(_FUSED_MIN_TOKENS)
 
 
 def _packed_qk_norm_rope_table(
@@ -74,11 +82,13 @@ def _packed_qk_norm_rope_table(
 ) -> torch.Tensor | None:
     """Pack text/image frequencies into a text-first ``[B*S, D]`` FP32 table.
 
-    Same coefficients and token gate as the per-stream fusion. ``None`` when
-    the CUDA kernel would not run or the joint sequence is below the gate.
+    Same coefficients and token gate as the per-stream fusion, including the
+    ``VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS`` override. ``None`` when the CUDA
+    kernel would not run or the joint sequence ``B*(S_txt+S_img)`` is below the
+    gate.
     """
     freqs = torch.cat((txt_freqs, vid_freqs), dim=0)
-    if batch_size * freqs.shape[0] < _FUSED_MIN_TOKENS:
+    if batch_size * freqs.shape[0] < _fused_min_tokens():
         return None
     return pack_qk_norm_rope_table(
         freqs.real, freqs.imag, batch_size, dtype=torch.float32, activation_dtype=activation_dtype
@@ -102,7 +112,7 @@ def _qwen_image_qk_norm_rope(
     tokens = batch * seq_len
     if (
         use_fused
-        and tokens >= _FUSED_MIN_TOKENS
+        and tokens >= _fused_min_tokens()
         and _fused_cuda_supported(q, k, head_dim, rotary_dim, interleaved=True)
     ):
         num_kv_heads = k.shape[2]
