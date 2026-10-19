@@ -32,10 +32,10 @@ import torch
 VOCAB_SIZE = 6562
 HISTORY_WINDOW = 16
 
-# TALKER_CODEC_FUSED_PRELUDE=1 (default, adopted 2026-10-17 after a 200-case
+# MINICPMO_TALKER_CODEC_FUSED_PRELUDE=1 (default, adopted 2026-10-17 after a 200-case
 # bit-exact verification on NPU) routes engine steps 6a+7b through one Triton
 # kernel; =0 falls back to the eager chain.
-_FUSED_PRELUDE_ENV = os.environ.get("TALKER_CODEC_FUSED_PRELUDE", "1") == "1"
+_FUSED_PRELUDE_ENV = os.environ.get("MINICPMO_TALKER_CODEC_FUSED_PRELUDE", "1") == "1"
 _PRELUDE_BLOCK = 1024
 
 try:  # Triton is NPU-only; other backends keep the eager prologue.

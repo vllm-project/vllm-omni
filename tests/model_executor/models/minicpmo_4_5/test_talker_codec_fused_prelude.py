@@ -3,7 +3,7 @@
 """Bit-exactness tests for the fused rep-penalty/temperature prelude.
 
 The fused Triton kernel is the default stage-1 codec sampling prologue on NPU
-(``TALKER_CODEC_FUSED_PRELUDE=1``). These tests compare it against the eager
+(``MINICPMO_TALKER_CODEC_FUSED_PRELUDE=1``). These tests compare it against the eager
 chain it replaces (``_repetition_penalty_scaling`` + ``logits / temperature``)
 through the public ``prepare_codec_logits`` entry point with the fused switch
 forced on and off, and additionally capture and replay the fused path under an
