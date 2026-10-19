@@ -22,7 +22,7 @@ import time
 import warnings
 from collections.abc import Callable, Collection, Generator, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass, fields, replace
+from dataclasses import dataclass, fields, is_dataclass, replace
 from pathlib import Path
 from typing import Any, Literal, cast
 
@@ -1189,8 +1189,15 @@ def _project_omni_stage_engine_args(
         ):
             engine_args.update(_project_upstream_config_fields(config, field_map))
 
-    for name in ("compilation_config", "profiler_config"):
-        value = getattr(stage_config, name)
+    # Same category as the two above: vLLM config objects copied verbatim from
+    # the stage config into the engine args. Only compilation_config and
+    # profiler_config used to be copied, so a speculative_config in the deploy
+    # config (stage-0 n-gram, or the stage-1 one injected by stage_config.py)
+    # silently disappeared here (no error) and showed up engine-side as
+    # speculative_config=None. getattr(..., None) guards stage config types
+    # that lack the field.
+    for name in ("compilation_config", "profiler_config", "speculative_config"):
+        value = getattr(stage_config, name, None)
         if value is not None:
             engine_args[name] = copy.deepcopy(value)
 
@@ -1389,7 +1396,16 @@ def build_legacy_engine_args_dict(
     cli_tokenizer: str | None = None,
 ) -> dict[str, Any]:
     """Implement engine-argument building for the legacy stage representation."""
-    engine_args_dict = copy.deepcopy(_to_dict(stage_config.engine_args))
+    source_args = stage_config.engine_args
+    if is_dataclass(source_args) and not isinstance(source_args, type):
+        # Keep prebuilt upstream config objects typed. Flattening them with
+        # asdict makes a default FaultToleranceConfig look like an explicit
+        # JSON override, which EngineArgs interprets as opting into FT.
+        engine_args_dict = {
+            field.name: copy.deepcopy(getattr(source_args, field.name)) for field in fields(source_args)
+        }
+    else:
+        engine_args_dict = copy.deepcopy(_to_dict(source_args))
     # Legacy configs can materialize an omitted optional TP size as None.
     # Remove it from the detached adapter dict so the backend default applies
     # without mutating stage_config.engine_args.

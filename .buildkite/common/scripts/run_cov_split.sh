@@ -20,7 +20,7 @@
 # just that half. Total runtime is bounded by the step's timeout_in_minutes.
 #
 # Coverage + artifact upload run only on scheduled weekly E2E sweeps
-# (WEEKLY=1 on main or an X.Y.Z branch — same gate as bootstrap --e2e).
+# (WEEKLY=1 on a release-line push: main, or non-PR release/vX.Y.Z — same gate as bootstrap --e2e).
 # All other invocations (PR merge-test, regular release-line merge, local) run the
 # same combined pytest as the job used before coverage was added.
 #
@@ -57,7 +57,7 @@ if ((${#OFFLINE[@]} == 0 && ${#ONLINE[@]} == 0)); then
 fi
 
 _should_run_coverage() {
-    [[ "${WEEKLY:-}" == "1" ]] && is_release_line_branch
+    [[ "${WEEKLY:-}" == "1" ]] && is_release_line_push
 }
 
 if ! _should_run_coverage; then

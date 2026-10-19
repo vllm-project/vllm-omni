@@ -38,7 +38,9 @@ def test_generate_excel_report_with_perf_templates(tmp_path: Path):
     diffusion_template_path = perf_scripts_dir / "diffusion_result_template.json"
 
     omni_record = json.loads(omni_template_path.read_text(encoding="utf-8"))
+    omni_record["branch"] = "release/v0.30.0"
     diffusion_records = json.loads(diffusion_template_path.read_text(encoding="utf-8"))
+    diffusion_records[0]["branch"] = "release/v0.30.0"
     diffusion_records[0]["endpoint"] = "/v1/videos"
     diffusion_records[0]["result"]["endpoint"] = "/v1/videos"
 
@@ -61,7 +63,6 @@ def test_generate_excel_report_with_perf_templates(tmp_path: Path):
         commit_sha="test_commit_sha",
         build_id="test_build_id",
         build_url="https://example.com/build/123",
-        branch="0.30.0",
     )
 
     assert output_file.exists()
@@ -74,7 +75,10 @@ def test_generate_excel_report_with_perf_templates(tmp_path: Path):
     assert baseline_cell == json.dumps(omni_record["baseline"], ensure_ascii=False, sort_keys=True)
 
     ws_omni_summary = wb["omni_summary"]
-    assert _cell_value_by_header(ws_omni_summary, "branch") == "0.30.0"
+    assert "branch" not in [c.value for c in ws_omni_summary[1]]
+    assert "branch" not in [c.value for c in ws_omni_raw[1]]
+    assert "branch" not in [c.value for c in wb["diffusion_summary"][1]]
+    assert "branch" not in [c.value for c in wb["diffusion_raw"][1]]
     assert _cell_value_by_header(ws_omni_summary, "commit_sha") == "test_commit_sha"
     assert _cell_value_by_header(ws_omni_summary, "build_id") == "test_build_id"
 

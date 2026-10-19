@@ -29,6 +29,7 @@ from vllm_omni.engine.duplex.plugin import (
     payload_turn_id,
     reject_changed_runtime_value,
     validate_duplex_plugin_sampling,
+    validate_duplex_replica_policy,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -145,6 +146,11 @@ def test_load_duplex_plugin_instantiates_the_class_at_the_dotted_path() -> None:
     assert plugin.private_runtime_config_keys == frozenset()
     assert plugin.silence_continuation_samples == 16000
     assert plugin.runtime_config_for_function_output(DuplexSessionConfig(), {}, {"name": "tool"}) is None
+    assert plugin.note_published_function_call({}, call_id="call_1", history_len=1) is None
+    assert plugin.has_pending_tool_followup({}) is False
+    assert plugin.extra_prompt_config({}) == {}
+    assert plugin.runtime_patch_for_submitted_prompt({}) is None
+    assert plugin.runtime_config_after_response({}, committed=False) is None
 
 
 def test_load_duplex_plugin_rejects_a_non_plugin_class() -> None:
@@ -228,6 +234,44 @@ def test_validate_duplex_plugin_sampling_rejects_non_tuple_results() -> None:
 
     with pytest.raises(TypeError, match="as a tuple"):
         validate_duplex_plugin_sampling(ListSamplingPlugin(_encode_audio), sampling_defaults=(SamplingParams(),))
+
+
+# --------------------------------------------------------------------------- #
+# validate_duplex_replica_policy                                               #
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize(
+    ("policy", "cap", "distributed", "sharing", "error"),
+    [
+        ("legacy", None, True, False, None),
+        ("legacy", 2, False, False, None),
+        ("least_sessions", 1, False, False, None),
+        ("least_sessions", 2, False, True, None),
+        ("least_sessions", 2, False, False, "set max_sessions_per_replica to 1"),
+        ("least_sessions", 1, True, False, "does not support distributed hub/LB mode"),
+        ("least_sessions", 2, True, False, "does not support distributed hub/LB mode"),
+    ],
+)
+def test_validate_duplex_replica_policy(policy, cap, distributed, sharing, error) -> None:
+    capability_calls: list[int] = []
+
+    class CapabilityPlugin(FakePlugin):
+        def capabilities(self, *, max_sessions: int) -> DuplexCapabilities:
+            capability_calls.append(max_sessions)
+            return DuplexCapabilities(supports_multi_session_same_replica=sharing)
+
+    plugin = CapabilityPlugin(_encode_audio)
+    config = DuplexSessionRuntimeConfig(max_sessions=11, replica_policy=policy, max_sessions_per_replica=cap)
+    if error is not None:
+        with pytest.raises(ValueError, match=error):
+            validate_duplex_replica_policy(plugin, config, distributed=distributed)
+    else:
+        validate_duplex_replica_policy(plugin, config, distributed=distributed)
+    # Distributed rejection precedes plugin access. Legacy and one-session
+    # replicas do not need a capability that permits sharing.
+    expected = [cap] if policy == "least_sessions" and not distributed and cap > 1 else []
+    assert capability_calls == expected
 
 
 # --------------------------------------------------------------------------- #

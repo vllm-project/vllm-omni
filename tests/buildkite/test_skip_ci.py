@@ -10,7 +10,12 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / ".buildkite" / "common" / "scripts"))
 
-from ci_conditions import RELEASE_LINE_VERSION_PATTERN, is_release_line_branch  # noqa: E402
+from ci_conditions import (  # noqa: E402
+    MERGE_MAIN_IF,
+    RELEASE_LINE_VERSION_PATTERN,
+    is_release_line_branch,
+    is_release_line_push,
+)
 from skip_ci import (  # noqa: E402
     CiDecision,
     _diff_only_contains_skip_mark_changes,
@@ -393,11 +398,12 @@ def test_yaml_gated_message_lists_changed_and_targets() -> None:
     ("branch", "expected"),
     [
         ("main", True),
-        ("0.30.0", True),
-        ("10.2.3", True),
+        ("release/v0.30.0", True),
+        ("release/v10.2.3", True),
+        ("0.30.0", False),
         ("v0.30.0", False),
-        ("0.30", False),
-        ("0.30.0-rc1", False),
+        ("release/v0.30", False),
+        ("release/v0.30.0-rc1", False),
         ("release/0.30.0", False),
         ("feature", False),
         ("", False),
@@ -405,6 +411,17 @@ def test_yaml_gated_message_lists_changed_and_targets() -> None:
 )
 def test_is_release_line_branch(branch: str, expected: bool) -> None:
     assert is_release_line_branch(branch) is expected
+
+
+def test_version_branch_push_requires_a_non_pr_build() -> None:
+    assert is_release_line_push("main", "99")
+    assert is_release_line_push("main", "false")
+    assert is_release_line_push("release/v0.30.0", "false")
+    assert is_release_line_push("release/v0.30.0", "")
+    assert not is_release_line_push("release/v0.30.0", "99")
+    assert not is_release_line_push("feature", "false")
+    assert "build.pull_request.id == null" in MERGE_MAIN_IF
+    assert MERGE_MAIN_IF.startswith('(build.branch == "main" || (build.branch =~ %r{')
 
 
 def test_release_line_version_pattern_is_shared() -> None:
@@ -435,7 +452,7 @@ def test_release_line_version_pattern_is_shared() -> None:
 
 def test_version_branch_diff_uses_parent_commit(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("BUILDKITE_PULL_REQUEST", "false")
-    monkeypatch.setenv("BUILDKITE_BRANCH", "0.30.0")
+    monkeypatch.setenv("BUILDKITE_BRANCH", "release/v0.30.0")
     monkeypatch.setenv("BUILDKITE_COMMIT", "abc123")
 
     class _GitResult:
@@ -444,6 +461,20 @@ def test_version_branch_diff_uses_parent_commit(monkeypatch: pytest.MonkeyPatch)
 
     monkeypatch.setattr("skip_ci._git", lambda *_args: _GitResult())
     assert _resolve_diff_range() == "abc123^..abc123"
+
+
+def test_version_branch_pull_request_uses_pr_range(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("BUILDKITE_PULL_REQUEST", "99")
+    monkeypatch.setenv("BUILDKITE_BRANCH", "release/v0.30.0")
+    monkeypatch.setenv("BUILDKITE_COMMIT", "abc123")
+    monkeypatch.setenv("BUILDKITE_PULL_REQUEST_BASE_BRANCH", "main")
+
+    class _GitResult:
+        returncode = 0
+        stdout = ""
+
+    monkeypatch.setattr("skip_ci._git", lambda *_args: _GitResult())
+    assert _resolve_diff_range() == "origin/main...abc123"
 
 
 def test_feature_branch_diff_is_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:

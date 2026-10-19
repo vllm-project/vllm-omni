@@ -215,7 +215,7 @@ collection, examples, bug reports, or logs.
 
 ## Model-specific variables
 
-The inventory includes 93 variables read by a single model or pipeline family. They are
+The inventory includes 96 variables read by a single model or pipeline family. They are
 not listed as public usage options here because doing so would turn implementation
 escape hatches into an accidental compatibility contract.
 
@@ -224,10 +224,10 @@ Every audited model-specific name has a migration disposition in the
 
 | Disposition | Count | Required outcome |
 | --- | ---: | --- |
-| Promote | 64 | Move a stable setting into typed stage or model configuration. |
+| Promote | 68 | Move a stable setting into typed stage or model configuration. |
 | Request scope | 5 | Move request-varying behavior into a declared request-option schema. |
 | External | 0 | Retain only when a supported third-party library owns the contract. |
-| Internalize | 17 | Keep a debug or diagnostic switch out of public documentation and configuration. |
+| Internalize | 16 | Keep a debug or diagnostic switch out of public documentation and configuration. |
 | Deprecate/remove | 7 | Remove a compatibility escape hatch that has no continuing contract. |
 
 The disposition is a migration target, not a statement that the existing

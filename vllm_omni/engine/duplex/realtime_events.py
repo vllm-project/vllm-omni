@@ -123,7 +123,6 @@ class _ResponseProjection:
     output_item_done: bool = False
     conversation_item_done: bool = False
     speak_emitted: bool = False
-    done_emitted: bool = False
 
     @property
     def transcript(self) -> str:
@@ -146,7 +145,8 @@ class RealtimeProjectionState:
     #: The first ``session.created`` also emits ``session.updated`` (client sent session.update to open).
     initial_session_update: bool = False
     # ---- response / item projection ----
-    response_states: dict[str | int, _ResponseProjection] = field(default_factory=dict)
+    # Only responses between response.created and their terminal retain buffers.
+    response_states: dict[str, _ResponseProjection] = field(default_factory=dict)
     item_truncation_cursors: dict[str, tuple[int, int]] = field(default_factory=dict)
     active_response_id: str | None = None
     last_response_id: str | None = None
@@ -197,8 +197,7 @@ def _response_state(
     state: RealtimeProjectionState,
     response_id: object,
     *,
-    event: Mapping[str, object] | None = None,
-    create: bool = True,
+    create: bool = False,
 ) -> _ResponseProjection | None:
     if not (isinstance(response_id, str) and response_id):
         # An event without a response id has no projection to attach to; a
@@ -214,9 +213,10 @@ def _response_state(
     return projection
 
 
-def response_is_done(state: RealtimeProjectionState, response_id: object) -> bool:
-    projection = _response_state(state, response_id, create=False)
-    return projection is not None and projection.done_emitted
+def response_is_inactive(state: RealtimeProjectionState, response_id: object) -> bool:
+    # Missing ids are deliberately inactive too: late events must not recreate
+    # retired buffers, even after their conversation item has been deleted.
+    return isinstance(response_id, str) and bool(response_id) and response_id not in state.response_states
 
 
 def _response_item_id(state: RealtimeProjectionState, response_id: object) -> str:
@@ -540,7 +540,7 @@ def _realtime_audio_done_events(
     state: RealtimeProjectionState, event: Mapping[str, object], response_id: object
 ) -> list[DuplexEvent]:
     item_id = _response_item_id(state, response_id)
-    projection = _response_state(state, response_id, event=event)
+    projection = _response_state(state, response_id)
     transcript = projection.transcript if projection is not None else ""
     events: list[DuplexEvent] = []
     if (
@@ -563,17 +563,10 @@ def _realtime_response_done_event(
     state: RealtimeProjectionState,
     event: Mapping[str, object],
     *,
-    projection: _ResponseProjection | None = None,
     status: str = "completed",
     status_details: dict[str, object] | None = None,
-) -> ResponseDone | None:
+) -> ResponseDone:
     response_id = event.get("response_id")
-    if projection is None:
-        projection = _response_state(state, response_id, event=event)
-    if projection is not None:
-        if projection.done_emitted:
-            return None
-        projection.done_emitted = True
     return ResponseDone(
         response_id=_str_or_none(response_id),
         response={
@@ -582,7 +575,9 @@ def _realtime_response_done_event(
             "status": status,
             "status_details": status_details,
             "output": [_response_done_output_item(state, response_id, status=status)],
-            "metadata": dict(event),
+            # Audio was delivered by output_audio.delta. Copying the waveform
+            # into the terminal doubles queue usage and defeats its reserve.
+            "metadata": {key: value for key, value in event.items() if key != "audio"},
         },
     )
 
@@ -596,7 +591,7 @@ def _realtime_response_terminal_events(
     status_details: dict[str, object] | None = None,
 ) -> list[DuplexEvent]:
     item_id = _response_item_id(state, response_id)
-    projection = _response_state(state, response_id, event=event)
+    projection = _response_state(state, response_id)
     transcript = projection.transcript if projection is not None else ""
     rid = _str_or_none(response_id)
     events: list[DuplexEvent] = []
@@ -637,16 +632,16 @@ def _realtime_response_terminal_events(
     done_event = _realtime_response_done_event(
         state,
         {**event, "response_id": response_id},
-        projection=projection,
         status=status,
         status_details=status_details,
     )
-    if done_event is not None:
-        events.append(done_event)
-        # vLLM-Omni does not expose a Realtime-specific quota budget; emit the
-        # terminal event with an empty list so clients that sequence on it work.
-        events.append(RateLimitsUpdated())
-        if isinstance(response_id, str) and response_id == state.active_response_id:
+    events.append(done_event)
+    # vLLM-Omni does not expose a Realtime-specific quota budget; emit the
+    # terminal event with an empty list so clients that sequence on it work.
+    events.append(RateLimitsUpdated())
+    if isinstance(response_id, str):
+        state.response_states.pop(response_id, None)
+        if response_id == state.active_response_id:
             state.active_response_id = None
     return events
 
@@ -750,6 +745,14 @@ def project_internal_event(state: RealtimeProjectionState, event: Mapping[str, o
 
 def _project(state: RealtimeProjectionState, event: dict[str, object]) -> list[DuplexEvent]:
     event_type = event.get("type")
+    if event_type in {
+        "response.speak",
+        "response.output_audio.delta",
+        "response.text.delta",
+        "response.done",
+        "response.output_item.done",
+    } and response_is_inactive(state, event.get("response_id")):
+        return []
     if event_type == "session.created":
         session = realtime_session_payload(state, event.get("session"))
         events: list[DuplexEvent] = [
@@ -789,6 +792,7 @@ def _project(state: RealtimeProjectionState, event: dict[str, object]) -> list[D
         return [SessionClosed(reason=str(event.get("reason") or "closed"), details=event)]
     if event_type == "response.created":
         response_id = event.get("response_id")
+        _response_state(state, response_id, create=True)
         if isinstance(response_id, str) and response_id:
             state.active_response_id = response_id
             state.last_response_id = response_id
@@ -930,6 +934,8 @@ def _project(state: RealtimeProjectionState, event: dict[str, object]) -> list[D
         item_id = (
             event_item_id if isinstance(event_item_id, str) and event_item_id else _pop_pending_commit_item_id(state)
         )
+        if isinstance(event_item_id, str) and event_item_id in state.pending_commit_item_ids:
+            state.pending_commit_item_ids.remove(event_item_id)
         committed_item = state.conversation_items.get(item_id)
         commit_events: list[DuplexEvent] = []
         if committed_item is None:
@@ -975,7 +981,7 @@ def _project(state: RealtimeProjectionState, event: dict[str, object]) -> list[D
             response_id = state.active_response_id
         if not isinstance(response_id, str) or not response_id:
             return events
-        if response_is_done(state, response_id):
+        if response_is_inactive(state, response_id):
             # Generation may finish long before the client drains its audio.
             # A later barge-in still needs to stop that queued playback, but
             # must not produce a second response.done for the completed turn.
@@ -1084,8 +1090,17 @@ def _function_call_done_events(state: RealtimeProjectionState, event: dict[str, 
         return [DuplexRawEvent(internal_type="function_call.done", details=event)]
     if not isinstance(arguments, str):
         arguments = str(arguments)
-    response_id = f"resp_{uuid4().hex}"
-    item_id = f"item_{uuid4().hex}"
+    # The emitter mints these so the item it projects and the record the
+    # tool-call ledger keeps are the same call; a caller that projects the
+    # internal event directly still gets fresh ids.
+    supplied_response_id = event.get("response_id")
+    supplied_item_id = event.get("item_id")
+    response_id = (
+        supplied_response_id
+        if isinstance(supplied_response_id, str) and supplied_response_id
+        else f"resp_{uuid4().hex}"
+    )
+    item_id = supplied_item_id if isinstance(supplied_item_id, str) and supplied_item_id else f"item_{uuid4().hex}"
     item: dict[str, object] = {
         "id": item_id,
         "object": "realtime.item",
@@ -1351,13 +1366,11 @@ class ResolvedControl:
 def resolve_cancel_response(state: RealtimeProjectionState, command: CancelResponse) -> ResolvedControl:
     payload: dict[str, object] = {"type": "response.cancel", "reason": "response.cancel"}
     response_id = command.response_id or state.active_response_id or state.last_response_id
-    if response_is_done(state, response_id):
+    if response_is_inactive(state, response_id):
         return ResolvedControl(
             payloads=[],
             events=[
-                error_event(
-                    "response_not_active", f"Response is already complete: {response_id}", event_id=command.event_id
-                )
+                error_event("response_not_active", f"Response is not active: {response_id}", event_id=command.event_id)
             ],
         )
     if isinstance(response_id, str) and response_id:
@@ -1372,7 +1385,7 @@ def resolve_clear_output_audio(state: RealtimeProjectionState, command: ClearOut
     response_id = command.response_id or state.active_response_id or state.last_response_id
     # A completed response can still own queued playback. Clear the latest
     # response in the engine, while keeping late clears away from newer turns.
-    if response_is_done(state, response_id) and (
+    if response_is_inactive(state, response_id) and (
         state.active_response_id is not None or response_id != state.last_response_id
     ):
         return ResolvedControl(payloads=[], events=[OutputAudioCleared(response_id=_str_or_none(response_id))])
@@ -1426,18 +1439,6 @@ def resolve_truncate_item(state: RealtimeProjectionState, command: TruncateItem)
     return ResolvedControl(payloads=[command.payload(), ack_payload], events=[])
 
 
-def _duplicate_function_call_output(state: RealtimeProjectionState, call_id: object) -> tuple[bool, bool]:
-    matching_call = any(
-        known.get("type") == "function_call" and known.get("call_id") == call_id
-        for known in state.conversation_items.values()
-    )
-    duplicate_output = any(
-        known.get("type") == "function_call_output" and known.get("call_id") == call_id
-        for known in state.conversation_items.values()
-    )
-    return matching_call, duplicate_output
-
-
 def resolve_create_item(state: RealtimeProjectionState, command: CreateItem) -> ResolvedControl:
     """Expand ``conversation.item.create`` the way the old translator did.
 
@@ -1446,6 +1447,14 @@ def resolve_create_item(state: RealtimeProjectionState, command: CreateItem) -> 
     become one ``input_audio_buffer.append`` per audio part followed by an
     ``input_audio_buffer.commit`` (no response). The user-item ack events are
     returned in ``events`` and must be emitted *before* running the payloads.
+
+    ``function_call_output`` is validated *structurally* here (shape and types)
+    and for nothing else: whether that call may still be answered is a property
+    of the session, not of the conversation history, and is decided by the
+    session's tool-call ledger in ``SessionControl`` when the payload runs. The
+    projection used to answer it from ``state.conversation_items``, which is
+    history-wide and epoch-blind, so a result arriving after a barge-in was
+    admitted against a call the session had already moved past.
     """
     item = dict(command.item)
     if isinstance(command.previous_item_id, str):
@@ -1456,8 +1465,7 @@ def resolve_create_item(state: RealtimeProjectionState, command: CreateItem) -> 
     if item_type == "function_call_output":
         call_id = item.get("call_id")
         output = item.get("output")
-        matching_call, duplicate_output = _duplicate_function_call_output(state, call_id)
-        if not isinstance(call_id, str) or not call_id or not matching_call:
+        if not isinstance(call_id, str) or not call_id:
             return ResolvedControl(
                 payloads=[],
                 events=[
@@ -1469,17 +1477,13 @@ def resolve_create_item(state: RealtimeProjectionState, command: CreateItem) -> 
                     )
                 ],
             )
-        if not isinstance(output, str) or duplicate_output:
+        if not isinstance(output, str):
             return ResolvedControl(
                 payloads=[],
                 events=[
                     error_event(
                         "invalid_function_call_output",
-                        (
-                            "function_call_output requires a string output"
-                            if not isinstance(output, str)
-                            else f"function_call_output already exists for call_id {call_id}"
-                        ),
+                        "function_call_output requires a string output",
                         event_id=command.event_id,
                         param="item.output",
                     )
@@ -1595,6 +1599,6 @@ __all__ = [
     "resolve_create_item",
     "resolve_delete_item",
     "resolve_truncate_item",
-    "response_is_done",
+    "response_is_inactive",
     "retrieve_item_events",
 ]

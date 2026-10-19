@@ -93,9 +93,9 @@ filter_test_specs_by_skip_ci() {
                 continue
                 ;;
             WEEKLY_TESTS:*)
-                # Scheduled main weekly survives docs-only skip-all. A PR
-                # weekly-test label does not.
-                if [[ "$BUILDKITE_BRANCH" == "main" && "${WEEKLY}" == "1" ]]; then
+                # Scheduled release-line weekly survives docs-only skip-all.
+                # A PR weekly-test label, including one opened from release/vX.Y.Z, does not.
+                if is_release_line_push && [[ "${WEEKLY}" == "1" ]]; then
                     runnable_specs+=("$suite_spec")
                     continue
                 fi
@@ -177,43 +177,12 @@ upload_pipeline() {
     cd .buildkite/amd
 
     # Multiple label-selected or debug-selected suites share one image build.
+    # When suites overlap, keep the first copy of an identical test step.
     if [[ ${#TEST_SPECS[@]} -eq 1 ]]; then
         TEST_YAML="${TEST_SPECS[0]#*:}"
     else
         TEST_YAML=$(mktemp "${TMPDIR:-/tmp}/amd-selected-tests.XXXXXX.yml")
-        python - "$TEST_YAML" "${TEST_SPECS[@]}" <<'PY'
-import sys
-
-import yaml
-
-
-output_path, *suite_specs = sys.argv[1:]
-combined = {"env": {}, "steps": []}
-
-for suite_spec in suite_specs:
-    group_name, input_path = suite_spec.split(":", 1)
-    with open(input_path, encoding="utf-8") as test_file:
-        suite = yaml.safe_load(test_file)
-
-    for name, value in (suite.get("env") or {}).items():
-        previous = combined["env"].get(name, value)
-        if previous != value:
-            raise ValueError(
-                f"Conflicting environment value for {name}: {previous!r} != {value!r}"
-            )
-        combined["env"][name] = value
-
-    suite_steps = []
-    for entry in suite.get("steps") or []:
-        if "group" in entry:
-            suite_steps.extend(entry.get("steps") or [])
-        else:
-            suite_steps.append(entry)
-    combined["steps"].append({"group": group_name, "steps": suite_steps})
-
-with open(output_path, "w", encoding="utf-8") as output_file:
-    yaml.safe_dump(combined, output_file, sort_keys=False)
-PY
+        python3 scripts/combine_test_suites.py "$TEST_YAML" "${TEST_SPECS[@]}"
     fi
     echo "AMD test suites: ${TEST_SPECS[*]}"
 
@@ -253,7 +222,7 @@ get_diff_main() {
 }
 
 file_diff=$(get_diff)
-if is_release_line_branch; then
+if is_release_line_push; then
     file_diff=$(get_diff_main)
 fi
 
@@ -324,7 +293,7 @@ fi
 
 
 LIST_FILE_DIFF=$(get_diff | tr ' ' '|')
-if is_release_line_branch; then
+if is_release_line_push; then
     LIST_FILE_DIFF=$(get_diff_main | tr ' ' '|')
 fi
 upload_pipeline

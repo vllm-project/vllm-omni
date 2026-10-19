@@ -315,6 +315,53 @@ filtering and local media. The default is three samples and single concurrency;
 without repeating it. `--seed` controls shuffling; `--disable-shuffle` preserves
 dataset order.
 
+For a Qwen3-Omni server started with `vllm_omni/deploy/qwen3_omni_duplex.yaml`,
+use the same entrypoint with server-detected turns and no reference audio:
+
+```bash
+vllm bench serve --omni \
+  --backend openai-realtime-duplex --endpoint /v1/realtime \
+  --base-url http://127.0.0.1:8000 \
+  --model Qwen/Qwen3-Omni-30B-A3B-Instruct \
+  --dataset-name omni-duplex-eval --dataset-path Hothan/Omni-DuplexEval \
+  --duplex-eval-split PR_correction --duplex-eval-turn-detection server_vad \
+  --duplex-eval-instructions "Reply briefly to the user's latest request." \
+  --duplex-eval-response-root ./duplex-eval-qwen3 \
+  --num-prompts 3 --disable-shuffle --max-concurrency 1 --num-warmups 0 \
+  --ready-check-timeout-sec 0 --save-result
+```
+
+`--duplex-eval-turn-detection` defaults to `none`, preserving the native duplex
+runner's explicit commit. With `server_vad`, the runner sends audio in 32 ms appends
+(one 512-sample detector frame at 16 kHz), appends trailing silence, and waits for
+observed speech/responses to settle. A larger append can span the end of one turn
+and the start of the next, hiding the earlier endpoint. Video sampling still uses
+`--duplex-eval-fps`; native duplex retains its 1000 ms default audio units. The
+sample metadata records the effective `unit_ms`. Audio pacing uses a cumulative
+monotonic deadline so sending and frame processing do not add a full extra sleep
+to every append. The standalone `generate` command rejects `server_vad` combined
+with `--pace as-fast-as-possible`, which compresses turn and playback timing.
+Settling is not an acknowledgement
+that all final input has been processed. Frames use the transport advertised by
+the server: native video frames or bounded image conversation items for Qwen3.
+`--duplex-eval-instructions` defaults to the native duplex prompt; passing an empty
+string uses the server's default instructions. `--duplex-eval-ref-audio` is optional
+for Qwen3 and remains available for models that require a reference voice.
+
+The CUDA nightly configuration
+`tests/dfx/perf/tests/test_qwen3_omni_duplex_omni_duplex_eval.json` uses the common
+performance runner on three GPUs (two for Qwen3-Omni, one for the text judge).
+It measures three `PR_correction` sessions with post-run judging and two
+`RTD_counting` sessions without judging, preserving dataset order. The checks require
+complete artifacts, completed observed responses and measured text/audio latency
+for every session; judging must cover every selected PR sample. Scores are reported
+without a quality threshold. RTD scoring requires a vision-capable judge and is
+outside this configuration. No hardware latency baseline is configured.
+These nightly checks do not establish that every input utterance produced a
+response. The dataset provides no expected VAD turn count, and a `PR_correction`
+sample can contain a single user statement, so a blanket two-response minimum is
+not valid. Deterministic CPU tests cover adjacent speech boundaries separately.
+
 Inputs retain the standalone runner's real-time pacing, question audio, media
 clock and 1 FPS default (`--duplex-eval-fps`). Each session decodes its media in a
 worker thread after acquiring a concurrency slot, and releases the decoded input
@@ -436,9 +483,64 @@ vllm bench serve --omni \
 
 `--dataset-path` accepts an extracted directory, `data.tar[.gz]`, or a Hugging Face dataset ID; omitting it uses
 `lucky-lance/OmniInteract`. `--num-prompts` is the total across subsets and defaults to 3 for OmniInteract; explicit `0`
-selects all and oversize values use all available cases. OmniInteract requires a reference WAV to pin the assistant voice
-for comparable scores; this is a benchmark constraint, since ordinary MiniCPM-o duplex sessions can use the model-bundled
-default when `ref_audio` is omitted. OmniInteract uses the `/v1/realtime` endpoint.
+selects all and oversize values use all available cases. OmniInteract uses the `/v1/realtime` endpoint. Pass
+`--omniinteract-ref-audio` for models that clone a reference voice (MiniCPM-o); models that refuse one (Qwen3-Omni) run
+without it. `--omniinteract-instructions` sets the session system prompt; by default none is sent.
+
+For comparable MiniCPM-o scores, explicitly pass the same reference WAV in every run, even though ordinary sessions
+can use the model-bundled default when `ref_audio` is omitted. Pass the model's `assets/HT_ref_audio.wav` to benchmark
+that default voice. The Qwen3-Omni examples omit reference audio because that model does not accept it.
+
+#### Turn-based duplex models (Qwen3-Omni)
+
+A model-native duplex model decides on its own when to speak, so each clip is streamed and committed once at the end.
+A turn-based model only answers committed turns. `--omniinteract-turn-detection server_vad` lets the server's VAD cut the
+soundtrack into turns. It sends 32 ms audio appends so each detector frame's endpoint is processed before the next onset;
+native duplex keeps its 200 ms appends, and video sampling is unchanged. The client never commits in `server_vad` mode,
+appends 1.5 s of trailing silence so a question at the very end still
+closes, and waits until no speech or response is open. Frames follow the session capabilities: a model that does not
+accept `video_frames` on audio appends but accepts images gets each frame as an `input_image` conversation item, with the
+oldest deleted so at most 8 stay in the session (frames too large for the server's 4 MiB image budget are downscaled).
+Serve with the duplex deployment, which needs the Silero VAD artifact in the Hugging Face cache (see
+[Qwen3-Omni duplex](https://github.com/vllm-project/vllm-omni/blob/main/examples/online_serving/qwen3_omni/README.md)):
+
+```bash
+vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
+  --deploy-config vllm_omni/deploy/qwen3_omni_duplex.yaml
+
+vllm bench serve --omni \
+  --backend openai-realtime-duplex \
+  --endpoint /v1/realtime \
+  --base-url http://127.0.0.1:8091 \
+  --model Qwen/Qwen3-Omni-30B-A3B-Instruct \
+  --dataset-name omniinteract \
+  --omniinteract-turn-detection server_vad \
+  --omniinteract-instructions "You are a real-time video assistant. Reply to the user's latest request briefly, in one or two spoken sentences, in the language the user speaks." \
+  --omniinteract-output-dir ./omniinteract-qwen3 \
+  --num-prompts 3
+```
+
+The deployment serves one session at a time unless `duplex_session.max_sessions` is raised, so keep
+`--max-concurrency 1`.
+
+Latency is reported per response in the `Duplex Per-Response Latency` block and as flat result keys
+(`num_/mean_/median_/p99_` + name), where every response counts once however many a session had. The standard
+`Mean TTFT` / `audio TTFP` rows instead average each session first, and E2EL and request throughput follow the video
+length because input is paced in real time.
+
+| Result key suffix | Starts at | Ends at |
+| --- | --- | --- |
+| `duplex_response_ttft_ms` / `duplex_response_ttfp_ms` | server: request accepted by the engine | first text / audio output |
+| `duplex_client_ttft_ms` / `duplex_client_ttfp_ms` | client: `response.created` received | first text / audio delta received |
+
+The server timer starts only after the model plugin prepared the prompt and the engine accepted it, so it leaves out
+prompt preparation; for Qwen3-Omni that is decoding the retained images, the chat template, and multimodal
+preprocessing. The client timer starts when `response.created` is received, after the server detects the end of the
+turn. It excludes VAD silence detection and any delay before that event arrives, so it does not measure the full
+user-speech-end to first-output latency. The server start point differs between model plugins, so compare server
+keys only within one model. VAD uses `silence_duration_ms: 500` by default.
+Qwen3-Omni duplex reports no per-token timing, so TPOT and ITL are unavailable. A turn-based model acknowledges a proactive request right away but does not speak again when the
+event later happens, so proactive and 1QnA scenarios score low by construction.
 
 To replay an existing sample set (for example `sampled_cases.jsonl` from a prior run), pass
 `--omniinteract-video-list` instead of discovering cases. List order is preserved; `--num-prompts` takes the prefix of
@@ -469,9 +571,11 @@ OmniInteract `batch_inference_minicpmo.py --video_list`); failed cases write
 not answer accuracy. Transcript timestamps are serialized playback-queue times. Playback ACKs report cumulative progress
 incrementally along that serialized clock, like a live listener; the first ack for a response goes out as soon as its audio
 arrives, checkpointing the response's history position so a later committed user input updates it in place. A residual
-`playback_ack_too_late` rejection is recorded as an artifact warning rather than failing the case. Clipped or cancelled
-outputs are ineligible and omitted from the official manifest; `audio_clipped_bytes` records output beyond the rounded video
-horizon.
+`playback_ack_too_late` rejection is recorded as an artifact warning rather than failing the case. When a barge-in model
+sends `output_audio_buffer.cleared`, the client flushes that response's unplayed audio from the serialized clock, as a live
+speaker would. Clipped, cancelled, or cleared-before-played outputs are ineligible and omitted from the official manifest
+(`audio_clipped`, `cancelled_response`, `cleared_response`), because their transcript holds more than the listener heard;
+`audio_clipped_bytes` records output beyond the rounded video horizon.
 
 Accuracy evaluation is opt-in and requires an already-running text judge with an OpenAI-compatible Chat Completions API. The
 benchmark does not launch or stop the judge server. Add the following options to the command above:
@@ -546,6 +650,39 @@ chunks. Official-manifest eligibility is reported separately because clipped or 
 signal, not a transport failure. Accuracy must finish with `status=ok` on every subset. After all three subsets finish,
 All Global IA-QTF1 is recomputed from pooled `Global_TP` / `Global_FP` / `Global_FN` and must be at or above
 `omniinteract_aggregate_min_ia_qtf1` (checked in as `0.2`).
+
+`test_qwen3_omni_duplex_omniinteract.json` runs Qwen3-Omni on `vllm_omni/deploy/qwen3_omni_duplex.yaml` with server VAD
+turns (see [Turn-based duplex models](#turn-based-duplex-models-qwen3-omni)). It is an L4 CUDA nightly performance job
+on H100 and the B200 mirror. It needs three visible GPUs: the Qwen3-Omni stages take the first two and the text judge
+the third (`cuda_visible_devices: "2"`). Run the same job locally with:
+
+```bash
+bash tools/nightly/run_nightly_jobs.sh \
+  --test-type perf \
+  --model-type omni \
+  --label-substr "Duplex OmniInteract"
+```
+
+The job uploads benchmark JSONs and per-case audio, transcripts, events, and evaluation artifacts. It records performance
+metrics without a hardware latency baseline; response validity and the math accuracy floor still gate the result.
+It differs from the MiniCPM-o configuration in three ways:
+
+- **Cold start.** The first request after the server starts compiles Triton kernels (rotary embedding, fused MoE) and
+  answers seconds late. The first subset (`1q1a_math`) therefore replays its first case once, unmeasured
+  (`num_warmups: 1`); later subsets reuse the warmed server and do not warm up again.
+- **Interrupted responses are not scored.** The official eligibility rule is kept: a case with a cancelled, cleared, or
+  clipped response is left out of accuracy, because its transcript holds text the listener never heard, and scoring it
+  would make the result incomparable with MiniCPM-o and the paper. Qwen3-Omni stops speaking when the next question
+  starts, so overlapping questions can make a case ineligible. A scored subset must keep at least one eligible case.
+  This configuration measures latency only for `1q1a` and `1qna` (no `omniinteract_evaluate`); individual cases may
+  still be eligible. Both subsets require at least one completed response with audio and transcript per case
+  (`omniinteract_require_response: true`). Accuracy covers `1q1a_math` only, so it is not comparable with the
+  three-subset MiniCPM-o score. Its
+  IA-QTF1 must be at or above `omniinteract_aggregate_min_ia_qtf1` (checked in as `0.3`); a single run on four cases
+  measured `0.50`, so the floor catches a lost correct answer or more, not small judge noise.
+- **Latency.** Compare Qwen3-Omni runs on the per-response keys, primarily `mean_duplex_client_ttfp_ms`
+  (`response.created` received to first audio, including prompt preparation); the standard TTFT rows average sessions
+  first, and TPOT is unavailable.
 
 ### Seed-TTS reference speech as real audio input
 
