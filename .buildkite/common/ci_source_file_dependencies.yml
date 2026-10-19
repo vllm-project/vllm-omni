@@ -201,11 +201,13 @@ source_file_dependencies:
   # --- features ---
   diffusion_distributed_attention:
     - tests/diffusion/distributed/
+    - tests/diffusion/test_mossimage_rope.py
     - tests/diffusion/attention/test_attention_sp.py
     - tests/diffusion/attention/test_ulysses_uaa.py
     - vllm_omni/diffusion/distributed/
     - vllm_omni/diffusion/attention/
     - vllm_omni/diffusion/data.py
+    - vllm_omni/diffusion/hooks/sequence_parallel.py
     - vllm_omni/diffusion/models/
 
   custom_pipeline:
@@ -532,7 +534,6 @@ source_file_dependencies:
     - vllm_omni/diffusion/models/flux/
     - vllm_omni/diffusion/models/flux2/
     - vllm_omni/diffusion/models/flux2_klein/
-    - vllm_omni/diffusion/models/hidream_image/
     - vllm_omni/diffusion/models/krea2/
     - vllm_omni/diffusion/models/lingbot_video/
 

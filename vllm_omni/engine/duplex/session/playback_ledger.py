@@ -19,8 +19,13 @@ from vllm_omni.engine.duplex.session.engine_session import DuplexEngineSession
 from vllm_omni.engine.duplex.session.lease import DuplexLeaseActivity
 
 
-def apply_playback_ack(session: DuplexEngineSession, event: dict[str, object]) -> list[DuplexEvent]:
-    """Apply one ``playback.ack`` and return the events it produces."""
+def apply_playback_ack(
+    session: DuplexEngineSession,
+    event: dict[str, object],
+    *,
+    require_audio_complete: bool = False,
+) -> list[DuplexEvent]:
+    """Apply an ACK, retaining incomplete replies when calibration is enabled."""
     played_ms = event.get("played_ms", event.get("audio_ms", 0))
     committed_ms = event.get("committed_ms")
     if not isinstance(played_ms, int | float):
@@ -30,10 +35,11 @@ def apply_playback_ack(session: DuplexEngineSession, event: dict[str, object]) -
     except Exception:
         pass
     committed_cursor = int(committed_ms) if isinstance(committed_ms, int | float) else int(played_ms)
-    item_id = event.get("item_id")
+    raw_item_id = event.get("item_id")
+    item_id: str | None = raw_item_id if isinstance(raw_item_id, str) and raw_item_id else None
     response_id = event.get("response_id")
     response_id = response_id if isinstance(response_id, str) and response_id else None
-    if not isinstance(item_id, str) or not item_id:
+    if item_id is None:
         item_id = f"item_{response_id}" if response_id is not None else None
     elif response_id is None and item_id.startswith("item_"):
         response_id = item_id.removeprefix("item_")
@@ -45,10 +51,10 @@ def apply_playback_ack(session: DuplexEngineSession, event: dict[str, object]) -
         response_id = session.active_response_id
         item_id = f"item_{response_id}"
     if response_id is not None:
-        expected_item_id = f"item_{response_id}"
+        response_item_id = f"item_{response_id}"
         if item_id is None:
-            item_id = expected_item_id
-        elif item_id != expected_item_id:
+            item_id = response_item_id
+        elif item_id != response_item_id:
             return [error_event("playback_item_mismatch", "playback.ack item_id must match item_<response_id>.")]
         if not session.has_assistant_response_item(response_id, item_id):
             return [
@@ -131,7 +137,18 @@ def apply_playback_ack(session: DuplexEngineSession, event: dict[str, object]) -
             }
         )
     ]
-    if committed_history and committed_cursor >= max(playback.sent_ms, playback.generated_ms):
+    if response_id is not None and session.history_calibration_retired(response_id):
+        # This ACK may have recreated a cursor for an evicted reply. Its stored
+        # prefix/cutoff suffice; keep no new response-scoped playback state.
         session.release_response_playback(response_id)
-        session.release_response_history_snapshot(response_id)
+    elif committed_history and response_id is not None:
+        # Calibration needs the original reply and cursor even before its
+        # first result. Keep that evidence for incomplete or hard-capped audio;
+        # sessions without calibration retain their existing ACK cleanup.
+        retirement_cursor = session.history_audio_cutoff(response_id) if require_audio_complete else committed_cursor
+        if (not require_audio_complete or playback.audio_complete) and retirement_cursor >= max(
+            playback.sent_ms, playback.generated_ms
+        ):
+            session.release_response_playback(response_id)
+            session.release_response_history_snapshot(response_id)
     return events

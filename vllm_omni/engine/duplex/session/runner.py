@@ -101,6 +101,7 @@ from vllm_omni.engine.duplex.session.context import (
 from vllm_omni.engine.duplex.session.control import SessionControl
 from vllm_omni.engine.duplex.session.emitter import SessionEmitter
 from vllm_omni.engine.duplex.session.engine_session import DuplexEngineSession
+from vllm_omni.engine.duplex.session.history_calibration import HistoryCalibration
 from vllm_omni.engine.duplex.session.lease import DuplexLeaseActivity
 from vllm_omni.engine.duplex.session.model_channel import ModelChannel
 from vllm_omni.engine.duplex.session.tool_calls import (
@@ -253,6 +254,16 @@ class DuplexSessionRunner:
             tool_calls=self.tool_calls,
         )
         self.out = SessionEmitter(self.ctx, promote_deferred_overlap=self._promote_deferred_overlap_later)
+        calibration = plugin.history_calibrator(manager.runtime_config)
+        if calibration is not None:
+            self.ctx.history_calibration = HistoryCalibration(
+                session,
+                calibration.calibrate,
+                max_bytes=manager.runtime_config.history_audio_max_bytes_per_session,
+                timeout_s=manager.runtime_config.history_calibration_timeout_ms / 1000,
+                requires_audio=calibration.requires_audio,
+                on_applied=self._settle_stored_answer,
+            )
         self.model = ModelChannel(
             self.ctx,
             self.out,
@@ -404,8 +415,10 @@ class DuplexSessionRunner:
         response_id = draining_response_id or session.active_response_id
         if response_id is None:
             return
+        playback = session.playback_for_response(response_id).as_dict()
         if draining_response_id is not None:
             session.clear_draining_for_response(draining_response_id)
+            session.release_finished_drain_response(draining_response_id)
             if isinstance(request_id, str):
                 session.request_resources.pop((stage_id, request_id), None)
         elif response_id == session.active_response_id:
@@ -420,7 +433,7 @@ class DuplexSessionRunner:
                 "committed": False,
                 "status": "failed",
                 "status_details": {"type": "failed", "reason": "runtime_data_plane_stream_failed"},
-                "playback": session.playback.as_dict(),
+                "playback": playback,
             }
         )
 
@@ -551,6 +564,8 @@ class DuplexSessionRunner:
                         self.spawn(self._rearm_deferred_silence(), name="duplex-continue")
 
     async def _stop_worker(self) -> None:
+        if self.ctx.history_calibration is not None:
+            self.ctx.history_calibration.close()
         worker = self._worker
         self._worker = None
         # Set even when the worker itself is stopping (a wire ``session.close``
@@ -641,6 +656,22 @@ class DuplexSessionRunner:
             return
         logger.warning("Unknown duplex runner internal item: %s", item.kind)
 
+    def _settle_stored_answer(self, response_id: str | None) -> None:
+        """Settle only a nonempty stored answer; close on unsafe tool state."""
+        if response_id is None:
+            return
+        message = self.session.history_item_ids.get(f"item_{response_id}")
+        content = message.get("content") if message is not None else None
+        if not isinstance(content, str) or not content:
+            return
+        try:
+            settle_response_runtime(self.plugin, self.session, committed=True, response_id=response_id)
+        except Exception:
+            logger.exception("Failed to settle runtime for a stored assistant answer")
+            self._emit_error("tool_call_settlement_failed", "the session could not settle a stored assistant answer")
+            self._begin_close("tool_call_settlement_failed")
+            self.manager.close_from_runner(self, "tool_call_settlement_failed")
+
     def _settle_playback_committed_answer(self, events) -> None:
         """Drop a tool pair only when this ACK stored that response's answer."""
         for event in events:
@@ -653,7 +684,7 @@ class DuplexSessionRunner:
             response_id = (
                 item_id.removeprefix("item_") if isinstance(item_id, str) and item_id.startswith("item_") else None
             )
-            settle_response_runtime(self.plugin, self.session, committed=True, response_id=response_id)
+            self._settle_stored_answer(response_id)
 
     async def _run_internal_payload(self, payload: dict[str, object]) -> None:
         """Run one internal event dictionary through the matching handler."""
@@ -663,7 +694,11 @@ class DuplexSessionRunner:
         elif event_type in {"input_audio_buffer.commit", "input.commit", "response.create"}:
             await self._on_commit(payload)
         elif event_type == "playback.ack":
-            events = playback_ledger.apply_playback_ack(self.session, payload)
+            events = playback_ledger.apply_playback_ack(
+                self.session,
+                payload,
+                require_audio_complete=self.ctx.history_calibration is not None,
+            )
             self._emit_events(events)
             self._settle_playback_committed_answer(events)
         elif event_type in _CANCEL_EVENTS:
@@ -742,7 +777,11 @@ class DuplexSessionRunner:
         elif isinstance(command, UpdateSession):
             await self.control.on_session_update(dict(command.patch), realtime_event_id=command.event_id)
         elif isinstance(command, AckPlayback):
-            events = playback_ledger.apply_playback_ack(self.session, command.payload())
+            events = playback_ledger.apply_playback_ack(
+                self.session,
+                command.payload(),
+                require_audio_complete=self.ctx.history_calibration is not None,
+            )
             self._emit_events(events)
             self._settle_playback_committed_answer(events)
             # A camera commit can arrive after response.done while its audio
@@ -781,6 +820,17 @@ class DuplexSessionRunner:
             await self._on_close_command(command.reason)
         else:
             self._emit_error("unknown_event", f"Unknown duplex command: {type(command).__name__}")
+        if self.ctx.history_calibration is not None:
+            if isinstance(command, AckPlayback):
+                self.ctx.history_calibration.release_confirmed()
+                # A final ACK may arrive after cancel/clear. Start while the
+                # user speaks, without running ASR on periodic playback ACKs.
+                if not helpers.assistant_playback_active(self.session):
+                    self.ctx.history_calibration.request_ready()
+            elif isinstance(command, DeleteItem):
+                self.ctx.history_calibration.discard(command.item_id.removeprefix("item_"))
+            elif isinstance(command, TruncateItem | CancelResponse | ClearOutputAudio | CancelInput | BargeIn):
+                self.ctx.history_calibration.request_ready()
 
     async def _on_close_command(self, reason: str) -> None:
         # A close requested through the ordered command stream (the client's
@@ -1015,6 +1065,8 @@ class DuplexSessionRunner:
 
     def _begin_close(self, reason: str) -> None:
         first_close = not self.run.closing
+        if self.ctx.history_calibration is not None:
+            self.ctx.history_calibration.close()
         self.run.closing = True
         self.run.close_reason = self.run.close_reason or reason
         self.session.mark_closing()
@@ -1911,6 +1963,8 @@ class DuplexSessionRunner:
         if not await self.model.signal_cancel_fence(cancelled_fence):
             return
         self.tasks.active_response_task = None
+        if self.ctx.history_calibration is not None:
+            self.ctx.history_calibration.request_ready()
 
     async def _cancel_active_response(
         self,
@@ -1987,6 +2041,9 @@ class DuplexSessionRunner:
         for request_id in draining_ids:
             self.plugin.data_plane.close_stream(request_id)
         session.clear_draining_requests()
+        # Retain audible, undeleted replies for late ACKs, as on normal drain completion.
+        for response_id, _, _ in draining_cancels:
+            session.release_finished_drain_response(response_id)
         if abort_ids:
             await self._abort_request_background(abort_ids, notify=notify)
         if has_running_task and active_task is not None:

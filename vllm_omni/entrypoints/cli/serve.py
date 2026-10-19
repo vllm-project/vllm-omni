@@ -1162,15 +1162,6 @@ class OmniServeCommand(CLISubcommand):
             help="Enable orchestrator window monitor and write a JSON log at shutdown.",
         )
 
-        # Supplementary auxiliary text encoder parameters
-        # (e.g., the meta llama/meta llama-3.1-8b-instrument used by hidream)
-        omni_config_group.add_argument(
-            "--auxiliary-text-encoder",
-            type=str,
-            default=None,
-            help="Auxiliary text encoder parameters model name or path (especially for Hidream-l1-full).",
-        )
-
         # Stash via type(self) so the docs hook (which execs this function in a
         # sandboxed globals dict via ``DummySelf``) doesn't fail on a NameError.
         type(self)._parser = serve_parser
