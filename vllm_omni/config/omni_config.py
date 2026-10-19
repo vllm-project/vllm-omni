@@ -56,6 +56,9 @@ class _QuantizationEngineOverrides(TypedDict, total=False):
 
 class _ModelEngineOverrides(TypedDict, total=False):
     active_stream_window: int
+    # Multi-step decode window size (K) for AR stages.  Per-stage on purpose:
+    # the thinker must not inherit the talker's K.
+    multi_step_decode_steps: int
     enable_sleep_mode: bool
     subtalker_sampling_params: dict[str, Any]
     has_sampling_extra_args: bool
@@ -257,6 +260,9 @@ class OmniStageModelConfig:
     """Per-stage model behavior."""
 
     active_stream_window: int = Field(default=0, ge=0)
+    # Per-stage multi-step decode window size; 0 (default) keeps the normal
+    # single-step loop, so the field is inert unless a stage opts in.
+    multi_step_decode_steps: int = Field(default=0, ge=0)
     enable_sleep_mode: bool = False
     default_sampling_params: dict[str, Any] | None = None
     subtalker_sampling_params: dict[str, Any] | None = None

@@ -98,3 +98,7 @@ class OmniSchedulerOutput(SchedulerOutput):
 
     finished_requests_needing_kv_transfer: dict[str, dict] = field(default_factory=dict)
     pending_input_registrations: list[OmniChunkRecvHandle] = field(default_factory=list)
+    # Multi-step decode window plan: req_id -> number of decode steps the
+    # runner replays inside this single engine step.  Empty when the step is
+    # not windowed; see vllm_omni/core/sched/multi_step_decode.py.
+    multi_step_plan: dict[str, int] = field(default_factory=dict)
