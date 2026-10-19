@@ -19,7 +19,7 @@ source .venv/bin/activate
 vLLM-Omni is quickly evolving, please see the [installation guide](../getting_started/installation/README.md) for details. It's recommended to build from source to provide the latest development environment.
 
 !!! tip
-    vLLM-Omni is compatible with Python versions 3.10 to 3.12. However, we recommend developing with Python 3.12 to minimize the chance of your local environment clashing with our CI environment.
+    vLLM-Omni supports Python versions 3.10 to 3.13, as declared in [`pyproject.toml`](https://github.com/vllm-project/vllm-omni/blob/main/pyproject.toml). We recommend developing with Python 3.12 to match the Read the Docs build environment.
 
 ### Adding a new model to vLLM-Omni
 
