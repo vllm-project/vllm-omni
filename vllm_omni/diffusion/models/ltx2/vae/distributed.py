@@ -141,6 +141,11 @@ def _shape_aware_spatial_grid(
     if tile_count < 1:
         raise ValueError(f"tile_count must be >= 1, got {tile_count}")
 
+    if overlap < 0:
+        raise ValueError(f"overlap must be >= 0, got {overlap}")
+    if min_tile_height < 1 or min_tile_width < 1:
+        raise ValueError(f"minimum tile dimensions must be >= 1, got {min_tile_height}x{min_tile_width}")
+
     candidates = []
     for height_count in range(1, tile_count + 1):
         if tile_count % height_count:

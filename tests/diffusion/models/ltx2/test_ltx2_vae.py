@@ -242,6 +242,45 @@ class TestLTXDiffusionDecoder:
 
         assert minimum == (3, 7, 7)
 
+    @pytest.mark.parametrize("height,width,parallel_size", [(7, 20, 8), (20, 7, 8), (7, 7, 2)])
+    def test_distributed_diffusion_tile_planner_rejects_illegal_natten_tiles(self, height, width, parallel_size):
+        from vllm_omni.diffusion.models.ltx2.vae.distributed import _shape_aware_spatial_grid
+
+        with pytest.raises(ValueError, match="legal spatial tiles"):
+            _shape_aware_spatial_grid(
+                height=height,
+                width=width,
+                tile_count=parallel_size,
+                overlap=4,
+                min_tile_height=7,
+                min_tile_width=7,
+            )
+
+    @pytest.mark.parametrize("height,width,parallel_size", [(61, 35, 8), (35, 61, 8), (13, 13, 4), (7, 60, 4)])
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+    def test_shape_aware_tiles_reconstruct_batched_video_without_seams(self, height, width, parallel_size, dtype):
+        from vllm_omni.diffusion.models.ltx2.vae.distributed import DistributedLTX2VideoDiffusionDecoderModel
+
+        with torch.device("meta"):
+            model = DistributedLTX2VideoDiffusionDecoderModel()
+        model.distributed_executor = _DistributedExecutorProbe(parallel_size=parallel_size, world_size=parallel_size)
+        # Use small output scales to exercise all overlap pixels without
+        # allocating a production-resolution RGB video in a CPU test.
+        model.spatial_compression_ratio = 2
+        model.temporal_compression_ratio = 2
+        plan = model._build_tiled_decode_plan(torch.empty(2, 128, 3, height, width))
+        expected = torch.randn(2, 3, *plan.output_shape).to(dtype)
+        tiles = {
+            (hi, wi): expected[..., h0 * 2 : h1 * 2, w0 * 2 : w1 * 2]
+            for hi, (h0, h1) in enumerate(plan.height_tiles)
+            for wi, (w0, w1) in enumerate(plan.width_tiles)
+        }
+
+        actual = model._merge_tiled_decode(tiles, plan)
+
+        assert actual.dtype == dtype
+        torch.testing.assert_close(actual, expected)
+
     def test_distributed_diffusion_tile_merge_uses_complementary_spatial_masks(self):
         from vllm_omni.diffusion.models.ltx2.vae.distributed import (
             DistributedLTX2VideoDiffusionDecoderModel,
