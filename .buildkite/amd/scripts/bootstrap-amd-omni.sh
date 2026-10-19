@@ -171,7 +171,7 @@ upload_pipeline() {
         # the commit header without requiring the parent object locally.
         VLLM_AITER_MHA_TRUSTED_COMMIT=$(git cat-file -p HEAD | sed -n 's/^parent //p' | head -n 1)
     else
-        VLLM_AITER_MHA_TRUSTED_COMMIT=$(git merge-base origin/main HEAD)
+        VLLM_AITER_MHA_TRUSTED_COMMIT=$DIFF_BASE
     fi
 
     cd .buildkite/amd
@@ -197,7 +197,7 @@ upload_pipeline() {
             -D mirror_hw="$AMD_MIRROR_HW" \
             -D fail_fast="$FAIL_FAST" \
             -D vllm_use_precompiled="$VLLM_USE_PRECOMPILED" \
-            -D vllm_merge_base_commit="$(git merge-base origin/main HEAD)" \
+            -D vllm_merge_base_commit="$DIFF_BASE" \
             -D vllm_aiter_mha_trusted_commit="$VLLM_AITER_MHA_TRUSTED_COMMIT" \
             -D cov_enabled="$COV_ENABLED" \
             -D vllm_ci_branch="$VLLM_CI_BRANCH" \
@@ -213,17 +213,42 @@ upload_pipeline() {
     exit 0
 }
 
-get_diff() {
-    git diff --name-only --diff-filter=ACMDR "$(git merge-base origin/main HEAD)"
+# First parent for a release-line push. A depth-one checkout has the commit
+# but not its parent object, so deepen once before diffing. Failure falls
+# back to running every suite instead of aborting under set -e.
+release_line_parent_base() {
+    if git rev-parse --verify --quiet 'HEAD^' >/dev/null; then
+        git rev-parse 'HEAD^'
+        return 0
+    fi
+    echo "AMD release-line checkout cannot resolve HEAD^; deepening by 1." >&2
+    if ! git fetch --deepen=1; then
+        return 1
+    fi
+    if git rev-parse --verify --quiet 'HEAD^' >/dev/null; then
+        git rev-parse 'HEAD^'
+        return 0
+    fi
+    return 1
 }
 
-get_diff_main() {
-    git diff --name-only --diff-filter=ACMDR HEAD~1
-}
-
-file_diff=$(get_diff)
+# Choose the diff base before any git command that can fail the bootstrap.
+# A release-line push must not call merge-base origin/main: that ref is often
+# absent on a fresh shallow checkout, and set -e would skip the upload.
+DIFF_BASE=""
 if is_release_line_push; then
-    file_diff=$(get_diff_main)
+    if ! DIFF_BASE=$(release_line_parent_base); then
+        echo "release-line parent is unavailable; running all AMD tests." >&2
+        RUN_ALL=1
+        DIFF_BASE=""
+    fi
+else
+    DIFF_BASE=$(git merge-base origin/main HEAD)
+fi
+
+file_diff=""
+if [[ -n "$DIFF_BASE" ]]; then
+    file_diff=$(git diff --name-only --diff-filter=ACMDR "$DIFF_BASE")
 fi
 
 # Resolve PR tier labels before skip-ci so ready/merge suites can be filtered
@@ -292,8 +317,6 @@ else
 fi
 
 
-LIST_FILE_DIFF=$(get_diff | tr ' ' '|')
-if is_release_line_push; then
-    LIST_FILE_DIFF=$(get_diff_main | tr ' ' '|')
-fi
+# Same base as file_diff. Do not resolve origin/main a second time.
+LIST_FILE_DIFF=$(printf '%s' "$file_diff" | tr ' ' '|')
 upload_pipeline

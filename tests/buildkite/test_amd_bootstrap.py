@@ -176,6 +176,23 @@ def _git_calls(tmp_path: Path) -> list[str]:
     return (tmp_path / "git-calls.txt").read_text(encoding="utf-8").splitlines()
 
 
+def test_release_line_diff_does_not_query_main_merge_base(tmp_path):
+    result = _run_bootstrap(tmp_path, pull_request=False, branch="release/v0.30.0")
+
+    assert result.returncode == 0, result.stderr
+    calls = _git_calls(tmp_path)
+    assert not any("merge-base" in call for call in calls)
+    assert any("rev-parse" in call and "HEAD^" in call for call in calls)
+
+
+def test_feature_branch_diff_uses_main_merge_base_once(tmp_path):
+    result = _run_bootstrap(tmp_path, pull_request=True, branch="feature")
+
+    assert result.returncode == 0, result.stderr
+    merge_base_calls = [call for call in _git_calls(tmp_path) if "merge-base" in call]
+    assert merge_base_calls == ["merge-base origin/main HEAD"]
+
+
 def test_version_branch_reads_parent_from_commit_header(tmp_path):
     result = _run_bootstrap(tmp_path, pull_request=False, branch="release/v0.30.0")
 
