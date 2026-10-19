@@ -82,6 +82,7 @@ from vllm_omni.benchmarks.duplex.omni_duplex_eval_serving import (
     get_duplex_eval_samples,
     prepare_duplex_eval_sample,
 )
+from vllm_omni.benchmarks.duplex_session_inputs import TURN_DETECTION_NONE
 from vllm_omni.benchmarks.omniinteract import (
     VIDEO_FPS,
     OmniInteractBenchmarkConfig,
@@ -654,10 +655,12 @@ def get_samples(args, tokenizer, **kwargs):
             output_root=output_root,
             timeout_s=float(getattr(args, "omniinteract_timeout_s")),
             media_timeout_s=float(getattr(args, "omniinteract_media_timeout_s")),
-            ref_audio=str(getattr(args, "omniinteract_ref_audio")),
+            ref_audio=getattr(args, "omniinteract_ref_audio", None) or None,
             require_response=bool(getattr(args, "omniinteract_require_response")),
             max_video_duration_s=float(getattr(args, "omniinteract_max_video_duration_s")),
             evaluation=evaluation,
+            turn_detection=str(getattr(args, "omniinteract_turn_detection", TURN_DETECTION_NONE)),
+            instructions=getattr(args, "omniinteract_instructions", None) or None,
         )
         requests = dataset.sample(
             tokenizer,
@@ -670,7 +673,6 @@ def get_samples(args, tokenizer, **kwargs):
         from vllm_omni.clients.duplex import reference_audio_data_url
 
         encoded_ref_audio = reference_audio_data_url(options.ref_audio)
-        assert encoded_ref_audio is not None
         for request in requests:
             case = request.omniinteract_case
             assert isinstance(request, OmniInteractSampleRequest) and case is not None
@@ -2909,6 +2911,8 @@ async def _async_request_omniinteract(
             require_response=options.require_response,
             extra_headers=headers or None,
             extra_body=dict(request_func_input.extra_body or {}) or None,
+            turn_detection=options.turn_detection,
+            instructions=options.instructions,
         )
         case_result = await run_omniinteract_case(
             case,
@@ -2973,8 +2977,8 @@ async def _async_request_duplex_eval(request: RequestFuncInput, *, pbar: tqdm | 
     output.tpot_measured = False
     try:
         sample = getattr(request, "duplex_eval_sample", None)
-        if not isinstance(sample, OmniDuplexEvalSampleRequest) or sample.sample is None or sample.ref_audio is None:
-            raise ValueError("Omni-DuplexEval requires a dataset sample and reference audio")
+        if not isinstance(sample, OmniDuplexEvalSampleRequest) or sample.sample is None:
+            raise ValueError("Omni-DuplexEval requires a dataset sample")
         # The benchmark's concurrency slot bounds live decoded inputs. Keep
         # preparation off the event loop and outside this session's latency;
         # throughput still includes any client preparation stalls.
@@ -2992,6 +2996,8 @@ async def _async_request_duplex_eval(request: RequestFuncInput, *, pbar: tqdm | 
                 fps=sample.fps,
                 prepared=prepared,
                 defer_artifacts=True,
+                turn_detection=sample.turn_detection,
+                instructions=sample.instructions,
                 additional_headers=headers or None,
                 extra_body=dict(request.extra_body or {}),
             ),
@@ -3826,6 +3832,14 @@ async def benchmark(
     ]
     if duplex_request_metrics:
         result["duplex_request_metrics"] = duplex_request_metrics
+        from vllm_omni.benchmarks.duplex_session_metrics import (
+            duplex_response_latency_metrics,
+            print_duplex_response_latency_metrics,
+        )
+
+        response_latency = duplex_response_latency_metrics(duplex_request_metrics)
+        result.update(response_latency)
+        print_duplex_response_latency_metrics(response_latency)
     duplex_session_metrics = [
         session_metrics
         for output in outputs

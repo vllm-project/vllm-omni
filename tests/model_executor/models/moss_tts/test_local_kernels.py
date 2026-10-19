@@ -135,15 +135,15 @@ def test_fused_sampling_graph_rng():
     assert ((result >= 0) & (result < 25)).all()
 
 
+@pytest.mark.nvidia_only
 @torch.inference_mode()
-def test_fused_frame_compilation_sampling_and_replay():
+def test_fused_frame_sampling_and_replay():
     from tests.model_executor.models.moss_tts.test_local_depth_qkv_lookup import _models
 
     model, embeddings, heads, stop_head = _models(12, "cuda", torch.bfloat16)
     model.prepare_qkv_lookup(embeddings, 12)
     model._fused_attention = True
     model._fused_sampling = True
-    model.setup_compile()
     graphs = []
     for batch in (1, 4):
         hidden = torch.randn(batch, 32, device="cuda", dtype=torch.bfloat16)
@@ -312,3 +312,19 @@ def test_unsupported_sampling_uses_reference_helper(monkeypatch, options):
     _, codes = model.generate_frame(hidden, heads, embeddings, stop_head, n_vq=12, **options)
     assert codes.shape == (4, 12)
     assert ((codes >= 0) & (codes < 19)).all()
+
+
+@pytest.mark.parametrize("rows", [1, 64])
+def test_add_layer_norm_matches_residual_add_and_layer_norm(rows):
+    from vllm_omni.model_executor.models.moss_tts.local_kernels import add_layer_norm
+
+    torch.manual_seed(0)
+    norm = torch.nn.LayerNorm(2560, eps=1e-5, device="cuda", dtype=torch.bfloat16)
+    with torch.no_grad():
+        norm.weight.uniform_(0.5, 1.5)
+        norm.bias.uniform_(-0.1, 0.1)
+    x = torch.randn(rows, 2560, device="cuda", dtype=torch.bfloat16)
+    update = torch.randn_like(x)
+    residual, out = add_layer_norm(x, update, norm)
+    torch.testing.assert_close(residual, x + update, atol=0, rtol=0)
+    torch.testing.assert_close(out, norm(x + update), atol=2e-2, rtol=2e-2)

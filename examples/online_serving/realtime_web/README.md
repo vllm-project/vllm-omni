@@ -10,6 +10,9 @@ This implements [RFC #7222](https://github.com/vllm-project/vllm-omni/issues/722
 | `qwen3-turn --manual` | Press **Send turn**; mic pauses while the reply plays | No | No |
 | `qwen3-turn --vad` | Server detects trailing silence; speech interrupts replies | Sampled frames with each spoken turn | Yes |
 | `aura-ptt` | Hold **Hold to talk**; release commits. Hold also stops local playback | Sticky frames with speech; vision-follow every 2 frames only while unlocked (locked from PTT release until text-final / listen) | Yes |
+| `joyai-turn` | Latest observation once per second while idle, or **Send observation**; waits for response completion and playback | Camera frames without audio input | Yes |
+| `joyai-turn --speech-input` | Hold to talk; release commits speech, then camera observations resume while idle | Latest frame with speech and camera-only observations | Yes |
+| `joyai-turn --speech-input --vad` | Server detects trailing silence; speech interrupts replies | Latest frame with each utterance; no automatic camera-only commits | Yes |
 
 Qwen3 VAD uses an engine-owned duplex plugin: microphone upload continues
 while replies stream, and speech can interrupt generation and playback. The
@@ -61,6 +64,42 @@ Release itself locks vision immediately so a follow-up frame cannot abort the
 just-committed speech turn on Stage0/1 (`max_num_seqs=1`). Audio still playing
 does not hold the next vision turn once text is done.
 MiniCPM / Qwen profiles do not set `pushToTalk`, so the PTT control stays hidden.
+
+## JoyAI: camera observations and spoken replies
+
+Start the [JoyAI unified Realtime deployment](../../../recipes/JD/JoyAI-VL-Interaction.md#unified-realtime-session-textvideo), then:
+
+```bash
+python -m examples.online_serving.realtime_web --profile joyai-turn \
+    --ws-backend ws://127.0.0.1:8099 --port 7862
+```
+
+Set the task in **System prompt** before starting the session, then enable
+**Camera**. The client captures one frame per second and commits the latest
+frame while idle. **Send observation** also submits the current frame. During
+generation and playback, newer frames replace the pending observation; the
+next turn starts after both `response.done` and local playback finish.
+
+Replies appear as text and play through the existing speaker component, which
+sends `playback.ack`. This profile uses camera input and text instructions;
+the default does not request microphone access. The browser only requests camera
+permission when **Camera** is enabled. Use localhost or HTTPS for browser capture.
+
+For spoken instructions, start the `joyai_vl_interaction_asr_duplex.yaml`
+deployment and add `--speech-input` to the UI command. **Hold to talk** captures
+speech with the latest camera frame; releasing it commits only when that hold
+uploaded audio. Empty or muted holds do not submit a turn. Camera-only
+observations resume after the response and playback finish. Incoming speech may
+be buffered during playback; holding the button does not cancel the response.
+
+Add `--speech-input --vad` to commit speech automatically with shared server VAD
+(Silero must be available on the server). Speech interrupts an active reply,
+using the server's supported `interrupt_response: true` setting. Each utterance
+includes the latest camera frame. In this mode automatic camera-only observations
+are paused, so continuous silent watching uses the default camera mode or
+push-to-talk mode.
+The three-stage deployment rejects audio input; use the ASR deployment for both
+microphone modes.
 
 ## Qwen3: explicit-turn Realtime
 

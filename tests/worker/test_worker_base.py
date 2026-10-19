@@ -291,6 +291,96 @@ def test_no_graph_capture_says_nothing_about_the_reserve(monkeypatch, caplog):
     assert "CUDA graph" not in "\n".join(record.getMessage() for record in caplog.records)
 
 
+def _fake_device_memory(monkeypatch, free_values):
+    """Device free memory read before and after a capture."""
+    frees = iter(free_values)
+    monkeypatch.setattr(torch.accelerator, "synchronize", lambda *args, **kwargs: None)
+    monkeypatch.setattr(torch.accelerator, "empty_cache", lambda *args, **kwargs: None)
+    monkeypatch.setattr(torch.accelerator, "get_memory_info", lambda *args, **kwargs: (next(frees), 40 * GIB))
+
+
+@pytest.mark.parametrize("mode", [CUDAGraphMode.FULL, CUDAGraphMode.NONE])
+def test_auxiliary_graphs_are_measured_released_and_reserved(monkeypatch, caplog, mode):
+    """Model-owned graphs are captured once while profiling, measured, and
+    released before the KV cache is sized; warmup captures them for real. The
+    hook owns its graphs whatever the runner's cudagraph mode is."""
+    worker = _make_worker(requested_memory=30 * GIB, model_memory_usage=10 * GIB)
+    worker.vllm_config.compilation_config.cudagraph_mode = mode
+    calls = []
+    worker.model_runner.profile_run = lambda: calls.append("model")
+
+    def profile_graphs():
+        calls.append("graphs")
+        return 4 * GIB
+
+    worker.model_runner.profile_cudagraph_memory = profile_graphs
+    worker.model_runner.model = SimpleNamespace(
+        capture_auxiliary_graphs=lambda: calls.append("auxiliary"),
+        release_auxiliary_graphs=lambda: calls.append("release"),
+    )
+    monkeypatch.setattr(base, "current_omni_platform", SimpleNamespace(is_cuda_alike=lambda: True))
+    monkeypatch.setenv("VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS", "1")
+    monkeypatch.setattr(base, "memory_profiling", _fake_memory_profiling(non_torch=1 * GIB, torch_peak=2 * GIB))
+    _fake_device_memory(monkeypatch, [20 * GIB, 18 * GIB, 20 * GIB])
+
+    with caplog.at_level("INFO", logger=base.logger.name):
+        out = worker.determine_available_memory()
+
+    graphs = 4 * GIB if mode == CUDAGraphMode.FULL else 0
+    assert out == 30 * GIB - 13 * GIB - graphs - 2 * GIB
+    assert calls == ["model", *(["graphs"] if graphs else []), "auxiliary", "release"]
+    # capture_model() reports only the runner's graphs, so the estimate it is
+    # compared with leaves the auxiliary pool out; the persistent total keeps it.
+    assert worker.cudagraph_memory_estimate == graphs
+    assert worker.total_consumed == 3 * GIB + 2 * GIB
+    reserved = "\n".join(record.getMessage() for record in caplog.records)
+    assert f"Reserved {base.format_gib(graphs + 2 * GIB)} GiB for CUDA graphs" in reserved
+    assert f"({base.format_gib(0)} GiB still held after release)" in reserved
+
+
+def test_disabling_the_reserve_leaves_auxiliary_graphs_to_warmup(monkeypatch):
+    worker = _make_worker(requested_memory=30 * GIB, model_memory_usage=10 * GIB)
+    worker.vllm_config.compilation_config.cudagraph_mode = CUDAGraphMode.FULL
+    worker.model_runner.profile_cudagraph_memory = lambda: pytest.fail("the reserve is disabled")
+    worker.model_runner.model = SimpleNamespace(
+        capture_auxiliary_graphs=lambda: pytest.fail("warmup captures these when the reserve is off")
+    )
+    monkeypatch.setattr(base, "current_omni_platform", SimpleNamespace(is_cuda_alike=lambda: True))
+    monkeypatch.setenv("VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS", "0")
+    monkeypatch.setattr(base, "memory_profiling", _fake_memory_profiling(non_torch=1 * GIB, torch_peak=2 * GIB))
+
+    assert worker.determine_available_memory() == 17 * GIB
+
+
+@pytest.mark.parametrize(
+    "hooks",
+    [{}, {"capture_auxiliary_graphs": lambda: pytest.fail("cannot be released, so warmup captures it only")}],
+)
+def test_auxiliary_graphs_that_cannot_be_released_are_not_measured(monkeypatch, hooks):
+    worker = _make_worker(requested_memory=30 * GIB, model_memory_usage=10 * GIB)
+    worker.model_runner.model = SimpleNamespace(**hooks)
+    monkeypatch.setattr(torch.accelerator, "get_memory_info", lambda *args, **kwargs: pytest.fail("nothing to measure"))
+
+    assert worker._profile_auxiliary_graph_memory() == 0
+
+
+def test_auxiliary_graphs_are_released_when_capture_fails(monkeypatch):
+    worker = _make_worker(requested_memory=30 * GIB, model_memory_usage=10 * GIB)
+    released = []
+
+    def capture():
+        raise RuntimeError("capture failed")
+
+    worker.model_runner.model = SimpleNamespace(
+        capture_auxiliary_graphs=capture, release_auxiliary_graphs=lambda: released.append(True)
+    )
+    _fake_device_memory(monkeypatch, [20 * GIB])
+
+    with pytest.raises(RuntimeError, match="capture failed"):
+        worker._profile_auxiliary_graph_memory()
+    assert released == [True]
+
+
 @pytest.mark.parametrize(
     "runner_path", ["gpu_ar_model_runner.GPUARModelRunner", "gpu_generation_model_runner.GPUGenerationModelRunner"]
 )

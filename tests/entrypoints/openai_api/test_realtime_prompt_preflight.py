@@ -220,6 +220,74 @@ async def test_preflight_truncates_by_rendered_token_count() -> None:
 
 
 @pytest.mark.asyncio
+async def test_input_images_map_to_chat_multimodal_prompt() -> None:
+    websocket = _FakeWebSocket()
+    connection, renderer = _make_connection(websocket=websocket)
+    png_data_url = "data:image/png;base64," + base64.b64encode(b"png-frame").decode("ascii")
+    jpeg_data_url = "data:image/jpeg;base64," + base64.b64encode(b"jpeg-frame").decode("ascii")
+    event = types.ConversationItemCreateEvent.model_validate_json(
+        json.dumps(
+            {
+                "type": "conversation.item.create",
+                "event_id": "evt_create_image",
+                "item": {
+                    "id": "camera",
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "Watch the camera."},
+                        {"type": "input_image", "image_url": png_data_url, "detail": "low"},
+                        {"type": "input_image", "image_url": jpeg_data_url},
+                    ],
+                },
+            }
+        )
+    )
+
+    assert isinstance(event.item, types.RealtimeConversationItemUserMessage)
+    await connection._handle_item_create(event)
+    item = connection.session.items[-1]
+
+    await connection._build_full_prompt(instructions="Describe changes.", items=[item])
+
+    message = renderer.conversations[0][-1]
+    assert message["role"] == "user"
+    assert message["content"] == [
+        {"type": "text", "text": "Watch the camera."},
+        {"type": "image_url", "image_url": {"url": png_data_url, "detail": "low"}},
+        {"type": "image_url", "image_url": {"url": jpeg_data_url}},
+    ]
+
+
+@pytest.mark.parametrize("image_url", [None, ""])
+def test_input_image_requires_an_image_url(image_url: str | None) -> None:
+    connection, _renderer = _make_connection()
+    item = types.RealtimeConversationItemUserMessage(
+        id="camera",
+        type="message",
+        role="user",
+        content=[{"type": "input_image", "image_url": image_url}],
+    )
+
+    with pytest.raises(ValueError, match="input_image"):
+        connection._validate_input_item(item)
+
+
+def test_assistant_output_audio_is_rejected() -> None:
+    connection, _renderer = _make_connection()
+    item = types.RealtimeConversationItemAssistantMessage(
+        id="assistant-audio",
+        type="message",
+        role="assistant",
+        status="completed",
+        content=[{"type": "output_audio", "audio": base64.b64encode(b"\x00\x00").decode("ascii")}],
+    )
+
+    with pytest.raises(ValueError, match="assistant audio"):
+        connection._validate_input_item(item)
+
+
+@pytest.mark.asyncio
 async def test_persistent_model_context_cursor_reuses_truncated_window() -> None:
     connection, renderer = _make_connection()
     first = _message_item("first")

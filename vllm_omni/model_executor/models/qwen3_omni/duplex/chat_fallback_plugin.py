@@ -166,8 +166,10 @@ class Qwen3OmniChatFallbackPlugin(DuplexModelPlugin):
         config: DuplexSessionConfig,
         current: Mapping[str, object],
         item: Mapping[str, object],
+        *,
+        history_len: int | None = None,
     ) -> dict[str, object] | None:
-        del config, current, item
+        del config, current, item, history_len
         raise DuplexRuntimeConfigError("Qwen duplex tool calls are not implemented", code="unsupported_tools")
 
     def data_plane_context(

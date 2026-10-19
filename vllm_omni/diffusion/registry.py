@@ -106,6 +106,11 @@ _DIFFUSION_MODELS = {
         "pipeline_ltx2",
         "LTX2Pipeline",
     ),
+    "LTX2TextToAudioPipeline": (
+        "ltx2",
+        "pipeline_ltx2_audio",
+        "LTX2TextToAudioPipeline",
+    ),
     "LTX2TwoStagePipeline": (
         "ltx2",
         "pipeline_ltx2_two_stage",
@@ -186,6 +191,11 @@ _DIFFUSION_MODELS = {
         "pipeline",
         "LingBotWorldCausalDMDPipeline",
     ),
+    "TaoMateH3Pipeline": (
+        "taomate_h3",
+        "pipeline",
+        "TaoMateH3Pipeline",
+    ),
     "ABotWorldCausalPipeline": (
         "abot_world",
         "pipeline_abot_world",
@@ -250,11 +260,6 @@ _DIFFUSION_MODELS = {
         "pi0",
         "pipeline_pi0",
         "Pi0Pipeline",
-    ),
-    "Pi05Pipeline": (
-        "pi05",
-        "pipeline_pi05",
-        "Pi05Pipeline",
     ),
     "LongCatImageEditPipeline": (
         "longcat_image",
@@ -386,11 +391,6 @@ _DIFFUSION_MODELS = {
         "pipeline_diffusers_adapter",
         "DiffusersAdapterPipeline",
     ),
-    "HiDreamImagePipeline": (
-        "hidream_image",
-        "pipeline_hidream_image",
-        "HiDreamImagePipeline",
-    ),
     "HiDreamO1ImagePipeline": (
         "hidream_o1_image",
         "pipeline_hidream_o1_image",
@@ -406,6 +406,11 @@ _DIFFUSION_MODELS = {
         "pipeline_anima",
         "AnimaPipeline",
     ),
+    "CausVidWanPipeline": (
+        "causvid_wan",
+        "pipeline_causvid_wan",
+        "CausVidWanPipeline",
+    ),
     "StableDiffusionXLPipeline": (
         "sdxl",
         "pipeline_sdxl",
@@ -420,6 +425,11 @@ _DIFFUSION_MODELS = {
         "kandinsky6",
         "pipeline_kandinsky6",
         "Kandinsky6TI2VAPipeline",
+    ),
+    "MOSSImagePipeline": (
+        "mossimage",
+        "pipeline_mossimage",
+        "MOSSImagePipeline",
     ),
 }
 _DIFFUSION_MODELS["MingImageLayeredDiffusionPipeline"] = _DIFFUSION_MODELS["MingImageDiffusionPipeline"]
@@ -439,13 +449,15 @@ _NO_CACHE_ACCELERATION = {
     # Pipelines that do not support cache acceleration (cache_dit / tea_cache).
     "NextStep11Pipeline",
     "AnimaPipeline",
+    "LTX2TextToAudioPipeline",
     # π0 is a flow-matching VLA with a self-contained sample_actions loop and no
     # DiT-style ``.transformer`` block list, so cache_dit / tea_cache cannot apply
     # to it; list it here so a stray cache_backend override disables gracefully
     # instead of erroring.
     "Pi0Pipeline",
-    "Pi05Pipeline",
     "LingBotWorldCausalDMDPipeline",
+    "TaoMateH3Pipeline",
+    "CausVidWanPipeline",
     "ABotWorldCausalPipeline",
     # Qwen-Image 2.1's transformer carries its own prefix KV cache (keyed by CFG
     # branch) across denoising steps, which conflicts with cache_dit / tea_cache
@@ -693,6 +705,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "WanDMDPipeline": "get_wan22_post_process_func",
     "WanVACEPipeline": "get_wan22_vace_post_process_func",
     "LTX2Pipeline": "get_ltx2_post_process_func",
+    "LTX2TextToAudioPipeline": "get_ltx2_audio_post_process_func",
     "LTX2TwoStagePipeline": "get_ltx2_post_process_func",
     "LTX2DistilledOneStagePipeline": "get_ltx2_post_process_func",
     "LTX2DistilledTwoStagePipeline": "get_ltx2_post_process_func",
@@ -709,6 +722,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "WanT2VDMD2Pipeline": "get_wan22_post_process_func",
     "WanI2VDMD2Pipeline": "get_wan22_i2v_post_process_func",
     "LingBotWorldCausalDMDPipeline": "get_lingbot_world_post_process_func",
+    "TaoMateH3Pipeline": "get_taomate_h3_post_process_func",
     "ABotWorldCausalPipeline": "get_abot_world_post_process_func",
     "LongCatImagePipeline": "get_longcat_image_post_process_func",
     "LongCatVideoAvatarPipeline": "get_longcat_video_avatar_post_process_func",
@@ -718,7 +732,6 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "MingImageDiffusionPipeline": "get_ming_image_post_process_func",
     "InternVLAA1Pipeline": "get_internvla_a1_post_process_func",
     "Pi0Pipeline": "get_pi0_post_process_func",
-    "Pi05Pipeline": "get_pi05_post_process_func",
     "LongCatImageEditPipeline": "get_longcat_image_post_process_func",
     "StableDiffusion3Pipeline": "get_sd3_image_post_process_func",
     "FluxKontextPipeline": "get_flux_kontext_post_process_func",
@@ -744,12 +757,12 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "SenseNovaU1Pipeline": "get_sensenova_u1_post_process_func",
     "Cosmos3OmniDiffusersPipeline": "get_cosmos3_post_process_func",
     "Cosmos3OmniPipeline": "get_cosmos3_post_process_func",
-    "HiDreamImagePipeline": "get_hidream_image_post_process_func",
     "HiDreamO1ImagePipeline": "get_hidream_o1_image_post_process_func",
     "StableDiffusionXLPipeline": "get_sdxl_image_post_process_func",
     "Krea2Pipeline": "get_krea2_post_process_func",
     "HunyuanImage3ForCausalMM": "get_hunyuan_image3_post_process_func",
     "Kandinsky6TI2VAPipeline": "get_kandinsky6_post_process_func",
+    "MOSSImagePipeline": "get_mossimage_post_process_func",
 }
 _DIFFUSION_POST_PROCESS_FUNCS["MingImageLayeredDiffusionPipeline"] = _DIFFUSION_POST_PROCESS_FUNCS[
     "MingImageDiffusionPipeline"
@@ -764,6 +777,7 @@ _DIFFUSION_IR_OP_PRIORITY_FUNCS = {
 }
 
 _DIFFUSION_PRE_PROCESS_FUNCS = {
+    "MOSSImagePipeline": "get_mossimage_pre_process_func",
     "SeedVR2Pipeline": "get_seedvr2_pre_process_func",
     # arch: pre_process_func
     # `pre_process_func` function must be placed in {mod_folder}/{mod_relname}.py,

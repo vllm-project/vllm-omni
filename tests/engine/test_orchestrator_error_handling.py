@@ -985,6 +985,54 @@ async def test_diffusion_client_error_output_propagates_status_code(orchestrator
 
 
 @pytest.mark.asyncio
+async def test_joyai_asr_invalid_context_fails_only_its_request(orchestrator_factory, monkeypatch) -> None:
+    monkeypatch.setattr(joyai_bridge, "cached_processor_from_config", lambda _: None)
+
+    class JoyAIStage(FakeStageClient):
+        def process_engine_inputs(self, source_outputs, prompt=None, streaming_context=None):
+            self.bridge_inputs = joyai_bridge.asr_to_joyai(source_outputs, prompt)
+            return self.bridge_inputs
+
+    stage0 = FakeStageClient(stage_type="llm", final_output=False)
+    stage1 = JoyAIStage(stage_type="llm", final_output=True)
+    proc0, proc1 = FakeOutputProcessor(), FakeOutputProcessor()
+    fixture = orchestrator_factory([stage0, stage1], output_processors=[proc0, proc1])
+    fixture.orchestrator._stage_input_processors[1] = SimpleNamespace(
+        process_inputs=lambda *, request_id, params, **kwargs: _processed_request(request_id, params),
+        renderer=SimpleNamespace(mm_processor_cache=None),
+    )
+    invalid_info: dict[str, object] = {"joyai_prompt_context": {}}
+    for index, (request_id, info) in enumerate((("invalid-context", invalid_info), ("valid", {})), start=1):
+        await _enqueue_add_request(
+            fixture,
+            request_id=request_id,
+            prompt=SimpleNamespace(request_id=request_id, prompt_token_ids=[1, 2]),
+            original_prompt={"additional_information": info},
+            sampling_params_list=[_sampling_params(), _sampling_params()],
+            final_stage_id=1,
+        )
+        await _wait_for(lambda: len(stage0.add_request_calls) == index)
+        proc0.request_outputs = [_build_request_output(request_id, text="language English<asr_text>Hello.")]
+        stage0.push_engine_core_outputs(_engine_core_outputs(f"{request_id}-asr", float(index)))
+        if info:
+            error = await _wait_for_error_message(fixture, request_id=request_id)
+            assert error.status_code == 400 and not error.fatal
+            assert error.stage_id == 1 and "joyai_prompt_context" in error.error
+            assert not stage1.add_request_calls
+        else:
+            await _wait_for(lambda: bool(stage1.add_request_calls) or fixture.result_future.done())
+            assert not fixture.result_future.done()
+            assert "Hello." in stage1.bridge_inputs[0]["prompt"]
+            proc1.request_outputs = [_build_request_output(request_id, text="Completed.")]
+            stage1.push_engine_core_outputs(_engine_core_outputs(f"{request_id}-joyai", float(index)))
+            output = await _get_output_message(fixture)
+            assert output.request_id == request_id and output.finished
+        await _wait_for(lambda: request_id not in fixture.orchestrator.request_states)
+        assert all(pool.get_bound_replica_id(request_id) is None for pool in fixture.orchestrator.stage_pools)
+        assert fixture.thread.is_alive() and not fixture.result_future.done()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("first_speaker", ["Ryan", "not-a-real-speaker"])
 async def test_joyai_tts_request_validation_keeps_orchestrator_running(
     orchestrator_factory,
