@@ -74,6 +74,10 @@ logger = init_logger(__name__)
 _refusal_counts: dict[str, int] = {}
 _executed_windows = 0
 _executed_steps = 0
+# Windows that actually used the batched rotary prebuild; 0 means every window
+# fell back to the per-step update_cos_sin path (so the prebuild ordering is
+# not exercised at all).
+_windows_with_cos_prebuild = 0
 
 # WIA (window-internal amortization): second-order host-cost amortization
 # inside the K-step window, env-gated for A/B:
@@ -451,12 +455,16 @@ def execute_multi_step_window(
     """
     window_k = next(iter(plan.values()))
 
-    global _executed_steps
+    global _executed_steps, _windows_with_cos_prebuild
     _executed_steps += window_k
     if _executed_steps % (window_k * 50) == window_k or _executed_steps == window_k:
         logger.info(
-            "Multi-step counters: executed_windows=%d executed_steps=%d refusals=%s",
-            _executed_windows, _executed_steps, dict(sorted(_refusal_counts.items())),
+            "Multi-step counters: executed_windows=%d executed_steps=%d "
+            "cos_prebuilt_windows=%d refusals=%s",
+            _executed_windows,
+            _executed_steps,
+            _windows_with_cos_prebuild,
+            dict(sorted(_refusal_counts.items())),
         )
 
     with record_function_or_nullcontext("multi_step_window"):
@@ -591,6 +599,8 @@ def execute_multi_step_window(
             cos_prebuilt = _COS_PREBUILD and _prebuild_window_cos_sin(
                 runner, comp_cpu, num_reqs, window_k
             )
+            if cos_prebuilt:
+                _windows_with_cos_prebuild += 1
 
             for step in range(window_k):
                 with record_function_or_nullcontext("multi_step_window:step"):

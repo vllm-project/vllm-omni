@@ -288,6 +288,10 @@ def test_window_cos_sin_positions_are_step_major():
     """
     positions = msd_module.window_cos_sin_positions([100, 200], 2, 3)
     assert positions == [100, 200, 101, 201, 102, 202]
+    # The request-major order this used before the fix -- request 0's whole
+    # step run first -- would hand request 1 request 0's positions.
+    request_major = [100, 101, 102, 200, 201, 202]
+    assert positions != request_major
     num_reqs = 2
     for step in range(3):  # each per-step slice is one step across requests
         block = positions[step * num_reqs : (step + 1) * num_reqs]
