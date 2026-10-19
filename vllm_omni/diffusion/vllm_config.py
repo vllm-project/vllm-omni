@@ -10,11 +10,15 @@ from typing import Any, cast
 
 import torch
 from vllm.config import CompilationConfig, DeviceConfig, KernelConfig, KVTransferConfig, VllmConfig
+from vllm.config.lora import LoRAConfig
 from vllm.transformers_utils.config import get_hf_text_config
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.platforms import current_omni_platform
+
+# Dense diffusion has no native scheduler token budget to inherit.
+DEFAULT_DIFFUSION_MOE_LORA_MAX_TOKENS = 65536
 
 
 def resolve_diffusion_max_model_len(od_config: OmniDiffusionConfig) -> int:
@@ -75,6 +79,9 @@ class _DiffusionVllmModelConfig:
     hf_text_config: Any | None = None
     multimodal_config: Any | None = None
     enforce_eager: bool = False
+    # Omni manages diffusion sleep/offload itself; native attention still
+    # queries this flag when selecting its CUDA graph pool.
+    sleep_mode_offload_cudagraph: bool = False
     disable_cascade_attn: bool = False
     enable_return_routed_experts: bool = False
     enable_prompt_embeds: bool = False
@@ -190,6 +197,24 @@ def _make_diffusion_vllm_model_config(od_config: OmniDiffusionConfig) -> _Diffus
     )
 
 
+def resolve_diffusion_moe_lora_token_capacity(
+    od_config: OmniDiffusionConfig,
+    vllm_config: VllmConfig,
+) -> int | None:
+    """Resolve the preallocated token-mapping capacity for dynamic MoE LoRA."""
+    if not od_config.is_moe:
+        return None
+    if od_config.diffusion_kv_mode is DiffusionKVCacheMode.PAGED_SCHEDULER:
+        capacity = vllm_config.scheduler_config.max_num_batched_tokens
+    else:
+        capacity = od_config.max_num_batched_tokens
+        if capacity is None:
+            capacity = DEFAULT_DIFFUSION_MOE_LORA_MAX_TOKENS
+    if type(capacity) is not int or capacity <= 0:
+        raise ValueError("MoE LoRA requires a positive token capacity")
+    return capacity
+
+
 def create_base_diffusion_vllm_config(
     device: torch.device,
     od_config: OmniDiffusionConfig,
@@ -219,6 +244,18 @@ def configure_diffusion_vllm_config(vllm_config: VllmConfig, od_config: OmniDiff
     vllm_config.parallel_config.enable_expert_parallel = parallel_config.enable_expert_parallel
 
     vllm_config.model_config = _make_diffusion_vllm_model_config(od_config)  # type: ignore[assignment]
+    lora_backend = getattr(od_config, "lora_backend", "peft")
+    lora_backend = getattr(lora_backend, "value", lora_backend)
+    if od_config.is_moe and lora_backend == "peft":
+        vllm_config.lora_config = LoRAConfig(
+            max_lora_rank=512,
+            max_loras=1,
+            max_cpu_loras=getattr(od_config, "max_cpu_loras", 1) or 1,
+            lora_dtype=od_config.dtype,
+            fully_sharded_loras=False,
+        )
+    else:
+        vllm_config.lora_config = None
     vllm_config.quant_config = od_config.quantization_config
     vllm_config.profiler_config = od_config.profiler_config
     if (
@@ -241,6 +278,16 @@ def configure_diffusion_vllm_config(vllm_config: VllmConfig, od_config: OmniDiff
     kv_transfer_config = getattr(od_config, "kv_transfer_config", None)
     if kv_transfer_config is not None:
         vllm_config.kv_transfer_config = cast(KVTransferConfig, kv_transfer_config)
+
+    # Weight transfer (RL training). Accepts the raw deploy dict or a
+    # pre-built config, mirroring upstream EngineArgs' dict coercion.
+    weight_transfer_config = getattr(od_config, "weight_transfer_config", None)
+    if weight_transfer_config is not None:
+        from vllm.config.weight_transfer import WeightTransferConfig
+
+        if isinstance(weight_transfer_config, dict):
+            weight_transfer_config = WeightTransferConfig(**weight_transfer_config)
+        vllm_config.weight_transfer_config = weight_transfer_config
     return vllm_config
 
 

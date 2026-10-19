@@ -369,6 +369,7 @@ def test_draining_empty_eos_completes_owning_response_before_shortcut() -> None:
             session=session,
             plugin=SimpleNamespace(data_plane=_Plane()),
             stage_port=port,
+            history_calibration=None,
             model_state=SimpleNamespace(clear_continuation=lambda: None),
             services=SimpleNamespace(spawn=lambda *_a, **_k: None),
             run=DuplexRunState(),
@@ -461,6 +462,7 @@ def test_draining_completion_drops_finished_response_books_only() -> None:
             session=session,
             plugin=SimpleNamespace(data_plane=_Plane()),
             stage_port=_Port(),
+            history_calibration=None,
             model_state=SimpleNamespace(clear_continuation=lambda: None),
             services=SimpleNamespace(spawn=lambda *_a, **_k: None),
             run=DuplexRunState(),
@@ -726,3 +728,75 @@ def test_silent_listen_aborts_data_plane_request_with_full_id() -> None:
     )
     assert aborts == [[request_id]]
     assert all(len(item) > 1 for batch in aborts for item in batch), "must not split request id into chars"
+
+
+def test_fast_tool_result_does_not_end_a_live_non_resumable_request() -> None:
+    import asyncio
+    from types import SimpleNamespace
+
+    from vllm_omni.engine.duplex.config import DuplexCapabilities, DuplexSessionConfig
+    from vllm_omni.engine.duplex.session.engine_session import DuplexEngineSession
+    from vllm_omni.engine.duplex.session.model_channel import ModelChannel
+
+    session = DuplexEngineSession(
+        session_id="s-fast-tool",
+        config=DuplexSessionConfig(model="m", modalities=["text", "audio"]),
+        capabilities=DuplexCapabilities(supports_core_resumable_request=False),
+    )
+    session.begin_response(turn_id=1)
+    live = session.active_response_id
+    session.bind_request("req-live")
+
+    class _Plane:
+        def is_terminal(self, request_id: str | None) -> bool:
+            del request_id
+            return False
+
+    class _Out:
+        def __init__(self) -> None:
+            self.events: list[dict[str, object]] = []
+
+        def auto_responds(self) -> bool:
+            return False
+
+        def emit(self, payload: dict[str, object]) -> None:
+            self.events.append(payload)
+
+    out = _Out()
+    cleared: list[bool] = []
+
+    async def _noop(*_args: object, **_kwargs: object) -> None:
+        return None
+
+    channel = ModelChannel(
+        SimpleNamespace(
+            session=session,
+            plugin=SimpleNamespace(data_plane=_Plane()),
+            stage_port=SimpleNamespace(),
+            history_calibration=None,
+            model_state=SimpleNamespace(clear_continuation=lambda: cleared.append(True)),
+            services=SimpleNamespace(spawn=lambda *_a, **_k: None),
+            run=SimpleNamespace(closing=False, stream_request_id="req-live"),
+        ),
+        out,
+        close_from_runtime=_noop,
+        schedule_silence_continuation=_noop,
+        abort_request=_noop,
+    )
+    asyncio.run(channel.maybe_continue_response(expected_epoch=session.epoch))
+    assert session.active_response_id == live
+    assert [event.get("type") for event in out.events] == []
+    assert cleared == [True]
+
+    session.clear_request()
+    asyncio.run(
+        channel._send_one_model_output_event(
+            {
+                "data_plane_request_id": "req-live",
+                "text": "still here",
+                "model_turn_id": 1,
+                "end_of_turn": False,
+            }
+        )
+    )
+    assert any(event.get("text") == "still here" for event in out.events)

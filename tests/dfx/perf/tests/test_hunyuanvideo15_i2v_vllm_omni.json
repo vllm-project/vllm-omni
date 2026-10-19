@@ -16,11 +16,12 @@
       "full_model",
       "diffusion"
     ],
-    "description": "Single-device baseline",
+    "description": "Single-device baseline with VAE tiling for 80GB GPUs",
     "server_params": {
       "model": "hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_i2v",
       "serve_args": {
         "flow-shift": 5.0,
+        "vae-use-tiling": true,
         "enable-diffusion-pipeline-profiler": true
       }
     },

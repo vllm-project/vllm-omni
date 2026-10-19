@@ -6,15 +6,17 @@ from __future__ import annotations
 
 import asyncio
 import json
+import queue
 from collections.abc import AsyncGenerator, Callable
 from http import HTTPStatus
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
 
+import anyio
 import numpy as np
 import pytest
-from fastapi import FastAPI, HTTPException, WebSocket
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from pytest_mock import MockerFixture
 from starlette.testclient import TestClient
 
@@ -211,7 +213,7 @@ def test_disconnect_aborts_while_generation_waits_for_playback(mocker: MockerFix
         mock_generate=generate,
     )
 
-    async def abort(request_id):
+    async def abort(request_id, *, timeout=None):
         aborted.set()
 
     engine.abort = mocker.AsyncMock(side_effect=abort)
@@ -1107,8 +1109,12 @@ class TestStreamingVideoOutputPromptUpdate:
             streaming_buffer_seconds=0.75,
         )
 
-        async def submit(request_id, *, interaction):
+        engine_client.reserve_streaming_interaction = mocker.AsyncMock(return_value=12.5)
+        engine_client.release_streaming_interaction = mocker.AsyncMock()
+
+        async def submit(request_id, *, interaction, track_playback):
             del request_id
+            assert track_playback is True
             delivered_ids.append(interaction["event_id"])
             delivery_started.set()
             await release_delivery.wait()
@@ -1141,6 +1147,7 @@ class TestStreamingVideoOutputPromptUpdate:
 
         queued = [m["event_id"] for m in ws.sent_json if m.get("type") == "session.interaction.queued"]
         assert queued == ["first", "second"]
+        assert next(m for m in ws.sent_json if m.get("event_id") == "first")["received_at"] == 12.5
         assert any(m.get("type") == "session.pong" for m in ws.sent_json)
         assert delivered_ids == ["first"]
 
@@ -1262,7 +1269,7 @@ async def test_blocked_media_send_does_not_block_playback_or_stop(mocker: Mocker
 
     handler, engine, ws = _build_handler_for_async_tests(mocker, mock_generate=generate)
     engine.update_streaming_playback = mocker.AsyncMock()
-    engine.abort = mocker.AsyncMock(side_effect=lambda *_: aborted.set())
+    engine.abort = mocker.AsyncMock(side_effect=lambda *_, **__: aborted.set())
 
     async def send_bytes(data):
         sending.set()
@@ -1356,7 +1363,7 @@ async def test_control_ack_outbox_overflow_aborts_before_notification(mocker: Mo
         )
 
     handler, engine, ws = _build_handler_for_async_tests(mocker, mock_generate=generate)
-    engine.abort = mocker.AsyncMock(side_effect=lambda *_: aborted.set())
+    engine.abort = mocker.AsyncMock(side_effect=lambda *_, **__: aborted.set())
 
     async def send_bytes(_data):
         sending.set()
@@ -1409,6 +1416,7 @@ async def test_interaction_event_id_is_bounded_before_queueing(mocker: MockerFix
         interaction_queue=asyncio.Queue(maxsize=64),
         stop_event=asyncio.Event(),
         progress=_SessionProgress(),
+        track_playback=True,
         response_queue=responses,
     )
     assert "at most 128" in responses.get_nowait()["message"]
@@ -1461,3 +1469,132 @@ async def test_stop_after_final_media_cancels_pending_interaction(mocker: Mocker
     # Cancellation response latency is exposed on the stop terminal.
     assert 0 <= ws.sent_json[-1]["stop_latency_s"] < 30
     assert not (asyncio.all_tasks() - tasks_before)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("disconnected", [False, True])
+async def test_session_scope_cancel_during_cleanup_reaps_all_tasks(mocker: MockerFixture, disconnected: bool):
+    """A disconnect during cleanup must not strand the other session tasks."""
+
+    async def generate(*_args, **_kwargs):
+        yield OmniRequestOutput.from_diffusion(
+            request_id="req-ws", images=[_fake_video_frames(2)], final_output_type="image", finished=True
+        )
+
+        if disconnected:
+            raise WebSocketDisconnect()
+
+    handler, engine, ws = _build_handler_for_async_tests(mocker, mock_generate=generate)
+    original_control = handler._control_loop
+    original_release = handler._release_queued_interactions
+    release_completed = False
+
+    async def release_queued_interactions(*args, **kwargs):
+        nonlocal release_completed
+        # Releasing a queued reservation can yield while waiting for the host RPC.
+        await anyio.sleep(0)
+        await original_release(*args, **kwargs)
+        release_completed = True
+
+    mocker.patch.object(handler, "_release_queued_interactions", release_queued_interactions)
+    cleanup_completed = False
+    tasks_before = asyncio.all_tasks()
+    try:
+        with anyio.CancelScope() as scope:
+
+            async def control(*args, **kwargs):
+                try:
+                    await original_control(*args, **kwargs)
+                finally:
+                    # Model Starlette cancelling the ASGI scope as the client exits
+                    # immediately after receiving session.done.
+                    scope.cancel()
+
+            mocker.patch.object(handler, "_control_loop", control)
+            await handler.handle_session(ws)
+            cleanup_completed = True
+
+    finally:
+        remaining = asyncio.all_tasks() - tasks_before
+        # Reap leaked tasks on the failing baseline, too.
+        for task in remaining:
+            task.cancel()
+        await asyncio.gather(*remaining, return_exceptions=True)
+    assert cleanup_completed
+    assert release_completed
+    assert not remaining
+    if disconnected:
+        engine.abort.assert_awaited_once()
+    else:
+        assert ws.sent_json[-1]["type"] == "session.done"
+        engine.abort.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_session_bounds_unresponsive_abort(mocker: MockerFixture):
+    async def generate(*_args, **_kwargs):
+        raise WebSocketDisconnect()
+        yield  # pragma: no cover
+
+    handler, engine, ws = _build_handler_for_async_tests(mocker, mock_generate=generate)
+    mocker.patch("vllm_omni.entrypoints.openai.serving_video_output_stream.ABORT_TIMEOUT_S", 0.01)
+    abort_exited = asyncio.Event()
+
+    async def abort(request_id, *, timeout=None):
+        scope.cancel()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            abort_exited.set()
+
+    engine.abort.side_effect = abort
+    tasks_before = asyncio.all_tasks()
+    scope = anyio.CancelScope()
+
+    async def session():
+        with scope:
+            await handler.handle_session(ws)
+
+    # Keep the watchdog outside the ASGI scope being cancelled.
+    await asyncio.wait_for(session(), timeout=1)
+    assert abort_exited.is_set()
+    assert not (asyncio.all_tasks() - tasks_before)
+    engine.abort.assert_awaited_once_with(ws.sent_json[0]["request_id"], timeout=0.01)
+
+
+@pytest.mark.asyncio
+async def test_video_abort_passes_deadline_to_rpc_waiter(mocker: MockerFixture):
+    from functools import partial
+
+    from vllm_omni.engine.omni_engine_base import OmniEngineBase
+    from vllm_omni.engine.rpc_result_router import CorrelatedRpcClient
+    from vllm_omni.entrypoints.async_omni import AsyncOmni
+    from vllm_omni.entrypoints.async_omni_base import AsyncOmniBase
+
+    async def generate(*_args, **_kwargs):
+        yield  # pragma: no cover
+
+    handler, client, _ws = _build_handler_for_async_tests(mocker, mock_generate=generate)
+    mocker.patch("vllm_omni.entrypoints.openai.serving_video_output_stream.ABORT_TIMEOUT_S", 0.1)
+    state = mocker.Mock(request_id="internal", external_request_id="external")
+    client.request_states = {"internal": state}
+    client.abort = partial(AsyncOmni.abort, client)
+    client._abort = partial(AsyncOmniBase._abort, client)
+    engine = mocker.Mock(spec=OmniEngineBase)
+    engine._shutdown_called = False
+    engine.request_queue = mocker.Mock()
+    client.engine = engine
+    engine.abort_async = partial(OmniEngineBase.abort_async, engine)
+    transport = object.__new__(CorrelatedRpcClient)
+    transport._request_queue = mocker.Mock()
+    transport._router = mocker.Mock()
+    waiter = transport._router.register.return_value
+    waiter.get.side_effect = queue.Empty
+    engine._correlated_rpc_client = transport
+
+    await handler._abort_request("external")
+
+    waiter.get.assert_called_once_with(timeout=0.1)
+    transport._router.unregister.assert_called_once()
+    message = transport._request_queue.put.call_args.args[0]
+    assert message.request_ids == ["internal"]

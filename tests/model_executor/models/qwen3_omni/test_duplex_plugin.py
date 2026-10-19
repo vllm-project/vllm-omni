@@ -23,7 +23,9 @@ from vllm_omni.engine.duplex.commands import (
     AckPlayback,
     CancelResponse,
     ClearOutputAudio,
+    CloseSession,
     Commit,
+    CreateItem,
     CreateResponse,
     UpdateSession,
 )
@@ -31,12 +33,19 @@ from vllm_omni.engine.duplex.config import DuplexSessionConfig
 from vllm_omni.engine.duplex.delivery import DuplexOutputBuffer
 from vllm_omni.engine.duplex.messages import OpenDuplexSessionMessage
 from vllm_omni.engine.duplex.plugin import DuplexRuntimeConfigError
+from vllm_omni.engine.duplex.session.history_calibration import HistoryCalibrationPolicy
 from vllm_omni.engine.duplex.session.manager import DuplexSessionManager
+from vllm_omni.engine.duplex.session.tool_calls import ToolCallOrigin
 from vllm_omni.model_executor.models.qwen3_omni.duplex.input import QwenPcmBuffer
 from vllm_omni.model_executor.models.qwen3_omni.duplex.plugin import MAX_PROMPT_IMAGES, Qwen3OmniDuplexPlugin
 from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.protocol.realtime.items import normalize_conversation_item
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+def _without_src(messages):
+    return [{key: value for key, value in message.items() if key != "_src"} for message in messages]
 
 
 def test_buffer_commit_and_rollback_preserve_all_samples():
@@ -73,8 +82,24 @@ def test_buffer_refuses_video_frames_and_points_at_the_openai_interface():
     committed.commit()
 
 
-async def open_qwen():
+def test_capabilities_advertise_image_items_not_append_frames():
+    """Clients choose how to send frames from these fields; they must match the buffer's refusal."""
+    caps = Qwen3OmniDuplexPlugin(lambda audio, *args: "AAAA").capabilities(max_sessions=1)
+    assert caps.supports_image_input
+    assert not caps.accepts_input_modality("video")
+    assert caps.validate_append_modalities(has_audio=True, has_video=True) == (
+        "This duplex model does not accept video_frames"
+    )
+    assert caps.validate_append_modalities(has_audio=True, has_video=False) is None
+
+
+async def open_qwen(
+    *, calibrate=None, calibration_timeout_ms=1000, history_max_bytes=8 * 1024 * 1024, requires_audio=True
+):
     plugin = Qwen3OmniDuplexPlugin(lambda audio, *args: "AAAA")
+    if calibrate is not None:
+        plugin.history_calibrator = lambda config: HistoryCalibrationPolicy(calibrate, requires_audio=requires_audio)
+        plugin.data_plane.retain_history_audio = requires_audio
     plugin.processor = SimpleNamespace(apply_chat_template=lambda messages, **kw: repr(messages))
     port = RecordingStagePort(stage_count=3)
     output: asyncio.Queue[Any] = asyncio.Queue()
@@ -85,7 +110,10 @@ async def open_qwen():
         stage_port=port,
         output_sink=output,
         result_sink=results,
-        runtime_config=DuplexSessionRuntimeConfig(),
+        runtime_config=DuplexSessionRuntimeConfig(
+            history_calibration_timeout_ms=calibration_timeout_ms,
+            history_audio_max_bytes_per_session=history_max_bytes,
+        ),
         model_config=None,
     )
     config = DuplexSessionConfig(model="qwen", modalities=["text", "audio"], overlap_policy="barge_in_on_speech")
@@ -106,6 +134,164 @@ async def open_qwen():
     )
     await harness.settle()
     return harness
+
+
+def _register_exposed_call(
+    h,
+    call_id: str,
+    *,
+    name: str = "get_weather",
+    arguments: str = '{"city":"Paris"}',
+    note: bool = True,
+) -> None:
+    """Record the call the session publishes, not a history item.
+
+    Admission reads the ledger. Stuffing ``conversation_items`` does not
+    expose a call. ``note`` is false when the test already stored the Qwen
+    history anchor at an earlier length.
+    """
+    h.runner.tool_calls.register(
+        ToolCallOrigin(
+            call_id=call_id,
+            epoch=h.session.epoch,
+            turn_id=h.session.turn_id,
+            response_id=f"resp_{call_id}",
+            item_id=f"item_{call_id}",
+            name=name,
+            arguments=arguments,
+        )
+    )
+    if not note:
+        return
+    noted = h.runner.plugin.note_published_function_call(
+        h.session.runtime_config,
+        call_id=call_id,
+        history_len=len(h.session.history),
+    )
+    if noted is not None:
+        h.session.replace_runtime_config(noted)
+
+
+async def _publish_call(
+    h,
+    call_id: str,
+    *,
+    name: str = "get_weather",
+    arguments: str = '{"city":"Paris"}',
+) -> None:
+    """Publish through ``_expose_function_call``, the session's real path.
+
+    That records the ledger origin, stores the Qwen anchor, and emits
+    ``function_call.done``. Calling ``register`` by itself can drift from
+    the ids and ordering production uses.
+    """
+    await h.runner.model._expose_function_call({"call_id": call_id, "name": name, "arguments": arguments})
+    await h.settle()
+
+
+def _published_call(events, call_id: str):
+    return [
+        event
+        for event in events
+        if event.type == "response.function_call_arguments.done" and getattr(event, "call_id", None) == call_id
+    ]
+
+
+@pytest.mark.asyncio
+async def test_parsed_qwen_call_registers_the_publish_anchor():
+    h = await open_qwen()
+    try:
+        h.session.append_history_message({"role": "user", "content": "Paris"})
+        await h.runner.model._send_one_model_output_event(
+            {
+                "qwen_function_call": {
+                    "call_id": "call_paris",
+                    "name": "get_weather",
+                    "arguments": {"city": "Paris"},
+                }
+            }
+        )
+        published = await h.settle()
+        done = _published_call(published, "call_paris")
+        assert len(done) == 1
+        assert done[0].arguments == '{"city": "Paris"}'
+        record = h.runner.tool_calls.record("call_paris")
+        assert record is not None and record.origin.arguments == '{"city": "Paris"}'
+        assert h.session.runtime_config["qwen_call_anchors"]["call_paris"] == 1
+        created = await h.run(
+            CreateItem(
+                item=normalize_conversation_item(
+                    {"type": "function_call_output", "call_id": "call_paris", "output": "18C"}
+                ),
+            )
+        )
+        assert not any(getattr(event, "code", None) for event in created)
+        turns = h.session.runtime_config["qwen_tool_turns"]
+        assert turns[0]["history_len"] == 1
+        assert turns[0]["messages"][1]["content"] == "18C"
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_conversation_history_alone_does_not_expose_a_call():
+    h = await open_qwen()
+    try:
+        projector = h.runner.out.require_projector()
+        projector.conversation_items["item_call"] = {
+            "type": "function_call",
+            "call_id": "call_x",
+            "name": "get_weather",
+            "arguments": '{"city":"Paris"}',
+        }
+        created = await h.run(
+            CreateItem(
+                item=normalize_conversation_item(
+                    {"type": "function_call_output", "call_id": "call_x", "output": "18C"}
+                ),
+            )
+        )
+        assert any(getattr(event, "code", None) == "invalid_function_call_output" for event in created)
+        assert "conversation.item.created" not in [event.type for event in created]
+        assert not h.runner.plugin.has_pending_tool_followup(h.session.runtime_config)
+        started = await h.run(CreateResponse())
+        assert any(getattr(event, "code", None) == "response_create_without_input" for event in started)
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_nonserializable_arguments_are_not_published():
+    h = await open_qwen()
+    try:
+        await h.runner.model._send_one_model_output_event(
+            {"function_call": True, "call_id": "call_1", "name": "get_weather", "arguments": object()}
+        )
+        events = await h.settle()
+        assert any(getattr(event, "code", None) == "invalid_function_call" for event in events)
+        assert _published_call(events, "call_1") == []
+        assert h.runner.tool_calls.record("call_1") is None
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_note_published_failure_closes_the_unpublished_call():
+    h = await open_qwen()
+    try:
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("anchor failed")
+
+        h.runner.plugin.note_published_function_call = boom
+        await h.runner.model._expose_function_call({"call_id": "call_paris", "name": "get_weather", "arguments": "{}"})
+        events = await h.settle()
+        assert any(getattr(event, "code", None) == "tool_call_registration_failed" for event in events)
+        assert _published_call(events, "call_paris") == []
+        assert any(event.type == "session.closed" for event in events)
+        assert h.runner.tool_calls.record("call_paris") is None
+    finally:
+        await h.manager.shutdown()
 
 
 @pytest.mark.asyncio
@@ -360,7 +546,7 @@ def test_audio_byte_budget_evicts_whole_multimodal_turn():
     )
     current = {"audio": "B" * (4 * 1024 * 1024)}
     config = plugin.prepare_prompt_config({"conversation": source}, state=state, payload=current)
-    assert config["qwen_messages"] == [{"role": "user", "audio_payload": current}]
+    assert _without_src(config["qwen_messages"]) == [{"role": "user", "audio_payload": current}]
     assert len(state.audio_history) == 1
     assert source[1] is image
 
@@ -393,7 +579,7 @@ def test_dropped_audio_removes_its_image_and_assistant(assistant_text):
         history.append({"role": "user", "content": [{"type": "audio_url"}]})
         config = plugin.prepare_prompt_config({"conversation": history}, state=state, payload={"audio": str(i)})
         history.append({"role": "assistant", "content": assistant_text})
-    assert config["qwen_messages"] == [
+    assert _without_src(config["qwen_messages"]) == [
         {"role": "user", "audio_payload": {"audio": "2"}},
         {"role": "assistant", "content": assistant_text},
         {"role": "user", "audio_payload": {"audio": "3"}},
@@ -963,6 +1149,529 @@ async def test_visual_capture_records_submitted_pixels_and_request(tmp_path, mon
 
 
 @pytest.mark.asyncio
+async def test_response_create_after_function_call_output_opens_one_follow_up():
+    h = await open_qwen()
+    try:
+        h.session.append_history_message({"role": "user", "content": "what is the weather in Paris"})
+        await _publish_call(h, "call_1")
+        created = await h.run(
+            CreateItem(
+                item=normalize_conversation_item(
+                    {"type": "function_call_output", "call_id": "call_1", "output": "18C"}
+                ),
+            )
+        )
+        assert "conversation.item.created" in [event.type for event in created]
+        assert not any(getattr(event, "code", None) for event in created)
+        assert h.runner.plugin.has_pending_tool_followup(h.session.runtime_config)
+        started = await h.run(CreateResponse())
+        assert not any(getattr(event, "code", None) == "response_create_without_input" for event in started)
+        assert h.port.submissions, [event.to_realtime() for event in h.events]
+        prompt = h.port.submissions[-1].prompt["prompt"]
+        assert "get_weather" in prompt
+        assert "18C" in prompt
+        assert not h.runner.plugin.has_pending_tool_followup(h.session.runtime_config)
+        request_id = h.port.submissions[-1].context.request_id
+        await h.deliver_and_settle(tts_output(request_id, samples=0, text="18C", finished=True), stage_id=0)
+        await h.deliver_and_settle(tts_output(request_id, samples=0, finished=True), stage_id=2)
+        # ACK-only playback and no audio samples store no assistant text.
+        # The tool pair is not in history, so it stays available.
+        assert not any(message.get("content") for message in h.session.history if message.get("role") == "assistant")
+        assert h.runner.plugin.has_pending_tool_followup(h.session.runtime_config)
+        continued = await h.run(CreateResponse())
+        assert not any(getattr(event, "code", None) == "response_create_without_input" for event in continued)
+        prompt = h.port.submissions[-1].prompt["prompt"]
+        assert "18C" in prompt
+        assert "get_weather" in prompt
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("raw_ack", [False, True])
+@pytest.mark.parametrize("calibration_enabled", [False, True])
+@pytest.mark.parametrize("settlement_fails", [False, True])
+async def test_late_playback_ack_stores_the_answer_and_drops_the_tool_pair(
+    monkeypatch, raw_ack, calibration_enabled, settlement_fails
+):
+    async def calibrate(snapshot):
+        pytest.fail("Fully played answers must not need history calibration")
+
+    h = await open_qwen(calibrate=calibrate if calibration_enabled else None)
+    try:
+        h.session.append_history_message({"role": "user", "content": "what is the weather in Paris"})
+        await _publish_call(h, "call_1")
+        await h.run(
+            CreateItem(
+                item=normalize_conversation_item(
+                    {"type": "function_call_output", "call_id": "call_1", "output": "18C"}
+                ),
+            )
+        )
+        started = await h.run(CreateResponse())
+        assert not any(getattr(event, "code", None) == "response_create_without_input" for event in started)
+        request_id = h.port.submissions[-1].context.request_id
+        response_id = h.session.active_response_id
+        await h.deliver_and_settle(tts_output(request_id, samples=0, text="sunny", finished=True), stage_id=0)
+        await h.deliver_and_settle(tts_output(request_id, samples=24000, finished=True), stage_id=2)
+        assert h.session.runtime_config.get("qwen_tool_turns_inflight")
+        assert not h.runner.plugin.has_pending_tool_followup(h.session.runtime_config)
+        if settlement_fails:
+            settle = h.runner.plugin.runtime_config_after_response
+
+            def fail_settlement(
+                runtime_config, *, committed, awaiting_playback=False, response_id=None, release_owner=False
+            ):
+                if committed:
+                    raise RuntimeError("private ACK settlement failure")
+                return settle(
+                    runtime_config,
+                    committed=committed,
+                    awaiting_playback=awaiting_playback,
+                    response_id=response_id,
+                    release_owner=release_owner,
+                )
+
+            monkeypatch.setattr(h.runner.plugin, "runtime_config_after_response", fail_settlement)
+        if raw_ack:
+            await h.runner._run_internal_payload(
+                {"type": "playback.ack", "response_id": response_id, "played_ms": 1000}
+            )
+        else:
+            await h.run(AckPlayback(response_id=response_id, played_ms=1000))
+        if settlement_fails:
+            await h.settle()
+            assert h.session.session_id not in h.manager.runners
+            assert not h.session.request_resources
+            errors = [event for event in h.events if event.type == "error"]
+            assert any(event.code == "tool_call_settlement_failed" for event in errors)
+            assert all("private ACK settlement failure" not in str(event) for event in errors)
+            return
+        assert [message["content"] for message in h.session.history if message.get("role") == "assistant"] == ["sunny"]
+        assert not h.session.runtime_config.get("qwen_tool_turns_inflight")
+        assert not h.runner.plugin.has_pending_tool_followup(h.session.runtime_config)
+        await h.run(append_audio())
+        await h.run(Commit(final=True, create_response=True))
+        prompt = h.port.submissions[-1].prompt["prompt"]
+        assert "sunny" in prompt
+        assert "get_weather" not in prompt
+        assert "18C" not in prompt
+    finally:
+        await h.manager.shutdown()
+
+
+async def _interrupt_tool_answer(h: Harness, *, text: str = "sunny answer") -> str:
+    h.session.append_history_message({"role": "user", "content": "what is the weather in Paris"})
+    await _publish_call(h, "call_1")
+    await h.run(
+        CreateItem(
+            item=normalize_conversation_item({"type": "function_call_output", "call_id": "call_1", "output": "18C"}),
+        )
+    )
+    await h.run(CreateResponse())
+    request_id = h.port.submissions[-1].context.request_id
+    response_id = h.session.active_response_id
+    await h.deliver_and_settle(tts_output(request_id, samples=0, text=text, finished=True), stage_id=0)
+    await h.deliver_and_settle(tts_output(request_id, samples=24000), stage_id=2)
+    await h.run(AckPlayback(response_id=response_id, played_ms=500))
+    await h.run(CancelResponse())
+    assert response_id is not None
+    return response_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("trailing_ack", [False, True])
+@pytest.mark.parametrize(
+    ("char_end", "heard"),
+    [
+        (5, "sunny"),
+        (0, ""),
+        (None, ""),
+        (99, ""),
+    ],
+    ids=["nonempty", "empty", "refused", "invalid"],
+)
+async def test_interrupted_tool_answer_calibration_settles_without_another_ack(char_end, heard, trailing_ack):
+    text = "sunny answer"
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def calibrate(snapshot):
+        assert snapshot.text == text
+        assert snapshot.played_ms == 500
+        entered.set()
+        await release.wait()
+        return char_end
+
+    h = await open_qwen(calibrate=calibrate)
+    try:
+        response_id = await _interrupt_tool_answer(h, text=text)
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        assert h.runner.plugin.has_pending_tool_followup(h.session.runtime_config)
+        assert not h.session.runtime_config.get("qwen_tool_turns_inflight")
+        assert h.session.history_item_ids[f"item_{response_id}"]["content"] == ""
+
+        release.set()
+        await h.runner.ctx.history_calibration.before_prompt()
+        assert h.session.history_item_ids[f"item_{response_id}"]["content"] == heard
+        if trailing_ack:
+            await h.run(AckPlayback(response_id=response_id, played_ms=500))
+
+        # A nonempty stored answer consumes the pair regardless of another ACK.
+        # An accepted empty prefix must leave it available for a retry.
+        assert h.runner.plugin.has_pending_tool_followup(h.session.runtime_config) is (not heard)
+        assert bool(h.session.runtime_config.get("qwen_tool_turns")) is (not heard)
+        assert not h.session.runtime_config.get("qwen_tool_turns_inflight")
+        await h.run(append_audio())
+        await h.run(Commit(final=True, create_response=True))
+        prompt = h.port.submissions[-1].prompt["prompt"]
+        assert ("get_weather" in prompt) is (not heard)
+        assert ("18C" in prompt) is (not heard)
+        if heard:
+            assert heard in prompt
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("char_end", "heard"), [(5, "sunny"), (0, ""), (None, ""), (99, "")])
+async def test_commit_snapshots_tool_runtime_after_calibration_wait(monkeypatch, char_end, heard):
+    entered, release, waiting = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    async def calibrate(snapshot):
+        entered.set()
+        await release.wait()
+        return char_end
+
+    h = await open_qwen(calibrate=calibrate)
+    commit = None
+    try:
+        response_id = await _interrupt_tool_answer(h)
+        await asyncio.wait_for(entered.wait(), 1)
+        controller = h.runner.ctx.history_calibration
+        before_prompt = controller.before_prompt
+
+        async def observed_wait():
+            waiting.set()
+            await before_prompt()
+
+        monkeypatch.setattr(controller, "before_prompt", observed_wait)
+        await h.run(append_audio())
+        commit = asyncio.create_task(h.run(Commit(final=True, create_response=True)))
+        await asyncio.wait_for(waiting.wait(), 1)
+        assert len(h.port.submissions) == 1
+        assert h.session.history_item_ids[f"item_{response_id}"]["content"] == ""
+        release.set()
+        await asyncio.wait_for(commit, 2)
+
+        assert h.session.history_item_ids[f"item_{response_id}"]["content"] == heard
+        assert len(h.port.submissions) == 2
+        submission = h.port.submissions[-1]
+        prompt = submission.prompt["prompt"]
+        assert ("get_weather" in prompt) is (not heard)
+        assert ("18C" in prompt) is (not heard)
+        assert bool(submission.context.runtime_config.get("qwen_tool_turns")) is (not heard)
+        assert bool(h.session.runtime_config.get("qwen_tool_turns_inflight")) is (not heard)
+        assert not h.session.runtime_config.get("qwen_tool_turns")
+        if heard:
+            assert heard in prompt
+    finally:
+        release.set()
+        if commit is not None:
+            await asyncio.gather(commit, return_exceptions=True)
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("during_commit", [False, True])
+@pytest.mark.parametrize("failure_source", ["calibration", "settlement"])
+async def test_calibrated_tool_settlement_failure_closes_session(monkeypatch, caplog, during_commit, failure_source):
+    entered, release, waiting = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    async def calibrate(snapshot):
+        entered.set()
+        await release.wait()
+        if failure_source == "calibration":
+            raise RuntimeError("private calibration failure")
+        return 5
+
+    h = await open_qwen(calibrate=calibrate)
+    commit = None
+    try:
+        response_id = await _interrupt_tool_answer(h)
+        await asyncio.wait_for(entered.wait(), 1)
+        controller = h.runner.ctx.history_calibration
+        settle = h.runner.plugin.runtime_config_after_response
+
+        def fail_settlement(
+            runtime_config, *, committed, awaiting_playback=False, response_id=None, release_owner=False
+        ):
+            if failure_source == "settlement" and committed:
+                raise RuntimeError("private settlement failure")
+            return settle(
+                runtime_config,
+                committed=committed,
+                awaiting_playback=awaiting_playback,
+                response_id=response_id,
+                release_owner=release_owner,
+            )
+
+        monkeypatch.setattr(h.runner.plugin, "runtime_config_after_response", fail_settlement)
+        calibration_tasks = tuple(controller.tasks.values())
+        if during_commit:
+            before_prompt = controller.before_prompt
+
+            async def observed_wait():
+                waiting.set()
+                await before_prompt()
+
+            monkeypatch.setattr(controller, "before_prompt", observed_wait)
+            await h.run(append_audio())
+            commit = asyncio.create_task(h.run(Commit(final=True, create_response=True)))
+            await asyncio.wait_for(waiting.wait(), 1)
+        release.set()
+        await asyncio.gather(*calibration_tasks, return_exceptions=True)
+        if commit is not None:
+            await asyncio.wait_for(commit, 2)
+        await h.settle()
+
+        if failure_source == "settlement":
+            assert h.session.session_id not in h.manager.runners
+            assert controller.closed and not controller.tasks and not controller.audio
+            assert len(h.port.submissions) == 1
+            assert not h.session.request_resources
+            assert any(event.type == "session.closed" for event in h.events)
+            errors = [event for event in h.events if event.type == "error"]
+            assert any(event.code == "tool_call_settlement_failed" for event in errors)
+            assert all("private settlement failure" not in str(event) for event in errors)
+            assert "Duplex history calibration failed" not in caplog.text
+        else:
+            assert h.session.session_id in h.manager.runners
+            assert not controller.closed
+            assert h.session.history_item_ids[f"item_{response_id}"]["content"] == ""
+            assert "Duplex history calibration failed" in caplog.text
+    finally:
+        release.set()
+        if commit is not None:
+            await asyncio.gather(commit, return_exceptions=True)
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("close", [False, True], ids=["cancel", "close"])
+async def test_calibration_wait_does_not_create_a_request_after_cancel_or_close(monkeypatch, close):
+    entered, release, waiting = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    async def calibrate(snapshot):
+        entered.set()
+        await release.wait()
+        return 5
+
+    h = await open_qwen(calibrate=calibrate)
+    commit = None
+    try:
+        await _interrupt_tool_answer(h)
+        await asyncio.wait_for(entered.wait(), 1)
+        controller = h.runner.ctx.history_calibration
+        before_prompt = controller.before_prompt
+
+        async def observed_wait():
+            waiting.set()
+            await before_prompt()
+
+        monkeypatch.setattr(controller, "before_prompt", observed_wait)
+        await h.run(append_audio())
+        ensured = len(h.port.ensured)
+        commit = asyncio.create_task(h.run(Commit(final=True, create_response=True)))
+        await asyncio.wait_for(waiting.wait(), 1)
+        assert len(h.port.ensured) == ensured
+        h.submit(CloseSession() if close else CancelResponse())
+        await h.settle()
+        release.set()
+        await asyncio.wait_for(commit, 2)
+        await h.settle()
+        assert len(h.port.submissions) == 1
+        assert len(h.port.ensured) == ensured
+        assert not h.session.request_resources
+        if close:
+            assert h.session.session_id not in h.manager.runners
+            assert controller.closed and not controller.tasks
+            assert sum(event.type == "session.closed" for event in h.events) == 1
+        else:
+            assert h.session.session_id in h.manager.runners
+    finally:
+        release.set()
+        if commit is not None:
+            await asyncio.gather(commit, return_exceptions=True)
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("raw_ack", [False, True])
+async def test_late_ack_for_retired_empty_prefix_keeps_the_tool_pair(raw_ack):
+    async def calibrate(snapshot):
+        return 0
+
+    h = await open_qwen(calibrate=calibrate)
+    try:
+        response_id = await _interrupt_tool_answer(h)
+        controller = h.runner.ctx.history_calibration
+        await controller.before_prompt()
+        assert h.runner.plugin.has_pending_tool_followup(h.session.runtime_config)
+        # Cache eviction uses discard to release the old evidence while keeping
+        # the immutable (possibly empty) assistant item for late ACKs.
+        controller.discard(response_id)
+        assert h.session.history_calibration_retired(response_id)
+        if raw_ack:
+            await h.runner._run_internal_payload({"type": "playback.ack", "response_id": response_id, "played_ms": 500})
+        else:
+            await h.run(AckPlayback(response_id=response_id, played_ms=500))
+        assert h.session.history_item_ids[f"item_{response_id}"]["content"] == ""
+        assert h.runner.plugin.has_pending_tool_followup(h.session.runtime_config)
+        assert not h.session.runtime_config.get("qwen_tool_turns_inflight")
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_user_turn_before_playback_ack_still_sees_the_tool_pair():
+    h = await open_qwen()
+    try:
+        h.session.append_history_message({"role": "user", "content": "what is the weather in Paris"})
+        await _publish_call(h, "call_1")
+        await h.run(
+            CreateItem(
+                item=normalize_conversation_item(
+                    {"type": "function_call_output", "call_id": "call_1", "output": "18C"}
+                ),
+            )
+        )
+        started = await h.run(CreateResponse())
+        assert not any(getattr(event, "code", None) == "response_create_without_input" for event in started)
+        request_id = h.port.submissions[-1].context.request_id
+        response_id = h.session.active_response_id
+        await h.deliver_and_settle(tts_output(request_id, samples=0, text="sunny", finished=True), stage_id=0)
+        await h.deliver_and_settle(tts_output(request_id, samples=24000, finished=True), stage_id=2)
+        first_inflight = h.session.runtime_config.get("qwen_tool_turns_inflight")
+        assert isinstance(first_inflight, list) and first_inflight
+        assert first_inflight[0].get("response_id") == response_id
+        await h.run(append_audio())
+        await h.run(Commit(final=True, create_response=True))
+        prompt = h.port.submissions[-1].prompt["prompt"]
+        assert "18C" in prompt
+        assert "get_weather" in prompt
+        assert "sunny" not in prompt
+        # Barge-in restores the pair, then this turn owns it. It must not disappear.
+        assert h.session.runtime_config.get("qwen_tool_turns_inflight") or h.runner.plugin.has_pending_tool_followup(
+            h.session.runtime_config
+        )
+        await h.run(AckPlayback(response_id=response_id, played_ms=1000))
+        # The item was reserved, so this ACK still stores the answer and drops
+        # the pair. The next prompt must not splice it again beside that text.
+        assert [message["content"] for message in h.session.history if message.get("role") == "assistant"] == ["sunny"]
+        assert not h.session.runtime_config.get("qwen_tool_turns_inflight")
+        await h.run(append_audio(value=-0.25))
+        await h.run(Commit(final=True, create_response=True))
+        later = h.port.submissions[-1].prompt["prompt"]
+        assert "sunny" in later
+        assert "18C" not in later
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_playback_clear_before_ack_puts_the_tool_pair_back():
+    h = await open_qwen()
+    try:
+        h.session.append_history_message({"role": "user", "content": "what is the weather in Paris"})
+        await _publish_call(h, "call_1")
+        await h.run(
+            CreateItem(
+                item=normalize_conversation_item(
+                    {"type": "function_call_output", "call_id": "call_1", "output": "18C"}
+                ),
+            )
+        )
+        started = await h.run(CreateResponse())
+        assert not any(getattr(event, "code", None) == "response_create_without_input" for event in started)
+        request_id = h.port.submissions[-1].context.request_id
+        response_id = h.session.active_response_id
+        await h.deliver_and_settle(tts_output(request_id, samples=0, text="sunny", finished=True), stage_id=0)
+        await h.deliver_and_settle(tts_output(request_id, samples=24000, finished=True), stage_id=2)
+        assert h.session.runtime_config.get("qwen_tool_turns_inflight")
+        await h.run(ClearOutputAudio(response_id=response_id))
+        assert h.runner.plugin.has_pending_tool_followup(h.session.runtime_config)
+        assert not h.session.runtime_config.get("qwen_tool_turns_inflight")
+        await h.run(append_audio())
+        await h.run(Commit(final=True, create_response=True))
+        prompt = h.port.submissions[-1].prompt["prompt"]
+        assert "18C" in prompt
+        assert "get_weather" in prompt
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_overlap_barge_in_before_playback_keeps_the_tool_result():
+    h = await open_qwen()
+    try:
+        h.session.append_history_message({"role": "user", "content": "what is the weather in Paris"})
+        await _publish_call(h, "call_1")
+        await h.run(
+            CreateItem(
+                item=normalize_conversation_item(
+                    {"type": "function_call_output", "call_id": "call_1", "output": "18C"}
+                ),
+            )
+        )
+        await h.run(CreateResponse())
+        request_id = h.port.submissions[-1].context.request_id
+        response_id = h.session.active_response_id
+        await h.deliver_and_settle(tts_output(request_id, samples=0, text="sunny", finished=True), stage_id=0)
+        await h.deliver_and_settle(tts_output(request_id, samples=24000, finished=True), stage_id=2)
+        assert h.session.playback.committed_ms == 0
+        await h.run(append_audio())
+        restored = h.session.runtime_config.get("qwen_tool_turns")
+        assert isinstance(restored, list) and restored
+        assert restored[0].get("response_id") == response_id
+        await h.run(Commit(final=True, create_response=True))
+        prompt = h.port.submissions[-1].prompt["prompt"]
+        assert "18C" in prompt
+        assert "get_weather" in prompt
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_overlap_barge_in_after_partial_playback_leaves_the_tool_pair_inflight():
+    h = await open_qwen()
+    try:
+        h.session.append_history_message({"role": "user", "content": "what is the weather in Paris"})
+        await _publish_call(h, "call_1")
+        await h.run(
+            CreateItem(
+                item=normalize_conversation_item(
+                    {"type": "function_call_output", "call_id": "call_1", "output": "18C"}
+                ),
+            )
+        )
+        await h.run(CreateResponse())
+        request_id = h.port.submissions[-1].context.request_id
+        response_id = h.session.active_response_id
+        await h.deliver_and_settle(tts_output(request_id, samples=0, text="sunny", finished=True), stage_id=0)
+        await h.deliver_and_settle(tts_output(request_id, samples=24000, finished=True), stage_id=2)
+        await h.run(AckPlayback(response_id=response_id, played_ms=100, committed_ms=100))
+        assert h.session.playback.committed_ms > 0
+        assert h.session.runtime_config.get("qwen_tool_turns_inflight")
+        await h.run(append_audio())
+        inflight = h.session.runtime_config.get("qwen_tool_turns_inflight")
+        assert isinstance(inflight, list) and inflight
+        assert inflight[0].get("response_id") == response_id
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_listen_audio_commit_does_not_use_video_deferred_response():
     h = await open_qwen()
     try:
@@ -980,5 +1689,117 @@ async def test_listen_audio_commit_does_not_use_video_deferred_response():
         await h.deliver_and_settle(tts_output(request_id, finished=True), stage_id=2)
         await h.run(AckPlayback(response_id=response_id, played_ms=1000))
         assert len(h.port.submissions) == 1
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_failed_follow_up_stays_armed_and_keeps_the_call_time_anchor():
+    h = await open_qwen()
+    try:
+        h.session.append_history_message({"role": "user", "content": "Paris"})
+        noted = h.runner.plugin.note_published_function_call(
+            h.session.runtime_config,
+            call_id="call_paris",
+            history_len=len(h.session.history),
+        )
+        assert noted is not None
+        h.session.replace_runtime_config(noted)
+        h.session.append_history_message({"role": "user", "content": "Tokyo"})
+        _register_exposed_call(h, "call_paris", note=False)
+        await h.run(
+            CreateItem(
+                item=normalize_conversation_item(
+                    {"type": "function_call_output", "call_id": "call_paris", "output": "18C"}
+                ),
+            )
+        )
+        turns = h.session.runtime_config["qwen_tool_turns"]
+        assert turns[0]["history_len"] == 1
+        assert h.runner.plugin.has_pending_tool_followup(h.session.runtime_config)
+        h.port.fail_submit = RuntimeError("stage down")
+        failed = await h.run(CreateResponse())
+        assert not any(getattr(event, "code", None) == "response_create_without_input" for event in failed)
+        assert h.port.submissions == []
+        assert h.runner.plugin.has_pending_tool_followup(h.session.runtime_config)
+        assert h.session.runtime_config["qwen_tool_turns"][0]["history_len"] == 1
+        h.port.fail_submit = None
+        started = await h.run(CreateResponse())
+        assert not any(getattr(event, "code", None) == "response_create_without_input" for event in started)
+        prompt = h.port.submissions[-1].prompt["prompt"]
+        assert prompt.index("Paris") < prompt.index("18C") < prompt.index("Tokyo")
+        assert not h.runner.plugin.has_pending_tool_followup(h.session.runtime_config)
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_cancel_before_the_follow_up_is_stored_keeps_the_tool_pair():
+    h = await open_qwen()
+    try:
+        h.session.append_history_message({"role": "user", "content": "Paris"})
+        noted = h.runner.plugin.note_published_function_call(
+            h.session.runtime_config,
+            call_id="call_paris",
+            history_len=len(h.session.history),
+        )
+        assert noted is not None
+        h.session.replace_runtime_config(noted)
+        _register_exposed_call(h, "call_paris", note=False)
+        await h.run(
+            CreateItem(
+                item=normalize_conversation_item(
+                    {"type": "function_call_output", "call_id": "call_paris", "output": "18C"}
+                ),
+            )
+        )
+        started = await h.run(CreateResponse())
+        assert not any(getattr(event, "code", None) == "response_create_without_input" for event in started)
+        assert h.session.runtime_config.get("qwen_tool_turns") == []
+        assert h.session.runtime_config["qwen_tool_turns_inflight"]
+        await h.run(CancelResponse())
+        assert h.runner.plugin.has_pending_tool_followup(h.session.runtime_config)
+        await h.run(append_audio())
+        await h.run(Commit(final=True, create_response=True))
+        prompt = h.port.submissions[-1].prompt["prompt"]
+        assert "18C" in prompt
+        assert "get_weather" in prompt
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_conversation_none_completion_keeps_the_tool_pair():
+    h = await open_qwen()
+    try:
+        h.session.config.extra_body["realtime_response_conversation"] = "none"
+        h.session.append_history_message({"role": "user", "content": "Paris"})
+        noted = h.runner.plugin.note_published_function_call(
+            h.session.runtime_config,
+            call_id="call_paris",
+            history_len=len(h.session.history),
+        )
+        assert noted is not None
+        h.session.replace_runtime_config(noted)
+        _register_exposed_call(h, "call_paris", note=False)
+        await h.run(
+            CreateItem(
+                item=normalize_conversation_item(
+                    {"type": "function_call_output", "call_id": "call_paris", "output": "18C"}
+                ),
+            )
+        )
+        started = await h.run(CreateResponse())
+        assert not any(getattr(event, "code", None) == "response_create_without_input" for event in started)
+        request_id = h.port.submissions[-1].context.request_id
+        await h.deliver_and_settle(tts_output(request_id, samples=0, text="18C", finished=True), stage_id=0)
+        await h.deliver_and_settle(tts_output(request_id, samples=0, finished=True), stage_id=2)
+        assert all(message.get("role") != "assistant" for message in h.session.history)
+        assert h.runner.plugin.has_pending_tool_followup(h.session.runtime_config)
+        await h.run(append_audio())
+        await h.run(Commit(final=True, create_response=True))
+        prompt = h.port.submissions[-1].prompt["prompt"]
+        assert "18C" in prompt
+        assert "get_weather" in prompt
     finally:
         await h.manager.shutdown()

@@ -11,7 +11,7 @@ name = "vllm-omni"
 dynamic = ["version", "dependencies"]
 description = "A framework for efficient model inference with omni-modality models"
 readme = "README.md"
-requires-python = ">=3.10,<3.14"
+requires-python = ">=3.11,<3.14"
 license = "Apache-2.0"
 authors = [
     {name = "vLLM-Omni Team"}
@@ -21,7 +21,6 @@ classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
@@ -191,6 +190,8 @@ include = ["vllm_omni*"]
 
 [tool.ruff]
 line-length = 120
+# Preserve the existing lint policy when raising the runtime Python floor.
+target-version = "py310"
 exclude = [
     ".eggs",
     ".git",

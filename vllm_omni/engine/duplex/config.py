@@ -11,6 +11,7 @@ accepts a ``DuplexSessionConfig`` (or the equivalent OpenAI Realtime
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import Enum
@@ -252,6 +253,40 @@ class DuplexPlaybackView:
         }
 
 
+#: ``extra_body`` key of the optional session-wide tool-result deadline. It sits
+#: in ``extra_body`` rather than in a typed field because a session's
+#: server-side behaviour switches (``auto_response``, ``realtime_tools``,
+#: ``realtime_turn_detection``) already travel there, and because the key is set
+#: once when the session opens -- see :meth:`DuplexSessionConfig.apply_realtime_update`.
+TOOL_RESULT_TIMEOUT_KEY = "tool_result_timeout_s"
+
+
+def resolve_tool_result_timeout_s(extra_body: Mapping[str, object] | None) -> float | None:
+    """Read the optional tool-result deadline in seconds; ``None`` disables it.
+
+    Rejects ``bool`` (``True`` is an ``int`` in Python and would otherwise read
+    as a one-second deadline), non-finite and non-positive values: the deadline
+    only ever makes a pending call *unanswerable*, so an accidental value must
+    not be able to silently expire every call of a session.
+    """
+    if not extra_body:
+        return None
+    value = extra_body.get(TOOL_RESULT_TIMEOUT_KEY)
+    if value is None:
+        return None
+    try:
+        timeout = float(value) if isinstance(value, int | float) and not isinstance(value, bool) else math.nan
+    except OverflowError:
+        timeout = math.nan
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise DuplexConfigError(
+            f"tool_result_timeout_s must be a finite positive number of seconds, got {value!r}",
+            code="invalid_tool_result_timeout",
+            param=TOOL_RESULT_TIMEOUT_KEY,
+        )
+    return timeout
+
+
 @dataclass
 class DuplexSessionConfig:
     model: str | None = None
@@ -275,6 +310,12 @@ class DuplexSessionConfig:
     overlap_silence_rms: float = 0.003
     playback_commit_policy: str = DuplexPlaybackCommitPolicy.COMMIT_ALL_ON_DONE.value
     extra_body: dict[str, object] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        # A caller that builds the config directly (the Python API, a test) is
+        # validated here; the Realtime path assigns ``extra_body`` after
+        # construction and re-validates in ``from_event``.
+        resolve_tool_result_timeout_s(self.extra_body)
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -363,6 +404,7 @@ class DuplexSessionConfig:
             playback_commit_policy = extra.get("playback_commit_policy")
             if isinstance(playback_commit_policy, str):
                 config.playback_commit_policy = cls._normalize_playback_commit_policy(playback_commit_policy)
+        resolve_tool_result_timeout_s(config.extra_body)
         return config
 
     @classmethod
@@ -411,6 +453,10 @@ class DuplexSessionConfig:
         audio_output = audio_config.get("output") if isinstance(audio_config, dict) else None
         extra_body_payload = payload.get("extra_body")
         extra_body: dict[str, object] = dict(extra_body_payload) if isinstance(extra_body_payload, dict) else {}
+        if TOOL_RESULT_TIMEOUT_KEY in payload:
+            # Accepted at the top level like ``idle_timeout_s``; an invalid value
+            # is rejected by ``resolve_tool_result_timeout_s``, never ignored.
+            extra_body[TOOL_RESULT_TIMEOUT_KEY] = payload[TOOL_RESULT_TIMEOUT_KEY]
         extra_body["realtime_session_payload"] = json_safe_realtime_payload(payload)
         if isinstance(payload.get("tools"), list):
             extra_body["realtime_tools"] = payload["tools"]
@@ -567,6 +613,30 @@ class DuplexSessionConfig:
         modalities = payload.get("modalities") or payload.get("output_modalities")
         if isinstance(modalities, list) and all(isinstance(item, str) for item in modalities):
             self.modalities = list(modalities)
+        # A realtime client resends the whole session. Resolve the deadline the
+        # same way ``from_realtime`` does: a top-level key wins over ``extra_body``.
+        # Reject only a real change, including set versus unset. Calls may already
+        # be pending under the old deadline; a live change would leave "is this
+        # result in time?" undecidable.
+        extra_body_patch = payload.get("extra_body")
+        if TOOL_RESULT_TIMEOUT_KEY in payload:
+            timeout_patch: object = payload[TOOL_RESULT_TIMEOUT_KEY]
+            timeout_present = True
+        elif isinstance(extra_body_patch, dict) and TOOL_RESULT_TIMEOUT_KEY in extra_body_patch:
+            timeout_patch = extra_body_patch[TOOL_RESULT_TIMEOUT_KEY]
+            timeout_present = True
+        else:
+            timeout_patch = None
+            timeout_present = False
+        if timeout_present:
+            proposed_timeout = resolve_tool_result_timeout_s({TOOL_RESULT_TIMEOUT_KEY: timeout_patch})
+            current_timeout = resolve_tool_result_timeout_s(self.extra_body)
+            if proposed_timeout != current_timeout:
+                raise DuplexConfigError(
+                    "session.update cannot change tool_result_timeout_s after the session is open",
+                    code="tool_result_timeout_update_unsupported",
+                    param=TOOL_RESULT_TIMEOUT_KEY,
+                )
         if isinstance(payload.get("extra_body"), dict):
             self.extra_body.update(payload["extra_body"])
             extra = payload["extra_body"]
@@ -576,6 +646,10 @@ class DuplexSessionConfig:
                 self.playback_commit_policy = self._normalize_playback_commit_policy(
                     str(extra["playback_commit_policy"])
                 )
+        if TOOL_RESULT_TIMEOUT_KEY in payload:
+            # ``extra_body.update`` above would otherwise store the nested value
+            # and change a deadline the top-level key just confirmed.
+            self.extra_body[TOOL_RESULT_TIMEOUT_KEY] = payload[TOOL_RESULT_TIMEOUT_KEY]
         if isinstance(payload.get("tools"), list):
             self.extra_body["realtime_tools"] = payload["tools"]
         elif "tools" in payload and payload.get("tools") is None:
