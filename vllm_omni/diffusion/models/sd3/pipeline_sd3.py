@@ -1,6 +1,3 @@
-# SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-
 import inspect
 import json
 import logging
@@ -599,10 +596,6 @@ class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelinePro
 
             # Broadcast timestep to match batch size
             timestep = t.expand(latents.shape[0]).to(device=self.device, dtype=self.od_config.dtype)
-
-            # Used by TeaCache hook to separate positive/negative CFG branches.
-            # Keep this attribute present even when do_true_cfg=False for robustness.
-            self.transformer.do_true_cfg = do_true_cfg
             positive_kwargs = {
                 "hidden_states": latents,
                 "timestep": timestep,

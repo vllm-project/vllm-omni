@@ -44,7 +44,13 @@ from vllm_omni.diffusion.cache.teacache.extractors import (
 )
 from vllm_omni.diffusion.cache.teacache.hook import apply_teacache_hook
 from vllm_omni.diffusion.config import set_current_diffusion_config
-from vllm_omni.diffusion.data import AttentionConfig, DiffusionCacheConfig
+from vllm_omni.diffusion.data import (
+    AttentionConfig,
+    DiffusionCacheConfig,
+    DiffusionParallelConfig,
+    OmniDiffusionConfig,
+    TransformerConfig,
+)
 from vllm_omni.diffusion.models.flux.flux_transformer import FluxTransformer2DModel
 from vllm_omni.diffusion.models.flux2_klein.flux2_klein_transformer import (
     Flux2Transformer2DModel,
@@ -458,25 +464,29 @@ class TestSD3Extractor(BaseExtractorTest):
         return extract_sd3_context
 
     @pytest.fixture
-    def sd3_module(self):
+    def sd3_module(self, tmp_path):
         # Same layout as SD3.5-Medium (dual attention in the first block, last
         # block is context_pre_only), shrunk to 2 blocks with inner_dim=16.
-        tf_config = SimpleNamespace(
-            num_layers=2,
-            sample_size=8,
-            in_channels=4,
-            out_channels=4,
-            num_attention_heads=2,
-            attention_head_dim=8,
-            caption_projection_dim=16,
-            pooled_projection_dim=8,
-            joint_attention_dim=12,
-            patch_size=2,
-            dual_attention_layers=[0],
-            qk_norm="rms_norm",
-            pos_embed_max_size=16,
+        tf_config = TransformerConfig.from_dict(
+            {
+                "num_layers": 2,
+                "sample_size": 8,
+                "in_channels": 4,
+                "out_channels": 4,
+                "num_attention_heads": 2,
+                "attention_head_dim": 8,
+                "caption_projection_dim": 16,
+                "pooled_projection_dim": 8,
+                "joint_attention_dim": 12,
+                "patch_size": 2,
+                "dual_attention_layers": [0],
+                "qk_norm": "rms_norm",
+                "pos_embed_max_size": 16,
+            }
         )
-        od_config = SimpleNamespace(tf_model_config=tf_config, parallel_config=SimpleNamespace())
+        od_config = OmniDiffusionConfig(
+            model=str(tmp_path), tf_model_config=tf_config, parallel_config=DiffusionParallelConfig()
+        )
         torch.manual_seed(0)
         module = SD3Transformer2DModel(od_config=od_config)
         # vLLM linear layers allocate uninitialized weights; give every parameter real values.
