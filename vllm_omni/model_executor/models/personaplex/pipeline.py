@@ -18,6 +18,7 @@ The inter-stage input processors named below live in
 the talker<->code2wav seam; they are built by the lead alongside the talker.
 """
 
+from vllm_omni.config.live_session import LiveSessionConfig
 from vllm_omni.config.stage_config import (
     PipelineConfig,
     StageExecutionType,
@@ -34,6 +35,9 @@ PERSONAPLEX_PIPELINE = PipelineConfig(
     default_deploy_config_name="personaplex.yaml",
     # Served full duplex over /v1/realtime?duplex=1 by the unified framework.
     duplex_plugin="vllm_omni.model_executor.models.personaplex.duplex.plugin.PersonaPlexDuplexPlugin",
+    live_session_config=LiveSessionConfig(
+        live_session_processor="vllm_omni.model_executor.models.personaplex.live.processor:PersonaPlexLiveSessionProcessor",
+    ),
     stages=(
         StagePipelineConfig(
             stage_id=0,
@@ -41,6 +45,10 @@ PERSONAPLEX_PIPELINE = PipelineConfig(
             execution_type=StageExecutionType.LLM_AR,
             input_sources=(),
             owns_tokenizer=True,
+            # The per-frame text token reaches the API server: Live sessions
+            # feed it back with the next frame (live/stage0.py).
+            final_output=True,
+            final_output_type="text",
             engine_output_type="latent",
             # built by lead: talker emits a 17-row Mimi token stack per frame;
             # these processors keep the PCM-bearing rows (cb 0..7) and flatten

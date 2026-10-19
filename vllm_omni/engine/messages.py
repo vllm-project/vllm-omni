@@ -115,6 +115,9 @@ class OutputMessage(EngineQueueMessage, kw_only=True):
     metrics: StageRequestMetrics | None = None
     finished: bool
     stage_submit_ts: float | None = None
+    # This stage reached a streaming-input segment boundary (resumable
+    # requests): the request continues after the next input chunk.
+    segment_finished: bool = False
 
 
 class AbortResultMessage(EngineQueueMessage, kw_only=True):

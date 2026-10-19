@@ -167,6 +167,9 @@ class OmniRequestOutput(RequestOutput):
     stage_id: int | None = None
     replica_id: int | None = None
     final_output_type: str = "text"
+    # The stage reached a streaming-input segment boundary: the resumable
+    # request waits for its next input chunk.
+    segment_finished: bool = False
 
     # --- Diffusion model fields ---
     images: list[Image.Image] = field(default_factory=list)

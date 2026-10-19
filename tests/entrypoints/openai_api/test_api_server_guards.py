@@ -155,6 +155,7 @@ _EXPECTED_ROUTER_ROUTES = {
     ("WEBSOCKET", "/v1/realtime"),
     ("WEBSOCKET", "/v1/realtime/robot/openpi"),
     ("WEBSOCKET", "/v1/duplex"),
+    ("WEBSOCKET", "/v1/live/sessions"),
     ("POST", "/v1/realtime/sessions"),
     ("POST", "/v1/realtime/sessions/{session_id}/step"),
     ("POST", "/v1/realtime/sessions/{session_id}/reset"),

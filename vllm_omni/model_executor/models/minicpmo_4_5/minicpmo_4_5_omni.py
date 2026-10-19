@@ -38,6 +38,7 @@ from vllm.v1.sample.metadata import SamplingMetadata
 
 from vllm_omni.model_executor.duplex_sampling import DuplexSamplingRow
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import MiniCPMO45DuplexPolicy
+from vllm_omni.model_executor.models.minicpmo_4_5.live.encoder import LIVE_AUDIO_KEY, apply_live_audio
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_llm import (
     MiniCPMO45OmniLLMDummyInputsBuilder,
     MiniCPMO45OmniLLMMultiModalProcessor,
@@ -475,6 +476,13 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                 if not hasattr(self, "_mrv2_sampling_infos"):
                     self._mrv2_sampling_infos = {}
                 self._mrv2_sampling_infos[str(req_id)] = kwargs
+        if isinstance(kwargs.get(LIVE_AUDIO_KEY), dict):
+            # /v1/live/sessions: streaming-encoded unit audio (live/encoder.py).
+            embeds = input_embeds if input_embeds is not None else self.get_input_embeddings(input_ids)
+            applied = apply_live_audio(self.thinker, input_ids, embeds, kwargs)
+            if applied is None:
+                return input_ids, embeds, {}
+            return input_ids, applied[0], applied[1]
 
         duplex = kwargs.get("duplex")
         if not isinstance(duplex, dict) or duplex.get("data_plane") is not True:
