@@ -297,3 +297,28 @@ def test_window_cos_sin_positions_are_step_major():
 def test_window_cos_sin_positions_single_request_matches_per_step_updates():
     """``num_reqs == 1`` collapses both orders, which is why c1 was unaffected."""
     assert msd_module.window_cos_sin_positions([7], 1, 4) == [7, 8, 9, 10]
+
+def test_notify_finished_requests_forwards_to_the_model():
+    """The window path must not skip the model's finished-request hook."""
+    calls = []
+    model = SimpleNamespace(on_requests_finished=lambda ids: calls.append(set(ids)))
+    runner = SimpleNamespace(model=model)
+    output = SimpleNamespace(finished_req_ids={"r0", "r1"})
+    msd_module.notify_finished_requests(runner, output)
+    assert calls == [{"r0", "r1"}]
+
+
+def test_notify_finished_requests_is_a_noop_without_finished_or_hook():
+    calls = []
+    runner = SimpleNamespace(
+        model=SimpleNamespace(on_requests_finished=lambda ids: calls.append(ids))
+    )
+    # No finished ids this step.
+    msd_module.notify_finished_requests(runner, SimpleNamespace(finished_req_ids=set()))
+    # Scheduler output without the field at all.
+    msd_module.notify_finished_requests(runner, SimpleNamespace())
+    # Model without the hook.
+    msd_module.notify_finished_requests(
+        SimpleNamespace(model=object()), SimpleNamespace(finished_req_ids={"r0"})
+    )
+    assert calls == []

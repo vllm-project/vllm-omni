@@ -91,6 +91,22 @@ def _refuse(reason: str) -> None:
         logger.warning("Multi-step plan refused at runner: %s (first occurrence)", reason)
 
 
+def notify_finished_requests(runner: Any, scheduler_output: SchedulerOutput) -> None:
+    """Run the model's finished-request hook for this step.
+
+    A schedule can retire a request while still opening a window for its
+    siblings.  The window branch of ``execute_model`` returns before the
+    single-step path's call site, so without this the talker never queues the
+    retired request for ``_flush_deferred_cleanup``: its ``_request_audio_states``
+    and per-request generators stay retained (and the omni wrapper's duplex
+    sessions are never dropped).  Called right after ``_update_states``, exactly
+    where the single-step path does it.
+    """
+    finished = getattr(scheduler_output, "finished_req_ids", None)
+    if finished and hasattr(runner.model, "on_requests_finished"):
+        runner.model.on_requests_finished(finished)
+
+
 def validate_multi_step_plan(
     runner: Any, scheduler_output: SchedulerOutput
 ) -> dict[str, int] | None:
@@ -447,6 +463,11 @@ def execute_multi_step_window(
                 # Mamba/spec corrections are gated off for windows; apply
                 # eagerly so per-step state starts consistent.
                 deferred()
+            # Same model lifecycle hook the single-step path runs right after
+            # _update_states: a schedule can retire request A while opening a
+            # window for still-running siblings, and this branch would otherwise
+            # return before the hook and retain A's request-local state.
+            notify_finished_requests(runner, scheduler_output)
 
             # Batch identity must be read after _update_states: under async
             # scheduling the plan may admit requests the input_batch has not
