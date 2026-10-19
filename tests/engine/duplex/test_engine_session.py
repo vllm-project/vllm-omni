@@ -426,7 +426,7 @@ def test_response_with_no_audio_and_no_text_is_not_ackable():
 
 
 @pytest.mark.parametrize("operation", ["delete", "truncate"])
-def test_removing_one_empty_assistant_preserves_the_other_turn_boundary(operation):
+def test_delete_and_truncate_preserve_other_empty_turn_boundaries(operation):
     session = _session(config=DuplexSessionConfig(playback_commit_policy="ack_only"))
     user_inputs = []
     response_ids = []
@@ -443,15 +443,22 @@ def test_removing_one_empty_assistant_preserves_the_other_turn_boundary(operatio
     if operation == "delete":
         assert session.delete_history_item(item_id) is True
     else:
-        # A full ACK releases the pending snapshot. Truncation then edits the
-        # stored message into another empty dict before removing that item.
+        # A full ACK releases the pending snapshot. A subsequent truncate
+        # clears text but preserves this turn and the target of delayed ACKs.
         ack = apply_playback_ack(session, {"response_id": response_ids[1], "played_ms": 10_000})
         assert ack[0].to_realtime()["event"]["history_committed"] is True
         assert session.truncate_history_item(item_id, audio_end_ms=0, hard=True) is True
-    assert session.history == (user_inputs[0], {"role": "assistant", "content": ""}, user_inputs[1])
+    expected: tuple[dict[str, object], ...] = (user_inputs[0], {"role": "assistant", "content": ""}, user_inputs[1])
+    if operation == "truncate":
+        expected += ({"role": "assistant", "content": ""},)
+    assert session.history == expected
     ack = apply_playback_ack(session, {"response_id": response_ids[1], "played_ms": 10_000})
-    assert ack[0].to_realtime()["error"]["code"] == "playback_item_not_found"
-    assert session.history == (user_inputs[0], {"role": "assistant", "content": ""}, user_inputs[1])
+    if operation == "delete":
+        assert ack[0].to_realtime()["error"]["code"] == "playback_item_not_found"
+    else:
+        assert ack[0].type == "playback.acknowledged"
+        assert ack[0].details["history_committed"] is False
+    assert session.history == expected
 
 
 def test_truncate_history_item_uses_response_alignment_marks():
@@ -473,6 +480,20 @@ def test_truncate_history_item_uses_response_alignment_marks():
     assert session.history_item_ids[item_id] == {"role": "assistant", "content": "hello"}
     assert session.delete_history_item(item_id) is True
     assert session.history == ()
+
+
+@pytest.mark.parametrize("response_ended", [False, True])
+def test_registered_history_item_cannot_inherit_another_responses_marks(response_ended):
+    session = _session()
+    response = session.begin_response()
+    session.append_assistant_text("a different answer")
+    session.mark_audio_sent(1000, text_chars=18)
+    if response_ended:
+        session.register_history_item(f"item_{response}", session.end_response())
+    # conversation.item.create also registers messages without a response snapshot.
+    session.register_history_item("item_imported", {"role": "assistant", "content": "hello"})
+    assert session.truncate_history_item("item_imported", audio_end_ms=200, hard=True)
+    assert session.history_item_ids["item_imported"]["content"] == ""
 
 
 # ---- turn signals / model turns ----

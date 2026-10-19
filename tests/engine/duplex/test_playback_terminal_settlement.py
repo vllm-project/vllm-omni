@@ -153,7 +153,9 @@ async def test_truncation_preserves_bounded_calibration_owner(use_truncate_item,
             assert session.history[-1]["content"] == ""
         _assert_released(session, response)
         before = session.history
-        await h.run(commands.AckPlayback(response_id=response, played_ms=400))
+        events = await h.run(commands.AckPlayback(response_id=response, played_ms=400))
+        ack = next(event for event in events if event.type == "playback.acknowledged")
+        assert ack.details["history_committed"] is False
         assert session.history == before
         _assert_released(session, response)
     finally:
@@ -227,7 +229,7 @@ async def test_repeated_item_truncation_keeps_original_alignment(
             session.mark_audio_sent(1000, text_requires_complete_audio=True)
         playback = session.playback
         expected = session.history[-1]["content"]
-        for cutoff, keep_chars in [(300, 3), (200, 2), (160, 1 if partial_marks else 2)]:
+        for cutoff, keep_chars in [(300, 3), (200, 2), (160, 1 if partial_marks else 2), (0, 0)]:
             expected = expected[:keep_chars]
             events = await h.run(commands.TruncateItem(item_id=f"item_{response}", audio_end_ms=cutoff))
             assert not any(event.type == "error" for event in events)
@@ -235,8 +237,127 @@ async def test_repeated_item_truncation_keeps_original_alignment(
             for ack_ms in (400, 100, 0, 400):
                 events = await h.run(commands.AckPlayback(response_id=response, played_ms=ack_ms))
                 assert not any(event.type == "error" for event in events)
+                ack = next(event for event in events if event.type == "playback.acknowledged")
+                assert ack.details["history_committed"] is False
                 assert session.history[-1]["content"] == expected
                 _assert_released(session, response)
                 assert session.playback == playback
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("unaligned", [False, True])
+@pytest.mark.parametrize("new_output", [None, "aligned", "unaligned"])
+@pytest.mark.parametrize("cutoff", [1, 200])
+async def test_finalized_markless_item_cannot_borrow_another_responses_alignment(unaligned, new_output, cutoff):
+    h = await open_qwen()
+    try:
+        session = h.session
+        session.replace_config(replace(session.config, playback_commit_policy="ack_only"))
+        user = session.commit_audio_input(transcript="first question")
+        response = session.begin_response()
+        h.runner.emit(h.runner.model.response_created_payload(response, epoch=session.epoch))
+        session.append_assistant_text("hello")
+        session.mark_audio_sent(400, text_requires_complete_audio=unaligned, audio_complete=True)
+        session.register_history_item(f"item_{response}", session.end_response())
+        await h.run(commands.AckPlayback(response_id=response, played_ms=400))
+        assert session.history == (user.message, {"role": "assistant", "content": "hello"})
+        _assert_released(session, response)
+        next_user = session.commit_audio_input(transcript="next question")
+        if new_output is not None:
+            newer = session.begin_response()
+            h.runner.emit(h.runner.model.response_created_payload(newer, epoch=session.epoch))
+            session.append_assistant_text("a different answer")
+            session.mark_audio_sent(
+                1000,
+                text_chars=18 if new_output == "aligned" else None,
+                text_requires_complete_audio=new_output == "unaligned",
+            )
+        active_playback = session.playback
+        events = await h.run(commands.TruncateItem(item_id=f"item_{response}", audio_end_ms=cutoff))
+        assert not any(event.type == "error" for event in events), events
+        # With neither timing marks nor duration left, no prefix is provable.
+        # Truncation preserves the turn and the follow-up playback ACK target.
+        expected = (user.message, {"role": "assistant", "content": ""}, next_user.message)
+        assert session.history == expected
+        assert f"item_{response}" in session.history_item_ids
+        ack = await h.run(commands.AckPlayback(response_id=response, played_ms=400))
+        assert not any(event.type == "error" for event in ack)
+        assert session.history == expected
+        assert session.playback == active_playback
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("output", ["aligned", "markless", "unaligned"])
+@pytest.mark.parametrize("hard_stop", [False, True])
+async def test_finalized_ack_does_not_report_a_commit_or_resettle_tools(monkeypatch, output, hard_stop):
+    from vllm_omni.engine.duplex.session import runner as runner_module
+
+    calls = []
+    settle = runner_module.settle_response_runtime
+
+    def record_settlement(*args, **kwargs):
+        calls.append(kwargs)
+        return settle(*args, **kwargs)
+
+    monkeypatch.setattr(runner_module, "settle_response_runtime", record_settlement)
+    h = await open_qwen()
+    try:
+        session = h.session
+        session.replace_config(replace(session.config, playback_commit_policy="ack_only"))
+        response = session.begin_response()
+        h.runner.emit(h.runner.model.response_created_payload(response, epoch=session.epoch))
+        session.append_assistant_text("hello")
+        session.mark_audio_sent(
+            400,
+            text_chars=5 if output == "aligned" else None,
+            text_requires_complete_audio=output == "unaligned",
+            audio_complete=True,
+        )
+        session.register_history_item(f"item_{response}", session.end_response())
+        session.replace_runtime_config(
+            {
+                **session.runtime_config,
+                "qwen_tool_turns_inflight": [{"response_id": response, "call_id": "old-tool", "messages": []}],
+                "qwen_tool_response_id": response,
+            }
+        )
+        await h.runner._run_internal_payload(
+            {
+                "type": "playback.ack",
+                "response_id": response,
+                "played_ms": 400,
+                "truncate": hard_stop,
+            }
+        )
+        await h.settle()
+        assert len(calls) == 1
+        assert not session.runtime_config.get("qwen_tool_turns_inflight")
+        _assert_released(session, response)
+        newer = session.begin_response()
+        h.runner.emit(h.runner.model.response_created_payload(newer, epoch=session.epoch))
+        session.append_assistant_text("new text")
+        session.mark_audio_sent(1000, text_chars=8)
+        session.replace_runtime_config(
+            {
+                **session.runtime_config,
+                "qwen_tool_turns_inflight": [{"response_id": newer, "call_id": "new-tool", "messages": []}],
+                "qwen_tool_response_id": newer,
+            }
+        )
+        runtime = dict(session.runtime_config)
+        playback = session.playback
+        for ack_ms in (400, 200, 0, 800):
+            events = await h.run(commands.AckPlayback(response_id=response, played_ms=ack_ms))
+            ack = next(event for event in events if event.type == "playback.acknowledged")
+            assert ack.details["history_committed"] is False
+            assert len(calls) == 1
+            assert session.history == ({"role": "assistant", "content": "hello"},)
+            assert session.runtime_config == runtime
+            assert session.playback == playback
+            _assert_released(session, response)
     finally:
         await close_harness(h)

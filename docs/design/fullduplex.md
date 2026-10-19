@@ -56,6 +56,15 @@ ACKs cannot change finalized history or restore unheard text. Plugin runtime
 settlement follows all history writes, including cancellation writeback into a
 reserved older turn; it must observe the final committed result.
 
+History edits pass the item's own timing marks and playback cursor explicitly;
+the text-prefix calculation never reads the active response implicitly. If both
+marks and duration have been released, a new explicit truncate cannot establish
+a heard prefix and clears the text conservatively. Truncation preserves the
+empty assistant turn so the command's following playback ACK remains valid;
+only deletion removes that turn. Ignored ACKs for finalized history report
+`history_committed: false` and do not settle plugin runtime again, including
+when calibration evidence has been retired.
+
 Opt-in history calibration is a separate retention owner: incomplete or
 hard-capped replies remain in its bounded cache for prefix correction. Every
 completion path preserves that evidence until calibration retires it. Sessions

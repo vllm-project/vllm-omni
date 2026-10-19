@@ -1401,7 +1401,12 @@ deferred commit during an active response (`event.response_create_deferred`)
 
 After this acknowledgement, `conversation.item.retrieve` returns the truncated
 transcript. Without text/audio alignment marks, its prefix is estimated from
-the requested position and audio duration; this is not exact word alignment.
+the requested position and that response's retained audio duration; this is not
+exact word alignment. If neither alignment nor duration remains, an explicit
+truncate clears the transcript conservatively. An empty truncated assistant
+item remains addressable for subsequent ACKs; use `conversation.item.delete`
+to remove it. Delayed progress ACKs cannot change finalized history and report
+`history_committed: false`, without repeating tool-result settlement.
 
 #### Response lifecycle
 

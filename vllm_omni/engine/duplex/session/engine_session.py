@@ -1539,11 +1539,13 @@ class DuplexEngineSession:
         self._conversation.pending_item_audio_text_marks.pop(item_id, None)
         self._conversation.pending_item_input_commit_seqs.pop(item_id, None)
         if message.get("role") == "assistant":
-            marks = (
-                response_audio_text_marks
-                if response_audio_text_marks is not None
-                else self._response.assistant_audio_text_marks or self._conversation.last_assistant_audio_text_marks
-            )
+            if response_audio_text_marks is not None:
+                marks = response_audio_text_marks
+            elif response_id is not None and response_id == self.active_response_id:
+                marks = self._response.assistant_audio_text_marks
+            else:
+                # Imported or retired items do not own the latest response's marks.
+                marks = []
             if marks:
                 self._conversation.item_audio_text_marks[item_id] = list(marks)
         if pending_audio_ms is not None:
@@ -1621,16 +1623,15 @@ class DuplexEngineSession:
             # Old ACKs cannot expand or shrink a finalized prefix. A stricter
             # explicit cutoff clears it because its alignment evidence expired.
             text, char_end, cutoff = self._conversation.heard_prefixes[item_id]
-            if hard and audio_end_ms < cutoff:
-                text, char_end, cutoff = "", 0, audio_end_ms
-                self._conversation.heard_prefixes[item_id] = (text, char_end, cutoff)
+            if not hard or audio_end_ms >= cutoff:
+                return False
+            text, char_end, cutoff = "", 0, audio_end_ms
+            self._conversation.heard_prefixes[item_id] = (text, char_end, cutoff)
             self._store_history_item_message(item_id, _object_dict(role="assistant", content=text[:char_end]))
             return True
-        playback = playback or self._playback_cursor_for_item_id(item_id)
-        if playback is None and response_id is not None and response_id != self.active_response_id:
-            # Retired items must not borrow the current response's playback
-            # policy or duration. Their retained marks use absolute offsets.
-            playback = DuplexPlaybackCursor()
+        # Every history edit uses only this item's evidence. Missing evidence
+        # must never fall back to another response's cursor or timing marks.
+        playback = playback or self._playback_cursor_for_item_id(item_id) or DuplexPlaybackCursor()
         if hard:
             previous_cap_ms = self._conversation.hard_truncations_ms.get(item_id)
             self._conversation.hard_truncations_ms[item_id] = (
@@ -1646,17 +1647,13 @@ class DuplexEngineSession:
             full_message, full_marks, _ = response_snapshot
             message = copy.deepcopy(full_message)
             prefix = self._conversation.heard_prefixes.get(item_id)
-            if prefix is not None and playback is not None and not hard:
+            if prefix is not None and not hard:
                 # Ordinary ACKs are cumulative: an older ACK must not erase
                 # already confirmed text. A hard truncate still only tightens.
                 audio_end_ms = max(audio_end_ms, playback.committed_ms)
                 if hard_cap_ms is not None:
                     audio_end_ms = min(audio_end_ms, hard_cap_ms)
-            fully_played = (
-                playback is not None
-                and playback.audio_complete
-                and audio_end_ms >= max(playback.generated_ms, playback.sent_ms)
-            )
+            fully_played = playback.audio_complete and audio_end_ms >= max(playback.generated_ms, playback.sent_ms)
             if prefix is not None and message.get("content") == prefix[0] and not fully_played:
                 keep_chars = prefix[1] if audio_end_ms >= prefix[2] else 0
                 message["content"] = prefix[0][:keep_chars].rstrip()
@@ -1694,7 +1691,7 @@ class DuplexEngineSession:
             changed = self._truncate_message_to_audio_ms(
                 message,
                 audio_end_ms=audio_end_ms,
-                marks=self._conversation.pending_item_audio_text_marks.get(item_id),
+                marks=self._conversation.pending_item_audio_text_marks.get(item_id, []),
                 playback=playback,
             )
             if not changed or self._message_text_len(message) <= 0:
@@ -1719,19 +1716,21 @@ class DuplexEngineSession:
             if item_id.startswith("item_"):
                 self._conversation.assistant_response_snapshots.pop(item_id.removeprefix("item_"), None)
             return True
-        if not hard and playback is not None and max(playback.sent_ms, playback.generated_ms) == 0:
+        if not hard and max(playback.sent_ms, playback.generated_ms) == 0:
             # No response snapshot or output cursor remains: this is finalized
             # history. Delayed progress ACKs cannot shorten it; only a new
             # explicit truncate may change the stored prefix.
-            return self._message_text_len(stored_message) > 0
+            return False
         message = stored_message
         changed = self._truncate_message_to_audio_ms(
             message,
             audio_end_ms=audio_end_ms,
-            marks=self._conversation.item_audio_text_marks.get(item_id),
+            marks=self._conversation.item_audio_text_marks.get(item_id, []),
             playback=playback,
         )
-        if changed and self._message_text_len(message) <= 0:
+        # Explicit truncation clears content, not the turn. The command also
+        # sends a playback ACK, which must still find this item even at zero.
+        if changed and self._message_text_len(message) <= 0 and not hard:
             self._conversation.item_ids.pop(item_id, None)
             self._conversation.item_audio_text_marks.pop(item_id, None)
             self._conversation.messages = [
@@ -1748,8 +1747,8 @@ class DuplexEngineSession:
         message: dict[str, object],
         *,
         audio_end_ms: int,
-        marks: list[DuplexAssistantAudioTextMark] | None = None,
-        playback: DuplexPlaybackCursor | DuplexPlaybackView | None = None,
+        marks: list[DuplexAssistantAudioTextMark],
+        playback: DuplexPlaybackCursor | DuplexPlaybackView,
     ) -> bool:
         content = message.get("content")
         if isinstance(content, str):
@@ -1828,38 +1827,46 @@ class DuplexEngineSession:
             # client that never acks playback can be credited with.
             if commit_all:
                 return assistant_text
-            keep_chars = self._text_chars_for_audio_ms(committed_ms, len(assistant_text))
+            keep_chars = self._text_chars_for_audio_ms(
+                committed_ms,
+                len(assistant_text),
+                marks=self._response.assistant_audio_text_marks,
+                playback=self._playback.current,
+            )
             return assistant_text[:keep_chars].rstrip()
         if sent_ms <= 0 or committed_ms >= sent_ms:
             return assistant_text
         if committed_ms <= 0:
             return assistant_text if commit_all else ""
-        keep_chars = self._text_chars_for_audio_ms(committed_ms, len(assistant_text))
+        keep_chars = self._text_chars_for_audio_ms(
+            committed_ms,
+            len(assistant_text),
+            marks=self._response.assistant_audio_text_marks,
+            playback=self._playback.current,
+        )
         if keep_chars <= 0:
             return ""
         return assistant_text[:keep_chars].rstrip()
 
+    @staticmethod
     def _text_chars_for_audio_ms(
-        self,
         audio_end_ms: int,
         text_len: int,
         *,
-        marks: list[DuplexAssistantAudioTextMark] | None = None,
-        playback: DuplexPlaybackCursor | DuplexPlaybackView | None = None,
+        marks: list[DuplexAssistantAudioTextMark],
+        playback: DuplexPlaybackCursor | DuplexPlaybackView,
     ) -> int:
         if text_len <= 0:
             return 0
         audio_end_ms = max(0, int(audio_end_ms))
-        marks = marks if marks is not None else self._response.assistant_audio_text_marks
-        playback = playback or self._playback.current
         if playback.text_requires_complete_audio:
             # Unaligned streams cannot establish a spoken prefix. A terminal
             # boundary plus its playback ACK can establish the whole answer.
             total_ms = max(playback.sent_ms, playback.generated_ms)
             return text_len if playback.audio_complete and total_ms > 0 and audio_end_ms >= total_ms else 0
         if not marks:
-            sent_ms = max(1, playback.sent_ms, playback.generated_ms)
-            return int(text_len * max(0.0, min(1.0, audio_end_ms / sent_ms)))
+            sent_ms = max(playback.sent_ms, playback.generated_ms)
+            return int(text_len * min(1.0, audio_end_ms / sent_ms)) if sent_ms > 0 else 0
         marks = sorted(
             (mark for mark in marks if mark.audio_end_ms >= 0 and mark.text_chars >= 0),
             key=lambda mark: mark.audio_end_ms,

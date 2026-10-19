@@ -1071,7 +1071,9 @@ async def test_full_ack_releases_cancelled_replies_without_history_calibration(a
             if hard_cutoff_ms is not None:
                 await h.run(commands.TruncateItem(item_id=f"item_{response}", audio_end_ms=hard_cutoff_ms))
             events = await h.run(commands.AckPlayback(response_id=response, played_ms=1000))
-            assert find(events, "playback.acknowledged").details["history_committed"]
+            # TruncateItem already applied its own ACK and finalized the stop;
+            # this later progress ACK must not report another history commit.
+            assert find(events, "playback.acknowledged").details["history_committed"] is (hard_cutoff_ms is None)
             assert not h.session._conversation.assistant_response_snapshots
             assert not h.session._playback.by_response
             assert not h.session._conversation.hard_truncations_ms
