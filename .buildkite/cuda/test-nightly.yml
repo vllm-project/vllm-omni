@@ -357,7 +357,7 @@ steps:
         # Qwen-Image-2.1 emits a 4D dense attn_mask once a batch mixes prompt
         # lengths (the 512 high-concurrency sweep). The auto-selected FLASH_ATTN
         # masked path only accepts 2D masks and asserts. Pin SDPA, which consumes
-        # the 4D mask natively. See docs/qwen_image_21_attention_mask_4d_bug.md.
+        # the 4D mask natively.
         env:
           DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
         artifact_paths:
