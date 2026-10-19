@@ -76,6 +76,25 @@ def _patched_load_weights(self, weights):
         if hasattr(self.decoder, "precompute_snake_caches"):
             self.decoder.precompute_snake_caches()
     _prepare_npu_decoder_weights(self.decoder)
+    # Weight loaders can update parameters in place: rebuild after every load,
+    # including the 310P dtype override above, and before graph capture.
+    from vllm.triton_utils import HAS_TRITON
+
+    from vllm_omni.model_executor.models.common.snake_activation import SnakeBeta
+    from vllm_omni.model_executor.models.qwen3_tts.tokenizer_12hz.modeling_qwen3_tts_tokenizer_v2 import (
+        EuclideanCodebook,
+    )
+
+    connector = getattr(self.vllm_config.model_config, "stage_connector_config", None)
+    extra = connector.get("extra", connector) if isinstance(connector, dict) else {}
+    fused_snake = extra.get("npu_fused_snake", False)
+    if not isinstance(fused_snake, bool):
+        raise ValueError("npu_fused_snake must be a boolean")
+    for module in self.decoder.modules():
+        if isinstance(module, EuclideanCodebook):
+            module.precompute_embedding()
+        elif isinstance(module, SnakeBeta):
+            module.npu_fused = fused_snake and HAS_TRITON
     actual_dtype = next(self.decoder.parameters()).dtype
     logger.info("Prepared NPU Code2Wav decoder with runtime dtype %s", actual_dtype)
     return loaded

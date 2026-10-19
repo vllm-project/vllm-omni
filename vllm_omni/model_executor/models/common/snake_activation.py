@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Copyright 2025 The Qwen team.
 """Shared Snake/SnakeBeta activations for speech decoders.
 
@@ -77,6 +77,7 @@ class SnakeBeta(nn.Module):
         super().__init__()
         self.in_features = in_features
         self.alpha_logscale = alpha_logscale
+        self.npu_fused = False
 
         if alpha_logscale:
             self.alpha = Parameter(torch.zeros(in_features) * alpha)
@@ -107,6 +108,21 @@ class SnakeBeta(nn.Module):
 
     def forward(self, hidden_states):
         """SnakeBeta := x + 1/b * sin^2(x*a)"""
+        if (
+            self.npu_fused
+            and not self.training
+            and not torch.is_grad_enabled()
+            and hidden_states.device.type == "npu"
+            and hidden_states.dtype == torch.bfloat16
+            and hidden_states.ndim == 3
+            and hidden_states.is_contiguous()
+            and 0 < hidden_states.numel() <= 1024 * 65535
+        ):
+            from vllm_omni.platforms.npu.layers.snake_beta import snake_beta
+
+            if not self._cached:
+                self.precompute_exp_cache()
+            return snake_beta(hidden_states, self._exp_alpha, self._inv_beta)
         if hidden_states.is_cuda and not torch.is_grad_enabled() and self._init_triton():
             try:
                 return self._triton_forward(hidden_states)

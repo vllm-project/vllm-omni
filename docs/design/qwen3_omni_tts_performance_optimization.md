@@ -608,3 +608,28 @@ bash benchmarks/qwen3-tts/vllm_omni/run_stacked_benchmark.sh
 ```
 
 This cycles through four configs (Baseline -> + Batch -> + CUDA Graph -> + Async Chunk + Streaming), benchmarks each at the specified concurrency levels, and generates all comparison figures automatically.
+
+## Qwen3-TTS NPU codec kernels
+
+On NPU, Code2Wav prepares normalized codebook embeddings after loading weights
+and applying the final decoder dtype. The cache is non-persistent and preserves
+the reference division and residual accumulation order. Module conversion,
+state-dict reload, or entering training invalidates it; the NPU weight loader
+rebuilds it after each load, including in-place parameter updates. Gradient-enabled
+calls bypass the cache. Other in-place weight mutations must explicitly refresh
+`precompute_embedding()` before inference. Such mutations are not supported
+while a captured graph is active.
+
+Qwen3-TTS provides an opt-in Ascend SnakeBeta kernel for contiguous, nonempty NCT
+BF16 inference tensors within its validated grid size. The kernel preserves
+BF16 rounding between multiply, sine, square, scale and addition. Unsupported
+dtypes/layouts and training or gradient-enabled calls retain the existing path;
+other models do not opt into this NPU kernel. Set `npu_fused_snake: true` in the
+Code2Wav stage connector `extra` configuration to enable it. The default is false:
+eager Triton dispatch overhead can outweigh the reduced device work. Measure
+your graph mode and workload before enabling it. If Triton is unavailable, the NPU
+loader keeps the eager path. CUDA behavior is unchanged. Runtime compilation
+errors are surfaced rather than silently hidden.
+
+These changes reduce repeated codec work; they do not establish an end-to-end
+throughput gain without matched model-level measurements and audio validation.

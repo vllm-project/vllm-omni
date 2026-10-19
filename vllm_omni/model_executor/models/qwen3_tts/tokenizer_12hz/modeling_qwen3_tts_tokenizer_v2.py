@@ -734,9 +734,42 @@ class EuclideanCodebook(nn.Module):
 
         self.cluster_usage = nn.Parameter(torch.ones(codebook_size))
         self.embedding_sum = nn.Parameter(torch.zeros(codebook_size, dim))
+        self.register_buffer("_normalized_embedding", None, persistent=False)
+
+    def precompute_embedding(self) -> None:
+        """Cache fixed inference weights after loading and dtype/device conversion."""
+        with torch.no_grad():
+            self._normalized_embedding = self.embedding_sum / self.cluster_usage.clamp(min=self.epsilon)[:, None]
+
+    def _apply(self, fn: Callable[[torch.Tensor], torch.Tensor], recurse: bool = True) -> "EuclideanCodebook":
+        # Recompute from converted parameters, rather than casting the quotient.
+        self._normalized_embedding = None
+        return super()._apply(fn, recurse=recurse)
+
+    def _load_from_state_dict(
+        self,
+        state_dict: dict[str, torch.Tensor],
+        prefix: str,
+        local_metadata: dict,
+        strict: bool,
+        missing_keys: list[str],
+        unexpected_keys: list[str],
+        error_msgs: list[str],
+    ) -> None:
+        self._normalized_embedding = None
+        super()._load_from_state_dict(
+            state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
+        )
+
+    def train(self, mode: bool = True) -> "EuclideanCodebook":
+        if mode:
+            self._normalized_embedding = None
+        return super().train(mode)
 
     def decode(self, codes: torch.Tensor) -> torch.Tensor:
-        embedding = self.embedding_sum / self.cluster_usage.clamp(min=self.epsilon)[:, None]
+        embedding = self._normalized_embedding
+        if embedding is None or self.training or torch.is_grad_enabled():
+            embedding = self.embedding_sum / self.cluster_usage.clamp(min=self.epsilon)[:, None]
         quantized = F.embedding(codes, embedding)
         return quantized
 
