@@ -13,9 +13,10 @@ import pytest
 import torch
 from pytest_mock import MockerFixture
 
+from tests.helpers.mark import hardware_marks
 from vllm_omni.diffusion.worker.diffusion_worker import DiffusionWorker
 
-pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.gpu]
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, *hardware_marks(res={"cuda": "L4"}, num_cards=1)]
 
 
 def patch_cumem_allocator(mocker: MockerFixture):
@@ -44,10 +45,12 @@ def mock_od_config(mocker: MockerFixture):
 def mock_gpu_worker(mocker: MockerFixture, mock_od_config):
     """Create a DiffusionWorker with mocked initialization."""
     mocker.patch.object(DiffusionWorker, "init_device")
+    mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.current_omni_platform.synchronize")
     mocker.patch.object(DiffusionWorker, "load_model")
     worker = DiffusionWorker(local_rank=0, rank=0, od_config=mock_od_config)
     # Mock the model_runner with pipeline
     worker.model_runner = mocker.Mock()
+    worker.model_runner._kv_receive_progress = None
     worker.model_runner.pipeline = mocker.Mock()
     worker.device = torch.device("cuda", 0)
     worker._sleep_saved_buffers = {}

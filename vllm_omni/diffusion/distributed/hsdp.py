@@ -46,6 +46,14 @@ class HSDPInferenceConfig:
     reshard_after_forward: bool = True
 
 
+@dataclass
+class HSDPShardContext:
+    """Reusable state for incrementally sharding one HSDP model."""
+
+    hsdp_kwargs: dict[str, Any]
+    ignored_params: set[nn.Parameter] | None = None
+
+
 def _create_hsdp_mesh(
     device_type: str,
     replicate_size: int,
@@ -111,6 +119,38 @@ def apply_hsdp_to_model(
     Returns:
         HSDP-wrapped model ready for inference
     """
+    context = prepare_hsdp_shard_context(
+        model,
+        hsdp_config,
+        target_device=target_device,
+    )
+
+    hsdp_shard_conditions = getattr(model, "_hsdp_shard_conditions", None)
+    if not hsdp_shard_conditions:
+        raise ValueError(f"Model {type(model).__name__} has no _hsdp_shard_conditions defined")
+
+    # Apply HSDP sharding, this will automatically handle weight distribution
+    shard_model(
+        model,
+        hsdp_shard_conditions=hsdp_shard_conditions,
+        context=context,
+    )
+
+    logger.info("HSDP applied to model: %s", type(model).__name__)
+    return model
+
+
+def prepare_hsdp_shard_context(
+    model: nn.Module,
+    hsdp_config: HSDPInferenceConfig,
+    target_device: torch.device | None = None,
+) -> HSDPShardContext:
+    """Prepare mesh, precision, and ignored-parameter state for HSDP.
+
+    The returned context can be reused to shard completed child modules while
+    checkpoint weights are still streaming, then to shard the root once all
+    children have been loaded.
+    """
     if not hsdp_config.enabled:
         raise ValueError("HSDP is not enabled in config")
 
@@ -160,7 +200,7 @@ def apply_hsdp_to_model(
     )
 
     hsdp_shard_conditions = getattr(model, "_hsdp_shard_conditions", None)
-    if not hsdp_shard_conditions or len(hsdp_shard_conditions) == 0:
+    if not hsdp_shard_conditions:
         raise ValueError(f"Model {type(model).__name__} has no _hsdp_shard_conditions defined")
 
     # Collect parameters of any modules the model wants excluded from FSDP sharding.
@@ -188,7 +228,11 @@ def apply_hsdp_to_model(
         except AttributeError:
             logger.warning("_hsdp_ignored_modules entry %r not found on model", mod_name)
             continue
-        sub_mod.to(target_device)
+        has_meta_tensor = any(tensor.device.type == "meta" for tensor in (*sub_mod.parameters(), *sub_mod.buffers()))
+        if has_meta_tensor:
+            sub_mod.to_empty(device=target_device)
+        else:
+            sub_mod.to(target_device)
         ignored_params.update(sub_mod.parameters())
     if ignored_params:
         logger.info(
@@ -224,21 +268,36 @@ def apply_hsdp_to_model(
             target_device,
         )
 
-    # Apply HSDP sharding, this will automatically handle weight distribution
-    shard_model(
-        model,
-        reshard_after_forward=hsdp_config.reshard_after_forward,
-        mp_policy=mp_policy,
-        mesh=device_mesh,
-        hsdp_shard_conditions=hsdp_shard_conditions,
-        ignored_params=ignored_params if ignored_params else None,
+    return HSDPShardContext(
+        hsdp_kwargs={
+            "reshard_after_forward": hsdp_config.reshard_after_forward,
+            "mesh": device_mesh,
+            "mp_policy": mp_policy,
+        },
+        ignored_params=ignored_params or None,
     )
 
-    for param in model.parameters():
+
+def shard_hsdp_module(module: nn.Module, context: HSDPShardContext) -> None:
+    """Shard one completed child module with a prepared HSDP context."""
+    module_kwargs = dict(context.hsdp_kwargs)
+    if context.ignored_params:
+        module_ignored_params = context.ignored_params.intersection(module.parameters())
+        if module_ignored_params:
+            module_kwargs["ignored_params"] = module_ignored_params
+    fully_shard(module, **module_kwargs)
+    for param in module.parameters():
         param.requires_grad = False
 
-    logger.info("HSDP applied to model: %s", type(model).__name__)
-    return model
+
+def finalize_hsdp_root(model: nn.Module, context: HSDPShardContext) -> None:
+    """Shard the model root after all selected child modules are sharded."""
+    root_kwargs = dict(context.hsdp_kwargs)
+    if context.ignored_params:
+        root_kwargs["ignored_params"] = context.ignored_params
+    fully_shard(model, **root_kwargs)
+    for param in model.parameters():
+        param.requires_grad = False
 
 
 def shard_model(
@@ -249,6 +308,7 @@ def shard_model(
     mesh: DeviceMesh | None = None,
     hsdp_shard_conditions: list[Callable[[str, nn.Module], bool]],
     ignored_params: set[nn.Parameter] | None = None,
+    context: HSDPShardContext | None = None,
 ) -> None:
     """Apply HSDP sharding to model modules based on shard conditions.
 
@@ -259,32 +319,30 @@ def shard_model(
     This is required for packed integer parameters inside sharded transformer
     blocks; the root wrap receives the full set for all remaining parameters.
     """
-    hsdp_kwargs: dict[str, Any] = {
-        "reshard_after_forward": reshard_after_forward,
-        "mesh": mesh,
-        "mp_policy": mp_policy,
-    }
+    if context is None:
+        context = HSDPShardContext(
+            hsdp_kwargs={
+                "reshard_after_forward": reshard_after_forward,
+                "mesh": mesh,
+                "mp_policy": mp_policy,
+            },
+            ignored_params=ignored_params,
+        )
+    elif any(value is not None for value in (mp_policy, mesh, ignored_params)) or not reshard_after_forward:
+        raise ValueError("Pass either context or individual HSDP shard options, not both")
 
     num_sharded = 0
     for name, module in reversed(list(model.named_modules())):
         if any(cond(name, module) for cond in hsdp_shard_conditions):
-            module_kwargs = dict(hsdp_kwargs)
-            if ignored_params:
-                module_ignored_params = ignored_params.intersection(module.parameters())
-                if module_ignored_params:
-                    module_kwargs["ignored_params"] = module_ignored_params
-            fully_shard(module, **module_kwargs)
+            shard_hsdp_module(module, context)
             num_sharded += 1
 
     if num_sharded == 0:
         raise ValueError("No modules were sharded")
 
-    root_kwargs = dict(hsdp_kwargs)
-    if ignored_params:
-        root_kwargs["ignored_params"] = ignored_params
-    fully_shard(model, **root_kwargs)
+    finalize_hsdp_root(model, context)
     logger.info(
         "Sharded %d modules + root (ignored_params=%d)",
         num_sharded,
-        len(ignored_params) if ignored_params else 0,
+        len(context.ignored_params) if context.ignored_params else 0,
     )

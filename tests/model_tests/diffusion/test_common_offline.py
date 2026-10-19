@@ -17,12 +17,13 @@ from tests.model_tests.diffusion.task_runners import (
     run_and_validate_image_to_image_request,
     run_and_validate_image_to_video_request,
     run_and_validate_multi_output,
+    run_and_validate_text_to_audio_request,
     run_and_validate_text_to_image_request,
     run_and_validate_text_to_video_request,
 )
 
-# NOTE : Hardware marks are added dynamically based on test requirements
-pytestmark = [pytest.mark.diffusion, pytest.mark.xdist]
+# NOTE: Hardware and model type marks are added dynamically based on test requirements and model type
+pytestmark = [pytest.mark.xdist]
 
 
 @pytest.mark.parametrize(
@@ -72,6 +73,8 @@ def test_pipeline_on_supported_tasks(
                     run_and_validate_text_to_video_request(omni)
                 elif task_type == DiffusionTasks.IMAGE_TO_VIDEO:
                     run_and_validate_image_to_video_request(omni, check_t2v_divergence=check_i2v_t2v_divergence)
+                elif task_type == DiffusionTasks.TEXT_TO_AUDIO:
+                    run_and_validate_text_to_audio_request(omni)
                 else:
                     raise ValueError(f"Task type {task_type} is not yet supported")
 

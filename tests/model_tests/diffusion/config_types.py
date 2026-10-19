@@ -39,7 +39,15 @@ class DiffusionTasks(str, Enum):
     IMAGE_TO_IMAGE = "image_to_image"
     TEXT_TO_VIDEO = "text_to_video"
     IMAGE_TO_VIDEO = "image_to_video"
-    # Text to audio, etc should be added here as needed
+    TEXT_TO_AUDIO = "text_to_audio"
+
+
+class ModelTypeMarker(str, Enum):
+    """Model type markers for pytest parametrization."""
+
+    DIFFUSION = "diffusion"
+    OMNI = "omni"
+    TTS = "tts"
 
 
 class DiffusionModelTestOpts(NamedTuple):
@@ -58,6 +66,10 @@ class DiffusionModelTestOpts(NamedTuple):
 
     # Actual tasks which controls the tests actually run
     supported_tasks: list[DiffusionTasks]
+
+    # Function module marker applied per-test-case via parametrization.
+    # Set to ModelTypeMarker.OMNI or ModelTypeMarker.TTS for non-diffusion models.
+    model_type_marker: ModelTypeMarker
 
     # Additional acceleration groups to run beyond the base case (no acceleration).
     # The base case is always run for every model in the test settings. None means

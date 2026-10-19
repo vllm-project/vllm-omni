@@ -20,6 +20,40 @@ FAILURE_REASONS = frozenset({"client_abort", "client_disconnect", "stage_error",
 DIFFUSION_METRICS_ONLY_REQUEST_ID = "__vllm_omni_diffusion_metrics__"
 
 
+def _as_int(value: object, default: int = 0) -> int:
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    return default
+
+
+def _as_optional_int(value: object) -> int | None:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    return None
+
+
+def _as_float(value: object, default: float = 0.0) -> float:
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, int | float):
+        return float(value)
+    return default
+
+
+def _as_float_list(value: object) -> list[float]:
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, int | float) and not isinstance(item, bool)]
+
+
 def extract_queue_wait_s(pipeline_timings: Mapping[str, float] | None) -> float | None:
     if pipeline_timings is None or "queue_wait_ms" not in pipeline_timings:
         return None
@@ -135,7 +169,7 @@ def diffusion_exception_metrics(exc: BaseException) -> dict[str, Any]:
     return dict(metrics) if isinstance(metrics, dict) else {}
 
 
-def sum_diffusion_stage_durations_ms(output: Any, suffix: str) -> float | None:
+def sum_diffusion_stage_durations_ms(output: Any, suffix: str | tuple[str, ...]) -> float | None:
     """Sum matching diffusion stage durations in milliseconds."""
     durations = getattr(output, "stage_durations", None)
     if not isinstance(durations, dict):
@@ -155,7 +189,12 @@ def sum_diffusion_stage_durations_ms(output: Any, suffix: str) -> float | None:
 
 
 def extract_diffusion_vae_decode_ms(output: Any) -> float | None:
-    return sum_diffusion_stage_durations_ms(output, ".vae.decode")
+    # Profiler keys are "<Class>.<target path>". Count decode and decode_latent
+    # on a module named "vae" or ending in "_vae": the default "vae.decode",
+    # MammothModa2 "gen_vae.decode" and MiniMax-H3 "video_vae.decode_latent".
+    return sum_diffusion_stage_durations_ms(
+        output, (".vae.decode", "_vae.decode", ".vae.decode_latent", "_vae.decode_latent")
+    )
 
 
 def extract_diffusion_denoise_ms(output: Any) -> float | None:

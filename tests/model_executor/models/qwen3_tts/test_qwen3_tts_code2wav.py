@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+from collections import defaultdict
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -8,9 +9,12 @@ import pytest
 import torch
 import torch.nn as nn
 
+from vllm_omni.data_entry_keys import to_dict
+from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import PRECOMPUTED_TEXT_IDS_KEY
 from vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_code2wav import (
     Qwen3TTSCode2Wav,
 )
+from vllm_omni.model_executor.stage_input_processors.qwen3_tts import talker2code2wav_async_chunk
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -23,8 +27,9 @@ class _FakeDecoder(nn.Module):
     def __init__(self, total_upsample: int = _TOTAL_UPSAMPLE):
         super().__init__()
         self.total_upsample = total_upsample
-        self.decode_calls: list[dict[str, int | tuple[int, ...]]] = []
+        self.decode_calls: list[dict[str, object]] = []
         self.batched_decode_calls: list[dict[str, object]] = []
+        self.batched_decode_codes: list[torch.Tensor] = []
         self.decode_codes: list[torch.Tensor] = []
         self.cudagraph_calls: list[dict[str, int | torch.device]] = []
 
@@ -64,6 +69,7 @@ class _FakeDecoder(nn.Module):
         left_context_size: int = 25,
         max_batch_size: int = 0,
     ) -> list[torch.Tensor]:
+        self.batched_decode_codes.append(codes.detach().cpu().clone())
         self.batched_decode_calls.append(
             {
                 "chunk_size": chunk_size,
@@ -91,8 +97,8 @@ class _FakeDecoder(nn.Module):
         wav_len = frames * self.total_upsample + 6
         wav = torch.arange(wav_len, dtype=torch.float32).view(1, 1, -1)
         offsets = torch.arange(batch, dtype=torch.float32).view(batch, 1, 1) * 1000
-        batched_wav = wav.expand(batch, 1, wav_len) + offsets
-        return [batched_wav[row, :, : lengths[row] * self.total_upsample] for row in range(batch)]
+        batched_outputs = wav.expand(batch, 1, wav_len) + offsets
+        return [batched_outputs[row, :, : lengths[row] * self.total_upsample] for row in range(batch)]
 
     def enable_cudagraph(self, **kwargs):
         self.cudagraph_calls.append(kwargs)
@@ -203,6 +209,26 @@ def test_forward_uses_decoder_audio_contract_without_context():
     torch.testing.assert_close(audio, expected)
 
 
+def test_forward_reads_current_model_intermediate_buffer_for_full_payload():
+    """Full-payload sync mode must decode connector codec ids, not placeholders."""
+    model = _make_model()
+    placeholder_ids = torch.zeros(12, dtype=torch.long)
+    payload_codes = torch.arange(12, dtype=torch.long) + 17
+
+    model.forward(
+        input_ids=placeholder_ids,
+        runtime_additional_information=[],
+        model_intermediate_buffer=[
+            {
+                "codes": {"audio": payload_codes},
+                "meta": {"left_context_size": 0},
+            }
+        ],
+    )
+
+    torch.testing.assert_close(model.decoder.batched_decode_codes[-1], payload_codes.reshape(1, _NUM_QUANTIZERS, 6))
+
+
 @pytest.mark.parametrize("skipped_length", [0, 1], ids=["empty", "malformed"])
 def test_stateless_batch_uses_original_request_index_for_left_context(skipped_length):
     model = _make_model()
@@ -269,6 +295,31 @@ def test_request_aware_forward_passes_only_delta_frames_to_decoder():
         (1, _NUM_QUANTIZERS, 3),
         (1, _NUM_QUANTIZERS, 2),
     ]
+
+
+def test_forward_reports_the_codec_frames_past_the_left_context():
+    model = _make_model()
+
+    out = model.forward(
+        input_ids=torch.arange(12, dtype=torch.long),
+        runtime_additional_information=[{"meta": {"left_context_size": 2}}],
+    )
+
+    # Codebook-major ids [[0..5], [6..11]]: the four frames after the two context
+    # frames, one row of codebooks per frame.
+    frames = out.multimodal_outputs["codec_frames"][0]
+    torch.testing.assert_close(frames, torch.tensor([[2, 8], [3, 9], [4, 10], [5, 11]]))
+
+
+def test_request_aware_forward_reports_each_delta_frame():
+    model = _make_model(async_chunk=True)
+    info = [{"meta": {"request_id": "rid", "left_context_size": 0}}]
+
+    first = model.forward(input_ids=torch.arange(6, dtype=torch.long), runtime_additional_information=info)
+    second = model.forward(input_ids=torch.arange(4, dtype=torch.long), runtime_additional_information=info)
+
+    torch.testing.assert_close(first.multimodal_outputs["codec_frames"][0], torch.tensor([[0, 3], [1, 4], [2, 5]]))
+    torch.testing.assert_close(second.multimodal_outputs["codec_frames"][0], torch.tensor([[0, 2], [1, 3]]))
 
 
 def test_four_frame_first_chunk_uses_configured_initial_size_without_ramp():
@@ -577,6 +628,7 @@ def test_decode_chunking_override_is_passed_to_cudagraph():
     _load_weights_noop(model)
 
     assert model.decoder.cudagraph_calls[-1] == {
+        "capture_modes": ("icl", "xvec"),
         "capture_batch_sizes": None,
         "stateless_capture_sizes": None,
         "device": torch.device("cuda"),
@@ -605,6 +657,13 @@ def test_cudagraph_batch_config_is_preserved():
 
     call = model.decoder.cudagraph_calls[-1]
     assert call["capture_batch_sizes"] == [1, 2, 4, 8]
+
+
+def test_cudagraph_captures_only_modes_used_by_the_model():
+    model = _make_model(async_chunk=True, device=torch.device("cuda"))
+    model.decoder_cudagraph_modes = ("xvec",)
+    _load_weights_noop(model)
+    assert model.decoder.cudagraph_calls[-1]["capture_modes"] == ("xvec",)
 
 
 def test_stateless_cudagraph_capture_sizes_are_passed_from_config():
@@ -711,6 +770,329 @@ def test_invalid_decode_chunking_is_rejected():
         _load_weights_noop(model)
 
 
+def _rho_meta(*, request_id: str = "rid", **meta: object) -> list[dict[str, object]]:
+    """Build a single-request runtime meta dict for rho-stat tests."""
+    payload = {"request_id": request_id, "left_context_size": 0}
+    payload.update(meta)
+    return [{"meta": payload}]
+
+
+def _mock_logged_messages(mock_logger: object) -> list[str]:
+    """Re-apply %-style formatting to the messages a patched logger recorded."""
+    messages: list[str] = []
+    for call in mock_logger.info.call_args_list:
+        args = call.args
+        if not args:
+            messages.append("")
+        elif len(args) == 1:
+            messages.append(str(args[0]))
+        else:
+            messages.append(str(args[0]) % args[1:])
+    return messages
+
+
+def test_rho_stats_accumulate_across_forwards_and_reset_on_segment_finish():
+    model = _make_model(async_chunk=True)
+
+    model.forward(
+        input_ids=torch.arange(8, dtype=torch.long),  # 4 codec frames
+        runtime_additional_information=_rho_meta(request_text_tokens=8),
+    )
+    model.forward(
+        input_ids=torch.arange(12, dtype=torch.long),  # 6 codec frames
+        runtime_additional_information=_rho_meta(),
+    )
+    assert model._rho_stats._stats["rid"] == {
+        "seg_frames": 10,
+        "seg_forwards": 2,
+        "seg_text_tokens": 8,
+        "text_tokens_base": 0,
+    }
+
+    # Segment boundary: the final chunk (2 frames) is accumulated first, so the
+    # logged ratio is 12 frames / 8 text tokens = 1.5, then counters reset. The
+    # running base survives and now holds the 8 text tokens this segment covered.
+    with patch("vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_code2wav.logger") as mock_logger:
+        model.forward(
+            input_ids=torch.arange(4, dtype=torch.long),  # 2 codec frames
+            runtime_additional_information=_rho_meta(is_segment_finished=torch.tensor(True, dtype=torch.bool)),
+        )
+    assert model._rho_stats._stats["rid"] == {
+        "seg_frames": 0,
+        "seg_forwards": 0,
+        "seg_text_tokens": 0,
+        "text_tokens_base": 8,
+    }
+    logged = _mock_logged_messages(mock_logger)
+    assert any("segment rho" in text and "rho=1.500" in text for text in logged)
+
+
+def test_rho_stats_disabled_without_async_chunk():
+    model = _make_model(async_chunk=False)
+
+    model.forward(
+        input_ids=torch.arange(8, dtype=torch.long),
+        runtime_additional_information=_rho_meta(request_text_tokens=8),
+    )
+    assert model._rho_stats._stats == {}
+
+
+def test_rho_stats_excludes_ref_context_frames():
+    model = _make_model(async_chunk=True)
+
+    model.forward(
+        input_ids=torch.arange(8, dtype=torch.long),  # 4 frames, 2 of them ref context
+        runtime_additional_information=_rho_meta(
+            ref_context_size=2,
+            ref_context_included=True,
+            request_text_tokens=6,
+        ),
+    )
+    assert model._rho_stats._stats["rid"] == {
+        "seg_frames": 2,
+        "seg_forwards": 1,
+        "seg_text_tokens": 6,
+        "text_tokens_base": 0,
+    }
+
+
+def test_rho_stats_flushes_partial_segment_on_early_return_finish():
+    model = _make_model(async_chunk=True)
+
+    model.forward(
+        input_ids=torch.arange(8, dtype=torch.long),  # 4 codec frames
+        runtime_additional_information=_rho_meta(request_text_tokens=10),
+    )
+
+    # Malformed final payload (length not divisible by num_quantizers) with
+    # finished=True: no valid codes, so forward() returns via the early
+    # boundary-cleanup path and must still flush the partial segment.
+    with patch("vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_code2wav.logger") as mock_logger:
+        model.forward(
+            input_ids=torch.arange(3, dtype=torch.long),
+            runtime_additional_information=_rho_meta(finished=torch.tensor(True, dtype=torch.bool)),
+        )
+    # 4 frames / 10 text tokens = 0.4, then the entry is dropped.
+    assert "rid" not in model._rho_stats._stats
+    logged = _mock_logged_messages(mock_logger)
+    assert any("segment rho" in text and "rho=0.400" in text for text in logged)
+
+
+def test_rho_stats_flush_on_empty_finished_input():
+    """The talker adapter ends a request with an empty-finished payload.
+
+    input_ids is empty, so forward() returns before the boundary-cleanup
+    loop; the empty-input path must still honor the finish flag and flush the
+    trailing segment.
+    """
+    model = _make_model(async_chunk=True)
+
+    model.forward(
+        input_ids=torch.arange(8, dtype=torch.long),  # 4 codec frames
+        runtime_additional_information=_rho_meta(request_text_tokens=8),
+    )
+    assert model._rho_stats._stats["rid"] == {
+        "seg_frames": 4,
+        "seg_forwards": 1,
+        "seg_text_tokens": 8,
+        "text_tokens_base": 0,
+    }
+
+    with patch("vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_code2wav.logger") as mock_logger:
+        model.forward(
+            input_ids=torch.tensor([], dtype=torch.long),  # empty-finished sentinel
+            runtime_additional_information=_rho_meta(finished=torch.tensor(True, dtype=torch.bool)),
+        )
+    # 4 frames / 8 text tokens = 0.5, then the entry is dropped.
+    assert "rid" not in model._rho_stats._stats
+    logged = _mock_logged_messages(mock_logger)
+    assert any("segment rho" in text and "rho=0.500" in text for text in logged)
+
+
+def test_rho_stats_empty_payload_flush_uses_the_canonical_request_id():
+    """Frame observations key on the scheduler-side ID, not the external one.
+
+    The payload meta carries the external request ID, which may differ from the
+    scheduler-side ID that keys ``observe_chunk``.  Keying the empty-payload
+    flush on the payload ID would leave the observed segment unflushed and
+    merge two segments into one ratio.
+    """
+    model = _make_model(async_chunk=True)
+
+    model.forward(
+        input_ids=torch.arange(8, dtype=torch.long),  # 4 codec frames
+        runtime_additional_information=_rho_meta(request_id="external-rid", request_text_tokens=8),
+        request_ids=["internal-rid"],
+    )
+    assert "internal-rid" in model._rho_stats._stats
+
+    with patch("vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_code2wav.logger") as mock_logger:
+        model.forward(
+            input_ids=torch.tensor([], dtype=torch.long),  # empty-finished sentinel
+            runtime_additional_information=_rho_meta(
+                request_id="external-rid", finished=torch.tensor(True, dtype=torch.bool)
+            ),
+            request_ids=["internal-rid"],
+        )
+    assert "internal-rid" not in model._rho_stats._stats
+    logged = _mock_logged_messages(mock_logger)
+    assert any("segment rho" in text and "rho=0.500" in text for text in logged)
+
+
+def test_rho_stats_flush_on_requests_finished():
+    """The trailing segment is logged when the runner reports the request finished.
+
+    The final empty-finished payload may never reach this stage, so
+    on_requests_finished must flush it.
+    """
+    model = _make_model(async_chunk=True)
+
+    model.forward(
+        input_ids=torch.arange(8, dtype=torch.long),  # 4 codec frames
+        runtime_additional_information=_rho_meta(request_text_tokens=4),
+    )
+    assert "rid" in model._rho_stats._stats
+
+    with patch("vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_code2wav.logger") as mock_logger:
+        model.on_requests_finished(["rid"])
+    # 4 frames / 4 text tokens = 1.0, then the entry is dropped.
+    assert "rid" not in model._rho_stats._stats
+    logged = _mock_logged_messages(mock_logger)
+    assert any("segment rho" in text and "rho=1.000" in text for text in logged)
+
+
+def test_rho_stats_log_one_segment_count_per_boundary_not_the_request_total():
+    """Two segment boundaries on one request ID: each n_k is the segment's own.
+
+    A resumable request keeps one request ID while it is fed segment after
+    segment, and the payloads carry the *running* text-token count of the
+    request.  Segment 1 covers 10 text tokens and segment 2 adds 6 more, so
+    segment 2's payloads report 16.  Pairing that 16 with segment 2's frames
+    (the regression this pins) would log rho = 8/16 = 0.500 instead of 8/6.
+    """
+    model = _make_model(async_chunk=True)
+    segment_finished = torch.tensor(True, dtype=torch.bool)
+    request_finished = torch.tensor(True, dtype=torch.bool)
+
+    # Segment 1: two chunks of 4 frames, running count 10 throughout.
+    model.forward(
+        input_ids=torch.arange(8, dtype=torch.long),  # 4 codec frames
+        runtime_additional_information=_rho_meta(request_text_tokens=10),
+    )
+    with patch("vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_code2wav.logger") as mock_logger:
+        model.forward(
+            input_ids=torch.arange(8, dtype=torch.long),  # 4 codec frames
+            runtime_additional_information=_rho_meta(
+                request_text_tokens=10,
+                is_segment_finished=segment_finished,
+            ),
+        )
+    logged = _mock_logged_messages(mock_logger)
+    # 8 frames / the 10 text tokens of segment 1 = 0.8.
+    assert any("segment rho" in text and "text_tokens=10" in text and "rho=0.800" in text for text in logged), logged
+
+    # Segment 2: the running count now covers both segments (16 text tokens).
+    model.forward(
+        input_ids=torch.arange(8, dtype=torch.long),  # 4 codec frames
+        runtime_additional_information=_rho_meta(request_text_tokens=16),
+    )
+    with patch("vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_code2wav.logger") as mock_logger:
+        model.forward(
+            input_ids=torch.tensor([], dtype=torch.long),  # empty-finished sentinel
+            runtime_additional_information=_rho_meta(
+                request_text_tokens=16,
+                finished=request_finished,
+            ),
+        )
+    assert "rid" not in model._rho_stats._stats
+    logged = _mock_logged_messages(mock_logger)
+    # 4 frames / the 6 text tokens segment 2 added = 0.667, and never 16.
+    assert any("segment rho" in text and "text_tokens=6" in text and "rho=0.667" in text for text in logged), logged
+    assert not any("text_tokens=16" in text for text in logged), logged
+
+
+def test_rho_stats_report_unknown_count_without_request_text_tokens():
+    """Payloads carrying no running count leave n_k unknown, and log n/a."""
+    model = _make_model(async_chunk=True)
+
+    with patch("vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_code2wav.logger") as mock_logger:
+        model.forward(
+            input_ids=torch.arange(8, dtype=torch.long),  # 4 codec frames
+            runtime_additional_information=_rho_meta(is_segment_finished=torch.tensor(True, dtype=torch.bool)),
+        )
+    assert model._rho_stats._stats["rid"]["text_tokens_base"] == 0
+    logged = _mock_logged_messages(mock_logger)
+    assert any("segment rho" in text and "text_tokens=n/a" in text for text in logged), logged
+
+
+def _producer_request(rid: str, n_text_ids: int) -> SimpleNamespace:
+    entry = SimpleNamespace(list_data=[list(range(n_text_ids))])
+    return SimpleNamespace(
+        external_req_id=rid,
+        is_finished=lambda: False,
+        additional_information=SimpleNamespace(entries={PRECOMPUTED_TEXT_IDS_KEY: entry}),
+    )
+
+
+def _producer_transfer_manager(rid: str, n_frames: int) -> SimpleNamespace:
+    extra = {"codec_chunk_frames": 25, "codec_left_context_frames": 25, "initial_codec_chunk_frames": 0}
+    tm = SimpleNamespace(
+        code_prompt_token_ids=defaultdict(list),
+        scheduler_max_num_seqs=8,
+        put_req_chunk=defaultdict(int),
+        ramp_chunk_count=defaultdict(int),
+        request_payload={},
+        connector=SimpleNamespace(config={"extra": extra}),
+    )
+    tm.code_prompt_token_ids[rid] = [[1, 2, 3, 4][:] for _ in range(n_frames)]
+    return tm
+
+
+def test_producer_payload_feeds_rho_logging_end_to_end():
+    """The real producer payload drives rho logging without further translation.
+
+    Joins the two halves tested separately: the stage-input processor writes the
+    request's running text-token count into the payload meta and Code2Wav must
+    consume the serialized payload (to_dict shape) and log rho = realized
+    frames / the segment's text tokens.
+    """
+    rid = "seam-rid"
+    empty_codes = {"codes": {"audio": torch.zeros((0,))}}
+    chunk_payload = talker2code2wav_async_chunk(
+        transfer_manager=_producer_transfer_manager(rid, n_frames=2),
+        multimodal_output=empty_codes,
+        request=_producer_request(rid, n_text_ids=12),
+        is_finished=False,
+    )
+    finished_payload = talker2code2wav_async_chunk(
+        transfer_manager=_producer_transfer_manager(rid, n_frames=2),
+        multimodal_output=empty_codes,
+        request=_producer_request(rid, n_text_ids=12),
+        is_finished=True,
+    )
+    model = _make_model(async_chunk=True)
+
+    chunk_dict = to_dict(chunk_payload)
+    assert chunk_dict["meta"]["request_text_tokens"] == 12
+    model.forward(
+        input_ids=torch.as_tensor(chunk_dict["codes"]["audio"], dtype=torch.long),  # 4 codec frames
+        runtime_additional_information=[chunk_dict],
+    )
+    assert model._rho_stats._stats[rid]["seg_frames"] == 4
+    assert model._rho_stats._stats[rid]["seg_text_tokens"] == 12
+
+    finished_dict = to_dict(finished_payload)
+    with patch("vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_code2wav.logger") as mock_logger:
+        model.forward(
+            input_ids=torch.as_tensor(finished_dict["codes"]["audio"], dtype=torch.long),
+            runtime_additional_information=[finished_dict],
+        )
+    # 4 + 4 frames / 12 text tokens = 0.667, then the entry is dropped.
+    assert rid not in model._rho_stats._stats
+    logged = _mock_logged_messages(mock_logger)
+    assert any("segment rho" in text and "rho=0.667" in text for text in logged)
+
+
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
 def test_load_weights_uses_model_dtype_before_precomputing_caches(dtype):
     model = _make_model()
@@ -722,3 +1104,37 @@ def test_load_weights_uses_model_dtype_before_precomputing_caches(dtype):
     assert _load_weights_noop(model) == {"decoder.fake_weight"}
     assert model.decoder.weight.dtype is dtype
     assert cache_dtypes == [dtype]
+
+
+@pytest.mark.parametrize("capture_fails", [False, True])
+def test_decode_autotune_restores_process_flags(mocker, monkeypatch, capture_fails):
+    monkeypatch.setattr(torch.backends.cudnn, "benchmark", False)
+    monkeypatch.setattr(torch.backends.cudnn, "benchmark_limit", 5)
+    original = (torch.backends.cudnn.enabled, torch.backends.cudnn.deterministic, torch.backends.cudnn.allow_tf32)
+    model = _make_model(
+        async_chunk=True,
+        device=torch.device("cuda"),
+        stage_connector_config={"extra": {"decode_cudnn_benchmark": True}},
+    )
+
+    observed = []
+
+    def capture(**kwargs):
+        observed.append(
+            (
+                torch.backends.cudnn.benchmark,
+                torch.backends.cudnn.benchmark_limit,
+                torch.backends.cudnn.enabled,
+                torch.backends.cudnn.deterministic,
+                torch.backends.cudnn.allow_tf32,
+            )
+        )
+        if capture_fails:
+            raise RuntimeError("capture failed")
+
+    capture_mock = mocker.patch.object(model, "_maybe_enable_decoder_cudagraph", side_effect=capture)
+    _load_weights_noop(model)
+    capture_mock.assert_called_once()
+    assert observed == [(True, 10, *original)]
+    assert torch.backends.cudnn.benchmark is False
+    assert torch.backends.cudnn.benchmark_limit == 5

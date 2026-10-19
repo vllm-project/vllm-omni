@@ -20,7 +20,11 @@ import pytest
 from omegaconf import OmegaConf
 from pydantic import ValidationError
 from transformers import PretrainedConfig, Qwen3OmniMoeConfig
+from vllm.config import VllmConfig
 from vllm.engine.arg_utils import EngineArgs
+from vllm.exceptions import VLLMValidationError
+from vllm.v1.engine.input_processor import InputProcessor
+from vllm.v1.worker.gpu.sample.logit_bias import LogitBiasState
 
 from tests.helpers.mock import patch_hf_snapshot_download
 from vllm_omni.config.model import OmniModelConfig
@@ -30,6 +34,36 @@ from vllm_omni.platforms import current_omni_platform
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+@pytest.mark.parametrize("use_v2", [False, True])
+def test_stage_runner_selects_matching_input_processor_validator(monkeypatch, use_v2):
+    from vllm.sampling_params import SamplingParams
+
+    from vllm_omni.model_executor.models.audex.cfg import AudexCFGLogitsProcessor
+
+    # Upstream's process-wide preference must not override a stage's deploy choice.
+    monkeypatch.setattr("vllm.envs.VLLM_USE_V2_MODEL_RUNNER", not use_v2)
+    config = VllmConfig()
+    model_config = object.__new__(OmniModelConfig)
+    model_config.use_v2_model_runner = use_v2
+    model_config.runner_type = "generate"
+    model_config.logits_processors = [LogitBiasState if use_v2 else AudexCFGLogitsProcessor]
+    config.model_config = model_config
+    assert config.use_v2_model_runner is use_v2
+    processor = object.__new__(InputProcessor)
+    processor.vllm_config, processor.model_config = config, model_config
+    validator = processor._build_logits_processors_params_validator()
+    validator(SamplingParams(extra_args={"cfg_role": "cond", "cfg_scale": 1.5}))
+    if not use_v2:
+        with pytest.raises(VLLMValidationError, match="cfg_role"):
+            validator(SamplingParams(extra_args={"cfg_role": "invalid"}))
+
+
+@pytest.mark.parametrize("use_v2", [False, True])
+def test_plain_vllm_config_retains_upstream_runner_preference(monkeypatch, use_v2):
+    monkeypatch.setattr("vllm.envs.VLLM_USE_V2_MODEL_RUNNER", use_v2)
+    assert VllmConfig().use_v2_model_runner is use_v2
 
 
 def test_sync_config_is_omni():

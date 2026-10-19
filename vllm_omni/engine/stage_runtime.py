@@ -30,6 +30,8 @@ from vllm_omni.distributed.omni_coordinator import (
     RandomBalancer,
     RoundRobinBalancer,
 )
+from vllm_omni.engine.arg_utils import is_frontend_only
+from vllm_omni.engine.cuda_mps import CudaMPSServer, physical_gpu_uuid
 from vllm_omni.engine.messages import (
     EngineQueueMessage,
     RegisterRemoteReplicaMessage,
@@ -178,6 +180,8 @@ class StageRuntime:
         self._model = model
         self._config_path = config_path
         self._stage_init_timeout = stage_init_timeout
+        # Set by shutdown()/cancel_initialization(): stop launching further replicas.
+        self._init_cancelled = threading.Event()
         self._async_chunk = async_chunk
         self._tokenizer = tokenizer
         # When True, same-device stages initialize concurrently, coordinated by
@@ -205,6 +209,7 @@ class StageRuntime:
         # device groups can initialize concurrently.
         self._replica_launch_lock = threading.Lock()
         self._init_visible_devices_baseline: str | None = None
+        self._mps_servers: dict[str, CudaMPSServer] = {}
 
     @staticmethod
     def _client_addresses_from_zmq(addresses: Any) -> dict[str, str]:
@@ -396,7 +401,15 @@ class StageRuntime:
         lock_fds: list[int] = []
         locked_devices: set[int] = set()
         launch: StageEngineLaunch | None = None
-        exited_contexts = 0
+        exited_contexts: set[int] = set()
+        handshake_executor: concurrent.futures.ThreadPoolExecutor | None = None
+        stop_handshakes = threading.Event()
+        # With several API servers every replica is spawned before the first
+        # handshake. Replicas sharing devices still initialize in launch
+        # order, so keep the conservative wait budget for the longest chain.
+        handshake_timeout_s = (
+            float(timeout) * sum(len(plan.replicas) for plan in stage_plans) if num_api_servers > 1 else None
+        )
 
         try:
             for plan in stage_plans:
@@ -411,16 +424,20 @@ class StageRuntime:
                         replica.metadata.runtime_cfg,
                     )
                     if not self._parallel_stage_init:
-                        with self._scoped_spawn_device_env(physical_devices):
-                            lock_fds.extend(
-                                acquire_device_locks(
-                                    replica.metadata.stage_id,
-                                    replica.engine_args_dict,
-                                    timeout,
-                                    locked_devices,
-                                )
+                        # Never hold the spawn-env lock while waiting for a GPU:
+                        # its current holder may need that lock to spawn.
+                        lock_fds.extend(
+                            acquire_device_locks(
+                                replica.metadata.stage_id,
+                                replica.engine_args_dict,
+                                timeout,
+                                locked_devices,
+                                visible_devices=physical_devices,
                             )
+                        )
 
+                    with self._replica_launch_lock:
+                        mps_env = self._mps_environment(physical_devices, replica.metadata.runtime_cfg)
                     launch_context = launch_stage_replica(
                         vllm_config=replica.stage_vllm_config,
                         executor_class=replica.executor_class,
@@ -430,23 +447,28 @@ class StageRuntime:
                         stage_config=replica.stage_cfg,
                         omni_master_server=self._get_omni_master_server(),
                         omni_coordinator_address=self._get_coordinator_address(),
-                        stage_visible_devices=physical_devices,
+                        stage_visible_devices=mps_env.get("CUDA_VISIBLE_DEVICES", physical_devices),
                         spawn_device_lock=self._spawn_device_lock,
                         omni_parallel_stage_init=self._parallel_stage_init,
                         num_api_servers=num_api_servers,
                         watched_frontend_processes=watched_frontend_processes if num_api_servers > 1 else None,
+                        stage_init_timeout=timeout,
+                        handshake_timeout_s=handshake_timeout_s,
                     )
                     # Environment overlays are process-global. Serialize spawn;
                     # parallel initialization waits for READY outside this lock.
                     with self._replica_launch_lock:
-                        with stage_runtime_env(replica.metadata.stage_id, replica.metadata.runtime_cfg):
+                        with (
+                            stage_runtime_env(replica.metadata.stage_id, replica.metadata.runtime_cfg),
+                            stage_runtime_env(replica.metadata.stage_id, {"env": mps_env}),
+                        ):
                             stage_resources = launch_context.__enter__()
                         entered_contexts.append(launch_context)
                         if stage_resources is None:
                             raise RuntimeError(f"LLM stage {plan.stage_id} launcher returned no resources")
                         resources.append(stage_resources)
                     if num_api_servers == 1:
-                        exited_contexts += 1
+                        exited_contexts.add(len(entered_contexts) - 1)
                         launch_context.__exit__(None, None, None)
                     addresses = stage_resources.addresses
                     # The generic resource bundle allows no addresses (e.g.
@@ -494,25 +516,117 @@ class StageRuntime:
             )
             yield launch
 
-            while exited_contexts < len(entered_contexts):
-                entered_context = entered_contexts[exited_contexts]
-                exited_contexts += 1
-                entered_context.__exit__(None, None, None)
+            if num_api_servers > 1:
+                replicas = [replica for plan in stage_plans for replica in plan.replicas]
+                handshake_groups: dict[str, list[int]] = {}
+                for index, key in enumerate(self._init_group_keys(replicas)):
+                    handshake_groups.setdefault(key, []).append(index)
+                handshake_state_lock = threading.Lock()
+
+                def complete_group(indices: list[int]) -> None:
+                    for index in indices:
+                        with handshake_state_lock:
+                            if stop_handshakes.is_set():
+                                return
+                            # A failed __exit__ also consumes its context.
+                            exited_contexts.add(index)
+                        try:
+                            entered_contexts[index].__exit__(None, None, None)
+                        except BaseException:
+                            stop_handshakes.set()
+                            raise
+
+                # The HELLO reply starts model initialization, so waiting for
+                # READY in launch order would serialize even disjoint GPUs.
+                # Match the frontend attachment scheduler's device groups.
+                if len(handshake_groups) == 1:
+                    complete_group(next(iter(handshake_groups.values())))
+                elif handshake_groups:
+                    handshake_executor = concurrent.futures.ThreadPoolExecutor(
+                        max_workers=len(handshake_groups), thread_name_prefix="stage-handshake"
+                    )
+                    futures = [handshake_executor.submit(complete_group, group) for group in handshake_groups.values()]
+                    for future in concurrent.futures.as_completed(futures):
+                        future.result()
         except BaseException as exc:
+            stop_handshakes.set()
+            # Terminating engines wakes handshake pollers via their process
+            # sentinels. Do this before joining any still-running workers.
             if launch is not None:
                 launch.shutdown()
             else:
                 StageEngineLaunch(client_configs=client_configs, resources=resources).shutdown()
+            if handshake_executor is not None:
+                handshake_executor.shutdown(wait=True, cancel_futures=True)
+                handshake_executor = None
             exc_info = (type(exc), exc, exc.__traceback__)
-            for pending_context in reversed(entered_contexts[exited_contexts:]):
+            for index in reversed(range(len(entered_contexts))):
+                if index in exited_contexts:
+                    continue
                 with contextlib.suppress(BaseException):
-                    pending_context.__exit__(*exc_info)
+                    entered_contexts[index].__exit__(*exc_info)
             raise
         finally:
+            if handshake_executor is not None:
+                handshake_executor.shutdown(wait=True)
             if lock_fds:
                 release_device_locks(lock_fds)
 
+    @staticmethod
+    def _mps_enabled(runtime_cfg: Any) -> bool:
+        return bool(
+            runtime_cfg.get("cuda_mps", False)
+            if isinstance(runtime_cfg, Mapping)
+            else getattr(runtime_cfg, "cuda_mps", False)
+        )
+
+    def _validate_mps_topology(self, stage_plans: Sequence[LogicalStageInitPlan]) -> None:
+        for plan in stage_plans:
+            for replica in plan.replicas:
+                runtime_cfg = getattr(replica.stage_cfg, "runtime_config", getattr(replica.stage_cfg, "runtime", None))
+                if not self._mps_enabled(runtime_cfg):
+                    continue
+                if replica.launch_mode != "local" or replica.metadata.stage_type == "diffusion":
+                    raise ValueError("cuda_mps currently supports local EngineCore stages only")
+                if self._parallel_stage_init:
+                    raise ValueError(
+                        "cuda_mps requires parallel_stage_init=false for physical GPU initialization locks"
+                    )
+
+    def _mps_environment(self, devices: str | None, runtime_cfg: Any) -> dict[str, str]:
+        if not self._mps_enabled(runtime_cfg):
+            return {}
+        if not current_omni_platform.is_cuda() or devices is None or len(devices.split(",")) != 1:
+            raise ValueError("cuda_mps currently requires a local CUDA stage on exactly one explicit GPU")
+        runtime_env = runtime_cfg.get("env") if isinstance(runtime_cfg, Mapping) else getattr(runtime_cfg, "env", None)
+        pipe_directory = (
+            str(runtime_env["CUDA_MPS_PIPE_DIRECTORY"])
+            if isinstance(runtime_env, Mapping) and "CUDA_MPS_PIPE_DIRECTORY" in runtime_env
+            else None
+        )
+        uuid = physical_gpu_uuid(devices.strip())
+        if uuid not in self._mps_servers:
+            self._mps_servers[uuid] = CudaMPSServer(uuid, pipe_directory=pipe_directory)
+        server = self._mps_servers[uuid]
+        if pipe_directory is not None and (pipe_directory or None) != server.operator_pipe_directory:
+            raise ValueError(f"Conflicting CUDA_MPS_PIPE_DIRECTORY settings for stages sharing GPU {uuid}")
+        return server.env
+
+    def _close_mps_servers(self) -> None:
+        for uuid, server in list(self._mps_servers.items()):
+            try:
+                server.close()
+            except Exception:
+                logger.exception("Failed to close private MPS server for %s; retaining its control directory", uuid)
+            else:
+                del self._mps_servers[uuid]
+
+    def cancel_initialization(self) -> None:
+        """Stop launching replicas that have not started yet (e.g. after an init timeout)."""
+        self._init_cancelled.set()
+
     def shutdown(self) -> None:
+        self._init_cancelled.set()
         for pool in self.stage_pools:
             for client in pool.clients:
                 if client is not None and hasattr(client, "shutdown"):
@@ -523,6 +637,7 @@ class StageRuntime:
         if self._stage_init_executor is not None:
             self._stage_init_executor.shutdown(wait=True, cancel_futures=True)
             self._stage_init_executor = None
+        self._close_mps_servers()
 
     def create_membership_controller(self) -> Any | None:
         """Return a distributed membership controller, if this runtime needs one."""
@@ -538,6 +653,7 @@ class StageRuntime:
             replicas_per_stage,
             replica_devices_map,
         )
+        self._validate_mps_topology(stage_plans)
         self._validate_native_kv_topology(stage_plans)
         return stage_plans
 
@@ -555,35 +671,20 @@ class StageRuntime:
 
     def _cleanup_after_initialize_failure(self) -> None:
         """Hook for runtimes that own extra infrastructure during init."""
-        return None
-
-    @contextmanager
-    def _scoped_spawn_device_env(self, physical_devices: str | None) -> Iterator[None]:
-        """Briefly scope device visibility for spawn-sensitive setup steps."""
-        from vllm_omni.engine.stage_engine_startup import scoped_spawn_device_env
-
-        with scoped_spawn_device_env(
-            physical_devices,
-            self._spawn_device_lock,
-        ):
-            yield
+        self._close_mps_servers()
 
     def _resolve_replica_physical_devices(self, stage_id: int, runtime_cfg: Any) -> str | None:
         if runtime_cfg is None:
             runtime_cfg = {}
         devices = runtime_cfg.get("devices") if hasattr(runtime_cfg, "get") else getattr(runtime_cfg, "devices", None)
-        return resolve_stage_physical_devices(
+        physical = resolve_stage_physical_devices(
             stage_id,
             devices,
             visible_baseline=self._init_visible_devices_baseline,
         )
-
-    @contextmanager
-    def _stage_device_scope(self, stage_id: int, runtime_cfg: Any) -> Iterator[None]:
-        """Temporarily apply the stage device env while launching a replica."""
-        physical_devices = self._resolve_replica_physical_devices(stage_id, runtime_cfg)
-        with self._scoped_spawn_device_env(physical_devices):
-            yield
+        if self._mps_enabled(runtime_cfg) and (physical is None or not physical.isdigit()):
+            raise ValueError("cuda_mps requires one numeric physical GPU for initialization locking")
+        return physical
 
     # ---- Internal methods ----
 
@@ -680,7 +781,7 @@ class StageRuntime:
             port = int(extra.get("bootstrap_port", 8998)) + replica_metadata.replica_id
             extra["bootstrap_addr"] = f"http://{kv_config.kv_ip}:{port}"
             if isinstance(replica_cfg, BaseVllmOmniStageConfig):
-                runtime_cfg = replica_cfg.runtime_config
+                runtime_cfg: Any = replica_cfg.runtime_config
                 runtime_cfg.env = {
                     **(runtime_cfg.env or {}),
                     "VLLM_MOONCAKE_BOOTSTRAP_PORT": str(port),
@@ -855,6 +956,21 @@ class StageRuntime:
             """Initialize replicas in one scheduling group sequentially."""
             nonlocal primary_exc
             for stage_idx, replica in group:
+                if self._init_cancelled.is_set():
+                    logger.warning(
+                        "[StageRuntime] Initialization cancelled; not launching stage-%s replica-%s",
+                        stage_idx,
+                        replica.replica_id,
+                    )
+                    # Fail initialization instead of returning a partial set of
+                    # replicas, so the caller's cleanup path runs.
+                    with init_state_lock:
+                        if primary_exc is None:
+                            primary_exc = RuntimeError(
+                                f"Stage initialization was cancelled before stage-{stage_idx} "
+                                f"replica-{replica.replica_id} was launched"
+                            )
+                    return
                 with init_state_lock:
                     if primary_exc is not None:
                         return
@@ -1182,10 +1298,8 @@ class StageRuntime:
         client = None
         resources = None
         try:
-            with (
-                stage_runtime_env(plan.metadata.stage_id, plan.metadata.runtime_cfg),
-                self._stage_device_scope(plan.metadata.stage_id, plan.metadata.runtime_cfg),
-            ):
+            physical_devices = self._resolve_replica_physical_devices(plan.metadata.stage_id, plan.metadata.runtime_cfg)
+            with stage_runtime_env(plan.metadata.stage_id, plan.metadata.runtime_cfg):
                 omni_conn_cfg, omni_from, omni_to = plan.omni_kv_connector
                 if omni_conn_cfg:
                     if omni_from is None or omni_to is None:
@@ -1221,6 +1335,8 @@ class StageRuntime:
                     replica_id=plan.replica_id,
                     omni_master_server=self._get_omni_master_server(),
                     omni_coordinator_address=self._get_coordinator_address(),
+                    stage_visible_devices=physical_devices,
+                    spawn_device_lock=self._spawn_device_lock,
                 )
 
             logger.info(
@@ -1359,12 +1475,15 @@ class DistStageRuntime(StageRuntime):
 
     def _prepare_stage_plans(self) -> list[LogicalStageInitPlan]:
         self._validate_single_stage_mode_replica_constraints()
-        return super()._prepare_stage_plans()
+        stage_plans = super()._prepare_stage_plans()
+        if all(replica.launch_mode == "remote" for plan in stage_plans for replica in plan.replicas):
+            logger.info("All stage replicas are remote; running only the frontend (API server + orchestrator)")
+        return stage_plans
 
     def _validate_single_stage_mode_replica_constraints(self) -> None:
         """Apply --omni-dp-size-local to the local stage's runtime.num_replicas."""
         target_stage_id = self._single_stage_id_filter
-        if target_stage_id is None:
+        if target_stage_id is None or is_frontend_only(target_stage_id):
             return
 
         for idx, stage_cfg in enumerate(self._stage_configs):
@@ -1390,6 +1509,7 @@ class DistStageRuntime(StageRuntime):
         self._stage_remote_factory_contexts = self._capture_stage_factory_contexts(stage_plans)
 
     def _cleanup_after_initialize_failure(self) -> None:
+        super()._cleanup_after_initialize_failure()
         self._cleanup_distributed_infra()
 
     def shutdown(self) -> None:
@@ -1413,7 +1533,8 @@ class DistStageRuntime(StageRuntime):
     # ---- Distributed overrides ----
 
     def _get_launch_mode(self, stage_id: int) -> str:
-        if self._single_stage_id_filter is not None and stage_id != self._single_stage_id_filter:
+        stage_id_filter = self._single_stage_id_filter
+        if is_frontend_only(stage_id_filter) or (stage_id_filter is not None and stage_id != stage_id_filter):
             return "remote"
         return "local"
 

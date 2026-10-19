@@ -3,8 +3,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
-from functools import lru_cache
+from collections import OrderedDict
+from collections.abc import Callable, Iterable
 from math import prod
 from typing import TYPE_CHECKING, Any
 
@@ -48,6 +48,7 @@ from vllm_omni.diffusion.layers.adalayernorm import AdaLayerNorm
 from vllm_omni.diffusion.layers.fused_qk_norm_rope import (
     _fused_cuda_supported,
     fused_qk_norm_rope,
+    fused_qk_norm_rope_min_tokens,
 )
 from vllm_omni.diffusion.layers.qwen_select01_modulation import (
     can_use_qwen_select01_triton,
@@ -58,6 +59,10 @@ from vllm_omni.diffusion.layers.qwen_select01_modulation import (
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 
 logger = init_logger(__name__)
+
+# Fuse only when B*S >= this; below it host launch overhead dominates (#7780).
+# Override: VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS (0 = always fuse).
+_FUSED_MIN_TOKENS = 2048
 
 
 def _qwen_image_qk_norm_rope(
@@ -73,14 +78,19 @@ def _qwen_image_qk_norm_rope(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     head_dim = q.shape[-1]
     rotary_dim = freqs.shape[-1] * 2
-    if use_fused and _fused_cuda_supported(q, k, head_dim, rotary_dim, interleaved=True):
-        batch, seq_len, num_heads, _ = q.shape
+    batch, seq_len, num_heads, _ = q.shape
+    tokens = batch * seq_len
+    if (
+        use_fused
+        and tokens >= fused_qk_norm_rope_min_tokens(_FUSED_MIN_TOKENS)
+        and _fused_cuda_supported(q, k, head_dim, rotary_dim, interleaved=True)
+    ):
         num_kv_heads = k.shape[2]
         rope_table = torch.cat((freqs.real, freqs.imag), dim=-1)
-        rope_table = rope_table.unsqueeze(0).expand(batch, -1, -1).reshape(batch * seq_len, rotary_dim)
+        rope_table = rope_table.unsqueeze(0).expand(batch, -1, -1).reshape(tokens, rotary_dim)
         fused_q, fused_k = fused_qk_norm_rope(
-            q.reshape(batch * seq_len, num_heads, head_dim),
-            k.reshape(batch * seq_len, num_kv_heads, head_dim),
+            q.reshape(tokens, num_heads, head_dim),
+            k.reshape(tokens, num_kv_heads, head_dim),
             norm_q.weight,
             norm_k.weight,
             rope_table,
@@ -119,6 +129,32 @@ def _resolve_qwen_image_lookup_name(
             continue
         return lookup_name.replace(weight_name, param_name), shard_id
     return lookup_name, None
+
+
+_ROPE_FREQS_CACHE_SIZE = 16
+_RopeFreqsCache = OrderedDict[tuple[object, ...], torch.Tensor]
+
+
+def _cached_rope_freqs(
+    cache: _RopeFreqsCache,
+    key: tuple[object, ...],
+    compute: Callable[[], torch.Tensor],
+) -> torch.Tensor:
+    """Bounded per-module cache for rope frequency tables.
+
+    A method-level ``functools.lru_cache`` keys on ``self`` and keeps the module
+    and its device tensors alive after the engine shuts down (#8016).
+    """
+    freqs = cache.get(key)
+    if freqs is not None:
+        cache.move_to_end(key)
+        return freqs
+
+    freqs = compute()
+    cache[key] = freqs
+    if len(cache) > _ROPE_FREQS_CACHE_SIZE:
+        cache.popitem(last=False)
+    return freqs
 
 
 class ImageRopePrepare(nn.Module):
@@ -304,6 +340,7 @@ class QwenEmbedLayer3DRope(nn.Module):
         )
 
         self.scale_rope = scale_rope
+        self._freqs_cache: _RopeFreqsCache = OrderedDict()
 
     def rope_params(self, index, dim, theta=10000):
         """
@@ -354,8 +391,14 @@ class QwenEmbedLayer3DRope(nn.Module):
 
         return vid_freqs, txt_freqs
 
-    @lru_cache(maxsize=16)
     def _compute_video_freqs(self, frame, height, width, idx=0):
+        return _cached_rope_freqs(
+            self._freqs_cache,
+            ("video", frame, height, width, idx),
+            lambda: self._build_video_freqs(frame, height, width, idx),
+        )
+
+    def _build_video_freqs(self, frame, height, width, idx=0):
         seq_lens = frame * height * width
         freqs_pos = self.pos_freqs.split([x // 2 for x in self.axes_dim], dim=1)
         freqs_neg = self.neg_freqs.split([x // 2 for x in self.axes_dim], dim=1)
@@ -373,8 +416,14 @@ class QwenEmbedLayer3DRope(nn.Module):
         freqs = torch.cat([freqs_frame, freqs_height, freqs_width], dim=-1).reshape(seq_lens, -1)
         return freqs.clone().contiguous()
 
-    @lru_cache(maxsize=16)
     def _compute_condition_freqs(self, frame, height, width):
+        return _cached_rope_freqs(
+            self._freqs_cache,
+            ("condition", frame, height, width),
+            lambda: self._build_condition_freqs(frame, height, width),
+        )
+
+    def _build_condition_freqs(self, frame, height, width):
         seq_lens = frame * height * width
         freqs_pos = self.pos_freqs.split([x // 2 for x in self.axes_dim], dim=1)
         freqs_neg = self.neg_freqs.split([x // 2 for x in self.axes_dim], dim=1)
@@ -419,6 +468,7 @@ class QwenEmbedRope(nn.Module):
 
         # DO NOT USING REGISTER BUFFER HERE, IT WILL CAUSE COMPLEX NUMBERS LOSE ITS IMAGINARY PART
         self.scale_rope = scale_rope
+        self._freqs_cache: _RopeFreqsCache = OrderedDict()
 
     def rope_params(self, index: torch.Tensor, dim: int, theta: int = 10000):
         """
@@ -468,8 +518,14 @@ class QwenEmbedRope(nn.Module):
 
         return vid_freqs, txt_freqs
 
-    @lru_cache(maxsize=16)
     def _compute_video_freqs(self, frame, height, width, idx=0):
+        return _cached_rope_freqs(
+            self._freqs_cache,
+            (frame, height, width, idx),
+            lambda: self._build_video_freqs(frame, height, width, idx),
+        )
+
+    def _build_video_freqs(self, frame, height, width, idx=0):
         seq_lens = frame * height * width
         freqs_pos = self.pos_freqs.split([x // 2 for x in self.axes_dim], dim=1)
         freqs_neg = self.neg_freqs.split([x // 2 for x in self.axes_dim], dim=1)

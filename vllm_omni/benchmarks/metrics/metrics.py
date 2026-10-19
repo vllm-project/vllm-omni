@@ -131,14 +131,6 @@ def _p_label(p: float) -> str:
     return str(pf)
 
 
-_STREAMING_OUTPUT_UNIT_TYPES = frozenset(
-    {
-        "text",
-        "stream",
-        "audio",
-    }
-)
-
 _AGGREGATE_PERCENTILE_FIELD_NAMES = {
     defs.AUDIO_TTFP: (
         defs.MEAN_AUDIO_TTFP_MS,
@@ -185,28 +177,6 @@ def _wants_stream_tpoc(metrics: list[str]) -> bool:
 
 def _wants_stream_icl(metrics: list[str]) -> bool:
     return "icl" in metrics
-
-
-def _stage_modality_flags(
-    final_output_type: str,
-    output_unit_type: str,
-) -> tuple[bool, bool, bool, bool, bool]:
-    is_text_stage = final_output_type == "text" or output_unit_type == "text"
-    is_audio_stage = final_output_type == "audio" or output_unit_type == "audio"
-    is_video_stage = final_output_type in {"video", "videos"} or output_unit_type == "video"
-    # Video diffusion may still report output_unit_type="image" when frames are
-    # stored in ``images``; prefer video when final_output_type says so.
-    is_image_stage = (not is_video_stage) and (final_output_type in {"image", "images"} or output_unit_type == "image")
-    is_internal_stream_stage = (
-        output_unit_type in _STREAMING_OUTPUT_UNIT_TYPES and not is_text_stage and not is_audio_stage
-    )
-    return (
-        is_text_stage,
-        is_audio_stage,
-        is_image_stage,
-        is_video_stage,
-        is_internal_stream_stage,
-    )
 
 
 def has_metric_samples(metrics: object, metric_name: str) -> bool:
@@ -736,7 +706,7 @@ def print_stage_metrics(
         is_image_stage,
         is_video_stage,
         is_internal_stream_stage,
-    ) = _stage_modality_flags(getattr(sm, "final_output_type"), getattr(sm, "output_unit_type"))
+    ) = defs.stage_modality_flags(getattr(sm, "final_output_type"), getattr(sm, "output_unit_type"))
 
     print("{s:{c}^{n}}".format(s=title, n=50, c="="))
     if is_video_stage:
@@ -786,7 +756,7 @@ def _build_stage_metrics_from_outputs(
         ]
         output_unit_type = output_unit_types[0] if output_unit_types else "other"
 
-        is_text_stage, is_audio_stage, _, _, is_internal_stream_stage = _stage_modality_flags(
+        is_text_stage, is_audio_stage, _, _, is_internal_stream_stage = defs.stage_modality_flags(
             final_output_type, output_unit_type
         )
         total_output = 0

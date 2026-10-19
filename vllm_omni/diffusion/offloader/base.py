@@ -244,5 +244,12 @@ class OffloadBackend(ABC):
         """
         raise NotImplementedError
 
+    def shutdown(self) -> None:
+        """Release offload resources at process exit.
+
+        Backends may skip work that only matters for a later ``enable``.
+        """
+        self.disable()
+
     def is_enabled(self) -> bool:
         return self.enabled

@@ -5,13 +5,15 @@ from __future__ import annotations
 import dataclasses
 import time
 from collections import OrderedDict
-from collections.abc import Iterator
-from contextlib import contextmanager
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import AbstractContextManager, contextmanager
+from typing import TYPE_CHECKING, Any
 
 import torch
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.diffusion_kv.metadata import DiffusionKVMetadata
 from vllm_omni.diffusion.models.interface import supports_step_execution
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import CachedRequestData, DiffusionSchedulerOutput, KVPrefetchJob
@@ -19,17 +21,71 @@ from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunn
 from vllm_omni.diffusion.worker.utils import BatchRunnerOutput
 from vllm_omni.experimental.ar_diffusion.capability import (
     ARDiffusionKVCacheSpec,
+    SupportsARDiffusionCellPipeline,
     SupportsARDiffusionPipeline,
     SupportsARDiffusionWarmup,
     supports_chunk_step_grouping,
 )
 from vllm_omni.experimental.ar_diffusion.kv_cache.config import ARDiffusionKVConfig
 from vllm_omni.experimental.ar_diffusion.kv_cache.manager import ARDiffusionKVCache
+from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import NoisyKVCache, NoisyKVState
 from vllm_omni.experimental.ar_diffusion.kv_cache.state import ARDiffusionKVState
 from vllm_omni.experimental.ar_diffusion.tick_protocol import ARDiffusionTickRequest
 from vllm_omni.platforms import current_omni_platform
 
+if TYPE_CHECKING:
+    from vllm.v1.attention.backend import MultipleOf
+
 logger = init_logger(__name__)
+
+
+def paging_block_size(tokens_per_frame: int, supported: Sequence[int | MultipleOf] | None = None) -> int:
+    """Choose the paging unit, which is not the eviction unit.
+
+    AR-Diffusion evicts by frame; the attention kernel tiles by a fixed number
+    of tokens. Using the frame as the block binds every output resolution to
+    that kernel constraint, so the resolutions that run today do so by
+    arithmetic accident -- and the LingBot World v2 checkpoint's own default
+    832x480 is not one of them:
+
+        (480/16) x (832/16) = 30 x 52 = 1560 tokens per frame, 1560 % 16 = 8
+
+    A frame that is already a legal block stays one, so every resolution that
+    works today keeps precisely the paging it has now. Anything else pages at
+    the finest legal unit, which costs a longer block table and gives back the
+    rounding waste of a block one whole frame wide -- at 832x480 that block is
+    over a gigabyte.
+
+    What counts as legal is asked, not assumed. ``supported`` carries vLLM's
+    own vocabulary: a plain int is that exact size, ``MultipleOf(b)`` is any
+    positive multiple of ``b``. The kernels AR-Diffusion reaches agree on
+    multiples of 16, but others in the same tree do not -- ``hpc_attn`` takes
+    only 64, and FlashInfer offers pages of 128 and up on Blackwell alone. A
+    constant here would be a silently wrong block size on the first machine
+    whose kernel differs, and a wrong block size is not an error: it is a
+    kernel reading tokens that were never written.
+    """
+    if supported is None:
+        # Imported here, not at module scope: paged_attention registers a
+        # custom op on import, and the tests that pop it from sys.modules to
+        # re-import it depend on nothing else holding it first.
+        from vllm_omni.experimental.ar_diffusion.kv_cache.paged_attention import supported_kernel_block_sizes
+
+        supported = supported_kernel_block_sizes()
+    if not supported:
+        raise ValueError("The attention kernel advertises no legal block size.")
+
+    def legal(size: int) -> bool:
+        return size > 0 and any(
+            size == entry if isinstance(entry, int) else size % entry.base == 0 for entry in supported
+        )
+
+    if legal(tokens_per_frame):
+        return tokens_per_frame
+    finest = min(entry if isinstance(entry, int) else entry.base for entry in supported)
+    if not legal(finest):
+        raise ValueError(f"No legal paging unit among {supported!r}.")
+    return finest
 
 
 def resolve_ar_diffusion_kv_config(od_config: OmniDiffusionConfig) -> ARDiffusionKVConfig:
@@ -63,7 +119,9 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         super().__init__(vllm_config, od_config, device)
         self.ar_diffusion_kv_config = resolve_ar_diffusion_kv_config(od_config)
         self.kv_cache: ARDiffusionKVCache | None = None
+        self.noisy_kv_cache: NoisyKVCache | None = None
         self._ar_diffusion_capability: SupportsARDiffusionPipeline | None = None
+        self._ar_diffusion_cell_capability: SupportsARDiffusionCellPipeline | None = None
         self._ar_diffusion_kv_cache_spec: ARDiffusionKVCacheSpec | None = None
         self._sessions: OrderedDict[str, ARDiffusionKVState] = OrderedDict()
         self._session_capacity = 0
@@ -85,8 +143,17 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             )
         return pipeline
 
-    def load_model(self, *args: object, **kwargs: object) -> None:
-        super().load_model(*args, **kwargs)
+    def load_model(
+        self,
+        memory_pool_context_fn: Callable[[str], AbstractContextManager[Any]] | None = None,
+        load_format: str = "default",
+        custom_pipeline_name: str | None = None,
+    ) -> None:
+        super().load_model(
+            memory_pool_context_fn=memory_pool_context_fn,
+            load_format=load_format,
+            custom_pipeline_name=custom_pipeline_name,
+        )
         if self.pipeline is None:
             return
         self._preallocate_kv_cache()
@@ -98,6 +165,53 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             raise RuntimeError("AR-Diffusion KV preallocation requires an initialized device")
         return current_omni_platform.get_free_memory(torch.device(self.device))
 
+    def _stage_config(self) -> dict:
+        raw = getattr(self.od_config, "ar_diffusion_stage_config", None)
+        if raw is None:
+            model_config = getattr(self.od_config, "model_config", None)
+            if isinstance(model_config, dict):
+                raw = model_config.get("ar_diffusion_stage_config")
+        return dict(raw) if isinstance(raw, dict) else {}
+
+    def _preallocate_noisy_kv(
+        self, capability: SupportsARDiffusionCellPipeline, *, available_bytes: int | None = None
+    ) -> None:
+        spec = capability.ar_diffusion_noisy_kv_spec()
+        stage_cfg = self._stage_config()
+        stages = int(stage_cfg.get("stage_parallel_size", 1) or 1)
+        pp_world = int(getattr(getattr(self.od_config, "parallel_config", None), "pipeline_parallel_size", 1) or 1)
+        if stages < 1 or pp_world % stages != 0:
+            raise ValueError(f"pipeline_parallel_size={pp_world} must be divisible by stage_parallel_size={stages}")
+        layer_groups = pp_world // stages
+        max_batch_size = int(stage_cfg.get("max_batch_size", 1) or 1)
+        self._ar_diffusion_cell_capability = capability
+        avail = self._available_memory_bytes() if available_bytes is None else available_bytes
+        layer_offset = int(getattr(getattr(self.pipeline, "transformer", None), "start_layer", 0) or 0)
+        blocks_per_rank = max(1, int(spec.num_layers))
+        self.noisy_kv_cache = NoisyKVCache(
+            spec,
+            dtype=self.od_config.dtype,
+            device=self.device,
+            layer_groups=layer_groups,
+            max_batch_size=max_batch_size,
+            stages=stages,
+            gpu_memory_fraction=float(stage_cfg.get("gpu_memory_fraction", 1.0)),
+            available_bytes=avail,
+            layer_offset=layer_offset,
+            blocks_per_rank=blocks_per_rank,
+        )
+        logger.info(
+            "AR-Diffusion noisy KV: capacity=%d reserved_bytes=%d layers=%d H=%d G=%d R=%d S=%d K=%d",
+            self.noisy_kv_cache.capacity,
+            self.noisy_kv_cache.reserved_bytes,
+            spec.num_layers,
+            spec.max_history_chunks,
+            layer_groups,
+            max_batch_size,
+            stages,
+            blocks_per_rank,
+        )
+
     def _preallocate_kv_cache(self, *, available_bytes: int | None = None) -> None:
         """Build pools solely from the pipeline capability and runner config."""
         if bool(getattr(self.od_config, "step_execution", False)) and not supports_step_execution(self.pipeline):
@@ -105,6 +219,9 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
                 "ARDiffusionModelRunner currently supports request-mode execution only; "
                 "step_execution=True would bypass per-request AR session binding."
             )
+        if isinstance(self.pipeline, SupportsARDiffusionCellPipeline):
+            self._preallocate_noisy_kv(self.pipeline, available_bytes=available_bytes)
+            return
         max_num_seqs = int(getattr(self.od_config, "max_num_seqs", 1) or 1)
         if max_num_seqs > 1:
             raise ValueError(
@@ -139,7 +256,7 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             num_kv_heads=spec.num_kv_heads,
             head_size=spec.head_size,
             dtype=self.od_config.dtype,
-            block_size=spec.tokens_per_frame,
+            block_size=paging_block_size(spec.tokens_per_frame),
             max_model_len=spec.max_model_len,
             available_bytes=self._available_memory_bytes() if available_bytes is None else available_bytes,
             kv_branches=spec.kv_branches,
@@ -310,13 +427,55 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
                     suppress_errors=True,
                 )
 
+    def _make_chunk_context(self):
+        from vllm_omni.experimental.ar_diffusion.cell_executor import (
+            ARDiffusionCellContext,
+            CellRunSpec,
+            CellTopology,
+            resolve_pp_rank_and_group,
+        )
+
+        if self.noisy_kv_cache is None:
+            raise RuntimeError("noisy KV cache is not initialized")
+        stage_cfg = self._stage_config()
+        stages = int(stage_cfg.get("stage_parallel_size", 1) or 1)
+        pp_world = int(getattr(getattr(self.od_config, "parallel_config", None), "pipeline_parallel_size", 1) or 1)
+        topology = CellTopology(stages=stages, layer_groups=max(1, pp_world // max(1, stages)))
+        rank, pp_group = resolve_pp_rank_and_group()
+        return ARDiffusionCellContext(
+            spec=CellRunSpec(
+                topology=topology,
+                max_batch_size=int(stage_cfg.get("max_batch_size", 1) or 1),
+                rank=rank,
+                pp_group=pp_group,
+            ),
+            kv=NoisyKVState(self.noisy_kv_cache),
+        )
+
     def execute_model(
         self,
         req: OmniDiffusionRequest,
         kv_prefetch_job: KVPrefetchJob | None = None,
+        diffusion_kv_metadata: DiffusionKVMetadata | None = None,
     ) -> DiffusionOutput:
+        if self.noisy_kv_cache is not None and self._ar_diffusion_cell_capability is not None:
+            started = time.perf_counter()
+            ctx = self._make_chunk_context()
+            try:
+                with self._ar_diffusion_cell_capability.bind_ar_diffusion_cell_context(ctx):
+                    output = super().execute_model(
+                        req, kv_prefetch_job=kv_prefetch_job, diffusion_kv_metadata=diffusion_kv_metadata
+                    )
+            except Exception:
+                ctx.kv.reset_all()
+                logger.warning("AR-Diffusion chunk forward failed; NoisyKV versions were released fail-closed")
+                raise
+            self._perf_e2e_times.append(time.perf_counter() - started)
+            return output
         if self.kv_cache is None:
-            return super().execute_model(req, kv_prefetch_job=kv_prefetch_job)
+            return super().execute_model(
+                req, kv_prefetch_job=kv_prefetch_job, diffusion_kv_metadata=diffusion_kv_metadata
+            )
         if self._ar_diffusion_capability is None:
             raise RuntimeError("AR-Diffusion capability missing after KV cache initialization")
 
@@ -327,7 +486,9 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             self.reset_session(session_id)
         started = time.perf_counter()
         with self._bound_ar_session(session_id, description="forward"):
-            output = super().execute_model(req, kv_prefetch_job=kv_prefetch_job)
+            output = super().execute_model(
+                req, kv_prefetch_job=kv_prefetch_job, diffusion_kv_metadata=diffusion_kv_metadata
+            )
         self._perf_e2e_times.append(time.perf_counter() - started)
         if close_session:
             self.close_session(session_id)
@@ -338,7 +499,16 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         scheduler_output: DiffusionSchedulerOutput,
         od_config: OmniDiffusionConfig,
     ) -> BatchRunnerOutput:
-        """Reject request batching until batch-aware AR state binding exists."""
+        """Noisy KV chunk path may micro-batch requests; paged timeline KV stays single-seq."""
+        if self.noisy_kv_cache is not None and self._ar_diffusion_cell_capability is not None:
+            ctx = self._make_chunk_context()
+            try:
+                with self._ar_diffusion_cell_capability.bind_ar_diffusion_cell_context(ctx):
+                    return super().execute_model_batch(scheduler_output, od_config)
+            except Exception:
+                ctx.kv.reset_all()
+                logger.warning("AR-Diffusion chunk batch failed; NoisyKV versions were released fail-closed")
+                raise
         raise RuntimeError(
             "ARDiffusionModelRunner does not support request-batch execution; use request mode with max_num_seqs=1."
         )

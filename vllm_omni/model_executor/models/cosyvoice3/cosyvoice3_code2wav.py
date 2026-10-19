@@ -9,9 +9,10 @@ This module contains the code2wav (token-to-waveform) stage which uses:
 3. HiFiGAN vocoder for waveform synthesis
 """
 
+import os
 from collections import Counter
 from collections.abc import Mapping
-from typing import Any, TypedDict, cast
+from typing import Any, Literal, TypedDict, cast, overload
 
 import numpy as np
 import torch
@@ -34,6 +35,9 @@ from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.layers import PreL
 from vllm_omni.model_executor.models.cosyvoice3.runtime import (
     cosyvoice3_batch_flow_debug,
     cosyvoice3_batch_flow_profile,
+    cosyvoice3_full_response_enabled,
+    cosyvoice3_packed_inference_enabled,
+    cosyvoice3_packed_streaming_enabled,
 )
 from vllm_omni.transformers_utils.configs.cosyvoice3 import CosyVoice3Config
 
@@ -57,6 +61,14 @@ def _build_dit_estimator(estimator_config: Mapping[str, Any]) -> DiT:
         return DiT(**estimator_config)
 
 
+class StreamingHiFTState(TypedDict, total=False):
+    """Request-owned mel history, its absolute offset, and oscillator phase."""
+
+    mel: torch.Tensor
+    mel_offset: int
+    phase_acc: torch.Tensor | None
+
+
 class StreamingFlowItem(TypedDict, total=False):
     """One entry of the batched-streaming item list passed to forward_streaming_batch."""
 
@@ -67,7 +79,7 @@ class StreamingFlowItem(TypedDict, total=False):
     prompt_token: torch.Tensor
     prompt_feat: torch.Tensor
     embedding: torch.Tensor
-    cache_state: dict[str, torch.Tensor] | None
+    cache_state: StreamingHiFTState | None
     token_offset_tokens: int
     finalize: bool
 
@@ -79,6 +91,11 @@ class CosyVoice3Code2Wav(nn.Module):
     - Flow matching decoder with DiT backbone (using diffusion attention)
     - HiFiGAN vocoder for mel-to-waveform conversion
     """
+
+    # Returned CUDA payloads own their storage (including HiFT graph results).
+    # Subsequent forwards/state updates never mutate it; the runner can retain
+    # the tensors and copy to host without taking another device snapshot.
+    owns_generation_output_storage = True
 
     def __init__(self, config: CosyVoice3Config):
         super().__init__()
@@ -114,7 +131,6 @@ class CosyVoice3Code2Wav(nn.Module):
             pre_lookahead_layer=pre_lookahead_layer,
             decoder=decoder,
         )
-
         # Build HiFiGAN vocoder
         f0_predictor = CausalConvRNNF0Predictor(
             num_class=config.hift["f0_predictor"]["num_class"],
@@ -256,9 +272,9 @@ class CosyVoice3Code2Wav(nn.Module):
         self,
         feat: torch.Tensor,
         *,
-        cache_state: dict[str, torch.Tensor] | None = None,
+        cache_state: StreamingHiFTState | None = None,
         finalize: bool = False,
-    ) -> tuple[torch.Tensor, dict[str, torch.Tensor] | None]:
+    ) -> tuple[torch.Tensor, StreamingHiFTState | None]:
         hift_weight = self.hift.m_source.l_linear.weight
         chunk_mel = feat.to(device=hift_weight.device, dtype=hift_weight.dtype)
 
@@ -325,10 +341,24 @@ class CosyVoice3Code2Wav(nn.Module):
         if finalize:
             return emitted_speech.reshape(emitted_speech.shape[0], 1, -1), None
 
+        # Clone GPU views so each request owns its cache and does not retain
+        # the full batch allocation or alias a later inference output.
         new_state = {
-            "mel": f0_input_mel.detach().cpu().contiguous(),
+            "mel": (
+                f0_input_mel.detach().clone()
+                if cosyvoice3_packed_streaming_enabled()
+                else f0_input_mel.detach().cpu().contiguous()
+            ),
             "mel_offset": window_offset - f0_margin,
-            "phase_acc": new_phase_acc.detach().cpu().contiguous() if new_phase_acc is not None else None,
+            "phase_acc": (
+                (
+                    new_phase_acc.detach().clone()
+                    if cosyvoice3_packed_streaming_enabled()
+                    else new_phase_acc.detach().cpu().contiguous()
+                )
+                if new_phase_acc is not None
+                else None
+            ),
         }
         return emitted_speech.reshape(emitted_speech.shape[0], 1, -1), new_state
 
@@ -338,14 +368,34 @@ class CosyVoice3Code2Wav(nn.Module):
         items: list[StreamingFlowItem],
         *,
         n_timesteps: int = 10,
-    ) -> list[tuple[torch.Tensor, dict[str, torch.Tensor] | None]]:
+    ) -> list[tuple[torch.Tensor, StreamingHiFTState | None]]:
         """Batch the flow-matching mel path, then run HiFT per request.
 
         Items are grouped by prompt condition shape and finalization state.
         Codec tokens may have different lengths; those are padded within the
         group and passed to the flow as per-row token lengths.
         """
-        results: list[tuple[torch.Tensor, dict[str, torch.Tensor] | None] | None] = [None] * len(items)
+        if items and cosyvoice3_packed_streaming_enabled():
+            results = [None] * len(items)
+            for finalize in (False, True):
+                group = [(i, x) for i, x in enumerate(items) if bool(x.get("finalize", False)) == finalize]
+                if group:
+                    values = self.forward_batch([x for _, x in group], n_timesteps=n_timesteps, stream_items=True)
+                    for (i, _), value in zip(group, values):
+                        results[i] = value
+            return results
+        if (
+            items
+            and cosyvoice3_packed_inference_enabled()
+            and all(
+                item.get("finalize", False)
+                and item.get("cache_state") is None
+                and int(item.get("token_offset_tokens", 0)) == 0
+                for item in items
+            )
+        ):
+            return [(speech, None) for speech in self.forward_batch(items, n_timesteps=n_timesteps)]
+        results: list[tuple[torch.Tensor, StreamingHiFTState | None] | None] = [None] * len(items)
         groups: dict[tuple[int, int, int, bool], list[tuple[int, StreamingFlowItem]]] = {}
         for index, item in enumerate(items):
             assert isinstance(item["token"], torch.Tensor)
@@ -445,7 +495,7 @@ class CosyVoice3Code2Wav(nn.Module):
                 )
 
         assert all(result is not None for result in results), "every streaming item must produce exactly one result"
-        return cast(list[tuple[torch.Tensor, dict[str, torch.Tensor] | None]], results)
+        return cast(list[tuple[torch.Tensor, StreamingHiFTState | None]], results)
 
     @torch.inference_mode()
     def forward_streaming(
@@ -455,11 +505,11 @@ class CosyVoice3Code2Wav(nn.Module):
         prompt_feat: torch.Tensor,
         embedding: torch.Tensor,
         *,
-        cache_state: dict[str, torch.Tensor] | None = None,
+        cache_state: StreamingHiFTState | None = None,
         n_timesteps: int = 10,
         token_offset_tokens: int = 0,
         finalize: bool = False,
-    ) -> tuple[torch.Tensor, dict[str, torch.Tensor] | None]:
+    ) -> tuple[torch.Tensor, StreamingHiFTState | None]:
         """Decode streaming audio using cumulative mel + emitted-speech offset.
 
         This mirrors upstream CosyVoice3 streaming semantics more closely than
@@ -479,6 +529,176 @@ class CosyVoice3Code2Wav(nn.Module):
             finalize=finalize,
         )
         return self._stream_hift_from_feat(feat, cache_state=cache_state, finalize=finalize)
+
+    @torch.inference_mode()
+    def _stream_position_noise(self, width: int, like: torch.Tensor) -> torch.Tensor:
+        """Extend fixed-position noise without changing previously emitted prefixes.
+
+        Fixed-size CPU blocks preserve the initial experiment's seed-0 noise,
+        isolate the global RNG, and make growth independent of request ordering.
+        """
+        block_frames = 15000
+        cached = getattr(self, "_position_noise", None)
+        present = 0 if cached is None else cached.shape[-1]
+        blocks = [] if cached is None else [cached.to(like)]
+        for index in range(present // block_frames, (width + block_frames - 1) // block_frames):
+            generator = torch.Generator(device="cpu").manual_seed(index)
+            blocks.append(torch.randn((1, 80, block_frames), generator=generator).to(like))
+        if not blocks:
+            return like.new_empty((1, 80, 0))
+        self._position_noise = torch.cat(blocks, dim=-1) if len(blocks) > 1 else blocks[0]
+        return self._position_noise[..., :width]
+
+    @overload
+    def forward_batch(
+        self, items: list[StreamingFlowItem], *, n_timesteps: int = 10, stream_items: Literal[False] = False
+    ) -> list[torch.Tensor]: ...
+
+    @overload
+    def forward_batch(
+        self, items: list[StreamingFlowItem], *, n_timesteps: int = 10, stream_items: Literal[True]
+    ) -> list[tuple[torch.Tensor, StreamingHiFTState | None]]: ...
+
+    @torch.inference_mode()
+    def forward_batch(
+        self, items: list[StreamingFlowItem], *, n_timesteps: int = 10, stream_items: bool = False
+    ) -> list[torch.Tensor] | list[tuple[torch.Tensor, StreamingHiFTState | None]]:
+        """Batch Flow across different reference lengths and restore request order.
+
+        Build each prompt/continuation contiguously before right padding. Padding
+        the prompt and continuation separately would insert a gap in conditioning.
+        The default keeps exact-length CPU-F0 HiFT. The opt-in Hopper profile
+        uses packed Flow, batched HiFT, and FP64 GPU F0.
+        """
+        if not items:
+            return []
+        if stream_items:
+            if not cosyvoice3_packed_streaming_enabled():
+                raise ValueError("Packed streaming requires COSYVOICE3_PACKED_STREAMING on Hopper")
+            if any(bool(item.get("finalize", False)) != bool(items[0].get("finalize", False)) for item in items):
+                raise ValueError("Use forward_streaming_batch to group mixed finalization states")
+        if len(items) > 8:
+            ordered = sorted(
+                enumerate(items), key=lambda pair: pair[1]["token"].shape[1] + pair[1]["prompt_token"].shape[1]
+            )
+            outputs: list[torch.Tensor | tuple[torch.Tensor, StreamingHiFTState | None] | None] = [None] * len(items)
+            for start in range(0, len(ordered), 8):
+                group = ordered[start : start + 8]
+                for (index, _), speech in zip(
+                    group,
+                    self.forward_batch([item for _, item in group], n_timesteps=n_timesteps, stream_items=stream_items),
+                ):
+                    outputs[index] = speech
+            return cast(list[torch.Tensor] | list[tuple[torch.Tensor, StreamingHiFTState | None]], outputs)
+        flow = self.flow_model
+        weight = next(flow.parameters())
+        mus, conds, speakers, lengths, prompt_lengths = [], [], [], [], []
+        for item in items:
+            tokens = torch.cat(
+                tuple(item[key].to(device=weight.device, dtype=torch.long) for key in ("prompt_token", "token")), dim=1
+            )
+            embedded = flow.input_embedding(tokens.clamp(min=0))
+            if stream_items and not item.get("finalize", False) and int(flow.pre_lookahead_len) > 0:
+                lookahead = int(flow.pre_lookahead_len)
+                hidden = flow.pre_lookahead_layer(embedded[:, :-lookahead], context=embedded[:, -lookahead:])
+            else:
+                hidden = flow.pre_lookahead_layer(embedded)
+            mu = hidden.repeat_interleave(self.token_mel_ratio, dim=1)
+            prompt = item["prompt_feat"].to(device=weight.device, dtype=mu.dtype)
+            cond = torch.zeros_like(mu)
+            cond[:, : prompt.shape[1]] = prompt
+            speaker = torch.nn.functional.normalize(item["embedding"].to(weight), dim=1)
+            speakers.append(flow.spk_embed_affine_layer(speaker))
+            mus.append(mu.transpose(1, 2))
+            conds.append(cond.transpose(1, 2))
+            lengths.append(mu.shape[1])
+            prompt_lengths.append(prompt.shape[1])
+        width = max(lengths)
+        mu = torch.cat([torch.nn.functional.pad(x, (0, width - x.shape[-1])) for x in mus])
+        cond = torch.cat([torch.nn.functional.pad(x, (0, width - x.shape[-1])) for x in conds])
+        mask = (
+            (torch.arange(width, device=weight.device)[None, :] < torch.tensor(lengths, device=weight.device)[:, None])
+            .unsqueeze(1)
+            .to(mu)
+        )
+        if cosyvoice3_packed_inference_enabled():
+            from .code2wav_core.packed_dit import (
+                PackedDiT,
+                gather_rows,
+                pack_rows,
+                scatter_rows,
+                solve_flow_euler_packed,
+            )
+
+            if not hasattr(self, "_packed_estimator"):
+                self._packed_estimator = PackedDiT(flow.decoder.estimator)
+                self._packed_estimator.compile(mu.dtype)
+            rows = pack_rows(lengths, mu.device)
+            if stream_items:
+                noise = self._stream_position_noise(width, mu).expand(len(items), -1, -1)
+            else:
+                noise = torch.randn(mu.shape, device=mu.device, dtype=mu.dtype)
+            time_span = torch.linspace(0, 1, n_timesteps + 1, device=mu.device, dtype=mu.dtype)
+            if flow.decoder.t_scheduler == "cosine":
+                time_span = 1 - torch.cos(time_span * 0.5 * torch.pi)
+            with torch.autocast("cuda", dtype=mu.dtype):
+                packed = solve_flow_euler_packed(
+                    self._packed_estimator,
+                    gather_rows(noise.transpose(1, 2), rows),
+                    time_span,
+                    gather_rows(mu.transpose(1, 2), rows),
+                    torch.cat(speakers),
+                    gather_rows(cond.transpose(1, 2), rows),
+                    rows,
+                    cfg_rate=flow.decoder.inference_cfg_rate,
+                    streaming=stream_items and not items[0].get("finalize", False),
+                    modulation_key=(n_timesteps, flow.decoder.t_scheduler, mu.dtype, mu.device),
+                )
+            feat = scatter_rows(packed, rows, width).transpose(1, 2)
+
+        else:
+            feat, _ = flow.decoder(
+                mu=mu, mask=mask, spks=torch.cat(speakers), cond=cond, n_timesteps=n_timesteps, streaming=False
+            )
+        if stream_items:
+            results = []
+            for row, item in enumerate(items):
+                start = prompt_lengths[row] + max(0, int(item.get("token_offset_tokens", 0))) * self.token_mel_ratio
+                mel = feat[row : row + 1, :, start : lengths[row]].float()
+                results.append(
+                    self._stream_hift_from_feat(
+                        mel, cache_state=item.get("cache_state"), finalize=bool(item.get("finalize", False))
+                    )
+                )
+            return results
+        hift_weight = self.hift.m_source.l_linear.weight
+        if cosyvoice3_full_response_enabled():
+            mels = []
+            for row, item in enumerate(items):
+                start = prompt_lengths[row] + max(0, int(item.get("token_offset_tokens", 0))) * self.token_mel_ratio
+                mels.append(feat[row : row + 1, :, start : lengths[row]].float().to(hift_weight))
+            width = max(mel.shape[-1] for mel in mels)
+            if width == 0:
+                return [mel.new_zeros((1, 1, 0)) for mel in mels]
+            from .code2wav_core.packed_dit import bucketed_width
+
+            # Recurring shapes let cuDNN/cuFFT reuse plans; rows are already
+            # right padded to the batch maximum and trimmed below.
+            width = bucketed_width(width)
+            padded = torch.cat([torch.nn.functional.pad(mel, (0, width - mel.shape[-1])) for mel in mels])
+            speech, _, _ = self.hift.inference(speech_feat=padded, finalize=True)
+            stride = int(np.prod(self.hift.upsample_rates) * self.hift.istft_params["hop_len"])
+            return [speech[row : row + 1, ..., : mel.shape[-1] * stride] for row, mel in enumerate(mels)]
+        results = []
+        for row, item in enumerate(items):
+            start = prompt_lengths[row] + max(0, int(item.get("token_offset_tokens", 0))) * self.token_mel_ratio
+            mel = feat[row : row + 1, :, start : lengths[row]].float().to(hift_weight)
+            if mel.shape[-1] == 0:
+                speech = mel.new_zeros((1, 1, 0))
+            else:
+                speech, _, _ = self.hift.inference(speech_feat=mel, finalize=True)
+            results.append(speech)
+        return results
 
     @torch.inference_mode()
     def forward(
@@ -524,7 +744,6 @@ class CosyVoice3Code2Wav(nn.Module):
             model_dir: Model directory containing flow.pt and hift.pt
             device: Device to load weights to
         """
-        import os
 
         # Load flow weights
         flow_path = os.path.join(model_dir, "flow.pt")
@@ -538,5 +757,28 @@ class CosyVoice3Code2Wav(nn.Module):
             k.replace("generator.", ""): v for k, v in torch.load(hift_path, map_location=device).items()
         }
         self.hift.load_state_dict(hift_state_dict, strict=True)
-        self.hift.to(device).eval()
+        self.hift.to(device)
+        # Fold after loading and device placement to avoid recomputing weights
+        # for every chunk. Folding changes state_dict keys, so reloading the
+        # original checkpoint into this instance is unsupported.
+        folded = self.hift.remove_weight_norm()
+        logger.info("Folded %d weight-norm layers in HiFT generator", folded)
+        if folded == 0:
+            logger.warning("HiFT generator had no weight-norm layers to fold; check config drift")
+        # Fold on the same device as mainline F0 inference. Folding on CPU
+        # and moving to GPU later changes the normalized FP32 weights.
+        f0_device = device if device.type == "cuda" and os.getenv("COSYVOICE3_F0_ON_CPU", "0") != "1" else "cpu"
+        self.hift.f0_predictor.to(device=f0_device, dtype=torch.float32)
+        f0_folded = self.hift.f0_predictor.remove_weight_norm()
+        logger.info("Folded %d weight-norm layers in HiFT F0 predictor", f0_folded)
+        if f0_folded == 0:
+            logger.warning("HiFT F0 predictor had no weight-norm layers to fold; check config drift")
+        self.hift.eval()
+        if device.type == "cuda" and cosyvoice3_packed_streaming_enabled():
+            if os.getenv("COSYVOICE3_CACHED_ISTFT", "0") == "1":
+                self.hift.enable_cached_istft()
+                logger.info("CosyVoice3 streaming HiFT: cached ISTFT enabled")
+            if os.getenv("COSYVOICE3_HIFT_GRAPH", "0") == "1":
+                self.hift.enable_decode_graphs()
+                logger.info("CosyVoice3 streaming HiFT: decode CUDA graphs enabled")
         logger.info(f"Loaded hift weights from {hift_path}")

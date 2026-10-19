@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 
     from vllm_omni.diffusion.diffusion_kv.request import DiffusionKVRequest
+    from vllm_omni.diffusion.interaction.types import InteractionBoundaryContext
 
 
 class DiffusionRequestStatus(enum.IntEnum):
@@ -256,8 +257,23 @@ class DiffusionSchedulerOutput:
     kv_prefetch_job: KVPrefetchJob | None = None
     kv_connector_metadata: KVConnectorMetadata | None = None
     kv_transfer_request_ids: set[str] = field(default_factory=set)
+    # None preserves the synchronous path; an empty set means submit/poll
+    # without waiting. Transfer IDs above are submitted only once.
+    kv_required_request_ids: set[str] | None = None
+    kv_poll_only: bool = False
+    # Keep background transfers out of the current request's Mooncake batch.
+    kv_prefetch_connector_metadata: KVConnectorMetadata | None = None
+    kv_prefetch_request_ids: set[str] = field(default_factory=set)
     # Connector lifecycle uses per-sequence IDs, not public request IDs.
     kv_finished_request_ids: set[str] = field(default_factory=set)
+    interaction_boundaries: dict[str, InteractionBoundaryContext] = field(default_factory=dict)
+
+    @property
+    def has_sync_kv_loads(self) -> bool:
+        # vLLM defers async submission until post_forward. The synchronous
+        # receive loop must start its loads in pre_forward before polling.
+        required = self.kv_required_request_ids
+        return bool(self.kv_transfer_request_ids if required is None else required)
 
     @cached_property
     def scheduled_request_ids(self) -> list[str]:
@@ -275,4 +291,10 @@ class DiffusionSchedulerOutput:
 
     @property
     def is_empty(self) -> bool:
-        return self.num_scheduled_reqs == 0 and self.kv_connector_metadata is None
+        return (
+            self.num_scheduled_reqs == 0
+            and self.kv_connector_metadata is None
+            and self.kv_prefetch_connector_metadata is None
+            and not self.kv_required_request_ids
+            and not self.kv_poll_only
+        )

@@ -56,6 +56,47 @@ def test_pipeline_declares_layerwise_offload_components() -> None:
     assert Cosmos3VFMTransformer._layerwise_offload_blocks_attrs == ["gen_layers"]
 
 
+@torch.no_grad()
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_cosmos3_conditioning_with_encoder_fastpath(dtype):
+    from types import MethodType
+
+    from tests.diffusion.distributed.test_wan_vae_encoder_fastpath import CONFIG, bits_equal
+    from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import OmniAutoencoderKLWan
+    from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath import install_wan_vae_encoder_fastpath
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import Cosmos3OmniDiffusersPipeline
+
+    torch.manual_seed(7)
+    vae = OmniAutoencoderKLWan(**CONFIG).eval().to(dtype)
+    vae.register_to_config(latents_mean=[0.1, -0.2, 0.3, -0.4], latents_std=[0.5, 0.6, 0.7, 0.8])
+    pipeline = SimpleNamespace(
+        vae=vae,
+        dtype=dtype,
+        device=torch.device("cpu"),
+        vae_scale_factor_spatial=16,
+        sampling_dtype=Cosmos3OmniDiffusersPipeline.sampling_dtype,
+    )
+    for name in (
+        "_to_vae_device",
+        "_get_latents_mean_std",
+        "_normalize_vae_latent",
+        "_latent_hw_from_image_size",
+        "_crop_latent_to_image_size",
+    ):
+        setattr(pipeline, name, MethodType(getattr(Cosmos3OmniDiffusersPipeline, name), pipeline))
+    image = torch.rand(1, 3, 32, 32) * 2 - 1
+    video = torch.rand(1, 3, 5, 32, 32) * 2 - 1
+    encode_image = Cosmos3OmniDiffusersPipeline._encode_conditioning_image_latent
+    encode_video = Cosmos3OmniDiffusersPipeline._encode_video_tensor
+    expected_image = encode_image(pipeline, image)
+    expected_video = encode_video(pipeline, video, image_size=[32, 32, 16, 32])
+    assert install_wan_vae_encoder_fastpath(vae).installed
+    bits_equal(encode_image(pipeline, image), expected_image)
+    bits_equal(encode_video(pipeline, video, image_size=[32, 32, 16, 32]), expected_video)
+    assert expected_image.shape == (1, 4, 1, 2, 2)
+    assert expected_video.shape == (1, 4, 2, 1, 2)
+
+
 def test_component_selective_model_offload_fails_before_component_loading(monkeypatch) -> None:
     from vllm_omni.diffusion.models.cosmos3 import pipeline_cosmos3 as pipeline_module
 
@@ -76,6 +117,12 @@ def test_component_selective_model_offload_fails_before_component_loading(monkey
 
     with pytest.raises(ValueError, match="does not support the dit/text_encoder component selector"):
         pipeline_module.Cosmos3OmniDiffusersPipeline(od_config=config)
+
+
+def test_sampling_dtype_defaults_to_float32() -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import Cosmos3OmniDiffusersPipeline
+
+    assert Cosmos3OmniDiffusersPipeline.sampling_dtype == torch.float32
 
 
 class StubScheduler:
@@ -228,6 +275,7 @@ class StubCosmos3Transformer(nn.Module):
             {
                 "token": token,
                 "has_control": control_latents is not None,
+                "hidden_states_dtype": hidden_states.dtype,
                 "timestep": timestep.clone(),
                 "text_mask": text_mask.clone(),
                 "cache_before": self.cached_kv,
@@ -318,6 +366,7 @@ def make_sampling_params(**overrides: Any) -> SimpleNamespace:
         "frame_rate": None,
         "resolved_frame_rate": None,
         "max_sequence_length": None,
+        "output_type": None,
         "extra_args": {},
     }
     values.update(overrides)
@@ -1061,7 +1110,7 @@ def test_flow_unipc_reproducible_with_same_seed(make_cosmos3_pipeline) -> None:
             ),
         )
         output = pipeline.forward(request)
-        return output.output["video"]
+        return output.media.video.tensor
 
     first = run(123)
     second = run(123)
@@ -1121,7 +1170,7 @@ def test_pipeline_init_passes_tokenizer_attrs_into_transformer(
 def test_preprocess_i2v_image_and_action_video_inputs() -> None:
     from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import get_cosmos3_pre_process_func
 
-    preprocess = get_cosmos3_pre_process_func(SimpleNamespace())
+    preprocess = get_cosmos3_pre_process_func(SimpleNamespace(model_config={"guardrails": False}, tf_model_config=None))
     i2v = SimpleNamespace(
         prompt={"prompt": "A slow camera push.", "multi_modal_data": {"image": Image.new("RGB", (320, 160))}},
         sampling_params=make_sampling_params(height=None, width=None, extra_args={}),
@@ -1153,6 +1202,130 @@ def test_preprocess_i2v_image_and_action_video_inputs() -> None:
     additional = preprocess(v2v).prompt["additional_information"]
     assert tuple(additional["preprocessed_video"].shape) == (1, 3, 5, 16, 32)
     assert additional["condition_frame_indexes_vision"] == [0, 1]
+
+
+def test_preprocess_v2v_decodes_uploaded_video_path(tmp_path) -> None:
+    """Serving may pass multipart uploads as /tmp/...mp4 path lists (#8073)."""
+    imageio = pytest.importorskip("imageio.v3")
+
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import get_cosmos3_pre_process_func
+
+    frames = [np.full((16, 32, 3), i * 40, dtype=np.uint8) for i in range(6)]
+    video_path = tmp_path / "vllm_omni_video_reference_test.mp4"
+    imageio.imwrite(video_path, frames, fps=4, codec="libx264")
+
+    preprocess = get_cosmos3_pre_process_func(SimpleNamespace(model_config={"guardrails": False}, tf_model_config=None))
+    request = SimpleNamespace(
+        prompt={"prompt": "Continue.", "multi_modal_data": {"video": [str(video_path)]}},
+        sampling_params=make_sampling_params(
+            height=16,
+            width=32,
+            extra_args={"condition_frame_indexes_vision": [0, 1], "condition_video_keep": "first"},
+        ),
+    )
+
+    additional = preprocess(request).prompt["additional_information"]
+    # condition_frame_indexes_vision=[0,1] => 5 pixel frames after VAE indexing.
+    assert tuple(additional["preprocessed_video"].shape) == (1, 3, 5, 16, 32)
+    assert additional["condition_frame_indexes_vision"] == [0, 1]
+
+
+def test_decode_path_video_frames_honors_max_frames_and_keep(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    pytest.importorskip("imageio.v3")
+    import imageio.v3 as iio
+
+    from vllm_omni.diffusion.utils.video_decode import decode_path_video_frames
+
+    source = tmp_path / "clip.mp4"
+    source.write_bytes(b"placeholder")
+    seen = {"n": 0}
+
+    def fake_imiter(_path):
+        for idx in range(20):
+            seen["n"] += 1
+            yield np.full((4, 4, 3), idx, dtype=np.uint8)
+
+    monkeypatch.setattr(iio, "imiter", fake_imiter)
+
+    first = decode_path_video_frames(source, max_frames=5, keep="first")
+    assert len(first) == 5
+    assert seen["n"] == 5
+    assert first[0][0, 0, 0] == 0
+    assert first[-1][0, 0, 0] == 4
+
+    seen["n"] = 0
+    last = decode_path_video_frames(source, max_frames=5, keep="last")
+    assert len(last) == 5
+    assert seen["n"] == 20
+    assert last[0][0, 0, 0] == 15
+    assert last[-1][0, 0, 0] == 19
+
+
+def test_preprocess_v2v_video_path_honors_prompt_level_keep_and_indexes(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pytest.importorskip("imageio.v3")
+    import imageio.v3 as iio
+
+    from vllm_omni.diffusion.models.cosmos3 import pipeline_cosmos3 as cosmos_pipeline
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import get_cosmos3_pre_process_func
+    from vllm_omni.diffusion.utils.video_decode import decode_path_video_frames
+
+    source = tmp_path / "vllm_omni_video_reference_prompt.mp4"
+    source.write_bytes(b"placeholder")
+    captured: dict[str, Any] = {}
+
+    def fake_imiter(_path):
+        for idx in range(20):
+            yield np.full((16, 32, 3), idx, dtype=np.uint8)
+
+    def spy_decode(*args, **kwargs):
+        frames = decode_path_video_frames(*args, **kwargs)
+        captured["keep"] = kwargs.get("keep")
+        captured["max_frames"] = kwargs.get("max_frames")
+        captured["n"] = len(frames)
+        captured["first"] = int(frames[0][0, 0, 0])
+        captured["last"] = int(frames[-1][0, 0, 0])
+        return frames
+
+    monkeypatch.setattr(iio, "imiter", fake_imiter)
+    monkeypatch.setattr(cosmos_pipeline, "decode_path_video_frames", spy_decode)
+
+    preprocess = get_cosmos3_pre_process_func(SimpleNamespace(model_config={"guardrails": False}, tf_model_config=None))
+    last_keep = SimpleNamespace(
+        prompt={
+            "prompt": "Continue.",
+            "condition_video_keep": "last",
+            "condition_frame_indexes_vision": [0, 1],
+            "multi_modal_data": {"video": [str(source)]},
+        },
+        sampling_params=make_sampling_params(height=16, width=32, extra_args={}),
+    )
+    additional = preprocess(last_keep).prompt["additional_information"]
+    assert captured["keep"] == "last"
+    assert captured["max_frames"] == 5
+    assert captured["n"] == 5
+    assert captured["first"] == 15
+    assert captured["last"] == 19
+    assert tuple(additional["preprocessed_video"].shape) == (1, 3, 5, 16, 32)
+    assert additional["condition_frame_indexes_vision"] == [0, 1]
+
+    wider_indexes = SimpleNamespace(
+        prompt={
+            "prompt": "Continue.",
+            "condition_frame_indexes_vision": [0, 1, 2],
+            "multi_modal_data": {"video": [str(source)]},
+        },
+        sampling_params=make_sampling_params(height=16, width=32, extra_args={}),
+    )
+    additional = preprocess(wider_indexes).prompt["additional_information"]
+    assert captured["keep"] == "first"
+    assert captured["max_frames"] == 9
+    assert captured["n"] == 9
+    assert captured["first"] == 0
+    assert captured["last"] == 8
+    assert tuple(additional["preprocessed_video"].shape) == (1, 3, 9, 16, 32)
+    assert additional["condition_frame_indexes_vision"] == [0, 1, 2]
 
 
 def test_transfer_config_media_helpers_and_preprocess_budget(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1224,7 +1397,7 @@ def test_transfer_config_media_helpers_and_preprocess_budget(monkeypatch: pytest
     )
     assert tuple(loaded.shape) == (3, 2, 8, 8)
 
-    preprocess = get_cosmos3_pre_process_func(SimpleNamespace())
+    preprocess = get_cosmos3_pre_process_func(SimpleNamespace(model_config={"guardrails": False}, tf_model_config=None))
 
     class FramesWithFps(list):
         fps = 12.5
@@ -1245,6 +1418,29 @@ def test_transfer_config_media_helpers_and_preprocess_budget(monkeypatch: pytest
     assert tuple(additional["preprocessed_transfer_video"].shape) == (1, 3, 4, 192, 320)
     assert additional["transfer_input_fps"] == 12.5
     assert "preprocessed_video" not in additional
+
+
+def test_transfer_resize_antialiases_downscales_like_reference() -> None:
+    from vllm_omni.diffusion.models.cosmos3 import transfer
+
+    # One-pixel stripes shrunk 3x. The reference's torchvision resize (and the
+    # training loader) averages them; plain bilinear samples single columns,
+    # which would return the stripes as alternating 0 and 255.
+    stripes = torch.zeros(3, 2, 6, 18, dtype=torch.uint8)
+    stripes[..., 1::2] = 255
+    resized = transfer.resize_center_crop_uint8_cthw(stripes, 2, 6)
+    assert tuple(resized.shape) == (3, 2, 2, 6)
+    assert resized.min() >= 100 and resized.max() <= 155
+
+
+def test_transfer_center_crop_rounds_offsets_like_torchvision() -> None:
+    from vllm_omni.diffusion.models.cosmos3 import transfer
+
+    # Cropping 7 rows to 4 leaves 3. torchvision rounds the 1.5-row offset to 2,
+    # as for 1720x1080 fisheye inputs at 480p (43 spare rows, offset 22).
+    rows = torch.arange(0, 70, 10, dtype=torch.uint8).reshape(1, 1, 7, 1).expand(3, 1, 7, 4).contiguous()
+    cropped = transfer.resize_center_crop_uint8_cthw(rows, 4, 4)
+    assert cropped[0, 0, :, 0].tolist() == [20, 30, 40, 50]
 
 
 def test_transfer_control_weight_validation_and_normalization() -> None:
@@ -2025,6 +2221,43 @@ def test_prepare_latents_for_video_image_sound_and_action(make_cosmos3_pipeline)
     torch.testing.assert_close(action, clean)
 
 
+def test_sampling_state_casts_transformer_execution_to_model_dtype(make_cosmos3_pipeline) -> None:
+    pipeline = make_cosmos3_pipeline()
+    pipeline.dtype = torch.bfloat16
+
+    latents = pipeline._prepare_latents(16, 24, 5, torch.Generator(device="cpu").manual_seed(0))
+    assert pipeline.sampling_dtype == torch.float32
+    assert latents.dtype == torch.float32
+
+    prediction = pipeline.predict_noise(
+        hidden_states=latents,
+        timestep=torch.tensor([1]),
+        text_ids=_ids(2),
+        text_mask=_mask(),
+    )
+
+    assert pipeline.transformer.calls[-1]["hidden_states_dtype"] == torch.bfloat16
+    assert prediction.dtype == torch.float32
+
+
+def test_sampling_dtype_can_use_model_dtype(make_cosmos3_pipeline) -> None:
+    pipeline = make_cosmos3_pipeline()
+    pipeline.dtype = torch.bfloat16
+    pipeline.sampling_dtype = pipeline.dtype
+
+    latents = pipeline._prepare_latents(16, 24, 5, torch.Generator(device="cpu").manual_seed(0))
+    prediction = pipeline.predict_noise(
+        hidden_states=latents,
+        timestep=torch.tensor([1]),
+        text_ids=_ids(2),
+        text_mask=_mask(),
+    )
+
+    assert latents.dtype == torch.bfloat16
+    assert pipeline.transformer.calls[-1]["hidden_states_dtype"] == torch.bfloat16
+    assert prediction.dtype == torch.bfloat16
+
+
 def test_prepare_latents_i2v_encodes_only_conditioning_frame(make_cosmos3_pipeline) -> None:
     pipeline = make_cosmos3_pipeline()
     calls: list[tuple[str, tuple[int, ...]]] = []
@@ -2108,6 +2341,7 @@ def test_prepare_inverse_dynamics_latents_encodes_full_video(make_cosmos3_pipeli
 
 def test_diffuse_covers_cfg_i2v_and_multimodal_steps(make_cosmos3_pipeline) -> None:
     pipeline = make_cosmos3_pipeline()
+    pipeline.dtype = torch.bfloat16
     latents = torch.zeros(1, 2, 1, 1, 1)
 
     result = pipeline.diffuse(
@@ -2122,6 +2356,8 @@ def test_diffuse_covers_cfg_i2v_and_multimodal_steps(make_cosmos3_pipeline) -> N
         guidance_interval=(500.0, 1000.0),
     )
     assert [call["token"] for call in pipeline.transformer.calls] == [2, 1, 2]
+    assert all(call["hidden_states_dtype"] == torch.bfloat16 for call in pipeline.transformer.calls)
+    assert result.dtype == torch.float32
     torch.testing.assert_close(result, torch.full_like(latents, 6.0))
 
     i2v = pipeline.diffuse(
@@ -2136,6 +2372,8 @@ def test_diffuse_covers_cfg_i2v_and_multimodal_steps(make_cosmos3_pipeline) -> N
         velocity_mask=torch.tensor([[[[[0.0]], [[1.0]]]]]),
         image_latent=torch.full((1, 2, 1, 1, 1), 7.0),
     )
+    assert pipeline.transformer.calls[-1]["hidden_states_dtype"] == torch.bfloat16
+    assert i2v.dtype == torch.float32
     torch.testing.assert_close(i2v[:, :, 0:1], torch.full((1, 2, 1, 1, 1), 7.0))
     i2v_noise = pipeline.scheduler.step_calls[-1][0]
     torch.testing.assert_close(i2v_noise[:, :, 0:1], torch.zeros(1, 2, 1, 1, 1))
@@ -2155,6 +2393,9 @@ def test_diffuse_covers_cfg_i2v_and_multimodal_steps(make_cosmos3_pipeline) -> N
         guidance_scale=1.0,
         shared_kwargs={"video_shape": (1, 1, 1), "fps": 24.0, "action_domain_ids": torch.tensor([0])},
     )
+    assert all(call["hidden_states_dtype"] == torch.bfloat16 for call in pipeline.transformer.calls)
+    assert video_result.dtype == torch.float32
+    assert action_result.dtype == torch.float32
     torch.testing.assert_close(video_result, torch.full_like(latents, 4.0))
     torch.testing.assert_close(action_result, torch.full((), 44.0).expand_as(action_result))
 
@@ -2226,6 +2467,29 @@ def test_diffuse_drops_session_when_progress_iteration_fails(make_cosmos3_pipeli
     assert "request-that-fails" not in pipeline._memory_manager
 
 
+@pytest.mark.parametrize("guidance_scale", [0.0, 1.0, 3.0, 5.0])
+@pytest.mark.parametrize("cfg_normalize", [False, True])
+def test_transfer_control_delta_is_independent_of_text_guidance(
+    make_cosmos3_pipeline, guidance_scale, cfg_normalize
+) -> None:
+    pipeline = make_cosmos3_pipeline()
+    cond_no_control = torch.tensor([2.0, 4.0])
+    cond_full = torch.tensor([6.0, 10.0])
+    uncond_full = torch.tensor([1.0, 3.0])
+    expected = uncond_full + guidance_scale * (cond_no_control - uncond_full)
+    if guidance_scale != 0.0:
+        expected += 1.5 * (cond_full - cond_no_control)
+    if cfg_normalize:
+        expected = pipeline.cfg_normalize_function(cond_full, expected)
+
+    actual = pipeline.combine_multi_branch_cfg_noise(
+        [cond_full, cond_no_control, uncond_full],
+        {"mode": "cosmos3_transfer", "guidance_scale": guidance_scale, "control_guidance": 1.5},
+        cfg_normalize=cfg_normalize,
+    )
+    torch.testing.assert_close(actual, expected)
+
+
 def test_diffuse_transfer_applies_control_cfg(make_cosmos3_pipeline, sequential_cfg_parallel) -> None:
     pipeline = make_cosmos3_pipeline()
     latents = torch.zeros(1, 2, 1, 1, 1)
@@ -2256,7 +2520,7 @@ def test_diffuse_transfer_applies_control_cfg(make_cosmos3_pipeline, sequential_
     assert pipeline.transformer.calls[0]["kwargs"]["control_weights"] == [1.0]
     assert "control_weights" not in pipeline.transformer.calls[1]["kwargs"]
     assert pipeline.transformer.calls[2]["kwargs"]["control_weights"] == [1.0]
-    torch.testing.assert_close(result, torch.full_like(latents, 254.0))
+    torch.testing.assert_close(result, torch.full_like(latents, -46.0))
 
 
 def test_diffuse_transfer_uses_named_seacache_contexts(make_cosmos3_pipeline, sequential_cfg_parallel) -> None:
@@ -2407,7 +2671,7 @@ def test_diffuse_transfer_interval_switches_branch_counts(make_cosmos3_pipeline,
         (2, False),
         (2, True),
     ]
-    torch.testing.assert_close(result, torch.full_like(latents, 508.0))
+    torch.testing.assert_close(result, torch.full_like(latents, 208.0))
 
 
 @pytest.mark.parametrize(
@@ -2766,7 +3030,11 @@ class TestForwardRouting:
 
         output = pipeline.forward(make_request_batch(prompt, sampling_params))
 
-        assert expected["key"] in output.output
+        if expected["key"] == "video":
+            assert output.media is not None
+            assert output.output is None
+        else:
+            assert expected["key"] in output.output
         assert captured["format"]["is_t2i"] is expected["is_t2i"]
         assert captured["format"]["num_frames"] == expected["frames"]
         assert captured["flow_shifts"] == expected["flow"]
@@ -3001,3 +3269,164 @@ class TestForwardRouting:
 
         with pytest.raises(ValueError, match=message):
             pipeline.forward(make_request_batch(prompt, sampling_params))
+
+
+@pytest.mark.parametrize(
+    ("text_cfg_below_one", "expected_calls"),
+    [
+        (False, [(2, True)]),
+        (True, [(2, True), (1, True)]),
+    ],
+)
+def test_diffuse_transfer_guidance_below_one_runs_text_cfg_only_when_opted_in(
+    make_cosmos3_pipeline, sequential_cfg_parallel, text_cfg_below_one, expected_calls
+) -> None:
+    pipeline = make_cosmos3_pipeline()
+    latents = torch.zeros(1, 2, 1, 1, 1)
+    velocity_mask = torch.ones(1, 1, 1, 1, 1)
+
+    pipeline.diffuse_transfer(
+        latents=latents,
+        timesteps=torch.tensor([7]),
+        cond_ids=_ids(2),
+        cond_mask=_mask(),
+        uncond_ids=_ids(1),
+        uncond_mask=_mask(),
+        guidance_scale=0.0,
+        control_guidance=1.0,
+        control_guidance_interval=None,
+        control_latents=[torch.zeros_like(latents)],
+        shared_kwargs={"video_shape": (1, 1, 1), "fps": 24.0, "noisy_frame_mask": velocity_mask},
+        velocity_mask=velocity_mask,
+        condition_latents=torch.zeros_like(latents),
+        text_cfg_below_one=text_cfg_below_one,
+    )
+
+    assert [(call["token"], call["has_control"]) for call in pipeline.transformer.calls] == expected_calls
+
+
+def test_diffuse_transfer_runs_model_dtype_transformer_on_float32_state(make_cosmos3_pipeline) -> None:
+    pipeline = make_cosmos3_pipeline()
+    pipeline.dtype = torch.bfloat16
+    transformer_input_dtypes: list[torch.dtype] = []
+    stub_forward = pipeline.transformer.forward
+
+    def recording_forward(*, hidden_states: torch.Tensor, **kwargs: Any):
+        transformer_input_dtypes.append(hidden_states.dtype)
+        return stub_forward(hidden_states=hidden_states, **kwargs)
+
+    pipeline.transformer.forward = recording_forward
+    # 1 + 2**-12 rounds to 1 in BF16; the float32 sampler state must keep it.
+    latents = torch.full((1, 2, 1, 1, 1), 1.0 + 2**-12)
+    velocity_mask = torch.ones(1, 1, 1, 1, 1)
+
+    result = pipeline.diffuse_transfer(
+        latents=latents,
+        timesteps=torch.tensor([7]),
+        cond_ids=_ids(2),
+        cond_mask=_mask(),
+        uncond_ids=_ids(1),
+        uncond_mask=_mask(),
+        guidance_scale=1.0,
+        control_guidance=1.0,
+        control_guidance_interval=None,
+        control_latents=[torch.zeros_like(latents)],
+        shared_kwargs={"video_shape": (1, 1, 1), "fps": 24.0, "noisy_frame_mask": velocity_mask},
+        velocity_mask=velocity_mask,
+        condition_latents=torch.zeros_like(latents),
+    )
+
+    assert transformer_input_dtypes == [torch.bfloat16]
+    assert result.dtype == torch.float32
+    # The stub velocity is its cond token plus the control bonus: 2 + 100.
+    assert torch.equal(result, latents + 102.0)
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_diffuse_transfer_releases_unipc_history_on_completion_or_failure(make_cosmos3_pipeline, fail) -> None:
+    from vllm_omni.diffusion.models.schedulers.scheduling_flow_unipc_multistep import FlowUniPCMultistepScheduler
+
+    pipeline = make_cosmos3_pipeline()
+    pipeline.scheduler = FlowUniPCMultistepScheduler()
+    pipeline.scheduler.set_timesteps(3, device="cpu")
+    latents = torch.zeros(1, 2, 1, 1, 1)
+    original_predict = pipeline.predict_noise
+    calls = 0
+
+    def predict(**kwargs):
+        nonlocal calls
+        calls += 1
+        if fail and calls == 2:
+            assert pipeline.scheduler.last_sample is not None
+            raise RuntimeError("prediction failed")
+        return original_predict(**kwargs)
+
+    pipeline.predict_noise = predict
+    kwargs = dict(
+        latents=latents,
+        timesteps=pipeline.scheduler.timesteps,
+        cond_ids=_ids(2),
+        cond_mask=_mask(),
+        uncond_ids=_ids(1),
+        uncond_mask=_mask(),
+        guidance_scale=1.0,
+        control_guidance=1.0,
+        control_guidance_interval=None,
+        control_latents=[],
+        shared_kwargs={},
+        velocity_mask=torch.ones(1, 1, 1, 1, 1),
+        condition_latents=torch.zeros_like(latents),
+    )
+    if fail:
+        with pytest.raises(RuntimeError, match="prediction failed"):
+            pipeline.diffuse_transfer(**kwargs)
+    else:
+        result = pipeline.diffuse_transfer(**kwargs)
+        assert torch.isfinite(result).all()
+
+    assert pipeline.scheduler.model_outputs == [None] * pipeline.scheduler.config.solver_order
+    assert pipeline.scheduler.timestep_list == [None] * pipeline.scheduler.config.solver_order
+    assert pipeline.scheduler.last_sample is None
+    assert pipeline._cosmos3_branch_caches is None
+    # A completed or abandoned solve can start again with the same scheduler.
+    pipeline.scheduler.set_timesteps(3, device="cpu")
+    actual = pipeline.scheduler.step(torch.ones_like(latents), pipeline.scheduler.timesteps[0], latents).prev_sample
+    fresh = FlowUniPCMultistepScheduler()
+    fresh.set_timesteps(3, device="cpu")
+    expected = fresh.step(torch.ones_like(latents), fresh.timesteps[0], latents).prev_sample
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("open_interval", [False, True])
+@pytest.mark.parametrize("guidance,control_guidance", [(3.0, 1.0), (1.0, 3.0), (3.0, 3.0)])
+def test_diffuse_transfer_interval_bounds_and_cfg_normalization(
+    make_cosmos3_pipeline, open_interval, guidance, control_guidance
+) -> None:
+    pipeline = make_cosmos3_pipeline()
+    latents = torch.zeros(1, 2, 1, 1, 1)
+    cfg_calls = []
+
+    def predict_cfg(**kwargs):
+        cfg_calls.append(kwargs["cfg_normalize"])
+        return torch.zeros_like(latents)
+
+    pipeline.predict_noise_with_multi_branch_cfg = predict_cfg
+    pipeline.diffuse_transfer(
+        latents=latents,
+        timesteps=torch.tensor([9, 7, 3]),
+        cond_ids=_ids(2),
+        cond_mask=_mask(),
+        uncond_ids=_ids(1),
+        uncond_mask=_mask(),
+        guidance_scale=guidance,
+        control_guidance=control_guidance,
+        control_guidance_interval=(3, 9),
+        guidance_interval=(3, 9),
+        control_latents=[],
+        shared_kwargs={},
+        velocity_mask=torch.ones(1, 1, 1, 1, 1),
+        condition_latents=torch.zeros_like(latents),
+        normalize_cfg=True,
+        open_guidance_interval=open_interval,
+    )
+    assert cfg_calls == [True] * (1 if open_interval else 3)

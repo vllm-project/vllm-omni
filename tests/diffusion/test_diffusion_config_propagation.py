@@ -5,6 +5,7 @@
 Regression tests for https://github.com/vllm-project/vllm-omni/issues/1862
 """
 
+import json
 from collections.abc import Mapping
 
 import pytest
@@ -43,6 +44,21 @@ def _roundtrip_diffusion_config(**kwargs) -> OmniDiffusionConfig:
     engine_args = dict(stages[0]["engine_args"])
     diffusion_kwargs = extract_diffusion_stage_config_kwargs(engine_args, stage_id=0)
     return OmniDiffusionConfig(**{name: value for name, value in diffusion_kwargs.items() if value is not None})
+
+
+def test_direct_config_extras_are_independent_dicts():
+    first = OmniDiffusionConfig(model="test-model")
+    second = OmniDiffusionConfig(model="test-model")
+
+    assert first.extras.get("prefix_kv_cache_dtype") is None
+    first.extras["prefix_kv_cache_dtype"] = "fp8"
+    assert second.extras == {}
+
+
+def test_direct_config_preserves_explicit_extras():
+    config = OmniDiffusionConfig(model="test-model", extras={"prefix_kv_cache_dtype": "fp8"})
+
+    assert config.extras["prefix_kv_cache_dtype"] == "fp8"
 
 
 class TestParallelConfigPropagation:
@@ -214,6 +230,29 @@ def test_qwen_image_edit_plus_sets_generic_multimodal_limit():
     assert od_config.max_multimodal_image_inputs == QWEN_IMAGE_EDIT_PLUS_MAX_INPUT_IMAGES
 
 
+def test_vae_fast_path_roundtrip():
+    assert _roundtrip_diffusion_config(model="x").vae_fast_path == "lossless"
+    od = _roundtrip_diffusion_config(model="x", vae_fast_path="channels_last")
+    assert od.vae_fast_path == "channels_last"
+
+
+def test_invalid_vae_fast_path_is_rejected():
+    with pytest.raises(ValueError, match="vae_fast_path"):
+        OmniDiffusionConfig(model="x", vae_fast_path="fast")
+
+
+def test_vae_encode_fast_path_roundtrip():
+    assert _roundtrip_diffusion_config(model="x").vae_encode_fast_path == "lossless"
+    od = _roundtrip_diffusion_config(model="x", vae_fast_path="off", vae_encode_fast_path="channels_last")
+    assert od.vae_fast_path == "off"
+    assert od.vae_encode_fast_path == "channels_last"
+
+
+def test_invalid_vae_encode_fast_path_is_rejected():
+    with pytest.raises(ValueError, match="vae_encode_fast_path"):
+        OmniDiffusionConfig(model="x", vae_encode_fast_path="fast")
+
+
 def test_flux2_klein_sets_generic_multimodal_limit():
     od_config = OmniDiffusionConfig(
         model="black-forest-labs/FLUX.2-klein-9B",
@@ -253,6 +292,21 @@ def test_architecture_name_resolves_via_pipeline_class_fallback():
 
     assert hunyuan_od_config.supports_multimodal_inputs is True
     assert hunyuan_od_config.max_multimodal_image_inputs == HUNYUAN_IMAGE3_MAX_INPUT_IMAGES
+
+
+def test_architecture_only_checkpoint_propagates_multimodal_limit(tmp_path):
+    """A config.json-only checkpoint must expose its image-input capability."""
+    (tmp_path / "config.json").write_text(
+        json.dumps({"architectures": ["HunyuanImage3ForCausalMM"]}),
+        encoding="utf-8",
+    )
+
+    od_config = OmniDiffusionConfig(model=str(tmp_path))
+    od_config.enrich_config()
+
+    assert od_config.model_class_name == "HunyuanImage3ForCausalMM"
+    assert od_config.supports_multimodal_inputs is True
+    assert od_config.max_multimodal_image_inputs == HUNYUAN_IMAGE3_MAX_INPUT_IMAGES
 
 
 def test_additional_config_roundtrip():

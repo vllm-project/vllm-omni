@@ -15,7 +15,7 @@ from enum import Enum
 from functools import lru_cache
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, StringConstraints, field_validator, model_validator
 
 from vllm_omni.entrypoints.openai.image_api_utils import parse_size
 from vllm_omni.inputs.data import DIFFUSION_QUALITY_LEVELS
@@ -71,6 +71,18 @@ class VideoParams(BaseModel):
             return None
 
 
+class StreamingPacingConfig(BaseModel):
+    """Canonical request-level playback pacing policy for realtime video."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = True
+    mode: Literal["client_playhead"] = "client_playhead"
+    max_lead_ms: float = Field(default=1000.0, gt=0, le=10_000, allow_inf_nan=False)
+    max_output_bytes: int = Field(default=64 * 1024 * 1024, gt=0, le=_INT64_MAX, strict=True)
+    idle_timeout_s: float = Field(default=30.0, gt=0, le=86_400, allow_inf_nan=False)
+
+
 class FileImageReference(BaseModel):
     model_config = ConfigDict(extra="forbid")
     file_id: str
@@ -103,6 +115,51 @@ class UrlAudioReference(BaseModel):
 
 
 AudioReference = UrlAudioReference
+
+
+class TimelineGuideUpload(BaseModel):
+    """Reference to one repeated ``guide_files`` multipart upload."""
+
+    model_config = ConfigDict(extra="forbid")
+    upload_index: int = Field(
+        strict=True,
+        ge=0,
+        le=_INT64_MAX,
+        description="Zero-based index into the request's guide_files uploads.",
+    )
+
+
+class TimelineGuide(BaseModel):
+    """One ordered timeline guide entry addressing uploaded guide media."""
+
+    model_config = ConfigDict(extra="forbid")
+    frame_index: int = Field(
+        strict=True,
+        ge=_INT64_MIN,
+        le=_INT64_MAX,
+        description=(
+            "Pixel-frame start of this guide in the output timeline. Negative values count back from "
+            "the aligned output end."
+        ),
+    )
+    image: TimelineGuideUpload | None = Field(
+        default=None, description="Still-image guide source; cannot be combined with video."
+    )
+    video: TimelineGuideUpload | None = Field(
+        default=None, description="Clip guide source; cannot be combined with image."
+    )
+    audio: TimelineGuideUpload | None = Field(
+        default=None,
+        description="Audio guide source starting at the same frame. A video's soundtrack is never used.",
+    )
+
+    @model_validator(mode="after")
+    def validate_sources(self) -> "TimelineGuide":
+        if self.image is not None and self.video is not None:
+            raise ValueError("A timeline guide cannot contain both image and video")
+        if self.image is None and self.video is None and self.audio is None:
+            raise ValueError("A timeline guide requires at least one of image, video, or audio")
+        return self
 
 
 class VideoGenerationRequest(BaseModel):
@@ -160,6 +217,18 @@ class VideoGenerationRequest(BaseModel):
         description="Frames per second for output video",
     )
     num_frames: int | None = Field(default=None, ge=1, le=_INT64_MAX, description="Number of frames to generate")
+    streaming_pacing: StreamingPacingConfig | None = Field(
+        default=None,
+        description="Canonical realtime playback pacing policy; requires session.playback feedback.",
+    )
+    streaming_buffer_seconds: float | None = Field(
+        default=None,
+        gt=0,
+        le=10,
+        strict=True,
+        allow_inf_nan=False,
+        description="Maximum generated media lead, including the next chunk; requires session.playback updates.",
+    )
     aspect_ratio: str | None = Field(
         default=None,
         description=(
@@ -203,6 +272,19 @@ class VideoGenerationRequest(BaseModel):
         if value not in DIFFUSION_QUALITY_LEVELS:
             raise ValueError(f"quality must be one of {list(DIFFUSION_QUALITY_LEVELS)}, got {value!r}")
         return value
+
+    @model_validator(mode="after")
+    def normalize_streaming_pacing(self) -> "VideoGenerationRequest":
+        """Canonicalize pacing into ``streaming_pacing``; derive the lead alias."""
+        if self.streaming_pacing is not None and self.streaming_buffer_seconds is not None:
+            raise ValueError("use streaming_pacing or streaming_buffer_seconds, not both")
+        if self.streaming_buffer_seconds is not None:
+            self.streaming_pacing = StreamingPacingConfig(max_lead_ms=self.streaming_buffer_seconds * 1000.0)
+        if self.streaming_pacing is not None and self.streaming_pacing.enabled:
+            self.streaming_buffer_seconds = self.streaming_pacing.max_lead_ms / 1000.0
+        else:
+            self.streaming_buffer_seconds = None
+        return self
 
     negative_prompt: str | None = Field(default=None, description="Text describing what to avoid in the video")
     num_inference_steps: int | None = Field(
@@ -284,6 +366,12 @@ class VideoGenerationRequest(BaseModel):
             "scale|lora_scale, int_id|lora_int_id)."
         ),
     )
+
+    # Timeline guides for guide-capable models (MiniMax H3). The multipart
+    # parser validates the ``timeline_guides`` manifest against the
+    # ``guide_files`` uploads and attaches the decoded guide media and the
+    # request-owned temporary files here.
+    _timeline_guide_input: Any = PrivateAttr(default=None)
 
     # Generic model-specific parameters
     extra_params: dict[str, Any] | None = Field(

@@ -8,6 +8,7 @@
 - [High-Level Approach](#high-level-approach)
 - [Example](#example)
 - [What About Multimodal Inputs?](#what-about-multimodal-inputs)
+- [Diffusion KV Prefix Caching](#diffusion-kv-prefix-caching)
 - [Implementation](#implementation)
 - [Related Files](#related-files)
 
@@ -25,7 +26,7 @@ vLLM implements automatic prefix caching for managing its kv-cache, which is bes
 - Model / stage specific multimodal data
 
 !!! note "Note 1"
-    This document describes vLLM-Omni's mechanism for caching tensor outputs that are meant to be passed between stages, when requests have common prefixes, similar to the way in which vLLM has prefix caching for the kv-cache. This works in conjunction with vLLM's multimodal encoder caching, but is distinct. See the final section for a concrete example for how they tie together in practice.
+    The following sections describe caching tensor outputs passed between AR stages. This is distinct from multimodal encoder caching and from [diffusion KV prefix caching](#diffusion-kv-prefix-caching), which reuses GPU KV pages inside a diffusion stage.
 
 ### High-Level Approach
 
@@ -45,7 +46,7 @@ Host footprint: each cached key costs `num_blocks × block_size × D × dtype_by
 ### Example
 
 !!! note "Note 3"
-    Prefix caching in vLLM-Omni currently is only supported on AutoRegressive stages with one kv-cache group. Configure it with the pipeline-wide `enable_prefix_caching` field in the deploy config.
+    The stage-output tensor cache described here supports AutoRegressive stages with one kv-cache group. Configure it with the pipeline-wide `enable_prefix_caching` field in the deploy config. Diffusion KV caching has the separate requirements below.
 
 The way in which vLLM-Omni ties into vLLM's prefix caching is best understood by example. Say that we have the following:
 
@@ -167,6 +168,65 @@ When we pass our multimodal tensors to the language model component in the same 
 
 Finally, we look up the output hidden states/multimodal tensors corresponding to the prefix cache hit `Block 1` and concatenate it with the forward pass result to get the final result, which is expected to be identical to the full hidden states when prefix caching is disabled.
 
+### Diffusion KV Prefix Caching
+
+HunyuanImage3's standalone DiT pipeline can reuse stable text/reference-image KV
+across requests. Enable it on the diffusion stage in the deploy config:
+
+```yaml
+pipeline: hunyuan_image3_dit
+stages:
+  - stage_id: 0
+    diffusion_kv_mode: paged_scheduler
+    enable_prefix_caching: true
+```
+
+The Scheduler uses vLLM's native `KVCacheManager` to look up and retain complete
+prefix blocks. The Worker owns the GPU pages and block tables. On a hit, the first
+denoise forward computes only the uncached query suffix while attending to both
+cached and new KV. Dynamic target-image KV is never published as a reusable prefix.
+
+Cache identity includes token IDs, reference-image content and VAE random state,
+plus model/layout and LoRA context. The same image with different prompts can
+reuse the common leading blocks; it does not imply that every image span or CFG
+branch is interchangeable. Disabling prefix caching skips cache-identity hashing;
+`dense_legacy` remains the default. Enabling prefix caching with a mode other than
+`paged_scheduler`, without a registered model hook, or together with native
+`kv_transfer_config` raises a configuration error.
+Combining it with `enable_sleep_mode: true` is also rejected: sleep discards KV
+pages without invalidating the Scheduler's prefix-cache index. Disable either
+prefix caching or sleep mode.
+
+The current scope is local DiT reuse, not AR-imported KV or missing-page-only
+cross-stage transfer. Prefix-hit accuracy has been exercised with TP4/SP1 and
+TP2/SP2 (Ulysses), both with EP and CFGP1. Other combinations still require validation. See the
+[diffusion compatibility notes](../../user_guide/diffusion_features.md#diffusion-kv-prefix-caching).
+
+#### Shared-reference benchmark
+
+From the repository root, use the unified `vllm bench serve --omni` test runner:
+
+```bash
+pytest tests/dfx/perf/scripts/run_benchmark.py \
+  --test-config-file tests/dfx/perf/tests/test_hunyuan_image3_prefix_caching.json
+```
+
+Run GPU tests through your environment's GPU scheduler. The suite reuses the
+two-image IT2I accuracy input on a single DiT stage, comparing dense, paged without
+prefix caching, and paged with prefix caching. Each mode runs two ordinary upstream
+warmups followed by eight identical requests at CFG 2.5, 8 denoise steps and seed 42.
+Warmups are excluded from latency and request throughput. This measures full-prefix
+reuse, not the earlier distinct-prompt workload; its results must be reported separately.
+
+`tests/e2e/accuracy/test_hunyuan_image3_prefix_cache_accuracy.py` uses the same input
+at CFG 2.5, 50 steps and seed 42, comparing all modes against the existing official
+Instruct output image and IT2I thresholds (CLIP ≥90, SSIM ≥0.26, PSNR ≥12.5).
+A different prompt warms the cache; the original prompt then exercises partial
+and repeated hits, with reference-image reuse and query slicing verified.
+Only outputs for the original prompt are scored. The golden comes from AR-to-DiT;
+this single-DiT quality check does not establish identical conditioning between
+the pipelines. The existing AR-to-DiT test remains unchanged.
+
 ### Implementation
 
 The block/slot model is `vllm_omni/core/prefix_cache/`.
@@ -195,6 +255,7 @@ Which stages may set `enable_prefix_caching: true`:
 | --- | --- | --- |
 | AR stage with one full-attention kv group whose hidden states / per-token mm feed the next stage (Qwen3-Omni thinker and talker) | supported | The case the cache is built for: full-prompt hidden states are merged from the pool on a hit. |
 | AR stage that sets `requires_full_prefix_cached_hidden_states = False`, optionally with `deferred_prefix_cache_mm_keys` (Qwen3-TTS talker, Higgs v3 talker) | supported | Hidden is not cached; deferred codec rows are written once on finish. |
+| AR stage that appends its mm outputs in `sample()` and sets `mm_outputs_written_in_sample = True` together with `requires_full_prefix_cached_hidden_states = False` (YuE2) | supported | The step snapshot is taken before `sample()` and cannot hold those outputs, so the runner discards the step context and builds the payload from the live outputs. KV blocks are still reused on a hit. Setting the flag without the hidden-state opt-out is refused when the policy is built. |
 | Pooling stage | ignored | Never saves; the gate returns no config. |
 | `kv_role: kv_consumer` / `kv_both` | refused at kv-cache init (`OmniPrefixCacheUnmatchError`) | Producer KV shows up as `num_computed_tokens` and is indistinguishable from a local hit. |
 | Speculative decoding on the stage | refused at kv-cache init | Under async scheduling vLLM keeps `num_computed_tokens_cpu` optimistic (all drafts accepted) during the forward and corrects it afterwards; `step_slots_cpu` would mirror rows at the wrong slots. Not verified; refused as a whole. |
@@ -204,7 +265,7 @@ Which stages may set `enable_prefix_caching: true`:
 | Codec decoder / Code2Wav stages (Qwen3-Omni stage 2, Qwen3-TTS stage 1) | keep `false` | Nothing downstream consumes their hidden states; the cache would only add device→host copies. Not validated. |
 | Diffusion stages | n/a | No vLLM KV cache to mirror. |
 
-Hit spans come from `scheduled_new_reqs` only, as in the pre-refactor cache:
+Hit spans come from adapter-classified `STARTED` events for new requests:
 
 - A new request with a (partial) prefix hit is the normal path: the hit
   blocks are read from the pool, the rest is this step's rows, and the
@@ -225,22 +286,44 @@ Hit spans come from `scheduled_new_reqs` only, as in the pre-refactor cache:
   stay opt-in until preempt/resume hit spans are reconstructed.
 - `async_chunk` continuation: when the next upstream chunk arrives, the same
   request id re-enters `scheduled_new_reqs` with `num_computed_tokens` equal
-  to what it already computed itself. Ids already in `live_reqs` are skipped
-  for hit marking: those rows were delivered in earlier steps and re-emitting
-  them would duplicate output. A `delivered_upto` span for this case is
-  Phase 2.
+  to what it already computed itself. The adapter classifies an observed ID as
+  `EXTENDED`, so the manager does not mark a hit: those rows were delivered in
+  earlier steps and re-emitting them would duplicate output. A
+  `delivered_upto` span for this case is Phase 2.
 - Preemption + reschedule: vLLM resets `num_computed_tokens` to 0 on
   preemption and re-runs prefix matching on resume, so the resumed request
   can come back with a fresh hit. With the V1 model runner it arrives
   through `scheduled_cached_reqs` (id in `resumed_req_ids`, `new_block_ids`
   replaces the table); with the V2 runner it re-enters `scheduled_new_reqs`
-  while still in `live_reqs`. Neither path marks an omni hit span: the
+  as an already-observed ID. Neither path marks an omni hit span: the
   resumed request gets only the rows it recomputes, and its still-open
   deferred write keeps appending (a slot written twice keeps the later
   chunk). Cache integrity holds either way — the hit blocks already have
   rows, from this request or the one it hit. Stages that need full prompt
   hidden states should be sized so preemption does not occur while prefix
   caching is on. Same as before this refactor; tracked for Phase 2.
+
+The adapter is the sole owner of started-request observations. Its single
+`translate_step` entry point captures an immutable `PrefixCacheStep`.
+`EXTENDED` is represented by `step.extended_req_ids`, with token counts in
+`step.scheduled_tokens`, avoiding per-request event allocation on every step.
+It covers ordinary decode, chunked prefill and IDs re-entering
+`scheduled_new_reqs`. `RESUMED` payloads follow the scheduler's cached-request
+order. Terminal events precede arrivals, so same-step ID reuse finishes the old request
+before `STARTED` classifies the new one. The manager keeps write/resource
+bookkeeping only, with no second `live_reqs` lifecycle classifier.
+`ABORTED` accepts explicit optional `discarded_req_ids` or `aborted_req_ids`.
+The current `OmniSchedulerOutput` and upstream scheduler contract produce
+neither field: the `discarded_req_ids` producer is proposed in
+[PR #7681](https://github.com/vllm-project/vllm-omni/pull/7681), which has not
+landed. Until that dependency lands, production terminals remain `FINISHED`.
+The adapter's synthetic-input tests cover optional-field interpretation and
+ABORTED-over-FINISHED precedence, not production cancellation delivery.
+When #7681 lands, pin the producer/adapter contract with a real
+`OmniSchedulerOutput` test so a field rename cannot silently drop ABORTED.
+`REPLACED` belongs to item 5.
+Hit payloads describe prefixes `[0, hit_end)`; arbitrary read ranges and
+resume delivery watermarks are follow-up contracts, not inferred here.
 
 Two write paths, split by `ModelCachePolicy.deferred_keys`:
 
@@ -279,11 +362,32 @@ does not write the pool or carry abort/preempt occupancy.
 
 ```python
 cache.register_policy(ModelCachePolicy.from_model(model))   # load_model
-cache.new_step_starts(scheduler_output)   # before _update_states
+adapter = PrefixCacheSchedulerAdapter()
+step = adapter.translate_step(scheduler_output)
+cache.new_step_starts(step)   # before _update_states
+layout = adapter.build_write_layout(
+    prefix_cache_group_view,
+    num_scheduled_tokens=dict(step.scheduled_tokens),
+)
 sid = cache.save_outputs(hidden, mm_outputs, num_tokens_unpadded=n,
-                         num_tokens_padded=n_pad)
+                         num_tokens_padded=n_pad, write_layout=layout)
 outs = cache.materialize(sid, req_ids)    # or discard_step(sid)
 ```
+
+`new_step_starts` accepts only `PrefixCacheStep`; there is no bare-event or
+per-event count fallback. The runner builds the write layout from that step's
+captured counts. Before saving any rows, the manager cross-checks layout
+counts against the captured step for each prefix hit under `_state_lock`.
+A disagreement (including an omitted hit request) raises
+`OmniPrefixCacheUnmatchError` instead of merging into a wrongly sized buffer.
+
+Ordinary negative scheduled spans are normalized to zero (the runner's
+non-positive-span no-op contract). A negative count for a `STARTED` prefix
+hit raises before manager prefetch; write layouts still reject negative
+counts supplied independently. Runner initialization creates manager,
+adapter and view together; a partial unit fails before the forward.
+Shutdown stops the manager and clears the adapter, view, step snapshot and
+staged config together, releasing the view's reference to the input batch.
 
 Each step id is consumed exactly once. `req_ids` must be a subset of the save
 snapshot. At most `staging_depth` unused step ids may exist at once: every

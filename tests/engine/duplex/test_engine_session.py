@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import time
+from collections.abc import Callable
 from dataclasses import FrozenInstanceError
 
 import pytest
@@ -17,11 +19,17 @@ from vllm_omni.engine.duplex.config import (
     DuplexTurnEventType,
     DuplexTurnState,
     ResponseCreateOptions,
+    resolve_tool_result_timeout_s,
 )
 from vllm_omni.engine.duplex.contracts import DuplexFence
 from vllm_omni.engine.duplex.events import TurnEvent
-from vllm_omni.engine.duplex.session.engine_session import DuplexEngineSession, DuplexFenceMismatchError
+from vllm_omni.engine.duplex.session.engine_session import (
+    RESPONSE_REQUEST_MEASUREMENT_ORIGIN,
+    DuplexEngineSession,
+    DuplexFenceMismatchError,
+)
 from vllm_omni.engine.duplex.session.playback_ledger import apply_playback_ack
+from vllm_omni.metrics.stats import DUPLEX_STAGE_TABLE_EXCLUDE, OrchestratorAggregator, StageRequestStats, StageStats
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.capabilities import (
     minicpmo45_native_capabilities,
 )
@@ -29,8 +37,51 @@ from vllm_omni.model_executor.models.minicpmo_4_5.duplex.capabilities import (
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def _session(session_id: str = "duplex-test", config: DuplexSessionConfig | None = None) -> DuplexEngineSession:
-    return DuplexEngineSession(session_id=session_id, config=config or DuplexSessionConfig(model="test-model"))
+def _session(
+    session_id: str = "duplex-test",
+    config: DuplexSessionConfig | None = None,
+    *,
+    num_stages: int = 1,
+    log_stats: bool = False,
+    clock: Callable[[], float] | None = None,
+) -> DuplexEngineSession:
+    session = DuplexEngineSession(
+        session_id=session_id,
+        config=config or DuplexSessionConfig(model="test-model"),
+        num_stages=num_stages,
+        log_stats=log_stats,
+    )
+    if clock is not None:
+        session._clock = clock
+    return session
+
+
+def _stage_stats(
+    *,
+    stage_id: int,
+    request_id: str = "stage-req",
+    num_tokens_out: int = 3,
+    vllm_ttft_ms: float = 12.0,
+    vllm_tpot_ms: float = 0.0,
+    serving_time_to_first_output_ms: float = 0.0,
+) -> StageRequestStats:
+    return StageRequestStats(
+        batch_id=0,
+        batch_size=1,
+        num_tokens_in=7,
+        num_tokens_out=num_tokens_out,
+        stage_gen_time_ms=120.0,
+        rx_transfer_bytes=0,
+        rx_decode_time_ms=0.0,
+        rx_in_flight_time_ms=0.0,
+        stage_stats=StageStats(),
+        stage_id=stage_id,
+        request_id=request_id,
+        final_output_type="text",
+        vllm_ttft_ms=vllm_ttft_ms,
+        vllm_tpot_ms=vllm_tpot_ms,
+        serving_time_to_first_output_ms=serving_time_to_first_output_ms,
+    )
 
 
 def test_commit_audio_input_does_not_advance_model_turn_identity():
@@ -303,6 +354,45 @@ def test_unaligned_response_only_materializes_an_existing_answer_slot(reserve_sl
     assert session.history == (first.message,)
 
 
+def test_sent_audio_without_text_can_still_be_acknowledged():
+    session = _session(config=DuplexSessionConfig(playback_commit_policy="ack_only"))
+    user = session.commit_audio_input(transcript="What is the weather in Taipei?")
+    response_id = session.begin_response()
+    session.reserve_history_item(f"item_{response_id}")
+    session.mark_audio_sent(duration_ms=696, text_requires_complete_audio=True, audio_complete=True)
+
+    assert session.end_response(commit_text=True) is None
+    assert session.active_response_id is None
+    assert session.has_assistant_response_item(response_id, f"item_{response_id}")
+
+    ack = apply_playback_ack(
+        session,
+        {
+            "type": "playback.ack",
+            "response_id": response_id,
+            "item_id": f"item_{response_id}",
+            "played_ms": 696,
+            "committed_ms": 696,
+        },
+    )
+    assert "error" not in ack[0].to_realtime()
+    assert ack[0].to_realtime()["event"]["playback"]["committed_ms"] == 696
+    assert session.playback.sent_ms == session.playback.committed_ms == 696
+    # The reserved slot stays as an empty turn. There is no transcript to store.
+    assert session.history == (user.message, {"role": "assistant", "content": ""})
+
+
+def test_response_with_no_audio_and_no_text_is_not_ackable():
+    session = _session(config=DuplexSessionConfig(playback_commit_policy="ack_only"))
+    response_id = session.begin_response()
+    session.reserve_history_item(f"item_{response_id}")
+
+    assert session.end_response(commit_text=True) is None
+    assert not session.has_assistant_response_item(response_id, f"item_{response_id}")
+    ack = apply_playback_ack(session, {"response_id": response_id, "played_ms": 0})
+    assert ack[0].to_realtime()["error"]["code"] == "playback_item_not_found"
+
+
 @pytest.mark.parametrize("operation", ["delete", "truncate"])
 def test_removing_one_empty_assistant_preserves_the_other_turn_boundary(operation):
     session = _session(config=DuplexSessionConfig(playback_commit_policy="ack_only"))
@@ -354,6 +444,40 @@ def test_truncate_history_item_uses_response_alignment_marks():
 
 
 # ---- turn signals / model turns ----
+
+
+@pytest.mark.parametrize("edit", [None, "delete", "replace", "transcript", "replace_audio", "recreate_audio"])
+def test_input_transcription_is_idempotent_and_does_not_restore_edited_items(edit):
+    session = _session()
+    committed = session.commit_audio_input()
+    session.register_history_item("spoken-input", committed.message)
+    audio_part = session.input_audio_part("spoken-input")
+    if edit == "delete":
+        session.delete_history_item("spoken-input")
+    elif edit == "replace":
+        session.register_history_item("spoken-input", {"role": "user", "content": "replacement"})
+    elif edit == "transcript":
+        committed.message["content"][0]["transcript"] = "Edited instruction."
+    elif edit in {"replace_audio", "recreate_audio"}:
+        if edit == "recreate_audio":
+            session.delete_history_item("spoken-input")
+        replacement = session.commit_audio_input()
+        session.register_history_item("spoken-input", replacement.message)
+        assert session.input_audio_part("spoken-input") == audio_part
+        assert session.input_audio_part("spoken-input") is not audio_part
+    assert session.update_input_transcript("spoken-input", "Watch the pot.", audio_part=audio_part) is (edit is None)
+    assert not session.update_input_transcript("spoken-input", "Watch the pot.", audio_part=audio_part)
+    if edit is None:
+        assert session.history[0]["content"][0]["transcript"] == "Watch the pot."
+    elif edit == "replace":
+        assert session.history[0]["content"] == "replacement"
+    elif edit == "transcript":
+        assert session.history[0]["content"][0]["transcript"] == "Edited instruction."
+    elif edit in {"replace_audio", "recreate_audio"}:
+        assert session.update_input_transcript(
+            "spoken-input", "New instruction.", audio_part=session.input_audio_part("spoken-input")
+        )
+        assert session.history_item_ids["spoken-input"]["transcript"] == "New instruction."
 
 
 @pytest.mark.parametrize(
@@ -617,6 +741,31 @@ def test_from_realtime_ignores_client_chosen_session_ids():
     assert session.as_public_dict()["id"] == "duplex-engine-allocated"
 
 
+def test_from_realtime_reads_and_validates_the_tool_result_timeout():
+    config = DuplexSessionConfig.from_realtime({"tool_result_timeout_s": 2.5})
+    assert resolve_tool_result_timeout_s(config.extra_body) == 2.5
+    assert config.extra_body["tool_result_timeout_s"] == 2.5
+
+    nested = DuplexSessionConfig.from_realtime({"extra_body": {"tool_result_timeout_s": 4}})
+    assert resolve_tool_result_timeout_s(nested.extra_body) == 4.0
+
+    # The deadline only ever makes a pending call unanswerable, so a typo must
+    # be rejected rather than silently reinterpreted (``True`` is an ``int``).
+    for bad in (True, 0, -1.0, float("nan"), float("inf"), 10**400, "5"):
+        with pytest.raises(DuplexConfigError) as excinfo:
+            DuplexSessionConfig.from_realtime({"tool_result_timeout_s": bad})
+        assert excinfo.value.code == "invalid_tool_result_timeout"
+        assert excinfo.value.param == "tool_result_timeout_s"
+
+    with pytest.raises(DuplexConfigError) as excinfo:
+        DuplexSessionConfig(extra_body={"tool_result_timeout_s": False})
+    assert excinfo.value.code == "invalid_tool_result_timeout"
+
+    # Absent (or null) disables the deadline: the default is unchanged.
+    assert resolve_tool_result_timeout_s(DuplexSessionConfig.from_realtime({}).extra_body) is None
+    assert resolve_tool_result_timeout_s({"tool_result_timeout_s": None}) is None
+
+
 # ---- DuplexSessionConfig.apply_realtime_update ----
 
 
@@ -649,6 +798,56 @@ def test_apply_realtime_update_rejects_ref_audio_change():
 
     assert excinfo.value.code == "ref_audio_update_unsupported"
     assert config.ref_audio is None
+
+
+def test_apply_realtime_update_rejects_tool_result_timeout_change():
+    config = DuplexSessionConfig(model="served-model", extra_body={"tool_result_timeout_s": 5.0})
+
+    for patch in ({"tool_result_timeout_s": 1.0}, {"extra_body": {"tool_result_timeout_s": 1.0}}):
+        with pytest.raises(DuplexConfigError) as excinfo:
+            config.apply_realtime_update(patch, session_id="sid")
+        assert excinfo.value.code == "tool_result_timeout_update_unsupported"
+        assert excinfo.value.param == "tool_result_timeout_s"
+
+    assert resolve_tool_result_timeout_s(config.extra_body) == 5.0
+
+
+def test_apply_realtime_update_keeps_an_unchanged_tool_result_timeout():
+    config = DuplexSessionConfig(model="served-model", extra_body={"tool_result_timeout_s": 5.0})
+
+    config.apply_realtime_update({"instructions": "still here", "tool_result_timeout_s": 5}, session_id="sid")
+    config.apply_realtime_update({"extra_body": {"tool_result_timeout_s": 5.0}}, session_id="sid")
+
+    assert config.instructions == "still here"
+    assert resolve_tool_result_timeout_s(config.extra_body) == 5.0
+
+    unset = DuplexSessionConfig(model="served-model")
+    unset.apply_realtime_update({"tool_result_timeout_s": None}, session_id="sid")
+    assert resolve_tool_result_timeout_s(unset.extra_body) is None
+    with pytest.raises(DuplexConfigError) as excinfo:
+        unset.apply_realtime_update({"extra_body": {"tool_result_timeout_s": 1.0}}, session_id="sid")
+    assert excinfo.value.code == "tool_result_timeout_update_unsupported"
+    with pytest.raises(DuplexConfigError) as excinfo:
+        config.apply_realtime_update({"tool_result_timeout_s": None}, session_id="sid")
+    assert excinfo.value.code == "tool_result_timeout_update_unsupported"
+    assert resolve_tool_result_timeout_s(config.extra_body) == 5.0
+
+    opened = DuplexSessionConfig.from_realtime(
+        {"model": "served-model", "tool_result_timeout_s": 5, "extra_body": {"tool_result_timeout_s": 10}}
+    )
+    assert resolve_tool_result_timeout_s(opened.extra_body) == 5.0
+    opened.apply_realtime_update(
+        {"tool_result_timeout_s": 5, "extra_body": {"tool_result_timeout_s": 10}},
+        session_id="sid",
+    )
+    assert resolve_tool_result_timeout_s(opened.extra_body) == 5.0
+    with pytest.raises(DuplexConfigError) as excinfo:
+        opened.apply_realtime_update(
+            {"tool_result_timeout_s": 1, "extra_body": {"tool_result_timeout_s": 5}},
+            session_id="sid",
+        )
+    assert excinfo.value.code == "tool_result_timeout_update_unsupported"
+    assert resolve_tool_result_timeout_s(opened.extra_body) == 5.0
 
 
 def test_apply_realtime_update_patches_fields_and_realtime_keys():
@@ -731,6 +930,335 @@ def test_minicpmo_native_capabilities_do_not_overclaim_single_session_deployment
 
     assert caps["supports_multi_session"] is False
     assert caps["supports_multi_session_same_replica"] is False
+
+
+def test_response_timing_binds_latest_request_start_for_model_turn():
+    session = _session()
+    session.mark_model_turn_request_started(0, 10.0)
+    session.mark_model_turn_request_started(0, 11.0)
+    session.begin_response(turn_id=0)
+
+    first = session.mark_response_first_outputs(
+        observed_at_s=11.2,
+        has_text=True,
+        has_audio=False,
+    )
+    assert first["ttft_ms"] == pytest.approx(200.0)
+    assert first["measurement_origin"] == RESPONSE_REQUEST_MEASUREMENT_ORIGIN
+    assert "ttfp_ms" not in first
+
+    # After begin_response the origin is frozen at the pending start (11.0).
+    # The 12.0 append must not rebind, so TTFP is 12.3-11.0 = 1300 ms, not 300.
+    session.mark_model_turn_request_started(0, 12.0)
+    audio = session.mark_response_first_outputs(
+        observed_at_s=12.3,
+        has_text=False,
+        has_audio=True,
+    )
+    assert audio["ttft_ms"] == pytest.approx(200.0)
+    assert audio["ttfp_ms"] == pytest.approx(1300.0)
+
+
+def test_response_timing_attaches_metrics_only_when_newly_observed():
+    session = _session()
+    session.mark_model_turn_request_started(0, 10.0)
+    session.begin_response(turn_id=0)
+
+    first = session.mark_response_first_outputs(observed_at_s=10.2, has_text=True, has_audio=False)
+    assert first["ttft_ms"] == pytest.approx(200.0)
+    assert session.mark_response_first_outputs(observed_at_s=10.3, has_text=True, has_audio=False) == {}
+    audio = session.mark_response_first_outputs(observed_at_s=10.4, has_text=False, has_audio=True)
+    assert audio["ttft_ms"] == pytest.approx(200.0)
+    assert audio["ttfp_ms"] == pytest.approx(400.0)
+    assert session.mark_response_first_outputs(observed_at_s=10.5, has_text=True, has_audio=True) == {}
+
+
+def test_response_timing_is_cleared_on_end_barge_in_and_close():
+    session = _session()
+    session.mark_model_turn_request_started(0, 10.0)
+    session.begin_response(turn_id=0)
+    assert session.mark_response_first_outputs(observed_at_s=10.2, has_text=True, has_audio=False)
+    session.end_response()
+    assert session.mark_response_first_outputs(observed_at_s=10.4, has_text=True, has_audio=False) == {}
+
+    session.mark_model_turn_request_started(0, 11.0)
+    session.barge_in()
+    session.begin_response(turn_id=0)
+    assert session.mark_response_first_outputs(observed_at_s=11.2, has_text=True, has_audio=False) == {}
+
+    session.mark_model_turn_request_started(0, 12.0)
+    session.close()
+    session.begin_response(turn_id=0)
+    assert session.mark_response_first_outputs(observed_at_s=12.2, has_text=True, has_audio=False) == {}
+
+
+def test_complete_model_turn_drops_request_starts_for_finished_turns():
+    session = _session()
+    session.mark_model_turn_request_started(0, 10.0)
+    session.mark_model_turn_request_started(1, 11.0)
+    session.complete_model_turn(0)
+    session.begin_response(turn_id=1)
+    assert session.mark_response_first_outputs(
+        observed_at_s=11.25,
+        has_text=True,
+        has_audio=False,
+    )["ttft_ms"] == pytest.approx(250.0)
+    session.end_response()
+    session.begin_response(turn_id=0)
+    assert session.mark_response_first_outputs(observed_at_s=11.5, has_text=True, has_audio=False) == {}
+
+
+def test_log_stats_off_does_not_open_a_response_aggregator():
+    session = _session()
+    session.begin_response()
+    session.observe_stage_request_stats(0, _stage_stats(stage_id=0))
+    assert session._response_aggregator is None
+    session.end_response()
+    assert session._response_aggregator is None
+
+
+def test_end_response_logs_pending_and_active_stage_request_stats(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(OrchestratorAggregator, "build_and_log_summary", lambda self: {})
+    session = _session(num_stages=2, log_stats=True)
+    wire_stats = _stage_stats(stage_id=0, request_id="stage0-req", num_tokens_out=3)
+    session.observe_stage_request_stats(0, wire_stats)
+    assert session._response_aggregator is None
+    assert wire_stats.request_id == "stage0-req"
+
+    response_id = session.begin_response()
+    aggregator = session._response_aggregator
+    assert aggregator is not None
+    assert aggregator.num_stages == 2
+    recorded = aggregator.stage_events[response_id]
+    assert recorded[0].num_tokens_out == 3
+    assert recorded[0].request_id == response_id
+    assert wire_stats.request_id == "stage0-req"
+
+    session.observe_stage_request_stats(1, _stage_stats(stage_id=1, num_tokens_out=5, vllm_ttft_ms=0.0))
+    assert [event.stage_id for event in aggregator.stage_events[response_id]] == [0, 1]
+
+    session.end_response()
+    assert session._response_aggregator is None
+    assert response_id in aggregator.e2e_done
+
+
+def test_end_response_prints_one_column_per_stage(monkeypatch: pytest.MonkeyPatch):
+    logged: list[OrchestratorAggregator] = []
+
+    def _record_summary(self):
+        logged.append(self)
+        return {}
+
+    monkeypatch.setattr(OrchestratorAggregator, "build_and_log_summary", _record_summary)
+    session = _session(num_stages=3, log_stats=True)
+    session.observe_stage_request_stats(0, _stage_stats(stage_id=0, num_tokens_out=3, vllm_ttft_ms=40.0))
+    response_id = session.begin_response()
+    session.observe_stage_request_stats(0, _stage_stats(stage_id=0, num_tokens_out=4, vllm_ttft_ms=12.0))
+    session.observe_stage_request_stats(1, _stage_stats(stage_id=1, num_tokens_out=5, vllm_ttft_ms=20.0))
+    session.observe_stage_request_stats(1, _stage_stats(stage_id=1, num_tokens_out=6, vllm_ttft_ms=0.0))
+    session.observe_stage_request_stats(2, _stage_stats(stage_id=2, num_tokens_out=0, vllm_ttft_ms=0.0))
+    session.end_response()
+
+    assert len(logged) == 1
+    rows = logged[0].stage_events[response_id]
+    assert [event.stage_id for event in rows] == [0, 1, 2]
+    assert rows[0].num_tokens_out == 7
+    assert rows[0].vllm_ttft_ms == pytest.approx(40.0)
+    assert rows[1].num_tokens_out == 11
+    assert rows[1].vllm_ttft_ms == pytest.approx(20.0)
+    assert logged[0].stage_table_exclude == DUPLEX_STAGE_TABLE_EXCLUDE
+
+
+def test_end_response_omits_serving_time_to_first_output_from_stage_table(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = OrchestratorAggregator.build_and_log_summary
+    captured: list[tuple[OrchestratorAggregator, dict[str, object]]] = []
+
+    def _capture(self: OrchestratorAggregator) -> dict[str, object]:
+        summary = original(self)
+        captured.append((self, summary))
+        return summary
+
+    monkeypatch.setattr(OrchestratorAggregator, "build_and_log_summary", _capture)
+    session = _session(num_stages=3, log_stats=True)
+    response_id = session.begin_response()
+    session.observe_stage_request_stats(0, _stage_stats(stage_id=0, serving_time_to_first_output_ms=80.631))
+    session.observe_stage_request_stats(1, _stage_stats(stage_id=1, serving_time_to_first_output_ms=418.829))
+    session.observe_stage_request_stats(
+        2, _stage_stats(stage_id=2, vllm_ttft_ms=0.0, serving_time_to_first_output_ms=487.109)
+    )
+    session.end_response()
+
+    assert len(captured) == 1
+    aggregator, summary = captured[0]
+    stage_table = summary.get("stage_table")
+    assert isinstance(stage_table, list) and stage_table
+    rows = stage_table[0]["stages"]
+    assert isinstance(rows, list)
+    assert [row["stage_id"] for row in rows] == [0, 1, 2]
+    assert all("serving_time_to_first_output_ms" not in row for row in rows)
+    assert all("vllm_ttft_ms" in row for row in rows)
+    events = aggregator.stage_events[response_id]
+    assert [event.serving_time_to_first_output_ms for event in events] == pytest.approx([80.631, 418.829, 487.109])
+
+
+def test_end_response_omits_engine_core_phase_split_from_stage_table(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    phase_fields = ("vllm_queued_ms", "vllm_prefill_ms", "vllm_decode_ms", "vllm_num_preemptions")
+    original = OrchestratorAggregator.build_and_log_summary
+    captured: list[tuple[OrchestratorAggregator, dict[str, object]]] = []
+
+    def _capture(self: OrchestratorAggregator) -> dict[str, object]:
+        summary = original(self)
+        captured.append((self, summary))
+        return summary
+
+    monkeypatch.setattr(OrchestratorAggregator, "build_and_log_summary", _capture)
+    session = _session(num_stages=2, log_stats=True)
+    response_id = session.begin_response()
+    for stage_id in (0, 1):
+        stats = _stage_stats(stage_id=stage_id)
+        stats.vllm_queued_ms = 1.5
+        stats.vllm_prefill_ms = 20.0
+        stats.vllm_decode_ms = 300.0
+        stats.vllm_num_preemptions = 0
+        session.observe_stage_request_stats(stage_id, stats)
+    session.end_response()
+
+    assert len(captured) == 1
+    aggregator, summary = captured[0]
+    stage_table = summary.get("stage_table")
+    assert isinstance(stage_table, list) and stage_table
+    rows = stage_table[0]["stages"]
+    assert isinstance(rows, list)
+    assert [row["stage_id"] for row in rows] == [0, 1]
+    assert all(field not in row for row in rows for field in phase_fields)
+    assert all("vllm_ttft_ms" in row for row in rows)
+    events = aggregator.stage_events[response_id]
+    assert [event.vllm_prefill_ms for event in events] == pytest.approx([20.0, 20.0])
+
+
+def test_end_response_fold_keeps_the_chunk_that_carries_the_phase_split(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    phase_fields = ("vllm_queued_ms", "vllm_prefill_ms", "vllm_decode_ms", "vllm_num_preemptions")
+    logged: list[OrchestratorAggregator] = []
+
+    def _record(self: OrchestratorAggregator) -> dict[str, object]:
+        logged.append(self)
+        return {}
+
+    monkeypatch.setattr(OrchestratorAggregator, "build_and_log_summary", _record)
+    session = _session(num_stages=3, log_stats=True)
+    response_id = session.begin_response()
+
+    def _chunk(stage_id: int, split: tuple[float | None, float | None, float | None, int | None]):
+        stats = _stage_stats(stage_id=stage_id)
+        for field, value in zip(phase_fields, split):
+            setattr(stats, field, value)
+        return stats
+
+    no_split = (None, None, None, None)
+    # Stage 0: the split arrives on the last chunk, after the first (template) chunk.
+    session.observe_stage_request_stats(0, _chunk(0, no_split))
+    session.observe_stage_request_stats(0, _chunk(0, (1.5, 20.0, 300.0, 0)))
+    # Stage 1: a later chunk without a split does not erase it, and the split
+    # is taken from one chunk, not merged field by field.
+    session.observe_stage_request_stats(1, _chunk(1, (2.0, 30.0, 400.0, 1)))
+    session.observe_stage_request_stats(1, _chunk(1, (None, 35.0, 450.0, 0)))
+    session.observe_stage_request_stats(1, _chunk(1, no_split))
+    # Stage 2: no chunk carries a split.
+    session.observe_stage_request_stats(2, _chunk(2, no_split))
+    session.observe_stage_request_stats(2, _chunk(2, no_split))
+    session.end_response()
+
+    rows = logged[0].stage_events[response_id]
+    assert [row.stage_id for row in rows] == [0, 1, 2]
+    assert [tuple(getattr(row, field) for field in phase_fields) for row in rows] == [
+        (1.5, 20.0, 300.0, 0),
+        (None, 35.0, 450.0, 0),
+        no_split,
+    ]
+
+
+def test_http_stage_table_keeps_engine_core_phase_split() -> None:
+    agg = OrchestratorAggregator(num_stages=1, log_stats=True, wall_start_ts=0.0, final_stage_id_for_e2e=0)
+    stats = _stage_stats(stage_id=0)
+    stats.vllm_queued_ms = 1.5
+    stats.vllm_prefill_ms = 20.0
+    stats.vllm_decode_ms = 300.0
+    stats.vllm_num_preemptions = 0
+    agg.on_stage_metrics(0, "r1", stats)
+    agg.on_finalize_request(0, "r1", req_start_ts=0.0)
+
+    summary = agg.build_and_log_summary()
+    stage_table = summary.get("stage_table")
+    assert isinstance(stage_table, list) and stage_table
+    row = stage_table[0]["stages"][0]
+    assert row["vllm_prefill_ms"] == pytest.approx(20.0)
+    assert row["vllm_num_preemptions"] == 0
+
+
+def test_http_stage_table_keeps_serving_time_to_first_output() -> None:
+    agg = OrchestratorAggregator(num_stages=2, log_stats=True, wall_start_ts=0.0, final_stage_id_for_e2e=1)
+    agg.on_stage_metrics(0, "r1", _stage_stats(stage_id=0, serving_time_to_first_output_ms=80.0))
+    agg.on_stage_metrics(1, "r1", _stage_stats(stage_id=1, serving_time_to_first_output_ms=418.0))
+    agg.on_finalize_request(1, "r1", req_start_ts=0.0)
+
+    summary = agg.build_and_log_summary()
+    rows = summary["stage_table"][0]["stages"]
+    assert [row["serving_time_to_first_output_ms"] for row in rows] == [80.0, 418.0]
+
+
+def test_logged_e2e_includes_wait_before_first_output(monkeypatch: pytest.MonkeyPatch) -> None:
+    mono = {"t": 100.0}
+    wall = {"t": 1_000.0}
+    monkeypatch.setattr(time, "time", lambda: wall["t"])
+    logged: list[OrchestratorAggregator] = []
+
+    def _record_summary(self):
+        logged.append(self)
+        return {}
+
+    monkeypatch.setattr(OrchestratorAggregator, "build_and_log_summary", _record_summary)
+    session = _session(log_stats=True, clock=lambda: mono["t"])
+    session.mark_model_turn_request_started(0, 100.0)
+
+    mono["t"] = 102.0
+    wall["t"] = 1_002.0
+    response_id = session.begin_response(turn_id=0)
+    first = session.mark_response_first_outputs(observed_at_s=102.0, has_text=True, has_audio=True)
+    assert first["ttft_ms"] == pytest.approx(2000.0)
+
+    mono["t"] = 102.1
+    wall["t"] = 1_002.1
+    session.end_response()
+
+    assert logged[0].e2e_events[0].request_id == response_id
+    assert logged[0].e2e_events[0].e2e_total_ms == pytest.approx(2100.0)
+
+
+def test_logged_tpot_matches_client_weighted_aggregation(monkeypatch: pytest.MonkeyPatch) -> None:
+    logged: list[OrchestratorAggregator] = []
+
+    def _record_summary(self):
+        logged.append(self)
+        return {}
+
+    monkeypatch.setattr(OrchestratorAggregator, "build_and_log_summary", _record_summary)
+    session = _session(log_stats=True)
+    response_id = session.begin_response()
+    session.observe_stage_request_stats(0, _stage_stats(stage_id=0, num_tokens_out=11, vllm_tpot_ms=10.0))
+    session.observe_stage_request_stats(0, _stage_stats(stage_id=0, num_tokens_out=3, vllm_tpot_ms=100.0))
+    session.accumulate_response_stage_metrics({"0": {"num_tokens_out": 11, "vllm_tpot_ms": 10.0}})
+    client = session.accumulate_response_stage_metrics({"0": {"num_tokens_out": 3, "vllm_tpot_ms": 100.0}})
+    expected = client["0"]["vllm_tpot_ms"]
+    session.end_response()
+
+    assert expected == pytest.approx(25.0)
+    assert logged[0].stage_events[response_id][0].vllm_tpot_ms == pytest.approx(expected)
 
 
 def test_draining_response_stays_ack_admissible_after_next_begin_response() -> None:

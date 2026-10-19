@@ -95,6 +95,22 @@ class _ConvRNNF0Predictor(nn.Module):
         return self.classifier(self.condnet(x).transpose(1, 2)).squeeze(-1).abs()
 
 
+def drop_upstream_chunk_att_buffers(flow: nn.Module) -> int:
+    """Drop upstream cosyvoice2's unused chunk-streaming ``att_cache_buffer`` tensors (~2.1 GiB); returns bytes freed.
+
+    Only ``flow.setup_cache`` / ``flow.inference_chunk`` read them, and then
+    fail instead of computing on a stand-in.
+    """
+    released = 0
+    decoder = getattr(flow, "decoder", None)
+    for module in (decoder, getattr(decoder, "estimator", None)):
+        buffer = module._buffers.get("att_cache_buffer") if isinstance(module, nn.Module) else None
+        if isinstance(buffer, torch.Tensor):
+            released += buffer.numel() * buffer.element_size()
+            del module._buffers["att_cache_buffer"]
+    return released
+
+
 def _build_hift() -> HiFTGenerator:
     return HiFTGenerator(
         sampling_rate=24000,
@@ -115,9 +131,13 @@ class StepAudio2Token2WavCore(nn.Module):
         float16: bool = False,
         device: str = "cuda",
         n_timesteps: int = DEFAULT_TOKEN2WAV_CONFIG.n_timesteps,
+        drop_upstream_chunk_att_buffers: bool = False,
     ):
         super().__init__()
         self.model_path = model_path
+        # A backend that never runs ``flow.setup_cache`` / ``flow.inference_chunk``
+        # (MiniCPM-o's ``BatchedToken2Wav``) can drop their 2.1 GiB of buffers.
+        self._drop_chunk_att_buffers = bool(drop_upstream_chunk_att_buffers)
         self.float16 = float16
         self.device = torch.device(device)
         self.n_timesteps = n_timesteps
@@ -166,16 +186,13 @@ class StepAudio2Token2WavCore(nn.Module):
             s3tokenizer.load_model(f"{self.model_path}/speech_tokenizer_v2_25hz.onnx").to(self.device).eval()
         )
 
-        option = onnxruntime.SessionOptions()
-        option.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
-        option.intra_op_num_threads = 1
-        self._spk_model = onnxruntime.InferenceSession(
-            f"{self.model_path}/campplus.onnx", sess_options=option, providers=["CPUExecutionProvider"]
-        )
-
         with open(f"{self.model_path}/flow.yaml") as f:
             configs = load_hyperpyyaml(f)
         self._flow = configs["flow"]
+        if self._drop_chunk_att_buffers:
+            # Before ``.to(self.device)``: the buffers never reach the device.
+            released = drop_upstream_chunk_att_buffers(self._flow)
+            logger.info("Dropped the upstream flow chunk attention buffers (%.1f MiB)", released / 2**20)
         if self.float16:
             self._flow.half()
         self._flow.load_state_dict(
@@ -202,8 +219,22 @@ class StepAudio2Token2WavCore(nn.Module):
 
     @property
     def spk_model(self):
-        """Lazy-loaded speaker model"""
+        """Lazy-loaded speaker model.
+
+        The CPU onnxruntime fallback is built on first *use*: the device paths
+        (:meth:`enable_trt_spk_embedding` / :meth:`enable_device_spk_embedding`)
+        install a callable right after the eager facade init, so the temporary
+        CPU session is never allocated there (review: eager load + immediate
+        replacement wasted one full onnx parse per replica).
+        """
         self._ensure_models_loaded()
+        if self._spk_model is None:
+            option = onnxruntime.SessionOptions()
+            option.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
+            option.intra_op_num_threads = 1
+            self._spk_model = onnxruntime.InferenceSession(
+                f"{self.model_path}/campplus.onnx", sess_options=option, providers=["CPUExecutionProvider"]
+            )
         return self._spk_model
 
     @property
@@ -226,7 +257,7 @@ class StepAudio2Token2WavCore(nn.Module):
                 spk_model.run(None, {spk_model.get_inputs()[0].name: spk_feat.unsqueeze(dim=0).cpu().numpy()})[0],
                 device=self.device,
             )
-        # CampplusTRT (or any callable taking [T, 80] and returning [1, 192]).
+        # CampplusTRT / CampplusTorch (any callable taking [T, 80] -> [1, 192]).
         return spk_model(spk_feat).to(self.device)
 
     def enable_trt_spk_embedding(self) -> None:
@@ -234,11 +265,34 @@ class StepAudio2Token2WavCore(nn.Module):
 
         Reuses the CosyVoice3 CAM++ engine wrapper — MiniCPM-o / Step-Audio2
         ship the same campplus.onnx architecture and I/O contract.
+
+        Deliberately does *not* call ``_ensure_models_loaded()``: callers may
+        run inside vLLM's ``set_default_torch_dtype(model_config.dtype)`` block
+        (e.g. the standalone wrapper's ``__init__``), and forcing the load
+        there would eagerly build s3tokenizer/flow/HiFT under the stage dtype
+        instead of on first forward (review).
         """
         from vllm_omni.model_executor.models.cosyvoice3.speaker_embedding_trt import get_campplus_trt
 
-        self._ensure_models_loaded()
         self._spk_model = get_campplus_trt(f"{self.model_path}/campplus.onnx", device=self.device)
+
+    def enable_device_spk_embedding(self) -> None:
+        """Swap the CPU onnxruntime campplus session for an on-device model.
+
+        CUDA: shared TensorRT engine (same as :meth:`enable_trt_spk_embedding`).
+        Other devices (e.g. Ascend NPU): torch CAMPPlus loaded from the same
+        campplus.onnx weights — same architecture and I/O contract, no
+        per-request ``.cpu().numpy()`` host round-trip.
+
+        Like :meth:`enable_trt_spk_embedding`, this only installs the callable;
+        the remaining token2wav modules stay lazy and load on first forward.
+        """
+        if self.device.type == "cuda":
+            self.enable_trt_spk_embedding()
+            return
+        from vllm_omni.model_executor.models.cosyvoice3.speaker_embedding_torch import get_campplus_torch
+
+        self._spk_model = get_campplus_torch(f"{self.model_path}/campplus.onnx", device=self.device)
 
     def _prepare_prompt(self, prompt_wav: str):
         """Prepare prompt audio for conditioning"""
@@ -473,6 +527,15 @@ class StepAudio2Token2WavForConditionalGeneration(nn.Module, SupportsPP):
             device = str(vllm_config.device_config.device)
 
         self.token2wav = StepAudio2Token2WavCore(model_path=model_path, float16=float16, device=device)
+
+        # Match the MiniCPM-o wiring: on NPU run the campplus speaker embedding
+        # on device (torch, weights from the same campplus.onnx) instead of the
+        # per-request CPU onnxruntime session (~120-155ms host time each).
+        from vllm_omni.platforms import current_omni_platform
+
+        if current_omni_platform.is_npu():
+            self.token2wav.enable_device_spk_embedding()
+            logger.info("Step-Audio2 Token2Wav: campplus speaker embedding running on device (torch)")
 
         self.have_multimodal_outputs = True
         # Required for the runner to pass async_chunk info via

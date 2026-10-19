@@ -15,6 +15,10 @@ logger = init_logger(__name__)
 _HAS_MINDIESD = find_spec("mindiesd") is not None
 
 
+def _is_npu_tensor(x: torch.Tensor) -> bool:
+    return x.device.type == "npu"
+
+
 class LayerNorm(nn.LayerNorm, CustomOp):
     """
     LayerNorm implementation that inherits from both ``nn.LayerNorm`` and ``CustomOp``.
@@ -25,7 +29,11 @@ class LayerNorm(nn.LayerNorm, CustomOp):
     """
 
     def __init__(self, dim: int, eps: float = 1e-6, elementwise_affine: bool = True):
-        super().__init__(normalized_shape=dim, eps=eps, elementwise_affine=elementwise_affine)
+        super().__init__(  # type: ignore[call-arg]
+            normalized_shape=dim,
+            eps=eps,
+            elementwise_affine=elementwise_affine,
+        )
         # CustomOp.__init__ cannot be called here because it would re-run
         # nn.Module initialization and clear LayerNorm parameters.
         self._forward_method = CustomOp.dispatch_forward(self)
@@ -93,22 +101,8 @@ class RMSNorm(CustomOp):
         # (returns None) and accesses self.weight.data, which is a DTensor under
         # HSDP. Both patterns confuse inductor's compute_ancestors scheduler.
         # Fall back to forward_native so inductor can fuse the pure-PyTorch ops
-        # itself.
-        if torch.compiler.is_compiling():
-            return self.forward_native(x)
-        try:
-            return self._forward_fused(x)
-        except Exception:
-            return self.forward_native(x)
-
-    def forward_hip(
-        self,
-        x: torch.Tensor,
-        residual: torch.Tensor | None = None,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        if residual is not None:
-            return self.forward_native(x, residual)
-        if torch.compiler.is_compiling():
+        # itself. The fused kernel also cannot launch on an empty tensor.
+        if torch.compiler.is_compiling() or x.numel() == 0:
             return self.forward_native(x)
         try:
             return self._forward_fused(x)
@@ -136,6 +130,8 @@ class RMSNorm(CustomOp):
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if not _is_npu_tensor(x):
+            return self.forward_native(x, residual)
         import torch_npu
 
         if residual is not None:

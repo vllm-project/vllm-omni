@@ -12,7 +12,7 @@
   both with `Qwen/Qwen2.5-Omni-3B` as the frozen encoder
 - Task: zero-shot TTS, instruct TTS, content and acoustic editing,
   paralinguistic editing, speech enhancement, speaker and music separation
-- Mode: offline inference (online chat serving is not yet qualified)
+- Mode: offline inference and online `/v1/audio/speech` (online chat serving is not yet qualified)
 - Hardware: 1x H100 80GB
 - Maintainer: Community
 
@@ -130,23 +130,59 @@ Measured on one H100 against the upstream implementation with the same seeds
 and mean VAE latents (four cookbook cases, base checkpoint): identical
 transcripts, speaker similarity to the upstream output 0.993 to 0.999, log-mel
 L1 0.11 to 0.47 (the upstream VAE-resampling noise floor is 0.39). Flash:
-0.989 to 0.999 and 0.24 to 0.51. Wall per request on the second call: base
-1.0 to 2.0 s for 3.5 to 10.9 s of audio, Flash 0.17 to 0.30 s; engine start
-about 47 s with a warm page cache.
+0.989 to 0.999 and 0.24 to 0.51.
+
+Latency with the DiT and codec CUDA graphs, measured end to end on one
+H200-class GPU with both stages on it, concurrency 1, median of 10 warm
+requests: base (32 steps, CFG 2) zero-shot 0.25 / 0.31 / 0.40 s for 3 / 6 /
+12 s of audio, instruct TTS 0.17 / 0.23 / 0.32 s; Flash zero-shot 0.08 /
+0.10 / 0.14 s. The first request after start is 1.2 to 1.6 s, because the
+common shapes are compiled at startup. Engine start adds the codec decode
+compile and the DiT warmup to model loading (a few minutes on a cold
+Inductor cache, about 30 s less warm).
 
 ## Notes
 
 - Memory usage: about 25 GB peak on the device for a 12 s generation with
   both stages resident (deploy defaults: encoder 0.45, diffusion stage 0.35
-  of device memory).
-- Key flags: `enforce_eager` on both stages (the encoder walks the decoder
-  layers itself for the layer fusion). `enable_prefix_caching` must stay off
+  of device memory), plus about 1 GB of CUDA graph pools for the compiled
+  codec decode buckets.
+- Key flags: `enforce_eager` on the encoder stage (it walks the decoder
+  layers itself for the layer fusion); the diffusion stage runs with
+  `enforce_eager: false` so the codec decode is compiled into bucketed CUDA
+  graphs at startup (the deploy config sets 160/320/640 latent frames, i.e.
+  up to 12.8 s; longer clips are decoded in overlapping 640-frame tiles of
+  the same graph;
+  override with `model_config.auk_vae_compile_shapes` and
+  `auk_vae_tile_frames`). Each DiT denoise step replays a per-shape CUDA
+  graph of the regionally compiled double- and single-stream blocks; the
+  per-request conditioning (text projection, reference embedding, padding
+  biases, rotary tables) is prepared once per request outside the graph.
+  `enable_prefix_caching` must stay off
   for the encoder: a cache hit skips prompt positions that the fused
   condition needs. `enable_chunked_prefill` is off by default: forcing it
   (128-token chunks, so two to three chunks per prompt) reproduces the
   unchunked condition to bf16 rounding (per-token cosine 0.99999) and leaves
   request walls unchanged, because the encoder is about 3% of a base request,
   while concurrent runs stop being bit-identical to sequential ones.
+- FP8 DiT (opt-in): `diffusion_quantization_config: fp8` on the diffusion
+  stage runs the token-wise linears of the DiT blocks (QKV, attention output
+  and feed-forward projections, 160 in total) as FP8 E4M3 GEMMs; the
+  embeddings, the adaLN modulations and the output projection keep bf16. Ada
+  and Hopper GPUs only: elsewhere the stage logs a warning and stays bf16.
+  Against bf16 on the same GPU, base request latency drops 8 to 10% on an
+  H200-class GPU (zero-shot 0.19 / 0.25 / 0.34 s to 0.17 / 0.23 / 0.31 s for
+  3 / 6 / 12 s of audio) and about 30% on an H20 (0.50 / 0.71 / 1.01 s to
+  0.35 / 0.49 / 0.71 s), where the GEMMs are a larger share of a step, and
+  saturated base throughput on the H20 rises from 1.27 to 1.80 requests per
+  second at 6 s clips. Flash, with 4 steps, gains about 12% on the H20 and
+  nothing on the H200-class GPU. FP8
+  keeps three mantissa bits, so each guided velocity moves by about 7%
+  relative to bf16 and the waveforms differ (log-mel L1 0.15 to bf16, under
+  the VAE-resampling noise floor above). On 100 seed-tts English prompts with
+  the same seeds: base WER 0.0189 to 0.0211 with one prompt worse and none
+  better, speaker similarity -0.0002 (95% CI -0.0009 to +0.0006); Flash WER
+  unchanged, speaker similarity +0.0002 (-0.0008 to +0.0012).
 - Known limitations: the encoder's audio tower runs without `flash_attn` in a
   plain vLLM install, which shifts the encoder output on audio token positions
   (per-token cosine 0.96 vs the upstream fp32 fusion; text positions 0.9999)
@@ -161,7 +197,7 @@ about 47 s with a warm page cache.
 | --- | --- | --- |
 | Offline `Omni.generate` | supported (base and Flash) | `docs/getting_started/quickstart.md` |
 | Online `/v1/chat/completions` with audio | not yet qualified | `docs/serving/` |
-| `/v1/audio/speech` | not supported (needs a TTS adapter) | `docs/contributing/model/adding_tts_model.md` |
+| `/v1/audio/speech` | supported (base and Flash, `instructions` or `task_type`) | `docs/user_guide/examples/online_serving/text_to_speech.md` |
 | Streaming / async chunk | not supported | `docs/design/feature/async_chunk.md` |
 | Batching across requests | one request per DiT forward | `docs/user_guide/diffusion/` |
 | Tensor / sequence parallelism | not supported | `docs/configuration/composable_parallel.md` |

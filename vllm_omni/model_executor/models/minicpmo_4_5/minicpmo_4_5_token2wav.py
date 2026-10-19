@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """MiniCPM-o 4.5 Token2wav adapter over in-tree ``StepAudio2Token2WavCore``.
 
 ``minicpmo_4_5_omni_tts`` historically depended on the external
@@ -64,6 +64,7 @@ class MiniCPMO45Token2wav:
         float16: bool = False,
         n_timesteps: int = 10,
         device: str | torch.device | None = None,
+        drop_upstream_chunk_att_buffers: bool = False,
     ):
         self.float16 = float16
         self.n_timesteps = n_timesteps
@@ -73,6 +74,7 @@ class MiniCPMO45Token2wav:
             float16=float16,
             device=self.device,
             n_timesteps=n_timesteps,
+            drop_upstream_chunk_att_buffers=drop_upstream_chunk_att_buffers,
         )
         # Eager-load so construction failures surface at init time (same as
         # the external Token2wav package), not on the first request.
@@ -123,6 +125,10 @@ class MiniCPMO45Token2wav:
     def enable_trt_spk_embedding(self) -> None:
         """Run the campplus speaker-embedding model on TensorRT."""
         self._core.enable_trt_spk_embedding()
+
+    def enable_device_spk_embedding(self) -> None:
+        """Run the campplus speaker-embedding model on device (TRT on CUDA, torch elsewhere)."""
+        self._core.enable_device_spk_embedding()
 
     def __call__(self, generated_speech_tokens, prompt_wav) -> bytes:
         """One-shot tokens → 24 kHz WAV bytes."""
