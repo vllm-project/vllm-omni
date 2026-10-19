@@ -89,6 +89,10 @@ platforms:
       - stage_id: 0
         compilation_config:
           custom_ops: ["+rotary_embedding"]
+          cudagraph_mm_encoder: true
+          encoder_cudagraph_token_budgets: [256, 512, 1024, 2048, 4096]
+          encoder_cudagraph_max_vision_items_per_batch: 16
+          encoder_cudagraph_max_frames_per_batch: 128
 
   # The supported Qwen3-Omni ModelOpt checkpoint quantizes the thinker only. Clear the
   # checkpoint-level metadata for the BF16 audio stages on the verified MUSA
@@ -110,6 +114,10 @@ platforms:
         max_num_batched_tokens: 8192
         compilation_config:
           cudagraph_mode: PIECEWISE   # Qwen3-Omni not FULL-cudagraph-safe on NPU
+          cudagraph_mm_encoder: true
+          encoder_cudagraph_token_budgets: [256, 512, 1024, 2048, 4096]
+          encoder_cudagraph_max_vision_items_per_batch: 16
+          encoder_cudagraph_max_frames_per_batch: 128
         devices: "0,1"
       - stage_id: 1
         gpu_memory_utilization: 0.6

@@ -594,3 +594,28 @@ def test_cuda_profiler_is_wired_for_omni_worker(monkeypatch):
 
     assert isinstance(worker.profiler, FakeCudaProfiler)
     assert worker.profiler.profiler_config.profiler == "cuda"
+
+
+@pytest.mark.parametrize("estimate", [0, 4 * GIB])
+def test_encoder_graphs_are_not_profiled_twice(monkeypatch, estimate):
+    worker = _make_worker(requested_memory=30 * GIB, model_memory_usage=10 * GIB)
+    worker.vllm_config.compilation_config.cudagraph_mode = CUDAGraphMode.FULL
+    worker.vllm_config.compilation_config.cudagraph_mm_encoder = True
+    worker.model_runner.profile_cudagraph_memory = lambda: estimate
+    worker.model_runner.profile_encoder_cudagraph_memory = lambda: pytest.fail("encoder already included")
+    monkeypatch.setenv("VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS", "1")
+    monkeypatch.setattr(
+        base, "current_omni_platform", SimpleNamespace(is_cuda=lambda: True, is_cuda_alike=lambda: True)
+    )
+    monkeypatch.setattr(base, "memory_profiling", _fake_memory_profiling(non_torch=1 * GIB, torch_peak=2 * GIB))
+    assert worker.determine_available_memory() == 17 * GIB - estimate
+
+
+@pytest.mark.parametrize("estimate_enabled", ["0", "1"])
+def test_no_encoder_reserve_without_capture(monkeypatch, estimate_enabled):
+    worker = _make_worker(requested_memory=30 * GIB, model_memory_usage=10 * GIB)
+    worker.vllm_config.compilation_config.cudagraph_mm_encoder = True
+    worker.model_runner.profile_encoder_cudagraph_memory = lambda: pytest.fail("estimation disabled")
+    monkeypatch.setenv("VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS", estimate_enabled)
+    monkeypatch.setattr(base, "memory_profiling", _fake_memory_profiling(non_torch=1 * GIB, torch_peak=2 * GIB))
+    assert worker.determine_available_memory() == 17 * GIB

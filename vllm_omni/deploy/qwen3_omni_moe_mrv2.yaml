@@ -41,8 +41,27 @@ stages:
     model_runner: v2
 
 platforms:
+  # compilation_config is replaced whole, so repeat the sibling fields.
+  # MRv2's encoder manager does not apply the replay bounds these captures need.
+  cuda:
+    stages:
+      - stage_id: 0
+        compilation_config:
+          custom_ops: ["+rotary_embedding"]
+          cudagraph_mm_encoder: false
+          encoder_cudagraph_token_budgets: [256, 512, 1024, 2048, 4096]
+          encoder_cudagraph_max_vision_items_per_batch: 16
+          encoder_cudagraph_max_frames_per_batch: 128
   npu:
     model_runner: v1
+    stages:
+      - stage_id: 0
+        compilation_config:
+          cudagraph_mode: PIECEWISE
+          cudagraph_mm_encoder: false
+          encoder_cudagraph_token_budgets: [256, 512, 1024, 2048, 4096]
+          encoder_cudagraph_max_vision_items_per_batch: 16
+          encoder_cudagraph_max_frames_per_batch: 128
   xpu:
     model_runner: v1
   rocm:

@@ -1,9 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Base NPU worker class for vLLM-Omni with OmniProfiler support."""
 
 import time
+
+from vllm.config import CUDAGraphMode
+from vllm.logger import init_logger
 
 from vllm_omni.platforms.npu._310p import is_310p
 
@@ -11,6 +14,9 @@ if is_310p():
     from vllm_ascend._310p.worker_310p import NPUWorker310 as NPUWorker
 else:
     from vllm_ascend.worker.worker import NPUWorker
+
+
+logger = init_logger(__name__)
 
 
 class OmniNPUWorkerBase(NPUWorker):
@@ -35,6 +41,26 @@ class OmniNPUWorkerBase(NPUWorker):
                 worker_name=worker_name,
                 local_rank=self.local_rank,
             )
+
+    def determine_available_memory(self) -> int:
+        available = super().determine_available_memory()
+        self.encoder_cudagraph_memory_estimate = 0
+        if (
+            self.vllm_config.compilation_config.cudagraph_mm_encoder
+            and self.vllm_config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
+            and not self.cache_config.kv_cache_memory_bytes
+        ):
+            model = self.model_runner.get_model()
+            if not (
+                getattr(model, "encoder_cudagraph_single_replay", False)
+                or getattr(model, "_audio_encoder_graphs", None) is not None
+            ):
+                return available
+            self.encoder_cudagraph_memory_estimate = self.model_runner.profile_encoder_cudagraph_memory()
+            logger.info("Reserved %.2f GiB for encoder NPU graphs", self.encoder_cudagraph_memory_estimate / (1 << 30))
+            available = max(0, available - self.encoder_cudagraph_memory_estimate)
+            self.available_kv_cache_memory_bytes = available
+        return available
 
     def profile(self, is_start: bool = True, profile_prefix: str | None = None):
         """Override to set trace filename before starting the profiler.
