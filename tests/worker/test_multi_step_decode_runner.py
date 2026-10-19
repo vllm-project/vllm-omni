@@ -4,18 +4,102 @@
 ``validate_multi_step_plan`` re-checks every window invariant against
 runner-local state before the K-step replay runs (fail-closed: any
 refusal falls back to the normal single-step path).  These tests drive
-the validator with duck-typed fakes, no NPU device required.
+the validator with duck-typed fakes, no NPU device required: the module
+under test is loaded from source with stubbed ``vllm_ascend`` imports so
+the file also collects on the CUDA CPU lane (see ``_load_window_module``).
 """
 
 from __future__ import annotations
 
+import importlib.util
+import sys
+import types
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
-import vllm_omni.platforms.npu.worker.multi_step_decode as msd_module
-from vllm_omni.platforms.npu.worker.multi_step_decode import validate_multi_step_plan
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+_WINDOW_MODULE_PATH = (
+    Path(__file__).resolve().parents[2]
+    / "vllm_omni"
+    / "platforms"
+    / "npu"
+    / "worker"
+    / "multi_step_decode.py"
+)
+
+
+def _install_vllm_ascend_stubs() -> None:
+    """Stub the ``vllm_ascend`` attributes the window module needs.
+
+    The module top-level-imports the Ascend forward context and the rotary
+    cos/sin cache, and its package ``vllm_omni/platforms/npu/__init__.py``
+    imports ``vllm_ascend.platform``.  None of them exist on the CUDA CPU
+    images that collect ``tests/worker`` for the PR/merge lane, where a
+    collection ImportError fails the whole job before markers can deselect.
+    A real install wins (``setdefault``), so NPU hosts are unaffected.
+    """
+    try:
+        import vllm_ascend  # noqa: F401
+    except ImportError:
+        pass
+    else:
+        return
+
+    class _NPUPlatform:
+        """Stand-in base class for ``vllm_omni.platforms.npu.platform``."""
+
+    ascend = types.ModuleType("vllm_ascend")
+    forward_ctx = types.ModuleType("vllm_ascend.ascend_forward_context")
+    forward_ctx.set_ascend_forward_context = lambda *args, **kwargs: None
+    platform = types.ModuleType("vllm_ascend.platform")
+    platform.NPUPlatform = _NPUPlatform
+    ops = types.ModuleType("vllm_ascend.ops")
+    rotary = types.ModuleType("vllm_ascend.ops.rotary_embedding")
+    rotary.update_cos_sin = lambda *args, **kwargs: None
+    rotary._cos = None
+    rotary._sin = None
+    rotary._cos_sin_cache = None
+    ascend.ascend_forward_context = forward_ctx
+    ascend.platform = platform
+    ascend.ops = ops
+    ops.rotary_embedding = rotary
+    for name, module in (
+        ("vllm_ascend", ascend),
+        ("vllm_ascend.ascend_forward_context", forward_ctx),
+        ("vllm_ascend.platform", platform),
+        ("vllm_ascend.ops", ops),
+        ("vllm_ascend.ops.rotary_embedding", rotary),
+    ):
+        sys.modules.setdefault(name, module)
+
+
+def _load_window_module():
+    """Load the NPU window module from source.
+
+    Importing it as ``vllm_omni.platforms.npu.worker.multi_step_decode`` would
+    execute ``vllm_omni/platforms/npu/__init__.py`` and therefore need the whole
+    NPU platform stack.  Source loading is the established pattern for NPU unit
+    tests on CPU lanes (see ``tests/platforms/npu/test_310p_patches.py``).
+    """
+    _install_vllm_ascend_stubs()
+    spec = importlib.util.spec_from_file_location(
+        "vllm_omni_npu_multi_step_decode_under_test", _WINDOW_MODULE_PATH
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load import spec for {_WINDOW_MODULE_PATH}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+msd_module = _load_window_module()
+validate_multi_step_plan = msd_module.validate_multi_step_plan
+
 
 
 @pytest.fixture(autouse=True)

@@ -28,6 +28,11 @@ from vllm_omni.core.sched.multi_step_decode import (
     scheduler_allows_multi_step,
 )
 
+# The CUDA PR/merge lane runs ``pytest -m 'core_model and cpu'`` over the whole
+# tests/ tree; unmarked modules are collected and then deselected, so without
+# this marker these planner/reconcile cases would never execute there.
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
 # The one architecture that declares ``supports_multi_step_decode`` today.
 WINDOWED_ARCH = "MiniCPMO45OmniTTSForConditionalGeneration"
 
