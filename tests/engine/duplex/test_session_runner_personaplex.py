@@ -187,17 +187,24 @@ async def test_half_frames_are_buffered_until_a_whole_frame_exists() -> None:
 
 
 @pytest.mark.asyncio
-async def test_a_wrong_rate_append_is_refused_without_a_submission() -> None:
+async def test_capture_audio_is_resampled_to_the_plugin_native_rate() -> None:
     h = await open_personaplex_harness()
     try:
         events = await h.run(
-            commands.AppendAudio(audio=b"\x00" * 64, format="pcm_f32le", sample_rate_hz=16000, is_speech=None)
+            commands.AppendAudio(
+                audio=struct.pack("<1280f", *([0.05] * 1280)),
+                format="pcm_f32le",
+                sample_rate_hz=16000,
+                is_speech=True,
+            )
         )
 
-        error = find(events, "error")
-        assert error.code == "bad_event"
-        assert "24000" in error.message
-        assert h.port.submissions == []
+        assert not [event for event in events if event.type == "error"]
+        assert len(h.port.submissions) == 1
+        payload = submitted_duplex(h.port)[0]["payload"]
+        assert isinstance(payload, dict)
+        assert payload["sample_rate_hz"] == SAMPLE_RATE
+        assert len(base64.b64decode(payload["audio"])) == FRAME_SIZE * 4
     finally:
         await close_harness(h)
 

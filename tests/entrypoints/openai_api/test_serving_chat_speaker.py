@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Tests for chat endpoint speaker validation."""
 
 import asyncio
@@ -66,6 +66,12 @@ def test_get_supported_speakers_caches_normalized_keys(mocker: MockerFixture, se
     # Cached value should be reused even if the config changes afterwards.
     serving_chat.model_config.hf_config.talker_config.speaker_id = {"Serena": 2}
     assert serving_chat._get_supported_speakers() == {"vivian", "ethan"}
+
+
+def test_resolve_chat_speaker_falls_back_to_nested_audio_voice(serving_chat):
+    request = SimpleNamespace(audio={"voice": "Vivian"})
+
+    assert serving_chat._resolve_chat_speaker(request) == "Vivian"
 
 
 def test_create_chat_completion_converts_value_error_to_error_response(mocker: MockerFixture, serving_chat):

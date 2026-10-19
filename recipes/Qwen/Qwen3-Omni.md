@@ -187,15 +187,31 @@ curl http://localhost:8091/v1/chat/completions \
   }'
 ```
 
-Realtime WebSocket check (`/v1/realtime`) requires async chunk disabled:
+For turn-based duplex through chat completions, restart the server with the
+dedicated fallback profile. It disables async chunking and admits one session:
 
 ```bash
-python examples/online_serving/qwen3_omni/openai_realtime_client.py \
-  --url ws://localhost:8091/v1/realtime \
-  --model Qwen/Qwen3-Omni-30B-A3B-Instruct \
-  --input-wav /path/to/input_16k_mono.wav \
-  --output-wav realtime_output.wav
+vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
+  --deploy-config vllm_omni/deploy/qwen3_omni_chat_fallback.yaml
 ```
+
+Then exercise input, output and interruption with the model-neutral client:
+
+```bash
+python examples/online_serving/barge_in_client.py --preset none \
+  --url ws://localhost:8091/v1/duplex \
+  --model Qwen/Qwen3-Omni-30B-A3B-Instruct \
+  --question-wav /path/to/input_16k_mono.wav \
+  --interrupt-wav /path/to/follow_up_16k_mono.wav \
+  --output-dir ./duplex_out
+```
+
+The fallback reports `implementation_level: chat_fallback`. Audio commits
+create a response by default; `response_create: false` defers it until
+`response.create`. Images and reference voices are not supported in this
+profile. `qwen3_omni_duplex.yaml` retains the engine-managed Qwen path. See the
+[Realtime Duplex API](../../docs/serving/realtime_duplex_api.md#qwen3-omni-chat-fallback)
+for session controls and capability details.
 
 ### Benchmark with `vllm bench`
 
@@ -254,7 +270,7 @@ vllm bench serve \
 
 ### Notes
 
-- `/v1/realtime` is unsupported while `async_chunk` is enabled.
+- The chat-fallback profile requires `async_chunk: false`.
 - The default deploy uses `SharedMemoryConnector`; this is for single-host
   stage wiring.
 

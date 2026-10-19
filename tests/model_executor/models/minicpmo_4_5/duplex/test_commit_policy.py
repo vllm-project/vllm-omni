@@ -100,3 +100,16 @@ def test_decide_commit_action_covers_realtime_lifecycle_sequences(
     del case
 
     assert decide_commit_action(snapshot) is expected
+
+
+def test_auto_response_commit_defers_when_an_engine_response_is_active() -> None:
+    snapshot = CommitSnapshot(
+        auto_responds=True,
+        speech_since_commit=True,
+        active_response_id="resp-active",
+        overlap_speech_ms=800,
+        response_in_progress=True,
+        playback_active=True,
+    )
+
+    assert decide_commit_action(snapshot) is CommitAction.DEFER_ACTIVE_RESPONSE

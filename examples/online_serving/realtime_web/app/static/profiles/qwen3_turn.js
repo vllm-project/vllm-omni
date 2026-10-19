@@ -4,6 +4,7 @@
   profiles['qwen3-turn'] = (config) => {
     const vad = config.turnMode === 'vad';
     let interruptOnSpeech = vad;
+    let supportsImageInput = false;
     let imageSeq = 0;
     let imageItems = [];
     // The engine refuses a ninth image (or 4 MiB of them) for the whole
@@ -49,7 +50,7 @@
       // Realtime image interface, so the camera sends conversation items
       // rather than an extension field on the append.
       imageMessages(frame) {
-        if (!vad) return [];
+        if (!vad || !supportsImageInput) return [];
         const messages = [];
         if (imageItems.length >= MAX_IMAGE_ITEMS) {
           // Retire before creating: the engine counts what is already stored.
@@ -71,6 +72,9 @@
         item_id: `item_${responseId}`, played_ms: playedMs, committed_ms: playedMs } : null,
       mapEvent(event) {
         if (event.type === 'session.created' || event.type === 'session.updated') {
+          if (event.session?.capabilities) {
+            supportsImageInput = event.session.capabilities.supports_image_input === true;
+          }
           const input = event.session?.audio?.input;
           const turnDetection = input && 'turn_detection' in input
             ? input.turn_detection : event.session?.turn_detection;
@@ -85,10 +89,10 @@
           return { kind: 'interrupt' };
         }
         if (event.type === 'playback.acknowledged') return { kind: 'ack', committedMs: (event.event || event).committed_ms || 0 };
-        if (event.type === 'response.output_text.delta') {
+        if (event.type === 'response.output_text.delta' || event.type === 'response.text.delta') {
           return { kind: 'text', role: 'assistant', channel: 'text', text: event.delta || '' };
         }
-        if (event.type === 'response.output_text.done') {
+        if (event.type === 'response.output_text.done' || event.type === 'response.text.done') {
           return { kind: 'text-final', role: 'assistant', channel: 'text', text: event.text || '' };
         }
         if (vad && (event.type === 'output_audio_buffer.cleared' ||

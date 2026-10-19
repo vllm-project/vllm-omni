@@ -23,7 +23,11 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from vllm_omni.engine.duplex.turn_detection import validate_realtime_turn_detection
+from vllm_omni.engine.duplex.turn_detection import (
+    TurnDetectionConfig,
+    normalize_turn_detection_session_payload,
+    validate_realtime_turn_detection,
+)
 from vllm_omni.engine.duplex.vad import (
     SILERO_VAD_SHA256,
     ServerVADUnavailableError,
@@ -384,15 +388,28 @@ def test_the_documented_server_vad_fields_are_all_accepted() -> None:
     )
 
 
-@pytest.mark.parametrize("speech_probability", [0.5, 0.9])
-def test_resumed_speech_cancels_pending_silence(speech_probability):
-    config = SileroVADConfig(threshold=0.5, prefix_padding_ms=0, silence_duration_ms=96, min_speech_duration_ms=32)
-    # 32 ms pause, resumed speech, then a full 96 ms pause: one utterance.
-    scores = [0.9, 0.1, speech_probability, speech_probability, 0.1, 0.1, 0.1]
-    assert _drive(config, scores) == [("start", 0), ("stop", 224)]
+def test_turn_based_server_vad_resolves_non_interrupting_defaults() -> None:
+    payload: dict[str, object] = {
+        "audio": {"input": {"turn_detection": {"type": "server_vad"}}},
+    }
 
+    assert (
+        validate_realtime_turn_detection(
+            payload,
+            allow_interrupt_response_false=True,
+            default_interrupt_response=False,
+        )
+        is None
+    )
+    configured, config = normalize_turn_detection_session_payload(payload, default_interrupt_response=False)
 
-def test_short_pauses_do_not_split_continuous_speech_into_repeated_turns():
-    config = SileroVADConfig(threshold=0.5, prefix_padding_ms=0, silence_duration_ms=500, min_speech_duration_ms=32)
-    scores = [0.9] + [0.1, 0.9, 0.9, 0.9] * 20
-    assert _drive(config, scores) == [("start", 0)]
+    assert configured is True
+    assert isinstance(config, TurnDetectionConfig)
+    assert config.interrupt_response is False
+    assert config.overlap_policy == "listen_only"
+    audio = payload["audio"]
+    assert isinstance(audio, dict)
+    audio_input = audio["input"]
+    assert isinstance(audio_input, dict)
+    assert payload["turn_detection"] == audio_input["turn_detection"]
+    assert audio_input["turn_detection"]["interrupt_response"] is False

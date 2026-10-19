@@ -533,7 +533,7 @@ def test_minicpmo_npu_additional_config_reaches_engine_args(monkeypatch, deploy_
     monkeypatch.setattr(current_omni_platform, "device_name", "npu")
     monkeypatch.setattr(stage_init_utils, "resolve_worker_cls", lambda engine_args: None)
     stage = _from_pipeline_key("minicpmo_4_5", deploy_config_path=deploy_name).stage_by_id(2)
-    expected = {"code2wav_enable_npu_graph": True, "code2wav_max_npu_graphs": 32}
+    expected: dict[str, object] = {"code2wav_enable_npu_graph": True, "code2wav_max_npu_graphs": 32}
     if deploy_name == "minicpmo_4_5":
         # Single-card deploy: batch sizes round up to a capture bucket so the
         # 32-entry pool covers the shape space.
@@ -1194,6 +1194,7 @@ def test_sub_config_fields_match_structured_scopes():
     vllm_load_fields = {f.name for f in fields(VllmLoadConfig)}
     assert issubclass(OmniStageLoadConfig, VllmLoadConfig)
     assert {f.name for f in fields(OmniStageLoadConfig)} == vllm_load_fields | {
+        "cpu_offload_gb",
         "tokenizer",
         "skip_tokenizer_init",
         "tokenizer_mode",
