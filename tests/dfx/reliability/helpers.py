@@ -36,13 +36,13 @@ import uuid
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, TypedDict
+from typing import TYPE_CHECKING, Any, TypedDict
 
 import psutil
 import pytest
 
-from tests.dfx.conftest import create_reliability_omni_server_params
-from tests.helpers.runtime import OmniServerParams
+if TYPE_CHECKING:
+    from tests.helpers.runtime import OmniServerParams
 
 logger = logging.getLogger(__name__)
 
@@ -1438,6 +1438,8 @@ class FaultModel:
             )
         elif server_set not in ("default", "oom"):
             raise ValueError(f"unknown server set {server_set!r} for {self.model_id}")
+        from tests.dfx.conftest import create_reliability_omni_server_params
+
         params = create_reliability_omni_server_params(scenarios, self.deploy_dir)
         if logged:
             params = reliability_params_with_server_log(params, self.model_id)

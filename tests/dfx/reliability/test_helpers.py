@@ -129,7 +129,7 @@ def test_process_cleanup_can_pass_without_gpu_telemetry(monkeypatch: pytest.Monk
 
 
 def test_qwen_worker_pattern_is_the_thinker_stage() -> None:
-    source = (Path(__file__).resolve().parent / "cases" / "qwen3_omni.py").read_text(encoding="utf-8")
+    source = (Path(__file__).resolve().parent / "test_qwen3_omni.py").read_text(encoding="utf-8")
     tree = ast.parse(source)
     assignment = next(
         node
