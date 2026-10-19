@@ -198,10 +198,10 @@ class FluxKontextPipeline(
         untruncated_ids = self.tokenizer_2(prompt, padding="longest", return_tensors="pt").input_ids
 
         if untruncated_ids.shape[-1] >= text_input_ids.shape[-1] and not torch.equal(text_input_ids, untruncated_ids):
-            removed_text = self.tokenizer_2.batch_decode(untruncated_ids[:, self.tokenizer_max_length - 1 : -1])
+            removed_tokens = untruncated_ids.shape[-1] - text_input_ids.shape[-1]
             logger.warning(
-                "The following part of your input was truncated because `max_sequence_length` is set to "
-                f" {max_sequence_length} tokens: {removed_text}"
+                "The user prompt was truncated because `max_sequence_length` is set to "
+                f" {max_sequence_length} tokens; {removed_tokens} tokens were removed"
             )
 
         prompt_embeds = self.text_encoder_2(text_input_ids.to(device), output_hidden_states=False)[0]
@@ -243,10 +243,10 @@ class FluxKontextPipeline(
         text_input_ids = text_inputs.input_ids
         untruncated_ids = self.tokenizer(prompt, padding="longest", return_tensors="pt").input_ids
         if untruncated_ids.shape[-1] >= text_input_ids.shape[-1] and not torch.equal(text_input_ids, untruncated_ids):
-            removed_text = self.tokenizer.batch_decode(untruncated_ids[:, self.tokenizer_max_length - 1 : -1])
+            removed_tokens = untruncated_ids.shape[-1] - text_input_ids.shape[-1]
             logger.warning(
-                "The following part of your input was truncated because CLIP can only handle sequences up to"
-                f" {self.tokenizer_max_length} tokens: {removed_text}"
+                "The user prompt was truncated because CLIP can only handle sequences up to"
+                f" {self.tokenizer_max_length} tokens; {removed_tokens} tokens were removed"
             )
         prompt_embeds = self.text_encoder(text_input_ids.to(device), output_hidden_states=False)
 
