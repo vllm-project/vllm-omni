@@ -1678,12 +1678,17 @@ truncating ack after an interruption (what was actually heard)
 ```
 
 Send `response_id` or `item_id` to identify the playback being acknowledged.
-For compatibility, an omitted ID can select a sole pending item, the active
-response, or a sole stored assistant item with a response-style `item_<response_id>`
-ID. An imported item with an arbitrary ID is not selected automatically. With no
-identifiable target, an ordinary ACK updates only the current playback cursor;
-a hard ACK (`truncate: true`) returns `bad_event` before changing history or
-playback. Explicitly naming a non-response item still returns
+For compatibility, an omitted ID can select the active response. For a finished
+response, the server can infer a sole pending item, or a sole stored assistant
+item when no items are pending; either must belong to the most recently started
+response associated with current playback. A stored item must also have produced
+audio. The session retains that fact after releasing the full playback records,
+including for replies without text. An imported item's `item_`
+prefix alone does not make it a playback target. An older reply is not selected
+in place of a deleted current item, even if that older reply produced audio;
+send its ID explicitly to acknowledge it. With no identifiable target, an ordinary ACK updates only
+the current playback cursor; a hard ACK (`truncate: true`) returns `bad_event`
+before changing history or playback. Explicitly naming a non-response item still returns
 `playback_item_not_found`. The `truncate` flag is preserved through command
 translation, including the legacy `audio.playback_ack` alias. Once a
 hard-stopped response finishes generating, it no longer blocks `response.create`,

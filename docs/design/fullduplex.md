@@ -66,11 +66,16 @@ for stored history items; deleting or replacing finalized context removes it.
 This distinguishes a retired audio reply from imported context or a reply that never emitted audio
 without retaining its recording or full response snapshot. Realtime commands,
 native truncate signals, and hard playback ACKs reject a no-audio target.
-An ACK's implicit target is resolved before validation or mutation. The sole
-stored-item fallback requires a response-style `item_<response_id>` ID, then
-passes the same ownership validation as an explicit target; an arbitrary imported
-ID is not adopted. Without an identifiable target, ordinary ACKs update only the
-current playback cursor and hard ACKs fail before any history or cursor mutation.
+An ACK's implicit target is resolved before validation or mutation. Pending and
+stored-item fallbacks must match `last_response_id`, which `begin_response`
+updates together with the current playback cursor. A retained older reply cannot
+consume the current reply's ACK, even when it is the only remaining history item.
+The sole stored-item fallback also requires the item's live or retained audio
+provenance, including for audio-only replies, then passes the same ownership
+validation as an explicit target. Imported context without audio provenance is
+not selected, even if its ID starts with `item_`. Without an identifiable target, ordinary ACKs
+update only the current playback cursor and hard ACKs fail before any history or
+cursor mutation.
 The typed `AckPlayback` command preserves the wire `truncate` flag through
 translation and mailbox delivery, so hard stops reach the same handler as
 internal playback controls.

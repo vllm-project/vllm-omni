@@ -44,18 +44,15 @@ def apply_playback_ack(
     elif response_id is None and item_id.startswith("item_"):
         response_id = item_id.removeprefix("item_")
     if response_id is None and item_id is None and len(session.pending_history_item_ids) == 1:
-        item_id = next(iter(session.pending_history_item_ids))
-        if item_id.startswith("item_"):
-            response_id = item_id.removeprefix("item_")
+        pending_item_id = next(iter(session.pending_history_item_ids))
+        # An older pending reply must not consume the current playback's ACK.
+        if pending_item_id == f"item_{session.last_response_id}":
+            item_id = pending_item_id
+            response_id = session.last_response_id
     if response_id is None and item_id is None and session.active_response_id is not None:
         response_id = session.active_response_id
         item_id = f"item_{response_id}"
-    if (
-        response_id is None
-        and item_id is None
-        and not session.pending_history_item_ids
-        and session.last_assistant_full_message is not None
-    ):
+    if response_id is None and item_id is None and not session.pending_history_item_ids:
         # Resolve the legacy single-history-item target before any validation
         # or cursor mutation, just like explicit, pending, and active targets.
         assistant_item_ids = [
@@ -63,11 +60,16 @@ def apply_playback_ack(
             for known_item_id, message in session.history_item_ids.items()
             if message.get("role") == "assistant"
         ]
-        # Imported context with an arbitrary ID cannot identify a response.
-        # Leave it unselected so an ordinary ID-less ACK remains progress-only.
-        if len(assistant_item_ids) == 1 and assistant_item_ids[0].startswith("item_"):
+        # Imported IDs can look like response IDs, and a genuine older reply
+        # can outlive the current item. Require the current response's identity
+        # and audio provenance, including for retired audio-only replies.
+        if (
+            len(assistant_item_ids) == 1
+            and assistant_item_ids[0] == f"item_{session.last_response_id}"
+            and session.history_item_has_audio(assistant_item_ids[0])
+        ):
             item_id = assistant_item_ids[0]
-            response_id = item_id.removeprefix("item_")
+            response_id = session.last_response_id
     audio_only = response_id is not None and session.has_audio_only_response(response_id)
     history_is_late = False
     if response_id is not None:

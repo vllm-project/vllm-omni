@@ -37,7 +37,8 @@ def test_idless_hard_ack_rejects_missing_audio_or_ambiguous_target_without_mutat
 @pytest.mark.asyncio
 @pytest.mark.parametrize("reply_history", ["deleted", "uncommitted", "stored"])
 @pytest.mark.parametrize("hard", [False, True])
-async def test_idless_ack_does_not_adopt_imported_non_response_item(reply_history, hard):
+@pytest.mark.parametrize("item_id", ["imported-context", "item_imported"])
+async def test_idless_ack_does_not_adopt_imported_history(reply_history, hard, item_id):
     h = await open_harness()
     try:
         session = h.session
@@ -55,7 +56,7 @@ async def test_idless_ack_does_not_adopt_imported_non_response_item(reply_histor
         events = await h.run(
             commands.CreateItem(
                 item={
-                    "id": "imported-context",
+                    "id": item_id,
                     "type": "message",
                     "role": "assistant",
                     "content": [{"type": "text", "text": "keep this context"}],
@@ -66,7 +67,7 @@ async def test_idless_ack_does_not_adopt_imported_non_response_item(reply_histor
         assert session.last_assistant_full_message is not None
         assert session.active_response_id is None
         assert not session.pending_history_item_ids
-        assert session.history_item_ids["imported-context"]["content"] == "keep this context"
+        assert session.history_item_ids[item_id]["content"] == "keep this context"
         before = copy.deepcopy((session._conversation, session._playback))
         events = await h.run(
             commands.command_from_realtime({"type": "playback.ack", "played_ms": 200, "truncate": hard})
@@ -81,7 +82,7 @@ async def test_idless_ack_does_not_adopt_imported_non_response_item(reply_histor
             assert events[0].details["history_committed"] is False
             assert session.playback.played_ms == session.playback.committed_ms == 200
             assert session._conversation == before[0]
-        assert session.history_item_ids["imported-context"]["content"] == "keep this context"
+        assert session.history_item_ids[item_id]["content"] == "keep this context"
     finally:
         await close_harness(h)
 
@@ -97,26 +98,7 @@ def test_explicit_ack_for_imported_non_response_item_is_still_rejected(hard):
     assert (session._conversation, session._playback) == before
 
 
-@pytest.mark.parametrize("hard", [False, True])
-def test_idless_ack_preserves_response_style_imported_history(hard):
-    session = _session()
-    session.begin_response()
-    session.append_assistant_text("earlier answer")
-    session.end_response(commit_text=False)
-    session.register_history_item("item_imported", {"role": "assistant", "content": "keep this context"})
-    before = copy.deepcopy((session._conversation, session._playback))
-    events = apply_playback_ack(session, {"played_ms": 200, "truncate": hard})
-    assert len(events) == 1
-    if hard:
-        assert events[0].type == "error" and events[0].code == "bad_event"
-    else:
-        assert events[0].type == "playback.acknowledged"
-        assert events[0].details["item_id"] == "item_imported"
-        assert events[0].details["history_committed"] is False
-    assert (session._conversation, session._playback) == before
-
-
-@pytest.mark.parametrize("target", ["active", "pending", "stored"])
+@pytest.mark.parametrize("target", ["active", "pending", "stored", "retired"])
 @pytest.mark.parametrize("hard", [False, True])
 def test_idless_ack_resolves_one_audio_target_before_mutation(target, hard):
     session = _session()
@@ -127,12 +109,148 @@ def test_idless_ack_resolves_one_audio_target_before_mutation(target, hard):
     session.mark_audio_sent(400, text_chars=5, audio_complete=True)
     if target != "active":
         session.register_history_item(f"item_{response}", session.end_response())
+    if target == "retired":
+        apply_playback_ack(session, {"response_id": response, "played_ms": 400})
+        assert response not in session._playback.by_response
+        assert session.history_item_has_audio(f"item_{response}")
     events = apply_playback_ack(session, {"played_ms": 200 if hard else 400, "truncate": hard})
     assert len(events) == 1 and events[0].type == "playback.acknowledged"
     assert events[0].details["item_id"] == f"item_{response}"
     if target != "active":
         assert session.history_item_ids[f"item_{response}"]["content"] == ("he" if hard else "hello")
         assert response not in session._playback.by_response
+
+
+@pytest.mark.parametrize("hard", [False, True])
+def test_idless_ack_resolves_retired_audio_only_item(hard):
+    session = _session()
+    response = session.begin_response()
+    session.mark_audio_sent(400, audio_complete=True)
+    session.end_response()
+    apply_playback_ack(session, {"response_id": response, "played_ms": 400})
+    item_id = f"item_{response}"
+    assert response not in session._playback.by_response
+    assert not session.pending_history_item_ids
+    assert session.last_assistant_full_message is None
+    assert session.history_item_has_audio(item_id)
+    events = apply_playback_ack(session, {"played_ms": 200 if hard else 400, "truncate": hard})
+    assert len(events) == 1 and events[0].type == "playback.acknowledged"
+    assert events[0].details["item_id"] == item_id
+    assert session.history_item_ids[item_id]["content"] == ""
+    assert response not in session._playback.by_response
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("item_id", ["imported-context", "item_imported"])
+async def test_idless_ack_after_imported_history_allows_next_manual_response(item_id):
+    h = await open_qwen(requires_audio=False)
+    try:
+        await h.run(commands.UpdateSession(patch={"turn_detection": None}))
+        session = h.session
+        session.replace_config(replace(session.config, playback_commit_policy="ack_only"))
+        response = session.begin_response()
+        h.runner.emit(h.runner.model.response_created_payload(response, epoch=session.epoch))
+        session.append_assistant_text("hello")
+        session.mark_audio_sent(400, text_chars=5, audio_complete=True)
+        session.end_response()
+        events = await h.run(commands.DeleteItem(item_id=f"item_{response}"))
+        assert not any(event.type == "error" for event in events), events
+        events = await h.run(
+            commands.CreateItem(
+                item={
+                    "id": item_id,
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "keep this context"}],
+                }
+            )
+        )
+        assert not any(event.type == "error" for event in events), events
+        await h.run(append_audio())
+        await h.run(commands.Commit(final=True, create_response=False))
+        events = await h.run(commands.CreateResponse())
+        assert any(getattr(event, "code", None) == "response_already_active" for event in events)
+        assert not h.port.submissions
+        events = await h.run(commands.command_from_realtime({"type": "playback.ack", "played_ms": 400}))
+        assert len(events) == 1 and events[0].type == "playback.acknowledged"
+        assert events[0].details["item_id"] is None
+        assert session.playback.sent_ms == session.playback.committed_ms == 400
+        assert session.history_item_ids[item_id]["content"] == "keep this context"
+        events = await h.run(commands.CreateResponse())
+        assert not any(event.type == "error" for event in events), events
+        assert len(h.port.submissions) == 1
+        assert session.active_response_id is not None and session.active_response_id != response
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("older_acknowledged", [False, True])
+@pytest.mark.parametrize("hard", [False, True])
+async def test_idless_ack_does_not_select_older_reply_after_current_item_deleted(older_acknowledged, hard):
+    h = await open_qwen(requires_audio=False)
+    try:
+        await h.run(commands.UpdateSession(patch={"turn_detection": None}))
+        session = h.session
+        session.replace_config(replace(session.config, playback_commit_policy="ack_only"))
+        older = session.begin_response()
+        session.append_assistant_text("older answer")
+        session.mark_audio_sent(600, text_chars=12, audio_complete=True)
+        session.end_response()
+        if older_acknowledged:
+            await h.run(commands.AckPlayback(response_id=older, played_ms=600))
+        response = session.begin_response()
+        h.runner.emit(h.runner.model.response_created_payload(response, epoch=session.epoch))
+        session.append_assistant_text("hello")
+        session.mark_audio_sent(400, text_chars=5, audio_complete=True)
+        session.end_response()
+        events = await h.run(commands.DeleteItem(item_id=f"item_{response}"))
+        assert not any(event.type == "error" for event in events), events
+        assert session.history_item_has_audio(f"item_{older}")
+        assert session.last_response_id == response
+        before = copy.deepcopy((session._conversation, session._playback))
+        events = await h.run(
+            commands.command_from_realtime({"type": "playback.ack", "played_ms": 400, "truncate": hard})
+        )
+        assert len(events) == 1
+        if hard:
+            assert events[0].type == "error" and events[0].code == "bad_event"
+            assert (session._conversation, session._playback) == before
+            events = await h.run(commands.AckPlayback(played_ms=400))
+        assert events[0].type == "playback.acknowledged"
+        assert events[0].details["item_id"] is None
+        assert events[0].details["history_committed"] is False
+        assert session._conversation == before[0]
+        assert session._playback.by_response == before[1].by_response
+        assert session.playback.sent_ms == session.playback.committed_ms == 400
+        await h.run(append_audio())
+        await h.run(commands.Commit(final=True, create_response=False))
+        events = await h.run(commands.CreateResponse())
+        assert not any(event.type == "error" for event in events), events
+        assert len(h.port.submissions) == 1
+        assert session.active_response_id is not None and session.active_response_id != response
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.parametrize("hard", [False, True])
+def test_idless_ack_selects_active_reply_instead_of_older_pending_reply(hard):
+    session = _session()
+    session.replace_config(replace(session.config, playback_commit_policy="ack_only"))
+    older = session.begin_response()
+    session.append_assistant_text("older answer")
+    session.mark_audio_sent(600, text_chars=12, audio_complete=True)
+    session.end_response()
+    response = session.begin_response()
+    session.append_assistant_text("hello")
+    session.mark_audio_sent(400, text_chars=5, audio_complete=True)
+    pending_before = dict(session.pending_history_item_ids)
+    events = apply_playback_ack(session, {"played_ms": 200 if hard else 400, "truncate": hard})
+    assert len(events) == 1 and events[0].type == "playback.acknowledged"
+    assert events[0].details["item_id"] == f"item_{response}"
+    assert session.playback.committed_ms == (200 if hard else 400)
+    assert session.playback_for_response(older).committed_ms == 0
+    assert dict(session.pending_history_item_ids) == pending_before
 
 
 @pytest.mark.asyncio
