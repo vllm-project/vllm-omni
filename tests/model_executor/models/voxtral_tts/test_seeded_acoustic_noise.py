@@ -2,9 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import functools
-from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Protocol
 
 import pytest
 import torch
@@ -15,20 +13,10 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 N_ACOUSTIC_CODEBOOK = 3
 
 
-class _GeneratorWithDevice(Protocol):
-    @property
-    def device(self) -> torch.device: ...
-
-
 @dataclass(frozen=True)
 class _ModelArgsStub:
     n_acoustic_codebook: int = N_ACOUSTIC_CODEBOOK
     semantic_codebook_size: int = 2
-
-
-@dataclass(frozen=True)
-class _SamplingMetadataStub:
-    generators: Mapping[int, _GeneratorWithDevice]
 
 
 @dataclass(frozen=True)
@@ -131,18 +119,14 @@ def _generator(seed: int) -> torch.Generator:
     return torch.Generator(device="cpu").manual_seed(seed)
 
 
-def _sampling_metadata(generators: Mapping[int, _GeneratorWithDevice]) -> _SamplingMetadataStub:
-    return _SamplingMetadataStub(generators=generators)
-
-
 def test_same_seed_produces_identical_multi_frame_noise_streams():
     model = _make_voxtral_model()
     hidden = torch.zeros((1, 4))
-    metadata_a = _sampling_metadata({0: _generator(42)})
-    metadata_b = _sampling_metadata({0: _generator(42)})
+    generators_a = {0: _generator(42)}
+    generators_b = {0: _generator(42)}
 
-    frames_a = [model._make_acoustic_noise(hidden, metadata_a) for _ in range(3)]
-    frames_b = [model._make_acoustic_noise(hidden, metadata_b) for _ in range(3)]
+    frames_a = [model._make_acoustic_noise(hidden, generators_a) for _ in range(3)]
+    frames_b = [model._make_acoustic_noise(hidden, generators_b) for _ in range(3)]
 
     for frame_a, frame_b in zip(frames_a, frames_b):
         assert frame_a is not None
@@ -155,8 +139,8 @@ def test_different_seeds_produce_different_noise():
     model = _make_voxtral_model()
     hidden = torch.zeros((1, 4))
 
-    noise_a = model._make_acoustic_noise(hidden, _sampling_metadata({0: _generator(1)}))
-    noise_b = model._make_acoustic_noise(hidden, _sampling_metadata({0: _generator(2)}))
+    noise_a = model._make_acoustic_noise(hidden, {0: _generator(1)})
+    noise_b = model._make_acoustic_noise(hidden, {0: _generator(2)})
 
     assert noise_a is not None
     assert noise_b is not None
@@ -169,11 +153,11 @@ def test_row_reordering_does_not_change_request_noise():
 
     noise_ab = model._make_acoustic_noise(
         hidden,
-        _sampling_metadata({0: _generator(11), 1: _generator(22)}),
+        {0: _generator(11), 1: _generator(22)},
     )
     noise_ba = model._make_acoustic_noise(
         hidden,
-        _sampling_metadata({0: _generator(22), 1: _generator(11)}),
+        {0: _generator(22), 1: _generator(11)},
     )
 
     assert noise_ab is not None
@@ -186,11 +170,11 @@ def test_seeded_row_is_independent_of_unseeded_batch_rows():
     model = _make_voxtral_model()
     standalone = model._make_acoustic_noise(
         torch.zeros((1, 4)),
-        _sampling_metadata({0: _generator(7)}),
+        {0: _generator(7)},
     )
     batched = model._make_acoustic_noise(
         torch.zeros((3, 4)),
-        _sampling_metadata({1: _generator(7)}),
+        {1: _generator(7)},
     )
 
     assert standalone is not None
@@ -198,12 +182,79 @@ def test_seeded_row_is_independent_of_unseeded_batch_rows():
     torch.testing.assert_close(standalone[0], batched[1], atol=0, rtol=0)
 
 
+@pytest.mark.parametrize("use_cuda_graph", [False, True])
+@pytest.mark.parametrize("temperature", [0.0, 0.7])
+@pytest.mark.parametrize("seeded_neighbor", [False, True])
+def test_acoustic_noise_is_independent_of_interleaved_token_sampling(use_cuda_graph, temperature, seeded_neighbor):
+    from vllm.v1.sample.logits_processor import LogitsProcessors
+    from vllm.v1.sample.metadata import SamplingMetadata
+    from vllm.v1.sample.sampler import Sampler
+
+    def frames(batched):
+        model = _make_voxtral_model()
+        graph = _CaptureAcousticGraph() if use_cuda_graph else None
+        model._cudagraph_acoustic_transformer = graph
+        sampler = Sampler()
+        acoustic_generator = _generator(42)
+        token_generator = _generator(42)
+        # Keep A's generator in the token metadata even when A is greedy:
+        # mixed sampling must not be able to advance its acoustic stream.
+        token_generators = {0: token_generator}
+        if batched and seeded_neighbor:
+            token_generators[1] = _generator(17)
+        batch_size = 2 if batched else 1
+        temperatures = torch.tensor([temperature, 1.0] if batched else [temperature])
+        metadata = SamplingMetadata(
+            temperature=temperatures,
+            all_greedy=not batched and temperature == 0,
+            all_random=temperature > 0,
+            top_p=None,
+            top_k=None,
+            generators=token_generators,
+            max_num_logprobs=None,
+            no_penalties=True,
+            prompt_token_ids=None,
+            frequency_penalties=torch.zeros(batch_size),
+            presence_penalties=torch.zeros(batch_size),
+            repetition_penalties=torch.ones(batch_size),
+            output_token_ids=[[] for _ in range(batch_size)],
+            allowed_token_ids_mask=None,
+            bad_words_token_ids={},
+            logitsprocs=LogitsProcessors(),
+        )
+        initial_token_state = token_generator.get_state().clone()
+        for _ in range(3):
+            token_state = token_generator.get_state().clone()
+            model.make_omni_output(
+                torch.zeros((batch_size, 4)),
+                logits_index=torch.arange(batch_size),
+                sampling_metadata=metadata,
+                tts_local_generators={0: acoustic_generator},
+            )
+            torch.testing.assert_close(token_generator.get_state(), token_state, atol=0, rtol=0)
+            acoustic_state = acoustic_generator.get_state().clone()
+            sampled, _ = sampler.sample(torch.tensor([[0.0, 1.0, 2.0, 3.0]]).repeat(batch_size, 1), metadata)
+            if temperature == 0:
+                assert sampled[0].item() == 3
+            torch.testing.assert_close(acoustic_generator.get_state(), acoustic_state, atol=0, rtol=0)
+        if batched or temperature > 0:
+            assert not torch.equal(token_generator.get_state(), initial_token_state)
+        calls = graph.calls if graph is not None else model.model.calls
+        return [call["noise"][0] for call in calls]
+
+    standalone = frames(False)
+    mixed_batch = frames(True)
+    for alone, batched in zip(standalone, mixed_batch, strict=True):
+        torch.testing.assert_close(alone, batched, atol=0, rtol=0)
+    assert not torch.equal(standalone[0], standalone[1])
+
+
 def test_missing_active_generator_uses_legacy_noise_path():
     model = _make_voxtral_model()
 
     assert model._make_acoustic_noise(torch.zeros((2, 4)), None) is None
-    assert model._make_acoustic_noise(torch.zeros((2, 4)), _sampling_metadata({})) is None
-    assert model._make_acoustic_noise(torch.zeros((2, 4)), _sampling_metadata({4: _generator(3)})) is None
+    assert model._make_acoustic_noise(torch.zeros((2, 4)), {}) is None
+    assert model._make_acoustic_noise(torch.zeros((2, 4)), {4: _generator(3)}) is None
 
 
 def test_generator_device_mismatch_fails_with_row_context():
@@ -213,7 +264,7 @@ def test_generator_device_mismatch_fails_with_row_context():
     with pytest.raises(RuntimeError, match=r"row 0.*cuda:1.*cpu"):
         model._make_acoustic_noise(
             torch.zeros((1, 4)),
-            _sampling_metadata({0: incompatible_generator}),
+            {0: incompatible_generator},
         )
 
 
@@ -230,7 +281,7 @@ def test_make_omni_output_maps_generators_to_selected_rows(use_cuda_graph):
     model.make_omni_output(
         hidden_states,
         logits_index=logits_index,
-        sampling_metadata=_sampling_metadata(generators),
+        tts_local_generators=generators,
         sampling_extra_args=[{}, {}],
     )
 

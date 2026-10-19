@@ -107,8 +107,8 @@ class VoxtralTTSForConditionalGeneration(
     SupportsMultiModal,
     CustomProcessMixin,
 ):
-    # Voxtral consumes request-local randomness outside the vLLM token sampler,
-    # including when stage-0 token sampling is greedy.
+    # Acoustic randomness must have its own request-local stream, independent
+    # of the vLLM token sampler even when stage-0 token sampling is greedy.
     requires_tts_local_generator = True
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
@@ -373,14 +373,13 @@ class VoxtralTTSForConditionalGeneration(
     def _make_acoustic_noise(
         self,
         input_hidden_states: torch.Tensor,
-        sampling_metadata: SamplingMetadata | None,
+        generators: Mapping[int, torch.Generator] | None,
     ) -> torch.Tensor | None:
-        """Build row-local acoustic noise from active request generators.
+        """Build row-local noise from acoustic-only request generators.
 
         Returning ``None`` preserves the legacy batched/global RNG path when
         none of the active rows has a request-owned generator.
         """
-        generators = getattr(sampling_metadata, "generators", None)
         if not generators:
             return None
 
@@ -420,7 +419,7 @@ class VoxtralTTSForConditionalGeneration(
         self,
         model_outputs: torch.Tensor | OmniOutput | tuple,
         logits_index: torch.Tensor | int | None = None,
-        sampling_metadata: SamplingMetadata | None = None,
+        tts_local_generators: Mapping[int, torch.Generator] | None = None,
         **kwargs,
     ) -> OmniOutput:
         if isinstance(model_outputs, torch.Tensor):
@@ -431,7 +430,7 @@ class VoxtralTTSForConditionalGeneration(
                 cfg_alpha = self._extract_cfg_alpha(input_hidden_states, **kwargs)
                 noise = self._make_acoustic_noise(
                     input_hidden_states,
-                    sampling_metadata,
+                    tts_local_generators,
                 )
                 if self._cudagraph_acoustic_transformer is not None:
                     fake_eos, multimodal_outputs = self._cudagraph_acoustic_transformer(
