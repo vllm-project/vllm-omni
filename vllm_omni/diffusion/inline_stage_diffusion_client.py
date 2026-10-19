@@ -244,7 +244,7 @@ class InlineStageDiffusionClient(StageClientBase):
     ) -> Any:
         # Playback only updates condition-protected host state. A worker RPC
         # may occupy the single executor thread for a whole GPU chunk.
-        if method in ("update_streaming_playback", "release_streaming_output"):
+        if method in ("update_streaming_playback", "track_streaming_interaction", "release_streaming_output"):
             return getattr(self._engine, method)(*args, **(kwargs or {}))
 
         loop = asyncio.get_running_loop()
