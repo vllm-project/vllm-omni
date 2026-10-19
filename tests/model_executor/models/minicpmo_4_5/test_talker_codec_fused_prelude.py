@@ -6,9 +6,9 @@ The fused Triton kernel is the default stage-1 codec sampling prologue on NPU
 (``TALKER_CODEC_FUSED_PRELUDE=1``). These tests compare it against the eager
 chain it replaces (``_repetition_penalty_scaling`` + ``logits / temperature``)
 through the public ``prepare_codec_logits`` entry point with the fused switch
-forced on and off, and additionally capture and replay the fused path under a
-CUDA graph -- a Triton launch under graph capture is a different support path
-from an eager launch.
+forced on and off, and additionally capture and replay the fused path under an
+NPU graph (``torch.npu.NPUGraph``) -- a Triton launch under graph capture is a
+different support path from an eager launch.
 
 Everything is skipped outside NPU+Triton: the eager chain runs anywhere, but
 the parity claim these tests guard is only made where the fused path ships.
@@ -21,20 +21,32 @@ import torch
 
 from tests.helpers.mark import hardware_marks
 from vllm_omni.model_executor.models.minicpmo_4_5 import talker_codec_sample as tcs
+from vllm_omni.platforms import current_omni_platform
 
-pytestmark = [pytest.mark.core_model, *hardware_marks(res={"npu": "A3"}, num_cards=1)]
+pytestmark = [
+    pytest.mark.core_model,
+    *hardware_marks(res={"npu": "A3"}, num_cards=1),
+    pytest.mark.skipif(not current_omni_platform.is_npu(), reason="requires Ascend NPU"),
+]
 
 
 def _npu_and_triton_available() -> bool:
     return (hasattr(torch, "npu") and torch.npu.is_available()) and tcs._HAS_TRITON
 
 
-_DEVICE = torch.device("npu")
+def _device() -> torch.device:
+    """Build the NPU device lazily.
+
+    ``torch.device("npu")`` raises at import time when ``torch_npu`` has not
+    registered the backend, which would turn collection on a CPU/GPU host into
+    a collection error instead of a skip. Module scope must stay free of it.
+    """
+    return torch.device("npu")
 
 
 def _make_state(codes: list[int]) -> tcs.TalkerCodecDeviceState:
     return tcs.make_device_state(
-        torch.tensor(codes, dtype=torch.int32, device=_DEVICE),
+        torch.tensor(codes, dtype=torch.int32, device=_device()),
         step=0,
         max_tokens=100,
         finished=False,
@@ -45,11 +57,12 @@ def _run_both(raw_logits, state, repetition_penalty, temperature):
     """Run prepare_codec_logits with the fused switch on and off, return both.
 
     The switch is read once at import, so tests flip the module attribute
-    directly (monkeypatch restores it).
+    directly and restore it in a try/finally.
     """
+    device = _device()
     common = dict(
         state=state,
-        min_tokens=torch.tensor([0], dtype=torch.int32, device=_DEVICE),
+        min_tokens=torch.tensor([0], dtype=torch.int32, device=device),
         temperature=temperature,
         repetition_penalty=repetition_penalty,
         eos_token_id=0,
@@ -88,9 +101,10 @@ CASES: dict[str, dict[str, Any]] = {
 @pytest.mark.parametrize("case_name", sorted(CASES))
 @pytest.mark.skipif(not _npu_and_triton_available(), reason="requires NPU + Triton")
 def test_fused_prelude_bit_exact_eager(case_name):
+    device = _device()
     cfg = CASES[case_name]
     state = _make_state(cfg["codes"])
-    raw = torch.randn(1, tcs.VOCAB_SIZE, device=_DEVICE)
+    raw = torch.randn(1, tcs.VOCAB_SIZE, device=device)
     if cfg["neg"]:
         raw = -raw.abs() - 0.5
     if cfg["neg_inf"]:
@@ -100,8 +114,8 @@ def test_fused_prelude_bit_exact_eager(case_name):
     fused, eager = _run_both(
         raw,
         state,
-        torch.tensor([cfg["rep"]], dtype=torch.float32, device=_DEVICE),
-        torch.tensor([cfg["temp"]], dtype=torch.float32, device=_DEVICE),
+        torch.tensor([cfg["rep"]], dtype=torch.float32, device=device),
+        torch.tensor([cfg["temp"]], dtype=torch.float32, device=device),
     )
     assert torch.equal(fused, eager)
 
@@ -117,15 +131,18 @@ def test_fused_prelude_bit_exact_under_graph_capture_and_replay():
     stop_index tensor per call (H2D from a Python tuple), which is not a
     capture-safe pattern and is independent of the fused prelude.
 
-    Replay output must match the eager chain bit-for-bit on the replayed
-    inputs, and the capture-phase output must match the eager chain on the
-    captured inputs.
+    The eager warmup launch (which also compiles the kernel) is asserted on the
+    captured inputs. The capture-phase output itself is not asserted -- graph
+    capture records ops without executing them -- so the assertion that matters
+    is the replay output matching the eager chain bit-for-bit on the replayed
+    inputs.
     """
+    device = _device()
     state = _make_state([3, 1, 4, 1, 5, 9, 2, 6])
-    rep = torch.tensor([1.2], dtype=torch.float32, device=_DEVICE)
-    temp = torch.tensor([0.9], dtype=torch.float32, device=_DEVICE)
-    raw_a = torch.randn(1, tcs.VOCAB_SIZE, device=_DEVICE)
-    raw_b = torch.randn(1, tcs.VOCAB_SIZE, device=_DEVICE)
+    rep = torch.tensor([1.2], dtype=torch.float32, device=device)
+    temp = torch.tensor([0.9], dtype=torch.float32, device=device)
+    raw_a = torch.randn(1, tcs.VOCAB_SIZE, device=device)
+    raw_b = torch.randn(1, tcs.VOCAB_SIZE, device=device)
     raw_b[:, 0] = 0.0
 
     def _eager(x):
