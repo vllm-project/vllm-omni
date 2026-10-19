@@ -1,13 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-from types import SimpleNamespace
+from pathlib import Path
 
 import pytest
 import torch
 import torch.nn as nn
+from diffusers.schedulers.scheduling_flow_match_euler_discrete import (
+    FlowMatchEulerDiscreteScheduler,
+)
 
 from vllm_omni.diffusion.cache.teacache.extractors import CacheContext, get_extractor
+from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.models.sd3.pipeline_sd3 import StableDiffusion3Pipeline
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -102,33 +107,43 @@ def test_sd3_extractor_returns_valid_context() -> None:
     assert output[0].shape == (1, 4, 4, 4)
 
 
+class _FlagRecordingTransformer(nn.Module):
+    """Records the do_true_cfg flag that the TeaCache hook would read on each call."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.flags_seen: list[bool | None] = []
+
+    def forward(self, hidden_states: torch.Tensor, **kwargs: object) -> tuple[torch.Tensor]:
+        self.flags_seen.append(getattr(self, "do_true_cfg", None))
+        return (torch.ones_like(hidden_states),)
+
+
+class _SD3DiffuseHarness(CFGParallelMixin):
+    """The attributes StableDiffusion3Pipeline.diffuse reads, with the real shared CFG helper."""
+
+    interrupt = False
+    device = torch.device("cpu")
+
+    def __init__(self, od_config: OmniDiffusionConfig) -> None:
+        self.od_config = od_config
+        self.transformer = _FlagRecordingTransformer()
+        self.scheduler = FlowMatchEulerDiscreteScheduler()
+
+
 @pytest.mark.parametrize("do_true_cfg", [True, False])
-def test_sd3_diffuse_marks_cfg_branches_for_teacache(do_true_cfg: bool) -> None:
-    """The TeaCache hook reads transformer.do_true_cfg to keep positive/negative states apart."""
-    transformer = SimpleNamespace(do_true_cfg=None)
-    flags_seen_by_predict: list[bool | None] = []
-
-    def predict_noise_maybe_with_cfg(do_cfg, guidance_scale, positive_kwargs, negative_kwargs, cfg_normalize):
-        flags_seen_by_predict.append(transformer.do_true_cfg)
-        assert (negative_kwargs is not None) == do_cfg
-        return torch.zeros_like(positive_kwargs["hidden_states"])
-
-    pipeline = SimpleNamespace(
-        scheduler=SimpleNamespace(set_begin_index=lambda index: None),
-        interrupt=False,
-        device=torch.device("cpu"),
-        od_config=SimpleNamespace(dtype=torch.float32),
-        transformer=transformer,
-        predict_noise_maybe_with_cfg=predict_noise_maybe_with_cfg,
-        scheduler_step_maybe_with_cfg=lambda noise_pred, t, latents, do_cfg: latents,
-    )
+def test_sd3_diffuse_marks_cfg_branches_for_teacache(do_true_cfg: bool, tmp_path: Path) -> None:
+    """SD3 relies on the shared CFG helper to set transformer.do_true_cfg, which the
+    TeaCache hook reads to keep the positive and negative states apart."""
+    harness = _SD3DiffuseHarness(OmniDiffusionConfig(model=str(tmp_path), dtype=torch.float32))
+    harness.scheduler.set_timesteps(3)
     embeds = torch.zeros((1, 2, 3))
     pooled = torch.zeros((1, 3))
 
     StableDiffusion3Pipeline.diffuse(
-        pipeline,
+        harness,
         latents=torch.zeros((1, 4, 4, 4)),
-        timesteps=torch.tensor([1000.0, 500.0, 1.0]),
+        timesteps=harness.scheduler.timesteps,
         prompt_embeds=embeds,
         pooled_prompt_embeds=pooled,
         negative_prompt_embeds=embeds if do_true_cfg else None,
@@ -137,4 +152,6 @@ def test_sd3_diffuse_marks_cfg_branches_for_teacache(do_true_cfg: bool) -> None:
         guidance_scale=4.5 if do_true_cfg else 1.0,
     )
 
-    assert flags_seen_by_predict == [do_true_cfg] * 3
+    # Three steps; with CFG each step calls the transformer for both branches.
+    calls_per_step = 2 if do_true_cfg else 1
+    assert harness.transformer.flags_seen == [do_true_cfg] * (3 * calls_per_step)
