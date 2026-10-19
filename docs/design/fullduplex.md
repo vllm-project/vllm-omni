@@ -66,9 +66,14 @@ for stored history items; deleting or replacing finalized context removes it.
 This distinguishes a retired audio reply from imported context or a reply that never emitted audio
 without retaining its recording or full response snapshot. Realtime commands,
 native truncate signals, and hard playback ACKs reject a no-audio target.
-An ACK's implicit target is resolved before validation or mutation; a hard ACK
-without one identifiable audio item is rejected rather than editing the current
-cursor and choosing history afterward.
+An ACK's implicit target is resolved before validation or mutation. The sole
+stored-item fallback requires a response-style `item_<response_id>` ID, then
+passes the same ownership validation as an explicit target; an arbitrary imported
+ID is not adopted. Without an identifiable target, ordinary ACKs update only the
+current playback cursor and hard ACKs fail before any history or cursor mutation.
+The typed `AckPlayback` command preserves the wire `truncate` flag through
+translation and mailbox delivery, so hard stops reach the same handler as
+internal playback controls.
 
 History edits pass the item's own timing marks and playback cursor explicitly;
 the text-prefix calculation never reads the active response implicitly. If both

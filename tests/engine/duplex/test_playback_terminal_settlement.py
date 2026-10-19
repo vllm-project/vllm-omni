@@ -134,15 +134,16 @@ async def test_truncation_preserves_bounded_calibration_owner(use_truncate_item,
         if use_truncate_item:
             events = await h.run(commands.TruncateItem(item_id=f"item_{response}", audio_end_ms=200))
         else:
-            await h.runner._run_internal_payload(
-                {
-                    "type": "playback.ack",
-                    "response_id": response,
-                    "played_ms": 200,
-                    "truncate": True,
-                }
+            events = await h.run(
+                commands.command_from_realtime(
+                    {
+                        "type": "playback.ack",
+                        "response_id": response,
+                        "played_ms": 200,
+                        "truncate": True,
+                    }
+                )
             )
-            events = await h.settle()
         assert not any(event.type == "error" for event in events)
         if calibration_enabled:
             controller = h.runner.ctx.history_calibration

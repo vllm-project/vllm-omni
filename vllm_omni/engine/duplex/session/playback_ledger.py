@@ -63,10 +63,11 @@ def apply_playback_ack(
             for known_item_id, message in session.history_item_ids.items()
             if message.get("role") == "assistant"
         ]
-        if len(assistant_item_ids) == 1:
+        # Imported context with an arbitrary ID cannot identify a response.
+        # Leave it unselected so an ordinary ID-less ACK remains progress-only.
+        if len(assistant_item_ids) == 1 and assistant_item_ids[0].startswith("item_"):
             item_id = assistant_item_ids[0]
-            if item_id.startswith("item_"):
-                response_id = item_id.removeprefix("item_")
+            response_id = item_id.removeprefix("item_")
     audio_only = response_id is not None and session.has_audio_only_response(response_id)
     history_is_late = False
     if response_id is not None:

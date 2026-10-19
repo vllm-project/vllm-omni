@@ -1679,8 +1679,13 @@ truncating ack after an interruption (what was actually heard)
 
 Send `response_id` or `item_id` to identify the playback being acknowledged.
 For compatibility, an omitted ID can select a sole pending item, the active
-response, or a sole stored assistant item. A hard ACK with no identifiable audio
-target returns `bad_event` before changing history or playback. Once a
+response, or a sole stored assistant item with a response-style `item_<response_id>`
+ID. An imported item with an arbitrary ID is not selected automatically. With no
+identifiable target, an ordinary ACK updates only the current playback cursor;
+a hard ACK (`truncate: true`) returns `bad_event` before changing history or
+playback. Explicitly naming a non-response item still returns
+`playback_item_not_found`. The `truncate` flag is preserved through command
+translation, including the legacy `audio.playback_ack` alias. Once a
 hard-stopped response finishes generating, it no longer blocks `response.create`,
 including while its history-calibration evidence is retained. An ordinary
 partial ACK still means playback is in progress.
