@@ -46,6 +46,14 @@ if is_available():
         BLOCK_H: tl.constexpr,
         BLOCK_D: tl.constexpr,
         BLOCK_N: tl.constexpr,
+        K_STRIDE_BLOCK: tl.constexpr,
+        K_STRIDE_TOKEN: tl.constexpr,
+        K_STRIDE_HEAD: tl.constexpr,
+        K_STRIDE_DIM: tl.constexpr,
+        V_STRIDE_BLOCK: tl.constexpr,
+        V_STRIDE_TOKEN: tl.constexpr,
+        V_STRIDE_HEAD: tl.constexpr,
+        V_STRIDE_DIM: tl.constexpr,
         GUARD_MAX_SEQ_LEN: tl.constexpr,
     ):
         batch_id = tl.program_id(0)
@@ -80,14 +88,23 @@ if is_available():
                 other=0,
             )
 
-            kv_offsets = (
-                (physical_block[:, None] * 16 + block_offset[:, None]) * NUM_KV_HEADS + kv_head
-            ) * BLOCK_D + offs_d[None, :]
-            k = tl.load(K + kv_offsets, mask=mask_n[:, None], other=0.0)
+            k_offsets = (
+                physical_block[:, None] * K_STRIDE_BLOCK
+                + block_offset[:, None] * K_STRIDE_TOKEN
+                + kv_head * K_STRIDE_HEAD
+                + offs_d[None, :] * K_STRIDE_DIM
+            )
+            k = tl.load(K + k_offsets, mask=mask_n[:, None], other=0.0)
             qk = tl.dot(q, tl.trans(k)) * SCALE
             qk = tl.where(mask_h[:, None] & mask_n[None, :], qk, -float("inf"))
 
-            v = tl.load(V + kv_offsets, mask=mask_n[:, None], other=0.0)
+            v_offsets = (
+                physical_block[:, None] * V_STRIDE_BLOCK
+                + block_offset[:, None] * V_STRIDE_TOKEN
+                + kv_head * V_STRIDE_HEAD
+                + offs_d[None, :] * V_STRIDE_DIM
+            )
+            v = tl.load(V + v_offsets, mask=mask_n[:, None], other=0.0)
             m_new = tl.maximum(m_i, tl.max(qk, axis=1))
             p = tl.exp(qk - m_new[:, None])
             alpha = tl.exp(m_i - m_new)
@@ -119,6 +136,14 @@ if is_available():
         BLOCK_H: tl.constexpr,
         BLOCK_D: tl.constexpr,
         BLOCK_N: tl.constexpr,
+        K_STRIDE_BLOCK: tl.constexpr,
+        K_STRIDE_TOKEN: tl.constexpr,
+        K_STRIDE_HEAD: tl.constexpr,
+        K_STRIDE_DIM: tl.constexpr,
+        V_STRIDE_BLOCK: tl.constexpr,
+        V_STRIDE_TOKEN: tl.constexpr,
+        V_STRIDE_HEAD: tl.constexpr,
+        V_STRIDE_DIM: tl.constexpr,
         SPLIT_TOKENS: tl.constexpr,
         BATCH_SIZE: tl.constexpr,
         MIN_SEQ_LEN: tl.constexpr,
@@ -165,14 +190,23 @@ if is_available():
                 other=0,
             )
 
-            kv_offsets = (
-                (physical_block[:, None] * 16 + block_offset[:, None]) * NUM_KV_HEADS + kv_head
-            ) * BLOCK_D + offs_d[None, :]
-            k = tl.load(K + kv_offsets, mask=mask_n[:, None], other=0.0)
+            k_offsets = (
+                physical_block[:, None] * K_STRIDE_BLOCK
+                + block_offset[:, None] * K_STRIDE_TOKEN
+                + kv_head * K_STRIDE_HEAD
+                + offs_d[None, :] * K_STRIDE_DIM
+            )
+            k = tl.load(K + k_offsets, mask=mask_n[:, None], other=0.0)
             qk = tl.dot(q, tl.trans(k)) * SCALE
             qk = tl.where(mask_h[:, None] & mask_n[None, :], qk, -float("inf"))
 
-            v = tl.load(V + kv_offsets, mask=mask_n[:, None], other=0.0)
+            v_offsets = (
+                physical_block[:, None] * V_STRIDE_BLOCK
+                + block_offset[:, None] * V_STRIDE_TOKEN
+                + kv_head * V_STRIDE_HEAD
+                + offs_d[None, :] * V_STRIDE_DIM
+            )
+            v = tl.load(V + v_offsets, mask=mask_n[:, None], other=0.0)
             m_new = tl.maximum(m_i, tl.max(qk, axis=1))
             p = tl.exp(qk - m_new[:, None])
             alpha = tl.exp(m_i - m_new)
@@ -265,6 +299,8 @@ def fish_decode_kvcache_attn_triton(
     kv_group = num_q_heads // num_kv_heads
     block_h = triton.next_power_of_2(kv_group)
     max_blocks_per_seq = block_table.shape[1]
+    k_stride_block, k_stride_token, k_stride_head, k_stride_dim = key_cache.stride()
+    v_stride_block, v_stride_token, v_stride_head, v_stride_dim = value_cache.stride()
 
     if max_seq_len <= small_path_max_seq_len:
         _small_decode_kernel[(batch_size, num_kv_heads)](
@@ -283,6 +319,14 @@ def fish_decode_kvcache_attn_triton(
             BLOCK_H=block_h,
             BLOCK_D=head_dim,
             BLOCK_N=_BLOCK_N,
+            K_STRIDE_BLOCK=k_stride_block,
+            K_STRIDE_TOKEN=k_stride_token,
+            K_STRIDE_HEAD=k_stride_head,
+            K_STRIDE_DIM=k_stride_dim,
+            V_STRIDE_BLOCK=v_stride_block,
+            V_STRIDE_TOKEN=v_stride_token,
+            V_STRIDE_HEAD=v_stride_head,
+            V_STRIDE_DIM=v_stride_dim,
             GUARD_MAX_SEQ_LEN=0,
             num_warps=4,
             num_stages=3,
@@ -305,6 +349,14 @@ def fish_decode_kvcache_attn_triton(
         BLOCK_H=block_h,
         BLOCK_D=head_dim,
         BLOCK_N=_BLOCK_N,
+        K_STRIDE_BLOCK=k_stride_block,
+        K_STRIDE_TOKEN=k_stride_token,
+        K_STRIDE_HEAD=k_stride_head,
+        K_STRIDE_DIM=k_stride_dim,
+        V_STRIDE_BLOCK=v_stride_block,
+        V_STRIDE_TOKEN=v_stride_token,
+        V_STRIDE_HEAD=v_stride_head,
+        V_STRIDE_DIM=v_stride_dim,
         GUARD_MAX_SEQ_LEN=small_path_max_seq_len,
         num_warps=4,
         num_stages=3,
@@ -333,6 +385,14 @@ def fish_decode_kvcache_attn_triton(
         BLOCK_H=block_h,
         BLOCK_D=head_dim,
         BLOCK_N=_BLOCK_N,
+        K_STRIDE_BLOCK=k_stride_block,
+        K_STRIDE_TOKEN=k_stride_token,
+        K_STRIDE_HEAD=k_stride_head,
+        K_STRIDE_DIM=k_stride_dim,
+        V_STRIDE_BLOCK=v_stride_block,
+        V_STRIDE_TOKEN=v_stride_token,
+        V_STRIDE_HEAD=v_stride_head,
+        V_STRIDE_DIM=v_stride_dim,
         SPLIT_TOKENS=long_split_tokens,
         BATCH_SIZE=batch_size,
         MIN_SEQ_LEN=small_path_max_seq_len + 1,
