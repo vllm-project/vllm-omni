@@ -22,6 +22,13 @@ ONNX backend per model and one detector per session, fed 16 kHz chunks.
      utterance. Any commit before the end is a false cutoff.
 6. Resident memory added by loading each model.
 
+`false_cutoffs` and `endpoint_delay_ms` use the cumulative PCM position of each
+commit segment, including multiple commits inside one append. The JSON field
+`append_endpoint_delay_ms` separately measures the final commit at the enclosing
+append's end, including the wait to collect that chunk. Both are audio-time
+measurements and exclude model compute and network latency. Detector wall time
+is reported separately under chunk cost.
+
 ## Labeled clips
 
 The endpoint scenarios need clips labeled complete/incomplete, for example a

@@ -253,7 +253,10 @@ or is cancelled. If its ACK arrives before a later input, an empty assistant
 message preserves the turn boundary. A late ACK can update playback without
 appending the old turn after the newer input. Neither case commits answer text
 (`history_committed` remains false); a full ACK releases the response's pending
-playback and history state.
+playback and history state. While an older response is still draining audio,
+an ACK that catches up with the audio sent so far keeps its playback and history
+snapshot alive, including when its transcript is temporarily empty. Later text
+and audio still belong to that response; cleanup waits until the drain has ended.
 
 ### Interrupt
 

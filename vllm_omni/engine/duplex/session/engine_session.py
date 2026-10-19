@@ -504,6 +504,9 @@ class DuplexEngineSession:
         return tuple(self._conversation.last_assistant_audio_text_marks)
 
     def has_audio_only_response(self, response_id: str) -> bool:
+        # A draining snapshot can still receive text after its first audio ACK.
+        if self.response_has_draining_request(response_id):
+            return False
         snapshot = self._conversation.assistant_response_snapshots.get(response_id)
         return snapshot is not None and snapshot[0].get("content") == ""
 

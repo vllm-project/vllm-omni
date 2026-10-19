@@ -91,3 +91,38 @@ def test_local_model_paths_produce_endpoint_report_without_cache_or_torch_fallba
     assert 500 <= endpoints["server_vad"]["endpoint_delay_ms"] <= 700
     assert 1200 <= endpoints["semantic_vad"]["endpoint_delay_ms"] <= 1400
     assert endpoints["semantic_vad"]["smart_turn_calls"] == 1
+
+
+@pytest.mark.parametrize("kind", ["server_vad", "semantic_vad"])
+@pytest.mark.parametrize("chunk_ms", [100, 127, 10_000])
+def test_endpoint_report_counts_commit_before_continuation_in_same_append(monkeypatch, kind, chunk_ms):
+    from vllm_omni.engine.duplex.turn_detection import SemanticTurnDetector, ServerTurnDetector, TurnDetectionConfig
+
+    class _SileroBackend:
+        def new_state(self):
+            return object()
+
+        def infer(self, frame, state):
+            return (0.95 if np.max(np.abs(frame)) > 0.1 else 0.02), state
+
+    provider = vad.SileroVADBackendProvider()
+    backend = _SileroBackend()
+    monkeypatch.setattr(provider, "get", lambda: backend)
+    config = TurnDetectionConfig.from_realtime({"type": kind})
+    if kind == "server_vad":
+        detector = ServerTurnDetector(config, backend_provider=provider)
+    else:
+        detector = SemanticTurnDetector(config, backend_provider=provider, turn_scorer=lambda _: 0.9)
+    # Two 1 s speech intervals separated by 2 s silence. A 10 s append
+    # contains both commits; the first must still count as an early cutoff.
+    audio = np.concatenate([np.full(16000, 0.2), np.zeros(32000), np.full(16000, 0.2)]).astype(np.float32)
+    script = Path(__file__).resolve().parents[3] / "benchmarks/duplex_vad/bench_vad_latency.py"
+    bench = runpy.run_path(str(script))
+    row = bench["_endpoint_row"](detector, audio, chunk_ms, provider)
+    assert row["false_cutoffs"] == 1
+    expected = 500 if kind == "server_vad" else 1200
+    assert expected <= row["endpoint_delay_ms"] <= expected + 100
+    assert row["smart_turn_calls"] == (2 if kind == "semantic_vad" else 0)
+    assert row["append_endpoint_delay_ms"] >= row["endpoint_delay_ms"]
+    if chunk_ms == 10_000:
+        assert row["append_endpoint_delay_ms"] == 5500

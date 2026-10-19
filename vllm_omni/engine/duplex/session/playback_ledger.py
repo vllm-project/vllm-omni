@@ -140,7 +140,13 @@ def apply_playback_ack(session: DuplexEngineSession, event: dict[str, object]) -
             }
         )
     ]
-    if (committed_history or audio_only) and committed_cursor >= max(playback.sent_ms, playback.generated_ms):
+    # Catching up with the audio sent so far does not finish a draining response.
+    # Keep its snapshot and cursor for subsequent text/audio until the drain ends.
+    if (
+        (committed_history or audio_only)
+        and committed_cursor >= max(playback.sent_ms, playback.generated_ms)
+        and not session.response_has_draining_request(response_id)
+    ):
         session.release_response_playback(response_id)
         session.release_response_history_snapshot(response_id)
     return events

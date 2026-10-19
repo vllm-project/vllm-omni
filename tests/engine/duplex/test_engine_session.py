@@ -1321,16 +1321,68 @@ def test_draining_response_stays_ack_admissible_after_next_begin_response() -> N
     assert session.playback.sent_ms == 0
 
 
-def test_finished_drain_keeps_sent_audio_ackable() -> None:
+@pytest.mark.parametrize("initial_text", ["", "Hello"])
+@pytest.mark.parametrize("aligned_audio", [False, True])
+def test_caught_up_ack_preserves_draining_text_and_playback(initial_text, aligned_audio):
+    session = _session(config=DuplexSessionConfig(playback_commit_policy="ack_only"))
+    first_user = session.commit_audio_input(transcript="first question")
+    first = session.begin_response(turn_id=1)
+    session.append_assistant_text(initial_text)
+    session.mark_audio_sent(
+        400,
+        text_chars=len(initial_text) if aligned_audio else None,
+        text_requires_complete_audio=not aligned_audio,
+    )
+    session.bind_draining_request("first-tts", first)
+    session.snapshot_active_response_for_drain()
+    second_user = session.commit_audio_input(transcript="next question")
+    second = session.begin_response(turn_id=2)
+    session.mark_audio_sent(200)
+    second_playback = session.playback
+
+    ack = apply_playback_ack(session, {"response_id": first, "played_ms": 400})
+    assert ack[0].type == "playback.acknowledged"
+    assert first in session._conversation.assistant_response_snapshots
+    assert first in session._playback.by_response
+    assert not session.has_audio_only_response(first)
+    assert session.playback_for_response(first).committed_ms == 400
+
+    session.append_draining_assistant_text(first, " world")
+    text = initial_text + " world"
+    session.mark_audio_sent(
+        900,
+        text_chars=len(text) if aligned_audio else None,
+        response_id=first,
+        audio_complete=True,
+    )
+    assert session.assistant_transcript(first) == text
+    assert session.playback_for_response(first).committed_ms == 400
+    assert session.pop_draining_request("first-tts") == first
+    session.release_finished_drain_response(first)
+    ack = apply_playback_ack(session, {"response_id": first, "played_ms": 900})
+    assert ack[0].type == "playback.acknowledged"
+    assert ack[0].details["history_committed"] is True
+    assert session.history == (first_user.message, {"role": "assistant", "content": text}, second_user.message)
+    assert first not in session._conversation.assistant_response_snapshots
+    assert first not in session._playback.by_response
+    assert f"item_{first}" not in session.pending_history_item_ids
+    assert session.active_response_id == second
+    assert session.playback == second_playback
+
+
+@pytest.mark.parametrize("text", ["hello", ""])
+def test_finished_drain_keeps_sent_audio_ackable(text) -> None:
     from vllm_omni.engine.duplex.events import ErrorEvent
     from vllm_omni.engine.duplex.session.playback_ledger import apply_playback_ack
 
     session = _session()
     first = session.begin_response(turn_id=1)
-    session.append_assistant_text("hello")
-    session.mark_audio_sent(400, text_chars=5)
+    session.append_assistant_text(text)
+    session.mark_audio_sent(400, text_chars=len(text))
+    session.bind_draining_request("first-tts", first)
     session.snapshot_active_response_for_drain()
     second = session.begin_response(turn_id=2)
+    assert session.pop_draining_request("first-tts") == first
     session.release_finished_drain_response(first)
     assert first in session._conversation.assistant_response_snapshots
     assert f"item_{first}" in session._conversation.history_item_placeholders
@@ -1346,6 +1398,9 @@ def test_finished_drain_keeps_sent_audio_ackable() -> None:
     )
     assert not any(isinstance(event, ErrorEvent) for event in events)
     assert session.active_response_id == second
+    assert session.history == ({"role": "assistant", "content": text},)
+    assert first not in session._conversation.assistant_response_snapshots
+    assert first not in session._playback.by_response
 
     silent = session.begin_response(turn_id=3)
     session.snapshot_active_response_for_drain()

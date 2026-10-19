@@ -45,7 +45,7 @@ from pathlib import Path
 import numpy as np
 
 from vllm_omni.engine.duplex.smart_turn import SmartTurnBackendProvider
-from vllm_omni.engine.duplex.turn_detection import TurnDetectionConfig
+from vllm_omni.engine.duplex.turn_detection import TurnDetectionConfig, TurnDetectionResult
 from vllm_omni.engine.duplex.vad import SileroVADBackendProvider
 
 RATE = 16_000
@@ -180,8 +180,10 @@ def _detector(kind: str, silero_provider, smart_turn_provider):
     return config.build_detector(silero_provider, smart_turn_provider)
 
 
-def stream(detector, audio: np.ndarray, chunk_ms: int) -> list[tuple[int, list, float]]:
-    """Feed audio then 9 s of silence; return (chunk end ms, decisions, wall seconds)."""
+def stream(
+    detector, audio: np.ndarray, chunk_ms: int
+) -> list[tuple[int, list[tuple[int, TurnDetectionResult]], float]]:
+    """Return (append end ms, [(segment end ms, decision)], detector wall seconds)."""
     audio = np.concatenate([np.zeros(RATE // 2, dtype=np.float32), audio, np.zeros(9 * RATE, dtype=np.float32)])
     step = chunk_ms * RATE // 1000
     out = []
@@ -189,9 +191,17 @@ def stream(detector, audio: np.ndarray, chunk_ms: int) -> list[tuple[int, list, 
         payload = b64(audio[offset : offset + step])
         start = time.perf_counter()
         segments = detector.process_segments(payload, fmt="pcm_f32le", sample_rate_hz=RATE)
-        out.append(
-            ((offset + step) * 1000 // RATE, [segment.result for segment in segments], time.perf_counter() - start)
-        )
+        seconds = time.perf_counter() - start
+        segment_end = offset
+        decisions = []
+        for segment in segments:
+            # Segments contain normalized float32 PCM and partition the append.
+            # audio_end_ms is a speech boundary in server VAD, but a commit
+            # boundary in semantic VAD, so it is not a shared decision clock.
+            segment_end += len(base64.b64decode(segment.audio)) // 4
+            decisions.append((segment_end * 1000 // RATE, segment.result))
+        append_end_ms = min(offset + step, audio.size) * 1000 // RATE
+        out.append((append_end_ms, decisions, seconds))
     return out
 
 
@@ -204,7 +214,9 @@ def bench_chunk_cost(silero_provider, smart_turn_provider, clips: dict[str, np.n
             for _ in range(3):
                 detector = _detector(kind, silero_provider, smart_turn_provider)
                 for _, decisions, seconds in stream(detector, audio, chunk_ms):
-                    target = evaluating if any(r.turn_complete_probability is not None for r in decisions) else ordinary
+                    target = (
+                        evaluating if any(r.turn_complete_probability is not None for _, r in decisions) else ordinary
+                    )
                     target.append(seconds)
         results[kind] = {"ordinary_chunk": stats_ms(ordinary)}
         if evaluating:
@@ -222,13 +234,19 @@ def bench_classification(smart_turn, clips: list[dict]) -> list[dict]:
 def _endpoint_row(detector, audio: np.ndarray, chunk_ms: int, silero_provider: SileroVADBackendProvider) -> dict:
     end_ms = 500 + speech_end_ms(audio, silero_provider)
     chunks = stream(detector, audio, chunk_ms)
-    commits = [t for t, decisions, _ in chunks for result in decisions if result.should_commit]
-    final = [t for t in commits if t >= end_ms]
+    commits = [
+        (segment_ms, append_ms)
+        for append_ms, decisions, _ in chunks
+        for segment_ms, result in decisions
+        if result.should_commit
+    ]
+    final = [(segment_ms, append_ms) for segment_ms, append_ms in commits if segment_ms >= end_ms]
     return {
-        "false_cutoffs": sum(1 for t in commits if t < end_ms),
-        "endpoint_delay_ms": (final[0] - end_ms) if final else None,
+        "false_cutoffs": sum(1 for segment_ms, _ in commits if segment_ms < end_ms),
+        "endpoint_delay_ms": (final[0][0] - end_ms) if final else None,
+        "append_endpoint_delay_ms": (final[0][1] - end_ms) if final else None,
         "smart_turn_calls": sum(
-            1 for _, decisions, _ in chunks for result in decisions if result.turn_complete_probability is not None
+            1 for _, decisions, _ in chunks for _, result in decisions if result.turn_complete_probability is not None
         ),
     }
 
@@ -319,7 +337,7 @@ def markdown(report: dict) -> str:
         f"{report['pause_ms']} ms thinking pause, semantic_vad eagerness=auto)**",
         "",
         "| scenario | language | mode | runs | runs with a false cutoff "
-        "| endpoint delay P50 / P90 (ms) | silence-limit commits |",
+        "| segment endpoint delay P50 / P90 (ms) | silence-limit commits |",
         "|---|---|---|---|---|---|---|",
     ]
     for scenario in ("complete", "incomplete -> continue"):
