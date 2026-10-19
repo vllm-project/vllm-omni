@@ -167,7 +167,7 @@ def _git_calls(tmp_path: Path) -> list[str]:
 
 
 def test_version_branch_reads_parent_from_commit_header(tmp_path):
-    result = _run_bootstrap(tmp_path, pull_request=False, branch="0.30.0")
+    result = _run_bootstrap(tmp_path, pull_request=False, branch="release/v0.30.0")
 
     assert result.returncode == 0, result.stderr
     assert "cat-file -p HEAD" in _git_calls(tmp_path)
@@ -184,7 +184,7 @@ def test_version_branch_does_not_lookup_labels(tmp_path):
     result = _run_bootstrap(
         tmp_path,
         pull_request=False,
-        branch="0.30.0",
+        branch="release/v0.30.0",
         curl_status=22,
         jq_status=4,
     )

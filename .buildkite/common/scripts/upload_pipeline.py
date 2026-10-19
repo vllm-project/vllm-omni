@@ -14,7 +14,7 @@ Test pipeline mode (e.g. test-merge.yml, test-nightly.yml, test-weekly.yml):
   - Drop steps whose ``source_file_dependencies`` do not match changed files
     (string/list keys from ci_source_file_dependencies.yml, or inline path
     prefixes). Filtering applies on **PR label** uploads and on post-merge
-    release-line L3 uploads (``main`` or an ``X.Y.Z`` branch). Scheduled
+    release-line L3 uploads (``main`` or a ``release/vX.Y.Z`` branch). Scheduled
     release-line uploads that pass ``--all`` (NIGHTLY/WEEKLY) or ``--e2e``
     keep every selected job and still strip
     the field. If no job-key prefix matches, a change to the pipeline YAML
@@ -758,7 +758,7 @@ def _changed_files_for_source_filter(
 
     ``--all`` / ``--e2e`` disable filtering (scheduled NIGHTLY/WEEKLY full
     uploads and weekly E2E sweeps). Post-merge release-line L3 (``main`` or
-    ``X.Y.Z``) and PR-label uploads filter against the commit/PR diff. Pipeline YAML /
+    ``release/vX.Y.Z``) and PR-label uploads filter against the commit/PR diff. Pipeline YAML /
     ``source_filter_fallback`` matches are applied later in
     ``_render_test_pipeline`` only when no job-key prefix already matched.
     """

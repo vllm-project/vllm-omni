@@ -61,17 +61,18 @@ CUDA_HF_TOKEN_ENV = "VLLM_CI_HF_TOKEN"
 CUDA_HF_TOKEN_EXPORT = f'if [ -n "$${{{CUDA_HF_TOKEN_ENV}:-}}" ]; then export HF_TOKEN="$${{{CUDA_HF_TOKEN_ENV}}}"; fi'
 
 # Release lines run the same post-merge / scheduled pipelines as main.
-# Branch name is exactly X.Y.Z (for example 0.30.0). Keep this pattern identical
-# in release_line_branch.sh.
-RELEASE_LINE_VERSION_PATTERN = r"^[0-9]+\.[0-9]+\.[0-9]+$"
+# Branch name is exactly release/vX.Y.Z (for example release/v0.30.0). Keep this
+# pattern identical in release_line_branch.sh.
+RELEASE_LINE_VERSION_PATTERN = r"^release/v[0-9]+\.[0-9]+\.[0-9]+$"
 _RELEASE_LINE_VERSION_RE = re.compile(RELEASE_LINE_VERSION_PATTERN)
 
 # Bootstrap Buildkite ``if`` expressions.
-# ``*_MAIN_IF``: release line (main or X.Y.Z) + env schedule.
+# ``*_MAIN_IF``: release line (main or release/vX.Y.Z) + env schedule.
 # ``*_LABEL_IF``: PR label (and/or composed with MAIN).
 # ``*_UPLOAD_IF``: full gate for uploading that child pipeline.
-# Ruby regex; built from RELEASE_LINE_VERSION_PATTERN.
-_RELEASE_LINE_BRANCH_IF = f'(build.branch == "main" || build.branch =~ /{RELEASE_LINE_VERSION_PATTERN}/)'
+# Ruby regex; built from RELEASE_LINE_VERSION_PATTERN. ``%r{}`` keeps the
+# slash in ``release/v`` from ending a ``/.../`` literal.
+_RELEASE_LINE_BRANCH_IF = f'(build.branch == "main" || build.branch =~ %r{{{RELEASE_LINE_VERSION_PATTERN}}})'
 NIGHTLY_MAIN_IF = f'{_RELEASE_LINE_BRANCH_IF} && build.env("NIGHTLY") == "1"'
 NIGHTLY_LABEL_IF = (
     f'({NIGHTLY_MAIN_IF}) || (build.branch != "main" && build.pull_request.labels includes "nightly-test")'
@@ -92,7 +93,7 @@ BOOTSTRAP_ENABLED_IF = "true"
 
 
 def is_release_line_branch(branch: str | None = None) -> bool:
-    """Return True for ``main`` and for a branch named exactly ``X.Y.Z``."""
+    """Return True for ``main`` and for a branch named exactly ``release/vX.Y.Z``."""
     if branch is None:
         branch = os.environ.get("BUILDKITE_BRANCH", "")
     return branch == "main" or _RELEASE_LINE_VERSION_RE.fullmatch(branch) is not None

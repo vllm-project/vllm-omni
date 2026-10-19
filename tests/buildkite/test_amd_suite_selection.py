@@ -21,8 +21,9 @@ SPEC.loader.exec_module(SELECTOR)
     ("branch", "labels", "expected"),
     [
         ("main", (), ("merge",)),
-        ("0.30.0", (), ("merge",)),
-        ("0.30.0", ("ready",), ("merge",)),
+        ("release/v0.30.0", (), ("merge",)),
+        ("release/v0.30.0", ("ready",), ("merge",)),
+        ("0.30.0", (), ("ready",)),
         ("v0.30.0", (), ("ready",)),
         ("feature", ("ready",), ("ready",)),
         ("feature", ("merge-test",), ("merge",)),
@@ -59,7 +60,7 @@ def test_scheduled_main_selects_only_nightly():
 
 def test_scheduled_version_branch_selects_only_nightly():
     assert SELECTOR.select_amd_test_suites(
-        branch="0.30.0",
+        branch="release/v0.30.0",
         labels=("ready",),
         nightly=True,
     ) == ("nightly",)

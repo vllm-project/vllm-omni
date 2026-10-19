@@ -385,11 +385,12 @@ def test_yaml_gated_message_lists_changed_and_targets() -> None:
     ("branch", "expected"),
     [
         ("main", True),
-        ("0.30.0", True),
-        ("10.2.3", True),
+        ("release/v0.30.0", True),
+        ("release/v10.2.3", True),
+        ("0.30.0", False),
         ("v0.30.0", False),
-        ("0.30", False),
-        ("0.30.0-rc1", False),
+        ("release/v0.30", False),
+        ("release/v0.30.0-rc1", False),
         ("release/0.30.0", False),
         ("feature", False),
         ("", False),
@@ -427,7 +428,7 @@ def test_release_line_version_pattern_is_shared() -> None:
 
 def test_version_branch_diff_uses_parent_commit(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("BUILDKITE_PULL_REQUEST", "false")
-    monkeypatch.setenv("BUILDKITE_BRANCH", "0.30.0")
+    monkeypatch.setenv("BUILDKITE_BRANCH", "release/v0.30.0")
     monkeypatch.setenv("BUILDKITE_COMMIT", "abc123")
 
     class _GitResult:
