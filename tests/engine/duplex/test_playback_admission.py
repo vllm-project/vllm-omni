@@ -78,7 +78,7 @@ async def test_idless_ack_does_not_adopt_imported_history(reply_history, hard, i
             )
         )
         assert not any(event.type == "error" for event in events), events
-        assert session.last_assistant_full_message is not None
+        assert session.last_response_id == response
         assert session.active_response_id is None
         assert not session.pending_history_item_ids
         assert session.history_item_ids[item_id]["content"] == "keep this context"
@@ -158,7 +158,7 @@ def test_idless_ack_resolves_retired_audio_only_item(hard, older_pending):
     item_id = f"item_{response}"
     assert response not in session._playback.by_response
     assert dict(session.pending_history_item_ids) == pending_before
-    assert session.last_assistant_full_message is None
+    assert session.history_item_ids[item_id] == {"role": "assistant", "content": ""}
     assert session.history_item_has_audio(item_id)
     events = apply_playback_ack(session, {"played_ms": 200 if hard else 400, "truncate": hard})
     assert len(events) == 1 and events[0].type == "playback.acknowledged"

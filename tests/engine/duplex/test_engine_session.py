@@ -261,7 +261,7 @@ def test_playback_ack_is_scoped_per_response():
 
 def test_history_commit_uses_audio_text_alignment_marks():
     session = _session()
-    session.begin_response()
+    response_id = session.begin_response()
 
     session.append_assistant_text("hello ")
     session.mark_audio_sent(duration_ms=1_000, text_chars=6)
@@ -277,7 +277,7 @@ def test_history_commit_uses_audio_text_alignment_marks():
 
     assert committed == {"role": "assistant", "content": "hello w"}
     assert session.history[-1] == committed
-    assert session.last_assistant_full_message == {"role": "assistant", "content": "hello world"}
+    assert session.assistant_transcript(response_id) == "hello world"
 
 
 def test_history_commit_with_ack_only_policy_defers_unacknowledged_text():

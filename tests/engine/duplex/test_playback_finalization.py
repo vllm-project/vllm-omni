@@ -27,8 +27,6 @@ def _assert_released(session, response_id):
     assert response_id not in session._conversation.assistant_response_snapshots
     for entries in (
         session._conversation.pending_item_ids,
-        session._conversation.pending_item_audio_text_marks,
-        session._conversation.pending_item_input_commit_seqs,
         session._conversation.pending_truncations_ms,
         session._conversation.hard_truncations_ms,
         session._conversation.history_item_placeholders,
@@ -37,8 +35,8 @@ def _assert_released(session, response_id):
 
 
 @pytest.mark.parametrize("initial_text,terminal_text,unaligned", _CONTENT)
-@pytest.mark.parametrize("ack_before_end", [False, True])
-@pytest.mark.parametrize("ack_ms", [0, 200, 400])
+# A zero cursor sends no initial ACK, so its before/after ordering is identical.
+@pytest.mark.parametrize("ack_before_end,ack_ms", [(False, 0), (False, 200), (False, 400), (True, 200), (True, 400)])
 @pytest.mark.parametrize("terminal_audio_ms", [400, 800])
 def test_drain_finalization_event_orders(
     initial_text, terminal_text, unaligned, ack_before_end, ack_ms, terminal_audio_ms

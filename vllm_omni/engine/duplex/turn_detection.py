@@ -9,7 +9,7 @@ session, feeds each appended chunk to it and emits
 ``server_vad`` (:class:`ServerTurnDetector`) ends the turn after a fixed
 silence; ``semantic_vad`` (:class:`SemanticTurnDetector`) asks Smart Turn
 whether the turn is complete when Silero hears a short pause.
-The two-phase ``session.update`` commit (prepare / commit / reject) that used
+The two-phase ``session.update`` commit (prepare / commit) that used
 to live on the translator is expressed by :class:`PendingTurnDetectionUpdate`.
 """
 
@@ -658,7 +658,11 @@ def apply_turn_detection_result(payload: dict[str, object], result: TurnDetectio
 
 @dataclass
 class PendingTurnDetectionUpdate:
-    """A ``session.update`` turn-detection change awaiting the engine ACK (two-phase)."""
+    """A turn-detection candidate adopted after ``session.update`` validation.
+
+    Staged detectors have not processed audio or loaded a backend, so rejected
+    candidates need no cleanup.
+    """
 
     config: TurnDetectionConfig | None
     detector: TurnDetector | None
@@ -681,12 +685,7 @@ class PendingTurnDetectionUpdate:
     def commit(self, current: TurnDetector | None) -> tuple[TurnDetectionConfig | None, TurnDetector | None]:
         """Keep identical settings' live state; otherwise adopt the staged detector."""
         if current is not None and current.config == self.config:
-            self.reject()
             return self.config, current
         if current is not None:
             current.reset()
         return self.config, self.detector
-
-    def reject(self) -> None:
-        if self.detector is not None:
-            self.detector.reset()

@@ -257,12 +257,6 @@ class SessionControl:
     async def on_session_update(self, payload: dict[str, object], *, realtime_event_id: str | None) -> None:
         session = self._ctx.session
         model_state = self._ctx.model_state
-        pending_turn_detection: PendingTurnDetectionUpdate | None = None
-
-        def reject_update() -> None:
-            if pending_turn_detection is not None:
-                pending_turn_detection.reject()
-
         try:
             pending_turn_detection = PendingTurnDetectionUpdate.prepare(
                 payload,
@@ -278,7 +272,6 @@ class SessionControl:
                 "session.update was not applied because the preceding append failed",
                 event_id=realtime_event_id,
             )
-            reject_update()
             return
         if (
             pending_turn_detection is not None
@@ -301,13 +294,11 @@ class SessionControl:
                 "commit or clear input first",
                 event_id=realtime_event_id,
             )
-            reject_update()
             return
         try:
             self._ctx.plugin.validate_client_extra_body(payload.get("extra_body"))
         except DuplexRuntimeConfigError as exc:
             self._out.emit_error(exc.code, str(exc), event_id=realtime_event_id)
-            reject_update()
             return
         candidate_config = deepcopy(session.config)
         audio_started = session.playback.generated_ms > 0 or session.playback.sent_ms > 0
@@ -319,7 +310,6 @@ class SessionControl:
             )
         except DuplexConfigError as exc:
             self._out.emit_error(exc.code, str(exc) or "session.update was rejected", event_id=realtime_event_id)
-            reject_update()
             return
         # Also when the update only turns auto_response on under a live semantic_vad.
         unsupported = self._semantic_vad_unsupported(
@@ -328,7 +318,6 @@ class SessionControl:
         )
         if unsupported is not None:
             self._out.emit_error("unsupported_turn_detection", unsupported, event_id=realtime_event_id)
-            reject_update()
             return
         if candidate_config.instructions != session.config.instructions and model_state.context_locked:
             self._out.emit_error(
@@ -336,7 +325,6 @@ class SessionControl:
                 "session.update cannot change instructions after the native duplex context is initialized",
                 event_id=realtime_event_id,
             )
-            reject_update()
             return
         requests_audio = any(str(modality).lower() == "audio" for modality in candidate_config.modalities)
         if (
@@ -347,7 +335,6 @@ class SessionControl:
             self._out.emit_error(
                 "ref_audio_required", "Native duplex audio output requires ref_audio", event_id=realtime_event_id
             )
-            reject_update()
             return
         try:
             candidate_runtime_config = self._ctx.plugin.runtime_config_for_update(
@@ -361,11 +348,9 @@ class SessionControl:
             )
         except (DuplexRuntimeConfigError, DuplexConfigError) as exc:
             self._out.emit_error(exc.code, str(exc), event_id=realtime_event_id)
-            reject_update()
             return
         except Exception as exc:
             self._out.emit_error("runtime_signal_failed", str(exc), event_id=realtime_event_id)
-            reject_update()
             return
         session.replace_config(candidate_config)
         session.replace_runtime_config(candidate_runtime_config)
