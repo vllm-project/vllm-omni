@@ -52,7 +52,7 @@ pytestmark = [
 ]
 
 
-@pytest.mark.advanced_model
+@pytest.mark.slow
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": "H100"}, num_cards={"cuda": 1})
 @pytest.mark.parametrize(

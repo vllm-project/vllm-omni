@@ -14,10 +14,12 @@ from typing import TYPE_CHECKING, Any
 
 import diffusers
 import huggingface_hub
+import numpy as np
 import torch
 from PIL import Image
 from pydantic import model_validator
 from typing_extensions import Self
+from vllm.config import KernelConfig
 from vllm.config.utils import config
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.base_config import (
@@ -111,17 +113,6 @@ def normalize_omni_diffusion_kwargs(
             attention_backend=diffusion_attn_backend,
             fastvideo_vsa_topk=fastvideo_vsa_topk,
         )
-
-    auxiliary_text_encoder = config_kwargs.pop("auxiliary_text_encoder", None)
-    if auxiliary_text_encoder is not None:
-        extras = dict(config_kwargs.get("extras") or {})
-        if extras.get("auxiliary_text_encoder") is not None:
-            raise ValueError(
-                "Diffusion engine field 'auxiliary_text_encoder' cannot be provided both at the top level and in "
-                "'extras'."
-            )
-        extras["auxiliary_text_encoder"] = auxiliary_text_encoder
-        config_kwargs["extras"] = extras
 
     # Check environment variable as fallback for cache_backend.
     # Support both old DIFFUSION_CACHE_ADAPTER and new DIFFUSION_CACHE_BACKEND.
@@ -834,6 +825,19 @@ class OmniDiffusionConfig:
 
     model_class_name: str | None = None
 
+    # Multi-stage diffusion role. ``None``/"dit"/"diffusion" run the full
+    # pipeline (text-encode + denoise + decode) in one stage. "text_encode"
+    # runs only the text encoder and emits prompt embeddings for a downstream
+    # diffusion stage (Encode/Generation (EG) disaggregation).
+    model_stage: str | None = None
+
+    # Structured diffusion stage role (encode / denoise / decode / full).
+    # This supersedes the free-form ``model_stage`` string: it is the
+    # model-agnostic axis that drives role-based component loading and stage
+    # dispatch so any DiT model can be disaggregated via config. When ``None``
+    # it is derived from ``model_stage`` (see ``resolve_diffusion_stage_role``).
+    stage_role: str | None = None
+
     # Optional model-defined startup task. Pipelines may use this to select
     # task-specific components or weights before serving requests.
     task_type: str | None = None
@@ -884,6 +888,12 @@ class OmniDiffusionConfig:
     # worker subprocess (process isolation and RPC timeouts).
     distributed_executor_backend: str | None = None
     nccl_port: int | None = None
+
+    # Weight transfer configuration for RL training (pipeline-wide deploy
+    # field). A dict matching upstream vLLM ``WeightTransferConfig`` fields
+    # (e.g. ``{"backend": "ipc"}``); converted to the typed config when the
+    # diffusion VllmConfig is built. ``None`` disables weight transfer.
+    weight_transfer_config: dict[str, Any] | None = None
 
     # Engine backend selection, resolved by ``DiffusionEngine.resolve_engine_class``
     # (mirrors ``DiffusionExecutor.get_class``). Config files use a string:
@@ -977,8 +987,9 @@ class OmniDiffusionConfig:
     # STA_mode: STA_Mode = STA_Mode.STA_INFERENCE
     skip_time_steps: int = 15
 
-    # MoE kernel backend selection
+    # Reuse upstream kernel selection; "auto" preserves platform defaults.
     moe_backend: str = "auto"
+    linear_backend: str = "auto"
 
     # Compilation
     enforce_eager: bool = False
@@ -1101,6 +1112,7 @@ class OmniDiffusionConfig:
     # rather than carried inline through the orchestrator. Empty disables the
     # worker-side connector receive path.
     stage_input_payload_keys: tuple[str, ...] = ()
+    stage_input_optional_payload_keys: tuple[str, ...] = ()
 
     # Keys handed to the next stage over the omni connector. Empty disables the
     # worker-side connector send path.
@@ -1234,9 +1246,14 @@ class OmniDiffusionConfig:
         )
 
         self.stage_input_payload_keys = tuple(self.stage_input_payload_keys)
+        self.stage_input_optional_payload_keys = tuple(self.stage_input_optional_payload_keys)
         self.stage_output_payload_keys = tuple(self.stage_output_payload_keys)
         if self.vae_fast_path not in VAE_FAST_PATH_LEVELS:
             raise ValueError(f"vae_fast_path must be one of {list(VAE_FAST_PATH_LEVELS)}, got {self.vae_fast_path!r}")
+        kernels = KernelConfig(moe_backend=self.moe_backend, linear_backend=self.linear_backend)
+        self.moe_backend = kernels.moe_backend
+        self.linear_backend = kernels.linear_backend
+
         if self.vae_encode_fast_path not in VAE_FAST_PATH_LEVELS:
             raise ValueError(
                 f"vae_encode_fast_path must be one of {list(VAE_FAST_PATH_LEVELS)}, got {self.vae_encode_fast_path!r}"
@@ -1429,6 +1446,7 @@ class OmniDiffusionConfig:
         # Match vLLM's config flow: parse entrypoint shorthands before the
         # config object is built, and keep a single runtime truth source.
         self.diffusion_attention_config = build_attention_config(self.diffusion_attention_config)
+        validate_kv_cache_dtype_vs_attention_specs(self.diffusion_kv_cache_dtype, self.diffusion_attention_config)
         self.diffusion_kv_cache_skip_step_indices = parse_kv_cache_skip_selector(self.diffusion_kv_cache_skip_steps)
         self.diffusion_kv_cache_skip_layer_indices = parse_kv_cache_skip_selector(self.diffusion_kv_cache_skip_layers)
 
@@ -1777,11 +1795,6 @@ class OmniDiffusionConfig:
                         self.model_class_name = "Pi0Pipeline"
                     self.set_tf_model_config(TransformerConfig())
                     self.update_multimodal_support()
-                elif cfg.get("type") == "pi05":
-                    if self.model_class_name is None:
-                        self.model_class_name = "Pi05Pipeline"
-                    self.set_tf_model_config(TransformerConfig())
-                    self.update_multimodal_support()
                 elif model_type == "ti2v" and self.model_class_name == "ABotWorldCausalPipeline":
                     # The official ABot checkpoint uses its native single-directory
                     # layout and intentionally has no Diffusers pipeline index.
@@ -1842,6 +1855,8 @@ class DiffusionOutput:
     trajectory_latents: torch.Tensor | dict[str, Any] | None = None
     trajectory_log_probs: torch.Tensor | dict[str, Any] | None = None
     trajectory_decoded: list[Image.Image] | None = None
+    # Internal non-final-stage payload consumed by StagePool.
+    custom_output: dict[str, Any] = field(default_factory=dict)
     async_output_id: str | None = None
     error: str | None = None
     error_status_code: int | None = None
@@ -1861,9 +1876,13 @@ class DiffusionOutput:
     started_event_ids: list[str] = field(default_factory=list)
     active_event_ids: list[str] = field(default_factory=list)
     completed_event_ids: list[str] = field(default_factory=list)
+    coalesced_event_ids: list[str] = field(default_factory=list)
 
     # logged duration of stages
     stage_durations: dict[str, float] = field(default_factory=dict)
+
+    # Engine-side async materialization wait (seconds), separate from model stages.
+    output_ready_wait_time: float = 0.0
 
     # memory usage info
     peak_memory_mb: float = 0.0
@@ -1888,6 +1907,38 @@ class DiffusionOutput:
     # migrated to typed media. Only this tuple entry is eligible for video
     # transport optimizations; unmarked legacy outputs retain their old path.
     video_output_index: int | None = None
+
+    # Host-side playback diagnostics; carried through the existing output metadata.
+    streaming_metrics: dict[str, float | int] = field(default_factory=dict)
+
+    def output_nbytes(self) -> int:
+        """Payload bytes retained by one decoded output, excluding model workspace."""
+
+        def size(value: Any) -> int:
+            if isinstance(value, torch.Tensor):
+                return value.untyped_storage().nbytes()
+            if isinstance(value, np.ndarray):
+                return value.nbytes
+            if isinstance(value, Image.Image):
+                return value.width * value.height * len(value.getbands())
+            if isinstance(value, (bytes, bytearray, memoryview)):
+                return len(value)
+            if isinstance(value, dict):
+                return sum(size(item) for item in value.values())
+            if isinstance(value, (tuple, list)):
+                return sum(size(item) for item in value)
+            return 0
+
+        return sum(
+            size(value)
+            for value in (
+                self.media.video.tensor if self.media is not None else self.output,
+                self.trajectory_timesteps,
+                self.trajectory_latents,
+                self.trajectory_log_probs,
+                self.trajectory_decoded,
+            )
+        )
 
     def __post_init__(self) -> None:
         if self.media is not None and not isinstance(self.media, DiffusionMediaOutput):
@@ -1918,6 +1969,7 @@ class DiffusionOutput:
         self.trajectory_timesteps = _maybe_to_cpu(self.trajectory_timesteps)
         self.trajectory_latents = _maybe_to_cpu(self.trajectory_latents)
         self.trajectory_log_probs = _maybe_to_cpu(self.trajectory_log_probs)
+        self.custom_output = _maybe_to_cpu(self.custom_output)
 
     @classmethod
     def from_exception(cls, exc: BaseException) -> "DiffusionOutput":
@@ -2388,6 +2440,31 @@ def build_attention_config(
         {k: v.backend for k, v in normalized.per_role.items()},
     )
     return normalized
+
+
+def validate_kv_cache_dtype_vs_attention_specs(
+    kv_cache_dtype: str | None,
+    attention_config: "AttentionConfig | None",
+) -> None:
+    """Reject a global attention-quant knob combined with per-backend quant specs.
+
+    ``diffusion_kv_cache_dtype`` requests quantized attention for every layer;
+    an explicit ``quant`` spec is the advanced per-backend override. Setting both
+    is contradictory intent — fail fast instead of picking one silently. A pure
+    ``flashinfer_backend`` variant pin without dtypes is not a conflict.
+    """
+    if kv_cache_dtype in (None, "auto", "float") or attention_config is None:
+        return
+    specs = [attention_config.default, *attention_config.per_role.values()]
+    for spec in specs:
+        if spec is None or spec.quant is None:
+            continue
+        if spec.quant.dtype_qk is not None or spec.quant.dtype_vo is not None:
+            raise ValueError(
+                "diffusion_kv_cache_dtype conflicts with a diffusion_attention_config quant spec: "
+                "the unified knob already requests quantized attention. Remove the explicit "
+                "quant spec, or set diffusion_kv_cache_dtype to 'auto' and keep the spec."
+            )
 
 
 @dataclass

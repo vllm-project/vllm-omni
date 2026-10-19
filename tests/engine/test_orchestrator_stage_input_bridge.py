@@ -46,7 +46,7 @@ class FakeStageClient:
         self.next_inputs = list(next_inputs or [])
         self.add_request_calls: list[tuple[Any, ...]] = []
         self.decoded_source_tokens: str | None = None
-        self._engine_core_outputs = queue.Queue()
+        self._engine_core_outputs: queue.Queue[Any] = queue.Queue()
 
     async def add_request_async(self, *args, **_kwargs) -> None:
         self.add_request_calls.append(args)
@@ -87,6 +87,7 @@ class FakeOutputProcessor:
 class FakeInputProcessor:
     def __init__(self) -> None:
         self.calls: list[dict[str, Any]] = []
+        self.renderer = SimpleNamespace(mm_processor_cache=None)
 
     def process_inputs(self, **kwargs):
         self.calls.append(kwargs)
@@ -192,6 +193,7 @@ async def test_forward_text_prompt_uses_target_stage_input_processor() -> None:
         sampling_params_list=[SamplingParams(max_tokens=1), SamplingParams(max_tokens=1)],
         final_stage_id=1,
     )
+    orchestrator.request_states[req_state.request_id] = req_state
 
     await orchestrator._forward_to_next_stage("req-text", 0, _request_output("req-text"), req_state)
 
@@ -273,6 +275,7 @@ async def test_async_prewarm_skips_stage_with_custom_process_input_func() -> Non
     the turn-based Orchestrator base.
     """
     orchestrator = object.__new__(DuplexOrchestrator)
+    orchestrator.replica_placement = None
     stage0 = FakePrewarmPool("sender")
     stage1 = FakePrewarmPool("receiver")  # would receive chunks if role alone decided
     stage1.stage_client = SimpleNamespace(custom_process_input_func=lambda *a, **k: None)

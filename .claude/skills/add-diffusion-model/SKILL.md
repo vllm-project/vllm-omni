@@ -351,6 +351,12 @@ Required updates:
 
 ### Step 8: Add E2E Tests
 
+When the requested coverage includes numerical accuracy, use
+[diffusion-accuracy-test](../diffusion-accuracy-test/SKILL.md) after the model
+works. It guides representative task selection, independent references,
+threshold evidence, and the Accuracy CI lane. A functional-only request does
+not automatically require an accuracy workload.
+
 **Follow the [vllm-omni-test skill](../vllm-omni-test/SKILL.md)** for markers, file naming, Buildkite wiring, and run commands. Also read [l4_functionality_tests.inc.md](https://github.com/vllm-project/vllm-omni/blob/main/docs/contributing/ci/test_examples/l4_functionality_tests.inc.md), [test_system_overview.md](https://github.com/vllm-project/vllm-omni/blob/main/docs/contributing/ci/test_system_overview.md), and [test_writing_guide.md](https://github.com/vllm-project/vllm-omni/blob/main/docs/contributing/ci/test_writing_guide.md).
 
 Classify the model's **CI priority** first:

@@ -279,6 +279,8 @@ class QwenImagePipeline(
 
     supports_step_execution: ClassVar[bool] = True
 
+    supports_weight_reload: ClassVar[bool] = True
+
     def __init__(
         self,
         *,
@@ -939,7 +941,6 @@ class QwenImagePipeline(
 
         t = input_batch.timesteps
         self._current_timestep = t
-        self.transformer.do_true_cfg = input_batch.do_true_cfg
 
         positive_kwargs, negative_kwargs, output_slice = self._build_denoise_kwargs(
             latents=input_batch.latents,

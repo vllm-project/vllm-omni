@@ -16,6 +16,7 @@ For the full list of supported architectures across all modalities, see
 | --- | --- | --- | --- | --- | --- |
 | Breeze-TTS-2 | `BreezeBlue/Breeze-TTS-2` | ✓ (`ref_audio`+`ref_text`) | ✓ (PCM stream) | speaker tags (`S0`..`S9`, default `S0`) | — |
 | Audio8 TTS Preview | `Audio8/Audio8-TTS-Preview-0.6b` | ✓ (`ref_audio`+`ref_text`) | ✓ (PCM stream) | uploaded audio voice only; no presets | ✓ |
+| Fish Audio Drama 3 | `fishaudio/drama-3` | ✓ (`ref_audio`+`ref_text`) | ✓ (PCM stream) | speaker and event tags in `input` | — |
 | Fish Speech S2 Pro | `fishaudio/s2-pro` | ✓ (`ref_audio`+`ref_text`) | ✓ (PCM stream) | — | ✓ |
 | Gepard-1.0 | `nineninesix/gepard-1.0` | — (zero-shot default voice) | ✓ (PCM / WAV stream) | `default` only | — |
 | GLM-TTS | `zai-org/GLM-TTS` | ✓ (`ref_audio`+`ref_text`, required) | ✓ (PCM stream) | — | ✓ |
@@ -400,6 +401,54 @@ rare sub-300 ms gap.
 
 ---
 
+## Fish Audio Drama 3
+
+35B-total / 3B-active MoE TTS at 44.1 kHz: a Qwen3.5 MoE backbone samples one
+semantic token per frame and a codebook tower predicts the other 9 codebooks.
+It shares the DAC codec stage with Fish Speech S2 Pro. Speaker tags
+(`<|speaker:0|>` to `<|speaker:15|>`) and inline event tags such as `[sighs]`
+go in `input`. See the [Drama 3 recipe](../../../recipes/fishaudio/Drama-3.md) for measured
+performance and known limitations.
+
+### Launch
+
+```bash
+vllm serve fishaudio/drama-3 --omni --port 8091
+```
+
+The deploy config auto-loads from `vllm_omni/deploy/fish_omni.yaml` (the HF `model_type` on the checkpoint is `fish_omni`).
+
+### Voice cloning
+
+```bash
+curl -X POST http://localhost:8091/v1/audio/speech \
+    -H "Content-Type: application/json" \
+    -d '{
+        "model": "fishaudio/drama-3",
+        "input": "[sighs] Fine. If we miss it, it is on you.",
+        "ref_audio": "https://huggingface.co/datasets/zhaochenyang20/seed-tts-eval-mini/resolve/main/en/prompt-wavs/common_voice_en_10119832.wav",
+        "ref_text": "We asked over twenty different people, and they all said it was his.",
+        "response_format": "wav"
+    }' --output cloned.wav
+```
+
+### CLI client
+
+The Fish Speech client works unchanged with `--model fishaudio/drama-3`:
+
+```bash
+cd examples/online_serving/text_to_speech/fish_speech
+python speech_client.py --model fishaudio/drama-3 --text "<|speaker:0|> Hi. <|speaker:1|> Hello."
+python speech_client.py --model fishaudio/drama-3 --text "Hello world" --stream --output output.pcm
+```
+
+### Notes
+
+- Output: 44.1 kHz mono. Streaming PCM players must use `-r 44100`.
+- `ref_audio` needs `ref_text` (the transcript of the reference audio).
+
+---
+
 ## Fish Speech S2 Pro
 
 4B dual-AR TTS at 44.1 kHz. Server uses the DAC codec, which is vendored in
@@ -753,10 +802,10 @@ vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \
 ```
 
 This mode supports local EngineCore stages only; headless or remote stage
-deployments are not supported. Runtime voice upload and deletion are disabled
-with multiple API frontends because their registries are process-local.
-Built-in voices, inline `ref_audio`, and voices restored from `custom_voice_dir`
-at startup are supported.
+deployments are not supported. Built-in voices, inline `ref_audio`, voices
+restored from `custom_voice_dir` at startup, and runtime voice upload and
+deletion are supported: all API frontends share the uploaded-voice directory
+(`SPEAKER_SAMPLES_DIR`).
 
 ### Executor backend
 
@@ -812,9 +861,9 @@ checkpoint. When a request names an uploaded voice, the server infers
 `task_type="Base"`. Built-in presets such as `vivian` and `ryan` remain
 CustomVoice speakers and require a CustomVoice checkpoint.
 
-The runtime upload and delete routes require a single API frontend; with
-`--api-server-count > 1`, use inline `ref_audio` or restore precomputed voices
-from `custom_voice_dir` at startup.
+Uploaded voices live in `SPEAKER_SAMPLES_DIR`; with `--api-server-count > 1`
+every API process shares that directory, so a voice uploaded or deleted through
+one process is used or rejected consistently by all of them.
 
 ### Precomputed custom voices
 

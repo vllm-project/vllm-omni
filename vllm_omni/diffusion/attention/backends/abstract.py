@@ -85,6 +85,23 @@ class AttentionBackend(ABC):
         del attention_spec
         return False
 
+    @classmethod
+    def supports_cross_kv_mask(cls, attention_spec: object | None = None) -> bool:
+        """Whether a 2D mask excludes K/V only, including when Q and K have equal lengths."""
+        del attention_spec
+        return False
+
+    @classmethod
+    def supports_cross_head_geometry(cls, q_heads: int, kv_heads: int) -> bool:
+        """Whether the backend accepts projected cross Q and K/V head counts."""
+        return q_heads == kv_heads
+
+    @classmethod
+    def supports_cross_pair_mask(cls, attention_spec: object | None = None) -> bool:
+        """Whether Boolean or additive [B, 1/H, Q, KV] restrictions are supported."""
+        del attention_spec
+        return False
+
     @staticmethod
     @abstractmethod
     def get_name() -> str:
@@ -258,6 +275,38 @@ class AttentionMetadata:
     # Canonical mask-free view of structural suffix padding. Backends that do
     # not advertise supports_packed_mask_free ignore it.
     packed_padding: PackedPaddingMetadata | None = None
+    cross_kv_rows_validated: bool = False
+    cross_query_mask: torch.Tensor | None = None
+    cross_pair_mask_validated: bool = False
+
+    @classmethod
+    def for_cross_kv_mask(cls, mask: torch.Tensor, *, kv_slice: slice | None = None) -> "AttentionMetadata":
+        """Validate an immutable global KV mask once, before the layer stack.
+
+        For sequence-sharded K/V, supply the global mask and this rank's
+        ``kv_slice``. A local shard may be entirely padding even though the
+        global row is valid. The execution strategy gathers its local columns.
+        """
+        if mask.ndim != 2 or mask.dtype != torch.bool:
+            raise ValueError("Cross K/V mask must be a Boolean [B, KV_len] tensor")
+        if not bool(mask.any(dim=1).all()):
+            raise ValueError("Each cross-attention batch row must contain at least one valid K/V position")
+        local_mask = mask if kv_slice is None else mask[:, kv_slice]
+        return cls(attn_mask=local_mask, cross_kv_rows_validated=True, extra={"attention_mask_mode": "padding"})
+
+    @classmethod
+    def for_cross_pair_mask(cls, mask: torch.Tensor) -> "AttentionMetadata":
+        """Prepare immutable pair restrictions once, outside the layer stack.
+
+        True means allowed. Floating masks add finite biases or -inf. SDPA
+        returns zero for fully masked query rows. Separate Q validity can be
+        supplied through cross_query_mask without deleting any K/V positions.
+        """
+        if mask.ndim != 4 or not (mask.dtype == torch.bool or mask.is_floating_point()):
+            raise ValueError("Cross pair mask must be Boolean or floating [B, 1/H, Q, KV]")
+        if mask.is_floating_point() and not bool((torch.isfinite(mask) | torch.isneginf(mask)).all()):
+            raise ValueError("Cross pair mask cannot contain NaN or +inf")
+        return cls(attn_mask=mask, cross_pair_mask_validated=True, extra={"attention_mask_mode": "arbitrary"})
 
 
 T = TypeVar("T", bound=AttentionMetadata)

@@ -103,6 +103,51 @@ def test_async_output_blocking_event_preserves_masks_and_aux_output(monkeypatch,
     np.testing.assert_array_equal(copied[0][1], [2, 0])
 
 
+@pytest.mark.parametrize("has_audio", [False, True])
+@pytest.mark.parametrize("include_hidden", [False, True])
+def test_voxcpm2_streaming_output_owns_channels_and_finalizes_once(monkeypatch, has_audio, include_hidden) -> None:
+    from vllm_omni.model_executor.models.voxcpm2.model_state import VoxCPM2AudioOutput
+
+    monkeypatch.setattr(torch.cuda, "set_stream", lambda _stream: None)
+    audio = torch.arange(8, dtype=torch.float32)
+    input_batch = SimpleNamespace(
+        query_start_loc_np=np.array([0, 3, 4]),
+        num_scheduled_tokens=np.array([3, 1]),
+        num_reqs=2,
+        num_tokens_after_padding=4,
+    )
+    sampler_output = SamplerOutput(torch.tensor([[0], [1]]), None, None, torch.tensor([0, 1]), torch.tensor([0, 0]))
+    finalizer = MagicMock(side_effect=lambda output: output)
+
+    output = _async_output(
+        req_ids=["prefill", "decode"],
+        sampler_output=sampler_output,
+        num_sampled_tokens=torch.tensor([0, 1]),
+        text_hidden=torch.arange(8, dtype=torch.float32).reshape(4, 2) if include_hidden else None,
+        multimodal_outputs={"voxcpm2_audio_pending": True},
+        input_batch=input_batch,
+        streaming_audio=VoxCPM2AudioOutput.packed(
+            wav=audio if has_audio else torch.empty(0),
+            lengths=torch.tensor([audio.numel()] if has_audio else [], dtype=torch.long),
+            sample_rate=torch.tensor(48000),
+            batch_rows=(1,) if has_audio else (),
+            num_reqs=2,
+        ),
+        finalize_output=finalizer,
+    ).get_output()
+
+    finalizer.assert_called_once_with(output)
+    assert output.sampled_token_ids == [[], [1]]
+    assert output.pooler_output is None
+    assert output.inter_stage_outputs is None
+    if has_audio:
+        assert output.multimodal_outputs[0] == {}
+        assert set(output.multimodal_outputs[1]) == {"model_outputs", "sr"}
+        torch.testing.assert_close(output.multimodal_outputs[1]["model_outputs"], audio)
+    else:
+        assert output.multimodal_outputs == [{}, {}]
+
+
 @pytest.mark.parametrize("needs_history", [False, True])
 def test_last_pp_rank_orchestration_and_kv_resolver(monkeypatch, needs_history) -> None:
     runner = OmniARModelRunner.__new__(OmniARModelRunner)
@@ -150,7 +195,9 @@ def test_last_pp_rank_orchestration_and_kv_resolver(monkeypatch, needs_history) 
     runner.sample.side_effect = lambda *_: sampler_out if sampling_active is needs_history else pytest.fail()
     logprobs_mock = MagicMock(side_effect=lambda *_: pytest.fail("inside ctx") if sampling_active else {})
     runner.prompt_logprobs_worker = PromptLogprobsWorker(1, torch.device("cpu"), logprobs_mode="raw_logits")
-    runner.prompt_logprobs_worker.add_request("req", 0, SamplingParams(prompt_logprob_token_ids=[1, 0]))
+    runner.prompt_logprobs_worker.add_request(
+        "req", 0, SamplingParams(prompt_logprob_token_ids=np.array([[1, 0], [1, 0]]))
+    )
     runner.prompt_logprobs_worker.compute_prompt_logprobs = logprobs_mock
     runner.postprocess_sampled, connector_output = MagicMock(), object()
 
@@ -191,7 +238,9 @@ def test_chunked_fixed_token_scores_are_copied_from_cuda() -> None:
     device = torch.device("cuda")
     hidden = torch.tensor([[1.0, 2.0, 3.0], [3.0, 1.0, 2.0], [2.0, 3.0, 1.0], [4.0, 5.0, 6.0]], device=device)
     worker = PromptLogprobsWorker(1, device)
-    worker.add_request("req", 0, SamplingParams(prompt_logprob_token_ids=[2, 0], prompt_logprob_start=1))
+    worker.add_request(
+        "req", 0, SamplingParams(prompt_logprob_token_ids=np.array([[2, 0], [2, 0]]), prompt_logprob_start=1)
+    )
     batch = SimpleNamespace(
         req_ids=["req"],
         idx_mapping_np=np.array([0]),
@@ -576,8 +625,8 @@ def test_stream_audio_prefill_length_end_reaches_output(mocker) -> None:
 
     owner = mocker.Mock()
     owner.vllm_config.model_config.max_model_len = 4096
-    owner._stream_decode_event = None
     eager = EagerMTPState(owner)
+    eager.decode_event = None
     eager._audio_buffer = StreamingAudioBuffer(4, 25)
     eager._audio_buffer.add("request")
     eager._frame_requests = {"request"}
@@ -605,15 +654,15 @@ def test_stream_audio_preemption_preserves_position_rng_and_pending_pcm(mocker) 
     from vllm_omni.worker_v2.streaming_audio import StreamingAudioBuffer
 
     owner = mocker.Mock()
-    owner._stream_pos = {"request": 37}
-    owner._eager_embeds = torch.arange(18).reshape(6, 3).float()
-    owner._eager_ready = {}
     owner.intermediate_buffer.buffers = [{} for _ in range(6)]
     generator = torch.Generator().manual_seed(42)
     owner._mtp_generators = {"request": generator}
     saved = [torch.arange(6)]
     owner.model.stream_decoder.save_slot.return_value = saved
     eager = EagerMTPState(owner)
+    eager.stream_pos = {"request": 37}
+    eager.embeds = torch.arange(18).reshape(6, 3).float()
+    eager.ready = {}
     eager._talker_inputs["request"] = TalkerInputs(torch.ones(20, 3), 10)
     eager._side_stream = mocker.Mock()
     eager._audio_buffer = StreamingAudioBuffer(4, 25)
@@ -621,10 +670,10 @@ def test_stream_audio_preemption_preserves_position_rng_and_pending_pcm(mocker) 
     request.push(torch.ones(4), False)
     request.push(torch.ones(4), False)
     eager.suspend_audio("request", 2)
-    owner._stream_pos.clear()
+    eager.stream_pos.clear()
     owner._mtp_generators.clear()
     eager.resume_audio("request", 5)
-    assert owner._stream_pos["request"] == 37
+    assert eager.stream_pos["request"] == 37
     assert owner._mtp_generators["request"] is generator
     assert eager._restore_audio["request"] is saved
     assert sum(part.numel() for part in request.pending) == 4
@@ -640,10 +689,10 @@ def test_stream_audio_replay_uses_exact_inputs_and_consumes_last_frame_once(mock
     from vllm_omni.worker_v2.model_states.eager_mtp import EagerMTPState, TalkerInputs
 
     owner = mocker.Mock()
-    owner._eager_embeds = torch.tensor([[20.0, 30.0]])
     owner.model.preprocess.return_value = (None, None, {"mtp_inputs": (None, torch.tensor([[2.0, 3.0]]))})
     owner.intermediate_buffer.buffers = [{"req_id": "request"}]
     eager = EagerMTPState(owner)
+    eager.embeds = torch.tensor([[20.0, 30.0]])
     eager._restore_audio["request"] = []
     history = torch.arange(8).reshape(4, 2).float()
     eager._talker_inputs["request"] = TalkerInputs(history, 4)
@@ -669,7 +718,9 @@ def test_stream_reference_priming_groups_lengths_without_padding_or_slot_aliasin
         calls.append((codes.clone(), slots.clone(), pos.clone()))
 
     decoder = mocker.Mock(side_effect=stream, device=torch.device("cpu"))
-    model = mocker.Mock(stream_decoder=decoder, stream_prime_graphs=None, stream_chunk_frames=25)
+    model = mocker.Mock(
+        stream_decoder=decoder, stream_prime_graphs=None, stream_prime_pieces={}, stream_chunk_frames=25
+    )
     Qwen3TTSTalkerForConditionalGeneration.prime_stream_decoder(model, primes)
     assert len(calls) == 3
     for (codes, slots, pos), frames, indices, position in zip(
@@ -743,15 +794,19 @@ def test_stream_audio_history_replays_exact_inputs_after_batch_reordering(mocker
     owner = mocker.Mock()
     owner.vllm_config.model_config.max_model_len = 12
     eager = EagerMTPState(owner)
+    eager.embeds = torch.zeros(2, 3)
     first = torch.arange(9, dtype=torch.float32).reshape(3, 3)
     second = torch.arange(9, 18, dtype=torch.float32).reshape(3, 3)
     expected = {"a": torch.cat((first[:2], second[2:])), "b": torch.cat((first[2:], second[:2]))}
     batch = InputBatch.__new__(InputBatch)
+    batch.num_reqs = 2
     batch.req_ids = ["a", "b"]
+    batch.idx_mapping_np = np.array([0, 1])
     batch.query_start_loc_np = np.array([0, 2, 3])
     batch.num_computed_tokens_np = np.array([0, 0])
     eager.record_inputs(batch, first)
     batch.req_ids = ["b", "a"]
+    batch.idx_mapping_np = np.array([1, 0])
     batch.num_computed_tokens_np = np.array([1, 2])
     eager.record_inputs(batch, second)
     # Later input-buffer reuse must not change the conditioned replay history.
@@ -901,3 +956,27 @@ def test_request_owned_snapshot_skips_generic_partition(monkeypatch, streaming):
     assert result.inter_stage_outputs[0]["codes.audio"].tolist() == [[10, 11]]
     assert result.inter_stage_outputs[1] is None
     assert (result.pooler_output is None) == streaming
+
+
+def test_stream_history_allocates_only_for_scheduled_requests():
+    from vllm_omni.worker_v2.model_states.eager_mtp import EagerMTPState
+
+    owner = SimpleNamespace(
+        model=SimpleNamespace(stream_decoder=object()),
+        vllm_config=SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)),
+    )
+    batch = SimpleNamespace(
+        num_reqs=1,
+        req_ids=["request"],
+        idx_mapping_np=np.array([127]),
+        num_computed_tokens_np=np.array([0]),
+        query_start_loc_np=np.array([0, 1]),
+    )
+    state = EagerMTPState(owner)
+    embeds = torch.arange(4).reshape(1, 4).float()
+    state.record_inputs(batch, embeds)
+    history = state._talker_inputs["request"]
+    assert history.embeds.untyped_storage().nbytes() == 64 * 4 * embeds.element_size()
+    torch.testing.assert_close(history.embeds[:1], embeds)
+    state.finish_audio({"request"})
+    assert not state._talker_inputs

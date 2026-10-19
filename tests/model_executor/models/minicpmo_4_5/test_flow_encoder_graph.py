@@ -110,7 +110,7 @@ def test_replay_matches_the_eager_encoder_exactly(fake_capture, rows, frames) ->
 @pytest.mark.cpu
 def test_other_shapes_and_layouts_run_eager(fake_capture, monkeypatch: pytest.MonkeyPatch) -> None:
     graphs, _ = _graphs("cpu")
-    for rows, width, frames in ((4, 6, 8), (1, 5, 8), (1, 6, 10)):  # never padded, never another shape
+    for rows, width, frames in ((1, 5, 8), (1, 6, 10)):  # never padded, never another shape
         assert graphs.run(*_inputs(rows, width, frames, "cpu")) is None
     tokens, cnn, att = _inputs(2, 6, 8, "cpu")
     assert graphs.run(tokens, cnn, [att[0], att[1].double()]) is None
@@ -192,13 +192,19 @@ def test_explicit_shared_batches_bypass_opportunistic_capture_cutoff(fake_captur
 
 
 @pytest.mark.cpu
-def test_startup_precapture_uses_shared_arena_and_freezes_admission(fake_capture, mock_nvidia_platform):
+@pytest.mark.parametrize("runtime_capture", [False, True])
+def test_startup_precapture_admission_policy(fake_capture, mock_nvidia_platform, runtime_capture):
     from contextlib import nullcontext
 
     from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import BatchedToken2Wav
 
     weight = torch.randn(_HIDDEN, _HIDDEN)
-    graphs = FlowEncoderGraphs(functools.partial(_encode, weight=weight), max_graphs=2, rows=[1])
+    graphs = FlowEncoderGraphs(
+        functools.partial(_encode, weight=weight),
+        max_graphs=2,
+        rows=[1],
+        capture_after_precapture=runtime_capture,
+    )
     _, cnn, att = _inputs(1, 6, 8, "cpu")
     state = SimpleNamespace(flow_cache={"conformer_cnn_cache": cnn[0], "conformer_att_cache": att[0]})
     features = SimpleNamespace(mels=torch.zeros(1, 8, _HIDDEN))
@@ -219,9 +225,10 @@ def test_startup_precapture_uses_shared_arena_and_freezes_admission(fake_capture
     assert len(graphs.graphs) == 2
     assert backend._encoder_graphs is graphs
     assert not graphs.exact_graphs
-    assert not graphs.capture_on_request
+    assert graphs.capture_on_request is runtime_capture
     assert probes == [108]
     assert BatchedToken2Wav.precapture_chunk_encoder(backend, features) == 0
+    assert graphs.capture_on_request is runtime_capture
 
 
 @pytest.mark.cpu
@@ -858,3 +865,28 @@ def test_precision_change_recaptures_instead_of_reusing_previous_gemm():
             torch.testing.assert_close(actual, saved)
     finally:
         torch.backends.cuda.matmul.allow_tf32 = previous
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("rows", [5, 9, 32])
+def test_large_batch_reuses_small_arena_and_owns_outputs(fake_capture, rows):
+    graphs, encode = _graphs("cpu", rows=(1, 2, 3, 4))
+    tokens, cnn, att = _inputs(rows, 6, 18, "cpu")
+    actual = graphs.run(tokens, cnn, att)
+    expected = encode(tokens, cnn_cache=torch.cat(cnn), att_cache=torch.cat(att, dim=1))
+    assert actual is not None
+    for value, reference in zip(actual, expected, strict=True):
+        torch.testing.assert_close(value, reference)
+    # A later replay must not corrupt earlier groups or the returned batch.
+    graphs.run(tokens[:1], cnn[:1], att[:1])
+    for value, reference in zip(actual, expected, strict=True):
+        torch.testing.assert_close(value, reference)
+    assert max(key[0] for key in graphs.graphs) == 4
+
+
+@pytest.mark.cpu
+def test_large_batch_rejects_incompatible_cache_rows(fake_capture):
+    graphs, _ = _graphs("cpu", rows=(1, 2))
+    tokens, cnn, att = _inputs(5, 6, 18, "cpu")
+    att[-1] = att[-1].double()
+    assert graphs.run(tokens, cnn, att) is None
