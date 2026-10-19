@@ -215,8 +215,9 @@ upload_pipeline() {
 
 # First parent for a release-line push. A depth-one checkout has the commit
 # but not its parent object, so deepen once before diffing. Failure falls
-# back to RUN_ALL=1 instead of aborting under set -e. That flag uploads every
-# suite and, below, sets VLLM_USE_PRECOMPILED=0 so wheels build from source.
+# back to RUN_ALL=1 instead of aborting under set -e. That uploads every
+# suite. The wheel choice is the precompiled block below: a preset
+# VLLM_USE_PRECOMPILED is kept; otherwise RUN_ALL=1 builds from source.
 release_line_parent_base() {
     if git rev-parse --verify --quiet 'HEAD^' >/dev/null; then
         git rev-parse 'HEAD^'
@@ -236,14 +237,13 @@ release_line_parent_base() {
 # Choose the diff base before any git command that can fail the bootstrap.
 # A release-line push must not call merge-base origin/main: that ref is often
 # absent on a fresh shallow checkout, and set -e would skip the upload.
-# An unresolvable parent sets RUN_ALL=1 because the diff is unknown. The
-# precompiled decision further down treats RUN_ALL=1 as a critical change and
-# sets VLLM_USE_PRECOMPILED=0, so this path builds wheels from source. That is
-# slower than uploading every suite on the existing wheel.
+# An unresolvable parent sets RUN_ALL=1 because the diff is unknown. Do not
+# claim a from-source wheel build here: if VLLM_USE_PRECOMPILED is already
+# set, the block below keeps that value.
 DIFF_BASE=""
 if is_release_line_push; then
     if ! DIFF_BASE=$(release_line_parent_base); then
-        echo "release-line parent is unavailable; running all AMD tests and building wheels from source." >&2
+        echo "release-line parent is unavailable; running all AMD tests (RUN_ALL=1)." >&2
         RUN_ALL=1
         DIFF_BASE=""
     fi
@@ -309,13 +309,14 @@ for file in $file_diff; do
     fi
 done
 
-# Decide whether to use precompiled wheels
-# Relies on existing patterns array as a basis.
+# Decide whether to use precompiled wheels.
+# Relies on the existing patterns array and RUN_ALL decision above. A
+# caller-provided value wins, including when an unknown diff set RUN_ALL=1.
 if [[ -n "${VLLM_USE_PRECOMPILED:-}" ]]; then
     echo "VLLM_USE_PRECOMPILED is already set to: $VLLM_USE_PRECOMPILED"
 elif [[ $RUN_ALL -eq 1 ]]; then
     export VLLM_USE_PRECOMPILED=0
-    echo "Detected critical changes, building wheels from source"
+    echo "Detected critical or unknown changes, building wheels from source"
 else
     export VLLM_USE_PRECOMPILED=1
     echo "No critical changes, using precompiled wheels"

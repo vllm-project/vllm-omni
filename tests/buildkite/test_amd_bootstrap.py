@@ -38,23 +38,35 @@ def _run_bootstrap(
     branch: str | None = None,
     git_verify_status: int = 0,
     git_fetch_status: int = 0,
+    keep_suites: bool = False,
+    vllm_use_precompiled: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
     for relative_path in (
         ".buildkite/common/scripts/ci_conditions.py",
         ".buildkite/common/scripts/resolve_skip_ci.sh",
         ".buildkite/common/scripts/release_line_branch.sh",
         ".buildkite/amd/scripts/select_test_suites.py",
+        ".buildkite/amd/test-template-amd-omni.j2",
+        ".buildkite/amd/test-amd-ready.yml",
+        ".buildkite/amd/test-amd-merge.yml",
+        ".buildkite/amd/test-amd-nightly.yml",
+        ".buildkite/amd/test-amd-weekly.yml",
     ):
         destination = tmp_path / relative_path
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(REPO_ROOT / relative_path, destination)
 
-    # Stop after real suite selection, before rendering or uploading a pipeline.
-    (tmp_path / ".buildkite/common/scripts/skip_ci.py").write_text("print('test-skip')\n", encoding="utf-8")
+    # By default stop after real suite selection. A fallback-path test can make
+    # the gate return non-zero so the suite reaches wheel selection and upload.
+    (tmp_path / ".buildkite/common/scripts/skip_ci.py").write_text(
+        "import os\nprint('test-skip')\nraise SystemExit(int(os.environ.get('TEST_SKIP_CI_STATUS', '0')))\n",
+        encoding="utf-8",
+    )
     env = {
         "PATH": os.environ["PATH"],
         "BUILDKITE_PULL_REQUEST": "123" if pull_request else "false",
         "BUILDKITE_BRANCH": branch if branch is not None else ("feature" if pull_request else "main"),
+        "BUILDKITE_PIPELINE_SLUG": "test-amd-bootstrap",
         "TEST_PYTHON": sys.executable,
         "TEST_CURL_STATUS": str(curl_status),
         "TEST_JQ_STATUS": str(jq_status),
@@ -62,12 +74,21 @@ def _run_bootstrap(
         "TEST_GIT_LOG": str(tmp_path / "git-calls.txt"),
         "TEST_GIT_VERIFY_STATUS": str(git_verify_status),
         "TEST_GIT_FETCH_STATUS": str(git_fetch_status),
+        "TEST_SKIP_CI_STATUS": "1" if keep_suites else "0",
     }
     if debug_test_yaml is not None:
         env["DEBUG_TEST_YAML"] = debug_test_yaml
+    if vllm_use_precompiled is not None:
+        env["VLLM_USE_PRECOMPILED"] = vllm_use_precompiled
 
     # Source the unmodified bootstrap with subprocess-local command doubles.
     script = r"""
+source() {
+    if [[ "$1" == "/var/lib/buildkite-agent/.cargo/env" ]]; then
+        return 0
+    fi
+    builtin source "$@"
+}
 curl() {
     echo 'curl called' >&2
     return "$TEST_CURL_STATUS"
@@ -94,6 +115,11 @@ git() {
     return 0
 }
 python3() { "$TEST_PYTHON" "$@"; }
+minijinja-cli() { printf 'steps: []\n'; }
+buildkite-agent() {
+    printf 'buildkite-agent %s\n' "$*" >&2
+    return 0
+}
 source "$1"
 """
     return subprocess.run(
@@ -209,14 +235,52 @@ def test_release_line_missing_parent_runs_all_instead_of_exiting(tmp_path):
         branch="release/v0.30.0",
         git_verify_status=1,
         git_fetch_status=1,
+        keep_suites=True,
     )
 
     assert result.returncode == 0, result.stderr
-    assert "running all AMD tests" in result.stderr
-    assert "building wheels from source" in result.stderr
+    assert "running all AMD tests (RUN_ALL=1)" in result.stderr
+    assert "Detected critical or unknown changes, building wheels from source" in result.stdout
+    assert "Run all: 1" in result.stdout
+    assert "buildkite-agent pipeline upload pipeline.yaml" in result.stderr
     calls = _git_calls(tmp_path)
     assert "fetch --deepen=1" in calls
     assert any("rev-parse" in call and "--verify" in call for call in calls)
+    assert not any("merge-base" in call for call in calls)
+
+
+def test_release_line_missing_parent_honors_precompiled_preset(tmp_path):
+    result = _run_bootstrap(
+        tmp_path,
+        pull_request=False,
+        branch="release/v0.30.0",
+        git_verify_status=1,
+        git_fetch_status=1,
+        keep_suites=True,
+        vllm_use_precompiled="1",
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "running all AMD tests (RUN_ALL=1)" in result.stderr
+    assert "VLLM_USE_PRECOMPILED is already set to: 1" in result.stdout
+    assert "building wheels from source" not in result.stdout
+    assert "buildkite-agent pipeline upload pipeline.yaml" in result.stderr
+
+
+def test_release_line_deepen_success_but_parent_still_missing_runs_all(tmp_path):
+    result = _run_bootstrap(
+        tmp_path,
+        pull_request=False,
+        branch="release/v0.30.0",
+        git_verify_status=1,
+        git_fetch_status=0,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "running all AMD tests (RUN_ALL=1)" in result.stderr
+    calls = _git_calls(tmp_path)
+    assert calls.count("rev-parse --verify --quiet HEAD^") == 2
+    assert calls.count("fetch --deepen=1") == 1
     assert not any("merge-base" in call for call in calls)
 
 
