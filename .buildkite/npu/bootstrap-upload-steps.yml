@@ -106,7 +106,7 @@ steps:
         # shellcheck disable=SC1091
         source .buildkite/common/scripts/release_line_branch.sh
         EXTRA=""
-        if [ "${NIGHTLY:-}" = "1" ] && is_release_line_branch; then
+        if [ "${NIGHTLY:-}" = "1" ] && is_release_line_push; then
           EXTRA="--all"
         fi
         python3 .buildkite/common/scripts/upload_pipeline.py --upload $$EXTRA .buildkite/npu/test-npu-nightly.yml

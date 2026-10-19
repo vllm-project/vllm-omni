@@ -86,6 +86,7 @@ def test_docs_only_allows_main_scheduled_nightly_weekly_only() -> None:
     assert "NIGHTLY" not in by_key["upload-merge-pipeline"]["if"]
     assert 'build.branch == "main"' in by_key["upload-merge-pipeline"]["if"]
     assert RELEASE_LINE_VERSION_PATTERN in by_key["upload-merge-pipeline"]["if"]
+    assert "build.pull_request.id == null" in by_key["upload-merge-pipeline"]["if"]
     assert 'build.env("WEEKLY") == "1"' in by_key["upload-merge-pipeline"]["if"]
     assert 'build.env("NIGHTLY") == "1"' in by_key["upload-nightly-pipeline"]["if"]
     assert RELEASE_LINE_VERSION_PATTERN in by_key["upload-nightly-pipeline"]["if"]

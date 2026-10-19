@@ -82,7 +82,6 @@ DIFFUSION_SUMMARY_COLUMNS: tuple[str, ...] = (
     "peak_memory_mb_mean",
     "peak_memory_mb_median",
     "slo_attainment_rate",
-    "branch",
     "commit_sha",
     "build_id",
     "build_url",
@@ -206,7 +205,6 @@ def _load_summary_columns(script_dir: str) -> list[str]:
         "mean_audio_duration_s",
         "median_audio_duration_s",
         "p99_audio_duration_s",
-        "branch",
         "commit_sha",
         "build_id",
         "build_url",
@@ -333,12 +331,6 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=None,
         help="Optional build URL; defaults to environment variable BUILDKITE_BUILD_URL if unset.",
-    )
-    parser.add_argument(
-        "--branch",
-        type=str,
-        default=None,
-        help="Optional git branch; defaults to environment variable BUILDKITE_BRANCH if unset.",
     )
     return parser.parse_args()
 
@@ -586,14 +578,14 @@ def _apply_build_metadata_to_latest_only(
     commit_sha: str | None,
     build_id: str | None,
     build_url: str | None,
-    branch: str | None,
 ) -> None:
-    """Set branch, commit_sha, build_id, build_url on rows from the latest calendar day.
+    """Set commit_sha, build_id, build_url on rows from the latest calendar day.
 
     Dates are expected like YYYYMMDD-HHMMSS (filename / benchmark convention). All rows
     whose date starts with the same YYYYMMDD as the lexicographic max date receive
     build metadata; older calendar days get None.
     When max date is shorter than 8 chars, falls back to exact match.
+    Branch stays in the source JSON and is not written into this workbook.
     """
     if not records:
         return
@@ -610,13 +602,12 @@ def _apply_build_metadata_to_latest_only(
         else:
             in_latest_day = False
 
+        r.pop("branch", None)
         if in_latest_day:
-            r["branch"] = branch
             r["commit_sha"] = commit_sha
             r["build_id"] = build_id
             r["build_url"] = build_url
         else:
-            r["branch"] = None
             r["commit_sha"] = None
             r["build_id"] = None
             r["build_url"] = None
@@ -821,11 +812,10 @@ def generate_excel_report(
     commit_sha: str | None,
     build_id: str | None,
     build_url: str | None,
-    branch: str | None,
 ) -> None:
     """Main logic: load JSON records and generate an Excel report with multiple sheets."""
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    omni_summary_columns = _ensure_omni_summary_columns(_load_summary_columns(script_dir))
+    omni_summary_columns = [c for c in _ensure_omni_summary_columns(_load_summary_columns(script_dir)) if c != "branch"]
 
     omni_records = _collect_omni_records(input_dir)
     diffusion_records = _collect_diffusion_records(diffusion_input_dir)
@@ -838,8 +828,8 @@ def generate_excel_report(
     omni_sorted = _sort_records_for_summary(omni_records)
     diffusion_sorted = _sort_diffusion_records_for_summary(diffusion_records)
 
-    _apply_build_metadata_to_latest_only(omni_sorted, commit_sha, build_id, build_url, branch)
-    _apply_build_metadata_to_latest_only(diffusion_sorted, commit_sha, build_id, build_url, branch)
+    _apply_build_metadata_to_latest_only(omni_sorted, commit_sha, build_id, build_url)
+    _apply_build_metadata_to_latest_only(diffusion_sorted, commit_sha, build_id, build_url)
 
     wb = Workbook()
     ws_omni_summary = wb.active
@@ -908,7 +898,6 @@ def main() -> None:
     commit_sha = args.commit_sha or os.getenv("BUILDKITE_COMMIT")
     build_id = args.build_id or os.getenv("BUILDKITE_BUILD_ID")
     build_url = args.build_url or os.getenv("BUILDKITE_BUILD_URL")
-    branch = args.branch or os.getenv("BUILDKITE_BRANCH")
     diffusion_input_dir = args.diffusion_input_dir or _default_diffusion_input_dir(args.input_dir)
 
     generate_excel_report(
@@ -918,7 +907,6 @@ def main() -> None:
         commit_sha=commit_sha,
         build_id=build_id,
         build_url=build_url,
-        branch=branch,
     )
 
 

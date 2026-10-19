@@ -93,9 +93,9 @@ filter_test_specs_by_skip_ci() {
                 continue
                 ;;
             WEEKLY_TESTS:*)
-                # Scheduled main weekly survives docs-only skip-all. A PR
-                # weekly-test label does not.
-                if [[ "$BUILDKITE_BRANCH" == "main" && "${WEEKLY}" == "1" ]]; then
+                # Scheduled release-line weekly survives docs-only skip-all.
+                # A PR weekly-test label, including one opened from release/vX.Y.Z, does not.
+                if is_release_line_push && [[ "${WEEKLY}" == "1" ]]; then
                     runnable_specs+=("$suite_spec")
                     continue
                 fi
@@ -222,7 +222,7 @@ get_diff_main() {
 }
 
 file_diff=$(get_diff)
-if is_release_line_branch; then
+if is_release_line_push; then
     file_diff=$(get_diff_main)
 fi
 
@@ -293,7 +293,7 @@ fi
 
 
 LIST_FILE_DIFF=$(get_diff | tr ' ' '|')
-if is_release_line_branch; then
+if is_release_line_push; then
     LIST_FILE_DIFF=$(get_diff_main | tr ' ' '|')
 fi
 upload_pipeline

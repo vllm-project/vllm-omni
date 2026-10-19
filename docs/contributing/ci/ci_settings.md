@@ -80,11 +80,13 @@ Canonical layout (prefer these paths for new changes):
     | CI level | File | Typical trigger |
     | -------- | ---- | ----------------- |
     | L2 | `cuda/test-ready.yml` | `ready` label |
-    | L3 | `cuda/test-merge.yml` | `merge-test` label / release-line merge (`main` or `release/vX.Y.Z`) |
+    | L3 | `cuda/test-merge.yml` | `merge-test` label / direct release-line push (`main`, or non-PR `release/vX.Y.Z`) |
     | L4 | `cuda/test-nightly.yml` | `nightly-test` label or `NIGHTLY=1` |
     | L5 | `cuda/test-weekly.yml` | `weekly-test` label, `WEEKLY=1`, or `NON_CRITICAL=1` (see step `if`s below) |
 
-    On scheduled release-line builds (`main` or `release/vX.Y.Z`), `test-weekly.yml` is uploaded when **`WEEKLY=1` or `NON_CRITICAL=1`**. Inside that file:
+    A pull request whose source branch is `release/vX.Y.Z` is not a release-line push: `build.branch` is the PR head, so that build still needs a label. Direct pushes to `release/vX.Y.Z` keep the release-line gates. `main` is still matched by branch name alone.
+
+    On scheduled release-line builds (`main` or non-PR `release/vX.Y.Z`), `test-weekly.yml` is uploaded when **`WEEKLY=1` or `NON_CRITICAL=1`**. Inside that file:
 
     - **Reliability** / **Perf Test** / **Simple · CPU Coverage Test** → `WEEKLY=1` (or PR label `weekly-test` for Reliability/Perf). Pipeline upload for scheduled env vars still requires a release line: `main` or a branch named `release/vX.Y.Z` (for example `release/v0.30.0`).
     - **E2E Tests** group (slow Omni/TTS/Diffusion sweeps) → `NON_CRITICAL=1`
@@ -227,7 +229,7 @@ PR diffs drive **two independent skip layers**. Both read changed files from git
 | Build context | Diff command |
 | --- | --- |
 | Pull request | `git diff --name-only origin/<base>...<BUILDKITE_COMMIT>` |
-| Release-line push (`main` or `release/vX.Y.Z`) | `git diff --name-only <commit>^..<commit>` |
+| Release-line push (`main`, or non-PR `release/vX.Y.Z`) | `git diff --name-only <commit>^..<commit>` |
 | Local dry-run / non-PR | Diff unavailable → bootstrap and step filter both keep all steps; uploader-only keys are still stripped |
 
 Label triggers (`ready`, `merge-test`) are unchanged—diff-aware logic only reduces what runs **after** a pipeline is already scheduled.
