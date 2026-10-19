@@ -54,10 +54,10 @@ def _make_state(codes: list[int]) -> tcs.TalkerCodecDeviceState:
 
 
 def _run_both(raw_logits, state, repetition_penalty, temperature):
-    """Run prepare_codec_logits with the fused switch on and off, return both.
+    """Run prepare_codec_logits with the fused path on and off, return both.
 
-    The switch is read once at import, so tests flip the module attribute
-    directly and restore it in a try/finally.
+    The fused path is guarded by the module-level latch `_FUSED_PRELUDE_OK`,
+    so tests flip that attribute directly and restore it in a try/finally.
     """
     device = _device()
     common = dict(
@@ -70,14 +70,14 @@ def _run_both(raw_logits, state, repetition_penalty, temperature):
         top_p=1.0,
         min_p=0.0,
     )
-    original = tcs._FUSED_PRELUDE_ENV
+    original = tcs._FUSED_PRELUDE_OK
     try:
-        tcs._FUSED_PRELUDE_ENV = True
+        tcs._FUSED_PRELUDE_OK = True
         fused = tcs.prepare_codec_logits(raw_logits.clone(), **common)
-        tcs._FUSED_PRELUDE_ENV = False
+        tcs._FUSED_PRELUDE_OK = False
         eager = tcs.prepare_codec_logits(raw_logits.clone(), **common)
     finally:
-        tcs._FUSED_PRELUDE_ENV = original
+        tcs._FUSED_PRELUDE_OK = original
     return fused, eager
 
 

@@ -24,18 +24,21 @@ no-op at its default value.
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 
 import torch
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
 
 VOCAB_SIZE = 6562
 HISTORY_WINDOW = 16
 
-# MINICPMO_TALKER_CODEC_FUSED_PRELUDE=1 (default, adopted 2026-10-17 after a 200-case
-# bit-exact verification on NPU) routes engine steps 6a+7b through one Triton
-# kernel; =0 falls back to the eager chain.
-_FUSED_PRELUDE_ENV = os.environ.get("MINICPMO_TALKER_CODEC_FUSED_PRELUDE", "1") == "1"
+# Engine steps 6a+7b run as one Triton kernel on NPU (adopted 2026-10-17 after a
+# 200-case bit-exact verification). If the kernel fails to compile or launch at
+# runtime, _FUSED_PRELUDE_OK latches to False and the eager chain takes over for
+# the rest of the process; there is no environment switch to manage.
+_FUSED_PRELUDE_OK = True
 _PRELUDE_BLOCK = 1024
 
 try:  # Triton is NPU-only; other backends keep the eager prologue.
@@ -262,24 +265,32 @@ def _rep_pen_temp_fused(
     temperature: torch.Tensor,
 ) -> torch.Tensor | None:
     """Fused rep-penalty + temperature prologue on NPU; None if unsupported."""
+    global _FUSED_PRELUDE_OK
     if not _HAS_TRITON or logits.device.type != "npu":
         return None
     vocab = logits.shape[-1]
     flat = logits.reshape(1, vocab)
     out = torch.empty_like(flat)
     grid = (triton.cdiv(vocab, _PRELUDE_BLOCK),)
-    _rep_pen_temp_kernel[grid](
-        flat,
-        state.history,
-        state.history_len,
-        repetition_penalty.reshape(1, 1),
-        temperature.reshape(1, 1),
-        out,
-        vocab_size=vocab,
-        hist_len=HISTORY_WINDOW,
-        block_size=_PRELUDE_BLOCK,
-        num_warps=4,
-    )
+    try:
+        _rep_pen_temp_kernel[grid](
+            flat,
+            state.history,
+            state.history_len,
+            repetition_penalty.reshape(1, 1),
+            temperature.reshape(1, 1),
+            out,
+            vocab_size=vocab,
+            hist_len=HISTORY_WINDOW,
+            block_size=_PRELUDE_BLOCK,
+            num_warps=4,
+        )
+    except Exception as exc:  # compile/launch failure: latch to the eager chain
+        _FUSED_PRELUDE_OK = False
+        logger.warning(
+            "fused talker codec prelude disabled after a kernel failure: %s", exc
+        )
+        return None
     return out.reshape(logits.shape)
 
 
@@ -323,7 +334,7 @@ def prepare_codec_logits(
     # penalty requests fall back to the eager chain below).
     fused = (
         _rep_pen_temp_fused(logits, state, repetition_penalty, temperature)
-        if (_FUSED_PRELUDE_ENV and not frequency_penalty and not presence_penalty)
+        if (_FUSED_PRELUDE_OK and not frequency_penalty and not presence_penalty)
         else None
     )
     if fused is not None:
