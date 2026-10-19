@@ -33,6 +33,20 @@ turn-based stack free of duplex code, and exposes the same session to three
 consumers: the OpenAI Realtime WebSocket route, the in-process Python API and
 the model plugins.
 
+## Playback completion ownership
+
+`DuplexEngineSession` owns response snapshots and playback cursors. Output
+completion and a client's full `playback.ack` can arrive in either order.
+`finalize_response_playback` is the shared check used by ACK processing,
+normal response completion, draining response completion, and cancellation.
+It retains state while that response is active, any of its requests are still
+draining, or some sent/generated audio is not yet acknowledged. A final output
+can add transcript or completion metadata after the ACK, so history is reconciled
+against the retained cursor before releasing the snapshot and pending item state.
+Deleted history is never reconstructed. Natural drain completion establishes
+`audio_complete`; cancellation does not. A later response's cursor and history
+position remain independent.
+
 ## Architecture
 
 ```text

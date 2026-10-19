@@ -1948,8 +1948,9 @@ class DuplexSessionRunner:
         audio_started = session.playback.generated_ms > 0 or session.playback.sent_ms > 0
         # Barge-in / cancel aborts prior TTS; clear the concurrent-turn release.
         self.run.concurrent_turn_requests_released = False
+        should_commit = self.model.should_commit_response_to_history(session, old_response_id)
         committed_message = session.end_response(
-            commit_text=self.model.should_commit_response_to_history(session, old_response_id),
+            commit_text=should_commit,
             playback_commit_policy=DuplexPlaybackCommitPolicy.ACK_ONLY.value,
         )
         # Playback clear keeps the id. A cancel before any audio was sent does
@@ -1967,6 +1968,8 @@ class DuplexSessionRunner:
                 session.register_history_item(item_id, committed_message)
             elif committed_ms > 0 and not session.playback_ack_is_too_late(old_response_id, item_id):
                 session.truncate_history_item(item_id, audio_end_ms=committed_ms)
+            if should_commit:
+                session.finalize_response_playback(old_response_id)
         draining_cancels: list[tuple[str, int, dict[str, int]]] = []
         seen_responses: set[str] = set()
         if isinstance(old_response_id, str) and old_response_id:
@@ -2001,6 +2004,9 @@ class DuplexSessionRunner:
         for request_id in draining_ids:
             self.plugin.data_plane.close_stream(request_id)
         session.clear_draining_requests()
+        for response_id, _, _ in draining_cancels:
+            if session.finalize_response_playback(response_id):
+                settle_response_runtime(self.plugin, session, committed=True, response_id=response_id)
         if abort_ids:
             await self._abort_request_background(abort_ids, notify=notify)
         if has_running_task and active_task is not None:

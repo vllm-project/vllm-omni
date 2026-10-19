@@ -256,7 +256,13 @@ appending the old turn after the newer input. Neither case commits answer text
 playback and history state. While an older response is still draining audio,
 an ACK that catches up with the audio sent so far keeps its playback and history
 snapshot alive, including when its transcript is temporarily empty. Later text
-and audio still belong to that response; cleanup waits until the drain has ended.
+and audio still belong to that response. Cleanup requires both output completion
+and a full playback ACK, in either order: if the ACK arrives first, the terminal
+output applies that saved progress to the final transcript and releases the
+response without requiring another ACK. Partial playback retains the response
+for a later ACK. Cancellation does not mark unfinished audio as fully generated;
+it never credits an entire unaligned transcript merely because playback caught
+up with the chunks sent before cancellation.
 
 ### Interrupt
 

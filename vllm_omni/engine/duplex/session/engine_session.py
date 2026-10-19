@@ -591,6 +591,7 @@ class DuplexEngineSession:
         self._conversation.pending_item_input_commit_seqs.pop(item_id, None)
         self._conversation.pending_truncations_ms.pop(item_id, None)
         self._conversation.hard_truncations_ms.pop(item_id, None)
+        self._discard_history_item_placeholder(item_id)
 
     @property
     def playback(self) -> DuplexPlaybackView:
@@ -1295,26 +1296,55 @@ class DuplexEngineSession:
             return
         self._playback.by_response.pop(response_id, None)
 
-    def release_finished_drain_response(self, response_id: str | None) -> None:
-        """Drop unused books for a response whose TTS just finished.
+    def finalize_response_playback(self, response_id: str | None) -> bool:
+        """Reconcile history and release finished, fully acknowledged output.
 
-        Overlap leaves the next turn active, so this must not call
-        ``end_response``. Audio that was already sent stays ACK-admissible:
-        the client may ``playback.ack`` after the drain ``response.done``.
-        A response that sent no audio has nothing to acknowledge, so its
-        snapshot, playback cursor, and unused history placeholder are dropped.
-        The live response is left untouched.
+        ACK and output completion may arrive in either order. Both paths use
+        this check; neither requires another client ACK to finish cleanup.
+        Returns whether answer text was committed, for plugin settlement.
         """
-        if response_id is None or response_id == self.active_response_id:
-            return
+        if (
+            response_id is None
+            or response_id == self.active_response_id
+            or self.response_has_draining_request(response_id)
+        ):
+            return False
         playback = self._playback.by_response.get(response_id)
-        if playback is not None and max(playback.sent_ms, playback.generated_ms) > 0:
-            return
-        self._conversation.assistant_response_snapshots.pop(response_id, None)
-        self.release_response_playback(response_id)
+        snapshot = self._conversation.assistant_response_snapshots.get(response_id)
+        committed_history = False
         item_id = f"item_{response_id}"
-        if item_id not in self._conversation.item_ids:
-            self._discard_history_item_placeholder(item_id)
+        if playback is not None:
+            total_ms = max(playback.sent_ms, playback.generated_ms)
+            if self.has_assistant_response_item(response_id, item_id) and playback.committed_ms < total_ms:
+                return False
+            if snapshot is not None and total_ms > 0 and not self.playback_ack_is_too_late(response_id, item_id):
+                if self.has_audio_only_response(response_id):
+                    self.register_history_item(item_id, _object_dict(role="assistant", content=""))
+                else:
+                    # The terminal output may supply text/completion metadata
+                    # after the last ACK. Apply the retained cursor before
+                    # discarding the final transcript and truncation limits.
+                    committed_history = self.truncate_history_item(
+                        item_id, audio_end_ms=playback.committed_ms, playback=playback
+                    )
+        self.release_response_playback(response_id)
+        self.release_response_history_snapshot(response_id)
+        return committed_history
+
+    def release_finished_drain_response(self, response_id: str | None) -> bool:
+        """Finish a natural TTS drain, retaining any audio still awaiting ACK."""
+        if (
+            response_id is None
+            or response_id == self.active_response_id
+            or self.response_has_draining_request(response_id)
+        ):
+            return False
+        playback = self._playback.by_response.get(response_id)
+        if playback is not None:
+            # A terminal event need not carry another audio chunk or repeat
+            # audio_complete. Cancellation does not take this natural-end path.
+            playback.audio_complete = True
+        return self.finalize_response_playback(response_id)
 
     def clear_playback_cursor(self) -> None:
         self._playback.current = DuplexPlaybackCursor()
