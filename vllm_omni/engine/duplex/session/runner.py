@@ -813,7 +813,9 @@ class DuplexSessionRunner:
             for payload in control.payloads:
                 await self.control.on_turn_signal(payload)
         elif isinstance(command, TruncateItem):
-            control = resolve_truncate_item(projector, command)
+            control = resolve_truncate_item(
+                projector, command, has_audio=self.session.history_item_has_audio(command.item_id)
+            )
             self._emit_events(control.events)
             for payload in control.payloads:
                 await self._run_internal_payload(payload)

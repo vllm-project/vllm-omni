@@ -67,11 +67,13 @@ def apply_playback_ack(
             return [
                 error_event("playback_ack_too_late", "playback.ack arrived after a later user input was committed.")
             ]
-        if not history_is_late:
-            session.reserve_history_item(item_id)
     elif item_id is not None:
         return [error_event("playback_item_not_found", "playback.ack requires a response-owned assistant item.")]
     hard_truncate = event.get("truncate") is True
+    if hard_truncate and item_id is not None and not session.history_item_has_audio(item_id):
+        return [error_event("bad_event", "playback.ack truncate requires an item that produced audio")]
+    if item_id is not None and not history_is_late:
+        session.reserve_history_item(item_id)
     if hard_truncate:
         playback = session.acknowledge_playback(int(played_ms), committed_cursor, response_id=response_id)
         playback = session.truncate_playback_commit(committed_cursor, response_id=response_id)

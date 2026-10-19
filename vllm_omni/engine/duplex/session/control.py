@@ -225,6 +225,13 @@ class SessionControl:
             payload = event.get("payload")
             item_id = payload.get("item_id") if isinstance(payload, dict) else None
             audio_end_ms = payload.get("audio_end_ms") if isinstance(payload, dict) else None
+            if isinstance(item_id, str) and not session.history_item_has_audio(item_id):
+                self._out.emit_error(
+                    "bad_event",
+                    "conversation.item.truncate requires an item that produced audio",
+                    event_id=realtime_event_id,
+                )
+                return
             truncated = (
                 session.truncate_history_item(
                     item_id,

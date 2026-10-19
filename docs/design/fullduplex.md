@@ -56,11 +56,19 @@ ACKs cannot change finalized history or restore unheard text. Plugin runtime
 settlement follows all history writes, including cancellation writeback into a
 reserved older turn; it must observe the final committed result.
 
+Audio truncation is valid only for an item whose response produced audio.
+The session checks its live cursor or retained audio provenance before any
+history or playback mutation. Cursor cleanup preserves that provenance only
+for stored history items; deleting or replacing finalized context removes it.
+This distinguishes a retired audio reply from imported context or a reply that never emitted audio
+without retaining its recording or full response snapshot. Realtime commands,
+native truncate signals, and hard playback ACKs reject a no-audio target.
+
 History edits pass the item's own timing marks and playback cursor explicitly;
 the text-prefix calculation never reads the active response implicitly. If both
-marks and duration have been released, a new explicit truncate cannot establish
-a heard prefix and clears the text conservatively. Truncation preserves the
-empty assistant turn so the command's following playback ACK remains valid;
+marks and duration of a known audio reply have been released, a new explicit
+truncate cannot establish a heard prefix and clears the text conservatively.
+Truncation preserves the empty assistant turn so the command's following playback ACK remains valid;
 only deletion removes that turn. Ignored ACKs for finalized history report
 `history_committed: false` and do not settle plugin runtime again, including
 when calibration evidence has been retired.

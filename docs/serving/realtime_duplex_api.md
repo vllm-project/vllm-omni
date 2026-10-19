@@ -1399,11 +1399,17 @@ deferred commit during an active response (`event.response_create_deferred`)
 {"type": "conversation.item.truncated", "item_id": "item_resp_01", "content_index": 0, "audio_end_ms": 1850, "event": {"…": "…"}}
 ```
 
-After this acknowledgement, `conversation.item.retrieve` returns the truncated
+Audio truncation requires audio produced by the target item's response.
+Imported text context and replies that have not produced audio return
+`bad_event`, without changing history, playback progress, or pending truncation.
+A known duration of zero is a bound, not an unspecified duration.
+
+After a successful acknowledgement, `conversation.item.retrieve` returns the truncated
 transcript. Without text/audio alignment marks, its prefix is estimated from
 the requested position and that response's retained audio duration; this is not
-exact word alignment. If neither alignment nor duration remains, an explicit
-truncate clears the transcript conservatively. An empty truncated assistant
+exact word alignment. For a reply that previously produced audio, if neither
+alignment nor duration remains, an explicit truncate clears the transcript
+conservatively. An empty truncated assistant
 item remains addressable for subsequent ACKs; use `conversation.item.delete`
 to remove it. Delayed progress ACKs cannot change finalized history and report
 `history_committed: false`, without repeating tool-result settlement.

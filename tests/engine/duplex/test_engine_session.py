@@ -492,8 +492,9 @@ def test_registered_history_item_cannot_inherit_another_responses_marks(response
         session.register_history_item(f"item_{response}", session.end_response())
     # conversation.item.create also registers messages without a response snapshot.
     session.register_history_item("item_imported", {"role": "assistant", "content": "hello"})
-    assert session.truncate_history_item("item_imported", audio_end_ms=200, hard=True)
-    assert session.history_item_ids["item_imported"]["content"] == ""
+    assert not session.truncate_history_item("item_imported", audio_end_ms=200, hard=True)
+    assert session.history_item_ids["item_imported"]["content"] == "hello"
+    assert "item_imported" not in session._conversation.item_audio_text_marks
 
 
 # ---- turn signals / model turns ----

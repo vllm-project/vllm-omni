@@ -137,6 +137,8 @@ class ConversationHistory:
     item_ids: dict[str, dict[str, object]] = field(default_factory=dict)
     history_item_placeholders: dict[str, dict[str, object]] = field(default_factory=dict)
     item_audio_text_marks: dict[str, list[DuplexAssistantAudioTextMark]] = field(default_factory=dict)
+    # Preserve audio provenance with stored history after releasing its cursor.
+    retired_audio_item_ids: set[str] = field(default_factory=set)
     pending_item_ids: dict[str, dict[str, object]] = field(default_factory=dict)
     pending_item_audio_text_marks: dict[str, list[DuplexAssistantAudioTextMark]] = field(default_factory=dict)
     pending_item_input_commit_seqs: dict[str, int] = field(default_factory=dict)
@@ -1335,7 +1337,25 @@ class DuplexEngineSession:
     def release_response_playback(self, response_id: str | None) -> None:
         if response_id is None or response_id == self.active_response_id:
             return
-        self._playback.by_response.pop(response_id, None)
+        playback = self._playback.by_response.pop(response_id, None)
+        item_id = f"item_{response_id}"
+        if (
+            playback is not None
+            and max(playback.sent_ms, playback.generated_ms) > 0
+            and item_id in self._conversation.item_ids
+        ):
+            self._conversation.retired_audio_item_ids.add(item_id)
+
+    def history_item_has_audio(self, item_id: str) -> bool:
+        """Whether this item's response produced audio, including after cleanup.
+
+        A transcript or an empty cursor does not establish audio ownership.
+        Retired provenance follows the stored item's lifetime, not an ACK's.
+        """
+        playback = self._playback_cursor_for_item_id(item_id)
+        return item_id in self._conversation.retired_audio_item_ids or (
+            playback is not None and max(playback.sent_ms, playback.generated_ms) > 0
+        )
 
     def finalize_response_playback(self, response_id: str | None, *, require_audio_complete: bool = False) -> bool:
         """Reconcile history and release finished, acknowledged or truncated output.
@@ -1533,6 +1553,14 @@ class DuplexEngineSession:
                     playback=self._playback_cursor_for_item_id(item_id),
                 )
             return
+        if item_id in self._conversation.retired_audio_item_ids:
+            # Replacing finalized context does not give the new message the
+            # retired reply's audio ownership, alignment, or permanent cutoff.
+            self._conversation.retired_audio_item_ids.discard(item_id)
+            self._conversation.item_audio_text_marks.pop(item_id, None)
+            self._conversation.heard_prefixes.pop(item_id, None)
+            self._conversation.hard_truncations_ms.pop(item_id, None)
+            self._conversation.pending_truncations_ms.pop(item_id, None)
         message = self._store_history_item_message(item_id, message)
         pending_audio_ms = self._conversation.pending_truncations_ms.get(item_id)
         self._conversation.pending_item_ids.pop(item_id, None)
@@ -1562,6 +1590,7 @@ class DuplexEngineSession:
             self.release_response_playback(response_id)
         message = self._conversation.item_ids.pop(item_id, None)
         self._conversation.item_audio_text_marks.pop(item_id, None)
+        self._conversation.retired_audio_item_ids.discard(item_id)
         pending = self._conversation.pending_item_ids.pop(item_id, None)
         self._conversation.pending_item_audio_text_marks.pop(item_id, None)
         self._conversation.pending_item_input_commit_seqs.pop(item_id, None)
@@ -1617,6 +1646,9 @@ class DuplexEngineSession:
         playback: DuplexPlaybackCursor | DuplexPlaybackView | None = None,
         hard: bool = False,
     ) -> bool:
+        """Apply this item's heard prefix; a hard cut without audio is a no-op."""
+        if hard and not self.history_item_has_audio(item_id):
+            return False
         audio_end_ms = max(0, int(audio_end_ms))
         response_id = item_id.removeprefix("item_") if item_id.startswith("item_") else None
         if response_id is not None and self.history_calibration_retired(response_id):
@@ -1733,6 +1765,7 @@ class DuplexEngineSession:
         if changed and self._message_text_len(message) <= 0 and not hard:
             self._conversation.item_ids.pop(item_id, None)
             self._conversation.item_audio_text_marks.pop(item_id, None)
+            self._conversation.retired_audio_item_ids.discard(item_id)
             self._conversation.messages = [
                 candidate for candidate in self._conversation.messages if candidate is not message
             ]
