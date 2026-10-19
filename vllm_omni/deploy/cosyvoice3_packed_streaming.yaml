@@ -1,4 +1,5 @@
-# Opt-in single-Hopper streaming profile: AR64 / codec16, Flow10.
+# Opt-in single-GPU streaming profile: AR64 / codec16, Flow10.
+# Packed Flow uses FlashAttention 3 on Hopper, FlashAttention 2 on other CUDA GPUs.
 # Request stream=true to measure first audible audio; non-stream latency is not TTFP.
 # Keeps each request's HiFT mel/phase state on GPU and uses mainline GPU FP32 F0.
 # Shared serving settings come from the full-response profile; only chunk
