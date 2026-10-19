@@ -113,10 +113,14 @@ def _attention_isolates_packed_requests(attention_layer: Any) -> bool:
 
 
 def _supports_reference_kv_compaction(blocks: nn.ModuleList) -> bool:
-    """Whether the configured attention path accepts target-only queries."""
+    """Whether every attention path can restore cached reference K/V."""
     for block in iter_minimax_h3_blocks(blocks):
         attention_layer = block.attn.attention
         if _ring_sequence_parallel_is_active(attention_layer):
+            return False
+        # Only no-SP and pure Ulysses consume compacted reference K/V. The
+        # AllGather variants would gather target K/V without the cached rows.
+        if attention_layer._get_active_parallel_strategy().name not in {"none", "ulysses"}:
             return False
         backend = getattr(attention_layer, "attn_backend", None)
         if backend is None or backend.get_name() == "FASTVIDEO_VSA":

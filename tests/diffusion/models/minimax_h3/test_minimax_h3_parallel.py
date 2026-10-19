@@ -85,10 +85,11 @@ def test_reference_kv_compaction_allows_flash_with_unused_vsa_gates():
         def get_name(self) -> str:
             return self.name
 
-    def block(name: str, *, use_ring: bool = False):
+    def block(name: str, *, parallel: str = "none", use_ring: bool = False):
         attention = SimpleNamespace(
             use_ring=use_ring,
             attn_backend=Backend(name),
+            _get_active_parallel_strategy=lambda: SimpleNamespace(name=parallel),
         )
         return SimpleNamespace(
             attn=SimpleNamespace(
@@ -99,8 +100,106 @@ def test_reference_kv_compaction_allows_flash_with_unused_vsa_gates():
 
     assert _supports_reference_kv_compaction(nn.ModuleList())
     assert _supports_reference_kv_compaction([block("FLASH_ATTN")])
+    assert _supports_reference_kv_compaction([block("FLASH_ATTN", parallel="ulysses")])
+    assert not _supports_reference_kv_compaction([block("FLASH_ATTN", parallel="allgather_kv")])
+    assert not _supports_reference_kv_compaction([block("FLASH_ATTN", parallel="ulysses_allgather_kv")])
     assert not _supports_reference_kv_compaction([block("FASTVIDEO_VSA")])
     assert not _supports_reference_kv_compaction([block("FLASH_ATTN", use_ring=True)])
+
+
+@pytest.mark.parametrize("padded", [False, True])
+def test_tier1_allgather_reuses_every_reference_kv_without_compaction(padded: bool):
+    from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata, PackedPaddingMetadata
+    from vllm_omni.diffusion.attention.parallel.allgather_kv import AllGatherKVParallelAttention
+    from vllm_omni.diffusion.models.minimax_h3.reference_kv_cache import MiniMaxH3ReferenceKVTier1State
+
+    reference_mask = torch.tensor([False, True, False, False, True, False, False, False])
+    refresh_k = torch.arange(8, dtype=torch.float32).view(8, 1, 1) + 10
+    refresh_v = refresh_k + 100
+    current_k = refresh_k + 1000
+    current_v = refresh_v + 1000
+    expected_k = current_k.clone()
+    expected_v = current_v.clone()
+    expected_k[reference_mask] = refresh_k[reference_mask]
+    expected_v[reference_mask] = refresh_v[reference_mask]
+
+    states = [
+        MiniMaxH3ReferenceKVTier1State(
+            num_layers=1,
+            global_reference_rows=2,
+            device=torch.device("cpu"),
+            refresh_interval=2,
+            pin_memory=False,
+            skip_reference_projection=True,
+        )
+        for _ in range(2)
+    ]
+    key_chunks = []
+    value_chunks = []
+    for rank, state in enumerate(states):
+        rows = slice(rank * 4, (rank + 1) * 4)
+        state.begin_step(0)
+        state.set_global_reference_mask(reference_mask)
+        state.set_local_reference_mask(reference_mask[rows])
+        state.process_layer(0, refresh_k[rows].clone(), refresh_v[rows].clone())
+        state.end_step()
+
+        state.begin_step(1)
+        assert state.should_skip_reference_projection
+        state.set_global_reference_mask(reference_mask)
+        state.set_local_reference_mask(reference_mask[rows])
+        key, value = state.process_layer(0, current_k[rows].clone(), current_v[rows].clone())
+        key_chunks.append(key.unsqueeze(0))
+        value_chunks.append(value.unsqueeze(0))
+
+    class SPGroup:
+        allgather_world_size = 2
+
+        def __init__(self, rank: int):
+            self.allgather_group = self
+            self.allgather_rank = rank
+            self.calls = 0
+
+        def all_gather(self, tensor, dim=0, separate_tensors=False, group=None):
+            assert dim == 1 and not separate_tensors and group is self.allgather_group
+            chunks = (key_chunks, value_chunks)[self.calls]
+            self.calls += 1
+            torch.testing.assert_close(tensor, chunks[self.allgather_rank])
+            return torch.cat(chunks, dim=dim)
+
+    valid_rows = 6 if padded else 8
+    cu_seqlens = torch.tensor([0, 8], dtype=torch.int32)
+    for rank in range(2):
+        group = SPGroup(rank)
+        strategy = AllGatherKVParallelAttention(group)
+        metadata = AttentionMetadata(
+            packed_padding=(
+                PackedPaddingMetadata(
+                    q_length=valid_rows,
+                    kv_length=valid_rows,
+                    cu_seqlens_q=cu_seqlens,
+                    cu_seqlens_k=cu_seqlens,
+                )
+                if padded
+                else None
+            ),
+            extra={"cu_seqlens_q": cu_seqlens, "valid_kv_length": valid_rows},
+        )
+        _, key, value, metadata, _ = strategy.pre_attention(
+            torch.zeros_like(key_chunks[rank]), key_chunks[rank], value_chunks[rank], metadata
+        )
+        torch.testing.assert_close(key.squeeze(0), expected_k)
+        torch.testing.assert_close(value.squeeze(0), expected_v)
+        assert group.calls == 2
+        assert metadata is not None
+        if padded:
+            assert metadata.packed_padding is not None
+            assert metadata.packed_padding.q_length == (4 if rank == 0 else 2)
+            assert metadata.packed_padding.kv_length == valid_rows
+
+    for state in states:
+        assert state.stats.projection_skipped_layers == 0
+        state.end_step()
 
 
 def test_reference_kv_compaction_records_uniform_projection_reduction():
