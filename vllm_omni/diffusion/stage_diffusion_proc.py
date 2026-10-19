@@ -15,6 +15,7 @@ import multiprocessing.connection
 import signal
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
@@ -285,9 +286,10 @@ class StageDiffusionProc:
                 raise
 
         if method == "profile":
+            assert self._engine is not None
             is_start = args[0] if args else True
             profile_prefix = args[1] if len(args) > 1 else None
-            return await run_executor(self._engine.profile, is_start, profile_prefix)
+            return await run_executor(partial(self._engine.profile, is_start, profile_prefix, **(kwargs or {})))
 
         if method == "add_lora":
             # Reconstruct LoRARequest after IPC if needed.

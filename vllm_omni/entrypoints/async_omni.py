@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 import anyio
 from vllm import TokensPrompt
+from vllm.config.profiler import validate_profile_iteration_bounds
 from vllm.engine.protocol import EngineClient, StreamingInput
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
@@ -938,6 +939,9 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         self,
         profile_prefix: str | None = None,
         stages: list[int] | None = None,
+        *,
+        delay_iterations: int | None = None,
+        max_iterations: int | None = None,
     ) -> list[Any]:
         """Start profiling specified stages.
 
@@ -946,8 +950,24 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         Args:
             profile_prefix: Optional prefix for the trace file names.
             stages: List of stage IDs to profile. If None, profiles all stages.
+            delay_iterations: Optional per-session delayed start (vLLM compat).
+            max_iterations: Optional per-session iteration cap (vLLM compat).
         """
-        return await self.collective_rpc(method="profile", args=(True, profile_prefix), stage_ids=stages)
+        validate_profile_iteration_bounds(delay_iterations, max_iterations)
+        # Mirror upstream ExecutorBase.profile: forward the per-session
+        # controls as kwargs only when set, so workers without them keep
+        # working with plain (is_start, profile_prefix) args.
+        kwargs: dict[str, int] = {}
+        if delay_iterations is not None:
+            kwargs["delay_iterations"] = delay_iterations
+        if max_iterations is not None:
+            kwargs["max_iterations"] = max_iterations
+        return await self.collective_rpc(
+            method="profile",
+            args=(True, profile_prefix),
+            kwargs=kwargs or None,
+            stage_ids=stages,
+        )
 
     async def stop_profile(self, stages: list[int] | None = None) -> list[Any]:  # type: ignore[override]
         """Stop profiling specified stages.

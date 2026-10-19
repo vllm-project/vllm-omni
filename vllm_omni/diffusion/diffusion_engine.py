@@ -1653,12 +1653,21 @@ class DiffusionEngine:
                         output = fut.result(timeout=_async_output_timeout())
                     return output
 
-    def profile(self, is_start: bool = True, profile_prefix: str | None = None) -> None:
+    def profile(
+        self,
+        is_start: bool = True,
+        profile_prefix: str | None = None,
+        *,
+        delay_iterations: int | None = None,
+        max_iterations: int | None = None,
+    ) -> None:
         """Start or stop profiling on all diffusion workers.
 
         Args:
             is_start: True to start profiling, False to stop.
             profile_prefix: Optional prefix for trace filename.
+            delay_iterations: Per-session worker steps before profiling starts.
+            max_iterations: Per-session limit on profiled worker steps.
         """
         if is_start:
             if profile_prefix is None:
@@ -1668,7 +1677,15 @@ class DiffusionEngine:
             logger.info("Stopping diffusion profiling...")
 
         try:
-            self.collective_rpc(method="profile", args=(is_start, profile_prefix))
+            kwargs: dict[str, int] = {}
+            if delay_iterations is not None:
+                kwargs["delay_iterations"] = delay_iterations
+            if max_iterations is not None:
+                kwargs["max_iterations"] = max_iterations
+            if kwargs:
+                self.collective_rpc(method="profile", args=(is_start, profile_prefix), kwargs=kwargs)
+            else:
+                self.collective_rpc(method="profile", args=(is_start, profile_prefix))
         except Exception as e:
             action = "start" if is_start else "stop"
             logger.error(f"Failed to {action} profiling on workers", exc_info=True)

@@ -430,7 +430,10 @@ class DiffusionPagedAttentionAdapter:
         row_indices: list[int],
     ) -> None:
         native_num_blocks = self.block_tables.num_blocks.np
-        blocks_per_kv_block = self.block_tables.blocks_per_kv_block
+        # 02e55d2af3 (#57169): BlockTables pages directly at each group's
+        # block_size; the kernel-block subdivision ratio no longer exists,
+        # so the per-group multiplier below is identity.
+        blocks_per_kv_block = [1] * len(self.block_tables.block_sizes)
         for row, row_index in zip(rows, row_indices, strict=True):
             if type(row_index) is not int or not 0 <= row_index < self.block_tables.max_num_reqs:
                 raise ValueError(f"Paged attention row {row.identity!r} resolved to invalid Worker row {row_index!r}")
