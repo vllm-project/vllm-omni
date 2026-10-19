@@ -101,6 +101,7 @@ class ChunkedMP4Encoder:
         self.height = int(height)
         self._queue: queue.Queue[object] = queue.Queue(maxsize=max_pending)
         self._result: bytes | None = None
+        self.frame_count = 0
         self._error: BaseException | None = None
         self._closed = False
         self._aborted = False
@@ -154,6 +155,7 @@ class ChunkedMP4Encoder:
             try:
                 for frame_data in entry.frames:
                     yield av.VideoFrame.from_ndarray(frame_data, format="rgb24")
+                    self.frame_count += 1
             finally:
                 # Also runs when the muxer raises part-way through this chunk
                 # and abandons the generator, so a lent buffer is never

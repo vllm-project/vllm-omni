@@ -71,6 +71,19 @@ def test_decode_to_mp4_emits_one_container_per_batch_entry():
     assert all(_decoded(v).shape[0] == 8 for v in videos)
 
 
+def test_decode_to_mp4_reports_encoded_counts_for_each_output():
+    counts: list[int] = []
+    videos = decode_to_mp4(
+        _FakeVAE((0.0, 1.0), batch=2, chunks=3, frames=2),
+        torch.zeros(1),
+        fps=24,
+        batch_frames=4,
+        frame_counts=counts,
+    )
+    assert counts == [6, 6]
+    assert [_decoded(video).shape[0] for video in videos] == [6, 6]
+
+
 def test_decode_to_mp4_rejects_a_vae_without_the_capability():
     class PlainVAE:
         def decode(self, z):
