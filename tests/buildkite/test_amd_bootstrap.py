@@ -293,7 +293,12 @@ def test_feature_branch_diff_uses_main_merge_base_once(tmp_path):
 
 
 def test_version_branch_reads_parent_from_commit_header(tmp_path):
-    result = _run_bootstrap(tmp_path, pull_request=False, branch="release/v0.30.0")
+    result = _run_bootstrap(
+        tmp_path,
+        pull_request=False,
+        branch="release/v0.30.0",
+        keep_suites=True,
+    )
 
     assert result.returncode == 0, result.stderr
     assert "cat-file -p HEAD" in _git_calls(tmp_path)
