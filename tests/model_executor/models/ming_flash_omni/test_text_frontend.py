@@ -99,3 +99,45 @@ def test_numeric_terminal_tail_does_not_gain_sentence_punctuation():
         for char in text:
             assert frontend.feed(char) == []
         assert frontend.feed("", final=True) == [text]
+
+
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        (r"Objective \(f(\mathbf{x})\) end.", "Objective end."),
+        (r"Gradient \(\nabla f\) end.", "Gradient end."),
+        ("Display:\n\\[\n\\frac{a}{b}=c\n\\]\nDone.", "Display: Done."),
+        ("Update \\(\\Delta\nx_1\\) done.", "Update done."),
+        (r"Variable \(x\) and \(n\) end.", "Variable and end."),
+        (r"Path C:\dir and a\b stay.", r"Path C:\dir and a\b stay."),
+        (r"Unclosed \( tail stays.", r"Unclosed \( tail stays."),
+        (r"Cost $5 USD; formula \(x_1^2\) done.", "Cost $5 USD; formula done."),
+    ],
+)
+def test_backslash_math_partition_independence(text, expected):
+    from vllm_omni.model_executor.models.ming_flash_omni.front_toolkit import (
+        WebMarkupScrubber,
+        collapse_markup_residue,
+    )
+
+    assert strip_web_markup(text).strip() == expected
+    for width in (1, 2, 7, len(text)):
+        scrubber = WebMarkupScrubber()
+        parts = [scrubber.feed(text[i : i + width]) for i in range(0, len(text), width)]
+        parts.append(scrubber.feed("", final=True))
+        assert collapse_markup_residue("".join(parts)).strip() == expected
+
+
+@pytest.mark.parametrize("scrub_markup", [True, False])
+def test_backslash_math_respects_frontend_option(scrub_markup):
+    text = r"The answer \(x_1^2\) leaves this sentence readable."
+    expected = NativeMingTextFrontend(scrub_markup=scrub_markup).feed(text, final=True)
+    frontend = NativeMingTextFrontend(scrub_markup=scrub_markup)
+    fragments = []
+    for char in text:
+        fragments.extend(frontend.feed(char))
+    fragments.extend(frontend.feed("", final=True))
+    assert fragments == expected
+    spoken = "".join(fragments)
+    assert "leaves this sentence readable" in spoken
+    assert ("x_1" in spoken) is not scrub_markup

@@ -268,7 +268,7 @@ _CURRENCY_UNIT = re.compile(
     r"/(?:months?|mo|years?|yr|weeks?|days?|hours?|hr|minutes?|min|seconds?|sec|tokens?|requests?))\s*",
     re.IGNORECASE,
 )
-_MARKUP_START = re.compile(r"[<&`$]")
+_MARKUP_START = re.compile(r"[<&`$\\]")
 _ENTITY_PREFIX = re.compile(r"&(?:[A-Za-z][A-Za-z0-9]{0,10}|#\d{0,6})?")
 _ENTITY_COMPLETE = re.compile(r"&(?:[A-Za-z][A-Za-z0-9]{0,10}|#\d{1,6});")
 
@@ -283,7 +283,8 @@ def math_like(content: str) -> bool:
 class WebMarkupScrubber:
     """Bounded incremental parser shared by streaming and offline paths.
 
-    Suppress fences, script/style/svg bodies, comments, declarations and math;
+    Suppress fences, script/style/svg bodies, comments, declarations and math
+    ($…$, $$…$$, \\(…\\), \\[…\\]);
     keep ordinary container text, comparisons, prices and inline identifiers.
     Candidate tags/inline code/math are bounded; on overflow they are literal.
     Unfinished comments/blocks/fences suppress through EOF, incomplete ordinary
@@ -343,6 +344,10 @@ class WebMarkupScrubber:
             self._tick_mode(ch)
         elif self.mode == "dollar":
             self._dollar_mode(ch)
+        elif self.mode == "bsl":
+            self._bsl_mode(ch)
+        elif self.mode == "lmath":
+            self._lmath_mode(ch)
         else:
             self._entity_mode(ch)
 
@@ -359,7 +364,9 @@ class WebMarkupScrubber:
                 return
             self._emit(self.hold)  # Double backticks stay literal.
             self.hold = ""
-        if ch in "<&$":
+        if ch == "\\":
+            self.mode, self.hold = "bsl", "\\"
+        elif ch in "<&$":
             self.mode = {"<": "tag", "&": "entity", "$": "dollar"}[ch]
             self.hold = ch
         else:
@@ -489,6 +496,37 @@ class WebMarkupScrubber:
         elif not display and ch == "$":
             self._emit(" " if math_like(self.hold[1:-1]) else self.hold)
             self.mode, self.hold = "out", ""
+
+    def _bsl_mode(self, ch):
+        # Only explicit TeX openers start math; ordinary paths remain literal.
+        if ch in "([":
+            self.mode = "lmath"
+            self.hold = "\\" + ch
+            self.quote = "\\)" if ch == "(" else "\\]"
+        else:
+            self._emit(self.hold)
+            self.mode, self.hold = "out", ""
+            self._out_mode(ch)
+
+    def _lmath_mode(self, ch):
+        # Explicit TeX pairs may span newlines, including malformed command
+        # escapes emitted as a real newline. Keep the existing bounded literal
+        # fallback for unfinished or overlong candidates.
+        display = self.hold.startswith("\\[")
+        closer = self.quote
+        if ch == "`":
+            self._literal()
+            self._out_mode(ch)
+            return
+        cap = (self._DISPLAY_LIMIT + 4) if display else (self._INLINE_LIMIT + 4)
+        if len(self.hold) >= cap:
+            self._literal()
+            self._out_mode(ch)
+            return
+        self.hold += ch
+        if self.hold.endswith(closer):
+            self._emit(" ")
+            self.mode, self.hold, self.quote = "out", "", ""
 
     def _entity_mode(self, ch):
         candidate = self.hold + ch

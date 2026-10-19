@@ -4,11 +4,13 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Any
 
 import torch
 from vllm.inputs import TextPrompt
+from vllm.logger import init_logger
 from vllm.tokenizers import cached_tokenizer_from_config
 
 from vllm_omni.data_entry_keys import CodesStruct, MetaStruct, OmniPayloadStruct
@@ -21,6 +23,8 @@ from .ming_talker import (
     build_ming_talker_additional_info,
     build_ming_talker_inputs,
 )
+
+logger = init_logger(__name__)
 
 
 def thinker2talker_token_only(
@@ -96,6 +100,9 @@ def thinker2talker_async_chunk(
     delta = text[len(state.prefix) : end]
     state.prefix = text[:end]
     fragments = state.frontend.feed(delta, final=is_finished)
+    # Optional sender-side diagnostics before Talker linguistic normalization.
+    if fragments and os.environ.get("MING_TEXT_FRAG_LOG") == "1":
+        logger.info("Ming text fragments req=%s fragments=%r", request_id, fragments)
     if is_finished:
         states.pop(request_id, None)
     if not fragments and not is_finished:
