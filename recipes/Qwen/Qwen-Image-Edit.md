@@ -103,8 +103,8 @@ python examples/offline_inference/image_to_image/image_edit.py \
 
 Validated reference numbers for 1024×1024, 50 denoising steps, batch size 1, `guidance_scale=1.0`, seed 42 (`Cold` = first request after startup, `Warm` = identical subsequent request):
 
-| Cold latency | Warm latency | Peak GPU memory |
-| ---:         | ---:         | ---:            |
+| Cold latency | Warm latency | Peak GPU memory         |
+| ---:         | ---:         | ---:                    |
 | 17.80 s      | 17.78 s      | 61,091 MiB (~59.66 GiB) |
 
 ##### Notes
@@ -131,8 +131,8 @@ Run the same `curl` command as in the **1x H200** Verification section above aga
 
 Same workload as the 1x table above (1024×1024, 50 steps, `guidance_scale=1.0`, seed 42):
 
-| Configuration | Cold latency | Warm latency | Peak per-GPU memory |
-| ---           | ---:         | ---:         | ---:                |
+| Configuration | Cold latency | Warm latency | Peak per-GPU memory     |
+| ---           | ---:         | ---:         | ---:                    |
 | 1x H200       | 17.80 s      | 17.78 s      | 61,091 MiB (~59.66 GiB) |
 | 2x H200 TP=2  | 11.16 s      | 11.09 s      | 49,377 MiB (~48.22 GiB) |
 
@@ -143,6 +143,7 @@ TP=2 reduces single-request warm latency from `17.78 s` to `11.09 s` (≈ **1.60
 - TP=2 shards model weights across both cards, which is what produces both the latency reduction and the per-GPU VRAM drop above.
 - CFG-Parallel (`--cfg-parallel-size 2`) is supported on the Qwen-Image family but only when `cfg_scale > 1`. The verification command above uses `guidance_scale=1.0` to match the public example image, so it does not exercise CFG-parallel; a separate run with `cfg_scale > 1` is needed if you want to benchmark that path.
 - For deeper acceleration knobs (Cache-DiT, sequence parallel, HSDP) see [`docs/user_guide/diffusion/parallelism/overview.md`](../../docs/user_guide/diffusion/parallelism/overview.md); this recipe intentionally documents only the validated TP=2 baseline.
+- Sequence parallel (`--usp N`) keeps text embeddings replicated by default. To shard the text stream as well, set the Qwen-Image-only extra `qwen_image_split_text_embed_in_sp: true`. This pads the text length to a multiple of the SP size and leaves those pad tokens unmasked, so quality can shift slightly. Enable with `--stage-overrides '{"0":{"extras":{"qwen_image_split_text_embed_in_sp":true}}}'`.
 
 #### Profiling
 
