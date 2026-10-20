@@ -19,6 +19,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
     _zero_padded_frames,
 )
 from vllm_omni.model_executor.models.minicpmo_4_5.cuda_graph_wrapper import (
+    SharedPromptAttCache,
     WholeEulerCFMGraphWrapper,
     _att_keep_ranges,
     _build_capture_mask,
@@ -28,6 +29,17 @@ from vllm_omni.model_executor.models.minicpmo_4_5.cuda_graph_wrapper import (
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+def test_shared_prompt_attention_cache_is_bit_exact_and_range_copyable():
+    prefix = torch.arange(2 * 2 * 2 * 1 * 5 * 4, dtype=torch.float32).reshape(2, 2, 2, 1, 5, 4)
+    prompt = torch.arange(2 * 2 * 2 * 1 * 3 * 4, dtype=torch.float32).reshape(2, 2, 2, 1, 3, 4) + 1000
+    shared = SharedPromptAttCache(prefix, prompt)
+    torch.testing.assert_close(shared.materialize(), torch.cat((prefix, prompt), dim=4), rtol=0, atol=0)
+    copied = torch.empty_like(shared.materialize())
+    shared.copy_range_to(copied[..., :4, :], 0, 4)
+    shared.copy_range_to(copied[..., 4:, :], 4, 4)
+    torch.testing.assert_close(copied, shared.materialize(), rtol=0, atol=0)
 
 
 def test_pads_partial_chunk_up_to_bucket():

@@ -82,6 +82,10 @@ connectors:
       # are set.
       token2wav_spk_cpu_reference: true
       token2wav_n_timesteps: 5
+      # Opt-in hierarchical cache: share immutable voice prompt attention cache
+      # across sessions and size the Whole-Euler arena by graph tier.
+      cfm_prompt_att_sharing: false
+      cfm_arena_rows_from_graph_grid: false
 
 stages:
   - stage_id: 0

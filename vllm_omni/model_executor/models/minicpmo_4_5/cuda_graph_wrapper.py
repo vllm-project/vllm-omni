@@ -1090,8 +1090,78 @@ class ResidentAttCache:
         return self.pool.storage[:, :, self.slot].index_select(4, index)
 
 
+class SharedPromptAttCache:
+    """A request attention cache split into a request prefix and an immutable prompt suffix.
+
+    Holds ``(prefix, prompt)`` without joining them into a full tensor.
+    Logical shape is ``(n_t, depth, 2, heads, prefix_frames + prompt_frames, width)``.
+    """
+
+    __slots__ = ("prefix", "prompt")
+
+    def __init__(self, prefix: torch.Tensor, prompt: torch.Tensor) -> None:
+        self.prefix = prefix
+        self.prompt = prompt
+
+    @property
+    def shape(self) -> torch.Size:
+        return torch.Size(
+            (
+                self.prefix.shape[0],
+                self.prefix.shape[1],
+                self.prefix.shape[2],
+                self.prefix.shape[3],
+                self.prefix.shape[4] + self.prompt.shape[4],
+                self.prefix.shape[5],
+            )
+        )
+
+    @property
+    def dtype(self) -> torch.dtype:
+        return self.prefix.dtype
+
+    @property
+    def device(self) -> torch.device:
+        return self.prefix.device
+
+    def data_ptr(self) -> int:
+        """Expose a stable pointer for cache-owner accounting without a full materialization."""
+        return self.prefix.data_ptr()
+
+    def copy_range_to(self, dst: torch.Tensor, start: int, length: int) -> None:
+        """Copy a logical frame range into ``dst`` without joining prompt and tail."""
+        start, length = int(start), int(length)
+        if start < 0 or length < 0 or start + length > int(self.shape[4]):
+            raise ValueError(f"attention-cache range ({start}, {length}) is outside {tuple(self.shape)}")
+        prefix_len = int(self.prefix.shape[4])
+        position = 0
+        if start < prefix_len:
+            count = min(length, prefix_len - start)
+            dst[..., position : position + count, :].copy_(self.prefix[..., start : start + count, :])
+            position += count
+            start += count
+            length -= count
+        if length:
+            prompt_start = start - prefix_len
+            dst[..., position : position + length, :].copy_(self.prompt[..., prompt_start : prompt_start + length, :])
+
+    def materialize(self) -> torch.Tensor:
+        """Materialize the logical cache for eager or unsupported graph paths."""
+        return torch.cat((self.prefix, self.prompt), dim=4)
+
+
+def _copy_att_cache_range(dst: torch.Tensor, src, start: int, length: int) -> None:
+    if isinstance(src, SharedPromptAttCache):
+        src.copy_range_to(dst, start, length)
+    elif isinstance(src, ResidentAttCache):
+        materialized = src.materialize()
+        dst.copy_(materialized[..., int(start) : int(start) + int(length), :])
+    else:
+        dst.copy_(src[..., int(start) : int(start) + int(length), :])
+
+
 def _materialize_att_rows(rows: list) -> list[torch.Tensor]:
-    return [row.materialize() if isinstance(row, ResidentAttCache) else row for row in rows]
+    return [row.materialize() if isinstance(row, (ResidentAttCache, SharedPromptAttCache)) else row for row in rows]
 
 
 class _WholeEulerStatics(NamedTuple):
@@ -1151,6 +1221,7 @@ class WholeEulerCFMGraphWrapper:
         modulation_fn: Callable[[torch.Tensor], torch.Tensor] | None = None,
         att_slots: int = 0,
         row_offsets: bool = False,
+        arena_rows_from_graph_grid: bool = False,
     ) -> None:
         """``ragged_body(estimator, input, t_emb, mask, cnn, att, cnn_out, att_out, lengths)``
         replaces ``estimator.blocks_forward_chunk`` in the captured solve when
@@ -1195,6 +1266,8 @@ class WholeEulerCFMGraphWrapper:
         if pad_max_rows is None:
             pad_max_rows = self.micro_batch_size // 4
         self.pad_max_rows = max(0, int(pad_max_rows))
+        self.arena_rows_from_graph_grid = bool(arena_rows_from_graph_grid)
+        self._arena_rows = max(self._graph_batches()) if self.arena_rows_from_graph_grid else self.micro_batch_size
         # Largest steady cache length a caller announced; sizes the arena storage.
         self._att_capacity = 0
         parameter = next(estimator.parameters(), None)
@@ -1483,7 +1556,7 @@ class WholeEulerCFMGraphWrapper:
         # adding its width on top of the steady offset would hold ~300 frames
         # per row that nothing uses.
         capacity = max(offset + query_cap, max(offset, self._att_capacity) + 2 * self.query_bucket_frames)
-        rows = self.micro_batch_size
+        rows = self._arena_rows
         if self.att_slots:
             # Streaming chunks run from the slot pool; the arena only holds
             # what reaches it (the prompt solve or fallback), not a steady batch.
