@@ -650,7 +650,10 @@ class ModelChannel:
 
     def _build_stage_output(self, item: StageOutput) -> OmniRequestOutput:
         output = item.output
-        finished = bool(getattr(output, "finished", False)) or item.context.segment_finished
+        # A streaming segment boundary is not duplex turn EOS. context.segment_finished
+        # stays true for plugins; the projector object keeps the source finished flag.
+        # Promoting segment_finished here undoes a segment-stop clear of RequestOutput.finished.
+        source_finished = bool(getattr(output, "finished", False))
         if item.decision is not None:
             engine_output = OmniRequestOutput.from_stage_output(
                 output,
@@ -669,17 +672,19 @@ class ModelChannel:
             engine_output = attach_duplex_output_decision(engine_output, item.decision)
         elif isinstance(output, OmniRequestOutput):
             engine_output = copy.copy(output)
-            if finished:
-                engine_output.finished = True
+            engine_output.finished = source_finished
         else:
             final_output_type = getattr(output, "final_output_type", None)
             engine_output = OmniRequestOutput.from_stage_output(
                 output,
                 request_id=item.request_id,
-                finished=finished,
+                finished=source_finished,
                 stage_id=item.stage_id,
                 final_output_type=final_output_type if isinstance(final_output_type, str) else "audio",
             )
+            # from_stage_output copies source.finished last. Lock the projector
+            # flag to that value so a segment boundary cannot reopen turn EOS.
+            engine_output.finished = source_finished
         engine_output.stage_id = item.stage_id
         if self._ctx.plugin.projects_intermediate_outputs and item.stage_id < item.context.final_stage_id:
             engine_output.finished = False

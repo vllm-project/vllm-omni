@@ -67,6 +67,9 @@ class _MiniCPMO45Stage0SessionState:
     streaming_processor: Any | None = None
     audio_buffer: NDArray[np.float32] = field(default_factory=lambda: np.array([], dtype=np.float32))
     audio_chunk_idx: int = 0
+    #: Streaming audio-encoder chunks only. VISION units advance
+    #: ``audio_chunk_idx`` but leave the mel processor on its first window.
+    audio_encoder_chunk_idx: int = 0
     context_embeds: list[torch.Tensor] = field(default_factory=list)
     context_token_ids: list[int] = field(default_factory=list)
     context_prefix_embeds: list[Any] = field(default_factory=list)
@@ -429,13 +432,16 @@ class MiniCPMO45Stage0DuplexRuntime:
                 # after the scheduler accepted a segment stop. Rebuild from
                 # the scheduler's canonical boundary, just like its content.
                 state.pending_terminator_token = completed_terminator
-        if audio_waveform is None or len(audio_waveform) == 0:
-            return self._stage_prefill_result(False, start_time, "empty audio")
         num_frames = len(encoded_frames) if encoded_frames is not None else len(video_frames or ())
-        state.audio_buffer = np.concatenate([state.audio_buffer, np.asarray(audio_waveform, dtype=np.float32)])
+        vision_only = audio_waveform is None or len(audio_waveform) == 0
+        if vision_only and not num_frames:
+            return self._stage_prefill_result(False, start_time, "empty audio")
+        if not vision_only:
+            state.audio_buffer = np.concatenate([state.audio_buffer, np.asarray(audio_waveform, dtype=np.float32)])
         chunk_size = self._streaming_chunk_size(processor)
-        self._pad_first_audio_chunk_if_needed(state, processor)
-        if len(state.audio_buffer) < chunk_size:
+        if not vision_only:
+            self._pad_first_audio_chunk_if_needed(state, processor)
+        if not vision_only and len(state.audio_buffer) < chunk_size:
             if num_frames:
                 # Frames belong to the unit this append closes, and the
                 # scheduler already reserved their vision tokens against this
@@ -481,28 +487,35 @@ class MiniCPMO45Stage0DuplexRuntime:
         # and intentionally leaves a small carry that is not another model unit.
         units_built = 0
         while True:
-            if len(state.audio_buffer) < chunk_size:
+            if vision_only and units_built:
                 break
-            audio_chunk = state.audio_buffer[:chunk_size]
-            batch_feature = self._process_streaming_audio(audio_chunk, state.audio_chunk_idx, processor=processor)
-            for name, value in (
-                ("chunk_idx", state.audio_chunk_idx),
-                ("use_extra_context", True),
-                ("prefix_extra_frames", 0 if state.audio_chunk_idx == 0 else 2),
-                ("suffix_extra_frames", 2),
-            ):
-                with suppress(Exception):
-                    setattr(batch_feature, name, value)
-            audio_embeds = yield _MiniCPMO45AudioEncodeRequest(batch_feature, state)
-            if audio_embeds is None:
-                if units_built == 0:
-                    return self._stage_prefill_result(False, start_time, "streaming audio embedding returned empty")
-                break
-            consumed_samples = self._consumed_audio_samples(
-                state.audio_chunk_idx,
-                chunk_size,
-                processor=processor,
-            )
+            audio_embeds = None
+            consumed_samples = 0
+            if not vision_only:
+                if len(state.audio_buffer) < chunk_size:
+                    break
+                audio_chunk = state.audio_buffer[:chunk_size]
+                encoder_chunk_idx = state.audio_encoder_chunk_idx
+                batch_feature = self._process_streaming_audio(audio_chunk, encoder_chunk_idx, processor=processor)
+                for name, value in (
+                    ("chunk_idx", encoder_chunk_idx),
+                    ("use_extra_context", True),
+                    ("prefix_extra_frames", 0 if encoder_chunk_idx == 0 else 2),
+                    ("suffix_extra_frames", 2),
+                ):
+                    with suppress(Exception):
+                        setattr(batch_feature, name, value)
+                audio_embeds = yield _MiniCPMO45AudioEncodeRequest(batch_feature, state)
+                if audio_embeds is None:
+                    if units_built == 0:
+                        return self._stage_prefill_result(False, start_time, "streaming audio embedding returned empty")
+                    break
+                consumed_samples = self._consumed_audio_samples(
+                    encoder_chunk_idx,
+                    chunk_size,
+                    processor=processor,
+                )
+                state.audio_encoder_chunk_idx += 1
             if state.audio_chunk_idx > 0:
                 # Official duplex closes every unit (finalize_unit feeds the
                 # sampled terminator + </unit>) before the next <unit> opens.
@@ -549,10 +562,11 @@ class MiniCPMO45Stage0DuplexRuntime:
                         embed_parts.append(self._embed_token(end_id))
                         token_ids.append(int(end_id))
                 frame_blocks = []
-            embed_parts.append(audio_embeds)
-            token_ids.extend(
-                [self._audio_embedding_placeholder_token_id()] * int(self._as_2d_tensor(audio_embeds).shape[0])
-            )
+            if audio_embeds is not None:
+                embed_parts.append(audio_embeds)
+                token_ids.extend(
+                    [self._audio_embedding_placeholder_token_id()] * int(self._as_2d_tensor(audio_embeds).shape[0])
+                )
             state.audio_buffer = state.audio_buffer[consumed_samples:]
             state.audio_chunk_idx += 1
             units_built += 1
@@ -588,7 +602,12 @@ class MiniCPMO45Stage0DuplexRuntime:
                 "stage0_window_replaced": window_result is not None,
             }
         )
-        if is_speech and (append_identity is None or state.pending_speech_append_identity != append_identity):
+        # Standalone VISION input can open a response without speech. Camera
+        # frames accompanying silent audio must retain the OMNI speech gate:
+        # otherwise every frame can re-open a completed conversation turn.
+        if (is_speech or (vision_only and num_frames)) and (
+            append_identity is None or state.pending_speech_append_identity != append_identity
+        ):
             state.pending_speech_context = True
             state.pending_speech_append_identity = append_identity
         if append_identity is not None:
@@ -877,7 +896,7 @@ class MiniCPMO45Stage0DuplexRuntime:
         state: _MiniCPMO45Stage0SessionState,
         processor: Any | None = None,  # Any: remote-code processor
     ) -> None:
-        if state.audio_chunk_idx != 0 or len(state.audio_buffer) == 0:
+        if state.audio_encoder_chunk_idx != 0 or len(state.audio_buffer) == 0:
             return
         first_chunk_samples = self._first_chunk_samples(
             self._streaming_chunk_size(processor),
@@ -1294,6 +1313,8 @@ class MiniCPMO45Stage0DuplexRuntime:
     @staticmethod
     def _decode_audio_payload(payload: dict[str, object]) -> NDArray[np.float32]:
         audio = payload.get("audio") or payload.get("data")
+        if not audio and payload.get("video_frames"):
+            return np.empty(0, dtype=np.float32)
         if not isinstance(audio, str):
             raise ValueError("audio append payload requires base64 audio")
         fmt = payload.get("format") or "pcm_f32le"
