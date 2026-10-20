@@ -122,6 +122,16 @@ _OTHER_DEFAULTS = {
     "enable_hift_graph",
     "enable_cfm_graph",
     "cfm_onset_merge",
+    "enable_code2wav_encoder_graph",
+    "code2wav_encoder_capture_after_precapture",
+    "cfm_fused_body",
+    "cfm_slot_pool",
+    "enable_whole_euler",
+    "cfm_row_offset_merge",
+    "cfm_encoder_cuda_graph",
+    "cfm_cross_turn_buckets",
+    "cfm_precapture_empty_cache",
+    "cfm_drop_upstream_att_buffer",
 }
 
 
@@ -144,3 +154,53 @@ def test_quoted_false_disables_other_stage_flags(tmp_path, monkeypatch, npu_plat
     assert model._precapture_pending is False
     assert model._hift_graph_config["enabled"] is False
     assert model._ref_prefetch_enabled is False
+
+
+def test_quoted_false_disables_default_on_flags(tmp_path, monkeypatch, npu_platform):
+    """`cfm_fused_body` and `enable_whole_euler` default on: a quoted "false" must still turn them off."""
+    model, _ = _build_backend(
+        tmp_path,
+        monkeypatch,
+        {"cfm_fused_body": "false", "enable_whole_euler": "false"},
+    )
+    assert model._cfm_graph_config["fused_body"] is False
+    assert model._cfm_graph_config["enable_whole_euler"] is False
+
+
+def test_quoted_true_enables_flags_previously_compared_with_is_true(tmp_path, monkeypatch, npu_platform):
+    model, _ = _build_backend(
+        tmp_path,
+        monkeypatch,
+        {
+            "cfm_row_offset_merge": "true",
+            "cfm_slot_pool": "true",
+            "cfm_encoder_cuda_graph": "true",
+            "enable_code2wav_encoder_graph": "true",
+            "cfm_cross_turn_buckets": "true",
+            "cfm_precapture_empty_cache": "true",
+        },
+    )
+    assert model._cfm_graph_config["row_offset_merge"] is True
+    assert model._cfm_graph_config["slot_pool"] is True
+    assert model._encoder_graph_config["enabled"] is True
+    assert model._chunk_encoder_graph_config["enabled"] is True
+    assert model._cross_turn_buckets is True
+    assert model._precapture_empty_cache is True
+
+
+def test_explicit_null_falls_back_to_the_default(tmp_path, monkeypatch, npu_platform):
+    """`key: ~` in a YAML override means "unset", not "false"."""
+    model, token2wav = _build_backend(
+        tmp_path,
+        monkeypatch,
+        {
+            "token2wav_device_spk": None,
+            "cfm_fused_body": None,
+            "cfm_graph_precapture": None,
+            "enable_whole_euler": None,
+        },
+    )
+    assert token2wav.device_spk_calls == 1
+    assert model._cfm_graph_config["fused_body"] is True
+    assert model._cfm_graph_config["enable_whole_euler"] is True
+    assert model._precapture_pending is True

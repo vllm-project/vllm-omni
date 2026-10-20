@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any
 
 
@@ -26,3 +27,16 @@ def parse_bool_flag(value: Any, key: str) -> bool:
         if token in ("false", "0"):
             return False
     raise ValueError(f"{key} must be a boolean (true/false/1/0), got {value!r}")
+
+
+def read_bool_flag(extra: Mapping[str, Any], key: str, default: bool) -> bool:
+    """Read ``extra[key]`` strictly, keeping ``default`` when the key is unset.
+
+    An explicit ``null`` (``key: ~`` in a YAML override) means "not set" and
+    falls back to ``default`` rather than flipping the feature off, so dropping
+    a key from a stage config never changes behaviour silently.
+    """
+    value = extra.get(key, default)
+    if value is None:
+        return default
+    return parse_bool_flag(value, key)
