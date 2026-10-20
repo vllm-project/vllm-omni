@@ -10,12 +10,25 @@
 - Mode: Online serving with the OpenAI-compatible Chat Completions API
 - Maintainer: Community
 
-## When to use this recipe
+## References
+
+- [Hugging Face model](https://huggingface.co/inclusionAI/Ming-3.0-audio-flash)
+- [Upstream repository](https://github.com/inclusionAI/Ming)
+
+## Overview
 
 Use this recipe to transcribe multilingual audio or answer a question spoken in an audio clip.
 ASR and Speech QA share the Ming3 audio thinker; requests for audio output additionally run the bundled Ming talker and AudioVAE.
 
-## Serve
+## CUDA
+
+### Environment
+
+- Linux, Python 3.11–3.13, and vLLM-Omni matching vLLM 0.32.0.
+- Client examples use Bash, `curl`, `jq`, and GNU `base64`.
+- Run commands from the repository root. Speech output also requires the [text normalization resources](#text-normalization-resources).
+
+### Command
 
 The default end-to-end configuration targets four 80 GB-class GPUs.
 The thinker runs with TP=4 and the talker is colocated on GPU 3.
@@ -35,7 +48,7 @@ vllm serve inclusionAI/Ming-3.0-audio-flash \
 
 For two H200 GPUs, the following example selects TP=2:
 
-Example ming3_audio_flash_2gpu_h200.yaml
+Save the following overlay as `vllm_omni/deploy/ming3_audio_flash_2gpu_h200.yaml`:
 
 ```yaml
 base_config: ming3_audio_flash.yaml
@@ -51,7 +64,7 @@ stages:
     gpu_memory_utilization: 0.10
 ```
 
-Launch the server with
+Launch the server with:
 
 ```bash
 vllm serve /path/to/inclusionAI/Ming-3.0-audio-flash \
@@ -187,7 +200,11 @@ repetition blocking for text-only transcription; use a full profile for speech o
 Tiny templates have configuration-resolution coverage; validate their checkpoint
 compatibility, memory requirements and output quality on the target GPU.
 
-## Transcribe with Chat Completions
+## Verification
+
+Use a full Thinker/Talker profile for the speech-output examples. Text-only profiles support transcription and text QA. Run client requests in a separate terminal after the server is ready.
+
+### Transcribe with Chat Completions
 
 ```bash
 curl http://localhost:8091/v1/chat/completions \
@@ -215,9 +232,9 @@ curl http://localhost:8091/v1/chat/completions \
     }' | jq -r '.choices[0].message.content'
 ```
 
-## Ask a question in audio
+### Ask a question in audio
 
-Example inputs:
+Set `MING3_AUDIO_FILE` to the example clip in your downloaded model directory:
 
 ```bash
 MING3_AUDIO_FILE=/path/to/inclusionAI/Ming-3.0-audio-flash/examples/audio_files/introduce_ant_group.wav
@@ -244,7 +261,7 @@ base64 -w0 "$MING3_AUDIO_FILE" | jq -Rs '{
     --data-binary @- | jq -r '.choices[0].message.content'
 ```
 
-## Speak the answer
+### Speak the answer
 
 Select an explicit IP voice for a repeatable comparison. The two stages stay loaded in the service.
 
@@ -290,8 +307,8 @@ jq -r '.choices[0].message.audio.data' response.json \
 
 ### Text normalization resources
 
-Speech-output profiles enable `normalize_text: true` and `tn_mode: upstream`.
-Install the `ming-tn` optional dependencies in the serving environment(`pynini==2.1.7` and `inflect`).
+Full Flash/Tiny speech-output profiles enable `normalize_text: true` and `tn_mode: upstream`.
+Install the `ming-tn` optional dependencies in the serving environment (`pynini==2.1.7` and `inflect`).
 The native Talker reads the four `{zh,en}_tn_{tagger,verbalizer}.fst` files from the selected model's `talker/talker_tn/` directory; vLLM-Omni does not bundle these binary files.
 The checkpoint resolver includes this directory in its `talker/**` download, and `--revision` selects the same snapshot for weights and normalization rules. A complete local export or cached snapshot works offline.
 
@@ -302,6 +319,8 @@ copying an export for speech output. Explicit `tn_mode: legacy` or
 pronunciation of numbers, dates and amounts. Text-only ASR does not load them.
 
 ## Standalone text to speech
+
+Stop the full server before starting the standalone service on the same port. Run the request in a separate terminal after startup.
 
 Converted Ming3 exports contain a `talker/` directory with the Talker config,
 LLM tokenizer, AudioVAE and speaker extractor. Serve that export with the
