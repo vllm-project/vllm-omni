@@ -20,6 +20,7 @@ from vllm_omni.config import stage_config
 from vllm_omni.config.config_factory import StageConfigFactory
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig, PipelineConfig, StagePipelineConfig
 from vllm_omni.engine.duplex.config import DuplexCapabilities
+from vllm_omni.entrypoints.duplex.openai import OpenAIRealtimeHandler
 from vllm_omni.entrypoints.duplex.serving import OmniDuplexSessionHandler
 from vllm_omni.entrypoints.duplex.warmup import wait_for_duplex_warmup
 from vllm_omni.entrypoints.duplex_omni import DuplexOmni
@@ -385,13 +386,13 @@ def _turn_based_realtime_app(handler: object | None, mocker) -> FastAPI:
     )
     app.state.engine_client = mocker.Mock()
     app.state.openai_serving_chat = mocker.Mock()
+    app.state.openai_realtime_handler = OpenAIRealtimeHandler()
     return app
 
 
 def _assert_openai_realtime_connection(client: TestClient, path: str) -> None:
     with client.websocket_connect(path) as websocket:
         assert websocket.receive_json()["type"] == "session.created"
-        assert websocket.receive_json()["type"] == "conversation.created"
         websocket.send_json({"type": "unknown_event"})
         error = websocket.receive_json()
         assert error["type"] == "error"
@@ -462,6 +463,19 @@ def test_turn_based_deployment_uses_openai_realtime(mocker) -> None:
 
     with TestClient(app) as client:
         _assert_openai_realtime_connection(client, "/v1/realtime?model=omni-model")
+
+
+def test_turn_based_realtime_answers_session_update_with_session_updated(mocker) -> None:
+    """Clients send session.update right after session.created and expect session.updated next."""
+    app = _turn_based_realtime_app(None, mocker)
+
+    with TestClient(app) as client:
+        with client.websocket_connect("/v1/realtime?model=omni-model") as websocket:
+            assert websocket.receive_json()["type"] == "session.created"
+            websocket.send_json(
+                {"type": "session.update", "session": {"type": "realtime", "instructions": "Be brief."}}
+            )
+            assert websocket.receive_json()["type"] == "session.updated"
 
 
 # --------------------------------------------------------------------------- #

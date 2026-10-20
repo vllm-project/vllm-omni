@@ -7,11 +7,12 @@ import pytest
 import torch
 from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import Qwen3OmniMoeCode2WavConfig
 
+from tests.helpers.mark import hardware_marks
 from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_code2wav import Qwen3OmniMoeCode2Wav
 
 pytestmark = [
     pytest.mark.core_model,
-    pytest.mark.cuda,
+    *hardware_marks(res={"cuda": "L4"}, num_cards=1),
     pytest.mark.skipif(not torch.cuda.is_available() or torch.version.hip is not None, reason="requires CUDA"),
 ]
 

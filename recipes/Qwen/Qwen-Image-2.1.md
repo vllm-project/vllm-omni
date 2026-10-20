@@ -80,6 +80,63 @@ curl http://localhost:8091/v1/images/generations \
   }'
 ```
 
+### Four-GPU BF16 eager inference
+
+Start a four-GPU server with the checkpoint's native eight-step schedule:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 vllm serve Qwen/Qwen-Image-2.1-Turbo \
+  --omni --enforce-eager --dtype bfloat16 --num-gpus 4 \
+  --tensor-parallel-size 1 --usp 4 --ring 1 --cfg-parallel-size 1 \
+  --vae-patch-parallel-size 1 --max-num-seqs 1 \
+  --diffusion-attention-backend FLASH_ATTN --port 8098
+```
+
+The default communication backend remains the reference all-to-all. On a
+qualified CUDA installation, opt into symmetric-memory exchange with
+`--ulysses-a2a-permute`. This requires a working CUDA compiler/toolkit and
+NCCL 2.28 or later with symmetric-memory device support, including the wheel
+library/header layout required by the current extension builder. Missing
+requirements fail explicitly at initialization when opted in. No rank-local
+fallback is attempted after collectives have started.
+
+Eligible equal BF16 Q/K/V tensors then share one exchange; other layouts
+retain the separate exchanges. Backend selection uses the common parallel
+configuration; it does not depend on a model name or a hardware-name heuristic.
+
+Shared kernels live under `vllm_omni/diffusion/layers/`: pointwise fusion
+preserves BF16 intermediate roundings. Both standalone RoPE and full head128
+Q/K norm/RoPE require SM103 with CUDA/PyTorch 2.13, where the reduction and
+complex FMA order were validated. Other architectures, including SM90, retain
+the reference normalization and complex RoPE arithmetic. The channel-first VAE norm
+helper and epilogue are shared with Wan; Wan's channels-last policy stays in
+its own adapter.
+
+Exact pure-T2I text conditioning is bounded by 16 entries and 16 MiB.
+Image conditioning, batched prompts, training/gradients, LoRA and CPU offload
+bypass and invalidate this cache. Geometry follows the request's KV lifetime,
+with weak ownership and denoise-finally cleanup that preserves decode graphs.
+Generated images and sampled latents are never reused by these optimizations.
+
+After the server reports ready, send a full eight-step image request:
+
+```bash
+curl --fail --silent --show-error http://127.0.0.1:8098/health
+curl --fail --silent --show-error \
+  http://127.0.0.1:8098/v1/images/generations \
+  -H 'Content-Type: application/json' \
+  --data-binary @- > qwen-image-response.json <<'JSON'
+{"model":"Qwen/Qwen-Image-2.1-Turbo","prompt":"A ceramic teapot on a wooden table","seed":42,"n":1,"size":"1280x704","response_format":"b64_json","output_format":"png","output_compression":100,"true_cfg_scale":1.0,"sigmas":[1.0,0.978453,0.95418,0.926626,0.89508,0.845148,0.704534,0.414568]}
+JSON
+```
+
+The response contains a base64-encoded PNG in `data[0].b64_json`. This request
+checks generation; it does not measure latency. For performance comparisons,
+freeze the benchmark and accuracy checks independently of the optimization,
+use identical inputs and declared configurations, and compare native RGB and
+alpha outputs. Report cold/unseen prompts separately from warmed repeated
+prompts, which can reuse exact text conditioning.
+
 ## Offline Inference
 
 ### Text-to-image
@@ -461,3 +518,95 @@ unless noted; 4× NVIDIA H200):
   spatial compression). On CUDA OOM the tile size is automatically halved
   (keeping 25% overlap) and decoding retried, down to 128px tiles. Tile sizes
   are not yet exposed as engine arguments.
+
+## NPU performance defaults
+
+Qwen-Image-2.1 enables the following optimizations automatically on eligible
+NPU paths. The measured workload is Qwen-Image-2.1-Turbo, BF16, TP1, eager
+execution, batch 1, CFG1 and 1280×704 on Ascend 910B1. These defaults do not
+change the sampling schedule or select a different attention backend.
+
+These optimizations are selected automatically, without environment switches:
+
+- Interleaved NPU RoPE.
+- Broadcast modulation during BF16 batch-1 eager decode without SP.
+- Residual buffer reuse during eligible BF16 eager inference.
+- NZ storage for eligible BF16 NPU linear weights.
+- Model-local fusion attention for eligible calls with SDPA selected.
+- Triton Ascend SwiGLU fusion on eligible Ascend910B1 BF16 inputs.
+
+`QWEN21_FUSION_PRECISE` still controls fusion attention precision (default `0`).
+
+The automatic attention path requires TP1, no SP, no CPU offload, no
+quantization, batch 1, equal Q/K/V head counts, no metadata, no gradients and
+no compilation. It executes inside shared Attention dispatch. Other models,
+other selected backends, masked calls and graph execution keep their existing
+paths. Causal attention and unequal Q/K/V head counts also retain ordinary SDPA.
+
+Automatic NZ conversion requires unquantized TP1 execution without CPU offload,
+sequence parallelism, HSDP or a configured `lora_path`, BF16 NPU weights, and
+`allow_internal_format=True`
+already configured in the runtime. Otherwise it is skipped. Eligibility follows
+eager execution, not `enable_cuda_graph_decode`. On NPU this transformer stays
+eager either way: Ascend does not torch.compile it, and CUDA graph capture does
+not run, so the default graph manager falls back to eager and still converts.
+The model never changes the global internal-format setting. Conversion is
+skipped when its prerequisites are absent.
+Conversion runs while the transformer loads its weights. Distilled LoRA fusion
+adds ND deltas into those weights afterwards, and HSDP shards or broadcasts
+them, so both configurations keep ND storage.
+Residual reuse requires the eager prepared-modulation path and does not mutate
+its input or combine multiplication/addition rounding into one fused operation.
+
+VAE spatial-padding folding, prompt caching, request geometry reuse and shared
+modulation preparation apply under their own guards.
+
+VAE normalization also reuses its fresh FP32 conversion buffer on NPU for
+FP16/BF16 inference without autograd or compilation. It preserves the L2 norm,
+epsilon clamp and sequential scaling operations, and never overwrites the
+input. A separate 1024×1024,
+8-step Ascend 910B1 comparison validated pixel-identical outputs; its results
+should not be combined with the 1280×704 measurements above.
+
+Unquantized NPU BF16 MLP inference also reuses fresh gate-projection storage
+for separate SiLU and multiplication operations. Autograd, compilation and
+other dtypes retain the original path. VAE normalization skips its fixed Python
+zero bias, while trainable tensor biases are still applied. These changes need
+no additional environment flags and were validated with the 1024×1024 workload.
+
+### Triton Ascend SwiGLU fusion
+
+This path is enabled automatically when its eligibility checks pass.
+Earlier default-configuration measurements excluded this fusion and must not
+be treated as measurements of the new default. With Triton Ascend
+installed, unquantized eager BF16 inference on Ascend910B1 fuses the
+two-input SiLU/multiply path for batch 1, hidden width
+4096 and sequence length at least 4096. Both projected tensors must have width
+12288 and contiguous ND storage. Other cases use the existing implementation.
+The kernel reuses the fresh gate projection, preserves BF16 rounding after
+SiLU, and does not concatenate gate/up tensors. Sequence lengths share a single
+compiled kernel; initial compilation is excluded from warmed latency results.
+
+Focused validation (requires the project's NPU test environment):
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=0 python -m pytest \
+  tests/diffusion/models/qwen_image_21/test_npu_fused_ops.py \
+  --run-level core_model -q
+```
+
+### Conditioning cache and graph fallback scope
+
+The model-local text-only prompt cache matches upstream main. A single string
+prompt is cached directly and does not consult `enable_prompt_embed_cache`.
+Editing, multi-prompt calls, training, autograd, LoRA, and offload bypass the
+cache and drop stored text entries. The shared runner cache keeps its own
+default and collective-safety checks.
+
+Single-request step decode retains its request KV owner. Geometry is stored
+per CFG branch on that owner; rebuilding an equivalent mask no longer invalidates
+it. Prefix layout must remain fixed for the lifetime of that branch's KV cache.
+
+Shared modulation applies to eager prefill and eager decode fallback even when
+a decode graph manager exists. Captured graph execution is unchanged; no new
+graph-mode performance improvement is claimed.

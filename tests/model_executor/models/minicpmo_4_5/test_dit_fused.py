@@ -6,10 +6,15 @@ import pytest
 import torch
 import torch.nn as nn
 
+from tests.helpers.mark import hardware_marks
 from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import BatchedToken2Wav
-from vllm_omni.model_executor.models.minicpmo_4_5.dit_fused import blocks_forward_chunk_fused, supports_fused_body
+from vllm_omni.model_executor.models.minicpmo_4_5.dit_fused import (
+    blocks_forward_chunk_fused,
+    dit_modulation,
+    supports_fused_body,
+)
 
-pytestmark = [pytest.mark.core_model, pytest.mark.cuda]
+pytestmark = [pytest.mark.core_model, *hardware_marks(res={"cuda": "L4"}, num_cards=1)]
 
 _DEVICES = ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
 
@@ -68,3 +73,23 @@ def test_unsupported_estimator_is_refused() -> None:
     estimator = _upstream_dit("cpu")
     estimator.blocks[0].attn.q_norm = nn.Identity()
     assert not supports_fused_body(estimator)
+
+
+@pytest.mark.parametrize("cached", [0, 5])
+def test_ragged_body_reuses_modulation_without_recomputing_adaln(monkeypatch, cached):
+    estimator = _upstream_dit("cpu")
+    reference = BatchedToken2Wav._blocks_forward_chunk_ragged
+    expected = _run(reference, estimator, rows=4, frames=6, cached=cached, lengths=[6, 4])
+
+    def unexpected_forward(*args):
+        raise AssertionError("cached modulation must bypass adaLN projections")
+
+    def precomputed(estimator, estimator_input, time_embedding, *args):
+        table = dit_modulation(estimator, time_embedding[:1])
+        for layer in (*estimator.blocks, estimator.final_layer):
+            monkeypatch.setattr(layer.adaLN_modulation, "forward", unexpected_forward)
+        return reference(estimator, estimator_input, time_embedding, *args, modulation=table)
+
+    actual = _run(precomputed, estimator, rows=4, frames=6, cached=cached, lengths=[6, 4])
+    for want, got in zip(expected, actual, strict=True):
+        torch.testing.assert_close(got, want, rtol=1e-4, atol=2e-5)

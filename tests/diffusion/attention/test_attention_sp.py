@@ -43,7 +43,7 @@ import pytest
 import torch
 import torch.distributed
 
-from tests.helpers.mark import hardware_test
+from tests.helpers.mark import hardware_marks, hardware_test
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata, PackedPaddingMetadata, QueryRange
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.attention.parallel.allgather_kv import (
@@ -66,7 +66,7 @@ from vllm_omni.diffusion.distributed.parallel_state import (
 from vllm_omni.diffusion.forward_context import set_forward_context
 from vllm_omni.platforms import current_omni_platform
 
-pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
 
 
 def update_environment_variables(envs_dict: dict[str, str]):
@@ -202,6 +202,7 @@ class _MockAllGatherSPGroup:
         return torch.cat(chunks, dim=dim)
 
 
+@pytest.mark.cpu
 def test_allgather_kv_slices_full_dense_mask_to_local_query_rows():
     rank = 1
     joint_len = 1
@@ -267,6 +268,7 @@ def _packed_metadata(cu: list[int], max_len: int, valid_kv_length: int | None = 
     return AttentionMetadata(extra=extra, **kwargs)
 
 
+@pytest.mark.cpu
 def test_allgather_kv_remaps_packed_query_boundaries():
     """Packed backends consume cu_seqlens_q, not query_ranges: remap per rank.
 
@@ -308,6 +310,7 @@ def test_allgather_kv_remaps_packed_query_boundaries():
         assert metadata_local.extra["max_seqlen_q"] == 8
 
 
+@pytest.mark.cpu
 def test_allgather_kv_packed_document_without_local_rows_keeps_entry():
     """A document fully outside this rank's span keeps a zero-length entry.
 
@@ -335,6 +338,7 @@ def test_allgather_kv_packed_document_without_local_rows_keeps_entry():
     assert metadata_local.extra["cu_seqlens_k"].tolist() == cu
 
 
+@pytest.mark.cpu
 def test_allgather_kv_packed_single_request_with_padding():
     """The [real, pad] single-document packing narrows to the local valid prefix.
 
@@ -378,6 +382,7 @@ def test_allgather_kv_packed_single_request_with_padding():
         assert packed.cu_seqlens_k.tolist() == [0, 10]
 
 
+@pytest.mark.cpu
 def test_allgather_kv_rejects_packed_metadata_with_joint():
     """Packed cu_seqlens combined with joint attention is undefined; fail closed."""
     rank = 1
@@ -398,6 +403,7 @@ def test_allgather_kv_rejects_packed_metadata_with_joint():
         strategy.pre_attention(torch.zeros((1, img_seq_local, 1, 1)), key_chunks[rank], value_chunks[rank], metadata)
 
 
+@pytest.mark.cpu
 def test_allgather_kv_slices_rear_joint_dense_mask():
     rank = 1
     joint_len = 1
@@ -435,6 +441,7 @@ def test_allgather_kv_slices_rear_joint_dense_mask():
     assert torch.equal(metadata_local.attn_mask, expected_rows)
 
 
+@pytest.mark.cpu
 def test_allgather_kv_rejects_invalid_joint_strategy():
     chunks = [[torch.zeros((1, 2, 1, 1)) for _ in range(2)] for _ in range(2)]
     strategy = AllGatherKVParallelAttention(_MockAllGatherSPGroup(rank=0, gather_chunks=chunks))
@@ -450,6 +457,7 @@ def test_allgather_kv_rejects_invalid_joint_strategy():
         strategy.pre_attention(torch.zeros((1, 2, 1, 1)), chunks[0][0], chunks[1][0], metadata)
 
 
+@pytest.mark.cpu
 def test_allgather_kv_preserves_global_spans_and_sets_query_ranges():
     strategy = AllGatherKVParallelAttention(
         _MockAllGatherSPGroup(
@@ -486,6 +494,7 @@ def test_allgather_kv_preserves_global_spans_and_sets_query_ranges():
     )
 
 
+@pytest.mark.cpu
 def test_allgather_kv_query_ranges_include_reused_prefix_offset():
     strategy = AllGatherKVParallelAttention(
         _MockAllGatherSPGroup(
@@ -524,6 +533,7 @@ def test_allgather_kv_query_ranges_include_reused_prefix_offset():
     assert torch.equal(metadata_out.attn_mask, expected_mask)
 
 
+@pytest.mark.cpu
 def test_allgather_kv_allows_empty_full_attn_spans():
     strategy = AllGatherKVParallelAttention(
         _MockAllGatherSPGroup(
@@ -546,6 +556,7 @@ def test_allgather_kv_allows_empty_full_attn_spans():
     assert metadata_out.query_ranges == (QueryRange(0, 2, 0),)
 
 
+@pytest.mark.cpu
 def test_allgather_kv_keeps_gathered_kv_compressed_for_gqa():
     rank = 0
     img_seq_local = 2
@@ -588,6 +599,7 @@ class _MockComposedSPGroup(_MockAllGatherSPGroup):
         self.ulysses_rank = rank % 2
 
 
+@pytest.mark.cpu
 def test_composed_strategy_orders_ulysses_before_allgather(monkeypatch):
     """K/V must be gathered *after* the Ulysses reshard, and joint K/V after that.
 
@@ -659,6 +671,7 @@ def test_composed_strategy_orders_ulysses_before_allgather(monkeypatch):
     assert strategy.name == "ulysses_allgather_kv"
 
 
+@pytest.mark.cpu
 def test_composed_strategy_normalizes_image_only_mask(monkeypatch):
     """A 2D image-only mask must cover the gathered *global* image keys.
 
@@ -735,6 +748,7 @@ def _composed_mask_mocks(
     return make
 
 
+@pytest.mark.cpu
 def test_composed_strategy_merges_joint_only_mask(monkeypatch):
     """A joint-only 2D mask (text padding, ``attn_mask=None``) must not be dropped.
 
@@ -771,6 +785,7 @@ def test_composed_strategy_merges_joint_only_mask(monkeypatch):
     assert bool(merged_rear.attn_mask[0, :-1].all())
 
 
+@pytest.mark.cpu
 def test_composed_strategy_merges_joint_and_image_masks(monkeypatch):
     """Both 2D masks merge in ``joint_strategy`` order, preserving both contents."""
     region, joint_len = 4, 1
@@ -800,6 +815,7 @@ def test_composed_strategy_merges_joint_and_image_masks(monkeypatch):
     torch.testing.assert_close(merged_rear.attn_mask, torch.cat([img_mask, joint_mask], dim=1))
 
 
+@pytest.mark.cpu
 def test_composed_strategy_sizes_joint_mask_from_joint_key(monkeypatch):
     """Cached-KV reuse: ``joint_query`` may be empty, but joint K/V still gather.
 
@@ -824,6 +840,7 @@ def test_composed_strategy_sizes_joint_mask_from_joint_key(monkeypatch):
     assert bool(merged.attn_mask[0, 1:].all())
 
 
+@pytest.mark.cpu
 def test_composed_strategy_rejects_inconsistent_2d_masks(monkeypatch):
     """Shape mismatches fail closed with the expected layout in the message."""
     region, joint_len = 4, 1
@@ -856,6 +873,7 @@ def test_composed_strategy_rejects_inconsistent_2d_masks(monkeypatch):
         )
 
 
+@pytest.mark.cpu
 def test_composed_strategy_rejects_joint_mask_without_joint_kv(monkeypatch):
     """A joint mask without joint K/V describes keys that never gather."""
     make = _composed_mask_mocks(monkeypatch, region=4, joint_len=1, joint_fields=())
@@ -867,6 +885,7 @@ def test_composed_strategy_rejects_joint_mask_without_joint_kv(monkeypatch):
         strategy.pre_attention(query, query, query, metadata)
 
 
+@pytest.mark.cpu
 def test_composed_strategy_rejects_4d_mask_with_joint_mask(monkeypatch):
     """A 2D joint mask cannot be merged into a 4D image mask; fail closed."""
     region, joint_len = 4, 1
@@ -884,6 +903,7 @@ def test_composed_strategy_rejects_4d_mask_with_joint_mask(monkeypatch):
         strategy.pre_attention(query, query, query, metadata)
 
 
+@pytest.mark.cpu
 def test_composed_strategy_skips_region_len_collective_with_auto_pad(monkeypatch):
     """advanced_uaa + framework-managed auto_pad needs no length collective."""
     make = _composed_mask_mocks(monkeypatch)
@@ -923,6 +943,7 @@ def test_composed_strategy_skips_region_len_collective_with_auto_pad(monkeypatch
     assert collective_calls == [1], "manual sharding keeps the per-forward check"
 
 
+@pytest.mark.cpu
 def test_composed_strategy_detects_uneven_allgather_regions(monkeypatch):
     """Uneven regions fail closed, and the check is skipped in strict mode."""
     sp_group = _MockComposedSPGroup(
@@ -964,7 +985,6 @@ def test_composed_strategy_detects_uneven_allgather_regions(monkeypatch):
         uaa_strategy._assert_equal_region_lengths(4, torch.device("cpu"))
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=4)
 @pytest.mark.parametrize(
     "test_model_cls",
     [
@@ -974,11 +994,22 @@ def test_composed_strategy_detects_uneven_allgather_regions(monkeypatch):
 @pytest.mark.parametrize(
     ("ulysses_degree", "ring_degree", "allgather_degree", "num_kv_heads"),
     [
-        pytest.param(2, 2, 1, None, id="ulysses-ring"),
-        pytest.param(1, 1, 2, None, id="allgather-kv"),
-        pytest.param(2, 1, 2, None, id="ulysses-allgather-kv"),
-        pytest.param(1, 2, 1, 2, id="ring-gqa"),
-        pytest.param(1, 2, 1, 1, id="ring-mqa"),
+        pytest.param(
+            2, 2, 1, None, id="ulysses-ring", marks=hardware_marks(res={"cuda": "L4", "rocm": "MI325"}, num_cards=4)
+        ),
+        pytest.param(
+            1, 1, 2, None, id="allgather-kv", marks=hardware_marks(res={"cuda": "L4", "rocm": "MI325"}, num_cards=2)
+        ),
+        pytest.param(
+            2,
+            1,
+            2,
+            None,
+            id="ulysses-allgather-kv",
+            marks=hardware_marks(res={"cuda": "L4", "rocm": "MI325"}, num_cards=4),
+        ),
+        pytest.param(1, 2, 1, 2, id="ring-gqa", marks=hardware_marks(res={"cuda": "L4", "rocm": "MI325"}, num_cards=2)),
+        pytest.param(1, 2, 1, 1, id="ring-mqa", marks=hardware_marks(res={"cuda": "L4", "rocm": "MI325"}, num_cards=2)),
     ],
 )
 @pytest.mark.parametrize("batch_size", [2])
@@ -1465,6 +1496,7 @@ def _packed_fa_worker(
     destroy_distributed_env()
 
 
+@hardware_test(res={"cuda": "L4"}, num_cards=2)
 def test_packed_allgather_matches_unsplit_flash_varlen():
     """Real CUDA varlen kernel: AllGather-KV SP output == unsplit packed attention.
 

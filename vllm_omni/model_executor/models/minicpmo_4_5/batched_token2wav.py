@@ -56,6 +56,38 @@ _MAX_ENCODE_TOKEN_CAP = 1024
 # 100`` frames, keep the first ``prompt_len`` frames and the last 100.
 _CACHE_TRIM_SUFFIX = 100
 _TIMESTEP_MAX_PERIOD = 10000
+# Short histories did not show a repeatable gain on Ascend 910B; only use
+# strided in-place attention once eliminating history copies pays for it.
+_NPU_IN_PLACE_ATTENTION_MIN_CACHE_FRAMES = 512
+
+
+def _scale_shift(x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor) -> torch.Tensor:
+    """Apply DiT modulation with one Ascend elementwise kernel."""
+    if x.device.type == "npu" and x.dtype == scale.dtype == shift.dtype == torch.float32:
+        return torch.addcmul(shift, x, scale)
+    return x * scale + shift
+
+
+def _gated_residual(x: torch.Tensor, gate: torch.Tensor, branch: torch.Tensor) -> torch.Tensor:
+    # ACLNN Addcmul avoids materializing gate * branch on the NPU.
+    if x.device.type == "npu" and x.dtype == gate.dtype == branch.dtype == torch.float32:
+        return torch.addcmul(x, gate, branch)
+    return x + gate * branch
+
+
+def _gated_residual_norm(x, gate, branch, norm):
+    if (
+        x.device.type == "npu"
+        and x.dtype == gate.dtype == branch.dtype == torch.float32
+        and type(norm) is nn.LayerNorm
+        and norm.normalized_shape == (x.shape[-1],)
+        and not torch.is_grad_enabled()
+    ):
+        from vllm_omni.platforms.npu.models.minicpmo_fused import gated_residual_norm
+
+        return gated_residual_norm(x, gate, branch, norm)
+    residual = _gated_residual(x, gate, branch)
+    return residual, norm(residual)
 
 
 def _timestep_frequencies(dim: int) -> torch.Tensor:
@@ -336,6 +368,16 @@ class BatchedToken2Wav(nn.Module):
         self._trt_stepper = trt_stepper
         self.flow = token2wav.flow
         self.hift = token2wav.hift
+        flow_parameter = next(self.flow.parameters(), None)
+        if flow_parameter is not None and flow_parameter.device.type == "npu":
+            from vllm_omni.platforms.npu.models.minicpmo_fused import prepare_estimator
+
+            # Step graphs and Whole-Euler graphs must capture the same stable
+            # weight storage, even when the step path is warmed first.
+            prepare_estimator(
+                getattr(getattr(self.flow, "decoder", None), "estimator", None),
+                pack_convs=bool(cfm_graph_cfg.get("enabled", False) and cfm_graph_cfg.get("fused_body", False)),
+            )
         encoder_cfg = dict(chunk_encoder_graph_config or {})
         connector = connector_config or {}
         left_context = int(connector.get("codec_left_context_frames", 0) or 0)
@@ -352,6 +394,7 @@ class BatchedToken2Wav(nn.Module):
                 rows=encoder_cfg.get("rows", [1]),
                 max_graphs=int(encoder_cfg.get("max_graphs", 8)),
                 capture_after=int(encoder_cfg.get("capture_after", 2)),
+                capture_after_precapture=bool(encoder_cfg.get("capture_after_precapture", False)),
                 eager_min_batch=int(encoder_cfg.get("eager_min_batch", 8)),
             )
             if encoder_cfg.get("enabled", False)
@@ -404,19 +447,19 @@ class BatchedToken2Wav(nn.Module):
         if bool(graph_config.get("enabled", False)):
             if hift_parameter is None:
                 raise ValueError("MiniCPM-o HiFT Graph requires a parameterized HiFT module")
-            if hift_parameter.device.type != "cuda":
-                logger.info("HiFT CUDA Graph is disabled on device type %s", hift_parameter.device.type)
+            if hift_parameter.device.type not in {"cuda", "npu"}:
+                logger.info("HiFT device graph is disabled on device type %s", hift_parameter.device.type)
             else:
                 if connector_config is None:
-                    raise ValueError("MiniCPM-o HiFT CUDA Graph requires connector chunk configuration")
+                    raise ValueError("MiniCPM-o HiFT device graph requires connector chunk configuration")
                 if self.mel_cache_len <= 0 or self.source_cache_len % self.mel_cache_len != 0:
                     raise ValueError(
-                        "MiniCPM-o HiFT CUDA Graph requires source_cache_len to be divisible by mel_cache_len"
+                        "MiniCPM-o HiFT device graph requires source_cache_len to be divisible by mel_cache_len"
                     )
                 capture_batch_sizes = graph_config.get("capture_batch_sizes", [1])
                 max_serial_batch = int(graph_config.get("max_serial_batch", 4))
                 logger.info(
-                    "Enabling HiFT CUDA Graph with batch sizes %s (max_serial_batch=%d)",
+                    "Enabling HiFT device graph with batch sizes %s (max_serial_batch=%d)",
                     capture_batch_sizes,
                     max_serial_batch,
                 )
@@ -432,12 +475,11 @@ class BatchedToken2Wav(nn.Module):
         self._whole_euler_graph_wrapper: WholeEulerCFMGraphWrapper | None = None
         # Whether the ragged DiT body is the fused one (``dit_fused.py``).
         self._ragged_fused_body = False
-        # On NPU the platform graph runner captures instead of the CUDA wrappers, so bucketing and
-        # padding key off the requested flag.
+        # CUDA and NPU share the CFM graph layouts and padding policy.
         self._cfm_graph_enabled = bool(cfm_graph_cfg.get("enabled", False))
         if self._cfm_graph_enabled:
             flow_parameter = next(self.flow.parameters(), None)
-            if flow_parameter is not None and flow_parameter.device.type == "cuda":
+            if flow_parameter is not None and flow_parameter.device.type in {"cuda", "npu"}:
                 estimator = self.flow.decoder.estimator
                 max_graphs = int(cfm_graph_cfg.get("max_graphs", 32))
                 max_serial_batch = int(cfm_graph_cfg.get("max_serial_batch", 4))
@@ -449,8 +491,11 @@ class BatchedToken2Wav(nn.Module):
                 if bool(cfm_graph_cfg.get("fused_body", False)):
                     # A reduced-precision attention cache keeps the ragged body,
                     # which attends in the activation dtype through upstream.
+                    # NPU uses the same schedule with AddLayerNorm and packed QKV.
                     self._ragged_fused_body = (
-                        supports_fused_body(estimator) and self._estimator_att_cache_dtype == torch.float32
+                        flow_parameter.device.type in {"cuda", "npu"}
+                        and supports_fused_body(estimator)
+                        and self._estimator_att_cache_dtype == torch.float32
                     )
                     if not self._ragged_fused_body:
                         logger.warning(
@@ -460,7 +505,9 @@ class BatchedToken2Wav(nn.Module):
                 # attention, which reads keys/values out of the pool in place.
                 slot_pool = bool(cfm_graph_cfg.get("slot_pool", False))
                 if slot_pool and not (
-                    self._ragged_fused_body and tiled_attention_supported(flow_parameter.get_device())
+                    flow_parameter.device.type == "cuda"
+                    and self._ragged_fused_body
+                    and tiled_attention_supported(flow_parameter.get_device())
                 ):
                     logger.warning("cfm_slot_pool requested but needs cfm_fused_body on NVIDIA SM80+; using the arena")
                     slot_pool = False
@@ -497,14 +544,24 @@ class BatchedToken2Wav(nn.Module):
                         # ``_ragged_body`` picks the configured body on every call, so a
                         # replaced body is the one a capture records.
                         ragged_body=self._ragged_body if _supports_ragged_kernel(estimator) else None,
-                        # The fused body takes each timestep's modulation, computed once outside the graphs.
-                        modulation_fn=functools.partial(dit_modulation, estimator) if self._ragged_fused_body else None,
+                        # Modulation depends only on the fixed Euler timestep.
+                        # The NPU ragged body can reuse it without enabling the
+                        # fused convolution/attention schedule.
+                        modulation_fn=functools.partial(dit_modulation, estimator)
+                        if self._ragged_fused_body
+                        or (
+                            flow_parameter.device.type == "npu"
+                            and flow_parameter.dtype == torch.float32
+                            and supports_fused_body(estimator)
+                        )
+                        else None,
                         row_offsets=self._row_offset_merge,
                     )
                     logger.info(
-                        "Whole-Euler CFM CUDA Graph enabled "
+                        "Whole-Euler CFM device graph enabled "
                         "(max_graphs=%d, max_serial_batch=%d, max_graph_batch=%s, "
-                        "micro_batch_size=%d, query_bucket_frames=%s, offset_bucket_frames=%d, fused_body=%s)",
+                        "micro_batch_size=%d, query_bucket_frames=%s, offset_bucket_frames=%d, "
+                        "fused_body=%s, precomputed_modulation=%s)",
                         max_graphs,
                         max_serial_batch,
                         str(max_graph_batch),
@@ -512,20 +569,21 @@ class BatchedToken2Wav(nn.Module):
                         query_bucket_frames,
                         self._whole_euler_graph_wrapper.offset_bucket_frames,
                         self._ragged_fused_body,
+                        self._whole_euler_graph_wrapper.modulation_fn is not None,
                     )
                 elif enable_whole_euler:
-                    logger.info("Whole-Euler CFM CUDA Graph disabled because TensorRT stepper is configured")
+                    logger.info("Whole-Euler CFM device graph disabled because TensorRT stepper is configured")
                 self._cfm_graph_wrapper = CFMGraphWrapper(
                     graph_fn=estimator.blocks_forward_chunk,
                     max_graphs=max_graphs,
                 )
-                logger.info("CFM CUDA Graph enabled (max_graphs=%d)", max_graphs)
+                logger.info("CFM device graph enabled (max_graphs=%d)", max_graphs)
             else:
                 logger.info(
-                    "CFM CUDA Graph is disabled on device type %s",
+                    "CFM device graph is disabled on device type %s",
                     flow_parameter.device.type if flow_parameter is not None else "unknown",
                 )
-        # mel-frame bucket size for the CFM CUDA Graph path. Pad each decode
+        # mel-frame bucket size for the CFM device graph path. Pad each decode
         # chunk up to a multiple of this many frames so the graph cache key
         # space stays small (0 disables bucketing, e.g. when graphs are off).
         self._cfm_graph_bucket_frames = (
@@ -540,7 +598,7 @@ class BatchedToken2Wav(nn.Module):
         )
         if self._cfm_graph_bucket_frames > 1:
             logger.info(
-                "CFM CUDA Graph bucketing enabled (bucket_frames=%d)",
+                "CFM device graph bucketing enabled (bucket_frames=%d)",
                 self._cfm_graph_bucket_frames,
             )
         # Device copies of the DiT timestep-embedding frequency table.
@@ -711,16 +769,16 @@ class BatchedToken2Wav(nn.Module):
         )
         return self.flow.encoder_proj(hidden), new_cnn, new_att
 
-    def _flow_on_cuda(self) -> bool:
+    def _flow_supports_graphs(self) -> bool:
         flow_parameter = next(self.flow.parameters(), None)
-        return flow_parameter is not None and flow_parameter.device.type == "cuda"
+        return flow_parameter is not None and flow_parameter.device.type in {"cuda", "npu"}
 
     def _build_encoder_graphs(self, config: Mapping[str, Any], connector: Mapping) -> FlowEncoderGraphs | None:
         """``cfm_encoder_cuda_graph`` (default off): exact-shape graphs of the flow encoder's continuation chunk."""
         if not config.get("enabled", False):
             return None
-        if not self._flow_on_cuda():
-            logger.info("Flow encoder CUDA Graph is disabled off CUDA")
+        if not self._flow_supports_graphs():
+            logger.info("Flow encoder graph is disabled on this device")
             return None
         encoder = self.flow.encoder
         embed = getattr(encoder, "embed", None)
@@ -803,21 +861,22 @@ class BatchedToken2Wav(nn.Module):
             _format_memory_delta(memory_before, _memory_snapshot(att.device)),
         )
         if captured:
-            graphs.capture_on_request = False
+            graphs.capture_on_request = graphs.capture_after_precapture
         return captured
 
     @torch.inference_mode()
     def precapture_chunk_encoder(self, features: PromptFeatures) -> int:
         """Precapture continuation graphs into the shared FlowEncoderGraphs arena.
 
-        Keep the legacy configuration entry point. NPU uses the same owner's
-        exact-shape admission path; CUDA requests only replay startup shapes.
+        CUDA and NPU use the same keys, storage layouts and startup admission.
+        Requests replay startup shapes; optional exact-shape admission covers
+        repeated tail and prompt shapes outside the shared arena.
         """
         graph = self._chunk_encoder_graph
-        if graph is None or not self._flow_on_cuda() or torch.version.hip is not None or not graph.max_graphs:
+        if graph is None or not self._flow_supports_graphs() or torch.version.hip is not None or not graph.max_graphs:
             return 0
         if graph.graphs:
-            graph.capture_on_request = False
+            graph.capture_on_request = graph.capture_after_precapture
             return 0
         if graph.exact_graphs:
             return 0
@@ -857,13 +916,15 @@ class BatchedToken2Wav(nn.Module):
                 cnn_dtype=cnn.dtype,
             )
         if captured:
-            graph.capture_on_request = False
+            graph.capture_on_request = graph.capture_after_precapture
             self._encoder_graphs = graph
             logger.info(
-                "Flow encoder graphs frozen after precapture (%d shared-arena graphs, rows %s, buffers %.1f MiB)",
+                "Flow encoder precapture complete (%d shared-arena graphs, rows %s, buffers %.1f MiB, "
+                "runtime capture=%s)",
                 captured,
                 list(graph.rows),
                 graph.storage_bytes() / 2**20,
+                graph.capture_on_request,
             )
         return captured
 
@@ -921,7 +982,7 @@ class BatchedToken2Wav(nn.Module):
         cnn_cache: torch.Tensor | None,
         att_cache: torch.Tensor | None,
         attn_mask: torch.Tensor | None = None,
-        valid_lengths: list[int] | None = None,
+        valid_lengths: list[int] | torch.Tensor | None = None,
         valid_frames: int | None = None,
         time_embedding: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -936,7 +997,8 @@ class BatchedToken2Wav(nn.Module):
                 att_cache=att_cache,
             )
             return out.to(mu.dtype), new_cnn, new_att
-        time_embedding = self._time_embedding(estimator, time).unsqueeze(1)
+        if time_embedding is None:
+            time_embedding = self._time_embedding(estimator, time).unsqueeze(1)
         width = int(x.shape[-1])
         speaker_features = speakers.unsqueeze(-1).expand(-1, -1, width)
         if valid_frames is not None and valid_frames < width:
@@ -1002,12 +1064,23 @@ class BatchedToken2Wav(nn.Module):
     ) -> torch.Tensor:
         """The configured ragged DiT body, looked up per call so a capture records a replaced one.
 
-        ``modulation`` (fused body only) comes from the Whole-Euler arena.
+        ``modulation`` comes from the Whole-Euler arena, for either body.
         """
         estimator_input = args[1]
         if slots is not None or (self._ragged_fused_body and estimator_input.dtype == torch.float32):
             # Slot-pool graphs are only built over the fused body (``slot_pool`` above).
+            if estimator_input.device.type == "npu":
+                from vllm_omni.platforms.npu.models.minicpmo_fused import (
+                    blocks_forward_chunk_fused_npu,
+                    fused_body_accepts,
+                )
+
+                if fused_body_accepts(args[3], args[7]):
+                    return blocks_forward_chunk_fused_npu(*args, modulation=modulation, slots=slots)
+                return self._blocks_forward_chunk_ragged(*args, modulation=modulation)
             return blocks_forward_chunk_fused(*args, modulation=modulation, slots=slots)
+        if modulation is not None:
+            return self._blocks_forward_chunk_ragged(*args, modulation=modulation)
         return self._blocks_forward_chunk_ragged(*args)
 
     @staticmethod
@@ -1065,10 +1138,26 @@ class BatchedToken2Wav(nn.Module):
         cache, which the caller copied into ``kv``: four passes over Stage 2's
         largest tensor. Here only the current chunk is written and attention reads ``kv`` in
         place. A cache that already sits behind the current chunk in ``kv``
-        (Whole-Euler) is not moved; any other is copied there once. Other
-        devices keep upstream's attention and copy its cache into ``kv``.
+        (Whole-Euler) is not moved; any other is copied there once. CUDA and
+        NPU share this inference path. Other devices keep upstream's attention
+        and copy its cache into ``kv``.
         """
-        if kv.dtype != x.dtype or not x.is_cuda:
+        if x.device.type == "npu" and x.dtype == kv.dtype == torch.float32 and not attn.training:
+            from vllm_omni.platforms.npu.models.minicpmo_fused import attention, supports_packed_qkv
+
+            if not torch.is_grad_enabled() and supports_packed_qkv(attn):
+                return attention(
+                    attn, x, att_cache, attn_mask, kv, min_cache_frames=_NPU_IN_PLACE_ATTENTION_MIN_CACHE_FRAMES
+                )
+        if (
+            kv.dtype != x.dtype
+            or x.device.type not in {"cuda", "npu"}
+            or attn.training
+            or (
+                x.device.type == "npu"
+                and (att_cache is None or att_cache.shape[2] < _NPU_IN_PLACE_ATTENTION_MIN_CACHE_FRAMES)
+            )
+        ):
             # A reduced-precision cache attends in the activation dtype.
             x_att, new_att = attn.forward_chunk(x, att_cache, attn_mask)
             kv[:, :, : int(new_att.shape[2])].copy_(new_att)
@@ -1085,11 +1174,17 @@ class BatchedToken2Wav(nn.Module):
         head_dim = int(k.shape[3])
         kv[..., :frames, :head_dim].copy_(k)
         kv[..., :frames, head_dim:].copy_(v)
+        if x.device.type == "npu":
+            from vllm_omni.platforms.npu.models.cosyvoice2_dit_attn import _expand_attn_mask_for_npu
+
+            mask = _expand_attn_mask_for_npu(attn_mask, frames, frames + cached)
+        else:
+            mask = None if attn_mask is None else attn_mask.unsqueeze(1)
         out = F.scaled_dot_product_attention(
             q,
             kv[..., :head_dim],
             kv[..., head_dim:],
-            attn_mask=None if attn_mask is None else attn_mask.unsqueeze(1),
+            attn_mask=mask,
         )
         return attn.proj(out.transpose(1, 2).reshape(batch, frames, -1))
 
@@ -1104,6 +1199,8 @@ class BatchedToken2Wav(nn.Module):
         cnn_cache_buffer: torch.Tensor,
         att_cache_buffer: torch.Tensor,
         valid_lengths: list[int] | torch.Tensor,
+        *,
+        modulation: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Run one padded DiT batch while capturing exact per-row CNN state.
 
@@ -1116,15 +1213,17 @@ class BatchedToken2Wav(nn.Module):
         if isinstance(valid_lengths, torch.Tensor):
             lengths = valid_lengths
         else:
-            lengths = torch.tensor(
-                (*valid_lengths, *valid_lengths),
-                device=estimator_input.device,
-                dtype=torch.long,
-            )
+            lengths = index_to_device((*valid_lengths, *valid_lengths), estimator_input.device)
         # Causal cache gather index per conv width, shared by the blocks.
         cache_index: dict[int, torch.Tensor] = {}
         x = estimator.in_proj(estimator_input.transpose(1, 2))
         for block_index, block in enumerate(estimator.blocks):
+            if modulation is None:
+                mod = block.adaLN_modulation(time_embedding).chunk(9, dim=-1)
+            else:
+                # dit_modulation stores 1 + scale and broadcasts one fixed
+                # timestep across all CFG rows; no per-replay adaLN GEMMs.
+                mod = modulation[block_index].unbind(0)
             (
                 shift_msa,
                 scale_msa,
@@ -1135,9 +1234,11 @@ class BatchedToken2Wav(nn.Module):
                 shift_conv,
                 scale_conv,
                 gate_conv,
-            ) = block.adaLN_modulation(time_embedding).chunk(9, dim=-1)
+            ) = mod
+            if modulation is None:
+                scale_msa, scale_mlp, scale_conv = 1 + scale_msa, 1 + scale_mlp, 1 + scale_conv
 
-            normalized = block.norm1(x) * (1 + scale_msa) + shift_msa
+            normalized = _scale_shift(block.norm1(x), scale_msa, shift_msa)
             x_att = BatchedToken2Wav._attend_in_place(
                 block.attn,
                 normalized,
@@ -1145,12 +1246,12 @@ class BatchedToken2Wav(nn.Module):
                 attn_mask,
                 att_cache_buffer[block_index],
             )
-            x = x + gate_msa * x_att
+            x, conv_normed = _gated_residual_norm(x, gate_msa, x_att, block.norm3)
 
             # CausalConvBlock: [T, conv1, T, LayerNorm, Mish, T, conv2, T]
             # with the transposes (T) dropped.
             conv = block.conv
-            conv_input = block.norm3(x) * (1 + scale_conv) + shift_conv
+            conv_input = _scale_shift(conv_normed, scale_conv, shift_conv)
             old_cnn = cnn_cache[block_index]
             if old_cnn is None:
                 old_cnn = conv_input.new_zeros(
@@ -1168,13 +1269,19 @@ class BatchedToken2Wav(nn.Module):
             hidden = conv.block[4](conv.block[3](BatchedToken2Wav._causal_conv_frames_major(conv.block[1], history)))
             history = torch.cat((old_cnn[:, conv.in_channels :].transpose(1, 2), hidden), dim=1)
             new_cnn2 = gather_causal_cache(history, cache_index[width])
-            x = x + gate_conv * BatchedToken2Wav._causal_conv_frames_major(conv.block[6], history)
-            x = x + gate_mlp * block.mlp(block.norm2(x) * (1 + scale_mlp) + shift_mlp)
+            x, mlp_normed = _gated_residual_norm(
+                x, gate_conv, BatchedToken2Wav._causal_conv_frames_major(conv.block[6], history), block.norm2
+            )
+            x = _gated_residual(x, gate_mlp, block.mlp(_scale_shift(mlp_normed, scale_mlp, shift_mlp)))
 
             cnn_cache_buffer[block_index][:, : conv.in_channels].copy_(new_cnn1)
             cnn_cache_buffer[block_index][:, conv.in_channels :].copy_(new_cnn2)
 
-        return estimator.final_layer(x, time_embedding).transpose(1, 2)
+        if modulation is None:
+            return estimator.final_layer(x, time_embedding).transpose(1, 2)
+        final = estimator.final_layer
+        shift, scale = modulation[-1, 0], modulation[-1, 1]
+        return final.linear(_scale_shift(final.norm_final(x), scale, shift)).transpose(1, 2)
 
     def _get_timeline(self, device: torch.device, dtype: torch.dtype) -> tuple[torch.Tensor, list[float]]:
         """The Euler timeline and its step sizes, read to the host once.
@@ -1230,8 +1337,10 @@ class BatchedToken2Wav(nn.Module):
                 if len(set(row_offsets)) == 1 and not self._row_offset_merge:
                     row_offsets = None
         mel_frames = int(mu.shape[2])
-        # Padding only pays off while replay is active: Whole-Euler, the CFM wrapper (still enabled,
-        # no TRT stepper), or on NPU the platform runner keyed by `_cfm_graph_enabled`.
+        # Padding only pays off while replay is active: whole-Euler replay, or
+        # the CFM wrapper (`_disable` keeps the object alive, so check its
+        # flag) with no TRT stepper in the way -- or, on NPU where there is no
+        # wrapper, the platform runner keyed by `_cfm_graph_enabled`.
         graphs_active = valid_lengths is None and (
             self._whole_euler_active()
             or (
@@ -1284,33 +1393,20 @@ class BatchedToken2Wav(nn.Module):
             cfg_lengths = index_to_device((*valid_lengths, *valid_lengths), mu.device)
             positions = torch.arange(int(mu.shape[2]), device=mu.device)
             valid_queries = positions.unsqueeze(0) < cfg_lengths.unsqueeze(1)
-            current_keys = valid_queries.unsqueeze(1).expand(-1, int(mu.shape[2]), -1)
             if row_offsets is None:
                 old_keys = torch.ones(
-                    (2 * batch_size, int(mu.shape[2]), offset),
+                    (2 * batch_size, offset),
                     dtype=torch.bool,
                     device=mu.device,
                 )
             else:
                 # Cache columns span the longest cache; a shorter one's tail stays masked.
                 cfg_offsets = index_to_device((*row_offsets, *row_offsets), mu.device)
-                cached = torch.arange(max(row_offsets), device=mu.device).unsqueeze(0) < cfg_offsets.unsqueeze(1)
-                old_keys = cached.unsqueeze(1).expand(-1, int(mu.shape[2]), -1)
-            attn_mask = valid_queries.unsqueeze(2) & torch.cat((current_keys, old_keys), dim=2)
-        elif pad_frames:
-            # Mask the padded keys instead of only zeroing their content: a
-            # zero-valued key/value pair still takes probability mass out of the
-            # softmax denominator, so the real frames keep attending to the
-            # padding unless it is explicitly excluded.
-            kv_len = int(mu.shape[2]) + offset
-            attn_mask = torch.ones(
-                2 * batch_size,
-                int(mu.shape[2]),
-                kv_len,
-                dtype=torch.bool,
-                device=mu.device,
-            )
-            attn_mask[:, :, mel_frames : mel_frames + pad_frames] = False
+                old_keys = torch.arange(max(row_offsets), device=mu.device).unsqueeze(0) < cfg_offsets.unsqueeze(1)
+            # Concatenate key validity once per row, then broadcast over queries.
+            # Expanding before cat materializes an extra full B x Q x K mask.
+            keys = torch.cat((valid_queries, old_keys), dim=1)
+            attn_mask = valid_queries.unsqueeze(2) & keys.unsqueeze(1)
 
         if self._whole_euler_active() and (valid_lengths is None or self._whole_euler_ragged_active()):
             whole_euler_result = self._whole_euler_graph_wrapper.replay(
@@ -1328,6 +1424,23 @@ class BatchedToken2Wav(nn.Module):
             )
             if whole_euler_result is not None:
                 return whole_euler_result
+        # Whole-Euler builds its capture mask directly from mel_frames.
+        # Only a refused replay needs the separate step/eager padding mask.
+        if pad_frames:
+            # Mask the padded keys instead of only zeroing their content: a
+            # zero-valued key/value pair still takes probability mass out of the
+            # softmax denominator, so the real frames keep attending to the
+            # padding unless it is explicitly excluded.
+            kv_len = int(mu.shape[2]) + offset
+            attn_mask = torch.ones(
+                2 * batch_size,
+                int(mu.shape[2]),
+                kv_len,
+                dtype=torch.bool,
+                device=mu.device,
+            )
+            attn_mask[:, :, mel_frames : mel_frames + pad_frames] = False
+
         if row_offsets is not None and len(set(row_offsets)) > 1:
             # Mixed cache lengths only. A same-length group (including every
             # ``_decode_cfm_per_offset`` subgroup, and equal-length rows under
@@ -1363,7 +1476,9 @@ class BatchedToken2Wav(nn.Module):
                     cnn_cache=old_cnn,
                     att_cache=old_att,
                     attn_mask=attn_mask,
-                    valid_lengths=valid_lengths,
+                    # Reuse the CFG lengths already uploaded for the mask;
+                    # every Euler step otherwise repeats this host copy.
+                    valid_lengths=cfg_lengths if valid_lengths is not None else None,
                     valid_frames=mel_frames if pad_frames else None,
                 )
                 if pad_frames:

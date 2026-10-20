@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """CFG Parallel Mixin for Qwen Image series
 Shared by
 - QwenImagePipeline
@@ -67,7 +67,6 @@ class QwenImageCFGParallelMixin(CFGParallelMixin, ProgressBarMixin):
             Denoised latents
         """
         self.scheduler.set_begin_index(0)
-        self.transformer.do_true_cfg = do_true_cfg
         additional_transformer_kwargs = additional_transformer_kwargs or {}
 
         with self.progress_bar(total=len(timesteps)) as pbar:

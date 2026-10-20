@@ -5,6 +5,7 @@
 import pytest
 import torch
 
+from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.models.auk.auk_transformer import AuKTransformer, sample_latents
 from vllm_omni.diffusion.models.auk.cudagraph_wrapper import AuKCUDAGraphWrapper
 
@@ -129,7 +130,7 @@ def test_bucket_padding_preserves_real_frame_outputs(cfg_strength: float, ref_fr
     torch.testing.assert_close(padded[:, : x.shape[1]], eager)
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph replay requires CUDA")
 @torch.inference_mode()
 @pytest.mark.parametrize("ref_frames", [0, 4])
@@ -176,7 +177,7 @@ def test_single_request_graph_replay_matches_eager_and_updates_inputs(cfg_streng
     assert len(wrapper._cache) == 1
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph replay requires CUDA")
 @torch.inference_mode()
 def test_graph_capture_failure_is_propagated(mocker) -> None:

@@ -64,7 +64,7 @@ def test_r2_01_is_nonblocking_single_gpu_coverage() -> None:
 
     assert step["agent_pool"] == "mi300_1"
     assert step["grade"] == "NonBlocking"
-    assert step["timeout_in_minutes"] == 20
+    assert step["timeout_in_minutes"] == 50
     assert step["mirror_hardwares"] == ["amdproduction"]
     assert step["artifact_paths"] == ["artifacts/rocm-r2-01/**/*"]
 
@@ -76,11 +76,17 @@ def test_dedicated_engine_job_preserves_r2_01_engine_coverage() -> None:
 
 def test_r2_01_runs_once_fails_closed_and_publishes_results() -> None:
     commands = _find_step(R2_01_LABEL)["commands"]
-    pytest_commands = [command for command in commands if command.lstrip().startswith("pytest ")]
+    pytest_commands = [command for command in commands if "pytest " in command]
     assert len(pytest_commands) == 1
     run_command = pytest_commands[0]
     artifact_dir = "$$BUILDKITE_BUILD_CHECKOUT_PATH/artifacts/rocm-r2-01"
 
+    assert split(run_command)[:4] == [
+        "timeout",
+        "--signal=TERM",
+        "--kill-after=2m",
+        "45m",
+    ]
     _assert_single_gpu_selection(run_command)
     assert "--collect-only" not in "\n".join(commands)
     assert "VLLM_CI_ALLOW_NO_TESTS" not in "\n".join(commands)
