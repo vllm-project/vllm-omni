@@ -404,6 +404,19 @@ ships a preset:
 Keyword overrides on a preset replace the corresponding `SessionConfig`
 field, e.g. `create_duplex_session_config(ref_audio=..., temperature=0.6)`.
 
+MiniCPM-o 4.5 uses `sliding_window_mode: "basic"` by default for the Thinker
+(Stage 0). When the projected context exceeds `basic_window_high_tokens`
+(8000), the window drops the oldest units, including the model's own output
+in them, targeting `basic_window_low_tokens` (6000). The system/reference-audio
+prefix is kept. Dropped input and earlier replies are no longer directly
+available to the Thinker. The retained time span depends on the input and
+generated speech; these limits are token counts, not a fixed number of seconds.
+
+Pass `extra_body={"sliding_window_mode": "off"}` to retain the full history.
+The `"context"` mode instead retains `context_max_units` (24) recent units
+plus up to `context_previous_max_tokens` (500) tokens of earlier model text.
+The window configuration is fixed when the session is created.
+
 Constructor options: `reconnect` (a `ReconnectPolicy`, default five
 attempts with 0.25–4 s jittered backoff; `None` disables auto-resume),
 `heartbeat_interval_s` (default 30 s; `None` disables the lease heartbeat),
