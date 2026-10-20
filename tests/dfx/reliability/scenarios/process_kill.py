@@ -133,7 +133,11 @@ def _require_signal(signal_name: str | None) -> str:
 
 
 class ProcessKillWorkerNoLoad(FaultScenario):
-    """After a quiet worker kill, every new request fails and /health ends at 503."""
+    """After a quiet worker kill, one new request returns HTTP 500 before concurrent checks.
+
+    ``assert_fast_fail`` uses ``err_code=500``. A client timeout raises and fails the
+    test. The concurrent checker runs only after that probe, then ``/health`` must end at 503.
+    """
 
     signals_attr = "worker_signals"
 
@@ -141,6 +145,7 @@ class ProcessKillWorkerNoLoad(FaultScenario):
         signal = _require_signal(signal_name)
         model.warmup(client, server)
         _kill_worker(model, server, signal)
+        model.assert_fast_fail(client, server)
         _assert_concurrent_all_fail(model, client, server)
         _assert_health_503(model, client)
 

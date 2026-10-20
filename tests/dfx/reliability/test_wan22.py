@@ -347,7 +347,7 @@ def test_reliability_fault_process_kill_worker_no_load(
     online_client_function,
     signal_name: str,
 ) -> None:
-    """After a quiet worker kill, every new request fails and /health ends at 503."""
+    """After a quiet worker kill, the next request returns HTTP 500, then concurrent requests fail."""
     ProcessKillWorkerNoLoad().run(MODEL, omni_server_function, online_client_function, signal_name)
 
 
