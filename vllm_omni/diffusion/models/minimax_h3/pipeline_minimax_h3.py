@@ -684,6 +684,10 @@ class MiniMaxH3Pipeline(
     """CFG-distilled joint video/audio generation for MiniMax H3."""
 
     supports_step_execution: ClassVar[bool] = True
+    # DiT implementation constructed for the primary ``transformer``.
+    # ``None`` means this module's ``MiniMaxH3DiTModel`` (resolved at call time);
+    # a derived pipeline may point this at a subclass.
+    _transformer_cls: ClassVar[type[MiniMaxH3DiTModel] | None] = None
     load_vae_decoder: bool = True
     supports_request_cancellation: ClassVar[bool] = True
 
@@ -1076,11 +1080,16 @@ class MiniMaxH3Pipeline(
                 )
             )
             self._dit_modules.append("transformers_ref")
-        self.transformer = MiniMaxH3DiTModel(
+        transformer_cls = type(self)._transformer_cls or MiniMaxH3DiTModel
+        # Only the ConvRot checkpoint carries arch overrides; subclass DiTs
+        # (e.g. TaoMate-H3) do not accept the argument.
+        transformer_kwargs: dict[str, Any] = {"diffusers_weights": modular}
+        if transformer_checkpoint is not None:
+            transformer_kwargs["arch_overrides"] = transformer_checkpoint.arch_overrides
+        self.transformer = transformer_cls(
             od_config,
             quant_config=transformer_quant_config,
-            arch_overrides=transformer_checkpoint.arch_overrides if transformer_checkpoint is not None else None,
-            diffusers_weights=modular,
+            **transformer_kwargs,
         )
         if self._fasth3_checkpoint is not None:
             self.transformer.enable_vsa_gates(sparsity=self._fasth3_checkpoint.vsa_sparsity)

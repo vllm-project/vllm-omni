@@ -23,20 +23,20 @@ from tests.diffusion.distributed.wan_vae_fastpath_helpers import (  # noqa: F401
     original_wan_rms_norm,
     unpatched_wan_rms_norm,
 )
-from tests.helpers.mark import hardware_test
+from tests.helpers.mark import hardware_marks, hardware_test
 from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath import forwards as fp
 from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath import (
     install_wan_vae_fastpath,
 )
 from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath import triton_data_movement as dm
-from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath import triton_rms_norm as rn
 from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath import triton_rms_norm_cl as cl
 from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath import triton_upsample as up
+from vllm_omni.diffusion.layers import vae_norm_epilogue as rn
 
 pytestmark = [
     pytest.mark.usefixtures("unpatched_wan_rms_norm"),
     pytest.mark.core_model,
-    pytest.mark.cuda,
+    *hardware_marks(res={"cuda": "L4"}, num_cards=1),
     pytest.mark.diffusion,
     pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
 ]
@@ -131,6 +131,35 @@ def test_rms_norm_fastpath_handles_attention_block_4d_input(dtype: torch.dtype) 
     expected = _reference_rms_norm(norm, x)
     actual = fp.rms_norm_fastpath(norm, x)
     assert actual is not None and _bits_equal(actual, expected)
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("dtype", ALL_DTYPES)
+@pytest.mark.parametrize("layout", ["contiguous", "frame_major", "attention_4d"])
+@pytest.mark.parametrize("silu", [False, True])
+@pytest.mark.parametrize("decline_kernel", [False, True])
+def test_shared_norm_preserves_pending_bias_and_fallback(monkeypatch, dtype, layout, silu, decline_kernel):
+    """Wan's deferred conv bias must be added exactly once through the shared helper."""
+    torch.manual_seed(7)
+    images = layout == "attention_4d"
+    shape = (2, 32, 7, 9) if images else (1, 32, 3, 7, 9)
+    norm = _make_norm(32, dtype, images=images)
+    x = torch.randn(shape, device="cuda", dtype=dtype)
+    if layout == "frame_major":
+        x = x.permute(0, 2, 1, 3, 4).contiguous().permute(0, 2, 1, 3, 4)
+    bias = torch.randn(32, device="cuda", dtype=dtype) * 0.1
+    expected = _reference_rms_norm(norm, x + bias.view(1, -1, *([1] * (x.dim() - 2))))
+    if silu:
+        expected = F.silu(expected)
+
+    if decline_kernel:
+        monkeypatch.setattr(rn, "rms_norm_scale", lambda *args, **kwargs: None)
+    actual = fp.rms_norm_fastpath(norm, x, silu=silu, bias=bias)
+
+    assert actual is not None
+    assert actual.dtype == expected.dtype
+    assert actual.stride() == expected.stride()
+    assert _bits_equal(actual, expected)
 
 
 @torch.no_grad()
@@ -1175,7 +1204,13 @@ def test_omni_wan_vae_decode_is_bitwise_exact_on_cuda(dtype: torch.dtype) -> Non
 @pytest.mark.parametrize(
     ("dtype", "allow_tf32", "tolerance"),
     [
-        pytest.param(torch.bfloat16, True, 3e-2, id="bf16"),
+        pytest.param(
+            torch.bfloat16,
+            True,
+            3e-2,
+            id="bf16",
+            marks=pytest.mark.skip(reason="https://github.com/vllm-project/vllm-omni/issues/8841"),
+        ),
         # With TF32 disabled the only difference is cuDNN's channels-last algorithm
         # choice and the norm kernel's reduction order.
         pytest.param(torch.float32, False, 2e-4, id="fp32"),

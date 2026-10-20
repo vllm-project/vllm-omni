@@ -170,9 +170,18 @@ def _cuda_marks(*, res: SkuSpec, num_cards: int):
 
 def _rocm_marks(*, res: str, num_cards: int):
     import pytest
+    from vllm.platforms import current_platform
 
     _require_sku("rocm", res)
-    return [getattr(pytest.mark, res), pytest.mark.rocm, _cards_mark(num_cards)]
+    marks = [getattr(pytest.mark, res), pytest.mark.rocm, _cards_mark(num_cards)]
+    if num_cards == 1 or not current_platform.is_rocm():
+        return marks
+    return marks + [
+        pytest.mark.skipif(
+            current_platform.device_count() < num_cards,
+            reason=f"Need at least {num_cards} ROCm GPUs to run the test.",
+        )
+    ]
 
 
 def _xpu_marks(*, res: str, num_cards: int):
@@ -195,7 +204,19 @@ def _musa_marks(*, res: str, num_cards: int):
     import pytest
 
     _require_sku("musa", res)
-    return [getattr(pytest.mark, res), pytest.mark.musa, _cards_mark(num_cards)]
+    marks = [getattr(pytest.mark, res), pytest.mark.musa, _cards_mark(num_cards)]
+    if num_cards == 1:
+        return marks
+    from vllm_omni.platforms import current_omni_platform
+
+    if not current_omni_platform.is_musa():
+        return marks
+    return marks + [
+        pytest.mark.skipif(
+            current_omni_platform.get_device_count() < num_cards,
+            reason=f"Need at least {num_cards} MUSA GPUs to run the test.",
+        )
+    ]
 
 
 @lru_cache(maxsize=1)
@@ -208,7 +229,19 @@ def _npu_marks(*, res: str, num_cards: int):
     import pytest
 
     _require_sku("npu", res)
-    return [pytest.mark.npu, getattr(pytest.mark, res), _cards_mark(num_cards)]
+    marks = [pytest.mark.npu, getattr(pytest.mark, res), _cards_mark(num_cards)]
+    if num_cards == 1:
+        return marks
+    from vllm_omni.platforms import current_omni_platform
+
+    if not current_omni_platform.is_npu():
+        return marks
+    return marks + [
+        pytest.mark.skipif(
+            current_omni_platform.get_device_count() < num_cards,
+            reason=f"Need at least {num_cards} NPUs to run the test.",
+        )
+    ]
 
 
 def _res_platforms() -> frozenset[str]:
@@ -225,9 +258,12 @@ def _normalize_num_cards(res: dict[str, SkuSpec], num_cards: int | dict[str, int
     device_class = get_supported_platforms() - allowed
     for platform in res:
         if platform in device_class:
+            accelerators = ", ".join(sorted(allowed))
+            if platform == "cpu":
+                raise ValueError(f"{platform!r} is not a res dict key; use pytest.mark.cpu.")
             raise ValueError(
-                f"{platform!r} is not a res dict key; use pytest.mark.{platform} "
-                f"or an accelerator key ({', '.join(sorted(allowed))})."
+                f"{platform!r} is not a res dict key. It is auto-added for [gpu] platforms; "
+                f"use an accelerator key ({accelerators})."
             )
         if platform not in allowed:
             supported = ", ".join(sorted(allowed)) or "(none)"

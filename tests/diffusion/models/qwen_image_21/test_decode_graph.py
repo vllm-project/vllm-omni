@@ -6,6 +6,7 @@ import weakref
 import pytest
 import torch
 
+from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.hooks import HookRegistry, ModelHook
 from vllm_omni.diffusion.models.qwen_image_21 import decode_graph
 from vllm_omni.diffusion.offloader.sequential_backend import SequentialOffloadHook
@@ -163,8 +164,7 @@ def test_registration_preserves_request_cache_and_separates_layouts(graph_case):
     assert not torch.equal(entries[0].freqs, entries[1].freqs)
 
 
-@pytest.mark.cuda
-@pytest.mark.gpu
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("failure_phase", ["warmup", "capture"])
 def test_capture_failure_releases_buffers_and_keeps_request_cache(graph_case, monkeypatch, failure_phase):
     manager, device, cleanup = graph_case
@@ -192,8 +192,7 @@ def test_capture_failure_releases_buffers_and_keeps_request_cache(graph_case, mo
     assert bool((cache[0]["cond"]["key"] == 1).all())
 
 
-@pytest.mark.cuda
-@pytest.mark.gpu
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_replay_uses_active_request_and_layout(graph_case):
     manager, device, _ = graph_case
     first, second = make_cache(device, 1.0), make_cache(device, 5.0)
@@ -278,8 +277,7 @@ def test_all_valid_mask_shares_graph_entry_and_padding_falls_back(graph_case):
         assert entry.attn_metadata is None
 
 
-@pytest.mark.cuda
-@pytest.mark.gpu
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_batch_changes_and_padding_do_not_reuse_stale_prefix(graph_case):
     manager, device, _ = graph_case
     first = make_cache(device, 1.0)
@@ -316,3 +314,43 @@ def test_batch_changes_and_padding_do_not_reuse_stale_prefix(graph_case):
         kwargs["encoder_hidden_states_mask"][1, 0] = False
         assert manager.try_decode(**kwargs) is None
         torch.testing.assert_close(decode(manager, first), single, rtol=0, atol=0)
+
+
+class WorkspaceGemmModel(DecodeModel):
+    """Decode body whose split-K GEMM needs a cuBLAS workspace."""
+
+    def __init__(self, device):
+        super().__init__()
+        generator = torch.Generator(device=device).manual_seed(0)
+        self.lhs = torch.randn(32768, 640, device=device, dtype=torch.bfloat16, generator=generator).T
+        self.rhs = torch.randn(32768, 640, device=device, dtype=torch.bfloat16, generator=generator)
+
+    def _decode_graph_forward(self, entry):
+        return super()._decode_graph_forward(entry) + torch.mm(self.lhs, self.rhs).float().mean()
+
+
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+def test_evicting_a_graph_keeps_survivor_workspace_when_warmup_aliases_capture(graph_case, monkeypatch):
+    manager, device, _ = graph_case
+    manager.model = WorkspaceGemmModel(device)
+    capture_stream = torch.cuda.graph.default_capture_stream or torch.cuda.Stream()
+    monkeypatch.setattr(torch.cuda.graph, "default_capture_stream", capture_stream)
+    # Pooled streams recycle: every 32nd warm-up stream is the capture stream.
+    monkeypatch.setattr(torch.cuda, "Stream", lambda *args, **kwargs: capture_stream)
+    gemm_mean = torch.mm(manager.model.lhs, manager.model.rhs).float().mean()
+    layouts = [(1, rows, 2) for rows in (2, 3, 4)]
+    with torch.inference_mode():
+        caches = [make_cache(device, float(value)) for value in (1, 2, 3)]
+        for cache, layout in zip(caches[:2], layouts):
+            register(manager, cache, layout)
+            assert decode(manager, cache, layout) is not None
+        # Registering a third layout evicts the oldest captured graph.
+        register(manager, caches[2], layouts[2])
+        assert len(manager.entries) == manager.max_entries
+        torch.accelerator.empty_cache()
+        for _ in range(3):
+            result = decode(manager, caches[1], layouts[1])
+        torch.accelerator.synchronize()
+    # Survivor terms: key 2, value 3, RoPE frequencies equal to the layout rows.
+    expected = torch.ones_like(result).sin() + 2.0 + 3.0 + layouts[1][1] + gemm_mean
+    torch.testing.assert_close(result, expected, rtol=0, atol=5e-2)

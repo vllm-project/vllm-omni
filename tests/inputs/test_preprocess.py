@@ -8,9 +8,13 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 import torch
+from vllm.config import ModelConfig
+from vllm.config.multimodal import MultiModalConfig
 from vllm.exceptions import VLLMValidationError
 from vllm.inputs import mm_input, tokens_input
 from vllm.multimodal.inputs import PlaceholderRange
+from vllm.multimodal.parse import MultiModalDataParser
+from vllm.multimodal.processing import BaseProcessingInfo, InputProcessingContext
 from vllm.pooling_params import PoolingParams
 from vllm.renderers import BaseRenderer
 from vllm.renderers.params import TokenizeParams
@@ -39,6 +43,20 @@ class _Renderer(BaseRenderer):
 @pytest.fixture
 def renderer():
     return omni_renderer_cls(_Renderer)()
+
+
+class _VideoProcessingInfo(BaseProcessingInfo):
+    def get_supported_mm_processor_kwargs(self) -> dict[str, set[str]]:
+        return {"videos_kwargs": {"size", "fps", "num_frames"}, "images_kwargs": {"size"}}
+
+    def get_data_parser(self) -> MultiModalDataParser:
+        return MultiModalDataParser()
+
+
+def _video_processing_info(mocker, config_kwargs: dict[str, object] | None = None) -> _VideoProcessingInfo:
+    config = mocker.Mock(spec=ModelConfig)
+    config.get_multimodal_config.return_value = MultiModalConfig(mm_processor_kwargs=config_kwargs)
+    return _VideoProcessingInfo(InputProcessingContext(config, tokenizer=None))
 
 
 @pytest.mark.parametrize("kwargs", [{}, {"target_h": 512, "target_w": 768}])
@@ -115,6 +133,188 @@ def test_omni_renderer_is_a_real_subclass_created_once():
     instance = cls()
     assert isinstance(instance, _Renderer)
     assert not hasattr(instance, "_renderer")
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+@pytest.mark.parametrize("size", [123, "bad", [], None, {"shortest_edge": 4096}])
+def test_qwen_video_size_validation_precedes_multimodal_processing(renderer, mocker, async_mode, size):
+    renderer.model_config.hf_config = SimpleNamespace(model_type="qwen3_vl")
+    renderer.get_mm_processor = mocker.Mock(return_value=mocker.Mock(info=_video_processing_info(mocker)))
+    prompt = {"prompt": "video", "multi_modal_data": {"video": ["frames"]}, "mm_processor_kwargs": {"size": size}}
+
+    def render():
+        if async_mode:
+            return asyncio.run(renderer.render_cmpl_async([prompt]))
+        return renderer.render_cmpl([prompt])
+
+    if size is not None and not isinstance(size, dict):
+        with pytest.raises(VLLMValidationError, match="size must be a dictionary"):
+            render()
+        renderer._process_multimodal.assert_not_called()
+    else:
+        render()
+        renderer._process_multimodal.assert_called_once()
+
+
+def test_other_video_processors_keep_their_own_size_contract(renderer):
+    renderer.model_config.hf_config = SimpleNamespace(model_type="other")
+    renderer.render_cmpl(
+        [
+            {
+                "prompt": "video",
+                "multi_modal_data": {"video": ["frames"]},
+                "mm_processor_kwargs": {"size": 224, "fps": [1], "num_frames": []},
+            }
+        ]
+    )
+    renderer._process_multimodal.assert_called_once()
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+@pytest.mark.parametrize("model_type", ["qwen3_vl", "qwen3_vl_moe"])
+@pytest.mark.parametrize("from_config", [False, True])
+@pytest.mark.parametrize(
+    "options,valid",
+    [
+        ({"fps": []}, False),
+        ({"num_frames": []}, False),
+        ({"fps": [1.0]}, False),
+        ({"num_frames": [2]}, False),
+        ({"fps": [1.0, "bad"]}, False),
+        ({"num_frames": [2, 2.5]}, False),
+        ({"fps": [1, 2]}, False),
+        ({"fps": "bad"}, False),
+        ({"num_frames": {}}, False),
+        ({"fps": True}, False),
+        ({"num_frames": [2, True]}, False),
+        ({"fps": float("inf")}, False),
+        ({"fps": [1.0, float("nan")]}, False),
+        ({"num_frames": 0}, False),
+        ({"fps": -1.0}, False),
+        ({"fps": None, "num_frames": None}, True),
+        ({"fps": 1}, True),
+        ({"fps": 2.5}, True),
+        ({"num_frames": 2}, True),
+        ({"fps": [1.0, 2.5], "num_frames": [2, 4]}, True),
+    ],
+)
+def test_qwen_video_sampling_options(renderer, mocker, async_mode, model_type, from_config, options, valid):
+    renderer.model_config.hf_config = SimpleNamespace(model_type=model_type)
+    renderer.get_mm_processor = lambda: mocker.Mock(
+        info=_video_processing_info(mocker, options if from_config else None)
+    )
+    video = torch.zeros(2, 4, 4, 3, dtype=torch.uint8)
+    prompt = {
+        "prompt": "video",
+        "multi_modal_data": {"video": [video, video]},
+        "mm_processor_kwargs": {} if from_config else options,
+    }
+
+    def render():
+        if async_mode:
+            return asyncio.run(renderer.render_cmpl_async([prompt]))
+        return renderer.render_cmpl([prompt])
+
+    if valid:
+        render()
+        renderer._process_multimodal.assert_called_once()
+    else:
+        with pytest.raises(VLLMValidationError, match="Video processor"):
+            render()
+        renderer._process_multimodal.assert_not_called()
+
+
+@pytest.mark.parametrize("video_form", ["array", "frames", "metadata", "cached"])
+def test_qwen_video_sampling_lists_count_videos_not_frames(renderer, mocker, video_form):
+    video = torch.zeros(3, 4, 4, 3, dtype=torch.uint8)
+    data = {"array": video, "frames": list(video), "metadata": (video, {}), "cached": [None]}[video_form]
+    renderer.model_config.hf_config = SimpleNamespace(model_type="qwen3_vl")
+    renderer.get_mm_processor = lambda: mocker.Mock(info=_video_processing_info(mocker, {"fps": [1.0]}))
+    renderer.render_cmpl([{"prompt": "video", "multi_modal_data": {"video": data}}])
+    renderer._process_multimodal.assert_called_once()
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+@pytest.mark.parametrize("from_config", [False, True])
+@pytest.mark.parametrize(
+    "options,valid",
+    [
+        ({}, True),
+        ({"videos_kwargs": None}, True),
+        ({"videos_kwargs": []}, False),
+        ({"videos_kwargs": 123}, False),
+        ({"fps": 2.0, "videos_kwargs": None}, True),
+        ({"fps": 2.0, "videos_kwargs": []}, False),
+        ({"fps": 2.0, "videos_kwargs": 123}, False),
+        ({"size": {"shortest_edge": 4096}, "videos_kwargs": []}, False),
+        ({"size": {"shortest_edge": 4096}, "videos_kwargs": 123}, False),
+        ({"size": 123, "videos_kwargs": {"size": {"shortest_edge": 4096}}}, True),
+        ({"size": {"shortest_edge": 4096}, "images_kwargs": {"size": 123}}, True),
+        ({"fps": "bad", "videos_kwargs": {"fps": 2.0}}, True),
+        ({"videos_kwargs": {"size": 123}}, False),
+        ({"fps": 2.0, "videos_kwargs": {"fps": []}}, False),
+        ({"videos_kwargs": {"num_frames": []}}, False),
+    ],
+)
+def test_qwen_video_validation_uses_resolved_video_scope(renderer, mocker, async_mode, from_config, options, valid):
+    renderer.model_config.hf_config = mocker.Mock(model_type="qwen3_vl")
+    renderer.get_mm_processor = lambda: mocker.Mock(
+        info=_video_processing_info(mocker, options if from_config else None)
+    )
+    prompt = {
+        "prompt": "video",
+        "multi_modal_data": {"video": ["frames"]},
+        "mm_processor_kwargs": {} if from_config else options,
+    }
+
+    def render():
+        if async_mode:
+            return asyncio.run(renderer.render_cmpl_async([prompt]))
+        return renderer.render_cmpl([prompt])
+
+    if valid:
+        render()
+        renderer._process_multimodal.assert_called_once()
+    else:
+        with pytest.raises(VLLMValidationError, match="Video processor"):
+            render()
+        renderer._process_multimodal.assert_not_called()
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+@pytest.mark.parametrize(
+    "config_scope,request_scope,valid",
+    [
+        ([], {"fps": 3.0}, True),
+        ({"fps": 3.0}, 123, False),
+        ([], None, False),
+        ({"fps": 3.0}, None, True),
+    ],
+)
+def test_qwen_video_scope_validation_keeps_merge_precedence(
+    renderer, mocker, async_mode, config_scope, request_scope, valid
+):
+    renderer.model_config.hf_config = SimpleNamespace(model_type="qwen3_vl")
+    info = _video_processing_info(mocker, {"fps": 2.0, "videos_kwargs": config_scope})
+    renderer.get_mm_processor = lambda: mocker.Mock(info=info)
+    prompt = {
+        "prompt": "video",
+        "multi_modal_data": {"video": ["frames"]},
+        "mm_processor_kwargs": {"videos_kwargs": request_scope},
+    }
+
+    def render():
+        if async_mode:
+            return asyncio.run(renderer.render_cmpl_async([prompt]))
+        return renderer.render_cmpl([prompt])
+
+    if valid:
+        render()
+        renderer._process_multimodal.assert_called_once()
+    else:
+        with pytest.raises(VLLMValidationError, match="videos_kwargs must be a mapping"):
+            render()
+        renderer._process_multimodal.assert_not_called()
 
 
 @pytest.mark.parametrize("async_mode", [False, True])

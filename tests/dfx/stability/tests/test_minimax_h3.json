@@ -1,18 +1,18 @@
 [
     {
-        "test_name": "test_minimax_h3_t2v_stability_4gpu",
-        "description": "MiniMax-H3 FastH3 T2VA on 4 GPUs (USP4 + HSDP4, encoder-TP4, VAE-PP4 tile); fused lora-path from VLLM_TEST_MINIMAX_H3_FASTH3_LORA; requests must use num_inference_steps=4",
+        "test_name": "test_minimax_h3_t2v_stability",
+        "description": "MiniMax-H3 FastH3 T2VA on 4 GPUs/NPUs (USP4 + HSDP4, encoder-TP4, VAE-PP4 tile); fused lora-path from VLLM_TEST_MINIMAX_H3_FASTH3_LORA; requests must use num_inference_steps=4",
         "mark": [
             {
                 "hardware_marks": {
                     "res": {
-                        "cuda": "H800"
+                        "cuda": "H800",
+                        "npu": "A3"
                     },
                     "num_cards": 4
                 }
             },
             "local_model",
-            "slow",
             "diffusion"
         ],
         "server_params": {
@@ -42,6 +42,7 @@
                 "max_concurrency": 1,
                 "num_prompts_per_batch": 50,
                 "seed": 42,
+                "warmup_num_inference_steps": 4,
                 "random_request_config": [
                     {
                         "width": 1344,
