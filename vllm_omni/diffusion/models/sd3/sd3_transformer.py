@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from collections.abc import Iterable
 
 import torch
@@ -461,7 +464,7 @@ class SD3Transformer2DModel(nn.Module):
         pooled_projections: torch.Tensor,
         timestep: torch.LongTensor,
         return_dict: bool = True,
-    ) -> torch.Tensor | Transformer2DModelOutput:
+    ) -> tuple[torch.Tensor] | Transformer2DModelOutput:
         """
         The [`SD3Transformer2DModel`] forward method.
 
@@ -515,6 +518,8 @@ class SD3Transformer2DModel(nn.Module):
             shape=(hidden_states.shape[0], self.out_channels, height * patch_size, width * patch_size)
         )
 
+        if not return_dict:
+            return (output,)
         return Transformer2DModelOutput(sample=output)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
