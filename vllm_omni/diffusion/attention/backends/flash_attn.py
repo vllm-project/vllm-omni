@@ -419,6 +419,8 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
     def _flash_varlen_wrapper(q, k, v, *, attn_func, causal, softmax_scale, **kwargs):
         """Call a varlen-only FlashAttention backend for a dense segment."""
         del kwargs
+        from vllm_omni.diffusion.attention.backends.utils.fa import vllm_varlen_version_kwargs
+
         batch_size, q_len = q.shape[:2]
         k_len = k.shape[1]
         cu_seqlens_q = torch.arange(0, (batch_size + 1) * q_len, q_len, dtype=torch.int32, device=q.device)
@@ -433,6 +435,7 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
             max_seqlen_k=k_len,
             causal=causal,
             softmax_scale=softmax_scale,
+            **vllm_varlen_version_kwargs(attn_func),
         )
         out = FlashAttentionImpl._unwrap_flash_output(out)
         return out.reshape(batch_size, q_len, *out.shape[1:])
@@ -450,6 +453,7 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
             _unpad_input,
             _upad_input,
             flash_attn_varlen_func,
+            vllm_varlen_version_kwargs,
         )
 
         if flash_attn_varlen_func is None:
@@ -482,6 +486,7 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
             **{
                 "causal": self.causal,
                 "softmax_scale": self.softmax_scale,
+                **vllm_varlen_version_kwargs(flash_attn_varlen_func),
             },
         )
         out_unpad = self._unwrap_flash_output(out_unpad)
@@ -508,6 +513,7 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         """
         from vllm_omni.diffusion.attention.backends.utils.fa import (
             flash_attn_varlen_func,
+            vllm_varlen_version_kwargs,
         )
 
         if flash_attn_varlen_func is None:
@@ -525,6 +531,7 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
             max_seqlen_k=max_seqlen_k,
             causal=self.causal,
             softmax_scale=self.softmax_scale,
+            **vllm_varlen_version_kwargs(flash_attn_varlen_func),
         )
         out = self._unwrap_flash_output(out)
         return out.reshape_as(query)
@@ -545,6 +552,7 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         """
         from vllm_omni.diffusion.attention.backends.utils.fa import (
             flash_attn_varlen_func,
+            vllm_varlen_version_kwargs,
         )
 
         if flash_attn_varlen_func is None:
@@ -568,6 +576,7 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
             max_seqlen_k=k_len,
             causal=self.causal,
             softmax_scale=self.softmax_scale,
+            **vllm_varlen_version_kwargs(flash_attn_varlen_func),
         )
         out = self._unwrap_flash_output(out)
         # (b s) h d -> b s h d

@@ -1410,7 +1410,8 @@ def resolve_delete_item(state: RealtimeProjectionState, command: DeleteItem) -> 
     return ResolvedControl(payloads=[command.payload()], events=[])
 
 
-def resolve_truncate_item(state: RealtimeProjectionState, command: TruncateItem) -> ResolvedControl:
+def resolve_truncate_item(state: RealtimeProjectionState, command: TruncateItem, *, has_audio: bool) -> ResolvedControl:
+    """Validate item shape and engine-owned audio provenance before any mutation."""
     item = state.conversation_items.get(command.item_id)
     if not isinstance(item, dict):
         return ResolvedControl(
@@ -1424,6 +1425,8 @@ def resolve_truncate_item(state: RealtimeProjectionState, command: TruncateItem)
     truncate_error = validate_realtime_item_truncate(
         item, content_index=command.content_index, audio_end_ms=command.audio_end_ms
     )
+    if truncate_error is None and not has_audio:
+        truncate_error = "conversation.item.truncate requires an item that produced audio"
     if truncate_error is not None:
         return ResolvedControl(
             payloads=[], events=[error_event("bad_event", truncate_error, event_id=command.event_id)]
