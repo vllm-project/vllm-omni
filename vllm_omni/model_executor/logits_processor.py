@@ -42,22 +42,35 @@ class NoRepeatNGramLogitsProcessor(LogitsProcessor):
             self.requests.pop(index, None)
         for index, params, prompt_ids, output_ids in batch_update.added:
             extras = params.extra_args or {}
+            n = int(extras.get("no_repeat_ngram_size", 0))
+            window = int(extras.get("no_repeat_ngram_window", 8192))
+            self.requests.pop(index, None)
+            if n <= 0 or window <= 0:
+                continue
             self.requests[index] = (
                 prompt_ids or [],
                 output_ids,
-                int(extras.get("no_repeat_ngram_size", 0)),
-                int(extras.get("no_repeat_ngram_window", 8192)),
+                n,
+                window,
                 extras.get("no_repeat_ngram_whitelist", []),
             )
         for source, target, direction in batch_update.moved:
+            source_request = self.requests.pop(source, None)
+            target_request = self.requests.pop(target, None)
             if direction == MoveDirectionality.SWAP:
-                self.requests[source], self.requests[target] = (self.requests[target], self.requests[source])
-            else:
-                self.requests[target] = self.requests.pop(source)
+                if target_request is not None:
+                    self.requests[source] = target_request
+            if source_request is not None:
+                self.requests[target] = source_request
 
     def apply(self, logits):
         for index, (prompt, output, n, window, whitelist) in self.requests.items():
-            banned = banned_tokens(list(prompt) + list(output), n, window, whitelist)
+            # Only the scan window and current n-gram prefix can affect bans.
+            tail_length = window + n
+            sequence = list(output[-tail_length:])
+            if len(sequence) < tail_length:
+                sequence = list(prompt[-(tail_length - len(sequence)) :]) + sequence
+            banned = banned_tokens(sequence, n, window, whitelist)
             if banned:
                 logits[index, list(banned)] = -float("inf")
         return logits
