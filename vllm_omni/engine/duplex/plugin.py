@@ -15,7 +15,7 @@ from __future__ import annotations
 import asyncio
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import lru_cache
 from importlib import import_module
 from typing import TYPE_CHECKING
@@ -118,6 +118,23 @@ class PcmAppendBuffer(ABC):
         allow_emit: bool,
     ) -> PcmAppendReservation | None: ...
 
+    def prepare_commit_prefix(self, *, operation_id: str, chunk_period_ms: int) -> PcmAppendReservation | None:
+        """Reserve one non-terminal unit that must precede a turn commit.
+
+        Models with a single terminal payload need no prefix. The runner submits
+        each prefix in wire order before reserving and acknowledging the commit.
+        """
+        return None
+
+    def retains_separate_vision_units(self) -> bool:
+        """Whether an already-committed camera unit must stay ahead of the next commit.
+
+        Streaming models replay each frame group as its own listen-only prefix.
+        A single-terminal model replaces that observation: replaying it as a
+        non-final prefix is not a legal append.
+        """
+        return False
+
     @abstractmethod
     def prepare_commit(
         self,
@@ -140,6 +157,7 @@ class DuplexModelSessionState(ABC):
     committed_audio_payload: dict[str, object] | None
     committed_audio_operation_id: str | None
     committed_audio_reserved_bytes: int
+    committed_audio_consume_started: bool
     deferred_response_create: bool
     deferred_precreate_response: bool
     continuation_owner_id: str | None
@@ -160,6 +178,15 @@ class DuplexModelSessionState(ABC):
         operation_id: str | None,
         reserved_bytes: int = 0,
     ) -> None: ...
+
+    def mark_committed_audio_consume_started(self) -> None:
+        if self.committed_audio_payload is not None:
+            self.committed_audio_consume_started = True
+
+    def mergeable_committed_audio(self) -> dict[str, object] | None:
+        if self.committed_audio_payload is None or self.committed_audio_consume_started:
+            return None
+        return self.committed_audio_payload
 
     @abstractmethod
     def clear_committed_audio(self) -> int: ...
@@ -185,6 +212,9 @@ class DefaultDuplexModelSessionState(DuplexModelSessionState):
     committed_audio_payload: dict[str, object] | None = None
     committed_audio_operation_id: str | None = None
     committed_audio_reserved_bytes: int = 0
+    #: True once an append task has begun submitting this retained PCM. Later
+    #: commits must not ``merge_audio_payloads`` with it (weather merge/dup).
+    committed_audio_consume_started: bool = False
     deferred_response_create: bool = False
     deferred_precreate_response: bool = False
     continuation_owner_id: str | None = None
@@ -196,6 +226,14 @@ class DefaultDuplexModelSessionState(DuplexModelSessionState):
     # continuation deadline. A real (non-silence) input resets the chain.
     last_native_submit_monotonic: float | None = None
     silence_deadline_monotonic: float | None = None
+    # Listen-only units peeled off a commit that had to wait for the active
+    # response. Promotion submits these before the retained terminal payload.
+    # Parallel to the payloads: bytes still charged against the session until
+    # that prefix is submitted or the retained turn is discarded. A moved
+    # retained payload contributes 0 here; its charge stays on
+    # ``committed_audio_reserved_bytes``.
+    commit_prefix_payloads: list[dict[str, object]] = field(default_factory=list)
+    commit_prefix_reserved_bytes: list[int] = field(default_factory=list)
 
     def retain_committed_audio(
         self,
@@ -207,14 +245,33 @@ class DefaultDuplexModelSessionState(DuplexModelSessionState):
         self.committed_audio_payload = payload
         self.committed_audio_operation_id = operation_id
         self.committed_audio_reserved_bytes += max(0, int(reserved_bytes))
+        self.committed_audio_consume_started = False
+
+    def mark_committed_audio_consume_started(self) -> None:
+        if self.committed_audio_payload is not None:
+            self.committed_audio_consume_started = True
+
+    def mergeable_committed_audio(self) -> dict[str, object] | None:
+        """Retained PCM safe to concatenate into a newer commit.
+
+        Once an append has started consuming the retain, merging would splice
+        an already-submitted utterance into the next turn (merged ASR +
+        duplicate aura2tts).
+        """
+        if self.committed_audio_payload is None or self.committed_audio_consume_started:
+            return None
+        return self.committed_audio_payload
 
     def clear_committed_audio(self) -> int:
-        reserved_bytes = self.committed_audio_reserved_bytes
+        reserved_bytes = self.committed_audio_reserved_bytes + sum(self.commit_prefix_reserved_bytes)
         self.committed_audio_payload = None
         self.committed_audio_operation_id = None
         self.committed_audio_reserved_bytes = 0
+        self.committed_audio_consume_started = False
         self.deferred_response_create = False
         self.deferred_precreate_response = False
+        self.commit_prefix_payloads.clear()
+        self.commit_prefix_reserved_bytes.clear()
         return reserved_bytes
 
     def clear_continuation(self) -> None:

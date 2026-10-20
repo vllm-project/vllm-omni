@@ -22,8 +22,7 @@ def _plugin():
     return module.MiniCPMO45DuplexPlugin(lambda *args: None)
 
 
-@pytest.mark.asyncio
-async def test_window_configuration_is_prepared_by_plugin(monkeypatch):
+def _stub_tokenizer(monkeypatch):
     tokenizer = SimpleNamespace(
         all_special_ids=[90],
         unk_token_id=-1,
@@ -32,6 +31,22 @@ async def test_window_configuration_is_prepared_by_plugin(monkeypatch):
         convert_tokens_to_ids=lambda token: {"<|listen|>": 91}.get(token, -1),
     )
     monkeypatch.setattr(module, "_load_tokenizer", lambda config: tokenizer)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("extra_body", "mode"), [({}, "basic"), ({"sliding_window_mode": "off"}, "off")])
+async def test_window_defaults_to_basic_and_can_be_disabled(monkeypatch, extra_body, mode):
+    _stub_tokenizer(monkeypatch)
+    config = DuplexSessionConfig(modalities=("text",), extra_body=dict(extra_body))
+    runtime = await _plugin().prepare_runtime_config(config, model_config=None)
+    window = runtime["duplex_window_config"]
+    assert window["sliding_window_mode"] == mode
+    assert (window["basic_window_high_tokens"], window["basic_window_low_tokens"]) == (8000, 6000)
+
+
+@pytest.mark.asyncio
+async def test_window_configuration_is_prepared_by_plugin(monkeypatch):
+    _stub_tokenizer(monkeypatch)
     config = DuplexSessionConfig(
         modalities=("text",),
         extra_body={
