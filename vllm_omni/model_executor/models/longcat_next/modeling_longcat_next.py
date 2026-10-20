@@ -315,6 +315,7 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
         features: torch.Tensor,
         encoder_lengths: torch.Tensor,
         bridge_lengths: torch.Tensor,
+        chunk_counts: torch.Tensor | None = None,
     ) -> list[torch.Tensor]:
         # features is every clip's chunks flat-concatenated on dim 0; the
         # audio encoder consumes the whole batch in one call, so split its
@@ -330,7 +331,18 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
             )
             ids = ids.long() + self.audio_offset_vals
             emb = self._code_embeddings(ids)
-        return list(emb.split([int(s) for s in bridge_lengths.tolist()], dim=0))
+        chunks = list(emb.split([int(s) for s in bridge_lengths.tolist()], dim=0))
+        if chunk_counts is None:
+            return chunks
+        embeds: list[torch.Tensor] = []
+        pos = 0
+        for count in chunk_counts.reshape(-1).tolist():
+            if count == 0:
+                embeds.append(emb.new_empty((0, emb.shape[1])))
+                continue
+            embeds.append(torch.cat(chunks[pos : pos + count], dim=0))
+            pos += count
+        return embeds
 
     def embed_multimodal(self, **kwargs: Any) -> tuple[torch.Tensor, ...]:
         # Must be named embed_multimodal, not get_multimodal_embeddings: the
@@ -347,7 +359,7 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
         if audio_features is not None:
             enc = kwargs.get("audio_encoder_lengths")
             bridge = kwargs.get("audio_bridge_lengths")
-            embeds.extend(self._encode_audios(audio_features, enc, bridge))
+            embeds.extend(self._encode_audios(audio_features, enc, bridge, kwargs.get("audio_chunk_counts")))
 
         return tuple(embeds)
 
@@ -690,8 +702,8 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
         # fallback only applies to a batch that isn't already mixed.
         fallback_modality = "visual" if (self._visual_gen and not self._audio_gen) else "audio"
 
-        frames_by_modality: dict[str, list[torch.Tensor]] = {"audio": [], "visual": []}
-        for info in info_dicts:
+        frames_by_modality: dict[str, list[tuple[int, torch.Tensor]]] = {"audio": [], "visual": []}
+        for idx, info in enumerate(info_dicts):
             if not isinstance(info, dict):
                 continue
             codes = info.get("codes")
@@ -716,14 +728,17 @@ class LongcatNextForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
                 modality = "audio"
             else:
                 modality = fallback_modality
-            frames_by_modality[modality].append(frame)
+            frames_by_modality[modality].append((idx, frame))
 
-        codes_out_by_modality: dict[str, torch.Tensor] = {}
-        for modality, frames in frames_by_modality.items():
-            if not frames:
+        codes_out_by_modality: dict[str, list[torch.Tensor]] = {}
+        for modality, indexed_frames in frames_by_modality.items():
+            if not indexed_frames:
                 continue
-            codes_out = torch.cat(frames, dim=0)
-            codes_out_by_modality[modality] = codes_out
+            first_frame = indexed_frames[0][1]
+            rows = [first_frame.new_empty((0, first_frame.shape[1])) for _ in info_dicts]
+            for idx, frame in indexed_frames:
+                rows[idx] = frame
+            codes_out_by_modality[modality] = rows
         if not codes_out_by_modality:
             return OmniOutput(text_hidden_states=model_output, multimodal_outputs={})
         return OmniOutput(

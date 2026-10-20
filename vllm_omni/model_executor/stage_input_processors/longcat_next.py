@@ -52,6 +52,7 @@ generated ids (see cosyvoice3.text2flow_token_only for the reference shape).
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -168,6 +169,48 @@ def _blank_user_turn(prompt: str) -> str:
     return prompt[:body_start] + " " + prompt[body_end:]
 
 
+_IMG_TOKEN_SIZE_TAG_RE = re.compile(
+    r"<longcat_img_token_size>\s*(\d+)\s+(\d+)\s*</longcat_img_token_size>"
+)
+
+
+def _int_or_none(value: Any) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _prompt_additional_information(prompt: Any) -> Any:
+    if prompt is None or isinstance(prompt, str):
+        return None
+    if isinstance(prompt, Mapping):
+        return prompt.get("additional_information")
+    return getattr(prompt, "additional_information", None)
+
+
+def _requested_grid_from_prompt(prompt: Any) -> tuple[int, int] | None:
+    """Resolve the image grid the user requested in the original prompt,
+    from its ``additional_information`` (token_h/token_w) or its
+    ``<longcat_img_token_size>`` tag -- <longcat_img_start> itself is prompt
+    text, so the generated ids may never contain a decodable segment."""
+    info = _prompt_additional_information(prompt)
+    if info is not None:
+        if isinstance(info, Mapping):
+            raw_h, raw_w = info.get("token_h"), info.get("token_w")
+        else:
+            raw_h, raw_w = getattr(info, "token_h", None), getattr(info, "token_w", None)
+        token_h, token_w = _int_or_none(raw_h), _int_or_none(raw_w)
+        if token_h is not None and token_w is not None:
+            return token_h, token_w
+    prompt_str = _prompt_str(prompt)
+    if prompt_str is not None:
+        match = _IMG_TOKEN_SIZE_TAG_RE.search(prompt_str)
+        if match is not None:
+            return int(match.group(1)), int(match.group(2))
+    return None
+
+
 def _generated_ids(source_output: Any) -> list[int]:
     """Generated ids for one finished request, prompt prefix stripped."""
     output = source_output.outputs[0]
@@ -218,7 +261,6 @@ def thinker2multi_decoder_token_only(
     non-empty per request per the reference's own mutually-exclusive
     GEN_IMAGE_STAGE/GEN_AUDIO_STAGE state machine; the decoder module itself
     dispatches on whichever is present."""
-    del prompt
     engine_inputs: list[OmniTokensPrompt] = []
     for source_output in source_outputs:
         if not source_output.finished:
@@ -227,7 +269,7 @@ def thinker2multi_decoder_token_only(
             "visual_token_ids": _extract_codes_from_output(source_output, "visual"),
             "audio_token_ids": _extract_codes_from_output(source_output, "audio"),
         }
-        grid = infer_visual_grid(_generated_ids(source_output))
+        grid = _requested_grid_from_prompt(prompt) or infer_visual_grid(_generated_ids(source_output))
         if grid is not None:
             additional_information["token_h"] = grid[0]
             additional_information["token_w"] = grid[1]

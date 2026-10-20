@@ -150,3 +150,71 @@ class TestThinker2MultiDecoderTokenOnly:
         assert len(result) == 2
         assert result[0]["additional_information"]["audio_token_ids"] == [[1] * 8]
         assert result[1]["additional_information"]["audio_token_ids"] == []
+
+
+class TestThinker2MultiDecoderGridResolution:
+    def _tagged_prompt(self, token_size: str) -> str:
+        return (
+            "<longcat_system>You are a helpful assistant.<longcat_end>"
+            f"<longcat_img_token_size>{token_size}</longcat_img_token_size><longcat_img_start>"
+            "<longcat_user>draw a cat<|longcat_end|>"
+            "<longcat_assistant>"
+        )
+
+    def _grid_stream(self, token_h: int, token_w: int) -> list[int]:
+        stream = [IMG_START_TOKEN_ID]
+        for _ in range(token_h):
+            stream.extend([IMG_PAD_TOKEN_ID] * token_w)
+            stream.append(IMG_NEWLINE_TOKEN_ID)
+        stream.append(IMG_END_TOKEN_ID)
+        return stream
+
+    def test_string_tag_sets_requested_grid_when_generated_segment_undecodable(self):
+        generated_ids = [IMG_START_TOKEN_ID, IMG_PAD_TOKEN_ID, IMG_PAD_TOKEN_ID]
+        result = thinker2multi_decoder_token_only(
+            [_source_output(generated_ids=generated_ids)],
+            prompt=self._tagged_prompt("17 23"),
+        )
+        info = result[0]["additional_information"]
+        assert (info["token_h"], info["token_w"]) == (17, 23)
+
+    def test_structured_additional_information_wins_over_string_tag(self):
+        prompt = {
+            "prompt": self._tagged_prompt("17 23"),
+            "additional_information": {"token_h": 5, "token_w": 7},
+        }
+        result = thinker2multi_decoder_token_only(
+            [_source_output(generated_ids=[IMG_START_TOKEN_ID])],
+            prompt=prompt,
+        )
+        info = result[0]["additional_information"]
+        assert (info["token_h"], info["token_w"]) == (5, 7)
+
+    def test_structured_additional_information_supports_object_shapes(self):
+        attr_prompt = SimpleNamespace(
+            prompt=self._tagged_prompt("17 23"),
+            additional_information=SimpleNamespace(token_h=9, token_w=11),
+        )
+        result = thinker2multi_decoder_token_only(
+            [_source_output(generated_ids=[IMG_START_TOKEN_ID])],
+            prompt=attr_prompt,
+        )
+        assert result[0]["additional_information"]["token_h"] == 9
+        assert result[0]["additional_information"]["token_w"] == 11
+
+        attr_prompt.additional_information = {"token_h": 13, "token_w": 19}
+        result = thinker2multi_decoder_token_only(
+            [_source_output(generated_ids=[IMG_START_TOKEN_ID])],
+            prompt=attr_prompt,
+        )
+        assert result[0]["additional_information"]["token_h"] == 13
+        assert result[0]["additional_information"]["token_w"] == 19
+
+    def test_grid_falls_back_to_generated_ids_without_prompt_grid_info(self):
+        prompt = "<longcat_user>draw a cat<|longcat_end|><longcat_assistant>"
+        result = thinker2multi_decoder_token_only(
+            [_source_output(generated_ids=self._grid_stream(2, 3))],
+            prompt=prompt,
+        )
+        info = result[0]["additional_information"]
+        assert (info["token_h"], info["token_w"]) == (2, 3)

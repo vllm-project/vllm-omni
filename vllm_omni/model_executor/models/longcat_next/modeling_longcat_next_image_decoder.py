@@ -28,6 +28,7 @@ from .longcat_next_utils import (
     load_remote_hf_config,
     load_weight_subtree,
     resolve_checkpoint_relative_path,
+    resolve_checkpoint_snapshot,
     resolve_single_request_additional_info,
 )
 
@@ -44,7 +45,10 @@ class LongcatNextImageDecoder(nn.Module):
         self.has_postprocess = False
         self.prefix = prefix
 
-        self.model_path: str = vllm_config.model_config.model
+        self.model_path: str = resolve_checkpoint_snapshot(
+            vllm_config.model_config.model,
+            revision=getattr(vllm_config.model_config, "revision", None),
+        )
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
 

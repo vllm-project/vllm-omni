@@ -71,7 +71,10 @@ def test_make_omni_output_returns_omni_output_with_codes():
 
     assert isinstance(out, OmniOutput)
     assert torch.equal(out.text_hidden_states, hidden)
-    assert torch.equal(out.multimodal_outputs["codes"]["audio"], _frame(7))
+    audio = out.multimodal_outputs["codes"]["audio"]
+    assert isinstance(audio, list)
+    assert len(audio) == 1
+    assert torch.equal(audio[0], _frame(7))
 
 
 def test_make_omni_output_consumes_frame_so_it_is_not_re_emitted():
@@ -84,7 +87,7 @@ def test_make_omni_output_consumes_frame_so_it_is_not_re_emitted():
     first = _make_omni_output(model, torch.zeros(1, HIDDEN), buffer)
     second = _make_omni_output(model, torch.zeros(1, HIDDEN), buffer)
 
-    assert first.multimodal_outputs["codes"]["audio"].shape[0] == 1
+    assert first.multimodal_outputs["codes"]["audio"][0].shape[0] == 1
     assert second.multimodal_outputs == {}
 
 
@@ -104,7 +107,9 @@ def test_make_omni_output_keeps_only_real_rows_in_mixed_batch():
 
     out = _make_omni_output(_model(), torch.zeros(2, HIDDEN), buffer)
 
-    assert torch.equal(out.multimodal_outputs["codes"]["audio"], _frame(5))
+    audio = out.multimodal_outputs["codes"]["audio"]
+    assert len(audio) == 1
+    assert torch.equal(audio[0], _frame(5))
 
 
 def test_make_omni_output_routes_mixed_batch_by_request_not_globally():
@@ -125,8 +130,58 @@ def test_make_omni_output_routes_mixed_batch_by_request_not_globally():
 
     out = _make_omni_output(model, torch.zeros(2, HIDDEN), buffer)
 
-    assert torch.equal(out.multimodal_outputs["codes"]["audio"], _frame(3))
-    assert torch.equal(out.multimodal_outputs["codes"]["visual"], _frame(9))
+    audio = out.multimodal_outputs["codes"]["audio"]
+    visual = out.multimodal_outputs["codes"]["visual"]
+    assert len(audio) == 2
+    assert len(visual) == 2
+    assert torch.equal(audio[0], _frame(3))
+    assert audio[1] is not None
+    assert audio[1].shape == (0, NUM_LEVELS)
+    assert visual[0] is not None
+    assert visual[0].shape == (0, NUM_LEVELS)
+    assert torch.equal(visual[1], _frame(9))
+
+
+def test_payload_builder_delivers_each_request_only_its_own_codes():
+    """End-to-end from make_omni_output through the worker payload builder
+    (the same flatten_payload -> build_mm_cpu -> build_omni_mm_payload chain
+    gpu_ar_model_runner runs): a mixed batch's batch-aligned code lists must
+    be split per request, not shared. A bare concatenated tensor is treated
+    as request-invariant by to_payload_element and cloned to every request,
+    which would deliver request 0's audio codes to request 1."""
+    from vllm_omni.data_entry_keys import flatten_payload
+    from vllm_omni.utils.mm_outputs import build_mm_cpu
+    from vllm_omni.worker.output.payload_build import build_omni_mm_payload
+
+    model = _model(_audio_gen={"rA": {"terminal": False}}, _visual_gen={"rB": {"terminal": False}})
+    buffer = [
+        {"req_id": "rA", "codes": {"audio": _frame(3)}},
+        {"req_id": "rB", "codes": {"audio": _frame(9)}},
+    ]
+
+    out = _make_omni_output(model, torch.zeros(2, HIDDEN), buffer)
+    mm_cpu = build_mm_cpu(flatten_payload(out.multimodal_outputs))
+
+    payloads = [
+        build_omni_mm_payload(
+            combined_multimodal_outputs=None,
+            mm_cpu=mm_cpu,
+            rid=rid,
+            idx=idx,
+            start=start,
+            end=end,
+            audio_sparse_output=False,
+            sparse_mm_index={},
+            hidden_seq_len=2,
+            scheduled_seq_len=2,
+        )
+        for idx, (rid, start, end) in enumerate([("rA", 0, 1), ("rB", 1, 2)])
+    ]
+
+    assert torch.equal(payloads[0]["codes.audio"], _frame(3))
+    assert payloads[0]["codes.visual"].numel() == 0
+    assert torch.equal(payloads[1]["codes.visual"], _frame(9))
+    assert payloads[1]["codes.audio"].numel() == 0
 
 
 def test_make_omni_output_empty_without_codes():

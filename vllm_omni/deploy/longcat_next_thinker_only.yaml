@@ -1,8 +1,7 @@
 # LongCat-Next deploy: thinker only (understanding only -- text in,
 # text/image/audio understanding out; no generation stage). Single stage,
-# TP=1 bf16, sized for a single 80GB GPU or equivalent; useful for
-# understanding-only serving and for CPU/smoke runs where the multi-decoder
-# generation stage is not needed.
+# TP=4 bf16 across 4x 80GB GPUs (~37 GiB/GPU); useful for
+# understanding-only serving without the generation stage.
 pipeline: longcat_next_thinker_only
 async_chunk: false
 
@@ -16,11 +15,11 @@ stages:
     # parent (the model combines both streams' logits per step). With
     # max_num_seqs=1 the twin decodes separately and CFG silently no-ops.
     max_num_seqs: 2
-    tensor_parallel_size: 1
-    devices: "0"
+    tensor_parallel_size: 4
+    devices: "0,1,2,3"
     trust_remote_code: true
     enforce_eager: true
-    gpu_memory_utilization: 0.85
+    gpu_memory_utilization: 0.65
     max_num_batched_tokens: 8192
     max_model_len: 65536
     default_sampling_params:

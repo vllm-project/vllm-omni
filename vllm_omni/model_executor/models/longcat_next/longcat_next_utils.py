@@ -66,6 +66,14 @@ def resolve_single_request_additional_info(kwargs: dict[str, Any], decoder_name:
     return info_dicts[0] if info_dicts else {}
 
 
+def resolve_checkpoint_snapshot(model_path: str, *, revision: str | None = None) -> str:
+    if os.path.isdir(model_path):
+        return model_path
+    from vllm_omni.transformers_utils.repo_utils import hf_api
+
+    return hf_api().snapshot_download(model_path, revision=revision)
+
+
 def resolve_checkpoint_relative_path(configured_path: str, model_path: str) -> str:
     """Resolve config.json's WEIGHT_PATH_TO_LONGCAT_NEXT placeholder against
     the local model directory, instead of requiring users to edit the
