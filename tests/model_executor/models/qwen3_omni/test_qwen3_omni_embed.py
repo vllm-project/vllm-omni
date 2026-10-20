@@ -21,11 +21,12 @@ from benchmarks.qwen3_omni.embedding_harness import (
     expected_outputs,
     make_thinker,
 )
+from tests.helpers.mark import hardware_marks
 from vllm_omni.platforms import current_omni_platform
 
 pytestmark = [
     pytest.mark.core_model,
-    pytest.mark.cuda,
+    *hardware_marks(res={"cuda": "L4"}, num_cards=1),
     pytest.mark.skipif(not current_omni_platform.is_cuda(), reason="requires NVIDIA CUDA"),
 ]
 

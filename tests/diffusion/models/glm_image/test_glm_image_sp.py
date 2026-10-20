@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Tests for GLM-Image Sequence Parallelism support."""
 
 import pytest
 
+from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.data import DiffusionParallelConfig
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -125,7 +126,7 @@ def test_glm_image_has_sp_support():
     # Actual SP testing requires multi-GPU setup
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.sp
 def test_glm_image_sp_inference():
     """Test SP inference (requires multi-GPU setup)."""
