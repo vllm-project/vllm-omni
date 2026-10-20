@@ -1523,8 +1523,12 @@ class MiniCPMO45Code2Wav(nn.Module):
             # the same campplus.onnx) — replaces the per-request CPU
             # onnxruntime run that blocks the host ~120-155ms per request.
             # "token2wav_device_spk": false in the stage extra config falls
-            # back to the CPU onnxruntime path (accuracy triage).
-            device_spk = bool(extra.get("token2wav_device_spk", True))
+            # back to the CPU onnxruntime path (accuracy triage). Parse it as
+            # strictly as the other flags: bool("false") is True, which would
+            # silently keep the device path on for a quoted YAML/JSON value.
+            from .minicpmo_4_5_omni_tts import _bool_flag
+
+            device_spk = _bool_flag(extra.get("token2wav_device_spk", True), "token2wav_device_spk")
             if device_spk:
                 token2wav.enable_device_spk_embedding()
                 logger.info("MiniCPM-o Code2Wav: campplus speaker embedding running on device (torch)")
