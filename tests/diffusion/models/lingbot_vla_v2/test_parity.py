@@ -8,6 +8,8 @@ RoboTwin snapshot and LINGBOT_BACKBONE_PATH to the local Qwen config directory.
 Run in a fresh process with CUBLAS_WORKSPACE_CONFIG=:4096:8. Both implementations
 use the same torch/transformers runtime; six cases compare preprocessing,
 canonical actions and calibrated robot actions. This is not a task-success test.
+The pinned reference calls Qwen3-VL vision methods that Transformers removed in
+5.17, so run this file with transformers==5.16.1.
 """
 
 import os

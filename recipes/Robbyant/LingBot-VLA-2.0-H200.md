@@ -69,9 +69,11 @@ and 55-D OpenPI metadata; do not reuse the 14-D RoboTwin deployment unchanged.
 
 - OS: Linux
 - Python: 3.12
-- Driver / runtime: NVIDIA driver 595 with the vLLM 0.31.0 wheel
-  (PyTorch 2.13.0+cu130); Transformers 5.14.0
-- vLLM version: 0.31.0
+- Driver / runtime: NVIDIA driver 595 with the vLLM 0.32.0 wheel
+  (PyTorch 2.13.0+cu130); Transformers 5.19.0. The parity test and the
+  latency benchmark load the LeRobot reference in the same process and use
+  Transformers 5.16.1.
+- vLLM version: 0.32.0
 - vLLM-Omni version or commit: the commit you deploy from
 
 ## Command
@@ -147,14 +149,14 @@ recovery, reset and reconnect.
 
 - Memory usage: the FP32 weights take about 25 GB (6.26 B inference
   parameters). Serving the repository's online tests (one to three cameras,
-  2 and 10 flow steps) peaked at 30.2 GiB of device memory on an H100 80GB.
+  2 and 10 flow steps) peaked at 30.2 GiB of device memory on this H200.
   Keep 40 GiB free, as the serving tests assume.
 - Key flags: `--omni` selects the pipeline; `--deploy-config` carries the
   OpenPI handshake metadata (`policy_server_config`); FP32 and eager execution
   are required.
 - Latency: on this H200, FP32, batch 1, three cameras and ten flow steps, the
-  direct-policy median is 640.22 ms for the model and 647.75 ms with pre- and
-  post-processing, against 637.79 ms and 645.75 ms for the LeRobot reference
+  direct-policy median is 649.62 ms for the model and 655.43 ms with pre- and
+  post-processing, against 654.99 ms and 659.31 ms for the LeRobot reference
   (ten interleaved ABBA blocks, fixed noise; see the benchmark README).
 - Numerics: match matmul and cuDNN TF32 settings separately. The online
   reference uses matmul TF32 off and cuDNN TF32 on, matching the default

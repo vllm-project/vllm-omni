@@ -12,7 +12,9 @@ the repository root. It does not run in CI.
 
 - One CUDA GPU with room for two FP32 copies of the policy (about 50 GB).
 - The LeRobot LingBot implementation installed in the same environment, pinned
-  to `huggingface/lerobot@f58f7fb9dbb241304df96e967aea0f5b42ff9a4d`.
+  to `huggingface/lerobot@f58f7fb9dbb241304df96e967aea0f5b42ff9a4d`. Its Qwen3-VL
+  code calls vision methods that Transformers removed in 5.17, so install
+  `transformers==5.16.1`.
 - A local `lerobot/lingbot_vla_v2_robotwin` snapshot at revision
   `54f79a4b6e9166bda91b5010088097ff3191bca2`, and a local directory holding the
   `Qwen/Qwen3-VL-4B-Instruct` `config.json`.

@@ -234,6 +234,18 @@ def vision_forward(self, hidden_states: torch.Tensor, grid_thw: torch.Tensor):
     return hidden_states, deepstack_feature_lists
 
 
+class Qwen3VLVisionRotaryEmbedding(nn.Module):
+    """Rotary angles for (h, w) patch coordinates; the buffer is derived, not loaded from the checkpoint."""
+
+    def __init__(self, dim: int, theta: float = 10000.0) -> None:
+        super().__init__()
+        inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float) / dim))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+    def forward(self, position_ids: torch.Tensor) -> torch.Tensor:
+        return (position_ids.unsqueeze(-1) * self.inv_freq).flatten(1)
+
+
 class Qwen3VLVisionModel(_Qwen3VLVisionModel):
     """Vision tower with per-observation grid metadata and LingBot attention blocks."""
 
@@ -243,6 +255,64 @@ class Qwen3VLVisionModel(_Qwen3VLVisionModel):
     def __init__(self, config, *inputs, **kwargs) -> None:
         super().__init__(config, *inputs, **kwargs)
         self.blocks = nn.ModuleList([Qwen3VLVisionBlock(config) for _ in range(config.depth)])
+        # note (0xtoward): Transformers 5.17 removed rot_pos_emb and fast_pos_embed_interpolate, so the
+        # tower owns this position math; it matches the 5.14 implementation the checkpoint was validated on.
+        self.rotary_pos_emb = Qwen3VLVisionRotaryEmbedding(config.hidden_size // config.num_heads // 2)
+
+    def rot_pos_emb(self, grid_thw: torch.Tensor) -> torch.Tensor:
+        """Rotary angles per patch, laid out block-major over the spatial-merge blocks."""
+        merge_size = self.spatial_merge_size
+        position_ids = []
+        for frames, height, width in grid_thw.tolist():
+            row_ids, column_ids = torch.meshgrid(
+                torch.arange(height, device=grid_thw.device),
+                torch.arange(width, device=grid_thw.device),
+                indexing="ij",
+            )
+            block_shape = (height // merge_size, merge_size, width // merge_size, merge_size)
+            row_ids = row_ids.reshape(block_shape).transpose(1, 2).flatten()
+            column_ids = column_ids.reshape(block_shape).transpose(1, 2).flatten()
+            position_ids.append(torch.stack([row_ids, column_ids], dim=-1).repeat(frames, 1))
+        return self.rotary_pos_emb(torch.cat(position_ids, dim=0))
+
+    def fast_pos_embed_interpolate(self, grid_thw: torch.Tensor) -> torch.Tensor:
+        """Bilinearly resample the learned position grid to each image's patches, block-major like rot_pos_emb."""
+        side = self.num_grid_per_side
+        merge_size = self.spatial_merge_size
+        device = grid_thw.device
+        corner_index_parts: list[list[torch.Tensor]] = [[] for _ in range(4)]
+        corner_weight_parts: list[list[torch.Tensor]] = [[] for _ in range(4)]
+        for frames, height, width in grid_thw.tolist():
+            row_grid = torch.linspace(0, side - 1, height, device=device)
+            column_grid = torch.linspace(0, side - 1, width, device=device)
+            row_floor = row_grid.int()
+            column_floor = column_grid.int()
+            row_ceil = (row_floor + 1).clamp(max=side - 1)
+            column_ceil = (column_floor + 1).clamp(max=side - 1)
+            row_fraction = row_grid - row_floor
+            column_fraction = column_grid - column_floor
+            corner_indices = [
+                (row_floor[:, None] * side + column_floor[None, :]).flatten(),
+                (row_floor[:, None] * side + column_ceil[None, :]).flatten(),
+                (row_ceil[:, None] * side + column_floor[None, :]).flatten(),
+                (row_ceil[:, None] * side + column_ceil[None, :]).flatten(),
+            ]
+            corner_weights = [
+                ((1 - row_fraction)[:, None] * (1 - column_fraction)[None, :]).flatten(),
+                ((1 - row_fraction)[:, None] * column_fraction[None, :]).flatten(),
+                (row_fraction[:, None] * (1 - column_fraction)[None, :]).flatten(),
+                (row_fraction[:, None] * column_fraction[None, :]).flatten(),
+            ]
+            row_blocks = torch.arange(height, device=device).view(height // merge_size, merge_size)
+            column_blocks = torch.arange(width, device=device).view(width // merge_size, merge_size)
+            block_order = (row_blocks[:, :, None, None] * width + column_blocks[None, None, :, :]).transpose(1, 2)
+            block_order = block_order.flatten().repeat(frames)
+            for corner in range(4):
+                corner_index_parts[corner].append(corner_indices[corner][block_order])
+                corner_weight_parts[corner].append(corner_weights[corner][block_order])
+        indices = torch.stack([torch.cat(parts) for parts in corner_index_parts])
+        weights = torch.stack([torch.cat(parts) for parts in corner_weight_parts])
+        return (self.pos_embed(indices) * weights[:, :, None]).sum(0)
 
 
 class Qwen3VLTextModel(_Qwen3VLTextModel):
