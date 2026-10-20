@@ -1,6 +1,6 @@
 ---
 name: vllm-omni-CI-Inspection
-description: Triages vLLM-Omni CI failures from Buildkite API or pasted logs. Single-job mode extracts first error, classifies failures (build/install, pytest, infra/resource, config/credentials, timeout/perf), attributes PR vs pre-existing, and outputs evidence-based hypotheses with <=5-minute verification. Batch mode inventories many nightly logs (full_moon_*, nightly-*), clusters root causes across GPU pools (H800/H100/A100), detects incomplete logs, and supports cross-run comparison. Buildkite auto-fetch supports PR dedup (latest build per branch), scheduled READY/MERGE triage, Feishu alert forwarding, and GitHub issue prefill. Use when CI is red/flaky/slow, user pastes nightly log paths, asks nightly red/green summary, compares H800 vs A100, or mentions L1-L5, timeout, pytest, build. By default excludes main branch builds unless user explicitly asks to include them.
+description: Triages vLLM-Omni CI failures from Buildkite API or pasted logs. Single-job mode extracts first error, classifies failures (build/install, pytest, infra/resource, config/credentials, timeout/perf), attributes PR vs pre-existing, and outputs evidence-based hypotheses with <=5-minute verification. Batch mode inventories many nightly logs (full_moon_*, nightly-*), clusters root causes across GPU pools (H800/H100/A100), detects incomplete logs, and supports cross-run comparison. Buildkite auto-fetch supports PR dedup (latest build per branch), scheduled READY/MERGE triage, Feishu alert forwarding, and GitHub issue prefill. Use when CI is red/flaky/slow, user pastes nightly log paths, asks nightly red/green summary, compares H800 vs A100, or mentions L1-L5, timeout, pytest, build. By default excludes main branch builds unless user explicitly asks to include them. Interactive 修复 READY#<build> / 修复 MERGE#<build> commands trigger the auto-bugfix workflow for Simple Test failures (references/auto-bugfix-workflow.md).
 ---
 
 # CI Failure & Duration Triage
@@ -13,6 +13,7 @@ description: Triages vLLM-Omni CI failures from Buildkite API or pasted logs. Si
 | User provides **one** log, Buildkite URL, or asks to deep-dive **one red job** | **Single Job Mode** (Quick Start below) |
 | Batch finds red jobs, user asks to deep-dive specific job(s) | Batch first → **Single Job Report Template** for selected jobs |
 | User provides Buildkite URL / token, wants failed builds fetched automatically | **Buildkite Auto-Fetch Mode** |
+| User sends 修复 READY#<build> / 修复 MERGE#<build> (command rendered in Simple Test failure alerts) | **Auto-bugfix Workflow** → [references/auto-bugfix-workflow.md](references/auto-bugfix-workflow.md) |
 
 ## Quick Start (Single Job Mode)
 
@@ -742,6 +743,13 @@ automatic write operation against GitHub**. Specifically:
 click; it never *executes* the filing itself. All GitHub issue/comment
 creation is manual, human-initiated, via the button.
 
+The auto-fix command follows the same line: scheduled/cron runs only *render*
+`修复 <TYPE>#<build>` in the alert for a human to send; the fix workflow
+(fresh branch → fix → verify → push fork → PR) executes only on an
+interactive, human-sent command — see
+[references/auto-bugfix-workflow.md](references/auto-bugfix-workflow.md).
+It never writes issues or comments.
+
 **Repo-specific button targeting** (so the link points at the right repo):
 - **vllm-omni** tasks (READY / NPU READY / MERGE): button URL targets
   `vllm-project/vllm-omni` with template `400-bug-report.yml` (skill default).
@@ -971,6 +979,26 @@ If filtering removes every row (all failures were PR-introduced), **send nothing
 - Cell text must not contain a literal `|` (breaks the table) — use `/` or `·` instead, or escape as `\|`.
 - Long cells (首个错误 / 根因假设) wrap inside the card; keep them within the length budgets above.
 
+**Auto-fix command rendering (Simple Test failures).** At the end of Message 2
+(after the root-cause / verification / recommendation sections), render a
+copyable auto-fix command when **all** of these hold:
+
+1. The build is a `vllm-omni`-pipeline **READY or MERGE** build (NPU / AFD /
+   ROUTER alerts never render it — no matching fix environment).
+2. The build survived the PR-introduced filtering (rows that remain in the
+   summary table).
+3. At least one failed job in the build has a name starting with `Simple · `.
+
+One command line per qualifying build:
+
+```text
+🤖 自动修复（Simple Test 失败）— 复制指令发给本机器人即可自动修复并提 PR：
+修复 READY#17435
+```
+
+A scheduled/cron run only *renders* this command; the workflow executes only
+when a human sends it to the bot interactively (write-ban above).
+
 **Alert-group forwarding** — send TWO messages to the alert group (E5 format, user-confirmed 2026-10-09):
 
 ```bash
@@ -997,6 +1025,33 @@ EOF
 朱铭觉 has two valid open_ids (both confirmed by the user); include both so the ping reaches whichever account is active. If one is later found dead (renders blank), drop it. Message 2 must contain NO at-tags — even one breaks the table.
 
 No second filtering pass at forward time — filtering already happened when the summary table was built. If the filtered table is empty, send nothing.
+
+### Auto-bugfix Workflow (修复指令触发)
+
+When a **human** sends `修复 READY#<build>` / `修复 MERGE#<build>` (the command
+the alert renderer emits for Simple Test failures), execute
+[references/auto-bugfix-workflow.md](references/auto-bugfix-workflow.md)
+end-to-end:
+
+1. **Phase 0 (bridge box)** — fetch the build from the Buildkite API, collect
+   failed `Simple · ` jobs, extract failing pytest nodes + first-error
+   signature.
+2. **Phase 1 (my_l20 container)** — fresh branch `fix/simple-b<build>-<date>`
+   from `origin/main` in `/rebase/vllm-omni` (venv `/rebase/.venv`,
+   container `vllm_omni_yenuo26`).
+3. **Phase 2** — reproduce first; judge 服务问题 vs 用例问题; modify **service
+   code only** or **the test only** (never both); genuinely ambiguous → stop
+   and ask the user.
+4. **Phase 3** — verify with `pytest -sv <node>`; max 3 fix/verify rounds;
+   still failing → honest report, no PR.
+5. **Phase 4** — commit (Co-Authored-By footer), push to the yenuo26 fork,
+   open a PR to `vllm-project/vllm-omni` from the bridge box (container has
+   no `gh`).
+6. **Phase 5** — report PR link, verdict + evidence, files changed,
+   verification result.
+
+Scheduled/cron runs never execute this workflow — they only render the
+command. No GitHub issue/comment writes anywhere in the workflow.
 
 ### CSV Persistence
 
