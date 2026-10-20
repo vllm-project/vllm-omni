@@ -211,9 +211,9 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         """Find the official MiniCPM-o reference-audio request forms.
 
         The benchmark sends ``extra_body.ref_audio`` while the official demo
-        puts an ``audio_url`` content part in the system message.  Both are
-        input data, not prompt/template controls; keep the value as a URI
-        until the existing MediaConnector materializes it below.
+        puts an ``audio_url`` content part in the system message. OpenAI
+        ``input_audio`` parts may also supply base64 data and a format; turn
+        those into a data URI before a media connector sees them.
         """
         for source in (
             getattr(request, "extra_body", None),
@@ -239,9 +239,18 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     "audio",
                 }:
                     continue
+                part_type = part.get("type")
                 audio = part.get("audio_url", part.get("input_audio", part.get("audio")))
                 if isinstance(audio, dict):
-                    audio = audio.get("url") or audio.get("data")
+                    if part_type == "input_audio":
+                        data = audio.get("data")
+                        audio_format = audio.get("format")
+                        if isinstance(data, str) and data:
+                            if data.startswith("data:"):
+                                return data
+                            if isinstance(audio_format, str) and audio_format:
+                                return f"data:audio/{audio_format};base64,{data}"
+                    audio = audio.get("url")
                 if isinstance(audio, str) and audio:
                     return audio
         return None
@@ -267,6 +276,19 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         if not isinstance(deferred, dict):
             deferred = {}
         if deferred.get("audio"):
+            return
+
+        # The renderer has already decoded supported audio parts such as
+        # OpenAI input_audio. Reuse that waveform instead of fetching its
+        # original base64 payload as if it were a media URI.
+        multi_modal_data = engine_prompt.get("multi_modal_data")
+        rendered_audio = multi_modal_data.get("audio") if isinstance(multi_modal_data, dict) else None
+        has_rendered_audio = rendered_audio is not None
+        if isinstance(rendered_audio, (list, tuple)):
+            has_rendered_audio = bool(rendered_audio)
+        if has_rendered_audio:
+            deferred["audio"] = rendered_audio if isinstance(rendered_audio, list) else [rendered_audio]
+            additional_information["deferred_multi_modal_data"] = deferred
             return
 
         media_connector = MediaConnector(
@@ -1055,7 +1077,20 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         if part_type in {"audio_url", "input_audio", "audio"} and "audio" in deferred_modalities:
             audio = part.get("audio_url", part.get("input_audio", part.get("audio")))
             if isinstance(audio, dict):
-                audio = audio.get("url") or audio.get("data")
+                if part_type == "input_audio":
+                    data = audio.get("data")
+                    audio_format = audio.get("format")
+                    if isinstance(data, str) and data:
+                        if data.startswith("data:"):
+                            audio = data
+                        elif isinstance(audio_format, str) and audio_format:
+                            audio = f"data:audio/{audio_format};base64,{data}"
+                        else:
+                            audio = None
+                    else:
+                        audio = audio.get("url")
+                else:
+                    audio = audio.get("url") or audio.get("data")
             return "audio", audio
         return None, None
 
