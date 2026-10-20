@@ -110,9 +110,14 @@ When the user provides a Buildkite URL or asks to analyze CI failures, automatic
 
    | Trigger time (CST) | Analysis window (CST) | API created_from (UTC) | API created_to (UTC) |
    |---------|------------|----------------------|---------------------|
-   | 7:30 / 8:30 | Yesterday 18:00 → Today 7:30/8:30 | Yesterday 10:00 UTC | Today 00:30/01:30 UTC |
-   | 13:30 / 14:30 | Today 7:30/8:30 → Today 13:30/14:30 | Today 00:30/01:30 UTC | Today 06:30/07:30 UTC |
-   | 17:30 / 18:30 | Today 13:30/14:30 → Today 17:30/18:30 | Today 06:30/07:30 UTC | Today 10:30/11:30 UTC |
+   | 06:00 | Yesterday 19:00 → Today 06:00 | Yesterday 07:00 UTC | Yesterday 23:00 UTC |
+   | 11:00 | Today 06:00 → 11:00 | Yesterday 18:00 UTC | Today 04:00 UTC |
+   | 15:00 | Today 11:00 → 15:00 | Yesterday 23:00 UTC | Today 08:00 UTC |
+   | 17:00 | Today 15:00 → 17:00 | Today 03:00 UTC | Today 10:00 UTC |
+   | 19:00 | Today 17:00 → 19:00 | Today 05:00 UTC | Today 12:00 UTC |
+
+   (Worked example: the READY CI grid. Apply the same prev-trigger→current-trigger
+   windowing + 4h/1h buffer math to whichever grid the prompt specifies.)
 
    **UTC conversion formula**: `UTC time = CST time - 8 hours`
 
@@ -672,12 +677,17 @@ authoritative if this table drifts.
 
 | Task | Cron (UTC) | Trigger time (CST) | Buildkite pipeline | CI type |
 |------|------|--------------|-------------------|---------|
-| READY CI | `0 22,3,9,11 * * *` | 06:00 / 11:00 / 17:00 / 19:00 | vllm-omni | Ready CI |
-| NPU READY CI | `10 22,3,9,11 * * *` | 06:10 / 11:10 / 17:10 / 19:10 | vllm-omni-npu-ci | Ready CI |
-| MERGE CI | `20 22,3,9,11 * * *` | 06:20 / 11:20 / 17:20 / 19:20 | vllm-omni | Merge CI |
-| AFD READY CI | `0 2,8,10 * * *` | 10:00 / 16:00 / 18:30 | afd-plugin | Ready CI |
-| AFD MERGE CI | `15 2,8,10 * * *` | 10:15 / 16:15 / 18:45 | afd-plugin | Merge CI |
-| ROUTER MERGE CI | `30 2 * * *` | 10:30 daily (24h window) | router | Merge CI |
+| READY CI | `0 22,3,7,9,11 * * *` | 06:00 / 11:00 / 15:00 / 17:00 / 19:00 | vllm-omni | Ready CI |
+| NPU READY CI | `10 22,3,7,9,11 * * *` | 06:10 / 11:10 / 15:10 / 17:10 / 19:10 | vllm-omni-npu-ci | Ready CI |
+| MERGE CI | `20 22,3,7,9,11 * * *` | 06:20 / 11:20 / 15:20 / 17:20 / 19:20 | vllm-omni | Merge CI |
+| AFD READY CI | `0 2,4,8,10 * * *` | 10:00 / 12:00 / 16:00 / 18:00 | afd-plugin | Ready CI |
+| AFD MERGE CI | `15 2,4,8,10 * * *` | 10:15 / 12:15 / 16:15 / 18:15 | afd-plugin | Merge CI |
+| ROUTER MERGE CI | `30 2,6,8 * * *` | 10:30 / 14:30 / 16:30 | router | Merge CI |
+| ROUTER READY CI | `40 2,6,8 * * *` | 10:40 / 14:40 / 16:40 | router | Ready CI |
+
+Note: the last daily round of each grid wraps overnight — the window after the
+final trigger runs to the next day's first trigger (e.g. READY CI 19:00 → next
+day 06:00 is an 11h window; ROUTER 16:30/16:40 → next day 10:30/10:40 is 18h).
 
 Pipeline-specific merge-CI filtering (scheduled-build exclusions differ per repo):
 - **vllm-omni / afd-plugin** merge CI: exclude builds whose message is
@@ -981,7 +991,7 @@ EOF
 
 | Alert type | At-tags for Message 1 |
 |---|---|
-| ROUTER MERGE / AFD READY / AFD MERGE | `<at user_id="ou_b0910cfdc8cbb8901afde1d406c62265"></at>` (王语) |
+| ROUTER MERGE / ROUTER READY / AFD READY / AFD MERGE | `<at user_id="ou_b0910cfdc8cbb8901afde1d406c62265"></at>` (王语) |
 | All others (READY / NPU READY / MERGE on vllm-omni) | `<at user_id="ou_f8547e27fe2edc35fb519fc1845d0b92"></at>` (王伟) + `<at user_id="ou_e2899f46b8e5cee8a3cf8ec346d5b462"></at>` (朱铭觉) + `<at user_id="ou_b5fe2c5e00ae0619cf6ae7e0c21321e1"></at>` (朱铭觉 second ID) |
 
 朱铭觉 has two valid open_ids (both confirmed by the user); include both so the ping reaches whichever account is active. If one is later found dead (renders blank), drop it. Message 2 must contain NO at-tags — even one breaks the table.
