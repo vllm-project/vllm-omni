@@ -2007,12 +2007,23 @@ class DiffusionEngine:
             getattr(batching_config, "warmup_profile_cache_dir", None)
             or "~/.cache/vllm_omni/warmup_batch_profile"
         )
+        # Parallel layout changes how one request is sharded across ranks,
+        # hence the per-step cost of a batch and the sweet-spot B*. Without
+        # these fields a profile measured at TP=1 would be silently reused
+        # for TP=2/4 (same GPU -> same key), yielding a too-small budget.
+        # DP is excluded: replicas calibrate independently. Note the sizes
+        # live on od_config.parallel_config, not on od_config itself.
+        pconf = getattr(self.od_config, "parallel_config", None)
         cache_fields = {
             "model": self.od_config.model,
             "model_class": self.od_config.model_class_name,
             "gpu": torch.cuda.get_device_name(),
             "capability": ".".join(str(x) for x in torch.cuda.get_device_capability()),
             "gpu_memory": torch.cuda.get_device_properties(torch.accelerator.current_device_index()).total_memory,
+            "tp": int(getattr(pconf, "tensor_parallel_size", 1) or 1),
+            "pp": int(getattr(pconf, "pipeline_parallel_size", 1) or 1),
+            "sp": int(getattr(pconf, "sequence_parallel_size", 1) or 1),
+            "cfg": int(getattr(pconf, "cfg_parallel_size", 1) or 1),
             "ref": f"{ref_h}x{ref_w}",
             "num_steps": num_steps,
             "b_max": b_max,
