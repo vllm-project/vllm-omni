@@ -38,6 +38,9 @@ from vllm_omni.model_executor.models.minicpmo_4_5 import (
     MINICPMO45_DUPLEX_CODEC_TOKENS_PER_CHUNK,
     MINICPMO45_DUPLEX_TURN_END_CODEC_TOKENS,
 )
+from vllm_omni.model_executor.models.minicpmo_4_5.config_flags import (
+    parse_bool_flag as _bool_flag,
+)
 from vllm_omni.model_executor.models.minicpmo_4_5.talker_codec_sample import (
     HISTORY_WINDOW,
     TalkerCodecDeviceState,
@@ -247,26 +250,6 @@ def _apply_batched_repetition_penalty(
         penalized[start:end] = torch.where(chunk_logits < 0, chunk_logits * alpha, chunk_logits / alpha)
 
     return penalized
-
-
-def _bool_flag(value: Any, key: str) -> bool:
-    """Parse a boolean knob strictly, so a typo fails at startup.
-
-    ``bool("false")`` is ``True``, which would silently keep the fused path on
-    for a quoted YAML value or a JSON/CLI stage override -- exactly the case
-    the switch exists to triage.
-    """
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, int) and value in (0, 1):
-        return bool(value)
-    if isinstance(value, str):
-        token = value.strip().lower()
-        if token in ("true", "1"):
-            return True
-        if token in ("false", "0"):
-            return False
-    raise ValueError(f"{key} must be a boolean (true/false/1/0), got {value!r}")
 
 
 def resolve_codec_sampling_params(

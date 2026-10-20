@@ -33,6 +33,7 @@ from .batched_token2wav import (
     row_offset_signature,
     state_shape_signature,
 )
+from .config_flags import parse_bool_flag
 from .cuda_graph_wrapper import ResidentAttCache, _format_memory_delta, _memory_snapshot
 
 if TYPE_CHECKING:
@@ -371,8 +372,12 @@ class MiniCPMO45Code2Wav(nn.Module):
         # chunk 0 still runs setup_batch inline. ``token2wav_ref_prefetch_setup``
         # also warms the batch-1 setup (phase B), a ~100 ms CFM pass that
         # competes with the thinker's decode on a shared GPU.
-        self._ref_prefetch_enabled = bool(extra.get("token2wav_ref_prefetch", True))
-        self._ref_prefetch_setup = bool(extra.get("token2wav_ref_prefetch_setup", False))
+        self._ref_prefetch_enabled = parse_bool_flag(
+            extra.get("token2wav_ref_prefetch", True), "token2wav_ref_prefetch"
+        )
+        self._ref_prefetch_setup = parse_bool_flag(
+            extra.get("token2wav_ref_prefetch_setup", False), "token2wav_ref_prefetch_setup"
+        )
         self._ref_prefetch_max_waiters = int(extra.get("token2wav_ref_prefetch_max_waiters", 1))
         if self._ref_prefetch_max_waiters < 1:
             raise ValueError("token2wav_ref_prefetch_max_waiters must be >= 1")
@@ -402,7 +407,7 @@ class MiniCPMO45Code2Wav(nn.Module):
         max_serial_batch = extra.get("max_serial_batch")
         max_serial_batch = 4 if max_serial_batch is None else int(max_serial_batch)
         self._hift_graph_config = {
-            "enabled": bool(extra.get("enable_hift_graph", False)),
+            "enabled": parse_bool_flag(extra.get("enable_hift_graph", False), "enable_hift_graph"),
             "capture_batch_sizes": capture_batch_sizes,
             "max_serial_batch": max_serial_batch,
         }
@@ -432,7 +437,7 @@ class MiniCPMO45Code2Wav(nn.Module):
             "rows": [row for row in encoder_rows if not max_num_seqs or row <= int(max_num_seqs)],
         }
         self._cfm_graph_config = {
-            "enabled": bool(extra.get("enable_cfm_graph", False)),
+            "enabled": parse_bool_flag(extra.get("enable_cfm_graph", False), "enable_cfm_graph"),
             "max_graphs": int(extra.get("cfm_max_graphs", 32)),
             "bucket_frames": int(extra.get("cfm_graph_bucket_frames", 0)),
             "capture_frames": extra.get("cfm_graph_capture_frames"),
@@ -480,7 +485,7 @@ class MiniCPMO45Code2Wav(nn.Module):
         self._default_prompt_id = str(extra.get("prompt_cache_id", "HT_ref_audio"))
         self._prompt_wav_override = extra.get("prompt_wav")
         self._default_prompt_normalized: tuple[str, str] | None = None
-        self._onset_merge = bool(extra.get("cfm_onset_merge", False))
+        self._onset_merge = parse_bool_flag(extra.get("cfm_onset_merge", False), "cfm_onset_merge")
         self._cross_turn_buckets = extra.get("cfm_cross_turn_buckets", False) is True
         self._row_offset_merge = self._cfm_graph_config["row_offset_merge"]
         self._precapture_empty_cache = extra.get("cfm_precapture_empty_cache", False) is True
@@ -1479,7 +1484,7 @@ class MiniCPMO45Code2Wav(nn.Module):
         tf32_mode = _tf32_mode(extra) if current_omni_platform.is_cuda() else "off"
         if tf32_mode != "off":
             logger.info("MiniCPM-o Code2Wav: ordinary TF32 enabled for CFM DiT GEMMs")
-        use_float16 = bool(extra.get("token2wav_float16", False))
+        use_float16 = parse_bool_flag(extra.get("token2wav_float16", False), "token2wav_float16")
         previous_dtype = torch.get_default_dtype()
         try:
             # vLLM constructs bf16 models under a bf16 default-dtype context.
@@ -1498,7 +1503,13 @@ class MiniCPMO45Code2Wav(nn.Module):
             torch.set_default_dtype(previous_dtype)
 
         trt_stepper = None
-        use_trt = bool(extra.get("token2wav_trt", False)) or os.environ.get("MINICPMO_TOKEN2WAV_TRT", "") == "1"
+        # Parsed before the platform branches: a typo in a shared stage config
+        # must fail at startup on every platform, not only where the toggle is
+        # consumed (CUDA for TensorRT, NPU for the device speaker embedding).
+        device_spk = parse_bool_flag(extra.get("token2wav_device_spk", True), "token2wav_device_spk")
+        use_trt = parse_bool_flag(extra.get("token2wav_trt", False), "token2wav_trt") or (
+            os.environ.get("MINICPMO_TOKEN2WAV_TRT", "") == "1"
+        )
         # TensorRT is CUDA-only; other platforms ignore the toggle.
         if use_trt and current_omni_platform.is_cuda():
             from vllm_omni.model_executor.models.step_audio2.step_audio2_dit_trt import build_dit_trt_stepper
@@ -1523,12 +1534,7 @@ class MiniCPMO45Code2Wav(nn.Module):
             # the same campplus.onnx) — replaces the per-request CPU
             # onnxruntime run that blocks the host ~120-155ms per request.
             # "token2wav_device_spk": false in the stage extra config falls
-            # back to the CPU onnxruntime path (accuracy triage). Parse it as
-            # strictly as the other flags: bool("false") is True, which would
-            # silently keep the device path on for a quoted YAML/JSON value.
-            from .minicpmo_4_5_omni_tts import _bool_flag
-
-            device_spk = _bool_flag(extra.get("token2wav_device_spk", True), "token2wav_device_spk")
+            # back to the CPU onnxruntime path (accuracy triage).
             if device_spk:
                 token2wav.enable_device_spk_embedding()
                 logger.info("MiniCPM-o Code2Wav: campplus speaker embedding running on device (torch)")
@@ -1544,13 +1550,15 @@ class MiniCPMO45Code2Wav(nn.Module):
             hift_graph_config=self._hift_graph_config,
             cfm_graph_config=self._cfm_graph_config,
             chunk_encoder_graph_config=self._chunk_encoder_graph_config,
-            bfloat16_attention_cache=bool(extra.get("code2wav_bfloat16_attention_cache", False)),
+            bfloat16_attention_cache=parse_bool_flag(
+                extra.get("code2wav_bfloat16_attention_cache", False), "code2wav_bfloat16_attention_cache"
+            ),
             setup_cache_size=self._setup_cache_size,
             cfm_tf32=tf32_mode != "off",
             encoder_graph_config=self._encoder_graph_config,
         )
         # Captured by the first forward (the warmup run): under vLLM's weight load a graph held GiBs.
-        self._precapture_pending = bool(extra.get("cfm_graph_precapture", True))
+        self._precapture_pending = parse_bool_flag(extra.get("cfm_graph_precapture", True), "cfm_graph_precapture")
 
     def _release_precapture_cache(self) -> None:
         """Return startup's unused cached allocator blocks to the driver (``cfm_precapture_empty_cache``).

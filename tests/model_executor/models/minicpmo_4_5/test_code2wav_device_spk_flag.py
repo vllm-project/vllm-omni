@@ -101,3 +101,46 @@ def test_unset_or_true_enables_the_device_embedding(tmp_path, monkeypatch, npu_p
 def test_invalid_value_is_rejected(tmp_path, monkeypatch, npu_platform, value):
     with pytest.raises(ValueError, match="token2wav_device_spk"):
         _build_backend(tmp_path, monkeypatch, {"token2wav_device_spk": value})
+
+
+def test_invalid_value_is_rejected_off_npu_too(tmp_path, monkeypatch):
+    """The flag is parsed before the platform branch, so a typo fails anywhere."""
+    monkeypatch.setattr(current_omni_platform, "is_npu", lambda: False)
+    monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: False)
+
+    with pytest.raises(ValueError, match="token2wav_device_spk"):
+        _build_backend(tmp_path, monkeypatch, {"token2wav_device_spk": "maybe"})
+
+
+_OTHER_DEFAULTS = {
+    "token2wav_float16",
+    "token2wav_trt",
+    "code2wav_bfloat16_attention_cache",
+    "cfm_graph_precapture",
+    "token2wav_ref_prefetch",
+    "token2wav_ref_prefetch_setup",
+    "enable_hift_graph",
+    "enable_cfm_graph",
+    "cfm_onset_merge",
+}
+
+
+@pytest.mark.parametrize("key", sorted(_OTHER_DEFAULTS))
+def test_other_stage_extra_flags_are_strict(tmp_path, monkeypatch, npu_platform, key):
+    with pytest.raises(ValueError, match=key):
+        _build_backend(tmp_path, monkeypatch, {key: "maybe"})
+
+
+def test_quoted_false_disables_other_stage_flags(tmp_path, monkeypatch, npu_platform):
+    model, _ = _build_backend(
+        tmp_path,
+        monkeypatch,
+        {
+            "cfm_graph_precapture": "false",
+            "enable_hift_graph": "false",
+            "token2wav_ref_prefetch": "false",
+        },
+    )
+    assert model._precapture_pending is False
+    assert model._hift_graph_config["enabled"] is False
+    assert model._ref_prefetch_enabled is False
