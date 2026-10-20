@@ -1,246 +1,392 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""CI guard for Omni-DuplexEval scoring regression.
+"""CPU regressions for the accuracy checks invoked by the DFX nightly."""
 
-Pipeline: bench serve (generate + evaluate + save) -> assert.
-"""
-
-from __future__ import annotations
-
+import io
 import json
-import secrets
-import subprocess
-from datetime import datetime, timezone
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
 
-from tests.e2e.accuracy.omni_duplex_eval import conftest as _omni_conftest
-from tests.e2e.online_serving.helpers.minicpmo_4_5_duplex import (
-    SERVER_PARAMS as DUPLEX_TEST_PARAMS,
-)
-from tests.e2e.online_serving.helpers.minicpmo_4_5_duplex import (
-    resolve_ref_audio,
-)
-from tests.helpers.mark import hardware_test
+from tests.e2e.accuracy.omni_duplex_eval.validation import assert_accuracy_result, load_accuracy_config
+from vllm_omni.benchmarks.duplex.omni_duplex_eval_eval import summarize_scores
 from vllm_omni.benchmarks.duplex.omni_duplex_eval_metrics import PROTOCOL_PIN
 
-# Thresholds (hardcoded, community accuracy test pattern).
-# baseline commit: 873e9bff7c545c5cda79fdb93a867f09e443b61d
-#
-# RECORD MODE: all thresholds are 0.0 until the first nightly run produces
-# real scores. After that, tighten to ~50% of the measured baseline (paper
-# MiniCPM-o 4.5 on the 100-point scale maps to ~1.15 content / ~2.40
-# temporal / ~0.20 PR on the code scales; see README "Reference paper").
-_MIN_RTD_MEAN_CONTENT_SCORE = 0.0  # 3-point scale (0.00-3.00)
-_MIN_RTD_MEAN_TEMPORAL_SCORE = 0.0  # 0-3 scale
-_MIN_PR_MEAN_ALL_SUCCESS = 0.0  # 0-1 scale
-
-_CONFIG_PATH = Path(__file__).resolve().parent / "omni_duplex_eval_ci_config.json"
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+_CONFIG_PATH = Path(__file__).with_name("omni_duplex_eval_ci_config.json")
 
 
-def _load_ci_config() -> dict:
-    return json.loads(_CONFIG_PATH.read_text(encoding="utf-8"))
+@pytest.fixture
+def config():
+    return json.loads(_CONFIG_PATH.read_text())
 
 
-pytestmark = [pytest.mark.full_model, pytest.mark.omni]
-
-# Dynamically inject the sub-process device isolation env_dict to avoid mutating
-# the pytest parent process's os.environ (which causes leaks to other multi-GPU
-# tests in the same session). ``_omni_server_device_env()`` returns ``None`` on
-# CPU-only hosts (no device split), which matches the default ``env_dict=None``.
-_DUPLEX_SERVER_PARAMS = [
-    pytest.param(
-        p.values[0]._replace(env_dict=_omni_conftest._omni_server_device_env()),
-        id=p.id,
+@pytest.fixture
+def result(tmp_path, config):
+    """Build real score files and summarize them through the production scorer."""
+    score_root = tmp_path / "evaluation"
+    for split, ids in config["sample_ids_per_split"].items():
+        for sid in ids:
+            row = {"id": sid, "protocol_pin": PROTOCOL_PIN}
+            if split.startswith("RTD_"):
+                row.update(
+                    family="rtd",
+                    task_type=split.removeprefix("RTD_").lower(),
+                    content={"content_score": 2.8},
+                    temporal={"summary": {"avg_temporal_score": 3.0}},
+                )
+            else:
+                task = {
+                    "PR_correction": "correction",
+                    "PR_event_reminder": "proactive_reminder",
+                    "PR_post_event_reminder": "post_event_reminder",
+                }[split]
+                row.update(family="pr", task_type=task, pr={"all_success": True, "total_score": 1})
+            path = score_root / split / f"{sid}.json"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(row))
+    summary = summarize_scores(score_root)
+    expected = sum(map(len, config["sample_ids_per_split"].values()))
+    summary.update(
+        status="completed",
+        total=expected,
+        evaluated=expected,
+        failed=0,
+        skipped=0,
+        errors=[],
+        score_root=str(score_root),
     )
-    for p in DUPLEX_TEST_PARAMS
-]
-
-
-_RESULT_DIR = Path(__file__).resolve().parent / "results"
-
-
-@hardware_test(res={"cuda": ["H100", "B200"], "npu": "A3"}, num_cards=2)
-@pytest.mark.parametrize("omni_server", _DUPLEX_SERVER_PARAMS, indirect=True)
-def test_omni_duplex_eval_ci(omni_server, tmp_path: Path, judge_server: str) -> None:
-    """CI guard: benchmark serving and assert the saved accuracy results."""
-    config = _load_ci_config()
-    response_root = tmp_path / "responses"
-
-    all_ids = sorted(set(sid for sids in config["sample_ids_per_split"].values() for sid in sids))
-    exclude = set(config.get("exclude_ids", []))
-    sample_ids = [sid for sid in all_ids if sid not in exclude]
-
-    # Validate dataset_revision (reserved for future pinning; not yet supported).
-    dataset_revision = config.get("dataset_revision")
-    if dataset_revision:
-        raise NotImplementedError(f"dataset_revision pinning is not yet supported (got {dataset_revision!r}).")
-
-    # The integrated benchmark owns generation, judging, and summarization.
-    # Remove previous artifacts so an early CLI failure cannot reuse old results.
-    _RESULT_DIR.mkdir(parents=True, exist_ok=True)
-    benchmark_path = _RESULT_DIR / "bench-result.json"
-    benchmark_path.unlink(missing_ok=True)
-    for old_result in _RESULT_DIR.glob("result_acc_*.json"):
-        old_result.unlink()
-    model_name = Path(omni_server.model).name
-    dataset_name = Path(config["dataset"]).name
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-    result_path = _RESULT_DIR / (
-        f"result_acc_{model_name}_{dataset_name}_{timestamp}_{secrets.randbelow(10**8):08d}.json"
-    )
-    judge_cfg = config["judge"]
-    _run_cli(
-        [
-            "vllm",
-            "bench",
-            "serve",
-            "--omni",
-            "--backend",
-            "openai-realtime-duplex",
-            "--base-url",
-            f"http://{omni_server.host}:{omni_server.port}",
-            "--endpoint",
-            "/v1/realtime",
-            "--dataset-name",
-            "omni-duplex-eval",
-            "--dataset-path",
-            config["dataset"],
-            "--duplex-eval-split",
-            "all",
-            "--duplex-eval-ids",
-            *sample_ids,
-            "--num-prompts",
-            "0",
-            "--disable-shuffle",
-            "--max-concurrency",
-            "1",
-            "--num-warmups",
-            "0",
-            "--ready-check-timeout-sec",
-            "0",
-            "--model",
-            omni_server.model,
-            "--trust-remote-code",
-            "--duplex-eval-ref-audio",
-            str(resolve_ref_audio()),
-            "--duplex-eval-response-root",
-            str(response_root),
-            "--duplex-eval-evaluate",
-            "--duplex-eval-judge-model",
-            judge_cfg["model"],
-            "--duplex-eval-judge-base-url",
-            judge_server,
-            "--duplex-eval-judge-video-mode",
-            judge_cfg.get("video_mode", "video_url"),
-            "--duplex-eval-judge-fps",
-            str(judge_cfg.get("fps", 2)),
-            "--duplex-eval-eval-workers",
-            str(judge_cfg.get("eval_workers", 4)),
-            "--save-result",
-            "--result-dir",
-            str(_RESULT_DIR),
-            "--result-filename",
-            benchmark_path.name,
-        ]
-    )
-
-    assert benchmark_path.exists(), f"bench serve exited without writing {benchmark_path}"
-    benchmark = json.loads(benchmark_path.read_text(encoding="utf-8"))
-    duplex = benchmark["omni_duplex_eval"]
-    summary = duplex["accuracy"]
-    # Export the accuracy artifact for dashboard collection without re-summarizing.
-    # Save before assertions so partial/failed judging remains inspectable in CI.
-    result_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"\n[Omni-DuplexEval] summary saved to {result_path}")
-
-    expected = len(sample_ids)
-    assert benchmark["completed"] == expected, f"expected {expected} completed requests, got {benchmark['completed']}"
-    assert benchmark["failed"] == 0, f"failed benchmark requests: {benchmark['failed']}"
-    assert duplex["published"] == expected, f"expected {expected} published samples, got {duplex['published']}"
-    assert not duplex["artifact_errors"], f"artifact errors: {duplex['artifact_errors']}"
-    assert summary["status"] == "completed", f"evaluation did not complete: {summary}"
-    assert summary["total"] == expected, f"expected {expected} total samples, got {summary['total']}"
-    assert summary["evaluated"] == expected, f"expected {expected} evaluated samples, got {summary['evaluated']}"
-    assert summary["failed"] == 0, f"failed evaluations: {summary['failed']}"
-    assert summary["skipped"] == 0, f"skipped evaluations: {summary['skipped']}"
-    assert not summary["errors"], f"evaluation errors: {summary['errors']}"
-
-    # Sanity check: config pin must match the runtime source-of-truth constant.
-    config_pin = config.get("protocol_pin")
-    assert config_pin == PROTOCOL_PIN, (
-        f"config protocol_pin {config_pin!r} does not match source of truth {PROTOCOL_PIN!r}"
-    )
-
-    score_root = Path(summary["score_root"])
-    score_files = [p for p in score_root.rglob("*.json") if not p.name.endswith("_summary.json")]
-    assert len(score_files) == len(sample_ids), f"expected {len(sample_ids)} score files, found {len(score_files)}"
-    expected_files = {
-        Path(split) / f"{sid}.json"
-        for split, ids in config["sample_ids_per_split"].items()
-        for sid in ids
-        if sid not in exclude
+    return {
+        "date": "20261020-065052",
+        "completed": expected,
+        "failed": 0,
+        "duplex_session_metrics": [
+            {
+                "client_ttft_ms": {"count": 1, "mean": 3.0},
+                "client_ttfp_ms": {"count": 1, "mean": 4.0},
+            }
+            for _ in range(expected)
+        ],
+        "omni_duplex_eval": {
+            "published": expected,
+            "artifact_errors": [],
+            "published_with_unfinished_responses": 0,
+            "accuracy": summary,
+        },
     }
-    assert {p.relative_to(score_root) for p in score_files} == expected_files, "score sample IDs differ from CI config"
 
-    # Validate each score file is consistent with the configured protocol pin.
-    mismatches = []
-    for sf in score_files:
-        row = json.loads(sf.read_text(encoding="utf-8"))
-        row_pin = row.get("protocol_pin")
-        if row_pin != config_pin:
-            mismatches.append(f"{sf.name}: {row_pin!r} != {config_pin!r}")
-    assert not mismatches, "protocol_pin mismatch in score files:\n" + "\n".join(mismatches)
 
-    assert summary["protocol_pin"] == PROTOCOL_PIN, f"protocol_pin changed: {summary['protocol_pin']} != {PROTOCOL_PIN}"
-    assert summary["samples"] == len(sample_ids), f"expected {len(sample_ids)} samples, got {summary['samples']}"
+def test_complete_scores_pass(result, config):
+    assert_accuracy_result(result, config)
 
-    rtd = summary.get("rtd", {})
-    pr = summary.get("pr", {})
-    assert rtd.get("by_task", {}).keys() >= {
-        "RTD_world_knowledge",
-        "RTD_counting",
-        "RTD_fine_grained_movement",
-        "RTD_interaction_relation",
-        "RTD_OCR",
-        "RTD_Omni",
-    }, f"RTD by_task keys mismatch: {rtd.get('by_task', {}).keys()}"
-    assert pr.get("by_task", {}).keys() >= {
-        "correction",
-        "proactive_reminder",
-        "post_event_reminder",
-    }, f"PR by_task keys mismatch: {pr.get('by_task', {}).keys()}"
 
-    assert rtd.get("mean_content_score", 0.0) >= _MIN_RTD_MEAN_CONTENT_SCORE, (
-        f"RTD content score {rtd.get('mean_content_score'):.4f} < {_MIN_RTD_MEAN_CONTENT_SCORE}"
+@pytest.mark.parametrize(
+    "section,field,value,passes",
+    [
+        ("rtd", "mean_content_score", 1.8, True),
+        ("rtd", "mean_content_score", 1.7999, False),
+        ("rtd", "mean_avg_temporal_score", 1.4, True),
+        ("rtd", "mean_avg_temporal_score", 1.3999, False),
+        ("pr", "mean_all_success", 0.28, True),
+        ("pr", "mean_all_success", 0.2799, False),
+        ("pr", "mean_all_success", 11 / 36, True),
+        ("pr", "mean_all_success", 10 / 36, False),
+    ],
+)
+def test_fixed_quality_thresholds(result, config, section, field, value, passes):
+    result["omni_duplex_eval"]["accuracy"][section][field] = value
+    if passes:
+        assert_accuracy_result(result, config)
+    else:
+        with pytest.raises(AssertionError, match="outside"):
+            assert_accuracy_result(result, config)
+
+
+@pytest.mark.parametrize(
+    "section,field,value,message",
+    [
+        ("benchmark", "completed", 65, "completed requests"),
+        ("benchmark", "failed", 1, "failed benchmark requests"),
+        ("duplex", "published", 65, "published samples"),
+        ("duplex", "artifact_errors", ["disk full"], "artifact errors"),
+        ("accuracy", "status", "partial", "evaluation did not complete"),
+        ("accuracy", "total", 3, "total samples"),
+        ("accuracy", "evaluated", 65, "evaluated samples"),
+        ("accuracy", "failed", 1, "failed evaluations"),
+        ("accuracy", "skipped", 1, "skipped evaluations"),
+        ("accuracy", "errors", ["judge failed"], "evaluation errors"),
+        ("accuracy", "samples", 65, "samples"),
+        ("accuracy", "protocol_pin", "old", "summary protocol_pin"),
+        ("accuracy", "rtd", {}, "RTD by_task"),
+        ("accuracy", "pr", {}, "PR by_task"),
+    ],
+)
+def test_incomplete_result_fails(result, config, section, field, value, message):
+    duplex = result["omni_duplex_eval"]
+    {"benchmark": result, "duplex": duplex, "accuracy": duplex["accuracy"]}[section][field] = value
+    with pytest.raises(AssertionError, match=message):
+        assert_accuracy_result(result, config)
+
+
+@pytest.mark.parametrize(
+    "section,field",
+    [("rtd", "mean_content_score"), ("rtd", "mean_avg_temporal_score"), ("pr", "mean_all_success")],
+)
+@pytest.mark.parametrize("value", [0.0, None, True, float("nan"), float("inf"), 4.0])
+def test_invalid_quality_fails(result, config, section, field, value):
+    result["omni_duplex_eval"]["accuracy"][section][field] = value
+    with pytest.raises(AssertionError, match="outside"):
+        assert_accuracy_result(result, config)
+
+
+@pytest.mark.parametrize(
+    "mutation,message", [("missing", "score files"), ("id", "sample IDs"), ("pin", "protocol_pin")]
+)
+def test_score_file_integrity(result, config, mutation, message):
+    path = Path(result["omni_duplex_eval"]["accuracy"]["score_root"]) / "RTD_world_knowledge/360.json"
+    if mutation == "missing":
+        path.unlink()
+    elif mutation == "id":
+        path.rename(path.with_name("wrong.json"))
+    else:
+        row = json.loads(path.read_text())
+        row["protocol_pin"] = "old"
+        path.write_text(json.dumps(row))
+    with pytest.raises(AssertionError, match=message):
+        assert_accuracy_result(result, config)
+
+
+def test_config_pin_must_match_runtime(result, config):
+    config["protocol_pin"] = "old"
+    with pytest.raises(AssertionError, match="source of truth"):
+        assert_accuracy_result(result, config)
+
+
+def test_zero_threshold_is_rejected(result, config):
+    config["baseline"]["min_pr_mean_all_success"] = 0
+    with pytest.raises(AssertionError, match="invalid PR success rate threshold"):
+        assert_accuracy_result(result, config)
+
+
+def test_dfx_invokes_full_accuracy_contract(result):
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    test_root = Path(__file__).resolve().parents[3]
+    dfx = json.loads((test_root / "dfx/perf/tests/test_minicpmo_4_5_omni_duplex_eval.json").read_text())[0]
+    params = dfx["benchmark_params"][0]
+    assert_result(result, params, 66)
+    result["omni_duplex_eval"]["accuracy"]["pr"]["mean_all_success"] = 0
+    with pytest.raises(AssertionError, match="PR success rate"):
+        assert_result(result, params, 66)
+
+
+@pytest.mark.parametrize("audio_sessions", [0, 1, 65, 66])
+def test_dfx_accuracy_requires_batch_audio(result, audio_sessions):
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    test_root = Path(__file__).resolve().parents[3]
+    dfx = json.loads((test_root / "dfx/perf/tests/test_minicpmo_4_5_omni_duplex_eval.json").read_text())[0]
+    for session in result["duplex_session_metrics"][audio_sessions:]:
+        session["client_ttfp_ms"] = {"count": 0, "mean": None}
+    if audio_sessions:
+        assert_result(result, dfx["benchmark_params"][0], 66)
+    else:
+        with pytest.raises(AssertionError, match="no measured client audio"):
+            assert_result(result, dfx["benchmark_params"][0], 66)
+
+
+@pytest.mark.parametrize(
+    "field,value", [("duplex_eval_ids", ["0"]), ("num_prompts", [3]), ("duplex_eval_evaluate", False)]
+)
+def test_wrong_workload_is_rejected(field, value):
+    test_root = Path(__file__).resolve().parents[3]
+    dfx = json.loads((test_root / "dfx/perf/tests/test_minicpmo_4_5_omni_duplex_eval.json").read_text())[0]
+    params = dfx["benchmark_params"][0]
+    params[field] = value
+    with pytest.raises(AssertionError):
+        load_accuracy_config(str(_CONFIG_PATH), params)
+
+
+def test_unsupported_dataset_revision_is_rejected(tmp_path, config):
+    config["dataset_revision"] = "unavailable"
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(config))
+    with pytest.raises(NotImplementedError, match="dataset_revision"):
+        load_accuracy_config(str(path), {})
+
+
+def test_empty_score_directory(tmp_path):
+    assert summarize_scores(tmp_path) == {"protocol_pin": PROTOCOL_PIN, "samples": 0}
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        None,
+        "quality",
+        "judge",
+        "publication",
+        "cli",
+        "cli_after_result",
+        "cuda_abort",
+        "npu_exit",
+        "silence",
+        "audio_outage",
+        "boundary",
+    ],
+)
+@pytest.mark.parametrize("accuracy_dir_override", [False, True])
+@pytest.mark.parametrize("resource_label", ["H100", "H800", "A3"])
+@pytest.mark.parametrize("benchmark_params_name", [None, "rtd-pr-c8"])
+def test_dfx_writes_both_artifacts_before_quality_gate(
+    tmp_path, monkeypatch, result, config, failure, accuracy_dir_override, resource_label, benchmark_params_name
+):
+    from tests.dfx import conftest as dfx
+    from tests.dfx.perf.scripts import run_benchmark as runner
+    from vllm_omni.platforms import current_omni_platform
+
+    test_root = Path(__file__).resolve().parents[3]
+    dfx_config = json.loads((test_root / "dfx/perf/tests/test_minicpmo_4_5_omni_duplex_eval.json").read_text())[0]
+    dfx_config["benchmark_params"][0]["duplex_eval_accuracy_config"] = str(_CONFIG_PATH.resolve())
+    if benchmark_params_name is not None:
+        dfx_config["benchmark_params"][0]["name"] = benchmark_params_name
+    result["model_id"] = "/models/MiniCPM-o-4_5"
+    monkeypatch.setattr(runner, "BENCHMARK_CONFIGS", [dfx_config])
+    monkeypatch.setattr(runner, "get_runtime_resource_label", lambda: resource_label)
+    monkeypatch.chdir(tmp_path)
+    perf_dir = tmp_path / "perf-results"
+    perf_dir.mkdir()
+    monkeypatch.setenv("BENCHMARK_DIR", str(perf_dir))
+    if accuracy_dir_override:
+        accuracy_dir = tmp_path / "accuracy-results"
+        monkeypatch.setenv("ACC_BENCH_RESULT_DIR", str(accuracy_dir))
+    else:
+        accuracy_dir = tmp_path / "tests/e2e/accuracy/omni_duplex_eval/results"
+        monkeypatch.delenv("ACC_BENCH_RESULT_DIR", raising=False)
+    monkeypatch.setenv("BUILDKITE_BRANCH", "test-branch")
+    if failure == "quality":
+        result["omni_duplex_eval"]["accuracy"]["pr"]["mean_all_success"] = 0.0
+    elif failure == "judge":
+        result["omni_duplex_eval"]["accuracy"].update(status="partial", failed=1, errors=["judge failed"])
+    elif failure == "publication":
+        result["omni_duplex_eval"]["artifact_errors"] = ["Cannot publish duplex metrics: disk full"]
+    elif failure == "silence":
+        result["duplex_session_metrics"][0] = {
+            "client_ttft_ms": {"count": 0, "mean": None},
+            "client_ttfp_ms": {"count": 0, "mean": None},
+        }
+    elif failure == "audio_outage":
+        for session in result["duplex_session_metrics"]:
+            session["client_ttfp_ms"] = {"count": 0, "mean": None}
+    elif failure == "boundary":
+        result["omni_duplex_eval"]["published_with_unfinished_responses"] = 1
+    monkeypatch.setattr(current_omni_platform, "is_npu", lambda: failure == "npu_exit")
+    returncode = -6 if failure in ("cuda_abort", "npu_exit") else 1 if failure in ("cli", "cli_after_result") else 0
+
+    commands = []
+
+    class BenchmarkProcess:
+        def __init__(self, command, **kwargs):
+            commands.append(command)
+            self.stdout = io.StringIO("")
+            self.stderr = io.StringIO("")
+            if failure != "cli":
+                path = (
+                    Path(command[command.index("--result-dir") + 1]) / command[command.index("--result-filename") + 1]
+                )
+                path.write_text(json.dumps(result))
+
+        def wait(self):
+            return returncode
+
+    @dataclass
+    class ServerEndpoint:
+        host: str = "localhost"
+        port: int = 8000
+        model: str = "openbmb/MiniCPM-o-4_5"
+        judge_base_url: str = "http://localhost:8001"
+
+    monkeypatch.setattr(dfx.subprocess, "Popen", BenchmarkProcess)
+    case = {"test_name": dfx_config["test_name"], "params": dfx_config["benchmark_params"][0]}
+    if failure and failure not in ("npu_exit", "silence", "boundary"):
+        message = "benchmark exited with unexpected code" if returncode else ""
+        with pytest.raises(AssertionError, match=message):
+            runner.test_performance_benchmark(ServerEndpoint(), case)
+    else:
+        runner.test_performance_benchmark(ServerEndpoint(), case)
+
+    assert len(commands) == 1
+    accuracy_paths = list(accuracy_dir.glob("result_acc_*.json"))
+    perf_paths = list(perf_dir.glob("result_*.json"))
+    assert len(accuracy_paths) == len(perf_paths) == 1
+    assert not list(perf_dir.glob("result_acc_*.json"))
+    timestamp = perf_paths[0].stem.rsplit("_", 1)[-1]
+    assert accuracy_paths[0].name == f"result_acc_MiniCPM-o-4_5_omni_duplex_eval_{timestamp.replace('-', '_')}.json"
+    saved_perf = json.loads(perf_paths[0].read_text())
+    saved = json.loads(accuracy_paths[0].read_text())
+    assert saved["Hardware"] == saved_perf["Hardware"] == resource_label
+    assert saved["model_id"] == (saved_perf.get("model_id") or ServerEndpoint.model)
+    assert "model" not in saved
+    assert saved["dataset"] == "omni_duplex_eval"
+    assert saved["dataset_path"] == config["dataset"]
+    assert saved["date"] == (saved_perf.get("date") or timestamp)
+    assert saved["test_name"] == dfx_config["test_name"]
+    assert saved["name"] == saved_perf.get("name") == benchmark_params_name
+    assert saved["num_prompts"] == dfx_config["benchmark_params"][0]["num_prompts"][0] == 66
+    assert saved["branch"] == "test-branch"
+    assert saved["max_concurrency"] == 8
+    assert saved["baseline"] == config["baseline"]
+    assert saved["benchmark_exit_code"] == returncode
+    if failure == "cli":
+        assert saved["accuracy"]["status"] == "failed"
+    else:
+        assert saved["accuracy"] == result["omni_duplex_eval"]["accuracy"]
+        assert saved["generation"] == {
+            "completed": result["completed"],
+            "failed": result["failed"],
+            **{k: v for k, v in result["omni_duplex_eval"].items() if k != "accuracy"},
+        }
+
+
+@pytest.mark.parametrize("returncode", [0, 1, -6])
+def test_qwen3_eval_keeps_existing_writer_behavior(tmp_path, monkeypatch, returncode):
+    from tests.dfx import conftest as dfx
+
+    test_root = Path(__file__).resolve().parents[3]
+    config = json.loads((test_root / "dfx/perf/tests/test_qwen3_omni_duplex_omni_duplex_eval.json").read_text())[0]
+    params = config["benchmark_params"][0]
+    assert params["duplex_eval_evaluate"] is True
+    assert "duplex_eval_accuracy_config" not in params
+    monkeypatch.setenv("BENCHMARK_DIR", str(tmp_path))
+    accuracy_dir = tmp_path / "accuracy"
+    monkeypatch.setenv("ACC_BENCH_RESULT_DIR", str(accuracy_dir))
+
+    class BenchmarkProcess:
+        def __init__(self, command, **kwargs):
+            self.stdout = io.StringIO("")
+            self.stderr = io.StringIO("")
+            path = Path(command[command.index("--result-dir") + 1]) / command[command.index("--result-filename") + 1]
+            path.write_text(json.dumps({"completed": params["num_prompts"][0]}))
+
+        def wait(self):
+            return returncode
+
+    monkeypatch.setattr(dfx.subprocess, "Popen", BenchmarkProcess)
+    saved = dfx.run_benchmark(
+        [
+            "--model",
+            config["server_params"]["model"],
+            "--dataset-path",
+            params["dataset_path"],
+            "--duplex-eval-evaluate",
+        ],
+        test_name=config["test_name"],
+        flow=params["max_concurrency"][0],
+        dataset_name=params["dataset_name"],
+        num_prompt=params["num_prompts"][0],
+        resource_label="H100",
     )
-    assert rtd.get("mean_avg_temporal_score", 0.0) >= _MIN_RTD_MEAN_TEMPORAL_SCORE, (
-        f"RTD temporal score {rtd.get('mean_avg_temporal_score'):.4f} < {_MIN_RTD_MEAN_TEMPORAL_SCORE}"
-    )
-    assert pr.get("mean_all_success", 0.0) >= _MIN_PR_MEAN_ALL_SUCCESS, (
-        f"PR success rate {pr.get('mean_all_success'):.4f} < {_MIN_PR_MEAN_ALL_SUCCESS}"
-    )
-
-
-# One command now includes both phases, previously allowed 5400 seconds each.
-_CLI_TIMEOUT = 10800
-
-
-def _run_cli(argv: list[str]) -> None:
-    """Run a CLI command and assert success within timeout.
-
-    stdout/stderr are printed in real-time (not captured) so CI logs
-    show full benchmark / evaluate progress — same pattern as PR#6817
-    perf tests (``-s -v`` + ``run_benchmark()``).
-    """
-    label = " ".join(argv[:3])
-    print(f"\n[Omni-DuplexEval] Running: {' '.join(argv)}\n", flush=True)
-    try:
-        result = subprocess.run(argv, capture_output=False, timeout=_CLI_TIMEOUT)
-    except subprocess.TimeoutExpired:
-        raise AssertionError(f"[{label}] timed out after {_CLI_TIMEOUT}s: {' '.join(argv)}") from None
-    # Tolerate -6 (SIGABRT from torch_npu exit heap corruption in vllm-ascend
-    # v0.29.0-a3 image); the guard assertions below verify artifact integrity.
-    assert result.returncode in (0, -6), f"failed with unexpected exit code {result.returncode}"
-    print(f"\n[Omni-DuplexEval] Done: {label}\n", flush=True)
+    assert saved["completed"] == params["num_prompts"][0]
+    assert len(list(tmp_path.glob("result_*.json"))) == 1
+    assert not accuracy_dir.exists()

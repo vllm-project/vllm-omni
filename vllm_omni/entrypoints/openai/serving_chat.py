@@ -147,18 +147,20 @@ from vllm_omni.entrypoints.openai.stage_params import (
 )
 from vllm_omni.entrypoints.openai.utils import (
     get_stage_type,
-    get_supported_speakers_from_hf_config,
     is_image_generation_stage,
     is_single_stage_diffusion,
     parse_lora_request,
     resolve_diffusion_od_config,
-    validate_requested_speaker,
 )
 from vllm_omni.errors import OmniClientError
 from vllm_omni.lora.request import LoRARequest
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.outputs.output_metadata import DiffusionMetadataMapping, DiffusionMetadataValue
 from vllm_omni.utils.audio import audio_chunk_pcm_bytes, audio_chunk_sample_rate
+from vllm_omni.utils.speakers import (
+    get_supported_speakers_from_hf_config,
+    validate_requested_speaker,
+)
 
 logger = init_logger(__name__)
 

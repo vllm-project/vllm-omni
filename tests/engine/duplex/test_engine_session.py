@@ -838,8 +838,64 @@ def test_apply_realtime_update_rejects_voice_change_after_audio_started():
 
     config.apply_realtime_update({"voice": "verse"}, audio_started=False)
     assert config.voice == "verse"
+    # The echo check is playback-independent: a variant spelling must not
+    # overwrite the stored value before playback either.
+    config.apply_realtime_update({"voice": " VERSE "}, audio_started=False)
+    assert config.voice == "verse"
+    config.apply_realtime_update({"audio": {"output": {"voice": " verse "}}}, audio_started=False)
+    assert config.voice == "verse"
+    # Only a real change is a change: realtime clients resend the whole
+    # session object, so a round-tripped voice (same value, any case or
+    # spacing) and a null matching a voice-less config must pass the guard.
+    # An echo also keeps the stored spelling: shared plugins may compare the
+    # stored voice exactly.
+    config.apply_realtime_update({"voice": "verse"}, audio_started=True)
+    assert config.voice == "verse"
+    config.apply_realtime_update({"voice": " VERSE "}, audio_started=True)
+    assert config.voice == "verse"
+    config.apply_realtime_update({"audio": {"output": {"voice": " verse "}}}, audio_started=True)
+    assert config.voice == "verse"
+    config.apply_realtime_update({"voice": None}, audio_started=False)
+    assert config.voice is None
+    config.apply_realtime_update({"voice": None}, audio_started=True)
+    assert config.voice is None
+    for patch in ({"voice": "alloy"}, {"audio": {"output": {"voice": "alloy"}}}):
+        with pytest.raises(DuplexConfigError) as excinfo:
+            config.apply_realtime_update(patch, audio_started=True)
+        assert excinfo.value.code == "voice_update_after_audio_unsupported"
+        assert config.voice is None
+
+    # A nested null is a clear request: honored before audio output (GA
+    # clients carry the voice under audio.output), rejected after.
+    config = DuplexSessionConfig(model="m", voice="alloy")
+    config.apply_realtime_update({"audio": {"output": {"voice": None}}}, audio_started=False)
+    assert config.voice is None
+    config = DuplexSessionConfig(model="m", voice="alloy")
     with pytest.raises(DuplexConfigError) as excinfo:
-        config.apply_realtime_update({"audio": {"output": {"voice": "alloy"}}}, audio_started=True)
+        config.apply_realtime_update({"audio": {"output": {"voice": None}}}, audio_started=True)
+    assert excinfo.value.code == "voice_update_after_audio_unsupported"
+
+
+def test_apply_realtime_update_treats_blank_and_null_as_the_same_voice():
+    # A blank value and null both mean "no voice": switching between them
+    # after playback is an echo, not a change, so it must not be rejected.
+    config = DuplexSessionConfig(model="m", voice="")
+    config.apply_realtime_update({"voice": None}, audio_started=True)
+    assert config.voice is None
+
+    config = DuplexSessionConfig(model="m")
+    config.apply_realtime_update({"voice": "   "}, audio_started=True)
+    assert config.voice is None
+
+    # Before playback a blank clear is stored as null, matching the docs.
+    config = DuplexSessionConfig(model="m", voice="verse")
+    config.apply_realtime_update({"voice": "   "}, audio_started=False)
+    assert config.voice is None
+
+    # Clearing a set voice with a blank value is still a real change.
+    config = DuplexSessionConfig(model="m", voice="verse")
+    with pytest.raises(DuplexConfigError) as excinfo:
+        config.apply_realtime_update({"voice": "   "}, audio_started=True)
     assert excinfo.value.code == "voice_update_after_audio_unsupported"
     assert config.voice == "verse"
 

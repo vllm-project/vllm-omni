@@ -38,6 +38,9 @@ from vllm_omni.model_executor.models.minicpmo_4_5 import (
     MINICPMO45_DUPLEX_CODEC_TOKENS_PER_CHUNK,
     MINICPMO45_DUPLEX_TURN_END_CODEC_TOKENS,
 )
+from vllm_omni.model_executor.models.minicpmo_4_5.config_flags import (
+    parse_bool_flag as _bool_flag,
+)
 from vllm_omni.model_executor.models.minicpmo_4_5.talker_codec_sample import (
     HISTORY_WINDOW,
     TalkerCodecDeviceState,
@@ -46,6 +49,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5.talker_codec_sample import (
     greedy_codec_sample,
     make_device_state,
     prepare_codec_logits,
+    warmup_fused_prelude,
 )
 from vllm_omni.model_executor.models.minicpmo_4_5.talker_codec_sample import (
     VOCAB_SIZE as _CODEC_VOCAB_SIZE,
@@ -660,6 +664,15 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         else:
             self._tts_config = None
             self._codec_eos_id = 0
+        # The fused prelude is a stage-connector knob rather than a sampler
+        # value: the connector's ``extra`` block is the YAML surface that
+        # actually reaches ``OmniModelConfig`` for this stage. Default true; a
+        # deployment sets ``talker_codec_fused_prelude: false`` to force the
+        # eager chain, and the runtime latch still covers kernel failures.
+        self._codec_fused_prelude = _bool_flag(
+            self._extra_config().get("talker_codec_fused_prelude", True),
+            "talker_codec_fused_prelude",
+        )
 
         # Multi-frame decode: K codec frames per Talker decode step. A value
         # >= 2 engages the loop -- the scheduler hands each request K query
@@ -1878,6 +1891,23 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             self._request_generators[request_id] = generator
         return generator
 
+    def _extra_config(self) -> dict[str, Any]:
+        """Stage-connector ``extra``: the per-stage knobs a deploy YAML can set.
+
+        The talker has no incoming connector edge, so ``get_stage_connector_spec``
+        takes the producer fallback and hands it the extra of its outgoing
+        ``1->2`` edge. If a deploy ever gives stage 1 an explicit
+        ``input_connectors`` entry, the dict comes from that edge instead and
+        ``talker_codec_fused_prelude`` silently reverts to the default.
+        """
+        model_config = getattr(self.vllm_config, "model_config", None)
+        connector = getattr(model_config, "stage_connector_config", None)
+        if isinstance(connector, Mapping):
+            extra = connector.get("extra", connector)
+        else:
+            extra = getattr(connector, "extra", None)
+        return dict(extra) if isinstance(extra, Mapping) else {}
+
     def _codec_sample_setup(
         self,
         request_id: str,
@@ -1937,6 +1967,12 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 ),
             )
             device_inputs_by_request[request_id] = device_inputs
+        # Compile the codec prelude kernel before this request decodes, so a
+        # compile failure latches the eager chain outside any graph capture.
+        # An eager-only configuration never touches the kernel: after a
+        # CANN/torch_npu upgrade a broken kernel may fault the device instead
+        # of raising, which would defeat the switch.
+        warmup_fused_prelude(hidden_state.device, enabled=self._codec_fused_prelude)
         return device_state, device_inputs, device_states
 
     def _sample_audio_code(
@@ -1977,6 +2013,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             frequency_penalty=_codec_float_param(request_state, "codec_frequency_penalty", 0.0),
             presence_penalty=_codec_float_param(request_state, "codec_presence_penalty", 0.0),
             eos_window_masked=eos_window_masked,
+            fused_prelude=self._codec_fused_prelude,
         )
         probabilities = torch.softmax(logits, dim=-1)
         sampled = torch.multinomial(

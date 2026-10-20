@@ -17,7 +17,7 @@ import asyncio
 import base64
 import struct
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from types import SimpleNamespace
 from typing import Any
 
@@ -48,9 +48,11 @@ from vllm_omni.engine.duplex.messages import (
     OpenDuplexSessionMessage,
 )
 from vllm_omni.engine.duplex.plugin import DuplexModelPlugin
+from vllm_omni.engine.duplex.session.emitter import SessionEmitter
 from vllm_omni.engine.duplex.session.engine_session import RESPONSE_REQUEST_MEASUREMENT_ORIGIN
 from vllm_omni.engine.duplex.session.manager import DuplexSessionManager
 from vllm_omni.engine.duplex.session.runner import DuplexSessionRunner
+from vllm_omni.entrypoints.duplex.realtime_input import RealtimeEnvelope
 from vllm_omni.metrics.stats import OrchestratorAggregator, StageRequestStats, StageStats
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.plugin import MiniCPMO45DuplexPlugin
 
@@ -1977,6 +1979,368 @@ async def test_session_update_rejects_instruction_changes_after_the_context_is_l
 
 
 @pytest.mark.asyncio
+async def test_uncaught_session_update_error_names_that_update(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A failure outside the handled update branches still answers that command.
+
+    The serving reader matches ``related_event_id``. Without it, the next
+    append waits forever.     The failure is before the session adopts the candidate, so the live
+    config stays and the staged detector is not installed.
+    """
+
+    def explode(self, patch, *, session_id=None, audio_started=False):
+        del self, patch, session_id, audio_started
+        raise RuntimeError("update exploded")
+
+    class _StagedDetector:
+        def __init__(self) -> None:
+            self.reset_calls = 0
+
+        def reset(self) -> None:
+            self.reset_calls += 1
+
+    staged = _StagedDetector()
+
+    def fake_prepare(cls, payload, *, backend_provider=None, semantic_backend_provider=None):
+        del cls, payload, backend_provider, semantic_backend_provider
+        from vllm_omni.engine.duplex.turn_detection import PendingTurnDetectionUpdate
+
+        return PendingTurnDetectionUpdate(config=None, detector=staged)
+
+    monkeypatch.setattr("vllm_omni.engine.duplex.config.DuplexSessionConfig.apply_realtime_update", explode)
+    monkeypatch.setattr(
+        "vllm_omni.engine.duplex.session.control.PendingTurnDetectionUpdate.prepare",
+        classmethod(fake_prepare),
+    )
+    h = await open_harness()
+    try:
+        temperature = h.session.config.temperature
+        events = await h.run(commands.UpdateSession(patch={"temperature": 0.2}, event_id="evt-boom"))
+        assert types(events) == ["error"]
+        assert events[0].code == "internal_error"
+        assert events[0].related_event_id == "evt-boom"
+        assert h.session.config.temperature == temperature
+        assert h.runner.control._detector is not staged
+        later = await h.run(commands.UpdateSession(patch={"temperature": 0.4}, event_id="evt-later"))
+        assert later[0].code == "internal_error"
+        assert later[0].related_event_id == "evt-later"
+        assert h.runner.control._detector is not staged
+        assert h.session.config.temperature == temperature
+    finally:
+        await close_harness(h)
+
+
+def _accepted_format_patch() -> dict[str, object]:
+    return {
+        "temperature": 0.3,
+        "audio": {"input": {"format": {"type": "audio/pcm", "rate": 24000}}},
+    }
+
+
+def _assert_serving_applies_adopted_session(session: object) -> None:
+    """The object serving applies must move the live wire defaults, not only the event type."""
+    assert isinstance(session, dict)
+    assert session["id"] == SESSION_ID
+    assert session["temperature"] == 0.3
+    envelope = RealtimeEnvelope()
+    assert envelope.defaults.input_sample_rate_hz == 16000
+    envelope.apply_accepted_session(session)
+    assert envelope.defaults.input_audio_format == "pcm16"
+    assert envelope.defaults.input_sample_rate_hz == 24000
+
+
+@pytest.mark.asyncio
+async def test_adopted_session_update_publishes_when_the_snapshot_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    """After the live config is replaced, a snapshot failure is still ``session.updated``.
+
+    A stamped ``internal_error`` would tell serving the update was rejected
+    while the engine had already adopted it. The fallback session is the
+    accepted client payload, so serving's apply path picks up the new rate.
+    """
+
+    def explode(self):
+        del self
+        raise RuntimeError("snapshot exploded")
+
+    h = await open_harness()
+    monkeypatch.setattr(
+        "vllm_omni.engine.duplex.session.engine_session.DuplexEngineSession.as_public_dict",
+        explode,
+    )
+    try:
+        events = await h.run(commands.UpdateSession(patch=_accepted_format_patch(), event_id="evt-pub"))
+        assert types(events) == ["session.updated"]
+        assert h.session.config.temperature == 0.3
+        assert all(getattr(event, "code", None) != "internal_error" for event in events)
+        _assert_serving_applies_adopted_session(events[0].session)
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_adopted_session_update_publishes_when_replace_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A failed replace still publishes ``session.updated`` so serving takes the new rate.
+
+    The live config did not change, so the event must not echo the patch's
+    temperature. Projection fills the format and rate from the projector.
+    """
+
+    def explode(self, config: object) -> None:
+        del self, config
+        raise RuntimeError("replace exploded")
+
+    h = await open_harness()
+    monkeypatch.setattr(
+        "vllm_omni.engine.duplex.session.engine_session.DuplexEngineSession.replace_config",
+        explode,
+    )
+    try:
+        temperature = h.session.config.temperature
+        events = await h.run(commands.UpdateSession(patch=_accepted_format_patch(), event_id="evt-replace"))
+        assert types(events) == ["session.updated"]
+        assert h.session.config.temperature == temperature
+        assert events[0].session.get("temperature") != 0.3
+        assert all(getattr(event, "code", None) != "internal_error" for event in events)
+        envelope = RealtimeEnvelope()
+        envelope.apply_accepted_session(events[0].session)
+        assert envelope.defaults.input_audio_format == "pcm16"
+        assert envelope.defaults.input_sample_rate_hz == 24000
+    finally:
+        await close_harness(h)
+
+
+def _stage_turn_detection(monkeypatch: pytest.MonkeyPatch):
+    """Stage a detector without building Silero. ``prepare`` still leaves the patch in place."""
+
+    class _StagedDetector:
+        def __init__(self) -> None:
+            self.reset_calls = 0
+
+        def reset(self) -> None:
+            self.reset_calls += 1
+
+    staged = _StagedDetector()
+
+    def fake_prepare(cls, payload, *, backend_provider=None, semantic_backend_provider=None):
+        del cls, payload, backend_provider, semantic_backend_provider
+        from vllm_omni.engine.duplex.turn_detection import PendingTurnDetectionUpdate
+
+        return PendingTurnDetectionUpdate(config=None, detector=staged)
+
+    monkeypatch.setattr(
+        "vllm_omni.engine.duplex.session.control.PendingTurnDetectionUpdate.prepare",
+        classmethod(fake_prepare),
+    )
+    return staged
+
+
+def _patch_with_turn_detection() -> dict[str, object]:
+    patch = _accepted_format_patch()
+    patch["turn_detection"] = {"type": "server_vad", "threshold": 0.5}
+    return patch
+
+
+@pytest.mark.asyncio
+async def test_runtime_replace_failure_finishes_adoption_before_echo(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A runtime-config failure after ``replace_config`` is finished before the echo.
+
+    The first replace raises. The except path applies the runtime config and
+    commits the staged detector, so the echoed ``turn_detection`` is live and
+    the engine is not left on the new config with the old runtime config.
+    """
+    from vllm_omni.engine.duplex.session.engine_session import DuplexEngineSession
+
+    calls = {"n": 0}
+    original = DuplexEngineSession.replace_runtime_config
+
+    def flaky(self, runtime_config: object) -> None:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("runtime replace exploded")
+        original(self, runtime_config)
+
+    staged = _stage_turn_detection(monkeypatch)
+    h = await open_harness()
+    monkeypatch.setattr(DuplexEngineSession, "replace_runtime_config", flaky)
+    try:
+        events = await h.run(commands.UpdateSession(patch=_patch_with_turn_detection(), event_id="evt-runtime"))
+        assert calls["n"] == 2
+        assert types(events) == ["session.updated"]
+        assert h.session.config.temperature == 0.3
+        assert h.session.runtime_config["duplex_stage_sampling_params"]["0"]["temperature"] == 0.3
+        assert h.runner.control._detector is staged
+        assert staged.reset_calls == 0
+        assert events[0].session["turn_detection"]["type"] == "server_vad"
+        assert all(getattr(event, "code", None) != "internal_error" for event in events)
+        _assert_serving_applies_adopted_session(events[0].session)
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_runtime_replace_that_cannot_finish_drops_the_uncommitted_vad(monkeypatch: pytest.MonkeyPatch) -> None:
+    """If the runtime config never lands, restore the previous config and reject the detector.
+
+    The echo must not advertise the patch's ``turn_detection``. Projection still
+    carries the format and rate the projector already adopted.
+    """
+
+    def explode(self, runtime_config: object) -> None:
+        del self, runtime_config
+        raise RuntimeError("runtime replace exploded")
+
+    staged = _stage_turn_detection(monkeypatch)
+    h = await open_harness()
+    temperature = h.session.config.temperature
+    monkeypatch.setattr(
+        "vllm_omni.engine.duplex.session.engine_session.DuplexEngineSession.replace_runtime_config",
+        explode,
+    )
+    try:
+        events = await h.run(commands.UpdateSession(patch=_patch_with_turn_detection(), event_id="evt-runtime-stuck"))
+        assert types(events) == ["session.updated"]
+        assert h.session.config.temperature == temperature
+        assert h.runner.control._detector is not staged
+        # Projection fills a missing turn_detection with None. That is not the
+        # new server_vad config prepare wrote into the patch.
+        assert events[0].session.get("turn_detection") is None
+        assert all(getattr(event, "code", None) != "internal_error" for event in events)
+        envelope = RealtimeEnvelope()
+        envelope.apply_accepted_session(events[0].session)
+        assert envelope.defaults.input_audio_format == "pcm16"
+        assert envelope.defaults.input_sample_rate_hz == 24000
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_rejected_runtime_replace_does_not_count_the_candidate_seed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Restoring the previous config must not go through ``replace_config``.
+
+    The forward replace already counted the candidate seed and bumped
+    ``config_generation``. A second ``replace_config`` would count the old
+    seed as well, so a later ``response.create`` sees input that never landed.
+    """
+    from vllm_omni.engine.duplex.config import DuplexSessionConfig
+
+    original = DuplexSessionConfig.apply_realtime_update
+
+    def apply_seed(self, patch, *, session_id=None, audio_started=False):
+        original(self, patch, session_id=session_id, audio_started=audio_started)
+        seed = patch.get("initial_user_text")
+        if isinstance(seed, str):
+            self.initial_user_text = seed
+
+    def explode(self, runtime_config: object) -> None:
+        del self, runtime_config
+        raise RuntimeError("runtime replace exploded")
+
+    h = await open_harness()
+    h.session.config.initial_user_text = "ask about A"
+    unanswered = h.session.unanswered_user_items()
+    generation = h.session.config_generation
+    temperature = h.session.config.temperature
+    monkeypatch.setattr(DuplexSessionConfig, "apply_realtime_update", apply_seed)
+    monkeypatch.setattr(
+        "vllm_omni.engine.duplex.session.engine_session.DuplexEngineSession.replace_runtime_config",
+        explode,
+    )
+    try:
+        patch = _accepted_format_patch()
+        patch["initial_user_text"] = "ask about B"
+        events = await h.run(commands.UpdateSession(patch=patch, event_id="evt-seed"))
+        assert types(events) == ["session.updated"]
+        assert h.session.config.initial_user_text == "ask about A"
+        assert h.session.config.temperature == temperature
+        assert h.session.unanswered_user_items() == unanswered
+        assert h.session.config_generation == generation
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_detector_reset_failure_still_adopts_the_staged_detector(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A reset failure while swapping detectors still leaves one consistent update.
+
+    ``commit`` discards the old detector either way. Keeping it after the new
+    config and overlap policy landed would advertise a VAD the runner is not
+    running.
+    """
+    from vllm_omni.engine.duplex.turn_detection import (
+        PendingTurnDetectionUpdate,
+        TurnDetectionConfig,
+        normalize_turn_detection_session_payload,
+    )
+
+    class _OldDetector:
+        def __init__(self) -> None:
+            self.config = TurnDetectionConfig(threshold=0.2)
+            self.reset_calls = 0
+
+        def reset(self) -> None:
+            self.reset_calls += 1
+            raise RuntimeError("reset exploded")
+
+    class _StagedDetector:
+        def __init__(self) -> None:
+            self.reset_calls = 0
+
+        def reset(self) -> None:
+            self.reset_calls += 1
+
+    staged = _StagedDetector()
+    old = _OldDetector()
+
+    def fake_prepare(cls, payload, *, backend_provider=None, semantic_backend_provider=None):
+        del cls, backend_provider, semantic_backend_provider
+        _configured, config = normalize_turn_detection_session_payload(payload)
+        return PendingTurnDetectionUpdate(config=config, detector=staged)
+
+    monkeypatch.setattr(
+        "vllm_omni.engine.duplex.session.control.PendingTurnDetectionUpdate.prepare",
+        classmethod(fake_prepare),
+    )
+    h = await open_harness()
+    h.runner.control._detector = old
+    h.runner.control._config = old.config
+    try:
+        events = await h.run(commands.UpdateSession(patch=_patch_with_turn_detection(), event_id="evt-reset"))
+        assert types(events) == ["session.updated"]
+        assert old.reset_calls == 1
+        assert h.runner.control._detector is staged
+        assert h.session.config.overlap_policy == "barge_in_on_speech"
+        assert events[0].session["overlap_policy"] == h.session.config.overlap_policy
+        assert events[0].session["turn_detection"]["type"] == "server_vad"
+        assert h.session.config.extra_body["realtime_turn_detection"]["type"] == "server_vad"
+        assert h.runner.control._config is not old.config
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_publish_failure_after_replace_carries_the_accepted_payload(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Once the live config is replaced, a failed publish still echoes the accepted patch."""
+    calls = {"n": 0}
+    original = SessionEmitter.emit
+
+    def flaky(self: SessionEmitter, payload: dict[str, object]) -> None:
+        if payload.get("type") == "session.updated" and calls["n"] == 0:
+            calls["n"] += 1
+            raise RuntimeError("emit exploded")
+        original(self, payload)
+
+    h = await open_harness()
+    monkeypatch.setattr(SessionEmitter, "emit", flaky)
+    try:
+        events = await h.run(commands.UpdateSession(patch=_accepted_format_patch(), event_id="evt-emit"))
+        assert calls["n"] == 1
+        assert types(events) == ["session.updated"]
+        assert h.session.config.temperature == 0.3
+        _assert_serving_applies_adopted_session(events[0].session)
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
 async def test_session_update_replaces_config_and_runtime_config_together() -> None:
     h = await open_harness()
     try:
@@ -2631,6 +2995,53 @@ async def test_an_append_cancelled_from_outside_fails_the_response_it_precreated
         assert "response.created" not in types(events)
         assert find(events, "error").code == "commit_aborted"
         assert h.session.active_response_id is None
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_commit_aborted_does_not_claim_the_next_commit_item_id() -> None:
+    """An aborted commit drops its own id, so a later FIFO ack keeps its own.
+
+    ``resolve_commit`` pushes the id before ``_on_commit``. The abort discards
+    that id, not whatever happens to be at the head. The next acknowledgement
+    carries no explicit id, so it pops the FIFO.
+    """
+    h = await open_harness(auto_response=False)
+    try:
+        await _commit_with_pending_response(h)
+        pending = h.runner.tasks.append_tail
+        assert pending is not None
+        pending.cancel()
+        await h.settle()
+        h.port.submit_gate = None
+
+        await h.run(append_audio())
+        aborted = await h.run(commands.Commit(create_response=False, realtime_item_id="item_abort"))
+        assert find(aborted, "error").code == "commit_aborted"
+        assert "input_audio_buffer.committed" not in types(aborted)
+        projector = h.runner.out.require_projector()
+        assert projector.pending_commit_item_ids == []
+
+        # No explicit id: the ack has to pop the FIFO. A leftover item_abort
+        # would come out here instead of item_fifo.
+        projector.pending_commit_item_ids.append("item_fifo")
+        h.runner.emit({"type": "input.committed", "message": {"role": "user", "content": "later"}})
+        fifo = await h.settle()
+        assert find(fifo, "input_audio_buffer.committed").to_realtime()["item_id"] == "item_fifo"
+        assert projector.pending_commit_item_ids == []
+
+        # The failed append stays on the tail. A non-resumable retry is what
+        # starts a new chain, so the next commit can be acknowledged.
+        h.session.capabilities = replace(h.session.capabilities, supports_core_resumable_request=False)
+        await h.run(append_audio())
+        accepted = await h.run(commands.Commit(create_response=False))
+        stopped = find(accepted, "input_audio_buffer.speech_stopped")
+        committed = find(accepted, "input_audio_buffer.committed")
+        assert committed.to_realtime()["item_id"] == stopped.item_id
+        assert stopped.item_id != "item_abort"
+        assert projector.pending_commit_item_ids == []
+        assert h.session.state == DuplexSessionState.OPEN
     finally:
         await close_harness(h)
 

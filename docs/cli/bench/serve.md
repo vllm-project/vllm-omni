@@ -538,14 +538,26 @@ length because input is paced in real time.
 | Result key suffix | Starts at | Ends at |
 | --- | --- | --- |
 | `duplex_response_ttft_ms` / `duplex_response_ttfp_ms` | server: request accepted by the engine | first text / audio output |
-| `duplex_client_ttft_ms` / `duplex_client_ttfp_ms` | client: `response.created` received | first text / audio delta received |
+| `duplex_client_ttft_ms` | client: `response.created` received | first non-empty text delta |
+| `duplex_client_ttfp_ms` | client: last `input_audio_buffer.append` send before this `response.created` (after the previous `response.created` or stream start), when that send was recorded | first audio delta |
 
 The server timer starts only after the model plugin prepared the prompt and the engine accepted it, so it leaves out
 prompt preparation; for Qwen3-Omni that is decoding the retained images, the chat template, and multimodal
-preprocessing. The client timer starts when `response.created` is received, after the server detects the end of the
-turn. It excludes VAD silence detection and any delay before that event arrives, so it does not measure the full
-user-speech-end to first-output latency. The server start point differs between model plugins, so compare server
-keys only within one model. VAD uses `silence_duration_ms: 500` by default.
+preprocessing. `duplex_client_ttft_ms` starts when `response.created` is received, after the server detects the end of
+the turn, so Qwen3-Omni's prompt preparation after that event is included. OmniInteract and Omni-DuplexEval record
+append sends, so `duplex_client_ttfp_ms` starts at the last append in that turn window rather than at `response.created`.
+On a continuous stream with server VAD, the turn closes after `silence_duration_ms` of trailing silence (500 ms by
+default), so that last append is typically the chunk in which server VAD closed the turn, and
+`duplex_client_ttfp_ms` is about `response_created_to_first_audio_ms` plus a phase in `[0, chunk_ms)`. The phase
+scales with the adapter's chunk size: native OmniInteract uses 200 ms, native Omni-DuplexEval uses ~1 s units, and
+`server_vad` sends 32 ms detector frames. Proactive or silence-driven turns still use the last append in the window.
+Created-origin audio stays on `response_created_to_first_audio_ms` (and
+`audio_output.response_created_to_first_audio_ms`) and is not copied into `client_ttfp_ms`. Both client timers exclude
+VAD silence detection and any delay before the last recorded append / `response.created` arrives, so they do not
+measure the full user-speech-end to first-output latency. Per-response `client_rtf` uses the same append-send start
+through the last audio packet, divided by emitted audio duration, when an append send was recorded. The server start
+point differs between model plugins, so compare server keys only within one model; client append keys are only
+comparable within one adapter / chunk size.
 Qwen3-Omni duplex reports no per-token timing, so TPOT and ITL are unavailable. A turn-based model acknowledges a proactive request right away but does not speak again when the
 event later happens, so proactive and 1QnA scenarios score low by construction.
 
@@ -627,8 +639,11 @@ timing. If transcript chunks include `aligned_words`, the evaluator splits bound
 timing from word alignment.
 
 Per-response TTFT and TTFP start when the server begins executing the native model-turn request that owns the response. RTF
-continues to use client receipt of `response.created` through the last audio packet, divided by emitted audio duration. Global
-TTFT, TTFP, and RTF cover the complete input-stream window. TPOT/ITL use engine stage-0 timing; ITL is emitted only when every
+continues to use client receipt of `response.created` through the last audio packet, divided by emitted audio duration.
+When the client recorded `input_audio_buffer.append` sends, `client_ttfp_ms` / `client_rtf` start at the last such send
+before this `response.created` (after the previous `response.created` or stream start). `client_ttft_ms` still starts at
+`response.created`. Created-origin audio is `response_created_to_first_audio_ms` and is not copied into `client_ttfp_ms`.
+Global TTFT, TTFP, and RTF cover the complete input-stream window. TPOT/ITL use engine stage-0 timing; ITL is emitted only when every
 token interval is present within a continuous generation segment. Model-unit pacing and gaps between generation segments are
 excluded from TPOT/ITL. Raw request metrics retain `response_created_to_first_text_ms` and
 `response_created_to_first_audio_ms` as client-envelope diagnostics.
@@ -688,8 +703,10 @@ It differs from the MiniCPM-o configuration in three ways:
   IA-QTF1 must be at or above `omniinteract_aggregate_min_ia_qtf1` (checked in as `0.3`); a single run on four cases
   measured `0.50`, so the floor catches a lost correct answer or more, not small judge noise.
 - **Latency.** Compare Qwen3-Omni runs on the per-response keys, primarily `mean_duplex_client_ttfp_ms`
-  (`response.created` received to first audio, including prompt preparation); the standard TTFT rows average sessions
-  first, and TPOT is unavailable.
+  (last append send in the turn window to first audio; on a continuous VAD stream this is about
+  `response_created_to_first_audio_ms` plus a `[0, chunk_ms)` phase from the chunk in which server VAD closed the
+  turn, and includes prompt preparation after `response.created`). Compare those client append keys only within one
+  adapter / chunk size. The standard TTFT rows average sessions first, and TPOT is unavailable.
 
 ### Seed-TTS reference speech as real audio input
 

@@ -80,6 +80,7 @@ from vllm_omni.engine.duplex.plugin import (
 from vllm_omni.engine.duplex.realtime_events import (
     RealtimeProjectionState,
     clear_input_buffer,
+    discard_pending_commit_item,
     discard_pending_input_audio,
     note_input_append,
     resolve_cancel_response,
@@ -564,7 +565,14 @@ class DuplexSessionRunner:
                 raise
             except Exception as exc:
                 logger.exception("Duplex session %s failed handling %r: %s", self.session.session_id, item, exc)
-                self._emit_error("internal_error", str(exc))
+                # The serving reader waits for this command's id. An unstamped
+                # internal_error never matches, so the connection parks forever.
+                event_id = getattr(item, "event_id", None)
+                self._emit_error(
+                    "internal_error",
+                    str(exc),
+                    event_id=event_id if isinstance(event_id, str) and event_id else None,
+                )
             finally:
                 if isinstance(item, AppendAudio):
                     self._pending_input_appends -= 1
@@ -897,6 +905,19 @@ class DuplexSessionRunner:
         retryable: bool | None = None,
     ) -> None:
         self.out.emit_error(code, message, event_id=event_id, retryable=retryable)
+
+    def _discard_aborted_commit_item(self, realtime_item_id: object) -> None:
+        """Drop the id ``resolve_commit`` pushed for this command, and no other.
+
+        ``commit_aborted`` is also emitted for a held prefix that never went
+        through ``resolve_commit``. Those paths must not pop the FIFO head.
+        """
+        if not isinstance(realtime_item_id, str) or not realtime_item_id:
+            return
+        projector = self.out.projector
+        if projector is None:
+            return
+        discard_pending_commit_item(projector, realtime_item_id)
 
     def _require_projector(self) -> RealtimeProjectionState:
         return self.out.require_projector()
@@ -2287,6 +2308,7 @@ class DuplexSessionRunner:
                 return False
             if not await self._submit_held_commit_prefixes(event_id=event.get("realtime_event_id")):
                 commit_reservation.rollback()
+                self._discard_aborted_commit_item(realtime_item_id)
                 return True
         flushed_buffer_reserved_bytes = model_state.audio_buffer.pending_byte_count if commit_reservation is None else 0
         flushed = (
@@ -2557,6 +2579,7 @@ class DuplexSessionRunner:
             return
         if not await self._submit_held_commit_prefixes(event_id=event.get("realtime_event_id")):
             commit_reservation.rollback()
+            self._discard_aborted_commit_item(realtime_item_id)
             return
         final_payload = commit_reservation.payload
         if final_payload is not None and isinstance(realtime_item_id, str) and realtime_item_id:
@@ -2647,6 +2670,7 @@ class DuplexSessionRunner:
             # silently leaves the client with those effects, no
             # input_audio_buffer.committed and no error. The session.update
             # path says so explicitly; this one now does too.
+            self._discard_aborted_commit_item(realtime_item_id)
             self._emit_error(
                 "commit_aborted",
                 "the commit was not applied because the preceding append failed",

@@ -31,6 +31,10 @@ from vllm_omni.model_executor.models.qwen3_omni.duplex.tools_utils import (
     ThinkerToolCursor,
     chat_template_tools,
 )
+from vllm_omni.utils.speakers import (
+    get_supported_speakers_from_hf_config,
+    validate_requested_speaker,
+)
 
 logger = init_logger(__name__)
 
@@ -337,6 +341,10 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         self.processor = None
         self._processor_lock = asyncio.Lock()
         self._history_calibrator = None
+        # Checkpoint speaker names, loaded once from the stage-0 model config.
+        # ``None`` means "not attempted" (no validation); an empty set means the
+        # checkpoint declares no speaker_id mapping (names pass through unvalidated).
+        self._supported_speakers: set[str] | None = None
 
     def history_calibrator(self, runtime_config):
         if runtime_config.history_asr_url is None and runtime_config.history_ms_per_token is None:
@@ -410,10 +418,22 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
                 code="unsupported_tool_choice",
             )
 
+    def _load_supported_speakers(self, model_config) -> None:
+        if self._supported_speakers is not None or model_config is None:
+            return
+        try:
+            # The stage-0 config carries the full Omni hf_config; the speaker
+            # names live in ``talker_config.speaker_id``.
+            self._supported_speakers = get_supported_speakers_from_hf_config(model_config.hf_config)
+        except Exception:
+            logger.warning("Qwen duplex could not read the checkpoint's speaker list", exc_info=True)
+            self._supported_speakers = set()
+
     async def prepare_runtime_config(self, config, *, model_config):
         self.validate_client_extra_body(config.extra_body)
         if config.ref_audio:
             raise DuplexRuntimeConfigError("Qwen duplex does not support reference voice audio")
+        self._load_supported_speakers(model_config)
         if model_config is None and self.processor is None:
             raise DuplexRuntimeConfigError("Qwen duplex requires the stage-0 model configuration")
         async with self._processor_lock:
@@ -432,9 +452,15 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
         self.validate_client_extra_body(config.extra_body)
         if config.ref_audio:
             raise DuplexRuntimeConfigError("Qwen duplex does not support reference voice audio")
+        voice = config.voice
+        try:
+            voice = validate_requested_speaker(voice, self._supported_speakers or set())
+        except ValueError as exc:
+            raise DuplexRuntimeConfigError(str(exc), code="invalid_speaker") from exc
         updated: dict[str, object] = {
             "instructions": config.instructions,
             "initial_user_text": config.initial_user_text,
+            "voice": voice,
             "temperature": config.temperature,
             "max_tokens": config.max_tokens,
         }
@@ -1186,6 +1212,14 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
                 # Reconcile appends these onto the live list. The full window above
                 # still feeds anchor removal, but must not be appended again.
                 prompt_payload["_qwen_newly_expired_call_ids"] = expired_anchors
+        # The Talker picks the checkpoint speaker token from this field; the
+        # chat-completions path sets it in serving_chat, so the duplex plan
+        # must forward the session voice the same way (#8815). runtime_config
+        # already carries the normalized voice; setdefault keeps any other
+        # additional_information keys this plan may carry.
+        voice = runtime_config.get("voice")
+        if isinstance(voice, str) and voice.strip():
+            prompt_payload.setdefault("additional_information", {})["speaker"] = [voice]
         return DuplexAppendPlan(prompt=prompt_payload)
 
     def decide_output(self, **kwargs):
