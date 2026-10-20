@@ -144,6 +144,7 @@ class BatchedTalkerRequest:
         self.publish = publish
         self.fail = fail
         self.prompt_wav_lat = prompt_wav_lat
+        self.ready_event: torch.cuda.Event | None = None
         self.min_steps = min_steps
         self.stop_threshold = stop_threshold
         self.sde_args = (cfg, sigma, temperature)
@@ -222,8 +223,11 @@ class MingTalkerBatchEngine:
         self.thread.start()
 
     def submit(self, request: BatchedTalkerRequest) -> None:
+        """Publish a request after recording all caller-stream input preparation."""
         if self.error is not None:
             raise RuntimeError("Ming talker batch engine failed") from self.error
+        request.ready_event = torch.cuda.Event()
+        request.ready_event.record(torch.cuda.current_stream(self.device))
         with self.cond:
             self.pending.append(request)
             self.cond.notify()
@@ -327,6 +331,14 @@ class MingTalkerBatchEngine:
                 with self.cond:
                     self.pending.extendleft(reversed([request, *waiting]))
                 return
+            assert request.ready_event is not None
+            self.stream.wait_event(request.ready_event)
+            # Inputs were allocated on the submitting stream; cancellation or
+            # row release must not recycle them while this stream uses them.
+            for segment in request.segments:
+                segment.embeds.record_stream(self.stream)
+            if request.prompt_wav_lat is not None and request.prompt_wav_lat.is_cuda:
+                request.prompt_wav_lat.record_stream(self.stream)
             request.row = heapq.heappop(self.free_rows)
             if request.seed is not None:
                 request.generator = torch.Generator(device=self.device)
