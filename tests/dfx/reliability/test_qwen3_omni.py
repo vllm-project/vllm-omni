@@ -318,6 +318,7 @@ class Qwen3Omni(FaultModel):
     def submit_concurrent(self, client: Any, server: Any) -> Any:
         return client.send_chat_completions_http_request(
             {"json": _multimodal_request(server.model), "timeout": 20},
+            err_code=(500, 503),
         )
 
     def assert_fast_fail(self, client: Any, server: Any) -> None:

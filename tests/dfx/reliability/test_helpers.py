@@ -203,17 +203,6 @@ def test_sigkill_records_dead_pid(monkeypatch: pytest.MonkeyPatch, capsys: pytes
     assert "dead=1" in output
 
 
-def test_server_log_paths_are_unique_across_param_builds() -> None:
-    def _param() -> SimpleNamespace:
-        item = SimpleNamespace(model="org/Model", log_path=None)
-        item._replace = lambda **kwargs: SimpleNamespace(model=item.model, log_path=kwargs["log_path"])
-        return item
-
-    first = helpers.reliability_params_with_server_log([_param()], "qwen3_omni")
-    second = helpers.reliability_params_with_server_log([_param()], "qwen3_omni")
-    assert first[0].log_path != second[0].log_path
-
-
 def test_allocate_device_chunk_returns_chunk_when_free_memory_drops() -> None:
     free = {"bytes": 100}
 
@@ -336,6 +325,55 @@ float16 = object()
     assert completed.returncode == 0, completed.stderr
     assert "READY:" in completed.stdout
     assert completed.stdout.rstrip().endswith("DONE")
+
+
+def test_stage_config_device_spec_uses_inherited_platform_devices(tmp_path: Path) -> None:
+    pytest.importorskip("vllm")
+    base = tmp_path / "base.yaml"
+    base.write_text(
+        "\n".join(
+            (
+                "stages:",
+                "  - stage_id: 0",
+                '    devices: "0,1"',
+                "platforms:",
+                "  npu:",
+                "    stages:",
+                "      - stage_id: 0",
+                '        devices: "4,5"',
+                "  xpu:",
+                "    stages:",
+                "      - stage_id: 0",
+                '        devices: "0,1,2,3,4,5,6,7"',
+                "",
+            )
+        ),
+        encoding="utf-8",
+    )
+    overlay = tmp_path / "overlay.yaml"
+    overlay.write_text(
+        "\n".join(
+            (
+                "base_config: base.yaml",
+                "stages:",
+                "  - stage_id: 0",
+                "    max_num_seqs: 2",
+                "",
+            )
+        ),
+        encoding="utf-8",
+    )
+    hunyuan = Path(__file__).resolve().parents[3] / "vllm_omni" / "deploy" / "hunyuan_image3_dit.yaml"
+
+    assert helpers.stage_config_device_spec(base, None) == "0,1"
+    assert helpers.stage_config_device_spec(base, "cuda") == "0,1"
+    assert helpers.stage_config_device_spec(base, "npu") == "4,5"
+    assert helpers.stage_config_device_spec(base, "xpu") == "0,1,2,3,4,5,6,7"
+    assert helpers.stage_config_device_spec(overlay, "cuda") == "0,1"
+    assert helpers.stage_config_device_spec(hunyuan, None) == "0,1,2,3"
+    assert helpers.stage_config_device_spec(hunyuan, "cuda") == "0,1,2,3"
+    assert helpers.stage_config_device_spec(hunyuan, "npu") == "0,1,2,3"
+    assert helpers.stage_config_device_spec(hunyuan, "xpu") == "0,1,2,3,4,5,6,7"
 
 
 def test_qwen_hip_oom_scenarios_force_eager_request_allocations() -> None:

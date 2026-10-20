@@ -39,9 +39,6 @@ def _kill_worker(model: FaultModel, server: Any, signal_name: str) -> None:
     )(server)
 
 
-_DEFAULT_HTTP_200_STATUS = "expected HTTP 200 when no error expectation is set, got "
-
-
 def _response_status(result: Any) -> int | None:
     if result is None:
         return None
@@ -50,48 +47,37 @@ def _response_status(result: Any) -> int | None:
     return status if isinstance(status, int) else None
 
 
-def _status_from_default_http_200_assertion(exc: BaseException) -> int | None:
-    text = str(exc)
-    index = text.find(_DEFAULT_HTTP_200_STATUS)
-    if index < 0:
-        return None
-    digits: list[str] = []
-    for char in text[index + len(_DEFAULT_HTTP_200_STATUS) :]:
-        if not char.isdigit():
-            break
-        digits.append(char)
-    if not digits:
-        return None
-    return int("".join(digits))
-
-
 def _assert_concurrent_all_fail(model: FaultModel, client: Any, server: Any) -> None:
     start = time.monotonic()
-    with concurrent.futures.ThreadPoolExecutor(max_workers=model.concurrent_workers) as executor:
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=model.concurrent_workers)
+    try:
         futures = [executor.submit(model.submit_concurrent, client, server) for _ in range(model.concurrent_workers)]
         done, pending = concurrent.futures.wait(
             futures,
             timeout=model.concurrent_timeout_sec,
             return_when=concurrent.futures.ALL_COMPLETED,
         )
-    elapsed = time.monotonic() - start
-    assert not pending, f"[process_kill concurrent] some fault-time requests hung: pending={len(pending)}"
-    assert elapsed < model.concurrent_timeout_sec, (
-        f"[process_kill concurrent] fault-time request convergence is too slow: {elapsed:.2f}s"
-    )
-    for future in done:
-        try:
-            result = future.result()
-        except Exception as exc:
-            status = _status_from_default_http_200_assertion(exc)
-            if status is not None and status >= 400:
-                continue
-            assert_fault_exception(exc, model.process_kill_error_keywords)
-            continue
-        status = _response_status(result)
-        assert status is not None and status >= 400, (
-            f"[process_kill concurrent] expected every request to fail after process-kill, got status={status}"
+        elapsed = time.monotonic() - start
+        assert not pending, f"[process_kill concurrent] some fault-time requests hung: pending={len(pending)}"
+        assert elapsed < model.concurrent_timeout_sec, (
+            f"[process_kill concurrent] fault-time request convergence is too slow: {elapsed:.2f}s"
         )
+        for future in done:
+            try:
+                result = future.result()
+            except AssertionError:
+                raise
+            except Exception as exc:
+                assert_fault_exception(exc, model.process_kill_error_keywords)
+                continue
+            status = _response_status(result)
+            assert status is not None and status >= 400, (
+                f"[process_kill concurrent] expected every request to fail after process-kill, got status={status}"
+            )
+    finally:
+        # ``with`` calls shutdown(wait=True) and would block until each request's
+        # own HTTP timeout. Fail on ``pending`` / ``elapsed`` first.
+        executor.shutdown(wait=False, cancel_futures=True)
 
 
 def _assert_health_503(model: FaultModel, client: Any) -> None:

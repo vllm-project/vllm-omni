@@ -110,6 +110,11 @@ class HunyuanImage(FaultModel):
     def warmup(self, client: Any, server: Any) -> None:
         client.send_images_generations_http_request(_image_request(server))
 
+    def submit_concurrent(self, client: Any, server: Any) -> Any:
+        request = _image_request(server)
+        request["timeout"] = 30
+        return client.send_images_generations_http_request(request, err_code=(500, 503))
+
     def assert_fast_fail(self, client: Any, server: Any) -> None:
         client.send_images_generations_http_request(
             {"json": _fast_fail_body(server.model), "timeout": _IMAGE_FAST_FAIL_HTTP_TIMEOUT_SEC},

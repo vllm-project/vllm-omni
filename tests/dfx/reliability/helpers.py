@@ -30,17 +30,14 @@ import shlex
 import signal
 import subprocess
 import sys
-import tempfile
 import time
-import uuid
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypedDict
 
 import psutil
 import pytest
-import yaml
 
 if TYPE_CHECKING:
     from tests.helpers.runtime import OmniServerParams
@@ -451,54 +448,36 @@ def stop_gpu_oom_hog(handle: OomHandle, *, timeout_sec: int = 5) -> None:
         proc.wait(timeout=timeout_sec)
 
 
-def _stage_devices_text(stage: Mapping[str, Any]) -> str | None:
-    devices = stage.get("devices")
-    if devices is None:
-        runtime = stage.get("runtime")
-        if isinstance(runtime, Mapping):
-            devices = runtime.get("devices")
-    if not isinstance(devices, str):
-        return None
-    text = devices.strip()
-    return text or None
-
-
-def stage_config_device_spec(stage_config_path: str | Path, platform: str | None) -> str:
-    """Devices after applying only ``platforms.<platform>``.
-
-    Other platform blocks stay out of the result. A CUDA run of a file that
-    also lists an XPU 8-GPU override keeps the base stage devices.
-    """
-    raw = yaml.safe_load(Path(stage_config_path).read_text(encoding="utf-8"))
-    if not isinstance(raw, dict):
-        raise ValueError(f"stage config must be a mapping: {stage_config_path}")
-    by_stage: dict[int, str] = {}
-    for stage in raw.get("stages") or []:
-        if not isinstance(stage, Mapping):
-            continue
-        stage_id = stage.get("stage_id")
-        devices = _stage_devices_text(stage)
-        if isinstance(stage_id, int) and devices is not None:
-            by_stage[stage_id] = devices
-    platforms = raw.get("platforms")
-    section = platforms.get(platform) if platform and isinstance(platforms, Mapping) else None
-    if isinstance(section, Mapping):
-        for stage in section.get("stages") or []:
-            if not isinstance(stage, Mapping):
-                continue
-            stage_id = stage.get("stage_id")
-            devices = _stage_devices_text(stage)
-            if isinstance(stage_id, int) and devices is not None and stage_id in by_stage:
-                by_stage[stage_id] = devices
+def _device_spec_from_deploy(deploy: Any, stage_config_path: str | Path) -> str:
     device_ids: set[int] = set()
-    for spec in by_stage.values():
-        for token in spec.split(","):
+    for stage in deploy.stages:
+        devices = stage.devices
+        if not isinstance(devices, str):
+            continue
+        for token in devices.split(","):
             token = token.strip()
             if token:
                 device_ids.add(int(token))
     if not device_ids:
         raise ValueError(f"No runtime.devices found in stage config: {stage_config_path}")
     return ",".join(str(device_id) for device_id in sorted(device_ids))
+
+
+def stage_config_device_spec(stage_config_path: str | Path, platform: str | None) -> str:
+    """Devices the server keeps after ``base_config`` inheritance and one platform overlay.
+
+    ``platform=None`` keeps the inherited base stages and does not apply
+    ``platforms.*``. A named platform uses
+    :func:`vllm_omni.config.stage_config._apply_platform_overrides` with that
+    same ``device_name`` key. Other platform blocks, including an XPU 8-GPU
+    list, stay out of the result.
+    """
+    from vllm_omni.config.stage_config import _apply_platform_overrides, load_deploy_config
+
+    deploy = load_deploy_config(stage_config_path)
+    if platform is not None:
+        deploy = _apply_platform_overrides(deploy, platform)
+    return _device_spec_from_deploy(deploy, stage_config_path)
 
 
 def inject_gpu_oom(
@@ -1068,31 +1047,6 @@ def assert_post_fault_api_unreachable(online_client: Any, *, scenario: str) -> N
 
 SIGTERM_CLEANUP_GRACE_SEC = 60.0
 PARTIAL_ISOLATION_HTTP_TIMEOUT_SEC = 30.0
-_RELIABILITY_SERVER_LOG_DIR: Path | None = None
-
-
-def _reliability_server_log_dir() -> Path:
-    """One temp directory per process. Paths inside it are unique per param build."""
-    global _RELIABILITY_SERVER_LOG_DIR
-    if _RELIABILITY_SERVER_LOG_DIR is None:
-        _RELIABILITY_SERVER_LOG_DIR = Path(tempfile.mkdtemp(prefix="vllm-omni-reliability-"))
-    return _RELIABILITY_SERVER_LOG_DIR
-
-
-def reliability_params_with_server_log(params: Sequence[Any], stem: str) -> list[Any]:
-    """Copy server params so the serve process log is written to a file.
-
-    Each call gets a new file. Partial-isolation and normal-exit both use the
-    lifecycle server set, and xdist can run them together; a shared path would
-    let one test truncate or mix the log the other test asserts on.
-    ``params`` items are ``OmniServerParams``.
-    """
-    logged = []
-    for param in params:
-        model_name = str(getattr(param, "model", "server")).rsplit("/", 1)[-1]
-        path = _reliability_server_log_dir() / f"{stem}-{uuid.uuid4().hex}-{model_name}.log"
-        logged.append(param._replace(log_path=str(path)))
-    return logged
 
 
 def assert_api_still_listening(online_client: Any, *, scenario: str) -> None:
@@ -1479,11 +1433,9 @@ class FaultModel:
 
     def servers(self, server_set: str) -> list[tuple[str, OmniServerParams]]:
         scenarios = list(self.scenarios)
-        logged = False
         if server_set == "lifecycle":
             if self.lifecycle_scenario is not None:
                 scenarios = [item for item in scenarios if item["test_name"] == self.lifecycle_scenario]
-            logged = True
         elif server_set == "oom" and self.eager_oom_stage_ids:
             import torch
 
@@ -1497,8 +1449,6 @@ class FaultModel:
         from tests.dfx.conftest import create_reliability_omni_server_params
 
         params = create_reliability_omni_server_params(scenarios, self.deploy_dir)
-        if logged:
-            params = reliability_params_with_server_log(params, self.model_id)
         return [(str(item["test_name"]), param) for item, param in zip(scenarios, params, strict=True)]
 
     def warmup(self, client: Any, server: Any) -> None:

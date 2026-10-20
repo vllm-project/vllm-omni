@@ -447,11 +447,11 @@ class OmniServer:
             return
         try:
             with open(path, encoding="utf-8", errors="replace") as log_file:
-                tail = "".join(log_file.readlines()[-120:])
+                text = log_file.read()
         except OSError as exc:
             print(f"failed to read server log {path}: {exc}", flush=True)
             return
-        print(f"\n=== omni server log tail ({path}) ===\n{tail}", flush=True)
+        print(f"\n=== omni server log ({path}) ===\n{text}", flush=True)
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         try:
