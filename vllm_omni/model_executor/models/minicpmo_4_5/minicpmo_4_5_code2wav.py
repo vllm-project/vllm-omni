@@ -96,17 +96,26 @@ def _tf32_mode(extra: Mapping[str, Any]) -> str:
 
 
 @contextmanager
-def _stage_matmul_policy(extra: Mapping[str, Any]) -> Iterator[None]:
+def _stage_matmul_policy(tf32_mode: str) -> Iterator[None]:
     """Apply this stage's TF32 matmul policy for the enclosed work.
 
     This stage owns the vocoder process. Restore its previous matmul
     policy after eager execution/capture; cuDNN's policy is independent.
     The idle prefetch runs the same preparation calls as chunk 0, so it
     runs under the same policy.
+
+    ``tf32_mode`` is resolved once in ``__init__`` and passed in, so this
+    never re-reads the stage config or the env var per forward, and it only
+    touches the CUDA matmul policy where that policy exists.
     """
+    from vllm_omni.platforms import current_omni_platform
+
+    if not current_omni_platform.is_cuda():
+        yield
+        return
     previous_tf32 = torch.backends.cuda.matmul.allow_tf32
     try:
-        if _tf32_mode(extra) != "off":
+        if tf32_mode != "off":
             torch.backends.cuda.matmul.allow_tf32 = True
         yield
     finally:
@@ -371,6 +380,9 @@ class MiniCPMO45Code2Wav(nn.Module):
         from vllm_omni.platforms import current_omni_platform
 
         extra = self._extra_config()
+        # Resolved on every platform so an invalid value fails at startup
+        # instead of inside the first forward/prefetch (_stage_matmul_policy).
+        self._tf32_mode = _tf32_mode(extra)
         self._runtime_prompt_cache_size = int(extra.get("token2wav_runtime_prompt_cache_size", 4))
         if self._runtime_prompt_cache_size < 0:
             raise ValueError("MiniCPM-o Code2Wav runtime prompt cache capacity must be >= 0")
@@ -462,7 +474,7 @@ class MiniCPMO45Code2Wav(nn.Module):
             "fused_body": read_bool_flag(
                 extra,
                 "cfm_fused_body",
-                (current_omni_platform.is_cuda() and _tf32_mode(extra) != "off") or current_omni_platform.is_npu(),
+                (current_omni_platform.is_cuda() and self._tf32_mode != "off") or current_omni_platform.is_npu(),
             ),
             "slot_pool": read_bool_flag(extra, "cfm_slot_pool", False),
             "row_offset_merge": read_bool_flag(extra, "cfm_row_offset_merge", False),
@@ -970,7 +982,7 @@ class MiniCPMO45Code2Wav(nn.Module):
         runtime_additional_information: list[dict[str, Any]] | None = None,
         **kwargs: Any,
     ) -> OmniOutput:
-        with _stage_matmul_policy(self._extra_config()):
+        with _stage_matmul_policy(self._tf32_mode):
             return self._forward_impl(
                 input_ids,
                 positions,
@@ -1362,7 +1374,7 @@ class MiniCPMO45Code2Wav(nn.Module):
         if len(self._prefetch_queue) > self._ref_prefetch_max_waiters:
             return False
         state_id, record = next(iter(self._prefetch_queue.items()))
-        with _stage_matmul_policy(self._extra_config()):
+        with _stage_matmul_policy(self._tf32_mode):
             return self._run_prefetch_phase(state_id, record)
 
     def _run_prefetch_phase(self, state_id: str, record: _RefPrefetch) -> bool:
@@ -1488,7 +1500,7 @@ class MiniCPMO45Code2Wav(nn.Module):
         # Token2wav runs in fp32, so without TF32 every flow-DiT GEMM runs on
         # SIMT cores. Ordinary TF32 uses SM80+ Tensor Cores for dense GEMMs and
         # Triton CFM attention dots. HiFT stays IEEE FP32.
-        tf32_mode = _tf32_mode(extra) if current_omni_platform.is_cuda() else "off"
+        tf32_mode = self._tf32_mode if current_omni_platform.is_cuda() else "off"
         if tf32_mode != "off":
             logger.info("MiniCPM-o Code2Wav: ordinary TF32 enabled for CFM DiT GEMMs")
         use_float16 = read_bool_flag(extra, "token2wav_float16", False)

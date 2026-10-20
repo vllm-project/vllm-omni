@@ -204,3 +204,24 @@ def test_explicit_null_falls_back_to_the_default(tmp_path, monkeypatch, npu_plat
     assert model._cfm_graph_config["fused_body"] is True
     assert model._cfm_graph_config["enable_whole_euler"] is True
     assert model._precapture_pending is True
+
+
+@pytest.mark.parametrize("key", ["token2wav_allow_tf32", "code2wav_allow_tf32"])
+def test_invalid_tf32_value_fails_at_startup_even_off_cuda(tmp_path, monkeypatch, npu_platform, key):
+    """The TF32 mode is resolved in `__init__`, so a typo cannot wait for the first forward."""
+    with pytest.raises(ValueError, match="allow_tf32"):
+        _build_backend(tmp_path, monkeypatch, {key: "maybe"})
+
+
+def test_invalid_tf32_env_fails_at_startup_even_off_cuda(tmp_path, monkeypatch, npu_platform):
+    monkeypatch.setenv("MINICPMO_CODE2WAV_TF32", "maybe")
+    with pytest.raises(ValueError, match="allow_tf32"):
+        _build_backend(tmp_path, monkeypatch, {})
+
+
+def test_tf32_mode_is_resolved_once_and_reused(tmp_path, monkeypatch, npu_platform):
+    model, _ = _build_backend(tmp_path, monkeypatch, {"token2wav_allow_tf32": "off"})
+    assert model._tf32_mode == "off"
+    # Mutating the stage config afterwards must not re-read it per forward.
+    model.vllm_config.model_config.stage_connector_config["extra"]["token2wav_allow_tf32"] = True
+    assert model._tf32_mode == "off"
