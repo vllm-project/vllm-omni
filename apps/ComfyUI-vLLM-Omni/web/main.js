@@ -1,16 +1,8 @@
 /**
  * @file Front-end extension for the vLLM-Omni nodes.
  *
- * Branding. Every vLLM-Omni node draws the vLLM-Omni "v" mark where LiteGraph
- * would otherwise draw its default title dot, and is tinted by the kind of value
- * it produces: blue nodes reach a server, amber and purple ones only assemble
- * parameters, red ones pin what the server has loaded, teal ones carry media.
- * A graph is then readable at a glance, and a node that turns out to be the
- * wrong colour for where it sits is usually wired wrong.
- *
- * The tint is keyed off each node's declared output types rather than a list of
- * node names, so a node added later is themed as soon as it returns one of the
- * existing types.
+ * Draws the vLLM-Omni mark in place of the default title dot.
+ * Node colours follow the active ComfyUI theme.
  *
  * It also migrates Generate Video graphs saved before `duration` replaced the
  * `num_frames` widget. See migrateNumFramesToDuration below.
@@ -171,46 +163,6 @@ function setupModelCombo(node) {
 }
 
 /**
- * Title bar and body tints, one per node family.
- *
- * The hues are the logo's: the amber and blue of the "v" mark, and three stops
- * of the gradient ring in the "O" (#9128A3, #CC5260, and the teal neighbouring
- * its blue). All of them are dark because LiteGraph paints the title bar darker
- * than the body and expects both to sit under light text; the ComfyUI light
- * theme lightens custom node colours on its own.
- */
-const FAMILIES = {
-    generate: { color: "#152A43", bgcolor: "#1F4269" },
-    sampling: { color: "#3A2C12", bgcolor: "#5C461C" },
-    model: { color: "#2E1233", bgcolor: "#4A1C52" },
-    deployment: { color: "#3A1A1F", bgcolor: "#5C2931" },
-    media: { color: "#0F2E2A", bgcolor: "#194A44" },
-};
-
-/** Output type -> family. Types absent here fall through to "generate". */
-const FAMILY_BY_OUTPUT = {
-    SAMPLING_PARAMS: "sampling",
-    TTS_PARAMS: "model",
-    VIDEO_PARAMS: "model",
-    REMOTE_LORA: "deployment",
-    FASTH3_DEPLOYMENT: "deployment",
-    VIDEO_REFERENCES: "media",
-    LATENT_MASK_EDITING: "media",
-};
-
-function familyOf(nodeData) {
-    for (const type of nodeData.output ?? []) {
-        const family = FAMILY_BY_OUTPUT[type];
-        if (family) {
-            return family;
-        }
-    }
-    // What is left returns a generated artifact (IMAGE, VIDEO, AUDIO, STRING),
-    // which is only ever produced by a node that talks to a vLLM-Omni server.
-    return "generate";
-}
-
-/**
  * Rewrite a pre-rename Generate Video graph in place.
  *
  * `duration` (seconds) took over the slot `num_frames` used to occupy, and
@@ -259,12 +211,6 @@ app.registerExtension({
         if (!nodeData.name.startsWith("VLLMOmni")) {
             return
         }
-
-        const { color, bgcolor } = FAMILIES[familyOf(nodeData)];
-        // On the prototype, not the instance: a colour the user picks by hand is
-        // written to the instance and shadows this, so manual overrides survive.
-        nodeType.prototype.color = color;
-        nodeType.prototype.bgcolor = bgcolor;
 
         const inputs = { ...nodeData.input?.required, ...nodeData.input?.optional };
         if ("url" in inputs && "model" in inputs) {

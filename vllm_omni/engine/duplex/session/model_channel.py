@@ -54,6 +54,7 @@ from vllm_omni.engine.duplex.session.context import CommittedInputContinuation, 
 from vllm_omni.engine.duplex.session.emitter import SessionEmitter
 from vllm_omni.engine.duplex.session.engine_session import DuplexEngineSession, DuplexFenceMismatchError
 from vllm_omni.engine.duplex.session.lease import DuplexLeaseActivity
+from vllm_omni.engine.duplex.session.tool_calls import ToolCallOrigin, ToolCallRegistrationError
 from vllm_omni.metrics.stats import OrchestratorAggregator, StageRequestStats
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.outputs.duplex import attach_duplex_output_decision
@@ -73,6 +74,8 @@ def _response_awaits_playback_ack(session, response_id, *, should_commit: bool, 
 
 
 _INVALID_FUNCTION_CALL = object()
+_MISSING_CALL_ID = "A recognized function call requires call_id and name"
+_ARGUMENTS_MUST_BE_JSON = "Function call arguments must be a JSON string"
 
 
 def _coerce_function_call(raw: object) -> dict[str, str] | None:
@@ -85,43 +88,59 @@ def _coerce_function_call(raw: object) -> dict[str, str] | None:
         return None
     if not isinstance(arguments, str):
         try:
-            arguments = json.dumps(arguments, ensure_ascii=False)
+            arguments = json.dumps(arguments, ensure_ascii=False, allow_nan=False)
         except (TypeError, ValueError):
-            arguments = str(arguments)
+            return None
     return {"call_id": call_id, "name": name, "arguments": arguments}
 
 
-def _recognized_function_call(plugin: object, model_result: Mapping[str, object]) -> dict[str, str] | object | None:
-    """Plugin parse first; otherwise the legacy ``function_call`` flag.
+def _legacy_function_call(model_result: Mapping[str, object]) -> dict[str, str] | object | None:
+    """The pre-parse ``function_call`` flag, or None when it is not set.
 
-    A plugin dict that is not a call is ``_INVALID_FUNCTION_CALL``. A missing
-    legacy ``call_id``/``name`` returns None so the caller can still project
-    the raw event. Plugins without ``parse_function_call`` are treated as no call.
+    A set flag that lacks ``call_id`` and ``name`` is invalid. There is no
+    second coerce at the caller.
     """
-    parse = getattr(plugin, "parse_function_call", None)
-    if not callable(parse):
-        if model_result.get("function_call") is not True:
-            return None
-        return _coerce_function_call(
-            {
-                "call_id": model_result.get("call_id"),
-                "name": model_result.get("name"),
-                "arguments": model_result.get("arguments", ""),
-            }
-        )
-    parsed = parse(model_result)
-    if parsed is not None:
-        call = _coerce_function_call(parsed)
-        return call if call is not None else _INVALID_FUNCTION_CALL
     if model_result.get("function_call") is not True:
         return None
-    return _coerce_function_call(
+    call = _coerce_function_call(
         {
             "call_id": model_result.get("call_id"),
             "name": model_result.get("name"),
             "arguments": model_result.get("arguments", ""),
         }
     )
+    return call if call is not None else _INVALID_FUNCTION_CALL
+
+
+def _recognized_function_call(plugin: object, model_result: Mapping[str, object]) -> dict[str, str] | object | None:
+    """Plugin parse first; otherwise the legacy ``function_call`` flag.
+
+    A plugin dict that is not a call is ``_INVALID_FUNCTION_CALL``. Plugins
+    without ``parse_function_call`` are no call unless the legacy flag is set.
+    """
+    parse = getattr(plugin, "parse_function_call", None)
+    if not callable(parse):
+        return _legacy_function_call(model_result)
+    parsed = parse(model_result)
+    if parsed is None:
+        return _legacy_function_call(model_result)
+    call = _coerce_function_call(parsed)
+    return call if call is not None else _INVALID_FUNCTION_CALL
+
+
+def _invalid_function_call_message(plugin: object, model_result: Mapping[str, object]) -> str:
+    """Why a recognized call was refused, for the client error text."""
+    parse = getattr(plugin, "parse_function_call", None)
+    candidate = parse(model_result) if callable(parse) else model_result
+    if candidate is None:
+        candidate = model_result
+    if not isinstance(candidate, Mapping):
+        return _MISSING_CALL_ID
+    call_id = candidate.get("call_id")
+    name = candidate.get("name")
+    if not isinstance(call_id, str) or not call_id or not isinstance(name, str) or not name:
+        return _MISSING_CALL_ID
+    return _ARGUMENTS_MUST_BE_JSON
 
 
 class SilenceContinuationScheduler(Protocol):
@@ -368,6 +387,12 @@ class ModelChannel:
         try:
             session.begin_lease_operation(fence, lease_operation_id)
             operation_started = True
+            if self._ctx.history_calibration is not None:
+                await self._ctx.history_calibration.before_prompt()
+                if session.epoch != fence.epoch or session.state != DuplexSessionState.OPEN:
+                    raise DuplexFenceMismatchError(session.fence, fence)
+            # Calibration can change history and response-owned runtime together.
+            # Freeze the request only after that wait and its close/epoch fence.
             reservation = session.prepare_append(fence)
             already_submitted = False if not resumable else session.stage_request_submitted(stage_id, request_id)
             request_context = self._ctx.manager.ensure_stage_request(
@@ -625,7 +650,10 @@ class ModelChannel:
 
     def _build_stage_output(self, item: StageOutput) -> OmniRequestOutput:
         output = item.output
-        finished = bool(getattr(output, "finished", False)) or item.context.segment_finished
+        # A streaming segment boundary is not duplex turn EOS. context.segment_finished
+        # stays true for plugins; the projector object keeps the source finished flag.
+        # Promoting segment_finished here undoes a segment-stop clear of RequestOutput.finished.
+        source_finished = bool(getattr(output, "finished", False))
         if item.decision is not None:
             engine_output = OmniRequestOutput.from_stage_output(
                 output,
@@ -644,17 +672,19 @@ class ModelChannel:
             engine_output = attach_duplex_output_decision(engine_output, item.decision)
         elif isinstance(output, OmniRequestOutput):
             engine_output = copy.copy(output)
-            if finished:
-                engine_output.finished = True
+            engine_output.finished = source_finished
         else:
             final_output_type = getattr(output, "final_output_type", None)
             engine_output = OmniRequestOutput.from_stage_output(
                 output,
                 request_id=item.request_id,
-                finished=finished,
+                finished=source_finished,
                 stage_id=item.stage_id,
                 final_output_type=final_output_type if isinstance(final_output_type, str) else "audio",
             )
+            # from_stage_output copies source.finished last. Lock the projector
+            # flag to that value so a segment boundary cannot reopen turn EOS.
+            engine_output.finished = source_finished
         engine_output.stage_id = item.stage_id
         if self._ctx.plugin.projects_intermediate_outputs and item.stage_id < item.context.final_stage_id:
             engine_output.finished = False
@@ -997,29 +1027,68 @@ class ModelChannel:
         return close_reason, emitted_response
 
     async def _expose_function_call(self, function_call: Mapping[str, object]) -> None:
-        """Publish one recognized call as ``function_call.done``.
+        """Register a recognized call before publishing it.
 
-        Parsed calls enter here before the client can see them. #8758 registers
-        the session call origin in this method before the same publish.
+        Parsing stays in the model plugin. The session ledger is the admission
+        book. After the origin is stored, a plugin that splices the result into
+        history can record where the call sat.
         """
         session = self._ctx.session
-        call_id = function_call["call_id"]
-        if isinstance(call_id, str) and call_id:
+        call_id, name = function_call.get("call_id"), function_call.get("name")
+        if not isinstance(call_id, str) or not call_id or not isinstance(name, str) or not name:
+            self._out.emit_error("invalid_function_call", _MISSING_CALL_ID)
+            return
+        arguments = function_call.get("arguments", "")
+        if not isinstance(arguments, str):
+            self._out.emit_error("invalid_function_call", _ARGUMENTS_MUST_BE_JSON)
+            return
+        item_id = f"item_{uuid.uuid4().hex}"
+        response_id = f"resp_{uuid.uuid4().hex}"
+        try:
+            self._ctx.tool_calls.register(
+                ToolCallOrigin(
+                    call_id=call_id,
+                    epoch=session.epoch,
+                    turn_id=session.turn_id,
+                    response_id=response_id,
+                    item_id=item_id,
+                    name=name,
+                    arguments=arguments,
+                )
+            )
+        except ToolCallRegistrationError as exc:
+            self._out.emit_error(exc.code, str(exc))
+            if exc.code != "resource_exhausted":
+                await self._close_from_runtime("tool_call_lifecycle")
+            return
+        try:
             updated_runtime = self._ctx.plugin.note_published_function_call(
                 session.runtime_config,
                 call_id=call_id,
                 history_len=len(session.history),
             )
-            if updated_runtime is not None:
-                session.replace_runtime_config(updated_runtime)
+        except Exception:
+            # The call is already in the ledger and the client has not seen it.
+            # Leaving it pending would time out a call that was never published.
+            logger.exception("Failed to record a published function call")
+            self._out.emit_error(
+                "tool_call_registration_failed",
+                "the session could not record a published function call",
+            )
+            await self._close_from_runtime("tool_call_lifecycle")
+            return
+        if updated_runtime is not None:
+            session.replace_runtime_config(updated_runtime)
         self._out.emit(
             {
                 "type": "function_call.done",
                 "session_id": session.session_id,
                 "epoch": session.epoch,
                 "call_id": call_id,
-                "name": function_call["name"],
-                "arguments": function_call["arguments"],
+                "name": name,
+                "arguments": arguments,
+                "item_id": item_id,
+                "response_id": response_id,
             }
         )
 
@@ -1066,27 +1135,11 @@ class ModelChannel:
         if function_call is _INVALID_FUNCTION_CALL:
             self._out.emit_error(
                 "invalid_function_call",
-                "A recognized function call requires call_id and name",
+                _invalid_function_call_message(self._ctx.plugin, model_result),
             )
             return close_reason, True
         if isinstance(function_call, dict):
             await self._expose_function_call(function_call)
-            return close_reason, True
-        if model_result.get("function_call") is True:
-            legacy = _coerce_function_call(
-                {
-                    "call_id": model_result.get("call_id"),
-                    "name": model_result.get("name"),
-                    "arguments": model_result.get("arguments", ""),
-                }
-            )
-            if legacy is None:
-                self._out.emit_error(
-                    "invalid_function_call",
-                    "A recognized function call requires call_id and name",
-                )
-            else:
-                await self._expose_function_call(legacy)
             return close_reason, True
         if model_result.get("requires_stage_handoff") is True or model_result.get("requires_tts_stage") is True:
             # Reserve the protocol response only when Stage1 emits text/audio.
@@ -1135,8 +1188,18 @@ class ModelChannel:
                 and auto_response
                 and (model_turn_id is not None or session.active_response_id is not None)
             ):
+                request_key = data_plane_request_id if isinstance(data_plane_request_id, str) else None
+                draining_response_id = (
+                    session.response_id_for_request(request_key) if session.is_draining_request(request_key) else None
+                )
                 self._ctx.services.spawn(
-                    self.maybe_continue_response(expected_epoch=expected_epoch, expected_model_turn_id=model_turn_id),
+                    self.maybe_continue_response(
+                        expected_epoch=expected_epoch,
+                        expected_model_turn_id=model_turn_id,
+                        expected_response_id=draining_response_id or session.active_response_id,
+                        finished_segment=True,
+                        finished_request_id=request_key,
+                    ),
                     name="duplex-continue",
                 )
             return close_reason, emitted_response
@@ -1261,6 +1324,8 @@ class ModelChannel:
             audio_complete=model_result.get("audio_complete") is True,
             response_id=target_id,
         )
+        if self._ctx.history_calibration is not None and response_id is not None:
+            self._ctx.history_calibration.record(target_id or response_id, model_result)
         payload = {
             "type": "response.output_audio.delta",
             "session_id": session.session_id,
@@ -1304,7 +1369,13 @@ class ModelChannel:
             and auto_response
         ):
             self._ctx.services.spawn(
-                self.maybe_continue_response(expected_epoch=expected_epoch), name="duplex-continue"
+                self.maybe_continue_response(
+                    expected_epoch=expected_epoch,
+                    expected_response_id=response_id if isinstance(response_id, str) else None,
+                    finished_segment=True,
+                    finished_request_id=(data_plane_request_id if isinstance(data_plane_request_id, str) else None),
+                ),
+                name="duplex-continue",
             )
         if end_of_turn:
             data_plane_request_id = model_result.get("data_plane_request_id")
@@ -1323,14 +1394,20 @@ class ModelChannel:
                 await self._release_ephemeral_request(data_plane_request_id, whole_turn=True)
                 if drained_response_id is not None:
                     playback = session.playback_for_response(drained_response_id).as_dict()
-                    session.release_finished_drain_response(drained_response_id)
+                    committed = session.release_finished_drain_response(
+                        drained_response_id, require_audio_complete=self._ctx.history_calibration is not None
+                    )
+                    if committed:
+                        settle_response_runtime(
+                            self._ctx.plugin, session, committed=True, response_id=drained_response_id
+                        )
                     self._out.emit(
                         {
                             "type": "response.done",
                             "session_id": session.session_id,
                             "response_id": drained_response_id,
                             "epoch": session.epoch,
-                            "committed": False,
+                            "committed": committed,
                             "status": "completed",
                             "playback": playback,
                         }
@@ -1347,7 +1424,7 @@ class ModelChannel:
                     data_plane.mark_terminal(data_plane_request_id)
             should_commit = self.should_commit_response_to_history(session, response_id)
             committed_message = session.end_response(commit_text=should_commit, preserve_request=auto_response)
-            self._settle_finished_response(
+            committed = self._settle_finished_response(
                 session,
                 response_id,
                 should_commit=should_commit,
@@ -1356,34 +1433,42 @@ class ModelChannel:
             model_turn_id = coerce_int(model_result.get("model_turn_id"))
             if model_turn_id is not None:
                 session.complete_model_turn(model_turn_id)
-            if should_commit:
-                session.register_history_item(f"item_{response_id}", committed_message)
             self._out.emit(
                 {
                     "type": "response.done",
                     "session_id": session.session_id,
                     "response_id": response_id,
                     "epoch": session.epoch,
-                    "committed": committed_message is not None,
+                    "committed": committed,
                     "playback": session.playback.as_dict(),
                 }
             )
             await self._release_ephemeral_request(data_plane_request_id, whole_turn=True)
         return close_reason, emitted_response
 
-    def _settle_finished_response(self, session, response_id, *, should_commit: bool, committed_message) -> None:
+    def _settle_finished_response(self, session, response_id, *, should_commit: bool, committed_message) -> bool:
+        """Store the final history before reconciling an ACK received earlier."""
+        committed = committed_message is not None
+        # Inspect the cursor before finalization releases response-owned state.
+        awaiting_playback = _response_awaits_playback_ack(
+            session, response_id, should_commit=should_commit, committed_message=committed_message
+        )
+        if should_commit:
+            session.register_history_item(f"item_{response_id}", committed_message)
+            committed = (
+                session.finalize_response_playback(
+                    response_id, require_audio_complete=self._ctx.history_calibration is not None
+                )
+                or committed
+            )
         settle_response_runtime(
             self._ctx.plugin,
             session,
-            committed=committed_message is not None,
-            awaiting_playback=_response_awaits_playback_ack(
-                session,
-                response_id,
-                should_commit=should_commit,
-                committed_message=committed_message,
-            ),
+            committed=committed,
+            awaiting_playback=awaiting_playback and not committed,
             response_id=response_id if isinstance(response_id, str) else None,
         )
+        return committed
 
     def _end_active_response_before_future_model_turn(self, *, model_turn_id: int | None) -> None:
         session = self._ctx.session
@@ -1398,21 +1483,19 @@ class ModelChannel:
         session.complete_model_turn(int(model_turn_id) - 1)
         should_commit = self.should_commit_response_to_history(session, response_id)
         committed_message = session.end_response(commit_text=should_commit, preserve_request=True)
-        self._settle_finished_response(
+        committed = self._settle_finished_response(
             session,
             response_id,
             should_commit=should_commit,
             committed_message=committed_message,
         )
-        if should_commit:
-            session.register_history_item(f"item_{response_id}", committed_message)
         self._out.emit(
             {
                 "type": "response.done",
                 "session_id": session.session_id,
                 "response_id": response_id,
                 "epoch": session.epoch,
-                "committed": committed_message is not None,
+                "committed": committed,
                 "playback": session.playback.as_dict(),
             }
         )
@@ -1570,11 +1653,17 @@ class ModelChannel:
         expected_epoch: int | None,
         expected_model_turn_id: int | None = None,
         expected_response_id: str | None = None,
+        finished_segment: bool = False,
+        finished_request_id: str | None = None,
     ) -> None:
         session = self._ctx.session
         model_state = self._ctx.model_state
         response_id = session.active_response_id
         if expected_response_id is not None and response_id != expected_response_id:
+            return
+        # This segment did not own a response. A response opened while the
+        # spawned task waited belongs to someone else.
+        if finished_segment and expected_response_id is None and response_id is not None:
             return
         auto_response = self._out.auto_responds()
         if session.state == DuplexSessionState.CLOSED or self._ctx.run.closing:
@@ -1587,13 +1676,24 @@ class ModelChannel:
         # A continue for a response that still has draining TTS must not emit
         # response.done here; that finish owns the done event.
         if not session.capabilities.supports_core_resumable_request:
-            # A fast tool result must not end the response while the original
-            # request is still running. Ending it clears active_request_id and
-            # the later final cannot own the stream.
+            # While stage0 is still producing, closing here clears
+            # active_request_id and the later final cannot own the stream.
+            # A finished segment may close only when that same request is still
+            # the active one. expected_response_id already drops a segment whose
+            # response was replaced before this spawned task ran.
             request_id = getattr(session, "active_request_id", None)
             data_plane = getattr(self._ctx.plugin, "data_plane", None)
+            # A segment from another request has nothing of its own to close,
+            # including when the active request is already terminal or unbound.
+            if finished_segment and isinstance(finished_request_id, str) and finished_request_id != request_id:
+                model_state.clear_continuation()
+                return
+            segment_owns_active_request = (
+                finished_segment and isinstance(finished_request_id, str) and finished_request_id == request_id
+            )
             if (
-                isinstance(request_id, str)
+                not segment_owns_active_request
+                and isinstance(request_id, str)
                 and data_plane is not None
                 and callable(getattr(data_plane, "is_terminal", None))
                 and not data_plane.is_terminal(request_id)
@@ -1604,21 +1704,19 @@ class ModelChannel:
             if response_id is not None and not session.response_has_draining_request(response_id):
                 should_commit = self.should_commit_response_to_history(session, response_id)
                 committed_message = session.end_response(commit_text=should_commit, preserve_request=auto_response)
-                self._settle_finished_response(
+                committed = self._settle_finished_response(
                     session,
                     response_id,
                     should_commit=should_commit,
                     committed_message=committed_message,
                 )
-                if should_commit and committed_message is not None:
-                    session.register_history_item(f"item_{response_id}", committed_message)
                 self._out.emit(
                     {
                         "type": "response.done",
                         "session_id": session.session_id,
                         "response_id": response_id,
                         "epoch": session.epoch,
-                        "committed": committed_message is not None if should_commit else False,
+                        "committed": committed,
                         "playback": session.playback.as_dict(),
                     }
                 )

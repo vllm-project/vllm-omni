@@ -292,14 +292,45 @@ The node requires at least one mask; the server then enforces the cross-field ru
 > [!TIP]
 > There is a dedicated node for VoiceClone tasks with reference audio input. Other simple text-to-speech tasks should use the regular TTS node.
 
-### Music generation (e.g., MiniMax Music 3)
+### Text to Music (e.g., MiniMax Music 3/YuE2)
 
-(Also available at **ComfyUI sidebar->Template->vLLM-Omni->vLLM-Omni Music Generation**)
+Open **ComfyUI sidebar->Template->vLLM-Omni** and select:
+
+- **vLLM-Omni Text to Music(MiniMax Music3)** — the existing MiniMax Music 3 template.
+- **vLLM-Omni Text to Music(YuE2)** — uses YuE2 Params with `cot=off` by default.
+
+Set Generate Music's URL and model to the running service. Caption and lyrics
+map to `instructions` and `input`. For YuE2, connect YuE2 Params to the optional
+`model_specific_params` input. Leave ABC empty for `off`; `melody/full` require
+ABC score text, pasted or connected as STRING, not a file path.
+
+See the [YuE2 recipe](../../recipes/m-a-p/YuE2-3B.md) for deployment details.
 
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" src="https://raw.githubusercontent.com/vllm-project/vllm-omni/refs/heads/main/apps/ComfyUI-vLLM-Omni/docs/images/comfyui-music-generation.jpg">
-    <img alt="vLLM-Omni Music Generation" src="https://raw.githubusercontent.com/vllm-project/vllm-omni/refs/heads/main/apps/ComfyUI-vLLM-Omni/docs/images/comfyui-music-generation.jpg" width=55%>
+    <source media="(prefers-color-scheme: dark)" src="https://raw.githubusercontent.com/vllm-project/vllm-omni/refs/heads/main/apps/ComfyUI-vLLM-Omni/docs/images/comfyui-text-to-music.jpg">
+    <img alt="vLLM-Omni Text to Music(MiniMax Music3)" src="https://raw.githubusercontent.com/vllm-project/vllm-omni/refs/heads/main/apps/ComfyUI-vLLM-Omni/docs/images/comfyui-text-to-music.jpg" width=55%>
+  </picture>
+</p>
+
+### Music Cover (e.g. YuE2)
+
+Open **ComfyUI sidebar->Template->vLLM-Omni->vLLM-Omni Music Cover(YuE2)**.
+
+The template uses native Load Audio, Audio Encoder Loader and SheetSage2 Audio
+to ABC nodes locally, followed by remote YuE2 generation. Download
+[sheetsage2_bf16.safetensors](https://huggingface.co/Comfy-Org/YuE2/resolve/main/audio_encoders/sheetsage2_bf16.safetensors)
+into `models/audio_encoders/`, select it and upload your source audio.
+
+Keep SheetSage2 mode and YuE2 Params cot matched; both default to `melody`.
+Provide lyrics separately. The remote service receives ABC text rather than the
+source recording, and returns audio without generated ABC or truncation metadata.
+Save Audio previews and saves the result.
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" src="https://raw.githubusercontent.com/vllm-project/vllm-omni/refs/heads/main/apps/ComfyUI-vLLM-Omni/docs/images/comfyui-music-cover.jpg">
+    <img alt="vLLM-Omni Music Cover(YuE2)" src="https://raw.githubusercontent.com/vllm-project/vllm-omni/refs/heads/main/apps/ComfyUI-vLLM-Omni/docs/images/comfyui-music-cover.jpg" width=55%>
   </picture>
 </p>
 

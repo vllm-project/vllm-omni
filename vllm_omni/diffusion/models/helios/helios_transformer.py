@@ -4,8 +4,8 @@
 
 import math
 import weakref
+from collections import OrderedDict
 from collections.abc import Iterable
-from functools import lru_cache
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -164,6 +164,9 @@ class HeliosFeedForward(nn.Module):
         return hidden_states
 
 
+_SPATIAL_MESHGRID_CACHE_SIZE = 32
+
+
 class HeliosRotaryPosEmbed(nn.Module):
     """Helios-style 3D rotary position embeddings using explicit frame indices."""
 
@@ -174,6 +177,9 @@ class HeliosRotaryPosEmbed(nn.Module):
         self.register_buffer("freqs_base_t", self._get_freqs_base(self.DT), persistent=False)
         self.register_buffer("freqs_base_y", self._get_freqs_base(self.DY), persistent=False)
         self.register_buffer("freqs_base_x", self._get_freqs_base(self.DX), persistent=False)
+        self._spatial_meshgrid_cache: OrderedDict[tuple[int, int, str], tuple[torch.Tensor, torch.Tensor]] = (
+            OrderedDict()
+        )
 
     def _get_freqs_base(self, dim):
         return 1.0 / (self.theta ** (torch.arange(0, dim, 2, dtype=torch.float32)[: (dim // 2)] / dim))
@@ -185,13 +191,21 @@ class HeliosRotaryPosEmbed(nn.Module):
         return freqs.cos(), freqs.sin()
 
     @torch.no_grad()
-    @lru_cache(maxsize=32)
-    def _get_spatial_meshgrid(self, height, width, device_str):
+    def _get_spatial_meshgrid(self, height: int, width: int, device_str: str) -> tuple[torch.Tensor, torch.Tensor]:
+        key = (height, width, device_str)
+        grids = self._spatial_meshgrid_cache.get(key)
+        if grids is not None:
+            self._spatial_meshgrid_cache.move_to_end(key)
+            return grids
+
         device = torch.device(device_str)
         grid_y_coords = torch.arange(height, device=device, dtype=torch.float32)
         grid_x_coords = torch.arange(width, device=device, dtype=torch.float32)
-        grid_y, grid_x = torch.meshgrid(grid_y_coords, grid_x_coords, indexing="ij")
-        return grid_y, grid_x
+        grids = torch.meshgrid(grid_y_coords, grid_x_coords, indexing="ij")
+        self._spatial_meshgrid_cache[key] = grids
+        if len(self._spatial_meshgrid_cache) > _SPATIAL_MESHGRID_CACHE_SIZE:
+            self._spatial_meshgrid_cache.popitem(last=False)
+        return grids
 
     @torch.no_grad()
     def forward(self, frame_indices, height, width, device):

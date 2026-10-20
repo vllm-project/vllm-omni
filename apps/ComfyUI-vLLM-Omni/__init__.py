@@ -32,6 +32,7 @@ from .comfyui_vllm_omni.nodes import (
     VLLMOmniVideoReferences,
     VLLMOmniVoiceClone,
     VLLMOmniWanParams,
+    VLLMOmniYuE2Params,
 )
 
 # A dictionary that contains all nodes you want to export with their names
@@ -54,6 +55,7 @@ NODE_CLASS_MAPPINGS = {
     "VLLMOmniFastH3Deployment": VLLMOmniFastH3Deployment,
     "VLLMOmniQwenTTSParams": VLLMOmniQwenTTSParams,
     "VLLMOmniWanParams": VLLMOmniWanParams,
+    "VLLMOmniYuE2Params": VLLMOmniYuE2Params,
     "VLLMOmniMiniMaxH3Params": VLLMOmniMiniMaxH3Params,
 }
 
@@ -77,6 +79,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "VLLMOmniFastH3Deployment": "FastH3 Deployment",
     "VLLMOmniQwenTTSParams": "Qwen TTS Params",
     "VLLMOmniWanParams": "Wan Video Params",
+    "VLLMOmniYuE2Params": "YuE2 Params",
     "VLLMOmniMiniMaxH3Params": "MiniMax-H3 Video Params",
 }
 

@@ -1023,15 +1023,36 @@ def test_forward_propagates_pipeline_profiler_stage_durations() -> None:
     assert output.stage_durations == pipeline.stage_durations
 
 
-def test_pipeline_weight_loader_preserves_component_parameter_prefixes() -> None:
+@pytest.mark.parametrize("leased_post_attention", [False, True])
+def test_pipeline_weight_loader_preserves_component_parameter_prefixes(
+    monkeypatch: pytest.MonkeyPatch, leased_post_attention: bool
+) -> None:
+    from vllm_omni.diffusion.models.lingbot_world import leased_post_attention as leased_module
+
     module = _load_pipeline_module()
     pipeline = _pipeline(module)
+    pipeline._lingbot_leased_post_attention = leased_post_attention
+    encoded = _counting_text_encoder(pipeline)
+    pipeline.encode_prompt("move through the room", max_sequence_length=512, dtype=torch.float32)
+    installs: list[tuple[nn.Module, bool]] = []
+
+    def install(transformer: nn.Module, *, enabled: bool) -> None:
+        assert pipeline.transformer.loaded_weights == [("blocks.0.weight", weight)]
+        assert pipeline._conditioning_projection_revision == 1
+        assert not pipeline._prompt_embeds_cache
+        installs.append((transformer, enabled))
+
+    monkeypatch.setattr(leased_module, "install", install)
     weight = torch.randn(2, 2)
 
     loaded = pipeline.load_weights([("transformer.blocks.0.weight", weight)])
 
     assert loaded == {"transformer.blocks.0.weight"}
     assert pipeline.transformer.loaded_weights == [("blocks.0.weight", weight)]
+    assert pipeline._conditioning_projection_revision == 1
+    assert installs == ([(pipeline.transformer, True)] if leased_post_attention else [])
+    pipeline.encode_prompt("move through the room", max_sequence_length=512, dtype=torch.float32)
+    assert encoded == ["move through the room", "move through the room"]
 
 
 def test_request_requires_runner_provided_generator() -> None:

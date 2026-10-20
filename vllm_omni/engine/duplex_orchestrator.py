@@ -210,6 +210,10 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             # Session gone: nothing may forward or reach a client.
             return True
         segment = req_state.streaming.segment(stage_id)
+        # A codec segment stop is not the utterance. Leave RequestOutput.finished
+        # for the real stop (is_segment_finished is false on that poll).
+        if req_state.streaming.enabled and segment.finished and getattr(output, "finished", False):
+            output.finished = False
         finished = bool(getattr(output, "finished", False)) or (req_state.streaming.enabled and segment.finished)
         transcript = self.plugin.user_transcript(
             stage_id=stage_id,

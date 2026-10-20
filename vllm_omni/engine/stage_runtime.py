@@ -180,6 +180,8 @@ class StageRuntime:
         self._model = model
         self._config_path = config_path
         self._stage_init_timeout = stage_init_timeout
+        # Set by shutdown()/cancel_initialization(): stop launching further replicas.
+        self._init_cancelled = threading.Event()
         self._async_chunk = async_chunk
         self._tokenizer = tokenizer
         # When True, same-device stages initialize concurrently, coordinated by
@@ -450,6 +452,7 @@ class StageRuntime:
                         omni_parallel_stage_init=self._parallel_stage_init,
                         num_api_servers=num_api_servers,
                         watched_frontend_processes=watched_frontend_processes if num_api_servers > 1 else None,
+                        stage_init_timeout=timeout,
                         handshake_timeout_s=handshake_timeout_s,
                     )
                     # Environment overlays are process-global. Serialize spawn;
@@ -618,7 +621,12 @@ class StageRuntime:
             else:
                 del self._mps_servers[uuid]
 
+    def cancel_initialization(self) -> None:
+        """Stop launching replicas that have not started yet (e.g. after an init timeout)."""
+        self._init_cancelled.set()
+
     def shutdown(self) -> None:
+        self._init_cancelled.set()
         for pool in self.stage_pools:
             for client in pool.clients:
                 if client is not None and hasattr(client, "shutdown"):
@@ -771,7 +779,10 @@ class StageRuntime:
         if kv_config.kv_connector == "MooncakeConnector" and kv_config.kv_role == "kv_producer":
             extra = kv_config.kv_connector_extra_config
             port = int(extra.get("bootstrap_port", 8998)) + replica_metadata.replica_id
-            extra["bootstrap_addr"] = f"http://{kv_config.kv_ip}:{port}"
+            # Upstream removed KVTransferConfig.kv_ip (f700178f90); fall back
+            # to its old default like omni_engine_base/pd_utils already do.
+            kv_ip = getattr(kv_config, "kv_ip", None) or "127.0.0.1"
+            extra["bootstrap_addr"] = f"http://{kv_ip}:{port}"
             if isinstance(replica_cfg, BaseVllmOmniStageConfig):
                 runtime_cfg: Any = replica_cfg.runtime_config
                 runtime_cfg.env = {
@@ -948,6 +959,21 @@ class StageRuntime:
             """Initialize replicas in one scheduling group sequentially."""
             nonlocal primary_exc
             for stage_idx, replica in group:
+                if self._init_cancelled.is_set():
+                    logger.warning(
+                        "[StageRuntime] Initialization cancelled; not launching stage-%s replica-%s",
+                        stage_idx,
+                        replica.replica_id,
+                    )
+                    # Fail initialization instead of returning a partial set of
+                    # replicas, so the caller's cleanup path runs.
+                    with init_state_lock:
+                        if primary_exc is None:
+                            primary_exc = RuntimeError(
+                                f"Stage initialization was cancelled before stage-{stage_idx} "
+                                f"replica-{replica.replica_id} was launched"
+                            )
+                    return
                 with init_state_lock:
                     if primary_exc is not None:
                         return

@@ -9,10 +9,12 @@ import pytest
 from vllm_omni.engine.duplex.config import DuplexSessionConfig
 from vllm_omni.engine.duplex.contracts import DuplexFence, duplex_resource_request_id
 from vllm_omni.engine.duplex.plugin import DuplexRuntimeConfigError
-from vllm_omni.engine.duplex.realtime_events import prepared_function_call_output
 from vllm_omni.engine.duplex.session.model_channel import (
+    _ARGUMENTS_MUST_BE_JSON,
     _INVALID_FUNCTION_CALL,
+    _MISSING_CALL_ID,
     _coerce_function_call,
+    _invalid_function_call_message,
     _recognized_function_call,
 )
 from vllm_omni.model_executor.models.qwen3_omni.duplex.plugin import Qwen3OmniDuplexPlugin, QwenDataPlane
@@ -107,12 +109,18 @@ def test_data_plane_holds_markup_and_emits_one_call():
     assert audio and audio[0]["audio_data"] == "AAAA"
 
 
-def test_stage2_keeps_audio_after_a_stage0_tool_call():
+@pytest.mark.parametrize("retain_history_audio", [False, True])
+def test_stage2_keeps_audio_after_a_stage0_tool_call(retain_history_audio):
     plane = QwenDataPlane(lambda *args: "AAAA")
+    plane.retain_history_audio = retain_history_audio
     context = {"modalities": ("text", "audio"), "response_format": "pcm16", "turn_id": 1}
-    list(plane.project(_output(_CALL, audio=True), context=context))
+    tool_events = list(plane.project(_output(_CALL, audio=True), context=context))
+    assert tool_events and all(event["history_audio_pcm"] is None for event in tool_events)
     audio = list(plane.project(_output("", stage_id=2, audio=True), context=context))
     assert audio and audio[0]["audio_data"] == "AAAA"
+    expected_pcm = np.ones(16, dtype="<f4").tobytes() if retain_history_audio else None
+    assert audio[0]["history_audio_pcm"] == expected_pcm
+    assert audio[0]["history_audio_supported"] is True
 
 
 def test_plain_text_still_passes_through():
@@ -234,6 +242,30 @@ def test_qwen_preparation_uses_the_supplied_call_and_can_be_repeated():
             {"type": "function_call_output", "call_id": "call_1", "name": "forged", "output": "25C"},
         )
     assert refused.value.code == "invalid_function_call_output"
+
+
+def test_nonfinite_tool_call_text_is_not_a_call():
+    nan_speech, nan_call = ThinkerToolCursor().absorb(
+        '<tool_call>{"name": "get_weather", "arguments": {"x": NaN}}</tool_call>'
+    )
+    assert nan_speech == ""
+    assert nan_call == {"call_id": "", "name": "", "invalid": "1"}
+    inf_speech, inf_call = ThinkerToolCursor().absorb(
+        '<tool_call>{"name": "get_weather", "arguments": {"x": Infinity}}</tool_call>'
+    )
+    assert inf_speech == ""
+    assert inf_call == {"call_id": "", "name": "", "invalid": "1"}
+
+
+def test_invalid_function_call_message_keeps_the_reason():
+    assert _invalid_function_call_message(SimpleNamespace(), {"function_call": True}) == _MISSING_CALL_ID
+    assert (
+        _invalid_function_call_message(
+            SimpleNamespace(),
+            {"function_call": True, "call_id": "call_1", "name": "get_weather", "arguments": object()},
+        )
+        == _ARGUMENTS_MUST_BE_JSON
+    )
 
 
 def test_malformed_tool_call_is_not_speech():
@@ -862,23 +894,6 @@ def test_new_user_audio_does_not_rebind_the_previous_question():
     assert payloads == ["paris", "tokyo"]
 
 
-def test_projected_function_call_supplies_name_and_arguments():
-    prepared = prepared_function_call_output(
-        {"type": "function_call_output", "call_id": "call_1", "output": "25C", "name": "forged"},
-        {
-            "item_1": {
-                "type": "function_call",
-                "call_id": "call_1",
-                "name": "get_weather",
-                "arguments": '{"city":"Taipei"}',
-            }
-        },
-    )
-    assert prepared["name"] == "get_weather"
-    assert prepared["arguments"] == '{"city":"Taipei"}'
-    assert prepared["output"] == "25C"
-
-
 def test_missing_parse_function_call_is_not_a_call():
     assert _recognized_function_call(SimpleNamespace(), {"text": "hello"}) is None
     call = _recognized_function_call(
@@ -886,6 +901,23 @@ def test_missing_parse_function_call_is_not_a_call():
         {"function_call": True, "call_id": "call_1", "name": "get_weather", "arguments": {"city": "Taipei"}},
     )
     assert call == {"call_id": "call_1", "name": "get_weather", "arguments": '{"city": "Taipei"}'}
+    assert _recognized_function_call(SimpleNamespace(), {"function_call": True}) is _INVALID_FUNCTION_CALL
+    assert (
+        _recognized_function_call(
+            SimpleNamespace(),
+            {"function_call": True, "call_id": "call_1", "name": "get_weather", "arguments": object()},
+        )
+        is _INVALID_FUNCTION_CALL
+    )
+    assert _coerce_function_call({"call_id": "c", "name": "n", "arguments": object()}) is None
+    assert _coerce_function_call({"call_id": "c", "name": "n", "arguments": {"x": float("nan")}}) is None
+    assert (
+        _recognized_function_call(
+            SimpleNamespace(),
+            {"function_call": True, "call_id": "call_1", "name": "get_weather", "arguments": {"x": float("nan")}},
+        )
+        is _INVALID_FUNCTION_CALL
+    )
 
 
 def test_parse_function_call_json_dumps_dict_arguments():
@@ -894,6 +926,20 @@ def test_parse_function_call_json_dumps_dict_arguments():
         {"qwen_function_call": {"call_id": "call_1", "name": "get_weather", "arguments": {"city": "Taipei"}}}
     )
     assert parsed == {"call_id": "call_1", "name": "get_weather", "arguments": '{"city": "Taipei"}'}
+    refused = plugin.parse_function_call(
+        {"qwen_function_call": {"call_id": "call_1", "name": "get_weather", "arguments": object()}}
+    )
+    assert refused == {"call_id": "invalid", "name": ""}
+    assert plugin.parse_function_call(
+        {"qwen_function_call": {"call_id": "call_1", "name": "get_weather", "arguments": {"x": float("nan")}}}
+    ) == {"call_id": "invalid", "name": ""}
+    assert (
+        _recognized_function_call(
+            plugin,
+            {"qwen_function_call": {"call_id": "call_1", "name": "get_weather", "arguments": object()}},
+        )
+        is _INVALID_FUNCTION_CALL
+    )
     assert _coerce_function_call({"call_id": "c", "name": "n", "arguments": {"x": 1}}) == {
         "call_id": "c",
         "name": "n",

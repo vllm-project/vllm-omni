@@ -56,6 +56,28 @@ def chat_template_tools(tools: object) -> list[dict[str, object]]:
     return converted
 
 
+def _reject_nonfinite(constant: str) -> None:
+    raise ValueError(constant)
+
+
+def _json_argument_text(arguments: object) -> str | None:
+    """RFC 8259 argument text. Hermes leaves ``NaN`` / ``Infinity`` in the string."""
+    if not isinstance(arguments, str):
+        try:
+            return json.dumps(
+                {} if arguments is None else arguments,
+                ensure_ascii=False,
+                allow_nan=False,
+            )
+        except (TypeError, ValueError):
+            return None
+    try:
+        json.loads(arguments, parse_constant=_reject_nonfinite)
+    except ValueError:
+        return None
+    return arguments
+
+
 def parse_completed_tool_call(inner: str) -> dict[str, str] | None:
     """Return one call from a finished ``<tool_call>`` body, or None."""
     wrapped = f"{TOOL_CALL_START}{inner}{TOOL_CALL_END}"
@@ -64,11 +86,11 @@ def parse_completed_tool_call(inner: str) -> dict[str, str] | None:
         return None
     function = extracted.tool_calls[0].function
     name = getattr(function, "name", None)
-    arguments = getattr(function, "arguments", None)
     if not isinstance(name, str) or not name:
         return None
-    if not isinstance(arguments, str):
-        arguments = json.dumps(arguments if arguments is not None else {}, ensure_ascii=False)
+    arguments = _json_argument_text(getattr(function, "arguments", None))
+    if arguments is None:
+        return None
     return {"call_id": f"call_{uuid4().hex}", "name": name, "arguments": arguments}
 
 

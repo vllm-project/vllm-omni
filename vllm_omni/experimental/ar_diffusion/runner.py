@@ -130,6 +130,7 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         # ``_perf_e2e_times`` keeps one entry per AR block in both execution
         # modes instead of one entry per denoise step.
         self._stepwise_chunk_started: dict[str, float] = {}
+        self._active_stepwise_request_id: str | None = None
 
     @staticmethod
     def _require_capability(pipeline: object) -> SupportsARDiffusionPipeline:
@@ -148,22 +149,45 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         memory_pool_context_fn: Callable[[str], AbstractContextManager[Any]] | None = None,
         load_format: str = "default",
         custom_pipeline_name: str | None = None,
+        initialize_lora: Callable[[], None] | None = None,
     ) -> None:
         super().load_model(
             memory_pool_context_fn=memory_pool_context_fn,
             load_format=load_format,
             custom_pipeline_name=custom_pipeline_name,
+            initialize_lora=initialize_lora,
         )
         if self.pipeline is None:
             return
         self._preallocate_kv_cache()
-        if not self.od_config.enforce_eager and self.ar_diffusion_kv_config.warmup_cudagraph:
+        # The rollout warmup exists for CUDA graph capture, but a pipeline may
+        # also want it in eager mode (first-request kernel selection, lazy
+        # allocations); ``ar_diffusion_warmup_eager`` opts in.
+        warmup_eager = bool(getattr(self.pipeline, "ar_diffusion_warmup_eager", False))
+        if self.ar_diffusion_kv_config.warmup_cudagraph and (not self.od_config.enforce_eager or warmup_eager):
             self._warmup_ar_rollout()
 
     def _available_memory_bytes(self) -> int:
         if self.device is None:
             raise RuntimeError("AR-Diffusion KV preallocation requires an initialized device")
         return current_omni_platform.get_free_memory(torch.device(self.device))
+
+    @staticmethod
+    def _segmented_all_rank_min(value: int) -> int:
+        """Agree on segmented allocation admission before a model collective."""
+        if not torch.distributed.is_initialized():
+            return value
+        from vllm_omni.diffusion.distributed.parallel_state import get_sp_group
+
+        group = get_sp_group()
+        if group.world_size == 1:
+            return value
+        vote = torch.tensor(value, dtype=torch.int64, device="cpu")
+        torch.distributed.all_reduce(vote, op=torch.distributed.ReduceOp.MIN, group=group.cpu_group)
+        return int(vote.item())
+
+    def _agree_segmented_allocation(self, successful: bool) -> bool:
+        return bool(self._segmented_all_rank_min(int(successful)))
 
     def _stage_config(self) -> dict:
         raw = getattr(self.od_config, "ar_diffusion_stage_config", None)
@@ -250,15 +274,18 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         self.ar_diffusion_kv_config = config
         self._ar_diffusion_capability = capability
         self._ar_diffusion_kv_cache_spec = spec
+        memory_bytes = self._available_memory_bytes() if available_bytes is None else available_bytes
+        if spec.segmented is not None:
+            memory_bytes = self._segmented_all_rank_min(memory_bytes)
         self.kv_cache = ARDiffusionKVCache(
             config,
             num_layers=spec.num_layers,
             num_kv_heads=spec.num_kv_heads,
             head_size=spec.head_size,
             dtype=self.od_config.dtype,
-            block_size=paging_block_size(spec.tokens_per_frame),
+            block_size=paging_block_size(spec.segmented.block_size if spec.segmented else spec.tokens_per_frame),
             max_model_len=spec.max_model_len,
-            available_bytes=self._available_memory_bytes() if available_bytes is None else available_bytes,
+            available_bytes=memory_bytes,
             kv_branches=spec.kv_branches,
             session_capacity=spec.session_capacity,
             cross_attention_lengths=spec.cross_attention_lengths,
@@ -266,6 +293,8 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             frames_per_block=spec.frames_per_block,
             max_scratch_tokens_per_branch=spec.max_scratch_tokens_per_branch,
             model_owned_state_bytes_per_session=spec.model_owned_state_bytes_per_session,
+            segmented=spec.segmented,
+            agree_staging_allocation=self._agree_segmented_allocation,
             device=self.device,
         )
         self._session_capacity = self.kv_cache.session_capacity
@@ -408,24 +437,33 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             )
             raise
 
+    def release_step_requests(self, request_ids: Sequence[str]) -> None:
+        """Release cancelled AR sessions even when no execution wave follows.
+
+        The base runner also retires completed states while the pipeline is
+        still bound. Keep that session alive until ``execute_stepwise`` exits
+        the binding and synchronizes; external cancellation arrives at the
+        serialized worker-call boundary and can release it immediately.
+        """
+        super().release_step_requests(request_ids)
+        if self.kv_cache is None:
+            return
+        for request_id in request_ids:
+            if request_id == getattr(self, "_active_stepwise_request_id", None):
+                continue
+            self._stepwise_chunk_started.pop(request_id, None)
+            if request_id in self._sessions:
+                self._release_session(request_id, reset_model=False, reason="close", suppress_errors=True)
+
     def _release_scheduler_finished_sessions(self, scheduler_output: DiffusionSchedulerOutput) -> None:
         """Close sessions the scheduler retired, including aborted requests.
 
-        A stepwise request that runs to completion is closed as soon as its
-        final chunk is emitted; an aborted one never produces that output, so
-        its KV would otherwise linger until LRU eviction. Session ids equal
-        request ids on this path, and tick sessions are keyed by their own ids,
-        so the membership check leaves them untouched.
+        This also covers schedulers that retire an aborted request without an
+        explicit worker release call. Session ids equal request ids on this
+        path, and tick sessions are keyed by their own ids, so the membership
+        check leaves them untouched.
         """
-        for request_id in getattr(scheduler_output, "finished_req_ids", None) or ():
-            self._stepwise_chunk_started.pop(request_id, None)
-            if request_id in self._sessions:
-                self._release_session(
-                    request_id,
-                    reset_model=False,
-                    reason="close",
-                    suppress_errors=True,
-                )
+        self.release_step_requests(getattr(scheduler_output, "finished_req_ids", None) or ())
 
     def _make_chunk_context(self):
         from vllm_omni.experimental.ar_diffusion.cell_executor import (
@@ -608,9 +646,8 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             return super().execute_stepwise(scheduler_output)
         if self._ar_diffusion_capability is None:
             raise RuntimeError("AR-Diffusion capability missing after KV cache initialization")
-        # Retire sessions the scheduler dropped before serving this cycle: a
-        # completed request is closed when its final chunk is emitted, an
-        # aborted one only here.
+        # Also retire sessions reported by the scheduler if no explicit worker
+        # release call preceded this wave.
         self._release_scheduler_finished_sessions(scheduler_output)
         request_ids = list(getattr(scheduler_output, "scheduled_request_ids", ()))
         if not request_ids:
@@ -623,12 +660,31 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         request_id = request_ids[0]
         session_id = request_id
         chunk_started = self._stepwise_chunk_started.setdefault(request_id, time.perf_counter())
+        self._active_stepwise_request_id = request_id
         try:
             # Denoise steps inside one chunk need no device barrier; the chunk
             # boundary below is the meaningful one, and syncing per step would
             # cost one synchronize per denoise step instead of per AR block.
             with self._bound_ar_session(session_id, description="stepwise", synchronize=False):
+                resume_reason = scheduler_output.step_resumes.get(request_id)
+                if resume_reason is not None:
+                    resume = getattr(pipeline, "ar_diffusion_resume_step", None)
+                    if not callable(resume):
+                        raise RuntimeError("Pipeline requested a step wait without an AR-Diffusion resume hook")
+                    resume(self.state_cache[request_id], resume_reason)
                 output = super().execute_stepwise(scheduler_output)
+                wait_hook = getattr(pipeline, "ar_diffusion_step_wait", None)
+                req_output = output.get_request_output(request_id)
+                state = self.state_cache.get(request_id) if callable(wait_hook) else None
+                if (
+                    callable(wait_hook)
+                    and state is not None
+                    and req_output is not None
+                    and not req_output.finished
+                    and req_output.result is not None
+                    and not req_output.result.error
+                ):
+                    req_output.wait_for_interaction = wait_hook(state)
             runner_output = output.get_request_output(request_id)
             finished = bool(runner_output is not None and runner_output.finished)
             result = None if runner_output is None else runner_output.result
@@ -642,6 +698,8 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         except Exception:
             self._fail_closed_stepwise(request_id)
             raise
+        finally:
+            self._active_stepwise_request_id = None
         # One entry per emitted AR block keeps ``_perf_e2e_times`` comparable
         # with request mode, where one execute_model() is one block.
         if chunk_emitted:

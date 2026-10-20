@@ -60,6 +60,8 @@ def is_flash_attn_4_available() -> bool:
 # Bind via aliases so mypy does not treat each candidate import as a redefinition.
 flash_attn_func: FlashAttnFn | None = None
 flash_attn_varlen_func: FlashAttnFn | None = None
+# FP8 descales are supported by vLLM's FA3 dispatcher and standalone FA3.
+FLASH_ATTN_SUPPORTS_FP8 = False
 IS_FLASH_ATTN_4 = False
 IS_AITER = False
 
@@ -119,6 +121,7 @@ else:
             from vllm.vllm_flash_attn import flash_attn_varlen_func as _fa_varlen
 
             flash_attn_varlen_func = _fa_varlen
+            FLASH_ATTN_SUPPORTS_FP8 = True
         except (ImportError, ModuleNotFoundError):
             pass
 
@@ -131,6 +134,7 @@ else:
 
                 flash_attn_func = _fa_func
                 flash_attn_varlen_func = _fa_varlen
+                FLASH_ATTN_SUPPORTS_FP8 = True
             except (ImportError, ModuleNotFoundError):
                 pass
 
@@ -223,6 +227,30 @@ def resolve_vllm_flash_attn_version(requested: str | int | None = None) -> int:
         raise RuntimeError("Cannot resolve FlashAttention without a CUDA device capability")
     supported_versions = frozenset(version for version in (2, 3, 4) if is_fa_version_supported(version))
     return _choose_vllm_flash_attn_version(capability.major, requested, supported_versions)
+
+
+def _is_vllm_flash_attn_varlen(attn_func: FlashAttnFn) -> bool:
+    """Return whether ``attn_func`` is vLLM's versioned varlen dispatcher.
+
+    Identity by design; compiled-specs variants intentionally fall through.
+    """
+    try:
+        from vllm.vllm_flash_attn import flash_attn_varlen_func as vllm_func
+    except ImportError:
+        return False
+    return attn_func is vllm_func
+
+
+def vllm_varlen_version_kwargs(attn_func: FlashAttnFn | None) -> dict[str, int]:
+    """Return ``fa_version`` when calling vLLM's varlen dispatcher.
+
+    vLLM 0.31 defaults that argument to FA2. Hopper and Blackwell must receive
+    the version from :func:`resolve_vllm_flash_attn_version`, or dense diffusion
+    attention stays on FA2. Other backends do not accept the argument.
+    """
+    if attn_func is None or not _is_vllm_flash_attn_varlen(attn_func):
+        return {}
+    return {"fa_version": resolve_vllm_flash_attn_version()}
 
 
 _FA3_MISSING = "A standalone FlashAttention-3 varlen interface (flash_attn_interface) is required"
