@@ -7,7 +7,12 @@ vllm-omni serve Qwen/Qwen3-Omni-30B-A3B-Instruct --port 8000 --log-stats
 curl http://localhost:8000/metrics
 ```
 
-**`--log-stats` is required to populate metric data.** Without the flag, the endpoint still returns `200 OK` but the upstream `vllm:*` wrap is not registered at all, and the 15 `vllm_omni:*` families are registered as placeholders with no data written to them. This keeps the runtime cost essentially zero for deployments that don't need monitoring. With the flag, all ~80 families populate.
+API serving (`vllm serve ... --omni` / `vllm-omni serve`) populates metric data by default; pass `--disable-log-stats` to turn it off. With statistics off, the endpoint still returns `200 OK` but the upstream `vllm:*` wrap is not registered at all, and the 15 `vllm_omni:*` families are registered as placeholders with no data written to them. This keeps the runtime cost essentially zero for deployments that don't need monitoring. With statistics on, all ~80 families populate.
+
+!!! note
+    Releases before v0.24.0 did not enable statistics by default for API serving; pass `--log-stats` there. The offline Python interface (`Omni` / `AsyncOmni`) still defaults to `log_stats=False`.
+
+Both namespaces carry the same `model_name` label: the served model name (`--served-model-name`, defaulting to the model path), so one dashboard `model_name` selector matches `vllm:*` and `vllm_omni:*` series alike.
 
 ## Metric Namespaces
 
@@ -120,11 +125,11 @@ For the full list of upstream metrics, see [the vLLM docs](https://github.com/vl
 
 | Metric group | Multi-stage LLM (Qwen3-Omni) |
 | --- | --- |
-| `vllm_omni:` request tracking + latency | With `--log-stats` |
-| `vllm_omni:` audio modality | With `--log-stats`, if pipeline has a talker stage |
-| `vllm_omni:` transfer | With `--log-stats`, if pipeline has ≥ 2 stages |
-| `vllm:` engine metrics (per `(stage, replica)`) | With `--log-stats` |
-| `vllm:` MFU metrics | With `--log-stats --enable-mfu-metrics` |
+| `vllm_omni:` request tracking + latency | Default (off with `--disable-log-stats`) |
+| `vllm_omni:` audio modality | Default, if pipeline has a talker stage |
+| `vllm_omni:` transfer | Default, if pipeline has ≥ 2 stages |
+| `vllm:` engine metrics (per `(stage, replica)`) | Default |
+| `vllm:` MFU metrics | With `--enable-mfu-metrics` |
 
 ## Naming Convention
 
