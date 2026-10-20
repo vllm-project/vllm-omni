@@ -465,6 +465,30 @@ async def test_stream_pcm_chunking():
 
 
 @pytest.mark.asyncio
+async def test_stream_pcm_pacing_accounts_for_send_overhead(monkeypatch):
+    import vllm_omni.clients.duplex as duplex
+
+    client, _ = make_client(FakeSocket())
+    clock = [0.0]
+    send_starts = []
+
+    async def append(pcm, **kwargs):
+        send_starts.append(clock[0])
+        clock[0] += 0.03
+
+    async def sleep(delay):
+        assert delay >= 0
+        clock[0] += delay
+
+    monkeypatch.setattr(client, "append_audio", append)
+    monkeypatch.setattr(duplex.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(duplex.asyncio, "sleep", sleep)
+    await client.stream_pcm(bytes(9600), chunk_ms=100)
+    assert send_starts == pytest.approx([0.0, 0.1, 0.2])
+    assert clock[0] == pytest.approx(0.3)
+
+
+@pytest.mark.asyncio
 async def test_interruption_primitives_send_documented_events():
     sock = FakeSocket()
     sock.feed(SESSION_CREATED)
@@ -1584,6 +1608,35 @@ async def test_stream_pcm_sends_each_units_composite_beside_its_base_frame():
         ]
         assert [event["audio_end_ms"] for event in appends if "video_frames" in event] == [1000, 2000, 3000]
         assert frames_sent == 3
+        sock.feed(SESSION_CLOSED)
+
+
+@pytest.mark.asyncio
+async def test_stream_pcm_tail_stays_on_the_clip_media_timeline():
+    """1.4 s of audio plus 1 s of tail: the append that closes 2.0 s keeps the last frame."""
+    sock = FakeSocket()
+    sock.feed(SESSION_CREATED)
+    client, _ = make_client(sock)
+    frames = ["f0", "f1"]
+    async with client:
+        frames_sent = await client.stream_pcm(
+            b"\x01\x00" * int(16_000 * 1.4),
+            chunk_ms=200,
+            realtime=False,
+            video_frames=frames,
+        )
+        assert frames_sent == 1
+        await client.stream_pcm(
+            b"\x00\x00" * 16_000,
+            chunk_ms=200,
+            realtime=False,
+            video_frames=frames,
+            media_origin_ms=1400,
+            unit_index=frames_sent,
+        )
+        appends = [event for event in sock.sent if event.get("type") == "input_audio_buffer.append"]
+        framed = [(event["audio_end_ms"], event["video_frames"]) for event in appends if "video_frames" in event]
+        assert framed == [(1000, ["f0"]), (2000, ["f1"])]
         sock.feed(SESSION_CLOSED)
 
 

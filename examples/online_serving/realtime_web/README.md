@@ -34,6 +34,14 @@ The compatibility wrapper serves the shared assets with `minicpm-native`.
 The current native query, `extra_body`, reference voice, continuous microphone
 upload, camera frames and playback acknowledgements are retained.
 
+With **Camera** enabled, **Mute** first closes the open one-second audio unit
+with silence, then stops microphone uploads but keeps sending fresh video
+frames at 1 fps. These are frame-only MiniCPM VISION inputs, without
+synthetic silence or a client commit; the model decides whether to listen or
+speak. **Unmute** resumes combined microphone/video input. Turning the camera
+off while muted stops input uploads. This requires a backend with MiniCPM
+video-only input support.
+
 ## AURA: push-to-talk duplex
 
 AURA has no client VAD. Start the duplex serve, then the thin wrapper:

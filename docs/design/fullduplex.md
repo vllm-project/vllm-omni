@@ -395,6 +395,17 @@ for queue updates and the final validity check before delivery.
   turn_id)` when it starts and re-checks them before the stage submit and
   before committing ledgers; a task that finds the epoch advanced rolls back
   its PCM reservation and exits.
+- **Buffered commit prefixes.** A model buffer may reserve non-terminal units
+  before its terminal commit payload. The runner submits these in wire order
+  with `force_listen=True` and waits for append acceptance before acknowledging
+  the commit. A commit that must wait for an active response holds those
+  prefixes and submits them, still in wire order, when that response ends,
+  before the retained terminal payload. Reservations keep their normal rollback
+  ownership. MiniCPM uses this path to preserve separate buffered VISION units
+  and a following speech tail in manual commit/response sessions. Native
+  resumable responses also defer video-only commits. If response creation is
+  disabled on the commit, a later explicit `response.create` must drain the
+  held prefixes before submitting the terminal payload.
 - **Cancel is atomic at the session.** `CancelResponse` / `BargeIn` advance
   the epoch, cancel tracked append tasks, abort the owned stage bindings
   through the stage port and emit the cancelled terminal events before
