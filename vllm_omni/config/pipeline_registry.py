@@ -34,6 +34,7 @@ from vllm_omni.config.stage_config import (
     PipelineConfig,
 )
 from vllm_omni.diffusion.models.pi0_pipeline_config import PI0_PIPELINE
+from vllm_omni.model_executor.models.alpamayo2_super.pipeline import ALPAMAYO2_SUPER_PIPELINE
 from vllm_omni.model_executor.models.audex.pipeline import (
     AUDEX_S2S_PIPELINE,
     AUDEX_THINKER_ONLY_PIPELINE,
@@ -142,6 +143,7 @@ PipelineResolverFunc: TypeAlias = Callable[[PretrainedConfig | None], PipelineCo
 
 # --- Multi-stage omni pipelines (LLM-centric; audio / video I/O) ---
 OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
+    "alpamayo2_super": ALPAMAYO2_SUPER_PIPELINE,
     "arktts": AUDIO8_TTS_PIPELINE,
     "audex_s2s": AUDEX_S2S_PIPELINE,
     "audex_thinker_only": AUDEX_THINKER_ONLY_PIPELINE,
