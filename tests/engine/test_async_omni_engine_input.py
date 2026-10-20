@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 from pytest_mock import MockerFixture
@@ -9,9 +11,10 @@ from vllm.v1.engine import EngineCoreRequest
 
 from vllm_omni.distributed.omni_coordinator import ReplicaInfo, ReplicaStatus
 from vllm_omni.engine import OmniEngineCoreRequest
+from vllm_omni.engine.async_engine_utils import scope_stage_replica_mm_uuids
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine, StageRuntimeInfo
 from vllm_omni.engine.serialization import deserialize_additional_information
-from vllm_omni.engine.stage_pool import StagePool
+from vllm_omni.engine.stage_pool import StagePool, StageUnavailableError
 from vllm_omni.model_executor.stage_input_processors.bagel import ExpandedPrompt
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -471,6 +474,77 @@ def test_mm_uuid_scoping_keys_reused_prompt_by_its_own_media(mocker: MockerFixtu
     assert all(uuid.count("stage0:") == 1 for uuid in seen_uuids)
 
 
+def test_shared_mm_uuid_scoping_preserves_media_and_user_uuids(mocker: MockerFixture):
+    hash_kwargs = mocker.patch("vllm.multimodal.hasher.MultiModalHasher.hash_kwargs", return_value="audio-hash")
+    audio = ([0.1, 0.2], 16000)
+    prompt = {
+        "multi_modal_data": {"audio": audio, "image": [None, None], "video": None},
+        "multi_modal_uuids": {"image": ["cached-image", None], "other": ["untouched"]},
+    }
+
+    scoped = scope_stage_replica_mm_uuids(
+        prompt, stage_id=2, replica_id=3, model_id="stage-model", mm_hasher_algorithm="sha256"
+    )
+
+    hash_kwargs.assert_called_once_with("sha256", model_id="stage-model", audio=audio)
+    assert scoped is not prompt
+    assert scoped["multi_modal_data"] is prompt["multi_modal_data"]
+    assert scoped["multi_modal_uuids"] == {
+        "audio": ["stage2:rep3:audio-hash"],
+        "image": ["stage2:rep3:cached-image", None],
+        "other": ["untouched"],
+    }
+    assert prompt["multi_modal_uuids"] == {"image": ["cached-image", None], "other": ["untouched"]}
+
+
+def test_shared_mm_uuid_scoping_reuses_cache_only_within_one_receiver(mocker: MockerFixture):
+    mocker.patch("vllm.multimodal.hasher.MultiModalHasher.hash_kwargs", return_value="same-media")
+    prompt = {"multi_modal_data": {"audio": "same-audio"}}
+    sender_cache: set[str] = set()
+    cache_hits = []
+    for stage_id, replica_id in [(0, 0), (0, 1), (0, 0), (1, 0)]:
+        scoped = scope_stage_replica_mm_uuids(
+            prompt, stage_id=stage_id, replica_id=replica_id, model_id="model", mm_hasher_algorithm="blake3"
+        )
+        key = scoped["multi_modal_uuids"]["audio"][0]
+        cache_hits.append(key in sender_cache)
+        sender_cache.add(key)
+
+    assert cache_hits == [False, False, True, False]
+    assert "multi_modal_uuids" not in prompt
+
+
+@pytest.mark.parametrize(
+    "prompt", ["plain text", {}, {"multi_modal_data": {}}, {"multi_modal_data": {"image": "image"}}]
+)
+def test_async_mm_uuid_wrapper_delegates_all_prompts(mocker: MockerFixture, prompt):
+    engine = object.__new__(AsyncOmniEngine)
+    engine.model = "engine-model"
+    helper = mocker.patch("vllm_omni.engine.async_omni_engine.scope_stage_replica_mm_uuids")
+    mocker.patch.object(engine, "_resolve_mm_hasher_algorithm", return_value="sha256")
+
+    scoped = engine._ensure_stage_replica_mm_uuids(prompt, stage_id=0, replica_id=1)
+
+    assert scoped is helper.return_value
+    helper.assert_called_once_with(
+        prompt, stage_id=0, replica_id=1, model_id="engine-model", mm_hasher_algorithm="sha256"
+    )
+
+
+def test_async_mm_uuid_wrapper_preserves_stage0_hash_config(mocker: MockerFixture):
+    engine = object.__new__(AsyncOmniEngine)
+    engine.model = "engine-model"
+    engine.stage_vllm_configs = [
+        SimpleNamespace(model_config=SimpleNamespace(multimodal_config=SimpleNamespace(mm_hasher_algorithm="sha256")))
+    ]
+    hash_kwargs = mocker.patch("vllm.multimodal.hasher.MultiModalHasher.hash_kwargs", return_value="image-hash")
+
+    scoped = engine._ensure_stage_replica_mm_uuids({"multi_modal_data": {"image": "image"}}, stage_id=0, replica_id=1)
+
+    hash_kwargs.assert_called_once_with("sha256", model_id="engine-model", image="image")
+    assert scoped["multi_modal_uuids"] == {"image": ["stage0:rep1:image-hash"]}
+
+
 @pytest.mark.asyncio
 async def test_build_add_request_message_scopes_mm_uuids_to_distributed_stage0_replica(mocker: MockerFixture):
     engine = object.__new__(AsyncOmniEngine)
@@ -515,6 +589,16 @@ async def test_build_add_request_message_scopes_mm_uuids_to_distributed_stage0_r
     assert stage_pool.get_bound_replica_id("req-2") == 1
     assert await stage_pool.pick("req-1") == 0
     assert await stage_pool.pick("req-2") == 1
+
+    # Replica 0 leaves the hub after req-1's keys were scoped to it: a submit pinned to
+    # those keys fails instead of sending them to replica 1, while routing moves on.
+    stage_pool.attach_hub(_FakeHub([_replica(addr1)]))
+    with pytest.raises(StageUnavailableError):
+        await stage_pool.submit_initial(
+            "req-1", mocker.Mock(sampling_params_list=[params]), _make_engine_core_request(), expected_replica_id=0
+        )
+    assert stage_pool.get_bound_replica_id("req-1") is None
+    assert await stage_pool.pick("req-1") == 1
 
 
 def test_build_add_request_message_skips_distributed_mm_scope_when_no_replica(mocker: MockerFixture):

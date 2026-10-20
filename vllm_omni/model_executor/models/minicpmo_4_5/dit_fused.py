@@ -55,7 +55,9 @@ def dit_modulation(estimator: nn.Module, time_embedding: torch.Tensor) -> torch.
     """adaLN table ``(depth + 1, 9, C)`` for one timestep; scales stored as ``1 + scale``."""
     embedding = time_embedding.reshape(1, 1, -1)
     table = torch.stack([block.adaLN_modulation(embedding).reshape(9, -1) for block in estimator.blocks], dim=0)
-    table[:, (_SCALE_MSA, _SCALE_MLP, _SCALE_CONV)] += 1.0
+    # Basic slicing avoids uploading an advanced-index tensor inside NPUGraph.
+    # Each shift/scale/gate triple stores its scale at indices 1, 4 and 7.
+    table[:, _SCALE_MSA::3].add_(1.0)
     final_shift, final_scale = estimator.final_layer.adaLN_modulation(embedding).reshape(2, -1)
     final = table.new_zeros((1, 9, int(table.shape[2])))
     # Where a block keeps its MSA shift/scale, so the last block's closing LayerNorm reads it like a next block.

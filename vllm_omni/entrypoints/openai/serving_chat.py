@@ -6,9 +6,10 @@ import base64
 import json
 import time
 import uuid
-from collections.abc import AsyncGenerator, AsyncIterator, Callable
+from collections.abc import AsyncGenerator, AsyncIterator, Callable, Sequence
 from dataclasses import fields, is_dataclass
 from datetime import datetime, timedelta, timezone
+from functools import partial
 from io import BytesIO
 from typing import Any, Final, cast
 
@@ -18,14 +19,15 @@ from fastapi import Request
 from openai.types.chat.chat_completion_audio import ChatCompletionAudio as OpenAIChatCompletionAudio
 from PIL import Image
 from pydantic import TypeAdapter
-from vllm.entrypoints.chat_utils import (
+from vllm.exceptions import RetryableRequestError
+from vllm.parser.utils import (
+    count_chat_history_tool_calls as get_history_tool_calls_cnt,
+)
+from vllm.renderers.chat_utils import (
     ChatCompletionMessageParam,
     ChatTemplateContentFormatOption,
     ConversationMessage,
     make_tool_call_id,
-)
-from vllm.parser.utils import (
-    count_chat_history_tool_calls as get_history_tool_calls_cnt,
 )
 
 from vllm_omni.diffusion.utils.image_output import extract_images_from_outputs
@@ -105,6 +107,7 @@ from vllm.parser.mistral import MistralToolCall
 from vllm.reasoning import ReasoningParser
 from vllm.renderers import BaseRenderer, merge_kwargs
 from vllm.renderers.inputs import TokPrompt
+from vllm.renderers.params import ChatParams, TokenizeParams
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 from vllm.tokenizers import TokenizerLike
 from vllm.tokenizers import TokenizerLike as AnyTokenizer
@@ -144,18 +147,20 @@ from vllm_omni.entrypoints.openai.stage_params import (
 )
 from vllm_omni.entrypoints.openai.utils import (
     get_stage_type,
-    get_supported_speakers_from_hf_config,
     is_image_generation_stage,
     is_single_stage_diffusion,
     parse_lora_request,
     resolve_diffusion_od_config,
-    validate_requested_speaker,
 )
 from vllm_omni.errors import OmniClientError
 from vllm_omni.lora.request import LoRARequest
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.outputs.output_metadata import DiffusionMetadataMapping, DiffusionMetadataValue
 from vllm_omni.utils.audio import audio_chunk_pcm_bytes, audio_chunk_sample_rate
+from vllm_omni.utils.speakers import (
+    get_supported_speakers_from_hf_config,
+    validate_requested_speaker,
+)
 
 logger = init_logger(__name__)
 
@@ -222,7 +227,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         field is now resolved on demand via ``get_tool_call_id_type``.
         """
         try:
-            from vllm.entrypoints.chat_utils import get_tool_call_id_type
+            from vllm.renderers.chat_utils import get_tool_call_id_type
 
             return get_tool_call_id_type(self.model_config)
         except Exception:
@@ -470,9 +475,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         nested = root.pop("extra_body", None)
         if nested is None:
             nested = getattr(request, "extra_body", None)
-        explicit = getattr(request, "model_fields_set", None)
-        if explicit is None:
-            explicit = getattr(request, "__fields_set__", None) or ()
+        explicit = request.model_fields_set
         explicit_root_args = {
             key: getattr(request, key) for key in explicit if key != "extra_body" and hasattr(request, key)
         }
@@ -621,7 +624,10 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
             model_name = self.models.model_name(lora_request)
 
-            renderer = self.renderer
+            # A request that bypasses stage 0 is rendered with the tokenizer and
+            # chat template of the stage it enters at.
+            entry_stage_id = self.engine_client.resolve_entry_stage_id(self._input_modalities(request.messages))
+            renderer = self.engine_client.get_stage_renderer(entry_stage_id) if entry_stage_id else self.renderer
             tokenizer = renderer.get_tokenizer()
             if tokenizer is None:
                 tokenizer = await self.engine_client.get_tokenizer()
@@ -697,6 +703,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     continue_final_message=request.continue_final_message,
                     documents=getattr(request, "documents", None),
                     add_special_tokens=request.add_special_tokens,
+                    entry_stage_id=entry_stage_id,
                 )
             else:
                 should_include_tools = tool_dicts is not None
@@ -922,6 +929,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     output_modalities=output_modalities,
                     arrival_time=request_timestamp,
                     lora_request=lora_request,
+                    entry_stage_id=entry_stage_id,
                 )
 
                 generators.append(generator)
@@ -977,6 +985,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         documents: list[dict[str, str]] | None = None,
         add_special_tokens: bool = False,
         skip_mm_cache: bool = False,
+        entry_stage_id: int = 0,
     ) -> tuple[list[ConversationMessage], list[TokPrompt]]:
         if renderer is None:
             renderer = self.renderer
@@ -1007,13 +1016,14 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         )
 
         deferred_multi_modal_data: dict[str, Any] | None = None
-        if self._needs_multistage_multimodal_split():
+        if entry_stage_id == 0 and self._needs_multistage_multimodal_split():
             messages, deferred_multi_modal_data = await self._prepare_multistage_multimodal_inputs(
                 messages,
                 request,
             )
 
-        (conversation,), (engine_prompt,) = await renderer.render_chat_async(
+        render_chat = partial(self._render_chat_deferred, renderer) if entry_stage_id else renderer.render_chat_async
+        (conversation,), (engine_prompt,) = await render_chat(
             [messages],
             chat_params,
             tok_params,
@@ -1098,6 +1108,36 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             additional_information = {}
             engine_prompt["additional_information"] = additional_information
         return additional_information
+
+    def _input_modalities(self, messages: list[ChatCompletionMessageParam]) -> set[str]:
+        """Return the modalities of the media parts in ``messages``."""
+        return {
+            modality
+            for message in messages
+            if isinstance(message, dict) and isinstance(message.get("content"), list)
+            for part in message["content"]
+            if (modality := self._deferred_multimodal_part(part, {"audio", "image", "video"})[0])
+        }
+
+    @staticmethod
+    async def _render_chat_deferred(
+        renderer: BaseRenderer,
+        conversations: Sequence[list[ChatCompletionMessageParam]],
+        chat_params: ChatParams,
+        tok_params: TokenizeParams,
+        *,
+        prompt_extras: dict[str, Any],
+        skip_mm_cache: bool = False,
+    ) -> tuple[list[list[ConversationMessage]], list[TokPrompt]]:
+        """Upstream ``render_chat_async`` minus ``process_for_engine_async`` (the only step
+        ``skip_mm_cache`` affects): a bypassing request keeps its media raw for the orchestrator
+        (``_build_entry_stage_request``), which processes it with the same prompt extras."""
+        rendered = await asyncio.gather(*(renderer.render_messages_async(c, chat_params) for c in conversations))
+        tok_prompts = await renderer.tokenize_prompts_async([prompt for _, prompt in rendered], tok_params)
+        prompt_extras = {**prompt_extras, "media_io_kwargs": chat_params.media_io_kwargs or {}}
+        for tok_prompt in tok_prompts:
+            tok_prompt.update(prompt_extras)
+        return [conversation for conversation, _ in rendered], tok_prompts
 
     def _needs_multistage_multimodal_split(self) -> bool:
         return bool(self._deferred_multimodal_modalities())
@@ -1415,10 +1455,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         params = default_params.clone()
 
         # Only apply fields explicitly provided by user, not protocol defaults.
-        # Pydantic v2 uses `model_fields_set`; keep v1 fallback for compatibility.
-        explicit_fields = getattr(request, "model_fields_set", None)
-        if explicit_fields is None:
-            explicit_fields = getattr(request, "__fields_set__", None) or set()
+        explicit_fields = request.model_fields_set
 
         for field_name in self._OPENAI_SAMPLING_FIELDS:
             if field_name not in explicit_fields:
@@ -2488,7 +2525,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 final_outputs.append(res)
         except asyncio.CancelledError:
             return self.create_error_response("Client disconnected")
-        except ValueError as e:
+        except (ValueError, RetryableRequestError) as e:
             return self.create_error_response(e)
 
         assert final_outputs is not None

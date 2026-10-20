@@ -14,9 +14,14 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True, slots=True)
 class MiniCPMO45DuplexWindowConfig:
-    """Stage-0 window settings matching the released checkpoint defaults."""
+    """Stage-0 window settings.
 
-    sliding_window_mode: str = "off"
+    Sizes match the released checkpoint defaults. The checkpoint's mode is
+    ``off``; serving defaults to ``basic`` to bound long-session context
+    (#8879). Clients can explicitly select ``off`` to retain full history.
+    """
+
+    sliding_window_mode: str = "basic"
     basic_window_high_tokens: int = 8000
     basic_window_low_tokens: int = 6000
     context_previous_max_tokens: int = 500
@@ -38,7 +43,7 @@ class MiniCPMO45DuplexWindowConfig:
                 raise ValueError(f"{name} must be greater than zero")
             return parsed
 
-        mode = source.get("sliding_window_mode", "off")
+        mode = source.get("sliding_window_mode", "basic")
         if mode not in {"off", "basic", "context"}:
             raise ValueError("sliding_window_mode must be one of: off, basic, context")
         config = cls(

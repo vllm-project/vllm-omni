@@ -21,6 +21,13 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 pytestmark = [pytest.mark.diffusion, pytest.mark.core_model, pytest.mark.cpu]
 
 
+def test_coalesced_events_keep_their_reporting_chunk():
+    output = DiffusionOutput(chunk_index=4, coalesced_event_ids=["superseded"])
+    metadata = output_formatter._stream_metadata_from_diffusion_output(output)
+    assert metadata["coalesced_event_ids"] == ["superseded"]
+    assert metadata["generation_chunk_index"] == 4
+
+
 def _request(
     prompt: str | dict | None = None,
     *,

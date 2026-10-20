@@ -65,7 +65,7 @@ class AsyncEventResolver:
         }
         return fut
 
-    async def resolve(self, ack: OmniACK):
+    async def resolve(self, ack: OmniACK | dict[str, Any]):
         tid = getattr(ack, "task_id", None)
 
         if tid is None and isinstance(ack, dict):
@@ -173,6 +173,17 @@ class AsyncOmniBase(OmniBase):
         if self.input_processor is None:
             return None
         return self.input_processor.renderer
+
+    def resolve_entry_stage_id(self, input_modalities: Iterable[str]) -> int:
+        """Return the stage a request with ``input_modalities`` enters at: 1 when stage 0 declares
+        ``bypass_without_modalities`` and the request carries none of them, else 0."""
+        stage_configs = self.engine.stage_configs
+        bypass_without = set(getattr(stage_configs[0], "bypass_without_modalities", ())) if stage_configs else set()
+        return 1 if bypass_without and bypass_without.isdisjoint(input_modalities) else 0
+
+    def get_stage_renderer(self, stage_id: int):
+        """Return the renderer for chat requests that bypass stage 0 and enter at ``stage_id``."""
+        return self.engine.get_stage_renderer(stage_id)
 
     @property
     def vllm_config(self):

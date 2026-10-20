@@ -30,7 +30,7 @@ Example layout:
 ```text
 recipes/
   lerobot/
-    Pi05.md
+    Pi0.md
   Qwen/
     Qwen3-Omni-H100.md
     Qwen3-TTS-A100.md
@@ -52,15 +52,17 @@ recipes/
 | [`BreezeBlue/Breeze-TTS-2.md`](./BreezeBlue/Breeze-TTS-2.md) | Online + offline TTS (plain / voice design / voice clone / voice direction, streaming PCM) | 1x NVIDIA L20 48GB |
 | [`ByteDance/Lance.md`](./ByteDance/Lance.md) | Unified AR+diffusion: text/img/video gen + understanding (Lance 3B) | 1x B300 / A100 80GB |
 | [`circlestone-labs/Anima.md`](./circlestone-labs/Anima.md) | Native single-file text-to-image serving | 1x AMD MI300X |
+| [`fishaudio/Drama-3.md`](./fishaudio/Drama-3.md) | Online serving for TTS | 1x H100 80GB |
 | [`fishaudio/Fish-Speech-S2-Pro.md`](./fishaudio/Fish-Speech-S2-Pro.md) | Online serving for TTS | 1x A800 80GB |
 | [`Helios/Helios.md`](./Helios/Helios.md) | Text-to-video, image-to-video, and video-to-video generation | 1x NVIDIA H20 |
 | [`HiDream-ai/HiDream-O1-Image.md`](./HiDream-ai/HiDream-O1-Image.md) | Text-to-image with shared offline example | 1x or 2x H100 80GB |
 | [`inclusionAI/Ming-flash-omni-2.0.md`](./inclusionAI/Ming-flash-omni-2.0.md) | Online serving for multimodal chat + standalone TTS | 4x H100 / 1x H100 80GB |
 | [`inclusionAI/Ming-omni-tts.md`](./inclusionAI/Ming-omni-tts.md) | Offline + online dense Ming TTS/audio generation | 1x H100 80GB / 1x AMD MI300X (ROCm 7.2) |
 | [`k2-fsa/OmniVoice.md`](./k2-fsa/OmniVoice.md) | Offline and online multilingual text-to-speech | 1x AMD MI300X (ROCm 7.2) |
-| [`lerobot/Pi05.md`](./lerobot/Pi05.md) | Online OpenPI serving for the π0.5 vision-language-action policy | 1x H100 80GB |
+| [`lerobot/Pi0.md`](./lerobot/Pi0.md) | Online OpenPI serving for the π0 vision-language-action policy | 1x H200 141GB |
 | [`IndexTeam/IndexTTS-2.md`](./IndexTeam/IndexTTS-2.md) | Online serving for voice-cloned TTS with optional emotion control | 1x L4 24GB or larger CUDA GPU |
 | [`IndexTeam/IndexTTS-2_5.md`](./IndexTeam/IndexTTS-2_5.md) | Online + offline multilingual voice-cloned TTS with native speed and emotion control | 1x NVIDIA H20 96GB |
+| [`Microsoft/VibeVoice-1.5B-H100.md`](./Microsoft/VibeVoice-1.5B-H100.md) | Offline single-speaker TTS with optional voice clone (eager) | 1x H100 80GB |
 | [`MiniMaxAI/MiniMax-H3.md`](./MiniMaxAI/MiniMax-H3.md) | T2VA, FL2VA, image+audio Ref2VA, and multi-video Ref2VA serving | 1x GPU with CPU offload / 4x B300 |
 | [`MiniMaxAI/MiniMax-H3-Spark-GB10.md`](./MiniMaxAI/MiniMax-H3-Spark-GB10.md) | MiniMax H3 T2VA and Ref2VA on DGX Spark | 1x or 2x DGX Spark (GB10) |
 | [`MiniMaxAI/MiniMax-H3-MUSA.md`](./MiniMaxAI/MiniMax-H3-MUSA.md) | MiniMax H3 T2VA, FL2VA, and Ref2VA on MUSA | 4x MTT S5000 (TP4 Ref2VA profile) |
@@ -78,6 +80,7 @@ recipes/
 | [`Robbyant/LingBot-Video.md`](./Robbyant/LingBot-Video.md) | Native dense and MoE text-to-video serving | Dense: 1x L20X; MoE: 1x L20X (~67.7 GiB peak) |
 | [`SandAI/MAGI-2-preview-L20X.md`](./SandAI/MAGI-2-preview-L20X.md) | Native Preview-stage text/image-to-video-and-audio generation | 1x/4x NVIDIA L20X 140 GiB qualified |
 | [`Robbyant/LingBot-World-2.0.md`](./Robbyant/LingBot-World-2.0.md) | Offline and experimental realtime interactive world generation | 1x H200/B200 or 2x B200 for TP=2 |
+| [`TaoLiveAIGC/TaoMate-H3.md`](./TaoLiveAIGC/TaoMate-H3.md) | Realtime streaming presenter: MiniMax-H3 + TaoMate LoRA on the AR-Diffusion runtime | 2x H200-class FP8 (USP2) or 4x BF16 (USP4) |
 | [`cosmos3/Cosmos3-Nano.md`](./cosmos3/Cosmos3-Nano.md) | Text-to-image, text-to-video, image-to-video, video-to-video generation, text to video with sound, action policy | 1x H200 141GB / B300 |
 | [`cosmos3/Cosmos3-Edge.md`](./cosmos3/Cosmos3-Edge.md) | T2I / T2V / I2V + action (Physical-AI) generation on the Nemotron-based Edge transformer | 1x GPU (~8 GiB) |
 | [`cosmos3/Cosmos3-Super.md`](./cosmos3/Cosmos3-Super.md) | 64B T2I / T2V / I2V / V2V generation (+ optional audio) / Action policy | 8x H200/H100/A100 / 2x H200 / B300 |
@@ -85,6 +88,7 @@ recipes/
 | [`OpenBMB/VoxCPM2.md`](./OpenBMB/VoxCPM2.md) | Online + offline TTS with native AR pipeline (48 kHz, 30+ languages) | 1x RTX 4090 24GB / 1x Ascend 910B3 64GB |
 | [`OpenMOSS/MOSS-TTS.md`](./OpenMOSS/MOSS-TTS.md) | Online + offline multilingual TTS (MOSS-TTS family, 8B) | 1x H100 80GB |
 | [`OpenMOSS/MOSS-TTS-Nano-NPU.md`](./OpenMOSS/MOSS-TTS-Nano-NPU.md) | Online multilingual voice-cloned TTS | 1x Ascend 910B3 64GB |
+| [`Physis-AI/CausVid-Wan.md`](./Physis-AI/CausVid-Wan.md) | Experimental offline Noisy KV / Chunk PP on CausVid Wan 2.1 1.3B | Multi-GPU CUDA (qualify with S=T+1) |
 | [`NVIDIA/Nemotron-Labs-Audex.md`](./NVIDIA/Nemotron-Labs-Audex.md) | TTS / text-to-audio / audio understanding / cascaded S2S (Audex 2B + 30B-A3B) | 1x H100 80GB |
 | [`NVIDIA/NemotronLabs-VoiceChat.md`](./NVIDIA/NemotronLabs-VoiceChat.md) | Offline speech-to-speech voice chat (11B, frame-locked 12.5 Hz, 3-stage thinker/talker/code2wav) | 1x H100 80GB |
 | [`NVIDIA/SANA-WM.md`](./NVIDIA/SANA-WM.md) | First-frame image-to-video serving with camera control | 1x 24GB+ CUDA GPU; ~40GB disk |
