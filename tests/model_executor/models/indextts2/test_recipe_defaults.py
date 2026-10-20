@@ -6,6 +6,8 @@ from pathlib import Path
 import pytest
 import yaml
 
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
 
 def test_indextts25_default_recipe_enables_validated_cfm_batching():
     recipe_path = Path(__file__).parents[4] / "vllm_omni" / "deploy" / "indextts2_5.yaml"
