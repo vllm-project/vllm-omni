@@ -43,6 +43,9 @@ from vllm_omni.outputs import OmniRequestOutput
 logger = init_logger(__name__)
 
 SERVER_STARTUP_TIMEOUT_S = 2400
+# Diffusion workers alone may need 15s + 5s + 5s for cooperative cleanup
+# and signal escalation. Keep their tracker alive while the API owns teardown.
+SERVER_SHUTDOWN_TIMEOUT_S = 60
 
 PromptAudioInput = list[tuple[Any, int]] | tuple[Any, int] | None
 PromptImageInput = list[Any] | Any | None
@@ -340,7 +343,7 @@ class OmniServer:
             # 2. Give the parent time to shut down its children cleanly.
             parent_exited = False
             try:
-                parent.wait(timeout=15)
+                parent.wait(timeout=SERVER_SHUTDOWN_TIMEOUT_S)
                 parent_exited = True
             except psutil.NoSuchProcess:
                 parent_exited = True

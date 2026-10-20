@@ -6,6 +6,13 @@ The vllm bench command launches the vLLM-Omni benchmark to evaluate the performa
 
 vLLM-Omni registers the `openai-chat-omni`, `openai-audio-speech`, `openai-image-edits-omni`, `daily-omni`, `openai-realtime-duplex`, `openai-realtime-tts`, and `openai-realtime-chat` serving benchmark backends. It also adds the `omniinteract` dataset.
 
+`openai-chat-omni` retries explicit `ServiceUnavailableError` responses with
+code 503 up to three times, provided no text, reasoning, tool, audio, or image
+output has arrived. This includes retryable multimodal cache misses reported
+inside an HTTP 200 SSE stream. Other server errors and partial responses remain
+failed requests. Request latency and time to first output include failed
+attempts and retry delays.
+
 ## Basic Parameter Description
 
 You can use `vllm bench serve --omni --help=all` to get descriptions of all parameters. The commonly used parameters are described below:

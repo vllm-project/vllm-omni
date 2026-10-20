@@ -454,7 +454,6 @@ class DiffusionLoRAManager:
             peft_helper = PEFTHelper.from_local_dir(
                 lora_path,
                 max_position_embeddings=None,  # no need in diffusion
-                tensorizer_config_dict=lora_request.tensorizer_config_dict,
             )
 
             lora_model = LoRAModel.from_local_checkpoint(
@@ -465,7 +464,6 @@ class DiffusionLoRAManager:
                 device="cpu",  # consistent w/ vllm's behavior
                 dtype=self.dtype,
                 model_vocab_size=None,
-                tensorizer_config_dict=lora_request.tensorizer_config_dict,
                 weights_mapper=None,
             )
         else:

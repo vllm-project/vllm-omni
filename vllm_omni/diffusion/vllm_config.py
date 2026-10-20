@@ -79,6 +79,9 @@ class _DiffusionVllmModelConfig:
     hf_text_config: Any | None = None
     multimodal_config: Any | None = None
     enforce_eager: bool = False
+    # Omni manages diffusion sleep/offload itself; native attention still
+    # queries this flag when selecting its CUDA graph pool.
+    sleep_mode_offload_cudagraph: bool = False
     disable_cascade_attn: bool = False
     enable_return_routed_experts: bool = False
     enable_prompt_embeds: bool = False

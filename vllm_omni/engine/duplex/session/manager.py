@@ -58,7 +58,7 @@ from vllm_omni.engine.duplex.messages import (
 from vllm_omni.engine.duplex.plugin import DuplexModelPlugin, DuplexRuntimeConfigError, validate_duplex_plugin_sampling
 from vllm_omni.engine.duplex.session.engine_session import DuplexEngineSession, DuplexFenceMismatchError
 from vllm_omni.engine.duplex.session.lease import DuplexLeaseActivity, DuplexLeaseConfig, DuplexLeaseState
-from vllm_omni.engine.duplex.turn_detection import SileroVADBackendProvider
+from vllm_omni.engine.duplex.turn_detection import SileroVADBackendProvider, SmartTurnBackendProvider
 
 if TYPE_CHECKING:
     import janus
@@ -141,6 +141,10 @@ class DuplexSessionManager:
         #: on the first session that actually turns server VAD on.
         self.vad_backend_provider = SileroVADBackendProvider(
             model_path=getattr(runtime_config, "server_vad_model_path", None)
+        )
+        #: Likewise one Smart Turn classifier for every ``semantic_vad`` session.
+        self.semantic_vad_backend_provider = SmartTurnBackendProvider(
+            model_path=getattr(runtime_config, "semantic_vad_model_path", None)
         )
         self.runners: dict[str, DuplexSessionRunner] = {}
         self._outputs: dict[str, DuplexOutputBuffer] = {}

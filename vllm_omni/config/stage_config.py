@@ -689,6 +689,9 @@ class DuplexSessionRuntimeConfig:
     # parse, and goes away with the PR that ports the last of them.
     completed_append_cache_size: int = 256
     server_vad_model_path: str | None = None
+    # Local Smart Turn v3.2 ONNX artifact for ``turn_detection: semantic_vad``;
+    # null resolves the pinned file from the Hugging Face cache.
+    semantic_vad_model_path: str | None = None
     # Experimental Qwen heard-text calibration. Server-owned URL; never accept
     # a transcription endpoint from a client session.update.
     history_asr_url: str | None = None
@@ -775,6 +778,10 @@ class DuplexSessionRuntimeConfig:
             not isinstance(self.server_vad_model_path, str) or not self.server_vad_model_path.strip()
         ):
             raise ValueError("duplex_session.server_vad_model_path must be a non-empty string or null")
+        if self.semantic_vad_model_path is not None and (
+            not isinstance(self.semantic_vad_model_path, str) or not self.semantic_vad_model_path.strip()
+        ):
+            raise ValueError("duplex_session.semantic_vad_model_path must be a non-empty string or null")
         for name, value in positive.items():
             if value <= 0:
                 raise ValueError(f"duplex_session.{name} must be positive")

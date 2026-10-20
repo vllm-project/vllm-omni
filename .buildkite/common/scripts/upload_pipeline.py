@@ -14,8 +14,9 @@ Test pipeline mode (e.g. test-merge.yml, test-nightly.yml, test-weekly.yml):
   - Drop steps whose ``source_file_dependencies`` do not match changed files
     (string/list keys from ci_source_file_dependencies.yml, or inline path
     prefixes). Filtering applies on **PR label** uploads and on post-merge
-    ``main`` L3 uploads. Scheduled ``main`` uploads that pass ``--all``
-    (NIGHTLY/WEEKLY) or ``--e2e`` keep every selected job and still strip
+    release-line L3 uploads (``main`` or a ``release/vX.Y.Z`` branch). Scheduled
+    release-line uploads that pass ``--all`` (NIGHTLY/WEEKLY) or ``--e2e``
+    keep every selected job and still strip
     the field. A diff limited to the pipeline YAML being uploaded or to paths
     under ``source_filter_fallback`` keeps every job, even if a job lists a
     shared path. For mixed diffs, narrow coverage only when a non-fallback file
@@ -62,10 +63,28 @@ except ModuleNotFoundError:
     )
     import yaml
 
-from skip_ci import (
+from ci_conditions import (
+    BOOTSTRAP_DISABLED_IF,
+    BOOTSTRAP_ENABLED_IF,
+    BOOTSTRAP_IMAGE_BUILD_KEYS,
+    BOOTSTRAP_STEPS_FILENAME,
+    BOOTSTRAP_UPLOAD_IF_KEYS,
+    CI_MIRROR_HARDWARES_PATH,
+    CI_SOURCE_FILE_DEPENDENCIES_PATH,
+    CUDA_HF_TOKEN_EXPORT,
+    E2E_GROUP_MARKER,
+    MERGE_UPLOAD_IF,
+    NIGHTLY_LABEL_IF,
+    NIGHTLY_MAIN_IF,
+    READY_LABEL_IF,
+    READY_UPLOAD_IF,
     ROOT,
-    resolve_ci_context_from_git,
+    SOURCE_FILTER_FALLBACK_KEY,
+    WEEKLY_E2E_IF,
+    WEEKLY_LABEL_IF,
+    WEEKLY_MAIN_IF,
 )
+from skip_ci import resolve_ci_context_from_git
 
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -78,53 +97,7 @@ from tests.helpers.mark import (  # noqa: E402
 # --- Constants ---
 
 LOG = "upload_pipeline"
-BOOTSTRAP_STEPS_FILENAME = "bootstrap-upload-steps.yml"
-BOOTSTRAP_IMAGE_BUILD_KEYS = frozenset(
-    {
-        "image-build",
-        "image-build-a2",
-        "image-build-a3",
-        "image-build-a5",
-        "image-build-310p",
-    }
-)
-BOOTSTRAP_UPLOAD_IF_KEYS = {
-    "upload-ready-pipeline": "ready",
-    "upload-merge-pipeline": "merge",
-    "upload-nightly-pipeline": "nightly",
-    "upload-weekly-pipeline": "weekly",
-}
-E2E_GROUP_MARKER = "E2E Test"
-CI_MIRROR_HARDWARES_PATH = ROOT / ".buildkite/common/ci_mirror_hardwares.yml"
-CI_SOURCE_FILE_DEPENDENCIES_PATH = ROOT / ".buildkite/common/ci_source_file_dependencies.yml"
-# Registry key whose prefixes bypass source filtering. Paths live in
-# ci_source_file_dependencies.yml; do not attach this key to a job.
-SOURCE_FILTER_FALLBACK_KEY = "source_filter_fallback"
-CUDA_HF_TOKEN_ENV = "VLLM_CI_HF_TOKEN"
-CUDA_HF_TOKEN_EXPORT = f'if [ -n "$${{{CUDA_HF_TOKEN_ENV}:-}}" ]; then export HF_TOKEN="$${{{CUDA_HF_TOKEN_ENV}}}"; fi'
 CUDA_RUNTIME_CHECK = "python3 .buildkite/cuda/scripts/check_vllm_runtime.py"
-
-# Bootstrap Buildkite ``if`` expressions.
-# ``*_MAIN_IF``: main + env schedule. ``*_LABEL_IF``: PR label (and/or composed with MAIN).
-# ``*_UPLOAD_IF``: full gate for uploading that child pipeline.
-NIGHTLY_MAIN_IF = 'build.branch == "main" && build.env("NIGHTLY") == "1"'
-NIGHTLY_LABEL_IF = (
-    f'({NIGHTLY_MAIN_IF}) || (build.branch != "main" && build.pull_request.labels includes "nightly-test")'
-)
-WEEKLY_E2E_IF = 'build.branch == "main" && build.env("WEEKLY") == "1"'
-WEEKLY_MAIN_IF = 'build.branch == "main" && (build.env("WEEKLY") == "1" || build.env("NON_CRITICAL") == "1")'
-WEEKLY_LABEL_IF = f'({WEEKLY_MAIN_IF}) || (build.branch != "main" && build.pull_request.labels includes "weekly-test")'
-READY_LABEL_IF = 'build.branch != "main" && build.pull_request.labels includes "ready"'
-MERGE_LABEL_IF = 'build.branch != "main" && build.pull_request.labels includes "merge-test"'
-MERGE_MAIN_IF = (
-    'build.branch == "main" && build.env("NIGHTLY") != "1" && '
-    'build.env("WEEKLY") != "1" && build.env("NON_CRITICAL") != "1"'
-)
-READY_UPLOAD_IF = f"({WEEKLY_E2E_IF}) || ({READY_LABEL_IF})"
-MERGE_UPLOAD_IF = f"({WEEKLY_E2E_IF}) || (({MERGE_MAIN_IF}) || ({MERGE_LABEL_IF}))"
-BOOTSTRAP_DISABLED_IF = "false"
-BOOTSTRAP_ENABLED_IF = "true"
-
 
 # --- Logging ---
 
@@ -252,7 +225,7 @@ def _render_bootstrap_pipeline(
     platform = _get_bootstrap_platform(path)
     if_exprs = _compute_bootstrap_if_exprs(decision=decision, platform=platform)
     doc["steps"] = _apply_bootstrap_if(steps, if_exprs)
-    return yaml.safe_dump(doc, sort_keys=False)
+    return yaml.safe_dump(doc, sort_keys=False, width=4096)
 
 
 # --- Test pipeline (test-ready.yml, test-merge.yml, test-nightly.yml) ---
@@ -792,8 +765,8 @@ def _changed_files_for_source_filter(
     """Return the diff to filter against, or None to keep every step.
 
     ``--all`` / ``--e2e`` disable filtering (scheduled NIGHTLY/WEEKLY full
-    uploads and weekly E2E sweeps). Post-merge ``main`` L3 and PR-label
-    uploads filter against the commit/PR diff. Pipeline YAML /
+    uploads and weekly E2E sweeps). Post-merge release-line L3 (``main`` or
+    ``release/vX.Y.Z``) and PR-label uploads filter against the commit/PR diff. Pipeline YAML /
     ``source_filter_fallback`` matches are applied later in
     ``_render_test_pipeline`` when no non-fallback file matches a job-key prefix.
     Otherwise, normal filtering uses all changed files, including shared helpers.
@@ -832,7 +805,7 @@ def _render_pipeline(
         pipeline_path=path,
         e2e_only=e2e_only,
     )
-    return yaml.safe_dump(doc, sort_keys=False)
+    return yaml.safe_dump(doc, sort_keys=False, width=4096)
 
 
 def _upload_to_buildkite(content: str) -> None:

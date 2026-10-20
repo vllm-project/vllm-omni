@@ -1389,14 +1389,20 @@ class ModelChannel:
                 await self._release_ephemeral_request(data_plane_request_id, whole_turn=True)
                 if drained_response_id is not None:
                     playback = session.playback_for_response(drained_response_id).as_dict()
-                    session.release_finished_drain_response(drained_response_id)
+                    committed = session.release_finished_drain_response(
+                        drained_response_id, require_audio_complete=self._ctx.history_calibration is not None
+                    )
+                    if committed:
+                        settle_response_runtime(
+                            self._ctx.plugin, session, committed=True, response_id=drained_response_id
+                        )
                     self._out.emit(
                         {
                             "type": "response.done",
                             "session_id": session.session_id,
                             "response_id": drained_response_id,
                             "epoch": session.epoch,
-                            "committed": False,
+                            "committed": committed,
                             "status": "completed",
                             "playback": playback,
                         }
@@ -1413,7 +1419,7 @@ class ModelChannel:
                     data_plane.mark_terminal(data_plane_request_id)
             should_commit = self.should_commit_response_to_history(session, response_id)
             committed_message = session.end_response(commit_text=should_commit, preserve_request=auto_response)
-            self._settle_finished_response(
+            committed = self._settle_finished_response(
                 session,
                 response_id,
                 should_commit=should_commit,
@@ -1422,34 +1428,42 @@ class ModelChannel:
             model_turn_id = coerce_int(model_result.get("model_turn_id"))
             if model_turn_id is not None:
                 session.complete_model_turn(model_turn_id)
-            if should_commit:
-                session.register_history_item(f"item_{response_id}", committed_message)
             self._out.emit(
                 {
                     "type": "response.done",
                     "session_id": session.session_id,
                     "response_id": response_id,
                     "epoch": session.epoch,
-                    "committed": committed_message is not None,
+                    "committed": committed,
                     "playback": session.playback.as_dict(),
                 }
             )
             await self._release_ephemeral_request(data_plane_request_id, whole_turn=True)
         return close_reason, emitted_response
 
-    def _settle_finished_response(self, session, response_id, *, should_commit: bool, committed_message) -> None:
+    def _settle_finished_response(self, session, response_id, *, should_commit: bool, committed_message) -> bool:
+        """Store the final history before reconciling an ACK received earlier."""
+        committed = committed_message is not None
+        # Inspect the cursor before finalization releases response-owned state.
+        awaiting_playback = _response_awaits_playback_ack(
+            session, response_id, should_commit=should_commit, committed_message=committed_message
+        )
+        if should_commit:
+            session.register_history_item(f"item_{response_id}", committed_message)
+            committed = (
+                session.finalize_response_playback(
+                    response_id, require_audio_complete=self._ctx.history_calibration is not None
+                )
+                or committed
+            )
         settle_response_runtime(
             self._ctx.plugin,
             session,
-            committed=committed_message is not None,
-            awaiting_playback=_response_awaits_playback_ack(
-                session,
-                response_id,
-                should_commit=should_commit,
-                committed_message=committed_message,
-            ),
+            committed=committed,
+            awaiting_playback=awaiting_playback and not committed,
             response_id=response_id if isinstance(response_id, str) else None,
         )
+        return committed
 
     def _end_active_response_before_future_model_turn(self, *, model_turn_id: int | None) -> None:
         session = self._ctx.session
@@ -1464,21 +1478,19 @@ class ModelChannel:
         session.complete_model_turn(int(model_turn_id) - 1)
         should_commit = self.should_commit_response_to_history(session, response_id)
         committed_message = session.end_response(commit_text=should_commit, preserve_request=True)
-        self._settle_finished_response(
+        committed = self._settle_finished_response(
             session,
             response_id,
             should_commit=should_commit,
             committed_message=committed_message,
         )
-        if should_commit:
-            session.register_history_item(f"item_{response_id}", committed_message)
         self._out.emit(
             {
                 "type": "response.done",
                 "session_id": session.session_id,
                 "response_id": response_id,
                 "epoch": session.epoch,
-                "committed": committed_message is not None,
+                "committed": committed,
                 "playback": session.playback.as_dict(),
             }
         )
@@ -1687,21 +1699,19 @@ class ModelChannel:
             if response_id is not None and not session.response_has_draining_request(response_id):
                 should_commit = self.should_commit_response_to_history(session, response_id)
                 committed_message = session.end_response(commit_text=should_commit, preserve_request=auto_response)
-                self._settle_finished_response(
+                committed = self._settle_finished_response(
                     session,
                     response_id,
                     should_commit=should_commit,
                     committed_message=committed_message,
                 )
-                if should_commit and committed_message is not None:
-                    session.register_history_item(f"item_{response_id}", committed_message)
                 self._out.emit(
                     {
                         "type": "response.done",
                         "session_id": session.session_id,
                         "response_id": response_id,
                         "epoch": session.epoch,
-                        "committed": committed_message is not None if should_commit else False,
+                        "committed": committed,
                         "playback": session.playback.as_dict(),
                     }
                 )
