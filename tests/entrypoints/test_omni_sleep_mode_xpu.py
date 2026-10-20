@@ -15,6 +15,7 @@ from tests.entrypoints.test_omni_sleep_mode import (
     _get_device_global_memory_used_gib as _shared_get_device_global_memory_used_gib,
 )
 from tests.entrypoints.test_omni_sleep_mode import get_ack_info
+from tests.helpers.mark import hardware_marks, hardware_test
 from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -111,6 +112,7 @@ async def diffusion_engine():
     await asyncio.sleep(1.5)
 
 
+@hardware_test(res={"xpu": "B70"}, num_cards=2)
 class TestOmniSleepMode:
     @pytest.mark.asyncio
     async def test_llm_sleep_ack(self, llm_engine: AsyncOmni):
@@ -346,6 +348,7 @@ class TestOmniSleepMode:
 @pytest.mark.advanced_model
 @pytest.mark.parametrize("tp_size", [1])
 @pytest.mark.asyncio
+@hardware_test(res={"xpu": "B70"}, num_cards=2)
 async def test_diffusion_model_sleep_tp(tp_size: int):
     """Two-stage BAGEL default config: warmup, sleep all, wake, verify generate."""
     num_gpus = torch.accelerator.device_count()
@@ -390,6 +393,7 @@ async def test_diffusion_model_sleep_tp(tp_size: int):
 @pytest.mark.advanced_model
 @pytest.mark.parametrize("tp_size", [1])
 @pytest.mark.asyncio
+@hardware_test(res={"xpu": "B70"}, num_cards=2)
 async def test_multistage_sleep_b70(tp_size: int):
     """Explicit 3-stage Qwen2.5-Omni config; sleep/wake all stages."""
     num_gpus = torch.accelerator.device_count()
@@ -497,7 +501,13 @@ async def test_multistage_sleep_b70(tp_size: int):
 
 @pytest.mark.omni
 @pytest.mark.advanced_model
-@pytest.mark.parametrize("tp_size", [1, 2])
+@pytest.mark.parametrize(
+    "tp_size",
+    [
+        pytest.param(1, marks=hardware_marks(res={"xpu": "B70"}, num_cards=1)),
+        pytest.param(2, marks=hardware_marks(res={"xpu": "B70"}, num_cards=2)),
+    ],
+)
 @pytest.mark.asyncio
 async def test_pure_diffusion_scenario(tp_size: int):
     """Single-stage random diffusion: sleep, wake, generate."""
