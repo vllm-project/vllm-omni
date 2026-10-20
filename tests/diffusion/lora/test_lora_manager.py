@@ -2078,7 +2078,7 @@ def test_compose_lora_models_rejects_rank_sum_over_limit():
         manager._compose_lora_models(101, [(model1, 1.0), (model2, 1.0)])
 
 
-def test_compose_lora_models_rejects_packed_weights():
+def test_compose_lora_models_rejects_mixed_packed_and_fused_layouts():
     from vllm.lora.lora_weights import PackedLoRALayerWeights
 
     manager = DiffusionLoRAManager(
@@ -2098,7 +2098,7 @@ def test_compose_lora_models_rejects_packed_weights():
     model1 = LoRAModel(lora_model_id=1, rank=2, loras={"transformer.to_qkv": packed})
     model2 = _make_lora_model(2, {"transformer.to_qkv": (torch.ones(2, 4), torch.ones(6, 2))})
 
-    with pytest.raises(NotImplementedError, match="packed LoRA"):
+    with pytest.raises(ValueError, match="packed and fused"):
         manager._compose_lora_models(102, [(model1, 1.0), (model2, 1.0)])
 
 
@@ -2299,3 +2299,50 @@ def test_stacked_scale_keys_match_scheduler_batch_key():
     # The first three combos must stay distinct (they differ at/below the
     # canonical quantization step), so each gets its own composed adapter.
     assert len(set(keys)) == len(scale_sets)
+
+
+@pytest.mark.parametrize("scales", [(0.65, 1.0), (0.0, 1.0), (-0.5, 0.7)])
+def test_compose_h3_packed_and_separate_projections(scales):
+    from vllm.lora.lora_weights import PackedLoRALayerWeights
+
+    manager = DiffusionLoRAManager(
+        pipeline=torch.nn.Module(), device=torch.device("cpu"), dtype=torch.float32, max_cached_adapters=3
+    )
+    manager._packed_modules_mapping = {"qkv_proj": ["to_q", "to_k", "to_v"]}
+    generator = torch.Generator().manual_seed(42)
+    packed_weights = {}
+    separate_weights = {}
+    expected = {}
+    for module, slices in (("attn.qkv_proj", 3), ("mlp.fc1", 2)):
+        name = f"transformer.blocks.0.{module}"
+        a = [torch.randn(2, 4, generator=generator) for _ in range(slices)]
+        b = [torch.randn(6, 2, generator=generator) for _ in range(slices)]
+        packed_weights[name] = PackedLoRALayerWeights(
+            module_name=name, rank=2, lora_alphas=[2] * slices, lora_a=a, lora_b=b, scaling=[1.0] * slices
+        )
+        a2 = [torch.randn(3, 4, generator=generator) for _ in range(slices)]
+        b2 = [torch.randn(6, 3, generator=generator) for _ in range(slices)]
+        if module == "attn.qkv_proj":
+            for index, suffix in enumerate(("to_q", "to_k", "to_v")):
+                sub_name = f"transformer.blocks.0.attn.{suffix}"
+                separate_weights[sub_name] = LoRALayerWeights(
+                    sub_name, 3, 3, lora_a=a2[index], lora_b=b2[index], scaling=1.0
+                )
+                expected[sub_name] = scales[0] * b[index] @ a[index] + scales[1] * b2[index] @ a2[index]
+        else:
+            separate_weights[name] = PackedLoRALayerWeights(name, 3, [3] * slices, a2, b2, scaling=[1.0] * slices)
+            expected[name] = [scales[0] * b[i] @ a[i] + scales[1] * b2[i] @ a2[i] for i in range(slices)]
+    first = LoRAModel(lora_model_id=1, rank=2, loras=packed_weights)
+    second = LoRAModel(lora_model_id=2, rank=3, loras=separate_weights)
+    composed, _ = manager._compose_lora_models(101, [(first, scales[0]), (second, scales[1])])
+    for name, delta in expected.items():
+        weights = composed.loras[name]
+        if isinstance(delta, list):
+            for slice_a, slice_b, target in zip(weights.lora_a, weights.lora_b, delta):
+                torch.testing.assert_close(slice_b @ slice_a, target)
+        else:
+            assert isinstance(weights.lora_a, torch.Tensor)
+            assert isinstance(weights.lora_b, torch.Tensor)
+            torch.testing.assert_close(weights.lora_b @ weights.lora_a, delta)
+    assert set(first.loras) == set(packed_weights)
+    assert first.loras["transformer.blocks.0.attn.qkv_proj"] is packed_weights["transformer.blocks.0.attn.qkv_proj"]

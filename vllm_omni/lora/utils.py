@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -66,4 +66,26 @@ def build_lora_batch_key(
     )
 
 
-__all__ = ["LORA_SCALE_ROUND_DECIMALS", "build_lora_batch_key", "round_lora_scale", "stable_lora_int_id"]
+def filter_active_lora_adapters(
+    lora_request: LoRARequest | list[LoRARequest] | None,
+    lora_scale: float | list[float],
+) -> tuple[tuple[LoRARequest, float], ...]:
+    """Return request-scale pairs, excluding requests whose scale is zero."""
+    requests = lora_request
+    if requests is None:
+        return ()
+    requests = requests if isinstance(requests, (list, tuple)) else [requests]
+    scales = lora_scale
+    scales = scales if isinstance(scales, (list, tuple)) else [scales] * len(requests)
+    if len(requests) != len(scales):
+        raise ValueError("LoRA request and scale counts must match")
+    return tuple((request, scale) for request, scale in zip(requests, scales) if scale != 0.0)
+
+
+__all__ = [
+    "LORA_SCALE_ROUND_DECIMALS",
+    "build_lora_batch_key",
+    "filter_active_lora_adapters",
+    "round_lora_scale",
+    "stable_lora_int_id",
+]

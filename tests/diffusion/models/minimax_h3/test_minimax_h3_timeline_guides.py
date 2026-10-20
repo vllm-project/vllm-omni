@@ -197,7 +197,7 @@ def _guide_pipeline():
     pipeline._quality_policy.resolve.return_value = SimpleNamespace(cache_dit=None)
     pipeline._cache_dit_runtime = SimpleNamespace(prepare=lambda spec: None)
     pipeline._turbo_lora_specs = {}
-    pipeline._native_lora_adapter_ids = set()
+    pipeline._native_distilled_lora_adapter_ids = set()
     pipeline._lora_sigma_schedules = {}
     return pipeline
 

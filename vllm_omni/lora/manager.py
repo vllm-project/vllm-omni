@@ -39,6 +39,29 @@ from vllm_omni.lora.utils import round_lora_scale, stable_lora_int_id
 logger = init_logger(__name__)
 
 
+def repack_lora_weights(
+    loras: dict[str, LoRALayerWeights],
+    packed_slices: dict[str, list[str]],
+    rank: int,
+) -> dict[str, LoRALayerWeights]:
+    """Reassemble composed slices into packed layers without changing the input mapping."""
+    composed_loras = dict(loras)
+    for name, slice_names in packed_slices.items():
+        if name in composed_loras:
+            raise ValueError(f"Cannot mix packed and fused LoRA layouts for {name}")
+        slices = [composed_loras.pop(slice_name, None) for slice_name in slice_names]
+        composed_loras[name] = PackedLoRALayerWeights(
+            module_name=name,
+            rank=rank,
+            lora_alphas=[None if weights is None else weights.rank for weights in slices],
+            lora_a=[None if weights is None else weights.lora_a for weights in slices],
+            lora_b=[None if weights is None else weights.lora_b for weights in slices],
+            scaling=[1.0] * len(slices),
+        )
+
+    return composed_loras
+
+
 def _moe_lora_proj_names(moe_config: object | None) -> list[str]:
     """Map PEFT projection names to upstream ``[w1, w2, w3]`` order.
 
@@ -564,6 +587,46 @@ class LoRAManager:
         )
         return composed_id
 
+    def unpack_lora_projections(
+        self, specs: list[tuple[LoRAModel, float]]
+    ) -> tuple[list[tuple[LoRAModel, float]], dict[str, list[str]]]:
+        """Normalize packed and separate projections to named slices for composition."""
+        repack: dict[str, list[str]] = {}
+        normalized_specs: list[tuple[LoRAModel, float]] = []
+        for model, scale in specs:
+            normalized = dict(model.loras)
+            for name, weights in model.loras.items():
+                if not isinstance(weights, PackedLoRALayerWeights):
+                    continue
+                prefix, _, suffix = name.rpartition(".")
+                mapping = self._packed_modules_mapping.get(suffix)
+                if mapping is not None and len(mapping) != len(weights.lora_a):
+                    raise ValueError(f"Packed LoRA slice count does not match mapping for {name}")
+                names = (
+                    [f"{prefix}.{sub}" if prefix else sub for sub in mapping]
+                    if mapping is not None
+                    else [f"{name}.__slice_{index}" for index in range(len(weights.lora_a))]
+                )
+                if mapping is None:
+                    repack[name] = names
+                del normalized[name]
+                for index, sub_name in enumerate(names):
+                    a, b = weights.lora_a[index], weights.lora_b[index]
+                    if a is None or b is None:
+                        continue
+                    if sub_name in normalized:
+                        raise ValueError(f"LoRA contains both packed and separate weights for {sub_name}")
+                    normalized[sub_name] = LoRALayerWeights(
+                        module_name=sub_name,
+                        rank=a.shape[0],
+                        lora_alpha=weights.lora_alphas[index],
+                        lora_a=a,
+                        lora_b=b,
+                        scaling=weights.scaling[index],
+                    )
+            normalized_specs.append((LoRAModel(lora_model_id=model.id, rank=model.rank, loras=normalized), scale))
+        return normalized_specs, repack
+
     def _compose_lora_models(
         self,
         composed_id: int,
@@ -576,6 +639,7 @@ class LoRAManager:
         the output dim: sum(scale_i * B_i @ A_i @ x) == B_cat @ A_cat @ x.
         Modules covered by only some adapters take just their contributions.
         """
+        specs, repack = self.unpack_lora_projections(specs)
         module_names: set[str] = set()
         for lora_model, _ in specs:
             module_names.update(lora_model.loras.keys())
@@ -590,11 +654,6 @@ class LoRAManager:
                 weights = lora_model.loras.get(module_name)
                 if weights is None:
                     continue
-                if isinstance(weights, PackedLoRALayerWeights):
-                    raise NotImplementedError(
-                        f"Cannot compose packed LoRA weights for module {module_name}; "
-                        "stacking adapters on packed layers is not supported."
-                    )
                 lora_a_parts.append(weights.lora_a)
                 # Fold the checkpoint scaling into B: pipelines with
                 # scale-in-epilogue skip optimize(), so weights.scaling may
@@ -620,6 +679,8 @@ class LoRAManager:
                 lora_b=torch.cat(lora_b_parts, dim=1),
                 scaling=1.0,
             )
+
+        composed_loras = repack_lora_weights(composed_loras, repack, max_composed_rank)
 
         if not composed_loras:
             raise ValueError("Cannot compose LoRA adapters: none of the adapters cover any module.")
