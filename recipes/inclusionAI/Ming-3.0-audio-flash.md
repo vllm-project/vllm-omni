@@ -283,14 +283,16 @@ jq -r '.choices[0].message.audio.data' response.json \
 
 Full Flash/Tiny speech-output profiles enable `normalize_text: true` and `tn_mode: upstream`.
 Install the `ming-tn` optional dependencies in the serving environment (`pynini==2.1.7` and `inflect`).
-The native Talker reads the four `{zh,en}_tn_{tagger,verbalizer}.fst` files from the selected model's `talker/talker_tn/` directory; vLLM-Omni does not bundle these binary files.
+The native Talker reads `talker_re.json` and the four `{zh,en}_tn_{tagger,verbalizer}.fst` files from the selected model's `talker/talker_tn/` directory; vLLM-Omni does not bundle these resources.
 The checkpoint resolver includes this directory in its `talker/**` download, and `--revision` selects the same snapshot for weights and normalization rules. A complete local export or cached snapshot works offline.
 
-Upstream normalization reports missing dependencies or graph files instead
+Upstream normalization reports missing dependencies, rules or graph files instead
 of silently changing the spoken-text rules. Keep `talker/talker_tn/` when
 copying an export for speech output. Explicit `tn_mode: legacy` or
 `normalize_text: false` does not require these graphs and can change the
-pronunciation of numbers, dates and amounts. Text-only ASR does not load them.
+pronunciation of numbers, dates and amounts. Legacy mode segments text and
+expands English numbers without the upstream Chinese RE/FST rules.
+Text-only ASR does not load these resources.
 
 ## Standalone text to speech
 

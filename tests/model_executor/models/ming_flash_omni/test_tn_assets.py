@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Checkpoint-owned Ming TN resources, without network or model weights."""
 
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -25,6 +26,14 @@ def test_upstream_tn_reports_incomplete_model_assets(tmp_path):
         TalkerTN(tmp_path)
     assert str(tmp_path) in str(error.value)
     assert "en_tn_verbalizer.fst" in str(error.value)
+
+
+def test_upstream_tn_requires_checkpoint_re_rules(tmp_path):
+    for lang in ("zh", "en"):
+        for kind in ("tagger", "verbalizer"):
+            (tmp_path / f"{lang}_tn_{kind}.fst").touch()
+    with pytest.raises(FileNotFoundError, match=r"talker_re\.json"):
+        TalkerTN(tmp_path)
 
 
 def test_talker_validates_upstream_tn_before_constructing_models(tmp_path, mocker):
@@ -79,7 +88,21 @@ def test_checkpoint_graphs_are_read_by_native_code(tmp_path: Path):
         pynini.cross(source, tagged).write(str(tmp_path / f"{lang}_tn_tagger.fst"))
         pynini.cross(tagged, spoken).write(str(tmp_path / f"{lang}_tn_verbalizer.fst"))
     (tmp_path / "__init__.py").write_text("raise RuntimeError('Remote model code must not execute')")
+    (tmp_path / "talker_re.json").write_text(
+        json.dumps(
+            {
+                "money": {},
+                "measure_before": {},
+                "measure_after": {},
+                "serial_before": {},
+                "serial_after": {},
+                "char_map0": {},
+                "proper_noun": {"原文": "甲"},
+            }
+        )
+    )
     tn = TalkerTN(tmp_path)
+    assert tn("原文") == "乙"
     assert tn("甲") == "乙"
     assert tn("word") == "spoken"
     assert segment_and_normalize("word", tn_mode="upstream", normalizer=tn) == ["spoken"]
@@ -92,6 +115,7 @@ def test_missing_pynini_has_install_guidance(tmp_path, monkeypatch):
     for lang in ("zh", "en"):
         for kind in ("tagger", "verbalizer"):
             (tmp_path / f"{lang}_tn_{kind}.fst").touch()
+    (tmp_path / "talker_re.json").write_text("{}")
     original_import = builtins.__import__
 
     def without_pynini(name, *args, **kwargs):

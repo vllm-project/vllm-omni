@@ -16,6 +16,7 @@ class TalkerTN:
     def __init__(self, resource_dir: str | Path):
         resource_dir = Path(resource_dir)
         required = [f"{lang}_tn_{kind}.fst" for lang in ("zh", "en") for kind in ("tagger", "verbalizer")]
+        required.append("talker_re.json")
         missing = [name for name in required if not (resource_dir / name).is_file()]
         if missing:
             raise FileNotFoundError(
@@ -33,9 +34,7 @@ class TalkerTN:
 
         self.talker_pre_processor = TalkerPreProcessor()
         self.talker_re = TalkerRE()
-        default_re_cfg = Path(__file__).with_name("talker_re.json")
-        if default_re_cfg.is_file():
-            self.talker_re.update(default_re_cfg)
+        self.talker_re.update(resource_dir / "talker_re.json")
         self.re_contains_chinese = re.compile(r"[一-鿿]")
         self.re_digit_hyphen = re.compile(r"(?<=\d)-(?=\d)")
         self.tn_zh = Normalizer(str(resource_dir / "zh_tn"), ordertype="tn")

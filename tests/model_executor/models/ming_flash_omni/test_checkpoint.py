@@ -30,6 +30,7 @@ def test_prepare_talker_checkpoint_does_not_require_or_link_data(tmp_path: Path,
     (root / "data/voice_name.json").write_text("{}")
     if with_tn:
         (talker / "talker_tn").mkdir()
+        (talker / "talker_tn/talker_re.json").write_text("{}")
         for lang in ("zh", "en"):
             for kind in ("tagger", "verbalizer"):
                 (talker / "talker_tn" / f"{lang}_tn_{kind}.fst").touch()
@@ -41,6 +42,7 @@ def test_prepare_talker_checkpoint_does_not_require_or_link_data(tmp_path: Path,
     if with_tn:
         assert (view / "talker_tn").resolve() == talker / "talker_tn"
         assert len(list((view / "talker_tn").glob("*.fst"))) == 4
+        assert (view / "talker_tn/talker_re.json").read_text() == "{}"
 
     (root / "data/voice_name.json").unlink()
     assert prepare_talker_checkpoint(str(root), cache_dir=str(tmp_path / "cache")) == str(view)
