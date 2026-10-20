@@ -37,9 +37,9 @@
       case 'response.audio_transcript.done': case 'response.output_audio_transcript.done':
         return action('text-final', { role: 'assistant', channel: 'audio', text: event.transcript || '' });
       case 'conversation.item.input_audio_transcription.delta':
-        return action('text', { role: 'user', text: event.delta || '' });
+        return action('text', { role: 'user', text: event.delta || '', itemId: event.item_id || '' });
       case 'conversation.item.input_audio_transcription.completed':
-        return action('text-final', { role: 'user', text: event.transcript || '' });
+        return action('text-final', { role: 'user', text: event.transcript || '', itemId: event.item_id || '' });
       case 'response.done': return action('done');
       case 'session.closed': return action('closed');
       case 'error': {

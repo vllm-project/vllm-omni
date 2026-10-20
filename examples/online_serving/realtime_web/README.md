@@ -9,8 +9,11 @@ This implements [RFC #7222](https://github.com/vllm-project/vllm-omni/issues/722
 | `minicpm-native` | Model-controlled listen/speak, continuous audio input | Frames accompany audio | Yes |
 | `qwen3-turn --manual` | Press **Send turn**; mic pauses while the reply plays | No | No |
 | `qwen3-turn --vad` | Server detects trailing silence; speech interrupts replies | Sampled frames with each spoken turn | Yes |
+| `qwen3-turn --semantic-vad` | Silero detects pauses; Smart Turn checks completion; speech interrupts replies | Sampled frames with each spoken turn | Yes |
 | `aura-ptt` | Hold **Hold to talk**; release commits. Hold also stops local playback | Sticky frames with speech; vision-follow every 2 frames only while unlocked (locked from PTT release until text-final / listen) | Yes |
 | `joyai-turn` | Latest observation once per second while idle, or **Send observation**; waits for response completion and playback | Camera frames without audio input | Yes |
+| `joyai-turn --speech-input` | Hold to talk; release commits speech, then camera observations resume while idle | Latest frame with speech and camera-only observations | Yes |
+| `joyai-turn --speech-input --vad` | Server detects trailing silence; speech interrupts replies | Latest frame with each utterance; no automatic camera-only commits | Yes |
 
 Qwen3 VAD uses an engine-owned duplex plugin: microphone upload continues
 while replies stream, and speech can interrupt generation and playback. The
@@ -30,6 +33,14 @@ python -m examples.online_serving.minicpmo.realtime_web \
 The compatibility wrapper serves the shared assets with `minicpm-native`.
 The current native query, `extra_body`, reference voice, continuous microphone
 upload, camera frames and playback acknowledgements are retained.
+
+With **Camera** enabled, **Mute** first closes the open one-second audio unit
+with silence, then stops microphone uploads but keeps sending fresh video
+frames at 1 fps. These are frame-only MiniCPM VISION inputs, without
+synthetic silence or a client commit; the model decides whether to listen or
+speak. **Unmute** resumes combined microphone/video input. Turning the camera
+off while muted stops input uploads. This requires a backend with MiniCPM
+video-only input support.
 
 ## AURA: push-to-talk duplex
 
@@ -80,9 +91,24 @@ next turn starts after both `response.done` and local playback finish.
 
 Replies appear as text and play through the existing speaker component, which
 sends `playback.ack`. This profile uses camera input and text instructions;
-microphone input will follow the unified Session ASR integration. The browser
-only requests camera permission when **Camera** is enabled. Use localhost or
-HTTPS for browser camera access.
+the default does not request microphone access. The browser only requests camera
+permission when **Camera** is enabled. Use localhost or HTTPS for browser capture.
+
+For spoken instructions, start the `joyai_vl_interaction_asr_duplex.yaml`
+deployment and add `--speech-input` to the UI command. **Hold to talk** captures
+speech with the latest camera frame; releasing it commits only when that hold
+uploaded audio. Empty or muted holds do not submit a turn. Camera-only
+observations resume after the response and playback finish. Incoming speech may
+be buffered during playback; holding the button does not cancel the response.
+
+Add `--speech-input --vad` to commit speech automatically with shared server VAD
+(Silero must be available on the server). Speech interrupts an active reply,
+using the server's supported `interrupt_response: true` setting. Each utterance
+includes the latest camera frame. In this mode automatic camera-only observations
+are paused, so continuous silent watching uses the default camera mode or
+push-to-talk mode.
+The three-stage deployment rejects audio input; use the ASR deployment for both
+microphone modes.
 
 ## Qwen3: explicit-turn Realtime
 
@@ -161,11 +187,84 @@ The bundled duplex deploy allows four audio inputs and eight images per prompt.
 Use headphones to avoid speaker audio triggering VAD interruption. Reference
 voices and tool calls are not supported by this plugin.
 
+### Semantic VAD (Silero + Smart Turn)
+
+Server-side `Duplex VAD` logs include the session ID and `semantic_decision`
+(`smart_turn_complete`, `smart_turn_incomplete`, or `smart_turn_error`) at each
+candidate pause. The final commit also records `commit_reason=semantic_complete`
+or `commit_reason=silence_timeout`, with the last decision for that pause. This
+distinguishes a low completion score from an inference failure when both wait
+for the silence limit. Decisions are logged at candidate pauses and commits,
+not on every audio chunk.
+
+`turn_detection: {"type": "semantic_vad", "eagerness": "auto"}` keeps Silero
+for speech activity and asks the [Smart Turn v3.2](https://github.com/pipecat-ai/smart-turn)
+classifier whether the user has finished whenever Silero hears a pause. A
+complete turn commits at once; a thinking pause stays inside the same utterance
+until speech resumes or the silence reaches the limit. `eagerness` sets both:
+
+| eagerness | pause that asks Smart Turn | longest wait |
+| --- | --- | --- |
+| `high` | 300 ms | 2 s |
+| `medium` / `auto` | 1200 ms | 4 s |
+| `low` | 1500 ms | 8 s |
+
+The default favors avoiding interruptions during clause pauses. A complete
+utterance also waits approximately 1.2 seconds before classification; use
+`high` when lower latency matters more. Timing is measured from received audio
+on Silero's 32 ms frame grid, not from gaps in network delivery. The longest
+wait starts at the actual beginning of the detected silence.
+
+Smart Turn runs once per candidate pause. An incomplete result waits for
+new speech or the silence limit; silence alone does not trigger repeated
+classification. The completion threshold is 0.5 for the pinned INT8 model.
+False completions and false incompletions remain possible, and audio beyond
+the most recent eight seconds is outside the classifier's context.
+The scored window includes the candidate silence: `auto` normally uses about
+1.2 seconds of that context for trailing silence. Changing eagerness therefore
+changes both latency and classifier input; scores measured with a shorter pause
+are not necessarily calibrated identically.
+
+It is available on turn-based sessions; auto-responding (native duplex) sessions
+refuse it.
+
+The engine runs the pinned INT8 artifact
+`pipecat-ai/smart-turn-v3/smart-turn-v3.2-cpu.onnx` on **CPUExecutionProvider**.
+It does not require a GPU and does not download the artifact
+while serving. Pre-download it into the Hugging Face cache, or point the overlay at a
+local copy next to the Silero artifact:
+
+```yaml
+base_config: /path/to/vllm-omni/vllm_omni/deploy/qwen3_omni_duplex.yaml
+duplex_session:
+  server_vad_model_path: /path/to/silero_vad.onnx
+  semantic_vad_model_path: /path/to/smart-turn-v3.2-cpu.onnx
+```
+
+```bash
+hf download pipecat-ai/smart-turn-v3 smart-turn-v3.2-cpu.onnx \
+    --revision f766f81d3cfdf7737ac64aad813d91bbfd56bf93
+```
+
+A missing or mismatched artifact fails the session's first audio chunk with
+`semantic_vad_unavailable`, and turn detection stays off for the rest of that
+session.
+
 ### Using the Qwen3 web UI
 
-The shared UI supports both explicit turns and Server VAD. Use the manual UI
-command above with the turn-based deployment, or start the VAD deployment above
-and launch the UI with `--vad`.
+The shared UI supports explicit turns, Server VAD and Semantic VAD. Use the
+manual UI command above with the turn-based deployment. On a duplex deployment,
+`--vad` retains Silero-only endpointing at 500 ms and requires no Smart Turn
+artifact. Select Semantic VAD explicitly after preparing both model artifacts:
+
+```bash
+python -m examples.online_serving.realtime_web --profile qwen3-turn \
+    --backend ws://127.0.0.1:8091 --semantic-vad --port 7863
+```
+
+Semantic mode uses INT8 Smart Turn on CPU with the `auto` 1200 ms candidate
+pause and 4 s silence limit. Missing Smart Turn artifacts stop the browser
+session with setup guidance; the UI does not silently switch detection modes.
 
 Stop the existing UI process before starting another on the same port, then
 refresh the browser and reconnect. To enable VAD on a default backend, restart
@@ -219,7 +318,7 @@ native camera protocol, where Stage 0 interleaves frames at unit boundaries.
 
 This is a supported subset, not full OpenAI Realtime API compatibility.
 `duplex=1`, `overlap_policy`, `playback.ack`, and `session.close` remain vLLM-Omni
-extensions. This demo does not add WebRTC, semantic VAD, or tool calling.
+extensions. This demo does not add WebRTC or tool calling.
 
 ## Shared host options
 
@@ -234,7 +333,9 @@ This Qwen3 UI profile requires the server-VAD deployment above.
 
 - `--backend` / `--ws-backend`: backend WebSocket origin (not the full `/v1/realtime` URL).
 - `--model`: override the wrapper's model name.
-- `--manual` / `--vad`: Qwen turn control; manual turns are the default.
+- `--manual` / `--vad` / `--semantic-vad`: Qwen turn control; manual turns are
+  the default. `--vad` uses Silero only; `--semantic-vad` requires `qwen3-turn`
+  and both Silero and Smart Turn artifacts (see [Semantic VAD](#semantic-vad-silero--smart-turn)).
 - `--public-realtime-url`: optional browser-visible WebSocket URL; otherwise the
   static host proxies `/v1/realtime` on the same origin.
 - `--host`, `--port`: UI bind address and port (default port 7862).

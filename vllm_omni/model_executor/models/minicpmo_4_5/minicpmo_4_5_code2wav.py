@@ -373,6 +373,9 @@ class MiniCPMO45Code2Wav(nn.Module):
         # competes with the thinker's decode on a shared GPU.
         self._ref_prefetch_enabled = bool(extra.get("token2wav_ref_prefetch", True))
         self._ref_prefetch_setup = bool(extra.get("token2wav_ref_prefetch_setup", False))
+        self._ref_prefetch_max_waiters = int(extra.get("token2wav_ref_prefetch_max_waiters", 1))
+        if self._ref_prefetch_max_waiters < 1:
+            raise ValueError("token2wav_ref_prefetch_max_waiters must be >= 1")
         self._prefetch_queue: OrderedDict[str, _RefPrefetch] = OrderedDict()
         self._prefetch_pins: dict[str, str] = {}
         self._prefetch_setup_holder: str | None = None
@@ -425,6 +428,7 @@ class MiniCPMO45Code2Wav(nn.Module):
             "enabled": bool(extra.get("enable_code2wav_encoder_graph", False)),
             "max_graphs": int(extra.get("code2wav_encoder_max_graphs", 8)),
             "capture_after": int(extra.get("code2wav_encoder_capture_after", 2)),
+            "capture_after_precapture": bool(extra.get("code2wav_encoder_capture_after_precapture", False)),
             "rows": [row for row in encoder_rows if not max_num_seqs or row <= int(max_num_seqs)],
         }
         self._cfm_graph_config = {
@@ -438,10 +442,15 @@ class MiniCPMO45Code2Wav(nn.Module):
             "max_graph_batch": max_graph_batch,
             "micro_batch_size": micro_batch_size,
             "pad_max_rows": extra.get("whole_euler_pad_max_rows"),
-            # The fused body uses tiled TF32 attention on NVIDIA SM80+;
-            # older CUDA devices retain its SDPA fallback. Respect TF32 opt-out.
+            # Default on for CUDA and NPU. CUDA uses tiled TF32 attention on
+            # SM80+ and SDPA otherwise, so it respects the TF32 opt-out; NPU
+            # uses packed QKV, in-place KV and ACLNN AddLayerNorm, independent
+            # of TF32. An explicit ``cfm_fused_body`` overrides either default.
             "fused_body": bool(
-                extra.get("cfm_fused_body", current_omni_platform.is_cuda() and _tf32_mode(extra) != "off")
+                extra.get(
+                    "cfm_fused_body",
+                    (current_omni_platform.is_cuda() and _tf32_mode(extra) != "off") or current_omni_platform.is_npu(),
+                )
             ),
             "slot_pool": bool(extra.get("cfm_slot_pool", False)),
             "row_offset_merge": extra.get("cfm_row_offset_merge", False) is True,
@@ -1306,7 +1315,7 @@ class MiniCPMO45Code2Wav(nn.Module):
 
     @torch.inference_mode()
     def run_idle_prefetch(self) -> bool:
-        """Run one phase of the lone queued prefetch.
+        """Run one phase of a queued prefetch within the waiter limit.
 
         Returns whether a phase ran. The runner ignores the result; callers
         such as the unit tests use it to see which phase ran.
@@ -1315,7 +1324,7 @@ class MiniCPMO45Code2Wav(nn.Module):
         on the same thread as ``forward``: the cold reference work runs through
         the same calls chunk 0 makes, so chunk 0 runs its normal inline path
         and simply hits the warm caches. Phase A (materialize + prepare_prompt)
-        runs only while no stream is live here, no other reference is queued
+        runs only while no stream is live here, the waiter limit is respected
         and a pin is free; by default it then retires the record and chunk 0
         runs setup_batch inline. Only with ``token2wav_ref_prefetch_setup``
         does a later call run phase B (setup_batch).
@@ -1336,7 +1345,9 @@ class MiniCPMO45Code2Wav(nn.Module):
         # that share this GPU, and a phase would compete with it. This keeps
         # the prefetch to a lone request at low concurrency; the queued
         # records are dropped by their own chunk 0 or finish as usual.
-        if len(self._prefetch_queue) > 1:
+        # Explicitly increasing the limit permits bounded concurrency
+        # experiments; each idle call still runs at most one phase.
+        if len(self._prefetch_queue) > self._ref_prefetch_max_waiters:
             return False
         state_id, record = next(iter(self._prefetch_queue.items()))
         with _stage_matmul_policy(self._extra_config()):
@@ -1507,6 +1518,12 @@ class MiniCPMO45Code2Wav(nn.Module):
             logger.info("MiniCPM-o Code2Wav: DiT estimator running on TensorRT (%s)", dtype_name)
             token2wav.enable_trt_spk_embedding()
             logger.info("MiniCPM-o Code2Wav: campplus speaker embedding running on TensorRT")
+        elif current_omni_platform.is_npu():
+            # CAM++ speaker embedding on device via torch (weights loaded from
+            # the same campplus.onnx) — replaces the per-request CPU
+            # onnxruntime run that blocks the host ~120-155ms per request.
+            token2wav.enable_device_spk_embedding()
+            logger.info("MiniCPM-o Code2Wav: campplus speaker embedding running on device (torch)")
         self.backend = BatchedToken2Wav(
             token2wav,
             trt_stepper=trt_stepper,

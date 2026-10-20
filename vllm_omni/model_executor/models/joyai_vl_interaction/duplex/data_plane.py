@@ -43,6 +43,9 @@ class Observation:
 
 
 class JoyAIDataPlane(DuplexDataPlane):
+    joyai_stage_id = 0
+    audio_stage_id = 2
+
     def __init__(self, encode_audio: Callable[..., str]) -> None:
         self.encode_audio = encode_audio
         self.requests: dict[str, Observation] = {}
@@ -85,7 +88,7 @@ class JoyAIDataPlane(DuplexDataPlane):
                 "audio_format": context.response_format,
                 "end_of_turn": False,
             }
-            if stage_id == 0:
+            if stage_id == self.joyai_stage_id:
                 if observation.text_sent:
                     continue
                 action = observation.parse(output)
@@ -113,7 +116,7 @@ class JoyAIDataPlane(DuplexDataPlane):
                         if observation.state is not None:
                             observation.state.last_response_text = action.text
                 yield event
-            elif stage_id == 2:
+            elif stage_id == self.audio_stage_id:
                 completion = next(iter(output.outputs or ()), None)
                 mm = output.multimodal_output or getattr(completion, "multimodal_output", None) or {}
                 audio = mm.get("audio") if isinstance(mm, Mapping) else None

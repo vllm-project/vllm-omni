@@ -322,6 +322,11 @@ class OmniOpenAIServingVideo:
         latent_edit_input: LatentEditInput | None = None,
     ) -> VideoGenerationArtifacts:
         """Run the generation pipeline and extract video/audio/profiler outputs."""
+        if request.streaming_buffer_seconds is not None:
+            raise HTTPException(
+                status_code=HTTPStatus.BAD_REQUEST.value,
+                detail="streaming_buffer_seconds is only supported by /v1/realtime/video; use session.playback.",
+            )
         prompt: OmniTextPrompt = OmniTextPrompt(prompt=request.prompt, modalities=["video"])
         if request.negative_prompt is not None:
             prompt["negative_prompt"] = request.negative_prompt

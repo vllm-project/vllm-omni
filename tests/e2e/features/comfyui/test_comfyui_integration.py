@@ -35,6 +35,7 @@ from comfyui_vllm_omni.nodes import (
     VLLMOmniUnderstanding,
     VLLMOmniVideoReferences,
     VLLMOmniVoiceClone,
+    VLLMOmniYuE2Params,
 )
 from comfyui_vllm_omni.utils.types import (
     AutoregressionSamplingParams,
@@ -1307,6 +1308,31 @@ def _build_music_tokenizer():
         return [101, 102, 103]
 
     return SimpleNamespace(encode=encode, convert_tokens_to_ids=special_token_ids.get)
+
+
+@pytest.mark.parametrize("cot", ["off", "melody", "full"])
+def test_yue2_params(cot: str) -> None:
+    abc = "" if cot == "off" else "X:1\nK:C\nC D E F|"
+
+    (params,) = VLLMOmniYuE2Params().get_params(cot=cot, abc=abc)
+
+    expected = {"cot": cot}
+    if abc:
+        expected["abc"] = abc
+    assert params == expected
+
+
+@pytest.mark.parametrize(
+    ("cot", "abc", "message"),
+    [
+        ("off", "X:1\nK:C\nC D E F|", "ABC requires cot=melody or full"),
+        ("melody", "", "requires supplied ABC score text"),
+        ("full", " ", "requires supplied ABC score text"),
+    ],
+)
+def test_yue2_params_rejects_incompatible_abc(cot: str, abc: str, message: str) -> None:
+    with pytest.raises(ValueError, match=message):
+        VLLMOmniYuE2Params().get_params(cot=cot, abc=abc)
 
 
 @pytest.mark.asyncio

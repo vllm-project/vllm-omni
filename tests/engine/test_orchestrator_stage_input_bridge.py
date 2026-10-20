@@ -275,6 +275,7 @@ async def test_async_prewarm_skips_stage_with_custom_process_input_func() -> Non
     the turn-based Orchestrator base.
     """
     orchestrator = object.__new__(DuplexOrchestrator)
+    orchestrator.replica_placement = None
     stage0 = FakePrewarmPool("sender")
     stage1 = FakePrewarmPool("receiver")  # would receive chunks if role alone decided
     stage1.stage_client = SimpleNamespace(custom_process_input_func=lambda *a, **k: None)

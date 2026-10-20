@@ -17,7 +17,10 @@ def can_sdpa_use_fused_gqa(
     This check is specific to the SDPA backend. Native GQA backends such as
     FlashAttention should keep compressed K/V heads and do not use this helper.
     """
-    if not query.is_cuda:
+    # SDPAParams is a pybind object and cannot be constructed inside a
+    # fullgraph trace. The equal-head path preserves GQA semantics and lets
+    # Inductor lower the SDPA operator without a Python capability probe.
+    if torch.compiler.is_compiling() or not query.is_cuda:
         return False
 
     try:

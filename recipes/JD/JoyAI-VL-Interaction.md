@@ -62,18 +62,38 @@ Incoming frames can be buffered while an answer is being generated; speech audio
 is delivered after synthesis finishes. Prompts retain up to four recent camera
 frames (thumbnail size at most 448×448) and eight recent text messages. Older
 history/frames are evicted when the expanded visual-token count plus the generation
-budget would exceed the configured Stage 0 context limit. The active instruction
+budget would exceed the configured JoyAI-stage context limit. The active instruction
 and newest frame are retained; an oversized instruction is reported as an error.
 These bounds provide a small working context, with summary memory planned in
 [RFC #8803](https://github.com/vllm-project/vllm-omni/issues/8803).
 
-The next speech-input integration will reuse the Qwen3-ASR pipeline and audio-free
-bypass added by [#8031](https://github.com/vllm-project/vllm-omni/pull/8031), with
-audio buffering and commit handling in the unified Session. Summary memory and
-tool delegation follow the later steps in that RFC. The current profile accepts
+The current profile accepts
 text, images, and camera frames, and uses the existing CustomVoice
 `tts_speaker`, `tts_language`, and `tts_instruct` fields in `session.extra_body`.
 The default `joyai_vl_interaction.yaml` remains turn-based.
+
+### Speech input
+
+Select the ASR duplex overlay to accept microphone input on the same Session:
+
+```bash
+vllm serve jdopensource/JoyAI-VL-Interaction-Preview --omni \
+  --deploy-config vllm_omni/deploy/joyai_vl_interaction_asr_duplex.yaml \
+  --port 8099
+```
+
+Send PCM audio through `input_audio_buffer.append`, then
+`input_audio_buffer.commit` with `create_response: true`; alternatively configure
+`session.audio.input.turn_detection` with `type: "server_vad"`. Session owns
+buffering, cancellation, VAD and playback acknowledgements. Qwen3-ASR transcribes
+each committed utterance; JoyAI receives that transcript together with the original
+visual inputs, standing instructions and committed conversation. Transcripts are
+added to the matching user history item, so later camera observations retain the
+spoken task. Text/video-only turns bypass ASR on this deployment. The final
+expanded prompt is checked against JoyAI's context budget after transcription.
+
+Speech output remains all-sync. Summary memory and tool delegation are separate
+follow-ups tracked by [RFC #8803](https://github.com/vllm-project/vllm-omni/issues/8803).
 
 ### Browser client
 
@@ -89,8 +109,13 @@ python -m examples.online_serving.realtime_web --profile joyai-turn \
 Set the instruction, start the session, and enable Camera. Observations are
 committed once per second while idle; **Send observation** submits the current
 frame manually. The client waits for response completion and playback before
-submitting the latest pending frame. Microphone input is planned with ASR
-integration; generated speech already plays through the shared audio component.
+submitting the latest pending frame. With the ASR duplex deployment, add
+`--speech-input` for **Hold to talk**, releasing to commit a spoken instruction.
+Add `--speech-input --vad` for automatic speech commits with server VAD; camera
+frames accompany utterances, while automatic camera-only observations are paused
+in VAD mode. Starting speech clears queued reply audio immediately, including
+after reply generation has completed. Use push-to-talk for continuous camera
+observations between utterances.
 
 ## Standalone interaction server
 

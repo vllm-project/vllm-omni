@@ -2,7 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Fish Audio Drama 3 pipeline topology (frozen).
 
-Stage 0: fish_omni   — text + voice references → 10-codebook frames (LLM AR).
+Stage 0: fish_omni   — text + voice references → one sampled 10-codebook frame per
+         step (Qwen3.5 MoE backbone + codebook tower, Model Runner V2).
 Stage 1: dac_decoder — frames → 44.1 kHz audio; the same Fish DAC codec as S2 Pro.
 """
 
@@ -12,7 +13,7 @@ from vllm_omni.config.stage_config import (
     StagePipelineConfig,
 )
 
-_PROC = "vllm_omni.model_executor.stage_input_processors.fish_speech"
+_PROC = "vllm_omni.model_executor.stage_input_processors.fish_omni"
 
 FISH_OMNI_PIPELINE = PipelineConfig(
     model_type="fish_omni",
@@ -26,7 +27,7 @@ FISH_OMNI_PIPELINE = PipelineConfig(
             input_sources=(),
             owns_tokenizer=True,
             engine_output_type="latent",
-            async_chunk_process_next_stage_input_func=f"{_PROC}.slow_ar_to_dac_decoder_async_chunk",
+            async_chunk_process_next_stage_input_func=f"{_PROC}.fish_omni_to_dac_decoder_async_chunk",
             sampling_constraints={
                 "detokenize": False,
                 # Drama 3 end of speech (config eos_token_id).

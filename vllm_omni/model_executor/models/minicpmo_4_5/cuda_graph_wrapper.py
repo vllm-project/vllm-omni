@@ -906,7 +906,7 @@ class WholeEulerExecutionArena:
         self._buffers: dict[tuple, torch.Tensor] = {}
         # The one attention cache storage; every graph takes a prefix view.
         self._att: torch.Tensor | None = None
-        # Per-timestep modulation table for a fused body (``get_modulation``).
+        # Per-timestep modulation table shared by compatible DiT bodies.
         self._modulation: torch.Tensor | None = None
 
     def _buffer(self, name: str, shape: tuple[int, ...], new=torch.zeros, dtype: torch.dtype | None = None):
@@ -1163,7 +1163,7 @@ class WholeEulerCFMGraphWrapper:
         ``query_bucket_frames`` is one capture width or several
         (``_capture_query_width``); ``offset_bucket_frames`` > 1 snaps cache
         lengths onto a grid (``_capture_offset``); ``modulation_fn`` gives a
-        fused body its per-timestep table. ``att_slots`` > 0 keeps request
+        compatible bodies their per-timestep table. ``att_slots`` > 0 keeps request
         caches resident in an ``AttSlotPool``: streaming chunks replay graphs
         keyed by batch and width alone, with no cache copies, and with
         ``row_offsets`` rows of different cache lengths share one replay.

@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any, Literal
 import huggingface_hub
 import vllm.envs as envs
 from omegaconf import OmegaConf
+from vllm.exceptions import RetryableRequestError
 from vllm.logger import init_logger
 from vllm.transformers_utils.repo_utils import file_or_path_exists
 from vllm.transformers_utils.runai_utils import is_runai_obj_uri
@@ -509,6 +510,9 @@ class OmniBase(PDDisaggregationMixin):
                     msg.error,
                     error_stage_id=msg.stage_id,
                 )
+            if msg.mm_cache_miss_hashes and msg.request_id is not None and msg.request_id not in self.request_states:
+                # The engine has applied cache feedback for a cancelled request.
+                return True, None, None, None
             self._raise_nonfatal_error_message(msg)
 
         if not isinstance(msg, OutputMessage):
@@ -547,6 +551,8 @@ class OmniBase(PDDisaggregationMixin):
 
     def _raise_nonfatal_error_message(self, msg: ErrorMessage) -> None:
         """Raise the exception for a non-fatal, request-scoped error message."""
+        if msg.mm_cache_miss_hashes and msg.status_code == 503 and msg.error_type == "ServiceUnavailableError":
+            raise RetryableRequestError(msg.error)
         raise_client_error_or(
             msg.error,
             status_code=msg.status_code,

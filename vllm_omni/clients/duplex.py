@@ -800,6 +800,8 @@ class DuplexClientBase(ABC):
         is_speech: bool | None = None,
         video_frames: Sequence[str] | None = None,
         stacked_video_frames: Sequence[str | None] | None = None,
+        media_origin_ms: float = 0.0,
+        unit_index: int = 0,
     ) -> int:
         """Slice ``pcm`` into ``chunk_ms`` chunks, pace, append; interleave frames.
 
@@ -820,6 +822,10 @@ class DuplexClientBase(ABC):
 
         Returns the number of base frames actually sent (a clip shorter than
         the frame list leaves the tail unsent).
+
+        ``media_origin_ms`` and ``unit_index`` continue a previous call's
+        media clock. A tail streamed on its own otherwise restarts at unit 0,
+        so the append that closes the next whole second carries no frame.
         """
         input_format = self.config.input_audio
         chunk_bytes = max(input_format.byte_count(chunk_ms), input_format.bytes_per_sample)
@@ -827,8 +833,8 @@ class DuplexClientBase(ABC):
         stacked = list(stacked_video_frames or [])
 
         def units() -> Iterator[tuple[bytes, list[str] | None]]:
-            audio_end_ms = 0.0
-            frames_sent = 0
+            audio_end_ms = media_origin_ms
+            frames_sent = unit_index
             for offset in range(0, len(pcm), chunk_bytes):
                 chunk = pcm[offset : offset + chunk_bytes]
                 audio_end_ms += input_format.duration_ms(len(chunk))
@@ -844,6 +850,8 @@ class DuplexClientBase(ABC):
                 yield chunk, [frames[index]] if composite is None else [frames[index], composite]
 
         frames_sent = 0
+        stream_started_at = time.monotonic()
+        sent_duration_s = 0.0
         for chunk, unit_frames in units():
             if not chunk:
                 continue
@@ -851,7 +859,11 @@ class DuplexClientBase(ABC):
             if unit_frames:
                 frames_sent += 1
             if realtime:
-                await asyncio.sleep(input_format.duration_ms(len(chunk)) / 1000.0)
+                # Relative sleeps accumulate encoding, send, and scheduling
+                # overhead, progressively slowing the input media clock.
+                sent_duration_s += input_format.duration_ms(len(chunk)) / 1000.0
+                delay_s = stream_started_at + sent_duration_s - time.monotonic()
+                await asyncio.sleep(max(0.0, delay_s))
         return frames_sent
 
     async def commit(self, *, final: bool = True, create_response: bool | None = None) -> None:
