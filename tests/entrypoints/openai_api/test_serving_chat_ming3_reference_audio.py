@@ -96,14 +96,59 @@ async def test_chat_references_stay_numeric_through_engine_and_connector(mocker)
         [(np.zeros(0, dtype=np.float32), 16000)],
         [(np.zeros(1), 0)],
         [(np.array([float("nan")]), 16000)],
-        [(np.zeros(61), 1)],
-        [(np.zeros(31), 1), (np.zeros(30), 1)],
         [(np.zeros(1), 16000)] * 17,
     ],
 )
 def test_reference_audio_bounds(references):
     with pytest.raises(ValueError, match="Reference audio"):
         pack_reference_audio(references)
+
+
+@pytest.mark.parametrize(
+    "count,length,rate", [(3, 25, 1), (2, 1_500_000, 96000)], ids=["75-seconds-total", "3000000-samples-total"]
+)
+def test_reference_audio_accepts_above_old_aggregate_limits(count, length, rate):
+    references = [(np.full(length, index, dtype=np.float32), rate) for index in range(count)]
+
+    restored = unpack_reference_audio(pack_reference_audio(references))
+
+    assert len(restored) == count
+    for reference, (samples, sample_rate) in zip(restored, references, strict=True):
+        assert reference["sample_rate"] == sample_rate
+        torch.testing.assert_close(reference["samples"], torch.from_numpy(samples))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "count,samples,fetches", [(17, [0.1], 0), (2, [float("nan")], 1)], ids=["too-many-clips", "invalid-first-clip"]
+)
+async def test_chat_rejects_invalid_references_before_further_io(mocker, count, samples, fetches):
+    connector_class = mocker.patch("vllm_omni.entrypoints.openai.serving_chat.MediaConnector")
+    connector = connector_class.return_value
+    connector.fetch_audio_async = mocker.AsyncMock(return_value=(np.array(samples, dtype=np.float32), 16000))
+    prompt = {"additional_information": {"ref_audio": ["AA=="] * count}}
+
+    with pytest.raises(ValueError, match="Reference audio"):
+        await _serving_chat()._attach_ming3_reference_audio(prompt)
+
+    assert connector.fetch_audio_async.await_count == fetches
+    if fetches == 0:
+        connector_class.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_other_models_skip_ming3_reference_validation(mocker):
+    chat = _serving_chat()
+    chat.engine_client.stage_configs = [
+        {"engine_args": {"model_arch": "BailingMM2NativeForConditionalGeneration", "model_stage": "thinker"}}
+    ]
+    connector_class = mocker.patch("vllm_omni.entrypoints.openai.serving_chat.MediaConnector")
+    info = {"ref_audio": ["AA=="] * 17}
+
+    await chat._attach_ming3_reference_audio({"additional_information": info})
+
+    connector_class.assert_not_called()
+    assert info == {"ref_audio": ["AA=="] * 17}
 
 
 @pytest.mark.asyncio

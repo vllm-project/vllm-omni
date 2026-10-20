@@ -829,6 +829,20 @@ def test_ming3_build_passes_base64_reference_audio():
     assert info["instruction"] is None
 
 
+@pytest.mark.parametrize(
+    "count,samples,fetches", [(17, [0.1], 0), (2, [float("nan")], 1)], ids=["too-many-clips", "invalid-first-clip"]
+)
+def test_ming3_build_rejects_invalid_references_before_further_io(mocker, count, samples, fetches):
+    resolve = mocker.AsyncMock(return_value=(samples, 16000, "cache-key"))
+    adapter = Ming3AudioTTSAdapter(SpeechServingContext(server=SimpleNamespace(_resolve_ref_audio_array=resolve)))
+    request = OpenAICreateSpeechRequest(input="hello", ref_audio=["AA=="] * count)
+
+    with pytest.raises(ValueError, match="Reference audio"):
+        asyncio.run(adapter.build(request, [], True))
+
+    assert resolve.await_count == fetches
+
+
 def test_ming3_rejects_mixed_ip_and_reference():
     adapter = Ming3AudioTTSAdapter(SimpleNamespace(server=SimpleNamespace(), engine_client=SimpleNamespace()))
     request = OpenAICreateSpeechRequest(input="hello", voice="灵小柔", ref_audio="data:audio/wav;base64,AA==")

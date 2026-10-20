@@ -327,10 +327,12 @@ speech-output pipeline the same applies to the Talker stage: set stage 1
 
 Omitting `voice` and reference inputs defaults to the IP voice `灵小柔`.
 For voice cloning, pass `ref_audio` instead of `voice`, with optional `ref_text`.
-Decoded inline and registered reference audio is limited to 16 clips,
-60 seconds and 2,880,000 samples in total per request. Clip order and sample
-rates are preserved; oversized references return an input error.
-The Speech API also retains its existing 1–30 second limit per clip.
+Inline and registered reference audio accepts up to 16 clips per request,
+with clip order and sample rates preserved. The clip count is checked before
+loading inline references, and each decoded clip must be nonempty and finite
+with a positive sample rate. There is no additional aggregate duration or sample-count
+limit; the media loader's existing size/duration protections and the Speech API's
+existing 1–30 second limit per clip still apply.
 A registered `voice` name selects its stored reference audio and transcript.
 An unregistered string is interpreted as an IP caption by this standalone endpoint.
 The existing

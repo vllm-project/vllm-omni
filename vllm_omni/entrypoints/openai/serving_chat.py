@@ -298,7 +298,11 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             ip_voice_name,
             validate_voice_controls,
         )
-        from vllm_omni.model_executor.models.ming_flash_omni.reference_audio import pack_reference_audio
+        from vllm_omni.model_executor.models.ming_flash_omni.reference_audio import (
+            pack_reference_audio,
+            validate_reference_audio,
+            validate_reference_audio_count,
+        )
 
         validate_voice_controls(info)
         audio = getattr(request, "audio", None)
@@ -325,6 +329,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             sources = [sources]
         if not isinstance(sources, list) or not sources or not all(isinstance(source, str) for source in sources):
             raise ValueError("ref_audio must be a base64 audio string or a nonempty list of them")
+        validate_reference_audio_count(len(sources))
         config = self.model_config
         connector = MediaConnector(
             allowed_local_media_path=getattr(config, "allowed_local_media_path", "") or "",
@@ -333,7 +338,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         references = []
         for source in sources:
             waveform, sample_rate = await connector.fetch_audio_async(reference_audio_uri(source))
-            references.append((waveform, sample_rate))
+            references.append((validate_reference_audio(waveform, sample_rate), sample_rate))
         info.pop("ref_audio")
         info.update(pack_reference_audio(references))
         info["voice_mode"] = "reference"
