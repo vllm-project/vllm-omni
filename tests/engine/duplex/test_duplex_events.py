@@ -469,7 +469,7 @@ def test_one_truncate_command_truncates_retrieved_transcript_once():
         "content": [{"type": "output_audio", "transcript": "abcdefghij", "audio_duration_ms": 10_000}],
     }
 
-    control = resolve_truncate_item(state, TruncateItem(item_id="item_resp_1", audio_end_ms=4_000))
+    control = resolve_truncate_item(state, TruncateItem(item_id="item_resp_1", audio_end_ms=4_000), has_audio=True)
     # The runner executes this signal and projects its acknowledgement.
     signal = control.payloads[0]
     payload = signal["payload"]

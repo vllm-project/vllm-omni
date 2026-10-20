@@ -1071,7 +1071,9 @@ async def test_full_ack_releases_cancelled_replies_without_history_calibration(a
             if hard_cutoff_ms is not None:
                 await h.run(commands.TruncateItem(item_id=f"item_{response}", audio_end_ms=hard_cutoff_ms))
             events = await h.run(commands.AckPlayback(response_id=response, played_ms=1000))
-            assert find(events, "playback.acknowledged").details["history_committed"]
+            # TruncateItem already applied its own ACK and finalized the stop;
+            # this later progress ACK must not report another history commit.
+            assert find(events, "playback.acknowledged").details["history_committed"] is (hard_cutoff_ms is None)
             assert not h.session._conversation.assistant_response_snapshots
             assert not h.session._playback.by_response
             assert not h.session._conversation.hard_truncations_ms
@@ -1587,7 +1589,12 @@ async def test_interrupted_drain_releases_only_deleted_item_playback(termination
             assert h.session.playback_for_response(old_response).committed_ms == 500
             events = await h.run(commands.TruncateItem(item_id=item_id, audio_end_ms=250))
             assert types(events) == ["conversation.item.truncated", "playback.acknowledged"]
-            assert h.session.playback_for_response(old_response).committed_ms == 250
+            assert find(events, "playback.acknowledged").details["playback"]["committed_ms"] == 250
+            assert h.session.history_item_ids[item_id]["content"] == "h"
+            assert old_response not in h.session._playback.by_response
+            assert old_response not in h.session._conversation.assistant_response_snapshots
+            assert item_id not in h.session._conversation.hard_truncations_ms
+            assert h.session.playback_for_response(active_response).sent_ms == 250
     finally:
         await close_harness(h)
 
@@ -2150,6 +2157,11 @@ class _ScriptedDetector:
         del base64_audio, fmt, sample_rate_hz, audio_end_ms
         return self._results.pop(0)
 
+    def process_segments(self, base64_audio: str, *, fmt: str, sample_rate_hz: int | None):
+        from vllm_omni.engine.duplex.turn_detection import TurnDetectionSegment
+
+        return [TurnDetectionSegment(base64_audio, self.process(base64_audio, fmt=fmt, sample_rate_hz=sample_rate_hz))]
+
     def reset(self) -> None:
         self.resets += 1
 
@@ -2217,6 +2229,235 @@ async def test_server_vad_speech_stopped_still_commits_a_turn_mode_session() -> 
         assert "input_audio_buffer.speech_stopped" in types(events)
         assert "input_audio_buffer.committed" in types(events)
         assert len(_final_submissions(h)) == 1, "the detector's stop commits the turn and starts the response"
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_input_clear_resets_the_turn_detector() -> None:
+    """A clear starts a new turn, so the detector's speech/pause state goes with the audio."""
+    h = await open_harness(auto_response=False)
+    try:
+        detector = _speech_then_stop()
+        h.runner.control._detector = detector
+        await h.run(append_audio())
+        await h.run(commands.ClearInput())
+        assert detector.resets == 1
+    finally:
+        await close_harness(h)
+
+
+def _semantic_detector(*turn_probabilities: float | Exception):
+    from vllm_omni.engine.duplex.turn_detection import SemanticTurnDetector, TurnDetectionConfig
+
+    answers = list(turn_probabilities)
+
+    def turn_scorer(_audio: np.ndarray) -> float:
+        if not answers:
+            pytest.fail("Smart Turn was called more often than the test expects")
+        answer = answers.pop(0)
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    return SemanticTurnDetector(
+        TurnDetectionConfig.from_realtime({"type": "semantic_vad", "eagerness": "high"}),
+        turn_scorer=turn_scorer,
+        frame_scorer=lambda frame: 0.95 if float(np.abs(frame).max()) >= 0.01 else 0.02,
+    )
+
+
+@pytest.mark.parametrize(
+    ("answer", "decision"),
+    [(0.1, "smart_turn_incomplete"), (RuntimeError("inference failed"), "smart_turn_error")],
+)
+@pytest.mark.asyncio
+async def test_semantic_timeout_logs_session_and_last_decision(answer, decision, monkeypatch) -> None:
+    from vllm_omni.engine.duplex.session import control
+
+    messages: list[str] = []
+    monkeypatch.setattr(control.logger, "info", lambda fmt, *args: messages.append(fmt % args))
+    h = await open_harness(auto_response=False)
+    try:
+        h.runner.control._detector = _semantic_detector(answer)
+        await h.run(append_audio(samples=8000, is_speech=None))
+        pause = await h.run(append_audio(samples=9600, value=0.0, is_speech=None))
+        assert "input_audio_buffer.committed" not in types(pause)
+        decisions = [message for message in messages if f"semantic_decision={decision}" in message]
+        assert len(decisions) == 1
+        assert f"session={SESSION_ID}" in decisions[0] and "commit=False" in decisions[0]
+        events = await h.run(append_audio(samples=32000, value=0.0, is_speech=None))
+        assert types(events).count("input_audio_buffer.committed") == 1
+        commits = [message for message in messages if "commit_reason=silence_timeout" in message]
+        assert len(commits) == 1
+        assert f"session={SESSION_ID}" in commits[0] and f"semantic_decision={decision}" in commits[0]
+        assert "commit=True" in commits[0]
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.parametrize("command", [commands.ClearInput, commands.CancelInput, commands.BargeIn])
+@pytest.mark.asyncio
+async def test_discard_input_starts_a_fresh_semantic_turn(command) -> None:
+    """Discarding an incomplete turn must also discard its pending semantic pause."""
+    h = await open_harness(auto_response=False)
+    try:
+        h.runner.control._detector = _semantic_detector(0.1, 0.9)
+        await h.run(append_audio(samples=8000, is_speech=None))
+        pause = await h.run(append_audio(samples=9600, value=0.0, is_speech=None))
+        assert "input_audio_buffer.committed" not in types(pause)
+
+        await h.run(command())
+        events = await h.run(append_audio(samples=8000, is_speech=None))
+        events += await h.run(append_audio(samples=9600, value=0.0, is_speech=None))
+        assert types(events).count("input_audio_buffer.speech_started") == 1
+        assert types(events).count("input_audio_buffer.speech_stopped") == 1
+        assert types(events).count("input_audio_buffer.committed") == 1
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_semantic_vad_keeps_a_thinking_pause_inside_one_committed_turn() -> None:
+    h = await open_harness(auto_response=False)
+    try:
+        h.runner.control._detector = _semantic_detector(0.1, 0.9)
+        events = await h.run(append_audio(samples=8000, is_speech=None))
+        # Smart Turn calls this pause incomplete: no stop, no commit, and the
+        # silence is buffered rather than skipped as silence_or_noise.
+        pause = await h.run(append_audio(samples=9600, value=0.0, is_speech=None))
+        assert "input_audio_buffer.speech_stopped" not in types(pause)
+        assert "input_audio_buffer.committed" not in types(pause)
+        assert "response.listen" not in types(pause)
+        events += pause
+        events += await h.run(append_audio(samples=8000, is_speech=None))
+        events += await h.run(append_audio(samples=9600, value=0.0, is_speech=None))
+
+        assert types(events).count("input_audio_buffer.speech_started") == 1
+        assert types(events).count("input_audio_buffer.speech_stopped") == 1
+        assert types(events).count("input_audio_buffer.committed") == 1
+        assert len(_final_submissions(h)) == 1
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.parametrize("mode", ["server_vad", "semantic_vad"])
+@pytest.mark.asyncio
+async def test_one_append_preserves_multiple_vad_turns(mode: str) -> None:
+    from vllm_omni.engine.duplex.turn_detection import SemanticTurnDetector, TurnDetectionConfig
+
+    h = await open_harness(auto_response=False)
+    try:
+        config = TurnDetectionConfig(type=mode, create_response=False)
+        if mode == "semantic_vad":
+            detector = SemanticTurnDetector(config, turn_scorer=lambda _: 0.1)
+        else:
+            detector = config.build_detector()
+        detector.vad._frame_scorer = lambda frame: 0.95 if np.abs(frame).max() > 0.1 else 0.02
+        h.runner.control._detector = detector
+        audio = np.concatenate([np.full(16000, 0.2), np.zeros(80000), np.full(16000, 0.4), np.zeros(80000)]).astype(
+            "<f4"
+        )
+        events = await h.run(commands.AppendAudio(audio=audio.tobytes(), format="pcm_f32le", sample_rate_hz=16000))
+        assert types(events).count("input_audio_buffer.speech_started") == 2
+        assert types(events).count("input_audio_buffer.speech_stopped") == 2
+        assert types(events).count("input_audio_buffer.committed") == 2
+        assert "error" not in types(events)
+        assert "response.created" not in types(events)
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.parametrize("command", [commands.CancelResponse, commands.ClearOutputAudio])
+@pytest.mark.asyncio
+async def test_cancelling_output_keeps_the_pending_semantic_turn(command) -> None:
+    h = await open_harness(auto_response=False)
+    try:
+        await h.run(append_audio())
+        await h.run(commands.Commit(create_response=True))
+        assert h.session.active_response_id is not None
+        h.runner.control._detector = _semantic_detector(0.1, 0.9)
+        await h.run(append_audio(samples=8000, is_speech=None))
+        await h.run(append_audio(samples=9600, value=0.0, is_speech=None))
+        await h.run(command())
+        events = await h.run(append_audio(samples=8000, is_speech=None))
+        events += await h.run(append_audio(samples=9600, value=0.0, is_speech=None))
+        assert "input_audio_buffer.speech_started" not in types(events)
+        assert types(events).count("input_audio_buffer.committed") == 1
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_auto_commit_does_not_reset_later_speech_in_the_same_append() -> None:
+    h = await open_harness(auto_response=False)
+    try:
+        h.runner.control._detector = _semantic_detector(0.9, 0.9)
+        audio = np.concatenate([np.full(16000, 0.2), np.zeros(16000), np.full(8000, 0.2)])
+        first = await h.run(
+            commands.AppendAudio(audio=audio.astype("<f4").tobytes(), format="pcm_f32le", sample_rate_hz=16000)
+        )
+        assert types(first).count("input_audio_buffer.speech_started") == 2
+        assert types(first).count("input_audio_buffer.committed") == 1
+        second = await h.run(append_audio(samples=9600, value=0.0, is_speech=None))
+        assert "input_audio_buffer.speech_started" not in types(second)
+        assert types(second).count("input_audio_buffer.committed") == 1
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_a_missing_smart_turn_model_disables_turn_detection_with_its_own_code(tmp_path) -> None:
+    from vllm_omni.engine.duplex.smart_turn import SmartTurnBackendProvider
+    from vllm_omni.engine.duplex.turn_detection import SemanticTurnDetector, TurnDetectionConfig
+
+    h = await open_harness(auto_response=False)
+    try:
+        h.runner.control._detector = SemanticTurnDetector(
+            TurnDetectionConfig.from_realtime({"type": "semantic_vad"}),
+            smart_turn_provider=SmartTurnBackendProvider(model_path=str(tmp_path / "missing.onnx")),
+            frame_scorer=lambda _frame: 0.0,
+        )
+        events = await h.run(append_audio(is_speech=None))
+        assert find(events, "error").code == "semantic_vad_unavailable"
+        assert h.runner.control._detector is None
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_semantic_vad_is_not_started_for_an_auto_responding_session() -> None:
+    h = await open_harness(auto_response=True, extra_body={"realtime_turn_detection": {"type": "semantic_vad"}})
+    try:
+        assert h.runner.control._detector is None
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_auto_response_cannot_be_turned_on_under_semantic_vad() -> None:
+    h = await open_harness(auto_response=False)
+    try:
+        await h.run(commands.UpdateSession(patch={"turn_detection": {"type": "semantic_vad"}}))
+        assert h.runner.control._detector is not None
+        events = await h.run(commands.UpdateSession(patch={"extra_body": {"auto_response": True}}))
+        assert find(events, "error").code == "unsupported_turn_detection"
+        assert h.session.config.extra_body.get("auto_response") is False
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_semantic_vad_is_refused_for_an_auto_responding_session() -> None:
+    h = await open_harness(auto_response=True)
+    try:
+        events = await h.run(
+            commands.UpdateSession(patch={"turn_detection": {"type": "semantic_vad"}}, event_id="evt-sem")
+        )
+        error = find(events, "error")
+        assert error.code == "unsupported_turn_detection"
+        assert "semantic_vad" in error.message
+        assert h.runner.control._detector is None
     finally:
         await close_harness(h)
 

@@ -76,6 +76,7 @@ REALTIME_ERROR_TYPES_BY_CODE: dict[str, str] = {
     "tool_call_settlement_failed": "server_error",
     "tool_result_retirement_failed": "server_error",
     "server_vad_unavailable": "server_error",
+    "semantic_vad_unavailable": "server_error",
 }
 
 

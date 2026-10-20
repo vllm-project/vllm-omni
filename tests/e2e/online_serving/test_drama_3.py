@@ -103,6 +103,12 @@ def test_voice_clone_streaming_002(omni_server, openai_client, seed: int) -> Non
         "min_audio_bytes": _MIN_AUDIO_BYTES,
         "expected_sample_rate": SAMPLE_RATE,
         "transcript_pcm_sample_rate": SAMPLE_RATE,
+        # The clone_2.wav reference is itself only 1.70 dB on this metric, and the
+        # cloned voice keeps its rough delivery: H100 runs have scored 2.61, 1.89
+        # and 0.80 dB, with the transcript matching word for word where it was
+        # checked. Keep the catastrophic-failure check and leave speech quality to
+        # the transcript check.
+        "min_hnr_db": -1.0,
     }
     openai_client.send_audio_speech_request(request_config)
 
