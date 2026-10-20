@@ -67,20 +67,32 @@ def _tf32_mode(extra: Mapping[str, Any]) -> str:
     dots. Not compensated TF32x3. ``token2wav_allow_tf32`` is the shipped YAML
     key; ``code2wav_allow_tf32`` and legacy env ``tf32x3`` / ``3xtf32`` alias it.
     Defaults to ``"tf32"`` unless explicitly disabled.
+
+    Like the other stage booleans, an explicit ``null`` means "unset" and falls
+    through to the alias and then to the default, and a value that is neither a
+    boolean nor a known token raises instead of silently disabling TF32.
     """
     raw = os.environ.get("MINICPMO_CODE2WAV_TF32")
-    value = raw if raw not in (None, "") else extra.get("token2wav_allow_tf32", extra.get("code2wav_allow_tf32", True))
+    value = raw if raw not in (None, "") else None
+    if value is None:
+        for key in ("token2wav_allow_tf32", "code2wav_allow_tf32"):
+            candidate = extra.get(key)
+            if candidate is not None:
+                value = candidate
+                break
+    if value is None:
+        return "tf32"
+    if isinstance(value, bool):
+        return "tf32" if value else "off"
+    if isinstance(value, int) and value in (0, 1):
+        return "tf32" if value else "off"
     if isinstance(value, str):
-        return {
-            "tf32": "tf32",
-            "tf32x3": "tf32",
-            "3xtf32": "tf32",
-            "flow": "tf32",
-            "1": "tf32",
-            "true": "tf32",
-            "yes": "tf32",
-        }.get(value.strip().lower(), "off")
-    return "tf32" if value else "off"
+        token = value.strip().lower()
+        if token in ("tf32", "tf32x3", "3xtf32", "flow", "1", "true", "yes"):
+            return "tf32"
+        if token in ("off", "0", "false", "no"):
+            return "off"
+    raise ValueError(f"token2wav_allow_tf32/MINICPMO_CODE2WAV_TF32 must be 'tf32'/'off' (or a boolean), got {value!r}")
 
 
 @contextmanager
