@@ -203,61 +203,75 @@ def test_omni_coordinator_heartbeat_timeout_handling():
         host="127.0.0.1",
         port=0,
     )
+    # 2.4x the clients' heartbeat interval (5s, hardcoded in
+    # OmniCoordClientForStage): A/B must survive scheduler jitter, while C
+    # (no heartbeats at all) still times out deterministically.
     coordinator = OmniCoordinator(
         router_zmq_addr=router_addr,
         pub_zmq_addr=pub_addr,
-        heartbeat_timeout=5.0,
+        heartbeat_timeout=12.0,
     )
 
-    sub_ctx = zmq.Context.instance()
-    sub = sub_ctx.socket(zmq.SUB)
+    # Private context: teardown must not block on unrelated sockets that
+    # other tests leaked into the process-global zmq.Context.instance(),
+    # and must not terminate the global instance for the rest of the suite.
+    ctx = zmq.Context()
+    sub = ctx.socket(zmq.SUB)
     sub.connect(coordinator.pub_zmq_addr)
     sub.setsockopt(zmq.SUBSCRIBE, b"")
 
-    time.sleep(0.3)
+    client_a = None
+    client_b = None
+    dealer_c = None
+    try:
+        # ZMQ PUB/SUB slow-joiner: allow SUB to connect before clients
+        # register. Generous margin: PUB drops messages for absent
+        # subscribers, so a missed registration broadcast is unrecoverable.
+        time.sleep(1.0)
 
-    # A and B: real clients that send heartbeats every 5s.
-    client_a = OmniCoordClientForStage(coordinator.router_zmq_addr, "tcp://stage:a", "tcp://stage:a-out", 0)
-    client_b = OmniCoordClientForStage(coordinator.router_zmq_addr, "tcp://stage:b", "tcp://stage:b-out", 0)
+        # A and B: real clients that send heartbeats every 5s.
+        client_a = OmniCoordClientForStage(coordinator.router_zmq_addr, "tcp://stage:a", "tcp://stage:a-out", 0)
+        client_b = OmniCoordClientForStage(coordinator.router_zmq_addr, "tcp://stage:b", "tcp://stage:b-out", 0)
 
-    # C: raw DEALER that sends only registration, no heartbeat.
-    dealer_ctx = zmq.Context.instance()
-    dealer_c = dealer_ctx.socket(zmq.DEALER)
-    dealer_c.connect(coordinator.router_zmq_addr)
-    reg_event = {
-        "input_addr": "tcp://stage:c",
-        "output_addr": "tcp://stage:c-out",
-        "stage_id": 0,
-        "event_type": "update",
-        "status": ReplicaStatus.UP.value,
-        "queue_length": 0,
-    }
-    dealer_c.send(json.dumps(reg_event).encode("utf-8"))
+        # C: raw DEALER that sends only registration, no heartbeat.
+        dealer_c = ctx.socket(zmq.DEALER)
+        dealer_c.connect(coordinator.router_zmq_addr)
+        reg_event = {
+            "input_addr": "tcp://stage:c",
+            "output_addr": "tcp://stage:c-out",
+            "stage_id": 0,
+            "event_type": "update",
+            "status": ReplicaStatus.UP.value,
+            "queue_length": 0,
+        }
+        dealer_c.send(json.dumps(reg_event).encode("utf-8"))
 
-    msg = _wait_for_replica_list(sub, expected_count=3)
-    assert msg is not None, "Expected initial 3 replicas"
-    assert len(msg["replicas"]) == 3
+        msg = _wait_for_replica_list(sub, expected_count=3, timeout=10.0)
+        assert msg is not None, "Expected initial 3 replicas"
+        assert len(msg["replicas"]) == 3
 
-    # Wait for heartbeat timeout (timeout=5s, check interval ~2.5s).
-    time.sleep(8.0)
+        # Poll for C's exclusion (timeout=12s, check interval <=5s) instead
+        # of a fixed sleep, so a loaded CI runner only slows the test down
+        # instead of failing it. With all three replicas registered, only
+        # C's heartbeat timeout can drop the active count to 2.
+        msg_after_timeout = _wait_for_replica_list(sub, expected_count=2, timeout=30.0)
+        assert msg_after_timeout is not None, "Expected ReplicaList with 2 replicas after timeout"
+        replicas = msg_after_timeout.get("replicas", [])
+        input_addrs = {rep["input_addr"] for rep in replicas}
 
-    # Receive the update (C should be ERROR and excluded from active list).
-    msg_after_timeout = _wait_for_replica_list(sub, expected_count=2, timeout=5.0)
-    assert msg_after_timeout is not None, "Expected ReplicaList with 2 replicas after timeout"
-    replicas = msg_after_timeout.get("replicas", [])
-    input_addrs = {rep["input_addr"] for rep in replicas}
-
-    assert "tcp://stage:a" in input_addrs
-    assert "tcp://stage:b" in input_addrs
-    assert "tcp://stage:c" not in input_addrs
-
-    client_a.close()
-    client_b.close()
-    dealer_c.close(0)
-    coordinator.close()
-    sub.close(0)
-    dealer_ctx.term()
-    sub_ctx.term()
+        assert "tcp://stage:a" in input_addrs
+        assert "tcp://stage:b" in input_addrs
+        assert "tcp://stage:c" not in input_addrs
+    finally:
+        if client_a is not None:
+            client_a.close()
+        if client_b is not None:
+            client_b.close()
+        if dealer_c is not None:
+            dealer_c.close(0)
+        coordinator.close()
+        sub.close(0)
+        ctx.term()
 
 
 def test_omni_coordinator_replica_shutdown_handling():
