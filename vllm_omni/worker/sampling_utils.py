@@ -92,18 +92,25 @@ def call_model_sampler(
     input_batch: Any,
     requests: Any,
 ) -> Any:
-    """Call an opted-in model sampler with per-request extra arguments.
+    """Call an opted-in model sampler with per-request host arguments.
 
     The opt-in keeps the existing two-argument sampler contract unchanged for
     every other model while allowing custom samplers to make row-local choices.
     """
-    if not getattr(model, "model_sampler_wants_extra_args", False):
+    wants_extra_args = getattr(model, "model_sampler_wants_extra_args", False)
+    wants_sampling_params = getattr(model, "model_sampler_wants_sampling_params", False)
+    if not wants_extra_args and not wants_sampling_params:
         return model_sample(logits, sampling_metadata)
-    return model_sample(
-        logits,
-        sampling_metadata,
-        per_req_extra_args=build_model_sampler_extra_args(input_batch, requests),
-    )
+    kwargs: dict[str, Any] = {}
+    if wants_extra_args:
+        kwargs["per_req_extra_args"] = build_model_sampler_extra_args(input_batch, requests)
+    if wants_sampling_params:
+        request_states = requests or {}
+        kwargs["per_req_sampling_params"] = [
+            getattr(request_states.get(req_id), "sampling_params", None)
+            for req_id in getattr(input_batch, "req_ids", [])
+        ]
+    return model_sample(logits, sampling_metadata, **kwargs)
 
 
 def clamp_prompt_ids_to_penalty_padding(prompt_token_ids: torch.Tensor, logits_vocab: int) -> torch.Tensor:

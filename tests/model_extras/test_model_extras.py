@@ -252,6 +252,15 @@ def test_ltx_extra_registry_declares_official_guidance_params() -> None:
         assert get_extra_output_params(pipeline_name) == frozenset()
 
 
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_ltx_t2a_extra_registry_omits_inapplicable_modality_scale() -> None:
+    params = get_extra_body_params("LTX2TextToAudioPipeline")
+
+    assert "audio_modality_scale" not in params
+    assert "audio_cfg_scale" in params
+
+
 @pytest.mark.parametrize(
     ("model_version", "expected"),
     [("2", False), ("2.3", False), ("2.5", True)],
@@ -493,6 +502,14 @@ def test_bagel_image_to_image_prompt_builder() -> None:
     assert result["mm_processor_kwargs"]["target_h"] == 256
     assert result["mm_processor_kwargs"]["target_w"] == 256
     assert result["negative_prompt"] == "ugly"
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_qwen_image_21_extra_registry_declares_sigmas() -> None:
+    assert get_extra_body_params("QwenImage21Pipeline") == frozenset({"sigmas"})
+    assert get_extra_output_params("QwenImage21Pipeline") == frozenset()
+    assert should_init_extra_args_for_non_diffusion_stages("QwenImage21Pipeline") is False
 
 
 @pytest.mark.core_model

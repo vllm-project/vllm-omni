@@ -123,9 +123,9 @@ def _transformer_timestep(timestep: torch.Tensor, transformer_dtype: torch.dtype
 
 
 def _transformer_autocast(device: torch.device, transformer_dtype: torch.dtype):
-    if device.type != "cuda" or transformer_dtype not in {torch.bfloat16, torch.float16}:
+    if device.type == "cpu" or transformer_dtype not in {torch.bfloat16, torch.float16}:
         return nullcontext()
-    return torch.autocast(device_type="cuda", dtype=transformer_dtype)
+    return torch.autocast(device_type=device.type, dtype=transformer_dtype)
 
 
 def _group_global_rank(group: Any | None, group_rank: int) -> int:
@@ -549,12 +549,16 @@ class LingBotVideoPipeline(
         vae_device = _module_device(self.vae)
         vae_dtype = _module_dtype(self.vae)
         vae_latents = self._dit_latent_to_vae(latents).to(device=vae_device, dtype=torch.float32)
-        if vae_latents.ndim == 5:
+        if vae_latents.ndim == 5 and vae_device.type == "cuda":
             vae_latents = vae_latents.contiguous(memory_format=torch.channels_last_3d)
         autocast_dtype = (
-            vae_dtype if vae_device.type == "cuda" and vae_dtype in {torch.bfloat16, torch.float16} else None
+            vae_dtype if vae_device.type != "cpu" and vae_dtype in {torch.bfloat16, torch.float16} else None
         )
-        with torch.autocast("cuda", dtype=autocast_dtype or torch.bfloat16, enabled=autocast_dtype is not None):
+        with torch.autocast(
+            device_type=vae_device.type,
+            dtype=autocast_dtype or torch.bfloat16,
+            enabled=autocast_dtype is not None,
+        ):
             decoded = self.vae.decode(vae_latents)
         frames = decoded[0] if isinstance(decoded, tuple) else decoded.sample
         frames = frames.float().clamp_(-1, 1)

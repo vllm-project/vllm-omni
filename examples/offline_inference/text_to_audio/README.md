@@ -3,8 +3,11 @@
 A unified script for text-to-audio generation. Supported models:
 
 | Model | Tasks | Notes |
-|-------|-------|-------|
+| ------- | ------- | ------- |
 | `stabilityai/stable-audio-open-1.0` | text-to-audio | gated; uses `--audio-length` |
+| `Lightricks/LTX-2` | text-to-audio | use `--model-class-name LTX2TextToAudioPipeline`; defaults to 40 steps |
+| `diffusers/LTX-2.3-Diffusers` | text-to-audio | use `--model-class-name LTX2TextToAudioPipeline`; defaults to 30 steps |
+| `Lightricks/LTX-2.5-Diffusers` | text-to-audio | use `--model-class-name LTX2TextToAudioPipeline`; defaults to 30 steps |
 
 The `stabilityai/stable-audio-open-1.0` pipeline generates audio from text prompts.
 
@@ -19,6 +22,32 @@ If you use a gated model (e.g., `stabilityai/stable-audio-open-1.0`), ensure you
    ```
 
 ## Local CLI Usage
+
+For LTX-2 or LTX-2.3:
+
+```bash
+python text_to_audio.py \
+  --model Lightricks/LTX-2 \
+  --model-class-name LTX2TextToAudioPipeline \
+  --prompt "A fingerpicked acoustic guitar in a quiet studio" \
+  --audio-length 5 \
+  --num-inference-steps 40 \
+  --output ltx2_audio.wav
+
+python text_to_audio.py \
+  --model diffusers/LTX-2.3-Diffusers \
+  --model-class-name LTX2TextToAudioPipeline \
+  --prompt "A fingerpicked acoustic guitar in a quiet studio" \
+  --audio-length 5 \
+  --num-inference-steps 30 \
+  --output ltx23_audio.wav
+```
+
+The LTX output sample rate is taken from the checkpoint vocoder. LTX
+text-to-audio currently runs with tensor parallel size 1, sequence parallel
+size 1, and no Cache-DiT backend.
+
+For Stable Audio Open:
 
 ```bash
 python text_to_audio.py \

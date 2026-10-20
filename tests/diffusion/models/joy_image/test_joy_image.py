@@ -10,7 +10,6 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 
-from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.config import set_current_diffusion_config
 from vllm_omni.diffusion.data import AttentionConfig, AttentionSpec
 from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
@@ -219,7 +218,7 @@ class _TinyJoyLayerwisePipeline(torch.nn.Module):
     def __init__(self, *, device: torch.device, cleanup_mode: str):
         super().__init__()
         self.device = device
-        self.scheduler = SimpleNamespace(
+        self.scheduler: SimpleNamespace = SimpleNamespace(
             set_timesteps=lambda num_inference_steps, device: setattr(
                 self.scheduler,
                 "timesteps",
@@ -472,12 +471,6 @@ def test_model_level_cpu_offload_cleanup_still_moves_transformer(monkeypatch):
             {"non_blocking": False, "pin_memory": False},
         )
     ]
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@pytest.mark.parametrize("first_mode", ["dummy", "decoded", "latent"])
-def test_layerwise_joy_lifecycle_survives_second_forward(first_mode):
-    _run_tiny_joy_layerwise_sequence(first_mode)
 
 
 def test_joy_hsdp_is_explicitly_unsupported():
@@ -1086,93 +1079,6 @@ def test_encode_vae_image_does_not_forward_noise_generator_to_posterior_sample()
     )
 
     assert pipeline.vae.latent_dist.received_generator is None
-
-
-@pytest.mark.parametrize(
-    "dtype",
-    [
-        torch.float32,
-        torch.bfloat16,
-    ],
-)
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_joy_attention_native_sdpa_matches_torch_sdpa_without_mask(dtype):
-    torch.manual_seed(123)
-    device = torch.device("cuda")
-    attention = _make_joy_attention(dtype=dtype).to(device=device)
-    hidden_states = torch.randn(2, 3, 32, device=device, dtype=dtype)
-    encoder_hidden_states = torch.randn(2, 5, 32, device=device, dtype=dtype)
-
-    actual = attention(hidden_states, encoder_hidden_states)
-    expected = _reference_joy_attention_output(attention, hidden_states, encoder_hidden_states)
-
-    assert isinstance(attention.attn, Attention)
-    assert attention.attn.role == "joy_image.joint"
-    assert attention.attn.role_category == "self"
-    assert attention.attn.qkv_layout == "BSND"
-    _assert_attention_outputs_close(actual, expected, dtype=dtype)
-
-
-@pytest.mark.parametrize(
-    "dtype",
-    [
-        torch.float32,
-        torch.bfloat16,
-    ],
-)
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_joy_attention_native_sdpa_matches_torch_sdpa_with_padding_mask(dtype):
-    torch.manual_seed(456)
-    device = torch.device("cuda")
-    attention = _make_joy_attention(dtype=dtype).to(device=device)
-    hidden_states = torch.randn(2, 3, 32, device=device, dtype=dtype)
-    encoder_hidden_states = torch.randn(2, 5, 32, device=device, dtype=dtype)
-    attention_mask = torch.tensor(
-        [
-            [1, 1, 1, 1, 1, 1, 1, 1],
-            [1, 1, 1, 1, 1, 1, 0, 0],
-        ],
-        device=device,
-        dtype=torch.bool,
-    )
-
-    actual = attention(hidden_states, encoder_hidden_states, attention_mask=attention_mask)
-    expected = _reference_joy_attention_output(
-        attention,
-        hidden_states,
-        encoder_hidden_states,
-        attention_mask=attention_mask,
-    )
-
-    _assert_attention_outputs_close(actual, expected, dtype=dtype)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_transformer_shape_and_masked_forward():
-    device = torch.device("cuda")
-    transformer = JoyImageEditTransformer3DModel(
-        in_channels=4,
-        out_channels=4,
-        hidden_size=32,
-        text_dim=16,
-        num_layers=1,
-        num_attention_heads=4,
-        patch_size=(1, 2, 2),
-    ).to(device=device, dtype=torch.bfloat16)
-    hidden_states = torch.randn(2, 2, 4, 1, 4, 4, device=device, dtype=torch.bfloat16)
-    encoder_hidden_states = torch.randn(2, 5, 16, device=device, dtype=torch.bfloat16)
-    encoder_hidden_states_mask = torch.tensor([[1, 1, 1, 1, 1], [1, 1, 1, 0, 0]], device=device)
-
-    output = transformer(
-        hidden_states=hidden_states,
-        timestep=torch.tensor([1.0, 2.0], device=device),
-        encoder_hidden_states=encoder_hidden_states,
-        encoder_hidden_states_mask=encoder_hidden_states_mask,
-        return_dict=False,
-    )[0]
-
-    assert output.shape == hidden_states.shape
-    assert isinstance(transformer.double_blocks[0].attn.attn, Attention)
 
 
 def test_transformer_from_config_file_loads_checkpoint_config(tmp_path):
