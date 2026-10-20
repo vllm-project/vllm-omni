@@ -112,9 +112,6 @@ class _MossTTSAdapterBase(ARTTSAdapter):
             return await self.ctx.server._resolve_ref_audio(ref_audio)
         return await self.ctx.server._resolve_ref_audio_array(ref_audio)
 
-    def _voice_created_at(self, voice: str) -> int:
-        return self.ctx.server._voice_created_at(voice)
-
     def _get_resolved_ref_audio_artifact_key(self, cache_key: str):
         return self.ctx.server._get_resolved_ref_audio_artifact_key(cache_key)
 
@@ -126,12 +123,13 @@ class _MossTTSAdapterBase(ARTTSAdapter):
         from vllm_omni.model_executor.models.moss_tts.reference_encoder import build_reference_encoder
 
         # The variant's encode geometry (n_vq, working sample rate) is derived
-        # inside the model package; this layer only supplies the processor and
-        # the process-wide speaker cache.
+        # inside the model package; this layer only supplies the processor,
+        # the process-wide speaker cache and the multi-API scratch directory.
         encoder = build_reference_encoder(
             self._get_moss_realtime_components()[2] if self._moss_variant == "realtime" else self._get_moss_processor(),
             variant=cast(str, self._moss_variant),
             speaker_cache=self._speaker_cache,
+            server_dir=self.ctx.server.api_server_shared_dir,
         )
         self._moss_ref_encoder = encoder
         return encoder
@@ -346,9 +344,12 @@ class _MossTTSAdapterBase(ARTTSAdapter):
         if hasattr(proc, "audio_tokenizer"):
             device = self._resolve_ref_encoder_device()
             proc._vllm_omni_ref_encoder_device = device
-            from vllm_omni.model_executor.models.moss_tts.reference_encoder import shared_encoder_role
+            from vllm_omni.model_executor.models.moss_tts.reference_encoder import (
+                shared_codes_dir,
+                shared_encoder_role,
+            )
 
-            if shared_encoder_role() == "client":
+            if shared_encoder_role(shared_codes_dir(self.ctx.server.api_server_shared_dir)) == "client":
                 # Another API process hosts the shared encoder on the GPU.
                 proc.audio_tokenizer = proc.audio_tokenizer.eval()
                 logger.info("MOSS reference-audio encoder: using the shared encoder of another API process")

@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+import shlex
 from dataclasses import dataclass
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -14,7 +16,8 @@ from vllm_omni.diffusion.distributed import a2a_permute
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def test_jit_build_includes_cuda_headers_from_nvidia_wheels(tmp_path, monkeypatch) -> None:
+@pytest.mark.parametrize("toolkit_has_cusparse", [False, True])
+def test_jit_build_prefers_toolkit_and_keeps_wheel_headers(tmp_path, monkeypatch, toolkit_has_cusparse) -> None:
     cu13_include = tmp_path / "nvidia" / "cu13" / "include"
     nccl_include = tmp_path / "nvidia" / "nccl" / "include"
     nccl_lib = tmp_path / "nvidia" / "nccl" / "lib" / "libnccl.so.2"
@@ -24,6 +27,13 @@ def test_jit_build_includes_cuda_headers_from_nvidia_wheels(tmp_path, monkeypatc
     (cu13_include / "cusparse.h").touch()
     (nccl_include / "nccl.h").touch()
     nccl_lib.touch()
+
+    toolkit_include = tmp_path / "toolkit" / "include"
+    toolkit_include.mkdir(parents=True)
+    (toolkit_include / "cuda_runtime.h").touch()
+    (cu13_include / "cuda_runtime.h").touch()
+    if toolkit_has_cusparse:
+        (toolkit_include / "cusparse.h").touch()
 
     load_kwargs = {}
     monkeypatch.setattr(a2a_permute.sysconfig, "get_paths", lambda: {"purelib": str(tmp_path)})
@@ -37,7 +47,23 @@ def test_jit_build_includes_cuda_headers_from_nvidia_wheels(tmp_path, monkeypatc
 
     a2a_permute.ensure_a2a_permute_available()
 
-    assert set(load_kwargs["extra_include_paths"]) == {str(cu13_include), str(nccl_include)}
+    assert not load_kwargs.get("extra_include_paths")
+    vendor_paths = []
+    for flag in load_kwargs["extra_cuda_cflags"]:
+        args = shlex.split(flag)
+        if args[0] == "-isystem":
+            assert flag in load_kwargs["extra_cflags"]
+            vendor_paths.append(args[1])
+    assert set(vendor_paths) == {str(cu13_include), str(nccl_include)}
+    # cpp_extension places its toolkit system include before extra flags.
+    paths = [str(toolkit_include), *vendor_paths]
+
+    def selected_header(name):
+        return next(Path(path) / name for path in paths if (Path(path) / name).is_file())
+
+    assert selected_header("cuda_runtime.h") == toolkit_include / "cuda_runtime.h"
+    expected_cusparse = toolkit_include if toolkit_has_cusparse else cu13_include
+    assert selected_header("cusparse.h") == expected_cusparse / "cusparse.h"
     assert load_kwargs["extra_ldflags"] == [str(nccl_lib)]
 
 
