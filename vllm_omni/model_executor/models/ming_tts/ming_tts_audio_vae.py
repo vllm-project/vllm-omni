@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Adopted from https://github.com/inclusionAI/Ming-omni-tts/blob/main/audio_tokenizer/modeling_audio_vae.py
 from __future__ import annotations
 
@@ -20,11 +20,10 @@ from vllm_omni.model_executor.models.common.ming.audio_vae import AudioVAE
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
 from .config_ming_tts import KEY_CHUNK_ID, KEY_REQUEST_ID, MingTTSConfig
-from .patch_emission import MING_STOP_REASON_KEY
+from .patch_emission import MING_FINAL_DECODE_STEP_KEY, MING_STOP_REASON_KEY
 
 logger = init_logger(__name__)
 
-MING_FINAL_DECODE_STEP_KEY = "ming_final_decode_step"
 _STREAM_STATE_TTL_SECONDS = 15 * 60
 _MAX_STREAM_STATES = 1024
 

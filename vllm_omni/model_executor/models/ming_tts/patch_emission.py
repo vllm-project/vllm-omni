@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Adopted from https://github.com/inclusionAI/Ming-omni-tts/blob/main/modeling_bailingmm.py
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ MING_STOP_REASON_CONTINUE = "continue"
 MING_STOP_REASON_STOP_HEAD = "stop_head"
 MING_STOP_REASON_MAX_DECODE_STEPS = "max_decode_steps"
 MING_STOP_REASON_KEY = "ming_stop_reason"
+MING_FINAL_DECODE_STEP_KEY = "ming_final_decode_step"
 MING_STOP_REASON_CODES = {
     MING_STOP_REASON_CONTINUE: 0,
     MING_STOP_REASON_STOP_HEAD: 1,
