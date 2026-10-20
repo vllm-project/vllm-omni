@@ -9,7 +9,7 @@ import pytest
 import torch
 import torch.nn as nn
 
-from tests.helpers.mark import hardware_test
+from tests.helpers.mark import hardware_marks, hardware_test
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 from vllm_omni.diffusion.models.qwen_image import qwen_image_transformer as qwen_mod
 from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
@@ -17,7 +17,7 @@ from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
     _qwen_image_qk_norm_rope,
 )
 
-pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
+pytestmark = [pytest.mark.core_model, *hardware_marks(res={"cuda": "L4"}, num_cards=1), pytest.mark.diffusion]
 
 BATCH = 2
 Q_HEADS = 24
@@ -267,7 +267,6 @@ def _joint_reference(txt: QwenImageQKInput, img: QwenImageQKInput, *, use_fused:
     return torch.cat([txt_q, img_q], dim=1), torch.cat([txt_k, img_k], dim=1)
 
 
-@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("txt_len,img_len", [(512, 4096), (77, 1024)])
 def test_joint_launch_matches_per_stream_then_cat(txt_len, img_len, force_always_fuse):
@@ -321,7 +320,6 @@ def test_packed_table_skipped_when_fused_path_unavailable(force_always_fuse):
         assert torch.equal(table, expected)  # text first, as the eager cat
 
 
-@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_packed_table_respects_token_gate(monkeypatch):
     """The joint launch keeps the per-stream gate: below it main's eager chain runs."""
@@ -340,7 +338,6 @@ def test_packed_table_respects_token_gate(monkeypatch):
 # --- VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS override -----------------------
 
 
-@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_min_tokens_env_large_value_disables_both_paths(monkeypatch):
     """A value above every sequence keeps both the joint and the per-stream path on the eager chain."""
@@ -361,7 +358,6 @@ def test_min_tokens_env_large_value_disables_both_paths(monkeypatch):
     assert _packed_qk_norm_rope_table(vid, txt, 1, torch.bfloat16).shape == (2048, HEAD_DIM)
 
 
-@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_min_tokens_env_zero_forces_both_paths(monkeypatch):
     """``0`` removes the threshold for the joint and the per-stream path alike."""
