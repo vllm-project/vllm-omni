@@ -112,7 +112,9 @@ def _encode_temporal_tail_pad(self, x):
     return z
 
 
-def _decode_temporal_streaming_uint8(self, z, z_head, z_tail, num_chunks, pad_tokens, temporal_cat_dtype):
+def _decode_temporal_streaming_uint8(
+    self, z, z_head, z_tail, num_chunks, pad_tokens, temporal_cat_dtype, output_callback=None
+):
     """Drop-in fork of the checkpoint's ``_decode_temporal_streaming``.
 
     The chunk loop, overlap blending, frame plan, and assertions are
@@ -120,6 +122,18 @@ def _decode_temporal_streaming_uint8(self, z, z_head, z_tail, num_chunks, pad_to
     denormalize -> clamp -> quantize chain in place (the same op order the
     pipeline applies after decode) and accumulates into a uint8 buffer.
     """
+    if output_callback is not None:
+        # Callback consumers expect the checkpoint's raw floating-point
+        # chunks. Preserve that contract rather than applying uint8 conversion.
+        return self._omni_original_decode_temporal_streaming(
+            z,
+            z_head,
+            z_tail,
+            num_chunks,
+            pad_tokens,
+            temporal_cat_dtype,
+            output_callback=output_callback,
+        )
     total_frames, pad_frames, output_frames = self._decode_temporal_output_frame_plan(
         z, z_head, z_tail, num_chunks, pad_tokens
     )
@@ -262,6 +276,8 @@ def install_temporal_stream_patches(model) -> None:
     else:
         logger.warning("MiniMax-H3 VAE encode_temporal contract not found; keeping checkpoint method")
     if callable(getattr(model, "_decode_temporal_streaming", None)) and _processor_denorm_available(model):
+        if getattr(model._decode_temporal_streaming, "__func__", None) is not _decode_temporal_streaming_uint8:
+            model._omni_original_decode_temporal_streaming = model._decode_temporal_streaming
         model._decode_temporal_streaming = MethodType(_decode_temporal_streaming_uint8, model)
         logger.info("MiniMax-H3 VAE streaming uint8 decode patch installed")
     else:
