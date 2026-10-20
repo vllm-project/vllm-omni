@@ -1258,9 +1258,17 @@ class DuplexSessionRunner:
                 # VAD's force_listen hint controls native model decoding. Committed
                 # turn models already buffer speech; it must not suppress barge-in.
                 segment.pop("force_listen", None)
-            await self._append_detected_audio(segment, vad_result)
+            # Every segment is admitted audio. The first PCM handoff releases the
+            # admission charge; the release is idempotent for later segments.
+            await self._append_detected_audio(segment, vad_result, release_queued_input=release_queued_input)
 
-    async def _append_detected_audio(self, event: dict[str, object], vad_result: TurnDetectionResult | None) -> None:
+    async def _append_detected_audio(
+        self,
+        event: dict[str, object],
+        vad_result: TurnDetectionResult | None,
+        *,
+        release_queued_input: Callable[[], None] | None = None,
+    ) -> None:
         """Buffer one segment and apply its commit before accepting the next one."""
         session = self.session
         model_state = self.model_state
