@@ -13,7 +13,8 @@
 ## References
 
 - [Hugging Face model](https://huggingface.co/inclusionAI/Ming-3.0-audio-flash)
-- [Upstream repository](https://github.com/inclusionAI/Ming)
+- [Hugging Face Tiny model](https://huggingface.co/inclusionAI/Ming-3.0-audio-tiny)
+- [Upstream repository and examples](https://github.com/inclusionAI/Ming-3.0-audio-flash)
 
 ## Overview
 
@@ -43,38 +44,6 @@ vllm serve inclusionAI/Ming-3.0-audio-flash \
 
 `"modalities": ["text"]` stops after the thinker.
 `"modalities": ["text", "audio"]` runs the talker and returns the same answer as text and speech.
-
-### 2 x H200
-
-For two H200 GPUs, the following example selects TP=2:
-
-Save the following overlay as `vllm_omni/deploy/ming3_audio_flash_2gpu_h200.yaml`:
-
-```yaml
-base_config: ming3_audio_flash.yaml
-
-stages:
-  - stage_id: 0
-    devices: "0,1"
-    tensor_parallel_size: 2
-    gpu_memory_utilization: 0.88
-
-  - stage_id: 1
-    devices: "1"
-    gpu_memory_utilization: 0.10
-```
-
-Launch the server with:
-
-```bash
-vllm serve /path/to/inclusionAI/Ming-3.0-audio-flash \
-    --omni \
-    --deploy-config vllm_omni/deploy/ming3_audio_flash_2gpu_h200.yaml \
-    --init-timeout 1800 \
-    --stage-init-timeout 1800 \
-    --served-model-name ming3-audio-flash \
-    --port 8091
-```
 
 ### Text-only deployment
 
@@ -186,10 +155,10 @@ The earlier Flash `*_128k`, `*_history`, `*_history_cache`, `*_llm_graph` and
 Use `ming3_audio_flash.yaml` for speech output or the ASR/thinker-only profiles
 for text output. Limit answer length with request `max_tokens` as needed.
 
-Tiny profiles require a compatible Tiny checkpoint, selected explicitly:
+Tiny profiles use the [Ming-3.0-audio-tiny checkpoint](https://huggingface.co/inclusionAI/Ming-3.0-audio-tiny), selected explicitly:
 
 ```bash
-vllm serve /path/to/Ming-3.0-audio-tiny --omni \
+vllm serve inclusionAI/Ming-3.0-audio-tiny --omni \
     --deploy-config ming3_audio_tiny.yaml \
     --served-model-name ming3-audio-tiny --port 8091
 ```
@@ -234,10 +203,15 @@ curl http://localhost:8091/v1/chat/completions \
 
 ### Ask a question in audio
 
-Set `MING3_AUDIO_FILE` to the example clip in your downloaded model directory:
+The upstream [`examples/audio/`](https://github.com/inclusionAI/Ming-3.0-audio-flash/tree/main/examples/audio) directory includes `introduce_ant_group.wav`. Its [manifest](https://github.com/inclusionAI/Ming-3.0-audio-flash/blob/main/examples/audio/manifest.json) identifies the spoken question as “介绍一下蚂蚁集团。” (24 kHz mono, 2.48 seconds).
+
+Download the clip once from the public source, then reuse it for this request and **Speak the answer** below. The download runs on the client before inference; no local model directory is needed:
 
 ```bash
-MING3_AUDIO_FILE=/path/to/inclusionAI/Ming-3.0-audio-flash/examples/audio_files/introduce_ant_group.wav
+BASE=https://raw.githubusercontent.com/inclusionAI/Ming-3.0-audio-flash/main/examples/audio
+MING3_AUDIO_FILE=introduce_ant_group.wav
+curl --fail --location "$BASE/introduce_ant_group.wav" --output "$MING3_AUDIO_FILE"
+
 base64 -w0 "$MING3_AUDIO_FILE" | jq -Rs '{
   model: "ming3-audio-flash",
   messages: [
@@ -322,14 +296,13 @@ pronunciation of numbers, dates and amounts. Text-only ASR does not load them.
 
 Stop the full server before starting the standalone service on the same port. Run the request in a separate terminal after startup.
 
-Converted Ming3 exports contain a `talker/` directory with the Talker config,
-LLM tokenizer, AudioVAE and speaker extractor. Serve that export with the
-Ming3-specific profile. The resolver accepts a local export or a Hub repository
-with that layout; `--revision` selects the Hub snapshot. Download remote storage
-exports into a local directory before serving.
+The official [Ming-3.0-audio-flash checkpoint](https://huggingface.co/inclusionAI/Ming-3.0-audio-flash) includes a `talker/` directory with the Talker config,
+LLM tokenizer, AudioVAE and speaker extractor. The Ming3-specific profile loads
+only the Talker assets, without loading Thinker weights. The resolver also accepts
+a local export with the same layout; `--revision` selects the Hub snapshot.
 
 ```bash
-vllm serve /path/to/converted-Ming3-export --omni \
+vllm serve inclusionAI/Ming-3.0-audio-flash --omni \
     --deploy-config vllm_omni/deploy/ming3_audio_tts.yaml \
     --served-model-name ming3-audio-tts \
     --port 8091
