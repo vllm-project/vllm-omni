@@ -206,19 +206,23 @@ def _find_steps_selecting_path(pipeline_path: Path, test_path: str) -> list[dict
     return matches
 
 
-def _find_model_executor_cpu_shard_step(pipeline_path: Path) -> dict:
+def _find_model_executor_cpu_shard_step(pipeline_path: Path) -> tuple[dict, list[str]]:
     matches = []
     pipeline = yaml.safe_load(pipeline_path.read_text(encoding="utf-8"))
 
     def walk(steps: list[dict]) -> None:
         for step in steps:
-            commands = step.get("commands", [])
-            if any(
-                split(command)[:3] == ["pytest", "-sv", "tests/model_executor"]
-                and "--num-shards=$$BUILDKITE_PARALLEL_JOB_COUNT" in split(command)
-                for command in commands
-            ):
-                matches.append(step)
+            for command in step.get("commands", []):
+                # Keep shell setup and output capture around the pytest invocation.
+                for line in command.replace("\\\n", "").splitlines():
+                    if not line.lstrip().startswith("pytest "):
+                        continue
+                    argv = split(line)
+                    if (
+                        argv[:3] == ["pytest", "-sv", "tests/model_executor"]
+                        and "--num-shards=$$BUILDKITE_PARALLEL_JOB_COUNT" in argv
+                    ):
+                        matches.append((step, argv))
             walk(step.get("steps", []))
 
     walk(pipeline.get("steps", []))
@@ -372,9 +376,7 @@ def test_omni_processor_full_matrix_moves_to_nightly_with_blocking_rocm_smoke() 
 def test_model_executor_cpu_shards_keep_fast_personaplex_and_exclude_slow_stress(
     pipeline_path: Path,
 ) -> None:
-    step = _find_model_executor_cpu_shard_step(pipeline_path)
-    pytest_command = next(command for command in step["commands"] if "tests/model_executor" in command)
-    argv = split(pytest_command)
+    step, argv = _find_model_executor_cpu_shard_step(pipeline_path)
 
     assert step["parallelism"] == 3
     assert argv[:3] == ["pytest", "-sv", "tests/model_executor"]

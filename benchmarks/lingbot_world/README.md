@@ -1,5 +1,9 @@
 # LingBot-World Benchmarks — Realtime Streaming Cadence
 
+For blocking GPU/NPU performance, precision, WBench/VBench and long-session
+pytest jobs, see the [CI regression suite](../../tests/dfx/lingbot_world/README.md).
+The standalone benchmark reports measurements; the pytest suite asserts gates.
+
 `benchmark_lingbot_world_realtime.py` measures LingBot-World 2.0 as it is
 actually deployed: one `WS /v1/realtime/video` session that streams one video
 chunk per AR block, for as long as the world keeps running.

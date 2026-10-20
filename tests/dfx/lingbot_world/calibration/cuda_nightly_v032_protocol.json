@@ -1,0 +1,19 @@
+{
+  "protocol_source_revision": "89739f237482ba0495470759271e4143af718c10",
+  "protocol_path": "tests/dfx/lingbot_world/README.md",
+  "reference_revision": "48cebe5a248d4b0160f20c7fc18b5d1c46883872",
+  "scope": "CUDA nightly only; no weekly or NPU campaign",
+  "training_cohort_1": 17633,
+  "training_cohort_2": "next independent CUDA nightly campaign after duplex fixture fix",
+  "reference_starts_per_cohort": 3,
+  "training_reference_starts": 6,
+  "native_reference_spread": "Per case/dimension: max(existing conservative ceiling, ceil(six-reference range * 1.25 / 0.005) * 0.005)",
+  "pixels": "All 15 unordered reference-video pairs per case, complete frames/windows and pinned canonical decoder",
+  "transient_noise": "Maximum two-way reference-cohort excess * 1.25; ceil to 1ms startup-stall / 5ms TTFC",
+  "p95_cv": "Largest training case/cohort reference CV * 1.25, round up to0.005 and at least0.03",
+  "candidate_allowances_changed": false,
+  "candidate_data_used_to_fit": false,
+  "historical_records_immutable": true,
+  "heldout": "Freeze before third independent reference cohort and final-source candidates; investigate failure without refitting",
+  "protocol_file_sha256": "50a28ed3461cc85735ffdd8cb0ecc534c93b4f00c51d9bac3f75bcb515fc39d9"
+}

@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "reference_revision": "8d7c354674c7e1dc57544f248689574fccb71af9",
+  "model_revision": "59cccf49f2d2dd27418ae7a04b82b10868d455c2",
+  "height": 480,
+  "width": 832,
+  "precision": "bfloat16",
+  "num_chunks": 600,
+  "warmup_chunks": 6,
+  "min_steady_samples": 1186,
+  "mux_fps": 16,
+  "target_fps": 12,
+  "startup_timeout_s": 1200,
+  "precision_timeout_s": 600,
+  "first_chunk_timeout_s": 900,
+  "chunk_timeout_s": 120,
+  "lifecycle_checks": true,
+  "max_reference_cv": 0.03,
+  "performance_regression_fraction": 0.05,
+  "precision_atol": 0.0,
+  "precision_rtol": 0.0,
+  "cases": [
+    {
+      "id": "boardwalk-42",
+      "image": "2560px-Gfp-wisconsin-madison-the-nature-boardwalk",
+      "prompt": "The camera moves through a wooden boardwalk in a green wetland.",
+      "camera_pattern": "forward",
+      "seed": 42
+    }
+  ],
+  "platform": "npu",
+  "cpu_threads_per_worker": 1,
+  "cards": 4,
+  "reserved_cards": 8,
+  "dies": 4,
+  "deploy_config": "tests/dfx/lingbot_world/configs/npu_usp4_offload.yaml",
+  "memory_growth_budget_bytes": 268435456,
+  "measured_sessions": 2,
+  "warmup_num_chunks": 8,
+  "transient_noise_sigma": 3.0
+}

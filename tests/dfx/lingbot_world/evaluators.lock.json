@@ -1,0 +1,79 @@
+{
+  "files": {
+    "vbench-cache/aesthetic_model/emb_reader/sa_0_4_vit_l_14_linear.pth": "2cd4e60f4f24ae3bcd57b847b13c1f3ba27edc28cc1a7f9ce74ee9f421243cba",
+    "vbench-cache/amt_model/amt-s.pth": "07e7e03405c213fe4405678db9b42d05671e48c56faf6a441b99bb0047d3cf77",
+    "vbench-cache/clip_model/ViT-B-32.pt": "40d365715913c9da98579312b702a82c18be219cc2a73407c4526f58eba950af",
+    "vbench-cache/clip_model/ViT-L-14.pt": "b8cca3fd41ae0c99ba7e8951adf17d267cdb84cd88be6f7c2e0eca1737a03836",
+    "vbench-cache/dino_model/dino_vitbase16_pretrain.pth": "bf34ad0f424b9029b593e8dc3ed553bf26e88bcba0d32bf3e62a6209cb64c85e",
+    "vbench-cache/pyiqa_model/musiq_spaq_ckpt-358bb6af.pth": "358bb6af275e28ea56821d44fb55c6cb83645db11f394d3ad65b2d149965ab50",
+    "vbench-cache/raft_model/models/raft-things.pth": "fcfa4125d6418f4de95d84aec20a3c5f4e205101715a79f193243c186ac9a7e1",
+    "wbench/weights/HPSv3/HPSv3.safetensors": "a13d7ff5a07b7ffa0f7824e60d62e6ae144541ceefd5224b4c08fda7ab39f353",
+    "wbench/weights/HPSv3/HPSv3_7B_local.yaml": "a62d034031fa57a6da30750ad739efbe224318d0a5d6f7d8ec6da106543c751c",
+    "wbench/weights/Qwen2-VL-7B-Instruct/chat_template.json": "ad60d90252ed0b0705ba14e2d0ad0fec0beac1ea955642b54059b36052d8bc96",
+    "wbench/weights/Qwen2-VL-7B-Instruct/config.json": "4745aaba24756172765cb804b86512792202df6c65ac28989355971bbb27649c",
+    "wbench/weights/Qwen2-VL-7B-Instruct/generation_config.json": "85fb0349cef993fe7d1cab4baa61c81a42326c3a549dc220fcecb43e6eea3413",
+    "wbench/weights/Qwen2-VL-7B-Instruct/merges.txt": "599bab54075088774b1733fde865d5bd747cbcc7a547c5bc12610e874e26f5e3",
+    "wbench/weights/Qwen2-VL-7B-Instruct/model-00001-of-00005.safetensors": "eab4f4dc1abf860794c98ce3759b4ace1059fc0fc041ede76b88988b3557c132",
+    "wbench/weights/Qwen2-VL-7B-Instruct/model-00002-of-00005.safetensors": "0546b7cd070ff239de0f61a28770de6a0ac517ad313071e151653e38911ffb25",
+    "wbench/weights/Qwen2-VL-7B-Instruct/model-00003-of-00005.safetensors": "11368ea1e9c0039ca54012a74ac32d543a9e9d980b2d0ad7e93af0341ace1fe6",
+    "wbench/weights/Qwen2-VL-7B-Instruct/model-00004-of-00005.safetensors": "381e110d74db594cc24956af0e74a01ae02104497113a78926990c5bd1f395f6",
+    "wbench/weights/Qwen2-VL-7B-Instruct/model-00005-of-00005.safetensors": "e76ec4dc2e7c0dcbe3432e58fae08e62204a2ef2323069d85c8fa0affb87332a",
+    "wbench/weights/Qwen2-VL-7B-Instruct/model.safetensors.index.json": "4cb1cbc47a33f4b18226b5d938127227cbdcb21bf0448f78aa665e3dbe7f15d6",
+    "wbench/weights/Qwen2-VL-7B-Instruct/preprocessor_config.json": "b5eaad0c2815f07631535dcc58f3c462b0d73693638ad21d19f3c50820eae1cc",
+    "wbench/weights/Qwen2-VL-7B-Instruct/tokenizer.json": "cb63a0a23eef3d5b01063a9880a1925a65aaf4d1591d519910ee3527852950a0",
+    "wbench/weights/Qwen2-VL-7B-Instruct/tokenizer_config.json": "ff5c4fd898fe8c39591eb70e5d39d2782802d4204d6ae9ba1223252f354842a0",
+    "wbench/weights/Qwen2-VL-7B-Instruct/vocab.json": "ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910",
+    "wbench/weights/aesthetic/sa_0_4_vit_l_14_linear.pth": "2cd4e60f4f24ae3bcd57b847b13c1f3ba27edc28cc1a7f9ce74ee9f421243cba",
+    "wbench/weights/amt/amt-s.pth": "07e7e03405c213fe4405678db9b42d05671e48c56faf6a441b99bb0047d3cf77",
+    "wbench/weights/clip/ViT-B-32.pt": "40d365715913c9da98579312b702a82c18be219cc2a73407c4526f58eba950af",
+    "wbench/weights/clip/ViT-L-14.pt": "b8cca3fd41ae0c99ba7e8951adf17d267cdb84cd88be6f7c2e0eca1737a03836",
+    "wbench/weights/pyiqa/musiq_koniq_ckpt-e95806b9.pth": "e95806b9eae5f3814c410f574ba8e552362bd5bc63d758ed5b97860f5d6185aa",
+    "wbench/weights/raft/raft-things.pth": "fcfa4125d6418f4de95d84aec20a3c5f4e205101715a79f193243c186ac9a7e1"
+  },
+  "repositories": {
+    "vbench": {
+      "revision": "fd18b3d055cb0fc6f066ca90fe2c3c8cbb698490",
+      "url": "https://github.com/Vchitect/VBench.git"
+    },
+    "vbench-cache/dino_model/facebookresearch_dino_main": {
+      "revision": "7c446df5b9f45747937fb0d72314eb9f7b66930a",
+      "url": "https://github.com/facebookresearch/dino.git"
+    },
+    "wbench": {
+      "revision": "fdd7e74c400d7b5f8310e07dd94c129eaf6c6f61",
+      "url": "https://github.com/meituan-longcat/WBench.git"
+    }
+  },
+  "schema_version": 1,
+  "urls": {
+    "vbench-cache/aesthetic_model/emb_reader/sa_0_4_vit_l_14_linear.pth": "https://huggingface.co/meituan-longcat/WBench-weights/resolve/1c5fde9aed33c2659a620e244d0151b7741e237d/aesthetic/sa_0_4_vit_l_14_linear.pth",
+    "vbench-cache/amt_model/amt-s.pth": "https://huggingface.co/meituan-longcat/WBench-weights/resolve/1c5fde9aed33c2659a620e244d0151b7741e237d/amt/amt-s.pth",
+    "vbench-cache/clip_model/ViT-B-32.pt": "https://huggingface.co/meituan-longcat/WBench-weights/resolve/1c5fde9aed33c2659a620e244d0151b7741e237d/clip/ViT-B-32.pt",
+    "vbench-cache/clip_model/ViT-L-14.pt": "https://huggingface.co/meituan-longcat/WBench-weights/resolve/1c5fde9aed33c2659a620e244d0151b7741e237d/clip/ViT-L-14.pt",
+    "vbench-cache/dino_model/dino_vitbase16_pretrain.pth": "https://dl.fbaipublicfiles.com/dino/dino_vitbase16_pretrain/dino_vitbase16_pretrain.pth",
+    "vbench-cache/pyiqa_model/musiq_spaq_ckpt-358bb6af.pth": "https://github.com/chaofengc/IQA-PyTorch/releases/download/v0.1-weights/musiq_spaq_ckpt-358bb6af.pth",
+    "vbench-cache/raft_model/models/raft-things.pth": "https://huggingface.co/meituan-longcat/WBench-weights/resolve/1c5fde9aed33c2659a620e244d0151b7741e237d/raft/raft-things.pth",
+    "wbench/weights/HPSv3/HPSv3.safetensors": "https://huggingface.co/meituan-longcat/WBench-weights/resolve/1c5fde9aed33c2659a620e244d0151b7741e237d/HPSv3/HPSv3.safetensors",
+    "wbench/weights/HPSv3/HPSv3_7B_local.yaml": "https://huggingface.co/meituan-longcat/WBench-weights/resolve/1c5fde9aed33c2659a620e244d0151b7741e237d/HPSv3/HPSv3_7B_local.yaml",
+    "wbench/weights/Qwen2-VL-7B-Instruct/chat_template.json": "https://huggingface.co/Qwen/Qwen2-VL-7B-Instruct/resolve/eed13092ef92e448dd6875b2a00151bd3f7db0ac/chat_template.json",
+    "wbench/weights/Qwen2-VL-7B-Instruct/config.json": "https://huggingface.co/Qwen/Qwen2-VL-7B-Instruct/resolve/eed13092ef92e448dd6875b2a00151bd3f7db0ac/config.json",
+    "wbench/weights/Qwen2-VL-7B-Instruct/generation_config.json": "https://huggingface.co/Qwen/Qwen2-VL-7B-Instruct/resolve/eed13092ef92e448dd6875b2a00151bd3f7db0ac/generation_config.json",
+    "wbench/weights/Qwen2-VL-7B-Instruct/merges.txt": "https://huggingface.co/Qwen/Qwen2-VL-7B-Instruct/resolve/eed13092ef92e448dd6875b2a00151bd3f7db0ac/merges.txt",
+    "wbench/weights/Qwen2-VL-7B-Instruct/model-00001-of-00005.safetensors": "https://huggingface.co/Qwen/Qwen2-VL-7B-Instruct/resolve/eed13092ef92e448dd6875b2a00151bd3f7db0ac/model-00001-of-00005.safetensors",
+    "wbench/weights/Qwen2-VL-7B-Instruct/model-00002-of-00005.safetensors": "https://huggingface.co/Qwen/Qwen2-VL-7B-Instruct/resolve/eed13092ef92e448dd6875b2a00151bd3f7db0ac/model-00002-of-00005.safetensors",
+    "wbench/weights/Qwen2-VL-7B-Instruct/model-00003-of-00005.safetensors": "https://huggingface.co/Qwen/Qwen2-VL-7B-Instruct/resolve/eed13092ef92e448dd6875b2a00151bd3f7db0ac/model-00003-of-00005.safetensors",
+    "wbench/weights/Qwen2-VL-7B-Instruct/model-00004-of-00005.safetensors": "https://huggingface.co/Qwen/Qwen2-VL-7B-Instruct/resolve/eed13092ef92e448dd6875b2a00151bd3f7db0ac/model-00004-of-00005.safetensors",
+    "wbench/weights/Qwen2-VL-7B-Instruct/model-00005-of-00005.safetensors": "https://huggingface.co/Qwen/Qwen2-VL-7B-Instruct/resolve/eed13092ef92e448dd6875b2a00151bd3f7db0ac/model-00005-of-00005.safetensors",
+    "wbench/weights/Qwen2-VL-7B-Instruct/model.safetensors.index.json": "https://huggingface.co/Qwen/Qwen2-VL-7B-Instruct/resolve/eed13092ef92e448dd6875b2a00151bd3f7db0ac/model.safetensors.index.json",
+    "wbench/weights/Qwen2-VL-7B-Instruct/preprocessor_config.json": "https://huggingface.co/Qwen/Qwen2-VL-7B-Instruct/resolve/eed13092ef92e448dd6875b2a00151bd3f7db0ac/preprocessor_config.json",
+    "wbench/weights/Qwen2-VL-7B-Instruct/tokenizer.json": "https://huggingface.co/Qwen/Qwen2-VL-7B-Instruct/resolve/eed13092ef92e448dd6875b2a00151bd3f7db0ac/tokenizer.json",
+    "wbench/weights/Qwen2-VL-7B-Instruct/tokenizer_config.json": "https://huggingface.co/Qwen/Qwen2-VL-7B-Instruct/resolve/eed13092ef92e448dd6875b2a00151bd3f7db0ac/tokenizer_config.json",
+    "wbench/weights/Qwen2-VL-7B-Instruct/vocab.json": "https://huggingface.co/Qwen/Qwen2-VL-7B-Instruct/resolve/eed13092ef92e448dd6875b2a00151bd3f7db0ac/vocab.json",
+    "wbench/weights/aesthetic/sa_0_4_vit_l_14_linear.pth": "https://huggingface.co/meituan-longcat/WBench-weights/resolve/1c5fde9aed33c2659a620e244d0151b7741e237d/aesthetic/sa_0_4_vit_l_14_linear.pth",
+    "wbench/weights/amt/amt-s.pth": "https://huggingface.co/meituan-longcat/WBench-weights/resolve/1c5fde9aed33c2659a620e244d0151b7741e237d/amt/amt-s.pth",
+    "wbench/weights/clip/ViT-B-32.pt": "https://huggingface.co/meituan-longcat/WBench-weights/resolve/1c5fde9aed33c2659a620e244d0151b7741e237d/clip/ViT-B-32.pt",
+    "wbench/weights/clip/ViT-L-14.pt": "https://huggingface.co/meituan-longcat/WBench-weights/resolve/1c5fde9aed33c2659a620e244d0151b7741e237d/clip/ViT-L-14.pt",
+    "wbench/weights/pyiqa/musiq_koniq_ckpt-e95806b9.pth": "https://huggingface.co/meituan-longcat/WBench-weights/resolve/1c5fde9aed33c2659a620e244d0151b7741e237d/pyiqa/musiq_koniq_ckpt-e95806b9.pth",
+    "wbench/weights/raft/raft-things.pth": "https://huggingface.co/meituan-longcat/WBench-weights/resolve/1c5fde9aed33c2659a620e244d0151b7741e237d/raft/raft-things.pth"
+  }
+}

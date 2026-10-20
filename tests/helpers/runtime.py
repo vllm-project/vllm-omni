@@ -171,9 +171,13 @@ class OmniServer:
         env_dict: dict[str, str] | None = None,
         use_omni: bool = True,
         startup_timeout: int = SERVER_STARTUP_TIMEOUT_S,
+        source_root: str | None = None,
     ) -> None:
         cleanup_test_environment()
         self.startup_timeout = startup_timeout
+        # Paired regression tests run a frozen reference in a separate checkout
+        # under the same interpreter/dependencies as the candidate.
+        self.source_root = source_root or _omni_subprocess_cwd()
         self.model = model
         self.serve_args = list(serve_args)
         self.log_stats = "--disable-log-stats" not in self.serve_args and "--log-stats" in self.serve_args
@@ -253,7 +257,7 @@ class OmniServer:
         self.proc = subprocess.Popen(
             cmd,
             env=env,
-            cwd=_omni_subprocess_cwd(),
+            cwd=self.source_root,
         )
 
         max_wait = self.startup_timeout
@@ -417,13 +421,49 @@ class OmniServer:
         except psutil.NoSuchProcess:
             pass
 
+    def _log_startup_processes(self) -> None:
+        """Retain bounded process evidence before failed startup tears it down."""
+        if self.proc is None:
+            return
+        rows: list[dict[str, object]] = []
+        snapshot: dict[str, object] = {"processes": rows}
+        try:
+            parent = psutil.Process(self.proc.pid)
+            children = parent.children(recursive=True)
+            snapshot["omitted_processes"] = max(0, len(children) - 31)
+            for process in [parent, *children[:31]]:
+                row: dict[str, object] = {"pid": process.pid}
+                try:
+                    attrs = ["pid", "ppid", "name", "status", "num_threads", "cpu_times", "memory_info"]
+                    if hasattr(process, "io_counters"):
+                        attrs.append("io_counters")
+                    row.update(
+                        process.as_dict(
+                            attrs=attrs,
+                            ad_value=None,
+                        )
+                    )
+                except psutil.Error as error:
+                    row["error"] = str(error)
+                try:
+                    row["wait_channel"] = Path(f"/proc/{process.pid}/wchan").read_text().strip()
+                except OSError as error:
+                    row["wait_channel_error"] = str(error)
+                rows.append(row)
+        except psutil.Error as error:
+            snapshot["error"] = str(error)
+        logger.warning("Server startup process snapshot before cleanup: %s", snapshot)
+
     def __enter__(self):
         try:
             self._start_server()
         except BaseException:
             # ``__exit__`` is not invoked when ``__enter__`` raises; roll back
             # any processes / log handles already launched.
-            self.__exit__(None, None, None)
+            try:
+                self._log_startup_processes()
+            finally:
+                self.__exit__(None, None, None)
             raise
         return self
 

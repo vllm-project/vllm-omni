@@ -86,7 +86,7 @@ def wait_for_gpu_memory_to_clear(
     assert threshold_bytes is not None or threshold_ratio is not None
     logical_devices = list(devices)
     physical_by_logical = {logical: _logical_to_physical(logical) for logical in logical_devices}
-    start_time = time.time()
+    start_time = time.monotonic()
 
     device_list = ", ".join(str(physical_by_logical[d]) for d in logical_devices)
     if threshold_bytes is not None:
@@ -132,7 +132,7 @@ def wait_for_gpu_memory_to_clear(
                 line += f" [Whisper worker {whisper:.1f}GiB excluded]"
             print(line)
 
-        dur_s = time.time() - start_time
+        dur_s = time.monotonic() - start_time
         if all(is_free(used, total) for used, total, _whisper in output_raw.values()):
             print(f"[Device Memory Freed] Device(s) {device_list} meet memory condition")
             print(f"   Condition: {condition_str}")

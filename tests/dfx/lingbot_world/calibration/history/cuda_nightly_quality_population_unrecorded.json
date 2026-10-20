@@ -1,0 +1,2729 @@
+{
+  "asset_lock_sha256": "18f352ed2b20b48ca8ccf5de3489d961571f3d180d2abe710828bb5c2613fa81",
+  "cases": {
+    "blossom-42": {
+      "input": {
+        "camera_pattern": "orbit",
+        "id": "blossom-42",
+        "image": "cherry_blossom",
+        "prompt": "Cherry blossoms in a quiet park, detailed natural scenery.",
+        "seed": 42
+      },
+      "pixels": [
+        {
+          "decoded_frames": 477,
+          "ssim": {
+            "mean": 0.3310215611223304
+          },
+          "total": {
+            "psnr_db": 12.357460524506049,
+            "psnr_is_infinite": false
+          },
+          "uniform_frame_indices": {
+            "candidate": [],
+            "reference": []
+          },
+          "windows": [
+            {
+              "frame_count": 32,
+              "index": 0,
+              "psnr_db": 28.007631043069146,
+              "psnr_is_infinite": false,
+              "start_frame": 0
+            },
+            {
+              "frame_count": 32,
+              "index": 1,
+              "psnr_db": 21.7609382148906,
+              "psnr_is_infinite": false,
+              "start_frame": 32
+            },
+            {
+              "frame_count": 32,
+              "index": 2,
+              "psnr_db": 15.842571747730512,
+              "psnr_is_infinite": false,
+              "start_frame": 64
+            },
+            {
+              "frame_count": 32,
+              "index": 3,
+              "psnr_db": 14.002683128534448,
+              "psnr_is_infinite": false,
+              "start_frame": 96
+            },
+            {
+              "frame_count": 32,
+              "index": 4,
+              "psnr_db": 12.588484630802784,
+              "psnr_is_infinite": false,
+              "start_frame": 128
+            },
+            {
+              "frame_count": 32,
+              "index": 5,
+              "psnr_db": 11.99744077025133,
+              "psnr_is_infinite": false,
+              "start_frame": 160
+            },
+            {
+              "frame_count": 32,
+              "index": 6,
+              "psnr_db": 11.882731398571956,
+              "psnr_is_infinite": false,
+              "start_frame": 192
+            },
+            {
+              "frame_count": 32,
+              "index": 7,
+              "psnr_db": 11.318489274177407,
+              "psnr_is_infinite": false,
+              "start_frame": 224
+            },
+            {
+              "frame_count": 32,
+              "index": 8,
+              "psnr_db": 11.53329470275419,
+              "psnr_is_infinite": false,
+              "start_frame": 256
+            },
+            {
+              "frame_count": 32,
+              "index": 9,
+              "psnr_db": 11.387422486329246,
+              "psnr_is_infinite": false,
+              "start_frame": 288
+            },
+            {
+              "frame_count": 32,
+              "index": 10,
+              "psnr_db": 11.140602700436732,
+              "psnr_is_infinite": false,
+              "start_frame": 320
+            },
+            {
+              "frame_count": 32,
+              "index": 11,
+              "psnr_db": 11.119282975111089,
+              "psnr_is_infinite": false,
+              "start_frame": 352
+            },
+            {
+              "frame_count": 32,
+              "index": 12,
+              "psnr_db": 10.996361375502728,
+              "psnr_is_infinite": false,
+              "start_frame": 384
+            },
+            {
+              "frame_count": 32,
+              "index": 13,
+              "psnr_db": 10.930904513342508,
+              "psnr_is_infinite": false,
+              "start_frame": 416
+            },
+            {
+              "frame_count": 29,
+              "index": 14,
+              "psnr_db": 10.653830728840887,
+              "psnr_is_infinite": false,
+              "start_frame": 448
+            }
+          ]
+        },
+        {
+          "decoded_frames": 477,
+          "ssim": {
+            "mean": 0.3774246362482941
+          },
+          "total": {
+            "psnr_db": 12.942100059058445,
+            "psnr_is_infinite": false
+          },
+          "uniform_frame_indices": {
+            "candidate": [],
+            "reference": []
+          },
+          "windows": [
+            {
+              "frame_count": 32,
+              "index": 0,
+              "psnr_db": 26.051282074156475,
+              "psnr_is_infinite": false,
+              "start_frame": 0
+            },
+            {
+              "frame_count": 32,
+              "index": 1,
+              "psnr_db": 20.789863388452954,
+              "psnr_is_infinite": false,
+              "start_frame": 32
+            },
+            {
+              "frame_count": 32,
+              "index": 2,
+              "psnr_db": 17.517395266616568,
+              "psnr_is_infinite": false,
+              "start_frame": 64
+            },
+            {
+              "frame_count": 32,
+              "index": 3,
+              "psnr_db": 16.23650619206118,
+              "psnr_is_infinite": false,
+              "start_frame": 96
+            },
+            {
+              "frame_count": 32,
+              "index": 4,
+              "psnr_db": 14.410531051258372,
+              "psnr_is_infinite": false,
+              "start_frame": 128
+            },
+            {
+              "frame_count": 32,
+              "index": 5,
+              "psnr_db": 13.385668090345984,
+              "psnr_is_infinite": false,
+              "start_frame": 160
+            },
+            {
+              "frame_count": 32,
+              "index": 6,
+              "psnr_db": 12.402132392837729,
+              "psnr_is_infinite": false,
+              "start_frame": 192
+            },
+            {
+              "frame_count": 32,
+              "index": 7,
+              "psnr_db": 11.636001608323012,
+              "psnr_is_infinite": false,
+              "start_frame": 224
+            },
+            {
+              "frame_count": 32,
+              "index": 8,
+              "psnr_db": 11.126818409183697,
+              "psnr_is_infinite": false,
+              "start_frame": 256
+            },
+            {
+              "frame_count": 32,
+              "index": 9,
+              "psnr_db": 11.587354375833163,
+              "psnr_is_infinite": false,
+              "start_frame": 288
+            },
+            {
+              "frame_count": 32,
+              "index": 10,
+              "psnr_db": 11.85940672103865,
+              "psnr_is_infinite": false,
+              "start_frame": 320
+            },
+            {
+              "frame_count": 32,
+              "index": 11,
+              "psnr_db": 11.83477969538375,
+              "psnr_is_infinite": false,
+              "start_frame": 352
+            },
+            {
+              "frame_count": 32,
+              "index": 12,
+              "psnr_db": 11.622094736711695,
+              "psnr_is_infinite": false,
+              "start_frame": 384
+            },
+            {
+              "frame_count": 32,
+              "index": 13,
+              "psnr_db": 11.348239783695885,
+              "psnr_is_infinite": false,
+              "start_frame": 416
+            },
+            {
+              "frame_count": 29,
+              "index": 14,
+              "psnr_db": 10.696711380147095,
+              "psnr_is_infinite": false,
+              "start_frame": 448
+            }
+          ]
+        },
+        {
+          "decoded_frames": 477,
+          "ssim": {
+            "mean": 0.3130717425554906
+          },
+          "total": {
+            "psnr_db": 12.394726908547831,
+            "psnr_is_infinite": false
+          },
+          "uniform_frame_indices": {
+            "candidate": [],
+            "reference": []
+          },
+          "windows": [
+            {
+              "frame_count": 32,
+              "index": 0,
+              "psnr_db": 26.090181808503125,
+              "psnr_is_infinite": false,
+              "start_frame": 0
+            },
+            {
+              "frame_count": 32,
+              "index": 1,
+              "psnr_db": 20.097434710783787,
+              "psnr_is_infinite": false,
+              "start_frame": 32
+            },
+            {
+              "frame_count": 32,
+              "index": 2,
+              "psnr_db": 14.31776820480183,
+              "psnr_is_infinite": false,
+              "start_frame": 64
+            },
+            {
+              "frame_count": 32,
+              "index": 3,
+              "psnr_db": 13.669605166840826,
+              "psnr_is_infinite": false,
+              "start_frame": 96
+            },
+            {
+              "frame_count": 32,
+              "index": 4,
+              "psnr_db": 12.754445230847171,
+              "psnr_is_infinite": false,
+              "start_frame": 128
+            },
+            {
+              "frame_count": 32,
+              "index": 5,
+              "psnr_db": 12.142332423907556,
+              "psnr_is_infinite": false,
+              "start_frame": 160
+            },
+            {
+              "frame_count": 32,
+              "index": 6,
+              "psnr_db": 12.611385744901714,
+              "psnr_is_infinite": false,
+              "start_frame": 192
+            },
+            {
+              "frame_count": 32,
+              "index": 7,
+              "psnr_db": 12.017335336189047,
+              "psnr_is_infinite": false,
+              "start_frame": 224
+            },
+            {
+              "frame_count": 32,
+              "index": 8,
+              "psnr_db": 11.934858834064508,
+              "psnr_is_infinite": false,
+              "start_frame": 256
+            },
+            {
+              "frame_count": 32,
+              "index": 9,
+              "psnr_db": 11.683177564883753,
+              "psnr_is_infinite": false,
+              "start_frame": 288
+            },
+            {
+              "frame_count": 32,
+              "index": 10,
+              "psnr_db": 11.523827538547893,
+              "psnr_is_infinite": false,
+              "start_frame": 320
+            },
+            {
+              "frame_count": 32,
+              "index": 11,
+              "psnr_db": 11.48054711843567,
+              "psnr_is_infinite": false,
+              "start_frame": 352
+            },
+            {
+              "frame_count": 32,
+              "index": 12,
+              "psnr_db": 10.85349107680968,
+              "psnr_is_infinite": false,
+              "start_frame": 384
+            },
+            {
+              "frame_count": 32,
+              "index": 13,
+              "psnr_db": 10.363805411690631,
+              "psnr_is_infinite": false,
+              "start_frame": 416
+            },
+            {
+              "frame_count": 29,
+              "index": 14,
+              "psnr_db": 10.162474327065603,
+              "psnr_is_infinite": false,
+              "start_frame": 448
+            }
+          ]
+        },
+        {
+          "decoded_frames": 477,
+          "ssim": {
+            "mean": 0.37152947165810424
+          },
+          "total": {
+            "psnr_db": 13.072182028430063,
+            "psnr_is_infinite": false
+          },
+          "uniform_frame_indices": {
+            "candidate": [],
+            "reference": []
+          },
+          "windows": [
+            {
+              "frame_count": 32,
+              "index": 0,
+              "psnr_db": 26.11996020069185,
+              "psnr_is_infinite": false,
+              "start_frame": 0
+            },
+            {
+              "frame_count": 32,
+              "index": 1,
+              "psnr_db": 17.86899732550088,
+              "psnr_is_infinite": false,
+              "start_frame": 32
+            },
+            {
+              "frame_count": 32,
+              "index": 2,
+              "psnr_db": 14.330881668694953,
+              "psnr_is_infinite": false,
+              "start_frame": 64
+            },
+            {
+              "frame_count": 32,
+              "index": 3,
+              "psnr_db": 14.836002303619747,
+              "psnr_is_infinite": false,
+              "start_frame": 96
+            },
+            {
+              "frame_count": 32,
+              "index": 4,
+              "psnr_db": 15.425592065274909,
+              "psnr_is_infinite": false,
+              "start_frame": 128
+            },
+            {
+              "frame_count": 32,
+              "index": 5,
+              "psnr_db": 15.509290179907298,
+              "psnr_is_infinite": false,
+              "start_frame": 160
+            },
+            {
+              "frame_count": 32,
+              "index": 6,
+              "psnr_db": 12.67283540015322,
+              "psnr_is_infinite": false,
+              "start_frame": 192
+            },
+            {
+              "frame_count": 32,
+              "index": 7,
+              "psnr_db": 12.975626327892272,
+              "psnr_is_infinite": false,
+              "start_frame": 224
+            },
+            {
+              "frame_count": 32,
+              "index": 8,
+              "psnr_db": 13.296661348515702,
+              "psnr_is_infinite": false,
+              "start_frame": 256
+            },
+            {
+              "frame_count": 32,
+              "index": 9,
+              "psnr_db": 13.424808455422816,
+              "psnr_is_infinite": false,
+              "start_frame": 288
+            },
+            {
+              "frame_count": 32,
+              "index": 10,
+              "psnr_db": 13.09715378590046,
+              "psnr_is_infinite": false,
+              "start_frame": 320
+            },
+            {
+              "frame_count": 32,
+              "index": 11,
+              "psnr_db": 11.740074600653386,
+              "psnr_is_infinite": false,
+              "start_frame": 352
+            },
+            {
+              "frame_count": 32,
+              "index": 12,
+              "psnr_db": 10.71564179238516,
+              "psnr_is_infinite": false,
+              "start_frame": 384
+            },
+            {
+              "frame_count": 32,
+              "index": 13,
+              "psnr_db": 10.209288903766042,
+              "psnr_is_infinite": false,
+              "start_frame": 416
+            },
+            {
+              "frame_count": 29,
+              "index": 14,
+              "psnr_db": 9.719719694863308,
+              "psnr_is_infinite": false,
+              "start_frame": 448
+            }
+          ]
+        },
+        {
+          "decoded_frames": 477,
+          "ssim": {
+            "mean": 0.4802951498311102
+          },
+          "total": {
+            "psnr_db": 14.414939243964554,
+            "psnr_is_infinite": false
+          },
+          "uniform_frame_indices": {
+            "candidate": [],
+            "reference": []
+          },
+          "windows": [
+            {
+              "frame_count": 32,
+              "index": 0,
+              "psnr_db": 30.61677196997486,
+              "psnr_is_infinite": false,
+              "start_frame": 0
+            },
+            {
+              "frame_count": 32,
+              "index": 1,
+              "psnr_db": 23.532125473621406,
+              "psnr_is_infinite": false,
+              "start_frame": 32
+            },
+            {
+              "frame_count": 32,
+              "index": 2,
+              "psnr_db": 20.13878518257915,
+              "psnr_is_infinite": false,
+              "start_frame": 64
+            },
+            {
+              "frame_count": 32,
+              "index": 3,
+              "psnr_db": 17.94471521731236,
+              "psnr_is_infinite": false,
+              "start_frame": 96
+            },
+            {
+              "frame_count": 32,
+              "index": 4,
+              "psnr_db": 17.526300983692288,
+              "psnr_is_infinite": false,
+              "start_frame": 128
+            },
+            {
+              "frame_count": 32,
+              "index": 5,
+              "psnr_db": 14.127146651830301,
+              "psnr_is_infinite": false,
+              "start_frame": 160
+            },
+            {
+              "frame_count": 32,
+              "index": 6,
+              "psnr_db": 12.41788510811466,
+              "psnr_is_infinite": false,
+              "start_frame": 192
+            },
+            {
+              "frame_count": 32,
+              "index": 7,
+              "psnr_db": 13.1766808484633,
+              "psnr_is_infinite": false,
+              "start_frame": 224
+            },
+            {
+              "frame_count": 32,
+              "index": 8,
+              "psnr_db": 14.171693883464636,
+              "psnr_is_infinite": false,
+              "start_frame": 256
+            },
+            {
+              "frame_count": 32,
+              "index": 9,
+              "psnr_db": 13.333401930562975,
+              "psnr_is_infinite": false,
+              "start_frame": 288
+            },
+            {
+              "frame_count": 32,
+              "index": 10,
+              "psnr_db": 13.841947909798336,
+              "psnr_is_infinite": false,
+              "start_frame": 320
+            },
+            {
+              "frame_count": 32,
+              "index": 11,
+              "psnr_db": 12.816246273839656,
+              "psnr_is_infinite": false,
+              "start_frame": 352
+            },
+            {
+              "frame_count": 32,
+              "index": 12,
+              "psnr_db": 12.463487815195268,
+              "psnr_is_infinite": false,
+              "start_frame": 384
+            },
+            {
+              "frame_count": 32,
+              "index": 13,
+              "psnr_db": 12.702605151699863,
+              "psnr_is_infinite": false,
+              "start_frame": 416
+            },
+            {
+              "frame_count": 29,
+              "index": 14,
+              "psnr_db": 11.944463603152418,
+              "psnr_is_infinite": false,
+              "start_frame": 448
+            }
+          ]
+        },
+        {
+          "decoded_frames": 477,
+          "ssim": {
+            "mean": 0.4209005647966845
+          },
+          "total": {
+            "psnr_db": 13.453970725181987,
+            "psnr_is_infinite": false
+          },
+          "uniform_frame_indices": {
+            "candidate": [],
+            "reference": []
+          },
+          "windows": [
+            {
+              "frame_count": 32,
+              "index": 0,
+              "psnr_db": 26.386210478808827,
+              "psnr_is_infinite": false,
+              "start_frame": 0
+            },
+            {
+              "frame_count": 32,
+              "index": 1,
+              "psnr_db": 18.615793574928812,
+              "psnr_is_infinite": false,
+              "start_frame": 32
+            },
+            {
+              "frame_count": 32,
+              "index": 2,
+              "psnr_db": 14.471600512081174,
+              "psnr_is_infinite": false,
+              "start_frame": 64
+            },
+            {
+              "frame_count": 32,
+              "index": 3,
+              "psnr_db": 15.046981576219306,
+              "psnr_is_infinite": false,
+              "start_frame": 96
+            },
+            {
+              "frame_count": 32,
+              "index": 4,
+              "psnr_db": 15.527705995786988,
+              "psnr_is_infinite": false,
+              "start_frame": 128
+            },
+            {
+              "frame_count": 32,
+              "index": 5,
+              "psnr_db": 14.327593533435081,
+              "psnr_is_infinite": false,
+              "start_frame": 160
+            },
+            {
+              "frame_count": 32,
+              "index": 6,
+              "psnr_db": 15.052066229123852,
+              "psnr_is_infinite": false,
+              "start_frame": 192
+            },
+            {
+              "frame_count": 32,
+              "index": 7,
+              "psnr_db": 14.716715477701147,
+              "psnr_is_infinite": false,
+              "start_frame": 224
+            },
+            {
+              "frame_count": 32,
+              "index": 8,
+              "psnr_db": 13.686609126229271,
+              "psnr_is_infinite": false,
+              "start_frame": 256
+            },
+            {
+              "frame_count": 32,
+              "index": 9,
+              "psnr_db": 14.351250471438055,
+              "psnr_is_infinite": false,
+              "start_frame": 288
+            },
+            {
+              "frame_count": 32,
+              "index": 10,
+              "psnr_db": 13.236914953126997,
+              "psnr_is_infinite": false,
+              "start_frame": 320
+            },
+            {
+              "frame_count": 32,
+              "index": 11,
+              "psnr_db": 12.33190028090548,
+              "psnr_is_infinite": false,
+              "start_frame": 352
+            },
+            {
+              "frame_count": 32,
+              "index": 12,
+              "psnr_db": 10.903333831323849,
+              "psnr_is_infinite": false,
+              "start_frame": 384
+            },
+            {
+              "frame_count": 32,
+              "index": 13,
+              "psnr_db": 10.128801568809681,
+              "psnr_is_infinite": false,
+              "start_frame": 416
+            },
+            {
+              "frame_count": 29,
+              "index": 14,
+              "psnr_db": 9.738762502847722,
+              "psnr_is_infinite": false,
+              "start_frame": 448
+            }
+          ]
+        }
+      ],
+      "reference_videos": [
+        {
+          "path": "reference/0/blossom-42/rollout.mp4",
+          "sha256": "1688b1220113996436dbc488f14396c7d2fbabb369c6d9cbe8118481650660b8"
+        },
+        {
+          "path": "reference/1/blossom-42/rollout.mp4",
+          "sha256": "cc818f7e030e50f28a42d5d675824ee11857476a3c0412136cda0fa1f34b1179"
+        },
+        {
+          "path": "reference/2/blossom-42/rollout.mp4",
+          "sha256": "29881cc82d453b2a30f4e2127b968a67e49720c58f5b7eb1dcaa76f7dc0a72b1"
+        },
+        {
+          "path": "reference/0/blossom-42/rollout.mp4",
+          "sha256": "3adba6d3c9385b009c67f63e71fd7722f14317c118ac3f91c0e15e5d762e452e"
+        },
+        {
+          "path": "reference/1/blossom-42/rollout.mp4",
+          "sha256": "c7dfa568065eb0625f77f74d40d9edb1b040e5bade46ae32344c35220ea57693"
+        },
+        {
+          "path": "reference/2/blossom-42/rollout.mp4",
+          "sha256": "a736844d7ba4ec84cb61123025c7422332304401bca26ec4498e44d96961001b"
+        }
+      ],
+      "suites": {
+        "vbench": [
+          {
+            "aesthetic_quality": 0.8216760754585266,
+            "background_consistency": 0.9298782989758403,
+            "imaging_quality": 0.773385194662482,
+            "motion_smoothness": 0.980754169969034,
+            "subject_consistency": 0.9363035510818497,
+            "temporal_flickering": 0.9500304988786286
+          },
+          {
+            "aesthetic_quality": 0.8214606046676636,
+            "background_consistency": 0.9263823693539915,
+            "imaging_quality": 0.7737386496361947,
+            "motion_smoothness": 0.9810853735367482,
+            "subject_consistency": 0.9390110001594079,
+            "temporal_flickering": 0.9496796215281768
+          },
+          {
+            "aesthetic_quality": 0.8265109658241272,
+            "background_consistency": 0.9280385249803046,
+            "imaging_quality": 0.7718516836426293,
+            "motion_smoothness": 0.9786615919188502,
+            "subject_consistency": 0.9394842110135976,
+            "temporal_flickering": 0.9472597159591376
+          },
+          {
+            "aesthetic_quality": 0.8219149708747864,
+            "background_consistency": 0.9291817801339286,
+            "imaging_quality": 0.765727008043845,
+            "motion_smoothness": 0.9775892836375847,
+            "subject_consistency": 0.9399406566214161,
+            "temporal_flickering": 0.9462706696753408
+          },
+          {
+            "aesthetic_quality": 0.8260056376457214,
+            "background_consistency": 0.9292664087119222,
+            "imaging_quality": 0.7715558776215687,
+            "motion_smoothness": 0.9800517043697664,
+            "subject_consistency": 0.9415702084783747,
+            "temporal_flickering": 0.9474579119214824
+          },
+          {
+            "aesthetic_quality": 0.8177919983863831,
+            "background_consistency": 0.9331049558495274,
+            "imaging_quality": 0.7673056831599782,
+            "motion_smoothness": 0.9771225254689923,
+            "subject_consistency": 0.9417713526792887,
+            "temporal_flickering": 0.9441932790419635
+          }
+        ],
+        "wbench": [
+          {
+            "aesthetic_quality": 0.8063931314150492,
+            "hpsv3_quality": 0.8255133690951357,
+            "imaging_quality": 0.6783948262532553,
+            "motion_smoothness": 0.9701242808232833,
+            "temporal_flickering": 0.9201193790809781
+          },
+          {
+            "aesthetic_quality": 0.8057649842898053,
+            "hpsv3_quality": 0.8271781207856151,
+            "imaging_quality": 0.6854016850789387,
+            "motion_smoothness": 0.969668446721323,
+            "temporal_flickering": 0.9196606505150888
+          },
+          {
+            "aesthetic_quality": 0.8145371643702191,
+            "hpsv3_quality": 0.8335562421685535,
+            "imaging_quality": 0.6845946540832519,
+            "motion_smoothness": 0.9686965123491265,
+            "temporal_flickering": 0.9161185245887906
+          },
+          {
+            "aesthetic_quality": 0.8118299341201782,
+            "hpsv3_quality": 0.8409523436026014,
+            "imaging_quality": 0.6838681831359864,
+            "motion_smoothness": 0.9678930916257906,
+            "temporal_flickering": 0.9148672141280829
+          },
+          {
+            "aesthetic_quality": 0.8110682423909504,
+            "hpsv3_quality": 0.8458835264363268,
+            "imaging_quality": 0.6861626739501954,
+            "motion_smoothness": 0.9684639406958422,
+            "temporal_flickering": 0.9167626324821921
+          },
+          {
+            "aesthetic_quality": 0.8065832551320394,
+            "hpsv3_quality": 0.8343097483887513,
+            "imaging_quality": 0.68103214263916,
+            "motion_smoothness": 0.9672626643393971,
+            "temporal_flickering": 0.9117895014145795
+          }
+        ]
+      }
+    },
+    "boardwalk-42": {
+      "input": {
+        "camera_pattern": "forward",
+        "id": "boardwalk-42",
+        "image": "2560px-Gfp-wisconsin-madison-the-nature-boardwalk",
+        "prompt": "The camera moves through a wooden boardwalk in a green wetland.",
+        "seed": 42
+      },
+      "pixels": [
+        {
+          "decoded_frames": 477,
+          "ssim": {
+            "mean": 0.40073626992190314
+          },
+          "total": {
+            "psnr_db": 14.75040208859944,
+            "psnr_is_infinite": false
+          },
+          "uniform_frame_indices": {
+            "candidate": [],
+            "reference": []
+          },
+          "windows": [
+            {
+              "frame_count": 32,
+              "index": 0,
+              "psnr_db": 32.03613947120121,
+              "psnr_is_infinite": false,
+              "start_frame": 0
+            },
+            {
+              "frame_count": 32,
+              "index": 1,
+              "psnr_db": 27.616600646331047,
+              "psnr_is_infinite": false,
+              "start_frame": 32
+            },
+            {
+              "frame_count": 32,
+              "index": 2,
+              "psnr_db": 23.89510570337756,
+              "psnr_is_infinite": false,
+              "start_frame": 64
+            },
+            {
+              "frame_count": 32,
+              "index": 3,
+              "psnr_db": 20.502516719477214,
+              "psnr_is_infinite": false,
+              "start_frame": 96
+            },
+            {
+              "frame_count": 32,
+              "index": 4,
+              "psnr_db": 18.969625185165405,
+              "psnr_is_infinite": false,
+              "start_frame": 128
+            },
+            {
+              "frame_count": 32,
+              "index": 5,
+              "psnr_db": 18.09919572404444,
+              "psnr_is_infinite": false,
+              "start_frame": 160
+            },
+            {
+              "frame_count": 32,
+              "index": 6,
+              "psnr_db": 17.71826342962043,
+              "psnr_is_infinite": false,
+              "start_frame": 192
+            },
+            {
+              "frame_count": 32,
+              "index": 7,
+              "psnr_db": 17.155278786451007,
+              "psnr_is_infinite": false,
+              "start_frame": 224
+            },
+            {
+              "frame_count": 32,
+              "index": 8,
+              "psnr_db": 16.161570603404726,
+              "psnr_is_infinite": false,
+              "start_frame": 256
+            },
+            {
+              "frame_count": 32,
+              "index": 9,
+              "psnr_db": 15.351758229664714,
+              "psnr_is_infinite": false,
+              "start_frame": 288
+            },
+            {
+              "frame_count": 32,
+              "index": 10,
+              "psnr_db": 13.927331316287095,
+              "psnr_is_infinite": false,
+              "start_frame": 320
+            },
+            {
+              "frame_count": 32,
+              "index": 11,
+              "psnr_db": 12.021879889796892,
+              "psnr_is_infinite": false,
+              "start_frame": 352
+            },
+            {
+              "frame_count": 32,
+              "index": 12,
+              "psnr_db": 10.66633460146043,
+              "psnr_is_infinite": false,
+              "start_frame": 384
+            },
+            {
+              "frame_count": 32,
+              "index": 13,
+              "psnr_db": 10.283463993850672,
+              "psnr_is_infinite": false,
+              "start_frame": 416
+            },
+            {
+              "frame_count": 29,
+              "index": 14,
+              "psnr_db": 10.355374670776087,
+              "psnr_is_infinite": false,
+              "start_frame": 448
+            }
+          ]
+        },
+        {
+          "decoded_frames": 477,
+          "ssim": {
+            "mean": 0.41777427106913184
+          },
+          "total": {
+            "psnr_db": 15.652331975992098,
+            "psnr_is_infinite": false
+          },
+          "uniform_frame_indices": {
+            "candidate": [],
+            "reference": []
+          },
+          "windows": [
+            {
+              "frame_count": 32,
+              "index": 0,
+              "psnr_db": 33.31601431589466,
+              "psnr_is_infinite": false,
+              "start_frame": 0
+            },
+            {
+              "frame_count": 32,
+              "index": 1,
+              "psnr_db": 29.887844119980116,
+              "psnr_is_infinite": false,
+              "start_frame": 32
+            },
+            {
+              "frame_count": 32,
+              "index": 2,
+              "psnr_db": 25.453718159899555,
+              "psnr_is_infinite": false,
+              "start_frame": 64
+            },
+            {
+              "frame_count": 32,
+              "index": 3,
+              "psnr_db": 21.148044937206564,
+              "psnr_is_infinite": false,
+              "start_frame": 96
+            },
+            {
+              "frame_count": 32,
+              "index": 4,
+              "psnr_db": 18.7581943247959,
+              "psnr_is_infinite": false,
+              "start_frame": 128
+            },
+            {
+              "frame_count": 32,
+              "index": 5,
+              "psnr_db": 17.860249184512845,
+              "psnr_is_infinite": false,
+              "start_frame": 160
+            },
+            {
+              "frame_count": 32,
+              "index": 6,
+              "psnr_db": 17.355478548609707,
+              "psnr_is_infinite": false,
+              "start_frame": 192
+            },
+            {
+              "frame_count": 32,
+              "index": 7,
+              "psnr_db": 16.98983828772787,
+              "psnr_is_infinite": false,
+              "start_frame": 224
+            },
+            {
+              "frame_count": 32,
+              "index": 8,
+              "psnr_db": 16.27097075742675,
+              "psnr_is_infinite": false,
+              "start_frame": 256
+            },
+            {
+              "frame_count": 32,
+              "index": 9,
+              "psnr_db": 15.269360308195644,
+              "psnr_is_infinite": false,
+              "start_frame": 288
+            },
+            {
+              "frame_count": 32,
+              "index": 10,
+              "psnr_db": 14.254865545288283,
+              "psnr_is_infinite": false,
+              "start_frame": 320
+            },
+            {
+              "frame_count": 32,
+              "index": 11,
+              "psnr_db": 13.504388889658255,
+              "psnr_is_infinite": false,
+              "start_frame": 352
+            },
+            {
+              "frame_count": 32,
+              "index": 12,
+              "psnr_db": 12.524444361260397,
+              "psnr_is_infinite": false,
+              "start_frame": 384
+            },
+            {
+              "frame_count": 32,
+              "index": 13,
+              "psnr_db": 11.782680293805047,
+              "psnr_is_infinite": false,
+              "start_frame": 416
+            },
+            {
+              "frame_count": 29,
+              "index": 14,
+              "psnr_db": 11.258999200582178,
+              "psnr_is_infinite": false,
+              "start_frame": 448
+            }
+          ]
+        },
+        {
+          "decoded_frames": 477,
+          "ssim": {
+            "mean": 0.44294914240415595
+          },
+          "total": {
+            "psnr_db": 14.770741274456242,
+            "psnr_is_infinite": false
+          },
+          "uniform_frame_indices": {
+            "candidate": [],
+            "reference": []
+          },
+          "windows": [
+            {
+              "frame_count": 32,
+              "index": 0,
+              "psnr_db": 34.54037926297488,
+              "psnr_is_infinite": false,
+              "start_frame": 0
+            },
+            {
+              "frame_count": 32,
+              "index": 1,
+              "psnr_db": 30.43087718723131,
+              "psnr_is_infinite": false,
+              "start_frame": 32
+            },
+            {
+              "frame_count": 32,
+              "index": 2,
+              "psnr_db": 27.636539496056574,
+              "psnr_is_infinite": false,
+              "start_frame": 64
+            },
+            {
+              "frame_count": 32,
+              "index": 3,
+              "psnr_db": 24.640143109568548,
+              "psnr_is_infinite": false,
+              "start_frame": 96
+            },
+            {
+              "frame_count": 32,
+              "index": 4,
+              "psnr_db": 20.747750477547626,
+              "psnr_is_infinite": false,
+              "start_frame": 128
+            },
+            {
+              "frame_count": 32,
+              "index": 5,
+              "psnr_db": 19.15643222521452,
+              "psnr_is_infinite": false,
+              "start_frame": 160
+            },
+            {
+              "frame_count": 32,
+              "index": 6,
+              "psnr_db": 18.416828393506822,
+              "psnr_is_infinite": false,
+              "start_frame": 192
+            },
+            {
+              "frame_count": 32,
+              "index": 7,
+              "psnr_db": 17.099410555850834,
+              "psnr_is_infinite": false,
+              "start_frame": 224
+            },
+            {
+              "frame_count": 32,
+              "index": 8,
+              "psnr_db": 15.954715260914774,
+              "psnr_is_infinite": false,
+              "start_frame": 256
+            },
+            {
+              "frame_count": 32,
+              "index": 9,
+              "psnr_db": 14.643192284417525,
+              "psnr_is_infinite": false,
+              "start_frame": 288
+            },
+            {
+              "frame_count": 32,
+              "index": 10,
+              "psnr_db": 13.125451021287573,
+              "psnr_is_infinite": false,
+              "start_frame": 320
+            },
+            {
+              "frame_count": 32,
+              "index": 11,
+              "psnr_db": 11.739219838178565,
+              "psnr_is_infinite": false,
+              "start_frame": 352
+            },
+            {
+              "frame_count": 32,
+              "index": 12,
+              "psnr_db": 10.836024780811695,
+              "psnr_is_infinite": false,
+              "start_frame": 384
+            },
+            {
+              "frame_count": 32,
+              "index": 13,
+              "psnr_db": 10.372410147564814,
+              "psnr_is_infinite": false,
+              "start_frame": 416
+            },
+            {
+              "frame_count": 29,
+              "index": 14,
+              "psnr_db": 10.208605366138332,
+              "psnr_is_infinite": false,
+              "start_frame": 448
+            }
+          ]
+        },
+        {
+          "decoded_frames": 477,
+          "ssim": {
+            "mean": 0.43767170963297486
+          },
+          "total": {
+            "psnr_db": 15.922281167407613,
+            "psnr_is_infinite": false
+          },
+          "uniform_frame_indices": {
+            "candidate": [],
+            "reference": []
+          },
+          "windows": [
+            {
+              "frame_count": 32,
+              "index": 0,
+              "psnr_db": 33.32960919284769,
+              "psnr_is_infinite": false,
+              "start_frame": 0
+            },
+            {
+              "frame_count": 32,
+              "index": 1,
+              "psnr_db": 29.426057666892742,
+              "psnr_is_infinite": false,
+              "start_frame": 32
+            },
+            {
+              "frame_count": 32,
+              "index": 2,
+              "psnr_db": 24.44784691637932,
+              "psnr_is_infinite": false,
+              "start_frame": 64
+            },
+            {
+              "frame_count": 32,
+              "index": 3,
+              "psnr_db": 22.406450406531103,
+              "psnr_is_infinite": false,
+              "start_frame": 96
+            },
+            {
+              "frame_count": 32,
+              "index": 4,
+              "psnr_db": 20.99596521321348,
+              "psnr_is_infinite": false,
+              "start_frame": 128
+            },
+            {
+              "frame_count": 32,
+              "index": 5,
+              "psnr_db": 20.35034060970556,
+              "psnr_is_infinite": false,
+              "start_frame": 160
+            },
+            {
+              "frame_count": 32,
+              "index": 6,
+              "psnr_db": 18.99990731973476,
+              "psnr_is_infinite": false,
+              "start_frame": 192
+            },
+            {
+              "frame_count": 32,
+              "index": 7,
+              "psnr_db": 16.453107548734707,
+              "psnr_is_infinite": false,
+              "start_frame": 224
+            },
+            {
+              "frame_count": 32,
+              "index": 8,
+              "psnr_db": 15.160425287835814,
+              "psnr_is_infinite": false,
+              "start_frame": 256
+            },
+            {
+              "frame_count": 32,
+              "index": 9,
+              "psnr_db": 14.383117513220272,
+              "psnr_is_infinite": false,
+              "start_frame": 288
+            },
+            {
+              "frame_count": 32,
+              "index": 10,
+              "psnr_db": 14.026250503551289,
+              "psnr_is_infinite": false,
+              "start_frame": 320
+            },
+            {
+              "frame_count": 32,
+              "index": 11,
+              "psnr_db": 13.626092074063559,
+              "psnr_is_infinite": false,
+              "start_frame": 352
+            },
+            {
+              "frame_count": 32,
+              "index": 12,
+              "psnr_db": 12.97130744654013,
+              "psnr_is_infinite": false,
+              "start_frame": 384
+            },
+            {
+              "frame_count": 32,
+              "index": 13,
+              "psnr_db": 12.452773547226233,
+              "psnr_is_infinite": false,
+              "start_frame": 416
+            },
+            {
+              "frame_count": 29,
+              "index": 14,
+              "psnr_db": 11.743113682569064,
+              "psnr_is_infinite": false,
+              "start_frame": 448
+            }
+          ]
+        },
+        {
+          "decoded_frames": 477,
+          "ssim": {
+            "mean": 0.4525985212013352
+          },
+          "total": {
+            "psnr_db": 14.684012778667551,
+            "psnr_is_infinite": false
+          },
+          "uniform_frame_indices": {
+            "candidate": [],
+            "reference": []
+          },
+          "windows": [
+            {
+              "frame_count": 32,
+              "index": 0,
+              "psnr_db": 35.22478697802517,
+              "psnr_is_infinite": false,
+              "start_frame": 0
+            },
+            {
+              "frame_count": 32,
+              "index": 1,
+              "psnr_db": 33.0495276144253,
+              "psnr_is_infinite": false,
+              "start_frame": 32
+            },
+            {
+              "frame_count": 32,
+              "index": 2,
+              "psnr_db": 28.70081001680274,
+              "psnr_is_infinite": false,
+              "start_frame": 64
+            },
+            {
+              "frame_count": 32,
+              "index": 3,
+              "psnr_db": 25.816382722549363,
+              "psnr_is_infinite": false,
+              "start_frame": 96
+            },
+            {
+              "frame_count": 32,
+              "index": 4,
+              "psnr_db": 22.111785149860324,
+              "psnr_is_infinite": false,
+              "start_frame": 128
+            },
+            {
+              "frame_count": 32,
+              "index": 5,
+              "psnr_db": 19.399788486439896,
+              "psnr_is_infinite": false,
+              "start_frame": 160
+            },
+            {
+              "frame_count": 32,
+              "index": 6,
+              "psnr_db": 17.715124806925676,
+              "psnr_is_infinite": false,
+              "start_frame": 192
+            },
+            {
+              "frame_count": 32,
+              "index": 7,
+              "psnr_db": 15.732374438731302,
+              "psnr_is_infinite": false,
+              "start_frame": 224
+            },
+            {
+              "frame_count": 32,
+              "index": 8,
+              "psnr_db": 14.49581287966284,
+              "psnr_is_infinite": false,
+              "start_frame": 256
+            },
+            {
+              "frame_count": 32,
+              "index": 9,
+              "psnr_db": 13.545903347638184,
+              "psnr_is_infinite": false,
+              "start_frame": 288
+            },
+            {
+              "frame_count": 32,
+              "index": 10,
+              "psnr_db": 12.97685328342052,
+              "psnr_is_infinite": false,
+              "start_frame": 320
+            },
+            {
+              "frame_count": 32,
+              "index": 11,
+              "psnr_db": 12.125484610332675,
+              "psnr_is_infinite": false,
+              "start_frame": 352
+            },
+            {
+              "frame_count": 32,
+              "index": 12,
+              "psnr_db": 11.103910289050594,
+              "psnr_is_infinite": false,
+              "start_frame": 384
+            },
+            {
+              "frame_count": 32,
+              "index": 13,
+              "psnr_db": 10.527359813669399,
+              "psnr_is_infinite": false,
+              "start_frame": 416
+            },
+            {
+              "frame_count": 29,
+              "index": 14,
+              "psnr_db": 10.360951220104514,
+              "psnr_is_infinite": false,
+              "start_frame": 448
+            }
+          ]
+        },
+        {
+          "decoded_frames": 477,
+          "ssim": {
+            "mean": 0.4459743653697261
+          },
+          "total": {
+            "psnr_db": 15.321125979630157,
+            "psnr_is_infinite": false
+          },
+          "uniform_frame_indices": {
+            "candidate": [],
+            "reference": []
+          },
+          "windows": [
+            {
+              "frame_count": 32,
+              "index": 0,
+              "psnr_db": 33.85886790928719,
+              "psnr_is_infinite": false,
+              "start_frame": 0
+            },
+            {
+              "frame_count": 32,
+              "index": 1,
+              "psnr_db": 30.056645973084947,
+              "psnr_is_infinite": false,
+              "start_frame": 32
+            },
+            {
+              "frame_count": 32,
+              "index": 2,
+              "psnr_db": 25.360942694250102,
+              "psnr_is_infinite": false,
+              "start_frame": 64
+            },
+            {
+              "frame_count": 32,
+              "index": 3,
+              "psnr_db": 22.657336590529074,
+              "psnr_is_infinite": false,
+              "start_frame": 96
+            },
+            {
+              "frame_count": 32,
+              "index": 4,
+              "psnr_db": 21.09163124078116,
+              "psnr_is_infinite": false,
+              "start_frame": 128
+            },
+            {
+              "frame_count": 32,
+              "index": 5,
+              "psnr_db": 19.829350425699413,
+              "psnr_is_infinite": false,
+              "start_frame": 160
+            },
+            {
+              "frame_count": 32,
+              "index": 6,
+              "psnr_db": 17.859425735144118,
+              "psnr_is_infinite": false,
+              "start_frame": 192
+            },
+            {
+              "frame_count": 32,
+              "index": 7,
+              "psnr_db": 16.81473685518347,
+              "psnr_is_infinite": false,
+              "start_frame": 224
+            },
+            {
+              "frame_count": 32,
+              "index": 8,
+              "psnr_db": 16.431717497756253,
+              "psnr_is_infinite": false,
+              "start_frame": 256
+            },
+            {
+              "frame_count": 32,
+              "index": 9,
+              "psnr_db": 15.762868631454454,
+              "psnr_is_infinite": false,
+              "start_frame": 288
+            },
+            {
+              "frame_count": 32,
+              "index": 10,
+              "psnr_db": 14.689763123769676,
+              "psnr_is_infinite": false,
+              "start_frame": 320
+            },
+            {
+              "frame_count": 32,
+              "index": 11,
+              "psnr_db": 13.35811221351481,
+              "psnr_is_infinite": false,
+              "start_frame": 352
+            },
+            {
+              "frame_count": 32,
+              "index": 12,
+              "psnr_db": 11.639676248562596,
+              "psnr_is_infinite": false,
+              "start_frame": 384
+            },
+            {
+              "frame_count": 32,
+              "index": 13,
+              "psnr_db": 10.553708748586612,
+              "psnr_is_infinite": false,
+              "start_frame": 416
+            },
+            {
+              "frame_count": 29,
+              "index": 14,
+              "psnr_db": 10.191931688521631,
+              "psnr_is_infinite": false,
+              "start_frame": 448
+            }
+          ]
+        }
+      ],
+      "reference_videos": [
+        {
+          "path": "reference/0/boardwalk-42/rollout.mp4",
+          "sha256": "20a230e213c951e695991148688e680a4528e99456cbf369f29715db246c3d0f"
+        },
+        {
+          "path": "reference/1/boardwalk-42/rollout.mp4",
+          "sha256": "e6bd344ccc74e4a28323b7f9e87cbf28cc5b2c92d0616c11cd7765230b9d7ab6"
+        },
+        {
+          "path": "reference/2/boardwalk-42/rollout.mp4",
+          "sha256": "a99728a4f3f6e5eb6875dabf1d50b480c240a6e161142f1a7de7b9cff947d0f4"
+        },
+        {
+          "path": "reference/0/boardwalk-42/rollout.mp4",
+          "sha256": "1e9553e733c53a08d49efa18d21a8717f66e4f39d888a2ac52bad331b36a5280"
+        },
+        {
+          "path": "reference/1/boardwalk-42/rollout.mp4",
+          "sha256": "5e0f80acaf362e1ec2ed3b39f0c743657229eb9a072b977e354cfd8ac3d75471"
+        },
+        {
+          "path": "reference/2/boardwalk-42/rollout.mp4",
+          "sha256": "d8d0efc22fa4681145f28dea77a7bb75e4331b621eb04d107ec0d0085a65e34d"
+        }
+      ],
+      "suites": {
+        "vbench": [
+          {
+            "aesthetic_quality": 0.6810023784637451,
+            "background_consistency": 0.9587479278820903,
+            "imaging_quality": 0.7946166797054138,
+            "motion_smoothness": 0.9804161410962543,
+            "subject_consistency": 0.9417684026250318,
+            "temporal_flickering": 0.9497269910924575
+          },
+          {
+            "aesthetic_quality": 0.6962029337882996,
+            "background_consistency": 0.9652766379989496,
+            "imaging_quality": 0.797116379327994,
+            "motion_smoothness": 0.9822231279114524,
+            "subject_consistency": 0.9492104855530402,
+            "temporal_flickering": 0.9552990894691616
+          },
+          {
+            "aesthetic_quality": 0.6840289235115051,
+            "background_consistency": 0.9631742589613971,
+            "imaging_quality": 0.7909603877037575,
+            "motion_smoothness": 0.9806181582876207,
+            "subject_consistency": 0.9362699726299077,
+            "temporal_flickering": 0.9485681197222542
+          },
+          {
+            "aesthetic_quality": 0.6802963018417358,
+            "background_consistency": 0.9643605977547269,
+            "imaging_quality": 0.7900433405590257,
+            "motion_smoothness": 0.9815690421860674,
+            "subject_consistency": 0.9417479961108761,
+            "temporal_flickering": 0.9531088847740024
+          },
+          {
+            "aesthetic_quality": 0.687236487865448,
+            "background_consistency": 0.9624510692949054,
+            "imaging_quality": 0.7963926906305789,
+            "motion_smoothness": 0.9811764202523016,
+            "subject_consistency": 0.9448906626521039,
+            "temporal_flickering": 0.9507684184055702
+          },
+          {
+            "aesthetic_quality": 0.6915673613548279,
+            "background_consistency": 0.9639395064666492,
+            "imaging_quality": 0.7978250104476321,
+            "motion_smoothness": 0.9826344900783969,
+            "subject_consistency": 0.9481002391010773,
+            "temporal_flickering": 0.9582061094396255
+          }
+        ],
+        "wbench": [
+          {
+            "aesthetic_quality": 0.6929694271087645,
+            "hpsv3_quality": 0.7929218443361273,
+            "imaging_quality": 0.717158358256022,
+            "motion_smoothness": 0.9776413803525746,
+            "temporal_flickering": 0.9258740967395259
+          },
+          {
+            "aesthetic_quality": 0.7030001513163248,
+            "hpsv3_quality": 0.8576324256905253,
+            "imaging_quality": 0.7210240071614583,
+            "motion_smoothness": 0.9775164682671711,
+            "temporal_flickering": 0.9340486489090265
+          },
+          {
+            "aesthetic_quality": 0.6927957510948182,
+            "hpsv3_quality": 0.8036637856542805,
+            "imaging_quality": 0.7063420524597169,
+            "motion_smoothness": 0.9774258384184179,
+            "temporal_flickering": 0.9245508829752604
+          },
+          {
+            "aesthetic_quality": 0.68986137231191,
+            "hpsv3_quality": 0.8620118929232254,
+            "imaging_quality": 0.7188354606628418,
+            "motion_smoothness": 0.977523304024507,
+            "temporal_flickering": 0.9303628734513825
+          },
+          {
+            "aesthetic_quality": 0.6954432479540507,
+            "hpsv3_quality": 0.8374779543552315,
+            "imaging_quality": 0.7193900184631347,
+            "motion_smoothness": 0.9767938811396857,
+            "temporal_flickering": 0.9286621692133885
+          },
+          {
+            "aesthetic_quality": 0.7026615317662556,
+            "hpsv3_quality": 0.8658044527995086,
+            "imaging_quality": 0.7232573216756186,
+            "motion_smoothness": 0.9778874293558549,
+            "temporal_flickering": 0.9377691867304784
+          }
+        ]
+      }
+    },
+    "street-42": {
+      "input": {
+        "camera_pattern": "hold",
+        "id": "street-42",
+        "image": "stop_sign",
+        "prompt": "A street corner with a stop sign and surrounding buildings.",
+        "seed": 42
+      },
+      "pixels": [
+        {
+          "decoded_frames": 477,
+          "ssim": {
+            "mean": 0.2586207052531461
+          },
+          "total": {
+            "psnr_db": 10.077113292488411,
+            "psnr_is_infinite": false
+          },
+          "uniform_frame_indices": {
+            "candidate": [],
+            "reference": []
+          },
+          "windows": [
+            {
+              "frame_count": 32,
+              "index": 0,
+              "psnr_db": 21.246009106944065,
+              "psnr_is_infinite": false,
+              "start_frame": 0
+            },
+            {
+              "frame_count": 32,
+              "index": 1,
+              "psnr_db": 12.588986882424539,
+              "psnr_is_infinite": false,
+              "start_frame": 32
+            },
+            {
+              "frame_count": 32,
+              "index": 2,
+              "psnr_db": 12.26904325089513,
+              "psnr_is_infinite": false,
+              "start_frame": 64
+            },
+            {
+              "frame_count": 32,
+              "index": 3,
+              "psnr_db": 12.39230338815263,
+              "psnr_is_infinite": false,
+              "start_frame": 96
+            },
+            {
+              "frame_count": 32,
+              "index": 4,
+              "psnr_db": 10.498424303818165,
+              "psnr_is_infinite": false,
+              "start_frame": 128
+            },
+            {
+              "frame_count": 32,
+              "index": 5,
+              "psnr_db": 10.53499246046308,
+              "psnr_is_infinite": false,
+              "start_frame": 160
+            },
+            {
+              "frame_count": 32,
+              "index": 6,
+              "psnr_db": 9.354473763401577,
+              "psnr_is_infinite": false,
+              "start_frame": 192
+            },
+            {
+              "frame_count": 32,
+              "index": 7,
+              "psnr_db": 8.965084942603145,
+              "psnr_is_infinite": false,
+              "start_frame": 224
+            },
+            {
+              "frame_count": 32,
+              "index": 8,
+              "psnr_db": 9.070685330731244,
+              "psnr_is_infinite": false,
+              "start_frame": 256
+            },
+            {
+              "frame_count": 32,
+              "index": 9,
+              "psnr_db": 9.025242053844325,
+              "psnr_is_infinite": false,
+              "start_frame": 288
+            },
+            {
+              "frame_count": 32,
+              "index": 10,
+              "psnr_db": 9.340948679907292,
+              "psnr_is_infinite": false,
+              "start_frame": 320
+            },
+            {
+              "frame_count": 32,
+              "index": 11,
+              "psnr_db": 8.992077778083553,
+              "psnr_is_infinite": false,
+              "start_frame": 352
+            },
+            {
+              "frame_count": 32,
+              "index": 12,
+              "psnr_db": 8.994898377498487,
+              "psnr_is_infinite": false,
+              "start_frame": 384
+            },
+            {
+              "frame_count": 32,
+              "index": 13,
+              "psnr_db": 8.956333636169164,
+              "psnr_is_infinite": false,
+              "start_frame": 416
+            },
+            {
+              "frame_count": 29,
+              "index": 14,
+              "psnr_db": 8.795140665967969,
+              "psnr_is_infinite": false,
+              "start_frame": 448
+            }
+          ]
+        },
+        {
+          "decoded_frames": 477,
+          "ssim": {
+            "mean": 0.2955046668471048
+          },
+          "total": {
+            "psnr_db": 10.666442337315853,
+            "psnr_is_infinite": false
+          },
+          "uniform_frame_indices": {
+            "candidate": [],
+            "reference": []
+          },
+          "windows": [
+            {
+              "frame_count": 32,
+              "index": 0,
+              "psnr_db": 27.172386035895425,
+              "psnr_is_infinite": false,
+              "start_frame": 0
+            },
+            {
+              "frame_count": 32,
+              "index": 1,
+              "psnr_db": 16.269269093809292,
+              "psnr_is_infinite": false,
+              "start_frame": 32
+            },
+            {
+              "frame_count": 32,
+              "index": 2,
+              "psnr_db": 11.729420090492713,
+              "psnr_is_infinite": false,
+              "start_frame": 64
+            },
+            {
+              "frame_count": 32,
+              "index": 3,
+              "psnr_db": 10.855967263659636,
+              "psnr_is_infinite": false,
+              "start_frame": 96
+            },
+            {
+              "frame_count": 32,
+              "index": 4,
+              "psnr_db": 11.742339820132548,
+              "psnr_is_infinite": false,
+              "start_frame": 128
+            },
+            {
+              "frame_count": 32,
+              "index": 5,
+              "psnr_db": 11.333105314213261,
+              "psnr_is_infinite": false,
+              "start_frame": 160
+            },
+            {
+              "frame_count": 32,
+              "index": 6,
+              "psnr_db": 11.259507074171424,
+              "psnr_is_infinite": false,
+              "start_frame": 192
+            },
+            {
+              "frame_count": 32,
+              "index": 7,
+              "psnr_db": 9.801698291994363,
+              "psnr_is_infinite": false,
+              "start_frame": 224
+            },
+            {
+              "frame_count": 32,
+              "index": 8,
+              "psnr_db": 9.837069983432826,
+              "psnr_is_infinite": false,
+              "start_frame": 256
+            },
+            {
+              "frame_count": 32,
+              "index": 9,
+              "psnr_db": 8.544883816457586,
+              "psnr_is_infinite": false,
+              "start_frame": 288
+            },
+            {
+              "frame_count": 32,
+              "index": 10,
+              "psnr_db": 9.213981898377902,
+              "psnr_is_infinite": false,
+              "start_frame": 320
+            },
+            {
+              "frame_count": 32,
+              "index": 11,
+              "psnr_db": 9.369930222939594,
+              "psnr_is_infinite": false,
+              "start_frame": 352
+            },
+            {
+              "frame_count": 32,
+              "index": 12,
+              "psnr_db": 9.312368103717152,
+              "psnr_is_infinite": false,
+              "start_frame": 384
+            },
+            {
+              "frame_count": 32,
+              "index": 13,
+              "psnr_db": 10.024280158000437,
+              "psnr_is_infinite": false,
+              "start_frame": 416
+            },
+            {
+              "frame_count": 29,
+              "index": 14,
+              "psnr_db": 10.123407698412423,
+              "psnr_is_infinite": false,
+              "start_frame": 448
+            }
+          ]
+        },
+        {
+          "decoded_frames": 477,
+          "ssim": {
+            "mean": 0.2822005139830985
+          },
+          "total": {
+            "psnr_db": 10.333997050299502,
+            "psnr_is_infinite": false
+          },
+          "uniform_frame_indices": {
+            "candidate": [],
+            "reference": []
+          },
+          "windows": [
+            {
+              "frame_count": 32,
+              "index": 0,
+              "psnr_db": 22.70824094191305,
+              "psnr_is_infinite": false,
+              "start_frame": 0
+            },
+            {
+              "frame_count": 32,
+              "index": 1,
+              "psnr_db": 13.249299761092475,
+              "psnr_is_infinite": false,
+              "start_frame": 32
+            },
+            {
+              "frame_count": 32,
+              "index": 2,
+              "psnr_db": 13.091183443303452,
+              "psnr_is_infinite": false,
+              "start_frame": 64
+            },
+            {
+              "frame_count": 32,
+              "index": 3,
+              "psnr_db": 10.571988616333389,
+              "psnr_is_infinite": false,
+              "start_frame": 96
+            },
+            {
+              "frame_count": 32,
+              "index": 4,
+              "psnr_db": 10.29147667647367,
+              "psnr_is_infinite": false,
+              "start_frame": 128
+            },
+            {
+              "frame_count": 32,
+              "index": 5,
+              "psnr_db": 11.066010231947526,
+              "psnr_is_infinite": false,
+              "start_frame": 160
+            },
+            {
+              "frame_count": 32,
+              "index": 6,
+              "psnr_db": 9.484618257260827,
+              "psnr_is_infinite": false,
+              "start_frame": 192
+            },
+            {
+              "frame_count": 32,
+              "index": 7,
+              "psnr_db": 9.154310986064708,
+              "psnr_is_infinite": false,
+              "start_frame": 224
+            },
+            {
+              "frame_count": 32,
+              "index": 8,
+              "psnr_db": 9.277410374366271,
+              "psnr_is_infinite": false,
+              "start_frame": 256
+            },
+            {
+              "frame_count": 32,
+              "index": 9,
+              "psnr_db": 9.118721790861638,
+              "psnr_is_infinite": false,
+              "start_frame": 288
+            },
+            {
+              "frame_count": 32,
+              "index": 10,
+              "psnr_db": 9.875664209730742,
+              "psnr_is_infinite": false,
+              "start_frame": 320
+            },
+            {
+              "frame_count": 32,
+              "index": 11,
+              "psnr_db": 9.534039741947433,
+              "psnr_is_infinite": false,
+              "start_frame": 352
+            },
+            {
+              "frame_count": 32,
+              "index": 12,
+              "psnr_db": 9.362690775966984,
+              "psnr_is_infinite": false,
+              "start_frame": 384
+            },
+            {
+              "frame_count": 32,
+              "index": 13,
+              "psnr_db": 9.33639803458049,
+              "psnr_is_infinite": false,
+              "start_frame": 416
+            },
+            {
+              "frame_count": 29,
+              "index": 14,
+              "psnr_db": 9.665637846433368,
+              "psnr_is_infinite": false,
+              "start_frame": 448
+            }
+          ]
+        },
+        {
+          "decoded_frames": 477,
+          "ssim": {
+            "mean": 0.3302574906740521
+          },
+          "total": {
+            "psnr_db": 10.60673652966213,
+            "psnr_is_infinite": false
+          },
+          "uniform_frame_indices": {
+            "candidate": [],
+            "reference": []
+          },
+          "windows": [
+            {
+              "frame_count": 32,
+              "index": 0,
+              "psnr_db": 29.631063684968804,
+              "psnr_is_infinite": false,
+              "start_frame": 0
+            },
+            {
+              "frame_count": 32,
+              "index": 1,
+              "psnr_db": 18.486296147840022,
+              "psnr_is_infinite": false,
+              "start_frame": 32
+            },
+            {
+              "frame_count": 32,
+              "index": 2,
+              "psnr_db": 15.653069402768336,
+              "psnr_is_infinite": false,
+              "start_frame": 64
+            },
+            {
+              "frame_count": 32,
+              "index": 3,
+              "psnr_db": 11.858534875258034,
+              "psnr_is_infinite": false,
+              "start_frame": 96
+            },
+            {
+              "frame_count": 32,
+              "index": 4,
+              "psnr_db": 10.554855639481397,
+              "psnr_is_infinite": false,
+              "start_frame": 128
+            },
+            {
+              "frame_count": 32,
+              "index": 5,
+              "psnr_db": 9.968241042963946,
+              "psnr_is_infinite": false,
+              "start_frame": 160
+            },
+            {
+              "frame_count": 32,
+              "index": 6,
+              "psnr_db": 10.351622948929482,
+              "psnr_is_infinite": false,
+              "start_frame": 192
+            },
+            {
+              "frame_count": 32,
+              "index": 7,
+              "psnr_db": 9.870096319003142,
+              "psnr_is_infinite": false,
+              "start_frame": 224
+            },
+            {
+              "frame_count": 32,
+              "index": 8,
+              "psnr_db": 9.656528246434245,
+              "psnr_is_infinite": false,
+              "start_frame": 256
+            },
+            {
+              "frame_count": 32,
+              "index": 9,
+              "psnr_db": 9.333707324831071,
+              "psnr_is_infinite": false,
+              "start_frame": 288
+            },
+            {
+              "frame_count": 32,
+              "index": 10,
+              "psnr_db": 9.693505165969341,
+              "psnr_is_infinite": false,
+              "start_frame": 320
+            },
+            {
+              "frame_count": 32,
+              "index": 11,
+              "psnr_db": 9.428549911156916,
+              "psnr_is_infinite": false,
+              "start_frame": 352
+            },
+            {
+              "frame_count": 32,
+              "index": 12,
+              "psnr_db": 9.101816452764863,
+              "psnr_is_infinite": false,
+              "start_frame": 384
+            },
+            {
+              "frame_count": 32,
+              "index": 13,
+              "psnr_db": 9.150694049581967,
+              "psnr_is_infinite": false,
+              "start_frame": 416
+            },
+            {
+              "frame_count": 29,
+              "index": 14,
+              "psnr_db": 9.008923396355854,
+              "psnr_is_infinite": false,
+              "start_frame": 448
+            }
+          ]
+        },
+        {
+          "decoded_frames": 477,
+          "ssim": {
+            "mean": 0.338516162465037
+          },
+          "total": {
+            "psnr_db": 10.526906107542022,
+            "psnr_is_infinite": false
+          },
+          "uniform_frame_indices": {
+            "candidate": [],
+            "reference": []
+          },
+          "windows": [
+            {
+              "frame_count": 32,
+              "index": 0,
+              "psnr_db": 29.393382830460286,
+              "psnr_is_infinite": false,
+              "start_frame": 0
+            },
+            {
+              "frame_count": 32,
+              "index": 1,
+              "psnr_db": 19.060621571689495,
+              "psnr_is_infinite": false,
+              "start_frame": 32
+            },
+            {
+              "frame_count": 32,
+              "index": 2,
+              "psnr_db": 13.04287215107524,
+              "psnr_is_infinite": false,
+              "start_frame": 64
+            },
+            {
+              "frame_count": 32,
+              "index": 3,
+              "psnr_db": 10.85220246960208,
+              "psnr_is_infinite": false,
+              "start_frame": 96
+            },
+            {
+              "frame_count": 32,
+              "index": 4,
+              "psnr_db": 12.130089450863405,
+              "psnr_is_infinite": false,
+              "start_frame": 128
+            },
+            {
+              "frame_count": 32,
+              "index": 5,
+              "psnr_db": 11.885766267865188,
+              "psnr_is_infinite": false,
+              "start_frame": 160
+            },
+            {
+              "frame_count": 32,
+              "index": 6,
+              "psnr_db": 11.286695647055748,
+              "psnr_is_infinite": false,
+              "start_frame": 192
+            },
+            {
+              "frame_count": 32,
+              "index": 7,
+              "psnr_db": 9.793221727134306,
+              "psnr_is_infinite": false,
+              "start_frame": 224
+            },
+            {
+              "frame_count": 32,
+              "index": 8,
+              "psnr_db": 10.095569857344627,
+              "psnr_is_infinite": false,
+              "start_frame": 256
+            },
+            {
+              "frame_count": 32,
+              "index": 9,
+              "psnr_db": 9.624680625558137,
+              "psnr_is_infinite": false,
+              "start_frame": 288
+            },
+            {
+              "frame_count": 32,
+              "index": 10,
+              "psnr_db": 9.33084950317302,
+              "psnr_is_infinite": false,
+              "start_frame": 320
+            },
+            {
+              "frame_count": 32,
+              "index": 11,
+              "psnr_db": 8.487876876900716,
+              "psnr_is_infinite": false,
+              "start_frame": 352
+            },
+            {
+              "frame_count": 32,
+              "index": 12,
+              "psnr_db": 8.511971113420046,
+              "psnr_is_infinite": false,
+              "start_frame": 384
+            },
+            {
+              "frame_count": 32,
+              "index": 13,
+              "psnr_db": 8.687956369936373,
+              "psnr_is_infinite": false,
+              "start_frame": 416
+            },
+            {
+              "frame_count": 29,
+              "index": 14,
+              "psnr_db": 8.486710257024678,
+              "psnr_is_infinite": false,
+              "start_frame": 448
+            }
+          ]
+        },
+        {
+          "decoded_frames": 477,
+          "ssim": {
+            "mean": 0.29353585357370093
+          },
+          "total": {
+            "psnr_db": 10.318702815128429,
+            "psnr_is_infinite": false
+          },
+          "uniform_frame_indices": {
+            "candidate": [],
+            "reference": []
+          },
+          "windows": [
+            {
+              "frame_count": 32,
+              "index": 0,
+              "psnr_db": 30.10076590232098,
+              "psnr_is_infinite": false,
+              "start_frame": 0
+            },
+            {
+              "frame_count": 32,
+              "index": 1,
+              "psnr_db": 18.512743596085375,
+              "psnr_is_infinite": false,
+              "start_frame": 32
+            },
+            {
+              "frame_count": 32,
+              "index": 2,
+              "psnr_db": 12.597212420607633,
+              "psnr_is_infinite": false,
+              "start_frame": 64
+            },
+            {
+              "frame_count": 32,
+              "index": 3,
+              "psnr_db": 10.63773869927925,
+              "psnr_is_infinite": false,
+              "start_frame": 96
+            },
+            {
+              "frame_count": 32,
+              "index": 4,
+              "psnr_db": 10.58677263490914,
+              "psnr_is_infinite": false,
+              "start_frame": 128
+            },
+            {
+              "frame_count": 32,
+              "index": 5,
+              "psnr_db": 9.889607098405067,
+              "psnr_is_infinite": false,
+              "start_frame": 160
+            },
+            {
+              "frame_count": 32,
+              "index": 6,
+              "psnr_db": 11.07595389860795,
+              "psnr_is_infinite": false,
+              "start_frame": 192
+            },
+            {
+              "frame_count": 32,
+              "index": 7,
+              "psnr_db": 9.630871342546378,
+              "psnr_is_infinite": false,
+              "start_frame": 224
+            },
+            {
+              "frame_count": 32,
+              "index": 8,
+              "psnr_db": 9.214099428266094,
+              "psnr_is_infinite": false,
+              "start_frame": 256
+            },
+            {
+              "frame_count": 32,
+              "index": 9,
+              "psnr_db": 9.094121489884932,
+              "psnr_is_infinite": false,
+              "start_frame": 288
+            },
+            {
+              "frame_count": 32,
+              "index": 10,
+              "psnr_db": 9.27480367139937,
+              "psnr_is_infinite": false,
+              "start_frame": 320
+            },
+            {
+              "frame_count": 32,
+              "index": 11,
+              "psnr_db": 8.667182920648635,
+              "psnr_is_infinite": false,
+              "start_frame": 352
+            },
+            {
+              "frame_count": 32,
+              "index": 12,
+              "psnr_db": 9.075745302501455,
+              "psnr_is_infinite": false,
+              "start_frame": 384
+            },
+            {
+              "frame_count": 32,
+              "index": 13,
+              "psnr_db": 9.057805481465694,
+              "psnr_is_infinite": false,
+              "start_frame": 416
+            },
+            {
+              "frame_count": 29,
+              "index": 14,
+              "psnr_db": 9.285523905277778,
+              "psnr_is_infinite": false,
+              "start_frame": 448
+            }
+          ]
+        }
+      ],
+      "reference_videos": [
+        {
+          "path": "reference/0/street-42/rollout.mp4",
+          "sha256": "d11c7289d7526fc8d1ec77a2742b7d6b7352ae59052cc8920ad7a1ca5a6bd826"
+        },
+        {
+          "path": "reference/1/street-42/rollout.mp4",
+          "sha256": "fc7c16227fa6dc4782ba806b0d77ec073ea1434013047a09b982fbceebe3061a"
+        },
+        {
+          "path": "reference/2/street-42/rollout.mp4",
+          "sha256": "f4c2eec0bbb3a98bcf6670860cb70101164c38c9807dd54a07d8d15eadfb87cf"
+        },
+        {
+          "path": "reference/0/street-42/rollout.mp4",
+          "sha256": "67561e0b97edc67ef38d972b3b9cfb96384ddb2b6ac68173d67e9deaf8a0f735"
+        },
+        {
+          "path": "reference/1/street-42/rollout.mp4",
+          "sha256": "37ac9414754f85027f8ec1c15adddf89255c623354c26fab930d28e96bb3daeb"
+        },
+        {
+          "path": "reference/2/street-42/rollout.mp4",
+          "sha256": "9c3e5aaa2f6698126a10f841b807f2852f8c92a93cebf9f387beb8b379305984"
+        }
+      ],
+      "suites": {
+        "vbench": [
+          {
+            "aesthetic_quality": 0.4710577428340912,
+            "background_consistency": 0.8801161822150735,
+            "imaging_quality": 0.7938008101681244,
+            "motion_smoothness": 0.9527794316845327,
+            "subject_consistency": 0.8825873657434928,
+            "temporal_flickering": 0.9232907313926547
+          },
+          {
+            "aesthetic_quality": 0.4782884120941162,
+            "background_consistency": 0.8865664185596114,
+            "imaging_quality": 0.7996441677581339,
+            "motion_smoothness": 0.9602540972377356,
+            "subject_consistency": 0.8764410832223772,
+            "temporal_flickering": 0.9331233005897671
+          },
+          {
+            "aesthetic_quality": 0.4740533232688904,
+            "background_consistency": 0.9021190995929622,
+            "imaging_quality": 0.7918409195586071,
+            "motion_smoothness": 0.9559878800946127,
+            "subject_consistency": 0.8700981755279192,
+            "temporal_flickering": 0.9305227840647978
+          },
+          {
+            "aesthetic_quality": 0.47153738141059875,
+            "background_consistency": 0.8851108070181197,
+            "imaging_quality": 0.7958444510565863,
+            "motion_smoothness": 0.96193809056428,
+            "subject_consistency": 0.8894813715660271,
+            "temporal_flickering": 0.9333384495155485
+          },
+          {
+            "aesthetic_quality": 0.4743800461292267,
+            "background_consistency": 0.8906362838103992,
+            "imaging_quality": 0.794294687906901,
+            "motion_smoothness": 0.9568598928384828,
+            "subject_consistency": 0.893349176570147,
+            "temporal_flickering": 0.9264498841528799
+          },
+          {
+            "aesthetic_quality": 0.4723344147205353,
+            "background_consistency": 0.8810163225446429,
+            "imaging_quality": 0.793300332523242,
+            "motion_smoothness": 0.9536480035684932,
+            "subject_consistency": 0.8677510480482539,
+            "temporal_flickering": 0.9279911265653722
+          }
+        ],
+        "wbench": [
+          {
+            "aesthetic_quality": 0.48578220129013067,
+            "hpsv3_quality": 0.9127710341717157,
+            "imaging_quality": 0.7307752990722657,
+            "motion_smoothness": 0.9342187811092574,
+            "temporal_flickering": 0.8901677823534199
+          },
+          {
+            "aesthetic_quality": 0.48256911436716715,
+            "hpsv3_quality": 0.9066844252187504,
+            "imaging_quality": 0.7160418497721354,
+            "motion_smoothness": 0.9417799247456337,
+            "temporal_flickering": 0.9013616374894684
+          },
+          {
+            "aesthetic_quality": 0.487430852651596,
+            "hpsv3_quality": 0.9069372541480057,
+            "imaging_quality": 0.7263140856424968,
+            "motion_smoothness": 0.9373165050019505,
+            "temporal_flickering": 0.8993261449477252
+          },
+          {
+            "aesthetic_quality": 0.4874396332105001,
+            "hpsv3_quality": 0.9227399222240089,
+            "imaging_quality": 0.7298897069295248,
+            "motion_smoothness": 0.9470070798948664,
+            "temporal_flickering": 0.9027556625067019
+          },
+          {
+            "aesthetic_quality": 0.49672187646230065,
+            "hpsv3_quality": 0.8993240701824469,
+            "imaging_quality": 0.7309594313303628,
+            "motion_smoothness": 0.9411182592538021,
+            "temporal_flickering": 0.8931081659653608
+          },
+          {
+            "aesthetic_quality": 0.48009581724802647,
+            "hpsv3_quality": 0.9128172687442188,
+            "imaging_quality": 0.7257244307200115,
+            "motion_smoothness": 0.9328528523926853,
+            "temporal_flickering": 0.8961233475629021
+          }
+        ]
+      }
+    }
+  },
+  "contract": {
+    "deploy_sha256": "021744799f41f1cdcda6fd2fed86fd5ff5def62463397ac437d9d62506a51339",
+    "hardware": {
+      "cards": 4,
+      "devices": [
+        {
+          "name": "NVIDIA H100 80GB HBM3",
+          "total_bytes": 85017624576
+        },
+        {
+          "name": "NVIDIA H100 80GB HBM3",
+          "total_bytes": 85017624576
+        },
+        {
+          "name": "NVIDIA H100 80GB HBM3",
+          "total_bytes": 85017624576
+        },
+        {
+          "name": "NVIDIA H100 80GB HBM3",
+          "total_bytes": 85017624576
+        }
+      ],
+      "dies": 4,
+      "packages": {
+        "diffusers": "0.40.0",
+        "torch": "2.13.0+cu130",
+        "transformers": "5.14.1",
+        "vllm": "0.31.0"
+      },
+      "platform": "cuda"
+    },
+    "profile": {
+      "cards": 4,
+      "cases": [
+        {
+          "camera_pattern": "forward",
+          "id": "boardwalk-42",
+          "image": "2560px-Gfp-wisconsin-madison-the-nature-boardwalk",
+          "prompt": "The camera moves through a wooden boardwalk in a green wetland.",
+          "seed": 42
+        },
+        {
+          "camera_pattern": "orbit",
+          "id": "blossom-42",
+          "image": "cherry_blossom",
+          "prompt": "Cherry blossoms in a quiet park, detailed natural scenery.",
+          "seed": 42
+        },
+        {
+          "camera_pattern": "hold",
+          "id": "street-42",
+          "image": "stop_sign",
+          "prompt": "A street corner with a stop sign and surrounding buildings.",
+          "seed": 42
+        }
+      ],
+      "chunk_timeout_s": 120,
+      "deploy_config": "benchmarks/lingbot_world/configs/usp4_compiled.yaml",
+      "dies": 4,
+      "first_chunk_timeout_s": 900,
+      "height": 480,
+      "lifecycle_checks": true,
+      "max_reference_cv": 0.03,
+      "memory_growth_budget_bytes": 268435456,
+      "min_steady_samples": 33,
+      "model_revision": "59cccf49f2d2dd27418ae7a04b82b10868d455c2",
+      "mux_fps": 16,
+      "num_chunks": 40,
+      "performance_regression_fraction": 0.05,
+      "platform": "cuda",
+      "precision": "bfloat16",
+      "precision_atol": 0.0,
+      "precision_rtol": 0.0,
+      "precision_timeout_s": 600,
+      "reference_revision": "ebe2c18271db4fdd12221fbb4def6061e14a9379",
+      "reserved_cards": 8,
+      "schema_version": 1,
+      "startup_timeout_s": 1200,
+      "target_fps": 12,
+      "transient_noise_sigma": 3.0,
+      "warmup_chunks": 6,
+      "warmup_num_chunks": 8,
+      "width": 832
+    }
+  },
+  "evaluator_lock_sha256": "3944139af9027ddbb45f73bcaa14718405b77e15436f301df18b35a5bc16775c",
+  "evaluator_packages_sha256": "410a4672f234431c9f186fa8056f37a886316c8115d0f54bfb1d4f232f94f348",
+  "inputs": [
+    {
+      "artifact_path": "lingbot-artifacts/cuda-nightly/generation.json",
+      "build": 17443,
+      "job_id": "01a145df-c788-427d-b4de-fd232a817763",
+      "pipeline": "vllm-omni",
+      "sha256": "3e2fa677eefd2e4623297f90c07caeb467353753b2066237d94c10349f882e30"
+    },
+    {
+      "artifact_path": "lingbot-artifacts/cuda-nightly-quality/quality.json",
+      "build": 17443,
+      "job_id": "01a145df-c788-4b61-95db-a12edb635b51",
+      "pipeline": "vllm-omni",
+      "sha256": "bb042adf43d3da2474a8a4ebe47e9737023db6916d621d776da96140e8f32f0d"
+    },
+    {
+      "artifact_path": "lingbot-artifacts/cuda-nightly-quality/vbench-raw.json",
+      "build": 17443,
+      "job_id": "01a145df-c788-4b61-95db-a12edb635b51",
+      "pipeline": "vllm-omni",
+      "sha256": "c17dcb05df881ec5a59d33fc62f6a05b2b89b5f97f22e3165adae2bd74d308af"
+    },
+    {
+      "artifact_path": "lingbot-artifacts/cuda-nightly-quality/wbench-raw.json",
+      "build": 17443,
+      "job_id": "01a145df-c788-4b61-95db-a12edb635b51",
+      "pipeline": "vllm-omni",
+      "sha256": "c270e8265ef5c00295b0090186976b2dbf94ca44e58abfa0eed0ca3e62f07d94"
+    },
+    {
+      "artifact_path": "lingbot-artifacts/cuda-nightly/generation.json",
+      "build": 17454,
+      "job_id": "01a14756-990e-48e7-9bf0-c11ba4bcbf52",
+      "pipeline": "vllm-omni",
+      "sha256": "b26ffc82dd745bfd91f298c79fc4f49a010f7b8187cb1cd62ebb7b0476b4e22c"
+    },
+    {
+      "artifact_path": "lingbot-artifacts/cuda-nightly-quality/quality.json",
+      "build": 17454,
+      "job_id": "01a14756-990f-4b5c-b6eb-ad8f9151802e",
+      "pipeline": "vllm-omni",
+      "sha256": "bf3262bdcd696ddbd2550afa053e1f99c3e561d794431f7e425871fbd6d5c608"
+    },
+    {
+      "artifact_path": "lingbot-artifacts/cuda-nightly-quality/vbench-raw.json",
+      "build": 17454,
+      "job_id": "01a14756-990f-4b5c-b6eb-ad8f9151802e",
+      "pipeline": "vllm-omni",
+      "sha256": "508c8ea038127762d374615614deee20f61d3b48dac25c84b1c3d36d63ce79c7"
+    },
+    {
+      "artifact_path": "lingbot-artifacts/cuda-nightly-quality/wbench-raw.json",
+      "build": 17454,
+      "job_id": "01a14756-990f-4b5c-b6eb-ad8f9151802e",
+      "pipeline": "vllm-omni",
+      "sha256": "f2a2e4fb77ef6f56de08e5850a21f8030e2f473547c08e8d29ac69a182fe239a"
+    }
+  ],
+  "schema_version": 1,
+  "scope": "CUDA nightly 40-chunk reference population from two independent three-start frozen-reference cohorts. Candidate data excluded. Historical engine overrides were not recorded; independent final-source validation with pinned switches remains required. Candidate degradation budgets are separate and unchanged. No NPU, weekly or long-profile reuse."
+}

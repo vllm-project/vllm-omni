@@ -46,7 +46,8 @@ import platform
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -150,6 +151,7 @@ class SessionResult:
     video_start_s: float | None
     wall_s: float
     done_event: dict[str, Any]
+    events: list[dict[str, Any]] = field(default_factory=list)
 
 
 async def _keepalive(websocket: Any, send_lock: asyncio.Lock, interval: float) -> None:
@@ -175,6 +177,9 @@ async def run_session(
     ping_interval: float,
     collect_media: bool,
     print_chunks: bool,
+    on_chunk: Callable[[ChunkRecord], None] | None = None,
+    interactions_after_chunk: dict[int, dict[str, Any]] | None = None,
+    failure_output: Path | None = None,
 ) -> SessionResult:
     """Drive one rollout and timestamp every chunk as its bytes land."""
     try:
@@ -194,119 +199,166 @@ async def run_session(
     video_start_s: float | None = None
     last_arrival: float | None = None
     done_event: dict[str, Any] = {}
+    events: list[dict[str, Any]] = []
     send_lock = asyncio.Lock()
     keepalive: asyncio.Task[None] | None = None
     # Fire remaining prompt updates in chunk order as their boundary passes.
     updates = sorted(workload.prompt_updates, key=lambda update: update.after_chunk)
     update_index = 0
 
-    async with connect(url, max_size=None, ping_interval=None) as websocket:
-        async with send_lock:
-            await websocket.send(json.dumps(payload, ensure_ascii=False))
-        started = time.perf_counter()
-        if ping_interval > 0:
-            keepalive = asyncio.create_task(_keepalive(websocket, send_lock, ping_interval))
+    started: float | None = None
+    complete = False
+    try:
+        async with connect(url, max_size=None, ping_interval=None) as websocket:
+            async with send_lock:
+                await websocket.send(json.dumps(payload, ensure_ascii=False))
+            started = time.perf_counter()
+            if ping_interval > 0:
+                keepalive = asyncio.create_task(_keepalive(websocket, send_lock, ping_interval))
 
-        try:
-            while True:
-                timeout = first_chunk_timeout if not records else chunk_timeout
-                try:
-                    deadline = started + (last_arrival if last_arrival is not None else 0.0) + timeout
-                    remaining = deadline - time.perf_counter()
-                    if remaining <= 0:
-                        raise asyncio.TimeoutError
-                    message = await asyncio.wait_for(websocket.recv(), timeout=remaining)
-                except asyncio.TimeoutError as exc:
-                    raise BenchmarkError(
-                        f"No media chunk for {timeout:g} s after {len(records)} chunk(s); "
-                        "the server may still be loading, compiling, or capturing graphs."
-                    ) from exc
-                now = time.perf_counter()
+            try:
+                while True:
+                    timeout = first_chunk_timeout if not records else chunk_timeout
+                    try:
+                        deadline = started + (last_arrival if last_arrival is not None else 0.0) + timeout
+                        remaining = deadline - time.perf_counter()
+                        if remaining <= 0:
+                            raise asyncio.TimeoutError
+                        message = await asyncio.wait_for(websocket.recv(), timeout=remaining)
+                    except asyncio.TimeoutError as exc:
+                        raise BenchmarkError(
+                            f"No media chunk for {timeout:g} s after {len(records)} chunk(s); "
+                            "the server may still be loading, compiling, or capturing graphs."
+                        ) from exc
+                    now = time.perf_counter()
 
-                if isinstance(message, (bytes, bytearray)):
-                    if pending is None:
-                        raise BenchmarkError("Received a binary frame with no preceding video.chunk_metadata event.")
-                    if collect_media:
-                        media.extend(message)
-                    if pending.get("kind") == "media":
-                        index = int(pending["generation_chunk_index"])
-                        arrival = now - started
-                        if ttfc_s is None:
-                            ttfc_s = arrival
-                        records.append(
-                            ChunkRecord(
-                                index=index,
-                                arrival_s=arrival,
-                                inter_arrival_s=arrival - (last_arrival if last_arrival is not None else 0.0),
-                                byte_length=len(message),
-                                num_frames=int(pending["num_frames"]),
+                    if isinstance(message, (bytes, bytearray)):
+                        if pending is None:
+                            raise BenchmarkError(
+                                "Received a binary frame with no preceding video.chunk_metadata event."
                             )
+                        if collect_media:
+                            media.extend(message)
+                        if pending.get("kind") == "media":
+                            index = int(pending["generation_chunk_index"])
+                            arrival = now - started
+                            if ttfc_s is None:
+                                ttfc_s = arrival
+                            records.append(
+                                ChunkRecord(
+                                    index=index,
+                                    arrival_s=arrival,
+                                    inter_arrival_s=arrival - (last_arrival if last_arrival is not None else 0.0),
+                                    byte_length=len(message),
+                                    num_frames=int(pending["num_frames"]),
+                                )
+                            )
+                            last_arrival = arrival
+                            if on_chunk is not None:
+                                # Diagnostic observations may synchronize devices.
+                                # Performance runs never install this callback.
+                                on_chunk(records[-1])
+                            if interactions_after_chunk is not None and index in interactions_after_chunk:
+                                async with send_lock:
+                                    await websocket.send(
+                                        json.dumps(interactions_after_chunk[index], ensure_ascii=False)
+                                    )
+                            if print_chunks:
+                                print(
+                                    f"  chunk {index:3d}  t={arrival:8.3f}s  "
+                                    f"interval={records[-1].inter_arrival_s * 1000:8.1f}ms  "
+                                    f"frames={records[-1].num_frames:3d}  bytes={len(message)}",
+                                    flush=True,
+                                )
+                            while update_index < len(updates) and updates[update_index].after_chunk <= index:
+                                async with send_lock:
+                                    await websocket.send(
+                                        json.dumps(updates[update_index].to_payload(), ensure_ascii=False)
+                                    )
+                                update_index += 1
+                        pending = None
+                        continue
+
+                    event = json.loads(message)
+                    events.append(event)
+                    event_type = event.get("type")
+                    if event_type == "video.chunk_metadata":
+                        pending = event
+                    elif event_type == "video.start":
+                        request_id = event.get("request_id")
+                        video_start_s = now - started
+                    elif event_type == "error":
+                        # Say what was asked for alongside what the server refused:
+                        # some builds cap a rollout's num_frames, and the operator
+                        # needs to know which --num-chunks would fit.
+                        raise BenchmarkError(
+                            f"Server rejected the session after {len(records)} chunk(s): "
+                            f"{event.get('message', event)} "
+                            f"(requested {workload.num_chunks} chunks = num_frames {workload.num_frames})"
                         )
-                        last_arrival = arrival
-                        if print_chunks:
-                            print(
-                                f"  chunk {index:3d}  t={arrival:8.3f}s  "
-                                f"interval={records[-1].inter_arrival_s * 1000:8.1f}ms  "
-                                f"frames={records[-1].num_frames:3d}  bytes={len(message)}",
-                                flush=True,
-                            )
-                        while update_index < len(updates) and updates[update_index].after_chunk <= index:
-                            async with send_lock:
-                                await websocket.send(json.dumps(updates[update_index].to_payload(), ensure_ascii=False))
-                            update_index += 1
-                    pending = None
-                    continue
+                    elif event_type == "session.done":
+                        done_event = event
+                        break
+            finally:
+                if keepalive is not None:
+                    keepalive.cancel()
+                    try:
+                        await keepalive
+                    except asyncio.CancelledError:
+                        pass
 
-                event = json.loads(message)
-                event_type = event.get("type")
-                if event_type == "video.chunk_metadata":
-                    pending = event
-                elif event_type == "video.start":
-                    request_id = event.get("request_id")
-                    video_start_s = now - started
-                elif event_type == "error":
-                    # Say what was asked for alongside what the server refused:
-                    # some builds cap a rollout's num_frames, and the operator
-                    # needs to know which --num-chunks would fit.
-                    raise BenchmarkError(
-                        f"Server rejected the session after {len(records)} chunk(s): "
-                        f"{event.get('message', event)} "
-                        f"(requested {workload.num_chunks} chunks = num_frames {workload.num_frames})"
-                    )
-                elif event_type == "session.done":
-                    done_event = event
-                    break
-        finally:
-            if keepalive is not None:
-                keepalive.cancel()
-                try:
-                    await keepalive
-                except asyncio.CancelledError:
-                    pass
+            wall_s = time.perf_counter() - started
 
-        wall_s = time.perf_counter() - started
+        if not records:
+            raise BenchmarkError("The session finished without delivering a single media chunk.")
+        if done_event.get("stopped"):
+            raise BenchmarkError(f"The session was stopped before it finished: {done_event}")
+        observed = [record.index for record in records]
+        if observed != list(range(len(records))):
+            raise BenchmarkError(f"Chunk indices are not contiguous from zero: {observed}")
+        if len(records) != workload.num_chunks:
+            raise BenchmarkError(
+                f"Expected {workload.num_chunks} chunks for num_frames={workload.num_frames}, received {len(records)}."
+            )
 
-    if not records:
-        raise BenchmarkError("The session finished without delivering a single media chunk.")
-    if done_event.get("stopped"):
-        raise BenchmarkError(f"The session was stopped before it finished: {done_event}")
-    observed = [record.index for record in records]
-    if observed != list(range(len(records))):
-        raise BenchmarkError(f"Chunk indices are not contiguous from zero: {observed}")
-    if len(records) != workload.num_chunks:
-        raise BenchmarkError(
-            f"Expected {workload.num_chunks} chunks for num_frames={workload.num_frames}, received {len(records)}."
+        result = SessionResult(
+            request_id=request_id,
+            records=records,
+            media=bytes(media),
+            ttfc_s=ttfc_s,
+            video_start_s=video_start_s,
+            wall_s=wall_s,
+            done_event=done_event,
+            events=events,
         )
-
-    return SessionResult(
-        request_id=request_id,
-        records=records,
-        media=bytes(media),
-        ttfc_s=ttfc_s,
-        video_start_s=video_start_s,
-        wall_s=wall_s,
-        done_event=done_event,
-    )
+        complete = True
+        return result
+    finally:
+        if not complete and failure_output is not None:
+            # A diagnostic trace is never a benchmark result. Write only after
+            # the failed session has unwound; successful timing is unchanged.
+            error = sys.exc_info()[1]
+            trace = {
+                "complete": False,
+                "error": {"type": type(error).__name__, "message": str(error)},
+                "request_id": request_id,
+                "expected_chunks": workload.num_chunks,
+                "video_start_ms": video_start_s * 1000.0 if video_start_s is not None else None,
+                "ttfc_ms": ttfc_s * 1000.0 if ttfc_s is not None else None,
+                "wall_seconds": time.perf_counter() - started if started is not None else None,
+                "chunks": [record.to_dict() for record in records],
+                "events": events,
+                "done_event": done_event,
+            }
+            try:
+                failure_output.parent.mkdir(parents=True, exist_ok=True)
+                temporary = failure_output.with_suffix(failure_output.suffix + ".tmp")
+                temporary.write_text(json.dumps(trace, indent=2) + "\n")
+                os.replace(temporary, failure_output)
+            except OSError as write_error:
+                # A diagnostic filesystem error must not replace the original
+                # timeout, protocol error, disconnect or cancellation.
+                print(f"Could not retain failed session trace at {failure_output}: {write_error}", file=sys.stderr)
 
 
 # --------------------------------------------------------------------------- #
@@ -460,6 +512,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     run.add_argument("--sessions", type=int, default=1, help="Sequential measured rollouts.")
     run.add_argument("--warmup-sessions", type=int, default=0, help="Unmeasured rollouts first (pays compile cost).")
     run.add_argument(
+        "--warmup-num-chunks",
+        type=int,
+        default=None,
+        help="Optional shorter warmup rollout; measured rollout length is unchanged.",
+    )
+    run.add_argument(
         "--warmup-chunks",
         type=int,
         default=DEFAULT_WARMUP_CHUNKS,
@@ -496,6 +554,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--sessions must be at least 1.")
     if args.warmup_sessions < 0:
         parser.error("--warmup-sessions must be non-negative.")
+    if args.warmup_num_chunks is not None and args.warmup_num_chunks < 1:
+        parser.error("--warmup-num-chunks must be positive.")
     if args.warmup_chunks < 0:
         parser.error("--warmup-chunks must be non-negative.")
     if args.playback_buffer_chunks < 1:
@@ -542,17 +602,33 @@ async def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         + ("" if args.target_fps is None else f" (mux label stays {workload.fps} fps)")
     )
 
+    warmup_results: list[SessionResult] = []
     for index in range(args.warmup_sessions):
         print(f"Warmup session {index + 1}/{args.warmup_sessions} (not measured)...")
-        await run_session(
-            url,
-            args.model,
-            workload,
-            first_chunk_timeout=args.first_chunk_timeout,
-            chunk_timeout=args.chunk_timeout,
-            ping_interval=args.ping_interval,
-            collect_media=False,
-            print_chunks=False,
+        warmup = workload
+        if args.warmup_num_chunks is not None:
+            count = min(args.warmup_num_chunks, workload.num_chunks)
+            warmup = replace(
+                workload,
+                camera_script=workload.camera_script[:count],
+                prompt_updates=tuple(update for update in workload.prompt_updates if update.after_chunk < count),
+            )
+        warmup_results.append(
+            await run_session(
+                url,
+                args.model,
+                warmup,
+                first_chunk_timeout=args.first_chunk_timeout,
+                chunk_timeout=args.chunk_timeout,
+                ping_interval=args.ping_interval,
+                collect_media=False,
+                print_chunks=False,
+                failure_output=(
+                    Path(args.output_json).with_name(f"{Path(args.output_json).stem}-warmup-{index}-failure.json")
+                    if args.output_json is not None
+                    else None
+                ),
+            )
         )
 
     session_metrics: list[dict[str, Any]] = []
@@ -570,6 +646,11 @@ async def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             ping_interval=args.ping_interval,
             collect_media=args.save_video is not None,
             print_chunks=args.print_chunks,
+            failure_output=(
+                Path(args.output_json).with_name(f"{Path(args.output_json).stem}-session-{index}-failure.json")
+                if args.output_json is not None
+                else None
+            ),
         )
         last_result = result
         metrics = compute_metrics(
@@ -609,6 +690,7 @@ async def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         "config": {
             "sessions": args.sessions,
             "warmup_sessions": args.warmup_sessions,
+            "warmup_num_chunks": args.warmup_num_chunks,
             "warmup_chunks": args.warmup_chunks,
             "camera_pattern": args.camera_pattern,
             "chunk_slo_ms": args.chunk_slo_ms,
@@ -617,6 +699,20 @@ async def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             "playback_buffer_chunks": args.playback_buffer_chunks,
             "workload_file": args.workload,
         },
+        # Serialize warmup evidence after measurement; it never participates in
+        # the measured session population or adds a pause between requests.
+        "warmups": [
+            {
+                "session_index": index,
+                "measured": False,
+                "request_id": result.request_id,
+                "video_start_ms": (result.video_start_s * 1000.0) if result.video_start_s is not None else None,
+                "ttfc_ms": (result.ttfc_s * 1000.0) if result.ttfc_s is not None else None,
+                "wall_seconds": result.wall_s,
+                "chunks": [record.to_dict() for record in result.records],
+            }
+            for index, result in enumerate(warmup_results)
+        ],
         "sessions": session_payloads,
         "metrics": aggregate,
     }

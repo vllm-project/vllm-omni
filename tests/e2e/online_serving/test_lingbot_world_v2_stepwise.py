@@ -146,11 +146,11 @@ def test_lingbot_world_v2_stepwise_streams_one_chunk_per_block(omni_server) -> N
     assert done["chunks"] >= _NUM_CHUNKS
 
 
-# Paced-playback scenarios. The first chunk decodes 13 media frames (0.8125 s
-# at 16 fps), so with a 1.5 s window the admission of the second chunk is
-# gated as soon as the first chunk lands and the client has not reported any
-# playback: the gate engages deterministically regardless of GPU speed.
-_PACED_MAX_LEAD_MS = 1500
+# The initial block decodes nine frames (0.5625 s at 16 fps), then each block
+# adds twelve (0.75 s). A one-second window fits one block but cannot admit
+# the second before playback advances. This makes the held-playhead checks
+# independent of how long inference of the second block would take.
+_PACED_MAX_LEAD_MS = 1000
 _PACED_HOLD_S = 5.0
 _PACED_NUM_CHUNKS = 6
 _PACED_ACTIONS = [[["w"], ["w"], ["w"]]] * _PACED_NUM_CHUNKS

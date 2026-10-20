@@ -1,0 +1,160 @@
+{
+  "schema_version": 1,
+  "reference_revision": "8d7c354674c7e1dc57544f248689574fccb71af9",
+  "model_revision": "59cccf49f2d2dd27418ae7a04b82b10868d455c2",
+  "height": 480,
+  "width": 832,
+  "precision": "bfloat16",
+  "num_chunks": 160,
+  "warmup_chunks": 6,
+  "min_steady_samples": 306,
+  "mux_fps": 16,
+  "target_fps": 12,
+  "startup_timeout_s": 1200,
+  "precision_timeout_s": 600,
+  "first_chunk_timeout_s": 900,
+  "chunk_timeout_s": 120,
+  "lifecycle_checks": true,
+  "max_reference_cv": 0.03,
+  "performance_regression_fraction": 0.05,
+  "precision_atol": 0.0,
+  "precision_rtol": 0.0,
+  "cases": [
+    {
+      "id": "boardwalk-42-forward",
+      "image": "2560px-Gfp-wisconsin-madison-the-nature-boardwalk",
+      "prompt": "The camera moves through a wooden boardwalk in a green wetland.",
+      "camera_pattern": "forward",
+      "seed": 42
+    },
+    {
+      "id": "boardwalk-42-orbit",
+      "image": "2560px-Gfp-wisconsin-madison-the-nature-boardwalk",
+      "prompt": "The camera moves through a wooden boardwalk in a green wetland.",
+      "camera_pattern": "orbit",
+      "seed": 42
+    },
+    {
+      "id": "boardwalk-42-hold",
+      "image": "2560px-Gfp-wisconsin-madison-the-nature-boardwalk",
+      "prompt": "The camera moves through a wooden boardwalk in a green wetland.",
+      "camera_pattern": "hold",
+      "seed": 42
+    },
+    {
+      "id": "boardwalk-314-forward",
+      "image": "2560px-Gfp-wisconsin-madison-the-nature-boardwalk",
+      "prompt": "The camera moves through a wooden boardwalk in a green wetland.",
+      "camera_pattern": "forward",
+      "seed": 314
+    },
+    {
+      "id": "boardwalk-314-orbit",
+      "image": "2560px-Gfp-wisconsin-madison-the-nature-boardwalk",
+      "prompt": "The camera moves through a wooden boardwalk in a green wetland.",
+      "camera_pattern": "orbit",
+      "seed": 314
+    },
+    {
+      "id": "boardwalk-314-hold",
+      "image": "2560px-Gfp-wisconsin-madison-the-nature-boardwalk",
+      "prompt": "The camera moves through a wooden boardwalk in a green wetland.",
+      "camera_pattern": "hold",
+      "seed": 314
+    },
+    {
+      "id": "blossom-42-forward",
+      "image": "cherry_blossom",
+      "prompt": "Cherry blossoms in a quiet park, detailed natural scenery.",
+      "camera_pattern": "forward",
+      "seed": 42
+    },
+    {
+      "id": "blossom-42-orbit",
+      "image": "cherry_blossom",
+      "prompt": "Cherry blossoms in a quiet park, detailed natural scenery.",
+      "camera_pattern": "orbit",
+      "seed": 42
+    },
+    {
+      "id": "blossom-42-hold",
+      "image": "cherry_blossom",
+      "prompt": "Cherry blossoms in a quiet park, detailed natural scenery.",
+      "camera_pattern": "hold",
+      "seed": 42
+    },
+    {
+      "id": "blossom-314-forward",
+      "image": "cherry_blossom",
+      "prompt": "Cherry blossoms in a quiet park, detailed natural scenery.",
+      "camera_pattern": "forward",
+      "seed": 314
+    },
+    {
+      "id": "blossom-314-orbit",
+      "image": "cherry_blossom",
+      "prompt": "Cherry blossoms in a quiet park, detailed natural scenery.",
+      "camera_pattern": "orbit",
+      "seed": 314
+    },
+    {
+      "id": "blossom-314-hold",
+      "image": "cherry_blossom",
+      "prompt": "Cherry blossoms in a quiet park, detailed natural scenery.",
+      "camera_pattern": "hold",
+      "seed": 314
+    },
+    {
+      "id": "street-42-forward",
+      "image": "stop_sign",
+      "prompt": "A street corner with a stop sign and surrounding buildings.",
+      "camera_pattern": "forward",
+      "seed": 42
+    },
+    {
+      "id": "street-42-orbit",
+      "image": "stop_sign",
+      "prompt": "A street corner with a stop sign and surrounding buildings.",
+      "camera_pattern": "orbit",
+      "seed": 42
+    },
+    {
+      "id": "street-42-hold",
+      "image": "stop_sign",
+      "prompt": "A street corner with a stop sign and surrounding buildings.",
+      "camera_pattern": "hold",
+      "seed": 42
+    },
+    {
+      "id": "street-314-forward",
+      "image": "stop_sign",
+      "prompt": "A street corner with a stop sign and surrounding buildings.",
+      "camera_pattern": "forward",
+      "seed": 314
+    },
+    {
+      "id": "street-314-orbit",
+      "image": "stop_sign",
+      "prompt": "A street corner with a stop sign and surrounding buildings.",
+      "camera_pattern": "orbit",
+      "seed": 314
+    },
+    {
+      "id": "street-314-hold",
+      "image": "stop_sign",
+      "prompt": "A street corner with a stop sign and surrounding buildings.",
+      "camera_pattern": "hold",
+      "seed": 314
+    }
+  ],
+  "platform": "npu",
+  "cpu_threads_per_worker": 1,
+  "cards": 4,
+  "reserved_cards": 8,
+  "dies": 4,
+  "deploy_config": "tests/dfx/lingbot_world/configs/npu_usp4_offload.yaml",
+  "memory_growth_budget_bytes": 268435456,
+  "warmup_num_chunks": 8,
+  "transient_noise_sigma": 3.0,
+  "measured_sessions": 2
+}

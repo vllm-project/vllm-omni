@@ -191,6 +191,20 @@ x-lingbot-world: &lingbot_world
 
 
 source_file_dependencies:
+  lingbot_world_regression:
+    - benchmarks/lingbot_world/
+    - tests/diffusion/models/lingbot_world/
+    - tests/dfx/lingbot_world/
+    - tests/benchmarks/test_lingbot_world_
+    - tests/e2e/online_serving/test_lingbot_world_v2_stepwise.py
+    - tests/helpers/runtime.py
+    - vllm_omni/diffusion/models/lingbot_world/
+    - vllm_omni/experimental/ar_diffusion/
+    - vllm_omni/entrypoints/openai/serving_video_output_stream.py
+    - vllm_omni/entrypoints/openai/video_stream_base.py
+    - vllm_omni/diffusion/distributed/autoencoders/
+    - requirements/lingbot-quality
+    - .buildkite/common/scripts/run-lingbot-ci.sh
   # Hardware presets and shared test helpers. Not a job key — do not attach this
   # to a step. Fallback-only diffs keep every job, even when a job lists a shared
   # path. Mixed diffs use normal job dependencies when any job-key prefix matches.
