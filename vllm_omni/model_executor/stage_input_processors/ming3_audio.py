@@ -5,13 +5,14 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import torch
 from vllm.inputs import TextPrompt
 from vllm.logger import init_logger
 from vllm.tokenizers import cached_tokenizer_from_config
+from vllm.tokenizers.detokenizer_utils import detokenize_incrementally
 
 from vllm_omni.data_entry_keys import CodesStruct, MetaStruct, OmniPayloadStruct
 from vllm_omni.engine import OmniEngineCoreRequest
@@ -41,7 +42,10 @@ class _MingChunkState:
     frontend: NativeMingTextFrontend
     max_length: int
     scrub_markup: bool
-    prefix: str = ""
+    token_ids: list[int] = field(default_factory=list)
+    tokens: list[str] | None = None
+    prefix_offset: int = 0
+    read_offset: int = 0
     synthesis_info: dict[str, Any] | None = None
 
 
@@ -78,7 +82,10 @@ def thinker2talker_async_chunk(
     elif state.max_length != max_length or state.scrub_markup != scrub_markup:
         raise ValueError("max_text_length and scrub_markup cannot change within a Ming text stream")
 
-    token_ids = list(request.all_token_ids)[len(request.prompt_token_ids) :]
+    token_offset = len(request.prompt_token_ids) + len(state.token_ids)
+    if len(request.all_token_ids) < token_offset:
+        raise RuntimeError("Ming3 thinker token history shrank within a text stream")
+    new_token_ids = request.all_token_ids[token_offset:]
     model_config = getattr(transfer_manager, "model_config", None) or getattr(transfer_manager, "config", None)
     if model_config is None and hasattr(transfer_manager, "_get_model_config"):
         model_config = transfer_manager._get_model_config()
@@ -88,17 +95,23 @@ def thinker2talker_async_chunk(
         if tokenizer is None:
             raise RuntimeError("Ming3 async chunk requires the thinker tokenizer")
         transfer_manager._ming3_text_tokenizer = tokenizer
-    text = tokenizer.decode(token_ids, skip_special_tokens=True)
-    if not text.startswith(state.prefix):
-        raise RuntimeError("Ming3 thinker text changed after a text delta was consumed")
-
-    # Byte-level tokens can temporarily decode to U+FFFD. Feed only stable
-    # UTF-8 text; the final snapshot still flushes the frontend when empty.
-    end = len(text) if is_finished else text.find("\ufffd", len(state.prefix))
-    if end < 0:
-        end = len(text)
-    delta = text[len(state.prefix) : end]
-    state.prefix = text[:end]
+    deltas = []
+    for token_id in new_token_ids:
+        state.token_ids.append(token_id)
+        tokens, delta, state.prefix_offset, state.read_offset = detokenize_incrementally(
+            tokenizer,
+            state.token_ids,
+            state.tokens,
+            state.prefix_offset,
+            state.read_offset,
+            skip_special_tokens=True,
+        )
+        if state.tokens is None:
+            state.tokens = tokens
+        else:
+            state.tokens.extend(tokens)
+        deltas.append(delta)
+    delta = "".join(deltas)
     fragments = state.frontend.feed(delta, final=is_finished)
     # Optional sender-side diagnostics before Talker linguistic normalization.
     if fragments and os.environ.get("MING_TEXT_FRAG_LOG") == "1":

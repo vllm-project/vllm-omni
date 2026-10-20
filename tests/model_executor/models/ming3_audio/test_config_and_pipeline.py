@@ -457,10 +457,19 @@ def test_ming3_pipeline_supports_text_and_audio_outputs():
 
 
 def test_ming3_async_chunk_emits_stable_sentences_and_terminal_tail(mocker: MockerFixture):
-    tokenizer = mocker.Mock(spec=["decode"])
-    tokenizer.decode.side_effect = lambda ids, **kwargs: "".join(
-        {1: "这是一段包含足够多汉字的正常回答", 2: "。", 3: "世界"}[token_id] for token_id in ids
-    )
+    class Tokenizer:
+        is_fast = True
+
+        def __len__(self):
+            return 4
+
+        def convert_ids_to_tokens(self, ids, **kwargs):
+            return [{1: "这是一段包含足够多汉字的正常回答", 2: "。", 3: "世界"}[token_id] for token_id in ids]
+
+        def convert_tokens_to_string(self, tokens):
+            return "".join(tokens)
+
+    tokenizer = Tokenizer()
     manager = mocker.Mock(spec=["_ming3_text_tokenizer", "_ming3_chunk_state"])
     manager._ming3_text_tokenizer = tokenizer
     manager._ming3_chunk_state = {}
