@@ -3,10 +3,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-import vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni as minicpmo_module
 from vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni import (
     _extract_first_audio_ref,
-    _trace_ref_audio,
     llm2tts,
 )
 
@@ -49,22 +47,6 @@ def test_extract_first_audio_ref_accepts_dict_stereo_audio() -> None:
     waveform, sample_rate = ref
     assert sample_rate == 16000
     assert torch.allclose(waveform, torch.tensor([1.5, 3.5, 5.5]))
-
-
-def test_ref_audio_trace_is_opt_in_and_fingerprints_without_waveform(monkeypatch) -> None:
-    ref = (torch.tensor([0.1, 0.2]), 16000)
-    messages = []
-    monkeypatch.setattr(minicpmo_module.logger, "warning", lambda *args: messages.append(args))
-    _trace_ref_audio("test.off", ref)
-    assert not messages
-
-    monkeypatch.setenv("MINICPMO45_REF_AUDIO_TRACE", "1")
-    _trace_ref_audio("test.on", ref)
-    message = " ".join(str(item) for item in messages[-1])
-    assert "stage=%s" in message and "test.on" in message
-    assert "present=true" in message
-    assert "samples=%s" in message and "2" in message
-    assert "0.1" not in message
 
 
 def test_plain_chat_handoff_owns_talker_prompt_contract() -> None:
