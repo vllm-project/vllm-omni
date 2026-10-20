@@ -2075,10 +2075,10 @@ def test_tf32_mode_null_means_unset_and_typos_raise(monkeypatch):
     assert _tf32_mode({"token2wav_allow_tf32": "off"}) == "off"
     assert _tf32_mode({"token2wav_allow_tf32": "  TF32  "}) == "tf32"
     with pytest.raises(ValueError, match="allow_tf32"):
-        _tf32_mode({"token2wav_allow_tf32": "ture"})
+        _tf32_mode({"token2wav_allow_tf32": "maybe"})
     with pytest.raises(ValueError, match="allow_tf32"):
         _tf32_mode({"token2wav_allow_tf32": 2})
-    monkeypatch.setenv("MINICPMO_CODE2WAV_TF32", "ture")
+    monkeypatch.setenv("MINICPMO_CODE2WAV_TF32", "maybe")
     with pytest.raises(ValueError, match="allow_tf32"):
         _tf32_mode({})
 
