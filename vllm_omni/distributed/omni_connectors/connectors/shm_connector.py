@@ -35,9 +35,10 @@ _LOCK_FILE_PREFIX = "shm_"
 _LOCK_FILE_SUFFIX = "_lockfile.lock"
 _STALE_LOCK_GRACE_SECONDS = 60.0
 # Time-gated orphan sweep: instead of a once-per-process flag, remember when
-# the last sweep ran. A process that starts (or calls put/get) within the
-# grace window of a crash retries the sweep later, so young orphan lock files
-# are not skipped forever.
+# the last sweep was triggered.  Sweeps only run when __init__/put()/get()
+# call the gate, at most once per grace interval; the gate re-arms, so a
+# start inside a crash's grace window skips young orphans for now and later
+# calls retry once the interval has passed.
 _last_stale_sweep = float("-inf")
 _sweep_gate_lock = threading.Lock()
 
@@ -95,9 +96,12 @@ def _reclaim_orphan_lock_file(key: str, grace: float | None = None) -> bool:
 def _sweep_stale_lock_files(grace: float | None = None) -> int:
     """Best-effort removal of orphan lock files whose segment is already gone.
 
-    A lock file only guards one transfer; its segment is unlinked by the
-    receiving read or by ``resource_tracker`` when the owner process dies, so
-    a lock file whose segment no longer exists is garbage.  Uses a
+    A lock file only guards one transfer; its segment may have been unlinked
+    by the receiving read or by an external cleanup such as
+    ``resource_tracker`` after an abnormal owner exit.  A lock file whose
+    segment no longer exists is a sweep candidate — still subject to the
+    grace, lock-acquisition and recheck conditions below; nothing guarantees
+    that every abnormal exit completes segment reclamation.  Uses a
     check–lock–recheck–unlink protocol so a concurrent creator/reader can
     never lose its lock:
 
@@ -170,16 +174,29 @@ class SharedMemoryConnector(OmniConnectorBase):
 
     - a receiving **byte read** that returned successfully (``consumed`` is
       set before deserialization, so a later deserialize failure still
-      removes the lock; the byte read itself unlinks the segment on
-      success, best-effort, before returning);
+      removes the lock).  The read attempts to unlink the segment before
+      returning but swallows failures, so the lock can be removed while
+      the segment still exists;
     - a read that acquired the lock and then found the segment already
       gone — a read that never acquired the lock never touches it, and a
       failed read with the segment still alive keeps it for retry;
-    - a key-based poll whose segment is missing, reclaiming an aged orphan
-      via ``_reclaim_orphan_lock_file`` (best-effort like every path);
-    - a ``put()`` whose ``shm_write_bytes`` raised before the segment
-      existed (removed while still holding the lock);
-    - ``cleanup()`` / ``close()`` for a given key.
+    - a key-based poll whose segment is missing, attempting to reclaim an
+      aged orphan via ``_reclaim_orphan_lock_file`` (best-effort like every
+      path);
+    - a ``put()`` whose ``shm_write_bytes`` raised — the trigger is the
+      raise, not a missing segment, and the branch does not roll back a
+      segment the write may already have created (lock removed while still
+      held, best-effort).  Serialization failures happen before this call
+      opens or creates the lock file; failures after a successful write
+      never enter this branch;
+    - ``cleanup(key)``: attempts exact-key cleanup for the given key
+      regardless of whether it is tracked — it pops any tracking record,
+      then proceeds to the lock file even when the segment cleanup failed
+      ("segment still exists, lock removed" is possible), and keeps no
+      failure record for a later retry;
+    - ``close()``: snapshots the keys currently tracked in
+      ``_pending_keys`` and runs ``cleanup()`` for each — it does not scan
+      for or clean untracked resources.
 
     Orphan sweeping is lazy and per-process — not a background timer.
     ``_maybe_sweep_stale_lock_files()`` fires from ``__init__`` / ``put()``
@@ -193,12 +210,12 @@ class SharedMemoryConnector(OmniConnectorBase):
     ``resource_tracker`` at owner shutdown — itself best-effort) is an
     orphan candidate for the sweep.
 
-    ``_pending_keys`` is a process-local record of keys this connector has
-    put and not yet observed consumed: ``put()`` registers them, successful
-    reads pop them, ``reap_consumed()`` bounds the backlog, and
-    ``cleanup()`` / ``close()`` drain them (``cleanup(key)`` unlinks
-    unconditionally, tracked or not).  It is bookkeeping — not an authority
-    on segment existence, and not a crash-recovery log.
+    ``_pending_keys`` is this connector instance's process-local record of
+    keys it has put, kept for later cleanup: ``put()`` registers them,
+    successful reads and explicit cleanup pop them (cleanup pops even when
+    the segment cleanup failed), and ``reap_consumed()`` rotates the
+    window it inspects.  It is bookkeeping for this instance — not an
+    authority on segment existence, and not a crash-recovery log.
     """
 
     def get_with_deadline(self, from_stage, to_stage, get_key, metadata=None, *, deadline):
@@ -231,9 +248,10 @@ class SharedMemoryConnector(OmniConnectorBase):
         self._wake_path: str | None = None
         self._wake_generation = 0
         self._wake_closed = False
-        # Orphan lock files left by crashed predecessors are reaped here; the
-        # gate retries after the grace window (via put/get) when this process
-        # starts inside it, instead of skipping young orphans forever.
+        # Orphan lock files left by crashed predecessors are swept here,
+        # best-effort.  A start inside the grace window skips them for now;
+        # the gate re-arms, so later put()/get() calls retry once the
+        # interval has passed.
         _maybe_sweep_stale_lock_files()
 
     def _open_wakeup_receiver(self) -> bool:
@@ -371,11 +389,11 @@ class SharedMemoryConnector(OmniConnectorBase):
                 try:
                     meta = shm_write_bytes(payload, name=put_key)
                 except BaseException:
-                    # The transfer did not complete — drop the lock while we
-                    # still hold it.  Best-effort: shm_write_bytes may also
-                    # raise *after* creating the segment and does not roll
-                    # back, which leaves an orphan segment behind (see the
-                    # lifecycle contract; the remove itself may fail too).
+                    # Trigger: shm_write_bytes raised — not only before the
+                    # segment existed.  The lock is dropped while still held,
+                    # best-effort; a segment the write already created is not
+                    # rolled back here.  Failures after a successful write do
+                    # not reach this branch.
                     try:
                         os.remove(lock_file)
                     except OSError:
@@ -499,9 +517,13 @@ class SharedMemoryConnector(OmniConnectorBase):
         return result
 
     def cleanup(self, request_id: str) -> bool:
-        """Unlink the exact key passed to ``put()``, never a request-id prefix.
+        """Attempt exact-key cleanup for the key passed to ``put()``, never a
+        request-id prefix: pop the tracking record, try to unlink the segment,
+        then try to remove the lock file — even when the segment cleanup
+        failed.  No failure record is kept for a later retry, so a failed
+        segment cleanup can leave "segment still exists, lock removed".
 
-        Returns True when an unconsumed segment was actually unlinked.
+        Returns True when a segment was actually unlinked.
         """
         key = request_id
         unlinked = False
@@ -526,18 +548,24 @@ class SharedMemoryConnector(OmniConnectorBase):
         return unlinked
 
     def cleanup_prefix(self, key_prefix: str) -> int:
-        """Unlink every tracked key of the form ``{key_prefix}{chunk_id}``.
+        """Attempt cleanup for every tracked key of the form
+        ``{key_prefix}{chunk_id}``.
 
         Only keys still in ``_pending_keys`` are considered, and the suffix
         must be a bare integer chunk id, so another request whose id merely
-        shares the prefix is never matched. Returns the unlinked count.
+        shares the prefix is never matched.  Best-effort like ``cleanup()``:
+        the return value counts segments actually unlinked — not matched
+        keys, and not removed lock files.
         """
         with self._pending_keys_lock:
             keys = [k for k in self._pending_keys if k.startswith(key_prefix) and k[len(key_prefix) :].isdigit()]
         return sum(self.cleanup(key) for key in keys)
 
     def close(self) -> None:
-        """Unlink all remaining tracked SHM segments."""
+        """Drain the currently tracked keys: snapshot ``_pending_keys`` and run
+        ``cleanup()`` for each, then close the wakeup FIFO.  It does not scan
+        for, or guarantee cleanup of, untracked leftovers.
+        """
         with self._pending_keys_lock:
             keys = list(self._pending_keys)
         for key in keys:
@@ -545,7 +573,12 @@ class SharedMemoryConnector(OmniConnectorBase):
         self._close_wakeups()
 
     def reap_consumed(self, *, max_keys: int = 64) -> None:
-        """Bounded round-robin sweep; receivers unlink SHM in another process."""
+        """Inspect at most *max_keys* tracking records, round-robin: records
+        whose segment no longer exists are dropped, records whose segment
+        still exists rotate to the back.  Bounds per-call work — not the
+        number of unread records — and never touches lock files (receivers
+        unlink segments in another process).
+        """
         with self._pending_keys_lock:
             for _ in range(min(max_keys, len(self._pending_keys))):
                 key, _ = self._pending_keys.popitem(last=False)

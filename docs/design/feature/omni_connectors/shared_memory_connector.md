@@ -170,11 +170,11 @@ inline-payload path or size threshold.
 
 #### 6.2 Cleanup Unlinks the Exact Key
 
-`cleanup(request_id)` unlinks the exact key passed to `put()` — never a request-id prefix — together with its lock file, and returns whether a segment was actually unlinked. The cleanup is unconditional: the key does not need to be tracked in this connector's `_pending_keys`, so a caller may also reclaim a key it only knows by name. `cleanup_prefix()` and `close()` are the tracked-key operations: the former unlinks only tracked keys of the form `{key_prefix}{chunk_id}`, the latter drains the tracked keys (§6.3). A key the consumer never reads and nobody cleans up stays allocated until the sender's `close()` — or the orphan sweep, once its segment is gone (§4.3).
+`cleanup(request_id)` attempts exact-key cleanup for the key passed to `put()` — never a request-id prefix: it pops the tracking record, tries to unlink the segment, then tries to remove the lock file — even when the segment cleanup failed, and without keeping a failure record for a later retry ("segment still exists, lock removed" is possible). It returns whether a segment was actually unlinked. The cleanup is unconditional: the key does not need to be tracked in this connector's `_pending_keys`, so a caller may also target a key it only knows by name. `cleanup_prefix()` and `close()` are the tracked-key operations: the former cleans up only tracked keys of the form `{key_prefix}{chunk_id}`, the latter drains the keys tracked at close time (§6.3). A key the consumer never reads and nobody cleans up stays allocated until the sender's `close()` — or the orphan sweep, once its segment is gone (§4.3).
 
 #### 6.3 Close Drains Tracked Keys and Wakeups
 
-`close()` runs the exact-key cleanup for every key still tracked in `_pending_keys`, then closes the receiver's wakeup FIFO. There is no connector-owned background thread or memory pool. Crash leftovers beyond the tracked keys are reaped by the time-gated orphan sweep described in §4.3.
+`close()` snapshots the keys currently tracked in `_pending_keys`, runs the exact-key cleanup for each, then closes the receiver's wakeup FIFO. There is no connector-owned background thread or memory pool, and `close()` does not scan for or guarantee cleanup of untracked leftovers. Crash leftovers beyond the tracked keys are left to the time-gated orphan sweep (best-effort, §4.3).
 
 ### 7. Data Flow in the Pipeline
 
