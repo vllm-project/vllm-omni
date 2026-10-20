@@ -21,16 +21,17 @@ job with the same prefix). These jobs run CPU-marked tests
 reproducible on the my_l20 box. Out of scope: NPU READY (no NPU on the fix
 box), AFD / ROUTER (different repos).
 
-**Fix environment** (verified 2026-10-19):
+**Fix environment** (verified 2026-10-20, first live run of build #17604):
 
 | Item | Value |
 |---|---|
 | SSH host | `my_l20` (entry in `~/.ssh/config`; BatchMode works) |
-| Container | `vllm_omni_yenuo26` — must be `Up`; if stopped, ask the user before starting it |
-| Repo | `/rebase/vllm-omni`, `origin = https://github.com/yenuo26/vllm-omni.git` (the fork) |
+| Container | **`vllm_omni`** — must be `Up`; if stopped, ask the user before starting it. (⚠️ NOT `vllm_omni_yenuo26`: that container's repo tracks the yenuo26 fork whose `main` is ~9 months stale (2026-01) and its venv has vllm 0.31.0 — tests fail collection with `ImportError` there.) |
+| Repo | `/rebase/vllm-omni` inside `vllm_omni`; `origin = https://github.com/vllm-project/vllm-omni.git` — **the upstream repo, read-only for us; never push to it** |
 | venv | `/rebase/.venv` → `source /rebase/.venv/bin/activate` (there is NO repo-local `.venv`) |
+| vllm version | Must match main's alignment — **0.32.0** as of commit f7f40063d "[Core] Align vLLM-Omni with vLLM v0.32.0". Before running, `pip show vllm`; a mismatch (e.g. 0.31.0) fails at collection with `ImportError: cannot import name 'RequestError' from 'vllm.outputs'`. If stale, tell the user (they maintain this venv) — direct PyPI from the box can be very slow; tsinghua mirror `-i https://pypi.tuna.tsinghua.edu.cn/simple` completes in <1 min. |
 | `gh` CLI | **not installed in the container** — PR creation happens from the bridge box |
-| Note | The container may sit on any working branch; this workflow always creates a fresh branch from `origin/main` |
+| Note | The container may sit on any working branch; this workflow always creates a fresh branch from `origin/main` (genuine upstream main in this container). Verify the base is fresh: `git fetch origin main && git log -1 --format=%ci origin/main` should be ≤ a few days old. |
 
 ## Phase 0 — Rebuild context (bridge box, read-only)
 
@@ -59,11 +60,13 @@ box), AFD / ROUTER (different repos).
 
 ```bash
 ssh -o BatchMode=yes my_l20
-docker exec vllm_omni_yenuo26 bash -lc '
+docker exec vllm_omni bash -lc '
   source /rebase/.venv/bin/activate
   cd /rebase/vllm-omni
   git fetch origin main
+  git log -1 --format="%h %ci" origin/main   # sanity: must be recent, not months old
   git checkout -B fix/simple-b<n>-<yyyymmdd> origin/main
+  pip show vllm | head -2                     # sanity: must match main's vllm alignment
 '
 ```
 
@@ -92,7 +95,7 @@ Branch naming: `fix/simple-b<build#>-<yyyymmdd>` (UTC date).
 ## Phase 3 — Verify (container)
 
 ```bash
-docker exec vllm_omni_yenuo26 bash -lc '
+docker exec vllm_omni bash -lc '
   source /rebase/.venv/bin/activate
   cd /rebase/vllm-omni
   unset HF_HUB_CACHE TRANSFORMERS_CACHE
@@ -116,11 +119,14 @@ docker exec vllm_omni_yenuo26 bash -lc '
      -m "Co-Authored-By: Claude Code <noreply@anthropic.com>"
    ```
 
-2. Push to the fork: preferred `git push -u origin <branch>` in the container
-   (check `git config credential.helper` / `~/.git-credentials` exists first;
-   never print their contents). Fallback: `git format-patch origin/main -o
-   /tmp` → copy the patches to the bridge box → apply on a fresh branch in
-   `/home/wy/vllm-omni-yn` → push from there.
+2. Push to the fork. The fix container's `origin` is **upstream** (read-only —
+   never push there), so the patch travels via the bridge box:
+   `git format-patch origin/main -o /tmp` in the container → `scp`/`ssh cat`
+   the patches to the bridge box → apply on a fresh branch in
+   `/home/wy/vllm-omni-yn` → `git push origin <branch>` from there (that clone
+   pushes to the fork). If the container happens to have a writable fork
+   remote/credentials, `git push -u <fork-remote> <branch>` is fine too (never
+   print credential contents).
 3. Create the PR **from the bridge box** (the container has no `gh`): `gh pr
    create -R vllm-project/vllm-omni --head yenuo26:<branch> --base main` or
    `POST https://api.github.com/repos/vllm-project/vllm-omni/pulls` with
