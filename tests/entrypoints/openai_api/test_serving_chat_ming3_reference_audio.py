@@ -45,7 +45,9 @@ def test_chat_ip_name_passes_to_talker_without_reference():
 
 
 @pytest.mark.asyncio
-async def test_chat_base64_reference_passes_decoded_samples_to_talker(mocker: MockerFixture):
+async def test_chat_base64_reference_passes_decoded_samples_to_talker(mocker: MockerFixture, monkeypatch):
+    monkeypatch.setenv("MING_TTS_REFERENCE_WAV", "/missing/server-reference.wav")
+    monkeypatch.setenv("MING_TTS_REFERENCE_TEXT", "server transcript")
     chat = _serving_chat()
     encoded = base64.b64encode(b"RIFFfakeWAVE").decode()
     prompt = {"additional_information": {"ref_audio": encoded}}
@@ -174,17 +176,11 @@ def test_default_voice_is_ip_without_reference_files(text, controls, monkeypatch
     assert all(info[key] is None for key in ("prompt_wav", "reference_audio", "prompt_text", "spk_emb"))
 
 
-def test_explicit_reference_without_source_is_rejected(monkeypatch):
+@pytest.mark.parametrize("server_reference", [None, "/custom/reference.wav"], ids=["unset", "set"])
+def test_explicit_reference_without_source_is_rejected(monkeypatch, server_reference):
     monkeypatch.delenv("MING_TTS_REFERENCE_WAV", raising=False)
+    monkeypatch.setenv("MING_TTS_REFERENCE_TEXT", "server transcript")
+    if server_reference is not None:
+        monkeypatch.setenv("MING_TTS_REFERENCE_WAV", server_reference)
     with pytest.raises(ValueError, match="requires reference audio"):
         build_ming_talker_additional_info("你好", {"additional_information": {"voice_mode": "reference"}})
-
-
-def test_explicit_reference_keeps_legacy_environment_override(monkeypatch):
-    monkeypatch.setenv("MING_TTS_REFERENCE_WAV", "/custom/reference.wav")
-    monkeypatch.setenv("MING_TTS_REFERENCE_TEXT", "参考文本")
-    info = build_ming_talker_additional_info("你好", {"additional_information": {"voice_mode": "reference"}})
-    assert info["voice_mode"] == "reference"
-    assert info["prompt_wav"] == "/custom/reference.wav"
-    assert info["prompt_text"] == "参考文本"
-    assert info["prompt_audio_mode"] == "continuation"

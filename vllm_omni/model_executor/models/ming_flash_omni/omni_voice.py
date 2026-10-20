@@ -3,7 +3,6 @@
 """Reference and IP voice selection shared by completed and chunked speech."""
 
 import json
-import os
 from pathlib import Path
 from typing import Any
 
@@ -72,11 +71,7 @@ def resolve_omni_voice(text: str, controls: dict[str, Any]) -> dict[str, Any]:
         }
 
     if not has_reference:
-        override = os.getenv("MING_TTS_REFERENCE_WAV")
-        if override:
-            reference.update(prompt_wav=override, prompt_text=os.getenv("MING_TTS_REFERENCE_TEXT") or None)
-        else:
-            raise ValueError("reference voice_mode requires reference audio, a stored voice, or a speaker embedding")
+        raise ValueError("reference voice_mode requires reference audio, a stored voice, or a speaker embedding")
     audio_mode = controls.get("prompt_audio_mode") or (
         "continuation" if reference["prompt_text"] or reference["voice_name"] else "speaker_only"
     )

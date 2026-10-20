@@ -215,7 +215,7 @@ collection, examples, bug reports, or logs.
 
 ## Model-specific variables
 
-The inventory includes 98 variables read by a single model or pipeline family. They are
+The inventory includes 96 variables read by a single model or pipeline family. They are
 not listed as public usage options here because doing so would turn implementation
 escape hatches into an accidental compatibility contract.
 
@@ -225,17 +225,15 @@ Every audited model-specific name has a migration disposition in the
 | Disposition | Count | Required outcome |
 | --- | ---: | --- |
 | Promote | 68 | Move a stable setting into typed stage or model configuration. |
-| Request scope | 7 | Move request-varying behavior into a declared request-option schema. |
+| Request scope | 5 | Move request-varying behavior into a declared request-option schema. |
 | External | 0 | Retain only when a supported third-party library owns the contract. |
 | Internalize | 16 | Keep a debug or diagnostic switch out of public documentation and configuration. |
 | Deprecate/remove | 7 | Remove a compatibility escape hatch that has no continuing contract. |
 
 Ming's existing `MING_TTS_CONFIG_CACHE` belongs to the typed-configuration
-migration, while `MING_TTS_REFERENCE_WAV` and `MING_TTS_REFERENCE_TEXT` belong
-to request-scoped voice controls. Their classification preserves current
-compatibility behavior without promoting them to public process-wide options.
-The reference overrides apply only to explicitly requested reference mode;
-omitting Ming3 voice selection and reference inputs defaults to the IP voice `灵小柔`.
+migration. Explicit reference mode requires reference audio, a registered voice, or a speaker
+embedding. Omitting Ming3 voice selection and reference inputs defaults to the
+IP voice `灵小柔`.
 
 The disposition is a migration target, not a statement that the existing
 environment switch is stable. Promote or request-scope work should land in
