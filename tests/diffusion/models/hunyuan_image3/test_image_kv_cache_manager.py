@@ -327,6 +327,49 @@ def test_scheduler_paged_kv_runs_piecewise_for_first_and_later_steps() -> None:
     assert mgr.attn.paged_metadata[1].full_attn_spans == full_attn_spans
 
 
+def test_memory_profile_runs_first_and_later_steps_without_dense_kv(mocker) -> None:
+    from vllm_omni.diffusion.attention.backends.flash_attn import FlashAttentionBackend
+    from vllm_omni.diffusion.attention.layer import Attention
+    from vllm_omni.diffusion.attention.parallel.base import NoParallelAttention
+    from vllm_omni.diffusion.forward_context import set_forward_context
+
+    mgr = _make_cache_mgr()
+    attention = Attention.__new__(Attention)
+    nn.Module.__init__(attention)
+    attention._explicit_cross_contract = False
+    attention._scheduler_paged_kv = True
+    attention.paged_kv_cache_role = "primary"
+    attention.attn_backend = FlashAttentionBackend
+    attention.use_ring = False
+    attention._no_parallel_strategy = NoParallelAttention()
+    attention._get_active_parallel_strategy = lambda: attention._no_parallel_strategy
+    attention.attention = mocker.Mock()
+    mgr.attn = attention
+    dense_forward = mocker.patch.object(mgr, "_forward_dense_legacy", side_effect=AssertionError("dense KV"))
+    expand_kv = mocker.patch(f"{_TRANSFORMER_MODULE}.repeat_kv", side_effect=AssertionError("KV head expansion"))
+    with set_forward_context(in_diffusion_kv_memory_profile=True):
+        for first_step, query_len in [(True, 12), (False, IMAGE_TOKEN_LEN)]:
+            query = torch.ones(2 * query_len, NUM_HEADS, HEAD_DIM)
+            key, value = _make_known_kv(2 * query_len)
+            output = mgr(
+                query,
+                key,
+                value,
+                first_step=first_step,
+                query_lens=[query_len] * 2,
+                seq_lens=[12] * 2,
+                full_attn_spans=[[(4, 12)]] * 2,
+            )
+            assert output.shape == query.shape
+            assert torch.count_nonzero(output) == 0
+            assert mgr.image_kv_cache_map is None
+            assert mgr.image_kv_cache_lens is None
+    dense_forward.assert_not_called()
+    expand_kv.assert_not_called()
+    attention.attention.forward.assert_not_called()
+    attention.attention.forward_paged.assert_not_called()
+
+
 def test_cache_manager_rejects_dense_imported_prefix_for_paged_attention() -> None:
     from vllm_omni.diffusion.forward_context import override_paged_kv_adapter, set_forward_context
 
