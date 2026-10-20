@@ -1126,7 +1126,7 @@ class SharedPromptAttCache:
 
     def data_ptr(self) -> int:
         """Expose a stable pointer for cache-owner accounting without a full materialization."""
-        return self.prefix.data_ptr()
+        return self.prefix.data_ptr() if self.prefix.numel() > 0 else id(self)
 
     def copy_range_to(self, dst: torch.Tensor, start: int, length: int) -> None:
         """Copy a logical frame range into ``dst`` without joining prompt and tail."""

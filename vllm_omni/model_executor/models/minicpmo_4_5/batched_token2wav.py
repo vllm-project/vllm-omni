@@ -1377,6 +1377,7 @@ class BatchedToken2Wav(nn.Module):
         cnn_cache: torch.Tensor | None,
         att_cache: torch.Tensor | list[torch.Tensor] | None,
         valid_lengths: list[int] | None = None,
+        att_keep: tuple[int, int] | None = None,
         prompt_lengths: list[int] | None = None,
         prompt_att_cache: torch.Tensor | None = None,
         prompt_cache_key: tuple[str, str] | None = None,
@@ -2085,6 +2086,7 @@ class BatchedToken2Wav(nn.Module):
         per_request_att = self._whole_euler_active()
         prompt_lengths, projected_speakers = self._batch_conditioning(features, batch_size)
         prompt_len = max(prompt_lengths)
+        att_keep = (prompt_len, _CACHE_TRIM_SUFFIX)
         prompt_att_cache = self._prompt_att_caches.get(features.cache_key)
         with self._autocast(tokens.device):
             self._watchdog.phase(

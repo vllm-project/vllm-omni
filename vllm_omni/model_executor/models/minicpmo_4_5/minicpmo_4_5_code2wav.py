@@ -501,6 +501,7 @@ class MiniCPMO45Code2Wav(nn.Module):
                 extra,
                 "cfm_fused_body",
                 (current_omni_platform.is_cuda() and self._tf32_mode != "off") or current_omni_platform.is_npu(),
+            ),
             "slot_pool": read_bool_flag(extra, "cfm_slot_pool", False),
             "row_offset_merge": read_bool_flag(extra, "cfm_row_offset_merge", False),
             # Keep one immutable prompt estimator-cache suffix per voice and
