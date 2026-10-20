@@ -7,6 +7,7 @@ handles each); they are registered under distinct model-type names.
 """
 
 import asyncio
+import copy
 import threading
 from typing import TYPE_CHECKING, Any, cast
 
@@ -648,7 +649,22 @@ class _MossTTSAdapterBase(ARTTSAdapter):
         prompt: dict | None = None,
         request_id: str | None = None,
     ) -> list:
-        return apply_max_new_tokens(sampling_params_list, request)
+        sampling_params_list = apply_max_new_tokens(sampling_params_list, request)
+        # Seed the talker_mtp/residual sampling per request. MOSS-TTS reads
+        # ``tts_local_seed`` and otherwise falls back to global RNG, so an
+        # unseeded request's audio would depend on batch composition. Default it
+        # from the deploy stage seed; an explicit request.seed still overrides it,
+        # because the generic serving layer writes ``tts_local_seed`` after this
+        # hook. Mirrors the qwen3_tts and audio8_tts adapters.
+        if sampling_params_list:
+            default_seed = getattr(sampling_params_list[0], "seed", None)
+            if default_seed is not None:
+                sampling_params_list = copy.deepcopy(sampling_params_list)
+                stage0_params = sampling_params_list[0]
+                if stage0_params.extra_args is None:
+                    stage0_params.extra_args = {}
+                stage0_params.extra_args.setdefault("tts_local_seed", int(default_seed))
+        return sampling_params_list
 
 
 @register_tts_adapter
