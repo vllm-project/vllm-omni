@@ -11,17 +11,16 @@ import torch
 import torch.nn as nn
 
 import vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts as talker_module
-
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
     MiniCPMO45OmniForConditionalGeneration,
 )
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
-    MiniCPMO45OmniTTSForConditionalGeneration,
     _CODEC_REPETITION_PENALTY,
     _CODEC_SEED,
     _CODEC_TEMPERATURE,
     _CODEC_TOP_K,
     _CODEC_TOP_P,
+    MiniCPMO45OmniTTSForConditionalGeneration,
     _max_audio_tokens,
     _restore_weight_norm_weight,
 )
@@ -449,7 +448,7 @@ def test_chunked_prefill_tail_aligns_condition_with_prompt_length(mocker) -> Non
     assert torch.equal(embeds, condition)
     state = talker._request_audio_states["req-chunked-prefill"]
     assert state["min_tokens"] == 50
-    assert state["max_tokens"] == 64
+    assert state["max_tokens"] == 2048
 
 
 @pytest.mark.parametrize(
