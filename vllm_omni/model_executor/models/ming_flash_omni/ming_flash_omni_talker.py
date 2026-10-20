@@ -36,6 +36,7 @@ from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.transformers_utils.configs.ming_talker import MingFlashOmniTalkerConfig
 
 from .native_text_frontend import normalize_native_fragment
+from .reference_audio import has_reference_audio, unpack_reference_audio
 from .streaming import MingBatchedStreamJob, MingStreamingJob
 from .talker_batch import BatchedTalkerRequest, MingTalkerBatchEngine, TalkerSegment
 from .talker_module import CFM, DiT, MingAudioGenerator, build_tts_input
@@ -605,6 +606,7 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
             or "prompt_audio_mode" in additional_info
             or "prompt_wav" in additional_info
             or "reference_audio" in additional_info
+            or has_reference_audio(additional_info)
         ):
             return self._resolve_formal_voice(additional_info)
 
@@ -629,7 +631,7 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
     def _resolve_formal_voice(self, info: dict[str, Any]) -> _VoiceContext:
         spk_emb = info.get("spk_emb")
         reference = info.get("prompt_wav")
-        reference_audio = info.get("reference_audio")
+        reference_audio = unpack_reference_audio(info)
         preset = self.voice_presets.get(info.get("voice_name")) or {}
         has_reference = spk_emb is not None or bool(reference) or bool(reference_audio) or bool(preset)
         mode, audio_mode = resolve_conditioning_modes(info, has_reference=has_reference)

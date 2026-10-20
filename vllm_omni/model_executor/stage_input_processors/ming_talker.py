@@ -13,6 +13,7 @@ from vllm.inputs import TextPrompt
 from vllm_omni.inputs.data import OmniTokensPrompt
 from vllm_omni.model_executor.models.ming_flash_omni.omni_voice import resolve_omni_voice
 from vllm_omni.model_executor.models.ming_flash_omni.prompt_utils import create_omni_prompt
+from vllm_omni.model_executor.models.ming_flash_omni.reference_audio import REFERENCE_AUDIO_FIELDS
 
 # ASR/QA thinkers in transcribe mode prefix their output with the detected
 # language tag ("Chinese\t<transcript>"). The tag is API metadata for
@@ -64,6 +65,7 @@ def build_ming_talker_additional_info(
         "instruction",
         "prompt_wav",
         "reference_audio",
+        *REFERENCE_AUDIO_FIELDS,
         "prompt_audio_mode",
         "speaker_conditioning",
         "cfg",

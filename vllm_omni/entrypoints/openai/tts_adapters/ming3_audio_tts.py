@@ -11,6 +11,7 @@ from vllm_omni.entrypoints.openai.reference_audio import reference_audio_uri
 from vllm_omni.entrypoints.openai.tts_adapters import register_tts_adapter
 from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, PreparedRequest
 from vllm_omni.entrypoints.openai.tts_adapters.ming_tts import parse_ming_instruction_fields
+from vllm_omni.model_executor.models.ming_flash_omni.reference_audio import pack_reference_audio
 
 if TYPE_CHECKING:
     from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
@@ -97,11 +98,13 @@ class Ming3AudioTTSAdapter(ARTTSAdapter):
         has_spk_emb = request.speaker_embedding is not None
         reference_audio = None
         if isinstance(request.ref_audio, list):
-            references = await server._resolve_ref_audio_many([reference_audio_uri(uri) for uri in request.ref_audio])
-            reference_audio = [{"samples": samples, "sample_rate": sr} for samples, sr in references]
+            reference_audio = []
+            for uri in request.ref_audio:
+                samples, sr, _ = await server._resolve_ref_audio_array(reference_audio_uri(uri))
+                reference_audio.append((samples, sr))
         elif request.ref_audio is not None:
-            samples, sr, _ = await server._resolve_ref_audio(reference_audio_uri(request.ref_audio))
-            reference_audio = [{"samples": samples, "sample_rate": sr}]
+            samples, sr, _ = await server._resolve_ref_audio_array(reference_audio_uri(request.ref_audio))
+            reference_audio = [(samples, sr)]
         has_reference = has_spk_emb or bool(reference_audio)
         audio_mode = (
             ("speaker_only" if request.x_vector_only_mode or request.ref_text is None else "continuation")
@@ -129,7 +132,7 @@ class Ming3AudioTTSAdapter(ARTTSAdapter):
             "temperature": 0.0,
         }
         if reference_audio:
-            info["reference_audio"] = reference_audio
+            info.update(pack_reference_audio(reference_audio))
         if request.max_new_tokens is not None:
             info["max_decode_steps"] = request.max_new_tokens
         if request.seed is not None:

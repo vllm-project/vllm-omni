@@ -12,6 +12,8 @@ from typing import TYPE_CHECKING, Any
 from starlette.datastructures import Headers, UploadFile
 from vllm.logger import init_logger
 
+from vllm_omni.model_executor.models.ming_flash_omni.reference_audio import pack_reference_audio
+
 if TYPE_CHECKING:
     from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
 
@@ -122,7 +124,7 @@ async def resolve_stored_voice(server: "OmniOpenAIServingSpeech", value: Any) ->
     text = entry.get("ref_text") or None
     return {
         "voice_name": name,
-        "reference_audio": [{"samples": samples.tolist(), "sample_rate": sr}],
+        **pack_reference_audio([(samples, sr)]),
         "prompt_text": text,
         "prompt_audio_mode": "continuation" if text else "speaker_only",
     }

@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from .prompt_utils import create_instruction
+from .reference_audio import REFERENCE_AUDIO_FIELDS, has_reference_audio
 
 DEFAULT_IP_VOICE = "灵小柔"
 _DATA_DIR = Path(__file__).parent / "data"
@@ -34,10 +35,13 @@ def resolve_omni_voice(text: str, controls: dict[str, Any]) -> dict[str, Any]:
     validate_voice_controls(controls)
     selected = controls.get("voice_name")
     name = ip_voice_name(selected) if isinstance(selected, str) else None
-    reference = {key: controls.get(key) for key in ("prompt_wav", "reference_audio", "prompt_text", "voice_name")}
+    reference = {
+        key: controls.get(key)
+        for key in ("prompt_wav", "reference_audio", "prompt_text", "voice_name", *REFERENCE_AUDIO_FIELDS)
+    }
     has_reference = (
         bool(reference["prompt_wav"])
-        or bool(reference["reference_audio"])
+        or has_reference_audio(reference)
         or bool(reference["voice_name"])
         or controls.get("spk_emb") is not None
     )
@@ -62,6 +66,7 @@ def resolve_omni_voice(text: str, controls: dict[str, Any]) -> dict[str, Any]:
                     "prompt_wav_lat",
                     "prompt_wav_emb",
                     "voice_name",
+                    *REFERENCE_AUDIO_FIELDS,
                 )
             ),
         }

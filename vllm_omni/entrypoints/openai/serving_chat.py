@@ -298,6 +298,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             ip_voice_name,
             validate_voice_controls,
         )
+        from vllm_omni.model_executor.models.ming_flash_omni.reference_audio import pack_reference_audio
 
         validate_voice_controls(info)
         audio = getattr(request, "audio", None)
@@ -332,9 +333,9 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         references = []
         for source in sources:
             waveform, sample_rate = await connector.fetch_audio_async(reference_audio_uri(source))
-            references.append({"samples": waveform.tolist(), "sample_rate": sample_rate})
+            references.append((waveform, sample_rate))
         info.pop("ref_audio")
-        info["reference_audio"] = references
+        info.update(pack_reference_audio(references))
         info["voice_mode"] = "reference"
 
     async def _attach_minicpmo45_reference_audio(

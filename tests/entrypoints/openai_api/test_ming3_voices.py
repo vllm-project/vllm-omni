@@ -151,8 +151,11 @@ async def test_named_chat_voice_reaches_talker_with_audio_and_text(store, model)
     assert info["prompt_text"] == "感谢你的认可。"
     assert info["prompt_audio_mode"] == "continuation"
     assert info["speaker_conditioning"] == "prompt"
-    assert info["reference_audio"][0]["sample_rate"] == 16000
-    assert info["reference_audio"][0]["samples"][0] == pytest.approx(0.125)
+    from vllm_omni.model_executor.models.ming_flash_omni.reference_audio import unpack_reference_audio
+
+    reference = unpack_reference_audio(info)[0]
+    assert reference["sample_rate"] == 16000
+    assert reference["samples"][0] == pytest.approx(0.125)
     assert info["instruction"] is None
 
 

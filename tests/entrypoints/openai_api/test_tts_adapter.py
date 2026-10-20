@@ -63,6 +63,7 @@ from vllm_omni.model_executor.models.indextts2 import prompt_utils
 from vllm_omni.model_executor.models.indextts2.tokenizer_v2_5 import (
     INDEXTTS25_TOKENIZER_FILE,
 )
+from vllm_omni.model_executor.models.ming_flash_omni.reference_audio import unpack_reference_audio
 from vllm_omni.model_executor.stage_input_processors.auk import encoder2dit
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -806,7 +807,7 @@ def test_ming3_build_passes_base64_reference_audio():
     class FakeServer:
         uploaded_speakers = {}
 
-        async def _resolve_ref_audio(self, uri):
+        async def _resolve_ref_audio_array(self, uri):
             self.uri = uri
             return [0.1, -0.1], 16000, "cache-key"
 
@@ -820,7 +821,9 @@ def test_ming3_build_passes_base64_reference_audio():
 
     assert server.uri == f"data:audio/wav;base64,{encoded}"
     info = prepared.prompt["additional_information"]
-    assert info["reference_audio"] == [{"samples": [0.1, -0.1], "sample_rate": 16000}]
+    reference = unpack_reference_audio(info)[0]
+    assert reference["sample_rate"] == 16000
+    assert reference["samples"].tolist() == pytest.approx([0.1, -0.1])
     assert info["speaker_conditioning"] == "prompt"
     assert info["prompt_audio_mode"] == "speaker_only"
     assert info["instruction"] is None
