@@ -1,0 +1,68 @@
+[
+  {
+    "file": "short_pause.wav",
+    "text": "[帮我点一杯, 停顿 0.8 s, 少冰不加糖的拿铁。]",
+    "voice": "zh-CN-XiaoxiaoNeural",
+    "rate": "-5%",
+    "annotations": [
+      {
+        "text": "帮我点一杯",
+        "start_ms": 300.0,
+        "end_ms": 1086.0625
+      },
+      {
+        "text": "少冰不加糖的拿铁。",
+        "start_ms": 1886.0625,
+        "end_ms": 3591.0625
+      }
+    ],
+    "sha256": "bfb09b90c7c98d370cb6bdbff63d3fa63fc6df3e15fab732ae636c56633baa4f"
+  },
+  {
+    "file": "complete.wav",
+    "text": "[不用帮我叫车了，我自己坐地铁回去。]",
+    "voice": "zh-CN-XiaoxiaoNeural",
+    "rate": "-5%",
+    "annotations": [
+      {
+        "text": "不用帮我叫车了，我自己坐地铁回去。",
+        "start_ms": 300.0,
+        "end_ms": 3400.0
+      }
+    ],
+    "sha256": "620e437debc9d93b9467fcd0fa830b25fc86e3d9bc5785a5d6e58df5aed032c3"
+  },
+  {
+    "file": "thinking_pause.wav",
+    "text": "[我今天不能去开会，因为, 停顿 3.8 s, 家里临时有点事情。]",
+    "voice": "zh-CN-XiaoxiaoNeural",
+    "rate": "-5%",
+    "annotations": [
+      {
+        "text": "我今天不能去开会，因为",
+        "start_ms": 300.0,
+        "end_ms": 2337.625
+      },
+      {
+        "text": "家里临时有点事情。",
+        "start_ms": 6137.625,
+        "end_ms": 7842.625
+      }
+    ],
+    "sha256": "de8b09cb7b8bc284b889591f1cf495219b14e0f31f6ef8c6ba8e75604d275a54"
+  },
+  {
+    "file": "abandoned.wav",
+    "text": "[我今天不能去开会，因为, 不再续说，持续静音]",
+    "voice": "zh-CN-XiaoxiaoNeural",
+    "rate": "-5%",
+    "annotations": [
+      {
+        "text": "我今天不能去开会，因为",
+        "start_ms": 300.0,
+        "end_ms": 2337.625
+      }
+    ],
+    "sha256": "8c36ada4995f9f1510032d856d3ada7fcbc480c7c1a06b859bd92060509382ac"
+  }
+]

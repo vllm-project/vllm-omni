@@ -227,6 +227,21 @@ def test_hub_component_keys_map_onto_pipeline_modules():
     assert _adapt_k6_weight_name("transformer.visual_transformer_blocks.0.audioT.feed_forward.in_layer.weight") == (
         "transformer.visual_transformer_blocks.0.audio_dec_block.feed_forward.in_layer.weight"
     )
+    assert _adapt_k6_weight_name("transformer.audio_text_transformer_blocks.0.attn.to_query.weight") == (
+        "transformer.audio_text_transformer_blocks.0.self_attention.to_query.weight"
+    )
+    assert _adapt_k6_weight_name(
+        "transformer.visual_transformer_blocks.0.video_dec_block.feed_forward.net.0.proj.weight"
+    ) == ("transformer.visual_transformer_blocks.0.video_dec_block.feed_forward.in_layer.weight")
+    assert _adapt_k6_weight_name(
+        "transformer.visual_transformer_blocks.0.video_dec_block.feed_forward.net.2.weight"
+    ) == ("transformer.visual_transformer_blocks.0.video_dec_block.feed_forward.out_layer.weight")
+    assert _adapt_k6_weight_name("transformer.video_time_embeddings.timestep_embedder.linear_1.weight") == (
+        "transformer.video_time_embeddings.in_layer.weight"
+    )
+    assert _adapt_k6_weight_name("transformer.audio_time_embeddings.timestep_embedder.linear_2.bias") == (
+        "transformer.audio_time_embeddings.out_layer.bias"
+    )
     assert _adapt_k6_weight_name("vae.decoder.conv_in.conv.weight") == "vae.decoder.conv_in.conv.weight"
     assert _adapt_k6_weight_name("text_encoder_2.encoder.layers.0.mlp.fc1.weight") == (
         "text_encoder_2.encoder.layers.0.mlp.fc1.weight"

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # ruff: noqa: N803
 """Single-pass channels-last RMSNorm(+SiLU) for the Wan VAE decoder (Tier 2, not bit-exact).
 
@@ -7,14 +7,19 @@ With channels-last activations every spatial position owns a contiguous vector
 of ``C`` channels, so one program can load a ``(BLOCK_P, C)`` tile, reduce over
 the channels in registers and write the normalized (and optionally SiLU'd)
 result: the activation is read once and written once instead of the two-pass
-scheme :mod:`.triton_rms_norm` needs for channels-first layouts.
+scheme :mod:`vllm_omni.diffusion.layers.vae_norm_epilogue` needs for channels-first layouts.
 
 This kernel is only dispatched at the tolerance-based ``channels_last`` level,
-so it uses fast math: one reciprocal per position, ``scale`` folded into
+so for FP16/FP32 it uses fast math: one reciprocal per position, ``scale`` folded into
 ``gamma``, the approximate ``exp`` and divide for SiLU, and a single rounding
 to the activation dtype at the end. The bit-exact epilogue sequence (IEEE
 ``div_rn`` twice, libdevice ``exp``, six intermediate roundings) measured
 ALU-bound at 1.6 TB/s on the 512-channel stage.
+
+The encoder opts into ``exact_bf16`` for BF16: it retains the reference
+epilogue's intermediate roundings, because removing them accumulates excessive
+posterior drift across the encoder's normalization layers. The decoder keeps
+the fast math above for every dtype.
 
 The kernel can also absorb the bias of the convolution that produced ``x``:
 ``WanResidualBlock.conv1`` feeds only ``norm2``, so at this level the
@@ -27,7 +32,7 @@ exactly as ATen's ``add_`` does, so folding the bias changes no numerics.
 from __future__ import annotations
 
 import torch
-from vllm.triton_utils import HAS_TRITON, tl, triton
+from vllm.triton_utils import HAS_TRITON, tl, tldevice, triton
 
 _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 _MAX_CHANNELS = 1024
@@ -39,6 +44,25 @@ _TILE_ELEMENTS = 4096
 _NUM_WARPS = 4
 
 if HAS_TRITON:
+
+    @triton.jit
+    def _normalize_channels_last(
+        x, gamma, scale, eps, DTYPE: tl.constexpr, SILU: tl.constexpr, EXACT_BF16: tl.constexpr
+    ):
+        denom = tl.maximum(tl.sqrt(tl.sum(x * x, axis=1)), eps)
+        if EXACT_BF16 and DTYPE == tl.bfloat16:
+            v = tl.math.div_rn(x, denom[:, None]).to(DTYPE).to(tl.float32)
+            v = (v * scale).to(DTYPE).to(tl.float32)
+            v = (v * gamma[None, :]).to(DTYPE).to(tl.float32)
+            v = (v + 0.0).to(DTYPE).to(tl.float32)
+            if SILU:
+                v = tl.math.div_rn(v, 1.0 + tldevice.exp(-v))
+        else:
+            inv_norm = 1.0 / denom
+            v = x * inv_norm[:, None] * (gamma * scale)[None, :]
+            if SILU:
+                v = v / (1.0 + tl.exp(-v))
+        return v.to(DTYPE)
 
     @triton.jit
     def _rms_norm_cl_kernel(
@@ -53,6 +77,7 @@ if HAS_TRITON:
         BLOCK_C: tl.constexpr,
         SILU: tl.constexpr,
         HAS_BIAS: tl.constexpr,
+        EXACT_BF16: tl.constexpr,
         BLOCK_P: tl.constexpr,
     ):
         row = tl.program_id(0).to(tl.int64) * BLOCK_P + tl.arange(0, BLOCK_P)
@@ -68,12 +93,9 @@ if HAS_TRITON:
             # ATen's in-place conv bias ``add_``: fp32 opmath, rounded once.
             bias = tl.load(BIAS + col, mask=col_mask, other=0.0).to(tl.float32)
             x = (x + bias[None, :]).to(dtype).to(tl.float32)
-        inv_norm = 1.0 / tl.maximum(tl.sqrt(tl.sum(x * x, axis=1)), eps)
-        gamma = tl.load(GAMMA + col, mask=col_mask, other=0.0).to(tl.float32) * scale
-        v = x * inv_norm[:, None] * gamma[None, :]
-        if SILU:
-            v = v / (1.0 + tl.exp(-v))
-        tl.store(OUT + offsets, v.to(dtype), mask=mask)
+        gamma = tl.load(GAMMA + col, mask=col_mask, other=0.0).to(tl.float32)
+        v = _normalize_channels_last(x, gamma, scale, eps, dtype, SILU, EXACT_BF16)
+        tl.store(OUT + offsets, v, mask=mask)
 
 
 def _rows_view(x: torch.Tensor) -> torch.Tensor | None:
@@ -102,11 +124,13 @@ def rms_norm_channels_last(
     silu: bool = False,
     bias: torch.Tensor | None = None,
     eps: float = 1e-12,
+    exact_bf16: bool = False,
 ) -> torch.Tensor | None:
     """``F.normalize(x + bias, dim=1) * scale * gamma`` [then SiLU] for channels-last ``x`` (fast math), or ``None``.
 
     ``bias`` is an optional per-channel vector (the un-added bias of the
-    convolution that produced ``x``); ``None`` skips the add.
+    convolution that produced ``x``); ``None`` skips the add. ``exact_bf16``
+    keeps the reference epilogue's roundings for BF16 (encoder only).
     """
     if not HAS_TRITON or not x.is_cuda or x.dtype not in _SUPPORTED_DTYPES:
         return None
@@ -144,6 +168,7 @@ def rms_norm_channels_last(
             BLOCK_C=block_c,
             SILU=silu,
             HAS_BIAS=bias is not None,
+            EXACT_BF16=exact_bf16,
             BLOCK_P=block_p,
             num_warps=_NUM_WARPS,
             enable_fp_fusion=False,
