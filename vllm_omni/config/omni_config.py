@@ -493,6 +493,7 @@ class OmniStageModelConfig(_TrackExplicitConfigFields):
     media_io_kwargs: dict[str, Any] | None = None
     final_output: bool = False
     supports_running_prefix_cache_reset: bool = True
+    supports_pending_generation: bool = False
     active_stream_window: int = Field(default=0, ge=0)
     session_mode: str = "turn"
     duplex_max_sessions: int = Field(default=1, ge=1)
@@ -1393,6 +1394,7 @@ _DIFFUSION_STAGE_METADATA_FIELDS = frozenset(
         "model_arch",
         "model_stage",
         "retains_state_across_chunks",
+        "supports_pending_generation",
         "supports_running_prefix_cache_reset",
         "scheduler_cls",
         "stage_connector_spec",
@@ -2061,6 +2063,7 @@ def _build_model_config(
     if "active_stream_window" not in kwargs:
         kwargs["active_stream_window"] = _copy_value(deploy.active_stream_window)
     kwargs["final_output"] = topology.final_output
+    kwargs["supports_pending_generation"] = topology.supports_pending_generation
     if not topology.supports_running_prefix_cache_reset:
         kwargs["supports_running_prefix_cache_reset"] = False
     if "custom_voice_dir" not in kwargs and deploy.custom_voice_dir is not None:

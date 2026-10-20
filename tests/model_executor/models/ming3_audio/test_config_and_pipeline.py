@@ -443,6 +443,7 @@ def test_ming3_pipeline_supports_text_and_audio_outputs():
     assert talker.model_stage == "ming3_tts"
     assert talker.model_arch == "BailingTalker2"
     assert talker.execution_type is StageExecutionType.LLM_GENERATION
+    assert talker.supports_pending_generation is True
     assert talker.input_sources == (0,)
     assert talker.final_output is True
     assert talker.final_output_type == "audio"

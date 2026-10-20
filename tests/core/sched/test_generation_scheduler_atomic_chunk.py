@@ -243,6 +243,36 @@ def _stage_running_chunk(sched, request: Request) -> None:
     sched.chunk_transfer_adapter.requests_with_ready_chunks.add(request.request_id)
 
 
+@pytest.mark.parametrize("queue_name", ["running", "waiting"])
+@pytest.mark.parametrize("native,pending", [(False, False), (False, True), (True, False)])
+def test_in_flight_guard_preserves_stateless_legacy_overlap(queue_name, native, pending):
+    sched = _make_scheduler(budget=32)
+    sched._native_data_plane = native
+    sched._supports_pending_generation = pending
+    sched.async_scheduling = True
+    sched.scheduler_config.async_scheduling = True
+    request = _make_request("overlap", 8)
+    request.num_computed_tokens = 4
+    request.num_in_flight_tokens = 1
+    if queue_name == "running":
+        _stage_running_chunk(sched, request)
+    else:
+        _stage_waiting_chunk(sched, request)
+    output = sched.schedule()
+    assert (request.request_id in output.num_scheduled_tokens) == (not native and not pending)
+
+
+@pytest.mark.parametrize("pending", [False, True])
+def test_only_pending_generation_retains_ready_input_after_schedule(pending):
+    sched = _make_scheduler(budget=32)
+    sched._supports_pending_generation = pending
+    request = _make_request("ready", 8)
+    _stage_waiting_chunk(sched, request)
+    output = sched.schedule()
+    assert output.num_scheduled_tokens[request.request_id] == 8
+    assert (request.request_id in sched.chunk_transfer_adapter.requests_with_ready_chunks) == pending
+
+
 def _make_runner_output():
     return SimpleNamespace(
         sampled_token_ids=None,
@@ -283,8 +313,8 @@ class TestWaitingDefersWholeChunk:
         assert getattr(sched, queue_name).peek_request() is deferred
         assert deferred.request_id in sched.chunk_transfer_adapter.requests_with_ready_chunks
         assert len(sched.running) == 56
-        # An admitted input remains owned until its generation is complete.
-        assert sched.chunk_transfer_adapter.requests_with_ready_chunks == {request.request_id for request in requests}
+        # One-shot inputs release readiness on admission; deferred input stays ready.
+        assert sched.chunk_transfer_adapter.requests_with_ready_chunks == {deferred.request_id}
 
         # Complete the admitted chunks; the deferred chunk must remain usable
         # and be admitted whole on the next step from either waiting queue.
@@ -295,7 +325,7 @@ class TestWaitingDefersWholeChunk:
         next_output = sched.schedule()
         assert next_output.num_scheduled_tokens == {deferred.request_id: FIRST_CHUNK_TOKENS}
         assert not getattr(sched, queue_name)
-        assert sched.chunk_transfer_adapter.requests_with_ready_chunks == {deferred.request_id}
+        assert not sched.chunk_transfer_adapter.requests_with_ready_chunks
 
     def test_exact_fit_chunk_is_scheduled_whole(self):
         sched = _make_scheduler(budget=FIRST_CHUNK_TOKENS)
