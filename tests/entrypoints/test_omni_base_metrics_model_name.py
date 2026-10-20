@@ -10,11 +10,11 @@ whenever ``--served-model-name`` was set.
 
 from __future__ import annotations
 
-from types import SimpleNamespace
-
 import pytest
 from prometheus_client import REGISTRY
 from pytest_mock import MockerFixture
+
+from vllm_omni.engine.stage_runtime import StageRuntimeInfo
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -28,7 +28,9 @@ def _make_omni_base(mocker: MockerFixture, model: str = MODEL_PATH, **kwargs):
     engine.num_stages = 1
     engine.async_chunk = False
     engine.default_sampling_params_list = [mocker.MagicMock()]
-    engine.get_stage_metadata.side_effect = lambda i: SimpleNamespace(final_output_type="audio", final_output=True)
+    engine.get_stage_metadata.return_value = StageRuntimeInfo(
+        stage_type="llm", final_output=True, final_output_type="audio"
+    )
     create_engine = mocker.patch.object(OmniBase, "_create_engine", return_value=engine)
     mocker.patch("vllm_omni.entrypoints.omni_base.omni_snapshot_download", side_effect=lambda x: x)
     mocker.patch("vllm_omni.entrypoints.omni_base.weakref.finalize")
