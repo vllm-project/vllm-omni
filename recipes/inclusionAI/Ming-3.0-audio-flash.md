@@ -303,6 +303,9 @@ LLM tokenizer, AudioVAE and speaker extractor. The Ming3-specific profile loads
 only the Talker assets, without loading Thinker weights. The resolver also accepts
 a local export with the same layout; `--revision` selects the Hub snapshot.
 
+The resolver stores generated config views and asset symlinks under `VLLM_CACHE_ROOT/ming_talker`, using vLLM's standard cache root.
+Checkpoint files stay in the original local export or HF cache; they are not copied into the config view. The same checkpoint and config reuse the existing view.
+
 ```bash
 vllm serve inclusionAI/Ming-3.0-audio-flash --omni \
     --deploy-config vllm_omni/deploy/ming3_audio_tts.yaml \

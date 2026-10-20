@@ -6,13 +6,14 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import shutil
 import tempfile
 from pathlib import Path
 
+from vllm import envs
 
-def prepare_talker_checkpoint(source: str, cache_dir: str | None = None) -> str:
+
+def prepare_talker_checkpoint(source: str, cache_dir: str) -> str:
     """Link deployment assets into an engine config view; leave sources intact."""
     deployment = Path(source).resolve()
     # The engine may call the resolver again on our already normalized view.
@@ -50,7 +51,7 @@ def prepare_talker_checkpoint(source: str, cache_dir: str | None = None) -> str:
     config_json = json.dumps(config, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
     # Rebuild older views that did not link the checkpoint's TN resource directory.
     digest = hashlib.sha256(("model-tn-assets-v2\0" + str(deployment) + config_json).encode()).hexdigest()[:20]
-    cache = Path(cache_dir or os.environ.get("MING_TTS_CONFIG_CACHE", "~/.cache/vllm-omni/ming_talker")).expanduser()
+    cache = Path(cache_dir).expanduser()
     cache.mkdir(parents=True, exist_ok=True)
     target = cache / digest
     if target.is_dir():
@@ -92,4 +93,5 @@ def resolve_ming_talker_checkpoint(model: str, revision: str | None, task_type: 
             revision=revision,
             require_all=True,
         )
-    return prepare_talker_checkpoint(source)
+    # Generated config views use the runtime cache, not the HF weight cache.
+    return prepare_talker_checkpoint(source, cache_dir=str(Path(envs.VLLM_CACHE_ROOT) / "ming_talker"))
