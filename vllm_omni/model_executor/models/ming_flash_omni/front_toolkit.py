@@ -32,23 +32,6 @@ def tokenize_mixed_text_iterator(text_iterator: Iterable[str]):
             yield match.group(0)
 
 
-def split_uppercase_acronyms(text):
-    """
-    将连续大写字母（缩写词）逐字母用空格隔开。
-    单个大写字母或首字母大写的单词不受影响。
-    """
-    return re.sub(r"[A-Z]{2,}", lambda m: " ".join(m.group(0)), text)
-
-
-def replace_parens_with_sep(text, target_sep="，"):
-    """
-    将中英文括号替换为target_sep。
-    """
-    for ch in "()（）":
-        text = text.replace(ch, target_sep)
-    return text
-
-
 def clean_text_formatting(text):
     if not text:
         return text
@@ -213,17 +196,7 @@ def fallback_replace_non_alnum(text, replacement="，"):
 
 
 def normalize_text_kit(text):
-    """
-    完整文本规范化流水线：
-    连续大写字母拆开（NBA → N B A）
-    (已禁用) 中英括号替换为逗号
-    兜底：非汉字/英文/数字/基础标点 → 逗号 (已把 () （） " “ ” 加入白名单)
-    英文标点→中文标点 + 标点去重 + 空格清理
-    """
-    # ---- 已禁用: 连续大写字母拆分（NBA → N B A）----
-    # text = split_uppercase_acronyms(text)
-    # ---- 已禁用: 不再把括号替换成逗号 ----
-    # text = replace_parens_with_sep(text)
+    """Normalize unsupported characters, Chinese punctuation, and whitespace."""
     text = fallback_replace_non_alnum(text)
     text = chinese_punc_en2cn(text)
     text = re.sub(r"\s+", " ", text).strip()

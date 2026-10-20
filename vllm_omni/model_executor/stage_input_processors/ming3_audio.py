@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -114,8 +113,8 @@ def thinker2talker_async_chunk(
     delta = "".join(deltas)
     fragments = state.frontend.feed(delta, final=is_finished)
     # Optional sender-side diagnostics before Talker linguistic normalization.
-    if fragments and os.environ.get("MING_TEXT_FRAG_LOG") == "1":
-        logger.info("Ming text fragments req=%s fragments=%r", request_id, fragments)
+    if fragments:
+        logger.debug("Ming text fragments req=%s fragments=%r", request_id, fragments)
     if is_finished:
         states.pop(request_id, None)
     if not fragments and not is_finished:
