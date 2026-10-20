@@ -526,6 +526,39 @@ class NPUGenerationModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin
         else:
             raise RuntimeError("Unsupported diffusion output type")
 
+        # Attach the reference before partitioning so both nested and flattened
+        # payload representations retain it on the inter-stage branch.
+        req_ids_output_copy = self.input_batch.req_ids.copy()
+        for index, req_id in enumerate(req_ids_output_copy):
+            if index >= len(per_req_payloads):
+                break
+            info = self.model_intermediate_buffer.get(req_id, {})
+            info_codes = info.get("codes") if isinstance(info, dict) else None
+            ref_audio = info_codes.get("ref") if isinstance(info_codes, dict) else None
+            if ref_audio is None:
+                continue
+            payload = per_req_payloads[index]
+            if not isinstance(payload, dict):
+                continue
+            info_meta = info.get("meta") if isinstance(info, dict) else None
+            codes = payload.get("codes")
+            if isinstance(codes, dict):
+                codes = dict(codes)
+                codes.setdefault("ref", ref_audio)
+                payload["codes"] = codes
+            elif "codes.audio" in payload:
+                payload.setdefault("codes.ref", ref_audio)
+            else:
+                continue
+            if isinstance(info_meta, dict) and info_meta.get("ref_audio_sr") is not None:
+                meta = payload.get("meta")
+                if isinstance(meta, dict):
+                    meta = dict(meta)
+                    meta.setdefault("ref_audio_sr", info_meta["ref_audio_sr"])
+                    payload["meta"] = meta
+                else:
+                    payload.setdefault("meta.ref_audio_sr", info_meta["ref_audio_sr"])
+
         if self._async_chunk:
             inter_stage_outputs, multimodal_outputs = partition_payload_list(per_req_payloads)
         else:
@@ -533,7 +566,6 @@ class NPUGenerationModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin
             # stage; #4527's (None, per_req_payloads) starved the downstream stage. (PR #4792)
             inter_stage_outputs, multimodal_outputs = per_req_payloads, per_req_payloads
         # [Omni] Copy req_id mappings to avoid async scheduling mutation.
-        req_ids_output_copy = self.input_batch.req_ids.copy()
         req_id_to_index_output_copy = self.input_batch.req_id_to_index.copy()
         # [Omni] Full-payload send-side accumulation. Mirrors gpu_generation_model_runner.py.
         if inter_stage_outputs and self._should_accumulate_full_payload_output():

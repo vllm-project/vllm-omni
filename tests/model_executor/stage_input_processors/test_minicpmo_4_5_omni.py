@@ -93,6 +93,37 @@ def test_llm2tts_carries_request_ref_audio() -> None:
     assert info["ids"]["tts"] == [11, 12]
 
 
+def test_llm2tts_carries_deferred_multimodal_ref_audio() -> None:
+    latent = torch.arange(20, dtype=torch.float32).reshape(5, 4)
+    source = _output(
+        prompt_ids=[101, 9001],
+        output_ids=[11, 12, 9002],
+        latent=latent,
+        multimodal_output={
+            "meta": {
+                "tts_bos_token_id": 9001,
+                "tts_eos_token_id": 9002,
+            }
+        },
+    )
+    ref_waveform = torch.tensor([0.4, 0.5, 0.6])
+
+    converted = llm2tts(
+        [source],
+        prompt=[
+            {
+                "additional_information": {
+                    "deferred_multi_modal_data": {"audio": (ref_waveform, 16000)},
+                }
+            }
+        ],
+    )[0]
+
+    info = converted["model_intermediate_buffer"]
+    assert info["codes"]["ref"] == ref_waveform.tolist()
+    assert info["meta"]["ref_audio_sr"] == 16000
+
+
 def test_native_duplex_speak_segment_reaches_split_talker() -> None:
     prompt_ids = [101, 102]
     output_ids = [9304, 21, 22, 9308]
