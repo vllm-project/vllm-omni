@@ -202,6 +202,39 @@ def test_final_input_commit_checkpoints_playback_first():
     assert isinstance(commit_sent_at_s, float)
 
 
+def test_streaming_collector_acks_each_finished_reply_like_the_web_client():
+    demo = _load_demo_module()
+    audio = base64.b64encode(bytes(2 * 2400)).decode("ascii")
+    raw_events = [
+        {"type": "response.created", "response": {"id": "resp-audio"}},
+        {"type": "response.output_audio.delta", "response_id": "resp-audio", "delta": audio},
+        {"type": "response.done", "response": {"id": "resp-audio"}},
+        {"type": "response.created", "response": {"id": "resp-silent"}},
+        {"type": "response.done", "response": {"id": "resp-silent"}},
+    ]
+    acks: list[dict[str, object]] = []
+
+    class _Event:
+        def __init__(self, raw):
+            self.raw = raw
+
+    class _Client:
+        async def events(self):
+            for raw in raw_events:
+                yield _Event(raw)
+
+        async def ack_playback(self, played_ms, *, response_id=None, item_id=None, committed_ms=None):
+            acks.append({"response_id": response_id, "item_id": item_id, "played_ms": int(played_ms)})
+
+    class _Writer:
+        def handle(self, event):
+            pass
+
+    asyncio.run(demo._StreamingEventCollector(_Writer()).consume(_Client()))
+
+    assert acks == [{"response_id": "resp-audio", "item_id": "item_resp-audio", "played_ms": 100}]
+
+
 def _asymmetric_image():
     from PIL import Image
 
@@ -300,3 +333,46 @@ def test_streaming_output_writer_persists_audio_deltas_as_they_arrive(tmp_path, 
     stderr = capsys.readouterr().err
     assert "audio chunk 1" in stderr
     assert "你好" in stderr
+
+
+@pytest.mark.parametrize("audio_samples", [3 * 16000 + 512, 2 * 16000])
+def test_video_soundtrack_aligns_to_video_units(monkeypatch, tmp_path, audio_samples):
+    """AAC padding must not create an extra frame-less model unit at EOF."""
+    demo = _load_demo_module()
+    audio_path = tmp_path / "input.wav"
+    pcm = b"\x01\x00" * audio_samples
+    demo.write_pcm16_wav(audio_path, pcm, sample_rate_hz=16000)
+    monkeypatch.setattr(demo, "_probe_video_frames_and_fps", lambda path: (90, 30.0))
+    monkeypatch.setattr(demo, "_extract_video_soundtrack", lambda *args: audio_path)
+
+    def extract(path, work_dir, **kwargs):
+        assert kwargs["duration_s"] == 3.0
+        return ["f0", "f1", "f2"], [None] * 3
+
+    monkeypatch.setattr(demo, "_extract_video_frames", extract)
+    wav, frames, _ = demo._extract_video_input(tmp_path / "clip.mp4", tmp_path, fps=1.0, max_side=0, stack_frames=1)
+    aligned = demo.read_pcm16_wav(wav)
+    assert aligned == pcm[:96000].ljust(96000, b"\0")
+    assert len(frames) == 3
+    assert not demo._has_residual_model_unit(aligned, chunk_period_ms=1000)
+
+
+def test_video_without_soundtrack_uses_video_duration(monkeypatch, tmp_path):
+    demo = _load_demo_module()
+    monkeypatch.setattr(demo, "_video_has_audio", lambda path: False)
+    monkeypatch.setattr(demo, "_probe_video_frames_and_fps", lambda path: (90, 30.0))
+
+    def extract(path, work_dir, **kwargs):
+        assert kwargs["duration_s"] == 3.0
+        return ["f0", "f1", "f2"], [None] * 3
+
+    monkeypatch.setattr(demo, "_extract_video_frames", extract)
+    wav, frames, _ = demo._resolve_duplex_av_inputs(
+        input_wav=None,
+        input_video="silent.mp4",
+        work_dir=tmp_path,
+        fps=1.0,
+        max_side=0,
+    )
+    assert wav is None
+    assert len(frames) == 3

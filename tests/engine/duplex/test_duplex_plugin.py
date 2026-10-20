@@ -486,3 +486,63 @@ def test_default_session_state_implements_the_shared_transitions() -> None:
     assert state.continuation_owner_id is None
     assert state.continuation_units == 0
     assert state.pending_silence_task is None and state.pending_silence_owner_id is None
+
+
+def test_mergeable_committed_audio_stops_after_consume_starts() -> None:
+    """Once an append starts consuming retained PCM, the next commit must not merge it."""
+
+    class Buffer(PcmAppendBuffer):
+        pending_byte_count = 0
+
+        def clear(self) -> None: ...
+
+        def clear_force_listen(self) -> None: ...
+
+        def has_pending(self) -> bool:
+            return False
+
+        def has_reserved(self) -> bool:
+            return False
+
+        def prepare_append(self, payload, *, operation_id, chunk_period_ms, allow_emit):
+            return None
+
+        def prepare_commit(self, *, operation_id, chunk_period_ms):
+            raise NotImplementedError
+
+        def flush(self, *, chunk_period_ms):
+            return None
+
+    state = DefaultDuplexModelSessionState(audio_buffer=Buffer())
+    first = {"format": "pcm_f32le", "audio": "YQ==", "sample_rate_hz": 16000, "is_speech": True}
+    state.retain_committed_audio(first, operation_id="op1", reserved_bytes=8)
+    assert state.mergeable_committed_audio() is first
+    state.mark_committed_audio_consume_started()
+    assert state.mergeable_committed_audio() is None
+    assert state.committed_audio_payload is first
+    state.clear_committed_audio()
+    assert state.committed_audio_payload is None
+    assert state.committed_audio_consume_started is False
+
+
+def test_slots_session_states_track_committed_audio_consume() -> None:
+    """AURA and Qwen override retain/clear on slots dataclasses.
+
+    mergeable_committed_audio() reads committed_audio_consume_started. Without
+    the field on those states, the first commit raises AttributeError.
+    """
+    from vllm_omni.model_executor.models.aura_omni.duplex.session import AuraServingSessionState
+    from vllm_omni.model_executor.models.qwen3_omni.duplex.session import QwenDuplexSessionState
+
+    for state in (AuraServingSessionState(), QwenDuplexSessionState()):
+        first = {"audio": "YQ=="}
+        state.retain_committed_audio(first, operation_id="op1", reserved_bytes=4)
+        assert state.mergeable_committed_audio() is first
+        state.mark_committed_audio_consume_started()
+        assert state.mergeable_committed_audio() is None
+        state.retain_committed_audio({"audio": "Yg=="}, operation_id="op2", reserved_bytes=4)
+        assert state.committed_audio_consume_started is False
+        assert state.mergeable_committed_audio() == {"audio": "Yg=="}
+        state.clear_committed_audio()
+        assert state.committed_audio_payload is None
+        assert state.committed_audio_consume_started is False
