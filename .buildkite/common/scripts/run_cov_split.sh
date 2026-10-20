@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 # Run a model's E2E tests once per entry mode as separate coverage runs and upload
 # the reports, so per-mode attribution survives (see vllm-project/vllm-omni#5332).
 #
@@ -17,12 +20,16 @@
 # just that half. Total runtime is bounded by the step's timeout_in_minutes.
 #
 # Coverage + artifact upload run only on scheduled weekly E2E sweeps
-# (WEEKLY=1 and BUILDKITE_BRANCH=main — same gate as bootstrap --e2e).
-# All other invocations (PR merge-test, regular main merge, local) run the
+# (WEEKLY=1 on a release-line push: main, or non-PR release/vX.Y.Z — same gate as bootstrap --e2e).
+# All other invocations (PR merge-test, regular release-line merge, local) run the
 # same combined pytest as the job used before coverage was added.
 #
 # Exits non-zero if any half or the upload failed.
 set -uo pipefail
+
+_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck disable=SC1091
+source "${_SCRIPT_DIR}/release_line_branch.sh"
 
 MODEL_ID=""
 OFFLINE=()
@@ -50,7 +57,7 @@ if ((${#OFFLINE[@]} == 0 && ${#ONLINE[@]} == 0)); then
 fi
 
 _should_run_coverage() {
-    [[ "${WEEKLY:-}" == "1" && "${BUILDKITE_BRANCH:-}" == "main" ]]
+    [[ "${WEEKLY:-}" == "1" ]] && is_release_line_push
 }
 
 if ! _should_run_coverage; then
