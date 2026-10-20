@@ -1517,6 +1517,7 @@ class BatchedToken2Wav(nn.Module):
         cnn_cache: torch.Tensor | None,
         att_cache: torch.Tensor | list[torch.Tensor] | None,
         valid_lengths: list[int] | None = None,
+        att_keep: tuple[int, int] | None = None,
         prompt_lengths: list[int] | None = None,
         prompt_att_cache: torch.Tensor | None = None,
         prompt_cache_key: tuple[str, str] | None = None,

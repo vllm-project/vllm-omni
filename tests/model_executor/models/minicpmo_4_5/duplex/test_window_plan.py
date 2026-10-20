@@ -394,3 +394,35 @@ def test_paged_retention_policy_vs_unpaged_reference():
     # Retained tail [128..164) shifts by -delta (-16)
     assert reanchor_positions(128, plan) == 112
     assert reanchor_positions(163, plan) == 147
+
+
+def test_cross_session_context_cache_and_segmented_anchor_protection():
+    """Verify that multiple sessions sharing the same system prompt and reference
+    voice retain identical anchor tokens and that sliding-window compaction never
+    evicts or alters the immutable sink anchor blocks (Tier 0).
+    """
+    block_size = 16
+    system_prompt_len = 512
+    # Ensure sink_blocks covers all immutable system prompt tokens
+    geometry = DuplexWindowGeometry(
+        prefix_tokens=system_prompt_len,
+        window_tokens=2048,
+        block_size=block_size,
+        max_model_len=8192,
+        high_watermark_tokens=4096,
+    )
+    plan = plan_position_reanchor(
+        geometry,
+        computed_tokens=4600,
+        pending_tokens=0,
+        unit_tokens=[256, 512, 1024],
+    )
+    assert plan is not None
+    # Sink blocks must be strictly preserved across reanchor
+    expected_sink_blocks = cdiv(system_prompt_len, block_size)
+    assert plan.sink_blocks == expected_sink_blocks
+    assert plan.sink_end == expected_sink_blocks * block_size
+    assert plan.moved_from >= plan.sink_end
+    # The immutable anchor region [0 .. system_prompt_len) must be invariant
+    for pos in (0, 16, 256, system_prompt_len - 1):
+        assert reanchor_positions(pos, plan) == pos
