@@ -141,7 +141,6 @@ class OmniServerParams(NamedTuple):
     init_timeout: int | None = None
     stage_init_timeout: int | None = None  # None: fixture supplies default (600 s)
     startup_timeout: int = SERVER_STARTUP_TIMEOUT_S
-    log_path: str | None = None
 
 
 class AsyncOmniParams(NamedTuple):
@@ -169,7 +168,6 @@ class OmniServer:
         env_dict: dict[str, str] | None = None,
         use_omni: bool = True,
         startup_timeout: int = SERVER_STARTUP_TIMEOUT_S,
-        log_path: str | None = None,
     ) -> None:
         cleanup_test_environment()
         self.startup_timeout = startup_timeout
@@ -178,8 +176,6 @@ class OmniServer:
         self.log_stats = "--disable-log-stats" not in self.serve_args and "--log-stats" in self.serve_args
         self.env_dict = env_dict
         self.use_omni = use_omni
-        self.server_log_path = log_path
-        self._server_log_fh: Any | None = None
         self.proc: subprocess.Popen | None = None
         self.host = "127.0.0.1"
         self._auto_port = port is None
@@ -235,11 +231,6 @@ class OmniServer:
         env = os.environ.copy()
         if self.env_dict is not None:
             env.update(self.env_dict)
-        stdout: Any = None
-        if self.server_log_path is not None:
-            env["PYTHONUNBUFFERED"] = "1"
-            self._server_log_fh = open(self.server_log_path, "wb", buffering=0)
-            stdout = self._server_log_fh
 
         cmd = [
             sys.executable,
@@ -262,8 +253,6 @@ class OmniServer:
             cmd,
             env=env,
             cwd=_omni_subprocess_cwd(),
-            stdout=stdout,
-            stderr=subprocess.STDOUT if stdout is not None else None,
         )
 
         max_wait = self.startup_timeout
@@ -432,33 +421,16 @@ class OmniServer:
             self._start_server()
         except BaseException:
             # ``__exit__`` is not invoked when ``__enter__`` raises; roll back
-            # any processes / log handles already launched.
+            # any process already launched.
             self.__exit__(None, None, None)
             raise
         return self
-
-    def _close_server_log(self) -> None:
-        handle = self._server_log_fh
-        self._server_log_fh = None
-        if handle is not None:
-            handle.close()
-        path = self.server_log_path
-        if not path or not os.path.exists(path):
-            return
-        try:
-            with open(path, encoding="utf-8", errors="replace") as log_file:
-                text = log_file.read()
-        except OSError as exc:
-            print(f"failed to read server log {path}: {exc}", flush=True)
-            return
-        print(f"\n=== omni server log ({path}) ===\n{text}", flush=True)
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         try:
             if self.proc:
                 self._kill_process_tree(self.proc.pid)
         finally:
-            self._close_server_log()
             if self._port_lock is not None:
                 self._port_lock.release()
                 self._port_lock = None
@@ -1268,7 +1240,6 @@ def iter_omni_server(
                     env_dict=params.env_dict,
                     use_omni=params.use_omni,
                     startup_timeout=params.startup_timeout,
-                    log_path=params.log_path,
                 )
                 if port
                 else OmniServer(
@@ -1277,7 +1248,6 @@ def iter_omni_server(
                     env_dict=params.env_dict,
                     use_omni=params.use_omni,
                     startup_timeout=params.startup_timeout,
-                    log_path=params.log_path,
                 )
             ) as server:
                 if model != original_model:
