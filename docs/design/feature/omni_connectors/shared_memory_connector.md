@@ -117,6 +117,24 @@ Both sides acquire an exclusive lock. This ensures that the shared-memory segmen
 
 Lock-file lifecycle: a lock file has no purpose of its own — it only serializes one transfer, and its reclamation is tied to the segment's, best-effort rather than strict co-presence: a lock may briefly exist before its segment is created and may outlive a reaped segment until a removal path runs. Removal is *attempted*, never guaranteed (failures are swallowed), on: a receiving byte read that returned successfully (`consumed` is set before deserialization, so a later deserialize failure still removes the lock); a read that acquired the lock and then found the segment already gone; a key-based poll whose segment is missing, reclaiming an aged orphan; a `put()` whose `shm_write_bytes` raised before the segment existed; and `cleanup()` / `close()`. Sweeping is lazy and per-process — not a background timer: `_maybe_sweep_stale_lock_files()` fires from `__init__` / `put()` / `get()` at most once per grace interval (a monotonic-clock trigger rate limit, distinct from the orphan-age test, which compares the lock file's mtime against the wall clock). The gate re-arms, so a restart inside the grace window retries young orphans on later calls; with no further calls, or if removals keep failing, no reclamation time is guaranteed. A lock whose segment was reaped externally (e.g. by `resource_tracker` at owner shutdown — itself best-effort) becomes an orphan candidate, reaped with a check–lock–recheck protocol that never touches a young, held, or live-segment lock.
 
+#### 4.4 Key Generation
+
+Connector keys carry a per-admission generation token:
+
+```text
+{external_req_id}_{stage_id}_{transfer_gen}_{chunk_id}
+```
+
+The orchestrator stamps a unique token (`uuid4().hex[:8]`) into
+`payload_sender_info["transfer_gen"]` on every request it submits to a stage;
+both the sending stage and the receiving stage read the same value off their
+own request objects (`_request_transfer_gen`), so a re-used external request
+id can never produce keys that collide with a previous generation's leftover
+segments or lock files. The orchestrator's release RPC carries the token of
+the generation it is reclaiming, so a delayed release for an old generation
+cannot touch a newer generation's transfers. `"0"` is the fallback for
+requests that carry no stamp (unit tests, legacy admission paths).
+
 ### 5. Put / Get Flow
 
 #### 5.1 Producer Flow: `put()`

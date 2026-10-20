@@ -144,7 +144,7 @@ class StagePool:
         )
         # Per-replica release batching: ids waiting for the replica's next RPC
         # and the task sending them (also the strong reference keeping it alive).
-        self._pending_releases: dict[int, dict[str, None]] = {}
+        self._pending_releases: dict[int, dict[str, str | None]] = {}
         self._release_flushers: dict[int, asyncio.Task[None]] = {}
         self._next_replica_id = 0
         self._request_bindings: dict[str, int] = {}
@@ -1399,8 +1399,12 @@ class StagePool:
 
         return abort_outputs
 
-    def schedule_release_request_resources(self, request_ids: list[str]) -> None:
-        """Queue a best-effort release of *request_ids* on every live replica.
+    def schedule_release_request_resources(self, releases: list[tuple[str, str | None]]) -> None:
+        """Queue a best-effort release of *(request_id, transfer_gen)* on every live replica.
+
+        The generation token scopes the reclaim to that admission's connector
+        keys: a late release for a re-used external id cannot touch the new
+        generation's segments or lock files (see the adapter's release path).
 
         Broadcast rather than binding-routed: the orchestrator releases route
         bindings as part of the same teardown, so a binding lookup here would
@@ -1411,7 +1415,7 @@ class StagePool:
         hung replica delays only its own batches (bounded by
         ``RELEASE_RPC_TIMEOUT_S`` per RPC).
         """
-        if not request_ids or not self._has_chunk_transfer_adapter:
+        if not releases or not self._has_chunk_transfer_adapter:
             return
         try:
             loop = asyncio.get_running_loop()
@@ -1419,12 +1423,12 @@ class StagePool:
             logger.warning(
                 "[StagePool-%s] no running event loop; skipped reclaim of transfer resources for %s",
                 self.stage_id,
-                request_ids,
+                [rid for rid, _ in releases],
             )
             return
         for replica_id in self.live_replica_ids():
             pending = self._pending_releases.setdefault(replica_id, {})
-            pending.update(dict.fromkeys(request_ids))
+            pending.update(dict(releases))
             if replica_id not in self._release_flushers:
                 self._release_flushers[replica_id] = loop.create_task(self._flush_replica_releases(replica_id))
 
@@ -1434,7 +1438,7 @@ class StagePool:
             while pending:
                 # Let completions handled in this loop pass join the batch.
                 await asyncio.sleep(0)
-                ids = list(pending)
+                pairs = list(pending.items())
                 pending.clear()
                 # Resolve the client per RPC: the replica may have been removed or replaced.
                 client = self.clients[replica_id] if replica_id < len(self.clients) else None
@@ -1443,7 +1447,7 @@ class StagePool:
                     return
                 try:
                     await asyncio.wait_for(
-                        call("omni_release_request_resources", ids), timeout=self.RELEASE_RPC_TIMEOUT_S
+                        call("omni_release_request_resources", pairs), timeout=self.RELEASE_RPC_TIMEOUT_S
                     )
                 except Exception as e:
                     logger.warning(
