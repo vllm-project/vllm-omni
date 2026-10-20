@@ -1731,34 +1731,34 @@ class BatchedToken2Wav(nn.Module):
         prompt: torch.Tensor,
         rows: list[torch.Tensor | SharedPromptAttCache],
     ) -> list[torch.Tensor | SharedPromptAttCache]:
-        """Keep the immutable prompt suffix after a bit-exact suffix check."""
+        """Keep the immutable prompt prefix after a bit-exact prefix check."""
         if not self._prompt_att_sharing or cache_key in self._prompt_att_rejected:
             return rows
         if any(isinstance(row, SharedPromptAttCache) for row in rows):
             return rows
-        shared_len = min(_CACHE_TRIM_SUFFIX, int(prompt.shape[4]))
+        prompt_len = int(prompt.shape[4])
         if any(
             tuple(prompt.shape[:4]) != tuple(row.shape[:4])
             or prompt.shape[5] != row.shape[5]
-            or int(row.shape[4]) < shared_len
+            or int(row.shape[4]) < prompt_len
             for row in rows
         ):
             self._prompt_att_rejected.add(cache_key)
             return rows
-        prompt_segment = prompt[..., -shared_len:, :]
+        prompt_segment = prompt[..., :prompt_len, :]
         if cache_key not in self._prompt_att_verified:
-            if any(not torch.equal(row[..., -shared_len:, :], prompt_segment) for row in rows):
-                logger.warning("CFM prompt attention suffix differs; disabling sharing for %s", cache_key[0])
+            if any(not torch.equal(row[..., :prompt_len, :], prompt_segment) for row in rows):
+                logger.warning("CFM prompt attention prefix differs; disabling sharing for %s", cache_key[0])
                 self._prompt_att_rejected.add(cache_key)
                 return rows
             self._prompt_att_verified.add(cache_key)
             logger.info(
-                "CFM prompt attention suffix verified bit-exact (prompt=%s rows=%d frames=%d)",
+                "CFM prompt attention prefix verified bit-exact (prompt=%s rows=%d frames=%d)",
                 cache_key[0],
                 len(rows),
-                shared_len,
+                prompt_len,
             )
-        return [SharedPromptAttCache(row[..., :-shared_len, :].detach().clone(), prompt_segment) for row in rows]
+        return [SharedPromptAttCache(prompt_segment, row[..., prompt_len:, :].detach().clone()) for row in rows]
 
     @staticmethod
     def _stack_estimator_att(rows: list[torch.Tensor]) -> torch.Tensor:

@@ -5,8 +5,10 @@ from __future__ import annotations
 
 import base64
 import copy
+import hashlib
 import os
 import time
+from collections import OrderedDict
 from collections.abc import Callable, Generator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
@@ -34,6 +36,7 @@ _MINICPMO45_OPTIONAL_TOKEN_FIELDS = MiniCPMO45DuplexPolicy.OPTIONAL_TOKEN_FIELDS
 _MINICPMO45_PROCESSOR_LOAD_LOCK = Lock()
 _MINICPMO45_FRAME_POOL_LOCK = Lock()
 _MINICPMO45_FRAME_POOL: ThreadPoolExecutor | None = None
+_MINICPMO45_SHARED_CONTEXT_CACHE_MAX_SIZE = 32
 
 
 def _optional_int(value: Any) -> int | None:
@@ -160,11 +163,12 @@ class MiniCPMO45Stage0DuplexRuntime:
         self._audio_graph_attempted = False
         # Cross-session Tier-0 immutable context embedding cache:
         # (instructions, has_ref_audio, initial_user_text, ref_audio_hash) ->
-        #   (context_embeds, context_token_ids, prefix_embeds, prefix_token_ids, suffix_embeds, suffix_token_ids)
-        self._shared_context_cache: dict[
+        #   (context_embeds, context_token_ids, prefix_embeds, prefix_token_ids,
+        #    suffix_embeds, suffix_token_ids, has_streaming_side_effects)
+        self._shared_context_cache: OrderedDict[
             tuple[Any, ...],
-            tuple[list[Any], list[int], list[Any], list[int], list[Any], list[int]],
-        ] = {}
+            tuple[list[Any], list[int], list[Any], list[int], list[Any], list[int], bool],
+        ] = OrderedDict()
 
     def build_audio_cuda_graph(self) -> bool:
         """Capture the streaming-encoder CUDA graphs once weights are loaded (idempotent; failures stay eager).
@@ -295,23 +299,32 @@ class MiniCPMO45Stage0DuplexRuntime:
         # scheduler reserve can count these tokens exactly.
         initial_user_text = (runtime_config or {}).get("initial_user_text")
         instructions = session_config.get("instructions")
+        enable_context_caching = bool((runtime_config or {}).get("duplex_context_caching", False))
         ref_hash = None
         if ref_audio is not None:
-            ref_hash = hash(ref_audio.tobytes()) if hasattr(ref_audio, "tobytes") else hash(str(ref_audio))
+            data = ref_audio.tobytes() if hasattr(ref_audio, "tobytes") else str(ref_audio).encode("utf-8")
+            ref_hash = hashlib.sha256(data).hexdigest()
         cache_key = (instructions, ref_audio is not None, initial_user_text, ref_hash)
-        cached = self._shared_context_cache.get(cache_key)
+        cached = None
+        if enable_context_caching and cache_key in self._shared_context_cache:
+            self._shared_context_cache.move_to_end(cache_key)
+            cached = self._shared_context_cache[cache_key]
         if cached is not None:
-            c_embeds, c_tokens, p_embeds, p_tokens, s_embeds, s_tokens = cached
+            c_embeds, c_tokens, p_embeds, p_tokens, s_embeds, s_tokens, is_streaming_path = cached
             state.context_embeds.extend(c_embeds)
             state.context_token_ids.extend(c_tokens)
             state.context_prefix_embeds.extend(p_embeds)
             state.context_prefix_token_ids.extend(p_tokens)
             state.context_suffix_embeds.extend(s_embeds)
             state.context_suffix_token_ids.extend(s_tokens)
+            # Only replay side effects if the streaming fallback path was used
+            if ref_audio is not None and is_streaming_path:
+                self._stage_ref_audio_embeddings(ref_audio, state=state)
         else:
             c_embeds, c_tokens = [], []
             p_embeds, p_tokens = [], []
             s_embeds, s_tokens = [], []
+            is_streaming_path = False
             prefix, suffix = MiniCPMO45DuplexPolicy.session_context_texts(
                 instructions,
                 ref_audio is not None,
@@ -324,6 +337,9 @@ class MiniCPMO45Stage0DuplexRuntime:
                 p_embeds.append(embed)
                 p_tokens.append(token_id)
             if ref_audio is not None:
+                # Detect if the streaming fallback is taken
+                process_audio = getattr(self.processor, "process_audio", None)
+                is_streaming_path = not callable(process_audio)
                 ref_audio_embeds = self._stage_ref_audio_embeddings(ref_audio, state=state)
                 if ref_audio_embeds is not None:
                     ref_audio_embeds = self._as_2d_tensor(ref_audio_embeds)
@@ -338,7 +354,18 @@ class MiniCPMO45Stage0DuplexRuntime:
                 c_tokens.append(token_id)
                 s_embeds.append(embed)
                 s_tokens.append(token_id)
-            self._shared_context_cache[cache_key] = (c_embeds, c_tokens, p_embeds, p_tokens, s_embeds, s_tokens)
+            if enable_context_caching:
+                if len(self._shared_context_cache) >= _MINICPMO45_SHARED_CONTEXT_CACHE_MAX_SIZE:
+                    self._shared_context_cache.popitem(last=False)
+                self._shared_context_cache[cache_key] = (
+                    c_embeds,
+                    c_tokens,
+                    p_embeds,
+                    p_tokens,
+                    s_embeds,
+                    s_tokens,
+                    is_streaming_path,
+                )
             state.context_embeds.extend(c_embeds)
             state.context_token_ids.extend(c_tokens)
             state.context_prefix_embeds.extend(p_embeds)

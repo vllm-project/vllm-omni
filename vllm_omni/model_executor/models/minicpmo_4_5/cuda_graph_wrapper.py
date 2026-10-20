@@ -3,6 +3,7 @@
 
 import functools
 import itertools
+import os
 import time
 import weakref
 from collections import Counter
@@ -1091,63 +1092,63 @@ class ResidentAttCache:
 
 
 class SharedPromptAttCache:
-    """A request attention cache split into a request prefix and an immutable prompt suffix.
+    """A request attention cache split into an immutable prompt prefix and a request-owned delta tail.
 
-    Holds ``(prefix, prompt)`` without joining them into a full tensor.
-    Logical shape is ``(n_t, depth, 2, heads, prefix_frames + prompt_frames, width)``.
+    Holds ``(prompt, delta)`` without joining them into a full tensor.
+    Logical shape is ``(n_t, depth, 2, heads, prompt_frames + delta_frames, width)``.
     """
 
-    __slots__ = ("prefix", "prompt")
+    __slots__ = ("prompt", "delta")
 
-    def __init__(self, prefix: torch.Tensor, prompt: torch.Tensor) -> None:
-        self.prefix = prefix
+    def __init__(self, prompt: torch.Tensor, delta: torch.Tensor) -> None:
         self.prompt = prompt
+        self.delta = delta
 
     @property
     def shape(self) -> torch.Size:
         return torch.Size(
             (
-                self.prefix.shape[0],
-                self.prefix.shape[1],
-                self.prefix.shape[2],
-                self.prefix.shape[3],
-                self.prefix.shape[4] + self.prompt.shape[4],
-                self.prefix.shape[5],
+                self.prompt.shape[0],
+                self.prompt.shape[1],
+                self.prompt.shape[2],
+                self.prompt.shape[3],
+                self.prompt.shape[4] + self.delta.shape[4],
+                self.prompt.shape[5],
             )
         )
 
     @property
     def dtype(self) -> torch.dtype:
-        return self.prefix.dtype
+        return self.prompt.dtype
 
     @property
     def device(self) -> torch.device:
-        return self.prefix.device
+        return self.prompt.device
 
     def data_ptr(self) -> int:
         """Expose a stable pointer for cache-owner accounting without a full materialization."""
-        return self.prefix.data_ptr() if self.prefix.numel() > 0 else id(self)
+        return self.delta.data_ptr() if self.delta.numel() > 0 else id(self)
 
     def copy_range_to(self, dst: torch.Tensor, start: int, length: int) -> None:
         """Copy a logical frame range into ``dst`` without joining prompt and tail."""
         start, length = int(start), int(length)
         if start < 0 or length < 0 or start + length > int(self.shape[4]):
             raise ValueError(f"attention-cache range ({start}, {length}) is outside {tuple(self.shape)}")
-        prefix_len = int(self.prefix.shape[4])
+        prompt_len = int(self.prompt.shape[4])
         position = 0
-        if start < prefix_len:
-            count = min(length, prefix_len - start)
-            dst[..., position : position + count, :].copy_(self.prefix[..., start : start + count, :])
+        if start < prompt_len:
+            count = min(length, prompt_len - start)
+            dst[..., position : position + count, :].copy_(self.prompt[..., start : start + count, :])
             position += count
             start += count
             length -= count
         if length:
-            prompt_start = start - prefix_len
-            dst[..., position : position + length, :].copy_(self.prompt[..., prompt_start : prompt_start + length, :])
+            delta_start = start - prompt_len
+            dst[..., position : position + length, :].copy_(self.delta[..., delta_start : delta_start + length, :])
 
     def materialize(self) -> torch.Tensor:
         """Materialize the logical cache for eager or unsupported graph paths."""
-        return torch.cat((self.prefix, self.prompt), dim=4)
+        return torch.cat((self.prompt, self.delta), dim=4)
 
 
 def _copy_att_cache_range(dst: torch.Tensor, src, start: int, length: int) -> None:
@@ -1267,7 +1268,30 @@ class WholeEulerCFMGraphWrapper:
             pad_max_rows = self.micro_batch_size // 4
         self.pad_max_rows = max(0, int(pad_max_rows))
         self.arena_rows_from_graph_grid = bool(arena_rows_from_graph_grid)
-        self._arena_rows = max(self._graph_batches()) if self.arena_rows_from_graph_grid else self.micro_batch_size
+        # Parse VLLM_OMNI_CFM_GRAPH_GRID once at initialization
+        grid_raw = os.environ.get("VLLM_OMNI_CFM_GRAPH_GRID")
+        if grid_raw:
+            try:
+                parsed_grid = sorted({int(x) for x in grid_raw.split(",") if x.strip()})
+                filtered_batches = [b for b in parsed_grid if 0 < b <= self.micro_batch_size]
+                self._configured_graph_batches: list[int] = filtered_batches or [self.micro_batch_size]
+            except Exception:
+                logger.warning("Failed to parse VLLM_OMNI_CFM_GRAPH_GRID=%r; using powers of two", grid_raw)
+                self._configured_graph_batches = self._default_graph_batches()
+        else:
+            self._configured_graph_batches = self._default_graph_batches()
+
+        if self.arena_rows_from_graph_grid:
+            self._arena_rows = max(self._configured_graph_batches)
+            if self._arena_rows >= self.micro_batch_size:
+                logger.warning(
+                    "cfm_arena_rows_from_graph_grid is enabled, but the effective graph grid max (%d) "
+                    "is not smaller than micro_batch_size (%d); no arena memory will be saved",
+                    self._arena_rows,
+                    self.micro_batch_size,
+                )
+        else:
+            self._arena_rows = self.micro_batch_size
         # Largest steady cache length a caller announced; sizes the arena storage.
         self._att_capacity = 0
         parameter = next(estimator.parameters(), None)
@@ -1389,8 +1413,7 @@ class WholeEulerCFMGraphWrapper:
 
         return cur_x
 
-    def _graph_batches(self) -> list[int]:
-        """Native graph batch sizes: the powers of two below ``micro_batch_size``, and it."""
+    def _default_graph_batches(self) -> list[int]:
         sizes = []
         size = 1
         while size < self.micro_batch_size:
@@ -1398,6 +1421,14 @@ class WholeEulerCFMGraphWrapper:
             size *= 2
         sizes.append(self.micro_batch_size)
         return sizes
+
+    def _graph_batches(self) -> list[int]:
+        """Native graph batch sizes: the powers of two below ``micro_batch_size``, and it.
+
+        ``VLLM_OMNI_CFM_GRAPH_GRID`` (comma-separated sizes) pins them instead;
+        sizes above ``micro_batch_size`` are dropped.
+        """
+        return self._configured_graph_batches
 
     def _plan_groups(self, batch_size: int) -> list[tuple[int, int]]:
         """``(graph_batch, rows)`` replays that cover ``batch_size`` requests.
@@ -1489,11 +1520,11 @@ class WholeEulerCFMGraphWrapper:
             assert att_cache is not None
             static_att_rows[:, :, :, :rows].copy_(att_cache.unflatten(2, (2, batch_size))[:, :, :, start:stop])
         else:
-            for row, source in enumerate(_materialize_att_rows(att_rows[start:stop])):
+            for row, source in enumerate(att_rows[start:stop]):
                 # A mixed-reference batch right-pads shorter histories. Their
                 # remaining arena columns are excluded by the per-row mask.
                 row_offset = int(source.shape[4])
-                static_att_rows[:, :, :, row, :, :row_offset].copy_(source)
+                _copy_att_cache_range(static_att_rows[:, :, :, row, :, :row_offset], source, 0, row_offset)
 
     def _group_fills(self, groups: list[tuple[int, int]], after=None, **inputs) -> list[Callable]:
         """Per replay group, a ``fill(statics)`` that copies the group's requests in, then runs ``after``."""
