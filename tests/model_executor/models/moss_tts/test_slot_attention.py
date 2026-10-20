@@ -6,15 +6,21 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from tests.helpers.mark import hardware_marks
 from vllm_omni.model_executor.models.moss_tts.audio_tokenizer_v2 import (
     MossAudioTokenizerMultiheadAttention,
     MossAudioTokenizerRotaryEmbedding,
     RingKVCache,
     StreamingExecutionContext,
 )
-from vllm_omni.model_executor.models.moss_tts.slot_attention import slot_ring_attention, slot_ring_attention_rows
+from vllm_omni.model_executor.models.moss_tts.slot_attention import (
+    slot_ring_attention,
+    slot_ring_attention_rows,
+    slot_ring_flash_attention,
+    slot_ring_flash_attention_rows,
+)
 
-pytestmark = [pytest.mark.core_model, pytest.mark.cuda]
+pytestmark = [pytest.mark.core_model, *hardware_marks(res={"cuda": "L4"}, num_cards=1)]
 
 
 @pytest.mark.parametrize(
@@ -299,3 +305,292 @@ def test_fused_rows_attention_integrates_with_mha_offsets(frames, context):
         if step == 4:
             for model in (reference, candidate):
                 model._streaming_state.reset_slots(torch.tensor([0], device="cuda"))
+
+
+@pytest.mark.parametrize("frames,capacity", [(1, 125), (15, 125), (15, 250), (32, 400), (60, 400), (480, 400)])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_fused_rows_empty_tile_skip_is_exact(frames, capacity, dtype):
+    torch.manual_seed(51)
+    batch, heads, states, dim = 3, 2, 5, 64
+    projected = torch.randn(batch, frames, 3, heads, dim, device="cuda", dtype=dtype)
+    q, k, v = projected.permute(2, 0, 3, 1, 4).unbind(0)
+    base_cache = torch.randn(2, states, heads, capacity, dim, device="cuda", dtype=dtype)
+    slots = torch.tensor([0, 4, 2], device="cuda")
+    lengths = torch.tensor([frames, max(1, frames - 3), 0], device="cuda", dtype=torch.int32)
+    for start in [0, 1, capacity - 1, capacity + 9, 3 * capacity]:
+        starts = torch.full((batch,), start, device="cuda", dtype=torch.long)
+        expected_cache, cache = base_cache.clone(), base_cache.clone()
+        expected = slot_ring_attention_rows(q, k, v, expected_cache, starts, slots, lengths, 17)
+        actual = slot_ring_attention_rows(q, k, v, cache, starts, slots, lengths, 17, skip_empty_tiles=True)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        torch.testing.assert_close(cache, expected_cache, rtol=0, atol=0)
+
+
+def test_slot_attention_output_is_time_major_storage():
+    q, k, v = [torch.randn(2, 3, 5, 64, device="cuda", dtype=torch.bfloat16) for _ in range(3)]
+    cache = torch.zeros(2, 4, 3, 125, 64, device="cuda", dtype=torch.bfloat16)
+    slots = torch.tensor([1, 2], device="cuda")
+    lengths = torch.full((2,), 5, device="cuda", dtype=torch.int32)
+    end = torch.zeros(4, device="cuda", dtype=torch.long)
+    out = slot_ring_attention(q, k, v, cache.clone(), end, slots, lengths, 17)
+    rows = slot_ring_attention_rows(
+        q, k, v, cache.clone(), torch.zeros(2, device="cuda", dtype=torch.long), slots, lengths, 17
+    )
+    for result in (out, rows):
+        assert result.shape == q.shape
+        # (B, H, T, D) view over (B, T, H, D) storage: the codec reshape is a view.
+        assert result.transpose(1, 2).is_contiguous()
+    torch.testing.assert_close(out, rows, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("frames,capacity,context", [(129, 400, 400), (240, 400, 400), (480, 400, 400), (300, 125, 50)])
+def test_long_chunk_rows_dispatch_matches_fused_launch_exactly(frames, capacity, context, monkeypatch):
+    import vllm_omni.model_executor.models.moss_tts.slot_attention as slot_attention
+
+    torch.manual_seed(54)
+    batch, heads, states, dim = 4, 2, 6, 64
+    projected = torch.randn(batch, frames, 3, heads, dim, device="cuda", dtype=torch.bfloat16)
+    q, k, v = projected.permute(2, 0, 3, 1, 4).unbind(0)
+    base_cache = torch.randn(2, states, heads, capacity, dim, device="cuda", dtype=torch.bfloat16)
+    slots = torch.tensor([0, 5, 2, 3], device="cuda")
+    lengths = torch.tensor([frames, frames - 3, 0, frames // 2], device="cuda", dtype=torch.int32)
+    for start in [0, 1, capacity - 1, capacity + 9, 3 * capacity + 5]:
+        starts = torch.tensor([start, start + 2, start, max(0, start - 7)], device="cuda", dtype=torch.long)
+        split_cache, fused_cache = base_cache.clone(), base_cache.clone()
+        split = slot_ring_attention_rows(q, k, v, split_cache, starts, slots, lengths, context)
+        monkeypatch.setattr(slot_attention, "_FUSED_ROWS_MAX_FRAMES", 1 << 30)
+        fused = slot_ring_attention_rows(q, k, v, fused_cache, starts, slots, lengths, context)
+        monkeypatch.undo()
+        torch.testing.assert_close(split, fused, rtol=0, atol=0)
+        torch.testing.assert_close(split_cache, fused_cache, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "frames,capacity,context,head_dim",
+    [
+        (1, 125, 125, 64),
+        (15, 125, 125, 64),
+        (15, 140, 125, 64),
+        (30, 250, 250, 64),
+        (32, 400, 400, 64),
+        (60, 400, 400, 64),
+        (120, 400, 400, 64),
+        (240, 400, 400, 64),
+        (240, 640, 400, 64),
+        (480, 400, 400, 64),
+        (480, 880, 400, 64),
+        (300, 125, 50, 64),
+        (40, 125, 17, 64),
+        (33, 65, -1, 32),
+        (20, 130, 100, 128),
+        (16, 400, 400, 64),
+        (60, 300, 200, 32),
+        (100, 400, 400, 128),
+    ],
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_flash_rows_attention_matches_rows_op_exactly(frames, capacity, context, head_dim, dtype):
+    torch.manual_seed(61)
+    batch, heads, states = 5, 3, 8
+    projected = torch.randn(batch, frames, 3, heads, head_dim, device="cuda", dtype=dtype)
+    q, k, v = projected.permute(2, 0, 3, 1, 4).unbind(0)
+    base_cache = torch.randn(2, states, heads, capacity, head_dim, device="cuda", dtype=dtype)
+    slots = torch.tensor([0, 7, 2, 3, 5], device="cuda")
+    # Full, partial, padding, single-token and almost-full rows.
+    lengths = torch.tensor([frames, max(1, frames - 3), 0, 1, max(1, frames - 1)], device="cuda", dtype=torch.int32)
+    for start in [0, 1, capacity - 1, capacity, capacity + 9, 3 * capacity + 5, 1 << 33]:
+        starts = torch.tensor(
+            [start, start + 2, start, max(0, start - 7), start + capacity // 2], device="cuda", dtype=torch.long
+        )
+        for skip in (False, True):
+            expected_cache, cache = base_cache.clone(), base_cache.clone()
+            expected = slot_ring_attention_rows(
+                q, k, v, expected_cache, starts, slots, lengths, context, skip_empty_tiles=skip
+            )
+            actual = slot_ring_flash_attention_rows(q, k, v, cache, starts, slots, lengths, context)
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            torch.testing.assert_close(cache, expected_cache, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("frames,capacity", [(1, 125), (15, 125), (60, 400), (240, 400), (480, 400), (480, 880)])
+@pytest.mark.parametrize("execution", ["eager", "graph", "compiled"])
+def test_flash_attention_matches_three_launch_op_across_steps(frames, capacity, execution):
+    torch.manual_seed(67)
+    batch, heads, state_capacity, dim = 3, 2, 6, 64
+    projected = torch.randn(batch, frames, 3, heads, dim, device="cuda", dtype=torch.bfloat16)
+    q, k, v = projected.permute(2, 0, 3, 1, 4).unbind(0)
+    cache = torch.randn(2, state_capacity, heads, capacity, dim, device="cuda", dtype=q.dtype)
+    expected_cache = cache.clone()
+    end = torch.zeros(state_capacity, device="cuda", dtype=torch.long)
+    expected_end = end.clone()
+    slots = torch.zeros(batch, device="cuda", dtype=torch.long)
+    lengths = torch.zeros(batch, device="cuda", dtype=torch.int32)
+    context = min(capacity, 400)
+
+    def candidate():
+        return slot_ring_flash_attention(q, k, v, cache, end, slots, lengths, context)
+
+    run = candidate
+    if execution == "compiled":
+        run = torch.compile(candidate, fullgraph=True)
+    if execution == "graph":
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            candidate()
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            actual = candidate()
+        cache.copy_(expected_cache)
+        end.zero_()
+    for step in range(10):
+        slots.copy_(torch.roll(torch.arange(state_capacity, device="cuda"), step)[:batch])
+        lengths.copy_(torch.tensor([frames, max(1, frames - 3), 0], device="cuda", dtype=torch.int32))
+        projected.normal_()
+        expected = slot_ring_attention(q, k, v, expected_cache, expected_end, slots, lengths, context)
+        if execution == "graph":
+            graph.replay()
+        else:
+            actual = run()
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        torch.testing.assert_close(cache, expected_cache, rtol=0, atol=0)
+        torch.testing.assert_close(end, expected_end, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("frames,context", [(1, 9), (15, 125), (480, 400)])
+def test_flash_rows_attention_integrates_with_mha_offsets(frames, context):
+    torch.manual_seed(71)
+    reference = MossAudioTokenizerMultiheadAttention(
+        128,
+        2,
+        causal=True,
+        context=context,
+        rope=MossAudioTokenizerRotaryEmbedding(),
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    candidate = copy.deepcopy(reference)
+    reference._slot_attention_rows = slot_ring_attention_rows
+    candidate._slot_attention_rows = slot_ring_flash_attention_rows
+    for model in (reference, candidate):
+        model._streaming_state = model._init_streaming_state(4)
+    for step in range(8):
+        slots = torch.tensor([1, 0, 3] if step % 2 else [0, 1, 3], device="cuda")
+        valid = torch.tensor([True, True, False], device="cuda")
+        execution_context = StreamingExecutionContext(state_slot_ids=slots, valid_rows=valid)
+        x = torch.randn(3, frames, 128, device="cuda", dtype=torch.bfloat16)
+        with torch.inference_mode():
+            expected = reference(x, x, x, execution_context=execution_context)
+            actual = candidate(x, x, x, execution_context=execution_context)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        cs, rs = candidate._streaming_state, reference._streaming_state
+        torch.testing.assert_close(cs.offset, rs.offset, rtol=0, atol=0)
+        torch.testing.assert_close(cs.kv_cache.end_offset, rs.kv_cache.end_offset, rtol=0, atol=0)
+        torch.testing.assert_close(cs.kv_cache.cache, rs.kv_cache.cache, rtol=0, atol=0)
+        if step == 4:
+            for model in (reference, candidate):
+                model._streaming_state.reset_slots(torch.tensor([0], device="cuda"))
+
+
+def test_flash_attention_padding_rows_are_zero_and_preserve_state():
+    q, k, v = [torch.randn(2, 2, 480, 64, device="cuda", dtype=torch.bfloat16) for _ in range(3)]
+    cache = torch.randn(2, 4, 2, 400, 64, device="cuda", dtype=torch.bfloat16)
+    before = cache.clone()
+    starts = torch.tensor([5, 1 << 20], device="cuda")
+    slots = torch.tensor([1, 3], device="cuda")
+    lengths = torch.zeros(2, device="cuda", dtype=torch.int32)
+    out = slot_ring_flash_attention_rows(q, k, v, cache, starts, slots, lengths, 400)
+    assert out.count_nonzero() == 0
+    torch.testing.assert_close(cache, before, rtol=0, atol=0)
+    assert out.transpose(1, 2).is_contiguous()
+
+
+def test_packed_block_entries_list_each_segment_block_in_order():
+    from vllm_omni.model_executor.models.moss_tts.slot_attention import packed_block_entries
+
+    lengths = torch.tensor([1, 15, 0, 33, 16], device="cuda")
+    seg, blk = packed_block_entries(lengths, 16, 9)
+    assert seg[:6].tolist() == [0, 1, 3, 3, 3, 4]
+    assert blk[:6].tolist() == [0, 0, 0, 1, 2, 0]
+    assert blk[6:].tolist() == [9, 9, 9]
+
+
+@pytest.mark.parametrize("block_m", [16, 64])
+@pytest.mark.parametrize("capacity,context", [(125, 125), (140, 125), (400, 400)])
+def test_packed_flash_attention_matches_per_segment_launches_exactly(block_m, capacity, context):
+    from vllm_omni.model_executor.models.moss_tts.slot_attention import (
+        _launch_flash,
+        packed_block_entries,
+        slot_ring_flash_attention_packed,
+    )
+
+    torch.manual_seed(7)
+    heads, head_dim, states = 3, 64, 10
+    lengths_list = [1, 15, 0, 7, 33, 64, 130, 2]
+    n = sum(lengths_list) + 5  # trailing tokens owned by no segment
+    projected = torch.randn(1, n, 3, heads, head_dim, device="cuda", dtype=torch.bfloat16)
+    q, k, v = (projected[:, :, i].transpose(1, 2) for i in range(3))
+    cache = torch.randn(2, states, heads, capacity, head_dim, device="cuda", dtype=torch.bfloat16)
+    slots = torch.tensor([3, 0, 9, 5, 1, 7, 2, 8], device="cuda")
+    starts = torch.tensor([0, 5, 0, capacity - 1, capacity + 9, 3 * capacity + 5, 1 << 33, 2], device="cuda")
+    lengths = torch.tensor(lengths_list, device="cuda")
+    tok = torch.cumsum(lengths, 0) - lengths
+    expected_cache = cache.clone()
+    expected = {}
+    config = (block_m, 8 if capacity <= 256 else 4, 2)
+    for s, length in enumerate(lengths_list):
+        if length:
+            rows = slice(int(tok[s]), int(tok[s]) + length)
+            expected[s] = _launch_flash(
+                q[:, :, rows],
+                k[:, :, rows],
+                v[:, :, rows],
+                expected_cache,
+                starts[s : s + 1],
+                slots[s : s + 1],
+                lengths[s : s + 1].to(torch.int32),
+                context,
+                row_starts=True,
+                config=config,
+            )[0]
+    seg, blk = packed_block_entries(lengths, block_m, n // block_m + len(lengths_list))
+    got = slot_ring_flash_attention_packed(q, k, v, cache, starts, slots, lengths, tok, seg, blk, context, block_m)
+    assert torch.equal(cache, expected_cache)
+    for s, out in expected.items():
+        assert torch.equal(got[0, :, int(tok[s]) : int(tok[s]) + lengths_list[s]], out)
+
+
+@pytest.mark.parametrize("launch", [(16, 32, 2, 2), (32, 64, 4, 2), (64, 32, 4, 3)])
+def test_packed_flash_attention_retiled_launch_matches_to_rounding(launch):
+    from vllm_omni.model_executor.models.moss_tts.slot_attention import (
+        packed_block_entries,
+        slot_ring_flash_attention_packed,
+    )
+
+    torch.manual_seed(11)
+    heads, head_dim, states, capacity = 3, 64, 6, 250
+    lengths_list = [1, 15, 30, 0, 7]
+    n = sum(lengths_list)
+    projected = torch.randn(1, n, 3, heads, head_dim, device="cuda", dtype=torch.bfloat16)
+    q, k, v = (projected[:, :, i].transpose(1, 2) for i in range(3))
+    base = torch.randn(2, states, heads, capacity, head_dim, device="cuda", dtype=torch.bfloat16)
+    slots = torch.tensor([4, 0, 2, 5, 1], device="cuda")
+    starts = torch.tensor([0, capacity - 3, 3 * capacity + 1, 0, 9], device="cuda")
+    lengths = torch.tensor(lengths_list, device="cuda")
+    tok = torch.cumsum(lengths, 0) - lengths
+
+    def run(block_m, block_n, warps, stages):
+        cache = base.clone()
+        seg, blk = packed_block_entries(lengths, block_m, n // block_m + len(lengths_list))
+        out = slot_ring_flash_attention_packed(
+            q, k, v, cache, starts, slots, lengths, tok, seg, blk, capacity, block_m, block_n, warps, stages
+        )
+        return out, cache
+
+    ref, ref_cache = run(16, 0, 0, 0)
+    got, cache = run(*launch)
+    assert torch.equal(cache, ref_cache)
+    for s, length in enumerate(lengths_list):
+        rows = slice(int(tok[s]), int(tok[s]) + length)
+        torch.testing.assert_close(got[0, :, rows], ref[0, :, rows], atol=2e-2, rtol=2e-2)

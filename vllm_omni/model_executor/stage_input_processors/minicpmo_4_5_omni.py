@@ -92,6 +92,33 @@ def _extract_prompt_reference_audio(
     return _extract_first_audio_ref({"audio": serving_reference_audio})
 
 
+# The prewarm payload rides inline in the placeholder request; a longer
+# reference is left to the chunk-0 path alone.
+_CODE2WAV_PREWARM_MAX_REF_SECONDS = 60
+
+
+def code2wav_prewarm_payload(prompt: Any) -> dict[str, Any] | None:
+    """Return the reference Code2Wav can prepare before its first chunk.
+
+    Uses the same extractor as ``llm2tts``, so the waveform and sample rate
+    match the reference chunk 0 later carries and hit the same
+    content-addressed caches. Returns ``None`` when there is nothing to send.
+    """
+    try:
+        reference_audio = _extract_prompt_reference_audio(prompt)
+        if reference_audio is None:
+            return None
+        waveform, sample_rate = reference_audio
+        if sample_rate <= 0 or waveform.numel() == 0:
+            return None
+        if waveform.numel() > _CODE2WAV_PREWARM_MAX_REF_SECONDS * sample_rate:
+            return None
+        return {"ref_audio": waveform.contiguous(), "ref_audio_sr": int(sample_rate)}
+    except Exception:
+        logger.debug("MiniCPM-o 4.5 Code2Wav prewarm payload skipped", exc_info=True)
+        return None
+
+
 def _extract_native_runtime_ref_audio(data_plane_metadata):
     if not isinstance(data_plane_metadata, dict):
         return None
@@ -136,6 +163,11 @@ def _to_transport_list(value):
 
 
 def _coerce_int(value):
+    # Output accumulation can concatenate repeated scalar metadata snapshots.
+    while isinstance(value, (list, tuple)):
+        if len(value) == 0:
+            return None
+        value = value[0]
     if hasattr(value, "detach"):
         flat = value.detach().cpu().reshape(-1)
         if flat.numel() == 0:
@@ -207,9 +239,12 @@ def _extract_codec_delta(pooling_output: Any, request_id: str) -> list[int]:
         if valid is None:
             valid = pooling_output.get("meta.codec_frame_valid")
         if isinstance(valid, torch.Tensor) and isinstance(audio, torch.Tensor):
-            # Model Runner V2 emits one id per token row plus its validity
-            # (decode rows of live requests); keep only the codec frames.
+            # Device codec outputs carry a validity mask; prefill rows can
+            # carry empty audio and masks. reshape(0, -1) is ambiguous even
+            # for a correctly empty codec delta.
             rows = valid.detach().to(device="cpu").reshape(-1).bool()
+            if rows.numel() == 0 and audio.numel() == 0:
+                return []
             audio = audio.detach().to(device="cpu").reshape(rows.numel(), -1)[rows]
         return _codec_scalars(audio)
     if isinstance(pooling_output, Sequence) and not isinstance(
@@ -240,6 +275,10 @@ def _drop_codec_state(transfer_manager: Any, request_id: str) -> None:
 
 
 def _is_aborted(request: Any) -> bool:
+    # V1 passes the scheduler request; the MRv2 native transport passes a
+    # snapshot that carries no status and marks a cancelled terminal instead.
+    if getattr(request, "aborted", False) is True:
+        return True
     status_name = getattr(getattr(request, "status", None), "name", "")
     return any(marker in status_name for marker in ("ABORT", "CANCEL", "IGNORED", "ERROR"))
 
@@ -261,6 +300,8 @@ def tts2code2wav_async_chunk(
     duplex_epoch = _coerce_int(output_meta.get("duplex_epoch"))
     duplex_turn_id = _coerce_int(output_meta.get("duplex_turn_id"))
     segment_text_utf8 = output_meta.get("llm_output_text_utf8")
+    if isinstance(segment_text_utf8, (list, tuple)) and len(segment_text_utf8) > 0:
+        segment_text_utf8 = segment_text_utf8[0]
     if not isinstance(segment_text_utf8, torch.Tensor):
         segment_text_utf8 = None
     turn_end = bool(_coerce_int(output_meta.get("turn_end")))
@@ -293,12 +334,24 @@ def tts2code2wav_async_chunk(
         record["cache_epoch"] = int(record["cache_epoch"]) + 1
         record["chunk_seq"] = 0
         record["last_terminal_turn"] = None
+        record.pop("last_closed_condition", None)
         _drop_codec_state(transfer_manager, request_id)
 
     if _is_aborted(request):
         record["retired_internal_ids"].add(internal_id)
         _drop_codec_state(transfer_manager, request_id)
         return None
+
+    # Async scheduling can publish lookahead outputs after this condition's
+    # EOS, including after the next condition starts. Fence by the identity
+    # captured with the output, not the request's mutable current metadata.
+    condition_seq = _coerce_int(output_meta.get("streaming_condition_seq"))
+    condition_key = None
+    if native_duplex and all(isinstance(value, int) and value >= 0 for value in (*duplex_turn_key, condition_seq)):
+        condition_key = (*duplex_turn_key, condition_seq)
+        closed = record.get("last_closed_condition")
+        if closed is not None and condition_key <= closed:
+            return None
 
     if native_duplex and turn_end and record.get("last_terminal_turn") == duplex_turn_key:
         # Emit an empty replacement snapshot so Code2Wav cannot replay the
@@ -339,7 +392,23 @@ def tts2code2wav_async_chunk(
         state["segment_text_recorded"] = True
     request_finished = getattr(request, "is_finished", None)
     finished = bool(is_finished or (callable(request_finished) and request_finished()))
+    # A native-duplex turn end closes one Code2Wav turn, not the resumable
+    # request. meta.finished is the whole-stream terminal on the MRv2 native
+    # transport (the V1 chunk adapter overwrites it with the scheduler's
+    # request finish), so it must follow the request, not last_chunk.
+    request_terminal = finished
+    # MRv2 materializes sampled ids before publishing this payload. A
+    # resumable request is still alive at codec EOS; flush the segment using
+    # its confirmed host-side token rather than closing on every turn_end row.
+    if native_duplex:
+        stop_ids = getattr(getattr(request, "sampling_params", None), "stop_token_ids", ()) or ()
+        finished = finished or any(token in stop_ids for token in getattr(request, "sampled_token_ids", ()))
+    if finished and condition_key is not None:
+        record["last_closed_condition"] = condition_key
     chunk_frames, left_context_frames = _codec_config(transfer_manager)
+    # One window size for every payload. A separate smaller first window
+    # (initial_codec_chunk_frames) used to shorten the first payload, but with
+    # the steady window itself at 25 frames it only added a seam.
     flush_pending = finished
     last_chunk = bool(flush_pending and (not native_duplex or turn_end))
     if not flush_pending and len(pending) < chunk_frames:
@@ -413,7 +482,7 @@ def tts2code2wav_async_chunk(
             left_context_size=len(context),
             last_chunk=last_chunk,
             stream_finished=finished_tensor,
-            finished=finished_tensor,
+            finished=torch.tensor(request_terminal, dtype=torch.bool) if native_duplex else finished_tensor,
             is_segment_finished=finished_tensor,
             req_id=[request_id],
             duplex_epoch=duplex_epoch,
@@ -958,8 +1027,16 @@ def llm2tts(
             unit_start = 0
             while unit_start < len(out_ids) and out_ids[unit_start] == listen_id:
                 unit_start += 1
-            if tts_bos_idx is not None:
-                out_start = max(unit_start, tts_bos_idx - prompt_token_ids_len)
+            # Only the unit's opening decision (or a boundary folded as the last
+            # prompt token) starts the slice. The policy also rewrites a mid-unit
+            # <|listen|> into <|tts_bos|>; like the official loop, that token is
+            # fed and handed to the Talker with the text before it, not used as
+            # a new start that would drop the unit's earlier words.
+            folded_boundary = (
+                unit_start == 0 and prompt_token_ids_len > 0 and full_token_ids[prompt_token_ids_len - 1] == tts_bos_id
+            )
+            if folded_boundary:
+                out_start = 0
             elif unit_start < len(out_ids) and out_ids[unit_start] not in tts_end_ids:
                 out_start = unit_start + 1
             else:
@@ -1046,8 +1123,12 @@ def llm2tts(
             if not handoff_ids:
                 continue
         set_tts_handoff(model_intermediate_buffer, handoff_ids, handoff_hidden)
-        if native_turn_end_handoff:
-            model_intermediate_buffer.setdefault("meta", {})["turn_end"] = True
+        if is_native_duplex_handoff:
+            # Always write the flag: the connector merges per-request meta across
+            # units, so a turn_end=True left by the previous turn's last unit would
+            # otherwise stick and give every later unit the multi-unit turn-end
+            # Talker budget (speech overruns each 1 s unit and repeats words).
+            model_intermediate_buffer.setdefault("meta", {})["turn_end"] = native_turn_end_handoff
 
         condition_sequence_state = None
         condition_sequence_value = None
@@ -1113,3 +1194,50 @@ def llm2tts(
                     duplex_state["model_turn_id"] = current_model_turn_id + 1
 
     return tts_inputs
+
+
+def _update_native_talker_prompt(model_config: Any, session: Any, payload: dict[str, Any]) -> bool | None:
+    """Apply the existing Talker window recipe without a V1 transfer adapter.
+
+    Sender-only MRv2 stages receive conditions through StreamingUpdate.
+    The request already owns the previous condition metadata and confirmed
+    codec ledger, so no parallel request registry is needed.
+    """
+    from vllm_omni.distributed.omni_connectors.adapter import construct_next_stage_streaming_input_prompt
+    from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import (
+        _resolve_talker_streaming_prompt_config,
+    )
+
+    limit, previous_chunks, on_capacity = _resolve_talker_streaming_prompt_config(model_config)
+    if previous_chunks != 1 or payload.get("native_duplex") is not True:
+        return None
+    previous_info = getattr(session, "model_intermediate_buffer", None) or {}
+    previous = previous_info.get("meta", {})
+    meta = payload["meta"]
+    previous_seq, seq = previous.get("streaming_condition_seq"), meta.get("streaming_condition_seq")
+    if (
+        not isinstance(previous_seq, int)
+        or isinstance(previous_seq, bool)
+        or not isinstance(seq, int)
+        or isinstance(seq, bool)
+        or seq != previous_seq + 1
+    ):
+        raise ValueError("native Talker streaming_condition_seq must advance by one")
+    # Carry only confirmed codec ids, never the uncomputed sampled EOS.
+    # This also seeds the MRv2 16-code penalty after a new condition.
+    payload.setdefault("ids", {})["streaming_prompt_previous_codes"] = list(
+        session._all_token_ids[session.num_prompt_tokens : session.num_computed_tokens]
+    )
+    return construct_next_stage_streaming_input_prompt(
+        payload,
+        session,
+        max_model_len=limit,
+        previous_condition_len=previous.get("next_stage_prompt_len"),
+        previous_condition_seq=previous_seq,
+        condition_seq=seq,
+        recompute_previous_chunks=previous_chunks,
+        recompute_on_capacity=on_capacity,
+    )
+
+
+setattr(tts2code2wav_async_chunk, "update_streaming_prompt_for_condition", _update_native_talker_prompt)

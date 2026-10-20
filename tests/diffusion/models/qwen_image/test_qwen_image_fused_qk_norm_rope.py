@@ -9,6 +9,7 @@ import pytest
 import torch
 import torch.nn as nn
 
+from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 from vllm_omni.diffusion.models.qwen_image import qwen_image_transformer as qwen_mod
 from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
@@ -118,7 +119,7 @@ def force_always_fuse(monkeypatch):
     monkeypatch.setattr(qwen_mod, "_FUSED_MIN_TOKENS", 0)
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_qwen_image_qk_norm_rope_cuda_fp32_fallback_matches_reference():
     data = _make_input(
@@ -135,7 +136,7 @@ def test_qwen_image_qk_norm_rope_cuda_fp32_fallback_matches_reference():
     torch.testing.assert_close(actual_k, expected_k, atol=1e-5, rtol=1e-5)
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_qwen_image_qk_norm_rope_cuda_fp16_fallback_matches_reference():
     data = _make_input(
@@ -152,7 +153,7 @@ def test_qwen_image_qk_norm_rope_cuda_fp16_fallback_matches_reference():
     torch.testing.assert_close(actual_k, expected_k, atol=1e-3, rtol=1e-3)
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("seq_len", [1, 7, 257, 1024])
 @pytest.mark.parametrize("packed_qkv_view", [False, True])
@@ -175,7 +176,7 @@ def test_qwen_image_fused_qk_norm_rope_cuda_matches_fp32_rope_reference(
     torch.testing.assert_close(actual_k, expected_k, atol=0.0625, rtol=0.02)
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_qwen_image_fused_qk_norm_rope_torch_compile_fullgraph_capture(force_always_fuse):
     data = _make_input(
@@ -209,7 +210,7 @@ def test_qwen_image_fused_qk_norm_rope_torch_compile_fullgraph_capture(force_alw
     torch.testing.assert_close(actual_k, expected_k, atol=0.0625, rtol=0.02)
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_qwen_image_short_seq_default_gate_uses_eager_path(monkeypatch):
     """Below _FUSED_MIN_TOKENS the helper must stay on the eager chain (#7780)."""
@@ -230,7 +231,7 @@ def test_qwen_image_short_seq_default_gate_uses_eager_path(monkeypatch):
     torch.testing.assert_close(actual_k, expected_k, atol=0, rtol=0)
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_qwen_image_above_gate_uses_fused_path(monkeypatch):
     monkeypatch.delenv(MIN_TOKENS_ENV, raising=False)

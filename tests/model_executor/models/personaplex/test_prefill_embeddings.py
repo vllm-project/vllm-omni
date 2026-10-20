@@ -5,6 +5,7 @@ import pytest
 import torch
 from torch import nn
 
+from tests.helpers.mark import hardware_marks
 from vllm_omni.model_executor.models.personaplex.configuration_personaplex import PersonaPlexConfig
 from vllm_omni.model_executor.models.personaplex.personaplex_embeddings import PersonaPlexInputEmbeddings
 from vllm_omni.model_executor.models.personaplex.personaplex_talker import PersonaPlexTalkerForConditionalGeneration
@@ -61,7 +62,12 @@ def _reference_prefill(
     return torch.cat(rows, dim=0)
 
 
-@pytest.fixture(params=[pytest.param("cpu", marks=pytest.mark.cpu), pytest.param("cuda", marks=pytest.mark.cuda)])
+@pytest.fixture(
+    params=[
+        pytest.param("cpu", marks=pytest.mark.cpu),
+        pytest.param("cuda", marks=hardware_marks(res={"cuda": "L4"}, num_cards=1)),
+    ]
+)
 def device(request):
     if request.param == "cuda" and not torch.cuda.is_available():
         pytest.skip("CUDA PyTorch and a visible GPU are required")

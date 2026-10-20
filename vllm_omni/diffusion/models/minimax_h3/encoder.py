@@ -118,10 +118,9 @@ class MiniMaxH3Qwen3VLVocabParallelEmbedding(nn.Module):
         start_idx = self._tp_rank * self.num_embeddings_per_partition
         end_idx = start_idx + self.num_embeddings_per_partition
         input_mask = (input_ < start_idx) | (input_ >= end_idx)
-        masked_input = input_.clone() - start_idx
-        masked_input[input_mask] = 0
+        masked_input = torch.where(input_mask, torch.zeros_like(input_), input_ - start_idx)
         output = F.embedding(masked_input, self.weight)
-        output[input_mask, :] = 0.0
+        output = output.masked_fill(input_mask.unsqueeze(-1), 0.0)
         self.group.all_reduce(output)
         return output
 
@@ -448,9 +447,14 @@ class MiniMaxH3Qwen3VLTextRotaryEmbedding(nn.Module):
         inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2, dtype=torch.int64).float() / self.dim))
         return inv_freq.to(device)
 
-    def forward(self, x: torch.Tensor, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self, x: torch.Tensor, position_ids: torch.Tensor, *, inv_freq: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         # position_ids: (3, 1, seq)
-        inv_freq = self._get_inv_freq(position_ids.device)
+        if inv_freq is None:
+            inv_freq = self._get_inv_freq(position_ids.device)
+        elif inv_freq.dtype != torch.float32 or inv_freq.device != position_ids.device:
+            raise ValueError("prepared rotary inverse frequencies must be float32 on the positions device")
         inv_freq_expanded = inv_freq[None, None, :, None].float().expand(3, position_ids.shape[1], -1, 1)
         position_ids_expanded = position_ids[:, :, None, :].float()
         freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(2, 3)
@@ -975,9 +979,10 @@ class MiniMaxH3Qwen3VLTextModel(nn.Module):
         *,
         visual_pos_masks: torch.Tensor | None = None,
         deepstack_visual_embeds: list[torch.Tensor] | None = None,
+        rotary_inv_freq: torch.Tensor | None = None,
     ) -> torch.Tensor:
         hidden_states = inputs_embeds
-        position_embeddings = self.rotary_emb(hidden_states, positions)
+        position_embeddings = self.rotary_emb(hidden_states, positions, inv_freq=rotary_inv_freq)
         for layer_idx, decoder_layer in enumerate(self.layers):
             hidden_states = decoder_layer(hidden_states, position_embeddings=position_embeddings)
             if deepstack_visual_embeds is not None and layer_idx in range(len(deepstack_visual_embeds)):

@@ -6,12 +6,14 @@ from __future__ import annotations
 import json
 import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, TypeVar
 from uuid import uuid4
 
 from openai.types import realtime as types
+from pydantic import BaseModel
 
 MAX_HISTORY_BYTES = 64 * 1024 * 1024
+_ModelT = TypeVar("_ModelT", bound=BaseModel)
 
 
 class HistoryLimitError(ValueError):
@@ -57,13 +59,15 @@ def _default_config() -> types.RealtimeSessionCreateRequest:
     )
 
 
-def _deep_merge(base: dict[str, Any], update: dict[str, Any]) -> dict[str, Any]:
-    merged = base.copy()
-    for key, value in update.items():
-        if isinstance(value, dict) and isinstance(merged.get(key), dict):
-            merged[key] = _deep_merge(merged[key], value)
-        else:
-            merged[key] = value
+def _merge_config_models(base: _ModelT, update: BaseModel) -> _ModelT:
+    """Apply only explicitly set fields from one Pydantic model to another."""
+    merged = base.model_copy(deep=True)
+    for field_name in update.model_fields_set:
+        value = getattr(update, field_name)
+        current_value = getattr(merged, field_name, None)
+        if isinstance(current_value, BaseModel) and isinstance(value, BaseModel) and type(current_value) is type(value):
+            value = _merge_config_models(current_value, value)
+        setattr(merged, field_name, value)
     return merged
 
 
@@ -72,9 +76,7 @@ def merge_session_config(
     update: types.RealtimeSessionCreateRequest,
 ) -> types.RealtimeSessionCreateRequest:
     # Explicit nulls in a partial session.update must overwrite current values.
-    base = current.model_dump()
-    patch = update.model_dump(exclude_unset=True)
-    return types.RealtimeSessionCreateRequest.model_validate(_deep_merge(base, patch))
+    return _merge_config_models(current, update)
 
 
 @dataclass

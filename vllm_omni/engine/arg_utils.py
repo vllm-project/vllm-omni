@@ -20,6 +20,16 @@ from vllm_omni.worker.omni_connector_validation import validate_worker_omni_conn
 
 logger = init_logger(__name__)
 
+# Stage ids are non-negative, so this filter never matches a stage id; it must never be used as an index.
+# We use this as a sentinel value for --stage-id none to indicate all stages should be launched remotely.
+FRONTEND_ONLY_ID_FILTER = -1
+
+
+def is_frontend_only(single_stage_id_filter: int | None) -> bool:
+    """Return whether the stage filter asks the head to launch no local stage."""
+    return single_stage_id_filter == FRONTEND_ONLY_ID_FILTER
+
+
 # Maps model architecture names to their HuggingFace model_type values.
 # Used when auto-injecting hf_overrides for models with missing config.json.
 _ARCH_TO_MODEL_TYPE: dict[str, str] = {
@@ -553,6 +563,7 @@ class OrchestratorArgs:
 
     # === Observability ===
     log_stats: bool = False
+    collect_stage_metrics: bool = True
     enable_orch_monitor: bool = False
 
     # === Headless Mode (also forwarded to engine — see SHARED_FIELDS) ===
@@ -597,6 +608,7 @@ class OrchestratorArgs:
     vae_use_slicing: bool = False
     vae_use_tiling: bool = False
     vae_fast_path: str = "lossless"
+    vae_encode_fast_path: str = "lossless"
     enable_multithread_weight_load: bool = True
     enable_broadcast_weight_load: bool = False
     num_weight_load_threads: int = 4
@@ -624,7 +636,6 @@ class OrchestratorArgs:
     tts_max_instructions_length: int | None = None
     enable_diffusion_pipeline_profiler: bool = False
     enable_ar_profiler: bool = False
-    auxiliary_text_encoder: str | None = None
     log_file: str | None = None
     replica_id: int | None = None
     omni_replica_address: str | None = None

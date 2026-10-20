@@ -5,6 +5,7 @@ import pytest
 import torch
 from vllm.triton_utils import HAS_TRITON
 
+from tests.helpers.mark import hardware_marks, hardware_test
 from vllm_omni.model_executor.models.common.ming.audio_dsp import ISTFT
 
 pytestmark = [pytest.mark.core_model, pytest.mark.tts]
@@ -24,7 +25,7 @@ def _assert_outputs_close(actual, expected):
 
 
 @cuda
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("hop", [4, 320, 882])
 @pytest.mark.parametrize("window_dtype", [torch.float32, torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("batch,frames", [(1, 2), (1, 25), (3, 7), (2, 100)])
@@ -53,7 +54,7 @@ def test_fused_istft_matches_native(hop, window_dtype, batch, frames, mode, monk
 
 
 @cuda
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("hop", [320, 882])
 @pytest.mark.parametrize("window_dtype", [torch.float32, torch.bfloat16, torch.float16])
 @torch.inference_mode()
@@ -82,7 +83,7 @@ def test_fused_istft_streaming_state(hop, window_dtype):
 
 
 @cuda
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("invalid", [False, True])
 @torch.inference_mode()
 def test_fused_istft_silence_and_invalid_envelope(invalid):
@@ -100,7 +101,10 @@ def test_fused_istft_silence_and_invalid_envelope(invalid):
 
 @pytest.mark.parametrize(
     "device",
-    [pytest.param("cpu", marks=pytest.mark.cpu), pytest.param("cuda", marks=[pytest.mark.cuda, cuda])],
+    [
+        pytest.param("cpu", marks=pytest.mark.cpu),
+        pytest.param("cuda", marks=[*hardware_marks(res={"cuda": "L4"}, num_cards=1), cuda]),
+    ],
 )
 @pytest.mark.parametrize("padding", ["same", "center"])
 def test_istft_autograd_fallback(padding, device, monkeypatch):
@@ -127,7 +131,7 @@ def test_istft_autograd_fallback(padding, device, monkeypatch):
 
 
 @cuda
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize(
     "n_fft,hop,frames,dtype", [(32, 8, 1, torch.complex64), (30, 10, 7, torch.complex64), (32, 8, 7, torch.complex128)]
 )

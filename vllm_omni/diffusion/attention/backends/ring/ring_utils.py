@@ -8,6 +8,8 @@ from typing import Literal
 import torch
 import torch.nn.functional as F
 
+from vllm_omni.diffusion.attention.backends.ring.fused_merge import try_fused_ring_merge
+
 LseLayout = Literal["bhs", "bsh"]
 
 __all__ = [
@@ -84,8 +86,9 @@ def _update_out_and_lse(
     block_out: torch.Tensor,
     block_lse: torch.Tensor,
     lse_layout: LseLayout,
+    *,
+    use_fused_merge: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    block_out = block_out.to(torch.float32)
     if out.shape != block_out.shape:
         raise ValueError(
             f"Ring attention block output shape {tuple(block_out.shape)} does not match "
@@ -98,6 +101,12 @@ def _update_out_and_lse(
             f"accumulated LSE shape {tuple(lse.shape)}."
         )
 
+    if use_fused_merge:
+        fused = try_fused_ring_merge(out, lse, block_out, block_lse)
+        if fused is not None:
+            return fused
+
+    block_out = block_out.to(torch.float32)
     out = out - F.sigmoid(block_lse - lse) * (out - block_out)
     lse = lse - F.logsigmoid(lse - block_lse)
 
@@ -112,6 +121,7 @@ def update_out_and_lse(
     slice_=None,
     *,
     lse_layout: LseLayout,
+    use_fused_merge: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if out is None:
         if slice_ is not None:
@@ -121,11 +131,15 @@ def update_out_and_lse(
         lse = _normalize_lse(block_lse, out, lse_layout)
 
     elif slice_ is not None:
+        assert lse is not None
         slice_out, slice_lse = out[slice_], lse[slice_]
-        slice_out, slice_lse = _update_out_and_lse(slice_out, slice_lse, block_out, block_lse, lse_layout)
+        slice_out, slice_lse = _update_out_and_lse(
+            slice_out, slice_lse, block_out, block_lse, lse_layout, use_fused_merge=use_fused_merge
+        )
         out[slice_], lse[slice_] = slice_out, slice_lse
     else:
-        out, lse = _update_out_and_lse(out, lse, block_out, block_lse, lse_layout)
+        assert lse is not None
+        out, lse = _update_out_and_lse(out, lse, block_out, block_lse, lse_layout, use_fused_merge=use_fused_merge)
     return out, lse
 
 

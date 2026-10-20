@@ -8,7 +8,7 @@ import threading
 from collections.abc import Callable
 from contextlib import AbstractContextManager, ExitStack, contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeGuard
 
 import pytest
 
@@ -152,17 +152,17 @@ def _start_judge_server(judge_params: dict[str, object]):
     if not isinstance(extra, list | tuple):
         raise TypeError("judge_server_params.extra_cli_args must be a list")
     visible = _resolve_judge_cuda_visible_devices(judge_params.get("cuda_visible_devices", "1"))
-    print(f"Starting OmniInteract judge with model: {model} on CUDA_VISIBLE_DEVICES={visible}")
+    print(f"Starting benchmark judge with model: {model} on CUDA_VISIBLE_DEVICES={visible}")
     with OmniServer(
         model,
         [str(item) for item in extra],
         use_omni=bool(judge_params.get("use_omni", False)),
         env_dict={"CUDA_VISIBLE_DEVICES": visible},
     ) as judge:
-        print(f"OmniInteract judge started on {judge.host}:{judge.port}")
+        print(f"Benchmark judge started on {judge.host}:{judge.port}")
         yield judge
-        print("OmniInteract judge stopping...")
-    print("OmniInteract judge stopped")
+        print("Benchmark judge stopping...")
+    print("Benchmark judge stopped")
 
 
 # OmniServer defaults for flags not already present in JSON ``serve_args`` /
@@ -362,7 +362,7 @@ def _assert_fixed_stage_workloads(result: dict[str, Any], params: dict[str, Any]
     print(f"Fixed stage workload OK: {num_prompts} requests, num_tokens_out {stages}")
 
 
-def _is_finite_number(value: object) -> bool:
+def _is_finite_number(value: object) -> TypeGuard[int | float]:
     return isinstance(value, int | float) and not isinstance(value, bool) and math.isfinite(value)
 
 
@@ -476,9 +476,37 @@ def _maybe_assert_aggregate_ia_qtf1(params: dict[str, object], acc_summary: dict
     assert ia_qtf1 >= float(min_ia_qtf1), f"OmniInteract aggregate All Global IA-QTF1 {ia_qtf1} is below {min_ia_qtf1}"
 
 
+def _assert_duplex_eval_result(result: dict, params: dict, num_prompt: int) -> None:
+    summary = result.get("omni_duplex_eval")
+    assert isinstance(summary, dict), "Omni-DuplexEval summary is missing"
+    assert summary.get("published") == num_prompt, "Omni-DuplexEval artifacts are incomplete"
+    assert summary.get("artifact_errors") == [], "Omni-DuplexEval artifact publication failed"
+    assert summary.get("published_with_unfinished_responses") == 0, "Omni-DuplexEval responses are unfinished"
+    sessions = result.get("duplex_session_metrics")
+    assert isinstance(sessions, list) and len(sessions) == num_prompt, "Omni-DuplexEval session metrics are missing"
+    for session in sessions:
+        for name in ("client_ttft_ms", "client_ttfp_ms"):
+            metric = session.get(name, {})
+            assert metric.get("count", 0) > 0 and _is_finite_number(metric.get("mean")), (
+                f"Omni-DuplexEval session has no measured {name}"
+            )
+    if params.get("duplex_eval_evaluate"):
+        accuracy = summary.get("accuracy")
+        assert isinstance(accuracy, dict), "Omni-DuplexEval accuracy is missing"
+        assert accuracy.get("status") == "completed", "Omni-DuplexEval accuracy did not complete"
+        assert (accuracy.get("total"), accuracy.get("evaluated"), accuracy.get("failed"), accuracy.get("skipped")) == (
+            num_prompt,
+            num_prompt,
+            0,
+            0,
+        ), "Omni-DuplexEval accuracy coverage is incomplete"
+
+
 def assert_result(result, params, num_prompt) -> None:
     assert result["completed"] == num_prompt, "Request failures exist"
     _assert_fixed_stage_workloads(result, params, num_prompt)
+    if params.get("dataset_name") == "omni-duplex-eval":
+        _assert_duplex_eval_result(result, params, num_prompt)
     if params.get("dataset_name") == "omniinteract":
         summary = result.get("omniinteract")
         assert isinstance(summary, dict), "OmniInteract summary is missing"
@@ -540,11 +568,12 @@ def test_performance_benchmark(omni_server, benchmark_params):
     test_name = benchmark_params["test_name"]
     params = dict(benchmark_params["params"])
     dataset_name = params.get("dataset_name", "")
-    if params.get("omniinteract_evaluate"):
-        judge_base_url = getattr(omni_server, "judge_base_url", None)
-        if not isinstance(judge_base_url, str) or not judge_base_url:
-            raise ValueError("omniinteract_evaluate requires top-level judge_server_params to start a judge")
-        params["omniinteract_judge_base_url"] = judge_base_url
+    for dataset_prefix in ("omniinteract", "duplex_eval"):
+        if params.get(f"{dataset_prefix}_evaluate"):
+            judge_base_url = getattr(omni_server, "judge_base_url", None)
+            if not isinstance(judge_base_url, str) or not judge_base_url:
+                raise ValueError(f"{dataset_prefix}_evaluate requires top-level judge_server_params to start a judge")
+            params[f"{dataset_prefix}_judge_base_url"] = judge_base_url
 
     host = omni_server.host
     port = omni_server.port
