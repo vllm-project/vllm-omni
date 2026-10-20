@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """PD (Prefill-Decode) disaggregation helpers.
 
 Mixin for OmniBase — keeps omni.py focused on orchestration.
@@ -7,15 +7,33 @@ Mixin for OmniBase — keeps omni.py focused on orchestration.
 
 import logging
 import threading
+from collections.abc import Mapping
 from dataclasses import asdict, is_dataclass
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from vllm import SamplingParams
 
-_DEFAULT_MOONCAKE_BOOTSTRAP_PORT = 25201
+# vLLM's VLLM_MOONCAKE_BOOTSTRAP_PORT default, also the stage runtime's default
+# for kv_connector_extra_config.bootstrap_port.
+_DEFAULT_MOONCAKE_BOOTSTRAP_PORT = 8998
 
 logger = logging.getLogger(__name__)
+
+
+def mooncake_prefill_bootstrap_addr(kv_cfg: Mapping[str, Any], replica_id: int = 0) -> str | None:
+    """Bootstrap URL of a MooncakeConnector prefill replica, or ``None``.
+
+    Mirrors ``StageRuntime._prepare_replica_vllm_config``: replica ``r`` of a
+    Mooncake ``kv_producer`` listens on
+    ``kv_connector_extra_config.bootstrap_port`` (default 8998) + ``r``.
+    """
+    if kv_cfg.get("kv_connector") != "MooncakeConnector":
+        return None
+    extra = kv_cfg.get("kv_connector_extra_config") or {}
+    port = int(extra.get("bootstrap_port", _DEFAULT_MOONCAKE_BOOTSTRAP_PORT)) + replica_id
+    host = kv_cfg.get("kv_ip") or "127.0.0.1"
+    return f"http://{host}:{port}"
 
 
 class PDDisaggregationMixin:
@@ -225,19 +243,16 @@ class PDDisaggregationMixin:
         kv_cfg_dict = self._kv_cfg_to_dict(kv_cfg)
         if not kv_cfg_dict:
             return None
-
-        kv_connector = str(kv_cfg_dict.get("kv_connector", "") or "")
-        extra_cfg = kv_cfg_dict.get("kv_connector_extra_config", {}) or {}
-        if not isinstance(extra_cfg, dict):
-            extra_cfg = self._kv_cfg_to_dict(extra_cfg)
+        extra_cfg = kv_cfg_dict.get("kv_connector_extra_config")
+        if extra_cfg is not None and not isinstance(extra_cfg, dict):
+            kv_cfg_dict = {**kv_cfg_dict, "kv_connector_extra_config": self._kv_cfg_to_dict(extra_cfg)}
 
         info: dict[str, Any] = {}
-
-        if "mooncake" in kv_connector.lower():
-            bootstrap_port = extra_cfg.get("mooncake_bootstrap_port", _DEFAULT_MOONCAKE_BOOTSTRAP_PORT)
-            kv_ip = kv_cfg_dict.get("kv_ip") or "127.0.0.1"
-            info["prefill_bootstrap_addr"] = f"{kv_ip}:{bootstrap_port}"
-
+        # Replica 0's address; the orchestrator reads the per-replica value
+        # from the prefill client's KV transfer config.
+        bootstrap_addr = mooncake_prefill_bootstrap_addr(kv_cfg_dict)
+        if bootstrap_addr is not None:
+            info["prefill_bootstrap_addr"] = bootstrap_addr
         return info
 
     def _prepare_prefill_sampling_params(self, req_id: str, sp: "SamplingParams") -> "SamplingParams":

@@ -115,3 +115,68 @@ def test_validation_rejects_typed_stage_without_kv_transfer_config():
 
     with pytest.raises(ValueError, match="no 'kv_transfer_config'"):
         pd._validate_pd_separation_config()
+
+
+def _mooncake_prefill(extra: dict | None = None):
+    kv = {"kv_connector": "MooncakeConnector", "kv_role": "kv_producer", "kv_connector_extra_config": extra or {}}
+    return SimpleNamespace(
+        stage_id=0,
+        pd_role=PDRole.PREFILL,
+        input_sources=[],
+        connector_config=SimpleNamespace(kv_transfer_config=kv),
+        parallel_config=SimpleNamespace(tensor_parallel_size=1),
+    )
+
+
+@pytest.mark.parametrize(
+    ("extra", "expected"),
+    [
+        # Same rule as the stage runtime: bootstrap_port (default 8998) + replica id.
+        ({}, "http://127.0.0.1:8998"),
+        ({"bootstrap_port": 9100, "mooncake_protocol": "tcp"}, "http://127.0.0.1:9100"),
+        # The legacy key, which the stage runtime never reads, is ignored.
+        ({"mooncake_bootstrap_port": 25201}, "http://127.0.0.1:8998"),
+    ],
+)
+def test_connector_info_uses_the_stage_runtime_bootstrap_port(extra, expected):
+    pd = _pd([_mooncake_prefill(extra), _typed_stage(1, PDRole.DECODE, input_sources=(0,))])
+
+    assert pd._get_pd_connector_info() == {"prefill_bootstrap_addr": expected}
+
+
+def test_connector_info_has_no_bootstrap_address_for_mooncake_store():
+    prefill = _mooncake_prefill()
+    prefill.connector_config.kv_transfer_config["kv_connector"] = "MooncakeStoreConnector"
+    pd = _pd([prefill, _typed_stage(1, PDRole.DECODE, input_sources=(0,))])
+
+    assert pd._get_pd_connector_info() == {}
+
+
+def test_engine_reads_the_prefill_replica_bootstrap_address_and_engine_id():
+    """The orchestrator's decode params use the per-replica values the stage
+    runtime publishes on the prefill client's KV transfer config."""
+    from vllm.config import KVTransferConfig
+
+    from vllm_omni.engine.omni_engine_base import OmniEngineBase
+
+    engine = OmniEngineBase.__new__(OmniEngineBase)
+    engine.stage_configs = [
+        _typed_stage(0, PDRole.PREFILL, kv_role="kv_producer"),
+        _typed_stage(1, PDRole.DECODE, input_sources=(0,), kv_role="kv_consumer"),
+    ]
+    prefill_kv = KVTransferConfig(
+        kv_connector="MooncakeConnector",
+        kv_role="kv_producer",
+        engine_id="thinker-s0-r0",
+        kv_connector_extra_config={"bootstrap_port": 9100, "bootstrap_addr": "http://127.0.0.1:9100"},
+    )
+    engine.stage_clients = [
+        SimpleNamespace(vllm_config=SimpleNamespace(kv_transfer_config=prefill_kv)),
+        SimpleNamespace(vllm_config=None),
+    ]
+
+    assert engine._detect_pd_config() == {
+        "pd_pair": (0, 1),
+        "bootstrap_addr": "http://127.0.0.1:9100",
+        "prefill_engine_id": "thinker-s0-r0",
+    }

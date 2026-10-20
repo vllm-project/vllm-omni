@@ -17,7 +17,6 @@ from pathlib import Path
 from typing import Any, cast
 
 import janus
-from vllm import envs as vllm_envs
 from vllm.logger import init_logger
 from vllm.renderers import BaseRenderer
 from vllm.v1.engine.input_processor import InputProcessor
@@ -578,25 +577,32 @@ class OmniEngineBase:
 
     def _detect_pd_config(self) -> dict[str, Any] | None:
         """Detect PD (Prefill-Decode) disaggregation config from stage_configs.
-        Returns a dict with 'pd_pair' and 'bootstrap_addr', or None.
+        Returns a dict with 'pd_pair', 'bootstrap_addr' and 'prefill_engine_id', or None.
+
+        The bootstrap address and engine id come from the prefill client's KV
+        transfer config, where the stage runtime publishes the per-replica
+        values (``bootstrap_port`` + replica id and ``-s{stage}-r{replica}``),
+        as the AR->DiT native KV path reads them.
+        TODO(PD runtime contract): bind them per request to the prefill
+        replica that served it instead of the first replica.
         """
         pd_pair = PDDisaggregationMixin.detect_pd_separation_from_stage_configs(self.stage_configs)
         if pd_pair is None:
             return None
         prefill_idx, decode_idx = pd_pair
 
-        # Extract bootstrap address from prefill stage engine_args
         bootstrap_addr: str | None = None
+        prefill_engine_id: str | None = None
         try:
-            prefill_cfg = self.stage_configs[prefill_idx]
-            ea = getattr(prefill_cfg, "engine_args", None)
-            kv_cfg = getattr(ea, "kv_transfer_config", None) if ea is not None else None
+            prefill_client = self.stage_clients[prefill_idx]
+            kv_cfg = getattr(getattr(prefill_client, "vllm_config", None), "kv_transfer_config", None)
             if kv_cfg is not None:
-                port = vllm_envs.VLLM_MOONCAKE_BOOTSTRAP_PORT
-                kv_ip = getattr(kv_cfg, "kv_ip", None) or "127.0.0.1"
-                bootstrap_addr = f"http://{kv_ip}:{port}"
+                from vllm_omni.diffusion.diffusion_kv.kv_connector import bootstrap_addr_from_kv_transfer_config
+
+                bootstrap_addr = bootstrap_addr_from_kv_transfer_config(kv_cfg)
+                prefill_engine_id = getattr(kv_cfg, "engine_id", None)
         except Exception as exc:
-            logger.warning("[OmniEngine] Could not extract PD bootstrap address: %s", exc)
+            logger.warning("[OmniEngine] Could not read the prefill KV transfer config: %s", exc)
 
         logger.info(
             "[OmniEngine] PD disaggregation detected: prefill=stage-%d, decode=stage-%d, bootstrap=%s",
@@ -604,14 +610,6 @@ class OmniEngineBase:
             decode_idx,
             bootstrap_addr,
         )
-        prefill_engine_id: str | None = None
-        try:
-            prefill_client = self.stage_clients[prefill_idx]
-            kv_cfg = getattr(getattr(prefill_client, "vllm_config", None), "kv_transfer_config", None)
-            prefill_engine_id = getattr(kv_cfg, "engine_id", None)
-        except Exception as exc:
-            logger.warning("[OmniEngine] Could not extract prefill engine_id: %s", exc)
-
         return {
             "pd_pair": (prefill_idx, decode_idx),
             "bootstrap_addr": bootstrap_addr,
