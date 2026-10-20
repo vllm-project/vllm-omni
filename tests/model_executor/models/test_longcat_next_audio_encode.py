@@ -54,9 +54,7 @@ def test_multi_chunk_clips_regroup_to_one_embedding_per_clip():
 def test_no_chunk_counts_keeps_one_embedding_per_chunk():
     model = _model()
 
-    out = LongcatNextForCausalLM._encode_audios(
-        model, torch.zeros(2, 5), torch.tensor([4, 6]), torch.tensor([2, 3])
-    )
+    out = LongcatNextForCausalLM._encode_audios(model, torch.zeros(2, 5), torch.tensor([4, 6]), torch.tensor([2, 3]))
 
     assert len(out) == 2
     assert out[0].shape == (2, HIDDEN)

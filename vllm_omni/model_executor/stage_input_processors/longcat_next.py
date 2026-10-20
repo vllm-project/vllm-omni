@@ -52,10 +52,10 @@ generated ids (see cosyvoice3.text2flow_token_only for the reference shape).
 
 from __future__ import annotations
 
-import re
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+import regex as re
 import torch
 
 from vllm_omni.inputs.data import OmniTokensPrompt
@@ -169,9 +169,7 @@ def _blank_user_turn(prompt: str) -> str:
     return prompt[:body_start] + " " + prompt[body_end:]
 
 
-_IMG_TOKEN_SIZE_TAG_RE = re.compile(
-    r"<longcat_img_token_size>\s*(\d+)\s+(\d+)\s*</longcat_img_token_size>"
-)
+_IMG_TOKEN_SIZE_TAG_RE = re.compile(r"<longcat_img_token_size>\s*(\d+)\s+(\d+)\s*</longcat_img_token_size>")
 
 
 def _int_or_none(value: Any) -> int | None:
