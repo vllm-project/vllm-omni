@@ -7,7 +7,7 @@ Mixin for OmniBase — keeps omni.py focused on orchestration.
 
 import logging
 import threading
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict, is_dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -34,6 +34,31 @@ def mooncake_prefill_bootstrap_addr(kv_cfg: Mapping[str, Any], replica_id: int =
     port = int(extra.get("bootstrap_port", _DEFAULT_MOONCAKE_BOOTSTRAP_PORT)) + replica_id
     host = kv_cfg.get("kv_ip") or "127.0.0.1"
     return f"http://{host}:{port}"
+
+
+def reject_pd_until_runtime_ready(stage_configs: Sequence[Any]) -> None:
+    """Refuse to launch a detected PD pair: its prefill->decode handoff is not implemented.
+
+    The orchestrator needs ``remote_request_id`` from the prefill output, which
+    the pinned MooncakeConnector never returns, so every request would fail at
+    the handoff after both engines loaded; no other connector has been run on
+    this path. Each launch path calls this right after its stage configs are
+    resolved, before it launches any stage: ``OmniEngineBase.__init__``
+    (``Omni``/``AsyncOmni`` and ``vllm serve`` with one API server), the
+    ``--api-server-count`` > 1 parent in ``_build_multi_api_stage_runtime`` and
+    ``run_headless``.
+    """
+    # TODO: remove once the PD runtime handoff lands (Mooncake transfer_id
+    # contract, decode request rebuilt from the processed prefill request),
+    # tracked in https://github.com/vllm-project/vllm-omni/pull/2947.
+    pair = PDDisaggregationMixin.detect_pd_separation_from_stage_configs(list(stage_configs))
+    if pair is None:
+        return
+    raise NotImplementedError(
+        f"Stages declared with pd_role form a PD pair (prefill stage {pair[0]}, decode stage {pair[1]}), "
+        "but PD disaggregation cannot run yet: the prefill->decode KV handoff is not implemented, so "
+        "requests would fail at the handoff. Remove pd_role from these stages to launch the pipeline."
+    )
 
 
 class PDDisaggregationMixin:

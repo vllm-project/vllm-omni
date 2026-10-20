@@ -3,8 +3,11 @@
 !!! warning "Experimental design reference"
     PD disaggregation is only partially integrated on the current `main` branch.
     The runtime contains PD detection and routing scaffolding, but there is no
-    supported deploy overlay or end-to-end validated launch recipe yet. Treat this
-    page as a description of the current design, not as production guidance.
+    supported deploy overlay or end-to-end validated launch recipe yet. Until the
+    prefill-to-decode KV handoff is implemented, every launch path refuses a
+    detected PD pair with a `NotImplementedError` before any stage launches.
+    Treat this page as a description of the current design, not as production
+    guidance.
 
 Prefill-decode disaggregation splits the Qwen3-Omni Thinker into two logical
 stages: a prefill worker that processes the prompt and produces KV cache, and a
@@ -47,9 +50,10 @@ output of Code2Wav.
 
 ### Request lifecycle
 
-1. At startup, PD detection looks for one stage marked `is_prefill_only` and
-   one downstream stage marked `is_decode_only`. The decode stage must list the
-   prefill stage as an input source.
+1. At startup, PD detection looks for one stage whose `pd_role` is `prefill`
+   and one downstream stage whose `pd_role` is `decode` (hand-built configs may
+   still use the `is_prefill_only` / `is_decode_only` markers). The decode stage
+   must list the prefill stage as an input source.
 2. The orchestrator clones the Thinker sampling parameters for prefill, forces
    `max_tokens=1`, clears stop conditions, and sets producer-side
    `kv_transfer_params`. This makes prefill finish by length after exporting KV.
@@ -95,7 +99,7 @@ fails during engine initialization.
 | --- | --- |
 | Pair detection and topology validation | Implemented in the shared PD helper |
 | Prefill sampling preparation | Implemented for sync and async entrypoints |
-| Prefill-to-decode routing | Implemented in the current Orchestrator |
+| Prefill-to-decode routing | Scaffolding in the current Orchestrator; unreachable while startup refuses PD pairs |
 | Deploy-based configuration | Not yet migrated; the supported `stages:` deploy schema cannot currently expand Qwen3-Omni into the four-stage PD topology |
 | Qwen3 Thinker-to-Talker handoff | Bridge state and embedding-merge helpers exist, but the merge is not wired into the live stage processor |
 | Connector compatibility | Incomplete; the Orchestrator currently requires `remote_request_id`, while the pinned Mooncake connector completes prefill without returning that metadata |
@@ -134,6 +138,8 @@ for decode, and one for the two downstream audio stages.
   [`PDDisaggregationMixin`](gh-file:vllm_omni/entrypoints/pd_utils.py)
 - startup detection and connector metadata:
   [`AsyncOmniEngine`](gh-file:vllm_omni/engine/async_omni_engine.py)
+- the startup guard that refuses PD pairs for now: `reject_pd_until_runtime_ready`
+  in [`pd_utils.py`](gh-file:vllm_omni/entrypoints/pd_utils.py)
 - request-scoped prefill-to-decode routing:
   [`Orchestrator`](gh-file:vllm_omni/engine/orchestrator.py)
 - Qwen3 downstream conditioning helpers:

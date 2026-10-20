@@ -61,7 +61,7 @@ from vllm_omni.engine.stage_runtime import (
     StageRuntimeInfo,
     create_stage_runtime,
 )
-from vllm_omni.entrypoints.pd_utils import PDDisaggregationMixin
+from vllm_omni.entrypoints.pd_utils import PDDisaggregationMixin, reject_pd_until_runtime_ready
 from vllm_omni.entrypoints.utils import prepare_stage_config_inputs
 from vllm_omni.inputs.data import OmniSamplingParams
 from vllm_omni.inputs.preprocess import build_omni_renderer
@@ -270,6 +270,7 @@ class OmniEngineBase:
             kwargs,
             trust_remote_code=trust_remote_code,
         )
+        reject_pd_until_runtime_ready(self.stage_configs)
 
         if self._single_stage_id_filter is not None:
             self._validate_single_stage_choice(self._single_stage_id_filter, self.stage_configs)

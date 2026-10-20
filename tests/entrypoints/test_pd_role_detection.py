@@ -180,3 +180,40 @@ def test_engine_reads_the_prefill_replica_bootstrap_address_and_engine_id():
         "bootstrap_addr": "http://127.0.0.1:9100",
         "prefill_engine_id": "thinker-s0-r0",
     }
+
+
+class _PastThePDGuardError(Exception):
+    """Raised by the first engine init step that runs after the PD guard."""
+
+
+def _init_engine_up_to_runtime_config(monkeypatch, stages) -> None:
+    from vllm_omni.engine import omni_engine_base
+    from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
+
+    def _past_the_guard(*_args):
+        raise _PastThePDGuardError
+
+    engine = object.__new__(AsyncOmniEngine)
+    monkeypatch.setattr(omni_engine_base.StageConfigFactory, "get_pipeline_config", lambda *a, **k: None)
+    monkeypatch.setattr(engine, "_resolve_stage_configs", lambda *a, **k: (None, stages))
+    monkeypatch.setattr(engine, "_set_pipeline_runtime_config", _past_the_guard)
+    engine.__init__("test-model")
+
+
+def test_engine_refuses_a_pd_pair_before_any_stage_launches(monkeypatch):
+    """Until the prefill->decode KV handoff lands, a detected PD pair would fail
+    every request at the handoff, so the engine stops right after config resolution."""
+    stages = [
+        _typed_stage(0, PDRole.PREFILL, kv_role="kv_producer"),
+        _typed_stage(1, PDRole.DECODE, input_sources=(0,), kv_role="kv_consumer"),
+    ]
+
+    with pytest.raises(NotImplementedError, match=r"prefill stage 0, decode stage 1.*KV handoff"):
+        _init_engine_up_to_runtime_config(monkeypatch, stages)
+
+
+def test_engine_init_continues_without_a_pd_pair(monkeypatch):
+    stages = [_typed_stage(0, None), _typed_stage(1, None, input_sources=(0,))]
+
+    with pytest.raises(_PastThePDGuardError):
+        _init_engine_up_to_runtime_config(monkeypatch, stages)
