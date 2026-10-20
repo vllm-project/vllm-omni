@@ -1330,6 +1330,7 @@ async def test_multistage_app_state_key_snapshot(monkeypatch, mocker, tmp_path, 
     class _FakeSpeech(_FakeCtor):
         def __init__(self, *args, **kwargs):
             speech_kwargs.update(kwargs)
+
         _tts_model_type = "ming3_audio_tts" if ming3 == "tts" else None
 
         async def warmup(self):
