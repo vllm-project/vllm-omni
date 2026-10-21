@@ -27,6 +27,10 @@ from vllm.model_executor.layers.quantization.base_config import (
 )
 from vllm.transformers_utils.repo_utils import get_model_path
 
+from vllm_omni.diffusion.attention.backends.trtllm_calibration import (
+    collect_calibration_specs,
+    propagate_skip_softmax_calibration,
+)
 from vllm_omni.diffusion.attention.schedule import (
     AttentionSchedule,
     parse_attention_schedule,
@@ -1576,19 +1580,11 @@ class OmniDiffusionConfig:
         self._propagate_skip_softmax_calibration(tf_config)
 
     def _propagate_skip_softmax_calibration(self, tf_config: "TransformerConfig") -> None:
-        from vllm_omni.diffusion.attention.backends.trtllm_calibration import (
-            collect_calibration_specs,
-            propagate_skip_softmax_calibration,
-        )
-
         cfg = getattr(self, "diffusion_attention_config", None)
-        schedule = getattr(self, "diffusion_attention_schedule", None)
-        # One shared rule for which specs can carry calibration - the baseline plus every
-        # schedule profile - so a profile the service default never references cannot keep an
-        # undetected target_sparsity-without-calibration gap. The loader's calibration discovery
-        # calls the same helper. No schedule -> specs are exactly the baseline specs.
+        # The baseline plus every schedule profile, so a profile the service default never
+        # references still has its calibration discovered. The loader uses the same helper.
         baseline = cfg if isinstance(cfg, AttentionConfig) else None
-        specs: list[AttentionSpec] = collect_calibration_specs(baseline, schedule)
+        specs = collect_calibration_specs(baseline, getattr(self, "diffusion_attention_schedule", None))
         if not specs:
             return
 

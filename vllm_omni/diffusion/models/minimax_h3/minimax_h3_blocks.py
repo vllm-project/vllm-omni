@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -95,14 +95,6 @@ def _attention_isolates_packed_requests(attention_layer: Any, backend: Any = Non
     if backend is None or not backend.supports_multi_doc_packed_varlen():
         return False
     return not _ring_sequence_parallel_is_active(attention_layer)
-
-
-def _effective_attention_backend(attention_layer: Any) -> Any:
-    """Backend this forward runs: the scheduled candidate during an active denoise step, else the baseline."""
-    effective_attention = getattr(attention_layer, "effective_attention", None)
-    if effective_attention is None:
-        return getattr(attention_layer, "attn_backend", None)
-    return effective_attention()[1]
 
 
 def _candidate_excludes_packed_padding(record: Any) -> str | None:
@@ -289,13 +281,7 @@ class MiniMaxH3Attention(nn.Module):
         )
         if hasattr(self.to_gate_compress, "weight"):
             nn.init.zeros_(self.to_gate_compress.weight)
-        self.add_schedule_candidate_check(_fasth3_requires_vsa_candidate)
-
-    def add_schedule_candidate_check(self, check: Callable[[Any], str | None]) -> None:
-        """Register a startup check on the inner attention; test doubles without the hook skip it."""
-        add_check = getattr(self.attention, "add_schedule_candidate_check", None)
-        if add_check is not None:
-            add_check(check)
+        self.attention.add_schedule_candidate_check(_fasth3_requires_vsa_candidate)
 
     def _vsa_candidate_needs_gate(self, record: Any) -> str | None:
         """Schedule candidate check: MiniMaxH3VSAImpl routes by H3 segments only when a VSA gate exists.
@@ -307,8 +293,7 @@ class MiniMaxH3Attention(nn.Module):
         """
         if record.backend_cls.get_name() != "FASTVIDEO_VSA" or self.to_gate_compress is not None:
             return None
-        baseline = getattr(self.attention, "attn_backend", None)
-        if baseline is not None and baseline.get_name() == "FASTVIDEO_VSA":
+        if self.attention.attn_backend.get_name() == "FASTVIDEO_VSA":
             return None
         return (
             "this attention has no VSA compression gate, so it never passes vsa_h3_prefix_segments and "
@@ -329,7 +314,7 @@ class MiniMaxH3Attention(nn.Module):
             quant_config=self._gate_quant_config,
             prefix=f"{self._prefix}.vdn",
         )
-        self.add_schedule_candidate_check(_vdn_requires_vdnh3_candidate)
+        self.attention.add_schedule_candidate_check(_vdn_requires_vdnh3_candidate)
 
     def _apply_rope(self, x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
         """Rotate the first rot_dim head dims; pass the rest through.
@@ -398,7 +383,7 @@ class MiniMaxH3Attention(nn.Module):
         # Read once per forward: during an active scheduled denoise step this is
         # the candidate the layer dispatches to, and the packed layout below
         # must match that backend rather than the baseline.
-        backend = _effective_attention_backend(self.attention)
+        backend = self.attention.effective_attention()[1]
         if num_requests > 1:
             if not _attention_isolates_packed_requests(self.attention, backend):
                 backend_name = backend.get_name()
@@ -787,8 +772,8 @@ class MiniMaxH3DiTBlock(nn.Module):
         # padded packed documents and can carry a VSA gate. The token refiner's
         # text rows are unpadded, and FASTVIDEO_VSA falls back to dense SDPA
         # there for the baseline too, so the refiner registers neither check.
-        self.attn.add_schedule_candidate_check(_candidate_excludes_packed_padding)
-        self.attn.add_schedule_candidate_check(self.attn._vsa_candidate_needs_gate)
+        self.attn.attention.add_schedule_candidate_check(_candidate_excludes_packed_padding)
+        self.attn.attention.add_schedule_candidate_check(self.attn._vsa_candidate_needs_gate)
         self.mlp = MiniMaxH3MLP(
             arch,
             quant_config,

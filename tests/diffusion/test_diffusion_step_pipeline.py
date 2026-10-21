@@ -943,12 +943,12 @@ class TestRunner:
         """Without a service schedule, the real forward context carries no schedule during denoise."""
         runner = _make_runner()
         runner.vllm_config = None
-        seen: list[tuple[object, bool]] = []
+        seen: list[object] = []
 
         class _ContextRecordingStepPipeline(_StepPipeline):
             def denoise_step(self, input_batch, **kwargs):
                 ctx = get_forward_context()
-                seen.append((ctx.attention_schedule, ctx.attention_schedule_denoise_active))
+                seen.append(ctx.attention_schedule)
                 return super().denoise_step(input_batch, **kwargs)
 
         runner.pipeline = _ContextRecordingStepPipeline()
@@ -956,7 +956,7 @@ class TestRunner:
         DiffusionModelRunner.execute_stepwise(runner, _make_scheduler_output(_make_step_request(), step_id=0))
         DiffusionModelRunner.execute_stepwise(runner, _make_cached_scheduler_output(step_id=1))
 
-        assert seen == [(None, False), (None, False)]
+        assert seen == [None, None]
         assert "req-1" not in runner.state_cache
         assert is_forward_context_available() is False
 

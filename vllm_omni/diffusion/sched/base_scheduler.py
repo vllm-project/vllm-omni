@@ -15,6 +15,11 @@ from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import RequestStatus
 
+from vllm_omni.diffusion.attention.schedule import (
+    InvalidAttentionScheduleError,
+    parse_attention_schedule,
+    resolve_request_attention_schedule,
+)
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.diffusion_kv.kv_connector import (
@@ -39,6 +44,7 @@ from vllm_omni.diffusion.sched.interface import (
     _AdmissionWaitDecision,
 )
 from vllm_omni.diffusion.worker.utils import BaseRunnerOutput
+from vllm_omni.inputs.data import absorb_attention_schedule_extra_args
 
 logger = init_logger(__name__)
 
@@ -156,20 +162,15 @@ class BaseScheduler(ABC):
         return self._add_request_with_request_id(request.request_id, request)
 
     def _add_request_with_request_id(self, request_id: str, request: OmniDiffusionRequest) -> str:
-        from vllm_omni.diffusion.attention.schedule import (
-            InvalidAttentionScheduleError,
-            validate_request_attention_schedule,
-        )
-        from vllm_omni.inputs.data import absorb_attention_schedule_extra_args
-
         try:
             # A schedule written into extra_args after construction reaches here unabsorbed on the
             # inline stage client, whose clone() does not re-run __post_init__; the subprocess client
             # rebuilds the params and absorbs it. Normalize here so topology cannot change the result.
-            sampling = getattr(request, "sampling_params", None)
-            if sampling is not None:
-                absorb_attention_schedule_extra_args(sampling)
-            validate_request_attention_schedule(request, getattr(self, "od_config", None))
+            absorb_attention_schedule_extra_args(request.sampling_params)
+            resolve_request_attention_schedule(
+                request.sampling_params,
+                getattr(self.od_config, "diffusion_attention_schedule", None),
+            )
         except (TypeError, ValueError) as exc:
             raise InvalidAttentionScheduleError(str(exc)) from exc
         if request_id in self._request_states or request_id in self._kv_draining_requests:
@@ -767,16 +768,12 @@ class BaseScheduler(ABC):
         sampling = request.sampling_params
         # LoRA identity is optional on sampling params (and on test stubs).
         lora_request = getattr(sampling, "lora_request", None)
-        from vllm_omni.diffusion.attention.schedule import parse_attention_schedule
-
-        key_kwargs = {name: getattr(sampling, name) for name in _STEP_BATCH_SAMPLING_PARAMS_KEY_FIELD_NAMES}
-        attention_schedule = parse_attention_schedule(getattr(sampling, "attention_schedule", None))
         return StepBatchSamplingParamsKey(
+            attention_schedule=parse_attention_schedule(sampling.attention_schedule),
             condition_key=getattr(request, "batch_compatibility_key", None),
             lora_int_id=lora_request.lora_int_id if lora_request is not None else None,
             use_step_execution=getattr(request, "use_step_execution", True),
-            attention_schedule=attention_schedule,
-            **key_kwargs,
+            **{name: getattr(sampling, name) for name in _STEP_BATCH_SAMPLING_PARAMS_KEY_FIELD_NAMES},
         )
 
 

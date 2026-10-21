@@ -54,7 +54,7 @@ def test_attention_schedule_inherit_disable_replace(request_schedule, expected):
     default = [{"start": 3, "end": None, "profile": "quantized"}]
     original = copy.deepcopy((request_schedule, default))
 
-    bound = resolve_attention_schedule(request_schedule, default, profiles={"quantized", "sparse"}, total_steps=8)
+    bound = resolve_attention_schedule(request_schedule, default, profiles={"quantized", "sparse"})
 
     assert select_attention_profile(bound, 4, total_steps=8) == expected
     assert (request_schedule, default) == original
@@ -63,7 +63,7 @@ def test_attention_schedule_inherit_disable_replace(request_schedule, expected):
 def test_attention_schedule_none_is_distinct_from_empty():
     assert parse_attention_schedule(None) is None
     assert parse_attention_schedule([]) == ()
-    assert resolve_attention_schedule(None, (), profiles=set(), total_steps=1) == ()
+    assert resolve_attention_schedule(None, (), profiles=set()) == ()
 
 
 def test_attention_schedule_detached_immutable_and_serializable():
@@ -130,15 +130,24 @@ def test_attention_schedule_rejects_unsorted_overlap_and_nonterminal_open_end(ra
         parse_attention_schedule([{"start": start, "end": end, "profile": "sparse"} for start, end in ranges])
 
 
-@pytest.mark.parametrize("entry", [AttentionScheduleRange(3, 9, "sparse"), AttentionScheduleRange(8, None, "sparse")])
-def test_attention_schedule_rejects_bounds_against_actual_total_even_when_inherited(entry):
-    with pytest.raises(ValueError, match="total_steps"):
-        resolve_attention_schedule(None, (entry,), profiles={"sparse"}, total_steps=8)
+@pytest.mark.parametrize("entry", [AttentionScheduleRange(3, 9, "sparse"), AttentionScheduleRange(8, 9, "sparse")])
+def test_attention_schedule_rejects_bounded_range_past_actual_total(entry):
+    with pytest.raises(ValueError, match="exceeds total_steps=8"):
+        validate_attention_schedule((entry,), total_steps=8)
+
+
+@pytest.mark.parametrize("total_steps", [4, 6])
+def test_attention_schedule_open_range_starting_past_actual_total_selects_nothing(total_steps):
+    schedule = (AttentionScheduleRange(6, None, "sparse"),)
+    validate_attention_schedule(schedule, total_steps=total_steps)
+    assert [select_attention_profile(schedule, step, total_steps=total_steps) for step in range(total_steps)] == [
+        None
+    ] * total_steps
 
 
 @pytest.mark.parametrize("name", ["q", "Quant_2", "sparse-middle"])
 def test_attention_schedule_accepts_profile_name_grammar(name):
-    schedule = resolve_attention_schedule([{"start": 0, "end": 1, "profile": name}], (), profiles={name}, total_steps=1)
+    schedule = resolve_attention_schedule([{"start": 0, "end": 1, "profile": name}], (), profiles={name})
     assert select_attention_profile(schedule, 0, total_steps=1) == name
 
 
@@ -148,7 +157,7 @@ def test_attention_schedule_rejects_invalid_actual_total(total):
         validate_attention_schedule((), profiles=set(), total_steps=total)
 
 
-@pytest.mark.parametrize("step", [True, 1.0, -1, 8])
-def test_attention_schedule_rejects_invalid_selection_step(step):
-    with pytest.raises((TypeError, ValueError), match="step_index"):
+@pytest.mark.parametrize("step", [-1, 8])
+def test_attention_schedule_rejects_selection_step_outside_total(step):
+    with pytest.raises(ValueError, match="step_index"):
         select_attention_profile((), step, total_steps=8)
