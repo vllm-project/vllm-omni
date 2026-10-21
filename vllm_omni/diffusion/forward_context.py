@@ -14,7 +14,11 @@ from vllm.config import VllmConfig
 from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionMetadata,
 )
-from vllm_omni.diffusion.attention.schedule import AttentionSchedule, select_attention_profile
+from vllm_omni.diffusion.attention.schedule import (
+    AttentionSchedule,
+    require_attention_schedule_fits,
+    select_attention_profile,
+)
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 
 if TYPE_CHECKING:
@@ -344,6 +348,20 @@ def set_forward_context_denoise_step_idx(step_idx: int | None) -> None:
             ensure_active = getattr(paged_kv_runtime, "ensure_active", None)
             if callable(ensure_active):
                 ensure_active(step_idx)
+
+
+def begin_scheduled_denoise(total_steps: int) -> int | None:
+    """Check the bound schedule against one denoise sequence before its first forward.
+
+    Returns ``total_steps`` when a non-empty schedule is bound, else None. A pipeline that
+    publishes a total only for schedules passes the result through, so an unscheduled run
+    keeps publishing no total (RAINFUSION with end_step runs dense while the total is None).
+    Call it once per sequence that restarts at step 0.
+    """
+    if _forward_context is None or not _forward_context.attention_schedule:
+        return None
+    require_attention_schedule_fits(_forward_context.attention_schedule, total_steps)
+    return total_steps
 
 
 @contextmanager

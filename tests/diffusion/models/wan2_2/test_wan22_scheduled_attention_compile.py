@@ -14,6 +14,13 @@ from typing import Any
 import pytest
 import torch
 from torch._dynamo.utils import counters as dynamo_counters
+from torch._inductor.compile_fx import compile_fx
+from vllm.distributed.parallel_state import (
+    cleanup_dist_env_and_memory,
+    init_distributed_environment,
+    initialize_model_parallel,
+)
+from vllm.model_executor.layers.utils import default_unquantized_gemm
 
 import vllm_omni.diffusion.attention.layer as layer_mod
 import vllm_omni.diffusion.models.wan2_2.wan2_2_transformer as wan_mod
@@ -43,13 +50,6 @@ _SEEN: list[tuple[str, AttentionMetadata | None]] = []
 
 @pytest.fixture
 def wan_env(monkeypatch):
-    from vllm.distributed.parallel_state import (
-        cleanup_dist_env_and_memory,
-        init_distributed_environment,
-        initialize_model_parallel,
-    )
-    from vllm.model_executor.layers.utils import default_unquantized_gemm
-
     monkeypatch.setattr(
         "vllm.model_executor.layers.linear.dispatch_unquantized_gemm",
         lambda *_args, **_kwargs: default_unquantized_gemm,
@@ -102,8 +102,6 @@ class _CountingInductor:
         self.executions: list[int] = []
 
     def __call__(self, gm, example_inputs):
-        from torch._inductor.compile_fx import compile_fx
-
         index = len(self.graphs)
         self.graphs.append(
             {getattr(n.target, "__name__", str(n.target)) for n in gm.graph.nodes if n.op == "call_function"}

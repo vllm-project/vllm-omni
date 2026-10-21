@@ -30,6 +30,7 @@ from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionMetadata,
     VideoTokenLayout,
 )
+from vllm_omni.diffusion.attention.backends.registry import DiffusionAttentionBackendEnum
 from vllm_omni.diffusion.attention.backends.sdpa import SDPABackend, SDPAImpl
 from vllm_omni.diffusion.attention.backends.trtllm_calibration import (
     calibration_for_candidate,
@@ -54,6 +55,7 @@ from vllm_omni.diffusion.config import get_current_diffusion_config_or_none
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.diffusion_kv.layout import assert_backend_layout_supported
 from vllm_omni.diffusion.distributed.parallel_state import get_sp_group
+from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelInput
 from vllm_omni.diffusion.forward_context import (
     get_attention_schedule_profile,
     get_forward_context,
@@ -88,9 +90,10 @@ def _attention_identity(
 ) -> tuple:
     """Backend name, explicit-vs-default selection and canonical backend kwargs.
 
-    The ring runner is bound to the baseline's backend preference and ignores backend kwargs, so
-    a candidate can run on the ring path only when this identity equals the baseline's. An
-    unserializable kwargs value never matches.
+    The ring runner is bound to the baseline's backend preference and ignores backend kwargs, and
+    paged attention runs the native implementation bound to the baseline, so a candidate can run
+    on the ring or paged path only when this identity equals the baseline's. An unserializable
+    kwargs value never matches.
     """
     return (
         backend_cls.get_name() if backend_cls is not None else None,
@@ -531,8 +534,6 @@ class Attention(nn.Module):
                 # dense FLASH_ATTN request, so skip platform explicit-backend
                 # validation (Blackwell would otherwise require CuTe FA4). Formal
                 # paged execution still delegates to vLLM's native paged backend.
-                from vllm_omni.diffusion.attention.backends.registry import DiffusionAttentionBackendEnum
-
                 dense_backend_name = attn_backend_cls.get_name()
                 attn_backend_cls = DiffusionAttentionBackendEnum.FLASH_ATTN.get_class()
                 logger.info(
@@ -700,11 +701,11 @@ class Attention(nn.Module):
         not referenced by the service default schedule are still prepared, because
         startup compatibility validation covers every configured profile.
 
-        The baseline AllGather-KV + TRTLLM_ATTN rejection and implementation overrides apply to
-        candidates too, so a candidate is never prepared with that backend. Per-candidate
-        KV-cache-quantization and capability/layout validation (ring, kv dtype support) remain in
-        the post-load startup traversal (``validate_attention_schedule_candidates``) and are not
-        duplicated here.
+        The baseline guards that decide which backend a layer uses apply to candidates too: the
+        marked-paged default->FLASH_ATTN promotion, the AllGather-KV + TRTLLM_ATTN rejection and
+        implementation overrides. Per-candidate capability checks (paged KV, SP auto-pad, ring, kv
+        dtype support) run in the post-load startup traversal
+        (``validate_attention_schedule_candidates``).
 
         Identical effective identities for this role share one record. The dedup key carries the
         backend name, explicit-vs-default selection, the impl class object, and canonical JSON of
@@ -736,6 +737,14 @@ class Attention(nn.Module):
                 role_category=role_category,
                 allow_trtllm_default=allow_trtllm_default,
             )
+            # Reproduce the baseline marked-paged promotion of a platform default.
+            if (
+                self._scheduler_paged_kv
+                and self.paged_kv_cache_role is not None
+                and spec is None
+                and not backend_cls.supports_paged_kv
+            ):
+                backend_cls = DiffusionAttentionBackendEnum.FLASH_ATTN.get_class()
             _reject_allgather_trtllm(backend_cls, skip_sequence_parallel, allgather_degree)
             impl_cls = _select_impl_cls(backend_cls, impl_overrides)
             backend_explicit = spec is not None
@@ -914,11 +923,14 @@ class Attention(nn.Module):
     def _schedule_op_eligible(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor) -> bool:
         """Whether this layer and call can use the scheduled-attention op instead of the eager boundary.
 
-        Evaluated while tracing, on structure only (never on the step). HSDP (its own boundary) and
-        autograd (the op has no backward) keep ``_forward_schedule_compile_boundary``, as does
-        metadata that ``_encode_scheduled_op_metadata`` cannot carry.
+        Evaluated while tracing, on structure only (never on the step). HSDP (its own boundary),
+        Scheduler-managed paged KV (writes cache state the op does not declare) and autograd (the op
+        has no backward) keep ``_forward_schedule_compile_boundary``, as does metadata that
+        ``_encode_scheduled_op_metadata`` cannot carry.
         """
         if self._schedule_op_id is None or self._uses_hsdp_compile_boundary():
+            return False
+        if self._scheduler_paged_kv and self.paged_kv_cache_role is not None:
             return False
         return not (torch.is_grad_enabled() and (query.requires_grad or key.requires_grad or value.requires_grad))
 
@@ -1491,6 +1503,31 @@ class Attention(nn.Module):
         raise RuntimeError("Ring attention is enabled but strategy is not RingParallelAttention")
 
 
+def _plans_auto_pad(value: Any) -> bool:
+    """Whether one SP plan value declares ``auto_pad`` at any nesting level.
+
+    Plan values nest dicts and lists, e.g. ``{"rope": {0: SequenceParallelInput(..., auto_pad=True)}}``.
+    """
+    if isinstance(value, dict):
+        return any(_plans_auto_pad(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_plans_auto_pad(item) for item in value)
+    return isinstance(value, SequenceParallelInput) and value.auto_pad
+
+
+def _sp_auto_pad_roots(model: nn.Module) -> tuple[str, ...]:
+    """Qualified names of the components whose own ``_sp_plan`` declares ``auto_pad``.
+
+    SP hooks are applied per component, so one component's plan does not require mask
+    support from another component's layers. The root module has the empty name.
+    """
+    return tuple(
+        name
+        for name, module in model.named_modules()
+        if isinstance(getattr(module, "_sp_plan", None), dict) and _plans_auto_pad(module._sp_plan)
+    )
+
+
 def _validate_candidate_calibration(
     layer_name: str,
     profile_name: str,
@@ -1526,9 +1563,14 @@ def validate_attention_schedule_candidates(model: nn.Module, od_config: "OmniDif
     WHICH backend a layer uses. The checks here need the loaded model and the resolved parallel
     plan instead. The checks that run without this traversal do not read each prepared candidate,
     so an incompatible candidate would surface inside the first kernel after the layer switches to
-    it, be ignored on a ring layer, or run dense when its calibration curve is missing:
+    it, be ignored on a paged KV or ring layer, or run dense when its calibration curve is missing:
 
+    * paged KV: ``_forward_impl`` checks only the baseline backend for paged support, and paged
+      forward runs the native implementation bound to the baseline, so a candidate must support
+      paged KV and match the baseline backend, explicit selection and backend kwargs;
     * KV-cache quantization: ``_init_kv_cache_quantization`` probes the baseline impl only;
+    * SP auto-pad: the pad-time mask probe cannot check each prepared candidate, so a layer in a
+      component that plans auto_pad under SP needs mask-capable candidates;
     * ring: the ring path bypasses the backend and the ring runner is bound to the baseline backend
       preference and explicit flag, and ignores backend kwargs, so a candidate carrying skip_softmax
       or differing from the baseline in backend name, explicit selection or backend kwargs cannot be
@@ -1552,6 +1594,8 @@ def validate_attention_schedule_candidates(model: nn.Module, od_config: "OmniDif
         # configuration that loads fine without a schedule.
         kv_dtype = None
     platform_key = current_omni_platform.device_name
+    sp_size = od_config.parallel_config.sequence_parallel_size
+    auto_pad_roots = _sp_auto_pad_roots(model) if sp_size > 1 else ()
     ring_degree = od_config.parallel_config.ring_degree
     skip_layers = od_config.diffusion_kv_cache_skip_layer_indices
     effective_calibration = resolve_effective_calibration(od_config.diffusion_attention_config, schedule)
@@ -1566,6 +1610,11 @@ def validate_attention_schedule_candidates(model: nn.Module, od_config: "OmniDif
         if not module._schedule_configured:
             continue  # built with no current diffusion config; it can never take part in a schedule
         schedule_aware_layers += 1
+        # Only self-attention sees the SP padding mask; cross-attention keys come from the unpadded context.
+        requires_mask = module.computation is AttentionComputation.SELF and any(
+            root == "" or layer_name == root or layer_name.startswith(root + ".") for root in auto_pad_roots
+        )
+        paged = module._scheduler_paged_kv and module.paged_kv_cache_role is not None
         # Construction prepares a candidate for every configured profile, and only from a backend:
         # custom-attention layers never take part in a schedule.
         baseline_backend = cast(type[AttentionBackend], module.attn_backend).get_name()
@@ -1576,6 +1625,23 @@ def validate_attention_schedule_candidates(model: nn.Module, od_config: "OmniDif
             matches_baseline = (
                 _attention_identity(record.backend_cls, record.backend_explicit, record.spec) == baseline_identity
             )
+            if paged and not record.backend_cls.supports_paged_kv:
+                raise ValueError(
+                    f"attention schedule profile {name!r} selects backend {backend_name} which does not "
+                    f"support Scheduler-managed paged KV (layer {layer_name!r}, role "
+                    f"{module.paged_kv_cache_role!r}). Select a paged-capable backend for that profile "
+                    f"or disable scheduler paged KV."
+                )
+            if paged and not matches_baseline:
+                raise ValueError(
+                    f"attention schedule profile {name!r} selects backend {backend_name} "
+                    f"(explicit={record.backend_explicit}) on a Scheduler-managed paged KV layer "
+                    f"(layer {layer_name!r}, role {module.paged_kv_cache_role!r}), but paged attention runs "
+                    f"the native implementation bound to the baseline {baseline_backend!r} "
+                    f"(explicit={module.backend_explicit}) and cannot represent a candidate whose backend, "
+                    f"explicit selection or backend kwargs differ from it. Align that profile with the "
+                    f"baseline or disable scheduler paged KV."
+                )
             # Layers that can run ring: use_ring at construction (never explicit cross-attention), minus
             # layers that skip sequence parallelism, which always run local attention.
             if ring_degree > 1 and not module._explicit_cross_contract and not module.skip_sequence_parallel:
@@ -1612,6 +1678,13 @@ def validate_attention_schedule_candidates(model: nn.Module, od_config: "OmniDif
                     f"not support kv_cache_dtype={kv_dtype!r} on {platform_key} (layer {layer_name!r}). "
                     f"Select a compatible backend for that profile or set "
                     f"diffusion_kv_cache_dtype='auto'."
+                )
+            if requires_mask and not record.backend_cls.supports_attention_mask(record.spec):
+                raise ValueError(
+                    f"attention schedule profile {name!r} selects backend {backend_name} which does not "
+                    f"support attention_mask, but this model plans SP auto_pad with sequence_parallel_size="
+                    f"{sp_size} (layer {layer_name!r}). Remove that profile, select a mask-capable backend "
+                    f"for it, or disable auto_pad."
                 )
             for check in module._schedule_candidate_checks:
                 reason = check(record)
