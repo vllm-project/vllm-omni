@@ -872,7 +872,7 @@ async def omni_init_app_state(
 
     Sets up the application state with model information, request logger,
     and other server configuration needed for handling API requests.
-    Automatically detects pure diffusion mode (single diffusion stage) and
+    Automatically detects pure diffusion mode (all stages diffusion) and
     handles it appropriately.
 
     Args:

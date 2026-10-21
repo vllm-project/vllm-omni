@@ -53,3 +53,23 @@ def test_other_models_keep_aiter_groupnorm_patch(monkeypatch):
     od_config = types.SimpleNamespace(model_class_name="OtherDiffusionModel")
     assert patch_groupnorm._patched_initialize_model(od_config) is model
     assert replaced
+
+
+def test_a_stage_without_a_vae_is_left_alone(monkeypatch):
+    """Cosmos3's disaggregated reasoner never decodes, so its ``vae`` is ``None``."""
+    model = types.SimpleNamespace(vae=None)
+    monkeypatch.setattr(patch_groupnorm, "_original_initialize_model", lambda _: model)
+    monkeypatch.setattr(
+        patch_groupnorm,
+        "_replace_groupnorm_with_aiter",
+        lambda _: pytest.fail("there is no VAE to patch"),
+    )
+    aiter_ops = types.ModuleType("vllm._aiter_ops")
+    setattr(aiter_ops, "is_aiter_found_and_supported", lambda: True)
+    monkeypatch.setitem(sys.modules, "vllm._aiter_ops", aiter_ops)
+    warnings: list[str] = []
+    monkeypatch.setattr(patch_groupnorm.logger, "warning", lambda msg, *a, **k: warnings.append(msg))
+
+    od_config = types.SimpleNamespace(model_class_name="Cosmos3ReasonerPipeline")
+    assert patch_groupnorm._patched_initialize_model(od_config) is model
+    assert warnings == []
