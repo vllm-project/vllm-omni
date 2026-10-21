@@ -37,6 +37,11 @@ from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_
 from vllm_omni.diffusion.layers.exact_bf16_pointwise import eligible as pointwise_eligible
 from vllm_omni.diffusion.layers.exact_bf16_pointwise import residual, rotary, silu_mul
 from vllm_omni.diffusion.layers.exact_bf16_qk_norm_rope import qk_rotary
+from vllm_omni.diffusion.layers.fused_qk_norm_rope import (
+    fused_qkv_norm_rope_available,
+    prepare_qkv_norm_rope_tables,
+    try_fused_qkv_norm_rope,
+)
 from vllm_omni.diffusion.models.qwen_image_21.decode_graph import QwenImage21DecodeGraphManager
 from vllm_omni.diffusion.models.qwen_image_21.npu_attention import QwenImage21SDPAImpl
 from vllm_omni.diffusion.offloader.config import OffloadStrategy, resolve_offload_strategy
@@ -562,6 +567,7 @@ class QwenImage21Attention(nn.Module):
         kv_cache: dict[str, dict[str, torch.Tensor]] | None = None,
         cache_branch: str = "cond",
         cache_write_len: int | None = None,
+        rope_tables: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         r"""
         Args:
@@ -594,10 +600,26 @@ class QwenImage21Attention(nn.Module):
         key = key.unflatten(-1, (self.num_kv_heads, self.head_dim))
         value = value.unflatten(-1, (self.num_kv_heads, self.head_dim))
 
-        fused_qk = None
+        fused_qkv = fused_qk = None
         if self.norm_q.bias is None and self.norm_k.bias is None and self.norm_q.eps == self.norm_k.eps:
-            fused_qk = qk_rotary(query, key, self.norm_q.weight, self.norm_k.weight, freqs, self.norm_q.eps)
-        if fused_qk is not None:
+            if rope_tables is not None:
+                fused_qkv = try_fused_qkv_norm_rope(
+                    query,
+                    key,
+                    value,
+                    self.norm_q.weight,
+                    self.norm_k.weight,
+                    rope_tables,
+                    self.norm_q.eps,
+                    head_dim=self.head_dim,
+                    rotary_dim=self.head_dim,
+                    interleaved=True,
+                )
+            if fused_qkv is None:
+                fused_qk = qk_rotary(query, key, self.norm_q.weight, self.norm_k.weight, freqs, self.norm_q.eps)
+        if fused_qkv is not None:
+            query, key, value = fused_qkv
+        elif fused_qk is not None:
             query, key = fused_qk
         else:
             query = self.norm_q(query).to(value.dtype)
@@ -734,6 +756,7 @@ class QwenImage21TransformerBlock(nn.Module):
         cache_write_len: int | None = None,
         prepared_modulation: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
         _pointwise_validated: bool = False,
+        rope_tables: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         if prepared_modulation is None:
             mod1, mod2 = modulation.chunk(2, dim=-1)
@@ -751,6 +774,7 @@ class QwenImage21TransformerBlock(nn.Module):
             kv_cache=kv_cache,
             cache_branch=cache_branch,
             cache_write_len=cache_write_len,
+            rope_tables=rope_tables,
         )
         use_inplace_residual = (
             hidden_states.device.type == "npu"
@@ -1264,6 +1288,19 @@ class QwenImage21Transformer2DModel(CachedTransformer):
         # Local layout is always [prefix, target (shard)]: full sequence when SP is off.
         joint_hidden_states = torch.cat([prefix_hidden_states, target_hidden_states], dim=1)
         freqs = torch.cat([prefix_freqs, target_freqs], dim=0)
+        # Prepare once after SP hooks select/pad the local sequence. Each block
+        # still checks its actual projection/weight dtype before using fusion.
+        rope_tables = None
+        # Keep this backend eager-only until SD has a validated Fake/Meta contract.
+        if (
+            self._enforce_eager
+            and not torch.is_grad_enabled()
+            and not torch.compiler.is_compiling()
+            and fused_qkv_norm_rope_available(joint_hidden_states.device)
+        ):
+            rope_tables = prepare_qkv_norm_rope_tables(
+                freqs.real, freqs.imag, interleaved=True, dtype=joint_hidden_states.dtype
+            )
         prefix_len = prefix_hidden_states.shape[1]
         sp_prefix_len = prefix_len if sp_active and not is_decode else 0
 
@@ -1416,6 +1453,7 @@ class QwenImage21Transformer2DModel(CachedTransformer):
                 cache_write_len=cache_write_len,
                 prepared_modulation=prepared_modulation,
                 _pointwise_validated=pointwise_validated,
+                rope_tables=rope_tables,
             )
 
         if (

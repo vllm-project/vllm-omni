@@ -171,6 +171,7 @@ x-qwen-image: &qwen_image
   - vllm_omni/diffusion/distributed/autoencoders/autoencoder_kl_qwenimage.py
 
 x-qwen-image-21: &qwen_image_21
+  - vllm_omni/diffusion/layers/fused_qk_norm_rope.py
   - vllm_omni/diffusion/models/qwen_image_21/
   - vllm_omni/diffusion/models/qwen_image/
   - vllm_omni/diffusion/distributed/autoencoders/autoencoder_kl_qwenimage21.py
