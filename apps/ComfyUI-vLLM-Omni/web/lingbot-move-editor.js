@@ -416,7 +416,9 @@ function widgetValue(node, name) {
 function inputLinked(node, name) {
   const inputs = Array.isArray(node?.inputs) ? node.inputs : [];
   const slot = inputs.findIndex((input) => input?.name === name);
-  return slot >= 0 && inputs[slot].link != null;
+  if (slot < 0) return false;
+  if (typeof node.isInputConnected === "function") return node.isInputConnected(slot);
+  return inputs[slot].link != null;
 }
 
 /** An editor's natural height: its visible rows plus the 6 px gaps between them. */
@@ -876,27 +878,34 @@ function createMoveEditor(node, inputName) {
         signature = nextSignature;
         render();
       }
-      // Fit the node when its content changes; the first measure only grows it,
-      // so a loaded workflow keeps its saved height.
+      // ComfyUI caches a DOM widget's height during the first layout, so a node
+      // that measured tall before its styles settled would keep that height
+      // forever. Fit both ways once the content settles instead.
       const measured = contentHeight(root);
       if (measured !== null && measured !== height) {
         height = measured;
-        if (laidOut) fitNode(node);
-        else if (typeof node.expandToFitContent === "function") {
-          try {
-            node.expandToFitContent();
-          } catch {
-            fitNode(node);
-          }
-        } else {
-          fitNode(node);
-        }
+        const refit = () => fitNode(node);
+        if (typeof requestAnimationFrame === "function") requestAnimationFrame(refit);
+        else refit();
         laidOut = true;
       }
     },
   });
 
   render();
+  // The first draw can happen before the stylesheet and the fonts settle, and
+  // ComfyUI caches a DOM widget's height from that first layout, so fit once
+  // more after the next frame to remove any stale slack.
+  if (typeof requestAnimationFrame === "function") {
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+      height = contentHeight(root) ?? height;
+      const desired = height + 2 * (widget?.margin ?? 0);
+      if (typeof widget?.computedHeight === "number" && widget.computedHeight !== desired) {
+        widget.computedHeight = desired;
+      }
+      fitNode(node);
+    }));
+  }
   return widget;
 }
 
@@ -907,6 +916,10 @@ function createMoveEditor(node, inputName) {
 /** Install the editor on a ComfyUI `app`; kept separate so tests never build a DOM. */
 export function register(app) {
   if (!app || typeof app.registerExtension !== "function") return;
+  // ComfyUI can evaluate this module under two URLs (the extension scan and a
+  // relative import), so the registration must be idempotent.
+  if (globalThis.__vllmOmniLingBotEditor === true) return;
+  globalThis.__vllmOmniLingBotEditor = true;
   app.registerExtension({
     name: "vllm.lingbot_move_editor",
     setup() {

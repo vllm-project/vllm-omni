@@ -281,7 +281,7 @@ function buildPanel(node, app, VideoSession, cameraEvent) {
     autoplay: true,
     muted: true,
     playsInline: true,
-    controls: true,
+    controls: false,
     "aria-label": "Generated world",
   });
   output.muted = true;
@@ -646,8 +646,12 @@ function buildPanel(node, app, VideoSession, cameraEvent) {
 /** Install the extension on a ComfyUI `app`; kept separate so tests never run it. */
 export function register(app) {
   if (!app || typeof app.registerExtension !== "function") return;
+  // ComfyUI can evaluate this module under two URLs (the extension scan and a
+  // relative import), so the registration must be idempotent.
+  if (globalThis.__vllmOmniLingBotWorld === true) return;
+  globalThis.__vllmOmniLingBotWorld = true;
   app.registerExtension({
-    name: "Omni.LingBotWorld",
+    name: "vllm.lingbot_world",
     setup() { ensureStyle(); },
     nodeCreated(node) {
       if (!["VLLMOmniLingBotWorld", "VLLMOmniLingBotRealtimeJSON"].includes(node?.comfyClass)) return;

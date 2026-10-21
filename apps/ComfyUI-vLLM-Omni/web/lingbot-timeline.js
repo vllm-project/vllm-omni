@@ -337,6 +337,7 @@ function widgetValue(node, name) {
 
 function linkedNode(node, slot) {
   const graph = node?.graph;
+  if (typeof node?.isInputConnected === "function" && !node.isInputConnected(slot)) return null;
   if (typeof node?.getInputNode === "function") {
     const source = node.getInputNode(slot);
     if (source) return source;
@@ -396,6 +397,14 @@ function timelineMoves(shotNode) {
  * `sequence`) opens the session and holds `9 + 12 * (chunks - 1)` frames;
  * every later shot is a run of full chunks, `12 * chunks`.
  */
+/** Whether a shot's optional input is connected, without the deprecated `input.link`. */
+function connected(node, name) {
+  const slot = (node?.inputs ?? []).findIndex((input) => input?.name === name);
+  if (slot < 0) return false;
+  if (typeof node.isInputConnected === "function") return node.isInputConnected(slot);
+  return node.inputs[slot].link != null;
+}
+
 function readShotChain(node) {
   const terminal = upstream(node, "sequence");
   if (!terminal) return null;
@@ -412,7 +421,7 @@ function readShotChain(node) {
       prompt: asText(widgetValue(shotNode, "prompt")),
       frames: index === 0 ? FIRST_CHUNK_FRAMES + (chunks - 1) * CHUNK_FRAMES : CHUNK_FRAMES * chunks,
       moves: timelineMoves(shotNode),
-      movesOverridden: Boolean(shotNode.inputs?.find?.((input) => input?.name === "moves")?.link),
+      movesOverridden: connected(shotNode, "moves"),
     };
   });
 }
@@ -533,6 +542,18 @@ function contentHeight(root) {
   const rows = [...root.children].filter((child) => !child.hidden);
   return rows.reduce((height, child) => height + child.offsetHeight, 0) +
     ROW_GAP * Math.max(0, rows.length - 1);
+}
+
+/** Resize the node to its content, once ComfyUI has measured the widget. */
+function fitNode(node) {
+  try {
+    const size = node.computeSize?.();
+    if (Array.isArray(size) && Number.isFinite(size[1]) && Math.abs(size[1] - node.size[1]) > 1) {
+      node.setSize([node.size[0], size[1]]);
+    }
+  } catch {
+    // A node that is already detached has no size to fit.
+  }
 }
 
 /** Chunk grid lines thin to every `every`th chunk so they stay at least 6 px apart. */
@@ -709,13 +730,24 @@ function createTimelineWidget(node, app) {
     }
     // Fit the node to its content once; after that a height the user dragged is
     // theirs, and only the widget's own minimum tracks the measured height.
+    // ComfyUI caches a DOM widget's height during the first layout, so a node
+    // that measured tall before its styles settled would keep that height
+    // forever. Fit both ways once the content settles instead.
     const measured = contentHeight(root);
     if (measured !== null && measured !== height) {
       height = measured;
-      if (!laidOut) {
-        laidOut = true;
-        node.expandToFitContent?.();
-      }
+      const refit = () => {
+        // ComfyUI caches a DOM widget's height; refresh it before fitting so a
+        // stale first measurement cannot keep the node tall.
+        const desired = height + 2 * (widget?.margin ?? 0);
+        if (typeof widget?.computedHeight === "number" && widget.computedHeight !== desired) {
+          widget.computedHeight = desired;
+        }
+        fitNode(node);
+      };
+      if (typeof requestAnimationFrame === "function") requestAnimationFrame(refit);
+      else refit();
+      laidOut = true;
     }
   };
 
@@ -771,6 +803,19 @@ function createTimelineWidget(node, app) {
   };
 
   render();
+  // The first draw can happen before the stylesheet and the fonts settle, and
+  // ComfyUI caches a DOM widget's height from that first layout, so fit once
+  // more after the next frame to remove any stale slack.
+  if (typeof requestAnimationFrame === "function") {
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+      height = contentHeight(root) ?? height;
+      const desired = height + 2 * (widget?.margin ?? 0);
+      if (typeof widget?.computedHeight === "number" && widget.computedHeight !== desired) {
+        widget.computedHeight = desired;
+      }
+      fitNode(node);
+    }));
+  }
   return widget;
 }
 
@@ -781,8 +826,12 @@ function createTimelineWidget(node, app) {
 /** Install the extension on a ComfyUI `app`; kept separate so tests never run it. */
 export function register(app) {
   if (!app || typeof app.registerExtension !== "function") return;
+  // ComfyUI can evaluate this module under two URLs (the extension scan and a
+  // relative import), so the registration must be idempotent.
+  if (globalThis.__vllmOmniLingBotViewer === true) return;
+  globalThis.__vllmOmniLingBotViewer = true;
   app.registerExtension({
-    name: "Omni.LingBotTimeline",
+    name: "vllm.lingbot_timeline",
     setup() {
       ensureStyle();
     },

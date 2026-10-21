@@ -240,6 +240,6 @@ test("the module still exports layoutSequence and a guarded register", () => {
   const installed = [];
   register({ registerExtension: (extension) => installed.push(extension) });
   assert.equal(installed.length, 1);
-  assert.equal(installed[0].name, "Omni.LingBotTimeline");
+  assert.equal(installed[0].name, "vllm.lingbot_timeline");
   assert.equal(typeof installed[0].nodeCreated, "function");
 });
