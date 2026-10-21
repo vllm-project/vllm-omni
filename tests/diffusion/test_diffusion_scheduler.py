@@ -2457,3 +2457,29 @@ class TestPendingFinishedRequestIds:
         assert sched.pending_finished_request_ids() == set()
         # The next wave still ships the id to the worker for its own cleanup.
         assert sched.schedule().finished_req_ids == {"a"}
+
+
+@pytest.mark.parametrize(
+    ("model_class_name", "admitted"),
+    [("MiniMaxH3DecoderPipeline", True), ("MiniMaxH3Pipeline", False)],
+    ids=["decode-only-stage", "denoising-stage"],
+)
+def test_decode_only_stage_drops_the_request_schedule_copied_to_it(model_class_name, admitted) -> None:
+    """Multi-stage video and chat endpoints copy the request's diffusion params to every diffusion stage."""
+    scheduler = RequestScheduler()
+    scheduler.initialize(OmniDiffusionConfig(model_class_name=model_class_name))
+    request = OmniDiffusionRequest(
+        prompt="prompt",
+        sampling_params=OmniDiffusionSamplingParams(
+            num_inference_steps=1, extra_args={"attention_schedule": [{"start": 0, "end": None, "profile": "sparse"}]}
+        ),
+        request_id="req",
+    )
+
+    if admitted:
+        scheduler.add_request(request)
+        assert request.sampling_params.attention_schedule is None
+        assert "attention_schedule" not in request.sampling_params.extra_args
+    else:
+        with pytest.raises(ValueError, match="unknown profile"):
+            scheduler.add_request(request)
