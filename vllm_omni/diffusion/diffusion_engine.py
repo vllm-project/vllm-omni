@@ -397,6 +397,17 @@ class DiffusionEngine:
 
     def _resolve_execution_mode(self, od_config: OmniDiffusionConfig) -> DiffusionExecutionMode:
         mixfusion_needs_steps = validate_mixfusion_config(od_config, supported=supports_mixfusion)
+        # DRR admission (policy="compute_budget") is coupled to MixFusion:
+        # cost-normalized aging only pays off when heterogeneous resolutions
+        # can share a batch, so fail fast instead of silently degrading.
+        batching_config = getattr(od_config, "diffusion_batching_config", None)
+        if getattr(batching_config, "uses_compute_budget", False) and not bool(
+            getattr(od_config, "enable_mixfusion", False)
+        ):
+            raise ValueError(
+                "diffusion_batching_config policy='compute_budget' (DRR admission) requires "
+                "enable_mixfusion=True. Enable MixFusion, or use the default 'fixed' policy."
+            )
 
         self.step_execution = bool(getattr(od_config, "step_execution", False))
         if mixfusion_needs_steps and not self.step_execution:
