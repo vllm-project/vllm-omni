@@ -7,6 +7,7 @@ import socket
 import pytest
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.utils.network_utils import is_port_available
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -29,17 +30,21 @@ def _freeze_port_availability(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def _bind_available_port_below(max_port: int, port_inc: int) -> socket.socket:
+    # The held socket binds loopback only (CodeQL flags all-interface binds);
+    # a held loopback bind still conflicts with settle_port's wildcard probe.
+    # Verify the stepped candidate with the production probe itself, so a port
+    # held on any other interface cannot slip past the check.
     for _ in range(100):
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
-            sock.bind(("", 0))
+            sock.bind(("127.0.0.1", 0))
             port = sock.getsockname()[1]
             if port >= max_port - port_inc:
                 sock.close()
                 continue
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as next_sock:
-                next_sock.bind(("", port + port_inc))
-            return sock
+            if is_port_available(port + port_inc):
+                return sock
+            sock.close()
         except OSError:
             sock.close()
     raise RuntimeError(f"Failed to reserve an available port below {max_port - port_inc}")
@@ -82,7 +87,7 @@ class TestOmniDiffusionConfigMasterPort:
                 assert config.master_port is not None
                 with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
                     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                    sock.bind(("", config.master_port))
+                    sock.bind(("127.0.0.1", config.master_port))
                 return
             except OSError as exc:
                 last_error = exc
