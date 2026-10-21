@@ -237,6 +237,8 @@ def select_attention_profile(schedule: AttentionSchedule, step_index: int, *, to
 
 
 _SIGMA_FIELDS = frozenset({"low", "high", "profile"})
+# Schedulers that build sigmas in float32 can land a few ulps outside [0, 1].
+_SIGMA_ROUNDING_TOLERANCE = 1e-6
 
 
 def _validate_sigma(value: float, name: str) -> None:
@@ -319,9 +321,9 @@ def normalized_sigma(current: float, reference: float = 1.0) -> float:
     if not math.isfinite(reference) or reference <= 0:
         raise ValueError("normalized sigma reference must be finite and positive")
     value = current / reference
-    if not 0.0 <= value <= 1.0:
+    if not -_SIGMA_ROUNDING_TOLERANCE <= value <= 1.0 + _SIGMA_ROUNDING_TOLERANCE:
         raise ValueError(f"normalized scheduler sigma must be in [0, 1], got {value!r} ({current!r} / {reference!r})")
-    return value
+    return min(max(value, 0.0), 1.0)
 
 
 def select_attention_profile_by_sigma(schedule: AttentionSigmaSchedule, sigma: float) -> str | None:
