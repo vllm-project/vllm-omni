@@ -177,6 +177,7 @@ def test_decode_to_mp4_batches_consumer_transfers(monkeypatch):
             self.pushes = []
             self.frame_count = 0
             self.kwargs = kwargs
+            self.frame_count = 0
             self.__class__.instances.append(self)
 
         def push(self, frames, *, on_consumed=None):
@@ -974,6 +975,22 @@ def test_joint_postprocess_is_multiprocessing_picklable():
     np.testing.assert_array_equal(result["audio"], audio.numpy())
     assert result["audio_sample_rate"] == 32000
     assert result["fps"] == 24
+
+
+def test_preencoded_frame_counts_survive_registered_postprocess():
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import (
+        get_minimax_h3_post_process_func,
+    )
+    from vllm_omni.diffusion.output_formatter import (
+        normalize_diffusion_postprocess_output,
+    )
+
+    postprocess = get_minimax_h3_post_process_func(SimpleNamespace())
+    restored = ForkingPickler.loads(ForkingPickler.dumps(postprocess))
+    result = restored(([b"first-mp4", b"second-mp4"], None, None, [7, 9]))
+    normalized = normalize_diffusion_postprocess_output(result)
+    assert normalized.outputs["video"] == [b"first-mp4", b"second-mp4"]
+    assert normalized.metadata["video"]["frame_counts"] == [7, 9]
 
 
 def test_joint_video_output_is_quantized_before_transfer():

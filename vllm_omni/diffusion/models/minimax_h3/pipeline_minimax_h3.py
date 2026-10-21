@@ -397,6 +397,10 @@ def _minimax_h3_post_process(output, output_type: str = "np"):
     frames on the accelerator, so there is nothing left to scale or transpose
     here.
     """
+    frame_counts = None
+    if isinstance(output, tuple) and len(output) == 4:
+        video, audio, _, frame_counts = output
+        output = (video, audio)
     if not isinstance(output, tuple) or len(output) != 2:
         return output
     video, audio = output
@@ -407,12 +411,26 @@ def _minimax_h3_post_process(output, output_type: str = "np"):
     else:
         encoded_videos = None
     if encoded_videos is not None:
-        return {
+        result = {
             "video": encoded_videos,
             "audio": [None] * len(encoded_videos),
             "audio_sample_rate": MINIMAX_H3_AUDIO_SAMPLE_RATE,
             "fps": MINIMAX_H3_FPS,
         }
+        if frame_counts is not None:
+            if len(frame_counts) != len(encoded_videos):
+                raise ValueError("encoded frame counts must match video outputs")
+            return {
+                "payload": {
+                    "video": encoded_videos,
+                    "audio": [None] * len(encoded_videos),
+                },
+                "metadata": {
+                    "video": {"fps": MINIMAX_H3_FPS, "frame_counts": frame_counts},
+                    "audio": {"sample_rate": MINIMAX_H3_AUDIO_SAMPLE_RATE},
+                },
+            }
+        return result
     if video.dtype != torch.uint8 or video.ndim != 5 or video.shape[-1] not in (3, 4):
         # Float or channel-first frames would reach the muxer as a black or
         # banded video rather than as an error.
@@ -457,9 +475,7 @@ def _register_dlo_component_cache(cache: BoundedAllocatorCache, *components: Any
             component.set_omni_component_cache(cache)
 
 
-def get_minimax_h3_post_process_func(
-    od_config: OmniDiffusionConfig,
-):
+def get_minimax_h3_post_process_func(od_config: OmniDiffusionConfig):
     del od_config
     return _minimax_h3_post_process
 
@@ -3265,6 +3281,7 @@ class MiniMaxH3Pipeline(
         height, width = _minimax_h3_output_canvas(context, upscale_target)
         videos = []
         audios = []
+        frame_counts = []
         for output_seed in _minimax_h3_output_seeds(context["seed"], num_outputs):
             check_request_cancellation()
             output_kwargs = {**denoise_kwargs, "seed": output_seed}
@@ -3305,6 +3322,7 @@ class MiniMaxH3Pipeline(
                         width=width,
                         video_codec_options=context["video_codec_options"],
                         batch_frames=context["preencode_batch_frames"],
+                        frame_counts=frame_counts,
                     )
                 )
                 audios.append(None)
@@ -3337,7 +3355,7 @@ class MiniMaxH3Pipeline(
             video = videos[0] if len(videos) == 1 else torch.cat(videos, dim=0)
             audio = audios[0] if len(audios) == 1 else torch.cat(audios, dim=0)
         return DiffusionOutput(
-            output=(video, audio),
+            output=((video, audio, None, frame_counts) if frame_counts else (video, audio)),
             video_output_index=0 if isinstance(video, torch.Tensor) else None,
             post_process_func=get_minimax_h3_post_process_func(self.od_config),
             stage_durations=(self.stage_durations if hasattr(self, "_stage_durations") else {}),
@@ -3720,6 +3738,7 @@ class MiniMaxH3Pipeline(
             return self._decoder_stage_output(
                 [video_latent], [audio_latent], {**shape, "height": height, "width": width}
             )
+        frame_counts = []
         if shape.get("preencode_mp4", False):
             video = self.decode_to_mp4(
                 video_latent,
@@ -3728,6 +3747,7 @@ class MiniMaxH3Pipeline(
                 width=width,
                 video_codec_options=shape.get("video_codec_options"),
                 batch_frames=shape.get("preencode_batch_frames", 17),
+                frame_counts=frame_counts,
             )
             audio = None
         else:
@@ -3740,7 +3760,7 @@ class MiniMaxH3Pipeline(
             video = self._offload_model_cpu_stage_output(_prepare_minimax_h3_video_output(video))
             self._release_stage_cache()
         return DiffusionOutput(
-            output=(video, audio),
+            output=((video, audio, None, frame_counts) if frame_counts else (video, audio)),
             video_output_index=0 if isinstance(video, torch.Tensor) else None,
             post_process_func=get_minimax_h3_post_process_func(self.od_config),
             stage_durations=(self.stage_durations if hasattr(self, "_stage_durations") else {}),
