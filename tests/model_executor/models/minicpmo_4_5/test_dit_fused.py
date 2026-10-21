@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 
 from tests.helpers.mark import hardware_marks
+from vllm_omni.model_executor.models.minicpmo_4_5 import batched_token2wav
 from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import BatchedToken2Wav
 from vllm_omni.model_executor.models.minicpmo_4_5.dit_fused import (
     blocks_forward_chunk_fused,
@@ -17,6 +18,26 @@ from vllm_omni.model_executor.models.minicpmo_4_5.dit_fused import (
 pytestmark = [pytest.mark.core_model, *hardware_marks(res={"cuda": "L4"}, num_cards=1)]
 
 _DEVICES = ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("enabled", [False, True])
+def test_ragged_body_dispatches_supported_fused_precision(monkeypatch, dtype, enabled):
+    backend = BatchedToken2Wav.__new__(BatchedToken2Wav)
+    nn.Module.__init__(backend)
+    backend._ragged_fused_body = enabled
+    calls = []
+
+    def fused(*args, **kwargs):
+        calls.append("fused")
+
+    def ragged(*args, **kwargs):
+        calls.append("ragged")
+
+    monkeypatch.setattr(batched_token2wav, "blocks_forward_chunk_fused", fused)
+    monkeypatch.setattr(backend, "_blocks_forward_chunk_ragged", ragged)
+    backend._ragged_body(None, torch.empty(1, dtype=dtype))
+    assert calls == ["fused" if enabled and dtype in (torch.float16, torch.float32) else "ragged"]
 
 
 def _upstream_dit(device: str) -> nn.Module:
@@ -38,20 +59,22 @@ def _upstream_dit(device: str) -> nn.Module:
     return estimator.eval().to(device)
 
 
-def _run(body, estimator, *, rows: int, frames: int, cached: int, lengths):
+def _run(body, estimator, *, rows: int, frames: int, cached: int, lengths, dtype=torch.float32):
     torch.manual_seed(1)
     depth = len(estimator.blocks)
     channels = estimator.blocks[0].conv.block[1].in_channels
     attn = estimator.blocks[0].attn
     device = next(estimator.parameters()).device
-    estimator_input = torch.randn(rows, 320, frames, device=device)
+    estimator_input = torch.randn(rows, 320, frames, device=device, dtype=dtype)
     time_embedding = estimator.t_embedder(torch.rand((), device=device).expand(rows)).unsqueeze(1)
     mask = torch.rand(rows, frames, cached + frames, device=device) > 0.3
     mask[..., 0] = True
-    cnn = [torch.randn(rows, 2 * channels, 2, device=device) for _ in range(depth)]
-    att = [torch.randn(rows, attn.num_heads, cached, 2 * attn.head_dim, device=device) for _ in range(depth)]
-    cnn_out = torch.zeros((depth, rows, 2 * channels, 2), device=device)
-    att_out = torch.zeros((depth, rows, attn.num_heads, cached + frames, 2 * attn.head_dim), device=device)
+    cnn = [torch.randn(rows, 2 * channels, 2, device=device, dtype=dtype) for _ in range(depth)]
+    att = [
+        torch.randn(rows, attn.num_heads, cached, 2 * attn.head_dim, device=device, dtype=dtype) for _ in range(depth)
+    ]
+    cnn_out = torch.zeros((depth, rows, 2 * channels, 2), device=device, dtype=dtype)
+    att_out = torch.zeros((depth, rows, attn.num_heads, cached + frames, 2 * attn.head_dim), device=device, dtype=dtype)
     with torch.no_grad():
         out = body(estimator, estimator_input, time_embedding, mask, cnn, att, cnn_out, att_out, lengths)
     return out, cnn_out, att_out
@@ -67,6 +90,36 @@ def test_fused_body_matches_ragged_body(device: str) -> None:
     actual = _run(blocks_forward_chunk_fused, estimator, rows=4, frames=6, cached=5, lengths=[6, 4])
     for want, got in zip(expected, actual, strict=True):
         torch.testing.assert_close(got, want, rtol=1e-4, atol=2e-4)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("cached", [0, 5])
+def test_fp16_fused_body_matches_ragged_body(cached: int) -> None:
+    estimator = _upstream_dit("cuda").half()
+    backend = BatchedToken2Wav.__new__(BatchedToken2Wav)
+    nn.Module.__init__(backend)
+    backend._ragged_fused_body = True
+    with torch.autocast("cuda", dtype=torch.float16):
+        expected = _run(
+            BatchedToken2Wav._blocks_forward_chunk_ragged,
+            estimator,
+            rows=4,
+            frames=6,
+            cached=cached,
+            lengths=[6, 4],
+            dtype=torch.float16,
+        )
+        actual = _run(
+            backend._ragged_body,
+            estimator,
+            rows=4,
+            frames=6,
+            cached=cached,
+            lengths=[6, 4],
+            dtype=torch.float16,
+        )
+    for want, got in zip(expected, actual, strict=True):
+        torch.testing.assert_close(got, want, rtol=2e-3, atol=2e-3)
 
 
 def test_unsupported_estimator_is_refused() -> None:

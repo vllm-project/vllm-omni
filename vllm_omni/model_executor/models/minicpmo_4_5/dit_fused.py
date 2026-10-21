@@ -172,7 +172,10 @@ def _attention(
     head_dim = int(q.shape[-1])
     keys, values = kv[..., :head_dim], kv[..., head_dim:]
     if rows is not None or (
-        kv.is_cuda and kv.dtype == q.dtype == torch.float32 and tiled_attention_supported(kv.get_device())
+        kv.is_cuda
+        and kv.dtype == q.dtype
+        and q.dtype in (torch.float16, torch.float32)
+        and tiled_attention_supported(kv.get_device())
     ):
         from .cfm_attention import cfm_attention
 

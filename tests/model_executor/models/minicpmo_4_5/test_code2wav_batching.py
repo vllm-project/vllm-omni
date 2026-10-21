@@ -204,6 +204,13 @@ def _config(minimum: int = 1, initial: int = 0, *, runtime_prompt_cache_size: in
         (True, {}, "off", False),
         (True, {"token2wav_allow_tf32": False}, "tf32", True),
         (True, {"cfm_fused_body": True, "token2wav_allow_tf32": False}, None, True),
+        (True, {"token2wav_float16": True, "token2wav_allow_tf32": False}, None, True),
+        (True, {"token2wav_float16": True, "code2wav_allow_tf32": False}, None, True),
+        (True, {"token2wav_float16": True}, "off", True),
+        (True, {"token2wav_float16": "true"}, "off", True),
+        (True, {"token2wav_float16": "false"}, "off", False),
+        (True, {"token2wav_float16": True, "cfm_fused_body": False}, "off", False),
+        (False, {"token2wav_float16": True}, "off", False),
     ],
 )
 def test_cfm_fused_body_default_respects_platform_and_precision(monkeypatch, cuda, extra, env, expected):
