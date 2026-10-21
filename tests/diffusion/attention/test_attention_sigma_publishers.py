@@ -98,3 +98,16 @@ def test_noise_publisher_rejects_invalid_normalized_values(value):
 def test_normalization_requires_positive_finite_reference(reference):
     with pytest.raises(ValueError, match="reference"):
         normalized_sigma(0.1, reference)
+
+
+def test_float32_rounding_of_the_first_h3_sigma_publishes_as_one():
+    """MiniMax-H3 builds its shifted sigmas in float32, so the step-0 sigma can exceed 1 by one ulp."""
+    from vllm_omni.diffusion.models.minimax_h3.time_request import minimax_h3_time_shift_sigmas
+
+    first = minimax_h3_time_shift_sigmas(num_steps=8, shift_scale=2.14)[0]
+    assert first > 1.0
+
+    with set_forward_context(), bind_attention_schedule(None, _ALL):
+        minimax_h3_publish_denoise_progress(0, first, 8)
+        assert get_forward_context().denoise_sigma == 1.0
+        assert get_attention_schedule_profile() == "all"
