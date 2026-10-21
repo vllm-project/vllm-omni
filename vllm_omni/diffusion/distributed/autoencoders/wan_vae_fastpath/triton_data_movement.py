@@ -22,7 +22,7 @@ from __future__ import annotations
 import torch
 from vllm.triton_utils import HAS_TRITON, tl, triton
 
-from ._utils import _pick_block_width
+from ._utils import _pick_block_width, suggests_channels_last
 
 _MAX_INT32 = 2**31 - 1
 _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
@@ -527,10 +527,6 @@ if HAS_TRITON:
         tl.store(out_ptr + offsets, (x + h).to(dtype), mask=mask)
 
 
-def _uses_channels_last_3d(tensor: torch.Tensor) -> bool:
-    return tensor.shape[1] > 1 and tensor.stride(1) == 1
-
-
 def _next_power_of_2(value: int) -> int:
     return 1 << max(0, value - 1).bit_length()
 
@@ -568,7 +564,10 @@ def cat_pad_5d(
     if keep_cache_frames < 0:
         return None
 
-    channels_inner = _uses_channels_last_3d(x)
+    # Upstream's ``torch.cat`` + ``F.pad`` allocate channels_last_3d only when
+    # every input suggests it; a stride(1) == 1 test would also match contiguous
+    # tensors whose only non-unit dimension is C.
+    channels_inner = suggests_channels_last(x) and (cache_x is None or suggests_channels_last(cache_x))
     out_channels_inner = channels_inner or channels_last_output
     cache_frames = 0
     if cache_x is not None:
@@ -713,8 +712,9 @@ def cat_time_5d(
 ) -> tuple[torch.Tensor, torch.Tensor] | torch.Tensor | None:
     """Assemble ``[zeros(pad_front - Tc) | cache | x]`` along time, without spatial padding.
 
-    Returns the assembled tensor (same memory format as ``x``) and, with
-    ``keep_cache_frames > 0``, its last frames as the next feature-cache entry.
+    Returns the assembled tensor (in the memory format upstream's ``torch.cat``
+    would allocate) and, with ``keep_cache_frames > 0``, its last frames as the
+    next feature-cache entry.
     Because only whole aligned planes move, this runs at memory bandwidth in
     both layouts; the spatial zero padding is left to the convolution
     (``padding=(0, ph, pw)``), whose bitwise agreement with a pre-padded input
@@ -746,6 +746,9 @@ def cat_time_5d(
             return None
         cache_frames = cache_x.shape[2]
         cache_strides = (cache_x.stride(0), cache_layout[2], cache_x.stride(2))
+    # The output layout must be the one upstream's ``torch.cat`` would allocate.
+    if channels_last != (suggests_channels_last(x) and (cache_x is None or suggests_channels_last(cache_x))):
+        return None
     zero_front_frames = pad_front - cache_frames
     if zero_front_frames < 0:
         return None

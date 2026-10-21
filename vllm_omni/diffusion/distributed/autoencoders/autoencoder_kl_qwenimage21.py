@@ -92,9 +92,8 @@ class DistributedAutoencoderKLQwenImage21(AutoencoderKLQwenImage21, DistributedV
         time = []
         with _cudnn_deterministic():
             for k in range(len(task.tensor)):
-                self._conv_idx = [0]
                 tile = self.post_quant_conv(task.tensor[k])
-                decoded = self.decoder(tile, feat_cache=self._feat_map, feat_idx=self._conv_idx, first_chunk=(k == 0))
+                decoded = self.decoder(tile, first_chunk=(k == 0))
                 time.append(decoded)
         result = torch.cat(time, dim=2)
         return result

@@ -85,12 +85,7 @@ uncalibrated. See "Known limitations".
 from [`kandinskylab/Kandinsky-6.0-Pro-5s-Diffusers`](https://huggingface.co/kandinskylab/Kandinsky-6.0-Pro-5s-Diffusers)
 (`model_index.json`, `transformer/`, `vae/`, `text_encoder/`, `tokenizer/`,
 `text_encoder_2/`, `tokenizer_2/`, `audio_vae/`, `scheduler/`). Pass that
-repo id (or a local snapshot of it) to `vllm serve` / `Omni(model=...)`.
-The Hub repo is gated; export `HF_TOKEN` if download returns 401.
-
-A raw Kandinsky 6 weight tree is not required. If you already have a local
-Diffusers-layout snapshot, point `--model` at that directory instead of the
-Hub id.
+public repo id to `vllm serve` / `Omni(model=...)`.
 
 Each weight folder is loaded on its own (`transformer/`, `vae/`, `text_encoder/`, `text_encoder_2/`, `audio_vae/`). The DiT is built with initialization skipped, then the framework loader fills it from `transformer/`.
 

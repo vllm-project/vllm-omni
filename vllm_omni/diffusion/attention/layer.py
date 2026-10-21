@@ -21,6 +21,9 @@ from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheSpec
 from vllm_omni.diffusion.attention.backends.abstract import AttentionBackend, AttentionImpl, AttentionMetadata
 from vllm_omni.diffusion.attention.backends.sdpa import SDPABackend, SDPAImpl
 from vllm_omni.diffusion.attention.capabilities import (
+    AttentionComputation,
+    CapabilityResult,
+    CrossAttentionParallelLayout,
     ExecutionContext,
     ExecutionPathResult,
     OuterBoundary,
@@ -95,12 +98,40 @@ class Attention(nn.Module):
         # Keep the platform-selected backend and its capabilities unchanged.
         # Each override must preserve the selected implementation's contract.
         impl_overrides: Mapping[str, type[AttentionImpl]] | None = None,
+        # Computation semantics are independent of the role used for config.
+        # Omitted for legacy callers; new cross-attention callers set it.
+        computation: AttentionComputation | str | None = None,
+        cross_parallel_layout: CrossAttentionParallelLayout | str | None = None,
+        cross_mask_kind: str | None = None,
     ):
         super().__init__()
 
         self.role = role
         self.role_category = role_category
         self.qkv_layout = qkv_layout
+        default_computation = "cross" if role == "cross" else "self"
+        self.computation = AttentionComputation(computation if computation is not None else default_computation)
+        self._explicit_cross_contract = computation is not None and self.computation is AttentionComputation.CROSS
+        self.cross_parallel_layout = (
+            CrossAttentionParallelLayout(cross_parallel_layout) if cross_parallel_layout is not None else None
+        )
+        self.cross_mask_kind = cross_mask_kind
+        if self._explicit_cross_contract:
+            if causal:
+                raise NotImplementedError("The first cross-attention contract supports noncausal execution only")
+            if qkv_layout != "BSND":
+                raise ValueError("The first cross-attention contract requires qkv_layout='BSND'")
+            if skip_sequence_parallel and self.cross_parallel_layout is None:
+                raise ValueError("Skipping SP for cross attention requires an explicit Q/KV placement")
+            if (
+                self.cross_parallel_layout in (CrossAttentionParallelLayout.REPLICATED_Q_SHARDED_KV,)
+                and skip_sequence_parallel
+            ):
+                raise ValueError("Sharded-KV cross attention requires SP communication")
+            if paged_kv_cache_role is not None:
+                raise ValueError("Conditioning cross attention does not use Scheduler-managed paged KV")
+            if cross_mask_kind not in (None, "kv", "pair"):
+                raise ValueError("Cross mask kind must be 'kv' or 'pair'")
         # ``prefix`` is also the stable layer identity used by vLLM's native
         # KV-cache metadata.  Keep it on the Omni layer so the active paged
         # adapter can dispatch the already-resharded Q/K/V to the matching
@@ -113,6 +144,10 @@ class Attention(nn.Module):
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads if num_kv_heads is not None else num_heads
         self.head_size = head_size
+        if self._explicit_cross_contract and (
+            num_heads <= 0 or self.num_kv_heads <= 0 or num_heads % self.num_kv_heads or head_size <= 0
+        ):
+            raise ValueError("Cross attention requires positive head dimensions and Q heads divisible by KV heads")
 
         self._has_custom_attention = custom_attention is not None
 
@@ -197,7 +232,7 @@ class Attention(nn.Module):
                 self.backend_pref = attn_backend_cls.get_name()
                 logger.debug("Attention(role=%s) → platform default (%s)", role, self.backend_pref)
 
-            self.attn_backend: type[AttentionBackend] | None = attn_backend_cls
+            self.attn_backend = attn_backend_cls
             self.attn_impl_cls = self.attn_backend.get_impl_cls()
             if impl_overrides is not None:
                 override = impl_overrides.get(attn_backend_cls.get_name())
@@ -219,11 +254,12 @@ class Attention(nn.Module):
                 prefix=prefix,
                 backend_kwargs=backend_kwargs,
                 role=role,
+                computation=self.computation,
                 backend_explicit=self.backend_explicit,
             )
             # Compatibility kernels run inside shared dispatch, between the
             # parallel strategy's input preparation and output restoration.
-            self.sdpa_fallback: AttentionImpl | None = SDPABackend.get_impl_cls()(
+            self.sdpa_fallback = SDPABackend.get_impl_cls()(
                 num_heads=num_heads,
                 head_size=head_size,
                 softmax_scale=softmax_scale,
@@ -243,6 +279,27 @@ class Attention(nn.Module):
             self.sdpa_fallback = None
             logger.debug("Attention(role=%s) → custom kernel=%s", role, type(custom_attention).__name__)
 
+        # Backend and head geometry are fixed for the layer. Resolve these
+        # capabilities once rather than repeating platform queries per step.
+        self._cross_head_limitation = None
+        self._cross_mask_limitation = None
+        if self._explicit_cross_contract:
+            if self.attn_backend is None:
+                raise NotImplementedError("Explicit cross attention requires a shared attention backend")
+            if not self.attn_backend.supports_cross_head_geometry(self.num_heads, self.num_kv_heads):
+                self._cross_head_limitation = f"Q/KV head geometry {self.num_heads}/{self.num_kv_heads}"
+            if cross_mask_kind == "kv" and not self.attn_backend.supports_cross_kv_mask(self.attn_spec):
+                self._cross_mask_limitation = "KV-only validity mask"
+            elif cross_mask_kind == "pair" and not self.attn_backend.supports_cross_pair_mask(self.attn_spec):
+                self._cross_mask_limitation = "pair restrictions"
+            limitation = self._cross_head_limitation or self._cross_mask_limitation
+            if limitation is not None and not self.backend_explicit:
+                logger.warning_once(
+                    "Cross attention will use SDPA for calls requiring %s because %s does not support it",
+                    limitation,
+                    self.attn_backend.get_name(),
+                )
+
         self.softmax_scale = softmax_scale
         self.scatter_idx = scatter_idx
         self.gather_idx = gather_idx
@@ -256,7 +313,7 @@ class Attention(nn.Module):
         self.ring_runner = None
 
         if config is not None:
-            if config.parallel_config.ring_degree > 1:
+            if config.parallel_config.ring_degree > 1 and not self._explicit_cross_contract:
                 self.use_ring = True
                 sp_group = get_sp_group()
                 self.ring_pg = sp_group.ring_group
@@ -271,6 +328,7 @@ class Attention(nn.Module):
             gather_idx=gather_idx,
             use_sync=use_sync,
             causal=causal,
+            cross_parallel_layout=self.cross_parallel_layout if self._explicit_cross_contract else None,
         )
         # Local strategy when SP is intentionally inactive outside sharded regions.
         self._no_parallel_strategy = NoParallelAttention()
@@ -427,6 +485,7 @@ class Attention(nn.Module):
         else:
             parallel_strategy = {
                 "allgather_kv": ParallelStrategy.ALLGATHER_KV,
+                "cross_reshard_kv": ParallelStrategy.CROSS_RESHARD_KV,
                 "ulysses": ParallelStrategy.ULYSSES,
             }.get(strategy_name, ParallelStrategy.NONE)
         resolved_context = replace(
@@ -434,15 +493,32 @@ class Attention(nn.Module):
             outer_boundaries=frozenset(boundaries),
             paged_kv=self.is_paged_kv_active(),
             parallel_strategy=parallel_strategy,
+            computation=getattr(self, "computation", AttentionComputation.SELF),
+            q_heads=getattr(self, "num_heads", context.q_heads),
+            kv_heads=getattr(self, "num_kv_heads", context.kv_heads),
+            head_dim=getattr(self, "head_size", context.head_dim),
+            cross_parallel_layout=getattr(self, "cross_parallel_layout", context.cross_parallel_layout),
+            cross_mask_kind=getattr(self, "cross_mask_kind", context.cross_mask_kind),
         )
+        if not resolved_context.paged_kv:
+            attn_metadata = self._with_kv_cache_dtype(attn_metadata)
+        if getattr(self, "_explicit_cross_contract", False):
+            reason = self._cross_backend_limitation(attn_metadata)
+            if reason is not None:
+                blocked = self._cross_fallback_blocker(attn_metadata)
+                result = self.sdpa_fallback.resolve_execution_path(resolved_context, query, key, value, attn_metadata)
+                return replace(
+                    result,
+                    backend=self.attn_backend.get_name() if blocked else "SDPA",
+                    path="cross_unsupported" if blocked else "cross_sdpa_fallback",
+                    support=CapabilityResult.unsupported(blocked) if blocked else CapabilityResult.unmigrated(reason),
+                )
         resolver = getattr(self.attention, "resolve_execution_path", None)
         if not callable(resolver):
             return ExecutionPathResult.unmigrated(
                 type(self.attention).__name__,
                 resolved_context,
             )
-        if not resolved_context.paged_kv:
-            attn_metadata = self._with_kv_cache_dtype(attn_metadata)
         return resolver(
             resolved_context,
             query,
@@ -468,8 +544,15 @@ class Attention(nn.Module):
         value: torch.Tensor,
         attn_metadata: AttentionMetadata | None = None,
     ) -> torch.Tensor:
+        if getattr(self, "_explicit_cross_contract", False):
+            self._validate_cross_inputs(query, key, value, attn_metadata)
         # Get the appropriate parallel strategy based on SP active state
         strategy = self._get_active_parallel_strategy()
+        if self._explicit_cross_contract and self.cross_parallel_layout is None and strategy.enabled:
+            raise ValueError(
+                "Cross attention with SP requires an explicit Q/KV placement; "
+                "declare local_q_replicated_kv when K/V is replicated on each rank"
+            )
         paged_adapter = self._active_paged_kv_adapter()
         in_kv_memory_profile = is_forward_context_available() and get_forward_context().in_diffusion_kv_memory_profile
         if (
@@ -496,8 +579,10 @@ class Attention(nn.Module):
                 raise NotImplementedError(
                     "paged Scheduler KV is not supported with Ring attention; use strict Ulysses or no SP"
                 )
-            if strategy_name == "allgather_kv":
-                raise NotImplementedError("paged Scheduler KV is not supported with AllGather-KV sequence parallelism")
+            if strategy_name in ("allgather_kv", "ulysses_allgather_kv"):
+                raise NotImplementedError(
+                    f"paged Scheduler KV is not supported with the {strategy_name!r} sequence-parallel strategy"
+                )
             if strategy_name == "ulysses" and get_ulysses_mode(default="strict") != "strict":
                 raise NotImplementedError("paged Scheduler KV currently supports only strict Ulysses")
 
@@ -564,8 +649,102 @@ class Attention(nn.Module):
         # 3. Post-processing (Reverse Communication)
         # For Ulysses: AllToAll Output, and AllGather Joint Output
         out = strategy.post_attention(out, ctx)
+        if getattr(self, "_explicit_cross_contract", False) and attn_metadata is not None:
+            if attn_metadata.cross_query_mask is not None:
+                out = out.masked_fill(~attn_metadata.cross_query_mask[:, :, None, None], 0)
 
         return out
+
+    def _validate_cross_inputs(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: AttentionMetadata | None,
+    ) -> None:
+        if query.ndim != 4 or key.ndim != 4 or value.ndim != 4:
+            raise ValueError("Cross attention requires BSND Q/K/V tensors")
+        q_shape, k_shape, v_shape = query.shape, key.shape, value.shape
+        if q_shape[0] != k_shape[0] or k_shape[0] != v_shape[0]:
+            raise ValueError("Cross attention requires matching Q/K/V batch sizes")
+        if q_shape[1] <= 0 or k_shape[1] <= 0 or k_shape[1] != v_shape[1]:
+            raise ValueError("Cross attention requires nonempty Q/K/V and matching K/V sequence lengths")
+        if q_shape[2] != self.num_heads or k_shape[2] != self.num_kv_heads or v_shape[2] != self.num_kv_heads:
+            raise ValueError("Cross attention Q/K/V head counts do not match the declared local head geometry")
+        if q_shape[3] != self.head_size or k_shape[3] != self.head_size or v_shape[3] != self.head_size:
+            raise ValueError("Cross attention Q/K/V head dimensions must match head_size")
+        if (
+            query.dtype != key.dtype
+            or key.dtype != value.dtype
+            or query.device != key.device
+            or key.device != value.device
+        ):
+            raise ValueError("Cross attention Q/K/V must have the same dtype and device")
+        if attn_metadata is None:
+            return
+        if (
+            attn_metadata.joint_attn_mask is not None
+            or attn_metadata.joint_query is not None
+            or attn_metadata.joint_key is not None
+            or attn_metadata.joint_value is not None
+            or attn_metadata.full_attn_spans is not None
+            or attn_metadata.query_ranges is not None
+            or attn_metadata.video_layout is not None
+            or attn_metadata.packed_padding is not None
+            or set(attn_metadata.extra) - {"attention_mask_mode"}
+        ):
+            raise NotImplementedError("Explicit cross attention does not accept joint or packed metadata")
+        q_mask = attn_metadata.cross_query_mask
+        if q_mask is not None and (
+            q_mask.dtype != torch.bool or q_mask.shape != q_shape[:2] or q_mask.device != query.device
+        ):
+            raise ValueError("Cross Q validity must be a Boolean [B, Q_len] tensor on the Q device")
+        if attn_metadata.attn_mask is None:
+            return
+        mask = attn_metadata.attn_mask
+        if mask.device != query.device:
+            raise ValueError("Cross attention mask must be on the Q/K/V device")
+        if self.cross_mask_kind == "pair":
+            if (
+                mask.ndim != 4
+                or mask.shape[0] not in (1, q_shape[0])
+                or mask.shape[1] not in (1, self.num_heads)
+                or mask.shape[2] not in (1, q_shape[1])
+                or mask.shape[3] != k_shape[1]
+                or mask.dtype not in (torch.bool, torch.float32, query.dtype)
+            ):
+                raise ValueError("Cross pair mask must broadcast to [B, Q_heads, Q_len, KV_len]")
+            if not attn_metadata.cross_pair_mask_validated:
+                raise ValueError("Cross pair masks must be prepared with AttentionMetadata.for_cross_pair_mask")
+            return
+        if self.cross_mask_kind != "kv":
+            raise ValueError("Cross attention requires cross_mask_kind='kv' or 'pair' when a mask is supplied")
+        if mask.ndim != 2 or mask.shape != (q_shape[0], k_shape[1]) or mask.dtype != torch.bool:
+            raise ValueError("The cross-attention mask must be a Boolean KV validity mask of shape [B, KV_len]")
+        if mask.device.type != "cpu" and not attn_metadata.cross_kv_rows_validated:
+            raise ValueError("GPU cross K/V masks must be prepared with AttentionMetadata.for_cross_kv_mask")
+        if mask.device.type == "cpu" and not attn_metadata.cross_kv_rows_validated and not bool(mask.any(dim=1).all()):
+            raise ValueError("Each cross-attention batch row must contain at least one valid K/V position")
+
+    def _cross_backend_limitation(self, attn_metadata: AttentionMetadata | None) -> str | None:
+        if self._cross_head_limitation is not None:
+            return self._cross_head_limitation
+        if attn_metadata is not None and attn_metadata.attn_mask is not None:
+            return self._cross_mask_limitation
+        return None
+
+    def _cross_fallback_blocker(self, attn_metadata: AttentionMetadata | None) -> str | None:
+        if self.backend_explicit:
+            return (
+                f"Explicit backend {self.attn_backend.get_name()} does not support "
+                f"{self._cross_backend_limitation(attn_metadata)}"
+            )
+        if attn_metadata is not None and attn_metadata.extra.get("kv_cache_dtype") not in (None, "float"):
+            return (
+                "Cross SDPA fallback does not support quantized K/V; "
+                "disable KV quantization or select a compatible backend"
+            )
+        return None
 
     @staticmethod
     def _active_paged_kv_adapter():
@@ -584,6 +763,13 @@ class Attention(nn.Module):
         if self._has_custom_attention:
             return cast(nn.Module, self.attention)(query, key, value, attn_metadata)
 
+        if getattr(self, "_explicit_cross_contract", False):
+            reason = self._cross_backend_limitation(attn_metadata)
+            if reason is not None:
+                blocked = self._cross_fallback_blocker(attn_metadata)
+                if blocked is not None:
+                    raise NotImplementedError(blocked)
+                return self.sdpa_fallback.forward(query, key, value, attn_metadata)
         self._assert_metadata_compatible(attn_metadata)
 
         if (

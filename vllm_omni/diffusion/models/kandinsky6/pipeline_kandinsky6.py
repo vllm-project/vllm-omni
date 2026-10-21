@@ -799,9 +799,16 @@ def _adapt_k6_weight_name(name: str) -> str:
     ``mel_converter`` lives on ``native``.
     """
     if name.startswith("transformer."):
-        # Released Pro-5s checkpoints use the pre-rename block names.
+        # Current Pro-5s snapshots use Diffusers names: encoder ``attn``,
+        # ``FeedForward.net``, and ``TimestepEmbedding.linear_*``. Older
+        # snapshots still use ``videoT`` / ``audioT`` and ``in_layer``.
         rest = name[len("transformer.") :]
         rest = rest.replace(".videoT.", ".video_dec_block.").replace(".audioT.", ".audio_dec_block.")
+        rest = rest.replace(".attn.", ".self_attention.")
+        rest = rest.replace(".feed_forward.net.0.proj.", ".feed_forward.in_layer.")
+        rest = rest.replace(".feed_forward.net.2.", ".feed_forward.out_layer.")
+        rest = rest.replace(".timestep_embedder.linear_1.", ".in_layer.")
+        rest = rest.replace(".timestep_embedder.linear_2.", ".out_layer.")
         return "transformer." + rest
     if name.startswith("text_encoder."):
         rest = name[len("text_encoder.") :]

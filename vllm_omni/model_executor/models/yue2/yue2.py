@@ -1933,6 +1933,10 @@ class Yue2ForCausalLM(nn.Module):
     # opting out keeps the merged prefix-cache view from rebuilding "hidden"
     # payloads (KV-block prefix caching for cot=full stays on).
     requires_full_prefix_cached_hidden_states: bool = False
+    # _ship_audio appends the song in sample(), after the runner saved the
+    # step for the omni prefix cache; with prefix caching on, the payload is
+    # built from these live outputs rather than the step snapshot.
+    mm_outputs_written_in_sample: bool = True
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()

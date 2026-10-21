@@ -1054,3 +1054,86 @@ def test_predict_noise_with_multi_branch_cfg_parity(
         batch_size=batch_size,
         cfg_normalize=cfg_normalize,
     )
+
+
+class _FlagRecordingTransformer(SimpleTransformer):
+    """Records ``do_true_cfg`` at each forward call."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.seen_flags: list[Any] = []
+
+    def forward(self, x: torch.Tensor, **kwargs) -> tuple[torch.Tensor]:
+        self.seen_flags.append(getattr(self, "do_true_cfg", None))
+        return super().forward(x, **kwargs)
+
+
+class _FlagRecordingPipeline(CFGParallelMixin):
+    def __init__(self) -> None:
+        _set_random_seeds(0)
+        self.transformer = _FlagRecordingTransformer(in_channels=4, hidden_dim=32)
+
+
+@pytest.mark.core_model
+@pytest.mark.diffusion
+@pytest.mark.cpu
+def test_sequential_cfg_marks_transformer_for_per_branch_caches():
+    """``predict_noise_maybe_with_cfg`` sets ``transformer.do_true_cfg`` per call and clears it without CFG."""
+    pipeline = _FlagRecordingPipeline()
+    positive_kwargs, negative_kwargs = _make_two_branch_inputs(
+        batch_size=1, channels=4, height=4, width=4, dtype=torch.float32, device=torch.device("cpu"), input_seed=1
+    )
+
+    with torch.no_grad():
+        pipeline.predict_noise_maybe_with_cfg(
+            do_true_cfg=True,
+            true_cfg_scale=4.0,
+            positive_kwargs=positive_kwargs,
+            negative_kwargs=negative_kwargs,
+            cfg_normalize=False,
+        )
+        assert pipeline.transformer.seen_flags == [True, True]
+
+        pipeline.predict_noise_maybe_with_cfg(
+            do_true_cfg=False,
+            true_cfg_scale=1.0,
+            positive_kwargs=positive_kwargs,
+            negative_kwargs=None,
+            cfg_normalize=False,
+        )
+
+    assert pipeline.transformer.seen_flags == [True, True, False]
+    assert pipeline.transformer.do_true_cfg is False
+
+
+class _NoTransformerPipeline(CFGParallelMixin):
+    """Pipelines may route predict_noise to a module not named ``transformer``."""
+
+    def __init__(self) -> None:
+        _set_random_seeds(0)
+        self.denoiser = SimpleTransformer(in_channels=4, hidden_dim=32)
+
+    def predict_noise(self, *args: Any, **kwargs: Any) -> torch.Tensor:
+        return self.denoiser(*args, **kwargs)[0]
+
+
+@pytest.mark.core_model
+@pytest.mark.diffusion
+@pytest.mark.cpu
+def test_sequential_cfg_without_transformer_attribute():
+    pipeline = _NoTransformerPipeline()
+    positive_kwargs, negative_kwargs = _make_two_branch_inputs(
+        batch_size=1, channels=4, height=4, width=4, dtype=torch.float32, device=torch.device("cpu"), input_seed=2
+    )
+
+    with torch.no_grad():
+        out = pipeline.predict_noise_maybe_with_cfg(
+            do_true_cfg=True,
+            true_cfg_scale=4.0,
+            positive_kwargs=positive_kwargs,
+            negative_kwargs=negative_kwargs,
+            cfg_normalize=False,
+        )
+
+    assert out.shape == (1, 4, 4, 4)
+    assert not hasattr(pipeline, "transformer")

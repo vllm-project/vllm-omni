@@ -25,6 +25,11 @@ FIRST_AUDIO_REQUIRED_KEY = "_omni_first_audio_required"
 
 REQUEST_ARTIFACT_DIRS_KEY = "_omni_request_artifact_dirs"
 TRANSFORM_OWNED_META_KEYS = frozenset({"minimax_h3_prepared_reference_videos"})
+# Prefix of the flat ``f"{NS}.<name>"`` additional_information keys that carry
+# an async-chunk placeholder's prewarm payload. Values stay top-level tensors or
+# scalars (a dict holding a tensor would come back as a list); the receiving
+# scheduler pops these keys before the request reaches the model.
+ASYNC_CHUNK_PREWARM_NS = "_async_chunk_prewarm"
 
 if TYPE_CHECKING:
     from vllm_omni.engine import AdditionalInformationEntry, AdditionalInformationPayload
@@ -244,6 +249,12 @@ class MetaStruct(_StructBase):
     audio_seed: int | None = None
     token_role_ids: torch.Tensor | None = None
     minimax_h3_prepared_reference_videos: str | None = None
+    # Assistant text-token count the request's prompt has reached when this
+    # payload was produced: a running count over the request's text ids, which
+    # covers every segment a resumable request has been fed so far.  A consumer
+    # derives one segment's n_k as the increase between consecutive segment
+    # boundaries; the value itself is not segment-local.
+    request_text_tokens: int | None = None
 
 
 class OmniPayloadStruct(_StructBase):

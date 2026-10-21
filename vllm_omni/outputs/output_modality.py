@@ -139,9 +139,19 @@ class TensorAccumulationStrategy(Enum):
 # these defaults in the output process too, which may never import the model's
 # worker-side stage input processor. Feature lengths can change between
 # snapshots and cannot be concatenated as generated content deltas.
+# ``meta.finished`` is a per-step scalar end-of-stream flag (0-d tensor). The
+# step-to-step transport consumes it per chunk inside the engine; on the
+# output side it is a snapshot too -- the latest flag supersedes earlier ones,
+# and torch.cat on a list of 0-d tensors raises, aborting the request.
 _KEY_ACCUMULATION_OVERRIDES: dict[str, TensorAccumulationStrategy] = {
     key: TensorAccumulationStrategy.REPLACE
-    for key in ("embed.speech_token", "embed.speech_feat", "embed.embedding", "embed.speech_token_len")
+    for key in (
+        "embed.speech_token",
+        "embed.speech_feat",
+        "embed.embedding",
+        "embed.speech_token_len",
+        "meta.finished",
+    )
 }
 
 

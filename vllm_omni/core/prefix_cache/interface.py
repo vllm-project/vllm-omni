@@ -146,6 +146,19 @@ class ModelCachePolicy:
     # clone until finish/abort (JOIN_ON_FINISH). Also skipped by the
     # immediate on-device clone / device→host path.
     deferred_keys: frozenset[TensorName] = frozenset()
+    # The model appends its multimodal outputs in sample(), after the step
+    # was saved (YuE2 ships the finished song there), so the step's mm
+    # snapshot is missing them. The runner then discards the step snapshot
+    # and builds the payload from the live outputs, which carry no
+    # full-prompt hidden states.
+    mm_outputs_written_in_sample: bool = False
+
+    def __post_init__(self) -> None:
+        if self.mm_outputs_written_in_sample and self.needs_full_hidden_states:
+            raise OmniPrefixCacheUnmatchError(
+                "mm_outputs_written_in_sample needs requires_full_prefix_cached_hidden_states = False: "
+                "the payload is built from the live outputs, which carry no full-prompt hidden states"
+            )
 
     @property
     def hidden_key(self) -> TensorName | None:
@@ -168,4 +181,5 @@ class ModelCachePolicy:
         return cls(
             needs_full_hidden_states=bool(getattr(model, "requires_full_prefix_cached_hidden_states", True)),
             deferred_keys=deferred,
+            mm_outputs_written_in_sample=bool(getattr(model, "mm_outputs_written_in_sample", False)),
         )

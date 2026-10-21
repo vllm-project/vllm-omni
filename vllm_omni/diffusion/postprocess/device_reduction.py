@@ -98,6 +98,7 @@ def prepare_diffusion_media_for_transport(
         frames = reduce_video_to_uint8_frames(
             constrained_video.tensor,
             do_denormalize=constrained_video.spec.value_range is VideoValueRange.NEGATIVE_ONE_TO_ONE,
+            preserve_input_dtype=constrained_video.spec.preserve_input_dtype,
         )
     except torch.OutOfMemoryError:
         logger.warning("Device video preparation ran out of memory; using normalized float transport")
@@ -129,24 +130,46 @@ def prepare_diffusion_media_for_transport(
     return _prepare_float_media_for_transport(media, constrained_video)
 
 
-def reduce_video_to_uint8_frames(video: torch.Tensor, *, do_denormalize: bool = True) -> torch.Tensor:
-    """Reduce a decoded ``[B, C, F, H, W]`` video to uint8 ``[B, F, H, W, C]`` frames.
+# Bound intermediates at the post-VAE memory peak; the full uint8 output is
+# still allocated once, with OOM handled by transport preparation above.
+_VIDEO_CHUNK_BYTES = 64 << 20
 
-    Runs denormalize/clamp/permute/round on the input's device so the following
-    D2H copy carries uint8 instead of float. The result matches
-    ``VideoProcessor.postprocess_video(output_type="np")`` then the ``*255``
-    rounding done in the API server. Pass ``do_denormalize=False`` for VAEs that
-    already emit ``[0, 1]``.
+
+def reduce_video_to_uint8_frames(
+    video: torch.Tensor, *, do_denormalize: bool = True, preserve_input_dtype: bool = False
+) -> torch.Tensor:
+    """Convert BCTHW video to contiguous BTHWC bytes without mutating the input.
+
+    Default arithmetic is float32. ``preserve_input_dtype`` denormalizes in
+    the decoded dtype before the float32 scale/round, preserving historical
+    VideoProcessor bytes for pipelines such as Cosmos3. That opt-in path also
+    bounds conversion temporaries by processing frame chunks.
     """
     if video.dim() != 5:
         raise ValueError(f"expected a [B, C, F, H, W] video tensor, got shape {tuple(video.shape)}")
+    if not preserve_input_dtype:
+        # Match the numpy path, which promotes to float before scaling.
+        frames = video.to(torch.float32)
+        if do_denormalize:
+            frames = frames.mul(_DENORM_SCALE).add(_DENORM_SHIFT).clamp_(0.0, 1.0)
+        else:
+            frames = frames.clamp(0.0, 1.0)
+        frames = frames.permute(0, 2, 3, 4, 1)
+        frames = frames.mul_(255.0).round_().clamp_(0.0, 255.0).to(torch.uint8)
+        return frames.contiguous()
 
-    # Match the numpy path, which promotes to float before scaling.
-    frames = video.to(torch.float32)
-    if do_denormalize:
-        frames = frames.mul(_DENORM_SCALE).add(_DENORM_SHIFT).clamp_(0.0, 1.0)
-    else:
-        frames = frames.clamp(0.0, 1.0)
-    frames = frames.permute(0, 2, 3, 4, 1)
-    frames = frames.mul_(255.0).round_().clamp_(0.0, 255.0).to(torch.uint8)
-    return frames.contiguous()
+    video = video.detach()
+    batch, channels, frames, height, width = video.shape
+    out = torch.empty((batch, frames, height, width, channels), dtype=torch.uint8, device=video.device)
+    bytes_per_value = 4 if video.dtype == torch.float32 else video.element_size() + 4
+    step = max(1, _VIDEO_CHUNK_BYTES // (batch * channels * height * width * bytes_per_value))
+    for start in range(0, frames, step):
+        stop = min(start + step, frames)
+        chunk = video[:, :, start:stop].permute(0, 2, 3, 4, 1).clone()
+        if do_denormalize:
+            chunk.mul_(_DENORM_SCALE).add_(_DENORM_SHIFT)
+        chunk.clamp_(0.0, 1.0)
+        if chunk.dtype != torch.float32:
+            chunk = chunk.float()
+        out[:, start:stop] = chunk.mul_(255.0).round_().to(torch.uint8)
+    return out

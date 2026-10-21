@@ -43,9 +43,9 @@ pytestmark = [
     pytest.mark.skipif(
         not _checkpoint_on_disk(MODEL),
         reason=(
-            "Kandinsky 6 Diffusers weights are gated. Set KANDINSKY6_MODEL or "
-            "MODEL_PREFIX to a local copy of "
-            "kandinskylab/Kandinsky-6.0-Pro-5s-Diffusers."
+            "Kandinsky 6 Diffusers weights are not on disk. Download "
+            "kandinskylab/Kandinsky-6.0-Pro-5s-Diffusers or set "
+            "KANDINSKY6_MODEL / MODEL_PREFIX."
         ),
     ),
 ]
@@ -68,7 +68,7 @@ def _get_diffusion_feature_cases(model: str):
     ]
 
 
-@pytest.mark.advanced_model
+@pytest.mark.slow
 @pytest.mark.diffusion
 @pytest.mark.parametrize("omni_server", _get_diffusion_feature_cases(MODEL), indirect=True)
 def test_text_to_video_and_audio_001(omni_server: OmniServer, online_client: OnlineOmniClient) -> None:

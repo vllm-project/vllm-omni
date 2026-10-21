@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any, Literal
 import huggingface_hub
 import vllm.envs as envs
 from omegaconf import OmegaConf
+from vllm.exceptions import RetryableRequestError
 from vllm.logger import init_logger
 from vllm.transformers_utils.repo_utils import file_or_path_exists
 from vllm.transformers_utils.runai_utils import is_runai_obj_uri
@@ -181,6 +182,7 @@ class OmniBase(PDDisaggregationMixin):
         stage_init_timeout = kwargs.pop("stage_init_timeout", 300)
         init_timeout = kwargs.pop("init_timeout", 600)
         log_stats = kwargs.pop("log_stats", False)
+        collect_stage_metrics = kwargs.pop("collect_stage_metrics", True)
         self._enable_ar_profiler = kwargs.pop("enable_ar_profiler", False)
         # NOTE: read-only lookup — must NOT pop. Popping here drops the key
         # before it reaches ``StageConfigFactory._create_legacy_from_registry``, so
@@ -198,6 +200,7 @@ class OmniBase(PDDisaggregationMixin):
         self.__dict__["_name"] = self.__class__.__name__
         self.model = model
         self.log_stats = log_stats
+        self.collect_stage_metrics = collect_stage_metrics
         # Provisional value (mirrors the CLI/caller kwarg); the engine resolves
         # pipeline + deploy YAML + CLI precedence below and the final value is
         # re-assigned from ``self.engine.async_chunk`` after init.
@@ -219,6 +222,7 @@ class OmniBase(PDDisaggregationMixin):
             transfer_emitter=self.transfer_metrics,
             prom_metrics=self.prom_metrics,
             log_stats=log_stats,
+            collect_stage_metrics=collect_stage_metrics,
             **kwargs,
         )
         self._shutdown_called = False
@@ -506,6 +510,9 @@ class OmniBase(PDDisaggregationMixin):
                     msg.error,
                     error_stage_id=msg.stage_id,
                 )
+            if msg.mm_cache_miss_hashes and msg.request_id is not None and msg.request_id not in self.request_states:
+                # The engine has applied cache feedback for a cancelled request.
+                return True, None, None, None
             self._raise_nonfatal_error_message(msg)
 
         if not isinstance(msg, OutputMessage):
@@ -544,6 +551,8 @@ class OmniBase(PDDisaggregationMixin):
 
     def _raise_nonfatal_error_message(self, msg: ErrorMessage) -> None:
         """Raise the exception for a non-fatal, request-scoped error message."""
+        if msg.mm_cache_miss_hashes and msg.status_code == 503 and msg.error_type == "ServiceUnavailableError":
+            raise RetryableRequestError(msg.error)
         raise_client_error_or(
             msg.error,
             status_code=msg.status_code,
@@ -741,7 +750,9 @@ class OmniBase(PDDisaggregationMixin):
                 evt_output_type = evt_stage_meta.final_output_type
             stage_name = evt_stage_meta.model_stage
             sid_key = str(sid)
-            stage_metrics[sid_key] = OrchestratorAggregator._merge_stage_metric_event(stage_metrics.get(sid_key), evt)
+            stage_metrics[sid_key] = OrchestratorAggregator._merge_stage_metric_event(
+                stage_metrics.get(sid_key), evt, collect_stage_metrics=self.collect_stage_metrics
+            )
             stage_metrics[sid_key]["stage_name"] = stage_name or f"stage_{sid}"
             stage_metrics[sid_key]["final_output_type"] = evt_output_type
         if stage_metrics:

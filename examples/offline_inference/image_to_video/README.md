@@ -30,7 +30,7 @@ This folder provides a unified CLI script for image-to-video generation using vL
 | `sand-ai/MAGI-2-preview` | 512 x 896 | 125 | 100 | Model-fixed | Native four-GPU TP/SP; resident SP4 default; DLO available |
 | `Efficient-Large-Model/SANA-Video_2B_480p_diffusers` | 480 x 832 | 81 | 50 | 6.0 | Native `SanaImageToVideoPipeline`; Wan VAE |
 | `Efficient-Large-Model/SANA-Video_2B_720p_diffusers` | 704 x 1280 | 81 | 50 | 6.0 | Native `SanaImageToVideoPipeline`; LTX-2 Video VAE |
-| `kandinskylab/Kandinsky-6.0-Pro-5s-Diffusers` | 480 x 864 | 125 | 50 | 5.0 | ~75 GiB reserved (H100, CPU offload); gated Hub repo |
+| `kandinskylab/Kandinsky-6.0-Pro-5s-Diffusers` | 480 x 864 | 125 | 50 | 5.0 | ~75 GiB reserved (H100, CPU offload); public Hub repo |
 
 MAGI-2 native Preview setup, four-GPU topology and DLO choices, I2VA commands,
 and eight-GPU validation status are documented in the

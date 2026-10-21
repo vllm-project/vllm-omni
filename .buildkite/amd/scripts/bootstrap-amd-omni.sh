@@ -24,6 +24,10 @@ if [[ -z "${NIGHTLY:-}" ]]; then
     NIGHTLY=0
 fi
 
+if [[ -z "${WEEKLY:-}" ]]; then
+    WEEKLY=0
+fi
+
 if [[ -z "${VLLM_CI_BRANCH:-}" ]]; then
     VLLM_CI_BRANCH="main"
 fi
@@ -61,7 +65,8 @@ resolve_test_specs() {
         --branch "$BUILDKITE_BRANCH" \
         --labels "$PR_LABELS" \
         --debug-test-yaml "${DEBUG_TEST_YAML:-}" \
-        --nightly "$NIGHTLY"); then
+        --nightly "$NIGHTLY" \
+        --weekly "$WEEKLY"); then
         exit 1
     fi
 
@@ -84,6 +89,23 @@ filter_test_specs_by_skip_ci() {
             NIGHTLY_TESTS:*)
                 # Explicit PR and scheduled nightly selections must survive
                 # L2/L3 diff gating, including docs-only main commits.
+                runnable_specs+=("$suite_spec")
+                continue
+                ;;
+            WEEKLY_TESTS:*)
+                # Scheduled release-line weekly survives docs-only skip-all.
+                # A PR weekly-test label, including one opened from release/vX.Y.Z, does not.
+                if is_release_line_push && [[ "${WEEKLY}" == "1" ]]; then
+                    runnable_specs+=("$suite_spec")
+                    continue
+                fi
+                if decision=$(python3 "$SKIP_CI_PY" gate amd l2); then
+                    if [[ "$decision" == "skip-all" ]]; then
+                        echo "Skipping AMD weekly suite due to skip-all decision."
+                        skip_all=1
+                        continue
+                    fi
+                fi
                 runnable_specs+=("$suite_spec")
                 continue
                 ;;
@@ -144,46 +166,23 @@ upload_pipeline() {
 
     FAIL_FAST=$(fail_fast)
 
+    if is_release_line_branch && [[ "${BUILDKITE_PULL_REQUEST:-false}" == "false" ]]; then
+        # AMD checkouts are depth one. Read the first-parent object ID from
+        # the commit header without requiring the parent object locally.
+        VLLM_AITER_MHA_TRUSTED_COMMIT=$(git cat-file -p HEAD | sed -n 's/^parent //p' | head -n 1)
+    else
+        VLLM_AITER_MHA_TRUSTED_COMMIT=$DIFF_BASE
+    fi
+
     cd .buildkite/amd
 
     # Multiple label-selected or debug-selected suites share one image build.
+    # When suites overlap, keep the first copy of an identical test step.
     if [[ ${#TEST_SPECS[@]} -eq 1 ]]; then
         TEST_YAML="${TEST_SPECS[0]#*:}"
     else
         TEST_YAML=$(mktemp "${TMPDIR:-/tmp}/amd-selected-tests.XXXXXX.yml")
-        python - "$TEST_YAML" "${TEST_SPECS[@]}" <<'PY'
-import sys
-
-import yaml
-
-
-output_path, *suite_specs = sys.argv[1:]
-combined = {"env": {}, "steps": []}
-
-for suite_spec in suite_specs:
-    group_name, input_path = suite_spec.split(":", 1)
-    with open(input_path, encoding="utf-8") as test_file:
-        suite = yaml.safe_load(test_file)
-
-    for name, value in (suite.get("env") or {}).items():
-        previous = combined["env"].get(name, value)
-        if previous != value:
-            raise ValueError(
-                f"Conflicting environment value for {name}: {previous!r} != {value!r}"
-            )
-        combined["env"][name] = value
-
-    suite_steps = []
-    for entry in suite.get("steps") or []:
-        if "group" in entry:
-            suite_steps.extend(entry.get("steps") or [])
-        else:
-            suite_steps.append(entry)
-    combined["steps"].append({"group": group_name, "steps": suite_steps})
-
-with open(output_path, "w", encoding="utf-8") as output_file:
-    yaml.safe_dump(combined, output_file, sort_keys=False)
-PY
+        python3 scripts/combine_test_suites.py "$TEST_YAML" "${TEST_SPECS[@]}"
     fi
     echo "AMD test suites: ${TEST_SPECS[*]}"
 
@@ -198,7 +197,8 @@ PY
             -D mirror_hw="$AMD_MIRROR_HW" \
             -D fail_fast="$FAIL_FAST" \
             -D vllm_use_precompiled="$VLLM_USE_PRECOMPILED" \
-            -D vllm_merge_base_commit="$(git merge-base origin/main HEAD)" \
+            -D vllm_merge_base_commit="$DIFF_BASE" \
+            -D vllm_aiter_mha_trusted_commit="$VLLM_AITER_MHA_TRUSTED_COMMIT" \
             -D cov_enabled="$COV_ENABLED" \
             -D vllm_ci_branch="$VLLM_CI_BRANCH" \
             | sed '/^[[:space:]]*$/d' \
@@ -213,17 +213,47 @@ PY
     exit 0
 }
 
-get_diff() {
-    git diff --name-only --diff-filter=ACMDR "$(git merge-base origin/main HEAD)"
+# First parent for a release-line push. A depth-one checkout has the commit
+# but not its parent object, so deepen once before diffing. Failure falls
+# back to RUN_ALL=1 instead of aborting under set -e. That uploads every
+# suite. The wheel choice is the precompiled block below: a preset
+# VLLM_USE_PRECOMPILED is kept; otherwise RUN_ALL=1 builds from source.
+release_line_parent_base() {
+    if git rev-parse --verify --quiet 'HEAD^' >/dev/null; then
+        git rev-parse 'HEAD^'
+        return 0
+    fi
+    echo "AMD release-line checkout cannot resolve HEAD^; deepening by 1." >&2
+    if ! git fetch --deepen=1; then
+        return 1
+    fi
+    if git rev-parse --verify --quiet 'HEAD^' >/dev/null; then
+        git rev-parse 'HEAD^'
+        return 0
+    fi
+    return 1
 }
 
-get_diff_main() {
-    git diff --name-only --diff-filter=ACMDR HEAD~1
-}
+# Choose the diff base before any git command that can fail the bootstrap.
+# A release-line push must not call merge-base origin/main: that ref is often
+# absent on a fresh shallow checkout, and set -e would skip the upload.
+# An unresolvable parent sets RUN_ALL=1 because the diff is unknown. Do not
+# claim a from-source wheel build here: if VLLM_USE_PRECOMPILED is already
+# set, the block below keeps that value.
+DIFF_BASE=""
+if is_release_line_push; then
+    if ! DIFF_BASE=$(release_line_parent_base); then
+        echo "release-line parent is unavailable; running all AMD tests (RUN_ALL=1)." >&2
+        RUN_ALL=1
+        DIFF_BASE=""
+    fi
+else
+    DIFF_BASE=$(git merge-base origin/main HEAD)
+fi
 
-file_diff=$(get_diff)
-if [[ $BUILDKITE_BRANCH == "main" ]]; then
-    file_diff=$(get_diff_main)
+file_diff=""
+if [[ -n "$DIFF_BASE" ]]; then
+    file_diff=$(git diff --name-only --diff-filter=ACMDR "$DIFF_BASE")
 fi
 
 # Resolve PR tier labels before skip-ci so ready/merge suites can be filtered
@@ -279,21 +309,20 @@ for file in $file_diff; do
     fi
 done
 
-# Decide whether to use precompiled wheels
-# Relies on existing patterns array as a basis.
+# Decide whether to use precompiled wheels.
+# Relies on the existing patterns array and RUN_ALL decision above. A
+# caller-provided value wins, including when an unknown diff set RUN_ALL=1.
 if [[ -n "${VLLM_USE_PRECOMPILED:-}" ]]; then
     echo "VLLM_USE_PRECOMPILED is already set to: $VLLM_USE_PRECOMPILED"
 elif [[ $RUN_ALL -eq 1 ]]; then
     export VLLM_USE_PRECOMPILED=0
-    echo "Detected critical changes, building wheels from source"
+    echo "Detected critical or unknown changes, building wheels from source"
 else
     export VLLM_USE_PRECOMPILED=1
     echo "No critical changes, using precompiled wheels"
 fi
 
 
-LIST_FILE_DIFF=$(get_diff | tr ' ' '|')
-if [[ $BUILDKITE_BRANCH == "main" ]]; then
-    LIST_FILE_DIFF=$(get_diff_main | tr ' ' '|')
-fi
+# Same base as file_diff. Do not resolve origin/main a second time.
+LIST_FILE_DIFF=$(printf '%s' "$file_diff" | tr ' ' '|')
 upload_pipeline
