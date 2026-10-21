@@ -950,10 +950,10 @@ If filtering removes every row (all failures were PR-introduced), **send nothing
 
 窗口: CST <window> | pipeline: <pipeline> | <scope> | PR去重后 N 个失败build / M 个失败job (<cluster info>)
 
-| Build | 失败 Job | 失败测试 | 诊断 | 归因 | 首个错误 | 根因假设 | 处置 |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| [Build#11824](https://buildkite.com/...) | Simple · Diffusion Test | test_xxx | 🔴 Product code defect | 🟡 Pre-existing | AssertionError: ... | Hypothesis 1 | [File issue](https://github.com/vllm-project/vllm-omni/issues/new?template=400-bug-report.yml&labels=bug,ci-failure,high%20priority&title=...&current-environment=...&code-version=...&bug-description=...) |
-| [Build#11825](https://buildkite.com/...) | Engine Test | test_yyy | 🟢 Infrastructure | 🔵 Infra/env | OOM killed | Hypothesis 2 | [File issue](https://github.com/vllm-project/vllm-omni/issues/new?template=400-bug-report.yml&labels=bug,ci-failure,high%20priority&title=...&current-environment=...&code-version=...&bug-description=...) |
+| Build | 失败 Job | 失败测试 | 诊断 | 归因 | 首个错误 | 根因假设 | 处置 | 自动修复 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| [Build#11824](https://buildkite.com/...) | Simple · Diffusion Test | test_xxx | 🔴 Product code defect | 🟡 Pre-existing | AssertionError: ... | Hypothesis 1 | [File issue](https://github.com/vllm-project/vllm-omni/issues/new?template=400-bug-report.yml&labels=bug,ci-failure,high%20priority&title=...&current-environment=...&code-version=...&bug-description=...) | 🤖 **修复 READY#11824** |
+| [Build#11825](https://buildkite.com/...) | Engine Test | test_yyy | 🟢 Infrastructure | 🔵 Infra/env | OOM killed | Hypothesis 2 | [File issue](https://github.com/vllm-project/vllm-omni/issues/new?template=400-bug-report.yml&labels=bug,ci-failure,high%20priority&title=...&current-environment=...&code-version=...&bug-description=...) | — |
 
 🔍 根因 / 受影响job / ✅ 最小验证 / 处置建议 — keep as plain-text sections below the table
 ```
@@ -964,7 +964,7 @@ If filtering removes every row (all failures were PR-introduced), **send nothing
 > `code-version`, `bug-description`) so the GitHub issue form auto-fills
 > identically whether the alert or the report fires it.
 
-**Table columns** (8; build number + URL merged into one clickable cell):
+**Table columns** (9; build number + URL merged into one clickable cell):
 1. Build — `[Build#N](build URL)` clickable link
 2. 失败 Job — failed job name; collapse jobs with an identical signature into one row (e.g. `READY 14/14 jobs 全灭 (collection阶段)`), never one row per identical job
 3. 失败测试 — pytest node id / fixture path
@@ -973,27 +973,32 @@ If filtering removes every row (all failures were PR-introduced), **send nothing
 6. 首个错误 — first error summary (≤120 chars)
 7. 根因假设 — top hypothesis (one sentence)
 8. 处置 — `[File issue](...)` clickable link, existing-issue link for dup-guard rows, or `N/A`
+9. 自动修复 — `🤖 **修复 READY#N**` / `🤖 **修复 MERGE#N**` (bold + robot emoji so the cell stands out) when the row qualifies for auto-fix (rules below); `—` otherwise. The command is per-build: repeat it on every qualifying `Simple · ` row of that build so it can be copied from any row.
 
 **Table mechanics (Feishu card rendering)**:
 - Each table row MUST stay on a single line — no newlines inside a row.
 - Cell text must not contain a literal `|` (breaks the table) — use `/` or `·` instead, or escape as `\|`.
 - Long cells (首个错误 / 根因假设) wrap inside the card; keep them within the length budgets above.
 
-**Auto-fix command rendering (Simple Test failures).** At the end of Message 2
-(after the root-cause / verification / recommendation sections), render a
-copyable auto-fix command when **all** of these hold:
+**Auto-fix command rendering (Simple Test failures).** The copyable auto-fix
+command lives in the summary table's **last column (自动修复)** — right after
+处置, one cell per row, prominent (🤖 + bold). Fill the cell when **all** of
+these hold:
 
 1. The build is a `vllm-omni`-pipeline **READY or MERGE** build (NPU / AFD /
    ROUTER alerts never render it — no matching fix environment).
 2. The build survived the PR-introduced filtering (rows that remain in the
    summary table).
-3. At least one failed job in the build has a name starting with `Simple · `.
+3. The row's failed job has a name starting with `Simple · ` (the fix
+   workflow targets exactly those jobs; non-Simple rows of the same build
+   show `—`).
 
-One command line per qualifying build:
+Cell content: `🤖 **修复 READY#17435**` for a READY build, `🤖 **修复
+MERGE#17523**` for a MERGE build (actual build number). Keep ONE explainer
+line in the plain-text area below the table (with the 根因 / 验证 sections):
 
 ```text
-🤖 自动修复（Simple Test 失败）— 复制指令发给本机器人即可自动修复并提 PR：
-修复 READY#17435
+🤖 自动修复：复制「自动修复」列的指令直接发给本机器人，即可自动修复对应 build 的 Simple Test 失败并提 PR（仅人工发送生效；定时任务只展示指令）。
 ```
 
 A scheduled/cron run only *renders* this command; the workflow executes only
