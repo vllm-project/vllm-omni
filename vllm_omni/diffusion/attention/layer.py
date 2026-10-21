@@ -7,22 +7,28 @@
 # https://github.com/feifeibear/long-context-attention/blob/main/yunchang/attention/layer.py
 
 
+import functools
+import itertools
 import json
+import weakref
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
 import torch.nn as nn
+from torch.library import Library
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.logger import init_logger
 from vllm.model_executor.models.utils import extract_layer_index
+from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheSpec
 
 from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionBackend,
     AttentionImpl,
     AttentionMetadata,
+    VideoTokenLayout,
 )
 from vllm_omni.diffusion.attention.backends.sdpa import SDPABackend, SDPAImpl
 from vllm_omni.diffusion.attention.backends.trtllm_calibration import (
@@ -121,6 +127,225 @@ def _select_impl_cls(
     return override
 
 
+# Layers built with a startup schedule, keyed by the integer id the scheduled-attention op carries.
+# Weak values, so the registry never keeps a dropped model alive.
+_SCHEDULED_ATTENTION_LAYERS: "weakref.WeakValueDictionary[int, Attention]" = weakref.WeakValueDictionary()
+_SCHEDULED_ATTENTION_IDS = itertools.count()
+
+# AttentionMetadata fields that must hold their default (None) for a compiled call to use the
+# scheduled-attention op. The op carries attn_mask, plain-integer video_layout and plain-scalar extra
+# entries (see _encode_scheduled_op_metadata); any other metadata keeps the eager boundary.
+_SCHEDULED_OP_NONE_FIELDS = (
+    "joint_attn_mask",
+    "joint_query",
+    "joint_key",
+    "joint_value",
+    "full_attn_spans",
+    "query_ranges",
+    "packed_padding",
+    "cross_query_mask",
+)
+# Cross-attention mask validation flags that must hold their default (False). The op does not carry
+# them, so a call with a prepared cross mask keeps the eager boundary instead of losing them.
+_SCHEDULED_OP_FALSE_FIELDS = ("cross_kv_rows_validated", "cross_pair_mask_validated")
+# Spec of a call without metadata; any other spec starts with "M".
+_NO_METADATA_SPEC = "-"
+
+
+def _is_op_int(value: Any) -> bool:
+    # A bool is an int subclass; bools travel in the spec instead.
+    return (isinstance(value, int) and not isinstance(value, bool)) or isinstance(value, torch.SymInt)
+
+
+def _encode_scheduled_op_metadata(attn_metadata: AttentionMetadata | None) -> tuple[str, list[Any]] | None:
+    """Split metadata into a structure string and its integers for ``vllm_omni::scheduled_attention``.
+
+    Runs while tracing. The string holds only names, types and booleans, which are the same on every
+    call from one call site, so it never adds a guard that a new shape or step would fail. The
+    integers may be symbolic sizes; they become ``SymInt[]`` operands, so a new resolution does not
+    recompile the block either. ``attn_mask`` travels as its own tensor operand.
+
+    Carried: ``video_layout`` with plain ``prefix_len``/``latent_grid``/``used_len`` and no
+    ``video_spans``, and ``extra`` entries whose values are None, a bool, an int or a tuple/list of
+    ints. Returns None for anything else (tensors, floats or strings in ``extra``, video spans, joint
+    tensors, packed padding, ranges, cross-attention mask metadata, a non-default ``joint_strategy``, a
+    metadata subclass), which keeps the eager boundary.
+    """
+    if attn_metadata is None:
+        return _NO_METADATA_SPEC, []
+    if type(attn_metadata) is not AttentionMetadata or attn_metadata.joint_strategy != "front":
+        return None
+    for name in _SCHEDULED_OP_NONE_FIELDS:
+        if getattr(attn_metadata, name) is not None:
+            return None
+    for name in _SCHEDULED_OP_FALSE_FIELDS:
+        if getattr(attn_metadata, name):
+            return None
+    spec = "M"
+    ints: list[Any] = []
+    layout = attn_metadata.video_layout
+    if layout is not None:
+        if type(layout) is not VideoTokenLayout or layout.video_spans:
+            return None
+        spec += ";L"
+        for field_value in (layout.prefix_len, layout.used_len):
+            if field_value is None:
+                spec += "n"
+            elif _is_op_int(field_value):
+                spec += "i"
+                ints.append(field_value)
+            else:
+                return None
+        grid = layout.latent_grid
+        if grid is None:
+            spec += "n"
+        elif isinstance(grid, tuple) and len(grid) == 3 and all(_is_op_int(dim) for dim in grid):
+            spec += "g"
+            ints.extend(grid)
+        else:
+            return None
+    for key in sorted(attn_metadata.extra):
+        if not isinstance(key, str) or not key or ";" in key or "=" in key:
+            return None
+        value = attn_metadata.extra[key]
+        if value is None:
+            kind = "n"
+        elif isinstance(value, bool):
+            kind = "b1" if value else "b0"
+        elif _is_op_int(value):
+            kind = "i"
+            ints.append(value)
+        elif isinstance(value, (tuple, list)) and all(_is_op_int(item) for item in value):
+            kind = ("t" if isinstance(value, tuple) else "l") + str(len(value))
+            ints.extend(value)
+        else:
+            return None
+        spec += ";X" + key + "=" + kind
+    return spec, ints
+
+
+@functools.lru_cache(maxsize=256)
+def _parse_scheduled_op_spec(spec: str) -> tuple[tuple[str, ...] | None, tuple[tuple[str, str, int], ...]]:
+    """Parse a spec from ``_encode_scheduled_op_metadata`` once per call site.
+
+    Returns the layout field codes (or None) and, per ``extra`` key, ``(key, kind, int count)``.
+    """
+    if not spec.startswith("M"):
+        raise RuntimeError(f"malformed scheduled attention metadata spec {spec!r}")
+    layout: tuple[str, ...] | None = None
+    extra: list[tuple[str, str, int]] = []
+    for part in spec[1:].split(";")[1:]:
+        if part.startswith("L") and len(part) == 4 and layout is None:
+            layout = tuple(part[1:])
+            continue
+        key, sep, kind = part[1:].partition("=")
+        if not part.startswith("X") or not sep:
+            raise RuntimeError(f"malformed scheduled attention metadata spec {spec!r}")
+        if kind == "i":
+            count = 1
+        elif kind[:1] in ("t", "l"):
+            count = int(kind[1:])
+        else:
+            count = 0
+        extra.append((key, kind, count))
+    return layout, tuple(extra)
+
+
+def _decode_scheduled_op_metadata(
+    attn_mask: torch.Tensor | None, spec: str, ints: list[int]
+) -> AttentionMetadata | None:
+    """Rebuild the metadata ``_encode_scheduled_op_metadata`` split, with fresh containers."""
+    if spec == _NO_METADATA_SPEC:
+        return None
+    layout_codes, extra_codes = _parse_scheduled_op_spec(spec)
+    values = iter(ints)
+    video_layout = None
+    if layout_codes is not None:
+        prefix_code, used_code, grid_code = layout_codes
+        prefix_len = next(values) if prefix_code == "i" else None
+        used_len = next(values) if used_code == "i" else None
+        grid = (next(values), next(values), next(values)) if grid_code == "g" else None
+        video_layout = VideoTokenLayout(prefix_len=prefix_len, latent_grid=grid, used_len=used_len)
+    extra: dict[str, Any] = {}
+    for key, kind, count in extra_codes:
+        if kind == "n":
+            extra[key] = None
+        elif kind in ("b0", "b1"):
+            extra[key] = kind == "b1"
+        elif kind == "i":
+            extra[key] = next(values)
+        else:
+            items = [next(values) for _ in range(count)]
+            extra[key] = tuple(items) if kind[0] == "t" else items
+    if next(values, None) is not None:
+        raise RuntimeError(f"scheduled attention metadata spec {spec!r} does not match {len(ints)} integers")
+    return AttentionMetadata(attn_mask=attn_mask, extra=extra, video_layout=video_layout)
+
+
+def _run_scheduled_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attn_mask: torch.Tensor | None,
+    layer_id: torch.Tensor,
+    metadata_spec: str,
+    metadata_ints: list[int],
+) -> torch.Tensor:
+    """Eager body of ``vllm_omni::scheduled_attention``: the layer's full ``_forward_impl``.
+
+    Candidate selection, capability checks, backend-private gates and the parallel strategy run
+    here at execution time, exactly as behind ``_forward_schedule_compile_boundary``, so the step,
+    sigma and timestep never reach Dynamo.
+    """
+    layer = _SCHEDULED_ATTENTION_LAYERS.get(int(layer_id))
+    if layer is None:
+        raise RuntimeError(f"scheduled attention layer {int(layer_id)} is not registered")
+    metadata = _decode_scheduled_op_metadata(attn_mask, metadata_spec, metadata_ints)
+    out = layer._forward_impl(query, key, value, metadata)
+    expected = (*query.shape[:-1], value.shape[-1])
+    if tuple(out.shape) != expected or out.dtype != query.dtype or out.device != query.device:
+        raise RuntimeError(
+            f"scheduled attention on layer {layer.prefix!r} returned {tuple(out.shape)} {out.dtype} on {out.device}; "
+            f"the compiled graph expects {expected} {query.dtype} on {query.device}"
+        )
+    # Compiled code relies on the fake's contiguous strides, and a custom op may not return a view
+    # of one of its inputs.
+    out = out.contiguous()
+    if any(out.untyped_storage().data_ptr() == t.untyped_storage().data_ptr() for t in (query, key, value)):
+        out = out.clone()
+    return out
+
+
+def _scheduled_attention_fake(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attn_mask: torch.Tensor | None,
+    layer_id: torch.Tensor,
+    metadata_spec: str,
+    metadata_ints: list[int],
+) -> torch.Tensor:
+    return query.new_empty((*query.shape[:-1], value.shape[-1]))
+
+
+# direct_register_custom_op skips torch.library.custom_op's Python dispatch (~21us/call).
+# CompositeExplicitAutograd stays device-agnostic (CPU layer id beside device Q/K/V).
+# No autograd formula; Attention._schedule_op_eligible keeps gradient calls eager.
+_SCHEDULED_ATTENTION_LIB = Library("vllm_omni", "FRAGMENT")
+if not hasattr(torch.ops.vllm_omni, "scheduled_attention"):
+    direct_register_custom_op(
+        op_name="scheduled_attention",
+        op_func=_run_scheduled_attention,
+        mutates_args=[],
+        fake_impl=_scheduled_attention_fake,
+        target_lib=_SCHEDULED_ATTENTION_LIB,
+        dispatch_key="CompositeExplicitAutograd",
+    )
+
+
+_scheduled_attention_op = torch.ops.vllm_omni.scheduled_attention
+
+
 def _try_extract_layer_index(prefix: str) -> int | None:
     if not prefix:
         return None
@@ -153,6 +378,8 @@ class Attention(nn.Module):
     # diffusion config, and such a layer legitimately prepares no candidates, so startup
     # validation must not report it as a missing profile.
     _schedule_configured = False
+    # Id the compiled scheduled-attention op uses to find this layer (see _register_scheduled_op).
+    _schedule_op_id: torch.Tensor | None = None
 
     def __init__(
         self,
@@ -363,6 +590,7 @@ class Attention(nn.Module):
             schedule_config = getattr(config, "diffusion_attention_schedule", None)
             if schedule_config is not None:
                 self._schedule_configured = True
+                self._register_scheduled_op()
                 self._prepare_schedule_candidates(
                     schedule_config,
                     impl_kwargs,
@@ -640,6 +868,27 @@ class Attention(nn.Module):
         value: torch.Tensor,
         attn_metadata: AttentionMetadata | None = None,
     ) -> torch.Tensor:
+        if torch.compiler.is_compiling() and self._schedule_configured:
+            # Selecting a scheduled candidate reads the step, the total and the bound
+            # schedule from the forward context, and backend-private gates read the step or
+            # timestep. Traced, those values would become guards and each new step or range
+            # boundary would recompile the enclosing graph. The decision uses only the
+            # construction-time flag, so a layer without a startup schedule adds no boundary.
+            encoded = (
+                _encode_scheduled_op_metadata(attn_metadata) if self._schedule_op_eligible(query, key, value) else None
+            )
+            if encoded is not None:
+                # One opaque node: the enclosing block stays a single graph, and the selection
+                # runs when the op executes.
+                return _scheduled_attention_op(
+                    query,
+                    key,
+                    value,
+                    None if attn_metadata is None else attn_metadata.attn_mask,
+                    self._schedule_op_id,
+                    *encoded,
+                )
+            return self._forward_schedule_compile_boundary(query, key, value, attn_metadata)
         if torch.compiler.is_compiling() and self._uses_hsdp_compile_boundary():
             # Keep HSDP/FSDP2 parameter all-gather outside Inductor's
             # attention graph; otherwise scheduler dependency analysis can
@@ -647,6 +896,31 @@ class Attention(nn.Module):
             return self._forward_hsdp_compile_boundary(query, key, value, attn_metadata)
 
         return self._forward_impl(query, key, value, attn_metadata)
+
+    def _register_scheduled_op(self) -> None:
+        """Give this layer the id the compiled scheduled-attention op carries.
+
+        The id is a plain CPU tensor attribute, not a buffer: ``Module.to()`` leaves it on the CPU,
+        so reading it never synchronizes a device, and ``state_dict`` is unchanged. Dynamo passes it
+        as a graph input, so repeated blocks share one graph instead of guarding on a per-layer
+        constant (a string or int attribute would recompile once per block).
+        """
+        op_id = next(_SCHEDULED_ATTENTION_IDS)
+        _SCHEDULED_ATTENTION_LAYERS[op_id] = self
+        # Keep the id on the CPU even under ``with torch.device(...)``: reading a
+        # device tensor here would force a host sync on every attention call.
+        self._schedule_op_id = torch.tensor(op_id, dtype=torch.int64, device="cpu")
+
+    def _schedule_op_eligible(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor) -> bool:
+        """Whether this layer and call can use the scheduled-attention op instead of the eager boundary.
+
+        Evaluated while tracing, on structure only (never on the step). HSDP (its own boundary) and
+        autograd (the op has no backward) keep ``_forward_schedule_compile_boundary``, as does
+        metadata that ``_encode_scheduled_op_metadata`` cannot carry.
+        """
+        if self._schedule_op_id is None or self._uses_hsdp_compile_boundary():
+            return False
+        return not (torch.is_grad_enabled() and (query.requires_grad or key.requires_grad or value.requires_grad))
 
     def _uses_hsdp_compile_boundary(self) -> bool:
         if self._hsdp_compile_boundary_enabled:
@@ -728,6 +1002,18 @@ class Attention(nn.Module):
         value: torch.Tensor,
         attn_metadata: AttentionMetadata | None = None,
     ) -> torch.Tensor:
+        return self._forward_impl(query, key, value, attn_metadata)
+
+    @torch.compiler.disable
+    def _forward_schedule_compile_boundary(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: AttentionMetadata | None = None,
+    ) -> torch.Tensor:
+        # Runs eagerly: candidate selection, capability checks, backend-private gates and the
+        # parallel strategy of this layer. Projections, norms and RoPE outside it stay compiled.
         return self._forward_impl(query, key, value, attn_metadata)
 
     def _forward_impl(
@@ -943,18 +1229,47 @@ class Attention(nn.Module):
         if mask.device.type == "cpu" and not attn_metadata.cross_kv_rows_validated and not bool(mask.any(dim=1).all()):
             raise ValueError("Each cross-attention batch row must contain at least one valid K/V position")
 
-    def _cross_backend_limitation(self, attn_metadata: AttentionMetadata | None) -> str | None:
-        if self._cross_head_limitation is not None:
-            return self._cross_head_limitation
-        if attn_metadata is not None and attn_metadata.attn_mask is not None:
-            return self._cross_mask_limitation
+    def _cross_backend_limitation(
+        self,
+        attn_metadata: AttentionMetadata | None,
+        *,
+        backend: type[AttentionBackend] | None = None,
+        spec: Any = None,
+    ) -> str | None:
+        """Return what the selected backend cannot do for this cross call.
+
+        ``backend`` and ``spec`` name a scheduled candidate; without them the baseline's limitations,
+        resolved once at construction, apply.
+        """
+        if backend is None:
+            if self._cross_head_limitation is not None:
+                return self._cross_head_limitation
+            if attn_metadata is not None and attn_metadata.attn_mask is not None:
+                return self._cross_mask_limitation
+            return None
+        if not backend.supports_cross_head_geometry(self.num_heads, self.num_kv_heads):
+            return f"Q/KV head geometry {self.num_heads}/{self.num_kv_heads}"
+        if attn_metadata is None or attn_metadata.attn_mask is None:
+            return None
+        if self.cross_mask_kind == "kv" and not backend.supports_cross_kv_mask(spec):
+            return "KV-only validity mask"
+        if self.cross_mask_kind == "pair" and not backend.supports_cross_pair_mask(spec):
+            return "pair restrictions"
         return None
 
-    def _cross_fallback_blocker(self, attn_metadata: AttentionMetadata | None) -> str | None:
-        if self.backend_explicit:
+    def _cross_fallback_blocker(
+        self,
+        attn_metadata: AttentionMetadata | None,
+        *,
+        backend: type[AttentionBackend] | None = None,
+        spec: Any = None,
+    ) -> str | None:
+        explicit = self.backend_explicit if backend is None else spec is not None
+        if explicit:
+            selected = self.attn_backend if backend is None else backend
             return (
-                f"Explicit backend {self.attn_backend.get_name()} does not support "
-                f"{self._cross_backend_limitation(attn_metadata)}"
+                f"Explicit backend {selected.get_name()} does not support "
+                f"{self._cross_backend_limitation(attn_metadata, backend=backend, spec=spec)}"
             )
         if attn_metadata is not None and attn_metadata.extra.get("kv_cache_dtype") not in (None, "float"):
             return (
@@ -982,9 +1297,14 @@ class Attention(nn.Module):
 
         effective_impl, effective_backend, effective_spec = self.effective_attention()
         if getattr(self, "_explicit_cross_contract", False):
-            reason = self._cross_backend_limitation(attn_metadata)
+            # A scheduled candidate is checked against its own backend; the baseline keeps the
+            # limitations resolved at construction.
+            cross_backend, cross_spec = (
+                (None, None) if effective_impl is self.attention else (effective_backend, effective_spec)
+            )
+            reason = self._cross_backend_limitation(attn_metadata, backend=cross_backend, spec=cross_spec)
             if reason is not None:
-                blocked = self._cross_fallback_blocker(attn_metadata)
+                blocked = self._cross_fallback_blocker(attn_metadata, backend=cross_backend, spec=cross_spec)
                 if blocked is not None:
                     raise NotImplementedError(blocked)
                 return self.sdpa_fallback.forward(query, key, value, attn_metadata)
