@@ -12,7 +12,7 @@ import torch.nn.functional as F
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionBackend, AttentionImpl, AttentionMetadata
-from vllm_omni.diffusion.attention.backends.sdpa import _maybe_reshape_attn_mask
+from vllm_omni.diffusion.attention.backends.sdpa import _maybe_reshape_attn_mask, _sdpa_attention
 from vllm_omni.diffusion.attention.backends.utils.piecewise_attn import (
     piecewise_attn,
     run_paged_piecewise_plan,
@@ -1093,6 +1093,21 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         attn_metadata: AttentionMetadata | None = None,
     ) -> torch.Tensor:
         attention_mask = attn_metadata.attn_mask if attn_metadata else None
+        extra = attn_metadata.extra if attn_metadata else {}
+        # The native score kernel accepts Boolean keep/block masks, not an
+        # additive bias. In particular, bool(0) and bool(-inf) invert the
+        # meaning of SenseNova's prefix mask. Preserve arbitrary float biases
+        # in SDPA and use the same fallback for unqualified dense geometry.
+        # Packed callers own a separate dispatch contract below.
+        if not extra.get("npu_attn_varlen", False) and (
+            query.dtype not in (torch.float16, torch.bfloat16)
+            or query.shape[1] == 0
+            or key.shape[1] == 0
+            or query.shape[-1] not in FlashAttentionBackend.get_supported_head_sizes()
+            or query.shape[-1] != value.shape[-1]
+            or (attention_mask is not None and attention_mask.is_floating_point())
+        ):
+            return self._forward_npu_sdpa(query, key, value, attention_mask)
         if self.causal:
             import torch_npu
 
@@ -1183,10 +1198,42 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
             key,
             value,
             attn_mask=attention_mask,
+            scale=float(self.softmax_scale),
             opt_mode="manual",
             op_type="fused_attn_score",
             layout=layout,
         )
+
+    def _forward_npu_sdpa(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Dense fallback preserving FlashAttention's bottom-right causality."""
+        attention_mask = _maybe_reshape_attn_mask(query, key, attention_mask)
+        if self.causal:
+            q_pos = torch.arange(query.shape[1], device=query.device).unsqueeze(1)
+            k_pos = torch.arange(key.shape[1], device=query.device).unsqueeze(0)
+            keep = k_pos <= q_pos + key.shape[1] - query.shape[1]
+            if attention_mask is None:
+                attention_mask = keep
+            elif attention_mask.dtype == torch.bool:
+                attention_mask = attention_mask & keep
+            else:
+                attention_mask = attention_mask.masked_fill(~keep, float("-inf"))
+        # The causal restriction is explicit above: SDPA's is_causal=True
+        # would instead align unequal Q/K lengths at the top left.
+        output = _sdpa_attention(
+            query.transpose(1, 2),
+            key.transpose(1, 2),
+            value.transpose(1, 2),
+            attention_mask,
+            causal=False,
+            scale=self.softmax_scale,
+        )
+        return output.transpose(1, 2)
 
     def _resolve_packed_seq_npu(
         self,

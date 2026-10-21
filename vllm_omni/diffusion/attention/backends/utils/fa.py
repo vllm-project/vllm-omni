@@ -95,7 +95,7 @@ elif current_omni_platform.is_musa():
         flash_attn_varlen_func = _fa_varlen
     except (ImportError, ModuleNotFoundError):
         pass
-else:
+elif current_omni_platform.is_cuda():
     # CUDA implementation candidates, ordered by preference.
     # Candidate 1: CuTe-based FA4. This matters on Blackwell, where an
     # importable Hopper-only FA3 wheel may otherwise be selected and fail

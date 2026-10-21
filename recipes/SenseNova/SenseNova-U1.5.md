@@ -174,6 +174,171 @@ description and `text2text` the expected answer.
 pytest -q tests/diffusion/models/sensenova_u1/
 ```
 
+### Ascend A3: BF16 text-to-image (validation pending)
+
+The A3 path targets BF16, TP=1 and TP=2, with either the base checkpoint or
+startup fusion of the **original** `SenseNova-U1.5-8B-MoT-LoRA-8step.safetensors`.
+The V2 adapter is a different checkpoint and is not used by these commands.
+
+These configurations have **not been executed on A3** for this change: the
+available development host has neither an NPU nor the model weights. CPU
+regression tests cannot establish NPU kernel accuracy, image quality, memory
+capacity, HCCL behavior, or performance. The commands below are reproducible
+validation instructions, not measured results.
+
+| Configuration | Generation settings | A3 validation |
+| --- | --- | --- |
+| BF16, TP=1, no LoRA | 50 steps, CFG 4.0 | Not run |
+| BF16, TP=2, no LoRA | 50 steps, CFG 4.0 | Not run |
+| BF16, TP=1, original LoRA | 8 steps, CFG 1.0 | Not run |
+| BF16, TP=2, original LoRA | 8 steps, CFG 1.0 | Not run |
+
+#### Dependencies and checkpoints
+
+Follow the [NPU installation guide](../../docs/getting_started/installation/npu.md).
+Use matching Ascend driver/firmware, CANN, `torch`, `torch_npu`, `vllm`, and
+`vllm-ascend` versions for the checked-out Omni revision. In particular, the
+older release container in that guide is not proof of compatibility with
+current main. Install this checkout in the validated environment; do not
+replace its dependency pins with the GPU versions listed above. The serving
+benchmark additionally uses the existing `aiohttp` and `tqdm` client dependencies.
+The existing NPU FlashAttention backend requires a compatible MindIE-SD
+installation; without it, use the existing SDPA backend. Additive prefix masks
+and unqualified dense kernel shapes use SDPA even when FlashAttention is selected.
+
+Obtain the base checkpoint and exactly the original adapter from their public
+repositories (these commands download weights only when you run them):
+
+```bash
+hf download sensenova/SenseNova-U1.5-8B-MoT --local-dir models/SenseNova-U1.5-8B-MoT
+hf download sensenova/SenseNova-U1.5-8B-MoT-LoRAs \
+    SenseNova-U1.5-8B-MoT-LoRA-8step.safetensors --local-dir models/SenseNova-U1.5-LoRAs
+```
+
+Record the resolved Hugging Face revisions when downloading; pass `--revision`
+to repeat a run with the same weights. No GitCode patch or offline merged
+checkpoint is needed. The existing `distill` loader fuses the adapter once
+while loading each worker's base weights; requests do not attach a PEFT adapter.
+Omitting `LORA_PATH` preserves the no-LoRA path.
+
+#### Launch and generate: all four configurations
+
+Run from the repository root. Choose one row below, then start the server.
+Stop the preceding server before selecting another row; each configuration
+requires fresh base weights so that a previous fusion is not reused.
+
+```bash
+export MODEL=models/SenseNova-U1.5-8B-MoT
+export VLLM_WORKER_MULTIPROC_METHOD=spawn
+
+# Choose one configuration:
+export ASCEND_RT_VISIBLE_DEVICES=0 TP=1 LORA_PATH=""       # TP1, base
+# export ASCEND_RT_VISIBLE_DEVICES=0,1 TP=2 LORA_PATH=""   # TP2, base
+# export ASCEND_RT_VISIBLE_DEVICES=0 TP=1 LORA_PATH=models/SenseNova-U1.5-LoRAs/SenseNova-U1.5-8B-MoT-LoRA-8step.safetensors
+# export ASCEND_RT_VISIBLE_DEVICES=0,1 TP=2 LORA_PATH=models/SenseNova-U1.5-LoRAs/SenseNova-U1.5-8B-MoT-LoRA-8step.safetensors
+
+bash recipes/SenseNova/run_u15_a3.sh serve
+```
+
+The script uses the formal `vllm serve --omni --dtype bfloat16
+--tensor-parallel-size 1|2 --enforce-eager` interface. With `LORA_PATH` it adds
+`--lora-path "$LORA_PATH" --lora-backend distill`. There is no `torchrun` wrapper:
+the engine owns worker creation. Choose visible device IDs appropriate to the
+host and check available device memory before a high-resolution run.
+
+In another terminal, set the **same** `MODEL`, `TP`, `LORA_PATH` and `PORT`
+(default `8091`) as the server, then run:
+
+```bash
+OUTPUT=sensenova-u15-test bash recipes/SenseNova/run_u15_a3.sh generate
+```
+
+This reuses the existing chat client and saves a 2560×1760 PNG. It sends one
+prompt/image, seed 42, think off, `cfg_norm=none`, `timestep_shift=3.0` and the
+pipeline's default `t_eps=0.02`. Base weights use 50 steps/CFG 4.0; the original
+LoRA uses 8 steps/CFG 1.0. Do not leave `LORA_PATH` set on the client while using
+a base-only server: the client cannot inspect the adapter loaded by a server.
+
+The existing offline runner is also usable for both TP sizes and optional
+startup LoRA. Its unquantized diffusion default is BF16:
+
+```bash
+python examples/offline_inference/text_to_image/text_to_image.py \
+    --model "$MODEL" --tensor-parallel-size "$TP" --enforce-eager \
+    --prompt "A mountain lake at sunrise, detailed reflections, natural colors." \
+    --width 2560 --height 1760 --seed 42 --num-inference-steps 50 --cfg-scale 4.0 \
+    --extra-body '{"think": false, "cfg_norm": "none", "timestep_shift": 3.0, "t_eps": 0.02}' \
+    --output sensenova-u15-base.png
+```
+
+For the original LoRA, add `--lora-path "$LORA_PATH" --lora-backend distill`,
+change to `--num-inference-steps 8 --cfg-scale 1.0`, and use a different output
+filename. Run it once with `TP=1`, then with `TP=2` and two visible devices.
+
+#### Steady-state benchmark
+
+Restart the LoRA server with profiling enabled, using the same configuration
+variables in both terminals:
+
+```bash
+PROFILE=1 bash recipes/SenseNova/run_u15_a3.sh serve
+```
+
+Then, in the **same host/software environment** as the server:
+
+```bash
+export SERVER_METADATA='{"hardware":"Ascend A3","base_model_revision":"REPLACE_WITH_RESOLVED_REVISION","adapter_revision":"REPLACE_WITH_RESOLVED_REVISION","cann":"REPLACE_WITH_INSTALLED_VERSION","driver":"REPLACE_WITH_INSTALLED_VERSION"}'
+WARMUP=2 REPEATS=5 OUTPUT=results/sensenova-u15-a3-tp1 \
+    bash recipes/SenseNova/run_u15_a3.sh benchmark
+```
+
+Use actual metadata values before publishing results. Repeat after restarting
+with `TP=2`, two visible devices and `OUTPUT=results/sensenova-u15-a3-tp2`.
+The benchmark requires the original adapter filename, records its SHA-256,
+Omni commit/dirty state and installed software versions, and writes `.json`
+and `.csv`. Preserve the source diff separately when `omni_dirty` is true.
+Server metadata is declared by the operator, not discovered remotely; confirm
+that the running server has the same TP, dtype and adapter settings.
+
+The generic benchmark reuses the existing chat request backend. It runs
+**2560×1760, original LoRA, 8 steps, batch=1, concurrency=1**, discards two full
+warmup requests by default, then records every measured request separately:
+
+- `text_seconds`: tokenization, conditional/unconditional prefix prefill,
+  optional think generation and KV cache preparation. The supplied workload
+  disables think. Initial image noise and scheduler setup are excluded.
+- `generation_seconds`: the complete denoising loop, image feature extraction,
+  scheduler updates, cache cleanup and conversion to a CPU PIL image.
+- `end_to_end_seconds`: client wall time from request dispatch through receiving
+  and parsing the complete response, including queuing, image encoding and
+  transport; excludes server startup, weight loading and saving results.
+
+The existing pipeline profiler synchronizes the active device before and after
+stages, including NPU execution. After each worker completes a request, stage
+metrics use MAX across its TP group. Each phase is timed as a whole before
+reduction, rather than summing the maximum of individual rank timings. Text
+and generation maxima may come from different ranks, so their sum is not an
+end-to-end measurement. Profiling adds synchronization overhead; use the same
+profiling setting for comparisons. A client-side NPU synchronization cannot
+synchronize the remote workers and is deliberately unnecessary here.
+
+Missing stage metrics, failed warmups and failed requests abort the benchmark
+instead of producing zero timing values. Completed measurements are preserved
+if a later request fails. JSON contains raw stage durations and run settings;
+CSV contains one row per measured request. No A3 timings or speedup claims are
+provided until these commands have actually run.
+
+#### Current scope and limitations
+
+This adaptation covers eager BF16 text-to-image and TP=1/2 startup distilled
+LoRA fusion. FP8, dynamic PEFT switching, image editing/understanding, CFG
+parallelism, CPU offload, graph capture and other TP degrees have not been
+validated on A3 by this change. CUDA paged decode remains a CUDA-specific
+optimization; NPU uses the ordinary cache path. Unsupported optimized-kernel
+conditions use the existing correct fallback; runtime kernel failures are
+surfaced rather than retried silently. CPU mathematical checks do not replace
+the four A3 generation checks or numerical parity checks on real NPU kernels.
+
 ## Notes
 
 - Both `use_pixel_head` and `noise_scale_max_value` come from `config.json`; no flag is needed.
