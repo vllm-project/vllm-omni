@@ -16,6 +16,7 @@ from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import RequestStatus
 
 from vllm_omni.diffusion.attention.schedule import (
+    DECODE_ONLY_PIPELINES,
     InvalidAttentionScheduleError,
     parse_attention_schedule,
     resolve_request_attention_schedule,
@@ -167,6 +168,8 @@ class BaseScheduler(ABC):
             # inline stage client, whose clone() does not re-run __post_init__; the subprocess client
             # rebuilds the params and absorbs it. Normalize here so topology cannot change the result.
             absorb_attention_schedule_extra_args(request.sampling_params)
+            if getattr(self.od_config, "model_class_name", None) in DECODE_ONLY_PIPELINES:
+                request.sampling_params.attention_schedule = None
             resolve_request_attention_schedule(
                 request.sampling_params,
                 getattr(self.od_config, "diffusion_attention_schedule", None),

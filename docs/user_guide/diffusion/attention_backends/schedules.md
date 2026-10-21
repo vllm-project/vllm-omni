@@ -77,7 +77,9 @@ Set all backend options within the profile, including `quant`,
 Set `diffusion_attention_schedule` on the diffusion stage in a deploy YAML,
 using the same object as the server flag. Set its base configuration separately
 with `diffusion_attention_config`. In the bundled disaggregated H3
-deployment, the diffusion stage is `stage_id: 1`.
+deployments, the diffusion stage is `stage_id: 1`. The separate decode stage of
+`minimax_h3_disaggregated_decode` runs no denoising and ignores request
+schedules; configure the schedule on stage 1 only, not through the global flag.
 
 CLI overrides deep-merge profile mappings into the stage configuration.
 A CLI `default` list replaces the stage list rather than appending ranges.
