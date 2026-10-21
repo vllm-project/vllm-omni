@@ -15,6 +15,19 @@ from vllm_omni.diffusion.models.minimax_h3.temporal_chunks import decode_tempora
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
 
+@pytest.mark.parametrize("rank", [0, 1, 2])
+def test_only_the_chunk_output_owner_can_prestart_an_encoder(monkeypatch, rank):
+    from vllm_omni.diffusion.models.minimax_h3.vae import MiniMaxH3VideoVAE
+
+    vae = object.__new__(MiniMaxH3VideoVAE)
+    torch.nn.Module.__init__(vae)
+    monkeypatch.setattr(MiniMaxH3VideoVAE, "is_distributed_enabled", lambda self: True)
+    group = object()
+    monkeypatch.setattr(MiniMaxH3VideoVAE, "_native_parallel_state", lambda self: {"sp_process_group": group})
+    monkeypatch.setattr(dist, "get_rank", lambda actual: rank if actual is group else pytest.fail("wrong group"))
+    assert vae.owns_chunk_output is (rank == 0)
+
+
 @pytest.mark.parametrize("chunked", [False, True])
 def test_encode_only_video_vae_rejects_full_and_chunked_decode(chunked):
     from vllm_omni.diffusion.models.minimax_h3.vae import MiniMaxH3VideoVAE
@@ -87,7 +100,7 @@ class _FakeHost:
 def test_temporal_chunks_emit_ordered_frames_and_collect_when_unconsumed():
     model = _FakeTemporalModel()
     latent = torch.arange(8, dtype=torch.float32).view(1, 1, 8, 1, 1)
-    chunks = []
+    chunks: list[torch.Tensor] = []
     marker = decode_temporal_chunks(model, latent, chunks.append)
 
     assert marker.shape == (0,)
@@ -115,7 +128,7 @@ def test_h3_without_callback_is_a_plain_full_decode_on_a_vae_group(cpu_process_g
 
     full = decode_h3_chunks(host, latent, None, group=cpu_process_group)
 
-    chunks = []
+    chunks: list[torch.Tensor] = []
     decode_h3_chunks(host, latent, chunks.append, group=cpu_process_group)
     assert torch.equal(torch.cat(chunks, dim=2), full)
 

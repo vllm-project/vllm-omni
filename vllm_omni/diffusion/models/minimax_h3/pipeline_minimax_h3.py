@@ -2222,23 +2222,22 @@ class MiniMaxH3Pipeline(
         bytes -- the pre-encoded counterpart of the empty tensor the full
         decode leaves there.
         """
-        from vllm_omni.diffusion.utils.chunked_video import decode_to_mp4 as decode_chunks_to_mp4
+        from vllm_omni.diffusion.utils.chunked_video import (
+            ChunkedVideoMP4Session,
+        )
+        from vllm_omni.diffusion.utils.chunked_video import (
+            decode_to_mp4 as decode_chunks_to_mp4,
+        )
 
-        with self._component_on_device(self.audio_vae):
-            audio = self.audio_vae.decode_latent(audio_latent)
-        audio_np = audio.detach().float().cpu().numpy()
-        if audio_np.ndim == 3 and audio_np.shape[0] == 1:
-            audio_np = audio_np[0]
-
-        with self._component_on_device(self.video_vae):
-            with current_omni_platform.create_autocast_context(
-                device_type=self.device.type,
-                dtype=torch.float16,
-                enabled=True,
-            ):
-                videos = decode_chunks_to_mp4(
-                    self.video_vae,
-                    video_latent,
+        session = None
+        try:
+            with self._component_on_device(self.audio_vae):
+                audio = self.audio_vae.decode_latent(audio_latent)
+                audio_np = audio.detach().float().cpu().numpy()
+                if audio_np.ndim == 3 and audio_np.shape[0] == 1:
+                    audio_np = audio_np[0]
+                session = ChunkedVideoMP4Session(
+                    value_range=self.video_vae.chunk_value_range,
                     fps=MINIMAX_H3_FPS,
                     audio_waveforms=[audio_np],
                     audio_sample_rate=MINIMAX_H3_AUDIO_SAMPLE_RATE,
@@ -2247,6 +2246,20 @@ class MiniMaxH3Pipeline(
                     video_codec_options=video_codec_options,
                     crop=(height, width),
                 )
+                if self.video_vae.owns_chunk_output:
+                    session.start(width=width, height=height, batch_size=1)
+
+            with self._component_on_device(self.video_vae):
+                with current_omni_platform.create_autocast_context(
+                    device_type=self.device.type,
+                    dtype=torch.float16,
+                    enabled=True,
+                ):
+                    videos = decode_chunks_to_mp4(self.video_vae, video_latent, session=session)
+        except BaseException:
+            if session is not None:
+                session.abort()
+            raise
         if not videos:
             return b""
         if len(videos) != 1:

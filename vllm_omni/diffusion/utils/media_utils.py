@@ -476,12 +476,7 @@ def mux_av_video_audio_bytes(
             a_stream = cast(av.AudioStream, container.add_stream(audio_codec, rate=effective_audio_sample_rate))
             a_stream.layout = layout
 
-        for frame in video_frames:
-            for packet in v_stream.encode(frame):
-                container.mux(packet)
-        for packet in v_stream.encode():
-            container.mux(packet)
-
+        # Encode ready audio before waiting for the streaming video producer.
         if a_stream is not None and audio_waveform is not None:
             if samples is None or layout is None:
                 raise ValueError("Audio samples were not prepared for muxing.")
@@ -496,5 +491,11 @@ def mux_av_video_audio_bytes(
                 container.mux(packet)
             for packet in a_stream.encode():
                 container.mux(packet)
+
+        for frame in video_frames:
+            for packet in v_stream.encode(frame):
+                container.mux(packet)
+        for packet in v_stream.encode():
+            container.mux(packet)
 
     return buf.getvalue()
