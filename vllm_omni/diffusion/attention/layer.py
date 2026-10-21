@@ -1594,7 +1594,7 @@ def validate_attention_schedule_candidates(model: nn.Module, od_config: "OmniDif
     platform_key = current_omni_platform.device_name
     sp_size = od_config.parallel_config.sequence_parallel_size
     # Models build the SP padding mask only with mask_sp_padding; otherwise padded tokens are unmasked.
-    masks_sp_padding = sp_size > 1 and od_config.parallel_config.mask_sp_padding
+    masks_sp_padding = sp_size is not None and sp_size > 1 and od_config.parallel_config.mask_sp_padding
     auto_pad_roots = _sp_auto_pad_roots(model) if masks_sp_padding else ()
     ring_degree = od_config.parallel_config.ring_degree
     skip_layers = od_config.diffusion_kv_cache_skip_layer_indices
