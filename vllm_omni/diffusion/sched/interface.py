@@ -171,7 +171,7 @@ class SchedulerRequestState:
     status: DiffusionRequestStatus = DiffusionRequestStatus.WAITING
     error: str | None = None
     # Set once at the first enqueue (perf_counter) and preserved across
-    # preemption so CNA aging keeps accumulating while the request is re-queued.
+    # preemption so iDRR aging keeps accumulating while the request is re-queued.
     queued_at: float = 0.0
 
     def is_finished(self) -> bool:

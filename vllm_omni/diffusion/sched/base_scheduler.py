@@ -58,9 +58,9 @@ _STEP_BATCH_SAMPLING_PARAMS_KEY_FIELD_NAMES = frozenset(field.name for field in 
     "use_step_execution",
 }
 
-# CNA cost-normalization reference: one 512x512 image in packed latents
+# iDRR cost-normalization reference: one 512x512 image in packed latents
 # ((512 / 16) ** 2 = 1024 compute units).
-_CNA_REFERENCE_UNITS = 1024.0
+_IDRR_REFERENCE_UNITS = 1024.0
 
 
 def _mixfusion_requested(request: OmniDiffusionRequest, *, server_default: bool, supported: bool) -> bool:
@@ -104,10 +104,10 @@ def _apply_mixfusion_shape_relaxation(
 class BaseScheduler(ABC):
     """Shared queue/state bookkeeping for diffusion schedulers.
 
-    Waiting requests are ordered by CNA (cost-normalized aging) score:
+    Waiting requests are ordered by iDRR (cost-normalized aging) score:
     ``age**alpha / (cost / 1024)**beta``. The head of that order is admitted
     while it fits into the compute budget; an aged head (waiting longer than
-    ``cna_reserve_time_s``) reserves the remaining budget gap for itself, while
+    ``idrr_reserve_time_s``) reserves the remaining budget gap for itself, while
     a young head is skipped over so lower-scored requests can still fill the
     batch.
     """
@@ -239,7 +239,7 @@ class BaseScheduler(ABC):
             if state is not None and self._can_schedule_running(state):
                 scheduled_cached_request_ids.append(request_id)
 
-        # Second, schedule WAITING requests by CNA score while capacity remains.
+        # Second, schedule WAITING requests by iDRR score while capacity remains.
         self._schedule_waiting_requests(scheduled_new_reqs, scheduled_cached_request_ids)
 
         # Expose the next waiting request (serial mode) so the runner can
@@ -401,7 +401,7 @@ class BaseScheduler(ABC):
             self._admit_by_compute_budget(candidates, scheduled_new_reqs, scheduled_cached_request_ids)
             return
 
-        # Fixed / profiler policies are count-capped; CNA only orders the queue.
+        # Fixed / profiler policies are count-capped; iDRR only orders the queue.
         for state in candidates:
             if len(self._running) >= self.max_num_running_reqs:
                 break
@@ -422,7 +422,7 @@ class BaseScheduler(ABC):
     ) -> None:
         budget = self.batching_config.effective_compute_unit_budget()
         running_units = self._running_compute_units()
-        reserve_time = max(0.0, float(self.batching_config.cna_reserve_time_s))
+        reserve_time = max(0.0, float(self.batching_config.idrr_reserve_time_s))
         now = time.perf_counter()
         # A request costlier than the whole budget must not deadlock admission:
         # when nothing is running there is no concurrency left to budget, so
@@ -493,13 +493,13 @@ class BaseScheduler(ABC):
             return
 
     def _sorted_waiting_states(self) -> list[SchedulerRequestState]:
-        """Order waiting requests by CNA score, descending.
+        """Order waiting requests by iDRR score, descending.
 
         Ties fall back to enqueue time (FIFO) then request_id for
         determinism. Finished or popped states are skipped.
         """
-        alpha = float(self.batching_config.cna_alpha)
-        beta = float(self.batching_config.cna_beta)
+        alpha = float(self.batching_config.idrr_alpha)
+        beta = float(self.batching_config.idrr_beta)
         now = time.perf_counter()
         scored: list[tuple[float, float, str, SchedulerRequestState]] = []
         for request_id in self._waiting:
@@ -507,7 +507,7 @@ class BaseScheduler(ABC):
             if state is None or state.is_finished():
                 continue
             age = max(0.0, now - state.queued_at) if state.queued_at else 0.0
-            norm_cost = max(self._request_units(state) / _CNA_REFERENCE_UNITS, 1e-6)
+            norm_cost = max(self._request_units(state) / _IDRR_REFERENCE_UNITS, 1e-6)
             score = (age**alpha) / (norm_cost**beta)
             scored.append((score, state.queued_at, request_id, state))
         scored.sort(key=lambda item: (-item[0], item[1], item[2]))

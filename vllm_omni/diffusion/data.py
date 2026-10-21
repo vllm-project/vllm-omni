@@ -846,14 +846,14 @@ class DiffusionBatchingConfig:
     profiler_interval: int = 20
     log_stats: bool = False
 
-    # CNA (cost-normalized aging) waiting-queue ordering and admission.
+    # iDRR (improved DRR: cost-normalized aging) waiting-queue ordering and admission.
     # Waiting requests are ordered by score = age_s**alpha / (cost/1024)**beta,
     # where cost is the request's compute units and 1024 is one 512x512 image.
-    cna_alpha: float = 1.0
-    cna_beta: float = 1.0
+    idrr_alpha: float = 1.0
+    idrr_beta: float = 1.0
     # A request waiting longer than this becomes an aged head: it reserves the
     # remaining budget for itself instead of being skipped over.
-    cna_reserve_time_s: float = 60.0
+    idrr_reserve_time_s: float = 60.0
 
     # Warmup-time automatic budget calibration. Opt-in via warmup_auto_calibrate.
     # The ladder sweep runs at startup (step_execution + max_num_seqs > 1) and
