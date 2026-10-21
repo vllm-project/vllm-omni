@@ -19,9 +19,12 @@ from torch import nn
 
 from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed import cfg_parallel as cfg_mod
+from vllm_omni.diffusion.models.hidream_o1_image.hidream_o1_image_transformer import HiDreamO1ImageOutput
 from vllm_omni.diffusion.models.hidream_o1_image.pipeline_hidream_o1_image import (
+    PATCH_SIZE,
     T_EPS,
     HiDreamO1ImagePipeline,
+    HiDreamO1TextSample,
     build_hidream_o1_scheduler,
 )
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
@@ -31,11 +34,26 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 HEIGHT = WIDTH = 64
 STEPS = 4
 SEED = 7
+IMAGE_LEN = (HEIGHT // PATCH_SIZE) * (WIDTH // PATCH_SIZE)
+TOKEN_OF_BRANCH = {"pos": 1, "neg": 2}
+BRANCH_OF_TOKEN = {token: branch for branch, token in TOKEN_OF_BRANCH.items()}
 
 
 def _x_pred(branch: str, z: torch.Tensor, t_pixeldit: torch.Tensor) -> torch.Tensor:
     gain = 0.25 if branch == "pos" else -0.5
     return (z.float() * gain + t_pixeldit.float()).to(torch.bfloat16)
+
+
+def _sample(branch: str) -> HiDreamO1TextSample:
+    """One text token ahead of the image tokens; ``vinput_mask`` must drop it."""
+    seq_len = 1 + IMAGE_LEN
+    return HiDreamO1TextSample(
+        input_ids=torch.full((1, seq_len), TOKEN_OF_BRANCH[branch]),
+        position_ids=torch.arange(seq_len).unsqueeze(0),
+        attention_mask=None,
+        full_attn_spans=[[]],
+        vinput_mask=torch.tensor([[False] + [True] * IMAGE_LEN]),
+    )
 
 
 def _pipeline(guidance_scale: float) -> tuple[HiDreamO1ImagePipeline, list[str]]:
@@ -45,13 +63,23 @@ def _pipeline(guidance_scale: float) -> tuple[HiDreamO1ImagePipeline, list[str]]
     pipe.device = torch.device("cpu")
     calls: list[str] = []
 
-    def forward_once(sample: dict, z_in: torch.Tensor, t_pixeldit: torch.Tensor) -> torch.Tensor:
-        calls.append(sample["branch"])
-        return _x_pred(sample["branch"], z_in, t_pixeldit)
+    def model(
+        *,
+        input_ids: torch.Tensor,
+        position_ids: torch.Tensor,
+        vinputs: torch.Tensor,
+        timestep: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+        full_attn_spans: list[list[tuple[int, int]]],
+    ) -> HiDreamO1ImageOutput:
+        branch = BRANCH_OF_TOKEN[int(input_ids[0, 0])]
+        calls.append(branch)
+        text_row = torch.full_like(vinputs[:, :1], 1e4)
+        return HiDreamO1ImageOutput(x_pred=torch.cat([text_row, _x_pred(branch, vinputs, timestep)], dim=1))
 
     pipe._resolve_generation_params = lambda req: ("a cat", HEIGHT, WIDTH, STEPS, SEED, guidance_scale)
-    pipe._build_and_validate_sample = lambda prompt, *args: {"branch": "neg" if prompt == " " else "pos"}
-    pipe._forward_once = forward_once
+    pipe._build_and_validate_sample = lambda prompt, *args: _sample("neg" if prompt == " " else "pos")
+    pipe.model = model
     return pipe, calls
 
 
