@@ -167,7 +167,8 @@ def test_local_encoder_modes_preserve_validated_text_and_unified_handoff(task, t
     assert pipeline.video_vae.encode_image.call_count == int(task != "t2va")
 
 
-def test_decode_to_mp4_batches_consumer_transfers(monkeypatch):
+@pytest.mark.parametrize("decode_dtype", [torch.float16, torch.bfloat16])
+def test_decode_to_mp4_batches_consumer_transfers(monkeypatch, decode_dtype):
     from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
 
     class FakeEncoder:
@@ -175,7 +176,6 @@ def test_decode_to_mp4_batches_consumer_transfers(monkeypatch):
 
         def __init__(self, **kwargs):
             self.pushes = []
-            self.frame_count = 0
             self.kwargs = kwargs
             self.frame_count = 0
             self.__class__.instances.append(self)
@@ -197,10 +197,15 @@ def test_decode_to_mp4_batches_consumer_transfers(monkeypatch):
             return torch.zeros(1, 1, 2)
 
     class FakeVideoVAE:
-        chunk_value_range = (0.0, 1.0)
         owns_chunk_output = True
+        chunk_value_range = (0.0, 1.0)
+
+        def __init__(self):
+            self.decode_dtype = decode_dtype
 
         def decode_with_chunks(self, latent, *, on_chunk):
+            assert torch.is_autocast_enabled("cpu")
+            assert torch.get_autocast_dtype("cpu") == self.decode_dtype
             for value in (0.0, 0.25, 0.5):
                 on_chunk(torch.full((1, 3, 3, 2, 2), value))
 
@@ -250,6 +255,7 @@ def test_preencode_starts_before_audio_offload_and_cleans_up_on_video_load_failu
             return torch.zeros(1, 1, 8000)
 
     class VideoVAE:
+        decode_dtype = torch.float16
         chunk_value_range = (0.0, 1.0)
         owns_chunk_output = True
 
@@ -316,8 +322,9 @@ def test_request_video_codec_options_reach_the_preencoded_mp4_encoder(monkeypatc
             return torch.zeros(1, 1, 2)
 
     class FakeVideoVAE:
-        chunk_value_range = (0.0, 1.0)
         owns_chunk_output = True
+        chunk_value_range = (0.0, 1.0)
+        decode_dtype = torch.float16
 
         def decode_with_chunks(self, latent, *, on_chunk):
             on_chunk(torch.zeros(1, 3, 1, 2, 2))
@@ -991,6 +998,49 @@ def test_preencoded_frame_counts_survive_registered_postprocess():
     normalized = normalize_diffusion_postprocess_output(result)
     assert normalized.outputs["video"] == [b"first-mp4", b"second-mp4"]
     assert normalized.metadata["video"]["frame_counts"] == [7, 9]
+
+
+@pytest.mark.parametrize("frame_counts", [[], [7, 9], [0], [-1], [True], ["7"], 7])
+def test_invalid_preencoded_counts_preserve_the_legacy_video_result(frame_counts):
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import _minimax_h3_post_process
+
+    result = _minimax_h3_post_process(([b"encoded-video"], None, None, frame_counts))
+
+    assert result["video"] == [b"encoded-video"]
+    assert result["audio"] == [None]
+    assert result["fps"] == 24
+    assert "metadata" not in result
+
+
+@pytest.mark.parametrize("num_outputs", [1, 2])
+def test_decoder_stage_preserves_preencoded_frame_counts(monkeypatch, num_outputs):
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3_decoder import MiniMaxH3DecoderPipeline
+
+    def encode(self, video_latent, audio_latent, *, frame_counts, **kwargs):
+        frame_counts.append(7 + 2 * int(video_latent.item()))
+        return b"encoded-video"
+
+    monkeypatch.setattr(MiniMaxH3DecoderPipeline, "decode_to_mp4", encode)
+    decoder = object.__new__(MiniMaxH3DecoderPipeline)
+    nn.Module.__init__(decoder)
+    decoder.device = torch.device("cpu")
+    decoder.od_config = SimpleNamespace()
+    payload = {
+        "video_latents": [torch.tensor([index]) for index in range(num_outputs)],
+        "audio_latents": [torch.zeros(1) for _ in range(num_outputs)],
+        "preencode_mp4": True,
+        "height": 480,
+        "width": 864,
+        "video_codec_options": None,
+        "preencode_batch_frames": 17,
+    }
+    request = SimpleNamespace(prompts=[{"additional_information": {"minimax_h3_decode": payload}}])
+
+    result = decoder.forward(request)
+    formatted = result.post_process_func(result.output)
+
+    assert formatted["payload"]["video"] == [b"encoded-video"] * num_outputs
+    assert formatted["metadata"]["video"]["frame_counts"] == [7, 9][:num_outputs]
 
 
 def test_joint_video_output_is_quantized_before_transfer():
@@ -3558,8 +3608,9 @@ def _peer_rank_preencode_pipeline(monkeypatch):
             return torch.zeros(1, 1, 2)
 
     class PeerRankVideoVAE:
-        chunk_value_range = (0.0, 1.0)
         owns_chunk_output = False
+        chunk_value_range = (0.0, 1.0)
+        decode_dtype = torch.float16
 
         def decode_with_chunks(self, latent, *, on_chunk):
             del latent, on_chunk
