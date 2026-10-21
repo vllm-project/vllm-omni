@@ -256,17 +256,10 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
         self.register_buffer("_decode_generation_done", torch.zeros(max_bs, dtype=torch.bool), persistent=False)
         self._decode_active_audio_count: int = 0
 
-        # PrefixCache opt-outs (mirror qwen3_tts pattern):
-        # 1. The talker only consumes the last token's hidden state, so the
-        #    runner can skip the per-step full hidden-state GPU->CPU merge
-        #    that PrefixCache otherwise does.
-        # 2. Per-step ``codes.audio`` rows stay GPU-resident; defer the CPU
-        #    write of the prefix-cache mm-output copy to request finish so
-        #    the per-step bookkeeping does not block batching. Stage 0 can
-        #    then set ``enable_prefix_caching: true`` without the regression
-        #    observed in qwen3_tts (#3665).
+        # PrefixCache opt-out (mirrors qwen3_tts): the talker only consumes the
+        # last token's hidden state, so the runner can skip the per-step full
+        # hidden-state GPU->CPU merge that PrefixCache otherwise does.
         self.requires_full_prefix_cached_hidden_states = False
-        self.deferred_prefix_cache_mm_keys = {"codes.audio"}
 
     def _maybe_unwrap_flashinfer_api_wrappers(self) -> None:
         """Remove FlashInfer trace wrappers only from wrappers owned by this model."""

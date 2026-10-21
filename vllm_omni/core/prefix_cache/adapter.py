@@ -64,9 +64,8 @@ class PrefixCacheWrite:
 class PrefixCacheWriteLayout:
     writes: tuple[PrefixCacheWrite, ...]
     total_rows: int
-    # A fresh CPU tensor produced by the group view, shared by row-range
-    # writes rather than converted to Python integers and rebuilt.
-    slots_cpu: torch.Tensor | None = None
+    # The KV slot of each row, computed on the CPU by the group view.
+    slots_cpu: torch.Tensor
 
 
 class PrefixCacheSchedulerAdapter:
@@ -181,8 +180,7 @@ class PrefixCacheSchedulerAdapter:
             if count < 0:
                 if any(e.req_id == req_id and e.kind is PrefixCacheEventKind.STARTED and e.hit_end > 0 for e in events):
                     raise OmniPrefixCacheUnmatchError(f"negative scheduled token count for req {req_id}: {count}")
-                # #5269: ordinary non-positive spans are no-ops. A STARTED
-                # hit cannot use a negative count to size its prefetch buffer.
+                # #5269: ordinary non-positive spans are no-ops.
                 count = 0
             counts.append((req_id, count))
             if count > 0 and req_id in self._observed_req_ids and req_id not in emitted:

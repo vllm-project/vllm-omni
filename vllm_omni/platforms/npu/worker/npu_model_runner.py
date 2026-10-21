@@ -66,8 +66,6 @@ class OmniNPUModelRunner(NPUAuxOutputMixin, OmniGPUModelRunner, NPUModelRunner):
                 kv_cache_config=self.kv_cache_config,
                 cache_config=self.cache_config,
                 kv_transfer_config=getattr(self.vllm_config, "kv_transfer_config", None),
-                scheduler_config=self.scheduler_config,
-                model_config=self.model_config,
                 is_pooling_model=self.is_pooling_model,
                 speculative_config=self.speculative_config,
             )

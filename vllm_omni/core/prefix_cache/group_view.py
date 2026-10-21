@@ -162,8 +162,6 @@ def stage_prefix_cache_config(
     kv_cache_config: object,
     cache_config: object,
     kv_transfer_config: object,
-    scheduler_config: object,
-    model_config: object,
     is_pooling_model: bool,
     speculative_config: object = None,
 ) -> PrefixCacheConfig | None:
@@ -172,20 +170,17 @@ def stage_prefix_cache_config(
     Returns None when the stage does not run an omni prefix cache
     (``enable_prefix_caching`` off, or a pooling stage that never saves).
     Otherwise refuses kv_consumer / kv_both, speculative decoding,
-    sub-block matching and hybrid kv groups, then sizes the config from
-    the scheduler. One place so a platform runner cannot silently skip a
-    refusal the other one has.
+    sub-block matching and hybrid kv groups. One place so a platform runner
+    cannot silently skip a refusal the other one has.
     """
     if not getattr(cache_config, "enable_prefix_caching", False) or is_pooling_model:
         return None
     check_prefix_cache_kv_transfer(kv_transfer_config)
     check_prefix_cache_token_accounting(cache_config, speculative_config)
     check_prefix_cache_kv_groups(getattr(kv_cache_config, "kv_cache_groups", None))
-    return PrefixCacheConfig.from_vllm_config(
+    return PrefixCacheConfig(
         num_blocks=kv_cache_config.num_blocks,  # type: ignore[attr-defined]
         block_size=cache_config.block_size,  # type: ignore[attr-defined]
-        scheduler_config=scheduler_config,
-        model_config=model_config,
     )
 
 

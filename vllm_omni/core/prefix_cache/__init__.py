@@ -13,9 +13,9 @@ That is also why these files use ``logging.getLogger`` instead of
 the repo-wide ``init_logger`` — ``init_logger`` comes from
 ``vllm.logger``. The deviation is required, not an oversight.
 
-``_merge_uncached_mm`` is the exception at *call* time: it lazily
+``_split_other_mm`` is the exception at *call* time: it lazily
 imports ``vllm_omni.utils.mm_outputs``, which pulls in vllm. Import
-of this package still succeeds without vllm; materialize of leftover
+of this package still succeeds without vllm; merge_batch of leftover
 mm does not.
 """
 
@@ -27,8 +27,6 @@ from vllm_omni.core.prefix_cache.adapter import (
     PrefixCacheWrite,
     PrefixCacheWriteLayout,
 )
-from vllm_omni.core.prefix_cache.block_pool import PrefixBlockPool
-from vllm_omni.core.prefix_cache.controller import OmniPrefixCacheController
 from vllm_omni.core.prefix_cache.group_view import (
     FullAttentionGroupView,
     check_prefix_cache_kv_groups,
@@ -39,19 +37,17 @@ from vllm_omni.core.prefix_cache.group_view import (
 from vllm_omni.core.prefix_cache.interface import (
     HIDDEN_KEY,
     ModelCachePolicy,
-    OmniPrefixCacheStagingTimeoutError,
     OmniPrefixCacheUnmatchError,
     PrefixCacheConfig,
     StageCacheOutputs,
-    WriteSchedule,
 )
 from vllm_omni.core.prefix_cache.manager import OmniPrefixCacheManager
+from vllm_omni.core.prefix_cache.slot_index import SlotIndex
 
 __all__ = [
     "HIDDEN_KEY",
     "FullAttentionGroupView",
     "ModelCachePolicy",
-    "OmniPrefixCacheController",
     "OmniPrefixCacheManager",
     "PrefixCacheEventKind",
     "PrefixCacheRequestEvent",
@@ -59,12 +55,10 @@ __all__ = [
     "PrefixCacheStep",
     "PrefixCacheWrite",
     "PrefixCacheWriteLayout",
-    "OmniPrefixCacheStagingTimeoutError",
     "OmniPrefixCacheUnmatchError",
     "StageCacheOutputs",
-    "PrefixBlockPool",
     "PrefixCacheConfig",
-    "WriteSchedule",
+    "SlotIndex",
     "check_prefix_cache_kv_groups",
     "check_prefix_cache_kv_transfer",
     "get_prefix_cache_group_view",

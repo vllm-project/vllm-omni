@@ -73,8 +73,8 @@ stages:
     trust_remote_code: true
     # Omni prefix cache (reuse of talker codec rows on shared prefixes). Off
     # by default; set true when text repeats across requests (same voice or
-    # shared ref_audio). The talker opts out of hidden-state caching and
-    # defers codes.audio writes, so per-step cost is small. Stage 1 (codec
+    # shared ref_audio). The talker opts out of hidden-state caching, so
+    # per-step cost is small. Stage 1 (codec
     # decoder) is not a supported prefix-cache stage: keep it false there.
     # See docs/design/feature/prefix_caching.md for the stage matrix.
     enable_prefix_caching: false

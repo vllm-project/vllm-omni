@@ -106,7 +106,7 @@ materialization on top of CUDA Graph and async chunk produced the following
 results at concurrency 64:
 
 | Configuration | Request throughput | Mean audio TTFP | Mean audio RTF |
-|---|---:|---:|---:|
+| --- | ---: | ---: | ---: |
 | CUDA Graph + async chunk | 9.3 req/s | 655 ms | 0.63 |
 | + async output materialization | 11.3 req/s | 631 ms | 0.47 |
 | Change | **+22%** | **-4%** | **-25%** |
@@ -223,7 +223,7 @@ outputs are not deferred because they affect scheduler-visible request state.
 ### Qwen3-Omni Stage Behavior
 
 | Stage | Async output behavior | Reason |
-|---|---|---|
+| --- | --- | --- |
 | Thinker | Snapshots hidden states and multimodal outputs; builds the downstream payload in the background | The Talker needs the payload, but the next Thinker decode step only needs sampled-token feedback |
 | Talker | Runs lightweight postprocess eagerly; snapshots codec outputs; omits hidden states from the downstream payload | `hidden_states.last` is needed by the next Talker step, while Code2Wav only needs codec codes |
 | Code2Wav | Uses the normal generation-stage output path | Code2Wav is not executed by `GPUARModelRunner` |
@@ -323,21 +323,13 @@ because they use the same Talker implementation.
     construction. Enabling async chunk alone cannot activate the feature for a
     model that has not opted into async Omni output.
 
-!!! note "Prefix cache compatibility"
-    Prefix cache and async Omni output can run together. `save_outputs` returns
-    a `step_id`; the output builder later calls `materialize(sid, req_ids)` with
-    the save-time request list, which may be a step late relative to the live
-    `input_batch`. `_should_use_async_omni_output()` does not disable itself
-    when the cache is present. See
-    [Automatic Prefix Caching](prefix_caching.md#implementation).
-
 ## Compatibility and Fallbacks
 
 `GPUARModelRunner` uses the async output path only when all of the following
 runtime conditions hold:
 
 | Requirement | Reason |
-|---|---|
+| --- | --- |
 | AR async scheduling is enabled | The optimization relies on the scheduler advancing while the prior output is materialized |
 | `async_chunk` is enabled | The feature targets incremental downstream Omni payloads |
 | The model stage opts in with `use_async_omni_output` | Models must declare that their output lifecycle is safe to defer |
@@ -379,8 +371,6 @@ so Omni payload materialization remains synchronous.
 - `tests/worker/test_gpu_ar_model_runner.py`: Snapshot, guard, connector
   ordering, and background error-propagation tests.
 - [Async Chunk](async_chunk.md): Inter-stage chunking and scheduling design.
-- [Automatic Prefix Caching](prefix_caching.md#implementation): Prefix-cache
-  `step_id` / `materialize` contract used by the deferred output builder.
 - [Qwen3-Omni optimization blog](https://vllm.ai/blog/2026-07-01-qwen3-omni-optimization):
   Optimization context and controlled performance results.
 - [PR #4476](https://github.com/vllm-project/vllm-omni/pull/4476): Feature

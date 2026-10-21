@@ -945,7 +945,6 @@ def test_cpu_codec_transport_routes_owned_payloads_with_hidden(monkeypatch, use_
     output = runner._build_omni_model_runner_output_from_snapshot(
         scheduler_output=SimpleNamespace(total_num_scheduled_tokens=3, num_scheduled_tokens=dict.fromkeys(req_ids, 1)),
         hidden_states=hidden,
-        staged_hidden_states_cpu=None,
         multimodal_outputs=mm,
         req_ids_output_copy=req_ids,
         req_id_to_index_output_copy={rid: index for index, rid in enumerate(req_ids)},

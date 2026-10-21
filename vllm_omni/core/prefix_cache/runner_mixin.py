@@ -4,7 +4,7 @@
 
 One copy of the integration rules shared by the GPU and NPU runners:
 one-shot manager construction, the model cache-policy snapshot, and the
-per-step lifecycle entry. The manager/controller state machines and the
+per-step lifecycle entry. The manager state machine and the
 platform output-building flows stay in their owners.
 
 Not exported from the package ``__init__``; runners import this module
@@ -78,16 +78,16 @@ class PrefixCacheRunnerMixin:
     def _model_mm_outputs_written_in_sample(self) -> bool:
         """True when the step snapshot cannot hold the model's mm outputs.
 
-        Such a model appends them in ``sample()``, after
-        ``_prefix_cache_save_step``; the output path discards the step
-        context and builds the payload from the live outputs.
+        Such a model appends them in ``sample()``, which runs after
+        ``_prefix_cache_save_batch`` on NPU; the output path skips the merge
+        and builds the payload from the live outputs.
         """
         return self._omni_cache_policy.mm_outputs_written_in_sample
 
     def _ensure_omni_prefix_cache(self) -> None:
         """One-shot construction (caller gates on the staged config).
 
-        Only the last PP rank writes and materializes the cache. Other ranks
+        Only the last PP rank writes and reads the cache. Other ranks
         would register hits they can never serve (save_outputs is last-rank
         only), so skip construction there.
         """
@@ -114,9 +114,7 @@ class PrefixCacheRunnerMixin:
         self._prefix_cache_group_view = view
 
     def _prefix_cache_step_begin(self, scheduler_output: SchedulerOutput) -> None:
-        """Per-step lifecycle entry; must run before ``_update_states``
-        removes finished requests (finished/abort escalation happens inside
-        ``new_step_starts``). Builds the manager on the first real step."""
+        """Per engine step lifecycle entry. Builds the manager on the first real step."""
         if self.omni_prefix_cache is None and self._omni_prefix_cache_cfg is not None:
             self._ensure_omni_prefix_cache()
         if self.omni_prefix_cache is not None:
@@ -126,19 +124,22 @@ class PrefixCacheRunnerMixin:
             self._prefix_cache_step = step
             self.omni_prefix_cache.new_step_starts(step)
 
-    def _prefix_cache_save_step(
+    def _prefix_cache_save_batch(
         self,
-        hidden_states: torch.Tensor,
+        hidden_states: torch.Tensor | None,
         multimodal_outputs: dict | None,
         *,
         num_tokens_unpadded: int,
         num_tokens_padded: int,
     ) -> int | None:
-        """Write this step's outputs into the cache.
+        """Write this batch's outputs into the cache.
+
+        Takes CPU tensors only: the cache stores them without copying, so the one copy off the GPU
+        happens in the caller, which can reuse a copy it already makes for the output.
 
         None when this stage/rank does not write (pooling, cache off, or not
-        the last PP rank). The returned step id must be consumed exactly once
-        — materialize or discard_step — by the output path.
+        the last PP rank). The returned batch id must be consumed exactly once
+        — merge_batch or skip_merge — by the output path.
         """
         from vllm.distributed.parallel_state import get_pp_group
 
@@ -160,30 +161,40 @@ class PrefixCacheRunnerMixin:
             write_layout=layout,
         )
 
-    def _shutdown_omni_prefix_cache(self) -> None:
-        """Stop the manager and release the runner-owned cache unit."""
-        cache = self.omni_prefix_cache
-        try:
-            if cache is not None:
-                cache.shutdown()
-        finally:
-            self.omni_prefix_cache = None
-            self._prefix_cache_adapter = None
-            self._prefix_cache_group_view = None
-            self._prefix_cache_step = None
-            self._omni_prefix_cache_cfg = None
+    def _prefix_cache_cpu_copies(
+        self, hidden_states: torch.Tensor, multimodal_outputs: Any
+    ) -> tuple[torch.Tensor | None, Any]:
+        """Synchronous CPU copies of this batch's computed outputs (the tokens that missed the cache),
+        for callers with no async copy to share, or None, None if the omni prefix cache is disabled.
+        """
+        if self.omni_prefix_cache is None:
+            return None, None
+        # Imports vllm, which the rest of this package avoids at import time.
+        from vllm_omni.utils.mm_outputs import build_mm_cpu
 
-    def _prefix_cache_materialize(
-        self, step_id: int | None, req_ids: list[str]
+        hidden = hidden_states.cpu() if self._model_needs_full_prefix_hidden_states() else None
+        # Copied the way the output builder copies them, so payloads built from the cache match ones built without it.
+        return hidden, build_mm_cpu(flatten_payload(multimodal_outputs))
+
+    def _shutdown_omni_prefix_cache(self) -> None:
+        """Release the runner-owned cache unit."""
+        self.omni_prefix_cache = None
+        self._prefix_cache_adapter = None
+        self._prefix_cache_group_view = None
+        self._prefix_cache_step = None
+        self._omni_prefix_cache_cfg = None
+
+    def _prefix_cache_merge_batch(
+        self, batch_id: int | None, req_ids: list[str]
     ) -> tuple[dict[str, torch.Tensor] | None, dict | None]:
-        """Per-request merged outputs for a saved step.
+        """Per-request merged outputs for a saved batch.
 
         ``req_ids`` must be the save-time snapshot, never the live
-        ``input_batch`` (under async output this runs a step late).
-        ``step_id`` None means save did not run — nothing to consume.
-        ``mm_outputs`` is all-or-nothing; empty only when the step had no mm.
+        ``input_batch`` (under async output this runs a batch late).
+        ``batch_id`` None means save did not run — nothing to consume.
+        ``mm_outputs`` is all-or-nothing; empty only when the batch had no mm.
         """
-        if step_id is None or self.omni_prefix_cache is None:
+        if batch_id is None or self.omni_prefix_cache is None:
             return None, None
-        outs = self.omni_prefix_cache.materialize(step_id, list(req_ids))
+        outs = self.omni_prefix_cache.merge_batch(batch_id, list(req_ids))
         return outs.hidden_states, (outs.mm_outputs or None)

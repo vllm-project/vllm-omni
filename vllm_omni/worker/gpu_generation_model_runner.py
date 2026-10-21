@@ -509,14 +509,12 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
             spec_decode_metadata,
             spec_decode_common_attn_metadata,
             hidden_states,
-            _hidden_states_cpu,
             sample_hidden_states,
             aux_hidden_states,
             ec_connector_output,
             cudagraph_stats,
             multimodal_outputs_raw,
             slot_mappings,  # OMNI: unpack slot_mappings for upstream v1 API compatibility
-            _prefix_cache_step_id,  # generation stages never save to the prefix cache
         ) = self.execute_model_state
         self.execute_model_state = None
 

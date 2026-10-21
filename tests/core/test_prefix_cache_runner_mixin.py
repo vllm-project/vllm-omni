@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """CPU tests for PrefixCacheRunnerMixin: one-shot construction, policy
-snapshot identity/isolation, and the shared save/materialize gates.
+snapshot identity/isolation, and the shared save/merge gates.
 No vLLM and no GPU required (same shim as test_prefix_cache.py)."""
 
 import sys
@@ -30,7 +30,7 @@ except ModuleNotFoundError:
     sys.modules["vllm"] = _vllm
     sys.modules["vllm.logger"] = _vllm_logger
 
-from vllm_omni.core.prefix_cache.adapter import PrefixCacheStep, PrefixCacheWriteLayout
+from vllm_omni.core.prefix_cache.adapter import PrefixCacheStep, PrefixCacheWrite, PrefixCacheWriteLayout
 from vllm_omni.core.prefix_cache.interface import PrefixCacheConfig, StageCacheOutputs
 from vllm_omni.core.prefix_cache.runner_mixin import PrefixCacheRunnerMixin
 
@@ -102,24 +102,22 @@ def _sched():
 class _CacheStub:
     def __init__(self):
         self.save_calls = []
-        self.materialize_calls = []
+        self.merge_calls = []
         self.outs = StageCacheOutputs(hidden_states=None, mm_outputs={})
 
     def save_outputs(self, hidden, mm, *, num_tokens_unpadded, num_tokens_padded, write_layout):
         self.save_calls.append((hidden, mm, num_tokens_unpadded, num_tokens_padded, write_layout))
         return 7
 
-    def materialize(self, step_id, req_ids):
-        self.materialize_calls.append((step_id, req_ids))
+    def merge_batch(self, batch_id, req_ids):
+        self.merge_calls.append((batch_id, req_ids))
         return self.outs
 
 
 def test_step_begin_builds_once_and_registers_snapshot_policy(monkeypatch):
     _patch_pp(monkeypatch, is_last=True)
     r = _Runner(_cfg())
-    r._snapshot_prefix_cache_model_policy(
-        SimpleNamespace(requires_full_prefix_cached_hidden_states=True, deferred_prefix_cache_mm_keys=("k",))
-    )
+    r._snapshot_prefix_cache_model_policy(SimpleNamespace(requires_full_prefix_cached_hidden_states=True))
     r._prefix_cache_step_begin(_sched())
     mgr = r.omni_prefix_cache
     assert mgr is not None and r._omni_prefix_cache_cfg is None
@@ -154,18 +152,17 @@ def test_save_step_gates_and_passthrough(monkeypatch):
     r = _Runner()
     stub = _CacheStub()
     hidden = torch.zeros(2, 2)
+    layout = PrefixCacheWriteLayout((PrefixCacheWrite("a", 0, 2),), 2, torch.tensor([4, 5]))
 
     def save():
-        return r._prefix_cache_save_step(hidden, None, num_tokens_unpadded=2, num_tokens_padded=2)
+        return r._prefix_cache_save_batch(hidden, None, num_tokens_unpadded=2, num_tokens_padded=2)
 
     _patch_pp(monkeypatch, is_last=True)
     assert save() is None  # cache off
     r.omni_prefix_cache = stub
-    r._prefix_cache_adapter = SimpleNamespace(
-        build_write_layout=lambda view, *, num_scheduled_tokens: PrefixCacheWriteLayout((), 0)
-    )
+    r._prefix_cache_adapter = SimpleNamespace(build_write_layout=lambda view, *, num_scheduled_tokens: layout)
     r._prefix_cache_group_view = SimpleNamespace()
-    r._prefix_cache_step = PrefixCacheStep((), ())
+    r._prefix_cache_step = PrefixCacheStep((), (("a", 2),))
     r.is_pooling_model = True
     assert save() is None  # pooling stage never writes
     r.is_pooling_model = False
@@ -173,19 +170,31 @@ def test_save_step_gates_and_passthrough(monkeypatch):
     assert save() is None  # not the last PP rank
     _patch_pp(monkeypatch, is_last=True)
     assert save() == 7
-    assert stub.save_calls == [(hidden, {}, 2, 2, PrefixCacheWriteLayout((), 0))]  # empty mm stays {}
+    assert stub.save_calls == [(hidden, {}, 2, 2, layout)]  # empty mm stays {}
 
 
-def test_materialize_requires_explicit_step_and_snapshot_req_ids():
+def test_cpu_copies_only_what_the_cache_keeps():
+    r = _Runner()
+    hidden, mm = torch.zeros(2, 2), {"k": torch.ones(2, 1)}
+    assert r._prefix_cache_cpu_copies(hidden, mm) == (None, None)  # cache off
+    r.omni_prefix_cache = _CacheStub()
+    copied_hidden, copied_mm = r._prefix_cache_cpu_copies(hidden, mm)
+    assert torch.equal(copied_hidden, hidden) and torch.equal(copied_mm["k"], mm["k"])
+    r._snapshot_prefix_cache_model_policy(SimpleNamespace(requires_full_prefix_cached_hidden_states=False))
+    copied_hidden, copied_mm = r._prefix_cache_cpu_copies(hidden, mm)
+    assert copied_hidden is None and torch.equal(copied_mm["k"], mm["k"])
+
+
+def test_merge_batch_requires_explicit_batch_and_snapshot_req_ids():
     r = _Runner()
     stub = _CacheStub()
     r.omni_prefix_cache = stub
-    assert r._prefix_cache_materialize(None, ["a"]) == (None, None)
-    assert stub.materialize_calls == []  # step_id None: nothing to consume
+    assert r._prefix_cache_merge_batch(None, ["a"]) == (None, None)
+    assert stub.merge_calls == []  # batch_id None: nothing to consume
     hidden = {"a": torch.zeros(1, 2)}
     stub.outs = StageCacheOutputs(hidden_states=hidden, mm_outputs={})
-    assert r._prefix_cache_materialize(7, ["a"]) == (hidden, None)  # empty mm -> None
-    assert stub.materialize_calls == [(7, ["a"])]
+    assert r._prefix_cache_merge_batch(7, ["a"]) == (hidden, None)  # empty mm -> None
+    assert stub.merge_calls == [(7, ["a"])]
 
 
 def test_step_begin_and_save_keep_the_translated_snapshot(monkeypatch):
@@ -211,7 +220,7 @@ def test_step_begin_and_save_keep_the_translated_snapshot(monkeypatch):
     arrival.num_scheduled_tokens["r"] = 99
     assert runner._prefix_cache_step is steps[0]
     assert steps[0].scheduled_tokens == (("r", 2),)
-    runner._prefix_cache_save_step(torch.zeros(2, 2), None, num_tokens_unpadded=2, num_tokens_padded=2)
+    runner._prefix_cache_save_batch(torch.zeros(2, 2), None, num_tokens_unpadded=2, num_tokens_padded=2)
     layout = stub.save_calls[-1][-1]
     assert layout.total_rows == 2 and layout.slots_cpu.tolist() == [0, 1]
 
@@ -241,35 +250,24 @@ def test_step_begin_rejects_incomplete_cache_initialization(missing):
     assert runner._prefix_cache_step is None
 
 
-@pytest.mark.parametrize("fail", [False, True])
-def test_shutdown_clears_cache_unit_even_on_error(fail):
+def test_shutdown_clears_cache_unit():
     import weakref
 
     from vllm_omni.core.prefix_cache.adapter import PrefixCacheSchedulerAdapter
 
     runner = _Runner(_cfg())
-    calls = []
-
-    def shutdown():
-        calls.append(True)
-        if fail:
-            raise RuntimeError("shutdown failed")
 
     class View:
         pass
 
     view = View()
     ref = weakref.ref(view)
-    runner.omni_prefix_cache = SimpleNamespace(shutdown=shutdown)
+    runner.omni_prefix_cache = SimpleNamespace()
     runner._prefix_cache_adapter = PrefixCacheSchedulerAdapter()
     runner._prefix_cache_group_view = view
     runner._prefix_cache_step = PrefixCacheStep((), ())
     del view
-    if fail:
-        with pytest.raises(RuntimeError, match="shutdown failed"):
-            runner._shutdown_omni_prefix_cache()
-    else:
-        runner._shutdown_omni_prefix_cache()
+    runner._shutdown_omni_prefix_cache()
     assert runner.omni_prefix_cache is None
     assert runner._prefix_cache_adapter is None
     assert runner._prefix_cache_group_view is None
@@ -278,7 +276,6 @@ def test_shutdown_clears_cache_unit_even_on_error(fail):
     assert ref() is None
     runner._shutdown_omni_prefix_cache()
     runner._prefix_cache_step_begin(_sched())
-    assert calls == [True]
 
 
 def test_negative_non_hit_step_is_a_noop_through_manager(monkeypatch):
@@ -293,8 +290,7 @@ def test_negative_non_hit_step_is_a_noop_through_manager(monkeypatch):
         runner._prefix_cache_step_begin(scheduler_output)
         assert runner._prefix_cache_step.scheduled_tokens == (("r", 0),)
         assert runner.omni_prefix_cache._cur_num_scheduled == {"r": 0}
-        assert runner.omni_prefix_cache._hit_spans == {}
-        assert not runner.omni_prefix_cache._prefetch_queue
+        assert runner.omni_prefix_cache._hit_blocks == {}
     finally:
         runner._shutdown_omni_prefix_cache()
 
@@ -323,10 +319,10 @@ def test_shared_runner_shutdown_releases_cache_before_upstream():
     namespace = {"PrefixCacheRunnerMixin": PrefixCacheRunnerMixin, "Base": Base}
     exec(compile(module, "<shared runner shutdown>", "exec"), namespace)
     runner = namespace["OmniGPUModelRunner"]()
-    runner.omni_prefix_cache = SimpleNamespace(shutdown=lambda: order.append("cache"))
+    runner.omni_prefix_cache = SimpleNamespace()
     runner._prefix_cache_group_view = SimpleNamespace()
     runner.shutdown()
-    assert order == ["cache", "upstream"]
+    assert order == ["upstream"]
 
     ar_tree = ast.parse((root / "vllm_omni/worker/gpu_ar_model_runner.py").read_text(encoding="utf-8"))
     ar_cls = next(node for node in ar_tree.body if isinstance(node, ast.ClassDef) and node.name == "GPUARModelRunner")

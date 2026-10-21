@@ -109,9 +109,9 @@ class ExecuteModelState(NamedTuple):
     cudagraph_stats: CUDAGraphStat | None
     batch_desc: BatchDescriptor
     multimodal_outputs: Any # Omni-Specific
-    # Omni: prefix-cache step id; its context must be consumed exactly
-    # once (materialize or discard_step) in sample_tokens.
-    prefix_cache_step_id: int | None = None
+    # Omni: prefix-cache batch id; it must be consumed exactly
+    # once (merge_batch or skip_merge) in sample_tokens.
+    prefix_cache_batch_id: int | None = None
 
 class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, DuplexSamplingRunnerMixin):
     """Autoregressive NPU model runner that returns hidden states per request."""
@@ -902,9 +902,13 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 hidden_states, aux_hidden_states = hidden_states
 
             #  -------------------------------------- Omni-new -------------------------------------------------
-            prefix_cache_step_id = self._prefix_cache_save_step(
-                hidden_states,
-                multimodal_outputs,
+            # Saved here from the device tensors, so the cache's CPU copies are made now.
+            prefix_cache_hidden_states, prefix_cache_multimodal_outputs = self._prefix_cache_cpu_copies(
+                hidden_states, multimodal_outputs
+            )
+            prefix_cache_batch_id = self._prefix_cache_save_batch(
+                prefix_cache_hidden_states,
+                prefix_cache_multimodal_outputs,
                 num_tokens_unpadded=num_tokens_unpadded,
                 num_tokens_padded=num_tokens_padded,
             )
@@ -984,7 +988,7 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 cudagraph_stats,
                 batch_desc,
                 multimodal_outputs, # Omni-specific
-                prefix_cache_step_id,
+                prefix_cache_batch_id,
             )
             self.kv_connector_output = kv_connector_output
 
@@ -1081,7 +1085,7 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             cudagraph_stats,
             batch_desc,
             multimodal_outputs, # Omni-Specific
-            prefix_cache_step_id,
+            prefix_cache_batch_id,
         ) = self.execute_model_state
         pending_aux_output = self._prepare_omni_aux_output()
         # Clear ephemeral state.
@@ -1256,16 +1260,16 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         needs_scheduled_hidden_payload = needs_pooler_payload and (
             not _omni_cache_on or not self._model_needs_full_prefix_hidden_states()
         )
-        if prefix_cache_step_id is not None and (
+        if prefix_cache_batch_id is not None and (
             not needs_pooler_payload or self._model_mm_outputs_written_in_sample()
         ):
-            # No consumer for this step's merge, or the model wrote its mm
-            # outputs in sample() after the snapshot: consume the step context
+            # No consumer for this batch's merge, or the model wrote its mm
+            # outputs in sample() after the snapshot: skip the merge
             # by id (exactly-once contract) and build from the live outputs.
             # The cache write still lands.
             assert self.omni_prefix_cache is not None
-            self.omni_prefix_cache.discard_step(prefix_cache_step_id)
-            prefix_cache_step_id = None
+            self.omni_prefix_cache.skip_merge(prefix_cache_batch_id)
+            prefix_cache_batch_id = None
         if needs_scheduled_hidden_payload:
             num_valid_tokens = min(
                 int(scheduler_output.total_num_scheduled_tokens),
@@ -1297,7 +1301,7 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 (
                     combined_hidden_states,
                     combined_multimodal_outputs,
-                ) = self._prefix_cache_materialize(prefix_cache_step_id, list(req_ids_output_copy))
+                ) = self._prefix_cache_merge_batch(prefix_cache_batch_id, list(req_ids_output_copy))
             if not _omni_cache_on or combined_multimodal_outputs is None:
                 mm_cpu = build_mm_cpu(
                     flatten_payload(multimodal_outputs) if multimodal_outputs else multimodal_outputs

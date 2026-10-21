@@ -24,6 +24,9 @@ from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 
 from tests.helpers.mark import hardware_test
 from vllm_omni.core.prefix_cache import ModelCachePolicy, StageCacheOutputs
+from vllm_omni.core.prefix_cache.adapter import PrefixCacheSchedulerAdapter
+from vllm_omni.core.prefix_cache.interface import PrefixCacheConfig
+from vllm_omni.core.prefix_cache.manager import OmniPrefixCacheManager
 from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
 from vllm_omni.entrypoints.openai.tts_adapters.base import PreparedRequest
@@ -595,7 +598,6 @@ def test_build_omni_output_uses_snapshots_after_accumulation(monkeypatch):
             num_scheduled_tokens={"r1": 1, "r2": 2},
         ),
         hidden_states=torch.tensor([[1.0], [2.0], [3.0]]),
-        staged_hidden_states_cpu=None,
         multimodal_outputs={"foo": torch.tensor([10.0, 20.0, 30.0])},
         req_ids_output_copy=["r1", "r2"],
         req_id_to_index_output_copy={"r1": 0, "r2": 1},
@@ -639,7 +641,6 @@ def test_build_omni_output_copies_hidden_for_partial_downstream_batch(monkeypatc
             num_scheduled_tokens={"r1": 1, "r2": 2, "r3": 3},
         ),
         hidden_states=torch.tensor([[1.0], [2.0], [3.0], [4.0], [5.0], [6.0]]),
-        staged_hidden_states_cpu=None,
         multimodal_outputs={},
         req_ids_output_copy=["r1", "r2", "r3"],
         req_id_to_index_output_copy={"r1": 0, "r2": 1, "r3": 2},
@@ -694,7 +695,6 @@ def test_process_additional_information_uses_snapshot_request_order(monkeypatch,
             num_scheduled_tokens={"r1": 1, "r2": 2},
         ),
         hidden_states=torch.tensor([[1.0], [2.0], [3.0]]),
-        staged_hidden_states_cpu=None,
         multimodal_outputs={},
         req_ids_output_copy=["r1", "r2"],
         req_id_to_index_output_copy={"r1": 0, "r2": 1},
@@ -724,7 +724,7 @@ def test_async_omni_output_guard_requires_safe_conditions():
     assert GPUARModelRunner._should_use_async_omni_output(runner)
 
     # Prefix cache no longer forces the sync output path; leftover mm is
-    # snapshotted at save so the builder can materialize a step late.
+    # snapshotted at save so the builder can merge a batch late.
     runner.omni_prefix_cache = object()
     assert GPUARModelRunner._should_use_async_omni_output(runner)
 
@@ -756,7 +756,6 @@ def test_build_omni_output_skips_hidden_when_model_opts_out(monkeypatch):
             num_scheduled_tokens={"r1": 2},
         ),
         hidden_states=torch.tensor([[1.0], [2.0]]),
-        staged_hidden_states_cpu=None,
         multimodal_outputs={"codes": {"audio": torch.tensor([[7, 8], [9, 10]], dtype=torch.long)}},
         req_ids_output_copy=["r1"],
         req_id_to_index_output_copy={"r1": 0},
@@ -803,7 +802,6 @@ def test_build_omni_output_splits_mm_by_scheduled_tokens_when_hidden_is_tail_onl
             num_scheduled_tokens={"r1": 1, "r2": 1, "r3": 1},
         ),
         hidden_states=torch.tensor([[1.0]]),
-        staged_hidden_states_cpu=None,
         multimodal_outputs={"codes": {"audio": codes}},
         req_ids_output_copy=["r1", "r2", "r3"],
         req_id_to_index_output_copy={"r1": 0, "r2": 1, "r3": 2},
@@ -850,7 +848,6 @@ def test_build_omni_output_splits_mm_by_hidden_len_when_scheduled_is_padded(monk
             num_scheduled_tokens={"r1": 1, "r2": 1, "r3": 1},
         ),
         hidden_states=torch.randn(3, 4),
-        staged_hidden_states_cpu=None,
         multimodal_outputs={"hidden_states": {"layers": {0: layers}}},
         req_ids_output_copy=["r1", "r2", "r3"],
         req_id_to_index_output_copy={"r1": 0, "r2": 1, "r3": 2},
@@ -880,7 +877,6 @@ def test_async_snapshot_payload_omits_hidden_when_model_opts_out():
     payload = GPUARModelRunner._build_omni_async_snapshot_payload(
         runner,
         hidden_states=torch.tensor([[1.0], [2.0]]),
-        staged_hidden_states_cpu=torch.tensor([[3.0]]),
         multimodal_outputs={"codes": {"audio": torch.tensor([[1]], dtype=torch.long)}},
     )
 
@@ -931,42 +927,13 @@ def test_runner_assisted_full_attention_metadata_refresh_pads_buffers():
     assert block_table.commits == [4]
 
 
-@pytest.mark.parametrize("query_start_loc_attr", ["method", "tensor_attr"])
-def test_sample_tokens_tail_only_prefix_cache_uses_staged_cpu_hidden_states(monkeypatch, query_start_loc_attr):
+def _make_inline_sample_runner(monkeypatch, omni_prefix_cache) -> GPUARModelRunner:
+    """A runner whose sample_tokens builds the output inline, with sampling stubbed out."""
     runner = object.__new__(GPUARModelRunner)
     runner._omni_cache_policy = ModelCachePolicy(needs_full_hidden_states=True)
     runner._pooler_payload_include_hidden_flag = True
-    runner.execute_model_state = ExecuteModelState(
-        SimpleNamespace(
-            total_num_scheduled_tokens=3,
-            num_scheduled_tokens={"r1": 1, "r2": 2},
-        ),
-        None,
-        None,
-        None,
-        torch.zeros((3, 2), dtype=torch.float32),
-        torch.tensor([[1.0, 10.0], [2.0, 20.0], [3.0, 30.0]]),
-        None,
-        None,
-        None,
-        None,
-        {},
-        None,
-    )
     runner.kv_connector_output = None
-    runner.input_batch = SimpleNamespace(
-        req_ids=["r1", "r2"],
-        req_id_to_index={"r1": 0, "r2": 1},
-        sampling_metadata=SimpleNamespace(no_penalties=True),
-        vocab_size=10,
-        num_tokens_no_spec=None,
-    )
-    query_start_loc = torch.tensor([0, 1], dtype=torch.long)
-    if query_start_loc_attr == "method":
-        runner.query_start_loc = query_start_loc
-    else:
-        runner.query_start_loc = SimpleNamespace(cpu=query_start_loc)
-    runner.omni_prefix_cache = object()
+    runner.omni_prefix_cache = omni_prefix_cache
     runner.speculative_config = None
     runner.routed_experts_initialized = False
     runner.requests = {}
@@ -985,34 +952,60 @@ def test_sample_tokens_tail_only_prefix_cache_uses_staged_cpu_hidden_states(monk
     monkeypatch.setattr(
         GPUARModelRunner,
         "_bookkeeping_sync",
-        lambda *args, **kwargs: (
+        lambda self, *args, **kwargs: (
             0,
             None,
             None,
             [],
             None,
-            ["r1", "r2"],
-            {"r1": 0, "r2": 1},
+            list(self.input_batch.req_ids),
+            dict(self.input_batch.req_id_to_index),
             [],
         ),
     )
     monkeypatch.setattr(GPUARModelRunner, "eplb_step", lambda self: None)
     monkeypatch.setattr(GPUARModelRunner, "_resolve_pooler_payload_req_ids", lambda self, req_ids: ("audio", req_ids))
-    monkeypatch.setattr(GPUARModelRunner, "_model_needs_full_prefix_hidden_states", lambda self: False)
-    monkeypatch.setattr(
-        GPUARModelRunner,
-        "_prepare_prefix_cache_pooler_payload_sources",
-        lambda self, **kwargs: (kwargs["staged_hidden_states_cpu"], None, None),
-    )
     monkeypatch.setattr(GPUARModelRunner, "_process_additional_information_updates", lambda *args, **kwargs: None)
     monkeypatch.setattr(GPUARModelRunner, "_should_accumulate_full_payload_output", lambda self: False)
     monkeypatch.setattr(GPUARModelRunner, "get_omni_connector_output", lambda self: None)
-
     monkeypatch.setattr(
         GPUARModelRunner,
         "_snapshot_scheduler_output_for_async_omni_output",
         lambda *args: pytest.fail("inline output must not snapshot scheduler metadata"),
     )
+    return runner
+
+
+def _schedule_inline_step(runner: GPUARModelRunner, scheduler_output, hidden_states: torch.Tensor) -> None:
+    """Leave the state execute_model would for scheduler_output, with its requests in batch order."""
+    req_ids = list(scheduler_output.num_scheduled_tokens)
+    runner.execute_model_state = ExecuteModelState(
+        scheduler_output, None, None, None, hidden_states, None, None, None, None, {}, None
+    )
+    runner.input_batch = SimpleNamespace(
+        req_ids=req_ids,
+        req_id_to_index={req_id: index for index, req_id in enumerate(req_ids)},
+        sampling_metadata=SimpleNamespace(no_penalties=True),
+        vocab_size=10,
+        num_tokens_no_spec=None,
+    )
+    starts = np.cumsum([0, *scheduler_output.num_scheduled_tokens.values()])
+    runner.query_start_loc = SimpleNamespace(cpu=torch.tensor(starts, dtype=torch.long))
+
+
+@pytest.mark.parametrize("query_start_loc_attr", ["method", "tensor_attr"])
+def test_sample_tokens_tail_only_prefix_cache_serves_scheduled_hidden_states(monkeypatch, query_start_loc_attr):
+    runner = _make_inline_sample_runner(monkeypatch, omni_prefix_cache=object())
+    _schedule_inline_step(
+        runner,
+        SimpleNamespace(total_num_scheduled_tokens=3, num_scheduled_tokens={"r1": 1, "r2": 2}),
+        torch.tensor([[1.0, 10.0], [2.0, 20.0], [3.0, 30.0]]),
+    )
+    if query_start_loc_attr == "method":
+        runner.query_start_loc = runner.query_start_loc.cpu
+    monkeypatch.setattr(GPUARModelRunner, "_model_needs_full_prefix_hidden_states", lambda self: False)
+    monkeypatch.setattr(GPUARModelRunner, "_save_outputs_to_prefix_cache", lambda *args, **kwargs: None)
+
     output = GPUARModelRunner.sample_tokens(runner, grammar_output=None)
 
     # Non-async-chunk now ships the full payload to the next stage, so
@@ -1029,6 +1022,40 @@ def test_sample_tokens_tail_only_prefix_cache_uses_staged_cpu_hidden_states(monk
     )
 
 
+def test_inline_sample_tokens_puts_cached_prefix_rows_in_front(monkeypatch):
+    """Save and merge through sample_tokens with a real cache: r2 hits the
+    block r1 wrote, so r2's hidden payload starts with r1's rows."""
+    cache = OmniPrefixCacheManager(PrefixCacheConfig(num_blocks=4, block_size=2))
+    cache.register_policy(ModelCachePolicy(needs_full_hidden_states=True))
+    runner = _make_inline_sample_runner(monkeypatch, omni_prefix_cache=cache)
+    runner.is_pooling_model = False
+    runner._prefix_cache_adapter = PrefixCacheSchedulerAdapter()
+    step_slots = torch.empty(0, dtype=torch.long)
+    runner._prefix_cache_group_view = SimpleNamespace(
+        batch_req_ids=lambda: list(runner.input_batch.req_ids),
+        step_slots_cpu=lambda req_ids, num_scheduled: step_slots,
+    )
+    monkeypatch.setattr("vllm.distributed.parallel_state.get_pp_group", lambda: SimpleNamespace(is_last_rank=True))
+
+    def run_step(req_id, hit_tokens, block_ids, slots, rows):
+        nonlocal step_slots
+        step_slots = torch.tensor(slots)
+        scheduler_output = SimpleNamespace(
+            scheduled_new_reqs=[SimpleNamespace(req_id=req_id, num_computed_tokens=hit_tokens, block_ids=[block_ids])],
+            num_scheduled_tokens={req_id: len(slots)},
+            total_num_scheduled_tokens=len(slots),
+        )
+        runner._prefix_cache_step_begin(scheduler_output)
+        _schedule_inline_step(runner, scheduler_output, torch.tensor(rows).unsqueeze(1))
+        output = GPUARModelRunner.sample_tokens(runner, grammar_output=None)
+        return output.multimodal_outputs[0]["hidden"].flatten().tolist()
+
+    assert run_step("r1", 0, [0, 1], [0, 1, 2], [1.0, 2.0, 3.0]) == [1.0, 2.0, 3.0]
+    # r2 shares r1's first block and computes the rest in its own block 3.
+    assert run_step("r2", 2, [0, 3], [6, 7], [8.0, 9.0]) == [1.0, 2.0, 8.0, 9.0]
+    assert not cache._batches
+
+
 def test_build_omni_output_falls_back_to_mm_cpu_without_prefix_merge(monkeypatch):
     """Tail-only prefix-cache models still need per-step mm passthrough (e.g. codes.audio)."""
     runner = _make_async_output_runner(engine_output_type="latent")
@@ -1040,11 +1067,6 @@ def test_build_omni_output_falls_back_to_mm_cpu_without_prefix_merge(monkeypatch
         lambda self, req_ids: ("latent", req_ids),
     )
     monkeypatch.setattr(GPUARModelRunner, "_model_needs_full_prefix_hidden_states", lambda self: False)
-    monkeypatch.setattr(
-        GPUARModelRunner,
-        "_prepare_prefix_cache_pooler_payload_sources",
-        lambda *args, **kwargs: (None, None, None),
-    )
     monkeypatch.setattr(GPUARModelRunner, "_process_additional_information_updates", lambda *args, **kwargs: None)
     monkeypatch.setattr(GPUARModelRunner, "_should_accumulate_full_payload_output", lambda self: False)
     monkeypatch.setattr(GPUARModelRunner, "get_omni_connector_output", lambda self: None)
@@ -1057,7 +1079,6 @@ def test_build_omni_output_falls_back_to_mm_cpu_without_prefix_merge(monkeypatch
             num_scheduled_tokens={"r1": 1, "r2": 1},
         ),
         hidden_states=torch.tensor([[1.0], [2.0]]),
-        staged_hidden_states_cpu=None,
         multimodal_outputs={"codes.audio": codes},
         req_ids_output_copy=["r1", "r2"],
         req_id_to_index_output_copy={"r1": 0, "r2": 1},
@@ -1097,11 +1118,11 @@ def test_build_omni_output_uses_live_mm_when_model_writes_it_in_sample(monkeypat
     calls: list[tuple[str, int]] = []
 
     class StepCache:
-        def discard_step(self, step_id):
-            calls.append(("discard", step_id))
+        def skip_merge(self, batch_id):
+            calls.append(("skip", batch_id))
 
-        def materialize(self, step_id, req_ids):
-            calls.append(("materialize", step_id))
+        def merge_batch(self, batch_id, req_ids):
+            calls.append(("merge", batch_id))
             stale = {
                 "model_outputs": {rid: [] for rid in req_ids},
                 "sr": {rid: [] for rid in req_ids},
@@ -1122,7 +1143,6 @@ def test_build_omni_output_uses_live_mm_when_model_writes_it_in_sample(monkeypat
         runner,
         scheduler_output=SimpleNamespace(total_num_scheduled_tokens=2, num_scheduled_tokens={"r1": 1, "r2": 1}),
         hidden_states=torch.zeros(2, 4),
-        staged_hidden_states_cpu=None,
         multimodal_outputs={
             "model_outputs": [song],
             "sr": [torch.tensor(48000)],
@@ -1140,14 +1160,14 @@ def test_build_omni_output_uses_live_mm_when_model_writes_it_in_sample(monkeypat
         kv_extracted_req_ids=None,
         num_scheduled_tokens_np=np.array([1, 1], dtype=np.int32),
         query_start_loc_cpu=torch.tensor([0, 1], dtype=torch.long),
-        prefix_cache_step_id=7,
+        prefix_cache_batch_id=7,
     )
 
     if written_in_sample:
-        assert calls == [("discard", 7)]
+        assert calls == [("skip", 7)]
         assert torch.equal(output.multimodal_outputs[1]["model_outputs"], song)
     else:
-        assert calls == [("materialize", 7)]
+        assert calls == [("merge", 7)]
 
 
 # --- builder gap-fill: contract corners not covered by the tests above ---
@@ -1176,7 +1196,6 @@ def test_build_omni_output_never_leaks_internal_pooler_output_on_wire(monkeypatc
             num_scheduled_tokens={"r1": 1, "r2": 2},
         ),
         hidden_states=torch.tensor([[1.0], [2.0], [3.0]]),
-        staged_hidden_states_cpu=None,
         multimodal_outputs={"foo": torch.tensor([10.0, 20.0, 30.0])},
         req_ids_output_copy=["r1", "r2"],
         req_id_to_index_output_copy={"r1": 0, "r2": 1},
@@ -1216,7 +1235,6 @@ def test_build_omni_output_splits_client_mm_from_inter_stage_keys(monkeypatch):
             num_scheduled_tokens={"r1": 1, "r2": 2},
         ),
         hidden_states=torch.tensor([[1.0], [2.0], [3.0]]),
-        staged_hidden_states_cpu=None,
         # "audio" root is a client mm key; "codes.audio" root ("codes") is inter-stage.
         multimodal_outputs={"audio": torch.tensor([10.0, 20.0, 30.0])},
         req_ids_output_copy=["r1", "r2"],
@@ -1259,11 +1277,6 @@ def test_build_omni_output_filters_multimodal_by_partial_downstream_batch(monkey
         lambda self, req_ids: ("latent", ["r1", "r3"]),
     )
     monkeypatch.setattr(GPUARModelRunner, "_model_needs_full_prefix_hidden_states", lambda self: False)
-    monkeypatch.setattr(
-        GPUARModelRunner,
-        "_prepare_prefix_cache_pooler_payload_sources",
-        lambda *args, **kwargs: (None, None, None),
-    )
     monkeypatch.setattr(GPUARModelRunner, "_process_additional_information_updates", lambda *args, **kwargs: None)
     monkeypatch.setattr(GPUARModelRunner, "_should_accumulate_full_payload_output", lambda self: False)
     monkeypatch.setattr(GPUARModelRunner, "get_omni_connector_output", lambda self: None)
@@ -1276,7 +1289,6 @@ def test_build_omni_output_filters_multimodal_by_partial_downstream_batch(monkey
             num_scheduled_tokens={"r1": 1, "r2": 1, "r3": 1},
         ),
         hidden_states=torch.tensor([[1.0], [2.0], [3.0]]),
-        staged_hidden_states_cpu=None,
         multimodal_outputs={"codes.audio": codes},
         req_ids_output_copy=["r1", "r2", "r3"],
         req_id_to_index_output_copy={"r1": 0, "r2": 1, "r3": 2},
@@ -1301,7 +1313,7 @@ def test_build_omni_output_filters_multimodal_by_partial_downstream_batch(monkey
 
 def test_build_omni_output_uses_combined_prefix_cache_mm_payload_for_partial_downstream_batch(monkeypatch):
     """When the prefix-cache merge path is engaged (i.e.
-    _prepare_prefix_cache_pooler_payload_sources returns a non-None
+    _prefix_cache_merge_batch returns a non-None
     combined_multimodal_outputs), _build_omni_mm_payload must take the
     _build_combined_prefix_cache_mm_payload branch -- keyed by req_id,
     not by row/slice -- rather than falling back to build_mm_cpu, and
@@ -1336,8 +1348,8 @@ def test_build_omni_output_uses_combined_prefix_cache_mm_payload_for_partial_dow
     monkeypatch.setattr(GPUARModelRunner, "_model_needs_full_prefix_hidden_states", lambda self: False)
     monkeypatch.setattr(
         GPUARModelRunner,
-        "_prepare_prefix_cache_pooler_payload_sources",
-        lambda *args, **kwargs: (None, None, combined_mm),
+        "_prefix_cache_merge_batch",
+        lambda *args, **kwargs: (None, combined_mm),
     )
     monkeypatch.setattr(GPUARModelRunner, "_process_additional_information_updates", lambda *args, **kwargs: None)
     monkeypatch.setattr(GPUARModelRunner, "_should_accumulate_full_payload_output", lambda self: False)
@@ -1350,7 +1362,6 @@ def test_build_omni_output_uses_combined_prefix_cache_mm_payload_for_partial_dow
             num_scheduled_tokens={"r1": 1, "r2": 1, "r3": 1},
         ),
         hidden_states=torch.tensor([[1.0], [2.0], [3.0]]),
-        staged_hidden_states_cpu=None,
         multimodal_outputs={},
         req_ids_output_copy=["r1", "r2", "r3"],
         req_id_to_index_output_copy={"r1": 0, "r2": 1, "r3": 2},
@@ -2088,7 +2099,6 @@ def token_only_builder(monkeypatch):
     kwargs = dict(
         scheduler_output=scheduler,
         hidden_states=torch.tensor([[1.0], [2.0]]),
-        staged_hidden_states_cpu=None,
         multimodal_outputs=None,
         req_ids_output_copy=["r1", "r2"],
         req_id_to_index_output_copy={"r1": 0, "r2": 1},
@@ -2136,9 +2146,7 @@ def test_token_only_output_keeps_prefix_cache_merge(token_only_builder, mocker):
     runner, kwargs = token_only_builder
     runner.omni_prefix_cache = object()
     cached = {"codes.audio": {"r1": torch.tensor([31]), "r2": torch.tensor([32])}}
-    merge = mocker.patch.object(
-        runner, "_prepare_prefix_cache_pooler_payload_sources", return_value=(None, None, cached)
-    )
+    merge = mocker.patch.object(runner, "_prefix_cache_merge_batch", return_value=(None, cached))
     output = runner._build_omni_model_runner_output_from_snapshot(**kwargs)
 
     merge.assert_called_once()
@@ -2183,7 +2191,7 @@ def test_background_output_survives_step_metadata_reuse(monkeypatch, mocker):
     scheduler.total_num_scheduled_tokens = 3
     hidden = torch.tensor([[1.0], [2.0], [3.0]])
     runner.execute_model_state = ExecuteModelState(
-        scheduler, None, None, None, hidden, None, None, None, None, None, {}, None
+        scheduler, None, None, None, hidden, None, None, None, None, {}, None
     )
     sampler = SamplerOutput(sampled_token_ids=torch.tensor([[7], [8]]), logprobs_tensors=None)
     mocker.patch.object(runner, "_sample", return_value=sampler)
@@ -2212,9 +2220,7 @@ def test_background_output_survives_step_metadata_reuse(monkeypatch, mocker):
     mocker.patch.object(
         runner,
         "_snapshot_omni_output_tensors_for_async_output",
-        return_value=gpu_ar_model_runner._OmniOutputTensorSnapshot(
-            hidden_states=hidden, staged_hidden_states_cpu=None, multimodal_outputs={}
-        ),
+        return_value=gpu_ar_model_runner._OmniOutputTensorSnapshot(hidden_states=hidden, multimodal_outputs={}),
     )
     async_output = mocker.Mock(
         spec=OmniAsyncGPUModelRunnerOutput,

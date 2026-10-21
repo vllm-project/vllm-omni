@@ -61,7 +61,6 @@ def _make_runner(multimodal_outputs, num_reqs: int = 1):
         None,
         None,
         None,
-        None,
         multimodal_outputs,
         None,
     )

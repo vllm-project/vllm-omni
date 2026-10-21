@@ -558,7 +558,7 @@ class NPUGenerationModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin
             cudagraph_stats,
             _batch_desc,
             multimodal_outputs_raw,  # Omni-Specific
-            _prefix_cache_step_id,  # generation stages never save to the prefix cache
+            _prefix_cache_batch_id,  # generation stages never save to the prefix cache
         ) = self.execute_model_state
         pending_aux_output = self._prepare_omni_aux_output()
         # Clear ephemeral state.
