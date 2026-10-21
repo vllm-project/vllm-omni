@@ -189,9 +189,13 @@ Before real requests are admitted, the engine and Workers:
 4. Build the native cache configuration and resolve block geometry.
 5. Allocate rank-local physical pages and create the Scheduler facade over the
    same geometry.
-6. Run startup warmup with real Scheduler allocations and paged attention.
-   The earlier capacity profile does not measure paged-kernel workspaces or
-   replace this warmup.
+6. Run post-allocation warmup when the model provides a valid warmup request;
+   it uses real Scheduler allocations and paged attention. HunyuanImage3 skips
+   the generic blank-image warmup because its image-edit input's placeholder
+   token layout does not match the latent patch grid. This is a limitation of
+   the synthetic input, not paged KV: the first real request initializes and
+   uses the paged kernels. The pre-allocation capacity profile does not
+   measure paged-kernel workspaces.
 
 `kv_cache_memory_bytes` is a physical KV-pool budget per Worker rank, not a
 request token count. When omitted, the normal utilization path sizes the pool
