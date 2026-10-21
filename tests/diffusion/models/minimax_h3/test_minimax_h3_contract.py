@@ -984,8 +984,24 @@ def test_joint_postprocess_is_multiprocessing_picklable():
     assert result["fps"] == 24
 
 
+def test_preencoded_output_survives_process_queue_pickling():
+    from multiprocessing.reduction import ForkingPickler
+
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import (
+        _minimax_h3_post_process,
+        _MiniMaxH3EncodedOutput,
+    )
+
+    output = _MiniMaxH3EncodedOutput(video=b"encoded-video", frame_counts=[7])
+    restored = ForkingPickler.loads(ForkingPickler.dumps(output))
+    assert restored.video == b"encoded-video"
+    assert restored.frame_counts == [7]
+    assert _minimax_h3_post_process(restored)["metadata"]["video"]["frame_counts"] == [7]
+
+
 def test_preencoded_frame_counts_survive_registered_postprocess():
     from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import (
+        _MiniMaxH3EncodedOutput,
         get_minimax_h3_post_process_func,
     )
     from vllm_omni.diffusion.output_formatter import (
@@ -994,7 +1010,10 @@ def test_preencoded_frame_counts_survive_registered_postprocess():
 
     postprocess = get_minimax_h3_post_process_func(SimpleNamespace())
     restored = ForkingPickler.loads(ForkingPickler.dumps(postprocess))
-    result = restored(([b"first-mp4", b"second-mp4"], None, None, [7, 9]))
+    output = _MiniMaxH3EncodedOutput(video=[b"first-mp4", b"second-mp4"], frame_counts=[7, 9])
+    output = ForkingPickler.loads(ForkingPickler.dumps(output))
+    assert isinstance(output, _MiniMaxH3EncodedOutput)
+    result = restored(output)
     normalized = normalize_diffusion_postprocess_output(result)
     assert normalized.outputs["video"] == [b"first-mp4", b"second-mp4"]
     assert normalized.metadata["video"]["frame_counts"] == [7, 9]
@@ -1002,14 +1021,24 @@ def test_preencoded_frame_counts_survive_registered_postprocess():
 
 @pytest.mark.parametrize("frame_counts", [[], [7, 9], [0], [-1], [True], ["7"], 7])
 def test_invalid_preencoded_counts_preserve_the_legacy_video_result(frame_counts):
-    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import _minimax_h3_post_process
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import (
+        _minimax_h3_post_process,
+        _MiniMaxH3EncodedOutput,
+    )
 
-    result = _minimax_h3_post_process(([b"encoded-video"], None, None, frame_counts))
+    result = _minimax_h3_post_process(_MiniMaxH3EncodedOutput(video=[b"encoded-video"], frame_counts=frame_counts))
 
     assert result["video"] == [b"encoded-video"]
     assert result["audio"] == [None]
     assert result["fps"] == 24
     assert "metadata" not in result
+
+
+def test_untyped_four_tuple_is_not_treated_as_encoded_frame_counts():
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import _minimax_h3_post_process
+
+    output = ([b"encoded-video"], None, None, [7])
+    assert _minimax_h3_post_process(output) is output
 
 
 @pytest.mark.parametrize("num_outputs", [1, 2])
@@ -1037,6 +1066,7 @@ def test_decoder_stage_preserves_preencoded_frame_counts(monkeypatch, num_output
     request = SimpleNamespace(prompts=[{"additional_information": {"minimax_h3_decode": payload}}])
 
     result = decoder.forward(request)
+    assert result.output.frame_counts == [7, 9][:num_outputs]
     formatted = result.post_process_func(result.output)
 
     assert formatted["payload"]["video"] == [b"encoded-video"] * num_outputs
