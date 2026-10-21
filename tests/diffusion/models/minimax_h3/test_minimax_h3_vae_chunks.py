@@ -11,6 +11,7 @@ import torch.distributed as dist
 
 from vllm_omni.diffusion.models.minimax_h3.chunked_decode import decode_h3_chunks
 from vllm_omni.diffusion.models.minimax_h3.temporal_chunks import decode_temporal_chunks
+from vllm_omni.diffusion.models.minimax_h3.vae import MiniMaxH3VideoVAE
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
@@ -84,8 +85,9 @@ class _FakeTemporalModel:
         return part
 
 
-class _FakeHost:
+class _FakeHost(MiniMaxH3VideoVAE):
     def __init__(self):
+        torch.nn.Module.__init__(self)
         self.model = _FakeTemporalModel()
 
     @staticmethod
@@ -120,6 +122,17 @@ def test_h3_callback_failure_is_deferred_until_temporal_decode_finishes():
     with pytest.raises(RuntimeError, match="sink failed"):
         decode_h3_chunks(host, latent, fail_once, group=None)
     assert seen == [17]
+
+
+def test_replacement_decoder_pixel_transform_applies_to_full_and_chunked_decode():
+    host = _FakeHost()
+    host._pixel_transform = lambda raw: raw + 0.25
+    latent = torch.zeros(1, 1, 8, 1, 1)
+    full = decode_h3_chunks(host, latent, None, group=None)
+    chunks: list[torch.Tensor] = []
+    decode_h3_chunks(host, latent, chunks.append, group=None)
+    assert torch.equal(full, torch.cat(chunks, dim=2))
+    assert torch.all(full == 0.25)
 
 
 def test_h3_without_callback_is_a_plain_full_decode_on_a_vae_group(cpu_process_group):

@@ -61,6 +61,21 @@ def test_slot_returns_only_after_its_last_reader():
 
 
 @pytest.mark.cpu
+def test_slot_can_be_reused_after_inference_mode_producer():
+    """The final flush may reuse a VAE callback's slot outside inference mode."""
+    ring = _cpu_ring(1)
+    with torch.inference_mode():
+        first = ring.transfer(_frames(11), readers=1)
+        assert np.all(first.wait() == 11)
+        first.release()
+
+    final = ring.transfer(_frames(23), readers=1)
+    assert np.all(final.wait() == 23)
+    final.release()
+    assert ring.slots_in_use == 0
+
+
+@pytest.mark.cpu
 def test_transfer_waits_for_a_slot_instead_of_growing_the_pool():
     """Depth is the bound on in-flight host buffers, so a full ring blocks."""
     ring = _cpu_ring(1)
@@ -305,7 +320,8 @@ def test_session_gets_its_slot_back_after_a_real_encoder_failure():
 
 
 @hardware_test(res={"cuda": ["L4", "H100", "B200"], "rocm": "MI325"})
-def test_device_chunks_land_intact_through_the_pinned_ring():
+@pytest.mark.parametrize("inference_producer", [False, True])
+def test_device_chunks_land_intact_through_the_pinned_ring(inference_producer):
     """On an accelerator the copy is deferred, so its event must order the read."""
     if not torch.accelerator.is_available():
         pytest.skip("no accelerator available")
@@ -317,8 +333,11 @@ def test_device_chunks_land_intact_through_the_pinned_ring():
         value = 10 * step + 1
         # Quantize on the compute stream immediately before handing the chunk
         # over: without the source-ready event the copy would race this work.
-        chunk = torch.full((1, 3, 2, 4, 6), value / 255.0, device=device)
-        pending.append((value, ring.transfer(quantize_chunk(chunk, (0.0, 1.0)), readers=1)))
+        # The VAE callback can fill both slots in inference mode before a
+        # final flush reuses them outside that context.
+        with torch.inference_mode(inference_producer and step < 2):
+            chunk = torch.full((1, 3, 2, 4, 6), value / 255.0, device=device)
+            pending.append((value, ring.transfer(quantize_chunk(chunk, (0.0, 1.0)), readers=1)))
         if len(pending) == 2:
             for expected, lease in pending:
                 assert int(lease.wait()[0, 0, 0, 0, 0]) == expected
