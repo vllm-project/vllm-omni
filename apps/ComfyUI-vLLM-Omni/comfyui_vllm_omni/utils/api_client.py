@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """
-An high-level API client adapter that forwards ComfyUI inputs to vLLM-Omni's REST API,
+A high-level API client adapter that forwards ComfyUI inputs to vLLM-Omni's API,
 and transforms the API responses back to ComfyUI formats.
 
 The image generation part is derived from dougbtv/comfyui-vllm-omni by Doug (@dougbtv).
@@ -85,6 +85,41 @@ class VLLMOmniClient:
         self.timeout = aiohttp.ClientTimeout(total=timeout)
         self.poll_interval = poll_interval
         self.max_poll_duration = max_poll_duration
+
+    async def generate_video_stream(self, payload: dict[str, Any]) -> VideoInput:
+        """Collect a finite realtime rollout and decode all fragments as one VIDEO."""
+        chunks = bytearray()
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.max_poll_duration
+        async with aiohttp.ClientSession(timeout=self.timeout) as session:
+            async with session.ws_connect(self.base_url, max_msg_size=64 * 1024 * 1024) as ws:
+                await ws.send_json(payload)
+                while True:
+                    remaining = deadline - loop.time()
+                    if remaining <= 0:
+                        raise RuntimeError("Timed out waiting for the complete video session.")
+                    try:
+                        message = await ws.receive(timeout=min(20.0, remaining))
+                    except asyncio.TimeoutError:
+                        await ws.send_json({"type": "session.ping"})
+                        continue
+                    if message.type == aiohttp.WSMsgType.BINARY:
+                        chunks.extend(message.data)
+                    elif message.type == aiohttp.WSMsgType.TEXT:
+                        event = json.loads(message.data)
+                        if event.get("type") == "error":
+                            raise RuntimeError(f"Omni video generation failed: {event.get('message', 'Unknown error')}")
+                        if event.get("type") == "session.done":
+                            if event.get("stopped") or not chunks:
+                                raise RuntimeError("Video session stopped or completed without video data.")
+                            return bytes_to_video(bytes(chunks))
+                    elif message.type in (
+                        aiohttp.WSMsgType.CLOSING,
+                        aiohttp.WSMsgType.CLOSE,
+                        aiohttp.WSMsgType.CLOSED,
+                        aiohttp.WSMsgType.ERROR,
+                    ):
+                        raise RuntimeError("Video connection closed before session.done; result is incomplete.")
 
     async def generate_image(
         self,
