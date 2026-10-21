@@ -594,39 +594,35 @@ class HiDreamO1ImagePipeline(nn.Module, CFGParallelMixin, DiffusionPipelineProfi
             p2=PATCH_SIZE,
         )
 
-    def _forward_once(
-        self,
-        sample: HiDreamO1TextSample,
-        z_in: torch.Tensor,
-        t_pixeldit: torch.Tensor,
-    ) -> torch.Tensor:
-        with torch.autocast(self.device.type, dtype=self.dtype, cache_enabled=False):
-            outputs = self.model(
-                input_ids=sample["input_ids"],
-                position_ids=sample["position_ids"],
-                vinputs=z_in,
-                timestep=t_pixeldit.reshape(-1).to(self.device),
-                attention_mask=sample["attention_mask"],
-                full_attn_spans=sample["full_attn_spans"],
-            )
-
-        if outputs.x_pred is None:
-            raise RuntimeError("model returned x_pred=None")
-        if outputs.x_pred.shape[-1] != z_in.shape[-1]:
-            raise RuntimeError(f"x_pred patch_dim {outputs.x_pred.shape[-1]} != z_in {z_in.shape[-1]}")
-
-        mask = sample["vinput_mask"][0]
-        return outputs.x_pred[0, mask].unsqueeze(0)
-
     def predict_noise(
         self,
-        sample: HiDreamO1TextSample,
+        *,
+        input_ids: torch.Tensor,
+        position_ids: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+        full_attn_spans: list[list[tuple[int, int]]],
+        vinput_mask: torch.Tensor,
         z: torch.Tensor,
         t_pixeldit: torch.Tensor,
         sigma: torch.Tensor,
     ) -> torch.Tensor:
         """Run one CFG branch and convert its x-prediction to a velocity."""
-        x_pred = self._forward_once(sample, z, t_pixeldit)
+        with torch.autocast(self.device.type, dtype=self.dtype, cache_enabled=False):
+            outputs = self.model(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                vinputs=z,
+                timestep=t_pixeldit.reshape(-1).to(self.device),
+                attention_mask=attention_mask,
+                full_attn_spans=full_attn_spans,
+            )
+
+        if outputs.x_pred is None:
+            raise RuntimeError("model returned x_pred=None")
+        if outputs.x_pred.shape[-1] != z.shape[-1]:
+            raise RuntimeError(f"x_pred patch_dim {outputs.x_pred.shape[-1]} != z {z.shape[-1]}")
+
+        x_pred = outputs.x_pred[0, vinput_mask[0]].unsqueeze(0)
         return (x_pred.to(torch.float32) - z.to(torch.float32)) / sigma
 
     def _build_and_validate_sample(
@@ -708,8 +704,9 @@ class HiDreamO1ImagePipeline(nn.Module, CFGParallelMixin, DiffusionPipelineProfi
                 t_pixeldit = 1.0 - step_t_f32 / 1000.0
                 sigma = (step_t_f32 / 1000.0).to(dtype=torch.float32).clamp_min(T_EPS)
 
-                positive_kwargs = {"sample": samples[0], "z": z, "t_pixeldit": t_pixeldit, "sigma": sigma}
-                negative_kwargs = dict(positive_kwargs, sample=samples[1]) if do_true_cfg else None
+                step_kwargs = {"z": z, "t_pixeldit": t_pixeldit, "sigma": sigma}
+                positive_kwargs = {**samples[0], **step_kwargs}
+                negative_kwargs = {**samples[1], **step_kwargs} if do_true_cfg else None
                 v_guided = self.predict_noise_maybe_with_cfg(
                     do_true_cfg,
                     guidance_scale,
