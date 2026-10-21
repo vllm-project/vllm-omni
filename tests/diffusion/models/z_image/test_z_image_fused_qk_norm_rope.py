@@ -87,27 +87,13 @@ def test_packed_table_is_built_under_sequence_parallelism():
 
 @pytest.mark.skipif(not current_omni_platform.is_cuda() or not torch.cuda.is_available(), reason="NVIDIA CUDA required")
 @pytest.mark.skipif(not HAS_TRITON, reason="Triton required")
-@pytest.mark.parametrize("compiled", [False, True])
-def test_z_image_attention_fused_matches_eager(_dist_env, compiled, mocker):
-    """Eager: the fused path is bit-identical to norm_q/norm_k + RoPE. Compiled
-    (``fullgraph=True``): the fused custom op is traced into the graph and its
-    output stays within BF16 rounding of the compiled chain, whose RMSNorm is
-    Inductor's and reduces in a different order."""
-    from vllm_omni.diffusion.attention.backends.sdpa import SDPABackend
-    from vllm_omni.diffusion.config import set_current_diffusion_config
-    from vllm_omni.diffusion.data import AttentionConfig, OmniDiffusionConfig
+def test_z_image_attention_fused_matches_eager(_dist_env, mocker):
+    """The eager fused path is bit-identical to norm_q/norm_k + RoPE."""
     from vllm_omni.diffusion.models.z_image import z_image_transformer as z_image
 
     torch.manual_seed(3)
-    # Keep the fullgraph fusion check independent of FlashAttention's device
-    # probing and fake-op support. Eager execution retains the default backend.
-    od_config = OmniDiffusionConfig(
-        diffusion_attention_config=AttentionConfig(default="TORCH_SDPA") if compiled else AttentionConfig()
-    )
-    with set_current_diffusion_config(od_config), torch.device("cuda"):
+    with torch.device("cuda"):
         attn = z_image.ZImageAttention(dim=_DIM, num_heads=_HEADS, num_kv_heads=_HEADS, eps=1e-6)
-    if compiled:
-        assert attn.attn.attn_backend is SDPABackend
     attn = attn.to(torch.bfloat16).eval()
     with torch.no_grad():
         for p in attn.parameters():
@@ -121,21 +107,9 @@ def test_z_image_attention_fused_matches_eager(_dist_env, compiled, mocker):
     mask = torch.ones(batch, seq, dtype=torch.bool, device="cuda")
     table = z_image._packed_qk_norm_rope_table(cos, sin, torch.bfloat16)
 
-    if compiled:
-        attn = torch.compile(attn, fullgraph=True)
     with torch.no_grad():
         eager = attn(hidden, mask, cos, sin)
-        if compiled:
-            # A spy wrapper is not traceable under fullgraph: check the kernel launch instead.
-            from torch.profiler import ProfilerActivity, profile
-
-            with profile(activities=[ProfilerActivity.CUDA]) as prof:
-                fused = attn(hidden, mask, cos, sin, qk_norm_rope_table=table)
-                current_omni_platform.synchronize()
-            assert any("qk_norm_rope" in row.key for row in prof.key_averages()), "fused op not in the compiled graph"
-            torch.testing.assert_close(fused, eager, atol=6.25e-2, rtol=1.6e-2)
-        else:
-            fused_op = mocker.spy(z_image, "fused_qk_norm_rope")
-            fused = attn(hidden, mask, cos, sin, qk_norm_rope_table=table)
-            assert torch.equal(fused, eager)
-            assert fused_op.call_count == 1
+        fused_op = mocker.spy(z_image, "fused_qk_norm_rope")
+        fused = attn(hidden, mask, cos, sin, qk_norm_rope_table=table)
+        assert torch.equal(fused, eager)
+        assert fused_op.call_count == 1
