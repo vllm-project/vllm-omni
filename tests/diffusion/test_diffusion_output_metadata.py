@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -21,6 +21,7 @@ def test_validate_accepts_canonical_metadata_fields() -> None:
             "video": {
                 "fps": 24.0,
                 "video_fps_multiplier": 2,
+                "frame_counts": [16, 17],
                 "shape": [1, 3, 16, 64, 64],
             },
             "audio": {
@@ -53,6 +54,9 @@ def test_validate_accepts_canonical_metadata_fields() -> None:
         ({"video": {"fps": "24"}}, TypeError),
         ({"video": {"video_fps_multiplier": 0}}, ValueError),
         ({"video": {"shape": [1, 0, 64]}}, ValueError),
+        ({"video": {"frame_counts": [0]}}, ValueError),
+        ({"video": {"frame_counts": [True]}}, ValueError),
+        ({"video": {"frame_counts": "16"}}, TypeError),
         ({"audio": {"sample_rate": 0}}, ValueError),
         ({"actions": {"raw_action_dim": 0}}, ValueError),
         ({"actions": {"action_mode": ""}}, ValueError),
