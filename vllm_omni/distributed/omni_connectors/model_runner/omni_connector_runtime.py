@@ -10,7 +10,7 @@ import os
 import threading
 from collections import defaultdict, deque
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import torch
 from vllm.logger import init_logger
@@ -28,12 +28,21 @@ logger = init_logger("vllm_omni.worker.omni_connector_model_runner_mixin")
 
 if TYPE_CHECKING:
     from vllm_omni.config.model import OmniModelConfig
+    from vllm_omni.core.prefix_cache.adapter import PrefixCacheRequestOwner
+    from vllm_omni.core.prefix_cache.interface import PrefixCacheRequestProgress
     from vllm_omni.distributed.omni_connectors.connectors.base import (
         OmniConnectorBase,
     )
     from vllm_omni.distributed.omni_connectors.kv_transfer_manager import (
         OmniKVTransferManager,
     )
+
+
+class _FullPayloadEntry(NamedTuple):
+    chunks: dict[str, list[torch.Tensor]]
+    latest: dict[str, Any]
+    request: Any
+    progress: PrefixCacheRequestProgress | None
 
 
 def needs_omni_connector(model_config: Any) -> bool:
@@ -128,6 +137,7 @@ class _OmniConnectorRuntimeMixin:
     _cached_ic: dict[str, int]
     _request_ids_mapping: dict[str, str]
     _pending_load_reqs: dict[str, Any]
+    _recv_request_owners: dict[str, PrefixCacheRequestOwner | None]
     _finished_load_reqs: set[str]
     _pending_save_reqs: dict[str, deque[Any]]
     _pending_save_counts: dict[str, int]
@@ -140,7 +150,7 @@ class _OmniConnectorRuntimeMixin:
     _local_stage_payload_cache: dict[str, dict[str, Any]]
     _local_request_metadata: dict[str, dict[str, Any]]
     _chunk_stream_completed: set[str]
-    _pending_full_payload_send: dict[str, tuple[Any, ...]]
+    _pending_full_payload_send: dict[str, _FullPayloadEntry]
     _kv_sent_req_ids: list[str]
     _kv_pending_transfers: dict[str, dict[str, Any]]
     _kv_active_transfers: set[str]
@@ -266,6 +276,7 @@ class _OmniConnectorRuntimeMixin:
 
         # -- async I/O state (shared by chunk + full_payload_mode) --
         self._pending_load_reqs: dict[str, Any] = {}
+        self._recv_request_owners: dict[str, PrefixCacheRequestOwner | None] = {}
         self._finished_load_reqs: set[str] = set()
         self._pending_save_reqs: dict[str, deque] = {}
         self._pending_save_counts: dict[str, int] = defaultdict(int)
@@ -299,7 +310,7 @@ class _OmniConnectorRuntimeMixin:
 
         # -- full_payload_mode: accumulate latest pooler_output per request,
         #    send only when the request finishes (next-cycle flush) --
-        self._pending_full_payload_send: dict[str, tuple[Any, ...]] = {}
+        self._pending_full_payload_send: dict[str, _FullPayloadEntry] = {}
 
         # -- KV sent accumulator --
         self._kv_sent_req_ids: list[str] = []
@@ -364,7 +375,7 @@ class _OmniConnectorRuntimeMixin:
             except Exception:
                 pass
 
-    def cleanup_finished_request(self, req_id: str) -> None:
+    def cleanup_finished_request(self, req_id: str, *, discard_payload: bool = False) -> None:
         """Clean up per-request state after a request is fully finished.
 
         Call this when a request is freed from the model runner to prevent
@@ -388,6 +399,8 @@ class _OmniConnectorRuntimeMixin:
         # flush is idempotent when the entry has already been flushed by the
         # scheduler-driven path, but this cleanup path runs for every request,
         # so skip it entirely when the request never accumulated a payload.
+        if discard_payload:
+            self._pending_full_payload_send.pop(req_id, None)
         if req_id in self._pending_full_payload_send:
             try:
                 self.flush_full_payload_outputs({req_id})
@@ -458,6 +471,7 @@ class _OmniConnectorRuntimeMixin:
             self._clear_recv_delivery_state(req_id)
 
     def _clear_recv_delivery_state(self, req_id: str) -> None:
+        self._recv_request_owners.pop(req_id, None)
         self._get_req_chunk.pop(req_id, None)
         self._pending_load_reqs.pop(req_id, None)
         self._finished_load_reqs.discard(req_id)
@@ -521,6 +535,7 @@ class _OmniConnectorRuntimeMixin:
         # ultimately triggers cleanup_finished_request() here.
         for attr_name in (
             "_request_ids_mapping",
+            "_recv_request_owners",
             "_get_req_chunk",
             "_finished_load_reqs",
             "_chunk_ready_req_ids",

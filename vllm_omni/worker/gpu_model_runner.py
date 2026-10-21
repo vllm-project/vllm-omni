@@ -560,7 +560,9 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
             if hasattr(self, "_talker_mtp_generators"):
                 self._talker_mtp_generators.pop(req_id, None)
             if cleanup_finished_request is not None:
-                cleanup_finished_request(req_id)
+                cleanup_finished_request(
+                    req_id, discard_payload=req_id in getattr(scheduler_output, "discarded_req_ids", set())
+                )
 
         self.late_interaction_runner.on_requests_finished(scheduler_output.finished_req_ids)
         # Remove the finished requests from the persistent batch.
@@ -617,6 +619,9 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
                 if self._resume_streaming_row_in_place(req_id, new_req_data, scheduler_output):
                     continue
                 req_state = self._update_streaming_request(req_id, new_req_data)
+                setattr(
+                    req_state, "processed_media_provenance", getattr(new_req_data, "processed_media_provenance", None)
+                )
                 reqs_to_add.append(req_state)
                 continue
 
@@ -652,6 +657,7 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
                 lora_request=new_req_data.lora_request,
             )
             self.requests[req_id] = req_state
+            setattr(req_state, "processed_media_provenance", getattr(new_req_data, "processed_media_provenance", None))
             self.late_interaction_runner.register_request(req_id, pooling_params)
 
             # If prompt embeddings are provided, decode and attach to inter_data

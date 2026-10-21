@@ -3,6 +3,7 @@
 """Exercise Omni routing through the active upstream rendering pipeline."""
 
 import asyncio
+from dataclasses import asdict, replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -12,18 +13,27 @@ from vllm.config import ModelConfig
 from vllm.config.multimodal import MultiModalConfig
 from vllm.exceptions import VLLMValidationError
 from vllm.inputs import mm_input, tokens_input
-from vllm.multimodal.inputs import PlaceholderRange
+from vllm.multimodal.inputs import MultiModalKwargsItems, PlaceholderRange
 from vllm.multimodal.parse import MultiModalDataParser
 from vllm.multimodal.processing import BaseProcessingInfo, InputProcessingContext
 from vllm.pooling_params import PoolingParams
 from vllm.renderers import BaseRenderer
 from vllm.renderers.params import TokenizeParams
 from vllm.v1.engine.input_processor import InputProcessor
+from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 
+from tests.helpers.fixtures import ipc
+from vllm_omni.core.sched.output import OmniNewRequestData
+from vllm_omni.engine import OmniEngineCoreRequest
+from vllm_omni.engine.async_engine_utils import apply_omni_final_stage_metadata, upgrade_to_omni_request
 from vllm_omni.inputs import preprocess as preprocess_mod
+from vllm_omni.inputs.input_processor import OmniInputProcessor
 from vllm_omni.inputs.preprocess import OmniRenderer, build_omni_renderer, omni_renderer_cls
+from vllm_omni.inputs.processed_media import ProcessedMediaIdentity, ProcessedMediaProvenance
+from vllm_omni.request import OmniRequest
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+executor_roundtrip = ipc.executor_roundtrip
 
 
 class _Renderer(BaseRenderer):
@@ -61,9 +71,10 @@ def _video_processing_info(mocker, config_kwargs: dict[str, object] | None = Non
 
 @pytest.mark.parametrize("kwargs", [{}, {"target_h": 512, "target_w": 768}])
 @pytest.mark.parametrize("tokenized", [False, True])
-def test_process_inputs_routes_no_media_processor_kwargs(renderer, kwargs, tokenized):
+@pytest.mark.parametrize("processor_cls", [InputProcessor, OmniInputProcessor])
+def test_process_inputs_routes_no_media_processor_kwargs(renderer, kwargs, tokenized, processor_cls):
     # Keep real process_inputs/render_cmpl; stub unrelated config validation.
-    processor = object.__new__(InputProcessor)
+    processor = object.__new__(processor_cls)
     processor.renderer = renderer
     processor.model_config = renderer.model_config
     processor.vllm_config = SimpleNamespace(
@@ -386,3 +397,106 @@ def test_build_omni_renderer_resolves_like_upstream(monkeypatch):
     load_cls.assert_called_once_with("fake-mode")
     assert isinstance(built, OmniRenderer) and isinstance(built, _CtorRenderer)
     assert built.tokenizer is tokenizer
+
+
+def _provenance():
+    return ProcessedMediaProvenance(
+        (1, 90, 90, 2),
+        (ProcessedMediaIdentity("image", "a" * 64, "b" * 64, 1, 2),),
+        ("untrusted-caller-routing-uuid",),
+    )
+
+
+def _media_input(proof):
+    result = mm_input(
+        prompt_token_ids=[1, 90, 90, 2],
+        mm_kwargs=MultiModalKwargsItems({"image": [None]}),
+        mm_hashes={"image": ["untrusted-caller-routing-uuid"]},
+        mm_placeholders={"image": [PlaceholderRange(offset=1, length=2)]},
+    )
+    result["_omni_processed_media"] = proof
+    return result
+
+
+def _omni_processor(renderer):
+    processor = object.__new__(OmniInputProcessor)
+    processor.renderer = renderer
+    processor.model_config = renderer.model_config
+    processor.vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(data_parallel_size=1, data_parallel_size_local=1, local_engines_only=False)
+    )
+    processor._validate_params = Mock()
+    processor._validate_lora = Mock()
+    processor._validate_model_inputs = Mock()
+    processor.lora_config = None
+    return processor
+
+
+@pytest.mark.parametrize("already_rendered", [False, True])
+def test_provenance_survives_input_engine_and_scheduler_wires(renderer, already_rendered, executor_roundtrip):
+    proof = _provenance()
+    rendered = _media_input(proof)
+    renderer._process_multimodal.return_value = rendered
+    processor = _omni_processor(renderer)
+    raw = {
+        "prompt_token_ids": [1, 9, 2],
+        "multi_modal_data": {"image": "source"},
+        "additional_information": {"_omni_processed_media": {"fake": True}},
+    }
+    request = processor.process_inputs(
+        "current", rendered if already_rendered else raw, PoolingParams(), ("embed",), session_id="session"
+    )
+    assert isinstance(request, OmniEngineCoreRequest)
+    assert request.processed_media_provenance is proof
+    request = apply_omni_final_stage_metadata(upgrade_to_omni_request(request, raw), 1)
+    encoded = MsgpackEncoder().encode(request)
+    decoded = MsgpackDecoder(OmniEngineCoreRequest).decode(encoded)
+    assert decoded.processed_media_provenance == proof
+    assert decoded.session_id == "session"
+    admitted = OmniRequest.from_engine_core_request(decoded, None)
+    for scheduled in (
+        OmniNewRequestData.from_request(admitted, ([1],)),
+        OmniNewRequestData.from_base(OmniNewRequestData.from_request(admitted, ([1],)), admitted),
+    ):
+        # Exercise the scheduler broadcast, separately from frontend msgpack.
+        received = executor_roundtrip(scheduled)
+        assert received.processed_media_provenance == proof
+        received.processed_media_provenance.validate(received.prompt_token_ids, received.mm_features)
+
+
+def test_plain_json_cannot_mint_processor_provenance(renderer):
+    processor = _omni_processor(renderer)
+    fake = asdict(_provenance())
+    request = processor.process_inputs("fake", _media_input(fake), PoolingParams(), ("embed",))
+    assert getattr(request, "processed_media_provenance", None) is None
+    raw = {
+        "prompt_token_ids": [1, 90, 90, 2],
+        "_omni_processed_media": _provenance(),
+        "additional_information": {"processed_media_provenance": fake},
+    }
+    # Even a typed marker on a raw prompt is not an output of the renderer.
+    request = processor.process_inputs("raw", raw, PoolingParams(), ("embed",))
+    request = upgrade_to_omni_request(request, raw)
+    assert request.processed_media_provenance is None
+
+
+@pytest.mark.parametrize("tamper", ["prompt", "hash", "position", "mask", "missing", "extra_hash"])
+def test_stale_or_mismatched_processor_proof_is_rejected(renderer, tamper):
+    processor = _omni_processor(renderer)
+    rendered = _media_input(_provenance())
+    if tamper == "prompt":
+        rendered["prompt_token_ids"][0] = 999
+    elif tamper == "hash":
+        rendered["mm_hashes"]["image"][0] = "different"
+    elif tamper == "position":
+        rendered["mm_placeholders"]["image"][0] = PlaceholderRange(offset=0, length=2)
+    elif tamper == "mask":
+        rendered["mm_placeholders"]["image"][0] = PlaceholderRange(
+            offset=1, length=2, is_embed=torch.tensor([True, False])
+        )
+    elif tamper == "missing":
+        rendered["_omni_processed_media"] = replace(_provenance(), media=())
+    else:
+        rendered["_omni_processed_media"] = replace(_provenance(), routing_hashes=("extra", "hash"))
+    with pytest.raises(ValueError, match="provenance"):
+        processor.process_inputs("stale", rendered, PoolingParams(), ("embed",))

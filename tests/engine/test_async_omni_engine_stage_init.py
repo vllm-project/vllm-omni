@@ -2181,7 +2181,7 @@ def test_build_stage0_input_processor_uses_omni_renderer_subclass(monkeypatch):
             seen["renderer"] = renderer
             self.renderer = renderer
 
-    monkeypatch.setattr(init_mod, "InputProcessor", DummyInputProcessor)
+    monkeypatch.setattr(init_mod, "OmniInputProcessor", DummyInputProcessor)
     monkeypatch.setattr(init_mod, "build_omni_renderer", lambda cfg: built if cfg is config else None)
     processor = build_stage0_input_processor(config)
     assert seen["renderer"] is built
@@ -2203,7 +2203,7 @@ def test_build_stage0_input_processor_does_not_resolve_tokenizer_when_skipped(mo
     def _must_not_resolve(_cfg):
         raise AssertionError("tokenizer must not be resolved when skip_tokenizer_init=True")
 
-    monkeypatch.setattr(init_mod, "InputProcessor", DummyInputProcessor)
+    monkeypatch.setattr(init_mod, "OmniInputProcessor", DummyInputProcessor)
     monkeypatch.setattr(init_mod, "_build_token_only_renderer", lambda _: original)
     monkeypatch.setattr(init_mod, "build_omni_renderer", _must_not_resolve)
     config = types.SimpleNamespace(

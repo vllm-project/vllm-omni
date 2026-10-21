@@ -68,6 +68,8 @@ def _make_session() -> Request:
 def _replace_streaming_session(session: Request) -> None:
     """Run the real stage-0 streaming replacement (the discard/seed site)."""
     sched = OmniARScheduler.__new__(OmniARScheduler)
+    sched._prefix_cache_next_admission = 0
+    sched._prefix_cache_pending_replacements = []
     sched._new_prompt_len_snapshot = {}
     sched.vllm_config = SimpleNamespace(model_config=SimpleNamespace(stage_id=0))
     sched.num_waiting_for_streaming_input = 0

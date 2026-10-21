@@ -53,16 +53,18 @@ from __future__ import annotations
 import logging
 import threading
 from collections import deque
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import Any, NamedTuple, NoReturn
+from weakref import WeakValueDictionary
 
 import torch
 
 from vllm_omni.core.prefix_cache.adapter import (
     PrefixCacheEventKind,
+    PrefixCacheRequestEvent,
     PrefixCacheStep,
     PrefixCacheWriteLayout,
 )
@@ -78,6 +80,7 @@ from vllm_omni.core.prefix_cache.interface import (
     OmniPrefixCacheStagingTimeoutError,
     OmniPrefixCacheUnmatchError,
     PrefixCacheConfig,
+    PrefixCacheRequestProgress,
     ReqId,
     StageCacheOutputs,
     StepId,
@@ -265,6 +268,10 @@ class _StepContext:
 
     # Packed layout in batch order: req -> [start, end) of this step's rows.
     spans: dict[ReqId, tuple[int, int]]
+    token_ranges: dict[ReqId, tuple[int, int]]
+    progress: dict[ReqId, PrefixCacheRequestProgress]
+    hit_starts: dict[ReqId, int]
+    token_mm_keys: frozenset[TensorName]
     num_tokens_unpadded: int = 0
 
     # Hits snapshotted at new_step_starts. Prefetch fills [hit | empty tail]
@@ -367,7 +374,7 @@ class _SlotStatusTable:
 
 
 class _RequestTaskTable:
-    """Per request: still live, which writes it opened, deferred task.
+    """Per request: which WriteTasks it opened, deferred task.
 
     Also allocates ``tid`` and increments per-request ``write_n``.
     Device→host copy and pool write stay on the controller.
@@ -428,6 +435,12 @@ class OmniPrefixCacheManager:
         if (hk := self._policy.hidden_key) is not None:
             self._slot_status.init_table(hk)
         self._request_tasks = _RequestTaskTable()
+        self._request_progress: dict[ReqId, PrefixCacheRequestProgress] = {}
+        # Finished snapshots may still be held by a builder or accumulator.
+        # A later admission must retire them, even if it also finishes before
+        # the old builder returns. Weak values retain no completed requests.
+        self._finished_progress: WeakValueDictionary[ReqId, PrefixCacheRequestProgress] = WeakValueDictionary()
+        self._last_step_sequence = -1
         # Join worklists — not occupancy, not the request-task table.
         self._join_next_step_tids: list[Tid] = []
         self._join_finished_tids: set[Tid] = set()  # escalated on finish/abort
@@ -435,6 +448,7 @@ class OmniPrefixCacheManager:
         # This step's hits (copied into _StepContext at save).
         self._cur_num_scheduled: dict[ReqId, int] = {}
         self._hit_spans: dict[ReqId, tuple[int, list[int]]] = {}  # (upto, blocks)
+        self._hit_starts: dict[ReqId, int] = {}
         self._hit_prefetch: dict[ReqId, dict[TensorName, Future]] = {}
 
         # Planned-but-unread slot refs. A write reusing their slots copies the
@@ -478,6 +492,10 @@ class OmniPrefixCacheManager:
         events = step.events
         to_escalate: list[int] = []
         with self._state_lock:
+            if step.sequence is not None:
+                if step.sequence <= self._last_step_sequence:
+                    return
+                self._last_step_sequence = step.sequence
             # 1. Publish writes the committer has already written into the pool.
             self._commit_drained_writes()
 
@@ -489,13 +507,17 @@ class OmniPrefixCacheManager:
                 if event.kind not in (PrefixCacheEventKind.FINISHED, PrefixCacheEventKind.ABORTED):
                     continue
                 req_id = event.req_id
-                tids, dtask = self._request_tasks.finish(req_id)
-                if dtask is not None:
-                    tids.add(dtask.tid)
-                pending_tasks = [tid for tid in tids if self._controller.lookup(tid) is not None]
-                if pending_tasks:
-                    to_escalate.extend(pending_tasks)
-                    self._join_finished_tids.update(pending_tasks)
+                progress = self._request_progress.get(req_id) or self._finished_progress.get(req_id)
+                retire = False
+                if event.owner is not None:
+                    if progress is None or (progress.owner is not None and progress.owner > event.owner):
+                        continue
+                    # A replacement can finish before its control is dispatched.
+                    # Its newer terminal owner still fences the old builder.
+                    retire = progress.owner is not None and progress.owner != event.owner
+                # Normal final output retains its captured progress and remains
+                # deliverable after the request leaves the active table.
+                to_escalate.extend(self._detach_request_locked(req_id, retire=retire))
 
             # 3. Copy this arrival's prefix-hit block ids. The adapter captures
             #    them before _update_states; after that point they sit
@@ -503,13 +525,14 @@ class OmniPrefixCacheManager:
             #    materialize (async builder) must not reread that live table.
             self._clear_hit_infos()
             for event in events:
-                if event.kind not in (PrefixCacheEventKind.STARTED,):
-                    continue
                 req_id = event.req_id
-                # The adapter alone classifies starts versus continuation or
-                # resume. Do not re-infer that lifecycle from write-task state.
+                if not self._apply_request_event_locked(event, to_escalate):
+                    continue
+                progress = self._request_progress[req_id]
                 num_computed = int(event.hit_end)
-                if num_computed > 0:
+                progress.computed_upto = num_computed
+                hit_start = min(progress.delivered_upto.values(), default=0)
+                if num_computed > hit_start:
                     # block_ids is per-kv-group; group 0 only.
                     block_groups = event.block_ids
                     if not block_groups or not block_groups[0]:
@@ -532,6 +555,7 @@ class OmniPrefixCacheManager:
                         )
                     hit_blocks = list(block_groups[0][:needed])
                     self._hit_spans[req_id] = (num_computed, hit_blocks)
+                    self._hit_starts[req_id] = hit_start
 
             # 4. Gather those spans on the prefetch thread; overlaps this forward.
             while self._prefetch_queue and self._prefetch_queue[0][0].done():
@@ -541,6 +565,61 @@ class OmniPrefixCacheManager:
                 self._prefetch_hit_spans()
         if to_escalate:
             self._controller.escalate(to_escalate)
+
+    def _detach_request_locked(self, req_id: str, *, retire: bool) -> list[int]:
+        """Detach appendable tasks; the caller escalates after dropping the lock."""
+        progress = self._request_progress.pop(req_id, None)
+        if retire:
+            finished = self._finished_progress.pop(req_id, None)
+            if finished is not None:
+                finished.retired = True
+            if progress is not None:
+                progress.retired = True
+        elif progress is not None:
+            self._finished_progress[req_id] = progress
+        tids, deferred = self._request_tasks.finish(req_id)
+        if deferred is not None:
+            tids.add(deferred.tid)
+        pending = [tid for tid in tids if self._controller.lookup(tid) is not None]
+        self._join_finished_tids.update(pending)
+        return pending
+
+    def _apply_request_event_locked(self, event: PrefixCacheRequestEvent, to_escalate: list[int]) -> bool:
+        """Apply ownership, returning whether this event installs a lookup."""
+        kind = event.kind
+        if kind in (PrefixCacheEventKind.FINISHED, PrefixCacheEventKind.ABORTED):
+            return False
+        req_id = event.req_id
+        progress = self._request_progress.get(req_id)
+        owner = event.owner
+        if kind is PrefixCacheEventKind.REPLACED and owner is None:
+            raise OmniPrefixCacheUnmatchError(f"replacement for req {req_id} has no content owner")
+        if progress is not None and progress.owner is not None:
+            if owner is None or owner < progress.owner:
+                return False
+            if owner > progress.owner:
+                if kind not in (PrefixCacheEventKind.STARTED, PrefixCacheEventKind.REPLACED):
+                    raise OmniPrefixCacheUnmatchError(f"req {req_id} changed owner without a lifecycle event")
+                if kind is PrefixCacheEventKind.STARTED and owner.admission_id == progress.owner.admission_id:
+                    raise OmniPrefixCacheUnmatchError(f"req {req_id} changed content without REPLACED")
+        starts = kind in (PrefixCacheEventKind.STARTED, PrefixCacheEventKind.REPLACED)
+        if starts and (progress is None or owner is None or owner != progress.owner):
+            to_escalate.extend(self._detach_request_locked(req_id, retire=True))
+            progress = PrefixCacheRequestProgress(owner=owner)
+            self._request_progress[req_id] = progress
+        if progress is None or not event.lookup_complete:
+            return False
+        lookup = (event.hit_end, event.block_ids)
+        if progress.lookup is None:
+            progress.lookup = lookup
+            return True
+        if kind is PrefixCacheEventKind.RESUMED:
+            return True
+        if starts and progress.lookup != lookup:
+            raise OmniPrefixCacheUnmatchError(f"conflicting initial lookup for req {req_id}, owner={owner}")
+        # EXTENDED after the first completed lookup is ordinary execution
+        # progress, not another lookup. Duplicate controls are also no-ops.
+        return False
 
     @torch.inference_mode()
     def save_outputs(
@@ -637,6 +716,12 @@ class OmniPrefixCacheManager:
                     slots_cpu=slots_cpu,
                     mm_keys=set(mm_outputs.keys()),
                     write_ctx=write_ctx,
+                    token_ranges={w.req_id: (w.token_start, w.token_end) for w in write_layout.writes},
+                    token_mm_keys=frozenset(
+                        key
+                        for key, value in mm_outputs.items()
+                        if _is_step_token_tensor(value, num_tokens_unpadded, num_tokens_padded)
+                    ),
                 )
                 # Eager execution and queue dispatch must remain outside the lock.
                 write_ctx.start_writes()
@@ -689,7 +774,7 @@ class OmniPrefixCacheManager:
                         continue
                     hit_upto, hit_blocks = hit
                     prefetched = ctx.hit_prefetch.get(req_id, {})
-                    slots = self._get_hit_slots(hit_upto, hit_blocks)
+                    slots = self._get_hit_slots(hit_upto, hit_blocks, ctx.hit_starts[req_id])
                     keys = self._policy.get_hit_keys(cached_keys)
                     for key in keys:
                         fut = prefetched.get(key)
@@ -734,10 +819,125 @@ class OmniPrefixCacheManager:
                 }
 
             self._merge_uncached_mm(ctx, req_ids, cached_keys, mm_out)
-            return StageCacheOutputs(hidden_states=hidden_out, mm_outputs=mm_out)
+            return StageCacheOutputs(
+                hidden_states=hidden_out,
+                mm_outputs=mm_out,
+                token_ranges={
+                    r: (ctx.hit_starts.get(r, ctx.token_ranges[r][0]), ctx.token_ranges[r][1]) for r in req_ids
+                },
+                scheduled_token_ranges={r: ctx.token_ranges[r] for r in req_ids},
+                cached_mm_keys=frozenset(ctx.cached_keys),
+                token_mm_keys=ctx.token_mm_keys,
+                _progress={r: ctx.progress[r] for r in req_ids},
+            )
         finally:
             if ctx is not None and not step_released:
                 self._release_step_staging(ctx)
+
+    @_locked
+    def delivery_view(self, outputs: StageCacheOutputs, req_ids: list[str], *, consumer: str) -> StageCacheOutputs:
+        """Select unseen rows for an ordered local consumer, without acknowledging them.
+
+        The caller serializes view -> consume -> ack for each consumer. The
+        output builder consumes raw materialization for postprocess and uses
+        this view only for outgoing payloads.
+        """
+        ranges = {}
+        for req_id in req_ids:
+            start, end = outputs.token_ranges[req_id]
+            delivered = outputs._progress[req_id].delivered_upto.get(consumer, 0)
+            if end > delivered and start > delivered:
+                raise OmniPrefixCacheUnmatchError(
+                    f"delivery gap for req {req_id} consumer={consumer}: "
+                    f"delivered={delivered}, available=[{start}, {end})"
+                )
+            ranges[req_id] = (min(end, max(start, delivered)), end)
+
+        hidden = None
+        if outputs.hidden_states is not None:
+            hidden = {r: outputs.hidden_states[r][ranges[r][0] - outputs.token_ranges[r][0] :] for r in req_ids}
+        mm = {}
+        for key, per_req in outputs.mm_outputs.items():
+            values = {}
+            for req_id in req_ids:
+                value = per_req[req_id]
+                if key in outputs.token_mm_keys:
+                    origins = outputs.token_ranges if key in outputs.cached_mm_keys else outputs.scheduled_token_ranges
+                    origin = origins[req_id][0]
+                    value = value[max(0, ranges[req_id][0] - origin) :]
+                values[req_id] = value
+            mm[key] = values
+        return StageCacheOutputs(
+            hidden_states=hidden,
+            mm_outputs=mm,
+            token_ranges=ranges,
+            scheduled_token_ranges={r: outputs.scheduled_token_ranges[r] for r in req_ids},
+            cached_mm_keys=outputs.cached_mm_keys,
+            token_mm_keys=outputs.token_mm_keys,
+            _progress={r: outputs._progress[r] for r in req_ids},
+            _consumer=consumer,
+        )
+
+    @_locked
+    def ack_delivery(self, outputs: StageCacheOutputs) -> None:
+        """Record successful local handoff; cache reads and writes are not delivery."""
+        for delivered, consumer, end in self._delivery_advances(outputs, outputs.token_ranges):
+            delivered[consumer] = end
+
+    @staticmethod
+    def _delivery_advances(outputs: StageCacheOutputs, req_ids: Iterable[str]) -> list[tuple[dict[str, int], str, int]]:
+        """Validate the whole handoff before committing any delivery cursor."""
+        if outputs._consumer is None:
+            raise ValueError("ack_delivery requires a consumer delivery view")
+        advances = []
+        for req_id in req_ids:
+            start, end = outputs.token_ranges[req_id]
+            delivered = outputs._progress[req_id].delivered_upto
+            previous = delivered.get(outputs._consumer, 0)
+            if end > previous:
+                if start > previous:
+                    raise OmniPrefixCacheUnmatchError(f"delivery gap for req {req_id}: {previous} -> {start}")
+                advances.append((delivered, outputs._consumer, end))
+        return advances
+
+    @_locked
+    def commit_output(
+        self,
+        outputs: StageCacheOutputs,
+        handoff: Callable[[frozenset[str]], None],
+        *,
+        delivery: StageCacheOutputs | None = None,
+    ) -> frozenset[str]:
+        """Atomically filter retired owners, hand off prepared output, and ACK.
+
+        The caller builds tensors/payloads before entering. ``handoff`` may
+        only select already-built payloads and publish local references; it
+        must not build tensors, copy, wait, or call another manager entry.
+        Request IDs and scheduler accounting stay intact when their outgoing
+        payload is filtered. This is a local commit, not a remote receipt.
+
+        Finished requests remain eligible through their captured progress;
+        replacement marks that progress retired. A reused live admission
+        cannot receive a prior admission's output, even after normal finish.
+        Sparse metadata-only output can omit ``delivery`` and advance no
+        token cursor while using the same owner check.
+        """
+        live = frozenset(
+            req_id
+            for req_id, progress in outputs._progress.items()
+            if not progress.retired and self._request_progress.get(req_id, progress) is progress
+        )
+        advances = []
+        if delivery is not None:
+            for req_id, progress in delivery._progress.items():
+                if outputs._progress.get(req_id) is not progress:
+                    raise ValueError("delivery view does not belong to this output snapshot")
+            advances = self._delivery_advances(delivery, live.intersection(delivery.token_ranges))
+        handoff(live)
+        if delivery is not None:
+            for delivered, consumer, end in advances:
+                delivered[consumer] = end
+        return live
 
     @_locked
     def discard_step(self, step_id: int) -> None:
@@ -760,6 +960,7 @@ class OmniPrefixCacheManager:
     def _clear_hit_infos(self) -> None:
         """Drop the live hit / prefetch tables. Caller holds ``_state_lock``."""
         self._hit_spans.clear()
+        self._hit_starts.clear()
         self._hit_prefetch.clear()
 
     def _invalidate_overwritten_prefetches(self) -> None:
@@ -792,7 +993,7 @@ class OmniPrefixCacheManager:
             if all(key in futs for key in keys):
                 continue
             n_new = int(self._cur_num_scheduled.get(req_id, 0))
-            slots = self._get_hit_slots(hit_upto, hit_blocks)
+            slots = self._get_hit_slots(hit_upto, hit_blocks, self._hit_starts[req_id])
             for key in keys:
                 if key in futs:
                     continue
@@ -877,6 +1078,8 @@ class OmniPrefixCacheManager:
         slots_cpu: torch.Tensor | None,
         mm_keys: set[str],
         write_ctx: StepWriteContext,
+        token_ranges: dict[ReqId, tuple[int, int]],
+        token_mm_keys: frozenset[TensorName],
     ) -> None:
         """Takes ``_state_lock``. Register this step's writes and store the
         consume-once snapshot. Copies live hits into the snapshot, then
@@ -896,7 +1099,18 @@ class OmniPrefixCacheManager:
             self._invalidate_overwritten_prefetches()
             self._prefetch_hit_spans()
         self._next_step_id = step_id + 1
+        progress = {}
+        for req_id, (start, end) in token_ranges.items():
+            state = self._request_progress.setdefault(req_id, PrefixCacheRequestProgress())
+            state.computed_upto = end
+            if end > start and (step_outputs.immediate or step_outputs.deferred):
+                state.saved_upto = max(state.saved_upto, end)
+            progress[req_id] = state
         self._step_ctxs[step_id] = _StepContext(
+            token_ranges=dict(token_ranges),
+            progress=progress,
+            hit_starts=dict(self._hit_starts),
+            token_mm_keys=token_mm_keys,
             spans={r: (query_start[r], query_start[r] + num_sched[r]) for r in req_order},
             num_tokens_unpadded=num_tokens_unpadded,
             hits=dict(self._hit_spans),
@@ -1082,13 +1296,13 @@ class OmniPrefixCacheManager:
 
     # -------------------------------------------------- slot ref / fetch
 
-    def _get_hit_slots(self, hit_upto: int, hit_blocks: list[int]) -> torch.Tensor:
+    def _get_hit_slots(self, hit_upto: int, hit_blocks: list[int], hit_start: int = 0) -> torch.Tensor:
         """Prefix-hit block ids → KV slot ids. Alignment is checked at
         ``new_step_starts``. Does not require ``_state_lock``.
         """
         bs = self._config.block_size
         block_ids = torch.tensor(hit_blocks, dtype=torch.int64)
-        return (block_ids.unsqueeze(1) * bs + torch.arange(bs)).reshape(-1)[:hit_upto]
+        return (block_ids.unsqueeze(1) * bs + torch.arange(bs)).reshape(-1)[hit_start:hit_upto]
 
     def _slot_ref(self, slots: torch.Tensor, key: str, req_id: str) -> _SlotRef:
         """Caller holds ``_state_lock``. Pin a ``_SlotRef`` for `slots` (no data movement).
@@ -1194,7 +1408,7 @@ class OmniPrefixCacheManager:
         out: torch.Tensor | None = None
         if src.already_staged:
             out = self._pool.rows(src.key, src.slots)
-        in_transit = None
+        in_transit: torch.Tensor | None = None
         for task, mask in src.staged_list:
             try:
                 rows = self._controller.fetch_host(task, src.slots[mask], src.key)

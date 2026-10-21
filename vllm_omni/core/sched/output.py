@@ -7,7 +7,9 @@ from typing import Any
 from vllm.v1.core.sched.output import CachedRequestData, NewRequestData, SchedulerOutput
 from vllm.v1.request import Request
 
+from vllm_omni.core.prefix_cache.adapter import PrefixCacheRequestEvent, PrefixCacheRequestOwner
 from vllm_omni.engine import AdditionalInformationPayload
+from vllm_omni.inputs.processed_media import ProcessedMediaProvenance
 
 
 @dataclass
@@ -32,6 +34,7 @@ class OmniNewRequestData(NewRequestData):
     additional_information: AdditionalInformationPayload | dict[str, object] | None = None
     model_intermediate_buffer: dict[str, object] | None = None
     resumable: bool = False
+    processed_media_provenance: ProcessedMediaProvenance | None = None
 
     @classmethod
     def from_base(
@@ -47,6 +50,7 @@ class OmniNewRequestData(NewRequestData):
             additional_information=getattr(request, "additional_information", None),
             model_intermediate_buffer=getattr(request, "model_intermediate_buffer", None),
             resumable=bool(getattr(request, "resumable", False)),
+            processed_media_provenance=getattr(request, "processed_media_provenance", None),
         )
 
     @classmethod
@@ -82,6 +86,7 @@ class OmniNewRequestData(NewRequestData):
             additional_information=getattr(request, "additional_information", None),
             model_intermediate_buffer=getattr(request, "model_intermediate_buffer", None),
             resumable=bool(getattr(request, "resumable", False)),
+            processed_media_provenance=getattr(request, "processed_media_provenance", None),
         )
 
 
@@ -102,17 +107,17 @@ class OmniChunkRecvHandle:
     """Minimal identifier carried from scheduler to runner for input-receive
     registration.
 
-    The runner's ``register_chunk_recv`` only consumes ``request_id`` and
-    ``external_req_id`` from each pending request, so we ship just those
-    two fields instead of the full Request object.  Concrete typing
-    keeps msgspec serialization deterministic across IPC (default,
-    PD-disagg, multi-node executor variants) and avoids the
-    ``list[Any]`` fallback path.
+    Carries routing fields and the receiving scheduler's immutable content
+    owner, not the full Request. Concrete typing keeps msgspec serialization
+    deterministic across IPC (default, PD-disagg, multi-node executor variants)
+    and avoids the ``list[Any]`` fallback path. The owner is echoed in receive
+    notifications; it is not supplied by the remote producer's payload.
     """
 
     request_id: str
     external_req_id: str | None = None
     payload_sender_info: dict[str, object] | None = None
+    input_owner: PrefixCacheRequestOwner | None = None
 
 
 @dataclass
@@ -134,8 +139,13 @@ class OmniRequestPrewarm:
 class OmniSchedulerOutput(SchedulerOutput):
     """Scheduler output with omni-specific transfer metadata."""
 
+    discarded_req_ids: set[str] = field(default_factory=set)
     finished_requests_needing_kv_transfer: dict[str, dict] = field(default_factory=dict)
     pending_input_registrations: list[OmniChunkRecvHandle] = field(default_factory=list)
     data_plane_terminal_req_ids: set[str] = field(default_factory=set)
     input_terminal_req_ids: set[str] = field(default_factory=set)
+    prefix_cache_replacements: tuple[PrefixCacheRequestEvent, ...] = ()
+    prefix_cache_owners: dict[str, PrefixCacheRequestOwner] = field(default_factory=dict)
+    prefix_cache_terminal_owners: dict[str, PrefixCacheRequestOwner] = field(default_factory=dict)
+    prefix_cache_step_sequence: int | None = None
     pending_request_prewarms: list[OmniRequestPrewarm] = field(default_factory=list)

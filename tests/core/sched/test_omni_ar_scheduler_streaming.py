@@ -44,6 +44,11 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 def _make_scheduler(*, stage_id: int = 0, session_mode: str = "turn") -> OmniARScheduler:
     sched = OmniARScheduler.__new__(OmniARScheduler)
+    sched._prefix_cache_next_admission = 0
+    sched._prefix_cache_step_sequence = 0
+    sched._prefix_cache_pending_replacements = []
+    sched._prefix_cache_pending_terminal_owners = {}
+    sched._discarded_req_ids = set()
     sched._new_prompt_len_snapshot = {}
     sched._hold_payloadless_outputs = False
     sched.vllm_config = SimpleNamespace(
@@ -56,7 +61,7 @@ def _make_scheduler(*, stage_id: int = 0, session_mode: str = "turn") -> OmniARS
     # target truncates session.block_hashes with it.
     sched.hash_block_size = 16
     sched.chunk_transfer_adapter = None
-    sched.kv_holding_waiting = set()
+    sched.kv_holding_waiting = create_request_queue(SchedulingPolicy.FCFS)
     sched.deferred_waiting = set()
     sched._free_request_blocks = MagicMock()
     sched.encoder_cache_manager = MagicMock()
@@ -169,7 +174,7 @@ def _run_resumable_segment_stop(
     sched.perf_metrics = None
     sched.structured_output_manager.accept_tokens.return_value = True
 
-    def stop_request(request: Request, _token_ids: list[int]):
+    def stop_request(request: Request, _token_ids: list[int], *, is_stale=False):
         request.status = RequestStatus.FINISHED_STOPPED
         return [42], True
 
@@ -419,7 +424,7 @@ def test_stale_async_frame_is_dropped_before_output_processing() -> None:
     sched.perf_metrics = None
     sched.structured_output_manager.accept_tokens.return_value = True
 
-    def discard_stale_output(request: Request, token_ids: list[int]) -> tuple[list[int], bool]:
+    def discard_stale_output(request: Request, token_ids: list[int], *, is_stale=False) -> tuple[list[int], bool]:
         request.async_tokens_to_discard = 0
         return token_ids, False
 
@@ -831,6 +836,60 @@ def test_explicit_streaming_payload_replaces_placeholder_prompt() -> None:
     sched.encoder_cache_manager.free.assert_called_once_with(session)
 
 
+@pytest.mark.parametrize("replacement", [[21, 22, 23, 24], list(range(20, 28)), list(range(20, 32))])
+def test_replacement_hashes_match_a_fresh_request(replacement) -> None:
+    from vllm.utils.hashing import sha256
+    from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
+
+    init_none_hash(sha256)
+    hasher = get_request_block_hasher(4, sha256)
+    session = Request(
+        request_id="reused",
+        prompt_token_ids=list(range(8)),
+        sampling_params=SamplingParams(max_tokens=8),
+        pooling_params=None,
+        block_hasher=hasher,
+        cache_salt="caller-isolation",
+    )
+    session.append_output_token_ids([8, 9, 10, 11])
+    session.num_in_flight_tokens = 3
+    session.num_computed_tokens = 12
+    session._prompt_embeds_per_block_hashes[(0, 4)] = b"retired-embedding"
+    old_tokens = session.all_token_ids
+    old_outputs = session.output_token_ids
+    old_hashes = session.block_hashes
+    hash_snapshot = list(old_hashes)
+    update = _make_update(list(replacement))
+    update.sampling_params.skip_reading_prefix_cache = True
+    update.additional_information = {"meta": {"replace_streaming_prompt": True}}
+
+    _make_scheduler(stage_id=1)._update_request_as_session(session, update)
+
+    fresh = Request(
+        request_id="fresh",
+        prompt_token_ids=list(replacement),
+        sampling_params=update.sampling_params,
+        pooling_params=None,
+        block_hasher=hasher,
+        cache_salt="caller-isolation",
+    )
+    assert session.block_hashes == fresh.block_hashes
+    assert session.prompt_token_ids == replacement
+    assert list(session.all_token_ids) == replacement
+    assert session.num_prompt_tokens == len(replacement)
+    assert session._prompt_embeds_per_block_hashes == {}
+    assert session.skip_reading_prefix_cache is True
+    assert session.num_computed_tokens == 0
+    assert session.num_in_flight_tokens == session.num_stale_output_tokens == 3
+    assert session._omni_segment_generation == 1
+    # Dispatched steps may still own the old token/hash snapshots.
+    assert list(old_tokens) == list(range(12))
+    assert list(old_outputs) == [8, 9, 10, 11]
+    assert old_hashes == hash_snapshot
+    update.prompt_token_ids.append(99)
+    assert session.prompt_token_ids == replacement
+
+
 def test_explicit_model_intermediate_prompt_replacement_releases_cache_and_watermark() -> None:
     sched = _make_scheduler(stage_id=1)
     session = _make_request()
@@ -870,6 +929,26 @@ def test_explicit_model_intermediate_prompt_replacement_releases_cache_and_water
     assert sched.chunk_transfer_adapter.requests_num_chunks_sent == {}
     sched._free_request_blocks.assert_called_once_with(session)
     sched.encoder_cache_manager.free.assert_called_once_with(session)
+
+
+def test_invalid_replacement_leaves_active_input_and_inflight_state_untouched() -> None:
+    scheduler = _make_scheduler(stage_id=1)
+    session = _make_request()
+    session.append_output_token_ids([7])
+    session.num_computed_tokens = 4
+    session.num_in_flight_tokens = 2
+    session.num_output_placeholders = 1
+    original_state = dict(session.__dict__)
+    update = _make_update([20, -1])
+    update.additional_information = {"meta": {"replace_streaming_prompt": True}}
+
+    with pytest.raises(ValueError, match="non-negative integers"):
+        scheduler._update_request_as_session(session, update)
+
+    assert session.__dict__ == original_state
+    assert scheduler._new_prompt_len_snapshot == {}
+    scheduler._free_request_blocks.assert_not_called()
+    scheduler.encoder_cache_manager.free.assert_not_called()
 
 
 def test_talker_capacity_exact_fit_extends_from_declared_length_without_ids_prompt() -> None:
@@ -1261,6 +1340,7 @@ def _make_live_session_scheduler(*, max_model_len: int) -> OmniARScheduler:
     ``_free_request`` and the finished-request bookkeeping that wakes an idle
     engine all run. Only block freeing and the encoder cache are mocked."""
     sched = _make_admission_scheduler(max_model_len=max_model_len)
+    sched.input_coordinator = None
     del sched._free_request  # the admission helper mocks it; run the real one
     sched._omits_kv_transfer_cache = {}
     sched.connector = None
