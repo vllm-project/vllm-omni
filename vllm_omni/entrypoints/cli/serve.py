@@ -679,7 +679,8 @@ class OmniServeCommand(CLISubcommand):
             help=(
                 "Compilation scope for the generic diffusion model runner. "
                 "'regional' compiles repeated blocks (default); 'full' compiles the whole transformer and is "
-                "incompatible with HSDP, sequence parallelism, CPU offload, and layerwise offload."
+                "incompatible with HSDP, sequence parallelism, CPU offload, layerwise offload, and "
+                "--diffusion-attention-schedule profiles."
             ),
         )
         omni_config_group.add_argument(
