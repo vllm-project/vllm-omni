@@ -1095,3 +1095,70 @@ class TestLockFileLifecycle:
         # The interleaving is rare by construction; losing rounds is allowed,
         # residue never. Print for visibility, do not assert on timing.
         print(f"\nsame-key reuse storm: 200 rounds, {lost_rounds} lost rounds")
+
+    def test_put_failure_keeps_lock_when_old_segment_survives(self, connector, monkeypatch):
+        """F1: a put failure must not drop the lock when a segment exists.
+
+        The raise alone does not prove the name is empty (the FileExistsError
+        recovery may have failed to unlink, or the write may have half-created
+        a segment); a surviving segment under this name is still receivable,
+        so its lock must survive the failed put.
+        """
+        key = self._fresh_key()
+        lock = self._lock_path(key)
+        seg = shm_pkg.SharedMemory(create=True, size=64, name=key)  # old-gen segment
+        try:
+
+            def _boom(*args, **kwargs):
+                raise OSError("simulated segment write failure")
+
+            monkeypatch.setattr(shm_conn_module, "shm_write_bytes", _boom)
+            ok, _, _ = connector.put("s0", "s1", key, {"x": 1})
+
+            assert ok is False
+            assert os.path.exists(lock)  # the lock survives with the segment
+        finally:
+            seg.close()
+            try:
+                seg.unlink()
+            except FileNotFoundError:
+                pass
+            try:
+                os.remove(lock)
+            except OSError:
+                pass
+
+    def test_get_does_not_drop_lock_recreated_after_unlock(self, connector, monkeypatch):
+        """F2: removal is inode-checked and happens while we still hold the lock.
+
+        The patched read unlinks the segment (as the real one does), then
+        re-creates the lock path under a NEW inode — a later transfer that
+        took the path between our operations. Our removal must refuse to drop
+        the new lock.
+        """
+
+        key = self._fresh_key()
+        lock = self._lock_path(key)
+        try:
+            _, _, meta = connector.put("s0", "s1", key, {"data": "z" * 128})
+            real_read = shm_conn_module.shm_read_bytes
+
+            def _read_and_replace_path(handle):
+                data = real_read(handle)
+                # A new writer re-created the lock path under a fresh inode
+                # while we still hold the old one.
+                os.remove(lock)
+                open(lock, "wb").close()
+                return data
+
+            monkeypatch.setattr(shm_conn_module, "shm_read_bytes", _read_and_replace_path)
+
+            result = connector.get("s0", "s1", key, metadata=meta)
+
+            assert result is not None and result[0] == {"data": "z" * 128}
+            assert os.path.exists(lock)  # the new-generation lock survives
+        finally:
+            try:
+                os.remove(lock)
+            except OSError:
+                pass

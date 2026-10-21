@@ -93,6 +93,22 @@ def _reclaim_orphan_lock_file(key: str, grace: float | None = None) -> bool:
     return False
 
 
+def _lock_is_ours(fd: int, lock_path: str) -> bool:
+    """True when *lock_path* still resolves to the very inode *fd* holds.
+
+    Guards lock-file removal against a brand-new lock created by a later
+    transfer at the same path after we dropped our lock: the inode (and
+    device) differ in that case and the new lock must survive, otherwise its
+    holder silently loses mutual exclusion.
+    """
+    try:
+        st_fd = os.fstat(fd)
+        st_path = os.stat(lock_path)
+    except OSError:
+        return False
+    return st_fd.st_ino == st_path.st_ino and st_fd.st_dev == st_path.st_dev
+
+
 def _sweep_stale_lock_files(grace: float | None = None) -> int:
     """Best-effort removal of orphan lock files whose segment is already gone.
 
@@ -389,15 +405,18 @@ class SharedMemoryConnector(OmniConnectorBase):
                 try:
                     meta = shm_write_bytes(payload, name=put_key)
                 except BaseException:
-                    # Trigger: shm_write_bytes raised — not only before the
-                    # segment existed.  The lock is dropped while still held,
-                    # best-effort; a segment the write already created is not
-                    # rolled back here.  Failures after a successful write do
-                    # not reach this branch.
-                    try:
-                        os.remove(lock_file)
-                    except OSError:
-                        pass
+                    # Trigger: shm_write_bytes raised — the raise alone does
+                    # not prove that no segment exists under this name.  When
+                    # one does (e.g. the recreation after a FileExistsError
+                    # unlink also failed, or the write's own half-created
+                    # segment), the lock guarding that name must survive so a
+                    # receiver can still take it; drop the lock only when the
+                    # name is provably empty.
+                    if not os.path.exists(f"/dev/shm/{put_key}"):
+                        try:
+                            os.remove(lock_file)
+                        except OSError:
+                            pass
                     raise
                 fcntl.flock(lockf, fcntl.LOCK_UN)
 
@@ -417,14 +436,35 @@ class SharedMemoryConnector(OmniConnectorBase):
             return False, 0, None
 
     def _get_data_with_lock(self, lock_file: str, shm_handle: dict[str, Any]) -> tuple[Any, int] | None:
-        consumed = False
-        locked = False
+        seg_name = shm_handle["name"]
         try:
             with open(lock_file, "rb+") as lockf:
                 fcntl.flock(lockf, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                locked = True
-                data_bytes = shm_read_bytes(shm_handle)
-                consumed = True
+                # A blocked flock raises before this inner block is entered,
+                # so a read that never acquired the lock structurally cannot
+                # touch it.  During a same-key replacement the writer holds
+                # the lock while the old segment is already unlinked and the
+                # new one not yet created; that gap must not steal the
+                # writer's lock.
+                read_ok = False
+                try:
+                    data_bytes = shm_read_bytes(shm_handle)
+                    read_ok = True
+                finally:
+                    # Attempted, not guaranteed (OSError swallowed): with the
+                    # byte read consumed — or the segment already gone — the
+                    # lock is dropped while we still hold it and only when the
+                    # path still resolves to our inode (a later transfer may
+                    # have re-created the path under a new inode).  A failed
+                    # read with the segment still alive keeps the lock — the
+                    # transfer can be retried.
+                    if _lock_is_ours(lockf.fileno(), lock_file) and (
+                        read_ok or not os.path.exists(f"/dev/shm/{seg_name}")
+                    ):
+                        try:
+                            os.remove(lock_file)
+                        except OSError:
+                            pass
                 fcntl.flock(lockf, fcntl.LOCK_UN)
             obj = self.deserialize_obj(data_bytes)
             result = (obj, int(shm_handle.get("size", 0)))
@@ -434,21 +474,6 @@ class SharedMemoryConnector(OmniConnectorBase):
         except Exception as e:
             logger.error(f"SharedMemoryConnector shm get failed for req : {e}")
             return None
-        finally:
-            # Attempted, not guaranteed (OSError swallowed): with the byte
-            # read consumed — or the lock acquired and the segment already
-            # gone — the lock is dropped; but only when this call actually
-            # acquired the lock.  During a same-key replacement the writer
-            # holds it while the old segment is already unlinked and the new
-            # one not yet created, and that gap must not steal the writer's
-            # lock.  A failed read with the segment still alive keeps the
-            # lock — the transfer can be retried.
-            seg_gone = not os.path.exists(f"/dev/shm/{shm_handle['name']}")
-            if consumed or (locked and seg_gone):
-                try:
-                    os.remove(lock_file)
-                except OSError:
-                    pass
 
     def _get_by_key(self, get_key: str) -> tuple[Any, int] | None:
         """Read a SHM segment addressed purely by *get_key*."""
