@@ -7,6 +7,8 @@ import pytest
 
 from vllm_omni.diffusion.attention.schedule import (
     parse_attention_sigma_schedule,
+    resolve_request_attention_schedule,
+    resolve_request_attention_sigma_schedule,
     select_attention_profile_by_sigma,
     validate_request_attention_schedules,
 )
@@ -69,13 +71,31 @@ def test_service_rejects_combined_defaults():
         )
 
 
-def test_request_admission_validates_sigma_and_inherited_step_conflicts():
+def test_request_schedule_of_one_kind_replaces_the_server_default_of_the_other():
+    profiles = {"p": {"default": "TORCH_SDPA"}}
+    step_default = AttentionScheduleConfig(profiles=profiles, default=[{"start": 0, "end": None, "profile": "p"}])
+    sigma_default = AttentionScheduleConfig(profiles=profiles, sigma=[{"low": 0.0, "high": 1.0, "profile": "p"}])
+    sends_sigma = SimpleNamespace(
+        attention_schedule=None, attention_sigma_schedule=[{"low": 0.0, "high": 0.3, "profile": "p"}]
+    )
+    sends_steps = SimpleNamespace(
+        attention_schedule=[{"start": 0, "end": 2, "profile": "p"}], attention_sigma_schedule=None
+    )
+
+    validate_request_attention_schedules(sends_sigma, step_default)
+    assert resolve_request_attention_schedule(sends_sigma, step_default) == ()
+    validate_request_attention_schedules(sends_steps, sigma_default)
+    assert resolve_request_attention_sigma_schedule(sends_steps, sigma_default) == ()
+
+
+def test_request_admission_rejects_both_kinds_and_unknown_profiles():
     service = AttentionScheduleConfig(
         profiles={"p": {"default": "TORCH_SDPA"}},
         default=[{"start": 0, "end": None, "profile": "p"}],
     )
     sampling = SimpleNamespace(
-        attention_schedule=None, attention_sigma_schedule=[{"low": 0.0, "high": 0.3, "profile": "p"}]
+        attention_schedule=[{"start": 0, "end": 2, "profile": "p"}],
+        attention_sigma_schedule=[{"low": 0.0, "high": 0.3, "profile": "p"}],
     )
     with pytest.raises(ValueError, match="cannot combine"):
         validate_request_attention_schedules(sampling, service)
