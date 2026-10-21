@@ -1,6 +1,6 @@
 ---
 name: ci-resource-pool-stats
-description: "Fetch Buildkite build data for vllm-omni and vllm-omni-npu-ci pipelines and compute per-resource-pool queue wait time and occupancy statistics for the previous day in **Beijing Time (CST, UTC+8)**. The **Per-Pool Detail** section is computed statically from the local vllm-omni git repo (after `git pull`) by parsing `.buildkite/test-*.yml` against `.buildkite/common/ci_mirror_hardwares.yml` — no Buildkite API calls for that section. **Default output is always an HTML file** unless the user explicitly asks for Markdown or JSON. When the user explicitly says '归档报告', save the generated report under vllm-omni-kanban/data/pool_stats_report, commit it, and push it. Use when the user says 'resource pool stats', 'pool occupancy', 'queue time', 'CI pool stats', 'wait time stats', or 'resource pool report'."
+description: "Fetch Buildkite build data for vllm-omni and vllm-omni-npu-ci pipelines and compute per-resource-pool queue wait time and occupancy statistics for the previous day in **Beijing Time (CST, UTC+8)**. The **Per-Pool Detail** section is computed statically from the local vllm-omni git repo (after `git pull`) by parsing `.buildkite/test-*.yml` against `.buildkite/common/ci_mirror_hardwares.yml` — no Buildkite API calls for that section. **Default output is always an HTML file** unless the user explicitly asks for Markdown or JSON. When the user explicitly says '归档报告', archive the generated report ONLY to omni-reviewbot kanban/data/vllm_omni/pool_stats_report/ via /home/wy/archive_to_omni_review.sh (sole target since 2026-10-21 — kanban pushes stopped). Use when the user says 'resource pool stats', 'pool occupancy', 'queue time', 'CI pool stats', 'wait time stats', or 'resource pool report'."
 ---
 
 # CI Resource Pool Statistics
@@ -225,13 +225,20 @@ The report supports **dark mode** via `prefers-color-scheme: dark`.
 
 Only activate this behavior when the user explicitly says **`归档报告`**:
 
-1. Generate the report in the requested format (HTML by default) using the required `pool-stats-YYYY-MM-DD.<ext>` filename.
-2. Locate the `vllm-omni-kanban` repository. Prefer `/home/wy/vllm-omni-kanban` when it exists; otherwise locate the repository within the current workspace.
-3. Write the report to `vllm-omni-kanban/data/pool_stats_report/`. Create the destination directory if it does not exist.
-4. Before committing, inspect the repository status. Do not overwrite unrelated existing reports or include unrelated changes in the commit.
-5. Stage only the generated report, commit it with a descriptive message such as `data: archive pool stats report for YYYY-MM-DD`, and push the current branch to its configured remote.
-6. Report the archived path, commit hash, branch, and push result to the user. If generation, commit, or push fails, report the failure accurately and do not claim that archival completed.
-7. **Mirror to omni-reviewbot (user-set 2026-10-21; bridge box).** After the kanban push succeeds, run `/home/wy/mirror_to_omni_review.sh data/pool_stats_report/pool-stats-YYYY-MM-DD.html` (the `--from` date) — it copies the archived report into [JiusiServe/omni-reviewbot](https://github.com/JiusiServe/omni-reviewbot) at `kanban/data/vllm_omni/pool_stats_report/`, commits as `yenuo26`, and pushes (kanban `origin/main` is the source of truth; the push auto-triggers the repo's `Build kanban site` workflow). Skip with a note when the script or the `/home/wy/omni-reviewbot` clone is absent (non-bridge environments); on non-zero exit report the failure honestly — the kanban archive itself is already complete.
+> **Target switch (user-set 2026-10-21): report archives go ONLY to
+> [JiusiServe/omni-reviewbot](https://github.com/JiusiServe/omni-reviewbot) —
+> STOP pushing to vllm-omni-kanban (no copy, no commit, no push there).**
+
+1. Generate the report in the requested format (HTML by default) using the required `pool-stats-YYYY-MM-DD.<ext>` filename (the `--from` date).
+2. On the bridge box run:
+
+   ```bash
+   /home/wy/archive_to_omni_review.sh \
+     ./pool-stats-YYYY-MM-DD.html data/pool_stats_report/pool-stats-YYYY-MM-DD.html
+   ```
+
+   The script copies the report into omni-reviewbot at `kanban/data/vllm_omni/pool_stats_report/`, commits as `yenuo26`, and pushes; the push auto-triggers the repo's `Build kanban site` workflow. It never touches the kanban repo.
+3. Report the archived path, commit hash, and push result to the user. If generation or the archive script fails (non-zero exit), report the failure accurately and do not claim that archival completed. In non-bridge environments (script or `/home/wy/omni-reviewbot` clone absent), say so and leave the report in the current directory — do **not** fall back to pushing to vllm-omni-kanban.
 
 The user's explicit `归档报告` request authorizes the report-specific commit and push. Do not ask for an additional confirmation unless the repository state, target branch, remote, or required operation differs materially from the instructions above.
 

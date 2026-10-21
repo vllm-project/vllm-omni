@@ -19,7 +19,7 @@ reviewers the bot mentioned.
 | **Audience** | Reviewers triaging their pending reviews between nightly runs |
 | **Refresh cadence** | On-demand, after any bot-triage comment or new PR |
 | **Source skill** | Sibling of [vllm-omni-test-report](../vllm-omni-test-report/SKILL.md) |
-| **Archive** | On explicit `归档报告` → `vllm-omni-kanban/data/pr_monitor/pr-monitor-report.html` (no date, overwrites same-name, pushes to repo). See [Report archival (`归档报告`)](#report-archival-归档报告). |
+| **Archive** | On explicit `归档报告` → omni-reviewbot `kanban/data/vllm_omni/pr_monitor/pr-monitor-report.html` (no date, overwrites same-name, pushes to repo; sole target since 2026-10-21). See [Report archival (`归档报告`)](#report-archival-归档报告). |
 
 ## What it renders
 
@@ -126,39 +126,37 @@ Override with `--out`.
 ## Report archival (`归档报告`)
 
 Only activate this behavior when the user explicitly says **`归档报告`**
-(or an explicit equivalent such as "归档", "archive to kanban", "提交并推送报告"):
+(or an explicit equivalent such as "归档", "archive", "提交并推送报告"):
 
-1. Generate the report in the requested format (HTML by default) as usual.
-2. Locate the `vllm-omni-kanban` repository. Default **`/home/wy/vllm-omni-kanban`**
-   (override via `--kanban-repo-root PATH` or `$KANBAN_REPO_ROOT`).
-3. Copy the report to `vllm-omni-kanban/data/pr_monitor/pr-monitor-report.html`
-   — **no date in the filename**, **overwrite** any existing file with the
-   same name. Create the destination directory if it does not exist.
-4. Inside the kanban repo: verify `gh` is installed and authenticated,
-   then run `git pull --rebase`, `git add` only the archived file,
-   confirm the staged diff is exactly the intended file, commit with a
-   descriptive message (`data: archive pr monitor report (UTC <ISO>)`),
-   and push the current branch to its configured remote (defaults:
-   `origin` on the branch returned by `git rev-parse --abbrev-ref HEAD`).
-5. Report the archived path, commit hash, branch, and push result. If any
-   step (generation, copy, commit, push) fails, surface the exact error
-   and do **not** claim archival completed.
+> **Target switch (user-set 2026-10-21): report archives go ONLY to
+> [JiusiServe/omni-reviewbot](https://github.com/JiusiServe/omni-reviewbot) —
+> STOP pushing to vllm-omni-kanban.** The script's `--archive` /
+> `--archive-dry-run` CLI flags (and `--kanban-repo-root`) target the kanban
+> repo and are therefore **retired** — do not use them.
+
+1. Generate the report (HTML by default, dated filename) as usual and sanity-check
+   the bucket/reviewer data before archiving.
+2. On the bridge box run:
+
+   ```bash
+   /home/wy/archive_to_omni_review.sh \
+     <pr-monitor-report-YYYY-MM-DD.html> data/pr_monitor/pr-monitor-report.html
+   ```
+
+   — **no date in the destination filename**, overwrite semantics. The script
+   copies the report into omni-reviewbot at `kanban/data/vllm_omni/pr_monitor/`,
+   commits as `yenuo26`, and pushes; the push auto-triggers the repo's
+   `Build kanban site` workflow. It never touches the kanban repo.
+3. Report the archived path, commit hash, and push result. If generation or
+   the archive script fails (non-zero exit), surface the exact error and do
+   **not** claim archival completed. In non-bridge environments (script or
+   `/home/wy/omni-reviewbot` clone absent), say so and leave the report on
+   disk — do **not** fall back to pushing to vllm-omni-kanban.
 
 The user's explicit `归档报告` request authorizes this report-specific
-commit and push; no separate approval step is needed. The `--archive`
-flag drives the same workflow from the CLI:
-
-```bash
-# Single-shot: generate, copy (overwrite), commit, push
-python scripts/pr_monitor_report.py --archive
-python scripts/pr_monitor_report.py --archive --date 2026-08-26
-python scripts/pr_monitor_report.py --archive --kanban-repo-root /custom/path/to/vllm-omni-kanban
-```
-
-Use `--archive-dry-run` to print the planned archive + commit + push
-without touching git. The default filename is always
-`pr-monitor-report.html` — there is no dated archive variant because the
-file always reflects the most recent stale-PR snapshot.
+commit and push; no separate approval step is needed. The archived filename
+is always `pr-monitor-report.html` — there is no dated archive variant
+because the file always reflects the most recent stale-PR snapshot.
 
 Without the exact `归档报告` intent (and without `--archive`), preserve
 the normal behavior: generate the dated report in the skill directory and

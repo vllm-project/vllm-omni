@@ -1,6 +1,6 @@
 ---
 name: buildkite-ci-daily-analysis
-description: "Fetch yesterday's Buildkite builds (in **Beijing Time, CST, UTC+8**) for vllm-omni, vllm-omni-npu-ci, and vllm-omni-amd-ci pipelines (the default date window is the previous full CST calendar day, 00:00 — 23:59 CST) and analyze per-job and per-build success/failure and duration (with default infra-job filtering for `:pipeline: init`, `:docker: Build image`, `:buildkit: Build and Push`, `:github: Resolve skip-ci`, `Upload … Pipeline`, `Collect results`), then emit an HTML report with interactive **Pipeline**, **Branch**, **CI**, **State**, and **Job Name** filter dropdowns plus a **CI Aggregate** panel broken down by `ready` / `merge` / `nightly` / `weekly` buckets × pipeline (each card has both job-level and build-level stats). **Default output is always an HTML file** unless the user explicitly asks for Markdown or JSON. When the user explicitly says '归档报告' (or 'archive' / '提交报告' / 'push report'), copy the report to `vllm-omni-kanban/data/ci_monitor/`, commit it, and push to `origin`. Use when the user says 'daily CI analysis', 'today's CI jobs', 'nightly status', 'CI health check', '今日 CI 分析', '今日 job 分析', '今日 build 分析', 'Buildkite 当日分析', or '归档报告'."
+description: "Fetch yesterday's Buildkite builds (in **Beijing Time, CST, UTC+8**) for vllm-omni, vllm-omni-npu-ci, and vllm-omni-amd-ci pipelines (the default date window is the previous full CST calendar day, 00:00 — 23:59 CST) and analyze per-job and per-build success/failure and duration (with default infra-job filtering for `:pipeline: init`, `:docker: Build image`, `:buildkit: Build and Push`, `:github: Resolve skip-ci`, `Upload … Pipeline`, `Collect results`), then emit an HTML report with interactive **Pipeline**, **Branch**, **CI**, **State**, and **Job Name** filter dropdowns plus a **CI Aggregate** panel broken down by `ready` / `merge` / `nightly` / `weekly` buckets × pipeline (each card has both job-level and build-level stats). **Default output is always an HTML file** unless the user explicitly asks for Markdown or JSON. When the user explicitly says '归档报告' (or 'archive' / '提交报告' / 'push report'), archive the report ONLY to omni-reviewbot kanban/data/vllm_omni/ci_monitor/ via /home/wy/archive_to_omni_review.sh (sole target since 2026-10-21 — kanban pushes stopped). Use when the user says 'daily CI analysis', 'today's CI jobs', 'nightly status', 'CI health check', '今日 CI 分析', '今日 job 分析', '今日 build 分析', 'Buildkite 当日分析', or '归档报告'."
 ---
 
 # Buildkite Daily CI Analysis
@@ -288,36 +288,26 @@ and in-flight jobs from dragging the success rate down.
 Only activate this behavior when the user explicitly says **`归档报告`**
 (or one of the [intent keywords above](#intent-keywords-archival)):
 
+> **Target switch (user-set 2026-10-21): report archives go ONLY to
+> [JiusiServe/omni-reviewbot](https://github.com/JiusiServe/omni-reviewbot) —
+> STOP pushing to vllm-omni-kanban (no copy, no commit, no push there).**
+
 1. Generate the report in the requested format (HTML by default) using the
    required `ci-daily-YYYY-MM-DD.html` filename.
-2. Locate the `vllm-omni-kanban` repository. Prefer `/home/wy/vllm-omni-kanban`
-   when it exists; otherwise locate the repository within the current
-   workspace.
-3. Write the report to `vllm-omni-kanban/data/ci_monitor/`. Create the
-   destination directory if it does not exist.
-4. Before committing, inspect the repository status. Do not overwrite
-   unrelated existing reports or include unrelated changes in the commit.
-5. **Fetch / rebase first** if the local branch has diverged from
-   `origin/main` (other agents or dashboards may have pushed daily syncs
-   since you last pulled). Replay your commit on top of the remote HEAD
-   before pushing.
-6. Stage only the generated report, commit it with a descriptive message
-   such as `data: archive job monitor report for YYYY-MM-DD`, and push the
-   current branch to its configured remote.
-7. Report the archived path, commit hash, branch, and push result to the
-   user. If generation, commit, fetch, rebase, or push fails, report the
-   failure accurately and do not claim that archival completed.
-8. **Mirror to omni-reviewbot (user-set 2026-10-21; bridge box).** After the
-   kanban push succeeds, run
-   `/home/wy/mirror_to_omni_review.sh data/ci_monitor/ci-daily-YYYY-MM-DD.html`
-   (the report's date) — it copies the archived report into
-   [JiusiServe/omni-reviewbot](https://github.com/JiusiServe/omni-reviewbot)
-   at `kanban/data/vllm_omni/ci_monitor/`, commits as `yenuo26`, and pushes
-   (kanban `origin/main` is the source of truth; the push auto-triggers the
-   repo's `Build kanban site` workflow). Skip with a note when the script or
-   the `/home/wy/omni-reviewbot` clone is absent (non-bridge environments);
-   on non-zero exit report the failure honestly — the kanban archive itself
-   is already complete.
+2. On the bridge box run:
+
+   ```bash
+   /home/wy/archive_to_omni_review.sh \
+     ./ci-daily-YYYY-MM-DD.html data/ci_monitor/ci-daily-YYYY-MM-DD.html
+   ```
+
+   The script copies the report into omni-reviewbot at `kanban/data/vllm_omni/ci_monitor/`, commits as `yenuo26`, and pushes (its push loop already handles fetch/rebase on non-fast-forward races with the Actions bot); the push auto-triggers the repo's `Build kanban site` workflow. It never touches the kanban repo.
+3. Report the archived path, commit hash, and push result to the
+   user. If generation or the archive script fails (non-zero exit), report
+   the failure accurately and do not claim that archival completed. In
+   non-bridge environments (script or `/home/wy/omni-reviewbot` clone
+   absent), say so and leave the report in the current directory — do
+   **not** fall back to pushing to vllm-omni-kanban.
 
 The user's explicit `归档报告` request authorizes the report-specific
 commit and push. Do not ask for an additional confirmation unless the
