@@ -53,6 +53,7 @@ from vllm_omni.diffusion.forward_context import (
 from vllm_omni.diffusion.layers.fused_qk_norm_rope import (
     _fused_cuda_supported,
     fused_qk_norm_rope,
+    fused_qk_norm_rope_min_tokens,
     pack_qk_norm_rope_table,
 )
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding, apply_rope_to_qk
@@ -350,8 +351,10 @@ class ZImageAttention(nn.Module):
         # eager mode it is bit-identical to the chain below. Compiled graphs
         # use the same custom op; their reference is Inductor's RMSNorm, which
         # reduces in a different order.
-        if qk_norm_rope_table is not None and _fused_cuda_supported(
-            query, key, self.head_dim, qk_norm_rope_table.shape[-1], interleaved=True
+        if (
+            qk_norm_rope_table is not None
+            and self.norm_q.weight.dtype == self.norm_k.weight.dtype == query.dtype
+            and _fused_cuda_supported(query, key, self.head_dim, qk_norm_rope_table.shape[-1], interleaved=True)
         ):
             batch_size, seq_len, num_heads, head_dim = query.shape
             num_kv_heads = key.shape[2]
@@ -631,8 +634,11 @@ def _packed_qk_norm_rope_table(cos: torch.Tensor, sin: torch.Tensor, dtype: torc
     """Repeat cos[0]/sin[0] for all batches, matching RotaryEmbedding.
 
     Sequence-parallel inputs already contain this rank's shard. ``None``
-    outside the CUDA-matching contract (BF16, D=128).
+    below the token threshold or outside the CUDA-matching contract (BF16,
+    D=128). The default threshold of zero preserves fusion for all sizes.
     """
+    if cos.shape[0] * cos.shape[1] < fused_qk_norm_rope_min_tokens(0):
+        return None
     return pack_qk_norm_rope_table(cos[0], sin[0], cos.shape[0], dtype=dtype, cuda_rms_norm=True)
 
 

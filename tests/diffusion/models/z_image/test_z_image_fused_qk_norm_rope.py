@@ -47,6 +47,27 @@ def test_packed_table_skipped_on_cpu():
     assert _packed_qk_norm_rope_table(cos, sin, torch.bfloat16) is None
 
 
+@pytest.mark.parametrize("min_tokens", [None, "0", "59", "60", "61"])
+def test_packed_table_respects_min_tokens(monkeypatch, mocker, min_tokens):
+    from vllm_omni.diffusion.models.z_image import z_image_transformer as z_image
+
+    if min_tokens is None:
+        monkeypatch.delenv("VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS", min_tokens)
+    pack = mocker.patch.object(z_image, "pack_qk_norm_rope_table")
+    cos, sin = torch.randn(3, 20, _HEAD_DIM // 2), torch.randn(3, 20, _HEAD_DIM // 2)
+
+    table = z_image._packed_qk_norm_rope_table(cos, sin, torch.bfloat16)
+
+    if min_tokens == "61":
+        assert table is None
+        pack.assert_not_called()
+    else:
+        assert table is pack.return_value
+        pack.assert_called_once()
+
+
 @pytest.mark.skipif(not current_omni_platform.is_cuda() or not torch.cuda.is_available(), reason="NVIDIA CUDA required")
 @pytest.mark.skipif(not HAS_TRITON, reason="Triton required")
 def test_packed_table_uses_row_zero_like_rotary_embedding():
@@ -87,14 +108,21 @@ def test_packed_table_is_built_under_sequence_parallelism():
 
 @pytest.mark.skipif(not current_omni_platform.is_cuda() or not torch.cuda.is_available(), reason="NVIDIA CUDA required")
 @pytest.mark.skipif(not HAS_TRITON, reason="Triton required")
-def test_z_image_attention_fused_matches_eager(_dist_env, mocker):
-    """The eager fused path is bit-identical to norm_q/norm_k + RoPE."""
+@pytest.mark.parametrize(
+    ("fp32_norms", "min_tokens"),
+    [((), 0), (("q",), 0), (("k",), 0), (("q", "k"), 0), ((), 640), ((), 641)],
+)
+def test_z_image_attention_fused_matches_eager(_dist_env, mocker, monkeypatch, fp32_norms, min_tokens):
+    """Fusion and its weight/threshold fallbacks preserve the eager output."""
     from vllm_omni.diffusion.models.z_image import z_image_transformer as z_image
 
+    monkeypatch.setenv("VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS", str(min_tokens))
     torch.manual_seed(3)
     with torch.device("cuda"):
         attn = z_image.ZImageAttention(dim=_DIM, num_heads=_HEADS, num_kv_heads=_HEADS, eps=1e-6)
     attn = attn.to(torch.bfloat16).eval()
+    for name in fp32_norms:
+        getattr(attn, f"norm_{name}").float()
     with torch.no_grad():
         for p in attn.parameters():
             p.copy_((0.02 * torch.randn(p.shape, device="cuda")).to(p.dtype) if p.dim() > 1 else p)
@@ -112,4 +140,4 @@ def test_z_image_attention_fused_matches_eager(_dist_env, mocker):
         fused_op = mocker.spy(z_image, "fused_qk_norm_rope")
         fused = attn(hidden, mask, cos, sin, qk_norm_rope_table=table)
         assert torch.equal(fused, eager)
-        assert fused_op.call_count == 1
+        assert fused_op.call_count == int(not fp32_norms and min_tokens <= batch * seq)
