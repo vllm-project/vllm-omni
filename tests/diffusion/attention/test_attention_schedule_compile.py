@@ -16,7 +16,7 @@ the unpacked inputs used here. ``forward_cuda`` and the kernel are not exercised
 Compilation on the target backend and Inductor is not covered here.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from types import SimpleNamespace
 from typing import Any
 
@@ -25,9 +25,10 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from torch._dynamo.utils import counters as dynamo_counters
+from torch._inductor.compile_fx import compile_fx
 
 import vllm_omni.diffusion.attention.layer as layer_mod
-from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
+from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata, VideoTokenLayout, VideoTokenSpan
 from vllm_omni.diffusion.attention.backends.trtllm_attn import TrtllmAttentionBackend, TrtllmAttentionImpl
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.attention.parallel.base import NoParallelAttention
@@ -43,7 +44,6 @@ from vllm_omni.diffusion.data import (
 )
 from vllm_omni.diffusion.forward_context import (
     DenoiseProgressMixin,
-    begin_scheduled_denoise,
     bind_attention_schedule,
     set_forward_context,
 )
@@ -250,7 +250,7 @@ class _ToyPipeline(DenoiseProgressMixin):
             bind_attention_schedule(schedule),
         ):
             latents = torch.randn(1, _SEQ, _HIDDEN, generator=torch.Generator().manual_seed(_LATENT_SEED))
-            total = begin_scheduled_denoise(len(timesteps))
+            total = len(timesteps)
             for step_idx, timestep in enumerate(timesteps):
                 self.record_denoise_step(step_idx, timestep, total_steps=total)
                 trace_start = len(_TRACE)
@@ -472,8 +472,6 @@ class _InductorCounting(_CountingBackend):
     """``_CountingBackend`` that compiles each graph with Inductor."""
 
     def __call__(self, gm, example_inputs):
-        from torch._inductor.compile_fx import compile_fx
-
         index = len(self.graphs)
         self.graphs.append({_call_name(node) for node in gm.graph.nodes if node.op.startswith("call_")})
         self.executions.append(0)
@@ -570,8 +568,6 @@ def test_scheduled_op_returns_a_fresh_contiguous_tensor_and_rejects_a_wrong_shap
 
 
 def test_op_metadata_rule_covers_every_attention_metadata_field():
-    from dataclasses import fields
-
     carried_or_checked = {"attn_mask", "extra", "joint_strategy", "video_layout"}
     assert {f.name for f in fields(AttentionMetadata)} - carried_or_checked == set(
         layer_mod._SCHEDULED_OP_NONE_FIELDS
@@ -579,8 +575,6 @@ def test_op_metadata_rule_covers_every_attention_metadata_field():
 
 
 def test_op_metadata_round_trips_layouts_and_scalar_extras():
-    from vllm_omni.diffusion.attention.backends.abstract import VideoTokenLayout
-
     mask = torch.ones(1, 4, dtype=torch.bool)
     metadata = AttentionMetadata(
         attn_mask=mask,
@@ -614,8 +608,6 @@ def test_op_metadata_it_cannot_carry_returns_none(metadata):
 
 
 def test_op_metadata_with_video_spans_keeps_the_boundary():
-    from vllm_omni.diffusion.attention.backends.abstract import VideoTokenLayout, VideoTokenSpan
-
     span = VideoTokenSpan(start=0, latent_grid=(1, 2, 2), role="target")
     metadata = AttentionMetadata(video_layout=VideoTokenLayout(used_len=4, video_spans=(span,)))
     assert layer_mod._encode_scheduled_op_metadata(metadata) is None

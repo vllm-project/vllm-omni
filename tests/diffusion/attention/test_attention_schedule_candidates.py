@@ -12,10 +12,10 @@ resolved from the supplied AttentionConfig, mirroring test_attention_config.py.
 from types import SimpleNamespace
 
 import pytest
+import torch.nn as nn
 
 import vllm_omni.diffusion.attention.layer as layer_mod
 from vllm_omni.diffusion.attention.backends.abstract import AttentionImpl, AttentionMetadata
-from vllm_omni.diffusion.attention.backends.flash_attn import FlashAttentionBackend
 from vllm_omni.diffusion.attention.layer import Attention, _PreparedCandidate
 from vllm_omni.diffusion.attention.parallel.base import NoParallelAttention
 from vllm_omni.diffusion.config import set_current_diffusion_config
@@ -27,7 +27,6 @@ from vllm_omni.diffusion.data import (
     OmniDiffusionConfig,
     SkipSoftmaxSpec,
 )
-from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelInput
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
@@ -63,10 +62,8 @@ def _make_metadata_candidate(backend_cls: type, spec: AttentionSpec | None = Non
     return _PreparedCandidate(
         backend_cls=backend_cls,
         spec=spec,
-        impl_cls=_MetadataOnlyImpl,
         impl=impl,
         backend_explicit=spec is not None,
-        backend_pref=spec.backend if spec is not None else None,
     )
 
 
@@ -190,64 +187,13 @@ def test_allgather_trtllm_candidate_is_rejected(attention_env):
         attention_env.build(config)
 
 
-def _pipeline(layer, *, sp_plan=None, name="attn1"):
-    """A minimal loaded-pipeline stand-in exposing named_modules() and an optional _sp_plan."""
-    import torch.nn as nn
-
+def _pipeline(layer, *, name="attn1"):
+    """A minimal loaded-pipeline stand-in exposing named_modules()."""
     transformer = nn.Module()
     setattr(transformer, name, layer)
-    if sp_plan is not None:
-        transformer._sp_plan = sp_plan
     root = nn.Module()
     root.transformer = transformer
     return root
-
-
-def _flat_auto_pad_plan():
-    """auto_pad on the plan entry itself, one level below the plan root."""
-    return {"hidden_states": SequenceParallelInput(split_dim=1, expected_dims=3, auto_pad=True)}
-
-
-def test_startup_validation_rejects_candidate_without_paged_support(attention_env):
-    attention_env.monkeypatch.setattr(FlashAttentionBackend, "get_impl_cls", staticmethod(lambda: _FakeImpl))
-    schedule = AttentionScheduleConfig(
-        profiles={"nopaged": AttentionConfig(default=AttentionSpec(backend="BLOCK_SPARSE"))},
-        default=[{"start": 0, "end": None, "profile": "nopaged"}],
-    )
-    config = _make_config(schedule=schedule, kv_mode=layer_mod.DiffusionKVCacheMode.PAGED_SCHEDULER)
-    layer = attention_env.build(config, paged_kv_cache_role="primary")
-
-    with pytest.raises(ValueError, match=r"profile 'nopaged'.*does not support Scheduler-managed paged KV"):
-        layer_mod.validate_attention_schedule_candidates(_pipeline(layer), config)
-
-
-def test_startup_validation_rejects_paged_capable_candidate_that_differs_from_baseline(attention_env):
-    attention_env.monkeypatch.setattr(FlashAttentionBackend, "get_impl_cls", staticmethod(lambda: _FakeImpl))
-    attention_env.monkeypatch.setattr(_fake_backend("BLOCK_SPARSE"), "supports_paged_kv", True)
-    schedule = AttentionScheduleConfig(
-        profiles={"paged": AttentionConfig(default=AttentionSpec(backend="BLOCK_SPARSE"))},
-        default=[{"start": 0, "end": None, "profile": "paged"}],
-    )
-    config = _make_config(schedule=schedule, kv_mode=layer_mod.DiffusionKVCacheMode.PAGED_SCHEDULER)
-    layer = attention_env.build(config, paged_kv_cache_role="primary")
-
-    with pytest.raises(ValueError, match=r"profile 'paged'.*native implementation bound to the baseline"):
-        layer_mod.validate_attention_schedule_candidates(_pipeline(layer), config)
-
-
-def test_startup_validation_rejects_auto_pad_incompatible_candidate(attention_env):
-    schedule = AttentionScheduleConfig(
-        profiles={"nomask": AttentionConfig(default=AttentionSpec(backend="BLOCK_SPARSE"))},
-        default=[{"start": 0, "end": None, "profile": "nomask"}],
-    )
-    attention_env.monkeypatch.setattr(
-        _fake_backend("BLOCK_SPARSE"), "supports_attention_mask", staticmethod(lambda spec=None: False)
-    )
-    config = _make_config(schedule=schedule, sp_size=2)
-    layer = attention_env.build(config)
-
-    with pytest.raises(ValueError, match=r"profile 'nomask'.*attention_mask"):
-        layer_mod.validate_attention_schedule_candidates(_pipeline(layer, sp_plan=_flat_auto_pad_plan()), config)
 
 
 def _ring_config(schedule, **kwargs):
@@ -277,7 +223,7 @@ def test_startup_validation_rejects_candidate_backend_divergence_under_ring(atte
     )
     layer = attention_env.build(_make_config(schedule=schedule))
 
-    assert layer.backend_pref != layer._schedule_candidates["other"].backend_pref
+    assert layer.backend_pref != layer._schedule_candidates["other"].backend_cls.get_name()
     with pytest.raises(ValueError, match=r"profile 'other'.*ring"):
         layer_mod.validate_attention_schedule_candidates(_pipeline(layer), _ring_config(schedule))
 

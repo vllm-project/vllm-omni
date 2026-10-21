@@ -2,18 +2,22 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import pytest
+import torch.nn as nn
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionImpl, AttentionMetadata
 from vllm_omni.diffusion.attention.backends.trtllm_attn import TrtllmAttentionBackend
 from vllm_omni.diffusion.attention.backends.trtllm_calibration import (
+    apply_skip_softmax_calibration,
+    apply_to_pipeline,
     is_ignored,
+    layer_calibration_is_ignored,
     layer_match_names,
     parse_sparse_attention_config,
     resolve_layer_calibration,
     select_expert,
 )
 from vllm_omni.diffusion.attention.layer import _PreparedCandidate
-from vllm_omni.diffusion.data import AttentionSpec
+from vllm_omni.diffusion.data import AttentionConfig, AttentionScheduleConfig, AttentionSpec, SkipSoftmaxSpec
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
@@ -163,16 +167,12 @@ def _candidate(impl: _FakeImpl, spec: AttentionSpec | None = None) -> _PreparedC
     return _PreparedCandidate(
         backend_cls=TrtllmAttentionBackend,
         spec=spec,
-        impl_cls=_FakeImpl,
         impl=impl,
         backend_explicit=True,
-        backend_pref="TRTLLM_ATTN",
     )
 
 
 def _fake_pipeline():
-    import torch.nn as nn
-
     def _attn_layer():
         layer = nn.Module()
         layer.attention = _FakeImpl()
@@ -201,8 +201,6 @@ def _fake_pipeline():
 
 
 def test_apply_to_pipeline_routes_and_ignores():
-    from vllm_omni.diffusion.attention.backends.trtllm_calibration import apply_to_pipeline
-
     pipe = _fake_pipeline()
 
     calib = {
@@ -241,10 +239,6 @@ def test_apply_to_pipeline_routes_and_ignores():
 
 def test_apply_to_pipeline_ignored_layer_skips_baseline_and_candidates():
     """An ignored layer calibrates neither baseline nor candidates (legitimate dense fallback)."""
-    import torch.nn as nn
-
-    from vllm_omni.diffusion.attention.backends.trtllm_calibration import apply_to_pipeline
-
     attn = nn.Module()
     attn.attention = _FakeImpl()
     cand = _FakeImpl()
@@ -264,16 +258,6 @@ def test_apply_to_pipeline_ignored_layer_skips_baseline_and_candidates():
 
 
 def test_apply_skip_softmax_calibration_discovers_profile_only_calibration():
-    import torch.nn as nn
-
-    from vllm_omni.diffusion.attention.backends.trtllm_calibration import apply_skip_softmax_calibration
-    from vllm_omni.diffusion.data import (
-        AttentionConfig,
-        AttentionScheduleConfig,
-        AttentionSpec,
-        SkipSoftmaxSpec,
-    )
-
     calibration = {"by_expert": {"attn": {"a": 1.5, "b": 2.5}}}
     profile_spec = AttentionSpec(
         backend="TRTLLM_ATTN",
@@ -304,11 +288,6 @@ def test_apply_skip_softmax_calibration_discovers_profile_only_calibration():
 def test_apply_to_pipeline_stamps_each_candidate_from_its_own_curve():
     # A candidate with its own skip_calibration must not receive the fallback dict. The baseline
     # and a candidate without its own dict still receive that fallback.
-    import torch.nn as nn
-
-    from vllm_omni.diffusion.attention.backends.trtllm_calibration import apply_to_pipeline
-    from vllm_omni.diffusion.data import AttentionSpec
-
     attn = nn.Module()
     attn.attention = _FakeImpl()
     own = _FakeImpl()
@@ -335,8 +314,6 @@ def test_apply_to_pipeline_stamps_each_candidate_from_its_own_curve():
 
 
 def test_layer_calibration_is_ignored_distinguishes_ignored_from_missing_curve():
-    from vllm_omni.diffusion.attention.backends.trtllm_calibration import layer_calibration_is_ignored
-
     calibration = {"by_expert": {"transformer": {"a": 1.0, "b": 2.0, "ignore": ["blocks.*.attn2"]}}}
 
     assert layer_calibration_is_ignored("transformer.blocks.0.attn2", calibration) is True

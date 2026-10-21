@@ -15,7 +15,23 @@ import pytest
 import torch
 
 from tests.diffusion.attention.test_attention_schedule_candidates import _make_metadata_candidate
+from tests.diffusion.models.minimax_h3.test_minimax_h3_quantization import _FakeLinear, _small_od_config
+from vllm_omni.diffusion.attention import layer
+from vllm_omni.diffusion.attention.backends.fastvideo_vsa import FastVideoVSABackend
+from vllm_omni.diffusion.attention.backends.sdpa import SDPABackend
+from vllm_omni.diffusion.attention.parallel.base import NoParallelAttention
+from vllm_omni.diffusion.attention.schedule import AttentionScheduleRange
+from vllm_omni.diffusion.forward_context import (
+    bind_attention_schedule,
+    get_attention_schedule_profile,
+    get_forward_context,
+    set_forward_context,
+)
+from vllm_omni.diffusion.models.minimax_h3 import minimax_h3_transformer as h3
+from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3
+from vllm_omni.diffusion.models.minimax_h3.denoise_loop import minimax_h3_denoise_loop
 from vllm_omni.diffusion.worker.input_batch import InputBatch
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
@@ -100,7 +116,6 @@ def _sigmas(num_steps: int, shift: float) -> list[float]:
 def _make_state(request_id: str, model, branch, video_rows, audio_rows, sigmas_video, sigmas_audio):
     from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
     from vllm_omni.diffusion.worker.utils import StepRequestState
-    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
     state = StepRequestState(
         request_id=request_id, sampling=OmniDiffusionSamplingParams(guidance_scale=1.0, true_cfg_scale=4.0)
@@ -593,12 +608,10 @@ class _ProgressRecordingModel(_SegmentMeanModel):
 
     def __init__(self, *, fail_on_call: int | None = None):
         super().__init__()
-        self.progress: list[tuple[int | None, float | None, int | None, bool, int]] = []
+        self.progress: list[tuple[int | None, float | None, int | None, str | None, int]] = []
         self.fail_on_call = fail_on_call
 
     def __call__(self, **kwargs):
-        from vllm_omni.diffusion.forward_context import get_forward_context
-
         self.progress.append(
             (*_denoise_progress(get_forward_context()), kwargs["packed_seq_params"].get("num_requests", 1))
         )
@@ -607,8 +620,8 @@ class _ProgressRecordingModel(_SegmentMeanModel):
         return super().__call__(**kwargs)
 
 
-def _denoise_progress(ctx) -> tuple[int | None, float | None, int | None, bool]:
-    return ctx.denoise_step_idx, ctx.denoise_timestep, ctx.total_denoise_steps, ctx.attention_schedule_denoise_active
+def _denoise_progress(ctx) -> tuple[int | None, float | None, int | None, str | None]:
+    return ctx.denoise_step_idx, ctx.denoise_timestep, ctx.total_denoise_steps, get_attention_schedule_profile()
 
 
 def _mixed_progress_states(model):
@@ -626,16 +639,11 @@ def _mixed_progress_states(model):
 
 
 def _sparse_schedule():
-    from vllm_omni.diffusion.attention.schedule import AttentionScheduleRange
-
     return (AttentionScheduleRange(0, None, "sparse"),)
 
 
 def test_scheduled_mixed_step_batch_runs_each_request_under_its_own_progress():
     """Under a bound schedule, each request selects attention at its own step and total."""
-    from vllm_omni.diffusion.forward_context import bind_attention_schedule, get_forward_context, set_forward_context
-    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
-
     model = _ProgressRecordingModel()
     states = _mixed_progress_states(model)
     pipeline = _step_pipeline(model)
@@ -647,24 +655,21 @@ def test_scheduled_mixed_step_batch_runs_each_request_under_its_own_progress():
             velocity = pipeline.denoise_step(InputBatch.make_batch(states), states=states)
             after = _denoise_progress(get_forward_context())
 
-    first_sigmas = states[0].extra[mod._STEP_SIGMAS_VIDEO]
-    second_sigmas = states[1].extra[mod._STEP_SIGMAS_VIDEO]
-    assert packed_progress == [(None, None, None, False, 2)]
+    first_sigmas = states[0].extra[pipeline_minimax_h3._STEP_SIGMAS_VIDEO]
+    second_sigmas = states[1].extra[pipeline_minimax_h3._STEP_SIGMAS_VIDEO]
+    assert packed_progress == [(None, None, None, None, 2)]
     assert model.progress == [
-        (0, float(first_sigmas[0]), 6, True, 1),
-        (2, float(second_sigmas[2]), 4, True, 1),
+        (0, float(first_sigmas[0]), 6, "sparse", 1),
+        (2, float(second_sigmas[2]), 4, "sparse", 1),
     ]
     # The batch-level progress (no single point for this batch) is back after the requests.
-    assert after == (None, None, None, False)
+    assert after == (None, None, None, None)
     # One forward per request computes the same velocities as the packed forward.
     torch.testing.assert_close(velocity, packed_velocity)
 
 
 def test_scheduled_request_loop_restarts_progress_for_each_denoise_sequence():
     """forward() runs one request-mode loop per seed and per window; each selects from step 0 of its own total."""
-    from vllm_omni.diffusion.forward_context import bind_attention_schedule, get_forward_context, set_forward_context
-    from vllm_omni.diffusion.models.minimax_h3.denoise_loop import minimax_h3_denoise_loop
-
     model = _ProgressRecordingModel()
     branch, video_rows, audio_rows = _make_branch(text_len=9, latent_t=2, latent_h=4, latent_w=6, audio_t=3, seed=23)
     sigmas_video, sigmas_audio = _sigmas(4, 12.0), _sigmas(4, 3.0)
@@ -682,8 +687,8 @@ def test_scheduled_request_loop_restarts_progress_for_each_denoise_sequence():
                 sigmas_audio=sigmas_audio,
                 device=torch.device("cpu"),
             )
-            assert model.progress == [(step, sigmas_video[step], total, True, 1) for step in range(total)]
-            assert _denoise_progress(get_forward_context()) == (None, None, None, False)
+            assert model.progress == [(step, sigmas_video[step], total, "sparse", 1) for step in range(total)]
+            assert _denoise_progress(get_forward_context()) == (None, None, None, None)
 
 
 @pytest.mark.parametrize("batch_frames", [1, 33])
@@ -912,8 +917,6 @@ def _schedule_candidate(name: str, *, mask_free=False, prefix_kv_slicing=False, 
 
 def test_vdn_attention_accepts_only_vdnh3_candidates(monkeypatch):
     """VDN-H3 checkpoints read the frame window only in VDNH3_ATTN, so other profiles are rejected at startup."""
-    from vllm_omni.diffusion.models.minimax_h3 import minimax_h3_transformer as h3
-
     checks: list = []
     attention = SimpleNamespace(
         attn_backend=SimpleNamespace(get_name=lambda: "VDNH3_ATTN"),
@@ -937,13 +940,6 @@ def test_gateless_dit_accepts_a_vsa_candidate_when_its_baseline_is_vsa(monkeypat
     Its self role still resolves to FASTVIDEO_VSA, which the FastH3 VSA contract requires, so one self-role
     profile is checked on both DiTs. The DiTs use real Attention layers, whose baseline the check reads.
     """
-    from tests.diffusion.models.minimax_h3.test_minimax_h3_quantization import _FakeLinear, _small_od_config
-    from vllm_omni.diffusion.attention import layer
-    from vllm_omni.diffusion.attention.backends.fastvideo_vsa import FastVideoVSABackend
-    from vllm_omni.diffusion.attention.backends.sdpa import SDPABackend
-    from vllm_omni.diffusion.attention.parallel.base import NoParallelAttention
-    from vllm_omni.diffusion.models.minimax_h3 import minimax_h3_transformer as h3
-
     for name in ("ColumnParallelLinear", "MergedColumnParallelLinear", "QKVParallelLinear", "RowParallelLinear"):
         monkeypatch.setattr(h3, name, _FakeLinear)
     monkeypatch.setattr(h3, "get_tensor_model_parallel_world_size", lambda: 1)

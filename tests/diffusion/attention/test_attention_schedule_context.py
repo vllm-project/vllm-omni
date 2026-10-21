@@ -20,6 +20,7 @@ from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.attention.parallel.base import NoParallelAttention
 from vllm_omni.diffusion.attention.schedule import (
     AttentionScheduleRange,
+    require_attention_schedule_fits,
 )
 from vllm_omni.diffusion.config import set_current_diffusion_config
 from vllm_omni.diffusion.data import (
@@ -32,7 +33,6 @@ from vllm_omni.diffusion.data import (
 )
 from vllm_omni.diffusion.forward_context import (
     DenoiseProgressMixin,
-    begin_scheduled_denoise,
     get_forward_context,
     is_forward_context_available,
 )
@@ -146,7 +146,9 @@ class _PublishingRequestPipeline(DenoiseProgressMixin):
         if total is None:
             total = batch.requests[0].sampling_params.num_inference_steps
         self._select("encode")
-        begin_scheduled_denoise(total)
+        schedule = get_forward_context().attention_schedule
+        if schedule:
+            require_attention_schedule_fits(schedule, total)
         for step in range(total):
             self.record_denoise_step(step, total_steps=total)
             if step == self.fail_step:
@@ -251,10 +253,6 @@ class _StartupPublishingPipeline(DenoiseProgressMixin):
     """A loaded pipeline that publishes denoise progress."""
 
 
-class _StartupSilentPipeline:
-    """A loaded pipeline without a progress publisher."""
-
-
 class _StartupCacheBackend:
     def enable(self, pipeline):
         del pipeline
@@ -310,11 +308,6 @@ def _load_model(monkeypatch, pipeline, *, schedule, cache_backend=None, model_cl
 
 def _profiles_only_service():
     return AttentionScheduleConfig(profiles=_service().profiles, default=[])
-
-
-def test_startup_rejects_profiles_on_pipeline_without_progress_publisher(monkeypatch):
-    with pytest.raises(ValueError, match="_StartupSilentPipeline never publishes denoise progress"):
-        _load_model(monkeypatch, _StartupSilentPipeline(), schedule=_profiles_only_service())
 
 
 def test_startup_rejects_profiles_with_cache_backend_when_default_is_empty(monkeypatch):
