@@ -55,6 +55,7 @@ _DELEGATED_MARK_SOURCES = {
     "tests/model_tests/diffusion/test_common_offline.py": "tests/model_tests/diffusion/case_filtering.py",
     "tests/model_tests/diffusion/test_common_online.py": "tests/model_tests/diffusion/case_filtering.py",
 }
+_DELEGATED_MARK_CALLS = ("get_parametrized_options(",)
 
 # Match mark.X since we could also do `from pytest import mark`.
 # \b prevents matching prefixes (e.g., mark.slow vs mark.slow_test).
@@ -467,7 +468,7 @@ def get_files_missing_markers(
             if has_bare_platform_marker(path, contents):
                 missing.append(BARE_PLATFORM_MARKER)
             mark_source = _DELEGATED_MARK_SOURCES.get(_normalize_path(path))
-            if mark_source is not None and "get_parametrized_options(" in contents:
+            if mark_source is not None and any(call in contents for call in _DELEGATED_MARK_CALLS):
                 contents += "\n" + (read_test_file(str(_repo_root() / mark_source)) or "")
             if not has_level_marker(contents):
                 missing.append(MISSING_LEVEL_MARKER)

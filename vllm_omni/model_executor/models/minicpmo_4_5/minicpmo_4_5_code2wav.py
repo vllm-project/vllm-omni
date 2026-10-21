@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from functools import lru_cache, partial
 from hashlib import sha256
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import soundfile as sf
 import torch
@@ -855,23 +855,47 @@ class MiniCPMO45Code2Wav(nn.Module):
         )
 
     @staticmethod
-    def _bucket_key(item: _WorkItem, *, cross_turn: bool = False, row_offsets: bool = False) -> tuple[Any, ...]:
+    def _bucket_key(
+        item: _WorkItem, *, cross_turn: bool = False, row_offsets: bool = False, cross_reference: bool = False
+    ) -> tuple[Any, ...]:
         cache_signature: Any
         if item.previous is None:
             cache_signature = ("uninitialized",)
         elif row_offsets and _slot_resident(item):
             # A slot-pool row keeps its cache lengths per row (``cfm_row_offset_merge``).
             cache_signature = ("row_offsets", row_offset_signature(item.previous.token2wav))
+        elif cross_reference:
+            # The ragged decoder keeps attention lengths and voice conditioning
+            # per request. Different references need not split a compute batch.
+            cache_signature = row_offset_signature(item.previous.token2wav)
         else:
             cache_signature = state_shape_signature(item.previous.token2wav)
+        prompt = (None, None) if cross_reference else (item.prompt_cache_id, item.prompt_wav)
         if cross_turn:
-            return (item.prompt_cache_id, item.prompt_wav, cache_signature)
-        return (
-            item.prompt_cache_id,
-            item.prompt_wav,
-            cache_signature,
-            item.cache_epoch,
-        )
+            return (*prompt, cache_signature)
+        return (*prompt, cache_signature, item.cache_epoch)
+
+    def _prepare_decode_batch(
+        self, items: list[_WorkItem]
+    ) -> tuple[list[BatchedToken2WavState], PromptFeatures | list[PromptFeatures]]:
+        """Prepare each voice separately, then keep conditioning in request order."""
+        prompts: dict[tuple[str, str], PromptFeatures] = {}
+        fresh: dict[tuple[str, str], list[int]] = {}
+        states = [item.previous.token2wav if item.previous is not None else None for item in items]
+        features: list[PromptFeatures] = []
+        for row, item in enumerate(items):
+            key = (item.prompt_cache_id, item.prompt_wav)
+            if key not in prompts:
+                prompts[key] = self.backend.prepare_prompt(*key)
+            features.append(prompts[key])
+            if states[row] is None:
+                fresh.setdefault(key, []).append(row)
+        for key, rows in fresh.items():
+            for row, state in zip(rows, self.backend.setup_batch(prompts[key], len(rows)), strict=True):
+                states[row] = state
+        if any(state is None for state in states):
+            raise _batch_error("incomplete_setup")
+        return cast(list[BatchedToken2WavState], states), features[0] if len(prompts) == 1 else features
 
     def _signature_groups(
         self, bucket: list[_WorkItem], states: list[BatchedToken2WavState], *, row_offsets: bool
@@ -907,17 +931,22 @@ class MiniCPMO45Code2Wav(nn.Module):
         """Decode ``items`` together: ragged when asked to, or when their token counts or last-chunk flags differ."""
         tokens = [item.tokens for item in items]
         last_chunks = [item.last_chunk for item in items]
-        if ragged or len({int(t.numel()) for t in tokens}) > 1 or len(set(last_chunks)) > 1:
+        if (
+            ragged
+            or (isinstance(features, list) and self.backend._whole_euler_ragged_active())
+            or len({state_shape_signature(state) for state in states}) > 1
+            or len({int(t.numel()) for t in tokens}) > 1
+            or len(set(last_chunks)) > 1
+        ):
             return self.backend.decode_ragged_batch(tokens, features, states, last_chunks=last_chunks)
         return self.backend.decode_batch(torch.stack(tokens, dim=0), features, states, last_chunk=last_chunks[0])
 
     @staticmethod
     def _onset_group_key(key: tuple[Any, ...], *, cross_turn: bool = False) -> tuple[Any, ...]:
-        """The onset-merge group of a bucket key: its prompt, plus its cache epoch unless rows merge across turns."""
+        """Keep turn epochs separate when merging onset and continuation rows."""
         if cross_turn:
             return key[:2]
-        prompt_cache_id, prompt_wav, _, cache_epoch = key
-        return (prompt_cache_id, prompt_wav, cache_epoch)
+        return (*key[:2], key[-1])
 
     def _iter_limited_batches(
         self,
@@ -1094,9 +1123,19 @@ class MiniCPMO45Code2Wav(nn.Module):
 
         cross_turn = getattr(self, "_cross_turn_buckets", False) is True
         row_offsets = getattr(self, "_row_offset_merge", False) is True
+        # Without CUDA ragged Whole-Euler, keep exact reference/shape buckets
+        # so mixed voices do not bypass the configured step graphs or TRT.
+        cross_reference = (
+            self.backend is not None
+            and self.backend._whole_euler_ragged_active()
+            and self.backend._whole_euler_graph_wrapper.device.type == "cuda"
+        )
         buckets: dict[tuple[Any, ...], list[_WorkItem]] = {}
         for item in compute_items:
-            buckets.setdefault(self._bucket_key(item, cross_turn=cross_turn, row_offsets=row_offsets), []).append(item)
+            key = self._bucket_key(
+                item, cross_turn=cross_turn, row_offsets=row_offsets, cross_reference=cross_reference
+            )
+            buckets.setdefault(key, []).append(item)
         undersized = [
             {
                 "size": len(bucket),
@@ -1172,7 +1211,7 @@ class MiniCPMO45Code2Wav(nn.Module):
                 )
         decode_buckets: Iterable[list[_WorkItem]]
         if self._onset_merge and self.backend is not None and self.backend._whole_euler_ragged_active():
-            # Offer a fresh onset and a continuation of one prompt/epoch, ready together, to ragged
+            # Offer a fresh onset and a continuation of one epoch, ready together, to ragged
             # Whole-Euler; other exact-shape buckets stay as they are.
             grouped: dict[tuple[Any, ...], list[list[_WorkItem]]] = {}
             for key, bucket in buckets.items():
@@ -1188,20 +1227,19 @@ class MiniCPMO45Code2Wav(nn.Module):
         for bucket in self._iter_decode_batches(decode_buckets):
             batch_size = len(bucket)
             try:
-                features = self.backend.prepare_prompt(
-                    bucket[0].prompt_cache_id,
-                    bucket[0].prompt_wav,
-                )
+                states, features = self._prepare_decode_batch(bucket)
                 fresh = [item for item in bucket if item.previous is None]
-                setup = iter(self.backend.setup_batch(features, len(fresh)) if fresh else [])
-                states = [next(setup) if item.previous is None else item.previous.token2wav for item in bucket]
                 onset_mix = self._onset_merge and 0 < len(fresh) < batch_size
                 onset_ready = onset_mix and self.backend.can_merge_state_shapes(
                     states, [int(item.tokens.numel()) for item in bucket]
                 )
                 row_groups: list[list[int]] | None = None
                 offset_mix = False
-                if onset_mix and not onset_ready:
+                if isinstance(features, list):
+                    # Each reference has its own cache lengths and conditioning.
+                    # The ragged path handles them in one solve.
+                    pass
+                elif onset_mix and not onset_ready:
                     # Cache layouts ragged Whole-Euler cannot take split back into signature buckets.
                     row_groups = self._signature_groups(bucket, states, row_offsets=row_offsets)
                 elif row_offsets and not onset_ready and batch_size > 1:

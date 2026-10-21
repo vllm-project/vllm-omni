@@ -26,6 +26,8 @@ Layers pinned down here:
   owns.
 - Model Runner V2 is refused up front instead of silently arming a loop
   whose decode preprocess cannot re-embed the real previous frame.
+- A turn-end chunk masks, allows or forces codec EOS at the same frame as
+  on the single-frame path, for every drain kind.
 """
 
 import logging
@@ -35,7 +37,14 @@ import pytest
 import torch
 from torch import nn
 
+from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_llm import ConditionalChatTTSConfig
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
+    _DRAIN_BOUNDARY_MASK,
+    _DRAIN_NONE,
+    _DRAIN_UNTIL_SILENT,
+    _QUIET_CODEC_IDS,
+    _SILENT_CODEC_IDS,
+    _TURN_END_QUIET_STOP_FRAMES,
     MiniCPMO45OmniTTSForConditionalGeneration,
     _codec_int_param,
 )
@@ -1408,6 +1417,223 @@ def test_ignore_eos_does_not_ignore_stop_ids():
 
     assert state["finished"] is True
     assert bool(model._request_codec_device_states["r1"].finished.item()) is True
+
+
+_SPEECH = 42
+_SILENT = _SILENT_CODEC_IDS[0]
+_QUIET = next(code for code in _QUIET_CODEC_IDS if code not in _SILENT_CODEC_IDS)
+
+
+def _single_frame_eos(drain: int, previous: list[int], current: list[int]) -> tuple[bool, bool]:
+    """(forced, masked) codec EOS on the single-frame path after ``current`` codes of this condition.
+
+    ``previous`` holds codes retained from the previous condition, which the
+    penalty window still carries.
+    """
+    talker = MiniCPMO45OmniTTSForConditionalGeneration.__new__(MiniCPMO45OmniTTSForConditionalGeneration)
+    nn.Module.__init__(talker)
+    talker._num_audio_tokens = _NUM_AUDIO_TOKENS
+    talker._codec_eos_id = _EOS_ID
+    talker._force_eos_rows = None
+    talker._mask_eos_rows = None
+    talker._pending_force_eos_rows = None
+    talker._penalty_histories = None
+    talker._request_condition_states = {}
+    talker._deferred_cleanup_ids = set()
+    talker._tts_config = ConditionalChatTTSConfig()
+    talker._codec_temperature = 0.0
+    talker._codec_min_tokens = 0
+    talker._codec_max_tokens = 4032
+    talker._k_step_frames = 0
+    talker.supports_multi_frame_decode = False
+    talker.head_code = nn.ModuleList([nn.Linear(2, _NUM_AUDIO_TOKENS, bias=False)])
+    talker._request_audio_states = {
+        "r1": {
+            "finished": False,
+            "step": len(current),
+            "max_tokens": 104,
+            "min_tokens": 0,
+            "turn_end_drain": drain,
+            "recent_codes": (previous + current)[-16:],
+        }
+    }
+    output = talker.make_omni_output(
+        torch.ones(1, 2),
+        model_intermediate_buffer=[{"request_id": "r1", "codes": {"audio": torch.empty(0)}}],
+        request_token_spans=[(0, 1)],
+    )
+    logits = talker.compute_logits(output.text_hidden_states)
+    forced = bool(output.multimodal_outputs["meta"]["finished"][0])
+    return forced, not forced and logits[0, _EOS_ID].item() == float("-inf")
+
+
+def _kstep_eos(drain: int, previous: list[int], current: list[int], temperature: float) -> tuple[bool, bool]:
+    """(forced, masked) codec EOS on one K-step frame whose head strongly prefers EOS."""
+    model = _real_boundary_talker(temperature)
+    with torch.no_grad():
+        model.head_code[0].weight.zero_()
+        model.head_code[0].weight[_EOS_ID] = 10.0
+    history = previous + current
+    model._request_audio_states["r1"] = {
+        "step": len(current),
+        "max_tokens": 104,
+        "min_tokens": 0,
+        "codes": torch.tensor(history[-16:], dtype=torch.long),
+        "turn_end_drain": drain,
+    }
+    if history:
+        model._request_codec_history["r1"] = list(history)
+    out = _frame_call(model, torch.ones(1, 8))
+    state = model._request_audio_states["r1"]
+    sampled = "r1" in getattr(model, "_request_codec_device_states", {})
+    if not state["finished"]:
+        # EOS was the head's choice, so any other sample means it was masked.
+        assert out.multimodal_outputs["codes"]["audio"][0].numel() == 1
+    assert bool(out.multimodal_outputs["meta"]["finished"][0]) is state["finished"]
+    # Under K-step the stop row is what the scheduler acts on.
+    assert model.take_batch_stop_logits()[0].argmax().item() == int(state["finished"])
+    return state["finished"] and not sampled, not state["finished"]
+
+
+_QUIET_RUN = _TURN_END_QUIET_STOP_FRAMES * [_QUIET]
+# (previous condition, this condition, expected (forced, masked) per drain kind).
+# Frames 8/16/24/32 start K=8 steps.
+_DRAIN_CASES = [
+    pytest.param(
+        [],
+        [],
+        {_DRAIN_NONE: (False, False), _DRAIN_BOUNDARY_MASK: (False, False), _DRAIN_UNTIL_SILENT: (False, True)},
+        id="start",
+    ),
+    pytest.param(
+        [],
+        [_SPEECH] * 24,
+        {_DRAIN_NONE: (False, False), _DRAIN_BOUNDARY_MASK: (False, False), _DRAIN_UNTIL_SILENT: (False, True)},
+        id="speech-24",
+    ),
+    pytest.param(
+        [],
+        [_SPEECH] * 25,
+        {_DRAIN_NONE: (False, False), _DRAIN_BOUNDARY_MASK: (False, True), _DRAIN_UNTIL_SILENT: (False, True)},
+        id="speech-25",
+    ),
+    pytest.param(
+        [],
+        [_SPEECH] * 15 + [_SILENT],
+        {_DRAIN_NONE: (False, False), _DRAIN_BOUNDARY_MASK: (False, False), _DRAIN_UNTIL_SILENT: (False, True)},
+        id="one-silent",
+    ),
+    pytest.param(
+        [],
+        [_SPEECH] * 15 + [_SILENT] * 2,
+        {_DRAIN_NONE: (False, False), _DRAIN_BOUNDARY_MASK: (False, False), _DRAIN_UNTIL_SILENT: (False, False)},
+        id="silent-pair-across-step-16",
+    ),
+    pytest.param(
+        [],
+        [_SPEECH] * 26 + [_SILENT] * 2,
+        {_DRAIN_NONE: (False, False), _DRAIN_BOUNDARY_MASK: (False, True), _DRAIN_UNTIL_SILENT: (False, False)},
+        id="silent-pair-in-cadence-window",
+    ),
+    pytest.param(
+        [],
+        [_SPEECH] * 20 + _QUIET_RUN[:-1],
+        {_DRAIN_NONE: (False, False), _DRAIN_BOUNDARY_MASK: (False, True), _DRAIN_UNTIL_SILENT: (False, True)},
+        id="quiet-7",
+    ),
+    pytest.param(
+        [],
+        [_SPEECH] * 20 + _QUIET_RUN,
+        {_DRAIN_NONE: (False, False), _DRAIN_BOUNDARY_MASK: (False, True), _DRAIN_UNTIL_SILENT: (True, False)},
+        id="quiet-8",
+    ),
+    pytest.param(
+        [],
+        [_SPEECH] * 20 + [_QUIET, _SILENT] * (_TURN_END_QUIET_STOP_FRAMES // 2),
+        {_DRAIN_NONE: (False, False), _DRAIN_BOUNDARY_MASK: (False, True), _DRAIN_UNTIL_SILENT: (True, False)},
+        id="quiet-silent-mix-8",
+    ),
+    pytest.param(
+        [],
+        [_SPEECH] * 24 + _QUIET_RUN,
+        {_DRAIN_NONE: (False, False), _DRAIN_BOUNDARY_MASK: (False, False), _DRAIN_UNTIL_SILENT: (True, False)},
+        id="quiet-8-at-step-start",
+    ),
+    # Codes retained from the previous condition do not count toward either run.
+    pytest.param(
+        [_SILENT] * 7,
+        [_SILENT],
+        {_DRAIN_NONE: (False, False), _DRAIN_BOUNDARY_MASK: (False, False), _DRAIN_UNTIL_SILENT: (False, True)},
+        id="retained-silence",
+    ),
+    pytest.param(
+        _QUIET_RUN,
+        [],
+        {_DRAIN_NONE: (False, False), _DRAIN_BOUNDARY_MASK: (False, False), _DRAIN_UNTIL_SILENT: (False, True)},
+        id="retained-quiet-run",
+    ),
+]
+
+
+@pytest.mark.parametrize("temperature", [0.0, 0.8], ids=["greedy", "stochastic"])
+@pytest.mark.parametrize(
+    "drain", [_DRAIN_NONE, _DRAIN_BOUNDARY_MASK, _DRAIN_UNTIL_SILENT], ids=["none", "boundary-mask", "until-silent"]
+)
+@pytest.mark.parametrize("previous,current,expected", _DRAIN_CASES)
+def test_kstep_turn_end_drain_matches_single_frame(drain, previous, current, expected, temperature):
+    single = _single_frame_eos(drain, previous, current)
+    assert single == expected[drain]
+    assert _kstep_eos(drain, previous, current, temperature) == single
+
+
+def test_kstep_drain_until_silent_across_steps():
+    """Step by step, as the multi-frame loop runs: the stop lands where the single-frame path puts it."""
+    # The silent pair straddles the step boundary at frame 16, the closing
+    # silence fills the fourth step, and the stop lands on frame 0 of the fifth.
+    k = 8
+    script = [_SPEECH] * 15 + [_SILENT] * 2 + [_SPEECH] * 7 + [_SILENT] * _TURN_END_QUIET_STOP_FRAMES
+    model = _make_talker(k_step_frames=k, scripted_samples=[])
+    queue = iter(script)
+    masked = []
+
+    def _greedy(_hidden, codes, _request_id, step, _min_tokens, max_tokens, eos_window_masked=False):
+        masked.append(eos_window_masked)
+        device_state = make_device_state(codes, step=step, max_tokens=max_tokens, finished=False)
+        return codec_sample_result(device_state, torch.tensor(next(queue), dtype=torch.long), eos_token_id=_EOS_ID)
+
+    model._sample_audio_code_greedy = _greedy
+    state = {"step": 0, "max_tokens": 104, "min_tokens": 0, "turn_end_drain": _DRAIN_UNTIL_SILENT}
+    model._request_audio_states["r1"] = state
+    hidden = torch.randn(1, 8)
+    full_steps = len(script) // k
+    for step_index in range(full_steps + 1):
+        frames, frame_stops = [], []
+        for _ in range(k):
+            frames.append(_frame_call(model, hidden))
+            frame_stops.append(model.take_batch_stop_logits())
+        merged = model.merge_frame_outputs(frames, frame_stops)
+        stops = model.take_batch_stop_logits().argmax(dim=-1).tolist()
+        codes = merged.multimodal_outputs["codes"]["audio"][0].reshape(-1).tolist()
+        finished = bool(merged.multimodal_outputs["meta"]["finished"][0])
+        if step_index < full_steps:
+            assert codes == script[step_index * k : (step_index + 1) * k], step_index
+            assert stops == [0] * k, step_index
+            assert not finished, step_index
+        else:
+            # The eighth silent code stops the chunk on the next frame, without sampling.
+            assert codes == []
+            assert stops == [1] * k
+            assert finished
+    assert state["finished"] is True
+    assert model._request_codec_history["r1"] == script
+    assert len(masked) == len(script)
+    # Each sampled frame saw the single-frame path's EOS mask, and the
+    # single-frame path forces EOS on the same frame.
+    for frame, flag in enumerate(masked):
+        assert _single_frame_eos(_DRAIN_UNTIL_SILENT, [], script[:frame]) == (False, flag), frame
+    assert _single_frame_eos(_DRAIN_UNTIL_SILENT, [], script) == (True, False)
+    # EOS was open only right after the silent pair and during the closing silence.
+    assert [frame for frame, flag in enumerate(masked) if not flag] == [17, 26, 27, 28, 29, 30, 31]
 
 
 _TALKER_LOGGER = "vllm_omni.platforms.npu.worker.talker_multiframe"

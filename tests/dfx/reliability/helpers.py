@@ -33,10 +33,14 @@ import sys
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import Any, TypedDict
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, TypedDict
 
 import psutil
 import pytest
+
+if TYPE_CHECKING:
+    from tests.helpers.runtime import OmniServerParams
 
 logger = logging.getLogger(__name__)
 
@@ -444,6 +448,38 @@ def stop_gpu_oom_hog(handle: OomHandle, *, timeout_sec: int = 5) -> None:
         proc.wait(timeout=timeout_sec)
 
 
+def _device_spec_from_deploy(deploy: Any, stage_config_path: str | Path) -> str:
+    device_ids: set[int] = set()
+    for stage in deploy.stages:
+        devices = stage.devices
+        if not isinstance(devices, str):
+            continue
+        for token in devices.split(","):
+            token = token.strip()
+            if token:
+                device_ids.add(int(token))
+    if not device_ids:
+        raise ValueError(f"No runtime.devices found in stage config: {stage_config_path}")
+    return ",".join(str(device_id) for device_id in sorted(device_ids))
+
+
+def stage_config_device_spec(stage_config_path: str | Path, platform: str | None) -> str:
+    """Devices the server keeps after ``base_config`` inheritance and one platform overlay.
+
+    ``platform=None`` keeps the inherited base stages and does not apply
+    ``platforms.*``. A named platform uses
+    :func:`vllm_omni.config.stage_config._apply_platform_overrides` with that
+    same ``device_name`` key. Other platform blocks, including an XPU 8-GPU
+    list, stay out of the result.
+    """
+    from vllm_omni.config.stage_config import _apply_platform_overrides, load_deploy_config
+
+    deploy = load_deploy_config(stage_config_path)
+    if platform is not None:
+        deploy = _apply_platform_overrides(deploy, platform)
+    return _device_spec_from_deploy(deploy, stage_config_path)
+
+
 def inject_gpu_oom(
     *,
     device: int | str | list[int] = 0,
@@ -472,17 +508,22 @@ def inject_gpu_oom(
     if not devices:
         raise ValueError("device must not be empty.")
 
-    handles = [
-        start_gpu_oom_hog(
-            device=dev,
-            target_mem_ratio=target_mem_ratio,
-            hold_seconds=hold_seconds,
-            startup_timeout_sec=startup_timeout_sec,
-            strict=strict,
-            max_free_bytes=max_free_bytes,
-        )
-        for dev in devices
-    ]
+    handles: list[OomHandle] = []
+    try:
+        for dev in devices:
+            handles.append(
+                start_gpu_oom_hog(
+                    device=dev,
+                    target_mem_ratio=target_mem_ratio,
+                    hold_seconds=hold_seconds,
+                    startup_timeout_sec=startup_timeout_sec,
+                    strict=strict,
+                    max_free_bytes=max_free_bytes,
+                )
+            )
+    except BaseException:
+        stop_gpu_oom_hogs(handles)
+        raise
     if len(handles) == 1:
         return handles[0]
     return handles
@@ -1004,6 +1045,27 @@ def assert_post_fault_api_unreachable(online_client: Any, *, scenario: str) -> N
     )
 
 
+SIGTERM_CLEANUP_GRACE_SEC = 60.0
+PARTIAL_ISOLATION_HTTP_TIMEOUT_SEC = 30.0
+
+
+def assert_api_still_listening(online_client: Any, *, scenario: str) -> None:
+    """The API process is still bound. HTTP 200 and HTTP 503 both count."""
+    status = online_client.send_health_http_request({"timeout": 5}, err_code=(200, 503))[0].status_code
+    assert status in (200, 503), f"[{scenario}] expected /health 200 or 503 while the API is still up, got {status}"
+
+
+def sigterm_serve_root_and_assert_cleanup(
+    server: Any,
+    *,
+    scenario: str,
+    grace_sec: float = SIGTERM_CLEANUP_GRACE_SEC,
+) -> None:
+    """Send one SIGTERM to the serve root and require the process tree and GPU to clear."""
+    make_server_root_kill_fault_injector(signal_name="SIGTERM", post_kill_wait_seconds=0.0)(server)
+    assert_no_server_tree_process_residual_and_gpu_release(server, scenario=scenario, timeout_sec=grace_sec)
+
+
 def worker_residual_timeout_after_kill_signal(signal_name: str) -> float:
     """Wall-clock budget for fault-snapshot PIDs / GPU to clear after ``signal_name``."""
     if signal_name == "SIGKILL":
@@ -1323,3 +1385,178 @@ def make_process_kill_fault_injector(
         pytest.skip("no matching runtime process found for kill injection")
 
     return _inject
+
+
+# (signal name, skip reason). ``None`` means the signal runs.
+SignalSpec = tuple[str, str | None]
+
+# SIGTERM and SIGKILL, both executed. Serve-root adds SIGINT on top of this pair.
+TERM_KILL_SIGNALS: tuple[SignalSpec, ...] = (("SIGTERM", None), ("SIGKILL", None))
+SERVE_ROOT_SIGNALS: tuple[SignalSpec, ...] = (
+    ("SIGTERM", None),
+    ("SIGINT", None),
+    ("SIGKILL", None),
+)
+
+INFLIGHT_INJECTION_REQUEST_RATE = 0.3
+INFLIGHT_INJECTION_REQUEST_COUNT = 10
+
+
+class FaultModel:
+    """One model's deploy, hardware, and request probes for a fault scenario."""
+
+    model_id: str
+    res: dict[str, str]
+    num_cards: int
+    extra_marks: tuple[Any, ...] = ()
+    scenarios: list[dict[str, Any]]
+    deploy_dir: Any
+    lifecycle_scenario: str | None = None
+    eager_oom_stage_ids: tuple[int, ...] | None = None
+    worker_pattern: str
+    isolation_pattern: str
+    hard_oom_config: dict[str, Any]
+    recover_oom_config: dict[str, Any] | None = None
+    fault_error_keywords: tuple[str, ...]
+    process_kill_error_keywords: tuple[str, ...]
+    with_load_timeout_sec: float = 120.0
+    concurrent_workers: int = 3
+    concurrent_timeout_sec: float = 40.0
+    health_miss_skip: str | None = None
+    worker_signals: tuple[SignalSpec, ...] = TERM_KILL_SIGNALS
+    serve_root_signals: tuple[SignalSpec, ...] = SERVE_ROOT_SIGNALS
+    serve_root_with_load_signals: tuple[SignalSpec, ...] = SERVE_ROOT_SIGNALS
+    tree_signals: tuple[SignalSpec, ...] = TERM_KILL_SIGNALS
+    tree_with_load_signals: tuple[SignalSpec, ...] = TERM_KILL_SIGNALS
+    oom_large_fail_message: str = "expected request failure during GPU OOM injection"
+    oom_concurrent_fail_message: str = "expected concurrent request failure under OOM injection"
+
+    def servers(self, server_set: str) -> list[tuple[str, OmniServerParams]]:
+        scenarios = list(self.scenarios)
+        if server_set == "lifecycle":
+            if self.lifecycle_scenario is not None:
+                scenarios = [item for item in scenarios if item["test_name"] == self.lifecycle_scenario]
+        elif server_set == "oom" and self.eager_oom_stage_ids:
+            import torch
+
+            scenarios = reliability_scenarios_for_eager_oom(
+                scenarios,
+                is_hip=bool(getattr(torch.version, "hip", None)),
+                stage_ids=self.eager_oom_stage_ids,
+            )
+        elif server_set not in ("default", "oom"):
+            raise ValueError(f"unknown server set {server_set!r} for {self.model_id}")
+        from tests.dfx.conftest import create_reliability_omni_server_params
+
+        params = create_reliability_omni_server_params(scenarios, self.deploy_dir)
+        return [(str(item["test_name"]), param) for item, param in zip(scenarios, params, strict=True)]
+
+    def warmup(self, client: Any, server: Any) -> None:
+        raise NotImplementedError(self.model_id)
+
+    def submit_worker_load(self, client: Any, server: Any) -> None:
+        self.warmup(client, server)
+
+    def submit_serve_load(self, client: Any, server: Any) -> None:
+        self.warmup(client, server)
+
+    def submit_concurrent(self, client: Any, server: Any) -> Any:
+        self.warmup(client, server)
+        return None
+
+    def assert_fast_fail(self, client: Any, server: Any) -> None:
+        raise NotImplementedError(self.model_id)
+
+    def isolation_warmup(self, client: Any, server: Any) -> None:
+        self.warmup(client, server)
+
+    def isolation_after(self, client: Any, server: Any) -> None:
+        self.assert_fast_fail(client, server)
+
+    def oom_large_probe(self, client: Any, server: Any) -> None:
+        raise NotImplementedError(self.model_id)
+
+    def oom_concurrent_probe(self, client: Any, server: Any) -> None:
+        raise NotImplementedError(self.model_id)
+
+    def run_error_contract(self, server: Any, client: Any) -> None:
+        raise NotImplementedError(self.model_id)
+
+    def run_oom_recovery(self, server: Any, client: Any) -> None:
+        raise NotImplementedError(self.model_id)
+
+
+def _skip_marks(reason: str | None) -> list[Any]:
+    if not reason:
+        return []
+    return [pytest.mark.skip(reason=reason)]
+
+
+class FaultScenario:
+    """Shared fault steps. A model test calls ``run`` with its ``FaultModel``."""
+
+    server_set: str = "default"
+    signals_attr: str | None = None
+
+    def run(self, model: FaultModel, server: Any, client: Any, signal_name: str | None = None) -> None:
+        raise NotImplementedError(type(self).__name__)
+
+
+def server_params(
+    model: FaultModel,
+    *,
+    server_set: str = "default",
+    skip_reason: str | None = None,
+) -> list[Any]:
+    """One indirect server param per scenario of ``model``."""
+    return [
+        pytest.param(server, marks=_skip_marks(skip_reason), id=scenario_name)
+        for scenario_name, server in model.servers(server_set)
+    ]
+
+
+def server_and_signal_params(
+    model: FaultModel,
+    signals_attr: str,
+    *,
+    server_set: str = "default",
+    skip_reason: str | None = None,
+) -> list[Any]:
+    """Server param plus a direct signal name. A fault skip covers every signal."""
+    items: list[Any] = []
+    for scenario_name, server in model.servers(server_set):
+        for signal_name, signal_skip in getattr(model, signals_attr):
+            items.append(
+                pytest.param(
+                    server,
+                    signal_name,
+                    marks=_skip_marks(skip_reason or signal_skip),
+                    id=f"{scenario_name}__{signal_name.lower()}",
+                )
+            )
+    return items
+
+
+def scenario_params(
+    model: FaultModel,
+    scenario: type[FaultScenario],
+    *,
+    skip_reason: str | None = None,
+) -> Any:
+    """Parametrize ``omni_server_function`` from the scenario's server set and signals."""
+    if scenario.signals_attr is None:
+        return pytest.mark.parametrize(
+            "omni_server_function",
+            server_params(model, server_set=scenario.server_set, skip_reason=skip_reason),
+            indirect=True,
+        )
+    return pytest.mark.parametrize(
+        ("omni_server_function", "signal_name"),
+        server_and_signal_params(
+            model,
+            scenario.signals_attr,
+            server_set=scenario.server_set,
+            skip_reason=skip_reason,
+        ),
+        indirect=["omni_server_function"],
+    )

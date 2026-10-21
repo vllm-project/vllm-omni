@@ -193,7 +193,9 @@ class OmniServer:
         for attempt in range(128):
             if attempt:
                 self.port = get_open_port(self.host)
-            lock_path = Path(tempfile.gettempdir()) / f"vllm-omni-test-port-{os.getuid()}-{self.port}.lock"
+            # Windows has no uid; one shared owner keeps the port lock name stable.
+            owner_id = getattr(os, "getuid", lambda: 0)()
+            lock_path = Path(tempfile.gettempdir()) / f"vllm-omni-test-port-{owner_id}-{self.port}.lock"
             lock = FileLock(lock_path)
             try:
                 lock.acquire(timeout=0)
@@ -422,7 +424,7 @@ class OmniServer:
             self._start_server()
         except BaseException:
             # ``__exit__`` is not invoked when ``__enter__`` raises; roll back
-            # any processes / log handles already launched.
+            # any process already launched.
             self.__exit__(None, None, None)
             raise
         return self

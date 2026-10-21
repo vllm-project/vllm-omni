@@ -77,8 +77,8 @@ def test_benchmark_result_preserves_tpot_sample_count(monkeypatch, measured, sel
 
 def test_benchmark_result_flattens_duplex_per_response_latency(monkeypatch):
     request_metrics = [
-        {"response_id": "r1", "ttft_ms": 50.0, "ttfp_ms": 150.0, "client_ttft_ms": 300.0, "client_ttfp_ms": 400.0},
-        {"response_id": "r2", "ttft_ms": 70.0, "ttfp_ms": 170.0, "client_ttft_ms": 320.0, "client_ttfp_ms": 420.0},
+        {"response_id": "r1", "ttft_ms": 50.0, "ttfp_ms": 150.0, "client_ttft_ms": 300.0, "client_ttfp_ms": 500.0},
+        {"response_id": "r2", "ttft_ms": 70.0, "ttfp_ms": 170.0, "client_ttft_ms": 320.0, "client_ttfp_ms": 700.0},
     ]
 
     async def request_func(**kwargs):
@@ -125,6 +125,6 @@ def test_benchmark_result_flattens_duplex_per_response_latency(monkeypatch):
     saved_result = json.loads(json.dumps(result, allow_nan=False))
     assert saved_result["max_output_tokens_per_s"] is None
     assert saved_result["num_duplex_client_ttfp_ms_samples"] == 2
-    assert saved_result["mean_duplex_client_ttfp_ms"] == pytest.approx(410.0)
+    assert saved_result["mean_duplex_client_ttfp_ms"] == pytest.approx(600.0)
     assert saved_result["mean_duplex_response_ttft_ms"] == pytest.approx(60.0)
     assert saved_result["p99_duplex_client_ttft_ms"] == pytest.approx(320.0)
