@@ -635,6 +635,12 @@ source_file_dependencies:
     - tests/e2e/accuracy/test_qwen_image.py
     - tests/e2e/accuracy/test_diffusers_backend_similarity.py
 
+  diffusion_qwen_image_21_function:
+    - *qwen_image_21
+    - tests/e2e/offline_inference/test_qwen_image_21.py
+    - tests/helpers/
+    - tests/conftest.py
+
   diffusion_qwen_image_21_accuracy:
     - *qwen_image_21
     - tests/e2e/accuracy/qwen_image_21/
