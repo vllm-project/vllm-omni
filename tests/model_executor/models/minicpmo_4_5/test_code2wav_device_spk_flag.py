@@ -486,3 +486,23 @@ def test_precapture_after_load_propagates_a_poisoned_wrapper(tmp_path, monkeypat
         model._precapture_after_load()
     # The caller-less allocator blocks are still returned before the failure.
     assert released == [1]
+
+
+def test_precapture_after_load_does_not_mask_the_sweep_error(tmp_path, monkeypatch, device_platform):
+    """A failing cache release must not replace the error startup is failing for."""
+    model, _ = _build_backend(
+        tmp_path,
+        monkeypatch,
+        {"cfm_graph_precapture_after_load": "true", "cfm_precapture_empty_cache": "true"},
+    )
+
+    def sweep() -> None:
+        raise RuntimeError("poisoned wrapper")
+
+    def release() -> None:
+        raise RuntimeError("empty_cache failed")
+
+    monkeypatch.setattr(model, "_precapture_default_prompt", sweep)
+    monkeypatch.setattr(model, "_release_precapture_cache", release)
+    with pytest.raises(RuntimeError, match="poisoned wrapper"):
+        model._precapture_after_load()

@@ -1711,7 +1711,14 @@ class MiniCPMO45Code2Wav(nn.Module):
                 self._precapture_default_prompt()
         finally:
             if getattr(self, "_precapture_empty_cache", False):
-                self._release_precapture_cache()
+                try:
+                    self._release_precapture_cache()
+                except Exception:
+                    # Never mask the sweep error this ``finally`` may run for.
+                    logger.warning(
+                        "MiniCPM-o Code2Wav: releasing the precapture cache failed",
+                        exc_info=True,
+                    )
 
     def _release_precapture_cache(self) -> None:
         """Return startup's unused cached allocator blocks to the driver (``cfm_precapture_empty_cache``).
