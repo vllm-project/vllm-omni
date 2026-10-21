@@ -10,7 +10,12 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from .omni_duplex_eval_clock import normalize_response_items, validate_clock
+from .omni_duplex_eval_clock import (
+    has_response_chunks,
+    normalize_response_chunks,
+    normalize_response_items,
+    validate_clock,
+)
 from .omni_duplex_eval_dataset import DuplexSample
 from .omni_duplex_eval_judge import DuplexJudge
 from .omni_duplex_eval_media import extract_jpeg, materialize_media, video_duration
@@ -60,7 +65,6 @@ def evaluate_sample(
         else {}
     )
     validate_clock(meta, allow_invalid=allow_invalid_clock)
-    items = normalize_response_items(raw)
     result: dict[str, Any] = {
         "id": sample.id,
         "family": sample.family,
@@ -71,6 +75,7 @@ def evaluate_sample(
         "judge_video_mode": judge_video_mode,
     }
     if sample.family == "rtd":
+        items = normalize_response_items(raw)
         video_path = materialize_media(sample.video, score_path.parent / ".media", sample.id, ".mp4")
         duration = sample.video_duration or video_duration(video_path)
         temporal_rows = []
@@ -147,9 +152,12 @@ def evaluate_sample(
             raise ValueError(f"missing proactive-reminder task type for split {sample.split!r}")
         task = sample.task_type
         times = _reminder_times(sample)
+        chunks = normalize_response_chunks(raw)
+        # Chunks keep their own boundary whitespace; legacy sentence items are stripped.
+        separator = "" if has_response_chunks(raw) else " "
         event_rows = []
         if task == "correction" or not times:
-            response = _text(items)
+            response = separator.join(chunk["text"] for chunk in chunks).strip()
             parsed = parse_judge_json(
                 judge.chat(build_reminder_prompt(sample.question_text, response, task, sample.answer1))
             )
@@ -157,7 +165,9 @@ def evaluate_sample(
         else:
             for start in times:
                 lo, hi = reminder_window(start, window_size)
-                response = " ".join(item["sentence"] for item in items if lo <= item["start"] <= hi)
+                response = separator.join(
+                    chunk["text"] for chunk in chunks if lo <= chunk["current_time"] <= hi
+                ).strip()
                 if not response:
                     event_rows.append({"start_time": start, "response_segment": "", "success_score": 0})
                 else:

@@ -12,7 +12,9 @@ import pytest
 
 from vllm_omni.benchmarks.duplex import omni_duplex_eval_eval as eval_module
 from vllm_omni.benchmarks.duplex.omni_duplex_eval_clock import (
+    extract_timed_chunks,
     extract_timed_sentences,
+    normalize_response_chunks,
     normalize_response_items,
     split_text,
     validate_clock,
@@ -254,6 +256,161 @@ def test_timed_sentences_keep_whitespace_only_deltas_between_tokens():
     events = [{"type": "response.output_text.delta", "delta": delta, "_media_clock_ms": 1000} for delta in deltas]
     timed = extract_timed_sentences(events)
     assert [item.sentence for item in timed] == ["There are exactly 12 dumplings."]
+
+
+def test_timed_chunks_group_deltas_by_media_time():
+    stamped = [("Look", 13000), (",", 13000), (" ", None), ("the", 14000), (" man", 14000), (" is back.", 18000)]
+    events = [
+        {"type": "response.output_text.delta", "delta": delta} | ({} if stamp is None else {"_media_clock_ms": stamp})
+        for delta, stamp in stamped
+    ]
+    assert [chunk.as_dict() for chunk in extract_timed_chunks(events)] == [
+        {"text": "Look, ", "current_time": 13.0},
+        {"text": "the man", "current_time": 14.0},
+        {"text": " is back.", "current_time": 18.0},
+    ]
+    # The same deltas form one sentence that starts before an 18 s window.
+    assert [item.as_dict() for item in extract_timed_sentences(events)] == [
+        {"sentence": "Look, the man is back.", "start": 13.0, "end": 18.0}
+    ]
+    with pytest.raises(ValueError, match="only clock=media"):
+        extract_timed_chunks([], clock="wall")
+
+
+def test_response_chunks_prefer_chunks_and_fall_back_to_sentences():
+    sentences = [{"sentence": "Look, the man is back.", "start": 13.0, "end": 18.0}]
+    chunks = [{"text": "is back.", "current_time": 18.0}]
+    published = {"sentences": sentences, "chunks": chunks}
+    assert normalize_response_chunks(published) == [{"text": "is back.", "current_time": 18.0}]
+    assert normalize_response_items(published) == [{"sentence": "Look, the man is back.", "start": 13.0, "end": 18.0}]
+    assert normalize_response_chunks(sentences) == [{"text": "Look, the man is back.", "current_time": 13.0}]
+    assert normalize_response_chunks({"sentences": sentences}) == normalize_response_chunks(sentences)
+    with pytest.raises(ValueError, match="chunks/sentences"):
+        normalize_response_chunks({"text": "x"})
+
+
+@pytest.mark.parametrize(
+    "response,expected_segment",
+    [
+        (
+            {
+                "sentences": [{"sentence": "Look, the man is back.", "start": 13.0, "end": 18.0}],
+                "chunks": [
+                    {"text": "Look,", "current_time": 13.0},
+                    {"text": "the man", "current_time": 14.0},
+                    {"text": "is back.", "current_time": 18.0},
+                ],
+            },
+            "is back.",
+        ),
+        ([{"sentence": "Look, the man is back.", "start": 13.0, "end": 18.0}], ""),
+    ],
+    ids=["chunks", "legacy-sentences"],
+)
+def test_reminder_window_selects_chunks_by_output_time(tmp_path, response, expected_segment):
+    response_path = tmp_path / "265.json"
+    response_path.write_text(json.dumps(response), encoding="utf-8")
+    response_path.with_name("265.meta.json").write_text(json.dumps({"clock": "media"}), encoding="utf-8")
+    judged = []
+
+    class Judge:
+        def chat(self, prompt):
+            judged.append(prompt)
+            return '{"success_score": 1, "reasoning": "reminded"}'
+
+    sample = DuplexSample(
+        id="265",
+        split="PR_post_event_reminder",
+        family="pr",
+        task_type="post_event_reminder",
+        video=None,
+        question_text="Remind me when the man comes back.",
+        reminder1="18.0",
+    )
+    score = eval_module.evaluate_sample(sample, response_path, tmp_path / "score.json", Judge())
+    (event,) = score["pr"]["events"]
+    assert event["start_time"] == 18.0
+    assert event["response_segment"] == expected_segment
+    assert len(judged) == (1 if expected_segment else 0)
+    assert score["pr"]["all_success"] is bool(expected_segment)
+
+
+@pytest.mark.parametrize(
+    "task_type,chunks,expected",
+    [
+        (
+            "post_event_reminder",
+            [{"text": "dump", "current_time": 13.0}, {"text": "lings", "current_time": 13.08}],
+            "dumplings",
+        ),
+        (
+            "post_event_reminder",
+            [{"text": "你", "current_time": 13.0}, {"text": "好", "current_time": 13.08}],
+            "你好",
+        ),
+        (
+            "correction",
+            [{"text": "hello ", "current_time": 1.0}, {"text": "world", "current_time": 1.2}],
+            "hello world",
+        ),
+    ],
+    ids=["split-word", "cjk", "inter-word-space"],
+)
+def test_reminder_text_joins_chunks_without_inserting_spaces(tmp_path, task_type, chunks, expected):
+    response_path = tmp_path / "sample.json"
+    response_path.write_text(json.dumps({"sentences": [], "chunks": chunks}), encoding="utf-8")
+    response_path.with_name("sample.meta.json").write_text(json.dumps({"clock": "media"}), encoding="utf-8")
+    seen = []
+
+    class Judge:
+        def chat(self, prompt):
+            seen.append(prompt)
+            return '{"success_score": 1, "reasoning": "ok"}'
+
+    sample = DuplexSample(
+        id="sample",
+        split="PR_correction" if task_type == "correction" else "PR_post_event_reminder",
+        family="pr",
+        task_type=task_type,
+        video=None,
+        question_text="Watch this.",
+        reminder1=None if task_type == "correction" else "13.0",
+        answer1="right",
+    )
+    eval_module.evaluate_sample(sample, response_path, tmp_path / "score.json", Judge())
+    assert expected in seen[0]
+    assert "dump lings" not in seen[0]
+    assert "你 好" not in seen[0]
+
+
+@pytest.mark.parametrize("task_type", ["post_event_reminder", "correction"])
+def test_legacy_sentence_responses_keep_space_between_sentences(tmp_path, task_type):
+    response_path = tmp_path / "sample.json"
+    sentences = [
+        {"sentence": "Got it.", "start": 13.0, "end": 13.5},
+        {"sentence": "Let me check.", "start": 14.0, "end": 14.5},
+    ]
+    response_path.write_text(json.dumps(sentences), encoding="utf-8")
+    response_path.with_name("sample.meta.json").write_text(json.dumps({"clock": "media"}), encoding="utf-8")
+    seen = []
+
+    class Judge:
+        def chat(self, prompt):
+            seen.append(prompt)
+            return '{"success_score": 1, "reasoning": "ok"}'
+
+    sample = DuplexSample(
+        id="sample",
+        split="PR_correction" if task_type == "correction" else "PR_post_event_reminder",
+        family="pr",
+        task_type=task_type,
+        video=None,
+        question_text="Watch this.",
+        reminder1=None if task_type == "correction" else "13.0",
+        answer1="right",
+    )
+    score = eval_module.evaluate_sample(sample, response_path, tmp_path / "score.json", Judge())
+    assert score["pr"]["events"][0]["response_segment"] == "Got it. Let me check."
 
 
 def test_protocol_windows_and_parsing():
