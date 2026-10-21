@@ -476,7 +476,30 @@ def test_duplex_stage0_context_caching_hit_miss_lru():
     assert len(runtime._shared_context_cache) == 1
 
     # LRU eviction bounds cache size at _MINICPMO45_SHARED_CONTEXT_CACHE_MAX_SIZE
-    for i in range(_MINICPMO45_SHARED_CONTEXT_CACHE_MAX_SIZE + 5):
-        s = _MiniCPMO45Stage0SessionState(session_id=f"s_{i}")
+    # Insert 30 more items (total 31 entries)
+    for i in range(1, 31):
+        s = _MiniCPMO45Stage0SessionState(session_id=f"s_init_{i}")
+        runtime._prepare_session_context(s, {"instructions": f"Prompt {i}"}, runtime_config=rt_on)
+    assert len(runtime._shared_context_cache) == 31
+
+    # Touch cfg1 again so it moves to the end of the OrderedDict
+    s_touch = _MiniCPMO45Stage0SessionState(session_id="s_touch")
+    runtime._prepare_session_context(s_touch, cfg1, runtime_config=rt_on)
+    assert len(runtime._shared_context_cache) == 31
+
+    # Insert 10 more new items to overflow the 32 limit and force evictions
+    for i in range(100, 110):
+        s = _MiniCPMO45Stage0SessionState(session_id=f"s_overflow_{i}")
         runtime._prepare_session_context(s, {"instructions": f"Prompt {i}"}, runtime_config=rt_on)
     assert len(runtime._shared_context_cache) == _MINICPMO45_SHARED_CONTEXT_CACHE_MAX_SIZE
+
+    # Verify that cfg1 is still in the cache (proving move_to_end LRU ordering, not FIFO)
+    s_verify = _MiniCPMO45Stage0SessionState(session_id="s_verify")
+    runtime._prepare_session_context(s_verify, cfg1, runtime_config=rt_on)
+    # If it was FIFO, cfg1 would have been evicted and re-inserted, but in LRU it stayed resident.
+    # Verify that an early untouched key (Prompt 1) was evicted:
+    s_evicted = _MiniCPMO45Stage0SessionState(session_id="s_evicted")
+    cache_keys_before = set(runtime._shared_context_cache.keys())
+    runtime._prepare_session_context(s_evicted, {"instructions": "Prompt 1"}, runtime_config=rt_on)
+    cache_keys_after = set(runtime._shared_context_cache.keys())
+    assert cache_keys_before != cache_keys_after

@@ -337,10 +337,7 @@ class MiniCPMO45Stage0DuplexRuntime:
                 p_embeds.append(embed)
                 p_tokens.append(token_id)
             if ref_audio is not None:
-                # Detect if the streaming fallback is taken
-                process_audio = getattr(self.processor, "process_audio", None)
-                is_streaming_path = not callable(process_audio)
-                ref_audio_embeds = self._stage_ref_audio_embeddings(ref_audio, state=state)
+                ref_audio_embeds, is_streaming_path = self._stage_ref_audio_embeddings(ref_audio, state=state)
                 if ref_audio_embeds is not None:
                     ref_audio_embeds = self._as_2d_tensor(ref_audio_embeds)
                     placeholder_ids = [self.unit_token_id] * int(ref_audio_embeds.shape[0])
@@ -1163,7 +1160,7 @@ class MiniCPMO45Stage0DuplexRuntime:
         ref_audio: NDArray[np.float32],
         *,
         state: _MiniCPMO45Stage0SessionState | None = None,
-    ) -> torch.Tensor | None:
+    ) -> tuple[torch.Tensor | None, bool]:
         process_audio = getattr(self.processor, "process_audio", None)
         if callable(process_audio):
             batch_feature = process_audio([ref_audio])
@@ -1176,18 +1173,19 @@ class MiniCPMO45Stage0DuplexRuntime:
                     try:
                         chunk_length = getattr(getattr(target, "config", None), "audio_chunk_length", None)
                         if chunk_length is not None:
-                            return self._cat_nested_tensors(
-                                get_audio_embedding(batch_feature, chunk_length=chunk_length)
+                            return (
+                                self._cat_nested_tensors(get_audio_embedding(batch_feature, chunk_length=chunk_length)),
+                                False,
                             )
                     except TypeError:
                         pass
-                    return self._cat_nested_tensors(get_audio_embedding(batch_feature))
+                    return self._cat_nested_tensors(get_audio_embedding(batch_feature)), False
                 # The split vLLM stage0 wrapper ports official
                 # get_audio_embedding(chunk_length=...) as
                 # get_audio_hidden_states (chunk_length comes from config).
                 get_hidden = getattr(target, "get_audio_hidden_states", None)
                 if callable(get_hidden):
-                    return self._cat_nested_tensors(get_hidden(batch_feature))
+                    return self._cat_nested_tensors(get_hidden(batch_feature)), False
         # The split vLLM stage0 wrapper may only expose the streaming encoder
         # path.  Use it as a fallback so the server-resolved reference audio is
         # still represented in the same system context location as official
@@ -1202,7 +1200,7 @@ class MiniCPMO45Stage0DuplexRuntime:
         ):
             with suppress(Exception):
                 setattr(batch_feature, name, value)
-        return self._stage_audio_embeddings(batch_feature, state=state)
+        return self._stage_audio_embeddings(batch_feature, state=state), True
 
     @staticmethod
     def _ensure_dynamic_cache_compat() -> None:
