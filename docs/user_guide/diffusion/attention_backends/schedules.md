@@ -51,6 +51,9 @@ fewer steps on the base configuration.
 CFG evaluations share one step index.
 Each S2V clip and each H3 seed/continuation window restarts at step 0.
 Prompt encoding and decoding run with the base configuration.
+HunyuanImage-3.0 computes the prompt K/V inside the step-0 DiT forward with the
+step-0 profile and reuses it on later steps; only the AR KV-reuse prefill runs
+with the base configuration.
 
 ## Server configuration
 
