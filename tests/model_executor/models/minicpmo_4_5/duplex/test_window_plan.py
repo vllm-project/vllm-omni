@@ -415,9 +415,9 @@ def test_cross_session_context_cache_and_segmented_anchor_protection():
     )
     plan = plan_position_reanchor(
         geometry,
-        computed_tokens=4600,
+        computed_tokens=4624,
         pending_tokens=0,
-        unit_tokens=[256, 512, 1024],
+        unit_tokens=[512] * 9,
     )
     assert plan is not None
     # Sink blocks must be strictly preserved across reanchor
@@ -443,7 +443,7 @@ def test_duplex_stage0_context_caching_hit_miss_lru():
         thinker=SimpleNamespace(config=SimpleNamespace()),
         processor=SimpleNamespace(
             tokenizer=SimpleNamespace(
-                encode=lambda text: [100 + len(text)],
+                encode=lambda text, **kwargs: [100 + len(text)],
             )
         ),
     )
@@ -493,13 +493,10 @@ def test_duplex_stage0_context_caching_hit_miss_lru():
         runtime._prepare_session_context(s, {"instructions": f"Prompt {i}"}, runtime_config=rt_on)
     assert len(runtime._shared_context_cache) == _MINICPMO45_SHARED_CONTEXT_CACHE_MAX_SIZE
 
-    # Verify that cfg1 is still in the cache (proving move_to_end LRU ordering, not FIFO)
-    s_verify = _MiniCPMO45Stage0SessionState(session_id="s_verify")
-    runtime._prepare_session_context(s_verify, cfg1, runtime_config=rt_on)
-    # If it was FIFO, cfg1 would have been evicted and re-inserted, but in LRU it stayed resident.
-    # Verify that an early untouched key (Prompt 1) was evicted:
-    s_evicted = _MiniCPMO45Stage0SessionState(session_id="s_evicted")
-    cache_keys_before = set(runtime._shared_context_cache.keys())
-    runtime._prepare_session_context(s_evicted, {"instructions": "Prompt 1"}, runtime_config=rt_on)
-    cache_keys_after = set(runtime._shared_context_cache.keys())
-    assert cache_keys_before != cache_keys_after
+    # Verify membership directly to prove LRU vs FIFO:
+    # cfg1 was re-accessed (touch) before overflow, so under LRU it remains in cache.
+    # Prompt 1 was inserted early and never re-accessed, so under LRU it was evicted.
+    key_cfg1 = ("Prompt A", False, None, None)
+    key_prompt1 = ("Prompt 1", False, None, None)
+    assert key_cfg1 in runtime._shared_context_cache
+    assert key_prompt1 not in runtime._shared_context_cache
