@@ -52,7 +52,7 @@ def test_single_stream_bsnd_contract(monkeypatch, batch, heads, dim, interleaved
     q, k, v = [x.unflatten(-1, (heads, dim)) for x in packed.chunk(3, dim=-1)]
     assert not q.is_contiguous()
     theta = torch.randn(7, dim // 2)
-    tables = fused.prepare_qkv_norm_rope_tables(theta.cos(), theta.sin(), interleaved=interleaved, dtype=q.dtype)
+    tables = fused.prepare_norm_rope_concat_tables(theta.cos(), theta.sin(), interleaved=interleaved, dtype=q.dtype)
     weight = torch.ones(dim)
     calls = []
 
@@ -163,7 +163,9 @@ def test_single_stream_npu_against_fp32_reference(npu_family, batch, heads, dim,
         q, k, v = [t.unflatten(-1, (heads, dim)) for t in packed.chunk(3, -1)]
         weight = torch.randn(dim, device="npu", dtype=q.dtype)
         theta = torch.randn(17, dim // 2, device="npu")
-        cos, sin = fused.prepare_qkv_norm_rope_tables(theta.cos(), theta.sin(), interleaved=interleaved, dtype=q.dtype)
+        cos, sin = fused.prepare_norm_rope_concat_tables(
+            theta.cos(), theta.sin(), interleaved=interleaved, dtype=q.dtype
+        )
         result = fused.try_fused_qkv_norm_rope(
             q, k, v, weight, weight, (cos, sin), _EPS, head_dim=dim, rotary_dim=dim, interleaved=interleaved
         )

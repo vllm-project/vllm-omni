@@ -39,7 +39,7 @@ from vllm_omni.diffusion.layers.exact_bf16_pointwise import residual, rotary, si
 from vllm_omni.diffusion.layers.exact_bf16_qk_norm_rope import qk_rotary
 from vllm_omni.diffusion.layers.fused_qk_norm_rope import (
     norm_rope_concat_available,
-    prepare_qkv_norm_rope_tables,
+    prepare_norm_rope_concat_tables,
     try_fused_qkv_norm_rope,
 )
 from vllm_omni.diffusion.models.qwen_image_21.decode_graph import QwenImage21DecodeGraphManager
@@ -557,6 +557,43 @@ class QwenImage21Attention(nn.Module):
         # dispatches by platform, not tensor device, so it cannot serve CPU tensors).
         return _apply_qwen_image21_rotary_emb_native(x, freqs)
 
+    def _try_fused_qkv_norm_rope(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        freqs: torch.Tensor,
+        norm_rope_concat_tables: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        """Try fused normalization/rotation, returning BSND Q/K/V or None.
+
+        norm_rope_concat uses optional expanded cos/sin tables. The existing
+        qk_rotary path consumes Qwen's complex freqs and preserves the original V.
+        """
+        if self.norm_q.bias is not None or self.norm_k.bias is not None or self.norm_q.eps != self.norm_k.eps:
+            return None
+
+        if norm_rope_concat_tables is not None:
+            fused_qkv = try_fused_qkv_norm_rope(
+                query,
+                key,
+                value,
+                self.norm_q.weight,
+                self.norm_k.weight,
+                norm_rope_concat_tables,
+                self.norm_q.eps,
+                head_dim=self.head_dim,
+                rotary_dim=self.head_dim,
+                interleaved=True,
+            )
+            if fused_qkv is not None:
+                return fused_qkv
+
+        fused_qk = qk_rotary(query, key, self.norm_q.weight, self.norm_k.weight, freqs, self.norm_q.eps)
+        if fused_qk is not None:
+            return fused_qk[0], fused_qk[1], value
+        return None
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -567,7 +604,7 @@ class QwenImage21Attention(nn.Module):
         kv_cache: dict[str, dict[str, torch.Tensor]] | None = None,
         cache_branch: str = "cond",
         cache_write_len: int | None = None,
-        rope_tables: tuple[torch.Tensor, torch.Tensor] | None = None,
+        norm_rope_concat_tables: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         r"""
         Args:
@@ -588,6 +625,8 @@ class QwenImage21Attention(nn.Module):
             cache_branch (`str`): CFG branch whose cache entry is read/written this forward.
             cache_write_len (`int`, *optional*): Prefill mode — cache the first `cache_write_len` K/V positions.
                 `None` with a populated branch means decode — cached prefix K/V are prepended instead.
+            norm_rope_concat_tables (tuple, *optional*): Expanded `(cos, sin)` for norm_rope_concat only.
+                The existing CUDA fusion and independent rotary paths use `freqs` directly.
         """
         batch_size, seq_len, _ = hidden_states.shape
 
@@ -600,27 +639,11 @@ class QwenImage21Attention(nn.Module):
         key = key.unflatten(-1, (self.num_kv_heads, self.head_dim))
         value = value.unflatten(-1, (self.num_kv_heads, self.head_dim))
 
-        fused_qkv = fused_qk = None
-        if self.norm_q.bias is None and self.norm_k.bias is None and self.norm_q.eps == self.norm_k.eps:
-            if rope_tables is not None:
-                fused_qkv = try_fused_qkv_norm_rope(
-                    query,
-                    key,
-                    value,
-                    self.norm_q.weight,
-                    self.norm_k.weight,
-                    rope_tables,
-                    self.norm_q.eps,
-                    head_dim=self.head_dim,
-                    rotary_dim=self.head_dim,
-                    interleaved=True,
-                )
-            if fused_qkv is None:
-                fused_qk = qk_rotary(query, key, self.norm_q.weight, self.norm_k.weight, freqs, self.norm_q.eps)
+        fused_qkv = self._try_fused_qkv_norm_rope(
+            query, key, value, freqs, norm_rope_concat_tables=norm_rope_concat_tables
+        )
         if fused_qkv is not None:
             query, key, value = fused_qkv
-        elif fused_qk is not None:
-            query, key = fused_qk
         else:
             query = self.norm_q(query).to(value.dtype)
             key = self.norm_k(key).to(value.dtype)
@@ -756,7 +779,7 @@ class QwenImage21TransformerBlock(nn.Module):
         cache_write_len: int | None = None,
         prepared_modulation: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
         _pointwise_validated: bool = False,
-        rope_tables: tuple[torch.Tensor, torch.Tensor] | None = None,
+        norm_rope_concat_tables: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         if prepared_modulation is None:
             mod1, mod2 = modulation.chunk(2, dim=-1)
@@ -774,7 +797,7 @@ class QwenImage21TransformerBlock(nn.Module):
             kv_cache=kv_cache,
             cache_branch=cache_branch,
             cache_write_len=cache_write_len,
-            rope_tables=rope_tables,
+            norm_rope_concat_tables=norm_rope_concat_tables,
         )
         use_inplace_residual = (
             hidden_states.device.type == "npu"
@@ -1290,7 +1313,7 @@ class QwenImage21Transformer2DModel(CachedTransformer):
         freqs = torch.cat([prefix_freqs, target_freqs], dim=0)
         # Prepare once after SP hooks select/pad the local sequence. Each block
         # still checks its actual projection/weight dtype before using fusion.
-        rope_tables = None
+        norm_rope_concat_tables = None
         # Keep this backend eager-only until SD has a validated Fake/Meta contract.
         if (
             self._enforce_eager
@@ -1298,7 +1321,7 @@ class QwenImage21Transformer2DModel(CachedTransformer):
             and not torch.compiler.is_compiling()
             and norm_rope_concat_available(joint_hidden_states.device)
         ):
-            rope_tables = prepare_qkv_norm_rope_tables(
+            norm_rope_concat_tables = prepare_norm_rope_concat_tables(
                 freqs.real, freqs.imag, interleaved=True, dtype=joint_hidden_states.dtype
             )
         prefix_len = prefix_hidden_states.shape[1]
@@ -1453,7 +1476,7 @@ class QwenImage21Transformer2DModel(CachedTransformer):
                 cache_write_len=cache_write_len,
                 prepared_modulation=prepared_modulation,
                 _pointwise_validated=pointwise_validated,
-                rope_tables=rope_tables,
+                norm_rope_concat_tables=norm_rope_concat_tables,
             )
 
         if (
