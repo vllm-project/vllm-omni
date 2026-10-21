@@ -60,6 +60,7 @@ COSMOS3_OMNI_DEPLOY_PIPELINE = PipelineConfig(
             input_sources=(),
             final_output=True,
             final_output_type="video",
+            supported_output_types=["image", "video"],
             model_arch="Cosmos3OmniDiffusersPipeline",
         ),
     ),

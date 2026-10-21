@@ -56,6 +56,7 @@ def test_stage_client_forwards_renderer_to_the_actual_upstream_constructor(dp_si
         engine_input_source=[],
         final_output=True,
         final_output_type="text",
+        supported_output_types=["text"],
         default_sampling_params=SamplingParams(),
         custom_process_input_func=None,
         model_stage=None,

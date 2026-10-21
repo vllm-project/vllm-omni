@@ -698,6 +698,7 @@ class TestPromptUpdateIntegration:
             engine_input_source=[],
             final_output=True,
             final_output_type="image",
+            supported_output_types=["image"],
             default_sampling_params=OmniDiffusionSamplingParams(),
             custom_process_input_func=None,
             model_stage=None,
@@ -776,6 +777,7 @@ class TestPromptUpdateIntegration:
                     stage_type="diffusion",
                     final_output=True,
                     final_output_type="image",
+                    supported_output_types=["image"],
                 )
             ]
             self.stage_configs: list[Any] = [SimpleNamespace(stage_type="diffusion")]

@@ -93,6 +93,7 @@ def test_stage_engine_core_client_builds_payload_sender_info_after_base_init(
         engine_input_source=[],
         final_output=False,
         final_output_type=None,
+        supported_output_types=None,
         default_sampling_params=None,
         prompt_transform_func=None,
         prompt_expand_func=None,

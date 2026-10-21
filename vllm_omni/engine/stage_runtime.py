@@ -82,6 +82,7 @@ logger = init_logger(__name__)
 class StageRuntimeInfo:
     final_output: bool
     final_output_type: FinalOutputModalityType | None
+    supported_output_types: list[str] | None
     stage_type: str
     model_stage: str | None = None
 

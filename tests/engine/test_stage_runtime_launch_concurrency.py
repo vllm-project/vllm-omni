@@ -62,6 +62,7 @@ def _plan(stage_id: int, device: str) -> LogicalStageInitPlan:
         engine_input_source=[],
         final_output=False,
         final_output_type=None,
+        supported_output_types=None,
         default_sampling_params=SamplingParams(),
         custom_process_input_func=None,
         model_stage="dummy",

@@ -44,6 +44,7 @@ def _stage_meta(*, stage_type: str, final_output: bool, final_output_type: str |
         stage_type=stage_type,
         final_output=final_output,
         final_output_type=final_output_type,
+        supported_output_types=[final_output_type],
     )
 
 
@@ -222,7 +223,11 @@ def test_disabled_stage_metrics_preserve_speech_completion_without_full_merge(mo
     base.collect_stage_metrics = False
     base._enable_ar_profiler = False
     base.engine.get_stage_metadata.return_value = StageRuntimeInfo(
-        stage_type="llm", final_output=True, final_output_type="audio", model_stage="code2wav"
+        stage_type="llm",
+        final_output=True,
+        final_output_type="audio",
+        supported_output_types=["audio"],
+        model_stage="code2wav",
     )
     base._publish_request_gauges = MagicMock()
     metrics = OrchestratorAggregator(2, False, 0.0, 1)

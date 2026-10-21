@@ -136,7 +136,9 @@ def test_build_add_request_message_preserves_additional_information(mocker: Mock
     engine = object.__new__(AsyncOmniEngine)
     params = SamplingParams(max_tokens=8)
     engine.default_sampling_params_list = [params]
-    engine.stage_metadata = [StageRuntimeInfo(final_output=False, final_output_type=None, stage_type="llm")]
+    engine.stage_metadata = [
+        StageRuntimeInfo(final_output=False, final_output_type=None, supported_output_types=None, stage_type="llm")
+    ]
     engine.supported_tasks = ("speech",)
 
     input_processor = mocker.Mock()
@@ -178,7 +180,9 @@ def test_build_add_request_message_preserves_kv_hints_after_omni_payload_upgrade
     engine = object.__new__(AsyncOmniEngine)
     params = SamplingParams(max_tokens=8)
     engine.default_sampling_params_list = [params]
-    engine.stage_metadata = [StageRuntimeInfo(final_output=False, final_output_type=None, stage_type="llm")]
+    engine.stage_metadata = [
+        StageRuntimeInfo(final_output=False, final_output_type=None, supported_output_types=None, stage_type="llm")
+    ]
     engine.supported_tasks = ("generate",)
     processor = mocker.create_autospec(InputProcessor, instance=True)
     hints = KvHintsEnvelope("1", "hint-message", [])
@@ -206,7 +210,9 @@ def test_build_add_request_message_injects_global_id_before_prompt_transform(moc
     engine = object.__new__(AsyncOmniEngine)
     params = SamplingParams(max_tokens=8)
     engine.default_sampling_params_list = [params]
-    engine.stage_metadata = [StageRuntimeInfo(final_output=False, final_output_type=None, stage_type="llm")]
+    engine.stage_metadata = [
+        StageRuntimeInfo(final_output=False, final_output_type=None, supported_output_types=None, stage_type="llm")
+    ]
     engine.supported_tasks = ("speech",)
 
     input_processor = mocker.Mock()
@@ -239,7 +245,9 @@ def test_build_add_request_message_preserves_model_intermediate_buffer(mocker: M
     engine = object.__new__(AsyncOmniEngine)
     params = SamplingParams(max_tokens=8)
     engine.default_sampling_params_list = [params]
-    engine.stage_metadata = [StageRuntimeInfo(final_output=False, final_output_type=None, stage_type="llm")]
+    engine.stage_metadata = [
+        StageRuntimeInfo(final_output=False, final_output_type=None, supported_output_types=None, stage_type="llm")
+    ]
     engine.supported_tasks = ("speech",)
 
     input_processor = mocker.Mock()
@@ -309,7 +317,9 @@ def test_build_add_request_message_with_resumable_streaming(mocker: MockerFixtur
     engine = object.__new__(AsyncOmniEngine)
     params = SamplingParams(max_tokens=8)
     engine.default_sampling_params_list = [params]
-    engine.stage_metadata = [StageRuntimeInfo(final_output=False, final_output_type=None, stage_type="llm")]
+    engine.stage_metadata = [
+        StageRuntimeInfo(final_output=False, final_output_type=None, supported_output_types=None, stage_type="llm")
+    ]
     engine.supported_tasks = ("generate",)
 
     input_processor = mocker.Mock()
@@ -381,7 +391,9 @@ def test_build_add_request_message_scopes_mm_uuids_to_selected_stage0_replica(mo
     params = SamplingParams(max_tokens=8)
     engine.model = "test-model"
     engine.default_sampling_params_list = [params]
-    engine.stage_metadata = [StageRuntimeInfo(final_output=False, final_output_type=None, stage_type="llm")]
+    engine.stage_metadata = [
+        StageRuntimeInfo(final_output=False, final_output_type=None, supported_output_types=None, stage_type="llm")
+    ]
     engine.supported_tasks = ("generate",)
     engine.stage_pools = [StagePool(0, [_FakeStageClient(), _FakeStageClient()])]
 
@@ -417,7 +429,9 @@ def _two_replica_engine_recording_uuids(mocker: MockerFixture) -> tuple[AsyncOmn
     params = SamplingParams(max_tokens=8)
     engine.model = "test-model"
     engine.default_sampling_params_list = [params]
-    engine.stage_metadata = [StageRuntimeInfo(final_output=False, final_output_type=None, stage_type="llm")]
+    engine.stage_metadata = [
+        StageRuntimeInfo(final_output=False, final_output_type=None, supported_output_types=None, stage_type="llm")
+    ]
     engine.supported_tasks = ("generate",)
     engine.stage_pools = [StagePool(0, [_FakeStageClient(), _FakeStageClient()])]
 
@@ -551,7 +565,9 @@ async def test_build_add_request_message_scopes_mm_uuids_to_distributed_stage0_r
     params = SamplingParams(max_tokens=8)
     engine.model = "test-model"
     engine.default_sampling_params_list = [params]
-    engine.stage_metadata = [StageRuntimeInfo(final_output=False, final_output_type=None, stage_type="llm")]
+    engine.stage_metadata = [
+        StageRuntimeInfo(final_output=False, final_output_type=None, supported_output_types=None, stage_type="llm")
+    ]
     engine.supported_tasks = ("generate",)
 
     addr0 = "tcp://host-a:1000/input"
@@ -606,7 +622,9 @@ def test_build_add_request_message_skips_distributed_mm_scope_when_no_replica(mo
     params = SamplingParams(max_tokens=8)
     engine.model = "test-model"
     engine.default_sampling_params_list = [params]
-    engine.stage_metadata = [StageRuntimeInfo(final_output=False, final_output_type=None, stage_type="llm")]
+    engine.stage_metadata = [
+        StageRuntimeInfo(final_output=False, final_output_type=None, supported_output_types=None, stage_type="llm")
+    ]
     engine.supported_tasks = ("generate",)
 
     addr0 = "tcp://host-a:1000/input"
@@ -661,7 +679,9 @@ def test_build_add_request_message_releases_preselected_replica_on_preprocess_er
     params = SamplingParams(max_tokens=8)
     engine.model = "test-model"
     engine.default_sampling_params_list = [params]
-    engine.stage_metadata = [StageRuntimeInfo(final_output=False, final_output_type=None, stage_type="llm")]
+    engine.stage_metadata = [
+        StageRuntimeInfo(final_output=False, final_output_type=None, supported_output_types=None, stage_type="llm")
+    ]
     engine.supported_tasks = ("generate",)
     stage_pool = StagePool(0, [_FakeStageClient(), _FakeStageClient()])
     engine.stage_pools = [stage_pool]

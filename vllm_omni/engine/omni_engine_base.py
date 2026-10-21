@@ -438,6 +438,7 @@ class OmniEngineBase:
             StageRuntimeInfo(
                 final_output=client.final_output,
                 final_output_type=client.final_output_type,
+                supported_output_types=client.supported_output_types,
                 stage_type=client.stage_type,
                 model_stage=getattr(client, "model_stage", None),
             )
@@ -446,8 +447,24 @@ class OmniEngineBase:
         supported_tasks: set[str] = set()
         if any(getattr(stage_config, "is_comprehension", False) for stage_config in self.stage_configs):
             supported_tasks.add("generate")
-        if any(meta.final_output_type == "audio" for meta in self.stage_metadata):
+        if any(
+            "audio" in metadata.supported_output_types
+            for metadata in self.stage_metadata
+            if metadata.supported_output_types is not None
+        ):
             supported_tasks.add("speech")
+        if any(
+            "image" in metadata.supported_output_types
+            for metadata in self.stage_metadata
+            if metadata.supported_output_types is not None
+        ):
+            supported_tasks.add("x2i")
+        if any(
+            "video" in metadata.supported_output_types
+            for metadata in self.stage_metadata
+            if metadata.supported_output_types is not None
+        ):
+            supported_tasks.add("x2v")
         self.supported_tasks = tuple(supported_tasks) if supported_tasks else ("generate",)
 
     def _bootstrap_orchestrator(

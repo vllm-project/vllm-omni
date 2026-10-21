@@ -149,6 +149,7 @@ class StageEngineCoreClientBase(StageClientBase):
             self.engine_input_source = metadata.engine_input_source
             self.final_output = metadata.final_output
             self.final_output_type = metadata.final_output_type
+            self.supported_output_types = metadata.supported_output_types
             self.default_sampling_params = metadata.default_sampling_params
             self.prompt_transform_func = metadata.prompt_transform_func
             self.prompt_expand_func = metadata.prompt_expand_func

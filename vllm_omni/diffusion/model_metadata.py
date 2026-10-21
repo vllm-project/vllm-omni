@@ -17,6 +17,7 @@ class DiffusionModelMetadata:
     supported_control_upload_types: tuple[str, ...] = ()
     attention_mask_free: bool = False
     final_output_type: str | None = None
+    supported_output_types: list[str] | None = None
     # Whether ``/v1/videos`` accepts source media plus per-token video/audio
     # noise masks for latent initialization. Unknown pipelines must remain
     # opted out so uploaded files never reach a model that cannot consume them.
@@ -147,10 +148,12 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
     "Cosmos3OmniDiffusersPipeline": DiffusionModelMetadata(
         supported_control_upload_types=("edge", "blur", "depth", "seg", "wsm"),
         final_output_type="video",
+        supported_output_types=["image", "video"],
     ),
     "Cosmos3OmniPipeline": DiffusionModelMetadata(
         supported_control_upload_types=("edge", "blur", "depth", "seg", "wsm"),
         final_output_type="video",
+        supported_output_types=["image", "video"],
     ),
     "SanaVideoPipeline": DiffusionModelMetadata(final_output_type="video"),
     "SanaImageToVideoPipeline": DiffusionModelMetadata(final_output_type="video"),

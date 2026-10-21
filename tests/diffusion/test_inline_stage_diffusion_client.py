@@ -47,6 +47,7 @@ def client(mock_engine):
         engine_input_source="prompt",
         final_output=True,
         final_output_type="image",
+        supported_output_types=["image"],
         default_sampling_params={},
         custom_process_input_func=None,
         model_stage=None,

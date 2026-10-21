@@ -112,6 +112,7 @@ _STAGE2: dict[str, Any] = dict(
     engine_input_source=[1],
     final_output=True,
     final_output_type="audio",
+    supported_output_types=["audio"],
     default_sampling_params=None,
     custom_process_input_func=None,
     model_stage="code2wav",

@@ -1736,6 +1736,13 @@ class BaseVllmOmniStageConfig:
         return self.stage_pipeline_config.final_output_type
 
     @property
+    def supported_output_types(self) -> list[str]:
+        if self.stage_pipeline_config.supported_output_types is not None:
+            return self.stage_pipeline_config.supported_output_types
+        else:
+            return [self.final_output_type]
+
+    @property
     def hf_config_name(self) -> str | None:
         return self.stage_pipeline_config.hf_config_name
 

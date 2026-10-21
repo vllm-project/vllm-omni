@@ -346,6 +346,7 @@ class StagePipelineConfig:
     input_sources: tuple[int, ...] = ()
     final_output: bool = False
     final_output_type: str | None = None
+    supported_output_types: list[str] | None = None
     owns_tokenizer: bool = False
     requires_multimodal_data: bool = False
     hf_config_name: str | None = None
@@ -1533,6 +1534,9 @@ def merge_pipeline_deploy(
                 custom_process_input_func=input_proc,
                 final_output=ps.final_output,
                 final_output_type=ps.final_output_type,
+                supported_output_types=list(ps.supported_output_types)
+                if ps.supported_output_types is not None
+                else None,
                 worker_type=worker_type,
                 scheduler_cls=ps.scheduler_cls or _scheduler_path(sched_cls),
                 hf_config_name=ps.hf_config_name,
@@ -1562,6 +1566,7 @@ class StageConfig:
     custom_process_input_func: str | None = None
     final_output: bool = False
     final_output_type: str | None = None
+    supported_output_types: list[str] | None = None
     worker_type: str | None = None
     scheduler_cls: str | None = None
     hf_config_name: str | None = None
@@ -1649,6 +1654,7 @@ class StageConfig:
             "engine_input_source": self.input_sources,  # Legacy field name
             "final_output": self.final_output,
             "final_output_type": self.final_output_type,
+            "supported_output_types": self.supported_output_types,
             "is_comprehension": self.is_comprehension,
             "sampling_constraints": dict(self.sampling_constraints),
         }

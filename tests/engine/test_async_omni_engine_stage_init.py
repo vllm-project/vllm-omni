@@ -377,6 +377,7 @@ def test_async_omni_engine_initialize_stages_retains_stage0_prompt_transform(mon
         default_sampling_params=types.SimpleNamespace(),
         final_output=True,
         final_output_type="text",
+        supported_output_types=["text"],
         stage_type="llm",
         model_stage="text_encoder",
         is_comprehension=True,
@@ -2339,6 +2340,7 @@ def test_extract_legacy_stage_metadata_rocm_does_not_inject_diffusion_attention(
         engine_input_source=[],
         final_output=False,
         final_output_type=None,
+        supported_output_types=None,
     )
 
     metadata = extract_legacy_stage_metadata(stage_cfg)

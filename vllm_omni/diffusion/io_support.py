@@ -55,6 +55,11 @@ def get_diffusion_output_type(model_class_name: str | None) -> str:
     return "image"
 
 
+def get_diffusion_supported_output_types(model_class_name: str | None) -> list[str]:
+    """Return the supported_output_types for a diffusion model."""
+    return get_diffusion_model_metadata(model_class_name).supported_output_types
+
+
 def get_dummy_run_num_frames(model_class_name: str, supports_audio_input: bool) -> int:
     """Get num_frames for the dummy warmup run. Returns 0 to skip warmup."""
 

@@ -38,7 +38,7 @@ from vllm_omni.config.stage_config import (
     normalize_pipeline_cli_overrides,
 )
 from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig
-from vllm_omni.diffusion.io_support import get_diffusion_output_type
+from vllm_omni.diffusion.io_support import get_diffusion_output_type, get_diffusion_supported_output_types
 from vllm_omni.diffusion.utils.hf_utils import _looks_like_dreamzero
 
 logger = init_logger(__name__)
@@ -652,7 +652,7 @@ class StageConfigFactory:
     def _normalize_default_diffusion(
         cls,
         kwargs: dict[str, Any],
-    ) -> tuple[dict[str, Any], DiffusionParallelConfig, dict[str, Any], str]:
+    ) -> tuple[dict[str, Any], DiffusionParallelConfig, dict[str, Any], str, list[str]]:
         """Normalize inputs shared by typed and compatibility diffusion builders."""
         kwargs = normalize_and_validate_diffusion_engine_ingress_kwargs(kwargs, stage_id=0)
         raw_sampling_params = kwargs.get("default_sampling_params")
@@ -681,12 +681,13 @@ class StageConfigFactory:
 
         model_class_name = engine_args.get("model_class_name")
         final_output_type = get_diffusion_output_type(model_class_name)
+        supported_output_types = get_diffusion_supported_output_types(model_class_name)
         logger.info(
             "Resolved generic diffusion final_output_type=%r for model_class_name=%r.",
             final_output_type,
             model_class_name,
         )
-        return engine_args, parallel_config, default_sampling_params, final_output_type
+        return engine_args, parallel_config, default_sampling_params, final_output_type, supported_output_types
 
     @classmethod
     def create_default_diffusion(cls, kwargs: dict[str, Any]) -> list[dict[str, Any]]:
@@ -696,8 +697,8 @@ class StageConfigFactory:
         this compatibility builder only adds Omni stage topology, request
         defaults, and device placement.
         """
-        engine_args, parallel_config, default_sampling_params, final_output_type = cls._normalize_default_diffusion(
-            kwargs
+        engine_args, parallel_config, default_sampling_params, final_output_type, supported_output_types = (
+            cls._normalize_default_diffusion(kwargs)
         )
         engine_args["parallel_config"] = asdict(parallel_config)
         engine_args["model_stage"] = "diffusion"
@@ -714,6 +715,7 @@ class StageConfigFactory:
                 "default_sampling_params": default_sampling_params,
                 "final_output": True,
                 "final_output_type": final_output_type,
+                "supported_output_types": supported_output_types,
             }
         ]
 
@@ -756,7 +758,7 @@ class StageConfigFactory:
             merged_parallel.pop("world_size", None)
             kwargs = {**kwargs, "parallel_config": merged_parallel}
 
-        engine_overrides, parallel_config, default_sampling_params, final_output_type = (
+        engine_overrides, parallel_config, default_sampling_params, final_output_type, supported_output_tasks = (
             cls._normalize_default_diffusion(kwargs)
         )
         engine_overrides.update(asdict(parallel_config))
@@ -771,6 +773,7 @@ class StageConfigFactory:
                     execution_type=StageExecutionType.DIFFUSION,
                     final_output=True,
                     final_output_type=final_output_type,
+                    supported_output_types=supported_output_tasks,
                 ),
             ),
         )
