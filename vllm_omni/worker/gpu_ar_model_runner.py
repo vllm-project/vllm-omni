@@ -12,6 +12,7 @@ from __future__ import annotations
 import gc
 import threading
 from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import Future, wait
 from contextlib import nullcontext
 from copy import copy
 from dataclasses import replace
@@ -42,6 +43,7 @@ from vllm.v1.worker.gpu_model_runner import (
 )
 from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 
+from vllm_omni.core.prefix_cache.interface import StageCacheOutputs
 from vllm_omni.data_entry_keys import flatten_payload
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
 from vllm_omni.distributed.omni_connectors.utils.config import stage_sends_async_output
@@ -368,6 +370,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
 
     execute_model_state: ExecuteModelState | None
     kv_extracted_req_ids: list[str] | None
+    _full_payload_output_future: Future[None] | None = None
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -658,6 +661,9 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         # 1. Unfreeze GC so model weights and GPU tensors are collected
         #    immediately when references are dropped (upstream Worker.shutdown
         #    also does this before any teardown).
+        if self._full_payload_output_future is not None:
+            wait([self._full_payload_output_future])
+            self._full_payload_output_future = None
         gc.unfreeze()
 
         # 2. Destroy talker MTP CUDA graph wrapper to release captured graphs.
@@ -873,7 +879,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         needs_scheduled_hidden_payload: bool,
         req_ids: list[str],
         step_id: int | None,
-    ) -> tuple[torch.Tensor | None, dict[str, torch.Tensor] | None, dict | None]:
+    ) -> tuple[torch.Tensor | None, StageCacheOutputs | None]:
         """Prefix-cache payload sources for the pooler payload build.
 
         req_ids must be the step's snapshot, not ``input_batch.req_ids``: under
@@ -891,9 +897,8 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             # there is no step context to consume; serve the fresh slice.
             if hidden_states_cpu is None and staged_hidden_states_cpu is not None:
                 hidden_states_cpu = staged_hidden_states_cpu
-            return hidden_states_cpu, None, None
-        combined_hidden, combined_mm = self._prefix_cache_materialize(step_id, list(req_ids))
-        return hidden_states_cpu, combined_hidden, combined_mm
+            return hidden_states_cpu, None
+        return hidden_states_cpu, self._prefix_cache_materialize(step_id, list(req_ids))
 
     def _build_omni_pooler_payload(
         self,
@@ -1035,6 +1040,10 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             if hasattr(self.model, "_clear_warmup_state"):
                 self.model._clear_warmup_state()
 
+        if scheduler_output.finished_req_ids and self._full_payload_output_future is not None:
+            self._full_payload_output_future.result()
+            self._full_payload_output_future = None
+
         # Exactly once per real scheduler_output, before _update_states
         # (dummy/warmup runs never reach execute_model).
         self._prefix_cache_step_begin(scheduler_output)
@@ -1059,7 +1068,9 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 flush_ids = set(getattr(scheduler_output, "finished_req_ids", set()))
                 flush_ids.update({rid for rid in self._pending_full_payload_send if rid not in self.requests})
                 if flush_ids:
-                    self.flush_full_payload_outputs(flush_ids)
+                    self.flush_full_payload_outputs(
+                        flush_ids, discarded_req_ids=getattr(scheduler_output, "discarded_req_ids", set())
+                    )
 
         # If ngram_gpu is used, we need to copy the scheduler_output to avoid
         # the modification has influence on the scheduler_output in engine core process.
@@ -1915,9 +1926,13 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         query_start_loc_cpu: Any,
         postprocess_already_applied: bool = False,
         prefix_cache_step_id: int | None = None,
+        scheduled_token_ranges: dict[str, tuple[int, int]] | None = None,
+        previous_full_payload_output: Future[None] | None = None,
     ) -> OmniModelRunnerOutput:
         combined_hidden_states = None
         combined_multimodal_outputs = None
+        cache_outputs = None
+        delivery = None
 
         engine_output_type, downstream_req_ids = self._resolve_pooler_payload_req_ids(req_ids_output_copy)
         downstream_req_ids, sparse_mm_index, audio_sparse_output = resolve_sparse_mm_routing(
@@ -1987,16 +2002,15 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             scheduled_seq_len = int(scheduler_output.total_num_scheduled_tokens)
             mm_cpu = None
             if self.omni_prefix_cache is not None:
-                (
-                    hidden_states_cpu,
-                    combined_hidden_states,
-                    combined_multimodal_outputs,
-                ) = self._prepare_prefix_cache_pooler_payload_sources(
+                hidden_states_cpu, cache_outputs = self._prepare_prefix_cache_pooler_payload_sources(
                     staged_hidden_states_cpu=staged_hidden_states_cpu,
                     needs_scheduled_hidden_payload=needs_scheduled_hidden_payload,
                     step_id=prefix_cache_step_id,
                     req_ids=req_ids_output_copy,
                 )
+                if cache_outputs is not None:
+                    combined_hidden_states = cache_outputs.hidden_states
+                    combined_multimodal_outputs = cache_outputs.mm_outputs or None
             if combined_multimodal_outputs is None:
                 flat_mm = flatten_payload(multimodal_outputs) if multimodal_outputs else multimodal_outputs
                 if defer_full_payload_d2h:
@@ -2020,16 +2034,31 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                         query_start_loc_cpu=query_start_loc_cpu,
                     )
 
+            if (
+                cache_outputs is not None
+                and not self._should_accumulate_full_payload_output()
+                and ((include_hidden_payload and not audio_sparse_output) or cache_outputs.token_mm_keys)
+            ):
+                assert self.omni_prefix_cache is not None
+                delivery = self.omni_prefix_cache.delivery_view(cache_outputs, downstream_req_ids)
+                combined_hidden_states = delivery.hidden_states
+                combined_multimodal_outputs = delivery.mm_outputs or None
+
             pooler_output = []
             with record_function_or_nullcontext("omni_output_builder:build_pooler_payloads"):
                 for rid in req_ids_output_copy:
                     if rid not in downstream_req_id_set:
                         pooler_output.append({})
                         continue
+                    if delivery is not None and delivery.token_ranges[rid][0] == delivery.token_ranges[rid][1]:
+                        pooler_output.append({})
+                        continue
                     idx = req_id_to_index_output_copy[rid]
                     start = int(query_start_loc_cpu[idx])
                     sched = int(num_scheduled_tokens_np[idx])
                     end = start + sched
+                    if delivery is not None:
+                        start += max(0, delivery.token_ranges[rid][0] - delivery.scheduled_token_ranges[rid][0])
                     payload = self._build_omni_pooler_payload(
                         rid=rid,
                         idx=idx,
@@ -2063,12 +2092,17 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 {key: value for key, value in payload.items() if key in allowed} for payload in pooler_output
             ]
 
+        if previous_full_payload_output is not None:
+            # Payload preparation can overlap; shared accumulation follows execution order.
+            with record_function_or_nullcontext("omni_output_builder:wait_full_payload"):
+                previous_full_payload_output.result()
         if pooler_inter and self._should_accumulate_full_payload_output():
+            token_ranges = cache_outputs.scheduled_token_ranges if cache_outputs is not None else scheduled_token_ranges
+            assert token_ranges is not None
             with record_function_or_nullcontext("omni_output_builder:accumulate_full_payload_output"):
-                for i, rid in enumerate(req_ids_output_copy):
-                    req_state = self.requests.get(rid)
-                    if req_state is not None and pooler_inter[i]:
-                        self.accumulate_full_payload_output(rid, pooler_inter[i], req_state)
+                self._prefix_cache_accumulate_full_payload(
+                    req_ids_output_copy, pooler_inter, token_ranges, cache_outputs
+                )
 
         with record_function_or_nullcontext("omni_output_builder:build_multimodal_outputs"):
             inter_stage_outputs, multimodal_outputs = self._build_omni_step_outputs(
@@ -2093,6 +2127,9 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 cudagraph_stats=cudagraph_stats,
             )
             output.kv_extracted_req_ids = kv_extracted_req_ids
+        if delivery is not None:
+            assert self.omni_prefix_cache is not None
+            self.omni_prefix_cache.ack_delivery(delivery)
         return output
 
     @torch.inference_mode()
@@ -2132,6 +2169,12 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             prefix_cache_step_id,
         ) = self.execute_model_state
         self.execute_model_state = None
+        scheduled_token_ranges = None
+        if self._should_accumulate_full_payload_output():
+            scheduled_token_ranges = {
+                rid: (self.requests[rid].num_computed_tokens, self.requests[rid].num_computed_tokens + count)
+                for rid, count in scheduler_output.num_scheduled_tokens.items()
+            }
 
         # Apply structured output bitmasks if present.
         if grammar_output is not None:
@@ -2353,38 +2396,56 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         with record_function_or_nullcontext("omni_async_output:get_omni_connector_output"):
             omni_connector_output = self.get_omni_connector_output()
 
+        previous_full_payload_output = None
+        full_payload_output: Future[None] | None = None
+        if use_async_omni_output and scheduled_token_ranges is not None:
+            previous_full_payload_output = self._full_payload_output_future
+            full_payload_output = Future()
+            self._full_payload_output_future = full_payload_output
+
         def output_builder() -> OmniModelRunnerOutput:
-            if output_tensor_snapshot.async_payload is not None:
-                with record_function_or_nullcontext("omni_async_output:wait_cpu_payload"):
-                    output_tensor_snapshot.async_payload.wait()
-            mm_snapshot = output_tensor_snapshot.multimodal_outputs
-            finalize_snapshot = getattr(
-                getattr(self, "model", None), "finalize_multimodal_outputs_from_cpu_snapshot", None
-            )
-            if callable(finalize_snapshot):
-                mm_snapshot = finalize_snapshot(mm_snapshot)
-            with record_function_or_nullcontext("omni_output_builder:total"):
-                output = self._build_omni_model_runner_output_from_snapshot(
-                    scheduler_output=scheduler_output_snapshot,
-                    hidden_states=output_tensor_snapshot.hidden_states,
-                    staged_hidden_states_cpu=output_tensor_snapshot.staged_hidden_states_cpu,
-                    multimodal_outputs=mm_snapshot,
-                    req_ids_output_copy=req_ids_output_snapshot,
-                    req_id_to_index_output_copy=req_id_to_index_output_snapshot,
-                    valid_sampled_token_ids=valid_sampled_token_ids_snapshot,
-                    logprobs_lists=logprobs_lists_snapshot,
-                    prompt_logprobs_dict=prompt_logprobs_dict_snapshot,
-                    num_nans_in_logits=num_nans_in_logits_snapshot,
-                    kv_connector_output=kv_connector_output,
-                    ec_connector_output=ec_connector_output,
-                    cudagraph_stats=cudagraph_stats,
-                    kv_extracted_req_ids=kv_extracted_req_ids,
-                    num_scheduled_tokens_np=num_scheduled_tokens_np,
-                    query_start_loc_cpu=query_start_loc_cpu,
-                    postprocess_already_applied=omni_postprocess_already_applied,
-                    prefix_cache_step_id=prefix_cache_step_id,
+            try:
+                if output_tensor_snapshot.async_payload is not None:
+                    with record_function_or_nullcontext("omni_async_output:wait_cpu_payload"):
+                        output_tensor_snapshot.async_payload.wait()
+                mm_snapshot = output_tensor_snapshot.multimodal_outputs
+                finalize_snapshot = getattr(
+                    getattr(self, "model", None), "finalize_multimodal_outputs_from_cpu_snapshot", None
                 )
-            output.omni_connector_output = omni_connector_output
+                if callable(finalize_snapshot):
+                    mm_snapshot = finalize_snapshot(mm_snapshot)
+                with record_function_or_nullcontext("omni_output_builder:total"):
+                    output = self._build_omni_model_runner_output_from_snapshot(
+                        scheduler_output=scheduler_output_snapshot,
+                        hidden_states=output_tensor_snapshot.hidden_states,
+                        staged_hidden_states_cpu=output_tensor_snapshot.staged_hidden_states_cpu,
+                        multimodal_outputs=mm_snapshot,
+                        req_ids_output_copy=req_ids_output_snapshot,
+                        req_id_to_index_output_copy=req_id_to_index_output_snapshot,
+                        valid_sampled_token_ids=valid_sampled_token_ids_snapshot,
+                        logprobs_lists=logprobs_lists_snapshot,
+                        prompt_logprobs_dict=prompt_logprobs_dict_snapshot,
+                        num_nans_in_logits=num_nans_in_logits_snapshot,
+                        kv_connector_output=kv_connector_output,
+                        ec_connector_output=ec_connector_output,
+                        cudagraph_stats=cudagraph_stats,
+                        kv_extracted_req_ids=kv_extracted_req_ids,
+                        num_scheduled_tokens_np=num_scheduled_tokens_np,
+                        query_start_loc_cpu=query_start_loc_cpu,
+                        postprocess_already_applied=omni_postprocess_already_applied,
+                        prefix_cache_step_id=prefix_cache_step_id,
+                        scheduled_token_ranges=scheduled_token_ranges,
+                        previous_full_payload_output=previous_full_payload_output,
+                    )
+                output.omni_connector_output = omni_connector_output
+            except BaseException as exc:
+                if full_payload_output is not None:
+                    if previous_full_payload_output is not None:
+                        wait([previous_full_payload_output])
+                    full_payload_output.set_exception(exc)
+                raise
+            if full_payload_output is not None:
+                full_payload_output.set_result(None)
             return output
 
         if not use_async_omni_output:

@@ -90,6 +90,10 @@ class FakeView:
     def batch_req_ids(self) -> list[str]:
         return list(self.order)
 
+    def token_range(self, req_id, num_scheduled):
+        start = self.computed.get(req_id, 0)
+        return start, start + num_scheduled
+
     def step_slots_cpu(self, req_ids, num_scheduled) -> torch.Tensor:
         parts = []
         for r in req_ids:
@@ -397,7 +401,7 @@ def test_save_requires_slot_snapshot_with_cache_contract_error():
                 {},
                 num_tokens_unpadded=1,
                 num_tokens_padded=1,
-                write_layout=PrefixCacheWriteLayout((PrefixCacheWrite("a", 0, 1),), 1),
+                write_layout=PrefixCacheWriteLayout((PrefixCacheWrite("a", 0, 1, 0, 1),), 1),
             )
     finally:
         mgr.shutdown()

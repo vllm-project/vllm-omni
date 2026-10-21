@@ -26,6 +26,7 @@ class FakeInputCoordinator:
 
 class DummyRequest:
     request_id = "req-free"
+    status = RequestStatus.FINISHED_STOPPED
     client_index = 0
     additional_information = None
 

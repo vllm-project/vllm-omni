@@ -103,6 +103,8 @@ class _CacheStub:
     def __init__(self):
         self.save_calls = []
         self.materialize_calls = []
+        self.discard_calls = []
+        self.step_calls = []
         self.outs = StageCacheOutputs(hidden_states=None, mm_outputs={})
 
     def save_outputs(self, hidden, mm, *, num_tokens_unpadded, num_tokens_padded, write_layout):
@@ -112,6 +114,12 @@ class _CacheStub:
     def materialize(self, step_id, req_ids):
         self.materialize_calls.append((step_id, req_ids))
         return self.outs
+
+    def discard_step(self, step_id):
+        self.discard_calls.append(step_id)
+
+    def new_step_starts(self, step):
+        self.step_calls.append(step)
 
 
 def test_step_begin_builds_once_and_registers_snapshot_policy(monkeypatch):
@@ -180,11 +188,13 @@ def test_materialize_requires_explicit_step_and_snapshot_req_ids():
     r = _Runner()
     stub = _CacheStub()
     r.omni_prefix_cache = stub
-    assert r._prefix_cache_materialize(None, ["a"]) == (None, None)
+    assert r._prefix_cache_materialize(None, ["a"]) is None
     assert stub.materialize_calls == []  # step_id None: nothing to consume
     hidden = {"a": torch.zeros(1, 2)}
     stub.outs = StageCacheOutputs(hidden_states=hidden, mm_outputs={})
-    assert r._prefix_cache_materialize(7, ["a"]) == (hidden, None)  # empty mm -> None
+    result = r._prefix_cache_materialize(7, ["a"])
+    assert result is stub.outs
+    assert result.mm_outputs == {}
     assert stub.materialize_calls == [(7, ["a"])]
 
 
@@ -200,6 +210,7 @@ def test_step_begin_and_save_keep_the_translated_snapshot(monkeypatch):
     runner._prefix_cache_adapter = PrefixCacheSchedulerAdapter()
     runner._prefix_cache_group_view = SimpleNamespace(
         batch_req_ids=lambda: ["r"],
+        token_range=lambda req_id, count: (0, count),
         step_slots_cpu=lambda req_ids, counts: torch.arange(counts["r"], dtype=torch.long),
     )
     arrival = SimpleNamespace(
