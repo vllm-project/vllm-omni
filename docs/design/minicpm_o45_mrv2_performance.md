@@ -51,8 +51,42 @@ Set `cfm_fused_body: false` in connector `extra` to restore the original body.
 On CUDA, disabling TF32 with `token2wav_allow_tf32: false` or
 `MINICPMO_CODE2WAV_TF32=off` also disables the default fusion choice; an explicit
 `cfm_fused_body: true` overrides that choice and may use TF32 attention.
-Slot pooling and row-offset merging remain opt-in. Fusion changes floating-point
-rounding and does not promise identical waveforms.
+Slot pooling and its `cfm_row_offset_merge` option remain opt-in. Fusion changes
+floating-point rounding and does not promise identical waveforms.
+
+## Code2Wav batching across reference audio
+
+With CUDA ragged Whole-Euler enabled, ready requests with different reference
+audio can share a Code2Wav decode batch. This also merges compatible tensor
+histories of different lengths for a single reference; it does not enable slot
+pooling. Other configurations retain reference-specific, exact-shape buckets,
+preserving CFM step-graph and TRT dispatch. Mixed-history arena replay is
+restricted to CUDA; the existing opt-in slot path is unchanged on other
+platforms.
+
+Reference extraction and initial cache setup remain separate for each
+reference; speaker conditioning, attention lengths and cache trimming stay
+per request. Cache epochs remain separate unless cross-turn batching is enabled.
+
+The MiniCPM Code2Wav stage runs CAM++ speaker embedding on CUDA and NPU using
+the in-tree torch model with FP32 weights and inputs, loaded from the
+checkpoint's `campplus.onnx`. On CUDA, reference preparation follows the
+stage's matmul policy (`token2wav_allow_tf32`, enabled by default); cuDNN's
+convolution TF32 policy is independent. FP32 tensors therefore do not imply
+strict FP32 arithmetic.
+The CUDA path does not require TensorRT. Set `token2wav_device_spk: false`
+in connector `extra` to use CPU ONNX Runtime for accuracy triage; explicitly
+enabling `token2wav_trt` retains its TensorRT speaker embedding path.
+This moves speaker embedding off the CPU but does not batch reference
+extraction or initial cache setup. Device kernels can change floating-point
+rounding, so this does not promise bit-identical embeddings or waveforms.
+
+The ragged Whole-Euler path masks padded history and returns each request's
+own cache length, reserving each row's retained length so it can reuse its
+storage across chunks. Encoder work still groups by compatible cache shapes.
+Unsupported ragged graph shapes retain the existing exact-shape fallback.
+This changes compute batching, not the content-based reference cache identity
+or reference normalization policy.
 
 ## Full-duplex MRv2
 

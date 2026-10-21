@@ -126,9 +126,9 @@ class MiniCPMO45Token2wav:
         """Run the campplus speaker-embedding model on TensorRT."""
         self._core.enable_trt_spk_embedding()
 
-    def enable_device_spk_embedding(self) -> None:
-        """Run the campplus speaker-embedding model on device (TRT on CUDA, torch elsewhere)."""
-        self._core.enable_device_spk_embedding()
+    def enable_device_spk_embedding(self, *, use_trt: bool = True) -> None:
+        """Run CAM++ on device, optionally without TensorRT on CUDA."""
+        self._core.enable_device_spk_embedding(use_trt=use_trt)
 
     def __call__(self, generated_speech_tokens, prompt_wav) -> bytes:
         """One-shot tokens → 24 kHz WAV bytes."""

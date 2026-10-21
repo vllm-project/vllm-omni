@@ -896,9 +896,9 @@ def test_weekly_reliability_is_distinct_from_nightly() -> None:
     nightly = AMD_NIGHTLY_PIPELINE.read_text(encoding="utf-8")
     group = weekly["steps"][0]
     jobs = {
-        "Reliability Test · qwen3-omni": ("mi300_2", "cards_2", "test_reliability_qwen3_omni.py"),
-        "Reliability Test · wan22": ("mi300_1", "cards_1", "test_reliability_wan22.py"),
-        "Reliability Test · hunyuan-image": ("mi300_4", "cards_4", "test_reliability_hunyuan_image.py"),
+        "Reliability Test · qwen3-omni": ("mi300_2", "cards_2", "tests/dfx/reliability/test_qwen3_omni.py"),
+        "Reliability Test · wan22": ("mi300_1", "cards_1", "tests/dfx/reliability/test_wan22.py"),
+        "Reliability Test · hunyuan-image": ("mi300_4", "cards_4", "tests/dfx/reliability/test_hunyuan_image.py"),
         "Reliability Test · Invalid parameters · MI300 · 2-GPU": (
             "mi300_2",
             "cards_2",

@@ -91,6 +91,7 @@ from vllm_omni.model_executor.models.ming3_audio.pipeline import (
     MING3_AUDIO_FLASH_THINKER_ONLY_PIPELINE,
     MING3_AUDIO_TTS_PIPELINE,
 )
+from vllm_omni.model_executor.models.ming3_tts.pipeline import MING3_TTS_PIPELINE
 from vllm_omni.model_executor.models.ming_flash_omni.pipeline import (
     MING_FLASH_OMNI_IMAGE_PIPELINE,
     MING_FLASH_OMNI_PIPELINE,
@@ -188,10 +189,13 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "joyai_vl_interaction_asr": JOYAI_VL_INTERACTION_ASR_PIPELINE,
     "lance": LANCE_PIPELINE,
     "lingbot_world": LINGBOT_WORLD_PIPELINE,
+    # Public Ming-3.0-tts-tiny still serializes the former config name.
+    "lingv3_tts": MING3_TTS_PIPELINE,
     "mammoth_moda2": MAMMOTH_MODA2_PIPELINE,
     "mammoth_moda2_ar": MAMMOTH_MODA2_AR_PIPELINE,
     "mimo_audio": MIMO_AUDIO_PIPELINE,
     "ming3_audio_tts": MING3_AUDIO_TTS_PIPELINE,
+    "ming3_tts": MING3_TTS_PIPELINE,
     "ming_flash_omni": MING_FLASH_OMNI_PIPELINE,
     "ming_flash_omni_image": MING_FLASH_OMNI_IMAGE_PIPELINE,
     "ming_flash_omni_thinker_only": MING_FLASH_OMNI_THINKER_ONLY_PIPELINE,

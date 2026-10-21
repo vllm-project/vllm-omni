@@ -248,6 +248,27 @@ async def test_realtime_client_configure_disables_auto_response_without_obsolete
     assert extra_body == {"ref_audio": "data:audio/wav;base64,AAAA", "native_duplex": False}
 
 
+@pytest.mark.asyncio
+async def test_realtime_client_stamps_append_after_send():
+    class _FakeWs:
+        async def send(self, raw: str) -> None:
+            del raw
+
+    client = RealtimeDuplexClient("ws://unused")
+    client._ws = _FakeWs()
+    await client.send(
+        {
+            "type": "input_audio_buffer.append",
+            "audio": "xx",
+            "video_frames": ["frame"],
+        }
+    )
+    await client.send({"type": "input_audio_buffer.commit"})
+    assert len(client.events.client_appends) == 1
+    assert client.events.client_appends[0].keys() == {"sent_at_s", "event_id"}
+    assert client.events.client_appends[0]["event_id"] == ""
+
+
 def test_realtime_event_collector_partitions_audio_by_response():
     collector = RealtimeEventCollector()
     collector.add({"type": "response.created", "response": {"id": "resp-a"}})

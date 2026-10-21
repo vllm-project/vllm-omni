@@ -683,9 +683,17 @@ class PendingTurnDetectionUpdate:
         return cls(config=config, detector=detector)
 
     def commit(self, current: TurnDetector | None) -> tuple[TurnDetectionConfig | None, TurnDetector | None]:
-        """Keep identical settings' live state; otherwise adopt the staged detector."""
+        """Keep identical settings' live state; otherwise adopt the staged detector.
+
+        Resetting the detector being replaced is best-effort. That detector is
+        discarded either way, and a reset failure must not leave the new config
+        live beside the old detector.
+        """
         if current is not None and current.config == self.config:
             return self.config, current
         if current is not None:
-            current.reset()
+            try:
+                current.reset()
+            except Exception:
+                logger.exception("turn detection reset failed; adopting the staged detector")
         return self.config, self.detector

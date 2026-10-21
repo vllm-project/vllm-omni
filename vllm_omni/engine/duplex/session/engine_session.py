@@ -632,6 +632,25 @@ class DuplexEngineSession:
         if config.initial_user_text and config.initial_user_text != previous_seed:
             self.notify_new_user_item()
 
+    def restore_config(self, previous: DuplexSessionConfig) -> None:
+        """Undo a ``replace_config`` whose candidate never finished adopting.
+
+        The forward replace already assigned the candidate, bumped
+        ``config_generation``, and may have counted its seed text. Putting the
+        previous object back through ``replace_config`` would count that seed
+        again and advance the generation a second time.
+        """
+        candidate = self.config
+        if (
+            candidate.initial_user_text
+            and candidate.initial_user_text != previous.initial_user_text
+            and self._conversation.unanswered_user_items > 0
+        ):
+            self._conversation.unanswered_user_items -= 1
+        self.config = previous
+        if self.config_generation > 0:
+            self.config_generation -= 1
+
     def transition_turn(self, state: DuplexTurnState) -> None:
         self.turn_state = state
 

@@ -22,6 +22,19 @@ def test_common_diffusion_marks_are_checked_in_helper(kind, monkeypatch):
     assert check_test_marks.get_files_missing_markers([path]) == {path: ["Level", "Hardware"]}
 
 
+@pytest.mark.parametrize(
+    "path",
+    [
+        "tests/dfx/reliability/test_qwen3_omni.py",
+        "tests/dfx/reliability/test_wan22.py",
+        "tests/dfx/reliability/test_hunyuan_image.py",
+        "tests/dfx/reliability/test_minicpmo_4_5.py",
+    ],
+)
+def test_reliability_model_files_carry_marks(path):
+    assert check_test_marks.get_files_missing_markers([path]) == {}
+
+
 def test_unrelated_tests_cannot_inherit_diffusion_marks(monkeypatch):
     path = "tests/test_missing_marks.py"
     monkeypatch.setattr(check_test_marks, "read_test_file", lambda filename: "get_parametrized_options(settings)")

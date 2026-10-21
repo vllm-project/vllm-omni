@@ -278,6 +278,28 @@ _OMNI_MODELS = {
         "ming_flash_omni_talker",
         "MingFlashOmniTalkerForConditionalGeneration",
     ),
+    ## Ming-3.0-TTS
+    # Architecture retained in the public HF checkpoint's config.json.
+    "LingV3TTSForConditionalGeneration": (
+        "ming3_tts",
+        "ming3_tts",
+        "Ming3TTSForConditionalGeneration",
+    ),
+    "Ming3TTSForConditionalGeneration": (
+        "ming3_tts",
+        "ming3_tts",
+        "Ming3TTSForConditionalGeneration",
+    ),
+    "Ming3TTSLLMModel": (
+        "ming3_tts",
+        "ming3_tts_llm",
+        "Ming3TTSLLMModel",
+    ),
+    "Ming3TTSAudioVAEModel": (
+        "ming3_tts",
+        "ming3_tts_audio_vae",
+        "Ming3TTSAudioVAEModel",
+    ),
     ## glm_image
     "GlmImageForConditionalGeneration": (
         "glm_image",

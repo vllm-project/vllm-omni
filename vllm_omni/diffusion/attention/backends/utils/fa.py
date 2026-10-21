@@ -229,6 +229,30 @@ def resolve_vllm_flash_attn_version(requested: str | int | None = None) -> int:
     return _choose_vllm_flash_attn_version(capability.major, requested, supported_versions)
 
 
+def _is_vllm_flash_attn_varlen(attn_func: FlashAttnFn) -> bool:
+    """Return whether ``attn_func`` is vLLM's versioned varlen dispatcher.
+
+    Identity by design; compiled-specs variants intentionally fall through.
+    """
+    try:
+        from vllm.vllm_flash_attn import flash_attn_varlen_func as vllm_func
+    except ImportError:
+        return False
+    return attn_func is vllm_func
+
+
+def vllm_varlen_version_kwargs(attn_func: FlashAttnFn | None) -> dict[str, int]:
+    """Return ``fa_version`` when calling vLLM's varlen dispatcher.
+
+    vLLM 0.31 defaults that argument to FA2. Hopper and Blackwell must receive
+    the version from :func:`resolve_vllm_flash_attn_version`, or dense diffusion
+    attention stays on FA2. Other backends do not accept the argument.
+    """
+    if attn_func is None or not _is_vllm_flash_attn_varlen(attn_func):
+        return {}
+    return {"fa_version": resolve_vllm_flash_attn_version()}
+
+
 _FA3_MISSING = "A standalone FlashAttention-3 varlen interface (flash_attn_interface) is required"
 
 

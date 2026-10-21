@@ -1,0 +1,156 @@
+meta:
+  title: "Fish Speech S2 Pro"
+  slug: "fish-speech-s2-pro"
+  provider: "Fish Audio"
+  description: "Fish Audio's dual-AR text-to-speech model served via vLLM-Omni, producing 44.1 kHz mono audio with optional voice cloning, through the OpenAI /v1/audio/speech API."
+  date_added: 2026-06-17
+  date_updated: 2026-06-15
+  tasks:
+    - omni
+  related_recipes:
+    - Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice
+    - openbmb/VoxCPM2
+    - bosonai/higgs-audio-v3-tts-4b
+
+model:
+  model_id: "fishaudio/s2-pro"
+  min_vllm_version: "0.19.0"
+  architecture: dense
+  parameter_count: "4.6B"
+  active_parameters: "4.6B"
+  context_length: 0
+  base_args:
+    - "--omni"
+  base_env: {}
+
+omni:
+  tasks:
+    - id: t2a
+      label: "Text → Speech"
+      endpoint: "/v1/audio/speech"
+      description: "Fish Speech S2 Pro TTS via /v1/audio/speech (44.1 kHz mono)"
+      curl: |
+        curl -X POST http://localhost:8000/v1/audio/speech \
+          -H "Content-Type: application/json" \
+          -d '{
+            "model": "fishaudio/s2-pro",
+            "input": "Hello, how are you?",
+            "voice": "default",
+            "response_format": "wav"
+          }' --output output.wav
+
+dependencies:
+  - note: "vLLM-Omni provides the TTS serving backend and the `--omni` serve path. See the installation guide for pre-built wheels or building from source."
+    command: "uv pip install git+https://github.com/vllm-project/vllm-omni.git"
+  - note: "fish-speech supplies the DAC codec used by S2 Pro (pulls pyaudio, which needs PortAudio system libs: apt-get install -y libportaudio2 portaudio19-dev)"
+    command: "uv pip install fish-speech"
+
+features: {}
+
+opt_in_features: []
+
+variants:
+  default:
+    precision: bf16
+    vram_minimum_gb: 48
+    description: "BF16 weights — single GPU (model loads ~48.3 GiB; reference run on 1x A800 80 GB)"
+
+compatible_strategies: []
+
+hardware_overrides: {}
+strategy_overrides: {}
+
+guide: |
+  ## Overview
+
+  [Fish Speech S2 Pro](https://huggingface.co/fishaudio/s2-pro) is Fish Audio's
+  dual-AR text-to-speech model, served through **vLLM-Omni** with the
+  OpenAI-compatible `/v1/audio/speech` API. It produces **44.1 kHz mono** audio
+  and supports zero-shot voice cloning from a reference clip + its transcript.
+
+  ## Prerequisites
+
+  - **Hardware**: a single CUDA GPU. Reference run: 1x A800 80 GB — the model
+    loads at ~48.3 GiB and peaks ~48.9 GiB during inference. A two-GPU profile
+    (`fish_qwen3_omni_2gpu.yaml`) is available for higher concurrency.
+  - **vLLM-Omni** targeting vLLM >= 0.19.
+  - **`fish-speech`** for the DAC codec. It depends on `pyaudio`, which needs
+    PortAudio system libraries:
+
+    ```bash
+    # Ubuntu/Debian
+    sudo apt-get update && sudo apt-get install -y libportaudio2 portaudio19-dev
+    ```
+
+  ## Installation
+
+  ```bash
+  uv venv && source .venv/bin/activate
+  uv pip install git+https://github.com/vllm-project/vllm-omni.git
+  uv pip install fish-speech
+  ```
+
+  ### Kvcache attention fast path
+
+  S2 Pro uses a Triton decode-only kvcache-attention fast path by default on
+  CUDA builds. Toggle it with `VLLM_OMNI_FISH_KVCACHE_ATTN`:
+
+  ```bash
+  # Verify availability
+  python -c "from vllm_omni.attention import fish_kvcache_attn; print(fish_kvcache_attn.is_available()); print(fish_kvcache_attn.load_error())"
+
+  export VLLM_OMNI_FISH_KVCACHE_ATTN=0          # disable the fast path
+  # VLLM_OMNI_FISH_KVCACHE_ATTN=required        # fail fast if it can't load
+  ```
+
+  ## Launch the server
+
+  The deploy config (`vllm_omni/deploy/fish_qwen3_omni.yaml`) is auto-discovered
+  from `model_type=fish_qwen3_omni`:
+
+  ```bash
+  # Single GPU
+  vllm serve fishaudio/s2-pro --omni --port 8000
+  ```
+
+  ```bash
+  # Two GPUs (Stage0 Slow/Fast AR on GPU 0, Stage1 DAC decoder on GPU 1)
+  CUDA_VISIBLE_DEVICES=0,1 vllm serve fishaudio/s2-pro --omni --port 8000 \
+    --deploy-config vllm_omni/deploy/fish_qwen3_omni_2gpu.yaml
+  ```
+
+  ## Client usage
+
+  ### Basic TTS
+
+  ```bash
+  curl -X POST http://localhost:8000/v1/audio/speech \
+    -H "Content-Type: application/json" \
+    -d '{"model": "fishaudio/s2-pro", "input": "Hello, how are you?", "voice": "default", "response_format": "wav"}' \
+    --output output.wav
+  ```
+
+  ### Voice cloning (reference audio + transcript)
+
+  ```bash
+  curl -X POST http://localhost:8000/v1/audio/speech \
+    -H "Content-Type: application/json" \
+    -d '{
+      "model": "fishaudio/s2-pro",
+      "input": "Hello, this is a cloned voice.",
+      "voice": "default",
+      "ref_audio": "https://example.com/reference.wav",
+      "ref_text": "Transcript of the reference audio."
+    }' --output cloned.wav
+  ```
+
+  ## Known limitations
+
+  - Output is **44.1 kHz mono** WAV.
+  - Voice cloning requires **both** `ref_audio` and `ref_text`.
+
+  ## References
+
+  - [Model card](https://huggingface.co/fishaudio/s2-pro)
+  - [vLLM-Omni Fish Speech example](https://github.com/vllm-project/vllm-omni/tree/main/examples/online_serving/text_to_speech/fish_speech)
+  - Benchmarks: vllm-project/vllm-omni [#2515](https://github.com/vllm-project/vllm-omni/pull/2515) (H100x2), [#3323](https://github.com/vllm-project/vllm-omni/pull/3323) (H20x2)
