@@ -1556,8 +1556,8 @@ def test_packed_allgather_matches_unsplit_flash_varlen():
         torch.testing.assert_close(sp_output, baseline, atol=5e-2, rtol=5e-2)
 
 
-# Auto-pad checks mask support from the config at pad time, so it must also check the
-# backends a step schedule can switch to.
+# Auto-pad probes only the baseline backend at pad time. Startup validation checks the
+# schedule profiles, and only when the model masks SP padding.
 
 
 def _auto_pad_hook():
@@ -1575,8 +1575,8 @@ def _patch_sp_env(monkeypatch, *, od_config, world_size=2, rank=0):
     return ctx
 
 
-def test_auto_pad_probe_enumerates_real_schedule_profiles(monkeypatch):
-    # The real selector resolves both backends; only the SP world and forward context are patched.
+def test_auto_pad_accepts_mask_free_schedule_profile(monkeypatch):
+    # The real selector resolves the baseline; only the SP world and forward context are patched.
     schedule = AttentionScheduleConfig(
         profiles={"mask_free": AttentionConfig(default=AttentionSpec(backend="TRTLLM_ATTN"))},
         default=[{"start": 0, "end": None, "profile": "mask_free"}],
@@ -1585,7 +1585,9 @@ def test_auto_pad_probe_enumerates_real_schedule_profiles(monkeypatch):
         diffusion_attention_config=AttentionConfig(default=AttentionSpec(backend="CUDNN_ATTN")),
         diffusion_attention_schedule=schedule,
     )
-    _patch_sp_env(monkeypatch, od_config=od_config)
+    ctx = _patch_sp_env(monkeypatch, od_config=od_config)
 
-    with pytest.raises(ValueError, match=r"TRTLLM_ATTN which does not support attention_mask.*profile 'mask_free'"):
-        _auto_pad_hook()._shard_with_auto_pad(torch.zeros((1, 5, 4)), 1, None)
+    shard = _auto_pad_hook()._shard_with_auto_pad(torch.zeros((1, 5, 4)), 1, None)
+
+    assert shard.shape == (1, 3, 4)
+    assert ctx.sp_padding_size == 1
