@@ -188,6 +188,16 @@ class AppendAttempt:
     async def _submit(self) -> bool:
         session = self.ctx.session
         model_state = self.ctx.model_state
+        # Mark before await so a concurrent commit cannot merge this PCM into
+        # the next turn while Stage0/1 are still running.
+        if self.retained_committed_payload is not None and (
+            model_state.committed_audio_payload is self.retained_committed_payload
+        ):
+            mark = getattr(model_state, "mark_committed_audio_consume_started", None)
+            if callable(mark):
+                mark()
+            else:
+                model_state.committed_audio_consume_started = True
         try:
             append_ok, emitted_response = await self.model.append_runtime_input(
                 self.payload,

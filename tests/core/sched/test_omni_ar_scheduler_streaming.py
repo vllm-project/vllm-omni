@@ -51,6 +51,10 @@ def _make_scheduler(*, stage_id: int = 0, session_mode: str = "turn") -> OmniARS
     )
     sched.num_waiting_for_streaming_input = 0
     sched.log_stats = False
+    # Upstream Scheduler.__init__ resolves hash_block_size = block_size (16 by
+    # default); the super()._update_request_as_session call at the pinned
+    # target truncates session.block_hashes with it.
+    sched.hash_block_size = 16
     sched.chunk_transfer_adapter = None
     sched.kv_holding_waiting = set()
     sched.deferred_waiting = set()

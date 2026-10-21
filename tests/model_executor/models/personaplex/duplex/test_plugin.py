@@ -293,6 +293,39 @@ def test_runtime_config_update_rejects_changed_voice() -> None:
     assert unchanged["personaplex_voice_prompt"] == "NATF2.pt"
 
 
+def test_runtime_config_update_accepts_an_echoed_voice_spelling() -> None:
+    """A whole-session resend may change case or spacing; the stored voice must survive."""
+    plugin = _plugin()
+    current = {"personaplex_persona": DEFAULT_PERSONA, "personaplex_voice_prompt": "NATF2.pt"}
+
+    for voice in ("natf2.pt", " NATF2.pt "):
+        config = DuplexSessionConfig(voice="NATF2.pt")
+        config.apply_realtime_update({"voice": voice, "temperature": 0.5}, audio_started=False)
+        assert config.voice == "NATF2.pt"
+        unchanged = plugin.runtime_config_for_update(config, current)
+        assert unchanged["personaplex_voice_prompt"] == "NATF2.pt"
+        assert config.temperature == 0.5
+
+
+def test_runtime_config_update_treats_a_blank_voice_as_a_clear() -> None:
+    """A blank clear must match the equivalent null clear at the plugin boundary."""
+    plugin = _plugin()
+    current = {"personaplex_persona": DEFAULT_PERSONA, "personaplex_voice_prompt": "NATM1.pt"}
+
+    blank = DuplexSessionConfig(voice="NATM1.pt")
+    blank.apply_realtime_update({"voice": "   "}, audio_started=False)
+    assert blank.voice is None
+
+    null = DuplexSessionConfig(voice="NATM1.pt")
+    null.apply_realtime_update({"voice": None}, audio_started=False)
+    assert null.voice is None
+
+    for config in (blank, null):
+        with pytest.raises(DuplexRuntimeConfigError, match="voice") as excinfo:
+            plugin.runtime_config_for_update(config, current)
+        assert excinfo.value.code == "voice_update_unsupported"
+
+
 def test_data_plane_context_is_the_framework_default() -> None:
     context = _plugin().data_plane_context(
         epoch=1,

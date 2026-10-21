@@ -11,10 +11,10 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / ".buildkite" / "common" / "scripts"))
 
+from ci_conditions import NIGHTLY_LABEL_IF, RELEASE_LINE_BUILDKITE_PATTERN  # noqa: E402
 from skip_ci import resolve_ci_decision  # noqa: E402
 from upload_pipeline import (  # noqa: E402
     CUDA_HF_TOKEN_EXPORT,
-    NIGHTLY_LABEL_IF,
     _changed_files_for_source_filter,
     _expand_mirror_hardwares,
     _get_mirror_hw_selector,
@@ -81,11 +81,16 @@ def test_docs_only_allows_main_scheduled_nightly_weekly_only() -> None:
     by_key = {step["key"]: step for step in doc["steps"]}
     assert "NIGHTLY" not in by_key["upload-ready-pipeline"]["if"]
     assert 'build.branch == "main"' in by_key["upload-ready-pipeline"]["if"]
+    assert RELEASE_LINE_BUILDKITE_PATTERN in by_key["upload-ready-pipeline"]["if"]
     assert 'build.env("WEEKLY") == "1"' in by_key["upload-ready-pipeline"]["if"]
     assert "NIGHTLY" not in by_key["upload-merge-pipeline"]["if"]
     assert 'build.branch == "main"' in by_key["upload-merge-pipeline"]["if"]
+    assert RELEASE_LINE_BUILDKITE_PATTERN in by_key["upload-merge-pipeline"]["if"]
+    assert "build.pull_request.id == null" in by_key["upload-merge-pipeline"]["if"]
     assert 'build.env("WEEKLY") == "1"' in by_key["upload-merge-pipeline"]["if"]
     assert 'build.env("NIGHTLY") == "1"' in by_key["upload-nightly-pipeline"]["if"]
+    assert RELEASE_LINE_BUILDKITE_PATTERN in by_key["upload-nightly-pipeline"]["if"]
+    assert RELEASE_LINE_BUILDKITE_PATTERN in by_key["upload-weekly-pipeline"]["if"]
     assert 'build.env("WEEKLY") == "1"' in rendered
     assert 'build.env("NON_CRITICAL") == "1"' in rendered
     assert "nightly-test" not in rendered
@@ -121,6 +126,7 @@ def test_nightly_label_if_is_only_nightly_test() -> None:
     for path in (
         Path(".buildkite/cuda/test-nightly.yml"),
         Path(".buildkite/npu/test-npu-nightly.yml"),
+        Path(".buildkite/common/scripts/ci_conditions.py"),
         Path(".buildkite/common/scripts/upload_pipeline.py"),
     ):
         text = path.read_text(encoding="utf-8")

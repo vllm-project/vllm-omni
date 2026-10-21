@@ -14,8 +14,11 @@ The artifact service, rather than a PR-writable shared filesystem, owns the
 cross-build provenance boundary. A consumer accepts artifacts only from:
 
 * an earlier build of the same PR, head commit, merge base, and checkout; or
-* a Buildkite build whose server metadata names the exact trusted upstream
-  ``main`` commit supplied by the bootstrap.
+* a non-PR Buildkite build of the exact trusted commit on ``main``, or on the
+  current release line (``release/vX.Y.Z``) when this build is itself a non-PR
+  release-line push. The release line is tried first so a later push reuses
+  the previous release-line module; ``main`` remains the fallback for the
+  first build after the branch is cut.
 
 Every consumer receives a writable job-local copy. Checksums, ``gfx942``
 device code, runtime ABI identity, Buildkite source metadata, and the recorded
@@ -44,6 +47,12 @@ from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+_COMMON_SCRIPTS = Path(__file__).resolve().parents[2] / "common" / "scripts"
+if str(_COMMON_SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(_COMMON_SCRIPTS))
+
+from ci_conditions import is_release_line_push  # noqa: E402, I001
 
 MODULE_NAME = "mha_fwd_bf16_nbias_nmask_nlse_ndropout_nqscale"
 ARCH = "gfx942"
@@ -559,6 +568,17 @@ def discover_build_sources(
     return sources
 
 
+def _trusted_branches(branch: str, pull_request: str) -> tuple[str, ...]:
+    """Non-PR branches that may publish the trusted parent artifact.
+
+    A non-PR ``release/vX.Y.Z`` push looks up its own previous build first, then
+    ``main``. A pull request opened from that branch trusts only ``main``.
+    """
+    if branch != "main" and is_release_line_push(branch, pull_request):
+        return (branch, "main")
+    return ("main",)
+
+
 def candidate_sources(
     env: Mapping[str, str] | None = None,
     *,
@@ -581,17 +601,21 @@ def candidate_sources(
     )
 
     trusted = values.get("VLLM_OMNI_AITER_MHA_TRUSTED_COMMIT", "")
-    if _SHA_PATTERN.fullmatch(trusted) and not (branch == "main" and trusted == commit):
-        sources.extend(
-            discover_build_sources(
-                branch="main",
-                commit=trusted,
-                pull_request="",
-                current_build_id=current_build_id,
-                exact_checkout=False,
-                fetch=fetch,
+    if _SHA_PATTERN.fullmatch(trusted):
+        for trusted_branch in _trusted_branches(branch, pull_request):
+            # The exact-checkout query above already covered this commit.
+            if trusted_branch == branch and trusted == commit:
+                continue
+            sources.extend(
+                discover_build_sources(
+                    branch=trusted_branch,
+                    commit=trusted,
+                    pull_request="",
+                    current_build_id=current_build_id,
+                    exact_checkout=False,
+                    fetch=fetch,
+                )
             )
-        )
     return list({source.build_id: source for source in sources}.values())
 
 
@@ -700,7 +724,11 @@ def provenance_matches_source(
             log(f"artifact is not from the same checkout/base identity: build #{source.number}")
             return False
     elif (
-        source.branch != "main"
+        source.branch
+        not in _trusted_branches(
+            values.get("BUILDKITE_BRANCH", ""),
+            values.get("BUILDKITE_PULL_REQUEST", ""),
+        )
         or source.pull_request
         or source.commit != values.get("VLLM_OMNI_AITER_MHA_TRUSTED_COMMIT", "")
     ):

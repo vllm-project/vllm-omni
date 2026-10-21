@@ -58,10 +58,9 @@ class VoiceAssistant(Agent):
 
 @server.rtc_session()
 async def entrypoint(ctx: JobContext):
-    # Qwen3-Omni only supports turn_detection=null (manual mode) -- it does
-    # not perform voice activity detection itself, so turn-taking must be
-    # decided client-side. semantic_vad (MiniCPM-o only) is rejected by
-    # vLLM-Omni's OpenAI-compatible realtime endpoint for Qwen3-Omni.
+    # This agent keeps turn_detection=null (manual mode) and decides
+    # turn-taking client-side. Server-side server_vad / semantic_vad need
+    # the Qwen3-Omni duplex deployment (see the realtime_web README).
     # Omni serves one model, so an empty model lets the server select it.
     model = RealtimeModel(
         base_url=VLLM_BASE_URL,

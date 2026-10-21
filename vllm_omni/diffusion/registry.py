@@ -191,6 +191,11 @@ _DIFFUSION_MODELS = {
         "pipeline",
         "LingBotWorldCausalDMDPipeline",
     ),
+    "TaoMateH3Pipeline": (
+        "taomate_h3",
+        "pipeline",
+        "TaoMateH3Pipeline",
+    ),
     "ABotWorldCausalPipeline": (
         "abot_world",
         "pipeline_abot_world",
@@ -391,11 +396,6 @@ _DIFFUSION_MODELS = {
         "pipeline_diffusers_adapter",
         "DiffusersAdapterPipeline",
     ),
-    "HiDreamImagePipeline": (
-        "hidream_image",
-        "pipeline_hidream_image",
-        "HiDreamImagePipeline",
-    ),
     "HiDreamO1ImagePipeline": (
         "hidream_o1_image",
         "pipeline_hidream_o1_image",
@@ -431,6 +431,11 @@ _DIFFUSION_MODELS = {
         "pipeline_kandinsky6",
         "Kandinsky6TI2VAPipeline",
     ),
+    "MOSSImagePipeline": (
+        "mossimage",
+        "pipeline_mossimage",
+        "MOSSImagePipeline",
+    ),
 }
 _DIFFUSION_MODELS["MingImageLayeredDiffusionPipeline"] = _DIFFUSION_MODELS["MingImageDiffusionPipeline"]
 
@@ -457,6 +462,7 @@ _NO_CACHE_ACCELERATION = {
     "Pi0Pipeline",
     "Pi05Pipeline",
     "LingBotWorldCausalDMDPipeline",
+    "TaoMateH3Pipeline",
     "CausVidWanPipeline",
     "ABotWorldCausalPipeline",
     # Qwen-Image 2.1's transformer carries its own prefix KV cache (keyed by CFG
@@ -722,6 +728,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "WanT2VDMD2Pipeline": "get_wan22_post_process_func",
     "WanI2VDMD2Pipeline": "get_wan22_i2v_post_process_func",
     "LingBotWorldCausalDMDPipeline": "get_lingbot_world_post_process_func",
+    "TaoMateH3Pipeline": "get_taomate_h3_post_process_func",
     "ABotWorldCausalPipeline": "get_abot_world_post_process_func",
     "LongCatImagePipeline": "get_longcat_image_post_process_func",
     "LongCatVideoAvatarPipeline": "get_longcat_video_avatar_post_process_func",
@@ -757,12 +764,12 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "SenseNovaU1Pipeline": "get_sensenova_u1_post_process_func",
     "Cosmos3OmniDiffusersPipeline": "get_cosmos3_post_process_func",
     "Cosmos3OmniPipeline": "get_cosmos3_post_process_func",
-    "HiDreamImagePipeline": "get_hidream_image_post_process_func",
     "HiDreamO1ImagePipeline": "get_hidream_o1_image_post_process_func",
     "StableDiffusionXLPipeline": "get_sdxl_image_post_process_func",
     "Krea2Pipeline": "get_krea2_post_process_func",
     "HunyuanImage3ForCausalMM": "get_hunyuan_image3_post_process_func",
     "Kandinsky6TI2VAPipeline": "get_kandinsky6_post_process_func",
+    "MOSSImagePipeline": "get_mossimage_post_process_func",
 }
 _DIFFUSION_POST_PROCESS_FUNCS["MingImageLayeredDiffusionPipeline"] = _DIFFUSION_POST_PROCESS_FUNCS[
     "MingImageDiffusionPipeline"
@@ -777,6 +784,7 @@ _DIFFUSION_IR_OP_PRIORITY_FUNCS = {
 }
 
 _DIFFUSION_PRE_PROCESS_FUNCS = {
+    "MOSSImagePipeline": "get_mossimage_pre_process_func",
     "SeedVR2Pipeline": "get_seedvr2_pre_process_func",
     # arch: pre_process_func
     # `pre_process_func` function must be placed in {mod_folder}/{mod_relname}.py,

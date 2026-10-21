@@ -6,7 +6,7 @@ from __future__ import annotations
 import enum
 from dataclasses import dataclass, field
 from functools import cached_property
-from typing import TYPE_CHECKING, Any, TypedDict
+from typing import TYPE_CHECKING, Any, Literal, TypedDict
 
 from vllm_omni.diffusion.diffusion_kv.metadata import DiffusionKVMetadata
 from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -266,6 +266,8 @@ class DiffusionSchedulerOutput:
     kv_prefetch_request_ids: set[str] = field(default_factory=set)
     # Connector lifecycle uses per-sequence IDs, not public request IDs.
     kv_finished_request_ids: set[str] = field(default_factory=set)
+    # A single host-selected boundary decision is delivered to every Worker.
+    step_resumes: dict[str, Literal["interaction", "timeout"]] = field(default_factory=dict)
     interaction_boundaries: dict[str, InteractionBoundaryContext] = field(default_factory=dict)
 
     @property
