@@ -445,6 +445,11 @@ class ChunkedVideoMP4Session:
         return None if self._ring is None else self._ring.stats
 
     @property
+    def frame_counts(self) -> list[int]:
+        """Actual frame counts, complete after a successful finish()."""
+        return [encoder.frame_count for encoder in self._encoders]
+
+    @property
     def ring(self) -> PinnedChunkRing | None:
         """The transfer ring this session settled on, once a chunk has flushed."""
         return self._ring
@@ -523,7 +528,12 @@ class ChunkedVideoMP4Session:
 
 
 def decode_to_mp4(
-    vae: Any, z: torch.Tensor, *, session: ChunkedVideoMP4Session | None = None, **session_kwargs: Any
+    vae: Any,
+    z: torch.Tensor,
+    *,
+    frame_counts: list[int] | None = None,
+    session: ChunkedVideoMP4Session | None = None,
+    **session_kwargs: Any,
 ) -> list[bytes]:
     """Decode ``z`` straight into one progressive MP4 per batch entry.
 
@@ -543,6 +553,8 @@ def decode_to_mp4(
     try:
         vae.decode_with_chunks(z, on_chunk=session.push)
         videos = session.finish()
+        if frame_counts is not None:
+            frame_counts.extend(session.frame_counts)
     except BaseException:
         session.abort()
         raise

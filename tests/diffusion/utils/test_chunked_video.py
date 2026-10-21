@@ -133,6 +133,18 @@ def test_session_can_start_before_frames_without_changing_output():
         lazy.abort()
 
 
+@pytest.mark.parametrize("prestart", [False, True])
+def test_decode_collects_frame_counts_with_an_existing_session(prestart):
+    """Frame metadata must compose with an eagerly started AAC session."""
+    session = ChunkedVideoMP4Session(value_range=(0.0, 1.0), fps=24, transfer_slots=0)
+    if prestart:
+        session.start(width=32, height=16, batch_size=1)
+    frame_counts: list[int] = []
+    videos = decode_to_mp4(_FakeVAE((0.0, 1.0)), torch.zeros(1), session=session, frame_counts=frame_counts)
+    assert frame_counts == [8]
+    assert _decoded(videos[0]).shape[0] == frame_counts[0]
+
+
 def test_started_session_can_abort_before_receiving_any_frames():
     """A failed producer must not leave the encoder waiting for its first frame."""
     import threading

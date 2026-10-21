@@ -175,11 +175,13 @@ def test_decode_to_mp4_batches_consumer_transfers(monkeypatch):
 
         def __init__(self, **kwargs):
             self.pushes = []
+            self.frame_count = 0
             self.kwargs = kwargs
             self.__class__.instances.append(self)
 
         def push(self, frames, *, on_consumed=None):
             self.pushes.append(np.array(frames, copy=True))
+            self.frame_count += len(frames)
             if on_consumed is not None:
                 on_consumed()
 
@@ -212,15 +214,18 @@ def test_decode_to_mp4_batches_consumer_transfers(monkeypatch):
         FakeEncoder,
     )
 
+    frame_counts: list[int] = []
     output = pipeline.decode_to_mp4(
         torch.zeros(1),
         torch.zeros(1),
         height=2,
         width=2,
         batch_frames=4,
+        frame_counts=frame_counts,
     )
 
     assert output == b"mp4"
+    assert frame_counts == [9]
     encoder = FakeEncoder.instances[-1]
     assert [frames.shape[0] for frames in encoder.pushes] == [6, 3]
     assert np.array_equal(encoder.pushes[0][0], np.full((2, 2, 3), 0, dtype=np.uint8))

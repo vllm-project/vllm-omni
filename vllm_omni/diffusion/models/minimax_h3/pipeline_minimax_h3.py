@@ -2208,6 +2208,7 @@ class MiniMaxH3Pipeline(
         max_pending: int = 2,
         batch_frames: int = 17,
         video_codec_options: dict[str, str] | None = None,
+        frame_counts: list[int] | None = None,
     ) -> bytes:
         """Decode and encode one output on the worker without full-video materialization.
 
@@ -2255,7 +2256,9 @@ class MiniMaxH3Pipeline(
                     dtype=torch.float16,
                     enabled=True,
                 ):
-                    videos = decode_chunks_to_mp4(self.video_vae, video_latent, session=session)
+                    videos = decode_chunks_to_mp4(
+                        self.video_vae, video_latent, session=session, frame_counts=frame_counts
+                    )
         except BaseException:
             if session is not None:
                 session.abort()
