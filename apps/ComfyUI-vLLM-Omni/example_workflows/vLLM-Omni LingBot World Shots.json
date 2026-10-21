@@ -1,0 +1,317 @@
+{
+  "last_node_id": 7,
+  "last_link_id": 6,
+  "nodes": [
+    {
+      "id": 1,
+      "type": "LoadImage",
+      "pos": [
+        60,
+        120
+      ],
+      "size": [
+        320,
+        320
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            1
+          ],
+          "slot_index": 0
+        },
+        {
+          "name": "MASK",
+          "type": "MASK",
+          "links": null
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "LoadImage"
+      },
+      "widgets_values": [
+        "lingbot-upstream-03.jpg",
+        "image"
+      ]
+    },
+    {
+      "id": 2,
+      "type": "VLLMOmniLingBotMoves",
+      "pos": [
+        60,
+        500
+      ],
+      "size": [
+        400,
+        220
+      ],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "moves",
+          "type": "LINGBOT_MOVES",
+          "links": [
+            2
+          ],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VLLMOmniLingBotMoves"
+      },
+      "widgets_values": [
+        "move    forward  0    end\nlook_h  right    21   end"
+      ]
+    },
+    {
+      "id": 3,
+      "type": "VLLMOmniLingBotShot",
+      "pos": [
+        500,
+        120
+      ],
+      "size": [
+        420,
+        260
+      ],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "moves",
+          "type": "LINGBOT_MOVES",
+          "link": 2
+        }
+      ],
+      "outputs": [
+        {
+          "name": "sequence",
+          "type": "LINGBOT_SEQUENCE",
+          "links": [
+            3
+          ],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VLLMOmniLingBotShot"
+      },
+      "widgets_values": [
+        "A lone tree stands in a calm alpine lake, with snowy mountains and drifting clouds.",
+        4
+      ]
+    },
+    {
+      "id": 4,
+      "type": "VLLMOmniLingBotShot",
+      "pos": [
+        500,
+        430
+      ],
+      "size": [
+        420,
+        220
+      ],
+      "flags": {},
+      "order": 4,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "sequence",
+          "type": "LINGBOT_SEQUENCE",
+          "link": 3
+        }
+      ],
+      "outputs": [
+        {
+          "name": "sequence",
+          "type": "LINGBOT_SEQUENCE",
+          "links": [
+            4,
+            6
+          ],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VLLMOmniLingBotShot"
+      },
+      "widgets_values": [
+        "Dusk falls over the lake; the mountains turn violet and the water stills.",
+        7
+      ]
+    },
+    {
+      "id": 5,
+      "type": "VLLMOmniLingBotRender",
+      "pos": [
+        980,
+        120
+      ],
+      "size": [
+        460,
+        300
+      ],
+      "flags": {},
+      "order": 5,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "image",
+          "type": "IMAGE",
+          "link": 1
+        },
+        {
+          "name": "sequence",
+          "type": "LINGBOT_SEQUENCE",
+          "link": 4
+        }
+      ],
+      "outputs": [
+        {
+          "name": "video",
+          "type": "VIDEO",
+          "links": [
+            5
+          ],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VLLMOmniLingBotRender"
+      },
+      "widgets_values": [
+        "ws://127.0.0.1:8000/v1/realtime/video",
+        "robbyant/lingbot-world-v2-14b-causal-fast-diffusers",
+        832,
+        480,
+        16,
+        42
+      ]
+    },
+    {
+      "id": 6,
+      "type": "SaveVideo",
+      "pos": [
+        1480,
+        120
+      ],
+      "size": [
+        320,
+        300
+      ],
+      "flags": {},
+      "order": 6,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "video",
+          "type": "VIDEO",
+          "link": 5
+        }
+      ],
+      "outputs": [],
+      "properties": {
+        "Node name for S&R": "SaveVideo"
+      },
+      "widgets_values": [
+        "video/LingBot-Shots",
+        "mp4",
+        "h264"
+      ]
+    },
+    {
+      "id": 7,
+      "type": "VLLMOmniLingBotVisualizer",
+      "pos": [
+        980,
+        470
+      ],
+      "size": [
+        460,
+        160
+      ],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "sequence",
+          "type": "LINGBOT_SEQUENCE",
+          "link": 6
+        }
+      ],
+      "outputs": [],
+      "properties": {
+        "Node name for S&R": "VLLMOmniLingBotVisualizer"
+      },
+      "widgets_values": [
+        16
+      ]
+    }
+  ],
+  "links": [
+    [
+      1,
+      1,
+      0,
+      5,
+      0,
+      "IMAGE"
+    ],
+    [
+      2,
+      2,
+      0,
+      3,
+      0,
+      "LINGBOT_MOVES"
+    ],
+    [
+      3,
+      3,
+      0,
+      4,
+      0,
+      "LINGBOT_SEQUENCE"
+    ],
+    [
+      4,
+      4,
+      0,
+      5,
+      1,
+      "LINGBOT_SEQUENCE"
+    ],
+    [
+      5,
+      5,
+      0,
+      6,
+      0,
+      "VIDEO"
+    ],
+    [
+      6,
+      4,
+      0,
+      7,
+      0,
+      "LINGBOT_SEQUENCE"
+    ]
+  ],
+  "groups": [],
+  "config": {},
+  "extra": {},
+  "version": 0.4
+}

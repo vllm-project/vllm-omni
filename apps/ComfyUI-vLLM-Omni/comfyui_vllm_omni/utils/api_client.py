@@ -11,6 +11,7 @@ Original source at https://github.com/dougbtv/comfyui-vllm-omni, distributed und
 
 import asyncio
 import json
+from collections.abc import Mapping
 from typing import Any
 
 import aiohttp
@@ -86,8 +87,19 @@ class VLLMOmniClient:
         self.poll_interval = poll_interval
         self.max_poll_duration = max_poll_duration
 
-    async def generate_video_stream(self, payload: dict[str, Any]) -> VideoInput:
-        """Collect a finite realtime rollout and decode all fragments as one VIDEO."""
+    async def generate_video_stream(
+        self,
+        payload: dict[str, Any],
+        prompt_switches: Mapping[int, str] | None = None,
+    ) -> VideoInput:
+        """Collect a finite realtime rollout and decode all fragments as one VIDEO.
+
+        ``prompt_switches`` maps a chunk index to the prompt that starts at that
+        chunk. The server applies an interaction before the next chunk it
+        generates, so each prompt goes out as soon as the chunk before its
+        boundary has been announced.
+        """
+        pending = dict(prompt_switches or {})
         chunks = bytearray()
         loop = asyncio.get_running_loop()
         deadline = loop.time() + self.max_poll_duration
@@ -109,7 +121,22 @@ class VLLMOmniClient:
                         event = json.loads(message.data)
                         if event.get("type") == "error":
                             raise RuntimeError(f"Omni video generation failed: {event.get('message', 'Unknown error')}")
+                        if event.get("type") == "video.chunk_metadata":
+                            announced = event.get("generation_chunk_index")
+                            prompt = pending.pop(announced + 1, None) if isinstance(announced, int) else None
+                            if prompt is not None:
+                                await ws.send_json(
+                                    {
+                                        "type": "session.interaction",
+                                        "interaction": {
+                                            "event_id": f"shot-{announced + 1}",
+                                            "event": {"prompt": prompt},
+                                        },
+                                    }
+                                )
                         if event.get("type") == "session.done":
+                            if pending:
+                                raise RuntimeError("The video ended before every shot prompt was applied.")
                             if event.get("stopped") or not chunks:
                                 raise RuntimeError("Video session stopped or completed without video data.")
                             return bytes_to_video(bytes(chunks))

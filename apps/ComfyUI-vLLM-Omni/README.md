@@ -51,6 +51,7 @@ This extension offers the following nodes based on the output modalities (at **C
 - **Generate Video** for text-to-video, first-frame/image-to-video, and reference-conditioned video
 - **Latent Mask Editing** for MiniMax-H3 latent-mask editing (source media plus video/audio noise masks)
 - **LingBot World** for first-image world generation: keyboard interaction, Realtime JSON trajectory playback, and Offline JSON returning a complete `VIDEO`; see the [LingBot guide](docs/lingbot-world.md)
+- **LingBot shots** — Camera Moves, World Shot, World Render and World Visualizer — for chains of prompted shots with camera moves compiled to the server's per-chunk script
 - **FastH3 Deployment** for routing text-to-video requests to a MiniMax-H3 server with FastH3 fused at startup
 - **Multimodality Understanding** for multimodality-to-text and multimodality-to-audio tasks
 - **TTS** and **TTS Voice Clone** for TTS tasks

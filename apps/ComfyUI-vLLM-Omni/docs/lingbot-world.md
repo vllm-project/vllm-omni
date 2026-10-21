@@ -88,6 +88,91 @@ This 33-frame example moves forward in the first chunk, moves left for one laten
 
 Both JSON nodes submit the complete script at session start. They do not schedule wall-clock `session.interaction` events. Realtime connects from the browser; Offline connects from the ComfyUI process, so set its `server_url` to an address reachable from that process. Offline collects all fragmented MP4 chunks until `session.done`, decodes them using the existing video converter and returns one video; a stopped or disconnected session raises an error instead of returning a partial result. The client sends keepalive messages during initialization and waits up to 30 minutes. Full-video decoding holds frames in CPU memory, so start with the 33-frame example.
 
+## Shots, sequences and camera moves
+
+The JSON node above asks you to write one key list per generated chunk, which
+means computing `(num_frames - 9) / 12 + 1` yourself and redoing it whenever the
+frame count changes. The shot nodes take a timeline instead and compile it.
+
+| Node | Takes | Gives |
+| --- | --- | --- |
+| **LingBot Camera Moves** | a moves text | `LINGBOT_MOVES` |
+| **LingBot World Shot** | a prompt, a length in chunks, optional `sequence` and `moves` | `LINGBOT_SEQUENCE` |
+| **LingBot World Render** | a first image, a `sequence`, the server settings | `VIDEO` |
+| **LingBot World Visualizer** | a `sequence` | nothing; it draws the plan |
+
+Chain shots through `sequence` and feed the last one to **Render** and to
+**Visualizer**. Import
+[vLLM-Omni LingBot World Shots.json](../example_workflows/vLLM-Omni%20LingBot%20World%20Shots.json)
+for a two-shot example.
+
+### How long a shot is
+
+A LingBot rollout is decoded causally, so its first chunk holds 9 pixel frames
+and every later chunk holds 12. A sequence therefore has to live on that grid:
+
+- the first shot lasts `9 + 12k` frames (one to `k + 1` chunks);
+- every later shot lasts whole chunks;
+- the whole sequence is `9 + 12k` frames, the same rule the `num_frames` widget
+  of the JSON nodes follows.
+
+The **Shot** node's `chunks` field counts chunks, one chunk being 0.75 seconds
+at 16 FPS, and the node sizes the shot for you.
+
+### Camera moves
+
+One move per line, `lane value start end`, with frames counted from the shot's
+start and `end` exclusive. `end` on its own means the shot's last frame. `#`
+starts a comment.
+
+```
+# lane   value    start  end
+move     forward  0      end
+look_h   right    21     end
+```
+
+| Lane | Values | The server integrates |
+| --- | --- | --- |
+| `move` | `forward`, `back` | 0.05 world units per latent frame |
+| `strafe` | `left`, `right` | 0.05 world units per latent frame |
+| `look_v` | `up`, `down` | 4 degrees of pitch per latent frame |
+| `look_h` | `left`, `right` | 6 degrees of yaw per latent frame |
+
+Values that name their own lane (`forward`, `back`, `up`, `down`) may drop the
+lane word; `left` and `right` need it, because they can be a strafe or a look.
+There is no speed setting: how far the camera travels is how long the move
+lasts. A move that would run past its shot is cut there and reported by the
+visualizer; one too short to cover a latent frame is widened to one.
+
+The same moves text can be reused across shots, and **Moves** output can feed
+several **Shot** nodes' `moves` input.
+
+### What renders
+
+**Render** runs one session for the whole sequence. The first shot's prompt
+starts it, and every later shot's prompt goes out as an interaction as soon as
+the chunk before its boundary has been generated, so it takes effect exactly at
+the boundary. This is a prompt change inside one continuous world, not a hard
+scene cut: the backend does not expose its KV-cache reset on this endpoint, so a
+different world means a separate **Render**.
+
+The compiled script goes into `extra_params.camera_action_script`. For the shot
+layout in the example workflow (4 + 7 + 5 chunks, with a yaw started 21 frames
+in and a strafe in the second shot) the server integrates:
+
+```
+chunk  0..1   forward
+chunk  2..3   forward + yaw right
+chunk  4..6   forward + strafe left
+chunk  7..10  forward
+chunk 11..12  (shot 3's prompt, no moves)
+chunk 13..15  pitch up
+```
+
+The key vocabulary has no vertical translation and no absolute pose, so a crane
+shot or an exact camera path is not expressible here; those need a speed-profile
+script on the backend side.
+
 ## Local and remote connections
 
 The browser connects directly to `server_url`. Use an Omni WebSocket endpoint reachable from the browser's machine. `localhost` and `127.0.0.1` refer to that machine, not the ComfyUI server. HTTPS pages require a `wss://` endpoint.
@@ -116,6 +201,7 @@ From the vLLM-Omni repository, with its test dependencies installed:
 
 ```bash
 pytest tests/e2e/features/comfyui/test_lingbot_world.py \
+  tests/e2e/features/comfyui/test_lingbot_moves.py \
   -m 'core_model and cpu' --run-level core_model
 ```
 
@@ -124,10 +210,10 @@ The pytest suite uses the existing ComfyUI test shims and mocked client transpor
 The standalone frontend regression tests are optional and use Node.js 20+:
 
 ```bash
-node --test tests/e2e/features/comfyui/lingbot_player.test.mjs
+node --test tests/e2e/features/comfyui/lingbot_player.test.mjs tests/e2e/features/comfyui/lingbot_timeline.test.mjs
 ```
 
-They cover camera key states, keepalive and media buffering without launching ComfyUI or a browser.
+They cover camera key states, keepalive and media buffering, and the visualizer's layout maths, without launching ComfyUI or a browser.
 
 ## Real-model validation plan
 

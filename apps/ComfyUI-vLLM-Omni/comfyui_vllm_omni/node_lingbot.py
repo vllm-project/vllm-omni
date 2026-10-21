@@ -4,15 +4,20 @@
 """Prepare a finite LingBot session; the browser panel owns its live connection."""
 
 import json
-from urllib.parse import urlsplit
 
-import torch
-
+from .lingbot_geometry import DEFAULT_GEOMETRY
+from .lingbot_request import (
+    DEFAULT_MODEL,
+    check_start_payload,
+    encode_first_frame,
+    validate_endpoint,
+    validate_size,
+)
 from .utils.api_client import VLLMOmniClient
-from .utils.format import image_tensor_to_base64
 
-MODEL = "robbyant/lingbot-world-v2-14b-causal-fast-diffusers"
+MODEL = DEFAULT_MODEL
 MODES = ["keyboard (camera API required)", "stationary", "forward"]
+_ACTION_KEYS = ("w", "a", "s", "d", "i", "j", "k", "l")
 
 
 class VLLMOmniLingBotWorld:
@@ -40,28 +45,20 @@ class VLLMOmniLingBotWorld:
     DESCRIPTION = "Run to prepare the scene, then open the interaction panel and click Start."
 
     def prepare(self, image, server_url, model, prompt, mode, width, height, num_frames, fps, seed, camera_json=None):
-        url = urlsplit(server_url.strip())
-        if url.scheme not in ("ws", "wss") or not url.hostname or url.username or url.password or url.fragment:
-            raise ValueError("Use a ws:// or wss:// video endpoint without embedded credentials or a fragment.")
+        url = validate_endpoint(server_url)
         if not prompt.strip() or not model.strip():
             raise ValueError("Model and prompt are required.")
         if mode not in MODES:
             raise ValueError("Unknown camera mode.")
-        if width <= 0 or height <= 0 or width % 16 or height % 16:
-            raise ValueError("Width and height must be positive multiples of 16 matching the Omni deploy config.")
-        if num_frames < 9 or (num_frames - 9) % 12 or fps <= 0:
-            raise ValueError("LingBot requires num_frames = 9 + 12k and positive FPS.")
-        if image.ndim != 4 or image.shape[0] != 1 or image.shape[-1] != 3:
-            raise ValueError("Connect exactly one RGB image; select one image from a batch first.")
-        image = image.detach().cpu()
-        if not torch.isfinite(image).all():
-            raise ValueError("The input image contains non-finite values.")
-        image = image.clamp(0, 1)
+        validate_size(width, height)
+        if fps <= 0:
+            raise ValueError("LingBot requires positive FPS.")
+        chunks = DEFAULT_GEOMETRY.chunks_for(num_frames)
         payload = {
             "type": "session.start",
             "model": model.strip(),
             "prompt": prompt.strip(),
-            "image_reference": {"image_url": image_tensor_to_base64(image, size=(width, height))},
+            "image_reference": {"image_url": encode_first_frame(image, width, height)},
             "format": "m4s",
             "width": width,
             "height": height,
@@ -76,15 +73,14 @@ class VLLMOmniLingBotWorld:
         elif mode != MODES[0]:
             actions = ["w"] if mode == "forward" else []
             payload["extra_params"]["camera_action_script"] = [
-                [list(actions) for _ in range(3)] for _ in range((num_frames - 9) // 12 + 1)
+                [list(actions) for _ in range(DEFAULT_GEOMETRY.latent_frames_per_chunk)] for _ in range(chunks)
             ]
-        if len(json.dumps(payload)) > 4 * 1024 * 1024:
-            raise ValueError("The start message exceeds Omni's 4 MiB limit; reduce the image dimensions or prompt.")
+        check_start_payload(payload)
         return {
             "ui": {
                 "omni_lingbot": [
                     {
-                        "url": server_url.strip(),
+                        "url": url,
                         "payload": payload,
                         "keyboard": mode == MODES[0],
                     }
@@ -104,16 +100,17 @@ def _parse_camera_json(camera_json: str, num_frames: int) -> list:
         script = json.loads(camera_json)
     except (ValueError, TypeError) as exc:
         raise ValueError("Camera JSON must be a JSON array of chunks.") from exc
-    chunks = (num_frames - 9) // 12 + 1
+    chunks = DEFAULT_GEOMETRY.chunks_for(num_frames)
     if not isinstance(script, list) or len(script) != chunks:
         raise ValueError(f"Camera JSON requires exactly {chunks} chunks for {num_frames} frames.")
     for chunk in script:
-        if not isinstance(chunk, list) or len(chunk) != 3:
-            raise ValueError("Each camera chunk requires exactly three action lists.")
+        if not isinstance(chunk, list) or len(chunk) != DEFAULT_GEOMETRY.latent_frames_per_chunk:
+            raise ValueError(
+                f"Each camera chunk requires exactly {DEFAULT_GEOMETRY.latent_frames_per_chunk} action lists."
+            )
         for actions in chunk:
             if not isinstance(actions, list) or any(
-                not isinstance(key, str) or key.lower() not in ("w", "a", "s", "d", "i", "j", "k", "l")
-                for key in actions
+                not isinstance(key, str) or key.lower() not in _ACTION_KEYS for key in actions
             ):
                 raise ValueError("Each action list supports only W/A/S/D/I/J/K/L keys.")
     return script

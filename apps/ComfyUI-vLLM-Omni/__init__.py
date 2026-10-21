@@ -19,6 +19,12 @@ from .comfyui_vllm_omni.node_lingbot import (
     VLLMOmniLingBotRealtimeJSON,
     VLLMOmniLingBotWorld,
 )
+from .comfyui_vllm_omni.node_lingbot_scene import (
+    VLLMOmniLingBotMoves,
+    VLLMOmniLingBotRender,
+    VLLMOmniLingBotShot,
+    VLLMOmniLingBotVisualizer,
+)
 from .comfyui_vllm_omni.nodes import (
     VLLMOmniARSampling,
     VLLMOmniDiffusionSampling,
@@ -45,6 +51,10 @@ NODE_CLASS_MAPPINGS = {
     "VLLMOmniLingBotWorld": VLLMOmniLingBotWorld,
     "VLLMOmniLingBotRealtimeJSON": VLLMOmniLingBotRealtimeJSON,
     "VLLMOmniLingBotOfflineJSON": VLLMOmniLingBotOfflineJSON,
+    "VLLMOmniLingBotMoves": VLLMOmniLingBotMoves,
+    "VLLMOmniLingBotShot": VLLMOmniLingBotShot,
+    "VLLMOmniLingBotRender": VLLMOmniLingBotRender,
+    "VLLMOmniLingBotVisualizer": VLLMOmniLingBotVisualizer,
     # === Generation ===
     "VLLMOmniGenerateImage": VLLMOmniGenerateImage,
     "VLLMOmniGenerateVideo": VLLMOmniGenerateVideo,
@@ -72,6 +82,10 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "VLLMOmniLingBotWorld": "LingBot World (Realtime)",
     "VLLMOmniLingBotRealtimeJSON": "LingBot World (Realtime JSON)",
     "VLLMOmniLingBotOfflineJSON": "LingBot World (Offline JSON)",
+    "VLLMOmniLingBotMoves": "LingBot Camera Moves",
+    "VLLMOmniLingBotShot": "LingBot World Shot",
+    "VLLMOmniLingBotRender": "LingBot World Render",
+    "VLLMOmniLingBotVisualizer": "LingBot World Visualizer",
     # === Generation ===
     "VLLMOmniGenerateImage": "Generate Image",
     "VLLMOmniGenerateVideo": "Generate Video",
