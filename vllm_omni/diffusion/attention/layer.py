@@ -1229,8 +1229,6 @@ def validate_attention_schedule_candidates(model: nn.Module, od_config: "OmniDif
     so an incompatible candidate would surface inside the first kernel after the layer switches to
     it, be ignored on a ring layer, or run dense when its calibration curve is missing:
 
-    * profile coverage: every configured profile is prepared on every attention layer, including
-      profiles the service default never references;
     * KV-cache quantization: ``_init_kv_cache_quantization`` probes the baseline impl only;
     * ring: the ring path bypasses the backend and the ring runner is bound to the baseline backend
       preference and explicit flag, and ignores backend kwargs, so a candidate carrying skip_softmax
@@ -1269,13 +1267,9 @@ def validate_attention_schedule_candidates(model: nn.Module, od_config: "OmniDif
         if not module._schedule_configured:
             continue  # built with no current diffusion config; it can never take part in a schedule
         schedule_aware_layers += 1
-        for name in profiles:
-            if name not in module._schedule_candidates:
-                raise ValueError(
-                    f"attention schedule profile {name!r} was not prepared on layer {layer_name!r}; "
-                    f"startup compatibility validation covers every configured profile."
-                )
-        baseline_backend = module.attn_backend.get_name() if module.attn_backend is not None else module.backend_pref
+        # Construction prepares a candidate for every configured profile, and only from a backend:
+        # custom-attention layers never take part in a schedule.
+        baseline_backend = cast(type[AttentionBackend], module.attn_backend).get_name()
         baseline_identity = _attention_identity(module.attn_backend, module.backend_explicit, module.attn_spec)
         for name in profiles:
             record = module._schedule_candidates[name]
@@ -1329,14 +1323,14 @@ def validate_attention_schedule_candidates(model: nn.Module, od_config: "OmniDif
             stamped = calibration_for_candidate(record, effective_calibration)
             _validate_candidate_calibration(layer_name, name, record, stamped)
             validated += 1
-    if profiles and attention_layers == 0:
+    if attention_layers == 0:
         raise ValueError(
             f"an attention schedule with profile(s) {', '.join(repr(p) for p in profiles)} is configured but "
             f"no attention layer was discovered in {type(model).__name__}; nothing was validated and the "
             f"schedule could never be selected. Remove the schedule, or load a model whose attention uses "
             f"vllm_omni.diffusion.attention.layer.Attention."
         )
-    if profiles and schedule_aware_layers == 0:
+    if schedule_aware_layers == 0:
         raise ValueError(
             f"an attention schedule with profile(s) {', '.join(repr(p) for p in profiles)} is configured but "
             f"none of the {attention_layers} attention layer(s) in {type(model).__name__} saw it at "
