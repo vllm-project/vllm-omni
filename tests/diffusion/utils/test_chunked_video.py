@@ -128,6 +128,66 @@ def test_session_muxes_one_waveform_per_batch_entry():
             assert container.streams.audio
 
 
+def test_session_can_start_before_frames_without_changing_output():
+    """Eager initialization must preserve encoded media and timestamps."""
+    time = np.arange(8000, dtype=np.float32) / 16000
+    audio = [0.1 * np.sin(2 * np.pi * 440 * time)]
+    kwargs = dict(
+        value_range=(0.0, 1.0),
+        fps=24,
+        audio_waveforms=audio,
+        audio_sample_rate=16000,
+        video_codec_options={"threads": "1"},
+        transfer_slots=0,
+    )
+    lazy = ChunkedVideoMP4Session(**kwargs)
+    eager = ChunkedVideoMP4Session(**kwargs)
+    try:
+        eager.start(width=32, height=16, batch_size=1)
+        for index in range(4):
+            frames = torch.full((1, 3, 3, 16, 32), index / 4)
+            lazy.push(frames)
+            eager.push(frames)
+        assert eager.finish() == lazy.finish()
+    finally:
+        eager.abort()
+        lazy.abort()
+
+
+@pytest.mark.parametrize("prestart", [False, True])
+def test_decode_collects_frame_counts_with_an_existing_session(prestart):
+    """Frame metadata must compose with an eagerly started AAC session."""
+    session = ChunkedVideoMP4Session(value_range=(0.0, 1.0), fps=24, transfer_slots=0)
+    if prestart:
+        session.start(width=32, height=16, batch_size=1)
+    frame_counts: list[int] = []
+    videos = decode_to_mp4(_FakeVAE((0.0, 1.0)), torch.zeros(1), session=session, frame_counts=frame_counts)
+    assert frame_counts == [8]
+    assert _decoded(videos[0]).shape[0] == frame_counts[0]
+
+
+def test_started_session_can_abort_before_receiving_any_frames():
+    """A failed producer must not leave the encoder waiting for its first frame."""
+    import threading
+
+    before = set(threading.enumerate())
+    session = ChunkedVideoMP4Session(value_range=(0.0, 1.0), fps=24)
+    session.start(width=32, height=16, batch_size=1)
+    session.abort()
+    assert not [thread for thread in threading.enumerate() if thread not in before and thread.name == "chunked-mp4"]
+
+
+@pytest.mark.parametrize("shape", [(2, 3, 4, 16, 32), (1, 3, 4, 16, 24)])
+def test_started_session_rejects_frames_that_disagree_with_declared_output(shape):
+    session = ChunkedVideoMP4Session(value_range=(0.0, 1.0), fps=24)
+    try:
+        session.start(width=32, height=16, batch_size=1)
+        with pytest.raises(ValueError, match="dimensions|batch"):
+            session.push(torch.zeros(shape))
+    finally:
+        session.abort()
+
+
 def test_session_rejects_a_waveform_count_that_does_not_match_the_batch():
     session = ChunkedVideoMP4Session(value_range=(0.0, 1.0), fps=24, audio_waveforms=[np.zeros(8000, dtype=np.float32)])
     with pytest.raises(ValueError, match="one audio waveform per batch entry"):

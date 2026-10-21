@@ -197,6 +197,7 @@ def test_decode_to_mp4_batches_consumer_transfers(monkeypatch, decode_dtype):
             return torch.zeros(1, 1, 2)
 
     class FakeVideoVAE:
+        owns_chunk_output = True
         chunk_value_range = (0.0, 1.0)
 
         def __init__(self):
@@ -219,20 +220,79 @@ def test_decode_to_mp4_batches_consumer_transfers(monkeypatch, decode_dtype):
         FakeEncoder,
     )
 
+    frame_counts: list[int] = []
     output = pipeline.decode_to_mp4(
         torch.zeros(1),
         torch.zeros(1),
         height=2,
         width=2,
         batch_frames=4,
+        frame_counts=frame_counts,
     )
 
     assert output == b"mp4"
+    assert frame_counts == [9]
     encoder = FakeEncoder.instances[-1]
     assert [frames.shape[0] for frames in encoder.pushes] == [6, 3]
     assert np.array_equal(encoder.pushes[0][0], np.full((2, 2, 3), 0, dtype=np.uint8))
     assert np.array_equal(encoder.pushes[0][3], np.full((2, 2, 3), 64, dtype=np.uint8))
     assert encoder.pushes[1].shape == (3, 2, 2, 3)
+
+
+@pytest.mark.parametrize("fail_video_load", [False, True])
+def test_preencode_starts_before_audio_offload_and_cleans_up_on_video_load_failure(monkeypatch, fail_video_load):
+    """Ready audio should start muxing even when video loading has not begun."""
+    import threading
+
+    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
+    from vllm_omni.diffusion.utils.chunked_video import ChunkedVideoMP4Session
+
+    events = []
+
+    class AudioVAE:
+        def decode_latent(self, latent):
+            events.append("audio_ready")
+            return torch.zeros(1, 1, 8000)
+
+    class VideoVAE:
+        decode_dtype = torch.float16
+        chunk_value_range = (0.0, 1.0)
+        owns_chunk_output = True
+
+        def decode_with_chunks(self, latent, *, on_chunk):
+            on_chunk(torch.zeros(1, 3, 4, 16, 32))
+
+    @contextmanager
+    def component_on_device(self, component):
+        if component is self.video_vae:
+            events.append("video_load")
+            if fail_video_load:
+                raise RuntimeError("video load failed")
+        yield
+        if component is self.audio_vae:
+            events.append("audio_offload")
+
+    start = ChunkedVideoMP4Session.start
+
+    def record_start(self, **kwargs):
+        events.append("mux_start")
+        return start(self, **kwargs)
+
+    pipeline = object.__new__(mod.MiniMaxH3Pipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.audio_vae = AudioVAE()
+    pipeline.video_vae = VideoVAE()
+    pipeline.device = torch.device("cpu")
+    monkeypatch.setattr(mod.MiniMaxH3Pipeline, "_component_on_device", component_on_device)
+    monkeypatch.setattr(ChunkedVideoMP4Session, "start", record_start)
+    before = set(threading.enumerate())
+    if fail_video_load:
+        with pytest.raises(RuntimeError, match="video load failed"):
+            pipeline.decode_to_mp4(torch.zeros(1), torch.zeros(1), height=16, width=32)
+    else:
+        assert pipeline.decode_to_mp4(torch.zeros(1), torch.zeros(1), height=16, width=32)
+    assert events[:4] == ["audio_ready", "mux_start", "audio_offload", "video_load"]
+    assert not [thread for thread in threading.enumerate() if thread not in before and thread.name == "chunked-mp4"]
 
 
 def test_request_video_codec_options_reach_the_preencoded_mp4_encoder(monkeypatch):
@@ -262,6 +322,7 @@ def test_request_video_codec_options_reach_the_preencoded_mp4_encoder(monkeypatc
             return torch.zeros(1, 1, 2)
 
     class FakeVideoVAE:
+        owns_chunk_output = True
         chunk_value_range = (0.0, 1.0)
         decode_dtype = torch.float16
 
@@ -3547,6 +3608,7 @@ def _peer_rank_preencode_pipeline(monkeypatch):
             return torch.zeros(1, 1, 2)
 
     class PeerRankVideoVAE:
+        owns_chunk_output = False
         chunk_value_range = (0.0, 1.0)
         decode_dtype = torch.float16
 
