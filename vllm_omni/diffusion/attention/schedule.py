@@ -346,14 +346,21 @@ def resolve_request_attention_sigma_schedule(
     )
 
 
+def batch_attention_sigma_schedule(schedules: Iterable[AttentionSigmaSchedule]) -> AttentionSigmaSchedule:
+    """One set of sigma windows for a batch of resolved ones. Different windows must not share a denoise forward."""
+    distinct = set(schedules)
+    if len(distinct) > 1:
+        raise ValueError("attention_sigma_schedule values in one batch must be identical")
+    return distinct.pop() if distinct else ()
+
+
 def resolve_batch_attention_sigma_schedule(
     sampling_params: Iterable["OmniDiffusionSamplingParams"], service: "AttentionScheduleConfig | None"
 ) -> AttentionSigmaSchedule:
-    """One resolved set of sigma windows for a batch. Different windows must not share a denoise forward."""
-    resolved = {resolve_request_attention_sigma_schedule(params, service) for params in sampling_params}
-    if len(resolved) > 1:
-        raise ValueError("attention_sigma_schedule values in one batch must be identical")
-    return resolved.pop() if resolved else ()
+    """Resolve each request's sigma windows and return the one set of the batch."""
+    return batch_attention_sigma_schedule(
+        resolve_request_attention_sigma_schedule(params, service) for params in sampling_params
+    )
 
 
 def validate_request_attention_schedules(
