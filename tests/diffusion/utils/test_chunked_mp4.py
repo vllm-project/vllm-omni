@@ -22,9 +22,8 @@ def _frames() -> np.ndarray:
     return rng.integers(0, 256, size=(8, 16, 24, 3), dtype=np.uint8)
 
 
-@pytest.mark.parametrize("eager_session", [False, True])
-def test_ready_audio_is_encoded_before_waiting_for_video(monkeypatch, eager_session) -> None:
-    """Audio work should overlap a producer that has not delivered video yet."""
+@pytest.fixture
+def audio_done(monkeypatch):
     audio_done = Event()
     open_container = av.open
 
@@ -57,6 +56,31 @@ def test_ready_audio_is_encoded_before_waiting_for_video(monkeypatch, eager_sess
             yield SimpleNamespace(add_stream=add_stream, mux=container.mux)
 
     monkeypatch.setattr(av, "open", recorded_container)
+    return audio_done
+
+
+@pytest.mark.parametrize("encode_audio_first", [None, False, True])
+def test_audio_priority_is_opt_in(audio_done, encode_audio_first) -> None:
+    def video():
+        assert audio_done.is_set() == (encode_audio_first is True)
+        yield from (av.VideoFrame.from_ndarray(frame, format="rgb24") for frame in _frames())
+
+    options = {} if encode_audio_first is None else {"encode_audio_first": encode_audio_first}
+    assert mux_av_video_audio_bytes(
+        video(),
+        width=24,
+        height=16,
+        fps=24,
+        audio_waveform=np.zeros((2, 8000), dtype=np.float32),
+        audio_sample_rate=24000,
+        **options,
+    )
+    assert audio_done.is_set()
+
+
+@pytest.mark.parametrize("eager_session", [False, True])
+def test_ready_audio_is_encoded_before_waiting_for_video(audio_done, eager_session) -> None:
+    """Audio work should overlap a producer that has not delivered video yet."""
 
     if eager_session:
         import torch
@@ -88,11 +112,13 @@ def test_ready_audio_is_encoded_before_waiting_for_video(monkeypatch, eager_sess
         fps=24,
         audio_waveform=np.zeros((2, 8000), dtype=np.float32),
         audio_sample_rate=24000,
+        encode_audio_first=True,
     )
     assert result
 
 
-def test_early_audio_preserves_decoded_media_and_timestamps() -> None:
+@pytest.mark.parametrize("encode_audio_first", [False, True])
+def test_early_audio_preserves_decoded_media_and_timestamps(encode_audio_first) -> None:
     """Moving AAC work must preserve samples, video pixels and stream timing."""
     frames = _frames()
     time = np.arange(8000, dtype=np.float32) / 24000
@@ -104,6 +130,7 @@ def test_early_audio_preserves_decoded_media_and_timestamps() -> None:
         width=24,
         height=16,
         audio_waveform=audio,
+        encode_audio_first=encode_audio_first,
         **options,
     )
 
@@ -159,6 +186,7 @@ def test_chunked_mp4_is_byte_identical_to_whole_mux() -> None:
         audio_waveform=audio,
         audio_sample_rate=32000,
         video_codec_options={"threads": "1"},
+        encode_audio_first=True,
     )
     encoder_audio = ChunkedMP4Encoder(
         width=24,
