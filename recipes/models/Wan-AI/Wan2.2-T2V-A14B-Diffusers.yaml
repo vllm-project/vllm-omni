@@ -1,0 +1,226 @@
+meta:
+  title: "Wan2.2"
+  slug: "wan2.2"
+  provider: "Wan (Alibaba)"
+  description: "Wan2.2 video generation models — T2V/I2V MoE (14B active) and unified TI2V (5B dense), served via vLLM-Omni"
+  date_added: 2025-12-31
+  date_updated: 2026-04-27
+  tasks:
+    - omni
+  related_recipes: []
+
+model:
+  model_id: "Wan-AI/Wan2.2-T2V-A14B-Diffusers"
+  min_vllm_version: "0.12.0"
+  architecture: moe
+  parameter_count: "28B"
+  active_parameters: "14B"
+  context_length: 0
+  base_args: []
+  base_env: {}
+
+omni:
+  # Each task picks a different Wan2.2 checkpoint — T2V/I2V are MoE-14B, TI2V
+  # is dense-5B. The model_id, VRAM hint, and description swap together when
+  # the user clicks a Task pill.
+  tasks:
+    - id: t2v
+      vram_minimum_gb: 152
+      description: "T2V MoE — 14B active parameters"
+    - id: i2v
+      model_id: "Wan-AI/Wan2.2-I2V-A14B-Diffusers"
+      vram_minimum_gb: 40
+      description: "I2V MoE — 14B active parameters"
+    - id: ti2v
+      model_id: "Wan-AI/Wan2.2-TI2V-5B-Diffusers"
+      vram_minimum_gb: 20
+      description: "Unified Text+Image-to-Video — dense 5B"
+
+dependencies:
+  - note: "Pin vllm==0.12.0 for Wan2.2"
+    command: "uv pip install vllm==0.12.0"
+  - note: "vllm-omni pinned to a specific commit that includes Wan2.2 text-to-video support"
+    command: "uv pip install git+https://github.com/vllm-project/vllm-omni.git@ef01223c42be10ee260b9f6e5ec31894cd09d86e"
+
+features: {}
+
+opt_in_features: []
+
+variants:
+  default:
+    precision: bf16
+    vram_minimum_gb: 152
+    description: "BF16 — variants moved to omni.tasks (T2V / I2V / TI2V each pick a different checkpoint)"
+
+compatible_strategies: []
+
+hardware_overrides:
+  amd:
+    extra_env:
+      VLLM_ROCM_USE_AITER: "1"
+      SAFETENSORS_FAST_GPU: "1"
+
+strategy_overrides: {}
+
+guide: |
+  ## Overview
+
+  Wan2.2 is a video generation family served via **vLLM-Omni** with optional **Cache-DiT**
+  acceleration:
+
+  - `Wan-AI/Wan2.2-T2V-A14B-Diffusers` — Text-to-Video (MoE, 14B active)
+  - `Wan-AI/Wan2.2-I2V-A14B-Diffusers` — Image-to-Video (MoE, 14B active)
+  - `Wan-AI/Wan2.2-TI2V-5B-Diffusers` — Unified Text+Image-to-Video (dense 5B)
+
+  ## Prerequisites
+
+  - vLLM-Omni on top of vLLM 0.12.0
+  - diffusers (bundled in vLLM-Omni CLI scripts)
+
+  ## Installation
+
+  ```bash
+  uv venv
+  source .venv/bin/activate
+  uv pip install vllm==0.12.0
+  uv pip install git+https://github.com/vllm-project/vllm-omni.git@ef01223c42be10ee260b9f6e5ec31894cd09d86e
+  ```
+
+  ### AMD ROCm (MI300X/MI325X/MI355X)
+
+  ```bash
+  uv venv
+  source .venv/bin/activate
+  uv pip install vllm==0.12.0 --extra-index-url https://wheels.vllm.ai/rocm/
+  uv pip install git+https://github.com/vllm-project/vllm-omni.git@ef01223c42be10ee260b9f6e5ec31894cd09d86e
+  ```
+
+  > ⚠️ The vLLM ROCm wheel requires Python 3.12, ROCm 7.0, and glibc >= 2.35.
+
+  ## Text-to-Video (T2V)
+
+  ```python
+  from vllm_omni.entrypoints.omni import Omni
+
+  omni = Omni(model="Wan-AI/Wan2.2-T2V-A14B-Diffusers")
+  frames = omni.generate(
+      "Two anthropomorphic cats in comfy boxing gear fight on a spotlighted stage.",
+      height=720, width=1280,
+      num_frames=81,
+      num_inference_steps=40,
+      guidance_scale=4.0,
+  )
+  ```
+
+  CLI:
+
+  ```bash
+  python examples/offline_inference/text_to_video/text_to_video.py \
+    --model Wan-AI/Wan2.2-T2V-A14B-Diffusers \
+    --prompt "A serene lakeside sunrise with mist over the water." \
+    --height 720 --width 1280 \
+    --num_frames 81 --num_inference_steps 40 \
+    --guidance_scale 4.0 --fps 24 \
+    --output t2v_output.mp4
+  ```
+
+  ### Running T2V on MI300X/MI325X/MI355X GPUs
+
+  ```bash
+  VLLM_ROCM_USE_AITER=1 \
+  SAFETENSORS_FAST_GPU=1 \
+  python examples/offline_inference/text_to_video/text_to_video.py \
+    --model Wan-AI/Wan2.2-T2V-A14B-Diffusers \
+    --prompt "A serene lakeside sunrise with mist over the water." \
+    --height 720 --width 1280 \
+    --num_frames 81 --num_inference_steps 40 \
+    --guidance_scale 4.0 --fps 24 \
+    --output t2v_output.mp4
+  ```
+
+  ## Image-to-Video (I2V)
+
+  ```python
+  import PIL.Image
+  from vllm_omni.entrypoints.omni import Omni
+
+  omni = Omni(model="Wan-AI/Wan2.2-I2V-A14B-Diffusers")
+  image = PIL.Image.open("input.jpg").convert("RGB")
+
+  frames = omni.generate(
+      "A cat playing with yarn",
+      pil_image=image,
+      height=480, width=832,
+      num_frames=81,
+      num_inference_steps=50,
+      guidance_scale=5.0,
+  )
+  ```
+
+  ### Running I2V on MI300X/MI325X/MI355X GPUs
+
+  ```bash
+  VLLM_ROCM_USE_AITER=1 \
+  SAFETENSORS_FAST_GPU=1 \
+  python examples/offline_inference/image_to_video/image_to_video.py \
+    --model Wan-AI/Wan2.2-I2V-A14B-Diffusers \
+    --image input.jpg --prompt "A cat playing with yarn" \
+    --num_frames 81 --num_inference_steps 50 \
+    --guidance_scale 5.0 --fps 16 --output i2v_output.mp4
+  ```
+
+  TI2V CLI:
+
+  ```bash
+  python examples/offline_inference/image_to_video/image_to_video.py \
+    --model Wan-AI/Wan2.2-TI2V-5B-Diffusers \
+    --image input.jpg --prompt "A cat playing with yarn" \
+    --num_frames 81 --num_inference_steps 50 \
+    --guidance_scale 5.0 --fps 16 --output ti2v_output.mp4
+  ```
+
+  ### Running TI2V on MI300X/MI325X/MI355X GPUs
+
+  ```bash
+  VLLM_ROCM_USE_AITER=1 \
+  SAFETENSORS_FAST_GPU=1 \
+  python examples/offline_inference/image_to_video/image_to_video.py \
+    --model Wan-AI/Wan2.2-TI2V-5B-Diffusers \
+    --image input.jpg --prompt "A cat playing with yarn" \
+    --num_frames 81 --num_inference_steps 50 \
+    --guidance_scale 5.0 --fps 16 --output ti2v_output.mp4
+  ```
+
+  ## Cache-DiT Acceleration
+
+  ```python
+  omni = Omni(
+      model="Wan-AI/Wan2.2-T2V-A14B-Diffusers",
+      cache_backend="cache_dit",
+      cache_config={
+          "Fn_compute_blocks": 8,
+          "Bn_compute_blocks": 0,
+          "max_warmup_steps": 4,
+          "residual_diff_threshold": 0.12,
+      },
+  )
+  ```
+
+  ## Key Parameters
+
+  | Parameter | Default | Description |
+  |-----------|---------|-------------|
+  | `height` | 720 (T2V) / auto (I2V) | Video height (multiples of 16) |
+  | `width` | 1280 (T2V) / auto (I2V) | Video width (multiples of 16) |
+  | `num_frames` | 81 | Frames to generate |
+  | `num_inference_steps` | 40–50 | Denoising steps |
+  | `guidance_scale` | 4.0–5.0 | Classifier-free guidance scale |
+  | `boundary_ratio` | 0.875 | MoE boundary split ratio |
+  | `flow_shift` | 5.0 (720p) / 12.0 (480p) | Scheduler flow shift |
+
+  ## References
+
+  - [Wan2.2-T2V-A14B](https://huggingface.co/Wan-AI/Wan2.2-T2V-A14B-Diffusers)
+  - [Wan2.2-I2V-A14B](https://huggingface.co/Wan-AI/Wan2.2-I2V-A14B-Diffusers)
+  - [Wan2.2-TI2V-5B](https://huggingface.co/Wan-AI/Wan2.2-TI2V-5B-Diffusers)
+  - [Cache-DiT Acceleration](https://github.com/vipshop/cache-dit)

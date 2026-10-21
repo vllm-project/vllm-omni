@@ -1,0 +1,160 @@
+meta:
+  title: "VoxCPM2"
+  slug: "voxcpm2"
+  provider: "MiniCPM (OpenBMB)"
+  description: "OpenBMB's 2B native-AR text-to-speech model served via vLLM-Omni — 48 kHz mono, 30+ languages, zero-shot synthesis and reference-audio voice cloning — through the OpenAI /v1/audio/speech API."
+  date_added: 2026-06-17
+  date_updated: 2026-06-15
+  tasks:
+    - omni
+  related_recipes:
+    - Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice
+    - fishaudio/s2-pro
+    - OpenMOSS-Team/MOSS-TTS
+
+model:
+  model_id: "openbmb/VoxCPM2"
+  min_vllm_version: "0.21.0"
+  architecture: dense
+  parameter_count: "2B"
+  active_parameters: "2B"
+  context_length: 0
+  base_args:
+    - "--omni"
+  base_env: {}
+
+omni:
+  tasks:
+    - id: t2a
+      label: "Text → Speech"
+      endpoint: "/v1/audio/speech"
+      description: "VoxCPM2 zero-shot TTS via /v1/audio/speech (48 kHz mono)"
+      curl: |
+        curl -X POST http://localhost:8000/v1/audio/speech \
+          -H "Content-Type: application/json" \
+          -d '{
+            "model": "openbmb/VoxCPM2",
+            "input": "Hello, this is VoxCPM2 served by vLLM-Omni.",
+            "voice": "default",
+            "response_format": "wav"
+          }' --output output.wav
+
+dependencies:
+  - note: "vLLM-Omni provides the TTS serving backend and the `--omni` serve path. See the installation guide for pre-built wheels or building from source."
+    command: "uv pip install git+https://github.com/vllm-project/vllm-omni.git"
+  - note: "Native VoxCPM2 source (>= 2.0), audio I/O, and ninja (flashinfer JIT-compiles a top-k sampling kernel on first run — without ninja on PATH startup dies with FileNotFoundError: 'ninja')"
+    command: "uv pip install voxcpm soundfile httpx ninja"
+
+features: {}
+
+opt_in_features: []
+
+variants:
+  default:
+    precision: bf16
+    vram_minimum_gb: 24
+    description: "BF16 weights — single 24 GB GPU (~22 GiB resident with the default config on an RTX 4090); no tensor parallelism needed"
+
+compatible_strategies: []
+
+hardware_overrides: {}
+strategy_overrides: {}
+
+guide: |
+  ## Overview
+
+  [VoxCPM2](https://huggingface.co/openbmb/VoxCPM2) is OpenBMB's 2B-parameter
+  native-AR text-to-speech model, served through **vLLM-Omni** with the
+  OpenAI-compatible `/v1/audio/speech` API. It emits **48 kHz mono** audio,
+  supports **30+ languages**, and runs both zero-shot synthesis and
+  reference-audio voice cloning. The pipeline is single-stage
+  (`MiniCPM4 base LM → FSQ → MiniCPM4 residual LM → LocDiT CFM solver →
+  AudioVAE`), so a single 24 GB consumer GPU is sufficient.
+
+  ## Prerequisites
+
+  - **Hardware**: one CUDA GPU with **≥ 24 GB** VRAM. Reference run: 1x RTX 4090
+    24 GB — ~4.9 GiB weights + ~15.2 GiB KV cache + ~2 GiB talker buffers ≈
+    **22 GiB / 24 GiB** with the default `voxcpm2.yaml`
+    (`gpu_memory_utilization: 0.9`, `max_num_seqs: 4`, `enforce_eager: true`).
+  - **vLLM-Omni** targeting vLLM >= 0.21.
+  - **`voxcpm >= 2.0`**, `soundfile`, `httpx`, and **`ninja`** on `PATH`.
+
+  ## Installation
+
+  ```bash
+  uv venv && source .venv/bin/activate
+  uv pip install git+https://github.com/vllm-project/vllm-omni.git
+  uv pip install voxcpm soundfile httpx ninja
+  ```
+
+  ## Launch the server
+
+  The deploy config (`vllm_omni/deploy/voxcpm2.yaml`) is auto-discovered from
+  `model_type=voxcpm2` (no `--trust-remote-code` needed):
+
+  ```bash
+  vllm serve openbmb/VoxCPM2 --omni --host 0.0.0.0 --port 8000
+  ```
+
+  On a shared GPU, pass `--gpu-memory-utilization 0.75` (or lower) if startup
+  fails the free-memory check. Cold start is ~60 s (subprocess fork + vLLM init
+  + model load + flashinfer JIT + torch.compile + the talker's own CUDA-Graph
+  capture over the CFM solver / AudioVAE).
+
+  ## Client usage
+
+  ### Zero-shot synthesis (curl, WAV)
+
+  ```bash
+  curl -X POST http://127.0.0.1:8000/v1/audio/speech \
+    -H "Content-Type: application/json" \
+    -d '{"model": "openbmb/VoxCPM2", "input": "Hello, this is VoxCPM2.", "voice": "default", "response_format": "wav"}' \
+    --output output.wav
+  ```
+
+  ### Voice cloning from a reference WAV (Python client)
+
+  ```bash
+  python examples/online_serving/text_to_speech/voxcpm2/openai_speech_client.py \
+    --text "This should sound like the reference speaker." \
+    --ref-audio /path/to/reference.wav \
+    --api-base http://127.0.0.1:8000 \
+    --output cloned.wav
+  ```
+
+  `--ref-audio` accepts local paths (auto-base64), HTTP(S) URLs, or
+  `data:audio/wav;base64,...` URIs. The OpenAI `voice` field is required by the
+  schema but ignored unless it names an uploaded voice — cloning is driven
+  entirely by `ref_audio`.
+
+  ### Streaming PCM (48 kHz s16le)
+
+  ```bash
+  curl -X POST http://127.0.0.1:8000/v1/audio/speech \
+    -H "Content-Type: application/json" \
+    -d '{"model": "openbmb/VoxCPM2", "input": "Streaming PCM test.", "voice": "default", "stream": true, "response_format": "pcm"}' \
+    --no-buffer | play -t raw -r 48000 -e signed -b 16 -c 1 -
+  ```
+
+  > The player sample rate is **48 kHz** (`-r 48000`), not 24 kHz.
+
+  ## Performance
+
+  After warmup, steady-state inference RTF is **~0.12** (~8x real-time on a
+  single RTX 4090). The first 1–2 requests pay a one-time warmup cost
+  (torch.compile + CUDA-Graph capture) that amortizes to zero; keep a server
+  warm for interactive use. Voice cloning adds only ~+0.017 RTF over zero-shot
+  (the per-request `AudioVAE.encode` over the reference clip).
+
+  ## Known limitations
+
+  - Output is **48 kHz mono**.
+  - The default config sets `enforce_eager: true`; vLLM engine-level CUDA graphs
+    are off by design (the talker captures its own CFM/AudioVAE graph instead).
+
+  ## References
+
+  - [Model card](https://huggingface.co/openbmb/VoxCPM2)
+  - [vLLM-Omni VoxCPM2 online example](https://github.com/vllm-project/vllm-omni/tree/main/examples/online_serving/text_to_speech/voxcpm2)
+  - [vLLM-Omni VoxCPM2 offline example](https://github.com/vllm-project/vllm-omni/blob/main/examples/offline_inference/text_to_speech/voxcpm2/end2end.py)

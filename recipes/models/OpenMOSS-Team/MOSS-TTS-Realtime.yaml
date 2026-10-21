@@ -1,0 +1,123 @@
+meta:
+  title: "MOSS-TTS-Realtime"
+  slug: "moss-tts-realtime"
+  provider: "OpenMOSS"
+  description: "OpenMOSS's 1.7B real-time streaming TTS for low-latency voice agents (TTFB ~180 ms) — multi-turn context-aware incremental synthesis — served via vLLM-Omni through the OpenAI /v1/audio/speech API (24 kHz mono)."
+  date_added: 2026-06-17
+  date_updated: 2026-06-15
+  tasks:
+    - omni
+  related_recipes:
+    - OpenMOSS-Team/MOSS-TTS
+    - Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice
+    - openbmb/VoxCPM2
+
+model:
+  model_id: "OpenMOSS-Team/MOSS-TTS-Realtime"
+  min_vllm_version: "0.22.0"
+  architecture: dense
+  parameter_count: "1.7B"
+  active_parameters: "1.7B"
+  context_length: 0
+  base_args:
+    - "--omni"
+  base_env: {}
+
+omni:
+  tasks:
+    - id: t2a
+      label: "Text → Speech"
+      endpoint: "/v1/audio/speech"
+      description: "MOSS-TTS-Realtime low-latency streaming TTS via /v1/audio/speech"
+      curl: |
+        curl -X POST http://localhost:8000/v1/audio/speech \
+          -H "Content-Type: application/json" \
+          -d '{
+            "model": "OpenMOSS-Team/MOSS-TTS-Realtime",
+            "input": "This is a low-latency streaming TTS test.",
+            "voice": "default",
+            "ref_audio": "https://raw.githubusercontent.com/OpenMOSS/MOSS-TTS/main/assets/audio/zh_1.wav",
+            "response_format": "wav",
+            "stream": true
+          }' --output output.wav
+
+dependencies:
+  - note: "vLLM-Omni provides the TTS serving backend and the `--omni` serve path. See the installation guide for pre-built wheels or building from source."
+    command: "uv pip install git+https://github.com/vllm-project/vllm-omni.git"
+
+features: {}
+
+opt_in_features: []
+
+variants:
+  default:
+    precision: bf16
+    vram_minimum_gb: 16
+    description: "MOSS-TTS-Realtime 1.7B (MossTTSRealtime) — lowest-latency streaming variant (reference run on 1x A10G 24 GB)"
+
+compatible_strategies: []
+
+hardware_overrides: {}
+strategy_overrides: {}
+
+guide: |
+  ## Overview
+
+  [MOSS-TTS-Realtime](https://huggingface.co/OpenMOSS-Team/MOSS-TTS-Realtime) is
+  the **1.7B real-time streaming** member of OpenMOSS's MOSS-TTS Family, served
+  through **vLLM-Omni** with the OpenAI-compatible `/v1/audio/speech` API. It is
+  a multi-turn, context-aware model for **low-latency voice agents**, using a
+  local depth transformer (no delay warm-up) for incremental synthesis. TTFB
+  (time to first byte) is **~180 ms**, and LLM-first-sentence + TTS-TTFB is
+  ~377 ms. Output is **24 kHz mono**.
+
+  ## Prerequisites
+
+  - **Hardware**: a single CUDA GPU. Reference run: 1x A10G 24 GB — ~6 GB for the
+    1.7B talker + ~8 GB for the codec decoder.
+  - **vLLM-Omni** targeting vLLM >= 0.22.
+
+  ## Installation
+
+  ```bash
+  uv venv && source .venv/bin/activate
+  uv pip install git+https://github.com/vllm-project/vllm-omni.git
+  ```
+
+  ## Launch the server
+
+  MOSS-TTS-Realtime uses `model_type=moss_tts_realtime`, so its deploy config
+  (`vllm_omni/deploy/moss_tts_realtime.yaml`, `codec_chunk_frames: 15` for low
+  TTFA) is auto-discovered:
+
+  ```bash
+  vllm serve OpenMOSS-Team/MOSS-TTS-Realtime --omni --port 8000
+  ```
+
+  ## Client usage
+
+  ### Streaming voice clone (curl)
+
+  ```bash
+  curl -X POST http://localhost:8000/v1/audio/speech \
+    -H "Content-Type: application/json" \
+    -d '{
+      "model": "OpenMOSS-Team/MOSS-TTS-Realtime",
+      "input": "This is a low-latency streaming TTS test.",
+      "voice": "default",
+      "ref_audio": "https://raw.githubusercontent.com/OpenMOSS/MOSS-TTS/main/assets/audio/zh_1.wav",
+      "response_format": "wav",
+      "stream": true
+    }' --output output.wav
+  ```
+
+  ## Known limitations
+
+  - Output is **24 kHz mono**.
+  - Shares the `OpenMOSS-Team/MOSS-Audio-Tokenizer` codec (~7 GB, auto-downloaded;
+    override with `MOSS_TTS_CODEC_PATH`).
+
+  ## References
+
+  - [Model card](https://huggingface.co/OpenMOSS-Team/MOSS-TTS-Realtime)
+  - [MOSS-TTS Family](https://huggingface.co/OpenMOSS-Team/MOSS-TTS) · [GitHub](https://github.com/OpenMOSS/MOSS-TTS)

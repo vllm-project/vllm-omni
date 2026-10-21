@@ -1,0 +1,189 @@
+meta:
+  title: "GLM-Image"
+  slug: "glm-image"
+  provider: "GLM (Z-AI)"
+  description: "Hybrid autoregressive + diffusion image generation model — text-to-image and image-to-image with strong text rendering and knowledge-intensive generation"
+  date_added: 2026-01-26
+  date_updated: 2026-04-17
+  tasks:
+    - omni
+  performance_headline: "9B AR generator + 7B DiT decoder, state-of-the-art text rendering in generated images"
+  related_recipes: []
+  hardware:
+    h100: verified
+
+model:
+  model_id: "zai-org/GLM-Image"
+  min_vllm_version: "0.11.0"
+  architecture: dense
+  parameter_count: "16B"
+  active_parameters: "16B"
+  context_length: 4096
+  base_args:
+    - "--trust-remote-code"
+  base_env: {}
+
+omni:
+  # Same checkpoint serves both T2I and I2I — the task toggle in the UI just
+  # rewires the cURL endpoint (T2I → /v1/images/generations,
+  # I2I → /v1/chat/completions with a multimodal user turn).
+  tasks:
+    - t2i
+    - i2i
+
+dependencies:
+  - note: "vllm-omni provides the diffusion decoder path"
+    command: "uv pip install vllm-omni"
+  - note: "transformers from source (GLM-Image tokenizer)"
+    command: "uv pip install git+https://github.com/huggingface/transformers.git"
+  - note: "diffusers from source — required for the DiT decoder"
+    command: "uv pip install git+https://github.com/huggingface/diffusers.git"
+
+features: {}
+
+opt_in_features: []
+
+variants:
+  default:
+    precision: bf16
+    vram_minimum_gb: 38
+    description: "Single-GPU deployment (~33 GB for model weights, plus activation headroom)"
+
+compatible_strategies:
+  - single_node_tp
+  - multi_node_tp
+
+hardware_overrides: {}
+
+strategy_overrides: {}
+
+guide: |
+  ## Overview
+
+  GLM-Image is an image generation model with a hybrid architecture:
+
+  - **Autoregressive Generator (9B):** initialized from GLM-4-9B-0414 with an expanded
+    vocabulary for visual tokens. Produces a compact encoding (~256 tokens), then
+    expands to 1K–4K tokens corresponding to 1K–2K resolution images.
+  - **Diffusion Decoder (7B):** single-stream DiT that decodes latents into pixels.
+    Includes a Glyph Encoder text module for accurate in-image text rendering.
+
+  Served via vLLM-Omni for OpenAI-compatible online inference.
+
+  ### Key Capabilities
+
+  - Text-to-image and image-to-image (editing, style transfer, identity-preserving)
+  - Exceptional text rendering inside generated images
+  - Strong knowledge-intensive generation
+
+  ## Prerequisites
+
+  - **vLLM version:** latest (with `vllm-omni` extension)
+  - **Transformers:** >= 5.0.0 (use source install for latest)
+  - **Hardware:** single H100-class GPU (approx. 33 GB for weights)
+
+  ### Install Dependencies
+
+  ```bash
+  uv venv --python 3.12 --seed
+  source .venv/bin/activate
+
+  uv pip install -U vllm --torch-backend auto
+  uv pip install vllm-omni
+
+  pip install git+https://github.com/huggingface/transformers.git
+  pip install git+https://github.com/huggingface/diffusers.git
+  ```
+
+  ## Online Serving
+
+  ```bash
+  vllm serve zai-org/GLM-Image --omni
+  ```
+
+  ## Client Usage
+
+  ### OpenAI SDK (Text-to-Image)
+
+  ```python
+  import base64
+  from openai import OpenAI
+
+  client = OpenAI(base_url="http://localhost:8000/v1", api_key="EMPTY")
+
+  response = client.chat.completions.create(
+      model="zai-org/GLM-Image",
+      messages=[{"role": "user", "content": "A beautiful landscape painting with mountains and a lake at sunset"}],
+  )
+
+  image_url = response.choices[0].message.content[0].image_url.url
+  image_data = base64.b64decode(image_url.split(",")[1])
+  with open("output.png", "wb") as f:
+      f.write(image_data)
+  ```
+
+  ### cURL (Text-to-Image)
+
+  ```bash
+  curl -s http://localhost:8000/v1/chat/completions \
+    -H "Content-Type: application/json" \
+    -d '{
+      "messages": [{"role": "user", "content": "A beautiful landscape painting"}]
+    }' | jq -r '.choices[0].message.content[0].image_url.url' | cut -d',' -f2- | base64 -d > output.png
+  ```
+
+  ### Image-to-Image
+
+  ```python
+  import base64
+  from openai import OpenAI
+
+  client = OpenAI(base_url="http://localhost:8000/v1", api_key="EMPTY")
+
+  with open("input.png", "rb") as f:
+      image_base64 = base64.b64encode(f.read()).decode("utf-8")
+
+  response = client.chat.completions.create(
+      model="zai-org/GLM-Image",
+      messages=[{
+          "role": "user",
+          "content": [
+              {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_base64}"}},
+              {"type": "text", "text": "Replace the background with a sunset beach scene"}
+          ]
+      }],
+  )
+
+  image_url = response.choices[0].message.content[0].image_url.url
+  image_data = base64.b64decode(image_url.split(",")[1])
+  with open("output.png", "wb") as f:
+      f.write(image_data)
+  ```
+
+  ## Offline Inference
+
+  ```bash
+  # Text to Image
+  cd examples/offline_inference/text_to_image
+  python3 text_to_image.py --model zai-org/GLM-Image --output t2i_output.png
+
+  # Image to Image
+  cd examples/offline_inference/image_to_image
+  wget https://vllm-public-assets.s3.us-west-2.amazonaws.com/omni-assets/qwen-bear.png
+  python3 image_to_image.py --model zai-org/GLM-Image --image qwen-bear.png --output i2i_output.png
+  ```
+
+  ## Troubleshooting
+
+  - **Resolution errors:** Target image dimensions must be divisible by 32.
+  - **Text rendering:** Wrap text that should appear in the image with quotation marks
+    in the prompt.
+  - **Output stability:** Default `temperature=0.9`, `top_p=0.75`. Higher temperature
+    gives more diverse outputs but may reduce stability.
+  - **Transformers version:** Requires `transformers >= 5.0.0`.
+
+  ## References
+
+  - [Model card](https://huggingface.co/zai-org/GLM-Image)
+  - [Technical blog](https://z.ai/blog/glm-image)
+  - [GitHub repo](https://github.com/zai-org/GLM-Image)

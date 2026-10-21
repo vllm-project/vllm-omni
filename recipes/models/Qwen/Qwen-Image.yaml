@@ -1,0 +1,213 @@
+meta:
+  title: "Qwen-Image"
+  slug: "qwen-image"
+  provider: "Qwen"
+  description: "Text-to-image diffusion model (20B parameters) from the Qwen-Image family, served via vLLM-Omni."
+  date_added: 2026-04-03
+  date_updated: 2026-04-17
+  tasks:
+    - omni
+  performance_headline: "Shared DiT core across T2I, image editing, and layered-image variants; accelerated via Cache-DiT, TeaCache, and sequence parallelism"
+  related_recipes: []
+
+model:
+  model_id: "Qwen/Qwen-Image"
+  min_vllm_version: "0.18.0"
+  architecture: dense
+  parameter_count: "20B"
+  active_parameters: "20B"
+  context_length: 0
+  base_args: []
+  base_env: {}
+
+omni:
+  tasks:
+    - t2i
+
+dependencies:
+  - note: "vLLM-Omni must be installed from source and pins vllm==0.18.0 for diffusion support"
+    command: "git clone https://github.com/vllm-project/vllm-omni.git && cd vllm-omni && uv pip install -e . vllm==0.18.0"
+
+features: {}
+
+opt_in_features: []
+
+variants:
+  default:
+    precision: bf16
+    vram_minimum_gb: 48
+    description: "Full precision BF16 — use CPU offload / layerwise offload for lower VRAM"
+  fp8:
+    precision: fp8
+    vram_minimum_gb: 24
+    description: "FP8 quantization with `img_mlp` kept at full precision for quality."
+    extra_args:
+      - "--quantization"
+      - "fp8"
+      - "--ignored-layers"
+      - "img_mlp"
+  int8:
+    precision: int8
+    vram_minimum_gb: 24
+    description: "INT8 quantization (`--quantization int8`)."
+    extra_args:
+      - "--quantization"
+      - "int8"
+
+compatible_strategies:
+  - single_node_tp
+
+hardware_overrides: {}
+
+strategy_overrides: {}
+
+guide: |
+  ## Overview
+
+  Qwen-Image is a diffusion-based text-to-image model. This recipe documents the Qwen-Image family served via **vLLM-Omni**:
+
+  | Model | HuggingFace | Description |
+  |-------|-------------|-------------|
+  | **Qwen-Image** | [Qwen/Qwen-Image](https://huggingface.co/Qwen/Qwen-Image) | Text-to-image (20B, Aug 2025) |
+  | **Qwen-Image-2512** | [Qwen/Qwen-Image-2512](https://huggingface.co/Qwen/Qwen-Image-2512) | Updated T2I with enhanced realism (Dec 2025) |
+  | **Qwen-Image-Edit** | [Qwen/Qwen-Image-Edit](https://huggingface.co/Qwen/Qwen-Image-Edit) | Single-image editing (Aug 2025) |
+  | **Qwen-Image-Edit-2509** | [Qwen/Qwen-Image-Edit-2509](https://huggingface.co/Qwen/Qwen-Image-Edit-2509) | Multi-image editing (Sep 2025) |
+  | **Qwen-Image-Edit-2511** | [Qwen/Qwen-Image-Edit-2511](https://huggingface.co/Qwen/Qwen-Image-Edit-2511) | Enhanced consistency + built-in LoRA (Nov 2025) |
+  | **Qwen-Image-Layered** | [Qwen/Qwen-Image-Layered](https://huggingface.co/Qwen/Qwen-Image-Layered) | Decomposes input into RGBA layers (Dec 2025) |
+
+  All models share the same DiT transformer core — acceleration methods are applicable across the entire series.
+
+  ## Prerequisites
+
+  ```bash
+  git clone https://github.com/vllm-project/vllm-omni.git
+  cd vllm-omni
+  uv venv
+  source .venv/bin/activate
+  uv pip install -e . vllm==0.18.0
+  ```
+
+  ## Usage
+
+  ### Text-to-Image
+  ```bash
+  python3 ./examples/offline_inference/text_to_image/text_to_image.py \
+      --model Qwen/Qwen-Image \
+      --prompt "a cup of coffee on the table" \
+      --output output_qwen_image.png \
+      --num-inference-steps 50 \
+      --cfg-scale 4.0
+  ```
+
+  ### Image Editing (Qwen-Image-Edit)
+  ```bash
+  python3 ./examples/offline_inference/image_to_image/image_edit.py \
+      --model Qwen/Qwen-Image-Edit \
+      --image qwen_bear.png \
+      --prompt "Let this mascot dance under the moon, surrounded by floating stars" \
+      --output output_image_edit.png \
+      --num-inference-steps 50 \
+      --cfg-scale 4.0
+  ```
+
+  ### Layered RGBA Decomposition
+  ```bash
+  python3 ./examples/offline_inference/image_to_image/image_edit.py \
+      --model Qwen/Qwen-Image-Layered \
+      --image input.png \
+      --prompt "" \
+      --output layered \
+      --num-inference-steps 50 \
+      --cfg-scale 4.0 \
+      --layers 4 \
+      --color-format "RGBA"
+  ```
+
+  ## Acceleration
+
+  Pick one cache backend AND any supported parallel strategy.
+
+  ### Cache-DiT
+  ```bash
+  python3 ./examples/offline_inference/text_to_image/text_to_image.py \
+      --model Qwen/Qwen-Image --prompt "..." --cache-backend cache_dit
+  ```
+
+  ### TeaCache
+  ```bash
+  python3 ./examples/offline_inference/text_to_image/text_to_image.py \
+      --model Qwen/Qwen-Image --prompt "..." --cache-backend tea_cache
+  ```
+
+  ### Ulysses / Ring Sequence Parallelism
+  ```bash
+  python3 ./examples/offline_inference/text_to_image/text_to_image.py \
+      --model Qwen/Qwen-Image --prompt "..." --ulysses-degree 4
+  ```
+  ```bash
+  python3 ./examples/offline_inference/text_to_image/text_to_image.py \
+      --model Qwen/Qwen-Image --prompt "..." --ring-degree 4
+  ```
+
+  ### CFG Parallelism (2 GPUs, non-distilled models with `cfg-scale > 1`)
+  ```bash
+  python3 ./examples/offline_inference/image_to_image/image_edit.py \
+      --model Qwen/Qwen-Image-Edit --image qwen_bear.png --prompt "..." \
+      --cfg-parallel-size 2 --num-inference-steps 50 --cfg-scale 4.0
+  ```
+
+  ### Tensor Parallelism
+  ```bash
+  python3 ./examples/offline_inference/text_to_image/text_to_image.py \
+      --model Qwen/Qwen-Image --prompt "..." --tensor-parallel-size 2
+  ```
+
+  ### CPU / Layerwise Offload (low VRAM)
+  ```bash
+  python3 ./examples/offline_inference/text_to_image/text_to_image.py \
+      --model Qwen/Qwen-Image --prompt "..." --enable-cpu-offload
+  ```
+  ```bash
+  python3 ./examples/offline_inference/image_to_image/image_edit.py \
+      --model Qwen/Qwen-Image-Edit --image qwen_bear.png --prompt "..." \
+      --enable-layerwise-offload
+  ```
+
+  ### VAE Patch Parallelism
+  ```bash
+  python3 ./examples/offline_inference/text_to_image/text_to_image.py \
+      --model Qwen/Qwen-Image --prompt "..." \
+      --height 1536 --width 1536 \
+      --ulysses-degree 2 --vae-patch-parallel-size 2
+  ```
+  Must be combined with another parallel method.
+
+  ### Quantization (Qwen-Image / Qwen-Image-2512 only)
+  ```bash
+  python3 ./examples/offline_inference/text_to_image/text_to_image.py \
+      --model Qwen/Qwen-Image --prompt "..." --quantization fp8 \
+      --ignored-layers "img_mlp"
+  ```
+  ```bash
+  python3 ./examples/offline_inference/text_to_image/text_to_image.py \
+      --model Qwen/Qwen-Image --prompt "..." --quantization int8
+  ```
+
+  Qwen-Image-Edit variants do **not** support quantization.
+
+  ## Configuration Tips
+
+  - **Cache + SP** is the recommended combo for long-sequence generation.
+  - **Sequence parallelism** (Ulysses / Ring) beats TP for high-res / long-sequence.
+  - **Tensor parallelism** is most useful when model weights alone don't fit on one GPU.
+  - **CFG parallelism** targets non-distilled diffusion with full CFG (not for guidance-distilled models).
+  - To reduce peak VRAM, use CPU/layerwise offload and/or VAE patch parallelism.
+  - TeaCache and Cache-DiT cannot be used together.
+  - `--enforce-eager` disables torch.compile if needed.
+
+  See the [Feature Support Table](https://github.com/vllm-project/vllm-omni/blob/main/docs/user_guide/diffusion_features.md#supported-models) and [Feature Compatibility Guide](https://github.com/vllm-project/vllm-omni/blob/main/docs/user_guide/feature_compatibility.md) for combinations.
+
+  ## References
+
+  - [Model card](https://huggingface.co/Qwen/Qwen-Image)
+  - [vLLM-Omni](https://github.com/vllm-project/vllm-omni)

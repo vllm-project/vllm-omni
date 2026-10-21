@@ -1,0 +1,360 @@
+meta:
+  title: "Qwen-Image-2.1"
+  slug: "qwen-image-2-1"
+  provider: "Qwen"
+  description: "Unified text-to-image and image-conditioned generation. A 7.1B single-stream DiT with block-causal attention and an exact cross-step prefix KV cache, paired with a Qwen3-VL-8B text encoder and a 16x RGBA autoencoder."
+  date_added: 2026-09-19
+  date_updated: 2026-09-19
+  tasks:
+    - omni
+  performance_headline: "One 7.1B DiT serves both text-to-image and editing; the prefix KV cache turns the text and reference-image portion of the sequence into a one-time cost instead of a per-step one"
+  related_recipes:
+    - Qwen/Qwen-Image
+  # Tri-state and fail-open: absent would mean "assumed to work everywhere",
+  # which claims more than leaving it out appears to. gb300 is the one profile
+  # with an end-to-end run behind it.
+  hardware:
+    gb300: verified
+  default_hardware: gb300
+
+model:
+  model_id: "Qwen/Qwen-Image-2.1"
+  # Support is not in any tagged vLLM-Omni release: it lives in the open PR
+  # vllm-project/vllm-omni#7759, which rebases onto vLLM 0.29.0. The weights are
+  # also still private on the Hub at the time of writing. Both must land before
+  # this recipe is runnable by a reader.
+  min_vllm_version: "0.29.0"
+  # No nightly_required: the builder defines that flag as "min_vllm_version
+  # hasn't shipped", and 0.29.0 is the current PyPI release. What is unshipped
+  # is vLLM-Omni's support for this model, which `dependencies` states directly.
+  docker_image: "vllm/vllm-omni:qwen-image21"
+  install:
+    # Docker-only until vllm-project/vllm-omni#7759 merges. `pip: false` is the
+    # schema's way to say "no wheel can run this" -- it hides the pip tab
+    # instead of showing a command that cannot work. Flip it back to a real
+    # command the moment a wheel carries the support.
+    docker:
+      note: "vllm-project/vllm-omni#7759 is still under review, so support ships only in the image below. Use Docker until it merges."
+    pip: false
+  architecture: dense
+  parameter_count: "16B"
+  active_parameters: "16B"
+  context_length: 0
+  base_args: []
+  base_env: {}
+
+omni:
+  # Object form, not bare ids: the shared catalog templates send guidance_scale,
+  # which this model has no parameter for and silently drops, and they omit
+  # true_cfg_scale. The server substitutes 4.0 for a missing value, which is
+  # inert unless a negative_prompt is also sent -- see the serving section.
+  tasks:
+    - id: t2i
+      description: "Text to image. 1024x1024 in ~4.5 s on one GB300 at 40 steps."
+      curl: |
+        curl -X POST http://localhost:8000/v1/images/generations \
+          -H "Content-Type: application/json" \
+          -d '{
+            "model": "Qwen/Qwen-Image-2.1",
+            "prompt": "A ceramic teapot on a wooden table, soft window light",
+            "size": "1024x1024",
+            "num_inference_steps": 40,
+            "true_cfg_scale": 1.0,
+            "seed": 42
+          }'
+      # `vllm bench serve` drives /v1/completions and /v1/chat/completions only;
+      # there is no image-generation workload in the harness. Timing one request
+      # is the honest substitute, not a throughput figure.
+      benchmark: |
+        # No image-generation benchmark exists in vllm bench serve.
+        # Time a single request instead:
+        time curl -s -o /dev/null -X POST http://localhost:8000/v1/images/generations \
+          -H "Content-Type: application/json" \
+          -d '{"model":"Qwen/Qwen-Image-2.1","prompt":"a teapot","size":"1024x1024","num_inference_steps":40,"true_cfg_scale":1.0,"seed":42}'
+    - id: i2i
+      # /v1/images/edits is the OpenAI-compatible edit endpoint and the default
+      # here. It takes multipart/form-data: the picture is a file upload and the
+      # settings are form fields. Sending it a JSON body resets the connection.
+      # Repeat -F image=@... for more pictures, up to four.
+      description: "Image-conditioned generation. Up to 4 reference images per request; a fifth is rejected."
+      curl: |
+        curl -X POST http://localhost:8000/v1/images/edits \
+          -F image=@plate.png \
+          -F 'prompt=Write the words "FRESH BASIL" on this plate in dark green lettering' \
+          -F model=Qwen/Qwen-Image-2.1 \
+          -F size=1024x1024 \
+          -F num_inference_steps=40 \
+          -F true_cfg_scale=1.0 \
+          -F seed=42
+        # The picture comes back base64-encoded at .data[0].b64_json
+        #
+        # There is a second way in, if you would rather send JSON: the chat
+        # endpoint takes image_url content parts and returns the picture at
+        # .choices[0].message.content[0].image_url.url
+
+dependencies:
+  - note: "vLLM-Omni must be built from PR #7759. Qwen-Image-2.1 is not in a tagged release and not on main either, so a plain clone cannot serve it."
+    command: "git clone https://github.com/vllm-project/vllm-omni.git && cd vllm-omni && git fetch origin pull/7759/head:qwen-image-2.1 && git checkout qwen-image-2.1 && uv pip install -e ."
+
+features: {}
+
+opt_in_features: []
+
+variants:
+  default:
+    label: "BF16"
+    precision: bf16
+    vram_minimum_gb: 40
+    description: "Checkpoint precision. 33.1 GB of weights. Measured 34.0 GB peak on one GB300 at 1024x1024 with --vae-use-tiling (40 steps, CFG off); the contributors report ~40 GB on GB200. Sized by the repo formula (ceil(33.1 GB x 1.2) = 40), which the 34.0 GB measurement sits under."
+  fp8:
+    precision: fp8
+    vram_minimum_gb: 40
+    description: "Online FP8 scoped to the DiT, holding the composition-sensitive `img_mlp` layers in BF16 (64 of 160 block linears quantized). 32 GB peak against 34 GB in BF16, and no faster. Quantizing the text encoder instead saves more — about 28 GB — and is one more key in the same JSON."
+    extra_args:
+      - "--diffusion-quantization-config"
+      - '{"transformer":{"method":"fp8","ignored_layers":["img_mlp"]}}'
+
+compatible_strategies:
+  - single_node_tp
+
+hardware_overrides: {}
+
+strategy_overrides: {}
+
+guide: |
+  ## Overview
+
+  vLLM-Omni accelerates Qwen-Image 2.1 through cross-step prefix KV cache reuse and dedicated CUDA Graphs, reducing redundant computation and kernel launch overhead. Request-level and step-level continuous batching improve GPU utilization and throughput, with phase-aware prefill and decode scheduling. It also supports tensor and Ulysses sequence parallelism, distributed VAE decoding with adaptive OOM recovery, FP8 weights and prefix KV storage, and CPU offloading for varying memory budgets.
+
+  One pipeline class, `QwenImage21Pipeline`, serves both text-to-image and
+  image-conditioned generation (editing). Prompt and reference images are encoded
+  together by a Qwen3-VL vision-language model, so an edit request takes the same
+  serving path as plain text-to-image, and there is no separate edit model to load.
+
+  | Component | Class | On disk |
+  |---|---|---|
+  | Text encoder | `Qwen3VLForConditionalGeneration` | bf16, 17.5 GB |
+  | DiT | `QwenImage21Transformer2DModel` | bf16, 14.2 GB |
+  | Autoencoder | `AutoencoderKLQwenImage21` | fp32, 1.4 GB |
+
+  The autoencoder compresses 16x into a 64-channel latent and carries 4 channels in
+  and out, so RGBA transparency survives the round trip.
+
+  ## Sampling defaults
+
+  Sample at **40 steps with classifier-free guidance off** — `num_inference_steps=40`
+  and `true_cfg_scale=1.0` in the reference implementation's pipeline signature
+  ([diffusers#14804](https://github.com/huggingface/diffusers/pull/14804)).
+
+  ```bash
+  --num-inference-steps 40 --cfg-scale 1.0
+  ```
+
+  `--cfg-scale` above 1 engages only with a negative prompt; otherwise it is ignored
+  with a warning. When it engages, the DiT runs twice per step, roughly doubling
+  latency.
+
+  ## Prerequisites
+
+  Support is not in a tagged release and, as of this writing, not yet merged
+  (vllm-project/vllm-omni#7759).
+
+  The pipeline itself is known-good: brought up from PR #7759 on one NVIDIA
+  GB300, it generated a 1024x1024 PNG in **4.5 s** over 40 steps at **34.0 GB**
+  peak.
+
+  ```bash
+  git clone https://github.com/vllm-project/vllm-omni.git && cd vllm-omni
+  git fetch origin pull/7759/head:qwen-image-2.1 && git checkout qwen-image-2.1
+  uv venv --python 3.12 --seed && source .venv/bin/activate
+  uv pip install vllm==0.29.0 --torch-backend=auto && uv pip install -e .
+  ```
+
+  ## Offline inference
+
+  ```bash
+  # text-to-image
+  python examples/offline_inference/text_to_image/text_to_image.py \
+    --model Qwen/Qwen-Image-2.1 \
+    --prompt "A ceramic teapot on a wooden table" \
+    --output t2i.png --num-inference-steps 40 --cfg-scale 1.0
+
+  # image-conditioned
+  python examples/offline_inference/image_to_image/image_edit.py \
+    --model Qwen/Qwen-Image-2.1 --color-format RGBA --seed 42 \
+    --image input1.png input2.png \
+    --prompt "Combine these images into a single scene" \
+    --output edit.png --num-inference-steps 40 --cfg-scale 1.0
+  ```
+
+  Up to 4 reference images per request; a fifth is rejected with a 400. Each is resized
+  independently to ~1024x1024 of area, so they may differ in aspect ratio, and each
+  is tagged `<image1>`, `<image2>` in the order given, so an ordinal reference in the
+  prompt binds a phrase to a photo.
+
+  `--color-format RGBA` preserves transparency (the shared example defaults to RGB).
+  Width and height are floored to a multiple of 32, never rejected. When omitted on an edit request
+  the output size derives from the last reference image's aspect ratio at ~1024x1024.
+
+  ## Online serving
+
+  ```bash
+  vllm serve Qwen/Qwen-Image-2.1 --omni --port 8091
+  ```
+
+  Add `--step-execution --max-num-seqs 8` to batch requests at the same KV-cache
+  phase. Admission is all-or-nothing: once a wave is past its first denoising step, a
+  new arrival waits for it to finish, even if `max-num-seqs` has room.
+
+  Send `num_inference_steps` on every request; the server's own default is 50, not
+  the 40 this checkpoint wants. `true_cfg_scale` defaults to 4.0 but only applies
+  alongside a `negative_prompt` — send one without the other and you get guidance
+  at 4.0 and roughly double the compute.
+
+  ### Text to image
+
+  Send JSON to `/v1/images/generations`. The picture comes back base64-encoded at
+  `.data[0].b64_json`.
+
+  ```bash
+  curl -X POST http://localhost:8091/v1/images/generations \
+    -H "Content-Type: application/json" \
+    -d '{"model": "Qwen/Qwen-Image-2.1",
+         "prompt": "A ceramic teapot on a wooden table",
+         "size": "1024x1024",
+         "num_inference_steps": 40,
+         "true_cfg_scale": 1.0,
+         "seed": 42}'
+  ```
+
+  ### Image editing
+
+  Send a **form**, not JSON, to `/v1/images/edits`. The picture is a file upload
+  and everything else is a form field. A JSON body to this endpoint resets the
+  connection. Repeat `-F image=@...` for more pictures, up to four.
+
+  ```bash
+  curl -X POST http://localhost:8091/v1/images/edits \
+    -F image=@plate.png \
+    -F 'prompt=Write the words "FRESH BASIL" on this plate in dark green lettering' \
+    -F model=Qwen/Qwen-Image-2.1 \
+    -F size=1024x1024 \
+    -F num_inference_steps=40 \
+    -F true_cfg_scale=1.0 \
+    -F seed=42
+  ```
+
+  The reply has the same shape as text to image: the picture is at
+  `.data[0].b64_json`.
+
+  If you would rather send JSON, the chat endpoint also accepts pictures. It puts
+  the result somewhere different — `.choices[0].message.content[0].image_url.url`:
+
+  ```bash
+  curl -X POST http://localhost:8091/v1/chat/completions \
+    -H "Content-Type: application/json" \
+    -d '{"model": "Qwen/Qwen-Image-2.1",
+         "messages": [{"role": "user", "content": [
+           {"type": "image_url", "image_url": {"url": "data:image/png;base64,<BASE64>"}},
+           {"type": "text", "text": "Write the words \"FRESH BASIL\" on this plate"}
+         ]}],
+         "modalities": ["image"],
+         "extra_body": {"size": "1024x1024", "num_inference_steps": 40,
+                        "true_cfg_scale": 1.0, "seed": 42}}'
+  ```
+
+  ## Prefix KV cache
+
+  On automatically; rebuilt per generation, so nothing leaks between requests. The
+  prompt and any reference images are cached after the first denoising step and
+  reused for the rest, which is exact rather than approximate.
+
+  It pays off in proportion to how much prefix there is: repeating a prompt costs
+  about a third of the first submission, four reference images leave only about a
+  fifth of the sequence to recompute, and plain short-prompt text-to-image has
+  almost nothing to cache. Changing the tail of a prompt loses the saving.
+
+  For long-prompt or multi-image workloads it can be stored in FP8 via the stage
+  `extras` key `prefix_kv_cache_dtype` — on the command line through
+  `--stage-overrides '{"0":{"extras":{"prefix_kv_cache_dtype":"fp8_v"}}}'`, or as a
+  stage field in a deploy YAML. `"fp8_v"` quantizes V only, `"fp8"` quantizes K too — the contributors
+  measured ~41 dB and ~35 dB PSNR against BF16. A quantized cache returns less of
+  the speed-up than one in the native dtype, and is not CUDA-graph capturable, so
+  those requests fall back to eager decode.
+
+  ## CUDA graphs
+
+  Fixed-shape decode steps are captured automatically (`enforce_eager=False` by
+  default); prefill stays eager. Each image layout gets its own entry and prefix K/V
+  is copied into static buffers before replay, which costs memory. TP, SP/ring, HSDP,
+  offload and cache hooks, compiled blocks, quantized KV caches, dynamic LoRA and
+  padded text masks each force eager decode. Disable with `--enforce-eager`; the AR
+  engine's `compilation_config.cudagraph_mode` does not reach this path.
+
+  Expect the first request after startup to cost about 1.3x a later one.
+  `--enforce-eager` does not remove that cost, so it is not graph capture and
+  disabling graphs will not flatten startup.
+
+  ## Quantization
+
+  Online FP8, per component:
+
+  ```python
+  from vllm_omni import Omni
+  omni = Omni(model="Qwen/Qwen-Image-2.1", quantization_config={
+      "transformer": {"method": "fp8", "ignored_layers": ["img_mlp"]},
+      "text_encoder": {"method": "fp8"},
+  })
+  ```
+
+  Only the DiT's block-internal linears are eligible; boundary projections stay
+  BF16. Measured by the vLLM-Omni contributors on GB200 at 1024x1024, 50 steps:
+
+  | Config | Quantized | Avg PSNR vs BF16 | Peak memory |
+  |---|---|---|---|
+  | BF16 | 0 / 160 | — | 40.0 GB |
+  | FP8, all layers | 160 / 160 | 26.1 dB | 33.4 GB |
+  | FP8, `ignored_layers=["img_mlp"]` | 64 / 160 | 29.7 dB | 38.3 GB |
+
+  Measured here on one GB300 at 1024x1024, 40 steps, same prompt and seed in each
+  case:
+
+  | Config | Peak memory | Time per image |
+  |---|---|---|
+  | BF16 | 34.0 GB | 3282-4492 ms |
+  | DiT FP8, `img_mlp` kept BF16 | 32.0-32.7 GB | 3356-4706 ms |
+  | Text-encoder FP8 | **27.5-28.1 GB** | 3427-4770 ms |
+
+  The text encoder is the bigger saving by a wide margin: about 6 GB against about
+  2 GB. Neither runs faster.
+
+  Keeping `img_mlp` in BF16 protects composition but gives back most of the saving.
+  The larger win is the text encoder: in a separate GB200 run, peak memory went ~41.0
+  GiB in BF16 to ~34.4 GiB with text-encoder FP8, and ~28.1 GiB with the DiT too. Its
+  vision tower and unused `lm_head` are excluded by construction, but reference-image
+  tokens still cross the quantized language-model linears, so text-encoder FP8 does
+  reach the edit path. On Blackwell FP8 buys memory, not speed.
+
+  ## Limitations
+
+  - Cache backends (`cache_dit`, `tea_cache`) unsupported — the model's own prefix
+    cache conflicts with step-skipping hooks.
+  - Sequence parallelism is Ulysses only — no ring attention, no pipeline parallelism.
+  - True CFG only; there is no `guidance_scale`.
+  - `/v1/images/edits` takes **multipart/form-data**, not JSON. Send the picture
+    as a file upload and the settings as form fields. Posting a JSON body to it
+    resets the connection, which is easy to mistake for a broken endpoint.
+  - Passing a picture as a `data:` URL in the `url` form field is limited to
+    **1024 KB per part**. A 512x512 PNG from this model is about 1 MB, so it
+    usually fails with `Part exceeded maximum size of 1024KB`. File uploads have
+    no such limit. Base64 inside a form field only suits small images.
+  - `/v1/chat/completions` with `image_url` content parts works too, and returns
+    the picture at `.choices[0].message.content[0].image_url.url`.
+  - NVIDIA GPUs only.
+  - VAE tiling (`--vae-use-tiling`) decodes in 512px tiles at 384px stride, halving
+    on CUDA OOM down to 128px; tile sizes are not exposed as engine arguments.
+
+  ## References
+
+  - [In-repo recipe](https://github.com/vllm-project/vllm-omni/blob/qwen-image-2.1/recipes/Qwen/Qwen-Image-2.1.md)
+  - [Feature support matrix](https://github.com/vllm-project/vllm-omni/blob/qwen-image-2.1/docs/user_guide/diffusion_features.md)

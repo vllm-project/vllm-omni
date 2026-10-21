@@ -1,0 +1,412 @@
+meta:
+  title: "LTX-2.5"
+  slug: "ltx-2.5"
+  provider: "Lightricks"
+  description: "19B diffusion transformer for joint video and synchronized audio generation, served via vLLM-Omni"
+  date_added: 2026-08-11
+  date_updated: 2026-08-15
+  tasks:
+    - omni
+  related_recipes:
+    - Wan-AI/Wan2.2-T2V-A14B-Diffusers
+  default_hardware: b300
+  hardware:
+    h200: verified
+    b300: verified
+    dgx_spark_gb10: supported
+    rtx_pro_5000: supported
+    rtx_pro_6000: supported
+
+model:
+  model_id: "Lightricks/LTX-2.5-Diffusers"
+  min_vllm_version: "0.27.0"
+  install:
+    docker: false
+  architecture: dense
+  parameter_count: "19B"
+  active_parameters: "19B"
+  context_length: 0
+  base_args: []
+  base_env: {}
+
+features: {}
+
+opt_in_features: []
+
+variants:
+  default:
+    label: "BF16"
+    precision: bf16
+    vram_minimum_gb: 80
+    description: "Original BF16 weights with Full/SFT and distilled one-stage/two-stage generation paths"
+    supported_hardware:
+      - h100
+      - h200
+      - b200
+      - gb200
+      - b300
+      - gb300
+      - rtx_pro_6000
+      - mi300x
+      - mi325x
+      - mi355x
+    hardware_overrides:
+      b200:
+        extra_args:
+          - "--diffusion-attention-backend"
+          - "CUDNN_ATTN"
+      gb200:
+        extra_args:
+          - "--diffusion-attention-backend"
+          - "CUDNN_ATTN"
+      b300:
+        extra_args:
+          - "--diffusion-attention-backend"
+          - "CUDNN_ATTN"
+      gb300:
+        extra_args:
+          - "--diffusion-attention-backend"
+          - "CUDNN_ATTN"
+  fp8:
+    label: "FP8"
+    precision: fp8
+    precision_hardware:
+      brand: NVIDIA
+    vram_minimum_gb: 61
+    description: "Online FP8 quantization for lower memory use"
+    supported_hardware:
+      - h100
+      - h200
+      - b200
+      - gb200
+      - b300
+      - gb300
+      - dgx_spark_gb10
+      - rtx_pro_5000
+      - rtx_pro_6000
+    extra_args:
+      - "--quantization"
+      - "fp8"
+    hardware_overrides:
+      b200:
+        extra_args:
+          - "--diffusion-attention-backend"
+          - "CUDNN_ATTN"
+      gb200:
+        extra_args:
+          - "--diffusion-attention-backend"
+          - "CUDNN_ATTN"
+      b300:
+        extra_args:
+          - "--diffusion-attention-backend"
+          - "CUDNN_ATTN"
+      gb300:
+        extra_args:
+          - "--diffusion-attention-backend"
+          - "CUDNN_ATTN"
+
+compatible_strategies: []
+
+hardware_overrides: {}
+
+strategy_overrides: {}
+
+omni:
+  port: 8000
+  variant_label: "Quantization"
+  variant_hint: "Choose BF16 for original weights or FP8 to reduce memory. Unavailable options are disabled for the selected hardware."
+  task_label: "Generation Mode"
+  task_hint: "Choose Full/SFT or distilled weights, then one-stage or two-stage T2V/I2V execution."
+  task_axes:
+    - id: stage
+      label: "Stage"
+      options:
+        - id: one_stage
+          label: "One-stage"
+        - id: two_stage
+          label: "Two-stage"
+    - id: weights
+      label: "Weights"
+      options:
+        - id: full
+          label: "Full"
+        - id: distilled
+          label: "Distilled"
+    - id: x2v
+      label: "X2V"
+      options:
+        - id: t2v
+          label: "T2V"
+        - id: i2v
+          label: "I2V"
+  tasks:
+    - id: t2v
+      key: full_one_stage_t2v
+      label: "Full one-stage T2V"
+      axes:
+        stage: one_stage
+        weights: full
+        x2v: t2v
+      vram_minimum_gb: 80
+      endpoint: "/v1/videos/sync"
+      description: "Full/SFT text-to-video generation with 30 denoising steps and synchronized audio."
+      extra_args:
+        - "--model-class-name"
+        - "LTX2Pipeline"
+      curl: |
+        curl -sS --fail-with-body \
+          -X POST http://localhost:8000/v1/videos/sync \
+          -F 'prompt=A cinematic shot of a red fox walking through a snowy forest at dawn, the camera tracking alongside, snow crunching underfoot.' \
+          -o ltx25-one-stage-t2v.mp4
+
+    - id: i2v
+      key: full_one_stage_i2v
+      label: "Full one-stage I2V"
+      axes:
+        stage: one_stage
+        weights: full
+        x2v: i2v
+      vram_minimum_gb: 80
+      endpoint: "/v1/videos/sync"
+      description: "Full/SFT first-frame image-to-video generation with 30 denoising steps and synchronized audio."
+      extra_args:
+        - "--model-class-name"
+        - "LTX2Pipeline"
+      curl: |
+        export FIRST_FRAME=/absolute/path/to/first-frame.png
+
+        curl -sS --fail-with-body \
+          -X POST http://localhost:8000/v1/videos/sync \
+          -F "input_reference=@${FIRST_FRAME};type=image/png" \
+          -F 'prompt=The red fox walks forward while the camera tracks alongside.' \
+          -o ltx25-one-stage-i2v.mp4
+
+    - id: t2v
+      key: distilled_one_stage_t2v
+      label: "Distilled one-stage T2V"
+      axes:
+        stage: one_stage
+        weights: distilled
+        x2v: t2v
+      vram_minimum_gb: 79
+      endpoint: "/v1/videos/sync"
+      description: "Positive-only text-to-video generation with the fixed eight-step distilled schedule."
+      extra_args:
+        - "--model-class-name"
+        - "LTX2DistilledOneStagePipeline"
+      curl: |
+        curl -sS --fail-with-body \
+          -X POST http://localhost:8000/v1/videos/sync \
+          -F 'prompt=A cinematic shot of a red fox walking through a snowy forest at dawn, the camera tracking alongside, snow crunching underfoot.' \
+          -o ltx25-distilled-one-stage-t2v.mp4
+
+    - id: i2v
+      key: distilled_one_stage_i2v
+      label: "Distilled one-stage I2V"
+      axes:
+        stage: one_stage
+        weights: distilled
+        x2v: i2v
+      vram_minimum_gb: 79
+      endpoint: "/v1/videos/sync"
+      description: "Positive-only first-frame I2V with CRF-18 conditioning and the fixed eight-step schedule."
+      extra_args:
+        - "--model-class-name"
+        - "LTX2DistilledOneStagePipeline"
+      curl: |
+        export FIRST_FRAME=/absolute/path/to/first-frame.png
+
+        curl -sS --fail-with-body \
+          -X POST http://localhost:8000/v1/videos/sync \
+          -F "input_reference=@${FIRST_FRAME};type=image/png" \
+          -F 'prompt=The red fox walks forward while the camera tracks alongside.' \
+          -o ltx25-distilled-one-stage-i2v.mp4
+
+    - id: t2v
+      key: distilled_two_stage_t2v
+      label: "Distilled two-stage T2V"
+      axes:
+        stage: two_stage
+        weights: distilled
+        x2v: t2v
+      vram_minimum_gb: 114
+      endpoint: "/v1/videos/sync"
+      description: "Eight-step low-resolution generation, x2 latent upsampling, and three-step full-resolution refinement."
+      extra_args:
+        - "--model-class-name"
+        - "LTX2DistilledTwoStagePipeline"
+      curl: |
+        curl -sS --fail-with-body \
+          -X POST http://localhost:8000/v1/videos/sync \
+          -F 'prompt=A cinematic shot of a red fox walking through a snowy forest at dawn, the camera tracking alongside, snow crunching underfoot.' \
+          -o ltx25-distilled-two-stage-t2v.mp4
+
+    - id: i2v
+      key: distilled_two_stage_i2v
+      label: "Distilled two-stage I2V"
+      axes:
+        stage: two_stage
+        weights: distilled
+        x2v: i2v
+      vram_minimum_gb: 114
+      endpoint: "/v1/videos/sync"
+      description: "First-frame I2V with an eight-step first stage and three-step full-resolution refinement."
+      extra_args:
+        - "--model-class-name"
+        - "LTX2DistilledTwoStagePipeline"
+      curl: |
+        export FIRST_FRAME=/absolute/path/to/first-frame.png
+
+        curl -sS --fail-with-body \
+          -X POST http://localhost:8000/v1/videos/sync \
+          -F "input_reference=@${FIRST_FRAME};type=image/png" \
+          -F 'prompt=The red fox walks forward while the camera tracks alongside.' \
+          -o ltx25-distilled-two-stage-i2v.mp4
+
+    - id: t2v
+      key: full_two_stage_t2v
+      label: "Full two-stage T2V"
+      axes:
+        stage: two_stage
+        weights: full
+        x2v: t2v
+      vram_minimum_gb: 114
+      endpoint: "/v1/videos/sync"
+      description: "Full/SFT Stage 1, x2 latent upsampling, and LoRA-450 three-step refinement."
+      extra_args:
+        - "--model-class-name"
+        - "LTX2TwoStagePipeline"
+      curl: |
+        curl -sS --fail-with-body \
+          -X POST http://localhost:8000/v1/videos/sync \
+          -F 'prompt=A cinematic shot of a red fox walking through a snowy forest at dawn, the camera tracking alongside, snow crunching underfoot.' \
+          -o ltx25-full-two-stage-t2v.mp4
+
+    - id: i2v
+      key: full_two_stage_i2v
+      label: "Full two-stage I2V"
+      axes:
+        stage: two_stage
+        weights: full
+        x2v: i2v
+      vram_minimum_gb: 114
+      endpoint: "/v1/videos/sync"
+      description: "Full/SFT first-frame I2V followed by x2 latent upsampling and LoRA-450 refinement."
+      extra_args:
+        - "--model-class-name"
+        - "LTX2TwoStagePipeline"
+      curl: |
+        export FIRST_FRAME=/absolute/path/to/first-frame.png
+
+        curl -sS --fail-with-body \
+          -X POST http://localhost:8000/v1/videos/sync \
+          -F "input_reference=@${FIRST_FRAME};type=image/png" \
+          -F 'prompt=The red fox walks forward while the camera tracks alongside.' \
+          -o ltx25-full-two-stage-i2v.mp4
+
+dependencies:
+  - note: "LTX-2.5 support is provided by current vLLM-Omni main."
+    command: "uv pip install git+https://github.com/vllm-project/vllm-omni.git"
+
+guide: |
+  ## Overview
+
+  [LTX-2.5-Diffusers](https://huggingface.co/Lightricks/LTX-2.5-Diffusers)
+  is a dense 19B diffusion transformer for video with synchronized 48 kHz
+  stereo audio. vLLM-Omni supports T2V and first-frame I2V through four
+  pipeline classes:
+
+  | Pipeline | Mode | Default size | Schedule |
+  |----------|------|------------|----------|
+  | `LTX2Pipeline` | Full/SFT one-stage | 960x544 | 30 steps |
+  | `LTX2TwoStagePipeline` | Full/SFT two-stage | 1920x1088 | 30 + 3 steps |
+  | `LTX2DistilledOneStagePipeline` | Distilled one-stage | 960x544 | 8 steps |
+  | `LTX2DistilledTwoStagePipeline` | Distilled two-stage | 1920x1088 | 8 + 3 steps |
+
+  Select the class with `--model-class-name`; no `--task-type` flag is needed.
+  The supported model ID is `Lightricks/LTX-2.5-Diffusers`. The gated raw
+  `Lightricks/LTX-2.5` repository only supplies official two-stage sidecars and
+  is not directly loadable with `--model`.
+
+  ## Quantization
+
+  Choose **BF16** to keep the original weights, or **FP8** to add online
+  `--quantization fp8` and reduce memory use. The command builder disables a
+  quantization option when it is not available on the selected hardware. FP8
+  is available on the listed NVIDIA Hopper and Blackwell profiles; AMD uses
+  BF16. B200, GB200, B300, and GB300 use cuDNN attention for both options.
+
+  ## Prerequisites
+
+  - Accept both Lightricks model licenses and run `hf auth login`.
+  - Use current vLLM-Omni main, targeting vLLM 0.27+.
+  - Ensure `ffmpeg` and `ffprobe` are on `PATH`.
+  - I2V requires PyAV with the `libx264` encoder.
+
+  ## Installation
+
+  ```bash
+  uv venv && source .venv/bin/activate
+  uv pip install git+https://github.com/vllm-project/vllm-omni.git
+  hf auth login
+  ```
+
+  ## Offline inference
+
+  Choose `PIPELINE`, `WIDTH`, `HEIGHT`, and `STEPS` from the table. This example
+  selects the distilled two-stage path:
+
+  ```bash
+  export MODEL=Lightricks/LTX-2.5-Diffusers
+  export PIPELINE=LTX2DistilledTwoStagePipeline
+  export WIDTH=1920 HEIGHT=1088 STEPS=8
+
+  python examples/offline_inference/text_to_video/text_to_video.py \
+    --model "${MODEL}" --model-class-name "${PIPELINE}" \
+    --prompt "A cinematic red fox walking through a snowy forest at dawn." \
+    --width "${WIDTH}" --height "${HEIGHT}" --num-frames 121 \
+    --num-inference-steps "${STEPS}" --frame-rate 24 --fps 24 --seed 42 \
+    --output ltx25-t2v.mp4
+  ```
+
+  For first-frame I2V, use the generic image-to-video example with the same
+  pipeline values and one image:
+
+  ```bash
+  python examples/offline_inference/image_to_video/image_to_video.py \
+    --model "${MODEL}" --model-class-name "${PIPELINE}" \
+    --image /absolute/path/to/first-frame.png \
+    --prompt "The red fox walks forward while the camera tracks alongside." \
+    --width "${WIDTH}" --height "${HEIGHT}" --num-frames 121 \
+    --num-inference-steps "${STEPS}" --frame-rate 24 --fps 24 --seed 42 \
+    --output ltx25-i2v.mp4
+  ```
+
+  ## Online serving
+
+  ```bash
+  vllm serve "${MODEL}" \
+    --omni \
+    --model-class-name "${PIPELINE}"
+  ```
+
+  Use the task presets on this page for complete T2V and I2V requests. Restart
+  the server after changing `PIPELINE`.
+
+  ## Constraints
+
+  - Online `width`, `height`, `num_frames`, `fps`, and
+    `num_inference_steps` are optional and use the selected pipeline defaults
+    when omitted. `seed` is optional and random when omitted.
+  - `num_frames` must be `8k+1` when overridden.
+  - One-stage dimensions must be divisible by 32; two-stage final dimensions
+    must be divisible by 64.
+  - Distilled pipelines are positive-only and reject negative prompts.
+  - I2V accepts exactly one initial RGB image per prompt and uses the official
+    CRF-18 conditioning path by default.
+
+  ## References
+
+  - [LTX-2.5 Diffusers model card](https://huggingface.co/Lightricks/LTX-2.5-Diffusers)
+  - [Official LTX-2 repository](https://github.com/Lightricks/LTX-2)
+  - [vLLM-Omni LTX-2.5 recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/LTX/LTX-2.5.md)
