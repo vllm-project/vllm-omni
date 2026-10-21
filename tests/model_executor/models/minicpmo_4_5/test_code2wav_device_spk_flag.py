@@ -36,9 +36,11 @@ class _FakeToken2Wav:
         self.kwargs = kwargs
         self.device_spk_calls = 0
         self.trt_spk_calls = 0
+        self.device_spk_use_trt = None
 
-    def enable_device_spk_embedding(self):
+    def enable_device_spk_embedding(self, *, use_trt=True):
         self.device_spk_calls += 1
+        self.device_spk_use_trt = use_trt
 
     def enable_trt_spk_embedding(self):
         self.trt_spk_calls += 1
@@ -50,11 +52,11 @@ class _FakeBackend:
         self.kwargs = kwargs
 
 
-@pytest.fixture
-def npu_platform(monkeypatch):
-    """Route ``_build_backend`` down the NPU branch on a CPU-only machine."""
-    monkeypatch.setattr(current_omni_platform, "is_npu", lambda: True)
-    monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: False)
+@pytest.fixture(params=["cuda", "npu"])
+def device_platform(monkeypatch, request):
+    """Exercise each device speaker backend without loading model assets."""
+    monkeypatch.setattr(current_omni_platform, "is_npu", lambda: request.param == "npu")
+    monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: request.param == "cuda")
 
 
 def _build_backend(tmp_path, monkeypatch, extra):
@@ -84,32 +86,66 @@ def _build_backend(tmp_path, monkeypatch, extra):
 
 
 @pytest.mark.parametrize("value", [False, "false", "  FALSE  ", 0, "0"])
-def test_explicit_false_keeps_the_cpu_onnxruntime_fallback(tmp_path, monkeypatch, npu_platform, value):
+def test_explicit_false_keeps_the_cpu_onnxruntime_fallback(tmp_path, monkeypatch, device_platform, value):
     _, token2wav = _build_backend(tmp_path, monkeypatch, {"token2wav_device_spk": value})
     assert token2wav.device_spk_calls == 0
     assert token2wav.trt_spk_calls == 0
 
 
 @pytest.mark.parametrize("value", [None, True, "true", 1, "1"])
-def test_unset_or_true_enables_the_device_embedding(tmp_path, monkeypatch, npu_platform, value):
+def test_unset_or_true_enables_the_device_embedding(tmp_path, monkeypatch, device_platform, value):
     extra = {} if value is None else {"token2wav_device_spk": value}
     _, token2wav = _build_backend(tmp_path, monkeypatch, extra)
     assert token2wav.device_spk_calls == 1
+    assert token2wav.device_spk_use_trt is False
+    assert token2wav.trt_spk_calls == 0
 
 
 @pytest.mark.parametrize("value", ["maybe", "yes", 2, 1.5, []])
-def test_invalid_value_is_rejected(tmp_path, monkeypatch, npu_platform, value):
+def test_invalid_value_is_rejected(tmp_path, monkeypatch, device_platform, value):
     with pytest.raises(ValueError, match="token2wav_device_spk"):
         _build_backend(tmp_path, monkeypatch, {"token2wav_device_spk": value})
 
 
-def test_invalid_value_is_rejected_off_npu_too(tmp_path, monkeypatch):
+def test_invalid_value_is_rejected_off_device_too(tmp_path, monkeypatch):
     """The flag is parsed before the platform branch, so a typo fails anywhere."""
     monkeypatch.setattr(current_omni_platform, "is_npu", lambda: False)
     monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: False)
 
     with pytest.raises(ValueError, match="token2wav_device_spk"):
         _build_backend(tmp_path, monkeypatch, {"token2wav_device_spk": "maybe"})
+
+
+@pytest.mark.parametrize("use_trt", [False, True])
+def test_cuda_speaker_backend_preserves_lazy_model_loading(tmp_path, monkeypatch, use_trt):
+    """The facade can select torch on CUDA while other callers retain TRT."""
+    from vllm_omni.model_executor.models.cosyvoice3 import speaker_embedding_torch
+
+    monkeypatch.setattr(current_omni_platform, "is_npu", lambda: False)
+    core = token2wav_module.StepAudio2Token2WavCore(str(tmp_path), device="cuda")
+    calls = []
+    speaker = object()
+
+    def torch_backend(path, *, device):
+        assert path == f"{tmp_path}/campplus.onnx"
+        assert device == core.device
+        calls.append("torch")
+        return speaker
+
+    monkeypatch.setattr(speaker_embedding_torch, "get_campplus_torch", torch_backend)
+    monkeypatch.setattr(core, "enable_trt_spk_embedding", lambda: calls.append("trt"))
+    facade = token2wav_module.MiniCPMO45Token2wav.__new__(token2wav_module.MiniCPMO45Token2wav)
+    facade._core = core
+    if use_trt:
+        facade.enable_device_spk_embedding()
+        assert calls == ["trt"]
+    else:
+        facade.enable_device_spk_embedding(use_trt=False)
+        assert calls == ["torch"]
+        assert core._spk_model is speaker
+    assert core._models_loaded is False
+    assert core._flow is None
+    assert core._hift is None
 
 
 _OTHER_DEFAULTS = {
@@ -136,12 +172,12 @@ _OTHER_DEFAULTS = {
 
 
 @pytest.mark.parametrize("key", sorted(_OTHER_DEFAULTS))
-def test_other_stage_extra_flags_are_strict(tmp_path, monkeypatch, npu_platform, key):
+def test_other_stage_extra_flags_are_strict(tmp_path, monkeypatch, device_platform, key):
     with pytest.raises(ValueError, match=key):
         _build_backend(tmp_path, monkeypatch, {key: "maybe"})
 
 
-def test_quoted_false_disables_other_stage_flags(tmp_path, monkeypatch, npu_platform):
+def test_quoted_false_disables_other_stage_flags(tmp_path, monkeypatch, device_platform):
     model, _ = _build_backend(
         tmp_path,
         monkeypatch,
@@ -156,7 +192,7 @@ def test_quoted_false_disables_other_stage_flags(tmp_path, monkeypatch, npu_plat
     assert model._ref_prefetch_enabled is False
 
 
-def test_quoted_false_disables_default_on_flags(tmp_path, monkeypatch, npu_platform):
+def test_quoted_false_disables_default_on_flags(tmp_path, monkeypatch, device_platform):
     """`cfm_fused_body` and `enable_whole_euler` default on: a quoted "false" must still turn them off."""
     model, _ = _build_backend(
         tmp_path,
@@ -167,7 +203,7 @@ def test_quoted_false_disables_default_on_flags(tmp_path, monkeypatch, npu_platf
     assert model._cfm_graph_config["enable_whole_euler"] is False
 
 
-def test_quoted_true_enables_flags_previously_compared_with_is_true(tmp_path, monkeypatch, npu_platform):
+def test_quoted_true_enables_flags_previously_compared_with_is_true(tmp_path, monkeypatch, device_platform):
     model, _ = _build_backend(
         tmp_path,
         monkeypatch,
@@ -188,7 +224,7 @@ def test_quoted_true_enables_flags_previously_compared_with_is_true(tmp_path, mo
     assert model._precapture_empty_cache is True
 
 
-def test_explicit_null_falls_back_to_the_default(tmp_path, monkeypatch, npu_platform):
+def test_explicit_null_falls_back_to_the_default(tmp_path, monkeypatch, device_platform):
     """`key: ~` in a YAML override means "unset", not "false"."""
     model, token2wav = _build_backend(
         tmp_path,
@@ -201,25 +237,27 @@ def test_explicit_null_falls_back_to_the_default(tmp_path, monkeypatch, npu_plat
         },
     )
     assert token2wav.device_spk_calls == 1
+    assert token2wav.device_spk_use_trt is False
+    assert token2wav.trt_spk_calls == 0
     assert model._cfm_graph_config["fused_body"] is True
     assert model._cfm_graph_config["enable_whole_euler"] is True
     assert model._precapture_pending is True
 
 
 @pytest.mark.parametrize("key", ["token2wav_allow_tf32", "code2wav_allow_tf32"])
-def test_invalid_tf32_value_fails_at_startup_even_off_cuda(tmp_path, monkeypatch, npu_platform, key):
+def test_invalid_tf32_value_fails_at_startup_even_off_cuda(tmp_path, monkeypatch, device_platform, key):
     """The TF32 mode is resolved in `__init__`, so a typo cannot wait for the first forward."""
     with pytest.raises(ValueError, match="allow_tf32"):
         _build_backend(tmp_path, monkeypatch, {key: "maybe"})
 
 
-def test_invalid_tf32_env_fails_at_startup_even_off_cuda(tmp_path, monkeypatch, npu_platform):
+def test_invalid_tf32_env_fails_at_startup_even_off_cuda(tmp_path, monkeypatch, device_platform):
     monkeypatch.setenv("MINICPMO_CODE2WAV_TF32", "maybe")
     with pytest.raises(ValueError, match="allow_tf32"):
         _build_backend(tmp_path, monkeypatch, {})
 
 
-def test_tf32_mode_is_resolved_once_and_reused(tmp_path, monkeypatch, npu_platform):
+def test_tf32_mode_is_resolved_once_and_reused(tmp_path, monkeypatch, device_platform):
     model, _ = _build_backend(tmp_path, monkeypatch, {"token2wav_allow_tf32": "off"})
     assert model._tf32_mode == "off"
     # Mutating the stage config afterwards must not re-read it per forward.

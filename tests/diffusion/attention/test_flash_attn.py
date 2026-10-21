@@ -75,6 +75,102 @@ def test_vllm_varlen_version_kwargs_targets_only_vllm_dispatcher(monkeypatch):
 
 
 @pytest.mark.cpu
+@pytest.mark.parametrize(
+    ("major", "expect_hopper"),
+    [
+        (8, False),
+        (9, True),
+        (10, False),
+    ],
+)
+def test_is_hopper_matches_flash_attn_3_hub_gate(monkeypatch, major, expect_hopper):
+    monkeypatch.setattr(
+        fa.current_omni_platform,
+        "get_device_capability",
+        lambda: SimpleNamespace(major=major, minor=0),
+    )
+    assert fa._is_hopper() is expect_hopper
+
+
+@pytest.mark.cpu
+def test_bind_optional_fa3_fwd_dense_sets_dense_on_hopper_when_package_present(monkeypatch):
+    dense = object()
+    fake_mod = SimpleNamespace(flash_attn_func=dense)
+    monkeypatch.setitem(sys.modules, "fa3_fwd_interface", fake_mod)
+    monkeypatch.setattr(fa, "_is_hopper", lambda: True)
+
+    assert fa._bind_optional_fa3_fwd_dense() is dense
+
+
+@pytest.mark.cpu
+def test_bind_optional_fa3_fwd_dense_skips_non_hopper_even_when_package_present(monkeypatch):
+    dense = object()
+    fake_mod = SimpleNamespace(flash_attn_func=dense)
+    monkeypatch.setitem(sys.modules, "fa3_fwd_interface", fake_mod)
+    monkeypatch.setattr(fa, "_is_hopper", lambda: False)
+
+    assert fa._bind_optional_fa3_fwd_dense() is None
+
+
+@pytest.mark.cpu
+def test_bind_optional_fa3_fwd_dense_absent_on_hopper(monkeypatch):
+    import builtins
+
+    monkeypatch.setattr(fa, "_is_hopper", lambda: True)
+    monkeypatch.delitem(sys.modules, "fa3_fwd_interface", raising=False)
+    real_import = builtins.__import__
+
+    def _block_fa3_fwd(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "fa3_fwd_interface":
+            raise ModuleNotFoundError(name)
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", _block_fa3_fwd)
+
+    assert fa._bind_optional_fa3_fwd_dense() is None
+
+
+@pytest.mark.cpu
+def test_dense_flash_attn_func_for_prefers_optional_except_fp16(monkeypatch):
+    optional = object()
+    generic = object()
+    monkeypatch.setattr(fa, "optional_fa3_fwd_dense_func", optional)
+    monkeypatch.setattr(fa, "flash_attn_func", generic)
+
+    assert fa.dense_flash_attn_func_for(torch.bfloat16) is optional
+    assert fa.dense_flash_attn_func_for(torch.float16) is generic
+
+
+@pytest.mark.cpu
+def test_dense_unmasked_fp16_skips_optional_fa3_fwd(monkeypatch):
+    captured: dict[str, Any] = {}
+
+    def fail_if_called(*_args, **_kwargs):
+        raise AssertionError("optional fa3-fwd dense must not run for FP16")
+
+    def fake_varlen(**kwargs):
+        captured.update(kwargs)
+        return kwargs["q"]
+
+    monkeypatch.setattr(fa, "optional_fa3_fwd_dense_func", fail_if_called)
+    monkeypatch.setattr(fa, "flash_attn_func", None)
+    monkeypatch.setattr(fa, "flash_attn_varlen_func", fake_varlen)
+    monkeypatch.setattr(fa, "HAS_FLASH_ATTN", True)
+    monkeypatch.setattr(fa, "IS_FLASH_ATTN_4", False)
+    monkeypatch.setattr(fa, "_is_vllm_flash_attn_varlen", lambda func: func is fake_varlen)
+    monkeypatch.setattr(fa, "resolve_vllm_flash_attn_version", lambda requested=None: 3)
+
+    impl = FlashAttentionImpl(num_heads=2, head_size=8, softmax_scale=0.5, causal=False)
+    query = torch.randn(1, 4, 2, 8, dtype=torch.float16)
+    key = torch.randn(1, 4, 2, 8, dtype=torch.float16)
+    value = torch.randn(1, 4, 2, 8, dtype=torch.float16)
+
+    out = impl.forward_cuda(query, key, value, attn_metadata=None)
+    assert out.shape == query.shape
+    assert "fa_version" in captured
+
+
+@pytest.mark.cpu
 def test_dense_cuda_varlen_fallback_passes_resolved_fa_version(monkeypatch):
     captured: dict[str, Any] = {}
 
@@ -82,6 +178,7 @@ def test_dense_cuda_varlen_fallback_passes_resolved_fa_version(monkeypatch):
         captured.update(kwargs)
         return kwargs["q"]
 
+    monkeypatch.setattr(fa, "optional_fa3_fwd_dense_func", None)
     monkeypatch.setattr(fa, "flash_attn_func", None)
     monkeypatch.setattr(fa, "flash_attn_varlen_func", fake_varlen)
     monkeypatch.setattr(fa, "HAS_FLASH_ATTN", True)
@@ -106,6 +203,7 @@ def test_dense_cuda_varlen_fallback_omits_fa_version_for_other_backends(monkeypa
         captured.update(kwargs)
         return kwargs["q"]
 
+    monkeypatch.setattr(fa, "optional_fa3_fwd_dense_func", None)
     monkeypatch.setattr(fa, "flash_attn_func", None)
     monkeypatch.setattr(fa, "flash_attn_varlen_func", fake_varlen)
     monkeypatch.setattr(fa, "HAS_FLASH_ATTN", True)
@@ -582,6 +680,7 @@ def test_published_noop_mask_uses_dense_path(monkeypatch):
 
     monkeypatch.setattr(fa, "HAS_FLASH_ATTN", True)
     monkeypatch.setattr(fa, "IS_FLASH_ATTN_4", False)
+    monkeypatch.setattr(fa, "optional_fa3_fwd_dense_func", None)
     monkeypatch.setattr(fa, "flash_attn_func", fake_dense_func)
     monkeypatch.setattr(fa, "flash_attn_varlen_func", fail_varlen)
 
@@ -833,6 +932,7 @@ def rocm_contract(monkeypatch, mocker):
     monkeypatch.setattr(fa, "IS_FLASH_ATTN_4", False)
     monkeypatch.setattr(fa, "IS_AITER", True)
     monkeypatch.setattr(fa, "HAS_FLASH_ATTN", True)
+    monkeypatch.setattr(fa, "optional_fa3_fwd_dense_func", None)
     monkeypatch.setattr(fa, "flash_attn_func", dense)
     monkeypatch.setattr(fa, "flash_attn_varlen_func", packed)
     monkeypatch.setattr(fa, "validate_fa4_head_dims", lambda *_args: pytest.fail("ROCm must not validate FA4"))
