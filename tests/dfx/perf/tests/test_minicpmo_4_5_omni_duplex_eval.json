@@ -1,0 +1,69 @@
+[
+  {
+    "test_name": "test_minicpmo_4_5_omni_duplex_eval",
+    "description": "One C8 replay of the 66 CI IDs, followed by RTD/PR judging. Uses the model-bundled HT_ref_audio.wav. Fixed accuracy thresholds are 1.8 RTD content, 1.4 RTD temporal and 0.28 PR all-success, selected from the 2026-10-20 H800/C8 reference. Target-hardware validation and performance baseline calibration remain pending.",
+    "mark": [
+      {
+        "hardware_marks": {
+          "res": {"cuda": ["H100", "B200"], "npu": "A3"},
+          "num_cards": 2
+        }
+      },
+      "full_model",
+      "omni"
+    ],
+    "server_params": {
+      "model": "openbmb/MiniCPM-o-4_5",
+      "extra_cli_args": [
+        "--deploy-config",
+        "vllm_omni/deploy/minicpmo_4_5.yaml",
+        "--trust-remote-code"
+      ]
+    },
+    "judge_server_params": {
+      "model": "Qwen/Qwen2.5-VL-7B-Instruct",
+      "use_omni": false,
+      "device_index": "1",
+      "extra_cli_args": [
+        "--max-model-len", "65536",
+        "--dtype", "bfloat16",
+        "--gpu-memory-utilization", "0.85",
+        "--allowed-local-media-path", "tests/dfx/perf/results"
+      ]
+    },
+    "benchmark_params": [
+      {
+        "dataset_name": "omni-duplex-eval",
+        "dataset_path": "Hothan/Omni-DuplexEval",
+        "backend": "openai-realtime-duplex",
+        "endpoint": "/v1/realtime",
+        "num_prompts": [66],
+        "max_concurrency": [8],
+        "num_warmups": 0,
+        "ready_check_timeout_sec": 0,
+        "disable_shuffle": true,
+        "trust_remote_code": true,
+        "duplex_eval_split": "all",
+        "duplex_eval_evaluate": true,
+        "duplex_eval_judge_model": "Qwen/Qwen2.5-VL-7B-Instruct",
+        "duplex_eval_judge_video_mode": "video_url",
+        "duplex_eval_judge_fps": 2,
+        "duplex_eval_eval_workers": 4,
+        "duplex_eval_accuracy_config": "tests/e2e/accuracy/omni_duplex_eval/omni_duplex_eval_ci_config.json",
+        "duplex_eval_ids": [
+          "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12",
+          "133", "134", "135", "136", "137", "138", "139", "140", "141", "142", "143", "144", "145",
+          "261", "262", "263", "264", "265", "266", "267", "268", "269", "270",
+          "360", "361", "362", "363", "364",
+          "410", "411", "412", "413", "414",
+          "460", "461", "462", "463", "464",
+          "510", "511", "512", "513", "514",
+          "560", "561", "562", "563", "564",
+          "610", "611", "612", "613", "614"
+        ],
+        "duplex_eval_response_root": "tests/dfx/perf/results/omni_duplex_eval_minicpmo_4_5",
+        "percentile-metrics": "ttft,e2el,audio_ttfp,audio_rtf,audio_duration"
+      }
+    ]
+  }
+]

@@ -47,6 +47,7 @@ from vllm_omni.config.stage_config import (
     _STAGE_DEPLOY_FIELDS,
     PIPELINE_WIDE_ENGINE_FIELDS,
     DeployConfig,
+    DuplexSessionRuntimeConfig,
     PipelineConfig,
     StageDeployConfig,
     StageExecutionType,
@@ -155,6 +156,49 @@ def test_duplex_session_capacity_propagates_to_every_structured_stage() -> None:
 
     assert [stage.model_config.duplex_max_sessions for stage in omni_config.stage_configs] == [2, 2]
     assert [stage.model_config.session_mode for stage in omni_config.stage_configs] == ["duplex", "duplex"]
+
+
+@pytest.mark.parametrize(
+    ("session_mode", "placement", "expected"),
+    [
+        ("duplex", {}, 11),
+        ("duplex", {"replica_policy": "legacy"}, 11),
+        ("duplex", {"replica_policy": "legacy", "max_sessions_per_replica": 3}, 11),
+        ("duplex", {"replica_policy": "least_sessions", "max_sessions_per_replica": 3}, 3),
+        ("turn", {}, 1),
+    ],
+)
+def test_duplex_worker_capacity_matches_both_config_build_paths(session_mode, placement, expected) -> None:
+    pipeline = PipelineConfig(
+        model_type="test-duplex-replica-capacity",
+        stages=(
+            StagePipelineConfig(stage_id=0, model_stage="ar"),
+            StagePipelineConfig(
+                stage_id=1,
+                model_stage="codec",
+                execution_type=StageExecutionType.LLM_GENERATION,
+                input_sources=(0,),
+                final_output=True,
+            ),
+        ),
+    )
+    deploy = DeployConfig(
+        session_mode=session_mode,
+        duplex_session=DuplexSessionRuntimeConfig(max_sessions=11, **placement),
+        stages=[StageDeployConfig(stage_id=stage, num_replicas=2) for stage in (0, 1)],
+    )
+
+    # The legacy merge returns StageConfig; engine_args is exposed by its
+    # config-only projection, which does not resolve or initialize workers.
+    legacy_stages = [stage.to_omegaconf() for stage in merge_pipeline_deploy(pipeline, deploy)]
+    structured = VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=deploy)
+
+    assert [stage.engine_args.get("duplex_max_sessions", 1) for stage in legacy_stages] == [expected, expected]
+    assert [stage.engine_args.session_mode for stage in legacy_stages] == [session_mode, session_mode]
+    assert [stage.model_config.duplex_max_sessions for stage in structured.stage_configs] == [expected, expected]
+    assert [stage.model_config.session_mode for stage in structured.stage_configs] == [session_mode, session_mode]
+    # Placement does not reinterpret the global frontend admission limit.
+    assert deploy.duplex_session.max_sessions == 11
 
 
 def test_non_duplex_deploy_keeps_model_session_capacity_at_one(tmp_path: Path) -> None:
@@ -490,6 +534,10 @@ def test_minicpmo_npu_additional_config_reaches_engine_args(monkeypatch, deploy_
     monkeypatch.setattr(stage_init_utils, "resolve_worker_cls", lambda engine_args: None)
     stage = _from_pipeline_key("minicpmo_4_5", deploy_config_path=deploy_name).stage_by_id(2)
     expected = {"code2wav_enable_npu_graph": True, "code2wav_max_npu_graphs": 32}
+    if deploy_name == "minicpmo_4_5":
+        # Single-card deploy: batch sizes round up to a capture bucket so the
+        # 32-entry pool covers the shape space.
+        expected["cfm_graph_batch_buckets"] = [1, 2, 4, 8]
     assert stage.runtime_config.additional_config == expected
     engine_args = build_engine_args_dict_from_omni_stage_config(stage, model="test-model")
     assert engine_args["additional_config"] == expected
@@ -1019,6 +1067,10 @@ def test_vllm_omni_stage_config_public_fields_use_typed_stage_realizations():
         "compilation_config",
         "profiler_config",
         "quantization_config",
+        # Stage-level speculative_config is passed straight through to the
+        # engine: the Talker K-step block is read by the engine, not unpacked
+        # structurally like the other stage configs.
+        "speculative_config",
     }
     assert "diffusion_config" not in public_fields
     assert {f.name for f in fields(VllmOmniDiffusionStageConfig)} == public_fields | {"diffusion_config"}
