@@ -32,17 +32,56 @@ logger = init_logger(__name__)
 class CampplusTorch:
     """Callable wrapper matching the CampplusTRT contract: ``[T, 80]`` in, ``[1, 192]`` out."""
 
+    # item 131: one NPU graph per distinct frame count (references are folded
+    # onto a fixed window upstream, so this is a single bucket in practice;
+    # the cap guards against pathological callers).
+    _MAX_GRAPH_BUCKETS = 2
+
     def __init__(self, model: CAMPPlus, device: str | torch.device):
         self.device = torch.device(device)
         self.model = model.to(self.device).eval()
+        self._graphs: dict[int, tuple] = {}
 
     @torch.inference_mode()
     def __call__(self, feat: torch.Tensor) -> torch.Tensor:
         """feat: ``[T, 80]`` fbank features. Returns ``[1, 192]`` embedding."""
         if feat.device != self.device:
-            feat = feat.to(self.device, non_blocking=True)
+            # Pageable + non_blocking still degrades to a synchronous copy on
+            # Ascend (host blocks behind queued decode work); stage through
+            # pinned memory for a true async H2D.
+            pinned = torch.empty(feat.shape, dtype=feat.dtype, pin_memory=True)
+            pinned.copy_(feat)
+            feat = pinned.to(self.device, non_blocking=True)
         # Model weights are fp32; guard against any upstream bf16 activation.
-        return self.model(feat.unsqueeze(0).float())
+        batch = feat.unsqueeze(0).float()
+        # item 131: CAM++ is ~33ms eager on NPU while its output is
+        # input-length invariant (61..494 frames all ~31ms) — i.e.
+        # launch-bound. A captured graph replays in ~10.7ms with
+        # bit-identical output. Eager fallback off-NPU / on capture failure /
+        # bucket overflow. Capture and replay both run on the caller's
+        # current stream (the private CAM++ stream), so they stay aligned.
+        frames = int(batch.shape[1])
+        entry = self._graphs.get(frames)
+        if entry is None:
+            if self.device.type != "npu" or len(self._graphs) >= self._MAX_GRAPH_BUCKETS:
+                return self.model(batch)
+            try:
+                static_in = batch.clone()
+                for _ in range(2):
+                    self.model(static_in)
+                torch.npu.synchronize()
+                graph = torch.npu.NPUGraph()
+                with torch.npu.graph(graph):
+                    static_out = self.model(static_in)
+                torch.npu.synchronize()
+                entry = (graph, static_in, static_out)
+                self._graphs[frames] = entry
+            except Exception:
+                return self.model(batch)
+        graph, static_in, static_out = entry
+        static_in.copy_(batch)
+        graph.replay()
+        return static_out.clone()
 
 
 def _fused_conv2d(old: nn.Module, mod: str, by_mod: dict) -> nn.Module:

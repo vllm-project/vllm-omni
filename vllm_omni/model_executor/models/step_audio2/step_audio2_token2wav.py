@@ -3,6 +3,7 @@
 
 import io
 import os
+import time
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any
@@ -42,6 +43,57 @@ from vllm_omni.model_executor.models.step_audio2.step_audio2_constants import (
 )
 
 logger = init_logger(__name__)
+
+
+def _h2d_async(t: torch.Tensor, device: torch.device) -> torch.Tensor:
+    """Staging-copy to pinned memory, then async H2D.
+
+    A plain ``.to(device)`` on pageable memory is a synchronous copy: the host
+    blocks until every kernel already queued on the stream finishes, which
+    costs ~100ms per call when setup runs behind a c8 decode backlog. The
+    pinned staging copy is pure host work; the device copy overlaps with
+    whatever is already executing on the stream.
+    """
+    pinned = torch.empty(t.shape, dtype=t.dtype, pin_memory=True)
+    pinned.copy_(t)
+    return pinned.to(device, non_blocking=True)
+
+
+# --- setup probe (env-gated, timing only, no behavior change) ---
+_SETUP_PROBE = os.environ.get("VLLM_OMNI_SETUP_PROBE", "0") == "1"
+_SETUP_PROBE_STATS = {
+    "n": 0,
+    "load": 0.0,
+    "s3mel": 0.0,
+    "quant": 0.0,
+    "spk": 0.0,
+    "mel24": 0.0,
+    "tail": 0.0,
+    "total": 0.0,
+}
+
+
+def _setup_probe_flush() -> None:
+    s = _SETUP_PROBE_STATS
+    if s["n"] == 0:
+        return
+    logger.info(
+        "[setup-probe] n=%d total=%.0fms avg=%.1fms | load=%.1f s3mel=%.1f "
+        "quant=%.1f spk=%.1f mel24=%.1f tail=%.1f (ms avg, n=%d)",
+        s["n"],
+        s["total"] * 1000.0,
+        s["total"] / s["n"] * 1000.0,
+        s["load"] / s["n"] * 1000.0,
+        s["s3mel"] / s["n"] * 1000.0,
+        s["quant"] / s["n"] * 1000.0,
+        s["spk"] / s["n"] * 1000.0,
+        s["mel24"] / s["n"] * 1000.0,
+        s["tail"] / s["n"] * 1000.0,
+        s["n"],
+    )
+
+
+# --- end setup probe ---
 
 
 def _get_left_context_size(info: dict[str, Any]) -> Any | None:
@@ -147,6 +199,9 @@ class StepAudio2Token2WavCore(nn.Module):
         self._spk_model = None
         self._flow = None
         self._hift = None
+        # Private stream for the campplus forward (see _forward_spk_embedding).
+        self._spk_stream = None
+        self._spk_event = None
 
         self.cache = {}
 
@@ -185,6 +240,13 @@ class StepAudio2Token2WavCore(nn.Module):
         self._audio_tokenizer = (
             s3tokenizer.load_model(f"{self.model_path}/speech_tokenizer_v2_25hz.onnx").to(self.device).eval()
         )
+        # Cache the rotary table on device: AudioEncoderV2.forward does
+        # ``self.freqs_cis.to(x.device)`` on every call — a pageable (synchronous)
+        # H2D that blocks the host behind queued decode work. With the table
+        # already on device that ``.to`` is a no-op.
+        _enc = getattr(self._audio_tokenizer, "encoder", None)
+        if _enc is not None and isinstance(getattr(_enc, "freqs_cis", None), torch.Tensor):
+            _enc.freqs_cis = _enc.freqs_cis.to(self.device)
 
         with open(f"{self.model_path}/flow.yaml") as f:
             configs = load_hyperpyyaml(f)
@@ -258,7 +320,17 @@ class StepAudio2Token2WavCore(nn.Module):
                 device=self.device,
             )
         # CampplusTRT / CampplusTorch (any callable taking [T, 80] -> [1, 192]).
-        return spk_model(spk_feat).to(self.device)
+        stream = self._spk_stream
+        if stream is None or torch.is_grad_enabled():
+            return spk_model(spk_feat).to(self.device)
+        # Launching the ~50 campplus kernels on the decode stream blocks the
+        # host whenever that queue is saturated (~100 ms/request at c8, item
+        # 116). A private stream lets them run alongside decode; the dependency
+        # is attached with an event instead of an implicit host wait.
+        with torch.npu.stream(stream):
+            out = spk_model(spk_feat)
+        self._spk_event = stream.record_event()
+        return out.to(self.device)
 
     def enable_trt_spk_embedding(self) -> None:
         """Swap the onnxruntime campplus session for the shared TensorRT engine.
@@ -293,24 +365,107 @@ class StepAudio2Token2WavCore(nn.Module):
         from vllm_omni.model_executor.models.cosyvoice3.speaker_embedding_torch import get_campplus_torch
 
         self._spk_model = get_campplus_torch(f"{self.model_path}/campplus.onnx", device=self.device)
+        # Run campplus on its own stream so its ~50 kernel launches do not line
+        # up behind the decode backlog (item 117; see _forward_spk_embedding).
+        npu_mod = getattr(torch, "npu", None)
+        try:
+            if npu_mod is not None and npu_mod.is_available():
+                self._spk_stream = npu_mod.Stream(device=self.device)
+        except Exception:
+            self._spk_stream = None
+
+    # item 131: per-frame-count NPU graphs for the S3 quantize forward
+    # (short-audio path). References are folded onto a fixed window upstream,
+    # so this is a single bucket in practice; the cap guards against
+    # pathological callers.
+    _MAX_S3_GRAPHS = 2
+
+    @torch.inference_mode()
+    def _quantize_s3_graph(self, mels: torch.Tensor, mels_lens: torch.Tensor):
+        """S3 quantize (short audio, device tensors) with an NPU graph.
+
+        Equivalent to ``encoder + quantizer.encode`` (the library else-branch),
+        but replays a captured graph: eager is ~13ms on NPU while the output
+        is input-length invariant (61..249 frames all ~11ms) — launch-bound.
+        Graph replay is ~6ms with bit-identical tokens.  Eager fallback
+        off-NPU / on capture failure / bucket overflow.
+        """
+        tok = self.audio_tokenizer
+        frames = int(mels.shape[2])
+        graphs = getattr(self, "_s3_graphs", None)
+        if graphs is None:
+            graphs = {}
+            self._s3_graphs = graphs
+        entry = graphs.get(frames)
+        if entry is None:
+            if self.device.type != "npu" or len(graphs) >= self._MAX_S3_GRAPHS:
+                h, code_len = tok.encoder(mels, mels_lens)
+                return tok.quantizer.encode(h), code_len
+            try:
+                enc = tok.encoder
+                # freqs_cis ships as a CPU buffer and the forward does
+                # ``self.freqs_cis.to(x.device)`` every call — that H2D copy
+                # blocks graph capture, so hoist it once.
+                if enc.freqs_cis.device != self.device:
+                    enc.freqs_cis = enc.freqs_cis.to(self.device)
+                for _ in range(2):
+                    h, code_len = enc(mels, mels_lens)
+                    tok.quantizer.encode(h)
+                torch.npu.synchronize()
+                graph = torch.npu.NPUGraph()
+                with torch.npu.graph(graph):
+                    h, code_len = enc(mels, mels_lens)
+                    static_code = tok.quantizer.encode(h)
+                torch.npu.synchronize()
+                entry = (graph, mels, mels_lens, static_code, code_len)
+                graphs[frames] = entry
+            except Exception:
+                h, code_len = tok.encoder(mels, mels_lens)
+                return tok.quantizer.encode(h), code_len
+        graph, static_mels, static_lens, static_code, static_len = entry
+        static_mels.copy_(mels)
+        static_lens.copy_(mels_lens)
+        graph.replay()
+        return static_code.clone(), static_len.clone()
 
     def _prepare_prompt(self, prompt_wav: str):
         """Prepare prompt audio for conditioning"""
+        _pc = time.perf_counter
+        _t0 = _pc()
         audio_np_raw, sample_rate = load_audio(prompt_wav, sr=None, mono=True)
         sample_rate = int(sample_rate)
+        _t1 = _pc()
 
         # 16 kHz branch: s3tokenizer + speaker embedding
         audio_16k = AudioResampler(target_sr=16000).resample(audio_np_raw.astype(np.float32), orig_sr=sample_rate)
         audio = torch.from_numpy(audio_16k)
         mels = s3tokenizer.log_mel_spectrogram(audio)
         mels, mels_lens = s3tokenizer.padding([mels])
-        prompt_speech_tokens, prompt_speech_tokens_lens = self.audio_tokenizer.quantize(
-            mels.to(self.device), mels_lens.to(self.device)
-        )
+        _t2 = _pc()
+        mels_d = _h2d_async(mels, self.device)
+        mels_lens_d = _h2d_async(mels_lens, self.device)
+        if mels.shape[-1] > 3000:
+            # Long audio (>30 s) keeps the library call: it routes to the
+            # sliding-window mixed-batch path.
+            prompt_speech_tokens, prompt_speech_tokens_lens = self.audio_tokenizer.quantize(mels_d, mels_lens_d)
+        else:
+            # Short audio: item 131 graph replay of the library else-branch
+            # (encoder + quantizer.encode). The device-side
+            # `mel_len > max_frames` check is skipped — its `.any()` forces an
+            # implicit D2H sync; the frame count is static on host
+            # (mels.shape[-1]), so the branch decision needs no sync.
+            prompt_speech_tokens, prompt_speech_tokens_lens = self._quantize_s3_graph(mels_d, mels_lens_d)
+        _t3 = _pc()
 
         spk_feat = kaldi.fbank(audio.unsqueeze(0), num_mel_bins=80, dither=0, sample_frequency=16000)
         spk_feat = spk_feat - spk_feat.mean(dim=0, keepdim=True)
         spk_emb = self._forward_spk_embedding(spk_feat)
+        if self._spk_event is not None:
+            # Device-side join for the private campplus stream (never blocks the
+            # host); it lands here so the host-side 24 kHz mel work overlaps.
+            torch.npu.current_stream(self.device).wait_event(self._spk_event)
+            self._spk_event = None
+        _t4 = _pc()
 
         # 24 kHz branch: mel spectrogram for flow model conditioning
         # Must resample from the ORIGINAL audio, not the 16 kHz version.
@@ -331,13 +486,30 @@ class StepAudio2Token2WavCore(nn.Module):
             .transpose(1, 2)
             .squeeze(0)
         )  # [T, num_mels]
-        prompt_mels = prompt_mel.unsqueeze(0).to(self.device)
-        prompt_mels_lens = torch.tensor([prompt_mels.shape[1]], dtype=torch.int32, device=self.device)
+        _t5 = _pc()
+        prompt_mels = _h2d_async(prompt_mel.unsqueeze(0), self.device)
+        # Build on host then async-copy: torch.tensor(..., device=...) is itself
+        # a synchronous H2D that blocks behind queued decode work.
+        prompt_mels_lens = _h2d_async(torch.tensor([prompt_mel.shape[0]], dtype=torch.int32), self.device)
         prompt_mels = torch.nn.functional.pad(
             prompt_mels,
             (0, 0, 0, prompt_speech_tokens.shape[1] * self.flow.up_rate - prompt_mels.shape[1]),
             mode="replicate",
         )
+        _t6 = _pc()
+
+        if _SETUP_PROBE:
+            s = _SETUP_PROBE_STATS
+            s["n"] += 1
+            s["load"] += _t1 - _t0
+            s["s3mel"] += _t2 - _t1
+            s["quant"] += _t3 - _t2
+            s["spk"] += _t4 - _t3
+            s["mel24"] += _t5 - _t4
+            s["tail"] += _t6 - _t5
+            s["total"] += _t6 - _t0
+            if s["n"] % 32 == 0:
+                _setup_probe_flush()
 
         return prompt_speech_tokens, prompt_speech_tokens_lens, spk_emb, prompt_mels, prompt_mels_lens
 
