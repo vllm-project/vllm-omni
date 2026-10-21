@@ -12,6 +12,135 @@ from vllm_omni.diffusion.models.qwen_image_21 import qwen_image_21_transformer a
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
 
 
+@pytest.mark.cpu
+@pytest.mark.parametrize("cache_dtype", [None, "fp8_e4m3", "fp8_e4m3_v"])
+@pytest.mark.parametrize("sp", [False, True])
+@pytest.mark.parametrize("heads", [1, 2])
+def test_qkv_fusion_preserves_prefix_cache_and_sp_joint(monkeypatch, cache_dtype, sp, heads):
+    """Exercise routing with local TP heads, batch two and both CFG caches.
+
+    The CPU fusion stand-in checks data flow; the shared-layer NPU test checks
+    the real kernel. Cached K must never be normalized or rotated a second time.
+    """
+    attention = transformer.QwenImage21Attention.__new__(transformer.QwenImage21Attention)
+    torch.nn.Module.__init__(attention)
+    attention.num_heads = attention.num_kv_heads = heads
+    attention.head_dim = 64
+    attention.prefix_kv_cache_dtype = cache_dtype
+    attention.norm_q = torch.nn.RMSNorm(64)
+    attention.norm_k = torch.nn.RMSNorm(64)
+    # Match the Diffusers norm interface used by the production module.
+    attention.norm_q.bias = attention.norm_k.bias = None
+    attention.norm_q.eps = attention.norm_k.eps = 1e-5
+    attention.to_out = torch.nn.Identity()
+
+    class Projection(torch.nn.Module):
+        def forward(self, x):
+            return torch.cat((x, x * 2, x * 3), -1), None
+
+    received = []
+
+    class Capture(torch.nn.Module):
+        def forward(self, q, k, v, metadata):
+            received.append((q.clone(), k.clone(), v.clone(), metadata))
+            return q
+
+    attention.to_qkv = Projection()
+    attention.attn = Capture()
+    calls = []
+
+    def fused(q, k, v, *args, **kwargs):
+        calls.append(q.shape)
+        assert not q.is_contiguous()
+        # Make accidental reuse/double-processing of cached K observable.
+        return q + 1, k + 7, v
+
+    monkeypatch.setattr(transformer, "try_fused_qkv_norm_rope", fused)
+    cache = {}
+    tables = (torch.ones(5, 64), torch.zeros(5, 64))
+    with torch.inference_mode():
+        for branch, offset in (("cond", 0.0), ("uncond", 1.0)):
+            x = torch.randn(2, 5, heads * 64) + offset
+            attention(
+                x,
+                torch.empty(5, 32),
+                kv_cache=cache,
+                cache_branch=branch,
+                cache_write_len=2,
+                sp_prefix_len=2 if sp else 0,
+                rope_tables=tables,
+            )
+            prefix_key = (x * 2).unflatten(-1, (heads, 64))[:, :2] + 7
+            prefix_value = (x * 3).unflatten(-1, (heads, 64))[:, :2]
+            if cache_dtype == "fp8_e4m3":
+                key, scale = transformer._quantize_prefix_kv_fp8(prefix_key)
+                prefix_key = transformer._dequantize_prefix_kv_fp8(key, scale, x.dtype)
+            if cache_dtype is not None:
+                value, scale = transformer._quantize_prefix_kv_fp8(prefix_value)
+                prefix_value = transformer._dequantize_prefix_kv_fp8(value, scale, x.dtype)
+            if sp:
+                metadata = received[-1][3]
+                torch.testing.assert_close(metadata.joint_key, (x * 2).unflatten(-1, (heads, 64))[:, :2] + 7)
+                assert metadata.joint_strategy == "front"
+            decode = x[:, 2:]
+            attention(
+                decode,
+                torch.empty(3, 32),
+                kv_cache=cache,
+                cache_branch=branch,
+                sp_decode=sp,
+                rope_tables=tuple(t[2:] for t in tables),
+            )
+            q, k, v, metadata = received[-1]
+            current_key = (decode * 2).unflatten(-1, (heads, 64)) + 7
+            if sp:
+                assert metadata.joint_query.shape == (2, 0, heads, 64)
+                torch.testing.assert_close(metadata.joint_key, prefix_key)
+                torch.testing.assert_close(metadata.joint_value, prefix_value)
+                torch.testing.assert_close(k, current_key)
+            else:
+                torch.testing.assert_close(k[:, :2], prefix_key)
+                torch.testing.assert_close(v[:, :2], prefix_value)
+                torch.testing.assert_close(k[:, 2:], current_key)
+        assert [shape[1] for shape in calls] == [5, 3, 5, 3]
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("fused_qk", [False, True])
+def test_qkv_unavailable_preserves_existing_norm_rope(monkeypatch, fused_qk):
+    attention = transformer.QwenImage21Attention.__new__(transformer.QwenImage21Attention)
+    torch.nn.Module.__init__(attention)
+    attention.num_heads = attention.num_kv_heads = 2
+    attention.head_dim = 64
+    # Keep this CPU routing test independent of Diffusers' process-wide NPU
+    # dispatch, which selects npu_rms_norm even for CPU inputs on an NPU host.
+    attention.norm_q = torch.nn.RMSNorm(64, eps=1e-5)
+    attention.norm_k = torch.nn.RMSNorm(64, eps=1e-5)
+    attention.norm_q.bias = attention.norm_k.bias = None
+    attention.to_out = torch.nn.Identity()
+    attention._apply_rotary_emb = transformer._apply_qwen_image21_rotary_emb_native
+
+    class Projection(torch.nn.Module):
+        def forward(self, x):
+            return torch.cat([x] * 3, -1), None
+
+    class Capture(torch.nn.Module):
+        def forward(self, q, k, v, metadata):
+            return q
+
+    attention.to_qkv = Projection()
+    attention.attn = Capture()
+    monkeypatch.setattr(transformer, "try_fused_qkv_norm_rope", lambda *a, **kw: None)
+    monkeypatch.setattr(transformer, "qk_rotary", lambda q, k, *a: (q + 9, k + 9) if fused_qk else None)
+    x = torch.randn(2, 3, 128)
+    freqs = torch.polar(torch.ones(3, 32), torch.randn(3, 32))
+    with torch.inference_mode():
+        actual = attention(x, freqs, rope_tables=(torch.ones(3, 64), torch.zeros(3, 64)))
+        q = x.unflatten(-1, (2, 64))
+        expected = q + 9 if fused_qk else attention._apply_rotary_emb(attention.norm_q(q), freqs)
+    torch.testing.assert_close(actual, expected.flatten(2, 3), rtol=0, atol=0)
+
+
 @pytest.mark.parametrize(
     "device",
     [
