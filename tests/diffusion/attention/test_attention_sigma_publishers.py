@@ -22,6 +22,7 @@ from vllm_omni.diffusion.forward_context import (
     set_forward_context_denoise_sigma,
 )
 from vllm_omni.diffusion.models.minimax_h3.denoise_loop import minimax_h3_publish_denoise_progress
+from vllm_omni.diffusion.models.minimax_h3.time_request import minimax_h3_time_shift_sigmas
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
@@ -102,8 +103,6 @@ def test_normalization_requires_positive_finite_reference(reference):
 
 def test_float32_rounding_of_the_first_h3_sigma_publishes_as_one():
     """MiniMax-H3 builds its shifted sigmas in float32, so the step-0 sigma can exceed 1 by one ulp."""
-    from vllm_omni.diffusion.models.minimax_h3.time_request import minimax_h3_time_shift_sigmas
-
     first = minimax_h3_time_shift_sigmas(num_steps=8, shift_scale=2.14)[0]
     assert first > 1.0
 

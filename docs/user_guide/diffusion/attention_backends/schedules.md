@@ -1,8 +1,10 @@
 # Attention Schedules
 
-An attention schedule selects a named attention profile at zero-based denoising
-step indices. Profiles are prepared at startup; requests select ranges, not new
-backends. Steps outside a range use the base attention configuration.
+An attention schedule selects a named attention profile by zero-based denoising
+step range or by normalized sigma window (see [Sigma windows](#sigma-windows)).
+Profiles are prepared at startup; requests select ranges or windows, not new
+backends. Steps outside every range or window use the base attention
+configuration.
 
 Wan2.2 T2V, I2V, S2V and VACE publish progress in request mode.
 MiniMax-H3 and HunyuanImage-3.0 publish it in request and step modes.
@@ -91,12 +93,13 @@ The dotted flag is `--diffusion-attention-schedule.sigma`; deploy YAML uses
 stage list. There is no separate sigma flag or environment variable.
 
 Use `attention_sigma_schedule` in the same request extras or offline sampling
-parameters as `attention_schedule`. Omitted or `null` inherits, `[]` disables,
-and non-empty windows replace defaults of both kinds: a request that sends
-sigma windows does not inherit the service step ranges, and a request that
-sends step ranges does not inherit the service sigma windows. A request cannot
-set both kinds; a stage's `default_sampling_params` count as request values,
-so send `[]` for the other field to replace a stage default of the other kind.
+parameters as `attention_schedule`. Omitted or `null` inherits, `[]` disables
+sigma windows only, and non-empty windows replace defaults of both kinds: a
+request that sends sigma windows does not inherit the service step ranges, and
+a request that sends step ranges does not inherit the service sigma windows.
+A request cannot set both kinds; a stage's `default_sampling_params` count as
+request values, so send `[]` for the other field to replace a stage default of
+the other kind.
 Request and step modes validate the resolved schedules before denoising.
 
 ## Server configuration
@@ -146,14 +149,17 @@ startup, before weights are loaded.
 
 CLI overrides deep-merge profile mappings into the stage configuration.
 A CLI `default` list replaces the stage list rather than appending ranges.
+A configuration cannot hold both kinds, so switching a stage's `default` ranges
+to CLI `sigma` windows also needs `--diffusion-attention-schedule.default '[]'`,
+and switching the other way needs `--diffusion-attention-schedule.sigma '[]'`.
 
 ## Per-request configuration
 
-| `attention_schedule` value | Effect |
+| `attention_schedule` or `attention_sigma_schedule` value | Effect |
 | --- | --- |
-| Omitted or `null` | Inherit defaults. |
-| `[]` | Disable scheduling for this request. |
-| Non-empty ranges | Replace step ranges and sigma windows from the service defaults; do not merge. |
+| Omitted or `null` | Inherit the service default. |
+| `[]` | Disable this kind only. A service default of the other kind still applies; send `[]` in both fields to run every step on the base configuration. |
+| Non-empty | Replace step ranges and sigma windows from the service defaults; do not merge. |
 
 Video endpoints first apply a stage's `default_sampling_params`, if present;
 an omitted or `null` request value preserves that stage default. A schedule
