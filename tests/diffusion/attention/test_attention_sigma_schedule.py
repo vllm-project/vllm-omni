@@ -34,8 +34,8 @@ def test_sigma_selection_uses_normalized_noise_and_gaps():
 
 def test_batch_resolution_inherits_disables_and_rejects_mixed_windows():
     service = SimpleNamespace(profiles={"sparse": object()}, sigma=[{"low": 0.8, "high": 1.0, "profile": "sparse"}])
-    inherit = SimpleNamespace(attention_sigma_schedule=None)
-    disable = SimpleNamespace(attention_sigma_schedule=[])
+    inherit = SimpleNamespace(attention_schedule=None, attention_sigma_schedule=None)
+    disable = SimpleNamespace(attention_schedule=None, attention_sigma_schedule=[])
     assert resolve_batch_attention_sigma_schedule([inherit], service)[0].profile == "sparse"
     assert resolve_batch_attention_sigma_schedule([disable], service) == ()
     with pytest.raises(ValueError, match="must be identical"):
