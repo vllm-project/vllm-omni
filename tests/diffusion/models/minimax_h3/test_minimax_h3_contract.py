@@ -197,6 +197,10 @@ def test_decode_to_mp4_batches_consumer_transfers(monkeypatch, decode_dtype):
             return torch.zeros(1, 1, 2)
 
     class FakeVideoVAE:
+        @property
+        def decoder_component(self):
+            return self
+
         owns_chunk_output = True
         chunk_value_range = (0.0, 1.0)
 
@@ -255,6 +259,10 @@ def test_preencode_starts_before_audio_offload_and_cleans_up_on_video_load_failu
             return torch.zeros(1, 1, 8000)
 
     class VideoVAE:
+        @property
+        def decoder_component(self):
+            return self
+
         decode_dtype = torch.float16
         chunk_value_range = (0.0, 1.0)
         owns_chunk_output = True
@@ -322,6 +330,10 @@ def test_request_video_codec_options_reach_the_preencoded_mp4_encoder(monkeypatc
             return torch.zeros(1, 1, 2)
 
     class FakeVideoVAE:
+        @property
+        def decoder_component(self):
+            return self
+
         owns_chunk_output = True
         chunk_value_range = (0.0, 1.0)
         decode_dtype = torch.float16
@@ -3638,6 +3650,10 @@ def _peer_rank_preencode_pipeline(monkeypatch):
             return torch.zeros(1, 1, 2)
 
     class PeerRankVideoVAE:
+        @property
+        def decoder_component(self):
+            return self
+
         owns_chunk_output = False
         chunk_value_range = (0.0, 1.0)
         decode_dtype = torch.float16

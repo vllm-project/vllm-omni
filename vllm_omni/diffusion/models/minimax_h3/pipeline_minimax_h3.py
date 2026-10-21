@@ -2350,7 +2350,7 @@ class MiniMaxH3Pipeline(
                 if self.video_vae.owns_chunk_output:
                     session.start(width=width, height=height, batch_size=1)
 
-            with self._component_on_device(self.video_vae):
+            with self._component_on_device(self.video_vae.decoder_component):
                 with current_omni_platform.create_autocast_context(
                     device_type=self.device.type,
                     dtype=self.video_vae.decode_dtype,
