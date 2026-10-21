@@ -294,27 +294,27 @@ def test_pipeline_contract():
 
 
 @pytest.mark.parametrize(
-    "eager,graph_mode,legacy_switch,enabled",
+    "eager,graph_mode,env_var,env_value,enabled",
     [
-        (False, CUDAGraphMode.PIECEWISE, None, True),
-        (True, CUDAGraphMode.PIECEWISE, None, False),
-        (False, CUDAGraphMode.NONE, None, False),
-        (False, CUDAGraphMode.PIECEWISE, "0", False),
-        (False, CUDAGraphMode.PIECEWISE, "1", True),
-        (True, CUDAGraphMode.PIECEWISE, "1", False),
+        (False, CUDAGraphMode.PIECEWISE, None, None, True),
+        (True, CUDAGraphMode.PIECEWISE, None, None, False),
+        (False, CUDAGraphMode.NONE, None, None, False),
+        (True, CUDAGraphMode.NONE, "MING_CFM_CUDAGRAPH", None, True),
+        (True, CUDAGraphMode.NONE, "MING_CFM_CUDAGRAPH", "0", False),
+        (True, CUDAGraphMode.NONE, "MING_CFM_CUDAGRAPH", "1", True),
     ],
 )
-def test_cfm_graph_respects_stage_config(monkeypatch, eager, graph_mode, legacy_switch, enabled):
+def test_cfm_graph_enablement(monkeypatch, eager, graph_mode, env_var, env_value, enabled):
     model = SimpleNamespace(
         vllm_config=SimpleNamespace(
             model_config=SimpleNamespace(enforce_eager=eager),
             compilation_config=SimpleNamespace(cudagraph_mode=graph_mode),
         )
     )
-    env_var = None
-    if legacy_switch is not None:
-        env_var = "MING_CFM_CUDAGRAPH"
-        monkeypatch.setenv(env_var, legacy_switch)
+    if env_var is not None:
+        monkeypatch.delenv(env_var, raising=False)
+        if env_value is not None:
+            monkeypatch.setenv(env_var, env_value)
     Ming3TTSLLMModel._init_cfm_graph_state(model, env_var)
     assert model._cfm_graph_enabled is enabled
     if not enabled:

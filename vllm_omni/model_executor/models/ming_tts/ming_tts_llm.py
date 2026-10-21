@@ -120,8 +120,8 @@ class MingLLMModel(nn.Module):
         self._last_ming_next_token_ids: list[int] | None = None
         self._last_text_mode = False
         # CUDAGraph for the flow-matching (CFM) diffusion head — the TTFP/latency
-        # hot spot. Follow the stage's eager/graph configuration; the legacy
-        # MING_CFM_CUDAGRAPH=0 switch can additionally disable the flow graph.
+        # hot spot. The legacy MING_CFM_CUDAGRAPH switch controls this
+        # independently of the backbone's eager/graph configuration.
         self._init_cfm_graph_state("MING_CFM_CUDAGRAPH")
 
     def embed_input_ids(
@@ -385,11 +385,13 @@ class MingLLMModel(nn.Module):
 
     def _init_cfm_graph_state(self, env_var: str | None = None) -> None:
         compilation_config = self.vllm_config.compilation_config
-        self._cfm_graph_enabled = (
-            not self.vllm_config.model_config.enforce_eager
-            and compilation_config.cudagraph_mode != CUDAGraphMode.NONE
-            and (env_var is None or os.environ.get(env_var, "1") == "1")
-        )
+        if env_var is not None:
+            self._cfm_graph_enabled = os.environ.get(env_var, "1") == "1"
+        else:
+            self._cfm_graph_enabled = (
+                not self.vllm_config.model_config.enforce_eager
+                and compilation_config.cudagraph_mode != CUDAGraphMode.NONE
+            )
         self._cfm_graphs: dict[int, CFMGraphExecutor] = {}
         self._cfm_graph_failed_batch_sizes: set[int] = set()
         self._cfm_graph_warmed_up = False
