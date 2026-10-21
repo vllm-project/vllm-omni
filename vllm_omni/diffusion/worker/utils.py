@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import math
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -13,6 +14,7 @@ import torch
 if TYPE_CHECKING:
     from vllm_omni.diffusion.data import DiffusionOutput
     from vllm_omni.diffusion.interaction.types import (
+        InteractionBoundaryContext,
         InteractionChunkMetadata,
         InteractionSession,
     )
@@ -109,6 +111,7 @@ class StepRequestState:
     interaction_sessions: dict[str, InteractionSession] = field(default_factory=dict)  # Modality -> transition progress
     interaction_chunk_metadata: InteractionChunkMetadata | None = None  # Acknowledging completion of each interaction
     pending_chunk_boundary: bool = False
+    interaction_boundary: InteractionBoundaryContext | None = None
 
     # ── Per-request scheduler instance (set once by prepare_encode) ──
     scheduler: Any | None = None
@@ -183,6 +186,21 @@ class BaseRunnerOutput(ABC):
         pass
 
 
+@dataclass(frozen=True)
+class StepWait:
+    """Suspend an admitted request until an interaction or a host deadline.
+
+    ``None`` waits indefinitely. The scheduler starts a finite timeout when
+    it receives this output; workers never make independent clock decisions.
+    """
+
+    timeout_seconds: float | None = None
+
+    def __post_init__(self) -> None:
+        if self.timeout_seconds is not None and (not math.isfinite(self.timeout_seconds) or self.timeout_seconds <= 0):
+            raise ValueError("StepWait timeout_seconds must be finite and positive, or None")
+
+
 @dataclass
 class RunnerOutput(BaseRunnerOutput):
     """Output of a single denoising step for a request.
@@ -197,6 +215,7 @@ class RunnerOutput(BaseRunnerOutput):
     finished: bool = False
     result: DiffusionOutput | None = None
     async_output_id: str | None = None
+    wait_for_interaction: StepWait | None = None
     streaming_media_duration: float = 0.0
     streaming_next_media_duration: float = 0.0
 

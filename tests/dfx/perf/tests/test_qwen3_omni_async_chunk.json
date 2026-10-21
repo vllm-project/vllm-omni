@@ -47,12 +47,42 @@
         "baseline": {
           "H100": {
             "mean_audio_rtf": [
-              0.1098
+              0.1063
+            ],
+            "request_throughput": [
+              0.0976
+            ],
+            "mean_ttft_ms": [
+              302.6793
+            ],
+            "mean_tpot_ms": [
+              4.9271
+            ],
+            "mean_e2el_ms": [
+              2875.1345
+            ],
+            "mean_audio_ttfp_ms": [
+              418.0683
             ]
           },
           "A3": {
             "mean_audio_rtf": [
               0.7014
+            ],
+            "request_throughput": [
+              0.0758
+            ],
+            "mean_ttft_ms": [
+              529.783
+            ],
+            "mean_tpot_ms": [
+              27.2798
+            ],
+            "mean_e2el_ms": [
+              35032.2415
+            ],
+            "mean_audio_ttfp_ms": [
+              1424.6187
             ]
           }
         }
@@ -85,12 +115,42 @@
         "baseline": {
           "H100": {
             "mean_audio_rtf": [
-              0.1335
+              0.1296
+            ],
+            "request_throughput": [
+              0.483
+            ],
+            "mean_ttft_ms": [
+              292.8627
+            ],
+            "mean_tpot_ms": [
+              5.3421
+            ],
+            "mean_e2el_ms": [
+              3450.9627
+            ],
+            "mean_audio_ttfp_ms": [
+              472.818
             ]
           },
           "A3": {
             "mean_audio_rtf": [
               1.2352
+            ],
+            "request_throughput": [
+              0.31
+            ],
+            "mean_ttft_ms": [
+              431.6208
+            ],
+            "mean_tpot_ms": [
+              30.9782
+            ],
+            "mean_e2el_ms": [
+              52017.2332
+            ],
+            "mean_audio_ttfp_ms": [
+              2331.3428
             ]
           }
         }
@@ -126,11 +186,41 @@
           "H100": {
             "mean_audio_rtf": [
               0.1798
+            ],
+            "request_throughput": [
+              0.9562
+            ],
+            "mean_ttft_ms": [
+              460.0396
+            ],
+            "mean_tpot_ms": [
+              6.5413
+            ],
+            "mean_e2el_ms": [
+              4944.8597
+            ],
+            "mean_audio_ttfp_ms": [
+              759.7934
             ]
           },
           "A3": {
             "mean_audio_rtf": [
               2.5023
+            ],
+            "request_throughput": [
+              0.5098
+            ],
+            "mean_ttft_ms": [
+              1282.0529
+            ],
+            "mean_tpot_ms": [
+              44.8081
+            ],
+            "mean_e2el_ms": [
+              87154.8693
+            ],
+            "mean_audio_ttfp_ms": [
+              7125.4738
             ]
           }
         }
@@ -166,12 +256,30 @@
         "baseline": {
           "H100": {
             "mean_e2el_ms": [
-              756.8415
+              733.5836
+            ],
+            "request_throughput": [
+              0.0993
+            ],
+            "mean_ttft_ms": [
+              275.2829
+            ],
+            "mean_tpot_ms": [
+              4.6254
             ]
           },
           "A3": {
             "mean_e2el_ms": [
               2436.1048
+            ],
+            "request_throughput": [
+              0.0972
+            ],
+            "mean_ttft_ms": [
+              463.8431
+            ],
+            "mean_tpot_ms": [
+              24.5161
             ]
           }
         }
@@ -210,11 +318,29 @@
           "H100": {
             "mean_e2el_ms": [
               694.9777
+            ],
+            "request_throughput": [
+              0.4966
+            ],
+            "mean_ttft_ms": [
+              231.253
+            ],
+            "mean_tpot_ms": [
+              5.1925
             ]
           },
           "A3": {
             "mean_e2el_ms": [
               2534.4575
+            ],
+            "request_throughput": [
+              0.484
+            ],
+            "mean_ttft_ms": [
+              347.8392
+            ],
+            "mean_tpot_ms": [
+              27.363
             ]
           }
         }
@@ -254,12 +380,30 @@
         "baseline": {
           "H100": {
             "mean_e2el_ms": [
-              1006.1663
+              992.3741
+            ],
+            "request_throughput": [
+              0.9903
+            ],
+            "mean_ttft_ms": [
+              378.4494
+            ],
+            "mean_tpot_ms": [
+              6.1976
             ]
           },
           "A3": {
             "mean_e2el_ms": [
               3460.0385
+            ],
+            "request_throughput": [
+              0.963
+            ],
+            "mean_ttft_ms": [
+              878.5597
+            ],
+            "mean_tpot_ms": [
+              36.0758
             ]
           }
         }

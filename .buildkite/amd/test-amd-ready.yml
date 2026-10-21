@@ -63,13 +63,10 @@ steps:
         # that is not supported on CPU
         # Keep multi-GPU tests out of this one-GPU pool even when their module
         # also carries the cpu marker for unit tests.
-        # Keep π0.5 CPU units out of these shards: CUDA READY/MERGE already run
-        # the same suite mandatorily, and AMD covers it non-blocking in nightly.
         - >-
           pytest -sv tests/diffusion
           -m 'core_model and cpu and not (cards_2 or cards_3 or cards_4 or cards_5 or cards_6 or cards_7 or cards_8)'
           --ignore=tests/diffusion/cache/test_teacache_extractors.py
-          --ignore=tests/diffusion/models/pi05/test_pi05_units.py
           --deselect='tests/diffusion/distributed/test_wan_vae_fastpath_install.py::test_omni_wan_vae_decode_override_is_bitwise_exact[dtype0]'
           --deselect='tests/diffusion/distributed/test_wan_vae_fastpath_install.py::test_omni_wan_vae_decode_override_is_bitwise_exact[dtype1]'
           --deselect='tests/diffusion/distributed/test_wan_decoder_fast_path.py::test_sharded_fast_path_on_every_rank[True-exact]'
@@ -208,7 +205,7 @@ steps:
       depends_on: amd-build
       mirror_hardwares: [amdproduction]
       grade: Blocking
-      timeout_in_minutes: 20
+      timeout_in_minutes: 25
       commands:
         - export VLLM_ROCM_USE_AITER=1
         - export VLLM_OMNI_AR_FA_REQUIRED=1
@@ -218,6 +215,11 @@ steps:
         - >-
           timeout --signal=TERM --kill-after=2m 15m
           pytest -sv tests/diffusion/ar_diffusion/test_paged_attention.py
+          -m 'core_model and rocm and MI325 and cards_1' --run-level core_model
+        # Keep the pinned-ring device contract blocking without making the
+        # cold, experimental AITER coverage lane a required check.
+        - >-
+          timeout --signal=TERM --kill-after=1m 5m pytest -sv tests/diffusion/utils/test_chunked_transfer.py
           -m 'core_model and rocm and MI325 and cards_1' --run-level core_model
 
     - label: "Diffusion · Batch Test"
@@ -229,7 +231,7 @@ steps:
         # Restore the unmasked BF16 AITER module into a job-local directory.
         # This consumer does not publish a duplicate artifact.
         - eval "$$(python .buildkite/amd/scripts/aiter_mha_cache.py prepare)"
-        - pytest -sv tests/diffusion/batching -m 'core_model and cuda' --run-level "core_model"
+        - pytest -sv tests/diffusion/batching -m 'core_model and rocm and MI325 and cards_1' --run-level "core_model"
 
     - label: "Diffusion · Offloader Test"
       agent_pool: mi300_1
@@ -239,7 +241,7 @@ steps:
       commands:
         - export VLLM_LOGGING_LEVEL=DEBUG
         - export VLLM_WORKER_MULTIPROC_METHOD=spawn
-        - pytest -s -v tests/diffusion/offloader -m "core_model and cuda" --run-level "core_model"
+        - pytest -s -v tests/diffusion/offloader -m "core_model and rocm and MI325 and cards_1" --run-level "core_model"
 
     - label: "Diffusion · Cache Test"
       agent_pool: mi300_1
@@ -250,7 +252,7 @@ steps:
         - export GPU_ARCHS=gfx942
         - export VLLM_LOGGING_LEVEL=DEBUG
         - export VLLM_WORKER_MULTIPROC_METHOD=spawn
-        - pytest -sv tests/diffusion/cache -m 'core_model and cuda' --run-level "core_model"
+        - pytest -sv tests/diffusion/cache -m 'core_model and rocm and MI325 and cards_1' --run-level "core_model"
 
     - label: "Diffusion Sequence Parallelism Test"
       agent_pool: mi300_2
@@ -271,6 +273,21 @@ steps:
           tests/diffusion/models/ltx2/test_ltx2_transformer_ulysses.py
           -m 'core_model and rocm and cards_2'
           --run-level "core_model"
+
+    - label: "ROCm · Ulysses UAA Attention · 2-GPU"
+      agent_pool: mi300_2
+      depends_on: amd-build
+      mirror_hardwares: [amdproduction]
+      grade: Blocking
+      timeout_in_minutes: 25
+      commands:
+        - export VLLM_WORKER_MULTIPROC_METHOD=spawn
+        - >-
+          timeout --signal=TERM --kill-after=2m 20m pytest -s -v
+          tests/diffusion/attention/test_ulysses_uaa.py
+          tests/diffusion/attention/test_attention_sp.py
+          -m 'core_model and rocm and MI325 and cards_2'
+          --run-level "core_model" --durations=20
 
     - label: "Diffusion GPU Worker Test"
       agent_pool: mi300_2

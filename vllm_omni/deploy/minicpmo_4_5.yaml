@@ -16,6 +16,11 @@ connectors:
   connector_of_shared_memory:
     name: SharedMemoryConnector
     extra:
+      # Talker codec prelude: one Triton kernel for the rep-penalty and
+      # temperature steps on NPU. Defaults to on; set false to force the eager
+      # chain for accuracy triage (e.g. after a CANN/torch_npu upgrade). It is
+      # a no-op off NPU or without Triton.
+      # talker_codec_fused_prelude: false
       connector_get_sleep_s: 0.01
       connector_get_max_wait_first_chunk: 3000
       connector_get_max_wait: 300
@@ -35,8 +40,11 @@ connectors:
       hift_graph_continuation_frames: [4, 28]
       hift_graph_exact_batch_sizes: [1]
       enable_cfm_graph: true
-      # Small exact encoder batches share one arena; larger batches replay
-      # in groups, preserving cache lengths without batch padding.
+      # Fused CFM DiT body: CUDA via TF32, NPU via packed QKV + ACLNN
+      # AddLayerNorm + im2col-GEMM convolutions and a single cache transpose.
+      cfm_fused_body: true
+      # Small exact encoder batches share one startup arena; larger batches
+      # replay in groups, preserving cache lengths without batch padding.
       enable_code2wav_encoder_graph: true
       code2wav_encoder_graph_rows: 4
       code2wav_encoder_max_graphs: 12

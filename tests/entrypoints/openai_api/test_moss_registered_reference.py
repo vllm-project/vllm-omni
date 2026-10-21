@@ -11,8 +11,8 @@ from safetensors.torch import save_file
 
 from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
-from vllm_omni.entrypoints.openai.tts_adapters.base import SpeechServingContext, conditioning_cache_salt
-from vllm_omni.entrypoints.openai.tts_adapters.moss_tts import MossTTSAdapter
+from vllm_omni.entrypoints.openai.tts_adapters.base import SpeechServingContext
+from vllm_omni.entrypoints.openai.tts_adapters.moss_tts import MossTTSAdapter, _code_grid_cache_salt
 from vllm_omni.model_executor.models.moss_tts.reference_encoder import MossReferenceEncoder
 from vllm_omni.utils.speaker_cache import SpeakerEmbeddingCache
 
@@ -97,9 +97,7 @@ async def test_reupload_during_encoding_keeps_codes_and_salt_generation(setup):
     assert torch.equal(result.tts_params["codes"]["ref"], torch.full((3, 12), 7))
     assert result.tts_params["voice_created_at"] == [123]
     assert request.ref_text == "Reference."
-    assert result.prompt["cache_salt"] == conditioning_cache_salt(
-        request, result.tts_params, registered_voice=("alice", 123)
-    )
+    assert result.prompt["cache_salt"] == _code_grid_cache_salt(torch.full((3, 12), 7))
     assert server._speaker_cache.get(encoder._make_cache_key("alice", 124)) is None
     server._voice_created_at.assert_not_called()
 

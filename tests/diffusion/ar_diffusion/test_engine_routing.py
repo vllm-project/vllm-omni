@@ -133,7 +133,8 @@ def test_runner_rejects_multi_sequence_config():
 
     from vllm_omni.experimental.ar_diffusion.runner import ARDiffusionModelRunner
 
-    fake = SimpleNamespace(od_config=SimpleNamespace(max_num_seqs=4))
+    # Non-cell pipeline stub: exercise the paged max_num_seqs=1 guard.
+    fake = SimpleNamespace(od_config=SimpleNamespace(max_num_seqs=4), pipeline=object())
     with pytest.raises(ValueError, match="max_num_seqs=1"):
         ARDiffusionModelRunner._preallocate_kv_cache(fake)
 

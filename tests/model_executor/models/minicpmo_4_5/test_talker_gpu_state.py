@@ -12,6 +12,10 @@ from tests.model_executor.models.minicpmo_4_5.test_talker_batching import (
     _make_talker,
     _reference_repetition_penalty,
 )
+from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
+    _DRAIN_BOUNDARY_MASK,
+    _DRAIN_UNTIL_SILENT,
+)
 from vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni import _extract_codec_delta
 from vllm_omni.utils.mm_outputs import build_mm_cpu, to_payload_element
 
@@ -47,13 +51,20 @@ def test_codec_slots_grow_for_preempted_requests_without_losing_state(device):
     codec = CodecState(torch.device(device), 8, capacity=1)
     first: dict[str, int] = {}
     second: dict[str, int] = {}
+    no_classes = torch.zeros(9, dtype=torch.int8, device=device)
+    rules = {
+        "eos": 7,
+        "cadence": 25,
+        "boundary": 2,
+        "code_classes": no_classes,
+        "silent_frames": 2,
+        "quiet_stop_frames": 8,
+    }
     with NoHostRead():
-        codec.update([("preempted", first, 2)], torch.tensor([2], device=device), eos=7, cadence=25, boundary=2)
+        codec.update([("preempted", first, 2)], torch.tensor([2], device=device), **rules)
         # max_num_seqs bounds running requests, not retained preempted requests.
-        codec.update([("new", second, 3)], torch.tensor([3], device=device), eos=7, cadence=25, boundary=2)
-        history, valid, done, _ = codec.update(
-            [("preempted", first, 4)], torch.tensor([4], device=device), eos=7, cadence=25, boundary=2
-        )
+        codec.update([("new", second, 3)], torch.tensor([3], device=device), **rules)
+        history, valid, done, _ = codec.update([("preempted", first, 4)], torch.tensor([4], device=device), **rules)
     assert first["_gpu_slot"] != second["_gpu_slot"]
     assert history[0, -2:].tolist() == [2, 4]
     assert valid.item() and not done.item()
@@ -67,8 +78,8 @@ def test_v1_gpu_codec_state_matches_cpu_over_reordered_mixed_steps(device):
     cpu.emb_code = torch.nn.ModuleList([torch.nn.Embedding(8, 2)])
     gpu._request_audio_states = {
         "a": {"finished": False, "step": 23, "max_tokens": 26, "min_tokens": 26, "recent_codes": [1] * 16},
-        "b": {"finished": False, "step": 0, "turn_end_drain": True, "recent_codes": [2, 3]},
-        "c": {"finished": False, "step": 24, "max_tokens": 101, "turn_end_drain": True},
+        "b": {"finished": False, "step": 0, "turn_end_drain": _DRAIN_BOUNDARY_MASK, "recent_codes": [2, 3]},
+        "c": {"finished": False, "step": 24, "max_tokens": 101, "turn_end_drain": _DRAIN_BOUNDARY_MASK},
     }
     import copy
 
@@ -122,6 +133,56 @@ def test_v1_gpu_codec_state_matches_cpu_over_reordered_mixed_steps(device):
     gpu.on_requests_finished(set("abc"))
     gpu._flush_deferred_cleanup()
     assert not gpu._request_audio_states and not gpu._decode_codec_id_map()
+
+
+def test_v1_gpu_turn_end_drain_until_silent_matches_cpu(device):
+    import copy
+
+    gpu, cpu = _make_talker(), _make_talker()
+    for talker in (gpu, cpu):
+        # Small vocabulary: 2 is silent, 2 and 3 are quiet.
+        talker.silent_codec_ids, talker.quiet_codec_ids = (2,), (2, 3)
+    gpu.emb_code = torch.nn.ModuleList([torch.nn.Embedding(8, 2, device=device)])
+    cpu.emb_code = torch.nn.ModuleList([torch.nn.Embedding(8, 2)])
+    drain = {"finished": False, "step": 0, "max_tokens": 104, "min_tokens": 0, "turn_end_drain": _DRAIN_UNTIL_SILENT}
+    gpu._request_audio_states = {
+        # Silent codes retained from the previous condition do not count.
+        "a": dict(drain, recent_codes=[2, 2]),
+        "b": dict(drain),
+        # The boundary mask (kind 1) is unchanged.
+        "c": dict(drain, step=20, turn_end_drain=_DRAIN_BOUNDARY_MASK),
+    }
+    cpu._request_audio_states = copy.deepcopy(gpu._request_audio_states)
+    codes = {"a": [2, 2, 1, 2, 2, 1, 1, 1, 1, 1], "b": [3] * 9 + [1], "c": [1] * 10}
+    masked_a, done_b = [], []
+    for step in range(10):
+        req_ids = list("abc")
+        values = [codes[rid][step] for rid in req_ids]
+        infos = [{"request_id": rid, "audio_state": gpu._request_audio_states[rid]} for rid in req_ids]
+        with NoHostRead():
+            _, _, updates = gpu.preprocess_decode_batch(input_ids=torch.tensor(values, device=device), req_infos=infos)
+            gpu.make_omni_output(
+                torch.ones(3, 2, device=device),
+                model_intermediate_buffer=[dict(info, **update) for info, update in zip(infos, updates)],
+                request_token_spans=[(0, 1), (1, 2), (2, 3)],
+            )
+        cpu_infos = []
+        for rid, value in zip(req_ids, values):
+            _, _, update = cpu.preprocess(
+                torch.tensor([value]), None, request_id=rid, audio_state=cpu._request_audio_states[rid]
+            )
+            cpu_infos.append(dict(request_id=rid, **update))
+        cpu.make_omni_output(
+            torch.ones(3, 2), model_intermediate_buffer=cpu_infos, request_token_spans=[(0, 1), (1, 2), (2, 3)]
+        )
+        torch.testing.assert_close(gpu._force_eos_rows.cpu(), torch.tensor(cpu._force_eos_rows))
+        torch.testing.assert_close(gpu._mask_eos_rows.cpu(), torch.tensor(cpu._mask_eos_rows))
+        masked_a.append(bool(cpu._mask_eos_rows[0]))
+        done_b.append(bool(cpu._force_eos_rows[1]))
+    # Row a may stop only once two silent codes of this condition follow each other.
+    assert masked_a[:6] == [True, False, True, True, False, True]
+    # Row b is forced to stop on its eighth quiet code in a row.
+    assert done_b.index(True) == 7
 
 
 def test_v1_gpu_eos_masks_apply_without_host_reads(device):

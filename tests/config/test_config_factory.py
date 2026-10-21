@@ -2789,6 +2789,25 @@ class TestMingFlashOmniPipeline:
 class TestBaseConfigInheritance:
     """Test deploy YAML base_config inheritance."""
 
+    @pytest.mark.parametrize(
+        ("platform", "expected_devices", "talker_memory"),
+        [
+            ("rocm", ["0", "1", "1"], 0.3),
+            ("cuda", ["0", "1", "2"], 0.4),
+            ("xpu", ["0", "1", "2"], 0.5),
+        ],
+    )
+    def test_qwen2_5_omni_ci_placement(self, monkeypatch, platform, expected_devices, talker_memory):
+        """The two-card ROCm examples must colocate Code2Wav without changing other platforms."""
+        from vllm_omni import platforms
+
+        monkeypatch.setattr(platforms.current_omni_platform, "device_name", platform)
+        deploy = load_deploy_config(get_deploy_config_path("ci/qwen2_5_omni.yaml"))
+        stages = merge_pipeline_deploy(resolve_pipeline_config("qwen2_5_omni"), deploy)
+
+        assert [stage.yaml_runtime["devices"] for stage in stages] == expected_devices
+        assert stages[1].yaml_engine_args["gpu_memory_utilization"] == talker_memory
+
     def test_minicpmo_overlays_inherit_talker_sampling_params(self):
         """Overlays must keep the base Talker codec Sampler knobs."""
         for filename in (
@@ -3150,7 +3169,7 @@ class TestPlatformOverrides:
             assert args["hf_overrides"]["mrv2_gpu_slot_state"] is True
             assert args["hf_overrides"]["mrv2_batch_prefill"] is True
             assert args["hf_overrides"]["mrv2_direct_tokens"] is True
-            assert args["hf_overrides"]["local_compile_audio_sampler"] is True
+            assert "local_compile_audio_sampler" not in args["hf_overrides"]
             extra = deploy.connectors["shm"]["extra"]
             assert extra["generation_min_batch_size"] == 16
             assert extra["generation_max_wait_ms"] == 6
@@ -3173,8 +3192,12 @@ class TestPlatformOverrides:
             "mrv2_gpu_slot_state": True,
             "mrv2_batch_prefill": True,
             "mrv2_direct_tokens": True,
-            "local_compile_audio_sampler": True,
+            "mrv2_eager_mtp": True,
         }
+        # Both CUDA stages run without torch.compile; explicit kernels replace the fusions.
+        assert args["compilation_config"]["mode"] == 0
+        assert args["compilation_config"]["cudagraph_mode"] == "FULL"
+        assert "inductor_compile_config" not in args["compilation_config"]
         extra = deploy.connectors["shm"]["extra"]
         assert extra["initial_codec_chunk_frames"] == 1
         assert extra["codec_chunk_frames"] == 15
@@ -3187,10 +3210,10 @@ class TestPlatformOverrides:
         assert codec_args["max_num_seqs"] == 128
         assert codec_args["hf_overrides"]["codec_attention_backend"] == "triton_slot"
         compilation = codec_args["compilation_config"]
-        assert compilation["mode"] == 3 and compilation["backend"] == "inductor"
+        assert compilation["mode"] == 0 and "backend" not in compilation
         assert compilation["cudagraph_mode"] == "FULL"
         assert max(compilation["cudagraph_capture_sizes"]) == 128
-        assert compilation["inductor_compile_config"] == {"combo_kernels": False, "benchmark_combo_kernel": False}
+        assert "inductor_compile_config" not in compilation
         for variant in ("moss_tts_delay", "moss_tts_realtime"):
             assert not any(stage.supports_native_mrv2_data_plane for stage in resolve_pipeline_config(variant).stages)
 
