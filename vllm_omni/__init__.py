@@ -15,6 +15,10 @@ Architecture:
   processing
 """
 
+import atexit
+import os
+import sys
+
 # We import version early, because it will warn if vLLM / vLLM Omni
 # are not using the same major + minor version (if vLLM is installed).
 # We should do this before applying patch, because vLLM imports might
@@ -74,3 +78,14 @@ __all__ = [
     # All other components are available through their respective modules
     # processors.*, schedulers.*, executors.*, etc.
 ]
+
+
+# vLLM's model-inspection subprocess (`python3 -m vllm.model_executor.models.registry`)
+# imports vllm_omni, and on NPU the interpreter aborts while finalizing
+# (SIGABRT, "corrupted size vs. prev_size", exit code 134). vLLM 0.32 treats
+# that exit code as a hard failure ("Model architectures ... failed to be
+# inspected") and refuses to start the engine. The child only prints the
+# registry and exits, so terminate it cleanly right after its work is done;
+# no state needs flushing there.
+if sys.argv and sys.argv[0].endswith("models/registry.py"):
+    atexit.register(lambda: os._exit(0))
