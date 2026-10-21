@@ -942,7 +942,9 @@ class _ThreeStepS2VScheduler:
         return (latents,)
 
 
-def _run_two_clip_s2v_forward(monkeypatch, schedule, events: list[tuple[object, ...]]) -> None:
+def _run_two_clip_s2v_forward(
+    monkeypatch, schedule, events: list[tuple[object, ...]], *, from_request: bool = False
+) -> None:
     monkeypatch.setattr(
         "vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2_s2v.current_omni_platform",
         SimpleNamespace(is_available=lambda: False, empty_cache=lambda: None),
@@ -993,7 +995,7 @@ def _run_two_clip_s2v_forward(monkeypatch, schedule, events: list[tuple[object, 
             )
         ]
     )
-    with set_forward_context(), bind_attention_schedule(schedule):
+    with set_forward_context(), bind_attention_schedule(schedule, from_request=from_request):
         try:
             pipeline.forward(batch)
         finally:
@@ -1023,7 +1025,7 @@ def test_s2v_forward_rejects_schedule_past_clip_total_before_first_forward(monke
     events: list[tuple[object, ...]] = []
 
     with pytest.raises(InvalidAttentionScheduleError, match="exceeds total_steps=3"):
-        _run_two_clip_s2v_forward(monkeypatch, schedule, events)
+        _run_two_clip_s2v_forward(monkeypatch, schedule, events, from_request=True)
 
     # The first clip's check fails after audio encoding and before any denoise forward.
     assert events == [("audio", None, None, None), ("end", None, None, None)]

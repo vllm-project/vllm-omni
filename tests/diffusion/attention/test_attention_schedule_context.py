@@ -18,10 +18,7 @@ from tests.diffusion.attention.test_attention_schedule_candidates import (
 )
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.attention.parallel.base import NoParallelAttention
-from vllm_omni.diffusion.attention.schedule import (
-    AttentionScheduleRange,
-    require_attention_schedule_fits,
-)
+from vllm_omni.diffusion.attention.schedule import AttentionScheduleRange
 from vllm_omni.diffusion.config import set_current_diffusion_config
 from vllm_omni.diffusion.data import (
     AttentionConfig,
@@ -33,6 +30,7 @@ from vllm_omni.diffusion.data import (
 )
 from vllm_omni.diffusion.forward_context import (
     DenoiseProgressMixin,
+    begin_scheduled_denoise,
     get_forward_context,
     is_forward_context_available,
 )
@@ -146,9 +144,7 @@ class _PublishingRequestPipeline(DenoiseProgressMixin):
         if total is None:
             total = batch.requests[0].sampling_params.num_inference_steps
         self._select("encode")
-        schedule = get_forward_context().attention_schedule
-        if schedule:
-            require_attention_schedule_fits(schedule, total)
+        begin_scheduled_denoise(total)
         for step in range(total):
             self.record_denoise_step(step, total_steps=total)
             if step == self.fail_step:
@@ -216,6 +212,21 @@ def test_request_runner_failure_or_cancel_does_not_leak_into_next_request(attent
         "base",
         "base",
     ]
+
+
+def test_request_runner_serves_an_inherited_default_longer_than_the_sequence(attention_env, runner_platform):
+    service = AttentionScheduleConfig(
+        profiles=_service().profiles, default=[{"start": 0, "end": 6, "profile": "dense"}]
+    )
+    config = _runner_config(service)
+    layer = attention_env.build(config)
+    pipeline = _PublishingRequestPipeline(layer, actual_steps=4)
+    runner = _make_runner(pipeline, config)
+
+    output = DiffusionModelRunner.execute_model(runner, _request("req-a", steps=8))
+
+    assert output.error is None
+    assert [name for _phase, name in _names(layer, pipeline.selected)] == ["base", *["dense"] * 4, "base"]
 
 
 @pytest.mark.parametrize("batch_size", [1, 2])
