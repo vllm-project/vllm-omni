@@ -165,11 +165,10 @@ def checkpoint_pair(request) -> tuple[str, str]:
 # GPU.
 MIN_LOGPROB_COSINE = 0.90
 
-# Minimum number of aligned greedy steps required before the logprob gate can
-# be scored (cosine needs at least two points). A shorter shared prefix means
-# the two arms diverge almost immediately, which must fail rather than fall
-# back to NaN and silently skip the gate.
-MIN_SHARED_PREFIX = 2
+# Require at least five aligned greedy steps so the logprob gate cannot score
+# only a couple of prompt-echo tokens. A shorter shared prefix must fail rather
+# than fall back to NaN and silently skip the gate.
+MIN_SHARED_PREFIX = 5
 
 # Decoded-image A/B thresholds (same seed + greedy AR + deterministic DiT).
 MIN_IMAGE_COSINE = 0.98
@@ -298,9 +297,8 @@ def test_bf16_vs_int8_generation_consistency(checkpoint_pair: tuple[str, str]):
     )
     lp_len = min(agree_prefix, len(bf16_lp), len(int8_lp))
 
-    # Diverging within the first step or two is the strongest possible failure
-    # signal, so it must fail here instead of degrading the metrics to NaN and
-    # turning the gate below into a no-op.
+    # Too few aligned steps can score only prompt-echo tokens, so fail here
+    # instead of accepting an uninformative cosine or degrading it to NaN.
     assert lp_len >= MIN_SHARED_PREFIX, (
         f"BF16/INT8 agree on only {lp_len} step(s) before diverging "
         f"(agree_prefix={agree_prefix}/{common}); cannot score logprobs"
