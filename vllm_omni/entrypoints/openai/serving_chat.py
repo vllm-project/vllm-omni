@@ -1426,12 +1426,18 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         return new_messages
 
     def _to_sampling_params_list(
-        self, sampling_params_list: list[dict], request: ChatCompletionRequest | None = None
+        self,
+        sampling_params_list: list[dict],
+        request: ChatCompletionRequest | None = None,
+        *,
+        merge_llm_defaults: bool = True,
     ) -> list[Any]:
         """Convert request dicts to stage-typed sampling params objects.
 
         Partial LLM dictionaries inherit deploy defaults, then explicit top-level
         request parameters on the comprehension stage. Explicit stage fields win.
+        Video sessions set ``merge_llm_defaults=False`` so provided stage dicts
+        use constructor defaults instead, preserving their replacement semantics.
 
         For diffusion stages, build ``OmniDiffusionSamplingParams`` so
         downstream ``StageDiffusionClient._sampling_params_to_dict`` (which
@@ -1448,7 +1454,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             stage_type = get_stage_type(stage_config)
             target_cls = OmniDiffusionSamplingParams if stage_type == "diffusion" else SamplingParams
             if isinstance(sampling_params, dict):
-                if target_cls is SamplingParams:
+                if target_cls is SamplingParams and merge_llm_defaults:
                     default = default_params_list[idx] if idx < len(default_params_list) else SamplingParams()
                     final_sampling_params_list.append(
                         self._merge_llm_sampling_params(default, stage_config, sampling_params, request)
