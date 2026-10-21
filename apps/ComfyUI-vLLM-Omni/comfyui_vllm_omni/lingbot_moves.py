@@ -282,6 +282,40 @@ def _check_lane_overlaps(moves: tuple[CameraMove, ...] | list[CameraMove]) -> No
                 )
 
 
+def moves_from_editor(value: object, *, shot_frames: int) -> tuple[CameraMove, ...]:
+    """Read the in-node timeline editor's value, ``{"moves": [...]}``.
+
+    The editor stores moves on the shot's own frame clock, exactly as a moves
+    text does, so both authoring surfaces produce the same moves. A value that
+    is missing or empty means the shot has no camera movement.
+    """
+    if value is None:
+        return ()
+    if not isinstance(value, dict):
+        raise ValueError("The timeline editor expects an object with a 'moves' list.")
+    entries = value.get("moves") or []
+    if not isinstance(entries, list):
+        raise ValueError("The timeline editor's 'moves' must be a list.")
+    moves: list[CameraMove] = []
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            raise ValueError(f"Timeline move {index} must be an object with lane, value, start_frame and frames.")
+        try:
+            lane = entry["lane"]
+            move_value = entry["value"]
+            start = int(entry["start_frame"])
+            frames = int(entry["frames"])
+        except (KeyError, TypeError, ValueError):
+            raise ValueError(
+                f"Timeline move {index} needs lane, value, start_frame and frames; got {entry!r}."
+            ) from None
+        if start >= shot_frames:
+            raise ValueError(f"Timeline move {index} starts at frame {start}, after the shot's {shot_frames} frames.")
+        moves.append(CameraMove(lane, move_value, start, max(1, min(frames, shot_frames - start))))
+    _check_lane_overlaps(moves)
+    return tuple(moves)
+
+
 def compile_sequence(
     sequence: LingBotSequence,
     geometry: LingBotGeometry = DEFAULT_GEOMETRY,

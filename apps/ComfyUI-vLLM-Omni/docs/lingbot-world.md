@@ -29,7 +29,7 @@ These are screenshots of the actual ComfyUI graphs using the official [LingBot-W
 1. Install this app and restart ComfyUI. Drag the corresponding LingBot workflow JSON from `example_workflows` onto the canvas, or open it through the workflow menu. Import the JSON workflow, not the documentation JPEG.
 2. Download the [upstream first frame](https://raw.githubusercontent.com/Robbyant/lingbot-world-v2/1895d300d8ac936401689b26389f51cbd36530eb/examples/03/image.jpg) as `lingbot-upstream-03.jpg` and upload it in **Load Image**, or select your own first frame. To build the graph manually, double-click an empty canvas area to search for each node. Connect Load Image's `IMAGE` output to the LingBot node's `image` input; for Offline JSON, connect its `VIDEO` output to Save Video's `video` input.
 3. Enter the Omni address and prompt. For the JSON variants, paste the trajectory into `camera_json` and match `num_frames` to its chunk count. The supplied JSON examples use 33 frames.
-4. Drag node headers to arrange them, resize the nodes to expose their fields, and zoom until all connections fit. Capture the canvas region with a screenshot tool. Creating a structure screenshot does not require running the workflow or loading a model; save the workflow JSON separately to preserve an editable graph.
+4. Drag node headers to arrange them, resize the nodes to expose their fields, and zoom until all connections fit. Capture the canvas region with a screenshot tool. Creating a structure screenshot does not require running the workflow or loading a model; save the workflow JSON separately to preserve an editable graph. The shot workflow needs no screenshot: it is a chain of **Shot** nodes whose own bodies draw the timeline and the lane editor.
 
 ## Install and serve
 
@@ -59,9 +59,9 @@ Do not add `--disable-api-nodes`: its restrictive media policy blocks the `blob:
 2. Select one RGB image in **Load Image** and set the initial prompt. The first image is resized to the requested output dimensions.
 3. Keep `width=832`, `height=480` to match the default deploy configuration. Frame count must be `9 + 12k`; the default 129 frames at 16 FPS is about eight seconds.
 4. Run the workflow to prepare the request. Run does not start model inference.
-5. Click **Open interaction panel** below the seed, then **Start / Restart**. After the first chunk arrives, click the keyboard control area: **WASD** moves, **IJKL** turns.
-6. Camera speed defaults to **0.5×**, adjustable from 0.1× to 2×. Releasing keys, leaving the control area, or hiding the page releases movement.
-7. **Stop** cancels generation. Closing the panel, deleting the node, or replacing the workflow also closes the session. Restart creates a new world.
+5. Click **Open interaction panel** below the seed, then **Start**. The window shows the stream in a 16:9 player; click the video once to drive it. After the first chunk arrives: **WASD** moves and **IJKL** turns, and the keycaps in the legend light up while a key is held.
+6. **Apply** under the prompt sends a new prompt to the running session; it is enabled once the first chunk has arrived. Camera speed defaults to **0.5×**, adjustable from 0.1× to 2×. Releasing the keys, leaving the video, or hiding the page releases movement.
+7. **Save** stops the session and downloads the take as an MP4. **Stop** only cancels generation, and closing the window, pressing Escape, deleting the node, or replacing the workflow stops it too. Restart creates a new world.
 
 Changing node parameters requires another workflow Run. Only one panel is active per browser page; keep this node in the root workflow, outside subgraphs. The keyboard interaction node has no `VIDEO` output; use Offline JSON below for downstream nodes.
 
@@ -92,19 +92,21 @@ Both JSON nodes submit the complete script at session start. They do not schedul
 
 The JSON node above asks you to write one key list per generated chunk, which
 means computing `(num_frames - 9) / 12 + 1` yourself and redoing it whenever the
-frame count changes. The shot nodes take a timeline instead and compile it.
+frame count changes. The shot nodes take a timeline instead, and draw it.
 
 | Node | Takes | Gives |
 | --- | --- | --- |
-| **LingBot Camera Moves** | a moves text | `LINGBOT_MOVES` |
-| **LingBot World Shot** | a prompt, a length in chunks, optional `sequence` and `moves` | `LINGBOT_SEQUENCE` |
+| **LingBot World Shot** | a prompt, a length in chunks, an in-node lane editor, an optional `sequence` | `LINGBOT_SEQUENCE` |
 | **LingBot World Render** | a first image, a `sequence`, the server settings | `VIDEO` |
 | **LingBot World Visualizer** | a `sequence` | nothing; it draws the plan |
+| **LingBot Camera Moves** | a moves text | `LINGBOT_MOVES`, an override for one shot |
 
-Chain shots through `sequence` and feed the last one to **Render** and to
+Chain shots through `sequence`, then feed the last one to **Render** and to
 **Visualizer**. Import
 [vLLM-Omni LingBot World Shots.json](../example_workflows/vLLM-Omni%20LingBot%20World%20Shots.json)
-for a two-shot example.
+for a two-shot example. The lane editor and the viewer are DOM widgets, so they
+need a ComfyUI build recent enough to have `addDOMWidget` (any 2024-or-later
+build).
 
 ### How long a shot is
 
@@ -119,11 +121,34 @@ and every later chunk holds 12. A sequence therefore has to live on that grid:
 The **Shot** node's `chunks` field counts chunks, one chunk being 0.75 seconds
 at 16 FPS, and the node sizes the shot for you.
 
-### Camera moves
+### The lane editor
 
-One move per line, `lane value start end`, with frames counted from the shot's
-start and `end` exclusive. `end` on its own means the shot's last frame. `#`
-starts a comment.
+Each **Shot** node draws its own camera timeline under the prompt: a frame ruler
+in frames and seconds, the chunk grid as dotted lines, and one row per lane.
+
+- Click an empty lane to add a move there; it starts snapped to a latent frame
+  and lasts a chunk by default.
+- Drag a move to slide it, drag its right edge to resize it, press Delete or
+  Backspace to remove the selected one.
+- Select a move to edit its lane, direction, start frame and length as numbers
+  in the panel below.
+- Overlapping moves on one lane, a move shorter than one latent frame, an
+  unknown lane or direction, and a move running past the shot are drawn in red
+  with the reason in its tooltip. A move the shot cuts is drawn with a dashed
+  edge and listed under the viewer.
+- Editing the `chunks` field or chaining another shot re-grids the editor
+  immediately.
+
+Connect the optional **LingBot Camera Moves** node to a shot's `moves` socket
+only when the moves have to come from another node: the socket wins over the
+editor, and the **Visualizer** shows a note instead of drawing those moves until
+the workflow runs.
+
+### Camera moves as text
+
+The standalone **Moves** node takes one move per line, `lane value start end`,
+with frames counted from the shot's start and `end` exclusive; `end` on its own
+means the shot's last frame, and `#` starts a comment.
 
 ```
 # lane   value    start  end
@@ -141,11 +166,7 @@ look_h   right    21     end
 Values that name their own lane (`forward`, `back`, `up`, `down`) may drop the
 lane word; `left` and `right` need it, because they can be a strafe or a look.
 There is no speed setting: how far the camera travels is how long the move
-lasts. A move that would run past its shot is cut there and reported by the
-visualizer; one too short to cover a latent frame is widened to one.
-
-The same moves text can be reused across shots, and **Moves** output can feed
-several **Shot** nodes' `moves` input.
+lasts.
 
 ### What renders
 
@@ -158,7 +179,7 @@ different world means a separate **Render**.
 
 The compiled script goes into `extra_params.camera_action_script`. For the shot
 layout in the example workflow (4 + 7 + 5 chunks, with a yaw started 21 frames
-in and a strafe in the second shot) the server integrates:
+in and a pitch up in the third shot) the server integrates:
 
 ```
 chunk  0..1   forward
@@ -168,6 +189,12 @@ chunk  7..10  forward
 chunk 11..12  (shot 3's prompt, no moves)
 chunk 13..15  pitch up
 ```
+
+**Visualizer** walks the shot chain you wired and draws it before anything runs:
+the same ruler and chunk grid, one block per shot with its prompt, prompt-switch
+markers where the prompt changes, one row per lane, and a footer with the totals
+and any warnings. While a **Render** of that same chain is executing, a playhead
+crosses the ruler with the frames rendered so far.
 
 The key vocabulary has no vertical translation and no absolute pose, so a crane
 shot or an exact camera path is not expressible here; those need a speed-profile

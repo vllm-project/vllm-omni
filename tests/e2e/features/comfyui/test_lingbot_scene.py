@@ -36,11 +36,30 @@ def _three_shot_sequence() -> LingBotSequence:
 
 def test_shot_node_chains_and_assigns_whole_chunks():
     moves = VLLMOmniLingBotMoves().build("move forward 0 end")[0]
-    first = VLLMOmniLingBotShot().add("A", 4, None, moves)[0]
-    second = VLLMOmniLingBotShot().add("B", 7, first, None)[0]
+    first = VLLMOmniLingBotShot().add("A", 4, moves=moves)[0]
+    second = VLLMOmniLingBotShot().add("B", 7, sequence=first)[0]
     assert [shot.frames for shot in second.shots] == [45, 84]
     assert second.shots[0].moves == (CameraMove("move", "forward", 0, 45),)
     assert second.shots[1].moves == ()
+
+
+def test_shot_node_reads_the_timeline_editor():
+    timeline = {
+        "moves": [
+            {"lane": "move", "value": "forward", "start_frame": 0, "frames": 45},
+            {"lane": "look_h", "value": "right", "start_frame": 21, "frames": 24},
+        ]
+    }
+    shot = VLLMOmniLingBotShot().add("A", 4, timeline)[0]
+    assert shot.shots[0].moves == (
+        CameraMove("move", "forward", 0, 45),
+        CameraMove("look_h", "right", 21, 24),
+    )
+
+
+def test_shot_node_rejects_a_malformed_timeline_move():
+    with pytest.raises(ValueError, match="needs lane, value, start_frame and frames"):
+        VLLMOmniLingBotShot().add("A", 4, {"moves": [{"lane": "move"}]})
 
 
 def test_shot_node_rejects_an_empty_prompt():

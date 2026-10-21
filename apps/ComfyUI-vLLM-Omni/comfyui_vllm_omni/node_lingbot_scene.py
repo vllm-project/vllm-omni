@@ -16,7 +16,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from .lingbot_geometry import DEFAULT_GEOMETRY
-from .lingbot_moves import LingBotSequence, Shot, compile_sequence, parse_moves, sequence_payload
+from .lingbot_moves import (
+    LingBotSequence,
+    Shot,
+    compile_sequence,
+    moves_from_editor,
+    parse_moves,
+    sequence_payload,
+)
 from .lingbot_request import (
     DEFAULT_ENDPOINT,
     DEFAULT_MODEL,
@@ -89,6 +96,8 @@ class VLLMOmniLingBotShot:
                         "tooltip": "One chunk is 12 frames after the first; 0.75 s at 16 FPS.",
                     },
                 ),
+                # Drawn by the front-end as a lane editor; the value is {"moves": [...]}.
+                "timeline": ("LINGBOT_TIMELINE", {"default": {"moves": []}}),
             },
             "optional": {
                 "sequence": ("LINGBOT_SEQUENCE",),
@@ -102,14 +111,18 @@ class VLLMOmniLingBotShot:
     CATEGORY = "vLLM-Omni"
     DESCRIPTION = "Append a shot to a LingBot sequence. Feed the last shot to Render and to the Visualizer."
 
-    def add(self, prompt, chunks, sequence=None, moves=None):
+    def add(self, prompt, chunks, timeline=None, sequence=None, moves=None):
         text = prompt.strip()
         if not text:
             raise ValueError("A shot needs a prompt.")
         shots = sequence.shots if sequence is not None else ()
         index = len(shots)
         frames = DEFAULT_GEOMETRY.shot_frames(index, int(chunks))
-        move_list = parse_moves(moves.text, shot_frames=frames) if moves is not None else ()
+        if moves is not None:
+            # A moves node connected to the socket wins over the lane editor.
+            move_list = parse_moves(moves.text, shot_frames=frames)
+        else:
+            move_list = moves_from_editor(timeline, shot_frames=frames)
         return (LingBotSequence((*shots, Shot(prompt=text, frames=frames, moves=move_list))),)
 
 
