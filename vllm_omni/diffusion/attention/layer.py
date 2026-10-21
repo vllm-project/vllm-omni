@@ -95,6 +95,34 @@ def _attention_identity(backend_cls: type[AttentionBackend] | None, backend_expl
     )
 
 
+def _reject_allgather_trtllm(
+    backend_cls: type[AttentionBackend], skip_sequence_parallel: bool, allgather_degree: int
+) -> None:
+    # TODO: Move AllGather-KV compatibility into an AttentionBackend capability
+    # so validation does not depend on backend names.
+    if not skip_sequence_parallel and allgather_degree > 1 and backend_cls.get_name() == "TRTLLM_ATTN":
+        raise ValueError(
+            "TRTLLM_ATTN does not support AllGather-KV sequence parallelism. "
+            "Set --allgather-degree 1 or select another diffusion attention backend."
+        )
+
+
+def _select_impl_cls(
+    backend_cls: type[AttentionBackend], impl_overrides: Mapping[str, type[AttentionImpl]] | None
+) -> type[AttentionImpl]:
+    impl_cls = backend_cls.get_impl_cls()
+    override = impl_overrides.get(backend_cls.get_name()) if impl_overrides is not None else None
+    if override is None:
+        return impl_cls
+    if not issubclass(override, impl_cls):
+        raise TypeError(
+            f"Attention implementation override {override.__qualname__} must subclass "
+            f"the selected implementation {impl_cls.__qualname__} "
+            f"for backend {backend_cls.__qualname__}"
+        )
+    return override
+
+
 def _try_extract_layer_index(prefix: str) -> int | None:
     if not prefix:
         return None
@@ -290,13 +318,7 @@ class Attention(nn.Module):
                     dense_backend_name,
                 )
             allgather_degree = getattr(parallel_config, "allgather_degree", 1)
-            # TODO: Move AllGather-KV compatibility into an AttentionBackend capability
-            # so validation does not depend on backend names.
-            if not skip_sequence_parallel and allgather_degree > 1 and attn_backend_cls.get_name() == "TRTLLM_ATTN":
-                raise ValueError(
-                    "TRTLLM_ATTN does not support AllGather-KV sequence parallelism. "
-                    "Set --allgather-degree 1 or select another diffusion attention backend."
-                )
+            _reject_allgather_trtllm(attn_backend_cls, skip_sequence_parallel, allgather_degree)
             self.attn_spec = spec
             if spec is not None:
                 backend_kwargs = spec.backend_kwargs()
@@ -310,18 +332,10 @@ class Attention(nn.Module):
                 logger.debug("Attention(role=%s) → platform default (%s)", role, self.backend_pref)
 
             self.attn_backend = attn_backend_cls
-            self.attn_impl_cls = self.attn_backend.get_impl_cls()
-            if impl_overrides is not None:
-                override = impl_overrides.get(attn_backend_cls.get_name())
-                if override is not None:
-                    if not issubclass(override, self.attn_impl_cls):
-                        raise TypeError(
-                            f"Attention implementation override {override.__qualname__} must subclass "
-                            f"the selected implementation {self.attn_impl_cls.__qualname__} "
-                            f"for backend {attn_backend_cls.__qualname__}"
-                        )
-                    self.attn_impl_cls = override
-            self.attention = self.attn_impl_cls(
+            self.attn_impl_cls = _select_impl_cls(attn_backend_cls, impl_overrides)
+            # Every impl of this layer, the baseline and each schedule candidate, gets these
+            # arguments; only the backend selection differs.
+            impl_kwargs: dict[str, Any] = dict(
                 num_heads=num_heads,
                 head_size=head_size,
                 softmax_scale=softmax_scale,
@@ -329,10 +343,11 @@ class Attention(nn.Module):
                 num_kv_heads=num_kv_heads,
                 qkv_layout=qkv_layout,
                 prefix=prefix,
-                backend_kwargs=backend_kwargs,
                 role=role,
                 computation=self.computation,
-                backend_explicit=self.backend_explicit,
+            )
+            self.attention = self.attn_impl_cls(
+                **impl_kwargs, backend_kwargs=backend_kwargs, backend_explicit=self.backend_explicit
             )
             # Compatibility kernels run inside shared dispatch, between the
             # parallel strategy's input preparation and output restoration.
@@ -352,15 +367,10 @@ class Attention(nn.Module):
                 self._schedule_configured = True
                 self._prepare_schedule_candidates(
                     schedule_config,
+                    impl_kwargs,
                     role=role,
                     role_category=role_category,
                     head_size=head_size,
-                    num_heads=num_heads,
-                    num_kv_heads=num_kv_heads,
-                    softmax_scale=softmax_scale,
-                    causal=causal,
-                    qkv_layout=qkv_layout,
-                    prefix=prefix,
                     allow_trtllm_default=allow_trtllm_default,
                     impl_overrides=impl_overrides,
                     skip_sequence_parallel=skip_sequence_parallel,
@@ -444,16 +454,11 @@ class Attention(nn.Module):
     def _prepare_schedule_candidates(
         self,
         schedule_config: "AttentionScheduleConfig",
+        impl_kwargs: Mapping[str, Any],
         *,
         role: str,
         role_category: str | None,
         head_size: int,
-        num_heads: int,
-        num_kv_heads: int | None,
-        softmax_scale: float,
-        causal: bool,
-        qkv_layout: str | None,
-        prefix: str,
         allow_trtllm_default: bool,
         impl_overrides: Mapping[str, type[AttentionImpl]] | None,
         skip_sequence_parallel: bool,
@@ -462,16 +467,18 @@ class Attention(nn.Module):
         """Pre-construct one deduplicated candidate record per configured profile.
 
         Candidates are additional prepared objects only; the baseline impl built in
-        ``__init__`` is never replaced and remains the gap/no-selection choice. Each
+        ``__init__`` is never replaced and remains the gap/no-selection choice. Candidate impls
+        are built with the baseline's ``impl_kwargs`` and their own backend selection. Each
         profile is resolved independently through the same role-aware selector, so it
         keeps its own role precedence and never merges the baseline. Profiles
         not referenced by the service default schedule are still prepared, because
         startup compatibility validation covers every configured profile.
 
-        The baseline AllGather-KV + TRTLLM_ATTN rejection is reproduced here, so a candidate
-        is never prepared with that backend. Per-candidate KV-cache-quantization and
-        capability/layout validation (ring, kv dtype support) remain in the post-load startup
-        traversal (``validate_attention_schedule_candidates``) and are not duplicated here.
+        The baseline AllGather-KV + TRTLLM_ATTN rejection and implementation overrides apply to
+        candidates too, so a candidate is never prepared with that backend. Per-candidate
+        KV-cache-quantization and capability/layout validation (ring, kv dtype support) remain in
+        the post-load startup traversal (``validate_attention_schedule_candidates``) and are not
+        duplicated here.
 
         Identical effective identities for this role share one record. The dedup key carries the
         backend name, explicit-vs-default selection, the impl class object, and canonical JSON of
@@ -490,23 +497,8 @@ class Attention(nn.Module):
                 role_category=role_category,
                 allow_trtllm_default=allow_trtllm_default,
             )
-            # Reproduce the baseline AllGather-KV + TRTLLM rejection.
-            if not skip_sequence_parallel and allgather_degree > 1 and backend_cls.get_name() == "TRTLLM_ATTN":
-                raise ValueError(
-                    "TRTLLM_ATTN does not support AllGather-KV sequence parallelism. "
-                    "Set --allgather-degree 1 or select another diffusion attention backend."
-                )
-            impl_cls = backend_cls.get_impl_cls()
-            if impl_overrides is not None:
-                override = impl_overrides.get(backend_cls.get_name())
-                if override is not None:
-                    if not issubclass(override, impl_cls):
-                        raise TypeError(
-                            f"Attention implementation override {override.__qualname__} must subclass "
-                            f"the selected implementation {impl_cls.__qualname__} "
-                            f"for backend {backend_cls.__qualname__}"
-                        )
-                    impl_cls = override
+            _reject_allgather_trtllm(backend_cls, skip_sequence_parallel, allgather_degree)
+            impl_cls = _select_impl_cls(backend_cls, impl_overrides)
             backend_explicit = spec is not None
             backend_kwargs = spec.backend_kwargs() if spec is not None else None
             dedup_key = (
@@ -518,18 +510,7 @@ class Attention(nn.Module):
             )
             record = prepared.get(dedup_key)
             if record is None:
-                impl = impl_cls(
-                    num_heads=num_heads,
-                    head_size=head_size,
-                    softmax_scale=softmax_scale,
-                    causal=causal,
-                    num_kv_heads=num_kv_heads,
-                    qkv_layout=qkv_layout,
-                    prefix=prefix,
-                    backend_kwargs=backend_kwargs,
-                    role=role,
-                    backend_explicit=backend_explicit,
-                )
+                impl = impl_cls(**impl_kwargs, backend_kwargs=backend_kwargs, backend_explicit=backend_explicit)
                 record = _PreparedCandidate(
                     backend_cls=backend_cls,
                     spec=spec,
