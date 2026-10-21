@@ -1470,14 +1470,6 @@ class OmniDiffusionConfig:
         self.diffusion_attention_config = build_attention_config(self.diffusion_attention_config)
         validate_kv_cache_dtype_vs_attention_specs(self.diffusion_kv_cache_dtype, self.diffusion_attention_config)
         self.diffusion_attention_schedule = parse_attention_schedule_config(self.diffusion_attention_schedule)
-        if self.diffusion_attention_schedule is not None and self.diffusion_compile_granularity == "full":
-            # Scheduled attention layers call an eager boundary while compiling. Its compile tests
-            # use regional compilation, where each block is its own frame; with 'full' the boundary's graph
-            # break falls inside the block loop of the transformer's frame, which they do not cover.
-            raise ValueError(
-                "diffusion_compile_granularity='full' is incompatible with diffusion_attention_schedule "
-                "profiles; use 'regional' compilation instead"
-            )
         self.diffusion_kv_cache_skip_step_indices = parse_kv_cache_skip_selector(self.diffusion_kv_cache_skip_steps)
         self.diffusion_kv_cache_skip_layer_indices = parse_kv_cache_skip_selector(self.diffusion_kv_cache_skip_layers)
 
@@ -2471,7 +2463,7 @@ def parse_attention_schedule_config(
     """Normalize service config without initializing backends or reading env vars.
 
     A config without profiles can never select a candidate (its default must then be empty), so it
-    is returned as None: no schedule, and no compile boundary on the attention layers.
+    is returned as None: no schedule, and no attention layer prepares candidates.
     """
     if value is None:
         return None
