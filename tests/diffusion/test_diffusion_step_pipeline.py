@@ -1302,7 +1302,7 @@ class _RecordingLoRAManager:
     def __init__(self) -> None:
         self.calls: list[tuple[object | None, float]] = []
 
-    def set_active_adapter(self, adapter, scale: float = 1.0) -> None:
+    def set_request_adapter(self, adapter, scale: float = 1.0) -> None:
         self.calls.append((adapter, scale))
 
 

@@ -41,7 +41,6 @@ from vllm.v1.worker.gpu_model_runner import (
     AsyncGPUModelRunnerOutput,
 )
 from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
-from vllm.v1.worker.utils import is_residual_scattered_for_sp
 
 from vllm_omni.data_entry_keys import flatten_payload
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
@@ -1149,16 +1148,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 scheduler_output, num_scheduled_tokens_np
             )
 
-            cascade_attn_prefix_lens = None
-            # Disable cascade attention when using microbatching (DBO)
-            if self.cascade_attn_enabled and not self.parallel_config.use_ubatching:
-                # Pre-compute cascade attention prefix lengths
-                cascade_attn_prefix_lens = self._compute_cascade_attn_prefix_lens(
-                    num_scheduled_tokens_np,
-                    self.input_batch.num_computed_tokens_cpu[:num_reqs],
-                    scheduler_output.num_common_prefix_blocks,
-                )
-
             (
                 cudagraph_mode,
                 batch_desc,
@@ -1170,7 +1159,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 num_reqs=num_reqs,
                 num_scheduled_tokens_np=num_scheduled_tokens_np,
                 max_num_scheduled_tokens=max_num_scheduled_tokens,
-                use_cascade_attn=cascade_attn_prefix_lens is not None,
+                use_cascade_attn=False,
                 num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
             )
             num_tokens_padded = batch_desc.num_tokens
@@ -1243,7 +1232,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 max_num_sampled_tokens=max_num_sampled_tokens,
                 use_spec_decode=use_spec_decode,
                 num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
-                cascade_attn_prefix_lens=cascade_attn_prefix_lens,
                 slot_mappings=slot_mappings_by_group,
                 for_cudagraph_capture=runner_assisted_full_attn_capture,
             )
@@ -1405,13 +1393,9 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
 
                 sample_hidden_states = hidden_states[logits_indices.to(hidden_states.device)]
                 if not get_pp_group().is_last_rank:
-                    all_gather_tensors = {
-                        "residual": not is_residual_scattered_for_sp(self.vllm_config, num_tokens_padded)
-                    }
                     get_pp_group().send_tensor_dict(
                         hidden_states.tensors,
                         all_gather_group=get_tp_group(),
-                        all_gather_tensors=all_gather_tensors,
                     )
                     logits = None
                 else:

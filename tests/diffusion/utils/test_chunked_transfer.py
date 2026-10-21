@@ -38,21 +38,6 @@ def _cpu_ring(depth: int, *, max_pending_bytes: int | None = None) -> PinnedChun
 
 
 @pytest.mark.cpu
-def test_host_slot_can_be_reused_outside_the_vae_inference_context():
-    """The final flush can reuse a buffer allocated by an inference-mode callback."""
-    ring = _cpu_ring(1)
-    with torch.no_grad():
-        with torch.inference_mode():
-            first = ring.transfer(_frames(7), readers=1)
-            assert np.all(first.wait() == 7)
-            first.release()
-        final = ring.transfer(_frames(19), readers=1)
-        assert np.all(final.wait() == 19)
-        final.release()
-    assert ring.slots_in_use == 0
-
-
-@pytest.mark.cpu
 def test_slot_returns_only_after_its_last_reader():
     """Each batch entry reads the same buffer, so one release must not free it."""
     ring = _cpu_ring(2)
@@ -72,6 +57,21 @@ def test_slot_returns_only_after_its_last_reader():
     assert ring.slots_in_use == 0
     # A late extra release must not free the slot a second time.
     lease.release()
+    assert ring.slots_in_use == 0
+
+
+@pytest.mark.cpu
+def test_slot_can_be_reused_after_inference_mode_producer():
+    """The final flush may reuse a VAE callback's slot outside inference mode."""
+    ring = _cpu_ring(1)
+    with torch.inference_mode():
+        first = ring.transfer(_frames(11), readers=1)
+        assert np.all(first.wait() == 11)
+        first.release()
+
+    final = ring.transfer(_frames(23), readers=1)
+    assert np.all(final.wait() == 23)
+    final.release()
     assert ring.slots_in_use == 0
 
 
@@ -333,7 +333,8 @@ def test_session_gets_its_slot_back_after_a_real_encoder_failure():
 
 
 @hardware_test(res={"cuda": ["L4", "H100", "B200"], "rocm": "MI325"})
-def test_device_chunks_land_intact_through_the_pinned_ring():
+@pytest.mark.parametrize("inference_producer", [False, True])
+def test_device_chunks_land_intact_through_the_pinned_ring(inference_producer):
     """On an accelerator the copy is deferred, so its event must order the read."""
     if not torch.accelerator.is_available():
         pytest.skip("no accelerator available")
@@ -345,8 +346,11 @@ def test_device_chunks_land_intact_through_the_pinned_ring():
         value = 10 * step + 1
         # Quantize on the compute stream immediately before handing the chunk
         # over: without the source-ready event the copy would race this work.
-        chunk = torch.full((1, 3, 2, 4, 6), value / 255.0, device=device)
-        pending.append((value, ring.transfer(quantize_chunk(chunk, (0.0, 1.0)), readers=1)))
+        # The VAE callback can fill both slots in inference mode before a
+        # final flush reuses them outside that context.
+        with torch.inference_mode(inference_producer and step < 2):
+            chunk = torch.full((1, 3, 2, 4, 6), value / 255.0, device=device)
+            pending.append((value, ring.transfer(quantize_chunk(chunk, (0.0, 1.0)), readers=1)))
         if len(pending) == 2:
             for expected, lease in pending:
                 assert int(lease.wait()[0, 0, 0, 0, 0]) == expected

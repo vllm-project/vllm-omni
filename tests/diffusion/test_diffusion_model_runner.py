@@ -1212,14 +1212,18 @@ def test_execute_model_runs_forward_after_kv_receive(monkeypatch):
 
 @pytest.mark.core_model
 @pytest.mark.cpu
-def test_load_model_clears_cache_backend_for_unsupported_pipeline(monkeypatch):
+@pytest.mark.parametrize("early_lora", [False, True])
+def test_load_model_clears_cache_backend_for_unsupported_pipeline(monkeypatch, early_lora):
+    events = []
+
     class _DummyLoader:
         def __init__(self, load_config, od_config=None):
             del load_config, od_config
 
         def load_model(self, **kwargs):
             del kwargs
-            return SimpleNamespace(transformer=torch.nn.Identity())
+            events.append("weights_finalized")
+            return SimpleNamespace(transformer=torch.nn.Identity(), requires_early_lora_init=early_lora)
 
     class _DummyMemoryProfiler:
         consumed_memory = 0
@@ -1260,17 +1264,19 @@ def test_load_model_clears_cache_backend_for_unsupported_pipeline(monkeypatch):
     monkeypatch.setattr(model_runner_module, "LoadConfig", lambda: object())
     monkeypatch.setattr(model_runner_module, "DiffusersPipelineLoader", _DummyLoader)
     monkeypatch.setattr(model_runner_module, "DeviceMemoryProfiler", _DummyMemoryProfiler)
-    monkeypatch.setattr(
-        model_runner_module,
-        "enable_offload_backend",
-        lambda od_config, pipeline, device: (pipeline, None),
-    )
+
+    def offload(od_config, pipeline, device):
+        events.append("offload")
+        return pipeline, None
+
+    monkeypatch.setattr(model_runner_module, "enable_offload_backend", offload)
     monkeypatch.setattr(
         model_runner_module, "get_cache_backend", lambda cache_backend, cache_config: dummy_cache_backend
     )
 
-    DiffusionModelRunner.load_model(runner)
+    DiffusionModelRunner.load_model(runner, initialize_lora=lambda: events.append("lora"))
 
+    assert events == ["weights_finalized", *(["lora"] if early_lora else []), "offload"]
     assert runner.cache_backend is None
     assert runner.od_config.cache_backend is None
     assert dummy_cache_backend.enabled is False

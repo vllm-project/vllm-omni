@@ -128,8 +128,8 @@ class _HostSlot:
     @torch.inference_mode(False)
     def reserve(self, frames: torch.Tensor) -> torch.Tensor:
         """Return a host view shaped like ``frames``, growing the buffer if needed."""
-        # Slots outlive a VAE callback's inference context and are reused by the
-        # final flush, so their buffers must remain ordinary mutable tensors.
+        # VAE callbacks may run in inference mode while the final flush does
+        # not. Reusable host slots must remain mutable across that boundary.
         needed = frames.numel()
         if self._buffer is None or self._buffer.numel() < needed:
             try:

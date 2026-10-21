@@ -19,14 +19,15 @@ from fastapi import Request
 from openai.types.chat.chat_completion_audio import ChatCompletionAudio as OpenAIChatCompletionAudio
 from PIL import Image
 from pydantic import TypeAdapter
-from vllm.entrypoints.chat_utils import (
+from vllm.exceptions import RetryableRequestError
+from vllm.parser.utils import (
+    count_chat_history_tool_calls as get_history_tool_calls_cnt,
+)
+from vllm.renderers.chat_utils import (
     ChatCompletionMessageParam,
     ChatTemplateContentFormatOption,
     ConversationMessage,
     make_tool_call_id,
-)
-from vllm.parser.utils import (
-    count_chat_history_tool_calls as get_history_tool_calls_cnt,
 )
 
 from vllm_omni.diffusion.utils.image_output import extract_images_from_outputs
@@ -146,18 +147,20 @@ from vllm_omni.entrypoints.openai.stage_params import (
 )
 from vllm_omni.entrypoints.openai.utils import (
     get_stage_type,
-    get_supported_speakers_from_hf_config,
     is_image_generation_stage,
     is_single_stage_diffusion,
     parse_lora_request,
     resolve_diffusion_od_config,
-    validate_requested_speaker,
 )
 from vllm_omni.errors import OmniClientError
 from vllm_omni.lora.request import LoRARequest
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.outputs.output_metadata import DiffusionMetadataMapping, DiffusionMetadataValue
 from vllm_omni.utils.audio import audio_chunk_pcm_bytes, audio_chunk_sample_rate
+from vllm_omni.utils.speakers import (
+    get_supported_speakers_from_hf_config,
+    validate_requested_speaker,
+)
 
 logger = init_logger(__name__)
 
@@ -224,7 +227,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         field is now resolved on demand via ``get_tool_call_id_type``.
         """
         try:
-            from vllm.entrypoints.chat_utils import get_tool_call_id_type
+            from vllm.renderers.chat_utils import get_tool_call_id_type
 
             return get_tool_call_id_type(self.model_config)
         except Exception:
@@ -2522,7 +2525,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 final_outputs.append(res)
         except asyncio.CancelledError:
             return self.create_error_response("Client disconnected")
-        except ValueError as e:
+        except (ValueError, RetryableRequestError) as e:
             return self.create_error_response(e)
 
         assert final_outputs is not None
