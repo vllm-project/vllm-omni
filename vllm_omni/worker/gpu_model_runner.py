@@ -33,7 +33,7 @@ from vllm.v1.worker.gpu_input_batch import CachedRequestState
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner, PerLayerAttnMetadata
 from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 
-from vllm_omni.core.prefix_cache import stage_prefix_cache_config
+from vllm_omni.core.prefix_cache import check_qwen3_omni_talker_request_local_scope, stage_prefix_cache_config
 from vllm_omni.core.prefix_cache.runner_mixin import PrefixCacheRunnerMixin
 from vllm_omni.data_entry_keys import OmniPayload
 from vllm_omni.engine.serialization import deserialize_additional_information
@@ -41,8 +41,16 @@ from vllm_omni.model_executor.layers.rotary_embedding.mrope import OmniMRotaryEm
 from vllm_omni.model_executor.models.interfaces import requires_request_sample_eligibility
 from vllm_omni.model_executor.models.model_local_kv import collect_model_local_kv_specs
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.model_executor.models.qwen3_omni.talker_identity import is_qwen3_full_payload_talker
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.utils.device_copy import index_to_device
+from vllm_omni.worker.talker_history import (
+    bind_talker_history,
+    collect_pending_talker_primary,
+    install_pending_talker_primary,
+    preprocess_talker_history,
+    validate_local_talker_resume,
+)
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
@@ -99,6 +107,9 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
         # Output-payload constant snapshotted once in load_model; the cache
         # policy counterpart lives on PrefixCacheRunnerMixin.
         self._pooler_payload_include_hidden_flag = True
+        self._talker_history_enabled = bool(
+            self.cache_config.enable_prefix_caching and is_qwen3_full_payload_talker(self.model_config)
+        )
 
     def shutdown(self) -> None:
         # Also inherited by OmniNPUModelRunner. GPU AR stops the cache
@@ -142,6 +153,14 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
         # Stage the config; the manager is built on the first step once
         # input_batch exists. The gate (pooling stage, kv_consumer, hybrid
         # kv groups) is shared with the NPU runner.
+        check_qwen3_omni_talker_request_local_scope(
+            cache_config=self.cache_config,
+            scheduler_config=self.scheduler_config,
+            model_config=self.model_config,
+            parallel_config=self.parallel_config,
+            speculative_config=self.speculative_config,
+            kv_transfer_config=getattr(self.vllm_config, "kv_transfer_config", None),
+        )
         cfg = stage_prefix_cache_config(
             kv_cache_config=kv_cache_config,
             cache_config=self.cache_config,
@@ -560,7 +579,9 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
             if hasattr(self, "_talker_mtp_generators"):
                 self._talker_mtp_generators.pop(req_id, None)
             if cleanup_finished_request is not None:
-                cleanup_finished_request(req_id)
+                cleanup_finished_request(
+                    req_id, discard_payload=req_id in getattr(scheduler_output, "discarded_req_ids", set())
+                )
 
         self.late_interaction_runner.on_requests_finished(scheduler_output.finished_req_ids)
         # Remove the finished requests from the persistent batch.
@@ -617,6 +638,13 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
                 if self._resume_streaming_row_in_place(req_id, new_req_data, scheduler_output):
                     continue
                 req_state = self._update_streaming_request(req_id, new_req_data)
+                setattr(
+                    req_state, "processed_media_provenance", getattr(new_req_data, "processed_media_provenance", None)
+                )
+                bind_talker_history(
+                    req_state,
+                    getattr(scheduler_output, "prefix_cache_owners", {}).get(req_id),
+                )
                 reqs_to_add.append(req_state)
                 continue
 
@@ -652,6 +680,11 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
                 lora_request=new_req_data.lora_request,
             )
             self.requests[req_id] = req_state
+            setattr(req_state, "processed_media_provenance", getattr(new_req_data, "processed_media_provenance", None))
+            bind_talker_history(
+                req_state,
+                getattr(scheduler_output, "prefix_cache_owners", {}).get(req_id),
+            )
             self.late_interaction_runner.register_request(req_id, pooling_params)
 
             # If prompt embeddings are provided, decode and attach to inter_data
@@ -735,6 +768,14 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
             new_block_ids = req_data.new_block_ids[i]
             resumed_from_preemption = req_id in req_data.resumed_req_ids
             num_output_tokens = req_data.num_output_tokens[i]
+            if getattr(self, "_talker_history_enabled", False) and num_output_tokens < len(req_state.output_token_ids):
+                raise ValueError("Talker request-local replay detected rolled-back accepted primaries")
+            if resumed_from_preemption and getattr(self, "_talker_history_enabled", False):
+                validate_local_talker_resume(
+                    req_state,
+                    getattr(scheduler_output, "prefix_cache_owners", {}).get(req_id),
+                    num_output_tokens=num_output_tokens,
+                )
             req_index = self.input_batch.req_id_to_index.get(req_id)
 
             if req_state.prev_num_draft_len and self.use_async_scheduling:
@@ -1939,6 +1980,7 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
                 decode_batch_items.clear()
 
             preprocess_input_ids = input_ids if input_ids is not None else self.input_ids.gpu[:num_input_tokens]
+            history_enabled = bool(getattr(self, "_talker_history_enabled", False))
             for req_index, req_id in enumerate(self.input_batch.req_ids):
                 if req_id in batch_filled_req_ids:
                     # Rows preprocess_batch wrote also end a (contiguous) decode group.
@@ -1976,18 +2018,31 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
                 # Seed, so a model that samples inside forward() can be
                 # reproducible: vLLM's own sampler seeding does not reach it.
                 req_infos["_omni_seed"] = getattr(sampling_params, "seed", None)
-                if callable(batch_decode_preprocess) and span_len == 1 and not is_prefill:
+                if callable(batch_decode_preprocess) and span_len == 1 and not is_prefill and not history_enabled:
                     decode_batch_items.append((req_id, s, req_infos))
                     continue
 
                 flush_decode_batch()
 
                 embed_slice = inputs_embeds[s:e] if inputs_embeds is not None else None
-                req_input_ids, req_embeds, update_dict = self.model.preprocess(
-                    input_ids=preprocess_input_ids[s:e],
-                    input_embeds=embed_slice,
-                    **req_infos,
-                )
+                if history_enabled:
+                    self._materialize_pending_talker_history(
+                        [(req_id, num_computed_tokens, preprocess_input_ids[s:e], embed_slice, req_infos)]
+                    )
+                    req_input_ids, req_embeds, update_dict = preprocess_talker_history(
+                        self.model,
+                        req_state,
+                        row_start=num_computed_tokens,
+                        input_ids=preprocess_input_ids[s:e],
+                        input_embeds=embed_slice,
+                        payload=req_infos,
+                    )
+                else:
+                    req_input_ids, req_embeds, update_dict = self.model.preprocess(
+                        input_ids=preprocess_input_ids[s:e],
+                        input_embeds=embed_slice,
+                        **req_infos,
+                    )
                 if inputs_embeds is None:
                     inputs_embeds = torch.empty(
                         (preprocess_input_ids.shape[0], req_embeds.shape[-1]),
@@ -1996,7 +2051,12 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
                     )
                     input_ids = preprocess_input_ids
 
-                if self.has_talker_mtp and span_len == 1 and not is_prefill:
+                if (
+                    self.has_talker_mtp
+                    and span_len == 1
+                    and not is_prefill
+                    and not getattr(self, "_talker_history_enabled", False)
+                ):
                     last_talker_hidden, text_step = update_dict.pop("mtp_inputs")
                     decode_slice = slice(len(decode_req_ids), len(decode_req_ids) + 1)
                     self.talker_mtp_input_ids.gpu[decode_slice].copy_(req_input_ids)
@@ -2031,6 +2091,76 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
             model_kwargs,
             ec_connector_output,
         )
+
+    def _materialize_pending_talker_history(
+        self,
+        items: list[tuple[str, int, torch.Tensor, torch.Tensor | None, dict[str, Any]]],
+    ) -> None:
+        """Resolve each pending accepted primary before replaying its input."""
+        for req_id, row_start, input_ids, input_embeds, payload in items:
+            if input_embeds is None:
+                raise ValueError("Talker pending codec production requires model input embeddings")
+            req_state = self.requests.get(req_id)
+            if req_state is None:
+                raise ValueError("Talker pending codec production requires a retained request state")
+            collected = collect_pending_talker_primary(
+                self.model,
+                req_state,
+                row_start=row_start,
+                input_ids=input_ids,
+                payload=payload,
+                input_device=input_ids.device,
+                input_dtype=input_embeds.dtype,
+            )
+            if collected is None:
+                continue
+            pending_position, primary, hidden = collected
+            codes, embeddings = self._predict_talker_codes(primary, hidden)
+            # MTP outputs alias reusable graph storage. Both snapshots must
+            # survive another request's invocation before this input is used.
+            install_pending_talker_primary(
+                self.model,
+                req_state,
+                pending_position=pending_position,
+                codes=codes.reshape(-1).detach().clone(),
+                embedding=embeddings.reshape(1, -1).detach().clone(),
+            )
+
+    def _invoke_talker_mtp(
+        self, decode_batch_size: int, **talker_kwargs: Any
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Run the existing MTP buffers through their configured graph wrapper.
+
+        Returned tensors may alias graph storage. The caller owns any snapshot
+        needed across another invocation; this helper never publishes audio.
+        """
+        _cudagraph_mode, batch_desc, _, _, _ = self._determine_batch_execution_and_padding(
+            num_tokens=decode_batch_size,
+            num_reqs=decode_batch_size,
+            num_scheduled_tokens_np=np.ones(decode_batch_size, dtype=np.int32),
+            max_num_scheduled_tokens=1,
+            use_cascade_attn=False,
+        )
+        # Force eager for unwrapped code predictors (AR loops / multinomial).
+        # When talker_mtp is not wrapped by the platform's full-graph wrapper,
+        # it manages its own device graphs internally (code_predictor has its
+        # own bucket sizes).
+        seeded = talker_kwargs.get("generator") is not None or any(
+            generator is not None for generator in (talker_kwargs.get("generators") or ())
+        )
+        if not isinstance(self.talker_mtp, current_omni_platform.get_graph_wrapper_cls()) or seeded:
+            _cudagraph_mode = CUDAGraphMode.NONE
+            num_tokens_padded = decode_batch_size
+        else:
+            num_tokens_padded = batch_desc.num_tokens
+        req_input_ids = self.talker_mtp_input_ids.gpu[:num_tokens_padded]
+        req_embeds = self.talker_mtp_inputs_embeds.gpu[:num_tokens_padded]
+        last_talker_hidden = self.last_talker_hidden.gpu[:num_tokens_padded]
+        text_step = self.text_step.gpu[:num_tokens_padded]
+        with current_omni_platform.set_forward_context(
+            None, self.vllm_config, cudagraph_runtime_mode=_cudagraph_mode, batch_descriptor=batch_desc
+        ):
+            return self.talker_mtp(req_input_ids, req_embeds, last_talker_hidden, text_step, **talker_kwargs)
 
     def _talker_mtp_forward(
         self,
@@ -2077,32 +2207,6 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
             for stale_id in [rid for rid in cache if rid not in self.requests]:
                 del cache[stale_id]
 
-        _cudagraph_mode, batch_desc, _, _, _ = self._determine_batch_execution_and_padding(
-            num_tokens=decode_batch_size,
-            num_reqs=decode_batch_size,
-            num_scheduled_tokens_np=np.ones(decode_batch_size, dtype=np.int32),
-            max_num_scheduled_tokens=1,
-            use_cascade_attn=False,
-        )
-        # Force eager for unwrapped code predictors (AR loops / multinomial).
-        # When talker_mtp is not wrapped by the platform's full-graph wrapper,
-        # it manages its own device graphs internally (code_predictor has its
-        # own bucket sizes). Any batch that carries explicit per-row seeds
-        # (generators) must also run eagerly: a graph wrapper only replays a
-        # previously captured device graph and never re-executes the Python
-        # talker_mtp, so the per-row generators would be silently ignored.
-        if not isinstance(self.talker_mtp, current_omni_platform.get_graph_wrapper_cls()) or any(
-            generator is not None for generator in row_generators
-        ):
-            _cudagraph_mode = CUDAGraphMode.NONE
-            num_tokens_padded = decode_batch_size
-        else:
-            num_tokens_padded = batch_desc.num_tokens
-        req_input_ids = self.talker_mtp_input_ids.gpu[:num_tokens_padded]
-        req_embeds = self.talker_mtp_inputs_embeds.gpu[:num_tokens_padded]
-        last_talker_hidden = self.last_talker_hidden.gpu[:num_tokens_padded]
-        text_step = self.text_step.gpu[:num_tokens_padded]
-
         if (
             decode_batch_size > 1
             and any(generator is not None for generator in row_generators)
@@ -2146,16 +2250,7 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
             talker_kwargs["req_infos"] = [
                 self.model_intermediate_buffer.setdefault(req_id, {}) for req_id in decode_req_ids
             ]
-        with current_omni_platform.set_forward_context(
-            None, self.vllm_config, cudagraph_runtime_mode=_cudagraph_mode, batch_descriptor=batch_desc
-        ):
-            req_embeds, code_predictor_codes = self.talker_mtp(
-                req_input_ids,
-                req_embeds,
-                last_talker_hidden,
-                text_step,
-                **talker_kwargs,
-            )
+        req_embeds, code_predictor_codes = self._invoke_talker_mtp(decode_batch_size, **talker_kwargs)
         # update the inputs_embeds and code_predictor_codes
         out_key = getattr(self.model, "talker_mtp_output_key", ("codes", "audio"))
         if not isinstance(out_key, tuple) or len(out_key) != 2:

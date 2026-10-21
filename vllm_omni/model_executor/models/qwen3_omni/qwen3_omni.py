@@ -4,7 +4,7 @@
 """Inference-only Qwen3-Omni-Moe unified model (thinker + talker + code2wav)."""
 
 import asyncio
-from collections.abc import AsyncGenerator, Iterable, Mapping
+from collections.abc import AsyncGenerator, Iterable, Mapping, Sequence
 from functools import cached_property
 from typing import Any
 
@@ -47,6 +47,7 @@ from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
+from vllm_omni.core.prefix_cache.adapter import PrefixCacheRequestOwner
 from vllm_omni.data_entry_keys import Embeddings, HiddenStates, Ids, OmniPayload, OmniPayloadMeta
 from vllm_omni.metrics import definitions as defs
 from vllm_omni.model_executor.custom_process_mixin import CustomProcessMixin
@@ -62,25 +63,22 @@ from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
     Qwen3OmniMoeThinkerMultiModalProcessor,
     Qwen3OmniMoeThinkerProcessingInfo,
 )
-from vllm_omni.model_executor.models.qwen3_omni.tool_speech import spoken_span_end
+from vllm_omni.model_executor.models.qwen3_omni.talker_identity import (
+    DEFAULT_SPEAKER,
+    resolve_default_speaker,
+    resolve_talker_speaker,
+    talker_speaker_map,
+)
+from vllm_omni.model_executor.models.qwen3_omni.talker_input_plan import (
+    TalkerPrefillPart,
+    plan_talker_prefill,
+    read_talker_prefill_plan,
+    talker_prefill_token_ids,
+)
 from vllm_omni.model_executor.models.utils import add_prefix_to_loaded_weights, safe_tensor_reshape
 from vllm_omni.model_executor.stage_input_processors.chunk_size_utils import parse_chunk_ramp, ramp_decode_windows
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.utils.device_copy import to_device_nonblocking
-
-# Voice used when a request names no speaker. Matches the reference
-# ``Qwen3OmniMoeForConditionalGeneration.generate(speaker="Ethan")``; the
-# checkpoint's ``talker_config.speaker_id`` lists "chelsie" first, so taking the
-# first key would silently switch the default to a different (female) voice.
-DEFAULT_SPEAKER = "ethan"
-
-
-def resolve_default_speaker(speaker_token_ids: dict[str, int]) -> str:
-    """Return the speaker key used for requests that do not name one."""
-    if DEFAULT_SPEAKER in speaker_token_ids:
-        return DEFAULT_SPEAKER
-    return next(iter(speaker_token_ids))
-
 
 # Special token IDs for Qwen3 Omni MoE
 # Reference: https://huggingface.co/Qwen/Qwen3-Omni-30B-A3B-Instruct/blob/main/tokenizer_config.json
@@ -280,6 +278,16 @@ class Qwen3OmniMoeForConditionalGeneration(
             self.use_async_omni_output = True
             self.eager_omni_postprocess_before_async_output = True
             self.omni_pooler_payload_include_hidden = False
+            if not getattr(vllm_config.model_config, "async_chunk", False):
+                # Full-payload replay reconstructs inputs from the fixed
+                # Thinker payload and accepted codec history. The sampled
+                # last hidden stays on GPU; no consumer needs a host copy of
+                # every cached Talker hidden row.
+                self.requires_full_prefix_cached_hidden_states = False
+                # Connector-less delivery still uses cached codec payloads.
+                # Full-payload connector delivery uses request-local history
+                # at completion instead of duplicating those rows in the cache.
+                self.deferred_prefix_cache_mm_keys = {"codes.audio"}
             self.set_custom_preprocess(self.talker_preprocess)
             self.set_custom_postprocess(self.talker_postprocess)
             self.thinker = None
@@ -520,7 +528,14 @@ class Qwen3OmniMoeForConditionalGeneration(
         if self.model_stage == "code2wav":
             return torch.zeros_like(input_ids).reshape(-1, 1).repeat(1, self.vllm_config.model_config.get_hidden_size())
         if self.model_stage == "talker":
-            return self.model.embed_input_ids(input_ids)
+            # The generic runner has no per-request phase here. These IDs can
+            # be Thinker identity rows, not codec IDs; preprocess supplies the
+            # real embeddings for both prefill and decode.
+            return torch.zeros(
+                (*input_ids.shape, self.talker_config.text_config.hidden_size),
+                device=input_ids.device,
+                dtype=self.vllm_config.model_config.dtype,
+            )
         return self.model.embed_input_ids(
             input_ids=input_ids, multimodal_embeddings=multimodal_embeddings, is_multimodal=is_multimodal
         )
@@ -628,9 +643,10 @@ class Qwen3OmniMoeForConditionalGeneration(
                 # special case for profile run
                 input_ids = torch.zeros(inputs_embeds.shape[0], dtype=torch.long, device=inputs_embeds.device)
 
-            # Ensure we have base embeddings when only ids are provided
+            # Normal execution always supplies preprocessed embeddings. The
+            # profiling fallback must not interpret identity IDs as codec IDs.
             if inputs_embeds is None and input_ids is not None:
-                inputs_embeds = self.talker.embed_input_ids(input_ids)
+                inputs_embeds = self.embed_input_ids(input_ids)
 
             # Run talker forward
             with torch.inference_mode():
@@ -968,25 +984,15 @@ class Qwen3OmniMoeForConditionalGeneration(
         # Speaker token IDs (for voice selection)
         # In Qwen3, speaker_id mapping is in talker_config.speaker_id
         # Keys are lowercased for case-insensitive matching with serving layer.
-        if hasattr(talker_hf_config, "speaker_id") and talker_hf_config.speaker_id:
-            self.tts_text_spk_token_ids = {k.lower(): v for k, v in talker_hf_config.speaker_id.items()}
-        else:
-            # Default to audio_start_token_id if no speaker mapping
-            self.tts_text_spk_token_ids = {
-                "default": talker_hf_config.audio_start_token_id,
-                "ethan": talker_hf_config.audio_start_token_id,
-                "prefix_caching": talker_hf_config.audio_start_token_id,
-            }
+        self.tts_text_spk_token_ids = talker_speaker_map(talker_hf_config)
 
         self.default_tts_text_spk_type = resolve_default_speaker(self.tts_text_spk_token_ids)
 
         return set(["thinker_embedding.weight", "talker_embedding.weight"])
 
-    def _get_text_spk_token_id(self, voice_type: str) -> int:
+    def _get_text_spk_token_id(self, voice_type: object) -> int:
         """Get speaker token ID for voice type."""
-        if voice_type not in self.tts_text_spk_token_ids:
-            return self.tts_text_spk_token_ids[self.default_tts_text_spk_type]
-        return self.tts_text_spk_token_ids[voice_type]
+        return resolve_talker_speaker(voice_type, self.tts_text_spk_token_ids, self.default_tts_text_spk_type)
 
     def talker_postprocess(self, hidden_states: torch.Tensor, **info_dict: object):
         """
@@ -1000,10 +1006,6 @@ class Qwen3OmniMoeForConditionalGeneration(
         """
         payload: OmniPayload = info_dict
         meta = payload.setdefault("meta", {})
-
-        # Ensure we have base embeddings when only ids are provided
-        if input_embeds is None and input_ids is not None:
-            input_embeds = self.talker.embed_input_ids(input_ids)
 
         span_len = input_ids.shape[0]
         update_dict: OmniPayload = {}
@@ -1023,7 +1025,10 @@ class Qwen3OmniMoeForConditionalGeneration(
             )
             update_dict.setdefault("codes", {})["audio"] = code_predictor_codes
         else:
-            # decode
+            # Only decode IDs are codec IDs. Prefill identity rows can contain
+            # Thinker vocabulary IDs outside the codec embedding table.
+            # A supplied tensor may be the runner's reusable scratch buffer.
+            input_embeds = self.talker.embed_input_ids(input_ids)
             if not meta.get("decode_flag", False):
                 # Prefill already consumed the first text token via the
                 # assistant bootstrap path, so decode starts from the
@@ -1069,6 +1074,172 @@ class Qwen3OmniMoeForConditionalGeneration(
         inputs_embeds = (inputs_embeds + text_step).reshape(-1, self.talker_config.text_config.hidden_size)
         return inputs_embeds, code_predictor_codes.squeeze(-1)
 
+    def talker_replay_inputs(
+        self,
+        input_ids: torch.Tensor,
+        input_embeds: torch.Tensor,
+        *,
+        row_start: int,
+        prompt_length: int,
+        owner: PrefixCacheRequestOwner,
+        codec_inputs: Sequence[torch.Tensor],
+        payload: OmniPayload,
+        restore_text: bool = True,
+        codec_embeddings: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, OmniPayload]:
+        """Reconstruct a new/resumed interval, including generated-history hits.
+
+        ``codec_inputs`` is runner-local generated history, not scheduler
+        transport or additional_information. Its primary IDs are authoritative
+        for generated rows. Validate the interval before embedding anything;
+        never sample on a replay.
+        Rebuild text state from the current fixed payload, ignoring stale decode
+        queues/hidden states. This boundary operation is not the steady-state
+        decode path and does not retain a second projected-text cache.
+
+        Calling this method does not enable prefix caching; support remains
+        gated separately until runtime qualification is complete.
+        """
+        if self.vllm_config.model_config.async_chunk:
+            raise ValueError("Talker history replay requires the full fixed payload")
+        talker = self.talker
+        if talker is None:
+            raise ValueError("Talker history replay requires a loaded Talker stage")
+        if (
+            type(row_start) is not int
+            or type(prompt_length) is not int
+            or row_start < 0
+            or prompt_length <= 0
+            or not isinstance(owner, PrefixCacheRequestOwner)
+            or input_ids.ndim != 1
+            or not input_ids.numel()
+            or input_embeds.ndim != 2
+            or input_embeds.shape != (input_ids.shape[0], self.talker_config.text_config.hidden_size)
+        ):
+            raise ValueError("Talker replay interval and input shapes must align")
+        if codec_embeddings is not None and (
+            row_start < prompt_length
+            or input_ids.shape[0] != 1
+            or codec_embeddings.shape != input_embeds.shape
+            or codec_embeddings.dtype != input_embeds.dtype
+            or codec_embeddings.device != input_embeds.device
+        ):
+            raise ValueError("Talker prepared codec embedding must match the current input row")
+        row_end = row_start + input_ids.shape[0]
+        generated_start = max(prompt_length, row_start)
+        needed = max(0, row_end - generated_start)
+        first_index = generated_start - prompt_length
+        if needed and first_index + needed > len(codec_inputs):
+            raise ValueError("Talker replay is missing an accepted codec input")
+        replay_rows = codec_inputs[first_index : first_index + needed] if needed else ()
+        for row in replay_rows:
+            if (
+                not isinstance(row, torch.Tensor)
+                or row.ndim != 1
+                or row.dtype != torch.long
+                or row.numel() != talker.num_code_groups
+            ):
+                raise ValueError("Talker replay requires complete per-row int64 codec tensors")
+        codes_for_records = (
+            torch.stack(replay_rows).to(device=input_ids.device, non_blocking=True)
+            if needed
+            else torch.empty((0, talker.num_code_groups), device=input_ids.device, dtype=torch.long)
+        )
+        if not restore_text:
+            replay_meta = payload.get("meta", {})
+            steady_cursor = (
+                bool(replay_meta.get("decode_flag"))
+                and replay_meta.get("num_processed_tokens") == 1 + row_start - prompt_length
+            )
+            first_decode_handoff = (
+                row_start == prompt_length
+                and not replay_meta.get("decode_flag")
+                and replay_meta.get("prefill_consumed_text_tokens") == 1
+                and replay_meta.get("num_processed_tokens") == prompt_length
+            )
+            if (
+                row_start < prompt_length
+                or input_ids.shape[0] != 1
+                or not (steady_cursor or first_decode_handoff)
+                or not isinstance(payload.get("embed", {}).get("tts_pad_projected"), torch.Tensor)
+                or not isinstance(payload.get("hidden_states", {}).get("trailing_text"), torch.Tensor)
+            ):
+                raise ValueError("Talker steady replay or first decode handoff requires a contiguous text cursor")
+            codes = codes_for_records[:1]
+            if codec_embeddings is None:
+                codec_embeds = talker.replay_codec_embeddings(codes, dtype=input_embeds.dtype)
+            else:
+                codec_embeds = codec_embeddings
+            _, text, decode_update = self.talker_preprocess_decode(codes[:, 0], codec_embeds, {}, payload)
+            if text is None:
+                raise ValueError("Talker steady replay is missing its restored text state")
+            decode_update.setdefault("meta", {}).update(
+                decode_flag=True, num_processed_tokens=1 + row_end - prompt_length
+            )
+            decode_update.setdefault("codes", {})["audio"] = codes
+            return codes[:, 0], codec_embeds + text, decode_update
+
+        embed = payload["embed"]
+        plan = read_talker_prefill_plan(
+            payload["meta"].get("talker_prefill_plan"),
+            sequence_length=len(payload["ids"]["all"]),
+            embedding_rows=embed["prefill"].shape[0],
+            hidden_rows=payload["hidden_states"]["output"].shape[0],
+        )
+        if sum(part.num_rows for part in plan) != prompt_length or plan[-1].kind != "assistant":
+            raise ValueError("Talker replay prompt length must match the fixed assistant plan")
+
+        def prefill_at(start: int, span: int):
+            # Local metadata only: do not rewind the live queue or mutate a
+            # captured payload while reconstructing an evicted interval.
+            fixed_payload = dict(payload)
+            fixed_payload["meta"] = {**payload["meta"], "num_processed_tokens": start}
+            return self.talker_preprocess_prefill(input_ids[:span], input_embeds[:span], fixed_payload)
+
+        prefill_rows = max(0, min(row_end, prompt_length) - row_start)
+        ids_parts, embed_parts, code_parts = [], [], []
+        update: OmniPayload = {}
+        if prefill_rows:
+            prefill_ids, prefill_embeds, update = prefill_at(row_start, prefill_rows)
+            ids_parts.append(prefill_ids)
+            embed_parts.append(prefill_embeds.to(dtype=input_embeds.dtype))
+            code_parts.append(
+                torch.zeros((prefill_rows, talker.num_code_groups), device=input_ids.device, dtype=torch.long)
+            )
+        has_generated_rows = codes_for_records.shape[0] > 0
+        if has_generated_rows:
+            # A pure history hit never runs prefill. Reconstruct only its last
+            # bootstrap row to obtain the exact original text projection/tail;
+            # no user rows are projected and no prompt tokens are replanned.
+            if not prefill_rows:
+                _, _, update = prefill_at(prompt_length - 1, 1)
+            tail = update["hidden_states"]["trailing_text"].reshape(-1, input_embeds.shape[-1])
+            pad = update["embed"]["tts_pad_projected"].reshape(-1, input_embeds.shape[-1])
+            offset = generated_start - prompt_length
+            num_generated_rows = codes_for_records.shape[0]
+            text_rows = tail[offset : offset + num_generated_rows]
+            if text_rows.shape[0] < num_generated_rows:
+                text_rows = torch.cat((text_rows, pad.expand(num_generated_rows - text_rows.shape[0], -1)))
+            codes = codes_for_records
+            codec_embeds = (
+                talker.replay_codec_embeddings(codes, dtype=input_embeds.dtype)
+                if codec_embeddings is None
+                else codec_embeddings
+            )
+            embed_parts.append(codec_embeds + text_rows.to(device=codec_embeds.device, dtype=codec_embeds.dtype))
+            ids_parts.append(codes[:, 0])
+            code_parts.append(codes)
+            next_offset = row_end - prompt_length
+            update["hidden_states"]["trailing_text"] = tail[next_offset:] if next_offset < tail.shape[0] else pad
+            update.setdefault("meta", {}).update(decode_flag=True, num_processed_tokens=1 + next_offset)
+        else:
+            update.setdefault("meta", {}).update(decode_flag=False, num_processed_tokens=row_end)
+        if len(ids_parts) == 1:
+            update.setdefault("codes", {})["audio"] = code_parts[0]
+            return ids_parts[0], embed_parts[0], update
+        update.setdefault("codes", {})["audio"] = torch.cat(code_parts)
+        return torch.cat(ids_parts), torch.cat(embed_parts), update
+
     def _get_tts_embed(self, thinker_embed, tts_bos_thinker, tts_eos_thinker, tts_pad_thinker):
         """Project thinker-side TTS embeddings into talker text space."""
         module_device = self._module_device(self.talker)
@@ -1105,16 +1276,9 @@ class Qwen3OmniMoeForConditionalGeneration(
         # Containers to return per-request updates (e.g., code_predictor_hidden_per_request)
         update_dict: OmniPayload = {}
 
-        voice_type = payload.get("speaker")
-        if voice_type is not None and isinstance(voice_type, (list, tuple)) and len(voice_type) > 0:
-            voice_type = voice_type[0]
-        if not isinstance(voice_type, str) or not voice_type.strip():
-            # Fall back to model default; speaker is per-request.
-            voice_type = self.default_tts_text_spk_type
-        else:
-            voice_type = str(voice_type).lower().strip()
         start_index = meta.get("num_processed_tokens", 0)
-        end_index = start_index + input_embeds.shape[0]
+        wire_plan = meta.get("talker_prefill_plan")
+        end_index = start_index + input_ids.shape[0]
         # Read thinker outputs for prefill. Every copy here is H2D from the
         # connector payload; pageable copies would stall the whole Talker batch.
         talker_device = self._module_device(self.talker)
@@ -1126,10 +1290,14 @@ class Qwen3OmniMoeForConditionalGeneration(
         thinker_sequences_cpu = None if ids.get("all") is None else _cpu_long(ids["all"])
         thinker_chatml_ids_cpu = None if ids.get("prompt") is None else _cpu_long(ids["prompt"])
         thinker_sequences = (
-            None if thinker_sequences_cpu is None else to_device_nonblocking(thinker_sequences_cpu, talker_device)
+            thinker_sequences_cpu
+            if wire_plan is not None or thinker_sequences_cpu is None
+            else to_device_nonblocking(thinker_sequences_cpu, talker_device)
         )
         thinker_chatml_ids = (
-            None if thinker_chatml_ids_cpu is None else to_device_nonblocking(thinker_chatml_ids_cpu, talker_device)
+            None
+            if wire_plan is not None or thinker_chatml_ids_cpu is None
+            else to_device_nonblocking(thinker_chatml_ids_cpu, talker_device)
         )
 
         tts_bos_thinker = to_device_nonblocking(embed["tts_bos"], talker_device).to(torch.bfloat16)
@@ -1148,11 +1316,26 @@ class Qwen3OmniMoeForConditionalGeneration(
         if not isinstance(thinker_hidden_states, torch.Tensor):
             thinker_hidden_states = torch.as_tensor(thinker_hidden_states, device=self._module_device(self.talker))
 
-        if isinstance(thinker_chatml_ids, torch.Tensor) or isinstance(thinker_chatml_ids, list):
+        row_plan = None
+        row_ids = None
+        if wire_plan is not None:
+            row_plan = read_talker_prefill_plan(
+                wire_plan,
+                sequence_length=len(ids["all"]),
+                embedding_rows=thinker_sequence_embeds.shape[0],
+                hidden_rows=thinker_hidden_states.shape[0],
+            )
+            row_ids = meta.get("next_stage_prompt_ids")
+            if row_ids is None:
+                raise ValueError("fixed Talker row plan requires its admission IDs")
+            # The fixed plan already selected chat segments on CPU at source
+            # admission. Do not upload or read back the prompt to replan it.
+            ids_chatml = None
+        elif isinstance(thinker_chatml_ids, torch.Tensor) or isinstance(thinker_chatml_ids, list):
             ids_chatml = (
                 thinker_chatml_ids
                 if isinstance(thinker_chatml_ids, torch.Tensor)
-                else torch.as_tensor(thinker_chatml_ids, device=self._module_device(self.talker))
+                else torch.as_tensor(thinker_chatml_ids, device=talker_device)
             )
             if ids_chatml.ndim == 1:
                 ids_chatml = ids_chatml.unsqueeze(0)
@@ -1163,57 +1346,40 @@ class Qwen3OmniMoeForConditionalGeneration(
             ids_chatml = torch.zeros(
                 (1, thinker_sequence_embeds.shape[1]),
                 dtype=torch.long,
-                device=self._module_device(self.talker),
+                device=talker_device,
             )
             thinker_sequences = ids_chatml
             thinker_chatml_ids_cpu = thinker_sequences_cpu = None
 
-        speaker_id = self._get_text_spk_token_id(voice_type)
+        assert thinker_sequences is not None
+        speaker_id = self._get_text_spk_token_id(payload.get("speaker"))
         req_input_ids, req_embeds, trailing_text_hidden = self._thinker_to_talker_prefill(
-            thinker_embed=thinker_sequence_embeds.to(self._module_device(self.talker)),
-            thinker_hidden=thinker_hidden_states.to(self._module_device(self.talker)),
+            thinker_embed=thinker_sequence_embeds,
+            thinker_hidden=thinker_hidden_states,
             multimodal_mask=None,
-            input_ids=ids_chatml.to(self._module_device(self.talker)),
-            thinker_result_ids=thinker_sequences.to(self._module_device(self.talker)),
+            input_ids=ids_chatml,
+            thinker_result_ids=thinker_sequences,
             speaker_id=speaker_id,
             tts_bos_thinker=tts_bos_thinker,
             tts_eos_thinker=tts_eos_thinker,
             tts_pad_thinker=tts_pad_thinker,
             input_ids_cpu=thinker_chatml_ids_cpu,
             thinker_result_ids_cpu=thinker_sequences_cpu,
+            row_plan=row_plan,
+            identity_ids=row_ids,
+            row_start=start_index if row_plan is not None else 0,
+            row_end=end_index if row_plan is not None else None,
         )
 
-        # Queue trailing_text_hidden for decode (drop first for next steps),
-        try:
-            if isinstance(trailing_text_hidden, torch.Tensor) and trailing_text_hidden.numel() > 0:
-                if trailing_text_hidden.ndim == 2:
-                    rem_tail = trailing_text_hidden
-                elif trailing_text_hidden.ndim == 1:
-                    rem_tail = torch.zeros(
-                        0,
-                        trailing_text_hidden.shape[0],
-                        dtype=trailing_text_hidden.dtype,
-                        device=trailing_text_hidden.device,
-                    )
-                else:
-                    # compatible with old shape [1,S,D]
-                    rem_tail = trailing_text_hidden.squeeze(0)
-                if rem_tail.shape[0] > 0:
-                    update_dict.setdefault("hidden_states", {})["trailing_text"] = rem_tail.detach()
-            # Also persist projected tts_pad for decode fallback if needed
-            if isinstance(tts_pad_thinker, torch.Tensor):
-                pad_in = tts_pad_thinker
-                if pad_in.ndim == 2:
-                    pad_in = pad_in.unsqueeze(0)
-                if pad_in.ndim == 1:
-                    pad_in = pad_in.view(1, 1, -1)
-                pad_proj = self.talker.text_projection(pad_in.to(self._module_device(self.talker)))
-                update_dict.setdefault("embed", {})["tts_pad_projected"] = pad_proj.detach()
-        except Exception:
-            pass
+        if trailing_text_hidden is not None:
+            update_dict.setdefault("hidden_states", {})["trailing_text"] = trailing_text_hidden.detach()
+        # Bootstrap assembly normalizes aggregated source PAD snapshots to one row.
+        update_dict.setdefault("embed", {})["tts_pad_projected"] = self.tts_pad_embed.reshape(1, 1, -1).detach()
         update_dict.setdefault("meta", {})["prefill_consumed_text_tokens"] = 1
         self._talker_cache_thinker_decode_embeds(embed, update_dict)
 
+        if row_plan is not None:
+            return req_input_ids, req_embeds, update_dict
         return req_input_ids[start_index:end_index], req_embeds[start_index:end_index], update_dict
 
     def _talker_cache_thinker_decode_embeds(
@@ -1245,7 +1411,7 @@ class Qwen3OmniMoeForConditionalGeneration(
         thinker_embed: torch.Tensor,
         thinker_hidden: torch.Tensor,
         multimodal_mask: torch.Tensor | None,
-        input_ids: torch.Tensor,
+        input_ids: torch.Tensor | None,
         thinker_result_ids: torch.Tensor,
         speaker_id,
         tts_bos_thinker: torch.Tensor | None = None,
@@ -1253,6 +1419,11 @@ class Qwen3OmniMoeForConditionalGeneration(
         tts_pad_thinker: torch.Tensor | None = None,
         input_ids_cpu: torch.Tensor | None = None,
         thinker_result_ids_cpu: torch.Tensor | None = None,
+        *,
+        row_plan: Sequence[TalkerPrefillPart] | None = None,
+        identity_ids: Sequence[int] | None = None,
+        row_start: int = 0,
+        row_end: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """
         Project thinker outputs to talker inputs during prefill stage.
@@ -1262,49 +1433,69 @@ class Qwen3OmniMoeForConditionalGeneration(
         mask test on device ids is a host sync that stalls the Talker batch.
 
         Returns:
-            (input_ids, input_embeds) for talker
+            (input_ids, input_embeds, trailing_text_hidden) for talker
         """
         target_len = thinker_result_ids.shape[-1]
-        # Take batch 0 since batched inference is not supported here.
-        parse_ids = input_ids_cpu if input_ids_cpu is not None else input_ids
+        device = input_ids.device if input_ids is not None else thinker_embed.device
+        plan = row_plan
+        sequence_ids = None
+        if plan is None or identity_ids is None:
+            source_ids = thinker_result_ids_cpu if thinker_result_ids_cpu is not None else thinker_result_ids
+            sequence_ids = source_ids.reshape(-1).tolist()
+        if plan is None:
+            if input_ids is None:
+                raise ValueError("Talker prefill requires prompt IDs or a fixed row plan")
+            plan = plan_talker_prefill(
+                (input_ids_cpu if input_ids_cpu is not None else input_ids)[0].tolist(),
+                target_len,
+                im_start_token_id=self.config.im_start_token_id,
+                system_token_id=self.config.system_token_id,
+                user_token_id=self.config.user_token_id,
+                assistant_token_id=self.config.assistant_token_id,
+                embedding_rows=thinker_embed.shape[0],
+                hidden_rows=thinker_hidden.shape[0],
+                sequence_ids=sequence_ids,
+            )
+        if identity_ids is None:
+            identity_ids = talker_prefill_token_ids(
+                plan,
+                sequence_ids,
+                tts_pad_token_id=self.config.tts_pad_token_id,
+                tts_bos_token_id=self.config.tts_bos_token_id,
+            )
+        num_rows = sum(part.num_rows for part in plan)
+        row_end = num_rows if row_end is None else row_end
+        if len(identity_ids) != num_rows or not 0 <= row_start < row_end <= num_rows:
+            raise ValueError("Talker prefill interval and identity IDs must align with the fixed row plan")
         result_ids = thinker_result_ids_cpu if thinker_result_ids_cpu is not None else thinker_result_ids
-        im_start_indexes = torch.nonzero(parse_ids[0] == self.config.im_start_token_id).flatten().tolist()
-        im_start_indexes.append(target_len)
         multimodal_mask = (
             (result_ids == self.thinker_config.audio_token_id) |
             (result_ids == self.thinker_config.image_token_id) |
             (result_ids == self.thinker_config.video_token_id)
         )  # [t] # fmt: skip
-        role_tokens = parse_ids[0].tolist()
 
         tts_bos_embed, tts_eos_embed, tts_pad_embed = self._get_tts_embed(
             thinker_embed, tts_bos_thinker, tts_eos_thinker, tts_pad_thinker
         )
 
         talker_input_embeds = []  # [1 t d]
-        talker_input_ids = []
         trailing_text_hidden_all: torch.Tensor | None = None
-        # For every chatml parts
-        for i in range(len(im_start_indexes) - 1):
-            im_start_index = im_start_indexes[i]
-            segment_end_index = im_start_indexes[i + 1]
-            role_token = role_tokens[im_start_index + 1]
-            # Talker should ignore thinker system prompt
-            if role_token == self.config.system_token_id:
+        output_offset = 0
+        for part in plan:
+            first = max(row_start - output_offset, 0)
+            last = min(row_end - output_offset, part.num_rows)
+            output_offset += part.num_rows
+            if first >= last:
                 continue
+            im_start_index, segment_end_index = part.start, part.end
             # Talker takes word embeddings for tokens and hidden state from `accept_hidden_layer` for multimodal inputs
-            elif role_token == self.config.user_token_id:
+            if part.kind == "user":
                 talker_user_part = self._get_talker_user_parts(
-                    im_start_index, segment_end_index, multimodal_mask, thinker_hidden, thinker_embed
+                    im_start_index + first, im_start_index + last, multimodal_mask, thinker_hidden, thinker_embed
                 )
                 talker_input_embeds.append(talker_user_part)
-                talker_input_ids.append(thinker_result_ids[im_start_index:segment_end_index])
-            # Take assistant output (for now). A tool call is not speech:
-            # keep the preface and stop at the <tool_call> token so its
-            # hidden state never becomes a Talker text step.
-            elif role_token == self.config.assistant_token_id and i == len(im_start_indexes) - 2:
-                segment_end_index = spoken_span_end(result_ids.reshape(-1).tolist(), im_start_index, segment_end_index)
-                talker_assistant_embeds, talker_assistant_ids, trailing_text_hidden = self._get_talker_assistant_parts(
+            else:
+                talker_assistant_embeds, trailing_text_hidden = self._get_talker_assistant_parts(
                     im_start_index,
                     segment_end_index,
                     speaker_id,
@@ -1313,21 +1504,10 @@ class Qwen3OmniMoeForConditionalGeneration(
                     tts_bos_embed,
                     tts_eos_embed,
                 )
-                talker_input_embeds.append(talker_assistant_embeds)
-                talker_input_ids.append(talker_assistant_ids)
-                # capture trailing text hidden for decode steps
-                try:
-                    if isinstance(trailing_text_hidden, torch.Tensor):
-                        trailing_text_hidden_all = trailing_text_hidden
-                except Exception:
-                    pass
-            # History assistant output (ignore for now)
-            elif role_token == self.config.assistant_token_id and i != len(im_start_indexes) - 2:
-                continue
-            else:
-                raise AssertionError("Expect role id after <|im_start|> (assistant, user, system)")
-        talker_input_embed = torch.cat([embed.to(input_ids.device) for embed in talker_input_embeds], dim=0)
-        talker_input_id = torch.cat([embed.to(input_ids.device) for embed in talker_input_ids], dim=0)
+                talker_input_embeds.append(talker_assistant_embeds[first:last])
+                trailing_text_hidden_all = trailing_text_hidden
+        talker_input_embed = torch.cat([embed.to(device) for embed in talker_input_embeds], dim=0)
+        talker_input_id = to_device_nonblocking(torch.tensor(identity_ids[row_start:row_end], dtype=torch.long), device)
 
         return talker_input_id, talker_input_embed, trailing_text_hidden_all
 
@@ -1421,18 +1601,21 @@ class Qwen3OmniMoeForConditionalGeneration(
             if self.vllm_config.model_config.async_chunk:
                 text_step = self._thinker_decode_to_talker_decode(payload, input_ids.device, update_dict)
             else:
+                pad_embed = payload.get("embed", {}).get("tts_pad_projected")
+                if not isinstance(pad_embed, torch.Tensor):
+                    # Profiling/legacy payloads can lack per-request projections.
+                    pad_embed = self.tts_pad_embed
+                pad_embed = pad_embed.to(device=input_embeds.device, dtype=input_embeds.dtype).reshape(
+                    -1, input_embeds.shape[-1]
+                )
                 q_tail = hs.get("trailing_text", None)
                 if isinstance(q_tail, torch.Tensor) and q_tail.numel() > 0:
                     use_vec = q_tail[0:1, :]
-                    new_q_tail = (
-                        q_tail[1:, :].detach()
-                        if q_tail.shape[0] > 1
-                        else self.tts_pad_embed.to(input_embeds.device, dtype=input_embeds.dtype)
-                    )
+                    new_q_tail = q_tail[1:, :].detach() if q_tail.shape[0] > 1 else pad_embed
                     text_step = use_vec.to(input_embeds.device, dtype=input_embeds.dtype)
                     update_dict.setdefault("hidden_states", {})["trailing_text"] = new_q_tail
                 else:
-                    text_step = self.tts_pad_embed.to(input_embeds.device, dtype=input_embeds.dtype)
+                    text_step = pad_embed
 
             last_talker_hidden_tensor = hs.get("last")
             if last_talker_hidden_tensor is not None:
@@ -1450,6 +1633,7 @@ class Qwen3OmniMoeForConditionalGeneration(
         return last_talker_hidden, text_step, update_dict
 
     def _get_talker_user_parts(self, im_start_index, segment_end_index, multimodal_mask, thinker_hidden, thinker_embed):
+        assert self.talker is not None
         clamped = min(
             segment_end_index,
             multimodal_mask.shape[0],
@@ -1570,13 +1754,7 @@ class Qwen3OmniMoeForConditionalGeneration(
             trailing_text_hidden = tts_eos_embed
 
         input_embeds = assistant_text_hidden + assistant_codec_hidden
-        input_ids = torch.full(
-            (assistant_text_hidden.shape[0],),
-            fill_value=self.config.tts_pad_token_id,
-            dtype=torch.long,
-            device=assistant_text_hidden.device,
-        )
-        return input_embeds, input_ids, trailing_text_hidden
+        return input_embeds, trailing_text_hidden
 
     def _talker_to_code_predictor(
         self,

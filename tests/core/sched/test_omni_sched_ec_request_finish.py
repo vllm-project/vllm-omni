@@ -41,6 +41,9 @@ def _make_free_request_sched(*, ec_connector) -> tuple[OmniARScheduler, MagicMoc
     firing relative to the encoder-cache free."""
     order = MagicMock()
     sched = OmniARScheduler.__new__(OmniARScheduler)
+    sched._prefix_cache_next_admission = 0
+    sched._prefix_cache_pending_terminal_owners = {}
+    sched._discarded_req_ids = set()
     sched._omits_kv_transfer_cache = {}
     sched._connector_finished = lambda request: (False, None)
     sched.ec_connector = ec_connector
@@ -61,6 +64,7 @@ def _make_free_request_sched(*, ec_connector) -> tuple[OmniARScheduler, MagicMoc
 class _FakeFinishedRequest:
     def __init__(self, request_id: str) -> None:
         self.request_id = request_id
+        self.status = RequestStatus.FINISHED_STOPPED
 
     def is_finished(self) -> bool:
         return True
