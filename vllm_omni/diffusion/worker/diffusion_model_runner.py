@@ -31,10 +31,12 @@ from vllm_omni.diffusion.attention.schedule import (
     AttentionSchedule,
     AttentionSigmaSchedule,
     batch_attention_schedule,
+    batch_attention_sigma_schedule,
     require_attention_schedule_pipeline,
     resolve_batch_attention_schedule,
     resolve_batch_attention_sigma_schedule,
     resolve_request_attention_schedule,
+    resolve_request_attention_sigma_schedule,
     stage_runs_denoising,
 )
 from vllm_omni.diffusion.cache.cachedit import CacheDiTBackend, cache_summary
@@ -1231,6 +1233,9 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                     attention_schedule=resolve_request_attention_schedule(
                         sched_new_req.req.sampling_params, getattr(self.od_config, "diffusion_attention_schedule", None)
                     ),
+                    attention_sigma_schedule=resolve_request_attention_sigma_schedule(
+                        sched_new_req.req.sampling_params, getattr(self.od_config, "diffusion_attention_schedule", None)
+                    ),
                 )
                 if (
                     sched_new_req.diffusion_kv_metadata is not None
@@ -1524,9 +1529,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
             had_active_states = bool(self.state_cache)
             states, new_request_ids = self._update_states(scheduler_output)
             attention_schedule = batch_attention_schedule(state.attention_schedule for state in states)
-            sigma_schedule = resolve_batch_attention_sigma_schedule(
-                [state.sampling for state in states], getattr(self.od_config, "diffusion_attention_schedule", None)
-            )
+            sigma_schedule = batch_attention_sigma_schedule(state.attention_sigma_schedule for state in states)
             is_primary = not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
             if (
                 record_output_peak_memory
