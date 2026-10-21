@@ -16,6 +16,7 @@ import torch.nn as nn
 
 import vllm_omni.diffusion.attention.layer as layer_mod
 from vllm_omni.diffusion.attention.backends.abstract import AttentionImpl, AttentionMetadata
+from vllm_omni.diffusion.attention.capabilities import AttentionComputation
 from vllm_omni.diffusion.attention.layer import Attention, _PreparedCandidate
 from vllm_omni.diffusion.attention.parallel.base import NoParallelAttention
 from vllm_omni.diffusion.config import set_current_diffusion_config
@@ -175,6 +176,23 @@ def test_identical_effective_profiles_dedup_to_shared_record(attention_env):
     assert attention._schedule_profiles == ("a", "b")
     assert attention._schedule_candidates["a"] is attention._schedule_candidates["b"]
     assert attention._schedule_candidates["a"].impl is attention._schedule_candidates["b"].impl
+
+
+def test_candidates_are_built_with_the_baseline_impl_arguments(attention_env):
+    """A candidate impl gets every argument the baseline impl gets, except its own backend selection."""
+    schedule = AttentionScheduleConfig(
+        profiles={"sdpa": AttentionConfig(default=AttentionSpec(backend="SDPA"))},
+        default=[{"start": 0, "end": None, "profile": "sdpa"}],
+    )
+    layer = attention_env.build(_make_config(schedule=schedule), role="cross", prefix="blocks.0.attn2")
+
+    baseline = layer.attention.kwargs
+    candidate = layer._schedule_candidates["sdpa"].impl.kwargs
+    assert candidate["computation"] is AttentionComputation.CROSS
+    assert {key for key in baseline.keys() | candidate.keys() if baseline.get(key) != candidate.get(key)} <= {
+        "backend_kwargs",
+        "backend_explicit",
+    }
 
 
 def test_allgather_trtllm_candidate_is_rejected(attention_env):
