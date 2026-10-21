@@ -13,6 +13,95 @@ pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
 
 
 @pytest.mark.cpu
+@pytest.mark.parametrize("invalid_norm", ["query_bias", "key_bias", "different_eps"])
+def test_qkv_dispatch_rejects_unsupported_norms(monkeypatch, invalid_norm):
+    attention = transformer.QwenImage21Attention.__new__(transformer.QwenImage21Attention)
+    torch.nn.Module.__init__(attention)
+    attention.norm_q = torch.nn.RMSNorm(64, eps=1e-5)
+    attention.norm_k = torch.nn.RMSNorm(64, eps=1e-5)
+    attention.norm_q.bias = attention.norm_k.bias = None
+    if invalid_norm == "query_bias":
+        attention.norm_q.bias = torch.nn.Parameter(torch.ones(64))
+    elif invalid_norm == "key_bias":
+        attention.norm_k.bias = torch.nn.Parameter(torch.ones(64))
+    else:
+        attention.norm_k.eps = 1e-6
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("Unsupported norm must not enter either fused path")
+
+    monkeypatch.setattr(transformer, "try_fused_qkv_norm_rope", unexpected)
+    monkeypatch.setattr(transformer, "qk_rotary", unexpected)
+    q = torch.ones(1, 3, 2, 64)
+    tables = (torch.ones(3, 64), torch.zeros(3, 64))
+    assert attention._try_fused_qkv_norm_rope(q, q, q, torch.empty(3, 32), tables) is None
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize(
+    "route", ["qkv", "qk_with_tables", "qk_without_tables", "none_with_tables", "none_without_tables"]
+)
+def test_qkv_dispatch_uses_operator_tables_only_when_present(monkeypatch, route):
+    attention = transformer.QwenImage21Attention.__new__(transformer.QwenImage21Attention)
+    torch.nn.Module.__init__(attention)
+    attention.head_dim = 64
+    attention.norm_q = torch.nn.RMSNorm(64, eps=1e-5)
+    attention.norm_k = torch.nn.RMSNorm(64, eps=1e-5)
+    attention.norm_q.bias = attention.norm_k.bias = None
+    q, k, v = (torch.full((1, 3, 2, 64), value) for value in (1.0, 2.0, 3.0))
+    freqs = torch.empty(3, 32, dtype=torch.complex64)
+    tables = None if route.endswith("without_tables") else (torch.ones(3, 64), torch.zeros(3, 64))
+    qkv_outputs = (q + 10, k + 10, v.clone())
+    qk_outputs = (q + 20, k + 20)
+    calls = []
+
+    def fused_qkv(query, key, value, q_weight, k_weight, operator_tables, eps, **kwargs):
+        calls.append("qkv")
+        assert operator_tables is tables
+        return qkv_outputs if route == "qkv" else None
+
+    def fused_qk(query, key, q_weight, k_weight, rotary_freqs, eps):
+        calls.append("qk")
+        assert rotary_freqs is freqs
+        return qk_outputs if route.startswith("qk_") else None
+
+    monkeypatch.setattr(transformer, "try_fused_qkv_norm_rope", fused_qkv)
+    monkeypatch.setattr(transformer, "qk_rotary", fused_qk)
+    result = attention._try_fused_qkv_norm_rope(q, k, v, freqs, tables)
+    if route == "qkv":
+        assert result is qkv_outputs
+        assert calls == ["qkv"]
+    else:
+        assert calls == (["qk"] if tables is None else ["qkv", "qk"])
+        if route.startswith("qk_"):
+            assert result[0] is qk_outputs[0] and result[1] is qk_outputs[1]
+            assert result[2] is v
+        else:
+            assert result is None
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("with_operator_tables", [False, True])
+def test_qkv_dispatch_propagates_execution_errors(monkeypatch, with_operator_tables):
+    attention = transformer.QwenImage21Attention.__new__(transformer.QwenImage21Attention)
+    torch.nn.Module.__init__(attention)
+    attention.head_dim = 64
+    attention.norm_q = torch.nn.RMSNorm(64, eps=1e-5)
+    attention.norm_k = torch.nn.RMSNorm(64, eps=1e-5)
+    attention.norm_q.bias = attention.norm_k.bias = None
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("fusion execution failed")
+
+    monkeypatch.setattr(transformer, "try_fused_qkv_norm_rope", fail)
+    monkeypatch.setattr(transformer, "qk_rotary", fail)
+    q = torch.ones(1, 3, 2, 64)
+    tables = (torch.ones(3, 64), torch.zeros(3, 64)) if with_operator_tables else None
+    with pytest.raises(RuntimeError, match="fusion execution failed"):
+        attention._try_fused_qkv_norm_rope(q, q, q, torch.empty(3, 32), tables)
+
+
+@pytest.mark.cpu
 @pytest.mark.parametrize("cache_dtype", [None, "fp8_e4m3", "fp8_e4m3_v"])
 @pytest.mark.parametrize("sp", [False, True])
 @pytest.mark.parametrize("heads", [1, 2])
@@ -68,7 +157,7 @@ def test_qkv_fusion_preserves_prefix_cache_and_sp_joint(monkeypatch, cache_dtype
                 cache_branch=branch,
                 cache_write_len=2,
                 sp_prefix_len=2 if sp else 0,
-                rope_tables=tables,
+                norm_rope_concat_tables=tables,
             )
             prefix_key = (x * 2).unflatten(-1, (heads, 64))[:, :2] + 7
             prefix_value = (x * 3).unflatten(-1, (heads, 64))[:, :2]
@@ -89,7 +178,7 @@ def test_qkv_fusion_preserves_prefix_cache_and_sp_joint(monkeypatch, cache_dtype
                 kv_cache=cache,
                 cache_branch=branch,
                 sp_decode=sp,
-                rope_tables=tuple(t[2:] for t in tables),
+                norm_rope_concat_tables=tuple(t[2:] for t in tables),
             )
             q, k, v, metadata = received[-1]
             current_key = (decode * 2).unflatten(-1, (heads, 64)) + 7
@@ -135,7 +224,7 @@ def test_qkv_unavailable_preserves_existing_norm_rope(monkeypatch, fused_qk):
     x = torch.randn(2, 3, 128)
     freqs = torch.polar(torch.ones(3, 32), torch.randn(3, 32))
     with torch.inference_mode():
-        actual = attention(x, freqs, rope_tables=(torch.ones(3, 64), torch.zeros(3, 64)))
+        actual = attention(x, freqs, norm_rope_concat_tables=(torch.ones(3, 64), torch.zeros(3, 64)))
         q = x.unflatten(-1, (2, 64))
         expected = q + 9 if fused_qk else attention._apply_rotary_emb(attention.norm_q(q), freqs)
     torch.testing.assert_close(actual, expected.flatten(2, 3), rtol=0, atol=0)

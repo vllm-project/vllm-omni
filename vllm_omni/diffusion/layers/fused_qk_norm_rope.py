@@ -82,7 +82,7 @@ def norm_rope_concat_available(device: torch.device) -> bool:
     return device.type == "npu" and _load_norm_rope_concat() is not None
 
 
-def prepare_qkv_norm_rope_tables(
+def prepare_norm_rope_concat_tables(
     cos: torch.Tensor,
     sin: torch.Tensor,
     *,
@@ -106,7 +106,7 @@ def _norm_rope_concat_inputs_supported(
     v: torch.Tensor,
     q_weight: torch.Tensor,
     k_weight: torch.Tensor,
-    rope_tables: tuple[torch.Tensor, torch.Tensor],
+    norm_rope_concat_tables: tuple[torch.Tensor, torch.Tensor],
     head_dim: int,
     rotary_dim: int,
 ) -> bool:
@@ -120,7 +120,7 @@ def _norm_rope_concat_inputs_supported(
         return False
     if q_weight.shape != (head_dim,) or k_weight.shape != (head_dim,):
         return False
-    cos, sin = rope_tables
+    cos, sin = norm_rope_concat_tables
     if cos.shape != (q.shape[1], rotary_dim) or sin.shape != cos.shape:
         return False
     return all(t.device == q.device and t.dtype == q.dtype for t in (k, v, q_weight, k_weight, cos, sin))
@@ -132,7 +132,7 @@ def try_fused_qkv_norm_rope(
     v: torch.Tensor,
     q_weight: torch.Tensor,
     k_weight: torch.Tensor,
-    rope_tables: tuple[torch.Tensor, torch.Tensor],
+    norm_rope_concat_tables: tuple[torch.Tensor, torch.Tensor],
     eps: float,
     *,
     head_dim: int,
@@ -141,7 +141,7 @@ def try_fused_qkv_norm_rope(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
     """Try single-stream affine RMSNorm + RoPE, returning logical BSND Q/K/V.
 
-    Inputs are [batch, local_sequence, local_heads, head_dim]; ``rope_tables``
+    Inputs are [batch, local_sequence, local_heads, head_dim]; ``norm_rope_concat_tables``
     is (cos, sin), each [local_sequence, rotary_dim], in the activation dtype.
     Outputs may be noncontiguous. V is unchanged numerically, but may be copied.
     Only fresh projected tokens belong here: cached keys are already rotated.
@@ -153,12 +153,14 @@ def try_fused_qkv_norm_rope(
     """
     if torch.is_grad_enabled() or torch.compiler.is_compiling() or not norm_rope_concat_available(q.device):
         return None
-    if not _norm_rope_concat_inputs_supported(q, k, v, q_weight, k_weight, rope_tables, head_dim, rotary_dim):
+    if not _norm_rope_concat_inputs_supported(
+        q, k, v, q_weight, k_weight, norm_rope_concat_tables, head_dim, rotary_dim
+    ):
         return None
     op = _load_norm_rope_concat()
     if op is None:
         return None
-    cos, sin = rope_tables
+    cos, sin = norm_rope_concat_tables
     outputs = op(
         q,
         k,
