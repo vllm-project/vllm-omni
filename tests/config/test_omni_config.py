@@ -47,6 +47,7 @@ from vllm_omni.config.stage_config import (
     _STAGE_DEPLOY_FIELDS,
     PIPELINE_WIDE_ENGINE_FIELDS,
     DeployConfig,
+    DuplexSessionRuntimeConfig,
     PipelineConfig,
     StageDeployConfig,
     StageExecutionType,
@@ -155,6 +156,49 @@ def test_duplex_session_capacity_propagates_to_every_structured_stage() -> None:
 
     assert [stage.model_config.duplex_max_sessions for stage in omni_config.stage_configs] == [2, 2]
     assert [stage.model_config.session_mode for stage in omni_config.stage_configs] == ["duplex", "duplex"]
+
+
+@pytest.mark.parametrize(
+    ("session_mode", "placement", "expected"),
+    [
+        ("duplex", {}, 11),
+        ("duplex", {"replica_policy": "legacy"}, 11),
+        ("duplex", {"replica_policy": "legacy", "max_sessions_per_replica": 3}, 11),
+        ("duplex", {"replica_policy": "least_sessions", "max_sessions_per_replica": 3}, 3),
+        ("turn", {}, 1),
+    ],
+)
+def test_duplex_worker_capacity_matches_both_config_build_paths(session_mode, placement, expected) -> None:
+    pipeline = PipelineConfig(
+        model_type="test-duplex-replica-capacity",
+        stages=(
+            StagePipelineConfig(stage_id=0, model_stage="ar"),
+            StagePipelineConfig(
+                stage_id=1,
+                model_stage="codec",
+                execution_type=StageExecutionType.LLM_GENERATION,
+                input_sources=(0,),
+                final_output=True,
+            ),
+        ),
+    )
+    deploy = DeployConfig(
+        session_mode=session_mode,
+        duplex_session=DuplexSessionRuntimeConfig(max_sessions=11, **placement),
+        stages=[StageDeployConfig(stage_id=stage, num_replicas=2) for stage in (0, 1)],
+    )
+
+    # The legacy merge returns StageConfig; engine_args is exposed by its
+    # config-only projection, which does not resolve or initialize workers.
+    legacy_stages = [stage.to_omegaconf() for stage in merge_pipeline_deploy(pipeline, deploy)]
+    structured = VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=deploy)
+
+    assert [stage.engine_args.get("duplex_max_sessions", 1) for stage in legacy_stages] == [expected, expected]
+    assert [stage.engine_args.session_mode for stage in legacy_stages] == [session_mode, session_mode]
+    assert [stage.model_config.duplex_max_sessions for stage in structured.stage_configs] == [expected, expected]
+    assert [stage.model_config.session_mode for stage in structured.stage_configs] == [session_mode, session_mode]
+    # Placement does not reinterpret the global frontend admission limit.
+    assert deploy.duplex_session.max_sessions == 11
 
 
 def test_non_duplex_deploy_keeps_model_session_capacity_at_one(tmp_path: Path) -> None:
@@ -490,6 +534,10 @@ def test_minicpmo_npu_additional_config_reaches_engine_args(monkeypatch, deploy_
     monkeypatch.setattr(stage_init_utils, "resolve_worker_cls", lambda engine_args: None)
     stage = _from_pipeline_key("minicpmo_4_5", deploy_config_path=deploy_name).stage_by_id(2)
     expected = {"code2wav_enable_npu_graph": True, "code2wav_max_npu_graphs": 32}
+    if deploy_name == "minicpmo_4_5":
+        # Single-card deploy: batch sizes round up to a capture bucket so the
+        # 32-entry pool covers the shape space.
+        expected["cfm_graph_batch_buckets"] = [1, 2, 4, 8]
     assert stage.runtime_config.additional_config == expected
     engine_args = build_engine_args_dict_from_omni_stage_config(stage, model="test-model")
     assert engine_args["additional_config"] == expected
@@ -947,10 +995,15 @@ def test_platform_v1_fallback_overrides_stage_v2():
     assert deploy.stages[1].model_runner is None
 
 
-def test_downstream_mrv2_stage_requires_turn_sessions():
-    stages = [StageDeployConfig(stage_id=0), StageDeployConfig(stage_id=1, model_runner="v2")]
-    with pytest.raises(ValueError, match="session_mode 'turn' only"):
-        merge_pipeline_deploy(_qwen3_omni_pipeline(), DeployConfig(stages=stages, session_mode="duplex"))
+def test_qwen3_omni_downstream_mrv2_accepts_duplex_sessions():
+    stages = [
+        StageDeployConfig(stage_id=0),
+        StageDeployConfig(stage_id=1, model_runner="v2"),
+        StageDeployConfig(stage_id=2, model_runner="v2"),
+    ]
+    merged = merge_pipeline_deploy(_qwen3_omni_pipeline(), DeployConfig(stages=stages, session_mode="duplex"))
+    assert [stage.yaml_engine_args["use_v2_model_runner"] for stage in merged] == [False, True, True]
+    assert [stage.yaml_engine_args["session_mode"] for stage in merged] == ["duplex", "duplex", "duplex"]
 
 
 def test_v1_downstream_stage_keeps_duplex_sessions():
@@ -1014,6 +1067,10 @@ def test_vllm_omni_stage_config_public_fields_use_typed_stage_realizations():
         "compilation_config",
         "profiler_config",
         "quantization_config",
+        # Stage-level speculative_config is passed straight through to the
+        # engine: the Talker K-step block is read by the engine, not unpacked
+        # structurally like the other stage configs.
+        "speculative_config",
     }
     assert "diffusion_config" not in public_fields
     assert {f.name for f in fields(VllmOmniDiffusionStageConfig)} == public_fields | {"diffusion_config"}
@@ -1088,6 +1145,7 @@ def test_sub_config_fields_match_structured_scopes():
         "attention_backend",
         "attention_config",
         "moe_backend",
+        "linear_backend",
         "hf_overrides",
         "limit_mm_per_prompt",
         "interleave_mm_strings",
@@ -1955,10 +2013,12 @@ def test_diffusion_stage_payload_keys_roundtrip(source, key_container, tmp_path)
 
     topology_keys = {
         "stage_input_payload_keys": ("conditioning", "metadata"),
+        "stage_input_optional_payload_keys": ("metadata",),
         "stage_output_payload_keys": ("latents",),
     }
     override_keys = {
         "stage_input_payload_keys": (),
+        "stage_input_optional_payload_keys": (),
         "stage_output_payload_keys": ("audio", "video"),
     }
     pipeline = _resolve_pipeline_or_skip("dreamzero")
@@ -1997,6 +2057,25 @@ def test_diffusion_stage_payload_keys_roundtrip(source, key_container, tmp_path)
         assert getattr(od_config, name) == keys
     for name in topology_keys:
         assert getattr(topology, name) == (() if source == "default" else topology_keys[name])
+
+
+@pytest.mark.parametrize("pipeline_key", ["wan2_2_eg", "wan2_2_egd"])
+def test_wan_stage_roles_survive_structured_runtime_projection(pipeline_key, tmp_path):
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
+    from vllm_omni.engine.stage_init_utils import build_engine_args_dict_from_omni_stage_config
+
+    pipeline = _resolve_pipeline_or_skip(pipeline_key)
+    config = VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=_load_default_deploy(pipeline))
+    for topology in pipeline.stages:
+        stage = ForkingPickler.loads(ForkingPickler.dumps(config.stage_by_id(topology.stage_id)))
+        assert stage.diffusion_config.stage_role == topology.stage_role.value
+        engine_args = build_engine_args_dict_from_omni_stage_config(stage, model=str(tmp_path))
+        kwargs = omni_config_module.extract_diffusion_stage_config_kwargs(
+            engine_args, stage_id=stage.stage_id, include_engine_adapter_metadata=True
+        )
+        runtime = OmniDiffusionConfig.from_kwargs(**kwargs)
+        assert runtime.stage_role == topology.stage_role.value
+        assert runtime.stage_input_optional_payload_keys == topology.stage_input_optional_payload_keys
 
 
 def test_diffusion_config_field_classification_covers_current_fields():

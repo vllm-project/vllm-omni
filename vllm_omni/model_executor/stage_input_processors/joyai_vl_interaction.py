@@ -6,6 +6,7 @@ from typing import Any
 
 from vllm.outputs import RequestOutput
 from vllm.tokenizers import cached_tokenizer_from_config
+from vllm.transformers_utils.processor import cached_processor_from_config
 
 from vllm_omni.errors import OmniClientError
 from vllm_omni.experimental.fullduplex.joyvl.decision.output_parser import (
@@ -45,10 +46,50 @@ def _clean_qwen3_asr_transcript(raw_text: str) -> str:
     return " ".join(raw_text.rsplit(_ASR_TEXT_TAG, 1)[-1].replace("</asr_text>", "").split())
 
 
+def render_joyai_session_prompt(
+    processor: Any,
+    *,
+    system: str,
+    history: list[dict[str, Any]],
+    query: str,
+    images: list[Any],
+    image_token_counts: list[int],
+    budget: int,
+) -> tuple[str, list[Any]]:
+    """Fit the actual query, keeping system policy and the latest observation."""
+    history, images, image_token_counts = list(history), list(images), list(image_token_counts)
+    while True:
+        content = [{"type": "image"} for _ in images]
+        content.append(
+            {
+                "type": "text",
+                "text": f"{USER_QUERY_HEADER}\n{query}"
+                if query
+                else "Observe the current scene and choose whether to speak or stay silent.",
+            }
+        )
+        messages = [{"role": "system", "content": system}, *history, {"role": "user", "content": content}]
+        rendered = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        text_tokens = processor.tokenizer(text=[rendered])["input_ids"][0]
+        if len(text_tokens) + sum(image_token_counts) - len(images) <= budget:
+            return rendered, images
+        if history:
+            history.pop(0)
+            while history and history[0]["role"] == "assistant":
+                history.pop(0)
+        elif len(images) > 1:
+            images.pop(0)
+            image_token_counts.pop(0)
+        else:
+            raise OmniClientError("JoyAI instruction and current observation exceed the context budget")
+
+
 def asr_to_joyai(
     source_outputs: list[RequestOutput],
     prompt: object | None = None,
     requires_multimodal_data: bool = True,
+    *,
+    target_model_config: Any = None,
 ) -> list[dict[str, Any]]:
     """Build JoyAI prompts from Qwen3-ASR transcripts and the deferred image/video inputs;
     ``additional_information["joyai_system_prompt"]`` overrides the default system prompt."""
@@ -72,6 +113,48 @@ def asr_to_joyai(
                 "<|im_start|>assistant\n"
             ),
         }
+        context = additional_info.get("joyai_prompt_context")
+        if "joyai_prompt_context" in additional_info:
+            # Chat clients can also supply this metadata. Reject malformed
+            # session context as a request error before invoking the processor.
+            if (
+                not isinstance(context, dict)
+                or not isinstance(context.get("system"), str)
+                or not isinstance(context.get("history"), list)
+                or any(
+                    not isinstance(message, dict)
+                    or message.get("role") not in ("user", "assistant")
+                    or not isinstance(message.get("content"), str)
+                    for message in context["history"]
+                )
+            ):
+                raise OmniClientError(
+                    "joyai_prompt_context requires a string system and a history of user/assistant text messages"
+                )
+            budget = additional_info.get("joyai_prompt_budget")
+            if type(budget) is not int or budget <= 0:
+                raise OmniClientError("joyai_prompt_budget must be a positive integer")
+            image_token_counts = additional_info.get("joyai_image_token_counts")
+            images = visual_inputs.get("image", [])
+            if (
+                not isinstance(image_token_counts, list)
+                or not isinstance(images, list)
+                or len(image_token_counts) != len(images)
+                or any(type(count) is not int or count < 0 for count in image_token_counts)
+            ):
+                raise OmniClientError("joyai_image_token_counts must contain one non-negative integer per image")
+            # ASR determines the query length. Apply the same history/visual
+            # eviction policy as direct observations only once it is known.
+            joyai_input["prompt"], images = render_joyai_session_prompt(
+                cached_processor_from_config(target_model_config),
+                system=context["system"],
+                history=context["history"],
+                query=transcript,
+                images=images,
+                image_token_counts=image_token_counts,
+                budget=budget,
+            )
+            visual_inputs = {"image": images} if images else {}
         if requires_multimodal_data and visual_inputs:
             joyai_input["multi_modal_data"] = visual_inputs
         if request_prompt.get("mm_processor_kwargs") is not None:

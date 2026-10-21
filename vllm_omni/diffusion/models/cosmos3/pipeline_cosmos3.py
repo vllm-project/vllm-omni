@@ -123,6 +123,7 @@ from .transformer_cosmos3 import Cosmos3VFMTransformer, _tf_config_get, resolve_
 from .transformer_cosmos3_edge import COSMOS3_EDGE_BACKBONE_TYPE, Cosmos3EdgeVFMTransformer
 from .utils import (
     COSMOS3_DEFAULT_CONDITION_FRAME_INDEXES_VISION,
+    COSMOS3_TRANSFER_CONTROL_DIRECTIVE_TEMPLATE,
     COSMOS3_VAE_TEMPORAL_COMPRESSION,
     ROBOLAB_CONCAT_VIEW_DESCRIPTION,
     ROBOLAB_DEFAULT_ACTION_CHUNK_SIZE,
@@ -179,10 +180,6 @@ COSMOS3_T2I_SYSTEM_PROMPT = "You are a helpful assistant who will generate image
 COSMOS3_TRANSFER_SYSTEM_PROMPT = (
     "You are a helpful assistant that generates images or videos following the user's instructions"
     " and control signals (edge maps, blur, depth, or segmentation)."
-)
-COSMOS3_TRANSFER_CONTROL_DIRECTIVE_TEMPLATE = (
-    "Follow the {hint_names} control video precisely: shape, contour, silhouette, position, and motion of every "
-    "visible structure must align with the {hint_names} signal at every frame."
 )
 
 COSMOS3_T2V_DEFAULT_HEIGHT = 720
@@ -1468,7 +1465,13 @@ class Cosmos3OmniDiffusersPipeline(
             if isinstance(cond_full, tuple) or isinstance(cond_no_control, tuple) or isinstance(uncond_full, tuple):
                 raise ValueError("Cosmos3 transfer control+text CFG expects video-only tensor predictions.")
             cfg_reference = cond_full
-            control_cond = cond_no_control + control_guidance * (cond_full - cond_no_control)
+            # Text CFG is applied below; avoid multiplying the control delta
+            # by text guidance a second time (Cosmos Framework parity).
+            # A zero text scale discards this branch, so keep a finite scale.
+            effective_control_guidance = (
+                control_guidance / guidance_scale if guidance_scale != 0.0 else control_guidance
+            )
+            control_cond = cond_no_control + effective_control_guidance * (cond_full - cond_no_control)
             combined = uncond_full + guidance_scale * (control_cond - uncond_full)
         else:
             raise ValueError(f"Unknown Cosmos3 transfer CFG branch_mode={mode!r}.")
@@ -3271,6 +3274,20 @@ class Cosmos3OmniDiffusersPipeline(
                     return detected
         return None
 
+    def _mask_transfer_noise(
+        self, noise: torch.Tensor, velocity_mask: torch.Tensor, shared_kwargs: dict[str, Any]
+    ) -> torch.Tensor:
+        return noise * velocity_mask
+
+    def _apply_transfer_condition(
+        self,
+        latents: torch.Tensor,
+        velocity_mask: torch.Tensor,
+        condition_latents: torch.Tensor,
+        shared_kwargs: dict[str, Any],
+    ) -> torch.Tensor:
+        return velocity_mask * latents + (1.0 - velocity_mask) * condition_latents
+
     def diffuse_transfer(
         self,
         latents: torch.Tensor,
@@ -3290,6 +3307,9 @@ class Cosmos3OmniDiffusersPipeline(
         condition_latents: torch.Tensor,
         guidance_interval: tuple[float, float] | None = None,
         generator: torch.Generator | None = None,
+        normalize_cfg: bool = False,
+        open_guidance_interval: bool = False,
+        text_cfg_below_one: bool = False,
     ) -> torch.Tensor:
         if getattr(self, "_use_session_state", False):
             raise NotImplementedError(
@@ -3303,7 +3323,7 @@ class Cosmos3OmniDiffusersPipeline(
                 return True
             t_scalar = float(t.item()) if torch.is_tensor(t) else float(t)
             lo, hi = interval
-            return lo <= t_scalar <= hi
+            return lo < t_scalar < hi if open_guidance_interval else lo <= t_scalar <= hi
 
         self.transformer.reset_cache()
         self._cosmos3_branch_caches = {}
@@ -3314,9 +3334,12 @@ class Cosmos3OmniDiffusersPipeline(
                 timestep = t.unsqueeze(0)
                 step_guidance = guidance_scale if _active_at(t, guidance_interval) else 1.0
                 step_control = control_guidance if _active_at(t, control_guidance_interval) else 1.0
-                needs_text_cfg = step_guidance > 1.0
+                # Guidance <= 1 disables text CFG, as in diffuse(). Callers that
+                # follow a reference which skips it only at exactly 1 opt in.
+                needs_text_cfg = step_guidance != 1.0 if text_cfg_below_one else step_guidance > 1.0
                 needs_control_cfg = step_control != 1.0
 
+                branches_kwargs = None
                 cond_full_kwargs = dict(
                     _cache_context="cond",
                     hidden_states=latents,
@@ -3362,7 +3385,7 @@ class Cosmos3OmniDiffusersPipeline(
                             "control_guidance": step_control,
                         },
                         branches_kwargs=branches_kwargs,
-                        cfg_normalize=False,
+                        cfg_normalize=normalize_cfg,
                     )
                 elif needs_control_cfg:
                     branches_kwargs = [
@@ -3386,7 +3409,7 @@ class Cosmos3OmniDiffusersPipeline(
                             "control_guidance": step_control,
                         },
                         branches_kwargs=branches_kwargs,
-                        cfg_normalize=False,
+                        cfg_normalize=normalize_cfg,
                     )
                 elif needs_text_cfg:
                     branches_kwargs = [
@@ -3411,13 +3434,16 @@ class Cosmos3OmniDiffusersPipeline(
                             "guidance_scale": step_guidance,
                         },
                         branches_kwargs=branches_kwargs,
-                        cfg_normalize=False,
+                        cfg_normalize=normalize_cfg,
                     )
                 else:
                     noise_pred = self.predict_noise(**cond_full_kwargs)
+                # CFG argument dictionaries otherwise retain the previous
+                # sample during the next transformer call.
+                del cond_full_kwargs, branches_kwargs
                 if isinstance(noise_pred, tuple):
                     raise ValueError("Cosmos3 transfer diffusion expects video-only tensor predictions.")
-                noise_pred = noise_pred * velocity_mask
+                noise_pred = self._mask_transfer_noise(noise_pred, velocity_mask, shared_kwargs)
                 latents = self.scheduler.step(
                     noise_pred,
                     t,
@@ -3425,8 +3451,13 @@ class Cosmos3OmniDiffusersPipeline(
                     generator=generator,
                     return_dict=False,
                 )[0]
-                latents = velocity_mask * latents + (1.0 - velocity_mask) * condition_latents
+                del noise_pred
+                latents = self._apply_transfer_condition(latents, velocity_mask, condition_latents, shared_kwargs)
         finally:
+            # Transfer runs to completion here. The solver's previous samples
+            # must not overlap VAE decoding (also release them on failure).
+            if isinstance(self.scheduler, FlowUniPCMultistepScheduler):
+                self.scheduler.clear_history()
             self._clear_denoise_step_metadata()
             self._reset_mixed_precision()
             self._cosmos3_branch_caches = None

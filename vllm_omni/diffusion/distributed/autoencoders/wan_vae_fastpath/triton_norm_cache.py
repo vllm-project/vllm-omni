@@ -23,8 +23,9 @@ from __future__ import annotations
 import torch
 from vllm.triton_utils import HAS_TRITON, tl, tldevice, triton
 
+from vllm_omni.diffusion.layers import vae_norm_epilogue as rn
+
 from . import triton_data_movement as dm
-from . import triton_rms_norm as rn
 from . import triton_rms_norm_cl as cl
 
 _DTYPES = (torch.float16, torch.bfloat16, torch.float32)

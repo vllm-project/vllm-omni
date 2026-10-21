@@ -46,7 +46,11 @@ QWEN3_OMNI_PIPELINE = PipelineConfig(
             custom_process_next_stage_input_func=(f"{_PROC}.thinker2talker_full_payload"),
             async_chunk_process_next_stage_input_func=(f"{_PROC}.thinker2talker_async_chunk"),
             # Takes effect only when the deploy selects model_runner v2 for this stage.
+            # Duplex commits each utterance as a fresh request, so the turn-mode
+            # native data plane also serves duplex. Resumable streaming input
+            # stays on the V1 prompt-replacement path.
             supports_native_mrv2_data_plane=True,
+            supports_duplex_mrv2=True,
             sampling_constraints={"detokenize": True},
         ),
         StagePipelineConfig(
@@ -61,6 +65,7 @@ QWEN3_OMNI_PIPELINE = PipelineConfig(
             async_chunk_process_next_stage_input_func=(f"{_PROC}.talker2code2wav_async_chunk"),
             # Each stage can use MRv2 when its deploy selects model_runner v2.
             supports_native_mrv2_data_plane=True,
+            supports_duplex_mrv2=True,
             sampling_constraints={
                 "detokenize": False,
                 "stop_token_ids": [2150],
@@ -77,6 +82,7 @@ QWEN3_OMNI_PIPELINE = PipelineConfig(
             hf_config_name="thinker_config",
             engine_output_type="audio",
             supports_native_mrv2_data_plane=True,
+            supports_duplex_mrv2=True,
             sampling_constraints={"detokenize": True},
             requires_full_payload_input=True,
         ),

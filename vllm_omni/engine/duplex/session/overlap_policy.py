@@ -306,6 +306,22 @@ def input_audio_duration_ms(event: dict[str, object], payload: dict[str, object]
 
 
 def merge_audio_payloads(first: dict[str, object], second: dict[str, object]) -> dict[str, object]:
+    merged_frames = [
+        frame
+        for source in (first.get("video_frames"), second.get("video_frames"))
+        if isinstance(source, list)
+        for frame in source
+        if isinstance(frame, str) and frame
+    ]
+    if (
+        first.get("format") == "pcm_f32le"
+        and first.get("audio")
+        and not second.get("audio")
+        and second.get("video_frames")
+    ):
+        # Keep retained speech and its transcript owner. Frames accumulate in
+        # capture order; each model applies its own visual-window policy.
+        return {**first, "video_frames": merged_frames}
     if first.get("format") != "pcm_f32le" or second.get("format") != "pcm_f32le":
         return second
     first_rate = first.get("sample_rate_hz")
@@ -324,13 +340,20 @@ def merge_audio_payloads(first: dict[str, object], second: dict[str, object]) ->
     merged = dict(second)
     merged["audio"] = base64.b64encode(first_raw + second_raw).decode("ascii")
     merged["sample_rate_hz"] = first_rate
-    merged_frames = [
-        frame
-        for source in (first.get("video_frames"), second.get("video_frames"))
-        if isinstance(source, list)
-        for frame in source
-        if isinstance(frame, str) and frame
-    ]
+    merged.pop("committed_audio_segments", None)
+    segments = []
+    for source, raw in ((first, first_raw), (second, second_raw)):
+        source_segments = source.get("committed_audio_segments")
+        if isinstance(source_segments, list):
+            segments.extend(source_segments)
+        elif isinstance(source.get("realtime_item_id"), str):
+            segments.append({"item_id": source["realtime_item_id"], "byte_count": len(raw)})
+        else:
+            break
+    else:
+        # Preserve API commit boundaries even when a model consumes the PCM as
+        # one buffer. ASR-backed plugins can transcribe each item independently.
+        merged["committed_audio_segments"] = segments
     if merged_frames:
         merged["video_frames"] = merged_frames
     else:

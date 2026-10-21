@@ -55,8 +55,8 @@
         "baseline": {
           "H100": {
             "request_throughput": 1.1958,
-            "mean_e2el_ms": 843.0,
-            "mean_peak_memory_mb": 80000.0
+            "mean_e2el_ms": 837.8462,
+            "mean_peak_memory_mb": 19571.1429
           }
         }
       }
@@ -122,9 +122,9 @@
         },
         "baseline": {
           "H100": {
-            "request_throughput": 0.0307,
-            "mean_e2el_ms": 32766.5,
-            "mean_peak_memory_mb": 28762.4762
+            "request_throughput": 0.0394,
+            "mean_e2el_ms": 25428.4168,
+            "mean_peak_memory_mb": 27080.0
           }
         }
       }
@@ -197,9 +197,9 @@
         },
         "baseline": {
           "H100": {
-            "request_throughput": 0.0305,
-            "mean_e2el_ms": 33100.9,
-            "mean_peak_memory_mb": 29441.1429
+            "request_throughput": 0.0387,
+            "mean_e2el_ms": 25860.7593,
+            "mean_peak_memory_mb": 27080.0
           }
         }
       }
@@ -277,9 +277,9 @@
         },
         "baseline": {
           "H100": {
-            "request_throughput": 0.0299,
-            "mean_e2el_ms": 33925.0,
-            "mean_peak_memory_mb": 29443.1429
+            "request_throughput": 0.0367,
+            "mean_e2el_ms": 26717.7842,
+            "mean_peak_memory_mb": 27792.0
           }
         }
       }

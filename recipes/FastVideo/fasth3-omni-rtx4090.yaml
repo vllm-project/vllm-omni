@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+trust-remote-code: true
+enforce-eager: true
+num-gpus: 1
+task-type: ref2va
+quantization: fp8
+vae-use-tiling: true
+# Use rotating rank-local buffers and stage the native video/audio VAEs.
+# The compact dit/text_encoder selector keeps those large VAEs resident.
+enable-distributed-layerwise-offload: true
+dlo-no-use-allgather: true
+diffusion-attention-config:
+  default:
+    backend: FASTVIDEO_VSA
+    fastvideo_vsa_provider: triton
+default-sampling-params:
+  "0":
+    num_inference_steps: 8
+    guidance_scale: 1
+init-timeout: 3600
+stage-init-timeout: 3600
