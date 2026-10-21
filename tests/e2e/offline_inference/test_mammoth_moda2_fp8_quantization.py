@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import math
 import os
+from typing import Any
 
 import pytest
 import torch
@@ -61,10 +62,10 @@ QUANTIZATION_CASES = [None, "fp8"]
 _CUDA_ONLY = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA GPU")
 
 # Token agreement is reported only: one greedy-token change can shift the
-# continuation and make positional agreement misleading. Require at least two
-# identical initial tokens before scoring shared-prefix logprob similarity,
-# matching the MammothModa2 INT8 A/B gate.
-MIN_SHARED_PREFIX = 2
+# continuation and make positional agreement misleading. Require at least five
+# identical initial tokens so scoring extends beyond the first four tokens
+# that echo the prompt in the Preview run.
+MIN_SHARED_PREFIX = 5
 
 # Minimum cosine similarity between BF16 and quantized top-1 logprobs on the
 # shared greedy prefix. Steps from divergent continuations are not scored.
@@ -101,7 +102,7 @@ def _stage_config(quantization: str | None) -> str:
 
     base = get_deploy_config_path("mammoth_moda2_ar.yaml")
     # OmniRunner stores its seed but does not forward it to the engine.
-    updates = {"stages": {0: {"seed": _SEED}}}
+    updates: dict[str, Any] = {"stages": {0: {"seed": _SEED}}}
     if quantization is None:
         return modify_stage_config(base, updates=updates, deletes={"stages": {0: ["quantization"]}})
     updates["stages"][0]["quantization"] = quantization
@@ -278,7 +279,7 @@ def _t2i_stage_config(quantization: str | None) -> str:
     base = get_deploy_config_path("mammoth_moda2.yaml")
     # Only the AR engine accepts a deployment seed. DiT must receive its seed
     # through request sampling parameters (see dit_sampling below).
-    updates = {"stages": {0: {"seed": _SEED}}}
+    updates: dict[str, Any] = {"stages": {0: {"seed": _SEED}}}
     if quantization is None:
         return modify_stage_config(base, updates=updates, deletes={"stages": {0: ["quantization"]}})
     updates["stages"][0]["quantization"] = quantization
