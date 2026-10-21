@@ -29,6 +29,8 @@ from vllm_omni.diffusion.forward_context import (
     DenoiseProgressMixin,
     begin_scheduled_denoise,
     clear_scheduled_denoise_step_on_exit,
+    get_forward_context,
+    is_forward_context_available,
 )
 from vllm_omni.diffusion.lora.loader import WanLoraLoaderMixin
 from vllm_omni.diffusion.media import (
@@ -711,10 +713,22 @@ class Wan22Pipeline(
         # Checks a bound attention schedule against the actual sequence (3 steps for DMD) and returns its
         # length; None without a schedule, so unscheduled runs publish no total.
         total_steps = begin_scheduled_denoise(len(timesteps))
+        sigma_scheduled = is_forward_context_available() and bool(get_forward_context().attention_sigma_schedule)
         with self.progress_bar(total=len(timesteps)) as pbar, clear_scheduled_denoise_step_on_exit(total_steps):
             for step_idx, t in enumerate(timesteps):
                 self._current_timestep = t
-                self.record_denoise_step(step_idx, t, total_steps=total_steps)
+                self.record_denoise_step(
+                    step_idx,
+                    t,
+                    total_steps=total_steps,
+                    # DMD bypasses set_timesteps; its fixed flow timesteps are
+                    # sigma * num_train_timesteps, not scheduler.sigmas.
+                    normalized_sigma=(
+                        float(t) / self.scheduler.config.num_train_timesteps
+                        if self.is_dmd and sigma_scheduled
+                        else None
+                    ),
+                )
 
                 # Select model based on timestep and boundary_ratio
                 # High noise stage (t >= boundary_timestep): use transformer

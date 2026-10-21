@@ -21,7 +21,7 @@ from vllm_omni.diffusion.attention.backends.fastvideo_vsa import FastVideoVSABac
 from vllm_omni.diffusion.attention.backends.sdpa import SDPABackend
 from vllm_omni.diffusion.attention.backends.vdnh3_attn import VDNAttentionBackend
 from vllm_omni.diffusion.attention.parallel.base import NoParallelAttention
-from vllm_omni.diffusion.attention.schedule import AttentionScheduleRange
+from vllm_omni.diffusion.attention.schedule import AttentionScheduleRange, parse_attention_sigma_schedule
 from vllm_omni.diffusion.forward_context import (
     bind_attention_schedule,
     get_attention_schedule_profile,
@@ -542,6 +542,7 @@ def test_both_modes_publish_denoise_progress_for_gated_attention():
         def __init__(self):
             self.denoise_step_idx = None
             self.denoise_timestep = None
+            self.attention_sigma_schedule = None
 
         def __setattr__(self, name, value):
             object.__setattr__(self, name, value)
@@ -597,7 +598,7 @@ def test_mixed_step_batch_leaves_gated_attention_dense():
     ]
     states[1].step_index = 2  # admitted later, so it trails the batch
 
-    recorder = SimpleNamespace(denoise_step_idx="unset", denoise_timestep="unset")
+    recorder = SimpleNamespace(denoise_step_idx="unset", denoise_timestep="unset", attention_sigma_schedule=None)
     original = fc._forward_context
     fc._forward_context = recorder
     try:
@@ -672,6 +673,40 @@ def test_scheduled_mixed_step_batch_runs_each_request_under_its_own_progress():
     assert after == (None, None, None, None)
     # One forward per request computes the same velocities as the packed forward.
     torch.testing.assert_close(velocity, packed_velocity)
+
+
+def test_sigma_step_batch_isolates_equal_step_requests_with_different_noise():
+    seen = []
+
+    class _SigmaModel(_ProgressRecordingModel):
+        def __call__(self, **kwargs):
+            ctx = get_forward_context()
+            seen.append(
+                (
+                    ctx.denoise_step_idx,
+                    ctx.denoise_sigma,
+                    get_attention_schedule_profile(),
+                    kwargs["packed_seq_params"].get("num_requests", 1),
+                )
+            )
+            return super().__call__(**kwargs)
+
+    model = _SigmaModel()
+    states = _mixed_progress_states(model)
+    for state, sigma in zip(states, [0.8, 0.2]):
+        state.step_index = 1
+        state.extra[pipeline_minimax_h3._STEP_SIGMAS_VIDEO][1] = sigma
+    windows = parse_attention_sigma_schedule(
+        [
+            {"low": 0.0, "high": 0.3, "profile": "low"},
+            {"low": 0.3, "high": 1.0, "profile": "high"},
+        ]
+    )
+    with set_forward_context(), bind_attention_schedule(None, windows):
+        _step_pipeline(model).denoise_step(InputBatch.make_batch(states), states=states)
+        assert get_forward_context().denoise_sigma is None
+        assert get_attention_schedule_profile() is None
+    assert seen == [(1, 0.8, "high", 1), (1, 0.2, "low", 1)]
 
 
 def test_scheduled_request_loop_restarts_progress_for_each_denoise_sequence():

@@ -2397,7 +2397,8 @@ class HunyuanImage3Pipeline(
             )
         # A bound schedule selects attention from each request's own step and total, so requests
         # run one at a time and the batch-wide backend check, which reads the baseline config, is skipped.
-        scheduled = is_forward_context_available() and bool(get_forward_context().attention_schedule)
+        ctx = get_forward_context() if is_forward_context_available() else None
+        scheduled = ctx is not None and bool(ctx.attention_schedule or ctx.attention_sigma_schedule)
         if scheduled:
             groups = [[state] for state in states]
         else:
@@ -2413,16 +2414,17 @@ class HunyuanImage3Pipeline(
 
     @staticmethod
     def _scheduled_request_progress(state: "StepRequestState"):
-        """Publish one scheduled request's step, actual total and normalized timestep around its group.
+        """Publish one scheduled request's step, actual total, normalized timestep and sigma around its group.
 
         _denoise_step_group republishes the same step and clears it after its forward; the returned
         context manager restores the step, timestep and total on any exit.
         """
-        timestep = (
-            float(cast(torch.Tensor, state.current_timestep))
-            / cast(FlowMatchEulerDiscreteScheduler, state.scheduler).config.num_train_timesteps
-        )
-        return request_denoise_progress(state.step_index, state.total_steps, timestep)
+        scheduler = cast(FlowMatchEulerDiscreteScheduler, state.scheduler)
+        timestep = float(cast(torch.Tensor, state.current_timestep)) / scheduler.config.num_train_timesteps
+        sigma = None
+        if get_forward_context().attention_sigma_schedule:
+            sigma = DenoiseProgressMixin._denoise_sigma(state.step_index, scheduler, None)
+        return request_denoise_progress(state.step_index, state.total_steps, timestep, sigma=sigma)
 
     def step_scheduler(
         self,

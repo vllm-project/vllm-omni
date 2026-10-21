@@ -2693,13 +2693,13 @@ def _clear_denoise_progress_on_exit():
     restore assigns the values those fields already hold.
     """
     ctx = get_forward_context() if is_forward_context_available() else None
-    previous = (ctx.denoise_timestep, ctx.total_denoise_steps) if ctx is not None else (None, None)
+    previous = (ctx.denoise_timestep, ctx.total_denoise_steps, ctx.denoise_sigma) if ctx is not None else (None,) * 3
     try:
         yield
     finally:
         set_forward_context_denoise_step_idx(None)
         if ctx is not None:
-            ctx.denoise_timestep, ctx.total_denoise_steps = previous
+            ctx.denoise_timestep, ctx.total_denoise_steps, ctx.denoise_sigma = previous
 
 
 class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):

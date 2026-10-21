@@ -2492,14 +2492,27 @@ def test_decode_only_stage_drops_the_request_schedule_copied_to_it(model_class_n
         ),
         request_id="req",
     )
+    sigma_request = OmniDiffusionRequest(
+        prompt="prompt",
+        sampling_params=OmniDiffusionSamplingParams(
+            num_inference_steps=1,
+            extra_args={"attention_sigma_schedule": [{"low": 0.0, "high": 1.0, "profile": "sparse"}]},
+        ),
+        request_id="sigma-req",
+    )
 
     if admitted:
         scheduler.add_request(request)
         assert request.sampling_params.attention_schedule is None
         assert "attention_schedule" not in request.sampling_params.extra_args
+        scheduler.add_request(sigma_request)
+        assert sigma_request.sampling_params.attention_sigma_schedule is None
+        assert "attention_sigma_schedule" not in sigma_request.sampling_params.extra_args
     else:
         with pytest.raises(ValueError, match="unknown profile"):
             scheduler.add_request(request)
+        with pytest.raises(ValueError, match="unknown profile"):
+            scheduler.add_request(sigma_request)
 
 
 # (stage_role, model_stage) of the Wan2.2 topology stages, plus deploy configs that set only the

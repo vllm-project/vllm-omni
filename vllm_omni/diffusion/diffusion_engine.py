@@ -1751,6 +1751,7 @@ class DiffusionEngine:
                 # Warm up the base attention only: service ranges are sized for real
                 # requests, not for the fixed short warm-up sequence.
                 attention_schedule=(),
+                attention_sigma_schedule=(),
             ),
         )
 

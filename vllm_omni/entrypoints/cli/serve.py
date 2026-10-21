@@ -868,11 +868,15 @@ class OmniServeCommand(CLISubcommand):
             "--diffusion-attention-schedule",
             type=_json_object,
             default=None,
-            help="Startup attention profiles and default step ranges as JSON or dotted flags. "
-            "Each profile is an independent attention config; ranges use zero-based [start, end) steps, "
-            "with null end meaning the actual sequence end. "
+            help="Startup attention profiles with either default step ranges or sigma noise windows, as JSON "
+            "or dotted flags. Each profile is an independent attention config. Step ranges use zero-based "
+            "[start, end), with null end meaning the actual sequence end. Sigma windows use normalized "
+            "[low, high) noise in [0, 1]; a high of 1 includes 1. Non-empty default and sigma lists "
+            "are mutually exclusive. "
             'Example: \'{"profiles": {"dense": {"default": "TORCH_SDPA"}}, '
-            '"default": [{"start": 3, "end": null, "profile": "dense"}]}\'.',
+            '"default": [{"start": 3, "end": null, "profile": "dense"}]}\'. Sigma example: '
+            '\'{"profiles": {"dense": {"default": "TORCH_SDPA"}}, '
+            '"sigma": [{"low": 0.0, "high": 0.3, "profile": "dense"}]}\'.',
         )
 
         # Cache optimization parameters

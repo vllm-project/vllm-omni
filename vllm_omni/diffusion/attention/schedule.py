@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-"""Immutable integer-step schedules, independent of torch and attention backends."""
+"""Immutable step and normalized-noise schedules, independent of torch backends."""
 
+import math
 from collections.abc import Collection, Iterable, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, TypeAlias
@@ -190,8 +191,8 @@ ATTENTION_SCHEDULE_PIPELINES: Mapping[str, str] = {
 # Two kinds of diffusion stage run no denoising: a decode-only pipeline class listed here, and a
 # stage whose role loads no DiT, such as the encode stage of a Wan2.2 EG or EGD deployment and the
 # EGD decode stage, which use the same pipeline class as the denoising stage. Multi-stage endpoints
-# copy the request's diffusion params to every diffusion stage, so these stages drop the request
-# schedule instead of rejecting it.
+# copy the request's diffusion params to every diffusion stage, so these stages drop the request's
+# step ranges and sigma windows instead of rejecting them.
 DECODE_ONLY_PIPELINES = frozenset({"MiniMaxH3DecoderPipeline"})
 
 
@@ -208,8 +209,7 @@ def unsupported_attention_schedule_error(reason: str) -> ValueError:
     models = ", ".join(sorted(set(ATTENTION_SCHEDULE_PIPELINES.values())))
     return ValueError(
         f"Unsupported diffusion_attention_schedule: {reason}. Attention schedules currently support "
-        f"step ranges ('profiles' and 'default') on {models} only. Remove the schedule, or the "
-        "unsupported part, from this model's config."
+        f"{models} only. Remove the schedule from this model's config."
     )
 
 
@@ -234,3 +234,136 @@ def select_attention_profile(schedule: AttentionSchedule, step_index: int, *, to
         if entry.end is None or step_index < entry.end:
             return entry.profile
     return None
+
+
+_SIGMA_FIELDS = frozenset({"low", "high", "profile"})
+
+
+def _validate_sigma(value: float, name: str) -> None:
+    if isinstance(value, bool) or type(value) not in (int, float):
+        raise TypeError(f"attention_sigma_schedule {name} must be a number, got {value!r}")
+    if not 0.0 <= float(value) <= 1.0:  # also rejects NaN and infinities
+        raise ValueError(f"attention_sigma_schedule {name} must be in [0, 1], got {value!r}")
+
+
+@dataclass(frozen=True)
+class AttentionSigmaWindow:
+    """Select a profile on [low, high); a window ending at 1 also includes 1."""
+
+    low: float
+    high: float
+    profile: str
+
+    def __post_init__(self) -> None:
+        _validate_sigma(self.low, "low")
+        _validate_sigma(self.high, "high")
+        if self.high <= self.low:
+            raise ValueError("attention_sigma_schedule high must be greater than low")
+        validate_attention_profile_name(self.profile)
+
+
+AttentionSigmaSchedule: TypeAlias = tuple[AttentionSigmaWindow, ...]
+
+
+def parse_attention_sigma_schedule(value: object) -> AttentionSigmaSchedule | None:
+    """Detach sigma windows. None inherits, an empty tuple disables."""
+    if value is None:
+        return None
+    if not isinstance(value, (list, tuple)):
+        raise TypeError("attention_sigma_schedule must be a list of windows or None")
+    windows: list[AttentionSigmaWindow] = []
+    for item in value:
+        if isinstance(item, AttentionSigmaWindow):
+            entry = item
+        elif isinstance(item, Mapping):
+            if set(item) != _SIGMA_FIELDS:
+                raise ValueError("attention_sigma_schedule windows require exactly low, high and profile")
+            entry = AttentionSigmaWindow(**dict(item))
+        else:
+            raise TypeError("attention_sigma_schedule entries must be mappings or AttentionSigmaWindow objects")
+        if windows and entry.low < windows[-1].high:
+            raise ValueError("attention_sigma_schedule windows must be ordered and must not overlap")
+        windows.append(entry)
+    return tuple(windows)
+
+
+def validate_attention_sigma_schedule(
+    schedule: AttentionSigmaSchedule,
+    *,
+    profiles: Collection[str] | None = None,
+) -> None:
+    """Reject windows that name a profile outside ``profiles``."""
+    if profiles is not None:
+        unknown = sorted({entry.profile for entry in schedule if entry.profile not in profiles})
+        if unknown:
+            raise ValueError(f"attention_sigma_schedule references unknown profile(s): {unknown}")
+
+
+def resolve_attention_sigma_schedule(
+    request_schedule: object,
+    default_schedule: object,
+    *,
+    profiles: Collection[str],
+) -> AttentionSigmaSchedule:
+    effective = parse_attention_sigma_schedule(default_schedule if request_schedule is None else request_schedule)
+    schedule = () if effective is None else effective
+    validate_attention_sigma_schedule(schedule, profiles=profiles)
+    return schedule
+
+
+def normalized_sigma(current: float, reference: float = 1.0) -> float:
+    """Normalize scheduler noise; flow-matching sigma already uses reference=1."""
+    if isinstance(current, bool) or isinstance(reference, bool):
+        raise TypeError("normalized sigma inputs must be numbers")
+    current, reference = float(current), float(reference)
+    if not math.isfinite(reference) or reference <= 0:
+        raise ValueError("normalized sigma reference must be finite and positive")
+    value = current / reference
+    if not 0.0 <= value <= 1.0:
+        raise ValueError(f"normalized scheduler sigma must be in [0, 1], got {value!r} ({current!r} / {reference!r})")
+    return value
+
+
+def select_attention_profile_by_sigma(schedule: AttentionSigmaSchedule, sigma: float) -> str | None:
+    """Return the selected name, or None when the normalized sigma is in a gap.
+
+    The windows were validated at admission; ``sigma`` comes from normalized_sigma.
+    """
+    for entry in schedule:
+        if entry.low <= float(sigma) < entry.high or entry.high == sigma == 1.0:
+            return entry.profile
+    return None
+
+
+def resolve_request_attention_sigma_schedule(
+    sampling_params: "OmniDiffusionSamplingParams", service: "AttentionScheduleConfig | None"
+) -> AttentionSigmaSchedule:
+    """Resolve one request's sigma windows against the service configuration."""
+    if service is None:
+        return resolve_attention_sigma_schedule(sampling_params.attention_sigma_schedule, (), profiles=())
+    return resolve_attention_sigma_schedule(
+        sampling_params.attention_sigma_schedule, service.sigma, profiles=service.profiles
+    )
+
+
+def resolve_batch_attention_sigma_schedule(
+    sampling_params: Iterable["OmniDiffusionSamplingParams"], service: "AttentionScheduleConfig | None"
+) -> AttentionSigmaSchedule:
+    """One resolved set of sigma windows for a batch. Different windows must not share a denoise forward."""
+    resolved = {resolve_request_attention_sigma_schedule(params, service) for params in sampling_params}
+    if len(resolved) > 1:
+        raise ValueError("attention_sigma_schedule values in one batch must be identical")
+    return resolved.pop() if resolved else ()
+
+
+def validate_request_attention_schedules(
+    sampling_params: "OmniDiffusionSamplingParams", service: "AttentionScheduleConfig | None"
+) -> None:
+    """Resolve a request's step ranges and sigma windows at admission and reject using both."""
+    step_schedule = resolve_request_attention_schedule(sampling_params, service)
+    sigma_schedule = resolve_request_attention_sigma_schedule(sampling_params, service)
+    if step_schedule and sigma_schedule:
+        raise ValueError(
+            "a request cannot combine attention_schedule with attention_sigma_schedule, including one inherited "
+            "from the server default; send attention_schedule=[] or attention_sigma_schedule=[] to disable the other"
+        )
