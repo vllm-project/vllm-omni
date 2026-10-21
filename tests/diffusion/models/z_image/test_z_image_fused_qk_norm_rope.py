@@ -10,6 +10,7 @@ import torch
 from vllm.triton_utils import HAS_TRITON
 
 from tests.helpers.mark import hardware_marks
+from vllm_omni.platforms import current_omni_platform
 
 pytestmark = [pytest.mark.core_model, *hardware_marks(res={"cuda": "L4"}, num_cards=1), pytest.mark.diffusion]
 
@@ -25,8 +26,6 @@ def _dist_env():
         init_distributed_environment,
         initialize_model_parallel,
     )
-
-    from vllm_omni.platforms import current_omni_platform
 
     os.environ.setdefault("MASTER_ADDR", "localhost")
     os.environ.setdefault("MASTER_PORT", "29519")
@@ -48,7 +47,7 @@ def test_packed_table_skipped_on_cpu():
     assert _packed_qk_norm_rope_table(cos, sin, torch.bfloat16) is None
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.skipif(not current_omni_platform.is_cuda() or not torch.cuda.is_available(), reason="NVIDIA CUDA required")
 @pytest.mark.skipif(not HAS_TRITON, reason="Triton required")
 def test_packed_table_uses_row_zero_like_rotary_embedding():
     from vllm_omni.diffusion.models.z_image.z_image_transformer import _packed_qk_norm_rope_table
@@ -61,7 +60,7 @@ def test_packed_table_uses_row_zero_like_rotary_embedding():
     assert _packed_qk_norm_rope_table(cos, sin, torch.float16) is None
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.skipif(not current_omni_platform.is_cuda() or not torch.cuda.is_available(), reason="NVIDIA CUDA required")
 @pytest.mark.skipif(not HAS_TRITON, reason="Triton required")
 def test_packed_table_is_built_under_sequence_parallelism():
     from vllm_omni.diffusion.data import OmniDiffusionConfig
@@ -86,7 +85,7 @@ def test_packed_table_is_built_under_sequence_parallelism():
         assert torch.equal(_packed_qk_norm_rope_table(cos, sin, torch.bfloat16), expected.repeat(3, 1))
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.skipif(not current_omni_platform.is_cuda() or not torch.cuda.is_available(), reason="NVIDIA CUDA required")
 @pytest.mark.skipif(not HAS_TRITON, reason="Triton required")
 @pytest.mark.parametrize("compiled", [False, True])
 def test_z_image_attention_fused_matches_eager(_dist_env, compiled, mocker):
@@ -94,12 +93,20 @@ def test_z_image_attention_fused_matches_eager(_dist_env, compiled, mocker):
     (``fullgraph=True``): the fused custom op is traced into the graph and its
     output stays within BF16 rounding of the compiled chain, whose RMSNorm is
     Inductor's and reduces in a different order."""
+    from vllm_omni.diffusion.config import set_current_diffusion_config
+    from vllm_omni.diffusion.data import AttentionConfig, OmniDiffusionConfig
     from vllm_omni.diffusion.models.z_image import z_image_transformer as z_image
-    from vllm_omni.platforms import current_omni_platform
 
     torch.manual_seed(3)
-    with torch.device("cuda"):
+    # Keep the fullgraph fusion check independent of FlashAttention's device
+    # probing and fake-op support. Eager execution retains the default backend.
+    od_config = OmniDiffusionConfig(
+        diffusion_attention_config=AttentionConfig(default="TORCH_SDPA") if compiled else AttentionConfig()
+    )
+    with set_current_diffusion_config(od_config), torch.device("cuda"):
         attn = z_image.ZImageAttention(dim=_DIM, num_heads=_HEADS, num_kv_heads=_HEADS, eps=1e-6)
+    if compiled:
+        assert attn.attn.attn_backend.get_name() == "TORCH_SDPA"
     attn = attn.to(torch.bfloat16).eval()
     with torch.no_grad():
         for p in attn.parameters():
