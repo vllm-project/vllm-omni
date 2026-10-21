@@ -19,6 +19,7 @@ import pytest
 from vllm_omni.engine.orchestrator import (
     OrchestratorRequestState,
     _stamp_transfer_gen,
+    _state_transfer_gen,
 )
 from vllm_omni.engine.stage_engine_core_proc import StageEngineCoreProc
 
@@ -48,6 +49,19 @@ class TestStampTransferGen:
         out = _stamp_transfer_gen(req, "0")
         assert out is req
         assert req.payload_sender_info == {}
+
+    def test_stamps_dict_argument_directly(self):
+        # The mid-pipeline routing path passes the freshly built
+        # payload_sender_info dict itself; the stamp must land in it, not
+        # be swallowed as an attribute-set failure.
+        info = {"rank": 1}
+        out = _stamp_transfer_gen(info, "abcd1234")
+        assert out is info
+        assert info == {"rank": 1, "transfer_gen": "abcd1234"}
+
+    def test_state_transfer_gen_reads_unstamped_state_as_zero(self):
+        assert _state_transfer_gen(SimpleNamespace()) == "0"
+        assert _state_transfer_gen(SimpleNamespace(transfer_generation="aa11")) == "aa11"
 
     def test_state_defaults_to_zero_gen(self):
         state = OrchestratorRequestState(request_id="r1")
