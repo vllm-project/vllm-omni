@@ -1,5 +1,9 @@
 // Adapted from vLLM-Omni's Apache-2.0 streaming_video_generation/video-stream-view.js.
 // Copyright contributors to the vLLM-Omni project.
+
+// Save hands the received fMP4 fragments to the browser as one MP4 download.
+const MAX_RECORDED_BYTES = 256 * 1024 * 1024;
+
 export function cameraEvent(keys, eventId, { fps = 16, speed = 1 } = {}) {
   if (!Number.isFinite(fps) || fps <= 0 || !Number.isFinite(speed) || speed < 0) {
     throw new Error("Camera FPS must be positive and speed must be non-negative.");
@@ -50,6 +54,14 @@ export class VideoSession {
     this.playbackTimer = null;
     this.lastPlaybackPosition = -1;
     this.lastProgress = 0;
+    // The take is kept so Save can hand it to the browser as a download.
+    this.recorded = [];
+    this.recordedBytes = 0;
+    this.recordingTruncated = false;
+    // Session identity and progress, read by the interaction panel's stats line.
+    this.requestId = null;
+    this.chunkIndex = null;
+    this.framesReceived = 0;
     video.addEventListener("play", () => {
       if (this.source) this.playbackStarted = true;
     });
@@ -63,6 +75,12 @@ export class VideoSession {
 
   start(config) {
     this.dispose();
+    this.recorded = [];
+    this.recordedBytes = 0;
+    this.recordingTruncated = false;
+    this.requestId = null;
+    this.chunkIndex = null;
+    this.framesReceived = 0;
     if (location.protocol === "https:" && !config.url.startsWith("wss://")) {
       throw new Error("An HTTPS ComfyUI page requires a wss:// Omni endpoint.");
     }
@@ -110,12 +128,16 @@ export class VideoSession {
           if (typeof data === "string") {
             try { this.control(JSON.parse(data)); }
             catch (error) { this.fail(error.message); }
-          } else if (!this.done && !this.stopping) {
-            this.queue.push(data);
-            this.queuedBytes += data.byteLength;
-            // Guard bytes that have not yet reached MSE, independently of playback feedback.
-            if (this.queuedBytes > 32 * 1024 * 1024) this.fail("Video backlog exceeded 32 MiB; restart with fewer frames.");
-            else this.pump();
+          } else {
+            // Keep the bytes even after generation is done, so Save can download the whole take.
+            this.capture(data);
+            if (!this.done && !this.stopping) {
+              this.queue.push(data);
+              this.queuedBytes += data.byteLength;
+              // Guard bytes that have not yet reached MSE, independently of playback feedback.
+              if (this.queuedBytes > 32 * 1024 * 1024) this.fail("Video backlog exceeded 32 MiB; restart with fewer frames.");
+              else this.pump();
+            }
           }
         };
         ws.onerror = () => { if (this.ws === ws) this.fail("WebSocket failed; check the Omni address and server log."); };
@@ -129,11 +151,14 @@ export class VideoSession {
   }
 
   control(message) {
+    if (typeof message.request_id === "string") this.requestId = message.request_id;
     if (message.type === "error") {
       this.fail(`${message.message || "Server error"}. Keyboard mode requires Omni camera interaction support.`);
     } else if (message.type === "video.chunk_metadata") {
       if (message.kind === "media") {
         this.ready = !this.stopping;
+        if (Number.isInteger(message.generation_chunk_index)) this.chunkIndex = message.generation_chunk_index;
+        if (Number.isFinite(message.num_frames)) this.framesReceived += message.num_frames;
         const applied = message.started_event_ids || [];
         this.report(`Chunk ${message.generation_chunk_index ?? "?"} received` +
           (applied.length ? `; applied: ${applied.join(", ")}` : ""));
@@ -187,6 +212,21 @@ export class VideoSession {
     this.video.play().catch(error => {
       if (this.source === source && error.name === "NotAllowedError") this.report("Click the video play button to allow playback.");
     });
+  }
+
+  // Save keeps the fMP4 bytes this client received, capped so a long session cannot exhaust memory.
+  capture(data) {
+    if (!(data instanceof ArrayBuffer)) return;
+    if (this.recordedBytes + data.byteLength > MAX_RECORDED_BYTES) {
+      this.recordingTruncated = true;
+      return;
+    }
+    this.recorded.push(data);
+    this.recordedBytes += data.byteLength;
+  }
+
+  recordingBlob() {
+    return this.recorded.length ? new Blob(this.recorded, { type: "video/mp4" }) : null;
   }
 
   stop() {
