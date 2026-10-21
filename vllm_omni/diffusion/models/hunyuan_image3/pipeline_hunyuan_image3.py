@@ -2417,7 +2417,7 @@ class HunyuanImage3Pipeline(
         """Publish one scheduled request's step, actual total, normalized timestep and sigma around its group.
 
         _denoise_step_group republishes the same step and clears it after its forward; the returned
-        context manager restores the step, timestep and total on any exit.
+        context manager restores the step, timestep, total and sigma on any exit.
         """
         scheduler = cast(FlowMatchEulerDiscreteScheduler, state.scheduler)
         timestep = float(cast(torch.Tensor, state.current_timestep)) / scheduler.config.num_train_timesteps

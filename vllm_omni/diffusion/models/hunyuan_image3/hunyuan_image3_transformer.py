@@ -2687,10 +2687,10 @@ class HunyuanImage3Text2ImagePipelineOutput(BaseOutput):
 
 @contextmanager
 def _clear_denoise_progress_on_exit():
-    """Clear the published denoise step on any exit and restore the timestep and total seen on entry.
+    """Clear the published denoise step on any exit and restore the timestep, total and sigma seen on entry.
 
-    The denoise loop publishes a timestep and total only when a schedule is bound; without one, the
-    restore assigns the values those fields already hold.
+    The denoise loop publishes a timestep, total and sigma only when a schedule is bound; without one,
+    the restore assigns the values those fields already hold.
     """
     ctx = get_forward_context() if is_forward_context_available() else None
     previous = (ctx.denoise_timestep, ctx.total_denoise_steps, ctx.denoise_sigma) if ctx is not None else (None,) * 3

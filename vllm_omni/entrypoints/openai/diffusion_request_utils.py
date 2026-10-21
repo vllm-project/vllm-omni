@@ -107,8 +107,8 @@ def apply_normalized_diffusion_request_extra_args(
 ) -> None:
     """Overlay request extras without discarding stage defaults.
 
-    A request ``attention_schedule`` moves onto the typed field and replaces a stage default there;
-    an invalid one raises a 400 client error before dispatch.
+    A request ``attention_schedule`` or ``attention_sigma_schedule`` moves onto its typed field and
+    replaces a stage default there; an invalid one raises a 400 client error before dispatch.
     """
     if normalized_extra_args:
         sampling_params.extra_args = {
