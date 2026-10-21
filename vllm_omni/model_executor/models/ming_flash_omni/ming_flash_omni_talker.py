@@ -51,6 +51,18 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def _build_audio_vae(config: AudioVAEConfig) -> AudioVAE:
+    vae = AudioVAE(config)
+    # NOTE: Official Encoder.__init__ shares the Qwen2 config between encoder and aggregator;
+    # setting aggregator depth to 4 also limits the encoder:
+    # https://huggingface.co/inclusionAI/Ming-3.0-audio-tiny/blob/25b96e30be3739849bf76c0f48ac11db4a262fb3/talker/AudioVAE/vae_modules.py#L71-L86
+    # Preserve that behavior and the complete checkpoint weight layout here;
+    # the shared VAE default used by Ming3-TTS keeps its configured depth.
+    if config.patch_size != -1:
+        vae.encoder.encoder.config.num_hidden_layers = vae.encoder.aggregator.config.num_hidden_layers
+    return vae
+
+
 @dataclass(slots=True)
 class _VoiceContext:
     """Voice cloning inputs resolved from request info + presets."""
@@ -312,7 +324,7 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
         if os.path.isdir(vae_path):
             try:
                 vae_config = AudioVAEConfig.from_pretrained(vae_path)
-                vae = AudioVAE(vae_config)
+                vae = _build_audio_vae(vae_config)
                 logger.info("Initialized AudioVAE from %s (sr=%d)", vae_path, vae_config.sample_rate)
                 return vae, vae_path
             except Exception as e:
@@ -323,7 +335,7 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
         for subfolder in ("talker/vae", "vae"):
             try:
                 vae_config = AudioVAEConfig.from_pretrained(model_path, subfolder=subfolder, trust_remote_code=True)
-                vae = AudioVAE(vae_config)
+                vae = _build_audio_vae(vae_config)
                 logger.info(f"Initialized AudioVAE from {model_path}/{subfolder}")
                 return vae, (model_path, subfolder)
             except Exception:
