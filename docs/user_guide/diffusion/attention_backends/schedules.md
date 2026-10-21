@@ -34,10 +34,12 @@ Each range has exactly `start`, `end` and `profile`:
 
 Ranges must be ordered and non-overlapping. Adjacent ranges are allowed;
 an open-ended range must be last. Gaps use the base configuration.
-A bounded range must end within the actual timestep sequence, which may
-differ from `num_inference_steps`. An open-ended range that starts at or after
-the end of the sequence selects nothing, so `{"start": 6, "end": null}` leaves
-a request with 6 or fewer steps on the base configuration.
+A bounded range in a request's own schedule must end within the actual
+timestep sequence, which may differ from `num_inference_steps`. A bounded
+range inherited from the server default may end later; it applies up to the
+last step. An open-ended range that starts at or after the end of the sequence
+selects nothing, so `{"start": 6, "end": null}` leaves a request with 6 or
+fewer steps on the base configuration.
 CFG evaluations share one step index.
 Each H3 seed/continuation window restarts at step 0.
 Prompt encoding and decoding run with the base configuration.
@@ -114,8 +116,8 @@ distinct batch keys. Scheduled H3 step batches run one transformer forward
 per request so each uses its own progress.
 
 Malformed or unknown-profile schedules return HTTP 400 before dispatch.
-A bounded range that ends after the sequence fails before denoising and
-retains the client error through
+A bounded range in the request's own schedule that ends after the sequence
+fails before denoising and retains the client error through
 the runner and multiprocess executor. Asynchronous `/v1/videos` reports these
 errors on the job record rather than the creation response.
 

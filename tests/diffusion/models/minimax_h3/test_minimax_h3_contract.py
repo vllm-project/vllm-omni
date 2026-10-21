@@ -1382,6 +1382,19 @@ def test_prepare_encode_checks_the_attention_schedule_before_any_step():
         pipeline.prepare_encode(state)
 
 
+def test_inherited_default_range_past_the_sequence_end_is_not_rejected(monkeypatch):
+    """A service default serves requests of any length, so a default range that ends after this
+    request's four distilled steps applies up to the last step instead of failing the request."""
+    _allow_cpu_empty_cache(monkeypatch)
+    diffuse_calls: list[dict[str, Any]] = []
+    pipeline = _distilled_pipeline(diffuse_calls, {"fl2va": [1.0, 0.7, 0.4, 0.15, 0.0], "ref2va": None})
+    pipeline.od_config = _scheduled_od_config(default=[{"start": 2, "end": 6, "profile": "sparse"}])
+
+    pipeline.forward(_t2va_batch())
+
+    assert [call["num_steps"] for call in diffuse_calls] == [4]
+
+
 def test_forward_rejects_an_attention_schedule_with_request_scoped_cache_dit(monkeypatch):
     """A schedule is rejected before Cache-DiT is prepared when the quality plan installs it."""
     _allow_cpu_empty_cache(monkeypatch)
