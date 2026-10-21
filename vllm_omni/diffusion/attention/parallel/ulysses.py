@@ -251,7 +251,6 @@ class UlyssesParallelAttention:
         self._gather_idx = gather_idx
         self._use_sync = use_sync
         self._ulysses_a2a_permute = ulysses_a2a_permute
-        self._reference_seq_lens_cache: tuple[object, tuple[int, ...]] | None = None
         if _a2a_permute_enabled(
             ulysses_a2a_permute,
             scatter_idx,
@@ -291,9 +290,6 @@ class UlyssesParallelAttention:
         mode = get_ulysses_mode(default="strict")
         ulysses_world_size = self._sp_group.ulysses_world_size
         gate_compress = None
-        reference_key_local = reference_value_local = None
-        reference_global_rows = 0
-        reference_request_id = None
         if attn_metadata is not None:
             candidate = attn_metadata.extra.get("gate_compress")
             if isinstance(candidate, torch.Tensor):
@@ -302,33 +298,6 @@ class UlyssesParallelAttention:
                         f"gate_compress must match pre-Ulysses query shape, got {candidate.shape} vs {query.shape}"
                     )
                 gate_compress = candidate
-            reference_kv = attn_metadata.extra.get("ulysses_reference_kv")
-            if reference_kv is not None:
-                if (
-                    not isinstance(reference_kv, tuple)
-                    or len(reference_kv) != 2
-                    or not all(isinstance(t, torch.Tensor) for t in reference_kv)
-                ):
-                    raise TypeError("ulysses_reference_kv must be a (key, value) tensor tuple")
-                reference_key_local, reference_value_local = reference_kv
-                if reference_key_local.shape != reference_value_local.shape:
-                    raise ValueError(
-                        "reference key/value shape mismatch: "
-                        f"{reference_key_local.shape} != {reference_value_local.shape}"
-                    )
-                if (
-                    reference_key_local.ndim != 4
-                    or reference_key_local.shape[0] != query.shape[0]
-                    or reference_key_local.shape[2:] != key.shape[2:]
-                ):
-                    raise ValueError(
-                        "ulysses_reference_kv must match local K/V batch/head layout, got "
-                        f"{reference_key_local.shape} vs {key.shape}"
-                    )
-                reference_global_rows = int(attn_metadata.extra.get("reference_kv_global_rows", 0))
-                reference_request_id = attn_metadata.extra.get("reference_kv_request_id")
-                if reference_global_rows <= 0:
-                    raise ValueError("reference_kv_global_rows must be positive")
 
         # advanced_uaa pads non-divisible head counts before the Ulysses
         # all-to-all. This also holds in hybrid Ulysses+Ring: Q is derived
@@ -600,49 +569,6 @@ class UlyssesParallelAttention:
             seq_lens = []
             local_seq_len = 0
             orig_head_cnt = 0
-
-        if reference_key_local is not None:
-            if self._sp_group.ring_world_size > 1:
-                raise NotImplementedError("compacted MiniMax-H3 reference KV currently requires ring_degree=1")
-            local_reference_rows = int(reference_key_local.shape[1])
-            cache = self._reference_seq_lens_cache
-            # Request identity changes on every rank together. Local row counts
-            # alone are unsafe: only some ranks may otherwise enter this gather.
-            if reference_request_id is None or cache is None or cache[0] is not reference_request_id:
-                reference_seq_lens = _all_gather_int(
-                    self._ulysses_pg,
-                    local_reference_rows,
-                    device=query.device,
-                )
-                if sum(reference_seq_lens) != reference_global_rows:
-                    raise ValueError(
-                        f"distributed reference KV row count mismatch: {reference_seq_lens} != {reference_global_rows}"
-                    )
-                self._reference_seq_lens_cache = (
-                    reference_request_id,
-                    tuple(reference_seq_lens),
-                )
-            else:
-                reference_seq_lens = list(cache[1])
-
-            padded_reference_heads = (
-                _ceil_div(int(reference_key_local.shape[2]), ulysses_world_size) * ulysses_world_size
-            )
-            # K and V have identical row/head layouts.  Batch them into one
-            # collective to avoid paying a second all-to-all launch per layer.
-            reference_kv_local = torch.cat((reference_key_local, reference_value_local), dim=0)
-            reference_kv, _ = _ulysses_all_to_all_any_qkv(
-                self._ulysses_pg,
-                reference_kv_local,
-                seq_lens=reference_seq_lens,
-                use_sync=self._use_sync,
-                padded_head_cnt=padded_reference_heads,
-            )
-            reference_key, reference_value = reference_kv.chunk(2, dim=0)
-            # Reference rows are K/V-only.  Prepending them preserves the
-            # [real, suffix-padding] packed layout while omitting their queries.
-            key = torch.cat((reference_key, key), dim=1)
-            value = torch.cat((reference_value, value), dim=1)
 
         if is_joint and not defer_joint:
             # Concatenate joint query AFTER AllToAll

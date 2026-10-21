@@ -90,7 +90,6 @@ class HybridPlan:
     dense_queries: torch.Tensor
     key_permutation: torch.Tensor
     protected_keys: torch.Tensor
-    key_block_ids: torch.Tensor
     dense_cu_q: torch.Tensor
     dense_cu_k: torch.Tensor
     sparse_query_rows: int
@@ -127,7 +126,6 @@ def get_hybrid_plan(
         dense_queries=upload(dense),
         key_permutation=upload(k_perm),
         protected_keys=upload(torch.tensor(sorted(k_protected), dtype=torch.long)),
-        key_block_ids=upload(torch.arange(key_blocks, dtype=torch.float32)),
         dense_cu_q=upload(torch.tensor([0, dense.numel()], dtype=torch.int32)),
         dense_cu_k=upload(torch.tensor([0, kv_length], dtype=torch.int32)),
         sparse_query_rows=sparse.numel(),
@@ -172,21 +170,6 @@ def block_mask(
     return mask
 
 
-def select_blocks(query, key, plan, sparsity, scale, block_size=128):
-    mask = block_mask(query, key, plan, sparsity, scale, block_size)
-    count = mask.sum(dim=-1)
-    indices = plan.key_block_ids.reshape(1, 1, 1, -1).expand_as(mask)
-    sorted_ids = torch.where(mask, indices, 1e9).sort(dim=-1).values
-    indices = torch.where(indices < count.unsqueeze(-1), sorted_ids, -1).to(torch.int64)
-    return indices[0].transpose(0, 1).contiguous(), count[0].transpose(0, 1).contiguous()
-
-
-def _native_forward(*args, **kwargs):
-    from mindiesd.layers.flash_attn.sparse_flash_attn_rf_v2 import rain_fusion_attention
-
-    return rain_fusion_attention(*args, **kwargs)
-
-
 def _native_mask_forward(query, key, value, mask, scale, inner_precise):
     from mindiesd.layers import _custom_ops  # noqa: F401
 
@@ -220,7 +203,6 @@ def hybrid_attention(
     inner_precise: int = 0,
     kernel_dtype: str = "fp16",
     input_scale: float = 256.0,
-    kernel: str = "bsa",
 ) -> torch.Tensor:
     """BSND, one packed document; output contains only the caller's Q rows."""
     if query.shape[0] != 1 or key.shape != value.shape or query.shape[2:] != key.shape[2:]:
@@ -235,14 +217,8 @@ def hybrid_attention(
     if plan.sparse_query_rows:
         sparse_q = query.index_select(1, plan.sparse_queries)
         sparse_k = key.index_select(1, plan.key_permutation)
-        if kernel == "bsa":
-            mask = block_mask(sparse_q, sparse_k, plan, sparsity, scale)
-        elif kernel == "rf2":
-            select_idx, select_count = select_blocks(sparse_q, sparse_k, plan, sparsity, scale)
-        else:
-            raise ValueError("hybrid RF kernel must be bsa or rf2")
+        mask = block_mask(sparse_q, sparse_k, plan, sparsity, scale)
         sparse_v = value.index_select(1, plan.key_permutation)
-        heads, dim = query.shape[2:]
         output_dtype = query.dtype
         restore_scale = 1.0
         kernel_scale = scale
@@ -260,23 +236,7 @@ def hybrid_attention(
             inner_precise = 1
         elif kernel_dtype != "bf16":
             raise ValueError("hybrid RF kernel_dtype must be fp16 or bf16")
-        if kernel == "bsa":
-            sparse_out = _native_mask_forward(sparse_q, sparse_k, sparse_v, mask, kernel_scale, inner_precise)
-        else:
-            sparse_out = _native_forward(
-                sparse_q.reshape(-1, heads, dim),
-                sparse_k.reshape(-1, heads, dim),
-                sparse_v.reshape(-1, heads, dim),
-                scale=kernel_scale,
-                head_num=heads,
-                input_layout="TND",
-                select_idx=select_idx,
-                select_num_idx=select_count,
-                blockshape=[128, 128],
-                actual_seq_lengths=[plan.sparse_query_rows],
-                actual_seq_lengths_kv=[plan.key_rows],
-                inner_precise=inner_precise,
-            ).reshape(1, plan.sparse_query_rows, heads, dim)
+        sparse_out = _native_mask_forward(sparse_q, sparse_k, sparse_v, mask, kernel_scale, inner_precise)
         sparse_out = sparse_out.to(output_dtype) * restore_scale
         out.index_copy_(1, plan.sparse_queries, sparse_out)
     return out

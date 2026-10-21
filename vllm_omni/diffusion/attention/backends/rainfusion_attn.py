@@ -286,22 +286,30 @@ class RainFusionAttentionImpl(AttentionImpl):
                 used_kv = int(attn_metadata.extra["max_seqlen_k"])
                 if used_kv != used_q + reference_rows:
                     raise ValueError("compact RainFusion valid KV length must include the reference prefix")
-                sparse_metadata = replace(
-                    attn_metadata,
-                    packed_padding=None,
-                    extra={**attn_metadata.extra, "max_seqlen_q": used_kv},
-                    video_layout=replace(
+                kv_layout = attn_metadata.extra.get("minimax_h3_reference_kv_video_layout")
+                if kv_layout is None:
+                    kv_layout = replace(
                         layout,
                         used_len=used_kv,
                         video_spans=tuple(
                             replace(span, start=span.start + reference_rows) for span in layout.video_spans
                         ),
-                    ),
+                    )
+                if kv_layout.used_len != used_kv:
+                    raise ValueError("RainFusion reference KV video layout must match valid KV length")
+                sparse_metadata = replace(
+                    attn_metadata,
+                    packed_padding=None,
+                    extra={**attn_metadata.extra, "max_seqlen_q": used_kv},
+                    video_layout=kv_layout,
                 )
                 plan = self._resolve_plan(sparse_metadata)
                 if plan is not None:
                     if self._can_use_hybrid(query, attn_metadata):
-                        return self._forward_hybrid_npu(query, key, value, attn_metadata, plan, reference_rows)
+                        q_spans = tuple((span.start, tuple(span.latent_grid)) for span in layout.video_spans)
+                        return self._forward_hybrid_npu(
+                            query, key, value, attn_metadata, plan, reference_rows, q_spans=q_spans
+                        )
                     # MindIE-SD's rf_v2 ABI requires equal Q/K/V sequence
                     # lengths. Add dummy reference queries only after Ulysses;
                     # their outputs are discarded, so no reference projection
@@ -348,7 +356,7 @@ class RainFusionAttentionImpl(AttentionImpl):
             return False
         return not is_a5_device()
 
-    def _forward_hybrid_npu(self, query, key, value, metadata, sparse_plan, reference_rows):
+    def _forward_hybrid_npu(self, query, key, value, metadata, sparse_plan, reference_rows, *, q_spans):
         from vllm_omni.diffusion.attention.ops.rainfusion_hybrid import get_hybrid_plan, hybrid_attention
 
         used_q = int(metadata.extra["max_seqlen_q"])
@@ -357,7 +365,6 @@ class RainFusionAttentionImpl(AttentionImpl):
             kv_spans = tuple((int(span["start"]), tuple(span["latent_shape"])) for span in sparse_plan.video_spans)
         else:
             kv_spans = ((sparse_plan.prefix_len, tuple(sparse_plan.latent_shape)),)
-        q_spans = tuple((start - reference_rows, grid) for start, grid in kv_spans)
         plan = get_hybrid_plan(used_q, used_kv, q_spans, kv_spans, str(query.device))
 
         def dense_forward(q, k, v, geometry):
@@ -408,7 +415,6 @@ class RainFusionAttentionImpl(AttentionImpl):
             inner_precise=_INNER_PRECISE,
             kernel_dtype="fp16",
             input_scale=float(metadata.extra.get("laser_input_scale", 256.0)),
-            kernel="bsa",
         )
         if used_q == query.shape[1]:
             return out

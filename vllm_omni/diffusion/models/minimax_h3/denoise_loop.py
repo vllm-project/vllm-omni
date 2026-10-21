@@ -370,14 +370,14 @@ def minimax_h3_denoise_loop(
     audio_solver = create_h3_sample_solver(sampler, sigmas_audio)
     num_steps = len(sigmas_video) - 1
     reference_kv_state = None
-    create_reference_kv_state = getattr(model, "create_reference_kv_tier1_state", None)
+    create_reference_kv_state = getattr(model, "create_reference_kv_state", None)
     if callable(create_reference_kv_state):
         reference_kv_state = create_reference_kv_state(
             global_reference_rows=int((~positive.update_mask).sum()),
             device=device,
         )
     if reference_kv_state is not None:
-        positive.static_kwargs["reference_kv_tier1_state"] = reference_kv_state
+        positive.static_kwargs["reference_kv_state"] = reference_kv_state
 
     try:
         for step in range(num_steps):
@@ -475,7 +475,7 @@ def minimax_h3_denoise_loop(
     finally:
         minimax_h3_publish_denoise_progress(None, None, None)
         if reference_kv_state is not None:
-            positive.static_kwargs.pop("reference_kv_tier1_state", None)
+            positive.static_kwargs.pop("reference_kv_state", None)
             reference_kv_state.close()
     return video_rows, audio_rows
 

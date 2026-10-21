@@ -86,7 +86,7 @@ class MiniMaxH3CachedBlocks(CachedBlocks_Pattern_3_4_5):
         return super().call_Bn_blocks(hidden_states, *args, **kwargs)
 
     def forward(self, hidden_states: torch.Tensor, *args, **kwargs):
-        state = kwargs.get("reference_kv_tier1_state")
+        state = kwargs.get("reference_kv_state")
         if state is None:
             self._reference_phase_key = None
             return super().forward(hidden_states, *args, **kwargs)

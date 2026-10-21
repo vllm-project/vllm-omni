@@ -207,7 +207,6 @@ def test_native_constructor_enables_cache_by_default(monkeypatch, tp_size):
     monkeypatch.setattr(h3, "get_tensor_model_parallel_world_size", lambda: tp_size)
     config = _small_od_config()
     model = h3.MiniMaxH3DiTModel(config, diffusers_weights=False)
-    assert model._cache_dit_adapter_config.cached_adapter_cls is None
     assert model.adaln_cache.max_bytes > 0
     assert model.blocks[0].adaln_proj._adaln_cache is model.adaln_cache
     assert model.final_layer.adaln_proj._adaln_cache is model.adaln_cache
@@ -215,10 +214,6 @@ def test_native_constructor_enables_cache_by_default(monkeypatch, tp_size):
     config.cache_config = {"minimax_h3_adaln_cache": False}
     disabled = h3.MiniMaxH3DiTModel(config, diffusers_weights=False)
     assert disabled.adaln_cache.max_bytes == 0
-    config.kv_offload_config = {"mode": "tier2"}
-    configured = h3.MiniMaxH3DiTModel(config, diffusers_weights=False)
-    assert configured._cache_dit_adapter_config.cached_adapter_cls is h3.MiniMaxH3CachedAdapter
-    assert model._cache_dit_adapter_config.cached_adapter_cls is None
 
 
 @pytest.fixture

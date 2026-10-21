@@ -556,17 +556,20 @@ existing full-compute path. For an experiment with the two-layer staging ring:
 
 ```bash
 vllm serve /path/to/MiniMax-H3 --omni --task-type ref2va \
-  --kv-offload-config '{"mode":"tier2","kv_refresh_interval":8,"kv_host_quantization":"int8","skip_reference_projection":true}'
+  --kv-offload-config '{"mode":"on","kv_refresh_interval":8,"kv_host_quantization":"int8"}'
 ```
 
-The JSON object accepts four keys:
+The JSON object accepts three keys:
 
 | Key | Values | Default | Meaning |
 | --- | --- | --- | --- |
-| `mode` | `tier1`, `tier2` | required | Tier1 stages the full host cache each reuse step; Tier2 prefetches post-Ulysses layers into a fixed two-slot device ring. |
+| `mode` | `on` | required | Cache reference K/V after Ulysses and prefetch layers into a fixed two-slot device ring. |
 | `kv_refresh_interval` | integer >= 0 | `2` | Refresh every N denoise steps. `0` populates only at step 0 and has the highest quality risk. |
-| `kv_host_quantization` | `none`, `fp8`, `int8` | `none` | Host-cache storage format; quantization requires Tier2 and may fall back at runtime. |
-| `skip_reference_projection` | JSON boolean | `false` | Omit reference-token QKV projection and reference-query attention on reuse steps. This is lossy. |
+| `kv_host_quantization` | `none`, `fp8`, `int8` | `none` | Host-cache storage format; quantization may fall back at runtime. |
+
+Reuse steps skip reference-token QKV projection and reference-query attention. This is lossy.
+The current implementation requires one request per forward and either no
+sequence parallelism or pure Ulysses; Ring and AllGather-KV are unsupported.
 
 The former MiniMax-H3 reference-KV and RainFusion hybrid environment variables
 are no longer used. The experimental RainFusion hybrid uses its validated BSA

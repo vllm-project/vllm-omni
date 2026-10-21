@@ -1,23 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Host-resident reference-KV staging for MiniMax-H3.
-
-MiniMax-H3 uses bidirectional packed self-attention, so visual-condition K/V
-changes after the first DiT block as target tokens evolve. This module provides
-two explicit experimental caches backed by pinned host memory: Tier1 bulk-stages
-every layer before a reuse forward, while Tier2 caches the balanced post-Ulysses
-layout and prefetches into a small device ring. Tier2 optionally stores FP8 or
-scaled INT8 host values. A separate observer measures reference-KV drift without
-substituting cached values.
-"""
+"""Post-Ulysses reference-KV cache with layerwise host-to-device prefetch."""
 
 from __future__ import annotations
 
-import json
-import os
-import time
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 
 import torch
@@ -31,7 +18,7 @@ _log = init_logger(__name__)
 
 
 @dataclass
-class MiniMaxH3ReferenceKVTier1Stats:
+class MiniMaxH3ReferenceKVStats:
     block_cached_layers: int = 0
     refresh_steps: int = 0
     h2d_steps: int = 0
@@ -41,10 +28,6 @@ class MiniMaxH3ReferenceKVTier1Stats:
     projection_skipped_layers: int = 0
     projection_skipped_rows: int = 0
     projection_total_rows: int = 0
-
-
-@dataclass
-class MiniMaxH3ReferenceKVTier2Stats(MiniMaxH3ReferenceKVTier1Stats):
     prefetched_layers: int = 0
     ready_wait_layers: int = 0
     max_device_staging_bytes: int = 0
@@ -52,17 +35,10 @@ class MiniMaxH3ReferenceKVTier2Stats(MiniMaxH3ReferenceKVTier1Stats):
     quantization_fallbacks: int = 0
 
 
-class MiniMaxH3ReferenceKVTier1State:
-    """Request-local pinned-host K/V pool plus one-forward device staging.
+class _MiniMaxH3ReferenceKVBase:
+    """Request-local refresh schedule and reference-row bookkeeping."""
 
-    ``refresh_interval=2`` captures on even denoise steps and reuses on odd
-    steps.  ``refresh_interval=0`` captures only step 0, matching a strict
-    populate-once prototype; this is intentionally explicit because full-depth
-    MiniMax-H3 reference K/V is not invariant across denoise steps.
-    """
-
-    tier_name = "Tier1"
-    stats: MiniMaxH3ReferenceKVTier1Stats
+    stats: MiniMaxH3ReferenceKVStats
 
     def __init__(
         self,
@@ -72,7 +48,6 @@ class MiniMaxH3ReferenceKVTier1State:
         device: torch.device,
         refresh_interval: int,
         pin_memory: bool = True,
-        skip_reference_projection: bool = False,
         host_quantization: str = "none",
     ) -> None:
         if num_layers <= 0:
@@ -86,21 +61,14 @@ class MiniMaxH3ReferenceKVTier1State:
         self.device = torch.device(device)
         self.refresh_interval = int(refresh_interval)
         self.pin_memory = bool(pin_memory)
-        self.skip_reference_projection = bool(skip_reference_projection)
         if host_quantization not in {"none", "fp8", "int8"}:
             raise ValueError(f"host_quantization must be one of none, fp8, int8, got {host_quantization!r}")
         self.host_quantization = host_quantization
-        # A lightweight per-request identity for collective-order-safe
-        # Ulysses metadata caching. Do not retain the full cache state there.
-        self.request_token = object()
         self.effective_host_quantization = host_quantization
-        self.stats = MiniMaxH3ReferenceKVTier1Stats()
+        self.stats = MiniMaxH3ReferenceKVStats()
 
         self._host_pool: torch.Tensor | None = None
         self._host_scale_pool: torch.Tensor | None = None
-        self._device_pool: torch.Tensor | None = None
-        self._local_reference_positions: torch.Tensor | None = None
-        self._local_non_reference_positions: torch.Tensor | None = None
         self._local_sequence_rows: int | None = None
         self._global_sequence_rows: int | None = None
         self._global_non_reference_positions: torch.Tensor | None = None
@@ -109,84 +77,7 @@ class MiniMaxH3ReferenceKVTier1State:
         self._step: int | None = None
         self._refresh = False
         self._global_refresh = False
-        self._inactive = False
         self._layers_seen: set[int] = set()
-
-    @classmethod
-    def from_config(
-        cls,
-        *,
-        config: ReferenceKVConfig | None,
-        num_layers: int,
-        global_reference_rows: int,
-        device: torch.device,
-    ) -> MiniMaxH3ReferenceKVTier1State | None:
-        if config is None:
-            return None
-        tier2_enabled = config.mode == "tier2"
-        tier_name = "Tier2" if tier2_enabled else "Tier1"
-        if global_reference_rows <= 0:
-            _log.info(
-                "MiniMax-H3 reference-KV %s skipped: request has no visual "
-                "condition rows (T2VA has no reference KV to offload)",
-                tier_name,
-            )
-            return None
-        interval = config.kv_refresh_interval
-        skip_projection = config.skip_reference_projection
-        if interval == 0:
-            _log.warning(
-                "MiniMax-H3 reference-KV %s strict populate-once mode is "
-                "enabled. Full-depth reference K/V drifts in bidirectional "
-                "attention, so this mode is lossy; use refresh interval 2 for "
-                "the measured quality-oriented prototype.",
-                tier_name,
-            )
-        state: MiniMaxH3ReferenceKVTier1State
-        details = ""
-        if tier2_enabled:
-            tier2_state = MiniMaxH3ReferenceKVTier2State(
-                num_layers=num_layers,
-                global_reference_rows=global_reference_rows,
-                device=device,
-                refresh_interval=interval,
-                ring_size=2,
-                skip_reference_projection=skip_projection,
-                host_quantization=config.kv_host_quantization,
-            )
-            state = tier2_state
-            details = (
-                f", ring_size={tier2_state.ring_size}, cache_layout=post_ulysses"
-                f", host_quantization={tier2_state.host_quantization}"
-            )
-        else:
-            state = cls(
-                num_layers=num_layers,
-                global_reference_rows=global_reference_rows,
-                device=device,
-                refresh_interval=interval,
-                skip_reference_projection=skip_projection,
-            )
-        _log.info(
-            "MiniMax-H3 reference-KV %s enabled: layers=%d, global_ref_rows=%d, "
-            "refresh_interval=%d, device=%s, skip_reference_projection=%s%s",
-            tier_name,
-            num_layers,
-            global_reference_rows,
-            interval,
-            device,
-            skip_projection,
-            details,
-        )
-        return state
-
-    @property
-    def host_pool(self) -> torch.Tensor | None:
-        return self._host_pool
-
-    @property
-    def device_pool(self) -> torch.Tensor | None:
-        return self._device_pool
 
     @property
     def host_bytes(self) -> int:
@@ -196,10 +87,6 @@ class MiniMaxH3ReferenceKVTier1State:
         if self._host_scale_pool is not None:
             total += self._host_scale_pool.numel() * self._host_scale_pool.element_size()
         return total
-
-    @property
-    def post_parallel_cache(self) -> bool:
-        return False
 
     @property
     def current_step(self) -> int | None:
@@ -282,41 +169,36 @@ class MiniMaxH3ReferenceKVTier1State:
     @property
     def local_sequence_rows(self) -> int:
         if self._local_sequence_rows is None:
-            raise RuntimeError("local reference mask was not initialized")
+            raise RuntimeError("local sequence size was not initialized")
         return self._local_sequence_rows
+
+    def set_local_sequence_rows(self, rows: int) -> None:
+        if rows <= 0:
+            raise ValueError("local sequence size must be positive")
+        if self._local_sequence_rows is None:
+            self._local_sequence_rows = rows
+        elif self._local_sequence_rows != rows:
+            raise RuntimeError("local sequence size changed within one denoise request")
 
     @property
     def should_skip_reference_projection(self) -> bool:
         """Whether this global reuse step may compact reference query rows.
 
-        The decision must be identical on every sequence-parallel rank.  It
-        therefore follows the global refresh schedule instead of ``_inactive``;
-        only the rank owning reference rows has a host cache, but all ranks must
-        shard the same compact target sequence.
+        Every rank must compact the same target sequence on reuse steps.
         """
-        return self.skip_reference_projection and self._step is not None and not self._global_refresh
-
-    @property
-    def local_non_reference_positions(self) -> torch.Tensor:
-        if self._local_non_reference_positions is None:
-            raise RuntimeError("local reference mask was not initialized")
-        return self._local_non_reference_positions
+        return self._step is not None and not self._global_refresh
 
     def record_projection_skip(
         self,
         layer_index: int,
         total_rows: int,
         *,
-        projected_rows: int | None = None,
+        projected_rows: int,
     ) -> None:
         if not self.should_skip_reference_projection:
             raise RuntimeError("reference projection skip recorded outside reuse step")
         if not 0 <= layer_index < self.num_layers:
             raise IndexError(f"layer_index {layer_index} outside [0, {self.num_layers})")
-        if projected_rows is None:
-            if self._local_reference_positions is None:
-                raise RuntimeError("local reference mask was not initialized")
-            projected_rows = total_rows - self._local_reference_positions.numel()
         if not 0 <= projected_rows <= total_rows:
             raise ValueError(f"projected_rows must be within [0, {total_rows}], got {projected_rows}")
         self.stats.projection_skipped_layers += 1
@@ -324,221 +206,12 @@ class MiniMaxH3ReferenceKVTier1State:
         self.stats.projection_total_rows += total_rows
 
     def _is_refresh_step(self, step: int) -> bool:
-        if self._inactive:
-            return False
         if self._host_pool is None:
             return True
         return self.refresh_interval > 0 and step % self.refresh_interval == 0
 
-    def begin_step(self, step: int, *, sigma: float | None = None) -> None:
-        del sigma
-        if self._step is not None:
-            raise RuntimeError(f"reference-KV Tier1 step {self._step} is still active")
-        self._step = int(step)
-        self._layers_seen.clear()
-        self._global_refresh = step == 0 or (self.refresh_interval > 0 and step % self.refresh_interval == 0)
-        self._refresh = self._is_refresh_step(step)
-        if self._inactive:
-            return
-        if self._refresh:
-            self.stats.refresh_steps += 1
-            return
-        if self._host_pool is None:
-            raise RuntimeError("reference-KV Tier1 reuse requested before populate")
-        with record_function("minimax_h3.ref_kv_tier1.h2d_bulk"):
-            self._device_pool = self._host_pool.to(
-                device=self.device,
-                non_blocking=False,
-            )
-        copied = self.host_bytes
-        self.stats.h2d_steps += 1
-        self.stats.h2d_bytes += copied
-        _log.info(
-            "MiniMax-H3 reference-KV Tier1 H2D bulk: step=%d, bytes=%d, layers=%d",
-            step,
-            copied,
-            self.num_layers,
-        )
 
-    def set_local_reference_mask(self, reference_mask: torch.Tensor) -> None:
-        if reference_mask.dim() != 1 or reference_mask.dtype != torch.bool:
-            raise ValueError(
-                "reference_mask must be a 1-D bool tensor, got "
-                f"shape={tuple(reference_mask.shape)} dtype={reference_mask.dtype}"
-            )
-        positions = torch.nonzero(reference_mask, as_tuple=False).view(-1)
-        if self._local_reference_positions is None:
-            self._local_reference_positions = positions
-            self._local_non_reference_positions = torch.nonzero(~reference_mask, as_tuple=False).view(-1)
-            self._local_sequence_rows = reference_mask.numel()
-            self._inactive = positions.numel() == 0
-            if self._inactive and self._refresh and self.stats.refresh_steps:
-                self.stats.refresh_steps -= 1
-                self._refresh = False
-            return
-        if (
-            self._local_sequence_rows != reference_mask.numel()
-            or self._local_reference_positions.numel() != positions.numel()
-        ):
-            raise RuntimeError("MiniMax-H3 reference row layout changed within one denoise request")
-
-    def _allocate_host_pool(self, k: torch.Tensor) -> None:
-        if self._local_reference_positions is None:
-            raise RuntimeError("local reference mask must be set before KV capture")
-        shape = (
-            2,
-            self.num_layers,
-            self._local_reference_positions.numel(),
-            *k.shape[1:],
-        )
-        kwargs = {
-            "size": shape,
-            "dtype": k.dtype,
-            "device": "cpu",
-        }
-        try:
-            self._host_pool = torch.empty(
-                **kwargs,
-                pin_memory=self.pin_memory,
-            )
-        except RuntimeError:
-            if self.device.type != "cpu" or not self.pin_memory:
-                raise
-            # CPU-only unit-test environments may not provide a pin allocator.
-            self._host_pool = torch.empty(**kwargs)
-        _log.info(
-            "MiniMax-H3 reference-KV %s host pool populated lazily: shape=%s, pinned=%s, bytes=%d",
-            self.tier_name,
-            tuple(self._host_pool.shape),
-            self._host_pool.is_pinned(),
-            self.host_bytes,
-        )
-
-    def process_layer(
-        self,
-        layer_index: int,
-        k: torch.Tensor,
-        v: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if self._step is None:
-            raise RuntimeError("begin_step must be called before processing KV")
-        if not 0 <= layer_index < self.num_layers:
-            raise IndexError(f"layer_index {layer_index} outside [0, {self.num_layers})")
-        if layer_index in self._layers_seen:
-            raise RuntimeError(f"MiniMax-H3 layer {layer_index} processed twice in step {self._step}")
-        if k.shape != v.shape:
-            raise ValueError(f"K/V shape mismatch: {k.shape} != {v.shape}")
-        positions = self._local_reference_positions
-        if positions is None:
-            raise RuntimeError("local reference mask was not initialized")
-        if self._local_sequence_rows != k.shape[0]:
-            raise ValueError(f"local reference mask/KV row mismatch: {self._local_sequence_rows} != {k.shape[0]}")
-        if k.shape[0] == 0 or positions.numel() == 0:
-            self._layers_seen.add(layer_index)
-            return k, v
-
-        if self._refresh:
-            if self._host_pool is None:
-                self._allocate_host_pool(k)
-            assert self._host_pool is not None
-            expected = tuple(self._host_pool.shape[2:])
-            actual = (positions.numel(), *k.shape[1:])
-            if actual != expected:
-                raise ValueError(f"reference K/V shape changed: expected {expected}, got {actual}")
-            with record_function(f"minimax_h3.ref_kv_{self.tier_name.lower()}.populate_host"):
-                self._host_pool[0, layer_index].copy_(
-                    k.index_select(0, positions),
-                    non_blocking=False,
-                )
-                self._host_pool[1, layer_index].copy_(
-                    v.index_select(0, positions),
-                    non_blocking=False,
-                )
-            self.stats.captured_layers += 1
-        else:
-            if self._device_pool is None:
-                raise RuntimeError("bulk H2D staging is missing on a reuse step")
-            k.index_copy_(0, positions, self._device_pool[0, layer_index])
-            v.index_copy_(0, positions, self._device_pool[1, layer_index])
-            self.stats.substituted_layers += 1
-        self._layers_seen.add(layer_index)
-        return k, v
-
-    def take_cached_reference_layer(
-        self,
-        layer_index: int,
-        like: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return cached local reference K/V without rebuilding full K/V rows."""
-        if self._step is None or self._global_refresh:
-            raise RuntimeError("cached reference K/V requested outside a reuse step")
-        if not 0 <= layer_index < self.num_layers:
-            raise IndexError(f"layer_index {layer_index} outside [0, {self.num_layers})")
-        if layer_index in self._layers_seen:
-            raise RuntimeError(f"MiniMax-H3 layer {layer_index} processed twice in step {self._step}")
-        if self._inactive:
-            self._layers_seen.add(layer_index)
-            empty = like.new_empty((0, *like.shape[1:]))
-            return empty, empty
-        if self._device_pool is None:
-            raise RuntimeError("bulk H2D staging is missing on a reuse step")
-        self._layers_seen.add(layer_index)
-        self.stats.substituted_layers += 1
-        return self._device_pool[0, layer_index], self._device_pool[1, layer_index]
-
-    def end_step(self) -> None:
-        if self._step is None:
-            raise RuntimeError("no active reference-KV Tier1 step")
-        if len(self._layers_seen) != self.num_layers:
-            raise RuntimeError(
-                "MiniMax-H3 reference-KV Tier1 saw "
-                f"{len(self._layers_seen)}/{self.num_layers} layers in step {self._step}"
-            )
-        # The authoritative cache remains on pinned host memory.  Releasing the
-        # only device-pool reference returns the full-L staging allocation to the
-        # accelerator allocator after every reuse forward.
-        self._device_pool = None
-        self._step = None
-        self._layers_seen.clear()
-
-    def abort_step(self) -> None:
-        self._device_pool = None
-        self._step = None
-        self._layers_seen.clear()
-
-    def close(self) -> None:
-        if self._step is not None:
-            self.abort_step()
-        self._device_pool = None
-        _log.info(
-            "MiniMax-H3 reference-KV Tier1 summary: host_bytes=%d, "
-            "refresh_steps=%d, h2d_steps=%d, captured_layers=%d, block_cached_layers=%d, "
-            "substituted_layers=%d, h2d_bytes=%d, "
-            "projection_skipped_layers=%d, projection_skipped_rows=%d, "
-            "projection_total_rows=%d",
-            self.host_bytes,
-            self.stats.refresh_steps,
-            self.stats.h2d_steps,
-            self.stats.captured_layers,
-            self.stats.block_cached_layers,
-            self.stats.substituted_layers,
-            self.stats.h2d_bytes,
-            self.stats.projection_skipped_layers,
-            self.stats.projection_skipped_rows,
-            self.stats.projection_total_rows,
-        )
-        self._host_pool = None
-        self._host_scale_pool = None
-        self._local_reference_positions = None
-        self._local_non_reference_positions = None
-        self._local_sequence_rows = None
-        self._global_non_reference_positions = None
-        self._global_reference_positions = None
-        self._global_sequence_rows = None
-        self._compact_rope_table = None
-
-
-class MiniMaxH3ReferenceKVTier2State(MiniMaxH3ReferenceKVTier1State):
+class MiniMaxH3ReferenceKVTier2State(_MiniMaxH3ReferenceKVBase):
     """Layerwise asynchronous H2D staging backed by a small device ring.
 
     Refresh steps capture the balanced K/V head shard after Ulysses All-to-All.
@@ -548,11 +221,45 @@ class MiniMaxH3ReferenceKVTier2State(MiniMaxH3ReferenceKVTier1State):
     """
 
     tier_name = "Tier2"
-    stats: MiniMaxH3ReferenceKVTier2Stats
+    stats: MiniMaxH3ReferenceKVStats
 
-    @property
-    def post_parallel_cache(self) -> bool:
-        return True
+    @classmethod
+    def from_config(
+        cls,
+        *,
+        config: ReferenceKVConfig | None,
+        num_layers: int,
+        global_reference_rows: int,
+        device: torch.device,
+    ) -> MiniMaxH3ReferenceKVTier2State | None:
+        if config is None:
+            return None
+        if config.mode != "on":
+            raise ValueError(f"unsupported MiniMax-H3 reference-KV mode: {config.mode!r}")
+        if global_reference_rows <= 0:
+            _log.info("MiniMax-H3 reference-KV skipped: request has no visual condition rows")
+            return None
+        if config.kv_refresh_interval == 0:
+            _log.warning("MiniMax-H3 reference-KV populate-once mode is lossy with bidirectional attention")
+        state = cls(
+            num_layers=num_layers,
+            global_reference_rows=global_reference_rows,
+            device=device,
+            refresh_interval=config.kv_refresh_interval,
+            host_quantization=config.kv_host_quantization,
+        )
+        _log.info(
+            "MiniMax-H3 reference-KV enabled: layers=%d, global_ref_rows=%d, "
+            "refresh_interval=%d, device=%s, ring_size=%d, "
+            "host_quantization=%s, skip_reference_projection=True, cache_layout=post_ulysses",
+            num_layers,
+            global_reference_rows,
+            config.kv_refresh_interval,
+            device,
+            state.ring_size,
+            state.host_quantization,
+        )
+        return state
 
     def __init__(
         self,
@@ -563,7 +270,6 @@ class MiniMaxH3ReferenceKVTier2State(MiniMaxH3ReferenceKVTier1State):
         refresh_interval: int,
         ring_size: int = 2,
         pin_memory: bool = True,
-        skip_reference_projection: bool = False,
         host_quantization: str = "none",
     ) -> None:
         if not 2 <= ring_size <= 3:
@@ -574,21 +280,16 @@ class MiniMaxH3ReferenceKVTier2State(MiniMaxH3ReferenceKVTier1State):
             device=device,
             refresh_interval=refresh_interval,
             pin_memory=pin_memory,
-            skip_reference_projection=skip_reference_projection,
             host_quantization=host_quantization,
         )
         self.ring_size = int(ring_size)
-        self.stats = MiniMaxH3ReferenceKVTier2Stats()
+        self.stats = MiniMaxH3ReferenceKVStats()
         self._device_ring: torch.Tensor | None = None
         self._device_scale_ring: torch.Tensor | None = None
         self._copy_stream: Any | None = None
         self._slot_layers: list[int | None] = [None] * self.ring_size
         self._ready_events: list[Any | None] = [None] * self.ring_size
         self._consumed_events: list[Any | None] = [None] * self.ring_size
-
-    @property
-    def device_pool(self) -> torch.Tensor | None:
-        return self._device_ring
 
     @property
     def device_staging_bytes(self) -> int:
@@ -598,34 +299,6 @@ class MiniMaxH3ReferenceKVTier2State(MiniMaxH3ReferenceKVTier1State):
         if self._device_scale_ring is not None:
             total += self._device_scale_ring.numel() * self._device_scale_ring.element_size()
         return total
-
-    def set_local_reference_mask(self, reference_mask: torch.Tensor) -> None:
-        """Track pre-Ulysses row counts without deactivating zero-row ranks.
-
-        After Ulysses every rank owns the full reference sequence and one head
-        shard, even if its pre-Ulysses sequence shard contained no references.
-        """
-        if self._global_reference_positions is None:
-            # Preserve the standalone/legacy pre-Ulysses behavior used without
-            # the MiniMax transformer post-parallel hook.
-            return super().set_local_reference_mask(reference_mask)
-        if reference_mask.dim() != 1 or reference_mask.dtype != torch.bool:
-            raise ValueError(
-                "reference_mask must be a 1-D bool tensor, got "
-                f"shape={tuple(reference_mask.shape)} dtype={reference_mask.dtype}"
-            )
-        positions = torch.nonzero(reference_mask, as_tuple=False).view(-1)
-        if self._local_reference_positions is None:
-            self._local_reference_positions = positions
-            self._local_non_reference_positions = torch.nonzero(~reference_mask, as_tuple=False).view(-1)
-            self._local_sequence_rows = reference_mask.numel()
-            self._inactive = False
-            return
-        if (
-            self._local_sequence_rows != reference_mask.numel()
-            or self._local_reference_positions.numel() != positions.numel()
-        ):
-            raise RuntimeError("MiniMax-H3 reference row layout changed within one denoise request")
 
     def _fall_back_to_int8(self, reason: Exception | str) -> None:
         if self.effective_host_quantization == "int8":
@@ -825,6 +498,8 @@ class MiniMaxH3ReferenceKVTier2State(MiniMaxH3ReferenceKVTier1State):
                 raise RuntimeError("refresh steps must retain reference rows")
             self._capture_post_ulysses_layer(layer_index, key, value)
             return key, value
+        if not compact:
+            raise RuntimeError("reference-KV reuse must skip reference projection")
 
         cached_k, cached_v = self.take_cached_reference_layer(layer_index, key)
         if cached_k.shape[0] != self.global_reference_rows:
@@ -835,16 +510,9 @@ class MiniMaxH3ReferenceKVTier2State(MiniMaxH3ReferenceKVTier1State):
             raise ValueError(
                 f"cached post-Ulysses reference head layout mismatch: {cached_k.shape[1:]} != {key.shape[2:]}"
             )
-        if compact:
-            return (
-                torch.cat((cached_k.unsqueeze(0), key), dim=1),
-                torch.cat((cached_v.unsqueeze(0), value), dim=1),
-            )
-
-        positions = self.global_reference_positions
         return (
-            torch.index_copy(key, 1, positions, cached_k.unsqueeze(0)),
-            torch.index_copy(value, 1, positions, cached_v.unsqueeze(0)),
+            torch.cat((cached_k.unsqueeze(0), key), dim=1),
+            torch.cat((cached_v.unsqueeze(0), value), dim=1),
         )
 
     def _ensure_device_ring(self) -> None:
@@ -963,8 +631,6 @@ class MiniMaxH3ReferenceKVTier2State(MiniMaxH3ReferenceKVTier1State):
         self._layers_seen.clear()
         self._global_refresh = step == 0 or (self.refresh_interval > 0 and step % self.refresh_interval == 0)
         self._refresh = self._is_refresh_step(step)
-        if self._inactive:
-            return
         if self._refresh:
             self.stats.refresh_steps += 1
             return
@@ -985,7 +651,7 @@ class MiniMaxH3ReferenceKVTier2State(MiniMaxH3ReferenceKVTier1State):
     def mark_block_cache_skipped(self, layer_indices: list[int]) -> None:
         super().mark_block_cache_skipped(layer_indices)
         next_layer = len(self._layers_seen)
-        if not self._inactive and next_layer < self.num_layers:
+        if next_layer < self.num_layers:
             slot = next_layer % self.ring_size
             if self._slot_layers[slot] != next_layer:
                 self._prefetch_layer(next_layer)
@@ -1006,10 +672,6 @@ class MiniMaxH3ReferenceKVTier2State(MiniMaxH3ReferenceKVTier1State):
                 "Tier2 layerwise prefetch requires sequential layer execution: "
                 f"expected {len(self._layers_seen)}, got {layer_index}"
             )
-        if self._inactive:
-            self._layers_seen.add(layer_index)
-            empty = like.new_empty((0, *like.shape[1:]))
-            return empty, empty
         if self._device_ring is None:
             raise RuntimeError("Tier2 device ring is missing on a reuse step")
 
@@ -1053,33 +715,6 @@ class MiniMaxH3ReferenceKVTier2State(MiniMaxH3ReferenceKVTier1State):
             self._prefetch_layer(next_layer)
         return cached[0], cached[1]
 
-    def process_layer(
-        self,
-        layer_index: int,
-        k: torch.Tensor,
-        v: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if self._refresh:
-            return super().process_layer(layer_index, k, v)
-        if k.shape != v.shape:
-            raise ValueError(f"K/V shape mismatch: {k.shape} != {v.shape}")
-        positions = self._local_reference_positions
-        if positions is None:
-            raise RuntimeError("local reference mask was not initialized")
-        if self._local_sequence_rows != k.shape[0]:
-            raise ValueError(f"local reference mask/KV row mismatch: {self._local_sequence_rows} != {k.shape[0]}")
-        if self._inactive:
-            if layer_index in self._layers_seen:
-                raise RuntimeError(f"MiniMax-H3 layer {layer_index} processed twice in step {self._step}")
-            self._layers_seen.add(layer_index)
-            return k, v
-        cached_k, cached_v = self.take_cached_reference_layer(layer_index, k)
-        if positions.numel():
-            with record_function("minimax_h3.ref_kv_tier2.substitute"):
-                k.index_copy_(0, positions, cached_k)
-                v.index_copy_(0, positions, cached_v)
-        return k, v
-
     def end_step(self) -> None:
         if self._step is None:
             raise RuntimeError("no active reference-KV Tier2 step")
@@ -1120,7 +755,7 @@ class MiniMaxH3ReferenceKVTier2State(MiniMaxH3ReferenceKVTier1State):
             "captured_layers=%d, substituted_layers=%d, block_cached_layers=%d, "
             "prefetched_layers=%d, ready_wait_layers=%d, h2d_bytes=%d, "
             "projection_skipped_layers=%d, projection_skipped_rows=%d, "
-            "projection_total_rows=%d, inactive=%s, cache_layout=post_ulysses, "
+            "projection_total_rows=%d, cache_layout=post_ulysses, "
             "host_quantization=%s, effective_host_quantization=%s, "
             "dequantized_layers=%d, quantization_fallbacks=%d",
             self.host_bytes,
@@ -1136,7 +771,6 @@ class MiniMaxH3ReferenceKVTier2State(MiniMaxH3ReferenceKVTier1State):
             self.stats.projection_skipped_layers,
             self.stats.projection_skipped_rows,
             self.stats.projection_total_rows,
-            self._inactive,
             self.host_quantization,
             self.effective_host_quantization,
             self.stats.dequantized_layers,
@@ -1150,425 +784,8 @@ class MiniMaxH3ReferenceKVTier2State(MiniMaxH3ReferenceKVTier1State):
         self._consumed_events = [None] * self.ring_size
         self._host_pool = None
         self._host_scale_pool = None
-        self._local_reference_positions = None
-        self._local_non_reference_positions = None
         self._local_sequence_rows = None
         self._global_non_reference_positions = None
         self._global_reference_positions = None
         self._global_sequence_rows = None
         self._compact_rope_table = None
-
-
-@dataclass
-class MiniMaxH3ReferenceKVObserverStats(MiniMaxH3ReferenceKVTier1Stats):
-    observed_steps: int = 0
-    sampled_layers: int = 0
-    metric_records: int = 0
-    sampled_d2h_bytes: int = 0
-
-
-class MiniMaxH3ReferenceKVObserverState(MiniMaxH3ReferenceKVTier1State):
-    """Measure reference-KV drift without changing attention inputs.
-
-    The observer samples reference rows and KV heads after QK norm and RoPE,
-    compares the current values with hypothetical fixed-interval snapshots, and
-    always returns the original K/V tensors unchanged. It is therefore suitable
-    for collecting drift on the unmodified MiniMax-H3 denoise trajectory.
-    """
-
-    tier_name = "Observer"
-    stats: MiniMaxH3ReferenceKVObserverStats
-
-    def __init__(
-        self,
-        *,
-        num_layers: int,
-        global_reference_rows: int,
-        device: torch.device,
-        intervals: tuple[int, ...],
-        sample_rows: int,
-        sample_heads: int,
-        output_path: str,
-    ) -> None:
-        super().__init__(
-            num_layers=num_layers,
-            global_reference_rows=global_reference_rows,
-            device=device,
-            refresh_interval=1,
-            pin_memory=False,
-        )
-        if not intervals or any(interval <= 1 for interval in intervals):
-            raise ValueError(f"observer intervals must all be > 1, got {intervals}")
-        if sample_rows <= 0 or sample_heads <= 0:
-            raise ValueError(
-                f"observer sample_rows and sample_heads must both be positive, got {sample_rows} and {sample_heads}"
-            )
-        self.intervals = tuple(sorted(set(int(value) for value in intervals)))
-        self.sample_rows = int(sample_rows)
-        self.sample_heads = int(sample_heads)
-        self.stats = MiniMaxH3ReferenceKVObserverStats()
-
-        self._run_id = f"{os.getpid()}-{time.time_ns()}"
-        self._output_path = self._resolve_output_path(output_path)
-        self._output_path.parent.mkdir(parents=True, exist_ok=True)
-        self._snapshots: torch.Tensor | None = None
-        self._source_steps: list[int | None] = [None] * len(self.intervals)
-        self._source_sigmas: list[float | None] = [None] * len(self.intervals)
-        self._refresh_indices: set[int] = set()
-        self._sampled_positions: torch.Tensor | None = None
-        self._sampled_heads: torch.Tensor | None = None
-        self._sampled_row_indices: list[int] = []
-        self._sampled_head_indices: list[int] = []
-        self._pending_records: list[dict[str, Any]] = []
-        self._sigma: float | None = None
-
-        self._write_records(
-            [
-                {
-                    "kind": "run_start",
-                    "run_id": self._run_id,
-                    "pid": os.getpid(),
-                    "device": str(self.device),
-                    "num_layers": self.num_layers,
-                    "global_reference_rows": self.global_reference_rows,
-                    "intervals": list(self.intervals),
-                    "requested_sample_rows": self.sample_rows,
-                    "requested_sample_heads": self.sample_heads,
-                    "metric_definition": {
-                        "cosine": "per sampled token-head vector over head_dim",
-                        "rel_l2": "norm(current-cached)/norm(current)",
-                        "normalized_max": "max_abs_error/rms(current)",
-                    },
-                }
-            ]
-        )
-
-    @property
-    def supports_block_cache_reuse(self) -> bool:
-        # Observations need fresh KV from every physical layer on every step.
-        return False
-
-    def _resolve_output_path(self, raw_path: str) -> Path:
-        base = Path(raw_path)
-        device_label = f"{self.device.type}{self.device.index}" if self.device.index is not None else self.device.type
-        if base.suffix:
-            return base.with_name(f"{base.stem}.{device_label}{base.suffix}")
-        return base / f"minimax_h3_reference_kv_drift.{device_label}.jsonl"
-
-    @property
-    def output_path(self) -> str:
-        return str(self._output_path)
-
-    @property
-    def host_bytes(self) -> int:
-        if self._snapshots is None:
-            return 0
-        return self._snapshots.numel() * self._snapshots.element_size()
-
-    @property
-    def device_pool(self) -> None:
-        return None
-
-    def _write_records(self, records: list[dict[str, Any]]) -> None:
-        if not records:
-            return
-        with self._output_path.open("a", encoding="utf-8") as output:
-            for record in records:
-                output.write(json.dumps(record, sort_keys=True) + "\n")
-
-    @staticmethod
-    def _evenly_spaced_indices(
-        total: int,
-        limit: int,
-        *,
-        device: torch.device,
-    ) -> torch.Tensor:
-        count = min(total, limit)
-        if count == total:
-            return torch.arange(total, device=device, dtype=torch.long)
-        return torch.linspace(0, total - 1, steps=count, device=device).round().to(torch.long).unique(sorted=True)
-
-    def _initialize_layout(self, k: torch.Tensor) -> None:
-        positions = self._local_reference_positions
-        if positions is None:
-            raise RuntimeError("observer reference mask was not initialized")
-        row_indices = self._evenly_spaced_indices(
-            positions.numel(),
-            self.sample_rows,
-            device=positions.device,
-        )
-        head_indices = self._evenly_spaced_indices(
-            k.shape[1],
-            self.sample_heads,
-            device=k.device,
-        )
-        self._sampled_positions = positions.index_select(0, row_indices)
-        self._sampled_heads = head_indices
-        self._sampled_row_indices = row_indices.cpu().tolist()
-        self._sampled_head_indices = head_indices.cpu().tolist()
-
-        shape = (
-            len(self.intervals),
-            2,
-            self.num_layers,
-            row_indices.numel(),
-            head_indices.numel(),
-            k.shape[-1],
-        )
-        self._snapshots = torch.empty(shape, dtype=k.dtype, device="cpu")
-        self._write_records(
-            [
-                {
-                    "kind": "layout",
-                    "run_id": self._run_id,
-                    "local_reference_rows": positions.numel(),
-                    "sampled_reference_rows": row_indices.numel(),
-                    "sampled_kv_heads": head_indices.numel(),
-                    "head_dim": k.shape[-1],
-                    "sampled_row_indices": self._sampled_row_indices,
-                    "sampled_head_indices": self._sampled_head_indices,
-                    "snapshot_bytes": self.host_bytes,
-                }
-            ]
-        )
-        _log.info(
-            "MiniMax-H3 reference-KV Observer layout: local_ref_rows=%d, "
-            "sampled_rows=%d, sampled_heads=%d, head_dim=%d, "
-            "snapshot_bytes=%d, output=%s",
-            positions.numel(),
-            row_indices.numel(),
-            head_indices.numel(),
-            k.shape[-1],
-            self.host_bytes,
-            self.output_path,
-        )
-
-    def _sample_current(self, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-        if self._sampled_positions is None or self._sampled_heads is None:
-            self._initialize_layout(k)
-        assert self._sampled_positions is not None
-        assert self._sampled_heads is not None
-        sampled_k = k.index_select(0, self._sampled_positions).index_select(1, self._sampled_heads)
-        sampled_v = v.index_select(0, self._sampled_positions).index_select(1, self._sampled_heads)
-        sampled = (
-            torch.stack((sampled_k, sampled_v))
-            .detach()
-            .to(
-                device="cpu",
-                non_blocking=False,
-            )
-        )
-        self.stats.sampled_d2h_bytes += sampled.numel() * sampled.element_size()
-        return sampled.contiguous()
-
-    @staticmethod
-    def _metrics_batch(
-        current: torch.Tensor,
-        cached: torch.Tensor,
-        *,
-        eps: float = 1e-12,
-    ) -> dict[str, torch.Tensor]:
-        """Vectorize CPU metrics over cached versions and K/V."""
-        current_vectors = current.float().reshape(1, 2, -1, current.shape[-1])
-        cached_vectors = cached.float().reshape(cached.shape[0], 2, -1, cached.shape[-1])
-        diff_vectors = current_vectors - cached_vectors
-
-        current_norm = torch.linalg.vector_norm(current_vectors, dim=-1)
-        cached_norm = torch.linalg.vector_norm(cached_vectors, dim=-1)
-        cosine = (current_vectors * cached_vectors).sum(dim=-1) / (current_norm * cached_norm).clamp_min(eps)
-        relative = torch.linalg.vector_norm(diff_vectors, dim=-1) / (current_norm.clamp_min(eps))
-        absolute = diff_vectors.abs().flatten(start_dim=2)
-        global_relative = torch.linalg.vector_norm(
-            diff_vectors.flatten(start_dim=2), dim=-1
-        ) / torch.linalg.vector_norm(current_vectors.flatten(start_dim=2), dim=-1).clamp_min(eps)
-        rms = current_vectors.square().mean(dim=(-1, -2)).sqrt().clamp_min(eps)
-
-        return {
-            "cosine_mean": cosine.mean(dim=-1),
-            "cosine_p50": torch.quantile(cosine, 0.50, dim=-1),
-            "cosine_p01": torch.quantile(cosine, 0.01, dim=-1),
-            "cosine_min": cosine.amin(dim=-1),
-            "rel_l2": global_relative,
-            "rel_l2_p50": torch.quantile(relative, 0.50, dim=-1),
-            "rel_l2_p99": torch.quantile(relative, 0.99, dim=-1),
-            "rel_l2_max": relative.amax(dim=-1),
-            "abs_error_p99": torch.quantile(absolute, 0.99, dim=-1),
-            "abs_error_max": absolute.amax(dim=-1),
-            "normalized_max": absolute.amax(dim=-1) / rms,
-        }
-
-    def begin_step(self, step: int, *, sigma: float | None = None) -> None:
-        if self._step is not None:
-            raise RuntimeError(f"reference-KV Observer step {self._step} is still active")
-        self._step = int(step)
-        self._sigma = None if sigma is None else float(sigma)
-        self._layers_seen.clear()
-        self._pending_records.clear()
-        self._refresh_indices = {
-            index
-            for index, interval in enumerate(self.intervals)
-            if self._source_steps[index] is None or step % interval == 0
-        }
-
-    def set_local_reference_mask(self, reference_mask: torch.Tensor) -> None:
-        if reference_mask.dim() != 1 or reference_mask.dtype != torch.bool:
-            raise ValueError(
-                "reference_mask must be a 1-D bool tensor, got "
-                f"shape={tuple(reference_mask.shape)} dtype={reference_mask.dtype}"
-            )
-        positions = torch.nonzero(reference_mask, as_tuple=False).view(-1)
-        if self._local_reference_positions is None:
-            self._local_reference_positions = positions
-            self._local_sequence_rows = reference_mask.numel()
-            self._inactive = positions.numel() == 0
-            return
-        if (
-            self._local_sequence_rows != reference_mask.numel()
-            or self._local_reference_positions.numel() != positions.numel()
-        ):
-            raise RuntimeError("MiniMax-H3 observer reference row layout changed within a request")
-
-    def process_layer(
-        self,
-        layer_index: int,
-        k: torch.Tensor,
-        v: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if self._step is None:
-            raise RuntimeError("begin_step must be called before observing KV")
-        if not 0 <= layer_index < self.num_layers:
-            raise IndexError(f"layer_index {layer_index} outside [0, {self.num_layers})")
-        if layer_index in self._layers_seen:
-            raise RuntimeError(f"MiniMax-H3 layer {layer_index} observed twice in step {self._step}")
-        if k.shape != v.shape:
-            raise ValueError(f"K/V shape mismatch: {k.shape} != {v.shape}")
-        positions = self._local_reference_positions
-        if positions is None:
-            raise RuntimeError("observer local reference mask was not initialized")
-        if self._local_sequence_rows != k.shape[0]:
-            raise ValueError(f"local reference mask/KV row mismatch: {self._local_sequence_rows} != {k.shape[0]}")
-        if self._inactive or positions.numel() == 0:
-            self._layers_seen.add(layer_index)
-            return k, v
-
-        sampled = self._sample_current(k, v)
-        assert self._snapshots is not None
-        reuse_indices: list[int] = []
-        for interval_index in range(len(self.intervals)):
-            if interval_index in self._refresh_indices:
-                self._snapshots[interval_index, :, layer_index].copy_(sampled)
-            else:
-                reuse_indices.append(interval_index)
-
-        if reuse_indices:
-            cached = self._snapshots[reuse_indices, :, layer_index]
-            metrics = self._metrics_batch(sampled, cached)
-            for batch_index, interval_index in enumerate(reuse_indices):
-                interval = self.intervals[interval_index]
-                source_step = self._source_steps[interval_index]
-                if source_step is None:
-                    raise RuntimeError("observer reuse requested before snapshot capture")
-                age = self._step - source_step
-                source_sigma = self._source_sigmas[interval_index]
-                sigma_delta = None if self._sigma is None or source_sigma is None else self._sigma - source_sigma
-                for kv_index, kv_name in enumerate(("K", "V")):
-                    record: dict[str, Any] = {
-                        "kind": "metric",
-                        "run_id": self._run_id,
-                        "step": self._step,
-                        "sigma": self._sigma,
-                        "layer": layer_index,
-                        "interval": interval,
-                        "source_step": source_step,
-                        "source_sigma": source_sigma,
-                        "sigma_delta": sigma_delta,
-                        "age": age,
-                        "kv": kv_name,
-                    }
-                    record.update({name: float(values[batch_index, kv_index]) for name, values in metrics.items()})
-                    self._pending_records.append(record)
-        self.stats.sampled_layers += 1
-        self._layers_seen.add(layer_index)
-        return k, v
-
-    def end_step(self) -> None:
-        if self._step is None:
-            raise RuntimeError("no active reference-KV Observer step")
-        if len(self._layers_seen) != self.num_layers:
-            raise RuntimeError(
-                "MiniMax-H3 reference-KV Observer saw "
-                f"{len(self._layers_seen)}/{self.num_layers} layers "
-                f"in step {self._step}"
-            )
-        for interval_index in self._refresh_indices:
-            self._source_steps[interval_index] = self._step
-            self._source_sigmas[interval_index] = self._sigma
-        if not self._inactive:
-            self.stats.observed_steps += 1
-        self._write_records(self._pending_records)
-        self.stats.metric_records += len(self._pending_records)
-        self._pending_records.clear()
-        self._refresh_indices.clear()
-        self._step = None
-        self._sigma = None
-        self._layers_seen.clear()
-
-    def abort_step(self) -> None:
-        self._pending_records.clear()
-        self._refresh_indices.clear()
-        self._step = None
-        self._sigma = None
-        self._layers_seen.clear()
-
-    def close(self) -> None:
-        if self._step is not None:
-            self.abort_step()
-        self._write_records(
-            [
-                {
-                    "kind": "run_end",
-                    "run_id": self._run_id,
-                    "observed_steps": self.stats.observed_steps,
-                    "sampled_layers": self.stats.sampled_layers,
-                    "metric_records": self.stats.metric_records,
-                    "sampled_d2h_bytes": self.stats.sampled_d2h_bytes,
-                    "snapshot_bytes": self.host_bytes,
-                    "source_steps": {
-                        str(interval): source
-                        for interval, source in zip(self.intervals, self._source_steps, strict=True)
-                    },
-                    "source_sigmas": {
-                        str(interval): sigma
-                        for interval, sigma in zip(self.intervals, self._source_sigmas, strict=True)
-                    },
-                    "inactive": self._inactive,
-                }
-            ]
-        )
-        _log.info(
-            "MiniMax-H3 reference-KV Observer summary: output=%s, "
-            "observed_steps=%d, sampled_layers=%d, metric_records=%d, "
-            "sampled_d2h_bytes=%d, snapshot_bytes=%d, inactive=%s",
-            self.output_path,
-            self.stats.observed_steps,
-            self.stats.sampled_layers,
-            self.stats.metric_records,
-            self.stats.sampled_d2h_bytes,
-            self.host_bytes,
-            self._inactive,
-        )
-        self._snapshots = None
-        self._sampled_positions = None
-        self._sampled_heads = None
-        self._local_reference_positions = None
-        self._local_sequence_rows = None
-
-
-__all__ = [
-    "MiniMaxH3ReferenceKVTier1State",
-    "MiniMaxH3ReferenceKVTier1Stats",
-    "MiniMaxH3ReferenceKVTier2State",
-    "MiniMaxH3ReferenceKVTier2Stats",
-    "MiniMaxH3ReferenceKVObserverState",
-    "MiniMaxH3ReferenceKVObserverStats",
-]
