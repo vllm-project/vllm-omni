@@ -9,6 +9,7 @@ from vllm import SamplingParams
 from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
 from vllm.v1.request import Request, RequestStatus
 
+from tests.core.sched.test_omni_ar_scheduler_streaming import _make_request
 from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
 from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
 from vllm_omni.core.sched.omni_scheduling_coordinator import OmniSchedulingCoordinator
@@ -19,7 +20,10 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 def test_ready_inbox_coalesces_live_events_and_drops_cancelled(mocker):
     scheduler = OmniSchedulerMixin()
-    scheduler.requests, scheduler.waiting, scheduler.running = {"r": object()}, [], []
+    request = _make_request()
+    request.request_id = "r"
+    owner = scheduler._prefix_cache_owner(request)
+    scheduler.requests, scheduler.waiting, scheduler.running = {"r": request}, [], []
     scheduler.kv_holding_waiting = []
     scheduler._is_blocked_waiting_status = OmniARScheduler._is_blocked_waiting_status
     coordinator = SimpleNamespace(
@@ -27,12 +31,13 @@ def test_ready_inbox_coalesces_live_events_and_drops_cancelled(mocker):
     )
     scheduler.input_coordinator = coordinator
     scheduler._init_omni_connector_output_inbox()
-    scheduler.enqueue_omni_connector_output(OmniConnectorOutput(chunk_ready_req_ids={"r"}))
+    scheduler.enqueue_omni_connector_output(OmniConnectorOutput(chunk_ready_req_ids={"r"}, input_owners={"r": owner}))
     scheduler.enqueue_omni_connector_output(
         OmniConnectorOutput(
             chunk_ready_req_ids={"r", "aborted"},
             chunk_finished_req_ids={"r", "aborted"},
             request_metadata={"r": {"decode_token_end": 2}, "aborted": {"decode_token_end": 99}},
+            input_owners={"r": owner},
         )
     )
     scheduler._consume_pending_connector_output(model_mode="ar")

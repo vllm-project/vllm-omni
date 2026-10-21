@@ -790,7 +790,7 @@ def test_accumulate_full_payload_output_preserves_aligned_all_zero_qwen3_omni_co
 
     OmniConnectorModelRunnerMixin.accumulate_full_payload_output(runner, "r1", {"codes.audio": codes}, request)
 
-    stored, _ = OmniConnectorModelRunnerMixin._materialize_full_payload_entry(runner._pending_full_payload_send["r1"])
+    stored, _ = runner._materialize_full_payload_entry(runner._pending_full_payload_send["r1"])
     assert torch.equal(stored["codes.audio"], codes)
 
 
@@ -805,7 +805,7 @@ def test_accumulate_full_payload_output_keeps_misaligned_all_zero_qwen3_omni_cod
 
     OmniConnectorModelRunnerMixin.accumulate_full_payload_output(runner, "r1", {"codes.audio": codes}, request)
 
-    stored, _ = OmniConnectorModelRunnerMixin._materialize_full_payload_entry(runner._pending_full_payload_send["r1"])
+    stored, _ = runner._materialize_full_payload_entry(runner._pending_full_payload_send["r1"])
     assert "codes.audio" in stored
     assert torch.equal(stored["codes.audio"], codes)
 
@@ -813,7 +813,8 @@ def test_accumulate_full_payload_output_keeps_misaligned_all_zero_qwen3_omni_cod
 def test_accumulate_full_payload_output_preserves_incremental_aligned_all_zero_qwen3_omni_codec_rows():
     runner = _make_full_payload_accumulation_runner()
     request = SimpleNamespace(output_token_ids=[0, 1])
-    runner._pending_full_payload_send["r1"] = (
+    runner.accumulate_full_payload_output(
+        "r1",
         {"codes.audio": torch.ones((1, 3), dtype=torch.long)},
         request,
     )
@@ -821,7 +822,7 @@ def test_accumulate_full_payload_output_preserves_incremental_aligned_all_zero_q
 
     OmniConnectorModelRunnerMixin.accumulate_full_payload_output(runner, "r1", {"codes.audio": codes}, request)
 
-    stored, _ = OmniConnectorModelRunnerMixin._materialize_full_payload_entry(runner._pending_full_payload_send["r1"])
+    stored, _ = runner._materialize_full_payload_entry(runner._pending_full_payload_send["r1"])
     assert stored["codes.audio"].shape == (2, 3)
     assert torch.equal(stored["codes.audio"][1], torch.zeros(3, dtype=torch.long))
 
@@ -836,7 +837,7 @@ def test_accumulate_full_payload_output_keeps_all_zero_qwen3_omni_prefill_placeh
 
     OmniConnectorModelRunnerMixin.accumulate_full_payload_output(runner, "r1", {"codes.audio": codes}, request)
 
-    stored, _ = OmniConnectorModelRunnerMixin._materialize_full_payload_entry(runner._pending_full_payload_send["r1"])
+    stored, _ = runner._materialize_full_payload_entry(runner._pending_full_payload_send["r1"])
     assert "codes.audio" in stored
     assert torch.equal(stored["codes.audio"], codes)
 

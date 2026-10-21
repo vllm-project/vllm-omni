@@ -5,7 +5,9 @@ snapshot identity/isolation, and the shared save/materialize gates.
 No vLLM and no GPU required (same shim as test_prefix_cache.py)."""
 
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Event
 from types import ModuleType, SimpleNamespace
 from typing import Any
 
@@ -103,6 +105,7 @@ class _CacheStub:
     def __init__(self):
         self.save_calls = []
         self.materialize_calls = []
+        self.discard_calls = []
         self.outs = StageCacheOutputs(hidden_states=None, mm_outputs={})
 
     def save_outputs(self, hidden, mm, *, num_tokens_unpadded, num_tokens_padded, write_layout):
@@ -112,6 +115,9 @@ class _CacheStub:
     def materialize(self, step_id, req_ids):
         self.materialize_calls.append((step_id, req_ids))
         return self.outs
+
+    def discard_step(self, step_id):
+        self.discard_calls.append(step_id)
 
 
 def test_step_begin_builds_once_and_registers_snapshot_policy(monkeypatch):
@@ -180,12 +186,69 @@ def test_materialize_requires_explicit_step_and_snapshot_req_ids():
     r = _Runner()
     stub = _CacheStub()
     r.omni_prefix_cache = stub
-    assert r._prefix_cache_materialize(None, ["a"]) == (None, None)
+    assert r._prefix_cache_materialize(None, ["a"]) is None
     assert stub.materialize_calls == []  # step_id None: nothing to consume
     hidden = {"a": torch.zeros(1, 2)}
     stub.outs = StageCacheOutputs(hidden_states=hidden, mm_outputs={})
-    assert r._prefix_cache_materialize(7, ["a"]) == (hidden, None)  # empty mm -> None
+    result = r._prefix_cache_materialize(7, ["a"])
+    assert result is stub.outs
+    assert result.mm_outputs == {}
     assert stub.materialize_calls == [(7, ["a"])]
+
+
+def test_prefix_cache_output_builders_wait_for_prior_ack():
+    r = _Runner()
+    r.omni_prefix_cache = _CacheStub()
+    first_started, release_first, second_started = Event(), Event(), Event()
+
+    def first():
+        first_started.set()
+        assert release_first.wait(5)
+        return "first acked"
+
+    first_builder = r._prefix_cache_order_output_builder(first)
+
+    def second():
+        second_started.set()
+        return "second"
+
+    second_builder = r._prefix_cache_order_output_builder(second)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first_future = pool.submit(first_builder)
+        assert first_started.wait(5)
+        second_future = pool.submit(second_builder)
+        assert not second_started.wait(0.1)
+        release_first.set()
+        assert first_future.result(timeout=5) == "first acked"
+        assert second_future.result(timeout=5) == "second"
+        assert second_started.is_set()
+
+
+def test_prefix_cache_failed_output_builder_unblocks_successor_with_error():
+    r = _Runner()
+    cache = _CacheStub()
+    r.omni_prefix_cache = cache
+    first_started, release_first = Event(), Event()
+    second_called = Event()
+
+    def first():
+        first_started.set()
+        assert release_first.wait(5)
+        raise RuntimeError("first failed")
+
+    first_builder = r._prefix_cache_order_output_builder(first)
+    second_builder = r._prefix_cache_order_output_builder(lambda: second_called.set(), step_id=7)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first_future = pool.submit(first_builder)
+        assert first_started.wait(5)
+        second_future = pool.submit(second_builder)
+        release_first.set()
+        with pytest.raises(RuntimeError, match="first failed"):
+            first_future.result(timeout=5)
+        with pytest.raises(RuntimeError, match="first failed"):
+            second_future.result(timeout=5)
+        assert not second_called.is_set()
+        assert cache.discard_calls == [7]
 
 
 def test_step_begin_and_save_keep_the_translated_snapshot(monkeypatch):
@@ -201,6 +264,7 @@ def test_step_begin_and_save_keep_the_translated_snapshot(monkeypatch):
     runner._prefix_cache_group_view = SimpleNamespace(
         batch_req_ids=lambda: ["r"],
         step_slots_cpu=lambda req_ids, counts: torch.arange(counts["r"], dtype=torch.long),
+        token_range=lambda req_id, count: (0, count),
     )
     arrival = SimpleNamespace(
         scheduled_new_reqs=[SimpleNamespace(req_id="r", num_computed_tokens=0)],
