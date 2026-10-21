@@ -11,7 +11,7 @@ from torch import nn
 from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.models.wan2_2.cudagraph_wrapper import Wan22DiTCUDAGraphWrapper
 
-pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+pytestmark = [pytest.mark.core_model]
 
 
 class _StubDiT(nn.Module):
@@ -35,6 +35,7 @@ def _inputs(device: str = "cpu", dtype: torch.dtype = torch.float32):
     )
 
 
+@pytest.mark.cpu
 def test_full_graph_cache_retires_as_one_generation() -> None:
     wrapper = Wan22DiTCUDAGraphWrapper(_StubDiT(), max_graphs=2)
     first = ((2, 48, 21, 60, 104), (2,), (2, 512, 4096))
@@ -49,6 +50,7 @@ def test_full_graph_cache_retires_as_one_generation() -> None:
     assert not wrapper._cache
 
 
+@pytest.mark.cpu
 def test_key_uses_exact_shapes() -> None:
     wrapper = Wan22DiTCUDAGraphWrapper(_StubDiT())
     inputs = _inputs()
@@ -56,6 +58,7 @@ def test_key_uses_exact_shapes() -> None:
     assert key == ((2, 48, 21, 60, 104), (2,), (2, 512, 4096))
 
 
+@pytest.mark.cpu
 def test_cpu_calls_run_through_the_transformer() -> None:
     dit = _StubDiT()
     wrapper = Wan22DiTCUDAGraphWrapper(dit)
@@ -71,6 +74,7 @@ def test_cpu_calls_run_through_the_transformer() -> None:
     assert "return_dict" not in dit.calls[0]
 
 
+@pytest.mark.cpu
 def test_unexpected_kwarg_falls_back_to_eager() -> None:
     dit = _StubDiT()
     wrapper = Wan22DiTCUDAGraphWrapper(dit)
@@ -85,7 +89,6 @@ def test_unexpected_kwarg_falls_back_to_eager() -> None:
 
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph replay requires CUDA")
-@pytest.mark.gpu
 def test_graph_replay_matches_eager_and_updates_inputs() -> None:
     model, wrapper = _make_gpu_wrapper(max_graphs=4)
     inputs = _inputs("cuda", torch.bfloat16)
@@ -110,7 +113,6 @@ def test_graph_replay_matches_eager_and_updates_inputs() -> None:
 
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph replay requires CUDA")
-@pytest.mark.gpu
 def test_graph_capture_failure_is_propagated(mocker) -> None:
     model, wrapper = _make_gpu_wrapper()
     inputs = _inputs("cuda", torch.bfloat16)
