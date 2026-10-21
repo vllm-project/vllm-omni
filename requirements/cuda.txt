@@ -1,3 +1,5 @@
 -r common.txt
 onnxruntime>=1.23.2
 # CUDA libraries come from the matching vLLM/PyTorch installation.
+# CosyVoice3 exports masked Attention (opset 23) for TensorRT.
+onnx>=1.18.0

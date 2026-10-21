@@ -112,6 +112,18 @@ def _cosyvoice3_trt_enabled() -> bool:
     return os.environ.get("COSYVOICE3_TRT", "1") not in ("0", "false", "False", "")
 
 
+def _cosyvoice3_trt_chunk_mask_enabled() -> bool:
+    """COSYVOICE3_TRT_CHUNK_MASK env toggle (default on).
+
+    When on, the flow-decoder engine is exported from the repo's DiT with the
+    attention map as an input, so streaming chunks run upstream's
+    chunk-causal mask (``DiT.forward(streaming=True)``) instead of the full
+    attention the bundled ONNX was traced with. Off restores the bundled-ONNX
+    engine. Env-var toggle for the same reason as ``COSYVOICE3_TRT``.
+    """
+    return os.environ.get("COSYVOICE3_TRT_CHUNK_MASK", "1") not in ("0", "false", "False", "")
+
+
 def _campplus_onnx_providers() -> list[str]:
     """ONNX-Runtime providers for the campplus speaker-embedding session.
 
@@ -1386,6 +1398,18 @@ class CosyVoice3Model(
         stl_out = _rows(speech_token_len, 2)
         return st_out, sf_out, emb_out, stl_out
 
+    def _flow_estimator_onnx_dir(self) -> str:
+        """Root for automatically exported estimators, including read-only models."""
+        cache_dir = os.environ.get("COSYVOICE3_TRT_CACHE") or os.path.join(
+            os.path.expanduser("~"), ".cache", "vllm_omni", "cosyvoice3_trt"
+        )
+        return os.path.join(cache_dir, "exported")
+
+    def _flow_estimator_cache_key(self) -> str:
+        from vllm_omni.model_executor.models.cosyvoice3.flow_estimator_trt import flow_checkpoint_fingerprint
+
+        return flow_checkpoint_fingerprint(self.model_dir)
+
     def _resolve_flow_estimator_onnx(self) -> str | None:
         """Locate the flow-decoder estimator ONNX for the TensorRT engine.
 
@@ -1439,27 +1463,47 @@ class CosyVoice3Model(
             return
         if not (_cosyvoice3_trt_enabled() and torch.cuda.is_available()):
             return
-        onnx_path = self._resolve_flow_estimator_onnx()
-        if onnx_path is None:
-            logger.warning("CosyVoice3 code2wav: no flow-estimator ONNX available; keeping torch estimator")
-            return
+        chunk_mask = _cosyvoice3_trt_chunk_mask_enabled()
         try:
-            from vllm_omni.model_executor.models.cosyvoice3.flow_estimator_trt import (
-                build_flow_estimator_trt,
-            )
+            if chunk_mask:
+                from vllm_omni.model_executor.models.cosyvoice3.flow_estimator_trt import (
+                    build_chunk_mask_flow_estimator_trt,
+                )
 
-            wrapper = build_flow_estimator_trt(onnx_path, device="cuda")
+                wrapper = build_chunk_mask_flow_estimator_trt(
+                    self.code2wav.flow_model.decoder.estimator,
+                    self._flow_estimator_onnx_dir(),
+                    device="cuda",
+                    cache_key=self._flow_estimator_cache_key(),
+                )
+                if not wrapper.supports_attn_mask:
+                    raise RuntimeError("chunk-mask TensorRT estimator has no attn_mask input")
+            else:
+                from vllm_omni.model_executor.models.cosyvoice3.flow_estimator_trt import (
+                    build_flow_estimator_trt,
+                )
+
+                onnx_path = self._resolve_flow_estimator_onnx()
+                if onnx_path is None:
+                    logger.warning("CosyVoice3 code2wav: no flow-estimator ONNX available; keeping torch estimator")
+                    return
+                wrapper = build_flow_estimator_trt(onnx_path, device="cuda")
             # ``estimator`` is a registered nn.Module submodule; delete it first
             # (frees the torch estimator weights) so the TRT wrapper can be set
             # as a plain attribute — nn.Module.__setattr__ rejects non-Modules.
             decoder = self.code2wav.flow_model.decoder
+            wrapper.static_chunk_size = int(getattr(decoder.estimator, "static_chunk_size", 0))
             del decoder.estimator
             decoder.estimator = wrapper
-            logger.info("CosyVoice3: using TensorRT flow-decoder estimator (code2wav)")
+            logger.info(
+                "CosyVoice3: using TensorRT flow-decoder estimator (code2wav, chunk_mask=%s)",
+                wrapper.supports_attn_mask,
+            )
         except Exception as exc:  # pragma: no cover - defensive fallback
             logger.warning(
-                "CosyVoice3 code2wav: TensorRT estimator build failed (%s); keeping torch estimator",
+                "CosyVoice3 code2wav: TensorRT estimator build failed (%s); keeping torch estimator (chunk_mask=%s)",
                 exc,
+                chunk_mask,
             )
 
     def make_omni_output(self, hidden_states: torch.Tensor, **kwargs) -> OmniOutput:

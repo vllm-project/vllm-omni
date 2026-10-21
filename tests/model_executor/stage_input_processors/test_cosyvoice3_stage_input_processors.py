@@ -464,3 +464,42 @@ def test_reference_features_are_snapshots_under_output_accumulation():
     payload = payload.merged_with(MultimodalPayload.from_dict({"embed.speech_feat": latest}))
     payload.consolidate_tensors(OutputModality.LATENT)
     assert payload["embed.speech_feat"] is latest
+
+
+def _hop_schedule(transfer_manager, request_id: str, prompt_len: int, n_tokens: int) -> list[int]:
+    request = SimpleNamespace(
+        external_req_id=request_id,
+        output_token_ids=list(range(1, n_tokens + 1)),
+        additional_information={"embed": {"speech_token": [torch.tensor([list(range(prompt_len))])]}},
+        is_finished=lambda: False,
+    )
+    hops = []
+    while True:
+        payload = talker2code2wav_async_chunk(
+            transfer_manager=transfer_manager, multimodal_output=None, request=request, is_finished=False
+        )
+        if payload is None:
+            return hops
+        hops.append(len(payload.codes.audio) - payload.meta.left_context_size)
+
+
+def test_short_first_chunk_realigns_to_flow_blocks():
+    """A 15-token first chunk keeps TTFA; the second hop lands prompt + emitted
+    tokens on a 25-token block boundary, and later hops follow upstream."""
+    transfer_manager = _transfer_manager(chunk_frames=25, stream_scale_factor=2, max_chunk_frames=100)
+    transfer_manager.connector.config["extra"]["codec_first_chunk_frames"] = 15
+
+    hops = _hop_schedule(transfer_manager, "rid-realign", prompt_len=7, n_tokens=200)
+
+    # 15 + 8 pads the prompt to 30; 20 reaches 50; then 50 and 100 as upstream.
+    assert hops == [23, 20, 50, 100]
+    boundaries = [7 + sum(hops[: i + 1]) for i in range(len(hops))]
+    assert [b % 25 for b in boundaries[1:]] == [0, 0, 0]
+
+
+def test_first_chunk_defaults_to_the_aligned_hop():
+    transfer_manager = _transfer_manager(chunk_frames=25, stream_scale_factor=2, max_chunk_frames=100)
+
+    hops = _hop_schedule(transfer_manager, "rid-default", prompt_len=7, n_tokens=200)
+
+    assert hops == [43, 50, 100]

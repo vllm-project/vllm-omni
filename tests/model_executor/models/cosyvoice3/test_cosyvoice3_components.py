@@ -511,10 +511,10 @@ class TestCFM:
                 self.execute_stream = None
 
             def set_input_shape(self, name, shape):
-                pass
+                return True
 
             def set_tensor_address(self, name, address):
-                pass
+                return True
 
             def execute_async_v3(self, stream):
                 self.execute_stream = stream
@@ -529,6 +529,9 @@ class TestCFM:
 
         class FakeEstimatorPool:
             io_dtype = torch.float32
+            out_dtype = torch.float32
+            supports_attn_mask = False
+            input_names = frozenset({"x", "mask", "mu", "t", "spks", "cond"})
 
             def __init__(self):
                 self.released = []

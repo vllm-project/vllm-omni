@@ -79,6 +79,9 @@ def test_packed_full_response_preserves_request_isolation(monkeypatch):
     model.hift.upsample_rates = [1]
     model.hift.istft_params = {"hop_len": 1}
     items = _items([(7, 17), (13, 9), (3, 31)])
+    # Independent inference uses the preallocated noise; packed inference
+    # samples below. Both paths must see the same noise for this comparison.
+    model.flow_model.decoder.rand_noise.zero_()
     monkeypatch.setattr(torch, "randn", lambda shape, **kw: torch.zeros(shape, **kw))
     expected = [model.forward(**item, n_timesteps=3) for item in items]
     actual = model.forward_batch(items, n_timesteps=3)
