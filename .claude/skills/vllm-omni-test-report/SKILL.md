@@ -1,6 +1,6 @@
 ---
 name: vllm-omni-test-report
-description: Three report kinds; **default output is always HTML** unless the user explicitly asks for Markdown (.md). **Release** — `scripts/compose_full_report.py` (**Test conclusion**, Buildkite metrics, **Test Result** = Common stack + optional `--log-dir-h*` nightly-style summaries + H100/CI block, Open bugs); use `--format markdown` only when the user wants .md or `patch_report_*.py`. **Development** — `compose_full_report.py --kind development` — same **Test Result** layout as release, but **drops Test conclusion** + the top-level Open issues section and replaces **Metrics overview** with a 2-row operator-editable snapshot (UT coverage · Device-Hours / Build; both cells click-to-edit and persisted via `localStorage`; no metric auto-fetched — the DI ladder lives in the nightly Daily focus card + issue-monitor report) plus a top-level **遗留事项 (Next Steps)** action table (editable, persisted via `localStorage`). Each H200/H800/A100 section under Test Result gets a `#### Performance Data Comparison` subsection (reuses nightly Local Test perf comparison logic; read-only against kanban `docs/assets/charts/*_history.json`; no `prepare_kanban_before_report.py` / no push). **Nightly** — `scripts/nightly_local_log_report.py` from local `nightly_jobs` (fetch: vllm-omni-local-test) plus optional latest Buildkite scheduled nightly when token is set; use `--markdown-report` / `--to-stdout markdown` only when the user asks for Markdown. **Archive (opt-in)** — when the user asks to archive/commit/push, run **`/home/wy/archive_to_omni_review.sh <report.html> data/<kind>_test_report/<name>.html`** on the bridge box (omni-reviewbot is the **sole** archive target since 2026-10-21 — kanban pushes stopped; kanban stays read-only for baselines; no gh CLI needed). Use when generating Buildkite release summaries, parsing local nightly_jobs with CI cross-check, or opening https://buildkite.com/vllm/vllm-omni/builds?branch=main for CI documentation.
+description: Three report kinds; **default output is always HTML** unless the user explicitly asks for Markdown (.md). **Release** — `scripts/compose_full_report.py` (**Test conclusion**, Buildkite metrics, **Test Result** = Common stack + optional `--log-dir-h*` nightly-style summaries + H100/CI block, Open bugs); use `--format markdown` only when the user wants .md or `patch_report_*.py`. **Development** — `compose_full_report.py --kind development` — same **Test Result** layout as release, but **drops Test conclusion** + the top-level Open issues section and replaces **Metrics overview** with a 2-row operator-editable snapshot (UT coverage · Device-Hours / Build; both cells click-to-edit and persisted via `localStorage`; no metric auto-fetched — the DI ladder lives in the nightly Daily focus card + issue-monitor report) plus a top-level **遗留事项 (Next Steps)** action table (editable, persisted via `localStorage`). Each H200/H800/A100 section under Test Result gets a `#### Performance Data Comparison` subsection (reuses nightly Local Test perf comparison logic; read-only against kanban `docs/assets/charts/*_history.json`; no `prepare_kanban_before_report.py` / no push). **Nightly** — `scripts/nightly_local_log_report.py` from local `nightly_jobs` (fetch: vllm-omni-local-test) plus optional latest Buildkite scheduled nightly when token is set; use `--markdown-report` / `--to-stdout markdown` only when the user asks for Markdown. **Archive (opt-in)** — when the user asks to archive/commit/push, run **`scripts/archive_to_omni_review.sh <report.html> data/<kind>_test_report/<name>.html`** (this skill's scripts/ dir, shared by the sibling report skills) on the bridge box (omni-reviewbot is the **sole** archive target since 2026-10-21 — kanban pushes stopped; kanban stays read-only for baselines; no gh CLI needed). Use when generating Buildkite release summaries, parsing local nightly_jobs with CI cross-check, or opening https://buildkite.com/vllm/vllm-omni/builds?branch=main for CI documentation.
 ---
 
 # vLLM-Omni Test Report
@@ -51,11 +51,21 @@ Shared helpers live in `scripts/report_naming.py`. (The retired `push_report_to_
 > The kanban repo remains a **read-only** dependency: baseline `docs/assets/charts/*_history.json`
 > and `prepare_kanban_before_report.py` (pull + mkdocs prep) still run exactly as before;
 > only the archive push target changed.
+>
+> **Baseline flow (why stopping kanban pushes does not freeze baselines):**
+> `*_history.json` are gitignored local state that **regenerates at every nightly prep**
+> (mkdocs build) from raw data — they never flowed through any archive push. The
+> `manual_*` payloads archived below, plus the daily `data/buildkite_nightly_raw` sync
+> the Actions bot already pushes to omni-reviewbot, are the **inputs omni-reviewbot's own
+> site build uses to regenerate the same history/charts** (`mkdocs_hooks` merges
+> `local_nightly_raw` + `buildkite_nightly_raw` → `generate_charts.py`) — so the baseline
+> is durable and obtainable from omni-review too. Report generation keeps reading the
+> local kanban clone (freshest right after prep).
 
 When archive/push intent is present, **after** HTML generation:
 
 1. Generate the report as usual (nightly prep still pulls the kanban repo for baselines — read-only).
-2. Run **`/home/wy/archive_to_omni_review.sh <src> <dest-data-path>`** (one or more `<src> <dest>` pairs) — it copies each file/dir directly into omni-reviewbot at `kanban/data/vllm_omni/<X>`, commits as `yenuo26`, and pushes with retry; the push auto-triggers the repo's `Build kanban site` workflow. It never touches the kanban repo:
+2. Run **`scripts/archive_to_omni_review.sh <src> <dest-data-path>`** (this skill's `scripts/` dir — the shared archive script the sibling report skills also use; one or more `<src> <dest>` pairs) — it copies each file/dir directly into omni-reviewbot at `kanban/data/vllm_omni/<X>`, commits as `yenuo26`, and pushes with retry; the push auto-triggers the repo's `Build kanban site` workflow. It never touches the kanban repo:
    - nightly → `<report.html> data/nightly_test_report/nightly-report-buildkite-latest-YYYY-MM-DD.html`, plus (when prep wrote `.last_manual_dir`) `<kanban-repo>/data/local_nightly_raw/manual_<dir> data/local_nightly_raw/manual_<dir>`
    - release → `<report.html> data/release_test_report/vllm-omni-release-test-report-YYYY-MM-DD.html`
    - development → `<report.html> data/development_test_report/vllm-omni-test-report-development-YYYY-MM-DD.html`
@@ -80,7 +90,7 @@ python scripts/nightly_local_log_report.py \
 
 # 2) Archive to omni-reviewbot (report + manual_* payload when prep created one)
 MANUAL_DIR="$(cat "$KANBAN_REPO_ROOT/data/local_nightly_raw/.last_manual_dir" 2>/dev/null || true)"
-/home/wy/archive_to_omni_review.sh \
+./scripts/archive_to_omni_review.sh \
   ./nightly-report-buildkite-latest-YYYY-MM-DD.html data/nightly_test_report/nightly-report-buildkite-latest-YYYY-MM-DD.html \
   ${MANUAL_DIR:+"$KANBAN_REPO_ROOT/data/local_nightly_raw/$MANUAL_DIR" data/local_nightly_raw/$MANUAL_DIR}
 
@@ -623,6 +633,6 @@ Per-machine failure detail. Click the *Failed* cell in the Test Result summary t
 - HTML from Markdown (release): [scripts/release_md_to_html.py](scripts/release_md_to_html.py) (used by compose_full_report)
 - **Nightly** log tree / pytest parsing: [references/nightly-local-log-layout.md](references/nightly-local-log-layout.md) (fetch off cluster: [vllm-omni-local-test](../vllm-omni-local-test/SKILL.md))
 - Buildkite performance summary from kanban assets: [scripts/kanban_assets_perf_summary.py](scripts/kanban_assets_perf_summary.py)
-- Archive HTML reports to omni-reviewbot: `/home/wy/archive_to_omni_review.sh` (kanban archive flow retired 2026-10-21; historical refs kept: [references/kanban-report-archive.md](references/kanban-report-archive.md), [scripts/push_report_to_kanban.py](scripts/push_report_to_kanban.py), [scripts/push_kanban_report.py](scripts/push_kanban_report.py))
+- Archive HTML reports to omni-reviewbot: `scripts/archive_to_omni_review.sh` (this skill's scripts/ dir, shared by the sibling report skills; kanban archive flow retired 2026-10-21; historical refs kept: [references/kanban-report-archive.md](references/kanban-report-archive.md), [scripts/push_report_to_kanban.py](scripts/push_report_to_kanban.py), [scripts/push_kanban_report.py](scripts/push_kanban_report.py))
 - Laptop path defaults (confirm before sync/prep/report): [references/confirm-laptop-path-defaults.md](references/confirm-laptop-path-defaults.md)
 - Kanban prep before report (pull, `manual_*`, mkdocs build): [references/kanban-pre-report-prep.md](references/kanban-pre-report-prep.md), [scripts/prepare_kanban_before_report.py](scripts/prepare_kanban_before_report.py)

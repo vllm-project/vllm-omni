@@ -1,6 +1,6 @@
 ---
 name: buildkite-ci-daily-analysis
-description: "Fetch yesterday's Buildkite builds (in **Beijing Time, CST, UTC+8**) for vllm-omni, vllm-omni-npu-ci, and vllm-omni-amd-ci pipelines (the default date window is the previous full CST calendar day, 00:00 — 23:59 CST) and analyze per-job and per-build success/failure and duration (with default infra-job filtering for `:pipeline: init`, `:docker: Build image`, `:buildkit: Build and Push`, `:github: Resolve skip-ci`, `Upload … Pipeline`, `Collect results`), then emit an HTML report with interactive **Pipeline**, **Branch**, **CI**, **State**, and **Job Name** filter dropdowns plus a **CI Aggregate** panel broken down by `ready` / `merge` / `nightly` / `weekly` buckets × pipeline (each card has both job-level and build-level stats). **Default output is always an HTML file** unless the user explicitly asks for Markdown or JSON. When the user explicitly says '归档报告' (or 'archive' / '提交报告' / 'push report'), archive the report ONLY to omni-reviewbot kanban/data/vllm_omni/ci_monitor/ via /home/wy/archive_to_omni_review.sh (sole target since 2026-10-21 — kanban pushes stopped). Use when the user says 'daily CI analysis', 'today's CI jobs', 'nightly status', 'CI health check', '今日 CI 分析', '今日 job 分析', '今日 build 分析', 'Buildkite 当日分析', or '归档报告'."
+description: "Fetch yesterday's Buildkite builds (in **Beijing Time, CST, UTC+8**) for vllm-omni, vllm-omni-npu-ci, and vllm-omni-amd-ci pipelines (the default date window is the previous full CST calendar day, 00:00 — 23:59 CST) and analyze per-job and per-build success/failure and duration (with default infra-job filtering for `:pipeline: init`, `:docker: Build image`, `:buildkit: Build and Push`, `:github: Resolve skip-ci`, `Upload … Pipeline`, `Collect results`), then emit an HTML report with interactive **Pipeline**, **Branch**, **CI**, **State**, and **Job Name** filter dropdowns plus a **CI Aggregate** panel broken down by `ready` / `merge` / `nightly` / `weekly` buckets × pipeline (each card has both job-level and build-level stats). **Default output is always an HTML file** unless the user explicitly asks for Markdown or JSON. When the user explicitly says '归档报告' (or 'archive' / '提交报告' / 'push report'), archive the report ONLY to omni-reviewbot kanban/data/vllm_omni/ci_monitor/ via the shared ../vllm-omni-test-report/scripts/archive_to_omni_review.sh (sole target since 2026-10-21 — kanban pushes stopped). Use when the user says 'daily CI analysis', 'today's CI jobs', 'nightly status', 'CI health check', '今日 CI 分析', '今日 job 分析', '今日 build 分析', 'Buildkite 当日分析', or '归档报告'."
 ---
 
 # Buildkite Daily CI Analysis
@@ -297,11 +297,17 @@ Only activate this behavior when the user explicitly says **`归档报告`**
 2. On the bridge box run:
 
    ```bash
-   /home/wy/archive_to_omni_review.sh \
+   ../vllm-omni-test-report/scripts/archive_to_omni_review.sh \
      ./ci-daily-YYYY-MM-DD.html data/ci_monitor/ci-daily-YYYY-MM-DD.html
    ```
 
-   The script copies the report into omni-reviewbot at `kanban/data/vllm_omni/ci_monitor/`, commits as `yenuo26`, and pushes (its push loop already handles fetch/rebase on non-fast-forward races with the Actions bot); the push auto-triggers the repo's `Build kanban site` workflow. It never touches the kanban repo.
+   The shared archive script lives in the sibling **vllm-omni-test-report**
+   skill (`scripts/archive_to_omni_review.sh`; the path above is relative to
+   this skill's directory). It copies the report into omni-reviewbot at
+   `kanban/data/vllm_omni/ci_monitor/`, commits as `yenuo26`, and pushes (its
+   push loop already handles fetch/rebase on non-fast-forward races with the
+   Actions bot); the push auto-triggers the repo's `Build kanban site`
+   workflow. It never touches the kanban repo.
 3. Report the archived path, commit hash, and push result to the
    user. If generation or the archive script fails (non-zero exit), report
    the failure accurately and do not claim that archival completed. In

@@ -139,12 +139,15 @@ Only activate this behavior when the user explicitly says **`归档报告`**
 2. On the bridge box run:
 
    ```bash
-   /home/wy/archive_to_omni_review.sh \
+   ../vllm-omni-test-report/scripts/archive_to_omni_review.sh \
      <pr-monitor-report-YYYY-MM-DD.html> data/pr_monitor/pr-monitor-report.html
    ```
 
-   — **no date in the destination filename**, overwrite semantics. The script
-   copies the report into omni-reviewbot at `kanban/data/vllm_omni/pr_monitor/`,
+   — **no date in the destination filename**, overwrite semantics. The shared
+   archive script lives in the sibling **vllm-omni-test-report** skill
+   (`scripts/archive_to_omni_review.sh`; the path above is relative to this
+   skill's directory). It copies the report into omni-reviewbot at
+   `kanban/data/vllm_omni/pr_monitor/`,
    commits as `yenuo26`, and pushes; the push auto-triggers the repo's
    `Build kanban site` workflow. It never touches the kanban repo.
 3. Report the archived path, commit hash, and push result. If generation or
