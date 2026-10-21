@@ -140,15 +140,15 @@ class MiniMaxH3DenoiseBranch:
                 for span in raw_spans
             )
             target_start = next(span.start for span in reversed(spans) if span.role == "target")
-            prefix_tags = token_tags[:target_start]
-            prefix_segments: list[int] = []
-            if prefix_tags.numel():
-                # Run-lengths preserve modality/reference boundaries without
-                # carrying CUDA tensors into every attention layer.
+            prefix_segments = packed.get("vsa_prefix_segments")
+            if prefix_segments is None:
+                # Native T2VA/FL2VA layouts use modality runs, including any
+                # vision-token overrides. Ref2VA supplies explicit boundaries.
+                prefix_tags = token_tags[:target_start]
                 boundaries = torch.nonzero(prefix_tags[1:] != prefix_tags[:-1]).flatten().tolist()
                 starts = [0, *(index + 1 for index in boundaries)]
                 stops = [*(index + 1 for index in boundaries), target_start]
-                prefix_segments = [stop - start for start, stop in zip(starts, stops, strict=True)]
+                prefix_segments = tuple(stop - start for start, stop in zip(starts, stops, strict=True) if stop > start)
             self.static_kwargs["video_token_layout"] = VideoTokenLayout(
                 used_len=int(cu[1]),
                 video_spans=spans,
@@ -411,6 +411,8 @@ def minimax_h3_denoise_loop(
                 video_target_timesteps=video_target_timesteps,
                 audio_target_timesteps=audio_target_timesteps,
             )
+            if getattr(getattr(model, "arch", None), "pdd_steps", None) is not None:
+                fk["pdd_step"] = step
             with torch.inference_mode():
                 v_video, v_audio = model(**fk)
             mv_video_t = v_video.float()[update]

@@ -20,6 +20,16 @@ from vllm_omni.worker.omni_connector_validation import validate_worker_omni_conn
 
 logger = init_logger(__name__)
 
+# Stage ids are non-negative, so this filter never matches a stage id; it must never be used as an index.
+# We use this as a sentinel value for --stage-id none to indicate all stages should be launched remotely.
+FRONTEND_ONLY_ID_FILTER = -1
+
+
+def is_frontend_only(single_stage_id_filter: int | None) -> bool:
+    """Return whether the stage filter asks the head to launch no local stage."""
+    return single_stage_id_filter == FRONTEND_ONLY_ID_FILTER
+
+
 # Maps model architecture names to their HuggingFace model_type values.
 # Used when auto-injecting hf_overrides for models with missing config.json.
 _ARCH_TO_MODEL_TYPE: dict[str, str] = {
@@ -59,6 +69,10 @@ def _register_omni_hf_configs() -> None:
             IndexTTS2Config,
             IndexTTS25Config,
         )
+        from vllm_omni.model_executor.models.ming3_tts.config_ming3_tts import (
+            LingV3TTSConfig,
+            Ming3TTSConfig,
+        )
         from vllm_omni.model_executor.models.ming_tts.config_ming_tts import (
             MingDenseConfig,
             MingMoeConfig,
@@ -96,6 +110,8 @@ def _register_omni_hf_configs() -> None:
         ("breeze", BreezeConfig),
         ("dense", MingDenseConfig),
         ("bailingmm", MingMoeConfig),
+        ("ming3_tts", Ming3TTSConfig),
+        ("lingv3_tts", LingV3TTSConfig),
         ("indextts2", IndexTTS2Config),
         ("indextts2_5", IndexTTS25Config),
         ("moss_tts_local", MossTTSLocalConfig),
@@ -626,7 +642,6 @@ class OrchestratorArgs:
     tts_max_instructions_length: int | None = None
     enable_diffusion_pipeline_profiler: bool = False
     enable_ar_profiler: bool = False
-    auxiliary_text_encoder: str | None = None
     log_file: str | None = None
     replica_id: int | None = None
     omni_replica_address: str | None = None

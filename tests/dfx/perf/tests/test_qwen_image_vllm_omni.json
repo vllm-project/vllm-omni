@@ -92,7 +92,14 @@
         "num-inference-steps": 20,
         "num-prompts": 10,
         "max-concurrency": 1,
-        "enable-negative-prompt": true
+        "enable-negative-prompt": true,
+        "baseline": {
+          "A3": {
+            "throughput_qps": 0.1395,
+            "latency_mean": 7.1679,
+            "peak_memory_mb_mean": 56318.0
+          }
+        }
       }
     ]
   },
@@ -172,9 +179,9 @@
         "enable-negative-prompt": true,
         "baseline": {
           "H100": {
-            "throughput_qps": [0.3937, 0.6606, 0.6188, 0.7752],
-            "latency_mean": [2.5466, 3.0235, 6.3948, 10.1944],
-            "peak_memory_mb_mean": [55149.0, 55150.0, 55153.1458, 55156.325]
+            "throughput_qps": [0.3937, 0.6606, 0.6189, 0.7931],
+            "latency_mean": [2.5466, 3.0235, 6.3884, 9.9601],
+            "peak_memory_mb_mean": [55033.0, 55033.0, 55033.6667, 55035.7521]
           }
         }
       }
@@ -214,7 +221,14 @@
         "num-inference-steps": 20,
         "num-prompts": 10,
         "max-concurrency": 1,
-        "enable-negative-prompt": true
+        "enable-negative-prompt": true,
+        "baseline": {
+          "A3": {
+            "throughput_qps": 0.1393,
+            "latency_mean": 7.1803,
+            "peak_memory_mb_mean": 56318.0
+          }
+        }
       },
       {
         "name": "512x512_steps20_high_concurrency",
@@ -228,7 +242,29 @@
         "warmup-requests": 8,
         "warmup-concurrency": 8,
         "warmup-num-inference-steps": 20,
-        "enable-negative-prompt": true
+        "enable-negative-prompt": true,
+        "baseline": {
+          "A3": {
+            "throughput_qps": [
+              0.1385,
+              0.1756,
+              0.2076,
+              0.2154
+            ],
+            "latency_mean": [
+              7.2208,
+              11.3784,
+              19.208,
+              36.7984
+            ],
+            "peak_memory_mb_mean": [
+              56321.0,
+              56321.3333,
+              56321.3333,
+              56323.8562
+            ]
+          }
+        }
       }
     ]
   },
@@ -275,6 +311,11 @@
             "throughput_qps": 0.1214,
             "latency_mean": 8.2211,
             "peak_memory_mb_mean": 54474.0
+          },
+          "A3": {
+            "throughput_qps": 0.0332,
+            "latency_mean": 30.1144,
+            "peak_memory_mb_mean": 55994.0
           }
         }
       }
@@ -331,7 +372,7 @@
           "H100": {
             "throughput_qps": 0.559,
             "latency_mean": 1.794,
-            "peak_memory_mb_mean": 55174.0
+            "peak_memory_mb_mean": 55154.0
           }
         }
       },
@@ -401,7 +442,14 @@
         "num-inference-steps": 20,
         "num-prompts": 10,
         "max-concurrency": 1,
-        "enable-negative-prompt": true
+        "enable-negative-prompt": true,
+        "baseline": {
+          "A3": {
+            "throughput_qps": 0.2854,
+            "latency_mean": 3.5091,
+            "peak_memory_mb_mean": 56418.0
+          }
+        }
       }
     ]
   }

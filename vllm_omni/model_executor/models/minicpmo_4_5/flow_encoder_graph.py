@@ -86,7 +86,8 @@ class FlowEncoderGraphs:
 
     ``encode_fn(tokens, cnn_cache=, att_cache=)`` supplies the continuation
     body. ``chunk_forward`` additionally accepts ``last_chunk`` for generic
-    calls. Startup capture freezes admission; unseen shapes then run eager.
+    calls. Startup capture freezes admission by default; opt-in exact-shape capture
+    can retain repeated tail and prompt shapes in a separate bounded cache.
 
     Caches use the encoder layouts: ``cnn_cache`` ``(rows, channels, width)``,
     ``att_cache`` ``(depth, rows, heads, frames, 2 * head_dim)``; a chunk of
@@ -106,6 +107,7 @@ class FlowEncoderGraphs:
         held_tensors: Callable[[], Sequence[torch.Tensor]] = tuple,
         max_graphs: int = 8,
         capture_after: int = 2,
+        capture_after_precapture: bool = False,
         eager_min_batch: int | None = None,
         chunk_forward: Callable | None = None,
     ) -> None:
@@ -135,7 +137,8 @@ class FlowEncoderGraphs:
         self.eager_min_batch = None if eager_min_batch is None else int(eager_min_batch)
         if self.eager_min_batch is not None and self.eager_min_batch < 1:
             raise ValueError("encoder graph eager_min_batch must be >= 1")
-        # Startup precapture turns this off so serving only replays those graphs.
+        # Keep runtime capture opt-in after the shared continuation arena is ready.
+        self.capture_after_precapture = bool(capture_after_precapture)
         self.capture_on_request = True
         self.exact_graphs = {}
         self.seen = OrderedDict()

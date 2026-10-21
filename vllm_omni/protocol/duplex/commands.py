@@ -121,6 +121,8 @@ class AckPlayback(RealtimeCommand):
     committed_ms: int | None = None
     response_id: str | None = None
     item_id: str | None = None
+    #: Stop playback at the committed cutoff instead of reporting progress.
+    truncate: bool = False
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

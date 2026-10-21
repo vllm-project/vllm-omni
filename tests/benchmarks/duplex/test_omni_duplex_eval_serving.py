@@ -28,7 +28,7 @@ from vllm_omni.utils.tracking_parser import TrackingArgumentParser
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.benchmark]
 
 
-def _args(tmp_path, *extra):
+def _args(tmp_path, *extra, ref_audio=True):
     ref = tmp_path / "reference.wav"
     ref.write_bytes(b"reference")
     manifest = tmp_path / "samples.json"
@@ -54,8 +54,7 @@ def _args(tmp_path, *extra):
             str(manifest),
             "--endpoint",
             "/v1/realtime",
-            "--duplex-eval-ref-audio",
-            str(ref),
+            *(["--duplex-eval-ref-audio", str(ref)] if ref_audio else []),
             "--duplex-eval-response-root",
             str(tmp_path / "responses"),
             "--disable-shuffle",
@@ -97,6 +96,7 @@ def _result(sample):
         request_metrics=[{"stage0_tokens": {"output_token_count": 3, "itls_ms": [10.0, 30.0]}}],
         session_metrics={"ttft_ms": {"mean": 100.0}, "ttfp_ms": {"mean": 200.0}, "rtf": {"mean": 0.5}},
         timed_sentences=[{"sentence": "Done.", "start": 0.01, "end": 0.01}],
+        timed_chunks=[{"text": "Done.", "current_time": 0.01}],
         metadata={"response_done": True, "clock": "media"},
         output_tokens=3,
         audio_bytes=48000,
@@ -112,6 +112,17 @@ def test_selection_uses_standard_prompt_count(tmp_path, prepared, count, expecte
     assert args.max_concurrency == 1
     assert all(request.ref_audio is requests[0].ref_audio for request in requests)
     assert len({request.request_id for request in requests}) == expected
+
+
+@pytest.mark.parametrize("instructions", [None, "", "Reply briefly."])
+def test_session_instructions_preserve_native_default_or_explicit_override(tmp_path, prepared, instructions):
+    args = _args(
+        tmp_path, *([] if instructions is None else ["--duplex-eval-instructions", instructions]), ref_audio=False
+    )
+    preprocess_serve_args(args)
+    requests = patch.get_samples(args, None)
+    expected = runner.DEFAULT_INSTRUCTIONS if instructions is None else instructions or None
+    assert all(request.instructions == expected and request.ref_audio is None for request in requests)
 
 
 def test_repeated_sweep_runs_keep_artifacts_isolated(tmp_path, prepared):
@@ -136,7 +147,7 @@ def test_repeated_sweep_runs_keep_artifacts_isolated(tmp_path, prepared):
     assert roots[0] != roots[1]
     assert all(root.parent == parent for root in roots)
     for concurrency, root in enumerate(roots, start=1):
-        assert json.loads((root / "PR_correction/0.json").read_text()) == [{"sentence": str(concurrency)}]
+        assert json.loads((root / "PR_correction/0.json").read_text())["sentences"] == [{"sentence": str(concurrency)}]
 
 
 @pytest.mark.asyncio
@@ -154,6 +165,7 @@ async def test_standalone_preparation_keeps_event_loop_responsive(tmp_path, prep
         return prepared
 
     monkeypatch.setattr(runner, "prepare_sample", slow_prepare)
+    monkeypatch.setattr(runner, "_COMPLETION_SETTLE_S", 0.05)
 
     async def handler(socket):
         async for raw in socket:
@@ -161,6 +173,7 @@ async def test_standalone_preparation_keeps_event_loop_responsive(tmp_path, prep
             if event["type"] == "session.update":
                 await socket.send(json.dumps({"type": "session.created"}))
             elif event["type"] == "input_audio_buffer.commit":
+                await socket.send(json.dumps({"type": "input_audio_buffer.committed"}))
                 await socket.send(json.dumps({"type": "response.created", "response": {"id": "r1"}}))
                 await socket.send(json.dumps({"type": "response.done", "response": {"id": "r1"}}))
             elif event["type"] == "session.close":
@@ -405,10 +418,78 @@ async def test_adapter_preserves_metrics_and_forwards_request(tmp_path, prepared
     assert kwargs["additional_headers"]["Authorization"] == "Bearer test-key"
     assert kwargs["additional_headers"]["X-Custom"] == "test"
     assert kwargs["extra_body"] == request.extra_body and kwargs["defer_artifacts"]
+    assert kwargs["turn_detection"] == "none" and kwargs["instructions"] == runner.DEFAULT_INSTRUCTIONS
+    assert kwargs["mix"] == runner.MIX_QUESTION
     assert not expected.output.exists()
     summary = adapter.finalize_duplex_eval([sample], [output])
     assert summary["published"] == 1 and not summary["artifact_errors"]
-    assert json.loads(expected.output.read_text()) == expected.timed_sentences
+    assert json.loads(expected.output.read_text()) == {
+        "sentences": expected.timed_sentences,
+        "chunks": expected.timed_chunks,
+    }
+
+
+@pytest.mark.asyncio
+async def test_soundtrack_mix_reaches_preparation_and_session(tmp_path, monkeypatch):
+    args = _args(tmp_path, "--duplex-eval-mix", "soundtrack")
+    preprocess_serve_args(args)
+    sample = patch.get_samples(args, None)[0]
+    assert sample.mix == runner.MIX_SOUNDTRACK
+    prepared_mix = []
+    generated_mix = []
+
+    def prepare(*args, **kwargs):
+        prepared_mix.append(kwargs["mix"])
+        return runner.PreparedSample(b"\0\0" * 160, (), 0.01, None, None, mix=kwargs["mix"])
+
+    async def generate(case, **kwargs):
+        generated_mix.append(kwargs["mix"])
+        return _result(sample)
+
+    monkeypatch.setattr(adapter, "prepare_sample", prepare)
+    monkeypatch.setattr(runner, "generate_sample", generate)
+    output = await patch.async_request_openai_realtime_duplex(_request(sample), session=None)
+    assert output.success
+    assert prepared_mix == generated_mix == [runner.MIX_SOUNDTRACK]
+
+
+def test_soundtrack_preparation_overlays_clip_audio(tmp_path, monkeypatch):
+    question = (b"\x10\x00" * 4) + (b"\x00\x00" * 4)
+    soundtrack = b"\x01\x00" * 6
+    monkeypatch.setattr(runner, "read_audio_pcm16", lambda path: question)
+    monkeypatch.setattr(runner, "read_soundtrack_pcm16", lambda path: soundtrack)
+    monkeypatch.setattr(runner, "iter_jpegs", lambda *args, **kwargs: iter(()))
+    sample = runner.DuplexSample(
+        id="0",
+        split="PR_post_event_reminder",
+        family="pr",
+        task_type="post_event_reminder",
+        video="clip.mp4",
+        question_audio="question.wav",
+        video_duration=1.0,
+    )
+    plain = runner.prepare_sample(sample, media_dir=tmp_path, ref_audio=None, fps=1.0)
+    mixed = runner.prepare_sample(sample, media_dir=tmp_path, ref_audio=None, fps=1.0, mix=runner.MIX_SOUNDTRACK)
+    assert plain.pcm == question and plain.mix == runner.MIX_QUESTION
+    assert mixed.pcm == (b"\x11\x00" * 4) + (b"\x01\x00" * 2) + (b"\x00\x00" * 2)
+    assert mixed.mix == runner.MIX_SOUNDTRACK
+    with pytest.raises(ValueError, match="mix must be one of"):
+        runner.prepare_sample(sample, media_dir=tmp_path, ref_audio=None, fps=1.0, mix="karaoke")
+
+
+@pytest.mark.asyncio
+async def test_generate_rejects_input_prepared_with_another_mix(tmp_path, prepared):
+    sample = _samples(tmp_path)[0]
+    with pytest.raises(ValueError, match="prepared input uses mix='question'"):
+        await runner.generate_sample(
+            sample.sample,
+            url="http://localhost:8000/v1/realtime",
+            model="mock",
+            ref_audio=None,
+            output_root=tmp_path,
+            mix=runner.MIX_SOUNDTRACK,
+            prepared=prepared,
+        )
 
 
 def test_rejects_response_metadata_collision(tmp_path, prepared):
@@ -516,9 +597,13 @@ async def test_cancelled_request_propagates_and_cleans_up(tmp_path, prepared, mo
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("error_code,success", [("playback_ack_too_late", True), ("invalid_session", False)])
-async def test_socket_errors_match_omniinteract_policy(tmp_path, prepared, error_code, success):
+@pytest.mark.parametrize(
+    "error_code,success",
+    [("playback_ack_too_late", True), ("playback_item_not_found", True), ("invalid_session", False)],
+)
+async def test_socket_errors_match_omniinteract_policy(tmp_path, prepared, error_code, success, monkeypatch):
     sample = _samples(tmp_path)[0]
+    monkeypatch.setattr(runner, "_COMPLETION_SETTLE_S", 0.05)
 
     async def handler(socket):
         async for raw in socket:
@@ -527,6 +612,7 @@ async def test_socket_errors_match_omniinteract_policy(tmp_path, prepared, error
                 await socket.send(json.dumps({"type": "session.created"}))
             elif event["type"] == "input_audio_buffer.commit":
                 for response in [
+                    {"type": "input_audio_buffer.committed"},
                     {"type": "response.created", "response": {"id": "r1"}},
                     {"type": "response.done", "response": {"id": "r1", "status": "completed"}},
                     {"type": "error", "error": {"code": error_code}},
@@ -556,6 +642,7 @@ async def test_multiturn_drain_and_clip_end(tmp_path, prepared, monkeypatch, sta
         await original_wait(predicate, timeout_s=0.2, label=kwargs["label"])
 
     monkeypatch.setattr(runner, "wait_for", bounded_wait)
+    monkeypatch.setattr(runner, "_COMPLETION_SETTLE_S", 0.05)
 
     async def handler(socket):
         nonlocal closed_before_tail
@@ -565,6 +652,11 @@ async def test_multiturn_drain_and_clip_end(tmp_path, prepared, monkeypatch, sta
             await asyncio.sleep(0.05)
             await socket.send(json.dumps({"type": "response.output_text.delta", "response_id": "r2", "delta": "Tail."}))
             await socket.send(json.dumps({"type": "response.done", "response": {"id": "r2", "status": status}}))
+            # A cancelled reply can still be followed by the residual decision.
+            # A failed reply is itself terminal, so it needs no listen.
+            if status != "failed":
+                listen = {"type": "response.listen", "response": {"metadata": {"model_listen": True}}}
+                await socket.send(json.dumps(listen))
             tail_done.set()
 
         try:
@@ -580,7 +672,14 @@ async def test_multiturn_drain_and_clip_end(tmp_path, prepared, monkeypatch, sta
                         *([] if status == "close_tail" else [{"type": "response.created", "response": {"id": "r2"}}]),
                     ]:
                         await socket.send(json.dumps(response))
-                elif event["type"] == "input_audio_buffer.commit" and status not in {"timeout", "close_tail"}:
+                elif event["type"] == "input_audio_buffer.commit" and status == "close_tail":
+                    # The clip's reply is already done. The residual unit listens,
+                    # and the extra response is created only while the session closes.
+                    await socket.send(json.dumps({"type": "input_audio_buffer.committed"}))
+                    listen = {"type": "response.listen", "response": {"metadata": {"model_listen": True}}}
+                    await socket.send(json.dumps(listen))
+                elif event["type"] == "input_audio_buffer.commit" and status != "timeout":
+                    await socket.send(json.dumps({"type": "input_audio_buffer.committed"}))
                     pending = asyncio.create_task(finish_tail())
                 elif event["type"] == "session.close":
                     closed_before_tail = not tail_done.is_set()
@@ -608,10 +707,14 @@ async def test_multiturn_drain_and_clip_end(tmp_path, prepared, monkeypatch, sta
     assert summary["published"] == int(success)
     assert summary["published_with_unfinished_responses"] == int(status == "close_tail")
     if success:
-        sentences = json.loads(output.duplex_eval_result.output.read_text())
+        response = json.loads(output.duplex_eval_result.output.read_text())
+        sentences = response["sentences"]
         assert sentences[0]["sentence"] == "Earlier."
         if status != "close_tail":
             assert sentences[1]["sentence"] == "Tail."
+        assert "".join(chunk["text"] for chunk in response["chunks"]) == "".join(
+            sentence["sentence"] for sentence in sentences
+        )
 
 
 @pytest.mark.asyncio
@@ -737,10 +840,28 @@ def test_artifact_io_failure_preserves_service_results(tmp_path, prepared, monke
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("judge_status", [None, 200, 503])
-async def test_benchmark_socket_lifecycle_excludes_warmups(tmp_path, prepared, monkeypatch, capsys, judge_status):
-    samples = _samples(tmp_path)
+@pytest.mark.parametrize("turn_detection", ["none", "server_vad"])
+async def test_benchmark_socket_lifecycle_excludes_warmups(
+    tmp_path, prepared, monkeypatch, capsys, judge_status, turn_detection
+):
+    args = _args(
+        tmp_path,
+        "--duplex-eval-turn-detection",
+        turn_detection,
+        "--duplex-eval-instructions",
+        "Reply briefly.",
+        ref_audio=turn_detection == "none",
+    )
+    preprocess_serve_args(args)
+    samples = patch.get_samples(args, None)
+    if turn_detection == "server_vad":
+        assert all(sample.ref_audio is None for sample in samples)
+        monkeypatch.setattr(adapter, "prepare_sample", lambda *args, **kwargs: replace(prepared, ref_audio=None))
+        monkeypatch.setattr(runner, "SERVER_VAD_TAIL_S", 0.02)
+        monkeypatch.setattr(runner, "_SERVER_TURN_SETTLE_S", 0.05)
     configured: list[dict] = []
     judge_calls = []
+    received_types: list[str] = []
 
     class BenchmarkTime:
         offset = 0.0
@@ -778,14 +899,31 @@ async def test_benchmark_socket_lifecycle_excludes_warmups(tmp_path, prepared, m
         )
         samples = [replace(sample, evaluation=options) for sample in samples]
 
+    monkeypatch.setattr(runner, "_COMPLETION_SETTLE_S", 0.05)
+
     async def handler(socket):
+        responded = False
         async for raw in socket:
             event = json.loads(raw)
+            received_types.append(event["type"])
             if event["type"] == "session.update":
                 configured.append(event["session"])
-                await socket.send(json.dumps({"type": "session.created"}))
-            elif event["type"] == "input_audio_buffer.commit":
+                capabilities = (
+                    {
+                        "required_input_modalities": ["audio"],
+                        "optional_input_modalities": [],
+                        "supports_image_input": True,
+                    }
+                    if turn_detection == "server_vad"
+                    else {}
+                )
+                await socket.send(json.dumps({"type": "session.created", "session": {"capabilities": capabilities}}))
+            elif not responded and event["type"] == (
+                "input_audio_buffer.append" if turn_detection == "server_vad" else "input_audio_buffer.commit"
+            ):
+                responded = True
                 for response in [
+                    *([] if turn_detection == "server_vad" else [{"type": "input_audio_buffer.committed"}]),
                     {"type": "response.created", "response": {"id": "r1"}},
                     {"type": "response.output_text.delta", "response_id": "r1", "delta": "Done."},
                     {
@@ -833,15 +971,25 @@ async def test_benchmark_socket_lifecycle_excludes_warmups(tmp_path, prepared, m
             await judge_server.cleanup()
     assert len(configured) == 5  # one readiness, two warmups, two measured sessions
     assert all(session["extra_body"]["custom"] == "test" for session in configured)
+    assert all(session["instructions"] == "Reply briefly." for session in configured)
+    if turn_detection == "server_vad":
+        assert all(session["turn_detection"] == {"type": "server_vad"} for session in configured)
+        assert all(
+            "ref_audio" not in session and session["extra_body"]["auto_response"] is False for session in configured
+        )
+        assert "input_audio_buffer.commit" not in received_types
+        assert received_types.count("conversation.item.create") == 5
     assert result["completed"] == 2
     assert len(result["duplex_session_metrics"]) == 2
     assert len(result["duplex_request_metrics"]) == 2
     assert result["omni_duplex_eval"]["published"] == 2
     root = samples[0].response_root
     assert len(list(root.glob("*/*.meta.json"))) == 2
-    assert json.loads((root / "PR_correction/0.json").read_text()) == [
-        {"sentence": "Done.", "start": 0.01, "end": 0.01}
-    ]
+    response = json.loads((root / "PR_correction/0.json").read_text())
+    sentence = response["sentences"][0]
+    assert sentence["sentence"] == "Done."
+    assert sentence["start"] == sentence["end"] == pytest.approx(0.03 if turn_detection == "server_vad" else 0.01)
+    assert response["chunks"] == [{"text": "Done.", "current_time": sentence["start"]}]
     report = json.loads((root / "duplex_metrics.json").read_text())
     assert len(report["duplex_session_metrics"]) == 2
     assert 0 <= result["duration"] < 3600

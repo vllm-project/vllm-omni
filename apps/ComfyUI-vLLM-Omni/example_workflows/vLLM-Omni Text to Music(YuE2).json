@@ -1,0 +1,268 @@
+{
+  "id": "830b7fd3-73b9-4f91-b545-e8f5bd9a7da7",
+  "revision": 0,
+  "last_node_id": 5,
+  "last_link_id": 3,
+  "nodes": [
+    {
+      "id": 1,
+      "type": "VLLMOmniGenerateMusic",
+      "pos": [
+        920,
+        80
+      ],
+      "size": [
+        390,
+        700
+      ],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "url",
+          "type": "STRING",
+          "widget": {
+            "name": "url"
+          },
+          "link": null
+        },
+        {
+          "name": "model",
+          "type": "STRING",
+          "widget": {
+            "name": "model"
+          },
+          "link": null
+        },
+        {
+          "name": "instructions",
+          "type": "STRING",
+          "widget": {
+            "name": "instructions"
+          },
+          "link": null
+        },
+        {
+          "name": "lyrics",
+          "type": "STRING",
+          "widget": {
+            "name": "lyrics"
+          },
+          "link": null
+        },
+        {
+          "name": "max_duration_seconds",
+          "type": "FLOAT",
+          "widget": {
+            "name": "max_duration_seconds"
+          },
+          "link": null
+        },
+        {
+          "name": "seed",
+          "type": "INT",
+          "widget": {
+            "name": "seed"
+          },
+          "link": null
+        },
+        {
+          "name": "response_format",
+          "type": "COMBO",
+          "widget": {
+            "name": "response_format"
+          },
+          "link": null
+        },
+        {
+          "name": "model_specific_params",
+          "type": "MUSIC_PARAMS",
+          "link": 2
+        }
+      ],
+      "outputs": [
+        {
+          "name": "audio",
+          "type": "AUDIO",
+          "links": [
+            3
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VLLMOmniGenerateMusic"
+      },
+      "widgets_values": [
+        "http://localhost:8000/v1",
+        "m-a-p/YuE2-3B",
+        "Upbeat J-pop with clear, expressive female vocals singing in English. Sparkling piano, bright electric guitars, punchy live drums, melodic bass, and subtle synth layers. Youthful and energetic, with a sunlit summer atmosphere. Rhythmically lively verses build into a soaring, memorable chorus with rich vocal harmonies and colorful chord changes. Polished modern production with clear vocals and a bright, spacious mix.",
+        "[Verse]\nMorning light across the window\nCity waking down below\nI can hear the streets are calling\nFeels like somewhere we should go\n\n[Chorus]\nRun with me into the sunlight\nLeave the shadows far behind\nWe don't need to know tomorrow\nTonight the whole world feels alive\n\n[Verse]\nRadio playing through the open door\nLaughing like we did before\nEvery mile becomes a memory\nAnd I just want a little more\n\n[Chorus]\nRun with me into the sunlight\nLeave the shadows far behind\nWe don't need to know tomorrow\nTonight the whole world feels alive",
+        300.0,
+        0,
+        "fixed",
+        "wav"
+      ]
+    },
+    {
+      "id": 2,
+      "type": "SaveAudioAdvanced",
+      "pos": [
+        1360,
+        80
+      ],
+      "size": [
+        320,
+        320
+      ],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "audio",
+          "type": "AUDIO",
+          "link": 3
+        },
+        {
+          "name": "filename_prefix",
+          "type": "STRING",
+          "widget": {
+            "name": "filename_prefix"
+          },
+          "link": null
+        },
+        {
+          "name": "format",
+          "type": "COMFY_DYNAMICCOMBO_V3",
+          "widget": {
+            "name": "format"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "name": "audio",
+          "type": "AUDIO",
+          "links": null
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "SaveAudioAdvanced"
+      },
+      "widgets_values": [
+        "audio/vLLM-Omni-YuE2-Text-to-Music",
+        "mp3",
+        "V0"
+      ]
+    },
+    {
+      "id": 3,
+      "type": "MarkdownNote",
+      "title": "YuE2 Text to Music Generation Guide",
+      "pos": [
+        0,
+        80
+      ],
+      "size": [
+        480,
+        700
+      ],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "properties": {},
+      "widgets_values": [
+        "## YuE2 Text to Music Generation Guide\n\nThis template uses **YuE2** through the existing **Generate Music** node and **YuE2 Params**. Caption describes the music; Lyrics supplies the words. The default `cot=off` generates without an ABC score.\n\n### Parameters\n\n| Parameter | Description |\n|---|---|\n| url | vLLM-Omni service URL including `/v1`. Default: `http://localhost:8000/v1`. |\n| model | Served model name. Default: `m-a-p/YuE2-3B`. Match the running service. |\n| caption | Required music description, sent as `instructions`. Describe genre, instruments, mood, vocal language and arrangement. |\n| lyrics | Required words to sing, sent as `input`. Use section tags such as `[Verse]`, `[Chorus]` and `[Bridge]`. |\n| max_duration_seconds | Duration cap, default 300 seconds. YuE2 accepts 8–360 seconds; converted at 25 frames/s, rounded down. Generation may end earlier. |\n| seed | Random seed, default 0; range 0–9007199254740991. Keep all inputs and runtime settings unchanged for repeatability. |\n| control_after_generate | Seed behavior: fixed, randomize, increment or decrement. Template default: fixed. |\n| response_format | API audio format: WAV, MP3, FLAC or Opus. Template default: WAV. Save Audio independently exports MP3. |\n| model_specific_params | Optional MUSIC_PARAMS connection from YuE2 Params, carrying cot and ABC to the service. |\n| cot | `off`: no ABC; `melody`: supplied melody score; `full`: supplied score with chord annotations. |\n| abc | ABC score text, not a file path. Required for `melody/full`; keep empty for `off`. |\n\n### Usage\n\nSet URL/model to your YuE2 service, edit Caption and Lyrics, then queue the graph. Save Audio previews the output and writes MP3. To condition on an existing score, paste ABC text and choose its matching `melody/full` mode.\n\n### Prompt Writing Guide\n\nKeep Caption focused on genre, instrumentation, vocals and arrangement. Set the vocal language to match Lyrics. Section tags guide song structure without guaranteeing exact timing.\n"
+      ],
+      "widgets_values_named": {
+        "text": "## YuE2 Text to Music Generation Guide\n\nThis template uses **YuE2** through the existing **Generate Music** node and **YuE2 Params**. Caption describes the music; Lyrics supplies the words. The default `cot=off` generates without an ABC score.\n\n### Parameters\n\n| Parameter | Description |\n|---|---|\n| url | vLLM-Omni service URL including `/v1`. Default: `http://localhost:8000/v1`. |\n| model | Served model name. Default: `m-a-p/YuE2-3B`. Match the running service. |\n| caption | Required music description, sent as `instructions`. Describe genre, instruments, mood, vocal language and arrangement. |\n| lyrics | Required words to sing, sent as `input`. Use section tags such as `[Verse]`, `[Chorus]` and `[Bridge]`. |\n| max_duration_seconds | Duration cap, default 300 seconds. YuE2 accepts 8–360 seconds; converted at 25 frames/s, rounded down. Generation may end earlier. |\n| seed | Random seed, default 0; range 0–9007199254740991. Keep all inputs and runtime settings unchanged for repeatability. |\n| control_after_generate | Seed behavior: fixed, randomize, increment or decrement. Template default: fixed. |\n| response_format | API audio format: WAV, MP3, FLAC or Opus. Template default: WAV. Save Audio independently exports MP3. |\n| model_specific_params | Optional MUSIC_PARAMS connection from YuE2 Params, carrying cot and ABC to the service. |\n| cot | `off`: no ABC; `melody`: supplied melody score; `full`: supplied score with chord annotations. |\n| abc | ABC score text, not a file path. Required for `melody/full`; keep empty for `off`. |\n\n### Usage\n\nSet URL/model to your YuE2 service, edit Caption and Lyrics, then queue the graph. Save Audio previews the output and writes MP3. To condition on an existing score, paste ABC text and choose its matching `melody/full` mode.\n\n### Prompt Writing Guide\n\nKeep Caption focused on genre, instrumentation, vocals and arrangement. Set the vocal language to match Lyrics. Section tags guide song structure without guaranteeing exact timing.\n"
+      },
+      "color": "#333",
+      "bgcolor": "#535353"
+    },
+    {
+      "id": 4,
+      "type": "VLLMOmniYuE2Params",
+      "pos": [
+        530,
+        80
+      ],
+      "size": [
+        340,
+        400
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "cot",
+          "type": "COMBO",
+          "widget": {
+            "name": "cot"
+          },
+          "link": null
+        },
+        {
+          "name": "abc",
+          "type": "STRING",
+          "widget": {
+            "name": "abc"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "name": "model_specific_params",
+          "type": "MUSIC_PARAMS",
+          "links": [
+            2
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VLLMOmniYuE2Params"
+      },
+      "widgets_values": [
+        "off",
+        ""
+      ]
+    }
+  ],
+  "links": [
+    [
+      2,
+      4,
+      0,
+      1,
+      7,
+      "MUSIC_PARAMS"
+    ],
+    [
+      3,
+      1,
+      0,
+      2,
+      0,
+      "AUDIO"
+    ]
+  ],
+  "groups": [],
+  "config": {},
+  "extra": {
+    "workflowRendererVersion": "LG",
+    "ds": {
+      "scale": 1,
+      "offset": [
+        275,
+        240
+      ]
+    }
+  },
+  "version": 0.4
+}

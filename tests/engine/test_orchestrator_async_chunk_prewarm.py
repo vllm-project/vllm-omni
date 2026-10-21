@@ -245,6 +245,7 @@ async def test_add_request_attaches_payload_once_and_streaming_update_does_not(m
 @pytest.mark.asyncio
 async def test_duplex_session_submit_does_not_request_payload(mocker) -> None:
     orchestrator = _orchestrator(cls=DuplexOrchestrator)
+    orchestrator.replica_placement = None
     prewarm = mocker.AsyncMock(return_value=True)
     orchestrator._prewarm_async_chunk_stages = prewarm  # type: ignore[method-assign]
     sampling_params = tuple(_sampling_params())

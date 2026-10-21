@@ -187,6 +187,7 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
         # Placeholder for ExecuteModelState.hidden_states — allocated
         # once and reused every step to avoid per-forward allocation.
         self._dummy_hidden = torch.zeros(1, dtype=self.dtype, device=self.device)
+        self._retains_state_across_chunks = bool(getattr(self.model_config, "retains_state_across_chunks", False))
 
     # ------------------------------------------------------------------
     # Async-chunk support: replace prompt_token_ids for cached requests
@@ -230,31 +231,36 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
             if new_ids is None:
                 continue
 
+            block_ids = cached.new_block_ids[i]
+            chunk_data = OmniNewRequestData(
+                req_id=req_id,
+                prompt_token_ids=new_ids,
+                mm_features=[],
+                sampling_params=None,
+                pooling_params=None,
+                block_ids=block_ids if block_ids is not None else tuple(),
+                num_computed_tokens=0,
+                lora_request=None,
+                prompt_embeds=None,
+                prefill_token_ids=new_ids,
+                additional_information=cached.additional_information.get(req_id),
+            )
             req_idx = self.req_states.req_id_to_index.get(req_id)
             if req_idx is None:
-                block_ids = cached.new_block_ids[i]
-                released_chunks.append(
-                    OmniNewRequestData(
-                        req_id=req_id,
-                        prompt_token_ids=new_ids,
-                        mm_features=[],
-                        sampling_params=None,
-                        pooling_params=None,
-                        block_ids=block_ids if block_ids is not None else tuple(),
-                        num_computed_tokens=0,
-                        lora_request=None,
-                        prompt_embeds=None,
-                        prefill_token_ids=new_ids,
-                        additional_information=cached.additional_information.get(req_id),
-                    )
-                )
+                released_chunks.append(chunk_data)
                 continue
 
+            # Reset chunk-local model inputs using the same initialization as
+            # re-adding a released chunk, without recycling the runner slot.
             self.model_state.remove_request(req_idx)
+            self.model_state.add_request(req_idx, chunk_data)
 
             # In-place update token state — same slot, no remove/re-add.
             # .np[] = direct write (no GPU buffer); stage_write = GPU-synced.
             n = len(new_ids)
+            # Match add_request's max_tokens=1 fallback for chunk_data above.
+            self.req_states.max_seq_len[req_idx] = n + 1
+            self.req_states.draft_tokens[req_idx].zero_()
             self.req_states.prompt_len.np[req_idx] = n
             self.req_states.prefill_len.np[req_idx] = n
             self.req_states.total_len.stage_write_elem(req_idx, n)
@@ -272,20 +278,17 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
                 )
             )
         if updated:
-            self.req_states.apply_staged_writes()
+            # Match add_requests: collect request and model-state writes, then
+            # flush them together before subsequent input preparation.
+            with self._staged_writes.deferred():
+                self.req_states.apply_staged_writes()
+                self.model_state.apply_staged_writes()
 
     def _release_generation_slots(self, input_batch: Any) -> None:
         if not getattr(self.model_config, "async_chunk", False):
             return
-        model_state = getattr(self, "model_state", None)
-        remove_request = getattr(self, "_remove_request", None)
-        if model_state is None or remove_request is None:
-            return
-        for i in range(input_batch.num_reqs):
-            req_id = input_batch.req_ids[i]
-            req_idx = int(input_batch.idx_mapping_np[i])
-            model_state.remove_request(req_idx)
-            remove_request(req_id)
+        for req_id in input_batch.req_ids:
+            self._remove_request(req_id)
 
     # ------------------------------------------------------------------
     # profile / warmup — skip sampler since there are no logits
@@ -465,10 +468,11 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
             slot_mappings_by_layer=None,
             hidden_states=self._dummy_hidden,
             aux_hidden_states=None,
+            dp_sync_state=dp_sync,
             finished_req_ids=scheduler_output.finished_req_ids,
-            dp_sync=dp_sync,
             ec_connector_output=ec_connector_output,
             cudagraph_stats=None,
+            num_spec_tokens_to_schedule=scheduler_output.num_spec_tokens_to_schedule,
         )
         return None
 
@@ -550,7 +554,8 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
                 pending_aux_output=pending_aux_output,
             )
             self._reserve_native_data_plane_outputs(list(req_ids))
-            self._release_generation_slots(input_batch)
+            if not self._retains_state_across_chunks:
+                self._release_generation_slots(input_batch)
             return async_output
 
         # CPU execution keeps the synchronous materialization path. Final
@@ -561,7 +566,8 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
         output.multimodal_outputs = [
             _ensure_tensor_values(payload) if payload else {} for payload in multimodal_outputs
         ]
-        self._release_generation_slots(input_batch)
+        if not self._retains_state_across_chunks:
+            self._release_generation_slots(input_batch)
         return self._finalize_native_data_plane_output(output)
 
     # ------------------------------------------------------------------

@@ -78,7 +78,7 @@ def test_get_streaming_codec_delta_len_increments_and_finishes(_streaming_contex
 
 
 def test_streaming_input_prefill_chunk_is_cached() -> None:
-    transfer_manager = SimpleNamespace(_pending_streaming_prefills={})
+    transfer_manager = SimpleNamespace(_pending_streaming_prefills={}, request_payload={})
     request = SimpleNamespace(
         external_req_id="rt-1",
         output_token_ids=[100],
@@ -108,13 +108,14 @@ def test_streaming_input_prefill_chunk_is_cached() -> None:
 
 def test_streaming_input_prefill_flushes_with_next_decode_chunk() -> None:
     transfer_manager = SimpleNamespace(
+        request_payload={},
         _pending_streaming_prefills={
             "rt-2": {
                 "embed": {"prefill": torch.ones(2, 3)},
                 "hidden_states": {"output": torch.full((2, 3), 2.0)},
                 "ids": {"all": [151644, 872, 100], "prompt": [151644, 872]},
             }
-        }
+        },
     )
     request = SimpleNamespace(
         external_req_id="rt-2",
@@ -769,6 +770,7 @@ def test_qwen3_tts_code2wav_forward_decodes_connector_payload() -> None:
 
     from vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_code2wav import (
         Qwen3TTSCode2Wav,
+        _SegmentRhoTracker,
     )
 
     class _Decoder:
@@ -800,6 +802,7 @@ def test_qwen3_tts_code2wav_forward_decodes_connector_payload() -> None:
     model._logged_codec_stats = True
     model._logged_malformed_codec_lengths = set()
     model._batch_stats_enabled = False
+    model._rho_stats = _SegmentRhoTracker(enabled=False)
     model._batch_stats_log_every = 0
     model._batch_stats_forwards = 0
     model._batch_stats_groups = 0

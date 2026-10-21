@@ -307,6 +307,12 @@ class RotaryEmbeddingWan(RotaryEmbedding):
         cos: torch.Tensor,
         sin: torch.Tensor,
     ) -> torch.Tensor:
+        # SP-sharded call sites pass (local_tokens, rope_dim); expand to
+        # (1, S, 1, D/2) so it broadcasts over batch and heads like the CUDA
+        # kernel-facing layouts do.
+        if cos.dim() == 2:
+            cos = cos.unsqueeze(0).unsqueeze(2)
+            sin = sin.unsqueeze(0).unsqueeze(2)
         x1, x2 = x.unflatten(-1, (-1, 2)).unbind(-1)
         rotated = torch.stack(
             (

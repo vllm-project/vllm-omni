@@ -175,7 +175,8 @@ In sequential mode, each stage must wait for the previous stage to complete enti
    - **OmniChunkTransferAdapter**: Chunk-specific implementation that owns the full chunk lifecycle when async_chunk is enabled
      - **Chunk ID and key construction**: Builds keys like `{req_id}_{stage_id}_{chunk_id}` for put/get
      - **Async get**: `load_async(request)` enqueues the request; background **recv_loop** polls the connector (non-blocking); when data is available, updates the request and marks it in `_finished_load_reqs`; scheduler calls `get_finished_requests()` to learn which requests have chunks ready
-     - **Async put**: `save_async(pooling_output, request)` invokes `custom_process_next_stage_input_func` in the main thread to build the payload, then enqueues a save task; background **save_loop** performs `connector.put()`; payload processing and chunk accumulation (e.g. code2wav chunk_size) remain in the main thread
+     - **Async put**: `save_async(pooling_output, request)` admits the request and enqueues a save task; background **save_loop** runs `custom_process_next_stage_input_func` to build the payload (chunk accumulation, e.g. code2wav chunk_size, lives in the processor's per-request state) and performs `connector.put()`
+     - **Batched put**: when the processor module also defines `<func>_batch(transfer_manager, pooling_outputs, requests, is_finished) -> list[payload | None]`, the batch form opts in with `per_step_batch = True`, and the stage needs no per-step token updates, `OmniARScheduler` hands a whole step's saves to `save_async_batch`: one queued task and one processor call per step, with payloads in request order. Requests are not snapshotted for it, so an opted-in batch form reads nothing of a request but its ids and takes finishing from the flags it is given; while it runs, every live request is marked in flight as around the single processor, so a cancel's sender cleanup defers to the save loop
 
 3. **Stage Input Processors**: Custom functions that process stage outputs into chunks for different models
    - Receive **transfer_manager** (OmniChunkTransferAdapter)
@@ -188,6 +189,10 @@ In sequential mode, each stage must wait for the previous stage to complete enti
      - **Before** `super().schedule()`: `process_pending_chunks(waiting, running)` moves requests waiting for chunks to `WAITING_FOR_CHUNK`, enqueues load tasks for background polling
      - **After** `super().schedule()`: `restore_queues(waiting, running)` restores requests with ready chunks back to waiting/running, `postprocess_scheduler_output(scheduler_output)` attaches cached additional_information, clears chunk-ready flags
    - **put_chunk** `save_async(pooler_output, request)`; **get_chunk** / **get_chunk_for_generation** `load_async(request)`
+   - **OmniGenerationScheduler atomic scheduling contract**: Connector-delivered async chunks are indivisible scheduling units. The generation scheduler must either admit a ready chunk in its entirety or defer it intact with its codes and metadata unchanged. It must never slice a chunk to fit the remaining step token budget, because consumers such as the Qwen3-TTS ICL first chunk validate received chunks against their declared metadata.
+   - A ready chunk larger than the full step budget (`max_num_scheduled_tokens`) can never be admitted in any step. Such a request is terminated through the standard cleanup path with `FINISHED_ERROR` and an ERROR engine output carrying the rejection reason.
+   - Budget-based deferral stops scanning the current queue rather than skipping a ready chunk to pack smaller chunks behind it. This preserves queue order at that admission point, but can reduce step utilization under mixed chunk sizes; it does not guarantee priority for the deferred chunk in the next step.
+   - Non-chunk prompt inputs retain the existing splittable fast-path behavior.
 
 5. **Model Runners**: Handle chunk processing
    - `OmniGPUModelRunner`: Processes chunks in AR stages
@@ -272,6 +277,24 @@ stages:
     input_connectors:
       from_stage_0: connector_of_shared_memory
 ```
+
+### Scheduling Under Load
+
+Connector `extra` keys tune when a chunked AR stage admits new requests:
+
+```yaml
+connectors:
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+    extra:
+      # AR stage: while >= 32 requests run, a new request waits until 6
+      # requests wait or the oldest has waited 100 ms.
+      ar_prefill_admission_min_batch: 6
+      ar_prefill_admission_max_wait_ms: 100
+      ar_prefill_admission_min_running: 32
+```
+
+- `ar_prefill_admission_min_batch` / `ar_prefill_admission_max_wait_ms` / `ar_prefill_admission_min_running`: arrivals share one prefill / mixed step instead of each turning a decode step into one. Off unless `ar_prefill_admission_min_batch` > 1, which requires a positive `ar_prefill_admission_max_wait_ms`; below `ar_prefill_admission_min_running` running requests, arrivals are admitted at once. The wait counts against time to first audio, so keep it well under the first chunk's latency (Fish Audio Drama 3 at 128 streams: RTF 0.578 -> 0.513 with the values above).
 
 ### Code2Wav Batch Configuration
 

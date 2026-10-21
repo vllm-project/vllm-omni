@@ -82,6 +82,10 @@ logger = init_logger(__name__)
 
 
 def _build_fp8(**kw: Any) -> QuantizationConfig:
+    if kw.get("weight_scheme") == "per_channel":
+        from .fp8_config import SerializedPerChannelFp8Config
+
+        return SerializedPerChannelFp8Config.from_config(kw)
     if kw.get("is_checkpoint_fp8_serialized", False):
         from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 

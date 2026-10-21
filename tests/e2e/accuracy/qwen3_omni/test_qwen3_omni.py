@@ -13,7 +13,7 @@ downloaded and extracted under ``HF_HOME`` on demand. The tests patch in
 ``--daily-omni-inline-local-video`` so multimodal payloads use data URLs (no
 ``--allowed-local-media-path`` on the server). Use small ``--num-prompts`` defaults suitable for CI
 (override with ``ACC_BENCH_NUM_PROMPTS`` / ``ACC_BENCH_MAX_CONCURRENCY``; see
-:func:`tests.e2e.accuracy.qwen3_omni.qwen3_omni_acc_bench_core.build_acc_benchmark_cli_argv`).
+:func:`tests.e2e.accuracy.helpers.build_acc_benchmark_cli_argv`).
 
 This package lives under ``tests/e2e/accuracy/qwen3_omni/``, so pytest still loads
 ``tests/e2e/accuracy/conftest.py``, which imports ``tests.conftest`` (heavy deps: ``vllm``, ``torch``, …).
@@ -33,10 +33,6 @@ Only the subprocess accuracy marker::
 Skip when you do not have GPUs, a server, or datasets (CI opt-out)::
 
     VLLM_SKIP_ACC_BENCH=1 pytest -sv tests/e2e/accuracy/qwen3_omni/test_qwen3_omni.py
-
-Standalone CLI (expects a server already up; uses ``ACC_BENCH_*`` env defaults)::
-
-    python tests/e2e/accuracy/qwen3_omni/run_qwen_omni_acc_benchmark.py --help
 """
 
 from __future__ import annotations
@@ -45,11 +41,8 @@ from pathlib import Path
 
 import pytest
 
-from tests.e2e.accuracy.qwen3_omni import run_qwen_omni_acc_benchmark as _acc_bench
-from tests.e2e.accuracy.qwen3_omni.qwen3_omni_acc_bench_core import (
-    build_acc_benchmark_cli_argv,
-    find_vllm_cli,
-)
+from tests.e2e.accuracy import helpers as _acc_bench
+from tests.e2e.accuracy.helpers import build_acc_benchmark_cli_argv, find_vllm_cli
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniServerParams
 from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
@@ -94,9 +87,9 @@ def _require_vllm_cli() -> None:
 def _daily_omni_hub_inline_media(monkeypatch: pytest.MonkeyPatch) -> None:
     """Hub / lazy-cache mode uses local files → default ``file://`` needs server allowlist.
 
-    ``run_qwen_omni_acc_benchmark`` binds ``daily_omni_bench_argv`` at import time; patch that copy
-    so we append ``--daily-omni-inline-local-video`` whenever the core helper did not already set it
-    (local qa.json + video-dir mode already passes the flag).
+    ``tests.e2e.accuracy.helpers.run_daily_omni`` calls ``daily_omni_bench_argv`` on that module;
+    patch that function so we append ``--daily-omni-inline-local-video`` whenever the core helper
+    did not already set it (local qa.json + video-dir mode already passes the flag).
     """
     orig = _acc_bench.daily_omni_bench_argv
 
@@ -122,12 +115,31 @@ def test_qwen3_omni_daily_omni_accuracy_bench(omni_server) -> None:
     assert _acc_bench.run_acc_benchmark(ns) == 0
 
 
+# English Seed-TTS, 1088 utterances, L20X, 2026-10-20: mean WER 0.282,
+# mean SIM 0.824 (median 0.828), mean UTMOS 3.350 (median 3.361).
+# Earlier checked-in runs scored WER 0.217 and 0.223. SIM 0.75 is 0.074
+# under the L20X mean; UTMOS 3.10 is 0.25 under the L20X mean. H100 and
+# B200 still need their own SIM and UTMOS measurement before tightening.
+_MAX_SEED_TTS_MEAN_WER = 0.35
+_MIN_SEED_TTS_MEAN_SIM = 0.75
+_MIN_SEED_TTS_MEAN_UTMOS = 3.10
+
+
 @hardware_test(res={"cuda": ["H100", "B200"], "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_qwen3_omni_seed_tts_wer_bench(omni_server) -> None:
     _require_vllm_cli()
     pytest.importorskip("huggingface_hub")
-    ns = _acc_bench.parse_acc_benchmark_args(
-        build_acc_benchmark_cli_argv(omni_server, skip_seed=False, skip_daily=True)
+    argv = build_acc_benchmark_cli_argv(omni_server, skip_seed=False, skip_daily=True)
+    argv.extend(
+        [
+            "--max-seed-tts-mean-wer",
+            str(_MAX_SEED_TTS_MEAN_WER),
+            "--min-seed-tts-mean-sim",
+            str(_MIN_SEED_TTS_MEAN_SIM),
+            "--min-seed-tts-mean-utmos",
+            str(_MIN_SEED_TTS_MEAN_UTMOS),
+        ]
     )
+    ns = _acc_bench.parse_acc_benchmark_args(argv)
     assert _acc_bench.run_acc_benchmark(ns) == 0

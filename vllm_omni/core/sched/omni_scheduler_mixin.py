@@ -848,7 +848,27 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
 
     def _reject_invalid_grammar_tokens(self, request: Request, new_token_ids: list[int]) -> bool:
         """Mark rejected tokens terminal before callers capture the finish reason."""
-        if not new_token_ids or self.structured_output_manager.accept_tokens(request, new_token_ids):
+        if not new_token_ids:
+            return False
+        # vllm 0.30 put the whole accept flow on the manager (``accept_tokens``);
+        # on the 0.29 line it still lives inside the scheduler's own
+        # ``update_from_output``, which this class overrides -- so replay that
+        # flow here instead of losing the grammar advance entirely.
+        manager = self.structured_output_manager
+        accept_tokens = getattr(manager, "accept_tokens", None)
+        if accept_tokens is not None:
+            accepted = accept_tokens(request, new_token_ids)
+        else:
+            accepted = True
+            if manager.should_advance(request, new_token_ids=new_token_ids):
+                structured_req = getattr(request, "structured_output_request", None)
+                grammar = getattr(structured_req, "grammar", None)
+                if grammar is not None:
+                    advance_token_ids = manager.trim_reasoning_for_advance(request, new_token_ids)
+                    accepted = not advance_token_ids or bool(
+                        grammar.accept_tokens(request.request_id, advance_token_ids)
+                    )
+        if accepted:
             return False
         logger.error(
             "Unexpected: grammar rejected tokens %s for request %s. Terminating request.",
@@ -993,6 +1013,32 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
         A new request id also has its async-chunk prewarm payload moved into
         scheduler state (see ``_take_async_chunk_prewarm``).
         """
+        # Review P2-1 reject gate: the K-step in-model codec sampler has no
+        # reader for logit_bias / allowed_token_ids (the talker_codec_sample
+        # filter implements censoring/penalties/temperature/min-p/top-k/top-p
+        # only). The engine applies both fields to the 6562-wide codec logits
+        # on a single-frame stage, so a request setting either would decode
+        # differently than the same request on a single-frame deployment,
+        # silently. Honoring them needs a LogitBiasState-style per-request
+        # machine the codec path does not have; finish the request as
+        # FINISHED_ERROR instead of letting it diverge unnoticed.
+        kstep_armed = getattr(self, "_talker_kstep_armed", None)
+        if kstep_armed is not None and kstep_armed():
+            sp = getattr(request, "sampling_params", None)
+            unsupported = [
+                name for name in ("logit_bias", "allowed_token_ids") if sp is not None and getattr(sp, name, None)
+            ]
+            if unsupported:
+                logger.warning(
+                    "Rejecting request %s: %s not supported by the K-step codec "
+                    "sampler (no reader in the in-model filter); the request "
+                    "would decode differently than on a single-frame stage.",
+                    request.request_id,
+                    ", ".join(unsupported),
+                )
+                super().add_request(request)
+                self.finish_requests([request.request_id], RequestStatus.FINISHED_ERROR)
+                return
         existing = self.requests.get(request.request_id)
         if existing is None:
             # Only a fresh prewarm placeholder carries the payload; streaming

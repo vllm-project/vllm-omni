@@ -192,13 +192,19 @@ def test_explicit_shared_batches_bypass_opportunistic_capture_cutoff(fake_captur
 
 
 @pytest.mark.cpu
-def test_startup_precapture_uses_shared_arena_and_freezes_admission(fake_capture, mock_nvidia_platform):
+@pytest.mark.parametrize("runtime_capture", [False, True])
+def test_startup_precapture_admission_policy(fake_capture, mock_nvidia_platform, runtime_capture):
     from contextlib import nullcontext
 
     from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import BatchedToken2Wav
 
     weight = torch.randn(_HIDDEN, _HIDDEN)
-    graphs = FlowEncoderGraphs(functools.partial(_encode, weight=weight), max_graphs=2, rows=[1])
+    graphs = FlowEncoderGraphs(
+        functools.partial(_encode, weight=weight),
+        max_graphs=2,
+        rows=[1],
+        capture_after_precapture=runtime_capture,
+    )
     _, cnn, att = _inputs(1, 6, 8, "cpu")
     state = SimpleNamespace(flow_cache={"conformer_cnn_cache": cnn[0], "conformer_att_cache": att[0]})
     features = SimpleNamespace(mels=torch.zeros(1, 8, _HIDDEN))
@@ -219,9 +225,10 @@ def test_startup_precapture_uses_shared_arena_and_freezes_admission(fake_capture
     assert len(graphs.graphs) == 2
     assert backend._encoder_graphs is graphs
     assert not graphs.exact_graphs
-    assert not graphs.capture_on_request
+    assert graphs.capture_on_request is runtime_capture
     assert probes == [108]
     assert BatchedToken2Wav.precapture_chunk_encoder(backend, features) == 0
+    assert graphs.capture_on_request is runtime_capture
 
 
 @pytest.mark.cpu

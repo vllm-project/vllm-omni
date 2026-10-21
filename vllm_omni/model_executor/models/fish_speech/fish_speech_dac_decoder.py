@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Fish Speech S2 Pro -- DAC Decoder (Stage 1).
 
 Loads the DAC codec from ``codec.pth`` and decodes codebook indices
@@ -18,7 +21,6 @@ from typing import Any
 
 import torch
 import torch.nn as nn
-from torch.nn.utils.parametrize import remove_parametrizations
 from vllm.config import VllmConfig
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
@@ -27,9 +29,11 @@ from vllm_omni.model_executor.models.fish_speech.dac_utils import (
     DAC_HOP_LENGTH,
     DAC_NUM_CODEBOOKS,
     DAC_SAMPLE_RATE,
+    bake_weight_norm,
     build_dac_codec,
 )
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
 
@@ -76,6 +80,16 @@ class FishSpeechDACDecoder(nn.Module):
     via the DAC codec decoder.
     """
 
+    # Set in __init__ / at codec load; defaults keep partially built decoders usable.
+    _channels_last = None
+    _graphs = None
+    _cuda_graphs = False
+    _stateful = False
+
+    # Streaming with per-request convolution history keys slots by the
+    # scheduler's request IDs (the same ones on_requests_finished delivers).
+    requires_request_ids = True
+
     input_modalities = "audio"
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
@@ -88,6 +102,9 @@ class FishSpeechDACDecoder(nn.Module):
         self.has_postprocess = False
         self.enable_update_additional_information = True
         self.requires_raw_input_tokens = True
+        # Every forward returns freshly allocated waveforms, so the runner may
+        # copy them to the host asynchronously (async scheduling, eager).
+        self.owns_generation_output_storage = True
 
         self._codec: nn.Module | None = None
         self._num_codebooks: int = DAC_NUM_CODEBOOKS
@@ -109,6 +126,25 @@ class FishSpeechDACDecoder(nn.Module):
             "fish_speech_dac_max_batch",
             "dac_max_batch",
         )
+        # Opt-in, CUDA only: the decoder runs channels-last (no NCHW<->NHWC
+        # reformatting, fast dilated convs, a fused Snake), its window
+        # transformer compiled, as its own CUDA graphs per (batch, frames)
+        # bucket of the streaming windows (captured during the profiling run,
+        # where the codec loads). Otherwise the module decoder runs.
+        self._channels_last = None
+        self._cuda_graphs = bool(extra_cfg.get("fish_speech_dac_cuda_graphs", False))
+        # Keep every request's convolution history and window-transformer
+        # keys / values between windows: a window then decodes only its new
+        # frames, as decoding the whole utterance would.
+        self._stateful = bool(extra_cfg.get("fish_speech_dac_stateful", False))
+        if self._stateful and not self._cuda_graphs:
+            raise ValueError("fish_speech_dac_stateful needs fish_speech_dac_cuda_graphs (the channels-last decoder)")
+        self._stream_slots = {}
+        self._free_stream_slots = []
+        # Frames each slotted request has decoded (its next window's position).
+        self._stream_positions: dict[str, int] = {}
+        self._extra_cfg = extra_cfg
+        self._graphs = None
 
     def _decode_codes(
         self,
@@ -116,6 +152,8 @@ class FishSpeechDACDecoder(nn.Module):
         feature_lengths: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         assert self._codec is not None
+        if self._channels_last is not None:
+            return self._channels_last(codes_bqf), feature_lengths * self._hop_length
         if self._codec_decode_takes_lengths:
             return self._codec.decode(codes_bqf, feature_lengths)
 
@@ -133,14 +171,7 @@ class FishSpeechDACDecoder(nn.Module):
         return wav_batch, audio_lengths
 
     def _bake_weight_norm(self, codec: nn.Module) -> None:
-        baked = 0
-        for module in codec.modules():
-            parametrizations = getattr(module, "parametrizations", None)
-            if not parametrizations:
-                continue
-            for name in list(parametrizations.keys()):
-                remove_parametrizations(module, name, leave_parametrized=True)
-                baked += 1
+        baked = bake_weight_norm(codec)
         if baked > 0:
             logger.info("Baked %d DAC parametrized weights for inference", baked)
 
@@ -226,6 +257,15 @@ class FishSpeechDACDecoder(nn.Module):
         codec.eval()
         self._codec = codec
         self._codec_decode_takes_lengths = len(inspect.signature(codec.decode).parameters) >= 2
+        if self._cuda_graphs and not current_omni_platform.is_cuda():
+            logger.warning("fish_speech_dac_cuda_graphs needs CUDA; decoding with the module decoder")
+            self._cuda_graphs = self._stateful = False
+        if codec.decoder is not None and self._cuda_graphs:
+            from vllm_omni.model_executor.models.fish_speech.dac_channels_last import ChannelsLastDACDecoder
+
+            self._channels_last = ChannelsLastDACDecoder(codec)
+            self._channels_last.compile_transformer()
+            self._capture_graphs(torch.device(device))
 
         logger.info(
             "Fish Speech DAC codec loaded from %s (device=%s, dtype=%s, sample_rate=%d)",
@@ -234,6 +274,55 @@ class FishSpeechDACDecoder(nn.Module):
             self._dac_dtype,
             self._output_sample_rate,
         )
+
+    def _capture_graphs(self, device: torch.device) -> None:
+        from vllm_omni.model_executor.models.fish_speech.dac_channels_last import (
+            DACDecodeGraphs,
+            streaming_decode_shapes,
+        )
+
+        cfg = self._extra_cfg
+        ramp_cfg = cfg.get("codec_chunk_ramp", ())
+        if isinstance(ramp_cfg, str):
+            ramp = tuple(int(v) for v in ramp_cfg.split(",") if v.strip())
+        else:
+            ramp = tuple(int(v) for v in ramp_cfg)
+        if not ramp and int(cfg.get("initial_codec_chunk_frames", 0) or 0) > 0:
+            ramp = (int(cfg["initial_codec_chunk_frames"]),)
+        chunk = int(cfg.get("codec_chunk_frames", 25))
+        left = int(cfg.get("codec_left_context_frames", 25))
+        max_padded = self._decode_batch_max_padded_frames or 2048
+        max_batch = self._decode_batch_max_batch or self.vllm_config.scheduler_config.max_num_seqs
+        # The convolutions only need receptive_frames of a window's left
+        # context (the transformer still gets all of it).
+        receptive = self._channels_last.receptive_frames
+        stream = None
+        if self._stateful:
+            from vllm_omni.model_executor.models.fish_speech.dac_channels_last import DACStreamState
+
+            # Live streams can outnumber one step's batch; past the pool a
+            # request decodes with re-decoded context instead.
+            slots = 2 * max_batch
+            stream = DACStreamState(slots, max_window_frames=max((*ramp, chunk)))
+            self._free_stream_slots = list(range(slots - 1, -1, -1))
+            # Graphs take new frames only: buckets by window size, no trims.
+            receptive = left = 0
+        buckets, trims = streaming_decode_shapes(ramp, chunk, left, receptive)
+        self._graphs = DACDecodeGraphs(
+            self._channels_last,
+            self._num_codebooks,
+            buckets,
+            max_padded_frames=max_padded,
+            max_batch=max_batch,
+            trims=trims,
+            receptive_frames=receptive,
+            stream=stream,
+        )
+        self._graphs.capture(device)
+        if stream is not None:
+            logger.info(
+                "Fish DAC streaming convolution history: %d slots, %.1f MiB", stream.num_slots, stream.bytes() / 2**20
+            )
 
     def embed_input_ids(self, input_ids: torch.Tensor, **_: Any) -> torch.Tensor:
         if input_ids.numel() == 0:
@@ -388,6 +477,11 @@ class FishSpeechDACDecoder(nn.Module):
                 pass
 
         wav_tensors: list[torch.Tensor | None] = [None] * len(valid_codes_qf)
+        # Leading context frames each decode already dropped (conv-context trim).
+        dropped_frames = [0] * len(valid_codes_qf)
+        # Output samples per codec frame, read off each decoded batch's shape
+        # (the hop for this codec), so no device-to-host length copy is needed.
+        samples_per_frame = [self._hop_length] * len(valid_codes_qf)
 
         def _iter_bounded_groups(group: list[tuple[int, torch.Tensor]]) -> Iterable[list[tuple[int, torch.Tensor]]]:
             max_padded_frames = int(getattr(self, "_decode_batch_max_padded_frames", 0))
@@ -414,51 +508,112 @@ class FishSpeechDACDecoder(nn.Module):
             if current:
                 yield current
 
-        def _decode_group(group: list[tuple[int, torch.Tensor]]) -> None:
+        def _decode_group(
+            group: list[tuple[int, torch.Tensor]],
+            trim: int = 0,
+            rows: torch.Tensor | None = None,
+            eager: bool = False,
+            dropped: list[int] | None = None,
+        ) -> None:
             actual_frames = [int(codes_qf.shape[1]) for _, codes_qf in group]
             target_frames = max(actual_frames)
             batch_size = len(group)
             first_codes = group[0][1]
-            feature_lengths = torch.tensor(actual_frames, device=first_codes.device, dtype=torch.long)
-            codes_bqf = torch.zeros(
-                (batch_size, q, target_frames),
-                device=first_codes.device,
-                dtype=torch.long,
-            )
-            for row, (_, codes_qf) in enumerate(group):
-                frame_count = int(codes_qf.shape[1])
-                codes_bqf[row, :, :frame_count] = codes_qf
+            if all(frames == target_frames for frames in actual_frames):
+                codes_bqf = torch.stack([codes_qf for _, codes_qf in group])
+            else:
+                codes_bqf = torch.zeros(
+                    (batch_size, q, target_frames),
+                    device=first_codes.device,
+                    dtype=torch.long,
+                )
+                for row, (_, codes_qf) in enumerate(group):
+                    frame_count = int(codes_qf.shape[1])
+                    codes_bqf[row, :, :frame_count] = codes_qf
 
             with torch.amp.autocast("cuda", enabled=False):
-                wav_batch, audio_lengths = self._decode_codes(codes_bqf, feature_lengths)
-            audio_lengths_list = (
-                audio_lengths.detach().to(device="cpu", dtype=torch.long).reshape(-1).tolist()
-                if audio_lengths.numel() > 0
-                else []
-            )
+                if eager:
+                    with torch.inference_mode():
+                        wav_batch = self._channels_last(codes_bqf, trim)
+                elif self._graphs is not None:
+                    wav_batch = self._graphs(codes_bqf, trim, rows)
+                else:
+                    feature_lengths = torch.tensor(actual_frames, device=first_codes.device, dtype=torch.long)
+                    wav_batch, _ = self._decode_codes(codes_bqf, feature_lengths)
+            # The codec emits a fixed number of samples per frame: lengths are
+            # known on the host, so no device-to-host sync is needed here. One
+            # dtype conversion for the batch; requests take views of it.
+            wav_batch = wav_batch.to(dtype=torch.float32)
+            per_frame = max(1, int(wav_batch.shape[-1]) // max(1, target_frames - trim))
             for row, (j, _) in enumerate(group):
-                audio_len = int(audio_lengths_list[row]) if len(audio_lengths_list) > row else int(wav_batch.shape[-1])
+                audio_len = min((actual_frames[row] - trim) * per_frame, int(wav_batch.shape[-1]))
                 wav_tensors[j] = wav_batch[row, 0, :audio_len]
+                dropped_frames[j] = trim if dropped is None else dropped[row]
+                samples_per_frame[j] = per_frame
 
-        for bounded_group in _iter_bounded_groups(list(enumerate(valid_codes_qf))):
-            _decode_group(bounded_group)
+        if self._graphs is not None and self._graphs.stream is not None:
+            items = list(enumerate(valid_codes_qf))
+            contexts = [int(parsed_ctx_frames[idx]) for idx in valid_indices]
+            frames = [int(c.shape[1]) for c in valid_codes_qf]
+            request_ids = kwargs.get("request_ids") or [None] * num_req
+            slots, fresh, positions, release = self._claim_stream_slots(
+                [request_ids[idx] if idx < len(request_ids) else None for idx in valid_indices],
+                [
+                    self._meta_first_window(runtime_additional_information, idx, context)
+                    for idx, context in zip(valid_indices, contexts, strict=True)
+                ],
+                [self._meta_finished(runtime_additional_information, idx) for idx in valid_indices],
+                [count - context for count, context in zip(frames, contexts, strict=True)],
+                int(self._channels_last.transformer.freqs_cis.shape[0]),
+            )
+            for j, slot in enumerate(slots):
+                if slot is not None:
+                    # The history is kept: only the new frames go in.
+                    items[j] = (j, valid_codes_qf[j][:, contexts[j] :])
+            streamed = [j for j, slot in enumerate(slots) if slot is not None]
+            plan = self._graphs.plan([frames[j] - contexts[j] for j in streamed], [0] * len(streamed))
+            for group, _ in plan:
+                members = [streamed[g] for g in group]
+                rows = torch.tensor(
+                    [
+                        [slots[j] for j in members],
+                        [int(fresh[j]) for j in members],
+                        [frames[j] - contexts[j] for j in members],
+                        [positions[j] for j in members],
+                    ],
+                    dtype=torch.long,
+                ).to(valid_codes_qf[0].device, non_blocking=True)
+                _decode_group([items[j] for j in members], 0, rows, dropped=[contexts[j] for j in members])
+            # Without a slot (pool exhausted, or history lost): re-decode the
+            # convolutions' receptive context, eagerly.
+            receptive = self._channels_last.receptive_frames
+            for j, slot in enumerate(slots):
+                if slot is None:
+                    _decode_group([items[j]], contexts[j] - min(contexts[j], receptive), eager=True)
+            for slot_owner in release:
+                self._release_stream_slot(slot_owner)
+        elif self._graphs is not None:
+            items = list(enumerate(valid_codes_qf))
+            contexts = [int(parsed_ctx_frames[idx]) for idx in valid_indices]
+            for group, trim in self._graphs.plan([int(c.shape[1]) for c in valid_codes_qf], contexts):
+                _decode_group([items[i] for i in group], trim)
+        else:
+            for bounded_group in _iter_bounded_groups(list(enumerate(valid_codes_qf))):
+                _decode_group(bounded_group)
 
         audios: list[torch.Tensor] = [empty] * num_req
         srs = [sr_tensor] * num_req
 
         for j, idx in enumerate(valid_indices):
-            ctx_frames = parsed_ctx_frames[idx]
+            ctx_frames = parsed_ctx_frames[idx] - dropped_frames[j]
             total_frames = parsed_total_frames[idx]
             wav = wav_tensors[j]
             assert wav is not None
             # Trim context frames (left overlap for streaming).
             if ctx_frames > 0:
-                # Decode length may deviate from (frames * hop_length) due to model
-                # internals (padding/rounding). Use proportional trimming to keep
-                # overlap removal aligned with the actual decoded length.
-                denom = max(int(total_frames), 1)
-                cut = int(ctx_frames / denom * wav.shape[0])
-                cut = max(0, min(cut, int(wav.shape[0])))
+                # Each frame decodes to hop samples; drop the left-context frames.
+                del total_frames
+                cut = max(0, min(int(ctx_frames) * samples_per_frame[j], int(wav.shape[0])))
                 if cut < wav.shape[0]:
                     wav = wav[cut:]
                 else:
@@ -469,12 +624,86 @@ class FishSpeechDACDecoder(nn.Module):
                     )
                     continue
             if wav.shape[0] > 0:
-                audios[idx] = wav.to(dtype=torch.float32).reshape(-1)
+                audios[idx] = wav.reshape(-1)
 
         return OmniOutput(
             text_hidden_states=None,
             multimodal_outputs={"model_outputs": audios, "sr": srs},
         )
+
+    @staticmethod
+    def _meta_finished(infos: list[dict[str, Any]] | None, index: int) -> bool:
+        info = infos[index] if infos is not None and index < len(infos) else None
+        value = info.get("meta", {}).get("finished") if isinstance(info, dict) else None
+        if isinstance(value, torch.Tensor):
+            return bool(value.reshape(-1)[0]) if value.numel() else False
+        return bool(value)
+
+    @staticmethod
+    def _meta_first_window(infos: list[dict[str, Any]] | None, index: int, context: int) -> bool:
+        """Whether a window starts its stream: ``meta.chunk_seq == 0`` (the window's index in
+        its stream) when the producer numbers its windows, else no left context."""
+        info = infos[index] if infos is not None and index < len(infos) else None
+        seq = info.get("meta", {}).get("chunk_seq") if isinstance(info, dict) else None
+        if isinstance(seq, torch.Tensor):
+            seq = int(seq.reshape(-1)[0]) if seq.numel() else None
+        return int(seq) == 0 if seq is not None else context == 0
+
+    def _claim_stream_slots(
+        self,
+        request_ids: list[str | None],
+        first_windows: list[bool],
+        finished: list[bool],
+        new_frames: list[int],
+        rotary_limit: int,
+    ) -> tuple[list[int | None], list[bool], list[int], list[str]]:
+        """Per window: its history slot (None: decode with its left context instead), whether
+        the slot starts fresh, the frames its stream decoded before it, and the requests whose
+        stream ends with this step.
+
+        A stream's first window (re)starts its history in a free slot; later windows continue
+        it. A stream without a slot at its first window (pool empty), or whose real frames
+        would run past the rotary table, decodes without history from then on.
+        """
+        slots: list[int | None] = []
+        fresh: list[bool] = []
+        positions: list[int] = []
+        release: list[str] = []
+        for request_id, first, done, new in zip(request_ids, first_windows, finished, new_frames, strict=True):
+            slot, position = None, 0
+            if request_id is not None:
+                if first:
+                    self._release_stream_slot(request_id)
+                    if self._free_stream_slots:
+                        slot = self._free_stream_slots.pop()
+                        self._stream_slots[request_id] = slot
+                        self._stream_positions[request_id] = 0
+                else:
+                    slot = self._stream_slots.get(request_id)
+                if slot is not None:
+                    position = self._stream_positions[request_id]
+                    if position + new > rotary_limit:
+                        self._release_stream_slot(request_id)
+                        slot = None
+                    else:
+                        self._stream_positions[request_id] = position + new
+                        if done:
+                            release.append(request_id)
+            slots.append(slot)
+            fresh.append(slot is not None and first)
+            positions.append(position)
+        return slots, fresh, positions, release
+
+    def _release_stream_slot(self, request_id: str) -> None:
+        self._stream_positions.pop(request_id, None)
+        slot = self._stream_slots.pop(request_id, None)
+        if slot is not None:
+            self._free_stream_slots.append(slot)
+
+    def on_requests_finished(self, finished_req_ids: set[str] | list[str]) -> None:
+        if self._stateful:
+            for request_id in finished_req_ids:
+                self._release_stream_slot(request_id)
 
     def make_omni_output(self, model_outputs: torch.Tensor | OmniOutput, **kwargs: Any) -> OmniOutput:
         if isinstance(model_outputs, OmniOutput):
