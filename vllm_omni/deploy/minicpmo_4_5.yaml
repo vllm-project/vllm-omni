@@ -55,6 +55,11 @@ connectors:
       micro_batch_size: 4
       cfm_precapture_empty_cache: true
       cfm_max_graphs: 32
+      # Run the graph precapture sweep right after the weights load instead of
+      # on the first forward: Stage 2 never issues a warmup forward, so the
+      # deferred sweep used to stall the first real requests (a C8 duplex
+      # replay lost its first-wave sessions to the ~1-2 s per graph capture).
+      cfm_graph_precapture_after_load: true
       # Default CUDA speaker path: CPU-reference TensorRT, not full DiT TensorRT.
       # Missing TensorRT falls back to the Torch speaker. Non-CUDA ignores the
       # flag. Set false in an overlay to keep Torch. token2wav_trt /

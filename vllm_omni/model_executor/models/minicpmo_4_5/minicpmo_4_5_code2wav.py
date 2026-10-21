@@ -1526,6 +1526,9 @@ class MiniCPMO45Code2Wav(nn.Module):
         for _ in weights:
             pass
         self._build_backend()
+        # Optional: capture the device graphs here instead of deferring to the
+        # first forward; see ``_precapture_after_load``.
+        self._precapture_after_load()
         # Token2wav loads flow.pt and hift.pt inside its constructor instead of
         # from the parent MiniCPM checkpoint iterator. Report those registered
         # parameters as initialized so vLLM's strict loader audit does not
@@ -1680,6 +1683,36 @@ class MiniCPMO45Code2Wav(nn.Module):
         )
         # Captured by the first forward (the warmup run): under vLLM's weight load a graph held GiBs.
         self._precapture_pending = read_bool_flag(extra, "cfm_graph_precapture", True)
+
+    def _precapture_after_load(self) -> None:
+        """Capture the device graphs once the weights are fully on device.
+
+        Called from ``load_weights``: at that point the weights load is done, so
+        a graph no longer pins load-time allocator blocks (the reason the sweep
+        was originally deferred), yet no request has been served.
+
+        A failed sweep keeps the lazy path: the wrappers still capture a graph
+        per shape on demand, exactly as before.
+        """
+        # The deferred trigger above assumes an engine warmup forward fires it.
+        # The Code2Wav stage has no such forward: the sweep then lands on the
+        # first real request, and a C8 duplex replay stalls every in-flight
+        # stream for ~1-2 s per graph while its first-wave sessions time out.
+        if not read_bool_flag(self._extra_config(), "cfm_graph_precapture_after_load", False):
+            return
+        if not getattr(self, "_precapture_pending", False) or self.backend is None:
+            return
+        try:
+            self._precapture_default_prompt()
+        except Exception:
+            self._precapture_pending = False
+            logger.warning(
+                "MiniCPM-o Code2Wav: startup precapture failed; graphs capture lazily",
+                exc_info=True,
+            )
+            return
+        if getattr(self, "_precapture_empty_cache", False):
+            self._release_precapture_cache()
 
     def _release_precapture_cache(self) -> None:
         """Return startup's unused cached allocator blocks to the driver (``cfm_precapture_empty_cache``).
