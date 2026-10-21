@@ -206,7 +206,7 @@ class SchedulerRequestState:
     status: DiffusionRequestStatus = DiffusionRequestStatus.WAITING
     error: str | None = None
     # Set once at the first enqueue (perf_counter) and preserved across
-    # preemption so CNA aging keeps accumulating while the request is re-queued.
+    # preemption so DRR aging keeps accumulating while the request is re-queued.
     queued_at: float = 0.0
     # Request-mode admission must leave this request alone in its wave.
     requires_single_request: bool = False
