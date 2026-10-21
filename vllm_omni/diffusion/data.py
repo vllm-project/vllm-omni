@@ -826,6 +826,10 @@ class DiffusionBatchingConfig:
 
     For other models, hardware, or backend setups, run the profiler policy and
     set ``compute_unit_budget`` from the generated config.
+
+    The ``compute_budget`` policy (iDRR admission) is coupled to MixFusion:
+    it requires ``enable_mixfusion=True`` and engine startup fails fast
+    otherwise. MixFusion can still run with the default ``fixed`` policy.
     """
 
     policy: str = "fixed"

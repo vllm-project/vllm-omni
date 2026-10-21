@@ -390,6 +390,17 @@ class DiffusionEngine:
                 f"{getattr(od_config, 'model_class_name', None)!r} does not support MixFusion. "
                 "Disable enable_mixfusion, or choose a pipeline with supports_mixfusion=True."
             )
+        # iDRR admission (policy="compute_budget") is coupled to MixFusion:
+        # cost-normalized aging only pays off when heterogeneous resolutions
+        # can share a batch, so fail fast instead of silently degrading.
+        batching_config = getattr(od_config, "diffusion_batching_config", None)
+        if getattr(batching_config, "uses_compute_budget", False) and not bool(
+            getattr(od_config, "enable_mixfusion", False)
+        ):
+            raise ValueError(
+                "diffusion_batching_config policy='compute_budget' (iDRR admission) requires "
+                "enable_mixfusion=True. Enable MixFusion, or use the default 'fixed' policy."
+            )
 
         self.step_execution = bool(getattr(od_config, "step_execution", False))
         if bool(getattr(od_config, "enable_mixfusion", False)) and not self.step_execution:
