@@ -105,6 +105,11 @@ def _read_vae_scale_factor(od_config: OmniDiffusionConfig) -> int:
     return 16
 
 
+def _resolve_vae_dtype(dtype: torch.dtype) -> torch.dtype:
+    """Use BF16's wider exponent range to avoid FP16 VAE decode overflow."""
+    return torch.bfloat16 if dtype == torch.float16 else dtype
+
+
 def _resolve_text_encoder_quant_config(
     quant_config: "QuantizationConfig | None",
 ) -> "QuantizationConfig | None":
@@ -409,6 +414,7 @@ class QwenImage21Pipeline(
             subfolder="vae",
             prefetch_list=qwen_subfolders,
             local_files_only=local_files_only,
+            torch_dtype=_resolve_vae_dtype(od_config.dtype),
         ).to(self.device)
         transformer_kwargs = get_transformer_config_kwargs(od_config.tf_model_config, QwenImage21Transformer2DModel)
         self.transformer = QwenImage21Transformer2DModel(
@@ -853,8 +859,11 @@ class QwenImage21Pipeline(
         if vae_images is not None:
             all_image_latents = []
             for image in vae_images:
-                image = image.to(device=device, dtype=dtype)
-                encoded = image if image.shape[1] == self.latent_channels else self._encode_vae_image(image, generator)
+                if image.shape[1] == self.latent_channels:
+                    encoded = image.to(device=device, dtype=dtype)
+                else:
+                    image = image.to(device=device, dtype=self.vae.dtype)
+                    encoded = self._encode_vae_image(image, generator).to(dtype=dtype)
                 if batch_size > encoded.shape[0]:
                     if batch_size % encoded.shape[0] != 0:
                         raise ValueError(
@@ -1035,6 +1044,11 @@ class QwenImage21Pipeline(
             negative_prompt_embeds = None
             negative_prompt_embeds_mask = None
             negative_image_pad_mask = None
+
+        # Match the transformer dtype without mutating cached encoder outputs.
+        prompt_embeds = prompt_embeds.to(dtype=self.od_config.dtype)
+        if negative_prompt_embeds is not None:
+            negative_prompt_embeds = negative_prompt_embeds.to(dtype=self.od_config.dtype)
 
         # Collate condition images per input slot across requests. Batched VAE
         # encoding requires every request to share the same per-slot sizes.

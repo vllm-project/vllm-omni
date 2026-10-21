@@ -1023,6 +1023,33 @@ class TestAttentionInitUsesCurrentDiffusionConfig:
         with pytest.raises(ValueError, match="does not support attn_mask"):
             Attention._assert_metadata_compatible(fake_attention, metadata)
 
+    @pytest.mark.parametrize("backend_explicit", [False, True])
+    def test_dense_mask_fallback_respects_explicit_backend(self, backend_explicit):
+        sentinel = torch.randn(1, 2, 4, 8)
+        fake_attention = SimpleNamespace(
+            attn_backend=FlashAttentionBackend,
+            attn_spec=None,
+            backend_explicit=backend_explicit,
+            sdpa_fallback=Mock(),
+            attention=Mock(),
+            _has_custom_attention=False,
+            _explicit_cross_contract=False,
+        )
+        fake_attention.sdpa_fallback.forward.return_value = sentinel
+        fake_attention.attention.forward.side_effect = AssertionError("selected backend must not run")
+        query = torch.randn(1, 2, 4, 8)
+        metadata = AttentionMetadata(attn_mask=torch.ones(1, 1, 2, 2, dtype=torch.bool))
+
+        if backend_explicit:
+            with pytest.raises(NotImplementedError, match="dense .* attention mask"):
+                Attention._run_local_attention(fake_attention, query, query, query, metadata)
+            fake_attention.sdpa_fallback.forward.assert_not_called()
+        else:
+            output = Attention._run_local_attention(fake_attention, query, query, query, metadata)
+            assert output is sentinel
+            fake_attention.sdpa_fallback.forward.assert_called_once_with(query, query, query, metadata)
+        fake_attention.attention.forward.assert_not_called()
+
     def test_ring_attention_rejects_mask_instead_of_ignoring_it(self):
         fake_attention = SimpleNamespace(attention=SimpleNamespace(skip=None), ring_runner=None)
         query = torch.randn(1, 2, 4, 8)

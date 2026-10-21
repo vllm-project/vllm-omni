@@ -14,6 +14,7 @@ from torch import nn
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.models.qwen_image_21.pipeline_qwen_image_21 import (
     QwenImage21Pipeline,
+    _resolve_vae_dtype,
     get_qwen_image_21_post_process_func,
 )
 
@@ -136,6 +137,98 @@ def test_prepare_latents_concatenates_multiple_condition_images():
     assert image_latents.shape == (2, 20, 4)
     torch.testing.assert_close(image_latents[:, :16].mean(), torch.tensor(1.0))
     torch.testing.assert_close(image_latents[:, 16:].mean(), torch.tensor(3.0))
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("external_latents", [False, True])
+@pytest.mark.parametrize("cfg", [False, True])
+def test_generation_context_uses_transformer_dtype(monkeypatch, dtype, external_latents, cfg):
+    pipeline = _toy_pipeline()
+    pipeline.od_config = OmniDiffusionConfig(dtype=dtype)
+    pipeline.device = torch.device("cpu")
+    pipeline.transformer = nn.Module()
+    pipeline.transformer.in_channels = 4
+    monkeypatch.setattr(pipeline, "check_inputs", lambda *args: None)
+    monkeypatch.setattr(pipeline, "check_cfg_parallel_validity", lambda *args: None)
+    monkeypatch.setattr(pipeline, "prepare_timesteps", lambda *args: (torch.tensor([1.0]), 1))
+    positive = torch.arange(12, dtype=torch.bfloat16).reshape(1, 3, 4)
+    negative = -positive
+    mask = torch.tensor([[1, 1, 0]])
+    image_mask = torch.zeros(1, 3, dtype=torch.bool)
+
+    def fake_encode_prompt(prompt_name="prompt", **_kwargs):
+        return (negative if prompt_name == "negative_prompt" else positive), mask, image_mask
+
+    monkeypatch.setattr(pipeline, "encode_prompt", fake_encode_prompt)
+    supplied = torch.ones(1, 4, 4, dtype=torch.bfloat16) if external_latents else None
+    result = pipeline._prepare_generation_context(
+        prompt=["positive"],
+        negative_prompt=["negative"] if cfg else None,
+        height=32,
+        width=32,
+        num_inference_steps=1,
+        sigmas=None,
+        num_images_per_prompt=1,
+        generator=torch.Generator().manual_seed(42),
+        true_cfg_scale=4.0 if cfg else 1.0,
+        max_sequence_length=8,
+        per_request_images=[{"prompt_images": None}],
+        latents=supplied,
+    )
+    assert result["prompt_embeds"].dtype == dtype
+    assert torch.equal(result["prompt_embeds"], positive.to(dtype))
+    assert result["latents"].dtype == dtype
+    if external_latents:
+        assert torch.equal(result["latents"], supplied.to(dtype))
+    assert result["prompt_embeds_mask"] is mask
+    assert result["image_pad_mask"] is image_mask
+    if cfg:
+        assert result["negative_prompt_embeds"].dtype == dtype
+        assert torch.equal(result["negative_prompt_embeds"], negative.to(dtype))
+        assert result["negative_prompt_embeds_mask"] is mask
+    else:
+        assert result["negative_prompt_embeds"] is None
+    # Conversion at the consumer boundary must not mutate encoder/cache output.
+    assert positive.dtype == negative.dtype == torch.bfloat16
+    if dtype == torch.bfloat16:
+        assert result["prompt_embeds"] is positive
+
+
+def test_prepare_latents_respects_vae_dtype(monkeypatch):
+    pipeline = _toy_pipeline()
+    pipeline.vae = nn.Module()
+    pipeline.vae.dtype = torch.bfloat16
+    seen = []
+
+    def encode(image, generator):
+        seen.append(image.dtype)
+        return torch.ones(1, 4, 1, 2, 2, dtype=image.dtype)
+
+    monkeypatch.setattr(pipeline, "_encode_vae_image", encode)
+    _, image_latents = pipeline.prepare_latents(
+        [torch.ones(1, 3, 1, 32, 32)],
+        1,
+        4,
+        32,
+        32,
+        torch.float16,
+        torch.device("cpu"),
+        torch.Generator().manual_seed(42),
+    )
+    assert seen == [torch.bfloat16]
+    assert image_latents.dtype == torch.float16
+
+
+@pytest.mark.parametrize(
+    ("pipeline_dtype", "expected"),
+    [
+        (torch.float16, torch.bfloat16),
+        (torch.bfloat16, torch.bfloat16),
+        (torch.float32, torch.float32),
+    ],
+)
+def test_resolve_vae_dtype_avoids_fp16_decode(pipeline_dtype, expected):
+    assert _resolve_vae_dtype(pipeline_dtype) is expected
 
 
 # ---------------------------------------------------------------------------

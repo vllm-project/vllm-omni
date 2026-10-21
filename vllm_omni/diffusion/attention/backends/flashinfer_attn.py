@@ -162,6 +162,10 @@ class FlashInferAttentionBackend(AttentionBackend):
             return attention_spec is None
         return True
 
+    @classmethod
+    def supports_dense_attention_mask(cls, attention_spec: object | None = None) -> bool:
+        return cls.supports_attention_mask(attention_spec)
+
     @staticmethod
     def get_supported_head_sizes() -> list[int]:
         # FlashInfer dense prefill is well-tested for these head_dims on
