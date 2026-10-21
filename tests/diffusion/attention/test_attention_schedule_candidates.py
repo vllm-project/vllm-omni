@@ -18,6 +18,7 @@ import torch.nn as nn
 
 import vllm_omni.diffusion.attention.layer as layer_mod
 from vllm_omni.diffusion.attention.backends.abstract import AttentionImpl, AttentionMetadata
+from vllm_omni.diffusion.attention.backends.flash_attn import FlashAttentionBackend
 from vllm_omni.diffusion.attention.backends.trtllm_calibration import apply_to_pipeline
 from vllm_omni.diffusion.attention.capabilities import AttentionComputation
 from vllm_omni.diffusion.attention.layer import Attention, ScheduleCandidate
@@ -32,6 +33,7 @@ from vllm_omni.diffusion.data import (
     OmniDiffusionConfig,
     SkipSoftmaxSpec,
 )
+from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelInput
 from vllm_omni.diffusion.forward_context import (
     bind_attention_schedule,
     request_denoise_progress,
@@ -324,13 +326,62 @@ def test_constructed_layer_routes_a_dense_4d_mask_by_the_step_profile(attention_
     }
 
 
-def _pipeline(layer, *, name="attn1"):
-    """A minimal loaded-pipeline stand-in exposing named_modules()."""
+def _pipeline(layer, *, sp_plan=None, name="attn1"):
+    """A minimal loaded-pipeline stand-in exposing named_modules() and an optional _sp_plan."""
     transformer = nn.Module()
     setattr(transformer, name, layer)
+    if sp_plan is not None:
+        transformer._sp_plan = sp_plan
     root = nn.Module()
     root.transformer = transformer
     return root
+
+
+def _flat_auto_pad_plan():
+    """auto_pad on the plan entry itself, one level below the plan root."""
+    return {"hidden_states": SequenceParallelInput(split_dim=1, expected_dims=3, auto_pad=True)}
+
+
+def test_startup_validation_rejects_candidate_without_paged_support(attention_env):
+    attention_env.monkeypatch.setattr(FlashAttentionBackend, "get_impl_cls", staticmethod(lambda: _FakeImpl))
+    schedule = AttentionScheduleConfig(
+        profiles={"nopaged": AttentionConfig(default=AttentionSpec(backend="BLOCK_SPARSE"))},
+        default=[{"start": 0, "end": None, "profile": "nopaged"}],
+    )
+    config = _make_config(schedule=schedule, kv_mode=layer_mod.DiffusionKVCacheMode.PAGED_SCHEDULER)
+    layer = attention_env.build(config, paged_kv_cache_role="primary")
+
+    with pytest.raises(ValueError, match=r"profile 'nopaged'.*does not support Scheduler-managed paged KV"):
+        layer_mod.validate_attention_schedule_candidates(_pipeline(layer), config)
+
+
+def test_startup_validation_rejects_paged_capable_candidate_that_differs_from_baseline(attention_env):
+    attention_env.monkeypatch.setattr(FlashAttentionBackend, "get_impl_cls", staticmethod(lambda: _FakeImpl))
+    attention_env.monkeypatch.setattr(_fake_backend("BLOCK_SPARSE"), "supports_paged_kv", True)
+    schedule = AttentionScheduleConfig(
+        profiles={"paged": AttentionConfig(default=AttentionSpec(backend="BLOCK_SPARSE"))},
+        default=[{"start": 0, "end": None, "profile": "paged"}],
+    )
+    config = _make_config(schedule=schedule, kv_mode=layer_mod.DiffusionKVCacheMode.PAGED_SCHEDULER)
+    layer = attention_env.build(config, paged_kv_cache_role="primary")
+
+    with pytest.raises(ValueError, match=r"profile 'paged'.*native implementation bound to the baseline"):
+        layer_mod.validate_attention_schedule_candidates(_pipeline(layer), config)
+
+
+def test_startup_validation_rejects_auto_pad_incompatible_candidate(attention_env):
+    schedule = AttentionScheduleConfig(
+        profiles={"nomask": AttentionConfig(default=AttentionSpec(backend="BLOCK_SPARSE"))},
+        default=[{"start": 0, "end": None, "profile": "nomask"}],
+    )
+    attention_env.monkeypatch.setattr(
+        _fake_backend("BLOCK_SPARSE"), "supports_attention_mask", staticmethod(lambda spec=None: False)
+    )
+    config = _make_config(schedule=schedule, sp_size=2)
+    layer = attention_env.build(config)
+
+    with pytest.raises(ValueError, match=r"profile 'nomask'.*attention_mask"):
+        layer_mod.validate_attention_schedule_candidates(_pipeline(layer, sp_plan=_flat_auto_pad_plan()), config)
 
 
 def _ring_config(schedule, **kwargs):

@@ -8,17 +8,20 @@ from contextlib import nullcontext
 import pytest
 import torch
 
-from vllm_omni.diffusion.attention.schedule import AttentionScheduleRange
+from vllm_omni.diffusion.attention.schedule import AttentionScheduleRange, InvalidAttentionScheduleError
 from vllm_omni.diffusion.forward_context import (
+    begin_scheduled_denoise,
     bind_attention_schedule,
     get_attention_schedule_profile,
     get_forward_context,
+    is_forward_context_available,
     request_denoise_progress,
     set_forward_context,
     set_forward_context_denoise_step_idx,
     set_forward_context_denoise_timestep,
     set_forward_context_denoise_total_steps,
 )
+from vllm_omni.errors import OmniClientError, client_error_metadata
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
@@ -30,6 +33,35 @@ def _ranges(*entries):
 
 def _progress(ctx):
     return ctx.denoise_step_idx, ctx.denoise_timestep, ctx.total_denoise_steps
+
+
+@pytest.mark.parametrize(
+    "schedule", [_ranges((0, 2, "sparse")), _ranges((8, None, "sparse"))], ids=["bounded", "open-past-total"]
+)
+def test_begin_scheduled_denoise_returns_the_total_for_a_bound_schedule(schedule):
+    with set_forward_context(), bind_attention_schedule(schedule):
+        assert begin_scheduled_denoise(2) == 2
+        assert begin_scheduled_denoise(8) == 8
+        assert _progress(get_forward_context()) == (None, None, None)
+
+
+@pytest.mark.parametrize("scope", ["no-context", "unbound", "disabled"])
+def test_begin_scheduled_denoise_returns_none_without_checking_when_no_schedule_is_bound(scope):
+    if scope == "no-context":
+        assert is_forward_context_available() is False
+        assert begin_scheduled_denoise(0) is None
+    else:
+        with set_forward_context(), bind_attention_schedule(None if scope == "unbound" else ()):
+            assert begin_scheduled_denoise(0) is None
+
+
+def test_begin_scheduled_denoise_rejects_a_bounded_range_past_the_actual_total():
+    with set_forward_context(), bind_attention_schedule(_ranges((3, 6, "sparse"))):
+        with pytest.raises(InvalidAttentionScheduleError, match="exceeds total_steps=5") as excinfo:
+            begin_scheduled_denoise(5)
+
+    assert isinstance(excinfo.value, OmniClientError)
+    assert client_error_metadata(excinfo.value) == (400, "invalid_attention_schedule")
 
 
 class _RecordingPagedRuntime:

@@ -21,7 +21,7 @@ from vllm_omni.diffusion.attention.backends.abstract import (
 )
 
 if TYPE_CHECKING:
-    from vllm_omni.diffusion.data import AttentionConfig, AttentionSpec
+    from vllm_omni.diffusion.data import AttentionConfig, AttentionScheduleConfig, AttentionSpec
 
 logger = init_logger(__name__)
 
@@ -181,3 +181,29 @@ def get_attn_backend_for_capability(
 
         return DiffusionAttentionBackendEnum[spec.backend.upper()].get_class()
     return _cached_get_backend_cls(None, HEAD_SIZE_UNKNOWN)
+
+
+def resolve_capability_backends(
+    *,
+    role: str,
+    attention_config: AttentionConfig | None = None,
+    schedule: AttentionScheduleConfig | None = None,
+) -> list[tuple[str | None, type[AttentionBackend], AttentionSpec | None]]:
+    """The baseline backend (profile None) and each schedule profile with an explicit spec for ``role``.
+
+    A config-only probe such as SP auto-pad must hold for every backend a step can select.
+    A profile without an explicit spec resolves through the platform default, which this
+    probe cannot predict; the post-load candidate validation checks it instead.
+    """
+    spec = attention_config.resolve_with_source(role=role)[0] if attention_config is not None else None
+    entries: list[tuple[str | None, type[AttentionBackend], AttentionSpec | None]] = [
+        (None, get_attn_backend_for_capability(role=role, attention_config=attention_config), spec)
+    ]
+    if schedule is not None:
+        for name in sorted(schedule.profiles):
+            profile = schedule.profiles[name]
+            profile_spec, _ = profile.resolve_with_source(role=role)
+            if profile_spec is not None:
+                backend = get_attn_backend_for_capability(role=role, attention_config=profile)
+                entries.append((name, backend, profile_spec))
+    return entries
