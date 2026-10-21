@@ -27,6 +27,7 @@ from vllm_omni.diffusion.distributed.pipeline_parallel import AsyncLatents, Pipe
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.forward_context import DenoiseProgressMixin
 from vllm_omni.diffusion.lora.loader import WanLoraLoaderMixin
+from vllm_omni.diffusion.models.wan2_2.cudagraph_wrapper import Wan22DiTCUDAGraphWrapper
 from vllm_omni.diffusion.media import (
     DiffusionMediaOutput,
     VideoMediaOutput,
@@ -590,6 +591,26 @@ class Wan22Pipeline(
         for transformer in (self.transformer, self.transformer_2):
             if transformer is not None:
                 transformer.preserve_vsa_all_blocks = self.is_dmd
+
+        # Single-transformer (TI2V-5B tier) per-shape DiT CUDA graph cache.
+        # DMD pipelines keep their distinct per-step behavior in eager mode;
+        # the A14B MoE ``transformer_2`` stage is deliberately not wrapped yet.
+        model_config = getattr(od_config, "model_config", None) or {}
+        self.dit_cudagraph_wrapper = (
+            Wan22DiTCUDAGraphWrapper(
+                self.transformer,
+                enabled=not getattr(od_config, "enforce_eager", False) and not self.is_dmd,
+                max_graphs=int(model_config.get("wan22_dit_max_graphs", 8)),
+            )
+            if self.transformer is not None
+            else None
+        )
+        # Consumed by the diffusion model runner: while the DiT graph cache is
+        # active, inductor cudagraphs must stay off so the two graph layers
+        # (torch.compile's and this wrapper's) never stack.
+        self.enable_cuda_graph_decode = (
+            self.dit_cudagraph_wrapper is not None and self.dit_cudagraph_wrapper.enabled
+        )
 
         # Store the active transformer config
         if load_transformer:
@@ -1555,8 +1576,62 @@ class Wan22Pipeline(
         """
         if current_model is None:
             current_model = self.transformer
+        wrapper = getattr(self, "dit_cudagraph_wrapper", None)
+        if wrapper is not None and wrapper.enabled and current_model is self.transformer:
+            hidden_states = kwargs.get("hidden_states")
+            if hidden_states is not None:
+                rest = {k: v for k, v in kwargs.items() if k != "hidden_states"}
+                return wrapper(hidden_states, **rest)
         result = current_model(**kwargs)
         return result if isinstance(result, IntermediateTensors) else result[0]
+
+    def setup_compile(self) -> None:
+        """Capture the configured DiT CUDA graph shapes at startup.
+
+        ``model_config.wan22_dit_warmup_shapes`` lists ``(width, height,
+        num_frames)`` triples captured with zero tensors so the first real
+        request on a listed tier replays instead of paying capture. An empty
+        list (the default) leaves capture to the first request per shape,
+        matching the lazy behavior of the other diffusion graph wrappers.
+        """
+        wrapper = self.dit_cudagraph_wrapper
+        if wrapper is None or not wrapper.enabled:
+            return
+        model_config = getattr(self.od_config, "model_config", None) or {}
+        shapes = model_config.get("wan22_dit_warmup_shapes") or []
+        if not shapes:
+            logger.info("Wan2.2 DiT startup graph warm-up skipped: no shapes configured")
+            return
+        config = self.transformer_config
+
+        def _cfg(name: str, default: Any) -> Any:
+            return config.get(name, default) if isinstance(config, dict) else getattr(config, name, default)
+
+        in_channels = _cfg("in_channels", 48)
+        text_dim = _cfg("text_dim", 4096)
+        dtype = next(self.transformer.parameters()).dtype
+        device = self.transformer.device if hasattr(self.transformer, "device") else get_local_device()
+        start = time.perf_counter()
+        with torch.inference_mode():
+            for width, height, num_frames in shapes:
+                latent_frames = (num_frames - 1) // self.vae_scale_factor_temporal + 1
+                hidden_states = torch.zeros(
+                    1,
+                    in_channels,
+                    latent_frames,
+                    height // self.vae_scale_factor_spatial,
+                    width // self.vae_scale_factor_spatial,
+                    device=device,
+                    dtype=dtype,
+                )
+                timestep = torch.zeros(1, device=device, dtype=dtype)
+                encoder_hidden_states = torch.zeros(1, 512, text_dim, device=device, dtype=dtype)
+                wrapper(hidden_states, timestep=timestep, encoder_hidden_states=encoder_hidden_states, return_dict=False)
+        logger.info(
+            "Wan2.2 DiT startup graph warm-up captured %d shape(s) in %.1fs",
+            len(shapes),
+            time.perf_counter() - start,
+        )
 
     def encode_prompt(
         self,
