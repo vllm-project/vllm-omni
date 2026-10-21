@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """
 Unit tests for BufferAllocator and ManagedBuffer.
@@ -11,17 +11,19 @@ import threading
 import pytest
 import torch
 
+from tests.helpers.mark import hardware_test
 from vllm_omni.distributed.omni_connectors.connectors.mooncake_transfer_engine_connector import (
     BufferAllocator,
     ManagedBuffer,
 )
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import KVCacheTransferData
 
-# Most tests in this file are pure-CPU unit tests; CUDA smoke tests are skip-guarded.
-pytestmark = [pytest.mark.cpu, pytest.mark.parallel, pytest.mark.core_model]
+# Keep the shared execution markers at module scope. CPU markers are attached
+# only to CPU tests so the GPU smokes do not also enter CPU catch-all jobs.
+pytestmark = [pytest.mark.parallel, pytest.mark.core_model]
 
 
-@pytest.mark.core_model
+@pytest.mark.cpu
 class TestBufferAllocator:
     """Unit tests for BufferAllocator."""
 
@@ -87,6 +89,7 @@ class TestBufferAllocator:
         assert len(errors) == 0, f"Thread safety errors: {errors}"
 
 
+@pytest.mark.cpu
 class TestAllocatorInvariants:
     """
     Defensive invariant tests for BufferAllocator: double-free, partial
@@ -185,7 +188,6 @@ class TestAllocatorInvariants:
         assert offset == 0
 
 
-@pytest.mark.core_model
 class TestManagedBuffer:
     """Unit tests for ManagedBuffer."""
 
@@ -195,6 +197,7 @@ class TestManagedBuffer:
         self.allocator = BufferAllocator(total_size=4096, alignment=64)
         self.pool = torch.zeros(4096, dtype=torch.uint8)
 
+    @pytest.mark.cpu
     def test_tensor_view(self):
         """Verify tensor property and as_tensor return correct views."""
         offset = self.allocator.alloc(64)
@@ -214,6 +217,7 @@ class TestManagedBuffer:
 
         buf.release()
 
+    @pytest.mark.cpu
     def test_context_manager_releases_buffer(self):
         """Verify context manager releases buffer and space is reusable."""
         offset = self.allocator.alloc(128)
@@ -227,6 +231,7 @@ class TestManagedBuffer:
         new_offset = self.allocator.alloc(128)
         assert new_offset == offset
 
+    @pytest.mark.cpu
     def test_to_bytes_cpu_pool(self):
         """Smoke-test Mooncake's ManagedBuffer byte extraction on CPU pools."""
         expected = bytes(range(64))
@@ -239,7 +244,11 @@ class TestManagedBuffer:
         finally:
             buf.release()
 
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for GPU pool smoke test")
+    # PyTorch exposes ROCm devices through the cuda namespace. Keep this in the
+    # same one-GPU L4 marker scope used by the CUDA ready distributed job so the
+    # identical selection also executes a real GPU path on ROCm.
+    @hardware_test(res={"cuda": "L4"}, num_cards=1)
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU is required for GPU pool smoke test")
     def test_to_bytes_cuda_pool(self):
         """Smoke-test Mooncake's existing CUDA pool D2H byte path."""
         expected = bytes(range(64))
@@ -270,6 +279,7 @@ def _make_kv_payload(device: str | torch.device = "cpu") -> tuple[KVCacheTransfe
 class TestMooncakePackedPayloadSmoke:
     """Smoke tests for Mooncake raw payload helpers without real Mooncake/RDMA."""
 
+    @pytest.mark.cpu
     def test_load_header_from_cpu_tensor(self):
         payload, _, _ = _make_kv_payload()
         raw = payload.to_bytes()
@@ -279,7 +289,8 @@ class TestMooncakePackedPayloadSmoke:
         assert header["rid"] == "moon-smoke"
         assert data_start == 4 + int.from_bytes(raw[:4], "big")
 
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for packed CUDA smoke test")
+    @hardware_test(res={"cuda": "L4"}, num_cards=1)
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU is required for packed device smoke test")
     def test_from_bytes_device_cuda_round_trip(self):
         payload, key_tensor, value_tensor = _make_kv_payload(device="cuda:0")
         packed = payload.to_gpu_tensor()
