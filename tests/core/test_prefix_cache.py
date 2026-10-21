@@ -465,12 +465,24 @@ def test_empty_hit_block_group_fails_at_register():
         mgr.new_step_starts(PrefixCacheStep((event,), ()))
 
 
-def test_hit_not_block_aligned_fails_at_register():
+@pytest.mark.parametrize("hit_end", [1, 3, 4, 5, 6, 7])
+def test_partial_hit_materializes_exact_rows(hit_end):
     mgr, view = make_manager()
-    s1 = run_step(mgr, view, {"a": ([0, 1], 0, 8)})
+    cached_mm = torch.arange(24, dtype=DTYPE).reshape(8, 3)
+    fresh_mm = torch.full((2, 3), -1.0, dtype=DTYPE)
+    s1 = run_step(mgr, view, {"a": ([0, 1], 0, 8)}, mm={"talker.h": cached_mm})
     mgr.materialize(s1, ["a"])
-    with pytest.raises(OmniPrefixCacheUnmatchError, match="prefix hit not block aligned"):
-        run_step(mgr, view, {"b": ([0, 1, 2], 8, 4)}, new_hits={"b": 6})
+    s2 = run_step(
+        mgr,
+        view,
+        {"b": ([0, 1, 2], hit_end, 2)},
+        new_hits={"b": hit_end},
+        finished=["a"],
+        mm={"talker.h": fresh_mm},
+    )
+    out = mgr.materialize(s2, ["b"])
+    assert torch.equal(out.hidden_states["b"], expected_rows(view.slots_for("b", 0, hit_end + 2)))
+    assert torch.equal(out.mm_outputs["talker.h"]["b"], torch.cat((cached_mm[:hit_end], fresh_mm)))
 
 
 def test_mm_cached_key_merge():
@@ -813,7 +825,7 @@ def _stage_cfg(*, enable=True, pooling=False, kv_transfer=None, groups=(object()
 
 def test_stage_prefix_cache_config_gate():
     """The runner-side gate the GPU and NPU runners share: off / pooling
-    stages get no cache; kv_consumer, spec decode, sub-block matching and
+    stages get no cache; kv_consumer, spec decode and
     hybrid groups refuse loudly."""
     assert _stage_cfg(enable=False) is None
     assert _stage_cfg(pooling=True) is None
@@ -867,6 +879,9 @@ def test_group_view_step_slots_cpu():
     class Group:
         def __init__(self, t):
             self.block_table = TensorWrap(t)
+            self.block_size = BLOCK_SIZE
+            self.kv_cache_block_size = BLOCK_SIZE
+            self.dcp_world_size = 1
 
     class BT:
         def __init__(self, t):
@@ -988,6 +1003,9 @@ def test_step_slots_cpu_matches_block_table_math():
     class Group:
         def __init__(self, t):
             self.block_table = TensorWrap(t)
+            self.block_size = BLOCK_SIZE
+            self.kv_cache_block_size = BLOCK_SIZE
+            self.dcp_world_size = 1
 
     class BT:
         def __init__(self, t):
@@ -1015,7 +1033,13 @@ def test_step_slots_cpu_matches_block_table_math():
 
 def _ib_with_layout(**layout):
     """InputBatch fake whose group-0 block table carries vLLM's layout attrs."""
-    attrs = dict(kv_cache_block_size=BLOCK_SIZE, blocks_per_kv_block=1, use_hybrid_blocks=False, dcp_world_size=1)
+    attrs = dict(
+        block_size=BLOCK_SIZE,
+        kv_cache_block_size=BLOCK_SIZE,
+        blocks_per_kv_block=1,
+        use_hybrid_blocks=False,
+        dcp_world_size=1,
+    )
     attrs.update(layout)
     group = SimpleNamespace(block_table=SimpleNamespace(cpu=torch.zeros((1, 2), dtype=torch.int32)), **attrs)
 
@@ -1028,12 +1052,11 @@ def _ib_with_layout(**layout):
     return SimpleNamespace(req_ids=[], req_id_to_index={}, num_computed_tokens_cpu=torch.zeros(1), block_table=BT())
 
 
-def test_group_view_refuses_hybrid_kernel_blocks_and_dcp():
-    """step_slots_cpu assumes one allocator block per table column and no
-    token striping; both are silent wrong-slot writes if not refused."""
+def test_group_view_accepts_split_blocks_and_refuses_dcp():
     FullAttentionGroupView(_ib_with_layout(), block_size=BLOCK_SIZE)
-    with pytest.raises(OmniPrefixCacheUnmatchError, match="kernel_block_size"):
-        FullAttentionGroupView(_ib_with_layout(use_hybrid_blocks=True, blocks_per_kv_block=2), block_size=BLOCK_SIZE)
+    FullAttentionGroupView(
+        _ib_with_layout(block_size=2, use_hybrid_blocks=True, blocks_per_kv_block=2), block_size=BLOCK_SIZE
+    )
     with pytest.raises(OmniPrefixCacheUnmatchError, match="decode context parallel"):
         FullAttentionGroupView(_ib_with_layout(dcp_world_size=2), block_size=BLOCK_SIZE)
     with pytest.raises(OmniPrefixCacheUnmatchError, match="does not match"):
