@@ -20,6 +20,8 @@ from unittest import mock
 import pytest
 from pytest_mock import MockerFixture
 
+from vllm_omni.config.omni_config import OmniStageParallelConfig, OmniStageRuntimeConfig, VllmOmniARStageConfig
+from vllm_omni.config.stage_config import StagePipelineConfig
 from vllm_omni.engine import stage_init_utils
 from vllm_omni.engine.stage_init_utils import (
     _check_stage_device_layout,
@@ -32,11 +34,10 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def _stage(stage_id, devices, num_replicas=1, engine_args=None):
-    return types.SimpleNamespace(
-        stage_id=stage_id,
-        stage_type="llm",
-        engine_args=engine_args or {},
-        runtime=types.SimpleNamespace(devices=devices, num_replicas=num_replicas),
+    return VllmOmniARStageConfig(
+        stage_pipeline_config=StagePipelineConfig(stage_id=stage_id, model_stage="ar", final_output=True),
+        parallel_config=OmniStageParallelConfig(**(engine_args or {})),
+        runtime_config=OmniStageRuntimeConfig(devices=devices, num_replicas=num_replicas),
     )
 
 
@@ -157,10 +158,9 @@ def test_replica_guard_and_splitter_share_local_world_size(devices, expected):
     assert replica_devices_map == {0: expected}
 
 
-@pytest.mark.parametrize("typed", [False, True], ids=["legacy", "typed"])
 @pytest.mark.parametrize("local_dp", [None, 0, 1, 2])
 @pytest.mark.parametrize("pool_devices", [False, True], ids=["template", "pool"])
-def test_replica_layout_preserves_local_dp_semantics(typed, local_dp, pool_devices):
+def test_replica_layout_preserves_local_dp_semantics(local_dp, pool_devices):
     from vllm_omni.config.omni_config import VllmOmniConfig
     from vllm_omni.config.stage_config import PipelineConfig, StagePipelineConfig
     from vllm_omni.engine.stage_engine_startup import get_headless_replica_devices
@@ -173,20 +173,17 @@ def test_replica_layout_preserves_local_dp_semantics(typed, local_dp, pool_devic
     }
     width = 2 * max(1, local_dp if local_dp is not None else 4) * 2
     devices = ",".join(str(i) for i in range(width * (2 if pool_devices else 1)))
-    if typed:
-        pipeline = PipelineConfig(
-            model_type="test",
-            model_arch="TestModel",
-            stages=(StagePipelineConfig(stage_id=0, model_stage="ar", final_output=True),),
-        )
-        stage = VllmOmniConfig.from_pipeline_config(
-            pipeline,
-            cli_overrides={
-                f"stage_0_{key}": value for key, value in {**engine_args, "devices": devices, "num_replicas": 2}.items()
-            },
-        ).stage_configs[0]
-    else:
-        stage = _stage(0, devices=devices, num_replicas=2, engine_args=engine_args)
+    pipeline = PipelineConfig(
+        model_type="test",
+        model_arch="TestModel",
+        stages=(StagePipelineConfig(stage_id=0, model_stage="ar", final_output=True),),
+    )
+    stage = VllmOmniConfig.from_pipeline_config(
+        pipeline,
+        cli_overrides={
+            f"stage_0_{key}": value for key, value in {**engine_args, "devices": devices, "num_replicas": 2}.items()
+        },
+    ).stage_configs[0]
     expected = [",".join(str(i) for i in range(r * width, (r + 1) * width)) for r in range(2)]
 
     assert get_stage_devices_per_replica(stage) == width

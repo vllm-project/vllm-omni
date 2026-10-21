@@ -7,8 +7,9 @@ from types import SimpleNamespace
 import pytest
 
 from tests.helpers.stage_config import get_deploy_config_path
+from vllm_omni.config.omni_config import VllmOmniConfig
 from vllm_omni.config.pipeline_registry import resolve_pipeline_config
-from vllm_omni.config.stage_config import load_deploy_config, merge_pipeline_deploy
+from vllm_omni.config.stage_config import load_deploy_config
 from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler, VLLMScheduler
 from vllm_omni.platforms import current_omni_platform
 
@@ -48,18 +49,18 @@ def _config(*, native=True, stateful=True, tp=1, pp=1, extras=None, capacity=128
 def test_moss_profile_generation_constructor_after_platform_resolution(
     construct_scheduler, monkeypatch, mocker, platform
 ):
-    # merge_pipeline_deploy owns platform resolution. Mock the detected device
+    # VllmOmniConfig owns platform resolution. Mock the detected device
     # instead of applying an override first and then resolving the worker's
     # actual platform a second time.
     monkeypatch.setattr(current_omni_platform, "device_name", platform)
     deploy = load_deploy_config(get_deploy_config_path("moss_tts_local.yaml"))
     pipeline = resolve_pipeline_config("moss_tts_local")
-    codec = merge_pipeline_deploy(pipeline, deploy)[1]
+    codec = VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=deploy).stage_by_id(1)
     extras = deploy.connectors["shm"]["extra"]
     config = _config(
-        native=codec.yaml_engine_args["use_v2_model_runner"],
+        native=codec.model_config.use_v2_model_runner,
         stateful=pipeline.stages[1].retains_state_across_chunks,
-        capacity=codec.yaml_engine_args["max_num_seqs"],
+        capacity=codec.scheduler_config.max_num_seqs,
         extras=extras,
     )
     warning = mocker.patch("vllm_omni.core.sched.omni_generation_scheduler.logger.warning")

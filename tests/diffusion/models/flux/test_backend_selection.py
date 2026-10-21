@@ -30,7 +30,7 @@ from vllm_omni.diffusion.distributed.parallel_state import (
 from vllm_omni.diffusion.forward_context import set_forward_context
 from vllm_omni.diffusion.models.flux.flux_transformer import FluxTransformer2DModel
 from vllm_omni.diffusion.vllm_config import create_diffusion_vllm_config
-from vllm_omni.engine.stage_init_utils import build_engine_args_dict_from_omni_stage_config
+from vllm_omni.engine.stage_init_utils import project_engine_args
 
 pytestmark = [pytest.mark.local_model, pytest.mark.diffusion]
 
@@ -50,7 +50,8 @@ def test_tiny_flux_runs_requested_backends(tmp_path, mocker):
             "diffusion_attention_config": {"default": "TORCH_SDPA"},
         },
     )
-    args = build_engine_args_dict_from_omni_stage_config(stage, model="unused")
+    # A local placeholder keeps this random-weight component test offline.
+    args = project_engine_args(stage, model=str(tmp_path))
     od_config = OmniDiffusionConfig.from_kwargs(
         **extract_diffusion_stage_config_kwargs(
             args,

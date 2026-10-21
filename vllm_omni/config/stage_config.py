@@ -9,7 +9,7 @@ import math
 import re
 import warnings
 from collections.abc import Callable, Mapping
-from dataclasses import asdict, dataclass, field, fields
+from dataclasses import dataclass, field, fields
 from enum import Enum
 from pathlib import Path
 from typing import Any, Literal, NamedTuple
@@ -21,7 +21,7 @@ from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
 
 from vllm_omni.config.endpoint_policy import EndpointRestriction
 from vllm_omni.config.speech_cache import SpeechCacheConfig
-from vllm_omni.config.yaml_util import create_config, load_yaml_config, to_dict
+from vllm_omni.config.yaml_util import load_yaml_config, to_dict
 from vllm_omni.core.sched.omni_ar_scheduler import OmniARAsyncScheduler, OmniARScheduler
 from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler
 
@@ -167,7 +167,7 @@ def _apply_diffusion_parallel_runtime_overrides(
     engine_args: dict[str, Any],
     runtime_overrides: dict[str, Any],
 ) -> None:
-    """Move diffusion parallel overrides into nested ``parallel_config``."""
+    """Move diffusion parallel CLI overrides into nested ``parallel_config``."""
     from vllm_omni.diffusion.data import DiffusionParallelConfig
 
     parallel_fields = frozenset(f.name for f in fields(DiffusionParallelConfig))
@@ -200,12 +200,7 @@ def reconcile_diffusion_attention_overrides(
     engine_args: dict[str, Any],
     runtime_overrides: Mapping[str, Any],
 ) -> None:
-    """Apply CLI precedence across the two diffusion attention representations.
-
-    ``diffusion_attention_backend`` and ``diffusion_attention_config.default``
-    express the same setting and are rejected downstream when both are set, so
-    a CLI value in one form replaces the YAML value in the other.
-    """
+    """Apply CLI precedence across the two diffusion attention representations."""
     if runtime_overrides.get("diffusion_attention_backend") is not None:
         yaml_config = engine_args.get("diffusion_attention_config")
         if isinstance(yaml_config, Mapping) and yaml_config.get("default") is not None:
@@ -359,7 +354,7 @@ class StagePipelineConfig:
     sampling_constraints: dict[str, Any] = field(default_factory=dict)
     custom_process_input_func: str | None = None
     custom_process_next_stage_input_func: str | None = None
-    # Alternates picked by ``merge_pipeline_deploy`` based on ``deploy.async_chunk``.
+    # Alternates picked by the typed stage resolver based on ``deploy.async_chunk``.
     async_chunk_process_next_stage_input_func: str | None = None
     sync_process_input_func: str | None = None
     supports_native_mrv2_data_plane: bool = False
@@ -1214,20 +1209,6 @@ def _apply_platform_overrides(
     return deploy
 
 
-_EXECUTION_TYPE_TO_STAGE_WORKER: dict[StageExecutionType, tuple[StageType, str | None]] = {
-    StageExecutionType.LLM_AR: (StageType.LLM, "ar"),
-    StageExecutionType.LLM_GENERATION: (StageType.LLM, "generation"),
-    StageExecutionType.DIFFUSION: (StageType.DIFFUSION, None),
-}
-
-
-def _resolve_execution_mode(
-    execution_type: StageExecutionType,
-) -> tuple[StageType, str | None]:
-    """Map ``execution_type`` → ``(stage_type, worker_type)`` legacy tuple."""
-    return _EXECUTION_TYPE_TO_STAGE_WORKER.get(execution_type, (StageType.LLM, None))
-
-
 def resolve_stage_model_runner(deploy: DeployConfig, stage: StageDeployConfig | None) -> str:
     """The stage's own ``model_runner`` if set, else the deploy-level one."""
     runner = getattr(stage, "model_runner", None) if stage is not None else None
@@ -1274,95 +1255,6 @@ def _select_processor_funcs(
     return input_proc, next_stage_proc
 
 
-def _build_engine_args(
-    ps: StagePipelineConfig,
-    ds: StageDeployConfig | None,
-    pipeline: PipelineConfig,
-    deploy: DeployConfig,
-    next_stage_proc: str | None,
-) -> dict[str, Any]:
-    """Assemble the flat ``yaml_engine_args`` dict for one stage.
-
-    Pipeline-wide DeployConfig fields are applied uniformly to every stage;
-    per-stage StageDeployConfig overrides take precedence when present (e.g.
-    ``engine_extras`` can still carry a stage-specific ``dtype``).
-    """
-    engine_args: dict[str, Any] = {"model_arch": ps.model_arch or pipeline.model_arch or None}
-    engine_args["retains_state_across_chunks"] = ps.retains_state_across_chunks
-    if ps.execution_type == StageExecutionType.DIFFUSION and ps.model_arch:
-        engine_args.setdefault("model_class_name", ps.model_arch)
-    if ps.engine_output_type is not None:
-        engine_args["engine_output_type"] = ps.engine_output_type
-    if next_stage_proc:
-        engine_args["custom_process_next_stage_input_func"] = next_stage_proc
-    # Subdirectory indirections from StagePipelineConfig (structural, not
-    # deployment knobs).  Deploy YAML ``engine_extras`` can still override
-    # these per-stage if needed.
-    if ps.model_subdir:
-        engine_args["model_subdir"] = ps.model_subdir
-    if ps.tokenizer_subdir:
-        engine_args["tokenizer_subdir"] = ps.tokenizer_subdir
-    if ps.model_path_resolver:
-        engine_args["model_path_resolver"] = ps.model_path_resolver
-    engine_args["inline_diffusion"] = ps.inline_diffusion
-    if ps.stage_input_payload_keys:
-        engine_args["stage_input_payload_keys"] = tuple(ps.stage_input_payload_keys)
-    if ps.stage_input_optional_payload_keys:
-        engine_args["stage_input_optional_payload_keys"] = tuple(ps.stage_input_optional_payload_keys)
-    if ps.stage_output_payload_keys:
-        engine_args["stage_output_payload_keys"] = tuple(ps.stage_output_payload_keys)
-
-    # Pipeline-wide top-level DeployConfig settings, applied to every stage.
-    for name in PIPELINE_WIDE_ENGINE_FIELDS:
-        value = getattr(deploy, name)
-        if value is not None:
-            engine_args[name] = value
-
-    # Per-stage StageDeployConfig values override pipeline-wide settings.
-    if ds is not None:
-        for k, v in asdict(ds).items():
-            if k in _STAGE_RESERVED_KEYS or v is None:
-                continue
-            engine_args[k] = v
-        engine_args.update(ds.engine_extras)
-    engine_args["async_chunk"] = resolve_stage_async_chunk(deploy, ds)
-    engine_args["session_mode"] = deploy.session_mode
-    if deploy.session_mode == "duplex":
-        # Session placement caps model-owned state per replica. Legacy deploys
-        # retain the global admission limit as their worker capacity.
-        engine_args["duplex_max_sessions"] = deploy.duplex_session.worker_max_sessions
-    # The runner selection is a deploy-topology decision owned by the
-    # ``model_runner`` field; do not let an opaque ``engine_extras`` entry
-    # silently veto or force it per stage.
-    if ds is not None:
-        for reserved in ("use_v2_model_runner", "supports_native_mrv2_data_plane"):
-            if reserved in ds.engine_extras:
-                raise ValueError(
-                    f"stage {ds.stage_id}: {reserved!r} must not be set via engine_extras; "
-                    "it is derived from the deploy-level `model_runner` field and the "
-                    "pipeline's `supports_native_mrv2_data_plane` declaration."
-                )
-    stage_runner = resolve_stage_model_runner(deploy, ds)
-    validate_native_mrv2_session(deploy, ps, stage_runner)
-    engine_args["use_v2_model_runner"] = stage_runner == "v2"
-    engine_args["supports_native_mrv2_data_plane"] = bool(ps.supports_native_mrv2_data_plane)
-    if stage_runner == "v2" and not ps.supports_native_mrv2_data_plane:
-        logger.warning(
-            "Stage %s (%s) selects model_runner=v2 without declaring "
-            "supports_native_mrv2_data_plane. It will use the legacy transport path; "
-            "MRV2 support for this pipeline has not been validated. Use model_runner=v1 "
-            "unless you are validating a new MRV2 integration.",
-            ps.stage_id,
-            ps.model_arch or pipeline.model_arch or pipeline.model_type,
-        )
-    if ps.omni_kv_config:
-        engine_args["omni_kv_config"] = dict(ps.omni_kv_config)
-    engine_args["requires_full_payload_input"] = ps.requires_full_payload_input
-    if not ps.supports_running_prefix_cache_reset:
-        engine_args["supports_running_prefix_cache_reset"] = False
-    return engine_args
-
-
 def merge_sampling_constraints(
     sampling_params: Mapping[str, Any] | None,
     constraints: Mapping[str, Any],
@@ -1374,37 +1266,6 @@ def merge_sampling_constraints(
         required_stop_ids = resolved_constraints["stop_token_ids"] or []
         resolved_constraints["stop_token_ids"] = list(dict.fromkeys([*caller_stop_ids, *required_stop_ids]))
     return {**(sampling_params or {}), **resolved_constraints}
-
-
-def _build_extras(
-    ps: StagePipelineConfig,
-    ds: StageDeployConfig | None,
-) -> dict[str, Any]:
-    """Assemble ``yaml_extras`` (sampling + connectors + pipeline extras)."""
-    extras: dict[str, Any] = {}
-    sampling = merge_sampling_constraints(
-        ds.default_sampling_params if ds is not None else None,
-        ps.sampling_constraints,
-    )
-    if sampling:
-        extras["default_sampling_params"] = sampling
-    if ds is not None and ds.default_pooling_params:
-        extras["default_pooling_params"] = dict(ds.default_pooling_params)
-    if ds is not None and ds.output_connectors:
-        extras["output_connectors"] = dict(ds.output_connectors)
-    if ds is not None and ds.input_connectors:
-        extras["input_connectors"] = dict(ds.input_connectors)
-    if ps.prompt_transform_func:
-        extras["prompt_transform_func"] = ps.prompt_transform_func
-    if ps.prompt_expand_func:
-        extras["prompt_expand_func"] = ps.prompt_expand_func
-    if ps.cfg_kv_collect_func:
-        extras["cfg_kv_collect_func"] = ps.cfg_kv_collect_func
-    if ps.async_chunk_prewarm_payload_func:
-        extras["async_chunk_prewarm_payload_func"] = ps.async_chunk_prewarm_payload_func
-    if ps.extras:
-        extras.update(ps.extras)
-    return extras
 
 
 def update_deploy_config_async_chunk_enabled(
@@ -1477,187 +1338,3 @@ def validate_stage_async_chunk_edges(pipeline: PipelineConfig, deploy: DeployCon
                     f"connector edge {source_id} -> {consumer.stage_id}. "
                     "Set the same async_chunk mode on both stages or disable pipeline-wide async_chunk."
                 )
-
-
-def merge_pipeline_deploy(
-    pipeline: PipelineConfig,
-    deploy: DeployConfig,
-) -> list[StageConfig]:
-    """Merge pipeline + deploy + platform overrides → list[StageConfig]."""
-    deploy = _apply_platform_overrides(deploy)
-    deploy_by_id = {s.stage_id: s for s in deploy.stages}
-
-    # NOTE: The CLI override is applied to the Deployconfig for async chunk prior
-    # to this point. We are in the process of better organizing the creation of the
-    # DeployConfig/PipelineConfig, and this path will be removed with the incorporation
-    # of the OmniConfig.
-    update_deploy_config_async_chunk_enabled(pipeline, deploy)
-
-    result: list[StageConfig] = []
-    for ps in pipeline.stages:
-        ds = deploy_by_id.get(ps.stage_id)
-        stage_type, worker_type = _resolve_execution_mode(ps.execution_type)
-        stage_async_chunk = resolve_stage_async_chunk(deploy, ds)
-        input_proc, next_stage_proc = _select_processor_funcs(ps, stage_async_chunk)
-        engine_args = _build_engine_args(ps, ds, pipeline, deploy, next_stage_proc)
-        # Downstream stages may share a multimodal wrapper class without owning
-        # an encoder. Do not make vLLM profile dummy multimodal inputs for them.
-        if not ps.requires_multimodal_data:
-            engine_args.setdefault("skip_mm_profiling", True)
-        sched_cls = _resolve_scheduler(
-            ps.execution_type,
-            engine_args.get("async_scheduling", True),
-        )
-        if ps.execution_type == StageExecutionType.LLM_AR:
-            engine_args["async_scheduling"] = sched_cls is OmniARAsyncScheduler
-        extras = _build_extras(ps, ds)
-        runtime: dict[str, Any] = {"process": True}
-        if ds is not None:
-            if ds.devices is not None:
-                runtime["devices"] = ds.devices
-            runtime["num_replicas"] = ds.num_replicas
-            if ds.env is not None:
-                runtime["env"] = ds.env
-        if deploy.cuda_mps:
-            runtime["cuda_mps"] = True
-        runtime["requires_multimodal_data"] = ps.requires_multimodal_data
-
-        result.append(
-            StageConfig(
-                stage_id=ps.stage_id,
-                model_stage=ps.model_stage,
-                stage_role=ps.stage_role.value if ps.stage_role is not None else None,
-                session_mode=deploy.session_mode,
-                stage_type=stage_type,
-                input_sources=list(ps.input_sources),
-                custom_process_input_func=input_proc,
-                final_output=ps.final_output,
-                final_output_type=ps.final_output_type,
-                worker_type=worker_type,
-                scheduler_cls=ps.scheduler_cls or _scheduler_path(sched_cls),
-                hf_config_name=ps.hf_config_name,
-                is_comprehension=ps.owns_tokenizer,
-                sampling_constraints=dict(ps.sampling_constraints),
-                yaml_engine_args=engine_args,
-                yaml_runtime=runtime,
-                yaml_extras=extras,
-            )
-        )
-    return result
-
-
-@dataclass
-class StageConfig:
-    """Per-stage config (legacy path). Used by both new and legacy loaders.
-
-    TODO(@lishunyang12): replace with ResolvedStageConfig once all models are migrated.
-    """
-
-    stage_id: int
-    model_stage: str
-    stage_role: str | None = None
-    session_mode: str = "turn"
-    stage_type: StageType = StageType.LLM
-    input_sources: list[int] = field(default_factory=list)
-    custom_process_input_func: str | None = None
-    final_output: bool = False
-    final_output_type: str | None = None
-    worker_type: str | None = None
-    scheduler_cls: str | None = None
-    hf_config_name: str | None = None
-    is_comprehension: bool = False
-    sampling_constraints: dict[str, Any] = field(default_factory=dict)
-    yaml_engine_args: dict[str, Any] = field(default_factory=dict)
-    yaml_runtime: dict[str, Any] = field(default_factory=dict)
-    yaml_extras: dict[str, Any] = field(default_factory=dict)
-    runtime_overrides: dict[str, Any] = field(default_factory=dict)
-
-    def to_omegaconf(self) -> Any:
-        """TODO(@lishunyang12): remove once engine consumes ResolvedStageConfig directly."""
-        # Start with YAML engine_args defaults
-        engine_args: dict[str, Any] = dict(self.yaml_engine_args)
-        runtime_overrides = dict(self.runtime_overrides)
-
-        # Overlay topology-level fields
-        engine_args["model_stage"] = self.model_stage
-        # Diffusion disaggregation stage role (see DiffusionStageRole). Only
-        # surfaced when set so non-diffusion stages are unaffected; the payload
-        # key schema rides along in ``yaml_engine_args``.
-        if self.stage_role is not None:
-            engine_args["stage_role"] = self.stage_role
-        if self.worker_type:
-            engine_args["worker_type"] = self.worker_type
-        if self.scheduler_cls:
-            engine_args["scheduler_cls"] = self.scheduler_cls
-        if self.hf_config_name:
-            engine_args["hf_config_name"] = self.hf_config_name
-
-        if StageType(self.stage_type) == StageType.DIFFUSION:
-            _apply_diffusion_parallel_runtime_overrides(engine_args, runtime_overrides)
-            reconcile_diffusion_attention_overrides(engine_args, runtime_overrides)
-
-        # CLI overrides take precedence over YAML defaults. Most dict-valued
-        # overrides are deep-merged so a partial CLI dict (e.g. --no-guardrails
-        # riding on ``model_config``) layers onto the deploy YAML instead of
-        # clobbering sibling keys such as ``policy_server_config`` — the same
-        # rationale as the platform-overlay deep-merge. Legacy atomic mappings
-        # are handled explicitly below.
-        for key, value in runtime_overrides.items():
-            if value is not None and key not in ("devices", "max_batch_size", "num_replicas"):
-                existing = engine_args.get(key)
-                # ``omni_kv_config`` is an atomic legacy override: callers use
-                # a partial mapping to replace the topology-provided transfer
-                # role, rather than to add fields to it.
-                if key != "omni_kv_config" and isinstance(existing, dict) and isinstance(value, dict):
-                    engine_args[key] = _get_recursively_merged_dict(existing, value)
-                else:
-                    engine_args[key] = value
-
-        # Terminal-stage ownership comes from topology, not engine overrides.
-        engine_args["final_output"] = self.final_output
-        if self.yaml_engine_args.get("supports_running_prefix_cache_reset") is False:
-            engine_args["supports_running_prefix_cache_reset"] = False
-
-        # Build runtime config from YAML defaults + CLI overrides
-        runtime: dict[str, Any] = dict(self.yaml_runtime)
-        runtime.setdefault("process", True)
-        if runtime_overrides.get("devices") is not None:
-            runtime["devices"] = runtime_overrides["devices"]
-        if runtime_overrides.get("num_replicas") is not None:
-            runtime["num_replicas"] = runtime_overrides["num_replicas"]
-
-        # Legacy compat: migrate runtime.max_batch_size → engine_args.max_num_seqs
-        legacy_mbs = runtime.pop("max_batch_size", None)
-        cli_mbs = runtime_overrides.get("max_batch_size")
-        if legacy_mbs is not None or cli_mbs is not None:
-            warnings.warn(
-                "runtime.max_batch_size is deprecated and will be removed in a "
-                "future release. Use engine_args.max_num_seqs instead.",
-                FutureWarning,
-                stacklevel=2,
-            )
-            effective_mbs = int(cli_mbs or legacy_mbs or 1)
-            engine_args.setdefault("max_num_seqs", effective_mbs)
-
-        # Build full config dict
-        config_dict: dict[str, Any] = {
-            "stage_id": self.stage_id,
-            "stage_type": StageType(self.stage_type).value,
-            "session_mode": self.session_mode,
-            "engine_args": create_config(engine_args),
-            "runtime": create_config(runtime),
-            "engine_input_source": self.input_sources,  # Legacy field name
-            "final_output": self.final_output,
-            "final_output_type": self.final_output_type,
-            "is_comprehension": self.is_comprehension,
-            "sampling_constraints": dict(self.sampling_constraints),
-        }
-
-        if self.custom_process_input_func:
-            config_dict["custom_process_input_func"] = self.custom_process_input_func
-
-        # Pass through extra YAML fields (default_sampling_params,
-        # output_connectors, input_connectors, tts_args, etc.)
-        config_dict.update(self.yaml_extras)
-
-        return create_config(config_dict)

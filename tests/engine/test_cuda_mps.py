@@ -8,8 +8,10 @@ from unittest.mock import Mock
 
 import pytest
 
-from vllm_omni.config.omni_config import OmniStageRuntimeConfig
+from vllm_omni.config.omni_config import OmniStageRuntimeConfig, VllmOmniARStageConfig, VllmOmniDiffusionStageConfig
+from vllm_omni.config.stage_config import StageExecutionType, StagePipelineConfig
 from vllm_omni.engine import cuda_mps
+from vllm_omni.engine.stage_init_utils import LogicalStageInitPlan, ReplicaInitPlan, extract_stage_metadata
 from vllm_omni.engine.stage_runtime import StageRuntime
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -170,27 +172,46 @@ def test_failed_shutdown_preserves_socket_for_retry(controls):
 @pytest.mark.parametrize("launch_mode,stage_type", [("remote", "llm"), ("local", "diffusion")])
 def test_mps_rejects_unsupported_stages(launch_mode, stage_type):
     runtime = StageRuntime.__new__(StageRuntime)
-    metadata = SimpleNamespace(runtime_cfg={"cuda_mps": True}, stage_type=stage_type)
-    stage_cfg = SimpleNamespace(runtime=metadata.runtime_cfg)
-    plans = [
-        SimpleNamespace(replicas=[SimpleNamespace(metadata=metadata, stage_cfg=stage_cfg, launch_mode=launch_mode)])
-    ]
+    plan = _mps_stage_plan(launch_mode, stage_type)
     with pytest.raises(ValueError, match="local EngineCore"):
-        runtime._validate_mps_topology(plans)
-    metadata.runtime_cfg["cuda_mps"] = False
-    runtime._validate_mps_topology(plans)
+        runtime._validate_mps_topology([plan])
+    plan.replicas[0].stage_cfg.runtime_config.cuda_mps = False
+    runtime._validate_mps_topology([plan])
 
 
 def test_mps_rejects_parallel_initialization():
     runtime = StageRuntime.__new__(StageRuntime)
     runtime._parallel_stage_init = True
-    replica = SimpleNamespace(
-        metadata=SimpleNamespace(stage_type="llm"),
-        stage_cfg=SimpleNamespace(runtime={"cuda_mps": True}),
-        launch_mode="local",
-    )
     with pytest.raises(ValueError, match="parallel_stage_init=false"):
-        runtime._validate_mps_topology([SimpleNamespace(replicas=[replica])])
+        runtime._validate_mps_topology([_mps_stage_plan("local", "llm")])
+
+
+def _mps_stage_plan(launch_mode: str, stage_type: str) -> LogicalStageInitPlan:
+    is_diffusion = stage_type == "diffusion"
+    config_cls = VllmOmniDiffusionStageConfig if is_diffusion else VllmOmniARStageConfig
+    stage_cfg = config_cls(
+        stage_pipeline_config=StagePipelineConfig(
+            stage_id=0,
+            model_stage=stage_type,
+            execution_type=StageExecutionType.DIFFUSION if is_diffusion else StageExecutionType.LLM_AR,
+        ),
+        runtime_config=OmniStageRuntimeConfig(cuda_mps=True),
+    )
+    return LogicalStageInitPlan(
+        stage_idx=0,
+        stage_id=0,
+        replicas=[
+            ReplicaInitPlan(
+                replica_id=0,
+                num_replicas=1,
+                launch_mode=launch_mode,
+                stage_cfg=stage_cfg,
+                metadata=extract_stage_metadata(stage_cfg),
+                stage_connector_spec={},
+                omni_kv_connector=(None, None, None),
+            )
+        ],
+    )
 
 
 def test_failed_launch_command_still_checks_private_daemon_cleanup(controls):

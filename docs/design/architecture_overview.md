@@ -340,9 +340,6 @@ This envelope carries the effective `PipelineConfig` alongside typed
 same resolved topology, including injected stages. Backend arguments are
 projected from these typed stages when each engine is initialized.
 
-The legacy `stage_args` YAML path has been removed. Model topology now resolves
-through `PipelineConfig`, with runtime overrides supplied by `DeployConfig`.
-
 In the typed path, each stage configuration derives from
 `BaseVllmOmniStageConfig` and is specialized as
 `VllmOmniARStageConfig`, `VllmOmniGenerationStageConfig`, or

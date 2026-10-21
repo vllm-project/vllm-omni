@@ -282,26 +282,15 @@ class _MossTTSAdapterBase(ARTTSAdapter):
 
         The codec (code2wav) stage is the final stage of every MOSS pipeline
         (``moss_tts_local_codec`` / ``moss_tts_codec``); prefer a stage whose
-        ``model_stage`` mentions "codec", else anchor on the last stage. The
-        runtime mapping accepts the resolved ``runtime_config`` object, the
-        omegaconf ``runtime`` mapping, and the legacy ``yaml_runtime`` dict.
+        ``model_stage`` mentions "codec", else anchor on the last stage.
         """
         stages = list(getattr(self.engine_client, "stage_configs", None) or ())
         if not stages:
             return None
         codec_stages = [s for s in stages if "codec" in str(getattr(s, "model_stage", "") or "")]
         anchor = codec_stages[-1] if codec_stages else stages[-1]
-        for attr in ("runtime_config", "runtime", "yaml_runtime"):
-            runtime_cfg = getattr(anchor, attr, None)
-            if runtime_cfg is None:
-                continue
-            devices = (
-                runtime_cfg.get("devices") if hasattr(runtime_cfg, "get") else getattr(runtime_cfg, "devices", None)
-            )
-            if devices is not None and str(devices).strip():
-                return str(devices)
-        devices = getattr(anchor, "devices", None)
-        return str(devices) if devices is not None and str(devices).strip() else None
+        devices = anchor.runtime_config.devices
+        return devices if devices is not None and devices.strip() else None
 
     def _resolve_ref_encoder_device(self):
         """Pick the device of the API-process reference-audio encoder.

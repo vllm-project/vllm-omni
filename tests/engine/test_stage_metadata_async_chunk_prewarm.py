@@ -2,8 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Resolution of ``async_chunk_prewarm_payload_func`` into stage metadata and clients.
 
-The legacy (``to_omegaconf``) and structured (``VllmOmniConfig``) paths must
-resolve the same callable. MiniCPM-o 4.5 declares it on Code2Wav only.
+Typed stage configuration must preserve the callable through metadata and
+client construction. MiniCPM-o 4.5 declares it on Code2Wav only.
 """
 
 import copy
@@ -23,13 +23,11 @@ from vllm_omni.config.stage_config import (
     StageExecutionType,
     StagePipelineConfig,
     load_deploy_config,
-    merge_pipeline_deploy,
 )
 from vllm_omni.engine.stage_engine_core_client import DPLBStageEngineCoreClient, StageEngineCoreClient
 from vllm_omni.engine.stage_init_utils import (
     StageMetadata,
-    extract_legacy_stage_metadata,
-    extract_stage_metadata_from_omni_stage_config,
+    extract_stage_metadata,
 )
 from vllm_omni.model_executor.models.minicpmo_4_5.pipeline import MINICPMO_4_5_PIPELINE
 from vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni import code2wav_prewarm_payload
@@ -86,20 +84,12 @@ def test_minicpmo_declares_prewarm_payload_on_code2wav_only() -> None:
         pytest.param(_generic_inputs, [None, operator.neg], id="generic"),
     ],
 )
-def test_legacy_and_structured_metadata_resolve_prewarm_payload(make_inputs, expected) -> None:
+def test_typed_metadata_resolves_prewarm_payload(make_inputs, expected) -> None:
     pipeline, deploy = make_inputs()
 
-    legacy = [
-        extract_legacy_stage_metadata(stage.to_omegaconf())
-        for stage in merge_pipeline_deploy(pipeline, copy.deepcopy(deploy))
-    ]
     omni_config = VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=copy.deepcopy(deploy))
-    structured = [
-        extract_stage_metadata_from_omni_stage_config(omni_config.stage_by_id(stage.stage_id))
-        for stage in pipeline.stages
-    ]
+    structured = [extract_stage_metadata(omni_config.stage_by_id(stage.stage_id)) for stage in pipeline.stages]
 
-    assert [m.async_chunk_prewarm_payload_func for m in legacy] == expected
     assert [m.async_chunk_prewarm_payload_func for m in structured] == expected
 
 

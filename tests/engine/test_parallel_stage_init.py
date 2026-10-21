@@ -24,9 +24,17 @@ import threading
 import time
 import types
 from pathlib import Path
+from typing import Any
 
 import pytest
 
+from vllm_omni.config.omni_config import (
+    OmniStageCacheConfig,
+    OmniStageRuntimeConfig,
+    VllmOmniARStageConfig,
+    VllmOmniDiffusionStageConfig,
+)
+from vllm_omni.config.stage_config import StageExecutionType, StagePipelineConfig
 from vllm_omni.engine.stage_admission import (
     ADMISSION_EXEMPT,
     DeviceLedger,
@@ -67,11 +75,9 @@ def _llm_replica(stage_id: int, replica_id: int, devices: str | None, *, vllm_co
         runtime_cfg={"devices": devices} if devices is not None else {},
         replica_id=replica_id,
     )
-    stage_cfg = types.SimpleNamespace(
-        stage_id=stage_id,
-        stage_type="llm",
-        runtime=types.SimpleNamespace(devices=devices),
-        engine_args={},
+    stage_cfg = VllmOmniARStageConfig(
+        stage_pipeline_config=StagePipelineConfig(stage_id=stage_id, model_stage="ar"),
+        runtime_config=OmniStageRuntimeConfig(devices=devices),
     )
     return ReplicaInitPlan(
         replica_id=replica_id,
@@ -287,7 +293,13 @@ def _local_diffusion_replica(stage_id: int, replica_id: int, devices: str, *, ut
     replica = _llm_replica(stage_id, replica_id, devices)
     replica.metadata.stage_type = "diffusion"
     replica.stage_vllm_config = None
-    replica.stage_cfg.engine_args = {} if util is None else {"gpu_memory_utilization": util}
+    replica.stage_cfg = VllmOmniDiffusionStageConfig(
+        stage_pipeline_config=StagePipelineConfig(
+            stage_id=stage_id, model_stage="diffusion", execution_type=StageExecutionType.DIFFUSION
+        ),
+        runtime_config=OmniStageRuntimeConfig(devices=devices),
+        cache_config=OmniStageCacheConfig(gpu_memory_utilization=util),
+    )
     return replica
 
 
@@ -309,7 +321,7 @@ def test_check_admission_admits_diffusion_with_explicit_util():
 def test_check_admission_reads_typed_diffusion_cache_config():
     cap = 80 * 1024**3
     diff = _local_diffusion_replica(0, 0, "0", util=None)
-    diff.stage_cfg.cache_config = types.SimpleNamespace(gpu_memory_utilization=0.35)
+    diff.stage_cfg.cache_config.gpu_memory_utilization = 0.35
     plan = LogicalStageInitPlan(stage_idx=0, stage_id=0, replicas=[diff])
 
     ledgers = check_admission(
@@ -387,11 +399,8 @@ def test_run_stage_admission_excludes_remote_replicas(monkeypatch):
     runtime._init_visible_devices_baseline = None
 
     local = _llm_replica(0, 0, "0", vllm_config=_fake_vllm_config(0.4, cudagraph_mode="NONE"))
-    remote_diff = _llm_replica(1, 0, "0")
+    remote_diff = _local_diffusion_replica(1, 0, "0", util=0.3)
     remote_diff.launch_mode = "remote"
-    remote_diff.metadata.stage_type = "diffusion"
-    remote_diff.stage_vllm_config = None
-    remote_diff.stage_cfg.engine_args = {"gpu_memory_utilization": 0.3}
 
     captured = {}
 
@@ -428,12 +437,16 @@ def _capture_admission(monkeypatch, runtime, replicas):
 def _stub_platform(monkeypatch, seen: list[int], total: int = 80 * 1024**3):
     import vllm_omni.engine.stage_runtime as runtime_mod
 
+    def get_device_total_memory(device: int) -> int:
+        seen.append(device)
+        return total
+
     monkeypatch.setattr(
         runtime_mod,
         "current_omni_platform",
         types.SimpleNamespace(
             device_control_env_var="CUDA_VISIBLE_DEVICES",
-            get_device_total_memory=lambda d: (seen.append(d), total)[1],
+            get_device_total_memory=get_device_total_memory,
         ),
     )
 
@@ -798,6 +811,8 @@ def test_resolve_driver_device_ids_dp_slice(monkeypatch):
 # B2: executor wrapper ordering + retry
 # --------------------------------------------------------------------------- #
 class _RecordingLocker:
+    device_ids: list[int]
+
     def __init__(self):
         self.events: list[str] = []
 
@@ -900,7 +915,7 @@ def test_install_phase_locks_wraps_executor(monkeypatch):
         "from_child",
         classmethod(lambda _cls, _cfg, _rank: locker),
     )
-    kwargs = {"vllm_config": object(), "executor_class": _FakeExecutor}
+    kwargs: dict[str, Any] = {"vllm_config": object(), "executor_class": _FakeExecutor}
 
     _install_phase_locks(kwargs, local_dp_rank=0)
 

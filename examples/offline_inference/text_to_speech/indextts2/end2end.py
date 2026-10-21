@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Offline inference example for IndexTTS 2.0 and 2.5 via vLLM-Omni.
 
 Two-stage pipeline: GPT AR (Stage 0) → semantic codec + S2Mel + BigVGAN
@@ -95,12 +95,7 @@ def _get_stage0_tokenizer_file(omni: Omni) -> str | None:
     stage_configs = omni.stage_configs
     if not stage_configs:
         return None
-    engine_args = getattr(stage_configs[0], "engine_args", None)
-    if engine_args is None:
-        return None
-    hf_overrides = getattr(engine_args, "hf_overrides", None)
-    if hf_overrides is None and isinstance(engine_args, dict):
-        hf_overrides = engine_args.get("hf_overrides")
+    hf_overrides = getattr(stage_configs[0].model_config, "hf_overrides", None)
     if hf_overrides is None:
         return None
     if hasattr(hf_overrides, "get"):

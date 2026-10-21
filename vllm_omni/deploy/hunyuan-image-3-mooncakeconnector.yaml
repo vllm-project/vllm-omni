@@ -25,7 +25,6 @@ stages:
       kv_connector: MooncakeConnector
       kv_role: kv_producer
       engine_id: hunyuan-image3-ar
-      kv_ip: 127.0.0.1
       kv_connector_extra_config:
         mooncake_protocol: tcp
         bootstrap_port: 8998

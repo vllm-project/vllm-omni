@@ -16,7 +16,8 @@ import pytest
 from vllm.sampling_params import SamplingParams
 
 from tests.e2e.online_serving import personaplex_realtime_duplex as e2e_driver
-from vllm_omni.config.stage_config import load_deploy_config, merge_pipeline_deploy
+from vllm_omni.config.omni_config import VllmOmniConfig
+from vllm_omni.config.stage_config import load_deploy_config
 from vllm_omni.engine.arg_utils import OmniEngineArgs
 from vllm_omni.engine.duplex.config import DuplexSessionConfig
 from vllm_omni.engine.duplex.contracts import DuplexFence
@@ -27,6 +28,7 @@ from vllm_omni.engine.duplex.plugin import (
     load_duplex_plugin,
     validate_duplex_plugin_sampling,
 )
+from vllm_omni.engine.stage_init_utils import project_engine_args
 from vllm_omni.model_executor.models.personaplex.configuration_personaplex import PersonaPlexConfig
 from vllm_omni.model_executor.models.personaplex.duplex import stage0
 from vllm_omni.model_executor.models.personaplex.duplex.config import DEFAULT_PERSONA, FRAME_SIZE, SAMPLE_RATE
@@ -91,30 +93,33 @@ def test_pipeline_declares_the_duplex_plugin_and_no_pre_framework_wiring() -> No
     [("skip_tokenizer_init", True), ("enable_prefix_caching", False)],
 )
 def test_personaplex_stage_engine_args(engine_arg: str, expected: bool) -> None:
-    stages = merge_pipeline_deploy(PERSONAPLEX_PIPELINE, load_deploy_config(DEPLOY_PATH))
+    stages = VllmOmniConfig.from_pipeline_config(
+        PERSONAPLEX_PIPELINE, deploy_config_path=str(DEPLOY_PATH)
+    ).stage_configs
 
-    assert [stage.yaml_engine_args.get(engine_arg) for stage in stages] == [expected, expected]
+    assert [project_engine_args(stage, "test-model").get(engine_arg) for stage in stages] == [expected, expected]
 
 
 def test_personaplex_deploy_is_duplex_and_propagates_capacity_to_all_model_stages() -> None:
     deploy = load_deploy_config(DEPLOY_PATH)
-    stages = merge_pipeline_deploy(PERSONAPLEX_PIPELINE, deploy)
+    stages = VllmOmniConfig.from_pipeline_config(PERSONAPLEX_PIPELINE, user_deploy_config=deploy).stage_configs
 
     assert deploy.session_mode == "duplex"
     assert deploy.duplex_session.max_sessions == 2
-    assert [stage.yaml_engine_args.get("duplex_max_sessions") for stage in stages] == [2, 2]
+    assert [stage.model_config.duplex_max_sessions for stage in stages] == [2, 2]
     # Lockstep frames of all sessions must share a step (see the deploy comment).
-    assert stages[0].yaml_engine_args.get("async_scheduling") is False
+    assert stages[0].scheduler_config.async_scheduling is False
     assert "personaplex_codec_max_sessions" not in deploy.connectors["connector_of_shared_memory"]["extra"]
 
 
 def test_the_duplex_mrv2_deploy_carries_valid_stage0_perf_switches() -> None:
     import inspect
 
-    stages = merge_pipeline_deploy(
-        PERSONAPLEX_PIPELINE, load_deploy_config(DEPLOY_PATH.with_name("personaplex_duplex_mrv2.yaml"))
-    )
-    overrides = stages[0].yaml_engine_args["hf_overrides"]
+    stages = VllmOmniConfig.from_pipeline_config(
+        PERSONAPLEX_PIPELINE,
+        deploy_config_path=str(DEPLOY_PATH.with_name("personaplex_duplex_mrv2.yaml")),
+    ).stage_configs
+    overrides = stages[0].model_config.hf_overrides
 
     # PersonaPlexConfig takes **kwargs, so a misspelled switch would be ignored silently.
     assert set(overrides) <= set(inspect.signature(PersonaPlexConfig.__init__).parameters)
@@ -126,7 +131,9 @@ def test_personaplex_deploy_enables_mimi_cuda_graphs_on_both_stage_configs(tmp_p
     # The checkpoint ships an empty config.json; each stage's engine args build
     # its PersonaPlexConfig from that plus the deploy YAML's hf_overrides.
     (tmp_path / "config.json").write_text("{}")
-    stages = merge_pipeline_deploy(PERSONAPLEX_PIPELINE, load_deploy_config(DEPLOY_PATH))
+    stages = VllmOmniConfig.from_pipeline_config(
+        PERSONAPLEX_PIPELINE, deploy_config_path=str(DEPLOY_PATH)
+    ).stage_configs
 
     def resolve(model_arch: str, hf_overrides: dict[str, object] | None) -> PersonaPlexConfig:
         engine_args = OmniEngineArgs(
@@ -140,14 +147,14 @@ def test_personaplex_deploy_enables_mimi_cuda_graphs_on_both_stage_configs(tmp_p
         assert isinstance(config, PersonaPlexConfig)
         return config
 
-    assert [stage.yaml_engine_args["model_arch"] for stage in stages] == [
+    assert [stage.model_config.model_arch for stage in stages] == [
         "PersonaPlexTalkerForConditionalGeneration",
         "PersonaPlexCode2Wav",
     ]
     for stage in stages:
-        model_arch = stage.yaml_engine_args["model_arch"]
-        assert stage.yaml_engine_args["hf_overrides"]["mimi_cuda_graphs"] is True
-        assert resolve(model_arch, dict(stage.yaml_engine_args["hf_overrides"])).mimi_cuda_graphs is True
+        model_arch = stage.model_config.model_arch
+        assert stage.model_config.hf_overrides["mimi_cuda_graphs"] is True
+        assert resolve(model_arch, dict(stage.model_config.hf_overrides)).mimi_cuda_graphs is True
         # Without the deploy override the flag keeps its default.
         assert resolve(model_arch, None).mimi_cuda_graphs is False
 

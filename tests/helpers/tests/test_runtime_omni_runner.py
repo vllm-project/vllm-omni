@@ -195,3 +195,21 @@ def test_runner_cleanup_kills_owned_worker_ignoring_terminate(
         assert owned[0].poll() is None
 
     assert owned[0].poll() is not None
+
+
+def test_runner_failed_startup_never_scans_global_processes(monkeypatch: pytest.MonkeyPatch) -> None:
+    import tests.helpers.runtime as runtime
+
+    def forbid_process_scan(*args, **kwargs):
+        pytest.fail("Runner cleanup must never scan processes outside its owned tree")
+
+    monkeypatch.setattr(runtime.psutil, "process_iter", forbid_process_scan)
+    monkeypatch.setattr(runtime, "cleanup_test_environment", lambda: None)
+
+    class _FailingOmni:
+        def __init__(self, *args, **kwargs):
+            raise RuntimeError("startup failed")
+
+    monkeypatch.setattr("vllm_omni.entrypoints.omni.Omni", _FailingOmni)
+    with pytest.raises(RuntimeError, match="startup failed"):
+        OmniRunner("fake-model")

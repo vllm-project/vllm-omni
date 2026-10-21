@@ -15,7 +15,6 @@ from pytest_mock import MockerFixture
 
 import vllm_omni.diffusion.worker.diffusion_model_runner as model_runner_module
 from tests.helpers.mark import hardware_test
-from vllm_omni.config.config_factory import StageConfigFactory
 from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
@@ -239,8 +238,8 @@ class _AutoDenoiseProfilerPipeline(DiffusionPipelineProfilerMixin):
 class _InterruptingStepPipeline(_StepPipeline):
     interrupt = True
 
-    def denoise_step(self, state, **kwargs):
-        del state, kwargs
+    def denoise_step(self, input_batch, **kwargs):
+        del input_batch, kwargs
         self.denoise_calls += 1
         return None
 
@@ -1194,6 +1193,8 @@ class TestRunner:
         kv_payload = object()
 
         class _CapturingStepPipeline(_StepPipeline):
+            device: torch.device
+
             def prepare_encode(self, state, **kwargs):
                 captured["past_key_values"] = getattr(state.sampling, "past_key_values", None)
                 return super().prepare_encode(state, **kwargs)
@@ -1618,15 +1619,6 @@ class TestIPC:
 @pytest.mark.cpu
 class TestSupportedPipelines:
     """Step-execution protocol checks for supported pipelines."""
-
-    def test_default_stage_config_includes_step_execution(self):
-        stage_cfg = StageConfigFactory.create_default_diffusion(
-            {
-                "step_execution": True,
-            }
-        )[0]
-
-        assert stage_cfg["engine_args"]["step_execution"] is True
 
     def test_qwen_image_supports_step_execution(self):
         from vllm_omni.diffusion.models.interface import SupportsStepExecution, supports_step_execution

@@ -24,20 +24,21 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 def test_mrv2_profile_retains_full_thinker_handoff(profile, capacities, kv_gib, runners, monkeypatch):
     from pathlib import Path
 
-    from vllm_omni.config.stage_config import _apply_platform_overrides, load_deploy_config, merge_pipeline_deploy
+    from vllm_omni.config.omni_config import VllmOmniConfig
+    from vllm_omni.config.stage_config import load_deploy_config
     from vllm_omni.model_executor.models.minicpmo_4_5.pipeline import MINICPMO_4_5_PIPELINE
     from vllm_omni.platforms import current_omni_platform
 
-    # merge_pipeline_deploy resolves the platform again; test the CUDA profile
+    # The typed config builder resolves the platform; test the CUDA profile
     # consistently even when this CPU test runs on a ROCm host.
     monkeypatch.setattr(current_omni_platform, "device_name", "cuda")
     deploy = Path(__file__).resolve().parents[4] / "vllm_omni/deploy" / profile
-    config = _apply_platform_overrides(load_deploy_config(deploy), platform="cuda")
-    stages = merge_pipeline_deploy(MINICPMO_4_5_PIPELINE, config)
-    assert [s.yaml_engine_args["use_v2_model_runner"] for s in stages] == runners
-    assert [s.yaml_engine_args["async_chunk"] for s in stages] == [False, True, True]
-    assert [s.yaml_engine_args["max_num_seqs"] for s in stages] == capacities
-    assert stages[1].yaml_engine_args["kv_cache_memory_bytes"] == kv_gib * 1024**3
+    config = load_deploy_config(deploy)
+    stages = VllmOmniConfig.from_pipeline_config(MINICPMO_4_5_PIPELINE, user_deploy_config=config).stage_configs
+    assert [s.model_config.use_v2_model_runner for s in stages] == runners
+    assert [s.connector_config.async_chunk for s in stages] == [False, True, True]
+    assert [s.scheduler_config.max_num_seqs for s in stages] == capacities
+    assert stages[1].cache_config.kv_cache_memory_bytes == kv_gib * 1024**3
 
 
 def _model(mocker, *, v2=True, session="turn", async_chunk=False):

@@ -16,10 +16,13 @@ from pytest_mock import MockerFixture
 from vllm.v1.engine.utils import EngineZmqAddresses
 
 from vllm_omni.config.omni_config import (
+    BaseVllmOmniStageConfig,
+    VllmOmniARStageConfig,
     VllmOmniDiffusionStageConfig,
     normalize_and_validate_diffusion_engine_ingress_kwargs,
 )
 from vllm_omni.config.resolver import OmniConfigResolution
+from vllm_omni.config.stage_config import StageExecutionType, StagePipelineConfig
 from vllm_omni.engine.arg_utils import FRONTEND_ONLY_ID_FILTER
 from vllm_omni.engine.stage_engine_startup import StageReplicaResources
 from vllm_omni.engine.stage_runtime import StageEngineLaunch
@@ -46,18 +49,6 @@ class _FakeProcess:
 @dataclass
 class _FakeProcessOwner:
     processes: list[_FakeProcess]
-
-
-@dataclass
-class _FakeStageEngineArgs:
-    async_chunk: bool
-    enable_sleep_mode: bool
-
-
-@dataclass
-class _FakeStageConfig:
-    stage_id: int
-    engine_args: _FakeStageEngineArgs
 
 
 def _resolved(*stages: SimpleNamespace) -> OmniConfigResolution:
@@ -404,10 +395,9 @@ def test_serve_validate_rejects_sleep_mode_with_multiple_api_servers(mocker: Moc
         cmd.validate(args)
 
 
-@pytest.mark.parametrize("typed", [False, True])
 @pytest.mark.parametrize("downstream_async_chunk", [False, True])
 def test_build_multi_api_stage_runtime_matches_current_constructor(
-    mocker: MockerFixture, typed: bool, downstream_async_chunk: bool
+    mocker: MockerFixture, downstream_async_chunk: bool
 ) -> None:
     from vllm_omni.entrypoints.cli import serve as serve_module
 
@@ -421,25 +411,10 @@ def test_build_multi_api_stage_runtime_matches_current_constructor(
         ),
         frozenset({"model"}),
     )
-    if typed:
-        from vllm_omni.config.omni_config import VllmOmniARStageConfig
-        from vllm_omni.config.stage_config import StagePipelineConfig
-
-        stages = [
-            VllmOmniARStageConfig(stage_pipeline_config=StagePipelineConfig(stage_id=i, model_stage="ar"))
-            for i in range(2)
-        ]
-        stages[1].connector_config.async_chunk = downstream_async_chunk
-    else:
-        stages = [
-            _FakeStageConfig(
-                stage_id=i,
-                engine_args=_FakeStageEngineArgs(
-                    async_chunk=bool(i and downstream_async_chunk), enable_sleep_mode=False
-                ),
-            )
-            for i in range(2)
-        ]
+    stages = [
+        VllmOmniARStageConfig(stage_pipeline_config=StagePipelineConfig(stage_id=i, model_stage="ar")) for i in range(2)
+    ]
+    stages[1].connector_config.async_chunk = downstream_async_chunk
     mocker.patch("vllm_omni.entrypoints.omni_base.omni_snapshot_download", return_value="dummy-model")
     mocker.patch(
         "vllm_omni.config.config_factory.with_trust_remote_code_override",
@@ -458,9 +433,8 @@ def test_build_multi_api_stage_runtime_matches_current_constructor(
     assert runtime._async_chunk is downstream_async_chunk
 
 
-@pytest.mark.parametrize("typed", [False, True])
 def test_build_multi_api_stage_runtime_rejects_sleep_enabled_in_stage_config(
-    mocker: MockerFixture, typed: bool
+    mocker: MockerFixture,
 ) -> None:
     from vllm_omni.entrypoints.cli import serve as serve_module
 
@@ -474,17 +448,8 @@ def test_build_multi_api_stage_runtime_rejects_sleep_enabled_in_stage_config(
         ),
         frozenset({"model"}),
     )
-    stage_config = _FakeStageConfig(
-        stage_id=3,
-        engine_args=_FakeStageEngineArgs(async_chunk=False, enable_sleep_mode=True),
-    )
-    if typed:
-        from vllm_omni.config.omni_config import VllmOmniARStageConfig
-        from vllm_omni.config.stage_config import StagePipelineConfig
-
-        typed_stage = VllmOmniARStageConfig(stage_pipeline_config=StagePipelineConfig(stage_id=3, model_stage="ar"))
-        typed_stage.model_config.enable_sleep_mode = True
-        stage_config = typed_stage
+    stage_config = VllmOmniARStageConfig(stage_pipeline_config=StagePipelineConfig(stage_id=3, model_stage="ar"))
+    stage_config.model_config.enable_sleep_mode = True
     mocker.patch("vllm_omni.entrypoints.omni_base.omni_snapshot_download", return_value="dummy-model")
     mocker.patch(
         "vllm_omni.config.config_factory.with_trust_remote_code_override",
@@ -915,20 +880,18 @@ def test_run_headless_raises_when_stage_id_not_in_configs(mocker: MockerFixture)
 # ---------------------------------------------------------------------------
 
 
-def _make_stage_cfg(stage_id: int, stage_type: str) -> SimpleNamespace:
-    """Build a stage config that satisfies every attribute run_headless reads.
-
-    Notably ``engine_args`` is a real dict (not a Mock) so
-    ``get_stage_devices_per_replica`` can call ``.get("tensor_parallel_size")``
-    and feed the result through ``int()`` without TypeError.
-    """
-    return SimpleNamespace(
-        stage_id=stage_id,
-        stage_type=stage_type,
-        # No "devices" key -> split_devices_for_replicas skipped, each replica
-        # inherits the launcher's CUDA_VISIBLE_DEVICES.
-        runtime=None,
-        engine_args={},
+def _make_stage_cfg(stage_id: int, stage_type: str) -> BaseVllmOmniStageConfig:
+    """Build a typed stage that inherits the launcher's visible devices."""
+    if stage_type == "diffusion":
+        return VllmOmniDiffusionStageConfig(
+            stage_pipeline_config=StagePipelineConfig(
+                stage_id=stage_id,
+                model_stage="diffusion",
+                execution_type=StageExecutionType.DIFFUSION,
+            ),
+        )
+    return VllmOmniARStageConfig(
+        stage_pipeline_config=StagePipelineConfig(stage_id=stage_id, model_stage="ar"),
     )
 
 
@@ -939,7 +902,7 @@ def test_run_headless_llm_registers_with_auto_assigned_replica_id(mocker: Mocker
     from vllm_omni.engine.stage_engine_startup import StageRegistrationResponse
 
     stage_cfg = _make_stage_cfg(0, stage_type="llm")
-    stage_cfg.engine_args["async_chunk"] = True
+    stage_cfg.connector_config.async_chunk = True
     parallel_config = SimpleNamespace(
         data_parallel_size_local=1,
         data_parallel_rank=0,
@@ -963,7 +926,7 @@ def test_run_headless_llm_registers_with_auto_assigned_replica_id(mocker: Mocker
         "vllm_omni.engine.stage_init_utils.get_stage_connector_spec",
         return_value={},
     )
-    mocker.patch("vllm_omni.engine.stage_init_utils.build_engine_args_dict", return_value={})
+    mocker.patch("vllm_omni.engine.stage_init_utils.project_engine_args", return_value={})
     mocker.patch(
         "vllm_omni.engine.stage_init_utils.build_vllm_config",
         return_value=(vllm_config, object),
@@ -1040,7 +1003,7 @@ def test_run_headless_llm_launches_one_manager_per_omni_dp_size_local(mocker: Mo
         return_value=(None, None, None),
     )
     mocker.patch("vllm_omni.engine.stage_init_utils.get_stage_connector_spec", return_value={})
-    mocker.patch("vllm_omni.engine.stage_init_utils.build_engine_args_dict", return_value={})
+    mocker.patch("vllm_omni.engine.stage_init_utils.project_engine_args", return_value={})
     mocker.patch(
         "vllm_omni.engine.stage_init_utils.build_vllm_config",
         return_value=(vllm_config, object),
@@ -1099,11 +1062,11 @@ def test_run_headless_diffusion_registers_and_spawns_proc(mocker: MockerFixture)
         return_value=(None, None, None),
     )
     mocker.patch(
-        "vllm_omni.engine.stage_init_utils.extract_legacy_stage_metadata",
+        "vllm_omni.engine.stage_init_utils.extract_stage_metadata",
         return_value=SimpleNamespace(stage_id=1, stage_type="diffusion"),
     )
     mock_inject = mocker.patch("vllm_omni.engine.stage_init_utils.inject_kv_stage_info")
-    mocker.patch("vllm_omni.engine.stage_init_utils.build_diffusion_config", return_value=od_config)
+    mocker.patch("vllm_omni.engine.stage_init_utils.build_diffusion_stage_config", return_value=od_config)
     mock_register = mocker.patch(
         "vllm_omni.engine.stage_engine_startup.register_stage_with_omni_master",
         return_value=StageRegistrationResponse(
@@ -1177,7 +1140,7 @@ def test_run_headless_generic_diffusion_launches_structured_stage(mocker: Mocker
     captured: dict[str, Any] = {}
     od_config = SimpleNamespace()
 
-    def _build_diffusion_config(model, stage_config, metadata):
+    def _build_diffusion_stage_config(model, stage_config, metadata):
         captured.update(model=model, stage_config=stage_config, metadata=metadata)
         return od_config
 
@@ -1189,7 +1152,9 @@ def test_run_headless_generic_diffusion_launches_structured_stage(mocker: Mocker
         captured.update(replica_kwargs=kwargs)
         return SimpleNamespace(exitcode=None)
 
-    mocker.patch.object(startup_module.stage_init_utils, "build_diffusion_config", side_effect=_build_diffusion_config)
+    mocker.patch.object(
+        startup_module.stage_init_utils, "build_diffusion_stage_config", side_effect=_build_diffusion_stage_config
+    )
     mocker.patch.object(startup_module, "launch_headless_replica_group", side_effect=_launch_replica_group)
     mocker.patch.object(startup_module, "launch_headless_diffusion_replica", side_effect=_launch_replica)
 
@@ -1250,11 +1215,11 @@ def test_run_headless_diffusion_raises_on_nonzero_proc_exit(mocker: MockerFixtur
         return_value=(None, None, None),
     )
     mocker.patch(
-        "vllm_omni.engine.stage_init_utils.extract_legacy_stage_metadata",
+        "vllm_omni.engine.stage_init_utils.extract_stage_metadata",
         return_value=SimpleNamespace(stage_id=1, stage_type="diffusion"),
     )
     mocker.patch("vllm_omni.engine.stage_init_utils.inject_kv_stage_info")
-    mocker.patch("vllm_omni.engine.stage_init_utils.build_diffusion_config", return_value=mocker.Mock())
+    mocker.patch("vllm_omni.engine.stage_init_utils.build_diffusion_stage_config", return_value=mocker.Mock())
     mocker.patch(
         "vllm_omni.engine.stage_engine_startup.register_stage_with_omni_master",
         return_value=StageRegistrationResponse(
