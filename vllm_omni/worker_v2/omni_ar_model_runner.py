@@ -289,6 +289,7 @@ class OmniARModelRunner(OmniGPUModelRunner):
 
         # --- Async D2H via OmniAsyncOutput ---
         materialize_native = self._uses_native_output_materializer()
+        get_request_errors = getattr(self.model_state, "get_request_errors", None)
         async_output = OmniAsyncOutput(
             model_runner_output=model_runner_output,
             sampler_output=sampler_output,
@@ -304,6 +305,7 @@ class OmniARModelRunner(OmniGPUModelRunner):
             check_ep_fault=self.check_ep_fault,
             pending_aux_output=pending_aux_output,
             streaming_audio=streaming_audio,
+            request_errors=get_request_errors() if get_request_errors is not None else None,
             extra_multimodal_outputs=extra_outputs,
         )
         self._release_multimodal_snapshot(snapshot_slot, async_output.copy_event)
@@ -736,6 +738,7 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
         pending_aux_output: Any | None = None,
         streaming_audio: StreamingAudioOutput | None = None,
         extra_multimodal_outputs: tuple[dict[str, Any], torch.cuda.Event] | None = None,
+        request_errors: tuple[torch.Tensor, str] | None = None,
     ):
         self.model_runner_output = model_runner_output
         self.sampler_output = sampler_output
@@ -831,6 +834,15 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
             if check_ep_fault:
                 has_fault = get_ep_all2all_manager().query_fault()
                 self._has_fault = has_fault.to("cpu", non_blocking=True)
+
+            self._request_errors = (
+                (
+                    _async_copy_tensor(request_errors[0], copy_stream=copy_stream, pin_memory=pin_memory),
+                    request_errors[1],
+                )
+                if request_errors is not None
+                else None
+            )
 
             # Pooler output (hidden + multimodal) — async D2H
             self._hidden_cpu: torch.Tensor | None = None
@@ -985,6 +997,23 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
             self.model_runner_output.multimodal_outputs = (
                 [_ensure_tensor_values(p) if p else {} for p in pooler_payload] if pooler_payload else None
             )
+
+        if self._request_errors is not None:
+            flags, reason = self._request_errors
+            output = self.model_runner_output
+            output.request_errors = {}
+            for index, (req_id, failed) in enumerate(zip(output.req_ids, flags.tolist(), strict=True)):
+                if not failed:
+                    continue
+                output.request_errors[req_id] = reason
+                # Never publish failed audio or an ordinary EOS to the native
+                # data plane; the scheduler supplies the ERROR termination.
+                output.sampled_token_ids[index] = []
+                for payloads in (output.pooler_output, output.inter_stage_outputs):
+                    if payloads is not None:
+                        payloads[index] = None
+                if output.multimodal_outputs is not None:
+                    output.multimodal_outputs[index] = {}
 
         if self._finalize_output is not None:
             return self._finalize_output(self.model_runner_output)

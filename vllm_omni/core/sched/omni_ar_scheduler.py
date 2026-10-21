@@ -359,6 +359,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             if isinstance(connector_config, dict)
             else getattr(connector_config, "extra", None)
         ) or {}
+        # A single-stage pipeline has no connector edge; it sets the same keys in additional_config.
+        additional = getattr(self.vllm_config, "additional_config", None)
+        extra = {**(additional if isinstance(additional, dict) else {}), **extra}
         self._prefill_admission_min_batch = int(extra.get("ar_prefill_admission_min_batch", 0) or 0)
         self._prefill_admission_max_wait_s = float(extra.get("ar_prefill_admission_max_wait_ms", 0) or 0) / 1000
         self._prefill_admission_min_running = int(extra.get("ar_prefill_admission_min_running", 0) or 0)
@@ -988,6 +991,12 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 continue
 
             status_before_stop = request.status
+            model_error = (getattr(model_runner_output, "request_errors", None) or {}).get(req_id)
+            if model_error is not None:
+                request.status = RequestStatus.FINISHED_ERROR
+                request.stop_reason = model_error
+                request.resumable = False
+                generated_token_ids = []
             pre_updated = None
             if (
                 fast_decode
@@ -1126,13 +1135,15 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             if request.has_encoder_inputs:
                 self._free_encoder_inputs(request)
 
-            stopped = logprob_validation_failed
+            stopped = logprob_validation_failed or model_error is not None
             is_segment_finished = False
             finished = False
             new_token_ids = generated_token_ids
             pooler_output = pooler_outputs[req_index] if pooler_outputs else None
             mm_output = mm_outputs[req_index] if mm_outputs else None
             inter_stage_output = inter_stage_outputs[req_index] if inter_stage_outputs else None
+            if model_error is not None:
+                pooler_output = mm_output = inter_stage_output = None
             kv_transfer_params = None
             ec_transfer_params = None
             finish_reason = None

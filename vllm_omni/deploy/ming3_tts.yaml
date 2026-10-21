@@ -11,6 +11,9 @@ connectors:
     extra:
       latent_chunk_size: 25
       initial_latent_chunk_size: 4
+      # Double chunks from 4 up to 25 latents so playback does not stall
+      # between the small first chunk and the first full chunk.
+      latent_chunk_ramp: true
       latent_left_context: 0
 
 stages:

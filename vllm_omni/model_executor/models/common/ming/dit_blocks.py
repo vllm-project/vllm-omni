@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -43,7 +44,30 @@ class FeedForward(nn.Module):
         self.ff = nn.Sequential(project_in, nn.Dropout(dropout), nn.Linear(inner_dim, dim_out))
 
     def forward(self, x):
-        return self.ff(x)
+        project_in, activation = self.ff[0]
+        # On CUDA, bias and tanh-GELU run in the GEMM epilogue (cuBLASLt)
+        # instead of a separate pass over the [tokens, 4 * dim] activations.
+        # The CPU kernel applies the exact GELU, so CPU keeps the modules.
+        if self.training or not x.is_cuda or activation.approximate != "tanh" or project_in.bias is None:
+            return self.ff(x)
+        hidden = torch._addmm_activation(
+            project_in.bias, x.reshape(-1, x.shape[-1]), project_in.weight.t(), use_gelu=True
+        )
+        return self.ff[2](hidden.view(*x.shape[:-1], -1))
+
+
+# Flow-head sequences are a few tokens (condition, history, patch). For those,
+# a fused broadcast-and-reduce replaces one FlashAttention launch per layer and
+# ODE step.
+_SHORT_ATTENTION_MAX_TOKENS = 8
+
+
+def _short_attention(query, key, value):
+    """Attention for tiny sequences with fp32 accumulation, like the fused kernels."""
+    scale = query.shape[-1] ** -0.5
+    scores = (query.float().unsqueeze(3) * key.float().unsqueeze(2)).sum(-1) * scale
+    probs = scores.softmax(dim=-1)
+    return (probs.unsqueeze(-1) * value.float().unsqueeze(2)).sum(3).to(query.dtype)
 
 
 class Attention(nn.Module):
@@ -148,7 +172,10 @@ class Attention(nn.Module):
         else:
             attn_mask = None
 
-        x = F.scaled_dot_product_attention(query, key, value, attn_mask=attn_mask, dropout_p=0.0, is_causal=False)
+        if attn_mask is None and max(query.shape[-2], key.shape[-2]) <= _SHORT_ATTENTION_MAX_TOKENS:
+            x = _short_attention(query, key, value)
+        else:
+            x = F.scaled_dot_product_attention(query, key, value, attn_mask=attn_mask, dropout_p=0.0, is_causal=False)
         if self.attn_mask_enabled and mask is not None:
             final_output[valid_sample_indices] = x
             x = final_output

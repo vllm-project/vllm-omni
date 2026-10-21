@@ -6,7 +6,7 @@
 
 - Vendor: inclusionAI
 - Model: [`inclusionAI/Ming-3.0-tts-tiny`](https://huggingface.co/inclusionAI/Ming-3.0-tts-tiny)
-- Runtime: vLLM-Omni two-stage online serving
+- Runtime: vLLM-Omni two-stage serving or opt-in fused Model Runner V2
 - API: OpenAI-compatible `/v1/audio/speech`
 
 ## Architecture
@@ -24,7 +24,6 @@ with AudioVAE. The pipeline uses [ming3_tts.yaml](../../vllm_omni/deploy/ming3_t
 - CUDA: 13.0
 - PyTorch: 2.13.0+cu130; Transformers: 5.19.0
 - vLLM version: 0.32.0
-- vLLM-Omni commit: `9eb1adcc0`
 - GPU: 1x H100 / H200
 
 ### Reference audio
@@ -63,6 +62,42 @@ CUDA_VISIBLE_DEVICES=0 .venv/bin/vllm serve "$MODEL" \
 
 Use `--revision <HF-commit>` to pin a checkpoint. The HF model weights download
 automatically on first launch.
+
+### Throughput profiles
+
+For the opt-in fused throughput profile:
+
+```bash
+vllm serve inclusionAI/Ming-3.0-tts-tiny \
+  --omni \
+  --deploy-config vllm_omni/deploy/ming3_tts_fused.yaml \
+  --api-server-count 4 \
+  --allowed-local-media-path "$REF_DIR" \
+  --port 8000
+```
+
+| Deployment file | Execution | Admission wait under load |
+| --- | --- | --- |
+| `ming3_tts.yaml` | Default two-stage pipeline | Disabled |
+| `ming3_tts_high_concurrency.yaml` | Two stages, batched AudioVAE, 64 requests | Up to 300 ms |
+| `ming3_tts_mrv2.yaml` | Two stages, Model Runner V2 for Stage 0 | Up to 300 ms |
+| `ming3_tts_fused.yaml` | One stage, Model Runner V2 and per-step AudioVAE | Up to 150 ms |
+
+The throughput profiles admit arrivals together when at least 32 requests are
+running: admission resumes when eight requests wait or the oldest reaches the
+wait bound. This wait contributes to first-audio latency. Choose the default
+profile or tune these settings for latency-sensitive traffic.
+
+The fused decoder flushes its held final audio frame before completing a
+request. Its graph buckets cover up to 64 rows; larger row counts use eager
+decode. Seeded requests preserve an independent generator per request, so
+their CPU sampling cost differs from unseeded throughput workloads.
+
+Streaming chunk sizes are set in connector `extra` for two-stage deployments
+and Stage 0 `additional_config` for fused deployments. `latent_chunk_size`
+must be positive; `initial_latent_chunk_size` must be between zero and that
+size. Zero skips the initial ramp and uses the regular chunk size. The fused
+profile still releases its first available audio immediately.
 
 ## Voice cloning
 
@@ -152,7 +187,7 @@ curl --fail-with-body --silent --show-error http://127.0.0.1:8000/v1/audio/speec
 - CFM CUDA Graphs follow Stage 0's configuration: `enforce_eager: true` or `compilation_config.cudagraph_mode: NONE` disables their compilation and capture.
 - Context limit: 4096 tokens. Both stages allow 16 scheduled sequences;
   For chunked prefill, speaker and reference-audio conditioning is cached per request and sliced using the scheduled token offset, including single-token prefill slices.
-  AudioVAE currently decodes requests individually within a scheduled batch.
+  AudioVAE batches compatible request chunks within a scheduled batch. The fused MRV2 profile decodes active streams together in Stage 0; other profiles use the separate AudioVAE stage.
 - Reference clips must be 1–30 seconds. Upload clips through `/v1/audio/voices` and reuse their names in `voice`; built-in IP names use `instructions`.
 - Flow temperature defaults to 1.5; the examples explicitly use 0.0.
   `ming3_cfg=1` corresponds to native CFG scale 2. The legacy `lingv3_cfg` alias and checkpoint `lingv3_tts` metadata remain supported.

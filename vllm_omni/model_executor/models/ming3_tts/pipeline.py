@@ -53,4 +53,34 @@ MING3_TTS_PIPELINE = PipelineConfig(
     ),
 )
 
-__all__ = ["MING3_TTS_PIPELINE"]
+# Single-stage variant: Stage 0 decodes its latents with the AudioVAE decoder
+# and returns PCM as the final output (model option ``ming3_single_stage``).
+MING3_TTS_FUSED_PIPELINE = PipelineConfig(
+    model_type="ming3_tts_fused",
+    default_deploy_config_name="ming3_tts_fused.yaml",
+    single_stage_async_chunk=True,
+    model_arch="Ming3TTSForConditionalGeneration",
+    stages=(
+        StagePipelineConfig(
+            stage_id=0,
+            model_stage="llm",
+            execution_type=StageExecutionType.LLM_AR,
+            input_sources=(),
+            owns_tokenizer=True,
+            hf_config_name="llm_config",
+            final_output=True,
+            final_output_type="audio",
+            # The API output processor tags ``model_outputs`` by this modality.
+            engine_output_type="audio",
+            sampling_constraints={
+                "temperature": 0.0,
+                "top_p": 1.0,
+                "top_k": -1,
+                "max_tokens": 801,
+                "detokenize": True,
+            },
+        ),
+    ),
+)
+
+__all__ = ["MING3_TTS_FUSED_PIPELINE", "MING3_TTS_PIPELINE"]

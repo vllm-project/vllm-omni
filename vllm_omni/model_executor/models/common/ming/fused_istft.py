@@ -172,6 +172,26 @@ def fused_istft(
         block_size=256,
         enable_fp_fusion=False,
     )
-    if not (envelope > 1e-11).all():
-        raise RuntimeError("ISTFT window envelope underflowed; invalid overlap-add state.")
+    # The envelope depends only on the window values, hop, frame count and
+    # buffer layout, so validate each layout once per window version instead of
+    # synchronizing on every call.
+    validated = _validated_envelope_layouts(window)
+    layout = (hop, num_frames, has_buffer, streaming, last_chunk)
+    if layout not in validated:
+        if not (envelope > 1e-11).all():
+            raise RuntimeError("ISTFT window envelope underflowed; invalid overlap-add state.")
+        if len(validated) < 4096:
+            validated.add(layout)
     return output, next_audio, next_window
+
+
+def _validated_envelope_layouts(window: torch.Tensor) -> set[tuple]:
+    try:
+        version = window._version
+    except RuntimeError:  # inference tensors have no version counter
+        version = None
+    cached = getattr(window, "_istft_validated_layouts", None)
+    if cached is None or cached[0] != version:
+        cached = (version, set())
+        window._istft_validated_layouts = cached
+    return cached[1]

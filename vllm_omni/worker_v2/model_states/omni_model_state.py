@@ -249,6 +249,14 @@ class OmniModelState(DefaultModelState):
     ) -> StreamingAudioOutput | None:
         return self._eager_state.prepare_audio_output(input_batch, req_states, outputs)
 
+    def get_request_errors(self) -> tuple[torch.Tensor, str] | None:
+        """Optional owned per-row failure mask and reason for the current step.
+
+        The runner copies the mask with its other outputs and only reads it
+        after D2H completes. A failure terminates that request, not the batch.
+        """
+        return None
+
     def on_requests_finished(self, req_ids: set[str]) -> None:
         self._eager_state.finish_audio(req_ids)
 

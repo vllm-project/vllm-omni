@@ -574,9 +574,15 @@ class MingLLMModel(nn.Module):
         generators: list[torch.Generator | None],
         device: torch.device,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        shape = (1, self.ming_config.patch_size, self.ming_config.latent_dim)
+        if all(generator is None for generator in generators):
+            # Unseeded rows share the global RNG, so one draw serves them all.
+            count = len(generators)
+            initial = torch.randn((count, *shape[1:]), device=device, dtype=torch.float32)
+            solver = torch.randn((DEFAULT_CFM_STEPS, count, *shape[1:]), device=device, dtype=torch.float32)
+            return initial, solver
         initial_noise = []
         solver_noise = []
-        shape = (1, self.ming_config.patch_size, self.ming_config.latent_dim)
         for generator in generators:
             initial_noise.append(
                 torch.randn(
@@ -627,6 +633,13 @@ class MingLLMModel(nn.Module):
             dit_model = self.flowloss.cfm.model
             if not getattr(dit_model, "_ming_compiled", False):
                 try:
+                    # Static shapes compile once per graph bucket (plus once
+                    # for the lazily fused QKV weights); past dynamo's
+                    # recompile limit the remaining buckets would run eager.
+                    dynamo_config = torch._dynamo.config
+                    dynamo_config.recompile_limit = max(
+                        dynamo_config.recompile_limit, 2 * len(self._cfm_graph_batch_sizes)
+                    )
                     dit_model.forward = torch.compile(
                         dit_model.forward,
                         fullgraph=False,
@@ -674,6 +687,7 @@ class MingLLMModel(nn.Module):
         generator: torch.Generator | None = None,
         initial_noise: torch.Tensor | None = None,
         solver_noise: torch.Tensor | None = None,
+        check_finite: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         if hidden_states.dim() != 2:
             raise RuntimeError(f"Expected decode hidden_states rank-2 [B,H], got {tuple(hidden_states.shape)}")
@@ -687,7 +701,7 @@ class MingLLMModel(nn.Module):
             )
         # [Batch, Hidden] -> [Batch, Time, Hidden] = [B, 1, H] for FlowLoss conditioning.
         z_diff_cond = hidden_states.to(dtype=self.fm_dtype).unsqueeze(1)
-        if not torch.isfinite(z_diff_cond).all():
+        if check_finite and not torch.isfinite(z_diff_cond).all():
             raise RuntimeError("Non-finite z_diff_cond before FlowLoss.sample().")
 
         # Fast path: CUDAGraph-captured flow head (CFM sampling + Aggregator +
@@ -745,11 +759,11 @@ class MingLLMModel(nn.Module):
                 f"FlowLoss output shape mismatch: got {tuple(sampled_token_latent.shape)}, expected {expected_shape}"
             )
         new_history = torch.cat([latent_history[:, self.ming_config.patch_size :, :], sampled_token_latent], dim=1)
-        if not torch.isfinite(sampled_token_latent).all():
+        if check_finite and not torch.isfinite(sampled_token_latent).all():
             raise RuntimeError("Non-finite sampled_token_latent in Ming decode step.")
-        if not torch.isfinite(next_embeds).all():
+        if check_finite and not torch.isfinite(next_embeds).all():
             raise RuntimeError("Non-finite next_embeds in Ming decode step.")
-        if not torch.isfinite(stop_probs).all():
+        if check_finite and not torch.isfinite(stop_probs).all():
             raise RuntimeError("Non-finite stop_probs in Ming decode step.")
         return sampled_token_latent, next_embeds, new_history, stop_probs
 

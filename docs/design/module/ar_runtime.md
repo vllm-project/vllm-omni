@@ -70,6 +70,17 @@ construction snapshots those inputs. Both paths reuse the request IDs already
 copied by upstream bookkeeping; connector collection stays on the main thread
 because it can run a tensor-parallel collective.
 
+## Request-local model errors
+
+MRV2 model states can return an owned, step-local failure mask from
+`get_request_errors()`. `OmniAsyncOutput` copies it alongside the other output
+tensors and resolves request IDs after the copy completes. Before handing
+outputs to the native data plane, it removes failed rows' tokens and audio
+payloads. The scheduler then marks only those requests `FINISHED_ERROR`, frees
+their state through the normal completion path, and propagates `FinishReason.ERROR`
+to the API. Healthy rows continue. Numerical failure must not be represented as
+an ordinary EOS or a successful, truncated audio response.
+
 ## Safe-change guide
 
 Test request lifecycle, abort, cache state, and every affected worker execution

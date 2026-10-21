@@ -1,0 +1,39 @@
+# Opt-in single-stage Ming3-TTS for 64 streams on one H200: Stage 0 decodes
+# its latents with the AudioVAE decoder and returns PCM itself (no AudioVAE
+# stage, no connector). Each step decodes every stream's newest latent in one
+# pass; a request that halts runs one more step, in which its last latent is
+# flushed, and stops there.
+pipeline: ming3_tts_fused
+model_runner: v2
+async_chunk: true
+trust_remote_code: false
+dtype: bfloat16
+enable_prefix_caching: false
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 64
+    gpu_memory_utilization: 0.85
+    enforce_eager: false
+    enable_prefix_caching: false
+    async_scheduling: true
+    max_num_batched_tokens: 4096
+    max_model_len: 8192
+    devices: "0"
+    # Model and scheduler options that the two-stage profile sets on its
+    # connector: a single stage has no connector edge.
+    additional_config:
+      ming3_single_stage: true
+      ar_prefill_admission_min_batch: 8
+      ar_prefill_admission_max_wait_ms: 150
+      ar_prefill_admission_min_running: 32
+    compilation_config:
+      cudagraph_mode: FULL_AND_PIECEWISE
+      cudagraph_capture_sizes: [1, 2, 4, 8, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096]
+      cudagraph_num_of_warmups: 1
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 801
+      detokenize: true

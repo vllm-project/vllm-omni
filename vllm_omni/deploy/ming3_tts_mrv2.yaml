@@ -1,0 +1,12 @@
+# Opt-in Model Runner V2 profile for 64 Ming3-TTS streams on one H200.
+# Stage 0 keeps each request's flow-head feedback in device slots and decides
+# continue/stop on the device, so a step needs no host synchronization and
+# the CPU staging of step N+1 overlaps step N on the GPU.
+base_config: ming3_tts_high_concurrency.yaml
+
+stages:
+  - stage_id: 0
+    model_runner: v2
+    async_scheduling: true
+  - stage_id: 1
+    model_runner: v1

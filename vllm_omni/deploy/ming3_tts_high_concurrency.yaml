@@ -1,0 +1,28 @@
+# Opt-in single-H200 profile for 64 concurrent Ming3-TTS streams.
+# Inherit the model, connector, and sampling settings from ming3_tts.yaml.
+base_config: ming3_tts.yaml
+
+connectors:
+  connector_of_shared_memory:
+    extra:
+      # Under load (>= 32 running) arrivals are admitted together once 8 wait
+      # or the oldest has waited 300 ms. A step with any prefill leaves the
+      # FULL decode graph and runs the KDA prefill path eagerly, a fixed host
+      # cost that otherwise lands on almost every step at 64 streams.
+      ar_prefill_admission_min_batch: 8
+      ar_prefill_admission_max_wait_ms: 300
+      ar_prefill_admission_min_running: 32
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 64
+    max_num_batched_tokens: 4096
+    compilation_config:
+      # Decode steps replay one FULL graph; prefill and mixed steps up to
+      # max_num_batched_tokens stay inside the piecewise sizes.
+      cudagraph_mode: FULL_AND_PIECEWISE
+      cudagraph_capture_sizes: [1, 2, 4, 8, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096]
+      cudagraph_num_of_warmups: 1
+  - stage_id: 1
+    # The batched AudioVAE decoder serves all streams in one pass per step.
+    max_num_seqs: 64

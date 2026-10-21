@@ -50,3 +50,25 @@ def test_a_batch_size_needs_a_wait_bound():
     scheduler = SimpleNamespace(vllm_config=config)
     with pytest.raises(ValueError, match="max_wait_ms"):
         OmniARScheduler._init_prefill_admission_policy(scheduler)
+
+
+@pytest.mark.parametrize("connector_batch", [None, 3])
+def test_single_stage_admission_settings_and_connector_precedence(connector_batch):
+    scheduler = _scheduler(waiting=3, running=32)
+    scheduler.vllm_config = SimpleNamespace(
+        additional_config={
+            "ar_prefill_admission_min_batch": 8,
+            "ar_prefill_admission_max_wait_ms": 150,
+            "ar_prefill_admission_min_running": 32,
+        },
+        model_config=SimpleNamespace(
+            stage_connector_config=(
+                None if connector_batch is None else {"extra": {"ar_prefill_admission_min_batch": connector_batch}}
+            )
+        ),
+    )
+    OmniARScheduler._init_prefill_admission_policy(scheduler)
+    assert defer(scheduler) is (connector_batch is None)
+    # The wait bound applies even if the single-stage batch has not filled.
+    scheduler.waiting[0].arrival_time = time.time() - 1.0
+    assert not defer(scheduler)
