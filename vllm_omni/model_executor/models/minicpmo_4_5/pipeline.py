@@ -10,6 +10,7 @@ The thinker -> talker bridge uses ``llm2tts``. The talker -> Code2Wav bridge
 streams request-routed codec chunks.
 """
 
+from vllm_omni.config.live_session import LiveSessionConfig
 from vllm_omni.config.stage_config import (
     PipelineConfig,
     StageExecutionType,
@@ -43,6 +44,14 @@ MINICPMO_4_5_PIPELINE = PipelineConfig(
     default_deploy_config_name="minicpmo_4_5.yaml",
     model_arch="MiniCPMO45OmniForConditionalGeneration",
     duplex_plugin="vllm_omni.model_executor.models.minicpmo_4_5.duplex.plugin.MiniCPMO45DuplexPlugin",
+    live_session_config=LiveSessionConfig(
+        live_session_processor=(
+            "vllm_omni.model_executor.models.minicpmo_4_5.live.processor:MiniCPMO45LiveSessionProcessor"
+        ),
+        logits_processor={
+            0: "vllm_omni.model_executor.models.minicpmo_4_5.live.logits_processor:MiniCPMOLiveLogitsProcessor"
+        },
+    ),
     # MiniCPM-o 4.5's HF config.json reports `model_type="minicpmo"` and
     # `architectures=["MiniCPMO"]` — both shared verbatim with older MiniCPM-o
     # 1.0 / 2.6 checkpoints. The only field distinguishing the generations is

@@ -1,0 +1,11 @@
+# PersonaPlex on OpenAI Live (/v1/live/sessions). One resumable request per
+# session gets one streaming update per 80 ms frame. `session_mode: turn`
+# keeps the /v1/realtime full-duplex stack off.
+base_config: personaplex.yaml
+session_mode: turn
+
+live_session_config:
+  session_lifetime_s: 1800
+  # Sizes the Stage 0 streaming Mimi encoder rows and the Code2Wav decoders
+  # (one Mimi instance each); each session also holds one Stage 0 KV window.
+  max_sessions: 2

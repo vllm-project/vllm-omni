@@ -306,6 +306,12 @@ def tts2code2wav_async_chunk(
         segment_text_utf8 = None
     turn_end = bool(_coerce_int(output_meta.get("turn_end")))
     duplex_turn_key = (duplex_epoch, duplex_turn_id)
+    # /v1/live/sessions: the request spans the whole session. Each unit's
+    # segment end flushes its audio; only a turn end closes the stream, and
+    # the next turn starts a fresh codec stream (official MiniCPMODuplex
+    # resets Token2Wav per turn).
+    live = bool(_coerce_int(output_meta.get("minicpmo_live")))
+    live_turn_end = live and bool(_coerce_int(output_meta.get("live_turn_end")))
 
     request_payload = getattr(transfer_manager, "request_payload", None)
     if request_payload is None:
@@ -410,12 +416,18 @@ def tts2code2wav_async_chunk(
     # (initial_codec_chunk_frames) used to shorten the first payload, but with
     # the steady window itself at 25 frames it only added a seam.
     flush_pending = finished
-    last_chunk = bool(flush_pending and (not native_duplex or turn_end))
+    if live:
+        last_chunk = bool(flush_pending and live_turn_end)
+    else:
+        last_chunk = bool(flush_pending and (not native_duplex or turn_end))
     if not flush_pending and len(pending) < chunk_frames:
         return None
 
     hold_short_unit = (
-        native_duplex and flush_pending and not last_chunk and 0 < len(pending) < _MINICPMO45_MIN_STREAM_BODY_FRAMES
+        (native_duplex or live)
+        and flush_pending
+        and not last_chunk
+        and 0 < len(pending) < _MINICPMO45_MIN_STREAM_BODY_FRAMES
     )
     new_token_count = 0 if hold_short_unit else (len(pending) if flush_pending else chunk_frames)
     new_codes = pending[:new_token_count]
@@ -450,7 +462,7 @@ def tts2code2wav_async_chunk(
         # zero length tells Code2Wav to discard the placeholder.
         output_codes = [0]
 
-    if last_chunk and not native_duplex:
+    if last_chunk and not native_duplex and not live:
         record["retired_internal_ids"].add(internal_id)
         _drop_codec_state(transfer_manager, request_id)
 
@@ -489,7 +501,7 @@ def tts2code2wav_async_chunk(
             duplex_turn_id=duplex_turn_id,
             llm_output_text_utf8=segment_text_utf8,
             tts_is_last_chunk=flush_pending,
-            turn_end=turn_end and last_chunk,
+            turn_end=(live_turn_end if live else turn_end) and last_chunk,
             replace_runtime_additional_information=True,
             ref_audio_sr=ref_audio_sr,
         ),
@@ -497,6 +509,10 @@ def tts2code2wav_async_chunk(
     )
     if last_chunk and native_duplex:
         record["last_terminal_turn"] = duplex_turn_key
+        record["cache_epoch"] = int(record["cache_epoch"]) + 1
+        record["chunk_seq"] = 0
+        _drop_codec_state(transfer_manager, request_id)
+    elif last_chunk and live:
         record["cache_epoch"] = int(record["cache_epoch"]) + 1
         record["chunk_seq"] = 0
         _drop_codec_state(transfer_manager, request_id)
@@ -901,6 +917,130 @@ def _build_tts_scheduler_prompt_token_ids(
     raise ValueError("MiniCPM-o TTS stage requires at least one scheduler prompt token")
 
 
+# Official MiniCPMODuplex.streaming_generate: max_token_per_chunk = 25 + 1.
+MINICPMO45_LIVE_CODEC_TOKENS_PER_UNIT = 26
+
+
+def _minicpmo45_live_marker(prompt_item) -> Mapping | None:
+    """The /v1/live/sessions marker the Live processor puts on a request's
+    first prompt (top-level ``"minicpmo_live"``, never sent to an engine)."""
+    marker = prompt_item.get("minicpmo_live") if isinstance(prompt_item, Mapping) else None
+    return marker if isinstance(marker, Mapping) else None
+
+
+def _minicpmo45_live_unit_rows(
+    mm_output: Mapping, latent: torch.Tensor, unit_ids: list[int], request_id: str
+) -> torch.Tensor:
+    """The latent rows the Thinker produced by feeding ``unit_ids``.
+
+    Stage 0 tags every latent row with the token id and position that produced
+    it (``latent_input_ids`` / ``latent_positions``), and the official Talker
+    conditions on the hidden state after each token is fed. Rows that are not
+    the unit's (the next update's prefill, an asynchronous lookahead step) can
+    follow it, so the unit is the latest position-contiguous block of rows
+    whose inputs are exactly ``unit_ids``.
+    """
+    row_ids = mm_output.get("latent_input_ids")
+    row_positions = mm_output.get("latent_positions")
+    if not isinstance(row_ids, torch.Tensor) or not isinstance(row_positions, torch.Tensor):
+        raise ValueError(f"MiniCPM-o Live: missing latent row ledger for request_id={request_id}")
+    ids = [int(token) for token in row_ids.reshape(-1).tolist()]
+    positions = [int(position) for position in row_positions.reshape(-1).tolist()]
+    if len(ids) != int(latent.shape[0]) or len(positions) != len(ids):
+        raise ValueError(
+            f"MiniCPM-o Live: latent row ledger mismatch ids={len(ids)} positions={len(positions)} "
+            f"rows={int(latent.shape[0])} for request_id={request_id}"
+        )
+    width = len(unit_ids)
+    for base in range(len(ids) - width, -1, -1):
+        if ids[base : base + width] == unit_ids and all(
+            positions[base + k] == positions[base] + k for k in range(width)
+        ):
+            return latent[base : base + width]
+    raise ValueError(
+        f"MiniCPM-o Live: no latent rows for unit {unit_ids} (ledger tail={ids[-32:]}) request_id={request_id}"
+    )
+
+
+def _minicpmo45_live_tts_input(llm_output, marker: Mapping) -> OmniTokensPrompt | None:
+    """Talker input for the unit a /v1/live/sessions stage-0 segment just
+    finished, derived from this output alone.
+
+    Every unit's sampled tokens end with exactly one stop token (listen,
+    chunk_eos, chunk_tts_eos), so the current unit is what follows the
+    previous stop in ``cumulative_token_ids``. The unit's fed tokens are
+    located in the latent through its row ledger (``_minicpmo45_live_unit_rows``).
+    As in the official MiniCPMODuplex, a listen unit produces no speech, the unit's
+    first token does not condition the Talker, a unit ending in
+    ``<|turn_eos|>`` ends the turn, and a turn's first unit starts a fresh
+    Talker context.
+    """
+    output = llm_output.outputs[0]
+    ids = getattr(output, "cumulative_token_ids", None)
+    if ids is None:
+        ids = getattr(output, "token_ids", None)
+    ids = [int(token) for token in (ids or [])]
+    listen, turn_eos = int(marker["listen"]), int(marker["turn_eos"])
+    stops = {listen, int(marker["chunk_eos"]), int(marker["chunk_tts_eos"])}
+    stop_positions = [index for index, token in enumerate(ids) if token in stops]
+    if not ids or ids[-1] not in stops or ids[-1] == listen:
+        return None
+
+    unit_start = stop_positions[-2] + 1 if len(stop_positions) > 1 else 0
+    spoken = ids[unit_start:-1]
+    rows = None
+    if spoken:
+        mm_output = getattr(llm_output, "multimodal_output", None)
+        if not isinstance(mm_output, Mapping):
+            mm_output = getattr(output, "multimodal_output", None)
+        latent = mm_output.get("latent") if isinstance(mm_output, Mapping) else None
+        if latent is None:
+            latent = getattr(output, "hidden_states", None)
+        if latent is None:
+            raise ValueError("MiniCPM-o Live Talker handoff has no thinker latent")
+        latent = latent.detach()
+        if latent.ndim == 3 and latent.shape[0] == 1:
+            latent = latent.squeeze(0)
+        ledger = mm_output if isinstance(mm_output, Mapping) else {}
+        rows = _minicpmo45_live_unit_rows(ledger, latent, spoken, llm_output.request_id)
+
+    turn_end = bool(spoken) and spoken[-1] == turn_eos
+    # The turn starts here unless the previous speaking unit did not end it.
+    turn_start = True
+    for position in range(len(stop_positions) - 2, -1, -1):
+        stop_index = stop_positions[position]
+        if ids[stop_index] == listen:
+            continue
+        previous_start = stop_positions[position - 1] + 1 if position > 0 else 0
+        previous_spoken = ids[previous_start:stop_index]
+        turn_start = bool(previous_spoken) and previous_spoken[-1] == turn_eos
+        break
+
+    condition_ids = spoken[1:]
+    condition_rows = rows[1:].to(torch.float32).contiguous() if rows is not None else None
+    budget = MINICPMO45_LIVE_CODEC_TOKENS_PER_UNIT
+    buffer: dict = {
+        "minicpmo_live": {
+            "token_ids": condition_ids,
+            "hidden_states": _to_transport_list(condition_rows) if condition_ids else [],
+            "turn_start": turn_start,
+            "turn_end": turn_end,
+            "codec_max": budget,
+            # Official: at least a chunk's worth of audio, except at a turn's
+            # edges (allow <1 s at its start, stop freely at its end).
+            "codec_min": 0 if turn_start or turn_end else budget,
+        }
+    }
+    if turn_start:
+        buffer["meta"] = {"replace_streaming_prompt": True}
+    return OmniTokensPrompt(
+        prompt_token_ids=[0] * (len(condition_ids) + 1),
+        model_intermediate_buffer=buffer,
+        multi_modal_data=None,
+        mm_processor_kwargs=None,
+    )
+
+
 def llm2tts(
     source_outputs,
     prompt: OmniTokensPrompt | TextPrompt = None,
@@ -919,7 +1059,9 @@ def llm2tts(
 
     multi_modal_data = {}
     reference_audio_by_request_id = {}
+    live_markers = {}
     for llm_output, p in zip(llm_outputs, prompt):
+        live_markers[llm_output.request_id] = _minicpmo45_live_marker(p)
         if isinstance(p, dict):
             multi_modal_data[llm_output.request_id] = p.get("multi_modal_data", None)
         else:
@@ -927,6 +1069,12 @@ def llm2tts(
         reference_audio_by_request_id[llm_output.request_id] = _extract_prompt_reference_audio(p)
 
     for llm_output in llm_outputs:
+        live_marker = live_markers.get(llm_output.request_id)
+        if live_marker is not None:
+            live_input = _minicpmo45_live_tts_input(llm_output, live_marker)
+            if live_input is not None:
+                tts_inputs.append(live_input)
+            continue
         output = llm_output.outputs[0]
         request_mm_output = getattr(llm_output, "multimodal_output", None)
         completion_mm_output = getattr(output, "multimodal_output", None)
