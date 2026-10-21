@@ -97,7 +97,7 @@ warmup_quack_fp8([(14040, 2048, 6144), (14040, 2048, 2048)])
 | Qwen-Image | `Qwen/Qwen-Image`, `Qwen/Qwen-Image-2512` | Yes | Yes | Skip sensitive image-stream MLPs when quality regresses | `img_mlp` | |
 | Qwen-Image-2.1 | `Qwen/Qwen-Image-2.1` | Yes | Not validated | Skip image-stream MLPs for best fidelity; all-layer FP8 is loadable. On H200 (1024×1024, teapot prompt) DiT FP8-all is ~30.4 GB / 6.06 s vs BF16 ~36.9 GB / 7.34 s (~33 dB vs BF16). Text encoder FP8 covers the language model only — the vision tower and LM head stay BF16 | `img_mlp` | ✅︎ (language model only) |
 | Wan2.2 | Wan2.2 diffusion pipelines | Not validated | Not validated | Validate against BF16 before documenting as supported | TBD | |
-| LTX-2 | `Lightricks/LTX-2`, `rootonchair/LTX-2-19b-distilled` | Yes | Not validated | Transformer only; use dynamic phase LoRA for ordinary two-stage | None | |
+| LTX-2 | `Lightricks/LTX-2` | Yes | Not validated | Transformer only; use dynamic phase LoRA for ordinary two-stage | None | |
 | LTX-2.3 | `diffusers/LTX-2.3-Diffusers`, `diffusers/LTX-2.3-Distilled-Diffusers` | Yes | Not validated | Transformer only; use dynamic phase LoRA for ordinary two-stage | None | |
 | Z-Image | `Tongyi-MAI/Z-Image-Turbo` | Yes | Yes | All layers | None | ✅︎ |
 | FLUX.1 | `black-forest-labs/FLUX.1-dev`, `black-forest-labs/FLUX.1-schnell` | Yes | Yes | All layers | None | ✅︎ |
@@ -119,12 +119,13 @@ warmup_quack_fp8([(14040, 2048, 6144), (14040, 2048, 2048)])
 Audio encoder, vision encoder, talker, and code2wav stay in BF16 unless a
 model-specific guide says otherwise.
 
-### Multi-Stage Diffusion Model (BAGEL, GLM-Image)
+### Multi-Stage Diffusion Model (BAGEL, GLM-Image, MammothModa2)
 
-| Model     | Scope                                    | Status        | Notes                                           |
-| --------- | ---------------------------------------- | ------------- | ----------------------------------------------- |
-| BAGEL     | Stage-specific transformer or DiT module | Not validated | Route FP8 to the intended stage before enabling |
-| GLM-Image | Stage-specific transformer or DiT module | Not validated | Validate quality against BF16 baseline          |
+| Model        | Scope                                    | Status               | Notes                                                                           |
+| ------------ | ---------------------------------------- | -------------------- | ------------------------------------------------------------------------------- |
+| BAGEL        | Stage-specific transformer or DiT module | Not validated        | Route FP8 to the intended stage before enabling                                 |
+| GLM-Image    | Stage-specific transformer or DiT module | Not validated        | Validate quality against BF16 baseline                                          |
+| MammothModa2 | DiT stage (`stage_id: 1`) only           | Validated online FP8 | Set `quantization: fp8` on stage 1 in the deploy YAML; keep the AR stage in BF16 |
 
 ## Configuration
 

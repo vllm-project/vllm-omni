@@ -812,10 +812,11 @@ class OmniGPUModelRunner(GPUModelRunner):
             slot_mappings_by_layer=slot_mappings_by_layer,
             hidden_states=hidden_states,
             aux_hidden_states=None,
+            dp_sync_state=dp_sync,
             finished_req_ids=scheduler_output.finished_req_ids,
-            dp_sync=dp_sync,
             ec_connector_output=ec_connector_output,
             cudagraph_stats=None,
+            num_spec_tokens_to_schedule=scheduler_output.num_spec_tokens_to_schedule,
         )
 
         assert isinstance(hidden_states, torch.Tensor)

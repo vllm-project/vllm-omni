@@ -119,45 +119,47 @@ def _judge_server_params_for_test(test_name: str) -> dict[str, object] | None:
     return raw
 
 
-def _resolve_judge_cuda_visible_devices(configured: object) -> str:
-    """Map a judge card index onto the process-visible CUDA device list.
+def _resolve_judge_visible_devices(configured: object, device_env: str) -> str:
+    """Map a judge card index onto the process-visible device list.
 
-    ``judge_server_params.cuda_visible_devices`` is an index into
-    ``CUDA_VISIBLE_DEVICES`` when that env is set (``1`` with
-    ``CUDA_VISIBLE_DEVICES=2,3`` selects physical GPU 3). Without the env it
+    ``device_index`` is an index into the platform visibility environment:
+    ``1`` with ``CUDA_VISIBLE_DEVICES=2,3`` selects physical GPU 3. Without the env it
     is used as a raw device list.
     """
     if not isinstance(configured, str) or not configured:
-        raise ValueError("judge_server_params.cuda_visible_devices must be a non-empty string")
-    parent = os.environ.get("CUDA_VISIBLE_DEVICES")
+        raise ValueError("judge_server_params.device_index must be a non-empty string")
+    parent = os.environ.get(device_env)
     if parent is None or not parent.strip():
         return configured
     visible = [part.strip() for part in parent.split(",") if part.strip()]
     if configured.isdigit():
         index = int(configured)
         if index < 0 or index >= len(visible):
-            raise ValueError(
-                f"judge_server_params.cuda_visible_devices={configured!r} is outside CUDA_VISIBLE_DEVICES={parent!r}"
-            )
+            raise ValueError(f"judge_server_params.device_index={configured!r} is outside {device_env}={parent!r}")
         return visible[index]
     return configured
 
 
 @contextmanager
 def _start_judge_server(judge_params: dict[str, object]):
+    from vllm_omni.platforms import current_omni_platform
+
     model = judge_params.get("model")
     if not isinstance(model, str) or not model:
         raise ValueError("judge_server_params.model must be a non-empty string")
     extra = judge_params.get("extra_cli_args") or ()
     if not isinstance(extra, list | tuple):
         raise TypeError("judge_server_params.extra_cli_args must be a list")
-    visible = _resolve_judge_cuda_visible_devices(judge_params.get("cuda_visible_devices", "1"))
-    print(f"Starting benchmark judge with model: {model} on CUDA_VISIBLE_DEVICES={visible}")
+    device_env = current_omni_platform.device_control_env_var
+    # Existing CUDA-only configurations retain their device selection.
+    device_index = judge_params.get("device_index", judge_params.get("cuda_visible_devices", "1"))
+    visible = _resolve_judge_visible_devices(device_index, device_env)
+    print(f"Starting benchmark judge with model: {model} on {device_env}={visible}")
     with OmniServer(
         model,
         [str(item) for item in extra],
         use_omni=bool(judge_params.get("use_omni", False)),
-        env_dict={"CUDA_VISIBLE_DEVICES": visible},
+        env_dict={device_env: visible},
     ) as judge:
         print(f"Benchmark judge started on {judge.host}:{judge.port}")
         yield judge
@@ -481,9 +483,23 @@ def _assert_duplex_eval_result(result: dict, params: dict, num_prompt: int) -> N
     assert isinstance(summary, dict), "Omni-DuplexEval summary is missing"
     assert summary.get("published") == num_prompt, "Omni-DuplexEval artifacts are incomplete"
     assert summary.get("artifact_errors") == [], "Omni-DuplexEval artifact publication failed"
-    assert summary.get("published_with_unfinished_responses") == 0, "Omni-DuplexEval responses are unfinished"
     sessions = result.get("duplex_session_metrics")
     assert isinstance(sessions, list) and len(sessions) == num_prompt, "Omni-DuplexEval session metrics are missing"
+    if path := params.get("duplex_eval_accuracy_config"):
+        from tests.e2e.accuracy.omni_duplex_eval.validation import assert_accuracy_result, load_accuracy_config
+
+        # The accuracy suite scores collected output, including silence and
+        # close-boundary responses. Preserve its eligibility policy; missing
+        # client measurements and unfinished counts remain visible in artifacts.
+        assert_accuracy_result(result, load_accuracy_config(path, params))
+        # Allow individual silent sessions, but fail a batch-wide audio outage
+        # even when the text-only RTD/PR judge accepts the responses.
+        audio_metrics = (session.get("client_ttfp_ms", {}) for session in sessions)
+        assert any(metric.get("count", 0) > 0 and _is_finite_number(metric.get("mean")) for metric in audio_metrics), (
+            "Omni-DuplexEval accuracy run has no measured client audio"
+        )
+        return
+    assert summary.get("published_with_unfinished_responses") == 0, "Omni-DuplexEval responses are unfinished"
     for session in sessions:
         for name in ("client_ttft_ms", "client_ttfp_ms"):
             metric = session.get(name, {})
@@ -568,6 +584,11 @@ def test_performance_benchmark(omni_server, benchmark_params):
     test_name = benchmark_params["test_name"]
     params = dict(benchmark_params["params"])
     dataset_name = params.get("dataset_name", "")
+    accuracy_baseline = None
+    if path := params.get("duplex_eval_accuracy_config"):
+        from tests.e2e.accuracy.omni_duplex_eval.validation import load_accuracy_config
+
+        accuracy_baseline = load_accuracy_config(path, params)["baseline"]
     for dataset_prefix in ("omniinteract", "duplex_eval"):
         if params.get(f"{dataset_prefix}_evaluate"):
             judge_base_url = getattr(omni_server, "judge_base_url", None)
@@ -622,6 +643,7 @@ def test_performance_benchmark(omni_server, benchmark_params):
         _OMNIINTERACT_AGGREGATE_SUBSETS,
         _OMNIINTERACT_AGGREGATE_GROUP,
         "judge_server_params",
+        "duplex_eval_accuracy_config",
         "name",
         "enable_negative_prompt",
         "random_request_config",
@@ -648,6 +670,8 @@ def test_performance_benchmark(omni_server, benchmark_params):
         elif isinstance(value, dict):
             json_str = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
             args.extend([arg_name, json_str])
+        elif isinstance(value, (list, tuple)):
+            args.extend([arg_name, *map(str, value)])
         elif not isinstance(value, bool):
             args.extend([arg_name, str(value)])
 
@@ -675,6 +699,7 @@ def test_performance_benchmark(omni_server, benchmark_params):
             resource_label=resource_label,
             num_warmups=_resolve_num_warmups(params, default=2),
             benchmark_params_name=params.get("name") if isinstance(params.get("name"), str) else None,
+            accuracy_baseline=accuracy_baseline,
         )
         assert_result(result, {**params, **_aggregate_accuracy_params_for_test(test_name)}, num_prompt)
 
@@ -694,5 +719,6 @@ def test_performance_benchmark(omni_server, benchmark_params):
             resource_label=resource_label,
             num_warmups=_resolve_num_warmups(params, default=max(2, int(concurrency))),
             benchmark_params_name=params.get("name") if isinstance(params.get("name"), str) else None,
+            accuracy_baseline=accuracy_baseline,
         )
         assert_result(result, {**params, **_aggregate_accuracy_params_for_test(test_name)}, num_prompt)

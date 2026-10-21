@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 import anyio
 from vllm import TokensPrompt
+from vllm.config.profiler import validate_profile_iteration_bounds
 from vllm.engine.protocol import EngineClient, StreamingInput
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
@@ -109,6 +110,8 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         self._sleeping_tags: set[str] = set()
         self._stage_sleeping_tags: dict[int, set[str]] = {}
         self._level2_sleeping: bool = False
+        # Paced interaction ingress is stamped before ordered worker delivery.
+        self._interaction_reservations: dict[tuple[str, str], float | None] = {}
 
     # ==================== Generate Method ====================
 
@@ -357,6 +360,9 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
                 input_stream_task.cancel()
             if admitting:
                 await self._release_generate_admission()
+            reservations = getattr(self, "_interaction_reservations", {})
+            for key in [key for key in reservations if key[0] == request_id]:
+                reservations.pop(key, None)
             self._log_summary_and_cleanup(request_id)
 
     async def _release_generate_admission(self) -> None:
@@ -653,25 +659,8 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         if self.num_stages != 1 or self.engine.get_stage_metadata(0).stage_type != "diffusion":
             raise ValueError("playback feedback requires single-stage diffusion")
 
-    async def submit_interaction_async(
-        self,
-        request_id: str,
-        *,
-        interaction: OmniInteractionPrompt,
-    ) -> None:
-        """Apply a midway interaction to an active streaming diffusion request.
-
-        ``request_id`` is the external id created by the server-side session,
-        matching the value passed to :meth:`generate`.
-        """
-        event = interaction.get("event")
-        prompt = event.get("prompt") if isinstance(event, dict) else None
-        if isinstance(event, dict) and "prompt" in event and (not isinstance(prompt, str) or not prompt):
-            raise ValueError("prompt must be non-empty")
-        transition_chunks = interaction.get("transition_chunks")
-        if transition_chunks is not None and transition_chunks < 0:
-            raise ValueError("transition_chunks must be >= 0")
-
+    def _resolve_interaction_request(self, request_id: str) -> str:
+        """Validate and map an external streaming id to its internal id."""
         if self.num_stages != 1:
             raise ValueError("interaction requires single-stage diffusion")
         stage_meta = self.engine.get_stage_metadata(0)
@@ -685,13 +674,97 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
             raise ValueError(
                 f"interaction requires exactly one active request for {request_id!r}, found {len(internal_ids)}"
             )
+        return internal_ids[0]
 
-        await self.engine.submit_interaction_async(
-            internal_ids[0],
-            interaction=interaction,
-        )
+    def _interaction_reservations_map(self) -> dict[tuple[str, str], float | None]:
+        """Lazily provide state for lightweight objects that skip ``__init__``."""
+        reservations = getattr(self, "_interaction_reservations", None)
+        if reservations is None:
+            reservations = {}
+            self._interaction_reservations = reservations
+        return reservations
+
+    async def reserve_streaming_interaction(self, request_id: str, event_id: str) -> float | None:
+        """Reserve an engine-clock ingress timestamp without waiting for a worker RPC."""
+        internal_id = self._resolve_interaction_request(request_id)
+        reservations = self._interaction_reservations_map()
+        reservation_key = (internal_id, event_id)
+        reservations[reservation_key] = None
+        try:
+            stamps = await self._engine_core_rpc(
+                "track_streaming_interaction", stage_ids=[0], args=(internal_id, event_id)
+            )
+        except BaseException:
+            # Keep the placeholder so the caller's cancellation/error path can
+            # release the engine-side reservation exactly once.
+            raise
+        stamp = next((value for value in stamps if value is not None), None)
+        if stamp is not None:
+            reservations[reservation_key] = float(stamp)
+        else:
+            reservations.pop(reservation_key, None)
+        return stamp
+
+    async def release_streaming_interaction(self, request_id: str, event_id: str) -> None:
+        """Release a reservation that will not be delivered to the worker."""
+        internal_id = self._resolve_interaction_request(request_id)
+        reservations = self._interaction_reservations_map()
+        reservation_key = (internal_id, event_id)
+        if reservation_key not in reservations:
+            return
+        reservations.pop(reservation_key, None)
+        await self._engine_core_rpc("track_streaming_interaction", stage_ids=[0], args=(internal_id, event_id, False))
+
+    async def submit_interaction_async(
+        self,
+        request_id: str,
+        *,
+        interaction: OmniInteractionPrompt,
+        track_playback: bool = False,
+    ) -> float | None:
+        """Apply a midway interaction to an active streaming diffusion request.
+
+        ``request_id`` is the external id created by the server-side session,
+        matching the value passed to :meth:`generate`.
+        """
+        event = interaction.get("event")
+        prompt = event.get("prompt") if isinstance(event, dict) else None
+        if isinstance(event, dict) and "prompt" in event and (not isinstance(prompt, str) or not prompt):
+            raise ValueError("prompt must be non-empty")
+        transition_chunks = interaction.get("transition_chunks")
+        if transition_chunks is not None and transition_chunks < 0:
+            raise ValueError("transition_chunks must be >= 0")
+
+        internal_id = self._resolve_interaction_request(request_id)
+        event_id = interaction.get("event_id", "")
+        reservations = self._interaction_reservations_map()
+        reservation_key = (internal_id, event_id)
+        received_at = reservations.get(reservation_key)
+        reserved = reservation_key in reservations
+        reservation_attempted = track_playback and not reserved
+        try:
+            if reservation_attempted:
+                received_at = await self.reserve_streaming_interaction(request_id, event_id)
+                reserved = received_at is not None
+            # ``received_at`` is an engine-owned field. A direct caller may put
+            # one in the TypedDict, but it must never reach the runner unchanged.
+            interaction = {**interaction}
+            interaction.pop("received_at", None)
+            if received_at is not None:
+                interaction["received_at"] = received_at
+            await self.engine.submit_interaction_async(internal_id, interaction=interaction)
+        except BaseException:
+            if reserved or reservation_attempted:
+                try:
+                    await self.release_streaming_interaction(request_id, event_id)
+                except Exception:
+                    logger.debug("Failed to release interaction reservation", exc_info=True)
+            raise
+        else:
+            reservations.pop(reservation_key, None)
         if self.log_stats:
             logger.info("[AsyncOmni] Queued interaction for request %s", request_id)
+        return received_at
 
     def _split_stage_ids_by_type(self, stage_ids: list[int] | None = None) -> tuple[list[int], list[int]]:
         """Split stage ids into AR/LLM (EngineCore) vs diffusion (worker RPC)."""
@@ -866,6 +939,9 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         self,
         profile_prefix: str | None = None,
         stages: list[int] | None = None,
+        *,
+        delay_iterations: int | None = None,
+        max_iterations: int | None = None,
     ) -> list[Any]:
         """Start profiling specified stages.
 
@@ -874,8 +950,24 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         Args:
             profile_prefix: Optional prefix for the trace file names.
             stages: List of stage IDs to profile. If None, profiles all stages.
+            delay_iterations: Optional per-session delayed start (vLLM compat).
+            max_iterations: Optional per-session iteration cap (vLLM compat).
         """
-        return await self.collective_rpc(method="profile", args=(True, profile_prefix), stage_ids=stages)
+        validate_profile_iteration_bounds(delay_iterations, max_iterations)
+        # Mirror upstream ExecutorBase.profile: forward the per-session
+        # controls as kwargs only when set, so workers without them keep
+        # working with plain (is_start, profile_prefix) args.
+        kwargs: dict[str, int] = {}
+        if delay_iterations is not None:
+            kwargs["delay_iterations"] = delay_iterations
+        if max_iterations is not None:
+            kwargs["max_iterations"] = max_iterations
+        return await self.collective_rpc(
+            method="profile",
+            args=(True, profile_prefix),
+            kwargs=kwargs or None,
+            stage_ids=stages,
+        )
 
     async def stop_profile(self, stages: list[int] | None = None) -> list[Any]:  # type: ignore[override]
         """Stop profiling specified stages.

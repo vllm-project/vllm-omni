@@ -41,6 +41,250 @@ Grouping and pruning affect only the model-input view. They do not merge or
 delete the source conversation items exposed to clients, and do not change
 playback acknowledgement or interruption handling.
 
+### Qwen3-Omni voice selection
+
+The duplex session forwards the configured voice to the Talker as the
+checkpoint speaker. Accepted values are the names in the checkpoint's
+`talker_config.speaker_id` mapping (for example `chelsie`, `ethan`,
+`aiden`), matched case-insensitively. When the checkpoint exposes that
+mapping, an unknown name is rejected with error code `invalid_speaker`,
+leaving the previous voice in effect; a checkpoint without a mapping leaves
+voice names unvalidated and the Talker uses its default. The voice can be set
+when the session is opened and changed through `session.update` until audio
+output has started. Once audio output has started, a change to `voice` is
+rejected with `voice_update_after_audio_unsupported`; resending the current
+value — in any case or spacing, or as an echoing `null` — is a no-op, so
+clients may round-trip the whole session object. Clearing the voice before
+any audio output is allowed and makes the Talker fall back to the checkpoint's
+default speaker; a blank value is treated the same as `null`. Reference-voice
+audio (`ref_audio`) is not supported on this model.
+
+### Optional history calibration for interrupted Qwen3-Omni replies
+
+By default, Qwen3-Omni audio replies under `ack_only` retain their full text
+only after playback is completely acknowledged; an interrupted reply leaves an
+empty assistant turn. History calibration can retain a prefix of the original
+reply before the next prompt is prepared. Choose one of two experimental
+strategies in a server-side deployment overlay:
+
+- **Token rate:** estimate the prefix from playback time and the reply's complete
+  audio duration, with a configured rate for interrupted generation. Requires no
+  ASR service or output-audio cache.
+- **ASR prefix matching:** transcribe the played audio and match it against the
+  original reply. Requires a separately deployed transcription service.
+
+Both strategies are disabled by default and are mutually exclusive. They apply
+to Qwen3-Omni in `session_mode: duplex`, with `playback_commit_policy: ack_only`
+and playback speed 1. Other playback policies and speeds retain their existing
+behavior. These deployment settings cannot be changed by `session.update`.
+
+#### Configure token-rate estimation
+
+Save this as `qwen3_history.yaml`, replacing `base_config` with the absolute path
+to the repository's Qwen3-Omni duplex deployment:
+
+```yaml
+base_config: /path/to/vllm-omni/vllm_omni/deploy/qwen3_omni_duplex.yaml
+duplex_session:
+  history_ms_per_token: 383
+  history_calibration_timeout_ms: 1000
+```
+
+The example 383 ms/token was selected through WebUI playback testing for one
+deployment. It is the fallback audio duration per text token when generation was
+interrupted, not model generation time per token or a model-wide default. Check
+it for the language, voice and speaking style of your deployment.
+
+The plugin uses the existing processor's fast tokenizer without special tokens
+and estimates `floor(max(0, played_ms - 160) / ms_per_token)` tokens. Once the
+final audio stage has completed the reply, `ms_per_token` is that reply's total
+audio duration divided by its text token count. This adapts to each complete
+reply without sharing learned state across sessions. If audio generation was
+interrupted, `ms_per_token` falls back to `history_ms_per_token`: Thinker may have
+already produced all the text while audio synthesis is still incomplete, so
+dividing full text by partial audio would overestimate the speaking rate.
+It rounds down to whole English words or Chinese characters using original text
+offsets, accounts for overlapping byte tokens, and withholds the final unit of
+the reply during partial playback. Text longer than 8192 characters or 2048
+matching units is refused before tokenization.
+
+Both a reply's average rate and the configured fallback can retain unheard text
+when a phrase is spoken more slowly. Total duration does not provide word-level
+alignment; the time margin and downward rounding do not eliminate this error. This
+strategy is an explicit alternative to ASR, not an automatic fallback after an
+ASR timeout.
+
+#### Configure ASR prefix matching
+
+Deploy a transcription service before starting the duplex server. It must
+accept multipart `file`, `model`, and `response_format=json` fields and return
+`{"text": "..."}`. The duplex plugin uses HTTP; it does not load an ASR model
+inside each session.
+
+For a vLLM installation with native Qwen3-ASR support, an example is:
+
+```bash
+uv run --no-sync vllm serve Qwen/Qwen3-ASR-1.7B \
+    --served-model-name history-asr \
+    --host 127.0.0.1 --port 18942 \
+    --max-model-len 8192 --max-num-seqs 16 \
+    --kv-cache-memory-bytes 1073741824 \
+    --attention-backend FLASH_ATTN \
+    --no-enable-prefix-caching --mm-processor-cache-gb 0 \
+    --generation-config vllm \
+    --override-generation-config '{"max_new_tokens":256}'
+```
+
+Allocate resources for this additional service and size its memory budget for
+your workload. The 1 GiB KV cache example was exercised with four concurrent
+calibration calls; `--max-num-seqs 16` does not guarantee that sixteen
+maximum-length requests fit. Warm up the ASR service before using it with a
+short calibration deadline.
+
+Use this overlay as `qwen3_history.yaml` instead of the fixed-rate overlay:
+
+```yaml
+base_config: /path/to/vllm-omni/vllm_omni/deploy/qwen3_omni_duplex.yaml
+duplex_session:
+  history_asr_url: http://127.0.0.1:18942/v1/audio/transcriptions
+  history_asr_model: history-asr
+  history_asr_max_concurrency: 4
+  history_calibration_timeout_ms: 1000
+  history_audio_max_bytes_per_session: 8388608
+```
+
+`history_asr_model` must match a model name served by that endpoint. The URL
+is server-owned and accepts HTTP(S) without embedded credentials. The current
+client does not attach authentication headers.
+
+The callback subtracts a 160 ms margin from the reported playback position and
+sends only that audio prefix to ASR, without supplying the original text as a
+recognition hint. Audio shorter than 500 ms after the margin is refused. The
+transcript and original reply are split into Chinese characters and other
+words, ignoring punctuation and whitespace between units and normalizing
+Unicode width, case and apostrophe style. Matching starts at the beginning and
+stops at the first differing unit; it never skips a difference to resume later.
+The final matched unit is withheld, even when the transcript continues beyond
+the mismatch. For example, original `Keep your original files safe.` and ASR
+`keep your original file` retain `Keep your`.
+
+The transcript must contain at least three units, and neither text may exceed
+512 units. A valid comparison with no remaining units retains an empty prefix.
+The retained text is sliced from the original reply, preserving its spelling
+and internal punctuation; ASR text is never inserted into conversation history.
+Chinese boundaries are characters rather than lexical words. Early ASR errors
+can discard a long heard suffix, and a matching ASR hallucination can still
+retain unheard text; the guards do not establish exact acoustic alignment.
+
+The HTTP concurrency limit is shared across sessions and should match the
+backend's measured capacity. Timeout or cancellation closes the HTTP request.
+Stopping remote inference also requires the backend to propagate disconnects
+to engine abort. This was verified with native vLLM transcription in vLLM 0.31.0;
+verify it for other backends or proxies. Cancelling a request can stop queued
+work and subsequent decode steps, but cannot preempt an already launched CUDA
+kernel.
+
+#### Start the duplex server
+
+From the repository environment, start Qwen3-Omni with the chosen overlay:
+
+```bash
+uv run --no-sync vllm-omni serve Qwen/Qwen3-Omni-30B-A3B-Instruct \
+    --omni --deploy-config qwen3_history.yaml \
+    --trust-remote-code --host 127.0.0.1 --port 8099
+```
+
+Connect the client to `ws://127.0.0.1:8099/v1/realtime?duplex=1`. The overlay
+inherits the default Qwen3-Omni stages; it only changes session settings.
+Restart the server when changing the calibration strategy or its configuration.
+
+#### Report playback and interruptions
+
+Clients must report cumulative audio actually played, measured in milliseconds
+from the start of the assistant reply. Audio received or queued for playback
+is not a playback confirmation. Continue sending `playback.ack` during playback.
+
+For an interruption, stop local playback and capture its final position.
+Cancel the response if generation is still running, send
+`conversation.item.truncate` using the assistant item's actual ID, and clear
+queued server output with `output_audio_buffer.clear`. For example:
+
+```json
+{"type": "conversation.item.truncate", "item_id": "item_resp_01", "content_index": 0, "audio_end_ms": 1850}
+```
+
+The truncate event supplies a permanent playback limit; an additional ACK is
+not required for that limit. Its acknowledgement confirms the truncation was
+accepted, not that ASR has finished. Once generation has ended, calibration
+can run while the user speaks. A final ACK after playback stops can also start
+eligible work. Periodic ACKs while playback continues do not start ASR.
+
+Before copying history into the next prompt, the framework waits within the
+configured budget for any pending calibration, then updates the assistant item
+in its original position. Already submitted prompts are not changed.
+
+#### Limits, fallback and disabling
+
+| Setting | Default | Effect |
+| --- | --- | --- |
+| `history_ms_per_token` | unset | Enables fixed-rate estimation when positive and finite. |
+| `history_asr_url` | unset | Enables ASR calibration; requires `history_asr_model`. |
+| `history_asr_max_concurrency` | 4 | Maximum simultaneous calibration HTTP requests per plugin instance. |
+| `history_calibration_timeout_ms` | 1000 | Bounds each callback, including queueing, HTTP and matching; also bounds total prompt wait across replacement tasks. |
+| `history_audio_max_bytes_per_session` | 8388608 | Retained output PCM budget for ASR; separate from input audio history. |
+
+ASR retains at most four recordings per session within the byte budget.
+Oversized or evicted recordings are unusable for calibration; subsequent chunks
+cannot restart them with a suffix presented as a complete recording. Temporary
+snapshot, WAV and HTTP buffers are additional to the retained-PCM budget.
+
+For either strategy, eviction also releases the ended reply's original text
+snapshot, playback cursor and pending reconciliation state. Live or draining
+replies defer this cleanup until generation ends. The stored conversation turn
+keeps its confirmed prefix and cutoff, without retaining the original full
+reply. A later ACK cannot expand that prefix. If a later truncate is stricter
+than its cutoff, the prefix is cleared conservatively because the evidence
+needed to recalibrate it has expired. Recent retained replies can still be
+recalibrated. Conversation items and their compact cutoff metadata remain until
+item deletion or session disposal; the cache limits do not bound total history.
+
+Missing playback evidence, missing audio, matching refusal, exceptions and
+timeouts preserve the existing conservative history policy. Without an already
+confirmed prefix, partial playback leaves an empty assistant item. A permanent
+truncate can only tighten: late ACKs and calibration results cannot restore text
+beyond it. Fully acknowledged recordings are released; deleting an item or
+closing a session releases its cache and invalidates pending work. Deleting an
+ended reply also releases its playback cursor, with or without calibration.
+If its TTS is still draining after a newer reply starts, the cursor is retained
+until that drain completes, is cancelled or fails, then released because the
+deleted item cannot accept ACKs. Drains that produced no audio also release
+their snapshot, cursor and unused history placeholder on every exit path.
+Cancelled or failed drains with audio and an existing item retain playback
+state for later ACKs and truncation. Failure events report the failed reply's
+own playback cursor even when a newer reply is active.
+Realtime projection buffers are released when each response ends; its
+conversation item remains available until explicitly deleted. Late output or
+playback metadata reads cannot recreate the released buffers.
+
+Logs report calibration status and preprocessing, queueing, HTTP and matching
+durations, without audio or transcript content. Prompt preparation reports its
+actual extra wait separately. HTTP duration includes remote queueing and
+transport and is not pure inference time.
+
+To disable calibration, remove both strategy settings from an overlay whose
+base does not enable them, or explicitly override inherited settings with null:
+
+```yaml
+duplex_session:
+  history_asr_url: null
+  history_ms_per_token: null
+```
+
+Restarting with calibration disabled restores the original history policy and
+stops retaining output PCM for calibration. Broader language, boundary and
+sustained-load validation is still needed before enabling either strategy by
+default.
+
 ## Quick Start
 
 ### Start the Server
@@ -178,6 +422,19 @@ ships a preset:
 Keyword overrides on a preset replace the corresponding `SessionConfig`
 field, e.g. `create_duplex_session_config(ref_audio=..., temperature=0.6)`.
 
+MiniCPM-o 4.5 uses `sliding_window_mode: "basic"` by default for the Thinker
+(Stage 0). When the projected context exceeds `basic_window_high_tokens`
+(8000), the window drops the oldest units, including the model's own output
+in them, targeting `basic_window_low_tokens` (6000). The system/reference-audio
+prefix is kept. Dropped input and earlier replies are no longer directly
+available to the Thinker. The retained time span depends on the input and
+generated speech; these limits are token counts, not a fixed number of seconds.
+
+Pass `extra_body={"sliding_window_mode": "off"}` to retain the full history.
+The `"context"` mode instead retains `context_max_units` (24) recent units
+plus up to `context_previous_max_tokens` (500) tokens of earlier model text.
+The window configuration is fixed when the session is created.
+
 Constructor options: `reconnect` (a `ReconnectPolicy`, default five
 attempts with 0.25–4 s jittered backoff; `None` disables auto-resume),
 `heartbeat_interval_s` (default 30 s; `None` disables the lease heartbeat),
@@ -247,6 +504,29 @@ conversation history only as far as you acknowledge it, which is what keeps
 history truthful after an interruption. `acknowledge_collected_playback(client,
 collector)` acknowledges everything an `EventCollector` has received, which is
 what the example and the benchmarks do at the end of a turn.
+
+Audio without a transcript can still be acknowledged after the response ends
+or is cancelled. If its ACK arrives before a later input, an empty assistant
+message preserves the turn boundary. A late ACK can update playback without
+appending the old turn after the newer input. Neither case commits answer text
+(`history_committed` remains false); a full ACK releases the response's pending
+playback and history state. While an older response is still draining audio,
+an ACK that catches up with the audio sent so far keeps its playback and history
+snapshot alive, including when its transcript is temporarily empty. Later text
+and audio still belong to that response. Cleanup requires both output completion
+and either a full playback ACK or an explicit hard truncate, in either order: if the ACK arrives first, the terminal
+output applies that saved progress to the final transcript and releases the
+response without requiring another ACK. Ordinary partial playback retains the
+response for a later ACK. An explicit truncate stops playback at its cutoff and
+does not require acknowledging the discarded audio. Without calibration, text
+timing marks remain available for later, stricter item truncation. When usable
+alignment is unavailable, only the stored history prefix and cutoff survive.
+Subsequent progress ACKs cannot change finalized history or restore unheard text.
+When history calibration is enabled, its bounded cache retains the evidence
+needed for prefix correction until retirement, including hard-capped replies.
+Cancellation does not mark unfinished audio as fully generated;
+it never credits an entire unaligned transcript merely because playback caught
+up with the chunks sent before cancellation.
 
 ### Interrupt
 
@@ -614,9 +894,21 @@ Semantic divergences hidden behind shared names:
   before any commit; a commit may end in `response.listen` and no
   response, and the model may open a response with no commit at all.
   OpenAI: commit ⇒ item, `response.create` ⇒ exactly one response.
-- `turn_detection.interrupt_response=false` is rejected;
-  `create_response` is ignored; `semantic_vad` is unsupported; the VAD
-  runs per session (Silero) and implies `overlap_policy=barge_in_on_speech`.
+- `turn_detection.interrupt_response=false` is rejected; the VAD runs per
+  session (Silero) and implies `overlap_policy=barge_in_on_speech`.
+  `semantic_vad` (Silero + Smart Turn v3.2, `eagerness` low/medium/high/auto;
+  setup in the [realtime web guide](https://github.com/vllm-project/vllm-omni/blob/main/examples/online_serving/realtime_web/README.md#semantic-vad-silero--smart-turn))
+  is accepted for turn-based sessions only; auto-responding (native duplex)
+  sessions refuse it with `unsupported_turn_detection`. On turn-based sessions
+  the detector's commit honours `create_response`.
+- Re-sending the same normalized `turn_detection` settings preserves the active
+  speech and pause state. Changing settings (including switching modes or
+  disabling VAD) while input is pending rejects the entire `session.update`
+  with `unsupported_turn_detection`; commit or clear input before retrying.
+  This also applies to identical settings after a backend failure disabled the
+  detector: its replacement cannot reconstruct the buffered turn. Identical
+  settings preserve pending input only when reusing the live detector (or when
+  VAD remains disabled).
 - `rate_limits.updated` is always an empty list (compatibility only).
 - Cancellation never reuses a `response_id`; truncation is driven by
   `playback.ack` as well as `conversation.item.truncate`.
@@ -1142,9 +1434,20 @@ deferred commit during an active response (`event.response_create_deferred`)
 {"type": "conversation.item.truncated", "item_id": "item_resp_01", "content_index": 0, "audio_end_ms": 1850, "event": {"…": "…"}}
 ```
 
-After this acknowledgement, `conversation.item.retrieve` returns the truncated
+Audio truncation requires audio produced by the target item's response.
+Imported text context and replies that have not produced audio return
+`bad_event`, without changing history, playback progress, or pending truncation.
+A known duration of zero is a bound, not an unspecified duration.
+
+After a successful acknowledgement, `conversation.item.retrieve` returns the truncated
 transcript. Without text/audio alignment marks, its prefix is estimated from
-the requested position and audio duration; this is not exact word alignment.
+the requested position and that response's retained audio duration; this is not
+exact word alignment. For a reply that previously produced audio, if neither
+alignment nor duration remains, an explicit truncate clears the transcript
+conservatively. An empty truncated assistant
+item remains addressable for subsequent ACKs; use `conversation.item.delete`
+to remove it. Delayed progress ACKs cannot change finalized history and report
+`history_committed: false`, without repeating tool-result settlement.
 
 #### Response lifecycle
 
@@ -1405,6 +1708,25 @@ truncating ack after an interruption (what was actually heard)
 {"type": "playback.ack", "response_id": "resp_01", "played_ms": 1850, "committed_ms": 1850, "truncate": true}
 ```
 
+Send `response_id` or `item_id` to identify the playback being acknowledged.
+For compatibility, an omitted ID can select the active response. For a finished
+response, the server can infer its pending or stored assistant item if it belongs
+to the most recently started response associated with current playback. Older
+pending replies and imported history do not change that target, including after
+a partial ACK moves it into stored history. A stored item must also have produced
+audio. The session retains that fact after releasing the full playback records,
+including for replies without text. An imported item's `item_`
+prefix alone does not make it a playback target. An older reply is not selected
+in place of a deleted current item, even if that older reply produced audio;
+send its ID explicitly to acknowledge it. With no identifiable target, an ordinary ACK updates only
+the current playback cursor; a hard ACK (`truncate: true`) returns `bad_event`
+before changing history or playback. Explicitly naming a non-response item still returns
+`playback_item_not_found`. The `truncate` flag is preserved through command
+translation, including the legacy `audio.playback_ack` alias. Once a
+hard-stopped response finishes generating, it no longer blocks `response.create`,
+including while its history-calibration evidence is retained. An ordinary
+partial ACK still means playback is in progress.
+
 #### Overlap and barge-in
 
 `S→C overlap.decision`
@@ -1518,9 +1840,9 @@ them out into typed events before they reach a client.
   Text-to-speech has its own shape here — put the text in
   `extra_body.duplex_initial_user_text` on `session.update`, then stream audio
   units (silence is enough). The seeded turn is what the model answers.
-- `turn_detection` supports only `server_vad` with `interrupt_response=true`;
-  `semantic_vad`, `interrupt_response=false`, and `create_response` are not
-  supported.
+- `turn_detection` supports `server_vad` and, for turn-based sessions,
+  `semantic_vad`, both with `interrupt_response=true`; `interrupt_response=false`
+  is not supported.
 - `input_audio_transcription` and `input_audio_noise_reduction` are accepted
   and echoed but no separate transcription or noise-reduction stage runs;
   transcripts come from the model.

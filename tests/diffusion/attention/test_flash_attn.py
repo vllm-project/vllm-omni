@@ -58,6 +58,66 @@ def test_versioned_flash_attention_selection_rejects_invalid_or_unavailable_vers
         fa._choose_vllm_flash_attn_version(9, "4", frozenset((2, 3)))
 
 
+@pytest.mark.cpu
+def test_vllm_varlen_version_kwargs_targets_only_vllm_dispatcher(monkeypatch):
+    def vllm_func(**_kwargs):
+        return None
+
+    def other_func(**_kwargs):
+        return None
+
+    monkeypatch.setattr(fa, "_is_vllm_flash_attn_varlen", lambda func: func is vllm_func)
+    monkeypatch.setattr(fa, "resolve_vllm_flash_attn_version", lambda requested=None: 3)
+
+    assert fa.vllm_varlen_version_kwargs(vllm_func) == {"fa_version": 3}
+    assert fa.vllm_varlen_version_kwargs(other_func) == {}
+    assert fa.vllm_varlen_version_kwargs(None) == {}
+
+
+@pytest.mark.cpu
+def test_dense_cuda_varlen_fallback_passes_resolved_fa_version(monkeypatch):
+    captured: dict[str, Any] = {}
+
+    def fake_varlen(**kwargs):
+        captured.update(kwargs)
+        return kwargs["q"]
+
+    monkeypatch.setattr(fa, "flash_attn_func", None)
+    monkeypatch.setattr(fa, "flash_attn_varlen_func", fake_varlen)
+    monkeypatch.setattr(fa, "HAS_FLASH_ATTN", True)
+    monkeypatch.setattr(fa, "_is_vllm_flash_attn_varlen", lambda func: func is fake_varlen)
+    monkeypatch.setattr(fa, "resolve_vllm_flash_attn_version", lambda requested=None: 3)
+
+    impl = FlashAttentionImpl(num_heads=2, head_size=8, softmax_scale=0.5, causal=False)
+    query = torch.randn(1, 4, 2, 8)
+    output = impl.forward_cuda(query, query, query)
+
+    assert torch.equal(output, query)
+    assert captured["fa_version"] == 3
+    assert captured["causal"] is False
+    assert captured["softmax_scale"] == 0.5
+
+
+@pytest.mark.cpu
+def test_dense_cuda_varlen_fallback_omits_fa_version_for_other_backends(monkeypatch):
+    captured: dict[str, Any] = {}
+
+    def fake_varlen(**kwargs):
+        captured.update(kwargs)
+        return kwargs["q"]
+
+    monkeypatch.setattr(fa, "flash_attn_func", None)
+    monkeypatch.setattr(fa, "flash_attn_varlen_func", fake_varlen)
+    monkeypatch.setattr(fa, "HAS_FLASH_ATTN", True)
+    monkeypatch.setattr(fa, "_is_vllm_flash_attn_varlen", lambda _func: False)
+
+    impl = FlashAttentionImpl(num_heads=2, head_size=8, softmax_scale=0.5, causal=False)
+    query = torch.randn(1, 4, 2, 8)
+    impl.forward_cuda(query, query, query)
+
+    assert "fa_version" not in captured
+
+
 def test_vllm_dense_adapter_builds_varlen_metadata_and_restores_lse(monkeypatch):
     batch_size, seqlen_q, seqlen_k, num_heads, head_dim = 2, 3, 5, 4, 8
     query = torch.randn(batch_size, seqlen_q, num_heads, head_dim)

@@ -101,6 +101,7 @@ def test_contiguous_kv_cache_layout_v2(monkeypatch: pytest.MonkeyPatch, padded: 
     assert original(None, None, spec) is (not padded)
     config = make_kv_cache_config(name, spec)
     vllm_config = MagicMock()
+    vllm_config.parallel_config.decode_context_parallel_size = 1
     vllm_config.kv_transfer_config = None
     vllm_config.quant_config = None
     monkeypatch.setattr(attn_utils, "get_current_vllm_config", lambda: vllm_config)

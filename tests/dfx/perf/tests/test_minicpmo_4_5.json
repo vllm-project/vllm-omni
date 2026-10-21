@@ -1,7 +1,7 @@
 [
   {
     "test_name": "test_minicpmo_4_5",
-    "description": "Chat C1/C4/C8 baselines are unchanged from the parent configuration: H100 uses the equal-weight nightly means for 2026-09-22 through 2026-09-28 (7 runs, no added margin); A3 is preserved. New C16/C32 references use H100 Buildkite build 17017 (commit c5e0bd7c2c3dd297adfbf36a40f3b7a19bf94d24) and A3 vllm-omni-npu-ci build 8873 (commit 26237d470651a841534abbddfb70301580a0227d): request_throughput is measured x 0.90, latency and audio RTF are measured x 1.10, rounded to 4 decimals. These historical runs are reference measurements, not validation of the current revision. B200 remains without a baseline pending measurements.",
+    "description": "Chat C1/C4/C8 baselines incorporate non-regressing equal-weight nightly means for 2026-10-08 through 2026-10-14 (H100: 7 days; A3: 6 days; no added margin); A3 C4 mean_ttft_ms uses the window mean with an explicitly approved regression; other regressing A3 values are retained. C16/C32 references use H100 Buildkite build 17017 (commit c5e0bd7c2c3dd297adfbf36a40f3b7a19bf94d24) and A3 vllm-omni-npu-ci build 8873 (commit 26237d470651a841534abbddfb70301580a0227d): request_throughput is measured x 0.90, latency and audio RTF are measured x 1.10, rounded to 4 decimals. These historical runs are reference measurements, not validation of the current revision. B200 remains without a baseline pending measurements.",
     "mark": [
       {
         "hardware_marks": {
@@ -61,37 +61,37 @@
         "baseline": {
           "H100": {
             "request_throughput": [
-              0.9615,
-              1.4882,
-              1.6245,
+              1.525,
+              3.1855,
+              4.036,
               3.609,
               3.8121
             ],
             "mean_ttft_ms": [
-              156.5006,
-              272.8529,
-              283.2613,
+              121.6802,
+              255.7893,
+              256.2622,
               348.5606,
               398.8221
             ],
             "mean_e2el_ms": [
-              1042.7617,
-              2669.8806,
-              4882.2845,
+              660.8259,
+              1238.4447,
+              1965.672,
               4364.1781,
               8260.9541
             ],
             "mean_audio_ttfp_ms": [
-              585.7387,
-              1396.1575,
-              2508.4384,
+              362.9356,
+              795.4822,
+              1115.6453,
               1832.5383,
               3193.5749
             ],
             "mean_audio_rtf": [
-              0.2504,
-              0.6281,
-              1.1787,
+              0.159,
+              0.2941,
+              0.4743,
               0.9997,
               1.8129
             ]
@@ -99,21 +99,21 @@
           "A3": {
             "request_throughput": [
               0.4813,
-              0.6381,
+              0.6969,
               0.8728,
               0.8563,
               0.9032
             ],
             "mean_ttft_ms": [
-              328.182,
-              470.0053,
+              324.7352,
+              623.6599,
               506.3193,
               644.0404,
               719.7749
             ],
             "mean_e2el_ms": [
               2086.7028,
-              6480.6866,
+              5760.4772,
               9103.7395,
               18362.9433,
               34760.4601
@@ -127,7 +127,7 @@
             ],
             "mean_audio_rtf": [
               0.4659,
-              1.4737,
+              1.3127,
               2.1758,
               4.181,
               7.7519

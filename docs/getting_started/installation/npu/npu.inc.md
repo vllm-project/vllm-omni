@@ -10,25 +10,25 @@ The recommended way to use vLLM-Omni on NPU is through the vLLM-Ascend pre-built
 === "A2"
 
     ```bash
-    export IMAGE=quay.io/atlas-ci/vllm-ascend:v0.31.0
+    export IMAGE=quay.io/atlas-ci/vllm-ascend:v0.30.0
     ```
 
 === "A3"
 
     ```bash
-    export IMAGE=quay.io/atlas-ci/vllm-ascend:v0.31.0-a3
+    export IMAGE=quay.io/atlas-ci/vllm-ascend:v0.30.0-a3
     ```
 
 === "A5"
 
     ```bash
-    export IMAGE=quay.io/atlas-ci/vllm-ascend:v0.31.0-a5
+    export IMAGE=quay.io/atlas-ci/vllm-ascend:v0.30.0-a5
     ```
 
 === "310P (Experimental)"
 
     ```bash
-    export IMAGE=quay.io/atlas-ci/vllm-ascend:v0.31.0-310p
+    export IMAGE=quay.io/atlas-ci/vllm-ascend:v0.30.0-310p
     ```
 
 ```bash
@@ -72,10 +72,11 @@ We are keeping [issue #886](https://github.com/vllm-project/vllm-omni/issues/886
 # --8<-- [start:installation-main]
 
 You can also install vLLM-Omni from source if you want to use the latest features
-or bug fixes. This source checkout targets vLLM 0.31.0 and needs a matching
-vLLM-Ascend runtime. The v0.30.0 images above are for the published Omni v0.30.0
-release. Check [issue #886](https://github.com/vllm-project/vllm-omni/issues/886)
-for aligned versions and NPU validation before selecting a development image.
+or bug fixes. This alignment checkout targets vLLM 0.32.0 and requires a
+matching vLLM-Ascend runtime validated on your NPU. The v0.30.0 Ascend images
+above do not establish compatibility with this vLLM 0.32.0 checkout. Check
+[issue #886](https://github.com/vllm-project/vllm-omni/issues/886) for aligned
+versions and NPU validation before selecting a development image.
 
 ```bash
 # Inside a container with matching vLLM and vLLM-Ascend, install Omni from source

@@ -23,6 +23,10 @@ SPEC.loader.exec_module(SELECTOR)
     ("branch", "labels", "expected"),
     [
         ("main", (), ("merge",)),
+        ("release/v0.30.0", (), ("merge",)),
+        ("release/v0.30.0", ("ready",), ("merge",)),
+        ("0.30.0", (), ("ready",)),
+        ("v0.30.0", (), ("ready",)),
         ("feature", ("ready",), ("ready",)),
         ("feature", ("merge-test",), ("merge",)),
         ("feature", ("merge-test", "ready"), ("ready", "merge")),
@@ -87,6 +91,48 @@ def test_scheduled_main_rejects_nightly_and_weekly_together():
             nightly=True,
             weekly=True,
         )
+
+
+def test_version_branch_pull_request_follows_labels():
+    assert SELECTOR.select_amd_test_suites(
+        branch="release/v0.30.0",
+        labels=("ready",),
+        pull_request="123",
+    ) == ("ready",)
+    assert SELECTOR.select_amd_test_suites(
+        branch="release/v0.30.0",
+        labels=("merge-test",),
+        pull_request="123",
+    ) == ("merge",)
+    assert SELECTOR.select_amd_test_suites(
+        branch="release/v0.30.0",
+        labels=(),
+        pull_request="123",
+    ) == ("ready",)
+
+
+def test_main_pull_request_still_selects_merge():
+    assert SELECTOR.select_amd_test_suites(
+        branch="main",
+        labels=("ready",),
+        pull_request="123",
+    ) == ("merge",)
+
+
+def test_scheduled_version_branch_selects_only_nightly():
+    assert SELECTOR.select_amd_test_suites(
+        branch="release/v0.30.0",
+        labels=("ready",),
+        nightly=True,
+    ) == ("nightly",)
+
+
+def test_scheduled_version_branch_selects_only_weekly():
+    assert SELECTOR.select_amd_test_suites(
+        branch="release/v0.30.0",
+        labels=("ready",),
+        weekly=True,
+    ) == ("weekly",)
 
 
 def test_empty_debug_override_uses_normal_selection():

@@ -480,15 +480,23 @@ def test_ar_paged_attention_gpu_lane_is_blocking_and_pinned() -> None:
         lane_definitions.append(step)
 
         assert step["grade"] == "Blocking"
-        assert step["timeout_in_minutes"] == 20
+        assert step["timeout_in_minutes"] == 25
         assert "export VLLM_OMNI_AR_FA_REQUIRED=1" in step["commands"]
 
-        pytest_command = next(command for command in step["commands"] if "pytest" in command)
-        argv = split(pytest_command)
+        pytest_commands = [command for command in step["commands"] if "pytest" in command]
+        assert len(pytest_commands) == 2
+
+        argv = split(pytest_commands[0])
         assert argv[:4] == ["timeout", "--signal=TERM", "--kill-after=2m", "15m"]
         assert "tests/diffusion/ar_diffusion/test_paged_attention.py" in argv
         assert argv[argv.index("-m") + 1] == AR_PAGED_ATTENTION_MARKERS
         assert argv[argv.index("--run-level") + 1] == "core_model"
+
+        transfer_argv = split(pytest_commands[1])
+        assert transfer_argv[:4] == ["timeout", "--signal=TERM", "--kill-after=1m", "5m"]
+        assert "tests/diffusion/utils/test_chunked_transfer.py" in transfer_argv
+        assert transfer_argv[transfer_argv.index("-m") + 1] == AR_PAGED_ATTENTION_MARKERS
+        assert transfer_argv[transfer_argv.index("--run-level") + 1] == "core_model"
 
     assert lane_definitions[0] == lane_definitions[1]
 
@@ -582,6 +590,63 @@ def test_joy_gpu_helper_import_does_not_require_pytest_package_mode() -> None:
     assert Path(spec.origin).resolve() == Path(JOY_GPU_PATH).with_name("test_joy_image.py").resolve()
 
 
+@pytest.mark.parametrize("label", ["Diffusion · Batch Test", "Diffusion · Offloader Test", "Diffusion · Cache Test"])
+def test_ready_diffusion_gpu_lanes_select_rocm_variants(label: str) -> None:
+    step = _find_step(label, AMD_READY_PIPELINE)
+    pytest_command = next(command for command in step["commands"] if "pytest" in command)
+    argv = split(pytest_command)
+
+    assert argv[argv.index("-m") + 1] == "core_model and rocm and MI325 and cards_1"
+
+
+@pytest.mark.parametrize(
+    ("label", "pipeline", "cards"),
+    [
+        ("ROCm · Ulysses UAA Attention · 2-GPU", AMD_READY_PIPELINE, "cards_2"),
+        ("ROCm · Ulysses UAA Attention · 4-GPU", AMD_MERGE_PIPELINE, "cards_4"),
+    ],
+)
+def test_amd_ulysses_lanes_cover_uaa_and_attention_sp(label: str, pipeline: Path, cards: str) -> None:
+    step = _find_step(label, pipeline)
+    pytest_commands = [command for command in step["commands"] if "pytest" in command]
+
+    assert step["grade"] == "Blocking"
+    assert len(pytest_commands) == 1
+    assert "tests/diffusion/attention/test_ulysses_uaa.py" in pytest_commands[0]
+    assert "tests/diffusion/attention/test_attention_sp.py" in pytest_commands[0]
+    assert all(f"core_model and rocm and MI325 and {cards}" in command for command in pytest_commands)
+
+    argv = split(pytest_commands[0])
+    assert argv[:4] == ["timeout", "--signal=TERM", "--kill-after=2m", "20m"]
+    assert step["timeout_in_minutes"] == 25
+    assert "--durations=20" in argv
+
+
+@pytest.mark.parametrize(
+    ("label", "cards"),
+    [
+        ("Diffusion · Distributed Test · 2-GPU", "cards_2"),
+        ("Diffusion · Distributed & Attention Test · 4-GPU", "cards_4"),
+    ],
+)
+def test_cuda_distributed_lanes_cover_both_attention_files_within_the_job_budget(label: str, cards: str) -> None:
+    step = _find_step(label, CUDA_READY_PIPELINE)
+    argv = [split(command) for command in step["commands"] if "pytest" in split(command)]
+
+    paths = {arg for command in argv for arg in command if arg.startswith("tests/")}
+    assert paths == {
+        "tests/diffusion/distributed",
+        "tests/diffusion/attention/test_ulysses_uaa.py",
+        "tests/diffusion/attention/test_attention_sp.py",
+    }
+    assert step["mirror_hardwares"] == f"l4_{cards.removeprefix('cards_')}"
+    for command in argv:
+        assert command[command.index("-m") + 1] == f"core_model and cuda and L4 and {cards}"
+        assert command[command.index("--run-level") + 1] == "core_model"
+    command_budget = sum(int(command[1].removesuffix("m")) for command in argv)
+    assert step["timeout_in_minutes"] >= command_budget + 5
+
+
 def test_qwen3_tts_base_preserves_advanced_model_arguments() -> None:
     step = _find_step("Qwen3-TTS Base E2E Test")
     commands = step["commands"]
@@ -630,7 +695,6 @@ def test_diffusion_cpu_suite_shard_contract(pipeline_path: Path) -> None:
     assert argv[:3] == ["pytest", "-sv", "tests/diffusion"]
     assert argv[argv.index("-m") + 1] == DIFFUSION_CPU_MARKERS
     assert "--ignore=tests/diffusion/cache/test_teacache_extractors.py" in argv
-    assert "--ignore=tests/diffusion/models/pi05/test_pi05_units.py" in argv
     assert [arg.removeprefix("--deselect=") for arg in argv if arg.startswith("--deselect=")] == (
         DIFFUSION_SLOW_CPU_NODES
     )
@@ -821,7 +885,9 @@ def test_amd_template_supplies_a_server_verified_aiter_artifact_source() -> None
 
     assert template.count("VLLM_OMNI_AITER_MHA_TRUSTED_COMMIT") == 2
     assert "VLLM_AITER_MHA_TRUSTED_COMMIT=$(git cat-file -p HEAD | sed -n 's/^parent //p' | head -n 1)" in bootstrap
-    assert "VLLM_AITER_MHA_TRUSTED_COMMIT=$(git merge-base origin/main HEAD)" in bootstrap
+    assert "VLLM_AITER_MHA_TRUSTED_COMMIT=$DIFF_BASE" in bootstrap
+    assert bootstrap.count("git merge-base origin/main HEAD") == 1
+    assert '-D vllm_merge_base_commit="$DIFF_BASE"' in bootstrap
     assert '-D vllm_aiter_mha_trusted_commit="$VLLM_AITER_MHA_TRUSTED_COMMIT"' in bootstrap
 
 
@@ -830,9 +896,9 @@ def test_weekly_reliability_is_distinct_from_nightly() -> None:
     nightly = AMD_NIGHTLY_PIPELINE.read_text(encoding="utf-8")
     group = weekly["steps"][0]
     jobs = {
-        "Reliability Test · qwen3-omni": ("mi300_2", "cards_2", "test_reliability_qwen3_omni.py"),
-        "Reliability Test · wan22": ("mi300_1", "cards_1", "test_reliability_wan22.py"),
-        "Reliability Test · hunyuan-image": ("mi300_4", "cards_4", "test_reliability_hunyuan_image.py"),
+        "Reliability Test · qwen3-omni": ("mi300_2", "cards_2", "tests/dfx/reliability/test_qwen3_omni.py"),
+        "Reliability Test · wan22": ("mi300_1", "cards_1", "tests/dfx/reliability/test_wan22.py"),
+        "Reliability Test · hunyuan-image": ("mi300_4", "cards_4", "tests/dfx/reliability/test_hunyuan_image.py"),
         "Reliability Test · Invalid parameters · MI300 · 2-GPU": (
             "mi300_2",
             "cards_2",

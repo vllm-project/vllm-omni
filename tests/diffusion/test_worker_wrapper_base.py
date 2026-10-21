@@ -319,7 +319,11 @@ class TestWorkerWrapperBaseDelegation:
             kv_transfer_manager=None if native_kv else kv_manager,
             _kv_transfer_manager=kv_manager,
         )
-        worker.lora_manager = object()
+        lora_close = mocker.Mock(side_effect=lambda: events.append("lora"))
+        lora_weights = torch.ones(1)
+        lora_weights_ref = weakref.ref(lora_weights)
+        worker.lora_manager = SimpleNamespace(close=lora_close, pipeline=SimpleNamespace(weights=lora_weights))
+        del lora_weights
         worker.profiler = object()
         worker._sleep_saved_buffers = {"buffer": object()}
         worker._step_lora_state = {"request": (None, 1.0)}
@@ -338,6 +342,7 @@ class TestWorkerWrapperBaseDelegation:
             def release_pools(self):
                 assert worker.model_runner is None
                 assert worker.lora_manager is None
+                assert lora_weights_ref() is None
                 assert worker.profiler is None
                 assert worker._sleep_saved_buffers == {}
                 assert worker._step_lora_state == {}
@@ -385,6 +390,7 @@ class TestWorkerWrapperBaseDelegation:
         worker.shutdown()
 
         assert events == [
+            "lora",
             "offload",
             "kv",
             "connector",
@@ -399,6 +405,7 @@ class TestWorkerWrapperBaseDelegation:
         assert allocator.allocator_and_pools == {}
         assert not worker._owns_sleep_pool
         kv_manager.close.assert_called_once_with()
+        lora_close.assert_called_once_with()
         synchronize.assert_called_once_with()
         assert collect.call_count == 2
 
@@ -427,7 +434,11 @@ class TestWorkerWrapperBaseDelegation:
             assert engine_ref() is None
             events.append("pools")
 
-        allocator = SimpleNamespace(get_current_usage=lambda: 0, release_pools=release_pools)
+        allocator = SimpleNamespace(
+            pointer_to_data={},
+            get_current_usage=lambda: 0,
+            release_pools=release_pools,
+        )
         mocker.patch(
             "vllm_omni.diffusion.worker.diffusion_worker._get_cumem_allocator_class",
             return_value=SimpleNamespace(get_instance=lambda: allocator),
@@ -489,7 +500,8 @@ class TestWorkerWrapperBaseDelegation:
         worker.model_runner = SimpleNamespace(
             pipeline=pipeline, offload_backend=offload_backend, kv_transfer_manager=None
         )
-        worker.lora_manager = SimpleNamespace(pipeline=pipeline)
+        lora_close = mocker.Mock()
+        worker.lora_manager = SimpleNamespace(pipeline=pipeline, close=lora_close)
         worker._sleep_saved_buffers = {"buffer": weights}
         del weights, pipeline
 
@@ -500,6 +512,7 @@ class TestWorkerWrapperBaseDelegation:
         assert worker.lora_manager is None
         assert worker._sleep_saved_buffers == {}
         assert weights_ref() is None
+        lora_close.assert_called_once_with()
 
     @pytest.mark.parametrize("owns_pool", [False, True])
     @pytest.mark.parametrize("cleanup_fails", [False, True])

@@ -195,7 +195,9 @@ def test_last_pp_rank_orchestration_and_kv_resolver(monkeypatch, needs_history) 
     runner.sample.side_effect = lambda *_: sampler_out if sampling_active is needs_history else pytest.fail()
     logprobs_mock = MagicMock(side_effect=lambda *_: pytest.fail("inside ctx") if sampling_active else {})
     runner.prompt_logprobs_worker = PromptLogprobsWorker(1, torch.device("cpu"), logprobs_mode="raw_logits")
-    runner.prompt_logprobs_worker.add_request("req", 0, SamplingParams(prompt_logprob_token_ids=[1, 0]))
+    runner.prompt_logprobs_worker.add_request(
+        "req", 0, SamplingParams(prompt_logprob_token_ids=np.array([[1, 0], [1, 0]]))
+    )
     runner.prompt_logprobs_worker.compute_prompt_logprobs = logprobs_mock
     runner.postprocess_sampled, connector_output = MagicMock(), object()
 
@@ -236,7 +238,9 @@ def test_chunked_fixed_token_scores_are_copied_from_cuda() -> None:
     device = torch.device("cuda")
     hidden = torch.tensor([[1.0, 2.0, 3.0], [3.0, 1.0, 2.0], [2.0, 3.0, 1.0], [4.0, 5.0, 6.0]], device=device)
     worker = PromptLogprobsWorker(1, device)
-    worker.add_request("req", 0, SamplingParams(prompt_logprob_token_ids=[2, 0], prompt_logprob_start=1))
+    worker.add_request(
+        "req", 0, SamplingParams(prompt_logprob_token_ids=np.array([[2, 0], [2, 0]]), prompt_logprob_start=1)
+    )
     batch = SimpleNamespace(
         req_ids=["req"],
         idx_mapping_np=np.array([0]),

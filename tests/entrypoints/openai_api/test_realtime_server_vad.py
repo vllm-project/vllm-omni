@@ -19,6 +19,7 @@ from vllm_omni.engine.duplex.turn_detection import (
     TurnDetectionConfig,
     TurnDetectionResult,
 )
+from vllm_omni.engine.duplex.vad import SileroStreamingVAD
 from vllm_omni.entrypoints.openai.realtime.connection import (
     SAMPLE_RATE_HZ,
     OpenAIFullDuplexConnection,
@@ -256,6 +257,52 @@ async def test_server_vad_commits_and_creates_response() -> None:
     assert connection.session.input_audio_buffer == bytearray()
     assert connection._turn_detector.reset_count == 1
     assert len(connection.response_creates) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("create_response", [False, True])
+async def test_server_vad_appends_with_real_detector(monkeypatch, create_response: bool) -> None:
+    # Script only acoustic inference; keep the detector and its process API real.
+    monkeypatch.setattr(SileroStreamingVAD, "_score_frame", lambda _self, frame: 0.9 if abs(frame).max() > 0.1 else 0.0)
+    websocket = _FakeWebSocket()
+    connection = _make_connection(websocket)
+    await connection._handle_session_update(
+        _session_update_event(
+            {
+                "type": "server_vad",
+                "prefix_padding_ms": 0,
+                "silence_duration_ms": 64,
+                "create_response": create_response,
+            }
+        )
+    )
+    assert type(connection._turn_detector) is ServerTurnDetector
+
+    speech = b"\x00\x20" * (SAMPLE_RATE_HZ * 96 // 1000)
+    silence = b"\x00\x00" * (SAMPLE_RATE_HZ * 64 // 1000)
+    for _ in range(2):
+        await connection._handle_audio_append(_audio_event(speech))
+        await connection._handle_audio_append(_audio_event(silence))
+
+    events = [json.loads(message) for message in websocket.messages]
+    assert [event["type"] for event in events] == ["session.updated"] + [
+        "input_audio_buffer.speech_started",
+        "input_audio_buffer.speech_stopped",
+        "input_audio_buffer.committed",
+        "conversation.item.added",
+        "conversation.item.done",
+    ] * 2
+    starts = [event for event in events if event["type"] == "input_audio_buffer.speech_started"]
+    stops = [event for event in events if event["type"] == "input_audio_buffer.speech_stopped"]
+    commits = [event for event in events if event["type"] == "input_audio_buffer.committed"]
+    assert [event["audio_start_ms"] for event in starts] == [0, 160]
+    assert [event["audio_end_ms"] for event in stops] == [160, 320]
+    assert starts[0]["item_id"] != starts[1]["item_id"]
+    for start, stop, commit, item in zip(starts, stops, commits, connection.session.items, strict=True):
+        assert start["item_id"] == stop["item_id"] == commit["item_id"] == item.id
+        assert base64.b64decode(item.content[0].audio) == speech + silence
+    assert not connection.session.input_audio_buffer
+    assert len(connection.response_creates) == (2 if create_response else 0)
 
 
 @pytest.mark.asyncio

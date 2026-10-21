@@ -13,6 +13,7 @@ the concrete class the same way upstream ``renderer_from_config`` does.
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, cast
 
 from vllm.exceptions import VLLMValidationError
@@ -61,7 +62,18 @@ class OmniRenderer:
         if getattr(renderer.model_config.hf_config, "model_type", None) not in ("qwen3_vl", "qwen3_vl_moe"):
             return
         processor = renderer.get_mm_processor()
-        kwargs = processor.info.ctx.get_merged_mm_kwargs(prompt.get("mm_processor_kwargs") or {}, modality="video")
+        request_kwargs = prompt.get("mm_processor_kwargs") or {}
+        mm_config = processor.info.ctx.model_config.get_multimodal_config()
+        merged_kwargs = mm_config.merge_mm_processor_kwargs(request_kwargs)
+        kwargs = merged_kwargs.get("videos_kwargs", {})
+        # Validate the effective scope before upstream routes flat keys into it;
+        # routing into a non-mapping scope otherwise raises a plain TypeError.
+        if not isinstance(kwargs, Mapping):
+            raise VLLMValidationError(
+                "Video processor videos_kwargs must be a mapping.", parameter="mm_processor_kwargs", value=kwargs
+            )
+        merged_kwargs = processor.info._merge_and_resolve_mm_processor_kwargs(request_kwargs)
+        kwargs = merged_kwargs.get("videos_kwargs", {})
         # Qwen3-VL merges this dict before entering its HF error wrapper.
         # Reject malformed request options here; unrelated TypeErrors still
         # propagate as internal failures rather than being hidden as bad input.

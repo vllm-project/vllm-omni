@@ -62,11 +62,26 @@ def test_client_latency_includes_what_the_server_ttft_leaves_out():
 
     (metric,) = bundle.request_metrics
     assert (metric["ttft_ms"], metric["ttfp_ms"]) == (50.0, 150.0)
-    assert (metric["client_ttft_ms"], metric["client_ttfp_ms"]) == (300.0, 400.0)
+    assert metric["client_ttft_ms"] == 300.0
+    assert metric["response_created_to_first_audio_ms"] == 400.0
+    assert "client_ttfp_ms" not in metric
     assert "prompt preparation" in metric["measurement_origin"]["client_ttft"]
     assert metric["measurement_origin"]["ttft"] == "accepted native-append start"
     assert bundle.session_metrics["client_ttft_ms"]["mean"] == 300.0
-    assert bundle.session_metrics["client_ttfp_ms"]["mean"] == 400.0
+    assert "client_ttfp_ms" not in bundle.session_metrics
+
+
+def test_client_append_ttfp_is_not_mixed_with_created_ttfp():
+    collector = EventCollector()
+    collector.note_client_append({"sent_at_s": 9.6, "event_id": "append-last"})
+    _turn(collector, "r1", 10.0, text_s=0.3, audio_s=0.4)
+
+    bundle = collect_duplex_session_metrics(collector, stream_start=9.0, session_id="s")
+
+    (metric,) = bundle.request_metrics
+    assert metric["client_ttfp_ms"] == 800.0
+    assert metric["response_created_to_first_audio_ms"] == 400.0
+    assert bundle.session_metrics["client_ttfp_ms"]["mean"] == 800.0
 
 
 def test_client_latency_is_absent_for_a_response_without_output():
@@ -111,12 +126,14 @@ def test_report_and_console_expose_the_flat_latency_keys(capsys):
         request_metrics=bundle.request_metrics,
         session_metrics=[bundle.session_metrics],
     )
-    assert report["mean_duplex_client_ttfp_ms"] == 400.0
+    assert "mean_duplex_client_ttfp_ms" not in report
     assert report["mean_duplex_response_ttfp_ms"] == 150.0
+    assert bundle.request_metrics[0]["response_created_to_first_audio_ms"] == 400.0
 
     print_duplex_response_latency_metrics(duplex_response_latency_metrics(bundle.request_metrics))
     printed = capsys.readouterr().out
     assert "Duplex Per-Response Latency" in printed
-    assert "Mean client TTFP (ms):" in printed and "400.00" in printed
+    assert "Mean client TTFT (ms):" in printed and "300.00" in printed
+    assert "Mean client append TTFP" not in printed
     print_duplex_response_latency_metrics({})
     assert capsys.readouterr().out == ""

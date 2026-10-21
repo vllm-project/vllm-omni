@@ -29,6 +29,7 @@ def test_peft_single_adapter_normalizes_scalar_and_list_config(path, scale, mock
     manager = mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.DiffusionLoRAManager")
     worker = object.__new__(DiffusionWorker)
     worker.od_config = OmniDiffusionConfig(lora_backend=LoRABackend.PEFT, lora_path=path, lora_scale=scale)
+    worker.lora_manager = None
     worker.model_runner = Mock()
     worker.model_runner.pipeline.lora_is_fused = False
     worker.device = "cpu"
@@ -43,6 +44,7 @@ def test_dynamic_peft_rejects_multiple_static_adapters(path, scale, mocker):
     manager = mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.DiffusionLoRAManager")
     worker = object.__new__(DiffusionWorker)
     worker.od_config = OmniDiffusionConfig(lora_backend=LoRABackend.PEFT, lora_path=path, lora_scale=scale)
+    worker.lora_manager = None
     worker.model_runner = Mock()
     worker.model_runner.pipeline.lora_is_fused = False
     worker.device = "cpu"
