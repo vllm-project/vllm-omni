@@ -1569,8 +1569,9 @@ def validate_attention_schedule_candidates(model: nn.Module, od_config: "OmniDif
       forward runs the native implementation bound to the baseline, so a candidate must support
       paged KV and match the baseline backend, explicit selection and backend kwargs;
     * KV-cache quantization: ``_init_kv_cache_quantization`` probes the baseline impl only;
-    * SP auto-pad: the pad-time mask probe cannot check each prepared candidate, so a layer in a
-      component that plans auto_pad under SP needs mask-capable candidates;
+    * SP auto-pad: the pad-time mask probe checks only the baseline, so when the model masks SP
+      padding (``mask_sp_padding``), a self-attention layer in a component that plans auto_pad
+      needs mask-capable candidates;
     * ring: the ring path bypasses the backend and the ring runner is bound to the baseline backend
       preference and explicit flag, and ignores backend kwargs, so a candidate carrying skip_softmax
       or differing from the baseline in backend name, explicit selection or backend kwargs cannot be
@@ -1595,7 +1596,9 @@ def validate_attention_schedule_candidates(model: nn.Module, od_config: "OmniDif
         kv_dtype = None
     platform_key = current_omni_platform.device_name
     sp_size = od_config.parallel_config.sequence_parallel_size
-    auto_pad_roots = _sp_auto_pad_roots(model) if sp_size > 1 else ()
+    # Models build the SP padding mask only with mask_sp_padding; otherwise padded tokens are unmasked.
+    masks_sp_padding = sp_size > 1 and od_config.parallel_config.mask_sp_padding
+    auto_pad_roots = _sp_auto_pad_roots(model) if masks_sp_padding else ()
     ring_degree = od_config.parallel_config.ring_degree
     skip_layers = od_config.diffusion_kv_cache_skip_layer_indices
     effective_calibration = resolve_effective_calibration(od_config.diffusion_attention_config, schedule)
@@ -1683,8 +1686,8 @@ def validate_attention_schedule_candidates(model: nn.Module, od_config: "OmniDif
                 raise ValueError(
                     f"attention schedule profile {name!r} selects backend {backend_name} which does not "
                     f"support attention_mask, but this model plans SP auto_pad with sequence_parallel_size="
-                    f"{sp_size} (layer {layer_name!r}). Remove that profile, select a mask-capable backend "
-                    f"for it, or disable auto_pad."
+                    f"{sp_size} and mask_sp_padding=True (layer {layer_name!r}). Remove that profile, select "
+                    f"a mask-capable backend for it, or disable mask_sp_padding."
                 )
             for check in module._schedule_candidate_checks:
                 reason = check(record)

@@ -161,7 +161,8 @@ errors on the job record rather than the creation response.
   Step mode rejects these H3 options regardless of schedule. Non-empty
   default ranges with a `latent_refine` default in `--additional-config`
   fail at startup.
-- Auto-padding sequence parallelism requires mask-capable profiles.
+- Auto-padding sequence parallelism with `mask_sp_padding` enabled requires
+  mask-capable profiles.
   Ring and scheduler-managed paged KV require profiles equivalent to the base
   backend and options. AllGather-KV rejects TRTLLM and sparse RainFusion.
   Configured KV-cache quantization requires dtype support in every candidate.

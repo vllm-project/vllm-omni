@@ -130,6 +130,7 @@ def _make_config(
     kv_dtype: str | None = None,
     sp_size: int = 1,
     ring_degree: int = 1,
+    mask_sp_padding: bool = False,
 ) -> OmniDiffusionConfig:
     return OmniDiffusionConfig(
         diffusion_attention_config=baseline if baseline is not None else AttentionConfig(),
@@ -139,6 +140,7 @@ def _make_config(
             ring_degree=ring_degree,
             allgather_degree=allgather_degree,
             ulysses_degree=sp_size,
+            mask_sp_padding=mask_sp_padding,
         ),
         diffusion_kv_cache_dtype=kv_dtype,
         diffusion_kv_max_rows_per_request=64 if kv_mode is layer_mod.DiffusionKVCacheMode.PAGED_SCHEDULER else None,
@@ -342,11 +344,28 @@ def test_startup_validation_rejects_auto_pad_incompatible_candidate(attention_en
     attention_env.monkeypatch.setattr(
         _fake_backend("BLOCK_SPARSE"), "supports_attention_mask", staticmethod(lambda spec=None: False)
     )
-    config = _make_config(schedule=schedule, sp_size=2)
+    config = _make_config(schedule=schedule, sp_size=2, mask_sp_padding=True)
     layer = attention_env.build(config)
 
     with pytest.raises(ValueError, match=r"profile 'nomask'.*attention_mask"):
         layer_mod.validate_attention_schedule_candidates(_pipeline(layer, sp_plan=_flat_auto_pad_plan()), config)
+
+
+def test_startup_validation_accepts_mask_free_candidate_when_sp_padding_is_unmasked(attention_env):
+    """Without mask_sp_padding the model passes no padding mask, so the candidate needs no mask support."""
+    schedule = AttentionScheduleConfig(
+        profiles={"nomask": AttentionConfig(default=AttentionSpec(backend="BLOCK_SPARSE"))},
+        default=[{"start": 0, "end": None, "profile": "nomask"}],
+    )
+    attention_env.monkeypatch.setattr(
+        _fake_backend("BLOCK_SPARSE"), "supports_attention_mask", staticmethod(lambda spec=None: False)
+    )
+    config = _make_config(schedule=schedule, sp_size=2)
+    layer = attention_env.build(config)
+
+    assert (
+        layer_mod.validate_attention_schedule_candidates(_pipeline(layer, sp_plan=_flat_auto_pad_plan()), config) == 1
+    )
 
 
 def _ring_config(schedule, **kwargs):
