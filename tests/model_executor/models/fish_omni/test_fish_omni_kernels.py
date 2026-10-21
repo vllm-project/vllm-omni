@@ -143,15 +143,21 @@ def test_fused_tower_layer_matches_reference():
     assert (actual.float() - expected.float()).abs().max() < 0.1
 
 
-def _reference_top_k_top_p(logits, temperature, top_k, top_p):
+def _reference_top_k_top_p(logits, temperature, top_k, top_p, top=None):
     """Exact fp32 top-k / top-p sampling (top-p over the whole distribution, rank 0 kept)."""
     scaled = logits.float() / temperature.clamp(min=1e-5).unsqueeze(-1)
-    sorted_logits, sorted_ids = torch.sort(scaled, dim=-1, descending=True)
-    cumulative = torch.softmax(sorted_logits, dim=-1).cumsum(dim=-1)
+    if top is None:
+        sorted_logits, sorted_ids = torch.sort(scaled, dim=-1, descending=True)
+    else:
+        top_values, sorted_ids = top
+        sorted_logits = top_values.float() / temperature.clamp(min=1e-5).unsqueeze(-1)
+    probabilities = torch.exp(sorted_logits - torch.logsumexp(scaled, dim=-1, keepdim=True))
+    cumulative = probabilities.cumsum(dim=-1)
     ranks = torch.arange(sorted_logits.shape[-1], device=logits.device).unsqueeze(0)
     dropped = (cumulative > top_p.unsqueeze(-1)) | (ranks >= top_k.unsqueeze(-1))
     dropped[:, 0] = False
-    probabilities = torch.softmax(sorted_logits.masked_fill(dropped, float("-inf")), dim=-1)
+    probabilities = probabilities.masked_fill(dropped, 0.0)
+    probabilities = probabilities / probabilities.sum(dim=-1, keepdim=True)
     choice = torch.argmax(probabilities / torch.empty_like(probabilities).exponential_(), dim=-1, keepdim=True)
     return torch.gather(sorted_ids, -1, choice).squeeze(-1)
 
@@ -168,12 +174,15 @@ def test_fused_draw_matches_reference_distribution():
     temperature = torch.full((rows,), 0.8, device=device)
     top_k = torch.full((rows,), 30, dtype=torch.int64, device=device)
     top_p = torch.full((rows,), 0.9, device=device)
-    fused = draw_top_k_top_p(logits, temperature, top_k, top_p, torch.rand(rows, 64, device=device), 64)
-    reference = _reference_top_k_top_p(logits, temperature, top_k, top_p)
+    # Reuse the kernel's exact candidates: separate topk(64) and topk(30)
+    # calls may choose different token IDs when BF16 logits tie at the cutoff.
+    top = torch.topk(logits, 64, dim=-1)
+    fused = draw_top_k_top_p(logits, temperature, top_k, top_p, torch.rand(rows, 64, device=device), 64, top=top)
+    reference = _reference_top_k_top_p(logits, temperature, top_k, top_p, top=top)
     fused_hist = torch.bincount(fused, minlength=vocab).float() / rows
     reference_hist = torch.bincount(reference, minlength=vocab).float() / rows
     # Same support, and total variation within sampling noise.
-    assert set(fused.unique().tolist()) <= set(torch.topk(logits[0].float(), 30).indices.tolist())
+    assert (fused.unsqueeze(-1) == top.indices[:, :30]).any(dim=-1).all()
     assert 0.5 * (fused_hist - reference_hist).abs().sum() < 0.05
 
 

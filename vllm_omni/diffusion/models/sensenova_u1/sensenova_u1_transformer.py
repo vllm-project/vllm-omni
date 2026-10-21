@@ -766,13 +766,16 @@ class SenseNovaU1Model(nn.Module):
         past_key_values=None,
         inputs_embeds=None,
         use_cache=None,
+        exist_und: bool | None = None,
+        exist_gen: bool | None = None,
         **kwargs,
     ):
-        if image_gen_indicators is None:
-            exist_und, exist_gen = True, False
-        else:
-            exist_und = (~image_gen_indicators).any().item()
-            exist_gen = image_gen_indicators.any().item()
+        if exist_und is None or exist_gen is None:
+            if image_gen_indicators is None:
+                exist_und, exist_gen = True, False
+            else:
+                exist_und = (~image_gen_indicators).any().item()
+                exist_gen = image_gen_indicators.any().item()
 
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)

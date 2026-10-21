@@ -189,6 +189,10 @@ In sequential mode, each stage must wait for the previous stage to complete enti
      - **Before** `super().schedule()`: `process_pending_chunks(waiting, running)` moves requests waiting for chunks to `WAITING_FOR_CHUNK`, enqueues load tasks for background polling
      - **After** `super().schedule()`: `restore_queues(waiting, running)` restores requests with ready chunks back to waiting/running, `postprocess_scheduler_output(scheduler_output)` attaches cached additional_information, clears chunk-ready flags
    - **put_chunk** `save_async(pooler_output, request)`; **get_chunk** / **get_chunk_for_generation** `load_async(request)`
+   - **OmniGenerationScheduler atomic scheduling contract**: Connector-delivered async chunks are indivisible scheduling units. The generation scheduler must either admit a ready chunk in its entirety or defer it intact with its codes and metadata unchanged. It must never slice a chunk to fit the remaining step token budget, because consumers such as the Qwen3-TTS ICL first chunk validate received chunks against their declared metadata.
+   - A ready chunk larger than the full step budget (`max_num_scheduled_tokens`) can never be admitted in any step. Such a request is terminated through the standard cleanup path with `FINISHED_ERROR` and an ERROR engine output carrying the rejection reason.
+   - Budget-based deferral stops scanning the current queue rather than skipping a ready chunk to pack smaller chunks behind it. This preserves queue order at that admission point, but can reduce step utilization under mixed chunk sizes; it does not guarantee priority for the deferred chunk in the next step.
+   - Non-chunk prompt inputs retain the existing splittable fast-path behavior.
 
 5. **Model Runners**: Handle chunk processing
    - `OmniGPUModelRunner`: Processes chunks in AR stages

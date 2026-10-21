@@ -145,6 +145,7 @@ def scan_package(package_name: str = "vllm_omni") -> dict[str, list[str]]:
 
             # Skip excluded modules (avoid importing vllm during docs build)
             excluded_prefixes = [
+                "vllm_omni.benchmarks",  # api-autonav skips this implicit namespace package
                 "vllm_omni.diffusion.models.qwen_image",
                 "vllm_omni.diffusion.quantization",
                 "vllm_omni.quantization",

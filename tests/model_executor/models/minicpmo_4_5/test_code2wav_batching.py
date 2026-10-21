@@ -210,6 +210,7 @@ def test_cfm_fused_body_default_respects_platform_and_precision(monkeypatch, cud
     from vllm_omni.platforms import current_omni_platform
 
     monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: cuda)
+    monkeypatch.setattr(current_omni_platform, "is_npu", lambda: False)
     monkeypatch.delenv("MINICPMO_CODE2WAV_TF32", raising=False)
     if env is not None:
         monkeypatch.setenv("MINICPMO_CODE2WAV_TF32", env)
@@ -221,6 +222,23 @@ def test_cfm_fused_body_default_respects_platform_and_precision(monkeypatch, cud
     assert model._cfm_graph_config["fused_body"] is expected
     assert model._cfm_graph_config["slot_pool"] is False
     assert model._cfm_graph_config["row_offset_merge"] is False
+
+
+@pytest.mark.parametrize("extra,expected", [({}, True), ({"cfm_fused_body": False}, False)])
+def test_cfm_fused_body_defaults_on_for_npu(monkeypatch, extra, expected):
+    from vllm_omni.platforms import current_omni_platform
+
+    monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: False)
+    monkeypatch.setattr(current_omni_platform, "is_npu", lambda: True)
+    monkeypatch.delenv("MINICPMO_CODE2WAV_TF32", raising=False)
+    # NPU fusion does not use TF32, so the TF32 opt-out must not disable it.
+    monkeypatch.setenv("MINICPMO_CODE2WAV_TF32", "off")
+    config = _config()
+    config.model_config.stage_connector_config["extra"].update(extra)
+
+    model = MiniCPMO45Code2Wav(vllm_config=config)
+
+    assert model._cfm_graph_config["fused_body"] is expected
 
 
 @pytest.mark.parametrize(
@@ -666,6 +684,142 @@ def test_adapter_runs_true_batch_cfg_and_splits_request_caches():
     assert cache0.data_ptr() != cache1.data_ptr()
     assert cache0[0, 0, 0, 0, 0].item() == 10
     assert cache1[0, 0, 0, 0, 0].item() == 20
+
+
+@pytest.mark.parametrize("different_lengths", [False, True])
+@pytest.mark.parametrize("ragged_device", [None, "cuda", "npu"])
+def test_cross_reference_batch_matches_independent_streams(different_lengths, ragged_device):
+    """Different voices share a solve without sharing conditioning or history."""
+    batch = 8
+
+    def prepare_prompt(path):
+        voice = int(Path(path).stem.split("-")[-1])
+        length = 2 + voice % 3 if different_lengths else 2
+        return (
+            torch.arange(5, 5 + length).unsqueeze(0),
+            torch.tensor([length], dtype=torch.int32),
+            torch.tensor([[1.0 if voice % 2 == 0 else -1.0]]),
+            torch.full((1, length + 2, 1), float(voice + 1)),
+            torch.tensor([length + 2], dtype=torch.int32),
+        )
+
+    def make_model():
+        model, token2wav = _model()
+        token2wav._prepare_prompt = prepare_prompt
+        token2wav.flow.decoder.rand_noise = torch.zeros(1, 1, 1024)
+        return model, token2wav
+
+    model, token2wav = make_model()
+    independent = [make_model()[0] for _ in range(batch)]
+    replays = []
+    if ragged_device is not None:
+        # Exercise dispatch on CPU; real CUDA replay/parity is tested separately.
+        def replay(**kwargs):
+            replays.append(kwargs["prompt_lengths"])
+            return None
+
+        model.backend._whole_euler_graph_wrapper = SimpleNamespace(
+            enabled=True, device=SimpleNamespace(type=ragged_device), ragged_body=object(), replay=replay
+        )
+    merged = ragged_device == "cuda"
+    for chunk in range(8):
+        infos = []
+        for row in range(batch):
+            info = _info(f"voice-{row}", chunk, list(range(10 + row, 30 + row)), last_chunk=chunk == 7)
+            info["meta"].update(prompt_cache_id=f"voice-{row}", prompt_wav=f"/fake/voice-{row}.wav")
+            infos.append(info)
+        result = _forward(model, infos)
+        # Only CUDA ragged Whole-Euler opts into cross-reference batching.
+        expected_batch = batch if merged else 1
+        assert token2wav.flow.decoder.estimator.cfg_batches[-2:] == [2 * expected_batch] * 2
+        expected_speakers = (
+            [1.0 if row % 2 == 0 else -1.0 for row in range(batch)] + [0.0] * batch if merged else [-1.0, 0.0]
+        )
+        assert token2wav.flow.decoder.estimator.speaker_order[-1] == expected_speakers
+        assert token2wav.hift.calls[-1] == expected_batch
+        if merged:
+            assert replays[-1] == [4 + row % 3 if different_lengths else 4 for row in range(batch)]
+        for row, (single, info) in enumerate(zip(independent, infos, strict=True)):
+            expected = _forward(single, [info])
+            torch.testing.assert_close(
+                result.multimodal_outputs["model_outputs"][row], expected.multimodal_outputs["model_outputs"][0]
+            )
+            if chunk == 7:
+                continue
+            state = model._states[f"voice-{row}"].token2wav
+            reference = single._states[f"voice-{row}"].token2wav
+            for name, cache in reference.flow_cache.items():
+                torch.testing.assert_close(state.flow_cache[name], cache)
+            for name, cache in reference.hift_cache.items():
+                torch.testing.assert_close(state.hift_cache[name], cache)
+        if chunk:
+            caches = [state.token2wav.flow_cache["estimator_att_cache"] for state in model._states.values()]
+            assert len({cache.data_ptr() for cache in caches}) == len(caches)
+    assert not model._states
+
+
+@pytest.mark.parametrize("backend_kind", ["step_graph", "trt"])
+@pytest.mark.parametrize("different_references", [False, True])
+@pytest.mark.parametrize("mixed_histories", [False, True])
+def test_mixed_requests_preserve_configured_cfm_backend(backend_kind, different_references, mixed_histories):
+    model, _ = _model()
+    independent = [_model()[0] for _ in range(2)]
+
+    def info(row, chunk):
+        result = _info(f"request-{row}", chunk, [10 + row, 20 + row, 30 + row])
+        voice = row if different_references else 0
+        result["meta"].update(prompt_cache_id=f"voice-{voice}", prompt_wav=f"/fake/voice-{voice}.wav")
+        return result
+
+    # Mixed references and mixed cache ages must preserve the configured backend.
+    initial_chunks = [2, 1] if mixed_histories else [1, 1]
+    for row, count in enumerate(initial_chunks):
+        for chunk in range(count):
+            _forward(model, [info(row, chunk)])
+            _forward(independent[row], [info(row, chunk)])
+    adapter = model.backend
+    calls = []
+
+    if backend_kind == "step_graph":
+
+        def replay(inputs, time, cnn, att, cnn_out, att_out, mask=None):
+            calls.append("step_graph")
+            out = adapter.flow.decoder.estimator.blocks_forward_chunk(inputs, time, mask, cnn, att, cnn_out, att_out)
+            return out, cnn_out, att_out
+
+        adapter._cfm_graph_wrapper = SimpleNamespace(enabled=True, replay=replay)
+    else:
+
+        def step(*, x, mu, t, spks, cond, cnn_cache, att_cache):
+            calls.append("trt")
+            stepper, adapter._trt_stepper = adapter._trt_stepper, None
+            try:
+                return adapter._estimator_step(
+                    adapter.flow.decoder.estimator,
+                    x=x,
+                    mu=mu,
+                    time=t,
+                    speakers=spks,
+                    cond=cond,
+                    cnn_cache=cnn_cache,
+                    att_cache=att_cache,
+                )
+            finally:
+                adapter._trt_stepper = stepper
+
+        adapter._trt_stepper = SimpleNamespace(step=step)
+
+    for chunk in range(3):
+        calls.clear()
+        infos = [info(row, chunk + count) for row, count in enumerate(initial_chunks)]
+        result = _forward(model, infos)
+        groups = 2 if different_references or mixed_histories else 1
+        assert calls == [backend_kind] * (groups * adapter.n_timesteps)
+        for row in range(2):
+            expected = _forward(independent[row], [infos[row]])
+            torch.testing.assert_close(
+                result.multimodal_outputs["model_outputs"][row], expected.multimodal_outputs["model_outputs"][0]
+            )
 
 
 def test_relpos_encode_token_budget_leaves_room_for_upsample_and_cache():
@@ -2047,6 +2201,24 @@ def test_tf32_mode_reads_shipped_yaml_key(monkeypatch):
     assert _tf32_mode({}) == "tf32"
 
 
+def test_tf32_mode_null_means_unset_and_typos_raise(monkeypatch):
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_code2wav import _tf32_mode
+
+    monkeypatch.delenv("MINICPMO_CODE2WAV_TF32", raising=False)
+    # An explicit null means "unset": fall through to the alias, then the default.
+    assert _tf32_mode({"token2wav_allow_tf32": None}) == "tf32"
+    assert _tf32_mode({"token2wav_allow_tf32": None, "code2wav_allow_tf32": False}) == "off"
+    assert _tf32_mode({"token2wav_allow_tf32": "off"}) == "off"
+    assert _tf32_mode({"token2wav_allow_tf32": "  TF32  "}) == "tf32"
+    with pytest.raises(ValueError, match="allow_tf32"):
+        _tf32_mode({"token2wav_allow_tf32": "maybe"})
+    with pytest.raises(ValueError, match="allow_tf32"):
+        _tf32_mode({"token2wav_allow_tf32": 2})
+    monkeypatch.setenv("MINICPMO_CODE2WAV_TF32", "maybe")
+    with pytest.raises(ValueError, match="allow_tf32"):
+        _tf32_mode({})
+
+
 def _encoder_dispatch_backend(eager, precaptured, dynamic):
     return SimpleNamespace(
         flow=SimpleNamespace(training=False),
@@ -2258,3 +2430,32 @@ def test_eager_ragged_euler_reuses_uploaded_lengths():
     assert len(seen) == adapter.n_timesteps
     assert all(lengths is seen[0] for lengths in seen)
     torch.testing.assert_close(seen[0], torch.tensor([3, 1, 3, 1]))
+
+
+def test_estimator_step_preserves_precomputed_time_embedding(monkeypatch):
+    adapter = BatchedToken2Wav(_FakeToken2Wav())
+    supplied = torch.full((2, 1, 1), 19.0)
+    seen = []
+
+    class RecordingGraph:
+        def replay(self, estimator_input, time_embedding, cnn_cache, att_cache, cnn_out, att_out, attn_mask=None):
+            seen.append(time_embedding)
+            return estimator_input[:, :1], cnn_out, att_out
+
+    def unexpected_embedding(*args):
+        raise AssertionError("precomputed embedding must not be recomputed")
+
+    monkeypatch.setattr(adapter, "_time_embedding", unexpected_embedding)
+    adapter._cfm_graph_wrapper = RecordingGraph()
+    adapter._estimator_step(
+        adapter.flow.decoder.estimator,
+        x=torch.ones((2, 1, 2)),
+        mu=torch.ones((2, 1, 2)),
+        time=torch.zeros(2),
+        speakers=torch.ones((2, 1)),
+        cond=torch.zeros((2, 1, 2)),
+        cnn_cache=None,
+        att_cache=None,
+        time_embedding=supplied,
+    )
+    assert seen[0] is supplied
