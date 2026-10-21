@@ -1,39 +1,13 @@
-# LingBot World realtime sessions
+# LingBot World
 
-The **LingBot World (Realtime)** node prepares a first image and settings. Its interaction panel starts one video session, plays fragmented MP4 as it arrives, and sends keyboard camera controls without re-running the workflow. The model runs in vLLM-Omni; ComfyUI can run on CPU.
+LingBot World runs in vLLM-Omni; ComfyUI only prepares requests and draws the plan, so it can run on CPU. There are two ways to use it:
 
-## Workflow layouts
-
-These are screenshots of the actual ComfyUI graphs using the official [LingBot-World v2 example 03 image](https://github.com/Robbyant/lingbot-world-v2/blob/1895d300d8ac936401689b26389f51cbd36530eb/examples/03/image.jpg). Image source: Robbyant/LingBot-World v2, commit `1895d300d8ac936401689b26389f51cbd36530eb`. They show node connections, not generated video results.
-
-### Keyboard realtime
-
-`Load Image → LingBot World (Realtime)`
-
-![LingBot keyboard realtime workflow](images/comfyui-lingbot-realtime.jpg)
-
-### Realtime JSON
-
-`Load Image → LingBot World (Realtime JSON)`
-
-![LingBot realtime JSON workflow](images/comfyui-lingbot-realtime-json.jpg)
-
-### Offline JSON
-
-`Load Image → LingBot World (Offline JSON) → Save Video`
-
-![LingBot offline JSON workflow](images/comfyui-lingbot-offline-json.jpg)
-
-### Recreate the layouts
-
-1. Install this app and restart ComfyUI. Drag the corresponding LingBot workflow JSON from `example_workflows` onto the canvas, or open it through the workflow menu. Import the JSON workflow, not the documentation JPEG.
-2. Download the [upstream first frame](https://raw.githubusercontent.com/Robbyant/lingbot-world-v2/1895d300d8ac936401689b26389f51cbd36530eb/examples/03/image.jpg) as `lingbot-upstream-03.jpg` and upload it in **Load Image**, or select your own first frame. To build the graph manually, double-click an empty canvas area to search for each node. Connect Load Image's `IMAGE` output to the LingBot node's `image` input; for Offline JSON, connect its `VIDEO` output to Save Video's `video` input.
-3. Enter the Omni address and prompt. For the JSON variants, paste the trajectory into `camera_json` and match `num_frames` to its chunk count. The supplied JSON examples use 33 frames.
-4. Drag node headers to arrange them, resize the nodes to expose their fields, and zoom until all connections fit. Capture the canvas region with a screenshot tool. Creating a structure screenshot does not require running the workflow or loading a model; save the workflow JSON separately to preserve an editable graph. The shot workflow needs no screenshot: it is a chain of **Shot** nodes whose own bodies draw the timeline and the lane editor.
+- **Live**: the **LingBot World (Realtime)** node opens a window that plays the stream while you steer with W/A/S/D and I/J/K/L, change the prompt mid-run, and save the take.
+- **Scripted**: **LingBot World Shot** nodes chain a sequence, each with a camera lane editor inside the node, **LingBot World Render** turns the chain into one video, and **LingBot World Visualizer** draws the plan.
 
 ## Install and serve
 
-Install the parent `ComfyUI-vLLM-Omni` folder following its [README](../README.md). All LingBot node IDs use the `VLLMOmni` prefix, including `VLLMOmniLingBotWorld` for keyboard realtime. When migrating from the earlier standalone plugin, use the bundled workflows or replace its old keyboard node with this one.
+Install the parent `ComfyUI-vLLM-Omni` folder following its [README](../README.md). The lane editor and the visualizer are DOM widgets, so they need a ComfyUI build with `addDOMWidget` (2024 or later).
 
 Start the backend:
 
@@ -43,118 +17,57 @@ vllm serve robbyant/lingbot-world-v2-14b-causal-fast-diffusers \
   --host 127.0.0.1 --port 8000
 ```
 
-This is the repository's single-GPU configuration; streaming capability alone does not guarantee realtime generation speed. Multi-GPU and performance tuning belong to the backend deployment, not the ComfyUI process. See the [model recipe](../../../recipes/Robbyant/LingBot-World-2.0.md).
-
-Start ComfyUI in its own environment:
+This is the repository's single-GPU configuration; streaming capability alone does not guarantee realtime speed. Start ComfyUI in its own environment:
 
 ```bash
 python main.py --cpu --listen 127.0.0.1 --port 8188
 ```
 
-Do not add `--disable-api-nodes`: its restrictive media policy blocks the `blob:` URLs required by the player. A Chromium browser with H.264 Media Source Extensions is the initial validation target.
+Do not add `--disable-api-nodes`: its media policy blocks the `blob:` URLs the player needs. A Chromium browser with H.264 Media Source Extensions is the validation target.
 
-## Open and control a world
+## Live: steer a world
 
-1. Import [vLLM-Omni LingBot World.json](../example_workflows/vLLM-Omni%20LingBot%20World.json), also available in the app's workflow templates.
-2. Select one RGB image in **Load Image** and set the initial prompt. The first image is resized to the requested output dimensions.
-3. Keep `width=832`, `height=480` to match the default deploy configuration. Frame count must be `9 + 12k`; the default 129 frames at 16 FPS is about eight seconds.
-4. Run the workflow to prepare the request. Run does not start model inference.
-5. Click **Open interaction panel** below the seed, then **Start**. The window shows the stream in a 16:9 player; click the video once to drive it. After the first chunk arrives: **WASD** moves and **IJKL** turns, and the keycaps in the legend light up while a key is held.
-6. **Apply** under the prompt sends a new prompt to the running session; it is enabled once the first chunk has arrived. Camera speed defaults to **0.5×**, adjustable from 0.1× to 2×. Releasing the keys, leaving the video, or hiding the page releases movement.
-7. **Save** stops the session and downloads the take as an MP4. **Stop** only cancels generation, and closing the window, pressing Escape, deleting the node, or replacing the workflow stops it too. Restart creates a new world.
+Import [vLLM-Omni LingBot World.json](../example_workflows/vLLM-Omni%20LingBot%20World.json).
 
-Changing node parameters requires another workflow Run. Only one panel is active per browser page; keep this node in the root workflow, outside subgraphs. The keyboard interaction node has no `VIDEO` output; use Offline JSON below for downstream nodes.
+1. Select one RGB image in **Load Image** and set the initial prompt. The image is resized to the requested output size.
+2. Keep `width=832`, `height=480` to match the deploy configuration. The frame count must be `9 + 12k`; the default 129 frames at 16 FPS is about eight seconds.
+3. Run the workflow to prepare the request. Run does not start inference.
+4. Click **Open interaction panel** below the seed, then **Start**. Click the video once to drive it: **WASD** moves, **IJKL** turns, and the keycaps light up while held.
+5. **Apply** sends a new prompt to the running session; it is enabled once the first chunk arrives. Camera speed is 0.5x by default, adjustable from 0.1x to 2x. Releasing the keys, leaving the video, or hiding the page releases movement.
+6. **Save** stops the session and downloads the take as an MP4. **Stop** only cancels. Closing the window, pressing Escape, deleting the node, or replacing the workflow stops it too.
 
-`stationary` and `forward` modes use a fixed per-chunk camera script. `keyboard` mode omits that script, allowing live camera updates instead. It uses the structural camera interface documented in the [streaming video protocol](../../../examples/online_serving/streaming_video_generation/README.md#websocket-protocol).
+Changing node parameters requires another Run. Keep this node in the root workflow, outside subgraphs. Only one panel is active per browser page.
 
-## JSON camera trajectories
+## Scripted: shots and camera moves
 
-Two additional workflows replay a fixed camera script without keyboard input:
-
-- [Realtime JSON](../example_workflows/vLLM-Omni%20LingBot%20World%20Realtime%20JSON.json): Run to prepare the request, then open the panel and click Start to watch streamed video.
-- [Offline JSON](../example_workflows/vLLM-Omni%20LingBot%20World%20Offline%20JSON.json): Run to generate the entire video and pass its `VIDEO` output to **Save Video**. Here “offline” means non-interactive full-video output; the model still runs on the Omni service with the same stepwise deploy config above.
-
-Paste the movement JSON into `camera_json`, or connect a STRING containing the JSON. The value is the array sent as `extra_params.camera_action_script`, without an outer object:
-
-```json
-[
-  [["w"], ["w"], ["w"]],
-  [["a"], [], []],
-  [[], [], []]
-]
-```
-
-This 33-frame example moves forward in the first chunk, moves left for one latent step in the second, then holds still. There must be exactly `(num_frames - 9) / 12 + 1` chunks, each containing three action lists. Use W/A/S/D for translation and I/J/K/L for rotation; simultaneous keys share a list, and `[]` means no movement. Keys are case-insensitive. Invalid JSON, unsupported keys and mismatched chunk counts are rejected before connecting. The script uses the backend's action scale; the keyboard panel's speed slider does not change it.
-
-Both JSON nodes submit the complete script at session start. They do not schedule wall-clock `session.interaction` events. Realtime connects from the browser; Offline connects from the ComfyUI process, so set its `server_url` to an address reachable from that process. Offline collects all fragmented MP4 chunks until `session.done`, decodes them using the existing video converter and returns one video; a stopped or disconnected session raises an error instead of returning a partial result. The client sends keepalive messages during initialization and waits up to 30 minutes. Full-video decoding holds frames in CPU memory, so start with the 33-frame example.
-
-## Shots, sequences and camera moves
-
-The JSON node above asks you to write one key list per generated chunk, which
-means computing `(num_frames - 9) / 12 + 1` yourself and redoing it whenever the
-frame count changes. The shot nodes take a timeline instead, and draw it.
+Import [vLLM-Omni LingBot World Shots.json](../example_workflows/vLLM-Omni%20LingBot%20World%20Shots.json).
 
 | Node | Takes | Gives |
 | --- | --- | --- |
 | **LingBot World Shot** | a prompt, a length in chunks, an in-node lane editor, an optional `sequence` | `LINGBOT_SEQUENCE` |
 | **LingBot World Render** | a first image, a `sequence`, the server settings | `VIDEO` |
 | **LingBot World Visualizer** | a `sequence` | nothing; it draws the plan |
-| **LingBot Camera Moves** | a moves text | `LINGBOT_MOVES`, an override for one shot |
 
-Chain shots through `sequence`, then feed the last one to **Render** and to
-**Visualizer**. Import
-[vLLM-Omni LingBot World Shots.json](../example_workflows/vLLM-Omni%20LingBot%20World%20Shots.json)
-for a two-shot example. The lane editor and the viewer are DOM widgets, so they
-need a ComfyUI build recent enough to have `addDOMWidget` (any 2024-or-later
-build).
+Chain shots through `sequence` and feed the last one to **Render** and to **Visualizer**.
 
 ### How long a shot is
 
-A LingBot rollout is decoded causally, so its first chunk holds 9 pixel frames
-and every later chunk holds 12. A sequence therefore has to live on that grid:
+A rollout is decoded causally, so its first chunk holds 9 pixel frames and every later chunk holds 12:
 
-- the first shot lasts `9 + 12k` frames (one to `k + 1` chunks);
+- the first shot lasts `9 + 12k` frames;
 - every later shot lasts whole chunks;
-- the whole sequence is `9 + 12k` frames, the same rule the `num_frames` widget
-  of the JSON nodes follows.
+- the whole sequence is `9 + 12k` frames.
 
-The **Shot** node's `chunks` field counts chunks, one chunk being 0.75 seconds
-at 16 FPS, and the node sizes the shot for you.
+The Shot node's `chunks` field counts chunks, one chunk being 0.75 seconds at 16 FPS, and the node sizes the shot for you.
 
 ### The lane editor
 
-Each **Shot** node draws its own camera timeline under the prompt: a frame ruler
-in frames and seconds, the chunk grid as dotted lines, and one row per lane.
+Each Shot node draws its own timeline under the prompt: a frame ruler in frames and seconds, the chunk grid as dotted lines, and one row per lane.
 
-- Click an empty lane to add a move there; it starts snapped to a latent frame
-  and lasts a chunk by default.
-- Drag a move to slide it, drag its right edge to resize it, press Delete or
-  Backspace to remove the selected one.
-- Select a move to edit its lane, direction, start frame and length as numbers
-  in the panel below.
-- Overlapping moves on one lane, a move shorter than one latent frame, an
-  unknown lane or direction, and a move running past the shot are drawn in red
-  with the reason in its tooltip. A move the shot cuts is drawn with a dashed
-  edge and listed under the viewer.
-- Editing the `chunks` field or chaining another shot re-grids the editor
-  immediately.
-
-Connect the optional **LingBot Camera Moves** node to a shot's `moves` socket
-only when the moves have to come from another node: the socket wins over the
-editor, and the **Visualizer** shows a note instead of drawing those moves until
-the workflow runs.
-
-### Camera moves as text
-
-The standalone **Moves** node takes one move per line, `lane value start end`,
-with frames counted from the shot's start and `end` exclusive; `end` on its own
-means the shot's last frame, and `#` starts a comment.
-
-```
-# lane   value    start  end
-move     forward  0      end
-look_h   right    21     end
-```
+- Click an empty lane to add a move; it snaps to a latent frame and lasts a chunk by default.
+- Drag a move to slide it, drag its right edge to resize, press Delete to remove the selected one.
+- Select a move to edit its lane, direction, start frame and length as numbers below.
+- Overlapping moves on one lane, a move shorter than one latent frame, an unknown lane or direction, and a move running past the shot are drawn in red with the reason in the tooltip. A move the shot cuts is drawn with a dashed edge and listed by the visualizer.
 
 | Lane | Values | The server integrates |
 | --- | --- | --- |
@@ -163,85 +76,50 @@ look_h   right    21     end
 | `look_v` | `up`, `down` | 4 degrees of pitch per latent frame |
 | `look_h` | `left`, `right` | 6 degrees of yaw per latent frame |
 
-Values that name their own lane (`forward`, `back`, `up`, `down`) may drop the
-lane word; `left` and `right` need it, because they can be a strafe or a look.
-There is no speed setting: how far the camera travels is how long the move
-lasts.
+There is no speed setting: how far the camera travels is how long the move lasts. The vocabulary has no vertical translation and no absolute pose, so a crane shot or an exact camera path cannot be expressed.
 
 ### What renders
 
-**Render** runs one session for the whole sequence. The first shot's prompt
-starts it, and every later shot's prompt goes out as an interaction as soon as
-the chunk before its boundary has been generated, so it takes effect exactly at
-the boundary. This is a prompt change inside one continuous world, not a hard
-scene cut: the backend does not expose its KV-cache reset on this endpoint, so a
-different world means a separate **Render**.
+**Render** runs one session for the whole sequence. The first shot's prompt starts it, and every later prompt goes out as an interaction as soon as the chunk before its boundary has been generated, so it takes effect exactly at the boundary. That is a prompt change inside one continuous world, not a scene cut: the backend does not expose its KV-cache reset here, so a different world means a separate Render.
 
-The compiled script goes into `extra_params.camera_action_script`. For the shot
-layout in the example workflow (4 + 7 + 5 chunks, with a yaw started 21 frames
-in and a pitch up in the third shot) the server integrates:
-
-```
-chunk  0..1   forward
-chunk  2..3   forward + yaw right
-chunk  4..6   forward + strafe left
-chunk  7..10  forward
-chunk 11..12  (shot 3's prompt, no moves)
-chunk 13..15  pitch up
-```
-
-**Visualizer** walks the shot chain you wired and draws it before anything runs:
-the same ruler and chunk grid, one block per shot with its prompt, prompt-switch
-markers where the prompt changes, one row per lane, and a footer with the totals
-and any warnings. While a **Render** of that same chain is executing, a playhead
-crosses the ruler with the frames rendered so far.
-
-The key vocabulary has no vertical translation and no absolute pose, so a crane
-shot or an exact camera path is not expressible here; those need a speed-profile
-script on the backend side.
+**Visualizer** walks the chain you wired and draws it before anything runs: the same ruler and chunk grid, one block per shot with its prompt, prompt-switch markers, one row per lane, a footer with totals and warnings, and a playhead that follows a Render of that same chain.
 
 ## Local and remote connections
 
-The browser connects directly to `server_url`. Use an Omni WebSocket endpoint reachable from the browser's machine. `localhost` and `127.0.0.1` refer to that machine, not the ComfyUI server. HTTPS pages require a `wss://` endpoint.
+The browser connects directly to `server_url`, so use a WebSocket endpoint reachable from the browser's machine. `localhost` and `127.0.0.1` refer to that machine, not the ComfyUI server. HTTPS pages require `wss://`.
 
-For SSH access to a remote machine running both services, forward **8188 and 8000**:
+For SSH access to a machine running both services, forward **8188 and 8000**:
 
 ```bash
 ssh -N -L 8188:127.0.0.1:8188 -L 8000:127.0.0.1:8000 user@server
 ```
 
-Open ComfyUI at `http://127.0.0.1:8188` and keep `server_url=ws://127.0.0.1:8000/v1/realtime/video`.
-
 ## Control and playback contract
 
-The current backend applies `camera.mode=velocity` deltas on the **latent control grid**, not once per output pixel frame. At 16 FPS, 1× means a 0.05-unit translation, 4° pitch or 6° yaw per latent step. The panel scales these values with requested FPS and normalizes diagonal translation. Coordinates remain the backend's local SE3 convention.
+Control changes apply before the next chunk starts, after any playback wait; they cannot change frames already generated or buffered. Camera motion is generative, without a game engine's collision guarantees.
 
-Control changes apply immediately before the next chunk starts, after any playback wait; they cannot change frames already generated or buffered. Camera motion is generative, without a game engine's collision guarantees.
+The player buffers up to one second before starting playback, so the shorter first chunk bridges into the next. Keyboard mode reports the video playhead every 100 ms and asks for a 1.25-second generation window: the backend waits before starting another chunk once generated media is that far ahead, and an in-flight chunk can extend the window by one chunk. Pausing playback therefore stops further generation once the window fills, while controls and Stop stay available.
 
-The player buffers up to one second before automatically starting playback, allowing the shorter first chunk to bridge into the next one. The startup threshold stays below the playback feedback window; complete short clips start without waiting for more data. Native playback controls and Stop override automatic startup. The player sends `session.ping` every 20 seconds during lazy compilation. It leaves coded-frame eviction to the browser, rather than removing a fixed five-second history window that can destroy long-GOP reference frames. The unappended byte queue remains bounded. Keyboard mode reports the video playhead every 100 ms and requests a 1.25-second generation window. The backend waits before starting another chunk when generated media is at least this far ahead; an in-flight chunk can extend the window by one chunk. Pausing playback therefore stops further generation once this bounded window fills, while keyboard controls and Stop remain available. The backend must support `streaming_buffer_seconds` and `session.playback`; older servers need upgrading before using this keyboard client.
-
-Sessions are finite. There is no open-ended generation mode, reconnect-and-resume, live prompt editing or recording output node. Increasing `num_frames` extends one rollout but does not preserve it after completion. Long-session memory, quality and input-to-display latency need real-model validation.
+Sessions are finite. There is no reconnect-and-resume, no live recording node and no open-ended mode; increasing `num_frames` only extends one rollout.
 
 ## CPU checks
-
-From the vLLM-Omni repository, with its test dependencies installed:
 
 ```bash
 pytest tests/e2e/features/comfyui/test_lingbot_world.py \
   tests/e2e/features/comfyui/test_lingbot_moves.py \
+  tests/e2e/features/comfyui/test_lingbot_scene.py \
   -m 'core_model and cpu' --run-level core_model
 ```
 
-The pytest suite uses the existing ComfyUI test shims and mocked client transport. It does not require Node.js, a running service, GPU or model weights. These checks do not establish model speed, image quality or long-session stability.
-
-The standalone frontend regression tests are optional and use Node.js 20+:
+They need neither GPU, model weights nor a running service. The frontend tests are optional and need Node.js 20+:
 
 ```bash
-node --test tests/e2e/features/comfyui/lingbot_player.test.mjs tests/e2e/features/comfyui/lingbot_timeline.test.mjs
+node --test tests/e2e/features/comfyui/lingbot_player.test.mjs \
+  tests/e2e/features/comfyui/lingbot_live.test.mjs \
+  tests/e2e/features/comfyui/lingbot_move_editor.test.mjs \
+  tests/e2e/features/comfyui/lingbot_timeline.test.mjs
 ```
 
-They cover camera key states, keepalive and media buffering, and the visualizer's layout maths, without launching ComfyUI or a browser.
+## Real-model validation
 
-## Real-model validation plan
-
-After CPU checks, start the stepwise service using the command above and import both JSON workflows. Use the same source image, the bundled three-chunk JSON, model checkpoint, 832×480 dimensions, 33 frames, 16 FPS and seed 42 for both runs. Realtime must finish three generation chunks and reach `session.done`; Offline must produce a playable 33-frame video through Save Video, rather than only the final chunk. Inspect the complete forward/left/hold sequence and compare the two decoded videos. No performance or numerical-equivalence claim is made by the CPU tests. These GPU checks remain manual; record the service commit and configuration with the results.
+Start the service above and run both workflows against the attributed [upstream example 03 image](https://github.com/Robbyant/lingbot-world-v2/blob/1895d300d8ac936401689b26389f51cbd36530eb/examples/03/image.jpg). Live must reach `session.done` and show camera motion when keys are held. Render must produce a playable video whose two shots differ in prompt and whose camera follows the lane editor. No speed or quality claim is made by the CPU checks.

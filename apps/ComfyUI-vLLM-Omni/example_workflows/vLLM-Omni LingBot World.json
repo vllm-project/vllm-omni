@@ -69,7 +69,6 @@
         "ws://127.0.0.1:8000/v1/realtime/video",
         "robbyant/lingbot-world-v2-14b-causal-fast-diffusers",
         "A lone tree stands in a calm alpine lake, with snowy mountains and drifting clouds reflected in the water.",
-        "keyboard (camera API required)",
         832,
         480,
         129,

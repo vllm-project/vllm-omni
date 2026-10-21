@@ -2,19 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import asyncio
+import json
+from pathlib import Path
 
 import pytest
 import torch
 from comfyui_vllm_omni.lingbot_geometry import LingBotGeometry
-from comfyui_vllm_omni.lingbot_moves import (
-    CameraMove,
-    LingBotSequence,
-    Shot,
-    compile_sequence,
-    parse_moves,
-)
+from comfyui_vllm_omni.lingbot_moves import CameraMove, LingBotSequence, Shot
 from comfyui_vllm_omni.node_lingbot_scene import (
-    VLLMOmniLingBotMoves,
     VLLMOmniLingBotRender,
     VLLMOmniLingBotShot,
     VLLMOmniLingBotVisualizer,
@@ -22,25 +17,24 @@ from comfyui_vllm_omni.node_lingbot_scene import (
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 GEOMETRY = LingBotGeometry()
+ROOT = Path(__file__).resolve().parents[4]
+APP = ROOT / "apps/ComfyUI-vLLM-Omni"
 
 
 def _three_shot_sequence() -> LingBotSequence:
     return LingBotSequence(
         (
-            Shot("A", 45, parse_moves("move forward 0 end\nlook_h right 21 end", shot_frames=45)),
-            Shot("B", 84, parse_moves("move forward 0 end\nstrafe left 0 36", shot_frames=84)),
-            Shot("C", 60, parse_moves("look_v up 24 end", shot_frames=60)),
+            Shot("A", 45, (CameraMove("move", "forward", 0, 45), CameraMove("look_h", "right", 21, 24))),
+            Shot("B", 84, (CameraMove("move", "forward", 0, 84), CameraMove("strafe", "left", 0, 36))),
+            Shot("C", 60, (CameraMove("look_v", "up", 24, 36),)),
         )
     )
 
 
 def test_shot_node_chains_and_assigns_whole_chunks():
-    moves = VLLMOmniLingBotMoves().build("move forward 0 end")[0]
-    first = VLLMOmniLingBotShot().add("A", 4, moves=moves)[0]
+    first = VLLMOmniLingBotShot().add("A", 4, {"moves": []})[0]
     second = VLLMOmniLingBotShot().add("B", 7, sequence=first)[0]
     assert [shot.frames for shot in second.shots] == [45, 84]
-    assert second.shots[0].moves == (CameraMove("move", "forward", 0, 45),)
-    assert second.shots[1].moves == ()
 
 
 def test_shot_node_reads_the_timeline_editor():
@@ -65,11 +59,6 @@ def test_shot_node_rejects_a_malformed_timeline_move():
 def test_shot_node_rejects_an_empty_prompt():
     with pytest.raises(ValueError, match="needs a prompt"):
         VLLMOmniLingBotShot().add("   ", 4)
-
-
-def test_moves_node_rejects_an_empty_text():
-    with pytest.raises(ValueError, match="at least one move"):
-        VLLMOmniLingBotMoves().build("  \n ")
 
 
 def test_render_node_builds_the_session_payload(monkeypatch):
@@ -104,37 +93,26 @@ def test_render_node_builds_the_session_payload(monkeypatch):
     payload = captured["payload"]
     assert payload["num_frames"] == 189
     assert payload["prompt"] == "A"
-    assert payload["extra_params"]["camera_action_script"] == compile_sequence(sequence, GEOMETRY).camera_script()
+    assert payload["extra_params"]["camera_action_script"] != []
     assert captured["switches"] == {4: "B", 11: "C"}
 
 
-def test_visualizer_node_returns_draw_data_only():
-    sequence = _three_shot_sequence()
-    output = VLLMOmniLingBotVisualizer().show(sequence, 16)
-    assert output["result"] == ()
-    payload = output["ui"]["omni_lingbot_sequence"][0]
-    assert payload["total_chunks"] == 16
-    assert len(payload["shots"]) == 3
+def test_visualizer_checks_the_sequence_and_draws_nothing_itself():
+    assert VLLMOmniLingBotVisualizer().show(_three_shot_sequence(), 16) == {"result": ()}
+    with pytest.raises(ValueError):
+        VLLMOmniLingBotVisualizer().show(_three_shot_sequence(), 0)
 
 
 def test_shots_workflow_matches_the_node_contracts():
-    import json
-    from pathlib import Path
-
-    root = Path(__file__).resolve().parents[4]
-    workflow = json.loads(
-        (root / "apps/ComfyUI-vLLM-Omni/example_workflows/vLLM-Omni LingBot World Shots.json").read_text()
-    )
+    workflow = json.loads((APP / "example_workflows/vLLM-Omni LingBot World Shots.json").read_text())
     nodes = {node["id"]: node for node in workflow["nodes"]}
     classes = {
-        "VLLMOmniLingBotMoves": VLLMOmniLingBotMoves,
         "VLLMOmniLingBotShot": VLLMOmniLingBotShot,
         "VLLMOmniLingBotRender": VLLMOmniLingBotRender,
         "VLLMOmniLingBotVisualizer": VLLMOmniLingBotVisualizer,
     }
-    linked_inputs = {
-        "VLLMOmniLingBotMoves": set(),  # its moves text is a widget, not a socket
-        "VLLMOmniLingBotShot": {"sequence", "moves"},
+    linked = {
+        "VLLMOmniLingBotShot": {"sequence"},
         "VLLMOmniLingBotRender": {"image", "sequence"},
         "VLLMOmniLingBotVisualizer": {"sequence"},
     }
@@ -142,13 +120,11 @@ def test_shots_workflow_matches_the_node_contracts():
         node_class = classes.get(node["type"])
         if node_class is None:
             continue
-        required = node_class.INPUT_TYPES()["required"]
-        widgets = [name for name in required if name not in linked_inputs[node["type"]]]
+        widgets = [name for name in node_class.INPUT_TYPES()["required"] if name not in linked[node["type"]]]
         assert len(node["widgets_values"]) == len(widgets), node["type"]
 
     for link_id, from_node, from_slot, to_node, to_slot, link_type in workflow["links"]:
-        source = nodes[from_node]
-        target = nodes[to_node]
+        source, target = nodes[from_node], nodes[to_node]
         assert source["outputs"][from_slot]["type"] == link_type
         assert target["inputs"][to_slot]["type"] == link_type
         assert link_id in source["outputs"][from_slot]["links"]

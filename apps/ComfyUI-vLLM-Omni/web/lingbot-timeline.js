@@ -4,10 +4,8 @@
 /**
  * @file In-node timeline for `VLLMOmniLingBotVisualizer` ("LingBot World Visualizer").
  *
- * The Python node renders nothing; it returns
- * `{"ui": {"omni_lingbot_sequence": [payload]}}`. This module draws the plan
- * *inside* the node, like ComfyUI-Reactor's timeline viewer does for its
- * segments: a frame ruler, one block per shot, the prompt switch on every shot
+ * The Python node only checks the sequence; this module draws it *inside* the
+ * node: a frame ruler, one block per shot, the prompt switch on every shot
  * boundary, one row per camera lane with its move bars, and a footer with the
  * totals and warnings.
  *
@@ -16,9 +14,7 @@
  * `VLLMOmniLingBotShot` nodes (each links to the previous shot through its own
  * `sequence` input) and collects each shot's `prompt`, `chunks` and
  * `timeline.moves`. Editing any of those widgets, or resizing the node,
- * redraws. Only when the graph cannot be walked (the sequence comes from a
- * node this file does not know) does it fall back to the last run's payload in
- * `app.nodeOutputs[String(node.id)].omni_lingbot_sequence[0]`.
+ * redraws. A chain it cannot read draws nothing and says so.
  *
  * The visual language and interaction model follow ComfyUI-Reactor's
  * timeline (Apache-2.0): a ruler over a shot track, thin chunk lines, lane
@@ -106,8 +102,6 @@ function readMove(raw) {
   };
 }
 
-const overrideWarning = (index) =>
-  `Shot ${index}: its camera moves come from the connected Moves node; run the workflow to draw them.`;
 const cutWarning = (index, lane, frames) =>
   `Shot ${index}: the ${lane} move is cut to ${frames} frames at the shot's end.`;
 const widenWarning = (index, lane, temporalScale) =>
@@ -203,7 +197,6 @@ export function layoutSequence(description) {
       derived.push({ shot: index, message });
       if (!problems.includes(message)) problems.push(message);
     };
-    if (raw.movesOverridden) note(overrideWarning(index));
 
     for (const rawMove of asList(raw.moves)) {
       const move = readMove(rawMove);
@@ -287,23 +280,7 @@ export function layoutSequence(description) {
       prompt: shot.prompt,
     }));
 
-  // A payload may carry warnings of its own; keep them after the ones the
-  // layout found, without repeating a message the layout already derived.
-  const warnings = [];
-  const seen = new Set();
-  for (const entry of derived) {
-    if (seen.has(entry.message)) continue;
-    seen.add(entry.message);
-    warnings.push(entry.message);
-  }
-  for (const message of asList(source.warnings)) {
-    if (typeof message !== "string" || seen.has(message)) continue;
-    seen.add(message);
-    warnings.push(message);
-    const match = /^Shot (\d+):/.exec(message);
-    const shot = match ? shots[Number(match[1])] : null;
-    if (shot && !shot.problems.includes(message)) shot.problems.push(message);
-  }
+  const warnings = [...new Set(derived.map((entry) => entry.message))];
 
   const { step, ticks } = buildTicks(totalFrames, fps);
 
@@ -397,14 +374,6 @@ function timelineMoves(shotNode) {
  * `sequence`) opens the session and holds `9 + 12 * (chunks - 1)` frames;
  * every later shot is a run of full chunks, `12 * chunks`.
  */
-/** Whether a shot's optional input is connected, without the deprecated `input.link`. */
-function connected(node, name) {
-  const slot = (node?.inputs ?? []).findIndex((input) => input?.name === name);
-  if (slot < 0) return false;
-  if (typeof node.isInputConnected === "function") return node.isInputConnected(slot);
-  return node.inputs[slot].link != null;
-}
-
 function readShotChain(node) {
   const terminal = upstream(node, "sequence");
   if (!terminal) return null;
@@ -421,32 +390,8 @@ function readShotChain(node) {
       prompt: asText(widgetValue(shotNode, "prompt")),
       frames: index === 0 ? FIRST_CHUNK_FRAMES + (chunks - 1) * CHUNK_FRAMES : CHUNK_FRAMES * chunks,
       moves: timelineMoves(shotNode),
-      movesOverridden: connected(shotNode, "moves"),
     };
   });
-}
-
-/** The last run's `ui` payload as a layout description, or null when unusable. */
-function descriptionFromPayload(payload, fps) {
-  if (!payload || typeof payload !== "object") return null;
-  const geometry = payload.geometry && typeof payload.geometry === "object" ? payload.geometry : {};
-  const shots = asList(payload.shots)
-    .map((shot) => ({
-      prompt: asText(shot?.prompt),
-      frames: positiveInt(shot?.frames),
-      moves: asList(shot?.moves),
-    }))
-    .filter((shot) => shot.frames > 0);
-  if (!shots.length) return null;
-  const payloadFps = isFiniteNumber(payload.fps) && payload.fps > 0 ? payload.fps : null;
-  return {
-    shots,
-    firstChunkFrames: positiveInt(geometry.first_chunk_frames),
-    chunkFrames: positiveInt(geometry.chunk_frames),
-    temporalScale: positiveInt(geometry.temporal_scale),
-    fps: fps ?? payloadFps,
-    warnings: asList(payload.warnings).filter((message) => typeof message === "string"),
-  };
 }
 
 /* ------------------------------------------------------------------------- */
@@ -595,20 +540,17 @@ function createTimelineWidget(node, app) {
     const fpsValue = Number(widgetValue(node, "fps"));
     const nodeFps = Number.isFinite(fpsValue) && fpsValue > 0 ? fpsValue : null;
     const live = readShotChain(node);
-    const payload = app?.nodeOutputs?.[String(node.id)]?.omni_lingbot_sequence?.[0] ?? null;
-    const description = live
-      ? { shots: live, firstChunkFrames: FIRST_CHUNK_FRAMES, chunkFrames: CHUNK_FRAMES, fps: nodeFps }
-      : descriptionFromPayload(payload, nodeFps);
     return {
-      description,
-      source: live ? "graph" : description ? "output" : null,
+      description: live
+        ? { shots: live, firstChunkFrames: FIRST_CHUNK_FRAMES, chunkFrames: CHUNK_FRAMES, fps: nodeFps }
+        : null,
       linked: upstream(node, "sequence") !== null,
       width: track.clientWidth || 0,
     };
   };
 
   const stateSignature = (state) =>
-    JSON.stringify([state.description, state.source, state.width, selected]);
+    JSON.stringify([state.description, state.width, selected]);
 
   /** Put one line in the note, with the problems of the selected shot after it. */
   const renderNote = (shot) => {
@@ -715,7 +657,6 @@ function createTimelineWidget(node, app) {
     if (layout.seconds !== null) parts.push(`${layout.seconds.toFixed(2)} s at ${layout.fps} fps`);
     parts.push(`${layout.totalChunks} chunk${layout.totalChunks === 1 ? "" : "s"}`);
     parts.push(`${layout.shots.length} shot${layout.shots.length === 1 ? "" : "s"}`);
-    if (current.source === "output") parts.push("from the last run");
     totals.textContent = parts.join(" · ");
     warningsList.replaceChildren(...layout.warnings.map((message) => el("li", { textContent: message })));
     warningsList.hidden = !layout.warnings.length;

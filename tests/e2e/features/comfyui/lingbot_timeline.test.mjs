@@ -200,9 +200,8 @@ test("moves are reported when a shot cuts them short or they miss a latent frame
         { lane: "look_h", value: "right", start_frame: 0, frames: 2 },
       ] },
     ],
-    warnings: ["A warning the last run carried."],
   });
-  assert.deepEqual(warned.warnings, [cut, widened, "A warning the last run carried."]);
+  assert.deepEqual(warned.warnings, [cut, widened]);
   assert.deepEqual(warned.shots[0].problems, [cut]);
   assert.deepEqual(warned.shots[1].problems, [widened]);
   // The bar shows the length the move is actually cut to, not the widened one.
@@ -210,14 +209,6 @@ test("moves are reported when a shot cuts them short or they miss a latent frame
     [30, 45, 15],
     [45, 47, 2],
   ]);
-  // A payload that repeats a derived warning does not report it twice.
-  const repeated = layoutSequence({
-    shots: [{ prompt: "A move that runs past the shot.", frames: 45, moves: [
-      { lane: "strafe", value: "left", start_frame: 30, frames: 60 },
-    ] }],
-    warnings: [cut],
-  });
-  assert.deepEqual(repeated.warnings, [cut]);
 });
 
 test("missing fields fall back to the 9 + 12k defaults instead of throwing", () => {

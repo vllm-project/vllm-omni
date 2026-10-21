@@ -6,24 +6,15 @@
 A shot is a prompt held for a whole number of chunks. A sequence chains shots
 on one port, and the renderer turns the chain into a single session: the first
 shot's prompt starts it, every later shot's prompt goes out as an interaction
-just before its chunk, and the camera moves compile into the per-chunk
+just before its chunk, and the lane editor's moves compile into the per-chunk
 ``camera_action_script`` the server reads. Nothing here talks to a GPU to build
 a payload, so the whole surface is testable on CPU.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 from .lingbot_geometry import DEFAULT_GEOMETRY
-from .lingbot_moves import (
-    LingBotSequence,
-    Shot,
-    compile_sequence,
-    moves_from_editor,
-    parse_moves,
-    sequence_payload,
-)
+from .lingbot_moves import LingBotSequence, Shot, compile_sequence, moves_from_editor
 from .lingbot_request import (
     DEFAULT_ENDPOINT,
     DEFAULT_MODEL,
@@ -34,52 +25,9 @@ from .lingbot_request import (
 )
 from .utils.api_client import VLLMOmniClient
 
-DEFAULT_MOVES = """\
-# One move per line: lane value start end. Frames count from the shot's start;
-# 'end' means the shot's last frame. Lanes: move (forward/back), strafe
-# (left/right), look_v (up/down), look_h (left/right).
-move    forward  0    end
-look_h  right    24   end
-"""
-
-
-@dataclass(frozen=True)
-class LingBotMoves:
-    """A moves text on the ``LINGBOT_MOVES`` port.
-
-    The text is parsed by the shot that receives it, because a move's ``end``
-    and its bounds are relative to that shot's length.
-    """
-
-    text: str
-
-
-class VLLMOmniLingBotMoves:
-    """Author camera moves once and connect them to one or more shots."""
-
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "moves": ("STRING", {"default": DEFAULT_MOVES, "multiline": True}),
-            }
-        }
-
-    RETURN_TYPES = ("LINGBOT_MOVES",)
-    RETURN_NAMES = ("moves",)
-    FUNCTION = "build"
-    CATEGORY = "vLLM-Omni"
-    DESCRIPTION = "Camera moves for one shot, as one line per move."
-
-    def build(self, moves):
-        text = moves.strip()
-        if not text:
-            raise ValueError("Add at least one move, or leave the moves input unconnected.")
-        return (LingBotMoves(text),)
-
 
 class VLLMOmniLingBotShot:
-    """One prompt held for a number of chunks, with optional camera moves."""
+    """One prompt held for a number of chunks, with its own camera moves."""
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -101,7 +49,6 @@ class VLLMOmniLingBotShot:
             },
             "optional": {
                 "sequence": ("LINGBOT_SEQUENCE",),
-                "moves": ("LINGBOT_MOVES",),
             },
         }
 
@@ -111,19 +58,15 @@ class VLLMOmniLingBotShot:
     CATEGORY = "vLLM-Omni"
     DESCRIPTION = "Append a shot to a LingBot sequence. Feed the last shot to Render and to the Visualizer."
 
-    def add(self, prompt, chunks, timeline=None, sequence=None, moves=None):
+    def add(self, prompt, chunks, timeline=None, sequence=None):
         text = prompt.strip()
         if not text:
             raise ValueError("A shot needs a prompt.")
         shots = sequence.shots if sequence is not None else ()
         index = len(shots)
         frames = DEFAULT_GEOMETRY.shot_frames(index, int(chunks))
-        if moves is not None:
-            # A moves node connected to the socket wins over the lane editor.
-            move_list = parse_moves(moves.text, shot_frames=frames)
-        else:
-            move_list = moves_from_editor(timeline, shot_frames=frames)
-        return (LingBotSequence((*shots, Shot(prompt=text, frames=frames, moves=move_list))),)
+        moves = moves_from_editor(timeline, shot_frames=frames)
+        return (LingBotSequence((*shots, Shot(prompt=text, frames=frames, moves=moves))),)
 
 
 class VLLMOmniLingBotRender:
@@ -178,22 +121,14 @@ class VLLMOmniLingBotRender:
 
 
 class VLLMOmniLingBotVisualizer:
-    """Draw a sequence's shots and camera moves on a frame ruler."""
+    """Check a sequence on the queue; the front-end draws it inside this node."""
 
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
                 "sequence": ("LINGBOT_SEQUENCE",),
-                "fps": (
-                    "INT",
-                    {
-                        "default": 16,
-                        "min": 1,
-                        "max": 60,
-                        "tooltip": "Only sets the ruler's second marks; keep it equal to the Render node's FPS.",
-                    },
-                ),
+                "fps": ("INT", {"default": 16, "min": 1, "max": 60}),
             }
         }
 
@@ -201,11 +136,10 @@ class VLLMOmniLingBotVisualizer:
     OUTPUT_NODE = True
     FUNCTION = "show"
     CATEGORY = "vLLM-Omni"
-    DESCRIPTION = ("Show the shots, moves and chunk grid. It renders nothing; its FPS only labels the ruler.",)
+    DESCRIPTION = "Draws the shots, moves and chunk grid in this node. It renders nothing."
 
     def show(self, sequence, fps):
         if fps <= 0:
             raise ValueError("FPS must be positive.")
-        compiled = compile_sequence(sequence, DEFAULT_GEOMETRY)
-        payload = sequence_payload(sequence, compiled, DEFAULT_GEOMETRY, fps=fps)
-        return {"ui": {"omni_lingbot_sequence": [payload]}, "result": ()}
+        compile_sequence(sequence, DEFAULT_GEOMETRY)
+        return {"result": ()}

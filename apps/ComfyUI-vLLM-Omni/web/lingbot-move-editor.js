@@ -14,8 +14,8 @@
  * A shot's pixel length comes from its own `chunks` widget and its place in the
  * chain: a shot without a `sequence` link opens the sequence and lasts
  * `9 + 12 * (chunks - 1)` frames, while every later shot lasts `12 * chunks`.
- * A linked `moves` socket (a `VLLMOmniLingBotMoves` node) overrides this
- * editor at execution time, so the editor says so.
+ * The Python shot reads this widget's value as its camera moves, so what the
+ * editor draws is exactly what renders.
  *
  * The visual language follows ComfyUI-Reactor's timeline editor
  * (Apache-2.0): the same ruler/lane/block/panel anatomy and pointer-drag
@@ -358,7 +358,6 @@ const STYLE = `
 .lingbot-tl-move.clipped { border-style: dashed; }
 .lingbot-tl-resize { position: absolute; top: 0; right: 0; bottom: 0; width: 7px; cursor: ew-resize; background: linear-gradient(90deg, transparent, color-mix(in srgb, var(--input-text) 22%, transparent)); }
 .lingbot-tl-note { font-size: 11px; opacity: 0.75; }
-.lingbot-tl-override { color: #c98a2e; opacity: 1; }
 .lingbot-tl-panel { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 4px 8px; align-items: center; }
 .lingbot-tl-field { display: flex; align-items: center; gap: 5px; font-size: 11px; min-width: 0; }
 .lingbot-tl-field > span { min-width: 54px; opacity: 0.75; }
@@ -408,10 +407,6 @@ function ensureStyle() {
   document.head.append(style);
 }
 
-function widgetValue(node, name) {
-  return node?.widgets?.find((widget) => widget.name === name)?.value;
-}
-
 /** Whether an optional input is connected. Absent sockets count as unconnected. */
 function inputLinked(node, name) {
   const inputs = Array.isArray(node?.inputs) ? node.inputs : [];
@@ -419,6 +414,10 @@ function inputLinked(node, name) {
   if (slot < 0) return false;
   if (typeof node.isInputConnected === "function") return node.isInputConnected(slot);
   return inputs[slot].link != null;
+}
+
+function widgetValue(node, name) {
+  return node?.widgets?.find((widget) => widget.name === name)?.value;
 }
 
 /** An editor's natural height: its visible rows plus the 6 px gaps between them. */
@@ -520,8 +519,7 @@ function createMoveEditor(node, inputName) {
   const plot = el("div", { className: "lingbot-tl-plot" }, ruler, lanesEl);
   const panel = el("div", { hidden: true });
   const note = el("div", { className: "lingbot-tl-note" });
-  const override = el("div", { className: "lingbot-tl-note lingbot-tl-override", hidden: true });
-  root.append(status, plot, panel, note, override);
+  root.append(status, plot, panel, note);
 
   installDeleteKey();
   root.addEventListener("pointerdown", () => {
@@ -543,7 +541,6 @@ function createMoveEditor(node, inputName) {
         : DEFAULT_GEOMETRY.firstChunkFrames + DEFAULT_GEOMETRY.chunkFrames * (chunkCount - 1),
       geometry,
       width: lanesEl.clientWidth || 0,
-      movesLinked: inputLinked(node, "moves"),
       prompt: String(widgetValue(node, "prompt") ?? ""),
     };
   };
@@ -839,8 +836,6 @@ function createMoveEditor(node, inputName) {
       `${layout.frames} frames · ${(layout.frames / FPS).toFixed(1)} s at ${FPS} FPS · ` +
       `${shot.later ? "later shot" : "opening shot"}`;
     note.textContent = "Click a lane to add a camera move…";
-    override.textContent = "A connected Moves node overrides this editor.";
-    override.hidden = !shot.movesLinked;
 
     drawRuler(layout);
     drawLanes(layout, found);
@@ -871,7 +866,6 @@ function createMoveEditor(node, inputName) {
         shot.later,
         shot.frames,
         shot.prompt,
-        shot.movesLinked,
         shot.width,
       ]);
       if (nextSignature !== signature) {

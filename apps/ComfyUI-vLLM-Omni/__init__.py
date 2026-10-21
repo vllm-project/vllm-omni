@@ -14,13 +14,8 @@ __author__ = """vLLM-Omni Team"""
 __email__ = "vllm-omni@vllm.ai"
 __version__ = "0.0.1"
 
-from .comfyui_vllm_omni.node_lingbot import (
-    VLLMOmniLingBotOfflineJSON,
-    VLLMOmniLingBotRealtimeJSON,
-    VLLMOmniLingBotWorld,
-)
+from .comfyui_vllm_omni.node_lingbot import VLLMOmniLingBotWorld
 from .comfyui_vllm_omni.node_lingbot_scene import (
-    VLLMOmniLingBotMoves,
     VLLMOmniLingBotRender,
     VLLMOmniLingBotShot,
     VLLMOmniLingBotVisualizer,
@@ -49,9 +44,6 @@ from .comfyui_vllm_omni.nodes import (
 # A dictionary that contains all nodes you want to export with their names
 NODE_CLASS_MAPPINGS = {
     "VLLMOmniLingBotWorld": VLLMOmniLingBotWorld,
-    "VLLMOmniLingBotRealtimeJSON": VLLMOmniLingBotRealtimeJSON,
-    "VLLMOmniLingBotOfflineJSON": VLLMOmniLingBotOfflineJSON,
-    "VLLMOmniLingBotMoves": VLLMOmniLingBotMoves,
     "VLLMOmniLingBotShot": VLLMOmniLingBotShot,
     "VLLMOmniLingBotRender": VLLMOmniLingBotRender,
     "VLLMOmniLingBotVisualizer": VLLMOmniLingBotVisualizer,
@@ -80,9 +72,6 @@ NODE_CLASS_MAPPINGS = {
 # A dictionary that contains the friendly/humanly readable titles for the nodes
 NODE_DISPLAY_NAME_MAPPINGS = {
     "VLLMOmniLingBotWorld": "LingBot World (Realtime)",
-    "VLLMOmniLingBotRealtimeJSON": "LingBot World (Realtime JSON)",
-    "VLLMOmniLingBotOfflineJSON": "LingBot World (Offline JSON)",
-    "VLLMOmniLingBotMoves": "LingBot Camera Moves",
     "VLLMOmniLingBotShot": "LingBot World Shot",
     "VLLMOmniLingBotRender": "LingBot World Render",
     "VLLMOmniLingBotVisualizer": "LingBot World Visualizer",

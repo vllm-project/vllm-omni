@@ -3,8 +3,6 @@
 
 """Prepare a finite LingBot session; the browser panel owns its live connection."""
 
-import json
-
 from .lingbot_geometry import DEFAULT_GEOMETRY
 from .lingbot_request import (
     DEFAULT_MODEL,
@@ -13,11 +11,8 @@ from .lingbot_request import (
     validate_endpoint,
     validate_size,
 )
-from .utils.api_client import VLLMOmniClient
 
 MODEL = DEFAULT_MODEL
-MODES = ["keyboard (camera API required)", "stationary", "forward"]
-_ACTION_KEYS = ("w", "a", "s", "d", "i", "j", "k", "l")
 
 
 class VLLMOmniLingBotWorld:
@@ -29,7 +24,6 @@ class VLLMOmniLingBotWorld:
                 "server_url": ("STRING", {"default": "ws://127.0.0.1:8000/v1/realtime/video"}),
                 "model": ("STRING", {"default": MODEL}),
                 "prompt": ("STRING", {"default": "A quiet forest path in daylight.", "multiline": True}),
-                "mode": (MODES, {"default": MODES[0]}),
                 "width": ("INT", {"default": 832, "min": 16, "max": 4096, "step": 16}),
                 "height": ("INT", {"default": 480, "min": 16, "max": 4096, "step": 16}),
                 "num_frames": ("INT", {"default": 129, "min": 9, "max": 4089, "step": 12}),
@@ -44,16 +38,14 @@ class VLLMOmniLingBotWorld:
     CATEGORY = "vLLM-Omni"
     DESCRIPTION = "Run to prepare the scene, then open the interaction panel and click Start."
 
-    def prepare(self, image, server_url, model, prompt, mode, width, height, num_frames, fps, seed, camera_json=None):
+    def prepare(self, image, server_url, model, prompt, width, height, num_frames, fps, seed):
         url = validate_endpoint(server_url)
         if not prompt.strip() or not model.strip():
             raise ValueError("Model and prompt are required.")
-        if mode not in MODES:
-            raise ValueError("Unknown camera mode.")
         validate_size(width, height)
         if fps <= 0:
             raise ValueError("LingBot requires positive FPS.")
-        chunks = DEFAULT_GEOMETRY.chunks_for(num_frames)
+        DEFAULT_GEOMETRY.chunks_for(num_frames)
         payload = {
             "type": "session.start",
             "model": model.strip(),
@@ -68,94 +60,8 @@ class VLLMOmniLingBotWorld:
             "num_inference_steps": 4,
             "extra_params": {"flow_shift": 5.0},
         }
-        if camera_json is not None:
-            payload["extra_params"]["camera_action_script"] = _parse_camera_json(camera_json, num_frames)
-        elif mode != MODES[0]:
-            actions = ["w"] if mode == "forward" else []
-            payload["extra_params"]["camera_action_script"] = [
-                [list(actions) for _ in range(DEFAULT_GEOMETRY.latent_frames_per_chunk)] for _ in range(chunks)
-            ]
         check_start_payload(payload)
         return {
-            "ui": {
-                "omni_lingbot": [
-                    {
-                        "url": url,
-                        "payload": payload,
-                        "keyboard": mode == MODES[0],
-                    }
-                ]
-            },
+            "ui": {"omni_lingbot": [{"url": url, "payload": payload, "keyboard": True}]},
             "result": (),
         }
-
-
-def _parse_camera_json(camera_json: str, num_frames: int) -> list:
-    """Validate the server's per-chunk action format without importing model code."""
-    if not isinstance(camera_json, str):
-        raise ValueError("Camera JSON must be a string containing a JSON array.")
-    if len(camera_json.encode("utf-8")) > 64 * 1024:
-        raise ValueError("Camera JSON must not exceed 64 KiB.")
-    try:
-        script = json.loads(camera_json)
-    except (ValueError, TypeError) as exc:
-        raise ValueError("Camera JSON must be a JSON array of chunks.") from exc
-    chunks = DEFAULT_GEOMETRY.chunks_for(num_frames)
-    if not isinstance(script, list) or len(script) != chunks:
-        raise ValueError(f"Camera JSON requires exactly {chunks} chunks for {num_frames} frames.")
-    for chunk in script:
-        if not isinstance(chunk, list) or len(chunk) != DEFAULT_GEOMETRY.latent_frames_per_chunk:
-            raise ValueError(
-                f"Each camera chunk requires exactly {DEFAULT_GEOMETRY.latent_frames_per_chunk} action lists."
-            )
-        for actions in chunk:
-            if not isinstance(actions, list) or any(
-                not isinstance(key, str) or key.lower() not in _ACTION_KEYS for key in actions
-            ):
-                raise ValueError("Each action list supports only W/A/S/D/I/J/K/L keys.")
-    return script
-
-
-class VLLMOmniLingBotRealtimeJSON(VLLMOmniLingBotWorld):
-    DESCRIPTION = "Prepare a fixed JSON camera trajectory, then open the panel and click Start."
-
-    @classmethod
-    def INPUT_TYPES(cls):
-        inputs = super().INPUT_TYPES()
-        inputs["required"].pop("mode")
-        inputs["required"]["num_frames"][1]["default"] = 33
-        inputs["required"]["camera_json"] = (
-            "STRING",
-            {"default": '[[["w"],["w"],["w"]],[["a"],[],[]],[[],[],[]]]', "multiline": True},
-        )
-        return inputs
-
-    def prepare(self, image, server_url, model, prompt, width, height, num_frames, fps, seed, camera_json):
-        return super().prepare(
-            image,
-            server_url,
-            model,
-            prompt,
-            "stationary",
-            width,
-            height,
-            num_frames,
-            fps,
-            seed,
-            camera_json=camera_json,
-        )
-
-
-class VLLMOmniLingBotOfflineJSON(VLLMOmniLingBotRealtimeJSON):
-    RETURN_TYPES = ("VIDEO",)
-    RETURN_NAMES = ("video",)
-    OUTPUT_NODE = False
-    FUNCTION = "generate"
-    DESCRIPTION = "Run a JSON camera trajectory on Omni and return the complete video for Save Video."
-
-    async def generate(self, image, server_url, model, prompt, width, height, num_frames, fps, seed, camera_json):
-        config = self.prepare(image, server_url, model, prompt, width, height, num_frames, fps, seed, camera_json)[
-            "ui"
-        ]["omni_lingbot"][0]
-        video = await VLLMOmniClient(config["url"]).generate_video_stream(config["payload"])
-        return (video,)
