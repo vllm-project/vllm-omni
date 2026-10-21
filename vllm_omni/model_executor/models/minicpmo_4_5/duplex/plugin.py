@@ -772,9 +772,9 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
         runtime_config: dict[str, object] = {"instructions": config.instructions}
         window_config = self._pop_window_config(extra_body) or MiniCPMO45DuplexWindowConfig()
         runtime_config["duplex_window_config"] = window_config.as_dict()
-        context_caching = getattr(getattr(model_config, "model_config", None), "duplex_context_caching", None)
+        context_caching = getattr(model_config, "duplex_context_caching", None)
         if context_caching is None:
-            stage_conn = getattr(getattr(model_config, "model_config", None), "stage_connector_config", {}) or {}
+            stage_conn = getattr(model_config, "stage_connector_config", {}) or {}
             extra = stage_conn.get("extra", {}) if isinstance(stage_conn, dict) else {}
             context_caching = extra.get("duplex_context_caching", False)
         runtime_config["duplex_context_caching"] = bool(context_caching)

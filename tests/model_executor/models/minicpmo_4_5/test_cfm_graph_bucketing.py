@@ -45,8 +45,13 @@ def test_shared_prompt_attention_cache_is_bit_exact_and_range_copyable():
 def test_whole_euler_arena_rows_from_graph_grid_and_env(monkeypatch):
     """Verify that VLLM_OMNI_CFM_GRAPH_GRID pins graph batches and decouples arena rows."""
     monkeypatch.setenv("VLLM_OMNI_CFM_GRAPH_GRID", "1,4,8,16")
+    block0 = SimpleNamespace(
+        conv=SimpleNamespace(in_channels=2, out_channels=2, block=[None, SimpleNamespace(causal_padding=(4, 0))]),
+        attn=SimpleNamespace(num_heads=2, head_dim=4),
+    )
+    estimator = SimpleNamespace(blocks=[block0], parameters=lambda: iter(()))
     wrapper = WholeEulerCFMGraphWrapper(
-        estimator=torch.nn.Identity(),
+        estimator=estimator,
         micro_batch_size=32,
         arena_rows_from_graph_grid=True,
     )
