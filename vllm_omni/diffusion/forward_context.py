@@ -59,6 +59,8 @@ class ForwardContext:
     # Bound request schedule. None means unbound. () disables. A non-empty tuple
     # selects prepared profiles while a denoise step is published.
     attention_schedule: AttentionSchedule | None = None
+    # Whether the bound schedule is the request's own rather than an inherited service default.
+    attention_schedule_from_request: bool = False
     # Profile selected for (attention_schedule, denoise_step_idx, total_denoise_steps);
     # every scheduled layer in one step reads it instead of selecting again.
     _attention_profile_key: tuple[AttentionSchedule, int, int] | None = None
@@ -306,16 +308,20 @@ def override_paged_kv_adapter(adapter: Any | None):
 
 
 @contextmanager
-def bind_attention_schedule(schedule: AttentionSchedule | None):
-    """Install one request schedule and restore the previous one on any exit."""
+def bind_attention_schedule(schedule: AttentionSchedule | None, *, from_request: bool = False):
+    """Install one request schedule and restore the previous one on any exit.
+
+    ``from_request`` marks ranges the request sent itself; begin_scheduled_denoise checks only those.
+    """
     if _forward_context is None:
         raise RuntimeError("bind_attention_schedule requires an active forward context")
-    previous = _forward_context.attention_schedule
+    previous = _forward_context.attention_schedule, _forward_context.attention_schedule_from_request
     _forward_context.attention_schedule = None if schedule is None else tuple(schedule)
+    _forward_context.attention_schedule_from_request = from_request
     try:
         yield
     finally:
-        _forward_context.attention_schedule = previous
+        _forward_context.attention_schedule, _forward_context.attention_schedule_from_request = previous
 
 
 def get_attention_schedule_profile() -> str | None:
@@ -351,8 +357,10 @@ def set_forward_context_denoise_step_idx(step_idx: int | None) -> None:
 
 
 def begin_scheduled_denoise(total_steps: int) -> int | None:
-    """Check the bound schedule against one denoise sequence before its first forward.
+    """Check the request's own bound schedule against one denoise sequence before its first forward.
 
+    An inherited service default is not checked: it serves requests of any length, and a range that
+    ends after this sequence applies up to its last step.
     Returns ``total_steps`` when a non-empty schedule is bound, else None. A pipeline that
     publishes a total only for schedules passes the result through, so an unscheduled run
     keeps publishing no total (RAINFUSION with end_step runs dense while the total is None).
@@ -360,7 +368,8 @@ def begin_scheduled_denoise(total_steps: int) -> int | None:
     """
     if _forward_context is None or not _forward_context.attention_schedule:
         return None
-    require_attention_schedule_fits(_forward_context.attention_schedule, total_steps)
+    if _forward_context.attention_schedule_from_request:
+        require_attention_schedule_fits(_forward_context.attention_schedule, total_steps)
     return total_steps
 
 

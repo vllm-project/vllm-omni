@@ -852,14 +852,19 @@ def _denoise_progress():
 
 
 @pytest.mark.parametrize(
-    ("schedule", "fits"),
+    ("schedule", "from_request", "last_profile"),
     [
-        ((AttentionScheduleRange(start=2, end=3, profile="candidate"),), True),
-        ((AttentionScheduleRange(start=3, end=4, profile="candidate"),), False),
+        ((AttentionScheduleRange(start=2, end=3, profile="candidate"),), True, "candidate"),
+        ((AttentionScheduleRange(start=3, end=4, profile="candidate"),), True, None),
+        # An inherited default is not checked against the sequence; [3, 4) selects nothing in 3 steps.
+        ((AttentionScheduleRange(start=3, end=4, profile="candidate"),), False, None),
     ],
-    ids=["fits-three-steps", "past-three-steps"],
+    ids=["fits-three-steps", "past-three-steps", "inherited-past-three-steps"],
 )
-def test_dmd_forward_checks_and_publishes_the_fixed_three_step_total(schedule, fits, monkeypatch) -> None:
+def test_dmd_forward_checks_and_publishes_the_fixed_three_step_total(
+    schedule, from_request, last_profile, monkeypatch
+) -> None:
+    fits = not from_request or schedule[0].end <= 3
     pipeline = _make_pipeline()
     pipeline.is_dmd = True
     pipeline.scheduler = _StubDMDScheduler()
@@ -885,7 +890,7 @@ def test_dmd_forward_checks_and_publishes_the_fixed_three_step_total(schedule, f
         ),
     )
 
-    with set_forward_context(), bind_attention_schedule(schedule):
+    with set_forward_context(), bind_attention_schedule(schedule, from_request=from_request):
         if fits:
             pipeline.forward(DiffusionRequestBatch(requests=[request]))
         else:
@@ -893,7 +898,7 @@ def test_dmd_forward_checks_and_publishes_the_fixed_three_step_total(schedule, f
                 pipeline.forward(DiffusionRequestBatch(requests=[request]))
         after = _denoise_progress()
 
-    assert calls == ([(0, 3, None), (1, 3, None), (2, 3, "candidate")] if fits else [])
+    assert calls == ([(0, 3, None), (1, 3, None), (2, 3, last_profile)] if fits else [])
     assert after == (None, None, None)
 
 

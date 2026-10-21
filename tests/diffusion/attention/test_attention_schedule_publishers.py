@@ -55,8 +55,14 @@ def test_begin_scheduled_denoise_returns_none_without_checking_when_no_schedule_
             assert begin_scheduled_denoise(0) is None
 
 
-def test_begin_scheduled_denoise_rejects_a_bounded_range_past_the_actual_total():
+def test_begin_scheduled_denoise_does_not_check_an_inherited_default():
+    # A service default serves requests of any length; a range past this sequence applies up to its last step.
     with set_forward_context(), bind_attention_schedule(_ranges((3, 6, "sparse"))):
+        assert begin_scheduled_denoise(5) == 5
+
+
+def test_begin_scheduled_denoise_rejects_a_requested_bounded_range_past_the_actual_total():
+    with set_forward_context(), bind_attention_schedule(_ranges((3, 6, "sparse")), from_request=True):
         with pytest.raises(InvalidAttentionScheduleError, match="exceeds total_steps=5") as excinfo:
             begin_scheduled_denoise(5)
 

@@ -165,11 +165,13 @@ def _normalize_pipeline_outputs(
     return outputs
 
 
-def _attention_schedule_scope(schedule: AttentionSchedule) -> AbstractContextManager[Any]:
+def _attention_schedule_scope(
+    schedule: AttentionSchedule, *, from_request: bool = False
+) -> AbstractContextManager[Any]:
     """Bind a non-empty schedule; an unscheduled batch leaves the forward context untouched."""
     if not schedule:
         return nullcontext()
-    return bind_attention_schedule(schedule)
+    return bind_attention_schedule(schedule, from_request=from_request)
 
 
 class DiffusionModelRunner(DiffusionStagePayloadMixin):
@@ -928,7 +930,11 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                     [getattr(req, "cancellation_signal", None) for req in reqs],
                     enabled=getattr(self.pipeline, "supports_request_cancellation", False) is True,
                 ),
-                _attention_schedule_scope(attention_schedule),
+                # Batch keys keep omitted and explicit schedules apart, so the batch shares one source.
+                _attention_schedule_scope(
+                    attention_schedule,
+                    from_request=any(req.sampling_params.attention_schedule is not None for req in reqs),
+                ),
             ):
                 with record_function(record_name):
                     try:

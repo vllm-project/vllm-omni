@@ -597,8 +597,8 @@ def _progress(ctx) -> tuple:
 
 
 @contextmanager
-def _denoise_context(schedule, *, stale_timestep=None, stale_total=None):
-    with set_forward_context(), bind_attention_schedule(schedule):
+def _denoise_context(schedule, *, stale_timestep=None, stale_total=None, from_request=False):
+    with set_forward_context(), bind_attention_schedule(schedule, from_request=from_request):
         ctx = get_forward_context()
         ctx.denoise_timestep = stale_timestep
         ctx.total_denoise_steps = stale_total
@@ -768,7 +768,10 @@ def test_request_loop_rejects_schedule_past_actual_steps_before_any_forward(monk
     pipe = _request_mode_pipeline(monkeypatch, num_steps=4, events=events)
 
     # 8 steps are requested but the sequence built has 4, so [3, 6) does not fit.
-    with _denoise_context(_STEP_SCHEDULE), pytest.raises(InvalidAttentionScheduleError, match="exceeds total_steps=4"):
+    with (
+        _denoise_context(_STEP_SCHEDULE, from_request=True),
+        pytest.raises(InvalidAttentionScheduleError, match="exceeds total_steps=4"),
+    ):
         _run_request_loop(pipe, num_inference_steps=8)
 
     assert events == []
