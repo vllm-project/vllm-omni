@@ -53,7 +53,6 @@ class ParallelStrategy(str, Enum):
 
 class OuterBoundary(str, Enum):
     HSDP = "hsdp"
-    ATTENTION_SCHEDULE = "attention_schedule"
 
 
 @dataclass(frozen=True, slots=True)
