@@ -14,12 +14,14 @@ from vllm_omni.model_executor.models.ming_flash_omni.talker_batch import (
     MingTalkerBatchEngine,
     TalkerSegment,
 )
+from vllm_omni.platforms import current_omni_platform
 
 pytestmark = pytest.mark.core_model
 
 
 @hardware_test(res={"cuda": "H100"})
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA streams")
+@pytest.mark.nvidia_only
+@pytest.mark.skipif(not current_omni_platform.is_cuda(), reason="Requires NVIDIA CUDA FlashAttention and streams")
 @torch.inference_mode()
 def test_prefill_waits_for_request_embeddings_and_reference_latents(monkeypatch):
     device = torch.device("cuda")
