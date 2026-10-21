@@ -94,7 +94,7 @@ def validate_attention_schedule(
     """Check normalized intervals against prepared names and the actual sequence.
 
     Startup can validate names without a sequence. Request preparation validates
-    the actual total before any denoising forward, including inherited defaults.
+    a request's own ranges against the actual total before any denoising forward.
     A bounded range must fit the sequence. An open-ended range that starts at or
     after the end selects nothing, like a gap, so a service default such as
     ``[6, null)`` leaves shorter requests on the base attention.
@@ -165,10 +165,12 @@ def require_request_attention_schedule_fits(
     """Resolve one request's schedule and check it against the sequence the pipeline built.
 
     Step-mode preparation runs before the runner binds a schedule, so pipelines resolve the
-    request's own schedule here instead of reading the forward context.
+    request's own schedule here instead of reading the forward context. An inherited service
+    default serves requests of any length, so it is not checked: a default range that ends after
+    this sequence applies up to its last step.
     """
     schedule = resolve_request_attention_schedule(sampling_params, service)
-    if schedule:
+    if schedule and sampling_params.attention_schedule is not None:
         require_attention_schedule_fits(schedule, total_steps)
     return schedule
 
