@@ -112,12 +112,23 @@ docker exec vllm_omni bash -lc '
 
 ## Phase 4 — Commit, push, PR
 
-1. Commit in the container:
+**Signature rule (user-set 2026-10-21): the fix PR carries ONLY the user's
+account — `yenuo26`.** No `Co-Authored-By: Claude Code` trailer on commits,
+no `🤖 Generated with Claude Code` footer in the PR body. The PR must be
+created **following the repo's PR template**
+(`.github/PULL_REQUEST_TEMPLATE.md` on `vllm-project/vllm-omni`).
+
+1. Commit in the container — the `vllm_omni` container has **no git user
+   configured**, so pass the identity explicitly; no co-author trailer:
 
    ```bash
-   git commit -m "fix: <one-line what and why> (build #<n> <job name>)" \
-     -m "Co-Authored-By: Claude Code <noreply@anthropic.com>"
+   git -c user.name="yenuo26" -c user.email="410167048@qq.com" \
+     commit -m "fix: <one-line what and why> (build #<n> <job name>)"
    ```
+
+   (`git format-patch` → bridge `git am` preserves this author; the bridge
+   clone `/home/wy/vllm-omni-yn` is also already configured
+   `yenuo26 <410167048@qq.com>`.)
 
 2. Push to the fork. The fix container's `origin` is **upstream** (read-only —
    never push there), so the patch travels via the bridge box:
@@ -127,14 +138,47 @@ docker exec vllm_omni bash -lc '
    pushes to the fork). If the container happens to have a writable fork
    remote/credentials, `git push -u <fork-remote> <branch>` is fine too (never
    print credential contents).
-3. Create the PR **from the bridge box** (the container has no `gh`): `gh pr
-   create -R vllm-project/vllm-omni --head yenuo26:<branch> --base main` or
-   `POST https://api.github.com/repos/vllm-project/vllm-omni/pulls` with
-   `GITHUB_TOKEN`. If the token cannot create the PR, report the exact error
-   plus a ready-to-run manual command — never silently skip. PR body includes:
-   failing build link, job name, failing test nodes, first-error excerpt,
-   服务问题/用例问题 verdict + evidence, verification command + passing
-   output; ends with `🤖 Generated with [Claude Code](https://claude.com/claude-code)`.
+
+3. Create the PR **from the bridge box** (the container has no `gh`): the
+   bridge box's `gh` is logged in as **yenuo26** (verified 2026-10-21), so
+   `gh pr create -R vllm-project/vllm-omni --head yenuo26:<branch> --base
+   main` authors the PR as the user. (Equivalent fallback: `POST …/pulls`
+   with `GITHUB_TOKEN` — same account.) If the PR cannot be created, report
+   the exact error plus a ready-to-run manual command — never silently skip.
+   **The PR body follows the repo's PR template:**
+
+   - **Fetch the current template first** — read
+     `.github/PULL_REQUEST_TEMPLATE.md` from the local clone
+     (`/home/wy/vllm-omni`, after a pull) or the GitHub API; never trust a
+     remembered shape (the template evolves).
+   - Fill it section by section:
+     - **Contributor intent (4 required human answers)** — the template
+       forbids the agent from inventing, inferring, or prefilling these.
+       Q1 (outcome) / Q3 (how this moves it) can be *reused* from the human's
+       修复 command + the fix summary (public-safe); **Q2 (highest-leverage
+       variable) and Q4 (whose user needs this) must be asked** — show the
+       user the draft body and ask; reuse their explicit answers verbatim.
+       No answers → stop after pushing the branch and hand the user the
+       ready-to-run `gh pr create` command. Never publish private
+       conversation content without authorization.
+     - **Purpose** — behavior before vs after the fix; link the affected
+       module/feature contract.
+     - **Test Plan** — **vLLM Version** (`pip show vllm` in the container) +
+       **vLLM-Omni Commit** (the fix branch's base commit on origin/main).
+     - **Test Result** — failing test nodes, first-error excerpt, and the
+       Phase 3 verification command + passing output; explicitly list
+       relevant checks NOT run (e.g. GPU tests, full suite).
+   - Everything below the template's "(anything written below this line will
+     be removed by GitHub Actions)" line is stripped — never put content
+     there.
+   - **Pre-flight — 5-open-PR cap**: contributors without write access are
+     capped at 5 open PRs. Check
+     `gh pr list -R vllm-project/vllm-omni --author yenuo26 --state open`;
+     if ≥ 5, warn the user instead of creating a PR that will be blocked.
+   - **Pre-flight — precheck**: the template's BEFORE-SUBMITTING note asks
+     for the repo's `precheck-pr` self-check (`.claude/skills/precheck-pr`
+     in the repo); run it on the fix diff and fix what it flags.
+   - PR body carries **no** Claude attribution footer.
 
 ## Phase 5 — Report back
 

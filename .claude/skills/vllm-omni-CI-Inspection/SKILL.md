@@ -1043,15 +1043,17 @@ end-to-end:
    signature.
 2. **Phase 1 (my_l20 container)** — fresh branch `fix/simple-b<build>-<date>`
    from `origin/main` in `/rebase/vllm-omni` (venv `/rebase/.venv`,
-   container `vllm_omni_yenuo26`).
+   container `vllm_omni`).
 3. **Phase 2** — reproduce first; judge 服务问题 vs 用例问题; modify **service
    code only** or **the test only** (never both); genuinely ambiguous → stop
    and ask the user.
 4. **Phase 3** — verify with `pytest -sv <node>`; max 3 fix/verify rounds;
    still failing → honest report, no PR.
-5. **Phase 4** — commit (Co-Authored-By footer), push to the yenuo26 fork,
-   open a PR to `vllm-project/vllm-omni` from the bridge box (container has
-   no `gh`).
+5. **Phase 4** — commit (yenuo26-only signature, user-set 2026-10-21: **no**
+   Claude co-author trailer / generated-with footer), push to the yenuo26
+   fork, open a PR to `vllm-project/vllm-omni` from the bridge box (`gh` is
+   logged in as yenuo26) **following the repo's PR template**
+   (`.github/PULL_REQUEST_TEMPLATE.md` — container has no `gh`).
 6. **Phase 5** — report PR link, verdict + evidence, files changed,
    verification result.
 
