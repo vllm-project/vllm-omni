@@ -41,7 +41,7 @@ from vllm_omni.engine.stage_pool import StagePool
 from vllm_omni.entrypoints.omni_base import OmniEngineDeadError
 from vllm_omni.entrypoints.openai import api_server as api_server_module
 from vllm_omni.entrypoints.openai import serving_speech as serving_speech_module
-from vllm_omni.entrypoints.openai.audio_utils_mixin import AudioMixin
+from vllm_omni.entrypoints.openai.audio_utils_mixin import AudioMixin, create_wav_header
 from vllm_omni.entrypoints.openai.errors import InvalidPresetVoiceReferenceError, InvalidVoiceReferenceError
 from vllm_omni.entrypoints.openai.protocol.audio import (
     BatchSpeechRequest,
@@ -55,7 +55,6 @@ from vllm_omni.entrypoints.openai.protocol.audio import (
 )
 from vllm_omni.entrypoints.openai.serving_speech import (
     OmniOpenAIServingSpeech,
-    _create_wav_header,
 )
 from vllm_omni.entrypoints.openai.tts_adapters.base import (
     DEFAULT_TTS_LANGUAGES,
@@ -4760,7 +4759,7 @@ class TestWAVHeaderGeneration:
 
     def test_wav_header_basic_structure(self):
         """Test basic WAV header structure with default parameters."""
-        header = _create_wav_header(sample_rate=24000, num_channels=1, bits_per_sample=16)
+        header = create_wav_header(sample_rate=24000, num_channels=1, bits_per_sample=16)
 
         # Verify header length (should be 44 bytes)
         assert len(header) == 44, f"Expected 44 bytes, got {len(header)}"
@@ -4812,7 +4811,7 @@ class TestWAVHeaderGeneration:
         ]
 
         for sample_rate, num_channels, bits_per_sample in test_cases:
-            header = _create_wav_header(sample_rate, num_channels, bits_per_sample)
+            header = create_wav_header(sample_rate, num_channels, bits_per_sample)
             assert len(header) == 44, f"Header length mismatch for {sample_rate} Hz"
 
             # Parse sample rate from header
@@ -4823,7 +4822,7 @@ class TestWAVHeaderGeneration:
 
     def test_wav_header_stereo(self):
         """Test WAV header with stereo audio."""
-        header = _create_wav_header(sample_rate=44100, num_channels=2, bits_per_sample=16)
+        header = create_wav_header(sample_rate=44100, num_channels=2, bits_per_sample=16)
 
         # Parse header
         parsed = struct.unpack("<4sI4s4sIHHIIHH4sI", header)
@@ -4837,7 +4836,7 @@ class TestWAVHeaderGeneration:
 
     def test_wav_header_placeholder_values(self):
         """Test that placeholder values are correctly set to 0xFFFFFFFF."""
-        header = _create_wav_header(sample_rate=24000)
+        header = create_wav_header(sample_rate=24000)
 
         # Extract size fields
         chunk_size = struct.unpack("<I", header[4:8])[0]

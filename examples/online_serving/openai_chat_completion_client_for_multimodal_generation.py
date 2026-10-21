@@ -466,27 +466,35 @@ def run_multimodal_generation(args, client: OpenAI) -> None:
     else:
         printed_content = False
         for chat_completion in chat_completions:
-            for chunk in chat_completion:
-                for choice in chunk.choices:
-                    if hasattr(choice, "delta"):
-                        content = getattr(choice.delta, "content", None)
-                    else:
-                        content = None
+            # Each choice is one WAV stream: its first audio chunk contains
+            # the header and later chunks contain PCM for the same file.
+            audio_files = {}
+            try:
+                for chunk in chat_completion:
+                    for choice in chunk.choices:
+                        if hasattr(choice, "delta"):
+                            content = getattr(choice.delta, "content", None)
+                        else:
+                            content = None
 
-                    if getattr(chunk, "modality", None) == "audio" and content:
-                        audio_data = base64.b64decode(content)
-                        request_id = getattr(chunk, "id", None)
-                        audio_file_path = make_audio_output_filename(request_id=request_id, index=count)
-                        with open(audio_file_path, "wb") as f:
-                            f.write(audio_data)
-                        print(f"\nAudio saved to {audio_file_path}")
-                        count += 1
+                        if getattr(chunk, "modality", None) == "audio" and content:
+                            audio_data = base64.b64decode(content)
+                            if choice.index not in audio_files:
+                                request_id = getattr(chunk, "id", None)
+                                audio_file_path = make_audio_output_filename(request_id=request_id, index=count)
+                                audio_files[choice.index] = open(audio_file_path, "wb")
+                                print(f"\nAudio saved to {audio_file_path}")
+                                count += 1
+                            audio_files[choice.index].write(audio_data)
 
-                    elif getattr(chunk, "modality", None) == "text":
-                        if not printed_content:
-                            printed_content = True
-                            print("\ncontent:", end="", flush=True)
-                        print(content, end="", flush=True)
+                        elif getattr(chunk, "modality", None) == "text":
+                            if not printed_content:
+                                printed_content = True
+                                print("\ncontent:", end="", flush=True)
+                            print(content, end="", flush=True)
+            finally:
+                for audio_file in audio_files.values():
+                    audio_file.close()
 
 
 def parse_args():
