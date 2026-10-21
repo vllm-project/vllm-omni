@@ -3396,11 +3396,12 @@ class MiniMaxH3Pipeline(
             raise OmniClientError("MiniMax H3 continuation requires uncached denoising; set quality=lossless")
         if (attention_schedule or sigma_schedule) and quality_plan.cache_dit is not None:
             # Cache-DiT reuses transformer outputs across steps, so a cached residual can come from a step
-            # that ran a different attention profile. Reject before its hooks are installed.
+            # that ran a different attention profile. Reject before its hooks are installed. An empty list
+            # of one kind keeps the service default of the other, so the message names both fields.
             field = "attention_sigma_schedule" if sigma_schedule else "attention_schedule"
             raise InvalidAttentionScheduleError(
-                f"{field} cannot be combined with MiniMax H3 Cache-DiT (quality=high); "
-                f"send quality=lossless or {field}=[]"
+                f"{field} cannot be combined with MiniMax H3 Cache-DiT (quality=high); send quality=lossless, "
+                "or attention_schedule=[] and attention_sigma_schedule=[]"
             )
         if attention_schedule and self._resolve_latent_refine(extra) is not None:
             # latent_refine runs a second denoise sequence over the tail of the sigma list. It publishes step

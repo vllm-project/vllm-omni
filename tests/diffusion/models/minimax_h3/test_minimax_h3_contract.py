@@ -1452,6 +1452,39 @@ def test_forward_rejects_an_attention_schedule_with_request_scoped_cache_dit(mon
     assert len(diffuse_calls) == count
 
 
+def test_cache_dit_rejection_names_both_schedule_fields(monkeypatch):
+    """An empty list of one kind keeps the service default of the other, so the Cache-DiT rejection
+    asks for both fields to be emptied, and a request that follows it runs with Cache-DiT."""
+    _allow_cpu_empty_cache(monkeypatch)
+    diffuse_calls: list[dict[str, Any]] = []
+    pipeline = _distilled_pipeline(diffuse_calls, {"fl2va": None, "ref2va": None})
+    pipeline.od_config = _scheduled_od_config()
+    pipeline.od_config.diffusion_attention_schedule.sigma = parse_attention_sigma_schedule(
+        [{"low": 0.0, "high": 0.3, "profile": "sparse"}]
+    )
+    # quality=high resolves to the request-scoped Cache-DiT profile.
+    pipeline._quality_policy = MiniMaxH3QualityPolicy(pipeline.od_config)
+    runtime = _RecordingCacheDiTRuntime(pipeline)
+    pipeline._cache_dit_runtime = runtime
+
+    with pytest.raises(InvalidAttentionScheduleError) as exc_info:
+        pipeline.forward(
+            _t2va_batch(
+                num_inference_steps=4, attention_schedule=[{"start": 0, "end": 2, "profile": "sparse"}], quality="high"
+            )
+        )
+    assert "attention_schedule=[] and attention_sigma_schedule=[]" in str(exc_info.value)
+    with pytest.raises(InvalidAttentionScheduleError, match="Cache-DiT"):
+        pipeline.forward(_t2va_batch(num_inference_steps=4, attention_schedule=[], quality="high"))
+
+    pipeline.forward(
+        _t2va_batch(num_inference_steps=4, attention_schedule=[], attention_sigma_schedule=[], quality="high")
+    )
+    prepared_keys = [None if spec is None else spec.installation_key for spec in runtime.prepared]
+    assert prepared_keys == [MINIMAX_H3_HIGH_CACHE_KEY]
+    assert len(diffuse_calls) == 1
+
+
 @pytest.mark.parametrize(
     "server_schedule, request_schedule, server_refine, request_refine",
     [
