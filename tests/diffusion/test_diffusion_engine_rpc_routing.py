@@ -390,8 +390,10 @@ async def test_streaming_credit_covers_downstream_consumer_and_final_chunk(expli
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("over_limit", [False, True])
-async def test_streaming_idle_and_oversized_output_release_scheduler(over_limit):
+@pytest.mark.parametrize("interaction_wait", [False, True])
+async def test_streaming_idle_and_oversized_output_release_scheduler(over_limit, interaction_wait):
     from vllm_omni.diffusion.request import OmniDiffusionRequest
+    from vllm_omni.diffusion.worker.utils import StepWait
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
     calls = []
@@ -405,6 +407,7 @@ async def test_streaming_idle_and_oversized_output_release_scheduler(over_limit)
             step_index=1,
             finished=finished,
             result=DiffusionOutput(output=b"four", finished=finished),
+            wait_for_interaction=StepWait() if interaction_wait and not finished else None,
             streaming_media_duration=0.01,
             streaming_next_media_duration=0.01,
         )

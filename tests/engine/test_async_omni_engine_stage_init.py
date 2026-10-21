@@ -2664,7 +2664,6 @@ def test_native_kv_producer_replica_identity_and_bootstrap_are_isolated(mocker, 
         kv_connector="MooncakeConnector",
         kv_role="kv_producer",
         engine_id="ar",
-        kv_ip="127.0.0.1",
         kv_connector_extra_config={"bootstrap_port": 9100},
     )
     if typed:

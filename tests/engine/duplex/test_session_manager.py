@@ -120,6 +120,7 @@ class FakeModelSessionState(DuplexModelSessionState):
         self.committed_audio_payload = None
         self.committed_audio_operation_id = None
         self.committed_audio_reserved_bytes = 0
+        self.committed_audio_consume_started = False
         self.deferred_response_create = False
         self.deferred_precreate_response = False
         self.continuation_owner_id = None
@@ -133,12 +134,14 @@ class FakeModelSessionState(DuplexModelSessionState):
         self.committed_audio_payload = payload
         self.committed_audio_operation_id = operation_id
         self.committed_audio_reserved_bytes = reserved_bytes
+        self.committed_audio_consume_started = False
 
     def clear_committed_audio(self) -> int:
         reserved = self.committed_audio_reserved_bytes
         self.committed_audio_payload = None
         self.committed_audio_operation_id = None
         self.committed_audio_reserved_bytes = 0
+        self.committed_audio_consume_started = False
         return reserved
 
     def clear_continuation(self) -> None:

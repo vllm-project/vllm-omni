@@ -654,13 +654,6 @@ class StageConfigFactory:
         kwargs: dict[str, Any],
     ) -> tuple[dict[str, Any], DiffusionParallelConfig, dict[str, Any], str]:
         """Normalize inputs shared by typed and compatibility diffusion builders."""
-        # Preserve the default builder's explicit top-level override of model
-        # extras before the strict same-source alias validator runs.
-        if kwargs.get("auxiliary_text_encoder") is not None:
-            kwargs = dict(kwargs)
-            extras = dict(kwargs.get("extras") or {})
-            extras.pop("auxiliary_text_encoder", None)
-            kwargs["extras"] = extras
         kwargs = normalize_and_validate_diffusion_engine_ingress_kwargs(kwargs, stage_id=0)
         raw_sampling_params = kwargs.get("default_sampling_params")
         if isinstance(raw_sampling_params, str):
@@ -685,18 +678,6 @@ class StageConfigFactory:
         engine_args = OmniDiffusionConfig.normalize_init_kwargs(
             {name: value for name, value in kwargs.items() if name in diffusion_config_fields}
         )
-
-        extras = dict(engine_args.get("extras") or {})
-        for key, default in (
-            ("auxiliary_text_encoder", None),
-            ("default_llama_model_id", "meta-llama/Meta-Llama-3.1-8B-Instruct"),
-        ):
-            value = kwargs.get(key)
-            if value is not None:
-                extras[key] = value
-            else:
-                extras.setdefault(key, default)
-        engine_args["extras"] = extras
 
         model_class_name = engine_args.get("model_class_name")
         final_output_type = get_diffusion_output_type(model_class_name)
@@ -741,8 +722,40 @@ class StageConfigFactory:
         cls,
         model: str,
         kwargs: dict[str, Any],
+        *,
+        deploy_config_path: str | None = None,
     ) -> VllmOmniConfig:
         """Build generic diffusion directly into the structured runtime config."""
+        deploy = cls._load_user_deploy_config(deploy_config_path) or DeployConfig()
+        stage_deploy = next((stage for stage in deploy.stages if stage.stage_id == 0), None)
+        if stage_deploy is None:
+            stage_deploy = StageDeployConfig(stage_id=0)
+            deploy.stages.append(stage_deploy)
+
+        # Resolve deploy parallel degrees before inserting defaults. Otherwise
+        # the CLI-default degrees would overwrite YAML and leave SP/world size
+        # inconsistent with the requested device layout.
+        parallel_fields = {item.name for item in fields(DiffusionParallelConfig) if item.init}
+        deploy_parallel = {
+            name: value
+            for source in (deploy, stage_deploy)
+            for name in parallel_fields
+            if (value := getattr(source, name, None)) is not None
+        }
+        if deploy_parallel:
+            cli_parallel = {name: kwargs[name] for name in parallel_fields if kwargs.get(name) is not None}
+            nested_parallel = kwargs.get("parallel_config")
+            if isinstance(nested_parallel, Mapping):
+                cli_parallel.update({name: value for name, value in nested_parallel.items() if value is not None})
+            elif nested_parallel is not None:
+                cli_parallel.update(asdict(DiffusionParallelConfig.from_stage_overrides(kwargs)))
+            merged_parallel = {**deploy_parallel, **cli_parallel}
+            if any(name in cli_parallel for name in ("ulysses_degree", "ring_degree", "allgather_degree")):
+                if "sequence_parallel_size" not in cli_parallel:
+                    merged_parallel.pop("sequence_parallel_size", None)
+            merged_parallel.pop("world_size", None)
+            kwargs = {**kwargs, "parallel_config": merged_parallel}
+
         engine_overrides, parallel_config, default_sampling_params, final_output_type = (
             cls._normalize_default_diffusion(kwargs)
         )
@@ -771,13 +784,24 @@ class StageConfigFactory:
         stage_overrides["stage_0_devices"] = (
             kwargs.get("stage_0_devices")
             or kwargs.get("devices")
+            or stage_deploy.devices
             or ",".join(str(i) for i in range(parallel_config.world_size))
         )
+        for name in ("num_replicas", "env"):
+            if kwargs.get(name) is not None:
+                stage_overrides[f"stage_0_{name}"] = kwargs[name]
         # Caller defaults belong to deployment, not immutable pipeline constraints:
         # explicit request sampling parameters must still be able to override them.
-        deploy = DeployConfig(stages=[StageDeployConfig(stage_id=0, default_sampling_params=default_sampling_params)])
+        if default_sampling_params:
+            stage_deploy.default_sampling_params = {
+                **(stage_deploy.default_sampling_params or {}),
+                **default_sampling_params,
+            }
         return VllmOmniConfig.from_pipeline_config(
-            pipeline, user_deploy_config=deploy, cli_overrides={"model": model, **stage_overrides}
+            pipeline,
+            user_deploy_config=deploy,
+            deploy_config_path=deploy_config_path,
+            cli_overrides={"model": model, **stage_overrides},
         )
 
     @classmethod

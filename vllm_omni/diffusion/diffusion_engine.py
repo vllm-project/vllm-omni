@@ -687,13 +687,12 @@ class DiffusionEngine:
                 self._emit_finished_outputs(pending_finished, None)
 
             with self._cv:
-                while (
-                    (self._scheduling_paused or self._playback_blocked() or not self.scheduler.has_requests())
-                    and self._rpc_queue.empty()
-                    and self.abort_queue.empty()
-                    and not self.stop_event.is_set()
-                ):
+                if self._rpc_queue.empty() and self.abort_queue.empty() and not self.stop_event.is_set():
                     now = time.monotonic()
+                    if self._scheduling_paused or self._playback_blocked() or not self.scheduler.has_requests():
+                        wait_timeout: float | None = 1.0
+                    else:
+                        wait_timeout = self.scheduler.get_execution_wait_timeout(now)
                     deadlines = [
                         state.next_ready_at - now
                         for state in (self._streaming_playback or {}).values()
@@ -704,13 +703,23 @@ class DiffusionEngine:
                         for state in (self._streaming_playback or {}).values()
                         if state.idle_since is not None
                     )
-                    self._cv.wait(timeout=min(1.0, *deadlines) if deadlines else 1.0)
-                    break  # Recheck idle expiry even when no client message arrives.
+                    if deadlines:
+                        wait_timeout = min(deadlines) if wait_timeout is None else min(wait_timeout, *deadlines)
+                    if wait_timeout != 0:
+                        self._cv.wait(timeout=wait_timeout)
+                        # Recheck idle expiry, interactions and aborts before scheduling.
+                        continue
 
                 if self.stop_event.is_set():
                     break
 
-                if self._scheduling_paused or self._playback_blocked() or not self.scheduler.has_requests():
+                if (
+                    self._scheduling_paused
+                    or self._playback_blocked()
+                    or not self.scheduler.has_requests()
+                    or not self._rpc_queue.empty()
+                    or not self.abort_queue.empty()
+                ):
                     # Only RPC / abort work pending; loop back to drain it.
                     continue
 
@@ -1033,6 +1042,11 @@ class DiffusionEngine:
             if not fut.done():
                 fut.set_exception(exc)
         else:
+            if task.method == "submit_interaction":
+                request_id = task.args[0] if task.args else (task.kwargs or {})["request_id"]
+                with self._cv:
+                    self.scheduler.notify_interaction(request_id)
+                    self._cv.notify_all()
             if not fut.done():
                 fut.set_result(result)
 
@@ -1639,12 +1653,21 @@ class DiffusionEngine:
                         output = fut.result(timeout=_async_output_timeout())
                     return output
 
-    def profile(self, is_start: bool = True, profile_prefix: str | None = None) -> None:
+    def profile(
+        self,
+        is_start: bool = True,
+        profile_prefix: str | None = None,
+        *,
+        delay_iterations: int | None = None,
+        max_iterations: int | None = None,
+    ) -> None:
         """Start or stop profiling on all diffusion workers.
 
         Args:
             is_start: True to start profiling, False to stop.
             profile_prefix: Optional prefix for trace filename.
+            delay_iterations: Per-session worker steps before profiling starts.
+            max_iterations: Per-session limit on profiled worker steps.
         """
         if is_start:
             if profile_prefix is None:
@@ -1654,7 +1677,15 @@ class DiffusionEngine:
             logger.info("Stopping diffusion profiling...")
 
         try:
-            self.collective_rpc(method="profile", args=(is_start, profile_prefix))
+            kwargs: dict[str, int] = {}
+            if delay_iterations is not None:
+                kwargs["delay_iterations"] = delay_iterations
+            if max_iterations is not None:
+                kwargs["max_iterations"] = max_iterations
+            if kwargs:
+                self.collective_rpc(method="profile", args=(is_start, profile_prefix), kwargs=kwargs)
+            else:
+                self.collective_rpc(method="profile", args=(is_start, profile_prefix))
         except Exception as e:
             action = "start" if is_start else "stop"
             logger.error(f"Failed to {action} profiling on workers", exc_info=True)

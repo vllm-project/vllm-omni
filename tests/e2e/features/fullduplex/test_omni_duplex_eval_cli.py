@@ -540,10 +540,14 @@ def test_collect_duplex_session_metrics_matches_omniinteract_window():
     )
     collector.add(audio, received_at_s=10.3)
     collector.add({"type": "response.done", "response": {"id": "r1"}}, received_at_s=10.4)
+    collector.note_client_append({"sent_at_s": 10.05, "event_id": "append-1"})
     bundle = collect_duplex_session_metrics(collector, stream_start=10.0, session_id="sample")
     assert bundle.request_metrics[0]["ttft_ms"] == 100.0
     assert bundle.request_metrics[0]["ttfp_ms"] == 200.0
     assert bundle.request_metrics[0]["rtf"] == 2.0
+    assert bundle.request_metrics[0]["client_ttfp_ms"] == 250.0
+    assert bundle.request_metrics[0]["client_audio_generation_ms"] == 250.0
+    assert bundle.request_metrics[0]["client_rtf"] == 2.5
     assert bundle.session_metrics["stream_ttft_ms"] == 200.0
     assert bundle.session_metrics["stream_ttfp_ms"] == 300.0
     report = build_duplex_metrics_report(
@@ -552,6 +556,18 @@ def test_collect_duplex_session_metrics_matches_omniinteract_window():
     )
     assert report["duplex_stream_ttft_ms"]["mean"] == 200.0
     assert report["duplex_stream_ttfp_ms"]["mean"] == 300.0
+
+
+def test_event_collector_from_realtime_copies_client_appends():
+    from vllm_omni.experimental.fullduplex.client import RealtimeEventCollector
+
+    source = RealtimeEventCollector()
+    stamp = {"sent_at_s": 9.8, "event_id": "evt-1"}
+    source.note_client_append(stamp)
+    source.add({"type": "response.created", "response": {"id": "r1"}}, received_at_s=10.0)
+    copied = runner._event_collector_from_realtime(source)
+    assert copied.client_appends == [stamp]
+    assert copied.response_ids == ["r1"]
 
 
 def test_collect_duplex_session_metrics_keeps_all_engine_stages():

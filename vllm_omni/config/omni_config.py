@@ -1412,9 +1412,7 @@ _DIFFUSION_ENGINE_ADAPTER_METADATA_FIELDS = frozenset(
         "session_mode",
     }
 )
-_DIFFUSION_DEFAULT_FACTORY_FIELDS = frozenset(
-    {"default_llama_model_id", "default_sampling_params", "devices", "stage_0_devices"}
-)
+_DIFFUSION_DEFAULT_FACTORY_FIELDS = frozenset({"default_sampling_params", "devices", "stage_0_devices"})
 
 
 def _frontend_cli_fields() -> frozenset[str]:

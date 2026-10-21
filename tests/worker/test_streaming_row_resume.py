@@ -30,7 +30,15 @@ def _blocks(num_tokens: int) -> tuple[list[int], ...]:
 
 def _batch_after_one_step(monkeypatch) -> tuple[InputBatch, dict[str, CachedRequestState]]:
     monkeypatch.setattr(gpu_input_batch, "PIN_MEMORY", False)
-    batch = InputBatch(4, 64, 64, torch.device("cpu"), 1024, [_BLOCK], [_BLOCK], [16])
+    batch = InputBatch(
+        max_num_reqs=4,
+        max_model_len=64,
+        max_num_batched_tokens=64,
+        device=torch.device("cpu"),
+        vocab_size=1024,
+        block_sizes=[_BLOCK],
+        max_num_blocks_per_req=[64 // _BLOCK],
+    )
     requests = {}
     for req_id, prompt_len in _PROMPT_LENS.items():
         state = CachedRequestState(

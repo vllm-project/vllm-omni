@@ -1,0 +1,298 @@
+meta:
+  title: "FLUX 3 Image Klein"
+  slug: "flux-3-image-klein"
+  provider: "Black Forest Labs"
+  description: "5.6B distilled image transformer for text-to-image and image editing, served via vLLM-Omni with a Qwen3-VL-4B text encoder"
+  date_added: 2026-10-15
+  date_updated: 2026-10-15
+  tasks:
+    - omni
+  performance_headline: "1024x1024 in ~2s on a single GB200 (16-step distilled schedule)"
+  related_recipes: []
+  hardware:
+    gb200: verified
+
+model:
+  model_id: "black-forest-labs/flux-3-image-klein"
+  min_vllm_version: "0.32.0"
+  docker_image: "vllm/vllm-omni:flux-3-image-klein"
+  install:
+    docker:
+      note: "Recommended: the day-0 image ships vLLM-Omni with FLUX 3 Image Klein support"
+    pip:
+      command: "uv pip install git+https://github.com/vllm-project/vllm-omni.git"
+      note: "installs vLLM-Omni from source (main) — FLUX 3 Image Klein support ships in the upcoming release"
+  architecture: dense
+  parameter_count: "5.6B"
+  active_parameters: "5.6B"
+  context_length: 0
+  base_args: []
+  base_env: {}
+
+features: {}
+
+opt_in_features: []
+
+variants:
+  default:
+    label: "BF16"
+    precision: bf16
+    vram_minimum_gb: 24
+    description: "Root BF16 distilled package (5.6B DiT + Qwen3-VL-4B text encoder + VAE), fixed 16-step schedule, no guidance"
+    supported_hardware:
+      - h100
+      - h200
+      - b200
+      - gb200
+      - b300
+      - gb300
+      - rtx_pro_6000
+  fp8r:
+    label: "FP8R"
+    precision: fp8
+    precision_hardware:
+      brand: NVIDIA
+    vram_minimum_gb: 17
+    description: "FP8R DiT variant from the package's variants/fp8r folder; text encoder and VAE stay BF16"
+    supported_hardware:
+      - h100
+      - h200
+      - b200
+      - gb200
+      - b300
+      - gb300
+    extra_args:
+      - "--stage-overrides"
+      - '{"0":{"additional_config":{"variant":"fp8r"}}}'
+  nvfp4:
+    label: "NVFP4"
+    precision: nvfp4
+    precision_hardware:
+      brand: NVIDIA
+    vram_minimum_gb: 13
+    description: "NVFP4 DiT variant from the package's variants/nvfp4 folder; text encoder and VAE stay BF16"
+    supported_hardware:
+      - b200
+      - gb200
+      - b300
+      - gb300
+    extra_args:
+      - "--stage-overrides"
+      - '{"0":{"additional_config":{"variant":"nvfp4"}}}'
+
+compatible_strategies: []
+
+hardware_overrides: {}
+
+strategy_overrides: {}
+
+omni:
+  port: 8099
+  variant_label: "DiT Variant"
+  variant_hint: "Choose BF16 for the root package or FP8R/NVFP4 to shrink DiT memory. Variants live in the checkpoint's variants/ folder."
+  task_label: "Generation Mode"
+  task_hint: "T2I hits /v1/images/generations; I2I sends the reference image through /v1/chat/completions."
+  task_axes:
+    - id: x2i
+      label: "X2I"
+      options:
+        - id: t2i
+          label: "T2I"
+        - id: i2i
+          label: "I2I"
+  tasks:
+    - id: t2i
+      key: t2i
+      label: "Text-to-image"
+      axes:
+        x2i: t2i
+      vram_minimum_gb: 24
+      endpoint: "/v1/images/generations"
+      description: "Text-to-image generation with the package default 1024x1024 size and 16-step distilled schedule."
+      curl: |
+        curl -sS --fail-with-body \
+          -X POST http://localhost:8099/v1/images/generations \
+          -H 'Content-Type: application/json' \
+          -d '{
+            "model": "flux-3-image-klein",
+            "prompt": "a serene alpine meadow at golden hour, wildflowers in the foreground",
+            "size": "1024x1024",
+            "n": 1,
+            "response_format": "b64_json",
+            "seed": 42
+          }' | python3 -c 'import base64,json,sys; open("t2i.png","wb").write(base64.b64decode(json.load(sys.stdin)["data"][0]["b64_json"]))'
+
+    - id: i2i
+      key: i2i
+      label: "Image-to-image"
+      axes:
+        x2i: i2i
+      vram_minimum_gb: 24
+      endpoint: "/v1/chat/completions"
+      description: "Reference-based editing / restyling, with up to 10 reference images. Each image rides as a base64 data URI in a chat message."
+      curl: |
+        export REF_IMAGE=/absolute/path/to/reference.png
+
+        DATA_URI="data:image/png;base64,$(base64 -w0 "$REF_IMAGE")"
+        curl -sS --fail-with-body \
+          -X POST http://localhost:8099/v1/chat/completions \
+          -H 'Content-Type: application/json' \
+          -d "{
+            \"model\": \"flux-3-image-klein\",
+            \"messages\": [{
+              \"role\": \"user\",
+              \"content\": [
+                {\"type\": \"text\", \"text\": \"restyle as a watercolor painting with soft pastel tones\"},
+                {\"type\": \"image_url\", \"image_url\": {\"url\": \"${DATA_URI}\"}}
+              ]
+            }],
+            \"seed\": 42,
+            \"height\": 1024,
+            \"width\": 1024
+          }" | python3 -c 'import base64,json,sys; u=json.load(sys.stdin)["choices"][0]["message"]["content"][0]["image_url"]["url"]; open("i2i.png","wb").write(base64.b64decode(u.split(",",1)[1]))'
+
+dependencies:
+  - note: "Accept the FLUX Kommunity License on Hugging Face first, then authenticate."
+    command: "hf auth login"
+
+guide: |
+  ## Overview
+
+  [FLUX 3 Image Klein](https://huggingface.co/black-forest-labs/flux-3-image-klein)
+  is a 5.6B distilled image transformer from Black Forest Labs for text-to-image
+  generation and image editing (single- and multi-reference). It uses
+  Qwen3-VL-4B-Instruct as the text encoder and runs a fixed 16-step schedule
+  with no classifier-free guidance. vLLM-Omni serves it through an
+  OpenAI-compatible API:
+
+  | Mode | Endpoint | Request body |
+  |------|----------|--------------|
+  | T2I | `/v1/images/generations` | JSON (`prompt`, `size`, `seed`) |
+  | I2I | `/v1/chat/completions` | Chat message with the reference image as a base64 data URI |
+
+  The checkpoint is a single package: DiT (`model.safetensors`), image
+  autoencoder (`ae.safetensors`), and `text_encoder/` at the root, with
+  quantized DiT packages under `variants/fp8r` and `variants/nvfp4`. Select a
+  variant with
+  `--stage-overrides '{"0":{"additional_config":{"variant":"fp8r"}}}'`; omit it
+  for the BF16 root package.
+
+  ## Prerequisites
+
+  - Accept the [FLUX Kommunity License](https://huggingface.co/black-forest-labs/flux-3-image-klein/blob/main/LICENSE.md) on Hugging Face, then `hf auth login`. The license permits non-commercial use with a commercial-output exception for Qualifying Users.
+  - Recommended: use the day-0 Docker image `vllm/vllm-omni:flux-3-image-klein`, which ships vLLM-Omni and all dependencies. Bare-metal installs use vLLM-Omni from source (see Install above).
+
+  ## Launching the server
+
+  With the day-0 image:
+
+  ```bash
+  docker run --runtime nvidia --gpus all \
+    -v ${HF_HOME:-$HOME/.cache/huggingface}:/root/.cache/huggingface \
+    --env "HF_TOKEN=$HF_TOKEN" \
+    -p 8099:8099 \
+    --ipc=host \
+    vllm/vllm-omni:flux-3-image-klein \
+    vllm serve black-forest-labs/flux-3-image-klein --omni \
+      --served-model-name flux-3-image-klein \
+      --port 8099
+  ```
+
+  Bare metal:
+
+  ```bash
+  vllm serve black-forest-labs/flux-3-image-klein --omni \
+    --served-model-name flux-3-image-klein \
+    --port 8099
+
+  # FP8R / NVFP4 DiT variant
+  vllm serve black-forest-labs/flux-3-image-klein --omni \
+    --served-model-name flux-3-image-klein \
+    --stage-overrides '{"0":{"additional_config":{"variant":"fp8r"}}}' \
+    --port 8099
+  ```
+
+  Useful extras (see `examples/online_serving/flux3/run_server.sh` in the vLLM-Omni repository):
+
+  - `--tensor-parallel-size N` / `--cfg-parallel-size N` for multi-GPU scaling.
+  - `--fp8-attention` (FlashInfer/cuDNN FP8 DiT attention, SM100 only, needs cuDNN >= 9.17.1).
+  - `--lora-path /path/to/adapter --lora-scale 1.0` to preload a PEFT LoRA adapter; each request still selects the adapter by path.
+  - `uv pip install -e '.[prims-ts]'` enables PrimsTS kernels for FP8R/NVFP4 packages on SM100/SM103/SM107; BF16 always uses vLLM kernels.
+
+  ## Offline inference
+
+  ```bash
+  # T2I
+  python examples/offline_inference/flux3/end2end.py \
+    --model black-forest-labs/flux-3-image-klein \
+    --prompt "a serene alpine meadow at golden hour, wildflowers in the foreground"
+
+  # I2I (conditioning image; repeat --image for multi-reference, up to 10)
+  python examples/offline_inference/flux3/end2end.py \
+    --model black-forest-labs/flux-3-image-klein \
+    --image /absolute/path/to/reference.png \
+    --prompt "restyle as a watercolor painting with soft pastel tones" \
+    --seed 7
+  ```
+
+  ## Prompt upsampling (optional)
+
+  [black-forest-labs/flux-3-image-klein-pup](https://huggingface.co/black-forest-labs/flux-3-image-klein-pup)
+  is a Qwen3.5-9B vision-language fine-tune that expands a short request into
+  the detailed caption FLUX 3 Image Klein works best with — the reference
+  inference code runs it in front of the image model by default. It is a
+  standard `Qwen3_5ForConditionalGeneration` checkpoint, so it is served with
+  the stock vLLM image on a separate GPU:
+
+  ```bash
+  hf download black-forest-labs/flux-3-image-klein-pup --local-dir /path/to/pup
+
+  docker run --gpus '"device=0"' --ipc=host -p 8000:8000 \
+    -v /path/to/pup:/model:ro \
+    vllm/vllm-openai:v0.29.0 \
+    --model /model \
+    --served-model-name flux-3-image-klein-pup \
+    --max-model-len 32768 \
+    --gpu-memory-utilization 0.90 \
+    --reasoning-parser qwen3
+  ```
+
+  The system prompts (`system_prompts.json` in the pup repo) select
+  text-to-image vs. editing mode, and `t2i_bbox` / `i2i_bbox` variants return
+  the caption plus a JSON table of `[y_min, x_min, y_max, x_max]` boxes on the
+  0-1000 grid. A ready-made client is `openai_client_pup.py` next to
+  `openai_client.py` in `examples/online_serving/flux3/` of the vLLM-Omni
+  repository — pass `--image` repeatedly (up to 10) for multi-reference
+  editing; feed its printed caption to the image model as the prompt.
+
+  ## Behavior and constraints
+
+  - **Distilled package**: do not pass `guidance_scale` or a nonempty
+    `negative_prompt` — the model rejects them. Step count and flow shift
+    default to the package config (16 steps, shift 6.93); `--steps` and
+    `--flow-shift` override them.
+  - **Multi-reference editing**: I2I accepts up to 10 reference images, sent
+    in order as multiple `image_url` entries in the chat message. Prompts can
+    cite them by position ("the first image", "the second image", ...).
+  - **I2I has no strength parameter**: the reference image is fed to the DiT as
+    conditioning tokens and generation always starts from pure noise. The seed
+    controls how far the output drifts from the reference — some seeds stay
+    very close to the input, so change the seed when you want a bolder restyle.
+  - Startup logs show two benign `Error parsing config ... Should have a
+    'model_type' key` lines: the package's root `config.json` is a custom FLUX
+    format, and vLLM-Omni falls back to the Flux3 pipeline automatically.
+  - Bounding boxes on a 0-1000 grid can be embedded in the prompt to place,
+    move, recolor, or remove elements (see the model card).
+
+  ## Verified setup
+
+  Recipe validated end-to-end on 2026-10-15 with the day-0 image build
+  (arm64, CUDA 13.0) on a GB200: T2I 1024x1024 in ~2.1s and I2I in ~2.8s
+  after a ~105s engine startup; ~19 GiB GPU memory with the BF16 package.
+
+  ## References
+
+  - [FLUX 3 Image Klein model card](https://huggingface.co/black-forest-labs/flux-3-image-klein)
+  - [FLUX 3 Image Klein Base](https://huggingface.co/black-forest-labs/flux-3-image-klein-base) (undistilled, for fine-tuning / LoRA training)
+  - [FLUX 3 Image Klein PUP](https://huggingface.co/black-forest-labs/flux-3-image-klein-pup) (prompt upsampler)
+  - [vLLM-Omni](https://github.com/vllm-project/vllm-omni)

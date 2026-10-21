@@ -179,6 +179,11 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
         adapt_patch()
         init_ascend_config(vllm_config)
 
+        # Register Ascend LoRA classes for generic vLLM from_layer paths.
+        from vllm_ascend.lora.utils import refresh_all_lora_classes
+
+        refresh_all_lora_classes()
+
     @classmethod
     def configure_diffusion_vllm_config(cls, vllm_config: Any, od_config: Any) -> None:
         """Use the block geometry required by Ascend's native paged kernel."""
