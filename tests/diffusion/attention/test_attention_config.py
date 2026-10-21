@@ -267,7 +267,7 @@ class TestAttentionScheduleConfig:
         ids=["none", "empty", "no-profiles", "no-profiles-empty-default", "json", "typed"],
     )
     def test_schedule_without_profiles_is_no_schedule(self, raw):
-        # A config that can select nothing is no schedule.
+        # No schedule adds no compile boundary; a config that can select nothing is no schedule.
         assert parse_attention_schedule_config(raw) is None
         assert OmniDiffusionConfig(diffusion_attention_schedule=raw).diffusion_attention_schedule is None
 
@@ -334,6 +334,21 @@ class TestAttentionScheduleConfig:
                     "profiles": {"unused": {"default": {"backend": "TORCH_SDPA", "skip_softmax": {"threshold": 0.1}}}}
                 }
             )
+
+    def test_schedule_profiles_reject_full_compile_granularity(self):
+        # The eager boundary that scheduled attention layers call while compiling is tested under
+        # regional compilation only, so config creation rejects profiles with 'full', as it rejects
+        # 'full' with HSDP, sequence parallelism or offload.
+        raw = {"profiles": {"dense": {"default": "TORCH_SDPA"}}}
+        with pytest.raises(ValueError, match="'full' is incompatible with diffusion_attention_schedule"):
+            OmniDiffusionConfig(diffusion_attention_schedule=raw, diffusion_compile_granularity="full")
+        # The same profiles load with regional compilation, and a schedule without profiles is no
+        # schedule, so it loads with 'full'.
+        assert OmniDiffusionConfig(diffusion_attention_schedule=raw).diffusion_attention_schedule is not None
+        unscheduled = OmniDiffusionConfig(
+            diffusion_attention_schedule={"profiles": {}}, diffusion_compile_granularity="full"
+        )
+        assert unscheduled.diffusion_attention_schedule is None
 
 
 class TestAttentionConfig:
