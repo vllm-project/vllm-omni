@@ -27,6 +27,7 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.model_executor.parameter import ChannelQuantScaleParameter
 
 from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionMetadata,
@@ -117,6 +118,10 @@ class MiniMaxH3DiTArchConfig:
     timestep_input_dim: int = 256
     time_embed_hidden_size: int = 5376
     time_embed_dim: int = 2688
+    # ComfyUI's AdaLN-pruned checkpoints replace the dense time embedder with
+    # a small shared interpolation table and project its low-rank coordinates.
+    adaln_curve_grid: int | None = None
+    adaln_curve_dim: int = 8
     adaln_out_features: int = 18 * 5376
     final_adaln_out_features: int = 2 * 5376
     rope_inv_freq_len: int = 16
@@ -146,6 +151,10 @@ class MiniMaxH3DiTArchConfig:
         if len(arch.patch_size) != 3:
             raise ValueError(f"patch_size must contain three values, got {arch.patch_size!r}")
         return arch
+
+    @property
+    def adaln_input_dim(self) -> int:
+        return self.adaln_curve_dim if self.adaln_curve_grid is not None else self.time_embed_dim
 
 
 _ARCH_DEFAULTS = MiniMaxH3DiTArchConfig()
@@ -820,15 +829,17 @@ class MiniMaxH3AdalnProj(nn.Module):
         self.expand_ratio = expand_ratio
         self.modality_num = modality_num
         self.hidden_size = arch.hidden_size
+        self.apply_silu = arch.adaln_curve_grid is None
+        self.input_dtype = _BF16_DTYPE if self.apply_silu else _FP32_DTYPE
         # Allocate host weights from the start: moving them after construction
         # would still require enough VRAM for the complete resident model.
         with torch.device("cpu") if self._offload_weights else nullcontext():
             self.linear = ColumnParallelLinear(
-                arch.time_embed_dim,
+                arch.adaln_input_dim,
                 out_features,
                 bias=True,
                 gather_output=True,
-                params_dtype=_BF16_DTYPE,
+                params_dtype=self.input_dtype,
                 quant_config=quant_config,
                 prefix=f"{prefix}.linear",
             )
@@ -881,12 +892,12 @@ class MiniMaxH3AdalnProj(nn.Module):
         self._prepare_weight_stager(t_emb.device)
 
         def project() -> torch.Tensor:
-            x = nn.functional.silu(t_emb)
+            x = nn.functional.silu(t_emb) if self.apply_silu else t_emb
             if self._weight_stager is None:
-                return self.linear(x.to(_BF16_DTYPE))[0]
+                return self.linear(x.to(self.input_dtype))[0]
             self._weight_stager.load()
             try:
-                return self.linear(x.to(_BF16_DTYPE))[0]
+                return self.linear(x.to(self.input_dtype))[0]
             finally:
                 self._weight_stager.offload()
 
@@ -1157,6 +1168,13 @@ class MiniMaxH3FinalLayer(nn.Module):
         """
         shift, scale = self.adaln_proj(t_emb)
         h = self.norm(x)
+        # Comfy's out-of-place affine naturally promotes the normalized BF16
+        # activations when an AdaLN-curve checkpoint supplies FP32 modulation.
+        # Our fused affine writes in-place, so promote its destination first or
+        # the FP32 shift/scale contribution is silently rounded back to BF16.
+        # Dense checkpoints keep BF16 AdaLN inputs and retain the existing path.
+        if self.adaln_proj.input_dtype == _FP32_DTYPE:
+            h = h.to(_FP32_DTYPE)
         h = indexed_scale_shift_(h, shift, scale, inverse_indices)
         # Preserve full precision through both final output projections.
         h = h.to(_FP32_DTYPE)
@@ -1284,6 +1302,7 @@ class MiniMaxH3DiTModel(nn.Module):
         self,
         od_config: OmniDiffusionConfig,
         quant_config: QuantizationConfig | None = None,
+        arch_overrides: Mapping[str, Any] | None = None,
         *,
         diffusers_weights: bool | None = None,
         attention_cls: type[MiniMaxH3Attention] = MiniMaxH3Attention,
@@ -1291,6 +1310,8 @@ class MiniMaxH3DiTModel(nn.Module):
         super().__init__()
         tf_config = od_config.tf_model_config
         config_mapping = tf_config.to_dict() if hasattr(tf_config, "to_dict") else dict(tf_config)
+        if arch_overrides:
+            config_mapping.update(arch_overrides)
         # The native MiniMax-H3 Hub snapshot advertises the Diffusers
         # transformer class in its root config, while its FL2VA/Ref2VA
         # components still contain native weights.  The pipeline has already
@@ -1303,6 +1324,11 @@ class MiniMaxH3DiTModel(nn.Module):
         )
         self._rope_theta = float(config_mapping.get("rope_theta", 10000.0))
         arch = MiniMaxH3DiTArchConfig.from_mapping(config_mapping)
+        if arch.adaln_curve_grid is not None:
+            if arch.adaln_curve_grid < 2:
+                raise ValueError(f"adaln_curve_grid must be >= 2, got {arch.adaln_curve_grid}")
+            if arch.adaln_curve_dim <= 0:
+                raise ValueError(f"adaln_curve_dim must be positive, got {arch.adaln_curve_dim}")
         self.arch = arch
         cache_config = getattr(od_config, "cache_config", {})
         enabled = (
@@ -1346,6 +1372,13 @@ class MiniMaxH3DiTModel(nn.Module):
         )
         self.od_config = od_config
         self.parallel_config = od_config.parallel_config
+        # Comfy's serialized INT8 ConvRot checkpoint already stores fused QKV
+        # rows in runtime [Q-all, K-all, V-all] order.  Dense and online
+        # quantized MiniMax checkpoints retain the original grouped layout and
+        # still need the transform in load_weights().
+        self._qkv_checkpoint_is_runtime_layout = bool(
+            getattr(quant_config, "is_checkpoint_int8_convrot_serialized", False)
+        )
         self.hidden_size = arch.hidden_size
         self.num_attention_heads = arch.num_attention_heads
         self.num_channels_latents = arch.latents_dim
@@ -1391,10 +1424,21 @@ class MiniMaxH3DiTModel(nn.Module):
             quant_config=quant_config,
             prefix="condition_proj",
         )
-        self.time_embedder = MiniMaxH3TimeEmbedder(
-            arch,
-            prefix="time_embedder",
-        )
+        if arch.adaln_curve_grid is None:
+            self.time_embedder: MiniMaxH3TimeEmbedder | None = MiniMaxH3TimeEmbedder(
+                arch,
+                prefix="time_embedder",
+            )
+        else:
+            self.time_embedder = None
+            self.register_buffer(
+                "adaln_t_table",
+                torch.empty(
+                    arch.adaln_curve_grid,
+                    arch.adaln_curve_dim,
+                    dtype=_FP32_DTYPE,
+                ),
+            )
         self.rope = MiniMaxH3Rope(arch.rope_inv_freq_len)
         self.token_refiner = MiniMaxH3TokenRefiner(
             arch,
@@ -1424,6 +1468,9 @@ class MiniMaxH3DiTModel(nn.Module):
             adaln_cache=self.adaln_cache,
         )
         self._mark_missing_params_required()
+        validate_bindings = getattr(quant_config, "validate_model_bindings", None)
+        if callable(validate_bindings):
+            validate_bindings(self)
 
     def enable_vsa_gates(self, *, sparsity: float | None = None) -> None:
         """Give every DiT block's attention a VSA compression gate.
@@ -1526,6 +1573,8 @@ class MiniMaxH3DiTModel(nn.Module):
         for name, param in self.named_parameters():
             if name in MINIMAX_H3_FP32_PARAM_NAMES and param.dtype != _FP32_DTYPE:
                 raise ValueError(f"{name} must stay fp32 after load, got {param.dtype}.")
+            if self.arch.adaln_curve_grid is not None and ".adaln_proj.linear." in name and param.dtype != _FP32_DTYPE:
+                raise ValueError(f"{name} must stay fp32 for an AdaLN-curve checkpoint, got {param.dtype}.")
         for name, buffer in self.named_buffers():
             if name in MINIMAX_H3_FP32_BUFFER_NAMES and buffer.dtype != _FP32_DTYPE:
                 raise ValueError(f"{name} must stay fp32 after load, got {buffer.dtype}.")
@@ -1548,6 +1597,11 @@ class MiniMaxH3DiTModel(nn.Module):
         qkv_parts: dict[str, set[str]] = {}
         source_names: set[str] = set()
         for name, loaded_weight in weights:
+            if name.endswith(".comfy_quant"):
+                # Marker JSON was validated before construction.  It is a
+                # checkpoint protocol tensor, not executable model state.
+                loaded.add(name)
+                continue
             layout = "plain"
             if diffusers_weights:
                 if name in source_names:
@@ -1564,23 +1618,37 @@ class MiniMaxH3DiTModel(nn.Module):
                     raise ValueError(f"Diffusers H3 weight has no model parameter: {name}")
                 logger.warning("Skipping MiniMax H3 weight not present in model: %s", name)
                 continue
+            # Comfy serializes row scales as either [N] or [N, 1]. Normalize
+            # only our channel-scale parameter; other quantizers may attach a
+            # different meaning and loader contract to a 1-D weight_scale.
+            if (
+                isinstance(param, ChannelQuantScaleParameter)
+                and loaded_weight.dim() == 1
+                and param.dim() == 2
+                and param.shape[1] == 1
+            ):
+                loaded_weight = loaded_weight.unsqueeze(1)
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
+            is_channel_scale = isinstance(param, ChannelQuantScaleParameter)
             if layout in {"q", "k", "v"}:
                 # vLLM can load each projection directly into its packed QKV
                 # parameter, including TP slicing and online quantization.
                 weight_loader(param, loaded_weight, layout)
                 qkv_parts.setdefault(name, set()).add(layout)
-            elif name.endswith(".attn.qkv_proj.weight"):
-                # Transform checkpoint layout before entering vLLM's loader so
-                # online FP8 can keep ``online_process_loader`` outermost.
-                loaded_weight = _reorder_grouped_qkv_to_qkv(
-                    loaded_weight,
-                    num_query_groups=self.arch.num_attention_heads,
-                    heads_per_group=1,
-                    head_dim=self.arch.attention_head_dim,
-                )
+            elif name.endswith(".attn.qkv_proj.weight") or (
+                name.endswith(".attn.qkv_proj.weight_scale") and is_channel_scale
+            ):
+                if not getattr(self, "_qkv_checkpoint_is_runtime_layout", False):
+                    # Transform checkpoint layout before entering vLLM's loader
+                    # so online FP8 can keep ``online_process_loader`` outermost.
+                    loaded_weight = _reorder_grouped_qkv_to_qkv(
+                        loaded_weight,
+                        num_query_groups=self.arch.num_attention_heads,
+                        heads_per_group=1,
+                        head_dim=self.arch.attention_head_dim,
+                    )
                 weight_loader(param, loaded_weight)
-            elif name.endswith(".mlp.fc1.weight"):
+            elif name.endswith(".mlp.fc1.weight") or (name.endswith(".mlp.fc1.weight_scale") and is_channel_scale):
                 if loaded_weight.shape[0] % 2:
                     raise ValueError(
                         "MiniMax H3 fc1 checkpoint rows must split evenly into "
@@ -1607,6 +1675,16 @@ class MiniMaxH3DiTModel(nn.Module):
             default_weight_loader(params["rope.inv_freq"], rope)
             loaded.add("rope.inv_freq")
         return loaded
+
+    def _embed_timesteps(self, unique_timesteps: torch.Tensor) -> torch.Tensor:
+        if self.time_embedder is not None:
+            return self.time_embedder(unique_timesteps)
+
+        table = self.adaln_t_table
+        positions = unique_timesteps.to(_FP32_DTYPE).clamp(0.0, 1.0) * (table.shape[0] - 1)
+        lower = positions.floor().to(torch.long).clamp(max=table.shape[0] - 2)
+        fraction = (positions - lower).unsqueeze(1)
+        return torch.lerp(table[lower], table[lower + 1], fraction)
 
     @staticmethod
     def _pos_ids(pos_info: Any, key: str) -> torch.Tensor:
@@ -1734,7 +1812,7 @@ class MiniMaxH3DiTModel(nn.Module):
             audio_embed.to(_BF16_DTYPE)[: audio_local_pos.shape[0]],
         )
 
-        t_emb = self.time_embedder(unique_timesteps)
+        t_emb = self._embed_timesteps(unique_timesteps)
         return embeddings, t_emb
 
     def forward(self, **kwargs: Any) -> tuple[torch.Tensor, torch.Tensor]:

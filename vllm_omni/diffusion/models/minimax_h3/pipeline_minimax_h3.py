@@ -110,6 +110,11 @@ from vllm_omni.quantization.component_config import (
 )
 
 from .batched_packing import minimax_h3_batched_forward_kwargs
+from .comfy_checkpoint import (
+    MiniMaxH3ComfyCheckpoint,
+    inspect_comfy_checkpoint,
+    resolve_comfy_checkpoint_path,
+)
 from .condition_noise import (
     minimax_h3_audio_cond_noise_aug_rows,
     minimax_h3_imgvid_cond_noise_aug_rows,
@@ -223,6 +228,22 @@ MINIMAX_H3_DIFFUSION_DOWNLOAD_PATTERNS = {
 }
 
 
+def _validate_int8_convrot_override_pair(
+    transformer_override: bool,
+    transformer_quant_config: QuantizationConfig | None,
+) -> None:
+    uses_int8_convrot = transformer_quant_config is not None and transformer_quant_config.get_name() == "int8_convrot"
+    if transformer_override and not uses_int8_convrot:
+        raise ValueError(
+            "A Comfy INT8 ConvRot transformer checkpoint requires component quantization "
+            '`{"transformer":{"method":"int8_convrot"}}`.'
+        )
+    if uses_int8_convrot and not transformer_override:
+        raise ValueError(
+            'MiniMax-H3 int8_convrot quantization requires a validated Comfy checkpoint in model_paths["transformer"].'
+        )
+
+
 def _resolve_minimax_h3_text_encoder_quant_config(
     quant_config: QuantizationConfig | None,
 ) -> QuantizationConfig | None:
@@ -243,13 +264,26 @@ def _resolve_minimax_h3_model_root(
     partition: str,
     *,
     load_text_encoder: bool,
+    skip_transformer: bool = False,
 ) -> Path:
+    if skip_transformer and is_minimax_h3_modular(model, revision):
+        # FastH3 modular releases replace the whole native transformer.
+        raise ValueError("A MiniMax-H3 transformer override requires a native FL2VA/Ref2VA release, not FastH3.")
     path = Path(model)
     if path.is_dir():
         if path.name in {"FL2VA", "Ref2VA"}:
             return path.parent
         return path
-    if is_minimax_h3_modular(model, revision):
+    if skip_transformer:
+        if partition == "combined":
+            raise ValueError("A MiniMax-H3 transformer override does not support combined mode.")
+        prefix = {"fl2va": "FL2VA", "ref2va": "Ref2VA"}[partition]
+        components = ["model_index.json"]
+        if load_text_encoder:
+            components.extend(["tokenizer/**", "processor/**", "text_encoder/**"])
+        components.extend(["transformer/config.json", "video_vae/**", "audio_vae/**"])
+        allow_patterns = [f"{prefix}/{component}" for component in components]
+    elif is_minimax_h3_modular(model, revision):
         allow_patterns = ["modular_model_index.json", "fastvideo_inference.json", "provenance.json", "transformer/**"]
         if load_text_encoder:
             allow_patterns += ["text_encoder/**", "tokenizer/**", "processor/**"]
@@ -356,6 +390,9 @@ def resolve_minimax_h3_diffusion_model_path(
     model: str,
     revision: str | None,
     task_type: str | None,
+    *,
+    model_paths: Mapping[str, str] | None = None,
+    use_hsdp: bool | None = None,
 ) -> str:
     """Resolve a repository root or Hub ID to its startup partition."""
     partition = (
@@ -363,11 +400,15 @@ def resolve_minimax_h3_diffusion_model_path(
         if str(task_type or "").lower() == "combined"
         else resolve_minimax_h3_partition(model, task_type, auto_partition="fl2va")
     )
+    transformer_override = bool(model_paths and model_paths.get("transformer"))
+    if transformer_override and use_hsdp:
+        raise ValueError("MiniMax-H3 INT8 ConvRot currently supports tensor parallelism, not HSDP/FSDP.")
     model_root = _resolve_minimax_h3_model_root(
         model,
         revision,
         partition,
         load_text_encoder=False,
+        skip_transformer=transformer_override,
     )
     if is_minimax_h3_modular(str(model_root), revision):
         return str(model_root)
@@ -928,11 +969,15 @@ class MiniMaxH3Pipeline(
         self._turbo_lora_specs: dict[int, TurboSpec] = {}
         self._native_lora_adapter_ids: set[int] = set()
         self._lora_sigma_schedules: dict[int, DMD2SigmaSchedule] = {}
+        transformer_override = od_config.model_paths.get("transformer")
+        if transformer_override and bool(getattr(self.parallel_config, "use_hsdp", False)):
+            raise ValueError("MiniMax-H3 INT8 ConvRot currently supports tensor parallelism, not HSDP/FSDP.")
         model_root = _resolve_minimax_h3_model_root(
             str(od_config.model),
             od_config.revision,
             self.partition,
             load_text_encoder=self.load_text_encoder,
+            skip_transformer=bool(transformer_override),
         )
         if modular:
             model_path = model_root
@@ -979,15 +1024,50 @@ class MiniMaxH3Pipeline(
         if ref2va_model_path is not None:
             self._base_schedule_by_partition["ref2va"] = _read_base_schedule(ref2va_release)
 
-        self.weights_sources = [
-            DiffusersPipelineLoader.ComponentSource(
-                model_or_path=str(model_path),
-                subfolder="transformer",
-                revision=od_config.revision,
-                prefix="transformer.",
-                fall_back_to_pt=False,
+        transformer_quant_config = _resolve_component_quant_config(
+            od_config.quantization_config,
+            "transformer",
+        )
+        _validate_int8_convrot_override_pair(
+            bool(transformer_override),
+            transformer_quant_config,
+        )
+        transformer_checkpoint: MiniMaxH3ComfyCheckpoint | None = None
+        if transformer_override:
+            if self.partition == "combined":
+                raise ValueError(
+                    "A Comfy MiniMax-H3 transformer override currently supports one partition at a time; "
+                    "start FL2VA or Ref2VA instead of combined mode."
+                )
+            checkpoint_path = resolve_comfy_checkpoint_path(transformer_override)
+            transformer_checkpoint = inspect_comfy_checkpoint(
+                checkpoint_path,
+                expected_partition=expected_partition,
             )
-        ]
+            configure_layers = getattr(transformer_quant_config, "configure_layers", None)
+            if configure_layers is None:
+                raise TypeError("The active int8_convrot config cannot consume checkpoint layer metadata.")
+            configure_layers(transformer_checkpoint.layer_configs)
+            self.weights_sources = [
+                DiffusersPipelineLoader.ComponentSource(
+                    model_or_path=str(checkpoint_path.parent),
+                    subfolder=None,
+                    revision=None,
+                    prefix="transformer.",
+                    fall_back_to_pt=False,
+                    allow_patterns_overrides=[checkpoint_path.name],
+                )
+            ]
+        else:
+            self.weights_sources = [
+                DiffusersPipelineLoader.ComponentSource(
+                    model_or_path=str(model_path),
+                    subfolder="transformer",
+                    revision=od_config.revision,
+                    prefix="transformer.",
+                    fall_back_to_pt=False,
+                )
+            ]
         self._dit_modules = ["transformer"]
         if ref2va_model_path is not None:
             self.weights_sources.append(
@@ -1000,15 +1080,16 @@ class MiniMaxH3Pipeline(
                 )
             )
             self._dit_modules.append("transformers_ref")
-        transformer_quant_config = _resolve_component_quant_config(
-            od_config.quantization_config,
-            "transformer",
-        )
         transformer_cls = type(self)._transformer_cls or MiniMaxH3DiTModel
+        # Only the ConvRot checkpoint carries arch overrides; subclass DiTs
+        # (e.g. TaoMate-H3) do not accept the argument.
+        transformer_kwargs: dict[str, Any] = {"diffusers_weights": modular}
+        if transformer_checkpoint is not None:
+            transformer_kwargs["arch_overrides"] = transformer_checkpoint.arch_overrides
         self.transformer = transformer_cls(
             od_config,
             quant_config=transformer_quant_config,
-            diffusers_weights=modular,
+            **transformer_kwargs,
         )
         if self._fasth3_checkpoint is not None:
             self.transformer.enable_vsa_gates(sparsity=self._fasth3_checkpoint.vsa_sparsity)
@@ -1028,6 +1109,8 @@ class MiniMaxH3Pipeline(
             # The hybrid modules must exist before the branch tensors stream in.
             self.transformer.enable_vdn(self._vdn.config)
         self._fasth3 = resolve_fasth3_fusion(od_config, self.transformer) if self._vdn is None else None
+        if transformer_checkpoint is not None and (self._vdn is not None or self._fasth3 is not None):
+            raise ValueError("FastH3/VDN-H3 weight deltas cannot be fused into rotated INT8 ConvRot weights.")
         if self._fasth3 is not None and self._fasth3.requires_vsa:
             # The artifact assigns a compression gate per DiT block, so those
             # modules have to exist before load_weights streams them in. Only
