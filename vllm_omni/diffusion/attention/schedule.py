@@ -140,10 +140,14 @@ def resolve_attention_schedule(
 def resolve_request_attention_schedule(
     sampling_params: "OmniDiffusionSamplingParams", service: "AttentionScheduleConfig | None"
 ) -> AttentionSchedule:
-    """Resolve one request's schedule against the service configuration."""
+    """Resolve one request's schedule against the service configuration.
+
+    Non-empty request sigma windows replace the service step ranges too, so only one kind applies.
+    """
     if service is None:
         return resolve_attention_schedule(sampling_params.attention_schedule, (), profiles=())
-    return resolve_attention_schedule(sampling_params.attention_schedule, service.default, profiles=service.profiles)
+    default = () if sampling_params.attention_sigma_schedule else service.default
+    return resolve_attention_schedule(sampling_params.attention_schedule, default, profiles=service.profiles)
 
 
 def batch_attention_schedule(schedules: Iterable[AttentionSchedule]) -> AttentionSchedule:
@@ -340,11 +344,15 @@ def select_attention_profile_by_sigma(schedule: AttentionSigmaSchedule, sigma: f
 def resolve_request_attention_sigma_schedule(
     sampling_params: "OmniDiffusionSamplingParams", service: "AttentionScheduleConfig | None"
 ) -> AttentionSigmaSchedule:
-    """Resolve one request's sigma windows against the service configuration."""
+    """Resolve one request's sigma windows against the service configuration.
+
+    Non-empty request step ranges replace the service sigma windows too, so only one kind applies.
+    """
     if service is None:
         return resolve_attention_sigma_schedule(sampling_params.attention_sigma_schedule, (), profiles=())
+    default = () if sampling_params.attention_schedule else service.sigma
     return resolve_attention_sigma_schedule(
-        sampling_params.attention_sigma_schedule, service.sigma, profiles=service.profiles
+        sampling_params.attention_sigma_schedule, default, profiles=service.profiles
     )
 
 
@@ -373,6 +381,7 @@ def validate_request_attention_schedules(
     sigma_schedule = resolve_request_attention_sigma_schedule(sampling_params, service)
     if step_schedule and sigma_schedule:
         raise ValueError(
-            "a request cannot combine attention_schedule with attention_sigma_schedule, including one inherited "
-            "from the server default; send attention_schedule=[] or attention_sigma_schedule=[] to disable the other"
+            "a request cannot combine attention_schedule with attention_sigma_schedule, including one set by the "
+            "stage's default_sampling_params; send attention_schedule=[] or attention_sigma_schedule=[] to disable "
+            "the other"
         )
