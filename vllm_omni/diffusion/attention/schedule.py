@@ -181,6 +181,10 @@ ATTENTION_SCHEDULE_PIPELINES: Mapping[str, str] = {
     "MiniMaxH3Pipeline": "MiniMax-H3",
 }
 
+# Decode-only stages run no denoising. Multi-stage endpoints copy the request's diffusion params to
+# every diffusion stage, so these stages drop the request schedule instead of rejecting it.
+DECODE_ONLY_PIPELINES = frozenset({"MiniMaxH3DecoderPipeline"})
+
 
 def unsupported_attention_schedule_error(reason: str) -> ValueError:
     """The one startup error for a schedule configuration this service cannot run yet."""
