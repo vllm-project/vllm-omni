@@ -1,8 +1,11 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import pytest
 import torch
 
 from vllm_omni.utils import mm_outputs as mm_outputs_mod
-from vllm_omni.utils.mm_outputs import build_mm_cpu
+from vllm_omni.utils.mm_outputs import build_mm_cpu, split_mapping_outputs, to_payload_element
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -145,3 +148,36 @@ def test_build_mm_cpu_preserves_nested_and_non_tensor_payload_semantics():
     assert torch.equal(result["grad_key"], grad_tensor.detach())
 
     assert result["scalar"] == 42
+
+
+@pytest.mark.parametrize("sr", [24000, torch.tensor(24000)])
+def test_split_mapping_outputs_broadcasts_invariants_and_indexes_lists(sr):
+    waveforms = [torch.zeros(4), torch.ones(4)]
+
+    payloads = split_mapping_outputs(
+        {"model_outputs": waveforms, "sr": sr},
+        num_reqs=2,
+        copy_tensor=torch.Tensor.clone,
+    )
+
+    # Both the int and the int wrapped as a 0d tensor should be canonicalized to a wrapped tensor
+    for payload, waveform in zip(payloads, waveforms, strict=True):
+        model_outputs = payload["model_outputs"]
+        assert isinstance(model_outputs, torch.Tensor) and torch.equal(model_outputs, waveform)
+        assert torch.equal(torch.as_tensor(payload["sr"]), torch.tensor(24000))
+
+
+def test_split_mapping_outputs_rejects_misaligned_lists():
+    with pytest.raises(ValueError, match="one entry per request"):
+        split_mapping_outputs(
+            {"model_outputs": [torch.zeros(4)]},
+            num_reqs=2,
+            copy_tensor=torch.Tensor.clone,
+        )
+
+
+def test_to_payload_element_shares_0d_tensor_with_every_request():
+    sr = torch.tensor(24000)
+    for idx in range(2):
+        payload = to_payload_element(sr, idx=idx, start=idx, end=idx + 1, seq_len=2, scheduled_seq_len=2)
+        assert torch.equal(payload, sr)

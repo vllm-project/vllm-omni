@@ -271,16 +271,22 @@ class OmniCoordinator:
 
             with self._pending_lock:
                 has_pending_broadcast = self._pending_broadcast
+                if has_pending_broadcast:
+                    # Clear before the snapshot. A replica event handled while
+                    # this flush is in flight sets the flag again and is sent
+                    # on the next tick. Clearing after a successful send drops
+                    # that event until the next keepalive.
+                    self._pending_broadcast = False
 
             if not has_pending_broadcast:
                 if self._stop_event.wait(timeout=loop_interval):
                     break
                 continue
 
-            # Publish outside lock. Clear pending only on success.
-            if self.publish_replica_list_update():
-                with self._pending_lock:
-                    self._pending_broadcast = False
+            # Publish outside the lock. A dropped send must be retried;
+            # events that arrived during the send already re-armed the flag.
+            if not self.publish_replica_list_update():
+                self._schedule_broadcast()
 
             if self._stop_event.wait(timeout=loop_interval):
                 break

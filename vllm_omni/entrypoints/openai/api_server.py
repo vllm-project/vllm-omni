@@ -35,7 +35,6 @@ from starlette.datastructures import State
 from starlette.types import ASGIApp, Receive, Scope, Send
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.anthropic.serving import AnthropicServingMessages
-from vllm.entrypoints.chat_utils import ChatTemplateConfig, load_chat_template
 from vllm.entrypoints.generate.base.protocol import RequestResponseMetadata
 from vllm.entrypoints.launchers.cli_args import make_arg_parser
 from vllm.entrypoints.launchers.launcher import serve_http
@@ -81,6 +80,7 @@ from vllm.entrypoints.speech_to_text.translation.serving import (
     OpenAIServingTranslation,
 )
 from vllm.logger import configure_logging_from_args, init_logger
+from vllm.renderers.chat_utils import ChatTemplateConfig, load_chat_template
 from vllm.renderers.online_renderer import OnlineRenderer
 from vllm.tasks import POOLING_TASKS
 from vllm.tool_parsers import ToolParserManager
@@ -428,6 +428,13 @@ async def omni_run_server_worker(
         _register_omni_exception_handlers(app)
 
         await omni_init_app_state(engine_client, app.state, args)
+
+        # The inherited routes assume a tokenization handler. Pure diffusion
+        # has none; omit those capabilities instead of dereferencing None.
+        if getattr(app.state, "serving_tokenization", None) is None:
+            remove_route_from_app(app, "/tokenize", {"POST"})
+            remove_route_from_app(app, "/detokenize", {"POST"})
+            remove_route_from_app(app, "/tokenizer_info", {"GET"})
 
         # After initializing the app state, shut down any endpoints that are model specific
         if hasattr(engine_client, "endpoint_restrictions"):

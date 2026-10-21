@@ -276,18 +276,19 @@ class StepAudio2Token2WavCore(nn.Module):
 
         self._spk_model = get_campplus_trt(f"{self.model_path}/campplus.onnx", device=self.device)
 
-    def enable_device_spk_embedding(self) -> None:
+    def enable_device_spk_embedding(self, *, use_trt: bool = True) -> None:
         """Swap the CPU onnxruntime campplus session for an on-device model.
 
-        CUDA: shared TensorRT engine (same as :meth:`enable_trt_spk_embedding`).
-        Other devices (e.g. Ascend NPU): torch CAMPPlus loaded from the same
+        CUDA defaults to the shared TensorRT engine. Set ``use_trt=False``
+        to use torch without a TensorRT dependency.
+        Other devices (e.g. Ascend NPU) use torch CAMPPlus loaded from the same
         campplus.onnx weights — same architecture and I/O contract, no
         per-request ``.cpu().numpy()`` host round-trip.
 
         Like :meth:`enable_trt_spk_embedding`, this only installs the callable;
         the remaining token2wav modules stay lazy and load on first forward.
         """
-        if self.device.type == "cuda":
+        if self.device.type == "cuda" and use_trt:
             self.enable_trt_spk_embedding()
             return
         from vllm_omni.model_executor.models.cosyvoice3.speaker_embedding_torch import get_campplus_torch

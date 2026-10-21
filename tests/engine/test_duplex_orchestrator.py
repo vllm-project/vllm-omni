@@ -13,6 +13,7 @@ from typing import Any
 
 import numpy as np
 import pytest
+from vllm.outputs import CompletionOutput
 from vllm.v1.engine import FinishReason
 from vllm.v1.engine.exceptions import EngineDeadError
 
@@ -45,6 +46,7 @@ from vllm_omni.engine.orchestrator import Orchestrator, OrchestratorRequestState
 from vllm_omni.engine.stage_pool import StageUnavailableError
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.plugin import MiniCPMO45DuplexPlugin
 from vllm_omni.model_executor.models.qwen3_omni.duplex.plugin import Qwen3OmniDuplexPlugin
+from vllm_omni.outputs import OmniRequestOutput
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -181,6 +183,82 @@ def _tts_output(request_id: str, *, samples: int = 24000, text: str = "hello") -
             "meta.duplex_epoch": np.array([0], dtype=np.int32),
         },
     )
+
+
+def _audio_request_output(
+    request_id: str,
+    *,
+    samples: int,
+    finished: bool,
+    text: str = "hello",
+    turn_end: bool = False,
+) -> OmniRequestOutput:
+    multimodal: dict[str, object] = {
+        "audio": np.zeros(samples, dtype=np.float32),
+        "sr": 24000,
+        "meta.duplex_turn_id": np.array([0], dtype=np.int32),
+        "meta.duplex_epoch": np.array([0], dtype=np.int32),
+    }
+    if turn_end:
+        multimodal["turn_end"] = True
+    return OmniRequestOutput(
+        request_id=request_id,
+        finished=finished,
+        final_output_type="audio",
+        outputs=[
+            CompletionOutput(
+                index=0,
+                text=text,
+                token_ids=[],
+                cumulative_logprob=0.0,
+                logprobs=None,
+                finish_reason="stop" if finished else None,
+            )
+        ],
+        _multimodal_output=multimodal,
+    )
+
+
+async def _route_raw_codec_output(
+    orchestrator: DuplexOrchestrator,
+    *,
+    stage_id: int,
+    request_id: str,
+    processed: OmniRequestOutput,
+    is_segment_finished: bool,
+    finish_reason: FinishReason | None = FinishReason.STOP,
+) -> None:
+    """Drive one codec poll through raw bookkeeping, the interceptor, and the projector.
+
+    Session-owned requests skip ``_finish_raw_terminal_requests``. The raw
+    record these tests lock is ``finished_stage_ids`` from
+    ``_apply_raw_terminal_stage_finish``.
+    """
+    orchestrator.stage_pools[stage_id].output_processor.request_outputs = [processed]
+    raw = OmniEngineCoreOutputs(
+        outputs=[
+            OmniEngineCoreOutput(
+                request_id=request_id,
+                new_token_ids=[],
+                finish_reason=finish_reason,
+                is_segment_finished=is_segment_finished,
+            )
+        ]
+    )
+    terminal: set[str] = set()
+    routed = await orchestrator._process_llm_stage_outputs(stage_id, 0, raw, terminal)
+    await orchestrator._handle_processed_outputs(stage_id, 0, routed)
+    await orchestrator._finish_raw_terminal_requests(stage_id, 0, terminal)
+    await _settle(orchestrator)
+
+
+async def _drain_events(output_buffer: DuplexOutputBuffer, output_q: asyncio.Queue) -> list[Any]:
+    events = [await output_buffer.get() for _ in range(output_buffer.pending_events)]
+    while not output_q.empty():
+        message = output_q.get_nowait()
+        event = getattr(message, "event", message)
+        events.append(event)
+    return events
 
 
 # --------------------------------------------------------------------------- #
@@ -567,6 +645,108 @@ async def test_session_owned_outputs_reach_the_runner_and_never_the_client_queue
     )
     assert await orchestrator._intercept_stage_output(1, 0, _tts_output(orphan.request_id), orphan, None, None)
     await orchestrator.session_manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_streaming_segment_stop_keeps_response_open_until_real_terminal(mocker) -> None:
+    """Codec segment EOS must not close the duplex response before the real stop."""
+    orchestrator, _, rpc_q, output_q = _build(stages=2)
+    output_buffer = DuplexOutputBuffer(max_bytes=2 * 1024 * 1024, max_events=512)
+    await _open(orchestrator, rpc_q, output_buffer=output_buffer)
+    request_id = _stage0_request_id()
+    await _submit(orchestrator, _append_audio())
+    request_state = orchestrator.request_states[request_id]
+    assert request_state.streaming.enabled is True
+    session = orchestrator.session_manager.get(SESSION_ID)
+    assert session is not None
+    while output_buffer.pending_events:
+        await output_buffer.get()
+    mocker.patch.object(orchestrator, "_handle_kv_ready_raw_outputs", new_callable=mocker.AsyncMock)
+
+    try:
+        await _route_raw_codec_output(
+            orchestrator,
+            stage_id=1,
+            request_id=request_id,
+            processed=_audio_request_output(request_id, samples=2400, finished=True, text="seg"),
+            is_segment_finished=True,
+        )
+        after_segment = await _drain_events(output_buffer, output_q)
+        assert any(event.type == "response.output_audio.delta" for event in after_segment)
+        assert not any(event.type == "response.done" for event in after_segment)
+        assert session.active_response_id is not None
+        assert request_state.streaming.segment(1).finished is True
+        assert request_id in orchestrator.request_states
+        assert 1 not in request_state.finished_stage_ids
+        assert 1 not in request_state.finished_final_output_stage_ids
+
+        await _route_raw_codec_output(
+            orchestrator,
+            stage_id=1,
+            request_id=request_id,
+            processed=_audio_request_output(request_id, samples=7200, finished=False, text="more"),
+            is_segment_finished=False,
+            finish_reason=None,
+        )
+        after_more = await _drain_events(output_buffer, output_q)
+        assert any(event.type == "response.output_audio.delta" for event in after_more)
+        assert not any(event.type == "response.done" for event in after_more)
+        assert session.active_response_id is not None
+
+        response_id = session.active_response_id
+        await _route_raw_codec_output(
+            orchestrator,
+            stage_id=1,
+            request_id=request_id,
+            processed=_audio_request_output(request_id, samples=8400, finished=True, text="end", turn_end=True),
+            is_segment_finished=False,
+        )
+        after_terminal = await _drain_events(output_buffer, output_q)
+        done = [event for event in after_terminal if event.type == "response.done"]
+        assert len(done) == 1
+        assert done[0].response_id == response_id
+        assert done[0].status == "completed"
+        assert session.active_response_id is None
+        assert 1 in request_state.finished_stage_ids
+        assert 1 in request_state.finished_final_output_stage_ids
+    finally:
+        await orchestrator.session_manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_non_streaming_terminal_completes_the_response_once(mocker) -> None:
+    """A finished codec stop with is_segment_finished=False still ends exactly once."""
+    orchestrator, _, rpc_q, output_q = _build(stages=2)
+    output_buffer = DuplexOutputBuffer(max_bytes=2 * 1024 * 1024, max_events=512)
+    await _open(orchestrator, rpc_q, output_buffer=output_buffer)
+    request_id = _stage0_request_id()
+    await _submit(orchestrator, _append_audio())
+    request_state = orchestrator.request_states[request_id]
+    session = orchestrator.session_manager.get(SESSION_ID)
+    assert session is not None
+    while output_buffer.pending_events:
+        await output_buffer.get()
+    mocker.patch.object(orchestrator, "_handle_kv_ready_raw_outputs", new_callable=mocker.AsyncMock)
+
+    try:
+        await _route_raw_codec_output(
+            orchestrator,
+            stage_id=1,
+            request_id=request_id,
+            processed=_audio_request_output(request_id, samples=2400, finished=True, text="done", turn_end=True),
+            is_segment_finished=False,
+        )
+        events = await _drain_events(output_buffer, output_q)
+        done = [event for event in events if event.type == "response.done"]
+        assert any(event.type == "response.output_audio.delta" for event in events)
+        assert len(done) == 1
+        assert done[0].status == "completed"
+        assert session.active_response_id is None
+        assert request_state.streaming.segment(1).finished is False
+        assert 1 in request_state.finished_stage_ids
+        assert 1 in request_state.finished_final_output_stage_ids
+    finally:
+        await orchestrator.session_manager.shutdown()
 
 
 @pytest.mark.asyncio

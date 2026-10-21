@@ -46,9 +46,12 @@ from vllm_omni.diffusion.distributed.sp_plan import (
 from vllm_omni.diffusion.forward_context import get_forward_context
 from vllm_omni.diffusion.layers.adalayernorm import AdaLayerNorm
 from vllm_omni.diffusion.layers.fused_qk_norm_rope import (
+    QK_NORM_ROPE_TABLE_KEY,
     _fused_cuda_supported,
+    fused_joint_qkv_norm_rope,
     fused_qk_norm_rope,
     fused_qk_norm_rope_min_tokens,
+    pack_qk_norm_rope_table,
 )
 from vllm_omni.diffusion.layers.qwen_select01_modulation import (
     can_use_qwen_select01_triton,
@@ -60,9 +63,36 @@ from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 
 logger = init_logger(__name__)
 
-# Fuse only when B*S >= this; below it host launch overhead dominates (#7780).
-# Override: VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS (0 = always fuse).
+# Default token gate: fuse only when B*S >= this; below it host launch overhead
+# dominates (#7780). VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS overrides it for both
+# the joint and the per-stream path (0 = always fuse; a very large value disables
+# fusion), read at forward time.
 _FUSED_MIN_TOKENS = 2048
+
+
+def _fused_min_tokens() -> int:
+    return fused_qk_norm_rope_min_tokens(_FUSED_MIN_TOKENS)
+
+
+def _packed_qk_norm_rope_table(
+    vid_freqs: torch.Tensor,
+    txt_freqs: torch.Tensor,
+    batch_size: int,
+    activation_dtype: torch.dtype,
+) -> torch.Tensor | None:
+    """Pack text/image frequencies into a text-first ``[B*S, D]`` FP32 table.
+
+    Same coefficients and token gate as the per-stream fusion, including the
+    ``VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS`` override. ``None`` when the CUDA
+    kernel would not run or the joint sequence ``B*(S_txt+S_img)`` is below the
+    gate.
+    """
+    freqs = torch.cat((txt_freqs, vid_freqs), dim=0)
+    if batch_size * freqs.shape[0] < _fused_min_tokens():
+        return None
+    return pack_qk_norm_rope_table(
+        freqs.real, freqs.imag, batch_size, dtype=torch.float32, activation_dtype=activation_dtype
+    )
 
 
 def _qwen_image_qk_norm_rope(
@@ -82,7 +112,7 @@ def _qwen_image_qk_norm_rope(
     tokens = batch * seq_len
     if (
         use_fused
-        and tokens >= fused_qk_norm_rope_min_tokens(_FUSED_MIN_TOKENS)
+        and tokens >= _fused_min_tokens()
         and _fused_cuda_supported(q, k, head_dim, rotary_dim, interleaved=True)
     ):
         num_kv_heads = k.shape[2]
@@ -726,6 +756,7 @@ class QwenImageCrossAttention(nn.Module):
         txt_freqs: torch.Tensor,
         hidden_states_mask: torch.Tensor | None = None,
         encoder_hidden_states_mask: torch.Tensor | None = None,
+        qk_norm_rope_table: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         img_qkv, _ = self.to_qkv(hidden_states)
         q_size = self.query_num_heads * self.head_dim
@@ -745,36 +776,60 @@ class QwenImageCrossAttention(nn.Module):
         txt_key = txt_key.unflatten(-1, (self.add_kv_num_heads, self.head_dim))
         txt_value = txt_value.unflatten(-1, (self.add_kv_num_heads, self.head_dim))
 
-        img_query, img_key = _qwen_image_qk_norm_rope(
-            img_query,
-            img_key,
-            self.norm_q,
-            self.norm_k,
-            vid_freqs,
-            self.rope,
-            self.eps,
-            use_fused=self.qk_norm,
-        )
-        txt_query, txt_key = _qwen_image_qk_norm_rope(
-            txt_query,
-            txt_key,
-            self.norm_added_q,
-            self.norm_added_k,
-            txt_freqs,
-            self.rope,
-            self.eps,
-        )
-
         seq_len_txt = encoder_hidden_states.shape[1]
-        joint_query = torch.cat([txt_query, img_query], dim=1)
-        joint_key = torch.cat([txt_key, img_key], dim=1)
-        joint_value = torch.cat([txt_value, img_value], dim=1)
+        sp_active = self.parallel_config is not None and self.parallel_config.sequence_parallel_size > 1
+        use_sp_joint_attention = sp_active and not get_forward_context().split_text_embed_in_sp
+        # One launch for both streams, writing the joint [B, S_txt+S_img, H, D]
+        # Q/K/V attention consumes — no per-stream launches and no cats. Any
+        # sequence parallelism keeps the per-stream chain: `vid_freqs` is
+        # sharded by `_sp_plan` while `txt_freqs` stays replicated, so a joint
+        # table built from the two would not line up with the local tokens.
+        use_fused_joint = (
+            self.qk_norm
+            and qk_norm_rope_table is not None
+            and not sp_active
+            and _fused_cuda_supported(img_query, img_key, self.head_dim, qk_norm_rope_table.shape[-1], interleaved=True)
+        )
+        if use_fused_joint:
+            joint_query, joint_key, joint_value = fused_joint_qkv_norm_rope(
+                txt_query,
+                txt_key,
+                txt_value,
+                img_query,
+                img_key,
+                img_value,
+                self.norm_added_q.weight,
+                self.norm_added_k.weight,
+                self.norm_q.weight,
+                self.norm_k.weight,
+                qk_norm_rope_table,
+                self.eps,
+            )
+        else:
+            img_query, img_key = _qwen_image_qk_norm_rope(
+                img_query,
+                img_key,
+                self.norm_q,
+                self.norm_k,
+                vid_freqs,
+                self.rope,
+                self.eps,
+                use_fused=self.qk_norm,
+            )
+            txt_query, txt_key = _qwen_image_qk_norm_rope(
+                txt_query,
+                txt_key,
+                self.norm_added_q,
+                self.norm_added_k,
+                txt_freqs,
+                self.rope,
+                self.eps,
+            )
+            joint_query = torch.cat([txt_query, img_query], dim=1)
+            joint_key = torch.cat([txt_key, img_key], dim=1)
+            joint_value = torch.cat([txt_value, img_value], dim=1)
 
-        if (
-            self.parallel_config is not None
-            and self.parallel_config.sequence_parallel_size > 1
-            and not get_forward_context().split_text_embed_in_sp
-        ):
+        if use_sp_joint_attention:
             attn_metadata = AttentionMetadata(
                 joint_query=txt_query,
                 joint_key=txt_key,
@@ -965,6 +1020,7 @@ class QwenImageTransformerBlock(nn.Module):
             txt_freqs=image_rotary_emb[1],
             hidden_states_mask=hidden_states_mask,
             encoder_hidden_states_mask=encoder_hidden_states_mask,
+            qk_norm_rope_table=(joint_attention_kwargs or {}).get(QK_NORM_ROPE_TABLE_KEY),
         )
 
         # QwenAttnProcessor2_0 returns (img_output, txt_output) when encoder_hidden_states is provided
@@ -1306,6 +1362,16 @@ class QwenImageTransformer2DModel(CachedTransformer):
 
         if encoder_hidden_states_mask is not None and encoder_hidden_states_mask.all():
             encoder_hidden_states_mask = None
+
+        # One packed table per forward for the joint QK RMSNorm + RoPE + cat of
+        # every block. Never mutate the caller-owned dict: rebind to a copy.
+        qk_norm_rope_table = _packed_qk_norm_rope_table(
+            image_rotary_emb[0], image_rotary_emb[1], hidden_states.shape[0], hidden_states.dtype
+        )
+        if qk_norm_rope_table is not None:
+            attention_kwargs = {**(attention_kwargs or {}), QK_NORM_ROPE_TABLE_KEY: qk_norm_rope_table}
+        elif attention_kwargs is not None:
+            attention_kwargs = {k: v for k, v in attention_kwargs.items() if k != QK_NORM_ROPE_TABLE_KEY}
 
         for index_block, block in enumerate(self.transformer_blocks):
             encoder_hidden_states, hidden_states = block(

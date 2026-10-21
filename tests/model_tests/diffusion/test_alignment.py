@@ -31,6 +31,10 @@ EXCLUDED_MODELS = [
     # Dedicated CPU/unit coverage in tests/diffusion/models/qwen_image_21/.
     # Tiny-model offline suite is not wired yet (2.1 transformer/VAE configs).
     "QwenImage21Pipeline",
+    # Custom DiT/scheduler with a Qwen3.5 encoder; no tiny builder yet.
+    # Covered by tests/diffusion/test_mossimage_*.py and
+    # test_mossimage_registry.py.
+    "MOSSImagePipeline",
     "GlmImagePipeline",
     "ZImagePipeline",
     "OvisImagePipeline",

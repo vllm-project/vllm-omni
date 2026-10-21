@@ -26,6 +26,7 @@ module is the duplex consumer of it (RFC #6592 P0a).
 from __future__ import annotations
 
 from collections.abc import Mapping
+from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, cast
 from uuid import uuid4
@@ -263,6 +264,11 @@ def _previous_item_id(state: RealtimeProjectionState, item_id: str) -> str | Non
     return state.last_conversation_item_id
 
 
+def _item_snapshot(item: Mapping[str, object]) -> dict[str, object]:
+    """Deep-copy an item for outbound events so later state mutations cannot rewrite them."""
+    return deepcopy(dict(item))
+
+
 def _conversation_item_added_events(state: RealtimeProjectionState, item: dict[str, object]) -> list[DuplexEvent]:
     item_id = item.get("id")
     explicit_previous_item_id = item.pop("_previous_item_id", None)
@@ -271,9 +277,10 @@ def _conversation_item_added_events(state: RealtimeProjectionState, item: dict[s
     )
     if isinstance(item_id, str) and item_id:
         state.last_conversation_item_id = item_id
+    snapshot = _item_snapshot(item)
     return [
-        ItemAdded(previous_item_id=previous_item_id, item=item),
-        ItemCreated(previous_item_id=previous_item_id, item=item),
+        ItemAdded(previous_item_id=previous_item_id, item=snapshot),
+        ItemCreated(previous_item_id=previous_item_id, item=snapshot),
     ]
 
 
@@ -283,7 +290,7 @@ def _conversation_item_done_event(state: RealtimeProjectionState, item: dict[str
     if isinstance(item_id, str) and item_id:
         state.conversation_items[item_id] = item
         state.last_conversation_item_id = item_id
-    return ItemDone(previous_item_id=previous_item_id, item=item)
+    return ItemDone(previous_item_id=previous_item_id, item=_item_snapshot(item))
 
 
 def _remove_conversation_item(state: RealtimeProjectionState, item_id: str) -> bool:
@@ -624,7 +631,7 @@ def _realtime_response_terminal_events(
         if projection is not None:
             projection.output_item_done = True
         item = _response_done_output_item(state, response_id, status=status)
-        events.append(OutputItemDone(response_id=rid, item=item))
+        events.append(OutputItemDone(response_id=rid, item=_item_snapshot(item)))
         if projection is None or not projection.conversation_item_done:
             if projection is not None:
                 projection.conversation_item_done = True
@@ -700,6 +707,34 @@ def _pop_pending_commit_item_id(state: RealtimeProjectionState) -> str:
     if state.pending_commit_item_ids:
         return state.pending_commit_item_ids.pop(0)
     return f"item_{uuid4().hex}"
+
+
+def _acknowledge_pending_commit_item_id(state: RealtimeProjectionState, item_id: str | None) -> str:
+    """Remove ``item_id`` from the pending queue when present; otherwise pop FIFO.
+
+    ``input.committed`` may carry an explicit ``realtime_item_id``. Using that id
+    without removing it from ``pending_commit_item_ids`` leaves the queue drifted
+    so a later ack without an id pairs with the wrong item (#7636 Issue 12).
+    """
+    if isinstance(item_id, str) and item_id:
+        try:
+            state.pending_commit_item_ids.remove(item_id)
+        except ValueError:
+            pass
+        return item_id
+    return _pop_pending_commit_item_id(state)
+
+
+def discard_pending_commit_item(state: RealtimeProjectionState, item_id: str | None = None) -> None:
+    """Drop a pending commit id after ``commit_aborted`` (or matching explicit id)."""
+    if isinstance(item_id, str) and item_id:
+        try:
+            state.pending_commit_item_ids.remove(item_id)
+        except ValueError:
+            pass
+        return
+    if state.pending_commit_item_ids:
+        state.pending_commit_item_ids.pop(0)
 
 
 def realtime_session_payload(state: RealtimeProjectionState, session: object) -> dict[str, object]:
@@ -813,7 +848,7 @@ def _project(state: RealtimeProjectionState, event: dict[str, object]) -> list[D
         events = [
             _response_created_event(event),
             *_conversation_item_added_events(state, item),
-            OutputItemAdded(response_id=_str_or_none(response_id), item=item),
+            OutputItemAdded(response_id=_str_or_none(response_id), item=_item_snapshot(item)),
         ]
         if has_audio_modality:
             events.extend(_ensure_response_audio_part_added(state, response_id))
@@ -931,8 +966,8 @@ def _project(state: RealtimeProjectionState, event: dict[str, object]) -> list[D
         ]
     if event_type == "input.committed":
         event_item_id = event.get("realtime_item_id")
-        item_id = (
-            event_item_id if isinstance(event_item_id, str) and event_item_id else _pop_pending_commit_item_id(state)
+        item_id = _acknowledge_pending_commit_item_id(
+            state, event_item_id if isinstance(event_item_id, str) and event_item_id else None
         )
         if isinstance(event_item_id, str) and event_item_id in state.pending_commit_item_ids:
             state.pending_commit_item_ids.remove(event_item_id)
@@ -1122,10 +1157,10 @@ def _function_call_done_events(state: RealtimeProjectionState, event: dict[str, 
     return [
         ResponseCreated(response_id=response_id, response={**response, "status": "in_progress", "output": []}),
         *_conversation_item_added_events(state, item),
-        OutputItemAdded(response_id=response_id, item=dict(item)),
+        OutputItemAdded(response_id=response_id, item=_item_snapshot(item)),
         FunctionCallArgumentsDelta(response_id=response_id, item_id=item_id, call_id=call_id, delta=arguments),
         FunctionCallArgumentsDone(response_id=response_id, item_id=item_id, call_id=call_id, arguments=arguments),
-        OutputItemDone(response_id=response_id, item=dict(item)),
+        OutputItemDone(response_id=response_id, item=_item_snapshot(item)),
         _conversation_item_done_event(state, item),
         ResponseDone(response_id=response_id, response=response),
     ]
@@ -1164,7 +1199,7 @@ def retrieve_item_events(state: RealtimeProjectionState, payload: Mapping[str, o
     item = state.conversation_items.get(item_id)
     if item is None:
         return [error_event("item_not_found", f"Conversation item not found: {item_id}", event_id=event_id)]
-    return [ItemRetrieved(item=item)]
+    return [ItemRetrieved(item=_item_snapshot(item))]
 
 
 def emit_input_speech_started(state: RealtimeProjectionState, audio_start_ms: object = 0) -> list[DuplexEvent]:
@@ -1410,7 +1445,8 @@ def resolve_delete_item(state: RealtimeProjectionState, command: DeleteItem) -> 
     return ResolvedControl(payloads=[command.payload()], events=[])
 
 
-def resolve_truncate_item(state: RealtimeProjectionState, command: TruncateItem) -> ResolvedControl:
+def resolve_truncate_item(state: RealtimeProjectionState, command: TruncateItem, *, has_audio: bool) -> ResolvedControl:
+    """Validate item shape and engine-owned audio provenance before any mutation."""
     item = state.conversation_items.get(command.item_id)
     if not isinstance(item, dict):
         return ResolvedControl(
@@ -1424,6 +1460,8 @@ def resolve_truncate_item(state: RealtimeProjectionState, command: TruncateItem)
     truncate_error = validate_realtime_item_truncate(
         item, content_index=command.content_index, audio_end_ms=command.audio_end_ms
     )
+    if truncate_error is None and not has_audio:
+        truncate_error = "conversation.item.truncate requires an item that produced audio"
     if truncate_error is not None:
         return ResolvedControl(
             payloads=[], events=[error_event("bad_event", truncate_error, event_id=command.event_id)]
@@ -1586,6 +1624,7 @@ __all__ = [
     "ResolvedCommit",
     "ResolvedControl",
     "clear_input_buffer",
+    "discard_pending_commit_item",
     "discard_pending_input_audio",
     "emit_input_speech_started",
     "emit_input_speech_stopped",
