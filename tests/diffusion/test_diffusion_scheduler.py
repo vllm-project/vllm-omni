@@ -1360,7 +1360,7 @@ class TestRequestScheduler:
         assert third.num_waiting_reqs == 0
 
     def test_records_initial_scheduler_queue_wait(self, mocker: MockerFixture) -> None:
-        # Clock reads: enqueue, CNA ordering pass, then the queue-wait record.
+        # Clock reads: enqueue, DRR ordering pass, then the queue-wait record.
         perf_counter = mocker.patch(
             "vllm_omni.diffusion.sched.base_scheduler.time.perf_counter",
             side_effect=[10.0, 10.125, 10.125],
@@ -1570,7 +1570,7 @@ class TestRequestScheduler:
         assert first.num_running_reqs == 1
         assert first.num_waiting_reqs == 1
 
-    def test_cna_respects_homogeneous_batch_gate_by_compute_budget(self) -> None:
+    def test_drr_respects_homogeneous_batch_gate_by_compute_budget(self) -> None:
         scheduler = RequestScheduler()
         scheduler.initialize(
             _scheduler_config(
@@ -1591,7 +1591,7 @@ class TestRequestScheduler:
         )
         req_id_c = scheduler.add_request(_make_request("c"))
 
-        # Age b so its CNA score dominates the microsecond-scale ages of the
+        # Age b so its DRR score dominates the microsecond-scale ages of the
         # fresh requests; otherwise the ordering would be timing-dependent.
         state_b = scheduler.get_request_state(req_id_b)
         assert state_b is not None
@@ -1610,7 +1610,7 @@ class TestRequestScheduler:
         scheduler.update_from_output(first, _make_request_output(req_id_b))
         second = scheduler.schedule()
 
-        # With b finished, CNA fills the budget with same-key requests:
+        # With b finished, DRR fills the budget with same-key requests:
         # a (4096) + c (4096) = 8192 <= 10240.
         assert _new_ids(second) == [req_id_a, req_id_c]
         assert second.num_running_reqs == 2
@@ -2269,7 +2269,7 @@ class TestStepScheduler:
         assert state is not None
         state.queued_at = time.perf_counter() - age_s
 
-    def test_cna_aged_head_reserves_remaining_budget_gap(self) -> None:
+    def test_drr_aged_head_reserves_remaining_budget_gap(self) -> None:
         scheduler = StepScheduler()
         scheduler.initialize(
             SimpleNamespace(
@@ -2328,7 +2328,7 @@ class TestStepScheduler:
         assert second.num_running_reqs == 6
         assert second.num_waiting_reqs == 2
 
-    def test_cna_young_head_is_skipped_to_fill_budget(self) -> None:
+    def test_drr_young_head_is_skipped_to_fill_budget(self) -> None:
         scheduler = StepScheduler()
         scheduler.initialize(
             SimpleNamespace(
@@ -2366,7 +2366,7 @@ class TestStepScheduler:
                 ),
             )
         )
-        # Young aged head: only 10s < cna_reserve_time_s, so it does not get
+        # Young aged head: only 10s < drr_reserve_time_s, so it does not get
         # reservation treatment.
         self._age_request(scheduler, req_big, 10.0)
         req_small = scheduler.add_request(
@@ -2388,7 +2388,7 @@ class TestStepScheduler:
         assert second.num_running_reqs == 7
         assert second.num_waiting_reqs == 1
 
-    def test_cna_aging_promotes_waiting_request_over_new_arrivals(self) -> None:
+    def test_drr_aging_promotes_waiting_request_over_new_arrivals(self) -> None:
         scheduler = StepScheduler()
         scheduler.initialize(SimpleNamespace(max_num_seqs=1))
 
@@ -2458,7 +2458,7 @@ class TestStepScheduler:
 
         # Qwen-Image packed latent units:
         # 512x512 -> (512 / 16)^2 = 1024, profiled budget = 1024 * 10.
-        # 1024x1024 -> (1024 / 16)^2 = 4096. CNA admits by compute-unit sum,
+        # 1024x1024 -> (1024 / 16)^2 = 4096. DRR admits by compute-unit sum,
         # not by ceil(budget / cost) count: 2 * 4096 = 8192 <= 10240, a third
         # would exceed it.
         assert _new_ids(sched_output) == req_ids[:2]
