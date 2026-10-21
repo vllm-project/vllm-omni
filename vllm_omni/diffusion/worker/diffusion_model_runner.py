@@ -49,6 +49,7 @@ from vllm_omni.diffusion.interaction.types import InteractionPayload
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import (
     SupportsInteractionApply,
+    SupportsSamplingStep,
     adopt_request_scoped_cache_dit,
     is_request_scoped_cache_dit_enabled,
     supports_interaction_apply,
@@ -380,7 +381,8 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         if getattr(self.od_config, "step_execution", False) and not self._supports_step_mode():
             raise ValueError(
                 "step_execution=True requires a pipeline implementing "
-                "prepare_encode(), denoise_step(), step_scheduler(), and post_decode(); "
+                "prepare_encode(), denoise_step(), post_decode(), and either "
+                "step_scheduler() or denoise_step_updates_state=True; "
                 f"{self.od_config.model_class_name} does not support that contract."
             )
         if self.od_config.streaming_output and not self._supports_step_mode():
@@ -1465,7 +1467,14 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 in_diffusion_kv_memory_profile=in_diffusion_kv_memory_profile,
             ):
                 clear_pipeline_stage_durations(pipeline)
-                noise_pred = pipeline.denoise_step(input_batch, states=states)
+                sample_results = None
+                if isinstance(pipeline, SupportsSamplingStep) and pipeline.denoise_step_updates_state:
+                    sample_results = pipeline.denoise_step(input_batch, states=states)
+                    if set(sample_results) != {state.request_id for state in states}:
+                        raise ValueError("denoise_step must return a result for every active request")
+                    noise_pred = None
+                else:
+                    noise_pred = pipeline.denoise_step(input_batch, states=states)
                 denoise_stage_durations = consume_pipeline_stage_durations(pipeline)
                 for state in states:
                     merge_stage_durations(
@@ -1492,9 +1501,14 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                             raise RuntimeError(f"Stepwise request {req.request_id} has no latent state.")
                         row_num = req.latents.shape[0]
                         try:
-                            pipeline.step_scheduler(
-                                req, noise_pred[offset : offset + row_num] if noise_pred is not None else None
-                            )
+                            if sample_results is not None:
+                                error = sample_results[req.request_id]
+                                if error is not None:
+                                    raise error
+                            else:
+                                pipeline.step_scheduler(
+                                    req, noise_pred[offset : offset + row_num] if noise_pred is not None else None
+                                )
                             if self.od_config.streaming_output:
                                 should_decode = req.chunk_denoise_completed or req.request_denoise_completed
                             else:

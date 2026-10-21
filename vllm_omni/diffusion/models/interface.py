@@ -162,10 +162,33 @@ class SupportsComponentDiscovery(Protocol):
     _resident_modules: ClassVar[list[str]] = []
 
 
-def supports_step_execution(pipeline: object) -> bool:
-    """Return whether `pipeline` implements :class:`SupportsStepExecution`."""
+@runtime_checkable
+class SupportsSamplingStep(Protocol):
+    """Pipelines whose denoise_step also updates latents and step_index.
 
-    return isinstance(pipeline, SupportsStepExecution)
+    denoise_step owns every model evaluation and commits one complete algorithm
+    step per successful request. Return every request ID mapped to None on
+    success or its exception on failure. A failed request must not advance.
+    """
+
+    supports_step_execution: ClassVar[bool] = True
+    denoise_step_updates_state: ClassVar[bool] = True
+
+    def prepare_encode(self, state: StepRequestState, **kwargs: Any) -> StepRequestState: ...
+
+    def denoise_step(
+        self, input_batch: InputBatch, *, states: Sequence[StepRequestState] | None = None
+    ) -> dict[str, Exception | None]: ...
+
+    def post_decode(self, state: StepRequestState, **kwargs: Any) -> DiffusionOutput: ...
+
+
+def supports_step_execution(pipeline: object) -> bool:
+    """Return whether the pipeline implements either supported step protocol."""
+
+    return isinstance(pipeline, SupportsStepExecution) or (
+        isinstance(pipeline, SupportsSamplingStep) and pipeline.denoise_step_updates_state
+    )
 
 
 # --- Generic role-based component loading for diffusion disaggregation ---------

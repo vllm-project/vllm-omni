@@ -231,6 +231,15 @@ upstream vLLM's media URL allowlist protection. Deployments should therefore
 treat remote media URLs as untrusted and choose this setting as part of their
 URL access policy.
 
+### MiniMax H3 Samplers
+
+Set `"sampler": "heun"` in `extra_params` to select Heun. Supported values are
+`euler` (default), `res_multistep`, and `heun`. An N-step schedule ending at zero
+uses `2N - 1` model evaluations with Heun. Both request and step execution support
+it; compatible requests share packed model evaluations in both the prediction
+and Heun correction stages. Fixed distilled schedules remain Euler-only. Disable cache
+acceleration, including `quality=high`, when using Heun.
+
 ### MiniMax H3 Latent-Mask Editing
 
 MiniMax H3 accepts request-scoped source media and video/audio noise masks.

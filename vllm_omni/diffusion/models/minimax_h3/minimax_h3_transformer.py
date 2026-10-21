@@ -603,6 +603,11 @@ class MiniMaxH3Attention(nn.Module):
             if used < packed_total and not no_mask and not use_ring:
                 attn_mask = torch.arange(packed_total, device=q.device)[None] < used
         metadata = AttentionMetadata(
+            denoise_progress=(
+                get_forward_context().denoise_progress.get(self.attention.role)
+                if is_forward_context_available()
+                else None
+            ),
             attn_mask=attn_mask,
             packed_padding=(
                 PackedPaddingMetadata(

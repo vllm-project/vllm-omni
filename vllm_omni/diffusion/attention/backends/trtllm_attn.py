@@ -468,12 +468,11 @@ class TrtllmAttentionImpl(AttentionImpl):
     def set_layer_calibration(self, a: float, b: float) -> None:
         self.skip = replace(self.skip, a=a, b=b)
 
-    def _resolve_skip_factor(self, seqlen: int) -> float | None:
+    def _resolve_skip_factor(self, seqlen: int, timestep: float | None = None) -> float | None:
         if not self.skip.enabled:
             return None
 
-        timestep = None
-        if self.skip.gated:
+        if self.skip.gated and timestep is None:
             from vllm_omni.diffusion.forward_context import get_forward_context
 
             timestep = getattr(get_forward_context(), "denoise_timestep", None)
@@ -603,6 +602,35 @@ class TrtllmAttentionImpl(AttentionImpl):
                 "another backend via --diffusion-attention-backend."
             )
 
+        progress = attn_metadata.denoise_progress if attn_metadata is not None else None
+        timestep = None
+        if progress and self.skip.enabled and self.skip.gated:
+            if (
+                query.shape[0] != 1
+                or sum(p.sequence_length for p in progress) != query.shape[1]
+                or key.shape[:2] != query.shape[:2]
+                or any(p.sequence_length <= 0 for p in progress)
+            ):
+                raise ValueError("Denoise progress must describe the packed self-attention documents")
+            timestep = max(p.timestep for p in progress)
+            gates = {p.timestep > self.skip.disabled_until_timestep for p in progress}
+            if len(gates) > 1:
+                # The kernel takes one skip factor. Keep the DiT batched, but
+                # evaluate documents independently when their gate decisions differ.
+                outputs, offset = [], 0
+                for p in progress:
+                    end = offset + p.sequence_length
+                    outputs.append(
+                        self.forward_cuda(
+                            query[:, offset:end],
+                            key[:, offset:end],
+                            value[:, offset:end],
+                            AttentionMetadata(denoise_progress=(p,)),
+                        )
+                    )
+                    offset = end
+                return torch.cat(outputs, dim=1)
+
         physical_batch, q_len, num_q_heads, head_dim = query.shape
         kv_len, num_kv_heads = key.shape[1], key.shape[2]
         device = query.device
@@ -662,7 +690,7 @@ class TrtllmAttentionImpl(AttentionImpl):
         bmm1_scale = self.softmax_scale
         bmm2_scale = 1.0
 
-        _skip_factor = self._resolve_skip_factor(max_kv_len)
+        _skip_factor = self._resolve_skip_factor(max_kv_len, timestep)
 
         sage_q_sf = sage_k_sf = sage_v_sf = None
         sage_q_block_size = sage_k_block_size = 0

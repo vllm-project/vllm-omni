@@ -539,6 +539,8 @@ class TaoMateH3Pipeline(MiniMaxH3Pipeline, SupportsStepExecution, InteractionMix
     """Streaming TaoMate-H3 on the AR-Diffusion runtime."""
 
     supports_step_execution: ClassVar[bool] = True
+    # TaoMate returns velocity from denoise_step and updates state in step_scheduler.
+    denoise_step_updates_state: ClassVar[bool] = False
     # The three student steps of a phase run back to back; the scheduler regains
     # control at the phase boundary, where prompt interactions are applied.
     supports_chunk_step_grouping: ClassVar[bool] = True

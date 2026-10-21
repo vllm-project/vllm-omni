@@ -10,7 +10,7 @@ import torch
 import torch.nn.functional as F
 
 from vllm_omni.diffusion.attention.backends import trtllm_attn as tg
-from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata, PackedPaddingMetadata
+from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata, DenoiseProgress, PackedPaddingMetadata
 from vllm_omni.diffusion.attention.capabilities import (
     CompilationMode,
     ExecutionContext,
@@ -32,6 +32,39 @@ def _inputs(q_len=8, kv_len=12, dtype=torch.bfloat16):
         torch.randn(1, kv_len, 2, 128, dtype=dtype),
         torch.randn(1, kv_len, 2, 128, dtype=dtype),
     )
+
+
+@pytest.mark.parametrize("timesteps", [(0.9, 0.9, 0.3), (0.4, 0.4, 0.2)])
+def test_packed_denoise_gate_uses_each_documents_time(monkeypatch, timesteps):
+    """Different progress shares a kernel unless gate decisions differ."""
+    calls = []
+
+    def attention(q, k, v, *args):
+        calls.append((q.clone(), args[12]))
+        return q.clone()
+
+    monkeypatch.setattr(tg, "HAS_FLASHINFER", True)
+    monkeypatch.setattr(tg, "_trtllm_ragged_attention_op", attention)
+    monkeypatch.setattr(tg.TrtllmAttentionImpl, "_get_workspace", classmethod(lambda *_: torch.zeros(1)))
+    q, k, v = _inputs(q_len=9, kv_len=9)
+    bounds = torch.tensor([0, 3, 5, 9], dtype=torch.int32)
+    metadata = AttentionMetadata(
+        extra={"cu_seqlens_q": bounds, "cu_seqlens_k": bounds, "max_seqlen_q": 4, "max_seqlen_k": 4},
+        denoise_progress=tuple(
+            DenoiseProgress(length, step, time, 10)
+            for length, step, time in zip((3, 2, 4), (0, 0, 7), timesteps, strict=True)
+        ),
+    )
+    impl = _impl(backend_kwargs={"skip_softmax_threshold": 0.01, "disabled_until_timestep": 0.6})
+    actual = impl.forward_cuda(q, k, v, metadata)
+    torch.testing.assert_close(actual, q)
+    if timesteps[0] > 0.6:
+        assert [factor for _, factor in calls] == [-1.0, -1.0, 0.04]
+        for (part, _), expected in zip(calls, q[0].split((3, 2, 4)), strict=True):
+            torch.testing.assert_close(part, expected)
+    else:
+        assert len(calls) == 1
+        assert calls[0][1] == 0.04
 
 
 @pytest.fixture

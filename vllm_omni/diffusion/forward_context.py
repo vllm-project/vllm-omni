@@ -13,6 +13,7 @@ from vllm.config import VllmConfig
 
 from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionMetadata,
+    DenoiseProgress,
 )
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 
@@ -51,6 +52,8 @@ class ForwardContext:
     denoise_step_idx: int | None = None
     denoise_timestep: float | None = None
     total_denoise_steps: int | None = None
+    # Per-document progress by attention role; scoped to the current model evaluation.
+    denoise_progress: dict[str, tuple[DenoiseProgress, ...]] = field(default_factory=dict)
     # Per-request reference latent for img2img DiT models (e.g. Ming)
     ref_latent: torch.Tensor | None = None
     # Per-request projected direct-VLM condition (e.g., Ming-Image). For now for bsz 1.

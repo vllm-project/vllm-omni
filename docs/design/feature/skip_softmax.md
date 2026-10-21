@@ -143,6 +143,15 @@ configured cutoff and passes no skip factor to the kernel while `t` is above it.
 becomes active on the first step whose `t` is at or below the cutoff and stays active for the rest
 of the run, since `t` only decreases.
 
+For H3 packed execution, `AttentionMetadata.denoise_progress` supplies one
+immutable progress entry per document in packing order, including padding.
+The model adapter scopes entries to the current evaluation and separates the
+text-refiner and joint-token layouts. This metadata takes precedence over the
+shared forward-context timestep. Equal gate decisions retain one packed kernel
+call; differing decisions use separate document calls with their own skip
+factors. Step indices and total steps remain request-local, and Heun's second
+evaluation carries its provisional noise time without advancing the step.
+
 The default `disabled_until_timestep = 0` is a sentinel rather than a cutoff: the gate is off, the
 timestep is never read, and Skip-Softmax runs on every step. Any positive value enables the gate.
 `disabled_until_timestep = 1.0` therefore also yields no dense steps on a pipeline that publishes

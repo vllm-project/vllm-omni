@@ -62,7 +62,7 @@ class StepRequestState:
 
     Owned by Runner and passed through all step-execution stages:
     ``prepare_encode()`` initializes/updates fields, ``denoise_step()`` and
-    ``step_scheduler()`` mutate per-step fields, and ``post_decode()``
+    (when needed) ``step_scheduler()`` mutate per-step fields, and ``post_decode()``
     consumes final latents. This state object is also the cache unit for
     future continuous batching.
 
