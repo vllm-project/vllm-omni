@@ -934,7 +934,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 if request.stream:
                     sampling_params_list = self._fix_audio_stream_output_kinds(
                         sampling_params_list,
-                        output_modalities,
+                        request.modalities,
                     )
 
                 comprehension_idx = (
@@ -1745,6 +1745,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         modality_finished: list[set[str]] = [set() for _ in range(num_choices)]
         modality_seen: list[set[str]] = [set() for _ in range(num_choices)]
         stop_reason_emitted: list[bool] = [False] * num_choices
+        # Preserve text truncation until the final audio/terminal event.
+        text_limit_reached = [False] * num_choices
         num_prompt_tokens = 0
         num_cached_tokens = None
         num_cache_creation_tokens = None
@@ -2357,9 +2359,10 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                                 finish_reason_ = "tool_calls"
                             else:
                                 finish_reason_ = output.finish_reason if output.finish_reason else "stop"
+                            text_limit_reached[i] |= finish_reason_ == "length"
                             # Only emit finish_reason on the last modality to
                             # comply with OpenAI streaming spec: exactly one
-                            # chunk per choice carries finish_reason="stop".
+                            # chunk per choice carries a terminal finish_reason.
                             modality_finished[i].add("text")
                             if modality_seen[i] < set(request.modalities) or not all(
                                 m in modality_finished[i] for m in modality_seen[i]
@@ -2462,6 +2465,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                             choice.finish_reason = None
                         else:
                             stop_reason_emitted[choice.index] = True
+                            if text_limit_reached[choice.index]:
+                                choice.finish_reason = "length"
                     # Record per-chunk PCM byte count + arrival timestamp for
                     # audio_underrun_s / audio_continuity_ok_total at finalize.
                     if req_state is not None and req_state.request_arrival_ts > 0:
@@ -2531,7 +2536,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     logger.warning(f"Unsupported streaming final output type: {final_output_type}")
                     continue
 
-            # Fallback: if a choice had modalities finish but no finish_reason="stop"
+            # Fallback: if a choice had modalities finish but no terminal finish_reason
             # was emitted (e.g. request.modalities included a modality the engine
             # never produced), emit a final stop chunk for that choice.
             for i in range(num_choices):
@@ -2539,7 +2544,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     stop_choice = ChatCompletionResponseStreamChoice(
                         index=i,
                         delta=DeltaMessage(),
-                        finish_reason="stop",
+                        finish_reason="length" if text_limit_reached[i] else "stop",
                     )
                     stop_chunk = OmniChatCompletionStreamResponse(
                         id=request_id,

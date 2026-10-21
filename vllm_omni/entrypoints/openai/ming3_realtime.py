@@ -313,6 +313,7 @@ class Ming3RealtimeConnection(RealtimeConnection):
         result = None
         transcript = ""
         status = "completed"
+        limit_reached = False
         sent_audio = False
         resampler = None
         audio_output = session.get("output_modalities") != ["text"]
@@ -373,6 +374,9 @@ class Ming3RealtimeConnection(RealtimeConnection):
                     if "error" in data:
                         raise ValueError(str(data["error"]))
                     for choice in data.get("choices", []):
+                        # Terminal choices may have no content; later audio
+                        # choices must not overwrite the Thinker's limit.
+                        limit_reached |= choice.get("finish_reason") == "length"
                         content = choice.get("delta", {}).get("content")
                         if not content:
                             continue
@@ -407,6 +411,8 @@ class Ming3RealtimeConnection(RealtimeConnection):
                     "transcript" if audio_output else "text": transcript,
                 }
             )
+            if limit_reached:
+                status = "incomplete"
         except asyncio.CancelledError:
             status = "cancelled"
         except Exception as exc:
@@ -435,9 +441,10 @@ class Ming3RealtimeConnection(RealtimeConnection):
                 await self.send_json(
                     {"type": "response.output_item.done", "response_id": response_id, "output_index": 0, "item": item}
                 )
-                await self.send_json(
-                    {"type": "response.done", "response": {"id": response_id, "status": status, "output": [item]}}
-                )
+                response: dict[str, object] = {"id": response_id, "status": status, "output": [item]}
+                if status == "incomplete":
+                    response["status_details"] = {"type": "incomplete", "reason": "max_output_tokens"}
+                await self.send_json({"type": "response.done", "response": response})
 
     async def _emit_audio(self, samples, common, session):
         if not samples.size:

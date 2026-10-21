@@ -379,8 +379,11 @@ async def test_realtime_audio_locks_voice_once_after_first_nonempty_chunk(realti
     assert realtime._spoken_voice == ("reference", "灵小柔")
 
 
-@pytest.mark.parametrize("selected", [None, "TEST_VOICE_A", "US_Stella", "灵小柔"])
-async def test_realtime_response_uses_selected_voice_and_emits_pcm24(realtime, store, model, selected):
+@pytest.mark.parametrize(
+    "selected,finish_reason",
+    [(None, "stop"), ("TEST_VOICE_A", "stop"), ("US_Stella", "stop"), ("灵小柔", "stop"), (None, "length")],
+)
+async def test_realtime_response_uses_selected_voice_and_emits_pcm24(realtime, store, model, selected, finish_reason):
     await register_model_voice_presets(store, str(model))
     await update(realtime, {"id": selected} if selected is not None else None)
     await realtime.handle_event(
@@ -398,9 +401,10 @@ async def test_realtime_response_uses_selected_voice_and_emits_pcm24(realtime, s
     async def events():
         try:
             for modality, content in [("text", "你好"), ("audio", audio)]:
-                yield (
-                    "data: " + json.dumps({"modality": modality, "choices": [{"delta": {"content": content}}]}) + "\n\n"
-                )
+                choice: dict[str, object] = {"delta": {"content": content}}
+                if modality == "audio":
+                    choice["finish_reason"] = finish_reason
+                yield "data: " + json.dumps({"modality": modality, "choices": [choice]}) + "\n\n"
             yield "data: [DONE]\n\n"
         finally:
             closed.append(True)
@@ -430,7 +434,11 @@ async def test_realtime_response_uses_selected_voice_and_emits_pcm24(realtime, s
         sum(len(base64.b64decode(e["delta"])) for e in events_sent if e["type"] == "response.output_audio.delta")
         == 2400 * 2
     )
-    assert events_sent[-1]["response"]["status"] == "completed"
+    response = events_sent[-1]["response"]
+    assert response["status"] == ("incomplete" if finish_reason == "length" else "completed")
+    assert response.get("status_details") == (
+        {"type": "incomplete", "reason": "max_output_tokens"} if finish_reason == "length" else None
+    )
     assert realtime._audio_started
     assert closed
 
@@ -511,6 +519,48 @@ async def test_realtime_generation_failure_has_terminal_event(realtime, store, m
     await realtime.generation_task
     assert any(e["type"] == "error" for e in sent(realtime))
     assert sent(realtime)[-1]["response"]["status"] == "failed"
+
+
+@pytest.mark.parametrize(
+    "finish_reason,terminal_text,expected",
+    [
+        ("stop", "", "completed"),
+        ("length", "Hello", "incomplete"),
+        ("length", "", "incomplete"),
+        ("length", "", "failed"),
+        ("length", "", "cancelled"),
+    ],
+)
+async def test_realtime_preserves_chat_termination(realtime, mocker, finish_reason, terminal_text, expected):
+    import asyncio
+
+    async def events():
+        for content, reason in [("Hello" if not terminal_text else "", None), (terminal_text, finish_reason)]:
+            yield (
+                "data: " + json.dumps({"choices": [{"delta": {"content": content}, "finish_reason": reason}]}) + "\n\n"
+            )
+        if expected == "failed":
+            raise RuntimeError("generation failed after text")
+        elif expected == "cancelled":
+            raise asyncio.CancelledError
+        yield "data: [DONE]\n\n"
+
+    await update(realtime, None, output_modalities=["text"], max_output_tokens=1)
+    realtime._messages = [{"role": "user", "content": "hello"}]
+    realtime.serving.create_chat_completion = mocker.AsyncMock(return_value=events())
+    await realtime.handle_event({"type": "response.create"})
+    await realtime.generation_task
+
+    done = [event for event in sent(realtime) if event["type"] == "response.done"]
+    assert len(done) == 1
+    response = done[0]["response"]
+    assert response["status"] == expected
+    assert response.get("status_details") == (
+        {"type": "incomplete", "reason": "max_output_tokens"} if expected == "incomplete" else None
+    )
+    assert response["output"][0]["status"] == ("completed" if expected == "completed" else "incomplete")
+    assert realtime._messages[-1] == {"role": "assistant", "content": "Hello"}
+    assert realtime.serving.create_chat_completion.call_args.args[0].max_completion_tokens == 1
 
 
 async def test_hf_snapshot_audio_symlinks_are_supported(store, model, tmp_path):
