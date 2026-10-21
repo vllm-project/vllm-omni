@@ -169,6 +169,17 @@ Only activate this behavior when the user explicitly says **`归档报告`**
 5. Report the archived path, commit hash, branch, and push result. If any
    step (generation, copy, commit, push) fails, surface the exact error
    and do **not** claim archival completed.
+6. **Mirror to omni-reviewbot (user-set 2026-10-21; bridge box).** After the
+   kanban push succeeds, run
+   `/home/wy/mirror_to_omni_review.sh data/issue_monitor/issue-monitor-report.html`
+   — it copies the archived report into
+   [JiusiServe/omni-reviewbot](https://github.com/JiusiServe/omni-reviewbot)
+   at `kanban/data/vllm_omni/issue_monitor/`, commits as `yenuo26`, and
+   pushes (kanban `origin/main` is the source of truth; the push
+   auto-triggers the repo's `Build kanban site` workflow). Skip with a note
+   when the script or the `/home/wy/omni-reviewbot` clone is absent
+   (non-bridge environments); on non-zero exit report the failure honestly —
+   the kanban archive itself is already complete.
 
 The user's explicit `归档报告` request authorizes this report-specific
 commit and push; no separate approval step is needed (unlike

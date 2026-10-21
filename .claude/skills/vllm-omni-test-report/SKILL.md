@@ -55,6 +55,12 @@ When archive/push intent is present, **after** HTML generation:
    > ⚠️ **`.last_manual_dir` is a local-only marker file** — written by `prepare_kanban_before_report.py` to record which `manual_*` directory should be included in the next archive push. It is **not** part of the report or raw test data and **must NOT be staged or pushed**. The script stages `manual_<date>/` content directly, so the marker stays untracked. If you (or the agent) accidentally `git add` it, run `git restore --staged data/local_nightly_raw/.last_manual_dir` before committing.
 4. **Paste the full push preview to the user** (do not summarize as “ready to push”). Ask whether to proceed. Then run **`scripts/push_kanban_report.py`** — the only script that commits and pushes. Use **`--preview-only`** to re-print the preview without attempting push. In a terminal it prompts `[y/N]`; in agent/non-interactive mode it exits with code 3 and prints the full preview again — **ask the user in chat**, then re-run with **`--yes`** after they confirm.
 5. Confirm push succeeded; report filenames and paths: [references/kanban-report-archive.md](references/kanban-report-archive.md).
+6. **Mirror to omni-reviewbot (user-set 2026-10-21; bridge box).** After the kanban push succeeds, run `/home/wy/mirror_to_omni_review.sh <kanban-relative-path>...` once with every path this run archived:
+   - nightly → `data/nightly_test_report/nightly-report-buildkite-latest-YYYY-MM-DD.html`, plus `data/local_nightly_raw/manual_<dir>` when prep created one
+   - release → `data/release_test_report/vllm-omni-release-test-report-YYYY-MM-DD.html`
+   - development → `data/development_test_report/vllm-omni-test-report-development-YYYY-MM-DD.html`
+
+   The script copies each `data/<X>` into [JiusiServe/omni-reviewbot](https://github.com/JiusiServe/omni-reviewbot) at `kanban/data/vllm_omni/<X>` (kanban `origin/main` is the source of truth, so API-archived files are included), commits as `yenuo26`, and pushes with retry; the push auto-triggers the repo's `Build kanban site` workflow. Bridge box only — when the script or the `/home/wy/omni-reviewbot` clone is absent (e.g. laptop), skip with a note; the kanban archive is already complete. Non-zero exit → report the failure honestly; never claim the mirror landed when it did not.
 
 ```bash
 gh auth status   # required before push

@@ -231,6 +231,7 @@ Only activate this behavior when the user explicitly says **`归档报告`**:
 4. Before committing, inspect the repository status. Do not overwrite unrelated existing reports or include unrelated changes in the commit.
 5. Stage only the generated report, commit it with a descriptive message such as `data: archive pool stats report for YYYY-MM-DD`, and push the current branch to its configured remote.
 6. Report the archived path, commit hash, branch, and push result to the user. If generation, commit, or push fails, report the failure accurately and do not claim that archival completed.
+7. **Mirror to omni-reviewbot (user-set 2026-10-21; bridge box).** After the kanban push succeeds, run `/home/wy/mirror_to_omni_review.sh data/pool_stats_report/pool-stats-YYYY-MM-DD.html` (the `--from` date) — it copies the archived report into [JiusiServe/omni-reviewbot](https://github.com/JiusiServe/omni-reviewbot) at `kanban/data/vllm_omni/pool_stats_report/`, commits as `yenuo26`, and pushes (kanban `origin/main` is the source of truth; the push auto-triggers the repo's `Build kanban site` workflow). Skip with a note when the script or the `/home/wy/omni-reviewbot` clone is absent (non-bridge environments); on non-zero exit report the failure honestly — the kanban archive itself is already complete.
 
 The user's explicit `归档报告` request authorizes the report-specific commit and push. Do not ask for an additional confirmation unless the repository state, target branch, remote, or required operation differs materially from the instructions above.
 
