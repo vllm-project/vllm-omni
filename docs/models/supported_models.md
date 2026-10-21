@@ -37,6 +37,7 @@ th {
 | `GlmImagePipeline` | GLM-Image | `zai-org/GLM-Image` | ✅︎ | ✅︎ | | | — |
 | `ZImagePipeline` | Z-Image | `Tongyi-MAI/Z-Image-Turbo` | ✅︎ | ✅︎ | ✅︎ | ✅︎ | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Tongyi-MAI/Z-Image-Turbo.md) |
 | `Krea2Pipeline` | Krea 2 (Raw + Turbo) | `krea/Krea-2-Raw`, `krea/Krea-2-Turbo` | ✅︎ | | | ✅︎ | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/krea/Krea-2.md) |
+| `MOSSImagePipeline` | MOSS-Image-Base | `OpenMOSS-Team/MOSS-Image-Base` | ✅︎ | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/MOSS-Image/MOSS-Image-Base.md) |
 | `WanPipeline` | Wan2.1-T2V, Wan2.2-T2V, Wan2.2-TI2V | `Wan-AI/Wan2.1-T2V-1.3B-Diffusers`, `Wan-AI/Wan2.1-T2V-14B-Diffusers`, `Wan-AI/Wan2.2-T2V-A14B-Diffusers`, `Wan-AI/Wan2.2-TI2V-5B-Diffusers` | ✅︎ | ✅︎ | ✅︎ | ✅︎ | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Wan-AI/Wan2.2-T2V.md) |
 | `WanImageToVideoPipeline` | Wan2.2-I2V | `Wan-AI/Wan2.2-I2V-A14B-Diffusers` | ✅︎ | ✅︎ | ✅︎ | ✅︎ | — |
 | `LingBotWorldCausalDMDPipeline` | LingBot-World 2.0 v1 (experimental) | `robbyant/lingbot-world-v2-14b-causal-fast-diffusers` | Experimental | | | | — |
@@ -48,9 +49,10 @@ th {
 | `Wan22VACEPipeline` | Wan2.2-VACE | `Pyros13/Wan2.2-VACE-Fun-A14B-Diffusers` | ✅︎ | | | ✅︎ | — |
 | `LTX2Pipeline` | LTX-2 / LTX-2.3 one-stage T2V and I2V | `Lightricks/LTX-2`, `diffusers/LTX-2.3-Diffusers` | ✅︎ | ✅︎ | | ✅︎ | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/LTX/LTX-2.md) |
 | `LTX2TwoStagePipeline` | LTX-2 / LTX-2.3 ordinary two-stage T2V and I2V | `Lightricks/LTX-2`, `diffusers/LTX-2.3-Diffusers` + matching Lightricks LoRA and upsampler | ✅︎ | ✅︎ | | ✅︎ | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/LTX/LTX-2.md) |
-| `LTX2DistilledOneStagePipeline` | LTX-2 / LTX-2.3 merged-distilled one-stage T2V and I2V | `rootonchair/LTX-2-19b-distilled`, `diffusers/LTX-2.3-Distilled-Diffusers` | ✅︎ | ✅︎ | | ✅︎ | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/LTX/LTX-2.md) |
-| `LTX2DistilledTwoStagePipeline` | LTX-2 / LTX-2.3 merged-distilled two-stage T2V and I2V | `rootonchair/LTX-2-19b-distilled`, `diffusers/LTX-2.3-Distilled-Diffusers` + matching Lightricks upsampler | ✅︎ | ✅︎ | | ✅︎ | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/LTX/LTX-2.md) |
+| `LTX2DistilledOneStagePipeline` | LTX-2.3 merged-distilled one-stage T2V and I2V | `diffusers/LTX-2.3-Distilled-Diffusers` | ✅︎ | ✅︎ | | ✅︎ | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/LTX/LTX-2.md) |
+| `LTX2DistilledTwoStagePipeline` | LTX-2.3 merged-distilled two-stage T2V and I2V | `diffusers/LTX-2.3-Distilled-Diffusers` + matching Lightricks upsampler | ✅︎ | ✅︎ | | ✅︎ | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/LTX/LTX-2.md) |
 | `LTX2Pipeline` | LTX-2.5 Full/SFT one-stage T2V and I2V | `Lightricks/LTX-2.5-Diffusers` | ✅︎ | | | ✅︎ | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/LTX/LTX-2.5.md) |
+| `LTX2TextToAudioPipeline` | LTX-2 / LTX-2.3 / LTX-2.5 text-to-audio | `Lightricks/LTX-2`, `diffusers/LTX-2.3-Diffusers`, `Lightricks/LTX-2.5-Diffusers` | ✅︎ | | | | [LTX-2/2.3](https://github.com/vllm-project/vllm-omni/blob/main/recipes/LTX/LTX-2.md), [LTX-2.5](https://github.com/vllm-project/vllm-omni/blob/main/recipes/LTX/LTX-2.5.md) |
 | `LTX2TwoStagePipeline` | LTX-2.5 Full/SFT two-stage T2V and I2V | `Lightricks/LTX-2.5-Diffusers` + `Lightricks/LTX-2.5` LoRA | ✅︎ | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/LTX/LTX-2.5.md) |
 | `LTX2DistilledOneStagePipeline` | LTX-2.5 merged-distilled one-stage T2V and I2V | `Lightricks/LTX-2.5-Diffusers` | ✅︎ | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/LTX/LTX-2.5.md) |
 | `LTX2DistilledTwoStagePipeline` | LTX-2.5 merged-distilled two-stage T2V and I2V | `Lightricks/LTX-2.5-Diffusers` | ✅︎ | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/LTX/LTX-2.5.md) |
@@ -59,10 +61,10 @@ th {
 | `SanaImageToVideoPipeline` | SANA-Video-2B I2V (native and Diffusers adapter validated at 480p/720p) | `Efficient-Large-Model/SANA-Video_2B_480p_diffusers`, `Efficient-Large-Model/SANA-Video_2B_720p_diffusers` | ✅︎ | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/NVIDIA/SANA-Video-2B.md) |
 | `SeedVR2Pipeline` | [SeedVR2 3B](seedvr2.md) video restoration | `ByteDance-Seed/SeedVR2-3B` | ✅︎ | | | ✅︎ | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/ByteDance/SeedVR2-RTX-5090.md) |
 | `MiniMaxH3Pipeline` | MiniMax H3 T2VA, first/last-keyframe FL2VA, and mixed-reference Ref2VA | `MiniMaxAI/MiniMax-H3` | ✅︎ | ✅︎ | | | [Published](https://recipes.vllm.ai/MiniMaxAI/MiniMax-H3) |
+| `TaoMateH3Pipeline` | TaoMate-H3 realtime streaming presenter (MiniMax-H3 + TaoMate LoRA, USP2/USP4) | `MiniMaxAI/MiniMax-H3` FL2VA + `TaoLiveAIGC/TaoMate-H3` | Experimental | | | | [Recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/TaoLiveAIGC/TaoMate-H3.md) |
 | `Magi2Pipeline` | MAGI-2 native Preview-stage T2VA and I2VA (272p/540p) | `sand-ai/MAGI-2-preview` | ✅︎ | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/SandAI/MAGI-2-preview-L20X.md) |
 | `DreamZeroPipeline` | DreamZero-DROID | `GEAR-Dreams/DreamZero-DROID` | ✅︎ | ✅︎ | ✅︎ | ✅︎ | — |
 | `Pi0Pipeline` | π0 (Pi-Zero) VLA | `lerobot/pi0_base` | ✅︎ | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/lerobot/Pi0.md) |
-| `Pi05Pipeline` | π0.5 VLA | `lerobot/pi05_base` | ✅︎ | | | ✅︎ | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/lerobot/Pi05.md) |
 | `HeliosPipeline`, `HeliosPyramidPipeline` | Helios | `BestWishYsh/Helios-Base`, `BestWishYsh/Helios-Mid`, `BestWishYsh/Helios-Distilled` | ✅︎ | ✅︎ | ✅︎ | | — |
 | `OvisImagePipeline` | Ovis-Image | `OvisAI/Ovis-Image` | ✅︎ | ✅︎ | | ✅︎ | — |
 | `LongcatImagePipeline` | LongCat-Image | `meituan-longcat/LongCat-Image` | ✅︎ | ✅︎ | ✅︎ | ✅︎ | — |
@@ -119,7 +121,6 @@ th {
 | `PersonaPlexTalkerForConditionalGeneration` | PersonaPlex (full duplex, 24 kHz speech in/out over `/v1/realtime?duplex=1`) | `nvidia/personaplex-7b-v1` | ✅︎ | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/NVIDIA/PersonaPlex.md) |
 | `ErnieImagePipeline` | ERNIE-Image | `baidu/ERNIE-Image`, `baidu/ERNIE-Image-Turbo` | ✅︎ | ✅︎ | ✅︎ | ✅︎ | — |
 | `GepardTalkerForConditionalGeneration` | Gepard-1.0 | `nineninesix/gepard-1.0` | ✅︎ | | | ✅︎ | — |
-| `HiDreamImagePipeline` | HiDream-I1-Full | `HiDream-ai/HiDream-I1-Full` | ✅︎ | ✅︎ | | | — |
 | `HiDreamO1ImagePipeline` | HiDream-O1-Image | `HiDream-ai/HiDream-O1-Image` | ✅︎ | | | | — |
 | `AnimaPipeline` | Anima | `circlestone-labs/Anima` | ✅︎ | ✅︎ | | ✅︎ | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/circlestone-labs/Anima.md) |
 

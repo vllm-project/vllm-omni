@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
-import json
 import queue
 import threading
 import time
@@ -551,52 +550,6 @@ class OmniEngineBase:
                 self._try_shutdown("[OmniEngine] Failed to cleanup after orchestrator startup failure")
                 raise
 
-    @staticmethod
-    def _get_default_cache_config(cache_backend: str | None) -> dict[str, Any] | None:
-        if cache_backend == "cache_dit":
-            return {
-                "Fn_compute_blocks": 1,
-                "Bn_compute_blocks": 0,
-                "max_warmup_steps": 4,
-                "residual_diff_threshold": 0.24,
-                "max_continuous_cached_steps": 3,
-                "enable_taylorseer": False,
-                "taylorseer_order": 1,
-                "scm_steps_mask_policy": None,
-                "scm_steps_policy": "dynamic",
-            }
-        if cache_backend == "tea_cache":
-            return {
-                "rel_l1_thresh": 0.2,
-            }
-        if cache_backend == "mag_cache":
-            return {
-                "mag_threshold": 0.24,
-                "mag_max_skip_steps": 5,
-                "mag_retention_ratio": 0.1,
-            }
-        if cache_backend == "step_cache":
-            return {
-                "step_cache_dit_enabled": True,
-                "velocity_sim_thresholds": [0.95, 0.93],
-                "velocity_skip_countdowns": [4, 2],
-                "step_cache_dit_min_history": 2,
-                "step_cache_dit_max_history": 2,
-            }
-        return None
-
-    @staticmethod
-    def _normalize_cache_config(cache_backend: str | None, cache_config: Any | None) -> Any | None:
-        if isinstance(cache_config, str):
-            try:
-                cache_config = json.loads(cache_config)
-            except json.JSONDecodeError:
-                logger.warning("Invalid cache_config JSON, using defaults.")
-                cache_config = None
-        if cache_config is None and cache_backend not in (None, "", "none"):
-            cache_config = OmniEngineBase._get_default_cache_config(cache_backend)
-        return cache_config
-
     def _detect_pd_config(self) -> dict[str, Any] | None:
         """Detect PD (Prefill-Decode) disaggregation config from stage_configs.
         Returns a dict with 'pd_pair' and 'bootstrap_addr', or None.
@@ -729,11 +682,30 @@ class OmniEngineBase:
     def try_get_output(self, timeout: float = 0.001) -> EngineQueueMessage | None:
         """Read one output message from the Orchestrator output queue."""
         try:
-            return self.output_queue.sync_q.get(timeout=timeout)
+            msg = self.output_queue.sync_q.get(timeout=timeout)
+            self._invalidate_mm_cache_on_error(msg)
+            return msg
         except queue.Empty:
             if not self.is_alive():
                 raise RuntimeError("Orchestrator died unexpectedly. See logs above.")
             return None
+
+    def _invalidate_mm_cache_on_error(self, msg: EngineQueueMessage) -> None:
+        if not isinstance(msg, ErrorMessage) or msg.stage_id != 0 or not msg.mm_cache_miss_hashes:
+            return
+        processor = self.input_processor
+        cache = processor.renderer.mm_processor_cache if processor is not None else None
+        if cache is not None:
+            for mm_hash in msg.mm_cache_miss_hashes:
+                cache.invalidate(mm_hash)
+
+    def _drain_output_messages(self, max_messages: int) -> list[EngineQueueMessage]:
+        assert self._output_sink is not None
+        messages = self._output_sink.drain(max_messages)
+        # Invalidate before the frontend routes (or drops) request-scoped errors.
+        for msg in messages:
+            self._invalidate_mm_cache_on_error(msg)
+        return messages
 
     async def get_outputs_async(
         self,
@@ -749,11 +721,11 @@ class OmniEngineBase:
         """
         sink = self._output_sink
         assert sink is not None
-        msgs = sink.drain(max_messages)
+        msgs = self._drain_output_messages(max_messages)
         if msgs:
             return msgs
         ready = sink.arm_wakeup()
-        msgs = sink.drain(max_messages)
+        msgs = self._drain_output_messages(max_messages)
         if msgs:
             return msgs
         try:
@@ -761,11 +733,11 @@ class OmniEngineBase:
         except asyncio.TimeoutError:
             # A put that skipped the wakeup (e.g. an error written while the
             # orchestrator thread died) is still delivered before giving up.
-            msgs = sink.drain(max_messages)
+            msgs = self._drain_output_messages(max_messages)
             if not msgs and not self.is_alive():
                 raise RuntimeError("Orchestrator died unexpectedly. See logs above.") from None
             return msgs
-        return sink.drain(max_messages)
+        return self._drain_output_messages(max_messages)
 
     def get_stage_renderer(self, stage_id: int) -> BaseRenderer:
         """Return the renderer for chat requests that bypass stage 0 and enter at ``stage_id``."""
@@ -918,6 +890,13 @@ class OmniEngineBase:
         finalizer = getattr(self, "_weak_finalizer", None)
         if finalizer is not None and finalizer.alive:
             finalizer.detach()
+
+        cancel_initialization = getattr(getattr(self, "_runtime", None), "cancel_initialization", None)
+        if callable(cancel_initialization):
+            # The orchestrator thread may still be initializing stages. Cancel
+            # before waiting for it: a stage that becomes READY while we wait
+            # must not start launching the next one.
+            cancel_initialization()
 
         logger.info("[OmniEngine] Shutting down Orchestrator")
         request_queue_closed = False

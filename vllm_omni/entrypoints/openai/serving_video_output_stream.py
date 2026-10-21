@@ -39,6 +39,7 @@ from collections.abc import AsyncGenerator
 from http import HTTPStatus
 from typing import Any, cast
 
+import anyio
 import numpy as np
 import torch
 from fastapi import HTTPException, WebSocket, WebSocketDisconnect
@@ -47,6 +48,7 @@ from pydantic import ValidationError
 from vllm.logger import init_logger
 
 from vllm_omni.entrypoints.async_omni import AsyncOmni
+from vllm_omni.entrypoints.async_omni_base import ABORT_TIMEOUT_S
 from vllm_omni.entrypoints.openai.errors import InvalidInputReferenceError
 from vllm_omni.entrypoints.openai.protocol.videos import VideoGenerationRequest, VideoParams
 from vllm_omni.entrypoints.openai.stage_params import (
@@ -177,6 +179,7 @@ class OmniStreamingVideoOutputHandler:
                     send_lock=send_lock,
                     progress=progress,
                     interaction_event_ids=interaction_event_ids,
+                    track_playback=request.streaming_buffer_seconds is not None,
                 )
             )
             control_task = asyncio.create_task(
@@ -188,6 +191,7 @@ class OmniStreamingVideoOutputHandler:
                     progress,
                     interaction_event_ids,
                     interaction_queue,
+                    request.streaming_buffer_seconds is not None,
                     stop_received_at=stop_received_at,
                     response_queue=response_queue,
                 )
@@ -273,18 +277,28 @@ class OmniStreamingVideoOutputHandler:
             logger.exception("Streaming video output session error: %s", e)
             await self._send_error(websocket, str(e))
         finally:
-            stop_event.set()
-            if control_task is not None:
-                control_task.cancel()
-                await asyncio.gather(control_task, return_exceptions=True)
-            if interaction_delivery_task is not None and request_id is not None:
-                interaction_delivery_task.cancel()
-                await asyncio.gather(interaction_delivery_task, return_exceptions=True)
-            if response_task is not None:
-                response_task.cancel()
-                await asyncio.gather(response_task, return_exceptions=True)
-            if request_id is not None and not generation_done:
-                await self._abort_request(request_id)
+            # ASGI disconnect cancellation can arrive after session.done, while
+            # we await a child. Finish reaping every task and aborting unfinished
+            # generation before leaving the session's cancellation scope.
+            with anyio.CancelScope(shield=True):
+                stop_event.set()
+                if control_task is not None:
+                    control_task.cancel()
+                    await asyncio.gather(control_task, return_exceptions=True)
+                if interaction_delivery_task is not None and request_id is not None:
+                    interaction_delivery_task.cancel()
+                    await asyncio.gather(interaction_delivery_task, return_exceptions=True)
+                    await self._release_queued_interactions(
+                        interaction_queue,
+                        request_id=request_id,
+                        track_playback=request is not None and request.streaming_buffer_seconds is not None,
+                        interaction_event_ids=interaction_event_ids,
+                    )
+                if response_task is not None:
+                    response_task.cancel()
+                    await asyncio.gather(response_task, return_exceptions=True)
+                if request_id is not None and not generation_done:
+                    await self._abort_request(request_id)
 
     async def _receive_start(self, websocket: WebSocket) -> tuple[VideoGenerationRequest, StreamingVideoFormat] | None:
         try:
@@ -362,7 +376,7 @@ class OmniStreamingVideoOutputHandler:
         send_lock: asyncio.Lock,
         stop_event: asyncio.Event,
         request_id: str,
-        timeout: float,
+        timeout: float | None,
     ) -> None:
         try:
             while True:
@@ -392,6 +406,7 @@ class OmniStreamingVideoOutputHandler:
         progress: _SessionProgress,
         interaction_event_ids: set[str],
         interaction_queue: asyncio.Queue[OmniInteractionPrompt],
+        track_playback: bool = False,
         *,
         stop_received_at: list[float],
         response_queue: asyncio.Queue[dict[str, Any]],
@@ -497,6 +512,7 @@ class OmniStreamingVideoOutputHandler:
                         interaction_queue=interaction_queue,
                         stop_event=stop_event,
                         progress=progress,
+                        track_playback=track_playback,
                     )
                     continue
                 await self._send_error(
@@ -522,6 +538,7 @@ class OmniStreamingVideoOutputHandler:
         send_lock: asyncio.Lock,
         progress: _SessionProgress,
         interaction_event_ids: set[str],
+        track_playback: bool,
     ) -> None:
         """Deliver accepted interactions in ingress order without blocking the reader."""
         try:
@@ -529,16 +546,25 @@ class OmniStreamingVideoOutputHandler:
                 interaction = await interaction_queue.get()
                 try:
                     try:
-                        await self._engine_client.submit_interaction_async(
-                            request_id,
-                            interaction=interaction,
-                        )
+                        if track_playback:
+                            await self._engine_client.submit_interaction_async(
+                                request_id,
+                                interaction=interaction,
+                                track_playback=True,
+                            )
+                        else:
+                            await self._engine_client.submit_interaction_async(
+                                request_id,
+                                interaction=interaction,
+                            )
                         progress.touch()
                     except asyncio.CancelledError:
+                        await self._release_interaction_reservation(request_id, interaction["event_id"], track_playback)
                         raise
                     except Exception:
                         logger.exception("Failed to apply interaction for request %s", request_id, exc_info=True)
                         interaction_event_ids.discard(interaction["event_id"])
+                        await self._release_interaction_reservation(request_id, interaction["event_id"], track_playback)
                         await self._send_error(
                             websocket,
                             "Failed to apply interaction",
@@ -555,9 +581,39 @@ class OmniStreamingVideoOutputHandler:
             stop_event.set()
             await self._abort_request(request_id)
 
+    async def _release_interaction_reservation(self, request_id: str, event_id: str, track_playback: bool) -> None:
+        if not track_playback:
+            return
+        try:
+            await self._engine_client.release_streaming_interaction(request_id, event_id)
+        except Exception:
+            logger.debug("Failed to release interaction reservation", exc_info=True)
+
+    async def _release_queued_interactions(
+        self,
+        interaction_queue: asyncio.Queue[OmniInteractionPrompt],
+        *,
+        request_id: str,
+        track_playback: bool,
+        interaction_event_ids: set[str],
+    ) -> None:
+        while True:
+            try:
+                interaction = interaction_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+            interaction_event_ids.discard(interaction["event_id"])
+            await self._release_interaction_reservation(request_id, interaction["event_id"], track_playback)
+            interaction_queue.task_done()
+
     async def _abort_request(self, request_id: str) -> None:
         try:
-            await self._engine_client.abort(request_id)
+            # Bound both the coroutine and the executor thread waiting for the
+            # orchestrator acknowledgement, including inside shielded cleanup.
+            await asyncio.wait_for(
+                self._engine_client.abort(request_id, timeout=ABORT_TIMEOUT_S),
+                timeout=ABORT_TIMEOUT_S,
+            )
         except Exception:
             logger.debug("Failed to abort streaming video request %s", request_id, exc_info=True)
 
@@ -572,6 +628,7 @@ class OmniStreamingVideoOutputHandler:
         interaction_queue: asyncio.Queue[OmniInteractionPrompt],
         stop_event: asyncio.Event,
         progress: _SessionProgress,
+        track_playback: bool = False,
         response_queue: asyncio.Queue[dict[str, Any]],
     ) -> None:
         interaction = msg.get("interaction")
@@ -718,19 +775,26 @@ class OmniStreamingVideoOutputHandler:
             return
         interaction_event_ids.add(event_id)
 
+        received_at: float | None = None
+        reservation_attempted = False
         try:
             if interaction_queue.full():
                 raise asyncio.QueueFull
+            if track_playback:
+                reservation_attempted = True
+                received_at = await self._engine_client.reserve_streaming_interaction(request_id, event_id)
             response_queue.put_nowait(
                 {
                     "type": "session.interaction.queued",
                     "request_id": request_id,
                     "event_id": event_id,
+                    **({"received_at": received_at} if received_at is not None else {}),
                 }
             )
             interaction_queue.put_nowait(normalized)
         except asyncio.QueueFull:
             interaction_event_ids.discard(event_id)
+            await self._release_interaction_reservation(request_id, event_id, reservation_attempted)
             stop_event.set()
             await self._abort_request(request_id)
             await self._send_error(
@@ -745,10 +809,12 @@ class OmniStreamingVideoOutputHandler:
             return
         except asyncio.CancelledError:
             interaction_event_ids.discard(event_id)
+            await self._release_interaction_reservation(request_id, event_id, reservation_attempted)
             raise
         except Exception:
-            logger.exception("Failed to queue interaction for request %s", request_id, exc_info=True)
+            logger.exception("Failed to reserve interaction for request %s", request_id, exc_info=True)
             interaction_event_ids.discard(event_id)
+            await self._release_interaction_reservation(request_id, event_id, reservation_attempted)
             await self._send_error(
                 websocket,
                 "Failed to queue interaction",
@@ -1052,6 +1118,11 @@ class OmniStreamingVideoOutputHandler:
             "active_event_ids": stream_metadata.get("active_event_ids", []),
             "completed_event_ids": stream_metadata.get("completed_event_ids", []),
             **{key: stream_metadata[key] for key in ("pacing", "output_chunk_index") if key in stream_metadata},
+            **(
+                {"coalesced_event_ids": stream_metadata["coalesced_event_ids"]}
+                if stream_metadata.get("coalesced_event_ids")
+                else {}
+            ),
         }
 
     @staticmethod

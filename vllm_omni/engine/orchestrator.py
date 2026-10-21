@@ -614,6 +614,10 @@ class OrchestratorBase:
     async def _shutdown_extensions(self) -> None:
         """Runs in ``run()``'s ``finally`` after task cancellation, before membership drain."""
 
+    def _session_route(self, stage_id: int, req_state: OrchestratorRequestState) -> int | None:
+        """Return a required replica, if any, without changing request bindings."""
+        return None
+
     def _on_stage_submitted(
         self,
         stage_id: int,
@@ -869,6 +873,9 @@ class OrchestratorBase:
         await self._handle_kv_ready_raw_outputs(stage_id, raw_outputs)
 
         for eco in raw_outputs.outputs:
+            mm_cache_miss_hashes = getattr(eco, "mm_cache_miss_hashes", None)
+            if mm_cache_miss_hashes and stage_id != 0:
+                await asyncio.to_thread(self._invalidate_stage_mm_cache, stage_id, mm_cache_miss_hashes)
             # Emit kv_wait_s before _handle_kv_ready_raw_outputs'
             # async_chunk early-return so it lands in all modes.
             kv_params = getattr(eco, "kv_transfer_params", None)
@@ -884,6 +891,18 @@ class OrchestratorBase:
             request_id = getattr(eco, "request_id", None)
             req_state = self.request_states.get(request_id) if request_id is not None else None
             if req_state is None:
+                # Stage 0's sender lives on the frontend. Deliver its cache
+                # feedback even after cancellation; consumers may drop the error
+                # only after the engine has invalidated those stale entries.
+                if mm_cache_miss_hashes and stage_id == 0:
+                    await self.output_async_queue.put(
+                        ErrorMessage(
+                            request_id=request_id,
+                            stage_id=stage_id,
+                            error="Multi-modal processor cache miss.",
+                            mm_cache_miss_hashes=mm_cache_miss_hashes,
+                        )
+                    )
                 continue
 
             segment_finished = bool(getattr(eco, "is_segment_finished", False))
@@ -895,7 +914,11 @@ class OrchestratorBase:
                 and not segment_finished
                 and not req_state.session_owned
             ):
-                reason = getattr(eco, "stop_reason", None)
+                reason = (
+                    "Multi-modal processor cache miss. Please retry the request."
+                    if mm_cache_miss_hashes
+                    else getattr(eco, "stop_reason", None)
+                )
                 await self._handle_stage_error(
                     stage_id,
                     eco,
@@ -1460,8 +1483,13 @@ class OrchestratorBase:
                 request_id=parent_id,
                 stage_id=stage_id,
                 error=error if error is not None else output.error,
-                status_code=getattr(output, "error_status_code", None),
-                error_type=getattr(output, "error_type", None),
+                status_code=503
+                if getattr(output, "mm_cache_miss_hashes", None)
+                else getattr(output, "error_status_code", None),
+                error_type="ServiceUnavailableError"
+                if getattr(output, "mm_cache_miss_hashes", None)
+                else getattr(output, "error_type", None),
+                mm_cache_miss_hashes=getattr(output, "mm_cache_miss_hashes", None),
             )
         )
         await self._cleanup_request_ids(
@@ -1691,6 +1719,18 @@ class OrchestratorBase:
             # cleanup may otherwise try to abort the already-dead engine.
             pool = self.stage_pools[stage_id]
             dead_replica = pool.get_bound_replica_id(dispatch_req_id or req_id)
+            req_state = self.request_states.get(req_id)
+            pinned_replica = None
+            if req_state is not None:
+                try:
+                    pinned_replica = self._session_route(stage_id, req_state)
+                except StageUnavailableError:
+                    pass
+            if pinned_replica is not None:
+                # A failed initial submit rolls back the request binding. The
+                # session route still identifies every owner of the dead worker.
+                await self._handle_dead_replica(stage_id, pinned_replica, e)
+                return False
             logger.error(
                 "[Orchestrator] %s dispatch for req=%s hit dead stage-%s replica-%s: %s",
                 operation,
@@ -1883,6 +1923,7 @@ class OrchestratorBase:
                 fatal=False,
                 request_id=req_state.request_id,
                 stage_id=stage_id,
+                mm_cache_miss_hashes=getattr(eco, "mm_cache_miss_hashes", None),
             )
         )
 
@@ -2138,6 +2179,15 @@ class OrchestratorBase:
             processor = build_stage0_input_processor(self.stage_pools[stage_id].stage_vllm_config)
             self._stage_input_processors[stage_id] = processor
         return processor
+
+    def _invalidate_stage_mm_cache(self, stage_id: int, mm_hashes: list[str]) -> None:
+        # Multimodal preprocessing uses this same lock in a worker thread.
+        with self._prompt_processing_lock:
+            processor = self._stage_input_processors.get(stage_id)
+            cache = processor.renderer.mm_processor_cache if processor is not None else None
+            if cache is not None:
+                for mm_hash in mm_hashes:
+                    cache.invalidate(mm_hash)
 
     def _upgrade_processed_stage_request(self, request: Any, raw_prompt: Any) -> Any:
         prompt_embeds = getattr(request, "prompt_embeds", None)
@@ -2610,6 +2660,10 @@ class OrchestratorBase:
         """Forward output from the current logical stage to the next one."""
         next_logical = src_stage_id + 1
         next_pool = self.stage_pools[next_logical]
+        pinned_replica_id = self._session_route(next_logical, req_state)
+        if pinned_replica_id is not None:
+            next_pool.bind_request_to_replica(req_id, pinned_replica_id)
+        route_kwargs: dict[str, Any] = {} if pinned_replica_id is None else {"pinned_replica_id": pinned_replica_id}
         if not next_pool.live_replica_ids():
             # The downstream stage lost all of its replicas before this in-flight
             # request could be forwarded.
@@ -2751,12 +2805,16 @@ class OrchestratorBase:
                 diffusion_prompt = req_state.prompt
 
             submit_kwargs = self._diffusion_submit_kwargs(req_id, src_stage_id, next_client, req_state, output)
-            payload_sender_info = self._build_payload_sender_info(src_stage_id, request_id=req_id)
+            payload_sender_info = self._build_payload_sender_info(src_stage_id, request_id=req_id, req_state=req_state)
             if payload_sender_info is not None:
                 submit_kwargs["payload_sender_info"] = payload_sender_info
             if already_submitted:
                 replica_id = await next_pool.submit_update(
-                    req_id, req_state, diffusion_prompt, submit_kwargs=submit_kwargs
+                    req_id,
+                    req_state,
+                    diffusion_prompt,
+                    submit_kwargs=submit_kwargs,
+                    **route_kwargs,
                 )
             else:
                 replica_id = await next_pool.submit_initial(
@@ -2765,6 +2823,7 @@ class OrchestratorBase:
                     diffusion_prompt,
                     submit_kwargs=submit_kwargs,
                     params_override=self._maybe_clone_diffusion_params_for_cfg(req_id, params),
+                    **route_kwargs,
                 )
             self._on_stage_submitted(
                 next_logical,
@@ -2816,9 +2875,11 @@ class OrchestratorBase:
                 )
                 request.external_req_id = request.request_id
                 if already_submitted:
-                    replica_id = await next_pool.submit_update(req_id, req_state, request)
+                    replica_id = await next_pool.submit_update(req_id, req_state, request, **route_kwargs)
                 else:
-                    replica_id = await next_pool.submit_initial(req_id, req_state, request, prompt_text=None)
+                    replica_id = await next_pool.submit_initial(
+                        req_id, req_state, request, prompt_text=None, **route_kwargs
+                    )
                 self._on_stage_submitted(
                     next_logical,
                     req_id,
@@ -2949,7 +3010,9 @@ class OrchestratorBase:
                         params=params,
                         mm_features=mm_features,
                         resumable=next_stage_resumable,
-                        payload_sender_info=self._build_payload_sender_info(src_stage_id, request_id=req_id),
+                        payload_sender_info=self._build_payload_sender_info(
+                            src_stage_id, request_id=req_id, req_state=req_state
+                        ),
                         replica_id=scoped_replica_id,
                     )
                 except (ValueError, VLLMClientError) as exc:
@@ -2973,10 +3036,15 @@ class OrchestratorBase:
                 if mark_submitting is not None:
                     mark_submitting()
                 if already_submitted:
-                    replica_id = await next_pool.submit_update(req_id, req_state, request)
+                    replica_id = await next_pool.submit_update(req_id, req_state, request, **route_kwargs)
                 else:
                     replica_id = await next_pool.submit_initial(
-                        req_id, req_state, request, prompt_text=None, expected_replica_id=scoped_replica_id
+                        req_id,
+                        req_state,
+                        request,
+                        prompt_text=None,
+                        expected_replica_id=scoped_replica_id,
+                        **route_kwargs,
                     )
             self._on_stage_submitted(
                 next_logical,
@@ -3057,6 +3125,15 @@ class OrchestratorBase:
                 # execute before that conditioning payload arrives.
                 continue
 
+            for route_stage_id in (next_stage_id - 1, next_stage_id):
+                try:
+                    pinned_replica_id = self._session_route(route_stage_id, req_state)
+                    if pinned_replica_id is not None:
+                        self.stage_pools[route_stage_id].bind_request_to_replica(request_id, pinned_replica_id)
+                except StageUnavailableError:
+                    await self._fail_request_dead_stage(request_id, route_stage_id)
+                    return False
+            route_kwargs: dict[str, Any] = {} if pinned_replica_id is None else {"pinned_replica_id": pinned_replica_id}
             req_state.stage_submit_ts[next_stage_id] = _time.time()
             _t_submit_start = _time.perf_counter()
 
@@ -3073,6 +3150,7 @@ class OrchestratorBase:
                         req_state,
                         req_state.prompt,
                         submit_kwargs=submit_kwargs,
+                        **route_kwargs,
                     ),
                     req_id=request_id,
                     stage_id=next_stage_id,
@@ -3144,7 +3222,9 @@ class OrchestratorBase:
                     model_config=next_pool.stage_vllm_config.model_config,
                     resumable=downstream_resumable,
                 )
-                request.payload_sender_info = self._build_payload_sender_info(next_stage_id - 1, request_id=request_id)
+                request.payload_sender_info = self._build_payload_sender_info(
+                    next_stage_id - 1, request_id=request_id, req_state=req_state
+                )
                 request.external_req_id = request.request_id
                 submitted = await self._dispatch_or_fail_request(
                     lambda: next_pool.submit_initial(
@@ -3152,6 +3232,7 @@ class OrchestratorBase:
                         req_state,
                         request,
                         prompt_text=None,
+                        **route_kwargs,
                     ),
                     req_id=request_id,
                     stage_id=next_stage_id,
@@ -3292,10 +3373,15 @@ class OrchestratorBase:
         sender_stage_id: int,
         *,
         request_id: str | None = None,
+        req_state: OrchestratorRequestState | None = None,
     ) -> dict[str, Any] | None:
         if sender_stage_id < 0 or sender_stage_id >= len(self.stage_pools):
             return None
         sender_pool = self.stage_pools[sender_stage_id]
+        if request_id is not None and req_state is not None:
+            pinned_replica_id = self._session_route(sender_stage_id, req_state)
+            if pinned_replica_id is not None:
+                sender_pool.bind_request_to_replica(request_id, pinned_replica_id)
         sender_stage = sender_pool.get_bound_client(request_id) if request_id is not None else None
         if sender_stage is None:
             sender_stage = sender_pool.stage_client
@@ -3570,16 +3656,25 @@ class Orchestrator(OrchestratorBase):
         )
         self.request_states[companion_id] = companion_state
         companion_state.stage_submit_ts[0] = _time.time()
+
         # A dead-stage failure is attributed to the parent request; its cleanup
         # also releases this companion.
-        if not await self._dispatch_or_fail_request(
-            lambda: self.stage_pools[0].submit_initial(
+        async def submit_companion() -> None:
+            pinned_replica_id = self._session_route(0, parent_state)
+            if pinned_replica_id is not None:
+                self.stage_pools[0].bind_request_to_replica(companion_id, pinned_replica_id)
+            route_kwargs: dict[str, Any] = {} if pinned_replica_id is None else {"pinned_replica_id": pinned_replica_id}
+            await self.stage_pools[0].submit_initial(
                 companion_id,
                 companion_state,
                 companion_prompt,
                 prompt_text=msg.companion_prompt_text,
                 affinity_request_id=parent_id,
-            ),
+                **route_kwargs,
+            )
+
+        if not await self._dispatch_or_fail_request(
+            submit_companion,
             req_id=parent_id,
             stage_id=0,
             operation=f"companion {companion_id}",

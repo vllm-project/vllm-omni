@@ -14,6 +14,7 @@ from vllm.v1.worker.gpu.model_states.default import DefaultModelState
 from tests.helpers.mark import hardware_marks, hardware_test
 from vllm_omni.model_executor.models.moss_tts.local_model_state import MossLocalModelState
 from vllm_omni.model_executor.models.moss_tts.modeling_moss_tts_talker import MossTTSLocalTalkerForGeneration
+from vllm_omni.model_executor.output_snapshot import PackedOutputSnapshot
 from vllm_omni.utils.device_copy import DeviceStager
 from vllm_omni.worker_v2.model_states import init_omni_model_state
 from vllm_omni.worker_v2.model_states.eager_mtp import EagerMTPState
@@ -128,6 +129,10 @@ def _step(state, batch, req_states, dispatcher=None):
         hidden = inputs["inputs_embeds"] + 0.25
         state.run_postprocess(hidden, batch)
         _, payload = state.postprocess_model_output(hidden, batch, req_states)
+        if isinstance(payload, PackedOutputSnapshot):
+            # The runner only reads a snapshot through its host copy plan; an
+            # identity copy keeps the rows as views of the owned gathered tensor.
+            payload = payload.copy_to_cpu(lambda tensor: tensor)
         last = batch.query_start_loc[1:] - 1
         tokens = state.model.compute_logits(hidden.index_select(0, last)).argmax(-1)
         result = inputs["inputs_embeds"].clone(), payload, tokens

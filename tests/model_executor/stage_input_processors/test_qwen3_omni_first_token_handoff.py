@@ -10,6 +10,10 @@ import pytest
 import torch
 
 import vllm_omni.model_executor.stage_input_processors.qwen3_omni as q3
+from vllm_omni.model_executor.models.qwen3_omni.tool_speech import (
+    TOOL_CALL_START_TOKEN_ID,
+    spoken_span_end,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -23,6 +27,7 @@ class _Manager:
     def __init__(self) -> None:
         self.put_req_chunk: defaultdict[str, int] = defaultdict(int)
         self.request_payload: dict[str, dict] = {}
+        self._pending_streaming_prefills: dict[str, dict] = {}
         self.config = SimpleNamespace(
             hf_config=SimpleNamespace(talker_config=SimpleNamespace(accept_hidden_layer=ACCEPT))
         )
@@ -64,8 +69,8 @@ def _output(token_ids, sampled=None):
     return {"hidden_states": {"layers": layers}, "embed": embed}
 
 
-def _run_turn(tokens, *, publish, max_tokens=64, prefill_chunks=(len(PROMPT),)):
-    manager = _Manager()
+def _run_turn(tokens, *, publish, max_tokens=64, prefill_chunks=(len(PROMPT),), manager=None):
+    manager = _Manager() if manager is None else manager
     rows, chunks, start = [], 0, 0
     for i, size in enumerate(prefill_chunks):
         last = i == len(prefill_chunks) - 1
@@ -144,3 +149,106 @@ def test_missing_sample_on_sampled_stream(prefill_rows):
         assert manager.put_req_chunk["r"] == before
         chunk = manager.process(_output([12], sampled=_embed(13)), _request([11, 12, 13], history=False))
         assert torch.equal(chunk.embed.decode, _embed(13))
+
+
+def test_spoken_span_stops_at_the_tool_call_token():
+    prompt = [151644, 77091, 198]
+    preface = [11, 12]
+    tail = [TOOL_CALL_START_TOKEN_ID, 99, 100]
+    ids = prompt + preface + tail
+    assert spoken_span_end(ids, 0, len(ids)) == len(prompt) + len(preface)
+    assert spoken_span_end(preface, 0, len(preface)) == len(preface)
+
+
+@pytest.mark.parametrize("publish", [True, False])
+def test_tool_call_token_is_not_forwarded_to_the_talker(publish):
+    rows, _chunks, manager = _run_turn([11, 12, TOOL_CALL_START_TOKEN_ID, 99, EOS], publish=publish)
+    # Preface stays in both publication modes. The marker and everything after it do not.
+    assert rows == [11, 12]
+    assert manager.request_payload["r"].get(q3._TOOL_SPEECH_CUT) is True
+
+
+def test_captured_tool_step_still_forwards_the_preceding_token():
+    manager = _Manager()
+    spoken = _request([11, 12, TOOL_CALL_START_TOKEN_ID])
+    spoken.resumable = True
+    payload = q3._construct_thinker2talker_streaming_input_async_chunk(
+        False, spoken, _embed(12), torch.randn(1, HIDDEN).to(torch.bfloat16), manager
+    )
+    assert payload is not None and payload.embed is not None
+    assert torch.equal(payload.embed.decode, _embed(12))
+    assert manager.request_payload["r"].get(q3._TOOL_SPEECH_CUT) is True
+    following = _request([11, 12, TOOL_CALL_START_TOKEN_ID, 99])
+    following.resumable = True
+    assert (
+        q3._construct_thinker2talker_streaming_input_async_chunk(
+            False, following, _embed(TOOL_CALL_START_TOKEN_ID), torch.randn(1, HIDDEN).to(torch.bfloat16), manager
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize("publish", [True, False])
+def test_one_preface_token_is_kept_when_chunk_zero_samples_the_marker(publish):
+    rows, _chunks, manager = _run_turn([11, TOOL_CALL_START_TOKEN_ID, 99, EOS], publish=publish)
+    assert rows == [11]
+    assert manager.request_payload["r"].get(q3._TOOL_SPEECH_CUT) is True
+
+
+@pytest.mark.parametrize("publish", [True, False])
+def test_tool_call_as_the_first_token_forwards_no_speech(publish):
+    rows, _chunks, manager = _run_turn([TOOL_CALL_START_TOKEN_ID, 99, EOS], publish=publish)
+    # Prompt prefill goes out so chunk_id can advance. No generated token does.
+    assert rows == []
+    assert manager.request_payload["r"].get(q3._TOOL_SPEECH_CUT) is True
+
+
+def test_cleanup_lets_the_same_external_id_speak_again():
+    import threading
+
+    from vllm_omni.distributed.omni_connectors.model_runner.omni_connector_payload_transport import (
+        _OmniConnectorPayloadTransportMixin,
+    )
+    from vllm_omni.distributed.omni_connectors.model_runner.omni_connector_runtime import _OmniConnectorRuntimeMixin
+    from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import OmniChunkTransferAdapter
+
+    _rows, _chunks, manager = _run_turn([11, 12, TOOL_CALL_START_TOKEN_ID, 99, EOS], publish=True)
+    assert manager.request_payload["r"].get(q3._TOOL_SPEECH_CUT) is True
+    retained = {"ext": {q3._TOOL_SPEECH_CUT: True}}
+    runtime = SimpleNamespace(
+        _qwen3_tts_emitted_frames={},
+        _send_side_request_payload=retained,
+        _cached_ic={},
+    )
+    _OmniConnectorRuntimeMixin._drop_send_side_payload_state(runtime, "ext", None)
+    assert "ext" not in retained
+    deferred = {"ext": {q3._TOOL_SPEECH_CUT: True}}
+    transport = SimpleNamespace(
+        _lock=threading.Lock(),
+        _pending_save_counts={"ext": 1},
+        _deferred_send_cleanup={"ext"},
+        _put_req_chunk={},
+        _send_side_request_payload=deferred,
+        _code_prompt_token_ids={},
+        _qwen3_tts_emitted_frames={},
+        _cached_ic={},
+        _ramp_chunk_count={},
+        _adaptive_states={},
+    )
+    _OmniConnectorPayloadTransportMixin._decrement_pending_save_count(transport, "ext")
+    assert "ext" not in deferred
+    sender = SimpleNamespace(
+        put_req_chunk=manager.put_req_chunk,
+        request_payload=manager.request_payload,
+        code_prompt_token_ids={},
+        requests_num_chunks_sent={},
+        _segment_generation={},
+        ramp_chunk_count={},
+        _adaptive_states={},
+        _pending_streaming_prefills=manager._pending_streaming_prefills,
+    )
+    OmniChunkTransferAdapter._clear_sender_state_locked(sender, "r")
+    assert "r" not in manager.request_payload
+    rows, _chunks, manager = _run_turn([11, 12, EOS], publish=True, manager=manager)
+    assert rows == [11, 12]
+    assert q3._TOOL_SPEECH_CUT not in manager.request_payload.get("r", {})

@@ -63,13 +63,10 @@ steps:
         # that is not supported on CPU
         # Keep multi-GPU tests out of this one-GPU pool even when their module
         # also carries the cpu marker for unit tests.
-        # Keep π0.5 CPU units out of these shards: CUDA READY/MERGE already run
-        # the same suite mandatorily, and AMD covers it non-blocking in nightly.
         - >-
           pytest -sv tests/diffusion
           -m 'core_model and cpu and not (cards_2 or cards_3 or cards_4 or cards_5 or cards_6 or cards_7 or cards_8)'
           --ignore=tests/diffusion/cache/test_teacache_extractors.py
-          --ignore=tests/diffusion/models/pi05/test_pi05_units.py
           --deselect='tests/diffusion/distributed/test_wan_vae_fastpath_install.py::test_omni_wan_vae_decode_override_is_bitwise_exact[dtype0]'
           --deselect='tests/diffusion/distributed/test_wan_vae_fastpath_install.py::test_omni_wan_vae_decode_override_is_bitwise_exact[dtype1]'
           --deselect='tests/diffusion/distributed/test_wan_decoder_fast_path.py::test_sharded_fast_path_on_every_rank[True-exact]'
@@ -157,7 +154,7 @@ steps:
       depends_on: amd-build
       mirror_hardwares: [amdproduction]
       grade: Blocking
-      timeout_in_minutes: 20
+      timeout_in_minutes: 25
       commands:
         - export VLLM_ROCM_USE_AITER=1
         - export VLLM_OMNI_AR_FA_REQUIRED=1
@@ -167,6 +164,11 @@ steps:
         - >-
           timeout --signal=TERM --kill-after=2m 15m
           pytest -sv tests/diffusion/ar_diffusion/test_paged_attention.py
+          -m 'core_model and rocm and MI325 and cards_1' --run-level core_model
+        # Keep the pinned-ring device contract blocking without making the
+        # cold, experimental AITER coverage lane a required check.
+        - >-
+          timeout --signal=TERM --kill-after=1m 5m pytest -sv tests/diffusion/utils/test_chunked_transfer.py
           -m 'core_model and rocm and MI325 and cards_1' --run-level core_model
 
     - label: "Diffusion · LoRA Test"
@@ -230,6 +232,23 @@ steps:
         - export VLLM_LOGGING_LEVEL=DEBUG
         - export VLLM_WORKER_MULTIPROC_METHOD=spawn
         - pytest -s -v tests/diffusion/distributed/test_ulysses_uaa_perf.py
+
+    # Four-GPU jobs remain merge-only because mi300_4 capacity is scarce.
+    # The blocking two-GPU ready lane covers two-rank UAA/SP variants.
+    - label: "ROCm · Ulysses UAA Attention · 4-GPU"
+      agent_pool: mi300_4
+      depends_on: amd-build
+      mirror_hardwares: [amdproduction]
+      grade: Blocking
+      timeout_in_minutes: 25
+      commands:
+        - export VLLM_WORKER_MULTIPROC_METHOD=spawn
+        - >-
+          timeout --signal=TERM --kill-after=2m 20m pytest -s -v
+          tests/diffusion/attention/test_ulysses_uaa.py
+          tests/diffusion/attention/test_attention_sp.py
+          -m 'core_model and rocm and MI325 and cards_4'
+          --run-level "core_model" --durations=20
 
     # merge-only tests
     - label: "Diffusion Tensor Parallelism Test"

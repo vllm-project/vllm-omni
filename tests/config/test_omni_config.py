@@ -45,6 +45,7 @@ from vllm_omni.config.stage_config import (
     _STAGE_DEPLOY_FIELDS,
     PIPELINE_WIDE_ENGINE_FIELDS,
     DeployConfig,
+    DuplexSessionRuntimeConfig,
     PipelineConfig,
     StageDeployConfig,
     StageExecutionType,
@@ -113,6 +114,48 @@ def test_duplex_session_capacity_propagates_to_every_structured_stage() -> None:
 
     assert [stage.model_config.duplex_max_sessions for stage in omni_config.stage_configs] == [2, 2]
     assert [stage.model_config.session_mode for stage in omni_config.stage_configs] == ["duplex", "duplex"]
+
+
+@pytest.mark.parametrize(
+    ("session_mode", "placement", "expected"),
+    [
+        ("duplex", {}, 11),
+        ("duplex", {"replica_policy": "legacy"}, 11),
+        ("duplex", {"replica_policy": "legacy", "max_sessions_per_replica": 3}, 11),
+        ("duplex", {"replica_policy": "least_sessions", "max_sessions_per_replica": 3}, 3),
+        ("turn", {}, 1),
+    ],
+)
+def test_duplex_worker_capacity_survives_typed_engine_projection(session_mode, placement, expected) -> None:
+    pipeline = PipelineConfig(
+        model_type="test-duplex-replica-capacity",
+        stages=(
+            StagePipelineConfig(stage_id=0, model_stage="ar"),
+            StagePipelineConfig(
+                stage_id=1,
+                model_stage="codec",
+                execution_type=StageExecutionType.LLM_GENERATION,
+                input_sources=(0,),
+                final_output=True,
+            ),
+        ),
+    )
+    deploy = DeployConfig(
+        session_mode=session_mode,
+        duplex_session=DuplexSessionRuntimeConfig(max_sessions=11, **placement),
+        stages=[StageDeployConfig(stage_id=stage, num_replicas=2) for stage in (0, 1)],
+    )
+
+    structured = VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=deploy)
+    from vllm_omni.engine.stage_init_utils import project_engine_args
+
+    engine_args = [project_engine_args(stage, "test-model") for stage in structured.stage_configs]
+    assert [args["duplex_max_sessions"] for args in engine_args] == [expected, expected]
+    assert [args["session_mode"] for args in engine_args] == [session_mode, session_mode]
+    assert [stage.model_config.duplex_max_sessions for stage in structured.stage_configs] == [expected, expected]
+    assert [stage.model_config.session_mode for stage in structured.stage_configs] == [session_mode, session_mode]
+    # Placement does not reinterpret the global frontend admission limit.
+    assert deploy.duplex_session.max_sessions == 11
 
 
 def test_non_duplex_deploy_keeps_model_session_capacity_at_one(tmp_path: Path) -> None:
@@ -1485,21 +1528,21 @@ def test_diffusion_config_from_kwargs_reuses_legacy_normalization(monkeypatch):
     assert cfg.diffusers_call_kwargs == {}
 
 
-def test_direct_config_extras_are_independent_dicts():
+def test_direct_config_extras_are_independent_dicts(tmp_path):
     from vllm_omni.diffusion.data import OmniDiffusionConfig
 
-    first = OmniDiffusionConfig(model="test-model")
-    second = OmniDiffusionConfig(model="test-model")
+    first = OmniDiffusionConfig(model=str(tmp_path))
+    second = OmniDiffusionConfig(model=str(tmp_path))
 
     assert first.extras.get("prefix_kv_cache_dtype") is None
     first.extras["prefix_kv_cache_dtype"] = "fp8"
     assert second.extras == {}
 
 
-def test_direct_config_preserves_explicit_extras():
+def test_direct_config_preserves_explicit_extras(tmp_path):
     from vllm_omni.diffusion.data import OmniDiffusionConfig
 
-    config = OmniDiffusionConfig(model="test-model", extras={"prefix_kv_cache_dtype": "fp8"})
+    config = OmniDiffusionConfig(model=str(tmp_path), extras={"prefix_kv_cache_dtype": "fp8"})
 
     assert config.extras["prefix_kv_cache_dtype"] == "fp8"
 
@@ -1700,7 +1743,7 @@ def test_diffusion_stage_payload_keys_roundtrip(source, key_container, tmp_path)
     if source == "default":
         expected = dict.fromkeys(topology_keys, ())
     restored_stage = ForkingPickler.loads(ForkingPickler.dumps(stage))
-    engine_args = project_engine_args(restored_stage, model="test-model")
+    engine_args = project_engine_args(restored_stage, model=str(tmp_path))
     diffusion_kwargs = omni_config_module.extract_diffusion_stage_config_kwargs(
         engine_args, stage_id=restored_stage.stage_id, include_engine_adapter_metadata=True
     )
