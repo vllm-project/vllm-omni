@@ -14,7 +14,12 @@ import torch.nn as nn
 from tests.diffusion.models.wan2_2.conftest import noop_progress_bar
 from vllm_omni.diffusion.attention.schedule import AttentionScheduleRange, InvalidAttentionScheduleError
 from vllm_omni.diffusion.data import OmniDiffusionConfig
-from vllm_omni.diffusion.forward_context import bind_attention_schedule, get_forward_context, set_forward_context
+from vllm_omni.diffusion.forward_context import (
+    bind_attention_schedule,
+    get_attention_schedule_profile,
+    get_forward_context,
+    set_forward_context,
+)
 from vllm_omni.diffusion.models.schedulers import FlowUniPCMultistepScheduler
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2_s2v import (
     Wan22S2VPipeline,
@@ -900,7 +905,7 @@ def test_s2v_preencode_keeps_the_full_decode_path_untouched() -> None:
 
 def _denoise_progress():
     context = get_forward_context()
-    return context.denoise_step_idx, context.total_denoise_steps, context.attention_schedule_denoise_active
+    return context.denoise_step_idx, context.total_denoise_steps, get_attention_schedule_profile()
 
 
 class _ProgressRecordingS2VTransformer(nn.Module):
@@ -1003,13 +1008,14 @@ def test_s2v_forward_applies_schedule_to_each_clip_and_clears_between_clips(monk
     _run_two_clip_s2v_forward(monkeypatch, schedule, events)
 
     total = 3 if scheduled else None
-    denoise = [("denoise", step, total, scheduled) for step in range(3)]
+    profiles = [None, "candidate", "candidate"] if scheduled else [None, None, None]
+    denoise = [("denoise", step, total, profiles[step]) for step in range(3)]
     # Each clip restarts at step 0 and is checked against its own 3 steps. With a schedule, audio
-    # encoding before the second clip and the work after the last clip see no active step. Without
-    # one, the last step stays published.
-    between = ("audio", None, None, False) if scheduled else ("audio", 2, None, False)
-    end = ("end", None, None, False) if scheduled else ("end", 2, None, False)
-    assert events == [("audio", None, None, False), *denoise, between, *denoise, end]
+    # encoding before the second clip and the work after the last clip see no published step.
+    # Without one, the last step stays published.
+    between = ("audio", None, None, None) if scheduled else ("audio", 2, None, None)
+    end = ("end", None, None, None) if scheduled else ("end", 2, None, None)
+    assert events == [("audio", None, None, None), *denoise, between, *denoise, end]
 
 
 def test_s2v_forward_rejects_schedule_past_clip_total_before_first_forward(monkeypatch) -> None:
@@ -1020,4 +1026,4 @@ def test_s2v_forward_rejects_schedule_past_clip_total_before_first_forward(monke
         _run_two_clip_s2v_forward(monkeypatch, schedule, events)
 
     # The first clip's check fails after audio encoding and before any denoise forward.
-    assert events == [("audio", None, None, False), ("end", None, None, False)]
+    assert events == [("audio", None, None, None), ("end", None, None, None)]

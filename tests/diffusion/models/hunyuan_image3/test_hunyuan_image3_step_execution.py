@@ -16,7 +16,12 @@ from vllm_omni.diffusion.attention.schedule import (
     InvalidAttentionScheduleError,
 )
 from vllm_omni.diffusion.data import AttentionConfig, AttentionSpec
-from vllm_omni.diffusion.forward_context import bind_attention_schedule, get_forward_context, set_forward_context
+from vllm_omni.diffusion.forward_context import (
+    bind_attention_schedule,
+    get_attention_schedule_profile,
+    get_forward_context,
+    set_forward_context,
+)
 from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_tokenizer import TokenizerEncodeOutput
 from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_transformer import (
     HunyuanImage3Text2ImagePipeline,
@@ -588,7 +593,7 @@ _REQUEST_SCHEDULE = (AttentionScheduleRange(start=1, end=3, profile="sparse"),)
 
 
 def _progress(ctx) -> tuple:
-    return ctx.denoise_step_idx, ctx.total_denoise_steps, ctx.denoise_timestep, ctx.attention_schedule_denoise_active
+    return ctx.denoise_step_idx, ctx.total_denoise_steps, ctx.denoise_timestep, get_attention_schedule_profile()
 
 
 @contextmanager
@@ -650,11 +655,11 @@ def test_scheduled_step_requests_run_separately_with_their_own_progress(monkeypa
         after = _progress(ctx)
 
     assert records == [
-        (2, 8, 0.6, True, [1.0]),
-        (5, 10, 0.5, True, [2.0]),
+        (2, 8, 0.6, None, [1.0]),
+        (5, 10, 0.5, "sparse", [2.0]),
     ]
     torch.testing.assert_close(out, torch.tensor([[10.0], [20.0]]))
-    assert after == (None, 99, 0.9, False)
+    assert after == (None, 99, 0.9, None)
 
 
 def test_scheduled_step_restores_context_when_second_request_fails(monkeypatch):
@@ -667,8 +672,8 @@ def test_scheduled_step_restores_context_when_second_request_fails(monkeypatch):
             pipeline.denoise_step(InputBatch.make_batch(states))
         after = _progress(ctx)
 
-    assert [record[:4] for record in records] == [(2, 8, 0.6, True), (5, 10, 0.5, True)]
-    assert after == (None, 99, 0.9, False)
+    assert [record[:4] for record in records] == [(2, 8, 0.6, None), (5, 10, 0.5, "sparse")]
+    assert after == (None, 99, 0.9, None)
 
 
 class _FakeFlowScheduler:
@@ -750,12 +755,12 @@ def test_request_loop_publishes_actual_total_and_timestep_when_scheduled(monkeyp
     assert events == [
         "prepare_latents",
         "ar_kv_reuse",
-        ("forward", 0, 4, 0.4, True, True),
-        ("forward", 1, 4, 0.3, True, False),
-        ("forward", 2, 4, 0.2, True, False),
-        ("forward", 3, 4, 0.1, True, False),
+        ("forward", 0, 4, 0.4, None, True),
+        ("forward", 1, 4, 0.3, "sparse", False),
+        ("forward", 2, 4, 0.2, "sparse", False),
+        ("forward", 3, 4, 0.1, None, False),
     ]
-    assert after == (None, None, None, False)
+    assert after == (None, None, None, None)
 
 
 def test_request_loop_rejects_schedule_past_actual_steps_before_any_forward(monkeypatch):
