@@ -960,6 +960,45 @@ class TestRunner:
         assert "req-1" not in runner.state_cache
         assert is_forward_context_available() is False
 
+    def test_cached_step_reuses_the_schedule_resolved_at_admission(self, monkeypatch):
+        """A request's schedule is resolved once when it reaches the runner, not again on each later step."""
+        from vllm_omni.diffusion.attention import schedule as schedule_module
+        from vllm_omni.diffusion.attention.schedule import AttentionScheduleRange
+        from vllm_omni.diffusion.data import parse_attention_schedule_config
+
+        runner = _make_runner()
+        runner.vllm_config = None
+        runner.od_config.diffusion_attention_schedule = parse_attention_schedule_config(
+            {
+                "profiles": {"dense": {"default": "TORCH_SDPA"}},
+                "default": [{"start": 1, "end": None, "profile": "dense"}],
+            }
+        )
+        resolved: list[object] = []
+        real_resolve = schedule_module.resolve_attention_schedule
+
+        def _recording_resolve(*args, **kwargs):
+            schedule = real_resolve(*args, **kwargs)
+            resolved.append(schedule)
+            return schedule
+
+        monkeypatch.setattr(schedule_module, "resolve_attention_schedule", _recording_resolve)
+        seen: list[object] = []
+
+        class _ContextRecordingStepPipeline(_StepPipeline):
+            def denoise_step(self, input_batch, **kwargs):
+                seen.append(get_forward_context().attention_schedule)
+                return super().denoise_step(input_batch, **kwargs)
+
+        runner.pipeline = _ContextRecordingStepPipeline()
+
+        DiffusionModelRunner.execute_stepwise(runner, _make_scheduler_output(_make_step_request(), step_id=0))
+        DiffusionModelRunner.execute_stepwise(runner, _make_cached_scheduler_output(step_id=1))
+
+        expected = (AttentionScheduleRange(start=1, end=None, profile="dense"),)
+        assert seen == [expected, expected]
+        assert resolved == [expected]
+
     @staticmethod
     def _make_grouping_runner(pipeline, *, grouping: bool):
         """An AR runner without KV (so it inherits the stepwise entry) over a streaming stub pipeline."""
