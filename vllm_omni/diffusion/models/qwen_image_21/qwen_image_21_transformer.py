@@ -38,7 +38,7 @@ from vllm_omni.diffusion.layers.exact_bf16_pointwise import eligible as pointwis
 from vllm_omni.diffusion.layers.exact_bf16_pointwise import residual, rotary, silu_mul
 from vllm_omni.diffusion.layers.exact_bf16_qk_norm_rope import qk_rotary
 from vllm_omni.diffusion.layers.fused_qk_norm_rope import (
-    fused_qkv_norm_rope_available,
+    norm_rope_concat_available,
     prepare_qkv_norm_rope_tables,
     try_fused_qkv_norm_rope,
 )
@@ -1296,7 +1296,7 @@ class QwenImage21Transformer2DModel(CachedTransformer):
             self._enforce_eager
             and not torch.is_grad_enabled()
             and not torch.compiler.is_compiling()
-            and fused_qkv_norm_rope_available(joint_hidden_states.device)
+            and norm_rope_concat_available(joint_hidden_states.device)
         ):
             rope_tables = prepare_qkv_norm_rope_tables(
                 freqs.real, freqs.imag, interleaved=True, dtype=joint_hidden_states.dtype

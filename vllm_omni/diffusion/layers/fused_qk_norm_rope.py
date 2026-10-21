@@ -38,6 +38,8 @@ per-stream fused path) keep the default.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from functools import lru_cache
 from importlib.util import find_spec
 from inspect import signature
 
@@ -62,8 +64,9 @@ _HEADS_PER_PROGRAM = 8
 _INTERLEAVED_HEADS_PER_PROGRAM = 8
 
 
-def _load_mindiesd_norm_rope_concat():
-    """Resolve the optional public API, without probing a kernel or a card model."""
+@lru_cache(maxsize=1)
+def _load_norm_rope_concat() -> Callable[..., tuple[torch.Tensor, ...]] | None:
+    """Resolve the optional public API on first use and cache it for this process."""
     if not current_omni_platform.is_npu() or find_spec("mindiesd") is None:
         return None
     import mindiesd
@@ -74,15 +77,9 @@ def _load_mindiesd_norm_rope_concat():
     return op
 
 
-# Resolve the optional dependency before graph tracing. Returning a Python
-# callable through an lru_cache/assume_constant_result wrapper is not traceable
-# on all supported PyTorch versions; the installed API is fixed for a process.
-_NPU_NORM_ROPE_CONCAT = _load_mindiesd_norm_rope_concat()
-
-
-def fused_qkv_norm_rope_available(device: torch.device) -> bool:
-    """Whether the single-stream BSND backend is installed on this device."""
-    return device.type == "npu" and _NPU_NORM_ROPE_CONCAT is not None
+def norm_rope_concat_available(device: torch.device) -> bool:
+    """Whether the public norm_rope_concat layout API is available on this device."""
+    return device.type == "npu" and _load_norm_rope_concat() is not None
 
 
 def prepare_qkv_norm_rope_tables(
@@ -103,7 +100,16 @@ def prepare_qkv_norm_rope_tables(
     return torch.cat((cos, cos), dim=-1).to(dtype), torch.cat((sin, sin), dim=-1).to(dtype)
 
 
-def _qkv_norm_rope_inputs_supported(q, k, v, q_weight, k_weight, rope_tables, head_dim, rotary_dim):
+def _norm_rope_concat_inputs_supported(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    rope_tables: tuple[torch.Tensor, torch.Tensor],
+    head_dim: int,
+    rotary_dim: int,
+) -> bool:
     # The current SD kernel has full-head rotary and equal Q/K/V head counts.
     # It accepts packed projection views: its Python wrapper owns input copies.
     if q.ndim != 4 or min(q.shape) <= 0 or k.shape != q.shape or v.shape != q.shape:
@@ -145,12 +151,15 @@ def try_fused_qkv_norm_rope(
     composes norm/rotation in FP32 before its final cast, so it need not be
     bitwise identical to a chain that rounds the normalized activation first.
     """
-    if torch.is_grad_enabled() or torch.compiler.is_compiling() or not fused_qkv_norm_rope_available(q.device):
+    if torch.is_grad_enabled() or torch.compiler.is_compiling() or not norm_rope_concat_available(q.device):
         return None
-    if not _qkv_norm_rope_inputs_supported(q, k, v, q_weight, k_weight, rope_tables, head_dim, rotary_dim):
+    if not _norm_rope_concat_inputs_supported(q, k, v, q_weight, k_weight, rope_tables, head_dim, rotary_dim):
+        return None
+    op = _load_norm_rope_concat()
+    if op is None:
         return None
     cos, sin = rope_tables
-    outputs = _NPU_NORM_ROPE_CONCAT(
+    outputs = op(
         q,
         k,
         v,
