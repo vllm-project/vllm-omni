@@ -225,6 +225,18 @@ Record the server commit, model/adapter, input assets, prompt, settings, and out
 alongside the result. Local schema or mocked-server checks do not establish H3
 generation quality or replace this real-model validation.
 
+#### Character Replacement
+
+Load [MiniMax-H3 Character Replacement](example_workflows/vLLM-Omni%20MiniMax-H3%20Character%20Replacement.json),
+select your own target image and motion video, and replace both `/models/...`
+adapter paths with server-local files. This template uses reference conditioning,
+not pixel-locked editing, and saves generated audio. Supply the complete reference
+video and target duration. Enable long_video, select continuation, and enable
+continuation_slice_reference_video to match each window to the corresponding
+source interval. Adjust continuation_window_frames and
+continuation_overlap_frames to set the window length and overlap. Inspect
+continuity and source action timing; output may include frame-alignment padding.
+
 ### MiniMax H3 Text to Video
 
 Import [the H3 text-to-video template](example_workflows/MiniMax_H3_Text_to_Video.json)

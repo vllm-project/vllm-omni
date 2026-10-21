@@ -9,6 +9,7 @@ import av
 import pytest
 import torch
 from comfy_api.input import VideoInput
+from comfyui_vllm_omni import nodes as omni_nodes
 from comfyui_vllm_omni.nodes import VLLMOmniMiniMaxH3Params, VLLMOmniVideoReferences
 from comfyui_vllm_omni.utils import api_client
 from PIL import Image
@@ -137,6 +138,106 @@ async def test_frame_and_references_are_mutually_exclusive(api_calls):
     with pytest.raises(ValueError, match="only one of frame or references"):
         await _generate(_references(1, 0, 0), frame=torch.zeros(1, 16, 16, 3))
     api_calls.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "long_video, mode", [(False, "full"), (False, "continuation"), (True, "full"), (True, "continuation")]
+)
+async def test_h3_inactive_continuation_settings_are_not_uploaded(api_calls, long_video, mode):
+    (params,) = omni_nodes.VLLMOmniMiniMaxH3Params().get_params(
+        long_video=long_video,
+        long_video_mode=mode,
+        continuation_window_frames=311,
+        continuation_overlap_frames=39,
+        continuation_slice_reference_video=True,
+    )
+    await _generate(_references(1, 0, 0), model_params=params)
+    fields = api_calls.call_args_list[0].kwargs["data"]._fields
+    extra = json.loads(next(value for options, _, value in fields if options["name"] == "extra_params"))
+    continuation = {key: value for key, value in extra.items() if key.startswith("continuation_")}
+    if long_video and mode == "continuation":
+        assert continuation == {
+            "continuation_window_frames": 311,
+            "continuation_overlap_frames": 39,
+            "continuation_slice_reference_video": True,
+        }
+    else:
+        assert continuation == {}
+    assert extra.get("long_video", False) == long_video
+
+
+async def test_video_node_uses_short_http_timeout_and_long_job_wait(api_calls, monkeypatch):
+    clients = []
+
+    def create_client(*args, **kwargs):
+        client = api_client.VLLMOmniClient(*args, **kwargs)
+        clients.append(client)
+        return client
+
+    monkeypatch.setattr(omni_nodes, "VLLMOmniClient", create_client)
+    await omni_nodes.VLLMOmniGenerateVideo().generate(
+        url="http://localhost/v1",
+        model="MiniMaxAI/MiniMax-H3",
+        prompt="test",
+        width=896,
+        height=512,
+        fps=24,
+        duration=4,
+    )
+    assert clients[0].max_poll_duration == 10800
+    session = api_calls.call_args_list[0].args[0]
+    assert session.timeout.total == 300
+
+
+@pytest.mark.parametrize("enabled, scale, expected", [(False, 0.7, 0.0), (True, 0.7, 0.7), (True, 0.0, 0.0)])
+def test_lora_switch_controls_only_its_adapter(enabled, scale, expected):
+    previous = {"name": "swap", "local_path": "/swap.safetensors", "scale": 0.8}
+    stack, active = omni_nodes.VLLMOmniRemoteLoRA().get_lora(
+        "/turbo.safetensors", "turbo", scale, 0, lora=previous, enabled=enabled
+    )
+    assert stack["adapters"][0] == previous
+    assert stack["adapters"][1]["scale"] == expected
+    assert active == (expected > 0)
+
+
+async def test_lora_chain_uploads_list_in_lora_field(api_calls):
+    swap, _ = omni_nodes.VLLMOmniRemoteLoRA().get_lora("/swap.safetensors", "swap", 0.0, 0, enabled=False)
+    stack, _ = omni_nodes.VLLMOmniRemoteLoRA().get_lora("/turbo.safetensors", "turbo", 1.0, 0, lora=swap)
+    await _generate(_references(1, 0, 0), lora=stack)
+    fields = {options["name"]: value for options, _, value in api_calls.call_args_list[0].kwargs["data"]._fields}
+    assert "loras" not in fields
+    assert json.loads(fields["lora"]) == stack["adapters"]
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+async def test_fast_h3_omni_toggle_forwards_video_reference_and_lora(monkeypatch, enabled):
+    call = AsyncMock(return_value=b"video")
+    monkeypatch.setattr(omni_nodes.VLLMOmniClient, "generate_video", call)
+    deployment = omni_nodes.VLLMOmniFastH3Deployment().get_deployment(
+        "http://fast/v1", "FastVideo/FastVideo-FastH3-Omni-8-Step-V1", variant="Omni", enabled=enabled
+    )[0]
+    refs = {"video_1": VideoInput()}
+    lora = {"name": "swap", "scale": 1}
+    await omni_nodes.VLLMOmniGenerateVideo().generate(
+        url="http://base/v1",
+        model="MiniMaxAI/MiniMax-H3",
+        prompt="Replace the subject.",
+        width=1344,
+        height=768,
+        fps=24,
+        duration=5,
+        references=refs,
+        lora=lora,
+        fast_h3=deployment,
+    )
+    args = call.call_args.kwargs
+    assert args["references"] is refs
+    assert args["lora"] is lora
+    assert args["model"] == ("FastVideo/FastVideo-FastH3-Omni-8-Step-V1" if enabled else "MiniMaxAI/MiniMax-H3")
+    if enabled:
+        assert args["sampling_params"]["num_inference_steps"] == 8
+    else:
+        assert deployment is None
 
 
 def _extra_params(api_calls):

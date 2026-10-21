@@ -68,7 +68,14 @@ def _minimaxh3_params_builder(
 
     if "flow_shift" in params:
         form_fields["flow_shift"] = params.pop("flow_shift")
-    for key in ("audio_flow_shift",):
+    for key in (
+        "audio_flow_shift",
+        "long_video",
+        "long_video_mode",
+        "continuation_window_frames",
+        "continuation_overlap_frames",
+        "continuation_slice_reference_video",
+    ):
         if key in params:
             merged_extra_params[key] = params.pop(key)
     # "native" is the server default; omit it so ordinary requests are unchanged.
