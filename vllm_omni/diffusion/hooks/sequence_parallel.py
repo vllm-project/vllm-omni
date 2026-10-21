@@ -44,6 +44,7 @@ import torch
 import torch.nn as nn
 from vllm.logger import init_logger
 
+from vllm_omni.diffusion.attention.selector import resolve_capability_backends
 from vllm_omni.diffusion.distributed.sp_plan import (
     AnySequenceParallelInput,
     SequenceParallelConfig,
@@ -455,7 +456,6 @@ class SequenceParallelSplitHook(ModelHook):
         via `shard_group` to build masks. Legacy singleton padding fields are
         also populated for single-sequence models.
         """
-        from vllm_omni.diffusion.attention.selector import get_attn_backend_for_capability
         from vllm_omni.diffusion.distributed.parallel_state import (
             get_ring_parallel_world_size,
             get_sequence_parallel_rank,
@@ -484,25 +484,26 @@ class SequenceParallelSplitHook(ModelHook):
             # Keyed groups record their length even when no padding is needed.
             return sp_shard(x, dim, validate=False)
 
-        # Check backend compatibility
+        # Check backend compatibility. A step schedule can switch to any prepared profile,
+        # so the padding mask must be supported by the baseline and by every profile.
         attention_config = None
+        schedule = None
         if is_forward_context_available():
             od_config = get_forward_context().omni_diffusion_config
             if od_config is not None:
                 attention_config = od_config.diffusion_attention_config
+                schedule = getattr(od_config, "diffusion_attention_schedule", None)
 
-        attn_backend = get_attn_backend_for_capability(
-            role="self",
-            attention_config=attention_config,
-        )
-        attention_spec = None
-        if attention_config is not None:
-            attention_spec, _ = attention_config.resolve_with_source(role="self")
-        if not attn_backend.supports_attention_mask(attention_spec):
+        for profile, attn_backend, attention_spec in resolve_capability_backends(
+            role="self", attention_config=attention_config, schedule=schedule
+        ):
+            if attn_backend.supports_attention_mask(attention_spec):
+                continue
+            selected_by = "" if profile is None else f"Attention schedule profile {profile!r} selects it. "
             raise ValueError(
                 f"Sequence length ({seq_len}) is not divisible by SP world size ({world_size}). "
                 f"Cannot use {attn_backend.get_name()} which does not support attention_mask. "
-                f"Please switch to SDPA or Ascend attention backend."
+                f"{selected_by}Please switch to SDPA or Ascend attention backend."
             )
 
         # Ring attention does not support attention_mask

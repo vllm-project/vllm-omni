@@ -6,8 +6,10 @@ backends. Steps outside a range use the base attention configuration.
 
 Wan2.2 T2V, I2V, S2V and VACE publish progress in request mode.
 MiniMax-H3 and HunyuanImage-3.0 publish it in request and step modes.
-Configured profiles on any other model fail at startup with an
-`Unsupported diffusion_attention_schedule` error, before weights are loaded.
+Configured profiles on any other model, including the Wan DMD2 pipelines
+(`WanT2VDMD2Pipeline`, `WanI2VDMD2Pipeline`) and `CausVidWanPipeline`, fail at
+startup with an `Unsupported diffusion_attention_schedule` error, before weights
+are loaded.
 Backend and model requirements still apply, and a backend's own kernel
 fallbacks still run when a profile selects it.
 A backend that a profile names is an explicit selection: if it cannot use a

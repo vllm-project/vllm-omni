@@ -18,12 +18,26 @@ from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.attention.parallel.base import NoParallelAttention
 from vllm_omni.diffusion.attention.schedule import AttentionScheduleRange, InvalidAttentionScheduleError
 from vllm_omni.diffusion.config import set_current_diffusion_config
-from vllm_omni.diffusion.data import AttentionConfig, AttentionScheduleConfig, AttentionSpec, DiffusionCacheConfig
-from vllm_omni.diffusion.forward_context import bind_attention_schedule, get_forward_context, set_forward_context
+from vllm_omni.diffusion.data import (
+    AttentionConfig,
+    AttentionScheduleConfig,
+    AttentionSpec,
+    DiffusionCacheConfig,
+    OmniDiffusionConfig,
+)
+from vllm_omni.diffusion.forward_context import (
+    bind_attention_schedule,
+    get_attention_schedule_profile,
+    get_forward_context,
+    is_forward_context_available,
+    override_forward_context,
+    set_forward_context,
+)
 from vllm_omni.diffusion.media import VideoTensorEncoding, VideoTensorLayout, VideoValueRange
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import Wan22Pipeline, build_wan_scheduler
 from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import WanSelfAttention
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
@@ -656,9 +670,6 @@ def _candidate_from_step_2() -> AttentionScheduleConfig:
 
 
 def _make_scheduled_runner(pipeline, monkeypatch, schedule_config):
-    from vllm_omni.diffusion.data import OmniDiffusionConfig
-    from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
-
     runner = object.__new__(DiffusionModelRunner)
     runner.pipeline = pipeline
     runner.od_config = OmniDiffusionConfig(model="", dtype=torch.float32)
@@ -683,8 +694,6 @@ def _execute_wan_request(runner, request):
 
 @pytest.mark.parametrize("scheduled", [True, False], ids=["inherited-default", "disabled"])
 def test_runner_selects_wan_attention_by_actual_denoise_step(scheduled, monkeypatch, fake_attention_backends):
-    from vllm_omni.diffusion.forward_context import override_forward_context
-
     schedule_config = _candidate_from_step_2()
     with set_current_diffusion_config(_make_config(schedule=schedule_config)):
         layer = Attention(num_heads=4, head_size=64, causal=False, softmax_scale=1.0)
@@ -760,8 +769,6 @@ def test_runner_selects_wan_attention_by_actual_denoise_step(scheduled, monkeypa
 
 
 def test_runner_rejects_wan_schedule_past_actual_total_before_denoise(monkeypatch):
-    from vllm_omni.diffusion.forward_context import is_forward_context_available, override_forward_context
-
     calls = []
     pipeline = _make_pipeline()
     pipeline.scheduler = _StubScheduler([900, 500, 100])
@@ -841,7 +848,7 @@ def test_diffuse_dmd_predicts_clean_and_renoises_between_steps(monkeypatch) -> N
 
 def _denoise_progress():
     context = get_forward_context()
-    return context.denoise_step_idx, context.total_denoise_steps, context.attention_schedule_denoise_active
+    return context.denoise_step_idx, context.total_denoise_steps, get_attention_schedule_profile()
 
 
 @pytest.mark.parametrize(
@@ -858,7 +865,7 @@ def test_dmd_forward_checks_and_publishes_the_fixed_three_step_total(schedule, f
     pipeline.scheduler = _StubDMDScheduler()
     # forward reads num_train_timesteps for the expert boundary.
     monkeypatch.setattr(pipeline.scheduler, "config", SimpleNamespace(num_train_timesteps=1000), raising=False)
-    calls: list[tuple[int | None, int | None, bool]] = []
+    calls: list[tuple[int | None, int | None, str | None]] = []
 
     def fake_predict_noise_maybe_with_cfg(**kwargs):
         calls.append(_denoise_progress())
@@ -886,8 +893,8 @@ def test_dmd_forward_checks_and_publishes_the_fixed_three_step_total(schedule, f
                 pipeline.forward(DiffusionRequestBatch(requests=[request]))
         after = _denoise_progress()
 
-    assert calls == ([(0, 3, True), (1, 3, True), (2, 3, True)] if fits else [])
-    assert after == (None, None, False)
+    assert calls == ([(0, 3, None), (1, 3, None), (2, 3, "candidate")] if fits else [])
+    assert after == (None, None, None)
 
 
 def _make_gate_loading_pipeline():

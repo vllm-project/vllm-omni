@@ -2084,7 +2084,9 @@ class HunyuanImage3Pipeline(
         )
         # Check the request's schedule against the sequence built here, before prepare_latents and the
         # AR-reuse prefill below. The runner has not opened the forward context yet.
-        require_request_attention_schedule_fits(state, self.od_config, len(timesteps))
+        require_request_attention_schedule_fits(
+            state.sampling, getattr(self.od_config, "diffusion_attention_schedule", None), len(timesteps)
+        )
         pipe._num_timesteps = len(timesteps)
         req_scheduler = copy.deepcopy(self.scheduler)
         if hasattr(req_scheduler, "set_begin_index"):
@@ -2394,7 +2396,7 @@ class HunyuanImage3Pipeline(
         """Publish one scheduled request's step, actual total and normalized timestep around its group.
 
         _denoise_step_group republishes the same step and clears it after its forward; the returned
-        context manager restores the step, timestep, total and active flag on any exit.
+        context manager restores the step, timestep and total on any exit.
         """
         timestep = (
             float(cast(torch.Tensor, state.current_timestep))
