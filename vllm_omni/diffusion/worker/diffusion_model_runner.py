@@ -28,8 +28,10 @@ from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.attention.schedule import (
     AttentionSchedule,
+    batch_attention_schedule,
     require_attention_schedule_pipeline,
     resolve_batch_attention_schedule,
+    resolve_request_attention_schedule,
 )
 from vllm_omni.diffusion.cache.cachedit import CacheDiTBackend, cache_summary
 from vllm_omni.diffusion.cache.prompt_embed_cache import (
@@ -1201,6 +1203,9 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                     kv_sender_info=sched_new_req.req.kv_sender_info,
                     prepared_layout=getattr(sched_new_req.req, "prepared_layout", None),
                     external_req_id=getattr(sched_new_req.req, "external_req_id", None),
+                    attention_schedule=resolve_request_attention_schedule(
+                        sched_new_req.req.sampling_params, getattr(self.od_config, "diffusion_attention_schedule", None)
+                    ),
                 )
                 if (
                     sched_new_req.diffusion_kv_metadata is not None
@@ -1493,9 +1498,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
             assert pipeline is not None, "Model not loaded. Call load_model() first."
             had_active_states = bool(self.state_cache)
             states, new_request_ids = self._update_states(scheduler_output)
-            attention_schedule = resolve_batch_attention_schedule(
-                [state.sampling for state in states], getattr(self.od_config, "diffusion_attention_schedule", None)
-            )
+            attention_schedule = batch_attention_schedule(state.attention_schedule for state in states)
             is_primary = not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
             if (
                 record_output_peak_memory
