@@ -2251,6 +2251,7 @@ class MiniMaxH3Pipeline(
                 videos = decode_chunks_to_mp4(
                     self.video_vae,
                     video_latent,
+                    frame_counts=frame_counts,
                     fps=MINIMAX_H3_FPS,
                     audio_waveforms=[audio_np],
                     audio_sample_rate=MINIMAX_H3_AUDIO_SAMPLE_RATE,
@@ -2258,7 +2259,6 @@ class MiniMaxH3Pipeline(
                     max_pending=max_pending,
                     video_codec_options=video_codec_options,
                     crop=(height, width),
-                    frame_counts=frame_counts,
                 )
         if not videos:
             return b""

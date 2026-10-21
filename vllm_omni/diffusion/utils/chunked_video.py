@@ -517,6 +517,7 @@ def decode_to_mp4(
     z: torch.Tensor,
     *,
     frame_counts: list[int] | None = None,
+    session: ChunkedVideoMP4Session | None = None,
     **session_kwargs: Any,
 ) -> list[bytes]:
     """Decode ``z`` straight into one progressive MP4 per batch entry.
@@ -530,7 +531,10 @@ def decode_to_mp4(
     if not supports_chunked_vae_decode(vae):
         raise TypeError(f"{type(vae).__name__} does not expose the chunked VAE decode capability")
 
-    session = ChunkedVideoMP4Session(value_range=vae.chunk_value_range, **session_kwargs)
+    if session is not None and session_kwargs:
+        raise ValueError("session options cannot accompany an existing session")
+    if session is None:
+        session = ChunkedVideoMP4Session(value_range=vae.chunk_value_range, **session_kwargs)
     try:
         vae.decode_with_chunks(z, on_chunk=session.push)
         videos = session.finish()

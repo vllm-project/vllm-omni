@@ -84,6 +84,14 @@ def test_decode_to_mp4_reports_encoded_counts_for_each_output():
     assert [_decoded(video).shape[0] for video in videos] == [6, 6]
 
 
+def test_decode_to_mp4_collects_counts_from_an_existing_session():
+    counts: list[int] = []
+    session = ChunkedVideoMP4Session(value_range=(0.0, 1.0), fps=24)
+    videos = decode_to_mp4(_FakeVAE((0.0, 1.0)), torch.zeros(1), session=session, frame_counts=counts)
+    assert counts == [8]
+    assert _decoded(videos[0]).shape[0] == counts[0]
+
+
 def test_decode_to_mp4_rejects_a_vae_without_the_capability():
     class PlainVAE:
         def decode(self, z):
