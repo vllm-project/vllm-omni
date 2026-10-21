@@ -92,9 +92,11 @@ stage list. There is no separate sigma flag or environment variable.
 
 Use `attention_sigma_schedule` in the same request extras or offline sampling
 parameters as `attention_schedule`. Omitted or `null` inherits, `[]` disables,
-and non-empty windows replace defaults. Both effective schedules cannot be
-non-empty, including inherited defaults. To replace a step default with sigma
-windows, also send `attention_schedule: []` (or clear the CLI `default` list).
+and non-empty windows replace defaults of both kinds: a request that sends
+sigma windows does not inherit the service step ranges, and a request that
+sends step ranges does not inherit the service sigma windows. A request cannot
+set both kinds; a stage's `default_sampling_params` count as request values,
+so send `[]` for the other field to replace a stage default of the other kind.
 Request and step modes validate the resolved schedules before denoising.
 
 ## Server configuration
@@ -151,7 +153,7 @@ A CLI `default` list replaces the stage list rather than appending ranges.
 | --- | --- |
 | Omitted or `null` | Inherit defaults. |
 | `[]` | Disable scheduling for this request. |
-| Non-empty ranges | Replace defaults; do not merge. |
+| Non-empty ranges | Replace step ranges and sigma windows from the service defaults; do not merge. |
 
 Video endpoints first apply a stage's `default_sampling_params`, if present;
 an omitted or `null` request value preserves that stage default. A schedule
