@@ -1249,18 +1249,35 @@ class DuplexSessionRunner:
             event["format"] = fmt
             event["sample_rate_hz"] = sample_rate_hz
             detected = await self.control.run_turn_detection(event)
-        for segment, vad_result in detected:
-            if (
-                vad_result is not None
-                and not session.capabilities.supports_core_resumable_request
-                and not client_force_listen
-            ):
-                # VAD's force_listen hint controls native model decoding. Committed
-                # turn models already buffer speech; it must not suppress barge-in.
-                segment.pop("force_listen", None)
-            # Every segment is admitted audio. The first PCM handoff releases the
-            # admission charge; the release is idempotent for later segments.
-            await self._append_detected_audio(segment, vad_result, release_queued_input=release_queued_input)
+        with ExitStack() as unprocessed:
+            releases: list[Callable[[], None] | None] = [None] * len(detected)
+            if release_queued_input is not None:
+                # Swap the wire charge for each segment's decoded size in one step
+                # (no await), so segments not yet handed off stay charged while an
+                # earlier one runs. Each handoff releases only its own segment.
+                for index, (segment, _) in enumerate(detected):
+                    frames = segment.get("video_frames")
+                    charge = helpers.audio_payload_size_bytes(segment) + (
+                        sum(len(frame) for frame in frames) if isinstance(frames, list) else 0
+                    )
+                    session.reserve_input_bytes(charge, limit=sys.maxsize, queued=True)
+                    segment_charge = unprocessed.enter_context(ExitStack())
+                    segment_charge.callback(session.release_input_bytes, charge, queued=True)
+                    releases[index] = segment_charge.close
+                release_queued_input()
+            for (segment, vad_result), release in zip(detected, releases):
+                if (
+                    vad_result is not None
+                    and not session.capabilities.supports_core_resumable_request
+                    and not client_force_listen
+                ):
+                    # VAD's force_listen hint controls native model decoding. Committed
+                    # turn models already buffer speech; it must not suppress barge-in.
+                    segment.pop("force_listen", None)
+                await self._append_detected_audio(segment, vad_result, release_queued_input=release)
+                if release is not None:
+                    # A dropped or skipped segment never reached its handoff.
+                    release()
 
     async def _append_detected_audio(
         self,
@@ -1373,12 +1390,13 @@ class DuplexSessionRunner:
         raw_audio_bytes = helpers.audio_payload_size_bytes(payload)
         pending_before = model_state.audio_buffer.pending_byte_count
         limit = int(self.manager.runtime_config.max_pending_input_bytes_per_session)
-        # No await between releasing admission bytes and reserving PCM bytes.
+        # No await between releasing this segment's charge and reserving PCM bytes.
         if release_queued_input is not None:
             release_queued_input()
             # Admission already applied backpressure; the handoff only converts
-            # the wire charge into decoded PCM bytes, which can be larger
-            # (pcm16 -> f32, resampling), so it must not drop admitted audio.
+            # the segment's queued charge into a PCM reservation. Decoding can
+            # make it larger than the wire bytes (pcm16 -> f32, resampling), so
+            # the handoff must not drop admitted audio.
             # This is a soft limit: pending PCM can overshoot by the decode
             # expansion of the queued backlog (up to 8x for 8 kHz G.711) until
             # admission sees it; charge admission in PCM units if that matters.

@@ -895,6 +895,71 @@ async def test_admitted_pcm16_append_is_not_dropped_when_decoding_grows_it() -> 
         await close_harness(h)
 
 
+class _SplitDetector:
+    """Splits every append into one 1 s segment and its remainder."""
+
+    def process_segments(self, base64_audio: str, *, fmt: str, sample_rate_hz: int | None):
+        from vllm_omni.engine.duplex.turn_detection import TurnDetectionResult, TurnDetectionSegment
+
+        del fmt, sample_rate_hz
+        audio = base64.b64decode(base64_audio)
+        result = TurnDetectionResult(is_speech=True, speech_active=True)
+        return [
+            TurnDetectionSegment(base64.b64encode(part).decode(), result) for part in (audio[:64_000], audio[64_000:])
+        ]
+
+    def reset(self) -> None:
+        pass
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fails", [False, True])
+async def test_vad_split_append_keeps_unprocessed_segments_charged(monkeypatch, fails) -> None:
+    h = await open_harness(runtime_config=DuplexSessionRuntimeConfig(max_pending_input_bytes_per_session=120_000))
+    h.runner.control._detector = _SplitDetector()
+    h.port.submit_gate = asyncio.Event()
+    handed_off = asyncio.Event()
+    resume = asyncio.Event()
+    start_append = h.runner._start_append
+
+    async def pause_after_first_handoff(*args, **kwargs):
+        task = await start_append(*args, **kwargs)
+        if not handed_off.is_set():
+            handed_off.set()
+            await resume.wait()
+            if fails:
+                raise RuntimeError("append failed after handoff")
+        return task
+
+    monkeypatch.setattr(h.runner, "_start_append", pause_after_first_handoff)
+    try:
+        # 96_000 bytes: the first 1 s segment is handed off and its stage
+        # submission stays pending; the 32_000-byte tail is not processed yet.
+        h.submit(append_audio(samples=24_000))
+        await asyncio.wait_for(handed_off.wait(), timeout=2.0)
+        assert h.session.pending_input_bytes == 96_000
+        # Fits only if the unprocessed tail is forgotten.
+        h.submit(append_audio(samples=8000, event_id="over-limit"))
+        events = await h.settle(timeout_s=0.2)
+        assert any(
+            event.type == "error" and event.code == "input_backpressure" and event.related_event_id == "over-limit"
+            for event in events
+        )
+
+        resume.set()
+        h.port.submit_gate.set()
+        await h.settle()
+        # Every charge is released once: the tail is buffered, or released on failure.
+        assert h.session._input.queued_input_bytes == 0
+        assert h.session.pending_input_bytes == (0 if fails else 32_000)
+        await h.run(commands.ClearInput())
+        assert h.session.pending_input_bytes == 0
+    finally:
+        resume.set()
+        h.port.submit_gate.set()
+        await close_harness(h)
+
+
 @pytest.mark.asyncio
 async def test_commit_without_audio_is_rejected() -> None:
     h = await open_harness()
