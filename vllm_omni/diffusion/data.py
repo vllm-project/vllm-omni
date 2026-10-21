@@ -33,9 +33,12 @@ from vllm_omni.diffusion.attention.backends.trtllm_calibration import (
 )
 from vllm_omni.diffusion.attention.schedule import (
     AttentionSchedule,
+    AttentionSigmaSchedule,
     parse_attention_schedule,
+    parse_attention_sigma_schedule,
     validate_attention_profile_name,
     validate_attention_schedule,
+    validate_attention_sigma_schedule,
 )
 from vllm_omni.diffusion.diffusion_kv.config import (
     DiffusionKVCacheMode,
@@ -2437,7 +2440,7 @@ class AttentionConfig:
 
 @dataclass
 class AttentionScheduleConfig:
-    """Startup-owned attention profiles and the default integer-step schedule.
+    """Startup-owned profiles with default integer-step ranges or normalized-noise windows.
 
     Profiles resolve their own roles, without merging the baseline or its
     environment fallback. Candidate construction and hardware validation happen
@@ -2446,6 +2449,8 @@ class AttentionScheduleConfig:
 
     profiles: dict[str, AttentionConfig] = field(default_factory=dict)
     default: AttentionSchedule = ()
+    # Ascending [low, high) windows; high=1 also includes 1. Cannot coexist with default ranges.
+    sigma: AttentionSigmaSchedule = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.profiles, Mapping):
@@ -2462,6 +2467,16 @@ class AttentionScheduleConfig:
             raise TypeError("diffusion_attention_schedule.default must be a list of ranges, not None")
         validate_attention_schedule(default, profiles=self.profiles)
         self.default = default
+        sigma = parse_attention_sigma_schedule(self.sigma)
+        if sigma is None:
+            raise TypeError("diffusion_attention_schedule.sigma must be a list of windows, not None")
+        validate_attention_sigma_schedule(sigma, profiles=self.profiles)
+        if self.default and sigma:
+            raise ValueError(
+                "diffusion_attention_schedule cannot combine default step ranges with sigma windows; "
+                "leave one of them empty"
+            )
+        self.sigma = sigma
 
 
 def parse_attention_schedule_config(
@@ -2477,7 +2492,7 @@ def parse_attention_schedule_config(
     if isinstance(value, str):
         value = json.loads(value)
     if isinstance(value, AttentionScheduleConfig):
-        config = AttentionScheduleConfig(profiles=value.profiles, default=value.default)
+        config = AttentionScheduleConfig(profiles=value.profiles, default=value.default, sigma=value.sigma)
     elif isinstance(value, Mapping):
         config = AttentionScheduleConfig(**dict(value))
     else:

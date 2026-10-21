@@ -1998,8 +1998,9 @@ memory a full-length activation volume takes (10.1 GiB against 5.6 GiB at
   own resolution and its own truncated schedule, and the step contract carries
   one schedule per request, so step execution rejects it. `latent_upscale`
   without `latent_refine` works in both modes.
-- Non-empty attention schedules reject `latent_refine` in request mode too;
-  disable the schedule (`attention_schedule=[]`) or refinement (`latent_refine=false`).
+- Non-empty attention step ranges reject `latent_refine` in request mode too;
+  disable them (`attention_schedule=[]`) or refinement (`latent_refine=false`).
+  Sigma windows work with `latent_refine`.
 - Large refine layouts can abort workers with `CUDA error: an illegal memory
   access was encountered`. On B300, observed video token counts of 54,144 per
   rank complete while 108,288 and 109,360 abort. The preflight limit of 65,536

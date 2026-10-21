@@ -16,8 +16,10 @@ from vllm_omni.diffusion.attention.backends.abstract import (
 )
 from vllm_omni.diffusion.attention.schedule import (
     AttentionSchedule,
+    normalized_sigma,
     require_attention_schedule_fits,
     select_attention_profile,
+    select_attention_profile_by_sigma,
 )
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 
@@ -55,13 +57,17 @@ class ForwardContext:
     split_text_embed_in_sp: bool = False
     denoise_step_idx: int | None = None
     denoise_timestep: float | None = None
+    # Normalized scheduler noise in [0, 1], published only while sigma windows are bound.
+    denoise_sigma: float | None = None
     total_denoise_steps: int | None = None
-    # Bound request schedule. None means unbound. () disables. A non-empty tuple
-    # selects prepared profiles while a denoise step is published.
+    # Bound request schedules. None means unbound. () disables. A non-empty tuple
+    # selects prepared profiles while a denoise step is published. A request binds
+    # step ranges or sigma windows, never both.
     attention_schedule: AttentionSchedule | None = None
+    attention_sigma_schedule: tuple[Any, ...] | None = None
     # Whether the bound schedule is the request's own rather than an inherited service default.
     attention_schedule_from_request: bool = False
-    # Profile selected for (attention_schedule, denoise_step_idx, total_denoise_steps);
+    # Profile selected for the bound schedule and the published step or sigma;
     # every scheduled layer in one step reads it instead of selecting again.
     _attention_profile_key: tuple[AttentionSchedule, int, int] | None = None
     _attention_profile: str | None = None
@@ -308,30 +314,47 @@ def override_paged_kv_adapter(adapter: Any | None):
 
 
 @contextmanager
-def bind_attention_schedule(schedule: AttentionSchedule | None, *, from_request: bool = False):
-    """Install one request schedule and restore the previous one on any exit.
+def bind_attention_schedule(
+    schedule: AttentionSchedule | None, sigma_schedule: tuple[Any, ...] | None = None, *, from_request: bool = False
+):
+    """Install one request's step ranges and sigma windows and restore the previous ones on any exit.
 
-    ``from_request`` marks ranges the request sent itself; begin_scheduled_denoise checks only those.
+    ``from_request`` marks step ranges the request sent itself; begin_scheduled_denoise checks only those.
     """
     if _forward_context is None:
         raise RuntimeError("bind_attention_schedule requires an active forward context")
-    previous = _forward_context.attention_schedule, _forward_context.attention_schedule_from_request
-    _forward_context.attention_schedule = None if schedule is None else tuple(schedule)
-    _forward_context.attention_schedule_from_request = from_request
+    ctx = _forward_context
+    previous = (ctx.attention_schedule, ctx.attention_sigma_schedule, ctx.attention_schedule_from_request)
+    ctx.attention_schedule = None if schedule is None else tuple(schedule)
+    ctx.attention_sigma_schedule = None if sigma_schedule is None else tuple(sigma_schedule)
+    ctx.attention_schedule_from_request = from_request
     try:
         yield
     finally:
-        _forward_context.attention_schedule, _forward_context.attention_schedule_from_request = previous
+        ctx.attention_schedule, ctx.attention_sigma_schedule, ctx.attention_schedule_from_request = previous
 
 
 def get_attention_schedule_profile() -> str | None:
     """Return the profile the bound schedule selects for the published step, or None.
 
-    The selection is computed once per (schedule, step, total) and reused by every
-    scheduled layer in that step.
+    The selection is computed once per (schedule, step, total) or (sigma windows, sigma)
+    and reused by every scheduled layer in that step.
     """
     ctx = _forward_context
-    if ctx is None or not ctx.attention_schedule or ctx.denoise_step_idx is None:
+    # Check the schedules before the step, so unscheduled compiled code never guards on the step index.
+    if ctx is None:
+        return None
+    if ctx.attention_sigma_schedule:
+        if ctx.denoise_step_idx is None:
+            return None
+        sigma_key = (ctx.attention_sigma_schedule, ctx.denoise_sigma)
+        if sigma_key != ctx._attention_profile_key:
+            if ctx.denoise_sigma is None:
+                raise RuntimeError("attention sigma windows need denoise_sigma published with denoise_step_idx")
+            ctx._attention_profile = select_attention_profile_by_sigma(ctx.attention_sigma_schedule, ctx.denoise_sigma)
+            ctx._attention_profile_key = sigma_key
+        return ctx._attention_profile
+    if not ctx.attention_schedule or ctx.denoise_step_idx is None:
         return None
     total = ctx.total_denoise_steps
     if total is None:
@@ -360,16 +383,17 @@ def begin_scheduled_denoise(total_steps: int) -> int | None:
     """Check the request's own bound schedule against one denoise sequence before its first forward.
 
     An inherited service default is not checked: it serves requests of any length, and a range that
-    ends after this sequence applies up to its last step.
-    Returns ``total_steps`` when a non-empty schedule is bound, else None. A pipeline that
-    publishes a total only for schedules passes the result through, so an unscheduled run
-    keeps publishing no total (RAINFUSION with end_step runs dense while the total is None).
-    Call it once per sequence that restarts at step 0.
+    ends after this sequence applies up to its last step. Sigma windows do not depend on the length.
+    Returns ``total_steps`` when non-empty step ranges or sigma windows are bound, else None.
+    A pipeline that publishes a total only for schedules passes the result through, so an
+    unscheduled run keeps publishing no total (RAINFUSION with end_step runs dense while the
+    total is None). Call it once per sequence that restarts at step 0.
     """
-    if _forward_context is None or not _forward_context.attention_schedule:
+    ctx = _forward_context
+    if ctx is None or not (ctx.attention_schedule or ctx.attention_sigma_schedule):
         return None
-    if _forward_context.attention_schedule_from_request:
-        require_attention_schedule_fits(_forward_context.attention_schedule, total_steps)
+    if ctx.attention_schedule and ctx.attention_schedule_from_request:
+        require_attention_schedule_fits(ctx.attention_schedule, total_steps)
     return total_steps
 
 
@@ -393,28 +417,27 @@ def clear_scheduled_denoise_step_on_exit(total_steps: int | None):
 
 
 @contextmanager
-def request_denoise_progress(step_idx: int, total_steps: int, timestep: float | None = None):
+def request_denoise_progress(
+    step_idx: int, total_steps: int, timestep: float | None = None, *, sigma: float | None = None
+):
     """Publish one request's progress around its own forward and restore the previous values on any exit.
 
     For scheduled requests that share a denoise_step call but not their progress: each request
-    is evaluated separately under its own step, total and timestep. Restoring assigns the saved
-    fields directly, so a restore never calls the paged runtime's ensure_active.
+    is evaluated separately under its own step, total, timestep and sigma. Restoring assigns the
+    saved fields directly, so a restore never calls the paged runtime's ensure_active.
     """
     if _forward_context is None:
         raise RuntimeError("request_denoise_progress requires an active forward context")
     ctx = _forward_context
-    previous_step = ctx.denoise_step_idx
-    previous_timestep = ctx.denoise_timestep
-    previous_total = ctx.total_denoise_steps
+    previous = (ctx.denoise_step_idx, ctx.denoise_timestep, ctx.denoise_sigma, ctx.total_denoise_steps)
     try:
         set_forward_context_denoise_step_idx(step_idx)
         ctx.denoise_timestep = None if timestep is None else float(timestep)
+        set_forward_context_denoise_sigma(sigma)
         ctx.total_denoise_steps = total_steps
         yield
     finally:
-        ctx.denoise_step_idx = previous_step
-        ctx.denoise_timestep = previous_timestep
-        ctx.total_denoise_steps = previous_total
+        ctx.denoise_step_idx, ctx.denoise_timestep, ctx.denoise_sigma, ctx.total_denoise_steps = previous
 
 
 def get_paged_kv_computed_tokens() -> tuple[int, ...]:
@@ -458,6 +481,15 @@ def paged_kv_prefill(sequence_id: int, num_tokens: int):
     )
 
 
+def set_forward_context_denoise_sigma(sigma: float | None) -> None:
+    """Publish normalized scheduler noise in [0, 1] for bound sigma windows.
+
+    Without bound windows nothing reads the noise level, so the value is neither checked nor stored.
+    """
+    if _forward_context is not None and _forward_context.attention_sigma_schedule:
+        _forward_context.denoise_sigma = None if sigma is None else normalized_sigma(sigma)
+
+
 def set_forward_context_denoise_timestep(timestep: float | None) -> None:
     """Set the normalized (descending, 1 -> 0) denoise timestep.
 
@@ -487,20 +519,40 @@ class DenoiseProgressMixin:
         scheduler=None,
         normalized_timestep: float | None = None,
         total_steps: int | None = None,
+        normalized_sigma: float | None = None,
     ) -> None:
         set_forward_context_denoise_step_idx(step_idx)
         if _forward_context is not None:
             _forward_context.total_denoise_steps = total_steps
         if _forward_context is None:
             return
+        scheduler = scheduler if scheduler is not None else getattr(self, "scheduler", None)
+        if _forward_context.attention_sigma_schedule:
+            # Only sigma windows read the noise level, so unscheduled runs never compute it.
+            _forward_context.denoise_sigma = self._denoise_sigma(step_idx, scheduler, normalized_sigma)
         if normalized_timestep is not None:
             _forward_context.denoise_timestep = float(normalized_timestep)
             return
         if timestep is None:
             return
-        scheduler = scheduler if scheduler is not None else getattr(self, "scheduler", None)
         ntt = getattr(getattr(scheduler, "config", None), "num_train_timesteps", None)
         _forward_context.denoise_timestep = float(timestep) / ntt if ntt else None
+
+    @staticmethod
+    def _denoise_sigma(step_idx: int | None, scheduler: Any, sigma: float | None) -> float | None:
+        """The caller's normalized sigma, else ``scheduler.sigmas[step_idx]`` relative to the first sigma.
+
+        A raw model timestep is never read as noise; without either source the sigma stays None and
+        the attention layer rejects the step.
+        """
+        if step_idx is None:
+            return None
+        if sigma is not None:
+            return normalized_sigma(sigma)
+        sigmas = getattr(scheduler, "sigmas", None)
+        if sigmas is None or step_idx >= len(sigmas):
+            return None
+        return normalized_sigma(float(sigmas[step_idx]), float(sigmas[0]))
 
 
 def set_forward_context_ref_latent(ref_latent: torch.Tensor | None) -> None:
