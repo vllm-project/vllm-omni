@@ -31,6 +31,12 @@ from vllm_omni.diffusion.attention.backends.abstract import (
     VideoTokenLayout,
 )
 from vllm_omni.diffusion.attention.backends.sdpa import SDPABackend, SDPAImpl
+from vllm_omni.diffusion.attention.backends.trtllm_calibration import (
+    calibration_for_candidate,
+    layer_calibration_is_ignored,
+    resolve_effective_calibration,
+    resolve_layer_calibration,
+)
 from vllm_omni.diffusion.attention.capabilities import (
     AttentionComputation,
     CapabilityResult,
@@ -49,6 +55,7 @@ from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.diffusion_kv.layout import assert_backend_layout_supported
 from vllm_omni.diffusion.distributed.parallel_state import get_sp_group
 from vllm_omni.diffusion.forward_context import (
+    get_attention_schedule_profile,
     get_forward_context,
     get_ulysses_mode,
     is_forward_context_available,
@@ -56,16 +63,17 @@ from vllm_omni.diffusion.forward_context import (
 from vllm_omni.platforms import current_omni_platform
 
 if TYPE_CHECKING:
-    from vllm_omni.diffusion.data import AttentionScheduleConfig, AttentionSpec
+    from vllm_omni.diffusion.data import AttentionScheduleConfig, AttentionSpec, OmniDiffusionConfig
 
 logger = init_logger(__name__)
 
 
-def _canonical_json(value):
+def _canonical_json(value: Any) -> str | object:
     """Order-insensitive canonical form for dedup keys; ``""`` for None or empty containers.
 
-    An unserializable value is not shareable. ``repr`` is not used: two different objects can share
-    a repr and would otherwise collapse onto one impl.
+    An unserializable value is not shareable, so it gets a fresh sentinel that equals nothing else.
+    ``repr`` is not used: two different objects can share a repr and would otherwise collapse onto
+    one impl.
     """
     if not value:
         return ""
@@ -333,15 +341,19 @@ class _PreparedCandidate:
 
     backend_cls: type[AttentionBackend]
     spec: "AttentionSpec | None"
-    impl_cls: type[AttentionImpl]
     impl: AttentionImpl
     backend_explicit: bool
-    backend_pref: str
 
 
 class Attention(nn.Module):
     _scheduler_paged_kv = False
     _has_custom_attention = False
+    # Whether this layer saw a schedule at construction. Attention can be built with no current
+    # diffusion config, and such a layer legitimately prepares no candidates, so startup
+    # validation must not report it as a missing profile.
+    _schedule_configured = False
+    # Id the compiled scheduled-attention op uses to find this layer (see _register_scheduled_op).
+    _schedule_op_id: torch.Tensor | None = None
 
     def __init__(
         self,
@@ -440,12 +452,6 @@ class Attention(nn.Module):
         # registers no submodule and leaves state_dict untouched.
         self._schedule_profiles: tuple[str, ...] = ()
         self._schedule_candidates: dict[str, _PreparedCandidate] = {}
-        # Whether this layer saw a schedule at construction. Attention can be built with no current
-        # diffusion config, and such a layer legitimately prepares no candidates, so startup
-        # validation must not report it as a missing profile.
-        self._schedule_configured: bool = False
-        # Id the compiled scheduled-attention op uses to find this layer (see _register_scheduled_op).
-        self._schedule_op_id: torch.Tensor | None = None
         # Model-owned requirements on every candidate of this layer (add_schedule_candidate_check).
         self._schedule_candidate_checks: list[Callable[[_PreparedCandidate], str | None]] = []
 
@@ -568,7 +574,7 @@ class Attention(nn.Module):
             # Pre-construct one deduplicated candidate per configured
             # profile. Runs only when a startup schedule exists; the baseline impl
             # above is never replaced and stays the gap/no-selection choice.
-            schedule_config = getattr(config, "diffusion_attention_schedule", None) if config is not None else None
+            schedule_config = getattr(config, "diffusion_attention_schedule", None)
             if schedule_config is not None:
                 self._schedule_configured = True
                 self._register_scheduled_op()
@@ -585,8 +591,6 @@ class Attention(nn.Module):
                     prefix=prefix,
                     allow_trtllm_default=allow_trtllm_default,
                     impl_overrides=impl_overrides,
-                    scheduler_paged_kv=scheduler_paged_kv,
-                    paged_kv_cache_role=paged_kv_cache_role,
                     skip_sequence_parallel=skip_sequence_parallel,
                     allgather_degree=allgather_degree,
                 )
@@ -595,15 +599,6 @@ class Attention(nn.Module):
                 raise ValueError("custom_attention does not support Scheduler-managed paged KV")
             if not skip_sequence_parallel:
                 raise ValueError("custom_attention must own its communication and requires skip_sequence_parallel=True")
-            schedule_config = getattr(config, "diffusion_attention_schedule", None) if config is not None else None
-            if schedule_config is not None:
-                # A model-owned kernel cannot represent prepared per-step
-                # candidates, so reject at construction, not inside the first kernel.
-                raise ValueError(
-                    "diffusion_attention_schedule cannot be combined with custom_attention: a model-owned "
-                    "kernel cannot represent prepared per-step candidates. Remove the schedule or use a "
-                    "backend-representable attention layer."
-                )
             self.attn_spec = None
             self.attn_backend = None
             self.attn_impl_cls = type(custom_attention)
@@ -689,8 +684,6 @@ class Attention(nn.Module):
         prefix: str,
         allow_trtllm_default: bool,
         impl_overrides: Mapping[str, type[AttentionImpl]] | None,
-        scheduler_paged_kv: bool,
-        paged_kv_cache_role: str | None,
         skip_sequence_parallel: bool,
         allgather_degree: int,
     ) -> None:
@@ -703,13 +696,10 @@ class Attention(nn.Module):
         not referenced by the service default schedule are still prepared, because
         startup compatibility validation covers every configured profile.
 
-        The baseline construction-time guards that decide WHICH backend a layer uses
-        are reproduced here, so a candidate is never prepared with a wrong or
-        incompatible backend: the marked-paged default->FLASH_ATTN promotion and the
-        AllGather-KV + TRTLLM_ATTN rejection. Per-candidate KV-cache-quantization and
-        capability/layout validation (ring, paged representability, kv dtype support)
-        remain in the post-load startup traversal (``validate_attention_schedule_candidates``)
-        and are not duplicated here.
+        The baseline AllGather-KV + TRTLLM_ATTN rejection is reproduced here, so a candidate
+        is never prepared with that backend. Per-candidate KV-cache-quantization and
+        capability/layout validation (ring, kv dtype support) remain in the post-load startup
+        traversal (``validate_attention_schedule_candidates``) and are not duplicated here.
 
         Identical effective identities for this role share one record. The dedup key carries the
         backend name, explicit-vs-default selection, the impl class object, and canonical JSON of
@@ -728,18 +718,6 @@ class Attention(nn.Module):
                 role_category=role_category,
                 allow_trtllm_default=allow_trtllm_default,
             )
-            # Reproduce the baseline marked-paged promotion: a paged layer whose
-            # profile falls back to the platform default must still be promoted to a
-            # paged-capable backend, exactly as baseline construction does.
-            if (
-                scheduler_paged_kv
-                and paged_kv_cache_role is not None
-                and spec is None
-                and not backend_cls.supports_paged_kv
-            ):
-                from vllm_omni.diffusion.attention.backends.registry import DiffusionAttentionBackendEnum
-
-                backend_cls = DiffusionAttentionBackendEnum.FLASH_ATTN.get_class()
             # Reproduce the baseline AllGather-KV + TRTLLM rejection.
             if not skip_sequence_parallel and allgather_degree > 1 and backend_cls.get_name() == "TRTLLM_ATTN":
                 raise ValueError(
@@ -783,10 +761,8 @@ class Attention(nn.Module):
                 record = _PreparedCandidate(
                     backend_cls=backend_cls,
                     spec=spec,
-                    impl_cls=impl_cls,
                     impl=impl,
                     backend_explicit=backend_explicit,
-                    backend_pref=spec.backend if spec is not None else backend_cls.get_name(),
                 )
                 prepared[dedup_key] = record
             candidates[name] = record
@@ -897,7 +873,7 @@ class Attention(nn.Module):
         value: torch.Tensor,
         attn_metadata: AttentionMetadata | None = None,
     ) -> torch.Tensor:
-        if torch.compiler.is_compiling() and getattr(self, "_schedule_configured", False):
+        if torch.compiler.is_compiling() and self._schedule_configured:
             # Selecting a scheduled candidate reads the step, the total and the bound
             # schedule from the forward context, and backend-private gates read the step or
             # timestep. Traced, those values would become guards and each new step or range
@@ -943,14 +919,11 @@ class Attention(nn.Module):
     def _schedule_op_eligible(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor) -> bool:
         """Whether this layer and call can use the scheduled-attention op instead of the eager boundary.
 
-        Evaluated while tracing, on structure only (never on the step). HSDP (its own boundary),
-        Scheduler-managed paged KV (writes cache state the op does not declare) and autograd (the op
-        has no backward) keep ``_forward_schedule_compile_boundary``, as does metadata that
-        ``_encode_scheduled_op_metadata`` cannot carry.
+        Evaluated while tracing, on structure only (never on the step). HSDP (its own boundary) and
+        autograd (the op has no backward) keep ``_forward_schedule_compile_boundary``, as does
+        metadata that ``_encode_scheduled_op_metadata`` cannot carry.
         """
-        if getattr(self, "_schedule_op_id", None) is None or self._uses_hsdp_compile_boundary():
-            return False
-        if self._scheduler_paged_kv and self.paged_kv_cache_role is not None:
+        if self._schedule_op_id is None or self._uses_hsdp_compile_boundary():
             return False
         return not (torch.is_grad_enabled() and (query.requires_grad or key.requires_grad or value.requires_grad))
 
@@ -980,7 +953,7 @@ class Attention(nn.Module):
         if self._uses_hsdp_compile_boundary():
             boundaries.add(OuterBoundary.HSDP)
         attention, cross_backend, cross_spec = self.attention, None, _UNSET
-        if getattr(self, "_schedule_configured", False):
+        if self._schedule_configured:
             # While compiling, a layer built with a schedule always runs behind
             # _forward_schedule_compile_boundary, and inside a denoise step it runs the candidate
             # selected for that step. effective_attention() returns the baseline when there is no
@@ -1177,10 +1150,6 @@ class Attention(nn.Module):
         # backend resolution below selects CUDA or Ascend execution.
         if use_paged_attention:
             assert paged_adapter is not None
-            # Startup validation keeps every candidate on a paged layer identical to the baseline,
-            # because forward_paged runs the native implementation bound to it. The call still
-            # applies the missing-step, out-of-range and unprepared-profile checks.
-            self.effective_attention()
             paged_kv_context = paged_adapter.prepare_layer_context(
                 self.prefix,
                 query,
@@ -1453,7 +1422,9 @@ class Attention(nn.Module):
 
         return effective_impl.forward(query, key, value, attn_metadata)
 
-    def _selects_automatic_flash_attention(self, impl, backend, spec) -> bool:
+    def _selects_automatic_flash_attention(
+        self, impl: AttentionImpl | nn.Module, backend: type[AttentionBackend] | None, spec: "AttentionSpec | None"
+    ) -> bool:
         """Whether the selected implementation is an automatic FLASH_ATTN choice.
 
         The FP32 fallback applies only to that choice, so an explicit backend or an explicitly
@@ -1475,30 +1446,16 @@ class Attention(nn.Module):
         """
         self._schedule_candidate_checks.append(check)
 
-    def effective_attention(self):
-        """Baseline outside an active denoise step; a prepared candidate inside one.
+    def effective_attention(
+        self,
+    ) -> tuple[AttentionImpl | nn.Module, type[AttentionBackend] | None, "AttentionSpec | None"]:
+        """Baseline outside a scheduled denoise step; the step's prepared candidate inside one.
 
-        A missing step or total while a non-empty schedule is active fails here. That check does
-        not replace the request-admission rejection.
+        A layer built without a schedule config has no candidates and always runs its baseline.
         """
-        impl = self.attention
-        backend = self.attn_backend
-        spec = getattr(self, "attn_spec", None)
-        if not is_forward_context_available():
-            return impl, backend, spec
-        ctx = get_forward_context()
-        schedule = getattr(ctx, "attention_schedule", None)
-        if not schedule or not getattr(ctx, "attention_schedule_denoise_active", False):
-            return impl, backend, spec
-        step_idx = ctx.denoise_step_idx
-        total_steps = ctx.total_denoise_steps
-        if step_idx is None or total_steps is None:
-            raise RuntimeError("active denoise attention schedule requires denoise_step_idx and total_denoise_steps")
-        from vllm_omni.diffusion.attention.schedule import select_attention_profile
-
-        name = select_attention_profile(schedule, step_idx, total_steps=total_steps)
+        name = get_attention_schedule_profile() if self._schedule_configured else None
         if name is None:
-            return impl, backend, spec
+            return self.attention, self.attn_backend, getattr(self, "attn_spec", None)
         record = self._schedule_candidates.get(name)
         if record is None:
             raise RuntimeError(f"attention schedule profile {name!r} was not prepared on this layer")
@@ -1551,10 +1508,6 @@ class Attention(nn.Module):
                 "the ring path bypasses the backend, so the skip config would be silently ignored. "
                 "Use Ulysses SP instead, or remove the skip_softmax config."
             )
-        # Startup validation keeps every candidate on a ring layer identical to the baseline, because
-        # the ring runner is bound to the baseline's backend preference and ignores backend kwargs.
-        # The call still applies the missing-step, out-of-range and unprepared-profile checks.
-        self.effective_attention()
         # Delegate to RingParallelAttention strategy if available
         if self.ring_runner is not None:
             return self.ring_runner.run_attention(
@@ -1562,46 +1515,6 @@ class Attention(nn.Module):
             )
 
         raise RuntimeError("Ring attention is enabled but strategy is not RingParallelAttention")
-
-
-def _sp_plan_declares_auto_pad(value) -> bool:
-    """Whether one SP plan value declares ``auto_pad`` at any nesting level.
-
-    ``SequenceParallelInputType`` is itself a dict (parameter name or output index -> input spec,
-    optionally a list/tuple of them), and in-tree models declare plans shaped like
-    ``{"rope": {0: SequenceParallelInput(..., auto_pad=True)}}`` (``WanTransformer3DModel._sp_plan``),
-    so auto_pad normally sits two levels below the plan root. Duck-typed on the entry so this module
-    does not import the SP plan types.
-    """
-    if isinstance(value, dict):
-        return any(_sp_plan_declares_auto_pad(item) for item in value.values())
-    if isinstance(value, (list, tuple)):
-        return any(_sp_plan_declares_auto_pad(item) for item in value)
-    return bool(getattr(value, "auto_pad", False))
-
-
-def _sp_auto_pad_roots(model: nn.Module) -> tuple[str, ...]:
-    """Qualified names of the submodules whose OWN SP plan declares ``auto_pad``.
-
-    SP hooks are applied per component: the registry reads each transformer's ``_sp_plan`` and
-    applies hooks to that transformer only. A plan on one component must therefore not impose mask
-    support on another component's layers, so coverage is decided by qualified
-    name prefix rather than by "any module anywhere pads". The root module yields the empty name,
-    which covers every layer. Duck-typed so this module does not import the SP plan types.
-    """
-    roots = []
-    for name, module in model.named_modules():
-        plan = getattr(module, "_sp_plan", None)
-        if not isinstance(plan, dict):
-            continue
-        if any(_sp_plan_declares_auto_pad(value) for value in plan.values()):
-            roots.append(name)
-    return tuple(roots)
-
-
-def _layer_plans_sp_auto_pad(layer_name: str, auto_pad_roots: tuple[str, ...]) -> bool:
-    """Whether this layer sits under a component that declared ``auto_pad``."""
-    return any(root == "" or layer_name == root or layer_name.startswith(root + ".") for root in auto_pad_roots)
 
 
 def _validate_candidate_calibration(
@@ -1618,19 +1531,9 @@ def _validate_candidate_calibration(
     ignore-rule hit is a preserved legitimate dense fallback and passes; a layer that dict gives no
     curve for would silently stay dense at runtime, so it is rejected at startup.
     """
-    spec = record.spec
-    if spec is None:
-        return
-    skip = getattr(spec, "skip_softmax", None)
-    if skip is None or getattr(skip, "target_sparsity", None) is None:
-        return
-    if getattr(skip, "threshold", None) is not None:
-        return  # calibration-free path
-    from vllm_omni.diffusion.attention.backends.trtllm_calibration import (
-        layer_calibration_is_ignored,
-        resolve_layer_calibration,
-    )
-
+    skip = record.spec.skip_softmax if record.spec is not None else None
+    if skip is None or skip.target_sparsity is None or skip.threshold is not None:
+        return  # no curve requested, or the calibration-free path
     if layer_calibration_is_ignored(layer_name, effective_calibration):
         return
     per = resolve_layer_calibration(layer_name, effective_calibration) if effective_calibration else None
@@ -1643,26 +1546,18 @@ def _validate_candidate_calibration(
         )
 
 
-def validate_attention_schedule_candidates(model: nn.Module, od_config) -> int:
+def validate_attention_schedule_candidates(model: nn.Module, od_config: "OmniDiffusionConfig") -> int:
     """Post-load startup traversal over every prepared schedule candidate.
 
     Construction (``Attention._prepare_schedule_candidates``) reproduces the guards that decide
     WHICH backend a layer uses. The checks here need the loaded model and the resolved parallel
     plan instead. The checks that run without this traversal do not read each prepared candidate,
     so an incompatible candidate would surface inside the first kernel after the layer switches to
-    it, be ignored on a paged KV or ring layer, or run dense when its calibration curve is missing:
+    it, be ignored on a ring layer, or run dense when its calibration curve is missing:
 
     * profile coverage: every configured profile is prepared on every attention layer, including
       profiles the service default never references;
-    * paged KV: an explicit profile is never promoted, so a non-paged backend survives
-      construction, and ``_forward_impl`` checks only the baseline backend for paged support.
-      Paged forward runs the native implementation bound to the baseline, so a candidate whose
-      backend name, explicit selection or backend kwargs differ from the baseline cannot be
-      represented either;
     * KV-cache quantization: ``_init_kv_cache_quantization`` probes the baseline impl only;
-    * SP auto-pad: the pad-time mask probe cannot be answered per candidate before load, so a layer
-      inside a component that plans auto_pad under SP must have mask-capable candidates. Coverage is
-      per component, because the registry applies SP hooks per component;
     * ring: the ring path bypasses the backend and the ring runner is bound to the baseline backend
       preference and explicit flag, and ignores backend kwargs, so a candidate carrying skip_softmax
       or differing from the baseline in backend name, explicit selection or backend kwargs cannot be
@@ -1674,30 +1569,21 @@ def validate_attention_schedule_candidates(model: nn.Module, od_config) -> int:
     walks nothing. A schedule that finds no attention layer, or no layer that saw it, is rejected
     instead of passing silently.
     """
-    from vllm_omni.diffusion.attention.backends.trtllm_calibration import (
-        calibration_for_candidate,
-        resolve_effective_calibration,
-    )
-
-    schedule = getattr(od_config, "diffusion_attention_schedule", None) if od_config is not None else None
+    schedule = od_config.diffusion_attention_schedule
     if schedule is None:
         return 0
 
-    profiles = tuple(sorted(getattr(schedule, "profiles", None) or {}))
-    parallel_config = getattr(od_config, "parallel_config", None)
-    sp_size = int(getattr(parallel_config, "sequence_parallel_size", 1) or 1)
-    kv_dtype = getattr(od_config, "diffusion_kv_cache_dtype", None)
+    profiles = tuple(sorted(schedule.profiles))
+    kv_dtype = od_config.diffusion_kv_cache_dtype
     if kv_dtype in ("auto", "float"):
         # The baseline guard treats both as "no quantization" (see _init_kv_cache_quantization,
         # which probes only `if dtype and dtype != "float"`). Probing them here would reject a
         # configuration that loads fine without a schedule.
         kv_dtype = None
     platform_key = current_omni_platform.device_name
-    auto_pad_roots = _sp_auto_pad_roots(model) if sp_size > 1 else ()
-    ring_degree = int(getattr(parallel_config, "ring_degree", 1) or 1)
-    effective_calibration = resolve_effective_calibration(
-        getattr(od_config, "diffusion_attention_config", None), schedule
-    )
+    ring_degree = od_config.parallel_config.ring_degree
+    skip_layers = od_config.diffusion_kv_cache_skip_layer_indices
+    effective_calibration = resolve_effective_calibration(od_config.diffusion_attention_config, schedule)
 
     validated = 0
     attention_layers = 0
@@ -1706,48 +1592,25 @@ def validate_attention_schedule_candidates(model: nn.Module, od_config) -> int:
         if not isinstance(module, Attention):
             continue
         attention_layers += 1
-        candidates = getattr(module, "_schedule_candidates", None) or {}
-        if not getattr(module, "_schedule_configured", False):
+        if not module._schedule_configured:
             continue  # built with no current diffusion config; it can never take part in a schedule
         schedule_aware_layers += 1
         for name in profiles:
-            if name not in candidates:
+            if name not in module._schedule_candidates:
                 raise ValueError(
                     f"attention schedule profile {name!r} was not prepared on layer {layer_name!r}; "
                     f"startup compatibility validation covers every configured profile."
                 )
-        requires_mask = _layer_plans_sp_auto_pad(layer_name, auto_pad_roots)
-        paged = bool(module._scheduler_paged_kv and module.paged_kv_cache_role is not None)
         baseline_backend = module.attn_backend.get_name() if module.attn_backend is not None else module.backend_pref
-        baseline_identity = _attention_identity(
-            module.attn_backend, module.backend_explicit, getattr(module, "attn_spec", None)
-        )
+        baseline_identity = _attention_identity(module.attn_backend, module.backend_explicit, module.attn_spec)
         for name in profiles:
-            record = candidates[name]
+            record = module._schedule_candidates[name]
             backend_name = record.backend_cls.get_name()
             matches_baseline = (
                 _attention_identity(record.backend_cls, record.backend_explicit, record.spec) == baseline_identity
             )
-            if paged and not getattr(record.backend_cls, "supports_paged_kv", False):
-                raise ValueError(
-                    f"attention schedule profile {name!r} selects backend {backend_name} which does not "
-                    f"support Scheduler-managed paged KV (layer {layer_name!r}, role "
-                    f"{module.paged_kv_cache_role!r}). Select a paged-capable backend for that profile "
-                    f"or disable scheduler paged KV."
-                )
-            if paged and not matches_baseline:
-                # forward_paged runs the native implementation bound to the baseline and never
-                # reads the candidate's spec, so a different candidate would be silently ignored.
-                raise ValueError(
-                    f"attention schedule profile {name!r} selects backend {backend_name} "
-                    f"(explicit={record.backend_explicit}) on a Scheduler-managed paged KV layer "
-                    f"(layer {layer_name!r}, role {module.paged_kv_cache_role!r}), but paged attention runs "
-                    f"the native implementation bound to the baseline {baseline_backend!r} "
-                    f"(explicit={module.backend_explicit}) and cannot represent a candidate whose backend, "
-                    f"explicit selection or backend kwargs differ from it. Align that profile with the "
-                    f"baseline or disable scheduler paged KV."
-                )
-            if ring_degree > 1 and not module.skip_sequence_parallel:
+            # Same condition as use_ring at construction: explicit cross-attention never runs ring.
+            if ring_degree > 1 and not module._explicit_cross_contract and not module.skip_sequence_parallel:
                 # The ring path bypasses the backend, so a candidate carrying skip_softmax
                 # would be silently ignored (_run_ring_attention only reads the baseline impl). The
                 # ring runner was constructed once from the baseline backend preference and explicit
@@ -1755,7 +1618,7 @@ def validate_attention_schedule_candidates(model: nn.Module, od_config) -> int:
                 # baseline would fall back to SDPA ring where it must raise, and quant or sparse
                 # kwargs would be dropped (ring.py). Kernel-availability probing is deliberately not
                 # duplicated here.
-                if record.spec is not None and getattr(record.spec, "skip_softmax", None) is not None:
+                if record.spec is not None and record.spec.skip_softmax is not None:
                     raise ValueError(
                         f"attention schedule profile {name!r} configures skip_softmax, which ring sequence "
                         f"parallelism cannot honor: the ring path bypasses the backend, so the skip config "
@@ -1772,27 +1635,17 @@ def validate_attention_schedule_candidates(model: nn.Module, od_config) -> int:
                         f"backend kwargs differ from the baseline; use Ulysses SP, or align that profile "
                         f"with the baseline."
                     )
-            skip_layers = getattr(od_config, "diffusion_kv_cache_skip_layer_indices", None)
             kv_opted_out = module._disable_kv_quant or (
                 skip_layers is not None and module.layer_idx is not None and module.layer_idx in skip_layers
             )
-            if kv_dtype and not kv_opted_out:
-                probe = getattr(record.impl, "supports_kv_cache_dtype", None)
-                if probe is not None and not probe(kv_dtype, platform_key):
-                    raise ValueError(
-                        f"attention schedule profile {name!r} selects backend {backend_name} which does "
-                        f"not support kv_cache_dtype={kv_dtype!r} on {platform_key} (layer {layer_name!r}). "
-                        f"Select a compatible backend for that profile or set "
-                        f"diffusion_kv_cache_dtype='auto'."
-                    )
-            if requires_mask and not record.backend_cls.supports_attention_mask(record.spec):
+            if kv_dtype and not kv_opted_out and not record.impl.supports_kv_cache_dtype(kv_dtype, platform_key):
                 raise ValueError(
-                    f"attention schedule profile {name!r} selects backend {backend_name} which does not "
-                    f"support attention_mask, but this model plans SP auto_pad with sequence_parallel_size="
-                    f"{sp_size} (layer {layer_name!r}). Remove that profile, select a mask-capable backend "
-                    f"for it, or disable auto_pad."
+                    f"attention schedule profile {name!r} selects backend {backend_name} which does "
+                    f"not support kv_cache_dtype={kv_dtype!r} on {platform_key} (layer {layer_name!r}). "
+                    f"Select a compatible backend for that profile or set "
+                    f"diffusion_kv_cache_dtype='auto'."
                 )
-            for check in getattr(module, "_schedule_candidate_checks", ()):
+            for check in module._schedule_candidate_checks:
                 reason = check(record)
                 if reason is not None:
                     raise ValueError(

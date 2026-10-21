@@ -3,11 +3,15 @@
 
 """Immutable integer-step schedules, independent of torch and attention backends."""
 
-from collections.abc import Collection, Mapping
+from collections.abc import Collection, Iterable, Mapping
 from dataclasses import dataclass
-from typing import Any, TypeAlias
+from typing import TYPE_CHECKING, Any, TypeAlias
 
 from vllm_omni.errors import OmniClientError
+
+if TYPE_CHECKING:
+    from vllm_omni.diffusion.data import AttentionScheduleConfig
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 _RANGE_FIELDS = frozenset({"start", "end", "profile"})
 
@@ -89,9 +93,11 @@ def validate_attention_schedule(
 ) -> None:
     """Check normalized intervals against prepared names and the actual sequence.
 
-    Startup can validate names without a sequence. Request preparation must
-    validate the actual total before any denoising forward, including inherited
-    defaults. No range is clipped to fit a shorter request.
+    Startup can validate names without a sequence. Request preparation validates
+    the actual total before any denoising forward, including inherited defaults.
+    A bounded range must fit the sequence. An open-ended range that starts at or
+    after the end selects nothing, like a gap, so a service default such as
+    ``[6, null)`` leaves shorter requests on the base attention.
     """
     if profiles is not None:
         unknown = sorted({entry.profile for entry in schedule if entry.profile not in profiles})
@@ -100,21 +106,18 @@ def validate_attention_schedule(
     if total_steps is not None:
         _validate_step(total_steps, "total_steps", minimum=1)
         for entry in schedule:
-            if entry.start >= total_steps or (entry.end is not None and entry.end > total_steps):
+            if entry.end is not None and entry.end > total_steps:
                 raise ValueError(f"attention_schedule range {entry!r} exceeds total_steps={total_steps}")
 
 
 def require_attention_schedule_fits(schedule: AttentionSchedule, total_steps: int) -> None:
     """Reject, as a client error, a schedule whose ranges do not fit the actual denoise sequence.
 
-    Publishers call this once they know the sequence they will run and before its first denoise
-    forward. The actual total can differ from the requested num_inference_steps (fixed DMD tables,
-    FastH3 positions), so callers pass the length of the sequence they built, not the request field.
+    Callers pass the length of the sequence they built, which can differ from the requested
+    num_inference_steps (fixed DMD tables, FastH3 positions), before its first denoise forward.
     """
     try:
         validate_attention_schedule(schedule, total_steps=total_steps)
-    except InvalidAttentionScheduleError:
-        raise
     except ValueError as exc:
         raise InvalidAttentionScheduleError(str(exc)) from exc
 
@@ -124,86 +127,45 @@ def resolve_attention_schedule(
     default_schedule: Any,
     *,
     profiles: Collection[str],
-    total_steps: int | None = None,
 ) -> AttentionSchedule:
     """Resolve inherit/disable/replace without changing either input."""
     effective = parse_attention_schedule(default_schedule if request_schedule is None else request_schedule)
     schedule = () if effective is None else effective
-    validate_attention_schedule(schedule, profiles=profiles, total_steps=total_steps)
+    validate_attention_schedule(schedule, profiles=profiles)
     return schedule
 
 
-def validate_request_attention_schedule(request: Any, od_config: Any) -> AttentionSchedule:
-    """Resolve one request against the service schedule. Raises before any denoiser runs."""
-    sampling = getattr(request, "sampling_params", None)
-    request_schedule = getattr(sampling, "attention_schedule", None) if sampling is not None else None
-    service = getattr(od_config, "diffusion_attention_schedule", None) if od_config is not None else None
-    profiles = tuple(getattr(service, "profiles", None) or ())
-    default = getattr(service, "default", None)
-    return resolve_attention_schedule(request_schedule, default, profiles=profiles)
+def resolve_request_attention_schedule(
+    sampling_params: "OmniDiffusionSamplingParams", service: "AttentionScheduleConfig | None"
+) -> AttentionSchedule:
+    """Resolve one request's schedule against the service configuration."""
+    if service is None:
+        return resolve_attention_schedule(sampling_params.attention_schedule, (), profiles=())
+    return resolve_attention_schedule(sampling_params.attention_schedule, service.default, profiles=service.profiles)
 
 
-def resolve_batch_attention_schedule(states: Any, od_config: Any) -> AttentionSchedule:
+def resolve_batch_attention_schedule(
+    sampling_params: Iterable["OmniDiffusionSamplingParams"], service: "AttentionScheduleConfig | None"
+) -> AttentionSchedule:
     """One resolved schedule for a batch. Different ranges must not share a denoise forward."""
-    resolved = [validate_request_attention_schedule(SimpleRequest(state), od_config) for state in states]
-    if not resolved:
-        return ()
-    first = resolved[0]
-    if any(item != first for item in resolved[1:]):
+    resolved = {resolve_request_attention_schedule(params, service) for params in sampling_params}
+    if len(resolved) > 1:
         raise ValueError("attention_schedule values in one batch must be identical")
-    return first
+    return resolved.pop() if resolved else ()
 
 
-def require_request_attention_schedule_fits(request: Any, od_config: Any, total_steps: int) -> AttentionSchedule:
-    """Step-mode form of require_attention_schedule_fits for one request or runner state.
+def require_request_attention_schedule_fits(
+    sampling_params: "OmniDiffusionSamplingParams", service: "AttentionScheduleConfig | None", total_steps: int
+) -> AttentionSchedule:
+    """Resolve one request's schedule and check it against the sequence the pipeline built.
 
-    Step-mode preparation runs before the runner opens the forward context, so the bound schedule is
-    not available there; this resolves the request's own schedule against the service default.
+    Step-mode preparation runs before the runner binds a schedule, so pipelines resolve the
+    request's own schedule here instead of reading the forward context.
     """
-    schedule = validate_request_attention_schedule(SimpleRequest(request), od_config)
+    schedule = resolve_request_attention_schedule(sampling_params, service)
     if schedule:
         require_attention_schedule_fits(schedule, total_steps)
     return schedule
-
-
-class SimpleRequest:
-    """Adapter so a runner state with ``sampling`` satisfies the request validator."""
-
-    def __init__(self, state: Any) -> None:
-        self.sampling_params = getattr(state, "sampling_params", None)
-        if self.sampling_params is None:
-            self.sampling_params = getattr(state, "sampling", None)
-
-
-def require_no_cache_backend(od_config: Any, schedule: AttentionSchedule) -> None:
-    """A non-empty schedule cannot run with a cache backend that reuses or skips transformer evaluations.
-
-    TeaCache-style backends skip DiT evaluations on some steps and add a residual cached at an
-    earlier step, which may have run a different profile. The selected attention would then not be
-    what ran, so the combination is rejected instead of invalidating caches at profile switches.
-    """
-    if not schedule:
-        return
-    cache_backend = getattr(od_config, "cache_backend", None) if od_config is not None else None
-    if cache_backend in (None, "none"):
-        return
-    raise ValueError(
-        f"attention_schedule cannot be combined with cache_backend={cache_backend!r}: the cache backend "
-        "reuses or skips transformer evaluations across denoise steps, so the scheduled attention would "
-        "not run as selected. Disable the cache backend or send attention_schedule=[]."
-    )
-
-
-def require_denoise_progress_publisher(pipeline: Any, schedule: AttentionSchedule) -> None:
-    """A non-empty schedule cannot enter denoise on a pipeline that never publishes a step."""
-    if not schedule:
-        return
-    if callable(getattr(pipeline, "record_denoise_step", None)):
-        return
-    raise ValueError(
-        "attention_schedule requires a pipeline that publishes denoise progress via record_denoise_step; "
-        "rejecting before denoise"
-    )
 
 
 # Pipeline classes (as registered in the diffusion model registry) that publish denoise progress
@@ -231,12 +193,13 @@ def require_attention_schedule_pipeline(pipeline_class_name: str | None, model_c
 
 
 def select_attention_profile(schedule: AttentionSchedule, step_index: int, *, total_steps: int) -> str | None:
-    """Return the selected name, or None for the original configuration in gaps."""
-    _validate_step(total_steps, "total_steps", minimum=1)
-    _validate_step(step_index, "step_index")
-    if step_index >= total_steps:
-        raise ValueError(f"attention_schedule step_index={step_index} must be less than total_steps={total_steps}")
-    validate_attention_schedule(schedule, total_steps=total_steps)
+    """Return the profile selected at ``step_index``, or None for the base attention in gaps.
+
+    The schedule was validated against ``total_steps`` before denoising started, so this
+    only walks the ranges.
+    """
+    if not 0 <= step_index < total_steps:
+        raise ValueError(f"attention_schedule step_index={step_index} must be in [0, total_steps={total_steps})")
     for entry in schedule:
         if step_index < entry.start:
             break

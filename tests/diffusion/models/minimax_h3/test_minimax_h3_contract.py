@@ -14,7 +14,19 @@ import pytest
 import torch
 import torch.nn as nn
 
+from vllm_omni.diffusion.attention.schedule import AttentionScheduleRange, InvalidAttentionScheduleError
+from vllm_omni.diffusion.cache.cachedit import CacheDiTRequestSpec
+from vllm_omni.diffusion.data import (
+    AttentionConfig,
+    AttentionScheduleConfig,
+    DiffusionCacheConfig,
+    OmniDiffusionConfig,
+)
+from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3
 from vllm_omni.diffusion.models.minimax_h3.lora import TurboSpec, parse_turbo_filename
+from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import MiniMaxH3Attention
+from vllm_omni.diffusion.models.minimax_h3.quality_policy import MiniMaxH3QualityPlan
+from vllm_omni.diffusion.worker.utils import StepRequestState
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
@@ -1331,8 +1343,6 @@ def test_distilled_forward_rejects_a_mismatched_explicit_step_count():
 
 def _scheduled_od_config(default=None, **fields):
     """Service config with one prepared profile, an optional default schedule and any further config fields."""
-    from vllm_omni.diffusion.data import AttentionConfig, AttentionScheduleConfig, OmniDiffusionConfig
-
     return OmniDiffusionConfig(
         diffusion_attention_schedule=AttentionScheduleConfig(
             profiles={"sparse": AttentionConfig()}, default=[] if default is None else default
@@ -1343,16 +1353,12 @@ def _scheduled_od_config(default=None, **fields):
 
 def _allow_cpu_empty_cache(monkeypatch) -> None:
     """CPU platform objects may leave empty_cache unset; the forward still calls it at stage boundaries."""
-    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3
-
     monkeypatch.setattr(pipeline_minimax_h3.current_omni_platform, "empty_cache", lambda: None, raising=False)
 
 
 def test_forward_checks_the_attention_schedule_against_the_actual_step_count(monkeypatch):
     """The distilled table's four steps bound the schedule; num_inference_steps is omitted."""
     _allow_cpu_empty_cache(monkeypatch)
-    from vllm_omni.diffusion.attention.schedule import InvalidAttentionScheduleError
-
     diffuse_calls: list[dict[str, Any]] = []
     pipeline = _distilled_pipeline(diffuse_calls, {"fl2va": [1.0, 0.7, 0.4, 0.15, 0.0], "ref2va": None})
     pipeline.od_config = _scheduled_od_config()
@@ -1367,12 +1373,9 @@ def test_forward_checks_the_attention_schedule_against_the_actual_step_count(mon
 
 def test_prepare_encode_checks_the_attention_schedule_before_any_step():
     """Step mode checks the request's own schedule in prepare_encode, before the runner binds it for a step."""
-    from vllm_omni.diffusion.attention.schedule import InvalidAttentionScheduleError
-    from vllm_omni.diffusion.worker.utils import StepRequestState
-
     pipeline = _distilled_pipeline([], {"fl2va": [1.0, 0.7, 0.4, 0.15, 0.0], "ref2va": None})
     pipeline.od_config = _scheduled_od_config()
-    batch = _t2va_batch(attention_schedule=[{"start": 4, "end": None, "profile": "sparse"}])
+    batch = _t2va_batch(attention_schedule=[{"start": 2, "end": 6, "profile": "sparse"}])
     state = StepRequestState(request_id="scheduled", prompt=batch.prompts[0], sampling=batch.sampling_params)
 
     with pytest.raises(InvalidAttentionScheduleError, match="exceeds total_steps=4"):
@@ -1382,14 +1385,8 @@ def test_prepare_encode_checks_the_attention_schedule_before_any_step():
 def test_forward_rejects_an_attention_schedule_with_request_scoped_cache_dit(monkeypatch):
     """A schedule is rejected before Cache-DiT is prepared when the quality plan installs it."""
     _allow_cpu_empty_cache(monkeypatch)
-    from vllm_omni.diffusion.attention.schedule import InvalidAttentionScheduleError
-
     diffuse_calls: list[dict[str, Any]] = []
     prepared: list[object] = []
-    from vllm_omni.diffusion.cache.cachedit import CacheDiTRequestSpec
-    from vllm_omni.diffusion.data import DiffusionCacheConfig
-    from vllm_omni.diffusion.models.minimax_h3.quality_policy import MiniMaxH3QualityPlan
-
     cache_spec = CacheDiTRequestSpec("test-high", DiffusionCacheConfig(), num_inference_steps=4)
     pipeline = _distilled_pipeline(diffuse_calls, {"fl2va": None, "ref2va": None})
     pipeline.od_config = _scheduled_od_config()
@@ -1428,8 +1425,6 @@ def test_forward_rejects_an_attention_schedule_with_latent_refine(
 
     Either value can come from the request or from the server default.
     """
-    from vllm_omni.diffusion.attention.schedule import AttentionScheduleRange, InvalidAttentionScheduleError
-
     diffuse_calls: list[dict[str, Any]] = []
     pipeline = _distilled_pipeline(diffuse_calls, {"fl2va": None, "ref2va": None})
     pipeline.od_config = _scheduled_od_config(
@@ -1476,6 +1471,9 @@ def test_cudnn_packed_attention_uses_python_length_without_padding_mask():
         def __init__(self):
             super().__init__()
             self.metadata = None
+
+        def effective_attention(self):
+            return self, self.attn_backend, None
 
         def forward(self, query, key, value, metadata):
             self.metadata = metadata
@@ -1528,6 +1526,9 @@ def test_packed_attention_skips_mask_for_packed_mask_free_backend():
         def __init__(self):
             super().__init__()
             self.metadata = None
+
+        def effective_attention(self):
+            return self, self.attn_backend, None
 
         def forward(self, query, key, value, metadata):
             self.metadata = metadata
@@ -1590,6 +1591,9 @@ def test_packed_attention_keeps_padding_mask_for_other_backends():
         def __init__(self):
             super().__init__()
             self.metadata = None
+
+        def effective_attention(self):
+            return self, self.attn_backend, None
 
         def forward(self, query, key, value, metadata):
             self.metadata = metadata
@@ -1707,6 +1711,9 @@ def _fake_packed_attention(
             super().__init__()
             self.metadata = None
 
+        def effective_attention(self):
+            return self, self.attn_backend, None
+
         def forward(self, query, key, value, metadata):
             self.metadata = metadata
             return query
@@ -1780,6 +1787,9 @@ def test_rainfusion_packed_padding_stays_mask_free_on_unaligned_lengths():
             super().__init__()
             self.metadata = None
 
+        def effective_attention(self):
+            return self, self.attn_backend, None
+
         def forward(self, query, key, value, metadata):
             self.metadata = metadata
             return query
@@ -1826,9 +1836,6 @@ def _packed_backend(name: str, *, mask_free=False, prefix_kv_slicing=False, mult
 
 def _scheduled_packed_attention(baseline, candidate):
     """A MiniMaxH3Attention whose inner layer dispatches this forward to ``candidate``, not its baseline."""
-    from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import (
-        MiniMaxH3Attention,
-    )
 
     class FakeAttention(torch.nn.Module):
         attn_backend = baseline

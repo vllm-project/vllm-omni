@@ -6,6 +6,7 @@ from __future__ import annotations
 from dataclasses import fields
 from typing import TYPE_CHECKING
 
+from vllm_omni.diffusion.attention.schedule import parse_attention_schedule
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.base_scheduler import BaseScheduler
 from vllm_omni.diffusion.sched.interface import (
@@ -55,10 +56,8 @@ def build_request_batch_sampling_params_key(request: OmniDiffusionRequest) -> Re
     key_kwargs["flow_shift"] = _normalize_explicit_flow_shift(extra_args.get("flow_shift"))
     key_kwargs["condition_key"] = getattr(request, "batch_compatibility_key", None)
     key_kwargs["lora_int_id"] = lora_request.lora_int_id if lora_request is not None else None
-    from vllm_omni.diffusion.attention.schedule import parse_attention_schedule
-
-    attention_schedule = parse_attention_schedule(getattr(sampling, "attention_schedule", None))
-    return RequestBatchSamplingParamsKey(attention_schedule=attention_schedule, **key_kwargs)
+    key_kwargs["attention_schedule"] = parse_attention_schedule(sampling.attention_schedule)
+    return RequestBatchSamplingParamsKey(**key_kwargs)
 
 
 class RequestScheduler(BaseScheduler):

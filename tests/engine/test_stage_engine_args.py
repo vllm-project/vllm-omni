@@ -46,7 +46,7 @@ from vllm_omni.config.stage_config import (
     load_deploy_config,
     merge_pipeline_deploy,
 )
-from vllm_omni.diffusion.data import AttentionConfig, OmniDiffusionConfig
+from vllm_omni.diffusion.data import AttentionConfig, AttentionScheduleConfig, OmniDiffusionConfig
 from vllm_omni.engine import stage_init_utils
 from vllm_omni.engine.arg_utils import OmniEngineArgs
 from vllm_omni.engine.stage_init_utils import (
@@ -599,8 +599,6 @@ def test_typed_diffusion_engine_args_use_structured_diffusion_config(tmp_path, a
 @pytest.mark.diffusion
 @pytest.mark.parametrize("cli_override", [False, True])
 def test_attention_schedule_survives_yaml_and_both_stage_projections(tmp_path, cli_override):
-    from vllm_omni.diffusion.data import AttentionScheduleConfig
-
     pipeline, deploy, model = _engine_arg_inputs(tmp_path)
     raw = {
         "profiles": {"sparse": {"default": {"backend": "TRTLLM_ATTN", "skip_softmax": {"threshold": 0.1}}}},

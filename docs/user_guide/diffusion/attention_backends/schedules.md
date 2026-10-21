@@ -34,8 +34,11 @@ Each range has exactly `start`, `end` and `profile`:
 
 Ranges must be ordered and non-overlapping. Adjacent ranges are allowed;
 an open-ended range must be last. Gaps use the base configuration.
-Ranges are not clipped: they must fit the actual timestep sequence, which may
-differ from `num_inference_steps`. CFG evaluations share one step index.
+A bounded range must end within the actual timestep sequence, which may
+differ from `num_inference_steps`. An open-ended range that starts at or after
+the end of the sequence selects nothing, so `{"start": 6, "end": null}` leaves
+a request with 6 or fewer steps on the base configuration.
+CFG evaluations share one step index.
 Each H3 seed/continuation window restarts at step 0.
 Prompt encoding and decoding run with the base configuration.
 
@@ -111,7 +114,8 @@ distinct batch keys. Scheduled H3 step batches run one transformer forward
 per request so each uses its own progress.
 
 Malformed or unknown-profile schedules return HTTP 400 before dispatch.
-Out-of-bounds ranges fail before denoising and retain the client error through
+A bounded range that ends after the sequence fails before denoising and
+retains the client error through
 the runner and multiprocess executor. Asynchronous `/v1/videos` reports these
 errors on the job record rather than the creation response.
 
@@ -123,21 +127,19 @@ errors on the job record rather than the creation response.
   `[]`; the op picks the profile when it runs, so the block stays one graph.
   The op carries `attn_mask`, a `video_layout` without video spans and `extra`
   entries holding None, bools, ints or int tuples (a video grid). Other metadata
-  (tensors, floats or strings in `extra`, joint tensors, video spans), HSDP,
-  scheduler-managed paged KV and autograd keep an eager boundary that splits
-  the block around attention.
+  (tensors, floats or strings in `extra`, joint tensors, video spans), HSDP
+  and autograd keep an eager boundary that splits the block around attention.
   Different candidate output layouts may trigger recompilation.
 - H3 rejects non-empty schedules with request-scoped Cache-DiT (`quality=high`)
   or `latent_refine`. Disable the schedule or the conflicting option.
   Step mode rejects these H3 options regardless of schedule.
-- Auto-padding sequence parallelism requires mask-capable profiles.
-  Ring and scheduler-managed paged KV require profiles equivalent to the base
-  backend and options. AllGather-KV rejects TRTLLM and sparse RainFusion.
+- Ring attention requires profiles equivalent to the base backend and options.
+  AllGather-KV rejects TRTLLM and sparse RainFusion.
   Configured KV-cache quantization requires dtype support in every candidate.
 - H3 DiT profiles must exclude packed padding; VSA profiles require the VSA
   gate or a VSA base, and gated FastH3 layers accept only VSA.
-- Model-owned kernels reject profiles. TRTLLM `target_sparsity` needs a
-  per-layer calibration curve unless the layer is explicitly ignored.
+- TRTLLM `target_sparsity` needs a per-layer calibration curve unless the
+  layer is explicitly ignored.
 
 Startup warm-up does not exercise profiles. Warm up the base and each profile
 before timing. CPU tests use stand-in kernels; they do not establish GPU,

@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import fnmatch
 import logging
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from vllm_omni.diffusion.data import AttentionConfig, AttentionScheduleConfig, AttentionSpec
 
 logger = logging.getLogger(__name__)
 
@@ -79,29 +82,19 @@ def propagate_skip_softmax_calibration(specs: list, model: str | None, tf_config
     logger.info("Loaded skip-softmax calibration from checkpoint (%d curve(s): %s).", len(experts), ", ".join(experts))
 
 
-def collect_calibration_specs(attention_config: Any, schedule: Any = None) -> list:
+def collect_calibration_specs(
+    attention_config: AttentionConfig | None, schedule: AttentionScheduleConfig | None = None
+) -> list[AttentionSpec]:
     """Baseline specs plus every schedule profile's specs, in a stable order.
 
     Both calibration discovery and the target-sparsity-without-calibration check have to see
     non-active profiles, otherwise a profile the service default never references keeps an
     undetected calibration gap. Without a schedule this returns exactly the baseline specs.
     """
-    specs: list = []
-
-    def _extend(cfg: Any) -> None:
-        if cfg is None:
-            return
-        default = getattr(cfg, "default", None)
-        if default is not None:
-            specs.append(default)
-        per_role = getattr(cfg, "per_role", None) or {}
-        specs.extend(spec for spec in per_role.values() if spec is not None)
-
-    _extend(attention_config)
-    profiles = getattr(schedule, "profiles", None) or {}
-    for name in sorted(profiles):
-        _extend(profiles[name])
-    return specs
+    configs = [attention_config] if attention_config is not None else []
+    if schedule is not None:
+        configs.extend(schedule.profiles[name] for name in sorted(schedule.profiles))
+    return [spec for cfg in configs for spec in (cfg.default, *cfg.per_role.values()) if spec is not None]
 
 
 def layer_calibration_is_ignored(module_name: str, calibration: dict | None) -> bool:
@@ -124,7 +117,9 @@ def layer_calibration_is_ignored(module_name: str, calibration: dict | None) -> 
     return is_ignored(module_name, entry.get("ignore"))
 
 
-def resolve_effective_calibration(attention_config: Any, schedule: Any = None) -> dict | None:
+def resolve_effective_calibration(
+    attention_config: AttentionConfig | None, schedule: AttentionScheduleConfig | None = None
+) -> dict | None:
     """Fallback calibration for the baseline and for candidates that carry none of their own.
 
     This is the first non-empty ``skip_calibration`` over ``collect_calibration_specs`` (baseline
@@ -132,27 +127,25 @@ def resolve_effective_calibration(attention_config: Any, schedule: Any = None) -
     ``skip_calibration`` is stamped and validated from that dict instead.
     """
     for spec in collect_calibration_specs(attention_config, schedule):
-        calibration = getattr(spec, "skip_calibration", None)
-        if calibration:
-            return calibration
+        if spec.skip_calibration:
+            return spec.skip_calibration
     return None
 
 
 def calibration_for_candidate(record: Any, fallback: dict | None) -> dict | None:
     """The dict that stamping writes onto this candidate impl."""
-    spec = getattr(record, "spec", None)
-    own = getattr(spec, "skip_calibration", None) if spec is not None else None
-    if own:
-        return own
-    return fallback
+    own = record.spec.skip_calibration if record.spec is not None else None
+    return own or fallback
 
 
-def apply_skip_softmax_calibration(attention_config: Any, model: Any, schedule: Any = None) -> None:
+def apply_skip_softmax_calibration(
+    attention_config: AttentionConfig | None, model: Any, schedule: AttentionScheduleConfig | None = None
+) -> None:
     fallback = resolve_effective_calibration(attention_config, schedule)
     stamped = apply_to_pipeline(model, fallback)
     if not stamped:
         return
-    logger.debug("Skip-softmax: stamped calibration onto %d attention impl(s).", stamped)
+    logger.info("Skip-softmax: stamped calibration onto %d attention impl(s).", stamped)
 
 
 _EXPERT_PREFIXES = ("transformer.", "transformer_2.")
@@ -224,11 +217,7 @@ def apply_to_pipeline(pipeline, calibration: dict | None) -> int:
         seen: set[int] = set()
         baseline = getattr(module, "attention", None)
         stamped += _stamp_impl(baseline, name, calibration, seen)
-        candidates = getattr(module, "_schedule_candidates", None) or {}
-        # Records are not necessarily hashable (tests use SimpleNamespace). Identity dedup is
-        # by impl object inside _stamp_impl, so a shared impl is stamped once even if two names
-        # point at it.
-        for record in candidates.values():
-            own = calibration_for_candidate(record, calibration)
-            stamped += _stamp_impl(getattr(record, "impl", None), name, own, seen)
+        # Deduplicated profiles share one impl; _stamp_impl stamps each impl once.
+        for record in getattr(module, "_schedule_candidates", {}).values():
+            stamped += _stamp_impl(record.impl, name, calibration_for_candidate(record, calibration), seen)
     return stamped
