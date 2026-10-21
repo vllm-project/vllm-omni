@@ -115,12 +115,31 @@ def test_qwen3_omni_daily_omni_accuracy_bench(omni_server) -> None:
     assert _acc_bench.run_acc_benchmark(ns) == 0
 
 
+# English Seed-TTS, 1088 utterances, L20X, 2026-10-20: mean WER 0.282,
+# mean SIM 0.824 (median 0.828), mean UTMOS 3.350 (median 3.361).
+# Earlier checked-in runs scored WER 0.217 and 0.223. SIM 0.75 is 0.074
+# under the L20X mean; UTMOS 3.10 is 0.25 under the L20X mean. H100 and
+# B200 still need their own SIM and UTMOS measurement before tightening.
+_MAX_SEED_TTS_MEAN_WER = 0.35
+_MIN_SEED_TTS_MEAN_SIM = 0.75
+_MIN_SEED_TTS_MEAN_UTMOS = 3.10
+
+
 @hardware_test(res={"cuda": ["H100", "B200"], "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_qwen3_omni_seed_tts_wer_bench(omni_server) -> None:
     _require_vllm_cli()
     pytest.importorskip("huggingface_hub")
-    ns = _acc_bench.parse_acc_benchmark_args(
-        build_acc_benchmark_cli_argv(omni_server, skip_seed=False, skip_daily=True)
+    argv = build_acc_benchmark_cli_argv(omni_server, skip_seed=False, skip_daily=True)
+    argv.extend(
+        [
+            "--max-seed-tts-mean-wer",
+            str(_MAX_SEED_TTS_MEAN_WER),
+            "--min-seed-tts-mean-sim",
+            str(_MIN_SEED_TTS_MEAN_SIM),
+            "--min-seed-tts-mean-utmos",
+            str(_MIN_SEED_TTS_MEAN_UTMOS),
+        ]
     )
+    ns = _acc_bench.parse_acc_benchmark_args(argv)
     assert _acc_bench.run_acc_benchmark(ns) == 0

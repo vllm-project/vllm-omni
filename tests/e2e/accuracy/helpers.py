@@ -241,15 +241,110 @@ def _validate_seed_tts(
     if n <= 0:
         errs.append("seed_tts_content_evaluated is 0 (enable --seed-tts-wer-eval and check PCM capture).")
     mean_wer = result.get("seed_tts_content_error_mean")
-    if mean_wer is not None and max_mean_wer is not None and float(mean_wer) > float(max_mean_wer) + 1e-12:
+    if n > 0 and max_mean_wer is not None and mean_wer is None:
+        errs.append(
+            f"seed_tts_content_error_mean (WER) is missing; cannot apply --max-seed-tts-mean-wer={max_mean_wer}"
+        )
+    elif mean_wer is not None and max_mean_wer is not None and float(mean_wer) > float(max_mean_wer) + 1e-12:
         errs.append(f"seed_tts_content_error_mean (WER)={mean_wer:.6f} > --max-seed-tts-mean-wer={max_mean_wer}")
-    sim_m = result.get("seed_tts_sim_mean")
-    if sim_m is not None and min_mean_sim is not None and float(sim_m) + 1e-12 < float(min_mean_sim):
-        errs.append(f"seed_tts_sim_mean={sim_m:.6f} < --min-seed-tts-mean-sim={min_mean_sim}")
-    ut_m = result.get("seed_tts_utmos_mean")
-    if ut_m is not None and min_mean_utmos is not None and float(ut_m) + 1e-12 < float(min_mean_utmos):
-        errs.append(f"seed_tts_utmos_mean={ut_m:.6f} < --min-seed-tts-mean-utmos={min_mean_utmos}")
+    errs.extend(
+        _seed_tts_floor_errors(
+            result,
+            mean_key="seed_tts_sim_mean",
+            count_key="seed_tts_sim_evaluated",
+            expected=_seed_tts_sim_expected_count(result),
+            floor=min_mean_sim,
+            flag="--min-seed-tts-mean-sim",
+            enable_env="SEED_TTS_SIM_EVAL=1",
+        )
+    )
+    errs.extend(
+        _seed_tts_floor_errors(
+            result,
+            mean_key="seed_tts_utmos_mean",
+            count_key="seed_tts_utmos_evaluated",
+            expected=_seed_tts_utmos_expected_count(result),
+            floor=min_mean_utmos,
+            flag="--min-seed-tts-mean-utmos",
+            enable_env="SEED_TTS_UTMOS_EVAL=1",
+        )
+    )
     return errs
+
+
+def _seed_tts_floor_errors(
+    result: dict[str, Any],
+    *,
+    mean_key: str,
+    count_key: str,
+    expected: int | None,
+    floor: float | None,
+    flag: str,
+    enable_env: str,
+) -> list[str]:
+    """Fail closed when a configured floor has no score or only a partial one.
+
+    A missing SIM or UTMOS mean used to skip the comparison, so a CI baseline
+    passed while the scorer was still off. A later forward error is counted in
+    ``*_failed`` and left out of the mean, so a high mean over the clips that
+    survived must not pass either. ``expected`` is the number of rows that
+    reached this scorer; rows the evaluator never hands to it do not count.
+    """
+    if floor is None:
+        return []
+    mean = result.get(mean_key)
+    count = int(result.get(count_key, 0) or 0)
+    failed_key = count_key.replace("_evaluated", "_failed")
+    failed = int(result.get(failed_key, 0) or 0)
+    if mean is None or count <= 0:
+        return [f"{mean_key} is missing (evaluated={count}); set {enable_env} before applying {flag}={floor}"]
+    errs: list[str] = []
+    if failed > 0 or (expected is not None and count < expected):
+        expected_text = "unknown" if expected is None else str(expected)
+        errs.append(
+            f"{count_key}={count} failed={failed} expected={expected_text}; coverage is incomplete for {flag}={floor}"
+        )
+    if float(mean) + 1e-12 < float(floor):
+        errs.append(f"{mean_key}={float(mean):.6f} < {flag}={floor}")
+    return errs
+
+
+def _seed_tts_sim_expected_count(result: dict[str, Any]) -> int | None:
+    """SIM runs only on WER-scored rows that have a reference wav."""
+    content = result.get("seed_tts_content_evaluated")
+    if content is None:
+        return None
+    expected = int(content or 0) - int(result.get("seed_tts_sim_skipped_no_ref", 0) or 0)
+    return max(expected, 0)
+
+
+def _seed_tts_utmos_expected_count(result: dict[str, Any]) -> int | None:
+    """UTMOS runs on every captured row with non-empty audio, independent of ASR."""
+    turn_count = result.get("seed_tts_turn_count")
+    if turn_count is None:
+        content = result.get("seed_tts_content_evaluated")
+        return None if content is None else int(content or 0)
+    expected = int(turn_count or 0)
+    expected -= int(result.get("seed_tts_request_failed", 0) or 0)
+    expected -= int(result.get("seed_tts_no_pcm", 0) or 0)
+    expected -= int(result.get("seed_tts_empty_audio", 0) or 0)
+    return max(expected, 0)
+
+
+def seed_tts_eval_env(ns: argparse.Namespace) -> dict[str, str]:
+    """Env for the Seed-TTS accuracy subprocess.
+
+    WER is always on for this path. SIM and UTMOS turn on when their floor is
+    set and the parent process has not already chosen an explicit value.
+    """
+    env: dict[str, str] = {"SEED_TTS_WER_EVAL": "1"}
+    if ns.seed_tts_eval_device:
+        env["SEED_TTS_EVAL_DEVICE"] = ns.seed_tts_eval_device
+    if ns.min_seed_tts_mean_sim is not None and not os.environ.get("SEED_TTS_SIM_EVAL", "").strip():
+        env["SEED_TTS_SIM_EVAL"] = "1"
+    if ns.min_seed_tts_mean_utmos is not None and not os.environ.get("SEED_TTS_UTMOS_EVAL", "").strip():
+        env["SEED_TTS_UTMOS_EVAL"] = "1"
+    return env
 
 
 def sync_dataset_env_from_ns(ns: argparse.Namespace) -> None:
@@ -442,9 +537,7 @@ def run_seed_tts(ns: argparse.Namespace, vllm: str) -> Path:
         argv.append("--seed-tts-wer-save-items")
     if ns.seed_tts_file_ref_audio:
         argv.append("--seed-tts-file-ref-audio")
-    extra_env: dict[str, str] = {"SEED_TTS_WER_EVAL": "1"}
-    if ns.seed_tts_eval_device:
-        extra_env["SEED_TTS_EVAL_DEVICE"] = ns.seed_tts_eval_device
+    extra_env = seed_tts_eval_env(ns)
     print("\n$", vllm, *argv, "\n", flush=True)
     _omni_acc_bench_core().run_vllm_bench_subprocess(vllm, argv, extra_env=extra_env)
     out = Path(ns.result_dir) / result_filename
@@ -695,13 +788,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--min-seed-tts-mean-sim",
         type=float,
         default=None,
-        help="If set, fail when seed_tts_sim_mean is strictly below this value.",
+        help="If set, fail when seed_tts_sim_mean is missing or strictly below this value.",
     )
     p.add_argument(
         "--min-seed-tts-mean-utmos",
         type=float,
         default=None,
-        help="If set, fail when seed_tts_utmos_mean is strictly below this value.",
+        help="If set, fail when seed_tts_utmos_mean is missing or strictly below this value.",
     )
     return p
 
