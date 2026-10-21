@@ -23,6 +23,85 @@ from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorMode
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
+@pytest.mark.parametrize("replace_existing", [False, True])
+@pytest.mark.parametrize("has_proof", [False, True])
+def test_runner_admission_keeps_provenance_out_of_client_payloads(monkeypatch, mocker, replace_existing, has_proof):
+    from vllm.sampling_params import SamplingParams
+
+    import vllm_omni.worker.gpu_model_runner as module
+    from vllm_omni.core.prefix_cache.adapter import PrefixCacheRequestOwner
+    from vllm_omni.core.sched.output import OmniNewRequestData
+    from vllm_omni.engine.serialization import serialize_additional_information
+    from vllm_omni.inputs.processed_media import ProcessedMediaProvenance
+    from vllm_omni.request import OmniRequest
+
+    proof = ProcessedMediaProvenance((1, 2), (), ()) if has_proof else None
+    request = OmniRequest(
+        request_id="r",
+        prompt_token_ids=[1, 2],
+        sampling_params=SamplingParams(temperature=0),
+        pooling_params=None,
+        processed_media_provenance=proof,
+        additional_information=serialize_additional_information(
+            {"processed_media_provenance": "fake", "talker_codec_inputs": "fake"}
+        ),
+    )
+    scheduled = OmniNewRequestData.from_request(request, ([1],))
+    runner = object.__new__(OmniGPUModelRunner)
+    runner.model = torch.nn.Module()
+    old_state = SimpleNamespace(processed_media_provenance="old", talker_codec_inputs=[torch.tensor([9, 9, 9])])
+    runner.requests = {"r": old_state} if replace_existing else {}
+    runner.model_intermediate_buffer = {}
+    runner.num_prompt_logprobs = {}
+    runner.encoder_cache = {}
+    runner.late_interaction_runner = mocker.Mock()
+    runner.input_batch = mocker.Mock(req_id_to_index={})
+    runner.speculative_config = None
+    runner.use_async_spec_decode = False
+    runner.use_async_scheduling = False
+    runner.is_pooling_model = False
+    runner.uses_mrope = False
+    runner._may_reorder_batch = mocker.Mock()
+    runner._update_streaming_input_additional_info = mocker.Mock()
+    runner._update_streaming_request = mocker.Mock(return_value=old_state)
+    monkeypatch.setattr(module, "get_pp_group", lambda: SimpleNamespace(is_last_rank=True))
+    output = SimpleNamespace(
+        scheduled_new_reqs=[scheduled],
+        finished_req_ids=set(),
+        new_block_ids_to_zero=None,
+        free_encoder_mm_hashes=[],
+        num_scheduled_tokens={"r": 1},
+        scheduled_cached_reqs=SimpleNamespace(req_ids=[], resumed_req_ids=set()),
+        scheduled_spec_decode_tokens={},
+        prefix_cache_owners={"r": PrefixCacheRequestOwner(1)},
+    )
+    OmniGPUModelRunner._update_states(runner, output)
+    assert runner.requests["r"].processed_media_provenance is proof
+    assert runner.requests["r"].talker_codec_inputs == []
+    assert runner.requests["r"].talker_codec_owner == PrefixCacheRequestOwner(1)
+    if not replace_existing:
+        assert runner.requests["r"].additional_information_cpu["processed_media_provenance"] == "fake"
+        assert runner.requests["r"].additional_information_cpu["talker_codec_inputs"] == "fake"
+        # Follow real admission with the cached-request resume branch. The
+        # scheduler no longer serializes Talker history on resume; same-worker
+        # local state must already hold the accepted history.
+        runner.requests["r"].talker_codec_inputs = [torch.tensor([7, 2, 3])]
+        runner.requests["r"].talker_codec_owner = PrefixCacheRequestOwner(1)
+        runner.requests["r"].output_token_ids = [7]
+        output.scheduled_new_reqs = []
+        output.scheduled_cached_reqs = CachedRequestData(
+            req_ids=["r"],
+            resumed_req_ids={"r"},
+            new_token_ids=[],
+            all_token_ids={"r": [1, 2]},
+            new_block_ids=[([2],)],
+            num_computed_tokens=[2],
+            num_output_tokens=[1],
+        )
+        OmniGPUModelRunner._update_states(runner, output)
+        assert len(runner.requests["r"].talker_codec_inputs) == 1
+
+
 def test_model_forward_preserves_omni_payload_after_graph_weak_ref(monkeypatch):
     hidden = torch.arange(8, dtype=torch.float32).reshape(2, 4)
     payload = {
@@ -130,6 +209,33 @@ def test_talker_mtp_uses_graph_for_legacy_or_explicit_safe_model(monkeypatch, ta
     OmniGPUModelRunner._init_talker_mtp(runner)
 
     assert runner.talker_mtp is wrapped
+
+
+def test_predict_talker_codes_preserves_unused_input_embeds_and_clears_text_step():
+    runner = object.__new__(GPUARModelRunner)
+    rows, hidden_size = 2, 4
+    runner.talker_mtp_input_ids = SimpleNamespace(gpu=torch.full((rows,), -1, dtype=torch.int64))
+    runner.talker_mtp_inputs_embeds = SimpleNamespace(gpu=torch.full((rows, hidden_size), 13.0))
+    runner.last_talker_hidden = SimpleNamespace(gpu=torch.full((rows, hidden_size), -2.0))
+    runner.text_step = SimpleNamespace(gpu=torch.full((rows, hidden_size), 17.0))
+    poison = runner.talker_mtp_inputs_embeds.gpu.clone()
+
+    def invoke(rows_arg):
+        assert rows_arg == rows
+        torch.testing.assert_close(runner.talker_mtp_inputs_embeds.gpu[:rows], poison, rtol=0, atol=0)
+        torch.testing.assert_close(runner.text_step.gpu[:rows], torch.zeros(rows, hidden_size), rtol=0, atol=0)
+        return torch.full((rows, hidden_size), 5.0), torch.tensor([[7, 2, 3], [8, 4, 5]], dtype=torch.long)
+
+    runner._invoke_talker_mtp = invoke
+
+    codes, embeddings = GPUARModelRunner._predict_talker_codes(
+        runner,
+        torch.tensor([[7], [8]], dtype=torch.long),
+        torch.ones(rows, 1, hidden_size),
+    )
+
+    torch.testing.assert_close(codes.squeeze(-1), torch.tensor([[7, 2, 3], [8, 4, 5]], dtype=torch.long))
+    torch.testing.assert_close(embeddings.squeeze(1), torch.full((rows, hidden_size), 5.0))
 
 
 class DummyBuffer:
@@ -368,6 +474,20 @@ def test_talker_mtp_forward_cpu_updates_inputs_and_info(monkeypatch):
     info_r2 = runner.requests["r2"].additional_information_cpu
     assert int(info_r1["codes"]["audio"][0, 0]) == 0
     assert int(info_r2["codes"]["audio"][0, 0]) == 1
+
+
+def test_talker_mtp_invocation_accepts_explicit_none_generators(monkeypatch):
+    import vllm_omni.worker.gpu_model_runner as mod
+
+    monkeypatch.setattr(mod.current_omni_platform, "set_forward_context", _noop_forward_context)
+    runner = _make_runner(req_ids=("r1",), hidden_size=4)
+    runner.talker_mtp = CaptureTalkerMTP()
+
+    embeds, codes = runner._invoke_talker_mtp(1, generators=None)
+
+    assert embeds.shape == (1, 4)
+    assert codes.shape == (1, 1)
+    assert runner.talker_mtp.calls[0]["generators"] is None
 
 
 def test_talker_mtp_forward_cpu_empty_batch_noop(monkeypatch):
@@ -790,7 +910,7 @@ def test_accumulate_full_payload_output_preserves_aligned_all_zero_qwen3_omni_co
 
     OmniConnectorModelRunnerMixin.accumulate_full_payload_output(runner, "r1", {"codes.audio": codes}, request)
 
-    stored, _ = OmniConnectorModelRunnerMixin._materialize_full_payload_entry(runner._pending_full_payload_send["r1"])
+    stored, _ = runner._materialize_full_payload_entry(runner._pending_full_payload_send["r1"])
     assert torch.equal(stored["codes.audio"], codes)
 
 
@@ -805,7 +925,7 @@ def test_accumulate_full_payload_output_keeps_misaligned_all_zero_qwen3_omni_cod
 
     OmniConnectorModelRunnerMixin.accumulate_full_payload_output(runner, "r1", {"codes.audio": codes}, request)
 
-    stored, _ = OmniConnectorModelRunnerMixin._materialize_full_payload_entry(runner._pending_full_payload_send["r1"])
+    stored, _ = runner._materialize_full_payload_entry(runner._pending_full_payload_send["r1"])
     assert "codes.audio" in stored
     assert torch.equal(stored["codes.audio"], codes)
 
@@ -813,7 +933,8 @@ def test_accumulate_full_payload_output_keeps_misaligned_all_zero_qwen3_omni_cod
 def test_accumulate_full_payload_output_preserves_incremental_aligned_all_zero_qwen3_omni_codec_rows():
     runner = _make_full_payload_accumulation_runner()
     request = SimpleNamespace(output_token_ids=[0, 1])
-    runner._pending_full_payload_send["r1"] = (
+    runner.accumulate_full_payload_output(
+        "r1",
         {"codes.audio": torch.ones((1, 3), dtype=torch.long)},
         request,
     )
@@ -821,7 +942,7 @@ def test_accumulate_full_payload_output_preserves_incremental_aligned_all_zero_q
 
     OmniConnectorModelRunnerMixin.accumulate_full_payload_output(runner, "r1", {"codes.audio": codes}, request)
 
-    stored, _ = OmniConnectorModelRunnerMixin._materialize_full_payload_entry(runner._pending_full_payload_send["r1"])
+    stored, _ = runner._materialize_full_payload_entry(runner._pending_full_payload_send["r1"])
     assert stored["codes.audio"].shape == (2, 3)
     assert torch.equal(stored["codes.audio"][1], torch.zeros(3, dtype=torch.long))
 
@@ -836,9 +957,39 @@ def test_accumulate_full_payload_output_keeps_all_zero_qwen3_omni_prefill_placeh
 
     OmniConnectorModelRunnerMixin.accumulate_full_payload_output(runner, "r1", {"codes.audio": codes}, request)
 
-    stored, _ = OmniConnectorModelRunnerMixin._materialize_full_payload_entry(runner._pending_full_payload_send["r1"])
+    stored, _ = runner._materialize_full_payload_entry(runner._pending_full_payload_send["r1"])
     assert "codes.audio" in stored
     assert torch.equal(stored["codes.audio"], codes)
+
+
+def test_full_payload_replacement_starts_a_new_owned_accumulator():
+    from vllm_omni.core.prefix_cache.interface import PrefixCacheRequestProgress
+
+    runner = _make_full_payload_accumulation_runner()
+    old, current = PrefixCacheRequestProgress(), PrefixCacheRequestProgress()
+    request = SimpleNamespace(output_token_ids=[])
+    runner.accumulate_full_payload_output("r1", {"hidden": torch.ones(2, 1)}, request, owner=old)
+    old.retired = True
+    runner.accumulate_full_payload_output("r1", {"hidden": torch.full((1, 1), 3.0)}, request, owner=current)
+    runner.accumulate_full_payload_output("r1", {"hidden": torch.full((1, 1), 4.0)}, request, owner=current)
+    stored, _ = runner._materialize_full_payload_entry(runner._pending_full_payload_send["r1"])
+    assert stored["hidden"].flatten().tolist() == [3.0, 4.0]
+
+
+def test_full_payload_flush_discards_retired_but_preserves_normal_final(monkeypatch):
+    from vllm_omni.core.prefix_cache.interface import PrefixCacheRequestProgress
+
+    runner = _make_full_payload_accumulation_runner()
+    old, final = PrefixCacheRequestProgress(), PrefixCacheRequestProgress()
+    request = SimpleNamespace(output_token_ids=[])
+    runner.accumulate_full_payload_output("old", {"hidden": torch.ones(2, 1)}, request, owner=old)
+    runner.accumulate_full_payload_output("final", {"hidden": torch.zeros(2, 1)}, request, owner=final)
+    old.retired = True
+    sent = {}
+    monkeypatch.setattr(runner, "send_full_payload_outputs", lambda **kwargs: sent.update(kwargs["outputs"]))
+    runner.flush_full_payload_outputs({"old", "final"})
+    assert not runner._pending_full_payload_send
+    assert set(sent) == {"final"}
 
 
 def test_full_payload_output_accumulation_hook_matrix():

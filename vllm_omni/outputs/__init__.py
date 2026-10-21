@@ -10,6 +10,7 @@ from PIL import Image
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.v1.outputs import ModelRunnerOutput
 
+from vllm_omni.core.prefix_cache.adapter import PrefixCacheRequestOwner
 from vllm_omni.inputs.data import OmniPromptType
 
 
@@ -38,6 +39,9 @@ class OmniConnectorOutput:
     kv_sent_req_ids: list[str] = field(default_factory=list)
     stage_recv_req_ids: set[str] = field(default_factory=set)
     has_pending_kv_work: bool = False
+    # Receiving-stage owners captured at registration, never producer IDs or
+    # values read from untrusted payload metadata.
+    input_owners: dict[str, PrefixCacheRequestOwner] = field(default_factory=dict)
 
 
 @dataclass
@@ -55,7 +59,7 @@ class OmniModelRunnerOutput(ModelRunnerOutput):
             to the orchestrator output processor.
     """
 
-    multimodal_outputs: list[dict[str, object]] | None = None
+    multimodal_outputs: list[dict[str, object] | None] | None = None
     inter_stage_outputs: list[dict[str, Any] | None] | None = None
     # IDs of requests whose KV cache has been extracted from GPU/NPU to CPU.
     # The Scheduler can safely free the block tables for these requests.
