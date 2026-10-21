@@ -13,7 +13,6 @@ from contextlib import contextmanager, nullcontext
 from dataclasses import fields, replace
 from itertools import groupby
 from pathlib import Path
-from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple
 
 import numpy as np
@@ -3352,7 +3351,7 @@ class MiniMaxH3Pipeline(
         # context, so the request's own schedule is resolved against the service default; in request mode
         # that is the schedule the runner bound.
         attention_schedule = require_request_attention_schedule_fits(
-            SimpleNamespace(sampling_params=sampling), self.od_config, num_steps
+            sampling, getattr(self.od_config, "diffusion_attention_schedule", None), num_steps
         )
         transformer = getattr(
             self, "transformers_ref" if task == "ref2va" and hasattr(self, "transformers_ref") else "transformer", None
@@ -3384,8 +3383,8 @@ class MiniMaxH3Pipeline(
             # Cache-DiT reuses transformer outputs across steps, so a cached residual can come from a step
             # that ran a different attention profile. Reject before its hooks are installed.
             raise InvalidAttentionScheduleError(
-                "attention_schedule cannot be combined with MiniMax H3 Cache-DiT (quality=high, or an omitted "
-                "quality on a server started with Cache-DiT); send quality=lossless or attention_schedule=[]"
+                "attention_schedule cannot be combined with MiniMax H3 Cache-DiT (quality=high); "
+                "send quality=lossless or attention_schedule=[]"
             )
         if attention_schedule and self._resolve_latent_refine(extra) is not None:
             # latent_refine runs a second denoise sequence over the tail of the sigma list. It publishes step

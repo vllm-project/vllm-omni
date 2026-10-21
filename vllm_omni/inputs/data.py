@@ -476,11 +476,11 @@ def absorb_attention_schedule_extra_args(params: OmniDiffusionSamplingParams, *,
     put on the typed field. Without it both values come from one caller, so a mismatch is rejected.
     A null value means the same as leaving the key out, so the typed field keeps its value.
     """
-    extra = getattr(params, "extra_args", None) or {}
+    extra = params.extra_args or {}
     if "attention_schedule" not in extra:
         return
     extra_schedule = parse_attention_schedule(extra["attention_schedule"])
-    schedule = getattr(params, "attention_schedule", None)
+    schedule = params.attention_schedule
     if extra_schedule is not None:
         if not override:
             current = parse_attention_schedule(schedule)

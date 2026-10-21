@@ -1748,8 +1748,8 @@ class DiffusionEngine:
                 guidance_scale=guidance_scale,
                 num_outputs_per_prompt=1,
                 extra_args={"cfg_text_scale": 1.0, "cfg_img_scale": 1.0},
-                # Startup requests use a fixed short step count; a service schedule
-                # sized for real requests would reject them, so keep the original path.
+                # Warm-up uses a fixed short step count, and a bounded service range
+                # sized for real requests would not fit it, so warm up the base attention.
                 attention_schedule=(),
             ),
         )
