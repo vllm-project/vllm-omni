@@ -145,7 +145,7 @@ def test_qkv_fusion_preserves_prefix_cache_and_sp_joint(monkeypatch, cache_dtype
         return q + 1, k + 7, v
 
     monkeypatch.setattr(transformer, "try_fused_qkv_norm_rope", fused)
-    cache = {}
+    cache: dict[str, dict[str, torch.Tensor]] = {}
     tables = (torch.ones(5, 64), torch.zeros(5, 64))
     with torch.inference_mode():
         for branch, offset in (("cond", 0.0), ("uncond", 1.0)):
