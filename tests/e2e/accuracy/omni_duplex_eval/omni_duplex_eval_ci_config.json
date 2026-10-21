@@ -88,12 +88,9 @@
       "270"
     ]
   },
-  "judge": {
-    "model": "Qwen/Qwen2.5-VL-7B-Instruct",
-    "base_url": "http://127.0.0.1:8001",
-    "base_url_env": "VLLM_DUPLEX_EVAL_JUDGE_URL",
-    "video_mode": "video_url",
-    "fps": 2,
-    "eval_workers": 4
+  "baseline": {
+    "min_rtd_mean_content_score": 1.8,
+    "min_rtd_mean_temporal_score": 1.4,
+    "min_pr_mean_all_success": 0.28
   }
 }

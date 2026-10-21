@@ -639,6 +639,7 @@ def test_encoder_task_validation_and_transformer_routing():
 )
 @pytest.mark.parametrize("load_text_encoder", [None, True, False])
 @pytest.mark.parametrize("trust_remote_code", [False, True])
+@pytest.mark.parametrize("custom_transformer", [False, True])
 def test_pipeline_loads_task_selected_components_with_encoder_ownership(
     monkeypatch,
     tmp_path,
@@ -650,6 +651,7 @@ def test_pipeline_loads_task_selected_components_with_encoder_ownership(
     expected_tasks,
     load_text_encoder,
     trust_remote_code,
+    custom_transformer,
 ):
     from vllm_omni.diffusion.data import (
         DiffusionParallelConfig,
@@ -688,6 +690,12 @@ def test_pipeline_loads_task_selected_components_with_encoder_ownership(
         def __init__(self, *args, **kwargs):
             super().__init__()
             created["dit"].append((args, kwargs))
+
+    class CustomDiT(FakeDiT):
+        pass
+
+    class CustomPipeline(pipeline_module.MiniMaxH3Pipeline):
+        _transformer_cls = CustomDiT
 
     def component_factory(name):
         def create(path, *args, **kwargs):
@@ -748,9 +756,14 @@ def test_pipeline_loads_task_selected_components_with_encoder_ownership(
     if load_text_encoder is not None:
         od_config.model_loaded["text_encoder"] = load_text_encoder
         od_config.model_loaded["vae_encoder"] = load_text_encoder
-    pipeline = pipeline_module.MiniMaxH3Pipeline(od_config=od_config)
+    pipeline_cls = CustomPipeline if custom_transformer else pipeline_module.MiniMaxH3Pipeline
+    pipeline = pipeline_cls(od_config=od_config)
     expect_encoder = load_text_encoder is not False
 
+    assert type(pipeline.transformer) is (CustomDiT if custom_transformer else FakeDiT)
+    if expected_dits == 2:
+        # A derived pipeline's primary DiT must not replace the separate Ref2VA model.
+        assert type(pipeline.transformers_ref) is FakeDiT
     assert pipeline.partition == expected_partition
     assert pipeline.supported_tasks == expected_tasks
     assert len(created["dit"]) == expected_dits

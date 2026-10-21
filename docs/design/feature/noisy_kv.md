@@ -44,12 +44,13 @@ chunk c → step s → cell (c,s,b)   # one tick / rank = one block
 History KV is matched on the **same** `b` only. With `K>1` local blocks, one
 `(c,s)` spans multiple ticks.
 
-Two orderings share the same topology:
+Three orderings; Latest-KV and Same-Step share the diagonal (vertical) topology:
 
 | Strategy | Advance | History KV |
 | --- | --- | --- |
 | **Self-Forcing** (`Ordering.SELF_FORCING`) | Finish one chunk before the next | Clean `(c', T, b)` only |
 | **Latest-KV** (`Ordering.LATEST_KV`) | Diagonal cell overlap | Newest finished `(c', s*, b)` with completion tick strictly earlier |
+| **Same-Step** (`Ordering.SAME_STEP`) | Same diagonal placement | Matching step `(c', s, b)` only; always local (no KV P2P) |
 
 `S = 1` is native layer PP. `S = T+1` places one weight replica per denoise
 step plus a clean stage. Activations still follow PP (`next_rank` after the
@@ -67,8 +68,8 @@ speedup SLA. DreamZero / LingBot paged-session defaults must not regress.
 | **Model / weight split** | Unchanged PP: ranks own contiguous layer groups (`G = ⌈B/K⌉`); `pipeline_parallel_size = S·G` |
 | **Schedule / KV** | Cell `(chunk, step, block)` — one transformer block per tick |
 
-`cell_schedule` (request `extra_args`) selects Self-Forcing or Latest-KV for one
-generation's `CellPlan`. It is not a session property.
+`cell_schedule` (request `extra_args`) selects Self-Forcing, Latest-KV, or
+Same-Step for one generation's `CellPlan`. It is not a session property.
 Optional session only keeps clean KV across generations
 ([Realtime AR-Diffusion sessions](realtime_ar_diffusion.md)).
 
@@ -123,15 +124,21 @@ Implemented in `experimental/ar_diffusion/cell_schedule.py`.
 Visibility for history of the same block `b`:
 
 ```text
+# Latest-KV / Self-Forcing (Self-Forcing exposes only clean by then)
 s* = max { s | P(c', s, b) < current_tick }
 src = (c', s*, b)
+
+# Same-Step: same step × block → same rank → local only
+src = (c', s_task, b)   # only if P(c', s_task, b) < current_tick
+# no KV transfers under Same-Step
 ```
 
 Invariants:
 
 - `S ∈ {1, T+1}`
 - No Latest-KV edge inside the same micro-batch / tick
-- Cross-rank KV ready before use
+- Cross-rank KV ready before use (Latest-KV / Self-Forcing when remote)
+- Same-Step history never needs KV P2P (co-located with the consumer)
 - Finite `H` + `last_use` bounds residency
 - Consumer of `b` never waits on producer's `b' ≠ b` (activation edges are separate)
 
@@ -175,7 +182,7 @@ remote source. Mitigations: post-on-produce, dedupe `(version, dst)`, larger `G`
 | `ar_diffusion_stage_config` | `stage_parallel_size` | `S` |
 | | `max_batch_size` | `R` |
 | | `max_history_chunks` | Cap for `H` |
-| Request `extra_args` | `cell_schedule` | `self_forcing` \| `latest_kv` (aliases: `serial`, `latest`, `interleaved`) |
+| Request `extra_args` | `cell_schedule` | `self_forcing` \| `latest_kv` \| `same_step` (no aliases; former `serial`/`latest`/`interleaved` removed) |
 | | `num_chunks`, `num_denoise_steps`, `kv_history_chunks` | `N`, `T`, `H` |
 
 Backend: `ARDiffusionEngine` + mp executor from deploy YAML. For `S > 1`,
@@ -188,7 +195,7 @@ DreamZero / LingBot YAMLs must not silently enter `run_cell_pipeline`.
 
 | Combination | Status |
 | --- | --- |
-| No session + Self-Forcing/Latest-KV | Supported (opt-in) |
+| No session + Self-Forcing/Latest-KV/Same-Step | Supported (opt-in) |
 | Session + legacy loop | Supported (unchanged) |
 | Session + Cell path | Designed; not required for #102 |
 
@@ -201,7 +208,7 @@ CPU: `tests/diffusion/ar_diffusion/test_cell_{schedule,executor}.py`,
 `test_noisy_kv*.py`, and model/config resolve tests under the same tree.
 
 GPU (record config): `S=1` Self-Forcing; `S=2` (`T=1`); `S=T+1` Self-Forcing
-vs Latest-KV (`benchmarks/` / recipe smoke).
+vs Latest-KV vs Same-Step (`benchmarks/` / recipe smoke).
 
 ## Open issues
 

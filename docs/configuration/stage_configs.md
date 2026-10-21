@@ -114,6 +114,7 @@ The new deploy schema lives under `vllm_omni/deploy/` and is paired with a froze
 | `data_parallel_size` | int \| null | optional | `null` | **Pipeline-wide.** DP degree for every stage. |
 | `pipeline_parallel_size` | int \| null | optional | `null` | **Pipeline-wide.** PP degree for every stage. |
 | `custom_voice_dir` | str \| null | optional | `null` | **Pipeline-wide.** Directory containing custom voice profiles for supported TTS models. |
+| `weight_transfer_config` | dict \| null | optional | `null` | **Pipeline-wide.** Weight transfer configuration for RL training. Enables dynamic model weight updates without engine restart. See [Weight Transfer](../user_guide/weight_transfer.md). |
 
 ### Duplex replica placement
 

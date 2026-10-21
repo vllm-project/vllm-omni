@@ -135,6 +135,12 @@ def _event_collector_from_realtime(source: RealtimeEventCollector) -> EventColle
     collector = EventCollector()
     for event, received_at_s in zip(source.events, source.event_received_at_s, strict=True):
         collector.add(event, received_at_s=received_at_s)
+    for record in source.client_appends:
+        sent_at_s = record.get("sent_at_s")
+        event_id = record.get("event_id")
+        if not isinstance(sent_at_s, int | float) or not isinstance(event_id, str):
+            continue
+        collector.note_client_append({"sent_at_s": float(sent_at_s), "event_id": event_id})
     return collector
 
 

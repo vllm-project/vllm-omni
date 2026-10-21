@@ -120,7 +120,7 @@ def test_the_duplex_capabilities_reject_unimplemented_turn_detection() -> None:
     # The duplex answer comes from engine.duplex.turn_detection, reached through
     # the capability object rather than imported by the codec.
     rejection = protocol.validate_session_payload(
-        {"turn_detection": {"type": "semantic_vad"}},
+        {"turn_detection": {"type": "foo_vad"}},
         capabilities=duplex_codec.DUPLEX_REALTIME_CAPABILITIES,
     )
 

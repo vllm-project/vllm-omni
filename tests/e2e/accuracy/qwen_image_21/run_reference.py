@@ -113,7 +113,10 @@ def generate(request: dict, output: Path, repeats: int) -> None:
         text = pipe.text_encoder.model.language_model.rotary_emb
         device = pipe.text_encoder.device
         with torch.device(device):
-            fresh_vision = type(vision)(vision.dim, vision.theta)
+            if hasattr(vision, "config"):
+                fresh_vision = type(vision)(vision.config)
+            else:
+                fresh_vision = type(vision)(vision.dim, vision.theta)
             fresh_text = type(text)(text.config, device=device)
         for target, source in ((vision, fresh_vision), (text, fresh_text)):
             for name, value in source.named_buffers():

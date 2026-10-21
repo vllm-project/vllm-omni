@@ -34,7 +34,6 @@ from vllm_omni.config.stage_config import (
     PipelineConfig,
 )
 from vllm_omni.diffusion.models.pi0_pipeline_config import PI0_PIPELINE
-from vllm_omni.diffusion.models.pi05_pipeline_config import PI05_PIPELINE
 from vllm_omni.model_executor.models.audex.pipeline import (
     AUDEX_S2S_PIPELINE,
     AUDEX_THINKER_ONLY_PIPELINE,
@@ -125,6 +124,7 @@ from vllm_omni.model_executor.models.step_audio2.pipeline import (
     STEP_AUDIO2_ASR_PIPELINE,
     STEP_AUDIO2_PIPELINE,
 )
+from vllm_omni.model_executor.models.taomate_h3.pipeline import TAOMATE_H3_PIPELINE
 from vllm_omni.model_executor.models.vibevoice.pipeline import VIBEVOICE_PIPELINE
 from vllm_omni.model_executor.models.voxcpm2.pipeline import VOXCPM2_PIPELINE
 from vllm_omni.model_executor.models.voxtral_tts.pipeline import VOXTRAL_TTS_PIPELINE
@@ -211,7 +211,6 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "omnivoice": OMNIVOICE_PIPELINE,
     "personaplex": PERSONAPLEX_PIPELINE,
     "pi0": PI0_PIPELINE,
-    "pi05": PI05_PIPELINE,
     "qwen2_5_omni": QWEN2_5_OMNI_PIPELINE,
     "qwen2_5_omni_thinker_only": QWEN2_5_OMNI_THINKER_ONLY_PIPELINE,
     "qwen3_omni_moe": resolve_qwen3_omni_pipeline,
@@ -220,6 +219,7 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "qwen3_tts_fused": QWEN3_TTS_FUSED_PIPELINE,
     "step_audio_2": STEP_AUDIO2_PIPELINE,
     "step_audio_2_asr": STEP_AUDIO2_ASR_PIPELINE,
+    "taomate_h3": TAOMATE_H3_PIPELINE,
     "vibevoice": VIBEVOICE_PIPELINE,
     "voxcpm2": VOXCPM2_PIPELINE,
     "voxtral_tts": VOXTRAL_TTS_PIPELINE,

@@ -63,7 +63,7 @@ out = omni.generate(
         extra_args={
             "num_chunks": 7,
             "num_denoise_steps": 3,
-            "cell_schedule": "self_forcing",  # or "latest_kv" (aliases: serial, latest, interleaved)
+            "cell_schedule": "self_forcing",  # or latest_kv / same_step (canonical names only; serial/latest/interleaved removed)
             "shift": 8.0,
             "reset": True,
         },
@@ -74,7 +74,9 @@ out = omni.generate(
 ## Notes
 
 - **Self-Forcing** (`Ordering.SELF_FORCING`) matches CausVid clean-history
-  semantics; **Latest-KV** is schedule-only and not how CausVid was trained.
+  semantics; **Latest-KV** and **Same-Step** (`same_step`)
+  share the diagonal placement but differ in which history KV step is read —
+  Same-Step stays local (no KV P2P). Neither matches how CausVid was trained.
 - Exact official DMD timestep table parity (`1000/757/522`) vs the shared
   FlowEuler grid is still converging; defaults use CausVid **shift=8** and
   **T=3** on the Euler cell path.

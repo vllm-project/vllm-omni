@@ -30,7 +30,7 @@ Example layout:
 ```text
 recipes/
   lerobot/
-    Pi05.md
+    Pi0.md
   Qwen/
     Qwen3-Omni-H100.md
     Qwen3-TTS-A100.md
@@ -59,7 +59,7 @@ recipes/
 | [`inclusionAI/Ming-flash-omni-2.0.md`](./inclusionAI/Ming-flash-omni-2.0.md) | Online serving for multimodal chat + standalone TTS | 4x H100 / 1x H100 80GB |
 | [`inclusionAI/Ming-omni-tts.md`](./inclusionAI/Ming-omni-tts.md) | Offline + online dense Ming TTS/audio generation | 1x H100 80GB / 1x AMD MI300X (ROCm 7.2) |
 | [`k2-fsa/OmniVoice.md`](./k2-fsa/OmniVoice.md) | Offline and online multilingual text-to-speech | 1x AMD MI300X (ROCm 7.2) |
-| [`lerobot/Pi05.md`](./lerobot/Pi05.md) | Online OpenPI serving for the π0.5 vision-language-action policy | 1x H100 80GB |
+| [`lerobot/Pi0.md`](./lerobot/Pi0.md) | Online OpenPI serving for the π0 vision-language-action policy | 1x H200 141GB |
 | [`IndexTeam/IndexTTS-2.md`](./IndexTeam/IndexTTS-2.md) | Online serving for voice-cloned TTS with optional emotion control | 1x L4 24GB or larger CUDA GPU |
 | [`IndexTeam/IndexTTS-2_5.md`](./IndexTeam/IndexTTS-2_5.md) | Online + offline multilingual voice-cloned TTS with native speed and emotion control | 1x NVIDIA H20 96GB |
 | [`Microsoft/VibeVoice-1.5B-H100.md`](./Microsoft/VibeVoice-1.5B-H100.md) | Offline single-speaker TTS with optional voice clone (eager) | 1x H100 80GB |
@@ -80,6 +80,7 @@ recipes/
 | [`Robbyant/LingBot-Video.md`](./Robbyant/LingBot-Video.md) | Native dense and MoE text-to-video serving | Dense: 1x L20X; MoE: 1x L20X (~67.7 GiB peak) |
 | [`SandAI/MAGI-2-preview-L20X.md`](./SandAI/MAGI-2-preview-L20X.md) | Native Preview-stage text/image-to-video-and-audio generation | 1x/4x NVIDIA L20X 140 GiB qualified |
 | [`Robbyant/LingBot-World-2.0.md`](./Robbyant/LingBot-World-2.0.md) | Offline and experimental realtime interactive world generation | 1x H200/B200 or 2x B200 for TP=2 |
+| [`TaoLiveAIGC/TaoMate-H3.md`](./TaoLiveAIGC/TaoMate-H3.md) | Realtime streaming presenter: MiniMax-H3 + TaoMate LoRA on the AR-Diffusion runtime | 2x H200-class FP8 (USP2) or 4x BF16 (USP4) |
 | [`cosmos3/Cosmos3-Nano.md`](./cosmos3/Cosmos3-Nano.md) | Text-to-image, text-to-video, image-to-video, video-to-video generation, text to video with sound, action policy | 1x H200 141GB / B300 |
 | [`cosmos3/Cosmos3-Edge.md`](./cosmos3/Cosmos3-Edge.md) | T2I / T2V / I2V + action (Physical-AI) generation on the Nemotron-based Edge transformer | 1x GPU (~8 GiB) |
 | [`cosmos3/Cosmos3-Super.md`](./cosmos3/Cosmos3-Super.md) | 64B T2I / T2V / I2V / V2V generation (+ optional audio) / Action policy | 8x H200/H100/A100 / 2x H200 / B300 |

@@ -167,6 +167,57 @@ portable guarantees.
 Mask-heavy DiTs favored `CUDNN_ATTN`; lighter-mask or TP-saturated workloads
 were close enough that users should benchmark their exact model and shape.
 
+## Unified attention quantization (`diffusion_kv_cache_dtype`)
+
+`diffusion_kv_cache_dtype` is a historically named Omni option. It requests
+quantized attention **compute** for every eligible DiT attention layer; it does
+not select the dtype of a persistent KV cache. It is independent of the
+upstream vLLM `--kv-cache-dtype` option, which belongs to autoregressive KV
+storage:
+
+```bash
+vllm-omni serve <model> --diffusion-kv-cache-dtype fp8
+```
+
+- Leaving the option unset or using `auto` keeps native dtype execution.
+- `fp8` quantizes Q/K/V for the current attention call and dequantizes inside
+  the attention kernel. Persistent model-owned KV storage is unaffected.
+- CUDA FP8 attention uses FA3. Before quantization, vLLM's normalized Hadamard
+  transform rotates Q/K within each head to reduce outlier-induced rounding
+  error; V is unchanged. Non-power-of-two head dimensions use equal
+  power-of-two blocks within the head.
+- Ascend NPU passes BF16/FP16 Q/K/V and the selected precision to MindIE-SD's
+  `quant_attention`, which performs the vendor-side quantization and attention.
+- `diffusion_kv_cache_skip_steps` / `diffusion_kv_cache_skip_layers` exempt
+  individual denoise steps or transformer blocks (format: `"0-9,20,25-30"`).
+
+Backend support for `fp8`:
+
+| Backend | Platform | Notes |
+| --- | --- | --- |
+| `FLASH_ATTN` | CUDA (SM90 Hopper) | FA3 FP8 |
+| `FLASH_ATTN` | Ascend NPU | MindIE-SD `quant_attention` with Hadamard Q/K rotation; also `mxfp8`, `mxfp4` |
+| `RAINFUSION_ATTN` | Ascend NPU | Block-sparse fp8/mxfp4 |
+
+Backends not listed here reject the knob at startup with the list of compatible
+options. Quantization is lossy; validate image/video quality against the
+unquantized baseline before enabling it in production.
+
+CUDA FP8 attention returns the input dtype (BF16 or FP16), casting FA3's BF16
+output when needed. This path currently accepts dense inputs without caller
+masks, packed-sequence metadata, or piecewise spans; incompatible requests fail explicitly.
+FP8 attention requires FA3 on SM90 and a head dimension divisible by 16 and at
+most 256; unsupported FA implementations are rejected.
+
+Dynamic quantization adds Q/K rotation, reductions, FP8 conversion, and kernel launches.
+FP8 attention can therefore be slower than BF16, especially for short
+sequences. This option does not promise lower peak memory use or faster
+end-to-end generation.
+
+An explicit `diffusion_attention_config.*.quant` spec conflicts with the knob
+and is rejected at config load; drop one of them. A pure
+`flashinfer_backend` variant pin without dtypes is allowed to compose.
+
 ## Compatibility anchors
 
 The following headings preserve links to sections that moved into dedicated
