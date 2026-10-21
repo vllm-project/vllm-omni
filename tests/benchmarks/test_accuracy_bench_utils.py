@@ -53,7 +53,7 @@ from tests.e2e.accuracy.qwen3_omni.qwen3_omni_acc_bench_core import (
     seed_tts_bench_argv,
     videomme_bench_argv,
 )
-from tests.e2e.accuracy.qwen3_omni.run_qwen_omni_acc_benchmark import (
+from tests.e2e.accuracy.helpers import (
     _acc_result_filename,
     _write_accuracy_result_metadata,
     sync_dataset_env_from_ns,
@@ -108,6 +108,7 @@ def test_write_accuracy_result_metadata(tmp_path: Path, monkeypatch: pytest.Monk
     import tests.helpers.hardware as hardware
 
     monkeypatch.setattr(hardware, "get_runtime_resource_label", lambda: "H100")
+    monkeypatch.setenv("BUILDKITE_BRANCH", "main")
     path = tmp_path / "result_acc_MiniCPM-o-4_5_daily_omni_20261014_164800.json"
     path.write_text(
         json.dumps({"model_id": "openbmb/MiniCPM-o-4_5", "daily_omni_accuracy": 0.8}),
@@ -128,6 +129,7 @@ def test_write_accuracy_result_metadata(tmp_path: Path, monkeypatch: pytest.Monk
     assert saved["model_id"] == "openbmb/MiniCPM-o-4_5"
     assert saved["baseline"] == {"min_daily_omni_accuracy": 0.77}
     assert saved["Hardware"] == "H100"
+    assert saved["branch"] == "main"
 
 
 def test_write_accuracy_result_metadata_hardware_failure_keeps_baseline(
@@ -139,6 +141,7 @@ def test_write_accuracy_result_metadata_hardware_failure_keeps_baseline(
         raise RuntimeError("device_count unavailable")
 
     monkeypatch.setattr(hardware, "get_runtime_resource_label", _boom)
+    monkeypatch.delenv("BUILDKITE_BRANCH", raising=False)
     path = tmp_path / "result_acc_Qwen3-Omni-30B-A3B-Instruct_daily_omni_20261015_110000.json"
     path.write_text(
         json.dumps({"model_id": "Qwen/Qwen3-Omni-30B-A3B-Instruct", "daily_omni_accuracy": 0.8}),
@@ -160,6 +163,7 @@ def test_write_accuracy_result_metadata_hardware_failure_keeps_baseline(
     assert saved["model_id"] == "Qwen/Qwen3-Omni-30B-A3B-Instruct"
     assert saved["baseline"] == {"min_daily_omni_accuracy": 0.69}
     assert saved["Hardware"] == ""
+    assert saved["branch"] == ""
     assert "Hardware" in caplog.text
 
 

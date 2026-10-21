@@ -24,11 +24,8 @@ from pathlib import Path
 
 import pytest
 
-from tests.e2e.accuracy.qwen3_omni import run_qwen_omni_acc_benchmark as _acc_bench
-from tests.e2e.accuracy.qwen3_omni.qwen3_omni_acc_bench_core import (
-    build_acc_benchmark_cli_argv,
-    find_vllm_cli,
-)
+from tests.e2e.accuracy import helpers as _acc_bench
+from tests.e2e.accuracy.helpers import build_acc_benchmark_cli_argv, find_vllm_cli
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniServerParams
 from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
