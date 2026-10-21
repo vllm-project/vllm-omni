@@ -18,6 +18,7 @@ import torch
 from vllm_omni.diffusion.attention.backends.abstract import VideoTokenLayout, VideoTokenSpan
 from vllm_omni.diffusion.cancellation import check_request_cancellation
 from vllm_omni.diffusion.forward_context import (
+    set_forward_context_denoise_sigma,
     set_forward_context_denoise_step_idx,
     set_forward_context_denoise_timestep,
     set_forward_context_denoise_total_steps,
@@ -50,6 +51,8 @@ def minimax_h3_publish_denoise_progress(
     and the total step count enables the ``end_step`` tail fallback.
     """
     set_forward_context_denoise_step_idx(step)
+    # H3's shifted rectified-flow video sigma is already normalized noise.
+    set_forward_context_denoise_sigma(sigma_video)
     set_forward_context_denoise_timestep(sigma_video)
     set_forward_context_denoise_total_steps(total_steps)
 
@@ -368,6 +371,14 @@ def minimax_h3_denoise_loop(
 
     video_solver = create_h3_sample_solver(sampler, sigmas_video)
     audio_solver = create_h3_sample_solver(sampler, sigmas_audio)
+    # Each call denoises one sequence and publishes its steps from 0 with its
+    # own num_steps. forward() runs one call per output seed and per
+    # continuation window, all with the main num_steps, and with latent_refine
+    # one more call per output seed over the tail of the sigma list, which has
+    # its own num_steps. An attention schedule selects profiles on each call
+    # from step 0. The pipeline checks the schedule against the main num_steps
+    # before the first call and rejects a schedule together with latent_refine,
+    # so a request with a schedule runs only calls with the main num_steps.
     num_steps = len(sigmas_video) - 1
     for step in range(num_steps):
         check_request_cancellation()

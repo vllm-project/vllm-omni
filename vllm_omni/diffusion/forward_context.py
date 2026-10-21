@@ -50,7 +50,15 @@ class ForwardContext:
     split_text_embed_in_sp: bool = False
     denoise_step_idx: int | None = None
     denoise_timestep: float | None = None
+    # Independent of model timesteps: normalized scheduler noise in [0, 1].
+    denoise_sigma: float | None = None
     total_denoise_steps: int | None = None
+    # Bound request schedule. None means unbound. () disables. A non-empty tuple
+    # selects prepared profiles only while attention_schedule_denoise_active is set.
+    attention_schedule: tuple[Any, ...] | None = None
+    attention_schedule_denoise_active: bool = False
+    attention_sigma_schedule: tuple[Any, ...] | None = None
+    attention_sigma_schedule_active: bool = False
     # Per-request reference latent for img2img DiT models (e.g. Ming)
     ref_latent: torch.Tensor | None = None
     # Per-request projected direct-VLM condition (e.g., Ming-Image). For now for bsz 1.
@@ -293,15 +301,110 @@ def override_paged_kv_adapter(adapter: Any | None):
         _forward_context.paged_kv_adapter = previous
 
 
+@contextmanager
+def bind_attention_schedule(schedule: tuple[Any, ...] | None, *, denoise: bool = False):
+    """Install one request schedule and restore the previous context on any exit."""
+    if _forward_context is None:
+        raise RuntimeError("bind_attention_schedule requires an active forward context")
+    previous_schedule = _forward_context.attention_schedule
+    previous_denoise = _forward_context.attention_schedule_denoise_active
+    _forward_context.attention_schedule = None if schedule is None else tuple(schedule)
+    _forward_context.attention_schedule_denoise_active = denoise
+    try:
+        yield
+    finally:
+        _forward_context.attention_schedule = previous_schedule
+        _forward_context.attention_schedule_denoise_active = previous_denoise
+
+
+@contextmanager
+def bind_attention_sigma_schedule(schedule: tuple[Any, ...] | None, *, denoise: bool = False):
+    """Install one sigma-window schedule and restore the previous context on any exit."""
+    if _forward_context is None:
+        raise RuntimeError("bind_attention_sigma_schedule requires an active forward context")
+    previous_schedule = _forward_context.attention_sigma_schedule
+    previous_active = _forward_context.attention_sigma_schedule_active
+    _forward_context.attention_sigma_schedule = None if schedule is None else tuple(schedule)
+    _forward_context.attention_sigma_schedule_active = denoise
+    try:
+        yield
+    finally:
+        _forward_context.attention_sigma_schedule = previous_schedule
+        _forward_context.attention_sigma_schedule_active = previous_active
+
+
 def set_forward_context_denoise_step_idx(step_idx: int | None) -> None:
     """Set the current diffusion denoise step on the active ForwardContext."""
     if _forward_context is not None:
         _forward_context.denoise_step_idx = step_idx
+        if step_idx is not None and getattr(_forward_context, "attention_schedule", None):
+            _forward_context.attention_schedule_denoise_active = True
+        elif step_idx is None:
+            _forward_context.attention_schedule_denoise_active = False
+        if step_idx is not None and getattr(_forward_context, "attention_sigma_schedule", None):
+            _forward_context.attention_sigma_schedule_active = True
+        elif step_idx is None:
+            _forward_context.attention_sigma_schedule_active = False
         if step_idx is not None:
             paged_kv_runtime = getattr(_forward_context, "paged_kv_runtime", None)
             ensure_active = getattr(paged_kv_runtime, "ensure_active", None)
             if callable(ensure_active):
                 ensure_active(step_idx)
+
+
+def begin_scheduled_denoise(total_steps: int) -> int | None:
+    """Check the bound schedule against one actual denoise sequence; call before its first forward.
+
+    Returns ``total_steps`` when a non-empty schedule is bound and None otherwise. A publisher with
+    no other reason to publish a total passes the result as its published total, so a run without a
+    schedule publishes no total. Publishing one there would change backends that read it: RAINFUSION
+    with end_step set, for example, runs dense while the total is None. Raises
+    InvalidAttentionScheduleError when a range does not fit the sequence. Call it once per sequence
+    the pipeline runs (per output, window or clip when those restart at step 0).
+    """
+    ctx = _forward_context
+    schedule = getattr(ctx, "attention_schedule", None)
+    if not schedule and not getattr(ctx, "attention_sigma_schedule", None):
+        return None
+    from vllm_omni.diffusion.attention.schedule import require_attention_schedule_fits
+
+    require_attention_schedule_fits(schedule or (), total_steps)
+    return total_steps
+
+
+@contextmanager
+def request_denoise_progress(
+    step_idx: int, total_steps: int, timestep: float | None = None, *, sigma: float | None = None
+):
+    """Publish one request's progress around its own forward and restore the previous values on any exit.
+
+    For scheduled requests that share a denoise_step call but not their progress: each request
+    is evaluated separately under its own step, total and timestep. Publishing goes through
+    set_forward_context_denoise_step_idx, like a per-batch publish. Restoring assigns the saved fields
+    directly, so a restore never calls the paged runtime's ensure_active.
+    """
+    if _forward_context is None:
+        raise RuntimeError("request_denoise_progress requires an active forward context")
+    ctx = _forward_context
+    previous_step = ctx.denoise_step_idx
+    previous_timestep = ctx.denoise_timestep
+    previous_sigma = ctx.denoise_sigma
+    previous_sigma_active = ctx.attention_sigma_schedule_active
+    previous_total = ctx.total_denoise_steps
+    previous_denoise = ctx.attention_schedule_denoise_active
+    try:
+        set_forward_context_denoise_step_idx(step_idx)
+        ctx.denoise_timestep = None if timestep is None else float(timestep)
+        set_forward_context_denoise_sigma(sigma)
+        ctx.total_denoise_steps = total_steps
+        yield
+    finally:
+        ctx.denoise_step_idx = previous_step
+        ctx.denoise_timestep = previous_timestep
+        ctx.denoise_sigma = previous_sigma
+        ctx.attention_sigma_schedule_active = previous_sigma_active
+        ctx.total_denoise_steps = previous_total
+        ctx.attention_schedule_denoise_active = previous_denoise
 
 
 def get_paged_kv_computed_tokens() -> tuple[int, ...]:
@@ -345,6 +448,17 @@ def paged_kv_prefill(sequence_id: int, num_tokens: int):
     )
 
 
+def set_forward_context_denoise_sigma(sigma: float | None) -> None:
+    """Publish normalized noise separately from legacy timestep-gated features."""
+    if _forward_context is None:
+        return
+    if sigma is not None:
+        from vllm_omni.diffusion.attention.schedule import normalized_sigma
+
+        sigma = normalized_sigma(sigma, 1.0)
+    _forward_context.denoise_sigma = sigma
+
+
 def set_forward_context_denoise_timestep(timestep: float | None) -> None:
     """Set the normalized (descending, 1 -> 0) denoise timestep.
 
@@ -374,18 +488,32 @@ class DenoiseProgressMixin:
         scheduler=None,
         normalized_timestep: float | None = None,
         total_steps: int | None = None,
+        normalized_sigma: float | None = None,
     ) -> None:
         set_forward_context_denoise_step_idx(step_idx)
         if _forward_context is not None:
             _forward_context.total_denoise_steps = total_steps
         if _forward_context is None:
             return
+        scheduler = scheduler if scheduler is not None else getattr(self, "scheduler", None)
+        # Never infer noise from a raw model timestep. Clear stale progress even
+        # when a scheduler cannot publish noise for this evaluation.
+        sigma = None
+        if step_idx is not None:
+            sigma = normalized_sigma
+            sigmas = getattr(scheduler, "sigmas", None)
+            if sigma is None and sigmas is not None and step_idx < len(sigmas):
+                from vllm_omni.diffusion.attention.schedule import normalized_sigma as normalize
+
+                sigma = normalize(float(sigmas[step_idx]), float(sigmas[0]))
+        set_forward_context_denoise_sigma(sigma)
         if normalized_timestep is not None:
             _forward_context.denoise_timestep = float(normalized_timestep)
             return
         if timestep is None:
+            if step_idx is None:
+                _forward_context.denoise_timestep = None
             return
-        scheduler = scheduler if scheduler is not None else getattr(self, "scheduler", None)
         ntt = getattr(getattr(scheduler, "config", None), "num_train_timesteps", None)
         _forward_context.denoise_timestep = float(timestep) / ntt if ntt else None
 
