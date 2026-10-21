@@ -100,6 +100,7 @@ class StepBatchSamplingParamsKey:
     # Same resolved request schedule and source as the request-batch key.
     attention_schedule: AttentionSchedule = ()
     attention_schedule_explicit: bool = False
+    attention_sigma_schedule: tuple[Any, ...] | None = None
 
 
 @dataclass(frozen=True, eq=True)
@@ -172,6 +173,7 @@ class RequestBatchSamplingParamsKey:
     # Whether the request sent its schedule. An explicit schedule is checked against the step count and
     # an inherited default is not, so the two never share a batch even when their ranges are equal.
     attention_schedule_explicit: bool = False
+    attention_sigma_schedule: tuple[Any, ...] | None = None
 
 
 @dataclass

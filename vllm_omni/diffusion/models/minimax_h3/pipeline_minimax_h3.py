@@ -28,6 +28,7 @@ from vllm_omni.diffusion import envs
 from vllm_omni.diffusion.attention.schedule import (
     InvalidAttentionScheduleError,
     require_request_attention_schedule_fits,
+    resolve_request_attention_sigma_schedule,
 )
 from vllm_omni.diffusion.cache.cachedit import (
     CacheDiTBackend,
@@ -3374,9 +3375,9 @@ class MiniMaxH3Pipeline(
         # execution modes reach this point before any denoise forward. Step mode runs it outside the forward
         # context, so the request's own schedule is resolved against the service default; in request mode
         # that is the schedule the runner bound.
-        attention_schedule = require_request_attention_schedule_fits(
-            sampling, getattr(self.od_config, "diffusion_attention_schedule", None), num_steps
-        )
+        service = getattr(self.od_config, "diffusion_attention_schedule", None)
+        attention_schedule = require_request_attention_schedule_fits(sampling, service, num_steps)
+        sigma_schedule = resolve_request_attention_sigma_schedule(sampling, service)
         transformer = getattr(
             self, "transformers_ref" if task == "ref2va" and hasattr(self, "transformers_ref") else "transformer", None
         )
@@ -3403,12 +3404,13 @@ class MiniMaxH3Pipeline(
         )
         if continuation is not None and quality_plan.cache_dit is not None:
             raise OmniClientError("MiniMax H3 continuation requires uncached denoising; set quality=lossless")
-        if attention_schedule and quality_plan.cache_dit is not None:
+        if (attention_schedule or sigma_schedule) and quality_plan.cache_dit is not None:
             # Cache-DiT reuses transformer outputs across steps, so a cached residual can come from a step
             # that ran a different attention profile. Reject before its hooks are installed.
+            field = "attention_sigma_schedule" if sigma_schedule else "attention_schedule"
             raise InvalidAttentionScheduleError(
-                "attention_schedule cannot be combined with MiniMax H3 Cache-DiT (quality=high); "
-                "send quality=lossless or attention_schedule=[]"
+                f"{field} cannot be combined with MiniMax H3 Cache-DiT (quality=high); "
+                f"send quality=lossless or {field}=[]"
             )
         if attention_schedule and self._resolve_latent_refine(extra) is not None:
             # latent_refine runs a second denoise sequence over the tail of the sigma list. It publishes step
