@@ -93,6 +93,7 @@ def test_z_image_attention_fused_matches_eager(_dist_env, compiled, mocker):
     (``fullgraph=True``): the fused custom op is traced into the graph and its
     output stays within BF16 rounding of the compiled chain, whose RMSNorm is
     Inductor's and reduces in a different order."""
+    from vllm_omni.diffusion.attention.backends.sdpa import SDPABackend
     from vllm_omni.diffusion.config import set_current_diffusion_config
     from vllm_omni.diffusion.data import AttentionConfig, OmniDiffusionConfig
     from vllm_omni.diffusion.models.z_image import z_image_transformer as z_image
@@ -106,7 +107,7 @@ def test_z_image_attention_fused_matches_eager(_dist_env, compiled, mocker):
     with set_current_diffusion_config(od_config), torch.device("cuda"):
         attn = z_image.ZImageAttention(dim=_DIM, num_heads=_HEADS, num_kv_heads=_HEADS, eps=1e-6)
     if compiled:
-        assert attn.attn.attn_backend.get_name() == "TORCH_SDPA"
+        assert attn.attn.attn_backend is SDPABackend
     attn = attn.to(torch.bfloat16).eval()
     with torch.no_grad():
         for p in attn.parameters():
