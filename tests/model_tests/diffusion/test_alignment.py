@@ -111,6 +111,7 @@ EXCLUDED_MODELS = [
     "StableDiffusionXLPipeline",
     "Gr00tN1d7Pipeline",
     "Pi0Pipeline",
+    "Pi05Pipeline",
     "SanaWmPipeline",
     # Audio pipeline conditioned by a separate Qwen2.5-Omni encoder stage;
     # covered by tests/diffusion/models/auk (CPU pipeline tests, parity) and

@@ -33,6 +33,7 @@ from __future__ import annotations
 import itertools
 import re
 from collections.abc import Iterable
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -1098,6 +1099,8 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
     stub that never runs the forward.
     """
 
+    quant_config: QuantizationConfig | None = None
+
     def __init__(
         self,
         model_path: str,
@@ -1111,7 +1114,6 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
         self.device_target = device
         self.encoder_group = encoder_group
         self.quant_config = quant_config
-        _validate_encoder_quant_config(quant_config)
         self.image_token_id = 151655
         self.video_token_id = 151656
         self._tp_size = 1
@@ -1124,6 +1126,17 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
         self.image_token_id = int(config.image_token_id)
         self.video_token_id = int(config.video_token_id)
         self._tp_size = int(encoder_group.world_size) if encoder_group is not None else 1
+        from .checkpoint_quantization import FastH3NVFP4Config
+
+        if getattr(config, "quantization_config", {}).get("quant_method") == "nvfp4":
+            from .vae_nvfp4 import require_nvfp4_linear
+
+            require_nvfp4_linear(device)
+            quant_config = FastH3NVFP4Config.from_encoder(
+                Path(model_path), rank=encoder_group.rank_in_group if encoder_group is not None else 0
+            )
+            self.quant_config = quant_config
+        _validate_encoder_quant_config(quant_config)
         dtype = torch.bfloat16
         self.vision = MiniMaxH3Qwen3VLVisionModel(config.vision_config)
         self.vision.to(dtype=dtype)
@@ -1134,7 +1147,8 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
             dtype,
             quant_config=quant_config,
         )
-        self.text_model.to(dtype=dtype)
+        if not isinstance(quant_config, FastH3NVFP4Config):
+            self.text_model.to(dtype=dtype)
         logger.info(
             "MiniMax H3 Qwen3-VL encoder: %d retained decoder layers, text_encoder_tp_size=%d, vision replicated",
             MINIMAX_H3_QWEN3VL_SELECTED_LM_LAYER,
@@ -1190,6 +1204,9 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
         return None
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        from .checkpoint_quantization import FastH3NVFP4Config
+
+        serialized_map = self.quant_config.weight_map if isinstance(self.quant_config, FastH3NVFP4Config) else {}
         params = dict(self.named_parameters())
         loaded: set[str] = set()
         # Seeded from modules that own a multi-shard loader, so a fused weight
@@ -1197,10 +1214,16 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
         expected_fused_shards: dict[str, tuple[tuple[str, str | int], ...]] = {
             f"{module_name}.weight": sources
             for module_name, module in self.named_modules()
-            if (sources := _fused_source_shards(module)) is not None
+            if (sources := _fused_source_shards(module)) is not None and f"{module_name}.weight" in params
         }
         loaded_fused_shards: dict[str, set[str | int]] = {name: set() for name in expected_fused_shards}
         for name, tensor in weights:
+            if name in serialized_map:
+                param_name = serialized_map[name]
+                parameter = params[param_name]
+                parameter.weight_loader(parameter, tensor)
+                loaded.add(param_name)
+                continue
             mapped = self._map_weight_name(name)
             if mapped is None:
                 continue
