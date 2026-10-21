@@ -30,8 +30,16 @@ def test_single_stream_optional_public_api(monkeypatch, api):
     monkeypatch.setitem(sys.modules, "mindiesd", module)
     monkeypatch.setattr(fused.current_omni_platform, "is_npu", lambda: True)
     monkeypatch.setattr(fused, "find_spec", lambda name: object())
-    assert (fused._load_mindiesd_norm_rope_concat() is not None) == (api == "public")
-    assert not fused.fused_qkv_norm_rope_available(torch.device("cpu"))
+    fused._load_norm_rope_concat.cache_clear()
+    try:
+        op = fused._load_norm_rope_concat()
+        assert (op is not None) == (api == "public")
+        # Resolution is cached; repeated calls do not inspect or import again.
+        monkeypatch.setattr(fused, "find_spec", lambda name: pytest.fail("Repeated dependency lookup"))
+        assert fused._load_norm_rope_concat() is op
+        assert not fused.norm_rope_concat_available(torch.device("cpu"))
+    finally:
+        fused._load_norm_rope_concat.cache_clear()
 
 
 @pytest.mark.cpu
@@ -54,8 +62,8 @@ def test_single_stream_bsnd_contract(monkeypatch, batch, heads, dim, interleaved
         # Current public SD BSND outputs are BNSD-backed views.
         return tuple(t.transpose(1, 2).contiguous().transpose(1, 2) for t in args) + (None,) * 8
 
-    monkeypatch.setattr(fused, "fused_qkv_norm_rope_available", lambda device: True)
-    monkeypatch.setattr(fused, "_NPU_NORM_ROPE_CONCAT", op)
+    monkeypatch.setattr(fused, "norm_rope_concat_available", lambda device: True)
+    monkeypatch.setattr(fused, "_load_norm_rope_concat", lambda: op)
     with torch.inference_mode():
         result = fused.try_fused_qkv_norm_rope(
             q, k, v, weight, weight, tables, _EPS, head_dim=dim, rotary_dim=dim, interleaved=interleaved
@@ -95,9 +103,9 @@ def test_single_stream_fallback_does_not_launch(monkeypatch, unsupported):
         q = q.double()
     elif unsupported == "empty":
         q = k = v = q[:, :0]
-    monkeypatch.setattr(fused, "fused_qkv_norm_rope_available", lambda device: unsupported != "missing")
+    monkeypatch.setattr(fused, "norm_rope_concat_available", lambda device: unsupported != "missing")
     monkeypatch.setattr(torch.compiler, "is_compiling", lambda: unsupported == "compile")
-    monkeypatch.setattr(fused, "_NPU_NORM_ROPE_CONCAT", lambda *a, **kw: pytest.fail("Unsupported input launched SD"))
+    monkeypatch.setattr(fused, "_load_norm_rope_concat", lambda: pytest.fail("Unsupported input loaded SD"))
     with torch.set_grad_enabled(unsupported == "grad"):
         assert (
             fused.try_fused_qkv_norm_rope(
@@ -114,8 +122,8 @@ def test_single_stream_execution_error_propagates(monkeypatch):
     def fail(*args, **kwargs):
         raise RuntimeError("kernel failure")
 
-    monkeypatch.setattr(fused, "fused_qkv_norm_rope_available", lambda device: True)
-    monkeypatch.setattr(fused, "_NPU_NORM_ROPE_CONCAT", fail)
+    monkeypatch.setattr(fused, "norm_rope_concat_available", lambda device: True)
+    monkeypatch.setattr(fused, "_load_norm_rope_concat", lambda: fail)
     q = torch.ones(1, 3, 2, 64)
     weight = torch.ones(64)
     with torch.inference_mode(), pytest.raises(RuntimeError, match="kernel failure"):
@@ -147,7 +155,7 @@ def test_single_stream_npu_against_fp32_reference(npu_family, batch, heads, dim,
     pytest.importorskip("torch_npu")
     from vllm_omni.diffusion.layers import fused_qk_norm_rope as fused
 
-    if not fused.fused_qkv_norm_rope_available(torch.device("npu")):
+    if not fused.norm_rope_concat_available(torch.device("npu")):
         pytest.skip(f"{npu_family} requires the public SD layout API")
     with torch.inference_mode():
         torch.manual_seed(17)
