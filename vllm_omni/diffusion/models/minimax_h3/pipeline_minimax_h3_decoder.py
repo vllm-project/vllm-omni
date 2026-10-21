@@ -20,6 +20,7 @@ from vllm_omni.model_executor.models.minimax_h3.checkpoint import resolve_minima
 
 from .pipeline_minimax_h3 import (
     MiniMaxH3Pipeline,
+    _MiniMaxH3EncodedOutput,
     _prepare_minimax_h3_video_output,
     get_minimax_h3_post_process_func,
 )
@@ -138,7 +139,9 @@ class MiniMaxH3DecoderPipeline(
             video = videos[0] if len(videos) == 1 else torch.cat(videos, dim=0)
             audio = audios[0] if len(audios) == 1 else torch.cat(audios, dim=0)
         return DiffusionOutput(
-            output=((video, audio, None, frame_counts) if frame_counts else (video, audio)),
+            output=(
+                _MiniMaxH3EncodedOutput(video=video, frame_counts=frame_counts) if frame_counts else (video, audio)
+            ),
             post_process_func=get_minimax_h3_post_process_func(self.od_config),
             stage_durations=(self.stage_durations if hasattr(self, "_stage_durations") else {}),
         )
