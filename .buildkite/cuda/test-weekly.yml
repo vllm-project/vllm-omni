@@ -30,6 +30,7 @@ steps:
     steps:
       - label: "MammothModa2 · Preview/Dev INT8 A/B · H100 · Single-GPU"
         key: weekly-mammoth-moda2-int8
+        source_file_dependencies: omni_mammoth_moda2_int8
         timeout_in_minutes: 180
         commands:
           # Use the immutable checkpoints pinned in the test module.

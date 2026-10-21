@@ -264,7 +264,6 @@ def _mean_abs_diff(a: list[float], b: list[float]) -> float:
 @_INT8_CUDA_ONLY
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
 @pytest.mark.usefixtures("int8_cuda_device")
-@pytest.mark.omni
 @pytest.mark.parametrize("quantization", QUANTIZATION_CASES)
 def test_ar_generation_smoke(checkpoint_pair: tuple[str, str], quantization: str | None):
     """Each supported format loads and produces a non-empty greedy sequence."""
@@ -276,7 +275,6 @@ def test_ar_generation_smoke(checkpoint_pair: tuple[str, str], quantization: str
 @_INT8_CUDA_ONLY
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
 @pytest.mark.usefixtures("int8_cuda_device")
-@pytest.mark.omni
 def test_bf16_vs_int8_generation_consistency(checkpoint_pair: tuple[str, str]):
     """A/B: BF16 vs INT8 — report token agreement + logprob similarity + MAE."""
     bf16_model, int8_model = checkpoint_pair
