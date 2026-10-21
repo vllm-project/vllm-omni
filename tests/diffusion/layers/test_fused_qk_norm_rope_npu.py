@@ -24,9 +24,14 @@ def test_single_stream_optional_public_api(monkeypatch, api):
 
     module = types.ModuleType("mindiesd")
     if api == "legacy":
-        module.norm_rope_concat = lambda q, k, v: None
+        monkeypatch.setattr(module, "norm_rope_concat", lambda q, k, v: None, raising=False)
     elif api == "public":
-        module.norm_rope_concat = lambda q, k, v, *, input_layout="BSND", output_layout="BSND": None
+        monkeypatch.setattr(
+            module,
+            "norm_rope_concat",
+            lambda q, k, v, *, input_layout="BSND", output_layout="BSND": None,
+            raising=False,
+        )
     monkeypatch.setitem(sys.modules, "mindiesd", module)
     monkeypatch.setattr(fused.current_omni_platform, "is_npu", lambda: True)
     monkeypatch.setattr(fused, "find_spec", lambda name: object())
@@ -194,9 +199,9 @@ def test_single_stream_npu_against_fp32_reference(npu_family, batch, heads, dim,
             rotary_dim=dim,
             interleaved=interleaved,
         )
-        assert compiled is not None
-        for actual, expected in zip(compiled, result):
-            torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+        # The backend is eager-only: tracing must decline before the SD op,
+        # which deliberately has no Fake/Meta registration in this integration.
+        assert compiled is None
 
 
 def _reference(
