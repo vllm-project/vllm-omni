@@ -1691,8 +1691,12 @@ class MiniCPMO45Code2Wav(nn.Module):
         a graph no longer pins load-time allocator blocks (the reason the sweep
         was originally deferred), yet no request has been served.
 
-        A failed sweep keeps the lazy path: the wrappers still capture a graph
-        per shape on demand, exactly as before.
+        Runs under the same context ``forward`` gives the lazy sweep (inference
+        mode plus this stage's matmul policy), so a graph captured here replays
+        the kernels the lazy path would have recorded.
+
+        Per-graph failures are already handled inside ``_precapture_default_prompt``;
+        a poisoned wrapper still fails startup there, so this must not catch it.
         """
         # The deferred trigger above assumes an engine warmup forward fires it.
         # The Code2Wav stage has no such forward: the sweep then lands on the
@@ -1703,16 +1707,11 @@ class MiniCPMO45Code2Wav(nn.Module):
         if not getattr(self, "_precapture_pending", False) or self.backend is None:
             return
         try:
-            self._precapture_default_prompt()
-        except Exception:
-            self._precapture_pending = False
-            logger.warning(
-                "MiniCPM-o Code2Wav: startup precapture failed; graphs capture lazily",
-                exc_info=True,
-            )
-            return
-        if getattr(self, "_precapture_empty_cache", False):
-            self._release_precapture_cache()
+            with torch.inference_mode(), _stage_matmul_policy(self._tf32_mode):
+                self._precapture_default_prompt()
+        finally:
+            if getattr(self, "_precapture_empty_cache", False):
+                self._release_precapture_cache()
 
     def _release_precapture_cache(self) -> None:
         """Return startup's unused cached allocator blocks to the driver (``cfm_precapture_empty_cache``).
