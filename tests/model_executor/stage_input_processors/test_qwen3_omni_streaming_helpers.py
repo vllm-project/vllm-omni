@@ -286,7 +286,15 @@ def test_thinker2talker_full_payload_packs_complete_tensors() -> None:
     # Mock transfer_manager with model config
     transfer_manager = SimpleNamespace(
         _get_model_config=lambda: SimpleNamespace(
-            hf_config=SimpleNamespace(talker_config=SimpleNamespace(accept_hidden_layer=24))
+            hf_config=SimpleNamespace(
+                talker_config=SimpleNamespace(accept_hidden_layer=24),
+                im_start_token_id=151644,
+                system_token_id=8948,
+                user_token_id=872,
+                assistant_token_id=77091,
+                tts_pad_token_id=151671,
+                tts_bos_token_id=151672,
+            )
         )
     )
 
@@ -298,6 +306,8 @@ def test_thinker2talker_full_payload_packs_complete_tensors() -> None:
     assert payload["hidden_states"]["output"].device.type == "cpu"
     assert payload["embed"]["prefill"].shape[0] == 2
     assert payload["hidden_states"]["output"].shape[0] == 2
+    assert payload["meta"]["next_stage_prompt_ids"] == [151644, 872]
+    assert payload["meta"]["next_stage_prompt_len"] == 2
 
 
 def test_thinker2talker_full_payload_uses_config_hidden_layer() -> None:
@@ -318,7 +328,15 @@ def test_thinker2talker_full_payload_uses_config_hidden_layer() -> None:
     }
     transfer_manager = SimpleNamespace(
         _get_model_config=lambda: SimpleNamespace(
-            hf_config=SimpleNamespace(talker_config=SimpleNamespace(accept_hidden_layer=6))
+            hf_config=SimpleNamespace(
+                talker_config=SimpleNamespace(accept_hidden_layer=6),
+                im_start_token_id=151644,
+                system_token_id=8948,
+                user_token_id=872,
+                assistant_token_id=77091,
+                tts_pad_token_id=151671,
+                tts_bos_token_id=151672,
+            )
         )
     )
 

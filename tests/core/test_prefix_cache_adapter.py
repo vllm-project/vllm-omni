@@ -7,6 +7,9 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
+from vllm.sampling_params import SamplingParams
+from vllm.v1.core.sched.output import NewRequestData
+from vllm.v1.request import Request
 
 try:  # pragma: no cover - namespace shim for vllm-less development
     import vllm  # noqa: F401
@@ -21,6 +24,7 @@ except ModuleNotFoundError:
 from vllm_omni.core.prefix_cache.adapter import (
     PrefixCacheEventKind,
     PrefixCacheRequestEvent,
+    PrefixCacheRequestOwner,
     PrefixCacheSchedulerAdapter,
 )
 from vllm_omni.core.prefix_cache.interface import OmniPrefixCacheUnmatchError
@@ -31,6 +35,10 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 class FakeView:
     def batch_req_ids(self):
         return ["b", "a"]
+
+    def token_range(self, req_id, num_scheduled):
+        start = {"b": 12, "a": 7}[req_id]
+        return start, start + num_scheduled
 
     def step_slots_cpu(self, req_ids, num_scheduled):
         return torch.tensor([20, 21, 7], dtype=torch.long)
@@ -237,7 +245,11 @@ def test_write_layout_uses_post_order_batch_and_slots():
 
 def test_write_layout_keeps_single_fresh_slot_tensor():
     slots = torch.tensor([20, 21])
-    view = SimpleNamespace(batch_req_ids=lambda: ["b", "a"], step_slots_cpu=lambda ids, counts: slots)
+    view = SimpleNamespace(
+        batch_req_ids=lambda: ["b", "a"],
+        step_slots_cpu=lambda ids, counts: slots,
+        token_range=FakeView().token_range,
+    )
     layout = PrefixCacheSchedulerAdapter().build_write_layout(view, num_scheduled_tokens={"b": 2})
     assert layout.slots_cpu is slots
     assert [(w.row_start, w.row_end) for w in layout.writes] == [(0, 2), (2, 2)]
@@ -374,3 +386,124 @@ def test_negative_continuation_does_not_become_a_new_hit():
     )
     assert step.events == ()
     assert step.scheduled_tokens == (("r", 0),)
+
+
+def test_write_layout_keeps_request_positions_separate_from_batch_rows():
+    layout = PrefixCacheSchedulerAdapter().build_write_layout(FakeView(), num_scheduled_tokens={"b": 2, "a": 1})
+    assert [(w.token_start, w.token_end) for w in layout.writes] == [(12, 14), (7, 8)]
+    assert [(w.row_start, w.row_end) for w in layout.writes] == [(0, 2), (2, 3)]
+
+
+@pytest.mark.parametrize("scheduled", [{}, {"a": 1}])
+def test_write_layout_keeps_zero_token_requests_without_advancing_rows(scheduled, mocker):
+    view = FakeView()
+    slots = torch.arange(sum(scheduled.values()))
+    slot_mapping = mocker.patch.object(view, "step_slots_cpu", return_value=slots)
+
+    layout = PrefixCacheSchedulerAdapter().build_write_layout(view, num_scheduled_tokens=scheduled)
+
+    assert layout.total_rows == len(slots)
+    assert layout.slots_cpu is slots
+    assert [(w.req_id, w.row_start, w.row_end, w.token_start, w.token_end) for w in layout.writes] == [
+        ("b", 0, 0, 12, 12),
+        ("a", 0, len(slots), 7, 7 + len(slots)),
+    ]
+    slot_mapping.assert_called_once_with(["b", "a"], scheduled)
+
+
+def test_replacement_control_precedes_first_delayed_lookup():
+    adapter = PrefixCacheSchedulerAdapter()
+    owner = PrefixCacheRequestOwner(1, 2)
+    control = PrefixCacheRequestEvent("a", PrefixCacheEventKind.REPLACED, owner=owner, lookup_complete=False)
+    control_only = output()
+    control_only.prefix_cache_replacements = (control,)
+    control_only.prefix_cache_step_sequence = 1
+    step = adapter.translate_step(control_only)
+    assert step.sequence == 1
+    assert step.events == (control,)
+    assert not step.scheduled_tokens
+
+    lookup = output(new=[SimpleNamespace(req_id="a", num_computed_tokens=0, block_ids=[[2]])])
+    lookup.prefix_cache_owners = {"a": owner}
+    event = adapter.translate_step(lookup).events[0]
+    assert event.kind is PrefixCacheEventKind.EXTENDED
+    assert event.owner == owner
+    assert event.lookup_complete and event.hit_end == 0
+
+
+def test_cached_extension_carries_delayed_lookup_and_owner():
+    adapter = PrefixCacheSchedulerAdapter()
+    owner = PrefixCacheRequestOwner(1, 1)
+    lookup = output(cached={"req_ids": ["a"], "num_computed_tokens": [8], "new_block_ids": [[[3, 4]]]})
+    lookup.prefix_cache_owners = {"a": owner}
+    control = output()
+    control.prefix_cache_replacements = (
+        PrefixCacheRequestEvent("a", PrefixCacheEventKind.REPLACED, owner=owner, lookup_complete=False),
+    )
+    adapter.translate_step(control)
+    event = adapter.translate_step(lookup).events[0]
+    assert event.kind is PrefixCacheEventKind.EXTENDED
+    assert event.owner == owner
+    assert event.hit_end == 8 and event.block_ids == ((3, 4),)
+
+
+def test_terminal_captures_old_admission_when_id_is_reused():
+    adapter = PrefixCacheSchedulerAdapter()
+    first = output(new=[SimpleNamespace(req_id="a")])
+    first.prefix_cache_owners = {"a": PrefixCacheRequestOwner(1)}
+    adapter.translate_step(first)
+    reused = output(new=[SimpleNamespace(req_id="a")], finished=["a"])
+    reused.prefix_cache_owners = {"a": PrefixCacheRequestOwner(2)}
+    events = adapter.translate_step(reused).events
+    assert events[0].owner == PrefixCacheRequestOwner(1)
+    assert events[-1].owner == PrefixCacheRequestOwner(2)
+
+
+def test_replayed_scheduler_step_does_not_rewrite_adapter_observations():
+    adapter = PrefixCacheSchedulerAdapter()
+    first = output(new=[SimpleNamespace(req_id="a")])
+    first.prefix_cache_step_sequence = 1
+    first.prefix_cache_owners = {"a": PrefixCacheRequestOwner(1)}
+    adapter.translate_step(first)
+    last = output(finished=["a"])
+    last.prefix_cache_step_sequence = 2
+    adapter.translate_step(last)
+    assert adapter.translate_step(first).events == ()
+    first.prefix_cache_step_sequence = 3
+    assert adapter.translate_step(first).events[0].kind is PrefixCacheEventKind.STARTED
+
+
+def test_stale_lookup_and_terminal_do_not_rewind_adapter_owner():
+    adapter = PrefixCacheSchedulerAdapter()
+    current = PrefixCacheRequestOwner(2, 1)
+    admitted = output(new=[SimpleNamespace(req_id="a")])
+    admitted.prefix_cache_owners = {"a": current}
+    adapter.translate_step(admitted)
+    stale = output(new=[SimpleNamespace(req_id="a")], finished=["a"])
+    stale.prefix_cache_owners = {"a": PrefixCacheRequestOwner(1)}
+    stale.prefix_cache_terminal_owners = {"a": PrefixCacheRequestOwner(1)}
+    events = adapter.translate_step(stale).events
+    assert all(event.kind is PrefixCacheEventKind.FINISHED for event in events)
+    assert adapter._observed["a"].owner == current
+    assert adapter.translate_step(admitted).extended_req_ids == ("a",)
+
+
+@pytest.mark.parametrize("owner", [None, PrefixCacheRequestOwner(1)])
+def test_ownerless_cached_step_preserves_admission_until_terminal(owner):
+    adapter = PrefixCacheSchedulerAdapter()
+    request = Request(
+        request_id="a",
+        prompt_token_ids=[1, 2, 3, 4],
+        sampling_params=SamplingParams(max_tokens=4),
+        pooling_params=None,
+    )
+    admitted = output(new=[NewRequestData.from_request(request, block_ids=())])
+    admitted.prefix_cache_owners = {"a": owner} if owner is not None else {}
+    assert adapter.translate_step(admitted).events[0].kind is PrefixCacheEventKind.STARTED
+    cached = output(cached={"req_ids": ["a"], "num_computed_tokens": [4]}, scheduled={"a": 1})
+    assert adapter.translate_step(cached).extended_req_ids == ("a",)
+    assert adapter.translate_step(admitted).extended_req_ids == ("a",)
+    terminal = adapter.translate_step(output(finished=["a"])).events[0]
+    assert terminal.kind is PrefixCacheEventKind.FINISHED
+    assert terminal.owner == owner
+    assert adapter.translate_step(admitted).events[0].kind is PrefixCacheEventKind.STARTED

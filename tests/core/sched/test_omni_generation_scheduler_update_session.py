@@ -28,6 +28,7 @@ from vllm.v1.metrics.stats import PrefillStats
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler
+from vllm_omni.core.prefix_cache.adapter import PrefixCacheRequestEvent
 from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
 
 # isort: on
@@ -49,6 +50,8 @@ class _SchedulerStub(OmniGenerationScheduler):
     """Minimal scheduler surface required by OmniGenerationScheduler."""
 
     def __init__(self, *, log_stats: bool = False) -> None:
+        self._prefix_cache_next_admission = 0
+        self._prefix_cache_pending_replacements: list[PrefixCacheRequestEvent] = []
         self.num_waiting_for_streaming_input = 0
         self.log_stats = log_stats
         self.chunk_transfer_adapter = _ChunkTransferAdapterStub()
@@ -296,7 +299,7 @@ class TestReplaceSessionWithStreamingUpdate:
         update = _make_update(prompt_token_ids=None)
         sched._update_request_as_session(session, update)
 
-        assert session.prompt_token_ids == ()
+        assert session.prompt_token_ids == []
         assert list(session._all_token_ids) == []
         assert session.num_prompt_tokens == 0
         assert sched.num_waiting_for_streaming_input == 0

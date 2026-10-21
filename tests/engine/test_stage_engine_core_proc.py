@@ -3,7 +3,6 @@
 
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import patch
 
 import pytest
 from vllm.v1.core.sched.scheduler import Scheduler
@@ -88,7 +87,7 @@ def test_first_audio_sink_preserves_first_decoder_and_opts_in_stream_decoder(
     assert runner.model_state.set_first_audio_sink.call_count == int(expected)
 
 
-def test_preprocess_add_request_preserves_omni_fields():
+def test_preprocess_add_request_preserves_omni_fields(mocker):
     engine = StageEngineCoreProc.__new__(StageEngineCoreProc)
     request = SimpleNamespace(
         request_id="internal",
@@ -97,12 +96,12 @@ def test_preprocess_add_request_preserves_omni_fields():
     )
     scheduler_request = SimpleNamespace()
 
-    with patch.object(
+    mocker.patch.object(
         EngineCoreProc,
         "preprocess_add_request",
         return_value=(scheduler_request, 3),
-    ):
-        result, current_wave = engine.preprocess_add_request(request)
+    )
+    result, current_wave = engine.preprocess_add_request(request)
 
     assert result is scheduler_request
     assert current_wave == 3
@@ -135,6 +134,45 @@ def test_first_audio_binding_preserves_talker_marker():
     assert outputs.get_nowait()[1].outputs[0].multimodal_output[FIRST_AUDIO_KEY]
     executor.vllm_config.parallel_config.tensor_parallel_size = 2
     assert not module._bind_first_audio_sink(executor, outputs, scheduler)
+
+
+def test_talker_hasher_uses_resolved_scheduler_hash_size_and_configured_algorithm():
+    from vllm.sampling_params import SamplingParams
+    from vllm.utils.hashing import sha256_cbor
+    from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
+
+    from vllm_omni.request import OmniRequest
+
+    init_none_hash(sha256_cbor)
+    engine = StageEngineCoreProc.__new__(StageEngineCoreProc)
+    engine.scheduler = SimpleNamespace(hash_block_size=2)
+    engine.vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(block_size=16, prefix_caching_hash_algo="sha256_cbor", enable_prefix_caching=True),
+        model_config=SimpleNamespace(model_stage="talker", model_arch="Qwen3OmniMoeForConditionalGeneration"),
+    )
+    engine._init_talker_request_hasher()
+    request = OmniRequest(
+        request_id="resolved-hash",
+        prompt_token_ids=[1, 2, 3],
+        sampling_params=SamplingParams(max_tokens=4),
+        pooling_params=None,
+        block_hasher=engine.request_block_hasher,
+    )
+    assert len(request.block_hashes) == 1
+    hashes = request.block_hashes
+    request.block_hashes = []
+    assert hashes == get_request_block_hasher(2, sha256_cbor)(request)
+
+
+def test_non_talker_stage_keeps_native_request_hasher():
+    engine = StageEngineCoreProc.__new__(StageEngineCoreProc)
+    engine.vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(enable_prefix_caching=True),
+        model_config=SimpleNamespace(model_stage="thinker"),
+    )
+    engine.request_block_hasher = original = object()
+    engine._init_talker_request_hasher()
+    assert engine.request_block_hasher is original
 
 
 @pytest.mark.parametrize(("timeout_s", "expected_minutes"), [(900.0, 15), (901.0, 16), (60.0, 5)])
