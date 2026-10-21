@@ -3,6 +3,7 @@
 """Decode-only Cache-DiT adapters preserving Qwen 2.1's per-layer prefix KV."""
 
 import weakref
+from typing import TYPE_CHECKING
 
 import cache_dit
 import torch
@@ -12,11 +13,15 @@ from vllm.logger import init_logger
 
 from vllm_omni.diffusion.cache.cachedit import CacheDiTConfig, CacheDiTEnableResult
 
+if TYPE_CHECKING:
+    from vllm_omni.diffusion.data import DiffusionCacheConfig
+    from vllm_omni.diffusion.models.qwen_image_21.pipeline_qwen_image_21 import QwenImage21Pipeline
+
 logger = init_logger(__name__)
 
 
 class _Layer(nn.Module):
-    def __init__(self, block, index):
+    def __init__(self, block: nn.Module, index: int) -> None:
         super().__init__()
         self._block_ref = weakref.ref(block)
         self.index = index
@@ -29,17 +34,19 @@ class _Layer(nn.Module):
 
 
 class _DecodeProxy(nn.Module):
-    def __init__(self, blocks):
+    def __init__(self, blocks: nn.ModuleList) -> None:
         super().__init__()
         self.blocks = nn.ModuleList([_Layer(block, i) for i, block in enumerate(blocks)])
 
-    def forward(self, hidden_states, **kwargs):
+    def forward(self, hidden_states: torch.Tensor, **kwargs) -> torch.Tensor:
         for block in self.blocks:
             hidden_states = block(hidden_states, **kwargs)
         return hidden_states
 
 
-def enable_qwen_image21_cache(pipeline, cache_config):
+def enable_qwen_image21_cache(
+    pipeline: "QwenImage21Pipeline", cache_config: "DiffusionCacheConfig"
+) -> CacheDiTEnableResult:
     """Install branch-isolated caches; prefill always executes the original blocks."""
     transformer = pipeline.transformer
     if not transformer.causal_condition:
@@ -47,7 +54,8 @@ def enable_qwen_image21_cache(pipeline, cache_config):
     projected = CacheDiTConfig.from_diffusion_config(cache_config)
     if projected.scm_steps_mask_policy is not None:
         raise ValueError("Qwen-Image 2.1 Cache-DiT does not yet support SCM masks")
-    proxies, adapters = {}, []
+    proxies = {}
+    adapters = []
     for branch in ("cond", "uncond"):
         proxy = _DecodeProxy(transformer.transformer_blocks)
         adapter = BlockAdapter(
@@ -57,6 +65,8 @@ def enable_qwen_image21_cache(pipeline, cache_config):
             has_separate_cfg=False,
         )
         pipe_cls = type(adapter.pipe)
+        # Cache-DiT sets this on the shared fake pipeline class; each CFG
+        # branch needs its own adapter initialization.
         if "_is_cached" in vars(pipe_cls):
             del pipe_cls._is_cached
         config = projected.to_db_cache_config()
@@ -73,7 +83,7 @@ def enable_qwen_image21_cache(pipeline, cache_config):
     transformer.enable_cuda_graph_decode = False
     logger.info("Qwen-Image 2.1 Cache-DiT: decode-only, isolated CFG branches; whole-decode CUDA Graph disabled")
 
-    def refresh(_pipeline, num_inference_steps, verbose=True):
+    def refresh(_pipeline, num_inference_steps: int, verbose: bool = True) -> None:
         for proxy in proxies.values():
             config = projected.to_db_cache_config()
             config.num_inference_steps = max(num_inference_steps - 1, 1)
