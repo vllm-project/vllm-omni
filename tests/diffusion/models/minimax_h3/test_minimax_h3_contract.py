@@ -919,6 +919,49 @@ def test_preencoded_frame_counts_survive_registered_postprocess():
     assert normalized.metadata["video"]["frame_counts"] == [7, 9]
 
 
+@pytest.mark.parametrize("frame_counts", [[], [7, 9], [0], [-1], [True], ["7"], 7])
+def test_invalid_preencoded_counts_preserve_the_legacy_video_result(frame_counts):
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import _minimax_h3_post_process
+
+    result = _minimax_h3_post_process(([b"encoded-video"], None, None, frame_counts))
+
+    assert result["video"] == [b"encoded-video"]
+    assert result["audio"] == [None]
+    assert result["fps"] == 24
+    assert "metadata" not in result
+
+
+@pytest.mark.parametrize("num_outputs", [1, 2])
+def test_decoder_stage_preserves_preencoded_frame_counts(monkeypatch, num_outputs):
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3_decoder import MiniMaxH3DecoderPipeline
+
+    def encode(self, video_latent, audio_latent, *, frame_counts, **kwargs):
+        frame_counts.append(7 + 2 * int(video_latent.item()))
+        return b"encoded-video"
+
+    monkeypatch.setattr(MiniMaxH3DecoderPipeline, "decode_to_mp4", encode)
+    decoder = object.__new__(MiniMaxH3DecoderPipeline)
+    nn.Module.__init__(decoder)
+    decoder.device = torch.device("cpu")
+    decoder.od_config = SimpleNamespace()
+    payload = {
+        "video_latents": [torch.tensor([index]) for index in range(num_outputs)],
+        "audio_latents": [torch.zeros(1) for _ in range(num_outputs)],
+        "preencode_mp4": True,
+        "height": 480,
+        "width": 864,
+        "video_codec_options": None,
+        "preencode_batch_frames": 17,
+    }
+    request = SimpleNamespace(prompts=[{"additional_information": {"minimax_h3_decode": payload}}])
+
+    result = decoder.forward(request)
+    formatted = result.post_process_func(result.output)
+
+    assert formatted["payload"]["video"] == [b"encoded-video"] * num_outputs
+    assert formatted["metadata"]["video"]["frame_counts"] == [7, 9][:num_outputs]
+
+
 def test_joint_video_output_is_quantized_before_transfer():
     from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import (
         _minimax_h3_post_process,

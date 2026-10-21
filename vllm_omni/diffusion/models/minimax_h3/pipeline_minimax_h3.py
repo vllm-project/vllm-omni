@@ -418,8 +418,13 @@ def _minimax_h3_post_process(output, output_type: str = "np"):
             "fps": MINIMAX_H3_FPS,
         }
         if frame_counts is not None:
-            if len(frame_counts) != len(encoded_videos):
-                raise ValueError("encoded frame counts must match video outputs")
+            if not (
+                isinstance(frame_counts, (list, tuple))
+                and len(frame_counts) == len(encoded_videos)
+                and all(type(count) is int and count > 0 for count in frame_counts)
+            ):
+                logger.warning("Ignoring invalid encoded frame counts; falling back to MP4 metadata inspection")
+                return result
             return {
                 "payload": {
                     "video": encoded_videos,
