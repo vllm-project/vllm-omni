@@ -144,14 +144,19 @@ def resolve_request_attention_schedule(
     return resolve_attention_schedule(sampling_params.attention_schedule, service.default, profiles=service.profiles)
 
 
+def batch_attention_schedule(schedules: Iterable[AttentionSchedule]) -> AttentionSchedule:
+    """One schedule for a batch of resolved schedules. Different ranges must not share a denoise forward."""
+    distinct = set(schedules)
+    if len(distinct) > 1:
+        raise ValueError("attention_schedule values in one batch must be identical")
+    return distinct.pop() if distinct else ()
+
+
 def resolve_batch_attention_schedule(
     sampling_params: Iterable["OmniDiffusionSamplingParams"], service: "AttentionScheduleConfig | None"
 ) -> AttentionSchedule:
-    """One resolved schedule for a batch. Different ranges must not share a denoise forward."""
-    resolved = {resolve_request_attention_schedule(params, service) for params in sampling_params}
-    if len(resolved) > 1:
-        raise ValueError("attention_schedule values in one batch must be identical")
-    return resolved.pop() if resolved else ()
+    """Resolve each request's schedule and return the one schedule of the batch."""
+    return batch_attention_schedule(resolve_request_attention_schedule(params, service) for params in sampling_params)
 
 
 def require_request_attention_schedule_fits(
