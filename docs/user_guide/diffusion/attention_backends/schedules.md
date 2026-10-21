@@ -22,7 +22,7 @@ mask with `full_attn_spans`, checks named backends at startup instead (see
 
 ## Format
 
-The server configuration contains `profiles` and `default`:
+The server configuration contains `profiles`, `default` and optional `sigma`:
 
 - `profiles` maps names to complete attention configurations with `default`
   and optional `per_role` specs, as in `--diffusion-attention-config`.
@@ -32,7 +32,6 @@ The server configuration contains `profiles` and `default`:
   underscores or hyphens. All profiles are validated, even unused ones.
 - The top-level `default` is a list of ranges. An empty configuration with
   no profiles is equivalent to not configuring schedules.
-- Other top-level keys are rejected at startup.
 
 Each range has exactly `start`, `end` and `profile`:
 
@@ -60,6 +59,43 @@ layers' step-0 attention outputs, so on this model the step-0 profile affects
 every step, not only step 0. A range that starts at step 0 with an approximate
 profile therefore also changes the later steps; the server logs this at startup
 when its default schedule does so.
+
+## Sigma windows
+
+Sigma schedules use the same prepared profiles, selected by normalized scheduler
+noise rather than step index or raw model timestep. MiniMax-H3 publishes its
+shifted rectified-flow video sigma. HunyuanImage-3.0 and Wan2.2 publish
+`scheduler.sigmas[i] / scheduler.sigmas[0]`. Wan2.2 DMD checkpoints, which
+denoise over a fixed timestep table, publish that timestep divided by the
+training timestep scale. Missing or invalid sigma fails
+rather than silently selecting the base backend.
+
+Each window has exactly `low`, `high` and `profile`. Bounds must be finite
+numbers with `0 <= low < high <= 1`. Windows are ordered, non-overlapping and
+half-open `[low, high)`, except an end at `1.0` includes `1.0`. Adjacent windows
+are allowed; gaps use the base configuration. Thresholds refer to the actual
+shifted trajectory: changing step count or flow shift changes when a threshold
+is crossed, not the threshold itself.
+
+Set service defaults with `sigma` instead of `default` in the existing flag:
+
+```bash
+--diffusion-attention-schedule '{
+  "profiles": {"flash": {"default": "FLASH_ATTN"}},
+  "sigma": [{"low": 0.3, "high": 1.0, "profile": "flash"}]
+}'
+```
+
+The dotted flag is `--diffusion-attention-schedule.sigma`; deploy YAML uses
+`diffusion_attention_schedule.sigma`. CLI lists replace the corresponding
+stage list. There is no separate sigma flag or environment variable.
+
+Use `attention_sigma_schedule` in the same request extras or offline sampling
+parameters as `attention_schedule`. Omitted or `null` inherits, `[]` disables,
+and non-empty windows replace defaults. Both effective schedules cannot be
+non-empty, including inherited defaults. To replace a step default with sigma
+windows, also send `attention_schedule: []` (or clear the CLI `default` list).
+Request and step modes validate the resolved schedules before denoising.
 
 ## Server configuration
 
@@ -151,6 +187,7 @@ request is at the same step and sigma and the selected profile's backends
 isolate packed requests; otherwise it runs one forward per request so each
 uses its own progress. A scheduled HunyuanImage-3.0 step batch always runs one
 transformer forward per request.
+Sigma windows also participate in batch keys.
 
 Malformed schedules return HTTP 400 before dispatch. A request schedule that
 names a profile the denoising stage does not configure returns HTTP 400 when
@@ -183,10 +220,12 @@ these errors on the job record rather than the creation response.
   attention. Different candidate output layouts may trigger recompilation.
   HunyuanImage-3.0 has no repeated blocks, so regional compilation skips it
   and it runs eager; its image attention also sends `full_attn_spans`.
-- H3 rejects non-empty schedules with request-scoped Cache-DiT (`quality=high`)
-  or `latent_refine`. Disable the schedule or the conflicting option.
+- H3 rejects non-empty step ranges or sigma windows with request-scoped
+  Cache-DiT (`quality=high`), and non-empty step ranges with `latent_refine`.
+  Disable the schedule or the conflicting option. Sigma windows work with
+  `latent_refine`: the refine pass publishes the sigma of its own steps.
   Step mode rejects these H3 options regardless of schedule. Non-empty
-  default ranges with a `latent_refine` default in `--additional-config`
+  default step ranges with a `latent_refine` default in `--additional-config`
   fail at startup.
 - Auto-padding sequence parallelism with `mask_sp_padding` enabled requires
   mask-capable profiles.

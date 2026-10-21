@@ -6,7 +6,7 @@ from __future__ import annotations
 from dataclasses import fields
 from typing import TYPE_CHECKING
 
-from vllm_omni.diffusion.attention.schedule import resolve_request_attention_schedule
+from vllm_omni.diffusion.attention.schedule import parse_attention_sigma_schedule, resolve_request_attention_schedule
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.base_scheduler import BaseScheduler
 from vllm_omni.diffusion.sched.interface import (
@@ -29,6 +29,7 @@ _REQUEST_BATCH_SAMPLING_PARAMS_KEY_FIELD_NAMES = frozenset(
 ) - {
     "attention_schedule",
     "attention_schedule_explicit",
+    "attention_sigma_schedule",
     "condition_key",
     "flow_shift",
     "lora_int_id",
@@ -73,6 +74,7 @@ def build_request_batch_sampling_params_key(
     key_kwargs["lora_int_id"] = lora_request.lora_int_id if lora_request is not None else None
     key_kwargs["attention_schedule"] = resolve_request_attention_schedule(sampling, attention_schedule_config)
     key_kwargs["attention_schedule_explicit"] = sampling.attention_schedule is not None
+    key_kwargs["attention_sigma_schedule"] = parse_attention_sigma_schedule(sampling.attention_sigma_schedule)
     return RequestBatchSamplingParamsKey(**key_kwargs)
 
 
