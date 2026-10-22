@@ -248,7 +248,8 @@ _SIGMA_ROUNDING_TOLERANCE = 1e-6
 def _validate_sigma(value: float, name: str) -> None:
     if isinstance(value, bool) or type(value) not in (int, float):
         raise TypeError(f"attention_sigma_schedule {name} must be a number, got {value!r}")
-    if not 0.0 <= float(value) <= 1.0:  # also rejects NaN and infinities
+    # Compare without float(): an int too large for a float would raise OverflowError, not a client error.
+    if not 0 <= value <= 1:  # also rejects NaN and infinities
         raise ValueError(f"attention_sigma_schedule {name} must be in [0, 1], got {value!r}")
 
 
