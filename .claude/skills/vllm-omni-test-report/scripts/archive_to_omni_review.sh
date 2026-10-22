@@ -52,6 +52,9 @@ while [ $# -ge 2 ]; do
     data/*) ;;
     *) fail "dest must start with data/ : $dest" ;;
   esac
+  # resolve to an absolute path BEFORE the later `cd $REVIEW` — otherwise a
+  # relative src (e.g. ./report.html) would be looked up inside the repo
+  src="$(readlink -f "$src")"
   SRCS+=("$src"); DESTS+=("kanban/data/vllm_omni/${dest#data/}"); RELS+=("${dest#data/}")
 done
 
@@ -70,7 +73,7 @@ for rel in "${RELS[@]}"; do
   dst="$REVIEW/${DESTS[$i]}"
   mkdir -p "$(dirname "$dst")"
   rm -rf "$dst"
-  cp -a "${SRCS[$i]}" "$dst"
+  cp -a "${SRCS[$i]}" "$dst" || fail "copy failed: ${SRCS[$i]} -> $dst"
   echo "archived: ${SRCS[$i]} -> ${DESTS[$i]}"
   i=$((i+1))
 done
