@@ -17,7 +17,7 @@ import torch.nn as nn
 import vllm_omni.diffusion.attention.layer as layer_mod
 from vllm_omni.diffusion.attention.backends.abstract import AttentionImpl, AttentionMetadata
 from vllm_omni.diffusion.attention.capabilities import AttentionComputation
-from vllm_omni.diffusion.attention.layer import Attention, _PreparedCandidate
+from vllm_omni.diffusion.attention.layer import Attention, ScheduleCandidate
 from vllm_omni.diffusion.attention.parallel.base import NoParallelAttention
 from vllm_omni.diffusion.config import set_current_diffusion_config
 from vllm_omni.diffusion.data import (
@@ -58,9 +58,9 @@ class _MetadataOnlyImpl(_FakeImpl, AttentionImpl[AttentionMetadata]):
         raise AssertionError("metadata-only fixture must not execute attention")
 
 
-def _make_metadata_candidate(backend_cls: type, spec: AttentionSpec | None = None) -> _PreparedCandidate:
+def _make_metadata_candidate(backend_cls: type, spec: AttentionSpec | None = None) -> ScheduleCandidate:
     impl = _MetadataOnlyImpl()
-    return _PreparedCandidate(
+    return ScheduleCandidate(
         backend_cls=backend_cls,
         spec=spec,
         impl=impl,

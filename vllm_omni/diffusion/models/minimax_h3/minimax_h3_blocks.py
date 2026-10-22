@@ -19,13 +19,14 @@ from vllm.model_executor.layers.linear import (
 )
 
 from vllm_omni.diffusion.attention.backends.abstract import (
+    AttentionBackend,
     AttentionMetadata,
     PackedPaddingMetadata,
     VideoTokenLayout,
 )
 from vllm_omni.diffusion.attention.backends.flash_attn import FlashAttentionBackend
 from vllm_omni.diffusion.attention.backends.vdnh3_attn import VDNLayout
-from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.attention.layer import Attention, ScheduleCandidate
 from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
 from vllm_omni.diffusion.layers.activation import SiluAndMul
 from vllm_omni.diffusion.layers.fused_qk_norm_rope import fused_qk_norm_rope
@@ -81,7 +82,7 @@ def _ring_sequence_parallel_is_active(attention_layer: Attention) -> bool:
     return True
 
 
-def _attention_isolates_packed_requests(attention_layer: Any, backend: Any = None) -> bool:
+def _attention_isolates_packed_requests(attention_layer: Any, backend: type[AttentionBackend] | None = None) -> bool:
     """True if this attention layer keeps N-document packed boundaries.
 
     Requires a backend advertising ``supports_multi_doc_packed_varlen`` *and*
@@ -97,7 +98,7 @@ def _attention_isolates_packed_requests(attention_layer: Any, backend: Any = Non
     return not _ring_sequence_parallel_is_active(attention_layer)
 
 
-def _candidate_excludes_packed_padding(record: Any) -> str | None:
+def _candidate_excludes_packed_padding(record: ScheduleCandidate) -> str | None:
     """Schedule candidate check: every DiT forward pads its packed documents to the sequence alignment."""
     backend = record.backend_cls
     if (
@@ -112,7 +113,7 @@ def _candidate_excludes_packed_padding(record: Any) -> str | None:
     )
 
 
-def _fasth3_requires_vsa_candidate(record: Any) -> str | None:
+def _fasth3_requires_vsa_candidate(record: ScheduleCandidate) -> str | None:
     """Schedule candidate check for FastH3 VSA students, registered once their gates are built."""
     if record.backend_cls.get_name() == "FASTVIDEO_VSA":
         return None
@@ -122,7 +123,7 @@ def _fasth3_requires_vsa_candidate(record: Any) -> str | None:
     )
 
 
-def _vdn_requires_vdnh3_candidate(record: Any) -> str | None:
+def _vdn_requires_vdnh3_candidate(record: ScheduleCandidate) -> str | None:
     """Schedule candidate check for VDN-H3 checkpoints, registered by MiniMaxH3Attention.enable_vdn."""
     if record.backend_cls.get_name() == "VDNH3_ATTN":
         return None
@@ -283,7 +284,7 @@ class MiniMaxH3Attention(nn.Module):
             nn.init.zeros_(self.to_gate_compress.weight)
         self.attention.add_schedule_candidate_check(_fasth3_requires_vsa_candidate)
 
-    def _vsa_candidate_needs_gate(self, record: Any) -> str | None:
+    def _vsa_candidate_needs_gate(self, record: ScheduleCandidate) -> str | None:
         """Schedule candidate check: MiniMaxH3VSAImpl routes by H3 segments only when a VSA gate exists.
 
         A gateless layer whose baseline is already FASTVIDEO_VSA runs the same dense fallback without

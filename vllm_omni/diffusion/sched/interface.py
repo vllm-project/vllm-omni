@@ -14,6 +14,7 @@ from vllm_omni.diffusion.request import OmniDiffusionRequest
 if TYPE_CHECKING:
     from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 
+    from vllm_omni.diffusion.attention.schedule import AttentionSchedule
     from vllm_omni.diffusion.diffusion_kv.request import DiffusionKVRequest
     from vllm_omni.diffusion.interaction.types import InteractionBoundaryContext
 
@@ -94,7 +95,7 @@ class StepBatchSamplingParamsKey:
     lora_int_id: int | None = None
     lora_scale: float = 1.0
     # Same request-schedule identity as the request-batch key.
-    attention_schedule: tuple[Any, ...] | None = None
+    attention_schedule: AttentionSchedule | None = None
 
 
 @dataclass(frozen=True, eq=True)
@@ -162,7 +163,7 @@ class RequestBatchSamplingParamsKey:
     lora_scale: float = 1.0
 
     # Immutable request schedule. None inherits; () disables; different ranges must not share a batch.
-    attention_schedule: tuple[Any, ...] | None = None
+    attention_schedule: AttentionSchedule | None = None
 
 
 @dataclass

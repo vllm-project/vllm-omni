@@ -14,7 +14,7 @@ from vllm.config import VllmConfig
 from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionMetadata,
 )
-from vllm_omni.diffusion.attention.schedule import select_attention_profile
+from vllm_omni.diffusion.attention.schedule import AttentionSchedule, select_attention_profile
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 
 if TYPE_CHECKING:
@@ -54,10 +54,10 @@ class ForwardContext:
     total_denoise_steps: int | None = None
     # Bound request schedule. None means unbound. () disables. A non-empty tuple
     # selects prepared profiles while a denoise step is published.
-    attention_schedule: tuple[Any, ...] | None = None
+    attention_schedule: AttentionSchedule | None = None
     # Profile selected for (attention_schedule, denoise_step_idx, total_denoise_steps);
     # every scheduled layer in one step reads it instead of selecting again.
-    _attention_profile_key: tuple[Any, ...] | None = None
+    _attention_profile_key: tuple[AttentionSchedule, int, int] | None = None
     _attention_profile: str | None = None
     # Per-request reference latent for img2img DiT models (e.g. Ming)
     ref_latent: torch.Tensor | None = None
@@ -302,7 +302,7 @@ def override_paged_kv_adapter(adapter: Any | None):
 
 
 @contextmanager
-def bind_attention_schedule(schedule: tuple[Any, ...] | None):
+def bind_attention_schedule(schedule: AttentionSchedule | None):
     """Install one request schedule and restore the previous one on any exit."""
     if _forward_context is None:
         raise RuntimeError("bind_attention_schedule requires an active forward context")

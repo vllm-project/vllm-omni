@@ -77,16 +77,14 @@ def _canonical_json(value: Any) -> str | object:
         return object()
 
 
-# Marks "argument not passed", so an explicit ``spec=None`` from effective_attention() is used as given.
-_UNSET: Any = object()
-
-
-def _attention_identity(backend_cls: type[AttentionBackend] | None, backend_explicit: bool, spec) -> tuple:
+def _attention_identity(
+    backend_cls: type[AttentionBackend] | None, backend_explicit: bool, spec: "AttentionSpec | None"
+) -> tuple:
     """Backend name, explicit-vs-default selection and canonical backend kwargs.
 
-    Ring and paged execution run from state bound to the baseline (the ring runner's backend
-    preference, the native paged implementation), so a candidate can run on those paths only when
-    this identity equals the baseline's. An unserializable kwargs value never matches.
+    The ring runner is bound to the baseline's backend preference and ignores backend kwargs, so
+    a candidate can run on the ring path only when this identity equals the baseline's. An
+    unserializable kwargs value never matches.
     """
     return (
         backend_cls.get_name() if backend_cls is not None else None,
@@ -133,10 +131,10 @@ def _try_extract_layer_index(prefix: str) -> int | None:
 
 
 @dataclass(frozen=True)
-class _PreparedCandidate:
+class ScheduleCandidate:
     """A pre-constructed per-profile attention candidate.
 
-    Carries the resolved backend class, spec, impl class and constructed impl so
+    Carries the resolved backend class, spec, constructed impl and explicit-selection flag so
     calibration, startup capability validation and runtime selection can
     use them without re-resolving. Deduplicated profiles share one instance, so the
     record intentionally carries no single profile name (the dict key is the name).
@@ -252,9 +250,9 @@ class Attention(nn.Module):
         # AttentionImpl is not an nn.Module, so keeping these in a plain dict
         # registers no submodule and leaves state_dict untouched.
         self._schedule_profiles: tuple[str, ...] = ()
-        self._schedule_candidates: dict[str, _PreparedCandidate] = {}
+        self._schedule_candidates: dict[str, ScheduleCandidate] = {}
         # Model-owned requirements on every candidate of this layer (add_schedule_candidate_check).
-        self._schedule_candidate_checks: list[Callable[[_PreparedCandidate], str | None]] = []
+        self._schedule_candidate_checks: list[Callable[[ScheduleCandidate], str | None]] = []
 
         # Resolve backend via role-aware config.
         # The global diffusion config is set during model init via
@@ -487,8 +485,8 @@ class Attention(nn.Module):
         """
         profiles = schedule_config.profiles
         self._schedule_profiles = tuple(sorted(profiles))
-        prepared: dict[tuple, _PreparedCandidate] = {}
-        candidates: dict[str, _PreparedCandidate] = {}
+        prepared: dict[tuple, ScheduleCandidate] = {}
+        candidates: dict[str, ScheduleCandidate] = {}
         for name in self._schedule_profiles:
             backend_cls, spec = get_attn_backend_for_role(
                 role=role,
@@ -511,7 +509,7 @@ class Attention(nn.Module):
             record = prepared.get(dedup_key)
             if record is None:
                 impl = impl_cls(**impl_kwargs, backend_kwargs=backend_kwargs, backend_explicit=backend_explicit)
-                record = _PreparedCandidate(
+                record = ScheduleCandidate(
                     backend_cls=backend_cls,
                     spec=spec,
                     impl=impl,
@@ -1078,7 +1076,7 @@ class Attention(nn.Module):
 
         return effective_impl.forward(query, key, value, attn_metadata)
 
-    def add_schedule_candidate_check(self, check: Callable[[_PreparedCandidate], str | None]) -> None:
+    def add_schedule_candidate_check(self, check: Callable[[ScheduleCandidate], str | None]) -> None:
         """Register a model-owned requirement that startup validation applies to every candidate.
 
         ``check(record)`` returns None when the candidate is usable on this layer, or the reason it is
@@ -1108,14 +1106,17 @@ class Attention(nn.Module):
         attn_metadata: AttentionMetadata | None,
         *,
         backend: type[AttentionBackend] | None = None,
-        spec: Any = _UNSET,
+        spec: "AttentionSpec | None" = None,
     ) -> None:
+        """Reject metadata that ``backend`` with ``spec`` cannot run; without ``backend``, check the baseline."""
         if attn_metadata is None:
             return
-        selected = self.attn_backend if backend is None else backend
+        if backend is None:
+            selected, selected_spec = self.attn_backend, getattr(self, "attn_spec", None)
+        else:
+            selected, selected_spec = backend, spec
         if selected is None:
             return
-        selected_spec = getattr(self, "attn_spec", None) if spec is _UNSET else spec
         backend_name = selected.get_name()
         if attn_metadata.attn_mask is not None and not selected.supports_attention_mask(selected_spec):
             raise ValueError(
@@ -1162,7 +1163,7 @@ class Attention(nn.Module):
 def _validate_candidate_calibration(
     layer_name: str,
     profile_name: str,
-    record: "_PreparedCandidate",
+    record: "ScheduleCandidate",
     effective_calibration: dict | None,
 ) -> None:
     """A candidate that asked for ``target_sparsity`` needs a curve for THIS layer.
@@ -1245,7 +1246,8 @@ def validate_attention_schedule_candidates(model: nn.Module, od_config: "OmniDif
             matches_baseline = (
                 _attention_identity(record.backend_cls, record.backend_explicit, record.spec) == baseline_identity
             )
-            # Same condition as use_ring at construction: explicit cross-attention never runs ring.
+            # Layers that can run ring: use_ring at construction (never explicit cross-attention), minus
+            # layers that skip sequence parallelism, which always run local attention.
             if ring_degree > 1 and not module._explicit_cross_contract and not module.skip_sequence_parallel:
                 # The ring path bypasses the backend, so a candidate carrying skip_softmax
                 # would be silently ignored (_run_ring_attention only reads the baseline impl). The
