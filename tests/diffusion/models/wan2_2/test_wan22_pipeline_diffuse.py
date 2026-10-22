@@ -858,7 +858,7 @@ def test_diffuse_dmd_predicts_clean_and_renoises_between_steps(monkeypatch, scop
     pipeline.is_dmd = True
     pipeline.scheduler = _StubDMDScheduler()
     # Only sigma scheduling needs a training-time scale. All other paths must
-    # retain C1 behavior with this scheduler, which deliberately has no config.
+    # publish no sigma with this scheduler, which deliberately has no config.
     if scope == "sigma":
         pipeline.scheduler.config = SimpleNamespace(num_train_timesteps=1000)  # type: ignore[attr-defined]
     latents = torch.zeros((1, 1, 1, 1, 1), dtype=torch.float32)
