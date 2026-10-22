@@ -158,6 +158,12 @@ export class VideoSession {
     if (typeof message.request_id === "string") this.requestId = message.request_id;
     if (message.type === "error") {
       const detail = message.message || "Server error";
+      // A control that lost the race with the end of the session is not a
+      // failure the viewer can act on; the take is already complete.
+      if (this.done || this.stopping) {
+        this.report(`Ignored after the session ended: ${detail}`);
+        return;
+      }
       // Only hint at the camera API when the server actually refused it.
       const camera = /camera|interaction/i.test(detail) ? " Keyboard mode requires Omni camera interaction support." : "";
       this.fail(`${detail}.${camera}`);
