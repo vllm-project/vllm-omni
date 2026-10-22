@@ -105,17 +105,8 @@ def layer_calibration_is_ignored(module_name: str, calibration: dict | None) -> 
     curve: ``resolve_layer_calibration`` returns ``None`` for both, but only the first one is
     acceptable when a profile asked for ``target_sparsity``.
     """
-    if not calibration:
-        return False
-    by_expert = calibration.get("by_expert")
-    if by_expert:
-        key = select_expert(module_name, by_expert.keys())
-        if key is None:
-            return False
-        entry = by_expert[key]
-    else:
-        entry = calibration
-    return is_ignored(module_name, entry.get("ignore"))
+    entry = _layer_calibration_entry(module_name, calibration)
+    return entry is not None and is_ignored(module_name, entry.get("ignore"))
 
 
 def resolve_effective_calibration(
@@ -177,20 +168,30 @@ def select_expert(module_name: str, expert_keys) -> str | None:
     return None
 
 
-def resolve_layer_calibration(module_name: str, calibration: dict) -> dict | None:
+def _layer_calibration_entry(module_name: str, calibration: dict | None) -> dict | None:
+    """This layer's expert entry, the whole dict when it has no experts, or None when no expert matches."""
     if not calibration:
         return None
     by_expert = calibration.get("by_expert")
-    if by_expert:
-        key = select_expert(module_name, by_expert.keys())
-        if key is None:
-            return None
-        entry = by_expert[key]
-    else:
-        entry = calibration
-    if is_ignored(module_name, entry.get("ignore")):
+    if not by_expert:
+        return calibration
+    key = select_expert(module_name, by_expert.keys())
+    return None if key is None else by_expert[key]
+
+
+def resolve_layer_calibration(module_name: str, calibration: dict | None) -> dict | None:
+    entry = _layer_calibration_entry(module_name, calibration)
+    if entry is None or is_ignored(module_name, entry.get("ignore")):
         return None
     return {"a": entry.get("a"), "b": entry.get("b")}
+
+
+def layer_calibration_curve(module_name: str, calibration: dict | None) -> tuple[float, float] | None:
+    """The ``(a, b)`` curve stamping writes onto this layer, or None when the layer stays dense."""
+    per = resolve_layer_calibration(module_name, calibration)
+    if per is None or per["a"] is None or per["b"] is None:
+        return None
+    return per["a"], per["b"]
 
 
 def _stamp_impl(impl, module_name: str, calibration: dict | None, seen: set[int]) -> int:
@@ -199,10 +200,10 @@ def _stamp_impl(impl, module_name: str, calibration: dict | None, seen: set[int]
     set_layer = getattr(impl, "set_layer_calibration", None)
     if set_layer is None:
         return 0
-    per = resolve_layer_calibration(module_name, calibration)
-    if not per or per.get("a") is None or per.get("b") is None:
+    curve = layer_calibration_curve(module_name, calibration)
+    if curve is None:
         return 0
-    set_layer(per["a"], per["b"])
+    set_layer(*curve)
     seen.add(id(impl))
     return 1
 
