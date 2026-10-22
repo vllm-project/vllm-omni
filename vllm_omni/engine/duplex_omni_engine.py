@@ -347,6 +347,15 @@ class DuplexOmniEngine(AsyncOmniEngine):
             ) from exc
 
     async def submit_command_async(self, session_id: str, command: DuplexCommand) -> None:
+        if not self.is_alive():
+            raise DuplexSessionError("engine is not alive", code="engine_dead", session_id=session_id)
+        message = DuplexSessionCommandMessage(session_id=session_id, command=command)
+        try:
+            self.request_queue.sync_q.put_nowait(message)
+            return
+        except queue.Full:
+            # Wait for capacity off the event loop, retaining the existing timeout.
+            pass
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, lambda: self._submit_command(session_id, command))
 
