@@ -39,6 +39,7 @@ import os
 import re
 from functools import cache
 from pathlib import Path
+from typing import Any
 
 import pytest
 import torch
@@ -184,7 +185,7 @@ pytestmark = [pytest.mark.slow]
 # ---------------------------------------------------------------------------
 
 
-_AR_STAGE_OVERRIDES = {"gpu_memory_utilization": 0.6, "skip_mm_profiling": True}
+_AR_STAGE_OVERRIDES: dict[str, Any] = {"gpu_memory_utilization": 0.6, "skip_mm_profiling": True}
 
 
 def _stage_config(quantization: str | None) -> str:
