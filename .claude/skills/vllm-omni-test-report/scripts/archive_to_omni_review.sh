@@ -67,15 +67,15 @@ git merge --ff-only origin/main >/dev/null 2>&1 \
 # ---- copy --------------------------------------------------------------------
 i=0
 for rel in "${RELS[@]}"; do
-  dst="$REVIEW/${DSTS[$i]}"
+  dst="$REVIEW/${DESTS[$i]}"
   mkdir -p "$(dirname "$dst")"
   rm -rf "$dst"
   cp -a "${SRCS[$i]}" "$dst"
-  echo "archived: ${SRCS[$i]} -> ${DSTS[$i]}"
+  echo "archived: ${SRCS[$i]} -> ${DESTS[$i]}"
   i=$((i+1))
 done
 
-git add -- "${DSTS[@]}"
+git add -- "${DESTS[@]}"
 if git diff --cached --quiet; then
   echo "ARCHIVE_NOOP: omni-reviewbot already up to date for: ${RELS[*]}"
   exit 0
