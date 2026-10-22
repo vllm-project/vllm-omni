@@ -1,8 +1,54 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
+import math
+
 from .logger import get_logger
 from .models import lookup_model_spec
-from .types import AutoregressionSamplingParams, DiffusionSamplingParams
+from .types import (
+    MINIMAX_H3_CONTROL_TYPES,
+    AutoregressionSamplingParams,
+    DiffusionSamplingParams,
+    MiniMaxH3Control,
+)
 
 logger = get_logger(__name__)
+
+_MINIMAX_H3_CONTROL_KEYS = frozenset(MiniMaxH3Control.__annotations__)
+
+
+def validate_minimax_h3_control(control: MiniMaxH3Control) -> None:
+    """Validate the proposed CTRL-01 H3 control contract without mutating it."""
+    unknown_keys = set(control) - _MINIMAX_H3_CONTROL_KEYS
+    if unknown_keys:
+        raise ValueError(f"Unknown MiniMax-H3 control fields: {', '.join(sorted(unknown_keys))}.")
+
+    control_type = control.get("control_type")
+    if control_type not in MINIMAX_H3_CONTROL_TYPES:
+        supported = ", ".join(MINIMAX_H3_CONTROL_TYPES)
+        raise ValueError(f"Unsupported MiniMax-H3 control_type {control_type!r}; expected one of: {supported}.")
+
+    strength = control.get("control_context_scale")
+    if isinstance(strength, bool) or not isinstance(strength, (int, float)):
+        raise ValueError("control_context_scale must be a finite, non-negative number.")
+    try:
+        normalized_strength = float(strength)
+    except (OverflowError, ValueError):
+        raise ValueError("control_context_scale must be a finite, non-negative number.") from None
+    if not math.isfinite(normalized_strength) or normalized_strength < 0:
+        raise ValueError("control_context_scale must be a finite, non-negative number.")
+
+    mask = control.get("mask")
+    mask_video = control.get("mask_video")
+    has_mask = mask is not None or mask_video is not None
+    if mask is not None and mask_video is not None:
+        raise ValueError("Provide only one of mask or mask_video, not both.")
+    if control.get("source_video") is not None and not has_mask:
+        raise ValueError("source_video requires mask or mask_video.")
+    if control_type == "inpaint" and not has_mask:
+        raise ValueError("inpaint requires mask or mask_video.")
+    if control_type != "inpaint" and control.get("control_video") is None:
+        raise ValueError(f"{control_type} requires control_video.")
 
 
 def validate_model_and_sampling_params_types(

@@ -55,8 +55,8 @@ function mergeModelValues(models, currentValue) {
  * one whenever a fetch fails: the dropdown is a convenience, and a server that
  * is down (or not started yet) must never make the node unfillable. `url`
  * edits refetch (debounced), the refresh button refetches immediately, and the
- * button is `serialize = false` so workflows saved before it existed still
- * restore their widget values positionally.
+ * button stays last and is excluded from workflow and API serialization, so
+ * saved workflows restore their widget values positionally without a gap.
  */
 class ModelComboController {
     constructor(node) {
@@ -78,9 +78,9 @@ class ModelComboController {
 
         const refreshButton = this.node.addWidget("button", "↻ refresh models", null, () => this.refreshModels());
         refreshButton.serialize = false;
-        // addWidget appends; move the button right after the model widget.
-        const widgets = this.node.widgets;
-        widgets.splice(widgets.indexOf(this.modelWidget) + 1, 0, widgets.pop());
+        refreshButton.options.serialize = false;
+        // Keep this non-serialized widget last: positional workflow serialization
+        // leaves a gap for skipped widgets between saved values.
         this.node.setSize([this.node.size[0], this.node.computeSize()[1]]);
 
         // Defer past onConfigure so a value restored from a saved workflow is
@@ -162,6 +162,24 @@ function setupModelCombo(node) {
     new ModelComboController(node).attach();
 }
 
+/** Restore graphs saved with the non-serialized refresh button between values. */
+function restoreModelComboWidgetValues(node, info) {
+    const widgets = node.widgets.filter((widget) => widget.serialize !== false);
+    const modelIndex = widgets.findIndex((widget) => widget.name === "model");
+    const values = info?.widgets_values;
+    const named = info?.widgets_values_named;
+    if (!named || values?.length !== widgets.length + 1 || values[modelIndex + 1] !== null) {
+        return
+    }
+    // That frontend serialized a gap but restored values contiguously. Its
+    // named values retained the original values, including prompt and duration.
+    for (const widget of widgets) {
+        if (widget.name in named) {
+            widget.value = named[widget.name];
+        }
+    }
+}
+
 /**
  * Rewrite a pre-rename Generate Video graph in place.
  *
@@ -218,6 +236,11 @@ app.registerExtension({
             nodeType.prototype.onNodeCreated = function () {
                 onNodeCreated?.apply(this, arguments);
                 setupModelCombo(this);
+            };
+            const onConfigure = nodeType.prototype.onConfigure;
+            nodeType.prototype.onConfigure = function (info) {
+                onConfigure?.apply(this, arguments);
+                restoreModelComboWidgetValues(this, info);
             };
         }
 
