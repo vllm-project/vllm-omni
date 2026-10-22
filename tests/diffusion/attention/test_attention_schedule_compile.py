@@ -13,7 +13,8 @@ TRTLLM_ATTN candidates subclass the production implementation, so ``__init__``, 
 by the SDPA math and passes ``key.shape[1]``, which equals the ``max_kv_len`` of ``forward_cuda`` for
 the unpacked inputs used here. ``forward_cuda`` and the kernel are not exercised here.
 
-Compilation on the target backend and Inductor is not covered here.
+Only ``test_dense_request_matches_a_service_without_a_schedule_bit_for_bit`` compiles with Inductor,
+on CPU. Compilation for the target GPU attention backend is not covered here.
 """
 
 from dataclasses import dataclass, fields
