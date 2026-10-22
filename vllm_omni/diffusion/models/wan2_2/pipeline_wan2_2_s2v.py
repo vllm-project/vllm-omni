@@ -541,6 +541,9 @@ class Wan22S2VPipeline(
     _DEFAULT_INFER_FRAMES = 80
     _DEFAULT_FPS = 16
     dummy_run_num_frames: ClassVar[int] = 0
+    # Step count forward() uses when the request leaves it unset. The model runner
+    # reads it to size the cache backend's context before forward() starts.
+    default_num_inference_steps: ClassVar[int] = 40
 
     def __init__(
         self,
@@ -1130,7 +1133,7 @@ class Wan22S2VPipeline(
         height: int = 704,
         width: int = 1024,
         infer_frames: int | None = None,
-        num_inference_steps: int = 40,
+        num_inference_steps: int | None = None,
         guidance_scale: float = 4.5,
         num_repeat: int | None = None,
         pose_video: str | None = None,
@@ -1199,7 +1202,7 @@ class Wan22S2VPipeline(
             or (req_num_frames if req_num_frames and req_num_frames > 1 else None)
             or self._DEFAULT_INFER_FRAMES
         )
-        num_steps = common.num_inference_steps or num_inference_steps
+        num_steps = common.num_inference_steps or num_inference_steps or self.default_num_inference_steps
         num_outputs_per_prompt = common.num_outputs_per_prompt or 1
         # The request's output_type is what serving honours downstream; the keyword
         # argument only carries a default for direct callers. Reading it here is what

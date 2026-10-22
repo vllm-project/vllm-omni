@@ -33,22 +33,29 @@ steps:
         source_file_dependencies: omni_qwen3_omni_reliability
         timeout_in_minutes: 180
         commands:
-          - pytest -s -v tests/dfx/reliability/test_reliability_qwen3_omni.py -m "slow"
+          - pytest -s -v tests/dfx/reliability/test_qwen3_omni.py -m "slow and cards_2"
         mirror_hardwares: h100_2
 
       - label: "Reliability Test · wan22"
         source_file_dependencies: diffusion_wan22_reliability
         timeout_in_minutes: 180
         commands:
-          - pytest -s -v tests/dfx/reliability/test_reliability_wan22.py -m "slow"
+          - pytest -s -v tests/dfx/reliability/test_wan22.py -m "slow and cards_1"
         mirror_hardwares: h100_1
 
       - label: "Reliability Test · hunyuan-image"
         source_file_dependencies: diffusion_hunyuan_image3_reliability
         timeout_in_minutes: 180
         commands:
-          - pytest -s -v tests/dfx/reliability/test_reliability_hunyuan_image.py -m "slow"
+          - pytest -s -v tests/dfx/reliability/test_hunyuan_image.py -m "slow and cards_4"
         mirror_hardwares: h100_4
+
+      - label: "Reliability Test · minicpmo-4.5"
+        source_file_dependencies: omni_minicpmo_4_5_reliability
+        timeout_in_minutes: 180
+        commands:
+          - pytest -s -v tests/dfx/reliability/test_minicpmo_4_5.py -m "slow and cards_1"
+        mirror_hardwares: h100_1
 
       - label: "Reliability Test · Invalid parameters · H100 · Single-GPU"
         source_file_dependencies: reliability_invalid_param_h100
@@ -331,6 +338,7 @@ steps:
 
       # Split the old shared H100 Single-GPU sweep: one pytest process collected
       # every slow+cards_1 diffusion file and exceeded 150 minutes.
+
       - label: "Diffusion · Qwen-Image · H100 · Single-GPU"
         timeout_in_minutes: 120
         commands:

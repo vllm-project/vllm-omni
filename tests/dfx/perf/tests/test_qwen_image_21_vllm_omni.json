@@ -35,8 +35,7 @@
         "extra_body": {
           "width": 512,
           "height": 512,
-          "num_inference_steps": 20,
-          "negative_prompt": "Negative prompt for benchmarking diffusion models"
+          "num_inference_steps": 20
         }
       },
       {
@@ -52,8 +51,7 @@
         "extra_body": {
           "width": 1536,
           "height": 1536,
-          "num_inference_steps": 35,
-          "negative_prompt": "Negative prompt for benchmarking diffusion models"
+          "num_inference_steps": 35
         }
       }
     ]
@@ -93,8 +91,7 @@
         "extra_body": {
           "width": 512,
           "height": 512,
-          "num_inference_steps": 20,
-          "negative_prompt": "Negative prompt for benchmarking diffusion models"
+          "num_inference_steps": 20
         }
       }
     ]
@@ -137,8 +134,7 @@
         "extra_body": {
           "width": 512,
           "height": 512,
-          "num_inference_steps": 20,
-          "negative_prompt": "Negative prompt for benchmarking diffusion models"
+          "num_inference_steps": 20
         }
       },
       {
@@ -154,8 +150,7 @@
         "extra_body": {
           "width": 1536,
           "height": 1536,
-          "num_inference_steps": 35,
-          "negative_prompt": "Negative prompt for benchmarking diffusion models"
+          "num_inference_steps": 35
         }
       },
       {
@@ -172,8 +167,7 @@
         "extra_body": {
           "width": 512,
           "height": 512,
-          "num_inference_steps": 20,
-          "negative_prompt": "Negative prompt for benchmarking diffusion models"
+          "num_inference_steps": 20
         }
       }
     ]
@@ -215,8 +209,7 @@
         "extra_body": {
           "width": 512,
           "height": 512,
-          "num_inference_steps": 20,
-          "negative_prompt": "Negative prompt for benchmarking diffusion models"
+          "num_inference_steps": 20
         }
       },
       {
@@ -233,8 +226,7 @@
         "extra_body": {
           "width": 512,
           "height": 512,
-          "num_inference_steps": 20,
-          "negative_prompt": "Negative prompt for benchmarking diffusion models"
+          "num_inference_steps": 20
         }
       }
     ]
@@ -275,8 +267,7 @@
         "extra_body": {
           "width": 512,
           "height": 512,
-          "num_inference_steps": 20,
-          "negative_prompt": "Negative prompt for benchmarking diffusion models"
+          "num_inference_steps": 20
         }
       }
     ]
@@ -317,8 +308,7 @@
         "extra_body": {
           "width": 512,
           "height": 512,
-          "num_inference_steps": 20,
-          "negative_prompt": "Negative prompt for benchmarking diffusion models"
+          "num_inference_steps": 20
         }
       }
     ]

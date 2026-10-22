@@ -283,6 +283,102 @@ def test_main_artifact_requires_the_exact_trusted_commit(tmp_path: Path) -> None
     )
 
 
+def test_release_line_accepts_same_line_or_main_and_rejects_other_lines(tmp_path: Path) -> None:
+    identity = _identity()
+    trusted = "7" * 40
+    release = "release/v0.30.0"
+    job_dir = tmp_path / "job"
+    job_dir.mkdir()
+    _write_module(job_dir / cache.module_filename(), b"release-module")
+    release_env = _env(
+        BUILDKITE_BUILD_ID="build-release",
+        BUILDKITE_BUILD_NUMBER="15000",
+        BUILDKITE_COMMIT=trusted,
+        BUILDKITE_BRANCH=release,
+        BUILDKITE_PULL_REQUEST="false",
+        VLLM_OMNI_AITER_MHA_TRUSTED_COMMIT="9" * 40,
+    )
+    provenance = cache.provenance_from_env(identity, release_env, checkout=trusted)
+    assert provenance is not None
+    published = cache.stage_publication(job_dir, tmp_path / "stage", identity, provenance)
+    assert published is not None
+    consumer = _env(
+        BUILDKITE_BRANCH=release,
+        BUILDKITE_PULL_REQUEST="false",
+        BUILDKITE_COMMIT=HEAD,
+        VLLM_OMNI_AITER_MHA_TRUSTED_COMMIT=trusted,
+    )
+    same_line = cache.BuildSource("build-release", 15000, trusted, release, "", False)
+    other_line = cache.BuildSource("build-other", 15001, trusted, "release/v0.31.0", "", False)
+    pull_request = cache.BuildSource("build-pr", 15002, trusted, release, "99", False)
+
+    assert cache.provenance_matches_source(published, same_line, identity, consumer)
+    assert not cache.provenance_matches_source(published, other_line, identity, consumer)
+    assert not cache.provenance_matches_source(published, pull_request, identity, consumer)
+
+    main_env = _env(
+        BUILDKITE_BUILD_ID="build-main",
+        BUILDKITE_BUILD_NUMBER="13999",
+        BUILDKITE_COMMIT=trusted,
+        BUILDKITE_BRANCH="main",
+        BUILDKITE_PULL_REQUEST="false",
+        VLLM_OMNI_AITER_MHA_TRUSTED_COMMIT="9" * 40,
+    )
+    main_provenance = cache.provenance_from_env(identity, main_env, checkout=trusted)
+    assert main_provenance is not None
+    main_published = cache.stage_publication(job_dir, tmp_path / "main-stage", identity, main_provenance)
+    assert main_published is not None
+    main_source = cache.BuildSource("build-main", 13999, trusted, "main", "", False)
+    assert cache.provenance_matches_source(main_published, main_source, identity, consumer)
+
+
+def test_release_line_candidate_sources_query_release_line_then_main() -> None:
+    trusted = "7" * 40
+    requested: list[str] = []
+
+    def fetch(url: str) -> str:
+        requested.append(url)
+        return ""
+
+    cache.candidate_sources(
+        _env(
+            BUILDKITE_BRANCH="release/v0.30.0",
+            BUILDKITE_PULL_REQUEST="false",
+            BUILDKITE_COMMIT=HEAD,
+            VLLM_OMNI_AITER_MHA_TRUSTED_COMMIT=trusted,
+        ),
+        fetch=fetch,
+    )
+
+    def _index(branch: str, commit: str) -> int:
+        needle_branch = f"branch={branch.replace('/', '%2F')}"
+        return next(i for i, url in enumerate(requested) if needle_branch in url and f"commit={commit}" in url)
+
+    assert _index("release/v0.30.0", trusted) < _index("main", trusted)
+
+
+def test_release_line_pull_request_trusts_only_main() -> None:
+    trusted = "7" * 40
+    requested: list[str] = []
+
+    def fetch(url: str) -> str:
+        requested.append(url)
+        return ""
+
+    cache.candidate_sources(
+        _env(
+            BUILDKITE_BRANCH="release/v0.30.0",
+            BUILDKITE_PULL_REQUEST="123",
+            BUILDKITE_COMMIT=HEAD,
+            VLLM_OMNI_AITER_MHA_TRUSTED_COMMIT=trusted,
+        ),
+        fetch=fetch,
+    )
+
+    assert any("branch=main" in url and f"commit={trusted}" in url for url in requested)
+    assert not any("branch=release%2Fv0.30.0" in url and f"commit={trusted}" in url for url in requested)
+
+
 def test_discovery_uses_server_metadata_and_excludes_the_current_build() -> None:
     listing = (
         '<a href="/vllm/vllm-omni-amd-ci/builds/14001">current</a>'

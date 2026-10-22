@@ -957,7 +957,9 @@ class OmniStreamingVideoHandler:
         try:
             chat_request = ChatCompletionRequest(**request_kwargs)
             if config.sampling_params_list:
-                params = self._chat_service._to_sampling_params_list(config.sampling_params_list)
+                params = self._chat_service._to_sampling_params_list(
+                    config.sampling_params_list, merge_llm_defaults=False
+                )
                 # Explicit params must retain the engine's streaming output mode.
                 sampling_kwargs["sampling_params_list"] = coerce_param_message_types(params, is_streaming=True)
         except Exception as e:

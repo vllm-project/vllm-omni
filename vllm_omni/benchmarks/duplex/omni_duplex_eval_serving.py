@@ -26,6 +26,7 @@ from vllm_omni.benchmarks.duplex.omni_duplex_eval_eval import evaluate_sample, s
 from vllm_omni.benchmarks.duplex.omni_duplex_eval_judge import DuplexJudge
 from vllm_omni.benchmarks.duplex.omni_duplex_eval_runner import (
     DEFAULT_INSTRUCTIONS,
+    MIX_QUESTION,
     GenerateSampleResult,
     PreparedReferenceAudio,
     PreparedSample,
@@ -56,6 +57,7 @@ class OmniDuplexEvalSampleRequest(SampleRequest):
     response_root: Path = Path("omni-duplex-eval-output")
     ref_audio: PreparedReferenceAudio | None = field(default=None, repr=False)
     fps: float = 1.0
+    mix: str = MIX_QUESTION
     turn_detection: str = TURN_DETECTION_NONE
     instructions: str | None = DEFAULT_INSTRUCTIONS
     evaluation: DuplexEvalEvaluation | None = field(default=None, repr=False)
@@ -117,6 +119,7 @@ def get_duplex_eval_samples(args: argparse.Namespace) -> list[SampleRequest]:
                 response_root=root,
                 ref_audio=reference,
                 fps=args.duplex_eval_fps,
+                mix=args.duplex_eval_mix,
                 turn_detection=args.duplex_eval_turn_detection,
                 instructions=(
                     DEFAULT_INSTRUCTIONS
@@ -138,6 +141,7 @@ def prepare_duplex_eval_sample(request: OmniDuplexEvalSampleRequest) -> Prepared
         media_dir=request.response_root / request.sample.split / ".media" / request.sample.id,
         ref_audio=request.ref_audio,
         fps=request.fps,
+        mix=request.mix,
     )
 
 

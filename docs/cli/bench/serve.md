@@ -6,6 +6,13 @@ The vllm bench command launches the vLLM-Omni benchmark to evaluate the performa
 
 vLLM-Omni registers the `openai-chat-omni`, `openai-audio-speech`, `openai-image-edits-omni`, `daily-omni`, `openai-realtime-duplex`, `openai-realtime-tts`, and `openai-realtime-chat` serving benchmark backends. It also adds the `omniinteract` dataset.
 
+`openai-chat-omni` retries explicit `ServiceUnavailableError` responses with
+code 503 up to three times, provided no text, reasoning, tool, audio, or image
+output has arrived. This includes retryable multimodal cache misses reported
+inside an HTTP 200 SSE stream. Other server errors and partial responses remain
+failed requests. Request latency and time to first output include failed
+attempts and retry delays.
+
 ## Basic Parameter Description
 
 You can use `vllm bench serve --omni --help=all` to get descriptions of all parameters. The commonly used parameters are described below:
@@ -363,7 +370,20 @@ sample can contain a single user statement, so a blanket two-response minimum is
 not valid. Deterministic CPU tests cover adjacent speech boundaries separately.
 
 Inputs retain the standalone runner's real-time pacing, question audio, media
-clock and 1 FPS default (`--duplex-eval-fps`). Each session decodes its media in a
+clock and 1 FPS default (`--duplex-eval-fps`). `--duplex-eval-mix` selects the
+session audio: `question` (default) streams only the instruction audio, while
+`soundtrack` sums it with the clip's own audio track, sample by sample with int16
+clipping. The dataset pads each instruction to the clip length. Clip audio is placed
+at its presentation time relative to the video start, including a leading silence
+when the track starts later, so the overlay keeps the original timestamps. Use
+`soundtrack` for samples that depend on what is said
+or heard in the clip, such as the word-repetition prompts in
+`PR_post_event_reminder` and `RTD_Omni`; a clip without an audio track keeps the
+instruction alone. The standalone `generate` command accepts the same choice as `--mix`.
+The MiniCPM-o Omni-DuplexEval nightly (`tests/dfx/perf/tests/test_minicpmo_4_5_omni_duplex_eval.json`)
+runs with `soundtrack`; the Qwen3-Omni `server_vad` nightly keeps `question`.
+
+Each session decodes its media in a
 worker thread after acquiring a concurrency slot, and releases the decoded input
 when the request finishes. `--max-concurrency` therefore bounds the number of
 decoded clips held in memory; the reference audio is encoded once and shared.
@@ -393,7 +413,12 @@ Each invocation creates an exclusive `run-*` subdirectory, so repeated runs and
 concurrency/QPS sweeps do not overwrite or reuse earlier responses. The actual
 run path is logged and returned in `omni_duplex_eval.response_root` in the saved
 benchmark result. Only successful measured sessions publish `<split>/<id>.json`
-and `<id>.meta.json`, using the existing judge format. Publication occurs after benchmark timing, alongside
+and `<id>.meta.json`, using the upstream judge format: RTD scoring reads its
+`sentences`, and PR scoring places its per-output `chunks` (`text`,
+`current_time`) in the 10-second reminder window. A response that is a bare
+sentence list is scored by sentence start. The standalone `generate` command
+refuses to reuse a proactive-reminder response that has no `chunks`; RTD
+responses are reused from their sentences. Publication occurs after benchmark timing, alongside
 `duplex_metrics.json`; artifact errors are recorded in the saved result's
 `omni_duplex_eval` summary without discarding service measurements.
 
@@ -449,19 +474,35 @@ unpublished sessions. To automatically score the actual successfully published
 samples, including shuffled or partially successful runs, use
 `--duplex-eval-evaluate` during `bench serve`.
 
-The standalone `generate` command remains available, including its existing
-skip-existing/overwrite behavior. This integration does not change scoring rules
-or enable new nightly jobs.
+The standalone `generate` command remains available. It still skips an existing
+sample unless `--overwrite` is set, and it reuses that sample only when the
+recorded mix matches (metadata without a mix counts as `question`). A different
+mix is rejected instead of returning the other artifact. This integration does
+not add nightly jobs. The MiniCPM-o job above selects `soundtrack`.
 
 For shuffled runs, use `evaluate --ids` with the successful selected sample IDs
 instead of `--limit`. Failed sessions have no judge input; do not silently drop
 them when reporting coverage or accuracy.
 
-This adapter retains the standalone runner's completion policy: it waits for a
-`response.done`, not an independently correlated final-input acknowledgment.
-A successful transport/session result is therefore not proof that every final
-input produced a response, nor an accuracy score. Final-input lifecycle
-hardening is separate from this entrypoint integration.
+This adapter retains the standalone runner's completion policy. Without
+`server_vad`, a session finishes once every created response has its
+`response.done`, no commit, listen, or response event has arrived for 2 seconds,
+and the residual unit flushed by the commit has decided. That decision is a
+`response.done` for a response created after `input_audio_buffer.committed`, or a
+`response.listen` with `model_listen` after every reply that was still open at
+that commit has finished. A reply already open when the clip ends does not
+decide the session: completing it normally is what starts the residual unit, and
+that unit can still open a response. A cancelled reply does not decide the
+session either: barge-in cancels that turn, and the residual response can still
+open afterwards. A failed reply does end the wait. The server does not promote
+another unit after a failure, and a failed response created after the commit is
+itself the residual. The listening outcome is
+a session in which the model never spoke; it publishes empty judge input and
+scores 0 instead of failing on the drain timeout. The runner withholds the last
+PCM sample when the clip ends on a model-unit boundary, so the commit always
+flushes a residual unit and that decision covers the end of the clip. A
+successful transport/session result is therefore not proof that every final
+input produced a response, nor an accuracy score.
 
 ### OmniInteract Realtime Benchmark
 
@@ -531,14 +572,26 @@ length because input is paced in real time.
 | Result key suffix | Starts at | Ends at |
 | --- | --- | --- |
 | `duplex_response_ttft_ms` / `duplex_response_ttfp_ms` | server: request accepted by the engine | first text / audio output |
-| `duplex_client_ttft_ms` / `duplex_client_ttfp_ms` | client: `response.created` received | first text / audio delta received |
+| `duplex_client_ttft_ms` | client: `response.created` received | first non-empty text delta |
+| `duplex_client_ttfp_ms` | client: last `input_audio_buffer.append` send before this `response.created` (after the previous `response.created` or stream start), when that send was recorded | first audio delta |
 
 The server timer starts only after the model plugin prepared the prompt and the engine accepted it, so it leaves out
 prompt preparation; for Qwen3-Omni that is decoding the retained images, the chat template, and multimodal
-preprocessing. The client timer starts when `response.created` is received, after the server detects the end of the
-turn. It excludes VAD silence detection and any delay before that event arrives, so it does not measure the full
-user-speech-end to first-output latency. The server start point differs between model plugins, so compare server
-keys only within one model. VAD uses `silence_duration_ms: 500` by default.
+preprocessing. `duplex_client_ttft_ms` starts when `response.created` is received, after the server detects the end of
+the turn, so Qwen3-Omni's prompt preparation after that event is included. OmniInteract and Omni-DuplexEval record
+append sends, so `duplex_client_ttfp_ms` starts at the last append in that turn window rather than at `response.created`.
+On a continuous stream with server VAD, the turn closes after `silence_duration_ms` of trailing silence (500 ms by
+default), so that last append is typically the chunk in which server VAD closed the turn, and
+`duplex_client_ttfp_ms` is about `response_created_to_first_audio_ms` plus a phase in `[0, chunk_ms)`. The phase
+scales with the adapter's chunk size: native OmniInteract uses 200 ms, native Omni-DuplexEval uses ~1 s units, and
+`server_vad` sends 32 ms detector frames. Proactive or silence-driven turns still use the last append in the window.
+Created-origin audio stays on `response_created_to_first_audio_ms` (and
+`audio_output.response_created_to_first_audio_ms`) and is not copied into `client_ttfp_ms`. Both client timers exclude
+VAD silence detection and any delay before the last recorded append / `response.created` arrives, so they do not
+measure the full user-speech-end to first-output latency. Per-response `client_rtf` uses the same append-send start
+through the last audio packet, divided by emitted audio duration, when an append send was recorded. The server start
+point differs between model plugins, so compare server keys only within one model; client append keys are only
+comparable within one adapter / chunk size.
 Qwen3-Omni duplex reports no per-token timing, so TPOT and ITL are unavailable. A turn-based model acknowledges a proactive request right away but does not speak again when the
 event later happens, so proactive and 1QnA scenarios score low by construction.
 
@@ -620,8 +673,11 @@ timing. If transcript chunks include `aligned_words`, the evaluator splits bound
 timing from word alignment.
 
 Per-response TTFT and TTFP start when the server begins executing the native model-turn request that owns the response. RTF
-continues to use client receipt of `response.created` through the last audio packet, divided by emitted audio duration. Global
-TTFT, TTFP, and RTF cover the complete input-stream window. TPOT/ITL use engine stage-0 timing; ITL is emitted only when every
+continues to use client receipt of `response.created` through the last audio packet, divided by emitted audio duration.
+When the client recorded `input_audio_buffer.append` sends, `client_ttfp_ms` / `client_rtf` start at the last such send
+before this `response.created` (after the previous `response.created` or stream start). `client_ttft_ms` still starts at
+`response.created`. Created-origin audio is `response_created_to_first_audio_ms` and is not copied into `client_ttfp_ms`.
+Global TTFT, TTFP, and RTF cover the complete input-stream window. TPOT/ITL use engine stage-0 timing; ITL is emitted only when every
 token interval is present within a continuous generation segment. Model-unit pacing and gaps between generation segments are
 excluded from TPOT/ITL. Raw request metrics retain `response_created_to_first_text_ms` and
 `response_created_to_first_audio_ms` as client-envelope diagnostics.
@@ -681,8 +737,10 @@ It differs from the MiniCPM-o configuration in three ways:
   IA-QTF1 must be at or above `omniinteract_aggregate_min_ia_qtf1` (checked in as `0.3`); a single run on four cases
   measured `0.50`, so the floor catches a lost correct answer or more, not small judge noise.
 - **Latency.** Compare Qwen3-Omni runs on the per-response keys, primarily `mean_duplex_client_ttfp_ms`
-  (`response.created` received to first audio, including prompt preparation); the standard TTFT rows average sessions
-  first, and TPOT is unavailable.
+  (last append send in the turn window to first audio; on a continuous VAD stream this is about
+  `response_created_to_first_audio_ms` plus a `[0, chunk_ms)` phase from the chunk in which server VAD closed the
+  turn, and includes prompt preparation after `response.created`). Compare those client append keys only within one
+  adapter / chunk size. The standard TTFT rows average sessions first, and TPOT is unavailable.
 
 ### Seed-TTS reference speech as real audio input
 

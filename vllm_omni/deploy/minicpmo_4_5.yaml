@@ -16,6 +16,11 @@ connectors:
   connector_of_shared_memory:
     name: SharedMemoryConnector
     extra:
+      # Talker codec prelude: one Triton kernel for the rep-penalty and
+      # temperature steps on NPU. Defaults to on; set false to force the eager
+      # chain for accuracy triage (e.g. after a CANN/torch_npu upgrade). It is
+      # a no-op off NPU or without Triton.
+      # talker_codec_fused_prelude: false
       connector_get_sleep_s: 0.01
       connector_get_max_wait_first_chunk: 3000
       connector_get_max_wait: 300
@@ -50,6 +55,12 @@ connectors:
       micro_batch_size: 4
       cfm_precapture_empty_cache: true
       cfm_max_graphs: 32
+      # Default CUDA speaker path: CPU-reference TensorRT, not full DiT TensorRT.
+      # Missing TensorRT falls back to the Torch speaker. Non-CUDA ignores the
+      # flag. Set false in an overlay to keep Torch. token2wav_trt /
+      # MINICPMO_TOKEN2WAV_TRT and token2wav_device_spk: false win when both
+      # are set.
+      token2wav_spk_cpu_reference: true
 
 stages:
   - stage_id: 0
@@ -137,6 +148,11 @@ stages:
 
 platforms:
   cuda:
+    # Private MPS for colocated CUDA stages. NPU does not read this block.
+    # A missing or failing nvidia-cuda-mps-control daemon, parallel stage
+    # init, or a stage that is not one numeric GPU disables MPS and continues. Set false
+    # in an overlay to disable it explicitly.
+    cuda_mps: true
     stages:
       - stage_id: 1
         # Full-attention occupancy is bounded by max_num_seqs * max_model_len
