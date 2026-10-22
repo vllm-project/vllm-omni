@@ -7,6 +7,7 @@ import os
 
 import pytest
 import torch
+from vllm.platforms import current_platform
 from vllm.triton_utils import HAS_TRITON
 
 from tests.helpers.mark import hardware_marks
@@ -43,7 +44,7 @@ def _rope(seq_len: int):
     return torch.cos(angles), torch.sin(angles)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.skipif(not current_platform.is_cuda() or not torch.cuda.is_available(), reason="NVIDIA CUDA required")
 @pytest.mark.skipif(not HAS_TRITON, reason="Triton required")
 @pytest.mark.parametrize("double_stream", [True, False])
 def test_ovis_attention_fused_matches_eager(_dist_env, double_stream):
