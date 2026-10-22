@@ -256,27 +256,34 @@ python3 benchmarks/diffusion/diffusion_benchmark_serving.py \
 **Symptoms**:
 
 ```text
-WARNING: vae_patch_parallel_size=2 is set but VAE patch parallelism is NOT enabled for xxxPipeline; ignoring.
+WARNING: Declared VAE settings for xxxPipeline are ignored: found 0 compatible distributed VAEs (vae_patch_parallel_size=2, vae_parallel_mode=tile).
 ```
 
-**Root Cause**: VAE Patch Parallelism requires the model's VAE to implement `DistributedVaeMixin`. At startup, `vllm_omni/diffusion/registry.py` checks whether the instantiated pipeline has a `.vae` attribute that is an instance of `DistributedVaeMixin`. If it does not, the setting is silently ignored:
+The count may also be greater than one when the pipeline exposes several
+compatible VAE instances and the target is ambiguous.
 
-```python
-vae_pp_size = od_config.parallel_config.vae_patch_parallel_size
-is_distributed_vae = hasattr(model, "vae") and isinstance(model.vae, DistributedVaeMixin)
-if vae_pp_size > 1 and not is_distributed_vae:
-    logger.warning(
-        "vae_patch_parallel_size=%d is set but VAE patch parallelism is NOT enabled for %s; ignoring.",
-        vae_pp_size,
-        od_config.model_class_name,
-    )
-```
+**Root Cause**: VAE parallelism requires a VAE that implements
+`DistributedVaeMixin`. The [model registry](gh-file:vllm_omni/diffusion/registry.py)
+first prefers a compatible `model.vae`. Otherwise it uses
+`ModuleDiscovery.discover(model).vaes`, which resolves declared `_vae_modules`
+paths such as `gen_vae` and deduplicates aliases to the same module. Exactly
+one compatible discovered VAE is required; the registry warns rather than
+choosing among multiple instances.
+
+Discovery runs when parallel size exceeds one, slicing or tiling is requested,
+or `vae_parallel_mode` is non-default. Thus slicing-only requests and explicit
+spatial-shard modes also reach discovery at parallel size one. If the selected
+VAE does not support the requested mode, its `set_parallel_size` raises an
+error. A plain `model.vae` can still use its standard single-rank slicing and
+tiling settings without implementing distributed decode.
 
 **Solutions**:
 
 1. **Use a supported model** (recommended): check [Supported Models](../../diffusion_features.md#supported-models) for the VAE-Patch-Parallel column.
 
-2. To add support for a new model, implement `DistributedVaeMixin` on its VAE class (contributions are welcome).
+2. To add support for a new model, implement `DistributedVaeMixin` on its VAE class. For a nonstandard attribute, expose its path through `_vae_modules` and `SupportsComponentDiscovery`.
+
+3. For an ambiguous target, use a pipeline with one compatible VAE target or make the target unambiguous in the model integration. Check that the requested mode is supported by that VAE implementation.
 
 ### Common Issue 2: `vae_patch_parallel_size` Exceeds DiT Process Group Size
 

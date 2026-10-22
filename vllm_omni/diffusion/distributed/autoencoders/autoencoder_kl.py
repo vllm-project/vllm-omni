@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import math
+from collections.abc import Callable
 from typing import Any
 
 import torch
@@ -29,15 +30,31 @@ logger = init_logger(__name__)
 
 # We use base class because some model re-implement AutoencoderKL, but split is share.
 class DistributedAutoencoderKL_base(DistributedVaeMixin):
+    # Supplied by the concrete Diffusers autoencoder through the mixin MRO.
+    tile_latent_min_size: int
+    tile_sample_min_size: int
+    tile_overlap_factor: float
+    config: Any
+    post_quant_conv: torch.nn.Module
+    decoder: torch.nn.Module
+    dtype: torch.dtype
+    blend_v: Callable[[torch.Tensor, torch.Tensor, int], torch.Tensor]
+    blend_h: Callable[[torch.Tensor, torch.Tensor, int], torch.Tensor]
+
+    def set_parallel_size(self, parallel_size: int, mode: str = "tile") -> None:
+        if mode not in {"tile", "batch"}:
+            raise ValueError(f"AutoencoderKL VAE parallel decode supports only 'tile' and 'batch'; got {mode!r}")
+        super().set_parallel_size(parallel_size, mode=mode)
+
     @classmethod
     def from_pretrained(cls, *args: Any, **kwargs: Any):
-        model = super().from_pretrained(*args, **kwargs)
+        model = super().from_pretrained(*args, **kwargs)  # type: ignore[misc]
         model.init_distributed()
         return model
 
     @classmethod
     def from_config(cls, *args: Any, **kwargs: Any):
-        model = super().from_config(*args, **kwargs)
+        model = super().from_config(*args, **kwargs)  # type: ignore[misc]
         model.init_distributed()
         return model
 
@@ -84,6 +101,49 @@ class DistributedAutoencoderKL_base(DistributedVaeMixin):
         )
         return DecoderOutput(sample=result) if return_dict else (result,)
 
+    def _slice_spatial_tasks(
+        self, z: torch.Tensor, tasks: list[TileTask], grid_spec: GridSpec
+    ) -> tuple[list[TileTask], GridSpec]:
+        if not getattr(self, "use_slicing", False) or z.shape[0] <= 1:
+            return tasks, grid_spec
+        sliced_tasks = [
+            TileTask(
+                batch_index * len(tasks) + task.tile_id,
+                (batch_index, *task.grid_coord),
+                task.tensor[batch_index : batch_index + 1],
+                workload=task.workload,
+            )
+            for batch_index in range(z.shape[0])
+            for task in tasks
+        ]
+        return sliced_tasks, GridSpec(
+            split_dims=(0, *grid_spec.split_dims),
+            grid_shape=(z.shape[0], *grid_spec.grid_shape),
+            tile_spec=grid_spec.tile_spec,
+            output_dtype=grid_spec.output_dtype,
+        )
+
+    def _merge_sliced_spatial_tiles(
+        self,
+        coord_tensor_map: dict[tuple[int, ...], torch.Tensor],
+        grid_spec: GridSpec,
+        merge: Callable[[dict[tuple[int, ...], torch.Tensor], GridSpec], torch.Tensor],
+    ) -> torch.Tensor:
+        spatial_grid = GridSpec(
+            split_dims=grid_spec.split_dims[1:],
+            grid_shape=grid_spec.grid_shape[1:],
+            tile_spec=grid_spec.tile_spec,
+            output_dtype=grid_spec.output_dtype,
+        )
+        images = [
+            merge(
+                {coord[1:]: tensor for coord, tensor in coord_tensor_map.items() if coord[0] == batch_index},
+                spatial_grid,
+            )
+            for batch_index in range(grid_spec.grid_shape[0])
+        ]
+        return torch.cat(images, dim=0)
+
     def tile_split(self, z: torch.Tensor) -> tuple[list[TileTask], GridSpec]:
         # mostly copy from AutoencoderKL
         overlap_size = int(self.tile_latent_min_size * (1 - self.tile_overlap_factor))
@@ -92,7 +152,7 @@ class DistributedAutoencoderKL_base(DistributedVaeMixin):
 
         # Split z into overlapping 64x64 tiles and decode them separately.
         # The tiles have an overlap to avoid seams between tiles.
-        tiletask_list = []
+        tiletask_list: list[TileTask] = []
         for i in range(0, z.shape[2], overlap_size):
             for j in range(0, z.shape[3], overlap_size):
                 tile = z[:, :, i : i + self.tile_latent_min_size, j : j + self.tile_latent_min_size]
@@ -114,7 +174,7 @@ class DistributedAutoencoderKL_base(DistributedVaeMixin):
             grid_shape=(tiletask_list[-1].grid_coord[0] + 1, tiletask_list[-1].grid_coord[1] + 1),
             tile_spec=tile_spec,
         )
-        return tiletask_list, grid_spec
+        return self._slice_spatial_tasks(z, tiletask_list, grid_spec)
 
     def tile_exec(self, task: TileTask) -> torch.Tensor:
         """Decode a single latent tile into RGB space."""
@@ -126,6 +186,9 @@ class DistributedAutoencoderKL_base(DistributedVaeMixin):
 
     def tile_merge(self, coord_tensor_map: dict[tuple[int, ...], torch.Tensor], grid_spec: GridSpec) -> torch.Tensor:
         """Merge decoded tiles into a full image."""
+
+        if grid_spec.split_dims[0] == 0:
+            return self._merge_sliced_spatial_tiles(coord_tensor_map, grid_spec, self.tile_merge)
 
         grid_h, grid_w = grid_spec.grid_shape
         result_rows = []
@@ -156,7 +219,7 @@ class DistributedAutoencoderKL_base(DistributedVaeMixin):
             if max_parallel_size % rows == 0:
                 grid_rows, grid_cols = rows, max_parallel_size // rows
                 break
-        tiletask_list = []
+        tiletask_list: list[TileTask] = []
         halo_size = dict()
         for i in range(grid_rows):
             for j in range(grid_cols):
@@ -191,12 +254,14 @@ class DistributedAutoencoderKL_base(DistributedVaeMixin):
             tile_spec=tile_spec,
             output_dtype=self.dtype,
         )
-        return tiletask_list, grid_spec
+        return self._slice_spatial_tasks(z, tiletask_list, grid_spec)
 
     def patch_exec(self, task: TileTask) -> torch.Tensor:
         return self.tile_exec(task)
 
     def patch_merge(self, coord_tensor_map: dict[tuple[int, ...], torch.Tensor], grid_spec: GridSpec) -> torch.Tensor:
+        if grid_spec.split_dims[0] == 0:
+            return self._merge_sliced_spatial_tiles(coord_tensor_map, grid_spec, self.patch_merge)
         grid_h, grid_w = grid_spec.grid_shape
         result_rows = []
         for i in range(grid_h):
@@ -238,16 +303,15 @@ class DistributedAutoencoderKL_base(DistributedVaeMixin):
         if self.distributed_executor.parallel_mode == "batch":
             return self._batch_parallel_decode(z, return_dict, *args, **kwargs)
         if not self.is_distributed_enabled():
-            return super().decode(z, return_dict=return_dict, *args, **kwargs)
+            return super().decode(z, return_dict=return_dict, *args, **kwargs)  # type: ignore[misc]
 
         split, exec, merge = self._strategy_select(z)
 
         if split is not None:
             strategy = "tile" if split == self.tile_split else "patch"
             logger.info(f"Decode run with distributed executor, split strategy is {strategy}")
-            result = self.distributed_executor.execute(
-                z, DistributedOperator(split=split, exec=exec, merge=merge), broadcast_result=False
-            )
+            operator = DistributedOperator(split=split, exec=exec, merge=merge)
+            result = self.distributed_executor.execute(z, operator, broadcast_result=False)
             if not return_dict:
                 return (result,)
 
@@ -255,7 +319,7 @@ class DistributedAutoencoderKL_base(DistributedVaeMixin):
 
             return DecoderOutput(sample=result)
         else:
-            return super().decode(z, return_dict=return_dict, *args, **kwargs)
+            return super().decode(z, return_dict=return_dict, *args, **kwargs)  # type: ignore[misc]
 
 
 class DistributedAutoencoderKL(DistributedAutoencoderKL_base, Diffusers_AutoencoderKL):

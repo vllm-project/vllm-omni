@@ -127,7 +127,7 @@ def test_pipeline_propagates_quant_config_to_all_dit_projections(monkeypatch, ti
     )
     # Only the unrelated VAE is stubbed; keep the complete pipeline ->
     # transformer -> block -> linear constructor chain real.
-    monkeypatch.setattr(pipeline_module.AutoencoderKL, "from_config", lambda config: torch.nn.Identity())
+    monkeypatch.setattr(pipeline_module.DistributedAutoencoderKL, "from_config", lambda config: torch.nn.Identity())
     pipeline = pipeline_module.MammothModa2DiTPipeline(od_config=od_config, prefix=prefix)
     transformer_prefix = f"{prefix}.gen_transformer" if prefix else "gen_transformer"
     _assert_quantized_projections(pipeline.gen_transformer, quant_config, transformer_prefix)
