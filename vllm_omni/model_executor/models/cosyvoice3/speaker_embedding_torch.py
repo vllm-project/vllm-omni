@@ -109,10 +109,14 @@ class CampplusTorch:
                     torch.npu.synchronize()
                     entry = (graph, static_in, static_out)
                     self._graphs[frames] = entry
-                    # The capture output is already this request's result;
-                    # record so later replays on other streams wait on the
-                    # buffers being written.
+                    # Captured kernels are recorded, not executed, so
+                    # static_out still holds uninitialized pool memory
+                    # here (the warmup results above went to temporary
+                    # tensors). Replay once so this request gets the same
+                    # real result the replay path produces.
+                    graph.replay()
                     out = static_out.clone()
+                    self._replay_calls += 1
                     self._graph_done = stream.record_event() if stream is not None else None
                     logger.info(
                         "CAM++ graph captured for %d frames (replays so far: %d, eager calls: %d)",

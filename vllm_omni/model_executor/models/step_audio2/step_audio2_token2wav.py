@@ -423,11 +423,15 @@ class StepAudio2Token2WavCore(nn.Module):
                     torch.npu.synchronize()
                     entry = (graph, static_mels, static_lens, static_code, code_len)
                     self._s3_graphs[frames] = entry
-                    # The capture output is already this request's result;
-                    # record so later replays on other streams wait on the
-                    # buffers being written.
+                    # Captured kernels are recorded, not executed, so
+                    # static_code and code_len still hold uninitialized
+                    # pool memory here (the warmup results above went to
+                    # temporary tensors). Replay once so this request
+                    # gets the same real result the replay path produces.
+                    graph.replay()
                     code = static_code.clone()
                     code_len = entry[4].clone()
+                    self._s3_replay_calls += 1
                     self._s3_graph_done = stream.record_event() if stream is not None else None
                     logger.info(
                         "S3 quantize graph captured for %d frames (replays so far: %d, eager calls: %d)",
