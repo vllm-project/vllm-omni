@@ -25,8 +25,10 @@
 #           else ~/omni-reviewbot.
 # Push:     direct push to main (credentials: /root/.gitconfig github.com
 #           helper, yenuo26, WRITE on JiusiServe/omni-reviewbot). Retries with
-#           lowSpeedLimit; on non-fast-forward rejection (github-actions bot
-#           races, e.g. the 14:00 UTC buildkite sync) re-fetch + rebase + retry.
+#           lowSpeedLimit; on non-fast-forward rejection (remote moved ahead,
+#           or the initial fetch flaked and the commit landed on a stale base)
+#           rebuilds the commit on the fresh origin/main and retries — a plain
+#           rebase stalls on same-file conflicts (seen twice on 2026-10-22).
 #           A data push with these credentials DOES trigger build-kanban-site
 #           (paths: kanban/data/**), so the site rebuilds automatically.
 # Identity: commits as yenuo26 <410167048@qq.com> (repo has no local git
@@ -60,6 +62,13 @@ done
 
 # ---- prepare omni-reviewbot working tree -------------------------------------
 cd "$REVIEW" || fail "cannot cd $REVIEW"
+# self-heal: a previous run's retry-rebase can stop half-done on a same-file
+# conflict and leave the repo unusable; abort it before the clean-tree check
+# (only when the stopped rebase is one of OUR archive commits)
+if [ -f .git/rebase-merge/done ] && grep -q "chore(data): archive reports" .git/rebase-merge/done 2>/dev/null; then
+  git rebase --abort >/dev/null 2>&1 || true
+  echo "WARN: aborted a stuck rebase from a previous archive run" >&2
+fi
 git diff --quiet && git diff --cached --quiet \
   || fail "$REVIEW has uncommitted changes; clean it first"
 git fetch origin main >/dev/null 2>&1 \
@@ -91,12 +100,38 @@ git -c user.name="yenuo26" -c user.email="410167048@qq.com" commit -q \
   -m "Co-Authored-By: Claude Code <noreply@anthropic.com>"
 
 # ---- push with retry ---------------------------------------------------------
+# Rebuild the archive commit on top of the fresh origin/main. The sources are
+# still on disk, so abort/reset/re-copy/re-commit is idempotent — and unlike a
+# plain `git rebase`, it cannot stall on a same-file conflict.
+recommit() {
+  git rebase --abort >/dev/null 2>&1 || true
+  git fetch origin main >/dev/null 2>&1
+  git reset --hard origin/main >/dev/null 2>&1
+  local i=0 dst
+  for rel in "${RELS[@]}"; do
+    dst="$REVIEW/${DESTS[$i]}"
+    mkdir -p "$(dirname "$dst")"
+    rm -rf "$dst"
+    cp -a "${SRCS[$i]}" "$dst" || fail "copy failed: ${SRCS[$i]} -> $dst"
+    i=$((i+1))
+  done
+  git add -- "${DESTS[@]}"
+  if git diff --cached --quiet; then
+    echo "ARCHIVE_NOOP after rebuild on origin/main: ${RELS[*]}"
+    exit 0
+  fi
+  git -c user.name="yenuo26" -c user.email="410167048@qq.com" commit -q \
+    -m "chore(data): archive reports (UTC $(date -u +%Y-%m-%dT%H:%M:%SZ))" \
+    -m "Archived: ${RELS[*]}" \
+    -m "Co-Authored-By: Claude Code <noreply@anthropic.com>"
+}
+
 for try in 1 2 3 4 5 6; do
   if git -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=30 push origin main; then
     echo "ARCHIVE_PUSH_OK (try $try): ${RELS[*]}"
     exit 0
   fi
-  git fetch origin main >/dev/null 2>&1 && git rebase origin/main >/dev/null 2>&1
+  recommit
   sleep 10
 done
 fail "push failed after 6 tries (commit kept locally in $REVIEW - retry later)"
