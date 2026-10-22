@@ -540,6 +540,11 @@ def initialize_model(
         if hasattr(model, "vae") and hasattr(model.vae, "use_tiling"):
             model.vae.use_tiling = od_config.vae_use_tiling
 
+        from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import DistributedAutoencoderKLWan
+
+        if isinstance(getattr(model, "vae", None), DistributedAutoencoderKLWan):
+            model.vae.spatial_temporal_chunk_size = od_config.vae_spatial_temporal_chunk_size
+
         if is_distributed_vae:
             model.vae.set_parallel_size(vae_pp_size, mode=vae_mode)
 

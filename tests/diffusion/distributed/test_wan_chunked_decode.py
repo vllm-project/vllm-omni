@@ -75,6 +75,50 @@ def test_slicing_and_forward_hooks(vae):
         handle.remove()
 
 
+@pytest.mark.parametrize("rank", [0, 1])
+@pytest.mark.parametrize("dst", [0, 1, None])
+@pytest.mark.parametrize("fast_path", [False, True])
+@pytest.mark.parametrize("return_dict", [False, True])
+@torch.no_grad()
+def test_small_decode_after_spatial_install(vae, monkeypatch, rank, dst, fast_path, return_dict):
+    from vllm_omni.diffusion.distributed.autoencoders import autoencoder_kl_wan as wan
+
+    z = torch.randn(1, 2, 3, 2, 2)
+    expected = vae.decode(z).sample
+    vae.enable_tiling()
+    group = object()
+    monkeypatch.setattr(wan_spatial_shard, "_rank_world", lambda group: (rank, 2))
+    monkeypatch.setattr(wan.dist, "get_rank", lambda group: rank)
+    monkeypatch.setattr(wan_spatial_shard, "_patch_decoder_modules", lambda *args: None)
+    monkeypatch.setattr(wan_spatial_shard, "split_for_parallel_decode", lambda x, **kwargs: (x, x.shape[-2]))
+    gathers = []
+    produce_output = dst is None or rank == dst
+
+    def gather(x, **kwargs):
+        gathers.append(x.shape)
+        return x if produce_output else x.new_zeros(0)
+
+    monkeypatch.setattr(wan_spatial_shard, "gather_and_trim_extent", gather)
+    wan_spatial_shard.install_wan_spatial_shard_decode(vae, group, dst=dst)
+    monkeypatch.setattr(wan, "is_installed", lambda vae: fast_path)
+    actual = vae.decode(z, return_dict=return_dict)
+    actual = actual.sample if return_dict else actual[0]
+    assert len(gathers) == z.shape[2]
+    if produce_output:
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    else:
+        assert actual.shape == (0,)
+    assert all(entry is None for entry in vae._feat_map)
+    gathers.clear()
+    chunks: list[torch.Tensor] = []
+    vae.decode_with_chunks(z, on_chunk=chunks.append)
+    assert len(gathers) == z.shape[2]
+    if produce_output:
+        torch.testing.assert_close(torch.cat(chunks, dim=2), expected, rtol=0, atol=0)
+    else:
+        assert chunks == []
+
+
 @torch.no_grad()
 def test_callback_failure_drains_and_clears_cache(vae):
     z = torch.randn(1, 2, 4, 2, 2)
@@ -105,7 +149,8 @@ def test_chunked_decode_rejects_spatial_tiling(vae):
 
 @pytest.mark.parametrize("rank", [0, 1])
 @pytest.mark.parametrize("fail_callback", [False, True])
-def test_spatial_callback_ownership_and_bounded_retention(monkeypatch, rank, fail_callback):
+@pytest.mark.parametrize("chunk_size", [1, 4])
+def test_spatial_callback_ownership_and_bounded_retention(monkeypatch, rank, fail_callback, chunk_size):
     # Isolate the temporal loop from halo kernels; weakrefs detect retention of
     # decoded GPU-sized tensors even after the consumer has failed.
     monkeypatch.setattr(wan_spatial_shard, "install_wan_spatial_shard_decode", lambda *args, **kwargs: None)
@@ -129,11 +174,19 @@ def test_spatial_callback_ownership_and_bounded_retention(monkeypatch, rank, fai
     z = torch.zeros(1, 3, 6, 2, 2)
     if rank == 0 and fail_callback:
         with pytest.raises(RuntimeError, match="consumer failed"):
-            wan_spatial_shard.spatial_shard_decode(vae, z, group=None, on_chunk=callback)
+            wan_spatial_shard.spatial_shard_decode(
+                vae, z, group=None, on_chunk=callback, temporal_chunk_size=chunk_size
+            )
     else:
-        assert wan_spatial_shard.spatial_shard_decode(vae, z, group=None, on_chunk=callback) is None
-    assert len(references) == z.shape[2]
-    assert callback.call_count == (0 if rank else 1 if fail_callback else z.shape[2])
+        assert (
+            wan_spatial_shard.spatial_shard_decode(
+                vae, z, group=None, on_chunk=callback, temporal_chunk_size=chunk_size
+            )
+            is None
+        )
+    expected_chunks = 1 + (z.shape[2] - 1 + chunk_size - 1) // chunk_size
+    assert len(references) == expected_chunks
+    assert callback.call_count == (0 if rank else 1 if fail_callback else expected_chunks)
     assert vae.clear_cache.call_count == 2
 
 
@@ -146,6 +199,46 @@ def test_distributed_small_latent_callback_ownership(vae, monkeypatch, rank):
     callback = Mock()
     vae.decode_with_chunks(torch.zeros(1, 2, 2, 2, 2), on_chunk=callback)
     assert callback.call_count == (2 if rank == 0 else 0)
+
+
+@pytest.mark.parametrize(
+    "level,world_size,override,expected",
+    [
+        ("off", 4, None, 1),
+        ("lossless", 2, None, 1),
+        ("channels_last", 2, None, 2),
+        ("channels_last", 4, None, 4),
+        ("channels_last", 8, None, 8),
+        ("channels_last", 16, None, 8),
+        ("off", 4, 2, 2),
+        ("lossless", 4, 4, 4),
+    ],
+)
+def test_spatial_automatic_chunk_size(monkeypatch, level, world_size, override, expected):
+    from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath import REPORT_ATTR, WanVaeFastPathReport
+
+    # Exercise the frame loop after deferred installation, including overrides.
+    def install(vae, *args, **kwargs):
+        setattr(vae, REPORT_ATTR, WanVaeFastPathReport(level=level, installed=level != "off"))
+
+    monkeypatch.setattr(wan_spatial_shard, "install_wan_spatial_shard_decode", install)
+    monkeypatch.setattr(wan_spatial_shard, "_rank_world", lambda group: (0, world_size))
+    chunks = []
+    vae = SimpleNamespace(
+        config=SimpleNamespace(patch_size=None),
+        clear_cache=Mock(),
+        post_quant_conv=lambda z: z,
+        decoder=lambda x, **kwargs: x,
+        _feat_map=[],
+    )
+    wan_spatial_shard.spatial_shard_decode(
+        vae,
+        torch.zeros(1, 3, 10, 2, 2),
+        group=None,
+        on_chunk=lambda x: chunks.append(x.shape[2]),
+        temporal_chunk_size=override,
+    )
+    assert chunks == [1, *[min(expected, 10 - i) for i in range(1, 10, expected)]]
 
 
 @pytest.mark.parametrize("mode", ["spatial_shard_height", "spatial_shard_width", "tile"])
@@ -170,5 +263,11 @@ def test_distributed_chunked_routing(monkeypatch, mode):
     else:
         assert vae.decode_with_chunks(z, on_chunk=callback) is None
         decode.assert_called_once_with(
-            vae, z, group=None, return_dict=True, split_dim=mode.removeprefix("spatial_shard_"), on_chunk=callback
+            vae,
+            z,
+            group=None,
+            return_dict=True,
+            split_dim=mode.removeprefix("spatial_shard_"),
+            on_chunk=callback,
+            temporal_chunk_size=None,
         )

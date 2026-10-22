@@ -57,8 +57,18 @@ stages:
   bit-identical to `F.silu` on the running toolkit; otherwise SiLU stays a
   separate operation. The startup log reports `fused_silu=...`.
 - Spatially sharded VAE decode (`--vae-parallel-mode spatial_shard_height` or
-  `spatial_shard_width`) is not combined with the fast path; the installer skips
-  the VAE and logs why. Tiled and tile-parallel decode work unchanged.
+  `spatial_shard_width`) supports both fast-path levels. Installation is deferred
+  until the spatial wrappers exist for active multi-GPU execution. With one GPU,
+  the normal decoder installs the selected fast path immediately, including the
+  default `lossless` level. Halo exchange and global boundary trimming
+  remain active; local block operations and convolution input assembly are
+  optimized, and only rank 0 retains the preallocated decoded video. Persistent
+  Conv2d buffers trade additional resident memory for fewer allocations; fused
+  Conv3d assembly uses transient buffers to avoid retaining every activation.
+  `lossless` is compared against spatial decode with `--vae-fast-path off`, not
+  against unsharded decode (which may choose different convolution algorithms).
+  Use `--vae-fast-path off --vae-spatial-temporal-chunk-size 1` for
+  reference spatial numerics and the original chunking.
 - The `channels_last` level changes the order in which cuDNN accumulates
   convolutions, so outputs differ from the reference in the last bits. Use
   `lossless` when bitwise reproducibility against diffusers matters.
@@ -225,6 +235,70 @@ Cosmos3-Nano VAE, 1280x720 x 189 frames, bf16, one GB200 GPU, `bench_wan_vae_dec
 Peak decode memory was unchanged (about 13 GiB): it is set by the largest
 activations and the cuDNN workspace, not by the output assembly.
 
+### Spatial-sharded decode
+
+Wan spatial-shard decode supports both fast-path levels with height or width
+sharding. It reuses the single-GPU normalization, residual, upsampling, and
+causal-input kernels while keeping halo exchange inside distributed convolutions.
+Both Conv2d and Conv3d use shared halo exchange and output masking helpers.
+The channels-last path packs both outgoing halos in one launch and scatters
+both received halos in one launch, retaining channels-last NCCL buffers. It
+also computes attention only for local queries, with full-frame keys and values.
+For eligible BF16 channels-last inputs, nearest-2x upsampling writes directly
+into the padded Conv2d input before the existing halo exchange. Spatial 1x1
+shortcut bias is folded into residual addition while retaining BF16 rounding
+and invalid-tail masking. These fusions activate automatically without extra
+configuration; unsupported inputs and modules with forward hooks retain the
+existing path.
+
+Configure temporal batching with `--vae-spatial-temporal-chunk-size` (engine
+argument and per-stage deploy key `vae_spatial_temporal_chunk_size`). When omitted,
+`off` and `lossless` use **1 latent frame per chunk**. An installed `channels_last`
+path uses **min(8, SP GPU count)**: 2 for two GPUs, 4 for four, and 8 for eight
+or more. Eight-rank chunk-8 memory was simulated; its distributed latency and
+correctness have not been measured.
+An explicit positive value overrides this policy for every level. The first frame is decoded separately to
+initialize causal upsampling; later chunks retain temporal cache history.
+All ranks must use the same value. This setting only affects spatial-shard
+VAE decode; single-GPU and tile decode keep their existing chunking.
+
+```bash
+vllm serve nvidia/Cosmos3-Nano --omni --vae-use-tiling \
+    --vae-patch-parallel-size 4 --vae-parallel-mode spatial_shard_width \
+    --vae-fast-path channels_last --vae-spatial-temporal-chunk-size 4
+```
+
+Larger chunks increase peak memory and can change convolution rounding, even
+with `lossless` or `off`. `lossless` means equality to spatial `off` **at the same
+chunk size**, not equality across chunk sizes or to single-GPU decoding.
+Use chunk size **1** with `--vae-fast-path off` for reference spatial numerics
+and the original chunking. Streaming callbacks receive one first-frame chunk followed by larger
+chunks; callback order and rank-0 delivery are preserved.
+
+Spatial input assembly, inference buffer reuse, and output masking are part of
+the distributed convolution implementation at every level; there are no
+per-optimization switches. Unsupported kernel inputs and autograd use PyTorch
+operations, and CPU/Gloo communication uses contiguous buffers. Channels-last local-query attention can change
+SDPA rounding; lossless keeps full-frame attention. Padded convolution outputs
+are masked in place only during inference, before any deferred bias
+can affect invalid positions.
+
+On four GB300 GPUs, Cosmos3-Nano VAE, BF16, 1280×720×189 frames, width sharding,
+the completed channels-last path measured:
+
+| Latent frames per chunk | Median decode | Peak allocated memory per GPU |
+| --- | --- | --- |
+| 4 (default) | 618 ms | 8.42 GiB |
+| 8 | 603 ms | 13.49 GiB |
+| 16 | 600 ms | 23.64 GiB |
+
+These are 15 warm decode measurements per size with seeded latents, PyTorch
+2.13.0+cu130 and Diffusers 0.40.0, not end-to-end generation timings. Chunk 4
+balances latency and memory on this workload. Halo packing and masking preserve
+bits; local-query attention measured 64.75 dB PSNR against full-query
+channels-last attention. Chunking changes rounding independently. Measurements
+on seeded latents do not establish perceptual quality on generated videos.
+
 ## Decoder benchmarking
 
 `benchmarks/diffusion/bench_wan_vae_decode.py` decodes seeded latents with the
@@ -259,4 +333,14 @@ the decode is timed across all ranks and rank 0 reports:
 ```bash
 torchrun --nproc-per-node 2 benchmarks/diffusion/bench_wan_vae_decode.py --model nvidia/Cosmos3-Nano \
     --vae-patch-parallel-size 2 --vae-parallel-mode tile
+```
+
+To benchmark spatial decode with an explicit four-frame chunk size for all levels:
+
+```bash
+PYTHONPATH="$PWD" torchrun --standalone --nproc-per-node=4 \
+    benchmarks/diffusion/bench_wan_vae_decode.py --model nvidia/Cosmos3-Nano \
+    --size 1280x720 --frames 189 --warmup 2 --iters 5 \
+    --vae-patch-parallel-size 4 --vae-parallel-mode spatial_shard_width \
+    --vae-spatial-temporal-chunk-size 4
 ```
