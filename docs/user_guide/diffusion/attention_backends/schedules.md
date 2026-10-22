@@ -76,8 +76,9 @@ training timestep scale. Missing or invalid sigma fails
 rather than silently selecting the base backend.
 
 Each window has exactly `low`, `high` and `profile`. Bounds must be finite
-numbers with `0 <= low < high <= 1`. Windows are ordered, non-overlapping and
-half-open `[low, high)`, except an end at `1.0` includes `1.0`. Adjacent windows
+numbers with `0 <= low < high <= 1`. List windows by ascending `low`, the
+reverse of denoising order, without overlaps. Windows are half-open
+`[low, high)`, except an end at `1.0` includes `1.0`. Adjacent windows
 are allowed; gaps use the base configuration. Thresholds refer to the actual
 shifted trajectory: changing step count or flow shift changes when a threshold
 is crossed, not the threshold itself.

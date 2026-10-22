@@ -289,7 +289,7 @@ def parse_attention_sigma_schedule(value: object) -> AttentionSigmaSchedule | No
         else:
             raise TypeError("attention_sigma_schedule entries must be mappings or AttentionSigmaWindow objects")
         if windows and entry.low < windows[-1].high:
-            raise ValueError("attention_sigma_schedule windows must be ordered and must not overlap")
+            raise ValueError("attention_sigma_schedule windows must be ordered by ascending low and must not overlap")
         windows.append(entry)
     return tuple(windows)
 
