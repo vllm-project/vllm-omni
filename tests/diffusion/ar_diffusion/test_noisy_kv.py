@@ -41,7 +41,7 @@ def _cache(**kwargs) -> NoisyKVCache:
         device=torch.device("cpu"),
         layer_groups=kwargs.get("layer_groups", 2),
         max_batch_size=kwargs.get("max_batch_size", 1),
-        stages=kwargs.get("stages", 1),
+        step_replicas=kwargs.get("step_replicas", 1),
     )
 
 
@@ -52,7 +52,7 @@ def test_capacity_uses_k1():
 
 
 def test_capacity_covers_latest_stage_frontier():
-    cache = _cache(layer_groups=1, stages=5)
+    cache = _cache(layer_groups=1, step_replicas=5)
     # A Latest-KV plan with H=6 and S=5 needs up to 10 live versions on one rank.
     assert cache.capacity == 11
 
@@ -74,14 +74,14 @@ def test_capacity_rejects_undersized_memory_budget():
 
 @pytest.mark.parametrize("extra_bytes", [0, 8])
 def test_capacity_accepts_complete_schedule_budget(extra_bytes):
-    cache = _cache(layer_groups=1, stages=5)
+    cache = _cache(layer_groups=1, step_replicas=5)
     bounded = NoisyKVCache(
         cache.spec,
         dtype=torch.float32,
         device=torch.device("cpu"),
         layer_groups=1,
         max_batch_size=1,
-        stages=5,
+        step_replicas=5,
         available_bytes=cache.reserved_bytes + extra_bytes,
     )
     assert bounded.capacity == cache.capacity == 11
@@ -137,7 +137,7 @@ def test_prepare_evict_releases_last_use():
         CellSchedule(
             chunks=4,
             num_denoise_steps=2,
-            stages=3,
+            step_replicas=3,
             layer_groups=2,
             ordering=Ordering.LATEST_KV,
             kv_history_chunks=6,
@@ -170,7 +170,7 @@ def _vertical_plan() -> CellPlan:
         CellSchedule(
             chunks=4,
             num_denoise_steps=2,
-            stages=3,
+            step_replicas=3,
             layer_groups=2,
             ordering=Ordering.LATEST_KV,
             kv_history_chunks=6,
@@ -205,9 +205,9 @@ def test_wait_ready_is_empty_without_kv_history():
         CellSchedule(
             chunks=2,
             num_denoise_steps=1,
-            stages=1,
+            step_replicas=1,
             layer_groups=2,
-            ordering=Ordering.LATEST_KV,
+            ordering=Ordering.SAME_STEP,
             kv_history_chunks=0,
         )
     )
@@ -216,17 +216,20 @@ def test_wait_ready_is_empty_without_kv_history():
         assert union_wait_ready(inflight, slot, 0) == frozenset()
 
 
-@pytest.mark.parametrize("stages", [1, 3])
+@pytest.mark.parametrize(
+    ("stages", "ordering"),
+    [(1, Ordering.SELF_FORCING), (3, Ordering.LATEST_KV)],
+)
 @pytest.mark.parametrize("chunk", [1, 3])
 @pytest.mark.parametrize("chunk_tokens", [4, 8, 12])
-def test_attention_reads_only_valid_version_pages(stages, chunk, chunk_tokens):
+def test_attention_reads_only_valid_version_pages(stages, ordering, chunk, chunk_tokens):
     plan = build_cell_plan(
         CellSchedule(
             chunks=4,
             num_denoise_steps=2,
-            stages=stages,
+            step_replicas=stages,
             layer_groups=2,
-            ordering=Ordering.SELF_FORCING,
+            ordering=ordering,
             kv_history_chunks=6,
         )
     )

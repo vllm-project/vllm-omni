@@ -338,6 +338,7 @@ steps:
 
       # Split the old shared H100 Single-GPU sweep: one pytest process collected
       # every slow+cards_1 diffusion file and exceeded 150 minutes.
+
       - label: "Diffusion · Qwen-Image · H100 · Single-GPU"
         timeout_in_minutes: 120
         commands:

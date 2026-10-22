@@ -36,6 +36,9 @@ _CLASS_TO_MODULE: dict[str, str] = {
     "MingImageGenConfig": "vllm_omni.transformers_utils.configs.ming_flash_omni",
     "MingFlashOmniConfig": "vllm_omni.transformers_utils.configs.ming_flash_omni",
     "Qwen3VLMoeVisionConfig": "vllm_omni.transformers_utils.configs.ming_flash_omni",
+    "BailingMoeV3AudioConfig": "vllm_omni.transformers_utils.configs.ming3_audio",
+    "BailingMoeV3AudioEncoderConfig": "vllm_omni.transformers_utils.configs.ming3_audio",
+    "BailingMoeV3TextConfig": "vllm_omni.transformers_utils.configs.ming3_audio",
     "WhisperEncoderConfig": "vllm_omni.transformers_utils.configs.ming_flash_omni",
     "AuKConfig": "vllm_omni.transformers_utils.configs.auk",
     "SenseNovaU1Config": "vllm_omni.transformers_utils.configs.sensenova_u1",
@@ -70,6 +73,9 @@ __all__ = [
     "MingImageGenConfig",
     "MingFlashOmniConfig",
     "Qwen3VLMoeVisionConfig",
+    "BailingMoeV3AudioConfig",
+    "BailingMoeV3AudioEncoderConfig",
+    "BailingMoeV3TextConfig",
     "WhisperEncoderConfig",
     "SenseNovaU1Config",
     "SenseNovaU1MoELLMConfig",
@@ -99,6 +105,7 @@ from vllm_omni.transformers_utils.configs import fish_speech as _fish_speech  # 
 from vllm_omni.transformers_utils.configs import glm_tts as _glm_tts  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import higgs_audio_v3 as _higgs_audio_v3  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import mammoth_moda2 as _mammoth_moda2  # noqa: F401, E402
+from vllm_omni.transformers_utils.configs import ming3_audio as _ming3_audio  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import ming_flash_omni as _ming_flash_omni  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import minimax_music3 as _minimax_music3  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import omnivoice as _omnivoice  # noqa: F401, E402

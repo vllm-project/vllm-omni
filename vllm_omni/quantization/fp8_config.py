@@ -1,9 +1,50 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Omni's online FP8 option backed by vLLM's online quantization API."""
+"""FP8 options backed by vLLM's quantization kernels."""
 
+from typing import Any, Literal
+
+import regex as re
 from vllm.config.quantization import QuantizationConfigArgs, QuantSpec
+from vllm.model_executor.layers.quantization.modelopt import ModelOptFp8Config
 from vllm.model_executor.layers.quantization.online.base import OnlineQuantizationConfig
+
+
+class SerializedPerChannelFp8Config(ModelOptFp8Config):
+    """E4M3 weights with one FP32 scale per output channel and dynamic tokens.
+
+    FastVideo exports this same tensor layout under ``quant_method=fp8``.
+    Reuse upstream's channel/token kernel and TP-aware parameter loaders.
+    """
+
+    def __init__(self, quantized_modules: str) -> None:
+        super().__init__(
+            quant_method="FP8_PER_CHANNEL_PER_TOKEN",
+            is_checkpoint_fp8_serialized=True,
+            kv_cache_quant_method=None,
+            exclude_modules=[],
+        )
+        self.quantized_modules = re.compile(quantized_modules)
+
+    @classmethod
+    def from_config(cls, config: dict[str, Any]) -> "SerializedPerChannelFp8Config":
+        for key, expected in (
+            ("fmt", "e4m3"),
+            ("weight_scheme", "per_channel"),
+            ("activation_scheme", "dynamic_per_token"),
+        ):
+            if config.get(key) != expected:
+                raise ValueError(f"Unsupported serialized per-channel FP8 {key}: {config.get(key)!r}")
+        pattern = config.get("quantized_modules")
+        if not isinstance(pattern, str) or not pattern:
+            raise ValueError("Serialized per-channel FP8 requires quantized_modules")
+        return cls(pattern)
+
+    def is_layer_excluded(self, prefix: str) -> bool:
+        return self.quantized_modules.fullmatch(prefix + ".weight") is None
+
+    def get_name(self) -> Literal["fp8"]:
+        return "fp8"
 
 
 class DiffusionFp8Config(OnlineQuantizationConfig):

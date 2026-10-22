@@ -322,14 +322,20 @@ def _cfm_matmul_tf32(fn):
 
     @functools.wraps(fn)
     def wrapper(self, *args, **kwargs):
-        if not getattr(self, "_cfm_tf32", False):
-            return fn(self, *args, **kwargs)
-        previous = torch.backends.cuda.matmul.allow_tf32
-        torch.backends.cuda.matmul.allow_tf32 = True
-        try:
-            return fn(self, *args, **kwargs)
-        finally:
-            torch.backends.cuda.matmul.allow_tf32 = previous
+        precision = (
+            self._cfm_autocast(next(self.flow.parameters()).device)
+            if getattr(self, "_cfm_only_float16", False)
+            else nullcontext()
+        )
+        with precision:
+            if not getattr(self, "_cfm_tf32", False):
+                return fn(self, *args, **kwargs)
+            previous = torch.backends.cuda.matmul.allow_tf32
+            torch.backends.cuda.matmul.allow_tf32 = True
+            try:
+                return fn(self, *args, **kwargs)
+            finally:
+                torch.backends.cuda.matmul.allow_tf32 = previous
 
     return wrapper
 
@@ -355,6 +361,7 @@ class BatchedToken2Wav(nn.Module):
         setup_cache_size: int = 1,
         cfm_tf32: bool = False,
         encoder_graph_config: Mapping[str, Any] | None = None,
+        cfm_float16: bool = False,
     ):
         super().__init__()
         if setup_cache_size < 0:
@@ -371,6 +378,13 @@ class BatchedToken2Wav(nn.Module):
         self.flow = token2wav.flow
         self.hift = token2wav.hift
         flow_parameter = next(self.flow.parameters(), None)
+        self._cfm_only_float16 = bool(cfm_float16 and not token2wav.float16)
+        if self._cfm_only_float16:
+            if flow_parameter is None or flow_parameter.device.type != "cuda":
+                raise ValueError("cfm_float16 requires CUDA")
+            self.flow.decoder.estimator.half()
+            self.flow.decoder.rand_noise = self.flow.decoder.rand_noise.half()
+
         if flow_parameter is not None and flow_parameter.device.type == "npu":
             from vllm_omni.platforms.npu.models.minicpmo_fused import prepare_estimator
 
@@ -431,7 +445,7 @@ class BatchedToken2Wav(nn.Module):
             del speech, source
             torch.accelerator.empty_cache()
         self.float16 = bool(token2wav.float16)
-        self._estimator_att_compute_dtype = torch.float16 if self.float16 else torch.float32
+        self._estimator_att_compute_dtype = torch.float16 if self.float16 or self._cfm_only_float16 else torch.float32
         self._estimator_att_cache_dtype = (
             torch.bfloat16 if bfloat16_attention_cache else self._estimator_att_compute_dtype
         )
@@ -494,17 +508,25 @@ class BatchedToken2Wav(nn.Module):
                 micro_batch_size = int(micro_batch_size_cfg) if micro_batch_size_cfg is not None else 4
                 enable_whole_euler = bool(cfm_graph_cfg.get("enable_whole_euler", True))
                 if bool(cfm_graph_cfg.get("fused_body", False)):
-                    # A reduced-precision attention cache keeps the ragged body,
-                    # which attends in the activation dtype through upstream.
+                    # A BF16 storage-only cache still uses the ragged body.
+                    # CUDA FP16 flow can keep its matching FP16 cache resident.
                     # NPU uses the same schedule with AddLayerNorm and packed QKV.
                     self._ragged_fused_body = (
                         flow_parameter.device.type in {"cuda", "npu"}
                         and supports_fused_body(estimator)
-                        and self._estimator_att_cache_dtype == torch.float32
+                        and (
+                            self._estimator_att_cache_dtype == torch.float32
+                            or (
+                                flow_parameter.device.type == "cuda"
+                                and self._estimator_att_cache_dtype == torch.float16
+                                and self._estimator_att_compute_dtype == torch.float16
+                            )
+                        )
                     )
                     if not self._ragged_fused_body:
                         logger.warning(
-                            "cfm_fused_body requested but unsupported here (DiT blocks or a non-fp32 attention cache)"
+                            "cfm_fused_body requested but unsupported here "
+                            "(DiT blocks or incompatible attention cache dtype)"
                         )
                 # Resident request caches need the fused body and its tiled
                 # attention, which reads keys/values out of the pool in place.
@@ -687,6 +709,11 @@ class BatchedToken2Wav(nn.Module):
         with self._autocast(features[0].speaker_embedding.device):
             projected = torch.cat([self._project_speakers(feature.speaker_embedding) for feature in features])
         return [int(feature.mels.shape[1]) for feature in features], projected
+
+    def _cfm_autocast(self, device: torch.device):
+        if self._cfm_only_float16:
+            return torch.amp.autocast(device.type, dtype=torch.float16)
+        return self._autocast(device)
 
     def _autocast(self, device: torch.device):
         if device.type != "cuda":
@@ -1086,7 +1113,10 @@ class BatchedToken2Wav(nn.Module):
         ``modulation`` comes from the Whole-Euler arena, for either body.
         """
         estimator_input = args[1]
-        if slots is not None or (self._ragged_fused_body and estimator_input.dtype == torch.float32):
+        fused_dtype = estimator_input.dtype == torch.float32 or (
+            estimator_input.is_cuda and estimator_input.dtype == torch.float16
+        )
+        if slots is not None or (self._ragged_fused_body and fused_dtype):
             # Slot-pool graphs are only built over the fused body (``slot_pool`` above).
             if estimator_input.device.type == "npu":
                 from vllm_omni.platforms.npu.models.minicpmo_fused import (
@@ -1339,6 +1369,8 @@ class BatchedToken2Wav(nn.Module):
         cache in the same form, already trimmed by ``att_keep``; the eager
         path returns it stacked and untrimmed (ragged: per request, untrimmed).
         """
+        if self._cfm_only_float16:
+            mu, speakers, cond = mu.half(), speakers.half(), cond.half()
         decoder = self.flow.decoder
         estimator = decoder.estimator
         batch_size = int(mu.shape[0])
@@ -1734,7 +1766,7 @@ class BatchedToken2Wav(nn.Module):
         wrapper = self._whole_euler_graph_wrapper
         prompt_len = int(features.mels.shape[1])
         steady = prompt_len + _CACHE_TRIM_SUFFIX
-        with self._autocast(wrapper.device):
+        with self._cfm_autocast(wrapper.device):
             return wrapper.precapture(
                 offsets=range(prompt_len, steady + 1),
                 steady=steady,

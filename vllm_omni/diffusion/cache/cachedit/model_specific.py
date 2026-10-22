@@ -50,20 +50,24 @@ def _split_wan22_inference_steps(pipeline, num_inference_steps: int) -> tuple[in
     Returns:
         A tuple of (num_high_noise_steps, num_low_noise_steps).
     """
-    if pipeline.boundary_ratio is not None:
-        boundary_timestep = pipeline.boundary_ratio * pipeline.scheduler.config.num_train_timesteps
-    else:
-        boundary_timestep = None
+    # Mirror the fallback forward() applies when the server pins no boundary_ratio;
+    # without it every step would land on transformer and transformer_2's context
+    # would be sized for zero steps.
+    boundary_ratio = pipeline.boundary_ratio if pipeline.boundary_ratio is not None else 0.875
+    boundary_timestep = boundary_ratio * pipeline.scheduler.config.num_train_timesteps
 
-    # Set timesteps to calculate the split
+    # Set timesteps to calculate the split. forward() re-arms the scheduler for
+    # every request, so probing it here is safe, but it must use the same flow
+    # shift: the UniPC scheduler is built unshifted and forward() applies the
+    # shift in set_timesteps, so an unshifted probe misplaces the boundary.
     device = next(pipeline.transformer.parameters()).device
-    pipeline.scheduler.set_timesteps(num_inference_steps, device=device)
+    if getattr(pipeline, "_sample_solver", None) == "unipc":
+        pipeline.scheduler.set_timesteps(num_inference_steps, device=device, shift=pipeline._flow_shift)
+    else:
+        pipeline.scheduler.set_timesteps(num_inference_steps, device=device)
 
     timesteps = pipeline.scheduler.timesteps
-    num_high_noise_steps = 0  # high-noise steps for transformer
-    for t in timesteps:
-        if boundary_timestep is None or t >= boundary_timestep:
-            num_high_noise_steps += 1
+    num_high_noise_steps = int((timesteps >= boundary_timestep).sum())  # high-noise steps for transformer
     # low-noise steps for transformer_2
     num_low_noise_steps = num_inference_steps - num_high_noise_steps
     return num_high_noise_steps, num_low_noise_steps
@@ -106,7 +110,16 @@ def enable_cache_for_wan22(pipeline: Any, cache_config: Any) -> RefreshCacheCont
             cache_config=db_cache_config,
             calibrator_config=calibrator_config,
         )
-        return _build_cache_context_refresh(cache_config)
+        refresh_single = _build_cache_context_refresh(cache_config)
+
+        def refresh_single_for_schedule(
+            pipeline: Any, timesteps: torch.Tensor, boundary_timestep: float | None, verbose: bool = True
+        ) -> None:
+            # A single expert denoises every timestep forward() resolved.
+            refresh_single(pipeline, len(timesteps), verbose)
+
+        pipeline._cache_dit_refresh_for_schedule = refresh_single_for_schedule
+        return refresh_single
 
     cache_dit.enable_cache(
         BlockAdapter(
@@ -162,6 +175,30 @@ def enable_cache_for_wan22(pipeline: Any, cache_config: Any) -> RefreshCacheCont
         refresh_trans_one(pipeline, num_high_noise_steps, verbose)
         refresh_trans_two(pipeline, num_low_noise_steps, verbose)
 
+    def refresh_cache_context_for_schedule(
+        pipeline: Any, timesteps: torch.Tensor, boundary_timestep: float | None, verbose: bool = True
+    ) -> None:
+        """Size both experts' contexts to the timesteps forward() is about to denoise.
+
+        The runner refreshes before forward() resolves this request's solver, flow
+        shift and boundary, so its split can follow the previous request's
+        schedule. forward() calls this once they are resolved; the counts follow
+        diffuse(), which runs transformer for t >= boundary_timestep and
+        transformer_2 below it.
+        """
+        if boundary_timestep is None:
+            num_high_noise_steps = len(timesteps)
+        else:
+            num_high_noise_steps = int((timesteps >= boundary_timestep).sum())
+        num_low_noise_steps = len(timesteps) - num_high_noise_steps
+        # An expert that gets no step in this request never runs, so its context
+        # can keep the reset the runner already gave it.
+        if num_high_noise_steps > 0:
+            refresh_trans_one(pipeline, num_high_noise_steps, verbose)
+        if num_low_noise_steps > 0:
+            refresh_trans_two(pipeline, num_low_noise_steps, verbose)
+
+    pipeline._cache_dit_refresh_for_schedule = refresh_cache_context_for_schedule
     return refresh_cache_context
 
 
