@@ -390,13 +390,14 @@ class DuplexEngineSession:
     def release_resources_for_request_ids(self, request_ids: Iterable[str]) -> list[str]:
         """Drop bindings for these request ids, whichever fence they sit on.
 
-        ``cancel_fence`` only releases the fence being cancelled. Overlapped
-        draining output stages belong to an older turn fence and would
-        otherwise stay until the session closes.
+        Fence-scoped cancellation only releases the fence being cancelled.
+        Overlapped draining output stages belong to an older turn fence and
+        would otherwise stay until the session closes.
         """
         wanted = {request_id for request_id in request_ids if isinstance(request_id, str) and request_id}
         if not wanted:
             return []
+
         released = list(
             dict.fromkeys(
                 resource.request_id for resource in self.request_resources.values() if resource.request_id in wanted
@@ -409,12 +410,11 @@ class DuplexEngineSession:
         }
         return released
 
-    def cancel_fence(self, cancelled_fence: DuplexFence, next_fence: DuplexFence) -> list[str]:
-        stale = self.prepare_cancel_fence(cancelled_fence, next_fence)
-        self.release_fence(cancelled_fence)
-        return stale
-
-    def prepare_cancel_fence(self, cancelled_fence: DuplexFence, next_fence: DuplexFence) -> list[str]:
+    def prepare_cancel_fence(
+        self,
+        cancelled_fence: DuplexFence,
+        next_fence: DuplexFence,
+    ) -> list[str]:
         """Advance the cancellation fence without dropping cleanup records."""
         current = self.accepted_fence
         if cancelled_fence.session_id != self.session_id:
@@ -631,6 +631,25 @@ class DuplexEngineSession:
         self.config_generation += 1
         if config.initial_user_text and config.initial_user_text != previous_seed:
             self.notify_new_user_item()
+
+    def restore_config(self, previous: DuplexSessionConfig) -> None:
+        """Undo a ``replace_config`` whose candidate never finished adopting.
+
+        The forward replace already assigned the candidate, bumped
+        ``config_generation``, and may have counted its seed text. Putting the
+        previous object back through ``replace_config`` would count that seed
+        again and advance the generation a second time.
+        """
+        candidate = self.config
+        if (
+            candidate.initial_user_text
+            and candidate.initial_user_text != previous.initial_user_text
+            and self._conversation.unanswered_user_items > 0
+        ):
+            self._conversation.unanswered_user_items -= 1
+        self.config = previous
+        if self.config_generation > 0:
+            self.config_generation -= 1
 
     def transition_turn(self, state: DuplexTurnState) -> None:
         self.turn_state = state

@@ -113,7 +113,7 @@ def _make_connection(
             chat_template_content_format="auto",
             _effective_chat_template_kwargs=lambda _request: {},
             _preprocess_chat=preprocess_chat,
-            _fix_minicpmo45_audio_stream_output_kinds=lambda params, _modalities: params,
+            _fix_audio_stream_output_kinds=lambda params, _modalities: params,
         ),
     )
     return connection, renderer

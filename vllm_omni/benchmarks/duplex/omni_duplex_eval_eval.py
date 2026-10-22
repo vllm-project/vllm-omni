@@ -6,10 +6,16 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from typing import Any
 
-from .omni_duplex_eval_clock import normalize_response_items, validate_clock
+from .omni_duplex_eval_clock import (
+    has_response_chunks,
+    normalize_response_chunks,
+    normalize_response_items,
+    validate_clock,
+)
 from .omni_duplex_eval_dataset import DuplexSample
 from .omni_duplex_eval_judge import DuplexJudge
 from .omni_duplex_eval_media import extract_jpeg, materialize_media, video_duration
@@ -24,6 +30,8 @@ from .omni_duplex_eval_metrics import (
     summarize_temporal_results,
     temporal_window,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def _read(path: Path) -> Any:
@@ -57,7 +65,6 @@ def evaluate_sample(
         else {}
     )
     validate_clock(meta, allow_invalid=allow_invalid_clock)
-    items = normalize_response_items(raw)
     result: dict[str, Any] = {
         "id": sample.id,
         "family": sample.family,
@@ -68,6 +75,7 @@ def evaluate_sample(
         "judge_video_mode": judge_video_mode,
     }
     if sample.family == "rtd":
+        items = normalize_response_items(raw)
         video_path = materialize_media(sample.video, score_path.parent / ".media", sample.id, ".mp4")
         duration = sample.video_duration or video_duration(video_path)
         temporal_rows = []
@@ -105,14 +113,32 @@ def evaluate_sample(
         content_frames = None
         if judge_video_mode == "frame-sample":
             content_frames = _extract_frames(video_path, _content_frame_times(duration))
-        content = parse_judge_json(
-            judge.content(
-                build_content_prompt(_text(items), sample.question_text, [sample.answer1, sample.answer2]),
-                video_path,
-                frames=content_frames,
-                mode=judge_video_mode,
+        content_prompt = build_content_prompt(_text(items), sample.question_text, [sample.answer1, sample.answer2])
+        try:
+            content = parse_judge_json(
+                judge.content(content_prompt, video_path, frames=content_frames, mode=judge_video_mode)
             )
-        )
+        except Exception as exc:
+            # A long clip can overflow the judge model's context window when the
+            # whole video is passed through (video_url mode): the judge answers
+            # HTTP 400 "Input length (83158) exceeds model's maximum context
+            # length (65536)" (#9089).  Degrade that single content call to the
+            # bounded frame-sample path instead of failing the whole run.
+            if judge_video_mode != "video_url" or not _is_judge_context_length_error(exc):
+                raise
+            logger.warning(
+                "Judge rejected the full video for %s (context length exceeded); "
+                "retrying the content prompt in frame-sample mode",
+                sample.id,
+            )
+            content_frames = _extract_frames(video_path, _content_frame_times(duration))
+            if not content_frames:
+                # Nothing to fall back to: keep the original judge error.
+                raise
+            content = parse_judge_json(
+                judge.content(content_prompt, video_path, frames=content_frames, mode="frame-sample")
+            )
+            content["judge_input_fallback"] = "frame-sample"
         if content_frames is not None:
             content["frame_count"] = len(content_frames)
         result.update(
@@ -126,9 +152,12 @@ def evaluate_sample(
             raise ValueError(f"missing proactive-reminder task type for split {sample.split!r}")
         task = sample.task_type
         times = _reminder_times(sample)
+        chunks = normalize_response_chunks(raw)
+        # Chunks keep their own boundary whitespace; legacy sentence items are stripped.
+        separator = "" if has_response_chunks(raw) else " "
         event_rows = []
         if task == "correction" or not times:
-            response = _text(items)
+            response = separator.join(chunk["text"] for chunk in chunks).strip()
             parsed = parse_judge_json(
                 judge.chat(build_reminder_prompt(sample.question_text, response, task, sample.answer1))
             )
@@ -136,7 +165,9 @@ def evaluate_sample(
         else:
             for start in times:
                 lo, hi = reminder_window(start, window_size)
-                response = " ".join(item["sentence"] for item in items if lo <= item["start"] <= hi)
+                response = separator.join(
+                    chunk["text"] for chunk in chunks if lo <= chunk["current_time"] <= hi
+                ).strip()
                 if not response:
                     event_rows.append({"start_time": start, "response_segment": "", "success_score": 0})
                 else:
@@ -159,6 +190,23 @@ def _times(start: float, end: float, *, fps: int) -> list[float]:
     return (
         [start + (end - start) / 2] if count == 1 else [start + i * (end - start) / (count - 1) for i in range(count)]
     )
+
+
+def _is_judge_context_length_error(exc: BaseException) -> bool:
+    """True when the judge rejected the request because its input was too long.
+
+    The judge client raises ``requests.HTTPError`` with the HTTP response
+    attached, e.g. HTTP 400
+    ``Input length (83158) exceeds model's maximum context length (65536)``.
+    """
+    response = getattr(exc, "response", None)
+    if getattr(response, "status_code", None) != 400:
+        return False
+    text = str(getattr(response, "text", "") or "").lower()
+    if "context length" in text:
+        return True
+    # Other OpenAI-compatible judges phrase the same rejection differently.
+    return "input length" in text and "exceed" in text
 
 
 def _extract_frames(path: str | Path, timestamps: list[float]) -> list[bytes]:

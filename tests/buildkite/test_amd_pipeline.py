@@ -695,6 +695,7 @@ def test_diffusion_cpu_suite_shard_contract(pipeline_path: Path) -> None:
     assert argv[:3] == ["pytest", "-sv", "tests/diffusion"]
     assert argv[argv.index("-m") + 1] == DIFFUSION_CPU_MARKERS
     assert "--ignore=tests/diffusion/cache/test_teacache_extractors.py" in argv
+    assert "--ignore=tests/diffusion/models/pi05/test_pi05_units.py" in argv
     assert [arg.removeprefix("--deselect=") for arg in argv if arg.startswith("--deselect=")] == (
         DIFFUSION_SLOW_CPU_NODES
     )
@@ -896,9 +897,9 @@ def test_weekly_reliability_is_distinct_from_nightly() -> None:
     nightly = AMD_NIGHTLY_PIPELINE.read_text(encoding="utf-8")
     group = weekly["steps"][0]
     jobs = {
-        "Reliability Test · qwen3-omni": ("mi300_2", "cards_2", "test_reliability_qwen3_omni.py"),
-        "Reliability Test · wan22": ("mi300_1", "cards_1", "test_reliability_wan22.py"),
-        "Reliability Test · hunyuan-image": ("mi300_4", "cards_4", "test_reliability_hunyuan_image.py"),
+        "Reliability Test · qwen3-omni": ("mi300_2", "cards_2", "tests/dfx/reliability/test_qwen3_omni.py"),
+        "Reliability Test · wan22": ("mi300_1", "cards_1", "tests/dfx/reliability/test_wan22.py"),
+        "Reliability Test · hunyuan-image": ("mi300_4", "cards_4", "tests/dfx/reliability/test_hunyuan_image.py"),
         "Reliability Test · Invalid parameters · MI300 · 2-GPU": (
             "mi300_2",
             "cards_2",
@@ -1005,3 +1006,58 @@ def test_amd_runner_preserves_piped_failures_and_empty_collection() -> None:
     assert 'VLLM_CI_ALLOW_NO_TESTS:-0}" == "1"' in runner
     assert template.count('{% if step.grade and step.grade == "Blocking" %}') == 2
     assert template.count("soft_fail: true") == 2
+
+
+def test_hunyuan_image3_lora_accuracy_is_one_nonblocking_nightly_job() -> None:
+    step = _find_step("HunyuanImage3 LoRA Accuracy", AMD_NIGHTLY_PIPELINE)
+    assert step["grade"] == "NonBlocking"
+    assert step["agent_pool"] == "mi300_4"
+    assert step["mirror_hardwares"] == ["amdproduction"]
+    assert step["timeout_in_minutes"] == 180
+    commands = "\n".join(step["commands"])
+    assert "full_model and diffusion and rocm and MI325 and cards_4" in commands
+    assert "--run-level full_model" in commands
+    assert "--collect-only" in commands
+    assert "exit 5" in commands
+    assert "pytest.xml" in commands
+    assert "test_hunyuan_image3_lora.py::test_hunyuan_image3_dit_lora_generation" in commands
+    assert "Expected exactly one HunyuanImage3 LoRA accuracy node" in commands
+    assert step["env"]["DIFFUSION_ATTENTION_BACKEND"] == "TORCH_SDPA"
+    assert step["env"]["HUNYUAN_IMAGE3_DEVICES"] == "0,1,2,3"
+    assert "test_hunyuan_image3_lora.py" in commands
+    assert "test_hunyuan_image3_pixel_accuracy.py" not in commands
+    for pipeline_path in (AMD_READY_PIPELINE, AMD_MERGE_PIPELINE):
+        text = pipeline_path.read_text(encoding="utf-8")
+        assert "HunyuanImage3 LoRA Accuracy" not in text
+
+
+def test_hunyuanvideo15_accuracy_is_one_nonblocking_nightly_job() -> None:
+    step = _find_step("HunyuanVideo-1.5 Video Similarity", AMD_NIGHTLY_PIPELINE)
+    assert step["grade"] == "NonBlocking"
+    assert step["agent_pool"] == "mi300_1"
+    assert step["mirror_hardwares"] == ["amdproduction"]
+    assert step["timeout_in_minutes"] == 180
+    commands = "\n".join(step["commands"])
+    assert "full_model and diffusion and rocm and MI325 and cards_1" in commands
+    assert "--run-level full_model" in commands
+    assert "--collect-only" in commands
+    assert "exit 5" in commands
+    assert "pytest.xml" in commands
+    assert step["env"]["DIFFUSION_ATTENTION_BACKEND"] == "TORCH_SDPA"
+    assert "hunyuanvideo15_t2v" in commands
+    assert "hunyuanvideo15_i2v" in commands
+    assert "test_hunyuanvideo15_t2v.py" not in commands
+    expected_nodes = (
+        "test_hunyuanvideo15_t2v_diffusers_offline_generates_video",
+        "test_hunyuanvideo15_t2v_online_serving_generates_video",
+        "test_hunyuanvideo15_t2v_serving_matches_offline_video_similarity",
+        "test_hunyuanvideo15_i2v_diffusers_offline_generates_video",
+        "test_hunyuanvideo15_i2v_online_serving_generates_video",
+        "test_hunyuanvideo15_i2v_serving_matches_offline_video_similarity",
+    )
+    for node in expected_nodes:
+        assert node in commands
+    assert "Expected exactly $${#nodes[@]} HunyuanVideo-1.5 accuracy nodes" in commands
+    for pipeline_path in (AMD_READY_PIPELINE, AMD_MERGE_PIPELINE):
+        text = pipeline_path.read_text(encoding="utf-8")
+        assert "HunyuanVideo-1.5 Video Similarity" not in text

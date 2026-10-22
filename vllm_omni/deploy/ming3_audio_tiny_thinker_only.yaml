@@ -1,0 +1,41 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+# Ming-3.0-audio-tiny thinker-only: ASR / Speech QA with text output.
+pipeline: bailing_moe_v3_audio_thinker_only
+async_chunk: true
+trust_remote_code: false
+distributed_executor_backend: mp
+dtype: bfloat16
+enable_prefix_caching: false
+enable_chunked_prefill: true
+
+stages:
+  - stage_id: 0
+    limit_mm_per_prompt:
+      audio: 20
+    devices: "0"
+    tensor_parallel_size: 1
+    # Also disable alternate all-reduce backends via the environment to align the metrics.
+    disable_custom_all_reduce: true
+    max_num_seqs: 1
+    max_model_len: 131072
+    max_num_batched_tokens: 32768
+    gpu_memory_utilization: 0.92
+    enforce_eager: false
+    async_scheduling: false
+    enable_prefix_caching: true
+    enable_chunked_prefill: true
+    engine_extras:
+      mamba_cache_mode: align
+    compilation_config:
+      cudagraph_mode: FULL_AND_PIECEWISE
+    default_sampling_params:
+      temperature: 0.6
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 65536
+      detokenize: true
+      ignore_eos: false
+
+# Native CUDA Bailing/KDA kernels are required.
+platforms: {}

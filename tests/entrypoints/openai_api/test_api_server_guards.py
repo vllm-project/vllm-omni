@@ -1284,8 +1284,9 @@ async def test_pure_diffusion_speech_forwards_media_access_args(monkeypatch, tmp
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("ming3", [False, True, "tts"])
 @pytest.mark.parametrize("supported_tasks", [("generate",), ("embed",)])
-async def test_multistage_app_state_key_snapshot(monkeypatch, mocker, tmp_path, supported_tasks) -> None:
+async def test_multistage_app_state_key_snapshot(monkeypatch, mocker, tmp_path, supported_tasks, ming3) -> None:
     """Lock multi-stage ``app.state`` keys after init, including live vs None.
 
     Fails if chat/speech/video/realtime/tokenization keys disappear or are
@@ -1315,6 +1316,9 @@ async def test_multistage_app_state_key_snapshot(monkeypatch, mocker, tmp_path, 
             self.kwargs = kwargs
             self.warmup_calls = 0
 
+        def _has_ming3_talker_stage(self):
+            return ming3 is True
+
         def warmup(self):
             self.warmup_calls += 1
 
@@ -1326,6 +1330,8 @@ async def test_multistage_app_state_key_snapshot(monkeypatch, mocker, tmp_path, 
     class _FakeSpeech(_FakeCtor):
         def __init__(self, *args, **kwargs):
             speech_kwargs.update(kwargs)
+
+        _tts_model_type = "ming3_audio_tts" if ming3 == "tts" else None
 
         async def warmup(self):
             return None
@@ -1352,12 +1358,26 @@ async def test_multistage_app_state_key_snapshot(monkeypatch, mocker, tmp_path, 
     monkeypatch.setattr(api_server, "OmniStreamingSpeechHandler", _FakeCtor)
     monkeypatch.setattr(api_server, "create_streaming_video_handler", lambda **_k: _marker("streaming_video"))
     monkeypatch.setattr(api_server, "OmniOpenAIServingVideo", _FakeCtor)
+    from unittest.mock import AsyncMock
+
+    register = AsyncMock()
+    monkeypatch.setattr("vllm_omni.entrypoints.openai.ming3_voices.register_model_voice_presets", register)
 
     state = State()
     await api_server.omni_init_app_state(engine, state, _minimal_args(log_error_stack=True))
     assert speech_kwargs["speech_cache_config"].resolve_max_bytes == 1024
     assert speech_kwargs["speech_cache_config"].resolve_max_entries == 2048
     assert speech_kwargs["speech_cache_config"].speaker_max_bytes == 8
+    if (ming3 is True and "generate" in supported_tasks) or ming3 == "tts":
+        register.assert_awaited_once()
+        assert register.call_args.args[0] is state.openai_serving_speech
+        assert register.call_args.args[1] == _minimal_args().model
+        if ming3 is True:
+            assert state.openai_serving_chat._ming3_speech_service is state.openai_serving_speech
+        else:
+            assert not hasattr(state.openai_serving_chat, "_ming3_speech_service")
+    else:
+        register.assert_not_awaited()
 
     disabled = (
         set()
