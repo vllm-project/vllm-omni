@@ -43,6 +43,9 @@ def test_adjacent_half_open_windows_and_terminal_one():
         (float("nan"), 1.0),
         (0.0, float("inf")),
         (False, 0.3),
+        # Integers too large for a float must be rejected as client errors, not overflow.
+        (0, 10**400),
+        (-(10**400), 0.3),
     ],
 )
 def test_invalid_window_bounds(low, high):
