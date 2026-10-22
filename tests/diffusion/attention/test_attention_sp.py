@@ -1575,6 +1575,7 @@ def _patch_sp_env(monkeypatch, *, od_config, world_size=2, rank=0):
     return ctx
 
 
+@pytest.mark.cpu
 def test_auto_pad_accepts_mask_free_schedule_profile(monkeypatch):
     # The real selector resolves the baseline; only the SP world and forward context are patched.
     schedule = AttentionScheduleConfig(
