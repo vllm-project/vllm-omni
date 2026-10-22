@@ -218,6 +218,10 @@ _MODEL_PROMOTE = (
     "VLLM_OMNI_WAN_VAE_ENCODE_MARGIN",
     "VLLM_OMNI_WAN_VAE_ENCODE_SPLIT",
     "YUE2_VAE",  # VAE checkpoint selection belongs in typed model configuration.
+    # Intel XPU: MiniMax-H3 video VAE decoder fast paths.
+    "H3_VAE_COMPILE",
+    "H3_VAE_FP16_WEIGHTS",
+    "H3_VAE_XEFMHA",
 )
 
 _MODEL_REQUEST_SCOPE = (

@@ -242,6 +242,25 @@ def _load_audio_vae_encoder(
     return component_cls(model)
 
 
+def vae_compile_allowed(enforce_eager: bool, platform) -> bool:
+    """Whether the pipeline may ask for the VAE decoder torch.compile wrap.
+
+    Same precedence as the DiT compile decision in
+    ``diffusion_model_runner.py`` (``load_model``): ``--enforce-eager`` vetoes
+    compilation outright, then the platform must support torch inductor. The
+    ``H3_VAE_COMPILE`` env switch is applied last, inside the VAE constructor.
+    Computed by the caller and passed in explicitly so the VAE does not guess
+    an execution-mode decision that belongs to the runner/pipeline layer.
+    """
+    if enforce_eager:
+        return False
+    try:
+        return bool(platform.supports_torch_inductor())
+    except NotImplementedError:
+        # A platform without an inductor answer (the base OmniPlatform) gets no compile.
+        return False
+
+
 class _AudioVAEDeterminismContext(AbstractContextManager):
     def __enter__(self):
         backends = torch.backends
@@ -345,6 +364,7 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         decode_only: bool = False,
         trust_remote_code: bool = False,
         decoder_source: str | Mapping[str, str] | None = None,
+        allow_decoder_compile: bool = False,
     ) -> None:
         super().__init__()
         self._device_target = device
@@ -388,6 +408,48 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
                 device=device,
             )
         install_temporal_stream_patches(self.remote.model, pixel_transform=self._pixel_transform)
+        # The three decoder fast paths below are XPU-only: they were written
+        # against the XPU kernels/compile stack and validated there. CUDA keeps
+        # its own fused-operator path (install_h3_vae_optimizations above); on
+        # every other device the checkpoint's reference decoder runs unchanged
+        # and none of the switches prints or installs anything. Like
+        # install_h3_vae_optimizations, they target the checkpoint's own
+        # decoder, so a replacement (NVFP4) decoder skips them too.
+        _xpu = device.type == "xpu" and decoder_path is None
+        if _xpu and os.environ.get("H3_VAE_XEFMHA", "1") == "1" and decoder is not None:
+            # third switch: route the decoder attention to the DiT's XeFMHA varlen entry;
+            # must run BEFORE H3_VAE_COMPILE wraps block.forward so the compiled graph sees the patched method.
+            try:
+                from vllm_omni.diffusion.models.minimax_h3.vae_xefmha import install_vae_xefmha
+
+                install_vae_xefmha(decoder, device, logger)
+            except Exception:
+                logger.exception("[H3_VAE_XEFMHA] install failed; decoder attention left unchanged")
+        # Env-gated (default on): the remote ViT3DDecoder defines no _repeated_blocks,
+        # so regional compilation never touches it and on XPU install_h3_vae_optimizations() returns False (operator
+        # table is CUDA sm90/100/103 only) -> every decoder block runs unfused eager elementwise/cast/rope kernels.
+        # ``allow_decoder_compile`` is the pipeline's eager/inductor decision
+        # (see ``vae_compile_allowed``); the env switch cannot override a veto.
+        if _xpu and allow_decoder_compile and os.environ.get("H3_VAE_COMPILE", "1") == "1" and decoder is not None:
+            _blocks = list(getattr(decoder, "transformer_blocks", []))
+            for _blk in _blocks:
+                _blk.forward = torch.compile(_blk.forward, dynamic=False)
+            logger.info(
+                "[H3_VAE_COMPILE] torch.compile applied to %d decoder transformer blocks device=%s",
+                len(_blocks),
+                device,
+            )
+        if _xpu and os.environ.get("H3_VAE_FP16_WEIGHTS", "1") == "1" and decoder is not None:
+            # CUDA path (ops/vae/__init__.py) persists decoder-block Linear weights in fp16 so autocast does not re-cast
+            # every weight on every tile; on XPU that path is never installed. Same cast, env-gated.
+            from vllm_omni.diffusion.models.minimax_h3.ops.vae import _decoder_block_linears as _h3_dbl
+
+            _linears = _h3_dbl(decoder) or []
+            for _lin in _linears:
+                _lin.to(dtype=torch.float16)
+            logger.info(
+                "[H3_VAE_FP16_WEIGHTS] %d decoder-block linears persisted as fp16 device=%s", len(_linears), device
+            )
         self.model = self.remote.model
         self._stager = None
         self._encoder_stager = None
@@ -403,6 +465,13 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         self._tile_gather_workspace: torch.Tensor | None = None
         self._tile_gather_stats = {"hits": 0, "allocs": 0, "workspace_bytes": 0}
         self._checkpoint_tile_gather = None
+        # Set per decode from the tile-grid geometry (see decode_latent); the
+        # gather protocol below must never be chosen from rank-local data.
+        self._tile_gather_grid_uniform = False
+        # The decoded spatial extent geometry predicts for every tile of the
+        # current decode (or None): the equal-shape gather checks local tiles
+        # against this prediction, not merely against each other.
+        self._tile_gather_expected_hw: tuple[int, int] | None = None
         if self._tile_gather_reuse_enabled():
             self._install_persistent_tile_gather()
 
@@ -596,6 +665,32 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         ``num_tiles`` tensors in global tile order, and raise on an empty local
         share so a rank that owns no tile cannot silently skip the collective.
 
+        Protocol selection is never rank-local. Whether this equal-shape
+        collective or the checkpoint's variable-shape gather runs is decided by
+        ``_tile_gather_grid_uniform``, which ``decode_latent`` records from the
+        tile-grid geometry before any tile is dispatched. The geometry is a
+        pure function of the latent shape and the checkpoint's tile parameters,
+        so every rank resolves the same decision and enters the same collective
+        sequence. A rank-local decision here could split the ranks between two
+        collectives (only the ranks holding edge tiles would fall back), which
+        mismatches or hangs the group without an error. Calls with no recorded
+        decision (for example the encoder-side gathers) take the checkpoint's
+        gather, on every rank alike. The shape check below asserts each local
+        tile against the spatial extent the geometry predicted
+        (``_tile_gather_expected_hw``), so a wrong prediction is caught even
+        when this rank's share happens to be locally uniform. Only the rank
+        actually holding an unexpected tile raises; peer ranks whose share
+        matches the prediction may already be waiting in the collective and
+        are torn down by the executor, so the raise is an error report, not a
+        group-wide desync guard.
+
+        The checkpoint's variable-shape gather that non-uniform grids fall
+        back to carries its own pre-existing limitation: it stacks the local
+        share (``torch.stack``) before the collective, so a rank whose
+        *local* share mixes tile shapes fails in that stack while its peers
+        may already be in the collective. Grid geometry producing such a mix
+        has not been observed from canonical request shapes.
+
         Tile ownership is round-robin (``range(sp_rank, num_tiles, sp_size)``),
         so every rank can compute every other rank's task count from
         ``num_tiles`` and ``sp_size`` alone. That makes the per-rank payloads
@@ -620,6 +715,31 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
 
         if not tasks:
             raise ValueError(f"Found empty tasks on sp rank {sp_rank}")
+
+        if not self._tile_gather_grid_uniform:
+            # No decode recorded an equal-shape grid for this call: every rank
+            # takes the checkpoint's variable-shape gather together. Warn once
+            # because the per-call allocation this class exists to avoid is
+            # back for these calls.
+            logger.warning_once(
+                "[H3_VAE_GATHER] tile grid not proven equal-shape by geometry; "
+                "all ranks use the checkpoint's variable-shape gather (per-call "
+                "allocation) for such calls"
+            )
+            return self._checkpoint_tile_gather(tasks, num_tiles)
+
+        expected_hw = self._tile_gather_expected_hw
+        if (expected_hw is not None and any(tuple(t.shape[-2:]) != tuple(expected_hw) for t in tasks)) or any(
+            t.shape != tasks[0].shape for t in tasks[1:]
+        ):
+            raise ValueError(
+                f"geometry predicted an equal-shape decoder tile grid of spatial size "
+                f"{expected_hw}, but sp rank {sp_rank} holds tiles of shapes "
+                f"{[tuple(t.shape) for t in tasks]} (num_tiles={num_tiles}, "
+                f"sp_size={sp_size}); this rank reports the violated prediction here -- "
+                "peer ranks matching the prediction may already be in the collective "
+                "and rely on the executor tearing the group down"
+            )
 
         max_tasks = -(-num_tiles // sp_size)
         if len(tasks) > max_tasks:
@@ -724,6 +844,42 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
             parallel_size,
         )
         return self._rank_local_tiling()
+
+    def _decoder_tile_grid_hw(self, latent: torch.Tensor) -> tuple[int, int] | None:
+        """The decoded spatial shape every tile of ``latent`` shares, or None.
+
+        Mirrors the checkpoint's ``tiled_decode`` slicing: ``split_tiles``
+        returns per-tile pixel starts and lengths, and each latent tile is
+        ``z[..., start // ratio : start // ratio + length // ratio]`` per axis,
+        clipped by Python slicing at the axis end. The decoder maps a latent
+        extent of ``e`` to a decoded extent of ``e * ratio`` (``split_tiles``
+        works in pixel units and the blend/crop path consumes pixel overlaps),
+        so when each axis yields a single latent extent the grid is
+        equal-shaped and its decoded spatial size is known here, before any
+        tile is decoded. Like ``_decoder_tile_count`` this is a pure function
+        of the latent shape and the checkpoint's tile parameters, so every
+        rank resolves it identically -- which is what lets the gather protocol
+        and its expected shape be chosen without any rank-local input.
+        """
+
+        ratio = int(self.model.vae_ratio)
+        hw: list[int] = []
+        for axis in (-2, -1):
+            axis_len = int(latent.shape[axis])
+            starts, lengths, _ = self.model.split_tiles(axis_len * ratio, True)
+            extents = {
+                min(int(start) // ratio + int(length) // ratio, axis_len) - int(start) // ratio
+                for start, length in zip(starts, lengths)
+            }
+            if len(extents) != 1:
+                return None
+            hw.append(next(iter(extents)) * ratio)
+        return (hw[0], hw[1])
+
+    def _decoder_tile_grid_uniform(self, latent: torch.Tensor) -> bool:
+        """Whether every decoder tile of ``latent`` decodes to the same shape."""
+
+        return self._decoder_tile_grid_hw(latent) is not None
 
     @contextmanager
     def _rank_local_tiling(self) -> Iterator[None]:
@@ -1010,8 +1166,24 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
     def decode_latent(self, latent: torch.Tensor) -> torch.Tensor:
         if getattr(self, "encode_only", False):
             raise RuntimeError("MiniMax H3 encode-only video VAE cannot decode latents")
-        with self._decode_tiling_context(latent):
-            decoded = self.model.decode_base(self._denormalize_latent(latent))
+        # Record the gather-protocol decision for this decode before any tile
+        # is dispatched. It comes from the grid geometry alone, so every rank
+        # records the same value and the gather never has to choose a
+        # collective from rank-local tile shapes.
+        record_protocol = getattr(self, "_checkpoint_tile_gather", None) is not None
+        if record_protocol:
+            expected_hw = self._decoder_tile_grid_hw(latent)
+            self._tile_gather_grid_uniform = expected_hw is not None
+            self._tile_gather_expected_hw = expected_hw
+        try:
+            with self._decode_tiling_context(latent):
+                decoded = self.model.decode_base(self._denormalize_latent(latent))
+        finally:
+            if record_protocol:
+                # The decision belongs to this decode's grid only; a gather
+                # with no recorded decision takes the checkpoint path.
+                self._tile_gather_grid_uniform = False
+                self._tile_gather_expected_hw = None
         if decoded.dtype == torch.uint8:
             # The streaming uint8 write-back already ran the revert and the
             # output quantizer inside write_part; nothing remains but the
