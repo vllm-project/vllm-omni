@@ -1610,7 +1610,8 @@ def validate_attention_schedule_candidates(model: nn.Module, od_config: "OmniDif
         kv_dtype = None
     platform_key = current_omni_platform.device_name
     sp_size = od_config.parallel_config.sequence_parallel_size
-    # Models build the SP padding mask only with mask_sp_padding; otherwise padded tokens are unmasked.
+    # mask_sp_padding turns on the SP padding mask in Wan2.2 T2V, I2V and VACE; without it, padded tokens are unmasked.
+    # HunyuanImage-3.0 masks its own padding either way, and requires mask support where it builds its image attention.
     masks_sp_padding = sp_size is not None and sp_size > 1 and od_config.parallel_config.mask_sp_padding
     auto_pad_roots = _sp_auto_pad_roots(model) if masks_sp_padding else ()
     ring_degree = od_config.parallel_config.ring_degree
