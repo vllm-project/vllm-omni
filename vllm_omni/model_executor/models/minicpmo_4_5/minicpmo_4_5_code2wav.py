@@ -1526,9 +1526,6 @@ class MiniCPMO45Code2Wav(nn.Module):
         for _ in weights:
             pass
         self._build_backend()
-        # Optional: capture the device graphs here instead of deferring to the
-        # first forward; see ``_precapture_after_load``.
-        self._precapture_after_load()
         # Token2wav loads flow.pt and hift.pt inside its constructor instead of
         # from the parent MiniCPM checkpoint iterator. Report those registered
         # parameters as initialized so vLLM's strict loader audit does not
@@ -1684,26 +1681,50 @@ class MiniCPMO45Code2Wav(nn.Module):
         # Captured by the first forward (the warmup run): under vLLM's weight load a graph held GiBs.
         self._precapture_pending = read_bool_flag(extra, "cfm_graph_precapture", True)
 
-    def _precapture_after_load(self) -> None:
-        """Capture the device graphs once the weights are fully on device.
+    def capture_auxiliary_graphs(self) -> None:
+        """Warm the graphs from the engine's warmup step, before the worker is ready.
 
-        Called from ``load_weights``: at that point the weights load is done, so
-        a graph no longer pins load-time allocator blocks (the reason the sweep
-        was originally deferred), yet no request has been served.
+        ``OmniGPUWorkerBase.compile_or_warm_up_model`` calls this right after the
+        runner's own init work, i.e. weights loaded, profiling done, nothing
+        served yet. Runners that capture their own graphs (CUDA V1) already run a
+        dummy forward at that point, which fires the deferred sweep first and
+        leaves this a no-op; runners that do not (MRv2, NPU) would otherwise
+        defer the sweep to the first real request, where a C8 duplex replay
+        stalls every in-flight stream for ~1-2 s per graph while its first-wave
+        sessions time out.
 
-        Runs under the same context ``forward`` gives the lazy sweep (inference
-        mode plus this stage's matmul policy), so a graph captured here replays
-        the kernels the lazy path would have recorded.
+        Capturing here rather than in ``load_weights`` also keeps the allocator
+        layout the runner already uses: a sweep at weight-load time raises the
+        reserved footprint by ~4 GiB on CUDA (measured), which is enough to OOM
+        at concurrency 8.
+
+        The sweep is platform-gated by ``cfm_graph_precapture_at_init``: on by
+        default on Ascend, off on CUDA, where the V1 runner already warms the
+        model up before it serves and the same ~4 GiB of graph memory would be
+        captured ahead of that warmup.
+        """
+        if not self._startup_sweep_enabled():
+            return
+        self._precapture_before_serve()
+
+    def _startup_sweep_enabled(self) -> bool:
+        """Resolve ``cfm_graph_precapture_at_init``, defaulting per platform."""
+        extra = self._extra_config()
+        if extra.get("cfm_graph_precapture_at_init") is not None:
+            return read_bool_flag(extra, "cfm_graph_precapture_at_init", False)
+        from vllm_omni.platforms import current_omni_platform
+
+        return current_omni_platform.is_npu()
+
+    def _precapture_before_serve(self) -> None:
+        """Run the precapture sweep once, under the context ``forward`` uses.
+
+        Inference mode plus this stage's matmul policy, so a graph captured here
+        replays the kernels the lazy path would have recorded.
 
         Per-graph failures are already handled inside ``_precapture_default_prompt``;
         a poisoned wrapper still fails startup there, so this must not catch it.
         """
-        # The deferred trigger above assumes an engine warmup forward fires it.
-        # The Code2Wav stage has no such forward: the sweep then lands on the
-        # first real request, and a C8 duplex replay stalls every in-flight
-        # stream for ~1-2 s per graph while its first-wave sessions time out.
-        if not read_bool_flag(self._extra_config(), "cfm_graph_precapture_after_load", False):
-            return
         if not getattr(self, "_precapture_pending", False) or self.backend is None:
             return
         try:

@@ -419,35 +419,62 @@ def _model_with_sweep(tmp_path, monkeypatch, extra):
     return model, calls
 
 
-def test_precapture_after_load_is_off_by_default(tmp_path, monkeypatch, device_platform):
-    """Without the flag the sweep stays deferred, as before."""
-    model, calls = _model_with_sweep(tmp_path, monkeypatch, {})
-    assert model._precapture_pending is True
-    model._precapture_after_load()
+def _force_platform(monkeypatch, platform: str) -> None:
+    monkeypatch.setattr(current_omni_platform, "is_npu", lambda: platform == "npu")
+    monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: platform == "cuda")
+
+
+def test_startup_sweep_stays_off_when_precapture_is_disabled(tmp_path, monkeypatch, device_platform):
+    """``cfm_graph_precapture: false`` keeps every graph lazy, as before."""
+    model, calls = _model_with_sweep(
+        tmp_path,
+        monkeypatch,
+        {"cfm_graph_precapture": "false", "cfm_graph_precapture_at_init": "true"},
+    )
+    assert model._precapture_pending is False
+    model.capture_auxiliary_graphs()
+    assert calls == []
+
+
+def test_capture_auxiliary_graphs_runs_the_sweep_once(tmp_path, monkeypatch, device_platform):
+    model, calls = _model_with_sweep(tmp_path, monkeypatch, {"cfm_graph_precapture_at_init": "true"})
+    model.capture_auxiliary_graphs()
+    assert calls == [1]
+    # The cleared flag is what keeps the first forward from sweeping again.
+    assert model._precapture_pending is False
+    model.capture_auxiliary_graphs()
+    assert calls == [1]
+
+
+def test_load_weights_does_not_sweep(tmp_path, monkeypatch, device_platform):
+    """Sweeping at weight-load time raised the reserved footprint by ~4 GiB on CUDA."""
+    model, calls = _model_with_sweep(tmp_path, monkeypatch, {"cfm_graph_precapture_at_init": "true"})
+    model.load_weights([])
     assert calls == []
     assert model._precapture_pending is True
 
 
-def test_precapture_after_load_runs_the_sweep_once(tmp_path, monkeypatch, device_platform):
-    model, calls = _model_with_sweep(tmp_path, monkeypatch, {"cfm_graph_precapture_after_load": "true"})
-    model._precapture_after_load()
+@pytest.mark.parametrize(("platform", "expected"), [("npu", True), ("cuda", False)])
+def test_startup_sweep_default_follows_the_platform(tmp_path, monkeypatch, platform, expected):
+    """Ascend has no warmup forward of its own; CUDA V1 warms up before serving."""
+    _force_platform(monkeypatch, platform)
+    model, calls = _model_with_sweep(tmp_path, monkeypatch, {})
+    model.capture_auxiliary_graphs()
+    assert (calls == [1]) is expected
+
+
+@pytest.mark.parametrize("platform", ["npu", "cuda"])
+def test_startup_sweep_can_be_forced_anywhere(tmp_path, monkeypatch, platform):
+    """The explicit flag overrides the platform default in both directions."""
+    _force_platform(monkeypatch, platform)
+    model, calls = _model_with_sweep(tmp_path, monkeypatch, {"cfm_graph_precapture_at_init": "true"})
+    model.capture_auxiliary_graphs()
     assert calls == [1]
-    # The cleared flag is what keeps the first forward from sweeping again.
-    assert model._precapture_pending is False
-    model._precapture_after_load()
-    assert calls == [1]
 
 
-def test_load_weights_triggers_the_startup_sweep(tmp_path, monkeypatch, device_platform):
-    """The sweep is wired into the weight load, not just callable."""
-    model, calls = _model_with_sweep(tmp_path, monkeypatch, {"cfm_graph_precapture_after_load": "true"})
-    model.load_weights([])
-    assert calls == [1]
-
-
-def test_precapture_after_load_matches_the_forward_context(tmp_path, monkeypatch, device_platform):
-    """Graphs captured here must replay what the lazy path would have recorded."""
-    model, _ = _build_backend(tmp_path, monkeypatch, {"cfm_graph_precapture_after_load": "true"})
+def test_startup_sweep_matches_the_forward_context(tmp_path, monkeypatch, device_platform):
+    """Graphs captured there must replay what the lazy path would have recorded."""
+    model, _ = _build_backend(tmp_path, monkeypatch, {"cfm_graph_precapture_at_init": "true"})
     seen: dict[str, object] = {}
 
     def sweep() -> None:
@@ -462,18 +489,18 @@ def test_precapture_after_load_matches_the_forward_context(tmp_path, monkeypatch
 
     monkeypatch.setattr(model, "_precapture_default_prompt", sweep)
     monkeypatch.setattr(code2wav_module, "_stage_matmul_policy", policy)
-    model._precapture_after_load()
+    model.capture_auxiliary_graphs()
     assert seen["inference"] is True
     assert seen["grad"] is False
     assert seen["policy"] == model._tf32_mode
 
 
-def test_precapture_after_load_propagates_a_poisoned_wrapper(tmp_path, monkeypatch, device_platform):
+def test_startup_sweep_propagates_a_poisoned_wrapper(tmp_path, monkeypatch, device_platform):
     """A poisoned wrapper fails startup instead of degrading to lazy capture."""
     model, _ = _build_backend(
         tmp_path,
         monkeypatch,
-        {"cfm_graph_precapture_after_load": "true", "cfm_precapture_empty_cache": "true"},
+        {"cfm_graph_precapture_at_init": "true", "cfm_precapture_empty_cache": "true"},
     )
     released: list[int] = []
 
@@ -483,17 +510,17 @@ def test_precapture_after_load_propagates_a_poisoned_wrapper(tmp_path, monkeypat
     monkeypatch.setattr(model, "_precapture_default_prompt", sweep)
     monkeypatch.setattr(model, "_release_precapture_cache", lambda: released.append(1))
     with pytest.raises(RuntimeError, match="poisoned wrapper"):
-        model._precapture_after_load()
+        model.capture_auxiliary_graphs()
     # The caller-less allocator blocks are still returned before the failure.
     assert released == [1]
 
 
-def test_precapture_after_load_does_not_mask_the_sweep_error(tmp_path, monkeypatch, device_platform):
+def test_startup_sweep_does_not_mask_the_sweep_error(tmp_path, monkeypatch, device_platform):
     """A failing cache release must not replace the error startup is failing for."""
     model, _ = _build_backend(
         tmp_path,
         monkeypatch,
-        {"cfm_graph_precapture_after_load": "true", "cfm_precapture_empty_cache": "true"},
+        {"cfm_graph_precapture_at_init": "true", "cfm_precapture_empty_cache": "true"},
     )
 
     def sweep() -> None:
@@ -505,4 +532,4 @@ def test_precapture_after_load_does_not_mask_the_sweep_error(tmp_path, monkeypat
     monkeypatch.setattr(model, "_precapture_default_prompt", sweep)
     monkeypatch.setattr(model, "_release_precapture_cache", release)
     with pytest.raises(RuntimeError, match="poisoned wrapper"):
-        model._precapture_after_load()
+        model.capture_auxiliary_graphs()
