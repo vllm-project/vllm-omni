@@ -16,6 +16,7 @@ from vllm_omni.diffusion.attention.backends.abstract import (
 )
 from vllm_omni.diffusion.attention.schedule import (
     AttentionSchedule,
+    AttentionSigmaSchedule,
     InvalidAttentionScheduleError,
     normalized_sigma,
     require_attention_schedule_fits,
@@ -65,12 +66,12 @@ class ForwardContext:
     # selects prepared profiles while a denoise step is published. A request binds
     # step ranges or sigma windows, never both.
     attention_schedule: AttentionSchedule | None = None
-    attention_sigma_schedule: tuple[Any, ...] | None = None
+    attention_sigma_schedule: AttentionSigmaSchedule | None = None
     # Whether the bound step ranges are the request's own rather than an inherited service default.
     attention_schedule_from_request: bool = False
     # Profile selected for the bound schedule and the published step or sigma;
     # every scheduled layer in one step reads it instead of selecting again.
-    _attention_profile_key: tuple[AttentionSchedule, int, int] | None = None
+    _attention_profile_key: tuple[AttentionSchedule, int, int] | tuple[AttentionSigmaSchedule, float] | None = None
     _attention_profile: str | None = None
     # Per-request reference latent for img2img DiT models (e.g. Ming)
     ref_latent: torch.Tensor | None = None
@@ -316,7 +317,10 @@ def override_paged_kv_adapter(adapter: Any | None):
 
 @contextmanager
 def bind_attention_schedule(
-    schedule: AttentionSchedule | None, sigma_schedule: tuple[Any, ...] | None = None, *, from_request: bool = False
+    schedule: AttentionSchedule | None,
+    sigma_schedule: AttentionSigmaSchedule | None = None,
+    *,
+    from_request: bool = False,
 ):
     """Install one request's step ranges and sigma windows and restore the previous ones on any exit.
 
@@ -348,11 +352,12 @@ def get_attention_schedule_profile() -> str | None:
     if ctx.attention_sigma_schedule:
         if ctx.denoise_step_idx is None:
             return None
-        sigma_key = (ctx.attention_sigma_schedule, ctx.denoise_sigma)
+        sigma = ctx.denoise_sigma
+        if sigma is None:
+            raise RuntimeError("attention sigma windows need denoise_sigma published with denoise_step_idx")
+        sigma_key = (ctx.attention_sigma_schedule, sigma)
         if sigma_key != ctx._attention_profile_key:
-            if ctx.denoise_sigma is None:
-                raise RuntimeError("attention sigma windows need denoise_sigma published with denoise_step_idx")
-            ctx._attention_profile = select_attention_profile_by_sigma(ctx.attention_sigma_schedule, ctx.denoise_sigma)
+            ctx._attention_profile = select_attention_profile_by_sigma(ctx.attention_sigma_schedule, sigma)
             ctx._attention_profile_key = sigma_key
         return ctx._attention_profile
     if not ctx.attention_schedule or ctx.denoise_step_idx is None:
@@ -540,7 +545,7 @@ class DenoiseProgressMixin:
         _forward_context.denoise_timestep = float(timestep) / ntt if ntt else None
 
     @staticmethod
-    def _denoise_sigma(step_idx: int | None, scheduler: Any, sigma: float | None) -> float | None:
+    def _denoise_sigma(step_idx: int | None, scheduler: object, sigma: float | None) -> float | None:
         """The caller's normalized sigma, else ``scheduler.sigmas[step_idx]`` relative to the first sigma.
 
         A raw model timestep is never read as noise; without either source the sigma stays None and
