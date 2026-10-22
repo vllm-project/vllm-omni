@@ -50,6 +50,11 @@ from vllm_omni.diffusion.forward_context import (
     get_forward_context,
     is_forward_context_available,
 )
+from vllm_omni.diffusion.layers.fused_qk_norm_rope import (
+    _fused_cuda_supported,
+    fused_qk_norm_rope,
+    fused_qk_norm_rope_min_tokens,
+)
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding, apply_rope_to_qk
 from vllm_omni.model_executor.layers.timestep_embedding import timestep_embedding
 
@@ -59,6 +64,28 @@ SEQ_MULTI_OF = 32
 LEARNED_PADDING = "learned"
 ZERO_MASKED_PADDING = "zero_masked"
 logger = init_logger(__name__)
+
+_FUSED_QK_NORM_ROPE_MIN_TOKENS = 2048
+
+ZImageCaptionContext = tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    list[int],
+    torch.Tensor,
+]
+
+
+def _has_image_alignment_padding(
+    item_seqlens: list[int],
+    image_sizes: list[tuple[int, int, int]],
+    patch_size: int,
+    f_patch_size: int,
+) -> bool:
+    return any(
+        seq_len != (frames // f_patch_size) * (height // patch_size) * (width // patch_size)
+        for seq_len, (frames, height, width) in zip(item_seqlens, image_sizes)
+    )
 
 
 class UnifiedPrepare(nn.Module):
@@ -339,10 +366,29 @@ class ZImageAttention(nn.Module):
         key = key.unflatten(-1, (self.to_qkv.num_kv_heads, -1))
         value = value.unflatten(-1, (self.to_qkv.num_kv_heads, -1))
 
-        query = self.norm_q(query)
-        key = self.norm_k(key)
-
-        query, key = apply_rope_to_qk(self.rope, query, key, (cos, sin))
+        batch, seq_len, num_heads, head_dim = query.shape
+        tokens = batch * seq_len
+        rotary_dim = cos.shape[-1] * 2
+        if tokens >= fused_qk_norm_rope_min_tokens(_FUSED_QK_NORM_ROPE_MIN_TOKENS) and _fused_cuda_supported(
+            query, key, head_dim, rotary_dim, interleaved=True
+        ):
+            num_kv_heads = key.shape[2]
+            rope_table = torch.cat((cos, sin), dim=-1).reshape(tokens, rotary_dim)
+            query, key = fused_qk_norm_rope(
+                query.reshape(tokens, num_heads, head_dim),
+                key.reshape(tokens, num_kv_heads, head_dim),
+                self.norm_q.weight,
+                self.norm_k.weight,
+                rope_table,
+                self.norm_q.variance_epsilon,
+                interleaved=True,
+            )
+            query = query.reshape(batch, seq_len, num_heads, head_dim)
+            key = key.reshape(batch, seq_len, num_kv_heads, head_dim)
+        else:
+            query = self.norm_q(query)
+            key = self.norm_k(key)
+            query, key = apply_rope_to_qk(self.rope, query, key, (cos, sin))
         # Cast to correct dtype
         dtype = query.dtype
         query, key = query.to(dtype), key.to(dtype)
@@ -861,6 +907,7 @@ class ZImageTransformer2DModel(CachedTransformer):
         f_patch_size: int,
         all_image_ref: list[torch.Tensor | None] | None = None,
         all_cap_feats_2: list[torch.Tensor | None] | None = None,
+        cap_padded_lens: list[int] | None = None,
     ):
         pH = pW = patch_size
         pF = f_patch_size
@@ -870,46 +917,27 @@ class ZImageTransformer2DModel(CachedTransformer):
         all_image_size = []
         all_image_pos_ids = []
         all_image_pad_mask = []
-        all_cap_pos_ids = []
-        all_cap_pad_mask = []
-        all_cap_feats_out = []
-        all_cap_feats_2_out = []
 
         if all_image_ref is None:
             all_image_ref = [None] * len(all_image)
-        if all_cap_feats_2 is None:
-            all_cap_feats_2 = [None] * len(all_image)
 
-        for image, cap_feat, cap_feat_2, image_ref in zip(all_image, all_cap_feats, all_cap_feats_2, all_image_ref):
-            ### Process Caption
-            cap_ori_len = len(cap_feat) + (len(cap_feat_2) if cap_feat_2 is not None else 0)
-            cap_padding_len = (-cap_ori_len) % SEQ_MULTI_OF
-            # padded position ids
-            cap_padded_pos_ids = self.create_coordinate_grid(
-                size=(cap_ori_len + cap_padding_len, 1, 1),
-                start=(1, 0, 0),
-                device=device,
-            ).flatten(0, 2)
-            all_cap_pos_ids.append(cap_padded_pos_ids)
-            # pad mask
-            all_cap_pad_mask.append(
-                torch.cat(
-                    [
-                        torch.zeros((cap_ori_len,), dtype=torch.bool, device=device),
-                        torch.ones((cap_padding_len,), dtype=torch.bool, device=device),
-                    ],
-                    dim=0,
-                )
-            )
-            # padded feature
-            if cap_feat_2 is None:
-                all_cap_feats_out.append(torch.cat([cap_feat, cap_feat[-1:].repeat(cap_padding_len, 1)], dim=0))
-            else:
-                all_cap_feats_out.append(cap_feat)
-                all_cap_feats_2_out.append(
-                    torch.cat([cap_feat_2, torch.zeros_like(cap_feat_2[-1:]).repeat(cap_padding_len, 1)])
-                )
+        if cap_padded_lens is None:
+            (
+                all_cap_feats_out,
+                all_cap_pos_ids,
+                all_cap_pad_mask,
+                all_cap_feats_2_out,
+            ) = self._prepare_caption_inputs(all_cap_feats, device, all_cap_feats_2)
+            cap_padded_lens = [len(item) for item in all_cap_pos_ids]
+        else:
+            if len(cap_padded_lens) != len(all_image):
+                raise ValueError("Caption context batch size must match the latent batch size.")
+            all_cap_feats_out = []
+            all_cap_pos_ids = []
+            all_cap_pad_mask = []
+            all_cap_feats_2_out = []
 
+        for image, cap_padded_len, image_ref in zip(all_image, cap_padded_lens, all_image_ref):
             ### Process Image
             if image_ref is not None:
                 image = torch.cat([image, image_ref], dim=1)
@@ -926,7 +954,7 @@ class ZImageTransformer2DModel(CachedTransformer):
 
             image_ori_pos_ids = self.create_coordinate_grid(
                 size=(F_tokens, H_tokens, W_tokens),
-                start=(cap_ori_len + cap_padding_len + 1, 0, 0),
+                start=(cap_padded_len + 1, 0, 0),
                 device=device,
             ).flatten(0, 2)
             image_padding_pos_ids = (
@@ -951,7 +979,9 @@ class ZImageTransformer2DModel(CachedTransformer):
                 )
             )
             # padded feature
-            image_padded_feat = torch.cat([image, image[-1:].repeat(image_padding_len, 1)], dim=0)
+            image_padded_feat = (
+                torch.cat([image, image[-1:].repeat(image_padding_len, 1)], dim=0) if image_padding_len else image
+            )
             all_image_out.append(image_padded_feat)
 
         return (
@@ -965,6 +995,122 @@ class ZImageTransformer2DModel(CachedTransformer):
             all_cap_feats_2_out,
         )
 
+    def _prepare_caption_inputs(
+        self,
+        all_cap_feats: list[torch.Tensor],
+        device: torch.device,
+        all_cap_feats_2: list[torch.Tensor | None] | None = None,
+    ) -> tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor], list[torch.Tensor]]:
+        all_cap_pos_ids = []
+        all_cap_pad_mask = []
+        all_cap_feats_out = []
+        all_cap_feats_2_out = []
+
+        if all_cap_feats_2 is None:
+            all_cap_feats_2 = [None] * len(all_cap_feats)
+
+        for cap_feat, cap_feat_2 in zip(all_cap_feats, all_cap_feats_2):
+            cap_ori_len = len(cap_feat) + (len(cap_feat_2) if cap_feat_2 is not None else 0)
+            cap_padding_len = (-cap_ori_len) % SEQ_MULTI_OF
+            all_cap_pos_ids.append(
+                self.create_coordinate_grid(
+                    size=(cap_ori_len + cap_padding_len, 1, 1),
+                    start=(1, 0, 0),
+                    device=device,
+                ).flatten(0, 2)
+            )
+            all_cap_pad_mask.append(
+                torch.cat(
+                    [
+                        torch.zeros((cap_ori_len,), dtype=torch.bool, device=device),
+                        torch.ones((cap_padding_len,), dtype=torch.bool, device=device),
+                    ],
+                    dim=0,
+                )
+            )
+            if cap_feat_2 is None:
+                all_cap_feats_out.append(torch.cat([cap_feat, cap_feat[-1:].repeat(cap_padding_len, 1)], dim=0))
+            else:
+                all_cap_feats_out.append(cap_feat)
+                all_cap_feats_2_out.append(
+                    torch.cat([cap_feat_2, torch.zeros_like(cap_feat_2[-1:]).repeat(cap_padding_len, 1)])
+                )
+
+        return all_cap_feats_out, all_cap_pos_ids, all_cap_pad_mask, all_cap_feats_2_out
+
+    def _refine_caption_context(
+        self,
+        cap_feats: list[torch.Tensor],
+        cap_pos_ids: list[torch.Tensor],
+        cap_inner_pad_mask: list[torch.Tensor],
+        cap_feats_2: list[torch.Tensor],
+        device: torch.device,
+    ) -> ZImageCaptionContext:
+        bsz = len(cap_feats)
+        cap_item_seqlens = [len(item) for item in cap_feats]
+        cap_feats_tensor = self.cap_embedder(torch.cat(cap_feats, dim=0))
+        if cap_feats_2:
+            cap_feats_items = list(cap_feats_tensor.split(cap_item_seqlens, dim=0))
+            if len(cap_feats_items) != len(cap_feats_2):
+                raise ValueError("Primary and direct caption conditions must have equal batch size.")
+            cap_feats_items = [
+                torch.cat([primary, direct], dim=0) for primary, direct in zip(cap_feats_items, cap_feats_2)
+            ]
+            cap_item_seqlens = [len(item) for item in cap_feats_items]
+            cap_feats_tensor = torch.cat(cap_feats_items, dim=0)
+        assert all(seq_len % SEQ_MULTI_OF == 0 for seq_len in cap_item_seqlens)
+
+        cap_pad_mask = torch.cat(cap_inner_pad_mask)
+        cap_padding = (
+            self.cap_pad_token.expand(cap_feats_tensor.shape[0], -1)
+            if self.alignment_padding_mode == LEARNED_PADDING
+            else torch.zeros_like(cap_feats_tensor)
+        )
+        cap_feats_tensor = torch.where(
+            cap_pad_mask.unsqueeze(1).expand_as(cap_feats_tensor),
+            cap_padding,
+            cap_feats_tensor,
+        )
+        cap_feats_items = list(cap_feats_tensor.split(cap_item_seqlens, dim=0))
+
+        cap_cos, cap_sin = self.rope_embedder(torch.cat(cap_pos_ids, dim=0))
+        cap_cos_items = list(cap_cos.split(cap_item_seqlens, dim=0))
+        cap_sin_items = list(cap_sin.split(cap_item_seqlens, dim=0))
+
+        cap_feats_tensor = pad_sequence(cap_feats_items, batch_first=True, padding_value=0.0)
+        cap_cos = pad_sequence(cap_cos_items, batch_first=True, padding_value=0.0)
+        cap_sin = pad_sequence(cap_sin_items, batch_first=True, padding_value=0.0)
+        cap_attn_mask = torch.zeros((bsz, max(cap_item_seqlens)), dtype=torch.bool, device=device)
+        for i, seq_len in enumerate(cap_item_seqlens):
+            cap_attn_mask[i, :seq_len] = 1
+            if self.alignment_padding_mode == ZERO_MASKED_PADDING:
+                cap_attn_mask[i, :seq_len].masked_fill_(cap_inner_pad_mask[i], False)
+
+        for layer in self.context_refiner:
+            cap_feats_tensor = layer(cap_feats_tensor, cap_attn_mask, cap_cos, cap_sin)
+
+        return cap_feats_tensor, cap_cos, cap_sin, cap_item_seqlens, cap_attn_mask
+
+    def prepare_caption_context(
+        self,
+        cap_feats: list[torch.Tensor],
+        device: torch.device,
+        cap_feats_2: list[torch.Tensor | None] | None = None,
+    ) -> ZImageCaptionContext:
+        (
+            cap_feats,
+            cap_pos_ids,
+            cap_inner_pad_mask,
+            cap_feats_2_out,
+        ) = self._prepare_caption_inputs(cap_feats, device, cap_feats_2)
+        return self._refine_caption_context(
+            cap_feats,
+            cap_pos_ids,
+            cap_inner_pad_mask,
+            cap_feats_2_out,
+            device,
+        )
+
     def forward(
         self,
         x: list[torch.Tensor],
@@ -974,15 +1120,24 @@ class ZImageTransformer2DModel(CachedTransformer):
         f_patch_size=1,
         ref_x: list[torch.Tensor | None] | None = None,
         cap_feats_2: list[torch.Tensor] | None = None,
+        caption_context: ZImageCaptionContext | None = None,
+        latent_repeat_count: int = 1,
     ):
         assert patch_size in self.all_patch_size
         assert f_patch_size in self.all_f_patch_size
+        if latent_repeat_count not in (1, 2):
+            raise ValueError(f"Unsupported latent repeat count: {latent_repeat_count}.")
+        if latent_repeat_count == 2 and len(x) != 1:
+            raise ValueError("Shared CFG latent preparation currently requires a single latent input.")
 
-        bsz = len(x)
+        latent_bsz = len(x)
+        bsz = latent_bsz * latent_repeat_count
         device = x[0].device
         t = t * self.t_scale
         t = self.t_embedder(t)
 
+        cached_cap_seqlens = caption_context[3] if caption_context is not None else None
+        latent_cap_seqlens = cached_cap_seqlens[:latent_bsz] if cached_cap_seqlens is not None else None
         (
             x,
             cap_feats,
@@ -992,7 +1147,15 @@ class ZImageTransformer2DModel(CachedTransformer):
             x_inner_pad_mask,
             cap_inner_pad_mask,
             cap_feats_2,
-        ) = self.patchify_and_embed(x, cap_feats, patch_size, f_patch_size, ref_x, cap_feats_2)
+        ) = self.patchify_and_embed(
+            x,
+            cap_feats,
+            patch_size,
+            f_patch_size,
+            ref_x,
+            cap_feats_2,
+            latent_cap_seqlens,
+        )
 
         # x embed & refine
         x_item_seqlens = [len(_) for _ in x]
@@ -1005,17 +1168,23 @@ class ZImageTransformer2DModel(CachedTransformer):
         # Match t_embedder output dtype to x for layerwise casting compatibility
         adaln_input = t.type_as(x)
         # Use torch.where instead of x[mask]= to avoid aten::index_put_/nonzero and cudaStreamSynchronize
-        x_pad_mask = torch.cat(x_inner_pad_mask)
-        x_padding = (
-            self.x_pad_token.expand(x.shape[0], -1)
-            if self.alignment_padding_mode == LEARNED_PADDING
-            else torch.zeros_like(x)
-        )
-        x = torch.where(
-            x_pad_mask.unsqueeze(1).expand_as(x),
-            x_padding,
-            x,
-        )
+        if _has_image_alignment_padding(
+            x_item_seqlens,
+            x_size,
+            patch_size,
+            f_patch_size,
+        ):
+            x_pad_mask = torch.cat(x_inner_pad_mask)
+            x_padding = (
+                self.x_pad_token.expand(x.shape[0], -1)
+                if self.alignment_padding_mode == LEARNED_PADDING
+                else torch.zeros_like(x)
+            )
+            x = torch.where(
+                x_pad_mask.unsqueeze(1).expand_as(x),
+                x_padding,
+                x,
+            )
         x = list(x.split(x_item_seqlens, dim=0))
         x_cos, x_sin = self.rope_embedder(torch.cat(x_pos_ids, dim=0))
         x_cos = list(x_cos.split(x_item_seqlens, dim=0))
@@ -1024,57 +1193,36 @@ class ZImageTransformer2DModel(CachedTransformer):
         x = pad_sequence(x, batch_first=True, padding_value=0.0)
         x_cos = pad_sequence(x_cos, batch_first=True, padding_value=0.0)
         x_sin = pad_sequence(x_sin, batch_first=True, padding_value=0.0)
-        x_attn_mask = torch.zeros((bsz, x_max_item_seqlen), dtype=torch.bool, device=device)
+        x_attn_mask = torch.zeros((latent_bsz, x_max_item_seqlen), dtype=torch.bool, device=device)
         for i, seq_len in enumerate(x_item_seqlens):
             x_attn_mask[i, :seq_len] = 1
             if self.alignment_padding_mode == ZERO_MASKED_PADDING:
                 x_attn_mask[i, :seq_len].masked_fill_(x_inner_pad_mask[i], False)
 
         for layer in self.noise_refiner:
-            x = layer(x, x_attn_mask, x_cos, x_sin, adaln_input)
+            x = layer(x, x_attn_mask, x_cos, x_sin, adaln_input[:latent_bsz])
 
-        # cap embed & refine
-        cap_item_seqlens = [len(_) for _ in cap_feats]
-        cap_feats = torch.cat(cap_feats, dim=0)
-        cap_feats = self.cap_embedder(cap_feats)
-        if cap_feats_2:
-            cap_feats = list(cap_feats.split(cap_item_seqlens, dim=0))
-            if len(cap_feats) != len(cap_feats_2):
-                raise ValueError("Primary and direct caption conditions must have equal batch size.")
-            cap_feats = [torch.cat([primary, direct], dim=0) for primary, direct in zip(cap_feats, cap_feats_2)]
-            cap_item_seqlens = [len(item) for item in cap_feats]
-            cap_feats = torch.cat(cap_feats, dim=0)
-        assert all(_ % SEQ_MULTI_OF == 0 for _ in cap_item_seqlens)
-        cap_max_item_seqlen = max(cap_item_seqlens)
+        if latent_repeat_count == 2:
+            x = x.repeat(2, 1, 1)
+            x_cos = x_cos.repeat(2, 1, 1)
+            x_sin = x_sin.repeat(2, 1, 1)
+            x_attn_mask = x_attn_mask.repeat(2, 1)
+            x_item_seqlens *= 2
+            x_size *= 2
 
-        # Use torch.where instead of cap_feats[mask]= to avoid aten::index_put_/nonzero and cudaStreamSynchronize
-        cap_pad_mask = torch.cat(cap_inner_pad_mask)
-        cap_padding = (
-            self.cap_pad_token.expand(cap_feats.shape[0], -1)
-            if self.alignment_padding_mode == LEARNED_PADDING
-            else torch.zeros_like(cap_feats)
-        )
-        cap_feats = torch.where(
-            cap_pad_mask.unsqueeze(1).expand_as(cap_feats),
-            cap_padding,
-            cap_feats,
-        )
-        cap_feats = list(cap_feats.split(cap_item_seqlens, dim=0))
-        cap_cos, cap_sin = self.rope_embedder(torch.cat(cap_pos_ids, dim=0))
-        cap_cos = list(cap_cos.split(cap_item_seqlens, dim=0))
-        cap_sin = list(cap_sin.split(cap_item_seqlens, dim=0))
-
-        cap_feats = pad_sequence(cap_feats, batch_first=True, padding_value=0.0)
-        cap_cos = pad_sequence(cap_cos, batch_first=True, padding_value=0.0)
-        cap_sin = pad_sequence(cap_sin, batch_first=True, padding_value=0.0)
-        cap_attn_mask = torch.zeros((bsz, cap_max_item_seqlen), dtype=torch.bool, device=device)
-        for i, seq_len in enumerate(cap_item_seqlens):
-            cap_attn_mask[i, :seq_len] = 1
-            if self.alignment_padding_mode == ZERO_MASKED_PADDING:
-                cap_attn_mask[i, :seq_len].masked_fill_(cap_inner_pad_mask[i], False)
-
-        for layer in self.context_refiner:
-            cap_feats = layer(cap_feats, cap_attn_mask, cap_cos, cap_sin)
+        if caption_context is None:
+            caption_context = self._refine_caption_context(
+                cap_feats,
+                cap_pos_ids,
+                cap_inner_pad_mask,
+                cap_feats_2,
+                device,
+            )
+        cap_feats, cap_cos, cap_sin, cap_item_seqlens, cap_attn_mask = caption_context
+        if len(cap_item_seqlens) != bsz:
+            raise ValueError(
+                f"Caption context batch size must match the latent batch size, got {len(cap_item_seqlens)} and {bsz}."
+            )
 
         # Prepare unified tensors via UnifiedPrepare module
         # This enables _cp_plan to shard outputs via split_output=True
