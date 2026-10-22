@@ -4041,6 +4041,73 @@ def test_h3_control_upload_contract(endpoint, mode, test_client, mocker):
             assert not Path(path).exists()
 
 
+@pytest.mark.parametrize("endpoint", ["/v1/videos", "/v1/videos/sync"])
+@pytest.mark.parametrize("path_source", ["filename", "extra_params"])
+def test_h3_control_cleanup_preserves_client_named_file(endpoint, path_source, test_client, mocker, tmp_path):
+    _mock_encode_video_bytes(mocker)
+    engine = test_client.app.state.openai_serving_video._engine_client
+    engine.model_class_name = "MiniMaxH3Pipeline"
+    engine.controlnet_model_path = "/configured/control.safetensors"
+    sentinel = tmp_path / "keep.mp4"
+    sentinel.write_bytes(b"unrelated server file")
+    fields = {"prompt": "Follow the control.", "control_type": "canny"}
+    if path_source == "extra_params":
+        fields["extra_params"] = json.dumps({"canny": {"control_path": str(sentinel)}})
+    response = test_client.post(
+        endpoint,
+        data=fields,
+        files={"control_reference": (str(sentinel), _make_test_video_bytes(), "video/mp4")},
+    )
+    if path_source == "extra_params":
+        assert response.status_code == 400
+        assert "server-local" in response.json()["detail"]
+        assert engine.captured_prompt is None
+        assert asyncio.run(api_server.VIDEO_STORE.list_values()) == []
+    else:
+        assert response.status_code == 200, response.text
+        if not endpoint.endswith("/sync"):
+            _wait_for_status(test_client, response.json()["id"], VideoGenerationStatus.COMPLETED.value)
+        path = engine.captured_sampling_params_list[0].extra_args["canny"]["control_path"]
+        assert path != str(sentinel)
+        assert not Path(path).exists()
+    assert sentinel.read_bytes() == b"unrelated server file"
+
+
+def test_h3_control_cleanup_when_task_cancelled_before_start(test_client, mocker):
+    engine = test_client.app.state.openai_serving_video._engine_client
+    engine.model_class_name = "MiniMaxH3Pipeline"
+    engine.controlnet_model_path = "/configured/control.safetensors"
+    created = []
+    original_mkstemp = video_generation_helpers.tempfile.mkstemp
+    original_upsert = api_server.VIDEO_TASKS.upsert
+
+    def track(*args, **kwargs):
+        result = original_mkstemp(*args, **kwargs)
+        created.append(Path(result[1]))
+        return result
+
+    async def cancel_before_start(video_id, task):
+        task.cancel()
+        await original_upsert(video_id, task)
+
+    mocker.patch.object(video_generation_helpers.tempfile, "mkstemp", side_effect=track)
+    mocker.patch.object(api_server.VIDEO_TASKS, "upsert", side_effect=cancel_before_start)
+    video_bytes = _make_test_video_bytes()
+    response = test_client.post(
+        "/v1/videos",
+        data={"prompt": "Cancel before generation.", "control_type": "canny"},
+        files={
+            "control_reference": ("hint.mp4", video_bytes, "video/mp4"),
+            "source_reference": ("source.mp4", video_bytes, "video/mp4"),
+            "mask_reference": ("mask.png", _make_test_image_bytes(), "image/png"),
+        },
+    )
+    assert response.status_code == 200, response.text
+    assert len(created) == 3
+    _wait_until(lambda: all(not path.exists() for path in created))
+    assert engine.captured_prompt is None
+
+
 @pytest.mark.parametrize(("endpoint", "with_hint"), [("/v1/videos/sync", False), ("/v1/videos", True)])
 def test_h3_inpaint_source_is_not_ref2va(endpoint, with_hint, test_client, mocker):
     _mock_encode_video_bytes(mocker)
