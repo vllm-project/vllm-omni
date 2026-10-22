@@ -1159,6 +1159,62 @@ async def test_session_update_ignores_model(model: str | None) -> None:
     assert connection.session.config.model == "test-model"
 
 
+@pytest.mark.parametrize(
+    ("modalities", "expected"),
+    [(["text"], "high"), (["audio"], None), (["text", "audio"], None)],
+)
+def test_resolve_response_gates_reasoning_on_output_modalities(modalities: list[str], expected: str | None) -> None:
+    connection, _ = _make_connection()
+    connection.session.config.output_modalities = modalities
+    connection.session.config.reasoning = types.RealtimeReasoning(effort="high")
+
+    response = connection._resolve_response(None)
+
+    assert response.reasoning_effort == expected
+
+
+def test_resolve_response_honors_response_level_reasoning() -> None:
+    connection, _ = _make_connection()
+    connection.session.config.output_modalities = ["text"]
+    connection.session.config.reasoning = types.RealtimeReasoning(effort="high")
+    response_cfg = types.RealtimeResponseCreateParams.model_validate({"reasoning": {"effort": "low"}})
+
+    assert connection._resolve_response(response_cfg).reasoning_effort == "low"
+
+
+def test_resolve_response_drops_response_level_reasoning_for_audio() -> None:
+    connection, _ = _make_connection()
+    response_cfg = types.RealtimeResponseCreateParams.model_validate({"reasoning": {"effort": "low"}})
+
+    assert connection._resolve_response(response_cfg).reasoning_effort is None
+
+
+def test_resolve_response_applies_session_reasoning_to_text_only_override() -> None:
+    connection, _ = _make_connection()
+    connection.session.config.output_modalities = ["audio"]
+    connection.session.config.reasoning = types.RealtimeReasoning(effort="high")
+    response_cfg = types.RealtimeResponseCreateParams.model_validate({"output_modalities": ["text"]})
+
+    assert connection._resolve_response(response_cfg).reasoning_effort == "high"
+
+
+@pytest.mark.asyncio
+async def test_build_full_prompt_forwards_reasoning_effort() -> None:
+    connection, _ = _make_connection()
+    captured: list[Any] = []
+    original = connection.chat_handler._preprocess_chat
+
+    async def capture(request, messages, **kwargs):
+        captured.append(request)
+        return await original(request, messages, **kwargs)
+
+    connection.chat_handler._preprocess_chat = capture
+
+    await connection._build_full_prompt(reasoning_effort="high")
+
+    assert captured[0].reasoning_effort == "high"
+
+
 @pytest.mark.asyncio
 async def test_session_update_rejects_mcp_tools() -> None:
     websocket = _FakeWebSocket()

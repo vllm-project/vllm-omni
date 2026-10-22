@@ -122,6 +122,11 @@ class AudioFullDuplexSessionState:
         speed = output.speed if output is not None else None
         return float(speed) if isinstance(speed, int | float) else 1.0
 
+    @property
+    def reasoning_effort(self) -> str | None:
+        reasoning = self.config.reasoning
+        return reasoning.effort if reasoning is not None else None
+
     def find_item_index(self, item_id: str) -> int | None:
         for i, item in enumerate(self.items):
             if item.id == item_id:

@@ -156,6 +156,7 @@ class _ResolvedResponse:
     tools: list[Any] | None
     tool_choice: Any
     metadata: Any
+    reasoning_effort: str | None = None
 
 
 class OpenAIFullDuplexConnection:
@@ -756,6 +757,14 @@ class OpenAIFullDuplexConnection:
         if tools and tool_choice != "none" and self._tool_call_parser_name is None:
             raise ValueError("Function tools require --enable-auto-tool-choice and --tool-call-parser")
 
+        reasoning_effort = s.reasoning_effort
+        if response_cfg is not None and response_cfg.reasoning is not None:
+            reasoning_effort = response_cfg.reasoning.effort
+        if reasoning_effort is not None and "audio" in modalities:
+            # Thinker reasoning tokens are fed to the Talker, which would speak
+            # them. Only honor reasoning for text-only responses.
+            reasoning_effort = None
+
         resolved_input = self._resolve_response_input(response_input) if response_input is not None else None
         return _ResolvedResponse(
             input=resolved_input,
@@ -765,6 +774,7 @@ class OpenAIFullDuplexConnection:
             tools=tools,
             tool_choice=tool_choice,
             metadata=metadata,
+            reasoning_effort=reasoning_effort,
         )
 
     async def _truncate_prompt_items(self, response: _ResolvedResponse) -> list[types.ConversationItem] | None:
@@ -785,6 +795,7 @@ class OpenAIFullDuplexConnection:
                     tools=response.tools,
                     instructions=response.instructions,
                     items=current_items,
+                    reasoning_effort=response.reasoning_effort,
                     skip_mm_cache=True,
                 )
             except VLLMValidationError as exc:
@@ -906,6 +917,7 @@ class OpenAIFullDuplexConnection:
                 tools=response.tools,
                 instructions=response.instructions,
                 items=preflight_items,
+                reasoning_effort=response.reasoning_effort,
             )
         except VLLMValidationError as exc:
             await self._send_error(str(exc), "invalid_request_error", event_id=event.event_id)
@@ -1961,6 +1973,7 @@ class OpenAIFullDuplexConnection:
         *,
         instructions: str | None = None,
         items: list[types.ConversationItem] | None = None,
+        reasoning_effort: str | None = None,
         skip_mm_cache: bool = False,
     ) -> EngineInput:
         """Render the effective conversation through normal chat preprocessing."""
@@ -2037,6 +2050,7 @@ class OpenAIFullDuplexConnection:
             model=self.model_name,
             messages=messages,
             max_completion_tokens=0,
+            reasoning_effort=reasoning_effort,
         )
         _, (engine_input,) = await chat_handler._preprocess_chat(
             request,
