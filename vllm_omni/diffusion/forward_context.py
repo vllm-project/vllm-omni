@@ -323,12 +323,13 @@ def get_attention_schedule_profile() -> str | None:
     ctx = _forward_context
     if ctx is None or not ctx.attention_schedule or ctx.denoise_step_idx is None:
         return None
-    key = (ctx.attention_schedule, ctx.denoise_step_idx, ctx.total_denoise_steps)
+    total = ctx.total_denoise_steps
+    if total is None:
+        raise RuntimeError("an attention schedule needs total_denoise_steps published with denoise_step_idx")
+    key = (ctx.attention_schedule, ctx.denoise_step_idx, total)
     if key != ctx._attention_profile_key:
-        if ctx.total_denoise_steps is None:
-            raise RuntimeError("an attention schedule needs total_denoise_steps published with denoise_step_idx")
         ctx._attention_profile = select_attention_profile(
-            ctx.attention_schedule, ctx.denoise_step_idx, total_steps=ctx.total_denoise_steps
+            ctx.attention_schedule, ctx.denoise_step_idx, total_steps=total
         )
         ctx._attention_profile_key = key
     return ctx._attention_profile
