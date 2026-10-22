@@ -21,8 +21,7 @@ The server configuration contains `profiles` and `default`:
   underscores or hyphens. All profiles are validated, even unused ones.
 - The top-level `default` is a list of ranges. An empty configuration with
   no profiles is equivalent to not configuring schedules.
-- Other top-level keys are rejected at startup; a `sigma` key fails with the
-  same `Unsupported diffusion_attention_schedule` error.
+- Other top-level keys are rejected at startup.
 
 Each range has exactly `start`, `end` and `profile`:
 
