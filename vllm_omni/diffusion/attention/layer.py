@@ -62,7 +62,7 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-def _canonical_json(value: Any) -> str | object:
+def _canonical_json(value: object) -> str | object:
     """Order-insensitive canonical form for dedup keys; ``""`` for None or empty containers.
 
     An unserializable value is not shareable, so it gets a fresh sentinel that equals nothing else.
