@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from vllm.platforms import current_platform
 from vllm.triton_utils import HAS_TRITON
 
 from tests.helpers.mark import hardware_marks
@@ -53,7 +54,7 @@ def test_packed_table_skipped_on_cpu():
     assert _packed_qk_norm_rope_table((cos, sin), 7, 2, torch.bfloat16) is None
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.skipif(not current_platform.is_cuda() or not torch.cuda.is_available(), reason="NVIDIA CUDA required")
 @pytest.mark.skipif(not HAS_TRITON, reason="Triton required")
 def test_packed_table_video_rows_then_identity_text_rows():
     cos, sin = torch.randn(50, _HEAD_DIM // 2, device="cuda"), torch.randn(50, _HEAD_DIM // 2, device="cuda")
@@ -91,7 +92,7 @@ def test_identity_rotation_rows_are_exact():
     assert (fq != ref).float().mean().item() < 0.02
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.skipif(not current_platform.is_cuda() or not torch.cuda.is_available(), reason="NVIDIA CUDA required")
 @pytest.mark.skipif(not HAS_TRITON, reason="Triton required")
 def test_hunyuan_attention_fused_matches_eager(_dist_env):
     from vllm_omni.diffusion.forward_context import set_forward_context
