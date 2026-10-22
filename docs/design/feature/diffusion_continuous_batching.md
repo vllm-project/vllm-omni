@@ -11,7 +11,7 @@ and output delivery. For user-facing configuration and CLI examples, see
 `max_num_seqs` as that mode's scheduler capacity:
 
 | Configuration | Engine mode | Scheduler | Execution |
-| --- | --- | --- | --- |
+|---|---|---|---|
 | `step_execution=False`, `max_num_seqs=1` | `REQUEST_BATCH` | `RequestScheduler` | One complete request-level `forward()` |
 | `step_execution=False`, `max_num_seqs>1` | `REQUEST_BATCH` | `RequestScheduler` | One fused `forward()` over compatible requests |
 | `step_execution=True`, `max_num_seqs=1` | `STEP_BATCH` | `StepScheduler` | One request advanced one denoise step per scheduler tick |
@@ -141,7 +141,7 @@ Step execution exposes denoising progress to the scheduler. A supporting
 pipeline implements four stateful operations:
 
 | Operation | Responsibility |
-| --- | --- |
+|---|---|
 | `prepare_encode(state)` | Validate input, encode prompts, initialize latents and timesteps, and create request-local scheduler state |
 | `denoise_step(input_batch, *, states=...)` | Run one denoise forward for the scheduler-provided request states |
 | `step_scheduler(state, noise_pred)` | Update latents and advance request progress |
