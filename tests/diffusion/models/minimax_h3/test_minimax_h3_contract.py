@@ -167,7 +167,8 @@ def test_local_encoder_modes_preserve_validated_text_and_unified_handoff(task, t
     assert pipeline.video_vae.encode_image.call_count == int(task != "t2va")
 
 
-def test_decode_to_mp4_batches_consumer_transfers(monkeypatch):
+@pytest.mark.parametrize("decode_dtype", [torch.float16, torch.bfloat16])
+def test_decode_to_mp4_batches_consumer_transfers(monkeypatch, decode_dtype):
     from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
 
     class FakeEncoder:
@@ -196,7 +197,12 @@ def test_decode_to_mp4_batches_consumer_transfers(monkeypatch):
     class FakeVideoVAE:
         chunk_value_range = (0.0, 1.0)
 
+        def __init__(self):
+            self.decode_dtype = decode_dtype
+
         def decode_with_chunks(self, latent, *, on_chunk):
+            assert torch.is_autocast_enabled("cpu")
+            assert torch.get_autocast_dtype("cpu") == self.decode_dtype
             for value in (0.0, 0.25, 0.5):
                 on_chunk(torch.full((1, 3, 3, 2, 2), value))
 
@@ -255,6 +261,7 @@ def test_request_video_codec_options_reach_the_preencoded_mp4_encoder(monkeypatc
 
     class FakeVideoVAE:
         chunk_value_range = (0.0, 1.0)
+        decode_dtype = torch.float16
 
         def decode_with_chunks(self, latent, *, on_chunk):
             on_chunk(torch.zeros(1, 3, 1, 2, 2))
@@ -3480,6 +3487,7 @@ def _peer_rank_preencode_pipeline(monkeypatch):
 
     class PeerRankVideoVAE:
         chunk_value_range = (0.0, 1.0)
+        decode_dtype = torch.float16
 
         def decode_with_chunks(self, latent, *, on_chunk):
             del latent, on_chunk

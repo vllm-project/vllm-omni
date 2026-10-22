@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -56,6 +56,7 @@ class Attention(nn.Module):
         qk_norm=None,
         pe_attn_head=None,
         attn_mask_enabled=True,
+        native_attention=False,
     ):
         super().__init__()
         self.dim = dim
@@ -79,6 +80,7 @@ class Attention(nn.Module):
         self.to_out.append(nn.Dropout(dropout))
         self.pe_attn_head = pe_attn_head
         self.attn_mask_enabled = attn_mask_enabled
+        self.native_attention = native_attention
         # cos/sin cache keyed by seq_len (freqs are deterministic in seq_len).
         self._rope_cache: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
         # TODO: materialize fused weights eagerly outside any torch.compile
@@ -87,6 +89,10 @@ class Attention(nn.Module):
         self._qkv_b: torch.Tensor | None = None
 
     def _qkv(self, x):
+        if self.native_attention:
+            # Keep AntOC's three GEMMs for formal checkpoint comparisons;
+            # fused BF16 QKV can change rounding even with identical weights.
+            return self.to_q(x), self.to_k(x), self.to_v(x)
         if self._qkv_w is None:
             self._qkv_w = torch.cat([self.to_q.weight, self.to_k.weight, self.to_v.weight], dim=0)
             if self.to_q.bias is not None:
@@ -121,7 +127,7 @@ class Attention(nn.Module):
         if rope is not None:
             freqs, xpos_scale = rope
             scale_is_one = xpos_scale is None or (not torch.is_tensor(xpos_scale) and xpos_scale == 1.0)
-            if scale_is_one and self.pe_attn_head is None:
+            if scale_is_one and self.pe_attn_head is None and not self.native_attention:
                 # Fast path: cached, cat-free RoPE (bit-exact for scale==1, full rotary).
                 cos, sin = self._rope_cos_sin(freqs)
                 query = _apply_rope_cached(query, cos, sin)
@@ -187,6 +193,7 @@ class DiTBlock(nn.Module):
             qk_norm=qk_norm,
             pe_attn_head=pe_attn_head,
             attn_mask_enabled=attn_mask_enabled,
+            native_attention=kwargs.get("native_attention", False),
         )
         self.norm2 = RMSNorm(hidden_size)
         self.mlp = FeedForward(dim=hidden_size, mult=mlp_ratio, dropout=dropout, approximate="tanh")

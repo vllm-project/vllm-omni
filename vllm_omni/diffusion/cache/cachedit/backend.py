@@ -375,6 +375,8 @@ class CacheDiTBackend(CacheBackend):
             if hasattr(pipeline, "_cache_dit_targets"):
                 del pipeline._cache_dit_targets
             pipeline._cache_dit_one_call_per_cfg_rank = False
+            if hasattr(pipeline, "_cache_dit_refresh_for_schedule"):
+                del pipeline._cache_dit_refresh_for_schedule
             self.enabled = False
 
     def refresh(self, pipeline: SupportsComponentDiscovery, num_inference_steps: int, verbose: bool = True) -> None:

@@ -7,6 +7,7 @@ import math
 from pathlib import Path
 
 from vllm_omni.benchmarks.duplex.omni_duplex_eval_metrics import PROTOCOL_PIN
+from vllm_omni.benchmarks.duplex.omni_duplex_eval_runner import MIX_QUESTION
 
 
 def load_accuracy_config(path: str, params: dict) -> dict:
@@ -19,6 +20,7 @@ def load_accuracy_config(path: str, params: dict) -> dict:
     expected_ids = {sid for ids in config["sample_ids_per_split"].values() for sid in ids}
     assert set(params["duplex_eval_ids"]) == expected_ids, "benchmark sample IDs differ from CI config"
     assert params["num_prompts"] == [len(expected_ids)], "benchmark sample count differs from CI config"
+    assert params.get("duplex_eval_mix", MIX_QUESTION) == config["mix"], "benchmark mix differs from CI config"
     return config
 
 
@@ -51,6 +53,8 @@ def assert_accuracy_result(benchmark: dict, config: dict) -> None:
     for path in score_files:
         row = json.loads(path.read_text(encoding="utf-8"))
         assert row.get("protocol_pin") == PROTOCOL_PIN, f"protocol_pin mismatch in score file: {path}"
+        mix = row.get("response_meta", {}).get("mix", MIX_QUESTION)
+        assert mix == config["mix"], f"mix {mix!r} in score file differs from CI config: {path}"
 
     rtd = summary.get("rtd", {})
     pr = summary.get("pr", {})

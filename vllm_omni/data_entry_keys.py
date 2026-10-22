@@ -143,6 +143,7 @@ class OmniPayload(TypedDict, total=False):
     speaker: Any
     language: Any
     request_id: str
+    additional_information: dict[str, Any]
 
 
 # ── msgspec.Struct mirror of the TypedDicts (runtime-validated) ──
@@ -271,6 +272,7 @@ class OmniPayloadStruct(_StructBase):
     speaker: list[str] | str | None = None
     language: list[str] | str | None = None
     request_id: str | None = None
+    additional_information: dict[str, Any] | None = None
     past_key_values: list[int] | None = None
     kv_metadata: dict[str, Any] | None = None
 
