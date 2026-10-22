@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-"""Malformed request ``attention_schedule`` values are client errors on every stage client.
+"""Malformed request ``attention_schedule`` values return HTTP 400 on the image and chat routes.
 
 A real ``vllm-omni serve`` runs ``tiny-random/Qwen-Image`` twice: the default single-stage launch
 uses the inline stage client, and ``--stage-id 0`` with an Omni master runs the stage in a
-``StageDiffusionProc`` subprocess. Each server must answer every malformed schedule with HTTP 400
-and then still generate an image for a valid request.
+``StageDiffusionProc`` subprocess. The routes reject a malformed schedule before dispatch; an
+unknown profile passes them and is rejected at scheduler admission inside the stage, so its client
+error must come back through the stage client. After each rejection the server must still generate
+an image for a valid request.
 
 From the repository root::
 
@@ -21,7 +23,7 @@ import requests
 from vllm.utils.network_utils import get_open_port
 
 from tests.helpers.mark import hardware_test
-from tests.helpers.runtime import OmniServer
+from tests.helpers.runtime import OmniServer, OmniServerParams
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
@@ -50,18 +52,27 @@ MALFORMED_SCHEDULES = [
     pytest.param([{"start": 0, "end": None, "profile": "dense"}], "unknown profile", id="unknown-profile"),
 ]
 
+# One schedule the chat route rejects itself and one that only scheduler admission rejects.
+MALFORMED_CHAT_SCHEDULES = [MALFORMED_SCHEDULES[1], MALFORMED_SCHEDULES[-1]]
 
-def _process_stage_args() -> list[str]:
-    return ["--stage-id", "0", "--omni-master-address", "127.0.0.1", "--omni-master-port", str(get_open_port())]
 
-
-@pytest.fixture(scope="module", params=["inline", "process"])
-def schedule_server(request: pytest.FixtureRequest):
-    serve_args = ["--stage-init-timeout", "600", "--init-timeout", "900"]
-    if request.param == "process":
-        serve_args += _process_stage_args()
-    with OmniServer(MODEL, serve_args) as server:
-        yield server
+SERVERS = [
+    pytest.param(OmniServerParams(model=MODEL), id="inline"),
+    pytest.param(
+        OmniServerParams(
+            model=MODEL,
+            server_args=[
+                "--stage-id",
+                "0",
+                "--omni-master-address",
+                "127.0.0.1",
+                "--omni-master-port",
+                str(get_open_port()),
+            ],
+        ),
+        id="process",
+    ),
+]
 
 
 def _generate(server: OmniServer, extra_params: dict | None = None) -> requests.Response:
@@ -70,6 +81,18 @@ def _generate(server: OmniServer, extra_params: dict | None = None) -> requests.
         body["extra_params"] = extra_params
     return requests.post(
         f"http://{server.host}:{server.port}/v1/images/generations",
+        json=body,
+        timeout=REQUEST_TIMEOUT_S,
+    )
+
+
+def _chat(server: OmniServer, schedule, *, in_extra_body: bool) -> requests.Response:
+    """Send the schedule in ``extra_args`` at the request root or inside ``extra_body``."""
+    extra_body = {"height": 64, "width": 64, "num_inference_steps": 2, "seed": 1}
+    body = {"messages": [{"role": "user", "content": "a cat"}], "extra_body": extra_body}
+    (extra_body if in_extra_body else body)["extra_args"] = {"attention_schedule": schedule}
+    return requests.post(
+        f"http://{server.host}:{server.port}/v1/chat/completions",
         json=body,
         timeout=REQUEST_TIMEOUT_S,
     )
@@ -85,12 +108,31 @@ def _assert_image(response: requests.Response) -> None:
 @pytest.mark.core_model
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": "L4"})
+@pytest.mark.parametrize("omni_server", SERVERS, indirect=True)
 @pytest.mark.parametrize(("schedule", "message"), MALFORMED_SCHEDULES)
-def test_malformed_attention_schedule_returns_400(schedule_server: OmniServer, schedule, message: str) -> None:
-    response = _generate(schedule_server, {"attention_schedule": schedule})
+def test_malformed_attention_schedule_returns_400(omni_server: OmniServer, schedule, message: str) -> None:
+    response = _generate(omni_server, {"attention_schedule": schedule})
 
     assert response.status_code == 400, response.text
     error = response.json()["error"]
     assert error["code"] == 400
     assert message in error["message"]
-    _assert_image(_generate(schedule_server))
+    _assert_image(_generate(omni_server))
+
+
+@pytest.mark.core_model
+@pytest.mark.diffusion
+@hardware_test(res={"cuda": "L4"})
+@pytest.mark.parametrize("omni_server", SERVERS, indirect=True)
+@pytest.mark.parametrize("in_extra_body", [False, True], ids=["root-extra-args", "extra-body-extra-args"])
+@pytest.mark.parametrize(("schedule", "message"), MALFORMED_CHAT_SCHEDULES)
+def test_malformed_chat_attention_schedule_returns_400(
+    omni_server: OmniServer, in_extra_body: bool, schedule, message: str
+) -> None:
+    response = _chat(omni_server, schedule, in_extra_body=in_extra_body)
+
+    assert response.status_code == 400, response.text
+    error = response.json()["error"]
+    assert error["code"] == 400
+    assert message in error["message"]
+    _assert_image(_generate(omni_server))
