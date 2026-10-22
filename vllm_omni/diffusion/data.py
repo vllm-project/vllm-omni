@@ -2484,7 +2484,7 @@ def parse_attention_schedule_config(
 ) -> AttentionScheduleConfig | None:
     """Normalize service config without initializing backends or reading env vars.
 
-    A config without profiles can never select a candidate (its default must then be empty), so it
+    A config without profiles can never select a candidate (its default and sigma must then be empty), so it
     is returned as None: no schedule, and no compile boundary on the attention layers.
     """
     if value is None:
