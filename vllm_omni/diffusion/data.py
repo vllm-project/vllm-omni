@@ -1387,6 +1387,9 @@ class OmniDiffusionConfig:
         # Resolve offload only after DP/SP normalization so cached policy
         # validation observes the actual execution topology.
         offload_strategy = materialize_legacy_offload_flags(self)
+        # Parsed before the 'full' check, which needs the normalized value: a schedule without
+        # profiles parses to None.
+        self.diffusion_attention_schedule = parse_attention_schedule_config(self.diffusion_attention_schedule)
 
         if self.diffusion_compile_granularity == "full":
             incompatible_features = []
@@ -1403,6 +1406,10 @@ class OmniDiffusionConfig:
                         OffloadStrategy.DISTRIBUTED_LAYER_WISE: "distributed layerwise offload",
                     }[offload_strategy]
                 )
+            if self.diffusion_attention_schedule is not None:
+                # The scheduled_attention op and its eager fallback are tested only under
+                # regional compilation.
+                incompatible_features.append("diffusion_attention_schedule profiles")
             if incompatible_features:
                 features = ", ".join(incompatible_features)
                 raise ValueError(
@@ -1467,18 +1474,9 @@ class OmniDiffusionConfig:
         # Match vLLM's config flow: parse entrypoint shorthands before the
         # config object is built, and keep a single runtime truth source.
         self.diffusion_attention_config = build_attention_config(self.diffusion_attention_config)
-        self.diffusion_attention_schedule = parse_attention_schedule_config(self.diffusion_attention_schedule)
         validate_kv_cache_dtype_vs_attention_specs(
             self.diffusion_kv_cache_dtype, self.diffusion_attention_config, self.diffusion_attention_schedule
         )
-        if self.diffusion_attention_schedule is not None and self.diffusion_compile_granularity == "full":
-            # Scheduled attention layers call an eager boundary while compiling. Its compile tests
-            # use regional compilation, where each block is its own frame; with 'full' the boundary's graph
-            # break falls inside the block loop of the transformer's frame, which they do not cover.
-            raise ValueError(
-                "diffusion_compile_granularity='full' is incompatible with diffusion_attention_schedule "
-                "profiles; use 'regional' compilation instead"
-            )
         self.diffusion_kv_cache_skip_step_indices = parse_kv_cache_skip_selector(self.diffusion_kv_cache_skip_steps)
         self.diffusion_kv_cache_skip_layer_indices = parse_kv_cache_skip_selector(self.diffusion_kv_cache_skip_layers)
 
