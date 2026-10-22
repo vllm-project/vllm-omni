@@ -41,7 +41,7 @@ from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 from vllm.v1.worker.utils import sanity_check_mm_encoder_outputs
 
 from vllm_omni.outputs import OmniModelRunnerOutput
-from vllm_omni.utils.mm_outputs import partition_payload_list
+from vllm_omni.utils.mm_outputs import partition_payload_list, split_mapping_outputs
 from vllm_omni.worker.gpu_ar_model_runner import (
     ExecuteModelState,
     _AsyncCPUPayloadSnapshot,
@@ -527,7 +527,7 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
 
         # Build per-request multimodal_outputs list (dedicated channel).
         # pooler_output is no longer used for multimodal data.
-        per_req_payloads: list[dict[str, object]] = []
+        per_req_payloads: list[Mapping[str, object]] = []
         pin_memory = is_pin_memory_available()
         accumulate_full_payload = self._should_accumulate_full_payload_output()
         use_async_output = (
@@ -564,22 +564,10 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
             for out in multimodal_outputs_raw:
                 per_req_payloads.append({"model_outputs": copy_tensor(out) if out is not None else None})
         elif isinstance(multimodal_outputs_raw, Mapping):
-            num_reqs = self.input_batch.num_reqs
-            for i in range(num_reqs):
-                mm_payload = {}
-                for key, out in multimodal_outputs_raw.items():
-                    if isinstance(out, list):
-                        if len(out) != num_reqs:
-                            raise ValueError(
-                                f"Multimodal output list for key '{key}' has length {len(out)} "
-                                f"but expected {num_reqs} (one entry per request)."
-                            )
-                        mm_payload[key] = copy_tensor(out[i])
-                    elif isinstance(out, torch.Tensor):
-                        mm_payload[key] = copy_tensor(out)
-                    else:
-                        logger.warning(f"Unsupported multimodal output type for key '{key}': {type(out)}")
-                per_req_payloads.append(_ensure_tensor_values(mm_payload))
+            per_req_payloads = [
+                _ensure_tensor_values(payload)
+                for payload in split_mapping_outputs(multimodal_outputs_raw, self.input_batch.num_reqs, copy_tensor)
+            ]
         else:
             raise RuntimeError("Unsupported diffusion output type")
         snapshot = None
@@ -646,6 +634,12 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
             ec_connector_output=ec_connector_output if self.supports_mm_inputs else None,
         )
         output.omni_connector_output = self.get_omni_connector_output()
+
+        model = getattr(self, "model", None)
+        if model is not None and hasattr(model, "get_pending_generation_request_ids"):
+            output.pending_generation_req_ids = set(req_ids_output_copy).intersection(
+                model.get_pending_generation_request_ids()
+            )
 
         if snapshot is not None:
             return _AsyncGenerationOutput(output, snapshot)

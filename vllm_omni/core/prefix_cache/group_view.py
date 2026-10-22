@@ -10,11 +10,12 @@ returns None when the input batch has no block table.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from collections.abc import Iterable
+from typing import TYPE_CHECKING, cast
 
 import torch
 
-from vllm_omni.core.prefix_cache.interface import OmniPrefixCacheUnmatchError, PrefixCacheConfig
+from vllm_omni.core.prefix_cache.interface import ModelCachePolicy, OmniPrefixCacheUnmatchError, PrefixCacheConfig
 
 if TYPE_CHECKING:
     from vllm.v1.worker.gpu_input_batch import InputBatch
@@ -101,7 +102,7 @@ def check_prefix_cache_kv_groups(kv_cache_groups: object) -> None:
     Only needs ``kv_cache_config.kv_cache_groups``. ``FullAttentionSpec``
     is imported here so ``tests/core`` can load this module without vllm.
     """
-    groups = list(kv_cache_groups or ())
+    groups = list(cast(Iterable[object], kv_cache_groups or ()))
     if len(groups) != 1:
         raise OmniPrefixCacheUnmatchError(
             "omni prefix caching requires a single full-attention kv-cache group; "
@@ -166,17 +167,22 @@ def stage_prefix_cache_config(
     model_config: object,
     is_pooling_model: bool,
     speculative_config: object = None,
+    model_cache_policy: ModelCachePolicy = ModelCachePolicy(),
 ) -> PrefixCacheConfig | None:
     """Runner-side gate shared by the GPU and NPU model runners.
 
     Returns None when the stage does not run an omni prefix cache
-    (``enable_prefix_caching`` off, or a pooling stage that never saves).
+    (``enable_prefix_caching`` off, a pooling stage that never saves, or
+    an explicit native-KV-only model). Native-only stages leave native KV
+    cache configuration and its validation untouched.
     Otherwise refuses kv_consumer / kv_both, speculative decoding,
     sub-block matching and hybrid kv groups, then sizes the config from
     the scheduler. One place so a platform runner cannot silently skip a
     refusal the other one has.
     """
     if not getattr(cache_config, "enable_prefix_caching", False) or is_pooling_model:
+        return None
+    if model_cache_policy.native_kv_cache_only:
         return None
     check_prefix_cache_kv_transfer(kv_transfer_config)
     check_prefix_cache_token_accounting(cache_config, speculative_config)

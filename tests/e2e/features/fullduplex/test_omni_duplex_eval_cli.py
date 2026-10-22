@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import base64
 import json
 import threading
@@ -137,6 +138,154 @@ def test_cli_generate_evaluate_summarize_flow(tmp_path: Path, monkeypatch: pytes
     assert summary["pr"]["mean_all_success"] == 1.0
 
 
+def _cached_sample(tmp_path: Path, meta: str | None, split: str = "PR_correction") -> DuplexSample:
+    sample = DuplexSample.from_row({"id": "sample", "split": split})
+    output = tmp_path / sample.split / f"{sample.id}.json"
+    output.parent.mkdir(parents=True)
+    output.write_text(json.dumps({"sentences": [], "chunks": []}), encoding="utf-8")
+    if meta is not None:
+        output.with_name(f"{sample.id}.meta.json").write_text(meta, encoding="utf-8")
+    return sample
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "meta,mix",
+    [
+        ('{"mix": "question"}', "question"),
+        ('{"mix": "soundtrack"}', "soundtrack"),
+        ("{}", "question"),
+        (None, "question"),
+    ],
+)
+async def test_generate_reuses_cached_sample_for_the_same_mix(tmp_path, monkeypatch, meta, mix):
+    sample = _cached_sample(tmp_path, meta)
+
+    def unexpected_preparation(*args, **kwargs):
+        pytest.fail("a cached sample with the same mix must be reused before preparation")
+
+    monkeypatch.setattr(runner, "prepare_sample", unexpected_preparation)
+    result = await runner.generate_sample(
+        sample,
+        url="ws://unused",
+        model="mock",
+        ref_audio=None,
+        output_root=tmp_path,
+        mix=mix,
+    )
+    assert result.output == tmp_path / sample.split / f"{sample.id}.json"
+    assert result.metadata == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "meta,mix",
+    [
+        ('{"mix": "question"}', "soundtrack"),
+        ('{"mix": "soundtrack"}', "question"),
+        ("{}", "soundtrack"),
+        (None, "soundtrack"),
+    ],
+)
+async def test_generate_refuses_cached_sample_recorded_with_another_mix(tmp_path, monkeypatch, meta, mix):
+    sample = _cached_sample(tmp_path, meta)
+
+    def unexpected_preparation(*args, **kwargs):
+        pytest.fail("a mix mismatch must be rejected before preparation")
+
+    monkeypatch.setattr(runner, "prepare_sample", unexpected_preparation)
+    with pytest.raises(ValueError, match="generated with mix="):
+        await runner.generate_sample(
+            sample,
+            url="ws://unused",
+            model="mock",
+            ref_audio=None,
+            output_root=tmp_path,
+            mix=mix,
+        )
+
+
+@pytest.mark.asyncio
+async def test_generate_rejects_unknown_mix_before_reusing_cache(tmp_path, monkeypatch):
+    sample = _cached_sample(tmp_path, '{"mix": "question"}')
+
+    def unexpected_preparation(*args, **kwargs):
+        pytest.fail("an unknown mix must be rejected before the cached artifact is reused")
+
+    monkeypatch.setattr(runner, "prepare_sample", unexpected_preparation)
+    with pytest.raises(ValueError, match="mix must be one of"):
+        await runner.generate_sample(
+            sample,
+            url="ws://unused",
+            model="mock",
+            ref_audio=None,
+            output_root=tmp_path,
+            mix="karaoke",
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("body", ["[]", '{"sentences": [{"sentence": "Old.", "start": 1, "end": 1}]}'])
+async def test_generate_reuses_rtd_cached_response_without_chunks(tmp_path, monkeypatch, body):
+    sample = _cached_sample(tmp_path, '{"mix": "question"}', split="RTD_OCR")
+    output = tmp_path / sample.split / f"{sample.id}.json"
+    output.write_text(body, encoding="utf-8")
+
+    def unexpected_preparation(*args, **kwargs):
+        pytest.fail("RTD scores sentences, so a cached sentence list must be reused")
+
+    monkeypatch.setattr(runner, "prepare_sample", unexpected_preparation)
+    result = await runner.generate_sample(
+        sample,
+        url="ws://unused",
+        model="mock",
+        ref_audio=None,
+        output_root=tmp_path,
+        mix="question",
+    )
+    assert result.output == output
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("body", ["[]", '{"sentences": [{"sentence": "Old.", "start": 1, "end": 1}]}'])
+async def test_generate_refuses_cached_response_without_chunks(tmp_path, monkeypatch, body):
+    sample = _cached_sample(tmp_path, '{"mix": "question"}')
+    output = tmp_path / sample.split / f"{sample.id}.json"
+    output.write_text(body, encoding="utf-8")
+
+    def unexpected_preparation(*args, **kwargs):
+        pytest.fail("a response without chunk times must be rejected before preparation")
+
+    monkeypatch.setattr(runner, "prepare_sample", unexpected_preparation)
+    with pytest.raises(ValueError, match="no chunk times"):
+        await runner.generate_sample(
+            sample,
+            url="ws://unused",
+            model="mock",
+            ref_audio=None,
+            output_root=tmp_path,
+            mix="question",
+        )
+
+
+@pytest.mark.asyncio
+async def test_generate_rejects_unreadable_cached_mix(tmp_path, monkeypatch):
+    sample = _cached_sample(tmp_path, "{")
+
+    def unexpected_preparation(*args, **kwargs):
+        pytest.fail("unreadable metadata must be rejected before preparation")
+
+    monkeypatch.setattr(runner, "prepare_sample", unexpected_preparation)
+    with pytest.raises(ValueError, match="cannot read mix"):
+        await runner.generate_sample(
+            sample,
+            url="ws://unused",
+            model="mock",
+            ref_audio=None,
+            output_root=tmp_path,
+        )
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("cached", [False, True])
 async def test_generate_rejects_unpaced_server_vad_before_preparation_or_cache(tmp_path, monkeypatch, cached):
@@ -195,11 +344,16 @@ async def test_generate_exercises_realtime_socket_and_media_clock(
                     )
                 )
             elif event["type"] == "input_audio_buffer.commit":
+                # The reply opened during the clip is not the residual decision.
+                await websocket.send(json.dumps({"type": "input_audio_buffer.committed"}))
                 await websocket.send(json.dumps({"type": "response.done", "response": {"id": "r1"}}))
+                listen = {"type": "response.listen", "response": {"metadata": {"model_listen": True}}}
+                await websocket.send(json.dumps(listen))
             elif event["type"] == "session.close":
                 await websocket.send(json.dumps({"type": "session.closed"}))
                 return
 
+    monkeypatch.setattr(runner, "_COMPLETION_SETTLE_S", 0.05)
     monkeypatch.setattr(runner, "read_audio_pcm16", lambda path: b"\0\0" * (16_000 * 8 // 10))
     monkeypatch.setattr(runner, "video_duration", lambda path: 0.8)
     monkeypatch.setattr(runner, "iter_jpegs", lambda *args, **kwargs: iter([(0.0, b"jpeg")]))
@@ -221,7 +375,10 @@ async def test_generate_exercises_realtime_socket_and_media_clock(
             pace=pace,
         )
 
-    assert json.loads(result.output.read_text(encoding="utf-8")) == [{"sentence": "Done.", "start": 0.8, "end": 0.8}]
+    assert json.loads(result.output.read_text(encoding="utf-8")) == {
+        "sentences": [{"sentence": "Done.", "start": 0.8, "end": 0.8}],
+        "chunks": [{"text": "Done.", "current_time": 0.8}],
+    }
     meta = json.loads(result.output.with_name("sample.meta.json").read_text(encoding="utf-8"))
     assert meta["response_done"] is True
     assert meta["drain_timeout"] is None
@@ -233,6 +390,263 @@ async def test_generate_exercises_realtime_socket_and_media_clock(
     assert result.request_metrics[0]["sample_id"] == "sample"
     assert result.session_metrics["stream_ttfp_ms"] is not None
     assert any(event["type"] == "playback.ack" for event in received)
+
+
+@pytest.mark.asyncio
+async def test_generate_finishes_a_silent_session_on_the_post_commit_listen(tmp_path: Path, monkeypatch):
+    import websockets
+
+    appended = []
+
+    async def handler(websocket):
+        async for raw in websocket:
+            event = json.loads(raw)
+            if event["type"] == "session.update":
+                await websocket.send(json.dumps({"type": "session.created"}))
+            elif event["type"] == "input_audio_buffer.append":
+                appended.append(base64.b64decode(event["audio"]))
+                # A decision for an earlier unit does not end the session.
+                listen = {"type": "response.listen", "response": {"metadata": {"model_listen": True}}}
+                await websocket.send(json.dumps(listen))
+            elif event["type"] == "input_audio_buffer.commit":
+                await websocket.send(json.dumps({"type": "input_audio_buffer.committed"}))
+                await websocket.send(json.dumps(listen))
+            elif event["type"] == "session.close":
+                await websocket.send(json.dumps({"type": "session.closed"}))
+                return
+
+    # Exactly one model unit: the runner keeps a residual for the commit to flush.
+    monkeypatch.setattr(runner, "_COMPLETION_SETTLE_S", 0.1)
+    monkeypatch.setattr(runner, "read_audio_pcm16", lambda path: b"\1\0" * 16_000)
+    monkeypatch.setattr(runner, "video_duration", lambda path: 1.0)
+    monkeypatch.setattr(runner, "iter_jpegs", lambda *args, **kwargs: iter([(0.0, b"jpeg")]))
+    audio = tmp_path / "question.wav"
+    video = tmp_path / "video.mp4"
+    for path in (audio, video):
+        path.write_bytes(b"data")
+    sample = DuplexSample("sample", "PR_post_event_reminder", "pr", "post_event_reminder", video, audio)
+
+    async with websockets.serve(handler, "127.0.0.1", 0) as server:
+        port = server.sockets[0].getsockname()[1]
+        result = await runner.generate_sample(
+            sample,
+            url=f"ws://127.0.0.1:{port}/v1/realtime?duplex=1",
+            model="mock",
+            ref_audio=None,
+            output_root=tmp_path / "responses",
+            pace="as-fast-as-possible",
+        )
+
+    assert result.error == ""
+    assert sum(len(chunk) for chunk in appended) == 2 * 16_000 - 2
+    assert json.loads(result.output.read_text(encoding="utf-8")) == {"sentences": [], "chunks": []}
+    meta = json.loads(result.output.with_name("sample.meta.json").read_text(encoding="utf-8"))
+    assert meta["response_done"] is True and meta["drain_timeout"] is None
+
+
+@pytest.mark.asyncio
+async def test_generate_waits_for_a_response_created_after_the_post_commit_listen(tmp_path: Path, monkeypatch):
+    import websockets
+
+    async def late_response(websocket):
+        # Stage1 output of an earlier speak decision trails the listen.
+        await asyncio.sleep(0.2)
+        await websocket.send(json.dumps({"type": "response.created", "response": {"id": "r1"}}))
+        await websocket.send(json.dumps({"type": "response.output_text.delta", "response_id": "r1", "delta": "Late."}))
+        await websocket.send(json.dumps({"type": "response.done", "response": {"id": "r1"}}))
+
+    async def handler(websocket):
+        tasks = []
+        async for raw in websocket:
+            event = json.loads(raw)
+            if event["type"] == "session.update":
+                await websocket.send(json.dumps({"type": "session.created"}))
+            elif event["type"] == "input_audio_buffer.commit":
+                await websocket.send(json.dumps({"type": "input_audio_buffer.committed"}))
+                listen = {"type": "response.listen", "response": {"metadata": {"model_listen": True}}}
+                await websocket.send(json.dumps(listen))
+                tasks.append(asyncio.create_task(late_response(websocket)))
+            elif event["type"] == "session.close":
+                for task in tasks:
+                    task.cancel()
+                await websocket.send(json.dumps({"type": "session.closed"}))
+                return
+
+    monkeypatch.setattr(runner, "_COMPLETION_SETTLE_S", 0.5)
+    monkeypatch.setattr(runner, "read_audio_pcm16", lambda path: b"\1\0" * 16_000)
+    monkeypatch.setattr(runner, "video_duration", lambda path: 1.0)
+    monkeypatch.setattr(runner, "iter_jpegs", lambda *args, **kwargs: iter([(0.0, b"jpeg")]))
+    audio = tmp_path / "question.wav"
+    video = tmp_path / "video.mp4"
+    for path in (audio, video):
+        path.write_bytes(b"data")
+    sample = DuplexSample("sample", "PR_post_event_reminder", "pr", "post_event_reminder", video, audio)
+
+    async with websockets.serve(handler, "127.0.0.1", 0) as server:
+        port = server.sockets[0].getsockname()[1]
+        result = await runner.generate_sample(
+            sample,
+            url=f"ws://127.0.0.1:{port}/v1/realtime?duplex=1",
+            model="mock",
+            ref_audio=None,
+            output_root=tmp_path / "responses",
+            pace="as-fast-as-possible",
+        )
+
+    assert result.error == ""
+    assert [chunk["text"] for chunk in json.loads(result.output.read_text(encoding="utf-8"))["chunks"]] == ["Late."]
+
+
+@pytest.mark.asyncio
+async def test_generate_keeps_a_response_opened_after_an_earlier_response_done(tmp_path: Path, monkeypatch):
+    import websockets
+
+    async def late_response(websocket):
+        # Stage1 output of a speak decision trails the post-commit listen.
+        await asyncio.sleep(0.2)
+        await websocket.send(json.dumps({"type": "response.created", "response": {"id": "r2"}}))
+        await websocket.send(json.dumps({"type": "response.output_text.delta", "response_id": "r2", "delta": "Late."}))
+        await websocket.send(json.dumps({"type": "response.done", "response": {"id": "r2"}}))
+
+    async def handler(websocket):
+        tasks = []
+        early_sent = False
+        async for raw in websocket:
+            event = json.loads(raw)
+            if event["type"] == "session.update":
+                await websocket.send(json.dumps({"type": "session.created"}))
+            elif event["type"] == "input_audio_buffer.append" and not early_sent:
+                early_sent = True
+                await websocket.send(json.dumps({"type": "response.created", "response": {"id": "r1"}}))
+                await websocket.send(
+                    json.dumps({"type": "response.output_text.delta", "response_id": "r1", "delta": "Early."})
+                )
+                await websocket.send(json.dumps({"type": "response.done", "response": {"id": "r1"}}))
+            elif event["type"] == "input_audio_buffer.commit":
+                await websocket.send(json.dumps({"type": "input_audio_buffer.committed"}))
+                listen = {"type": "response.listen", "response": {"metadata": {"model_listen": True}}}
+                await websocket.send(json.dumps(listen))
+                tasks.append(asyncio.create_task(late_response(websocket)))
+            elif event["type"] == "session.close":
+                for task in tasks:
+                    task.cancel()
+                await websocket.send(json.dumps({"type": "session.closed"}))
+                return
+
+    monkeypatch.setattr(runner, "_COMPLETION_SETTLE_S", 0.5)
+    monkeypatch.setattr(runner, "read_audio_pcm16", lambda path: b"\1\0" * 16_000)
+    monkeypatch.setattr(runner, "video_duration", lambda path: 1.0)
+    monkeypatch.setattr(runner, "iter_jpegs", lambda *args, **kwargs: iter([(0.0, b"jpeg")]))
+    audio = tmp_path / "question.wav"
+    video = tmp_path / "video.mp4"
+    for path in (audio, video):
+        path.write_bytes(b"data")
+    sample = DuplexSample("sample", "PR_post_event_reminder", "pr", "post_event_reminder", video, audio)
+
+    async with websockets.serve(handler, "127.0.0.1", 0) as server:
+        port = server.sockets[0].getsockname()[1]
+        result = await runner.generate_sample(
+            sample,
+            url=f"ws://127.0.0.1:{port}/v1/realtime?duplex=1",
+            model="mock",
+            ref_audio=None,
+            output_root=tmp_path / "responses",
+            pace="as-fast-as-possible",
+        )
+
+    assert result.error == ""
+    text = "".join(chunk["text"] for chunk in json.loads(result.output.read_text(encoding="utf-8"))["chunks"])
+    assert text == "Early.Late."
+
+
+def test_residual_unit_decision_follows_the_committed_event():
+    created = {"type": "response.created", "response": {"id": "r1"}}
+    done = {"type": "response.done", "response": {"id": "r1", "status": "completed"}}
+    committed = {"type": "input_audio_buffer.committed"}
+    listen = {"type": "response.listen", "response": {"metadata": {"model_listen": True}}}
+    late_created = {"type": "response.created", "response": {"id": "r2"}}
+    late_done = {"type": "response.done", "response": {"id": "r2", "status": "completed"}}
+
+    assert runner._residual_unit_decided([created, done, committed], 0) is False
+    assert runner._residual_unit_decided([created, committed, done], 0) is False
+    assert runner._residual_unit_decided([created, committed, listen, done], 0) is False
+    assert runner._residual_unit_decided([created, committed, done, listen], 0) is True
+    assert runner._residual_unit_decided([created, committed, late_created, late_done, done], 0) is True
+    assert runner._residual_unit_decided([committed, listen], 0) is True
+    assert runner._residual_unit_decided([created, done], 0) is False
+    cancelled = {"type": "response.done", "response": {"id": "r1", "status": "cancelled"}}
+    failed = {"type": "response.done", "response": {"id": "r1", "status": "failed"}}
+    late_cancelled = {"type": "response.done", "response": {"id": "r2", "status": "cancelled"}}
+    late_failed = {"type": "response.done", "response": {"id": "r2", "status": "failed"}}
+    # Barge-in can cancel the open reply and still open the residual afterwards.
+    assert runner._residual_unit_decided([created, committed, cancelled], 0) is False
+    assert runner._residual_unit_decided([created, committed, cancelled, late_created, late_done], 0) is True
+    assert runner._residual_unit_decided([committed, late_created, late_cancelled], 0) is False
+    # A failed reply is terminal: nothing is promoted after it.
+    assert runner._residual_unit_decided([created, committed, failed], 0) is True
+    assert runner._residual_unit_decided([committed, late_created, late_failed], 0) is True
+
+
+@pytest.mark.asyncio
+async def test_generate_waits_for_a_response_opened_after_an_in_flight_reply(tmp_path: Path, monkeypatch):
+    import websockets
+
+    async def late_response(websocket):
+        # The residual unit decides only after the in-flight reply finishes.
+        await asyncio.sleep(0.5)
+        await websocket.send(json.dumps({"type": "response.created", "response": {"id": "r2"}}))
+        await websocket.send(json.dumps({"type": "response.output_text.delta", "response_id": "r2", "delta": "Late."}))
+        await websocket.send(json.dumps({"type": "response.done", "response": {"id": "r2", "status": "completed"}}))
+
+    async def handler(websocket):
+        tasks = []
+        opened = False
+        async for raw in websocket:
+            event = json.loads(raw)
+            if event["type"] == "session.update":
+                await websocket.send(json.dumps({"type": "session.created"}))
+            elif event["type"] == "input_audio_buffer.append" and not opened:
+                opened = True
+                await websocket.send(json.dumps({"type": "response.created", "response": {"id": "r1"}}))
+                await websocket.send(
+                    json.dumps({"type": "response.output_text.delta", "response_id": "r1", "delta": "Early."})
+                )
+            elif event["type"] == "input_audio_buffer.commit":
+                await websocket.send(json.dumps({"type": "input_audio_buffer.committed"}))
+                await websocket.send(
+                    json.dumps({"type": "response.done", "response": {"id": "r1", "status": "completed"}})
+                )
+                tasks.append(asyncio.create_task(late_response(websocket)))
+            elif event["type"] == "session.close":
+                for task in tasks:
+                    task.cancel()
+                await websocket.send(json.dumps({"type": "session.closed"}))
+                return
+
+    monkeypatch.setattr(runner, "_COMPLETION_SETTLE_S", 0.2)
+    monkeypatch.setattr(runner, "read_audio_pcm16", lambda path: b"\1\0" * 16_000)
+    monkeypatch.setattr(runner, "video_duration", lambda path: 1.0)
+    monkeypatch.setattr(runner, "iter_jpegs", lambda *args, **kwargs: iter([(0.0, b"jpeg")]))
+    audio = tmp_path / "question.wav"
+    video = tmp_path / "video.mp4"
+    for path in (audio, video):
+        path.write_bytes(b"data")
+    sample = DuplexSample("sample", "PR_post_event_reminder", "pr", "post_event_reminder", video, audio)
+
+    async with websockets.serve(handler, "127.0.0.1", 0) as server:
+        port = server.sockets[0].getsockname()[1]
+        result = await runner.generate_sample(
+            sample,
+            url=f"ws://127.0.0.1:{port}/v1/realtime?duplex=1",
+            model="mock",
+            ref_audio=None,
+            output_root=tmp_path / "responses",
+            pace="as-fast-as-possible",
+        )
+
+    assert result.error == ""
+    text = "".join(chunk["text"] for chunk in json.loads(result.output.read_text(encoding="utf-8"))["chunks"])
+    assert text == "Early.Late."
 
 
 @pytest.mark.asyncio
@@ -540,10 +954,14 @@ def test_collect_duplex_session_metrics_matches_omniinteract_window():
     )
     collector.add(audio, received_at_s=10.3)
     collector.add({"type": "response.done", "response": {"id": "r1"}}, received_at_s=10.4)
+    collector.note_client_append({"sent_at_s": 10.05, "event_id": "append-1"})
     bundle = collect_duplex_session_metrics(collector, stream_start=10.0, session_id="sample")
     assert bundle.request_metrics[0]["ttft_ms"] == 100.0
     assert bundle.request_metrics[0]["ttfp_ms"] == 200.0
     assert bundle.request_metrics[0]["rtf"] == 2.0
+    assert bundle.request_metrics[0]["client_ttfp_ms"] == 250.0
+    assert bundle.request_metrics[0]["client_audio_generation_ms"] == 250.0
+    assert bundle.request_metrics[0]["client_rtf"] == 2.5
     assert bundle.session_metrics["stream_ttft_ms"] == 200.0
     assert bundle.session_metrics["stream_ttfp_ms"] == 300.0
     report = build_duplex_metrics_report(
@@ -552,6 +970,18 @@ def test_collect_duplex_session_metrics_matches_omniinteract_window():
     )
     assert report["duplex_stream_ttft_ms"]["mean"] == 200.0
     assert report["duplex_stream_ttfp_ms"]["mean"] == 300.0
+
+
+def test_event_collector_from_realtime_copies_client_appends():
+    from vllm_omni.experimental.fullduplex.client import RealtimeEventCollector
+
+    source = RealtimeEventCollector()
+    stamp = {"sent_at_s": 9.8, "event_id": "evt-1"}
+    source.note_client_append(stamp)
+    source.add({"type": "response.created", "response": {"id": "r1"}}, received_at_s=10.0)
+    copied = runner._event_collector_from_realtime(source)
+    assert copied.client_appends == [stamp]
+    assert copied.response_ids == ["r1"]
 
 
 def test_collect_duplex_session_metrics_keeps_all_engine_stages():

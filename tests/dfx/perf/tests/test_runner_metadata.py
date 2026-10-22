@@ -812,6 +812,90 @@ def test_dataset_judging_uses_launched_judge(monkeypatch, prefix, judge_url):
         assert args[args.index(f"--{prefix.replace('_', '-')}-judge-base-url") + 1] == judge_url
 
 
+def test_minicpmo_duplex_eval_config_replays_accuracy_ids_at_c8(monkeypatch):
+    from dataclasses import dataclass
+    from pathlib import Path
+
+    from tests.dfx.perf.scripts import run_benchmark
+    from vllm_omni.entrypoints.cli.benchmark.serve import OmniBenchmarkServingSubcommand
+    from vllm_omni.utils.tracking_parser import TrackingArgumentParser
+
+    test_root = Path(__file__).resolve().parents[3]
+    config = json.loads((Path(__file__).parent / "test_minicpmo_4_5_omni_duplex_eval.json").read_text())[0]
+    accuracy = json.loads((test_root / "e2e/accuracy/omni_duplex_eval/omni_duplex_eval_ci_config.json").read_text())
+    ids = {str(sample_id) for values in accuracy["sample_ids_per_split"].values() for sample_id in values}
+    params = config["benchmark_params"][0]
+    assert len(params["duplex_eval_ids"]) == len(ids) == 66
+    assert set(params["duplex_eval_ids"]) == ids
+    assert config["judge_server_params"]["model"] == params["duplex_eval_judge_model"]
+    assert params["duplex_eval_evaluate"]
+
+    @dataclass
+    class ServerEndpoint:
+        host: str = "localhost"
+        port: int = 8000
+        model: str = "openbmb/MiniCPM-o-4_5"
+        judge_base_url: str = "http://localhost:8001"
+
+    calls = []
+    monkeypatch.setattr(run_benchmark, "BENCHMARK_CONFIGS", [config])
+    monkeypatch.setattr(run_benchmark, "get_runtime_resource_label", lambda: "H100")
+
+    def benchmark(**kwargs):
+        calls.append(kwargs)
+        return {"completed": 66}
+
+    monkeypatch.setattr(run_benchmark, "run_benchmark", benchmark)
+    monkeypatch.setattr(run_benchmark, "assert_result", lambda *args: None)
+    run_benchmark.test_performance_benchmark(ServerEndpoint(), {"test_name": config["test_name"], "params": params})
+    assert len(calls) == 1
+    call = calls[0]
+    parser = TrackingArgumentParser()
+    OmniBenchmarkServingSubcommand.add_cli_args(parser)
+    args = parser.parse_args(call["args"])
+    assert args.duplex_eval_ids == params["duplex_eval_ids"]
+    assert args.num_prompts == 66
+    assert args.max_concurrency == 8
+    assert args.duplex_eval_split == "all"
+    assert args.disable_shuffle
+    assert call["num_warmups"] == 0
+    assert args.ready_check_timeout_sec == 0
+    assert args.trust_remote_code
+    assert args.duplex_eval_evaluate
+    assert args.duplex_eval_judge_base_url == "http://localhost:8001"
+    assert "--duplex-eval-accuracy-config" not in call["args"]
+    assert call["accuracy_baseline"] == accuracy["baseline"]
+
+
+@pytest.mark.parametrize("device_env", ["CUDA_VISIBLE_DEVICES", "ASCEND_RT_VISIBLE_DEVICES"])
+def test_judge_uses_allocated_second_device(monkeypatch, device_env):
+    from tests.dfx.perf.scripts import run_benchmark as runner
+    from vllm_omni.platforms import current_omni_platform
+
+    monkeypatch.setenv(device_env, "4,7")
+    monkeypatch.setattr(current_omni_platform, "device_control_env_var", device_env)
+    seen = []
+
+    @contextmanager
+    def server(model, args, **kwargs):
+        seen.append(kwargs["env_dict"])
+
+        class Endpoint:
+            host = "localhost"
+            port = 8001
+
+        yield Endpoint()
+
+    monkeypatch.setattr(runner, "OmniServer", server)
+    with runner._start_judge_server({"model": "judge", "device_index": "1"}):
+        pass
+    assert seen == [{device_env: "7"}]
+    assert runner._resolve_judge_visible_devices("0", device_env) == "4"
+    assert __import__("os").environ[device_env] == "4,7"
+    with pytest.raises(ValueError, match="outside"):
+        runner._resolve_judge_visible_devices("2", device_env)
+
+
 def test_omniinteract_result_rejects_incomplete_artifacts():
     from tests.dfx.perf.scripts.run_benchmark import assert_result
 

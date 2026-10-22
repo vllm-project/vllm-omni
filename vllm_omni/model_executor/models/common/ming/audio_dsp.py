@@ -68,7 +68,12 @@ class ISTFT(nn.Module):
         last_chunk: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
         if self.padding == "same" and spec.is_cuda and not torch.is_grad_enabled():
-            from .fused_istft import fused_istft, fused_istft_supported
+            try:
+                from .fused_istft import fused_istft, fused_istft_supported
+            except ImportError:
+                # The acceleration backend is optional for direct talker
+                # inference in the original AntOC environment.
+                return self.forward_native(spec, audio_buffer, window_buffer, streaming, last_chunk)
 
             if fused_istft_supported(
                 spec, self.window, self.n_fft, self.hop_length, audio_buffer, window_buffer, streaming

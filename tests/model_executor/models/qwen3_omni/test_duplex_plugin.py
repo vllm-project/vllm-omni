@@ -97,7 +97,12 @@ def test_capabilities_advertise_image_items_not_append_frames():
 
 
 async def open_qwen(
-    *, calibrate=None, calibration_timeout_ms=1000, history_max_bytes=8 * 1024 * 1024, requires_audio=True
+    *,
+    calibrate=None,
+    calibration_timeout_ms=1000,
+    history_max_bytes=8 * 1024 * 1024,
+    requires_audio=True,
+    **config_overrides: Any,
 ):
     plugin = Qwen3OmniDuplexPlugin(lambda audio, *args: "AAAA")
     if calibrate is not None:
@@ -120,6 +125,8 @@ async def open_qwen(
         model_config=None,
     )
     config = DuplexSessionConfig(model="qwen", modalities=["text", "audio"], overlap_policy="barge_in_on_speech")
+    for key, value in config_overrides.items():
+        setattr(config, key, value)
     await manager.handle(
         OpenDuplexSessionMessage(
             control_id="open", session_id=SESSION_ID, session_config=config, output_buffer=output_buffer
@@ -295,6 +302,245 @@ async def test_note_published_failure_closes_the_unpublished_call():
         assert h.runner.tool_calls.record("call_paris") is None
     finally:
         await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_session_voice_is_forwarded_to_the_talker_speaker_field():
+    """session.update voice must reach the Talker as additional_information.speaker.
+
+    The chat-completions path puts the requested voice into
+    ``prompt["additional_information"]["speaker"]`` and the thinker→talker
+    stage processor forwards it; the duplex plan is the only other prompt
+    producer, so it must set the same field (#8815). Re-targeting is only
+    legal while no audio output has started; the harness never plays audio,
+    which is exactly the pre-audio window these assertions cover.
+    """
+    h = await open_qwen()
+    try:
+        await h.run(UpdateSession(patch={"voice": " Chelsie "}))
+        await h.run(append_audio())
+        await h.run(Commit(final=True, create_response=True))
+        prompt = h.port.submissions[-1].prompt
+        assert prompt["additional_information"]["speaker"] == ["chelsie"]
+
+        # Still before any audio output: re-targeting the following turns is legal.
+        await h.run(UpdateSession(patch={"voice": "Ethan"}))
+        await h.run(append_audio())
+        await h.run(Commit(final=True, create_response=True))
+        prompt = h.port.submissions[-1].prompt
+        assert prompt["additional_information"]["speaker"] == ["ethan"]
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_open_session_voice_is_forwarded_to_the_talker_speaker_field():
+    h = await open_qwen(voice="Aiden")
+    try:
+        await h.run(append_audio())
+        await h.run(Commit(final=True, create_response=True))
+        prompt = h.port.submissions[-1].prompt
+        assert prompt["additional_information"]["speaker"] == ["aiden"]
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_nested_session_voice_is_forwarded_to_the_talker_speaker_field():
+    """GA-shaped clients carry the voice under ``audio.output.voice``."""
+    h = await open_qwen()
+    try:
+        await h.run(UpdateSession(patch={"audio": {"output": {"voice": " Chelsie "}}}))
+        await h.run(append_audio())
+        await h.run(Commit(final=True, create_response=True))
+        prompt = h.port.submissions[-1].prompt
+        assert prompt["additional_information"]["speaker"] == ["chelsie"]
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_unsupported_session_voice_is_rejected_and_keeps_the_previous_one():
+    h = await open_qwen(voice="chelsie")
+    h.manager.plugin._supported_speakers = {"chelsie", "ethan"}
+    try:
+        await h.run(append_audio())
+        await h.run(Commit(final=True, create_response=True))
+        assert h.port.submissions[-1].prompt["additional_information"]["speaker"] == ["chelsie"]
+
+        events = await h.run(UpdateSession(patch={"voice": "nova"}))
+        errors = [e.to_realtime() for e in events if e.to_realtime().get("type") == "error"]
+        assert errors, events
+        assert "Invalid speaker" in str(errors[0])
+        assert h.session.config.voice == "chelsie"
+
+        await h.run(append_audio())
+        await h.run(Commit(final=True, create_response=True))
+        assert h.port.submissions[-1].prompt["additional_information"]["speaker"] == ["chelsie"]
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_clearing_session_voice_drops_the_speaker_field():
+    h = await open_qwen(voice="chelsie")
+    try:
+        await h.run(append_audio())
+        await h.run(Commit(final=True, create_response=True))
+        assert h.port.submissions[-1].prompt["additional_information"]["speaker"] == ["chelsie"]
+
+        # Clearing is a voice change like any other; before audio output it is
+        # legal and simply falls back to the Talker default. After playback the
+        # guard rejects it — see the companion test below.
+        await h.run(UpdateSession(patch={"voice": None}))
+        await h.run(append_audio())
+        await h.run(Commit(final=True, create_response=True))
+        assert "additional_information" not in h.port.submissions[-1].prompt
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_voice_update_after_audio_output_is_rejected_and_keeps_the_speaker():
+    """Once audio has played, setting or clearing the voice must be rejected.
+
+    The harness passes updates with ``audio_started=False`` elsewhere; this
+    test plays and acknowledges an answer first, so the config guard is on
+    the production path and the session keeps its original speaker.
+    """
+    h = await open_qwen(voice="chelsie")
+    try:
+        await h.run(append_audio())
+        await h.run(Commit(final=True, create_response=True))
+        request_id = h.port.submissions[-1].context.request_id
+        response_id = h.session.active_response_id
+        await h.deliver_and_settle(tts_output(request_id, finished=True), stage_id=2)
+        await h.run(AckPlayback(response_id=response_id, played_ms=1000))
+        assert h.session.playback.sent_ms > 0
+
+        for patch in ({"voice": "Ethan"}, {"voice": None}):
+            events = await h.run(UpdateSession(patch=patch))
+            errors = [e.to_realtime() for e in events if e.to_realtime().get("type") == "error"]
+            assert errors, events
+            assert "voice" in str(errors[0])
+        assert h.session.config.voice == "chelsie"
+
+        await h.run(append_audio())
+        await h.run(Commit(final=True, create_response=True))
+        prompt = h.port.submissions[-1].prompt
+        assert prompt["additional_information"]["speaker"] == ["chelsie"]
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_round_trip_voice_update_after_playback_is_a_no_op():
+    """Realtime clients resend the whole session object, voice field included.
+
+    A voice-less session echoes ``"voice": null``, so after playback every
+    later update — temperature, turn detection — must still go through
+    instead of being rejected as a voice change. The next turn keeps the
+    Talker default (no speaker field).
+    """
+    h = await open_qwen()
+    try:
+        await h.run(append_audio())
+        await h.run(Commit(final=True, create_response=True))
+        request_id = h.port.submissions[-1].context.request_id
+        response_id = h.session.active_response_id
+        await h.deliver_and_settle(tts_output(request_id, finished=True), stage_id=2)
+        await h.run(AckPlayback(response_id=response_id, played_ms=1000))
+        assert h.session.playback.sent_ms > 0
+
+        events = await h.run(UpdateSession(patch={"voice": None, "temperature": 0.5}))
+        assert not any(e.to_realtime().get("type") == "error" for e in events)
+        assert h.session.config.voice is None
+        assert h.session.config.temperature == 0.5
+
+        await h.run(append_audio())
+        await h.run(Commit(final=True, create_response=True))
+        assert "additional_information" not in h.port.submissions[-1].prompt
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_resending_the_current_voice_after_playback_is_a_no_op():
+    h = await open_qwen(voice="chelsie")
+    try:
+        await h.run(append_audio())
+        await h.run(Commit(final=True, create_response=True))
+        request_id = h.port.submissions[-1].context.request_id
+        response_id = h.session.active_response_id
+        await h.deliver_and_settle(tts_output(request_id, finished=True), stage_id=2)
+        await h.run(AckPlayback(response_id=response_id, played_ms=1000))
+        assert h.session.playback.sent_ms > 0
+
+        # Same voice, different spelling: an echo, not a change — and the
+        # stored spelling is preserved for plugins that compare it exactly.
+        events = await h.run(UpdateSession(patch={"voice": " Chelsie "}))
+        assert not any(e.to_realtime().get("type") == "error" for e in events)
+        assert h.session.config.voice == "chelsie"
+
+        await h.run(append_audio())
+        await h.run(Commit(final=True, create_response=True))
+        prompt = h.port.submissions[-1].prompt
+        assert prompt["additional_information"]["speaker"] == ["chelsie"]
+    finally:
+        await h.manager.shutdown()
+
+
+def test_supported_speakers_come_from_the_talker_config():
+    plugin = Qwen3OmniDuplexPlugin(lambda *args: None)
+    model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(talker_config=SimpleNamespace(speaker_id={"Chelsie": 1, "Ethan": 2}))
+    )
+    plugin._load_supported_speakers(model_config)
+    assert plugin._supported_speakers == {"chelsie", "ethan"}
+    # A config without a speaker mapping leaves validation off, not empty-named.
+    plugin2 = Qwen3OmniDuplexPlugin(lambda *args: None)
+    plugin2._load_supported_speakers(SimpleNamespace(hf_config=SimpleNamespace(talker_config=SimpleNamespace())))
+    assert plugin2._supported_speakers == set()
+    plugin2.runtime_config_for_update(DuplexSessionConfig(voice="Nova"), {})
+    # A missing model config defers the load; names stay unvalidated.
+    plugin3 = Qwen3OmniDuplexPlugin(lambda *args: None)
+    plugin3._load_supported_speakers(None)
+    assert plugin3._supported_speakers is None
+    assert plugin3.runtime_config_for_update(DuplexSessionConfig(voice="Nova"), {})["voice"] == "nova"
+
+
+def test_runtime_config_voice_validation_rejects_unknown_names():
+    plugin = Qwen3OmniDuplexPlugin(lambda *args: None)
+    plugin._supported_speakers = {"chelsie"}
+    assert plugin.runtime_config_for_update(DuplexSessionConfig(voice=" CHELSIE "), {})["voice"] == "chelsie"
+    assert plugin.runtime_config_for_update(DuplexSessionConfig(voice=None), {})["voice"] is None
+    assert plugin.runtime_config_for_update(DuplexSessionConfig(voice="  "), {})["voice"] is None
+    with pytest.raises(DuplexRuntimeConfigError, match="Invalid speaker 'Nova'") as exc_info:
+        plugin.runtime_config_for_update(DuplexSessionConfig(voice="Nova"), {})
+    assert exc_info.value.code == "invalid_speaker"
+
+
+@pytest.mark.asyncio
+async def test_prepare_runtime_config_rejects_an_unknown_voice_at_open():
+    """The open path loads the checkpoint speakers and validates the session voice."""
+    plugin = Qwen3OmniDuplexPlugin(lambda *args: None)
+    # ``prepare_runtime_config`` only loads a processor when this is unset.
+    plugin.processor = SimpleNamespace()
+    model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(talker_config=SimpleNamespace(speaker_id={"Chelsie": 1})),
+        model="qwen",
+        trust_remote_code=True,
+    )
+
+    with pytest.raises(DuplexRuntimeConfigError, match="Invalid speaker 'nova'") as exc_info:
+        await plugin.prepare_runtime_config(DuplexSessionConfig(model="qwen", voice="nova"), model_config=model_config)
+    assert exc_info.value.code == "invalid_speaker"
+    assert plugin._supported_speakers == {"chelsie"}
+
+    runtime_config = await plugin.prepare_runtime_config(
+        DuplexSessionConfig(model="qwen", voice=" CHELSIE "), model_config=model_config
+    )
+    assert runtime_config["voice"] == "chelsie"
 
 
 @pytest.mark.asyncio

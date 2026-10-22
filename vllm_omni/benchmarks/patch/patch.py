@@ -3034,6 +3034,7 @@ async def _async_request_duplex_eval(request: RequestFuncInput, *, pbar: tqdm | 
                 ref_audio=sample.ref_audio,
                 output_root=sample.response_root,
                 fps=sample.fps,
+                mix=sample.mix,
                 prepared=prepared,
                 defer_artifacts=True,
                 turn_detection=sample.turn_detection,
@@ -3157,6 +3158,7 @@ class _RealtimeTTSProbe:
                 continue
             self._client = client
             break
+        self._client.attach_event_collector(self.events)
         self._consume_task = asyncio.create_task(self.events.consume(self._client))
 
     async def send(self, event: dict[str, object]) -> None:
@@ -3307,18 +3309,25 @@ async def async_request_openai_realtime_duplex(
                 if not isinstance(request_metrics, dict):
                     raise RuntimeError(f"Seed-TTS duplex audio turn {response_id} omitted per-request metrics")
                 turn_timings.append(timing)
-                turn_metrics.append(
+                metric = {
+                    "session_id": session_id,
+                    "request_index": request_index,
+                    "utterance_id": utterance_id or None,
+                    "response_id": response_id,
+                    **request_metrics,
+                    # The client reports raw data only; the RTF is derived
+                    # here with the canonical server-side definition.
+                    "rtf": _audio_rtf_from_raw_metric(request_metrics),
+                }
+                client_rtf = _audio_rtf_from_raw_metric(
                     {
-                        "session_id": session_id,
-                        "request_index": request_index,
-                        "utterance_id": utterance_id or None,
-                        "response_id": response_id,
-                        **request_metrics,
-                        # The client reports raw data only; the RTF is derived
-                        # here with the canonical server-side definition.
-                        "rtf": _audio_rtf_from_raw_metric(request_metrics),
+                        "audio_generation_ms": request_metrics.get("client_audio_generation_ms"),
+                        "audio_duration_ms": request_metrics.get("audio_duration_ms"),
                     }
                 )
+                if client_rtf is not None:
+                    metric["client_rtf"] = client_rtf
+                turn_metrics.append(metric)
                 response_audio = client.events.audio_bytes(response_id)
                 turn_pcm_bytes.append(
                     _pcm_s16le_to_seed_tts_wer_bytes(
@@ -3819,7 +3828,10 @@ async def benchmark(
             "itls": [output.itl for output in outputs],
             "generated_texts": [output.generated_text for output in outputs],
             "errors": [output.error for output in outputs],
-            "max_output_tokens_per_s": mm_metrics.max_output_tokens_per_s,
+            # Missing duplex token timelines remain unmeasured in JSON.
+            "max_output_tokens_per_s": (
+                mm_metrics.max_output_tokens_per_s if np.isfinite(mm_metrics.max_output_tokens_per_s) else None
+            ),
             "max_concurrent_requests": mm_metrics.max_concurrent_requests,
             "rtfx": mm_metrics.rtfx,
         }

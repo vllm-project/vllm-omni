@@ -38,6 +38,10 @@ from vllm_omni.model_executor.models.minicpmo_4_5 import (
     MINICPMO45_DUPLEX_CODEC_TOKENS_PER_CHUNK,
     MINICPMO45_DUPLEX_TURN_END_CODEC_TOKENS,
 )
+from vllm_omni.model_executor.models.minicpmo_4_5.config_flags import (
+    parse_bool_flag as _bool_flag,
+)
+from vllm_omni.model_executor.models.minicpmo_4_5.handoff import unpack_handoff_tensor
 from vllm_omni.model_executor.models.minicpmo_4_5.talker_codec_sample import (
     HISTORY_WINDOW,
     TalkerCodecDeviceState,
@@ -46,6 +50,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5.talker_codec_sample import (
     greedy_codec_sample,
     make_device_state,
     prepare_codec_logits,
+    warmup_fused_prelude,
 )
 from vllm_omni.model_executor.models.minicpmo_4_5.talker_codec_sample import (
     VOCAB_SIZE as _CODEC_VOCAB_SIZE,
@@ -107,10 +112,9 @@ _DUPLEX_CODEC_TOKENS_PER_CHUNK = MINICPMO45_DUPLEX_CODEC_TOKENS_PER_CHUNK
 _DUPLEX_TURN_END_CODEC_TOKENS = MINICPMO45_DUPLEX_TURN_END_CODEC_TOKENS
 #: Frames the Talker forwards per generate_chunk before its cadence EOS.
 _DUPLEX_CODEC_FRAMES_PER_CHUNK = MINICPMO45_DUPLEX_CODEC_TOKENS_PER_CHUNK - 1
-#: On a turn-end chunk the Talker's EOS is masked for this many steps after
-#: each 25-frame boundary: the model emits a cadence EOS there whether or not
-#: its text is spoken, while a genuine end of text shows up as an EOS anywhere
-#: else in the window.
+#: On a turn-end chunk drained with the boundary mask (``_DRAIN_BOUNDARY_MASK``)
+#: the Talker's EOS is masked for this many steps after each 25-frame boundary:
+#: the model emits a cadence EOS there whether or not its text is spoken.
 _DUPLEX_TURN_END_BOUNDARY_MASK_STEPS = 5
 
 
@@ -120,22 +124,89 @@ def _native_duplex_chunk_budget(meta: Mapping[str, Any] | None) -> tuple[int, in
     turn_end = isinstance(meta, Mapping) and bool(meta.get("turn_end"))
     if turn_end:
         # The turn-end chunk drains the text the Talker still owes: no floor
-        # (an early EOS means the text is spoken) and a multi-unit ceiling.
+        # and a multi-unit ceiling; ``_turn_end_drain_kind`` decides when the
+        # Talker's EOS may end it.
         return _DUPLEX_TURN_END_CODEC_TOKENS, 0
     ceiling = _DUPLEX_CODEC_TOKENS_PER_CHUNK
     return ceiling, 0 if turn_start else ceiling
 
 
 def _turn_end_boundary_eos_masked(step: int) -> bool:
-    """Whether a turn-end chunk masks codec EOS at ``step`` forwarded frames.
+    """Whether a ``_DRAIN_BOUNDARY_MASK`` turn-end chunk masks codec EOS at ``step`` forwarded frames.
 
     The Talker emits a cadence EOS after every 25 frames regardless of the text
-    left, so a turn-end chunk ignores EOS in a short window after each boundary
-    and lets the model continue; EOS elsewhere ends the chunk as usual.
+    left, so such a chunk ignores EOS in a short window after each boundary and
+    lets the model continue; EOS elsewhere ends the chunk as usual.
     """
     if step < _DUPLEX_CODEC_FRAMES_PER_CHUNK:
         return False
     return step % _DUPLEX_CODEC_FRAMES_PER_CHUNK < _DUPLEX_TURN_END_BOUNDARY_MASK_STEPS
+
+
+# How a native-duplex Talker condition may stop (``audio_state["turn_end_drain"]``).
+# The Talker keeps its 25-frame cadence on the turn-end condition too, so the
+# boundary mask alone lets it stop with text still unspoken (#8807). When the
+# turn's text ends a sentence, the turn-end condition carries <text_eos> and is
+# drained until the Talker falls silent. A turn whose text stops mid-sentence
+# keeps the boundary mask: draining it until silent makes the Talker invent a
+# continuation. Every path that reads ``turn_end_drain`` (MRv2 sampler, V1 host
+# path, V1 ``codec_state`` kernel) must handle all three kinds.
+_DRAIN_NONE = 0
+_DRAIN_BOUNDARY_MASK = 1
+_DRAIN_UNTIL_SILENT = 2
+#: Codec ids that are almost always silence: in MiniCPM-o 4.5 Talker output on
+#: Seed-TTS en, >= 95% of the frames carrying each id are 35 dB or more below
+#: the turn's 90th-percentile frame level.
+_SILENT_CODEC_IDS = (4137, 4218, 4299, 6324, 6405, 6486)
+#: Codec ids that are mostly silence or breath (>= 60% of their frames, same
+#: measurement); includes the silent ids.
+_QUIET_CODEC_IDS = (
+    735, 1458, 1461, 1464, 1488, 1539, 1701, 1704, 1707, 1716, 1731, 1944,
+    1947, 1950, 2031, 2112, 3648, 3651, 3891, 3894, 3895, 3903, 3972, 3975,
+    4134, 4137, 4138, 4146, 4218, 4299, 5900, 6082, 6324, 6405, 6486,
+)  # fmt: skip
+#: A condition drained until silent may sample EOS only after this many silent
+#: codes in a row.
+_TURN_END_SILENT_FRAMES = 2
+#: ...and is forced to EOS after this many quiet codes in a row: past the end of
+#: the sentence the Talker otherwise waits for its next cadence point and can
+#: start new words.
+_TURN_END_QUIET_STOP_FRAMES = 8
+# Both V1 paths count runs inside the codec penalty window.
+assert _TURN_END_QUIET_STOP_FRAMES <= _CODEC_PENALTY_WINDOW
+#: Bits of the per-codec-id class table (``_codec_classes``).
+_CODEC_CLASS_SILENT = 1
+_CODEC_CLASS_QUIET = 2
+
+
+def _turn_end_drain_kind(native_duplex: bool, meta: Mapping[str, Any] | None) -> int:
+    """How the condition described by ``meta`` may stop (see ``_DRAIN_*``)."""
+    if not native_duplex or not isinstance(meta, Mapping) or not meta.get("turn_end"):
+        return _DRAIN_NONE
+    return _DRAIN_UNTIL_SILENT if meta.get("turn_text_ends_sentence") else _DRAIN_BOUNDARY_MASK
+
+
+def _trailing_code_runs(
+    step: int,
+    recent_codes: Sequence[int] | None,
+    silent_ids: Sequence[int] = _SILENT_CODEC_IDS,
+    quiet_ids: Sequence[int] = _QUIET_CODEC_IDS,
+) -> tuple[int, int]:
+    """Silent and quiet codes in a row at the end of this condition's ``step`` codes.
+
+    ``recent_codes`` is the codec penalty window, which may still hold codes
+    retained from the previous condition; only the last ``step`` count.
+    """
+    codes = list(recent_codes or ())[-step:] if step > 0 else []
+    runs = []
+    for ids in (silent_ids, quiet_ids):
+        run = 0
+        for code in reversed(codes):
+            if int(code) not in ids:
+                break
+            run += 1
+        runs.append(run)
+    return runs[0], runs[1]
 
 
 def blank_scheduler_prompt_for_penalties(
@@ -555,6 +626,11 @@ def _install_mrv2_talker_sampler(sampler: Any, talker: "MiniCPMO45OmniTTSForCond
     talker._mrv2_empty_speech = torch.zeros(
         int(sampler.req_states.max_num_reqs), dtype=torch.bool, device=sampler.req_states.device
     )
+    # Per request slot: silent and quiet codes in a row of the current condition.
+    talker._mrv2_code_runs = torch.zeros(
+        (int(sampler.req_states.max_num_reqs), 2), dtype=torch.long, device=sampler.req_states.device
+    )
+    talker._codec_classes(sampler.req_states.device)
     logger.info(
         "MiniCPM-o Talker: MRv2 sampler with device-side %d-frame codec penalty and EOS control",
         _CODEC_PENALTY_WINDOW,
@@ -599,6 +675,9 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
     """Runner-owned MiniCPM-o 4.5 Talker that emits codec tokens only."""
 
     requires_request_sample_eligibility = True
+    # Codec ids of the turn-end stop rule (class attributes so tests can use a small vocabulary).
+    silent_codec_ids: tuple[int, ...] = _SILENT_CODEC_IDS
+    quiet_codec_ids: tuple[int, ...] = _QUIET_CODEC_IDS
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -660,6 +739,15 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         else:
             self._tts_config = None
             self._codec_eos_id = 0
+        # The fused prelude is a stage-connector knob rather than a sampler
+        # value: the connector's ``extra`` block is the YAML surface that
+        # actually reaches ``OmniModelConfig`` for this stage. Default true; a
+        # deployment sets ``talker_codec_fused_prelude: false`` to force the
+        # eager chain, and the runtime latch still covers kernel failures.
+        self._codec_fused_prelude = _bool_flag(
+            self._extra_config().get("talker_codec_fused_prelude", True),
+            "talker_codec_fused_prelude",
+        )
 
         # Multi-frame decode: K codec frames per Talker decode step. A value
         # >= 2 engages the loop -- the scheduler hands each request K query
@@ -706,6 +794,10 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         # Rows the sampler must force to codec EOS, computed with this step's output.
         self._mrv2_forced_eos: torch.Tensor | None = None
         self._mrv2_masked_eos: torch.Tensor | None = None
+        # Per request slot: silent and quiet codes in a row (see _install_mrv2_talker_sampler).
+        self._mrv2_code_runs: torch.Tensor | None = None
+        # Per codec id ``_CODEC_CLASS_*`` bits on the device (see _codec_classes).
+        self._codec_class_table: torch.Tensor | None = None
         self._mrv2_decode_rows_logged = False
 
     @classmethod
@@ -792,6 +884,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         tts_hidden_states: torch.Tensor,
         *,
         native_duplex: bool = False,
+        close_text: bool = False,
     ) -> torch.Tensor:
         if tts_token_ids.numel() == 0 or tts_hidden_states.numel() == 0:
             # The thinker can legally emit an empty speech segment (<|tts_bos|>
@@ -816,9 +909,12 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             hidden_embeds = F.normalize(hidden_embeds, p=2, dim=-1)
         audio_bos = self.emb_text(index_to_device([self._tts_bos_id], device))
         condition = text_embeds + hidden_embeds
-        if native_duplex:
+        if native_duplex and not close_text:
             # Match MiniCPMTTS.generate_chunk's streaming condition.
             return torch.cat([condition, audio_bos], dim=0)
+        # Offline, and the turn-end condition of a native-duplex turn whose text
+        # ends a sentence: <text_eos> tells the Talker no more text follows, as
+        # the last chunk of TTSStreamingGenerator.generate_with_buffer does.
         return torch.cat([condition, self._boundary_embeddings()], dim=0)
 
     def _build_streaming_recompute_embeddings(
@@ -990,6 +1086,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
 
         if is_prefill or first_call:
             token_ids, hidden_states = get_tts_handoff(info_dict)
+            hidden_states = unpack_handoff_tensor(hidden_states)
             # Cross-process stage transport serializes CPU tensors as lists.
             # Normalize both local tensor handoffs and transported payloads
             # before validating/building the Talker condition.
@@ -1017,10 +1114,12 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 )
             native_duplex = bool(info_dict.get("native_duplex", False))
             meta = info_dict.get("meta")
+            drain_kind = _turn_end_drain_kind(native_duplex, meta if isinstance(meta, Mapping) else None)
             full_embeds = self._build_condition_embeddings(
                 token_ids,
                 hidden_states,
                 native_duplex=native_duplex,
+                close_text=drain_kind == _DRAIN_UNTIL_SILENT,
             )
             if native_duplex:
                 full_embeds = self._build_streaming_recompute_embeddings(
@@ -1087,7 +1186,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 "step": 0,
                 "max_tokens": max_tokens,
                 "min_tokens": min_tokens,
-                "turn_end_drain": bool(native_duplex and isinstance(meta, Mapping) and bool(meta.get("turn_end"))),
+                "turn_end_drain": drain_kind,
             }
             if isinstance(retained_codes, torch.Tensor) or retained_codes:
                 state["recent_codes"] = retained_codes
@@ -1322,8 +1421,9 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         codec id of a request that has not ended. That id is the code V1 hands
         to Code2Wav on this step; the stage payload builder drops the other
         rows on the host, after the asynchronous output copy. Rows the model
-        terminates this step (empty condition, codec EOS already sampled, or
-        the offline length cap) are recorded for the sampler.
+        terminates this step (empty condition, codec EOS already sampled, the
+        offline length cap, or a turn-end condition that has gone quiet) are
+        recorded for the sampler.
         """
         if isinstance(model_outputs, OmniOutput):
             return model_outputs
@@ -1379,7 +1479,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             self._mrv2_forced_eos = empty | eos_input | (step >= limit)
             self._mrv2_masked_eos = None
         else:
-            limits, minimums, draining = [], [], []
+            limits, minimums, drains = [], [], []
             for i in range(num_reqs):
                 info = model_intermediate_buffer[i] if i < len(model_intermediate_buffer) else {}
                 info_dict = info if isinstance(info, dict) else {}
@@ -1388,21 +1488,43 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                     max_tok, min_tok = _native_duplex_chunk_budget(meta)
                     limits.append(max_tok - 1)
                     minimums.append(min_tok)
-                    draining.append(bool(meta.get("turn_end")))
+                    drains.append(_turn_end_drain_kind(True, meta))
                 else:
                     limits.append(_OFFLINE_CODEC_MAX_NEW_TOKENS - 1)
                     minimums.append(0)
-                    draining.append(False)
+                    drains.append(_DRAIN_NONE)
             device_limits = index_to_device(limits, device, dtype=torch.long)
             limit = torch.minimum(torch.clamp(remaining - 1, min=0), device_limits)
-            self._mrv2_forced_eos = empty | eos_input | (step >= limit)
-            cadence = (step >= _DUPLEX_CODEC_FRAMES_PER_CHUNK) & (
-                step % _DUPLEX_CODEC_FRAMES_PER_CHUNK < _DUPLEX_TURN_END_BOUNDARY_MASK_STEPS
+            drain = index_to_device(drains, device, dtype=torch.long)
+            forced = empty | eos_input | (step >= limit)
+            masked = (step < index_to_device(minimums, device, dtype=torch.long)) | (
+                (drain == _DRAIN_BOUNDARY_MASK)
+                & (step >= _DUPLEX_CODEC_FRAMES_PER_CHUNK)
+                & (step % _DUPLEX_CODEC_FRAMES_PER_CHUNK < _DUPLEX_TURN_END_BOUNDARY_MASK_STEPS)
             )
-            self._mrv2_masked_eos = ~self._mrv2_forced_eos & (
-                (step < index_to_device(minimums, device, dtype=torch.long))
-                | (index_to_device(draining, device, dtype=torch.bool) & cadence)
-            )
+            # Every step of a condition drained until silent, its prefill
+            # included, has that row in the batch, so the runs only need
+            # updating when one is present.
+            if _DRAIN_UNTIL_SILENT in drains:
+                prefilling = (
+                    index_to_device(input_batch.is_prefilling_np[:num_reqs].tolist(), device, dtype=torch.bool)
+                    if input_batch.has_prefill
+                    else None
+                )
+                silent_run, quiet_run = self._mrv2_trailing_code_runs(
+                    slot_ids,
+                    last_ids,
+                    valid,
+                    prefilling,
+                    token_ids=req_states.all_token_ids.gpu,
+                    seq_lens=input_batch.seq_lens[:num_reqs].long(),
+                    prompt_len=prompt_len,
+                )
+                until_silent = drain == _DRAIN_UNTIL_SILENT
+                forced = forced | (until_silent & (quiet_run >= _TURN_END_QUIET_STOP_FRAMES))
+                masked = masked | (until_silent & (silent_run < _TURN_END_SILENT_FRAMES))
+            self._mrv2_forced_eos = forced
+            self._mrv2_masked_eos = ~forced & masked
         frame_valid = torch.zeros(num_tokens, dtype=torch.bool, device=device)
         frame_valid.index_copy_(0, last_rows, valid)
         if not self._mrv2_decode_rows_logged and not input_batch.has_prefill:
@@ -1446,6 +1568,66 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 "meta": meta_outputs,
             },
         )
+
+    def _codec_classes(self, device: torch.device | str) -> torch.Tensor:
+        """Per codec id, plus the codec-history padding id: ``_CODEC_CLASS_*`` bits.
+
+        Built once with a pinned non-blocking upload, so it never waits on the device.
+        """
+        table: torch.Tensor | None = getattr(self, "_codec_class_table", None)
+        if table is None:
+            # The codec-history padding id is ``num_audio_tokens`` (CodecState's vocab_size).
+            size = max(int(getattr(self, "_num_audio_tokens", 0)), *self.silent_codec_ids, *self.quiet_codec_ids) + 1
+            classes = [0] * size
+            for code in self.silent_codec_ids:
+                classes[code] |= _CODEC_CLASS_SILENT
+            for code in self.quiet_codec_ids:
+                classes[code] |= _CODEC_CLASS_QUIET
+            table = self._codec_class_table = index_to_device(classes, device, dtype=torch.int8)
+        return table
+
+    def _mrv2_trailing_code_runs(
+        self,
+        slot_ids: torch.Tensor,
+        last_ids: torch.Tensor,
+        valid: torch.Tensor,
+        prefilling: torch.Tensor | None,
+        *,
+        token_ids: torch.Tensor | None = None,
+        seq_lens: torch.Tensor | None = None,
+        prompt_len: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Silent and quiet codes in a row, per row, ending with this step's input code.
+
+        A decode row extends its slot's runs with its input code; a row without a
+        forwarded code this step (EOS, empty condition) resets them. A prefill row
+        either starts a condition (no codes yet) or recomputes one after
+        preemption, so its runs are rebuilt from the request's token history
+        (``token_ids``: ``req_states.all_token_ids``): the condition's codes before
+        position ``seq_lens``. Runs are rebuilt up to the quiet-stop length, which
+        is all the stop rule reads.
+        """
+        assert self._mrv2_code_runs is not None
+        table = self._codec_classes(last_ids.device)
+        hits = self._codec_class_hits(table, last_ids) & valid[:, None]
+        runs = self._mrv2_code_runs.index_select(0, slot_ids)
+        runs = torch.where(hits, runs + 1, torch.zeros_like(runs))
+        if prefilling is not None:
+            assert token_ids is not None and seq_lens is not None and prompt_len is not None
+            span = _TURN_END_QUIET_STOP_FRAMES
+            positions = seq_lens[:, None] - span + torch.arange(span, device=slot_ids.device)
+            history = token_ids[slot_ids[:, None], positions.clamp(min=0)]
+            history_hits = self._codec_class_hits(table, history) & (positions >= prompt_len[:, None])[..., None]
+            rebuilt = history_hits.flip(1).long().cumprod(1).sum(1)
+            runs = torch.where(prefilling[:, None], rebuilt, runs)
+        self._mrv2_code_runs.index_copy_(0, slot_ids, runs)
+        return runs[:, 0], runs[:, 1]
+
+    @staticmethod
+    def _codec_class_hits(table: torch.Tensor, ids: torch.Tensor) -> torch.Tensor:
+        """``[..., 2]`` flags (silent, quiet) per codec id; out-of-table ids map to the last entry."""
+        classes = table.index_select(0, ids.long().clamp(0, table.shape[0] - 1).flatten()).view(ids.shape).long()
+        return torch.stack([(classes & _CODEC_CLASS_SILENT) != 0, (classes & _CODEC_CLASS_QUIET) != 0], dim=-1)
 
     def take_mrv2_forced_eos(self, input_batch: Any, req_states: Any, num_rows: int) -> torch.Tensor | None:
         """This step's forced-EOS rows, once; ``None`` outside a model step (warmup)."""
@@ -1572,18 +1754,40 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             else:
                 codes = codes.to(device=hidden.device, dtype=torch.long).reshape(-1)
             step = _codec_int_param(state, "step", 0)
-            # Note: main's turn-end semantics require masking codec EOS within 5
-            # steps after each 25-frame cadence boundary (see
-            # _turn_end_boundary_eos_masked and state["turn_end_drain"];
+            # Note: a turn-end chunk drains the way state["turn_end_drain"]
+            # says (see _DRAIN_*), with the same criteria the single-frame
+            # path's mask_eos_rows / force_eos_rows apply. _DRAIN_BOUNDARY_MASK
+            # masks codec EOS within 5 steps after each 25-frame cadence
+            # boundary (see _turn_end_boundary_eos_masked;
             # MINICPMO45_DUPLEX_TURN_END_CODEC_TOKENS is 4 chunks, so the window
-            # lands on steps 25-29 / 50-54 / 75-79 / 100-104). The EOS masking
-            # lives in the sampling core (talker_codec_sample.
-            # prepare_codec_logits / greedy_codec_sample), so the periodic
-            # window rides along as the eos_window_masked flag below -- the same
-            # criterion the single-frame path's mask_eos_rows applies.
+            # lands on steps 25-29 / 50-54 / 75-79 / 100-104). _DRAIN_UNTIL_SILENT
+            # masks it until this condition ends in two silent codes and stops
+            # the chunk after a run of quiet ones. The EOS masking lives in the
+            # sampling core (talker_codec_sample.prepare_codec_logits /
+            # greedy_codec_sample), so it rides along as the eos_window_masked
+            # flag below.
             min_tokens = _codec_int_param(state, "min_tokens", self._codec_min_tokens)
             max_tokens = _codec_int_param(state, "max_tokens", self._codec_max_tokens)
-            eos_window_masked = bool(state.get("turn_end_drain")) and _turn_end_boundary_eos_masked(step)
+            drain = int(state.get("turn_end_drain") or _DRAIN_NONE)
+            eos_window_masked = drain == _DRAIN_BOUNDARY_MASK and _turn_end_boundary_eos_masked(step)
+            if drain == _DRAIN_UNTIL_SILENT:
+                # The confirmed-frame record (below) is host-side and gains one
+                # code per confirmed frame, so its last ``step`` codes are this
+                # condition's without a device sync.
+                confirmed = getattr(self, "_request_codec_history", {}).get(request_id) or []
+                silent_run, quiet_run = _trailing_code_runs(
+                    step, confirmed[-step:] if step > 0 else [], self.silent_codec_ids, self.quiet_codec_ids
+                )
+                if quiet_run >= _TURN_END_QUIET_STOP_FRAMES:
+                    # The single-frame path forces this frame's sample to EOS;
+                    # finish the chunk here the same way, without sampling.
+                    state["finished"] = True
+                    info["audio_state"] = state
+                    stop_rows.append(row_stop)
+                    codec_deltas.append(empty_delta)
+                    terminal_flags.append(flag_true)
+                    continue
+                eos_window_masked = silent_run < _TURN_END_SILENT_FRAMES
             # A request pinning temperature to 0 (override or stage default)
             # takes the deterministic boundary sampler, same as single-frame.
             # Both boundary samplers return the full sample result; the device
@@ -1628,8 +1832,9 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             state["step"] = _codec_int_param(state, "step", 0) + 1
             # Single-source stop routing: the device state owns the
             # eos/stop-id/limit transition (codec_sample_result), so the host
-            # only consumes its finished/emit decision. Repetition detection
-            # stays host-side -- the scheduler never sees codec ids, so the
+            # only consumes its finished/emit decision. The _DRAIN_UNTIL_SILENT
+            # quiet-run stop above finishes before sampling, and repetition
+            # detection stays host-side -- the scheduler never sees codec ids, so the
             # engine's check_stop cannot police the codec stream; this mirrors
             # it over codec_full_ids exactly as the engine does over its
             # tokens (v1/core/sched/utils.py:125-133).
@@ -1878,6 +2083,23 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             self._request_generators[request_id] = generator
         return generator
 
+    def _extra_config(self) -> dict[str, Any]:
+        """Stage-connector ``extra``: the per-stage knobs a deploy YAML can set.
+
+        The talker has no incoming connector edge, so ``get_stage_connector_spec``
+        takes the producer fallback and hands it the extra of its outgoing
+        ``1->2`` edge. If a deploy ever gives stage 1 an explicit
+        ``input_connectors`` entry, the dict comes from that edge instead and
+        ``talker_codec_fused_prelude`` silently reverts to the default.
+        """
+        model_config = getattr(self.vllm_config, "model_config", None)
+        connector = getattr(model_config, "stage_connector_config", None)
+        if isinstance(connector, Mapping):
+            extra = connector.get("extra", connector)
+        else:
+            extra = getattr(connector, "extra", None)
+        return dict(extra) if isinstance(extra, Mapping) else {}
+
     def _codec_sample_setup(
         self,
         request_id: str,
@@ -1937,6 +2159,12 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 ),
             )
             device_inputs_by_request[request_id] = device_inputs
+        # Compile the codec prelude kernel before this request decodes, so a
+        # compile failure latches the eager chain outside any graph capture.
+        # An eager-only configuration never touches the kernel: after a
+        # CANN/torch_npu upgrade a broken kernel may fault the device instead
+        # of raising, which would defeat the switch.
+        warmup_fused_prelude(hidden_state.device, enabled=self._codec_fused_prelude)
         return device_state, device_inputs, device_states
 
     def _sample_audio_code(
@@ -1977,6 +2205,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             frequency_penalty=_codec_float_param(request_state, "codec_frequency_penalty", 0.0),
             presence_penalty=_codec_float_param(request_state, "codec_presence_penalty", 0.0),
             eos_window_masked=eos_window_masked,
+            fused_prelude=self._codec_fused_prelude,
         )
         probabilities = torch.softmax(logits, dim=-1)
         sampled = torch.multinomial(
@@ -2278,6 +2507,13 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             # Offline: force-stop at the remaining Talker context rather than
             # waiting for a sampled EOS.
             hit_chunk_limit = max_tokens is not None and step >= int(max_tokens) - 1
+            drain = int(state.get("turn_end_drain") or _DRAIN_NONE)
+            silent_run = quiet_run = 0
+            if drain == _DRAIN_UNTIL_SILENT:
+                silent_run, quiet_run = _trailing_code_runs(
+                    step, state.get("recent_codes"), self.silent_codec_ids, self.quiet_codec_ids
+                )
+                hit_chunk_limit = hit_chunk_limit or quiet_run >= _TURN_END_QUIET_STOP_FRAMES
             chunk_done = empty_speech or hit_chunk_limit
             if hit_chunk_limit:
                 # The next sampled id is forced EOS and will finish the request;
@@ -2287,7 +2523,8 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             force_eos_rows[index] = chunk_done
             mask_eos_rows[index] = not force_eos_rows[index] and (
                 (min_tokens is not None and step < int(min_tokens))
-                or (bool(state.get("turn_end_drain")) and _turn_end_boundary_eos_masked(step))
+                or (drain == _DRAIN_BOUNDARY_MASK and _turn_end_boundary_eos_masked(step))
+                or (drain == _DRAIN_UNTIL_SILENT and silent_run < _TURN_END_SILENT_FRAMES)
             )
             terminal_flags[index] = torch.tensor(chunk_done, dtype=torch.bool)
 
@@ -2318,6 +2555,9 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 eos=codec_eos_id,
                 cadence=_DUPLEX_CODEC_FRAMES_PER_CHUNK,
                 boundary=_DUPLEX_TURN_END_BOUNDARY_MASK_STEPS,
+                code_classes=self._codec_classes(device),
+                silent_frames=_TURN_END_SILENT_FRAMES,
+                quiet_stop_frames=_TURN_END_QUIET_STOP_FRAMES,
             )
             history_rows = histories.unbind()
             valid_rows = valid.split(1)
