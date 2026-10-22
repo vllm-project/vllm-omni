@@ -5,7 +5,7 @@
 
 from collections.abc import Collection, Iterable, Mapping
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, TypeAlias
+from typing import TYPE_CHECKING, TypeAlias
 
 from vllm_omni.errors import OmniClientError
 
@@ -58,7 +58,7 @@ class AttentionScheduleRange:
 AttentionSchedule: TypeAlias = tuple[AttentionScheduleRange, ...]
 
 
-def parse_attention_schedule(value: Any) -> AttentionSchedule | None:
+def parse_attention_schedule(value: object) -> AttentionSchedule | None:
     """Detach and normalize request intervals; None inherits, an empty tuple disables.
 
     JSON request bodies supply lists of mappings. Tuples and typed ranges also
@@ -123,8 +123,8 @@ def require_attention_schedule_fits(schedule: AttentionSchedule, total_steps: in
 
 
 def resolve_attention_schedule(
-    request_schedule: Any,
-    default_schedule: Any,
+    request_schedule: object,
+    default_schedule: object,
     *,
     profiles: Collection[str],
 ) -> AttentionSchedule:
