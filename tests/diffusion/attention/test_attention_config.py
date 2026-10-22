@@ -133,6 +133,48 @@ class TestAttentionSpec:
         with pytest.raises(ValueError, match="only supported by the FASTVIDEO_VSA"):
             AttentionSpec(backend="TORCH_SDPA", fastvideo_vsa_topk=96)
 
+    def test_sparge_serialized_with_overrides(self):
+        spec = AttentionSpec(
+            backend="SPARGE_ATTN",
+            sparge={
+                "topk": 0.25,
+                "q_block_tokens": 256,
+                "k_block_tokens": 64,
+                "q_tile_override": 256,
+            },
+        )
+        assert spec.backend_kwargs() == {
+            "sparge_topk": 0.25,
+            "sparge_q_block_tokens": 256,
+            "sparge_k_block_tokens": 64,
+            "sparge_q_tile_override": 256,
+        }
+
+    def test_sparge_defaults_are_applied_by_backend(self):
+        spec = AttentionSpec(backend="SPARGE_ATTN")
+        assert spec.sparge is None
+        assert spec.backend_kwargs() is None
+        assert AttentionSpec(backend="SPARGE_ATTN", sparge={}).backend_kwargs() == {"sparge_topk": 0.5}
+
+    def test_sparge_rejected_for_other_backend(self):
+        with pytest.raises(ValueError, match="only supported by the SPARGE_ATTN"):
+            AttentionSpec(backend="TORCH_SDPA", sparge={"topk": 0.25})
+
+    @pytest.mark.parametrize(
+        "sparge",
+        [
+            {"topk": 0.0},
+            {"topk": 1.5},
+            {"q_block_tokens": 32},
+            {"q_block_tokens": 128},
+            {"k_block_tokens": 128},
+            {"q_tile_override": 32},
+        ],
+    )
+    def test_sparge_invalid_values(self, sparge):
+        with pytest.raises(ValueError):
+            AttentionSpec(backend="SPARGE_ATTN", sparge=sparge)
+
     def test_block_sparse_defaults_applied_when_backend_selected(self):
         spec = AttentionSpec(backend="RAINFUSION_ATTN")
         assert spec.block_sparse.sparsity == 0.8
@@ -248,6 +290,13 @@ class TestAttentionConfig:
             "precision": "sage",
             "topk": 32,
         }
+
+    @pytest.mark.parametrize("nested", [False, True])
+    def test_sparge_config_in_per_role_mapping(self, nested):
+        spec = {"backend": "SPARGE_ATTN", "sparge": {"topk": 0.25}}
+        roles: dict[str, Any] = {"wan": {"self": spec}} if nested else {"wan.self": spec}
+        config = AttentionConfig(per_role=roles)
+        assert config.per_role["wan.self"].backend_kwargs() == {"sparge_topk": 0.25}
 
     def test_constructor_normalizes_auto_to_unset(self):
         config = AttentionConfig(
