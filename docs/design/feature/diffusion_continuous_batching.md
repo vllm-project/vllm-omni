@@ -11,7 +11,7 @@ and output delivery. For user-facing configuration and CLI examples, see
 `max_num_seqs` as that mode's scheduler capacity:
 
 | Configuration | Engine mode | Scheduler | Execution |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `step_execution=False`, `max_num_seqs=1` | `REQUEST_BATCH` | `RequestScheduler` | One complete request-level `forward()` |
 | `step_execution=False`, `max_num_seqs>1` | `REQUEST_BATCH` | `RequestScheduler` | One fused `forward()` over compatible requests |
 | `step_execution=True`, `max_num_seqs=1` | `STEP_BATCH` | `StepScheduler` | One request advanced one denoise step per scheduler tick |
@@ -116,7 +116,9 @@ per request. Cache refresh, homogeneous LoRA activation, and
 
 `RequestBatchSamplingParamsKey` contains fields that affect the tensor contract,
 including shape, guidance, output count, and LoRA identity. Only compatible
-requests can share a fused forward call.
+requests can share a fused forward call. The key also holds the request's
+normalized `attention_schedule`, because the runner binds one schedule per
+batch: an omitted schedule, `[]` and explicit ranges are distinct keys.
 
 Admission is FIFO and conservative. An incompatible request at the front of the
 waiting queue can prevent later compatible requests from joining the current
@@ -139,7 +141,7 @@ Step execution exposes denoising progress to the scheduler. A supporting
 pipeline implements four stateful operations:
 
 | Operation | Responsibility |
-|---|---|
+| --- | --- |
 | `prepare_encode(state)` | Validate input, encode prompts, initialize latents and timesteps, and create request-local scheduler state |
 | `denoise_step(input_batch, *, states=...)` | Run one denoise forward for the scheduler-provided request states |
 | `step_scheduler(state, noise_pred)` | Update latents and advance request progress |
@@ -187,8 +189,8 @@ denoise forward, then applies scheduler updates per request:
 
 `StepBatchSamplingParamsKey` protects the batched tensor contract. Requests can
 have different total step counts and current step indices, but shape-sensitive,
-CFG-sensitive, and LoRA fields must be compatible. FIFO head-of-line blocking
-also applies here.
+CFG-sensitive, LoRA, and `attention_schedule` fields must be compatible. FIFO
+head-of-line blocking also applies here.
 
 Chunk-capable pipelines may emit intermediate results. Final-only step
 pipelines emit when the request finishes even if `streaming_output=True`.
