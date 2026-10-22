@@ -13,7 +13,7 @@ import json
 import weakref
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, TypeGuard, cast
 
 import torch
 import torch.nn as nn
@@ -183,12 +183,14 @@ _SCHEDULED_OP_FALSE_FIELDS = ("cross_kv_rows_validated", "cross_pair_mask_valida
 _NO_METADATA_SPEC = "-"
 
 
-def _is_op_int(value: object) -> bool:
+def _is_op_int(value: object) -> TypeGuard[int | torch.SymInt]:
     # A bool is an int subclass; bools travel in the spec instead.
     return (isinstance(value, int) and not isinstance(value, bool)) or isinstance(value, torch.SymInt)
 
 
-def _encode_scheduled_op_metadata(attn_metadata: AttentionMetadata | None) -> tuple[str, list[Any]] | None:
+def _encode_scheduled_op_metadata(
+    attn_metadata: AttentionMetadata | None,
+) -> tuple[str, list[int | torch.SymInt]] | None:
     """Split metadata into a structure string and its integers for ``vllm_omni::scheduled_attention``.
 
     Runs while tracing. The string holds only names, types and booleans, which are the same on every
@@ -213,7 +215,7 @@ def _encode_scheduled_op_metadata(attn_metadata: AttentionMetadata | None) -> tu
         if getattr(attn_metadata, name):
             return None
     spec = "M"
-    ints: list[Any] = []
+    ints: list[int | torch.SymInt] = []
     layout = attn_metadata.video_layout
     if layout is not None:
         if type(layout) is not VideoTokenLayout or layout.video_spans:
