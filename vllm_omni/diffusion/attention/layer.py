@@ -649,20 +649,10 @@ class Attention(nn.Module):
         value: torch.Tensor,
         attn_metadata: AttentionMetadata | None,
     ) -> ExecutionPathResult:
-        """Compose backend capabilities with outer Attention boundaries.
-
-        On a layer built with a schedule, a call inside an active denoise step applies the step
-        and profile checks of ``forward`` and raises the same errors.
-        """
+        """Compose backend capabilities with outer Attention boundaries."""
         boundaries = set(context.outer_boundaries)
         if self._uses_hsdp_compile_boundary():
             boundaries.add(OuterBoundary.HSDP)
-        attention = self.attention
-        if self._schedule_configured:
-            # Inside a denoise step, a layer built with a schedule runs the candidate selected for
-            # that step. effective_attention() returns the baseline when there is no forward
-            # context, and otherwise applies the same step and profile checks as forward.
-            attention = self.effective_attention()[0]
         active_strategy = self._get_active_parallel_strategy()
         strategy_name = active_strategy.name
         if self.use_ring and active_strategy.enabled and strategy_name == "ulysses":
@@ -700,10 +690,10 @@ class Attention(nn.Module):
                     path="cross_unsupported" if blocked else "cross_sdpa_fallback",
                     support=CapabilityResult.unsupported(blocked) if blocked else CapabilityResult.unmigrated(reason),
                 )
-        resolver = getattr(attention, "resolve_execution_path", None)
+        resolver = getattr(self.attention, "resolve_execution_path", None)
         if not callable(resolver):
             return ExecutionPathResult.unmigrated(
-                type(attention).__name__,
+                type(self.attention).__name__,
                 resolved_context,
             )
         return resolver(
