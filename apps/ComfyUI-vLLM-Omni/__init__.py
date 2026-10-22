@@ -16,6 +16,7 @@ __version__ = "0.0.1"
 
 from .comfyui_vllm_omni.nodes import (
     VLLMOmniARSampling,
+    VLLMOmniAudioToVideoDuration,
     VLLMOmniDiffusionSampling,
     VLLMOmniFastH3Deployment,
     VLLMOmniGenerateImage,
@@ -37,6 +38,7 @@ from .comfyui_vllm_omni.nodes import (
 
 # A dictionary that contains all nodes you want to export with their names
 NODE_CLASS_MAPPINGS = {
+    "VLLMOmniAudioToVideoDuration": VLLMOmniAudioToVideoDuration,
     # === Generation ===
     "VLLMOmniGenerateImage": VLLMOmniGenerateImage,
     "VLLMOmniGenerateVideo": VLLMOmniGenerateVideo,
@@ -61,6 +63,7 @@ NODE_CLASS_MAPPINGS = {
 
 # A dictionary that contains the friendly/humanly readable titles for the nodes
 NODE_DISPLAY_NAME_MAPPINGS = {
+    "VLLMOmniAudioToVideoDuration": "Audio to Video Duration",
     # === Generation ===
     "VLLMOmniGenerateImage": "Generate Image",
     "VLLMOmniGenerateVideo": "Generate Video",

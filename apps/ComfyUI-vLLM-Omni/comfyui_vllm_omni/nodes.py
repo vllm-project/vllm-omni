@@ -2,12 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import math
+from fractions import Fraction
 from typing import Literal
 
 import torch
 from comfy_api.input import AudioInput, VideoInput
 
 from .utils.api_client import VLLMOmniClient
+from .utils.audio_timing import fit_audio_to_length
 from .utils.latent_mask import _align_frame_count
 from .utils.logger import get_logger
 from .utils.models import lookup_model_spec
@@ -38,6 +40,39 @@ FASTH3_FPS = 24
 # A FastH3 deployment may expose H3 under any --served-model-name, so the payload
 # spec has to be named outright rather than recovered from that alias.
 FASTH3_SPEC_MODEL = "MiniMax-H3"
+
+
+class VLLMOmniAudioToVideoDuration:
+    CATEGORY = "vLLM-Omni/media"
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "video": (
+                    "VIDEO",
+                    {"tooltip": "Constant-frame-rate video whose frame count/rate define the duration."},
+                ),
+                "audio": ("AUDIO",),
+                "short_audio": (
+                    ["loop", "pad", "trim"],
+                    {"default": "loop", "tooltip": "Loop to fill, pad with silence, or leave short audio unchanged."},
+                ),
+            }
+        }
+
+    RETURN_TYPES = ("AUDIO",)
+    RETURN_NAMES = ("audio",)
+    FUNCTION = "fit"
+
+    def fit(
+        self, video: VideoInput, audio: AudioInput, short_audio: Literal["trim", "loop", "pad"]
+    ) -> tuple[AudioInput]:
+        # 使用视频的有理数帧率，避免 30000/1001 等帧率先转 float。
+        target_samples = math.ceil(Fraction(video.get_frame_count() * audio["sample_rate"]) / video.get_frame_rate())
+        waveform = fit_audio_to_length(audio["waveform"], target_samples, short_audio)
+        fitted: AudioInput = {"waveform": waveform, "sample_rate": audio["sample_rate"]}
+        return (fitted,)
 
 
 def _resolve_fast_h3_deployment(deployment: dict) -> tuple[str, str]:

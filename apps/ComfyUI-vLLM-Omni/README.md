@@ -334,6 +334,16 @@ Save Audio previews and saves the result.
   </picture>
 </p>
 
+### Media handoff for generated or restored video
+
+The **vLLM-Omni Media Handoff** template preserves, replaces, mixes, or loops
+a supplied soundtrack to the video's duration. **Audio to Video Duration**
+also supports padding with silence and leaving short audio unchanged, while
+preserving the supplied sample rate and channels. Soundtrack overrides reuse
+encoded video through the standard Concatenate Video node, preserving frame
+timing without rebuilding RGB frames. See [media handoff](docs/media-handoff.md) for the
+audio-length rules, remote-service wiring and validation.
+
 ### Chaining multiple model services
 
 (Also available at **ComfyUI sidebar->Template->vLLM-Omni->vLLM-Omni Chaining Services**)

@@ -1,0 +1,658 @@
+{
+  "last_node_id": 13,
+  "last_link_id": 27,
+  "nodes": [
+    {
+      "id": 1,
+      "type": "LoadVideo",
+      "title": "H3 or restored video",
+      "pos": [
+        40,
+        130
+      ],
+      "size": [
+        280,
+        170
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "VIDEO",
+          "type": "VIDEO",
+          "links": [
+            13,
+            14,
+            18,
+            25,
+            26,
+            27
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "LoadVideo"
+      },
+      "widgets_values": [
+        "h3_source.mp4"
+      ]
+    },
+    {
+      "id": 2,
+      "type": "LoadAudio",
+      "title": "External soundtrack (or generated AUDIO)",
+      "pos": [
+        40,
+        420
+      ],
+      "size": [
+        280,
+        170
+      ],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "AUDIO",
+          "type": "AUDIO",
+          "links": [
+            15,
+            16,
+            19
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "LoadAudio"
+      },
+      "widgets_values": [
+        "soundtrack.wav"
+      ]
+    },
+    {
+      "id": 3,
+      "type": "GetVideoComponents",
+      "title": "Extract original audio for mixing",
+      "pos": [
+        400,
+        150
+      ],
+      "size": [
+        280,
+        170
+      ],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "video",
+          "type": "VIDEO",
+          "link": 13
+        }
+      ],
+      "outputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "links": []
+        },
+        {
+          "name": "audio",
+          "type": "AUDIO",
+          "links": [
+            17
+          ]
+        },
+        {
+          "name": "fps",
+          "type": "FLOAT",
+          "links": []
+        },
+        {
+          "name": "bit_depth",
+          "type": "COMBO",
+          "links": []
+        },
+        {
+          "name": "color_space",
+          "type": "COMBO",
+          "links": []
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "GetVideoComponents"
+      },
+      "widgets_values": []
+    },
+    {
+      "id": 4,
+      "type": "SaveVideo",
+      "title": "1. Keep the source audio",
+      "pos": [
+        1330,
+        40
+      ],
+      "size": [
+        280,
+        170
+      ],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "video",
+          "type": "VIDEO",
+          "link": 14
+        }
+      ],
+      "outputs": [
+        {
+          "name": "video",
+          "type": "VIDEO",
+          "links": []
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "SaveVideo"
+      },
+      "widgets_values": [
+        "CUI03/preserve",
+        "mp4",
+        "auto"
+      ]
+    },
+    {
+      "id": 5,
+      "type": "VLLMOmniAudioToVideoDuration",
+      "title": "Fit soundtrack to video duration",
+      "pos": [
+        600,
+        900
+      ],
+      "size": [
+        280,
+        170
+      ],
+      "flags": {},
+      "order": 4,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "video",
+          "type": "VIDEO",
+          "link": 18
+        },
+        {
+          "name": "audio",
+          "type": "AUDIO",
+          "link": 19
+        }
+      ],
+      "outputs": [
+        {
+          "name": "AUDIO",
+          "type": "AUDIO",
+          "links": [
+            21
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VLLMOmniAudioToVideoDuration"
+      },
+      "widgets_values": [
+        "loop"
+      ]
+    },
+    {
+      "id": 6,
+      "type": "MarkdownNote",
+      "title": "Media handoff",
+      "pos": [
+        40,
+        730
+      ],
+      "size": [
+        490,
+        410
+      ],
+      "flags": {},
+      "order": 5,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "properties": {
+        "Node name for S&R": "MarkdownNote"
+      },
+      "widgets_values": [
+        "Single CFR clip: preserve, replace, mix, or loop supplied audio. Concatenate Video uses one VIDEO and complete_audio to replace the soundtrack. Encoded file inputs retain the video stream; tensor VIDEO inputs require encoding. Keep codec auto in Concatenate Video and Save Video. Loop/pad/trim are selected in Audio to Video Duration."
+      ]
+    },
+    {
+      "id": 7,
+      "type": "ConcatenateVideo",
+      "title": "Replace audio / retain encoded video",
+      "pos": [
+        980,
+        330
+      ],
+      "size": [
+        280,
+        170
+      ],
+      "flags": {},
+      "order": 6,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "videos.video0",
+          "type": "VIDEO",
+          "link": 25
+        },
+        {
+          "name": "complete_audio",
+          "type": "AUDIO",
+          "link": 15
+        }
+      ],
+      "outputs": [
+        {
+          "name": "VIDEO",
+          "type": "VIDEO",
+          "links": [
+            22
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "ConcatenateVideo"
+      },
+      "widgets_values": [
+        "auto"
+      ]
+    },
+    {
+      "id": 8,
+      "type": "SaveVideo",
+      "title": "Save replacement",
+      "pos": [
+        1330,
+        330
+      ],
+      "size": [
+        280,
+        170
+      ],
+      "flags": {},
+      "order": 7,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "video",
+          "type": "VIDEO",
+          "link": 22
+        }
+      ],
+      "outputs": [
+        {
+          "name": "video",
+          "type": "VIDEO",
+          "links": []
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "SaveVideo"
+      },
+      "widgets_values": [
+        "CUI03/replace",
+        "mp4",
+        "auto"
+      ]
+    },
+    {
+      "id": 9,
+      "type": "AudioMerge",
+      "title": "3. Mix: mean of both tracks",
+      "pos": [
+        650,
+        610
+      ],
+      "size": [
+        280,
+        170
+      ],
+      "flags": {},
+      "order": 8,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "audio1",
+          "type": "AUDIO",
+          "link": 17
+        },
+        {
+          "name": "audio2",
+          "type": "AUDIO",
+          "link": 16
+        }
+      ],
+      "outputs": [
+        {
+          "name": "AUDIO",
+          "type": "AUDIO",
+          "links": [
+            20
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "AudioMerge"
+      },
+      "widgets_values": [
+        "mean"
+      ]
+    },
+    {
+      "id": 10,
+      "type": "ConcatenateVideo",
+      "title": "Mix audio / retain encoded video",
+      "pos": [
+        980,
+        620
+      ],
+      "size": [
+        280,
+        170
+      ],
+      "flags": {},
+      "order": 9,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "videos.video0",
+          "type": "VIDEO",
+          "link": 26
+        },
+        {
+          "name": "complete_audio",
+          "type": "AUDIO",
+          "link": 20
+        }
+      ],
+      "outputs": [
+        {
+          "name": "VIDEO",
+          "type": "VIDEO",
+          "links": [
+            23
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "ConcatenateVideo"
+      },
+      "widgets_values": [
+        "auto"
+      ]
+    },
+    {
+      "id": 11,
+      "type": "SaveVideo",
+      "title": "Save mixture",
+      "pos": [
+        1330,
+        620
+      ],
+      "size": [
+        280,
+        170
+      ],
+      "flags": {},
+      "order": 10,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "video",
+          "type": "VIDEO",
+          "link": 23
+        }
+      ],
+      "outputs": [
+        {
+          "name": "video",
+          "type": "VIDEO",
+          "links": []
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "SaveVideo"
+      },
+      "widgets_values": [
+        "CUI03/mix",
+        "mp4",
+        "auto"
+      ]
+    },
+    {
+      "id": 13,
+      "type": "ConcatenateVideo",
+      "title": "Loop audio / retain encoded video",
+      "pos": [
+        980,
+        910
+      ],
+      "size": [
+        280,
+        170
+      ],
+      "flags": {},
+      "order": 12,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "videos.video0",
+          "type": "VIDEO",
+          "link": 27
+        },
+        {
+          "name": "complete_audio",
+          "type": "AUDIO",
+          "link": 21
+        }
+      ],
+      "outputs": [
+        {
+          "name": "VIDEO",
+          "type": "VIDEO",
+          "links": [
+            24
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "ConcatenateVideo"
+      },
+      "widgets_values": [
+        "auto"
+      ]
+    },
+    {
+      "id": 12,
+      "type": "SaveVideo",
+      "title": "Save looped soundtrack",
+      "pos": [
+        1330,
+        910
+      ],
+      "size": [
+        280,
+        170
+      ],
+      "flags": {},
+      "order": 11,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "video",
+          "type": "VIDEO",
+          "link": 24
+        }
+      ],
+      "outputs": [
+        {
+          "name": "video",
+          "type": "VIDEO",
+          "links": []
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "SaveVideo"
+      },
+      "widgets_values": [
+        "CUI03/loop",
+        "mp4",
+        "auto"
+      ]
+    }
+  ],
+  "links": [
+    [
+      13,
+      1,
+      0,
+      3,
+      0,
+      "VIDEO"
+    ],
+    [
+      14,
+      1,
+      0,
+      4,
+      0,
+      "VIDEO"
+    ],
+    [
+      15,
+      2,
+      0,
+      7,
+      1,
+      "AUDIO"
+    ],
+    [
+      16,
+      2,
+      0,
+      9,
+      1,
+      "AUDIO"
+    ],
+    [
+      17,
+      3,
+      1,
+      9,
+      0,
+      "AUDIO"
+    ],
+    [
+      18,
+      1,
+      0,
+      5,
+      0,
+      "VIDEO"
+    ],
+    [
+      19,
+      2,
+      0,
+      5,
+      1,
+      "AUDIO"
+    ],
+    [
+      20,
+      9,
+      0,
+      10,
+      1,
+      "AUDIO"
+    ],
+    [
+      21,
+      5,
+      0,
+      13,
+      1,
+      "AUDIO"
+    ],
+    [
+      22,
+      7,
+      0,
+      8,
+      0,
+      "VIDEO"
+    ],
+    [
+      23,
+      10,
+      0,
+      11,
+      0,
+      "VIDEO"
+    ],
+    [
+      24,
+      13,
+      0,
+      12,
+      0,
+      "VIDEO"
+    ],
+    [
+      25,
+      1,
+      0,
+      7,
+      0,
+      "VIDEO"
+    ],
+    [
+      26,
+      1,
+      0,
+      10,
+      0,
+      "VIDEO"
+    ],
+    [
+      27,
+      1,
+      0,
+      13,
+      0,
+      "VIDEO"
+    ]
+  ],
+  "groups": [],
+  "config": {},
+  "extra": {
+    "ds": {
+      "scale": 0.75,
+      "offset": [
+        20,
+        20
+      ]
+    }
+  },
+  "version": 0.4
+}
