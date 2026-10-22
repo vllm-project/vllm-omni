@@ -983,6 +983,7 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         """XPU flash attention implementation."""
         from vllm_omni.diffusion.attention.backends.utils.fa import (
             HAS_FLASH_ATTN,
+            flash_attn_varlen_func,
         )
 
         if not HAS_FLASH_ATTN:
@@ -990,6 +991,18 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
                 "FlashAttentionBackend requires Flash Attention. "
                 "Please assure vllm-xpu-kernels properly installed. "
                 "Otherwise, use SDPA backend by setting DIFFUSION_ATTENTION_BACKEND=TORCH_SDPA"
+            )
+
+        # Spans take precedence over attn_mask, matching forward_cuda.
+        if attn_metadata is not None and attn_metadata.full_attn_spans is not None:
+            return piecewise_attn(
+                query,
+                key,
+                value,
+                attn_metadata.full_attn_spans,
+                self.softmax_scale,
+                partial(FlashAttentionImpl._flash_varlen_wrapper, attn_func=flash_attn_varlen_func),
+                query_ranges=attn_metadata.query_ranges,
             )
 
         attention_mask = attn_metadata.attn_mask if attn_metadata is not None else None

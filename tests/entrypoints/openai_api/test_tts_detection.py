@@ -162,6 +162,7 @@ _PIPELINE_STAGES = [
     "llm",
     "minimax_music3_ar",
     "ming_tts",
+    "ming3_tts",
     "moss_tts",
     "moss_tts_codec",
     "moss_tts_local",

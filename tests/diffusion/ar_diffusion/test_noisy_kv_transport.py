@@ -46,7 +46,7 @@ def _transfer_worker(rank: int, chunk_tokens: int, init_method: str, device_kind
         CellSchedule(
             chunks=3,
             num_denoise_steps=1,
-            stages=2,
+            step_replicas=2,
             layer_groups=1,
             ordering=Ordering.LATEST_KV,
             kv_history_chunks=2,

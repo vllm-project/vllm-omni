@@ -449,7 +449,7 @@ class NoisyKVCache:
         device: torch.device,
         layer_groups: int,
         max_batch_size: int,
-        stages: int = 1,
+        step_replicas: int = 1,
         gpu_memory_fraction: float = 1.0,
         available_bytes: int | None = None,
         layer_offset: int = 0,
@@ -463,7 +463,7 @@ class NoisyKVCache:
         self.blocks_per_rank = max(1, blocks_per_rank)
         chunk_blocks = spec.max_chunk_tokens // spec.block_size
         # Per-layer residency ~ H+2+G; capacity is per layer.
-        per_req = max(spec.max_history_chunks + 2 + layer_groups, spec.max_history_chunks + stages)
+        per_req = max(spec.max_history_chunks + 2 + layer_groups, spec.max_history_chunks + step_replicas)
         desired = self.max_batch_size * per_req
         bytes_per_version = (
             2

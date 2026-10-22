@@ -6,6 +6,8 @@ Pure-Python registry/resolution logic; no model or GPU resources are loaded.
 """
 
 import asyncio
+import base64
+import json
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
@@ -43,6 +45,7 @@ from vllm_omni.entrypoints.openai.tts_adapters.indextts2 import (
     IndexTTS25Adapter,
     indextts2_conditioning_cache_salt,
 )
+from vllm_omni.entrypoints.openai.tts_adapters.ming3_audio_tts import Ming3AudioTTSAdapter
 from vllm_omni.entrypoints.openai.tts_adapters.ming3_tts import Ming3TTSAdapter
 from vllm_omni.entrypoints.openai.tts_adapters.ming_flash_omni_tts import MingFlashOmniTTSAdapter
 from vllm_omni.entrypoints.openai.tts_adapters.moss_tts import (
@@ -63,6 +66,7 @@ from vllm_omni.model_executor.models.indextts2 import prompt_utils
 from vllm_omni.model_executor.models.indextts2.tokenizer_v2_5 import (
     INDEXTTS25_TOKENIZER_FILE,
 )
+from vllm_omni.model_executor.models.ming_flash_omni.reference_audio import unpack_reference_audio
 from vllm_omni.model_executor.stage_input_processors.auk import encoder2dit
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -828,10 +832,12 @@ def test_covo_audio_build_constructs_tokenized_prompt():
     assert prepared.model_type == "covo_audio"
 
 
-def test_ming_flash_omni_build_constructs_prepared_request():
+@pytest.mark.parametrize("voice", [None, "DB30"])
+def test_ming_flash_omni_build_constructs_prepared_request(voice):
     server = SimpleNamespace(uploaded_speakers={})
     adapter = MingFlashOmniTTSAdapter(SimpleNamespace(server=server, engine_client=SimpleNamespace()))
-    request = OpenAICreateSpeechRequest(input="hello", voice="test")
+    request = OpenAICreateSpeechRequest(input="hello", voice=voice)
+    assert adapter.validate(request) is None
 
     prepared = asyncio.run(adapter.build(request, [], False))
 
@@ -839,8 +845,75 @@ def test_ming_flash_omni_build_constructs_prepared_request():
     info = prepared.prompt["additional_information"]
     assert info["ming_task"] == "instruct"
     assert info["text"] == "hello"
-    assert info["voice_name"] == "test"
+    assert info["voice_name"] == voice
+    assert json.loads(info["instruction"])["audio_sequence"][0]["IP"] is None
+    assert "speaker_conditioning" not in info
+    assert "prompt_audio_mode" not in info
     assert prepared.model_type == "ming_flash_omni_tts"
+
+
+def test_ming3_build_passes_base64_reference_audio():
+    class FakeServer:
+        uploaded_speakers = {}
+
+        async def _resolve_ref_audio_array(self, uri):
+            self.uri = uri
+            return [0.1, -0.1], 16000, "cache-key"
+
+    server = FakeServer()
+    adapter = Ming3AudioTTSAdapter(SimpleNamespace(server=server, engine_client=SimpleNamespace()))
+    encoded = base64.b64encode(b"RIFFfakeWAVE").decode()
+    request = OpenAICreateSpeechRequest(input="hello", ref_audio=encoded)
+
+    assert adapter.validate(request) is None
+    prepared = asyncio.run(adapter.build(request, [], True))
+
+    assert server.uri == f"data:audio/wav;base64,{encoded}"
+    info = prepared.prompt["additional_information"]
+    reference = unpack_reference_audio(info)[0]
+    assert reference["sample_rate"] == 16000
+    assert reference["samples"].tolist() == pytest.approx([0.1, -0.1])
+    assert info["speaker_conditioning"] == "prompt"
+    assert info["prompt_audio_mode"] == "speaker_only"
+    assert info["instruction"] is None
+
+
+@pytest.mark.parametrize(
+    "count,samples,fetches", [(17, [0.1], 0), (2, [float("nan")], 1)], ids=["too-many-clips", "invalid-first-clip"]
+)
+def test_ming3_build_rejects_invalid_references_before_further_io(mocker, count, samples, fetches):
+    resolve = mocker.AsyncMock(return_value=(samples, 16000, "cache-key"))
+    adapter = Ming3AudioTTSAdapter(SpeechServingContext(server=SimpleNamespace(_resolve_ref_audio_array=resolve)))
+    request = OpenAICreateSpeechRequest(input="hello", ref_audio=["AA=="] * count)
+
+    with pytest.raises(ValueError, match="Reference audio"):
+        asyncio.run(adapter.build(request, [], True))
+
+    assert resolve.await_count == fetches
+
+
+def test_ming3_rejects_mixed_ip_and_reference():
+    adapter = Ming3AudioTTSAdapter(SimpleNamespace(server=SimpleNamespace(), engine_client=SimpleNamespace()))
+    request = OpenAICreateSpeechRequest(input="hello", voice="灵小柔", ref_audio="data:audio/wav;base64,AA==")
+    assert "either" in adapter.validate(request)
+
+
+def test_ming2_rejects_new_reference_api():
+    adapter = MingFlashOmniTTSAdapter(SpeechServingContext(server=SimpleNamespace()))
+    request = OpenAICreateSpeechRequest(input="hello", ref_audio="data:audio/wav;base64,AA==")
+    assert "not yet supported" in adapter.validate(request)
+
+
+def test_ming3_tts_does_not_reinterpret_ip_voice_as_ming2_preset():
+    adapter = Ming3AudioTTSAdapter(SpeechServingContext(server=SimpleNamespace(uploaded_speakers={})))
+    request = OpenAICreateSpeechRequest(input="hello", voice="TEST_VOICE_A")
+    assert adapter.validate(request) is None
+    prepared = asyncio.run(adapter.build(request, [], False))
+    info = prepared.prompt["additional_information"]
+    assert info["voice_name"] is None
+    assert json.loads(info["instruction"])["audio_sequence"][0]["IP"] == "TEST_VOICE_A"
+    assert info["speaker_conditioning"] == "mute"
+    assert prepared.model_type == "ming3_audio_tts"
 
 
 def test_step_audio2_build_constructs_open_assistant_turn():
@@ -1447,3 +1520,16 @@ def test_registered_voice_salt_preserves_resolved_conditioning(key):
     first = conditioning_cache_salt(request, {key: "a"}, registered_voice=("speaker", 123))
     second = conditioning_cache_salt(request, {key: "b"}, registered_voice=("speaker", 123))
     assert first != second
+
+
+def test_ming3_tts_defaults_to_ip_voice_without_reference():
+    adapter = Ming3AudioTTSAdapter(SpeechServingContext(server=SimpleNamespace(uploaded_speakers={})))
+    request = OpenAICreateSpeechRequest(input="hello")
+    assert adapter.validate(request) is None
+    assert request.voice == "灵小柔"
+    prepared = asyncio.run(adapter.build(request, [], False))
+    info = prepared.prompt["additional_information"]
+    assert json.loads(info["instruction"])["audio_sequence"][0]["IP"] == "灵小柔"
+    assert info["prompt_audio_mode"] == "none"
+    assert info["speaker_conditioning"] == "mute"
+    assert "reference_audio" not in info

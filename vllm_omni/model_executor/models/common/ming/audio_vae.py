@@ -69,8 +69,15 @@ class StreamingLinearUpsample(nn.Module):
         super().__init__()
         self.scale_factor = scale_factor
         self.upsampler = nn.Upsample(scale_factor=scale_factor, mode="linear", align_corners=False)
+        # When set, a multi-frame chunk holds back only its last frame (the
+        # lookahead the interpolation needs) instead of the whole chunk, so
+        # decoding a chunk in one call emits the same samples, as early, as
+        # decoding it one frame per call.
+        self.frame_holdback = False
 
     def forward(self, x, state=None, is_last=False):
+        if self.frame_holdback:
+            return self._forward_frame_holdback(x, state, is_last)
         if x is None and is_last and (state is None or state.get("prev_chunk") is None):
             raise ValueError("Received end-of-stream without any latent chunk to upsample.")
         if state is None:
@@ -121,6 +128,33 @@ class StreamingLinearUpsample(nn.Module):
 
         final_out = torch.cat(output_chunks, dim=1) if output_chunks else None
         return final_out, state
+
+    def _forward_frame_holdback(self, x, state, is_last):
+        # x and the state frames are [Batch, Time, Dimension]. Linear
+        # interpolation of a frame reads only its two neighbours, so emitting
+        # every pending frame except the last one (plus one frame of left
+        # context) reproduces the per-frame streaming output.
+        held = None if state is None else state["held"]
+        left = None if state is None else state["left"]
+        if x is None:
+            if not is_last:
+                return None, state
+            if held is None:
+                raise ValueError("Received end-of-stream without any latent chunk to upsample.")
+            pending = held
+        else:
+            pending = x if held is None else torch.cat([held, x], dim=1)
+        if not is_last and pending.size(1) < 2:
+            return None, {"held": pending, "left": left}
+
+        emit = pending if is_last else pending[:, :-1]
+        inp = pending if left is None else torch.cat([left, pending], dim=1)
+        up = self.upsampler(inp.transpose(1, 2))
+        start = 0 if left is None else self.scale_factor
+        out = up[:, :, start : start + emit.size(1) * self.scale_factor].transpose(1, 2)
+        if is_last:
+            return out, None
+        return out, {"held": pending[:, -1:], "left": emit[:, -1:]}
 
 
 class Encoder(nn.Module):

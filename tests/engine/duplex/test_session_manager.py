@@ -735,8 +735,9 @@ async def test_append_audio_is_backpressured_by_pending_input_bytes() -> None:
         assert events[0].related_event_id == "evt-over"
         assert events[0].epoch == 0
         assert [command.event_id for command in submitted] == ["evt-fits"]
-        # Admission reserved the wire size of the admitted append; the runner
-        # released it on dequeue and re-reserved the decoded size (2 bytes).
+        # Admission charged the admitted append's wire size as queued bytes;
+        # this harness never runs the runner, so pending is the pre-reserved 6
+        # plus that 2-byte charge.
         assert session.pending_input_bytes == 8
 
 
@@ -1122,7 +1123,7 @@ async def test_close_of_a_forgotten_session_is_idempotent() -> None:
         assert result.ok is True
 
 
-async def test_append_bytes_are_reserved_at_admission_until_the_runner_dequeues() -> None:
+async def test_append_bytes_are_reserved_at_admission_until_the_pcm_handoff() -> None:
     async with Harness.create(max_sessions=1, max_pending_input_bytes_per_session=8) as harness:
         await harness.open("sid-bytes")
         await harness.events()

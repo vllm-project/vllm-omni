@@ -729,6 +729,31 @@ def test_piecewise_flash_attn_uses_varlen_fallback(monkeypatch):
 
 
 @pytest.mark.cpu
+def test_xpu_piecewise_spans_ignore_4d_mask(monkeypatch):
+    """XPU must honor full_attn_spans instead of feeding a 4D mask to the 2D-only varlen-masked path."""
+    calls = []
+
+    def fake_varlen_func(q, k, v, **kwargs):
+        calls.append((kwargs["max_seqlen_q"], kwargs["max_seqlen_k"], kwargs["causal"]))
+        return q
+
+    monkeypatch.setattr(fa, "HAS_FLASH_ATTN", True)
+    monkeypatch.setattr(fa, "flash_attn_varlen_func", fake_varlen_func)
+
+    impl = FlashAttentionImpl(num_heads=2, head_size=4, softmax_scale=0.5, causal=False)
+    query = torch.randn(1, 6, 2, 4)
+    metadata = AttentionMetadata(
+        attn_mask=torch.ones((1, 1, 6, 6), dtype=torch.bool).tril(),
+        full_attn_spans=[[(2, 4)]],
+    )
+
+    output = impl.forward_xpu(query, query, query, metadata)
+
+    assert output.shape == query.shape
+    assert calls == [(2, 2, True), (2, 4, False), (2, 6, True)]
+
+
+@pytest.mark.cpu
 def test_packed_varlen_metadata_bypasses_mask_unpadding(monkeypatch):
     calls = []
 

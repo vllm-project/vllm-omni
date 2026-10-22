@@ -250,6 +250,8 @@ class _SlotRef:
     reserved_version: torch.Tensor | None = None
     # Copy-on-write rescue: slot's committed rows for pending reads.
     preserved: dict[int, torch.Tensor] = field(default_factory=dict)
+    # Slots never written at plan time; their pool rows are unset storage.
+    absent: torch.Tensor | None = None
 
 
 @dataclass(kw_only=True)
@@ -466,8 +468,8 @@ class OmniPrefixCacheManager:
         """Handle one immutable adapter-produced step.
 
         Engine thread only; before _update_states removes finished
-        requests; exactly once per real step. Registers new-request prefix
-        hits (copying their block tables) and forces finished/aborted
+        requests. Runners may skip this entry for pure decode steps. Registers
+        new-request prefix hits (copying their block tables) and forces finished/aborted
         requests' still-open writes onto the high-priority copy queue —
         a block hash that entered the batch must land in the cache,
         abort included. ``escalate`` (eager: the copy + pool write) runs
@@ -551,13 +553,14 @@ class OmniPrefixCacheManager:
         num_tokens_unpadded: int,
         num_tokens_padded: int,
         write_layout: PrefixCacheWriteLayout,
+        owned: bool = False,
     ) -> int:
         """Write this step's outputs into the cache; returns the step id.
 
         Engine thread only, after the forward and before materialize.
         Immediately-cached rows: one on-device clone, one whole-step
         device→host into the staging pool, then one JOIN_NEXT_STEP
-        write per request sharing that page, managed by the controller.
+        write for the step's requests, managed by the controller.
         Deferred rows stay on the device clone (JOIN_ON_FINISH); the
         committer copies them later. Leftover mm (this-step deferred rows
         + mm not written to the pool) is copied to CPU here so materialize
@@ -566,7 +569,8 @@ class OmniPrefixCacheManager:
         be consumed exactly once — by materialize() or discard_step().
         Every step id claims one staging slot (saves with only leftover mm
         included); a later save waits for a free slot and times out if
-        none return.
+        none return. ``owned`` inputs are fresh, unaliased storage the
+        caller hands over, so they are kept instead of cloned.
 
         The state lock never covers a blocking wait: the previous step's
         JOIN_NEXT_STEP wait, the clone build, the GPU-byte-budget reserve
@@ -615,6 +619,7 @@ class OmniPrefixCacheManager:
             mm_outputs,
             num_tokens_unpadded,
             num_tokens_padded,
+            owned=owned,
         )
 
         # Freeze on the compute stream before the controller launches copies.
@@ -738,6 +743,15 @@ class OmniPrefixCacheManager:
         finally:
             if ctx is not None and not step_released:
                 self._release_step_staging(ctx)
+
+    def reserve_device_bytes(self, nbytes: int) -> None:
+        """Charge device rows the runner holds for a later save (its decode
+        buffer) to the GPU-byte budget; may force pending copies first, so
+        it runs outside the state lock."""
+        self._controller.reserve_bytes(nbytes)
+
+    def release_device_bytes(self, nbytes: int) -> None:
+        self._controller.release_bytes(nbytes)
 
     @_locked
     def discard_step(self, step_id: int) -> None:
@@ -914,6 +928,8 @@ class OmniPrefixCacheManager:
         mm_outputs: dict[str, Any],
         num_tokens_unpadded: int,
         num_tokens_padded: int,
+        *,
+        owned: bool = False,
     ) -> _StepOutputs:
         """Split this step's outputs into immediate / deferred / leftover.
 
@@ -926,12 +942,15 @@ class OmniPrefixCacheManager:
         Lists and other shapes stay leftover.
         """
         n = num_tokens_unpadded
+        if owned and num_tokens_padded != n:
+            # Owned rows are the caller's whole batch; a padded tail means a live buffer.
+            raise OmniPrefixCacheUnmatchError(f"owned step outputs must be unpadded: {num_tokens_padded} rows for {n}")
         immediate: dict[str, torch.Tensor] = {}
         deferred_tensors: dict[str, torch.Tensor] = {}
         new_key_storage: dict[str, torch.Tensor] = {}
 
         def alloc_key(key: str, val: torch.Tensor) -> None:
-            # Pinned allocation, unlocked; installed under the lock at publish.
+            # Allocated unlocked; installed under the lock at publish.
             storage = self._pool.alloc_key(key, val.dtype, int(val.shape[-1]))
             if storage is not None:
                 new_key_storage[key] = storage
@@ -942,18 +961,18 @@ class OmniPrefixCacheManager:
                     rows = 0 if hidden_states.ndim < 2 else int(hidden_states.shape[0])
                     raise OmniPrefixCacheUnmatchError(f"hidden_states has {rows} rows, need {n}")
                 alloc_key(hk, hidden_states)
-                immediate[hk] = hidden_states[:n].clone()
+                immediate[hk] = hidden_states[:n] if owned else hidden_states[:n].clone()
             for key, val in mm_outputs.items():
                 is_step_rows = _is_step_token_tensor(val, n, num_tokens_padded)
                 if key in self._policy.deferred_keys:
                     if is_step_rows:
                         alloc_key(key, val)
-                        deferred_tensors[key] = val[:n].clone()
+                        deferred_tensors[key] = val[:n] if owned else val[:n].clone()
                     continue
                 if self._policy.skip_immediate_mm(key) or not is_step_rows:
                     continue
                 alloc_key(key, val)
-                immediate[key] = val[:n].clone()
+                immediate[key] = val[:n] if owned else val[:n].clone()
         leftover, leftover_event = _snapshot_leftover_mm_cpu(mm_outputs, set(immediate), n, num_tokens_padded)
         return _StepOutputs(
             immediate=immediate,
@@ -979,13 +998,17 @@ class OmniPrefixCacheManager:
         ):
             if not tensors:
                 continue
+            if schedule is WriteSchedule.JOIN_NEXT_STEP:
+                self._register_immediate_write(
+                    write_ctx, tuple(tensors.keys()), slots, req_order, query_start, num_sched
+                )
+                continue
             for req_id in req_order:
                 start = query_start[req_id]
                 end = start + num_sched[req_id]
                 if start == end:
                     continue
-                deferred = schedule is WriteSchedule.JOIN_ON_FINISH
-                handle = self._request_tasks.deferred.get(req_id) if deferred else None
+                handle = self._request_tasks.deferred.get(req_id)
                 if handle is None or not write_ctx.append(handle, start=start, end=end):
                     handle = write_ctx.register(
                         tid=self._request_tasks.alloc_tid(),
@@ -996,11 +1019,42 @@ class OmniPrefixCacheManager:
                         end=end,
                     )
                     self._request_tasks.track(req_id, handle.tid)
-                    if deferred:
-                        self._request_tasks.deferred[req_id] = handle
-                    else:
-                        self._join_next_step_tids.append(handle.tid)
+                    self._request_tasks.deferred[req_id] = handle
                 self._map_slots(slots[start:end], handle.tid, tensors.keys())
+
+    def _register_immediate_write(
+        self,
+        write_ctx: StepWriteContext,
+        keys: tuple[str, ...],
+        slots: torch.Tensor,
+        req_order: list[str],
+        query_start: dict[str, int],
+        num_sched: dict[str, int],
+    ) -> None:
+        """One immediate write for every request of the step.
+
+        A write per request costs a slot-table update and a pool scatter per
+        request on every step, which dominates decode batches.
+        """
+        written = [req_id for req_id in req_order if num_sched[req_id]]
+        if not written:
+            return
+        start = query_start[written[0]]
+        end = query_start[written[-1]] + num_sched[written[-1]]
+        if end - start != sum(num_sched[req_id] for req_id in written):
+            raise OmniPrefixCacheUnmatchError(f"step rows [{start}, {end}) are not one packed span")
+        handle = write_ctx.register(
+            tid=self._request_tasks.alloc_tid(),
+            req_id=written[0],
+            write_n=self._request_tasks.increment_write_n(written[0]),
+            schedule=WriteSchedule.JOIN_NEXT_STEP,
+            start=start,
+            end=end,
+        )
+        for req_id in written:
+            self._request_tasks.track(req_id, handle.tid)
+        self._join_next_step_tids.append(handle.tid)
+        self._map_slots(slots[start:end], handle.tid, keys)
 
     # ----------------------------------------------------- occupancy
 
@@ -1130,6 +1184,7 @@ class OmniPrefixCacheManager:
             n_abs = int((states == _Occupancy.ABSENT).sum())
             if n_abs or not has_source:
                 _raise_unreadable_hit(req_id, key, f"{n_abs} absent slots")
+        absent = states == _Occupancy.ABSENT
         ref = _SlotRef(
             slots=slots,
             key=key,
@@ -1138,6 +1193,7 @@ class OmniPrefixCacheManager:
             staged_list=staged,
             join_tids=join_tids,
             reserved_version=reserved_version,
+            absent=absent if bool(absent.any()) else None,
         )
         self._pending_reads.append(ref)
         return ref
@@ -1173,13 +1229,20 @@ class OmniPrefixCacheManager:
         finally:
             self._unregister_pending_read(src)
 
+    def _pool_rows(self, src: _SlotRef) -> torch.Tensor:
+        """Pool rows for ``src``; slots absent at plan time read as zeros."""
+        rows = self._pool.rows(src.key, src.slots)
+        if src.absent is not None:
+            rows[src.absent] = 0
+        return rows
+
     def _fetch_source_inner(self, src: _SlotRef) -> torch.Tensor:
         # For JOIN_NEXT_STEP, wait `done`, drain, read the pool
         if src.join_tids:
             self._controller.join(src.join_tids)
             with self._state_lock:
                 self._commit_drained_writes()
-            joined = self._apply_preserved_rows(src, self._pool.rows(src.key, src.slots))
+            joined = self._apply_preserved_rows(src, self._pool_rows(src))
             self._ensure_not_reassigned(
                 src.slots,
                 src.key,
@@ -1193,7 +1256,7 @@ class OmniPrefixCacheManager:
         n = int(src.slots.numel())
         out: torch.Tensor | None = None
         if src.already_staged:
-            out = self._pool.rows(src.key, src.slots)
+            out = self._pool_rows(src)
         in_transit = None
         for task, mask in src.staged_list:
             try:

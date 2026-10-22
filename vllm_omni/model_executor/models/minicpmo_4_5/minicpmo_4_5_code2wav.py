@@ -235,6 +235,30 @@ def _normalize_reference(
     return waveform, _REF_TARGET_SAMPLE_RATE
 
 
+def reference_campplus_fbank_frames(max_seconds: float) -> int:
+    """16 kHz CAM++ fbank length of one normalized reference window.
+
+    Prompt preparation resamples the fixed 24 kHz window to 16 kHz and runs
+    Kaldi fbank with a 25 ms window, a 10 ms shift, and ``snip_edges``. The
+    CPU-reference TensorRT profile must cover this length before serving.
+    """
+    import torchaudio.compliance.kaldi as kaldi
+    from vllm.multimodal.audio import AudioResampler
+
+    samples_24k = max(1, int(max_seconds * _REF_TARGET_SAMPLE_RATE))
+    waveform_16k = AudioResampler(target_sr=16000).resample(
+        torch.zeros(samples_24k, dtype=torch.float32).numpy(),
+        orig_sr=_REF_TARGET_SAMPLE_RATE,
+    )
+    features = kaldi.fbank(
+        torch.from_numpy(waveform_16k).unsqueeze(0),
+        num_mel_bins=80,
+        dither=0,
+        sample_frequency=16000,
+    )
+    return int(features.shape[0])
+
+
 def _codec_tensor(value: Any, fallback: torch.Tensor) -> torch.Tensor:
     # Codec ids arrive from the connector as host data. A pageable host copy
     # would block the host once per request per step; stage them pinned.
@@ -1565,6 +1589,34 @@ class MiniCPMO45Code2Wav(nn.Module):
         # consumed (CUDA for TensorRT, NPU for the device speaker embedding).
         device_spk = read_bool_flag(extra, "token2wav_device_spk", True)
         use_trt = read_bool_flag(extra, "token2wav_trt", False) or (os.environ.get("MINICPMO_TOKEN2WAV_TRT", "") == "1")
+        cpu_reference_spk = read_bool_flag(extra, "token2wav_spk_cpu_reference", False)
+        # The flag selects a CUDA speaker-only engine. Keep the previous path
+        # when it cannot apply, including explicit overrides that predate it:
+        # full DiT TensorRT and the CPU onnxruntime accuracy fallback.
+        if cpu_reference_spk and not current_omni_platform.is_cuda():
+            logger.info("MiniCPM-o Code2Wav: ignoring token2wav_spk_cpu_reference off CUDA")
+            cpu_reference_spk = False
+        elif cpu_reference_spk and use_trt:
+            logger.info(
+                "MiniCPM-o Code2Wav: ignoring token2wav_spk_cpu_reference because "
+                "token2wav_trt or MINICPMO_TOKEN2WAV_TRT selects full DiT TensorRT"
+            )
+            cpu_reference_spk = False
+        elif cpu_reference_spk and not device_spk:
+            logger.info(
+                "MiniCPM-o Code2Wav: ignoring token2wav_spk_cpu_reference because "
+                "token2wav_device_spk=false selects the CPU onnxruntime fallback"
+            )
+            cpu_reference_spk = False
+        elif cpu_reference_spk:
+            try:
+                import tensorrt  # noqa: F401
+            except ImportError:
+                logger.warning(
+                    "MiniCPM-o Code2Wav: ignoring token2wav_spk_cpu_reference because "
+                    "tensorrt is not installed; using the Torch speaker"
+                )
+                cpu_reference_spk = False
         # TensorRT is CUDA-only; other platforms ignore the toggle.
         if use_trt and current_omni_platform.is_cuda():
             from vllm_omni.model_executor.models.step_audio2.step_audio2_dit_trt import build_dit_trt_stepper
@@ -1584,6 +1636,18 @@ class MiniCPMO45Code2Wav(nn.Module):
             logger.info("MiniCPM-o Code2Wav: DiT estimator running on TensorRT (%s)", dtype_name)
             token2wav.enable_trt_spk_embedding()
             logger.info("MiniCPM-o Code2Wav: campplus speaker embedding running on TensorRT")
+        elif cpu_reference_spk:
+            from vllm_omni.model_executor.models.cosyvoice3.speaker_embedding_trt import _MAX_T, _MIN_T
+
+            frames = reference_campplus_fbank_frames(self._ref_max_seconds)
+            if frames < _MIN_T or frames > _MAX_T:
+                raise ValueError(
+                    "token2wav_spk_cpu_reference supports CAM++ TensorRT profiles of "
+                    f"{_MIN_T}..{_MAX_T} fbank frames; ref_audio_max_seconds="
+                    f"{self._ref_max_seconds} produces {frames} frames"
+                )
+            token2wav.enable_trt_spk_embedding(cpu_reference=True)
+            logger.info("MiniCPM-o Code2Wav: CPU-reference campplus speaker embedding on TensorRT")
         elif current_omni_platform.is_cuda() or current_omni_platform.is_npu():
             # CAM++ speaker embedding on device via torch (weights loaded from
             # the same campplus.onnx) — replaces the per-request CPU
@@ -1598,6 +1662,9 @@ class MiniCPMO45Code2Wav(nn.Module):
                     "MiniCPM-o Code2Wav: campplus speaker embedding falling back to CPU onnxruntime "
                     "(token2wav_device_spk=false)"
                 )
+        if read_bool_flag(extra, "token2wav_spk_cuda_graph", False):
+            token2wav.enable_speaker_cuda_graph(self.vllm_config)
+            logger.info("MiniCPM-o Code2Wav: exact-shape Torch speaker CUDA graphs enabled")
         self.backend = BatchedToken2Wav(
             token2wav,
             trt_stepper=trt_stepper,
@@ -1609,6 +1676,7 @@ class MiniCPMO45Code2Wav(nn.Module):
             setup_cache_size=self._setup_cache_size,
             cfm_tf32=tf32_mode != "off",
             encoder_graph_config=self._encoder_graph_config,
+            cfm_float16=read_bool_flag(extra, "cfm_float16", False),
         )
         # Captured by the first forward (the warmup run): under vLLM's weight load a graph held GiBs.
         self._precapture_pending = read_bool_flag(extra, "cfm_graph_precapture", True)

@@ -34,6 +34,11 @@ classifiers = [
 
 [project.optional-dependencies]
 
+ming-tn = [
+    "pynini",
+    "inflect",
+]
+
 dev = [
     "pytest==9.1.1",
     "pytest-asyncio==1.4.0",
@@ -189,6 +194,7 @@ include = ["vllm_omni*"]
     "model_executor/models/step_audio2/assets/*.wav",
     "transformers_utils/chat_templates/*.jinja",
 ]
+"vllm_omni.model_executor.models.ming_flash_omni" = ["data/*.json", "LICENSE.Ming", "NOTICE"]
 
 [tool.setuptools_scm]
 # no extra settings needed, presence enables setuptools-scm

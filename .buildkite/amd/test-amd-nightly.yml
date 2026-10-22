@@ -514,6 +514,50 @@ steps:
             "$$STABLE_AUDIO_OFFLOAD_ARTIFACT_DIR/pytest-summary.txt"
 
 
+  - group: ":full_moon: HunyuanImage3 LoRA MI300 Nightly"
+    steps:
+      - label: "HunyuanImage3 LoRA Accuracy"
+        agent_pool: mi300_4
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 180
+        env:
+          HUNYUAN_IMAGE3_MODEL: "tencent/HunyuanImage-3.0-Instruct"
+          HUNYUAN_IMAGE3_DEVICES: "0,1,2,3"
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+        artifact_paths:
+          - artifacts/rocm-hunyuanimage3-lora/**/*
+        commands:
+          - export ROCM_HUNYUANIMAGE3_LORA_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-hunyuanimage3-lora"
+          - mkdir -p "$$ROCM_HUNYUANIMAGE3_LORA_ARTIFACT_DIR"
+          - |
+            node="tests/e2e/accuracy/test_hunyuan_image3_lora.py::test_hunyuan_image3_dit_lora_generation"
+            pytest --collect-only -q tests/e2e/accuracy/test_hunyuan_image3_lora.py \
+              -m "full_model and diffusion and rocm and MI325 and cards_4" --run-level full_model \
+              > "$$ROCM_HUNYUANIMAGE3_LORA_ARTIFACT_DIR/collection.txt"
+            count=$$(awk -v node="$$node" 'index($$0, node) { n++ } END { print n + 0 }' \
+              "$$ROCM_HUNYUANIMAGE3_LORA_ARTIFACT_DIR/collection.txt")
+            if [[ "$$count" != 1 ]]; then
+              echo "Expected exactly one HunyuanImage3 LoRA accuracy node, found $$count." >&2
+              cat "$$ROCM_HUNYUANIMAGE3_LORA_ARTIFACT_DIR/collection.txt" >&2
+              exit 5
+            fi
+          - |
+            set +e
+            timeout --signal=TERM --kill-after=2m 165m \
+              pytest -s -v tests/e2e/accuracy/test_hunyuan_image3_lora.py \
+              -m "full_model and diffusion and rocm and MI325 and cards_4" --run-level full_model \
+              --junitxml="$$ROCM_HUNYUANIMAGE3_LORA_ARTIFACT_DIR/pytest.xml" \
+              2>&1 | tee "$$ROCM_HUNYUANIMAGE3_LORA_ARTIFACT_DIR/pytest.log"
+            status=$${PIPESTATUS[0]}
+            set -e
+            if [[ -d tests/e2e/accuracy/artifacts ]]; then
+              mkdir -p "$$ROCM_HUNYUANIMAGE3_LORA_ARTIFACT_DIR/accuracy"
+              cp -a tests/e2e/accuracy/artifacts/. "$$ROCM_HUNYUANIMAGE3_LORA_ARTIFACT_DIR/accuracy/"
+            fi
+
+            exit "$$status"
+
   - group: ":full_moon: HunyuanVideo-1.5 Accuracy MI300 Nightly"
     steps:
       - label: "HunyuanVideo-1.5 Video Similarity"
