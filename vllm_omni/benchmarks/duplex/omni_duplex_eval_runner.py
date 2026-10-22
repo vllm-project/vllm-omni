@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pybase64 as base64
+from vllm.logger import init_logger
 
 from vllm_omni.benchmarks.duplex.omni_duplex_eval_dataset import DuplexSample
 from vllm_omni.benchmarks.duplex_session_inputs import (
@@ -64,8 +65,13 @@ DEFAULT_INSTRUCTIONS = "Streaming Omni Conversation."
 MIX_QUESTION = "question"
 MIX_SOUNDTRACK = "soundtrack"
 MIX_MODES = (MIX_QUESTION, MIX_SOUNDTRACK)
+logger = init_logger(__name__)
+
 _SERVER_TURN_SETTLE_S = 2.0
 _COMPLETION_SETTLE_S = 2.0
+# Bound the closing playback ack: it rides the session socket, so a stuck write
+# must not hold the sample open until the benchmark's per-request timeout.
+_FINAL_ACK_TIMEOUT_S = 20.0
 # Events that can still open or extend a response after the commit. Playback
 # acknowledgements are omitted: the runner sends one every 250 ms for any
 # response that produced audio, and the server echoes each one, so counting
@@ -425,6 +431,8 @@ async def generate_sample(
     response_done = False
     drain_timeout = None
     close_timeout = None
+    ack_timeout = None
+    input_committed = False
     stream_start: float | None = None
     async with client:
         await client.configure(
@@ -485,6 +493,7 @@ async def generate_sample(
                     response_done = client.events.count("response.done") > 0
                 else:
                     await client.commit()
+                    input_committed = True
                     await wait_for(
                         responses_finished,
                         timeout_s=max(20.0, prepared.duration + 20.0),
@@ -499,7 +508,16 @@ async def generate_sample(
                 await ack_task
             except asyncio.CancelledError:
                 pass
-        await client.acknowledge_playback()
+        try:
+            await asyncio.wait_for(client.acknowledge_playback(), timeout=_FINAL_ACK_TIMEOUT_S)
+        except TimeoutError as exc:
+            # The ack only checkpoints how much audio was played, and it is sent
+            # over the same socket the session already used: a stuck write must
+            # not cost the sample its artifacts (an unbounded wait here left the
+            # sample with no files at all, which the accuracy pass then counted
+            # as skipped rather than as a diagnosable failure).
+            ack_timeout = str(exc)
+            logger.warning("DuplexEval: playback ack not delivered for sample %s: %s", sample.id, exc)
         try:
             await client.close_session(timeout_s=20.0)
         except TimeoutError as exc:
@@ -521,8 +539,10 @@ async def generate_sample(
         "frame_transport": frame_transport,
         "instructions": instructions,
         "response_done": response_done,
+        "input_committed": input_committed,
         "drain_timeout": drain_timeout,
         "close_timeout": close_timeout,
+        "ack_timeout": ack_timeout,
         "ref_audio_sha256": prepared.ref_audio_sha256,
     }
     from vllm_omni.benchmarks.duplex_session_metrics import collect_duplex_session_metrics
