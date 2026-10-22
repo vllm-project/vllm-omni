@@ -1142,6 +1142,24 @@ async def test_session_update_rejected_speed_keeps_previous_value() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("model", [None, "test-model", "other-model"])
+async def test_session_update_ignores_model(model: str | None) -> None:
+    websocket = _FakeWebSocket()
+    connection, _ = _make_connection(websocket=websocket)
+
+    await connection._handle_session_update(
+        types.SessionUpdateEvent(
+            event_id="evt_model",
+            type="session.update",
+            session=types.RealtimeSessionCreateRequest.model_validate({"type": "realtime", "model": model}),
+        )
+    )
+
+    assert not [event for event in _websocket_events(websocket) if event["type"] == "error"]
+    assert connection.session.config.model == "test-model"
+
+
+@pytest.mark.asyncio
 async def test_session_update_rejects_mcp_tools() -> None:
     websocket = _FakeWebSocket()
     connection, _ = _make_connection(websocket=websocket)

@@ -306,7 +306,7 @@ class OpenAIFullDuplexConnection:
             )
             return
         try:
-            candidate_config = self._sanitize_session_config(candidate_config, s.config)
+            candidate_config = self._sanitize_session_config(candidate_config)
         except _RealtimeRequestError as exc:
             await self._send_error(
                 str(exc),
@@ -352,13 +352,12 @@ class OpenAIFullDuplexConnection:
     def _sanitize_session_config(
         self,
         config: types.RealtimeSessionCreateRequest,
-        previous: types.RealtimeSessionCreateRequest,
     ) -> types.RealtimeSessionCreateRequest:
         """Normalize supported session settings while keeping Pydantic models intact."""
         sanitized = config.model_copy(deep=True)
 
-        if sanitized.model != self.model_name:
-            sanitized.model = previous.model
+        # session.update cannot change model; like OpenAI, echo the connection's model.
+        sanitized.model = self.model_name
 
         self._reject_mcp(sanitized, prefix="session")
 
