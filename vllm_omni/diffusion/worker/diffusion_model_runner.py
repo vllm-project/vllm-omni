@@ -25,6 +25,7 @@ from vllm.logger import init_logger
 from vllm.utils.mem_utils import DeviceMemoryProfiler, GiB_bytes, format_gib
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 
+from vllm_omni.config.stage_config import resolve_diffusion_stage_role
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.attention.schedule import (
     AttentionSchedule,
@@ -32,6 +33,7 @@ from vllm_omni.diffusion.attention.schedule import (
     require_attention_schedule_pipeline,
     resolve_batch_attention_schedule,
     resolve_request_attention_schedule,
+    stage_runs_denoising,
 )
 from vllm_omni.diffusion.cache.cachedit import CacheDiTBackend, cache_summary
 from vllm_omni.diffusion.cache.prompt_embed_cache import (
@@ -484,10 +486,11 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         logger.info("Model runner: Initialization complete.")
 
     def _require_attention_schedule_pipeline(self, load_format: str) -> None:
-        """Fail startup, before any weight is loaded, when configured profiles target an unsupported model.
+        """Fail startup, before any weight is loaded, when configured profiles cannot apply to this stage.
 
         Only registered pipeline classes known to publish denoise progress on every denoise forward
-        are accepted; a custom pipeline is not.
+        are accepted; a custom pipeline is not. A stage that runs no denoising, such as the encode
+        stage of a disaggregated deployment, is also rejected: its schedule would never apply.
         """
         if getattr(self.od_config, "diffusion_attention_schedule", None) is None:
             return
@@ -497,6 +500,16 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
             registered = DiffusionModelRegistry.models.get(model_class_name)
             pipeline_class_name = registered.class_name if registered is not None else None
         require_attention_schedule_pipeline(pipeline_class_name, model_class_name)
+        role = resolve_diffusion_stage_role(
+            getattr(self.od_config, "stage_role", None), getattr(self.od_config, "model_stage", None)
+        ).value
+        if not stage_runs_denoising(model_class_name, role):
+            raise ValueError(
+                f"diffusion_attention_schedule is set on stage {self.od_config.stage_id} ({model_class_name}, "
+                f"role {role!r}), which runs no denoising. Configure the schedule only on the denoising stage; in a "
+                "disaggregated deployment, set it on that stage in the deploy YAML or with --stage-overrides, "
+                "not with the global --diffusion-attention-schedule flag."
+            )
 
     def _validate_service_attention_schedule(self) -> None:
         """Fail startup when configured profiles meet a cache backend.

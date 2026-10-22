@@ -88,13 +88,17 @@ that sets `dtype_qk` or `dtype_vo`.
 
 ## Stage configuration
 
-Set `diffusion_attention_schedule` on the diffusion stage in a deploy YAML,
+Set `diffusion_attention_schedule` on the denoising stage in a deploy YAML,
 using the same object as the server flag. Set its base configuration separately
-with `diffusion_attention_config`. In the bundled disaggregated H3 and
-HunyuanImage-3.0 deployments, the diffusion stage is `stage_id: 1`. The separate
-decode stage of `minimax_h3_disaggregated_decode` runs no denoising and ignores
-request schedules; configure the schedule on stage 1 only, not through the
-global flag.
+with `diffusion_attention_config`. In the bundled disaggregated H3,
+HunyuanImage-3.0 and Wan2.2 (`wan2_2_eg`, `wan2_2_egd`) deployments, the
+denoising stage is `stage_id: 1`. The Wan2.2 encode stage, the `wan2_2_egd`
+decode stage and the separate decode stage of `minimax_h3_disaggregated_decode`
+run no denoising and ignore request schedules. In `wan2_2_eg`, `wan2_2_egd`
+and `minimax_h3_disaggregated_decode`, configure the schedule on stage 1 only,
+in the deploy YAML or with `--stage-overrides`. The global flag also reaches
+the stages that run no denoising, and a schedule on such a stage fails at
+startup, before weights are loaded.
 
 CLI overrides deep-merge profile mappings into the stage configuration.
 A CLI `default` list replaces the stage list rather than appending ranges.
@@ -142,11 +146,15 @@ isolate packed requests; otherwise it runs one forward per request so each
 uses its own progress. A scheduled HunyuanImage-3.0 step batch always runs one
 transformer forward per request.
 
-Malformed or unknown-profile schedules return HTTP 400 before dispatch.
+Malformed schedules return HTTP 400 before dispatch. A request schedule that
+names a profile the denoising stage does not configure returns HTTP 400 when
+that stage admits the request, before denoising. In the disaggregated
+deployments above, this happens after stage 0 has finished: the H3 encoder,
+the HunyuanImage-3.0 AR stage or the Wan2.2 encode stage.
 A bounded range in the request's own schedule that ends after the sequence
 fails before denoising and retains the client error through
-the runner and multiprocess executor. Asynchronous `/v1/videos` reports these
-errors on the job record rather than the creation response.
+the runner and multiprocess executor. Asynchronous `/v1/videos` reports all of
+these errors on the job record rather than the creation response.
 
 ## Compatibility limits
 
