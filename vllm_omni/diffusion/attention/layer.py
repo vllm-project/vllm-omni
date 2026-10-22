@@ -1039,7 +1039,8 @@ class Attention(nn.Module):
             and query.is_cuda
             and query.dtype == torch.float32
             and query.ndim == 4
-            and self._selects_automatic_flash_attention(effective_impl, effective_backend, effective_spec)
+            and not self.backend_explicit
+            and cast(type[AttentionBackend], self.attn_backend).get_name() == "FLASH_ATTN"
             and (
                 attn_metadata is None
                 or (
@@ -1076,20 +1077,6 @@ class Attention(nn.Module):
             return cast(AttentionImpl, self.sdpa_fallback).forward(query, key, value, attn_metadata)
 
         return effective_impl.forward(query, key, value, attn_metadata)
-
-    def _selects_automatic_flash_attention(
-        self, impl: AttentionImpl | nn.Module, backend: type[AttentionBackend] | None, spec: "AttentionSpec | None"
-    ) -> bool:
-        """Whether the selected implementation is an automatic FLASH_ATTN choice.
-
-        The FP32 fallback applies only to that choice, so an explicit backend or an explicitly
-        selected candidate runs or raises.
-        """
-        if impl is self.attention:
-            explicit, backend = self.backend_explicit, self.attn_backend
-        else:
-            explicit = spec is not None
-        return not explicit and cast(type[AttentionBackend], backend).get_name() == "FLASH_ATTN"
 
     def add_schedule_candidate_check(self, check: Callable[[_PreparedCandidate], str | None]) -> None:
         """Register a model-owned requirement that startup validation applies to every candidate.
