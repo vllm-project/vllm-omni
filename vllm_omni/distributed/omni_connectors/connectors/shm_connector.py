@@ -195,14 +195,18 @@ class SharedMemoryConnector(OmniConnectorBase):
       the segment still exists;
     - a read that acquired the lock and then found the segment already
       gone — a read that never acquired the lock never touches it, and a
-      failed read with the segment still alive keeps it for retry;
+      failed read with the segment still alive keeps it for retry.  Both
+      read-path removals run before ``LOCK_UN`` and re-check the lock
+      file's ``(st_ino, st_dev)`` via ``_lock_is_ours``, so a lock file
+      recreated under the key by a later transfer is never deleted;
     - a key-based poll whose segment is missing, attempting to reclaim an
       aged orphan via ``_reclaim_orphan_lock_file`` (best-effort like every
       path);
-    - a ``put()`` whose ``shm_write_bytes`` raised — the trigger is the
-      raise, not a missing segment, and the branch does not roll back a
-      segment the write may already have created (lock removed while still
-      held, best-effort).  Serialization failures happen before this call
+    - a ``put()`` whose ``shm_write_bytes`` raised **and left no segment
+      under the key** — removal happens while the lock is still held;
+      a helper that raised *after* creating the segment keeps the lock,
+      so the half-written segment and its lock are reclaimed together by
+      a later path.  Serialization failures happen before this call
       opens or creates the lock file; failures after a successful write
       never enter this branch;
     - ``cleanup(key)``: attempts exact-key cleanup for the given key
