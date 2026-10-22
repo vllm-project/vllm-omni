@@ -9,7 +9,6 @@ The adapter delegates full pipeline execution to diffusers' ``__call__()``.
 It does NOT support:
 - CFG parallel (diffusers handles CFG via guidance_scale internally)
 - Sequence parallel (requires model-specific attention surgery)
-- TeaCache / Cache-DiT (requires hooking into transformer blocks)
 - Step-wise execution (continuous batching)
 """
 
@@ -20,9 +19,9 @@ from typing import Any, cast
 
 import torch
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline
-from torch import nn
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.models.base import DiffusionPipelineBase
 from vllm_omni.diffusion.models.diffusers_adapter.pipeline_utils import (
     BasePipelineUtils,
     get_pipeline_utils_for_config,
@@ -83,7 +82,7 @@ _DIFFUSERS_CONFIG_LOAD_KWARGS = {
 }
 
 
-class DiffusersAdapterPipeline(nn.Module, DiffusionPipelineProfilerMixin):
+class DiffusersAdapterPipeline(DiffusionPipelineBase, DiffusionPipelineProfilerMixin):
     """Black-box adapter that delegates full pipeline execution to a diffusers pipeline.
 
     Usage::
@@ -99,6 +98,11 @@ class DiffusersAdapterPipeline(nn.Module, DiffusionPipelineProfilerMixin):
 
     supports_request_batch = False
     supports_step_execution: bool = False
+    default_num_inference_steps = 50
+
+    _dit_modules: list[str] = []
+    _encoder_modules: list[str] = []
+    _vae_modules: list[str] = []
 
     def __init__(self, *, od_config: OmniDiffusionConfig, device: torch.device | None = None):
         super().__init__()
@@ -176,6 +180,22 @@ class DiffusersAdapterPipeline(nn.Module, DiffusionPipelineProfilerMixin):
 
         # Attention backend
         self._set_attention_backend()
+
+        # Discover transformer/encoder/VAE from the loaded HF pipeline so
+        # cache backends (CacheDiT, TeaCache, etc.) can find them.
+        self._discover_components()
+
+    def _discover_components(self) -> None:
+        pipe = self._pipeline
+        self._dit_modules = [
+            f"_pipeline.{attr}" for attr in ("transformer", "unet") if getattr(pipe, attr, None) is not None
+        ]
+        self._encoder_modules = [
+            f"_pipeline.{attr}"
+            for attr in ("text_encoder", "text_encoder_2", "text_encoder_3")
+            if getattr(pipe, attr, None) is not None
+        ]
+        self._vae_modules = [f"_pipeline.{attr}" for attr in ("vae",) if getattr(pipe, attr, None) is not None]
 
     def _load_pipeline_from_pretrained(
         self,

@@ -29,7 +29,6 @@ from diffusers.schedulers.scheduling_flow_match_euler_discrete import (
     FlowMatchEulerDiscreteScheduler,
 )
 from diffusers.utils.torch_utils import randn_tensor
-from torch import nn
 from transformers import Qwen2TokenizerFast, Qwen3Model
 from vllm.logger import init_logger
 from vllm.model_executor.models.utils import AutoWeightsLoader
@@ -39,7 +38,7 @@ from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
-from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
+from vllm_omni.diffusion.models.base import DiffusionPipelineBase
 from vllm_omni.diffusion.models.ovis_image.ovis_image_transformer import OvisImageTransformer2DModel
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
@@ -143,8 +142,9 @@ def retrieve_timesteps(
     return timesteps, num_inference_steps
 
 
-class OvisImagePipeline(nn.Module, CFGParallelMixin, DiffusionPipelineProfilerMixin, SupportsComponentDiscovery):
+class OvisImagePipeline(DiffusionPipelineBase, CFGParallelMixin, DiffusionPipelineProfilerMixin):
     supports_request_batch = False
+    default_num_inference_steps = 50
 
     _dit_modules: ClassVar[list[str]] = ["transformer"]
     _encoder_modules: ClassVar[list[str]] = ["text_encoder"]

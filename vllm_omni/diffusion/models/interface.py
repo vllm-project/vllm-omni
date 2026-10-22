@@ -162,6 +162,10 @@ class SupportsComponentDiscovery(Protocol):
     _resident_modules: ClassVar[list[str]] = []
 
 
+# Note: The concrete implementation is `DiffusionPipelineBase` in models/base.py.
+# All native pipelines should inherit from it. Related: RFC #2189.
+
+
 def supports_step_execution(pipeline: object) -> bool:
     """Return whether `pipeline` implements :class:`SupportsStepExecution`."""
 

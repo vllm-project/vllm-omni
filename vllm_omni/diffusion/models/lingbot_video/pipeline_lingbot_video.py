@@ -15,15 +15,12 @@ import torch.distributed as dist
 from diffusers import AutoencoderKLWan
 from diffusers.utils.torch_utils import randn_tensor
 from PIL import Image
-from torch import nn
 from transformers import Qwen3VLForConditionalGeneration, Qwen3VLProcessor
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
-from vllm_omni.diffusion.models.interface import (
-    SupportImageInput,
-    SupportsComponentDiscovery,
-)
+from vllm_omni.diffusion.models.base import DiffusionPipelineBase
+from vllm_omni.diffusion.models.interface import SupportImageInput
 from vllm_omni.diffusion.models.lingbot_video.image_condition import (
     LingBotImageCondition,
     apply_clean_prefix,
@@ -303,10 +300,9 @@ def get_lingbot_video_post_process_func(od_config: OmniDiffusionConfig):
 
 
 class LingBotVideoPipeline(
-    nn.Module,
+    DiffusionPipelineBase,
     SupportImageInput,
     ProgressBarMixin,
-    SupportsComponentDiscovery,
     DiffusionPipelineProfilerMixin,
 ):
     """Native vLLM-Omni entry for LingBot-Video checkpoints.
@@ -317,6 +313,7 @@ class LingBotVideoPipeline(
     primary transformer; it does not enable automatic refiner orchestration.
     """
 
+    default_num_inference_steps = 40
     supports_step_execution: ClassVar[bool] = False
     max_outputs_per_prompt: ClassVar[int] = 1
     _dit_modules: ClassVar[list[str]] = ["transformer"]

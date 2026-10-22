@@ -28,7 +28,6 @@ import torch
 from diffusers.schedulers import DPMSolverMultistepScheduler
 from diffusers.utils.torch_utils import randn_tensor
 from diffusers.video_processor import VideoProcessor
-from torch import nn
 from transformers import AutoModel, Gemma2PreTrainedModel, GemmaTokenizer, GemmaTokenizerFast
 from vllm.transformers_utils.config import get_hf_file_to_dict
 
@@ -45,7 +44,7 @@ from vllm_omni.diffusion.distributed.parallel_state import (
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
-from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
+from vllm_omni.diffusion.models.base import DiffusionPipelineBase
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.models.utils import _load_json
 from vllm_omni.diffusion.offloader.config import (
@@ -307,11 +306,10 @@ def _validate_cache_offload_parallelism(od_config: OmniDiffusionConfig) -> None:
 
 
 class SanaVideoPipeline(
-    nn.Module,
+    DiffusionPipelineBase,
     CFGParallelMixin,
     ProgressBarMixin,
     DiffusionPipelineProfilerMixin,
-    SupportsComponentDiscovery,
 ):
     r"""
     vLLM-Omni pipeline for text-to-video generation using

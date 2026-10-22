@@ -37,8 +37,9 @@ from vllm_omni.diffusion.media import (
 )
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
+from vllm_omni.diffusion.models.base import DiffusionPipelineBase
 from vllm_omni.diffusion.models.dmd2 import DMD2PipelineMixin
-from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery, role_loads_component
+from vllm_omni.diffusion.models.interface import role_loads_component
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin, _is_rank_zero
 from vllm_omni.diffusion.models.schedulers import FlowUniPCMultistepScheduler
 from vllm_omni.diffusion.models.wan2_2.chunked_mp4 import (
@@ -431,16 +432,16 @@ _WAN_TEXT_ENCODER_OFFLOAD_PLAN = OffloadPlan(
 
 
 class Wan22Pipeline(
-    nn.Module,
+    DiffusionPipelineBase,
     PipelineParallelMixin,
     CFGParallelMixin,
     ProgressBarMixin,
     DenoiseProgressMixin,
     DiffusionPipelineProfilerMixin,
-    SupportsComponentDiscovery,
     WanLoraLoaderMixin,
 ):
     supports_request_batch = True
+    default_num_inference_steps = 40
     _dit_modules: ClassVar[list[str]] = ["transformer", "transformer_2"]
     _encoder_modules: ClassVar[list[str]] = ["text_encoder"]
     _vae_modules: ClassVar[list[str]] = ["vae"]

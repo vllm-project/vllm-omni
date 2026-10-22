@@ -24,7 +24,6 @@ from typing import Any, ClassVar, cast
 import numpy as np
 import PIL.Image
 import torch
-import torch.nn as nn
 from diffusers.image_processor import VaeImageProcessor
 from diffusers.models.autoencoders.autoencoder_kl_flux2 import AutoencoderKLFlux2
 from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion import retrieve_timesteps
@@ -41,11 +40,12 @@ from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
+from vllm_omni.diffusion.models.base import DiffusionPipelineBase
 from vllm_omni.diffusion.models.flux2_klein.flux2_klein_transformer import (
     Flux2Transformer2DModel,
     _use_local_single_stream_tp,
 )
-from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComponentDiscovery
+from vllm_omni.diffusion.models.interface import SupportImageInput
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
@@ -183,11 +183,10 @@ def compute_empirical_mu(image_seq_len: int, num_steps: int) -> float:
     return float(mu)
 
 
-class Flux2KleinPipeline(
-    nn.Module, CFGParallelMixin, SupportImageInput, DiffusionPipelineProfilerMixin, SupportsComponentDiscovery
-):
+class Flux2KleinPipeline(DiffusionPipelineBase, CFGParallelMixin, SupportImageInput, DiffusionPipelineProfilerMixin):
     """Flux2 klein pipeline for text-to-image generation."""
 
+    default_num_inference_steps = 50
     _dit_modules: ClassVar[list[str]] = ["transformer"]
     _encoder_modules: ClassVar[list[str]] = ["text_encoder"]
     _vae_modules: ClassVar[list[str]] = ["vae"]

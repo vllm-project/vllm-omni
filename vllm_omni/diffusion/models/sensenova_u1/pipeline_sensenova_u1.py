@@ -45,7 +45,7 @@ from vllm_omni.diffusion.lora.loader import (
     _remap_state_dict_keys,
 )
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
-from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
+from vllm_omni.diffusion.models.base import DiffusionPipelineBase
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
@@ -477,8 +477,7 @@ class SenseNovaU1DenoisingAdapter(nn.Module):
 
 
 class SenseNovaU1Pipeline(
-    nn.Module,
-    SupportsComponentDiscovery,
+    DiffusionPipelineBase,
     DiffusionPipelineProfilerMixin,
     CFGParallelMixin,
     LoraLoaderMixin,
@@ -497,6 +496,7 @@ class SenseNovaU1Pipeline(
     """
 
     support_image_input = True
+    default_num_inference_steps = 50
 
     # CPU-offload protocol: language_model carries the denoising blocks; the
     # vision and FM modules are lightweight encoders pinned on GPU during the

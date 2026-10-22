@@ -11,7 +11,6 @@ from diffusers.schedulers.scheduling_flow_match_euler_discrete import (
     FlowMatchEulerDiscreteScheduler,
 )
 from diffusers.utils.torch_utils import randn_tensor
-from torch import nn
 from transformers import CLIPTextModelWithProjection, CLIPTokenizer, T5EncoderModel, T5Tokenizer
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
@@ -21,7 +20,7 @@ from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
-from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
+from vllm_omni.diffusion.models.base import DiffusionPipelineBase
 from vllm_omni.diffusion.models.sd3.sd3_transformer import (
     SD3Transformer2DModel,
 )
@@ -131,8 +130,9 @@ def retrieve_timesteps(
     return timesteps, num_inference_steps
 
 
-class StableDiffusion3Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelineProfilerMixin, SupportsComponentDiscovery):
+class StableDiffusion3Pipeline(DiffusionPipelineBase, CFGParallelMixin, DiffusionPipelineProfilerMixin):
     supports_request_batch = True
+    default_num_inference_steps = 28
 
     _dit_modules: ClassVar[list[str]] = ["transformer"]
     _encoder_modules: ClassVar[list[str]] = ["text_encoder", "text_encoder_2", "text_encoder_3"]

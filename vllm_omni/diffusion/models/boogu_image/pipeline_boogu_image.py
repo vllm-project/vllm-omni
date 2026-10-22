@@ -32,7 +32,6 @@ import torch.nn.functional as F
 from diffusers.image_processor import VaeImageProcessor
 from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKL
 from diffusers.utils.torch_utils import randn_tensor
-from torch import nn
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from transformers import AutoModel, Qwen3VLConfig, Qwen3VLForConditionalGeneration, Qwen3VLModel, Qwen3VLProcessor
 from vllm.config.quantization import QuantizationConfigArgs
@@ -47,6 +46,7 @@ from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
+from vllm_omni.diffusion.models.base import DiffusionPipelineBase
 from vllm_omni.diffusion.models.boogu_image.boogu_image_transformer import (
     BooguImageDoubleStreamRotaryPosEmbed,
     BooguImageTransformer2DModel,
@@ -56,7 +56,7 @@ from vllm_omni.diffusion.models.boogu_image.image_processor import BooguImagePro
 from vllm_omni.diffusion.models.boogu_image.scheduling_flow_match_euler_discrete_time_shifting import (
     FlowMatchEulerDiscreteScheduler,
 )
-from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComponentDiscovery
+from vllm_omni.diffusion.models.interface import SupportImageInput
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.models.utils import create_transformers_model_with_vllm_linears
 from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -216,7 +216,7 @@ SYSTEM_PROMPT_4_T2I_UNIFIED = (
 )
 
 
-class BooguImagePipeline(CFGParallelMixin, nn.Module, ProgressBarMixin, SupportsComponentDiscovery, SupportImageInput):
+class BooguImagePipeline(CFGParallelMixin, DiffusionPipelineBase, ProgressBarMixin, SupportImageInput):
     """Boogu-Image text-to-image and image-editing (TI2I) pipeline.
 
     Native vLLM-Omni implementation. A request with a reference image (edit /
@@ -226,6 +226,7 @@ class BooguImagePipeline(CFGParallelMixin, nn.Module, ProgressBarMixin, Supports
     """
 
     supports_request_batch = True
+    default_num_inference_steps = 50
     # Turbo subclasses select the upstream few-step DMD student loop. Base and
     # Edit requests keep the regular scheduler and CFG path.
     _is_turbo: ClassVar[bool] = False

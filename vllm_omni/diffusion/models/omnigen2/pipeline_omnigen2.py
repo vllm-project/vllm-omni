@@ -13,7 +13,6 @@ from typing import Any, ClassVar
 import numpy as np
 import PIL.Image
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.image_processor import (
@@ -33,7 +32,7 @@ from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
-from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
+from vllm_omni.diffusion.models.base import DiffusionPipelineBase
 from vllm_omni.diffusion.models.omnigen2.omnigen2_transformer import (
     OmniGen2RotaryPosEmbed,
     OmniGen2Transformer2DModel,
@@ -621,7 +620,7 @@ def retrieve_timesteps(
     return timesteps, num_inference_steps
 
 
-class OmniGen2Pipeline(CFGParallelMixin, nn.Module, SupportsComponentDiscovery):
+class OmniGen2Pipeline(CFGParallelMixin, DiffusionPipelineBase):
     """
     Pipeline for text-to-image generation using OmniGen2.
 
@@ -635,6 +634,7 @@ class OmniGen2Pipeline(CFGParallelMixin, nn.Module, SupportsComponentDiscovery):
         od_config (OmniDiffusionConfig): The OmniDiffusion configuration.
     """
 
+    default_num_inference_steps = 28
     _dit_modules: ClassVar[list[str]] = ["transformer"]
     _encoder_modules: ClassVar[list[str]] = ["mllm"]
     _vae_modules: ClassVar[list[str]] = ["vae"]
