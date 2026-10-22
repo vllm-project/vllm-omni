@@ -34,6 +34,9 @@ The server configuration contains `profiles`, `default` and optional `sigma`:
   underscores or hyphens. All profiles are validated, even unused ones.
 - The top-level `default` is a list of ranges. An empty configuration with
   no profiles is equivalent to not configuring schedules.
+- The top-level `sigma` is a list of windows; see [Sigma windows](#sigma-windows).
+  `default` and `sigma` cannot both be non-empty.
+- Other top-level keys are rejected at startup.
 
 Each range has exactly `start`, `end` and `profile`:
 
