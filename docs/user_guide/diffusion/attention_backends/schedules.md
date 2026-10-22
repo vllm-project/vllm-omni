@@ -93,7 +93,10 @@ A CLI `default` list replaces the stage list rather than appending ranges.
 | Non-empty ranges | Replace defaults; do not merge. |
 
 Video endpoints first apply a stage's `default_sampling_params`, if present;
-an omitted or `null` request value preserves that stage default.
+an omitted or `null` request value preserves that stage default. A schedule
+from `default_sampling_params` is checked as the request's own, so its bounded
+ranges must end within the sequence; put ranges that may end later in the
+schedule configuration's `default`.
 
 Put the field in the endpoint's model-specific extras:
 
@@ -142,6 +145,11 @@ errors on the job record rather than the creation response.
   precision at startup, as it does for the base.
 - TRTLLM `target_sparsity` needs a per-layer calibration curve unless the
   layer is explicitly ignored.
+
+Each attention layer prepares its own implementation for every distinct
+profile. A FlashInfer profile therefore adds a 128 MiB workspace per layer,
+unless FlashInfer runs its cute-dsl backend (the automatic choice on
+Blackwell).
 
 Startup warm-up does not exercise profiles. Warm up the base and each profile
 before timing. CPU tests use stand-in kernels; they do not establish GPU,
