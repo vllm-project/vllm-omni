@@ -53,6 +53,7 @@ def _attention(*, enabled: bool, prefix: str = "image_attention") -> Attention:
     attention.head_size = 8
     attention.causal = False
     attention.attn_backend = _Backend
+    attention._schedule_candidate_checks = []
     return attention
 
 

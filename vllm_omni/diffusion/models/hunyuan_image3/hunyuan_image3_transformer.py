@@ -892,6 +892,17 @@ class HunYuanRotary2DEmbedder:
         return q, k
 
 
+def _require_attention_mask_support(record: ScheduleCandidate) -> str | None:
+    """Schedule candidate check for ImageKVCacheManager.attn (see Attention.add_schedule_candidate_check).
+
+    The dense path sends a 4D attention mask on every forward. The paged path sends none; there,
+    startup validation already requires every candidate to match the baseline paged backend.
+    """
+    if record.backend_cls.supports_attention_mask(record.spec):
+        return None
+    return "HunyuanImage3 image attention sends a 4D attention mask on every dense forward"
+
+
 class ImageKVCacheManager(nn.Module):
     """
     Manages specialized caching and updating of KV-Cache for image tokens in multimodal models.
@@ -938,6 +949,8 @@ class ImageKVCacheManager(nn.Module):
             # bfloat16 autocast, independent of the weight-loading dtype.
             paged_kv_cache_dtype=torch.bfloat16,
         )
+        # The dense image attention path always sends a mask. Startup validation runs this check only with a schedule.
+        self.attn.add_schedule_candidate_check(_require_attention_mask_support)
 
     @staticmethod
     def _get_current_starts(
@@ -1275,17 +1288,6 @@ class ImageKVCacheManager(nn.Module):
         if attention_mask is None:
             raise ValueError("Hunyuan dense attention requires an attention mask")
         return self._forward_dense_legacy(query, key, value, attention_mask, **kwargs)
-
-
-def _require_attention_mask_support(record: ScheduleCandidate) -> str | None:
-    """Schedule candidate check for ImageKVCacheManager.attn (see Attention.add_schedule_candidate_check).
-
-    The dense path sends a 4D attention mask on every forward. The paged path sends none; there,
-    startup validation already requires every candidate to match the baseline paged backend.
-    """
-    if record.backend_cls.supports_attention_mask(record.spec):
-        return None
-    return "HunyuanImage3 image attention sends a 4D attention mask on every dense forward"
 
 
 @dataclass
@@ -2185,10 +2187,6 @@ class HunyuanImage3Model(nn.Module):
         self.pre_processor = HunyuanImagePreprocessor()
         self.unifiled_cat = UnifiledCat()
         self.post_processor = HunyuanImagePostprocessor()
-        # The dense image attention path always sends a mask. Startup validation runs this check only with a schedule.
-        for module in self.modules():
-            if isinstance(module, ImageKVCacheManager):
-                module.attn.add_schedule_candidate_check(_require_attention_mask_support)
 
     def _split_qkv_weight(self, qkv: torch.Tensor):
         num_attention_heads = self.config.num_attention_heads
