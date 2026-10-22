@@ -7,6 +7,7 @@ import logging
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from vllm_omni.diffusion.attention.layer import ScheduleCandidate
     from vllm_omni.diffusion.data import AttentionConfig, AttentionScheduleConfig, AttentionSpec
 
 logger = logging.getLogger(__name__)
@@ -132,7 +133,7 @@ def resolve_effective_calibration(
     return None
 
 
-def calibration_for_candidate(record: Any, fallback: dict | None) -> dict | None:
+def calibration_for_candidate(record: ScheduleCandidate, fallback: dict | None) -> dict | None:
     """The dict that stamping writes onto this candidate impl."""
     own = record.spec.skip_calibration if record.spec is not None else None
     return own or fallback
