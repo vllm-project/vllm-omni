@@ -122,7 +122,8 @@ binds one schedule per batch, plus whether the request sent it. An omitted
 schedule does not share a key with the same ranges sent explicitly, because an
 explicit schedule is checked against the step count while an inherited default
 is not. `[]` never shares a batch with an omitted schedule, and different
-ranges never share.
+ranges never share. The key also holds the request's `attention_sigma_schedule`,
+because the runner binds one set of sigma windows per batch.
 
 Admission is FIFO and conservative. An incompatible request at the front of the
 waiting queue can prevent later compatible requests from joining the current
@@ -193,8 +194,8 @@ denoise forward, then applies scheduler updates per request:
 
 `StepBatchSamplingParamsKey` protects the batched tensor contract. Requests can
 have different total step counts and current step indices, but shape-sensitive,
-CFG-sensitive, LoRA, and `attention_schedule` fields must be compatible. FIFO
-head-of-line blocking also applies here.
+CFG-sensitive, LoRA, `attention_schedule`, and `attention_sigma_schedule` fields
+must be compatible. FIFO head-of-line blocking also applies here.
 
 Chunk-capable pipelines may emit intermediate results. Final-only step
 pipelines emit when the request finishes even if `streaming_output=True`.
