@@ -102,6 +102,34 @@ def _attention_identity(
     )
 
 
+def _promote_marked_paged_default(
+    backend_cls: type[AttentionBackend],
+    spec: "AttentionSpec | None",
+    *,
+    scheduler_paged_kv: bool,
+    paged_kv_cache_role: str | None,
+) -> type[AttentionBackend]:
+    """Return FLASH_ATTN for a marked paged layer whose platform default lacks paged KV support.
+
+    The promotion applies only when the Scheduler owns paged KV (PAGED_SCHEDULER mode), the layer has
+    a paged KV cache role and no explicit spec chose ``backend_cls``; otherwise ``backend_cls`` is
+    returned unchanged.
+    """
+    if scheduler_paged_kv and paged_kv_cache_role is not None and spec is None and not backend_cls.supports_paged_kv:
+        # FLASH_ATTN is an Omni selector, not a device-specific kernel.
+        # vLLM resolves it to CUDA FlashAttention on GPU and Ascend native
+        # attention on NPU. A platform may legitimately default dense
+        # attention to CUDNN/SDPA (for example when optional dense FA
+        # extras are absent), but a paged layer must advertise the
+        # capability so the Worker can register its native cache view.
+        # Load that selector from the registry: this is not a user-explicit
+        # dense FLASH_ATTN request, so skip platform explicit-backend
+        # validation (Blackwell would otherwise require CuTe FA4). Formal
+        # paged execution still delegates to vLLM's native paged backend.
+        return DiffusionAttentionBackendEnum.FLASH_ATTN.get_class()
+    return backend_cls
+
+
 def _reject_allgather_trtllm(
     backend_cls: type[AttentionBackend], skip_sequence_parallel: bool, allgather_degree: int
 ) -> None:
@@ -511,37 +539,26 @@ class Attention(nn.Module):
         self.attention: AttentionImpl | nn.Module
         self.sdpa_fallback: SDPAImpl | None
         if custom_attention is None:
-            attn_backend_cls, spec = get_attn_backend_for_role(
+            selected_backend_cls, spec = get_attn_backend_for_role(
                 role=role,
                 head_size=head_size,
                 attention_config=attention_config,
                 role_category=role_category,
                 allow_trtllm_default=allow_trtllm_default,
             )
-            if (
-                scheduler_paged_kv
-                and paged_kv_cache_role is not None
-                and spec is None
-                and not attn_backend_cls.supports_paged_kv
-            ):
-                # FLASH_ATTN is an Omni selector, not a device-specific kernel.
-                # vLLM resolves it to CUDA FlashAttention on GPU and Ascend native
-                # attention on NPU. A platform may legitimately default dense
-                # attention to CUDNN/SDPA (for example when optional dense FA
-                # extras are absent), but a paged layer must advertise the
-                # capability so the Worker can register its native cache view.
-                # Load that selector from the registry: this is not a user-explicit
-                # dense FLASH_ATTN request, so skip platform explicit-backend
-                # validation (Blackwell would otherwise require CuTe FA4). Formal
-                # paged execution still delegates to vLLM's native paged backend.
-                dense_backend_name = attn_backend_cls.get_name()
-                attn_backend_cls = DiffusionAttentionBackendEnum.FLASH_ATTN.get_class()
+            attn_backend_cls = _promote_marked_paged_default(
+                selected_backend_cls,
+                spec,
+                scheduler_paged_kv=scheduler_paged_kv,
+                paged_kv_cache_role=paged_kv_cache_role,
+            )
+            if attn_backend_cls is not selected_backend_cls:
                 logger.info(
                     "Resolved marked paged diffusion attention role=%r to %r because the platform default %r "
                     "does not support Scheduler-owned KV",
                     role,
                     attn_backend_cls.get_name(),
-                    dense_backend_name,
+                    selected_backend_cls.get_name(),
                 )
             allgather_degree = getattr(parallel_config, "allgather_degree", 1)
             _reject_allgather_trtllm(attn_backend_cls, skip_sequence_parallel, allgather_degree)
@@ -737,14 +754,12 @@ class Attention(nn.Module):
                 role_category=role_category,
                 allow_trtllm_default=allow_trtllm_default,
             )
-            # Reproduce the baseline marked-paged promotion of a platform default.
-            if (
-                self._scheduler_paged_kv
-                and self.paged_kv_cache_role is not None
-                and spec is None
-                and not backend_cls.supports_paged_kv
-            ):
-                backend_cls = DiffusionAttentionBackendEnum.FLASH_ATTN.get_class()
+            backend_cls = _promote_marked_paged_default(
+                backend_cls,
+                spec,
+                scheduler_paged_kv=self._scheduler_paged_kv,
+                paged_kv_cache_role=self.paged_kv_cache_role,
+            )
             _reject_allgather_trtllm(backend_cls, skip_sequence_parallel, allgather_degree)
             impl_cls = _select_impl_cls(backend_cls, impl_overrides)
             backend_explicit = spec is not None
