@@ -160,7 +160,8 @@ class StageEngineCoreProc(EngineCoreProc):
         has finished with the request. Idempotent and safe for unknown ids.
         Each entry is ``(request_id, transfer_gen)``; a bare-id list (older
         senders) is tolerated and falls back to the adapter's last-seen
-        generation for that external id.
+        generation for that external id ("0" once its sender state is
+        cleared).
         """
         adapter = getattr(getattr(self, "scheduler", None), "chunk_transfer_adapter", None)
         if adapter is None:

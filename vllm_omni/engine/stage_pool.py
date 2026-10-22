@@ -1403,8 +1403,9 @@ class StagePool:
         """Queue a best-effort release of *(request_id, transfer_gen)* on every live replica.
 
         The generation token scopes the reclaim to that admission's connector
-        keys: a late release for a re-used external id cannot touch the new
-        generation's segments or lock files (see the adapter's release path).
+        keys: a late release for a re-used external id names only the
+        generation it carries, never the new generation's keys (see the
+        adapter's release path).
 
         Broadcast rather than binding-routed: the orchestrator releases route
         bindings as part of the same teardown, so a binding lookup here would
@@ -1413,7 +1414,9 @@ class StagePool:
         Each replica batches independently: ids of requests that finish while
         its release RPC is in flight go out together in its next RPC, and a
         hung replica delays only its own batches (bounded by
-        ``RELEASE_RPC_TIMEOUT_S`` per RPC).
+        ``RELEASE_RPC_TIMEOUT_S`` per RPC). A re-admitted id whose release is
+        still queued supersedes its pending entry — the earlier generation's
+        reclaim falls to the sweep or the sender's close.
         """
         if not releases or not self._has_chunk_transfer_adapter:
             return

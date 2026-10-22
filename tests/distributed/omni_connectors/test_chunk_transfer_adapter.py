@@ -183,6 +183,22 @@ def test_same_ext_id_two_generations_isolated(shm_sender):
     assert f"{ext_id}_0_old_1" not in connector._pending_keys
 
 
+def test_sender_cleanup_drops_last_seen_generation_record(shm_sender):
+    """cleanup_sender must reclaim the last-seen-generation record with the
+    rest of the per-external-id sender state, or one dict entry leaks per
+    finished request (the record's only consumer is a bare-id release, which
+    cannot arrive once the sender state is gone)."""
+    adapter, connector = shm_sender
+    ext_id = f"genfree_{uuid.uuid4().hex}"
+    req = _gen_request("leak-1", RequestStatus.RUNNING, ext_id, "g1")
+    adapter.save_async(None, req)
+    while adapter._pending_save_reqs:
+        adapter._send_single_request(adapter._pending_save_reqs.popleft())
+    assert adapter._transfer_gen_by_ext.get(ext_id) == "g1"
+    adapter.cleanup_sender(ext_id)
+    assert ext_id not in adapter._transfer_gen_by_ext
+
+
 def test_receiver_polls_its_own_generation_not_leftovers(shm_sender):
     """Mode B: a new generation's first poll must miss old leftovers.
 

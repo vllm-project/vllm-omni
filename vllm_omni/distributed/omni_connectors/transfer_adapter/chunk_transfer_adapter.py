@@ -1214,6 +1214,10 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.ramp_chunk_count.pop(external_req_id, None)
         self._adaptive_states.pop(external_req_id, None)
         self._pending_streaming_prefills.pop(external_req_id, None)
+        # The last-seen generation served any bare-id release that could
+        # arrive while this state lived; keeping it past the request would
+        # leak one entry per finished external id.
+        self._transfer_gen_by_ext.pop(external_req_id, None)
 
         cached_ic = getattr(self, "_cached_ic", None)
         if cached_ic is not None:
