@@ -1129,3 +1129,24 @@ def test_hunyuanvideo15_accuracy_is_one_nonblocking_nightly_job() -> None:
     for pipeline_path in (AMD_READY_PIPELINE, AMD_MERGE_PIPELINE):
         text = pipeline_path.read_text(encoding="utf-8")
         assert "HunyuanVideo-1.5 Video Similarity" not in text
+
+
+def test_omni_duplex_eval_is_one_nonblocking_nightly_job() -> None:
+    step = _find_step("MiniCPM-o Omni-DuplexEval CI Guard", AMD_NIGHTLY_PIPELINE)
+    assert step["grade"] == "NonBlocking"
+    assert step["agent_pool"] == "mi300_2"
+    assert step["mirror_hardwares"] == ["amdproduction"]
+    assert step["timeout_in_minutes"] == 240
+    commands = "\n".join(step["commands"])
+    assert "full_model and omni and rocm and MI325 and cards_2" in commands
+    assert "--run-level full_model" in commands
+    assert "--collect-only" in commands
+    assert "exit 5" in commands
+    assert "pytest.xml" in commands
+    assert step["env"]["BENCHMARK_DIR"] == "tests/dfx/perf/results"
+    assert step["env"]["ACC_BENCH_RESULT_DIR"] == "tests/e2e/accuracy/omni_duplex_eval/results"
+    assert "test_minicpmo_4_5_omni_duplex_eval.json" in commands
+    assert "Expected exactly one MiniCPM-o Omni-DuplexEval node" in commands
+    for pipeline_path in (AMD_READY_PIPELINE, AMD_MERGE_PIPELINE):
+        text = pipeline_path.read_text(encoding="utf-8")
+        assert "MiniCPM-o Omni-DuplexEval CI Guard" not in text
