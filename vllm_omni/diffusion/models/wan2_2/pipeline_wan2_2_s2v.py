@@ -9,6 +9,7 @@ Migrated from Wan2.2/wan/speech2video.py (WanS2V class).
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 import os
@@ -41,9 +42,11 @@ from vllm_omni.diffusion.models.wan2_2.chunked_mp4 import (
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
     load_transformer_config,
     load_wan_weights_with_optional_gate,
+    resolve_wan_transformer_quant_config,
     retrieve_latents,
 )
 from vllm_omni.diffusion.models.wan2_2.wan2_2_s2v_transformer import (
+    WanS2VTransformer3DModel,
     create_s2v_transformer_from_config,
 )
 from vllm_omni.diffusion.offloader.config import (
@@ -635,7 +638,7 @@ class Wan22S2VPipeline(
 
         # -- Transformer (S2V variant, native vllm-omni ops) --
         transformer_config = load_transformer_config(model_path, "transformer", local_files_only=True)
-        self.transformer = create_s2v_transformer_from_config(transformer_config)
+        self.transformer = self._create_transformer(transformer_config, model_path, "transformer")
 
     def _init_original_format(self, model_path: str, dtype: torch.dtype) -> None:
         """Initialize from the original Wan2.2 checkpoint layout.
@@ -692,7 +695,25 @@ class Wan22S2VPipeline(
 
         # -- Transformer (S2V variant, native vllm-omni ops) --
         transformer_config = load_transformer_config(model_path, ".", local_files_only=True)
-        self.transformer = create_s2v_transformer_from_config(transformer_config)
+        self.transformer = self._create_transformer(transformer_config, model_path, ".")
+
+    def _create_transformer(self, config: dict, model_path: str, subfolder: str) -> WanS2VTransformer3DModel:
+        """Create the S2V transformer, honoring the checkpoint's quantization config.
+
+        Diffusers-format checkpoints carry ``quantization_config`` in
+        ``transformer/config.json``; original-format ones (e.g. AutoRound
+        MXFP8) ship it as a sibling ``quantization_config.json``.
+        """
+        if "quantization_config" not in config:
+            qc_path = os.path.join(model_path, subfolder, "quantization_config.json")
+            if os.path.isfile(qc_path):
+                with open(qc_path) as f:
+                    config = {**config, "quantization_config": json.load(f)}
+        quant_config = getattr(self.od_config, "quantization_config", None)
+        if getattr(self.od_config, "quantization_config_is_auto_detected", False):
+            quant_config = None
+        quant_config = resolve_wan_transformer_quant_config(config, quant_config, "transformer")
+        return create_s2v_transformer_from_config(config, quant_config=quant_config)
 
     # ------------------------------------------------------------------
     # Properties

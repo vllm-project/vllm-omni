@@ -28,6 +28,7 @@ from vllm.model_executor.layers.linear import (
     QKVParallelLinear,
     RowParallelLinear,
 )
+from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.attention.layer import Attention
@@ -86,7 +87,16 @@ def torch_dfs(model, parent_name="root"):
 class WanS2VSelfAttention(nn.Module):
     """S2V self-attention using vllm-omni ops (QKVParallelLinear + Attention)."""
 
-    def __init__(self, dim, num_heads, window_size=(-1, -1), qk_norm=True, eps=1e-6):
+    def __init__(
+        self,
+        dim,
+        num_heads,
+        window_size=(-1, -1),
+        qk_norm=True,
+        eps=1e-6,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+    ):
         if dim % num_heads != 0:
             raise ValueError(f"dim ({dim}) must be divisible by num_heads ({num_heads})")
         super().__init__()
@@ -102,7 +112,8 @@ class WanS2VSelfAttention(nn.Module):
             head_size=self.head_dim,
             total_num_heads=num_heads,
             bias=True,
-            quant_config=None,
+            quant_config=quant_config,
+            prefix=f"{prefix}.to_qkv" if prefix else "to_qkv",
         )
 
         self.num_heads = self.to_qkv.num_heads
@@ -120,6 +131,8 @@ class WanS2VSelfAttention(nn.Module):
             bias=True,
             input_is_parallel=True,
             return_bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.to_out" if prefix else "to_out",
         )
 
         # Unified attention layer
@@ -170,7 +183,16 @@ class WanS2VSelfAttention(nn.Module):
 class WanS2VCrossAttention(nn.Module):
     """S2V cross-attention using vllm-omni ops (ColumnParallelLinear + Attention)."""
 
-    def __init__(self, dim, num_heads, window_size=(-1, -1), qk_norm=True, eps=1e-6):
+    def __init__(
+        self,
+        dim,
+        num_heads,
+        window_size=(-1, -1),
+        qk_norm=True,
+        eps=1e-6,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+    ):
         if dim % num_heads != 0:
             raise ValueError(f"dim ({dim}) must be divisible by num_heads ({num_heads})")
         super().__init__()
@@ -180,9 +202,33 @@ class WanS2VCrossAttention(nn.Module):
         self.inner_dim = num_heads * self.head_dim
 
         # Separate Q/K/V projections for cross-attention
-        self.to_q = ColumnParallelLinear(dim, self.inner_dim, bias=True, gather_output=False, return_bias=False)
-        self.to_k = ColumnParallelLinear(dim, self.inner_dim, bias=True, gather_output=False, return_bias=False)
-        self.to_v = ColumnParallelLinear(dim, self.inner_dim, bias=True, gather_output=False, return_bias=False)
+        self.to_q = ColumnParallelLinear(
+            dim,
+            self.inner_dim,
+            bias=True,
+            gather_output=False,
+            return_bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.to_q" if prefix else "to_q",
+        )
+        self.to_k = ColumnParallelLinear(
+            dim,
+            self.inner_dim,
+            bias=True,
+            gather_output=False,
+            return_bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.to_k" if prefix else "to_k",
+        )
+        self.to_v = ColumnParallelLinear(
+            dim,
+            self.inner_dim,
+            bias=True,
+            gather_output=False,
+            return_bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.to_v" if prefix else "to_v",
+        )
 
         tp_size = get_tensor_model_parallel_world_size()
         self.num_heads = num_heads // tp_size
@@ -193,7 +239,15 @@ class WanS2VCrossAttention(nn.Module):
         self.norm_k = DistributedRMSNorm(self.tp_inner_dim, eps=eps) if qk_norm else nn.Identity()
 
         # Output projection
-        self.to_out = RowParallelLinear(self.inner_dim, dim, bias=True, input_is_parallel=True, return_bias=False)
+        self.to_out = RowParallelLinear(
+            self.inner_dim,
+            dim,
+            bias=True,
+            input_is_parallel=True,
+            return_bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.to_out" if prefix else "to_out",
+        )
 
         # Unified attention layer
         self.attn = Attention(
@@ -228,7 +282,18 @@ class WanS2VTransformerBlock(nn.Module):
     modulation is applied to each segment.
     """
 
-    def __init__(self, dim, ffn_dim, num_heads, window_size=(-1, -1), qk_norm=True, cross_attn_norm=False, eps=1e-6):
+    def __init__(
+        self,
+        dim,
+        ffn_dim,
+        num_heads,
+        window_size=(-1, -1),
+        qk_norm=True,
+        cross_attn_norm=False,
+        eps=1e-6,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+    ):
         super().__init__()
         self.dim = dim
         self.ffn_dim = ffn_dim
@@ -236,15 +301,37 @@ class WanS2VTransformerBlock(nn.Module):
 
         # Self-attention (TP-enabled)
         self.norm1 = FP32LayerNorm(dim, eps, elementwise_affine=False)
-        self.self_attn = WanS2VSelfAttention(dim, num_heads, window_size, qk_norm, eps)
+        self.self_attn = WanS2VSelfAttention(
+            dim,
+            num_heads,
+            window_size,
+            qk_norm,
+            eps,
+            quant_config=quant_config,
+            prefix=f"{prefix}.self_attn" if prefix else "self_attn",
+        )
 
         # Cross-attention (TP-enabled)
         self.norm3 = FP32LayerNorm(dim, eps, elementwise_affine=True) if cross_attn_norm else nn.Identity()
-        self.cross_attn = WanS2VCrossAttention(dim, num_heads, (-1, -1), qk_norm, eps)
+        self.cross_attn = WanS2VCrossAttention(
+            dim,
+            num_heads,
+            (-1, -1),
+            qk_norm,
+            eps,
+            quant_config=quant_config,
+            prefix=f"{prefix}.cross_attn" if prefix else "cross_attn",
+        )
 
         # FFN (TP-enabled, reused from wan2_2_transformer.py)
         self.norm2 = FP32LayerNorm(dim, eps, elementwise_affine=False)
-        self.ffn = WanFeedForward(dim=dim, inner_dim=ffn_dim, dim_out=dim)
+        self.ffn = WanFeedForward(
+            dim=dim,
+            inner_dim=ffn_dim,
+            dim_out=dim,
+            quant_config=quant_config,
+            prefix=f"{prefix}.ffn" if prefix else "ffn",
+        )
 
         # 6-way scale-shift modulation
         self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
@@ -489,6 +576,8 @@ class AudioInjector_WAN(nn.Module):
         enable_adain=False,
         adain_dim=2048,
         need_adain_ont=False,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
     ):
         super().__init__()
         if inject_layer is None:
@@ -504,7 +593,16 @@ class AudioInjector_WAN(nn.Module):
                         audio_injector_id += 1
 
         self.injector = nn.ModuleList(
-            [AudioCrossAttention(dim=dim, num_heads=num_heads, qk_norm=True) for _ in range(audio_injector_id)]
+            [
+                AudioCrossAttention(
+                    dim=dim,
+                    num_heads=num_heads,
+                    qk_norm=True,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.injector.{i}" if prefix else f"injector.{i}",
+                )
+                for i in range(audio_injector_id)
+            ]
         )
         self.injector_pre_norm_feat = nn.ModuleList(
             [nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6) for _ in range(audio_injector_id)]
@@ -1158,6 +1256,7 @@ class WanS2VTransformer3DModel(nn.Module):
         qk_norm=True,
         cross_attn_norm=True,
         eps=1e-6,
+        quant_config: QuantizationConfig | None = None,
         *args,
         **kwargs,
     ):
@@ -1191,8 +1290,18 @@ class WanS2VTransformer3DModel(nn.Module):
         # Transformer blocks (TP-enabled)
         self.blocks = nn.ModuleList(
             [
-                WanS2VTransformerBlock(dim, ffn_dim, num_heads, window_size, qk_norm, cross_attn_norm, eps)
-                for _ in range(num_layers)
+                WanS2VTransformerBlock(
+                    dim,
+                    ffn_dim,
+                    num_heads,
+                    window_size,
+                    qk_norm,
+                    cross_attn_norm,
+                    eps,
+                    quant_config=quant_config,
+                    prefix=f"blocks.{i}",
+                )
+                for i in range(num_layers)
             ]
         )
 
@@ -1237,6 +1346,8 @@ class WanS2VTransformer3DModel(nn.Module):
             enable_adain=enable_adain,
             adain_dim=dim,
             need_adain_ont=adain_mode != "attn_norm",
+            quant_config=quant_config,
+            prefix="audio_injector",
         )
         self.adain_mode = adain_mode
 
@@ -1469,9 +1580,14 @@ class WanS2VTransformer3DModel(nn.Module):
                 attn_hidden_states = self.audio_injector.injector_pre_norm_feat[audio_attn_id](input_hidden_states)
 
             attn_audio_emb = rearrange(audio_emb, "b t n c -> (b t) n c")
-            residual_out = self.audio_injector.injector[audio_attn_id](
-                x=attn_hidden_states,
-                context=attn_audio_emb,
+            injector = self.audio_injector.injector[audio_attn_id]
+            # The pipeline's autocast runs the LayerNorms above in float32.
+            # Plain linears autocast back down; quantized linear kernels
+            # (e.g. MXFP8) do not, so feed them the parameter dtype.
+            attn_dtype = injector.to_q.params_dtype
+            residual_out = injector(
+                x=attn_hidden_states.to(attn_dtype),
+                context=attn_audio_emb.to(attn_dtype),
                 context_lens=torch.ones(attn_hidden_states.shape[0], dtype=torch.long, device=attn_hidden_states.device)
                 * attn_audio_emb.shape[1],
             )
@@ -1714,6 +1830,12 @@ class WanS2VTransformer3DModel(nn.Module):
 
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
+        # An MXFP8 checkpoint (AutoRound) also quantizes layers this model keeps
+        # as plain nn.Linear, such as audio_injector.injector_adain_layers.*.
+        # linear. Their weight arrives with a sibling weight_scale that has no
+        # parameter to load into, so fold the scale back into the loaded weight.
+        # The two tensors can arrive in either order.
+        pending_scales: dict[str, torch.Tensor] = {}
 
         for name, loaded_weight in weights:
             original_name = name
@@ -1777,6 +1899,29 @@ class WanS2VTransformer3DModel(nn.Module):
             elif name.startswith("text_embedding.2."):
                 name = "condition_embedder.text_embedder.linear_2." + name[len("text_embedding.2.") :]
 
+            if name.endswith(".weight_scale") and name not in params_dict:
+                weight_name = name.removesuffix("_scale")
+                if weight_name in params_dict:
+                    loaded_params.add(original_name)
+                    if weight_name in loaded_params:
+                        _fold_mxfp8_scale(params_dict[weight_name], loaded_weight, weight_name)
+                    else:
+                        pending_scales[weight_name] = loaded_weight
+                    continue
+                fused_name = next(
+                    (
+                        weight_name.replace(weight_key, param_key)
+                        for param_key, weight_key, _ in stacked_params_mapping
+                        if weight_key in weight_name and weight_name.replace(weight_key, param_key) in params_dict
+                    ),
+                    None,
+                )
+                if fused_name is not None:
+                    raise ValueError(
+                        f"The checkpoint quantizes {original_name}, but {fused_name} was built without a "
+                        "quantization config. Serve this checkpoint with its quantization config."
+                    )
+
             if name not in params_dict:
                 logger.warning(f"Skipping weight {original_name} -> {name}")
                 continue
@@ -1791,10 +1936,43 @@ class WanS2VTransformer3DModel(nn.Module):
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
             weight_loader(param, loaded_weight)
 
+            scale = pending_scales.pop(name, None)
+            if scale is not None:
+                _fold_mxfp8_scale(param, scale, name)
+
             loaded_params.add(original_name)
             loaded_params.add(name)
 
+        if pending_scales:
+            raise ValueError(
+                f"The checkpoint has no weight for the MXFP8 scales {sorted(pending_scales)}, so those "
+                "layers would run unscaled."
+            )
         return loaded_params
+
+
+def _fold_mxfp8_scale(param: torch.nn.Parameter, scale: torch.Tensor, name: str) -> None:
+    """Scale a plain parameter whose checkpoint tensor was quantized to MXFP8.
+
+    AutoRound stores the E4M3 values either as float8 or as the bf16 they
+    round-trip to, so the already-loaded weight carries the values and this
+    only has to apply the per-group exponent. The weight may already live on
+    the accelerator while the checkpoint scale is still on the host.
+    """
+    from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
+        MXFP8_BLOCK_SIZE,
+        MXFP8_SCALE_DTYPE,
+        dequant_mxfp8_to_bf16,
+    )
+
+    if scale.dtype != MXFP8_SCALE_DTYPE:
+        raise ValueError(f"{name}_scale: expected MXFP8 exponents as {MXFP8_SCALE_DTYPE}, got {scale.dtype}")
+    expected = (*param.shape[:-1], param.shape[-1] // MXFP8_BLOCK_SIZE)
+    if tuple(scale.shape) != expected:
+        raise ValueError(
+            f"{name}_scale: expected shape {expected} for a {tuple(param.shape)} weight, got {tuple(scale.shape)}"
+        )
+    param.data.copy_(dequant_mxfp8_to_bf16(param.data, scale.to(param.device)))
 
 
 # ---------------------------------------------------------------------------
@@ -1802,9 +1980,13 @@ class WanS2VTransformer3DModel(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-def create_s2v_transformer_from_config(config: dict) -> WanS2VTransformer3DModel:
+def create_s2v_transformer_from_config(
+    config: dict, quant_config: QuantizationConfig | None = None
+) -> WanS2VTransformer3DModel:
     """Create WanS2VTransformer3DModel from a config dict (diffusers format)."""
-    kwargs = {}
+    kwargs: dict = {}
+    if quant_config is not None:
+        kwargs["quant_config"] = quant_config
 
     # Map config keys to constructor parameters
     key_mapping = {
