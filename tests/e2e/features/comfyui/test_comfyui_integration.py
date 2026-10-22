@@ -48,6 +48,7 @@ from comfyui_vllm_omni.utils.types import (
     MiniMaxH3ModelSpecificParams,
     WanModelSpecificParams,
 )
+from numpy.typing import NDArray
 from PIL import Image
 from pytest_mock import MockerFixture
 from vllm import SamplingParams
@@ -282,7 +283,7 @@ def _build_diffusion_video_output() -> OmniRequestOutput:
 
 def _build_test_video_bytes() -> bytes:
     output = BytesIO()
-    frames = np.zeros((2, VIDEO_HEIGHT, VIDEO_WIDTH, 3), dtype=np.uint8)
+    frames: NDArray[np.uint8] = np.zeros((2, VIDEO_HEIGHT, VIDEO_WIDTH, 3), dtype=np.uint8)
     with av.open(output, mode="w", format="mp4") as container:
         stream = container.add_stream("h264", rate=VIDEO_FPS)
         stream.width = VIDEO_WIDTH

@@ -18,6 +18,7 @@ import pytest
 import torch
 from comfyui_vllm_omni.utils.api_client import MINIMAX_H3_CONTROL_VIDEO_ENCODING
 from comfyui_vllm_omni.utils.format import video_to_bytes
+from numpy.typing import NDArray
 
 pytestmark = [pytest.mark.local_model, pytest.mark.diffusion, pytest.mark.cpu]
 
@@ -165,7 +166,7 @@ def test_real_comfyui_non_mp4_source_is_uploaded_as_the_declared_mp4(monkeypatch
         stream = container.add_stream("ffv1", rate=Fraction(24, 1))
         stream.width, stream.height, stream.pix_fmt = 64, 64, "gray"
         for index in range(4):
-            frame = np.zeros((64, 64), dtype=np.uint8)
+            frame: NDArray[np.uint8] = np.zeros((64, 64), dtype=np.uint8)
             frame[:, 10 + index] = 255
             for packet in stream.encode(av.VideoFrame.from_ndarray(frame, format="gray")):
                 container.mux(packet)
