@@ -280,7 +280,16 @@ class _StartupMemoryProfiler:
         return False
 
 
-def _load_model(monkeypatch, pipeline, *, schedule, cache_backend=None, model_class_name="MiniMaxH3Pipeline"):
+def _load_model(
+    monkeypatch,
+    pipeline,
+    *,
+    schedule,
+    cache_backend=None,
+    model_class_name="MiniMaxH3Pipeline",
+    stage_role=None,
+    model_stage=None,
+):
     """Run the real load_model with the loader, memory profiler, offload and cache factory replaced."""
 
     class _Loader:
@@ -303,6 +312,8 @@ def _load_model(monkeypatch, pipeline, *, schedule, cache_backend=None, model_cl
         cache_backend=cache_backend,
         cache_config={},
         model_class_name=model_class_name,
+        stage_role=stage_role,
+        model_stage=model_stage,
         enforce_eager=True,
         streaming_output=False,
         diffusion_attention_schedule=schedule,
@@ -325,4 +336,58 @@ def test_startup_rejects_profiles_with_cache_backend_when_default_is_empty(monke
     with pytest.raises(ValueError, match="cache_backend='tea_cache'"):
         _load_model(
             monkeypatch, _StartupPublishingPipeline(), schedule=_profiles_only_service(), cache_backend="tea_cache"
+        )
+
+
+@pytest.mark.parametrize(
+    ("stage_role", "model_stage", "role"),
+    [
+        ("encode", "text_encode", "encode"),
+        ("decode", "decode", "decode"),
+        (None, "text_encode", "encode"),
+        (None, "vae_decode", "decode"),
+    ],
+    ids=["eg-egd-encode", "egd-decode", "legacy-text-encode", "legacy-vae-decode"],
+)
+def test_startup_rejects_profiles_on_a_stage_without_denoising(monkeypatch, stage_role, model_stage, role):
+    """The global schedule flag reaches every stage, including the Wan2.2 EG/EGD encode and decode stages."""
+    with pytest.raises(ValueError, match=rf"role '{role}'.*runs no denoising.*only on the denoising stage"):
+        _load_model(
+            monkeypatch,
+            _StartupPublishingPipeline(),
+            schedule=_service(),
+            model_class_name="WanPipeline",
+            stage_role=stage_role,
+            model_stage=model_stage,
+        )
+
+
+@pytest.mark.parametrize(
+    ("stage_role", "model_stage"),
+    [("denoise", "denoise"), ("denoise_decode", "dit"), ("full", "diffusion"), (None, None)],
+    ids=["egd-denoise", "eg-denoise-decode", "single-stage", "unset"],
+)
+def test_startup_accepts_profiles_on_a_denoising_wan_stage(monkeypatch, stage_role, model_stage):
+    pipeline = _StartupPublishingPipeline()
+
+    runner = _load_model(
+        monkeypatch,
+        pipeline,
+        schedule=_service(),
+        model_class_name="WanPipeline",
+        stage_role=stage_role,
+        model_stage=model_stage,
+    )
+
+    assert runner.pipeline is pipeline
+
+
+def test_startup_keeps_the_unsupported_model_error_on_the_h3_decode_stage(monkeypatch):
+    with pytest.raises(ValueError, match="Unsupported diffusion_attention_schedule: model 'MiniMaxH3DecoderPipeline'"):
+        _load_model(
+            monkeypatch,
+            _StartupPublishingPipeline(),
+            schedule=_service(),
+            model_class_name="MiniMaxH3DecoderPipeline",
+            model_stage="vae_decode",
         )
