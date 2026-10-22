@@ -921,8 +921,9 @@ class MiniMaxH3Pipeline(
         self.parallel_config = od_config.parallel_config
         if int(self.parallel_config.cfg_parallel_size) != 1:
             raise ValueError("MiniMax-H3 is CFG-distilled and has no negative branch; cfg_parallel_size must be 1")
-        # A request that omits attention_schedule and latent_refine inherits both defaults, a pair
-        # _prepare_encoder_conditioning_inputs rejects; fail here instead of on every such request.
+        # A request that omits attention_schedule, attention_sigma_schedule and latent_refine inherits the
+        # default step ranges and the latent_refine default, a pair _prepare_encoder_conditioning_inputs
+        # rejects; fail here instead of on every such request.
         service_schedule = getattr(od_config, "diffusion_attention_schedule", None)
         additional_config = getattr(od_config, "additional_config", None) or {}
         if (
@@ -932,8 +933,9 @@ class MiniMaxH3Pipeline(
         ):
             raise ValueError(
                 "MiniMax H3 cannot combine default diffusion_attention_schedule ranges with a latent_refine "
-                "default in --additional-config: every request that omits attention_schedule and latent_refine "
-                "would be rejected. Remove the default ranges or the latent_refine default."
+                "default in --additional-config: every request that omits attention_schedule, "
+                "attention_sigma_schedule and latent_refine would be rejected. Remove the default ranges or the "
+                "latent_refine default."
             )
         self.device = get_local_device()
         self.load_text_encoder = od_config.model_loaded.get("text_encoder", True)
