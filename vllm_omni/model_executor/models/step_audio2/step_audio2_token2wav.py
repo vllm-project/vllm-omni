@@ -364,9 +364,9 @@ class StepAudio2Token2WavCore(nn.Module):
 
     # Per-frame-count NPU graphs for the S3 quantize forward (short-audio
     # path), capped: Seed-TTS references span many lengths (179 distinct over
-    # 200 wavs), so only the few most common frame counts replay and the rest
-    # run eager — the cap guards against pathological callers capturing a
-    # graph per length.
+    # 200 wavs), so only the first ``_MAX_S3_GRAPHS`` frame counts seen get
+    # captured and every later distinct length runs eager — the cap guards
+    # against pathological callers capturing a graph per length.
     _MAX_S3_GRAPHS = 2
 
     @torch.inference_mode()
@@ -422,15 +422,19 @@ class StepAudio2Token2WavCore(nn.Module):
                         static_code = tok.quantizer.encode(h)
                     torch.npu.synchronize()
                     entry = (graph, static_mels, static_lens, static_code, code_len)
-                    self._s3_graphs[frames] = entry
                     # Captured kernels are recorded, not executed, so
                     # static_code and code_len still hold uninitialized
                     # pool memory here (the warmup results above went to
                     # temporary tensors). Replay once so this request
                     # gets the same real result the replay path produces.
+                    # The entry is published only after the replay+clone
+                    # succeeded: a failed first replay must not leave the
+                    # bucket registered, or later same-length requests
+                    # would replay a broken graph instead of falling back.
                     graph.replay()
                     code = static_code.clone()
                     code_len = entry[4].clone()
+                    self._s3_graphs[frames] = entry
                     self._s3_replay_calls += 1
                     self._s3_graph_done = stream.record_event() if stream is not None else None
                     logger.info(
