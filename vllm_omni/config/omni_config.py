@@ -1057,8 +1057,10 @@ class _DiffusionConfigProjection(_TrackExplicitConfigFields):
                 "diffusion_attention_config must be an AttentionConfig, mapping, or None, "
                 f"got {type(self.diffusion_attention_config)!r}"
             )
-        validate_kv_cache_dtype_vs_attention_specs(self.diffusion_kv_cache_dtype, self.diffusion_attention_config)
         self.diffusion_attention_schedule = parse_attention_schedule_config(self.diffusion_attention_schedule)
+        validate_kv_cache_dtype_vs_attention_specs(
+            self.diffusion_kv_cache_dtype, self.diffusion_attention_config, self.diffusion_attention_schedule
+        )
 
         self.diffusion_kv_mode = parse_diffusion_kv_cache_mode(self.diffusion_kv_mode)
         if self.enable_prefix_caching and self.diffusion_kv_mode is not DiffusionKVCacheMode.PAGED_SCHEDULER:
