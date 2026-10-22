@@ -135,6 +135,9 @@ errors on the job record rather than the creation response.
   Configured KV-cache quantization requires dtype support in every candidate.
 - H3 DiT profiles must exclude packed padding; VSA profiles require the VSA
   gate or a VSA base, and gated FastH3 layers accept only VSA.
+  FastH3 checkpoints pin VSA sparsity, so their profiles cannot set
+  `fastvideo_vsa_topk`. FastH3 Omni checks each VSA profile's provider and
+  precision at startup, as it does for the base.
 - TRTLLM `target_sparsity` needs a per-layer calibration curve unless the
   layer is explicitly ignored.
 
