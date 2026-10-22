@@ -73,13 +73,13 @@ if HAS_TRITON:
             d = tl.load(DENOM + (b * T + t) * S + s, mask=mask, other=1)
             g = tl.load(GAMMA + c).to(tl.float32)
             # Same operations and materialization boundaries as rms_norm_scale.
-            v = tl.math.div_rn(x, d).to(dtype).to(tl.float32)
+            v = rn.div_rn(x, d).to(dtype).to(tl.float32)
             v = (v * scale).to(dtype).to(tl.float32)
             v = (v * g).to(dtype).to(tl.float32)
             v = (v + 0.0).to(dtype)
             if SILU:
                 v32 = v.to(tl.float32)
-                v = tl.math.div_rn(v32, 1.0 + tldevice.exp(-v32)).to(dtype)
+                v = rn.div_rn(v32, 1.0 + tldevice.exp(-v32)).to(dtype)
             value = v
         elif TC > 0:
             cached_frame = frame - (PAD - TC)

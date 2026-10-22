@@ -34,6 +34,8 @@ from __future__ import annotations
 import torch
 from vllm.triton_utils import HAS_TRITON, tl, tldevice, triton
 
+from vllm_omni.diffusion.layers import vae_norm_epilogue as rn
+
 from ._utils import on_kernel_device
 
 _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
@@ -53,12 +55,12 @@ if HAS_TRITON:
     ):
         denom = tl.maximum(tl.sqrt(tl.sum(x * x, axis=1)), eps)
         if EXACT_BF16 and DTYPE == tl.bfloat16:
-            v = tl.math.div_rn(x, denom[:, None]).to(DTYPE).to(tl.float32)
+            v = rn.div_rn(x, denom[:, None]).to(DTYPE).to(tl.float32)
             v = (v * scale).to(DTYPE).to(tl.float32)
             v = (v * gamma[None, :]).to(DTYPE).to(tl.float32)
             v = (v + 0.0).to(DTYPE).to(tl.float32)
             if SILU:
-                v = tl.math.div_rn(v, 1.0 + tldevice.exp(-v))
+                v = rn.div_rn(v, 1.0 + tldevice.exp(-v))
         else:
             inv_norm = 1.0 / denom
             v = x * inv_norm[:, None] * (gamma * scale)[None, :]

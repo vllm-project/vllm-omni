@@ -18,6 +18,7 @@ from diffusers.models.autoencoders.autoencoder_kl_wan import (
 )
 from torch import nn
 from torch.nn.attention import SDPBackend, sdpa_kernel
+from vllm.triton_utils import tl, triton
 
 from tests.diffusion.distributed.wan_vae_fastpath_helpers import (  # noqa: F401
     original_wan_rms_norm,
@@ -88,6 +89,39 @@ def _make_norm(channels: int, dtype: torch.dtype, images: bool = False) -> WanRM
     with torch.no_grad():
         norm.gamma.copy_(torch.randn_like(norm.gamma) * 0.5 + 1.0)
     return norm
+
+
+@triton.jit
+def _div_rn_kernel(X, Y, OUT, n, BLOCK: tl.constexpr):  # noqa: N803
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < n
+    x = tl.load(X + offs, mask=mask, other=0.0)
+    y = tl.load(Y + offs, mask=mask, other=1.0)
+    tl.store(OUT + offs, rn.div_rn(x, y), mask=mask)
+
+
+@torch.no_grad()
+def test_div_rn_matches_aten_fp32_division() -> None:
+    """Every bit-exact epilogue relies on ``rn.div_rn`` being IEEE round-to-nearest.
+
+    triton-xpu 3.8 lowers ``tl.math.div_rn`` to an approximate divide on XPU, so this
+    pins the helper itself rather than leaving it to the downstream norm tests.
+    """
+    torch.manual_seed(0)
+    n = 1 << 20
+    x = torch.randn(n, device=DEVICE)
+    y = torch.rand(n, device=DEVICE) * 30 + 0.5
+    special = torch.tensor(
+        [0.0, -0.0, 1e-45, -1e-45, 1e-38, 3e38, float("inf"), -float("inf"), 1.0, 7.0, 1e-30], device=DEVICE
+    )
+    x[: special.numel() ** 2] = special.repeat_interleave(special.numel())
+    y[: special.numel() ** 2] = special.repeat(special.numel())
+    out = torch.empty_like(x)
+    _div_rn_kernel[(triton.cdiv(n, 1024),)](x, y, out, n, BLOCK=1024)
+    expected = x / y
+    nan = torch.isnan(expected)
+    assert torch.equal(torch.isnan(out), nan)
+    assert _bits_equal(out[~nan], expected[~nan])
 
 
 # --------------------------------------------------------------------------- #
