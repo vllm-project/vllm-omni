@@ -1468,8 +1468,10 @@ class OmniDiffusionConfig:
         # Match vLLM's config flow: parse entrypoint shorthands before the
         # config object is built, and keep a single runtime truth source.
         self.diffusion_attention_config = build_attention_config(self.diffusion_attention_config)
-        validate_kv_cache_dtype_vs_attention_specs(self.diffusion_kv_cache_dtype, self.diffusion_attention_config)
         self.diffusion_attention_schedule = parse_attention_schedule_config(self.diffusion_attention_schedule)
+        validate_kv_cache_dtype_vs_attention_specs(
+            self.diffusion_kv_cache_dtype, self.diffusion_attention_config, self.diffusion_attention_schedule
+        )
         self.diffusion_kv_cache_skip_step_indices = parse_kv_cache_skip_selector(self.diffusion_kv_cache_skip_steps)
         self.diffusion_kv_cache_skip_layer_indices = parse_kv_cache_skip_selector(self.diffusion_kv_cache_skip_layers)
 
@@ -2582,23 +2584,36 @@ def build_attention_config(
 def validate_kv_cache_dtype_vs_attention_specs(
     kv_cache_dtype: str | None,
     attention_config: "AttentionConfig | None",
+    schedule: "AttentionScheduleConfig | None" = None,
 ) -> None:
     """Reject a global attention-quant knob combined with per-backend quant specs.
 
     ``diffusion_kv_cache_dtype`` requests quantized attention for every layer;
     an explicit ``quant`` spec is the advanced per-backend override. Setting both
     is contradictory intent — fail fast instead of picking one silently. A pure
-    ``flashinfer_backend`` variant pin without dtypes is not a conflict.
+    ``flashinfer_backend`` variant pin without dtypes is not a conflict. Attention
+    schedule profiles follow the same rule, because a scheduled step keeps the
+    global knob.
     """
-    if kv_cache_dtype in (None, "auto", "float") or attention_config is None:
+    if kv_cache_dtype in (None, "auto", "float"):
         return
-    specs = [attention_config.default, *attention_config.per_role.values()]
-    for spec in specs:
+    configs = {"diffusion_attention_config": attention_config}
+    if schedule is not None:
+        configs |= {
+            f"diffusion_attention_schedule profile {name!r}": profile for name, profile in schedule.profiles.items()
+        }
+    specs = [
+        (source, spec)
+        for source, source_config in configs.items()
+        if source_config is not None
+        for spec in (source_config.default, *source_config.per_role.values())
+    ]
+    for source, spec in specs:
         if spec is None or spec.quant is None:
             continue
         if spec.quant.dtype_qk is not None or spec.quant.dtype_vo is not None:
             raise ValueError(
-                "diffusion_kv_cache_dtype conflicts with a diffusion_attention_config quant spec: "
+                f"diffusion_kv_cache_dtype conflicts with a {source} quant spec: "
                 "the unified knob already requests quantized attention. Remove the explicit "
                 "quant spec, or set diffusion_kv_cache_dtype to 'auto' and keep the spec."
             )
