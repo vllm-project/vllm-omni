@@ -446,13 +446,16 @@ def main():
     parser.add_argument(
         "--simulate-stt",
         action="store_true",
-        help="Simulate STT by sending text word-by-word",
+        help=(
+            "Simulate STT by sending text in token-sized pieces: one word at a time for"
+            " space-delimited text, one character at a time for CJK"
+        ),
     )
     parser.add_argument(
         "--stt-delay",
         type=float,
         default=0.1,
-        help="Delay between words in STT simulation (seconds)",
+        help="Delay between pieces in STT simulation (seconds)",
     )
 
     args = parser.parse_args()
