@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Runtime toggles shared by the CosyVoice3 stages."""
 
+import importlib.util
 import os
 from contextlib import nullcontext
 from functools import cache
@@ -45,26 +46,41 @@ def _fa_version_supported(version: int) -> bool:
     return is_fa_version_supported(version)
 
 
-def cosyvoice3_packed_fa_version() -> int | None:
-    """FlashAttention version for packed Flow: FA3 on Hopper, else FA2 (sm80+).
+@cache
+def _flashinfer_available() -> bool:
+    return importlib.util.find_spec("flashinfer") is not None
 
-    COSYVOICE3_PACKED_FA_VERSION pins one version, e.g. FA2 on Hopper to
-    compare it against FA3. None means no packed backend runs here.
+
+PACKED_ATTENTION_BACKENDS = ("fa3", "fa2", "flashinfer")
+
+
+def _backend_supported(backend: str) -> bool:
+    if backend == "flashinfer":
+        return _flashinfer_available()
+    return _fa_version_supported(int(backend[2]))
+
+
+def cosyvoice3_packed_attention_backend() -> str | None:
+    """Attention backend for packed Flow: FA3 on Hopper, else FA2 (sm80+).
+
+    COSYVOICE3_PACKED_ATTENTION_BACKEND pins ``fa3``, ``fa2`` or ``flashinfer``
+    (FlashInfer is only used when pinned). None means no packed backend runs
+    here.
     """
-    pinned = os.environ.get("COSYVOICE3_PACKED_FA_VERSION", "")
-    if pinned not in ("", "2", "3"):
-        raise ValueError("COSYVOICE3_PACKED_FA_VERSION must be 2 or 3")
+    pinned = os.environ.get("COSYVOICE3_PACKED_ATTENTION_BACKEND", "")
+    if pinned and pinned not in PACKED_ATTENTION_BACKENDS:
+        raise ValueError("COSYVOICE3_PACKED_ATTENTION_BACKEND must be fa3, fa2 or flashinfer")
     if not torch.cuda.is_available():
         return None
-    candidates = (int(pinned),) if pinned else (3, 2)
-    for version in candidates:
-        if _fa_version_supported(version):
-            return version
+    candidates = (pinned,) if pinned else ("fa3", "fa2")
+    for backend in candidates:
+        if _backend_supported(backend):
+            return backend
     return None
 
 
 def cosyvoice3_full_response_enabled() -> bool:
-    """Opt-in packed full-response path; devices without FA2/FA3 retain the standard path."""
+    """Opt-in packed full-response path; devices without a packed backend retain the standard path."""
     return _packed_profile_enabled("COSYVOICE3_FULL_RESPONSE_OPTIMIZATIONS")
 
 
@@ -78,21 +94,20 @@ def _packed_profile_enabled(environment_variable: str) -> bool:
     if not _env_flag(environment_variable, "0"):
         return False
 
-    fa_version = cosyvoice3_packed_fa_version()
-    if fa_version is not None:
+    if cosyvoice3_packed_attention_backend() is not None:
         return True
 
-    pinned = os.environ.get("COSYVOICE3_PACKED_FA_VERSION", "")
+    pinned = os.environ.get("COSYVOICE3_PACKED_ATTENTION_BACKEND", "")
     if pinned:
         logger.warning_once(
-            "%s is enabled but pinned FlashAttention %s is unavailable on this GPU/build; "
+            "%s is enabled but pinned attention backend %s is unavailable on this GPU/build; "
             "CosyVoice3 will use the stock Flow path",
             environment_variable,
             pinned,
         )
     else:
         logger.warning_once(
-            "%s is enabled but no supported CUDA FlashAttention backend is available; "
+            "%s is enabled but no supported CUDA attention backend is available; "
             "CosyVoice3 will use the stock Flow path",
             environment_variable,
         )

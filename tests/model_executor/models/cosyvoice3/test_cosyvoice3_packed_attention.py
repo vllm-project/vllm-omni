@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""CPU checks of the packed Flow attention metadata for FA3 and FA2.
+"""CPU checks of the packed Flow attention metadata for FA3, FA2 and FlashInfer.
 
 The kernels only run on CUDA; here a reference reads the K/V exactly as the
 FlashAttention calls are configured (paged, or unpaged varlen for FA2 full
@@ -17,22 +17,22 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 CHUNK = 50
 
 
-def _attention(lengths, fa_version, chunk_size=None, width=None):
+def _attention(lengths, backend, chunk_size=None, width=None):
     from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.packed_dit import (
         build_row_attention,
         pack_rows,
     )
 
     rows = pack_rows(lengths, torch.device("cpu"), width=width)
-    attention = build_row_attention(rows, heads=2, head_dim=8, fa_version=fa_version, chunk_size=chunk_size)
+    attention = build_row_attention(rows, heads=2, head_dim=8, backend=backend, chunk_size=chunk_size)
     return rows, attention
 
 
-@pytest.mark.parametrize("fa_version", [2, 3])
-def test_attention_metadata_retains_live_graph_buffers(fa_version):
+@pytest.mark.parametrize("backend", ["fa2", "fa3"])
+def test_attention_metadata_retains_live_graph_buffers(backend):
     from dataclasses import replace
 
-    _, source = _attention([17, 0, 33], fa_version, chunk_size=CHUNK)
+    _, source = _attention([17, 0, 33], backend, chunk_size=CHUNK)
     graph_attention = replace(source)
 
     # Constructing metadata must retain the graph buffers, not snapshot them.
@@ -44,7 +44,7 @@ def test_attention_metadata_retains_live_graph_buffers(fa_version):
         buffer.copy_(updated)
         assert getattr(graph_attention, name).data_ptr() == address
         assert torch.equal(getattr(graph_attention, name), updated)
-    assert graph_attention.page_size == (16 if fa_version == 2 else 1)
+    assert graph_attention.page_size == (16 if backend == "fa2" else 1)
 
 
 def _segment_frames(attention, segment):
@@ -94,12 +94,12 @@ def _row_reference(q, k, v, lengths, chunk_size):
     return torch.cat(output)
 
 
-@pytest.mark.parametrize("fa_version", [2, 3])
+@pytest.mark.parametrize("backend", ["fa2", "fa3"])
 @pytest.mark.parametrize("chunk_size", [None, CHUNK])
-def test_paged_attention_matches_isolated_row_attention(fa_version, chunk_size):
+def test_paged_attention_matches_isolated_row_attention(backend, chunk_size):
     # Unaligned rows, a 16-frame row, a single frame and an empty bucket slot.
     lengths = [67, 0, 103, 16, 1]
-    _, attention = _attention(lengths, fa_version, chunk_size)
+    _, attention = _attention(lengths, backend, chunk_size)
     generator = torch.Generator().manual_seed(0)
     q, k, v = [torch.randn(sum(lengths), 2, 8, generator=generator) for _ in range(3)]
 
@@ -108,11 +108,11 @@ def test_paged_attention_matches_isolated_row_attention(fa_version, chunk_size):
     torch.testing.assert_close(actual, _row_reference(q, k, v, lengths, chunk_size))
 
 
-@pytest.mark.parametrize("fa_version", [2, 3])
+@pytest.mark.parametrize("backend", ["fa2", "fa3"])
 @pytest.mark.parametrize("chunk_size", [None, CHUNK])
 @pytest.mark.parametrize("lengths", [[1], [15, 17, 33], [67, 0, 103, 16, 1], [500, 7, 129, 64, 0]])
-def test_every_segment_reads_exactly_its_rows_frames(fa_version, chunk_size, lengths):
-    rows, attention = _attention(lengths, fa_version, chunk_size)
+def test_every_segment_reads_exactly_its_rows_frames(backend, chunk_size, lengths):
+    rows, attention = _attention(lengths, backend, chunk_size)
     page_size = attention.page_size
 
     if attention.paged:
@@ -136,7 +136,7 @@ def test_every_segment_reads_exactly_its_rows_frames(fa_version, chunk_size, len
 @pytest.mark.parametrize("chunk_size", [None, CHUNK])
 def test_fa2_slots_aliasing_frame_zero_never_reach_other_rows(chunk_size):
     lengths = [7, 67, 1, 103, 16]
-    _, attention = _attention(lengths, fa_version=2, chunk_size=chunk_size)
+    _, attention = _attention(lengths, backend="fa2", chunk_size=chunk_size)
     generator = torch.Generator().manual_seed(1)
     q, k, v = [torch.randn(sum(lengths), 2, 8, generator=generator) for _ in range(3)]
     clean = _paged_attention(q, k, v, attention)
@@ -163,15 +163,15 @@ def test_flow_graph_slot_buffer_covers_every_padded_layout(monkeypatch, seed):
     dit = SimpleNamespace(transformer_blocks=[SimpleNamespace(attn=attn)], static_chunk_size=CHUNK)
     rng = random.Random(seed)
     noise, spks, time_span = torch.zeros(1, 1, 80), torch.zeros(1, 80), torch.zeros(4)
-    for fa_version in (2, 3):
-        runner = FlowGraphRunner(SimpleNamespace(dit=dit, fa_version=fa_version))
-        page_size = 16 if fa_version == 2 else 1
+    for backend in ("fa2", "fa3"):
+        runner = FlowGraphRunner(SimpleNamespace(dit=dit, backend=backend, dtype=None))
+        page_size = 16 if backend == "fa2" else 1
         for _ in range(50):
             lengths = tuple(rng.choice([1, 15, 17, rng.randint(1, 900)]) for _ in range(rng.randint(1, 8)))
             streaming = rng.random() < 0.5
             key, twin, seg_rows, seg_ends, _ = runner._layout(lengths, streaming)
             state = runner._allocate(key, noise, spks, time_span)
-            if fa_version == 2 and not streaming:
+            if backend == "fa2" and not streaming:
                 # Full-context FA2 graphs attend unpaged and keep no page buffers.
                 assert state.page_table is None and state.slot_frames is None
                 continue
@@ -193,7 +193,7 @@ def test_flow_graph_slot_buffer_covers_every_padded_layout(monkeypatch, seed):
 
 def test_fa3_pages_are_the_packed_sequence_itself():
     lengths = [67, 0, 103]
-    rows, attention = _attention(lengths, fa_version=3, chunk_size=CHUNK)
+    rows, attention = _attention(lengths, backend="fa3", chunk_size=CHUNK)
 
     assert attention.page_size == 1
     assert torch.equal(attention.slot_frames, torch.arange(rows.total))
@@ -205,7 +205,7 @@ def test_fa3_pages_are_the_packed_sequence_itself():
 
 
 def test_fa2_pages_round_up_while_geometry_keeps_the_bucketed_width():
-    rows, attention = _attention([5, 0, 37], fa_version=2, chunk_size=CHUNK, width=256)
+    rows, attention = _attention([5, 0, 37], backend="fa2", chunk_size=CHUNK, width=256)
 
     assert rows.width == 256
     assert attention.page_table.shape == (3, 16)
@@ -221,8 +221,8 @@ def test_fa2_full_context_attends_unpaged_while_fa3_keeps_in_place_pages(width):
     from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.packed_dit import attention_uses_pages
 
     lengths = [5, 0, 37, 16]
-    _, fa2 = _attention(lengths, fa_version=2, width=width)
-    _, fa3 = _attention(lengths, fa_version=3, width=width)
+    _, fa2 = _attention(lengths, backend="fa2", width=width)
+    _, fa3 = _attention(lengths, backend="fa3", width=width)
 
     # FA2 full context: one segment per row whose K/V span is its query span.
     assert not fa2.paged and fa2.page_table is None and fa2.slot_frames is None
@@ -231,7 +231,10 @@ def test_fa2_full_context_attends_unpaged_while_fa3_keeps_in_place_pages(width):
     assert fa2.max_seqlen_q == 37
     # FA3 keeps its one-frame pages, and chunk-causal segments stay paged on both.
     assert fa3.paged
-    assert [attention_uses_pages(v, chunked) for v in (2, 3) for chunked in (False, True)] == [False, True, True, True]
+    backends = ("fa2", "fa3", "flashinfer")
+    uses_pages = [attention_uses_pages(b, chunked) for b in backends for chunked in (False, True)]
+    # FlashInfer plans its own KV indices instead of a FlashAttention page table.
+    assert uses_pages == [False, True, True, True, False, False]
 
 
 def test_rope_only_needs_a_width_covering_every_row():
@@ -253,40 +256,45 @@ def test_rope_only_needs_a_width_covering_every_row():
 def fake_gpu(monkeypatch):
     import vllm_omni.model_executor.models.cosyvoice3.runtime as runtime
 
-    supported: set[int] = set()
+    supported: set[str] = set()
     monkeypatch.setattr(runtime.torch.cuda, "is_available", lambda: True)
-    monkeypatch.setattr(runtime, "_fa_version_supported", lambda version: version in supported)
-    monkeypatch.delenv("COSYVOICE3_PACKED_FA_VERSION", raising=False)
+    monkeypatch.setattr(runtime, "_backend_supported", lambda backend: backend in supported)
+    monkeypatch.delenv("COSYVOICE3_PACKED_ATTENTION_BACKEND", raising=False)
     return runtime, supported
 
 
 @pytest.mark.parametrize(
     "supported, pinned, expected",
     [
-        ({2, 3}, None, 3),  # Hopper
-        ({2}, None, 2),  # Ampere, Ada, Blackwell
+        ({"fa2", "fa3"}, None, "fa3"),  # Hopper
+        ({"fa2"}, None, "fa2"),  # Ampere, Ada, Blackwell
         (set(), None, None),
-        ({2, 3}, "2", 2),
-        ({2}, "3", None),
+        ({"fa2", "fa3"}, "fa2", "fa2"),
+        ({"fa2"}, "fa3", None),
+        # FlashInfer is opt-in: installed alone, it is never picked automatically.
+        ({"fa2", "fa3", "flashinfer"}, None, "fa3"),
+        ({"flashinfer"}, None, None),
+        ({"fa2", "flashinfer"}, "flashinfer", "flashinfer"),
+        ({"fa2"}, "flashinfer", None),
     ],
 )
-def test_packed_fa_version_prefers_fa3_and_honors_the_pin(monkeypatch, fake_gpu, supported, pinned, expected):
+def test_packed_backend_prefers_fa3_and_honors_the_pin(monkeypatch, fake_gpu, supported, pinned, expected):
     runtime, available = fake_gpu
     available.update(supported)
     if pinned is not None:
-        monkeypatch.setenv("COSYVOICE3_PACKED_FA_VERSION", pinned)
+        monkeypatch.setenv("COSYVOICE3_PACKED_ATTENTION_BACKEND", pinned)
     monkeypatch.setenv("COSYVOICE3_FULL_RESPONSE_OPTIMIZATIONS", "1")
     monkeypatch.setenv("COSYVOICE3_PACKED_STREAMING", "1")
 
-    assert runtime.cosyvoice3_packed_fa_version() == expected
+    assert runtime.cosyvoice3_packed_attention_backend() == expected
     assert runtime.cosyvoice3_full_response_enabled() is (expected is not None)
     assert runtime.cosyvoice3_packed_streaming_enabled() is (expected is not None)
 
 
-def test_packed_fa_version_rejects_unknown_pins(monkeypatch, fake_gpu):
-    monkeypatch.setenv("COSYVOICE3_PACKED_FA_VERSION", "4")
-    with pytest.raises(ValueError, match="must be 2 or 3"):
-        fake_gpu[0].cosyvoice3_packed_fa_version()
+def test_packed_backend_rejects_unknown_pins(monkeypatch, fake_gpu):
+    monkeypatch.setenv("COSYVOICE3_PACKED_ATTENTION_BACKEND", "3")
+    with pytest.raises(ValueError, match="must be fa3, fa2 or flashinfer"):
+        fake_gpu[0].cosyvoice3_packed_attention_backend()
 
 
 def test_packed_profiles_stay_off_without_cuda(monkeypatch):
@@ -294,5 +302,100 @@ def test_packed_profiles_stay_off_without_cuda(monkeypatch):
 
     monkeypatch.setattr(runtime.torch.cuda, "is_available", lambda: False)
     monkeypatch.setenv("COSYVOICE3_FULL_RESPONSE_OPTIMIZATIONS", "1")
-    assert runtime.cosyvoice3_packed_fa_version() is None
+    assert runtime.cosyvoice3_packed_attention_backend() is None
     assert not runtime.cosyvoice3_full_response_enabled()
+
+
+@pytest.fixture
+def fake_flashinfer(monkeypatch):
+    """A flashinfer module whose wrappers record what they are planned with."""
+    import sys
+    from types import ModuleType
+
+    class Wrapper:
+        def __init__(self, float_workspace, layout, use_cuda_graph=False, **buffers):
+            self.use_cuda_graph, self.buffers, self.planned = use_cuda_graph, buffers, None
+
+        def reset_workspace_buffer(self, float_workspace, int_workspace):
+            self.workspaces = (float_workspace, int_workspace)
+
+        def plan(self, *args, **kwargs):
+            self.planned = (args, kwargs)
+
+    module = ModuleType("flashinfer")
+    module.BatchPrefillWithPagedKVCacheWrapper = type("Paged", (Wrapper,), {})
+    module.BatchPrefillWithRaggedKVCacheWrapper = type("Ragged", (Wrapper,), {})
+    monkeypatch.setitem(sys.modules, "flashinfer", module)
+    import vllm_omni.model_executor.models.cosyvoice3.code2wav_core.packed_flashinfer as packed_flashinfer
+
+    monkeypatch.setattr(packed_flashinfer, "_workspaces", {})
+    return packed_flashinfer
+
+
+@pytest.mark.parametrize("lengths", [[1], [15, 17, 33], [67, 0, 103, 16, 1], [500, 7, 129, 64, 0]])
+def test_flashinfer_chunk_plan_reads_each_rows_prefix_in_place(fake_flashinfer, lengths):
+    from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.packed_dit import row_segments
+
+    plan = fake_flashinfer.FlashInferRowPlan(
+        torch.device("cpu"), heads=2, head_dim=8, dtype=torch.bfloat16, chunked=True
+    )
+    segment_rows, segment_ends, offsets = row_segments(lengths, CHUNK)
+    plan.plan(lengths, segment_rows, segment_ends, offsets)
+    (qo_indptr, kv_indptr, indices, last_page_len, heads, kv_heads, head_dim, page_size), kwargs = plan.wrapper.planned
+
+    assert (heads, kv_heads, head_dim, page_size) == (2, 2, 8, 1)
+    # FlashInfer reads index tensors as int32; int64 ones are misread.
+    assert {t.dtype for t in (qo_indptr, kv_indptr, indices, last_page_len)} == {torch.int32}
+    assert kwargs == {"causal": False, "q_data_type": torch.bfloat16, "disable_split_kv": True}
+    assert qo_indptr.tolist() == offsets
+    assert last_page_len.tolist() == [1] * len(segment_ends)
+    # One-frame pages are packed frames: each segment reads its row's prefix.
+    row_starts = [sum(lengths[:row]) for row in range(len(lengths))]
+    for segment, (row, end) in enumerate(zip(segment_rows, segment_ends)):
+        frames = indices[kv_indptr[segment] : kv_indptr[segment + 1]]
+        assert frames.tolist() == list(range(row_starts[row], row_starts[row] + end))
+
+
+def test_flashinfer_full_context_plan_attends_each_rows_own_span(fake_flashinfer):
+    from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.packed_dit import row_segments
+
+    plan = fake_flashinfer.FlashInferRowPlan(
+        torch.device("cpu"), heads=2, head_dim=8, dtype=torch.float16, chunked=False
+    )
+    lengths = [5, 0, 37, 16]
+    plan.plan(lengths, *row_segments(lengths, None))
+    (qo_indptr, kv_indptr, heads, kv_heads, head_dim), kwargs = plan.wrapper.planned
+
+    assert type(plan.wrapper).__name__ == "Ragged"
+    assert qo_indptr.tolist() == kv_indptr.tolist() == [0, 5, 5, 42, 58]
+    assert (heads, kv_heads, head_dim) == (2, 2, 8)
+
+
+@pytest.mark.parametrize("seed", range(4))
+def test_flashinfer_graph_buffers_cover_every_padded_layout(monkeypatch, fake_flashinfer, seed):
+    import random
+    from types import SimpleNamespace
+
+    from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.packed_dit import FlowGraphRunner
+
+    monkeypatch.setattr(torch.cuda, "CUDAGraph", lambda: None)
+    attn = SimpleNamespace(heads=2, inner_dim=16)
+    dit = SimpleNamespace(transformer_blocks=[SimpleNamespace(attn=attn)], static_chunk_size=CHUNK)
+    runner = FlowGraphRunner(SimpleNamespace(dit=dit, backend="flashinfer", dtype=torch.bfloat16))
+    rng = random.Random(seed)
+    noise, spks, time_span = torch.zeros(1, 1, 80), torch.zeros(1, 80), torch.zeros(4)
+    for _ in range(50):
+        lengths = tuple(rng.choice([1, 15, 17, rng.randint(1, 900)]) for _ in range(rng.randint(1, 8)))
+        streaming = rng.random() < 0.5
+        key, twin, seg_rows, seg_ends, offsets = runner._layout(lengths, streaming)
+        state = runner._allocate(key, noise, spks, time_span)
+        wrapper = state.flashinfer.wrapper
+
+        assert state.page_table is None and state.slot_frames is None
+        assert wrapper.use_cuda_graph
+        assert wrapper.buffers["qo_indptr_buf"].shape[0] == len(offsets)
+        if streaming:
+            assert sum(seg_ends) <= wrapper.buffers["paged_kv_indices_buf"].shape[0]
+            assert wrapper.buffers["paged_kv_last_page_len_buf"].shape[0] == len(seg_ends)
+        else:
+            assert wrapper.buffers["kv_indptr_buf"].shape[0] == len(offsets)

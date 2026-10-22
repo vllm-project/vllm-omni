@@ -5,9 +5,10 @@
 Adapted from SGLang-Omni packed_dit.py, commit
 127f34b57446a3cb5588ec987da0771a3be675be (Apache-2.0):
 https://github.com/sgl-project/sglang-omni
-Attention runs on vLLM's FlashAttention: FA3 on Hopper, FA2 on other GPUs.
-Chunk-causal segments read paged K/V (FA3 one-frame pages, FA2 16-frame
-pages); FA2 full-context segments are whole rows and attend unpaged.
+Attention runs on vLLM's FlashAttention, FA3 on Hopper and FA2 on other GPUs,
+or on FlashInfer when pinned (see packed_flashinfer.py). FlashAttention's
+chunk-causal segments read paged K/V (FA3 one-frame pages, FA2 16-frame pages);
+FA2 full-context segments are whole rows and attend unpaged.
 """
 
 from __future__ import annotations
@@ -20,23 +21,51 @@ import torch._dynamo as dynamo
 import torch.nn.functional as F
 from vllm.logger import init_logger
 
-from ..runtime import cosyvoice3_packed_fa_version
+from ..runtime import cosyvoice3_packed_attention_backend
 from .packed_conv import pack_conv_weight, packed_causal_conv_mish
+from .packed_flashinfer import FlashInferRowPlan, activate, flashinfer_row_attention, paged_index_capacity
 
 # FA3 pages the packed KV in place. vLLM's FA2 requires pages of a multiple of
 # 16 frames, so every paged row is gathered onto a page-aligned start.
-PAGE_SIZE = {3: 1, 2: 16}
+PAGE_SIZE = {"fa3": 1, "fa2": 16}
+FA_VERSION = {"fa3": 3, "fa2": 2}
+# Head dims FlashInfer's prefill kernels are instantiated for (CosyVoice3: 64).
+FLASHINFER_HEAD_DIMS = (64, 128, 256)
 logger = init_logger(__name__)
 
 
-def attention_uses_pages(fa_version: int, chunked: bool) -> bool:
-    """Whether segments read K/V through a page table.
+def attention_uses_pages(backend: str, chunked: bool) -> bool:
+    """Whether segments read K/V through a FlashAttention page table.
 
     A full-context segment is its whole row, so its K/V span equals its query
     span and plain varlen attention reads the packed K/V directly. FA2 takes
     that path and skips the page gather; FA3 pages in place at no cost.
+    FlashInfer plans its own KV indices.
     """
-    return chunked or fa_version == 3
+    return backend == "fa3" or (backend == "fa2" and chunked)
+
+
+def row_segments(lengths: Sequence[int], chunk_size: int | None) -> tuple[list[int], list[int], list[int]]:
+    """Host attention segments of packed rows: (rows, KV ends, query offsets).
+
+    With no chunk size, each row is one segment over its whole row. Otherwise
+    each chunk of queries is a segment over the row prefix ending at it. Empty
+    rows retain an empty segment so bucketed layouts have stable shapes.
+    """
+    segment_rows, segment_ends, offsets = [], [], [0]
+    for row, length in enumerate(lengths):
+        if length == 0:
+            segment_rows.append(row)
+            segment_ends.append(0)
+            offsets.append(offsets[-1])
+            continue
+        span = chunk_size or length
+        for start in range(0, length, span):
+            end = min(start + span, length)
+            segment_rows.append(row)
+            segment_ends.append(end)
+            offsets.append(offsets[-1] + end - start)
+    return segment_rows, segment_ends, offsets
 
 
 def page_metadata(
@@ -79,7 +108,7 @@ class RaggedRowAttention:
 
     heads: int
     head_dim: int
-    fa_version: int
+    backend: str
     max_seqlen_q: int
     cache_seqlens: torch.Tensor
     cu_seqlens_q: torch.Tensor
@@ -91,9 +120,13 @@ class RaggedRowAttention:
         return self.page_table is not None
 
     @property
+    def fa_version(self) -> int:
+        return FA_VERSION[self.backend]
+
+    @property
     def page_size(self) -> int:
         """Number of KV frames per page for the selected backend."""
-        return PAGE_SIZE[self.fa_version]
+        return PAGE_SIZE[self.backend]
 
 
 def build_row_attention(
@@ -101,7 +134,7 @@ def build_row_attention(
     *,
     heads: int,
     head_dim: int,
-    fa_version: int,
+    backend: str,
     chunk_size: int | None = None,
 ) -> RaggedRowAttention:
     """Build metadata isolating packed rows and optional causal query chunks.
@@ -111,27 +144,13 @@ def build_row_attention(
     segment so bucketed layouts have stable metadata shapes.
     """
     device = rows.row_ids.device
-    segment_rows, segment_ends, offsets = [], [], [0]
-    for row, length in enumerate(rows.lengths):
-        if length == 0:
-            # Bucketed layouts keep one (empty) segment per row slot so
-            # metadata shapes are identical across batches in a bucket.
-            segment_rows.append(row)
-            segment_ends.append(0)
-            offsets.append(offsets[-1])
-            continue
-        span = chunk_size or length
-        for start in range(0, length, span):
-            end = min(start + span, length)
-            segment_rows.append(row)
-            segment_ends.append(end)
-            offsets.append(offsets[-1] + end - start)
+    segment_rows, segment_ends, offsets = row_segments(rows.lengths, chunk_size)
     cache_seqlens = torch.tensor(segment_ends, dtype=torch.int32, device=device)
     cu_seqlens_q = torch.tensor(offsets, dtype=torch.int32, device=device)
     max_seqlen_q = max(b - a for a, b in zip(offsets, offsets[1:]))
     page_table = slot_frames = None
-    if attention_uses_pages(fa_version, chunk_size is not None):
-        page_size = PAGE_SIZE[fa_version]
+    if attention_uses_pages(backend, chunk_size is not None):
+        page_size = PAGE_SIZE[backend]
         page_table, slot_frames = page_metadata(
             torch.tensor(rows.lengths, device=device),
             torch.tensor(segment_rows, device=device),
@@ -145,7 +164,7 @@ def build_row_attention(
     return RaggedRowAttention(
         heads=heads,
         head_dim=head_dim,
-        fa_version=fa_version,
+        backend=backend,
         max_seqlen_q=max_seqlen_q,
         cache_seqlens=cache_seqlens,
         cu_seqlens_q=cu_seqlens_q,
@@ -155,15 +174,21 @@ def build_row_attention(
 
 
 class PackedDiT:
-    """Adapt a loaded DiT to compiled, variable-length inference with paged FlashAttention."""
+    """Adapt a loaded DiT to compiled, variable-length inference with packed attention."""
 
     def __init__(self, dit: torch.nn.Module) -> None:
-        fa_version = cosyvoice3_packed_fa_version()
-        if fa_version is None:
-            raise ValueError("Packed Flow requires FlashAttention 2 or 3")
-        self.fa_version = fa_version
-        logger.info_once("CosyVoice3 packed Flow selected FlashAttention %d", fa_version)
+        backend = cosyvoice3_packed_attention_backend()
+        if backend is None:
+            raise ValueError("Packed Flow requires FlashAttention 2 or 3, or FlashInfer")
+        attn = dit.transformer_blocks[0].attn
+        if backend == "flashinfer" and attn.inner_dim // attn.heads not in FLASHINFER_HEAD_DIMS:
+            raise ValueError(f"FlashInfer packed Flow supports head dims {FLASHINFER_HEAD_DIMS}")
+        self.backend = backend
+        logger.info_once("CosyVoice3 packed Flow selected attention backend %s", backend)
         self.dit = dit
+        self.dtype: torch.dtype | None = None
+        # FlashInfer plans of ordinary (non-graph) solves, by chunk-causality.
+        self._flashinfer_plans: dict[bool, FlashInferRowPlan] = {}
         self.compiled_full_forward = None
         self.graph_buckets = False
         self.graph_runner: FlowGraphRunner | None = None
@@ -213,10 +238,15 @@ class PackedDiT:
     def compile(self, dtype: torch.dtype) -> None:
         if dtype not in (torch.float16, torch.bfloat16):
             raise ValueError("Packed Flow requires FP16 or BF16")
+        self.dtype = dtype
         import os
 
         options = {"emulate_precision_casts": True}
         if os.environ.get("COSYVOICE3_FLOW_CUDAGRAPH") == "1":
+            if self.backend == "flashinfer":
+                # Inductor graphs would replay a stale FlashInfer plan; the
+                # Flow graph runner (COSYVOICE3_FLOW_GRAPH) re-plans instead.
+                raise ValueError("COSYVOICE3_FLOW_CUDAGRAPH does not support the FlashInfer backend")
             # Inductor CUDA graphs replay one recording per concrete shape;
             # full-context batches are padded to recurring buckets.
             options["triton.cudagraphs"] = True
@@ -237,13 +267,17 @@ class PackedDiT:
 
     def row_attention(self, rows: PackedRows, *, streaming: bool) -> RaggedRowAttention:
         attn = self.dit.transformer_blocks[0].attn
-        result = build_row_attention(
-            rows,
-            heads=attn.heads,
-            head_dim=attn.inner_dim // attn.heads,
-            fa_version=self.fa_version,
-            chunk_size=self.dit.static_chunk_size if streaming else None,
-        )
+        heads, head_dim = attn.heads, attn.inner_dim // attn.heads
+        chunk_size = self.dit.static_chunk_size if streaming else None
+        result = build_row_attention(rows, heads=heads, head_dim=head_dim, backend=self.backend, chunk_size=chunk_size)
+        if self.backend == "flashinfer":
+            plan = self._flashinfer_plans.get(streaming)
+            if plan is None:
+                plan = self._flashinfer_plans[streaming] = FlashInferRowPlan(
+                    rows.row_ids.device, heads=heads, head_dim=head_dim, dtype=self.dtype, chunked=streaming
+                )
+            plan.plan(rows.lengths, *row_segments(rows.lengths, chunk_size))
+            activate(plan)
         mark_packed_compile_metadata(rows, result)
         return result
 
@@ -569,7 +603,10 @@ def ragged_attention_tensor_geometry(
 ) -> torch.Tensor:
     head_shape = (-1, attention.heads, attention.head_dim)
     query, key, value = query[0].reshape(head_shape), key[0].reshape(head_shape), value[0].reshape(head_shape)
-    if attention.paged:
+    if attention.backend == "flashinfer":
+        # The solve planned its layout before the first call (see PackedDiT.row_attention).
+        output = flashinfer_row_attention(query, key, value)
+    elif attention.paged:
         k_pages, v_pages = paged_kv(key, value, attention)
         output = paged_varlen_attention(
             query,
@@ -863,6 +900,7 @@ class _FlowGraph:
     slot_frames: torch.Tensor | None
     frames: torch.Tensor
     output: torch.Tensor | None = None
+    flashinfer: FlashInferRowPlan | None = None
 
 
 class FlowGraphRunner:
@@ -893,19 +931,7 @@ class FlowGraphRunner:
             return None
         twin = (tuple(lengths) + (0,) * (slots - n) + (padded_total - total,)) * 2
         chunk = self.estimator.dit.static_chunk_size if streaming else None
-        seg_rows, seg_ends, offsets = [], [], [0]
-        for row, length in enumerate(twin):
-            if length == 0:
-                seg_rows.append(row)
-                seg_ends.append(0)
-                offsets.append(offsets[-1])
-                continue
-            span = chunk or length
-            for start in range(0, length, span):
-                end = min(start + span, length)
-                seg_rows.append(row)
-                seg_ends.append(end)
-                offsets.append(offsets[-1] + end - start)
+        seg_rows, seg_ends, offsets = row_segments(twin, chunk)
         segments = len(seg_ends)
         if streaming:
             segments = -(-segments // _FLOW_GRAPH_SEGMENT_STEP) * _FLOW_GRAPH_SEGMENT_STEP
@@ -920,10 +946,20 @@ class FlowGraphRunner:
         device, dtype = noise.device, noise.dtype
         channels = noise.shape[-1]
         rows = 2 * (slots + 1)
-        fa_version = self.estimator.fa_version
-        page_size = PAGE_SIZE[fa_version]
-        page_table = slot_frames = None
-        if attention_uses_pages(fa_version, streaming):
+        backend = self.estimator.backend
+        page_size = PAGE_SIZE.get(backend, 1)
+        page_table = slot_frames = flashinfer = None
+        if backend == "flashinfer":
+            chunk = self.estimator.dit.static_chunk_size
+            flashinfer = FlashInferRowPlan(
+                device,
+                heads=self.heads,
+                head_dim=self.head_dim,
+                dtype=self.estimator.dtype,
+                chunked=streaming,
+                graph_capacity=(segments, paged_index_capacity(padded_total, chunk) if streaming else 0),
+            )
+        if attention_uses_pages(backend, streaming):
             page_table = torch.zeros((segments, -(-padded_total // page_size)), device=device, dtype=torch.int32)
             # Each row wastes less than one page: a static bound on the slots.
             slot_frames = torch.zeros(
@@ -944,6 +980,7 @@ class FlowGraphRunner:
             page_table=page_table,
             slot_frames=slot_frames,
             frames=torch.arange(padded_total, device=device),
+            flashinfer=flashinfer,
         )
 
     def _load(self, state: _FlowGraph, twin, seg_rows, seg_ends, offsets, noise, mu, cond, spks, time_span) -> None:
@@ -968,12 +1005,14 @@ class FlowGraphRunner:
                 ends,
                 state.row_ids,
                 state.positions,
-                page_size=PAGE_SIZE[self.estimator.fa_version],
+                page_size=PAGE_SIZE[self.estimator.backend],
                 columns=state.page_table.shape[1],
                 slots=state.slot_frames.shape[0],
             )
             state.page_table.copy_(page_table)
             state.slot_frames.copy_(slot_frames)
+        if state.flashinfer is not None:
+            state.flashinfer.plan(twin, seg_rows, seg_ends, offsets)
         state.noise[:, :total].copy_(noise)
         state.mu[:, :total].copy_(mu)
         state.cond[:, :total].copy_(cond)
@@ -989,10 +1028,12 @@ class FlowGraphRunner:
         # Streaming queries cover one training chunk even when the KV prefix
         # and packed graph allocation contain thousands of frames.
         max_seqlen_q = estimator.dit.static_chunk_size if key[0] else rows.width
+        if state.flashinfer is not None:
+            activate(state.flashinfer)
         attention = RaggedRowAttention(
             heads=self.heads,
             head_dim=self.head_dim,
-            fa_version=estimator.fa_version,
+            backend=estimator.backend,
             max_seqlen_q=max_seqlen_q,
             cache_seqlens=state.cache_seqlens,
             cu_seqlens_q=state.cu_seqlens_q,

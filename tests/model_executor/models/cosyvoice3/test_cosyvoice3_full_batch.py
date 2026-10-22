@@ -37,16 +37,19 @@ def _items(shapes, **extra):
     ]
 
 
-def require_packed_fa(monkeypatch, fa_version):
+PACKED_BACKENDS = ["fa2", "fa3", "flashinfer"]
+
+
+def require_packed_backend(monkeypatch, backend):
     """Pin the packed Flow attention backend, skipping GPUs without it."""
-    from vllm_omni.model_executor.models.cosyvoice3.runtime import cosyvoice3_packed_fa_version
+    from vllm_omni.model_executor.models.cosyvoice3.runtime import cosyvoice3_packed_attention_backend
 
-    monkeypatch.setenv("COSYVOICE3_PACKED_FA_VERSION", str(fa_version))
-    if cosyvoice3_packed_fa_version() != fa_version:
-        pytest.skip(f"FA{fa_version} is unavailable on this GPU")
+    monkeypatch.setenv("COSYVOICE3_PACKED_ATTENTION_BACKEND", backend)
+    if cosyvoice3_packed_attention_backend() != backend:
+        pytest.skip(f"{backend} is unavailable on this GPU")
 
 
-def tiny_flow(monkeypatch):
+def tiny_flow(monkeypatch, backend=None):
     import vllm_omni.model_executor.models.cosyvoice3.cosyvoice3_code2wav as module
     from vllm_omni.transformers_utils.configs.cosyvoice3 import CosyVoice3Config
 
@@ -54,7 +57,9 @@ def tiny_flow(monkeypatch):
     monkeypatch.setattr(module, "CausalHiFTGenerator", MelOutput)
     config = CosyVoice3Config()
     config.flow["pre_lookahead_layer"]["channels"] = 32
-    config.flow["decoder"]["estimator"].update(dim=32, depth=2, heads=4, dim_head=8)
+    # FlashInfer's prefill kernels need a head dim of at least 64.
+    heads, dim_head = (2, 64) if backend == "flashinfer" else (4, 8)
+    config.flow["decoder"]["estimator"].update(dim=32, depth=2, heads=heads, dim_head=dim_head)
     return module.CosyVoice3Code2Wav(config).cuda().eval()
 
 
@@ -79,12 +84,12 @@ def test_full_batch_ragged_prompt_matches_independent_flow(monkeypatch, offset, 
 
 
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
-@pytest.mark.parametrize("fa_version", [2, 3])
+@pytest.mark.parametrize("backend", PACKED_BACKENDS)
 @torch.inference_mode()
-def test_packed_full_response_preserves_request_isolation(monkeypatch, fa_version):
-    require_packed_fa(monkeypatch, fa_version)
+def test_packed_full_response_preserves_request_isolation(monkeypatch, backend):
+    require_packed_backend(monkeypatch, backend)
     monkeypatch.setenv("COSYVOICE3_FULL_RESPONSE_OPTIMIZATIONS", "1")
-    model = tiny_flow(monkeypatch).bfloat16()
+    model = tiny_flow(monkeypatch, backend).bfloat16()
     model.hift.upsample_rates = [1]
     model.hift.istft_params = {"hop_len": 1}
     items = _items([(7, 17), (13, 9), (3, 31)])
@@ -118,23 +123,32 @@ def test_packed_stream_noise_growth_preserves_prefix_and_global_rng():
 
 
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
-@pytest.mark.parametrize("fa_version", [2, 3])
+@pytest.mark.parametrize("backend", PACKED_BACKENDS)
 @pytest.mark.parametrize("chunk_size", [None, 50])
 @torch.inference_mode()
-def test_packed_attention_matches_row_reference(monkeypatch, fa_version, chunk_size):
-    require_packed_fa(monkeypatch, fa_version)
+def test_packed_attention_matches_row_reference(monkeypatch, backend, chunk_size):
+    require_packed_backend(monkeypatch, backend)
     from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.packed_dit import (
+        attention_uses_pages,
         build_row_attention,
         pack_rows,
         ragged_attention_tensor_geometry,
+        row_segments,
     )
+    from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.packed_flashinfer import FlashInferRowPlan, activate
 
     # Row starts that are not multiples of 16 exercise FA2's page alignment;
     # full context exercises FA2's unpaged varlen and empty bucket slots.
     lengths = [67, 0, 103]
     rows = pack_rows(lengths, torch.device("cuda"))
-    attention = build_row_attention(rows, heads=2, head_dim=64, fa_version=fa_version, chunk_size=chunk_size)
-    assert attention.paged is (fa_version == 3 or chunk_size is not None)
+    attention = build_row_attention(rows, heads=2, head_dim=64, backend=backend, chunk_size=chunk_size)
+    assert attention.paged is attention_uses_pages(backend, chunk_size is not None)
+    if backend == "flashinfer":
+        plan = FlashInferRowPlan(
+            rows.row_ids.device, heads=2, head_dim=64, dtype=torch.bfloat16, chunked=chunk_size is not None
+        )
+        plan.plan(lengths, *row_segments(lengths, chunk_size))
+        activate(plan)
     generator = torch.Generator(device="cuda").manual_seed(7)
     q, k, v = [
         torch.randn(sum(lengths), 2, 64, device="cuda", dtype=torch.bfloat16, generator=generator) for _ in range(3)
@@ -160,13 +174,13 @@ def test_packed_attention_matches_row_reference(monkeypatch, fa_version, chunk_s
 
 
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
-@pytest.mark.parametrize("fa_version", [2, 3])
+@pytest.mark.parametrize("backend", PACKED_BACKENDS)
 @torch.inference_mode()
-def test_packed_stream_mixed_finalization_and_ragged_requests_stay_aligned(monkeypatch, fa_version):
-    require_packed_fa(monkeypatch, fa_version)
+def test_packed_stream_mixed_finalization_and_ragged_requests_stay_aligned(monkeypatch, backend):
+    require_packed_backend(monkeypatch, backend)
     monkeypatch.setenv("COSYVOICE3_FULL_RESPONSE_OPTIMIZATIONS", "0")
     monkeypatch.setenv("COSYVOICE3_PACKED_STREAMING", "1")
-    model = tiny_flow(monkeypatch).bfloat16()
+    model = tiny_flow(monkeypatch, backend).bfloat16()
     monkeypatch.setattr(
         model, "_stream_hift_from_feat", lambda mel, cache_state, finalize: (mel, None if finalize else cache_state)
     )

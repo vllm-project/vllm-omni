@@ -5,18 +5,23 @@ import pytest
 import torch
 
 from tests.helpers.mark import hardware_test
-from tests.model_executor.models.cosyvoice3.test_cosyvoice3_full_batch import MelOutput, _items, require_packed_fa
+from tests.model_executor.models.cosyvoice3.test_cosyvoice3_full_batch import (
+    PACKED_BACKENDS,
+    MelOutput,
+    _items,
+    require_packed_backend,
+)
 from vllm_omni.platforms import current_omni_platform
 
 pytestmark = [pytest.mark.core_model, pytest.mark.skipif(not current_omni_platform.is_cuda(), reason="requires CUDA")]
 
 
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
-@pytest.mark.parametrize("fa_version", [2, 3])
+@pytest.mark.parametrize("backend", PACKED_BACKENDS)
 @pytest.mark.parametrize("streaming", [False, True])
 @torch.inference_mode()
-def test_flow_graph_replay_matches_eager_solve(monkeypatch, streaming, fa_version):
-    require_packed_fa(monkeypatch, fa_version)
+def test_flow_graph_replay_matches_eager_solve(monkeypatch, streaming, backend):
+    require_packed_backend(monkeypatch, backend)
     import vllm_omni.model_executor.models.cosyvoice3.cosyvoice3_code2wav as module
     from vllm_omni.transformers_utils.configs.cosyvoice3 import CosyVoice3Config
 
@@ -55,11 +60,16 @@ def test_flow_graph_replay_matches_eager_solve(monkeypatch, streaming, fa_versio
     extra = dict(token_offset_tokens=2, finalize=False, cache_state=None) if streaming else {}
     # The second batch reuses the first one's padded layout with new lengths.
     batches = [_items([(7, 60), (13, 41), (3, 97)], **extra), _items([(5, 71), (9, 30), (11, 88)], **extra)]
+    # FlashInfer picks its query tile from the planned layout, so the graph's
+    # padded layout may reduce in another order than the eager solve; CFG
+    # amplifies that rounding on a few elements. A misread KV row is O(1).
+    tolerance = 5e-2 if backend == "flashinfer" else 1e-2
     run(batches[0], graph=False)  # compile
     for items in batches:
         actual = run(items, graph=True)
         expected = run(items, graph=False)
         for output, reference in zip(actual, expected):
-            torch.testing.assert_close(output, reference, rtol=1e-2, atol=1e-2)
+            torch.testing.assert_close(output, reference, rtol=tolerance, atol=tolerance)
+            assert (output - reference).float().norm() <= 1e-2 * reference.float().norm()
     runner = model._packed_estimator.graph_runner
     assert len(runner.graphs) == 1
