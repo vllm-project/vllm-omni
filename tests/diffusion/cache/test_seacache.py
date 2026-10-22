@@ -58,6 +58,7 @@ def test_real_extractor_keeps_partial_target_but_not_control_in_indicator(with_c
     )
     module = mocker.Mock()
     module._gen_preprocess.return_value = prep
+    module._shard_gen_prep.return_value = prep
     ctx = extract_cosmos3_context(
         module,
         target,
@@ -69,6 +70,7 @@ def test_real_extractor_keeps_partial_target_but_not_control_in_indicator(with_c
         noisy_frame_mask=mask,
     )
     assert module._gen_preprocess.call_args.kwargs["control_latents"] is controls
+    module._shard_gen_prep.assert_called_once_with(prep, defer_gather=True)
     assert ctx.hidden_states is prep.hidden_gen
     assert len(ctx.extra_states["sea_cache_latents"]) == 1
     assert ctx.extra_states["sea_cache_latents"][0] is target
