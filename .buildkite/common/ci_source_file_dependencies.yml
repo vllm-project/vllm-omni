@@ -189,6 +189,10 @@ x-lingbot-video: &lingbot_video
 x-lingbot-world: &lingbot_world
   - vllm_omni/diffusion/models/lingbot_world/
 
+x-mage-flow: &mage_flow
+  - vllm_omni/diffusion/models/mage_flow/
+  - vllm_omni/model_extras/mage_flow.py
+
 
 source_file_dependencies:
   # Hardware presets and shared test helpers. Not a job key — do not attach this
@@ -625,6 +629,11 @@ source_file_dependencies:
     - *z_image
     - tests/e2e/online_serving/test_z_image.py
     - tests/e2e/online_serving/test_zimage_expansion.py
+
+  diffusion_mage_flow_function:
+    - *mage_flow
+    - tests/e2e/online_serving/test_mage_flow_expansion.py
+    - tests/e2e/online_serving/test_mage_flow_edit_expansion.py
 
   diffusion_stable_audio_function:
     - *stable_audio
