@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-"""Malformed request ``attention_schedule`` values return HTTP 400 on the image and chat routes.
+"""Malformed request ``attention_schedule`` values return HTTP 400 on the image and chat routes,
+and malformed ``attention_sigma_schedule`` values return HTTP 400 on the image route.
 
 A real ``vllm-omni serve`` runs ``tiny-random/Qwen-Image`` twice: the default single-stage launch
 uses the inline stage client, and ``--stage-id 0`` with an Omni master runs the stage in a
@@ -50,6 +51,28 @@ MALFORMED_SCHEDULES = [
     pytest.param([{"start": True, "end": None, "profile": "a"}], "must be an integer", id="bool-step"),
     pytest.param([{"start": 0, "end": None, "profile": "1bad"}], "profile name", id="invalid-profile-name"),
     pytest.param([{"start": 0, "end": None, "profile": "dense"}], "unknown profile", id="unknown-profile"),
+]
+
+MALFORMED_SIGMA_SCHEDULES = [
+    pytest.param({}, "must be a list", id="object-instead-of-list"),
+    pytest.param("dense", "must be a list", id="string-instead-of-list"),
+    pytest.param(
+        [{"low": 0.0, "high": 0.6, "profile": "a"}, {"low": 0.5, "high": 1.0, "profile": "b"}],
+        "must not overlap",
+        id="overlapping-windows",
+    ),
+    pytest.param(
+        [{"low": 0.5, "high": 1.0, "profile": "a"}, {"low": 0.0, "high": 0.5, "profile": "b"}],
+        "ascending low",
+        id="descending-windows",
+    ),
+    pytest.param([{"low": 0.0, "profile": "a"}], "exactly low, high and profile", id="missing-high"),
+    pytest.param([{"low": 0.5, "high": 0.5, "profile": "a"}], "greater than low", id="empty-window"),
+    pytest.param([{"low": 0.0, "high": 1.5, "profile": "a"}], "must be in [0, 1]", id="bound-above-one"),
+    pytest.param([{"low": 0, "high": 10**400, "profile": "a"}], "must be in [0, 1]", id="oversized-int-bound"),
+    pytest.param([{"low": True, "high": 1.0, "profile": "a"}], "must be a number", id="bool-bound"),
+    pytest.param([{"low": 0.0, "high": 1.0, "profile": "1bad"}], "profile name", id="invalid-profile-name"),
+    pytest.param([{"low": 0.0, "high": 1.0, "profile": "dense"}], "unknown profile", id="unknown-profile"),
 ]
 
 # One schedule the chat route rejects itself and one that only scheduler admission rejects.
@@ -112,6 +135,21 @@ def _assert_image(response: requests.Response) -> None:
 @pytest.mark.parametrize(("schedule", "message"), MALFORMED_SCHEDULES)
 def test_malformed_attention_schedule_returns_400(omni_server: OmniServer, schedule, message: str) -> None:
     response = _generate(omni_server, {"attention_schedule": schedule})
+
+    assert response.status_code == 400, response.text
+    error = response.json()["error"]
+    assert error["code"] == 400
+    assert message in error["message"]
+    _assert_image(_generate(omni_server))
+
+
+@pytest.mark.core_model
+@pytest.mark.diffusion
+@hardware_test(res={"cuda": "L4"})
+@pytest.mark.parametrize("omni_server", SERVERS, indirect=True)
+@pytest.mark.parametrize(("schedule", "message"), MALFORMED_SIGMA_SCHEDULES)
+def test_malformed_attention_sigma_schedule_returns_400(omni_server: OmniServer, schedule, message: str) -> None:
+    response = _generate(omni_server, {"attention_sigma_schedule": schedule})
 
     assert response.status_code == 400, response.text
     error = response.json()["error"]
