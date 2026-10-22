@@ -407,8 +407,13 @@ class OmniDiffusionSamplingParams:
             raise ValueError("streaming_idle_timeout_s must be finite and positive")
         if self.quality is not None and self.quality not in DIFFUSION_QUALITY_LEVELS:
             raise ValueError(f"quality must be one of {list(DIFFUSION_QUALITY_LEVELS)}, got {self.quality!r}")
-        self.attention_schedule = parse_attention_schedule(self.attention_schedule)
-        absorb_attention_schedule_extra_args(self)
+        # Request dicts become params here (chat sampling_params_list, the process stage client),
+        # so a malformed schedule must surface as a client error (HTTP 400), not a TypeError.
+        try:
+            self.attention_schedule = parse_attention_schedule(self.attention_schedule)
+            absorb_attention_schedule_extra_args(self)
+        except (TypeError, ValueError) as exc:
+            raise InvalidAttentionScheduleError(str(exc)) from exc
 
     @property
     def batch_size(self):
@@ -477,16 +482,6 @@ class OmniDiffusionSamplingParams:
         lora_request = params.get("lora_request")
         if lora_request is not None and not isinstance(lora_request, LoRARequest):
             params["lora_request"] = msgspec.convert(lora_request, LoRARequest)
-        # Construction parses the request schedule. Classify its failures as the scheduler does on
-        # the inline client, so a malformed schedule stays HTTP 400 instead of a plain error (500).
-        # Only the schedule fields are set here, so every other field keeps its valid default.
-        try:
-            cls(
-                attention_schedule=params.get("attention_schedule"),
-                extra_args=dict(params.get("extra_args") or {}),
-            )
-        except (TypeError, ValueError) as exc:
-            raise InvalidAttentionScheduleError(str(exc)) from exc
         return cls(**params)
 
 
