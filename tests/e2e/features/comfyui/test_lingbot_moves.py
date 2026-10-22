@@ -68,7 +68,6 @@ def test_compile_places_each_move_on_its_chunk_grid():
     assert compiled.total_frames == 189
     assert compiled.shot_start_chunks == (0, 4, 11)
     assert compiled.prompt_switches == ((4, "B"), (11, "C"))
-    assert compiled.warnings == ()
     script = compiled.camera_script()
     assert len(script) == 16
     assert all(len(chunk) == 3 for chunk in script)
@@ -83,19 +82,12 @@ def test_compile_places_each_move_on_its_chunk_grid():
     assert script[15] == [["i"]] * 3
 
 
-def test_compile_reports_a_move_cut_at_its_shot_end():
-    sequence = LingBotSequence((Shot("A", 33, (CameraMove("move", "forward", 0, 99),)),))
-    compiled = compile_sequence(sequence, GEOMETRY)
-    assert compiled.warnings == ("Shot 0: the move move is cut to 33 frames at the shot's end.",)
-    assert compiled.camera_script()[-1] == [["w"]] * 3
-
-
-def test_compile_widens_a_move_too_short_to_cover_a_latent_frame():
-    sequence = LingBotSequence((Shot("A", 21, (CameraMove("move", "forward", 0, 2),)),))
-    compiled = compile_sequence(sequence, GEOMETRY)
-    assert "widened to one latent frame" in compiled.warnings[0]
+def test_compile_clamps_moves_to_the_shot_and_to_one_latent_frame():
+    cut = compile_sequence(LingBotSequence((Shot("A", 33, (CameraMove("move", "forward", 0, 99),)),)), GEOMETRY)
+    assert cut.camera_script()[-1] == [["w"]] * 3
+    widened = compile_sequence(LingBotSequence((Shot("A", 21, (CameraMove("move", "forward", 0, 2),)),)), GEOMETRY)
     # The widened move covers the chunk's first latent sample only.
-    assert compiled.camera_script()[0] == [["w"], [], []]
+    assert widened.camera_script()[0] == [["w"], [], []]
 
 
 def test_compile_rejects_a_sequence_off_the_grid():

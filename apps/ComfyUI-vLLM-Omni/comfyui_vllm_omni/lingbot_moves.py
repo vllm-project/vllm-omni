@@ -13,7 +13,7 @@ camera travels.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from .lingbot_geometry import DEFAULT_GEOMETRY, LingBotGeometry
 
@@ -93,7 +93,6 @@ class CompiledSequence:
     shot_start_chunks: tuple[int, ...]
     total_chunks: int
     total_frames: int
-    warnings: tuple[str, ...] = field(default=())
 
     def camera_script(self) -> list[list[list[str]]]:
         """The ``camera_action_script`` value the server accepts."""
@@ -158,10 +157,9 @@ def compile_sequence(
 
     Moves are read on their shot's clock, moved onto the sequence's clock, cut
     at their shot's end, and sampled once per latent frame. A move too short to
-    cover a latent frame is widened to one and reported in ``warnings``.
+    cover a latent frame is widened to one.
     """
     del verbose
-    warnings: list[str] = []
     absolute_moves: list[CameraMove] = []
     shot_start_chunks: list[int] = []
     prompt_switches: list[tuple[int, str]] = []
@@ -181,14 +179,7 @@ def compile_sequence(
                     f"after the shot's {shot.frames} frames."
                 )
             frames = min(move.frames, shot.frames - move.start_frame)
-            if frames != move.frames:
-                warnings.append(f"Shot {index}: the {move.lane} move is cut to {frames} frames at the shot's end.")
-            if frames < geometry.temporal_scale:
-                frames = geometry.temporal_scale
-                warnings.append(
-                    f"Shot {index}: the {move.lane} move is widened to one latent frame "
-                    f"({geometry.temporal_scale} pixel frames)."
-                )
+            frames = max(frames, geometry.temporal_scale)
             absolute_moves.append(CameraMove(move.lane, move.value, offset + move.start_frame, frames))
         offset += shot.frames
         chunk_cursor += chunks
@@ -215,5 +206,4 @@ def compile_sequence(
         shot_start_chunks=tuple(shot_start_chunks),
         total_chunks=total_chunks,
         total_frames=total_frames,
-        warnings=tuple(dict.fromkeys(warnings)),
     )
