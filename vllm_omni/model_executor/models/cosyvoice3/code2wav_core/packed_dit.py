@@ -570,7 +570,7 @@ def ragged_attention_tensor_geometry(
     head_shape = (-1, attention.heads, attention.head_dim)
     query, key, value = query[0].reshape(head_shape), key[0].reshape(head_shape), value[0].reshape(head_shape)
     if attention.paged:
-        k_pages, v_pages = paged_kv(key, attention), paged_kv(value, attention)
+        k_pages, v_pages = paged_kv(key, value, attention)
         output = paged_varlen_attention(
             query,
             k_pages,
@@ -586,13 +586,37 @@ def ragged_attention_tensor_geometry(
     return output.reshape(1, -1, attention.heads * attention.head_dim)
 
 
-def paged_kv(x: torch.Tensor, attention: RaggedRowAttention) -> torch.Tensor:
-    """Packed K or V, ``(frames, heads, head_dim)``, as ``(pages, page_size, heads, head_dim)``."""
+def paged_kv(
+    key: torch.Tensor, value: torch.Tensor, attention: RaggedRowAttention
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Packed K and V, ``(frames, heads, head_dim)``, as ``(pages, page_size, heads, head_dim)``."""
     page_size = attention.page_size
     if page_size == 1:
         # One-frame pages: the packed sequence itself is the paged KV cache.
-        return x[:, None]
-    return x.index_select(0, attention.slot_frames).view(-1, page_size, *x.shape[1:])
+        return key[:, None], value[:, None]
+    key, value = gather_kv_slots(key, value, attention.slot_frames)
+    return key.view(-1, page_size, *key.shape[1:]), value.view(-1, page_size, *value.shape[1:])
+
+
+@torch.library.custom_op(
+    "vllm_omni_cosyvoice3_perf::gather_kv_slots",
+    mutates_args=(),
+    device_types="cuda",
+)
+def gather_kv_slots(
+    key: torch.Tensor, value: torch.Tensor, slot_frames: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Gather packed K/V onto page-aligned slots with native ``index_select``;
+    Inductor's generated gather is slower here."""
+    return key.index_select(0, slot_frames), value.index_select(0, slot_frames)
+
+
+@gather_kv_slots.register_fake
+def fake_gather_kv_slots(
+    key: torch.Tensor, value: torch.Tensor, slot_frames: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    shape = (slot_frames.shape[0], *key.shape[1:])
+    return key.new_empty(shape), value.new_empty(shape)
 
 
 def attend_tensor_geometry(
