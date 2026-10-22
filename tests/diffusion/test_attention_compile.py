@@ -107,10 +107,13 @@ def test_attention_compile_boundary_without_diffusion_config(monkeypatch, initia
 def test_attention_uses_schedule_boundary_only_for_scheduled_layers(
     monkeypatch, configured, initialized_with_hsdp, use_hsdp, with_context, compiling, expected
 ):
-    # While compiling, a layer built with a startup schedule calls
-    # _forward_schedule_compile_boundary (a torch.compiler.disable method); the schedule flag set at
-    # construction alone decides this, also when HSDP is enabled at construction or in the forward
-    # context. Unscheduled layers call the HSDP boundary or the compiled impl.
+    # Every case builds the layer with object.__new__, so _schedule_op_id keeps its class default
+    # None and a compiling call takes the eager fallback _forward_schedule_compile_boundary, never
+    # the scheduled_attention op. The test checks that forward() chooses that path from the schedule
+    # flag set at construction, also with no forward context, and runs the impl when not compiling.
+    # 'scheduled-with-hsdp' enables HSDP only through the forward context and checks that forward()
+    # tests the schedule flag before the HSDP check. No case enables HSDP at construction, and the
+    # test does not cover the op path or a real compile with HSDP.
     attention = object.__new__(Attention)
     attention._hsdp_compile_boundary_enabled = initialized_with_hsdp
     attention._schedule_configured = configured
