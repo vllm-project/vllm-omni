@@ -52,8 +52,6 @@ if current_omni_platform.is_xpu():
         _sagev1_params = inspect.signature(xpu_sageattn).parameters
         _sagev1_has_tensor_layout = "tensor_layout" in _sagev1_params
         _sagev1_scale_param = "sm_scale" if "sm_scale" in _sagev1_params else "scale"
-        # >= 0.15 (auto-round PR #1882) accepts bf16 natively; skip the fp16 round-trip.
-        _sagev1_native_bf16 = "smooth_k" in _sagev1_params
     except ImportError:
         logger.warning(
             "XPU SageAttention (auto_round_kernel sagev1) is not available. "
@@ -62,7 +60,6 @@ if current_omni_platform.is_xpu():
         xpu_sageattn = None
         _sagev1_has_tensor_layout = False
         _sagev1_scale_param = "scale"
-        _sagev1_native_bf16 = False
 else:
     try:
         from sageattention import sageattn as _sageattn
@@ -292,10 +289,9 @@ class SageAttentionImpl(AttentionImpl):
         if xpu_sageattn is None:
             raise ImportError("XPU SageAttention requires auto-round-lib. Install with: pip install auto-round-lib")
         orig_dtype = query.dtype
-        kernel_dtype = orig_dtype if (_sagev1_native_bf16 and orig_dtype == torch.bfloat16) else torch.float16
-        q = query.to(kernel_dtype)
-        k = key.to(kernel_dtype)
-        v = value.to(kernel_dtype)
+        q = query.to(torch.float16) if orig_dtype != torch.float16 else query
+        k = key.to(torch.float16) if orig_dtype != torch.float16 else key
+        v = value.to(torch.float16) if orig_dtype != torch.float16 else value
 
         if _sagev1_has_tensor_layout:
             if _SAGE_ATTN_TENSOR_LAYOUT == "HND":
@@ -326,6 +322,6 @@ class SageAttentionImpl(AttentionImpl):
             )
             output = output.transpose(1, 2).contiguous()
 
-        if output.dtype != orig_dtype:
+        if orig_dtype != torch.float16:
             output = output.to(orig_dtype)
         return output
