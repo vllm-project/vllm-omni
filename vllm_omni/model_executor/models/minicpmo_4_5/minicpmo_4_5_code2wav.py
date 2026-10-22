@@ -1703,6 +1703,11 @@ class MiniCPMO45Code2Wav(nn.Module):
         model up before it serves and the same ~4 GiB of graph memory would be
         captured ahead of that warmup.
         """
+        if self._extra_config().get("cfm_graph_precapture_after_load") is not None:
+            logger.warning_once(
+                "MiniCPM-o Code2Wav: cfm_graph_precapture_after_load is ignored; "
+                "the startup sweep is controlled by cfm_graph_precapture_at_init"
+            )
         if not self._startup_sweep_enabled():
             return
         self._precapture_before_serve()
@@ -1746,13 +1751,27 @@ class MiniCPMO45Code2Wav(nn.Module):
 
         Live tensors, the slot pool and graph pools stay, so no later solve changes.
         """
-        if torch.cuda.is_available() and torch.cuda.is_initialized():
-            device = torch.device("cuda", torch.accelerator.current_device_index())
+        accelerator = (
+            torch.accelerator.current_accelerator() if hasattr(torch.accelerator, "current_accelerator") else None
+        )
+        if accelerator is None:
+            return
+        # Device-agnostic on purpose: the startup sweep now runs by default on
+        # Ascend, where a CUDA-only guard made ``cfm_precapture_empty_cache`` a
+        # silent no-op.
+        device = torch.device(accelerator.type, torch.accelerator.current_device_index())
+        try:
             torch.accelerator.synchronize(device)
             before = _memory_snapshot(device)
             torch.accelerator.empty_cache()
             delta = _format_memory_delta(before, _memory_snapshot(device))
-            logger.info("MiniCPM-o Code2Wav: emptied the allocator cache after precapture%s", delta)
+        except Exception:
+            logger.warning(
+                "MiniCPM-o Code2Wav: could not release the precapture cache",
+                exc_info=True,
+            )
+            return
+        logger.info("MiniCPM-o Code2Wav: emptied the allocator cache after precapture%s", delta)
 
     def _precapture_default_prompt(self) -> None:
         """Capture the HiFT, default-voice Whole-Euler and flow-encoder graphs before serving.
