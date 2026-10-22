@@ -50,6 +50,7 @@ steps:
         timeout_in_minutes: 90
         artifact_paths:
           - audio_*.wav
+          - qwen3-omni-doc-artifacts/**/*
         commands:
           - pytest -s -v tests/examples/ -m "full_model and omni and H100 and B200 and cards_2" --run-level "full_model"
 

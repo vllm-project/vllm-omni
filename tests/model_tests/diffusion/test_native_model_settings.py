@@ -16,8 +16,15 @@ pytestmark = [pytest.mark.cpu, pytest.mark.core_model, pytest.mark.diffusion]
 
 
 @pytest.mark.parametrize("model_name", ["AnimaPipeline", "FluxPipeline"])
-def test_common_runners_resolve_native_checkpoint(model_name, tmp_path, monkeypatch):
+@pytest.mark.parametrize("timeouts", [None, (900, 600)])
+def test_common_runners_resolve_native_checkpoint(model_name, timeouts, tmp_path, monkeypatch):
     """Both entry points receive the file and class; directory models keep their existing arguments."""
+    for key in ("VLLM_OMNI_TEST_INIT_TIMEOUT", "VLLM_OMNI_TEST_STAGE_INIT_TIMEOUT"):
+        monkeypatch.delenv(key, raising=False)
+    if timeouts is not None:
+        monkeypatch.setenv("VLLM_OMNI_TEST_INIT_TIMEOUT", str(timeouts[0]))
+        monkeypatch.setenv("VLLM_OMNI_TEST_STAGE_INIT_TIMEOUT", str(timeouts[1]))
+    init_timeout, stage_init_timeout = timeouts or (600, 300)
     paths = {model_name: str(tmp_path)}
     subtests = SimpleNamespace(test=lambda **kwargs: nullcontext())
     build_omni = MagicMock()
@@ -36,11 +43,22 @@ def test_common_runners_resolve_native_checkpoint(model_name, tmp_path, monkeypa
     if model_name == "AnimaPipeline":
         checkpoint = str(tmp_path / anima_builder.CHECKPOINT_FILENAME)
         build_omni.assert_called_once_with(
-            accelerations=None, model=checkpoint, enforce_eager=True, model_class_name=model_name
+            accelerations=None,
+            model=checkpoint,
+            enforce_eager=True,
+            init_timeout=init_timeout,
+            stage_init_timeout=stage_init_timeout,
+            model_class_name=model_name,
         )
         server.assert_called_once_with(checkpoint, ["--enforce-eager", "--model-class-name", model_name])
     else:
-        build_omni.assert_called_once_with(accelerations=None, model=str(tmp_path), enforce_eager=True)
+        build_omni.assert_called_once_with(
+            accelerations=None,
+            model=str(tmp_path),
+            enforce_eager=True,
+            init_timeout=init_timeout,
+            stage_init_timeout=stage_init_timeout,
+        )
         server.assert_called_once_with(str(tmp_path), ["--enforce-eager"])
 
 

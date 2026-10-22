@@ -14,6 +14,7 @@ from pathlib import Path
 
 import pytest
 
+from tests.examples.audio_artifacts import transcribe_example_audio
 from tests.examples.helpers import (
     extract_content_after_keyword,
     extract_last_audio_saved_path,
@@ -22,16 +23,31 @@ from tests.examples.helpers import (
     strip_trailing_audio_saved_line,
 )
 from tests.helpers.mark import hardware_test
-from tests.helpers.media import convert_audio_file_to_text, cosine_similarity_text
+from tests.helpers.media import cosine_similarity_text
 from tests.helpers.runtime import OmniServerParams
-from tests.helpers.stage_config import get_deploy_config_path
+from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
 
 pytestmark = [pytest.mark.full_model, pytest.mark.example, pytest.mark.omni]
 
 models = ["Qwen/Qwen3-Omni-30B-A3B-Instruct"]
 
 
-stage_configs = [get_deploy_config_path("ci/qwen3_omni_moe.yaml")]
+# The documentation client asks for a complete image description. With a
+# expanded 512-token thinker response, the shared CI talker's 1000-token cap
+# can cut speech off mid-sentence (CUDA #16473 retained a 79.8275-second prefix).
+# Match the existing long-form function test's audio budgets in this fixture;
+# keep the prompt, thinker budget, sampling seed and similarity gate intact.
+stage_configs = [
+    modify_stage_config(
+        get_deploy_config_path("ci/qwen3_omni_moe.yaml"),
+        updates={
+            "stages": {
+                1: {"default_sampling_params.max_tokens": 3072},
+                2: {"default_sampling_params.max_tokens": 6144},
+            },
+        },
+    )
+]
 
 
 example_dir = str(Path(__file__).parent.parent.parent.parent / "examples" / "online_serving")
@@ -46,7 +62,7 @@ common_args = ["python", os.path.join(example_dir, "openai_chat_completion_clien
 
 @hardware_test(res={"cuda": ["H100", "B200"], "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
-def test_send_multimodal_request_001(omni_server) -> None:
+def test_send_multimodal_request_001(omni_server, request) -> None:
     command = common_args + [
         "--query-type",
         "use_image",
@@ -59,7 +75,7 @@ def test_send_multimodal_request_001(omni_server) -> None:
     text_content = strip_trailing_audio_saved_line(text_content_tmp)
     wav_path = extract_last_audio_saved_path(result)
     # Verify text output same as audio output
-    audio_content = convert_audio_file_to_text(output_path=f"./{wav_path}")
+    audio_content = transcribe_example_audio(f"./{wav_path}", request.node.name, result)
     print(f"text content is: {text_content}")
     print(f"audio content is: {audio_content}")
 
@@ -74,7 +90,7 @@ def test_send_multimodal_request_001(omni_server) -> None:
 
 @hardware_test(res={"cuda": ["H100", "B200"], "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
-def test_send_multimodal_request_002(omni_server) -> None:
+def test_send_multimodal_request_002(omni_server, request) -> None:
     command = common_args + [
         "--query-type",
         "use_video",
@@ -90,7 +106,7 @@ def test_send_multimodal_request_002(omni_server) -> None:
 
     # Verify text output same as audio output
     wav_path = extract_last_audio_saved_path(result)
-    audio_content = convert_audio_file_to_text(output_path=f"./{wav_path}")
+    audio_content = transcribe_example_audio(f"./{wav_path}", request.node.name, result)
     print(f"text content is: {text_content}")
     print(f"audio content is: {audio_content}")
     assert all(keyword in text_content for keyword in ["baby", "book"]), (
@@ -142,7 +158,7 @@ def test_modality_control_001(omni_server) -> None:
 
 @hardware_test(res={"cuda": ["H100", "B200"], "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
-def test_modality_control_002(omni_server) -> None:
+def test_modality_control_002(omni_server, request) -> None:
     command = common_args + [
         "--model",
         omni_server.model,
@@ -155,7 +171,7 @@ def test_modality_control_002(omni_server) -> None:
     result = run_cmd(command)
     # Verify text output same as audio output
     wav_path = extract_last_audio_saved_path(result)
-    audio_content = convert_audio_file_to_text(output_path=f"./{wav_path}")
+    audio_content = transcribe_example_audio(f"./{wav_path}", request.node.name, result)
     print(f"audio content is: {audio_content}")
     assert "cherry blossom" in audio_content, "The output does not contain any of the keywords."
 
@@ -164,7 +180,7 @@ def test_modality_control_002(omni_server) -> None:
 
 @hardware_test(res={"cuda": ["H100", "B200"], "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
-def test_modality_control_003(omni_server) -> None:
+def test_modality_control_003(omni_server, request) -> None:
     command = common_args + [
         "--model",
         omni_server.model,
@@ -181,7 +197,7 @@ def test_modality_control_003(omni_server) -> None:
 
     # Verify text output same as audio output
     wav_path = extract_last_audio_saved_path(result)
-    audio_content = convert_audio_file_to_text(output_path=f"./{wav_path}")
+    audio_content = transcribe_example_audio(f"./{wav_path}", request.node.name, result)
     print(f"text content is: {text_content}")
     assert "cherry blossom" in audio_content, "The output does not contain any of the keywords."
     print(f"audio content is: {audio_content}")
@@ -194,7 +210,7 @@ def test_modality_control_003(omni_server) -> None:
 
 @hardware_test(res={"cuda": ["H100", "B200"], "rocm": "MI325"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
-def test_stream_001(omni_server) -> None:
+def test_stream_001(omni_server, request) -> None:
     command = common_args + [
         "--model",
         omni_server.model,
@@ -210,7 +226,7 @@ def test_stream_001(omni_server) -> None:
 
     # Verify text output same as audio output
     wav_path = extract_last_audio_saved_path(result)
-    audio_content = convert_audio_file_to_text(output_path=f"./{wav_path}")
+    audio_content = transcribe_example_audio(f"./{wav_path}", request.node.name, result)
     print(f"text content is: {text_content}")
     assert "cherry blossom" in audio_content, "The output does not contain any of the keywords."
     print(f"audio content is: {audio_content}")
