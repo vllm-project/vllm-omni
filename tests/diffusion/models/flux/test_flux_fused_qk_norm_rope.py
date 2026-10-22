@@ -7,6 +7,7 @@ import os
 
 import pytest
 import torch
+from vllm.platforms import current_platform
 from vllm.triton_utils import HAS_TRITON
 
 from tests.helpers.mark import hardware_marks
@@ -52,7 +53,7 @@ def test_table_skipped_on_cpu():
     assert _with_qk_norm_rope_table({"other": 1}, (cos, sin), x) == {"other": 1}
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.skipif(not current_platform.is_cuda() or not torch.cuda.is_available(), reason="NVIDIA CUDA required")
 @pytest.mark.skipif(not HAS_TRITON, reason="Triton required")
 def test_table_and_kwargs():
     from vllm_omni.diffusion.models.flux.flux_transformer import QK_NORM_ROPE_TABLE_KEY, _with_qk_norm_rope_table
@@ -65,7 +66,7 @@ def test_table_and_kwargs():
     assert _with_qk_norm_rope_table(None, (cos[0], sin[0]), x.half()) is None  # non-bf16 activations
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.skipif(not current_platform.is_cuda() or not torch.cuda.is_available(), reason="NVIDIA CUDA required")
 @pytest.mark.skipif(not HAS_TRITON, reason="Triton required")
 @pytest.mark.parametrize("double_stream", [True, False])
 def test_flux_attention_fused_matches_eager(_dist_env, double_stream):
