@@ -1,11 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Opt-in packed Flow for full-response and streaming inference on Hopper GPUs.
+"""Opt-in packed Flow for full-response and streaming inference.
 
 Adapted from SGLang-Omni packed_dit.py, commit
 127f34b57446a3cb5588ec987da0771a3be675be (Apache-2.0):
 https://github.com/sgl-project/sglang-omni
-Full-context and chunk-causal attention use vLLM's FA3 binding.
+Attention runs on vLLM's FlashAttention, FA3 on Hopper and FA2 on other GPUs,
+or on FlashInfer when pinned (see packed_flashinfer.py). FlashAttention's
+chunk-causal segments read paged K/V (FA3 one-frame pages, FA2 16-frame pages);
+FA2 full-context segments are whole rows and attend unpaged.
 """
 
 from __future__ import annotations
@@ -16,55 +19,176 @@ from dataclasses import dataclass
 import torch
 import torch._dynamo as dynamo
 import torch.nn.functional as F
-from vllm.vllm_flash_attn import flash_attn_varlen_func
+from vllm.logger import init_logger
 
+from ..runtime import cosyvoice3_packed_attention_backend
 from .packed_conv import pack_conv_weight, packed_causal_conv_mish
+from .packed_flashinfer import FlashInferRowPlan, activate, flashinfer_row_attention, paged_index_capacity
 
-FA3_PAGE_SIZE = 1
+# FA3 pages the packed KV in place. vLLM's FA2 requires pages of a multiple of
+# 16 frames, so every paged row is gathered onto a page-aligned start.
+PAGE_SIZE = {"fa3": 1, "fa2": 16}
+FA_VERSION = {"fa3": 3, "fa2": 2}
+# Head dims FlashInfer's prefill kernels are instantiated for (CosyVoice3: 64).
+FLASHINFER_HEAD_DIMS = (64, 128, 256)
+logger = init_logger(__name__)
 
 
+def attention_uses_pages(backend: str, chunked: bool) -> bool:
+    """Whether segments read K/V through a FlashAttention page table.
+
+    A full-context segment is its whole row, so its K/V span equals its query
+    span and plain varlen attention reads the packed K/V directly. FA2 takes
+    that path and skips the page gather; FA3 pages in place at no cost.
+    FlashInfer plans its own KV indices.
+    """
+    return backend == "fa3" or (backend == "fa2" and chunked)
+
+
+def row_segments(lengths: Sequence[int], chunk_size: int | None) -> tuple[list[int], list[int], list[int]]:
+    """Host attention segments of packed rows: (rows, KV ends, query offsets).
+
+    With no chunk size, each row is one segment over its whole row. Otherwise
+    each chunk of queries is a segment over the row prefix ending at it. Empty
+    rows retain an empty segment so bucketed layouts have stable shapes.
+    """
+    segment_rows, segment_ends, offsets = [], [], [0]
+    for row, length in enumerate(lengths):
+        if length == 0:
+            segment_rows.append(row)
+            segment_ends.append(0)
+            offsets.append(offsets[-1])
+            continue
+        span = chunk_size or length
+        for start in range(0, length, span):
+            end = min(start + span, length)
+            segment_rows.append(row)
+            segment_ends.append(end)
+            offsets.append(offsets[-1] + end - start)
+    return segment_rows, segment_ends, offsets
+
+
+def page_metadata(
+    lengths: torch.Tensor,
+    segment_rows: torch.Tensor,
+    segment_ends: torch.Tensor,
+    row_ids: torch.Tensor,
+    positions: torch.Tensor,
+    *,
+    page_size: int,
+    columns: int,
+    slots: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Page table and KV gather index for packed rows that each start on a page.
+
+    Segment ``s`` reads the first ``segment_ends[s]`` frames of its row, which
+    is a whole row (full context) or the prefix up to one query chunk
+    (chunk-causal). KV slot ``j`` holds packed frame ``slot_frames[j]``. Slots
+    past a row's last frame hold frame 0; no segment reads past its own row,
+    so they are never attended.
+    """
+    pages = (lengths.long() + page_size - 1) // page_size
+    page_starts = F.pad(pages.cumsum(0), (1, 0))[:-1]
+    page = torch.arange(columns, dtype=torch.int64, device=lengths.device)
+    used = page[None] * page_size < segment_ends[:, None]
+    page_table = torch.where(used, page_starts[segment_rows.long()][:, None] + page[None], 0).to(torch.int32)
+    slot_frames = torch.zeros(slots, dtype=torch.int64, device=lengths.device)
+    slot_frames[page_starts[row_ids] * page_size + positions] = torch.arange(row_ids.shape[0], device=lengths.device)
+    return page_table, slot_frames
+
+
+@dataclass(frozen=True)
 class RaggedRowAttention:
-    """FA3 page metadata isolating each request and each causal query chunk."""
+    """Paged attention metadata shared by ordinary solves and CUDA graphs.
 
-    def __init__(
-        self,
-        rows: PackedRows,
-        *,
-        heads: int,
-        head_dim: int,
-        chunk_size: int | None = None,
-        width: int | None = None,
-    ) -> None:
-        self.heads, self.head_dim = heads, head_dim
-        device = rows.row_ids.device
-        segment_rows, segment_ends, offsets = [], [], [0]
-        for row, length in enumerate(rows.lengths):
-            if length == 0 and width is not None:
-                # Bucketed layouts keep one (empty) segment per row slot so
-                # metadata shapes are identical across batches in a bucket.
-                segment_rows.append(row)
-                segment_ends.append(0)
-                offsets.append(offsets[-1])
-                continue
-            span = chunk_size or length
-            for start in range(0, length, span):
-                end = min(start + span, length)
-                segment_rows.append(row)
-                segment_ends.append(end)
-                offsets.append(offsets[-1] + end - start)
-        self.cache_seqlens = torch.tensor(segment_ends, dtype=torch.int32, device=device)
-        self.cu_seqlens_q = torch.tensor(offsets, dtype=torch.int32, device=device)
-        self.max_seqlen_q = max(b - a for a, b in zip(offsets, offsets[1:]))
-        starts = rows.starts_host[segment_rows].to(device)
-        page = torch.arange(width or max(segment_ends), dtype=torch.int32, device=device)
-        self.page_table = torch.where(page[None] < self.cache_seqlens[:, None], starts[:, None] + page[None], 0)
+    Tensor references are retained without copying. Fields cannot be rebound,
+    but graph-owned buffers may be updated in place before replay. Unpaged
+    metadata (see ``attention_uses_pages``) has no page table or gather index.
+    """
+
+    heads: int
+    head_dim: int
+    backend: str
+    max_seqlen_q: int
+    cache_seqlens: torch.Tensor
+    cu_seqlens_q: torch.Tensor
+    page_table: torch.Tensor | None
+    slot_frames: torch.Tensor | None
+
+    @property
+    def paged(self) -> bool:
+        return self.page_table is not None
+
+    @property
+    def fa_version(self) -> int:
+        return FA_VERSION[self.backend]
+
+    @property
+    def page_size(self) -> int:
+        """Number of KV frames per page for the selected backend."""
+        return PAGE_SIZE[self.backend]
+
+
+def build_row_attention(
+    rows: PackedRows,
+    *,
+    heads: int,
+    head_dim: int,
+    backend: str,
+    chunk_size: int | None = None,
+) -> RaggedRowAttention:
+    """Build metadata isolating packed rows and optional causal query chunks.
+
+    With no chunk size, each query row sees its full KV row. Otherwise each
+    chunk sees the prefix ending at that chunk. Empty rows retain an empty
+    segment so bucketed layouts have stable metadata shapes.
+    """
+    device = rows.row_ids.device
+    segment_rows, segment_ends, offsets = row_segments(rows.lengths, chunk_size)
+    cache_seqlens = torch.tensor(segment_ends, dtype=torch.int32, device=device)
+    cu_seqlens_q = torch.tensor(offsets, dtype=torch.int32, device=device)
+    max_seqlen_q = max(b - a for a, b in zip(offsets, offsets[1:]))
+    page_table = slot_frames = None
+    if attention_uses_pages(backend, chunk_size is not None):
+        page_size = PAGE_SIZE[backend]
+        page_table, slot_frames = page_metadata(
+            torch.tensor(rows.lengths, device=device),
+            torch.tensor(segment_rows, device=device),
+            cache_seqlens,
+            rows.row_ids,
+            rows.positions,
+            page_size=page_size,
+            columns=-(-rows.width // page_size),
+            slots=sum(-(-length // page_size) for length in rows.lengths) * page_size,
+        )
+    return RaggedRowAttention(
+        heads=heads,
+        head_dim=head_dim,
+        backend=backend,
+        max_seqlen_q=max_seqlen_q,
+        cache_seqlens=cache_seqlens,
+        cu_seqlens_q=cu_seqlens_q,
+        page_table=page_table,
+        slot_frames=slot_frames,
+    )
 
 
 class PackedDiT:
-    """Adapt a loaded DiT to compiled, variable-length inference with FA3."""
+    """Adapt a loaded DiT to compiled, variable-length inference with packed attention."""
 
     def __init__(self, dit: torch.nn.Module) -> None:
+        backend = cosyvoice3_packed_attention_backend()
+        if backend is None:
+            raise ValueError("Packed Flow requires FlashAttention 2 or 3, or FlashInfer")
+        attn = dit.transformer_blocks[0].attn
+        if backend == "flashinfer" and attn.inner_dim // attn.heads not in FLASHINFER_HEAD_DIMS:
+            raise ValueError(f"FlashInfer packed Flow supports head dims {FLASHINFER_HEAD_DIMS}")
+        self.backend = backend
+        logger.info_once("CosyVoice3 packed Flow selected attention backend %s", backend)
         self.dit = dit
+        self.dtype: torch.dtype | None = None
+        # FlashInfer plans of ordinary (non-graph) solves, by chunk-causality.
+        self._flashinfer_plans: dict[bool, FlashInferRowPlan] = {}
         self.compiled_full_forward = None
         self.graph_buckets = False
         self.graph_runner: FlowGraphRunner | None = None
@@ -114,10 +238,15 @@ class PackedDiT:
     def compile(self, dtype: torch.dtype) -> None:
         if dtype not in (torch.float16, torch.bfloat16):
             raise ValueError("Packed Flow requires FP16 or BF16")
+        self.dtype = dtype
         import os
 
         options = {"emulate_precision_casts": True}
         if os.environ.get("COSYVOICE3_FLOW_CUDAGRAPH") == "1":
+            if self.backend == "flashinfer":
+                # Inductor graphs would replay a stale FlashInfer plan; the
+                # Flow graph runner (COSYVOICE3_FLOW_GRAPH) re-plans instead.
+                raise ValueError("COSYVOICE3_FLOW_CUDAGRAPH does not support the FlashInfer backend")
             # Inductor CUDA graphs replay one recording per concrete shape;
             # full-context batches are padded to recurring buckets.
             options["triton.cudagraphs"] = True
@@ -136,15 +265,19 @@ class PackedDiT:
         ):
             self.graph_runner = FlowGraphRunner(self)
 
-    def row_attention(self, rows: PackedRows, *, streaming: bool, width: int | None = None) -> RaggedRowAttention:
+    def row_attention(self, rows: PackedRows, *, streaming: bool) -> RaggedRowAttention:
         attn = self.dit.transformer_blocks[0].attn
-        result = RaggedRowAttention(
-            rows,
-            heads=attn.heads,
-            head_dim=attn.inner_dim // attn.heads,
-            chunk_size=self.dit.static_chunk_size if streaming else None,
-            width=width,
-        )
+        heads, head_dim = attn.heads, attn.inner_dim // attn.heads
+        chunk_size = self.dit.static_chunk_size if streaming else None
+        result = build_row_attention(rows, heads=heads, head_dim=head_dim, backend=self.backend, chunk_size=chunk_size)
+        if self.backend == "flashinfer":
+            plan = self._flashinfer_plans.get(streaming)
+            if plan is None:
+                plan = self._flashinfer_plans[streaming] = FlashInferRowPlan(
+                    rows.row_ids.device, heads=heads, head_dim=head_dim, dtype=self.dtype, chunked=streaming
+                )
+            plan.plan(rows.lengths, *row_segments(rows.lengths, chunk_size))
+            activate(plan)
         mark_packed_compile_metadata(rows, result)
         return result
 
@@ -178,43 +311,94 @@ class PackedDiT:
 
 
 @torch.library.custom_op(
-    "vllm_omni_cosyvoice3_perf::packed_fa3",
+    "vllm_omni_cosyvoice3_perf::paged_varlen_attention",
     mutates_args=(),
     device_types="cuda",
 )
-def packed_fa3(
+def paged_varlen_attention(
     q: torch.Tensor,
-    k_cache: torch.Tensor,
-    v_cache: torch.Tensor,
+    k_pages: torch.Tensor,
+    v_pages: torch.Tensor,
     cache_seqlens: torch.Tensor,
     page_table: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
     max_seqlen_q: int,
+    fa_version: int,
 ) -> torch.Tensor:
-    """Alias-free FA3 boundary for the compiled PackedDiT path."""
+    """Varlen queries over paged K/V: query segment ``s`` attends the first
+    ``cache_seqlens[s]`` frames of the pages in ``page_table[s]``.
+
+    ``k_pages``/``v_pages`` are ``(pages, page_size, heads, head_dim)``. The op
+    is an alias-free boundary for the compiled PackedDiT path.
+    """
+    from vllm.vllm_flash_attn import flash_attn_varlen_func
+
     return flash_attn_varlen_func(
         q,
-        k_cache,
-        v_cache,
+        k_pages,
+        v_pages,
         max_seqlen_q=max_seqlen_q,
         cu_seqlens_q=cu_seqlens_q,
-        max_seqlen_k=page_table.shape[1],
+        max_seqlen_k=page_table.shape[1] * k_pages.shape[1],
         seqused_k=cache_seqlens,
         block_table=page_table,
         causal=False,
-        fa_version=3,
+        fa_version=fa_version,
     )
 
 
-@packed_fa3.register_fake
-def fake_packed_fa3(
+@paged_varlen_attention.register_fake
+def fake_paged_varlen_attention(
     q: torch.Tensor,
-    k_cache: torch.Tensor,
-    v_cache: torch.Tensor,
+    k_pages: torch.Tensor,
+    v_pages: torch.Tensor,
     cache_seqlens: torch.Tensor,
     page_table: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
     max_seqlen_q: int,
+    fa_version: int,
+) -> torch.Tensor:
+    return torch.empty_like(q)
+
+
+@torch.library.custom_op(
+    "vllm_omni_cosyvoice3_perf::varlen_attention",
+    mutates_args=(),
+    device_types="cuda",
+)
+def varlen_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    max_seqlen: int,
+    fa_version: int,
+) -> torch.Tensor:
+    """Unpaged varlen attention: each segment of the packed rows attends
+    exactly its own query span (queries and keys share ``cu_seqlens``)."""
+    from vllm.vllm_flash_attn import flash_attn_varlen_func
+
+    return flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        max_seqlen_q=max_seqlen,
+        cu_seqlens_q=cu_seqlens,
+        max_seqlen_k=max_seqlen,
+        cu_seqlens_k=cu_seqlens,
+        causal=False,
+        fa_version=fa_version,
+    )
+
+
+@varlen_attention.register_fake
+def fake_varlen_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    max_seqlen: int,
+    fa_version: int,
 ) -> torch.Tensor:
     return torch.empty_like(q)
 
@@ -282,6 +466,10 @@ class PackedRows:
     starts_host: torch.Tensor
     row_ids: torch.Tensor
     positions: torch.Tensor
+    # arange(width): its length is the padded row width that RoPE and the
+    # padded convolution use. A tensor shape stays symbolic under dynamic
+    # compilation, where a Python int would add guards.
+    frames: torch.Tensor
 
     @property
     def total(self) -> int:
@@ -289,10 +477,12 @@ class PackedRows:
 
     @property
     def width(self) -> int:
-        return max(self.lengths)
+        return self.frames.shape[0]
 
 
-def pack_rows(lengths: Sequence[int], device: torch.device) -> PackedRows:
+def pack_rows(lengths: Sequence[int], device: torch.device, width: int | None = None) -> PackedRows:
+    """Pack rows back to back; ``width`` (default: the longest row) may be
+    bucketed so geometry and attention shapes recur across batches."""
     lengths = tuple(int(length) for length in lengths)
     starts_host = F.pad(torch.tensor(lengths, dtype=torch.int64).cumsum(0), (1, 0))
     starts = starts_host.to(device)
@@ -308,6 +498,7 @@ def pack_rows(lengths: Sequence[int], device: torch.device) -> PackedRows:
         starts_host=starts_host.to(torch.int32),
         row_ids=row_ids,
         positions=positions,
+        frames=torch.arange(max(lengths) if width is None else width, device=device),
     )
 
 
@@ -329,9 +520,12 @@ def scatter_rows(packed: torch.Tensor, rows: PackedRows, width: int) -> torch.Te
 
 
 def mark_packed_compile_metadata(rows: PackedRows, attention: RaggedRowAttention) -> None:
-    dynamo.mark_dynamic(attention.page_table, (0, 1))
     dynamo.mark_dynamic(attention.cu_seqlens_q, 0)
     dynamo.mark_dynamic(attention.cache_seqlens, 0)
+    if attention.paged:
+        dynamo.mark_dynamic(attention.page_table, (0, 1))
+        dynamo.mark_dynamic(attention.slot_frames, 0)
+    dynamo.mark_dynamic(rows.frames, 0)
     dynamo.mark_dynamic(rows.starts_host, 0)
     dynamo.mark_dynamic(rows.row_ids, 0)
     dynamo.mark_dynamic(rows.positions, 0)
@@ -364,7 +558,6 @@ def conv_pos_embed_tensor_geometry(
     estimator: PackedDiT,
     h: torch.Tensor,
     rows: PackedRows,
-    attention: RaggedRowAttention,
 ) -> torch.Tensor:
     module = estimator.dit.input_embed.conv_pos_embed
     if estimator.conv_weights is not None:
@@ -378,7 +571,7 @@ def conv_pos_embed_tensor_geometry(
     row_count = rows.starts_host.shape[0] - 1
     # Branch-free rounding keeps this symbolic under dynamic compilation; a
     # size comparison here would add guards and recompile mid-serving.
-    width = (attention.page_table.shape[1] + 63) // 64 * 64
+    width = (rows.width + 63) // 64 * 64
     padded = scatter_rows_tensor_geometry(h, rows, row_count, width)
     embedded = padded.permute(0, 2, 1)
     embedded = F.pad(embedded, (module.kernel_size - 1, 0, 0, 0))
@@ -394,10 +587,8 @@ def conv_pos_embed_tensor_geometry(
 def rope_tensor_geometry(
     estimator: PackedDiT,
     rows: PackedRows,
-    attention: RaggedRowAttention,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    width = attention.page_table.shape[1]
-    freqs, scale = estimator.dit.rotary_embed.forward_from_seq_len(width)
+    freqs, scale = estimator.dit.rotary_embed.forward_from_seq_len(rows.width)
     assert not isinstance(scale, torch.Tensor), "the DiT's RoPE has no xpos scale"
     freqs = freqs[:, rows.positions]
     return freqs.cos(), freqs.sin()
@@ -410,17 +601,59 @@ def ragged_attention_tensor_geometry(
     attention: RaggedRowAttention,
     max_seqlen_q: int,
 ) -> torch.Tensor:
-    page_shape = (-1, FA3_PAGE_SIZE, attention.heads, attention.head_dim)
-    output = packed_fa3(
-        query[0].reshape(-1, attention.heads, attention.head_dim),
-        key[0].reshape(page_shape),
-        value[0].reshape(page_shape),
-        attention.cache_seqlens,
-        attention.page_table,
-        attention.cu_seqlens_q,
-        max_seqlen_q,
-    )
+    head_shape = (-1, attention.heads, attention.head_dim)
+    query, key, value = query[0].reshape(head_shape), key[0].reshape(head_shape), value[0].reshape(head_shape)
+    if attention.backend == "flashinfer":
+        # The solve planned its layout before the first call (see PackedDiT.row_attention).
+        output = flashinfer_row_attention(query, key, value)
+    elif attention.paged:
+        k_pages, v_pages = paged_kv(key, value, attention)
+        output = paged_varlen_attention(
+            query,
+            k_pages,
+            v_pages,
+            attention.cache_seqlens,
+            attention.page_table,
+            attention.cu_seqlens_q,
+            max_seqlen_q,
+            attention.fa_version,
+        )
+    else:
+        output = varlen_attention(query, key, value, attention.cu_seqlens_q, max_seqlen_q, attention.fa_version)
     return output.reshape(1, -1, attention.heads * attention.head_dim)
+
+
+def paged_kv(
+    key: torch.Tensor, value: torch.Tensor, attention: RaggedRowAttention
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Packed K and V, ``(frames, heads, head_dim)``, as ``(pages, page_size, heads, head_dim)``."""
+    page_size = attention.page_size
+    if page_size == 1:
+        # One-frame pages: the packed sequence itself is the paged KV cache.
+        return key[:, None], value[:, None]
+    key, value = gather_kv_slots(key, value, attention.slot_frames)
+    return key.view(-1, page_size, *key.shape[1:]), value.view(-1, page_size, *value.shape[1:])
+
+
+@torch.library.custom_op(
+    "vllm_omni_cosyvoice3_perf::gather_kv_slots",
+    mutates_args=(),
+    device_types="cuda",
+)
+def gather_kv_slots(
+    key: torch.Tensor, value: torch.Tensor, slot_frames: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Gather packed K/V onto page-aligned slots with native ``index_select``;
+    Inductor's generated gather is slower here."""
+    return key.index_select(0, slot_frames), value.index_select(0, slot_frames)
+
+
+@gather_kv_slots.register_fake
+def fake_gather_kv_slots(
+    key: torch.Tensor, value: torch.Tensor, slot_frames: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    shape = (slot_frames.shape[0], *key.shape[1:])
+    return key.new_empty(shape), value.new_empty(shape)
 
 
 def attend_tensor_geometry(
@@ -500,9 +733,9 @@ def forward_packed_tensor_geometry(
     dit = estimator.dit
     t = dit.time_embed(t) if block_modulation is None else None
     h = dit.input_embed.proj(torch.cat((x, cond, mu, spks), dim=-1))
-    h = conv_pos_embed_tensor_geometry(estimator, h, rows, attention) + h
+    h = conv_pos_embed_tensor_geometry(estimator, h, rows) + h
     if rope is None:
-        rope = rope_tensor_geometry(estimator, rows, attention)
+        rope = rope_tensor_geometry(estimator, rows)
     residual = h
     for index, block in enumerate(dit.transformer_blocks):
         modulation = None if block_modulation is None else block_modulation[index : index + 1]
@@ -552,8 +785,8 @@ def solve_flow_euler_packed(
     width = None
     if estimator.graph_buckets and not streaming:
         rows, noise, mu, spks, cond, width = pad_to_graph_bucket(rows, noise, mu, spks, cond)
-    twin_rows = pack_rows(rows.lengths * 2, noise.device)
-    attention = estimator.row_attention(twin_rows, streaming=streaming, width=width)
+    twin_rows = pack_rows(rows.lengths * 2, noise.device, width=width)
+    attention = estimator.row_attention(twin_rows, streaming=streaming)
     mu_cfg = torch.cat((mu, torch.zeros_like(mu)), dim=1)
     cond_cfg = torch.cat((cond, torch.zeros_like(cond)), dim=1)
     spks_cfg = torch.cat((spks, torch.zeros_like(spks)), dim=0)
@@ -663,15 +896,18 @@ class _FlowGraph:
     positions: torch.Tensor
     cache_seqlens: torch.Tensor
     cu_seqlens_q: torch.Tensor
-    page_table: torch.Tensor
+    page_table: torch.Tensor | None
+    slot_frames: torch.Tensor | None
+    frames: torch.Tensor
     output: torch.Tensor | None = None
+    flashinfer: FlashInferRowPlan | None = None
 
 
 class FlowGraphRunner:
     """Replay the whole CFG Euler solve as one CUDA graph per padded layout.
 
     Small codec batches are launch bound: every step walks Dynamo guards, the
-    Inductor wrapper and one FA3 wrapper per block, several hundred host
+    Inductor wrapper and one FlashAttention wrapper per block, several hundred host
     microseconds per step before the GPU sees work. The layout (row slots,
     packed length, attention segments) is padded to recurring buckets exactly
     like the bucketed layouts above: padding rows are isolated by attention
@@ -695,19 +931,7 @@ class FlowGraphRunner:
             return None
         twin = (tuple(lengths) + (0,) * (slots - n) + (padded_total - total,)) * 2
         chunk = self.estimator.dit.static_chunk_size if streaming else None
-        seg_rows, seg_ends, offsets = [], [], [0]
-        for row, length in enumerate(twin):
-            if length == 0:
-                seg_rows.append(row)
-                seg_ends.append(0)
-                offsets.append(offsets[-1])
-                continue
-            span = chunk or length
-            for start in range(0, length, span):
-                end = min(start + span, length)
-                seg_rows.append(row)
-                seg_ends.append(end)
-                offsets.append(offsets[-1] + end - start)
+        seg_rows, seg_ends, offsets = row_segments(twin, chunk)
         segments = len(seg_ends)
         if streaming:
             segments = -(-segments // _FLOW_GRAPH_SEGMENT_STEP) * _FLOW_GRAPH_SEGMENT_STEP
@@ -718,10 +942,29 @@ class FlowGraphRunner:
         return (streaming, slots, padded_total, segments), twin, seg_rows, seg_ends, offsets
 
     def _allocate(self, key, noise, spks, time_span) -> _FlowGraph:
-        _, slots, padded_total, segments = key[:4]
+        streaming, slots, padded_total, segments = key[:4]
         device, dtype = noise.device, noise.dtype
         channels = noise.shape[-1]
         rows = 2 * (slots + 1)
+        backend = self.estimator.backend
+        page_table = slot_frames = flashinfer = None
+        if backend == "flashinfer":
+            chunk = self.estimator.dit.static_chunk_size
+            flashinfer = FlashInferRowPlan(
+                device,
+                heads=self.heads,
+                head_dim=self.head_dim,
+                dtype=self.estimator.dtype,
+                chunked=streaming,
+                graph_capacity=(segments, paged_index_capacity(padded_total, chunk) if streaming else 0),
+            )
+        if attention_uses_pages(backend, streaming):
+            page_size = PAGE_SIZE[backend]
+            page_table = torch.zeros((segments, -(-padded_total // page_size)), device=device, dtype=torch.int32)
+            # Each row wastes less than one page: a static bound on the slots.
+            slot_frames = torch.zeros(
+                (2 * padded_total // page_size + rows) * page_size, device=device, dtype=torch.int64
+            )
         return _FlowGraph(
             graph=torch.cuda.CUDAGraph(),
             noise=torch.zeros((1, padded_total, channels), device=device, dtype=dtype),
@@ -734,11 +977,13 @@ class FlowGraphRunner:
             positions=torch.zeros(2 * padded_total, device=device, dtype=torch.int64),
             cache_seqlens=torch.zeros(segments, device=device, dtype=torch.int32),
             cu_seqlens_q=torch.zeros(segments + 1, device=device, dtype=torch.int32),
-            page_table=torch.zeros((segments, padded_total), device=device, dtype=torch.int32),
+            page_table=page_table,
+            slot_frames=slot_frames,
+            frames=torch.arange(padded_total, device=device),
+            flashinfer=flashinfer,
         )
 
-    @staticmethod
-    def _load(state: _FlowGraph, twin, seg_rows, seg_ends, offsets, noise, mu, cond, spks, time_span) -> None:
+    def _load(self, state: _FlowGraph, twin, seg_rows, seg_ends, offsets, noise, mu, cond, spks, time_span) -> None:
         total = noise.shape[1]
         host = torch.tensor(list(twin) + seg_rows + seg_ends + offsets, dtype=torch.int32, pin_memory=True)
         state.table.copy_(host, non_blocking=True)
@@ -753,10 +998,21 @@ class FlowGraphRunner:
         ends = state.table[rows + segments : rows + 2 * segments]
         state.cache_seqlens.copy_(ends)
         state.cu_seqlens_q.copy_(state.table[rows + 2 * segments :])
-        page = torch.arange(state.page_table.shape[1], device=noise.device, dtype=torch.int32)
-        state.page_table.copy_(
-            torch.where(page[None] < ends[:, None], starts[seg_rows_t.long()].int()[:, None] + page[None], 0)
-        )
+        if state.page_table is not None:
+            page_table, slot_frames = page_metadata(
+                lengths,
+                seg_rows_t,
+                ends,
+                state.row_ids,
+                state.positions,
+                page_size=PAGE_SIZE[self.estimator.backend],
+                columns=state.page_table.shape[1],
+                slots=state.slot_frames.shape[0],
+            )
+            state.page_table.copy_(page_table)
+            state.slot_frames.copy_(slot_frames)
+        if state.flashinfer is not None:
+            state.flashinfer.plan(twin, seg_rows, seg_ends, offsets)
         state.noise[:, :total].copy_(noise)
         state.mu[:, :total].copy_(mu)
         state.cond[:, :total].copy_(cond)
@@ -766,14 +1022,24 @@ class FlowGraphRunner:
 
     def _solve(self, state: _FlowGraph, cfg_rate: float, key: tuple) -> torch.Tensor:
         estimator = self.estimator
-        rows = PackedRows(lengths=(), starts_host=state.table, row_ids=state.row_ids, positions=state.positions)
-        attention = object.__new__(RaggedRowAttention)
-        attention.heads, attention.head_dim = self.heads, self.head_dim
-        attention.cache_seqlens, attention.cu_seqlens_q = state.cache_seqlens, state.cu_seqlens_q
-        attention.page_table = state.page_table
-        # Streaming queries cover one training chunk, even when their KV
-        # prefix and the packed graph allocation contain thousands of frames.
-        attention.max_seqlen_q = estimator.dit.static_chunk_size if key[0] else state.page_table.shape[1]
+        rows = PackedRows(
+            lengths=(), starts_host=state.table, row_ids=state.row_ids, positions=state.positions, frames=state.frames
+        )
+        # Streaming queries cover one training chunk even when the KV prefix
+        # and packed graph allocation contain thousands of frames.
+        max_seqlen_q = estimator.dit.static_chunk_size if key[0] else rows.width
+        if state.flashinfer is not None:
+            activate(state.flashinfer)
+        attention = RaggedRowAttention(
+            heads=self.heads,
+            head_dim=self.head_dim,
+            backend=estimator.backend,
+            max_seqlen_q=max_seqlen_q,
+            cache_seqlens=state.cache_seqlens,
+            cu_seqlens_q=state.cu_seqlens_q,
+            page_table=state.page_table,
+            slot_frames=state.slot_frames,
+        )
         mark_packed_compile_metadata(rows, attention)
         mu_cfg = torch.cat((state.mu, torch.zeros_like(state.mu)), dim=1)
         cond_cfg = torch.cat((state.cond, torch.zeros_like(state.cond)), dim=1)
