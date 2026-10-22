@@ -32,7 +32,7 @@ from vllm.model_executor.models.utils import (
 from vllm.sequence import IntermediateTensors
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata, VideoTokenLayout
-from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.attention.layer import Attention, ScheduleCandidate
 from vllm_omni.diffusion.distributed.parallel_state import (
     get_pipeline_parallel_world_size,
     is_pipeline_first_stage,
@@ -354,7 +354,7 @@ class OutputScaleShiftPrepare(nn.Module):
         return shift, scale
 
 
-def _reject_vsa_candidate_without_gate(record: Any) -> str | None:
+def _reject_vsa_candidate_without_gate(record: ScheduleCandidate) -> str | None:
     """Schedule candidate check for a WanSelfAttention built without to_gate_compress."""
     if record.backend_cls.get_name() != "FASTVIDEO_VSA":
         return None
