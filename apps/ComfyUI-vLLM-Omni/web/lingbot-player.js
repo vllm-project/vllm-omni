@@ -100,8 +100,9 @@ export class VideoSession {
     // this window, so the window must cover the first chunk plus one more, or the
     // player never buffers enough to start and the session idles out.
     const windowSeconds = config.payload.streaming_buffer_seconds ?? 1.5;
-    // Leave room for the next chunk without waiting for more than the server can produce.
-    this.startupBufferSeconds = Math.min(1, Math.max(0, windowSeconds - 2 / fps));
+    // Start once the first chunk is in: waiting for more than one chunk can deadlock,
+    // because the server holds the next chunk back until playback advances.
+    this.startupBufferSeconds = Math.min(0.5, Math.max(0.25, windowSeconds / 3));
     this.startTimer = setTimeout(() => this.fail("Timed out opening the video connection."), 15000);
     source.addEventListener("sourceopen", () => {
       if (this.source !== source) return;
@@ -156,7 +157,10 @@ export class VideoSession {
   control(message) {
     if (typeof message.request_id === "string") this.requestId = message.request_id;
     if (message.type === "error") {
-      this.fail(`${message.message || "Server error"}. Keyboard mode requires Omni camera interaction support.`);
+      const detail = message.message || "Server error";
+      // Only hint at the camera API when the server actually refused it.
+      const camera = /camera|interaction/i.test(detail) ? " Keyboard mode requires Omni camera interaction support." : "";
+      this.fail(`${detail}.${camera}`);
     } else if (message.type === "video.chunk_metadata") {
       if (message.kind === "media") {
         this.ready = !this.stopping;
