@@ -141,8 +141,8 @@ errors on the job record rather than the creation response.
 - H3 DiT profiles must exclude packed padding; VSA profiles require the VSA
   gate or a VSA base, and gated FastH3 layers accept only VSA.
   FastH3 checkpoints pin VSA sparsity, so their profiles cannot set
-  `fastvideo_vsa_topk`. FastH3 Omni checks each VSA profile's provider and
-  precision at startup, as it does for the base.
+  `fastvideo_vsa_topk`. They also check each VSA profile's provider and
+  precision at startup, because warm-up runs only the base.
 - TRTLLM `target_sparsity` needs a per-layer calibration curve unless the
   layer is explicitly ignored.
 
