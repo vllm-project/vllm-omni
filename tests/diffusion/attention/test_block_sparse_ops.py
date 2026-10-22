@@ -12,9 +12,55 @@ from vllm_omni.diffusion.attention.ops.block_sparse import (
     build_prefix_dense_block_map,
     fastvideo_block_sparse_attn_bshd,
     mean_pool_tiles,
+    resolve_block_sparse_provider,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
+
+
+@pytest.mark.parametrize("capability", [(10, 0), (10, 3)])
+def test_tile128_startup_honors_installed_native_capability(monkeypatch, capability):
+    native = pytest.importorskip("fastvideo_kernel.block_sparse_attn_sm100a")
+    from vllm_omni.platforms import current_omni_platform
+
+    monkeypatch.setattr(current_omni_platform, "get_device_capability", lambda _: capability)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _: capability)
+    resolve_block_sparse_provider.cache_clear()
+    try:
+        with FakeTensorMode():
+            device = torch.device("cuda:0")
+            query = torch.empty(1, 1, 256, 128, dtype=torch.bfloat16, device=device)
+            sizes = torch.empty(2, dtype=torch.int32, device=device)
+            # Exercise the dependency's real predicate; fake tensors avoid
+            # needing either architecture or launching a GPU kernel.
+            supported = native.is_supported(query, sizes)
+            if capability == (10, 3):
+                assert not supported
+                assert resolve_block_sparse_provider("auto", "bf16", device, torch.bfloat16, 128, 128) == "triton"
+            if supported:
+                assert (
+                    resolve_block_sparse_provider("fastvideo", "bf16", device, torch.bfloat16, 128, 128) == "fastvideo"
+                )
+            else:
+                with pytest.raises((ImportError, ValueError), match="FastVideo tile128"):
+                    resolve_block_sparse_provider("fastvideo", "bf16", device, torch.bfloat16, 128, 128)
+    finally:
+        resolve_block_sparse_provider.cache_clear()
+
+
+def test_tile128_startup_rejects_native_build_without_tile128(monkeypatch):
+    native = pytest.importorskip("fastvideo_kernel.block_sparse_attn_sm100a")
+    from vllm_omni.platforms import current_omni_platform
+
+    monkeypatch.setattr(current_omni_platform, "get_device_capability", lambda _: (10, 0))
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _: (10, 0))
+    monkeypatch.setitem(native._FWD_BY_BLOCK, 128, None)
+    resolve_block_sparse_provider.cache_clear()
+    try:
+        with FakeTensorMode(), pytest.raises(ImportError, match="FastVideo tile128"):
+            resolve_block_sparse_provider("fastvideo", "bf16", torch.device("cuda:0"), torch.bfloat16, 128, 128)
+    finally:
+        resolve_block_sparse_provider.cache_clear()
 
 
 @pytest.mark.parametrize("prefix_blocks,topk", [(0, 1), (2, 0), (2, 1), (2, 3), (2, 5)])

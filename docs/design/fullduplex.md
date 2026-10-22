@@ -33,6 +33,71 @@ turn-based stack free of duplex code, and exposes the same session to three
 consumers: the OpenAI Realtime WebSocket route, the in-process Python API and
 the model plugins.
 
+## Playback completion ownership
+
+`DuplexEngineSession` owns response snapshots and playback cursors. Output
+completion and a client's full `playback.ack` can arrive in either order.
+`finalize_response_playback` is the shared check used by ACK processing,
+normal response completion, draining response completion, and cancellation.
+It retains state while that response is active, any of its requests are still
+draining, or playback is partial without an explicit hard truncate. A hard
+truncate means playback has stopped; once output ends, no further ACK is needed.
+At that point, detach the stopped response from the current playback gate even
+if calibration keeps its response-scoped cursor. Detach by cursor identity so
+an older stop or delayed ACK cannot unblock or overwrite a newer response.
+A final output
+can add transcript or completion metadata after the ACK, so history is reconciled
+against the retained cursor before releasing the snapshot and pending item state.
+Deleted history is never reconstructed. Natural drain completion establishes
+`audio_complete`; cancellation does not. A later response's cursor and history
+position remain independent. Without calibration, aligned history keeps its
+timing marks after a hard stop so a later explicit truncate can shorten the
+stored prefix. Marks retain their original character offsets; repeated truncation
+does not rescale them to the remaining text. Unaligned stops and retired
+calibration evidence keep only the stored prefix and cutoff. Delayed progress
+ACKs cannot change finalized history or restore unheard text. Plugin runtime
+settlement follows all history writes, including cancellation writeback into a
+reserved older turn; it must observe the final committed result.
+
+Audio truncation is valid only for an item whose response produced audio.
+The session checks its live cursor or retained audio provenance before any
+history or playback mutation. Cursor cleanup preserves that provenance only
+for stored history items; deleting or replacing finalized context removes it.
+This distinguishes a retired audio reply from imported context or a reply that never emitted audio
+without retaining its recording or full response snapshot. Realtime commands,
+native truncate signals, and hard playback ACKs reject a no-audio target.
+An ACK's implicit target is resolved before validation or mutation. Pending and
+stored-item fallbacks must match `last_response_id`, which `begin_response`
+updates together with the current playback cursor. A retained older reply cannot
+consume the current reply's ACK, even when it is the only remaining history item.
+Resolution looks up that current item directly in pending or stored history;
+unrelated older or imported items do not make its identity ambiguous. This must
+continue working when a partial ACK moves it from pending to stored history.
+The stored-item fallback also requires the item's live or retained audio
+provenance, including for audio-only replies, then passes the same ownership
+and late-ACK validation as an explicit target. Imported context without audio
+provenance is not selected, even if its ID starts with `item_`. Without an
+identifiable target, ordinary ACKs
+update only the current playback cursor and hard ACKs fail before any history or
+cursor mutation.
+The typed `AckPlayback` command preserves the wire `truncate` flag through
+translation and mailbox delivery, so hard stops reach the same handler as
+internal playback controls.
+
+History edits pass the item's own timing marks and playback cursor explicitly;
+the text-prefix calculation never reads the active response implicitly. If both
+marks and duration of a known audio reply have been released, a new explicit
+truncate cannot establish a heard prefix and clears the text conservatively.
+Truncation preserves the empty assistant turn so the command's following playback ACK remains valid;
+only deletion removes that turn. Ignored ACKs for finalized history report
+`history_committed: false` and do not settle plugin runtime again, including
+when calibration evidence has been retired.
+
+Opt-in history calibration is a separate retention owner: incomplete or
+hard-capped replies remain in its bounded cache for prefix correction. Every
+completion path preserves that evidence until calibration retires it. Sessions
+without calibration release stopped output immediately.
+
 ## Architecture
 
 ```text
@@ -330,6 +395,17 @@ for queue updates and the final validity check before delivery.
   turn_id)` when it starts and re-checks them before the stage submit and
   before committing ledgers; a task that finds the epoch advanced rolls back
   its PCM reservation and exits.
+- **Buffered commit prefixes.** A model buffer may reserve non-terminal units
+  before its terminal commit payload. The runner submits these in wire order
+  with `force_listen=True` and waits for append acceptance before acknowledging
+  the commit. A commit that must wait for an active response holds those
+  prefixes and submits them, still in wire order, when that response ends,
+  before the retained terminal payload. Reservations keep their normal rollback
+  ownership. MiniCPM uses this path to preserve separate buffered VISION units
+  and a following speech tail in manual commit/response sessions. Native
+  resumable responses also defer video-only commits. If response creation is
+  disabled on the commit, a later explicit `response.create` must drain the
+  held prefixes before submitting the terminal payload.
 - **Cancel is atomic at the session.** `CancelResponse` / `BargeIn` advance
   the epoch, cancel tracked append tasks, abort the owned stage bindings
   through the stage port and emit the cancelled terminal events before
@@ -383,6 +459,18 @@ for queue updates and the final validity check before delivery.
   accumulates the snapshot into the active response, so
   `ResponseDone.stage_metrics` and `metadata.vllm_omni.stage_metrics` on the
   wire keep their meaning.
+
+### Semantic turn decisions
+
+`SessionControl` owns a detector per session and offloads its ordered audio
+processing to the manager's executor. `SemanticTurnDetector` loads the shared
+Smart Turn backend on the first audio chunk; the backend constructor warms the
+CPU ONNX session. Silero's candidate pauses trigger subsequent scoring. Each
+detector retains the current pause's semantic decision until speech resumes or
+the turn resets. At commit, session-correlated logs distinguish a complete
+semantic decision from the silence timeout, including whether the preceding
+score was incomplete or inference failed. These diagnostics do not change the
+wire protocol or the endpoint decision.
 
 ### Experimental output limits
 

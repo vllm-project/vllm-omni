@@ -43,6 +43,9 @@ from vllm_omni.outputs import OmniRequestOutput
 logger = init_logger(__name__)
 
 SERVER_STARTUP_TIMEOUT_S = 2400
+# Diffusion workers alone may need 15s + 5s + 5s for cooperative cleanup
+# and signal escalation. Keep their tracker alive while the API owns teardown.
+SERVER_SHUTDOWN_TIMEOUT_S = 60
 
 PromptAudioInput = list[tuple[Any, int]] | tuple[Any, int] | None
 PromptImageInput = list[Any] | Any | None
@@ -190,7 +193,9 @@ class OmniServer:
         for attempt in range(128):
             if attempt:
                 self.port = get_open_port(self.host)
-            lock_path = Path(tempfile.gettempdir()) / f"vllm-omni-test-port-{os.getuid()}-{self.port}.lock"
+            # Windows has no uid; one shared owner keeps the port lock name stable.
+            owner_id = getattr(os, "getuid", lambda: 0)()
+            lock_path = Path(tempfile.gettempdir()) / f"vllm-omni-test-port-{owner_id}-{self.port}.lock"
             lock = FileLock(lock_path)
             try:
                 lock.acquire(timeout=0)
@@ -340,7 +345,7 @@ class OmniServer:
             # 2. Give the parent time to shut down its children cleanly.
             parent_exited = False
             try:
-                parent.wait(timeout=15)
+                parent.wait(timeout=SERVER_SHUTDOWN_TIMEOUT_S)
                 parent_exited = True
             except psutil.NoSuchProcess:
                 parent_exited = True
@@ -419,7 +424,7 @@ class OmniServer:
             self._start_server()
         except BaseException:
             # ``__exit__`` is not invoked when ``__enter__`` raises; roll back
-            # any processes / log handles already launched.
+            # any process already launched.
             self.__exit__(None, None, None)
             raise
         return self

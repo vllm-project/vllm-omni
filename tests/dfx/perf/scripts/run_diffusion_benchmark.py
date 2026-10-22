@@ -860,6 +860,7 @@ def run_benchmark(
         "stage_durations_p50": metrics.get("stage_durations_p50"),
         "stage_durations_p99": metrics.get("stage_durations_p99"),
         "commit_sha": _get_branchpoint_commit_sha(),
+        "branch": os.environ.get("BUILDKITE_BRANCH", ""),
         "build_id": os.environ.get("BUILDKITE_BUILD_ID", ""),
         "build_url": os.environ.get("BUILDKITE_BUILD_URL", ""),
         "source_file": source_file,

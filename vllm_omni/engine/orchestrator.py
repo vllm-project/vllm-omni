@@ -873,6 +873,9 @@ class OrchestratorBase:
         await self._handle_kv_ready_raw_outputs(stage_id, raw_outputs)
 
         for eco in raw_outputs.outputs:
+            mm_cache_miss_hashes = getattr(eco, "mm_cache_miss_hashes", None)
+            if mm_cache_miss_hashes and stage_id != 0:
+                await asyncio.to_thread(self._invalidate_stage_mm_cache, stage_id, mm_cache_miss_hashes)
             # Emit kv_wait_s before _handle_kv_ready_raw_outputs'
             # async_chunk early-return so it lands in all modes.
             kv_params = getattr(eco, "kv_transfer_params", None)
@@ -888,6 +891,18 @@ class OrchestratorBase:
             request_id = getattr(eco, "request_id", None)
             req_state = self.request_states.get(request_id) if request_id is not None else None
             if req_state is None:
+                # Stage 0's sender lives on the frontend. Deliver its cache
+                # feedback even after cancellation; consumers may drop the error
+                # only after the engine has invalidated those stale entries.
+                if mm_cache_miss_hashes and stage_id == 0:
+                    await self.output_async_queue.put(
+                        ErrorMessage(
+                            request_id=request_id,
+                            stage_id=stage_id,
+                            error="Multi-modal processor cache miss.",
+                            mm_cache_miss_hashes=mm_cache_miss_hashes,
+                        )
+                    )
                 continue
 
             segment_finished = bool(getattr(eco, "is_segment_finished", False))
@@ -899,7 +914,11 @@ class OrchestratorBase:
                 and not segment_finished
                 and not req_state.session_owned
             ):
-                reason = getattr(eco, "stop_reason", None)
+                reason = (
+                    "Multi-modal processor cache miss. Please retry the request."
+                    if mm_cache_miss_hashes
+                    else getattr(eco, "stop_reason", None)
+                )
                 await self._handle_stage_error(
                     stage_id,
                     eco,
@@ -1464,8 +1483,13 @@ class OrchestratorBase:
                 request_id=parent_id,
                 stage_id=stage_id,
                 error=error if error is not None else output.error,
-                status_code=getattr(output, "error_status_code", None),
-                error_type=getattr(output, "error_type", None),
+                status_code=503
+                if getattr(output, "mm_cache_miss_hashes", None)
+                else getattr(output, "error_status_code", None),
+                error_type="ServiceUnavailableError"
+                if getattr(output, "mm_cache_miss_hashes", None)
+                else getattr(output, "error_type", None),
+                mm_cache_miss_hashes=getattr(output, "mm_cache_miss_hashes", None),
             )
         )
         await self._cleanup_request_ids(
@@ -1899,6 +1923,7 @@ class OrchestratorBase:
                 fatal=False,
                 request_id=req_state.request_id,
                 stage_id=stage_id,
+                mm_cache_miss_hashes=getattr(eco, "mm_cache_miss_hashes", None),
             )
         )
 
@@ -2154,6 +2179,15 @@ class OrchestratorBase:
             processor = build_stage0_input_processor(self.stage_pools[stage_id].stage_vllm_config)
             self._stage_input_processors[stage_id] = processor
         return processor
+
+    def _invalidate_stage_mm_cache(self, stage_id: int, mm_hashes: list[str]) -> None:
+        # Multimodal preprocessing uses this same lock in a worker thread.
+        with self._prompt_processing_lock:
+            processor = self._stage_input_processors.get(stage_id)
+            cache = processor.renderer.mm_processor_cache if processor is not None else None
+            if cache is not None:
+                for mm_hash in mm_hashes:
+                    cache.invalidate(mm_hash)
 
     def _upgrade_processed_stage_request(self, request: Any, raw_prompt: Any) -> Any:
         prompt_embeds = getattr(request, "prompt_embeds", None)

@@ -31,7 +31,7 @@ except ModuleNotFoundError:
     sys.modules["vllm.logger"] = _vllm_logger
 
 from vllm_omni.core.prefix_cache.adapter import PrefixCacheStep, PrefixCacheWriteLayout
-from vllm_omni.core.prefix_cache.interface import PrefixCacheConfig, StageCacheOutputs
+from vllm_omni.core.prefix_cache.interface import ModelCachePolicy, PrefixCacheConfig, StageCacheOutputs
 from vllm_omni.core.prefix_cache.runner_mixin import PrefixCacheRunnerMixin
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -337,3 +337,112 @@ def test_shared_runner_shutdown_releases_cache_before_upstream():
         and node.func.attr == "_shutdown_omni_prefix_cache"
         for node in ast.walk(ar_shutdown)
     )
+
+
+def test_native_only_snapshot_is_explicit_and_immutable():
+    a, b = _Runner(), _Runner()
+    model = SimpleNamespace(requires_full_prefix_cached_hidden_states=False, uses_native_kv_cache_only=True)
+    a._snapshot_prefix_cache_model_policy(model)
+    model.uses_native_kv_cache_only = False
+    assert a._omni_cache_policy.native_kv_cache_only is True
+    assert b._omni_cache_policy.native_kv_cache_only is False
+    assert a._omni_cache_policy.needs_full_hidden_states is False
+
+
+@pytest.mark.parametrize("mode", ["none", "all"])
+@pytest.mark.parametrize("native_only", [False, True])
+def test_mamba_prefix_cache_non_align_is_noop(mode, native_only):
+    from vllm_omni.worker.mamba_prefix_cache import prepare_mamba_prefix_cache
+
+    def callback():
+        pytest.fail("must remain deferred")
+
+    runner = SimpleNamespace(
+        cache_config=SimpleNamespace(mamba_cache_mode=mode),
+        _omni_cache_policy=ModelCachePolicy(needs_full_hidden_states=False, native_kv_cache_only=native_only),
+    )
+    assert prepare_mamba_prefix_cache(runner, object(), 2, callback) is callback
+
+
+@pytest.mark.parametrize("policy", [None, ModelCachePolicy()], ids=["absent", "default"])
+@pytest.mark.parametrize("deferred", [False, True])
+def test_mamba_prefix_cache_requires_explicit_native_only_model(policy, deferred):
+    from vllm_omni.worker.mamba_prefix_cache import prepare_mamba_prefix_cache
+
+    def callback():
+        pytest.fail("another model's correction must remain deferred")
+
+    runner = SimpleNamespace(cache_config=SimpleNamespace(mamba_cache_mode="align"))
+    if policy is not None:
+        runner._omni_cache_policy = policy
+    # Unselected models do not need Ming's state buffers or migration hooks.
+    correction = callback if deferred else None
+    assert prepare_mamba_prefix_cache(runner, object(), 2, correction) is correction
+
+
+@pytest.mark.parametrize("postprocess", [False, True])
+@pytest.mark.parametrize("deferred", [False, True])
+def test_mamba_prefix_cache_align_order_and_native_arguments(monkeypatch, postprocess, deferred):
+    from vllm_omni.worker.mamba_prefix_cache import prepare_mamba_prefix_cache
+
+    events: list[Any] = []
+    scheduler = object()
+    pre, post, copies = object(), object() if postprocess else None, object()
+    cache = SimpleNamespace(mamba_cache_mode="align")
+    inputs = SimpleNamespace(num_accepted_tokens_cpu=torch.tensor([9, 8, 7]), req_ids=["a", "b"])
+    accepted = torch.tensor([0, 0, 99])
+    runner = SimpleNamespace(
+        _omni_cache_policy=ModelCachePolicy(needs_full_hidden_states=False, native_kv_cache_only=True),
+        cache_config=cache,
+        kv_cache_config=object(),
+        mamba_state_idx=object(),
+        input_batch=inputs,
+        requests=object(),
+        compilation_config=SimpleNamespace(static_forward_context=object()),
+        num_accepted_tokens=SimpleNamespace(
+            np=accepted, copy_to_gpu=lambda n: events.append(("sync", n, accepted.clone()))
+        ),
+    )
+
+    def get_bufs():
+        events.append("buffers")
+        return SimpleNamespace(preprocess=pre, postprocess_align=post)
+
+    runner._get_mamba_bufs = get_bufs
+    runner._get_mamba_state_copy_funcs = lambda: copies
+
+    def preprocess(*args, **kwargs):
+        assert args == (
+            scheduler,
+            runner.kv_cache_config,
+            cache,
+            runner.mamba_state_idx,
+            inputs,
+            runner.requests,
+            runner.compilation_config.static_forward_context,
+            copies,
+            pre,
+        )
+        assert kwargs == {"align_ctx": post}
+        assert events == (["deferred", "buffers"] if deferred else ["buffers"])
+        events.append("preprocess")
+        inputs.num_accepted_tokens_cpu[:2] = 1
+
+    def stage(*args):
+        assert args == (post, scheduler, inputs.req_ids, 2, runner.requests, runner.mamba_state_idx)
+        assert events[-1][0] == "sync"
+        events.append("stage")
+
+    native = ModuleType("vllm.v1.worker.mamba_utils")
+    setattr(native, "preprocess_mamba", preprocess)
+    setattr(native, "stage_postprocess_inputs_to_gpu", stage)
+    worker = ModuleType("vllm.v1.worker")
+    setattr(worker, "mamba_utils", native)
+    monkeypatch.setitem(sys.modules, "vllm.v1.worker", worker)
+    monkeypatch.setitem(sys.modules, "vllm.v1.worker.mamba_utils", native)
+    callback = (lambda: events.append("deferred")) if deferred else None
+    assert prepare_mamba_prefix_cache(runner, scheduler, 2, callback) is None
+    sync = events[-2] if postprocess else events[-1]
+    assert sync[:2] == ("sync", 2)
+    assert sync[2].tolist() == [1, 1, 99]
+    assert events[-1] == "stage" if postprocess else events[-2] == "preprocess"

@@ -41,6 +41,24 @@ Grouping and pruning affect only the model-input view. They do not merge or
 delete the source conversation items exposed to clients, and do not change
 playback acknowledgement or interruption handling.
 
+### Qwen3-Omni voice selection
+
+The duplex session forwards the configured voice to the Talker as the
+checkpoint speaker. Accepted values are the names in the checkpoint's
+`talker_config.speaker_id` mapping (for example `chelsie`, `ethan`,
+`aiden`), matched case-insensitively. When the checkpoint exposes that
+mapping, an unknown name is rejected with error code `invalid_speaker`,
+leaving the previous voice in effect; a checkpoint without a mapping leaves
+voice names unvalidated and the Talker uses its default. The voice can be set
+when the session is opened and changed through `session.update` until audio
+output has started. Once audio output has started, a change to `voice` is
+rejected with `voice_update_after_audio_unsupported`; resending the current
+value — in any case or spacing, or as an echoing `null` — is a no-op, so
+clients may round-trip the whole session object. Clearing the voice before
+any audio output is allowed and makes the Talker fall back to the checkpoint's
+default speaker; a blank value is treated the same as `null`. Reference-voice
+audio (`ref_audio`) is not supported on this model.
+
 ### Optional history calibration for interrupted Qwen3-Omni replies
 
 By default, Qwen3-Omni audio replies under `ack_only` retain their full text
@@ -404,6 +422,19 @@ ships a preset:
 Keyword overrides on a preset replace the corresponding `SessionConfig`
 field, e.g. `create_duplex_session_config(ref_audio=..., temperature=0.6)`.
 
+MiniCPM-o 4.5 uses `sliding_window_mode: "basic"` by default for the Thinker
+(Stage 0). When the projected context exceeds `basic_window_high_tokens`
+(8000), the window drops the oldest units, including the model's own output
+in them, targeting `basic_window_low_tokens` (6000). The system/reference-audio
+prefix is kept. Dropped input and earlier replies are no longer directly
+available to the Thinker. The retained time span depends on the input and
+generated speech; these limits are token counts, not a fixed number of seconds.
+
+Pass `extra_body={"sliding_window_mode": "off"}` to retain the full history.
+The `"context"` mode instead retains `context_max_units` (24) recent units
+plus up to `context_previous_max_tokens` (500) tokens of earlier model text.
+The window configuration is fixed when the session is created.
+
 Constructor options: `reconnect` (a `ReconnectPolicy`, default five
 attempts with 0.25–4 s jittered backoff; `None` disables auto-resume),
 `heartbeat_interval_s` (default 30 s; `None` disables the lease heartbeat),
@@ -473,6 +504,29 @@ conversation history only as far as you acknowledge it, which is what keeps
 history truthful after an interruption. `acknowledge_collected_playback(client,
 collector)` acknowledges everything an `EventCollector` has received, which is
 what the example and the benchmarks do at the end of a turn.
+
+Audio without a transcript can still be acknowledged after the response ends
+or is cancelled. If its ACK arrives before a later input, an empty assistant
+message preserves the turn boundary. A late ACK can update playback without
+appending the old turn after the newer input. Neither case commits answer text
+(`history_committed` remains false); a full ACK releases the response's pending
+playback and history state. While an older response is still draining audio,
+an ACK that catches up with the audio sent so far keeps its playback and history
+snapshot alive, including when its transcript is temporarily empty. Later text
+and audio still belong to that response. Cleanup requires both output completion
+and either a full playback ACK or an explicit hard truncate, in either order: if the ACK arrives first, the terminal
+output applies that saved progress to the final transcript and releases the
+response without requiring another ACK. Ordinary partial playback retains the
+response for a later ACK. An explicit truncate stops playback at its cutoff and
+does not require acknowledging the discarded audio. Without calibration, text
+timing marks remain available for later, stricter item truncation. When usable
+alignment is unavailable, only the stored history prefix and cutoff survive.
+Subsequent progress ACKs cannot change finalized history or restore unheard text.
+When history calibration is enabled, its bounded cache retains the evidence
+needed for prefix correction until retirement, including hard-capped replies.
+Cancellation does not mark unfinished audio as fully generated;
+it never credits an entire unaligned transcript merely because playback caught
+up with the chunks sent before cancellation.
 
 ### Interrupt
 
@@ -840,9 +894,21 @@ Semantic divergences hidden behind shared names:
   before any commit; a commit may end in `response.listen` and no
   response, and the model may open a response with no commit at all.
   OpenAI: commit ⇒ item, `response.create` ⇒ exactly one response.
-- `turn_detection.interrupt_response=false` is rejected;
-  `create_response` is ignored; `semantic_vad` is unsupported; the VAD
-  runs per session (Silero) and implies `overlap_policy=barge_in_on_speech`.
+- `turn_detection.interrupt_response=false` is rejected; the VAD runs per
+  session (Silero) and implies `overlap_policy=barge_in_on_speech`.
+  `semantic_vad` (Silero + Smart Turn v3.2, `eagerness` low/medium/high/auto;
+  setup in the [realtime web guide](https://github.com/vllm-project/vllm-omni/blob/main/examples/online_serving/realtime_web/README.md#semantic-vad-silero--smart-turn))
+  is accepted for turn-based sessions only; auto-responding (native duplex)
+  sessions refuse it with `unsupported_turn_detection`. On turn-based sessions
+  the detector's commit honours `create_response`.
+- Re-sending the same normalized `turn_detection` settings preserves the active
+  speech and pause state. Changing settings (including switching modes or
+  disabling VAD) while input is pending rejects the entire `session.update`
+  with `unsupported_turn_detection`; commit or clear input before retrying.
+  This also applies to identical settings after a backend failure disabled the
+  detector: its replacement cannot reconstruct the buffered turn. Identical
+  settings preserve pending input only when reusing the live detector (or when
+  VAD remains disabled).
 - `rate_limits.updated` is always an empty list (compatibility only).
 - Cancellation never reuses a `response_id`; truncation is driven by
   `playback.ack` as well as `conversation.item.truncate`.
@@ -1368,9 +1434,20 @@ deferred commit during an active response (`event.response_create_deferred`)
 {"type": "conversation.item.truncated", "item_id": "item_resp_01", "content_index": 0, "audio_end_ms": 1850, "event": {"…": "…"}}
 ```
 
-After this acknowledgement, `conversation.item.retrieve` returns the truncated
+Audio truncation requires audio produced by the target item's response.
+Imported text context and replies that have not produced audio return
+`bad_event`, without changing history, playback progress, or pending truncation.
+A known duration of zero is a bound, not an unspecified duration.
+
+After a successful acknowledgement, `conversation.item.retrieve` returns the truncated
 transcript. Without text/audio alignment marks, its prefix is estimated from
-the requested position and audio duration; this is not exact word alignment.
+the requested position and that response's retained audio duration; this is not
+exact word alignment. For a reply that previously produced audio, if neither
+alignment nor duration remains, an explicit truncate clears the transcript
+conservatively. An empty truncated assistant
+item remains addressable for subsequent ACKs; use `conversation.item.delete`
+to remove it. Delayed progress ACKs cannot change finalized history and report
+`history_committed: false`, without repeating tool-result settlement.
 
 #### Response lifecycle
 
@@ -1631,6 +1708,25 @@ truncating ack after an interruption (what was actually heard)
 {"type": "playback.ack", "response_id": "resp_01", "played_ms": 1850, "committed_ms": 1850, "truncate": true}
 ```
 
+Send `response_id` or `item_id` to identify the playback being acknowledged.
+For compatibility, an omitted ID can select the active response. For a finished
+response, the server can infer its pending or stored assistant item if it belongs
+to the most recently started response associated with current playback. Older
+pending replies and imported history do not change that target, including after
+a partial ACK moves it into stored history. A stored item must also have produced
+audio. The session retains that fact after releasing the full playback records,
+including for replies without text. An imported item's `item_`
+prefix alone does not make it a playback target. An older reply is not selected
+in place of a deleted current item, even if that older reply produced audio;
+send its ID explicitly to acknowledge it. With no identifiable target, an ordinary ACK updates only
+the current playback cursor; a hard ACK (`truncate: true`) returns `bad_event`
+before changing history or playback. Explicitly naming a non-response item still returns
+`playback_item_not_found`. The `truncate` flag is preserved through command
+translation, including the legacy `audio.playback_ack` alias. Once a
+hard-stopped response finishes generating, it no longer blocks `response.create`,
+including while its history-calibration evidence is retained. An ordinary
+partial ACK still means playback is in progress.
+
 #### Overlap and barge-in
 
 `S→C overlap.decision`
@@ -1744,9 +1840,9 @@ them out into typed events before they reach a client.
   Text-to-speech has its own shape here — put the text in
   `extra_body.duplex_initial_user_text` on `session.update`, then stream audio
   units (silence is enough). The seeded turn is what the model answers.
-- `turn_detection` supports only `server_vad` with `interrupt_response=true`;
-  `semantic_vad`, `interrupt_response=false`, and `create_response` are not
-  supported.
+- `turn_detection` supports `server_vad` and, for turn-based sessions,
+  `semantic_vad`, both with `interrupt_response=true`; `interrupt_response=false`
+  is not supported.
 - `input_audio_transcription` and `input_audio_noise_reduction` are accepted
   and echoed but no separate transcription or noise-reduction stage runs;
   transcripts come from the model.

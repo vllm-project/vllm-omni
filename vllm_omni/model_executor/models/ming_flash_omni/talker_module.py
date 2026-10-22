@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Copyright 2025 The vLLM-Omni team.
 # Copyright (c) Ant Group. All rights reserved.
 # Ported from:
@@ -21,6 +22,7 @@
 # MAE: https://github.com/facebookresearch/mae/blob/main/models_mae.py
 # --------------------------------------------------------
 import logging
+from contextlib import nullcontext
 from functools import cached_property
 from queue import Queue
 from threading import Lock
@@ -47,6 +49,8 @@ from vllm_omni.model_executor.models.model_local_kv import (
     RowDriver,
     spec_from_hf_config,
 )
+
+from .talker_llm_graph import Qwen2DecodeGraph
 
 logger = init_logger(__name__)
 
@@ -199,6 +203,7 @@ class CFMGraphExecutor:
         self.inputs_embeds_placeholder = None
         self.stop_out_placeholder = None
         self.graph = None
+        self._last_sde_args: tuple[float, float, float] | None = None
 
     def execute(
         self,
@@ -212,7 +217,6 @@ class CFMGraphExecutor:
         randn_tensor = torch.randn(
             (bat_size, self.config.patch_size, z_dim), device=input_tensor.device, dtype=input_tensor.dtype
         )
-        t = get_epss_timesteps(self.config.steps, device=input_tensor.device, dtype=input_tensor.dtype)
         sde_rnd = torch.randn(
             (self.config.steps, *randn_tensor.shape), device=input_tensor.device, dtype=input_tensor.dtype
         )
@@ -223,10 +227,14 @@ class CFMGraphExecutor:
         self.last_hidden_state_placeholder.copy_(input_tensor)
         self.his_lat_placeholder.copy_(his_lat)
         self.randn_like_placeholder.copy_(randn_tensor)
-        self.t_placeholder.copy_(t)
-        self.sde_args_placeholder[0] = cfg_strength
-        self.sde_args_placeholder[1] = sigma
-        self.sde_args_placeholder[2] = temperature
+        # t_placeholder holds the constant EPSS schedule built at capture;
+        # rebuilding it from a Python list each step is a blocking H2D copy.
+        sde_args = (cfg_strength, sigma, temperature)
+        if sde_args != self._last_sde_args:
+            self.sde_args_placeholder[0] = cfg_strength
+            self.sde_args_placeholder[1] = sigma
+            self.sde_args_placeholder[2] = temperature
+            self._last_sde_args = sde_args
         self.sde_rnd_placeholder.copy_(sde_rnd)
 
         self.graph.replay()
@@ -361,7 +369,7 @@ def trim_trailing_silence(
     sil_th: float = 1e-3,
     tail_silence_s: float = 0.3,
 ) -> torch.Tensor:
-    """Trim low-energy tail while keeping a short trailing silence.
+    """Apply native Ming's final-chunk silence holder to a full waveform.
 
     Works on 2-D ``(channels, samples)`` or 3-D ``(batch, channels, samples)``
     tensors. Any other shape is returned unchanged.
@@ -377,28 +385,7 @@ def trim_trailing_silence(
     else:
         return waveform
 
-    frame_step = int(sample_rate * 0.1)
-    frame_size = int(sample_rate * 0.1)
-    if speech.shape[-1] < frame_size:
-        keep = min(speech.shape[-1], int(tail_silence_s * sample_rate))
-        trimmed = speech[..., :keep]
-    else:
-        num_frame = (speech.shape[-1] - frame_size) // frame_step + 1
-        cur_len = (num_frame - 1) * frame_step + frame_size
-        speech = speech[..., :cur_len]
-        spe_frames = speech.unfold(-1, frame_size, frame_step)
-        scores = spe_frames.abs().mean(dim=-1)
-        scores = scores.mean(dim=list(range(scores.dim() - 1)))
-        idx = scores.shape[0] - 1
-        while idx >= 0 and scores[idx] <= sil_th:
-            idx -= 1
-        if idx < 0:
-            keep = min(speech.shape[-1], int(tail_silence_s * sample_rate))
-            trimmed = speech[..., :keep]
-        else:
-            non_sil_len = idx * frame_step + frame_size + int(tail_silence_s * sample_rate)
-            non_sil_len = min(non_sil_len, speech.shape[-1])
-            trimmed = speech[..., :non_sil_len]
+    trimmed, _ = silence_holder(speech, sample_rate, last_chunk=True, sil_th=sil_th, last_sil=tail_silence_s)
 
     if original_dim == 3:
         return trimmed.unsqueeze(1)
@@ -602,6 +589,7 @@ class MingAudioGenerator:
         latent_dim: int,
         cfg_strength: float,
         use_cuda_graphs: bool,
+        enable_llm_cuda_graph: bool = False,
     ) -> None:
         self._config = config
         self._llm_config = llm_config
@@ -617,10 +605,11 @@ class MingAudioGenerator:
         self.cfg_strength = cfg_strength
 
         self._use_cuda_graphs = use_cuda_graphs
-
-        # For FA2, let it see a full-length seq Q
-        # trailing latent frames prepended on each decode call
-        self._vae_decode_pad_frames = 32
+        self._enable_llm_cuda_graph = enable_llm_cuda_graph and use_cuda_graphs
+        self._max_cache_len = int(getattr(config, "max_cache_len", self._STATIC_CACHE_LEN))
+        self._llm_graph = (
+            Qwen2DecodeGraph(self._model, max_cache_len=self._max_cache_len) if self._enable_llm_cuda_graph else None
+        )
 
     def model_local_kv_specs(self) -> list[ModelLocalKVSpec]:
         """Declare the talker's preallocated decode cache.
@@ -645,23 +634,28 @@ class MingAudioGenerator:
         earlier revision did, by deriving the multiplier from scope -- reported
         ``max_num_seqs`` times the real figure.
 
-        The caveat is that nothing enforces the serialization. ``StaticCache``
-        is built outside ``_sampler_pool``'s lock, so overlapping calls to
-        ``generate_latents`` would coexist. If this model ever gains a
-        concurrent entry point, this row count is the line to revisit.
+        With LLM graphs enabled, a request lock serializes the entire AR loop
+        and the persistent cache is reset before and after each text segment.
+        Without LLM graphs, each invocation owns a separate request-local cache.
         """
+        max_cache_len = getattr(self, "_max_cache_len", self._STATIC_CACHE_LEN)
+        resident = getattr(self, "_enable_llm_cuda_graph", False)
         return [
             spec_from_hf_config(
                 self._llm_config,
                 name="talker_llm_static_cache",
                 dtype=next(self._model.parameters()).dtype,
-                physical_capacity_positions=self._STATIC_CACHE_LEN,
-                capacity_source=f"hardcoded max_cache_len={self._STATIC_CACHE_LEN} in _init_kv_cache",
-                scope=ModelLocalKVScope.INVOCATION,
+                physical_capacity_positions=max_cache_len,
+                capacity_source=f"talker config max_cache_len={max_cache_len}",
+                scope=ModelLocalKVScope.MODEL if resident else ModelLocalKVScope.REQUEST,
                 rows=RowDriver.FIXED,
                 rows_fixed=1,
-                rows_reason="forward() handles one request and runs the AR loop inline",
-                allocation_note="full extent on first write per layer, not grown; rebuilt per text segment",
+                rows_reason="one active Talker request per worker, including background streaming generation",
+                allocation_note=(
+                    "resident static cache reset between text segments"
+                    if resident
+                    else "full extent on first write per layer, not grown; rebuilt per text segment"
+                ),
             )
         ]
 
@@ -695,55 +689,97 @@ class MingAudioGenerator:
         inputs_embeds: torch.Tensor,
         *,
         prompt_wav_lat: torch.Tensor | None = None,
-        min_new_token: int = 10,
+        min_new_token: int = 3,
         max_steps: int = 1000,
         cfg: float | None = None,
         sigma: float = 0.25,
         temperature: float = 0.0,
         use_static_cache: bool = True,
+        stop_threshold: float = 0.5,
+        on_latent=None,
     ) -> list[torch.Tensor]:
         """Autoregressive LLM + CFM sampling loop"""
-        if cfg is None:
-            cfg = self.cfg_strength
-        device = next(self._model.parameters()).device
-        dtype = next(self._model.parameters()).dtype
+        graph = self._llm_graph if use_static_cache else None
+        with graph.request(inputs_embeds) if graph is not None else nullcontext():
+            if cfg is None:
+                cfg = self.cfg_strength
+            device = next(self._model.parameters()).device
+            dtype = next(self._model.parameters()).dtype
 
-        his_lat = self._init_his_lat(prompt_wav_lat, device, dtype)
-        past_key_values, max_cache_len = self._init_kv_cache(use_static_cache, device, dtype)
-        prefill_len = inputs_embeds.shape[1]
-        all_latents: list[torch.Tensor] = []
+            his_lat = self._init_his_lat(prompt_wav_lat, device, dtype)
+            past_key_values, max_cache_len = self._init_kv_cache(use_static_cache, device, dtype)
+            prefill_len = inputs_embeds.shape[1]
+            if prefill_len >= max_cache_len:
+                raise ValueError(f"TTS prompt has {prefill_len} positions, exceeding cache limit {max_cache_len}")
+            all_latents: list[torch.Tensor] = []
+            num_steps = min(max_steps, max_cache_len - prefill_len)
+            # On CUDA, launch the next LLM step before reading each stop probability.
+            overlap = device.type == "cuda"
+            stop_host = torch.empty((1,), dtype=torch.float32, pin_memory=True) if overlap else None
+            last_hs = None
 
-        for step in range(min(max_steps, max_cache_len - prefill_len)):
-            last_hs = self.llm_step(
-                inputs_embeds,
-                step=step,
-                past_key_values=past_key_values,
-                use_static_cache=use_static_cache,
-            )
-            gen_lat, inputs_embeds, stop_out = self.cfm_sample_step(
-                last_hs, his_lat, cfg=cfg, sigma=sigma, temperature=temperature
-            )
-            his_lat = self._update_his_lat(his_lat, gen_lat)
-            all_latents.append(gen_lat)
-
-            stop_prob = stop_out.cpu()[0, 1].item()
-
-            if logger.isEnabledFor(logging.DEBUG):
-                if step % 50 == 0 or step < 5:
-                    logger.debug(
-                        "step=%d stop_prob=%.4f hs_norm=%.4f lat_norm=%.4f emb_norm=%.4f",
-                        step,
-                        stop_prob,
-                        last_hs.float().norm().item(),
-                        gen_lat.float().norm().item(),
-                        inputs_embeds.float().norm().item(),
+            for step in range(num_steps):
+                if last_hs is None:
+                    last_hs = self.llm_step(
+                        inputs_embeds,
+                        step=step,
+                        past_key_values=past_key_values,
+                        use_static_cache=use_static_cache,
+                        position=prefill_len + step - 1,
                     )
+                step_hs = last_hs
+                gen_lat, inputs_embeds, stop_out = self.cfm_sample_step(
+                    step_hs, his_lat, cfg=cfg, sigma=sigma, temperature=temperature
+                )
+                his_lat = self._update_his_lat(his_lat, gen_lat)
+                all_latents.append(gen_lat)
 
-            if step > min_new_token and stop_prob > 0.5:
-                logger.debug("Stopping at step %d with stop_prob=%.4f", step, stop_prob)
-                break
+                latent_ready = None
+                last_hs = None
+                if overlap:
+                    # Queue the next LLM step before reading the stop
+                    # probability, so its launch overlaps the flow head on the
+                    # GPU. The step draws no random numbers; if this latent
+                    # stops the segment, its output is discarded.
+                    stop_host.copy_(stop_out[0, 1:2].float(), non_blocking=True)
+                    latent_ready = torch.cuda.Event()
+                    latent_ready.record()
+                    if step + 1 < num_steps:
+                        last_hs = self.llm_step(
+                            inputs_embeds,
+                            step=step + 1,
+                            past_key_values=past_key_values,
+                            use_static_cache=use_static_cache,
+                            position=prefill_len + step,
+                        )
+                    latent_ready.synchronize()
+                    stop_prob = float(stop_host[0])
+                else:
+                    stop_prob = stop_out.cpu()[0, 1].item()
 
-        return all_latents
+                if logger.isEnabledFor(logging.DEBUG):
+                    if step % 50 == 0 or step < 5:
+                        logger.debug(
+                            "step=%d stop_prob=%.4f hs_norm=%.4f lat_norm=%.4f emb_norm=%.4f",
+                            step,
+                            stop_prob,
+                            step_hs.float().norm().item(),
+                            gen_lat.float().norm().item(),
+                            inputs_embeds.float().norm().item(),
+                        )
+
+                stopped = step > min_new_token and stop_prob > stop_threshold
+                last = stopped or step + 1 == num_steps
+                if on_latent is not None:
+                    if latent_ready is None:
+                        on_latent(gen_lat, last)
+                    else:
+                        on_latent(gen_lat, last, latent_ready)
+                if stopped:
+                    logger.debug("Stopping at step %d with stop_prob=%.4f", step, stop_prob)
+                    break
+
+            return all_latents
 
     def cfm_sample_step(
         self,
@@ -809,7 +845,13 @@ class MingAudioGenerator:
         step: int,
         past_key_values: StaticCache | None,
         use_static_cache: bool,
+        position: int | None = None,
     ) -> torch.Tensor:
+        graph = self._llm_graph if use_static_cache else None
+        if step > 0 and graph is not None and past_key_values is graph.cache and position is not None:
+            output = graph.decode(inputs_embeds, position=position)
+            if output is not None:
+                return output[:, -1:, :]
         if step == 0 or not use_static_cache:
             outputs = self._model(
                 past_key_values=past_key_values,
@@ -817,7 +859,9 @@ class MingAudioGenerator:
                 use_cache=True,
             )
         else:
-            past_seen_tokens = int(past_key_values.get_seq_length())
+            # ``position`` is the cached length; reading it back from the
+            # cache would synchronize the host every step.
+            past_seen_tokens = position if position is not None else int(past_key_values.get_seq_length())
             cache_position = torch.arange(
                 past_seen_tokens,
                 past_seen_tokens + inputs_embeds.shape[1],
@@ -846,9 +890,11 @@ class MingAudioGenerator:
     def _init_kv_cache(
         self, use_static_cache: bool, device: torch.device, dtype: torch.dtype
     ) -> tuple[StaticCache | None, int]:
-        max_cache_len = self._STATIC_CACHE_LEN
+        max_cache_len = self._max_cache_len
         if not use_static_cache:
             return None, max_cache_len
+        if self._llm_graph is not None and self._llm_graph.active:
+            return self._llm_graph.cache, max_cache_len
         cache = StaticCache(
             config=self._llm_config,
             max_batch_size=1,
@@ -867,51 +913,34 @@ class MingAudioGenerator:
 
     # VAE streaming decode
     def _stream_decode(self, latents: list[torch.Tensor]) -> torch.Tensor:
-        sr = int(self._audio_vae.config.sample_rate)
-        decode_pad: torch.Tensor | None = None
-        sil_cache: dict | None = None
+        """Decode new latents with request-local VAE and overlap-add state.
+
+        The upsampler holds the first chunk until the next chunk supplies
+        its right context. Only the final call flushes that pending chunk
+        and the ISTFT overlap. This still returns one accumulated waveform;
+        it does not enable streaming transport to the client.
+        """
+        past_key_values = None
+        stream_state = (None, None, None)
         wav_chunks: list[torch.Tensor] = []
 
         for i, lat in enumerate(latents):
             last_chunk = i == (len(latents) - 1)
-
-            if decode_pad is not None:
-                vae_input = torch.cat([decode_pad, lat], dim=1)
-                pad_frames = decode_pad.shape[1]
-            else:
-                vae_input = lat
-                pad_frames = 0
-
-            # Stateless, no KV cache accum intentionally.
-            speech, _, _ = self._audio_vae.decode(
-                vae_input,
-                use_cache=False,
-                stream_state=(None, None, None),
-                last_chunk=True,
-            )
-
-            total_frames = vae_input.shape[1]
-            dcs = speech.shape[-1] // total_frames
-
-            # keep only the new audio.
-            speech_chunk = speech[:, :, pad_frames * dcs :][0].detach().float()
-            speech_chunk, sil_cache = silence_holder(
-                speech_chunk,
-                sr,
-                sil_cache=sil_cache,
+            speech, stream_state, past_key_values = self._audio_vae.decode(
+                lat,
+                past_key_values=past_key_values,
+                use_cache=True,
+                stream_state=stream_state,
                 last_chunk=last_chunk,
             )
-            if speech_chunk.numel() > 0:
-                wav_chunks.append(speech_chunk)
-
-            # Advance the sliding buffer
-            decode_pad = vae_input[:, -self._vae_decode_pad_frames :, :].detach()
+            if speech.numel() > 0:
+                wav_chunks.append(speech.detach().float())
 
         if not wav_chunks:
             device = next(self._model.parameters()).device
             dtype = next(self._model.parameters()).dtype
             return torch.zeros((1, 1, 0), device=device, dtype=dtype)
-        return torch.cat(wav_chunks, dim=-1).unsqueeze(0)
+        return torch.cat(wav_chunks, dim=-1)
 
     # Post-decode helper
     def trim_trailing_silence(self, waveform: torch.Tensor) -> torch.Tensor:
