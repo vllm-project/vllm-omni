@@ -1393,14 +1393,6 @@ class DuplexSessionRunner:
         # No await between releasing this segment's charge and reserving PCM bytes.
         if release_queued_input is not None:
             release_queued_input()
-            # Admission already applied backpressure; the handoff only converts
-            # the segment's queued charge into a PCM reservation. Decoding can
-            # make it larger than the wire bytes (pcm16 -> f32, resampling), so
-            # the handoff must not drop admitted audio.
-            # This is a soft limit: pending PCM can overshoot by the decode
-            # expansion of the queued backlog (up to 8x for 8 kHz G.711) until
-            # admission sees it; charge admission in PCM units if that matters.
-            limit = sys.maxsize
         try:
             if not session.reserve_input_bytes(raw_audio_bytes, limit=limit):
                 self._emit_error("input_backpressure", "Duplex session pending input exceeds server limit")

@@ -874,7 +874,7 @@ async def test_append_chained_behind_a_cleared_append_still_submits() -> None:
 
 
 @pytest.mark.asyncio
-async def test_admitted_pcm16_append_is_not_dropped_when_decoding_grows_it() -> None:
+async def test_admitted_pcm16_append_that_decodes_past_the_limit_is_rejected_cleanly() -> None:
     h = await open_harness(
         auto_response=False,
         runtime_config=DuplexSessionRuntimeConfig(max_pending_input_bytes_per_session=40_000),
@@ -882,15 +882,14 @@ async def test_admitted_pcm16_append_is_not_dropped_when_decoding_grows_it() -> 
     try:
         pcm16 = np.full(16000, 1600, dtype="<i2").tobytes()  # 32_000 wire bytes, 64_000 as f32
         events = await h.run(commands.AppendAudio(audio=pcm16, format="pcm16", sample_rate_hz=16000, is_speech=True))
-        assert [event for event in events if event.type == "error"] == []
-        assert h.runner.model_state.audio_buffer.pending_byte_count == 64_000
-        assert h.runner.model_state.input_since_commit
-        # The overshoot is charged, so the next append is refused at admission.
-        events = await h.run(append_audio(samples=10, event_id="next"))
-        assert any(
-            event.type == "error" and event.code == "input_backpressure" and event.related_event_id == "next"
-            for event in events
-        )
+        # Admission passes on wire bytes; the PCM handoff enforces the limit on the decoded size.
+        assert any(event.type == "error" and event.code == "input_backpressure" for event in events)
+        assert not h.runner.model_state.audio_buffer.has_pending()
+        assert not h.runner.model_state.input_since_commit
+        assert h.session.pending_input_bytes == 0
+        # Nothing stays charged, so audio that fits is still accepted.
+        await h.run(append_audio(samples=8000))
+        assert h.session.pending_input_bytes == h.runner.model_state.audio_buffer.pending_byte_count == 32_000
     finally:
         await close_harness(h)
 
