@@ -183,7 +183,7 @@ _SCHEDULED_OP_FALSE_FIELDS = ("cross_kv_rows_validated", "cross_pair_mask_valida
 _NO_METADATA_SPEC = "-"
 
 
-def _is_op_int(value: Any) -> bool:
+def _is_op_int(value: object) -> bool:
     # A bool is an int subclass; bools travel in the spec instead.
     return (isinstance(value, int) and not isinstance(value, bool)) or isinstance(value, torch.SymInt)
 
@@ -1258,7 +1258,7 @@ class Attention(nn.Module):
         attn_metadata: AttentionMetadata | None,
         *,
         backend: type[AttentionBackend] | None = None,
-        spec: Any = None,
+        spec: "AttentionSpec | None" = None,
     ) -> str | None:
         """Return what the selected backend cannot do for this cross call.
 
@@ -1286,7 +1286,7 @@ class Attention(nn.Module):
         attn_metadata: AttentionMetadata | None,
         *,
         backend: type[AttentionBackend] | None = None,
-        spec: Any = None,
+        spec: "AttentionSpec | None" = None,
     ) -> str | None:
         explicit = self.backend_explicit if backend is None else spec is not None
         if explicit:
@@ -1515,7 +1515,7 @@ class Attention(nn.Module):
         raise RuntimeError("Ring attention is enabled but strategy is not RingParallelAttention")
 
 
-def _plans_auto_pad(value: Any) -> bool:
+def _plans_auto_pad(value: object) -> bool:
     """Whether one SP plan value declares ``auto_pad`` at any nesting level.
 
     Plan values nest dicts and lists, e.g. ``{"rope": {0: SequenceParallelInput(..., auto_pad=True)}}``.
