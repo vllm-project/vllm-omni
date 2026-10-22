@@ -71,6 +71,9 @@ Dotted flags are also accepted: set
 and pass `--diffusion-attention-schedule.default` the ranges as one JSON list.
 Set all backend options within the profile, including `quant`,
 `fastvideo_vsa_topk` or Skip-Softmax settings when needed.
+`--diffusion-kv-cache-dtype` also applies to scheduled steps, so, as in the
+base configuration, startup rejects it together with a profile `quant` spec
+that sets `dtype_qk` or `dtype_vo`.
 
 ## Stage configuration
 
