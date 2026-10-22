@@ -8,6 +8,7 @@ test pins the inlined copy to the library on CPU with random weights, across
 varied lengths, batch shapes, and the long-audio boundary.
 """
 
+import contextlib
 import threading
 
 import pytest
@@ -87,3 +88,99 @@ def test_max_frames_boundary_matches_library() -> None:
 
     assert torch.equal(lib_code, eager_code)
     assert torch.equal(lib_len, eager_len)
+
+
+class _FakeNPUDevice:
+    """Stands in for ``torch.device("npu")`` on a CPU-only box: ``type``
+    reads "npu" so the capture branch is entered, while equality matches
+    cpu tensors (and the fake itself, plugged into the freqs_cis device
+    check) so nothing is moved to a device that does not exist."""
+
+    type = "npu"
+
+    def __eq__(self, other):
+        if other is self:
+            return True
+        return isinstance(other, torch.device) and other.type == "cpu"
+
+    def __hash__(self):
+        return hash(("fake-npu", id(self)))
+
+
+class _FakeStream:
+    def wait_event(self, event):
+        pass
+
+    def record_event(self):
+        return object()
+
+
+class _BrokenGraph:
+    """NPUGraph whose first ``replay()`` raises: the failure mode the
+    registration-order fix must survive without publishing a bucket."""
+
+    instances = []
+
+    def __init__(self):
+        self.replays = 0
+        _BrokenGraph.instances.append(self)
+
+    def replay(self):
+        self.replays += 1
+        raise RuntimeError("simulated first-replay failure")
+
+
+class _FakeNPUModule:
+    """Minimal ``torch.npu`` stand-in: the real encoder/quantizer kernels
+    run eagerly on CPU, only the graph bookkeeping is faked."""
+
+    graph = staticmethod(contextlib.nullcontext)
+
+    @staticmethod
+    def current_stream(device):
+        return _FakeStream()
+
+    @staticmethod
+    def synchronize():
+        pass
+
+    NPUGraph = _BrokenGraph
+
+
+def test_first_replay_failure_falls_back_to_eager(monkeypatch) -> None:
+    # Review r7: the bucket entry is published only after the first
+    # replay+clone succeed. Fake a graph whose first replay() raises and
+    # assert no bucket is left behind, the frame count is marked failed,
+    # and the same-length retry returns the eager result.
+    torch.manual_seed(2)
+    model = s3tokenizer.model_v2.S3TokenizerV2("speech_tokenizer_v2_25hz").eval()
+    core = _core_with(model)
+    core.device = _FakeNPUDevice()
+    # No freqs_cis stand-in needed: the real CPU-resident buffer compares
+    # equal to the fake device (its __eq__ matches cpu), so the hoist is
+    # skipped, and AudioEncoderV2.forward's internal
+    # ``self.freqs_cis.to(x.device)`` is a no-op on cpu tensors.
+    monkeypatch.setattr(torch, "npu", _FakeNPUModule, raising=False)
+    _BrokenGraph.instances.clear()
+
+    mels, mels_lens = _batch([50], seed=2)
+    frames = int(mels.shape[2])
+
+    with torch.inference_mode():
+        fallback_code, fallback_len = core._quantize_s3_graph(mels, mels_lens)
+        lib_code, lib_len = model.quantize(mels, mels_lens)
+
+    assert frames not in core._s3_graphs
+    assert frames in core._s3_failed
+    assert _BrokenGraph.instances[0].replays == 1
+    # The except branch already served this request the eager result.
+    assert torch.equal(fallback_code, lib_code)
+    assert torch.equal(fallback_len, lib_len)
+
+    with torch.inference_mode():
+        retry_code, retry_len = core._quantize_s3_graph(mels, mels_lens)
+
+    assert torch.equal(retry_code, lib_code)
+    assert torch.equal(retry_len, lib_len)
+    assert core._s3_eager_calls == 1  # only the retry; the fallback does not count
+    assert core._s3_replay_calls == 0
