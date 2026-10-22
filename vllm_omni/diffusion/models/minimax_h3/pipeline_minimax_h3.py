@@ -3293,10 +3293,10 @@ class MiniMaxH3Pipeline(
             )
         # num_steps is the length of the sequence this request denoises; FastH3 and pinned distilled
         # schedules can differ from num_inference_steps. A latent_refine pass has its own step count, which
-        # this check does not cover, so a schedule together with latent_refine is rejected below. Both
-        # execution modes reach this point before any denoise forward. Step mode runs it outside the forward
-        # context, so the request's own schedule is resolved against the service default; in request mode
-        # that is the schedule the runner bound.
+        # this check does not cover, so step ranges together with latent_refine are rejected below; sigma
+        # windows do not depend on the step count. Both execution modes reach this point before any denoise
+        # forward. Step mode runs it outside the forward context, so the request's own schedule is resolved
+        # against the service default; in request mode that is the schedule the runner bound.
         service = getattr(self.od_config, "diffusion_attention_schedule", None)
         attention_schedule = require_request_attention_schedule_fits(sampling, service, num_steps)
         sigma_schedule = resolve_request_attention_sigma_schedule(sampling, service)

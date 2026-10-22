@@ -65,7 +65,7 @@ class ForwardContext:
     # step ranges or sigma windows, never both.
     attention_schedule: AttentionSchedule | None = None
     attention_sigma_schedule: tuple[Any, ...] | None = None
-    # Whether the bound schedule is the request's own rather than an inherited service default.
+    # Whether the bound step ranges are the request's own rather than an inherited service default.
     attention_schedule_from_request: bool = False
     # Profile selected for the bound schedule and the published step or sigma;
     # every scheduled layer in one step reads it instead of selecting again.

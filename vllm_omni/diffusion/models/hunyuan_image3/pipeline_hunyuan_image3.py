@@ -2395,8 +2395,9 @@ class HunyuanImage3Pipeline(
                 "HunyuanImage3 paged_scheduler currently supports request-level execution only; "
                 "disable step execution or use dense_legacy."
             )
-        # A bound schedule selects attention from each request's own step and total, so requests
-        # run one at a time and the batch-wide backend check, which reads the baseline config, is skipped.
+        # Bound step ranges or sigma windows select attention from each request's own progress (step and
+        # total, or sigma), so requests run one at a time and the batch-wide backend check, which reads the
+        # baseline config, is skipped.
         ctx = get_forward_context() if is_forward_context_available() else None
         scheduled = ctx is not None and bool(ctx.attention_schedule or ctx.attention_sigma_schedule)
         if scheduled:
