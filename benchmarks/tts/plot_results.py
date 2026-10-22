@@ -255,7 +255,7 @@ def print_comparison_table(all_runs: list[list[dict]], labels: list[str]) -> Non
         # Improvement column (2-run comparison only)
         if len(all_runs) == 2:
             print(f"\n### Improvement ({labels[0]} vs {labels[1]})\n")
-            print("| Metric | Concurrency | Change |")
+            print("| Metric | Concurrency | Improvement |")
             print("| --- | --- | --- |")
             for metric, key, _ in perf_metrics:
                 for c in concurrencies:
