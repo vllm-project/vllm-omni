@@ -336,9 +336,9 @@ class TestAttentionScheduleConfig:
             )
 
     def test_schedule_profiles_reject_full_compile_granularity(self):
-        # The eager boundary that scheduled attention layers call while compiling is tested under
-        # regional compilation only, so config creation rejects profiles with 'full', as it rejects
-        # 'full' with HSDP, sequence parallelism or offload.
+        # The scheduled_attention op and its eager fallback are tested only under regional
+        # compilation, so config creation rejects profiles with 'full', as it rejects 'full' with
+        # HSDP, sequence parallelism or offload.
         raw = {"profiles": {"dense": {"default": "TORCH_SDPA"}}}
         with pytest.raises(ValueError, match="'full' is incompatible with diffusion_attention_schedule"):
             OmniDiffusionConfig(diffusion_attention_schedule=raw, diffusion_compile_granularity="full")
