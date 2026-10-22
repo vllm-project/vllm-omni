@@ -469,11 +469,8 @@ async def test_rejected_mixed_append_preserves_buffer_and_byte_accounting():
     h = await open_joyai(asr=True, modalities=("text",))
     try:
         image = frame()
-        # Admission charges wire bytes and the PCM handoff keeps admitted audio,
-        # so the mixed append must be refused at admission (4000 buffered + 2000
-        # pcm16 + the frame), while the audio-only append still fits.
         h.manager.runtime_config = DuplexSessionRuntimeConfig(
-            max_pending_input_bytes_per_session=6000 + len(image) // 2
+            max_pending_input_bytes_per_session=8000 + len(image) // 2
         )
         pcm = struct.pack("<h", 1000) * 1000
         h.runner.control._detector = _ScriptedDetector([TurnDetectionResult(is_speech=True, speech_active=True)] * 4)
