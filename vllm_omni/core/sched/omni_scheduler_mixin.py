@@ -717,10 +717,18 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
         scheduler_output: SchedulerOutput,
         *,
         include_cached_payloads: bool = False,
+        consume_chunks: bool = True,
     ) -> None:
         """Enrich new requests and apply async-chunk output bookkeeping."""
         self._rewrap_scheduled_new_reqs(scheduler_output)
         if not self.chunk_transfer_adapter:
+            return
+        if not consume_chunks:
+            self.chunk_transfer_adapter.postprocess_scheduler_output(
+                scheduler_output,
+                self.requests if include_cached_payloads else None,
+                consume_chunks=False,
+            )
             return
         if include_cached_payloads:
             self.chunk_transfer_adapter.postprocess_scheduler_output(

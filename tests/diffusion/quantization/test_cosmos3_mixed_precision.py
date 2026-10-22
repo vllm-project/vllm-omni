@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -211,19 +211,20 @@ def test_additional_config_distinguishes_absent_and_disabled() -> None:
 def test_checkpoint_policy_round_trip_through_transformer_config() -> None:
     from vllm_omni.diffusion.data import TransformerConfig
 
+    checkpoint_runtime = {"diffusion_step_policy": _policy(first_steps=2, last_steps=4)}
     disk = {
         "_class_name": "Cosmos3VFMTransformer",
         "quantization_config": {
             "quant_method": "modelopt",
             "quant_algo": "FP8",
-            "runtime": {"diffusion_step_policy": _policy(first_steps=2, last_steps=4)},
+            "runtime": checkpoint_runtime,
         },
     }
 
     tf_config = TransformerConfig.from_dict(disk)
     assert tf_config.quant_config is not None
     assert tf_config.quant_config.get_name() == "modelopt"
-    assert tf_config.to_dict()["quantization_config"]["runtime"] == disk["quantization_config"]["runtime"]
+    assert tf_config.to_dict()["quantization_config"]["runtime"] == checkpoint_runtime
     assert read_checkpoint_policy(SimpleNamespace(tf_model_config=tf_config)) == Cosmos3MixedPrecisionConfig(
         first_steps=2,
         last_steps=4,
@@ -247,9 +248,94 @@ def test_checkpoint_policy_rejects_nonserialized_modelopt_formats(name: str) -> 
         read_checkpoint_policy(od_config)
 
 
-def test_checkpoint_policy_rejects_mixed_modelopt_format() -> None:
+def test_checkpoint_policy_rejects_mixed_modelopt_without_layer_map() -> None:
     with pytest.raises(ValueError, match="serialized ModelOpt FP8 or NVFP4"):
         read_checkpoint_policy(_checkpoint_od_config(_fake_quant_config("modelopt_mixed"), policy=_policy()))
+
+
+def _mixed_quant_config(algorithms):
+    from vllm.model_executor.layers.quantization.modelopt import ModelOptMixedPrecisionConfig
+
+    return ModelOptMixedPrecisionConfig.from_config(
+        {
+            "quant_method": "modelopt",
+            "quant_algo": "MIXED_PRECISION",
+            "group_size": 16,
+            "exclude_modules": [],
+            "quantized_layers": {f"gen_layers.{i}.linear": {"quant_algo": algo} for i, algo in enumerate(algorithms)},
+        }
+    )
+
+
+@pytest.mark.parametrize("algorithms", [("FP8",), ("NVFP4",)])
+@pytest.mark.parametrize("override", [False, True])
+def test_mixed_modelopt_policy_supports_homogeneous_native_format(algorithms, override) -> None:
+    od_config = _checkpoint_od_config(
+        _mixed_quant_config(algorithms),
+        policy=None if override else _policy(),
+        additional_config={"cosmos3_mixed_precision": {}} if override else None,
+    )
+    assert resolve_mixed_precision_config(od_config) == (
+        Cosmos3MixedPrecisionConfig(),
+        "additional_config" if override else "checkpoint",
+    )
+
+
+@pytest.mark.parametrize("override", [False, True])
+def test_mixed_modelopt_policy_rejects_heterogeneous_formats(override) -> None:
+    od_config = _checkpoint_od_config(
+        _mixed_quant_config(("FP8", "NVFP4")),
+        policy=None if override else _policy(),
+        additional_config={"cosmos3_mixed_precision": {}} if override else None,
+    )
+    with pytest.raises(ValueError, match="does not support mixing FP8 and NVFP4"):
+        resolve_mixed_precision_config(od_config)
+
+
+@pytest.mark.parametrize("algorithm", ["MXFP8", "W4A16_NVFP4", "UNKNOWN"])
+def test_mixed_modelopt_policy_rejects_unsupported_layer(algorithm) -> None:
+    config = _mixed_quant_config(("NVFP4",))
+    config.quantized_layers["gen_layers.1.linear"] = {"quant_algo": algorithm}
+    with pytest.raises(ValueError, match=algorithm):
+        read_checkpoint_policy(_checkpoint_od_config(config, policy=_policy()))
+
+
+@pytest.mark.parametrize("entry", [None, {}, {"quant_algo": None}])
+def test_mixed_modelopt_policy_rejects_malformed_layer(entry) -> None:
+    config = _mixed_quant_config(("NVFP4",))
+    config.quantized_layers["gen_layers.0.linear"] = entry
+    with pytest.raises(ValueError, match="gen_layers.0.linear"):
+        read_checkpoint_policy(_checkpoint_od_config(config, policy=_policy()))
+
+
+@pytest.mark.parametrize(
+    ("algorithm", "subconfig", "flag"),
+    [
+        ("FP8", "fp8_config", "is_checkpoint_fp8_serialized"),
+        ("NVFP4", "nvfp4_config", "is_checkpoint_nvfp4_serialized"),
+    ],
+)
+def test_mixed_modelopt_policy_validates_selected_subconfig(algorithm, subconfig, flag) -> None:
+    config = _mixed_quant_config((algorithm,))
+    setattr(getattr(config, subconfig), flag, False)
+    with pytest.raises(ValueError, match="serialized ModelOpt"):
+        read_checkpoint_policy(_checkpoint_od_config(config, policy=_policy()))
+    setattr(config, subconfig, None)
+    with pytest.raises(ValueError, match="subconfig"):
+        read_checkpoint_policy(_checkpoint_od_config(config, policy=_policy()))
+
+
+def test_mixed_modelopt_policy_rejects_weight_only_nvfp4_subconfig() -> None:
+    config = _mixed_quant_config(("NVFP4",))
+    config.nvfp4_config.quant_method = "W4A16_NVFP4"
+    with pytest.raises(ValueError, match="W4A4"):
+        read_checkpoint_policy(_checkpoint_od_config(config, policy=_policy()))
+
+
+def test_mixed_modelopt_policy_ignores_unused_subconfig() -> None:
+    config = _mixed_quant_config(("NVFP4",))
+    config.fp8_config = None
+    assert read_checkpoint_policy(_checkpoint_od_config(config, policy=_policy())) == Cosmos3MixedPrecisionConfig()
 
 
 def test_checkpoint_policy_missing_metadata_preserves_ordinary_path() -> None:
@@ -398,18 +484,23 @@ def test_additional_config_disable_bypasses_incompatible_checkpoint(policy: obje
     assert resolve_mixed_precision_config(od_config) == (None, "additional_config_disabled")
 
 
-def test_runtime_allows_standard_offload_and_rejects_distributed(monkeypatch) -> None:
+@pytest.mark.parametrize("tp_size", [1, 2, 4])
+@pytest.mark.parametrize("quant_name", ["modelopt", "modelopt_fp4", "modelopt_mixed"])
+def test_runtime_allows_standard_offload_and_rejects_distributed(monkeypatch, tp_size, quant_name) -> None:
     from vllm_omni.diffusion.models.cosmos3 import transformer_cosmos3
 
     monkeypatch.setattr(
         transformer_cosmos3,
         "get_tensor_model_parallel_world_size",
-        lambda: 1,
+        lambda: tp_size,
     )
 
     def offload_config(**overrides: object) -> SimpleNamespace:
         config = SimpleNamespace(
             diffusion_offload_config=None,
+            quantization_config=(
+                _mixed_quant_config(("NVFP4",)) if quant_name == "modelopt_mixed" else _fake_quant_config(quant_name)
+            ),
             enable_cpu_offload=False,
             enable_layerwise_offload=True,
             enable_distributed_layerwise_offload=False,
@@ -439,6 +530,21 @@ def test_runtime_allows_standard_offload_and_rejects_distributed(monkeypatch) ->
             Cosmos3MixedPrecisionConfig(),
             offload_config(max_num_seqs=2),
         )
+
+    od_config = offload_config(
+        enable_cpu_offload=True,
+        enable_layerwise_offload=False,
+        parallel_config=SimpleNamespace(data_parallel_size=1, use_hsdp=True),
+    )
+    with pytest.raises(ValueError, match="HSDP.*offload"):
+        transformer_cosmos3._validate_mixed_precision_runtime(Cosmos3MixedPrecisionConfig(), od_config)
+
+
+def test_disabled_runtime_bypasses_restrictions() -> None:
+    from vllm_omni.diffusion.models.cosmos3 import transformer_cosmos3
+
+    od_config = SimpleNamespace(max_num_seqs=2, enable_distributed_layerwise_offload=True)
+    transformer_cosmos3._validate_mixed_precision_runtime(None, od_config)
 
 
 class _Layer(torch.nn.Module):
@@ -616,6 +722,38 @@ def test_nvfp4_reference_materializes_live_cutlass_weights() -> None:
     assert torch.equal(output, torch.ones_like(output))
 
 
+@pytest.mark.parametrize("emulation", [False, True])
+def test_nvfp4_materialization_respects_live_scale_layout(monkeypatch, emulation) -> None:
+    from vllm.model_executor.kernels.linear.nvfp4.emulation import EmulationNvFp4LinearKernel
+    from vllm.model_executor.layers.quantization.utils import nvfp4_emulation_utils
+
+    # Force the reference CPU implementation rather than its CUDA Triton path.
+    monkeypatch.setattr(nvfp4_emulation_utils.current_platform, "is_cuda_alike", lambda: False)
+    layer = _nvfp4_layer()
+    scales = (torch.arange(512).reshape(128, 4) % 7 + 1).to(torch.float8_e4m3fn)
+    layer.weight_scale = scales
+    layer.weight_scale_2 = torch.tensor([0.5])
+    method = _BaseMethod(nvfp4=True)
+    if emulation:
+        method.kernel = object.__new__(EmulationNvFp4LinearKernel)
+    strategy = Nvfp4W4A4W4A16Strategy()
+    strategy.validate_before_processing(method, layer, "gen.linear")
+    layer.weight_scale = scales if emulation else _swizzle_blockscale_cpu(scales)
+    layer.weight_global_scale = layer.weight_scale_2
+    del layer.weight_scale_2
+    strategy.validate_after_processing(layer, "gen.linear")
+    expected = (scales.float().repeat_interleave(16, dim=1) * 0.5).bfloat16()
+    torch.testing.assert_close(strategy.materialize(layer), expected, rtol=0, atol=0)
+
+
+def test_nvfp4_maps_rejects_marlin_with_emulation_hint() -> None:
+    from vllm.model_executor.kernels.linear.nvfp4.marlin import MarlinNvFp4LinearKernel
+
+    method = SimpleNamespace(kernel=object.__new__(MarlinNvFp4LinearKernel))
+    with pytest.raises(ValueError, match="Marlin repacks weights.*linear_backend='emulation'"):
+        Nvfp4W4A4W4A16Strategy().validate_before_processing(method, _nvfp4_layer(), "gen.linear")
+
+
 def test_nvfp4_rejects_fused_global_scales() -> None:
     layer = _nvfp4_layer()
     layer.weight_scale_2 = torch.tensor([1.0, 2.0])
@@ -689,7 +827,7 @@ def test_pipeline_helpers_forward_and_reset_schedule() -> None:
         Cosmos3OmniDiffusersPipeline,
     )
 
-    calls = []
+    calls: list[tuple[int, int] | str] = []
     pipeline = object.__new__(Cosmos3OmniDiffusersPipeline)
     pipeline.transformer = SimpleNamespace(
         set_mixed_precision_step=lambda step, count: calls.append((step, count)),
@@ -698,3 +836,118 @@ def test_pipeline_helpers_forward_and_reset_schedule() -> None:
     pipeline._set_mixed_precision_step(2, 7)
     pipeline._reset_mixed_precision()
     assert calls == [(2, 7), "reset"]
+
+
+@pytest.mark.parametrize("shards", [1, 2, 4, 8])
+def test_maps_hsdp_supported_configuration(shards):
+    from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import _validate_mixed_precision_runtime
+
+    config = SimpleNamespace(parallel_config=SimpleNamespace(use_hsdp=True, hsdp_shard_size=shards))
+    _validate_mixed_precision_runtime(Cosmos3MixedPrecisionConfig(), config)
+
+
+@pytest.mark.parametrize("degree", [2, 4])
+def test_maps_hsdp_supports_ulysses(degree):
+    from vllm_omni.diffusion.data import DiffusionParallelConfig
+    from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import _validate_mixed_precision_runtime
+
+    config = SimpleNamespace(
+        parallel_config=DiffusionParallelConfig(
+            data_parallel_size=1, use_hsdp=True, hsdp_shard_size=degree, ulysses_degree=degree
+        )
+    )
+    _validate_mixed_precision_runtime(Cosmos3MixedPrecisionConfig(), config)
+
+
+def test_maps_hsdp_supports_cfg():
+    from vllm_omni.diffusion.data import DiffusionParallelConfig
+    from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import _validate_mixed_precision_runtime
+
+    config = SimpleNamespace(
+        parallel_config=DiffusionParallelConfig(
+            data_parallel_size=1, use_hsdp=True, hsdp_shard_size=2, cfg_parallel_size=2
+        )
+    )
+    _validate_mixed_precision_runtime(Cosmos3MixedPrecisionConfig(), config)
+
+
+@pytest.mark.parametrize(
+    "settings",
+    [
+        pytest.param({"ring_degree": 2}, id="ring"),
+        pytest.param({"allgather_degree": 2}, id="allgather-kv"),
+        pytest.param({"cfg_parallel_size": 4}, id="cfg4"),
+        pytest.param({"ulysses_degree": 2, "cfg_parallel_size": 2}, id="sp2-cfg2"),
+    ],
+)
+def test_maps_hsdp_accepts_framework_parallel_config(settings):
+    """MAPS validation must not impose extra SP/CFG topology restrictions."""
+    from vllm_omni.diffusion.data import DiffusionParallelConfig
+    from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import _validate_mixed_precision_runtime
+
+    config = SimpleNamespace(parallel_config=DiffusionParallelConfig(data_parallel_size=1, use_hsdp=True, **settings))
+    _validate_mixed_precision_runtime(Cosmos3MixedPrecisionConfig(), config)
+
+
+def test_maps_hsdp_accepts_replication():
+    from vllm_omni.diffusion.data import DiffusionParallelConfig
+    from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import _validate_mixed_precision_runtime
+
+    config = SimpleNamespace(
+        parallel_config=DiffusionParallelConfig(
+            data_parallel_size=1, use_hsdp=True, hsdp_replicate_size=2, hsdp_shard_size=2
+        )
+    )
+    _validate_mixed_precision_runtime(Cosmos3MixedPrecisionConfig(), config)
+
+
+@pytest.mark.parametrize(
+    "settings",
+    [
+        {"enable_cpu_offload": True},
+        {"enable_layerwise_offload": True},
+        {"enable_distributed_layerwise_offload": True},
+        {"diffusion_offload_config": {"mode": "module", "components": ["dit"]}},
+        {"diffusion_offload_config": {"mode": "layer", "components": ["dit"]}},
+        {"diffusion_offload_config": {"mode": "module", "components": ["text_encoder"]}},
+        {
+            "diffusion_offload_config": {
+                "mode": "layer",
+                "components": ["dit"],
+                "layer_options": {"dit": {"weight_transfer": "allgather"}},
+            }
+        },
+    ],
+)
+def test_maps_hsdp_rejects_resolved_offload(settings):
+    from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import _validate_mixed_precision_runtime
+
+    config = SimpleNamespace(parallel_config=SimpleNamespace(use_hsdp=True), **settings)
+    with pytest.raises(ValueError, match="offload"):
+        _validate_mixed_precision_runtime(Cosmos3MixedPrecisionConfig(), config)
+
+
+def test_fp8_maps_rejects_generic_modelopt_marlin_kernel() -> None:
+    from vllm.model_executor.kernels.linear.scaled_mm.marlin import MarlinFP8ScaledMMLinearKernel
+
+    method = SimpleNamespace(kernel=object.__new__(MarlinFP8ScaledMMLinearKernel))
+    layer = SimpleNamespace(weight_scale=torch.ones(1))
+    with pytest.raises(ValueError, match="Marlin FP8.*repacks"):
+        Fp8W8A8W8A16Strategy().validate_before_processing(method, layer, "gen_layers.0.linear")
+
+
+@pytest.mark.parametrize("backend", ["auto", "emulation", "flashinfer_cutedsl"])
+def test_maps_linear_backend_reaches_native_config(backend: str) -> None:
+    from vllm_omni.config.config_factory import StageConfigFactory
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
+    from vllm_omni.diffusion.vllm_config import create_diffusion_vllm_config
+    from vllm_omni.engine.stage_init_utils import _project_omni_stage_engine_args
+
+    stage = StageConfigFactory.create_typed_default_diffusion(
+        "unused-local-model", {"model_class_name": "Cosmos3OmniDiffusersPipeline", "linear_backend": backend}
+    ).stage_by_id(0)
+    projected = _project_omni_stage_engine_args(stage)
+    assert projected["linear_backend"] == backend
+    config = OmniDiffusionConfig(linear_backend=projected["linear_backend"])
+    native = create_diffusion_vllm_config(torch.device("cpu"), config)
+    assert native.kernel_config.linear_backend == backend

@@ -1,0 +1,101 @@
+meta:
+  title: "LongCat-Image-Edit"
+  slug: "longcat-image-edit"
+  provider: "LongCat (Meituan)"
+  description: "Bilingual (Chinese-English) image editing model from Meituan LongCat, served via vLLM-Omni"
+  date_added: 2025-12-23
+  date_updated: 2026-04-17
+  tasks:
+    - omni
+  related_recipes: []
+
+model:
+  model_id: "meituan-longcat/LongCat-Image-Edit"
+  min_vllm_version: "0.12.0"
+  architecture: dense
+  parameter_count: "6B"
+  active_parameters: "6B"
+  context_length: 0
+  base_args: []
+  base_env: {}
+
+omni:
+  tasks:
+    - i2i
+
+dependencies:
+  - note: "vLLM-Omni must be installed from source with vllm==0.12.0 for LongCat-Image-Edit"
+    command: "git clone https://github.com/vllm-project/vllm-omni.git && cd vllm-omni && uv pip install -e . vllm==0.12.0"
+  - note: "xformers CUDA 12.8 build required for the diffusion attention kernels"
+    command: "uv pip install -U xformers --index-url https://download.pytorch.org/whl/cu128"
+  - note: "diffusers from source (needed by the image-edit pipeline)"
+    command: "git clone https://github.com/huggingface/diffusers.git && cd diffusers && uv pip install -e ."
+
+features: {}
+
+opt_in_features: []
+
+variants:
+  default:
+    precision: bf16
+    vram_minimum_gb: 36
+    description: "BF16 weights; served via vLLM-Omni"
+
+compatible_strategies: []
+
+hardware_overrides: {}
+strategy_overrides: {}
+
+guide: |
+  ## Overview
+
+  LongCat-Image-Edit is the image-editing variant of LongCat-Image by Meituan. It supports
+  bilingual (Chinese-English) editing instructions and is served via **vLLM-Omni** (not
+  standard vLLM). It achieves SOTA performance among open-source image editing models.
+
+  ## Prerequisites
+
+  - Hardware: 1x GPU with >=40 GB VRAM
+  - vLLM-Omni (runs on top of vLLM 0.12.0)
+  - diffusers (latest from source)
+  - xformers (latest)
+
+  ## Installation
+
+  ```bash
+  # Clone and install vllm-omni
+  git clone https://github.com/vllm-project/vllm-omni.git
+  cd vllm-omni
+  uv venv
+  source .venv/bin/activate
+  uv pip install -e . vllm==0.12.0
+
+  # Update xformers to the latest version
+  uv pip install -U xformers --index-url https://download.pytorch.org/whl/cu128
+
+  # Update diffusers to the latest version
+  git clone https://github.com/huggingface/diffusers.git
+  cd diffusers
+  uv pip install -e .
+  ```
+
+  ## Usage
+
+  ```bash
+  cd vllm-omni
+  python3 ./examples/offline_inference/image_to_image/image_edit.py \
+      --image qwen_bear.png \
+      --prompt "Add a white art board written with colorful text 'vLLM-Omni' on grassland. Add a paintbrush in the bear's hands. Position the bear standing in front of the art board as if painting." \
+      --output output_image_edit.png \
+      --num_inference_steps 50 \
+      --guidance_scale 4.5 \
+      --seed 42 \
+      --model meituan-longcat/LongCat-Image-Edit \
+      --cache_backend cache_dit \
+      --cache_dit_max_continuous_cached_steps 2
+  ```
+
+  ## References
+
+  - [LongCat-Image-Edit on Hugging Face](https://huggingface.co/meituan-longcat/LongCat-Image-Edit)
+  - [vLLM-Omni](https://github.com/vllm-project/vllm-omni)

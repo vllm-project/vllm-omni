@@ -3034,6 +3034,7 @@ async def _async_request_duplex_eval(request: RequestFuncInput, *, pbar: tqdm | 
                 ref_audio=sample.ref_audio,
                 output_root=sample.response_root,
                 fps=sample.fps,
+                mix=sample.mix,
                 prepared=prepared,
                 defer_artifacts=True,
                 turn_detection=sample.turn_detection,

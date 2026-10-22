@@ -3,10 +3,11 @@
 
 import asyncio
 import base64
+import copy
 import json
 import time
 import uuid
-from collections.abc import AsyncGenerator, AsyncIterator, Callable, Sequence
+from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping, Sequence
 from dataclasses import fields, is_dataclass
 from datetime import datetime, timedelta, timezone
 from functools import partial
@@ -42,6 +43,7 @@ from vllm_omni.entrypoints.openai.protocol.chat_completion import (
     OmniChatCompletionResponseChoice,
     OmniChatCompletionResponseStreamChoice,
 )
+from vllm_omni.entrypoints.openai.reference_audio import reference_audio_uri
 from vllm_omni.entrypoints.utils import coerce_param_message_types
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
 from vllm_omni.metrics import definitions as _metric_defs
@@ -282,6 +284,67 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 return True
         return False
 
+    def _has_ming3_talker_stage(self) -> bool:
+        stages = getattr(self.engine_client, "stage_configs", []) or []
+        metadata = [self._stage_model_metadata(stage) for stage in stages]
+        return any(arch == "BailingMoeV3AudioForConditionalGeneration" for arch, _ in metadata) and any(
+            model_stage == "ming3_tts" for _, model_stage in metadata
+        )
+
+    async def _attach_ming3_reference_audio(self, engine_prompt: TokPrompt, request=None) -> None:
+        """Resolve named voices or inline references before the Talker handoff."""
+        if not self._has_ming3_talker_stage():
+            return
+        info = self._ensure_prompt_additional_information(engine_prompt)
+        from vllm_omni.model_executor.models.ming_flash_omni.omni_voice import (
+            ip_voice_name,
+            validate_voice_controls,
+        )
+        from vllm_omni.model_executor.models.ming_flash_omni.reference_audio import (
+            pack_reference_audio,
+            validate_reference_audio,
+            validate_reference_audio_count,
+        )
+
+        validate_voice_controls(info)
+        audio = getattr(request, "audio", None)
+        selected = audio.get("voice") if isinstance(audio, dict) else getattr(audio, "voice", None)
+        selected = selected or info.get("voice_name") or info.get("voice")
+        if selected is not None:
+            if any(info.get(k) is not None for k in ("ref_audio", "reference_audio", "prompt_wav", "spk_emb")):
+                raise ValueError("Choose either a stored voice or reference audio/speaker embedding")
+            from vllm_omni.entrypoints.openai.ming3_voices import resolve_stored_voice, voice_id
+
+            name = ip_voice_name(voice_id(selected))
+            if name is not None:
+                info["voice_name"] = name
+                return
+            store = getattr(self, "_ming3_speech_service", None)
+            if store is None:
+                raise ValueError("Ming3 voice storage is not initialized")
+            info.update(await resolve_stored_voice(store, selected))
+            return
+        if "ref_audio" not in info:
+            return
+        sources = info["ref_audio"]
+        if isinstance(sources, str):
+            sources = [sources]
+        if not isinstance(sources, list) or not sources or not all(isinstance(source, str) for source in sources):
+            raise ValueError("ref_audio must be a base64 audio string or a nonempty list of them")
+        validate_reference_audio_count(len(sources))
+        config = self.model_config
+        connector = MediaConnector(
+            allowed_local_media_path=getattr(config, "allowed_local_media_path", "") or "",
+            allowed_media_domains=getattr(config, "allowed_media_domains", None),
+        )
+        references = []
+        for source in sources:
+            waveform, sample_rate = await connector.fetch_audio_async(reference_audio_uri(source))
+            references.append((validate_reference_audio(waveform, sample_rate), sample_rate))
+        info.pop("ref_audio")
+        info.update(pack_reference_audio(references))
+        info["voice_mode"] = "reference"
+
     async def _attach_minicpmo45_reference_audio(
         self,
         engine_prompt: TokPrompt,
@@ -320,28 +383,18 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             reference_sample_rate,
         )
 
-    def _fix_minicpmo45_audio_stream_output_kinds(
+    def _fix_audio_stream_output_kinds(
         self,
         sampling_params_list: list[Any],
         output_modalities: list[str] | tuple[str, ...] | None,
     ) -> list[Any]:
-        """Keep MiniCPM-o 4.5's thinker final-only during audio streaming.
+        """Keep completion-only text handoffs coherent under ``stream=true``.
 
-        Chat ``stream=true`` normally coerces every AR stage to DELTA output.
-        That is correct for token-level text streaming, but MiniCPM-o 4.5's
-        Talker consumes the completed TTS span plus aligned thinker hidden
-        states. If Stage0 is DELTA, llm2tts receives one generated token at a
-        time and repeatedly starts tiny, independent TTS streams. The API then
-        never represents one coherent audio response.
-
-        For this model, stream the audio stage, not the thinker-to-talker
-        boundary.
+        MiniCPM-o and synchronous Ming3 talkers need completed thinker text;
+        the async Ming3 bridge instead consumes the running token stream.
         """
         if not output_modalities or "audio" not in output_modalities:
             return sampling_params_list
-        if not self._has_minicpmo45_stage():
-            return sampling_params_list
-
         stage_configs = getattr(self.engine_client, "stage_configs", []) or []
         for idx, stage in enumerate(stage_configs):
             if idx >= len(sampling_params_list):
@@ -351,13 +404,15 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 continue
 
             model_arch, model_stage = self._stage_model_metadata(stage)
-            if model_arch != "MiniCPMO45OmniForConditionalGeneration":
-                continue
-
-            if model_stage == "llm":
-                sp.output_kind = RequestOutputKind.FINAL_ONLY
-            elif model_stage == "tts":
-                sp.output_kind = RequestOutputKind.DELTA
+            if model_arch == "MiniCPMO45OmniForConditionalGeneration":
+                if model_stage == "llm":
+                    sp.output_kind = RequestOutputKind.FINAL_ONLY
+                elif model_stage == "tts":
+                    sp.output_kind = RequestOutputKind.DELTA
+            elif model_arch == "BailingMoeV3AudioForConditionalGeneration" and model_stage == "thinker":
+                connector = self._stage_get(stage, "connector_config")
+                if not self._stage_get(connector, "async_chunk", False):
+                    sp.output_kind = RequestOutputKind.FINAL_ONLY
         return sampling_params_list
 
     @classmethod
@@ -867,7 +922,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 if self.enable_prompt_tokens_details:
                     mm_token_counts = _get_mm_token_counts(engine_prompt)
                 if hasattr(request, "sampling_params_list"):
-                    sampling_params_list = self._to_sampling_params_list(request.sampling_params_list)
+                    sampling_params_list = self._to_sampling_params_list(request.sampling_params_list, request=request)
                 else:
                     # Use standard OpenAI API parameters for comprehension stage
                     sampling_params_list = self._build_sampling_params_list_from_request(request)
@@ -877,9 +932,9 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 # convert cumulative to Final Only to ensure the output is correct.
                 sampling_params_list = coerce_param_message_types(sampling_params_list, request.stream)
                 if request.stream:
-                    sampling_params_list = self._fix_minicpmo45_audio_stream_output_kinds(
+                    sampling_params_list = self._fix_audio_stream_output_kinds(
                         sampling_params_list,
-                        output_modalities,
+                        request.modalities,
                     )
 
                 comprehension_idx = (
@@ -1078,6 +1133,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             prompt_additional_information["deferred_multi_modal_data"] = deferred_multi_modal_data
 
         await self._attach_minicpmo45_reference_audio(engine_prompt, request)
+        await self._attach_ming3_reference_audio(engine_prompt, request)
 
         speaker = getattr(request, "voice", None) or getattr(request, "speaker", None)
         normalized = validate_requested_speaker(speaker, self._get_supported_speakers())
@@ -1371,8 +1427,19 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
         return new_messages
 
-    def _to_sampling_params_list(self, sampling_params_list: list[dict]) -> list[Any]:
+    def _to_sampling_params_list(
+        self,
+        sampling_params_list: list[dict],
+        request: ChatCompletionRequest | None = None,
+        *,
+        merge_llm_defaults: bool = True,
+    ) -> list[Any]:
         """Convert request dicts to stage-typed sampling params objects.
+
+        Partial LLM dictionaries inherit deploy defaults, then explicit top-level
+        request parameters on the comprehension stage. Explicit stage fields win.
+        Video sessions set ``merge_llm_defaults=False`` so provided stage dicts
+        use constructor defaults instead, preserving their replacement semantics.
 
         For diffusion stages, build ``OmniDiffusionSamplingParams`` so
         downstream ``StageDiffusionClient._sampling_params_to_dict`` (which
@@ -1385,10 +1452,17 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         default_params_list = list(getattr(self.engine_client, "default_sampling_params_list", []) or [])
         final_sampling_params_list: list[Any] = []
         for idx, sampling_params in enumerate(sampling_params_list):
-            stage_type = get_stage_type(stage_configs[idx]) if idx < len(stage_configs) else "llm"
+            stage_config = stage_configs[idx] if idx < len(stage_configs) else None
+            stage_type = get_stage_type(stage_config)
             target_cls = OmniDiffusionSamplingParams if stage_type == "diffusion" else SamplingParams
             if isinstance(sampling_params, dict):
-                final_sampling_params_list.append(target_cls(**sampling_params))
+                if target_cls is SamplingParams and merge_llm_defaults:
+                    default = default_params_list[idx] if idx < len(default_params_list) else SamplingParams()
+                    final_sampling_params_list.append(
+                        self._merge_llm_sampling_params(default, stage_config, sampling_params, request)
+                    )
+                else:
+                    final_sampling_params_list.append(target_cls(**sampling_params))
             elif isinstance(sampling_params, target_cls):
                 final_sampling_params_list.append(sampling_params)
             elif isinstance(sampling_params, SamplingParams | OmniDiffusionSamplingParams):
@@ -1403,15 +1477,69 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             else:
                 raise ValueError(f"Invalid sampling params: {sampling_params}")
         for idx in range(len(final_sampling_params_list), len(stage_configs)):
-            if idx < len(default_params_list):
+            stage_config = stage_configs[idx]
+            is_comprehension = (
+                stage_config.get("is_comprehension", False)
+                if isinstance(stage_config, Mapping)
+                else getattr(stage_config, "is_comprehension", False)
+            )
+            if request is not None and is_comprehension and get_stage_type(stage_config) != "diffusion":
+                default = default_params_list[idx] if idx < len(default_params_list) else SamplingParams()
+                final_sampling_params_list.append(self._merge_llm_sampling_params(default, stage_config, {}, request))
+            elif idx < len(default_params_list):
                 final_sampling_params_list.append(clone_sampling_params(default_params_list[idx]))
             else:
                 final_sampling_params_list.append(SamplingParams())
         return final_sampling_params_list
 
+    def _merge_llm_sampling_params(
+        self,
+        default_params: SamplingParams | dict[str, Any],
+        stage_config: Any,
+        overrides: dict[str, Any],
+        request: ChatCompletionRequest | None,
+    ) -> SamplingParams:
+        """Merge raw configuration before constructing normalized runtime params."""
+        model_config = getattr(stage_config, "model_config", stage_config)
+        if isinstance(model_config, Mapping):
+            raw_defaults = model_config.get("default_sampling_params", default_params)
+        else:
+            raw_defaults = getattr(model_config, "default_sampling_params", default_params)
+        if raw_defaults is None:
+            merged = {}
+        elif isinstance(raw_defaults, Mapping):
+            merged = dict(raw_defaults)
+        elif isinstance(default_params, dict):
+            merged = dict(default_params)
+        else:
+            # Compatibility for clients without raw stage configuration. Keep
+            # their runtime policies; explicit and inferred values are ambiguous.
+            merged = {
+                name: getattr(default_params, name)
+                for name in SamplingParams.__struct_fields__
+                if not name.startswith("_") and name != "output_text_buffer_length"
+            }
+        is_comprehension = (
+            stage_config.get("is_comprehension", False)
+            if isinstance(stage_config, Mapping)
+            else getattr(stage_config, "is_comprehension", False)
+        )
+        if request is not None and is_comprehension:
+            merged.update(self._request_sampling_overrides(request))
+        extra_args = merged.get("extra_args")
+        merged.update(overrides)
+        if isinstance(extra_args, dict) and isinstance(overrides.get("extra_args"), dict):
+            merged["extra_args"] = {**extra_args, **overrides["extra_args"]}
+        # Constructors derive cache/stop/greedy state from the final values.
+        # Nested dictionaries must never alias deploy defaults or request data.
+        return SamplingParams(**copy.deepcopy(merged))
+
     def _get_comprehension_stage_index(self) -> int:
         for idx, stage in enumerate(self.engine_client.stage_configs):
-            if stage.is_comprehension:
+            is_comprehension = (
+                stage.get("is_comprehension", False) if isinstance(stage, Mapping) else stage.is_comprehension
+            )
+            if is_comprehension:
                 return idx
         raise ValueError("No comprehension stage (is_comprehension=True) found in stage configs")
 
@@ -1443,7 +1571,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         Starts with YAML defaults and only overrides fields that the user
         explicitly provided (non-None values) in the request.
 
-        max_tokens is NOT computed dynamically — it uses the deploy YAML default.
+        max_tokens uses the deploy YAML default unless explicitly overridden.
 
         Args:
             default_params: Default SamplingParams from the resolved pipeline and deploy configuration.
@@ -1453,6 +1581,13 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             New SamplingParams with YAML defaults overridden by request values.
         """
         params = default_params.clone()
+        for field_name, value in self._request_sampling_overrides(request).items():
+            setattr(params, field_name, value)
+        return params
+
+    def _request_sampling_overrides(self, request: ChatCompletionRequest) -> dict[str, Any]:
+        """Select explicit request values without introducing protocol defaults."""
+        overrides: dict[str, Any] = {}
 
         # Only apply fields explicitly provided by user, not protocol defaults.
         explicit_fields = request.model_fields_set
@@ -1463,9 +1598,12 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
             value = getattr(request, field_name, None)
             if (value is not None and not isinstance(value, list)) or (isinstance(value, list) and len(value) > 0):
-                setattr(params, field_name, value)
+                overrides[field_name] = value
 
-        return params
+        if "max_completion_tokens" in explicit_fields and request.max_completion_tokens is not None:
+            overrides["max_tokens"] = request.max_completion_tokens
+
+        return overrides
 
     @staticmethod
     def _set_if_supported(obj: Any, **kwargs: Any) -> None:
@@ -1546,14 +1684,16 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
         sampling_params_list = []
         for idx, default_params in enumerate(default_params_list):
-            if isinstance(default_params, dict):
-                default_params = SamplingParams(**default_params)
             if idx == comprehension_idx:
-                params = self._apply_request_overrides(default_params, request)
+                params = self._merge_llm_sampling_params(
+                    default_params, self.engine_client.stage_configs[idx], {}, request
+                )
                 sampling_params_list.append(params)
             else:
                 # For other stages, clone default params
-                sampling_params_list.append(default_params.clone())
+                sampling_params_list.append(
+                    SamplingParams(**default_params) if isinstance(default_params, dict) else default_params.clone()
+                )
 
         return sampling_params_list
 
@@ -1605,6 +1745,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         modality_finished: list[set[str]] = [set() for _ in range(num_choices)]
         modality_seen: list[set[str]] = [set() for _ in range(num_choices)]
         stop_reason_emitted: list[bool] = [False] * num_choices
+        # Preserve text truncation until the final audio/terminal event.
+        text_limit_reached = [False] * num_choices
         num_prompt_tokens = 0
         num_cached_tokens = None
         num_cache_creation_tokens = None
@@ -2217,9 +2359,10 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                                 finish_reason_ = "tool_calls"
                             else:
                                 finish_reason_ = output.finish_reason if output.finish_reason else "stop"
+                            text_limit_reached[i] |= finish_reason_ == "length"
                             # Only emit finish_reason on the last modality to
                             # comply with OpenAI streaming spec: exactly one
-                            # chunk per choice carries finish_reason="stop".
+                            # chunk per choice carries a terminal finish_reason.
                             modality_finished[i].add("text")
                             if modality_seen[i] < set(request.modalities) or not all(
                                 m in modality_finished[i] for m in modality_seen[i]
@@ -2322,6 +2465,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                             choice.finish_reason = None
                         else:
                             stop_reason_emitted[choice.index] = True
+                            if text_limit_reached[choice.index]:
+                                choice.finish_reason = "length"
                     # Record per-chunk PCM byte count + arrival timestamp for
                     # audio_underrun_s / audio_continuity_ok_total at finalize.
                     if req_state is not None and req_state.request_arrival_ts > 0:
@@ -2391,7 +2536,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     logger.warning(f"Unsupported streaming final output type: {final_output_type}")
                     continue
 
-            # Fallback: if a choice had modalities finish but no finish_reason="stop"
+            # Fallback: if a choice had modalities finish but no terminal finish_reason
             # was emitted (e.g. request.modalities included a modality the engine
             # never produced), emit a final stop chunk for that choice.
             for i in range(num_choices):
@@ -2399,7 +2544,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     stop_choice = ChatCompletionResponseStreamChoice(
                         index=i,
                         delta=DeltaMessage(),
-                        finish_reason="stop",
+                        finish_reason="length" if text_limit_reached[i] else "stop",
                     )
                     stop_chunk = OmniChatCompletionStreamResponse(
                         id=request_id,

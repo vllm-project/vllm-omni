@@ -28,7 +28,7 @@ def result(tmp_path, config):
     score_root = tmp_path / "evaluation"
     for split, ids in config["sample_ids_per_split"].items():
         for sid in ids:
-            row = {"id": sid, "protocol_pin": PROTOCOL_PIN}
+            row = {"id": sid, "protocol_pin": PROTOCOL_PIN, "response_meta": {"mix": config["mix"]}}
             if split.startswith("RTD_"):
                 row.update(
                     family="rtd",
@@ -141,7 +141,14 @@ def test_invalid_quality_fails(result, config, section, field, value):
 
 
 @pytest.mark.parametrize(
-    "mutation,message", [("missing", "score files"), ("id", "sample IDs"), ("pin", "protocol_pin")]
+    "mutation,message",
+    [
+        ("missing", "score files"),
+        ("id", "sample IDs"),
+        ("pin", "protocol_pin"),
+        ("mix", "mix 'question'"),
+        ("no_mix", "mix 'question'"),
+    ],
 )
 def test_score_file_integrity(result, config, mutation, message):
     path = Path(result["omni_duplex_eval"]["accuracy"]["score_root"]) / "RTD_world_knowledge/360.json"
@@ -151,7 +158,13 @@ def test_score_file_integrity(result, config, mutation, message):
         path.rename(path.with_name("wrong.json"))
     else:
         row = json.loads(path.read_text())
-        row["protocol_pin"] = "old"
+        if mutation == "pin":
+            row["protocol_pin"] = "old"
+        elif mutation == "mix":
+            row["response_meta"]["mix"] = "question"
+        else:
+            # Metadata written before mix was recorded counts as question.
+            del row["response_meta"]["mix"]
         path.write_text(json.dumps(row))
     with pytest.raises(AssertionError, match=message):
         assert_accuracy_result(result, config)
@@ -196,14 +209,32 @@ def test_dfx_accuracy_requires_batch_audio(result, audio_sessions):
             assert_result(result, dfx["benchmark_params"][0], 66)
 
 
+def test_nightly_workload_matches_ci_config():
+    test_root = Path(__file__).resolve().parents[3]
+    dfx = json.loads((test_root / "dfx/perf/tests/test_minicpmo_4_5_omni_duplex_eval.json").read_text())[0]
+    params = dfx["benchmark_params"][0]
+    assert params["duplex_eval_mix"] == "soundtrack"
+    assert load_accuracy_config(str(_CONFIG_PATH), params)["mix"] == "soundtrack"
+
+
 @pytest.mark.parametrize(
-    "field,value", [("duplex_eval_ids", ["0"]), ("num_prompts", [3]), ("duplex_eval_evaluate", False)]
+    "field,value",
+    [
+        ("duplex_eval_ids", ["0"]),
+        ("num_prompts", [3]),
+        ("duplex_eval_evaluate", False),
+        ("duplex_eval_mix", "question"),
+        ("duplex_eval_mix", None),
+    ],
 )
 def test_wrong_workload_is_rejected(field, value):
     test_root = Path(__file__).resolve().parents[3]
     dfx = json.loads((test_root / "dfx/perf/tests/test_minicpmo_4_5_omni_duplex_eval.json").read_text())[0]
     params = dfx["benchmark_params"][0]
-    params[field] = value
+    if value is None:
+        del params[field]
+    else:
+        params[field] = value
     with pytest.raises(AssertionError):
         load_accuracy_config(str(_CONFIG_PATH), params)
 
