@@ -53,6 +53,8 @@ from vllm_omni.engine.duplex.turn_detection import (
     TurnDetector,
 )
 from vllm_omni.entrypoints.async_omni import AsyncOmni
+from vllm_omni.entrypoints.openai.audio_utils_mixin import AudioMixin
+from vllm_omni.entrypoints.openai.protocol.audio import CreateAudio
 from vllm_omni.entrypoints.openai.realtime.session import (
     ActiveResponse,
     AudioFullDuplexSessionState,
@@ -77,6 +79,9 @@ _CLIENT_EVENT_ADAPTER: TypeAdapter[types.RealtimeClientEvent] = TypeAdapter(type
 # The Realtime PCM contract is mono signed PCM16 at 24 kHz.
 SAMPLE_RATE_HZ = 24000
 BYTES_PER_SAMPLE_PCM16 = 2
+# OpenAI's Realtime contract allows playback speed in this range.
+MIN_OUTPUT_SPEED = 0.25
+MAX_OUTPUT_SPEED = 1.5
 # Application safety caps for one append and the complete pending input turn.
 MAX_AUDIO_APPEND_BYTES = 15 * 1024 * 1024
 MAX_INPUT_AUDIO_BUFFER_BYTES = 64 * 1024 * 1024
@@ -92,18 +97,49 @@ def _is_prompt_limit_error(exc: VLLMValidationError) -> bool:
     return exc.parameter in {"input_text", "input_tokens"}
 
 
-class _UnsupportedAudioFormatError(ValueError):
-    """The Realtime endpoint only accepts mono PCM16 audio at 24 kHz."""
+class _RealtimeRequestError(ValueError):
+    """Realtime error carrying the OpenAI error-envelope fields."""
 
-
-class _RealtimeVoiceError(ValueError):
-    """Voice selection rejected in the OpenAI Realtime error shape."""
-
-    def __init__(self, message: str, *, code: str | None, param: str, client_event: bool = True) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str | None,
+        param: str | None = None,
+        client_event: bool = True,
+    ) -> None:
         super().__init__(message)
         self.code = code
         self.param = param
         self.client_event = client_event
+
+
+class _UnsupportedAudioFormatError(_RealtimeRequestError):
+    """The Realtime endpoint only accepts mono PCM16 audio at 24 kHz."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message, code="unsupported_audio_format")
+
+
+class _RealtimeVoiceError(_RealtimeRequestError):
+    """Voice selection rejected in the OpenAI Realtime error shape."""
+
+
+class _InvalidOutputSpeedError(_RealtimeRequestError):
+    """The requested playback speed is outside the supported range."""
+
+    def __init__(self, speed: float) -> None:
+        if speed > MAX_OUTPUT_SPEED:
+            code = "decimal_above_max_value"
+            detail = f"decimal above maximum value. Expected a value <= {MAX_OUTPUT_SPEED}, but got {speed} instead."
+        else:
+            code = "decimal_below_min_value"
+            detail = f"decimal below minimum value. Expected a value >= {MIN_OUTPUT_SPEED}, but got {speed} instead."
+        super().__init__(
+            f"Invalid 'session.audio.output.speed': {detail}",
+            code=code,
+            param="session.audio.output.speed",
+        )
 
 
 @dataclass(slots=True)
@@ -266,10 +302,7 @@ class OpenAIFullDuplexConnection:
             return
         try:
             candidate_config = self._sanitize_session_config(candidate_config, s.config)
-        except _UnsupportedAudioFormatError as exc:
-            await self._send_error(str(exc), "unsupported_audio_format", event_id=event.event_id)
-            return
-        except _RealtimeVoiceError as exc:
+        except _RealtimeRequestError as exc:
             await self._send_error(
                 str(exc),
                 exc.code,
@@ -341,15 +374,21 @@ class OpenAIFullDuplexConnection:
 
         audio_output = audio.output
         if audio_output is not None:
-            if audio_output.speed not in (None, 1):
-                previous_output = previous.audio.output if previous.audio is not None else None
-                audio_output.speed = previous_output.speed if previous_output is not None else None
+            if audio_output.speed is not None:
+                audio_output.speed = self._validate_output_speed(audio_output.speed)
             if not self._is_pcm16_24khz_format(audio_output.format):
                 raise _UnsupportedAudioFormatError("Only 24 kHz PCM16 output audio is supported")
             if audio_output.voice is not None:
                 audio_output.voice = self._validate_voice(audio_output.voice)
 
         return sanitized
+
+    @staticmethod
+    def _validate_output_speed(speed: float) -> float:
+        """Reject playback speeds outside the Realtime API's supported range."""
+        if not MIN_OUTPUT_SPEED <= speed <= MAX_OUTPUT_SPEED:
+            raise _InvalidOutputSpeedError(speed)
+        return speed
 
     def _validate_voice(self, voice: Voice) -> str | None:
         """Normalize a session voice, rejecting custom voice references."""
@@ -805,8 +844,13 @@ class OpenAIFullDuplexConnection:
 
         try:
             response = self._resolve_response(response_cfg)
-        except _UnsupportedAudioFormatError as exc:
-            await self._send_error(str(exc), "unsupported_audio_format", event_id=event.event_id)
+        except _RealtimeRequestError as exc:
+            await self._send_error(
+                str(exc),
+                exc.code,
+                event_id=event.event_id if exc.client_event else None,
+                param=exc.param,
+            )
             return
         except ValueError as exc:
             await self._send_error(str(exc), "invalid_request_error", event_id=event.event_id)
@@ -1217,6 +1261,7 @@ class OpenAIFullDuplexConnection:
 
         sampling_params_list = self.chat_handler._fix_audio_stream_output_kinds(sampling_params_list, modalities)
         opt_kwargs = self._build_opt_kwargs_from_model_extras(s.config.model_extra)
+        output_speed = self.session.output_speed
         gen = self.engine.generate(
             prompt=engine_input,
             request_id=active.request_id,
@@ -1235,13 +1280,15 @@ class OpenAIFullDuplexConnection:
                 if output_type == "audio":
                     audio_chunks = self._extract_audio_deltas(output)
                     if audio_chunks:
+                        sample_rate = audio_chunk_sample_rate(output)
                         if audio_resampler is None:
                             audio_resampler = StreamingAudioResampler(
-                                audio_chunk_sample_rate(output),
+                                sample_rate,
                                 SAMPLE_RATE_HZ,
                             )
                         for chunk in audio_chunks:
-                            await emit_audio_delta(audio_resampler.process(chunk))
+                            stretched = self._stretch_audio_delta(chunk, sample_rate, output_speed)
+                            await emit_audio_delta(audio_resampler.process(stretched))
                     continue
 
                 if output.outputs:
@@ -2062,6 +2109,30 @@ class OpenAIFullDuplexConnection:
         clipped = np.clip(audio_f32, -1.0, 1.0)
         pcm16 = (clipped * 32767.0).astype(np.int16)
         return base64.b64encode(pcm16.tobytes()).decode()
+
+    @staticmethod
+    def _stretch_audio_delta(chunk: np.ndarray, sample_rate: int, speed: float) -> np.ndarray:
+        """Time-stretch one audio delta through the shared encoder's speed control.
+
+        Each delta is stretched independently, so chunk boundaries are not
+        phase-continuous. A stateful streaming stretcher is the proper fix.
+        """
+        if speed == 1.0:
+            return chunk
+
+        response = AudioMixin().create_audio(
+            CreateAudio(
+                audio_tensor=np.asarray(chunk, dtype=np.float32),
+                sample_rate=sample_rate,
+                response_format="pcm",
+                speed=speed,
+                base64_encode=False,
+            )
+        )
+        audio_data = response.audio_data
+        assert isinstance(audio_data, bytes)
+        pcm16 = np.frombuffer(audio_data, dtype=np.int16)
+        return pcm16.astype(np.float32) / 32768.0
 
     # ------------------------------------------------------------------ #
     #  Server event emission                                              #

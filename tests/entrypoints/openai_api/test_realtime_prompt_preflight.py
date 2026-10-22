@@ -742,6 +742,155 @@ async def test_generated_audio_is_resampled_to_realtime_rate() -> None:
 
 
 @pytest.mark.asyncio
+async def test_generated_audio_honors_session_speed() -> None:
+    samples = SAMPLE_RATE_HZ // 5
+    waveform = np.sin(2 * np.pi * 440 * np.arange(samples) / SAMPLE_RATE_HZ).astype(np.float32)
+    multimodal_output = {"audio": waveform, "sample_rate": SAMPLE_RATE_HZ}
+    output = SimpleNamespace(
+        final_output_type="audio",
+        multimodal_output=multimodal_output,
+        outputs=[SimpleNamespace(multimodal_output=multimodal_output)],
+    )
+
+    async def generate(**_kwargs):
+        yield output
+
+    engine = SimpleNamespace(
+        model_config=SimpleNamespace(max_model_len=100, multimodal_config=None),
+        default_sampling_params_list=[],
+        generate=generate,
+    )
+    websocket = _FakeWebSocket()
+    connection, _ = _make_connection(websocket=websocket, engine=engine)
+    await connection._handle_session_update(_session_update("alloy", speed=0.5))
+    assert connection.session.output_speed == 0.5
+
+    response = _ResolvedResponse(
+        input=[],
+        instructions=None,
+        modalities=["audio"],
+        max_output_tokens="inf",
+        tools=None,
+        tool_choice="none",
+        metadata=None,
+    )
+    active = ActiveResponse(response_id="resp_test", request_id="req_test")
+    connection.session.active_response = active
+
+    await connection._run_response(active.response_id, response, {"prompt_token_ids": []})
+
+    events = [json.loads(message) for message in websocket.messages]
+    audio_deltas = [event for event in events if event["type"] == "response.output_audio.delta"]
+    pcm = b"".join(base64.b64decode(event["delta"]) for event in audio_deltas)
+    assert active.item_id is not None
+    assert len(pcm) == int(samples / 0.5) * 2
+    assert connection.session.item_duration_ms[active.item_id] == pytest.approx(400)
+
+
+@pytest.mark.asyncio
+async def test_generated_audio_stretches_each_delta() -> None:
+    samples = SAMPLE_RATE_HZ // 5
+    waveform = np.sin(2 * np.pi * 440 * np.arange(samples) / SAMPLE_RATE_HZ).astype(np.float32)
+    outputs = []
+    for chunk in np.split(waveform, 2):
+        multimodal_output = {"audio": chunk, "sample_rate": SAMPLE_RATE_HZ}
+        outputs.append(
+            SimpleNamespace(
+                final_output_type="audio",
+                multimodal_output=multimodal_output,
+                outputs=[SimpleNamespace(multimodal_output=multimodal_output)],
+            )
+        )
+
+    async def generate(**_kwargs):
+        for output in outputs:
+            yield output
+
+    engine = SimpleNamespace(
+        model_config=SimpleNamespace(max_model_len=100, multimodal_config=None),
+        default_sampling_params_list=[],
+        generate=generate,
+    )
+    websocket = _FakeWebSocket()
+    connection, _ = _make_connection(websocket=websocket, engine=engine)
+    await connection._handle_session_update(_session_update("alloy", speed=0.5))
+
+    response = _ResolvedResponse(
+        input=[],
+        instructions=None,
+        modalities=["audio"],
+        max_output_tokens="inf",
+        tools=None,
+        tool_choice="none",
+        metadata=None,
+    )
+    active = ActiveResponse(response_id="resp_test", request_id="req_test")
+    connection.session.active_response = active
+
+    await connection._run_response(active.response_id, response, {"prompt_token_ids": []})
+
+    events = [json.loads(message) for message in websocket.messages]
+    audio_deltas = [event for event in events if event["type"] == "response.output_audio.delta"]
+    assert len(audio_deltas) == 2
+    pcm = b"".join(base64.b64decode(event["delta"]) for event in audio_deltas)
+    assert active.item_id is not None
+    assert len(pcm) == int(samples / 0.5) * 2
+    assert connection.session.item_duration_ms[active.item_id] == pytest.approx(400)
+
+
+def test_stretch_audio_delta_is_noop_at_default_speed() -> None:
+    chunk = np.zeros(128, dtype=np.float32)
+
+    assert OpenAIFullDuplexConnection._stretch_audio_delta(chunk, SAMPLE_RATE_HZ, 1.0) is chunk
+
+
+@pytest.mark.asyncio
+async def test_generated_audio_applies_speed_before_resampling() -> None:
+    source_rate = 32_000
+    samples = source_rate // 10
+    waveform = np.sin(2 * np.pi * 440 * np.arange(samples) / source_rate).astype(np.float32)
+    multimodal_output = {"audio": waveform, "sample_rate": source_rate}
+
+    async def generate(**_kwargs):
+        yield SimpleNamespace(
+            final_output_type="audio",
+            multimodal_output=multimodal_output,
+            outputs=[SimpleNamespace(multimodal_output=multimodal_output)],
+        )
+
+    engine = SimpleNamespace(
+        model_config=SimpleNamespace(max_model_len=100, multimodal_config=None),
+        default_sampling_params_list=[],
+        generate=generate,
+    )
+    websocket = _FakeWebSocket()
+    connection, _ = _make_connection(websocket=websocket, engine=engine)
+    await connection._handle_session_update(_session_update("alloy", speed=0.5))
+
+    response = _ResolvedResponse(
+        input=[],
+        instructions=None,
+        modalities=["audio"],
+        max_output_tokens="inf",
+        tools=None,
+        tool_choice="none",
+        metadata=None,
+    )
+    active = ActiveResponse(response_id="resp_test", request_id="req_test")
+    connection.session.active_response = active
+
+    await connection._run_response(active.response_id, response, {"prompt_token_ids": []})
+
+    events = [json.loads(message) for message in websocket.messages]
+    pcm = b"".join(
+        base64.b64decode(event["delta"]) for event in events if event["type"] == "response.output_audio.delta"
+    )
+    assert active.item_id is not None
+    assert len(pcm) == int(samples / 0.5 / source_rate * SAMPLE_RATE_HZ) * 2
+    assert connection.session.item_duration_ms[active.item_id] == pytest.approx(200)
+
+
+@pytest.mark.asyncio
 async def test_minicpmo45_realtime_keeps_thinker_final_only() -> None:
     model_arch = "MiniCPMO45OmniForConditionalGeneration"
     stages = [
@@ -788,19 +937,20 @@ async def test_minicpmo45_realtime_keeps_thinker_final_only() -> None:
     ]
 
 
-def _session_update(voice: str | dict[str, str]) -> types.SessionUpdateEvent:
+def _session_update(voice: str | dict[str, str], *, speed: float | None = None) -> types.SessionUpdateEvent:
+    output: dict[str, Any] = {
+        "format": {"type": "audio/pcm", "rate": 24000},
+        "voice": voice,
+    }
+    if speed is not None:
+        output["speed"] = speed
     return types.SessionUpdateEvent(
         event_id="evt_test",
         type="session.update",
         session=types.RealtimeSessionCreateRequest.model_validate(
             {
                 "type": "realtime",
-                "audio": {
-                    "output": {
-                        "format": {"type": "audio/pcm", "rate": 24000},
-                        "voice": voice,
-                    }
-                },
+                "audio": {"output": output},
             }
         ),
     )
@@ -910,6 +1060,85 @@ async def test_session_update_blank_voice_is_unset(voice: str) -> None:
     assert connection.session.output_voice is None
     engine_input = await connection._build_full_prompt()
     assert "speaker" not in engine_input.get("additional_information", {})
+
+
+def test_output_speed_defaults_to_one() -> None:
+    connection, _ = _make_connection()
+
+    assert connection.session.output_speed == 1.0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("speed", [0.25, 0.5, 1.5])
+async def test_session_update_accepts_speed_in_range(speed: float) -> None:
+    websocket = _FakeWebSocket()
+    connection, _ = _make_connection(websocket=websocket)
+
+    await connection._handle_session_update(_session_update("alloy", speed=speed))
+
+    assert not [event for event in _websocket_events(websocket) if event["type"] == "error"]
+    updated_session = next(
+        event["session"] for event in _websocket_events(websocket) if event["type"] == "session.updated"
+    )
+    assert updated_session["audio"]["output"]["speed"] == speed
+    assert connection.session.output_speed == speed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("speed", "code"),
+    [
+        (0.2, "decimal_below_min_value"),
+        (0.0, "decimal_below_min_value"),
+        (-1.0, "decimal_below_min_value"),
+        (2.0, "decimal_above_max_value"),
+    ],
+)
+async def test_session_update_rejects_speed_out_of_range(speed: float, code: str) -> None:
+    websocket = _FakeWebSocket()
+    connection, _ = _make_connection(websocket=websocket)
+
+    await connection._handle_session_update(_session_update("alloy", speed=speed))
+
+    error = next(event for event in _websocket_events(websocket) if event["type"] == "error")
+    assert error["error"]["type"] == "invalid_request_error"
+    assert error["error"]["code"] == code
+    assert error["error"]["param"] == "session.audio.output.speed"
+    assert error["error"]["event_id"] == "evt_test"
+    assert connection.session.output_speed == 1.0
+
+
+@pytest.mark.asyncio
+async def test_session_update_keeps_speed_when_update_omits_it() -> None:
+    websocket = _FakeWebSocket()
+    connection, _ = _make_connection(websocket=websocket)
+    await connection._handle_session_update(_session_update("alloy", speed=0.5))
+
+    await connection._handle_session_update(
+        types.SessionUpdateEvent(
+            event_id="evt_test2",
+            type="session.update",
+            session=types.RealtimeSessionCreateRequest.model_validate({"type": "realtime", "instructions": "be brief"}),
+        )
+    )
+
+    updated_session = [
+        event["session"] for event in _websocket_events(websocket) if event["type"] == "session.updated"
+    ][-1]
+    assert updated_session["audio"]["output"]["speed"] == 0.5
+    assert connection.session.output_speed == 0.5
+
+
+@pytest.mark.asyncio
+async def test_session_update_rejected_speed_keeps_previous_value() -> None:
+    websocket = _FakeWebSocket()
+    connection, _ = _make_connection(websocket=websocket)
+    await connection._handle_session_update(_session_update("alloy", speed=0.5))
+
+    await connection._handle_session_update(_session_update("alloy", speed=2.0))
+
+    assert connection.session.output_speed == 0.5
+    assert len([event for event in _websocket_events(websocket) if event["type"] == "session.updated"]) == 1
 
 
 @pytest.mark.parametrize(
