@@ -293,10 +293,9 @@ class SageAttentionImpl(AttentionImpl):
             raise ImportError("XPU SageAttention requires auto-round-lib. Install with: pip install auto-round-lib")
         orig_dtype = query.dtype
         kernel_dtype = orig_dtype if (_sagev1_native_bf16 and orig_dtype == torch.bfloat16) else torch.float16
-        # ARK validates canonical strides; .contiguous() is a no-op for Cosmos3 (post-RoPE q, torch.cat k/v).
-        q = query.to(kernel_dtype).contiguous()
-        k = key.to(kernel_dtype).contiguous()
-        v = value.to(kernel_dtype).contiguous()
+        q = query.to(kernel_dtype)
+        k = key.to(kernel_dtype)
+        v = value.to(kernel_dtype)
 
         if _sagev1_has_tensor_layout:
             if _SAGE_ATTN_TENSOR_LAYOUT == "HND":
