@@ -13,6 +13,7 @@ import msgspec
 import pytest
 from vllm.sampling_params import SamplingParams
 
+from vllm_omni.diffusion.attention.schedule import InvalidAttentionScheduleError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -165,5 +166,5 @@ def test_null_extra_args_schedule_keeps_the_typed_value(typed):
 
 
 def test_attention_schedule_rejects_request_profile_definitions():
-    with pytest.raises(TypeError, match="attention_schedule"):
+    with pytest.raises(InvalidAttentionScheduleError, match="attention_schedule"):
         OmniDiffusionSamplingParams(extra_args={"attention_schedule": {"profiles": {"new": {}}}})
