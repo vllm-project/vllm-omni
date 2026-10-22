@@ -180,7 +180,14 @@ def enable_kandinsky6_teacache(pipeline: Any, config: DiffusionCacheConfig) -> N
     )
 
 
+def enable_qwen_image21_teacache(pipeline: Any, config: DiffusionCacheConfig) -> None:
+    from vllm_omni.diffusion.models.qwen_image_21.teacache import enable_qwen_image21_teacache as enable
+
+    enable(pipeline, config)
+
+
 CUSTOM_TEACACHE_ENABLERS = {
+    "QwenImage21Pipeline": enable_qwen_image21_teacache,
     "BagelPipeline": enable_bagel_teacache,
     "Flux2KleinPipeline": enable_flux2_klein_teacache,
     "HunyuanImage3Pipeline": enable_hunyuan_image3_teacache,
@@ -286,20 +293,14 @@ class TeaCacheBackend(CacheBackend):
                 logger.debug(f"TeaCache state refreshed for HunyuanImage3 (num_inference_steps={num_inference_steps})")
             return
 
-        # Extract transformer from pipeline
-        transformer = pipeline.transformer
-        if not hasattr(transformer, "_hook_registry") and hasattr(pipeline, "denoising_transformer"):
-            transformer = pipeline.denoising_transformer
-
-        if hasattr(transformer, "_hook_registry"):
-            hook = transformer._hook_registry.get_hook(TeaCacheHook._HOOK_NAME)
-            if hook is not None:
-                transformer._hook_registry.reset_hook(TeaCacheHook._HOOK_NAME)
+        # Prefer a denoising boundary that actually owns TeaCache. The weight
+        # owner can have a registry containing unrelated hooks.
+        for transformer in (getattr(pipeline, "denoising_transformer", None), pipeline.transformer):
+            registry = getattr(transformer, "_hook_registry", None)
+            if registry is not None and registry.get_hook(TeaCacheHook._HOOK_NAME) is not None:
+                registry.reset_hook(TeaCacheHook._HOOK_NAME)
                 if verbose:
                     logger.debug(f"TeaCache state refreshed (num_inference_steps={num_inference_steps})")
-            else:
-                if verbose:
-                    logger.warning("TeaCache hook not found, nothing to refresh")
-        else:
-            if verbose:
-                logger.warning("Transformer has no hook registry, TeaCache may not be applied")
+                return
+        if verbose:
+            logger.warning("TeaCache hook not found, nothing to refresh")

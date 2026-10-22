@@ -2,6 +2,41 @@
 
 This section describes how to add TeaCache to a diffusion transformer model. We use the Qwen-Image transformer as the reference implementation.
 
+## Qwen-Image 2.1 experimental decode adapter
+
+Qwen-Image 2.1 uses a single-stream transformer with per-layer prefix KV. Its
+TeaCache boundary differs from the older dual-stream Qwen-Image extractor:
+
+- `QwenImage21DenoisingAdapter` intercepts only the decode block stack.
+  Prefill bypasses the hook, executes every block and resets approximation state.
+- Sequence preparation and output normalization/projection remain in the model's
+  original forward. Each executed block receives its own prefix-KV entry.
+- The decision feature is first-block `img_norm1(target) * (1 + scale)` using
+  the current timestep's target modulation. Explicit `cond`/`uncond` identities
+  select separate positive/negative TeaCache states.
+- Backend refresh targets the adapter even when the original transformer has
+  another hook registry, by locating the TeaCache hook rather than matching the
+  pipeline class name. No parameters are registered on the adapter.
+- Whole-decode CUDA graphs are disabled because their replay bypasses Python
+  skip decisions. Other cache backends remain disabled for this model.
+- A frozen `QwenImage21SkipPolicy` on the adapter chooses the threshold per
+  request (`cfg_rel_l1_thresh` when the pipeline sets `do_true_cfg`) and allows
+  skips only inside `skip_timestep_range`. The extractor passes the threshold
+  through the hook's per-call `rel_l1_thresh` override and forces steps outside
+  the range through `synchronize_cache_decision`, which also resets the
+  accumulated distance. Without these keys the decision is the plain TeaCache rule.
+
+This is an opt-in experiment for single-GPU, batch-1 request-mode inference,
+without quantized weights, LoRA, offload or FP8 prefix storage. Both enablers
+reject those combinations; prefill also rejects dynamically loaded LoRA wrappers
+before writing prefix KV. Five finite coefficients and a finite positive
+threshold must be supplied explicitly; no model-specific defaults are registered.
+Real-checkpoint force-full parity and a bounded eager BF16 numerical-quality/performance
+experiment have been run on one RTX PRO 6000 Blackwell. Human visual acceptance
+remains pending; other platforms and feature combinations remain unqualified.
+See the [user guide](../../user_guide/diffusion/cache_acceleration/teacache.md#qwen-image-21-experimental)
+for the bounded dense collector and calibration requirements.
+
 ---
 
 ## Table of Contents
