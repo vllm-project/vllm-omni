@@ -14,7 +14,11 @@ from vllm.inputs import EmbedsPrompt, PromptType, TextPrompt, TokensPrompt
 from vllm.inputs.engine import TokensInput
 from vllm.sampling_params import SamplingParams
 
-from vllm_omni.diffusion.attention.schedule import AttentionSchedule, parse_attention_schedule
+from vllm_omni.diffusion.attention.schedule import (
+    AttentionSchedule,
+    InvalidAttentionScheduleError,
+    parse_attention_schedule,
+)
 from vllm_omni.lora.request import LoRARequest
 
 DIFFUSION_QUALITY_LEVELS: tuple[str, ...] = ("lossless", "high")
@@ -402,8 +406,13 @@ class OmniDiffusionSamplingParams:
             raise ValueError("streaming_idle_timeout_s must be finite and positive")
         if self.quality is not None and self.quality not in DIFFUSION_QUALITY_LEVELS:
             raise ValueError(f"quality must be one of {list(DIFFUSION_QUALITY_LEVELS)}, got {self.quality!r}")
-        self.attention_schedule = parse_attention_schedule(self.attention_schedule)
-        absorb_attention_schedule_extra_args(self)
+        # Request dicts become params here (chat sampling_params_list, the process stage client),
+        # so a malformed schedule must surface as a client error (HTTP 400), not a TypeError.
+        try:
+            self.attention_schedule = parse_attention_schedule(self.attention_schedule)
+            absorb_attention_schedule_extra_args(self)
+        except (TypeError, ValueError) as exc:
+            raise InvalidAttentionScheduleError(str(exc)) from exc
 
     @property
     def batch_size(self):
