@@ -1141,6 +1141,82 @@ async def test_session_update_rejected_speed_keeps_previous_value() -> None:
     assert len([event for event in _websocket_events(websocket) if event["type"] == "session.updated"]) == 1
 
 
+@pytest.mark.asyncio
+async def test_session_update_rejects_mcp_tools() -> None:
+    websocket = _FakeWebSocket()
+    connection, _ = _make_connection(websocket=websocket)
+    update = types.SessionUpdateEvent(
+        event_id="evt_mcp",
+        type="session.update",
+        session=types.RealtimeSessionCreateRequest.model_validate(
+            {
+                "type": "realtime",
+                "tools": [
+                    {"type": "mcp", "server_label": "docs", "server_url": "https://mcp.example.com"},
+                ],
+            }
+        ),
+    )
+
+    await connection._handle_session_update(update)
+
+    error = next(msg for msg in _websocket_events(websocket) if msg["type"] == "error")
+    assert error["error"]["type"] == "invalid_request_error"
+    assert error["error"]["code"] == "unsupported_feature"
+    assert error["error"]["param"] == "session.tools"
+    assert error["error"]["message"] == "Remote MCP tools are not supported"
+    assert connection.session.config.tools is None
+
+
+@pytest.mark.asyncio
+async def test_session_update_rejects_mcp_tool_choice() -> None:
+    websocket = _FakeWebSocket()
+    connection, _ = _make_connection(websocket=websocket)
+    update = types.SessionUpdateEvent(
+        event_id="evt_mcp_choice",
+        type="session.update",
+        session=types.RealtimeSessionCreateRequest.model_validate(
+            {
+                "type": "realtime",
+                "tools": [{"type": "function", "name": "lookup", "parameters": {"type": "object"}}],
+                "tool_choice": {"type": "mcp", "server_label": "docs", "name": "search"},
+            }
+        ),
+    )
+
+    await connection._handle_session_update(update)
+
+    error = next(msg for msg in _websocket_events(websocket) if msg["type"] == "error")
+    assert error["error"]["code"] == "unsupported_feature"
+    assert error["error"]["param"] == "session.tool_choice"
+    assert connection.session.config.tool_choice is None
+
+
+@pytest.mark.asyncio
+async def test_response_create_rejects_mcp_tools() -> None:
+    websocket = _FakeWebSocket()
+    connection, _ = _make_connection(websocket=websocket)
+    event = types.ResponseCreateEvent.model_validate(
+        {
+            "type": "response.create",
+            "event_id": "evt_mcp_response",
+            "response": {
+                "tools": [
+                    {"type": "mcp", "server_label": "docs", "server_url": "https://mcp.example.com"},
+                ],
+            },
+        }
+    )
+
+    await connection._handle_response_create(event)
+
+    error = next(msg for msg in _websocket_events(websocket) if msg["type"] == "error")
+    assert error["error"]["type"] == "invalid_request_error"
+    assert error["error"]["code"] == "unsupported_feature"
+    assert error["error"]["param"] == "response.tools"
+    assert error["error"]["message"] == "Remote MCP tools are not supported"
+
+
 @pytest.mark.parametrize(
     ("audio_end_ms", "expected"),
     [(0, ""), (250, "0"), (500, "01"), (999, "012"), (1000, "0123")],

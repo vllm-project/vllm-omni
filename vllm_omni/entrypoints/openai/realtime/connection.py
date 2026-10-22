@@ -28,6 +28,9 @@ from openai.types.chat.chat_completion_content_part_image_param import ImageURL
 from openai.types.chat.chat_completion_content_part_input_audio_param import InputAudio
 from openai.types.realtime.realtime_audio_config_output import Voice
 from openai.types.realtime.realtime_audio_input_turn_detection import SemanticVad, ServerVad
+from openai.types.realtime.realtime_response_create_mcp_tool import RealtimeResponseCreateMcpTool
+from openai.types.realtime.realtime_tools_config_union import Mcp
+from openai.types.responses.tool_choice_mcp import ToolChoiceMcp
 from opentelemetry import context, trace
 from pydantic import TypeAdapter
 from vllm.entrypoints.openai.chat_completion.protocol import (
@@ -75,6 +78,8 @@ from vllm_omni.utils.speakers import (
 logger = init_logger(__name__)
 
 _CLIENT_EVENT_ADAPTER: TypeAdapter[types.RealtimeClientEvent] = TypeAdapter(types.RealtimeClientEvent)
+
+_MCP_UNSUPPORTED_MESSAGE = "Remote MCP tools are not supported"
 
 # The Realtime PCM contract is mono signed PCM16 at 24 kHz.
 SAMPLE_RATE_HZ = 24000
@@ -355,10 +360,7 @@ class OpenAIFullDuplexConnection:
         if sanitized.model != self.model_name:
             sanitized.model = previous.model
 
-        if sanitized.tools is not None:
-            sanitized.tools = [tool for tool in sanitized.tools if getattr(tool, "type", None) != "mcp"]
-        if getattr(sanitized.tool_choice, "type", None) == "mcp":
-            sanitized.tool_choice = previous.tool_choice
+        self._reject_mcp(sanitized, prefix="session")
 
         audio = sanitized.audio
         if audio is None:
@@ -484,15 +486,28 @@ class OpenAIFullDuplexConnection:
         return format_type in ("audio/pcm", "pcm16") and rate == SAMPLE_RATE_HZ
 
     @staticmethod
-    def _uses_mcp(config: Any) -> bool:
-        return (
-            any(getattr(tool, "type", None) == "mcp" for tool in (getattr(config, "tools", None) or []))
-            or getattr(getattr(config, "tool_choice", None), "type", None) == "mcp"
-        )
+    def _reject_mcp(
+        config: types.RealtimeSessionCreateRequest | types.RealtimeResponseCreateParams,
+        *,
+        prefix: str,
+    ) -> None:
+        """Reject remote MCP tools, which require server-side support we lack."""
+        if any(isinstance(tool, (Mcp, RealtimeResponseCreateMcpTool)) for tool in config.tools or ()):
+            raise _RealtimeRequestError(
+                _MCP_UNSUPPORTED_MESSAGE,
+                code="unsupported_feature",
+                param=f"{prefix}.tools",
+            )
+        if isinstance(config.tool_choice, ToolChoiceMcp):
+            raise _RealtimeRequestError(
+                _MCP_UNSUPPORTED_MESSAGE,
+                code="unsupported_feature",
+                param=f"{prefix}.tool_choice",
+            )
 
     async def _send_unsupported_mcp(self, event_id: str | None) -> None:
         await self._send_error(
-            "Remote MCP tools are not supported",
+            _MCP_UNSUPPORTED_MESSAGE,
             "unsupported_feature",
             event_id=event_id,
         )
@@ -697,19 +712,24 @@ class OpenAIFullDuplexConnection:
     # ------------------------------------------------------------------ #
 
     @staticmethod
-    def _resolve_tools_and_choice(s: AudioFullDuplexSessionState, response_cfg: Any):
+    def _resolve_tools_and_choice(
+        s: AudioFullDuplexSessionState,
+        response_cfg: types.RealtimeResponseCreateParams | None,
+    ):
         """Per-response overrides win over session.config, same pattern as
         output_modalities/max_output_tokens below."""
         tools = s.config.tools
-        if response_cfg is not None and getattr(response_cfg, "tools", None) is not None:
+        if response_cfg is not None and response_cfg.tools is not None:
             tools = response_cfg.tools
         tool_choice = s.config.tool_choice
-        if response_cfg is not None and getattr(response_cfg, "tool_choice", None) is not None:
+        if response_cfg is not None and response_cfg.tool_choice is not None:
             tool_choice = response_cfg.tool_choice
         return tools, tool_choice
 
-    def _resolve_response(self, response_cfg: Any) -> _ResolvedResponse:
+    def _resolve_response(self, response_cfg: types.RealtimeResponseCreateParams | None) -> _ResolvedResponse:
         s = self.session
+        if response_cfg is not None:
+            self._reject_mcp(response_cfg, prefix="response")
         tools, tool_choice = self._resolve_tools_and_choice(s, response_cfg)
         modalities = s.config.output_modalities
         max_output_tokens = s.config.max_output_tokens
@@ -726,11 +746,11 @@ class OpenAIFullDuplexConnection:
             if response_cfg.conversation == "none":
                 raise ValueError("Out-of-band responses are not supported")
             metadata = response_cfg.metadata
-            audio = getattr(response_cfg, "audio", None)
+            audio = response_cfg.audio
             unsupported = self._unsupported_audio_option(audio)
             if unsupported is not None:
                 raise ValueError(f"{unsupported} is not supported")
-            output = getattr(audio, "output", None) if audio is not None else None
+            output = audio.output if audio is not None else None
             if output is not None and not self._is_pcm16_24khz_format(getattr(output, "format", None)):
                 raise _UnsupportedAudioFormatError("Only 24 kHz PCM16 output audio is supported")
 
@@ -837,10 +857,6 @@ class OpenAIFullDuplexConnection:
     async def _handle_response_create(self, event: types.ResponseCreateEvent):
         s = self.session
         response_cfg = event.response
-
-        if response_cfg is not None and self._uses_mcp(response_cfg):
-            await self._send_unsupported_mcp(event.event_id)
-            return
 
         try:
             response = self._resolve_response(response_cfg)
