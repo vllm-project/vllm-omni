@@ -119,8 +119,9 @@ def test_packed_stream_noise_growth_preserves_prefix_and_global_rng():
 
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
 @pytest.mark.parametrize("fa_version", [2, 3])
+@pytest.mark.parametrize("chunk_size", [None, 50])
 @torch.inference_mode()
-def test_packed_stream_attention_matches_chunk_causal_reference(monkeypatch, fa_version):
+def test_packed_attention_matches_row_reference(monkeypatch, fa_version, chunk_size):
     require_packed_fa(monkeypatch, fa_version)
     from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.packed_dit import (
         build_row_attention,
@@ -128,10 +129,12 @@ def test_packed_stream_attention_matches_chunk_causal_reference(monkeypatch, fa_
         ragged_attention_tensor_geometry,
     )
 
-    # Row starts that are not multiples of 16 exercise FA2's page alignment.
-    lengths = [67, 103]
+    # Row starts that are not multiples of 16 exercise FA2's page alignment;
+    # full context exercises FA2's unpaged varlen and empty bucket slots.
+    lengths = [67, 0, 103]
     rows = pack_rows(lengths, torch.device("cuda"))
-    attention = build_row_attention(rows, heads=2, head_dim=64, fa_version=fa_version, chunk_size=50)
+    attention = build_row_attention(rows, heads=2, head_dim=64, fa_version=fa_version, chunk_size=chunk_size)
+    assert attention.paged is (fa_version == 3 or chunk_size is not None)
     generator = torch.Generator(device="cuda").manual_seed(7)
     q, k, v = [
         torch.randn(sum(lengths), 2, 64, device="cuda", dtype=torch.bfloat16, generator=generator) for _ in range(3)
@@ -141,8 +144,11 @@ def test_packed_stream_attention_matches_chunk_causal_reference(monkeypatch, fa_
     ).reshape(-1, 2, 64)
     start = 0
     for length in lengths:
+        if length == 0:
+            continue
         position = torch.arange(length, device="cuda")
-        mask = position[None, :] < ((position[:, None] // 50 + 1) * 50)
+        span = chunk_size or length
+        mask = position[None, :] < ((position[:, None] // span + 1) * span)
         expected = torch.nn.functional.scaled_dot_product_attention(
             q[start : start + length].transpose(0, 1).float(),
             k[start : start + length].transpose(0, 1).float(),

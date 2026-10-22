@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""CPU checks of the packed Flow attention metadata for FA3 and FA2 pages.
+"""CPU checks of the packed Flow attention metadata for FA3 and FA2.
 
-The kernels only run on CUDA; here a reference reads the paged KV exactly as
-the FlashAttention calls are configured, so the page table, KV gather index and
-query segments can be checked against chunk-causal attention on unpadded rows.
+The kernels only run on CUDA; here a reference reads the K/V exactly as the
+FlashAttention calls are configured (paged, or unpaged varlen for FA2 full
+context), so the page table, KV gather index and query segments can be checked
+against chunk-causal attention on unpadded rows.
 """
 
 import pytest
@@ -46,30 +47,31 @@ def test_attention_metadata_retains_live_graph_buffers(fa_version):
     assert graph_attention.page_size == (16 if fa_version == 2 else 1)
 
 
-def _paged_kv(x, attention):
-    """Lay packed K or V out as ``packed_fa2`` does (identity for FA3 pages)."""
-    return x.index_select(0, attention.slot_frames)
-
-
-def _segment_slots(attention, segment):
+def _segment_frames(attention, segment):
+    """Packed frames a segment's K/V reads, the way the kernel reads them."""
+    end = int(attention.cache_seqlens[segment])
+    if not attention.paged:
+        # Unpaged varlen: keys share the query offsets.
+        start = int(attention.cu_seqlens_q[segment])
+        return torch.arange(start, start + end)
     page_size = attention.page_size
     pages = attention.page_table[segment].long()
-    slots = (pages[:, None] * page_size + torch.arange(page_size)).flatten()
-    return slots[: int(attention.cache_seqlens[segment])]
+    slots = (pages[:, None] * page_size + torch.arange(page_size)).flatten()[:end]
+    # Paged K/V is the packed sequence gathered by slot_frames (see paged_kv).
+    return attention.slot_frames[slots]
 
 
 def _paged_attention(q, k, v, attention):
-    """Each query segment attends the KV prefix its page-table row maps."""
-    k_pages, v_pages = _paged_kv(k, attention), _paged_kv(v, attention)
+    """Each query segment attends the K/V frames its metadata maps."""
     offsets = attention.cu_seqlens_q.tolist()
     output = torch.zeros_like(q)
     for segment in range(attention.cache_seqlens.shape[0]):
         start, end = offsets[segment], offsets[segment + 1]
         if start == end:
             continue
-        slots = _segment_slots(attention, segment)
+        frames = _segment_frames(attention, segment)
         output[start:end] = F.scaled_dot_product_attention(
-            q[start:end].transpose(0, 1), k_pages[slots].transpose(0, 1), v_pages[slots].transpose(0, 1)
+            q[start:end].transpose(0, 1), k[frames].transpose(0, 1), v[frames].transpose(0, 1)
         ).transpose(0, 1)
     return output
 
@@ -112,13 +114,14 @@ def test_paged_attention_matches_isolated_row_attention(fa_version, chunk_size):
 def test_every_segment_reads_exactly_its_rows_frames(fa_version, chunk_size, lengths):
     rows, attention = _attention(lengths, fa_version, chunk_size)
     page_size = attention.page_size
-    slot_frames = attention.slot_frames
 
-    # Rows start on a page and waste less than one page each.
-    assert slot_frames.shape[0] == sum(-(-n // page_size) for n in lengths) * page_size
-    assert int(attention.page_table.max()) < slot_frames.shape[0] // page_size
-    # Slots past a row's end alias frame 0, so a segment must never read past
-    # its own row: each one reads exactly its row's frames, in order.
+    if attention.paged:
+        # Rows start on a page and waste less than one page each.
+        slot_frames = attention.slot_frames
+        assert slot_frames.shape[0] == sum(-(-n // page_size) for n in lengths) * page_size
+        assert int(attention.page_table.max()) < slot_frames.shape[0] // page_size
+    # Paged slots past a row's end alias frame 0, so a segment must never read
+    # past its own row: each one reads exactly its row's frames, in order.
     row_starts = rows.starts_host[:-1].long()
     segment_rows = []
     for row, length in enumerate(lengths):
@@ -127,8 +130,7 @@ def test_every_segment_reads_exactly_its_rows_frames(fa_version, chunk_size, len
     assert len(segment_rows) == attention.cache_seqlens.shape[0]
     for segment, row in enumerate(segment_rows):
         end = int(attention.cache_seqlens[segment])
-        frames = slot_frames[_segment_slots(attention, segment)]
-        assert torch.equal(frames, row_starts[row] + torch.arange(end))
+        assert torch.equal(_segment_frames(attention, segment), row_starts[row] + torch.arange(end))
 
 
 @pytest.mark.parametrize("chunk_size", [None, CHUNK])
@@ -169,6 +171,10 @@ def test_flow_graph_slot_buffer_covers_every_padded_layout(monkeypatch, seed):
             streaming = rng.random() < 0.5
             key, twin, seg_rows, seg_ends, _ = runner._layout(lengths, streaming)
             state = runner._allocate(key, noise, spks, time_span)
+            if fa_version == 2 and not streaming:
+                # Full-context FA2 graphs attend unpaged and keep no page buffers.
+                assert state.page_table is None and state.slot_frames is None
+                continue
             twin_rows = pack_rows(twin, torch.device("cpu"), width=state.frames.shape[0])
             page_table, slot_frames = page_metadata(
                 torch.tensor(twin),
@@ -199,7 +205,7 @@ def test_fa3_pages_are_the_packed_sequence_itself():
 
 
 def test_fa2_pages_round_up_while_geometry_keeps_the_bucketed_width():
-    rows, attention = _attention([5, 0, 37], fa_version=2, width=256)
+    rows, attention = _attention([5, 0, 37], fa_version=2, chunk_size=CHUNK, width=256)
 
     assert rows.width == 256
     assert attention.page_table.shape == (3, 16)
@@ -208,6 +214,24 @@ def test_fa2_pages_round_up_while_geometry_keeps_the_bucketed_width():
     # Row 2 starts on page 1 although it starts at packed frame 5.
     assert attention.page_table[2, :3].tolist() == [1, 2, 3]
     assert not attention.page_table[1].any()
+
+
+@pytest.mark.parametrize("width", [None, 256])
+def test_fa2_full_context_attends_unpaged_while_fa3_keeps_in_place_pages(width):
+    from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.packed_dit import attention_uses_pages
+
+    lengths = [5, 0, 37, 16]
+    _, fa2 = _attention(lengths, fa_version=2, width=width)
+    _, fa3 = _attention(lengths, fa_version=3, width=width)
+
+    # FA2 full context: one segment per row whose K/V span is its query span.
+    assert not fa2.paged and fa2.page_table is None and fa2.slot_frames is None
+    assert fa2.cache_seqlens.tolist() == lengths
+    assert fa2.cu_seqlens_q.tolist() == [0, 5, 5, 42, 58]
+    assert fa2.max_seqlen_q == 37
+    # FA3 keeps its one-frame pages, and chunk-causal segments stay paged on both.
+    assert fa3.paged
+    assert [attention_uses_pages(v, chunked) for v in (2, 3) for chunked in (False, True)] == [False, True, True, True]
 
 
 def test_rope_only_needs_a_width_covering_every_row():
