@@ -560,6 +560,7 @@ def run_benchmark(
     num_warmups: int = 2,
     benchmark_params_name: str | None = None,
     accuracy_baseline: dict[str, Any] | None = None,
+    experiment_metadata: dict[str, object] | None = None,
 ) -> dict[str, Any]:
     """Run one ``vllm bench serve --omni`` iteration and return parsed metrics.
 
@@ -675,6 +676,8 @@ def run_benchmark(
     result["test_name"] = test_name
     if benchmark_params_name:
         result["name"] = benchmark_params_name
+    if experiment_metadata is not None:
+        result["experiment_metadata"] = experiment_metadata
     with open(result_path, "w", encoding="utf-8") as f:
         json.dump(result, f, ensure_ascii=False, indent=2)
     if dataset_name == "omni-duplex-eval" and "--duplex-eval-evaluate" in args and accuracy_baseline is not None:

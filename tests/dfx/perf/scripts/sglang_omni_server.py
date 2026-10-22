@@ -34,6 +34,22 @@ def _executable() -> str:
     return shutil.which("sgl-omni") or "sgl-omni"
 
 
+def _installed_revision(executable: str) -> str | None:
+    # The server has its own environment; the benchmark client's distribution
+    # metadata describes vLLM and cannot identify the SGLang installation.
+    launcher = Path(shutil.which(executable) or executable)
+    direct_url = subprocess.check_output(
+        [
+            str(launcher.with_name("python3")),
+            "-c",
+            "from importlib.metadata import distribution; "
+            "print(distribution('sglang-omni').read_text('direct_url.json') or '{}')",
+        ],
+        text=True,
+    )
+    return json.loads(direct_url).get("vcs_info", {}).get("commit_id")
+
+
 def _serve_args(values: dict[str, Any]) -> list[str]:
     args: list[str] = []
     for key, value in values.items():
@@ -79,11 +95,15 @@ class SglangOmniServer:
         self.port = _open_port()
         self._args = config["serve_args"]
         self._env = config["env"]
+        self.server_revision: str | None = None
+        self.config_path = self._args[self._args.index("--config") + 1] if "--config" in self._args else None
         self._proc: subprocess.Popen[Any] | None = None
 
     def __enter__(self) -> SglangOmniServer:
+        executable = _executable()
+        self.server_revision = _installed_revision(executable)
         command = [
-            _executable(),
+            executable,
             "serve",
             "--model-path",
             self.model,

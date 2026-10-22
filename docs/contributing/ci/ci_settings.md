@@ -4,6 +4,9 @@ This document describes **where** Buildkite YAML lives in the repo, **how each p
 
 For CI levels (L1–L5) and triggers, see [Test System Overview](./test_system_overview.md). For test authoring, see [Test Writing Guide](./test_writing_guide.md). For running tests locally or replaying CI jobs, see [Test Execution Guide](./test_execution_guide.md).
 
+For the isolated SGLang-Omni schedule and reuse of daily vLLM-Omni results, see
+[Scheduled Backend Comparison](./backend_comparison.md).
+
 ## Directory layout
 
 Canonical layout (prefer these paths for new changes):

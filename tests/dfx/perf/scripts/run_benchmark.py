@@ -627,6 +627,38 @@ def test_performance_benchmark(omni_server, benchmark_params):
 
     resource_label = get_runtime_resource_label()
 
+    provenance = None
+    if SERVER_TYPE == "sglang-omni" and CONFIG_FILE_PATH:
+        from tests.dfx.perf.scripts.experiment_metadata import (
+            comparison_provenance,
+            configured_num_gpus,
+            resolved_workload,
+        )
+
+        provenance = comparison_provenance(
+            test_config=CONFIG_FILE_PATH,
+            server_config=omni_server.config_path,
+            server_revision=omni_server.server_revision,
+        )
+        provenance["num_gpus"] = configured_num_gpus(_config_for_test(test_name) or {})
+        provenance["num_gpus_source"] = "test_config.hardware_marks.num_cards"
+
+    def metadata_for_sweep(
+        num_prompts: int, num_warmups: int, request_rate: float | str, max_concurrency: int | None = None
+    ) -> dict[str, object] | None:
+        if provenance is None:
+            return None
+        return {
+            **provenance,
+            "workload": resolved_workload(
+                params,
+                num_prompts=num_prompts,
+                num_warmups=num_warmups,
+                request_rate=request_rate,
+                max_concurrency=max_concurrency,
+            ),
+        }
+
     def to_list(value, default=None):
         if value is None:
             return [] if default is None else [default]
@@ -708,6 +740,7 @@ def test_performance_benchmark(omni_server, benchmark_params):
     # QPS / request-rate sweep
     for sweep_index, (qps, num_prompt) in enumerate(zip(qps_list, num_prompt_list)):
         args = args + ["--request-rate", str(qps), "--num-prompts", str(num_prompt)]
+        num_warmups = _resolve_num_warmups(params, default=2)
         result = run_benchmark(
             args=args,
             test_name=test_name,
@@ -719,15 +752,17 @@ def test_performance_benchmark(omni_server, benchmark_params):
             random_input_len=params.get("random_input_len"),
             random_output_len=params.get("random_output_len"),
             resource_label=resource_label,
-            num_warmups=_resolve_num_warmups(params, default=2),
+            num_warmups=num_warmups,
             benchmark_params_name=params.get("name") if isinstance(params.get("name"), str) else None,
             accuracy_baseline=accuracy_baseline,
+            experiment_metadata=metadata_for_sweep(num_prompt, num_warmups, qps),
         )
         assert_result(result, {**params, **_aggregate_accuracy_params_for_test(test_name)}, num_prompt)
 
     # concurrency test
     for sweep_index, (concurrency, num_prompt) in enumerate(zip(max_concurrency_list, num_prompt_list)):
         args = args + ["--max-concurrency", str(concurrency), "--num-prompts", str(num_prompt), "--request-rate", "inf"]
+        num_warmups = _resolve_num_warmups(params, default=max(2, int(concurrency)))
         result = run_benchmark(
             args=args,
             test_name=test_name,
@@ -739,8 +774,9 @@ def test_performance_benchmark(omni_server, benchmark_params):
             random_input_len=params.get("random_input_len"),
             random_output_len=params.get("random_output_len"),
             resource_label=resource_label,
-            num_warmups=_resolve_num_warmups(params, default=max(2, int(concurrency))),
+            num_warmups=num_warmups,
             benchmark_params_name=params.get("name") if isinstance(params.get("name"), str) else None,
             accuracy_baseline=accuracy_baseline,
+            experiment_metadata=metadata_for_sweep(num_prompt, num_warmups, "inf", concurrency),
         )
         assert_result(result, {**params, **_aggregate_accuracy_params_for_test(test_name)}, num_prompt)
