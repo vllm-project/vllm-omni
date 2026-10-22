@@ -457,3 +457,63 @@ def test_ltx_audio_weight_loader_ignores_video_weights_and_loads_audio_weights(m
 
     assert loaded == {"audio_proj_in.weight"}
     torch.testing.assert_close(model.audio_proj_in.weight, replacement)
+
+
+def test_ltx_audio_graph_compile_keeps_standard_norms_in_graph_idempotently():
+    def rms_norm():
+        return nn.RMSNorm(8, eps=1e-6, elementwise_affine=True)
+
+    block = SimpleNamespace(
+        audio_norm1=rms_norm(),
+        audio_norm2=rms_norm(),
+        audio_norm3=rms_norm(),
+        audio_attn1=SimpleNamespace(norm_q=rms_norm(), norm_k=rms_norm()),
+        audio_attn2=SimpleNamespace(norm_q=rms_norm(), norm_k=rms_norm()),
+    )
+    model = SimpleNamespace(transformer_blocks=[block])
+    norms = (
+        block.audio_norm1,
+        block.audio_norm2,
+        block.audio_norm3,
+        block.audio_attn1.norm_q,
+        block.audio_attn1.norm_k,
+        block.audio_attn2.norm_q,
+        block.audio_attn2.norm_k,
+    )
+
+    LTX2AudioTransformerModel.prepare_audio_cuda_graph_compile(model)
+    prepared_forwards = tuple(norm.forward for norm in norms)
+    LTX2AudioTransformerModel.prepare_audio_cuda_graph_compile(model)
+
+    assert all(getattr(forward, "_ltx2_native_rms_norm", False) for forward in prepared_forwards)
+    assert all(not getattr(forward, "_torchdynamo_disable", False) for forward in prepared_forwards)
+    assert tuple(norm.forward for norm in norms) == prepared_forwards
+
+
+def test_ltx_audio_graph_compile_preserves_standard_norm_output():
+    norm = nn.RMSNorm(8, eps=1e-6, elementwise_affine=True)
+    hidden_states = torch.randn(2, 4, 8, dtype=torch.float32)
+    expected = norm(hidden_states)
+
+    ltx2_audio_transformer._prepare_rms_norm_for_compile(norm)
+
+    torch.testing.assert_close(norm(hidden_states), expected, rtol=0, atol=0)
+
+
+def test_ltx_audio_graph_compile_disables_nonstandard_norms_idempotently():
+    norm = nn.Identity()
+    block = SimpleNamespace(
+        audio_norm1=norm,
+        audio_norm2=norm,
+        audio_norm3=norm,
+        audio_attn1=SimpleNamespace(norm_q=norm, norm_k=norm),
+        audio_attn2=SimpleNamespace(norm_q=norm, norm_k=norm),
+    )
+    model = SimpleNamespace(transformer_blocks=[block])
+
+    LTX2AudioTransformerModel.prepare_audio_cuda_graph_compile(model)
+    disabled_forward = norm.forward
+    LTX2AudioTransformerModel.prepare_audio_cuda_graph_compile(model)
+
+    assert getattr(disabled_forward, "_torchdynamo_disable", False)
+    assert norm.forward == disabled_forward

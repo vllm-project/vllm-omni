@@ -70,7 +70,7 @@ def test_ltx_t2a_public_contract_is_audio_only():
     assert LTX2TextToAudioPipeline.support_audio_output
     assert not LTX2TextToAudioPipeline.support_image_input
     assert not hasattr(LTX2TextToAudioPipeline, "support_video_output")
-    assert LTX2TextToAudioPipeline.dummy_run_num_frames == 9
+    assert LTX2TextToAudioPipeline.dummy_run_num_frames == 0
 
 
 def test_ltx_t2a_setup_compile_prepares_norms_before_regional_compile(monkeypatch):
@@ -402,7 +402,7 @@ def test_ltx_t2a_checkpoint_metadata_selects_profile(tmp_path, monkeypatch):
     assert pipe.model_version == "2.5"
     assert pipe.component_profile is LTX25_T2A_COMPONENT_PROFILE
     assert pipe.pipeline_recipe is LTX25_T2A_RECIPE
-    assert not hasattr(pipe, "audio_graph_runner")
+    assert pipe.audio_graph_runner is None
 
 
 @pytest.mark.parametrize("cache_backend", ["cache_dit", "tea_cache"])
@@ -432,6 +432,48 @@ def test_ltx_t2a_foundation_rejects_distributed_execution(tp_size, sp_size):
         r"TP/SP execution is not supported for audio-only T2A",
     ):
         LTX2TextToAudioPipeline(od_config=od_config)
+
+
+def test_ltx_t2a_runtime_owns_configured_audio_graph_runner(tmp_path, monkeypatch):
+    from vllm_omni.diffusion.models.ltx2 import ltx2_audio_runtime
+
+    (tmp_path / "model_index.json").write_text(json.dumps({"model_version": "2.5"}))
+    transformer = torch.nn.Identity()
+
+    def stub_components(pipe, od_config):
+        pipe.od_config = od_config
+        pipe.device = torch.device("cuda")
+        pipe.transformer = transformer
+
+    monkeypatch.setattr(ltx2_audio_runtime, "get_local_device", lambda: torch.device("cuda"))
+    monkeypatch.setattr(ltx2_audio_runtime, "initialize_audio_pipeline_components", stub_components)
+    monkeypatch.setattr(LTX2TextToAudioPipeline, "setup_diffusion_pipeline_profiler", lambda *_args, **_kwargs: None)
+
+    od_config = SimpleNamespace(
+        model=str(tmp_path),
+        revision=None,
+        dtype=torch.bfloat16,
+        parallel_config=SimpleNamespace(
+            ulysses_mode="strict",
+            tensor_parallel_size=1,
+            sequence_parallel_size=1,
+        ),
+        cache_backend="none",
+        enable_cpu_offload=False,
+        enable_layerwise_offload=False,
+        enable_distributed_layerwise_offload=False,
+        quantization_config=None,
+        lora_path=None,
+        enable_diffusion_pipeline_profiler=False,
+        additional_config={"ltx2_audio_cuda_graph": {"enabled": True, "max_entries": 2}},
+    )
+
+    pipe = LTX2TextToAudioPipeline(od_config=od_config)
+
+    assert pipe.audio_graph_runner is not None
+    assert pipe.audio_graph_runner.transformer is transformer
+    assert pipe.audio_graph_runner.max_graphs == 2
+    assert pipe.audio_graph_runner.device == torch.device("cuda")
 
 
 def test_ltx_t2a_transformer_factory_projects_full_config_to_audio_only_model():

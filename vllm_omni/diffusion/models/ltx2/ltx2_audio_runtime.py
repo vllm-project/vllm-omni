@@ -9,6 +9,7 @@ import copy
 import math
 import os
 from collections.abc import Iterable
+from contextlib import nullcontext
 from dataclasses import replace
 from typing import ClassVar
 
@@ -20,6 +21,7 @@ from transformers import AutoTokenizer
 from vllm.logger import init_logger
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
+from vllm_omni.diffusion.compile import regionally_compile
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.parallel_state import (
@@ -43,6 +45,7 @@ from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPi
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
 from . import ltx2_latents as latent_ops
+from .ltx2_audio_cuda_graph import LTX2AudioCUDAGraphConfig, LTX2AudioCUDAGraphRunner
 from .ltx2_audio_transformer import LTX2AudioStaticConditioning
 from .ltx2_components import (
     LTXComponentProfile,
@@ -247,9 +250,9 @@ class LTXAudioRuntime(
     support_audio_output = True
     support_image_input = False
     supports_request_batch = False
-    # LTX's causal audio clock requires ``8 * k + 1`` frames; 9 is the
-    # smallest valid startup warmup shape.
-    dummy_run_num_frames: ClassVar[int] = 9
+    # CUDA Graphs are captured lazily from the first real request, so a full
+    # startup request only shifts capture latency and needlessly runs decoding.
+    dummy_run_num_frames: ClassVar[int] = 0
     connector_batches_cfg = False
     _default_audio_resource_limits: ClassVar[LTX2AudioResourceLimits] = LTX2AudioResourceLimits()
 
@@ -266,10 +269,13 @@ class LTXAudioRuntime(
             )
 
         additional_config = getattr(od_config, "additional_config", None)
+        self._audio_cuda_graph_config = LTX2AudioCUDAGraphConfig.from_additional_config(additional_config)
         self._audio_resource_limits = LTX2AudioResourceLimits.from_additional_config(additional_config)
         cache_backend = getattr(od_config, "cache_backend", "none")
         if cache_backend not in (None, "", "none"):
             raise ValueError(f"{type(self).__name__} does not support cache_backend={cache_backend!r}.")
+        if self._audio_cuda_graph_config.enabled:
+            self._validate_audio_cuda_graph_support(od_config, get_local_device())
 
         self.model_version = detect_ltx_model_version(
             od_config.model,
@@ -285,9 +291,71 @@ class LTXAudioRuntime(
 
         super().__init__()
         initialize_audio_pipeline_components(self, od_config)
+        self.audio_graph_runner = (
+            LTX2AudioCUDAGraphRunner(
+                self.transformer,
+                max_graphs=self._audio_cuda_graph_config.max_entries,
+                device=self.device,
+            )
+            if self._audio_cuda_graph_config.enabled
+            else None
+        )
         self.setup_diffusion_pipeline_profiler(
             enable_diffusion_pipeline_profiler=getattr(od_config, "enable_diffusion_pipeline_profiler", False)
         )
+
+    @staticmethod
+    def _validate_audio_cuda_graph_support(od_config: OmniDiffusionConfig, device: torch.device) -> None:
+        errors: list[str] = []
+        if device.type != "cuda":
+            errors.append("device must be CUDA")
+        if od_config.dtype != torch.bfloat16:
+            errors.append("dtype must be bfloat16")
+        if od_config.enable_cpu_offload:
+            errors.append("CPU offload is unsupported")
+        if od_config.enable_layerwise_offload:
+            errors.append("layerwise offload is unsupported")
+        if getattr(od_config, "enable_distributed_layerwise_offload", False):
+            errors.append("distributed layerwise offload is unsupported")
+        if od_config.quantization_config is not None:
+            errors.append("quantization is unsupported")
+        if od_config.lora_path is not None:
+            errors.append("LoRA is unsupported")
+        if errors:
+            raise ValueError("LTX2 audio CUDA Graph configuration is unsupported: " + "; ".join(errors))
+
+    def setup_audio_cuda_graph_compile(self) -> None:
+        """Regionally compile the Transformer with eager-compatible BF16 numerics."""
+        runner = self.audio_graph_runner
+        if runner is None:
+            return
+
+        try:
+            self.transformer.prepare_audio_cuda_graph_compile()
+            self.transformer = regionally_compile(
+                self.transformer,
+                dynamic=self.od_config.diffusion_compile_dynamic,
+                options={
+                    "emulate_precision_casts": True,
+                    "triton.cudagraphs": False,
+                    "triton.cudagraph_trees": False,
+                },
+            )
+        except Exception as exc:
+            logger.warning("LTX2 audio compile failed; using eager CUDA Graph: %s", exc)
+            return
+        finally:
+            runner.transformer = self.transformer
+
+        logger.info(
+            "LTX2 audio CUDA Graph enabled (compiled, max_entries=%d)",
+            self._audio_cuda_graph_config.max_entries,
+        )
+
+    def release_captured_graphs(self) -> None:
+        """Synchronously release captured audio graphs while retaining the runner."""
+        if self.audio_graph_runner is not None:
+            self.audio_graph_runner.clear()
 
     @property
     def guidance_scale(self):
@@ -570,17 +638,28 @@ class LTXAudioRuntime(
         )
         perturbation_mask = perturbations.get("audio_self_attention_mask")
         stg_blocks = perturbations.get("audio_self_attention_blocks")
-        with self.progress_bar(total=len(timesteps)) as progress_bar:
+        audio_graph_runner = getattr(self, "audio_graph_runner", None)
+        graph_request_scope = audio_graph_runner.request_scope() if audio_graph_runner is not None else nullcontext()
+
+        with graph_request_scope, self.progress_bar(total=len(timesteps)) as progress_bar:
             for index, timestep in enumerate(timesteps):
                 if self.interrupt:
                     continue
-                model_input = _repeat_batch(audio_latents, model_pass_count).to(model_dtype)
+                if audio_graph_runner is None:
+                    model_input = _repeat_batch(audio_latents, model_pass_count).to(model_dtype)
+                    model_input_repeats = 1
+                else:
+                    # Broadcast directly into the graph's CFG-sized static
+                    # input buffer instead of materializing a repeated tensor.
+                    model_input = audio_latents.to(model_dtype)
+                    model_input_repeats = model_pass_count
                 model_batch_size = encoder_hidden_states.shape[0]
                 expanded_timestep = timestep.expand(model_batch_size)
                 model_timestep = expanded_timestep[:, None].expand(-1, model_input.shape[1])
                 model_sigma = audio_scheduler.sigmas[index].expand(model_batch_size)
                 velocity = self._run_audio_transformer(
                     audio_hidden_states=model_input,
+                    audio_hidden_states_repeats=model_input_repeats,
                     audio_encoder_hidden_states=encoder_hidden_states,
                     audio_timestep=model_timestep,
                     audio_sigma=model_sigma,
@@ -590,6 +669,11 @@ class LTXAudioRuntime(
                     audio_static_conditioning=audio_static_conditioning,
                 )
                 if guidance_parallel_ready:
+                    # Guidance collectives may consume their inputs on a
+                    # communication stream after this Python call returns. Do
+                    # not expose graph-owned output storage across that stream.
+                    if audio_graph_runner is not None:
+                        velocity = velocity.clone()
                     local_slots = velocity.chunk(model_pass_count)
                     group = get_guidance_parallel_group()
                     gathered_slots = [group.all_gather(value, separate_tensors=True) for value in local_slots]
@@ -622,6 +706,7 @@ class LTXAudioRuntime(
         self,
         *,
         audio_hidden_states: torch.Tensor,
+        audio_hidden_states_repeats: int = 1,
         audio_encoder_hidden_states: torch.Tensor,
         audio_timestep: torch.Tensor,
         audio_sigma: torch.Tensor,
@@ -630,7 +715,22 @@ class LTXAudioRuntime(
         stg_blocks,
         audio_static_conditioning: LTX2AudioStaticConditioning | None,
     ) -> torch.Tensor:
-        """Run one normalized audio Transformer invocation."""
+        """Run one normalized audio Transformer invocation eagerly or by graph."""
+        audio_graph_runner = getattr(self, "audio_graph_runner", None)
+        if audio_graph_runner is not None:
+            return audio_graph_runner(
+                audio_hidden_states=audio_hidden_states,
+                audio_hidden_states_repeats=audio_hidden_states_repeats,
+                audio_encoder_hidden_states=audio_encoder_hidden_states,
+                audio_timestep=audio_timestep,
+                audio_sigma=audio_sigma,
+                audio_coords=audio_coords,
+                audio_attention_mask=audio_attention_mask,
+                perturbation_mask=perturbation_mask,
+                stg_blocks=stg_blocks,
+                audio_static_conditioning=audio_static_conditioning,
+            )
+
         attention_kwargs = {}
         if perturbation_mask is not None:
             attention_kwargs["ltx_perturbation_kwargs"] = {
@@ -640,6 +740,8 @@ class LTXAudioRuntime(
         transformer_kwargs = {}
         if audio_static_conditioning is not None:
             transformer_kwargs["audio_static_conditioning"] = audio_static_conditioning
+        if audio_hidden_states_repeats != 1:
+            audio_hidden_states = _repeat_batch(audio_hidden_states, audio_hidden_states_repeats)
         return self.transformer(
             audio_hidden_states=audio_hidden_states,
             audio_encoder_hidden_states=audio_encoder_hidden_states,
