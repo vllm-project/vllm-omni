@@ -13,6 +13,8 @@ from typing import TYPE_CHECKING, ClassVar
 
 import torch
 
+from vllm_omni.diffusion.attention.ops.block_sparse import require_fastvideo_sparse, resolve_block_sparse_provider
+from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.sched.sigma_schedule import DMD2SigmaSchedule
 from vllm_omni.errors import OmniClientError
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
@@ -155,12 +157,6 @@ class FastH3CheckpointSpec:
 
     def _resolve_vsa_provider(self, spec: AttentionSpec, dtype: torch.dtype) -> None:
         """Resolve the sparse provider and precision ``spec`` runs with on this worker's device and tile."""
-        from vllm_omni.diffusion.attention.ops.block_sparse import (
-            require_fastvideo_sparse,
-            resolve_block_sparse_provider,
-        )
-        from vllm_omni.diffusion.distributed.utils import get_local_device
-
         provider = resolve_block_sparse_provider(
             spec.fastvideo_vsa_provider,
             spec.fastvideo_vsa_precision,
