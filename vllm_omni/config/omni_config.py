@@ -914,7 +914,6 @@ class _DiffusionConfigProjection(_TrackExplicitConfigFields):
     enable_stage_verification: bool = True
     prompt_file_path: str | None = None
     quantization_config: _QuantizationConfigType = None
-    linear_backend: str = "auto"
     # Pipeline-wide weight transfer deploy field (RL training). Kept as a raw
     # dict across the projection boundary; the diffusion worker converts it
     # to the typed upstream ``WeightTransferConfig`` when building its
