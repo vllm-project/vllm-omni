@@ -45,10 +45,11 @@ def minimax_h3_publish_denoise_progress(
 ) -> None:
     """Publish denoise progress for step-gated attention features.
 
-    Both execution modes must publish the same trio: the step index drives the
+    Both execution modes must publish the same four values: the step index drives the
     dense warmup of RAINFUSION_ATTN, the normalized descending timestep
     drives the TRTLLM_ATTN skip gate (which stays dense while it is unset),
-    and the total step count enables the ``end_step`` tail fallback.
+    the total step count enables the ``end_step`` tail fallback, and the
+    video sigma selects the profile when sigma windows are bound.
     """
     set_forward_context_denoise_step_idx(step)
     # H3's shifted rectified-flow video sigma is already normalized noise; only bound sigma windows read it.

@@ -721,8 +721,9 @@ class Wan22Pipeline(
                     step_idx,
                     t,
                     total_steps=total_steps,
-                    # DMD bypasses set_timesteps; its fixed flow timesteps are
-                    # sigma * num_train_timesteps, not scheduler.sigmas.
+                    # DMD bypasses set_timesteps, and its fixed timesteps are not on the
+                    # scheduler's sigma grid. Publish t / num_train_timesteps; the grid sigma
+                    # the step uses differs from it by less than 3e-4.
                     normalized_sigma=(
                         float(t) / self.scheduler.config.num_train_timesteps
                         if self.is_dmd and sigma_scheduled
