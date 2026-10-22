@@ -131,15 +131,34 @@ class FastH3CheckpointSpec:
             raise ValueError(
                 f"{self.name} pins VSA sparsity={self.vsa_sparsity}; remove the fixed fastvideo_vsa_topk override"
             )
+        # Warm-up runs only the base, so each scheduled VSA profile is resolved here on this checkpoint's tile.
         for name, spec in _scheduled_vsa_specs(od_config):
             if spec.fastvideo_vsa_topk is not None:
                 raise ValueError(
                     f"{self.name} pins VSA sparsity={self.vsa_sparsity}; remove the fixed fastvideo_vsa_topk "
                     f"override from attention schedule profile {name!r}"
                 )
+            try:
+                self._resolve_vsa_provider(spec, od_config)
+            except (ImportError, ValueError) as exc:
+                raise ValueError(f"{self.name} cannot run attention schedule profile {name!r}: {exc}") from exc
         parallel = od_config.parallel_config
         if parallel.ring_degree != 1 or parallel.allgather_degree != 1:
             raise ValueError(f"{self.name} supports local attention or pure Ulysses sequence parallelism")
+
+    def _resolve_vsa_provider(self, spec: AttentionSpec, od_config: OmniDiffusionConfig) -> None:
+        """Resolve the sparse provider and precision ``spec`` runs with on this worker's device and tile."""
+        from vllm_omni.diffusion.attention.ops.block_sparse import resolve_block_sparse_provider
+        from vllm_omni.diffusion.distributed.utils import get_local_device
+
+        resolve_block_sparse_provider(
+            spec.fastvideo_vsa_provider,
+            spec.fastvideo_vsa_precision,
+            get_local_device(),
+            od_config.dtype,
+            128,
+            block_size=self.vsa_tile_size,
+        )
 
     def check_request(self, sampling: OmniDiffusionSamplingParams, *, step_execution: bool = False) -> None:
         if step_execution:
@@ -185,26 +204,9 @@ class FastH3OmniCheckpointSpec(FastH3CheckpointSpec):
 
     def check_serving_contract(self, *, partition: str, od_config: OmniDiffusionConfig) -> None:
         super().check_serving_contract(partition=partition, od_config=od_config)
-        from vllm_omni.diffusion.attention.ops.block_sparse import resolve_block_sparse_provider
-        from vllm_omni.diffusion.distributed.utils import get_local_device
-
         attention, _ = od_config.diffusion_attention_config.resolve_with_source("self")
         assert attention is not None  # The base contract requires an explicit VSA spec.
-        # A scheduled VSA profile runs the same tile128 kernel at its steps, so it is checked the same way.
-        for profile, spec in [(None, attention), *_scheduled_vsa_specs(od_config)]:
-            try:
-                resolve_block_sparse_provider(
-                    spec.fastvideo_vsa_provider,
-                    spec.fastvideo_vsa_precision,
-                    get_local_device(),
-                    od_config.dtype,
-                    128,
-                    block_size=self.vsa_tile_size,
-                )
-            except (ImportError, ValueError) as exc:
-                if profile is None:
-                    raise
-                raise ValueError(f"{self.name} cannot run attention schedule profile {profile!r}: {exc}") from exc
+        self._resolve_vsa_provider(attention, od_config)
 
     @classmethod
     def from_metadata(cls, metadata: Mapping[str, object]) -> FastH3OmniCheckpointSpec:
