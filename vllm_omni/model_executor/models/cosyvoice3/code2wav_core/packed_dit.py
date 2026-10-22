@@ -947,7 +947,6 @@ class FlowGraphRunner:
         channels = noise.shape[-1]
         rows = 2 * (slots + 1)
         backend = self.estimator.backend
-        page_size = PAGE_SIZE.get(backend, 1)
         page_table = slot_frames = flashinfer = None
         if backend == "flashinfer":
             chunk = self.estimator.dit.static_chunk_size
@@ -960,6 +959,7 @@ class FlowGraphRunner:
                 graph_capacity=(segments, paged_index_capacity(padded_total, chunk) if streaming else 0),
             )
         if attention_uses_pages(backend, streaming):
+            page_size = PAGE_SIZE[backend]
             page_table = torch.zeros((segments, -(-padded_total // page_size)), device=device, dtype=torch.int32)
             # Each row wastes less than one page: a static bound on the slots.
             slot_frames = torch.zeros(

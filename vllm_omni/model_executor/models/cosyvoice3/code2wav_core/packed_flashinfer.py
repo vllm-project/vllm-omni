@@ -69,6 +69,7 @@ class FlashInferRowPlan:
         import flashinfer
 
         self.heads, self.head_dim, self.dtype, self.chunked = heads, head_dim, dtype, chunked
+        self.device = device
         float_workspace, int_workspace = _workspace(device)
         graph = graph_capacity is not None
         buffers = {}
@@ -106,8 +107,10 @@ class FlashInferRowPlan:
         """Plan segment ``s``: queries ``offsets[s]:offsets[s + 1]`` attend the
         first ``segment_ends[s]`` frames of row ``segment_rows[s]``."""
         qo_indptr = torch.tensor(offsets, dtype=torch.int32)
-        # Without split-KV, graph replays and ordinary solves reduce in the
-        # same order; packed Flow batches already fill the GPU with segments.
+        # Packed Flow batches already fill the GPU with segments, so split-KV
+        # only adds a merge pass. Graph plans still size query tiles for their
+        # worst-case layout, so replays may reduce in another order than
+        # ordinary solves.
         common = dict(causal=False, q_data_type=self.dtype, disable_split_kv=True)
         if not self.chunked:
             # Full context: each segment's K/V span is its query span.
@@ -120,6 +123,10 @@ class FlashInferRowPlan:
         # Segment s reads frames row_start .. row_start + end of the packing.
         shift = row_starts[torch.tensor(segment_rows, dtype=torch.long)] - kv_indptr[:-1]
         indices = torch.arange(int(kv_indptr[-1]), dtype=torch.int32) + shift.repeat_interleave(ends.long())
+        if self.device.type == "cuda":
+            # FlashInfer copies host indices into a graph's buffer synchronously,
+            # which would drain the stream before every re-plan.
+            indices = indices.pin_memory().to(self.device, non_blocking=True)
         last_page_len = torch.ones(len(segment_ends), dtype=torch.int32)
         self.wrapper.plan(
             qo_indptr, kv_indptr, indices, last_page_len, self.heads, self.heads, self.head_dim, 1, **common

@@ -297,6 +297,26 @@ def test_packed_backend_rejects_unknown_pins(monkeypatch, fake_gpu):
         fake_gpu[0].cosyvoice3_packed_attention_backend()
 
 
+@pytest.mark.parametrize("capability, expected", [((7, 5), False), ((8, 0), True), ((12, 0), True)])
+def test_flashinfer_pin_keeps_the_stock_flow_below_sm80(monkeypatch, capability, expected):
+    import vllm_omni.model_executor.models.cosyvoice3.runtime as runtime
+
+    find_spec = runtime.importlib.util.find_spec
+    monkeypatch.setattr(
+        runtime.importlib.util, "find_spec", lambda name: object() if name == "flashinfer" else find_spec(name)
+    )
+    monkeypatch.setattr(runtime.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(runtime.torch.cuda, "get_device_capability", lambda: capability)
+    monkeypatch.setenv("COSYVOICE3_PACKED_ATTENTION_BACKEND", "flashinfer")
+    monkeypatch.setenv("COSYVOICE3_FULL_RESPONSE_OPTIMIZATIONS", "1")
+    runtime._flashinfer_supported.cache_clear()
+    try:
+        assert runtime.cosyvoice3_packed_attention_backend() == ("flashinfer" if expected else None)
+        assert runtime.cosyvoice3_full_response_enabled() is expected
+    finally:
+        runtime._flashinfer_supported.cache_clear()
+
+
 def test_packed_profiles_stay_off_without_cuda(monkeypatch):
     import vllm_omni.model_executor.models.cosyvoice3.runtime as runtime
 

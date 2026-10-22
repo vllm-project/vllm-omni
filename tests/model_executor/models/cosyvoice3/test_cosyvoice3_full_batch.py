@@ -174,6 +174,35 @@ def test_packed_attention_matches_row_reference(monkeypatch, backend, chunk_size
 
 
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
+@pytest.mark.parametrize("graph", [False, True])
+def test_flashinfer_chunk_plan_hands_kv_indices_over_on_the_device(monkeypatch, graph):
+    require_packed_backend(monkeypatch, "flashinfer")
+    from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.packed_dit import row_segments
+    from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.packed_flashinfer import (
+        FlashInferRowPlan,
+        paged_index_capacity,
+    )
+
+    lengths = [67, 0, 103]
+    segments = row_segments(lengths, 50)
+    capacity = (len(segments[1]), paged_index_capacity(sum(lengths), 50)) if graph else None
+    plan = FlashInferRowPlan(
+        torch.device("cuda"), heads=2, head_dim=64, dtype=torch.bfloat16, chunked=True, graph_capacity=capacity
+    )
+    planned = []
+    wrapper_plan = plan.wrapper.plan
+
+    def record(*args, **kwargs):
+        planned.append(args[2])
+        return wrapper_plan(*args, **kwargs)
+
+    monkeypatch.setattr(plan.wrapper, "plan", record)
+    plan.plan(lengths, *segments)
+    # FlashInfer copies host indices into a graph's buffer synchronously.
+    assert planned[0].is_cuda and planned[0].dtype == torch.int32
+
+
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
 @pytest.mark.parametrize("backend", PACKED_BACKENDS)
 @torch.inference_mode()
 def test_packed_stream_mixed_finalization_and_ragged_requests_stay_aligned(monkeypatch, backend):

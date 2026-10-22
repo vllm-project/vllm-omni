@@ -47,8 +47,13 @@ def _fa_version_supported(version: int) -> bool:
 
 
 @cache
-def _flashinfer_available() -> bool:
-    return importlib.util.find_spec("flashinfer") is not None
+def _flashinfer_supported() -> bool:
+    # Same sm80 floor as FA2 (FlashInfer has no BF16 prefill below it), so a
+    # pin on an older GPU keeps the stock Flow fallback instead of failing at
+    # the first request.
+    if importlib.util.find_spec("flashinfer") is None:
+        return False
+    return torch.cuda.get_device_capability() >= (8, 0)
 
 
 PACKED_ATTENTION_BACKENDS = ("fa3", "fa2", "flashinfer")
@@ -56,7 +61,7 @@ PACKED_ATTENTION_BACKENDS = ("fa3", "fa2", "flashinfer")
 
 def _backend_supported(backend: str) -> bool:
     if backend == "flashinfer":
-        return _flashinfer_available()
+        return _flashinfer_supported()
     return _fa_version_supported(int(backend[2]))
 
 
