@@ -1425,7 +1425,8 @@ def test_forward_rejects_an_attention_schedule_with_request_scoped_cache_dit(mon
     # Without a schedule, or with the request disabling it, Cache-DiT is prepared.
     pipeline.forward(_t2va_batch(num_inference_steps=4, quality="high"))
     pipeline.forward(_t2va_batch(num_inference_steps=4, attention_schedule=[], quality="high"))
-    assert [spec.installation_key for spec in runtime.prepared] == [MINIMAX_H3_HIGH_CACHE_KEY] * 2
+    prepared_keys = [None if spec is None else spec.installation_key for spec in runtime.prepared]
+    assert prepared_keys == [MINIMAX_H3_HIGH_CACHE_KEY] * 2
     assert len(diffuse_calls) == 2
 
 

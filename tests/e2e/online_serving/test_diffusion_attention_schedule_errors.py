@@ -88,8 +88,8 @@ def _generate(server: OmniServer, extra_params: dict | None = None) -> requests.
 
 def _chat(server: OmniServer, schedule, *, in_extra_body: bool) -> requests.Response:
     """Send the schedule in ``extra_args`` at the request root or inside ``extra_body``."""
-    extra_body = {"height": 64, "width": 64, "num_inference_steps": 2, "seed": 1}
-    body = {"messages": [{"role": "user", "content": "a cat"}], "extra_body": extra_body}
+    extra_body: dict[str, object] = {"height": 64, "width": 64, "num_inference_steps": 2, "seed": 1}
+    body: dict[str, object] = {"messages": [{"role": "user", "content": "a cat"}], "extra_body": extra_body}
     (extra_body if in_extra_body else body)["extra_args"] = {"attention_schedule": schedule}
     return requests.post(
         f"http://{server.host}:{server.port}/v1/chat/completions",
