@@ -231,11 +231,14 @@ class SharedMemoryConnector(OmniConnectorBase):
     orphan candidate for the sweep.
 
     ``_pending_keys`` is this connector instance's process-local record of
-    keys it has put, kept for later cleanup: ``put()`` registers them,
-    successful reads and explicit cleanup pop them (cleanup pops even when
-    the segment cleanup failed), and ``reap_consumed()`` rotates the
-    window it inspects.  It is bookkeeping for this instance — not an
-    authority on segment existence, and not a crash-recovery log.
+    keys it has put, kept for later cleanup: ``put()`` registers them, and
+    explicit cleanup pops them (even when the segment cleanup failed).  A
+    successful key-path read pops defensively on the reading instance — in
+    production that is the receiver, whose record never held the key, so
+    the producer's record is instead dropped when ``reap_consumed()`` sees
+    the segment gone, or drained by ``close()``.  It is bookkeeping for
+    this instance — not an authority on segment existence, and not a
+    crash-recovery log.
     """
 
     def get_with_deadline(self, from_stage, to_stage, get_key, metadata=None, *, deadline):
