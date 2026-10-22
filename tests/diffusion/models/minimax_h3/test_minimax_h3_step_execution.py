@@ -19,6 +19,7 @@ from tests.diffusion.models.minimax_h3.test_minimax_h3_quantization import _Fake
 from vllm_omni.diffusion.attention import layer
 from vllm_omni.diffusion.attention.backends.fastvideo_vsa import FastVideoVSABackend
 from vllm_omni.diffusion.attention.backends.sdpa import SDPABackend
+from vllm_omni.diffusion.attention.backends.vdnh3_attn import VDNAttentionBackend
 from vllm_omni.diffusion.attention.parallel.base import NoParallelAttention
 from vllm_omni.diffusion.attention.schedule import AttentionScheduleRange
 from vllm_omni.diffusion.forward_context import (
@@ -915,23 +916,37 @@ def _schedule_candidate(name: str, *, mask_free=False, prefix_kv_slicing=False, 
     return _make_metadata_candidate(_Backend)
 
 
+def _small_dit(monkeypatch, baseline) -> h3.MiniMaxH3DiTModel:
+    """A small CPU MiniMax H3 DiT whose blocks use real Attention layers resolved to ``baseline``."""
+    for name in ("ColumnParallelLinear", "MergedColumnParallelLinear", "QKVParallelLinear", "RowParallelLinear"):
+        monkeypatch.setattr(h3, name, _FakeLinear)
+    monkeypatch.setattr(h3, "get_tensor_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(layer, "get_current_diffusion_config_or_none", lambda: None)
+    monkeypatch.setattr(layer, "build_parallel_attention_strategy", lambda **kwargs: NoParallelAttention())
+    monkeypatch.setattr(layer, "get_attn_backend_for_role", lambda **kwargs: (baseline, None))
+    model = h3.MiniMaxH3DiTModel(_small_od_config())
+    attention = [block.attn.attention for block in model.blocks]
+    assert all(isinstance(a, layer.Attention) and a.attn_backend is baseline for a in attention)
+    return model
+
+
+def _candidate_rejections(attention: layer.Attention, record) -> list[str]:
+    return [reason for check in attention._schedule_candidate_checks if (reason := check(record)) is not None]
+
+
 def test_vdn_attention_accepts_only_vdnh3_candidates(monkeypatch):
     """VDN-H3 checkpoints read the frame window only in VDNH3_ATTN, so other profiles are rejected at startup."""
-    checks: list = []
-    attention = SimpleNamespace(
-        attn_backend=SimpleNamespace(get_name=lambda: "VDNH3_ATTN"),
-        add_schedule_candidate_check=checks.append,
-    )
-    owner = SimpleNamespace(
-        attention=attention, _gate_hidden_size=8, total_num_heads=2, head_dim=4, _gate_quant_config=None, _prefix="b0"
-    )
-    owner.add_schedule_candidate_check = lambda check: h3.MiniMaxH3Attention.add_schedule_candidate_check(owner, check)
     monkeypatch.setattr(h3, "VDNH3HybridAttention", lambda *args, **kwargs: object())
+    model = _small_dit(monkeypatch, VDNAttentionBackend)
 
-    h3.MiniMaxH3Attention.enable_vdn(owner, config=None)
+    model.enable_vdn(config=None)
 
-    assert [check(_schedule_candidate("VDNH3_ATTN")) for check in checks] == [None]
-    assert "VDNH3_ATTN" in checks[0](_schedule_candidate("FLASH_ATTN"))
+    vdn = _schedule_candidate("VDNH3_ATTN", mask_free=True)
+    flash = _schedule_candidate("FLASH_ATTN", mask_free=True)
+    for attention in (block.attn.attention for block in model.blocks):
+        assert _candidate_rejections(attention, vdn) == []
+        [reason] = _candidate_rejections(attention, flash)
+        assert "VDNH3_ATTN" in reason
 
 
 def test_gateless_dit_accepts_a_vsa_candidate_when_its_baseline_is_vsa(monkeypatch):
@@ -940,33 +955,22 @@ def test_gateless_dit_accepts_a_vsa_candidate_when_its_baseline_is_vsa(monkeypat
     Its self role still resolves to FASTVIDEO_VSA, which the FastH3 VSA contract requires, so one self-role
     profile is checked on both DiTs. The DiTs use real Attention layers, whose baseline the check reads.
     """
-    for name in ("ColumnParallelLinear", "MergedColumnParallelLinear", "QKVParallelLinear", "RowParallelLinear"):
-        monkeypatch.setattr(h3, name, _FakeLinear)
-    monkeypatch.setattr(h3, "get_tensor_model_parallel_world_size", lambda: 1)
-    monkeypatch.setattr(layer, "get_current_diffusion_config_or_none", lambda: None)
-    monkeypatch.setattr(layer, "build_parallel_attention_strategy", lambda **kwargs: NoParallelAttention())
 
     def dit_attention(baseline, *, gated: bool):
-        monkeypatch.setattr(layer, "get_attn_backend_for_role", lambda **kwargs: (baseline, None))
-        model = h3.MiniMaxH3DiTModel(_small_od_config())
+        model = _small_dit(monkeypatch, baseline)
         if gated:
             model.enable_vsa_gates()
-        attention = [block.attn.attention for block in model.blocks]
-        assert all(isinstance(a, layer.Attention) and a.attn_backend is baseline for a in attention)
-        return attention
-
-    def rejections(attention, record) -> list[str]:
-        return [reason for check in attention._schedule_candidate_checks if (reason := check(record)) is not None]
+        return [block.attn.attention for block in model.blocks]
 
     gated = dit_attention(FastVideoVSABackend, gated=True)
     gateless = dit_attention(FastVideoVSABackend, gated=False)
 
     # One self-role profile covers both DiTs, so it has to pass on each of them.
     vsa = _schedule_candidate("FASTVIDEO_VSA", mask_free=True)
-    assert all(rejections(attention, vsa) == [] for attention in gated + gateless)
+    assert all(_candidate_rejections(attention, vsa) == [] for attention in gated + gateless)
     # The gated FastH3 DiT still accepts only FASTVIDEO_VSA.
     sdpa = _schedule_candidate("SDPA", attention_mask=True)
-    assert all(any("FastH3" in reason for reason in rejections(a, sdpa)) for a in gated)
+    assert all(any("FastH3" in reason for reason in _candidate_rejections(a, sdpa)) for a in gated)
     # A gateless DiT on another baseline still rejects the VSA candidate.
     dense = dit_attention(SDPABackend, gated=False)
-    assert all(any("VSA compression gate" in reason for reason in rejections(a, vsa)) for a in dense)
+    assert all(any("VSA compression gate" in reason for reason in _candidate_rejections(a, vsa)) for a in dense)
