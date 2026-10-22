@@ -16,6 +16,7 @@ from vllm_omni.diffusion.attention.backends.abstract import (
 )
 from vllm_omni.diffusion.attention.schedule import (
     AttentionSchedule,
+    InvalidAttentionScheduleError,
     normalized_sigma,
     require_attention_schedule_fits,
     select_attention_profile,
@@ -551,7 +552,15 @@ class DenoiseProgressMixin:
         sigmas = getattr(scheduler, "sigmas", None)
         if sigmas is None or step_idx >= len(sigmas):
             return None
-        return normalized_sigma(float(sigmas[step_idx]), float(sigmas[0]))
+        try:
+            return normalized_sigma(float(sigmas[step_idx]), float(sigmas[0]))
+        except ValueError as exc:
+            # Wan2.2 T2V, TI2V and I2V build these sigmas from the request's flow_shift, so sigmas that
+            # cannot be normalized into [0, 1] are a client error.
+            raise InvalidAttentionScheduleError(
+                "attention sigma windows cannot select a profile from this request's scheduler sigmas; "
+                f"check flow_shift: {exc}"
+            ) from exc
 
 
 def set_forward_context_ref_latent(ref_latent: torch.Tensor | None) -> None:
