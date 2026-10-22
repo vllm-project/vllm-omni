@@ -10,6 +10,7 @@ from pytest_mock import MockerFixture
 
 from vllm_omni.utils.speakers import (
     get_supported_speakers_from_hf_config,
+    set_prompt_speaker,
     validate_requested_speaker,
 )
 
@@ -50,6 +51,20 @@ def test_validate_requested_speaker_rejects_invalid_value_with_supported_list():
 def test_validate_requested_speaker_skips_validation_when_supported_empty():
     assert validate_requested_speaker("anything", set()) == "anything"
     assert validate_requested_speaker("  ", {"vivian"}) is None
+
+
+@pytest.mark.parametrize(
+    ("prompt", "expected"),
+    [
+        ({}, {"speaker": ["vivian"]}),
+        ({"additional_information": {"language": ["en"]}}, {"language": ["en"], "speaker": ["vivian"]}),
+        ({"additional_information": None}, {"speaker": ["vivian"]}),
+        ({"additional_information": "legacy"}, {"speaker": ["vivian"]}),
+    ],
+)
+def test_set_prompt_speaker_writes_speaker(prompt, expected):
+    set_prompt_speaker(prompt, "vivian")
+    assert prompt["additional_information"] == expected
 
 
 def test_get_supported_speakers_from_hf_config_uses_spk_id_fallback(mocker: MockerFixture):

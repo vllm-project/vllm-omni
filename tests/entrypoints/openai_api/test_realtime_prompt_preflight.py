@@ -88,9 +88,10 @@ def _make_connection(
     websocket: Any = None,
     engine: Any = None,
     chat_handler: Any = None,
+    hf_config: Any = None,
 ) -> tuple[OpenAIFullDuplexConnection, _FakeRenderer]:
     renderer = _FakeRenderer()
-    model_config = SimpleNamespace(max_model_len=max_model_len, multimodal_config=None)
+    model_config = SimpleNamespace(max_model_len=max_model_len, multimodal_config=None, hf_config=hf_config)
 
     async def preprocess_chat(request: Any, messages: list[dict[str, Any]], **kwargs: Any):
         tok_params = request.build_tok_params(model_config)
@@ -785,6 +786,130 @@ async def test_minicpmo45_realtime_keeps_thinker_final_only() -> None:
         RequestOutputKind.FINAL_ONLY,
         RequestOutputKind.DELTA,
     ]
+
+
+def _session_update(voice: str | dict[str, str]) -> types.SessionUpdateEvent:
+    return types.SessionUpdateEvent(
+        event_id="evt_test",
+        type="session.update",
+        session=types.RealtimeSessionCreateRequest.model_validate(
+            {
+                "type": "realtime",
+                "audio": {
+                    "output": {
+                        "format": {"type": "audio/pcm", "rate": 24000},
+                        "voice": voice,
+                    }
+                },
+            }
+        ),
+    )
+
+
+_SPEAKER_HF_CONFIG = SimpleNamespace(
+    talker_config={"speaker_id": {"vivian": 0, "ethan": 1}},
+)
+
+
+@pytest.mark.asyncio
+async def test_session_update_normalizes_and_forwards_voice() -> None:
+    websocket = _FakeWebSocket()
+    connection, _ = _make_connection(websocket=websocket, hf_config=_SPEAKER_HF_CONFIG)
+
+    await connection._handle_session_update(_session_update("Vivian"))
+
+    updated_session = next(
+        event["session"] for event in _websocket_events(websocket) if event["type"] == "session.updated"
+    )
+    assert updated_session["audio"]["output"]["voice"] == "vivian"
+
+    engine_input = await connection._build_full_prompt()
+    assert engine_input["additional_information"]["speaker"] == ["vivian"]
+
+
+@pytest.mark.asyncio
+async def test_session_update_rejects_unsupported_voice() -> None:
+    websocket = _FakeWebSocket()
+    connection, _ = _make_connection(websocket=websocket, hf_config=_SPEAKER_HF_CONFIG)
+
+    await connection._handle_session_update(_session_update("uncle_fu"))
+
+    error = next(event for event in _websocket_events(websocket) if event["type"] == "error")
+    assert error["error"]["type"] == "invalid_request_error"
+    assert error["error"]["code"] == "invalid_value"
+    assert error["error"]["param"] == "session.audio.output.voice"
+    assert error["error"]["event_id"] == "evt_test"
+    assert "Invalid speaker 'uncle_fu'" in error["error"]["message"]
+    assert connection.session.output_voice is None
+
+
+@pytest.mark.asyncio
+async def test_session_update_rejects_custom_voice_reference() -> None:
+    websocket = _FakeWebSocket()
+    connection, _ = _make_connection(websocket=websocket, hf_config=_SPEAKER_HF_CONFIG)
+
+    await connection._handle_session_update(_session_update({"id": "voice_1234"}))
+
+    error = next(event for event in _websocket_events(websocket) if event["type"] == "error")
+    assert error["error"]["type"] == "invalid_request_error"
+    assert error["error"].get("code") is None
+    assert error["error"]["param"] == "voice_id"
+    assert error["error"].get("event_id") is None
+    assert "No voice found with id 'voice_1234'" in error["error"]["message"]
+    assert connection.session.output_voice is None
+
+
+@pytest.mark.asyncio
+async def test_session_update_accepts_voice_without_speaker_list() -> None:
+    websocket = _FakeWebSocket()
+    connection, _ = _make_connection(websocket=websocket, hf_config=SimpleNamespace())
+
+    await connection._handle_session_update(_session_update("Alloy"))
+
+    assert not [event for event in _websocket_events(websocket) if event["type"] == "error"]
+    updated_session = next(
+        event["session"] for event in _websocket_events(websocket) if event["type"] == "session.updated"
+    )
+    assert updated_session["audio"]["output"]["voice"] == "alloy"
+    engine_input = await connection._build_full_prompt()
+    assert engine_input["additional_information"]["speaker"] == ["alloy"]
+
+
+@pytest.mark.asyncio
+async def test_session_update_keeps_voice_when_update_omits_it() -> None:
+    websocket = _FakeWebSocket()
+    connection, _ = _make_connection(websocket=websocket, hf_config=_SPEAKER_HF_CONFIG)
+    await connection._handle_session_update(_session_update("Vivian"))
+
+    await connection._handle_session_update(
+        types.SessionUpdateEvent(
+            event_id="evt_test2",
+            type="session.update",
+            session=types.RealtimeSessionCreateRequest.model_validate({"type": "realtime", "instructions": "be brief"}),
+        )
+    )
+
+    updated_session = [
+        event["session"] for event in _websocket_events(websocket) if event["type"] == "session.updated"
+    ][-1]
+    assert updated_session["audio"]["output"]["voice"] == "vivian"
+    assert updated_session["instructions"] == "be brief"
+    engine_input = await connection._build_full_prompt()
+    assert engine_input["additional_information"]["speaker"] == ["vivian"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("voice", ["", "   "])
+async def test_session_update_blank_voice_is_unset(voice: str) -> None:
+    websocket = _FakeWebSocket()
+    connection, _ = _make_connection(websocket=websocket, hf_config=_SPEAKER_HF_CONFIG)
+
+    await connection._handle_session_update(_session_update(voice))
+
+    assert not [event for event in _websocket_events(websocket) if event["type"] == "error"]
+    assert connection.session.output_voice is None
+    engine_input = await connection._build_full_prompt()
+    assert "speaker" not in engine_input.get("additional_information", {})
 
 
 @pytest.mark.parametrize(

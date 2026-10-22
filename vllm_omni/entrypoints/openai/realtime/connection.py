@@ -26,6 +26,7 @@ from openai.types.chat import (
 )
 from openai.types.chat.chat_completion_content_part_image_param import ImageURL
 from openai.types.chat.chat_completion_content_part_input_audio_param import InputAudio
+from openai.types.realtime.realtime_audio_config_output import Voice
 from openai.types.realtime.realtime_audio_input_turn_detection import SemanticVad, ServerVad
 from opentelemetry import context, trace
 from pydantic import TypeAdapter
@@ -63,6 +64,11 @@ from vllm_omni.entrypoints.openai.realtime.session import (
 from vllm_omni.tracing import SessionTrace, capture_trace_headers
 from vllm_omni.utils.audio import audio_chunk_sample_rate
 from vllm_omni.utils.audio_resample import StreamingAudioResampler
+from vllm_omni.utils.speakers import (
+    get_supported_speakers_from_hf_config,
+    set_prompt_speaker,
+    validate_requested_speaker,
+)
 
 logger = init_logger(__name__)
 
@@ -88,6 +94,16 @@ def _is_prompt_limit_error(exc: VLLMValidationError) -> bool:
 
 class _UnsupportedAudioFormatError(ValueError):
     """The Realtime endpoint only accepts mono PCM16 audio at 24 kHz."""
+
+
+class _RealtimeVoiceError(ValueError):
+    """Voice selection rejected in the OpenAI Realtime error shape."""
+
+    def __init__(self, message: str, *, code: str | None, param: str, client_event: bool = True) -> None:
+        super().__init__(message)
+        self.code = code
+        self.param = param
+        self.client_event = client_event
 
 
 @dataclass(slots=True)
@@ -125,6 +141,7 @@ class OpenAIFullDuplexConnection:
         self._semantic_vad_backend_provider = semantic_vad_backend_provider
         self._turn_detector: TurnDetector | None = None
         self._speech_item_id: str | None = None
+        self._supported_speakers = self._load_supported_speakers()
 
         self.session = AudioFullDuplexSessionState()
         self.session.config.model = model_name
@@ -252,6 +269,17 @@ class OpenAIFullDuplexConnection:
         except _UnsupportedAudioFormatError as exc:
             await self._send_error(str(exc), "unsupported_audio_format", event_id=event.event_id)
             return
+        except _RealtimeVoiceError as exc:
+            await self._send_error(
+                str(exc),
+                exc.code,
+                event_id=event.event_id if exc.client_event else None,
+                param=exc.param,
+            )
+            return
+        except ValueError as exc:
+            await self._send_error(str(exc), "invalid_request_error", event_id=event.event_id)
+            return
         try:
             turn_detection_config = self._build_turn_detection_config(candidate_config)
         except ValueError as exc:
@@ -318,8 +346,36 @@ class OpenAIFullDuplexConnection:
                 audio_output.speed = previous_output.speed if previous_output is not None else None
             if not self._is_pcm16_24khz_format(audio_output.format):
                 raise _UnsupportedAudioFormatError("Only 24 kHz PCM16 output audio is supported")
+            if audio_output.voice is not None:
+                audio_output.voice = self._validate_voice(audio_output.voice)
 
         return sanitized
+
+    def _validate_voice(self, voice: Voice) -> str | None:
+        """Normalize a session voice, rejecting custom voice references."""
+        if not isinstance(voice, str):
+            raise _RealtimeVoiceError(
+                f"No voice found with id '{voice.id}'.",
+                code=None,
+                param="voice_id",
+                client_event=False,
+            )
+        try:
+            return validate_requested_speaker(voice, self._supported_speakers)
+        except ValueError as exc:
+            raise _RealtimeVoiceError(
+                str(exc),
+                code="invalid_value",
+                param="session.audio.output.voice",
+            ) from exc
+
+    def _load_supported_speakers(self) -> set[str]:
+        """Read the checkpoint's speaker list, falling back to no validation."""
+        try:
+            return get_supported_speakers_from_hf_config(self.engine.model_config.hf_config)
+        except Exception:
+            logger.warning("Could not read the checkpoint's speaker list", exc_info=True)
+            return set()
 
     def _build_turn_detection_config(self, config: types.RealtimeSessionCreateRequest) -> TurnDetectionConfig | None:
         audio_input = config.audio.input if config.audio is not None else None
@@ -1931,6 +1987,9 @@ class OpenAIFullDuplexConnection:
         )
         if engine_input.get("prompt_token_ids") is None:
             raise RuntimeError("Realtime renderer did not return prompt token IDs")
+        voice = s.output_voice
+        if voice:
+            set_prompt_speaker(engine_input, voice)
         return engine_input
 
     # ------------------------------------------------------------------ #
@@ -2063,16 +2122,17 @@ class OpenAIFullDuplexConnection:
     async def _send_error(
         self,
         message: str,
-        code: str = "server_error",
+        code: str | None = "server_error",
         event_id: str | None = None,
         *,
         error_type: str = "invalid_request_error",
+        param: str | None = None,
     ) -> None:
         error_data: dict[str, Any] = {
             "type": error_type,
             "code": code,
             "message": message,
-            "param": None,
+            "param": param,
             "event_id": event_id,
         }
         await self._send_event(
