@@ -38,8 +38,8 @@ class _SenderGeneration:
         self.in_flight = False
         self.cancelled = False
         # Connector-key generation stamped at admission; cleanup tasks built
-        # from this token embed it so they can only match this generation's
-        # keys (same external request id re-use cannot collide).
+        # from this token embed it so they match only this generation's keys
+        # — a re-used external id replays no earlier key sequence.
         self.transfer_gen = transfer_gen
         # A request-terminal chunk is queued but not yet on the wire. The
         # downstream stage has no other way to learn the stream ended -- it
@@ -58,13 +58,15 @@ class _SenderGeneration:
 def _request_transfer_gen(request: Any) -> str:
     """Connector-key generation token for this request admission.
 
-    The orchestrator stamps a per-admission unique token into
-    ``payload_sender_info["transfer_gen"]`` on every request it submits to a
-    stage, so the sending stage and the receiving stage read the same value
-    off their own request objects.  Connector keys embed it, so a re-used
-    external request id can never produce keys that collide with a previous
-    generation's leftover segments or lock files.  ``"0"`` is the fallback
-    for requests that carry no stamp (unit tests, legacy admission paths).
+    The orchestrator mints a fresh token per admission and stamps it into
+    ``payload_sender_info["transfer_gen"]`` on every stage request it builds
+    from that admission, so the sending stage and the receiving stage read
+    the same value off their own request objects.  Connector keys embed it,
+    so a re-used external request id derives fresh keys per admission
+    instead of replaying a previous generation's key sequence (a collision
+    would need two admissions of the same id to draw the same 8-hex token).
+    ``"0"`` is the fallback for requests that carry no stamp (unit tests,
+    legacy admission paths).
     """
     info = getattr(request, "payload_sender_info", None)
     if isinstance(info, dict):

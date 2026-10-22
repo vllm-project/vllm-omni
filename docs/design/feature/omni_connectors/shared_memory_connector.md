@@ -102,7 +102,7 @@ This metadata is passed over the control plane and allows the downstream stage t
 
 #### 4.3 Locking Model
 
-To avoid races between the producer and consumer, the connector uses a lock file per request:
+To avoid races between the producer and consumer, the connector uses a lock file per transfer (one per key):
 
 ```text
 /dev/shm/shm_{put_key}_lockfile.lock
@@ -110,8 +110,8 @@ To avoid races between the producer and consumer, the connector uses a lock file
 
 Locking is done with `fcntl.flock`:
 
-- producer uses `LOCK_EX`
-- consumer uses `LOCK_EX`
+- producer uses `LOCK_EX` (blocks until acquired)
+- consumer uses `LOCK_EX | LOCK_NB` — a contended lock is not waited on: the read returns `None` and never touches the lock
 
 Both sides acquire an exclusive lock. This ensures that the shared-memory segment is not read while it is still being written and makes the handoff safer in a multi-process environment.
 
@@ -125,15 +125,17 @@ Connector keys carry a per-admission generation token:
 {external_req_id}_{stage_id}_{transfer_gen}_{chunk_id}
 ```
 
-The orchestrator stamps a unique token (`uuid4().hex[:8]`) into
-`payload_sender_info["transfer_gen"]` on every request it submits to a stage;
-both the sending stage and the receiving stage read the same value off their
-own request objects (`_request_transfer_gen`), so a re-used external request
-id can never produce keys that collide with a previous generation's leftover
-segments or lock files. The orchestrator's release RPC carries the token of
-the generation it is reclaiming, so a delayed release for an old generation
-cannot touch a newer generation's transfers. `"0"` is the fallback for
-requests that carry no stamp (unit tests, legacy admission paths).
+The orchestrator mints a fresh token (`uuid4().hex[:8]`) once per admission
+and stamps it into `payload_sender_info["transfer_gen"]` on every stage
+request it builds from that admission; the sending stage and the receiving
+stage read the same value off their own request objects
+(`_request_transfer_gen`), so a re-used external request id derives fresh
+keys per admission instead of replaying a previous generation's key
+sequence (a collision would need two admissions of the same id to draw the
+same 8-hex token). The orchestrator's release RPC carries the token of the
+generation it is reclaiming, so a delayed release for an old generation
+cannot match a newer generation's keys. `"0"` is the fallback for requests
+that carry no stamp (unit tests, legacy admission paths).
 
 ### 5. Put / Get Flow
 
@@ -232,7 +234,10 @@ This is a classic split-control-plane / data-plane design, but constrained to a 
 
 - Same-node only.
 - Full object serialization and deserialization are still required.
-- Resource cleanup depends on the normal consumer path.
+- Resource reclamation is best-effort on every path: the consumer read is
+  the primary one; failed puts, dead-segment reads, the time-gated sweep,
+  and the orchestrator's release RPC cover the failure and crash paths —
+  but no path guarantees a reclamation deadline.
 - Shared memory capacity is limited by host configuration.
 
 ### 9. Summary

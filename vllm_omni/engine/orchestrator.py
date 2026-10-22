@@ -282,8 +282,9 @@ class OrchestratorRequestState:
     entry_stage_id: int = 0
 
     # Per-admission transfer-key generation token.  Connector keys embed it
-    # (chunk_transfer_adapter), so a re-used external request id can never
-    # collide with a previous generation's leftover segments or lock files.
+    # (chunk_transfer_adapter), so a re-used external request id derives
+    # fresh keys per admission instead of replaying an earlier generation's
+    # key sequence.
     transfer_generation: str = "0"
     final_output_stage_ids: set[int] = field(default_factory=set)
     finished_final_output_stage_ids: set[int] = field(default_factory=set)
@@ -790,10 +791,12 @@ class OrchestratorBase:
 
         This is the only point that knows every stage is done with the request,
         so it is the only safe place to reclaim segments a consumer never
-        drained. Queued rather than awaited: reclaim is best-effort and must
-        not add RPC latency to request teardown. Each stage pool batches the
-        release per replica, so a burst of completions costs a few RPCs and a
-        hung replica delays only its own batches.
+        drained. Each release carries the admission's generation token, so it
+        reclaims only that generation's connector keys. Queued rather than
+        awaited: reclaim is best-effort and must not add RPC latency to
+        request teardown. Each stage pool batches the release per replica, so
+        a burst of completions costs a few RPCs and a hung replica delays
+        only its own batches.
         """
         if not request_ids:
             return
