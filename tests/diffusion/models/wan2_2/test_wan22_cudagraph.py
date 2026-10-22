@@ -139,6 +139,7 @@ def _make_gpu_wrapper(max_graphs: int = 8):
     from contextlib import ExitStack
 
     from vllm.config import VllmConfig, set_current_vllm_config
+
     from vllm_omni.diffusion.data import OmniDiffusionConfig
     from vllm_omni.diffusion.distributed.parallel_state import (
         init_distributed_environment,
