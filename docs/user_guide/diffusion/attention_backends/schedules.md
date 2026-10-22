@@ -177,8 +177,9 @@ these errors on the job record rather than the creation response.
   Ring and scheduler-managed paged KV require profiles equivalent to the base
   backend and options. AllGather-KV rejects TRTLLM and sparse RainFusion.
   Configured KV-cache quantization requires dtype support in every candidate.
-- Hunyuan image attention requires mask support. Wan VSA profiles require a
-  VSA base that constructs its gate. H3 DiT profiles must exclude packed padding;
+- Hunyuan image attention requires mask support. Wan T2V, I2V and VACE VSA
+  profiles require a VSA base that constructs its gate; Wan S2V passes no VSA
+  metadata, so VSA falls back to SDPA there. H3 DiT profiles must exclude packed padding;
   VSA profiles require the VSA gate or a VSA base, and gated FastH3 layers accept only VSA.
   FastH3 checkpoints pin VSA sparsity, so their profiles cannot set
   `fastvideo_vsa_topk`. They also check each VSA profile's provider and
