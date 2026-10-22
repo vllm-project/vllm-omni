@@ -919,11 +919,12 @@ class Attention(nn.Module):
         attn_metadata: AttentionMetadata | None = None,
     ) -> torch.Tensor:
         if torch.compiler.is_compiling() and self._schedule_configured:
-            # Selecting a scheduled candidate reads the step, the total and the bound
-            # schedule from the forward context, and backend-private gates read the step or
-            # timestep. Traced, those values would become guards and each new step or range
-            # boundary would recompile the enclosing graph. The decision uses only the
-            # construction-time flag, so a layer without a startup schedule adds no boundary.
+            # Selecting a scheduled candidate reads the bound schedule from the forward context,
+            # with the step and total for step ranges or the denoise sigma for sigma windows, and
+            # backend-private gates read the step or timestep. Traced, those values would become
+            # guards and each new step or sigma value would recompile the enclosing graph. The
+            # decision uses only the construction-time flag, so a layer without a startup schedule
+            # adds no boundary.
             encoded = (
                 _encode_scheduled_op_metadata(attn_metadata) if self._schedule_op_eligible(query, key, value) else None
             )
