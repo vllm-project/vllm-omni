@@ -27,9 +27,9 @@ from vllm_omni.diffusion.attention.backends.abstract import (
 from vllm_omni.diffusion.attention.backends.sdpa import SDPABackend, SDPAImpl
 from vllm_omni.diffusion.attention.backends.trtllm_calibration import (
     calibration_for_candidate,
+    layer_calibration_curve,
     layer_calibration_is_ignored,
     resolve_effective_calibration,
-    resolve_layer_calibration,
 )
 from vllm_omni.diffusion.attention.capabilities import (
     AttentionComputation,
@@ -1179,8 +1179,7 @@ def _validate_candidate_calibration(
         return  # no curve requested, or the calibration-free path
     if layer_calibration_is_ignored(layer_name, effective_calibration):
         return
-    per = resolve_layer_calibration(layer_name, effective_calibration) if effective_calibration else None
-    if not per or per.get("a") is None or per.get("b") is None:
+    if layer_calibration_curve(layer_name, effective_calibration) is None:
         raise ValueError(
             f"attention schedule profile {profile_name!r} requests skip_softmax.target_sparsity but the "
             f"calibration stamped onto this candidate resolves no curve for layer {layer_name!r}. "
