@@ -1251,6 +1251,7 @@ class DuplexSessionRunner:
             detected = await self.control.run_turn_detection(event)
         with ExitStack() as unprocessed:
             releases: list[Callable[[], None] | None] = [None] * len(detected)
+            charges = [0] * len(detected)
             if release_queued_input is not None:
                 # Swap the wire charge for each segment's decoded size in one step
                 # (no await), so segments not yet handed off stay charged while an
@@ -1264,8 +1265,9 @@ class DuplexSessionRunner:
                     segment_charge = unprocessed.enter_context(ExitStack())
                     segment_charge.callback(session.release_input_bytes, charge, queued=True)
                     releases[index] = segment_charge.close
+                    charges[index] = charge
                 release_queued_input()
-            for (segment, vad_result), release in zip(detected, releases):
+            for index, ((segment, vad_result), release) in enumerate(zip(detected, releases)):
                 if (
                     vad_result is not None
                     and not session.capabilities.supports_core_resumable_request
@@ -1274,7 +1276,14 @@ class DuplexSessionRunner:
                     # VAD's force_listen hint controls native model decoding. Committed
                     # turn models already buffer speech; it must not suppress barge-in.
                     segment.pop("force_listen", None)
-                await self._append_detected_audio(segment, vad_result, release_queued_input=release)
+                await self._append_detected_audio(
+                    segment,
+                    vad_result,
+                    release_queued_input=release,
+                    # Later segments stay charged for admission but, as on main,
+                    # do not count against this segment's limit: overflow drops the tail.
+                    queued_tail_bytes=sum(charges[index + 1 :]),
+                )
                 if release is not None:
                     # A dropped or skipped segment never reached its handoff.
                     release()
@@ -1285,6 +1294,7 @@ class DuplexSessionRunner:
         vad_result: TurnDetectionResult | None,
         *,
         release_queued_input: Callable[[], None] | None = None,
+        queued_tail_bytes: int = 0,
     ) -> None:
         """Buffer one segment and apply its commit before accepting the next one."""
         session = self.session
@@ -1389,7 +1399,7 @@ class DuplexSessionRunner:
         )
         raw_audio_bytes = helpers.audio_payload_size_bytes(payload)
         pending_before = model_state.audio_buffer.pending_byte_count
-        limit = int(self.manager.runtime_config.max_pending_input_bytes_per_session)
+        limit = int(self.manager.runtime_config.max_pending_input_bytes_per_session) + queued_tail_bytes
         # No await between releasing this segment's charge and reserving PCM bytes.
         if release_queued_input is not None:
             release_queued_input()

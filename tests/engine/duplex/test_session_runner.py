@@ -960,6 +960,26 @@ async def test_vad_split_append_keeps_unprocessed_segments_charged(monkeypatch, 
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(("limit", "kept"), [(80_000, 64_000), (48_000, 32_000)])
+async def test_vad_split_append_past_the_limit_matches_main(limit, kept) -> None:
+    h = await open_harness(
+        auto_response=False,
+        runtime_config=DuplexSessionRuntimeConfig(max_pending_input_bytes_per_session=limit),
+    )
+    h.runner.control._detector = _SplitDetector()
+    try:
+        pcm16 = np.full(24_000, 1600, dtype="<i2").tobytes()  # 48_000 wire bytes, 64_000 + 32_000 as f32
+        events = await h.run(commands.AppendAudio(audio=pcm16, format="pcm16", sample_rate_hz=16000, is_speech=True))
+        # Each segment is checked as on main: the still-queued tail never blocks an
+        # earlier segment, so only the segment that does not fit is rejected.
+        assert [event.code for event in events if event.type == "error"] == ["input_backpressure"]
+        assert h.session.pending_input_bytes == h.runner.model_state.audio_buffer.pending_byte_count == kept
+        assert h.session._input.queued_input_bytes == 0
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
 async def test_commit_without_audio_is_rejected() -> None:
     h = await open_harness()
     try:
