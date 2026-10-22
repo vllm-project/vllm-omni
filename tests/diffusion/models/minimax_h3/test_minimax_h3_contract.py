@@ -15,17 +15,16 @@ import torch
 import torch.nn as nn
 
 from vllm_omni.diffusion.attention.schedule import AttentionScheduleRange, InvalidAttentionScheduleError
-from vllm_omni.diffusion.cache.cachedit import CacheDiTRequestSpec
+from vllm_omni.diffusion.cache.cachedit import CacheDiTRequestSpec, RequestScopedCacheDiTRuntime
 from vllm_omni.diffusion.data import (
     AttentionConfig,
     AttentionScheduleConfig,
-    DiffusionCacheConfig,
     OmniDiffusionConfig,
 )
 from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3
 from vllm_omni.diffusion.models.minimax_h3.lora import TurboSpec, parse_turbo_filename
 from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import MiniMaxH3Attention
-from vllm_omni.diffusion.models.minimax_h3.quality_policy import MiniMaxH3QualityPlan
+from vllm_omni.diffusion.models.minimax_h3.quality_policy import MINIMAX_H3_HIGH_CACHE_KEY, MiniMaxH3QualityPolicy
 from vllm_omni.diffusion.worker.utils import StepRequestState
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
@@ -1262,13 +1261,13 @@ def _distilled_pipeline(diffuse_calls, base_schedule_by_partition):
     return pipeline
 
 
-def _t2va_batch(num_inference_steps=None, attention_schedule=None, extra_args=None):
+def _t2va_batch(num_inference_steps=None, attention_schedule=None, extra_args=None, quality="lossless"):
     from vllm_omni.diffusion.request import OmniDiffusionRequest
     from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
     sampling = OmniDiffusionSamplingParams(
-        quality="lossless",
+        quality=quality,
         width=1344,
         height=768,
         fps=24,
@@ -1395,28 +1394,38 @@ def test_inherited_default_range_past_the_sequence_end_is_not_rejected(monkeypat
     assert [call["num_steps"] for call in diffuse_calls] == [4]
 
 
+class _RecordingCacheDiTRuntime(RequestScopedCacheDiTRuntime):
+    """Records each Cache-DiT target the pipeline prepares; installing the hooks needs a real DiT."""
+
+    def __init__(self, pipeline) -> None:
+        super().__init__(pipeline)
+        self.prepared: list[CacheDiTRequestSpec | None] = []
+
+    def prepare(self, spec: CacheDiTRequestSpec | None) -> None:
+        self.prepared.append(spec)
+
+
 def test_forward_rejects_an_attention_schedule_with_request_scoped_cache_dit(monkeypatch):
     """A schedule is rejected before Cache-DiT is prepared when the quality plan installs it."""
     _allow_cpu_empty_cache(monkeypatch)
     diffuse_calls: list[dict[str, Any]] = []
-    prepared: list[object] = []
-    cache_spec = CacheDiTRequestSpec("test-high", DiffusionCacheConfig(), num_inference_steps=4)
     pipeline = _distilled_pipeline(diffuse_calls, {"fl2va": None, "ref2va": None})
     pipeline.od_config = _scheduled_od_config()
-    # The plan MiniMaxH3QualityPolicy returns for quality=high.
-    pipeline._quality_policy = SimpleNamespace(resolve=lambda **kwargs: MiniMaxH3QualityPlan(cache_dit=cache_spec))
-    pipeline._cache_dit_runtime = SimpleNamespace(prepare=prepared.append)
+    # quality=high resolves to the request-scoped Cache-DiT profile.
+    pipeline._quality_policy = MiniMaxH3QualityPolicy(pipeline.od_config)
+    runtime = _RecordingCacheDiTRuntime(pipeline)
+    pipeline._cache_dit_runtime = runtime
     schedule = [{"start": 0, "end": 2, "profile": "sparse"}]
 
     with pytest.raises(InvalidAttentionScheduleError, match="Cache-DiT"):
-        pipeline.forward(_t2va_batch(num_inference_steps=4, attention_schedule=schedule))
-    assert prepared == []
+        pipeline.forward(_t2va_batch(num_inference_steps=4, attention_schedule=schedule, quality="high"))
+    assert runtime.prepared == []
     assert diffuse_calls == []
 
     # Without a schedule, or with the request disabling it, Cache-DiT is prepared.
-    pipeline.forward(_t2va_batch(num_inference_steps=4))
-    pipeline.forward(_t2va_batch(num_inference_steps=4, attention_schedule=[]))
-    assert prepared == [cache_spec, cache_spec]
+    pipeline.forward(_t2va_batch(num_inference_steps=4, quality="high"))
+    pipeline.forward(_t2va_batch(num_inference_steps=4, attention_schedule=[], quality="high"))
+    assert [spec.installation_key for spec in runtime.prepared] == [MINIMAX_H3_HIGH_CACHE_KEY] * 2
     assert len(diffuse_calls) == 2
 
 
