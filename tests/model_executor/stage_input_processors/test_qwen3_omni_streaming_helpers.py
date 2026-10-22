@@ -986,6 +986,7 @@ def test_cosyvoice3_full_payload_replace_keys_present() -> None:
 
 def test_ming_flash_omni_thinker2talker_token_only_smoke() -> None:
     """Smoke: ming_flash_omni token-only carries voice metadata."""
+    from vllm_omni.inputs.data import OmniTokensPrompt
     from vllm_omni.model_executor.stage_input_processors.ming_flash_omni import (
         thinker2talker_token_only,
     )
@@ -998,12 +999,11 @@ def test_ming_flash_omni_thinker2talker_token_only_smoke() -> None:
         def __init__(self, text):
             self.outputs = [_Out(text)]
 
-    class _Prompt:
-        def __init__(self, info):
-            self.additional_information = info
-
     src = [_Wrap("hello world")]
-    prompt = _Prompt({"voice_name": "ZH_FEMALE", "prompt_text": "ref text"})
+    prompt = OmniTokensPrompt(
+        prompt_token_ids=[1],
+        additional_information={"voice_name": "ZH_FEMALE", "prompt_text": "ref text"},
+    )
     out = thinker2talker_token_only(src, prompt=prompt)
     assert len(out) == 1
     assert out[0]["prompt_token_ids"] == [0]

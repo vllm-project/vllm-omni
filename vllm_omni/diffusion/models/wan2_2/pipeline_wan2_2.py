@@ -104,6 +104,19 @@ def build_wan_scheduler(sample_solver: str, flow_shift: float) -> Any:
     )
 
 
+def refresh_cache_for_denoise_schedule(pipeline: Any, timesteps: torch.Tensor, boundary_timestep: float | None) -> None:
+    """Size an active Cache-DiT context to the schedule forward() resolved for this request.
+
+    The model runner refreshes cache state before forward() starts, when the
+    request's sample solver, flow shift and boundary are not resolved yet. Call
+    this once they are, so each expert's step budget is counted from the exact
+    timesteps diffuse() will route to it.
+    """
+    refresh = getattr(pipeline, "_cache_dit_refresh_for_schedule", None)
+    if refresh is not None:
+        refresh(pipeline, timesteps, boundary_timestep)
+
+
 def load_wan_weights_with_optional_gate(model: nn.Module, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
     """Load Wan weights and discard optional VSA gates absent from the checkpoint."""
     gate_param_names = {name for name, _ in model.named_parameters() if ".to_gate_compress." in name}
@@ -154,11 +167,7 @@ def resolve_wan_boundary_ratio(
     sampling_params: OmniDiffusionSamplingParams,
     warn_context: str | None = None,
 ) -> float:
-    """Return the effective MoE boundary: engine override, then request, then 0.875.
-
-    Shared by ``forward()`` and the Cache-DiT expert split so both see the same
-    boundary for a request.
-    """
+    """Return the effective MoE boundary: engine override, then request, then 0.875."""
     if engine_boundary_ratio is not None:
         return engine_boundary_ratio
     if sampling_params.boundary_ratio is not None:
@@ -166,21 +175,6 @@ def resolve_wan_boundary_ratio(
     if warn_context is not None:
         logger.warning("boundary_ratio is required for %s generation. using default value 0.875", warn_context)
     return 0.875
-
-
-def apply_wan_request_scheduler(pipeline: Any, req: OmniDiffusionRequest) -> tuple[str, float]:
-    """Rebuild ``pipeline.scheduler`` for the request's sample_solver / flow_shift.
-
-    Idempotent, so the runner can call it ahead of the Cache-DiT refresh and
-    ``forward()`` can call it again for the same request.
-    """
-    sample_solver = resolve_wan_sample_solver(req, default=pipeline._sample_solver)
-    flow_shift = resolve_wan_flow_shift(req, pipeline.od_config)
-    if sample_solver != pipeline._sample_solver or abs(flow_shift - pipeline._flow_shift) > 1e-6:
-        pipeline.scheduler = build_wan_scheduler(sample_solver, flow_shift)
-        pipeline._sample_solver = sample_solver
-        pipeline._flow_shift = flow_shift
-    return sample_solver, flow_shift
 
 
 def resolve_wan_guidance_scales(
@@ -450,6 +444,10 @@ class Wan22Pipeline(
     _dit_modules: ClassVar[list[str]] = ["transformer", "transformer_2"]
     _encoder_modules: ClassVar[list[str]] = ["text_encoder"]
     _vae_modules: ClassVar[list[str]] = ["vae"]
+    # Step count forward() uses when the request leaves it unset. The model runner
+    # reads it to size the cache backend's context before forward() starts. The
+    # DMD checkpoint overrides it in __init__ with its fixed three transitions.
+    default_num_inference_steps: int = 40
     _offload_plan = _WAN_TEXT_ENCODER_OFFLOAD_PLAN
 
     def __init__(
@@ -636,6 +634,8 @@ class Wan22Pipeline(
         else:
             raise RuntimeError("No transformer loaded")
 
+        if self.is_dmd:
+            self.default_num_inference_steps = len(FASTWAN_DMD_TIMESTEPS)
         self._sample_solver = "euler" if self.is_dmd else "unipc"
         self._flow_shift = (
             FASTWAN_DMD_SCHEDULER_SHIFT
@@ -1217,19 +1217,6 @@ class Wan22Pipeline(
             settings.append(current)
         validate_wan_batch_settings(settings, stage="generation")
 
-    def prepare_cache_refresh(self, req: OmniDiffusionRequest) -> None:
-        """Apply the request's scheduler settings before the runner refreshes the cache.
-
-        The Cache-DiT dual-expert step split reads ``self.scheduler``,
-        ``self._flow_shift`` and ``self._request_boundary_ratio``; without this,
-        a per-request ``flow_shift`` / ``boundary_ratio`` would only reach
-        ``forward()``, after the split was already planned.  The startup
-        ``self.boundary_ratio`` is left untouched.
-        """
-        self._request_boundary_ratio = resolve_wan_boundary_ratio(self.boundary_ratio, req.sampling_params)
-        if not self.is_dmd:
-            apply_wan_request_scheduler(self, req)
-
     def forward(self, req: DiffusionRequestBatch) -> list[DiffusionOutput]:
         sampling_params_list = req.sampling_params_list
         common = sampling_params_list[0]
@@ -1285,7 +1272,9 @@ class Wan22Pipeline(
             # request-level step counts, including the engine's 1-step warmup.
             num_steps = len(FASTWAN_DMD_TIMESTEPS)
         else:
-            num_steps = 40 if common.num_inference_steps is None else common.num_inference_steps
+            num_steps = (
+                self.default_num_inference_steps if common.num_inference_steps is None else common.num_inference_steps
+            )
 
         output_type = common.output_type or "np"
         preencode_mp4 = resolve_wan_preencode_mp4(common, output_type=output_type)
@@ -1371,7 +1360,13 @@ class Wan22Pipeline(
         if self.is_dmd:
             timesteps = torch.tensor(FASTWAN_DMD_TIMESTEPS, device=device, dtype=torch.float32)
         else:
-            sample_solver, flow_shift = apply_wan_request_scheduler(self, req.requests[0])
+            first_request = req.requests[0]
+            sample_solver = resolve_wan_sample_solver(first_request, default=self._sample_solver)
+            flow_shift = resolve_wan_flow_shift(first_request, self.od_config)
+            if sample_solver != self._sample_solver or abs(flow_shift - self._flow_shift) > 1e-6:
+                self.scheduler = build_wan_scheduler(sample_solver, flow_shift)
+                self._sample_solver = sample_solver
+                self._flow_shift = flow_shift
 
             if sample_solver == "unipc":
                 self.scheduler.set_timesteps(num_steps, device=device, shift=flow_shift)
@@ -1382,6 +1377,7 @@ class Wan22Pipeline(
         boundary_timestep = None
         if boundary_ratio is not None:
             boundary_timestep = boundary_ratio * self.scheduler.config.num_train_timesteps
+        refresh_cache_for_denoise_schedule(self, timesteps, boundary_timestep)
 
         if DEBUG_PERF:
             _t_latent_prep_start = time.perf_counter()

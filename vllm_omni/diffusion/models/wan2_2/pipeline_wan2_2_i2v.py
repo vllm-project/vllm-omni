@@ -40,13 +40,15 @@ from vllm_omni.diffusion.models.wan2_2.chunked_mp4 import (
 )
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
     _WAN_TEXT_ENCODER_OFFLOAD_PLAN,
-    apply_wan_request_scheduler,
     build_wan_scheduler,
     create_transformer_from_config,
     load_transformer_config,
     load_wan_weights_with_optional_gate,
+    refresh_cache_for_denoise_schedule,
     resolve_wan_boundary_ratio,
+    resolve_wan_flow_shift,
     resolve_wan_guidance_scales,
+    resolve_wan_sample_solver,
     retrieve_latents,
 )
 from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import WanTransformer3DModel
@@ -204,6 +206,9 @@ class Wan22I2VPipeline(
     _dit_modules: ClassVar[list[str]] = ["transformer", "transformer_2"]
     _encoder_modules: ClassVar[list[str]] = ["text_encoder", "image_encoder"]
     _vae_modules: ClassVar[list[str]] = ["vae"]
+    # Step count forward() uses when the request leaves it unset. The model runner
+    # reads it to size the cache backend's context before forward() starts.
+    default_num_inference_steps: ClassVar[int] = 40
     _offload_plan = _WAN_TEXT_ENCODER_OFFLOAD_PLAN
 
     def __init__(
@@ -466,14 +471,6 @@ class Wan22I2VPipeline(
             quant_config = None
         return create_transformer_from_config(config, quant_config=quant_config, component=component)
 
-    def prepare_cache_refresh(self, req: OmniDiffusionRequest) -> None:
-        """Apply the request's scheduler settings before the runner refreshes the cache.
-
-        See :meth:`Wan22Pipeline.prepare_cache_refresh`.
-        """
-        self._request_boundary_ratio = resolve_wan_boundary_ratio(self.boundary_ratio, req.sampling_params)
-        apply_wan_request_scheduler(self, req)
-
     def forward(self, req: DiffusionRequestBatch) -> list[DiffusionOutput]:
         sampling_params_list = req.sampling_params_list
         common = sampling_params_list[0]
@@ -523,7 +520,9 @@ class Wan22I2VPipeline(
         height = common.height or 480
         width = common.width or 832
         num_frames = common.num_frames or 81
-        num_steps = 40 if common.num_inference_steps is None else common.num_inference_steps
+        num_steps = (
+            self.default_num_inference_steps if common.num_inference_steps is None else common.num_inference_steps
+        )
 
         output_type = common.output_type or "np"
         preencode_mp4 = resolve_wan_preencode_mp4(common, output_type=output_type)
@@ -626,7 +625,13 @@ class Wan22I2VPipeline(
             current_omni_platform.synchronize()
             _t_img_enc_ms = (time.perf_counter() - _t_img_enc_start) * 1000
 
-        sample_solver, flow_shift = apply_wan_request_scheduler(self, req.requests[0])
+        first_request = req.requests[0]
+        sample_solver = resolve_wan_sample_solver(first_request, default=self._sample_solver)
+        flow_shift = resolve_wan_flow_shift(first_request, self.od_config)
+        if sample_solver != self._sample_solver or abs(flow_shift - self._flow_shift) > 1e-6:
+            self.scheduler = build_wan_scheduler(sample_solver, flow_shift)
+            self._sample_solver = sample_solver
+            self._flow_shift = flow_shift
 
         # Timesteps
         if sample_solver == "unipc":
@@ -639,6 +644,7 @@ class Wan22I2VPipeline(
         boundary_timestep = None
         if boundary_ratio is not None:
             boundary_timestep = boundary_ratio * self.scheduler.config.num_train_timesteps
+        refresh_cache_for_denoise_schedule(self, timesteps, boundary_timestep)
 
         # Prepare latents (use out_channels=16 for VAE latent, not in_channels=36)
         num_channels_latents = self.transformer.config.out_channels

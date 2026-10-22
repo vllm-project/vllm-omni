@@ -563,10 +563,16 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
                 payload = self._materialize_full_payload_entry(accumulated)[0] if accumulated is not None else None
             if self._async_chunk and isinstance(payload, dict):
                 payload = unflatten_payload(payload)
-            if payload is None and not state.finished:
+            token_only_producer = bool(
+                getattr(getattr(self, "_custom_process_func", None), "_requires_full_token_history", False)
+            )
+            if payload is None and not state.finished and not token_only_producer:
                 continue
             include_token_history = bool(
-                not self._async_chunk or state.resumable or self._put_req_chunk.get(state.external_req_id, 0) == 0
+                token_only_producer
+                or not self._async_chunk
+                or state.resumable
+                or self._put_req_chunk.get(state.external_req_id, 0) == 0
             )
             entries.append(
                 (

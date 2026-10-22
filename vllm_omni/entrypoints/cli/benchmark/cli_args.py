@@ -177,6 +177,7 @@ def add_omniinteract_cli_args(parser: argparse.ArgumentParser) -> None:
 
 
 def add_duplex_eval_cli_args(parser: argparse.ArgumentParser) -> None:
+    from vllm_omni.benchmarks.duplex.omni_duplex_eval_runner import MIX_MODES, MIX_QUESTION
     from vllm_omni.benchmarks.duplex_session_inputs import TURN_DETECTION_MODES, TURN_DETECTION_NONE
 
     group = parser.add_argument_group("Omni-DuplexEval Benchmark Options")
@@ -195,6 +196,12 @@ def add_duplex_eval_cli_args(parser: argparse.ArgumentParser) -> None:
         help="Session system prompt. Defaults to the native-duplex prompt; pass '' to use the server default.",
     )
     group.add_argument("--duplex-eval-fps", type=_positive_finite_float, default=1.0)
+    group.add_argument(
+        "--duplex-eval-mix",
+        choices=MIX_MODES,
+        default=MIX_QUESTION,
+        help="Session audio: 'question' streams only the instruction; 'soundtrack' overlays it on the clip's audio.",
+    )
     group.add_argument(
         "--duplex-eval-response-root",
         type=Path,

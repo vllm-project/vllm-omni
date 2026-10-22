@@ -13,6 +13,7 @@ import torch
 import torch.nn as nn
 from torch.overrides import TorchFunctionMode
 
+from vllm_omni.model_executor.models.minicpmo_4_5.handoff import pack_handoff_tensor
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
     MiniCPMO45OmniForConditionalGeneration,
 )
@@ -1049,7 +1050,8 @@ def test_empty_speech_segment_finishes_without_sampling_codes() -> None:
     assert decode_updates["codes"]["audio"].shape == (0,)
 
 
-def test_chunked_prefill_tail_aligns_condition_with_prompt_length(mocker) -> None:
+@pytest.mark.parametrize("packed", [False, True])
+def test_chunked_prefill_tail_aligns_condition_with_prompt_length(mocker, packed) -> None:
     talker = _make_talker()
     talker.emb_text = nn.Embedding(1, 2)
     condition = torch.arange(18, dtype=torch.float32).reshape(9, 2)
@@ -1063,7 +1065,7 @@ def test_chunked_prefill_tail_aligns_condition_with_prompt_length(mocker) -> Non
         _omni_prompt_len=68,
         request_id="req-chunked-prefill",
         tts_token_ids=torch.tensor([1]),
-        tts_hidden_states=torch.ones(1, 2),
+        tts_hidden_states=pack_handoff_tensor(torch.ones(1, 2)) if packed else torch.ones(1, 2),
     )
 
     assert torch.equal(embeds, condition)

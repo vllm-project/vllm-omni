@@ -25,6 +25,7 @@ from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import Cosmos3VFMTra
 from vllm_omni.diffusion.models.helios.helios_transformer import HeliosTransformer3DModel
 from vllm_omni.diffusion.models.longcat_image.longcat_image_transformer import LongCatImageTransformer2DModel
 from vllm_omni.diffusion.models.ltx2.ltx2_transformer import LTX2VideoTransformer3DModel
+from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import build_wan_scheduler
 from vllm_omni.platforms import current_omni_platform
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -278,6 +279,13 @@ def test_wan22_custom_enabler_low_noise_expert_only(mock_cache_dit, mock_block_a
     assert mock_backend_cache_dit.refresh_context.call_args.args[0] is transformer_2
     assert mock_backend_cache_dit.refresh_context.call_args.kwargs["num_inference_steps"] == 40
 
+    # forward()'s per-schedule refresh must hit the same expert.
+    mock_backend_cache_dit.refresh_context.reset_mock()
+    pipeline._cache_dit_refresh_for_schedule(pipeline, torch.arange(30), None, False)
+    mock_backend_cache_dit.refresh_context.assert_called_once()
+    assert mock_backend_cache_dit.refresh_context.call_args.args[0] is transformer_2
+    assert mock_backend_cache_dit.refresh_context.call_args.kwargs["num_inference_steps"] == 30
+
 
 def test_wan22_custom_enabler_without_any_transformer_raises():
     pipeline = SimpleNamespace(transformer=None, transformer_2=None)
@@ -287,131 +295,43 @@ def test_wan22_custom_enabler_without_any_transformer_raises():
 
 
 @pytest.mark.parametrize(
-    ("flow_shift", "expected_split"),
-    [(5.0, (17, 23)), (1.0, (5, 35))],
-)
-def test_wan22_step_split_applies_unipc_flow_shift(flow_shift, expected_split):
-    """The cache-dit split must count the same shifted schedule the pipeline denoises with."""
-    from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import build_wan_scheduler
-
-    pipeline = SimpleNamespace(
-        transformer=torch.nn.Linear(1, 1),
-        scheduler=build_wan_scheduler("unipc", flow_shift),
-        boundary_ratio=0.875,
-        _flow_shift=flow_shift,
-    )
-
-    assert cd_model_specific._split_wan22_inference_steps(pipeline, 40) == expected_split
-
-    pipeline.scheduler.set_timesteps(40, device="cpu", shift=flow_shift)
-    boundary_timestep = pipeline.boundary_ratio * pipeline.scheduler.config.num_train_timesteps
-    num_high_noise_steps = int((pipeline.scheduler.timesteps >= boundary_timestep).sum())
-    assert (num_high_noise_steps, 40 - num_high_noise_steps) == expected_split
-
-
-def test_wan22_step_split_follows_request_flow_shift_override():
-    """A per-request flow_shift must reach the split before the runner refreshes the cache."""
-    from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import Wan22Pipeline, build_wan_scheduler
-
-    pipeline = SimpleNamespace(
-        is_dmd=False,
-        od_config=SimpleNamespace(flow_shift=5.0),
-        transformer=torch.nn.Linear(1, 1),
-        scheduler=build_wan_scheduler("unipc", 5.0),
-        boundary_ratio=0.875,
-        _sample_solver="unipc",
-        _flow_shift=5.0,
-    )
-    req = SimpleNamespace(sampling_params=SimpleNamespace(extra_args={"flow_shift": 12.0}, boundary_ratio=None))
-
-    Wan22Pipeline.prepare_cache_refresh(pipeline, req)
-
-    assert pipeline._flow_shift == 12.0
-    split = cd_model_specific._split_wan22_inference_steps(pipeline, 40)
-    reference = build_wan_scheduler("unipc", 12.0)
-    reference.set_timesteps(40, device="cpu", shift=12.0)
-    num_high_noise_steps = int((reference.timesteps >= 875).sum())
-    assert split == (num_high_noise_steps, 40 - num_high_noise_steps)
-    assert split != (17, 23)
-
-
-def _wan22_split_reference(boundary_ratio, flow_shift=5.0, num_steps=40):
-    from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import build_wan_scheduler
-
-    reference = build_wan_scheduler("unipc", flow_shift)
-    reference.set_timesteps(num_steps, device="cpu", shift=flow_shift)
-    num_high_noise_steps = int((reference.timesteps >= boundary_ratio * reference.config.num_train_timesteps).sum())
-    return num_high_noise_steps, num_steps - num_high_noise_steps
-
-
-@pytest.mark.parametrize(
-    ("pipeline_module", "pipeline_cls"),
-    [
-        ("pipeline_wan2_2", "Wan22Pipeline"),
-        ("pipeline_wan2_2_i2v", "Wan22I2VPipeline"),
-        ("pipeline_wan2_2_vace", "Wan22VACEPipeline"),
-    ],
-)
-@pytest.mark.parametrize(
     ("engine_boundary", "request_boundary", "expected_boundary"),
     [
-        (None, None, 0.875),  # omitted everywhere: forward() defaults to 0.875
+        (None, None, 0.875),  # omitted everywhere: default 0.875
         (None, 0.9, 0.9),  # request override when the engine has none
         (0.875, 0.9, 0.875),  # engine override wins over the request
     ],
 )
-def test_wan22_step_split_uses_effective_boundary(
-    pipeline_module, pipeline_cls, engine_boundary, request_boundary, expected_boundary
-):
-    """The split must use the boundary forward() resolves (engine -> request -> 0.875)."""
-    import importlib
+def test_resolve_wan_boundary_ratio(engine_boundary, request_boundary, expected_boundary):
+    from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import resolve_wan_boundary_ratio
 
-    from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import build_wan_scheduler, resolve_wan_boundary_ratio
-
-    cls = getattr(importlib.import_module(f"vllm_omni.diffusion.models.wan2_2.{pipeline_module}"), pipeline_cls)
-    pipeline = SimpleNamespace(
-        is_dmd=False,
-        od_config=SimpleNamespace(flow_shift=5.0),
-        transformer=torch.nn.Linear(1, 1),
-        scheduler=build_wan_scheduler("unipc", 5.0),
-        boundary_ratio=engine_boundary,
-        _sample_solver="unipc",
-        _flow_shift=5.0,
-    )
-    sampling_params = SimpleNamespace(extra_args={}, boundary_ratio=request_boundary)
-
-    cls.prepare_cache_refresh(pipeline, SimpleNamespace(sampling_params=sampling_params))
-
+    sampling_params = SimpleNamespace(boundary_ratio=request_boundary)
     assert resolve_wan_boundary_ratio(engine_boundary, sampling_params) == expected_boundary
-    assert pipeline.boundary_ratio == engine_boundary  # startup value is not overwritten
-    split = cd_model_specific._split_wan22_inference_steps(pipeline, 40)
-    assert split == _wan22_split_reference(expected_boundary)
-    assert split != (40, 0)
 
 
-def test_wan22_step_split_follows_successive_request_boundaries():
-    """Each request picks its own boundary when the engine was started without one."""
-    from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import Wan22Pipeline, build_wan_scheduler
+@pytest.mark.parametrize("boundary_ratio", [None, 0.875])
+def test_wan22_step_split_matches_shifted_denoise_schedule(boundary_ratio):
+    """The per-expert Cache-DiT step counts must follow the schedule forward() runs.
 
+    forward() applies the flow shift in set_timesteps and falls back to boundary
+    0.875 when the server pins none; an unshifted probe or a missing fallback
+    sizes the experts' contexts for the wrong number of steps.
+    """
     pipeline = SimpleNamespace(
-        is_dmd=False,
-        od_config=SimpleNamespace(flow_shift=5.0),
-        transformer=torch.nn.Linear(1, 1),
+        boundary_ratio=boundary_ratio,
         scheduler=build_wan_scheduler("unipc", 5.0),
-        boundary_ratio=None,
+        transformer=torch.nn.Linear(1, 1),
         _sample_solver="unipc",
         _flow_shift=5.0,
     )
 
-    splits = []
-    for request_boundary in (0.95, None, 0.8):
-        req = SimpleNamespace(sampling_params=SimpleNamespace(extra_args={}, boundary_ratio=request_boundary))
-        Wan22Pipeline.prepare_cache_refresh(pipeline, req)
-        splits.append(cd_model_specific._split_wan22_inference_steps(pipeline, 40))
+    num_high_noise_steps, num_low_noise_steps = cd_model_specific._split_wan22_inference_steps(pipeline, 40)
 
-    assert splits == [_wan22_split_reference(b) for b in (0.95, 0.875, 0.8)]
-    assert len(set(splits)) == 3
-    assert pipeline.boundary_ratio is None
+    reference = build_wan_scheduler("unipc", 5.0)
+    reference.set_timesteps(40, device="cpu", shift=5.0)
+    expected_high_noise_steps = int((reference.timesteps >= 0.875 * 1000).sum())
+    assert (num_high_noise_steps, num_low_noise_steps) == (expected_high_noise_steps, 40 - expected_high_noise_steps)
+    assert num_low_noise_steps > 0
 
 
 @patch("vllm_omni.diffusion.cache.cachedit.backend.BlockAdapter")

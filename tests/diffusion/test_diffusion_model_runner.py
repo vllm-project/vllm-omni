@@ -362,26 +362,6 @@ def test_refresh_cache_prefers_request_steps_then_schedule_then_pipeline_default
 
 @pytest.mark.core_model
 @pytest.mark.cpu
-def test_refresh_cache_prepares_pipeline_before_backend_refresh():
-    """Request-scoped scheduler state must be applied before the cache plans its steps."""
-    events = []
-
-    class _RecordingCacheBackend(_EnabledCacheBackend):
-        def refresh(self, pipeline, num_inference_steps, verbose=True):
-            events.append(("refresh", num_inference_steps))
-
-    runner = _make_runner(cache_backend=_RecordingCacheBackend(), cache_backend_name="cache_dit")
-    runner.pipeline.prepare_cache_refresh = lambda req: events.append(("prepare", req))
-    req = _make_request()
-    req.sampling_params.num_inference_steps = 40
-
-    DiffusionModelRunner._refresh_cache_for_requests(runner, [req], od_config=runner.od_config)
-
-    assert events == [("prepare", req), ("refresh", 40)]
-
-
-@pytest.mark.core_model
-@pytest.mark.cpu
 def test_refresh_cache_without_request_or_pipeline_default_warns(caplog, monkeypatch):
     monkeypatch.setattr(model_runner_module.logger, "handlers", [*model_runner_module.logger.handlers, caplog.handler])
     cache_backend = _EnabledCacheBackend()

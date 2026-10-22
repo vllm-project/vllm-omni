@@ -36,12 +36,14 @@ from vllm_omni.diffusion.attention.layer import Attention as FrameworkAttention
 from vllm_omni.diffusion.cache.cachedit import CacheDiTAdapterConfig
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelInput, SequenceParallelOutput
+from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
 from vllm_omni.diffusion.models.utils import release_module_parameters_to_meta
 from vllm_omni.diffusion.offloader.config import (
     OffloadStrategy,
     resolve_offload_strategy,
 )
+from vllm_omni.diffusion.offloader.module_residency import PinnedModuleStager
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.quantization.component_config import (
     ComponentQuantizationConfig,
@@ -191,8 +193,9 @@ def _validate_mixed_precision_runtime(
 ) -> None:
     if config is None:
         return
-    if get_tensor_model_parallel_world_size() != 1:
-        raise ValueError("Cosmos3 mixed precision currently supports tensor parallel size 1 only")
+    # The policy resolver validates serialized ModelOpt FP8/NVFP4 configs,
+    # including homogeneous modelopt_mixed configs. A16 uses each linear's
+    # local weight partition; Column/RowParallelLinear owns TP communication.
     if int(getattr(od_config, "max_num_seqs", 1)) != 1:
         raise ValueError("Cosmos3 mixed precision currently supports one active request per worker")
     if resolve_offload_strategy(od_config) is OffloadStrategy.DISTRIBUTED_LAYER_WISE:
@@ -202,7 +205,8 @@ def _validate_mixed_precision_runtime(
         )
     parallel_config = getattr(od_config, "parallel_config", None)
     if bool(getattr(parallel_config, "use_hsdp", False)):
-        raise ValueError("Cosmos3 mixed precision has not validated live backend weights under HSDP")
+        if resolve_offload_strategy(od_config) is not OffloadStrategy.NONE:
+            raise ValueError("Cosmos3 mixed precision with HSDP does not support CPU offload")
 
 
 def _as_bool(value: Any) -> bool:
@@ -1054,6 +1058,34 @@ class Cosmos3GenDecoderLayer(nn.Module):
 # ---------------------------------------------------------------------------
 # Language Model (Understanding pathway)
 # ---------------------------------------------------------------------------
+class _Cosmos3StagedEmbedding(nn.Embedding):
+    """Stage the large UND embedding only when selected for on-demand offload."""
+
+    def __init__(self, num_embeddings: int, embedding_dim: int) -> None:
+        super().__init__(num_embeddings, embedding_dim)
+        self._stager: PinnedModuleStager | None = None
+
+    def load_to_device(self) -> None:
+        if self._stager is not None:
+            self._stager.load()
+
+    def offload_to_cpu(self) -> None:
+        # The backend calls this after checkpoint loading. Snapshotting earlier
+        # would retain uninitialized or meta weights instead of the checkpoint.
+        if self._stager is None:
+            self._stager = PinnedModuleStager(self, get_local_device())
+        self._stager.offload()
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        if self._stager is None:
+            return super().forward(input)
+        try:
+            self.load_to_device()
+            return super().forward(input)
+        finally:
+            self.offload_to_cpu()
+
+
 class Cosmos3LanguageModel(nn.Module):
     """Understanding pathway: a standard causal LM that processes text tokens.
 
@@ -1082,7 +1114,7 @@ class Cosmos3LanguageModel(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        self.embed_tokens = nn.Embedding(vocab_size, hidden_size)
+        self.embed_tokens = _Cosmos3StagedEmbedding(vocab_size, hidden_size)
         self.rotary_emb = Qwen3VLTextRotaryEmbedding(
             head_dim=head_dim,
             rope_theta=rope_theta,

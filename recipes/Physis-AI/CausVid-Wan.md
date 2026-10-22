@@ -9,7 +9,13 @@
 - Codec (T5 / VAE): official `Wan-AI/Wan2.1-T2V-1.3B` via Diffusers layout
   `Wan-AI/Wan2.1-T2V-1.3B-Diffusers` (Omni needs Diffusers; same Wan-AI weights)
 - Engine: `ARDiffusionEngine` + `CausVidWanPipeline` (Cell / Noisy KV stack)
-- Default schedule: `num_denoise_steps=3`, `shift=8.0`, `S=T+1=4`
+- Defaults: `num_denoise_steps=3` (`D`), `shift=8.0`
+- Schedule ↔ topology:
+
+| Schedule | Deploy YAML | Topology |
+| --- | --- | --- |
+| Self-Forcing | `vllm_omni/deploy/causvid_wan_self_forcing.yaml` | `S=1`, `G=2` (2 GPUs, layer PP) |
+| Latest-KV | `vllm_omni/deploy/causvid_wan_latest_kv.yaml` | `S=D+1=4`, `G=1` (4 GPUs, vertical) |
 
 CausVid trains causal few-step DMD on Wan 2.1 1.3B. Official README uses native
 `wan_models/Wan2.1-T2V-1.3B/`; Omni loads the Diffusers packaging of that same
@@ -21,7 +27,8 @@ base, then remaps CausVid `model.pt` onto the DiT.
 | --- | --- |
 | Tokenizer / UMT5 / VAE | `--model` → `Wan-AI/Wan2.1-T2V-1.3B-Diffusers` |
 | DiT student | `model_config.causvid_ckpt` → CausVid `autoregressive_checkpoint/model.pt` |
-| Deploy | `vllm_omni/deploy/causvid_wan.yaml` |
+| Deploy (Self-Forcing) | `vllm_omni/deploy/causvid_wan_self_forcing.yaml` |
+| Deploy (Latest-KV) | `vllm_omni/deploy/causvid_wan_latest_kv.yaml` |
 
 ## Prepare checkpoints
 
@@ -36,7 +43,7 @@ huggingface-cli download tianweiy/CausVid \
   --local-dir /data/models/CausVid
 ```
 
-## Offline smoke (4 GPUs, Self-Forcing)
+## Offline smoke (2 GPUs, Self-Forcing)
 
 ```python
 from pathlib import Path
@@ -45,7 +52,7 @@ from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 repo = Path("/path/to/vllm-omni")
-cfg = OmegaConf.load(repo / "vllm_omni/deploy/causvid_wan.yaml")
+cfg = OmegaConf.load(repo / "vllm_omni/deploy/causvid_wan_self_forcing.yaml")
 cfg.stages[0].model_config.causvid_ckpt = (
     "/data/models/CausVid/autoregressive_checkpoint/model.pt"
 )
@@ -63,7 +70,7 @@ out = omni.generate(
         extra_args={
             "num_chunks": 7,
             "num_denoise_steps": 3,
-            "cell_schedule": "self_forcing",  # or latest_kv / same_step (canonical names only; serial/latest/interleaved removed)
+            "cell_schedule": "self_forcing",
             "shift": 8.0,
             "reset": True,
         },
@@ -71,13 +78,17 @@ out = omni.generate(
 )
 ```
 
+For Latest-KV, load `causvid_wan_latest_kv.yaml` instead (4 GPUs) and keep
+`cell_schedule: "latest_kv"` as in that file.
+
 ## Notes
 
 - **Self-Forcing** (`Ordering.SELF_FORCING`) matches CausVid clean-history
-  semantics; **Latest-KV** and **Same-Step** (`same_step`)
-  share the diagonal placement but differ in which history KV step is read —
-  Same-Step stays local (no KV P2P). Neither matches how CausVid was trained.
+  semantics on **S=1** layer PP. **Latest-KV** needs vertical **S=D+1** and
+  reads the newest finished history step (may P2P KV). CausVidWan rejects
+  `same_step`.
 - Exact official DMD timestep table parity (`1000/757/522`) vs the shared
   FlowEuler grid is still converging; defaults use CausVid **shift=8** and
-  **T=3** on the Euler cell path.
+  **D=3** (S=1 Self-Forcing uses clean when `H>0`; Latest-KV YAML uses
+  `S=D+1` with an explicit clean replica).
 - Do not wrap in `torchrun`; use deploy `distributed_executor_backend: mp`.

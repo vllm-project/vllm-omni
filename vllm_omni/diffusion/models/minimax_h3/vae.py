@@ -7,7 +7,7 @@ from __future__ import annotations
 import importlib
 import json
 import os
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from pathlib import Path
 from typing import Any, ClassVar
@@ -326,6 +326,9 @@ class _VideoVAEPartProxy(nn.Module):
 class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
     """Adapter around the checkpoint's native parallel-tiled video VAE."""
 
+    decode_dtype: torch.dtype = torch.float16
+    _pixel_transform: Callable[[torch.Tensor], torch.Tensor] | None = None
+
     def __init__(
         self,
         component_path: str,
@@ -335,6 +338,7 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         encode_only: bool = False,
         decode_only: bool = False,
         trust_remote_code: bool = False,
+        decoder_source: str | Mapping[str, str] | None = None,
     ) -> None:
         super().__init__()
         self._device_target = device
@@ -342,6 +346,16 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         self.decode_only = bool(decode_only)
         if self.encode_only and self.decode_only:
             raise ValueError("MiniMax H3 video VAE cannot be both encode-only and decode-only")
+        from .vae_nvfp4 import (
+            install_nvfp4_video_decoder,
+            released_decoder_pixels,
+            resolve_video_decoder_checkpoint,
+        )
+
+        decoder_path = resolve_video_decoder_checkpoint(decoder_source, device)
+        self._pixel_transform = released_decoder_pixels if decoder_path is not None else None
+        if self.encode_only and decoder_path is not None:
+            raise ValueError("An encode-only VAE cannot load a replacement video decoder")
         self.config_dict = _load_component_config(component_path)
         _check_trust_remote_code(component_path, self.config_dict, trust_remote_code)
         if self.encode_only:
@@ -355,14 +369,19 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         # weights may be materialized in FP16 because reference decode casts
         # those same tensors through CUDA autocast on every tile.
         initial_device = load_device or device
-        self.remote.eval().to(device=initial_device, dtype=torch.float32)
+        weight_device = torch.device("cpu") if decoder_path is not None else initial_device
+        self.remote.eval().to(device=weight_device, dtype=torch.float32)
+        if decoder_path is not None:
+            install_nvfp4_video_decoder(self.remote.model, decoder_path)
+            self.decode_dtype = torch.bfloat16
+            self.remote.to(device=initial_device)
         decoder = getattr(self.remote.model, "decoder", None)
-        if decoder is not None:
+        if decoder is not None and decoder_path is None:
             install_h3_vae_optimizations(
                 decoder,
                 device=device,
             )
-        install_temporal_stream_patches(self.remote.model)
+        install_temporal_stream_patches(self.remote.model, pixel_transform=self._pixel_transform)
         self.model = self.remote.model
         self._stager = None
         self._encoder_stager = None
@@ -1045,6 +1064,13 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         with self._decode_tiling_context(z):
             decode_h3_chunks(self, z, on_chunk, group=group)
 
+    def _revert_decoded(self, decoded: torch.Tensor) -> torch.Tensor:
+        """Preserve chunk storage that the temporal decoder may still use."""
+        if self._pixel_transform is not None:
+            return self._pixel_transform(decoded)
+        processor = getattr(self.model, "processor", None)
+        return decoded if processor is None else processor.revert_tensor(decoded)
+
     def _revert_decoded_inplace(self, decoded: torch.Tensor) -> torch.Tensor:
         """In-place counterpart of the processor's ``revert_tensor``.
 
@@ -1060,6 +1086,8 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         Falls back to ``processor.revert_tensor`` when the checkpoint's
         denormalization constants are not discoverable.
         """
+        if self._pixel_transform is not None:
+            return self._pixel_transform(decoded)
         processor = getattr(self.model, "processor", None)
         transform_rev = getattr(processor, "transform_rev", None)
         mean = getattr(transform_rev, "mean", None)

@@ -34,6 +34,11 @@ classifiers = [
 
 [project.optional-dependencies]
 
+ming-tn = [
+    "pynini",
+    "inflect",
+]
+
 dev = [
     "pytest==9.1.1",
     "pytest-asyncio==1.4.0",
@@ -132,6 +137,11 @@ vsa = [
     "fastvideo-kernel==0.3.4",
 ]
 
+# Public cuDNN BSA API with native tile64/tile128 kernels.
+cudnn-bsa = [
+    "nvidia-cudnn-frontend==1.31.0",
+]
+
 docs = [
     "mkdocs>=1.5.0",
     "mkdocs-api-autonav",
@@ -184,6 +194,7 @@ include = ["vllm_omni*"]
     "model_executor/models/step_audio2/assets/*.wav",
     "transformers_utils/chat_templates/*.jinja",
 ]
+"vllm_omni.model_executor.models.ming_flash_omni" = ["data/*.json", "LICENSE.Ming", "NOTICE"]
 
 [tool.setuptools_scm]
 # no extra settings needed, presence enables setuptools-scm
@@ -311,6 +322,7 @@ markers = [
     "RTX5090: [hardware-resource] [cuda] Tests that require an RTX 5090 GPU (SM120, compute capability 12.0)",
     "MI325: [hardware-resource] [rocm] Tests that require MI325 GPU (AMD/ROCm)",
     "B60: [hardware-resource] [xpu] Tests that require Intel Arc Pro B60 XPU",
+    "B70: [hardware-resource] [xpu] Tests that require Intel Arc Pro B70 XPU",
     "S5000: [hardware-resource] [musa] Tests that require S5000 GPU (Moore Threads/MUSA)",
     "A2: [hardware-resource] [npu] Tests that require A2 NPU",
     "A3: [hardware-resource] [npu] Tests that require A3 NPU",

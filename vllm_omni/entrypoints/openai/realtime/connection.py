@@ -1077,9 +1077,7 @@ class OpenAIFullDuplexConnection:
                         sp.structured_outputs = StructuredOutputsParams(structural_tag=structural_tag_json)
                     thinker_params_configured = True
 
-        sampling_params_list = self.chat_handler._fix_minicpmo45_audio_stream_output_kinds(
-            sampling_params_list, modalities
-        )
+        sampling_params_list = self.chat_handler._fix_audio_stream_output_kinds(sampling_params_list, modalities)
         gen = self.engine.generate(
             prompt=engine_input,
             request_id=active.request_id,

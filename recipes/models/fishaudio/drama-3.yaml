@@ -1,0 +1,179 @@
+# yaml-language-server: $schema=https://recipes.vllm.ai/recipe.schema.json
+meta:
+  title: "Fish Audio Drama 3"
+  slug: "fish-audio-drama-3"
+  provider: "Fish Audio"
+  description: "Fish Audio's multi-speaker text-to-speech model (35B MoE, 3B active) served via vLLM-Omni, with voice cloning, speaker tags and inline event tags through the OpenAI /v1/audio/speech API."
+  date_added: 2026-10-13
+  date_updated: 2026-10-13
+  tasks:
+    - omni
+  performance_headline: "1x H100: first audio 126 ms, RTF 0.28 at concurrency 1"
+  related_recipes:
+    - fishaudio/s2-pro
+    - Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice
+  default_hardware: h100
+  hardware:
+    h100: verified
+
+model:
+  model_id: "fishaudio/drama-3"
+  min_vllm_version: "0.31.0"
+  architecture: moe
+  parameter_count: "35B"
+  active_parameters: "3B"
+  context_length: 0
+  base_args:
+    - "--omni"
+  base_env: {}
+
+omni:
+  tasks:
+    - id: t2a
+      label: "Text → Speech"
+      endpoint: "/v1/audio/speech"
+      description: "Drama 3 voice-cloned TTS via /v1/audio/speech (44.1 kHz mono)"
+      curl: |
+        curl -X POST http://localhost:8000/v1/audio/speech \
+          -H "Content-Type: application/json" \
+          -d '{
+            "model": "fishaudio/drama-3",
+            "input": "The quarterly report is due on Thursday, so please finish it by noon.",
+            "voice": "default",
+            "ref_audio": "https://huggingface.co/datasets/zhaochenyang20/seed-tts-eval-mini/resolve/main/en/prompt-wavs/common_voice_en_10119832.wav",
+            "ref_text": "We asked over twenty different people, and they all said it was his.",
+            "response_format": "wav"
+          }' --output output.wav
+
+dependencies:
+  - note: "vLLM-Omni provides the TTS serving backend and the `--omni` serve path. Drama 3 support is in vllm-project/vllm-omni#8900."
+    command: "uv pip install git+https://github.com/vllm-project/vllm-omni.git"
+
+features: {}
+
+opt_in_features: []
+
+variants:
+  default:
+    precision: fp8
+    vram_minimum_gb: 48
+    description: "Block-FP8 routed experts, other weights BF16 — single GPU (stage-0 weights 36.9 GiB; reference run on 1x H100 80 GB)"
+
+compatible_strategies: []
+
+hardware_overrides: {}
+strategy_overrides: {}
+
+guide: |
+  ## Overview
+
+  [Fish Audio Drama 3](https://huggingface.co/fishaudio/drama-3) is a
+  text-to-speech model built for multi-character scenes and long-form content:
+  a 35B-total / 3B-active MoE text backbone plus a codebook decoder that
+  produces 10 codebooks per frame, decoded to **44.1 kHz mono** audio. It
+  supports zero-shot voice cloning, speaker tags (`<|speaker:0|>` …
+  `<|speaker:15|>`) and inline event tags such as `[sighs]` or `[laughs]`.
+
+  vLLM-Omni serves it as two stages on one GPU: the AR stage (backbone +
+  codebook decoder) streams frames to the codec stage, which returns audio
+  through the OpenAI-compatible `/v1/audio/speech` API.
+
+  ## Prerequisites
+
+  - **Hardware**: a single CUDA GPU with at least 48 GB. Reference run:
+    1x H100 80 GB (stage-0 weights 36.9 GiB).
+  - **vLLM-Omni** with Drama 3 support, on vLLM >= 0.31.
+
+  ## Installation
+
+  ```bash
+  uv venv && source .venv/bin/activate
+  uv pip install vllm==0.31.0 --torch-backend=auto
+  uv pip install git+https://github.com/vllm-project/vllm-omni.git
+  ```
+
+  ## Launch the server
+
+  The deploy config (`vllm_omni/deploy/fish_omni.yaml`) is picked up
+  automatically from `model_type=fish_omni`:
+
+  ```bash
+  vllm serve fishaudio/drama-3 --omni --port 8000
+  ```
+
+  The first request after start compiles kernels and takes about 10 s;
+  send a few warmup requests before measuring latency.
+
+  ## Client usage
+
+  ### Voice cloning (reference audio + transcript)
+
+  ```bash
+  curl -X POST http://localhost:8000/v1/audio/speech \
+    -H "Content-Type: application/json" \
+    -d '{
+      "model": "fishaudio/drama-3",
+      "input": "The quarterly report is due on Thursday, so please finish it by noon.",
+      "voice": "default",
+      "ref_audio": "https://huggingface.co/datasets/zhaochenyang20/seed-tts-eval-mini/resolve/main/en/prompt-wavs/common_voice_en_10119832.wav",
+      "ref_text": "We asked over twenty different people, and they all said it was his.",
+      "response_format": "wav"
+    }' --output cloned.wav
+  ```
+
+  ### Streaming
+
+  Add `"stream": true, "response_format": "pcm"` to receive Server-Sent
+  Events whose `speech.audio.delta` events carry base64 16-bit PCM at 44.1 kHz.
+
+  ### Event and emotion tags
+
+  Non-verbal events and delivery are controlled only through the input text.
+  Write a short natural-language descriptor in square brackets where the event
+  should happen:
+
+  ```text
+  [sighs] Fine. If we miss it, it's on you. [laughs] Well, maybe that's fair.
+  ```
+
+  - There is no fixed tag list. Tags are ordinary text (no special tokens), so
+    any short descriptor is accepted; wordings close to the ones Fish Audio
+    documents work best: `[sighs]`, `[laughs]`, `[laughing]`, `[whisper]`,
+    `[angry]`, `[excited]`, `[pause]`.
+  - Speaker tags `<|speaker:0|>` … `<|speaker:15|>` are the only special control
+    tokens: `"<|speaker:0|> Hi. <|speaker:1|> Hello."`. Text without a leading
+    speaker tag is spoken by speaker 0.
+  - The reference clip also shapes delivery implicitly (an expressive or
+    pause-heavy reference carries over), but it is not a targeted control.
+  - A tag or filler word at the very start of a line (`[sighs] …`, `Yeah. …`)
+    more often renders the first word or event and then only silence until
+    `max_new_tokens`; mid-sentence tags are more reliable.
+
+  ## Performance
+
+  1x H100 80 GB, both stages on one GPU, streaming `/v1/audio/speech`, one
+  voice-clone reference, temperature 1.0 / top_p 0.9 / top_k 30, warm server:
+
+  | Concurrency | First audio (p50) | RTF |
+  |---:|---:|---:|
+  | 1 | 126 ms | 0.28 |
+  | 4 | 246 ms | 0.40 |
+  | 8 | 360 ms | 0.51 |
+
+  Voice cloning, 5 public Common Voice reference voices x 4 English
+  sentences: Whisper-large-v3 WER 0.000.
+
+  ## Known limitations
+
+  - Output is **44.1 kHz mono**; voice cloning requires **both** `ref_audio`
+    and `ref_text`.
+  - Some takes finish speaking and then keep emitting silence until
+    `max_new_tokens`, most often on prompts that start with fillers or event
+    tags; cap `max_new_tokens` to the expected length of the text.
+  - Editing as continuation (`previous_takes`) and long-text chunking are not
+    exposed through the speech API yet.
+
+  ## References
+
+  - [Model card](https://huggingface.co/fishaudio/drama-3)
+  - vLLM-Omni support: vllm-project/vllm-omni [#8900](https://github.com/vllm-project/vllm-omni/pull/8900)
