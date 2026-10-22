@@ -18,7 +18,7 @@ from vllm_omni.model_executor.model_loader.weight_utils import download_weights_
 from .fasth3 import FASTH3_BASE_MODEL
 
 if TYPE_CHECKING:
-    from vllm_omni.diffusion.data import OmniDiffusionConfig
+    from vllm_omni.diffusion.data import AttentionSpec, OmniDiffusionConfig
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 FASTH3_V2_MODEL_ID = "FastVideo/FastVideo-FastH3-8-Step-V2"
@@ -26,6 +26,19 @@ FASTH3_V2_BASE_SCHEDULE = DMD2SigmaSchedule.from_positions((0.999, 0.874, 0.749,
 # The public V2 export omits provenance.json. This is the Omni adapter's native
 # VAE compatibility pin, not a claim about the release's training provenance.
 FASTH3_V2_NATIVE_VAE_REVISION = "9bfb6693f2cf6de171db46d1aa586f67d773a1da"
+
+
+def _scheduled_vsa_specs(od_config: OmniDiffusionConfig) -> list[tuple[str, AttentionSpec]]:
+    """The self-attention spec of each schedule profile that selects FASTVIDEO_VSA, with its name."""
+    schedule = od_config.diffusion_attention_schedule
+    if schedule is None:
+        return []
+    specs = []
+    for name, profile in schedule.profiles.items():
+        spec, _ = profile.resolve_with_source("self")
+        if spec is not None and spec.backend.upper() == "FASTVIDEO_VSA":
+            specs.append((name, spec))
+    return specs
 
 
 @dataclass(frozen=True)
@@ -118,6 +131,12 @@ class FastH3CheckpointSpec:
             raise ValueError(
                 f"{self.name} pins VSA sparsity={self.vsa_sparsity}; remove the fixed fastvideo_vsa_topk override"
             )
+        for name, spec in _scheduled_vsa_specs(od_config):
+            if spec.fastvideo_vsa_topk is not None:
+                raise ValueError(
+                    f"{self.name} pins VSA sparsity={self.vsa_sparsity}; remove the fixed fastvideo_vsa_topk "
+                    f"override from attention schedule profile {name!r}"
+                )
         parallel = od_config.parallel_config
         if parallel.ring_degree != 1 or parallel.allgather_degree != 1:
             raise ValueError(f"{self.name} supports local attention or pure Ulysses sequence parallelism")
@@ -171,14 +190,21 @@ class FastH3OmniCheckpointSpec(FastH3CheckpointSpec):
 
         attention, _ = od_config.diffusion_attention_config.resolve_with_source("self")
         assert attention is not None  # The base contract requires an explicit VSA spec.
-        resolve_block_sparse_provider(
-            attention.fastvideo_vsa_provider,
-            attention.fastvideo_vsa_precision,
-            get_local_device(),
-            od_config.dtype,
-            128,
-            block_size=self.vsa_tile_size,
-        )
+        # A scheduled VSA profile runs the same tile128 kernel at its steps, so it is checked the same way.
+        for profile, spec in [(None, attention), *_scheduled_vsa_specs(od_config)]:
+            try:
+                resolve_block_sparse_provider(
+                    spec.fastvideo_vsa_provider,
+                    spec.fastvideo_vsa_precision,
+                    get_local_device(),
+                    od_config.dtype,
+                    128,
+                    block_size=self.vsa_tile_size,
+                )
+            except (ImportError, ValueError) as exc:
+                if profile is None:
+                    raise
+                raise ValueError(f"{self.name} cannot run attention schedule profile {profile!r}: {exc}") from exc
 
     @classmethod
     def from_metadata(cls, metadata: Mapping[str, object]) -> FastH3OmniCheckpointSpec:
