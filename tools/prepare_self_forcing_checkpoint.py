@@ -66,14 +66,23 @@ def main() -> None:
                 allow_patterns=["model_index.json", *(f"{name}/*" for name in BASE_COMPONENTS)],
             )
         )
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    # Checked before the checkpoint is fetched, so a bad pair of paths costs nothing:
+    # assembling into the base model directory would delete the components it reads from,
+    # since each target below names the same path as its source and stale targets go first.
+    if output_dir.resolve() == base_dir.resolve():
+        raise ValueError(
+            f"--output-dir must not be the base model directory ({base_dir}). Assembling in place "
+            f"would delete the base components this script reads from."
+        )
+
     checkpoint = (
         Path(args.checkpoint)
         if args.checkpoint
         else Path(api.hf_hub_download(SELF_FORCING_REPO, SELF_FORCING_CHECKPOINT))
     )
 
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
     for name in BASE_COMPONENTS:
         source = (base_dir / name).resolve()
         target = output_dir / name
