@@ -96,7 +96,10 @@ export class VideoSession {
     this.video.src = this.url;
     this.video.autoplay = false;
     const fps = config.payload.fps || 16;
-    const windowSeconds = config.payload.streaming_buffer_seconds ?? 1.25;
+    // The server holds the next chunk back when it would push generated media past
+    // this window, so the window must cover the first chunk plus one more, or the
+    // player never buffers enough to start and the session idles out.
+    const windowSeconds = config.payload.streaming_buffer_seconds ?? 1.5;
     // Leave room for the next chunk without waiting for more than the server can produce.
     this.startupBufferSeconds = Math.min(1, Math.max(0, windowSeconds - 2 / fps));
     this.startTimer = setTimeout(() => this.fail("Timed out opening the video connection."), 15000);
@@ -116,7 +119,7 @@ export class VideoSession {
           if (this.ws !== ws) return;
           clearTimeout(this.startTimer);
           this.send(config.keyboard
-            ? { ...config.payload, streaming_buffer_seconds: config.payload.streaming_buffer_seconds ?? 1.25 }
+            ? { ...config.payload, streaming_buffer_seconds: config.payload.streaming_buffer_seconds ?? 1.5 }
             : config.payload);
           this.pingTimer = setInterval(() => this.send({ type: "session.ping" }), 20000);
           if (config.keyboard) this.playbackTimer = setInterval(() => this.sendPlayback(), 100);
