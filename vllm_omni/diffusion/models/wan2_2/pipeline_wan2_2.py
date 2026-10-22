@@ -27,7 +27,6 @@ from vllm_omni.diffusion.distributed.pipeline_parallel import AsyncLatents, Pipe
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.forward_context import DenoiseProgressMixin
 from vllm_omni.diffusion.lora.loader import WanLoraLoaderMixin
-from vllm_omni.diffusion.models.wan2_2.cudagraph_wrapper import Wan22DiTCUDAGraphWrapper
 from vllm_omni.diffusion.media import (
     DiffusionMediaOutput,
     VideoMediaOutput,
@@ -58,6 +57,7 @@ from vllm_omni.diffusion.models.wan2_2.conditioning import (
     validate_wan_conditioning,
     wan_first_frame_mask,
 )
+from vllm_omni.diffusion.models.wan2_2.cudagraph_wrapper import Wan22DiTCUDAGraphWrapper
 from vllm_omni.diffusion.models.wan2_2.scheduling_wan_euler import WanEulerScheduler
 from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import WanSelfAttention, WanTransformer3DModel
 from vllm_omni.diffusion.offloader import OffloadPlan
@@ -593,13 +593,20 @@ class Wan22Pipeline(
                 transformer.preserve_vsa_all_blocks = self.is_dmd
 
         # Single-transformer (TI2V-5B tier) per-shape DiT CUDA graph cache.
-        # DMD pipelines keep their distinct per-step behavior in eager mode;
-        # the A14B MoE ``transformer_2`` stage is deliberately not wrapped yet.
+        # Off by default: the RTX 5090 A/B in the PR measured no benefit, so
+        # the cache stays opt-in via ``model_config.wan22_dit_cudagraph`` until
+        # a workload justifies it. DMD pipelines keep their distinct per-step
+        # behavior in eager mode; the A14B MoE ``transformer_2`` stage is
+        # deliberately not wrapped yet.
         model_config = getattr(od_config, "model_config", None) or {}
         self.dit_cudagraph_wrapper = (
             Wan22DiTCUDAGraphWrapper(
                 self.transformer,
-                enabled=not getattr(od_config, "enforce_eager", False) and not self.is_dmd,
+                enabled=(
+                    bool(model_config.get("wan22_dit_cudagraph", False))
+                    and not getattr(od_config, "enforce_eager", False)
+                    and not self.is_dmd
+                ),
                 max_graphs=int(model_config.get("wan22_dit_max_graphs", 8)),
             )
             if self.transformer is not None
@@ -608,9 +615,7 @@ class Wan22Pipeline(
         # Consumed by the diffusion model runner: while the DiT graph cache is
         # active, inductor cudagraphs must stay off so the two graph layers
         # (torch.compile's and this wrapper's) never stack.
-        self.enable_cuda_graph_decode = (
-            self.dit_cudagraph_wrapper is not None and self.dit_cudagraph_wrapper.enabled
-        )
+        self.enable_cuda_graph_decode = self.dit_cudagraph_wrapper is not None and self.dit_cudagraph_wrapper.enabled
 
         # Store the active transformer config
         if load_transformer:
@@ -1626,7 +1631,9 @@ class Wan22Pipeline(
                 )
                 timestep = torch.zeros(1, device=device, dtype=dtype)
                 encoder_hidden_states = torch.zeros(1, 512, text_dim, device=device, dtype=dtype)
-                wrapper(hidden_states, timestep=timestep, encoder_hidden_states=encoder_hidden_states, return_dict=False)
+                wrapper(
+                    hidden_states, timestep=timestep, encoder_hidden_states=encoder_hidden_states, return_dict=False
+                )
         logger.info(
             "Wan2.2 DiT startup graph warm-up captured %d shape(s) in %.1fs",
             len(shapes),

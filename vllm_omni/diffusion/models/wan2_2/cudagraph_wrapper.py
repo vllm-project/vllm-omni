@@ -87,11 +87,7 @@ class Wan22DiTCUDAGraphWrapper:
         # ``None``-valued and empty-dict keyword arguments (the denoise loop
         # normalizes ``attention_kwargs=None`` to ``{}``) are equivalent to
         # omitting them and stay capturable.
-        kwargs = {
-            k: v
-            for k, v in kwargs.items()
-            if v is not None and not (isinstance(v, dict) and not v)
-        }
+        kwargs = {k: v for k, v in kwargs.items() if v is not None and not (isinstance(v, dict) and not v)}
         timestep = kwargs.get("timestep")
         encoder_hidden_states = kwargs.get("encoder_hidden_states")
         capturable = (
