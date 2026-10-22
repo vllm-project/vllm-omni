@@ -478,6 +478,12 @@ class MiniCPMO45Code2Wav(nn.Module):
             ),
             "slot_pool": read_bool_flag(extra, "cfm_slot_pool", False),
             "row_offset_merge": read_bool_flag(extra, "cfm_row_offset_merge", False),
+            # Keep one immutable prompt estimator-cache suffix per voice and
+            # only a request-owned prefix in each state.
+            "prompt_att_sharing": read_bool_flag(extra, "cfm_prompt_att_sharing", False),
+            # Arena storage follows the largest explicitly captured graph tier
+            # instead of max_num_seqs; larger batches replay multiple tiers.
+            "arena_rows_from_graph_grid": read_bool_flag(extra, "cfm_arena_rows_from_graph_grid", False),
         }
         # Exact-shape flow-encoder graphs (``FlowEncoderGraphs``, default off).
         # ``cfm_encoder_graph_rows`` is the largest row count or a list of counts.

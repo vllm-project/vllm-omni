@@ -104,6 +104,7 @@ PRIVATE_RUNTIME_CONFIG_KEYS = frozenset(
         "duplex_window_suffix_token_ids",
         "duplex_window_previous_marker_token_ids",
         "duplex_window_special_token_ids",
+        "duplex_context_caching",
     }
 )
 
@@ -770,6 +771,12 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
         runtime_config: dict[str, object] = {"instructions": config.instructions}
         window_config = self._pop_window_config(extra_body) or MiniCPMO45DuplexWindowConfig()
         runtime_config["duplex_window_config"] = window_config.as_dict()
+        context_caching = getattr(model_config, "duplex_context_caching", None)
+        if context_caching is None:
+            stage_conn = getattr(model_config, "stage_connector_config", {}) or {}
+            extra = stage_conn.get("extra", {}) if isinstance(stage_conn, dict) else {}
+            context_caching = extra.get("duplex_context_caching", False)
+        runtime_config["duplex_context_caching"] = bool(context_caching)
         # ``duplex_initial_user_text`` is the older extra_body spelling and
         # still works; the session field is the framework-level one.
         initial_user_text = extra_body.pop("duplex_initial_user_text", None)

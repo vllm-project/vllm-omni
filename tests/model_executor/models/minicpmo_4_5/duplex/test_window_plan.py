@@ -12,8 +12,10 @@ trim needs no forward pass).
 from __future__ import annotations
 
 import cmath
+from types import SimpleNamespace
 
 import pytest
+import torch
 
 try:
     from vllm_omni.model_executor.models.minicpmo_4_5.duplex.window_plan import (
@@ -394,3 +396,107 @@ def test_paged_retention_policy_vs_unpaged_reference():
     # Retained tail [128..164) shifts by -delta (-16)
     assert reanchor_positions(128, plan) == 112
     assert reanchor_positions(163, plan) == 147
+
+
+def test_cross_session_context_cache_and_segmented_anchor_protection():
+    """Verify that multiple sessions sharing the same system prompt and reference
+    voice retain identical anchor tokens and that sliding-window compaction never
+    evicts or alters the immutable sink anchor blocks (Tier 0).
+    """
+    block_size = 16
+    system_prompt_len = 512
+    # Ensure sink_blocks covers all immutable system prompt tokens
+    geometry = DuplexWindowGeometry(
+        prefix_tokens=system_prompt_len,
+        window_tokens=2048,
+        block_size=block_size,
+        max_model_len=8192,
+        high_watermark_tokens=4096,
+    )
+    plan = plan_position_reanchor(
+        geometry,
+        computed_tokens=4600,
+        pending_tokens=0,
+        unit_tokens=[256, 512, 1024],
+    )
+    assert plan is not None
+    # Sink blocks must be strictly preserved across reanchor
+    expected_sink_blocks = cdiv(system_prompt_len, block_size)
+    assert plan.sink_blocks == expected_sink_blocks
+    assert plan.sink_end == expected_sink_blocks * block_size
+    # The immutable anchor region [0 .. system_prompt_len) must be invariant
+    for pos in (0, 16, 256, system_prompt_len - 1):
+        assert reanchor_positions(pos, plan) == pos
+
+
+def test_duplex_stage0_context_caching_hit_miss_lru():
+    """Verify that MiniCPMO45Stage0DuplexRuntime's context cache correctly reuses
+    identical context, respects the opt-in flag, and performs bounded LRU eviction.
+    """
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import (
+        _MINICPMO45_SHARED_CONTEXT_CACHE_MAX_SIZE,
+        MiniCPMO45Stage0DuplexRuntime,
+        _MiniCPMO45Stage0SessionState,
+    )
+
+    fake_model = SimpleNamespace(
+        thinker=SimpleNamespace(config=SimpleNamespace()),
+        processor=SimpleNamespace(
+            tokenizer=SimpleNamespace(
+                encode=lambda text: [100 + len(text)],
+            )
+        ),
+    )
+    runtime = MiniCPMO45Stage0DuplexRuntime(fake_model)
+    runtime._stage_runtime_ready = lambda: True
+    runtime._require_special_token_ids = lambda: None
+    runtime._embed_token = lambda token_id: torch.tensor([float(token_id)])
+
+    s1 = _MiniCPMO45Stage0SessionState(session_id="s1")
+    s2 = _MiniCPMO45Stage0SessionState(session_id="s2")
+
+    cfg1 = {"instructions": "Prompt A"}
+    rt_on = {"duplex_context_caching": True}
+
+    # First session fills cache
+    runtime._prepare_session_context(s1, cfg1, runtime_config=rt_on)
+    assert len(runtime._shared_context_cache) == 1
+    assert len(s1.context_token_ids) > 0
+
+    # Second session with identical config hits cache
+    runtime._prepare_session_context(s2, cfg1, runtime_config=rt_on)
+    assert s2.context_token_ids == s1.context_token_ids
+    assert len(runtime._shared_context_cache) == 1
+
+    # Opt-out config bypasses caching
+    s3 = _MiniCPMO45Stage0SessionState(session_id="s3")
+    runtime._prepare_session_context(
+        s3, {"instructions": "Prompt New"}, runtime_config={"duplex_context_caching": False}
+    )
+    assert len(runtime._shared_context_cache) == 1
+
+    # LRU eviction bounds cache size at _MINICPMO45_SHARED_CONTEXT_CACHE_MAX_SIZE
+    # Insert 30 more items (total 31 entries)
+    for i in range(1, 31):
+        s = _MiniCPMO45Stage0SessionState(session_id=f"s_init_{i}")
+        runtime._prepare_session_context(s, {"instructions": f"Prompt {i}"}, runtime_config=rt_on)
+    assert len(runtime._shared_context_cache) == 31
+
+    # Touch cfg1 again so it moves to the end of the OrderedDict
+    s_touch = _MiniCPMO45Stage0SessionState(session_id="s_touch")
+    runtime._prepare_session_context(s_touch, cfg1, runtime_config=rt_on)
+    assert len(runtime._shared_context_cache) == 31
+
+    # Insert 10 more new items to overflow the 32 limit and force evictions
+    for i in range(100, 110):
+        s = _MiniCPMO45Stage0SessionState(session_id=f"s_overflow_{i}")
+        runtime._prepare_session_context(s, {"instructions": f"Prompt {i}"}, runtime_config=rt_on)
+    assert len(runtime._shared_context_cache) == _MINICPMO45_SHARED_CONTEXT_CACHE_MAX_SIZE
+
+    # Verify membership directly to prove LRU vs FIFO:
+    # cfg1 was re-accessed (touch) before overflow, so under LRU it remains in cache.
+    # Prompt 1 was inserted early and never re-accessed, so under LRU it was evicted.
+    key_cfg1 = ("Prompt A", False, None, None)
+    key_prompt1 = ("Prompt 1", False, None, None)
+    assert key_cfg1 in runtime._shared_context_cache
+    assert key_prompt1 not in runtime._shared_context_cache

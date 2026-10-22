@@ -278,3 +278,24 @@ def test_final_exact_chunk_append_reserves_one_unit_not_two(seq):
         return len(prompt["prompt_token_ids"])
 
     assert _budget(seq=seq, final=True) == _budget(seq=seq, final=False)
+
+
+@pytest.mark.asyncio
+async def test_prepare_runtime_config_wires_duplex_context_caching():
+    plugin = _plugin()
+    config = DuplexSessionConfig(modalities=("text",))
+
+    # 1. From model_config.duplex_context_caching
+    mc1 = SimpleNamespace(duplex_context_caching=True)
+    rt1 = await plugin.prepare_runtime_config(config, model_config=mc1)
+    assert rt1["duplex_context_caching"] is True
+
+    # 2. From model_config.stage_connector_config.extra
+    mc2 = SimpleNamespace(stage_connector_config={"extra": {"duplex_context_caching": True}})
+    rt2 = await plugin.prepare_runtime_config(config, model_config=mc2)
+    assert rt2["duplex_context_caching"] is True
+
+    # 3. Default when unset
+    mc3 = SimpleNamespace()
+    rt3 = await plugin.prepare_runtime_config(config, model_config=mc3)
+    assert rt3["duplex_context_caching"] is False

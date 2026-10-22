@@ -5,8 +5,10 @@ from __future__ import annotations
 
 import base64
 import copy
+import hashlib
 import os
 import time
+from collections import OrderedDict
 from collections.abc import Callable, Generator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
@@ -33,6 +35,7 @@ _MINICPMO45_OPTIONAL_TOKEN_FIELDS = MiniCPMO45DuplexPolicy.OPTIONAL_TOKEN_FIELDS
 _MINICPMO45_PROCESSOR_LOAD_LOCK = Lock()
 _MINICPMO45_FRAME_POOL_LOCK = Lock()
 _MINICPMO45_FRAME_POOL: ThreadPoolExecutor | None = None
+_MINICPMO45_SHARED_CONTEXT_CACHE_MAX_SIZE = 32
 
 
 def _optional_int(value: Any) -> int | None:
@@ -157,6 +160,14 @@ class MiniCPMO45Stage0DuplexRuntime:
         # Built with the model, before its weights load and it switches to eval mode:
         # the streaming encoder's CUDA graphs are captured later, by build_audio_cuda_graph().
         self._audio_graph_attempted = False
+        # Cross-session Tier-0 immutable context embedding cache:
+        # (instructions, has_ref_audio, initial_user_text, ref_audio_hash) ->
+        #   (context_embeds, context_token_ids, prefix_embeds, prefix_token_ids,
+        #    suffix_embeds, suffix_token_ids, has_streaming_side_effects)
+        self._shared_context_cache: OrderedDict[
+            tuple[Any, ...],
+            tuple[list[Any], list[int], list[Any], list[int], list[Any], list[int], bool],
+        ] = OrderedDict()
 
     def build_audio_cuda_graph(self) -> bool:
         """Capture the streaming-encoder CUDA graphs once weights are loaded (idempotent; failures stay eager).
@@ -286,32 +297,77 @@ class MiniCPMO45Stage0DuplexRuntime:
         # template is shared with the serving adapter so the first-append
         # scheduler reserve can count these tokens exactly.
         initial_user_text = (runtime_config or {}).get("initial_user_text")
-        prefix, suffix = MiniCPMO45DuplexPolicy.session_context_texts(
-            session_config.get("instructions"),
-            ref_audio is not None,
-            initial_user_text,
-        )
-        for token_id in self._encode_text(prefix):
-            embed = self._embed_token(token_id)
-            state.context_embeds.append(embed)
-            state.context_token_ids.append(token_id)
-            state.context_prefix_embeds.append(embed)
-            state.context_prefix_token_ids.append(token_id)
+        instructions = session_config.get("instructions")
+        enable_context_caching = bool((runtime_config or {}).get("duplex_context_caching", False))
+        ref_hash = None
         if ref_audio is not None:
-            ref_audio_embeds = self._stage_ref_audio_embeddings(ref_audio, state=state)
-            if ref_audio_embeds is not None:
-                ref_audio_embeds = self._as_2d_tensor(ref_audio_embeds)
-                placeholder_ids = [self.unit_token_id] * int(ref_audio_embeds.shape[0])
-                state.context_embeds.append(ref_audio_embeds)
-                state.context_token_ids.extend(placeholder_ids)
-                state.context_prefix_embeds.append(ref_audio_embeds)
-                state.context_prefix_token_ids.extend(placeholder_ids)
-        for token_id in self._encode_text(suffix):
-            embed = self._embed_token(token_id)
-            state.context_embeds.append(embed)
-            state.context_token_ids.append(token_id)
-            state.context_suffix_embeds.append(embed)
-            state.context_suffix_token_ids.append(token_id)
+            data = ref_audio.tobytes() if hasattr(ref_audio, "tobytes") else str(ref_audio).encode("utf-8")
+            ref_hash = hashlib.sha256(data).hexdigest()
+        cache_key = (instructions, ref_audio is not None, initial_user_text, ref_hash)
+        cached = None
+        if enable_context_caching and cache_key in self._shared_context_cache:
+            self._shared_context_cache.move_to_end(cache_key)
+            cached = self._shared_context_cache[cache_key]
+        if cached is not None:
+            c_embeds, c_tokens, p_embeds, p_tokens, s_embeds, s_tokens, is_streaming_path = cached
+            state.context_embeds.extend(c_embeds)
+            state.context_token_ids.extend(c_tokens)
+            state.context_prefix_embeds.extend(p_embeds)
+            state.context_prefix_token_ids.extend(p_tokens)
+            state.context_suffix_embeds.extend(s_embeds)
+            state.context_suffix_token_ids.extend(s_tokens)
+            # Only replay side effects if the streaming fallback path was used
+            if ref_audio is not None and is_streaming_path:
+                self._stage_ref_audio_embeddings(ref_audio, state=state)
+        else:
+            c_embeds, c_tokens = [], []
+            p_embeds, p_tokens = [], []
+            s_embeds, s_tokens = [], []
+            is_streaming_path = False
+            prefix, suffix = MiniCPMO45DuplexPolicy.session_context_texts(
+                instructions,
+                ref_audio is not None,
+                initial_user_text,
+            )
+            for token_id in self._encode_text(prefix):
+                embed = self._embed_token(token_id)
+                c_embeds.append(embed)
+                c_tokens.append(token_id)
+                p_embeds.append(embed)
+                p_tokens.append(token_id)
+            if ref_audio is not None:
+                ref_audio_embeds, is_streaming_path = self._stage_ref_audio_embeddings(ref_audio, state=state)
+                if ref_audio_embeds is not None:
+                    ref_audio_embeds = self._as_2d_tensor(ref_audio_embeds)
+                    placeholder_ids = [self.unit_token_id] * int(ref_audio_embeds.shape[0])
+                    c_embeds.append(ref_audio_embeds)
+                    c_tokens.extend(placeholder_ids)
+                    p_embeds.append(ref_audio_embeds)
+                    p_tokens.extend(placeholder_ids)
+            for token_id in self._encode_text(suffix):
+                embed = self._embed_token(token_id)
+                c_embeds.append(embed)
+                c_tokens.append(token_id)
+                s_embeds.append(embed)
+                s_tokens.append(token_id)
+            if enable_context_caching:
+                if len(self._shared_context_cache) >= _MINICPMO45_SHARED_CONTEXT_CACHE_MAX_SIZE:
+                    self._shared_context_cache.popitem(last=False)
+                self._shared_context_cache[cache_key] = (
+                    c_embeds,
+                    c_tokens,
+                    p_embeds,
+                    p_tokens,
+                    s_embeds,
+                    s_tokens,
+                    is_streaming_path,
+                )
+            state.context_embeds.extend(c_embeds)
+            state.context_token_ids.extend(c_tokens)
+            state.context_prefix_embeds.extend(p_embeds)
+            state.context_prefix_token_ids.extend(p_tokens)
+            state.context_suffix_embeds.extend(s_embeds)
+            state.context_suffix_token_ids.extend(s_tokens)
         if isinstance(initial_user_text, str) and initial_user_text:
             # Seeded text is pending user content just like a speech append.
             # Otherwise the turn-ended latch forces its silent input clock to
@@ -1103,7 +1159,7 @@ class MiniCPMO45Stage0DuplexRuntime:
         ref_audio: NDArray[np.float32],
         *,
         state: _MiniCPMO45Stage0SessionState | None = None,
-    ) -> torch.Tensor | None:
+    ) -> tuple[torch.Tensor | None, bool]:
         process_audio = getattr(self.processor, "process_audio", None)
         if callable(process_audio):
             batch_feature = process_audio([ref_audio])
@@ -1116,18 +1172,19 @@ class MiniCPMO45Stage0DuplexRuntime:
                     try:
                         chunk_length = getattr(getattr(target, "config", None), "audio_chunk_length", None)
                         if chunk_length is not None:
-                            return self._cat_nested_tensors(
-                                get_audio_embedding(batch_feature, chunk_length=chunk_length)
+                            return (
+                                self._cat_nested_tensors(get_audio_embedding(batch_feature, chunk_length=chunk_length)),
+                                False,
                             )
                     except TypeError:
                         pass
-                    return self._cat_nested_tensors(get_audio_embedding(batch_feature))
+                    return self._cat_nested_tensors(get_audio_embedding(batch_feature)), False
                 # The split vLLM stage0 wrapper ports official
                 # get_audio_embedding(chunk_length=...) as
                 # get_audio_hidden_states (chunk_length comes from config).
                 get_hidden = getattr(target, "get_audio_hidden_states", None)
                 if callable(get_hidden):
-                    return self._cat_nested_tensors(get_hidden(batch_feature))
+                    return self._cat_nested_tensors(get_hidden(batch_feature)), False
         # The split vLLM stage0 wrapper may only expose the streaming encoder
         # path.  Use it as a fallback so the server-resolved reference audio is
         # still represented in the same system context location as official
@@ -1142,7 +1199,7 @@ class MiniCPMO45Stage0DuplexRuntime:
         ):
             with suppress(Exception):
                 setattr(batch_feature, name, value)
-        return self._stage_audio_embeddings(batch_feature, state=state)
+        return self._stage_audio_embeddings(batch_feature, state=state), True
 
     @staticmethod
     def _ensure_dynamic_cache_compat() -> None:

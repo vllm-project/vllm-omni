@@ -222,6 +222,8 @@ def test_cfm_fused_body_default_respects_platform_and_precision(monkeypatch, cud
     assert model._cfm_graph_config["fused_body"] is expected
     assert model._cfm_graph_config["slot_pool"] is False
     assert model._cfm_graph_config["row_offset_merge"] is False
+    assert model._cfm_graph_config["prompt_att_sharing"] is False
+    assert model._cfm_graph_config["arena_rows_from_graph_grid"] is False
 
 
 @pytest.mark.parametrize("extra,expected", [({}, True), ({"cfm_fused_body": False}, False)])

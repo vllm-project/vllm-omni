@@ -19,6 +19,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
     _zero_padded_frames,
 )
 from vllm_omni.model_executor.models.minicpmo_4_5.cuda_graph_wrapper import (
+    SharedPromptAttCache,
     WholeEulerCFMGraphWrapper,
     _att_keep_ranges,
     _build_capture_mask,
@@ -28,6 +29,30 @@ from vllm_omni.model_executor.models.minicpmo_4_5.cuda_graph_wrapper import (
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+def test_shared_prompt_attention_cache_is_bit_exact_and_range_copyable():
+    prompt = torch.arange(2 * 2 * 2 * 1 * 5 * 4, dtype=torch.float32).reshape(2, 2, 2, 1, 5, 4)
+    delta = torch.arange(2 * 2 * 2 * 1 * 3 * 4, dtype=torch.float32).reshape(2, 2, 2, 1, 3, 4) + 1000
+    shared = SharedPromptAttCache(prompt, delta)
+    torch.testing.assert_close(shared.materialize(), torch.cat((prompt, delta), dim=4), rtol=0, atol=0)
+    copied = torch.empty_like(shared.materialize())
+    shared.copy_range_to(copied[..., :4, :], 0, 4)
+    shared.copy_range_to(copied[..., 4:, :], 4, 4)
+    torch.testing.assert_close(copied, shared.materialize(), rtol=0, atol=0)
+
+
+def test_whole_euler_arena_rows_from_graph_grid_and_env(monkeypatch):
+    """Verify that VLLM_OMNI_CFM_GRAPH_GRID pins graph batches and decouples arena rows."""
+    monkeypatch.setenv("VLLM_OMNI_CFM_GRAPH_GRID", "1,4,8,16")
+    wrapper = WholeEulerCFMGraphWrapper(
+        estimator=torch.nn.Identity(),
+        micro_batch_size=32,
+        arena_rows_from_graph_grid=True,
+    )
+    # Sizes above micro_batch_size are dropped; largest pinned size in grid becomes arena rows
+    assert wrapper._graph_batches() == [1, 4, 8, 16]
+    assert wrapper._arena_rows == 16
 
 
 def test_pads_partial_chunk_up_to_bucket():
