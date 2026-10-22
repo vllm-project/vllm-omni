@@ -191,6 +191,14 @@ class CFGParallelMixin(metaclass=ABCMeta):
                 pred = _unwrap(_slice_pred(_wrap(pred), output_slice))
             return pred
 
+    def runs_separate_cfg_forwards(self, do_true_cfg: bool) -> bool:
+        """Return whether this rank runs both CFG branches itself, as two forwards per step.
+
+        Mirrors ``predict_noise_maybe_with_cfg``: without CFG there is one
+        forward per step, and in CFG parallel each rank computes one branch.
+        """
+        return do_true_cfg and _get_cfg_world_size_or_one() == 1
+
     def cfg_normalize_function(self, noise_pred: torch.Tensor, comb_pred: torch.Tensor) -> torch.Tensor:
         """
         Normalize the combined noise prediction.

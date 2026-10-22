@@ -13,12 +13,18 @@ from unittest.mock import Mock, patch
 
 import pytest
 import torch
+from cache_dit import ForwardPattern
 from cache_dit.caching.cache_blocks.pattern_0_1_2 import CachedBlocks_Pattern_0_1_2
 from vllm.distributed import parallel_state
 
 import vllm_omni.diffusion.cache.cachedit as cd_backend
 import vllm_omni.diffusion.cache.cachedit.model_specific as cd_model_specific
-from vllm_omni.diffusion.cache.cachedit import CacheDiTAdapterConfig, CacheDiTBackend, cache_summary
+from vllm_omni.diffusion.cache.cachedit import (
+    CacheDiTAdapterConfig,
+    CacheDiTBackend,
+    cache_summary,
+    set_separate_cfg,
+)
 from vllm_omni.diffusion.config import set_current_diffusion_config
 from vllm_omni.diffusion.data import AttentionConfig, DiffusionCacheConfig
 from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import Cosmos3VFMTransformer
@@ -171,6 +177,7 @@ def test_cachedit_public_api_is_explicit():
         "SensenovaCachedAdapter",
         "cache_summary",
         "enable_cache_for_dit",
+        "set_separate_cfg",
     }
     assert not hasattr(cd_backend, "enable_cache_for_wan22")
     assert not hasattr(cd_backend, "enable_cache_for_wan22_s2v")
@@ -528,3 +535,96 @@ def test_mammothmoda2_cache_dit_runs_end_to_end_on_tiny_model(init_fake_tp_group
 
     assert latents.shape == (1, 4, 8, 8)
     assert torch.isfinite(latents).all()
+
+
+class _TinyPattern3Block(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.linear = torch.nn.Linear(8, 8)
+
+    def forward(self, hidden_states: torch.Tensor, **kwargs) -> torch.Tensor:
+        return hidden_states + 0.01 * self.linear(hidden_states)
+
+
+class _TinyPattern3Transformer(torch.nn.Module):
+    """Smallest model the generic Cache-DiT path wraps; like SD3 it declares no CFG flag."""
+
+    _cache_dit_adapter_config = CacheDiTAdapterConfig(
+        block_forward_patterns={"transformer_blocks": ForwardPattern.Pattern_3},
+        check_forward_pattern=False,
+    )
+
+    def __init__(self):
+        super().__init__()
+        self.transformer_blocks = torch.nn.ModuleList([_TinyPattern3Block() for _ in range(4)])
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        for block in self.transformer_blocks:
+            hidden_states = block(hidden_states)
+        return hidden_states
+
+
+def _enable_cache_dit_on_tiny_transformer(request: pytest.FixtureRequest):
+    model = _TinyPattern3Transformer().eval()
+    pipeline = type("TinyPipeline", (), {})()
+    pipeline.transformer = model
+    backend = CacheDiTBackend(DiffusionCacheConfig())
+    backend.enable(pipeline)
+    request.addfinalizer(lambda: backend.disable(pipeline))
+    return model, pipeline, backend
+
+
+def _run_forwards(model: torch.nn.Module, count: int) -> None:
+    hidden_states = torch.randn(1, 4, 8)
+    with torch.no_grad():
+        for _ in range(count):
+            model(hidden_states)
+
+
+def _cache_context(model: torch.nn.Module):
+    return model._context_manager.get_context(model._context_names[0])
+
+
+def test_set_separate_cfg_matches_step_accounting_to_forwards_per_step(request: pytest.FixtureRequest):
+    """Regression test for https://github.com/vllm-project/vllm-omni/issues/8734.
+
+    Cache-DiT must count two forwards per denoise step for a sequential-CFG
+    request and one for a no-CFG request, on the same installed hooks.
+    """
+    model, pipeline, backend = _enable_cache_dit_on_tiny_transformer(request)
+    num_inference_steps = 6
+
+    backend.refresh(pipeline, num_inference_steps, verbose=False)
+    set_separate_cfg(model, True)
+    _run_forwards(model, 2 * num_inference_steps)
+
+    context = _cache_context(model)
+    assert context.cache_config.enable_separate_cfg is True
+    assert context.cache_config.num_inference_steps == num_inference_steps
+    assert context.executed_steps == num_inference_steps
+    assert context.transformer_executed_steps == 2 * num_inference_steps
+
+    # The runner's step refresh keeps the previous request's flag, so a no-CFG
+    # request has to set it back.
+    backend.refresh(pipeline, num_inference_steps, verbose=False)
+    assert _cache_context(model).cache_config.enable_separate_cfg is True
+    set_separate_cfg(model, False)
+    _run_forwards(model, num_inference_steps)
+
+    context = _cache_context(model)
+    assert context.cache_config.enable_separate_cfg is False
+    assert context.cache_config.num_inference_steps == num_inference_steps
+    assert context.executed_steps == num_inference_steps
+    assert context.transformer_executed_steps == num_inference_steps
+
+
+def test_set_separate_cfg_does_nothing_without_cache_dit(request: pytest.FixtureRequest):
+    """Pipelines call it for every request, whichever cache backend is configured."""
+    model, pipeline, backend = _enable_cache_dit_on_tiny_transformer(request)
+    backend.disable(pipeline)
+
+    with patch("vllm_omni.diffusion.cache.cachedit.backend.cache_dit.refresh_context") as mock_refresh_context:
+        set_separate_cfg(model, True)
+        set_separate_cfg(_TinyPattern3Transformer(), True)
+
+    mock_refresh_context.assert_not_called()

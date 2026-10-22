@@ -82,6 +82,24 @@ def cache_summary(pipeline: SupportsComponentDiscovery, details: bool = True) ->
         logger.warning("CacheDiT summary failed; this pipeline has no defined transformer attribute")
 
 
+def set_separate_cfg(transformer: nn.Module, enable_separate_cfg: bool) -> None:
+    """Tell Cache-DiT whether the next denoise runs CFG as two forwards per step.
+
+    Cache-DiT tells the conditional and unconditional passes apart purely by
+    transformer-forward parity, so the flag has to match what the request does
+    on this rank. A pipeline whose CFG mode is only known per request calls
+    this after the runner's step refresh. Only this field of the installed
+    cache context changes, and it stays until the next call, so call it for
+    every request. Does nothing when Cache-DiT is not enabled on ``transformer``.
+    """
+    if not BlockAdapter.is_cached(transformer):
+        return
+    cache_dit.refresh_context(
+        transformer,
+        cache_config=DBCacheConfig().reset(enable_separate_cfg=enable_separate_cfg),
+    )
+
+
 def _default_get_pipeline_transformer(
     pipeline: SupportsComponentDiscovery,
 ) -> nn.Module:
@@ -363,4 +381,5 @@ __all__ = [
     "CacheDiTBackend",
     "cache_summary",
     "enable_cache_for_dit",
+    "set_separate_cfg",
 ]

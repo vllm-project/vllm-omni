@@ -209,6 +209,26 @@ Per request, the pipeline calls `runtime.prepare(spec)` for CFG requests
 requests (disabling hooks — their single forward per step cannot be expressed
 by the parity accounting).
 
+### Example 4: Per-Request CFG on a Standard Model (Stable Diffusion 3.5)
+
+Stable Diffusion 3.5 uses the default enabler, but how many transformer
+forwards a denoise step runs depends on the request: two with sequential CFG
+(`guidance_scale > 1`), one without CFG, and one per rank with CFG parallel. A
+static `has_separate_cfg` is wrong for some of these requests, and disabling
+the hooks for no-CFG requests would give up their speed-up.
+
+**Key difference:** the hooks stay installed and the pipeline sets the flag
+for every request, after the runner's step refresh and before the denoise loop:
+
+```python
+do_cfg = self.guidance_scale > 1
+set_separate_cfg(self.transformer, self.runs_separate_cfg_forwards(do_cfg))
+```
+
+`set_separate_cfg` only changes `enable_separate_cfg` in the installed cache
+context. The value stays until the next call, so it has to be called for every
+request, not only for CFG ones.
+
 ### Registering Custom Implementations
 
 After writing your custom enabler, register it in
@@ -310,6 +330,7 @@ Complete examples in the codebase:
 | **LongCat** | `cachedit.config::CacheDiTAdapterConfig` | Declarative block adapter | Two block lists in one transformer |
 | **BAGEL** | `cachedit.model_specific::BagelCachedAdapter` | Custom cached adapter | Complex architecture |
 | **MammothModa2** | `cachedit.model_specific::enable_cache_for_mammothmoda2` | Sub-stack + paired CFG | Generation-runner pipeline; lifecycle owned by `pipeline_mammothmoda2_dit.py` |
+| **Stable Diffusion 3.5** | `cachedit.backend::set_separate_cfg` | Per-request CFG flag | Default enabler; `pipeline_sd3.py` sets the flag for every request |
 
 ---
 
