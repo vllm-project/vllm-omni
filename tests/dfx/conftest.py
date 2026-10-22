@@ -678,7 +678,7 @@ def run_benchmark(
     with open(result_path, "w", encoding="utf-8") as f:
         json.dump(result, f, ensure_ascii=False, indent=2)
     if dataset_name == "omni-duplex-eval" and "--duplex-eval-evaluate" in args and accuracy_baseline is not None:
-        from tests.e2e.accuracy.qwen3_omni.run_qwen_omni_acc_benchmark import _acc_result_filename
+        from tests.e2e.accuracy.helpers import _acc_result_filename
 
         def argument(name: str, default: str = "") -> str:
             return args[args.index(name) + 1] if name in args else default

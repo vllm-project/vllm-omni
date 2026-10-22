@@ -354,6 +354,8 @@ class StagePipelineConfig:
     # The model keeps per-request execution state while awaiting the next
     # async chunk, so the parked request continues to consume model capacity.
     retains_state_across_chunks: bool = False
+    # The model may yield output before completing the current input unit.
+    supports_pending_generation: bool = False
     # Some stateful audio stages cannot roll back already consumed frames.
     supports_running_prefix_cache_reset: bool = True
     sampling_constraints: dict[str, Any] = field(default_factory=dict)
@@ -632,6 +634,7 @@ class StageDeployConfig:
     enable_broadcast_weight_load: bool | None = None
     num_weight_load_threads: int | None = None
     diffusion_offload_config: dict[str, Any] | None = None
+    kv_offload_config: dict[str, Any] | None = None
     # Compatibility aliases for existing callers and model-specific stage
     # lifecycles that are broader than the compact dit/text_encoder selector.
     enable_cpu_offload: bool | None = None
@@ -1289,6 +1292,8 @@ def _build_engine_args(
     """
     engine_args: dict[str, Any] = {"model_arch": ps.model_arch or pipeline.model_arch or None}
     engine_args["retains_state_across_chunks"] = ps.retains_state_across_chunks
+    if ps.supports_pending_generation:
+        engine_args["supports_pending_generation"] = True
     if ps.execution_type == StageExecutionType.DIFFUSION and ps.model_arch:
         engine_args.setdefault("model_class_name", ps.model_arch)
     if ps.engine_output_type is not None:

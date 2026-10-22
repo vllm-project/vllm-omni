@@ -20,6 +20,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5 import (
     MINICPMO45_DUPLEX_CODEC_TOKENS_PER_CHUNK,
     MINICPMO45_DUPLEX_TURN_END_CODEC_TOKENS,
 )
+from vllm_omni.model_executor.models.minicpmo_4_5.handoff import pack_handoff_tensor, unpack_handoff_tensor
 from vllm_omni.model_executor.models.minicpmo_4_5.pipeline import MINICPMO45_REFERENCE_AUDIO_KEY
 
 logger = logging.getLogger(__name__)
@@ -461,7 +462,7 @@ def tts2code2wav_async_chunk(
     if int(record["cache_epoch"]) == 0 and chunk_seq == 0:
         codes_info = _request_intermediate_section(request, "codes")
         meta_info = _request_intermediate_section(request, "meta")
-        raw_ref_audio = codes_info.get("ref")
+        raw_ref_audio = unpack_handoff_tensor(codes_info.get("ref"))
         raw_ref_audio_sr = meta_info.get("ref_audio_sr")
         ref_audio_sr = _coerce_int(raw_ref_audio_sr)
         if raw_ref_audio is not None:
@@ -521,7 +522,7 @@ def tts2code2wav_full_payload(
     meta_info = _request_intermediate_section(request, "meta")
     duplex_info = _request_intermediate_section(request, "duplex")
 
-    ref_audio = codes_info.get("ref")
+    ref_audio = unpack_handoff_tensor(codes_info.get("ref"))
     finished = torch.tensor(True, dtype=torch.bool)
     return OmniPayloadStruct(
         codes=CodesStruct(
@@ -1149,8 +1150,12 @@ def llm2tts(
             )
         if ref_audio is not None:
             ref_waveform, ref_sr = ref_audio
-            set_ref_audio(model_intermediate_buffer, _to_transport_list(ref_waveform), ref_sr)
-        handoff_hidden = _to_transport_list(tts_hidden_slice) if tts_hidden_slice is not None else None
+            set_ref_audio(
+                model_intermediate_buffer,
+                _to_transport_list(ref_waveform) if is_native_duplex_handoff else pack_handoff_tensor(ref_waveform),
+                ref_sr,
+            )
+        handoff_hidden = _to_transport_list(tts_hidden_slice) if is_native_duplex_handoff else tts_hidden_slice
         native_turn_end_handoff = False
         turn_text_ends_sentence = False
         if is_native_duplex_handoff:
@@ -1158,7 +1163,11 @@ def llm2tts(
             native_turn_end_handoff = turn_eos_id is not None and handoff_ids is not None and turn_eos_id in handoff_ids
             if not handoff_ids:
                 continue
-        set_tts_handoff(model_intermediate_buffer, handoff_ids, handoff_hidden)
+        set_tts_handoff(
+            model_intermediate_buffer,
+            handoff_ids,
+            pack_handoff_tensor(handoff_hidden) if isinstance(handoff_hidden, torch.Tensor) else handoff_hidden,
+        )
         if is_native_duplex_handoff:
             # Always write the flag: the connector merges per-request meta across
             # units, so a turn_end=True left by the previous turn's last unit would

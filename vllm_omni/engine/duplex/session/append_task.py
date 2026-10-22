@@ -182,7 +182,8 @@ class AppendAttempt:
             # answer, and that is the client's doing, not a runtime failure.
             # The reservation rollback itself is already a no-op.
             self.abandon(reason="input_cleared")
-            return False
+            # Called off, not failed: audio appended after the clear still runs.
+            return True
         return await self._submit()
 
     async def _submit(self) -> bool:
@@ -212,7 +213,7 @@ class AppendAttempt:
             )
             if append_ok:
                 model_state.context_locked = True
-                if self.pcm_reservation is not None:
+                if self.pcm_reservation is not None and self.pcm_reservation.active:
                     self.pcm_reservation.commit()
                     session.release_input_bytes(self.pcm_reservation.byte_count)
                 self.discard_retained_audio()
