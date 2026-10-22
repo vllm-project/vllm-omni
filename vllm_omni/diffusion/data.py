@@ -34,7 +34,6 @@ from vllm_omni.diffusion.attention.backends.trtllm_calibration import (
 from vllm_omni.diffusion.attention.schedule import (
     AttentionSchedule,
     parse_attention_schedule,
-    unsupported_attention_schedule_error,
     validate_attention_profile_name,
     validate_attention_schedule,
 )
@@ -2471,8 +2470,6 @@ def parse_attention_schedule_config(
         return None
     if isinstance(value, str):
         value = json.loads(value)
-    if isinstance(value, Mapping) and "sigma" in value:
-        raise unsupported_attention_schedule_error("'sigma' windows are not supported yet")
     if isinstance(value, AttentionScheduleConfig):
         config = AttentionScheduleConfig(profiles=value.profiles, default=value.default)
     elif isinstance(value, Mapping):
