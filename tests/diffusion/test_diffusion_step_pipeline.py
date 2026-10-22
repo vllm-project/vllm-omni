@@ -18,7 +18,9 @@ from pytest_mock import MockerFixture
 import vllm_omni.diffusion.worker.diffusion_model_runner as model_runner_module
 from tests.helpers.mark import hardware_test
 from vllm_omni.config.config_factory import StageConfigFactory
-from vllm_omni.diffusion.data import DiffusionOutput
+from vllm_omni.diffusion.attention import schedule as schedule_module
+from vllm_omni.diffusion.attention.schedule import AttentionScheduleRange
+from vllm_omni.diffusion.data import DiffusionOutput, parse_attention_schedule_config
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.diffusion_kv.metadata import DiffusionKVMetadata
@@ -962,10 +964,6 @@ class TestRunner:
 
     def test_cached_step_reuses_the_schedule_resolved_at_admission(self, monkeypatch):
         """A request's schedule is resolved once when it reaches the runner, not again on each later step."""
-        from vllm_omni.diffusion.attention import schedule as schedule_module
-        from vllm_omni.diffusion.attention.schedule import AttentionScheduleRange
-        from vllm_omni.diffusion.data import parse_attention_schedule_config
-
         runner = _make_runner()
         runner.vllm_config = None
         runner.od_config.diffusion_attention_schedule = parse_attention_schedule_config(
