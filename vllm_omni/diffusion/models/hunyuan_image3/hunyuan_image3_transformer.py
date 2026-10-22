@@ -60,7 +60,7 @@ from vllm.v1.attention.backend import AttentionType
 from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionMetadata,
 )
-from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.attention.layer import Attention, ScheduleCandidate
 from vllm_omni.diffusion.cache.cachedit import CacheDiTAdapterConfig
 from vllm_omni.diffusion.distributed.parallel_state import (
     get_allgather_parallel_world_size,
@@ -1277,7 +1277,7 @@ class ImageKVCacheManager(nn.Module):
         return self._forward_dense_legacy(query, key, value, attention_mask, **kwargs)
 
 
-def _require_attention_mask_support(record) -> str | None:
+def _require_attention_mask_support(record: ScheduleCandidate) -> str | None:
     """Schedule candidate check for ImageKVCacheManager.attn (see Attention.add_schedule_candidate_check).
 
     The dense path sends a 4D attention mask on every forward. The paged path sends none; there,
