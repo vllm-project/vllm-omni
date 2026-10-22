@@ -129,7 +129,9 @@ errors on the job record rather than the creation response.
   default ranges.
 - H3 rejects non-empty schedules with request-scoped Cache-DiT (`quality=high`)
   or `latent_refine`. Disable the schedule or the conflicting option.
-  Step mode rejects these H3 options regardless of schedule.
+  Step mode rejects these H3 options regardless of schedule. Non-empty
+  default ranges with a `latent_refine` default in `--additional-config`
+  fail at startup.
 - Ring attention requires profiles equivalent to the base backend and options.
   AllGather-KV rejects TRTLLM and sparse RainFusion.
   Configured KV-cache quantization requires dtype support in every candidate.
