@@ -117,6 +117,18 @@ block's shard is copied to a device buffer and reconstructed with
 `all_gather_into_tensor` on a communication stream while the current block is
 executing.
 
+Weights are packed into chunk-major rank shards. `dlo_chunk_size_mb` (default
+64 MiB) bounds each collective, allowing the next chunk's host-to-device copy
+to overlap the current chunk's AllGather on separate streams. Two chunk-input
+buffers are reused only after their prior collective completes. The shared
+full-block buffers retain the existing compute-readiness and prefetch ordering.
+Chunk packing applies only when the effective weight-sharding group has more
+than one rank; rank-local mmap retains its bounded staging path.
+
+Packing preserves each parameter and buffer's physical layout, including
+strides. Loader-provided transforms may change strides but must preserve dtype
+and shape; invalid transforms raise before the source weights are released.
+
 ```text
 Compute:    [Block N]             [Block N+1]          [Block N+2]
 H2D:                      [shard N+1]           [shard N+2]
@@ -140,6 +152,22 @@ rank-local transfer path described below.
 When DP is greater than one, the engine can process one request per DP rank in
 the same denoising wave. Because AllGather is a collective, all participating
 requests must take the same execution path at every denoising step.
+
+### Optional MiniMax-H3 head buckets
+
+On Ascend NPU, `dlo_attention_head_buckets > 0` enables a bucketed attention
+pipeline for dense MiniMax-H3 with TP1 and equal SP shards of one packed
+request. Zero keeps the original attention path. QKV projection, input
+AlltoAll, fused attention, and output AlltoAll are scheduled by head bucket;
+the pipeline validates the actual real/padding sequence boundaries before
+launching collectives. FastH3 VSA, Ring/USP, and VDN attention are rejected.
+
+Blocks share bounded receive workspaces on one compute stream. A failed lease
+poisons the cache. At request preparation, every rank synchronizes device work
+before clearing the shared caches, including ranks whose previous forward
+succeeded. This prevents one rank from rejecting a later forward while its
+peers enter AlltoAll. Teardown synchronizes before restoring projections and
+releasing the workspaces.
 
 ### Rank-local path without DLO AllGather
 
