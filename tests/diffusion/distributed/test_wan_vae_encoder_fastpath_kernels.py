@@ -14,7 +14,7 @@ from diffusers.models.autoencoders import AutoencoderKLWan
 from diffusers.models.autoencoders.autoencoder_kl_wan import AvgDown3D, WanCausalConv3d, WanResample
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
-from tests.helpers.mark import hardware_marks
+from tests.helpers.mark import hardware_marks, hardware_test
 from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath import (
     encode_frames,
     install_wan_vae_encoder_fastpath,
@@ -31,10 +31,13 @@ DEVICE = "xpu" if hasattr(torch, "xpu") and torch.xpu.is_available() else "cuda"
 pytestmark = [
     pytest.mark.core_model,
     pytest.mark.diffusion,
-    *hardware_marks(res={"cuda": ["H100", "B200"], "xpu": "B60"}, num_cards=1),
+    *hardware_marks(res={"cuda": ["H100", "B200"]}, num_cards=1),
     pytest.mark.skipif(DEVICE == "cuda" and not torch.cuda.is_available(), reason="CUDA or XPU required"),
 ]
 DTYPES = [torch.bfloat16, torch.float16, torch.float32]
+# Intel CI runs only the tests marked _XPU_CI: the lossless encoder end to end on one B60.
+# Every test still runs on XPU when invoked directly.
+_XPU_CI = hardware_test(res={"xpu": "B60"}, num_cards=1)
 CONFIG = dict(
     base_dim=20,
     decoder_base_dim=32,
@@ -144,6 +147,7 @@ def test_temporal_downsample_cache_across_fused_and_fallback_calls(monkeypatch, 
 
 
 @torch.no_grad()
+@_XPU_CI
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("frames", [1, 5, 9])
 def test_lossless_encoder_posterior_and_output_assembly(dtype, frames):

@@ -40,7 +40,7 @@ DEVICE = "xpu" if hasattr(torch, "xpu") and torch.xpu.is_available() else "cuda"
 pytestmark = [
     pytest.mark.usefixtures("unpatched_wan_rms_norm"),
     pytest.mark.core_model,
-    *hardware_marks(res={"cuda": "L4", "xpu": "B60"}, num_cards=1),
+    *hardware_marks(res={"cuda": "L4"}, num_cards=1),
     pytest.mark.diffusion,
     pytest.mark.skipif(DEVICE == "cuda" and not torch.cuda.is_available(), reason="CUDA or XPU required"),
 ]
@@ -53,6 +53,10 @@ _LOSSLESS_DEFERS_CONV_BIAS = pytest.mark.skipif(
     DEVICE == "xpu", reason="lossless keeps the conv bias inside the convolution on XPU"
 )
 ALL_DTYPES = [torch.bfloat16, torch.float16, torch.float32]
+# Intel CI runs only the tests marked _XPU_CI (under a minute on one B60): enough to show
+# that the fast path is bit-exact on XPU, including the XPU-specific divide and conv-bias
+# rules. Every test still runs on XPU when invoked directly.
+_XPU_CI = hardware_test(res={"xpu": "B60"}, num_cards=1)
 # Cosmos3 720p decoder stages, spatially scaled down so the suite stays fast.
 NORM_SHAPES = [
     (1, 1024, 1, 45, 80),
@@ -100,6 +104,7 @@ def _div_rn_kernel(X, Y, OUT, n, BLOCK: tl.constexpr):  # noqa: N803
     tl.store(OUT + offs, rn.div_rn(x, y), mask=mask)
 
 
+@_XPU_CI
 @torch.no_grad()
 def test_div_rn_matches_aten_fp32_division() -> None:
     """Every bit-exact epilogue relies on ``rn.div_rn`` being IEEE round-to-nearest.
@@ -145,6 +150,7 @@ def test_vector_norm_from_low_precision_matches_fp32_normalize_denominator(dtype
     assert torch.equal(actual, expected)
 
 
+@_XPU_CI
 @torch.no_grad()
 @pytest.mark.parametrize("dtype", ALL_DTYPES)
 @pytest.mark.parametrize("shape", NORM_SHAPES)
@@ -209,6 +215,7 @@ def test_shared_norm_preserves_pending_bias_and_fallback(monkeypatch, dtype, lay
     assert _bits_equal(actual, expected)
 
 
+@_XPU_CI
 @torch.no_grad()
 @pytest.mark.parametrize("dtype", LOW_PRECISION)
 def test_fused_silu_epilogue_matches_silu_of_reference(dtype: torch.dtype) -> None:
@@ -856,6 +863,7 @@ def test_cached_conv_deferred_bias_matches_autocast(dtype: torch.dtype, force_pr
             assert _bits_equal(actual.contiguous(), expected.contiguous())
 
 
+@_XPU_CI
 @torch.no_grad()
 @pytest.mark.skipif(DEVICE != "xpu", reason="XPU only: oneDNN adds the conv bias inside the accumulator")
 @pytest.mark.parametrize("dtype", LOW_PRECISION)
@@ -1005,7 +1013,7 @@ def _first_frame_test_conv(dtype: torch.dtype, **kwargs) -> WanCausalConv3d:
 @pytest.mark.parametrize("dtype", ALL_DTYPES)
 @pytest.mark.parametrize("temporal_only", [False, True])
 @pytest.mark.parametrize("start", [None, "Rep"])
-@hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_first_frame_conv2d_preserves_following_cached_frame(dtype, temporal_only, start, monkeypatch) -> None:
     torch.manual_seed(19)
     kwargs = dict(kernel_size=(3, 1, 1), padding=(1, 0, 0)) if temporal_only else {}
@@ -1040,7 +1048,7 @@ def test_first_frame_conv2d_preserves_following_cached_frame(dtype, temporal_onl
 @torch.no_grad()
 @pytest.mark.parametrize("dtype", LOW_PRECISION)
 @pytest.mark.parametrize("with_bias", [False, True])
-@hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_first_frame_conv2d_deferred_bias_matches_autocast(dtype, with_bias) -> None:
     torch.manual_seed(20)
     conv = _first_frame_test_conv(torch.float32)
@@ -1079,7 +1087,7 @@ def test_first_frame_conv2d_deferred_bias_matches_autocast(dtype, with_bias) -> 
         ("temporal_padding", dict(padding=(2, 1, 1))),
     ],
 )
-@hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_first_frame_conv2d_declines_unsupported_calls(case, kwargs) -> None:
     conv = _first_frame_test_conv(torch.float32, **kwargs)
     if case == "lossless":
@@ -1098,7 +1106,7 @@ def test_first_frame_conv2d_declines_unsupported_calls(case, kwargs) -> None:
 
 @torch.no_grad()
 @pytest.mark.parametrize("attribute,value", [("padding_mode", "reflect"), ("padding", (0, 1, 1))])
-@hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_first_frame_conv2d_declines_nonzero_native_padding(attribute, value) -> None:
     conv = _first_frame_test_conv(torch.float32)
     setattr(conv, attribute, value)
@@ -1107,7 +1115,7 @@ def test_first_frame_conv2d_declines_nonzero_native_padding(attribute, value) ->
 
 
 @torch.no_grad()
-@hardware_test(res={"cuda": "L4", "xpu": "B60"}, num_cards=1)
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 def test_first_frame_conv2d_uses_reloaded_weights() -> None:
     torch.manual_seed(21)
     conv = _first_frame_test_conv(torch.bfloat16)
@@ -1148,6 +1156,7 @@ def _build_pair(config: dict, dtype: torch.dtype):
     return reference, candidate
 
 
+@_XPU_CI
 @torch.no_grad()
 @pytest.mark.parametrize("config", [TINY_RESIDUAL, TINY_WAN21], ids=["residual_patch2", "wan21"])
 @pytest.mark.parametrize("dtype", ALL_DTYPES)
@@ -1254,6 +1263,7 @@ def test_forward_hooks_registered_after_install_see_every_decoder_module_call(
     assert any(assembled)
 
 
+@_XPU_CI
 @torch.no_grad()
 @pytest.mark.parametrize("dtype", ALL_DTYPES)
 def test_omni_wan_vae_decode_is_bitwise_exact_on_cuda(dtype: torch.dtype) -> None:
@@ -1272,6 +1282,7 @@ def test_omni_wan_vae_decode_is_bitwise_exact_on_cuda(dtype: torch.dtype) -> Non
     assert _bits_equal(actual, expected)
 
 
+@_XPU_CI
 @torch.no_grad()
 @pytest.mark.parametrize(
     ("dtype", "allow_tf32", "tolerance"),
