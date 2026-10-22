@@ -65,6 +65,61 @@ steps:
           - export VLLM_ROCM_USE_AITER=1
           - pytest -s -v tests/e2e/online_serving/test_qwen3_omni_expansion.py::test_text_to_text_audio_001 -m "full_model and rocm and MI325 and cards_2" --run-level "full_model"
 
+  # The seven ROCm nodes in tests/examples/online_serving/test_qwen2_5_omni.py
+  # already select Qwen/Qwen2.5-Omni-7B on MI325 with two cards. Keep AITER off
+  # so this documentation lane does not pay for a cold JIT build.
+  - group: ":full_moon: Qwen2.5-Omni MI300 Nightly"
+    steps:
+      - label: "Qwen2.5-Omni Documentation Examples"
+        agent_pool: mi300_2
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 120
+        artifact_paths:
+          - "artifacts/rocm-qwen2-5-omni-doc/**/*"
+        commands:
+          - export VLLM_ROCM_USE_AITER=0
+          - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
+          - export QWEN25_OMNI_DOC_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-qwen2-5-omni-doc"
+          - mkdir -p "$$QWEN25_OMNI_DOC_ARTIFACT_DIR"
+          - |
+            pytest --collect-only -q \
+              tests/examples/online_serving/test_qwen2_5_omni.py \
+              -m "full_model and rocm and MI325 and cards_2" \
+              --run-level "full_model" \
+              > "$$QWEN25_OMNI_DOC_ARTIFACT_DIR/collection.txt"
+            count=$$(awk 'index($$0, "test_qwen2_5_omni.py::") { n++ } END { print n + 0 }' \
+              "$$QWEN25_OMNI_DOC_ARTIFACT_DIR/collection.txt")
+            if [[ "$$count" != 7 ]]; then
+              echo "Expected exactly 7 Qwen2.5-Omni ROCm documentation examples, found $$count." >&2
+              cat "$$QWEN25_OMNI_DOC_ARTIFACT_DIR/collection.txt" >&2
+              exit 5
+            fi
+          - >-
+            timeout --signal=TERM --kill-after=2m 105m
+            pytest -s -v -ra
+            tests/examples/online_serving/test_qwen2_5_omni.py
+            -m "full_model and rocm and MI325 and cards_2"
+            --run-level "full_model"
+            --durations=20
+            --junitxml="$$QWEN25_OMNI_DOC_ARTIFACT_DIR/pytest.xml"
+            2>&1 | tee "$$QWEN25_OMNI_DOC_ARTIFACT_DIR/pytest.log"
+          - >-
+            tail -n 100 "$$QWEN25_OMNI_DOC_ARTIFACT_DIR/pytest.log" >
+            "$$QWEN25_OMNI_DOC_ARTIFACT_DIR/pytest-summary.txt"
+          - |
+            python -c 'import sys, xml.etree.ElementTree as ET
+            root = ET.parse(sys.argv[1]).getroot()
+            suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
+            tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites)
+            skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites)
+            executed = tests - skipped
+            if executed < 1:
+                print(f"Expected Qwen2.5-Omni documentation examples to execute; ran {executed} of {tests}.", file=sys.stderr)
+                raise SystemExit(5)
+            ' "$$QWEN25_OMNI_DOC_ARTIFACT_DIR/pytest.xml"
+
   - group: ":speaker: CosyVoice3 MI300 Nightly"
     steps:
       # Exercise all sync/async and Chinese/English cases with the platform's
@@ -82,6 +137,27 @@ steps:
               limit: 1
         commands:
           - pytest -s -v tests/e2e/online_serving/test_cosyvoice3_tts_expansion.py -m "slow" --run-level "core_model"
+
+  - group: ":full_moon: CosyVoice3 Offline MI300 Nightly"
+    steps:
+      - label: "CosyVoice3 Offline Zero-shot Smoke"
+        agent_pool: mi300_1
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 90
+        retry:
+          automatic:
+            - exit_status: 134
+              limit: 1
+        artifact_paths:
+          - artifacts/rocm-cosyvoice3-offline-nightly/**/*
+        commands:
+          - pytest --collect-only -q tests/e2e/offline_inference/test_cosyvoice3_expansion.py -m "slow and tts and rocm and MI325 and cards_1" --run-level full_model
+          - pytest -s -v tests/e2e/offline_inference/test_cosyvoice3_expansion.py -m "slow and tts and rocm and MI325 and cards_1" --run-level full_model --junitxml=/tmp/cosyvoice3-offline-pytest.xml
+          - |
+            artifact_dir="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-cosyvoice3-offline-nightly"
+            mkdir -p "$$artifact_dir"
+            cp -v /tmp/cosyvoice3-offline-pytest.xml "$$artifact_dir/"
 
   - group: ":full_moon: JoyImage MI300 Nightly"
     steps:
@@ -192,6 +268,152 @@ steps:
             mkdir -p "$$artifact_dir"
             cp -v /tmp/lingbot-pytest.xml "$$artifact_dir/"
 
+  - group: ":full_moon: HunyuanVideo-1.5 MI300 Nightly"
+    steps:
+      - label: "HunyuanVideo-1.5 Default T2V Smoke"
+        agent_pool: mi300_1
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 90
+        env:
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+        artifact_paths:
+          - artifacts/rocm-hunyuanvideo15-nightly/**/*
+        commands:
+          - pytest --collect-only -q 'tests/e2e/online_serving/test_hunyuan_video_15_expansion.py::test_hunyuan_video_15_t2v_default[default]' -m "full_model and diffusion and rocm and MI325 and cards_1" --run-level full_model
+          - pytest -s -v 'tests/e2e/online_serving/test_hunyuan_video_15_expansion.py::test_hunyuan_video_15_t2v_default[default]' -m "full_model and diffusion and rocm and MI325 and cards_1" --run-level full_model --junitxml=/tmp/hunyuanvideo15-pytest.xml
+          - |
+            artifact_dir="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-hunyuanvideo15-nightly"
+            mkdir -p "$$artifact_dir"
+            cp -v /tmp/hunyuanvideo15-pytest.xml "$$artifact_dir/"
+
+  - group: ":full_moon: MiniMax-H3 MI300 Nightly"
+    steps:
+      - label: "MiniMax-H3 Official T2VA Smoke"
+        agent_pool: mi300_4
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 120
+        artifact_paths:
+          - artifacts/rocm-minimax-h3-nightly/**/*
+        commands:
+          - export VLLM_ROCM_USE_AITER=1
+          - export DIFFUSION_ATTENTION_BACKEND=FLASH_ATTN
+          - export MINIMAX_H3_ARTIFACT_DIR="$$BUILDKITE_BUILD_CHECKOUT_PATH/artifacts/rocm-minimax-h3-nightly"
+          - mkdir -p "$$MINIMAX_H3_ARTIFACT_DIR"
+          - |
+            {
+              echo "commit=$$(git rev-parse HEAD)"
+              echo "hf_home=$${HF_HOME:-unset}"
+              echo "--- rocm-smi"
+              rocm-smi
+              echo "--- rocminfo"
+              rocminfo
+              echo "--- PyTorch"
+              python -c 'import torch; print(f"torch={torch.__version__}"); print(f"hip={torch.version.hip}"); print(f"gpus={torch.cuda.device_count()}"); [print(f"gpu[{index}]={torch.cuda.get_device_name(index)}") for index in range(torch.cuda.device_count())]'
+            } > "$$MINIMAX_H3_ARTIFACT_DIR/runtime-inventory.txt" 2>&1
+          - >-
+            ps -eo pid=,ppid=,lstart=,stat=,comm=,args= >
+            "$$MINIMAX_H3_ARTIFACT_DIR/processes-before.txt"
+          - >-
+            rocm-smi --showpids >
+            "$$MINIMAX_H3_ARTIFACT_DIR/gpu-holders-before.txt" 2>&1
+          - |
+            if pytest --collect-only -q \
+              'tests/e2e/online_serving/test_minimax_h3_dlo_dp2_t2va.py::test_minimax_h3_rocm_t2va[minimax_h3_rocm_t2va]' \
+              -m 'full_model and diffusion and rocm and MI325 and cards_4' \
+              --run-level full_model \
+              2>&1 | tee "$$MINIMAX_H3_ARTIFACT_DIR/collection.txt"; then
+              collection_count=$$(awk '/::/ { count += 1 } END { print count + 0 }' \
+                "$$MINIMAX_H3_ARTIFACT_DIR/collection.txt")
+              if (( collection_count != 1 )); then
+                echo "Expected exactly one MiniMax-H3 ROCm test, collected $$collection_count." >&2
+                exit 5
+              fi
+            else
+              exit $$?
+            fi
+          - >-
+            timeout --signal=TERM --kill-after=2m 105m
+            pytest -s -v -ra
+            'tests/e2e/online_serving/test_minimax_h3_dlo_dp2_t2va.py::test_minimax_h3_rocm_t2va[minimax_h3_rocm_t2va]'
+            -m 'full_model and diffusion and rocm and MI325 and cards_4'
+            --run-level full_model
+            --durations=0
+            --junitxml="$$MINIMAX_H3_ARTIFACT_DIR/pytest.xml"
+            2>&1 | tee "$$MINIMAX_H3_ARTIFACT_DIR/pytest.log"
+          - >-
+            tail -n 200 "$$MINIMAX_H3_ARTIFACT_DIR/pytest.log" >
+            "$$MINIMAX_H3_ARTIFACT_DIR/pytest-summary.txt"
+          - |
+            sleep 5
+            ps -eo pid=,ppid=,lstart=,stat=,comm=,args= > "$$MINIMAX_H3_ARTIFACT_DIR/processes-after.txt"
+            rocm-smi --showpids > "$$MINIMAX_H3_ARTIFACT_DIR/gpu-holders-after.txt" 2>&1
+            awk '
+              NR == FNR {
+                if ($$9 != "ps") {
+                  baseline[$$1 "|" $$3 "|" $$4 "|" $$5 "|" $$6 "|" $$7] = 1
+                }
+                next
+              }
+              $$9 != "ps" {
+                identity = $$1 "|" $$3 "|" $$4 "|" $$5 "|" $$6 "|" $$7
+                if (!(identity in baseline)) {
+                  print
+                  leaked = 1
+                }
+              }
+              END {
+                if (leaked) {
+                  print "status=FAIL leaked_processes_detected=1"
+                  exit 1
+                }
+                print "status=PASS leaked_processes=0"
+              }
+            ' "$$MINIMAX_H3_ARTIFACT_DIR/processes-before.txt" \
+              "$$MINIMAX_H3_ARTIFACT_DIR/processes-after.txt" \
+              2>&1 | tee "$$MINIMAX_H3_ARTIFACT_DIR/process-cleanup.txt"
+
+  - group: ":full_moon: Qwen-Image MI300 Nightly"
+    steps:
+      - label: "Qwen-Image Official-Weight Smoke"
+        agent_pool: mi300_1
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 90
+        env:
+          VLLM_ROCM_USE_AITER: "1"
+          DIFFUSION_ATTENTION_BACKEND: FLASH_ATTN
+        artifact_paths:
+          - artifacts/rocm-qwen-image-nightly/**/*
+        commands:
+          - export QWEN_IMAGE_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-qwen-image-nightly"
+          - export AITER_JIT_DIR="/tmp/vllm-omni-qwen-image-aiter-$$BUILDKITE_JOB_ID"
+          - export TORCH_EXTENSIONS_DIR="/tmp/vllm-omni-qwen-image-torch-$$BUILDKITE_JOB_ID"
+          - mkdir -p "$$QWEN_IMAGE_ARTIFACT_DIR" "$$AITER_JIT_DIR" "$$TORCH_EXTENSIONS_DIR"
+          - |
+            node='tests/e2e/online_serving/test_qwen_image.py::test_text_to_image_001[default]'
+            pytest --collect-only -q \
+              'tests/e2e/online_serving/test_qwen_image.py::test_text_to_image_001[default]' \
+              -m 'full_model and diffusion and rocm and MI325 and cards_1' \
+              --run-level full_model > "$$QWEN_IMAGE_ARTIFACT_DIR/collection.txt"
+            count=$$(awk -v node="$$node" 'index($$0, node) { n++ } END { print n + 0 }' \
+              "$$QWEN_IMAGE_ARTIFACT_DIR/collection.txt")
+            if [[ "$$count" != 1 ]]; then
+              echo "Expected exactly one Qwen-Image ROCm node, found $$count." >&2
+              cat "$$QWEN_IMAGE_ARTIFACT_DIR/collection.txt" >&2
+              exit 5
+            fi
+          - >-
+            timeout --signal=TERM --kill-after=2m 75m
+            pytest -s -v -ra
+            'tests/e2e/online_serving/test_qwen_image.py::test_text_to_image_001[default]'
+            -m 'full_model and diffusion and rocm and MI325 and cards_1'
+            --run-level full_model
+            --durations=0
+            --junitxml="$$QWEN_IMAGE_ARTIFACT_DIR/pytest.xml"
+            2>&1 | tee "$$QWEN_IMAGE_ARTIFACT_DIR/pytest.log"
+
   - group: ":full_moon: Cosmos3 MI300 Nightly"
     steps:
       - label: "Cosmos3 T2I Function"
@@ -246,3 +468,156 @@ steps:
             mkdir -p "$$artifact_dir"
             cp -v tests/e2e/accuracy/artifacts/HunyuanImage-3_0-Instruct/*.png "$$artifact_dir/"
             cp -v /tmp/hunyuanimage3-pytest.xml "$$artifact_dir/"
+
+  # Full-model Stable Audio CPU offload. READY keeps the core_model Qwen-Image
+  # cases, and MERGE runs this file under TORCH_SDPA. This lane is the default
+  # ROCm backend and stays non-blocking while the ROCm memory threshold is unset.
+  - group: ":full_moon: Stable Audio CPU Offload MI300 Nightly"
+    steps:
+      - label: "Stable Audio CPU Offload"
+        agent_pool: mi300_1
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 60
+        artifact_paths:
+          - artifacts/rocm-stable-audio-cpu-offload/**/*
+        commands:
+          - export STABLE_AUDIO_OFFLOAD_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-stable-audio-cpu-offload"
+          - mkdir -p "$$STABLE_AUDIO_OFFLOAD_ARTIFACT_DIR"
+          # Restore the provenance-checked unmasked BF16 AITER MHA module used
+          # by the default ROCm diffusion backend before either inference path.
+          - eval "$$(python .buildkite/amd/scripts/aiter_mha_cache.py prepare)"
+          - |
+            node='tests/diffusion/offloader/test_diffusion_cpu_offload.py::test_cpu_offload_diffusion_model[stabilityai/stable-audio-open-1.0]'
+            pytest --collect-only -q \
+              tests/diffusion/offloader/test_diffusion_cpu_offload.py \
+              -m 'full_model and rocm and MI325 and cards_1' \
+              --run-level full_model > "$$STABLE_AUDIO_OFFLOAD_ARTIFACT_DIR/collection.txt"
+            count=$$(awk -v node="$$node" 'index($$0, node) { n++ } END { print n + 0 }' \
+              "$$STABLE_AUDIO_OFFLOAD_ARTIFACT_DIR/collection.txt")
+            if [[ "$$count" != 1 ]]; then
+              echo "Expected exactly one Stable Audio CPU-offload node, found $$count." >&2
+              cat "$$STABLE_AUDIO_OFFLOAD_ARTIFACT_DIR/collection.txt" >&2
+              exit 5
+            fi
+          - >-
+            timeout --signal=TERM --kill-after=2m 45m
+            pytest -s -v -ra
+            tests/diffusion/offloader/test_diffusion_cpu_offload.py
+            -m 'full_model and rocm and MI325 and cards_1'
+            --run-level full_model
+            --durations=0
+            --junitxml="$$STABLE_AUDIO_OFFLOAD_ARTIFACT_DIR/pytest.xml"
+            2>&1 | tee "$$STABLE_AUDIO_OFFLOAD_ARTIFACT_DIR/pytest.log"
+          - >-
+            tail -n 100 "$$STABLE_AUDIO_OFFLOAD_ARTIFACT_DIR/pytest.log" >
+            "$$STABLE_AUDIO_OFFLOAD_ARTIFACT_DIR/pytest-summary.txt"
+
+
+  - group: ":full_moon: HunyuanImage3 LoRA MI300 Nightly"
+    steps:
+      - label: "HunyuanImage3 LoRA Accuracy"
+        agent_pool: mi300_4
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 180
+        env:
+          HUNYUAN_IMAGE3_MODEL: "tencent/HunyuanImage-3.0-Instruct"
+          HUNYUAN_IMAGE3_DEVICES: "0,1,2,3"
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+        artifact_paths:
+          - artifacts/rocm-hunyuanimage3-lora/**/*
+        commands:
+          - export ROCM_HUNYUANIMAGE3_LORA_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-hunyuanimage3-lora"
+          - mkdir -p "$$ROCM_HUNYUANIMAGE3_LORA_ARTIFACT_DIR"
+          - |
+            node="tests/e2e/accuracy/test_hunyuan_image3_lora.py::test_hunyuan_image3_dit_lora_generation"
+            pytest --collect-only -q tests/e2e/accuracy/test_hunyuan_image3_lora.py \
+              -m "full_model and diffusion and rocm and MI325 and cards_4" --run-level full_model \
+              > "$$ROCM_HUNYUANIMAGE3_LORA_ARTIFACT_DIR/collection.txt"
+            count=$$(awk -v node="$$node" 'index($$0, node) { n++ } END { print n + 0 }' \
+              "$$ROCM_HUNYUANIMAGE3_LORA_ARTIFACT_DIR/collection.txt")
+            if [[ "$$count" != 1 ]]; then
+              echo "Expected exactly one HunyuanImage3 LoRA accuracy node, found $$count." >&2
+              cat "$$ROCM_HUNYUANIMAGE3_LORA_ARTIFACT_DIR/collection.txt" >&2
+              exit 5
+            fi
+          - |
+            set +e
+            timeout --signal=TERM --kill-after=2m 165m \
+              pytest -s -v tests/e2e/accuracy/test_hunyuan_image3_lora.py \
+              -m "full_model and diffusion and rocm and MI325 and cards_4" --run-level full_model \
+              --junitxml="$$ROCM_HUNYUANIMAGE3_LORA_ARTIFACT_DIR/pytest.xml" \
+              2>&1 | tee "$$ROCM_HUNYUANIMAGE3_LORA_ARTIFACT_DIR/pytest.log"
+            status=$${PIPESTATUS[0]}
+            set -e
+            if [[ -d tests/e2e/accuracy/artifacts ]]; then
+              mkdir -p "$$ROCM_HUNYUANIMAGE3_LORA_ARTIFACT_DIR/accuracy"
+              cp -a tests/e2e/accuracy/artifacts/. "$$ROCM_HUNYUANIMAGE3_LORA_ARTIFACT_DIR/accuracy/"
+            fi
+
+            exit "$$status"
+
+  - group: ":full_moon: HunyuanVideo-1.5 Accuracy MI300 Nightly"
+    steps:
+      - label: "HunyuanVideo-1.5 Video Similarity"
+        agent_pool: mi300_1
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 180
+        env:
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+        artifact_paths:
+          - artifacts/rocm-hunyuanvideo15-accuracy/**/*
+        commands:
+          - export ROCM_HUNYUANVIDEO15_ACCURACY_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-hunyuanvideo15-accuracy"
+          - mkdir -p "$$ROCM_HUNYUANVIDEO15_ACCURACY_ARTIFACT_DIR"
+          - |
+            nodes=(
+              "tests/e2e/accuracy/hunyuanvideo15_t2v/test_hunyuanvideo15_t2v_video_similarity.py::test_hunyuanvideo15_t2v_diffusers_offline_generates_video"
+              "tests/e2e/accuracy/hunyuanvideo15_t2v/test_hunyuanvideo15_t2v_video_similarity.py::test_hunyuanvideo15_t2v_online_serving_generates_video"
+              "tests/e2e/accuracy/hunyuanvideo15_t2v/test_hunyuanvideo15_t2v_video_similarity.py::test_hunyuanvideo15_t2v_serving_matches_offline_video_similarity"
+              "tests/e2e/accuracy/hunyuanvideo15_i2v/test_hunyuanvideo15_i2v_video_similarity.py::test_hunyuanvideo15_i2v_diffusers_offline_generates_video"
+              "tests/e2e/accuracy/hunyuanvideo15_i2v/test_hunyuanvideo15_i2v_video_similarity.py::test_hunyuanvideo15_i2v_online_serving_generates_video"
+              "tests/e2e/accuracy/hunyuanvideo15_i2v/test_hunyuanvideo15_i2v_video_similarity.py::test_hunyuanvideo15_i2v_serving_matches_offline_video_similarity"
+            )
+            pytest --collect-only -q "$${nodes[@]}" \
+              -m "full_model and diffusion and rocm and MI325 and cards_1" --run-level full_model \
+              > "$$ROCM_HUNYUANVIDEO15_ACCURACY_ARTIFACT_DIR/collection.txt"
+            count=$$(awk '/::/ { n++ } END { print n + 0 }' \
+              "$$ROCM_HUNYUANVIDEO15_ACCURACY_ARTIFACT_DIR/collection.txt")
+            if [[ "$$count" != "$${#nodes[@]}" ]]; then
+              echo "Expected exactly $${#nodes[@]} HunyuanVideo-1.5 accuracy nodes, found $$count." >&2
+              cat "$$ROCM_HUNYUANVIDEO15_ACCURACY_ARTIFACT_DIR/collection.txt" >&2
+              exit 5
+            fi
+            for node in "$${nodes[@]}"; do
+              if ! grep -Fq "$$node" "$$ROCM_HUNYUANVIDEO15_ACCURACY_ARTIFACT_DIR/collection.txt"; then
+                echo "HunyuanVideo-1.5 accuracy node was not collected: $$node" >&2
+                cat "$$ROCM_HUNYUANVIDEO15_ACCURACY_ARTIFACT_DIR/collection.txt" >&2
+                exit 5
+              fi
+            done
+          - |
+            set +e
+            nodes=(
+              "tests/e2e/accuracy/hunyuanvideo15_t2v/test_hunyuanvideo15_t2v_video_similarity.py::test_hunyuanvideo15_t2v_diffusers_offline_generates_video"
+              "tests/e2e/accuracy/hunyuanvideo15_t2v/test_hunyuanvideo15_t2v_video_similarity.py::test_hunyuanvideo15_t2v_online_serving_generates_video"
+              "tests/e2e/accuracy/hunyuanvideo15_t2v/test_hunyuanvideo15_t2v_video_similarity.py::test_hunyuanvideo15_t2v_serving_matches_offline_video_similarity"
+              "tests/e2e/accuracy/hunyuanvideo15_i2v/test_hunyuanvideo15_i2v_video_similarity.py::test_hunyuanvideo15_i2v_diffusers_offline_generates_video"
+              "tests/e2e/accuracy/hunyuanvideo15_i2v/test_hunyuanvideo15_i2v_video_similarity.py::test_hunyuanvideo15_i2v_online_serving_generates_video"
+              "tests/e2e/accuracy/hunyuanvideo15_i2v/test_hunyuanvideo15_i2v_video_similarity.py::test_hunyuanvideo15_i2v_serving_matches_offline_video_similarity"
+            )
+            timeout --signal=TERM --kill-after=2m 165m \
+              pytest -s -v "$${nodes[@]}" \
+              -m "full_model and diffusion and rocm and MI325 and cards_1" --run-level full_model \
+              --junitxml="$$ROCM_HUNYUANVIDEO15_ACCURACY_ARTIFACT_DIR/pytest.xml" \
+              2>&1 | tee "$$ROCM_HUNYUANVIDEO15_ACCURACY_ARTIFACT_DIR/pytest.log"
+            status=$${PIPESTATUS[0]}
+            set -e
+            if [[ -d tests/e2e/accuracy/artifacts ]]; then
+              mkdir -p "$$ROCM_HUNYUANVIDEO15_ACCURACY_ARTIFACT_DIR/accuracy"
+              cp -a tests/e2e/accuracy/artifacts/. "$$ROCM_HUNYUANVIDEO15_ACCURACY_ARTIFACT_DIR/accuracy/"
+            fi
+
+            exit "$$status"

@@ -11,7 +11,7 @@ name = "vllm-omni"
 dynamic = ["version", "dependencies"]
 description = "A framework for efficient model inference with omni-modality models"
 readme = "README.md"
-requires-python = ">=3.10,<3.14"
+requires-python = ">=3.11,<3.14"
 license = "Apache-2.0"
 authors = [
     {name = "vLLM-Omni Team"}
@@ -21,7 +21,6 @@ classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
@@ -34,6 +33,11 @@ classifiers = [
 # without requiring extras like [cuda]. See requirements/ directory for platform-specific dependencies.
 
 [project.optional-dependencies]
+
+ming-tn = [
+    "pynini",
+    "inflect",
+]
 
 dev = [
     "pytest==9.1.1",
@@ -111,6 +115,11 @@ longcat-video-avatar = [
     "soundfile>=0.13.1",
 ]
 
+# Optional torch-based fallback for server-side Silero VAD.
+server-vad = [
+    "silero-vad",
+]
+
 # Optional Blackwell-only fused-bias FP8 GEMM; package is `quack-kernels` (imported
 # as `quack`), not the unrelated `quack`. See docs/user_guide/quantization/fp8.md.
 quack = [
@@ -126,6 +135,11 @@ fa4 = [
 # FastVideo VSA kernels for the supported Linux/Python 3.12 wheel environment.
 vsa = [
     "fastvideo-kernel==0.3.4",
+]
+
+# Public cuDNN BSA API with native tile64/tile128 kernels.
+cudnn-bsa = [
+    "nvidia-cudnn-frontend==1.31.0",
 ]
 
 docs = [
@@ -180,12 +194,15 @@ include = ["vllm_omni*"]
     "model_executor/models/step_audio2/assets/*.wav",
     "transformers_utils/chat_templates/*.jinja",
 ]
+"vllm_omni.model_executor.models.ming_flash_omni" = ["data/*.json", "LICENSE.Ming", "NOTICE"]
 
 [tool.setuptools_scm]
 # no extra settings needed, presence enables setuptools-scm
 
 [tool.ruff]
 line-length = 120
+# Preserve the existing lint policy when raising the runtime Python floor.
+target-version = "py310"
 exclude = [
     ".eggs",
     ".git",

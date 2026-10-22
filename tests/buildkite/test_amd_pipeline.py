@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-from importlib.util import find_spec
+from importlib.util import find_spec, module_from_spec, spec_from_file_location
 from pathlib import Path
 from shlex import split
 
@@ -12,8 +12,10 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 AMD_MERGE_PIPELINE = Path(".buildkite/amd/test-amd-merge.yml")
 AMD_NIGHTLY_PIPELINE = Path(".buildkite/amd/test-amd-nightly.yml")
+AMD_WEEKLY_PIPELINE = Path(".buildkite/amd/test-amd-weekly.yml")
 AMD_READY_PIPELINE = Path(".buildkite/amd/test-amd-ready.yml")
 AMD_BOOTSTRAP = Path(".buildkite/amd/scripts/bootstrap-amd-omni.sh")
+AMD_SUITE_COMBINER = Path(__file__).resolve().parents[2] / ".buildkite/amd/scripts/combine_test_suites.py"
 AMD_RUNNER = Path(".buildkite/amd/scripts/run-amd-test.sh")
 AMD_TEMPLATE = Path(".buildkite/amd/test-template-amd-omni.j2")
 AMD_OMNI_PROCESSOR_RUNNER = Path(".buildkite/amd/scripts/run-omni-processor-test.sh")
@@ -54,6 +56,13 @@ OMNI_PROCESSOR_FULL_LABEL = "Simple · Omni Processor Test"
 OMNI_PROCESSOR_SMOKE_LABEL = "Simple · Omni Processor Snapshot Smoke"
 OMNI_PROCESSOR_TEST = "tests/model_executor/models/test_omni_processing.py"
 OMNI_PROCESSOR_TIMING_ENV = "VLLM_OMNI_AMD_PROCESSOR_TIMING"
+QWEN_IMAGE_SMOKE_LABEL = "Qwen-Image Official-Weight Smoke"
+QWEN_IMAGE_SMOKE_NODE = "tests/e2e/online_serving/test_qwen_image.py::test_text_to_image_001[default]"
+
+COMBINER_SPEC = spec_from_file_location("combine_test_suites", AMD_SUITE_COMBINER)
+assert COMBINER_SPEC is not None and COMBINER_SPEC.loader is not None
+COMBINER = module_from_spec(COMBINER_SPEC)
+COMBINER_SPEC.loader.exec_module(COMBINER)
 
 
 def _find_step(label: str, pipeline_path: Path = AMD_MERGE_PIPELINE) -> dict:
@@ -83,6 +92,100 @@ def _walk_steps(steps: list[dict]):
     for step in steps:
         yield step
         yield from _walk_steps(step.get("steps", []))
+
+
+def _steps_selecting_node(pipeline_path: Path, node: str) -> list[dict]:
+    pipeline = yaml.safe_load(pipeline_path.read_text(encoding="utf-8"))
+    return [
+        step
+        for step in _walk_steps(pipeline["steps"])
+        if any(node in split(command) for command in step.get("commands", []))
+    ]
+
+
+def test_qwen_image_has_one_amd_official_weight_nightly_owner() -> None:
+    owners = [
+        (pipeline_path, step)
+        for pipeline_path in (
+            AMD_READY_PIPELINE,
+            AMD_MERGE_PIPELINE,
+            AMD_NIGHTLY_PIPELINE,
+        )
+        for step in _steps_selecting_node(pipeline_path, QWEN_IMAGE_SMOKE_NODE)
+    ]
+
+    assert len(owners) == 1
+    assert owners[0][0] == AMD_NIGHTLY_PIPELINE
+    assert owners[0][1]["label"] == QWEN_IMAGE_SMOKE_LABEL
+
+
+def test_qwen_image_official_weight_nightly_smoke_follows_burn_in_contract() -> None:
+    step = _find_step(QWEN_IMAGE_SMOKE_LABEL, AMD_NIGHTLY_PIPELINE)
+
+    assert step["agent_pool"].startswith("mi300_")
+    card_count = step["agent_pool"].rsplit("_", 1)[1]
+    assert step["mirror_hardwares"] == ["amdproduction"]
+    assert step["grade"] == "NonBlocking"
+    assert step["timeout_in_minutes"] >= 90
+    assert "depends_on" not in step
+    assert "retry" not in step
+    assert len(step["artifact_paths"]) == 1
+    assert step["artifact_paths"][0].startswith("artifacts/rocm-")
+    assert step["artifact_paths"][0].endswith("/**/*")
+
+    commands = step["commands"]
+    all_commands = "\n".join(commands)
+    env = step.get("env", {})
+    assert env.get("VLLM_ROCM_USE_AITER") == "1" or ("export VLLM_ROCM_USE_AITER=1" in commands)
+    assert env.get("DIFFUSION_ATTENTION_BACKEND") == "FLASH_ATTN" or (
+        "export DIFFUSION_ATTENTION_BACKEND=FLASH_ATTN" in commands
+    )
+    assert "AITER_JIT_DIR" in all_commands
+    assert "TORCH_EXTENSIONS_DIR" in all_commands
+    assert "|| true" not in all_commands
+
+    pytest_commands = [command for command in commands if "pytest" in split(command)]
+    collect_commands = [command for command in pytest_commands if "--collect-only" in split(command)]
+    run_commands = [command for command in pytest_commands if "--collect-only" not in split(command)]
+    assert len(collect_commands) == 1
+    assert len(run_commands) == 1
+
+    collect_argv = split(collect_commands[0])
+    run_argv = split(run_commands[0])
+    collect_nodes = [arg for arg in collect_argv if arg.startswith("tests/") and "::" in arg]
+    run_nodes = [arg for arg in run_argv if arg.startswith("tests/") and "::" in arg]
+    assert len(collect_nodes) == 1
+    assert run_nodes == collect_nodes
+
+    expected_markers = f"full_model and diffusion and rocm and MI325 and cards_{card_count}"
+    assert collect_argv[collect_argv.index("-m") + 1] == expected_markers
+    assert run_argv[run_argv.index("-m") + 1] == expected_markers
+    assert collect_argv[collect_argv.index("--run-level") + 1] == "full_model"
+    assert run_argv[run_argv.index("--run-level") + 1] == "full_model"
+    assert "exit 5" in collect_commands[0]
+    assert "index($$0, node)" in collect_commands[0]
+
+    command_timeout = f"{step['timeout_in_minutes'] - 15}m"
+    assert run_argv[:4] == [
+        "timeout",
+        "--signal=TERM",
+        "--kill-after=2m",
+        command_timeout,
+    ]
+    assert "--durations=0" in run_argv
+    assert any(arg.startswith("--junitxml=") for arg in run_argv)
+    assert "|" in run_argv
+    assert "tee" in run_argv
+    assert "record_cache_metadata" not in all_commands
+
+
+def _leaf_steps(pipeline_path: Path) -> list[dict]:
+    pipeline = yaml.safe_load(pipeline_path.read_text(encoding="utf-8"))
+    return [step for entry in pipeline["steps"] for step in entry.get("steps", [entry])]
+
+
+def _step_signature(step: dict) -> str:
+    return yaml.safe_dump(step, sort_keys=True)
 
 
 def _find_steps_selecting_path(pipeline_path: Path, test_path: str) -> list[dict]:
@@ -140,6 +243,56 @@ def _find_diffusion_cpu_shard_step(pipeline_path: Path) -> dict:
     walk(pipeline.get("steps", []))
     assert len(matches) == 1, f"expected one diffusion CPU shard step in {pipeline_path}"
     return matches[0]
+
+
+def test_ready_merge_composition_preserves_the_structural_union() -> None:
+    ready_steps = _leaf_steps(AMD_READY_PIPELINE)
+    merge_steps = _leaf_steps(AMD_MERGE_PIPELINE)
+    ready_signatures = {_step_signature(step) for step in ready_steps}
+    merge_signatures = {_step_signature(step) for step in merge_steps}
+
+    shared = ready_signatures & merge_signatures
+    ready_only = ready_signatures - merge_signatures
+    merge_only = merge_signatures - ready_signatures
+    assert shared
+    assert ready_only
+    assert merge_only
+
+    combined = COMBINER.combine_test_suites(
+        (
+            f"READY_TESTS:{AMD_READY_PIPELINE}",
+            f"MERGE_TESTS:{AMD_MERGE_PIPELINE}",
+        )
+    )
+    assert [group["group"] for group in combined["steps"]] == [
+        "READY_TESTS",
+        "MERGE_TESTS",
+    ]
+    combined_ready_steps, combined_merge_steps = (group["steps"] for group in combined["steps"])
+    combined_steps = combined_ready_steps + combined_merge_steps
+    combined_signatures = [_step_signature(step) for step in combined_steps]
+
+    assert {_step_signature(step) for step in combined_ready_steps} == ready_signatures
+    assert {_step_signature(step) for step in combined_merge_steps} == merge_only
+    assert len(combined_signatures) == len(set(combined_signatures))
+    assert set(combined_signatures) == ready_signatures | merge_signatures
+    assert sum(step.get("parallelism", 1) for step in combined_steps) < sum(
+        step.get("parallelism", 1) for step in ready_steps + merge_steps
+    )
+
+
+@pytest.mark.parametrize("extra_pipeline", [AMD_NIGHTLY_PIPELINE, AMD_WEEKLY_PIPELINE], ids=["nightly", "weekly"])
+def test_combined_extra_tier_preserves_every_distinct_step(extra_pipeline: Path) -> None:
+    pipelines = [AMD_READY_PIPELINE, AMD_MERGE_PIPELINE, extra_pipeline]
+    extra_group = "NIGHTLY_TESTS" if extra_pipeline == AMD_NIGHTLY_PIPELINE else "WEEKLY_TESTS"
+    groups = ["READY_TESTS", "MERGE_TESTS", extra_group]
+    raw_signatures = {_step_signature(step) for path in pipelines for step in _leaf_steps(path)}
+
+    combined = COMBINER.combine_test_suites(tuple(f"{group}:{path}" for group, path in zip(groups, pipelines)))
+    combined_signatures = [_step_signature(step) for group in combined["steps"] for step in group["steps"]]
+
+    assert len(combined_signatures) == len(set(combined_signatures))
+    assert set(combined_signatures) == raw_signatures
 
 
 def test_omni_processor_full_matrix_moves_to_nightly_with_blocking_rocm_smoke() -> None:
@@ -327,15 +480,23 @@ def test_ar_paged_attention_gpu_lane_is_blocking_and_pinned() -> None:
         lane_definitions.append(step)
 
         assert step["grade"] == "Blocking"
-        assert step["timeout_in_minutes"] == 20
+        assert step["timeout_in_minutes"] == 25
         assert "export VLLM_OMNI_AR_FA_REQUIRED=1" in step["commands"]
 
-        pytest_command = next(command for command in step["commands"] if "pytest" in command)
-        argv = split(pytest_command)
+        pytest_commands = [command for command in step["commands"] if "pytest" in command]
+        assert len(pytest_commands) == 2
+
+        argv = split(pytest_commands[0])
         assert argv[:4] == ["timeout", "--signal=TERM", "--kill-after=2m", "15m"]
         assert "tests/diffusion/ar_diffusion/test_paged_attention.py" in argv
         assert argv[argv.index("-m") + 1] == AR_PAGED_ATTENTION_MARKERS
         assert argv[argv.index("--run-level") + 1] == "core_model"
+
+        transfer_argv = split(pytest_commands[1])
+        assert transfer_argv[:4] == ["timeout", "--signal=TERM", "--kill-after=1m", "5m"]
+        assert "tests/diffusion/utils/test_chunked_transfer.py" in transfer_argv
+        assert transfer_argv[transfer_argv.index("-m") + 1] == AR_PAGED_ATTENTION_MARKERS
+        assert transfer_argv[transfer_argv.index("--run-level") + 1] == "core_model"
 
     assert lane_definitions[0] == lane_definitions[1]
 
@@ -427,6 +588,63 @@ def test_joy_gpu_helper_import_does_not_require_pytest_package_mode() -> None:
     spec = find_spec("tests.diffusion.models.joy_image.test_joy_image")
     assert spec is not None and spec.origin is not None
     assert Path(spec.origin).resolve() == Path(JOY_GPU_PATH).with_name("test_joy_image.py").resolve()
+
+
+@pytest.mark.parametrize("label", ["Diffusion · Batch Test", "Diffusion · Offloader Test", "Diffusion · Cache Test"])
+def test_ready_diffusion_gpu_lanes_select_rocm_variants(label: str) -> None:
+    step = _find_step(label, AMD_READY_PIPELINE)
+    pytest_command = next(command for command in step["commands"] if "pytest" in command)
+    argv = split(pytest_command)
+
+    assert argv[argv.index("-m") + 1] == "core_model and rocm and MI325 and cards_1"
+
+
+@pytest.mark.parametrize(
+    ("label", "pipeline", "cards"),
+    [
+        ("ROCm · Ulysses UAA Attention · 2-GPU", AMD_READY_PIPELINE, "cards_2"),
+        ("ROCm · Ulysses UAA Attention · 4-GPU", AMD_MERGE_PIPELINE, "cards_4"),
+    ],
+)
+def test_amd_ulysses_lanes_cover_uaa_and_attention_sp(label: str, pipeline: Path, cards: str) -> None:
+    step = _find_step(label, pipeline)
+    pytest_commands = [command for command in step["commands"] if "pytest" in command]
+
+    assert step["grade"] == "Blocking"
+    assert len(pytest_commands) == 1
+    assert "tests/diffusion/attention/test_ulysses_uaa.py" in pytest_commands[0]
+    assert "tests/diffusion/attention/test_attention_sp.py" in pytest_commands[0]
+    assert all(f"core_model and rocm and MI325 and {cards}" in command for command in pytest_commands)
+
+    argv = split(pytest_commands[0])
+    assert argv[:4] == ["timeout", "--signal=TERM", "--kill-after=2m", "20m"]
+    assert step["timeout_in_minutes"] == 25
+    assert "--durations=20" in argv
+
+
+@pytest.mark.parametrize(
+    ("label", "cards"),
+    [
+        ("Diffusion · Distributed Test · 2-GPU", "cards_2"),
+        ("Diffusion · Distributed & Attention Test · 4-GPU", "cards_4"),
+    ],
+)
+def test_cuda_distributed_lanes_cover_both_attention_files_within_the_job_budget(label: str, cards: str) -> None:
+    step = _find_step(label, CUDA_READY_PIPELINE)
+    argv = [split(command) for command in step["commands"] if "pytest" in split(command)]
+
+    paths = {arg for command in argv for arg in command if arg.startswith("tests/")}
+    assert paths == {
+        "tests/diffusion/distributed",
+        "tests/diffusion/attention/test_ulysses_uaa.py",
+        "tests/diffusion/attention/test_attention_sp.py",
+    }
+    assert step["mirror_hardwares"] == f"l4_{cards.removeprefix('cards_')}"
+    for command in argv:
+        assert command[command.index("-m") + 1] == f"core_model and cuda and L4 and {cards}"
+        assert command[command.index("--run-level") + 1] == "core_model"
+    command_budget = sum(int(command[1].removesuffix("m")) for command in argv)
+    assert step["timeout_in_minutes"] >= command_budget + 5
 
 
 def test_qwen3_tts_base_preserves_advanced_model_arguments() -> None:
@@ -668,8 +886,113 @@ def test_amd_template_supplies_a_server_verified_aiter_artifact_source() -> None
 
     assert template.count("VLLM_OMNI_AITER_MHA_TRUSTED_COMMIT") == 2
     assert "VLLM_AITER_MHA_TRUSTED_COMMIT=$(git cat-file -p HEAD | sed -n 's/^parent //p' | head -n 1)" in bootstrap
-    assert "VLLM_AITER_MHA_TRUSTED_COMMIT=$(git merge-base origin/main HEAD)" in bootstrap
+    assert "VLLM_AITER_MHA_TRUSTED_COMMIT=$DIFF_BASE" in bootstrap
+    assert bootstrap.count("git merge-base origin/main HEAD") == 1
+    assert '-D vllm_merge_base_commit="$DIFF_BASE"' in bootstrap
     assert '-D vllm_aiter_mha_trusted_commit="$VLLM_AITER_MHA_TRUSTED_COMMIT"' in bootstrap
+
+
+def test_weekly_reliability_is_distinct_from_nightly() -> None:
+    weekly = yaml.safe_load(AMD_WEEKLY_PIPELINE.read_text(encoding="utf-8"))
+    nightly = AMD_NIGHTLY_PIPELINE.read_text(encoding="utf-8")
+    group = weekly["steps"][0]
+    jobs = {
+        "Reliability Test · qwen3-omni": ("mi300_2", "cards_2", "tests/dfx/reliability/test_qwen3_omni.py"),
+        "Reliability Test · wan22": ("mi300_1", "cards_1", "tests/dfx/reliability/test_wan22.py"),
+        "Reliability Test · hunyuan-image": ("mi300_4", "cards_4", "tests/dfx/reliability/test_hunyuan_image.py"),
+        "Reliability Test · Invalid parameters · MI300 · 2-GPU": (
+            "mi300_2",
+            "cards_2",
+            "test_invalid_omni_chat.py",
+        ),
+    }
+
+    assert group["group"] == "Reliability Test"
+    assert "if" not in group
+    assert [step["label"] for step in group["steps"]] == list(jobs)
+    for step in group["steps"]:
+        pool, cards, filename = jobs[step["label"]]
+        command = "\n".join(step["commands"])
+        assert "if" not in step
+        assert step["agent_pool"] == pool
+        assert step["grade"] == "NonBlocking"
+        assert step["depends_on"] == "amd-build"
+        assert "slow and rocm and MI325 and " + cards in command
+        assert filename in command
+        assert filename not in nightly
+    assert "tests/dfx/reliability/" not in nightly
+    assert "Qwen3-Omni Function Expansion" not in AMD_WEEKLY_PIPELINE.read_text(encoding="utf-8")
+
+
+def test_cosyvoice_offline_zero_shot_runs_nightly_on_rocm() -> None:
+    path = "tests/e2e/offline_inference/test_cosyvoice3_expansion.py"
+    markers = "slow and tts and rocm and MI325 and cards_1"
+    step = _find_step("CosyVoice3 Offline Zero-shot Smoke", AMD_NIGHTLY_PIPELINE)
+
+    assert step["grade"] == "NonBlocking"
+    assert step["agent_pool"] == "mi300_1"
+    assert step["mirror_hardwares"] == ["amdproduction"]
+    assert step["timeout_in_minutes"] == 90
+    assert step["retry"] == {"automatic": [{"exit_status": 134, "limit": 1}]}
+    assert step["artifact_paths"] == ["artifacts/rocm-cosyvoice3-offline-nightly/**/*"]
+    assert "env" not in step
+
+    pytest_commands = [command for command in step["commands"] if "pytest" in split(command)]
+    assert len(pytest_commands) == 2
+    collect_command = next(command for command in pytest_commands if "--collect-only" in split(command))
+    run_command = next(command for command in pytest_commands if "--collect-only" not in split(command))
+    for command in (collect_command, run_command):
+        argv = split(command)
+        assert path in argv
+        assert argv[argv.index("-m") + 1] == markers
+        assert argv[argv.index("--run-level") + 1] == "full_model"
+    assert "--junitxml=/tmp/cosyvoice3-offline-pytest.xml" in split(run_command)
+
+    commands = "\n".join(step["commands"])
+    assert "DIFFUSION_ATTENTION_BACKEND" not in commands
+    assert "VLLM_ROCM_USE_AITER" not in commands
+    assert "cp -v /tmp/cosyvoice3-offline-pytest.xml" in commands
+
+    source = Path(path).read_text(encoding="utf-8")
+    decorator = source.rsplit("@hardware_test", 1)[1].split("def test_cosyvoice3_offline_reference_zero_shot", 1)[0]
+    assert '"cuda": "L4"' in decorator
+    assert '"rocm": "MI325"' in decorator
+    assert 'id="sync"' in source
+    assert 'id="async_chunk"' in source
+
+
+def test_stable_audio_cpu_offload_has_one_nonblocking_nightly_owner() -> None:
+    label = "Stable Audio CPU Offload"
+    step = _find_step(label, AMD_NIGHTLY_PIPELINE)
+    assert step["grade"] == "NonBlocking"
+    assert step["agent_pool"] == "mi300_1"
+    assert step["mirror_hardwares"] == ["amdproduction"]
+    assert step["timeout_in_minutes"] == 60
+    assert step["artifact_paths"] == ["artifacts/rocm-stable-audio-cpu-offload/**/*"]
+    assert "retry" not in step
+    assert "env" not in step
+    _assert_build_scoped_aiter_mha_cache(
+        step,
+        "tests/diffusion/offloader/test_diffusion_cpu_offload.py",
+        publishes=False,
+    )
+
+    commands = "\n".join(step["commands"])
+    assert "DIFFUSION_ATTENTION_BACKEND" not in commands
+    assert "VLLM_ROCM_USE_AITER" not in commands
+    assert "test_diffusion_layerwise_offload.py" not in commands
+    assert "tests/diffusion/offloader/test_diffusion_cpu_offload.py" in commands
+    assert "full_model and rocm and MI325 and cards_1" in commands
+    assert "--run-level full_model" in commands
+    assert "--collect-only" in commands
+    assert "exit 5" in commands
+    assert "pytest.xml" in commands
+    assert "pytest.log" in commands
+
+    for pipeline_path in (AMD_READY_PIPELINE, AMD_MERGE_PIPELINE):
+        text = pipeline_path.read_text(encoding="utf-8")
+        assert label not in text
+        assert "full_model and rocm and MI325 and cards_1" not in text
 
 
 def test_amd_runner_preserves_piped_failures_and_empty_collection() -> None:
@@ -683,3 +1006,58 @@ def test_amd_runner_preserves_piped_failures_and_empty_collection() -> None:
     assert 'VLLM_CI_ALLOW_NO_TESTS:-0}" == "1"' in runner
     assert template.count('{% if step.grade and step.grade == "Blocking" %}') == 2
     assert template.count("soft_fail: true") == 2
+
+
+def test_hunyuan_image3_lora_accuracy_is_one_nonblocking_nightly_job() -> None:
+    step = _find_step("HunyuanImage3 LoRA Accuracy", AMD_NIGHTLY_PIPELINE)
+    assert step["grade"] == "NonBlocking"
+    assert step["agent_pool"] == "mi300_4"
+    assert step["mirror_hardwares"] == ["amdproduction"]
+    assert step["timeout_in_minutes"] == 180
+    commands = "\n".join(step["commands"])
+    assert "full_model and diffusion and rocm and MI325 and cards_4" in commands
+    assert "--run-level full_model" in commands
+    assert "--collect-only" in commands
+    assert "exit 5" in commands
+    assert "pytest.xml" in commands
+    assert "test_hunyuan_image3_lora.py::test_hunyuan_image3_dit_lora_generation" in commands
+    assert "Expected exactly one HunyuanImage3 LoRA accuracy node" in commands
+    assert step["env"]["DIFFUSION_ATTENTION_BACKEND"] == "TORCH_SDPA"
+    assert step["env"]["HUNYUAN_IMAGE3_DEVICES"] == "0,1,2,3"
+    assert "test_hunyuan_image3_lora.py" in commands
+    assert "test_hunyuan_image3_pixel_accuracy.py" not in commands
+    for pipeline_path in (AMD_READY_PIPELINE, AMD_MERGE_PIPELINE):
+        text = pipeline_path.read_text(encoding="utf-8")
+        assert "HunyuanImage3 LoRA Accuracy" not in text
+
+
+def test_hunyuanvideo15_accuracy_is_one_nonblocking_nightly_job() -> None:
+    step = _find_step("HunyuanVideo-1.5 Video Similarity", AMD_NIGHTLY_PIPELINE)
+    assert step["grade"] == "NonBlocking"
+    assert step["agent_pool"] == "mi300_1"
+    assert step["mirror_hardwares"] == ["amdproduction"]
+    assert step["timeout_in_minutes"] == 180
+    commands = "\n".join(step["commands"])
+    assert "full_model and diffusion and rocm and MI325 and cards_1" in commands
+    assert "--run-level full_model" in commands
+    assert "--collect-only" in commands
+    assert "exit 5" in commands
+    assert "pytest.xml" in commands
+    assert step["env"]["DIFFUSION_ATTENTION_BACKEND"] == "TORCH_SDPA"
+    assert "hunyuanvideo15_t2v" in commands
+    assert "hunyuanvideo15_i2v" in commands
+    assert "test_hunyuanvideo15_t2v.py" not in commands
+    expected_nodes = (
+        "test_hunyuanvideo15_t2v_diffusers_offline_generates_video",
+        "test_hunyuanvideo15_t2v_online_serving_generates_video",
+        "test_hunyuanvideo15_t2v_serving_matches_offline_video_similarity",
+        "test_hunyuanvideo15_i2v_diffusers_offline_generates_video",
+        "test_hunyuanvideo15_i2v_online_serving_generates_video",
+        "test_hunyuanvideo15_i2v_serving_matches_offline_video_similarity",
+    )
+    for node in expected_nodes:
+        assert node in commands
+    assert "Expected exactly $${#nodes[@]} HunyuanVideo-1.5 accuracy nodes" in commands
+    for pipeline_path in (AMD_READY_PIPELINE, AMD_MERGE_PIPELINE):
+        text = pipeline_path.read_text(encoding="utf-8")
+        assert "HunyuanVideo-1.5 Video Similarity" not in text

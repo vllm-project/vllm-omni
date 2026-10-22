@@ -71,6 +71,18 @@ class VideoParams(BaseModel):
             return None
 
 
+class StreamingPacingConfig(BaseModel):
+    """Canonical request-level playback pacing policy for realtime video."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = True
+    mode: Literal["client_playhead"] = "client_playhead"
+    max_lead_ms: float = Field(default=1000.0, gt=0, le=10_000, allow_inf_nan=False)
+    max_output_bytes: int = Field(default=64 * 1024 * 1024, gt=0, le=_INT64_MAX, strict=True)
+    idle_timeout_s: float = Field(default=30.0, gt=0, le=86_400, allow_inf_nan=False)
+
+
 class FileImageReference(BaseModel):
     model_config = ConfigDict(extra="forbid")
     file_id: str
@@ -205,6 +217,18 @@ class VideoGenerationRequest(BaseModel):
         description="Frames per second for output video",
     )
     num_frames: int | None = Field(default=None, ge=1, le=_INT64_MAX, description="Number of frames to generate")
+    streaming_pacing: StreamingPacingConfig | None = Field(
+        default=None,
+        description="Canonical realtime playback pacing policy; requires session.playback feedback.",
+    )
+    streaming_buffer_seconds: float | None = Field(
+        default=None,
+        gt=0,
+        le=10,
+        strict=True,
+        allow_inf_nan=False,
+        description="Maximum generated media lead, including the next chunk; requires session.playback updates.",
+    )
     aspect_ratio: str | None = Field(
         default=None,
         description=(
@@ -248,6 +272,19 @@ class VideoGenerationRequest(BaseModel):
         if value not in DIFFUSION_QUALITY_LEVELS:
             raise ValueError(f"quality must be one of {list(DIFFUSION_QUALITY_LEVELS)}, got {value!r}")
         return value
+
+    @model_validator(mode="after")
+    def normalize_streaming_pacing(self) -> "VideoGenerationRequest":
+        """Canonicalize pacing into ``streaming_pacing``; derive the lead alias."""
+        if self.streaming_pacing is not None and self.streaming_buffer_seconds is not None:
+            raise ValueError("use streaming_pacing or streaming_buffer_seconds, not both")
+        if self.streaming_buffer_seconds is not None:
+            self.streaming_pacing = StreamingPacingConfig(max_lead_ms=self.streaming_buffer_seconds * 1000.0)
+        if self.streaming_pacing is not None and self.streaming_pacing.enabled:
+            self.streaming_buffer_seconds = self.streaming_pacing.max_lead_ms / 1000.0
+        else:
+            self.streaming_buffer_seconds = None
+        return self
 
     negative_prompt: str | None = Field(default=None, description="Text describing what to avoid in the video")
     num_inference_steps: int | None = Field(

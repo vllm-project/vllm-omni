@@ -799,7 +799,9 @@ def test_check_kv_groups_rejects_empty_or_multi():
         check_prefix_cache_kv_groups([object(), object()])
 
 
-def _stage_cfg(*, enable=True, pooling=False, kv_transfer=None, groups=(object(),), spec=None, match_unit=None):
+def _stage_cfg(
+    *, enable=True, pooling=False, kv_transfer=None, groups=(object(),), spec=None, match_unit=None, policy=None
+):
     return stage_prefix_cache_config(
         kv_cache_config=SimpleNamespace(num_blocks=NUM_BLOCKS, kv_cache_groups=list(groups)),
         cache_config=SimpleNamespace(enable_prefix_caching=enable, block_size=BLOCK_SIZE, prefix_match_unit=match_unit),
@@ -808,6 +810,7 @@ def _stage_cfg(*, enable=True, pooling=False, kv_transfer=None, groups=(object()
         model_config=None,
         is_pooling_model=pooling,
         speculative_config=spec,
+        model_cache_policy=policy or ModelCachePolicy(),
     )
 
 
@@ -841,6 +844,44 @@ def test_npu_runner_uses_shared_prefix_cache_gate():
     calls = {n.func.id for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
     assert "stage_prefix_cache_config" in calls
     assert "check_prefix_cache_kv_groups" not in calls
+
+
+def test_native_only_cache_policy_leaves_hybrid_kv_cache_enabled():
+    policy = ModelCachePolicy(needs_full_hidden_states=False, native_kv_cache_only=True)
+    cache = SimpleNamespace(enable_prefix_caching=True, block_size=BLOCK_SIZE)
+    groups = [object(), object()]
+    assert (
+        stage_prefix_cache_config(
+            kv_cache_config=SimpleNamespace(num_blocks=NUM_BLOCKS, kv_cache_groups=groups),
+            cache_config=cache,
+            kv_transfer_config=None,
+            scheduler_config=None,
+            model_config=None,
+            is_pooling_model=False,
+            model_cache_policy=policy,
+        )
+        is None
+    )
+    assert cache.enable_prefix_caching is True
+    assert len(groups) == 2
+
+
+def test_hidden_optout_does_not_bypass_multimodal_output_cache_guards():
+    policy = ModelCachePolicy(needs_full_hidden_states=False, deferred_keys=frozenset({"codes.audio"}))
+    with pytest.raises(OmniPrefixCacheUnmatchError, match="single full-attention"):
+        _stage_cfg(policy=policy, groups=(object(), object()))
+    with pytest.raises(OmniPrefixCacheUnmatchError, match="KV connector"):
+        _stage_cfg(policy=policy, kv_transfer=SimpleNamespace(is_kv_consumer=True))
+    with pytest.raises(OmniPrefixCacheUnmatchError, match="speculative decoding"):
+        _stage_cfg(policy=policy, spec=object())
+    with pytest.raises(OmniPrefixCacheUnmatchError, match="block-aligned"):
+        _stage_cfg(policy=policy, match_unit=1)
+
+
+@pytest.mark.parametrize("hidden,deferred", [(True, ()), (False, ("codes.audio",))])
+def test_native_only_policy_rejects_prefix_output_dependencies(hidden, deferred):
+    with pytest.raises(ValueError, match="native.*only"):
+        ModelCachePolicy(needs_full_hidden_states=hidden, deferred_keys=frozenset(deferred), native_kv_cache_only=True)
 
 
 def _table_slots(table, req_idx, token_start, token_end, block_size=BLOCK_SIZE):

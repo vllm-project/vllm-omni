@@ -264,3 +264,152 @@ def test_tiled_encode_oom_clears_enc_feat_map(monkeypatch):
 
     assert all(slot is None for slot in vae._enc_feat_map)
     assert all(slot is None for slot in vae._feat_map)
+
+
+# Single-frame paths -> expected output shape. The toy VAE below has one temporal
+# stage so the downsample3d/upsample3d and first_chunk branches are exercised.
+_SINGLE_FRAME_PATHS = {
+    "decode": (1, 4, 1, 64, 64),
+    "tiled_decode": (1, 4, 1, 64, 64),
+    "tile_exec": (1, 4, 1, 64, 64),
+    "encode": (1, 8, 1, 16, 16),
+    "tiled_encode": (1, 8, 1, 16, 16),
+}
+
+
+def _make_single_frame_vae(path):
+    cls = DistributedAutoencoderKLQwenImage21 if path == "tile_exec" else AutoencoderKLQwenImage21
+    torch.manual_seed(0)
+    vae = _make_vae(cls, temperal_downsample=[False, True])
+    if path in ("tiled_decode", "tile_exec", "tiled_encode"):
+        vae.enable_tiling(
+            tile_sample_min_height=32,
+            tile_sample_min_width=32,
+            tile_sample_stride_height=24,
+            tile_sample_stride_width=24,
+        )
+    return vae
+
+
+def _run_single_frame_path(vae, path):
+    generator = torch.Generator().manual_seed(1)
+    with torch.no_grad():
+        if path in ("encode", "tiled_encode"):
+            return vae._encode(torch.randn(1, 4, 1, 64, 64, generator=generator))
+        z = torch.randn(1, 4, 1, 16, 16, generator=generator)
+        if path == "tile_exec":
+            tasks, grid_spec = vae.tile_split(z)
+            return vae.tile_merge({task.grid_coord: vae.tile_exec(task) for task in tasks}, grid_spec)
+        return vae.decode(z, return_dict=False)[0]
+
+
+def _wrap_coder_forwards(monkeypatch, vae, inject_cache):
+    """Wrap encoder/decoder forward; return the feature caches they ran with."""
+    caches = []
+    for name in ("encoder", "decoder"):
+        module = getattr(vae, name)
+        num_convs = vae._cached_conv_counts[name]
+
+        def forward(x, feat_cache=None, feat_idx=None, _forward=module.forward, _num_convs=num_convs, **kwargs):
+            if inject_cache:
+                # Fresh per-call cache, as the cached single-frame path used.
+                feat_cache, feat_idx = [None] * _num_convs, [0]
+            caches.append(feat_cache)
+            return _forward(x, feat_cache=feat_cache, feat_idx=feat_idx, **kwargs)
+
+        monkeypatch.setattr(module, "forward", forward)
+    return caches
+
+
+def _num_cached_tensors(feat_cache):
+    return sum(isinstance(entry, torch.Tensor) for entry in feat_cache or [])
+
+
+@pytest.mark.parametrize("path", list(_SINGLE_FRAME_PATHS))
+def test_single_frame_paths_hold_no_feature_cache(monkeypatch, path):
+    """The 2D convs never read the temporal cache, so no conv input is cloned into it."""
+    vae = _make_single_frame_vae(path)
+    caches = _wrap_coder_forwards(monkeypatch, vae, inject_cache=False)
+
+    out = _run_single_frame_path(vae, path)
+
+    assert out.shape == _SINGLE_FRAME_PATHS[path]
+    assert caches, "encoder/decoder was not called"
+    assert all(cache is None for cache in caches)
+    assert _num_cached_tensors(getattr(vae, "_feat_map", None)) == 0
+    assert _num_cached_tensors(getattr(vae, "_enc_feat_map", None)) == 0
+
+
+@pytest.mark.parametrize("path", list(_SINGLE_FRAME_PATHS))
+def test_single_frame_paths_match_cached_reference(monkeypatch, path):
+    vae = _make_single_frame_vae(path)
+    out = _run_single_frame_path(vae, path)
+    assert torch.equal(out, _run_single_frame_path(vae, path))
+
+    caches = _wrap_coder_forwards(monkeypatch, vae, inject_cache=True)
+    ref = _run_single_frame_path(vae, path)
+
+    # The reference really took the cached branches, and dropping them is bit-identical.
+    assert caches and all(_num_cached_tensors(cache) > 0 for cache in caches)
+    assert ref.shape == out.shape
+    assert torch.equal(out, ref)
+
+
+@pytest.mark.parametrize("padding", [0, 1, (1, 2)])
+@pytest.mark.parametrize("stride", [1, 2])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_causal_conv_matches_explicit_padding(padding, stride, dtype):
+    """Folding spatial padding into Conv2d preserves values and input gradients."""
+    from vllm_omni.diffusion.models.qwen_image_21.autoencoder_kl_qwenimage21 import QwenImage21CausalConv3d
+
+    torch.manual_seed(42)
+    conv = QwenImage21CausalConv3d(4, 8, 3, stride=stride, padding=padding).to(dtype=dtype)
+    x = torch.randn(2, 4, 1, 11, 13, dtype=dtype).transpose(-1, -2).requires_grad_()
+    reference_input = x.detach().clone().requires_grad_()
+    expected = torch.nn.functional.conv2d(
+        torch.nn.functional.pad(reference_input.squeeze(2), conv._padding),
+        conv.weight,
+        conv.bias,
+        stride=conv.stride,
+    ).unsqueeze(2)
+    actual = conv(x)
+    torch.testing.assert_close(actual, expected)
+    actual.sum().backward()
+    expected.sum().backward()
+    torch.testing.assert_close(x.grad, reference_input.grad)
+
+
+def test_causal_conv_keeps_explicit_padding_off_npu(monkeypatch):
+    """Built-in conv padding changes cuDNN BF16 kernels, so non-NPU devices must pad explicitly."""
+    from vllm_omni.diffusion.models.qwen_image_21 import autoencoder_kl_qwenimage21 as vae_module
+
+    pads = []
+    original_pad = vae_module.F.pad
+
+    def recording_pad(x, pad, *args, **kwargs):
+        pads.append(tuple(pad))
+        return original_pad(x, pad, *args, **kwargs)
+
+    monkeypatch.setattr(vae_module.F, "pad", recording_pad)
+    torch.manual_seed(0)
+    conv = vae_module.QwenImage21CausalConv3d(4, 8, 3, padding=1).to(torch.bfloat16)
+    x = torch.randn(1, 4, 1, 7, 9, dtype=torch.bfloat16)
+    with torch.inference_mode():
+        actual = conv(x)
+        expected = torch.nn.functional.conv2d(
+            original_pad(x.squeeze(2), conv._padding), conv.weight, conv.bias
+        ).unsqueeze(2)
+    assert pads == [conv._padding]
+    assert torch.equal(actual, expected)
+
+
+def test_causal_conv_preserves_asymmetric_padding():
+    from vllm_omni.diffusion.models.qwen_image_21.autoencoder_kl_qwenimage21 import QwenImage21CausalConv3d
+
+    conv = QwenImage21CausalConv3d(4, 8, 3)
+    conv._padding = (1, 2, 0, 1)
+    x = torch.randn(1, 4, 1, 7, 9)
+    expected = torch.nn.functional.conv2d(
+        torch.nn.functional.pad(x.squeeze(2), conv._padding), conv.weight, conv.bias
+    ).unsqueeze(2)
+    torch.testing.assert_close(conv(x), expected)

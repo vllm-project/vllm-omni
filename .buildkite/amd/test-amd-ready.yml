@@ -208,7 +208,7 @@ steps:
       depends_on: amd-build
       mirror_hardwares: [amdproduction]
       grade: Blocking
-      timeout_in_minutes: 20
+      timeout_in_minutes: 25
       commands:
         - export VLLM_ROCM_USE_AITER=1
         - export VLLM_OMNI_AR_FA_REQUIRED=1
@@ -218,6 +218,11 @@ steps:
         - >-
           timeout --signal=TERM --kill-after=2m 15m
           pytest -sv tests/diffusion/ar_diffusion/test_paged_attention.py
+          -m 'core_model and rocm and MI325 and cards_1' --run-level core_model
+        # Keep the pinned-ring device contract blocking without making the
+        # cold, experimental AITER coverage lane a required check.
+        - >-
+          timeout --signal=TERM --kill-after=1m 5m pytest -sv tests/diffusion/utils/test_chunked_transfer.py
           -m 'core_model and rocm and MI325 and cards_1' --run-level core_model
 
     - label: "Diffusion · Batch Test"
@@ -229,7 +234,7 @@ steps:
         # Restore the unmasked BF16 AITER module into a job-local directory.
         # This consumer does not publish a duplicate artifact.
         - eval "$$(python .buildkite/amd/scripts/aiter_mha_cache.py prepare)"
-        - pytest -sv tests/diffusion/batching -m 'core_model and cuda' --run-level "core_model"
+        - pytest -sv tests/diffusion/batching -m 'core_model and rocm and MI325 and cards_1' --run-level "core_model"
 
     - label: "Diffusion · Offloader Test"
       agent_pool: mi300_1
@@ -239,7 +244,7 @@ steps:
       commands:
         - export VLLM_LOGGING_LEVEL=DEBUG
         - export VLLM_WORKER_MULTIPROC_METHOD=spawn
-        - pytest -s -v tests/diffusion/offloader -m "core_model and cuda" --run-level "core_model"
+        - pytest -s -v tests/diffusion/offloader -m "core_model and rocm and MI325 and cards_1" --run-level "core_model"
 
     - label: "Diffusion · Cache Test"
       agent_pool: mi300_1
@@ -250,7 +255,7 @@ steps:
         - export GPU_ARCHS=gfx942
         - export VLLM_LOGGING_LEVEL=DEBUG
         - export VLLM_WORKER_MULTIPROC_METHOD=spawn
-        - pytest -sv tests/diffusion/cache -m 'core_model and cuda' --run-level "core_model"
+        - pytest -sv tests/diffusion/cache -m 'core_model and rocm and MI325 and cards_1' --run-level "core_model"
 
     - label: "Diffusion Sequence Parallelism Test"
       agent_pool: mi300_2
@@ -271,6 +276,21 @@ steps:
           tests/diffusion/models/ltx2/test_ltx2_transformer_ulysses.py
           -m 'core_model and rocm and cards_2'
           --run-level "core_model"
+
+    - label: "ROCm · Ulysses UAA Attention · 2-GPU"
+      agent_pool: mi300_2
+      depends_on: amd-build
+      mirror_hardwares: [amdproduction]
+      grade: Blocking
+      timeout_in_minutes: 25
+      commands:
+        - export VLLM_WORKER_MULTIPROC_METHOD=spawn
+        - >-
+          timeout --signal=TERM --kill-after=2m 20m pytest -s -v
+          tests/diffusion/attention/test_ulysses_uaa.py
+          tests/diffusion/attention/test_attention_sp.py
+          -m 'core_model and rocm and MI325 and cards_2'
+          --run-level "core_model" --durations=20
 
     - label: "Diffusion GPU Worker Test"
       agent_pool: mi300_2
@@ -337,7 +357,10 @@ steps:
   depends_on: amd-build
   mirror_hardwares: [amdproduction]
   grade: NonBlocking
-  timeout_in_minutes: 20
+  # Build 13918 selected 1635 cases and was killed at 20 minutes while AITER
+  # compiled the masked varlen module, with about half the nodes still queued.
+  # The command timeout leaves five minutes for the summary artifact.
+  timeout_in_minutes: 50
   artifact_paths:
     - "artifacts/rocm-r2-01/**/*"
   commands:
@@ -352,6 +375,7 @@ steps:
     # Verbose pytest output and JUnit retain node IDs without a second
     # collection-only pass over the same GPU-backed test tree.
     - >-
+      timeout --signal=TERM --kill-after=2m 45m
       pytest -s -v -ra
       tests/model_executor/
       -m 'core_model and cuda and not nvidia_only and not

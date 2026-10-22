@@ -51,8 +51,8 @@ def _make_runner(engine_output_type: str | None, downstream_req_ids: set[str]) -
     return runner
 
 
-def _mtp_runner(*, async_scheduling: bool, buffers: dict[str, dict]) -> tuple[GPUARModelRunner, dict[str, object]]:
-    received: dict[str, object] = {}
+def _mtp_runner(*, async_scheduling: bool, buffers: dict[str, dict]) -> tuple[GPUARModelRunner, dict[str, Any]]:
+    received: dict[str, Any] = {}
 
     def post_sample_talker_mtp(*, input_ids, hidden_states, req_ids, req_infos):
         received.update(
@@ -215,6 +215,25 @@ def test_post_sample_talker_mtp_rejects_invalid_selected_token_shape(
         )
 
 
+def test_post_sample_talker_mtp_before_bookkeeping_gathers_the_kept_rows() -> None:
+    runner, received = _mtp_runner(
+        async_scheduling=False,
+        buffers={"discarded-prefill": {"duplex": {"data_plane": True}}, "ready": {"duplex": {"data_plane": True}}},
+    )
+    multimodal = GPUARModelRunner._run_post_sample_talker_mtp(
+        runner,
+        req_ids=["discarded-prefill", "ready"],
+        valid_sampled_token_ids=None,
+        sampled_token_ids=torch.tensor([[101], [102]], dtype=torch.long),
+        invalid_req_indices=[0],
+        sample_hidden_states=torch.tensor([[1.0, 2.0], [3.0, 4.0]]),
+        multimodal_outputs=None,
+    )
+    assert received["req_ids"] == ["ready"] and received["input_ids"].tolist() == [102]
+    assert received["hidden_states"].tolist() == [[3.0, 4.0]]
+    assert multimodal["codes"]["audio"][1].tolist() == [[11, 12, 13]] and multimodal["codes"]["audio"][0].numel() == 0
+
+
 def test_speech_extra_params_reach_model_sampler_as_sampling_metadata(monkeypatch):
     requested = {"temperature": 0.7, "top_p": 0.8, "top_k": 17}
     request = OpenAICreateSpeechRequest.model_validate(
@@ -263,7 +282,6 @@ def test_speech_extra_params_reach_model_sampler_as_sampling_metadata(monkeypatc
         device=torch.device("cpu"),
         vocab_size=1024,
         block_sizes=[1],
-        kernel_block_sizes=[1],
         # vLLM 0.26: one entry per KV cache group; max_model_len=8 with
         # block_sizes=[1] means one group of 8 blocks.
         max_num_blocks_per_req=[8],
@@ -292,6 +310,7 @@ def test_speech_extra_params_reach_model_sampler_as_sampling_metadata(monkeypatc
     runner._omni_cache_policy = ModelCachePolicy(needs_full_hidden_states=True)
     runner._pooler_payload_include_hidden_flag = True
     runner.input_batch = input_batch
+
     runner.model = SimpleNamespace(
         prefer_model_sampler=True,
         skips_model_sampler_output_token_history=True,
@@ -688,10 +707,17 @@ def test_async_omni_output_guard_requires_safe_conditions():
     assert GPUARModelRunner._should_use_async_omni_output(runner)
 
 
-def test_build_omni_output_skips_hidden_when_model_opts_out(monkeypatch):
+@pytest.mark.parametrize("ming3", [False, True])
+def test_build_omni_output_skips_hidden_when_model_opts_out(monkeypatch, ming3):
     runner = _make_async_output_runner(engine_output_type="latent")
-    runner.model.omni_pooler_payload_include_hidden = False
-    runner._pooler_payload_include_hidden_flag = False
+    if ming3:
+        from vllm_omni.model_executor.models.ming3_audio.ming3_audio import BailingMoeV3AudioForConditionalGeneration
+
+        runner.model = BailingMoeV3AudioForConditionalGeneration
+        runner._pooler_payload_include_hidden_flag = getattr(runner.model, "omni_pooler_payload_include_hidden", True)
+    else:
+        runner.model.omni_pooler_payload_include_hidden = False
+        runner._pooler_payload_include_hidden_flag = False
 
     monkeypatch.setattr(
         GPUARModelRunner,
@@ -1750,7 +1776,7 @@ class TestMergeModelKvTransferMetadata:
                 return {"talker_codes": [7], "seen_tokens": num_computed_tokens}
 
         original_meta = {"a": 1}
-        original = {"r1": {"seq_len": 3, "block_ids": [4], "custom_metadata": original_meta}}
+        original: dict[str, dict[str, Any]] = {"r1": {"seq_len": 3, "block_ids": [4], "custom_metadata": original_meta}}
         runner = self._runner_with_model(_Model())
 
         merged = runner._merge_model_kv_transfer_metadata(original)
@@ -2188,3 +2214,17 @@ def test_background_output_survives_step_metadata_reuse(monkeypatch, mocker):
     assert output.req_id_to_index == {"r1": 0, "r2": 1}
     torch.testing.assert_close(output.inter_stage_outputs[0]["hidden"], hidden[:1])
     torch.testing.assert_close(output.inter_stage_outputs[1]["hidden"], hidden[1:])
+
+
+def test_shutdown_drops_cached_sampled_token_override(mocker):
+    """The cached bound model method must not keep the model alive after shutdown."""
+    runner = object.__new__(GPUARModelRunner)
+    runner.omni_prefix_cache = None
+    runner._sampled_token_ids_cpu_override = mocker.Mock()
+    mocker.patch.object(runner, "_clear_duplex_sampling")
+    upstream = mocker.patch.object(gpu_ar_model_runner.OmniGPUModelRunner, "shutdown")
+
+    runner.shutdown()
+
+    assert runner._sampled_token_ids_cpu_override is None
+    upstream.assert_called_once()

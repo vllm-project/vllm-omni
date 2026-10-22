@@ -367,6 +367,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="Enable diffusion pipeline profiler to display stage durations.",
     )
     parser.add_argument(
+        "--step-execution",
+        action="store_true",
+        help="Enable continuous-batching step execution (requires --max-num-seqs > 1 to batch).",
+    )
+    parser.add_argument(
+        "--max-num-seqs",
+        type=int,
+        default=None,
+        help="Maximum number of concurrent requests per diffusion stage (continuous batching).",
+    )
+    parser.add_argument(
+        "--data-parallel-size",
+        type=int,
+        default=None,
+        help="Data-parallel replicas of the diffusion stage.",
+    )
+    parser.add_argument(
         "--profiler-config",
         type=parse_profiler_config,
         default=None,
@@ -401,12 +418,6 @@ def build_parser() -> argparse.ArgumentParser:
         type=str,
         default=None,
         help=("Custom system prompt. Used when --use-system-prompt is custom. "),
-    )
-    parser.add_argument(
-        "--auxiliary-text-encoder",
-        type=str,
-        default=None,
-        help="Supplementary auxiliary text encoder parameters model name or path (especially for Hidream-l1-full).",
     )
     parser.add_argument(
         "--model-class-name",
@@ -592,7 +603,6 @@ def main():
         "profiler_config": args.profiler_config,
         "init_timeout": args.init_timeout,
         "stage_init_timeout": args.stage_init_timeout,
-        "auxiliary_text_encoder": args.auxiliary_text_encoder,
         **lora_args,
         **quant_kwargs,
     }
@@ -600,6 +610,12 @@ def main():
     # without a DIFFUSION stage pass ownership validation.
     if args.tensor_parallel_size is not None:
         omni_kwargs["tensor_parallel_size"] = args.tensor_parallel_size
+    if args.step_execution:
+        omni_kwargs["step_execution"] = True
+    if args.max_num_seqs is not None:
+        omni_kwargs["max_num_seqs"] = args.max_num_seqs
+    if args.data_parallel_size is not None:
+        omni_kwargs["data_parallel_size"] = args.data_parallel_size
     if args.enforce_eager is not None:
         omni_kwargs["enforce_eager"] = args.enforce_eager
     if args.trust_remote_code:

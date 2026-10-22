@@ -44,10 +44,11 @@ import asyncio
 import json
 import signal
 from argparse import Namespace
+from collections.abc import Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, NoReturn
 
 import pytest
 from fastapi import FastAPI, HTTPException
@@ -56,6 +57,9 @@ from fastapi.testclient import TestClient
 from starlette.datastructures import State
 from starlette.requests import Request
 from starlette.websockets import WebSocketDisconnect
+from vllm.entrypoints.serve.tokenize import api_router as tokenization_api_router
+from vllm.entrypoints.serve.tokenize.protocol import DetokenizeResponse, TokenizeResponse, TokenizerInfoResponse
+from vllm.exceptions import RetryableRequestError
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 
 from vllm_omni.entrypoints.openai import api_server
@@ -560,6 +564,85 @@ async def test_api_server_assembly_replaces_upstream_routes_and_mounts_omni_rout
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("has_tokenization", [False, True], ids=["diffusion", "autoregressive"])
+@pytest.mark.parametrize("tokenizer_info_enabled", [False, True], ids=["no-info", "info"])
+async def test_api_server_assembly_exposes_only_supported_tokenization_routes(
+    monkeypatch, mocker, has_tokenization: bool, tokenizer_info_enabled: bool
+) -> None:
+    """Use the inherited HTTP routes: diffusion returns 404; AR still delegates."""
+    captured: dict[str, FastAPI] = {}
+    handler = mocker.create_autospec(api_server.ServingTokenization, instance=True)
+    handler.create_tokenize.return_value = TokenizeResponse(count=1, max_model_len=1024, tokens=[42])
+    handler.create_detokenize.return_value = DetokenizeResponse(prompt="hello")
+    handler.get_tokenizer_info.return_value = TokenizerInfoResponse(tokenizer_class="TestTokenizer")
+
+    # attach_router conditionally adds /tokenizer_info to its module-level router.
+    # Isolate that registration so the opt-in cannot leak between test cases.
+    monkeypatch.setattr(
+        tokenization_api_router.router,
+        "routes",
+        [route for route in tokenization_api_router.router.routes if getattr(route, "path", None) != "/tokenizer_info"],
+    )
+
+    def build_app_with_native_tokenization(args, _supported_tasks):
+        app = FastAPI()
+        app.state.args = args
+        tokenization_api_router.attach_router(app)
+        captured["app"] = app
+        return app
+
+    @asynccontextmanager
+    async def build_engine(*_args, **_kwargs):
+        yield _FakeEngineClient()
+
+    async def init_app_state(engine_client, state, _args):
+        state.engine_client = engine_client
+        state.serving_tokenization = handler if has_tokenization else None
+
+    async def serve_http(_app, **_kwargs):
+        return asyncio.create_task(asyncio.sleep(0))
+
+    monkeypatch.setattr(api_server, "build_openai_app", build_app_with_native_tokenization)
+    monkeypatch.setattr(api_server, "build_async_omni", build_engine)
+    monkeypatch.setattr(api_server, "omni_init_app_state", init_app_state)
+    monkeypatch.setattr(api_server, "serve_http", serve_http)
+    monkeypatch.setattr(api_server.STORAGE_MANAGER, "start", lambda: asyncio.sleep(0))
+
+    await api_server.omni_run_server_worker(
+        "127.0.0.1:8000", _FakeSocket(), _minimal_args(enable_tokenizer_info_endpoint=tokenizer_info_enabled)
+    )
+
+    app = captured["app"]
+    with TestClient(app, raise_server_exceptions=False) as client:
+        tokenize_response = client.post("/tokenize", json={"model": "demo-model", "prompt": "hello"})
+        detokenize_response = client.post("/detokenize", json={"model": "demo-model", "tokens": [42]})
+        info_response = client.get("/tokenizer_info")
+
+    expected_status = 200 if has_tokenization else 404
+    assert tokenize_response.status_code == detokenize_response.status_code == expected_status
+    assert info_response.status_code == (200 if has_tokenization and tokenizer_info_enabled else 404)
+    openapi_paths = app.openapi()["paths"]
+    assert ("/tokenize" in openapi_paths) == has_tokenization
+    assert ("/detokenize" in openapi_paths) == has_tokenization
+    assert ("/tokenizer_info" in openapi_paths) == (has_tokenization and tokenizer_info_enabled)
+    if has_tokenization:
+        assert tokenize_response.json()["tokens"] == [42]
+        assert detokenize_response.json() == {"prompt": "hello"}
+        handler.create_tokenize.assert_awaited_once()
+        handler.create_detokenize.assert_awaited_once()
+        assert handler.create_tokenize.await_args.args[0].prompt == "hello"
+        assert handler.create_detokenize.await_args.args[0].tokens == [42]
+        assert handler.get_tokenizer_info.await_count == int(tokenizer_info_enabled)
+        if tokenizer_info_enabled:
+            assert info_response.json() == {"tokenizer_class": "TestTokenizer"}
+    else:
+        assert tokenize_response.json() == detokenize_response.json() == {"detail": "Not Found"}
+        handler.create_tokenize.assert_not_awaited()
+        handler.create_detokenize.assert_not_awaited()
+        handler.get_tokenizer_info.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_timestamp_middleware_stamps_http_and_passes_websocket(monkeypatch) -> None:
     """Lock outermost timestamp middleware behavior.
 
@@ -657,12 +740,12 @@ def test_websocket_routes_emit_stable_unavailable_frames_and_close(path: str, pa
         ("1", "duplex"),
         ("true", "duplex"),
         ("on", "duplex"),
-        ("0", "legacy"),
-        ("false", "legacy"),
+        ("0", "turn_based"),
+        ("false", "turn_based"),
     ],
 )
 async def test_realtime_route_defaults_to_configured_duplex_handler(
-    monkeypatch, duplex_query: str | None, expected_handler: str
+    duplex_query: str | None, expected_handler: str
 ) -> None:
     calls: list[str] = []
 
@@ -670,15 +753,16 @@ async def test_realtime_route_defaults_to_configured_duplex_handler(
         async def handle_realtime_session(self, _websocket) -> None:
             calls.append("duplex")
 
-    async def _dispatch_turn_based(_websocket) -> None:
-        calls.append("legacy")
+    class _TurnBasedHandler:
+        async def handle_websocket(self, _websocket) -> None:
+            calls.append("turn_based")
 
-    monkeypatch.setattr(api_server, "dispatch_realtime_websocket", _dispatch_turn_based)
     query_params = {} if duplex_query is None else {"duplex": duplex_query}
     websocket = SimpleNamespace(
         app=SimpleNamespace(
             state=SimpleNamespace(
                 openai_serving_duplex=_DuplexHandler(),
+                openai_realtime_handler=_TurnBasedHandler(),
             )
         ),
         query_params=query_params,
@@ -690,7 +774,18 @@ async def test_realtime_route_defaults_to_configured_duplex_handler(
 
 
 @pytest.mark.parametrize("path", ["/v1/duplex", "/v1/realtime", "/v1/realtime?duplex=1"])
-def test_multi_api_duplex_reconnect_rejected_on_each_worker(path: str) -> None:
+@pytest.mark.parametrize(
+    ("replica_policy", "resume_supported", "reason"),
+    [
+        ("legacy", False, "replica_policy=least_sessions"),
+        ("legacy", True, "replica_policy=least_sessions"),
+        ("least_sessions", True, "resume routing"),
+        ("least_sessions", None, "resume routing"),
+    ],
+)
+def test_multi_api_duplex_reconnect_rejected_on_each_worker(
+    path: str, replica_policy: str, resume_supported: bool | None, reason: str
+) -> None:
     class SessionHandler:
         async def handle_realtime_session(self, _websocket) -> None:
             pytest.fail("Multi-API requests must not access process-local sessions")
@@ -705,18 +800,96 @@ def test_multi_api_duplex_reconnect_rejected_on_each_worker(path: str) -> None:
         app = FastAPI()
         app.state.api_server_count = 2
         app.state.api_server_index = worker_index
+        app.state.engine_client = SimpleNamespace(
+            duplex_session_config=SimpleNamespace(replica_policy=replica_policy),
+            duplex_capabilities=SimpleNamespace(supports_session_resume=resume_supported),
+        )
         app.state.openai_serving_duplex = SessionHandler()
         app.state.duplex_warmup_done = PendingWarmup()
         app.include_router(api_server.router)
         with TestClient(app) as client, client.websocket_connect(path) as websocket:
-            assert websocket.receive_json()["code"] == "multi_api_duplex_unsupported"
+            error = websocket.receive_json()
+            assert error["code"] == "multi_api_duplex_unsupported"
+            assert reason in error["error"]
             with pytest.raises(WebSocketDisconnect) as exc:
                 websocket.receive_text()
             assert exc.value.code == 1008
 
 
+@pytest.mark.parametrize("path", ["/v1/duplex", "/v1/realtime", "/v1/realtime?duplex=1"])
+def test_multi_api_duplex_nonresumable_least_sessions_reaches_each_worker(path: str) -> None:
+    class SessionHandler:
+        async def handle_realtime_session(self, websocket) -> None:
+            await websocket.accept()
+            await websocket.send_json({"type": "session.created"})
+            await websocket.close()
+
+    for worker_index in (0, 1):
+        app = FastAPI()
+        app.state.api_server_count = 2
+        app.state.api_server_index = worker_index
+        app.state.engine_client = SimpleNamespace(
+            duplex_session_config=SimpleNamespace(replica_policy="least_sessions"),
+            duplex_capabilities=SimpleNamespace(supports_session_resume=False),
+        )
+        app.state.openai_serving_duplex = SessionHandler()
+        app.include_router(api_server.router)
+        with TestClient(app) as client, client.websocket_connect(path) as websocket:
+            assert websocket.receive_json() == {"type": "session.created"}
+
+
+@pytest.mark.parametrize("count", [0, -1, True, "2"])
+def test_multi_api_duplex_invalid_topology_rejected(count: object) -> None:
+    app = FastAPI()
+    app.state.api_server_count = count
+    app.state.engine_client = SimpleNamespace(
+        duplex_session_config=SimpleNamespace(replica_policy="least_sessions"),
+        duplex_capabilities=SimpleNamespace(supports_session_resume=False),
+    )
+    app.include_router(api_server.router)
+    with TestClient(app) as client, client.websocket_connect("/v1/duplex") as websocket:
+        error = websocket.receive_json()
+        assert error["code"] == "multi_api_duplex_unsupported"
+        assert "initialized API worker topology" in error["error"]
+        with pytest.raises(WebSocketDisconnect) as exc:
+            websocket.receive_text()
+        assert exc.value.code == 1008
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("duplex_query", ["0", "false"])
+async def test_multi_api_nonduplex_realtime_bypasses_duplex_guard(monkeypatch, duplex_query: str) -> None:
+    calls: list[str] = []
+
+    class _TurnBasedHandler:
+        async def handle_websocket(self, _websocket) -> None:
+            calls.append("turn_based")
+
+    async def unexpected_guard(_websocket) -> NoReturn:
+        fail: Callable[[str], NoReturn] = pytest.fail
+        fail("Non-duplex requests must not use the duplex topology guard")
+
+    monkeypatch.setattr(api_server, "_reject_multi_api_duplex", unexpected_guard)
+    websocket = SimpleNamespace(
+        app=SimpleNamespace(
+            state=SimpleNamespace(
+                api_server_count=2,
+                openai_serving_duplex=object(),
+                openai_realtime_handler=_TurnBasedHandler(),
+            )
+        ),
+        query_params={"duplex": duplex_query},
+    )
+    await api_server.realtime_websocket(websocket)
+    assert calls == ["turn_based"]
+
+
 @pytest.mark.parametrize("path", ["/v1/duplex", "/v1/realtime?duplex=1"])
-def test_single_api_duplex_session_still_reaches_handler(path: str) -> None:
+@pytest.mark.parametrize("replica_policy", ["legacy", "least_sessions"])
+@pytest.mark.parametrize("resume_supported", [False, True])
+def test_single_api_duplex_session_still_reaches_handler(
+    path: str, replica_policy: str, resume_supported: bool
+) -> None:
     class SessionHandler:
         async def handle_realtime_session(self, websocket) -> None:
             await websocket.accept()
@@ -725,6 +898,10 @@ def test_single_api_duplex_session_still_reaches_handler(path: str) -> None:
 
     app = FastAPI()
     app.state.api_server_count = 1
+    app.state.engine_client = SimpleNamespace(
+        duplex_session_config=SimpleNamespace(replica_policy=replica_policy),
+        duplex_capabilities=SimpleNamespace(supports_session_resume=resume_supported),
+    )
     app.state.openai_serving_duplex = SessionHandler()
     app.include_router(api_server.router)
     with TestClient(app) as client, client.websocket_connect(path) as websocket:
@@ -860,23 +1037,77 @@ def test_chat_completion_raw_body_guards_allow_null_defaults(raw_body) -> None:
     api_server._validate_chat_completion_raw_body(raw_body)
 
 
-@pytest.mark.asyncio
-async def test_multi_api_rejects_runtime_voice_upload() -> None:
-    app = FastAPI()
-    app.state.api_server_count = 2
-    raw_request = _request_for(app, method="POST", path="/v1/audio/voices")
+@pytest.mark.parametrize("stream", [False, True], ids=["http", "sse"])
+def test_chat_cache_miss_preserves_native_retryable_error_at_http_boundary(mocker, stream):
+    from tests.helpers.serving_chat import build_serving_chat
 
-    with pytest.raises(HTTPException) as exc_info:
-        await api_server.upload_voice(
-            raw_request,
-            audio_sample=None,
-            speaker_embedding=None,
-            consent="consent-id",
-            name="probe",
+    serving_chat = build_serving_chat()
+
+    async def failed_generation():
+        raise RetryableRequestError("Multi-modal processor cache miss.")
+        yield  # pragma: no cover - async generator boundary
+
+    async def create_completion(request, _raw_request):
+        generator = (
+            serving_chat.chat_completion_stream_generator
+            if request.stream
+            else serving_chat.chat_completion_full_generator
+        )
+        result = generator(
+            request=request,
+            result_generator=failed_generation(),
+            request_id="cache-miss-request",
+            model_name="demo-model",
+            conversation=[],
+            tokenizer=mocker.Mock(),
+            request_metadata=mocker.Mock(),
+        )
+        return result if request.stream else await result
+
+    mocker.patch.object(serving_chat, "create_chat_completion", side_effect=create_completion)
+    app = FastAPI()
+    app.state.openai_serving_chat = serving_chat
+    app.add_api_route("/v1/chat/completions", api_server.create_chat_completion, methods=["POST"])
+    with TestClient(app, raise_server_exceptions=False) as client:
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "demo-model",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": stream,
+                "modalities": ["text"],
+            },
         )
 
-    assert exc_info.value.status_code == 409
-    assert "process-local frontend state" in exc_info.value.detail
+    assert response.status_code == (200 if stream else 503)
+    if stream:
+        events = [json.loads(line.removeprefix("data: ")) for line in response.text.splitlines() if '"error"' in line]
+        error = events[0]["error"]
+        assert response.text.endswith("data: [DONE]\n\n")
+    else:
+        error = response.json()["error"]
+    assert error["type"] == "ServiceUnavailableError"
+    assert error["code"] == 503
+
+
+@pytest.mark.asyncio
+async def test_multi_api_allows_runtime_voice_upload_and_deletion() -> None:
+    # The speaker directory is shared by every API process, so these routes
+    # are not process-local; without a speech handler they report 404.
+    app = FastAPI()
+    app.state.api_server_count = 2
+    app.state.openai_serving_speech = None
+
+    upload = await api_server.upload_voice(
+        _request_for(app, method="POST", path="/v1/audio/voices"),
+        audio_sample=None,
+        speaker_embedding=None,
+        consent="consent-id",
+        name="probe",
+    )
+    deletion = await api_server.delete_voice("probe", _request_for(app, method="DELETE", path="/v1/audio/voices/probe"))
+
+    assert upload.status_code == deletion.status_code == 404
 
 
 @pytest.mark.asyncio
@@ -1053,8 +1284,9 @@ async def test_pure_diffusion_speech_forwards_media_access_args(monkeypatch, tmp
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("ming3", [False, True, "tts"])
 @pytest.mark.parametrize("supported_tasks", [("generate",), ("embed",)])
-async def test_multistage_app_state_key_snapshot(monkeypatch, mocker, tmp_path, supported_tasks) -> None:
+async def test_multistage_app_state_key_snapshot(monkeypatch, mocker, tmp_path, supported_tasks, ming3) -> None:
     """Lock multi-stage ``app.state`` keys after init, including live vs None.
 
     Fails if chat/speech/video/realtime/tokenization keys disappear or are
@@ -1084,6 +1316,9 @@ async def test_multistage_app_state_key_snapshot(monkeypatch, mocker, tmp_path, 
             self.kwargs = kwargs
             self.warmup_calls = 0
 
+        def _has_ming3_talker_stage(self):
+            return ming3 is True
+
         def warmup(self):
             self.warmup_calls += 1
 
@@ -1095,6 +1330,8 @@ async def test_multistage_app_state_key_snapshot(monkeypatch, mocker, tmp_path, 
     class _FakeSpeech(_FakeCtor):
         def __init__(self, *args, **kwargs):
             speech_kwargs.update(kwargs)
+
+        _tts_model_type = "ming3_audio_tts" if ming3 == "tts" else None
 
         async def warmup(self):
             return None
@@ -1121,12 +1358,26 @@ async def test_multistage_app_state_key_snapshot(monkeypatch, mocker, tmp_path, 
     monkeypatch.setattr(api_server, "OmniStreamingSpeechHandler", _FakeCtor)
     monkeypatch.setattr(api_server, "create_streaming_video_handler", lambda **_k: _marker("streaming_video"))
     monkeypatch.setattr(api_server, "OmniOpenAIServingVideo", _FakeCtor)
+    from unittest.mock import AsyncMock
+
+    register = AsyncMock()
+    monkeypatch.setattr("vllm_omni.entrypoints.openai.ming3_voices.register_model_voice_presets", register)
 
     state = State()
     await api_server.omni_init_app_state(engine, state, _minimal_args(log_error_stack=True))
     assert speech_kwargs["speech_cache_config"].resolve_max_bytes == 1024
     assert speech_kwargs["speech_cache_config"].resolve_max_entries == 2048
     assert speech_kwargs["speech_cache_config"].speaker_max_bytes == 8
+    if (ming3 is True and "generate" in supported_tasks) or ming3 == "tts":
+        register.assert_awaited_once()
+        assert register.call_args.args[0] is state.openai_serving_speech
+        assert register.call_args.args[1] == _minimal_args().model
+        if ming3 is True:
+            assert state.openai_serving_chat._ming3_speech_service is state.openai_serving_speech
+        else:
+            assert not hasattr(state.openai_serving_chat, "_ming3_speech_service")
+    else:
+        register.assert_not_awaited()
 
     disabled = (
         set()
