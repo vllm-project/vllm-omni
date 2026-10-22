@@ -11,6 +11,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar
 
+import torch
+
 from vllm_omni.diffusion.sched.sigma_schedule import DMD2SigmaSchedule
 from vllm_omni.errors import OmniClientError
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
@@ -131,6 +133,10 @@ class FastH3CheckpointSpec:
             raise ValueError(
                 f"{self.name} pins VSA sparsity={self.vsa_sparsity}; remove the fixed fastvideo_vsa_topk override"
             )
+        parallel = od_config.parallel_config
+        if parallel.ring_degree != 1 or parallel.allgather_degree != 1:
+            raise ValueError(f"{self.name} supports local attention or pure Ulysses sequence parallelism")
+        self._check_base_vsa_provider(attention, od_config)
         # Warm-up runs only the base, so each scheduled VSA profile is resolved here on this checkpoint's tile.
         for name, spec in _scheduled_vsa_specs(od_config):
             if spec.fastvideo_vsa_topk is not None:
@@ -139,26 +145,33 @@ class FastH3CheckpointSpec:
                     f"override from attention schedule profile {name!r}"
                 )
             try:
-                self._resolve_vsa_provider(spec, od_config)
+                # The runtime resolves with the query dtype, which H3 fixes to BF16 whatever --dtype is.
+                self._resolve_vsa_provider(spec, torch.bfloat16)
             except (ImportError, ValueError) as exc:
                 raise ValueError(f"{self.name} cannot run attention schedule profile {name!r}: {exc}") from exc
-        parallel = od_config.parallel_config
-        if parallel.ring_degree != 1 or parallel.allgather_degree != 1:
-            raise ValueError(f"{self.name} supports local attention or pure Ulysses sequence parallelism")
 
-    def _resolve_vsa_provider(self, spec: AttentionSpec, od_config: OmniDiffusionConfig) -> None:
+    def _check_base_vsa_provider(self, attention: AttentionSpec, od_config: OmniDiffusionConfig) -> None:
+        """Warm-up checks V2's base provider."""
+
+    def _resolve_vsa_provider(self, spec: AttentionSpec, dtype: torch.dtype) -> None:
         """Resolve the sparse provider and precision ``spec`` runs with on this worker's device and tile."""
-        from vllm_omni.diffusion.attention.ops.block_sparse import resolve_block_sparse_provider
+        from vllm_omni.diffusion.attention.ops.block_sparse import (
+            require_fastvideo_sparse,
+            resolve_block_sparse_provider,
+        )
         from vllm_omni.diffusion.distributed.utils import get_local_device
 
-        resolve_block_sparse_provider(
+        provider = resolve_block_sparse_provider(
             spec.fastvideo_vsa_provider,
             spec.fastvideo_vsa_precision,
             get_local_device(),
-            od_config.dtype,
+            dtype,
             128,
             block_size=self.vsa_tile_size,
         )
+        if provider == "fastvideo" and self.vsa_tile_size == 64:
+            # The resolver returns an explicit tile64 provider unchecked; the profile's step imports this kernel.
+            require_fastvideo_sparse()
 
     def check_request(self, sampling: OmniDiffusionSamplingParams, *, step_execution: bool = False) -> None:
         if step_execution:
@@ -202,11 +215,8 @@ class FastH3OmniCheckpointSpec(FastH3CheckpointSpec):
     vsa_sparsity: float = 0.9
     base_revision: str = ""
 
-    def check_serving_contract(self, *, partition: str, od_config: OmniDiffusionConfig) -> None:
-        super().check_serving_contract(partition=partition, od_config=od_config)
-        attention, _ = od_config.diffusion_attention_config.resolve_with_source("self")
-        assert attention is not None  # The base contract requires an explicit VSA spec.
-        self._resolve_vsa_provider(attention, od_config)
+    def _check_base_vsa_provider(self, attention: AttentionSpec, od_config: OmniDiffusionConfig) -> None:
+        self._resolve_vsa_provider(attention, od_config.dtype)
 
     @classmethod
     def from_metadata(cls, metadata: Mapping[str, object]) -> FastH3OmniCheckpointSpec:
