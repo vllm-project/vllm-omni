@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-"""Malformed request ``attention_schedule`` values return HTTP 400 on the image and chat routes,
-and malformed ``attention_sigma_schedule`` values return HTTP 400 on the image route.
+"""Malformed request ``attention_schedule`` and ``attention_sigma_schedule`` values return HTTP 400
+on the image and chat routes.
 
 A real ``vllm-omni serve`` runs ``tiny-random/Qwen-Image`` twice: the default single-stage launch
 uses the inline stage client, and ``--stage-id 0`` with an Omni master runs the stage in a
@@ -75,8 +75,9 @@ MALFORMED_SIGMA_SCHEDULES = [
     pytest.param([{"low": 0.0, "high": 1.0, "profile": "dense"}], "unknown profile", id="unknown-profile"),
 ]
 
-# One schedule the chat route rejects itself and one that only scheduler admission rejects.
+# For each schedule kind, one schedule the chat route rejects itself and one that only scheduler admission rejects.
 MALFORMED_CHAT_SCHEDULES = [MALFORMED_SCHEDULES[1], MALFORMED_SCHEDULES[-1]]
+MALFORMED_CHAT_SIGMA_SCHEDULES = [MALFORMED_SIGMA_SCHEDULES[1], MALFORMED_SIGMA_SCHEDULES[-1]]
 
 
 SERVERS = [
@@ -109,11 +110,11 @@ def _generate(server: OmniServer, extra_params: dict | None = None) -> requests.
     )
 
 
-def _chat(server: OmniServer, schedule, *, in_extra_body: bool) -> requests.Response:
-    """Send the schedule in ``extra_args`` at the request root or inside ``extra_body``."""
+def _chat(server: OmniServer, extra_args: dict[str, object], *, in_extra_body: bool) -> requests.Response:
+    """Send ``extra_args`` at the request root or inside ``extra_body``."""
     extra_body: dict[str, object] = {"height": 64, "width": 64, "num_inference_steps": 2, "seed": 1}
     body: dict[str, object] = {"messages": [{"role": "user", "content": "a cat"}], "extra_body": extra_body}
-    (extra_body if in_extra_body else body)["extra_args"] = {"attention_schedule": schedule}
+    (extra_body if in_extra_body else body)["extra_args"] = extra_args
     return requests.post(
         f"http://{server.host}:{server.port}/v1/chat/completions",
         json=body,
@@ -167,7 +168,25 @@ def test_malformed_attention_sigma_schedule_returns_400(omni_server: OmniServer,
 def test_malformed_chat_attention_schedule_returns_400(
     omni_server: OmniServer, in_extra_body: bool, schedule, message: str
 ) -> None:
-    response = _chat(omni_server, schedule, in_extra_body=in_extra_body)
+    response = _chat(omni_server, {"attention_schedule": schedule}, in_extra_body=in_extra_body)
+
+    assert response.status_code == 400, response.text
+    error = response.json()["error"]
+    assert error["code"] == 400
+    assert message in error["message"]
+    _assert_image(_generate(omni_server))
+
+
+@pytest.mark.core_model
+@pytest.mark.diffusion
+@hardware_test(res={"cuda": "L4"})
+@pytest.mark.parametrize("omni_server", SERVERS, indirect=True)
+@pytest.mark.parametrize("in_extra_body", [False, True], ids=["root-extra-args", "extra-body-extra-args"])
+@pytest.mark.parametrize(("schedule", "message"), MALFORMED_CHAT_SIGMA_SCHEDULES)
+def test_malformed_chat_attention_sigma_schedule_returns_400(
+    omni_server: OmniServer, in_extra_body: bool, schedule, message: str
+) -> None:
+    response = _chat(omni_server, {"attention_sigma_schedule": schedule}, in_extra_body=in_extra_body)
 
     assert response.status_code == 400, response.text
     error = response.json()["error"]
