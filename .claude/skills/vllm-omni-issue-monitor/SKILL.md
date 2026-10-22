@@ -28,8 +28,19 @@ recompute Outstanding DI.
 2. **Open bugs** counter — total number of `label:bug` issues counted.
 3. **Top 20 DI contributors** sub-card — sortable-by-DI table:
    `#` · `Title` · `Priority` · `Days` · `DI` · `Assignee` ·
-   `Maintainer` · `Bugfix`. Rows 21–40 hide behind an **Expand to show
-   Top 40** toggle when more issues exist.
+   `Maintainer` · `Bugfix`. Rows 21+ hide behind an **Expand to show all N**
+   toggle when more issues exist. Every rankable row ships in the DOM with a
+   `data-milestone` attribute plus a **milestone chip** next to the title;
+   a **milestone filter dropdown** (`All milestones` / each milestone title
+   with its DI total + issue count / `No milestone`, ordered by per-milestone
+   DI desc) scopes both the table and the two metric cards above it: picking
+   a milestone re-filters the rows, resizes the expand toggle, and swaps the
+   **Outstanding DI** / **Open bugs** card values + severity tint to that
+   milestone's server-precomputed aggregates (embedded as an
+   `application/json` blob — the JS never recomputes DI). Bucket semantics:
+   card counts include `wontfix`/`invalid` issues (they carry labels/DI
+   too), while the table only ever shows rankable rows — so a milestone
+   bucket's card count can exceed its visible row count.
 4. **Stale Bugs (open > 2 months)** sub-card — open `label:bug` issues
    still unresolved past the typical resolution window
    (`days_open > STALE_BUG_DAYS = 60`), excluding `wontfix` / `invalid`,

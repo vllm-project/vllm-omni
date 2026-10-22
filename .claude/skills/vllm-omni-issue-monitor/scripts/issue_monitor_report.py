@@ -292,6 +292,16 @@ def _fetch_bugfix_pr_links_via_graphql(
 # ---------------------------------------------------------------------------
 
 
+def _issue_milestone(issue: dict[str, Any]) -> str:
+    """Milestone title of an issue (``""`` when unset).
+
+    The REST issues payload carries the milestone inline, so no extra API
+    call is needed — the Top 20 milestone filter is pure render-time data.
+    """
+    ms = issue.get("milestone") or {}
+    return str(ms.get("title") or "").strip()
+
+
 def _bug_di_priority_class(issue: dict[str, Any]) -> str:
     label_names = [str(label.get("name") or "") for label in issue.get("labels", []) or []]
     if "invalid" in label_names:
@@ -392,6 +402,7 @@ def _build_mock_issues(now: datetime) -> list[dict[str, Any]]:
         labels: list[str],
         assignees: list[str] | None = None,
         created_offset_days: int = 10,
+        milestone: str | None = None,
     ) -> dict[str, Any]:
         from datetime import timedelta
 
@@ -403,31 +414,32 @@ def _build_mock_issues(now: datetime) -> list[dict[str, Any]]:
             "labels": [{"name": n} for n in (["bug"] + labels)],
             "assignees": [{"login": a} for a in (assignees or [])],
             "pull_request": None,
+            "milestone": {"title": milestone} if milestone else None,
         }
 
     return [
         # 4 critical (each contributes 10 × ceil(days/1))
         _issue(101, "Pipeline stalls when KV cache is reloaded mid-generation (regression after #94)",
-               ["critical"], ["alice"], created_offset_days=3),
+               ["critical"], ["alice"], created_offset_days=3, milestone="v0.32.0"),
         _issue(102, "Crash: tensor parallel worker OOM on >4 GPU configs", ["critical"], ["bob"], created_offset_days=2),
-        _issue(103, "Audio tokenizer produces NaNs for empty inputs", ["critical"], [], created_offset_days=1),
+        _issue(103, "Audio tokenizer produces NaNs for empty inputs", ["critical"], [], created_offset_days=1, milestone="v0.32.0"),
         _issue(104, "Inference server hangs on graceful shutdown", ["critical"], ["carol"], created_offset_days=4),
         # 6 high priority (base 3.0, slo 5d)
         _issue(110, "LoRA adapter weights leak between concurrent requests in Stream API",
-               ["high priority"], ["alice", "dave"], created_offset_days=12),
+               ["high priority"], ["alice", "dave"], created_offset_days=12, milestone="v0.32.0"),
         _issue(111, "Tokenizer trims trailing whitespace inconsistently across models",
                ["high priority"], ["bob"], created_offset_days=7),
         _issue(112, "Diffusion scheduler miscalculates CFG at batch_size > 8",
                ["high priority"], [], created_offset_days=15),
         _issue(113, "Chat template fails on multi-turn tool messages with image content",
-               ["high priority"], ["carol"], created_offset_days=11),
+               ["high priority"], ["carol"], created_offset_days=11, milestone="v0.31.0"),
         _issue(114, "Engine version mismatch between worker and frontend (404 on /v1/models)",
                ["high priority"], ["dave"], created_offset_days=9),
         _issue(115, "Vision encoder miscomputes RoPE positions for non-square inputs",
                ["high priority"], ["alice"], created_offset_days=18),
         # 8 medium priority (base 1.0, slo 10d)
         _issue(120, "Slow first-token latency when KV cache exceeds 80% capacity",
-               ["medium priority"], ["bob"], created_offset_days=22),
+               ["medium priority"], ["bob"], created_offset_days=22, milestone="v0.32.0"),
         _issue(121, "Paged attention swaps to CPU under bursty request patterns",
                ["medium priority"], ["alice"], created_offset_days=25),
         _issue(122, "Speculative decoding draft model not warmed on hot path",
@@ -437,7 +449,7 @@ def _build_mock_issues(now: datetime) -> list[dict[str, Any]]:
         _issue(124, "Logging middleware doubles latency on /v1/chat/completions",
                ["medium priority"], ["bob"], created_offset_days=12),
         _issue(125, "Worker health probe misreports during graceful shutdown window",
-               ["medium priority"], ["carol"], created_offset_days=19),
+               ["medium priority"], ["carol"], created_offset_days=19, milestone="v0.31.0"),
         _issue(126, "Diffusion sampler diverges when guidance_rescale > 0.7",
                ["medium priority"], [], created_offset_days=28),
         _issue(127, "ASR endpoint returns 200 with empty body for partial failures",
@@ -493,6 +505,12 @@ def _compute_outstanding_di(
     counts = {label: 0 for label in BUG_DI_TABLE}
     counts["unclassified"] = 0
     total = 0.0
+    # Per-milestone aggregates (same semantics as the headline numbers:
+    # every open label:bug issue counts, including wontfix/invalid —
+    # they add to the milestone DI total but never appear in the ranking).
+    ms_totals: dict[str, float] = {}
+    ms_counts: dict[str, int] = {}
+    ms_prio: dict[str, dict[str, int]] = {}
     for issue in issues:
         di, priority, _, _, _, _ = _compute_issue_di(issue, now=now)
         total += di
@@ -500,22 +518,41 @@ def _compute_outstanding_di(
             counts[priority] += 1
         else:
             counts["unclassified"] += 1
-    per_issue_raw: list[tuple[float, str, float, int, str, str]] = []
+        ms = _issue_milestone(issue)
+        ms_totals[ms] = ms_totals.get(ms, 0.0) + di
+        ms_counts[ms] = ms_counts.get(ms, 0) + 1
+        prio_map = ms_prio.setdefault(ms, {})
+        prio_map[priority] = prio_map.get(priority, 0) + 1
+    per_issue_raw: list[tuple[float, str, float, int, str, str, str]] = []
     for issue in rankable:
         di, priority, days_open, issue_number, title, assignee = _compute_issue_di(issue, now=now)
-        per_issue_raw.append((di, priority, days_open, issue_number, title, assignee))
+        per_issue_raw.append(
+            (di, priority, days_open, issue_number, title, assignee, _issue_milestone(issue))
+        )
     per_issue_sorted = sorted(per_issue_raw, key=lambda x: -x[0])
-    top_issue_numbers = [t[3] for t in per_issue_sorted[:40] if t[3]]
+    # Bugfix links are fetched for every rankable issue: the milestone
+    # filter can surface any rank (not just the global top 40), and all
+    # rankable rows are now rendered into the DOM.
+    top_issue_numbers = [t[3] for t in per_issue_sorted if t[3]]
     if mock:
         # Don't actually call GraphQL in mock mode — the synthetic map above
         # is sufficient and keeps the smoke test fully offline.
         pass
     else:
         bugfix_links = _fetch_bugfix_pr_links_via_graphql(gh_token, top_issue_numbers)
-    per_issue_with_bugfix: list[tuple[float, str, float, int, str, str, list[int]]] = []
-    for di, priority, days_open, issue_number, title, assignee in per_issue_sorted:
+    per_issue_with_bugfix: list[tuple[float, str, float, int, str, str, str, list[int]]] = []
+    for di, priority, days_open, issue_number, title, assignee, milestone in per_issue_sorted:
         per_issue_with_bugfix.append(
-            (di, priority, days_open, issue_number, title, assignee, bugfix_links.get(issue_number, []))
+            (
+                di,
+                priority,
+                days_open,
+                issue_number,
+                title,
+                assignee,
+                milestone,
+                bugfix_links.get(issue_number, []),
+            )
         )
     # Stale bugs (> STALE_BUG_DAYS days) — merge into the same bugfix-link
     # GraphQL pass so we make at most one HTTP call for the section.
@@ -536,6 +573,39 @@ def _compute_outstanding_di(
     if counts.get("unclassified", 0):
         detail_parts.append(f"unclassified={counts['unclassified']}")
     detail = ", ".join(detail_parts) if detail_parts else "no open bug in snapshot"
+
+    def _ms_detail(prio_map: dict[str, int]) -> str:
+        parts = [f"{p}={prio_map[p]}" for p in BUG_DI_TABLE if prio_map.get(p, 0)]
+        if prio_map.get("unclassified", 0):
+            parts.append(f"unclassified={prio_map['unclassified']}")
+        return ", ".join(parts) if parts else "no open bug in snapshot"
+
+    # Milestone stats consumed by the Top 20 milestone filter: "__all__"
+    # restores the headline numbers; each milestone (and "__none__" for
+    # un-milestoned issues) carries its own DI total / issue count /
+    # priority breakdown so the metric cards switch with the filter.
+    milestone_stats: dict[str, dict[str, Any]] = {
+        "__all__": {
+            "di_disp": _format_di_value(total),
+            "count": len(issues),
+            "detail": detail,
+            "severity": severity,
+            "bugs_detail": f"total labeled bug(s) on {_REPO}",
+            "scope_label": "",
+        }
+    }
+    for ms in sorted(ms_totals, key=lambda m: (-ms_totals[m], m)):
+        ms_total = ms_totals[ms]
+        milestone_stats[ms if ms else "__none__"] = {
+            "di_disp": _format_di_value(ms_total),
+            "count": ms_counts[ms],
+            "detail": _ms_detail(ms_prio.get(ms, {})),
+            "severity": "fail" if ms_total > BUG_DI_RED_THRESHOLD else "ok",
+            "bugs_detail": (
+                f"labeled bug(s) with milestone {ms}" if ms else "labeled bug(s) without a milestone"
+            ),
+            "scope_label": ms if ms else "No milestone",
+        }
     return {
         "total_di": total,
         "n_issues": len(issues),
@@ -546,6 +616,7 @@ def _compute_outstanding_di(
         "value": _format_di_value(total),
         "detail": detail,
         "severity": severity,
+        "milestone_stats": milestone_stats,
     }
 
 
@@ -619,9 +690,19 @@ def _details_subcard(
     )
 
 
-def _render_focus_metric_card(title: str, value: str, detail: str, severity: str) -> str:
+def _render_focus_metric_card(
+    title: str,
+    value: str,
+    detail: str,
+    severity: str,
+    *,
+    card_id: str = "",
+) -> str:
+    """One metric card. ``card_id`` lets the milestone-filter JS retarget the
+    Outstanding DI / Open bugs cards (value, detail, severity class)."""
+    id_attr = f' id="{html.escape(card_id, quote=True)}"' if card_id else ""
     return (
-        f'<div class="focus-card focus-card--{html.escape(severity)}">'
+        f'<div class="focus-card focus-card--{html.escape(severity)}"{id_attr}>'
         f'<div class="focus-card-title">{html.escape(title)}</div>'
         f'<div class="focus-card-value">{html.escape(value)}</div>'
         f'<div class="focus-card-detail">{html.escape(detail)}</div>'
@@ -693,9 +774,18 @@ def _di_action_cell_html() -> str:
 
 
 def _render_top_di_table_html(
-    per_issue: list[tuple[float, str, float, int, str, str, list[int]]],
+    per_issue: list[tuple[float, str, float, int, str, str, str, list[int]]],
+    milestone_stats: dict[str, dict[str, Any]] | None = None,
 ) -> str:
-    """Top 20 default; expands to Top 40 via toggle button."""
+    """Top 20 DI table with a **milestone filter**.
+
+    Every rankable issue is rendered into the DOM (rows ranked 21+ ship
+    ``hidden``) so any milestone's full issue list is reachable; the
+    client-side filter (``_di_milestone_filter_script``) shows/hides rows
+    for the selected milestone, drives the expand toggle, and swaps the
+    Outstanding DI / Open bugs metric cards to that milestone's aggregates
+    (precomputed server-side in ``#di-milestone-data``).
+    """
     if not per_issue:
         return ""
 
@@ -706,17 +796,27 @@ def _render_top_di_table_html(
         issue_number: int,
         title: str,
         assignee: str,
+        milestone: str,
         linked: list[int],
+        *,
+        hidden: bool = False,
     ) -> str:
         title_disp = html.escape(title)
         issue_url = f"{_REPO_URL}/issues/{issue_number}"
         days_disp = f"{int(days_open)}"
         di_disp = html.escape(_format_di_value(di))
         priority_disp = html.escape(priority)
+        ms_attr = html.escape(milestone, quote=True)
+        ms_chip = (
+            f'<span class="ms-chip" title="milestone: {ms_attr}">{html.escape(milestone)}</span>'
+            if milestone
+            else ""
+        )
+        hidden_attr = " hidden" if hidden else ""
         return (
-            "<tr>"
+            f'<tr data-milestone="{ms_attr}"{hidden_attr}>'
             f'<td><a href="{issue_url}" target="_blank" rel="noopener">#{issue_number}</a></td>'
-            f"<td>{title_disp}</td>"
+            f"<td>{title_disp}{ms_chip}</td>"
             f"<td>{priority_disp}</td>"
             f'<td class="di-days">{days_disp}</td>'
             f'<td class="di-value">{di_disp}</td>'
@@ -727,49 +827,71 @@ def _render_top_di_table_html(
             "</tr>"
         )
 
-    visible_rows = per_issue[:20]
-    extra_rows = per_issue[20:40]
-    main_tbody = "".join(_row_html(*row) for row in visible_rows)
+    rows_html = "".join(_row_html(*row, hidden=idx >= 20) for idx, row in enumerate(per_issue))
 
-    parts: list[str] = [
-        '<div class="focus-top-table" data-top-di-table>',
-        '<table class="summary top-di-table">',
-        "<thead><tr>",
-        "<th>#</th><th>Title</th><th>Priority</th><th>Days</th>",
-        "<th>DI</th><th>Assignee</th><th>Maintainer</th><th>Bugfix</th>",
-        "<th></th>",
-        "</tr></thead>",
-        f"<tbody>{main_tbody}</tbody>",
-    ]
-    if extra_rows:
-        extra_tbody = "".join(_row_html(*row) for row in extra_rows)
-        table_id = "di-top-table-extra"
-        parts.extend(
-            [
-                f'<tbody class="di-top-table-collapsed" id="{table_id}" hidden>',
-                extra_tbody,
-                "</tbody>",
-                "</table>",
-                "</div>",
-                '<div class="di-top-table-toggle-row">',
-                '<button type="button" class="di-top-table-toggle" '
-                f'aria-expanded="false" aria-controls="{table_id}" '
-                f'onclick="var t=document.getElementById(\'{table_id}\');'
-                "if(t.hasAttribute('hidden')){t.removeAttribute('hidden');"
-                "this.setAttribute('aria-expanded','true');"
-                "this.textContent='Collapse to Top 20';"
-                "this.classList.add('is-open');"
-                "}else{t.setAttribute('hidden','');"
-                "this.setAttribute('aria-expanded','false');"
-                "this.textContent='Expand to show Top 40';"
-                "this.classList.remove('is-open');"
-                '}">Expand to show Top 40</button>',
-                "</div>",
-            ]
+    # Milestone dropdown (skipped when no issue carries a milestone) —
+    # options ordered by milestone DI desc, "No milestone" bucket last.
+    stats = milestone_stats or {}
+    option_parts: list[str] = ['<option value="__all__">All milestones</option>']
+    none_option = ""
+    for key, st in stats.items():
+        if key == "__all__":
+            continue
+        label = "No milestone" if key == "__none__" else key
+        opt = (
+            f'<option value="{html.escape(key, quote=True)}">'
+            f"{html.escape(label)} · DI {html.escape(str(st.get('di_disp', '0')))}"
+            f" · {st.get('count', 0)} issue(s)</option>"
         )
-    else:
-        parts.extend(["</table>", "</div>"])
-    return "".join(parts)
+        if key == "__none__":
+            none_option = opt
+        else:
+            option_parts.append(opt)
+    if none_option:
+        option_parts.append(none_option)
+    has_milestones = len(option_parts) > 1
+
+    filter_row = (
+        '<div class="di-ms-filter-row">'
+        '<label class="di-ms-filter-label" for="di-milestone-filter">Milestone</label>'
+        '<select id="di-milestone-filter" class="di-ms-filter" '
+        'aria-label="Filter Top DI issues by milestone">'
+        + "".join(option_parts)
+        + "</select></div>"
+        if has_milestones
+        else ""
+    )
+
+    # Aggregates blob — the filter JS swaps the metric cards from this;
+    # "</" is escaped so a milestone title can never close the tag.
+    stats_json = json.dumps(stats, ensure_ascii=False).replace("</", "<\\/")
+    data_blob = (
+        '<script type="application/json" id="di-milestone-data">'
+        f"{stats_json}</script>"
+    )
+
+    table_html = (
+        '<div class="focus-top-table" data-top-di-table>'
+        '<table class="summary top-di-table">'
+        "<thead><tr>"
+        "<th>#</th><th>Title</th><th>Priority</th><th>Days</th>"
+        "<th>DI</th><th>Assignee</th><th>Maintainer</th><th>Bugfix</th>"
+        "<th></th>"
+        "</tr></thead>"
+        f"<tbody>{rows_html}</tbody>"
+        "</table>"
+        "</div>"
+    )
+    toggle_row = (
+        '<div class="di-top-table-toggle-row">'
+        '<span class="di-top-table-count" id="di-top-table-count"></span>'
+        '<button type="button" class="di-top-table-toggle" id="di-top-table-toggle" '
+        'aria-expanded="false" hidden>Expand</button>'
+        "</div>"
+    )
+    if has_milestones:
+        return filter_row + table_html + toggle_row + data_blob
+    return table_html + toggle_row
 
 
 def _render_stale_bugs_subcard_html(
@@ -1019,6 +1141,112 @@ def _inline_edit_script() -> str:
 """
 
 
+def _di_milestone_filter_script() -> str:
+    """Milestone filter for the Top 20 DI table.
+
+    Selecting a milestone (or the no-milestone bucket):
+
+    * hides non-matching rows — the table keeps its global DI-desc order,
+      so the filtered view is that milestone's issue list ranked by DI;
+    * re-labels the expand toggle ("Expand to show all N") for the
+      matching row count;
+    * swaps the **Outstanding DI** / **Open bugs** metric cards to the
+      selected scope's aggregates — read from the ``#di-milestone-data``
+      JSON blob (precomputed server-side; the JS never recomputes DI),
+      including the priority-breakdown detail line and the red
+      ``focus-card--fail`` threshold rule.
+
+    "All milestones" restores the headline (all-issue) numbers.
+    """
+    return """
+<script>
+(function () {
+  "use strict";
+  function init() {
+    var dataEl = document.getElementById("di-milestone-data");
+    var sel = document.getElementById("di-milestone-filter");
+    var wrap = document.querySelector("[data-top-di-table]");
+    if (!dataEl || !sel || !wrap) return;
+    var MS;
+    try { MS = JSON.parse(dataEl.textContent || "{}"); } catch (e) { return; }
+    var rows = [];
+    var tbodies = wrap.querySelectorAll("table tbody");
+    for (var t = 0; t < tbodies.length; t++) {
+      var trs = tbodies[t].rows;
+      for (var i = 0; i < trs.length; i++) rows.push(trs[i]);
+    }
+    var toggle = document.getElementById("di-top-table-toggle");
+    var countEl = document.getElementById("di-top-table-count");
+    var diCard = document.getElementById("focus-card-outstanding-di");
+    var bugsCard = document.getElementById("focus-card-open-bugs");
+    var expanded = false;
+    var TOP_N = 20;
+    function matching(key) {
+      var out = [];
+      for (var i = 0; i < rows.length; i++) {
+        var ms = rows[i].getAttribute("data-milestone") || "";
+        if (key === "__all__" || (key === "__none__" ? ms === "" : ms === key)) {
+          out.push(rows[i]);
+        }
+      }
+      return out;
+    }
+    function apply() {
+      var key = sel.value || "__all__";
+      var stats = MS[key] || MS["__all__"] || {};
+      var m = matching(key);
+      var visible = expanded ? m.length : Math.min(TOP_N, m.length);
+      for (var i = 0; i < rows.length; i++) rows[i].setAttribute("hidden", "");
+      for (var j = 0; j < visible; j++) m[j].removeAttribute("hidden");
+      if (toggle) {
+        if (m.length > TOP_N) {
+          toggle.removeAttribute("hidden");
+          toggle.setAttribute("aria-expanded", expanded ? "true" : "false");
+          toggle.textContent = expanded ? "Collapse to Top 20" : "Expand to show all " + m.length;
+          toggle.classList.toggle("is-open", expanded);
+        } else {
+          toggle.setAttribute("hidden", "");
+        }
+      }
+      if (countEl) {
+        countEl.textContent = "showing " + Math.min(TOP_N, m.length) + " / " + m.length + " issue(s)"
+          + (key === "__all__" ? "" : " · " + (key === "__none__" ? "no milestone" : key));
+      }
+      if (diCard) {
+        var v = diCard.querySelector(".focus-card-value");
+        var d = diCard.querySelector(".focus-card-detail");
+        if (v) v.textContent = stats.di_disp || "0";
+        if (d) {
+          var scope = stats.scope_label || "";
+          d.textContent = (scope ? scope + " — " : "") + (stats.detail || "");
+        }
+        var fail = stats.severity === "fail";
+        diCard.classList.toggle("focus-card--fail", fail);
+        diCard.classList.toggle("focus-card--ok", !fail);
+      }
+      if (bugsCard) {
+        var bv = bugsCard.querySelector(".focus-card-value");
+        if (bv) bv.textContent = String(stats.count != null ? stats.count : "0");
+        var bd = bugsCard.querySelector(".focus-card-detail");
+        if (bd) bd.textContent = stats.bugs_detail || "";
+      }
+    }
+    if (toggle) {
+      toggle.addEventListener("click", function () { expanded = !expanded; apply(); });
+    }
+    sel.addEventListener("change", function () { expanded = false; apply(); });
+    apply();
+  }
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", init);
+  } else {
+    init();
+  }
+})();
+</script>
+"""
+
+
 # ---------------------------------------------------------------------------
 # Section-specific CSS — copied from nightly_local_log_report.py so the
 # standalone HTML matches the parent nightly's Daily focus styling.
@@ -1098,6 +1326,53 @@ _DI_SECTION_CSS = """
 .di-top-table-toggle.is-open {
   background: var(--dashboard-link, #1d4ed8);
   color: #fff;
+}
+/* Milestone filter (Top 20 DI table) */
+.di-ms-filter-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin: 0.25rem 0 0.4rem;
+  flex-wrap: wrap;
+}
+.di-ms-filter-label {
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--dashboard-soft-text, #475569);
+}
+.di-ms-filter {
+  appearance: none;
+  -webkit-appearance: none;
+  background: var(--dashboard-card-tint, #f6f8fa);
+  color: var(--dashboard-text, #26323f);
+  border: 1px solid var(--dashboard-border, #d9e2ec);
+  border-radius: 6px;
+  padding: 0.32rem 0.6rem;
+  font-size: 0.85rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+.di-ms-filter:focus {
+  outline: 2px solid var(--dashboard-link, #1d4ed8);
+  outline-offset: 1px;
+}
+.ms-chip {
+  display: inline-block;
+  margin-left: 0.45rem;
+  padding: 0.02rem 0.45rem;
+  border-radius: 999px;
+  font-size: 0.72rem;
+  font-weight: 600;
+  white-space: nowrap;
+  vertical-align: middle;
+  background: var(--dashboard-card-tint, #f6f8fa);
+  border: 1px solid var(--dashboard-border, #d9e2ec);
+  color: var(--dashboard-soft-text, #475569);
+}
+.di-top-table-count {
+  font-size: 0.8rem;
+  color: var(--dashboard-soft-text, #64748b);
+  margin-right: 0.75rem;
 }
 /* Focus card (Outstanding DI) */
 .focus-card-grid {
@@ -1374,14 +1649,22 @@ def render_html(
         ),
     ]
 
-    # Metric cards — Outstanding DI + N open bugs
+    # Metric cards — Outstanding DI + N open bugs (both carry ids so the
+    # milestone filter can swap their values to the selected scope).
     cards = [
-        _render_focus_metric_card("Outstanding DI", di["value"], di["detail"], di["severity"]),
+        _render_focus_metric_card(
+            "Outstanding DI",
+            di["value"],
+            di["detail"],
+            di["severity"],
+            card_id="focus-card-outstanding-di",
+        ),
         _render_focus_metric_card(
             "Open bugs",
             str(di["n_issues"]),
             f"total labeled bug(s) on {_REPO}",
             "ok" if di["n_issues"] > 0 else "ok",
+            card_id="focus-card-open-bugs",
         ),
     ]
     body_parts.append('<div class="focus-card-grid">')
@@ -1389,12 +1672,17 @@ def render_html(
     body_parts.append("</div>")
 
     # Sub-card with the Top DI contributors table
-    di_table_html = _render_top_di_table_html(di.get("per_issue") or [])
+    di_table_html = _render_top_di_table_html(
+        di.get("per_issue") or [],
+        milestone_stats=di.get("milestone_stats"),
+    )
     if di_table_html:
         di_body = (
             '<p class="focus-table-sub">Top open <code>bug</code> issues '
             "ranked by SLO-escalating Defect Index. Use this to triage "
-            "which issues are accumulating the most backlog weight.</p>"
+            "which issues are accumulating the most backlog weight. Pick a "
+            "<strong>milestone</strong> to scope the table and the metric "
+            "cards above to that milestone's issues and DI total.</p>"
             + di_table_html
         )
         body_parts.append(
@@ -1440,7 +1728,12 @@ def render_html(
         f"</div></div>"
     )
 
-    return _html_document(title, css, "\n".join(body_parts), tail=_inline_edit_script())
+    return _html_document(
+        title,
+        css,
+        "\n".join(body_parts),
+        tail=_inline_edit_script() + _di_milestone_filter_script(),
+    )
 
 
 # ---------------------------------------------------------------------------
