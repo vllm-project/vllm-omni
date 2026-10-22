@@ -111,10 +111,14 @@ def _native_checkpoint():
     return model, checkpoint, expected
 
 
-def test_native_install_loads_all_lite_weights_without_changing_encoder():
+@pytest.mark.parametrize("default_device", ["cpu", "meta"])
+def test_native_install_loads_all_lite_weights_without_changing_encoder(default_device):
     model, checkpoint, expected = _native_checkpoint()
     encoder = {key: tensor.clone() for key, tensor in model.encoder.state_dict().items()}
-    _api("lightvae_native").install_h3_lite_decoder(model, checkpoint, native_config=checkpoint.config)
+    # Pipeline construction may set an accelerator default device while the
+    # native VAE and checkpoint are deliberately still loaded on the CPU.
+    with torch.device(default_device):
+        _api("lightvae_native").install_h3_lite_decoder(model, checkpoint, native_config=checkpoint.config)
     assert len(model.decoder.transformer_blocks) == 2
     actual = model.state_dict()
     for key, value in expected.items():

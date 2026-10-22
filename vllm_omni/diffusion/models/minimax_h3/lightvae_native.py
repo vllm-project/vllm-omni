@@ -64,7 +64,7 @@ def install_h3_lite_decoder(
     pos_embed = getattr(decoder, "pos_embed", None)
     inv_freq = getattr(pos_embed, "inv_freq", None)
     expected_freq = 1.0 / cast(float, checkpoint.config["decoder_rope_theta"]) ** torch.arange(
-        0, 1, 6 / rotary_dim, dtype=torch.float32
+        0, 1, 6 / rotary_dim, dtype=torch.float32, device="cpu"
     )
     if (
         getattr(pos_embed, "n_dim", None) != 3
