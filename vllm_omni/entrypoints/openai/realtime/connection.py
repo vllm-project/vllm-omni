@@ -340,7 +340,11 @@ class OpenAIFullDuplexConnection:
             if turn_detector.config.type == turn_detection_config.type:
                 turn_detector.reconfigure(turn_detection_config)
             else:
-                turn_detector.reset()
+                # The replacement detector has not seen the current onset, so
+                # drop the item id owned by the detector being replaced;
+                # otherwise a later onset cannot report speech_started and the
+                # buffered speech never commits.
+                self._reset_turn_detection()
                 turn_detector = turn_detection_config.build_detector(
                     self._vad_backend_provider,
                     self._semantic_vad_backend_provider,
