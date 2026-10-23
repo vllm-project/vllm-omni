@@ -33,18 +33,21 @@ parallel, cache, quantized, or expert-kernel backends.
 ## Hardware Support
 
 This recipe documents the CUDA single-GPU dense and BF16 MoE checkpoint paths.
-Multi-GPU parallelism, Cache-DiT, quantization, and CPU offload are not
-validated for LingBot-Video in this PR.
+Multi-GPU parallelism and Cache-DiT are not validated for LingBot-Video in this
+PR. Quantization is rejected at startup, whether it comes from `--quantization`
+or from a quantization config in the checkpoint, because the projections are
+plain `nn.Linear` layers that quantization would leave unchanged.
 
 ## GPU
 
 ### 1 x NVIDIA L20X
 
 Both checkpoints have been smoke-tested on one NVIDIA L20X at `192x320`,
-9 frames, and 2 steps. The MoE smoke reserved approximately `67.70 GiB` of GPU
-memory, so use a GPU with at least about 70 GiB of available memory for this
-small validation shape. Larger resolutions, frame counts, or concurrent
-requests require additional headroom.
+9 frames, and 2 steps. Without offload the MoE smoke reserved approximately
+`67.70 GiB` of GPU memory on L20X. The same shape reserved `72314 MiB` on one
+H200 and `75224 MiB` on one H100, so plan for an 80 GB class card when serving
+MoE without offload. Larger resolutions, frame counts, or concurrent requests
+require additional headroom.
 
 The MoE path is validated with BF16 expert weights.
 
@@ -146,6 +149,98 @@ done
 curl -L "http://localhost:8091/v1/videos/${video_id}/content" -o lingbot_t2v.mp4
 ```
 
+### 1 x NVIDIA H100 80GB or H200 with offload
+
+Both offload modes are supported. `--enable-cpu-offload` is model-level
+offload: the text encoder and the DiT swap places on the GPU, so only one of
+them is resident at a time, but the complete DiT is still on the GPU while it
+denoises. For the MoE smoke shape it lowers the peak from `72314 MiB` to
+`63634 MiB` on one H200 and from `75224 MiB` to `66534 MiB` on one H100.
+`--enable-layerwise-offload` streams the DiT blocks instead, peaks at
+`13160 MiB` on both, and is the mode to use on smaller cards. If both flags are
+set, layerwise offload is used.
+
+With offload enabled the pipeline is built in host memory. With
+`--enable-cpu-offload`, the startup warmup pins the DiT and the text encoder in
+host memory the first time each one is swapped, so requests swap from pinned
+memory instead of pageable memory. Layerwise offload keeps its own pinned
+buffers.
+
+The same modes can be selected with `--diffusion-offload-config`.
+`{"mode":"module","components":["dit","text_encoder"]}` matches
+`--enable-cpu-offload`, and `{"mode":"layer","components":["dit","text_encoder"]}`
+matches `--enable-layerwise-offload`. The layer form streams both the DiT
+blocks and the Qwen3-VL text encoder blocks. `{"mode":"layer","components":["dit"]}`
+streams only the DiT and keeps the text encoder resident.
+
+```bash
+CUDA_VISIBLE_DEVICES=0 \
+vllm serve robbyant/lingbot-video-moe-30b-a3b \
+  --omni \
+  --model-class-name LingBotVideoPipeline \
+  --enable-cpu-offload \
+  --vae-use-tiling \
+  --vae-use-slicing \
+  --default-sampling-params \
+  '{"0":{"num_frames":81,"num_inference_steps":40,"guidance_scale":6.0}}' \
+  --port 8091
+```
+
+Submit the same text-to-video job as above, with
+`model=robbyant/lingbot-video-moe-30b-a3b`.
+
+### 1 x NVIDIA RTX 5090 32GB
+
+Layerwise offload streams the DiT blocks and the text encoder blocks from host
+memory, so the MoE checkpoint also serves on a 32 GiB card.
+
+#### Environment
+
+- OS: Linux
+- Python: 3.10+
+- Driver / runtime: NVIDIA CUDA environment with a 32 GiB RTX 5090 GPU
+- vLLM version: Match the repository requirements for your checkout
+- vLLM-Omni version or commit: Use the commit you are deploying from
+
+#### Command
+
+```bash
+CUDA_VISIBLE_DEVICES=0 \
+vllm serve robbyant/lingbot-video-moe-30b-a3b \
+  --omni \
+  --model-class-name LingBotVideoPipeline \
+  --enable-layerwise-offload \
+  --vae-use-tiling \
+  --vae-use-slicing \
+  --default-sampling-params \
+  '{"0":{"num_frames":81,"num_inference_steps":40,"guidance_scale":6.0}}' \
+  --port 8091
+```
+
+#### Verification
+
+Submit the same text-to-video job as above, with
+`model=robbyant/lingbot-video-moe-30b-a3b`.
+
+#### Notes
+
+- Memory usage: the offline runner reports `9248 MiB` worker peak reserved
+  for 9 frames at `192x320` in 2 steps and `9152 MiB` for 25 frames at
+  `480x480` in 20 steps. Up to that shape the peak is set by the VAE, the
+  non-block modules, and the prefetched blocks; 81 frames at `480x832` in
+  4 steps raise it to `16104 MiB`. Selecting only `"dit"` keeps the text
+  encoder resident and peaks at `16278 MiB` for 9 frames at `192x320`. The
+  40-step serving default has not been measured on this card.
+- Key flags: layer-mode offload is required on this card, and
+  `--enable-layerwise-offload` is its lowest-memory form.
+  `--vae-use-tiling` and `--vae-use-slicing` keep decode memory flat at larger
+  shapes. The host holds the offloaded weights, so size host memory for the full
+  BF16 checkpoint.
+- Known limitations: `--enable-cpu-offload` moves the complete DiT to the GPU for
+  the first denoising forward, so it fails on this card with a CUDA
+  out-of-memory error. With the default startup warmup that forward runs before
+  the server reports ready. Use `--enable-layerwise-offload` instead.
+
 ## Key Parameters
 
 | Parameter | Suggested smoke value | Notes |
@@ -194,8 +289,91 @@ Local MoE validation on one NVIDIA L20X used checkpoint revision
 - The online `/v1/videos` smoke created, polled, and downloaded the generated
   MP4 successfully (`1 passed`).
 
+Local MoE offload validation on one RTX 5090 (32 GiB) with the offline
+`text_to_video.py` runner, `--vae-use-tiling --vae-use-slicing`, seed `42`,
+reporting worker peak reserved GPU memory and generation time for one request:
+
+| Offload selector | 9 frames, `192x320`, 2 steps | 25 frames, `480x480`, 20 steps | 81 frames, `480x832`, 4 steps |
+|------------------|------------------------------|--------------------------------|-------------------------------|
+| `--enable-layerwise-offload` | `9248 MiB`, `6.6s` | `9152 MiB`, `47.4s` | `16104 MiB`, `38.4s` |
+| `{"mode":"layer","components":["dit"]}` | `16278 MiB`, `4.8s` | not measured | not measured |
+| `--enable-cpu-offload` | CUDA out-of-memory during warmup | not measured | not measured |
+
+- `{"mode":"layer","components":["dit","text_encoder"]}` selects the same
+  plan as `--enable-layerwise-offload` and matched its peaks.
+- At the small shape, repeated runs of one configuration with the same seed
+  alternate between two outputs that differ by up to `45` of `255`, and every
+  layerwise selector produced one of those two. At the larger shape, the
+  `--enable-layerwise-offload` output from before the text encoder blocks
+  could stream matched the current output bitwise.
+- `vllm serve` with `--enable-layerwise-offload` reported ready after about
+  `70s` and completed 8 of 8 random 25-frame `480x480` 10-step requests at
+  concurrency 2, with a mean latency of `43.6s` and `11050 MiB` in use
+  afterwards. With only the DiT streamed it completed 8 of 8 with `17212 MiB`
+  in use.
+- At vLLM-Omni `0fc38ce3b`, which built the pipeline on the GPU, every
+  offload selector ran out of CUDA memory while the pipeline loaded on this
+  card, both offline and in `vllm serve`.
+- `--enable-cpu-offload` moves the complete DiT to the GPU for the first
+  denoising forward. With the default startup warmup that forward is the dummy
+  run, so the server never reports ready on this card.
+- Distributed layerwise offload is rejected at startup for
+  `--enable-distributed-layerwise-offload`, `weight_transfer: "allgather"`, and
+  `resident_layers`.
+
+Dense checkpoint on the same card at the small shape: no offload peaks at
+`14340 MiB` in `0.46s`, `--enable-cpu-offload` at `9408 MiB` in `1.99s`,
+`{"mode":"layer","components":["dit"]}` at `12028 MiB` in `0.59s`, and
+`--enable-layerwise-offload` at `4796 MiB` in `0.79s`. The no-offload, CPU
+offload, and layerwise outputs match each other bitwise.
+
+Local MoE offload validation on one H200 with the same runner, shapes, and
+seed, reporting worker peak reserved GPU memory. Generation times are in the
+H100 table below:
+
+| Offload selector | 9 frames, `192x320`, 2 steps | 25 frames, `480x480`, 20 steps |
+|------------------|------------------------------|--------------------------------|
+| none | `72314 MiB` | `72314 MiB` |
+| `--enable-cpu-offload` | `63634 MiB` | `63634 MiB` |
+| `{"mode":"module","components":["dit"]}` | `72126 MiB` | not measured |
+| `{"mode":"module","components":["text_encoder"]}` | `66960 MiB` | not measured |
+| `--enable-layerwise-offload` | `13160 MiB` | `13160 MiB` |
+| `{"mode":"layer","components":["dit"]}` | `20286 MiB` | not measured |
+
+- Each model-level selector matched the previous implementation bitwise when
+  the two ran back to back.
+- `vllm serve` with `--enable-cpu-offload` reported ready after about `86s`,
+  logged `Model-level offloading enabled`, and `nvidia-smi` showed
+  `60811 MiB` in use after one 9-frame request, versus `73087 MiB` without
+  offload. With `--enable-layerwise-offload` it showed `14215 MiB`, and with
+  only the DiT streamed `21321 MiB`.
+
+Local MoE offload validation on one H100 80GB with the same runner and seed,
+reporting worker peak reserved GPU memory and generation time for one request:
+
+| Offload selector | 9 frames, `192x320`, 2 steps | 25 frames, `480x480`, 20 steps | 81 frames, `480x832`, 4 steps |
+|------------------|------------------------------|--------------------------------|-------------------------------|
+| none | `75224 MiB`, `1.4s` | `75224 MiB`, `10.6s` | not measured |
+| `--enable-cpu-offload` | `66534 MiB`, `3.8s` | `66534 MiB`, `13.7s` | `69896 MiB`, `20.6s` |
+| `{"mode":"module","components":["dit"]}` | `75026 MiB`, `3.3s` | not measured | not measured |
+| `{"mode":"module","components":["text_encoder"]}` | `69822 MiB`, `1.9s` | not measured | not measured |
+| `--enable-layerwise-offload` | `13160 MiB`, `5.1s` | `13160 MiB`, `45.4s` | `21396 MiB`, `17.9s` |
+| `{"mode":"layer","components":["dit"]}` | `20286 MiB`, `4.9s` | not measured | not measured |
+
+- At vLLM-Omni `0fc38ce3b`, both layerwise selectors kept the whole model on
+  the GPU and peaked at `74338 MiB`, while the model-level selectors already
+  ran with the same peaks as above.
+- `vllm serve` completed 8 of 8 random 25-frame `480x480` 10-step requests at
+  concurrency 2 in every mode. `nvidia-smi` showed `61541 MiB` in use
+  afterwards with `--enable-cpu-offload` at a mean latency of `16.5s`,
+  `14311 MiB` with `--enable-layerwise-offload` at `43.6s`, and `76093 MiB`
+  without offload at `10.8s`.
+
+The e2e coverage for both offload flags lives in
+[`tests/e2e/online_serving/test_lingbot_video_offload.py`](../../tests/e2e/online_serving/test_lingbot_video_offload.py).
+
 Do not treat these as production benchmarks; they are functional smoke plus
-controlled numerical-parity evidence for small validation inputs.
+controlled numerical-parity evidence for single-GPU validation runs.
 
 ## Reproducing MoE numerical parity
 
@@ -252,8 +430,19 @@ bitwise correctness oracle.
   optional `refiner/` transformer are not supported by this PR.
 - Only the BF16 MoE checkpoint is validated in this first integration.
 - No HSDP, tensor, sequence, expert, or CFG parallelism is claimed.
-- No Cache-DiT, TeaCache, CPU offload, VAE patch parallelism, or quantized
-  inference is claimed.
+- No Cache-DiT, TeaCache, VAE patch parallelism, or quantized inference is
+  claimed.
+- CPU and layerwise offload are supported. Only layerwise offload brings the 30B
+  checkpoint onto a 32 GiB card; model-level CPU offload loads the complete DiT
+  for denoising and peaked at `63634 MiB` on one H200 and `66534 MiB` to
+  `69896 MiB` on one H100. Offload has not been measured on cards with more
+  than 32 GiB and less than 80 GB of memory.
+- Quantization is rejected at startup.
+- Distributed layerwise offload is rejected at startup. This covers
+  `--enable-distributed-layerwise-offload`, `weight_transfer: "allgather"`, and
+  `resident_layers` in `--diffusion-offload-config`. Each of these selects the
+  distributed layerwise backend, which has not been validated with this
+  pipeline, and the model declares no resident DiT paths.
 - Optional Triton, SGLang, FP8, and alternative fused-expert backends from the
   upstream project are not included.
 - Only one request per LingBot pipeline batch is currently supported.

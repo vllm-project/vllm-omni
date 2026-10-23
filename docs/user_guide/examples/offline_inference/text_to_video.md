@@ -56,6 +56,10 @@ Use `robbyant/lingbot-video-moe-30b-a3b` for the MoE checkpoint. For local
 paths without `lingbot` in the directory name, add
 `--model-class-name LingBotVideoPipeline`. Model-only options use
 `--extra-body`, for example `'{"batch_cfg": true, "output_type": "np"}'`.
+On a 32 GiB card, run the MoE checkpoint with `--enable-layerwise-offload
+--vae-use-tiling --vae-use-slicing`; see the
+[LingBot-Video recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Robbyant/LingBot-Video.md)
+for measured memory.
 
 ### LTX-2
 
