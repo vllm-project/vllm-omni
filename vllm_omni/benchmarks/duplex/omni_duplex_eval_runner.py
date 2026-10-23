@@ -432,6 +432,7 @@ async def generate_sample(
     drain_timeout = None
     close_timeout = None
     ack_timeout = None
+    server_errors: list[str] = []
     input_committed = False
     stream_start: float | None = None
     async with client:
@@ -543,6 +544,7 @@ async def generate_sample(
         "drain_timeout": drain_timeout,
         "close_timeout": close_timeout,
         "ack_timeout": ack_timeout,
+        "server_errors": server_errors,
         "ref_audio_sha256": prepared.ref_audio_sha256,
     }
     from vllm_omni.benchmarks.duplex_session_metrics import collect_duplex_session_metrics
@@ -553,13 +555,17 @@ async def generate_sample(
         session_id=sample.id,
     )
     errors = []
+    # Server-side failures are recorded apart from the timeouts below: the
+    # timeout strings are folded into ``error``, so a retry policy cannot tell a
+    # client-side stall from a reported server failure by that string alone.
     for event in client.events.errors():
         error = event.get("error")
         code = error.get("code") if isinstance(error, dict) else event.get("code")
         # As in OmniInteract, an ACK racing a later commit is harmless. All
         # other server errors still make the serving sample unsuccessful.
         if code not in {"playback_ack_too_late", "playback_item_not_found"}:
-            errors.append(str(event))
+            server_errors.append(str(event))
+    errors.extend(server_errors)
     errors.extend(str(error) for error in (drain_timeout, close_timeout) if error)
     finished = set()
     for event in events:

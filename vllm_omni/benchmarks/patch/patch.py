@@ -277,17 +277,21 @@ def _duplex_stall_reason(result: object) -> str | None:
 def _duplex_retryable_stall(result: object) -> str | None:
     """Return the stall worth retrying, if any.
 
-    A session can legitimately end without a completed response: server VAD mode
-    may never open a turn, and a session that ended on a server ``error`` already
-    reports it through ``result.error``. Retrying those would double the cost of
-    a deterministic failure and could turn a reported error into a pass, so the
-    missing-response case is only retried for a session that committed input.
+    Only a client-side timeout is retried. ``generate_sample`` folds
+    ``drain_timeout``/``close_timeout`` into ``result.error``, so that string
+    cannot separate a stall from a reported failure; the separately recorded
+    ``server_errors`` entry does. A session that hit a server error is a
+    deterministic failure, and retrying it could turn a reported error into a
+    pass.
     """
-    reason = _duplex_stall_reason(result)
-    if reason != "no completed response":
-        return reason
     metadata = getattr(result, "metadata", None) or {}
-    return reason if metadata.get("input_committed") is True else None
+    if metadata.get("server_errors"):
+        return None
+    for key in ("drain_timeout", "close_timeout"):
+        value = metadata.get(key)
+        if value:
+            return f"{key}: {value}"
+    return None
 
 
 def _duplex_retry_tally(outputs: list[RequestFuncOutput]) -> dict[str, int]:

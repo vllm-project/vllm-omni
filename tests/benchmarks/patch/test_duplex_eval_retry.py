@@ -114,7 +114,10 @@ async def test_latency_covers_only_the_attempt_that_succeeded(monkeypatch) -> No
 
 async def test_transport_stall_is_retried_once_and_counted(monkeypatch) -> None:
     clock = _FakeClock()
-    stalled = _session_result({"drain_timeout": "transport idle for 30.0s"})
+    stalled = _session_result(
+        {"drain_timeout": "transport idle for 30.0s"},
+        error="transport idle for 30.0s",
+    )
     recovered = _session_result()
     returned = iter([stalled, recovered])
 
@@ -134,7 +137,7 @@ async def test_transport_stall_is_retried_once_and_counted(monkeypatch) -> None:
 
 async def test_stall_is_not_retried_beyond_the_last_attempt(monkeypatch) -> None:
     clock = _FakeClock()
-    results = [_session_result({"drain_timeout": "transport idle"}) for _ in range(2)]
+    results = [_session_result({"drain_timeout": "transport idle"}, error="transport idle") for _ in range(2)]
     returned = iter(results)
 
     async def generate_sample(*_args, **_kwargs):
@@ -182,46 +185,13 @@ def test_retry_tally_aggregates_per_sample_counts() -> None:
     }
 
 
-async def test_missing_response_is_retried_when_the_input_was_committed(monkeypatch) -> None:
-    """A committed session that never completes is the silently-lost sample."""
-    clock = _FakeClock()
-    stalled = _session_result({"response_done": False})
-    recovered = _session_result()
-    returned = iter([stalled, recovered])
+async def test_missing_response_is_not_retried(monkeypatch) -> None:
+    """A session that ends without a completed response is reported, not retried.
 
-    async def generate_sample(*_args, **_kwargs):
-        clock.advance(_SESSION_S)
-        return next(returned)
-
-    _install_fakes(monkeypatch, clock, generate_sample)
-    output = await patch._async_request_duplex_eval(_request(), pbar=None)
-
-    assert output.duplex_retries == 1
-    assert output.success is True
-    assert next(returned, None) is None
-
-
-async def test_server_error_is_not_retried(monkeypatch) -> None:
-    """A deterministic failure must not be retried into a pass."""
-    clock = _FakeClock()
-    failed = _session_result({"response_done": False}, error="server error: bad audio")
-    returned = iter([failed])
-
-    async def generate_sample(*_args, **_kwargs):
-        clock.advance(_SESSION_S)
-        return next(returned)
-
-    _install_fakes(monkeypatch, clock, generate_sample)
-    output = await patch._async_request_duplex_eval(_request(), pbar=None)
-
-    assert output.duplex_retries == 0
-    assert next(returned, None) is None  # exactly one attempt
-    assert output.success is False
-    assert output.error == "server error: bad audio"
-
-
-async def test_session_without_a_committed_turn_is_not_retried(monkeypatch) -> None:
-    """Server VAD may legitimately end a session without opening a turn."""
+    In server-turn mode a VAD session can legitimately produce no turn, and in
+    commit mode a missing response always comes with a ``drain_timeout`` (which
+    the retry path below covers).
+    """
     clock = _FakeClock()
     silent = _session_result({"response_done": False, "input_committed": False})
     returned = iter([silent])
@@ -237,3 +207,34 @@ async def test_session_without_a_committed_turn_is_not_retried(monkeypatch) -> N
     assert next(returned, None) is None
     assert output.success is False
     assert output.error == "no completed response"
+
+
+async def test_server_error_with_a_drain_timeout_is_not_retried(monkeypatch) -> None:
+    """A reported server failure stays a single attempt, timeout or not.
+
+    ``generate_sample`` folds ``drain_timeout`` into ``result.error``, so this is
+    the shape the runner actually produces when the server errors mid-turn and
+    never sends ``response.done``.
+    """
+    clock = _FakeClock()
+    failed = _session_result(
+        {
+            "response_done": False,
+            "drain_timeout": "Timed out waiting for response.done",
+            "server_errors": ["{'type': 'error', 'error': {'code': 'invalid_audio'}}"],
+        },
+        error=("{'type': 'error', 'error': {'code': 'invalid_audio'}}; Timed out waiting for response.done"),
+    )
+    returned = iter([failed])
+
+    async def generate_sample(*_args, **_kwargs):
+        clock.advance(_SESSION_S)
+        return next(returned)
+
+    _install_fakes(monkeypatch, clock, generate_sample)
+    output = await patch._async_request_duplex_eval(_request(), pbar=None)
+
+    assert output.duplex_retries == 0
+    assert next(returned, None) is None
+    assert output.success is False
+    assert "invalid_audio" in output.error
