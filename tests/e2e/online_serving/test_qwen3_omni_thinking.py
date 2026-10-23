@@ -8,6 +8,7 @@ E2E Online tests for Qwen3-Omni model thinking variant
 import asyncio
 import json
 from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from typing import Literal
 
 import pytest
@@ -39,6 +40,15 @@ from tests.helpers.stage_config import get_deploy_config_path
 
 MODEL = "Qwen/Qwen3-Omni-30B-A3B-Thinking"
 STAGE_CONFIG_PATH = get_deploy_config_path("qwen3_omni_moe.yaml")
+# The checkpoint's template concatenates a content-parts list in its tools
+# branch; this copy renders both content shapes.
+THINKING_CHAT_TEMPLATE = (
+    Path(__file__).resolve().parents[3]
+    / "vllm_omni"
+    / "transformers_utils"
+    / "chat_templates"
+    / "qwen3_omni_thinking.jinja"
+)
 
 IMAGE_WIDTH = 224
 IMAGE_HEIGHT = 224
@@ -58,6 +68,8 @@ test_params = [
             model=MODEL,
             stage_config_path=STAGE_CONFIG_PATH,
             server_args=[
+                "--chat-template",
+                str(THINKING_CHAT_TEMPLATE),
                 "--reasoning-parser",
                 "qwen3",
                 "--tool-call-parser",
