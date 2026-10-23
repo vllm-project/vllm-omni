@@ -47,6 +47,7 @@ from vllm_omni.outputs.output_metadata import (
     DiffusionMetadataMapping,
     DiffusionMultimodalOutput,
     DiffusionPayloadValue,
+    valid_frame_counts,
 )
 
 logger = init_logger(__name__)
@@ -549,11 +550,7 @@ class OmniOpenAIServingVideo:
         metrics = {str(key): value for key, value in raw_metrics.items()} if isinstance(raw_metrics, Mapping) else None
         video_metadata = metadata.get("video") if isinstance(metadata, Mapping) else None
         frame_counts = video_metadata.get("frame_counts") if isinstance(video_metadata, Mapping) else None
-        if not (
-            isinstance(frame_counts, (list, tuple))
-            and len(frame_counts) == len(cast(list[DiffusionPayloadValue], videos))
-            and all(type(count) is int and count > 0 for count in frame_counts)
-        ):
+        if not valid_frame_counts(frame_counts, len(cast(list[DiffusionPayloadValue], videos))):
             frame_counts = None
         return VideoGenerationArtifacts(
             videos=videos,

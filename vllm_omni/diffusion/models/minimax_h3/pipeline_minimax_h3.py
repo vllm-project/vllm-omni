@@ -101,6 +101,7 @@ from vllm_omni.model_executor.models.minimax_h3.timeline_guides import (
     MINIMAX_H3_TIMELINE_GUIDES_KEY,
     resolve_guide_start,
 )
+from vllm_omni.outputs.output_metadata import valid_frame_counts
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.quantization import (
     resolve_component_quant_config as _resolve_component_quant_config,
@@ -428,11 +429,7 @@ def _minimax_h3_post_process(output, output_type: str = "np"):
             "fps": MINIMAX_H3_FPS,
         }
         if frame_counts is not None:
-            if not (
-                isinstance(frame_counts, (list, tuple))
-                and len(frame_counts) == len(encoded_videos)
-                and all(type(count) is int and count > 0 for count in frame_counts)
-            ):
+            if not valid_frame_counts(frame_counts, len(encoded_videos)):
                 logger.warning("Ignoring invalid encoded frame counts; falling back to MP4 metadata inspection")
                 return result
             return {

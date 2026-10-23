@@ -3,9 +3,11 @@
 
 from __future__ import annotations
 
+import numpy as np
 import pytest
 import torch
 
+from vllm_omni.outputs import output_metadata
 from vllm_omni.outputs.output_metadata import (
     strip_internal_metadata,
     validate_diffusion_metadata,
@@ -13,6 +15,37 @@ from vllm_omni.outputs.output_metadata import (
 )
 
 pytestmark = [pytest.mark.diffusion, pytest.mark.core_model, pytest.mark.cpu]
+
+
+@pytest.mark.parametrize(
+    ("value", "expected_len", "expected"),
+    [
+        ([7], 1, True),
+        ((7,), 1, True),
+        ([7, 9], 2, True),
+        ((7, 9), 2, True),
+        ([], 0, True),
+        (None, 1, False),
+        ([], 1, False),
+        ([7, 9], 1, False),
+        ([7], 2, False),
+        ([0], 1, False),
+        ([-1], 1, False),
+        ([True], 1, False),
+        ([False], 1, False),
+        ([7, True], 2, False),
+        ([7.0], 1, False),
+        (["7"], 1, False),
+        ([np.int64(7)], 1, False),
+        (7, 1, False),
+        ("7", 1, False),
+        (b"7", 1, False),
+        ({"count": 7}, 1, False),
+        (range(1, 2), 1, False),
+    ],
+)
+def test_valid_frame_counts_requires_aligned_positive_builtin_ints(value, expected_len, expected) -> None:
+    assert output_metadata.valid_frame_counts(value, expected_len) is expected
 
 
 def test_validate_accepts_canonical_metadata_fields() -> None:
