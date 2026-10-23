@@ -549,7 +549,19 @@ def _make_async_output_runner(engine_output_type: str = "audio"):
     runner.model_config = model_config
     runner._async_chunk = True
     runner.omni_prefix_cache = None
-    runner.requests = {"r1": object(), "r2": object()}
+    runner.requests = {
+        req_id: CachedRequestState(
+            req_id=req_id,
+            prompt_token_ids=[1],
+            mm_features=[],
+            sampling_params=SamplingParams(),
+            generator=None,
+            block_ids=([],),
+            num_computed_tokens=0,
+            output_token_ids=[],
+        )
+        for req_id in ("r1", "r2")
+    }
     runner.supports_mm_inputs = False
     runner.routed_experts_initialized = False
     runner.model = SimpleNamespace(has_postprocess=False)
