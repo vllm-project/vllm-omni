@@ -27,7 +27,11 @@ class _SDPAAttention(nn.Module):
         self.causal = causal
         self.scale = softmax_scale
 
-    def forward(self, query, key, value):
+    def for_layout(self, layout=None):
+        assert layout is None
+        return self
+
+    def forward(self, query, key, value, attn_metadata=None):
         return F.scaled_dot_product_attention(
             query.transpose(1, 2),
             key.transpose(1, 2),
@@ -67,7 +71,8 @@ def _load_cosmos_worker(rank, rendezvous, checkpoint_dir, edge):
                 stack.enter_context(patch.object(module, "get_tensor_model_parallel_world_size", return_value=1))
             for module in (transformer_cosmos3, transformer_cosmos3_edge):
                 stack.enter_context(patch.object(module, "get_tensor_model_parallel_world_size", return_value=1))
-                stack.enter_context(patch.object(module, "FrameworkAttention", _SDPAAttention))
+                attention_factory = "build_attention" if module is transformer_cosmos3 else "FrameworkAttention"
+                stack.enter_context(patch.object(module, attention_factory, _SDPAAttention))
             stack.enter_context(patch.object(transformer_cosmos3, "_get_ulysses_state", return_value=(1, 0, None)))
             stack.enter_context(
                 patch.object(hsdp, "get_world_group", return_value=SimpleNamespace(world_size=2, rank_in_group=rank))

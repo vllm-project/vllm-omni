@@ -37,7 +37,9 @@ from vllm_omni.diffusion.attention.backends.abstract import (
 )
 from vllm_omni.diffusion.attention.backends.flash_attn import FlashAttentionBackend
 from vllm_omni.diffusion.attention.backends.vdnh3_attn import VDNLayout
-from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.attention.contracts import LEGACY_EXECUTION, StrategyModelSupport
+from vllm_omni.diffusion.attention.layer import Attention, build_attention
+from vllm_omni.diffusion.attention.strategy import AttentionOperation, finalize_attention_strategy
 from vllm_omni.diffusion.cache.cachedit import CacheDiTAdapterConfig
 from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelInput,
@@ -547,6 +549,7 @@ class MiniMaxH3Attention(nn.Module):
         quant_config: QuantizationConfig | None,
         *,
         prefix: str,
+        operation: AttentionOperation | None = None,
         role: str = "self",
         role_category: str | None = None,
         skip_sequence_parallel: bool = False,
@@ -594,7 +597,7 @@ class MiniMaxH3Attention(nn.Module):
         self._prefix = prefix
         from .attention.fastvideo_h3 import MiniMaxH3VSAImpl
 
-        self.attention = Attention(
+        self.attention = build_attention(
             num_heads=self.num_heads,
             num_kv_heads=self.num_kv_heads,
             head_size=self.head_dim,
@@ -603,6 +606,7 @@ class MiniMaxH3Attention(nn.Module):
             # Packed rows reach the impl as [B, S, N, D].
             qkv_layout="BSND",
             role=role,
+            operation=operation,
             role_category=role_category,
             skip_sequence_parallel=skip_sequence_parallel,
             prefix=prefix,
@@ -658,6 +662,10 @@ class MiniMaxH3Attention(nn.Module):
         return torch.cat((x_rot, x_pass), dim=-1)
 
     @torch.compiler.disable
+    def _run_packed_attention_eager(self, *args, **kwargs):
+        """Preserve the legacy boundary for providers outside static strategies."""
+        return self._run_packed_attention(*args, **kwargs)
+
     def _run_packed_attention(
         self,
         q: torch.Tensor,
@@ -675,8 +683,9 @@ class MiniMaxH3Attention(nn.Module):
         reference_kv_layer_index: int | None = None,
         reference_kv_compact: bool = False,
         vdn_window: VDNLayout | None = None,
+        attention_layout: int | None = None,
     ) -> torch.Tensor:
-        """Run packed attention as a small eager island.
+        """Build packed metadata for the selected attention method.
 
         On a compact reuse step Q contains target rows only. Tier2 captures
         reference K/V after Ulysses has exchanged sequence rows for head shards,
@@ -705,15 +714,25 @@ class MiniMaxH3Attention(nn.Module):
         else:
             kv_cu_seqlens = cu_seqlens
 
+        attention = self.attention.for_layout(attention_layout)
+        local_execution = attention.attention_execution.local_tensor_forward
         attn_mask = None
         mask_free_packed_padding = False
-        use_ring = _ring_sequence_parallel_is_active(self.attention)
+        use_ring = False if local_execution else _ring_sequence_parallel_is_active(attention)
         if num_requests > 1:
-            if not _attention_isolates_packed_requests(self.attention):
-                backend_name = self.attention.attn_backend.get_name()
+            # A step-mode batch packs one document per request, so its valid
+            # rows are block-diagonal rather than a prefix: neither a KV prefix
+            # length nor a 1-D key mask can describe them. Such a layout is
+            # only correct on a backend that actually attends by cu_seqlens as
+            # a block-diagonal plan. Check the capability (not the backend
+            # name): FLASH_ATTN's NPU/XPU variants would otherwise silently
+            # fall back to a padding-mask rebuild that spans the whole packed
+            # row and attend across request boundaries.
+            if not _attention_isolates_packed_requests(attention):
+                backend_name = attention.attn_backend.get_name()
                 raise ValueError(
                     f"MiniMax H3 packed a {num_requests}-request batch, but the resolved "
-                    f"attention ({backend_name}, use_ring={getattr(self.attention, 'use_ring', False)}) "
+                    f"attention ({backend_name}, use_ring={getattr(attention, 'use_ring', False)}) "
                     "does not isolate multi-document packed cu_seqlens. Run one request "
                     "per forward on this backend."
                 )
@@ -723,16 +742,14 @@ class MiniMaxH3Attention(nn.Module):
             used_q = min(max_seqlen, packed_total)
             used_kv = min(kv_max_seqlen, kv_total)
             mask_free_packed_padding = not use_ring and (
-                self.attention.attn_backend.supports_packed_mask_free()
+                attention.attn_backend.supports_packed_mask_free()
                 or (
                     reference_kv_compact
-                    and self.attention.attn_backend.get_name() == "RAINFUSION_ATTN"
+                    and attention.attn_backend.get_name() == "RAINFUSION_ATTN"
                     and FlashAttentionBackend.supports_packed_mask_free()
                 )
             )
-            no_mask = not use_ring and (
-                self.attention.attn_backend.supports_prefix_kv_slicing or mask_free_packed_padding
-            )
+            no_mask = not use_ring and (attention.attn_backend.supports_prefix_kv_slicing or mask_free_packed_padding)
             # Hybrid Ulysses reshards Q to one ring partition before the ring
             # kernel runs, so a global key mask cannot pass its query-length
             # check. Ring consumes valid_kv_length directly.
@@ -745,6 +762,8 @@ class MiniMaxH3Attention(nn.Module):
             "max_seqlen_q": max_seqlen,
             "max_seqlen_k": kv_max_seqlen,
             "valid_kv_length": used_kv,
+            # Conditioning remains eligible for pruning in the sparse experiment.
+            "protected_kv_prefix": 0,
             "npu_attn_varlen": not use_ring,
             "laser_input_scale": MINIMAX_H3_LASER_INPUT_SCALE,
             **({"vsa_h3_sparsity": self.vsa_sparsity} if self.vsa_sparsity is not None else {}),
@@ -786,7 +805,7 @@ class MiniMaxH3Attention(nn.Module):
             extra=extra,
             video_layout=video_layout,
         )
-        return self.attention(
+        return attention(
             q.unsqueeze(0),
             k.unsqueeze(0),
             v.unsqueeze(0),
@@ -839,6 +858,7 @@ class MiniMaxH3Attention(nn.Module):
         reference_kv_layer_index: int | None = None,
         reference_kv_compact: bool = False,
         vdn_window: VDNLayout | None = None,
+        attention_layout: int | None = None,
     ) -> torch.Tensor:
         """x: [T, hidden] packed thd rows -> [T, hidden].
 
@@ -874,7 +894,12 @@ class MiniMaxH3Attention(nn.Module):
         # Each request contributes a document for its rows plus one for any
         # nonempty alignment padding. Local/Ulysses backends unpad it, while
         # Ring keeps aligned rows for fixed-size P2P buffers.
-        out = self._run_packed_attention(
+        run_attention = (
+            self._run_packed_attention
+            if self.attention.attention_execution.local_tensor_forward
+            else self._run_packed_attention_eager
+        )
+        out = run_attention(
             q,
             k,
             v,
@@ -892,6 +917,7 @@ class MiniMaxH3Attention(nn.Module):
             reference_kv_layer_index=reference_kv_layer_index,
             reference_kv_compact=reference_kv_compact,
             vdn_window=vdn_window,
+            **({"attention_layout": attention_layout} if attention_layout is not None else {}),
         )
         if self.vdn is not None:
             out = self.vdn.gate_softmax(out, x)
@@ -1078,6 +1104,7 @@ class MiniMaxH3TokenRefinerBlock(nn.Module):
         quant_config: QuantizationConfig | None,
         *,
         prefix: str,
+        operation: AttentionOperation | None = None,
     ) -> None:
         super().__init__()
         self.norm1 = _norm(arch.hidden_size, eps=arch.norm_eps)
@@ -1089,6 +1116,7 @@ class MiniMaxH3TokenRefinerBlock(nn.Module):
             arch,
             quant_config,
             prefix=f"{prefix}.attn",
+            operation=operation,
             role="minimax_h3.token_refiner",
             role_category="self",
             skip_sequence_parallel=True,
@@ -1106,6 +1134,7 @@ class MiniMaxH3TokenRefinerBlock(nn.Module):
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
         num_requests: int = 1,
+        attention_layout: int | None = None,
     ) -> torch.Tensor:
         x = x + self.attn(
             self.norm1(x),
@@ -1113,6 +1142,7 @@ class MiniMaxH3TokenRefinerBlock(nn.Module):
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
             num_requests=num_requests,
+            attention_layout=attention_layout,
         )
         x = x + self.mlp(self.norm2(x))
         return x
@@ -1125,6 +1155,7 @@ class MiniMaxH3TokenRefiner(nn.Module):
         quant_config: QuantizationConfig | None,
         *,
         prefix: str,
+        attention_component: str = "transformer",
     ) -> None:
         super().__init__()
         self.blocks = nn.ModuleList(
@@ -1133,6 +1164,9 @@ class MiniMaxH3TokenRefiner(nn.Module):
                     arch,
                     quant_config,
                     prefix=f"{prefix}.blocks.{i}",
+                    operation=AttentionOperation(
+                        f"refiner.{i}", i, "minimax_h3.token_refiner", "self", component=attention_component
+                    ),
                 )
                 for i in range(arch.token_refiner_num_layers)
             ]
@@ -1146,9 +1180,16 @@ class MiniMaxH3TokenRefiner(nn.Module):
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
         num_requests: int = 1,
+        attention_layout: int | None = None,
     ) -> torch.Tensor:
         for block in self.blocks:
-            x = block(x, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen, num_requests=num_requests)
+            x = block(
+                x,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+                num_requests=num_requests,
+                attention_layout=attention_layout,
+            )
         return self.final_norm(x)
 
 
@@ -1162,6 +1203,7 @@ class MiniMaxH3DiTBlock(nn.Module):
         layer_index: int,
         adaln_cache: MiniMaxH3RuntimeAdalnCache | None = None,
         attention_cls: type[MiniMaxH3Attention] = MiniMaxH3Attention,
+        operation: AttentionOperation | None = None,
     ) -> None:
         super().__init__()
         self.layer_index = int(layer_index)
@@ -1176,6 +1218,9 @@ class MiniMaxH3DiTBlock(nn.Module):
             arch,
             quant_config,
             prefix=f"{prefix}.attn",
+            operation=operation,
+            role="minimax_h3.dit",
+            role_category="self",
         )
         self.mlp = MiniMaxH3MLP(
             arch,
@@ -1209,6 +1254,7 @@ class MiniMaxH3DiTBlock(nn.Module):
         reference_kv_state: MiniMaxH3ReferenceKVTier2State | None = None,
         reference_kv_compact: bool = False,
         vdn_window: VDNLayout | None = None,
+        attention_layout: int | None = None,
     ) -> torch.Tensor:
         """x: [T, H]; t_emb: [M, t_dim]; combined_indices: [T]
         (= inverse_indices * modality_num + token_tags.clamp(min=0)).
@@ -1249,6 +1295,7 @@ class MiniMaxH3DiTBlock(nn.Module):
             reference_kv_layer_index=self.layer_index,
             reference_kv_compact=reference_kv_compact,
             vdn_window=vdn_window,
+            attention_layout=attention_layout,
         )
         x, h = indexed_gate_rms_norm_scale_shift(
             residual,
@@ -1454,6 +1501,9 @@ class MiniMaxH3DiTModel(nn.Module):
         if arch.ffn_hidden_size <= 0:
             raise ValueError("ffn_hidden_size must be positive.")
 
+    attention_strategy_support = StrategyModelSupport(ulysses=True)
+    attention_execution = LEGACY_EXECUTION
+
     def __init__(
         self,
         od_config: OmniDiffusionConfig,
@@ -1461,6 +1511,7 @@ class MiniMaxH3DiTModel(nn.Module):
         *,
         diffusers_weights: bool | None = None,
         attention_cls: type[MiniMaxH3Attention] = MiniMaxH3Attention,
+        attention_component: str = "transformer",
     ) -> None:
         super().__init__()
         tf_config = od_config.tf_model_config
@@ -1584,6 +1635,7 @@ class MiniMaxH3DiTModel(nn.Module):
             arch,
             quant_config,
             prefix="token_refiner",
+            attention_component=attention_component,
         )
         self.blocks = nn.ModuleList(
             [
@@ -1594,6 +1646,9 @@ class MiniMaxH3DiTModel(nn.Module):
                     layer_index=i,
                     adaln_cache=self.adaln_cache,
                     attention_cls=attention_cls,
+                    operation=AttentionOperation(
+                        f"dit.{i}", i, "minimax_h3.dit", "self", component=attention_component
+                    ),
                 )
                 for i in range(arch.num_layers)
             ]
@@ -1608,6 +1663,7 @@ class MiniMaxH3DiTModel(nn.Module):
             prefix="final_layer",
             adaln_cache=self.adaln_cache,
         )
+        finalize_attention_strategy(self)
         self._mark_missing_params_required()
 
     def enable_vsa_gates(
@@ -1884,6 +1940,7 @@ class MiniMaxH3DiTModel(nn.Module):
         local_span: tuple[int, int],
         num_requests: int = 1,
         global_positions: torch.Tensor | None = None,
+        attention_layout: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Build this rank's packed multimodal embedding rows.
 
@@ -1939,12 +1996,17 @@ class MiniMaxH3DiTModel(nn.Module):
             cu_seqlens=refiner_cu_seqlens,
             max_seqlen=refiner_max_seqlen,
             num_requests=num_requests,
+            attention_layout=attention_layout,
         )
         if text_local_indices is not None:
             text_embed = text_embed.index_select(0, text_local_indices)
 
+        # Keep the unsharded allocation tied to a tensor shape. A separately
+        # carried symbolic local_len can lose its binding when Inductor resumes
+        # compilation around layerwise offload hooks.
+        embedding_rows = local_len if local_len != seq_len else x.shape[1]
         embeddings = torch.zeros(
-            (local_len, self.hidden_size),
+            (embedding_rows, self.hidden_size),
             device=device,
             dtype=_BF16_DTYPE,
         )
@@ -1992,7 +2054,15 @@ class MiniMaxH3DiTModel(nn.Module):
             device=device,
         )
 
-    def forward(self, *, pdd_step: int | None = None, **kwargs: Any) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, **kwargs: Any) -> tuple[torch.Tensor, torch.Tensor]:
+        runner = getattr(self, "_attention_strategy_runner", None)
+        if runner is not None:
+            return runner(**kwargs)
+        return self.forward_with_attention_layout(**kwargs)
+
+    def forward_with_attention_layout(
+        self, *, attention_layout: int | None = None, pdd_step: int | None = None, **kwargs: Any
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Packed inference forward.
 
         Keyword names follow the checkpoint's serving contract.
@@ -2000,6 +2070,8 @@ class MiniMaxH3DiTModel(nn.Module):
         `img_pos_for_infer_output_info` and `audio_pos_info`, with condition
         rows zeroed by update masks.
         """
+        if attention_layout is not None and not self.attention_execution.local_tensor_forward:
+            raise ValueError("A fixed attention layout requires a startup strategy")
         # Strict keyword contract: refuse any kwarg forward does not consume.
         unexpected = sorted(set(kwargs) - _FORWARD_SUPPORTED_KWARGS)
         if unexpected:
@@ -2056,7 +2128,8 @@ class MiniMaxH3DiTModel(nn.Module):
         if inverse_indices.shape[0] != seq_len:
             raise ValueError(f"inverse_indices must be [{seq_len}], got {list(inverse_indices.shape)}")
         device = x.device
-        local_span = self._rope_local_span(seq_len)
+        single_device_strategy = self.attention_execution.single_device_strategy
+        local_span = (0, seq_len) if single_device_strategy else self._rope_local_span(seq_len)
         local_start, local_len = local_span
         compact_reference = False
         active_positions: torch.Tensor | None = None
@@ -2127,6 +2200,7 @@ class MiniMaxH3DiTModel(nn.Module):
             text_pos=text_pos.to(device),
             refiner_cu_seqlens=refiner_cu.to(device),
             refiner_max_seqlen=refiner_max,
+            attention_layout=attention_layout,
             num_requests=num_requests,
             seq_len=seq_len,
             device=device,
@@ -2134,7 +2208,8 @@ class MiniMaxH3DiTModel(nn.Module):
             global_positions=(compact_local_positions if compact_reference and local_len != seq_len else None),
         )
 
-        if getattr(self, "adaln_cache", None) is not None:
+        # Disabled caching needs no eager bookkeeping boundary.
+        if getattr(self, "adaln_cache", None) is not None and self.adaln_cache.max_bytes > 0:
             self.adaln_cache.prepare(t_emb)
 
         combined_indices = (inverse_indices * MINIMAX_H3_ADALN_MODALITY_NUM + token_tags.clamp(min=0)).to(device)
@@ -2165,7 +2240,8 @@ class MiniMaxH3DiTModel(nn.Module):
                 hidden = hidden.index_select(0, active_positions)
                 block_rope = block_rope.index_select(0, active_positions)
                 block_combined = block_combined.index_select(0, active_positions)
-                hidden, block_rope, block_combined = self.sp_prepare(hidden, block_rope, block_combined)
+                if not single_device_strategy:
+                    hidden, block_rope, block_combined = self.sp_prepare(hidden, block_rope, block_combined)
             else:
                 # Embeddings and RoPE already contain this rank's equal
                 # compact shard. Metadata starts global so its SP hook selects
@@ -2174,7 +2250,8 @@ class MiniMaxH3DiTModel(nn.Module):
                 hidden, block_rope, block_combined = self.local_sp_prepare(hidden, block_rope, block_combined)
         else:
             if local_len == seq_len:
-                hidden, block_rope, block_combined = self.sp_prepare(hidden, block_rope, block_combined)
+                if not single_device_strategy:
+                    hidden, block_rope, block_combined = self.sp_prepare(hidden, block_rope, block_combined)
             else:
                 hidden, block_rope, block_combined = self.local_sp_prepare(hidden, block_rope, block_combined)
             if reference_kv_state is not None:
@@ -2212,9 +2289,11 @@ class MiniMaxH3DiTModel(nn.Module):
                 reference_kv_state=reference_kv_state,
                 reference_kv_compact=compact_reference,
                 vdn_window=vdn_window,
+                attention_layout=attention_layout,
             )
         if local_len == seq_len:
-            hidden = self.sp_gather(hidden)
+            if not single_device_strategy:
+                hidden = self.sp_gather(hidden)
             final_inverse_indices = (
                 inverse_indices.index_select(0, active_positions) if active_positions is not None else inverse_indices
             )

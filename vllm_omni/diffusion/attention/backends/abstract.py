@@ -7,11 +7,95 @@ from typing import Any, Generic, Literal, TypeVar
 
 import torch
 
+from vllm_omni.diffusion.attention.block_selection.abstract import BlockSelection
 from vllm_omni.diffusion.attention.capabilities import (
+    CompilationMode,
     ExecutionContext,
     ExecutionPathResult,
 )
+from vllm_omni.diffusion.attention.contracts import MethodCapabilities
 from vllm_omni.platforms import current_omni_platform
+
+
+class BlockSparseAdapter(ABC):
+    """Provider contract for execution over a shared selected-block pattern.
+
+    The shared method owns scoring, selection, budgets and protected prefixes.
+    Adapters preserve its geometry, selected keys and native Q/KV head mapping.
+    They may convert metadata representation, but must not subdivide blocks,
+    replicate/merge selections, expand K/V or fall back to dense attention.
+
+    Instantiate without arguments, then prepare before executing. Prepared
+    adapter state describes the kernel/configuration; request tensors and mutable
+    workspaces must not be shared between invocations. Implementations live with
+    their provider backend and opt in through get_block_sparse_adapter().
+    """
+
+    provider: str
+    kernel_variant: str
+    compilation_mode: CompilationMode
+    dependency_version: str  # Populated by prepare().
+
+    @staticmethod
+    @abstractmethod
+    def validate_selection(implementation: str, head_size: int) -> None:
+        """Check the provider-scoped ID and known head size (-1 means unknown).
+
+        Preserve opaque IDs unchanged. Raise ValueError for unsupported choices
+        or ImportError for missing dependencies; never substitute another ID.
+        This is a preliminary selection check, not complete operation support.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def prepare(
+        self,
+        implementation: str,
+        head_size: int,
+        num_heads: int,
+        num_kv_heads: int,
+        device: torch.device,
+        block_size: tuple[int, int],
+    ) -> None:
+        """Prepare provider configuration and dependencies without synthetic inputs.
+
+        Runs outside compiled execution and records dependency_version. The
+        shared method warms actual request tensors through execute() and records
+        support only after successful synchronization. Loading dependencies here
+        does not establish support for any request geometry.
+        """
+        raise NotImplementedError
+
+    def validate_inputs(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor) -> None:
+        """Reject provider-specific input constraints before kernel execution.
+
+        Shared layout, Q/K dimensions, head mapping and device are checked by
+        the orchestration layer. Override for kernel dtype or V-size limits.
+        """
+
+    @abstractmethod
+    def execute(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        selection: BlockSelection,
+        scale: float,
+        block_size: tuple[int, int],
+    ) -> torch.Tensor:
+        """Execute the prepared operation without discovery or fallback.
+
+        Q/K/V use BSHD layout. selection follows BlockSelection: each row has
+        its own count of sorted unique logical KV block IDs; padding is ignored.
+        block_size is the prepared (Bq, Bkv). Sequence lengths bound tails and
+        prefix protection is already encoded. Empty rows are not permitted.
+
+        Normalize over the selected eligible keys only, preserving per-query-head
+        selections and native GQA. Return contiguous [B, Sq, Hq, Dv] output with
+        the input dtype and device. Do not mutate input tensors or retain request
+        buffers. Honor compilation_mode through the provider's execution boundary.
+        """
+        raise NotImplementedError
 
 
 class AttentionBackend(ABC):
@@ -28,6 +112,18 @@ class AttentionBackend(ABC):
     # tensors instead of materializing a padding mask. Models may use this to
     # avoid a slower masked-attention plan when tail padding is not semantic.
     supports_prefix_kv_slicing: bool = False
+
+    # Providers declare local execution ownership; tracing is backend-owned.
+    strategy_capabilities: MethodCapabilities | None = None
+
+    @classmethod
+    def get_block_sparse_adapter(cls) -> type[BlockSparseAdapter] | None:
+        """Return an adapter consuming the shared selected pattern, or None.
+
+        Adapters validate kernel IDs, prepare provider state and execute Q/K/V
+        with a BlockSelection. Selection and budgets belong to the strategy.
+        """
+        return None
 
     @classmethod
     def supports_packed_mask_free(cls) -> bool:
