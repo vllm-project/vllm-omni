@@ -70,14 +70,16 @@ def test_validate_available_accepts_ark_kernel(fake_ark):
 
 
 @pytest.mark.parametrize(
-    ("head_size", "expected"),
+    ("head_size", "kwargs", "expected"),
     [
-        (128, (256, 256, 64)),
-        (64, (128, 64, 64)),
+        (128, {}, (256, 256, 64)),
+        (64, {}, (128, 64, 64)),
+        (128, {"sparge_q_block_tokens": 64}, (0, 64, 64)),
+        (128, {"sparge_q_block_tokens": 64, "sparge_q_tile_override": 64}, (64, 64, 64)),
     ],
 )
-def test_head_dimension_defaults(head_size, expected):
-    impl = SpargeAttentionImpl(8, head_size, head_size**-0.5, num_kv_heads=2)
+def test_head_dimension_defaults(head_size, kwargs, expected):
+    impl = SpargeAttentionImpl(8, head_size, head_size**-0.5, num_kv_heads=2, backend_kwargs=kwargs)
     assert (impl.q_tile_override, impl.q_block_tokens, impl.k_block_tokens) == expected
 
 
@@ -185,6 +187,25 @@ def test_mask_execution_path_is_unsupported():
     result = impl.resolve_execution_path(ExecutionContext(platform="xpu"), query, query, query, metadata)
     assert result.support.status is SupportStatus.UNSUPPORTED
     assert result.support.reason == "SPARGE_ATTN: attn_mask is not supported"
+
+
+def test_mismatched_value_dtype_is_unsupported():
+    impl = SpargeAttentionImpl(4, 64, 0.125)
+    query = torch.empty(1, 16, 4, 64, dtype=torch.float16)
+    value = torch.empty(1, 16, 4, 64, dtype=torch.bfloat16)
+    result = impl.resolve_execution_path(ExecutionContext(platform="xpu"), query, query, value, None)
+    assert result.support.status is SupportStatus.UNSUPPORTED
+    assert result.support.reason == "SPARGE_ATTN: Q, K, and V dtypes must match."
+
+
+@pytest.mark.parametrize("parallel_strategy", [ParallelStrategy.RING, ParallelStrategy.HYBRID_ULYSSES_RING])
+def test_ring_execution_path_is_unsupported(parallel_strategy):
+    impl = SpargeAttentionImpl(4, 64, 0.125)
+    query = torch.empty(1, 16, 4, 64, dtype=torch.float16)
+    context = ExecutionContext(platform="xpu", parallel_strategy=parallel_strategy)
+    result = impl.resolve_execution_path(context, query, query, query, None)
+    assert result.support.status is SupportStatus.UNSUPPORTED
+    assert "ring sequence parallelism" in result.support.reason
 
 
 @pytest.mark.parametrize(

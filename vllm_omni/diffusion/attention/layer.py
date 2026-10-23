@@ -843,6 +843,13 @@ class Attention(nn.Module):
     def _run_ring_attention(self, query, key, value, attn_metadata):
         if attn_metadata is not None and attn_metadata.attn_mask is not None:
             raise ValueError("Ring attention does not support attn_mask; use Ulysses SP or disable mask_sp_padding.")
+        backend_name = self.attn_backend.get_name() if self.attn_backend is not None else None
+        if backend_name == "SPARGE_ATTN":
+            raise NotImplementedError(
+                "SPARGE_ATTN is not supported with ring sequence parallelism: "
+                "the ring path bypasses the backend, so the sparse config would be silently ignored. "
+                "Use Ulysses SP instead, or disable ring SP."
+            )
         skip = getattr(self.attention, "skip", None)
         if skip is not None and getattr(skip, "configured", False):
             raise NotImplementedError(

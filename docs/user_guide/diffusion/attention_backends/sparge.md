@@ -17,7 +17,8 @@ production.
 - FP16 or BF16 Q/K/V with `head_dim` 64 or 128.
 - Query heads equal to KV heads, or a positive multiple of KV heads (MHA/GQA).
 - No attention mask, packed variable-length input, paged KV cache, dropout, or
-  sequence-parallel attention.
+  ring sequence parallelism. Ulysses SP is not yet advertised for
+  guaranteed-fullgraph execution.
 
 Install the kernel package:
 
@@ -41,11 +42,17 @@ SPARGE options live in the typed `sparge` block:
 | `topk` | `0.5` | Fraction of logical K blocks retained per query block; must be in `(0, 1]`. |
 | `q_block_tokens` | `256` for `head_dim=128`, `64` for `head_dim=64` | Query-row granularity used for sparse routing. |
 | `k_block_tokens` | `64` | K-block granularity; the current kernel requires `64`. |
-| `q_tile_override` | `256` for `head_dim=128`, `128` for `head_dim=64` | Query prefill tile size. |
+| `q_tile_override` | Derived from `q_block_tokens`; see below | Query prefill tile size. |
 
 Lower `topk` values increase sparsity and speed but reduce the number of key
 blocks available to softmax. Start from the default and compare several values
 on the target checkpoint.
+
+When `q_tile_override` is omitted, the backend uses `0` for
+`head_dim=128, q_block_tokens=64`, `256` for
+`head_dim=128, q_block_tokens=256`, and `128` for
+`head_dim=64, q_block_tokens=64`. An explicit override still takes precedence
+and must remain compatible with the selected block size.
 
 ```bash
 vllm-omni serve <model> \
@@ -61,7 +68,7 @@ compute. Configure roles independently when a model exposes both:
 vllm-omni serve <model> \
   --diffusion-attention-config \
   '{"per_role":{"self":{"backend":"SPARGE_ATTN",
-  "sparge":{"topk":0.25,"q_block_tokens":256,"q_tile_override":256}},
+  "sparge":{"topk":0.25,"q_block_tokens":256}},
   "cross":{"backend":"TORCH_SDPA"}}}'
 ```
 

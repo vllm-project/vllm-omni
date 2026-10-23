@@ -191,12 +191,17 @@ class SpargeAttentionImpl(AttentionImpl):
             )
 
         kwargs = backend_kwargs or {}
-        default_q_tile = 256 if head_size == 128 else 128
         default_q_block = 256 if head_size == 128 else 64
         self.topk = float(kwargs.get("sparge_topk", 0.5))
-        self.q_tile_override = int(kwargs.get("sparge_q_tile_override", default_q_tile))
         self.q_block_tokens = int(kwargs.get("sparge_q_block_tokens", default_q_block))
         self.k_block_tokens = int(kwargs.get("sparge_k_block_tokens", 64))
+        q_tile_override = kwargs.get("sparge_q_tile_override")
+        if q_tile_override is None:
+            if head_size == 64:
+                q_tile_override = 128
+            else:
+                q_tile_override = 0 if self.q_block_tokens == 64 else 256
+        self.q_tile_override = int(q_tile_override)
 
         if not 0.0 < self.topk <= 1.0:
             raise ValueError(f"SPARGE_ATTN top-k ratio must be in (0, 1], got {self.topk}.")
@@ -241,8 +246,8 @@ class SpargeAttentionImpl(AttentionImpl):
             reason = "Q, K, and V must have rank 4 (batch, sequence, heads, head dimension)."
         elif any(tensor.dtype not in _SUPPORTED_DTYPES for tensor in (query, key, value)):
             reason = "Q, K, and V must be float16 or bfloat16."
-        elif query.dtype != key.dtype:
-            reason = "Q and K dtypes must match."
+        elif query.dtype != key.dtype or query.dtype != value.dtype:
+            reason = "Q, K, and V dtypes must match."
         elif query.device != key.device or query.device != value.device:
             reason = "Q, K, and V devices must match."
         elif key.shape != value.shape or query.shape[0] != key.shape[0] or query.shape[-1] != key.shape[-1]:
@@ -270,6 +275,14 @@ class SpargeAttentionImpl(AttentionImpl):
             packing_mode=PackingMode.NONE,
         )
         result = ExecutionPathResult.unmigrated("SPARGE_ATTN", resolved_context, path="sparge_int8")
+        if context.parallel_strategy in (ParallelStrategy.RING, ParallelStrategy.HYBRID_ULYSSES_RING):
+            return replace(
+                result,
+                support=CapabilityResult.unsupported(
+                    "SPARGE_ATTN does not support ring sequence parallelism: "
+                    "the ring path bypasses the backend. Use Ulysses SP or disable ring SP."
+                ),
+            )
         if (
             context.mask_mode is not MaskMode.NONE
             or context.packing_mode is not PackingMode.NONE
@@ -283,7 +296,7 @@ class SpargeAttentionImpl(AttentionImpl):
             return replace(
                 result,
                 support=CapabilityResult.unmigrated(
-                    "SPARGE_ATTN supports dense, non-packed XPU attention without sequence parallelism."
+                    "SPARGE_ATTN supports dense, non-packed XPU attention; this execution context is not verified."
                 ),
             )
         return replace(result, support=CapabilityResult.supported(), compilation_mode=CompilationMode.CUSTOM_OP)

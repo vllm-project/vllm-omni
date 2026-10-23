@@ -156,6 +156,10 @@ class TestAttentionSpec:
         assert spec.backend_kwargs() is None
         assert AttentionSpec(backend="SPARGE_ATTN", sparge={}).backend_kwargs() == {"sparge_topk": 0.5}
 
+    def test_sparge_q_block_is_serialized_without_implicit_tile(self):
+        spec = AttentionSpec(backend="SPARGE_ATTN", sparge={"q_block_tokens": 64})
+        assert spec.backend_kwargs() == {"sparge_topk": 0.5, "sparge_q_block_tokens": 64}
+
     def test_sparge_rejected_for_other_backend(self):
         with pytest.raises(ValueError, match="only supported by the SPARGE_ATTN"):
             AttentionSpec(backend="TORCH_SDPA", sparge={"topk": 0.25})
@@ -164,6 +168,7 @@ class TestAttentionSpec:
         "sparge",
         [
             {"topk": 0.0},
+            {"topk": None},
             {"topk": 1.5},
             {"q_block_tokens": 32},
             {"q_block_tokens": 128},
@@ -1025,6 +1030,17 @@ class TestAttentionInitUsesCurrentDiffusionConfig:
 
         with pytest.raises(ValueError, match="Ring attention does not support attn_mask"):
             Attention._run_ring_attention(fake_attention, query, query, query, metadata)
+
+    def test_ring_attention_rejects_sparge_instead_of_running_dense(self):
+        fake_attention = SimpleNamespace(
+            attn_backend=SimpleNamespace(get_name=lambda: "SPARGE_ATTN"),
+            attention=SimpleNamespace(skip=None),
+            ring_runner=None,
+        )
+        query = torch.randn(1, 2, 4, 8)
+
+        with pytest.raises(NotImplementedError, match="SPARGE_ATTN is not supported with ring sequence parallelism"):
+            Attention._run_ring_attention(fake_attention, query, query, query, None)
 
 
 class TestOptInFloat32Fallback:

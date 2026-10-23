@@ -2105,7 +2105,10 @@ class SpargeAttnSpec:
     _VALID_Q_TILE_OVERRIDES = frozenset({0, 64, 128, 256})
 
     def __post_init__(self) -> None:
-        self.topk = _in_range(self.topk, "sparge.topk", 0.0, 1.0) or 0.0
+        topk = _in_range(self.topk, "sparge.topk", 0.0, 1.0)
+        if topk is None:
+            raise ValueError("sparge.topk must be greater than 0 and at most 1.")
+        self.topk = topk
         if self.topk <= 0.0:
             raise ValueError("sparge.topk must be greater than 0 and at most 1.")
         if self.q_block_tokens is not None and self.q_block_tokens not in self._VALID_Q_BLOCK_TOKENS:
