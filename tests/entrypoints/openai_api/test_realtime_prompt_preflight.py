@@ -672,7 +672,6 @@ async def test_realtime_truncation_survives_history_mutations() -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.asyncio
 async def test_audio_prompt_uses_standard_chat_audio_content() -> None:
     audio = b"\x00\x00\x00\x40"
     connection, renderer = _make_connection(websocket=_FakeWebSocket())
