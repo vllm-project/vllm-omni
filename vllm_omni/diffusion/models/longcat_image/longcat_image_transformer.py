@@ -31,6 +31,7 @@ from vllm_omni.diffusion.distributed.sp_plan import (
 from vllm_omni.diffusion.forward_context import get_forward_context
 from vllm_omni.diffusion.layers.fused_qk_norm_rope import fused_qk_norm_rope_min_tokens
 from vllm_omni.diffusion.layers.fused_qk_rope import fused_qk_rope, fused_qk_rope_supported
+from vllm_omni.diffusion.layers.linear import MergedRowParallelLinear
 from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
@@ -207,6 +208,7 @@ class LongCatImageAttention(nn.Module):
         out_dim: int = None,
         context_pre_only: bool | None = None,
         pre_only: bool = False,
+        gather_output: bool = True,
     ):
         super().__init__()
         self.parallel_config = parallel_config
@@ -217,6 +219,9 @@ class LongCatImageAttention(nn.Module):
         self.out_dim = out_dim if out_dim is not None else query_dim
         self.context_pre_only = context_pre_only
         self.pre_only = pre_only
+        # pre_only only: False keeps the output TP-sharded on the head dimension for a
+        # caller that projects it with a row-parallel layer.
+        self.gather_output = gather_output
         self.heads = out_dim // dim_head if out_dim is not None else heads
         self.added_kv_proj_dim = added_kv_proj_dim
         self.added_proj_bias = added_proj_bias
@@ -455,7 +460,7 @@ class LongCatImageAttention(nn.Module):
             return hidden_states, encoder_hidden_states
         else:
             # For single-stream blocks, there's no to_out (RowParallelLinear) to handle the reduction
-            if get_tensor_model_parallel_world_size() > 1:
+            if self.gather_output and get_tensor_model_parallel_world_size() > 1:
                 hidden_states = tensor_model_parallel_all_gather(hidden_states, dim=-1)
             return hidden_states
 
@@ -669,9 +674,11 @@ class LongCatImageSingleTransformerBlock(nn.Module):
         self.mlp_hidden_dim = int(dim * mlp_ratio)
 
         self.norm = AdaLayerNormZeroSingle(dim)
-        self.proj_mlp = nn.Linear(dim, self.mlp_hidden_dim)
+        # Under TP, attention and MLP stay sharded on their feature dims and proj_out
+        # contracts both with one GEMM + all-reduce.
+        self.proj_mlp = ColumnParallelLinear(dim, self.mlp_hidden_dim, gather_output=False, return_bias=False)
         self.act_mlp = nn.GELU(approximate="tanh")
-        self.proj_out = nn.Linear(dim + self.mlp_hidden_dim, dim)
+        self.proj_out = MergedRowParallelLinear([dim, self.mlp_hidden_dim], dim, return_bias=False)
 
         # SP handling is delegated to LongCatImageAttention via text_seq_len kwarg
         self.attn = LongCatImageAttention(
@@ -683,6 +690,7 @@ class LongCatImageSingleTransformerBlock(nn.Module):
             bias=True,
             eps=1e-6,
             pre_only=True,
+            gather_output=False,
         )
 
     def forward(

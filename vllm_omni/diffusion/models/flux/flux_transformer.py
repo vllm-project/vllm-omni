@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
 
@@ -20,7 +20,6 @@ from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     QKVParallelLinear,
-    ReplicatedLinear,
     RowParallelLinear,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
@@ -40,6 +39,7 @@ from vllm_omni.diffusion.layers.adalayernorm import (
     AdaLayerNormZero,
     AdaLayerNormZeroSingle,
 )
+from vllm_omni.diffusion.layers.linear import MergedRowParallelLinear, merged_row_parallel_supported
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding, apply_rope_to_qk
 
 logger = init_logger(__name__)
@@ -130,6 +130,7 @@ class FluxAttention(torch.nn.Module):
         out_dim: int = None,
         context_pre_only: bool | None = None,
         pre_only: bool = False,
+        gather_output: bool = True,
         quant_config: "QuantizationConfig | None" = None,
         prefix: str = "",
     ):
@@ -143,6 +144,9 @@ class FluxAttention(torch.nn.Module):
         self.out_dim = out_dim if out_dim is not None else query_dim
         self.context_pre_only = context_pre_only
         self.pre_only = pre_only
+        # pre_only only: False keeps the output TP-sharded on the head dimension for a
+        # caller that projects it with a row-parallel layer.
+        self.gather_output = gather_output
         self.heads = out_dim // dim_head if out_dim is not None else heads
         self.added_kv_proj_dim = added_kv_proj_dim
         self.added_proj_bias = added_proj_bias
@@ -276,7 +280,7 @@ class FluxAttention(torch.nn.Module):
 
             return hidden_states, encoder_hidden_states
         else:
-            if get_tensor_model_parallel_world_size() > 1:
+            if self.gather_output and get_tensor_model_parallel_world_size() > 1:
                 hidden_states = tensor_model_parallel_all_gather(hidden_states, dim=-1)
             return hidden_states
 
@@ -386,22 +390,29 @@ class FluxSingleTransformerBlock(nn.Module):
         self.mlp_hidden_dim = int(dim * mlp_ratio)
 
         self.norm = AdaLayerNormZeroSingle(dim, quant_config=safe_quant_config(quant_config), prefix=f"{prefix}.norm")
-        self.proj_mlp = ReplicatedLinear(
+        # Under TP, attention and MLP stay sharded on their feature dims and proj_out
+        # contracts both with one GEMM + all-reduce. Quant methods the merged loader
+        # does not support keep both projections replicated (attention is gathered).
+        shard_proj = merged_row_parallel_supported(quant_config, f"{prefix}.proj_out")
+        self.proj_mlp = ColumnParallelLinear(
             dim,
             self.mlp_hidden_dim,
             bias=True,
+            gather_output=False,
             return_bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.proj_mlp",
+            disable_tp=not shard_proj,
         )
         self.act_mlp = nn.GELU(approximate="tanh")
-        self.proj_out = ReplicatedLinear(
-            dim + self.mlp_hidden_dim,
+        self.proj_out = MergedRowParallelLinear(
+            [dim, self.mlp_hidden_dim],
             dim,
             bias=True,
             return_bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.proj_out",
+            disable_tp=not shard_proj,
         )
 
         self.attn = FluxAttention(
@@ -412,6 +423,7 @@ class FluxSingleTransformerBlock(nn.Module):
             bias=True,
             eps=1e-6,
             pre_only=True,
+            gather_output=not shard_proj,
             quant_config=quant_config,
             prefix=f"{prefix}.attn",
         )
