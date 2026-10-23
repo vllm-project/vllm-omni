@@ -1313,6 +1313,10 @@ class QwenImage21Pipeline(
             num_blocks = len(caches[0])
             return QwenImage21KVCache({} for _ in range(num_blocks)), True
         if phases == {"decode"}:
+            if len(caches) == 1:
+                # Keep the request owner stable across decode steps. Prefill
+                # still scatters and records the padded prefix lengths above.
+                return caches[0], False
             # Decode only reads the cache, so a batched view is enough and the
             # per-request caches stay untouched. Merge every stored part — FP8
             # cache entries carry per-request scale tensors alongside "key"/"value".

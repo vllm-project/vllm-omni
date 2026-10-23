@@ -135,6 +135,13 @@ steps:
               -- -m 'advanced_model and cuda' --run-level 'advanced_model'
         mirror_hardwares: l4_1
 
+      - label: "TTS · VibeVoice Offline Eager Test"
+        source_file_dependencies: tts_vibevoice_function
+        timeout_in_minutes: 30
+        commands:
+          - pytest -s -v tests/e2e/offline_inference/test_vibevoice_tts.py -m 'advanced_model and cuda and H100' --run-level 'advanced_model'
+        mirror_hardwares: h100_1
+
       - label: "Omni · Qwen3-Omni Test"
         source_file_dependencies: omni_qwen3_omni_function
         timeout_in_minutes: 50

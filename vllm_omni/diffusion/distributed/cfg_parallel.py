@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """
 Base pipeline class for Diffusion models with shared CFG functionality.
 """
 
 from abc import ABCMeta
+from collections.abc import Callable
 from typing import Any
 
 import torch
@@ -88,6 +89,13 @@ class CFGParallelMixin(metaclass=ABCMeta):
         and set self.scheduler to a composite scheduler that handles tuples.
     """
 
+    transformer: torch.nn.Module
+
+    def _set_transformer_do_true_cfg(self, do_true_cfg: bool) -> None:
+        transformer = getattr(self, "transformer", None)
+        if transformer is not None:
+            transformer.do_true_cfg = do_true_cfg
+
     def predict_noise_maybe_with_cfg(
         self,
         do_true_cfg: bool,
@@ -118,8 +126,17 @@ class CFGParallelMixin(metaclass=ABCMeta):
             For multi-output models (e.g., video + audio where predict_noise
             returns a tuple), override combine_cfg_noise() for per-element CFG
             logic and set self.scheduler to a composite scheduler.
+
+            Sets ``self.transformer.do_true_cfg`` before predicting. TeaCache
+            reads it to keep one cache state per CFG branch; without it the
+            positive and negative calls of a step share a state and reuse each
+            other's residual.
         """
+        self._set_transformer_do_true_cfg(do_true_cfg)
+
         if do_true_cfg:
+            if negative_kwargs is None:
+                raise ValueError("CFG requires negative prediction arguments.")
             # Automatically detect CFG parallel configuration
             cfg_parallel_ready = _get_cfg_world_size_or_one() > 1
 
@@ -245,6 +262,8 @@ class CFGParallelMixin(metaclass=ABCMeta):
         branches_kwargs: list[dict[str, Any]],
         cfg_normalize: bool = False,
         output_slice: int | None = None,
+        combine_fn: Callable[[list[torch.Tensor | tuple[torch.Tensor, ...]]], torch.Tensor | tuple[torch.Tensor, ...]]
+        | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, ...]:
         """
         Predict noise with N-branch CFG dispatch across M GPUs.
@@ -262,6 +281,9 @@ class CFGParallelMixin(metaclass=ABCMeta):
                 positive/conditional branch.
             cfg_normalize: Whether to normalize (passed to combine_multi_branch_cfg_noise).
             output_slice: If set, slice each output to [:, :output_slice].
+            combine_fn: Optional request-local combiner, called after branch
+                predictions are available on every rank. Defaults to the
+                pipeline's combine_multi_branch_cfg_noise implementation.
 
         Returns:
             Combined noise prediction, identical on all ranks in CFG parallel.
@@ -279,6 +301,7 @@ class CFGParallelMixin(metaclass=ABCMeta):
                     true_cfg_scale,
                     cfg_normalize,
                     output_slice,
+                    combine_fn,
                 )
             else:
                 # Sequential: run all N branches on single device
@@ -288,6 +311,8 @@ class CFGParallelMixin(metaclass=ABCMeta):
                     if output_slice is not None:
                         pred = _slice_pred(pred, output_slice)
                     preds.append(_unwrap(pred))
+                if combine_fn is not None:
+                    return combine_fn(preds)
                 return self.combine_multi_branch_cfg_noise(preds, true_cfg_scale, cfg_normalize)
         else:
             # No CFG: only compute positive/conditional prediction
@@ -304,6 +329,8 @@ class CFGParallelMixin(metaclass=ABCMeta):
         true_cfg_scale: float | dict[str, float],
         cfg_normalize: bool,
         output_slice: int | None,
+        combine_fn: Callable[[list[torch.Tensor | tuple[torch.Tensor, ...]]], torch.Tensor | tuple[torch.Tensor, ...]]
+        | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, ...]:
         """Dispatch N branches across M ranks, all_gather, then combine."""
         cfg_group = get_cfg_group()
@@ -321,6 +348,14 @@ class CFGParallelMixin(metaclass=ABCMeta):
         assignments = _dispatch_branches(n_branches, cfg_world_size)
         my_branch_ids = assignments[cfg_rank]
         max_per_rank = max(len(a) for a in assignments)
+        if max_per_rank > 1 and getattr(self, "_cache_dit_one_call_per_cfg_rank", False):
+            # Cache-DiT counts every transformer call on a CFG rank as a denoise step, so a rank
+            # running two branches would exhaust its cache budget early while the others don't.
+            raise ValueError(
+                f"Cache-DiT with cfg_parallel_size={cfg_world_size} does not support {n_branches}-branch CFG: "
+                f"a rank would run {max_per_rank} branches per step. Set cfg_parallel_size to at least "
+                f"{n_branches}, or disable cache_dit."
+            )
 
         # Run assigned branches
         my_preds: list[tuple[torch.Tensor, ...]] = []
@@ -362,6 +397,8 @@ class CFGParallelMixin(metaclass=ABCMeta):
             elements = tuple(all_slots[slot_idx][elem_idx][owner_rank] for elem_idx in range(len(ref_pred)))
             final_preds.append(_unwrap(elements))
 
+        if combine_fn is not None:
+            return combine_fn(final_preds)
         return self.combine_multi_branch_cfg_noise(final_preds, true_cfg_scale, cfg_normalize)
 
     def combine_multi_branch_cfg_noise(

@@ -1147,6 +1147,29 @@ def _http_response_body_materialize(resp: Any) -> tuple[bytes, dict[str, Any] | 
     return raw, parsed if isinstance(parsed, dict) else None
 
 
+def _response_error_code(payload: dict[str, Any] | None) -> int | str | None:
+    """Return OpenAI-style ``error.code`` when the body carries one.
+
+    Numeric strings are returned as ``int``. ``bool`` is ignored because it is a subclass of ``int``.
+    """
+    if not isinstance(payload, dict):
+        return None
+    error = payload.get("error")
+    if not isinstance(error, dict):
+        return None
+    code = error.get("code")
+    if isinstance(code, bool) or code is None:
+        return None
+    if isinstance(code, int):
+        return code
+    if isinstance(code, str):
+        stripped = code.strip()
+        if stripped.isdigit():
+            return int(stripped)
+        return stripped or None
+    return None
+
+
 def assert_err_message_in_text(
     haystack: str,
     err_message: str | tuple[str, ...] | list[str] | set[str] | frozenset[str],
@@ -1189,6 +1212,8 @@ def assert_http_error(
     Tuple/list ``err_message`` then uses **any** substring match; HTTP mode still requires **all** pieces.
 
     - ``err_code``: exact HTTP ``int``, or membership if a non-string sequence (e.g. ``(400, 422)``).
+      When the HTTP status is 200 and the JSON body has ``error.code``, that value is checked instead of
+      the status. Sync errors still match on the HTTP status, which is set from the same code.
       When ``err_code`` is set and the actual status is a client error in ``400..499`` other than ``404``,
       the JSON body must include FastAPI ``detail`` and/or OpenAI-style ``error`` (2xx skips this).
     - ``err_message``: substring match (case-insensitive) against serialized ``json_body`` and ``error_message``.
@@ -1215,14 +1240,19 @@ def assert_http_error(
     actual = getattr(resp, "status_code", None)
     assert actual is not None, "response missing status_code"
 
+    body_bytes, payload = _http_response_body_materialize(resp)
+
     if err_code is not None:
+        code_to_check: int | str = actual
+        if actual == 200:
+            body_code = _response_error_code(payload)
+            if body_code is not None:
+                code_to_check = body_code
         if isinstance(err_code, int):
-            assert actual == err_code, (resp, err_code)
+            assert code_to_check == err_code, (resp, err_code)
         else:
             allowed = tuple(err_code)
-            assert actual in allowed, (resp, allowed)
-
-    body_bytes, payload = _http_response_body_materialize(resp)
+            assert code_to_check in allowed, (resp, allowed)
 
     if err_code is not None and actual is not None and 400 <= actual < 500 and actual != 404:
         assert payload is not None, getattr(resp, "error_message", resp)

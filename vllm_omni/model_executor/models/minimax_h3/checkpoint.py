@@ -2,7 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """MiniMax H3 checkpoint resolution for the AR text-encoder stage."""
 
+import json
+from collections.abc import Mapping
 from pathlib import Path
+
+from vllm.transformers_utils.config import get_hf_file_to_dict
 
 from vllm_omni.diffusion.utils.hf_utils import get_diffusion_model_index
 from vllm_omni.model_executor.model_loader.weight_utils import (
@@ -10,6 +14,31 @@ from vllm_omni.model_executor.model_loader.weight_utils import (
 )
 
 _FASTH3_MODULAR_MODEL_PREFIX = "FastVideo/"
+FASTH3_BASE_MODEL = "MiniMaxAI/MiniMax-H3"
+
+
+def read_fasth3_contract(model: str, revision: str | None = None) -> dict[str, object]:
+    path = Path(model)
+    if path.is_dir():
+        contract = path / "fastvideo_inference.json"
+        return json.loads(contract.read_text()) if contract.is_file() else {}
+    if model.startswith(_FASTH3_MODULAR_MODEL_PREFIX):
+        return get_hf_file_to_dict("fastvideo_inference.json", model, revision=revision) or {}
+    return {}
+
+
+def fasth3_base_revision(contract: Mapping[str, object]) -> str:
+    source = contract.get("base_model_revision", "")
+    prefix = f"hf://{FASTH3_BASE_MODEL}@"
+    if not isinstance(source, str) or not source.startswith(prefix) or not source[len(prefix) :]:
+        raise ValueError("FastH3 Omni must pin a MiniMaxAI/MiniMax-H3 base_model_revision")
+    return source[len(prefix) :]
+
+
+def minimax_h3_transformer_subfolder(*, model: str | None, revision: str | None = None) -> str:
+    contract = read_fasth3_contract(model or "", revision)
+    return "transformer_ref" if contract.get("model_type") == "ref2va" else "transformer"
+
 
 MINIMAX_H3_ENCODER_DOWNLOAD_PATTERNS = {
     partition: [
@@ -65,6 +94,17 @@ def resolve_minimax_h3_encoder_model_root(
     path = Path(model)
     partition = resolve_minimax_h3_partition(model, task_type, auto_partition="fl2va")
     modular = is_minimax_h3_modular(model, revision)
+    if modular:
+        contract = read_fasth3_contract(model, revision)
+        if contract.get("model_type") == "ref2va":
+            snapshot = download_weights_from_hf_specific(
+                model_name_or_path=FASTH3_BASE_MODEL,
+                cache_dir=None,
+                allow_patterns=MINIMAX_H3_ENCODER_DOWNLOAD_PATTERNS["ref2va"],
+                revision=fasth3_base_revision(contract),
+                require_all=True,
+            )
+            return str(Path(snapshot) / "Ref2VA" / "text_encoder")
 
     if path.is_dir():
         if path.name == "text_encoder" and (path / "config.json").is_file():

@@ -7,12 +7,14 @@ owners:
 primary_code_paths:
   - vllm_omni/profiler/**
   - vllm_omni/diffusion/profiler/**
+  - vllm_omni/utils/profiler.py
 related_code_paths:
   - vllm_omni/entrypoints/**
 depends_on:
   - observability.md
 validation_paths:
   - tests/profile/**
+  - tests/utils/test_profiler.py
 upstream_refs:
   - vllm.profiler
 last_reviewed: 2026-07-16
@@ -22,6 +24,13 @@ last_reviewed: 2026-07-16
 
 Profiling owns opt-in instrumentation and trace collection used to locate
 runtime bottlenecks without changing model results or execution policy.
+
+The Qwen2.5-Omni and CosyVoice3 offline examples share the JSON argument parser
+in `vllm_omni.utils.profiler`. The parser defaults to `None`, rejects malformed
+JSON and non-object values before engine initialization, and leaves field
+validation to the engine configuration. See the
+[offline profiling guide](../../contributing/profiling.md#offline-qwen25-omni-and-cosyvoice3-examples)
+for commands and the shared helper API.
 
 ## Candidate invariants
 

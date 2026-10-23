@@ -11,6 +11,7 @@ This script tests two main scenarios:
 
 import sys
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import Mock
 
 import pytest
@@ -55,6 +56,239 @@ def test_versioned_flash_attention_selection_rejects_invalid_or_unavailable_vers
         fa._choose_vllm_flash_attn_version(9, "5", frozenset((2, 3, 4)))
     with pytest.raises(RuntimeError, match="FlashAttention 4 is unavailable"):
         fa._choose_vllm_flash_attn_version(9, "4", frozenset((2, 3)))
+
+
+@pytest.mark.cpu
+def test_vllm_varlen_version_kwargs_targets_only_vllm_dispatcher(monkeypatch):
+    def vllm_func(**_kwargs):
+        return None
+
+    def other_func(**_kwargs):
+        return None
+
+    monkeypatch.setattr(fa, "_is_vllm_flash_attn_varlen", lambda func: func is vllm_func)
+    monkeypatch.setattr(fa, "resolve_vllm_flash_attn_version", lambda requested=None: 3)
+
+    assert fa.vllm_varlen_version_kwargs(vllm_func) == {"fa_version": 3}
+    assert fa.vllm_varlen_version_kwargs(other_func) == {}
+    assert fa.vllm_varlen_version_kwargs(None) == {}
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize(
+    ("major", "expect_hopper"),
+    [
+        (8, False),
+        (9, True),
+        (10, False),
+    ],
+)
+def test_is_hopper_matches_flash_attn_3_hub_gate(monkeypatch, major, expect_hopper):
+    monkeypatch.setattr(
+        fa.current_omni_platform,
+        "get_device_capability",
+        lambda: SimpleNamespace(major=major, minor=0),
+    )
+    assert fa._is_hopper() is expect_hopper
+
+
+@pytest.mark.cpu
+def test_bind_optional_fa3_fwd_dense_sets_dense_on_hopper_when_package_present(monkeypatch):
+    dense = object()
+    fake_mod = SimpleNamespace(flash_attn_func=dense)
+    monkeypatch.setitem(sys.modules, "fa3_fwd_interface", fake_mod)
+    monkeypatch.setattr(fa, "_is_hopper", lambda: True)
+
+    assert fa._bind_optional_fa3_fwd_dense() is dense
+
+
+@pytest.mark.cpu
+def test_bind_optional_fa3_fwd_dense_skips_non_hopper_even_when_package_present(monkeypatch):
+    dense = object()
+    fake_mod = SimpleNamespace(flash_attn_func=dense)
+    monkeypatch.setitem(sys.modules, "fa3_fwd_interface", fake_mod)
+    monkeypatch.setattr(fa, "_is_hopper", lambda: False)
+
+    assert fa._bind_optional_fa3_fwd_dense() is None
+
+
+@pytest.mark.cpu
+def test_bind_optional_fa3_fwd_dense_absent_on_hopper(monkeypatch):
+    import builtins
+
+    monkeypatch.setattr(fa, "_is_hopper", lambda: True)
+    monkeypatch.delitem(sys.modules, "fa3_fwd_interface", raising=False)
+    real_import = builtins.__import__
+
+    def _block_fa3_fwd(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "fa3_fwd_interface":
+            raise ModuleNotFoundError(name)
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", _block_fa3_fwd)
+
+    assert fa._bind_optional_fa3_fwd_dense() is None
+
+
+@pytest.mark.cpu
+def test_dense_flash_attn_func_for_prefers_optional_except_fp16(monkeypatch):
+    optional = object()
+    generic = object()
+    monkeypatch.setattr(fa, "optional_fa3_fwd_dense_func", optional)
+    monkeypatch.setattr(fa, "flash_attn_func", generic)
+
+    assert fa.dense_flash_attn_func_for(torch.bfloat16) is optional
+    assert fa.dense_flash_attn_func_for(torch.float16) is generic
+
+
+@pytest.mark.cpu
+def test_dense_unmasked_fp16_skips_optional_fa3_fwd(monkeypatch):
+    captured: dict[str, Any] = {}
+
+    def fail_if_called(*_args, **_kwargs):
+        raise AssertionError("optional fa3-fwd dense must not run for FP16")
+
+    def fake_varlen(**kwargs):
+        captured.update(kwargs)
+        return kwargs["q"]
+
+    monkeypatch.setattr(fa, "optional_fa3_fwd_dense_func", fail_if_called)
+    monkeypatch.setattr(fa, "flash_attn_func", None)
+    monkeypatch.setattr(fa, "flash_attn_varlen_func", fake_varlen)
+    monkeypatch.setattr(fa, "HAS_FLASH_ATTN", True)
+    monkeypatch.setattr(fa, "IS_FLASH_ATTN_4", False)
+    monkeypatch.setattr(fa, "_is_vllm_flash_attn_varlen", lambda func: func is fake_varlen)
+    monkeypatch.setattr(fa, "resolve_vllm_flash_attn_version", lambda requested=None: 3)
+
+    impl = FlashAttentionImpl(num_heads=2, head_size=8, softmax_scale=0.5, causal=False)
+    query = torch.randn(1, 4, 2, 8, dtype=torch.float16)
+    key = torch.randn(1, 4, 2, 8, dtype=torch.float16)
+    value = torch.randn(1, 4, 2, 8, dtype=torch.float16)
+
+    out = impl.forward_cuda(query, key, value, attn_metadata=None)
+    assert out.shape == query.shape
+    assert "fa_version" in captured
+
+
+@pytest.mark.cpu
+def test_dense_cuda_varlen_fallback_passes_resolved_fa_version(monkeypatch):
+    captured: dict[str, Any] = {}
+
+    def fake_varlen(**kwargs):
+        captured.update(kwargs)
+        return kwargs["q"]
+
+    monkeypatch.setattr(fa, "optional_fa3_fwd_dense_func", None)
+    monkeypatch.setattr(fa, "flash_attn_func", None)
+    monkeypatch.setattr(fa, "flash_attn_varlen_func", fake_varlen)
+    monkeypatch.setattr(fa, "HAS_FLASH_ATTN", True)
+    monkeypatch.setattr(fa, "_is_vllm_flash_attn_varlen", lambda func: func is fake_varlen)
+    monkeypatch.setattr(fa, "resolve_vllm_flash_attn_version", lambda requested=None: 3)
+
+    impl = FlashAttentionImpl(num_heads=2, head_size=8, softmax_scale=0.5, causal=False)
+    query = torch.randn(1, 4, 2, 8)
+    output = impl.forward_cuda(query, query, query)
+
+    assert torch.equal(output, query)
+    assert captured["fa_version"] == 3
+    assert captured["causal"] is False
+    assert captured["softmax_scale"] == 0.5
+
+
+@pytest.mark.cpu
+def test_dense_cuda_varlen_fallback_omits_fa_version_for_other_backends(monkeypatch):
+    captured: dict[str, Any] = {}
+
+    def fake_varlen(**kwargs):
+        captured.update(kwargs)
+        return kwargs["q"]
+
+    monkeypatch.setattr(fa, "optional_fa3_fwd_dense_func", None)
+    monkeypatch.setattr(fa, "flash_attn_func", None)
+    monkeypatch.setattr(fa, "flash_attn_varlen_func", fake_varlen)
+    monkeypatch.setattr(fa, "HAS_FLASH_ATTN", True)
+    monkeypatch.setattr(fa, "_is_vllm_flash_attn_varlen", lambda _func: False)
+
+    impl = FlashAttentionImpl(num_heads=2, head_size=8, softmax_scale=0.5, causal=False)
+    query = torch.randn(1, 4, 2, 8)
+    impl.forward_cuda(query, query, query)
+
+    assert "fa_version" not in captured
+
+
+def test_vllm_dense_adapter_builds_varlen_metadata_and_restores_lse(monkeypatch):
+    batch_size, seqlen_q, seqlen_k, num_heads, head_dim = 2, 3, 5, 4, 8
+    query = torch.randn(batch_size, seqlen_q, num_heads, head_dim)
+    key = torch.randn(batch_size, seqlen_k, num_heads, head_dim)
+    value = torch.randn_like(key)
+    packed_out = torch.randn(batch_size * seqlen_q, num_heads, head_dim)
+    packed_lse = torch.arange(num_heads * batch_size * seqlen_q).reshape(num_heads, -1)
+    captured: dict[str, Any] = {}
+
+    def fake_varlen(q, k, v, **kwargs):
+        captured.update(q=q, k=k, v=v, **kwargs)
+        return packed_out, packed_lse
+
+    monkeypatch.setattr(fa, "vllm_flash_attn_varlen_with_lse", fake_varlen)
+
+    out, lse = fa.vllm_flash_attn_dense_with_lse(query, key, value, causal=True, softmax_scale=0.25)
+
+    assert out.shape == query.shape
+    assert torch.equal(out.flatten(0, 1), packed_out)
+    assert lse.shape == (batch_size, num_heads, seqlen_q)
+    assert torch.equal(lse, packed_lse.unflatten(1, (batch_size, seqlen_q)).permute(1, 0, 2))
+    assert captured["q"].shape == (batch_size * seqlen_q, num_heads, head_dim)
+    assert captured["k"].shape == (batch_size * seqlen_k, num_heads, head_dim)
+    assert captured["v"].shape == (batch_size * seqlen_k, num_heads, head_dim)
+    assert torch.equal(captured["cu_seqlens_q"], torch.tensor([0, 3, 6], dtype=torch.int32))
+    assert torch.equal(captured["cu_seqlens_k"], torch.tensor([0, 5, 10], dtype=torch.int32))
+    assert captured["max_seqlen_q"] == seqlen_q
+    assert captured["max_seqlen_k"] == seqlen_k
+    assert captured["causal"] is True
+    assert captured["softmax_scale"] == 0.25
+
+
+@hardware_test(res={"cuda": ["L4", "H100"]}, num_cards=1)
+@pytest.mark.skipif(not current_omni_platform.is_cuda(), reason="vLLM FlashAttention requires CUDA")
+def test_vllm_dense_adapter_cuda_matches_sdpa_and_lse():
+    """Exercise the real versioned vLLM dispatcher and its LSE contract."""
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    batch_size, seqlen_q, seqlen_k, num_heads, head_dim = 2, 17, 23, 4, 64
+    softmax_scale = head_dim**-0.5
+
+    torch.manual_seed(19)
+    query = torch.randn(batch_size, seqlen_q, num_heads, head_dim, device=device, dtype=dtype)
+    key = torch.randn(batch_size, seqlen_k, num_heads, head_dim, device=device, dtype=dtype)
+    value = torch.randn_like(key)
+
+    capability = torch.cuda.get_device_capability(device)
+    expected_version = 3 if capability[0] == 9 else 2
+    assert capability[0] in (8, 9), f"test expects an Ampere/Ada or Hopper GPU, got SM{capability[0]}{capability[1]}"
+    assert fa.resolve_vllm_flash_attn_version() == expected_version
+
+    output, lse = fa.vllm_flash_attn_dense_with_lse(
+        query,
+        key,
+        value,
+        softmax_scale=softmax_scale,
+        causal=False,
+    )
+
+    query_bhsd = query.transpose(1, 2)
+    key_bhsd = key.transpose(1, 2)
+    value_bhsd = value.transpose(1, 2)
+    output_ref = torch.nn.functional.scaled_dot_product_attention(
+        query_bhsd,
+        key_bhsd,
+        value_bhsd,
+        scale=softmax_scale,
+    ).transpose(1, 2)
+    logits = torch.matmul(query_bhsd.float(), key_bhsd.float().transpose(-2, -1)) * softmax_scale
+    lse_ref = torch.logsumexp(logits, dim=-1)
+
+    torch.testing.assert_close(output, output_ref, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(lse, lse_ref, rtol=1e-3, atol=1e-3)
 
 
 def create_attention_mask(batch_size: int, seq_len: int, valid_len: int, device: torch.device) -> torch.Tensor:
@@ -446,6 +680,7 @@ def test_published_noop_mask_uses_dense_path(monkeypatch):
 
     monkeypatch.setattr(fa, "HAS_FLASH_ATTN", True)
     monkeypatch.setattr(fa, "IS_FLASH_ATTN_4", False)
+    monkeypatch.setattr(fa, "optional_fa3_fwd_dense_func", None)
     monkeypatch.setattr(fa, "flash_attn_func", fake_dense_func)
     monkeypatch.setattr(fa, "flash_attn_varlen_func", fail_varlen)
 
@@ -491,6 +726,31 @@ def test_piecewise_flash_attn_uses_varlen_fallback(monkeypatch):
     assert calls[0]["max_seqlen_k"] == 3
     assert calls[0]["causal"] is False
     assert calls[0]["softmax_scale"] == 0.5
+
+
+@pytest.mark.cpu
+def test_xpu_piecewise_spans_ignore_4d_mask(monkeypatch):
+    """XPU must honor full_attn_spans instead of feeding a 4D mask to the 2D-only varlen-masked path."""
+    calls = []
+
+    def fake_varlen_func(q, k, v, **kwargs):
+        calls.append((kwargs["max_seqlen_q"], kwargs["max_seqlen_k"], kwargs["causal"]))
+        return q
+
+    monkeypatch.setattr(fa, "HAS_FLASH_ATTN", True)
+    monkeypatch.setattr(fa, "flash_attn_varlen_func", fake_varlen_func)
+
+    impl = FlashAttentionImpl(num_heads=2, head_size=4, softmax_scale=0.5, causal=False)
+    query = torch.randn(1, 6, 2, 4)
+    metadata = AttentionMetadata(
+        attn_mask=torch.ones((1, 1, 6, 6), dtype=torch.bool).tril(),
+        full_attn_spans=[[(2, 4)]],
+    )
+
+    output = impl.forward_xpu(query, query, query, metadata)
+
+    assert output.shape == query.shape
+    assert calls == [(2, 2, True), (2, 4, False), (2, 6, True)]
 
 
 @pytest.mark.cpu
@@ -697,6 +957,7 @@ def rocm_contract(monkeypatch, mocker):
     monkeypatch.setattr(fa, "IS_FLASH_ATTN_4", False)
     monkeypatch.setattr(fa, "IS_AITER", True)
     monkeypatch.setattr(fa, "HAS_FLASH_ATTN", True)
+    monkeypatch.setattr(fa, "optional_fa3_fwd_dense_func", None)
     monkeypatch.setattr(fa, "flash_attn_func", dense)
     monkeypatch.setattr(fa, "flash_attn_varlen_func", packed)
     monkeypatch.setattr(fa, "validate_fa4_head_dims", lambda *_args: pytest.fail("ROCm must not validate FA4"))

@@ -54,6 +54,7 @@ from vllm_omni.engine.duplex.plugin import (
     PcmAppendBuffer,
     PcmAppendReservation,
 )
+from vllm_omni.engine.duplex.replica_placement import DuplexReplicaPlacement
 from vllm_omni.engine.duplex.session import manager as session_manager_module
 from vllm_omni.engine.duplex.session.context import DuplexSessionTasks
 from vllm_omni.engine.duplex.session.engine_session import DuplexEngineSession
@@ -119,6 +120,7 @@ class FakeModelSessionState(DuplexModelSessionState):
         self.committed_audio_payload = None
         self.committed_audio_operation_id = None
         self.committed_audio_reserved_bytes = 0
+        self.committed_audio_consume_started = False
         self.deferred_response_create = False
         self.deferred_precreate_response = False
         self.continuation_owner_id = None
@@ -132,12 +134,14 @@ class FakeModelSessionState(DuplexModelSessionState):
         self.committed_audio_payload = payload
         self.committed_audio_operation_id = operation_id
         self.committed_audio_reserved_bytes = reserved_bytes
+        self.committed_audio_consume_started = False
 
     def clear_committed_audio(self) -> int:
         reserved = self.committed_audio_reserved_bytes
         self.committed_audio_payload = None
         self.committed_audio_operation_id = None
         self.committed_audio_reserved_bytes = 0
+        self.committed_audio_consume_started = False
         return reserved
 
     def clear_continuation(self) -> None:
@@ -270,6 +274,34 @@ class FakeStagePort(DuplexStagePort):
         self.abort_calls.append(list(request_ids))
 
 
+class PlacementStagePort(FakeStagePort):
+    def __init__(self, *, replicas: int = 1, capacity: int = 1) -> None:
+        super().__init__()
+        self.capacity = capacity
+        self.placement = DuplexReplicaPlacement(
+            stage_replica_counts=[replicas] * self.stage_count,
+            max_sessions_per_replica=capacity,
+        )
+        self.reserve_calls: list[str] = []
+        self.release_calls: list[str] = []
+        self.rejections: list[str] = []
+
+    def reserve_session(self, session_id: str) -> None:
+        self.reserve_calls.append(session_id)
+        self.placement.reserve(session_id)
+
+    def release_session(self, session_id: str) -> None:
+        self.release_calls.append(session_id)
+        self.placement.release(session_id)
+
+    def reject_session(self, reason: str) -> None:
+        self.rejections.append(reason)
+
+    def ensure_request(self, context: DuplexStageRequestContext) -> None:
+        self.placement.route(context.session_id, context.stage_id)
+        super().ensure_request(context)
+
+
 # --------------------------------------------------------------------------- #
 # Harness                                                                     #
 # --------------------------------------------------------------------------- #
@@ -310,10 +342,14 @@ class Harness:
         plugin: FakePlugin | None = None,
         stage_port: FakeStagePort | None = None,
         clock: FakeClock | None = None,
+        admission_limit: int | None = None,
         **runtime_overrides: Any,
     ) -> Harness:
         plugin = plugin or FakePlugin()
         stage_port = stage_port or FakeStagePort()
+        if isinstance(stage_port, PlacementStagePort):
+            runtime_overrides.setdefault("replica_policy", "least_sessions")
+            runtime_overrides.setdefault("max_sessions_per_replica", stage_port.capacity)
         clock = clock or FakeClock()
         output_sink: asyncio.Queue = asyncio.Queue()
         result_sink: asyncio.Queue = asyncio.Queue()
@@ -324,6 +360,7 @@ class Harness:
             result_sink=result_sink,
             runtime_config=_runtime_config(**runtime_overrides),
             model_config=None,
+            admission_limit=admission_limit,
             clock=clock,
         )
         return cls(manager, plugin, stage_port, clock, output_sink, result_sink)
@@ -698,8 +735,9 @@ async def test_append_audio_is_backpressured_by_pending_input_bytes() -> None:
         assert events[0].related_event_id == "evt-over"
         assert events[0].epoch == 0
         assert [command.event_id for command in submitted] == ["evt-fits"]
-        # Admission reserved the wire size of the admitted append; the runner
-        # released it on dequeue and re-reserved the decoded size (2 bytes).
+        # Admission charged the admitted append's wire size as queued bytes;
+        # this harness never runs the runner, so pending is the pre-reserved 6
+        # plus that 2-byte charge.
         assert session.pending_input_bytes == 8
 
 
@@ -1085,7 +1123,7 @@ async def test_close_of_a_forgotten_session_is_idempotent() -> None:
         assert result.ok is True
 
 
-async def test_append_bytes_are_reserved_at_admission_until_the_runner_dequeues() -> None:
+async def test_append_bytes_are_reserved_at_admission_until_the_pcm_handoff() -> None:
     async with Harness.create(max_sessions=1, max_pending_input_bytes_per_session=8) as harness:
         await harness.open("sid-bytes")
         await harness.events()
@@ -1494,7 +1532,8 @@ async def test_expiry_emits_a_terminal_event_even_when_a_close_deferred_it() -> 
         assert terminal[0].reason == "request_cleanup"
 
 
-async def test_an_open_abandoned_by_its_caller_does_not_hold_the_admission_slot() -> None:
+@pytest.mark.parametrize("use_placement", [False, True])
+async def test_an_open_abandoned_by_its_caller_does_not_hold_the_admission_slot(use_placement) -> None:
     """A control-RPC timeout must not leave the engine holding a session.
 
     The caller's timeout unregisters its RPC waiter but cannot cancel the
@@ -1503,7 +1542,8 @@ async def test_an_open_abandoned_by_its_caller_does_not_hold_the_admission_slot(
     reservation, and with ``max_sessions=1`` the next open is refused until
     idle expiry.
     """
-    async with Harness.create(max_sessions=1) as harness:
+    port = PlacementStagePort() if use_placement else FakeStagePort()
+    async with Harness.create(max_sessions=1, stage_port=port) as harness:
         harness.plugin.blocked_session_ids.add("blocked")
         config = DuplexSessionConfig(model="fake-model", instructions="blocked")
 
@@ -1518,6 +1558,9 @@ async def test_an_open_abandoned_by_its_caller_does_not_hold_the_admission_slot(
         await open_task
 
         assert "sid-abandoned" not in harness.manager.runners
+        if isinstance(port, PlacementStagePort):
+            assert port.release_calls == ["sid-abandoned"]
+            assert port.placement.snapshot()["sessions"] == {}
         # The slot came back, so a replacement is admitted.
         assert (await harness.open("sid-replacement")).ok is True
 
@@ -1821,7 +1864,10 @@ async def test_an_open_cancelled_after_admission_releases_the_runner_and_its_sta
         assert (await harness.open("sid-replacement")).ok is True
 
 
-async def test_an_open_cancelled_again_during_its_rollback_leaves_the_stage_cleanup_to_the_reaper() -> None:
+@pytest.mark.parametrize("use_placement", [False, True])
+async def test_an_open_cancelled_again_during_its_rollback_leaves_the_stage_cleanup_to_the_reaper(
+    use_placement,
+) -> None:
     """A second cancellation landing in the rollback's awaits must not orphan the Stage0 request.
 
     The runner, the reservations and the request index are already gone by
@@ -1829,7 +1875,8 @@ async def test_an_open_cancelled_again_during_its_rollback_leaves_the_stage_clea
     The rollback records the ids as a pending request cleanup before it
     awaits anything, and the reaper's retry finishes the job.
     """
-    async with Harness.create(max_sessions=1) as harness:
+    port = PlacementStagePort() if use_placement else FakeStagePort()
+    async with Harness.create(max_sessions=1, stage_port=port) as harness:
         sink = _BlockingResultSink()
         original_sink = harness.manager._result_sink
         harness.manager._result_sink = sink
@@ -1866,11 +1913,361 @@ async def test_an_open_cancelled_again_during_its_rollback_leaves_the_stage_clea
         assert harness.stage_port.cleanup_calls == [], "the cleanup await was never reached"
         key = ("sid-cancelled", 0)
         assert key in harness.manager._pending_request_cleanups
+        if isinstance(port, PlacementStagePort):
+            assert port.release_calls == ["sid-cancelled"]
+            assert port.placement.snapshot()["sessions"] == {}
 
         await harness.manager.reap_expired()
         assert harness.stage_port.cleanup_calls == [([stage0_request_id("sid-cancelled")], False)]
         assert key not in harness.manager._pending_request_cleanups
+        if isinstance(port, PlacementStagePort):
+            assert port.release_calls == ["sid-cancelled"], "late request cleanup must not release twice"
         assert (await harness.open("sid-replacement")).ok is True
+
+
+# --------------------------------------------------------------------------- #
+# Session replica reservations                                               #
+# --------------------------------------------------------------------------- #
+
+
+async def test_replica_reservation_is_held_before_plugin_await_without_exceeding_capacity() -> None:
+    port = PlacementStagePort(replicas=2)
+    async with Harness.create(stage_port=port, max_sessions=3) as harness:
+        harness.plugin.blocked_session_ids.update({"a", "b"})
+        opens = [
+            asyncio.create_task(harness.open(sid, DuplexSessionConfig(model="fake-model", instructions=sid)))
+            for sid in ("a", "b")
+        ]
+        # Both opens execute their synchronous admission before parking on the gate.
+        await asyncio.sleep(0)
+        try:
+            assert port.placement.snapshot()["sessions"] == {"a": 0, "b": 1}
+            assert harness.manager._admission_count() == 2
+            rejected = await harness.open("c")
+            assert rejected.error_code == "resource_exhausted"
+            assert "replica_capacity_exhausted" in rejected.error_message
+            assert port.release_calls == [], "a failed reserve must not release another owner"
+        finally:
+            harness.plugin.runtime_config_gate.set()
+        assert all(result.ok for result in await asyncio.gather(*opens))
+
+
+async def test_global_cap_is_not_multiplied_by_replica_count() -> None:
+    port = PlacementStagePort(replicas=2)
+    async with Harness.create(stage_port=port, max_sessions=1) as harness:
+        assert (await harness.open("a")).ok
+        assert (await harness.open("b")).error_code == "resource_exhausted"
+        assert port.reserve_calls == ["a"]
+        assert port.rejections == ["global_capacity_exhausted"]
+        assert port.placement.snapshot()["sessions"] == {"a": 0}
+
+
+@pytest.mark.parametrize("limit", [0, 1, 2])
+async def test_frontend_budget_is_atomic_without_changing_worker_config(limit) -> None:
+    port = PlacementStagePort(replicas=4, capacity=2)
+    async with Harness.create(stage_port=port, max_sessions=8, admission_limit=limit) as harness:
+        ids = [f"s{index}" for index in range(limit)]
+        harness.plugin.blocked_session_ids.update(ids)
+        opens = [
+            asyncio.create_task(harness.open(sid, DuplexSessionConfig(model="fake-model", instructions=sid)))
+            for sid in ids
+        ]
+        await asyncio.sleep(0)
+        try:
+            assert harness.manager._admission_count() == limit
+            result = await harness.open("overflow")
+            assert result.error_code == "resource_exhausted" and result.error_retryable
+            assert f"limit={limit}" in result.error_message
+            assert port.reserve_calls == ids
+            assert harness.manager.runtime_config.max_sessions == 8
+            assert harness.manager.runtime_config.worker_max_sessions == 2
+        finally:
+            harness.plugin.runtime_config_gate.set()
+        assert all(result.ok for result in await asyncio.gather(*opens))
+
+
+async def test_frontend_budget_remains_occupied_until_cleanup_finishes() -> None:
+    port = PlacementStagePort(replicas=2, capacity=2)
+    async with Harness.create(stage_port=port, max_sessions=8, admission_limit=1) as harness:
+        assert (await harness.open("a")).ok
+        port.cleanup_gate = asyncio.Event()
+        closing = asyncio.create_task(harness.close("a"))
+        await asyncio.wait_for(port.cleanup_started.wait(), timeout=1)
+        try:
+            result = await harness.open("b")
+            assert result.error_code == "resource_exhausted" and result.error_retryable
+            assert port.reserve_calls == ["a"]
+        finally:
+            port.cleanup_gate.set()
+        assert (await closing).ok
+        assert (await harness.open("b")).ok
+
+
+async def test_duplicate_open_does_not_release_an_inflight_replica_reservation() -> None:
+    port = PlacementStagePort()
+    async with Harness.create(stage_port=port) as harness:
+        harness.plugin.blocked_session_ids.add("blocked")
+        first = asyncio.create_task(harness.open("a", DuplexSessionConfig(model="fake-model", instructions="blocked")))
+        await asyncio.wait_for(harness.plugin.runtime_config_started.wait(), timeout=1)
+        assert (await harness.open("a")).error_code == "session_exists"
+        assert port.release_calls == []
+        assert port.placement.route("a", 0) == 0
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        assert port.release_calls == ["a"]
+        assert port.placement.snapshot()["sessions"] == {}
+        assert (await harness.open("b")).ok
+
+
+@pytest.mark.parametrize(
+    "failure_point",
+    ["validation", "runtime", "capabilities", "sampling", "model_state", "stage_request", "start", "result"],
+)
+async def test_each_open_failure_releases_its_replica_reservation(failure_point, monkeypatch) -> None:
+    port = PlacementStagePort()
+    async with Harness.create(stage_port=port) as harness:
+
+        def fail(*args, **kwargs):
+            raise ValueError("planned open failure")
+
+        async def fail_async(*args, **kwargs):
+            fail()
+
+        with monkeypatch.context() as patch:
+            if failure_point == "validation":
+                patch.setattr(harness.plugin, "validate_client_extra_body", fail)
+            elif failure_point == "runtime":
+                patch.setattr(harness.plugin, "prepare_runtime_config", fail_async)
+            elif failure_point == "capabilities":
+                patch.setattr(harness.plugin, "capabilities", fail)
+            elif failure_point == "sampling":
+                patch.setattr(harness.plugin, "configure_sampling_params", fail)
+            elif failure_point == "model_state":
+                patch.setattr(harness.plugin, "create_session_state", fail)
+            elif failure_point == "stage_request":
+                patch.setattr(port, "ensure_request", fail)
+            elif failure_point == "start":
+                from vllm_omni.engine.duplex.session.runner import DuplexSessionRunner
+
+                patch.setattr(DuplexSessionRunner, "start", fail)
+            else:
+                put_result = harness.manager._put_result
+
+                async def fail_success_result(message, **kwargs):
+                    if kwargs["ok"]:
+                        fail()
+                    await put_result(message, **kwargs)
+
+                patch.setattr(harness.manager, "_put_result", fail_success_result)
+            assert not (await harness.open("failed")).ok
+        assert port.release_calls == ["failed"]
+        assert port.placement.snapshot()["sessions"] == {}
+        assert harness.manager.get("failed") is None
+        assert (await harness.open("replacement")).ok
+
+
+async def test_open_cancelled_after_stage0_reservation_releases_replica_capacity() -> None:
+    port = PlacementStagePort()
+    async with Harness.create(stage_port=port) as harness:
+        original_sink = harness.manager._result_sink
+        sink = _BlockingResultSink()
+        harness.manager._result_sink = sink
+        opening = asyncio.create_task(harness.open("cancelled"))
+        await asyncio.wait_for(sink.entered.wait(), timeout=1)
+        assert port.placement.route("cancelled", 0) == 0
+        opening.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await opening
+        harness.manager._result_sink = original_sink
+        assert port.release_calls == ["cancelled"]
+        assert port.placement.snapshot()["sessions"] == {}
+        assert (await harness.open("replacement")).ok
+
+
+async def test_replica_capacity_stays_reserved_while_close_cleanup_is_blocked() -> None:
+    port = PlacementStagePort()
+    async with Harness.create(stage_port=port) as harness:
+        assert (await harness.open("a")).ok
+        port.cleanup_gate = asyncio.Event()
+        closing = asyncio.create_task(harness.close("a"))
+        await asyncio.wait_for(port.cleanup_started.wait(), timeout=1)
+        try:
+            assert port.placement.snapshot()["sessions"] == {"a": 0}
+            assert (await harness.open("b")).error_code == "resource_exhausted"
+            assert port.release_calls == []
+        finally:
+            port.cleanup_gate.set()
+        assert (await closing).ok
+        assert (await harness.close("a")).ok
+        assert port.release_calls == ["a"]
+        assert (await harness.open("b")).ok
+
+
+async def test_late_rollback_cleanup_cannot_release_a_reopened_sessions_reservation() -> None:
+    class GatedCleanupPort(PlacementStagePort):
+        def __init__(self) -> None:
+            super().__init__()
+            self.old_started = asyncio.Event()
+            self.old_gate = asyncio.Event()
+            self.new_started = asyncio.Event()
+            self.new_gate = asyncio.Event()
+
+        async def cleanup(self, request_ids: list[str], *, abort: bool = False) -> None:
+            await super().cleanup(request_ids, abort=abort)
+            if len(self.cleanup_calls) == 1:
+                self.old_started.set()
+                await self.old_gate.wait()
+            else:
+                self.new_started.set()
+                await self.new_gate.wait()
+
+    port = GatedCleanupPort()
+    async with Harness.create(stage_port=port, max_sessions=1) as harness:
+        original_sink = harness.manager._result_sink
+        sink = _BlockingResultSink()
+        harness.manager._result_sink = sink
+        opening = asyncio.create_task(harness.open("reused"))
+        await asyncio.wait_for(sink.entered.wait(), timeout=1)
+        opening.cancel()
+        await asyncio.wait_for(port.old_started.wait(), timeout=1)
+        old_cleanup = harness.manager._request_cleanup_tasks[("reused", 0)]
+        opening.cancel()  # Leave the shielded cleanup running after rollback returns.
+        with pytest.raises(asyncio.CancelledError):
+            await opening
+        harness.manager._result_sink = original_sink
+        assert port.release_calls == ["reused"]
+
+        # Both incarnations use lease generation 0 and identical request IDs.
+        assert (await harness.open("reused")).ok
+        closing = asyncio.create_task(harness.close("reused"))
+        await asyncio.wait_for(port.new_started.wait(), timeout=1)
+        new_closing = harness.manager._closing["reused"]
+        try:
+            port.old_gate.set()
+            await asyncio.wait_for(old_cleanup, timeout=1)
+            assert harness.manager._closing["reused"] is new_closing
+            assert harness.manager._request_index[stage0_request_id("reused")] == "reused"
+            assert port.placement.snapshot()["sessions"] == {"reused": 0}
+            assert port.release_calls == ["reused"], "old cleanup must not release the new reservation"
+        finally:
+            port.old_gate.set()
+            port.new_gate.set()
+        assert (await closing).ok
+        assert port.release_calls == ["reused", "reused"]
+        assert port.placement.snapshot()["sessions"] == {}
+
+
+@pytest.mark.parametrize("cleanup_kind", ["close", "expiry", "request_failure"])
+async def test_failed_cleanup_holds_replica_capacity_until_reaper_succeeds(cleanup_kind) -> None:
+    port = PlacementStagePort()
+    async with Harness.create(stage_port=port, idle_ttl_s=1) as harness:
+        assert (await harness.open("a")).ok
+        port.cleanup_failures_remaining = 1
+        if cleanup_kind == "close":
+            assert (await harness.close("a")).ok
+        elif cleanup_kind == "expiry":
+            harness.clock.advance(2)
+            await harness.manager.reap_expired()
+        else:
+            harness.manager.close_sessions_for_request_ids([stage0_request_id("a")])
+            await _settle()
+            await harness.manager.reap_expired()
+        assert port.placement.snapshot()["sessions"] == {"a": 0}
+        assert port.release_calls == []
+        assert (await harness.open("b")).error_code == "resource_exhausted"
+        await harness.manager.reap_expired()
+        assert port.release_calls == ["a"]
+        assert port.placement.snapshot()["sessions"] == {}
+        assert (await harness.open("b")).ok
+
+
+async def test_replica_failure_expires_idle_owner_and_preserves_other_group() -> None:
+    port = PlacementStagePort(replicas=2)
+    async with Harness.create(stage_port=port) as harness:
+        assert (await harness.open("a")).ok
+        assert (await harness.open("b")).ok
+        await harness.events()
+        # No request intersection can find this owner, but its placement remains.
+        harness.session("a").release_all_requests()
+        affected = port.placement.mark_unavailable(1, 0)
+        await harness.manager.fail_sessions(affected, reason="Stage-1 replica-0 died")
+        await asyncio.gather(*tuple(harness.manager._dispatched_control_tasks))
+        events = await harness.events("a")
+        assert [type(event) for event in events] == [ErrorEvent, SessionExpired]
+        assert events[0].code == "replica_unavailable"
+        assert harness.manager.get("a") is None
+        assert harness.manager.get("b") is not None
+        assert port.placement.snapshot()["sessions"] == {"b": 1}
+        assert port.placement.route("b", 1) == 1
+        assert port.release_calls == ["a"]
+
+
+async def test_failure_inside_append_does_not_await_its_own_cancellation() -> None:
+    port = PlacementStagePort()
+    async with Harness.create(stage_port=port) as harness:
+        assert (await harness.open("a")).ok
+        runner = harness.manager.runners["a"]
+        returned_from_failure = asyncio.Event()
+
+        async def append_discovering_failure() -> bool:
+            affected = port.placement.mark_unavailable(1, 0)
+            await harness.manager.fail_sessions(affected, reason="prewarm found a dead replica")
+            returned_from_failure.set()
+            await asyncio.Event().wait()
+            return True
+
+        append = asyncio.create_task(append_discovering_failure())
+        runner.tasks.track_append_task(append, epoch=0, final=False, response_bound=False)
+        await asyncio.wait_for(returned_from_failure.wait(), timeout=1)
+        await asyncio.wait_for(asyncio.gather(*tuple(harness.manager._dispatched_control_tasks)), timeout=1)
+        assert append.cancelled()
+        assert harness.manager.get("a") is None
+        assert port.placement.snapshot()["sessions"] == {}
+        assert port.release_calls == ["a"]
+
+
+async def test_downstream_failure_during_open_rolls_back_before_session_created() -> None:
+    port = PlacementStagePort()
+    async with Harness.create(stage_port=port) as harness:
+        harness.plugin.blocked_session_ids.add("blocked")
+        opening = asyncio.create_task(
+            harness.open("a", DuplexSessionConfig(model="fake-model", instructions="blocked"))
+        )
+        await asyncio.wait_for(harness.plugin.runtime_config_started.wait(), timeout=1)
+        affected = port.placement.mark_unavailable(1, 0)
+        await harness.manager.fail_sessions(affected, reason="downstream failed")
+        harness.plugin.runtime_config_gate.set()
+        result = await opening
+        assert result.error_code == "replica_unavailable"
+        assert port.release_calls == ["a"]
+        assert port.placement.snapshot()["sessions"] == {}
+        assert not any(isinstance(event, SessionCreated) for event in await harness.events("a"))
+
+
+async def test_resume_and_detach_keep_replica_reservation_until_expiry() -> None:
+    port = PlacementStagePort()
+    async with Harness.create(stage_port=port, disconnect_grace_s=1) as harness:
+        assert (await harness.open("a")).ok
+        assert (await harness.touch("a", DuplexLeaseActivity.DETACH.value)).ok
+        assert (await harness.resume("a", expected_lease_generation=0)).ok
+        assert port.reserve_calls == ["a"]
+        assert port.release_calls == []
+        assert port.placement.route("a", 0) == 0
+        assert (await harness.touch("a", DuplexLeaseActivity.DETACH.value)).ok
+        harness.clock.advance(2)
+        await harness.manager.reap_expired()
+        assert port.release_calls == ["a"]
+
+
+async def test_shutdown_releases_active_replica_reservations() -> None:
+    port = PlacementStagePort(replicas=2)
+    harness = Harness.create(stage_port=port)
+    assert (await harness.open("a")).ok
+    assert (await harness.open("b")).ok
+    await harness.manager.shutdown()
+    assert port.placement.snapshot()["sessions"] == {}
+    assert set(port.release_calls) == {"a", "b"}
 
 
 # --------------------------------------------------------------------------- #
