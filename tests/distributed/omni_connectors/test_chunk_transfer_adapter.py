@@ -60,9 +60,9 @@ def test_shm_abort_cleans_only_owned_chunks_before_id_reuse(shm_sender):
     replacement = _req("new", RequestStatus.RUNNING, external_req_id=ext_id)
     adapter.save_async(None, replacement)
     adapter._send_single_request(adapter._pending_save_reqs.popleft())
-    assert connector.get("0", "1", f"{ext_id}_0_0") is None
+    assert connector.get("0", "1", f"{ext_id}_0_0_0") is None
     adapter._send_single_request(adapter._pending_save_reqs.popleft())
-    assert connector.get("0", "1", f"{ext_id}_0_0") is not None
+    assert connector.get("0", "1", f"{ext_id}_0_0_0") is not None
     assert connector.get("0", "1", sibling_key)[0] == "sibling"
 
 
@@ -94,7 +94,7 @@ def test_shm_abort_reclaims_inflight_put_without_blocking(shm_sender, monkeypatc
     while adapter._pending_save_reqs:
         adapter._send_single_request(adapter._pending_save_reqs.popleft())
     assert not connector._pending_keys
-    assert connector.get("0", "1", f"{request.external_req_id}_0_0") is None
+    assert connector.get("0", "1", f"{request.external_req_id}_0_0_0") is None
     assert not adapter._sender_tokens
     assert not adapter.code_prompt_token_ids
 
@@ -109,18 +109,117 @@ def test_shm_release_reclaims_undrained_chunks_after_finish(shm_sender):
         adapter.save_async(None, request)
         adapter._send_single_request(adapter._pending_save_reqs.popleft())
     # The consumer read only the first chunk before its own request ended.
-    assert connector.get("0", "1", f"{ext_id}_0_0") is not None
+    assert connector.get("0", "1", f"{ext_id}_0_0_0") is not None
 
     adapter.release_shm_resources(ext_id)
     # The release is queued behind sends; nothing is unlinked on the caller.
-    assert f"{ext_id}_0_1" in connector._pending_keys
+    assert f"{ext_id}_0_0_1" in connector._pending_keys
     while adapter._pending_save_reqs:
         adapter._send_single_request(adapter._pending_save_reqs.popleft())
 
     assert adapter._reclaimed_shm_total == 2
     assert not any(k.startswith(f"{ext_id}_0_") for k in connector._pending_keys)
-    assert connector.get("0", "1", f"{ext_id}_0_1") is None
+    assert connector.get("0", "1", f"{ext_id}_0_0_1") is None
     assert connector.get("0", "1", sibling_key)[0] == "sibling"
+
+
+def _gen_request(req_id: str, status: RequestStatus, ext_id: str, gen: str):
+    """A _req whose payload_sender_info carries a transfer generation stamp."""
+    request = _req(req_id, status, external_req_id=ext_id)
+    request.payload_sender_info = {"transfer_gen": gen}
+    return request
+
+
+def test_same_ext_id_two_generations_isolated(shm_sender):
+    """Generation tokens keep a re-used external id from colliding on keys.
+
+    The old generation leaves unconsumed segments (keys {ext}_{stage}_old_),
+    its release is delayed, and the new generation (gen new_) already writes
+    and reads.  The delayed old-generation release must not touch the new
+    generation's segments or lock files, and the new generation's first poll
+    must not read the old generation's leftover chunk.
+    """
+    adapter, connector = shm_sender
+    ext_id = f"reuse_{uuid.uuid4().hex}"
+
+    # Old generation: 2 chunks put, none consumed (undrained leftovers).
+    old_req = _gen_request("old-1", RequestStatus.RUNNING, ext_id, "old")
+    adapter.save_async(None, old_req)
+    adapter.save_async(None, old_req)
+    while adapter._pending_save_reqs:
+        adapter._send_single_request(adapter._pending_save_reqs.popleft())
+    old_key = f"{ext_id}_0_old_0"
+    assert old_key in connector._pending_keys
+    # The old generation finished: its sender state is cleared (as
+    # ``finish_requests`` does in production), resetting the chunk counter —
+    # without generations the new request's keys would restart at _0 and
+    # collide with these leftovers; the token keeps them distinct.
+    adapter.cleanup_sender(ext_id)
+
+    # New generation admitted with a fresh token, puts and reads its chunk.
+    new_req = _gen_request("new-1", RequestStatus.RUNNING, ext_id, "new")
+    adapter.save_async(None, new_req)
+    while adapter._pending_save_reqs:
+        adapter._send_single_request(adapter._pending_save_reqs.popleft())
+    new_key = f"{ext_id}_0_new_0"
+    assert new_key in connector._pending_keys
+    assert connector.get("0", "1", new_key) is not None  # reads its own chunk
+
+    # The delayed old-generation release carries the OLD token: it may reap
+    # the old generation's leftovers but must not touch the new generation's
+    # segment or lock file.
+    adapter.release_shm_resources(ext_id, transfer_gen="old")
+    while adapter._pending_save_reqs:
+        adapter._send_single_request(adapter._pending_save_reqs.popleft())
+
+    assert old_key not in connector._pending_keys
+    # New generation can still put subsequent chunks under its own prefix.
+    adapter.save_async(None, new_req)
+    while adapter._pending_save_reqs:
+        adapter._send_single_request(adapter._pending_save_reqs.popleft())
+    next_key = f"{ext_id}_0_new_1"
+    assert next_key in connector._pending_keys
+    assert connector.get("0", "1", next_key) is not None
+    # Old generation's leftover (chunk 1, never drained) is gone after release.
+    assert f"{ext_id}_0_old_1" not in connector._pending_keys
+
+
+def test_sender_cleanup_drops_last_seen_generation_record(shm_sender):
+    """cleanup_sender must reclaim the last-seen-generation record with the
+    rest of the per-external-id sender state, or one dict entry leaks per
+    finished request (the record's only consumer is a bare-id release, which
+    cannot arrive once the sender state is gone)."""
+    adapter, connector = shm_sender
+    ext_id = f"genfree_{uuid.uuid4().hex}"
+    req = _gen_request("leak-1", RequestStatus.RUNNING, ext_id, "g1")
+    adapter.save_async(None, req)
+    while adapter._pending_save_reqs:
+        adapter._send_single_request(adapter._pending_save_reqs.popleft())
+    assert adapter._transfer_gen_by_ext.get(ext_id) == "g1"
+    adapter.cleanup_sender(ext_id)
+    assert ext_id not in adapter._transfer_gen_by_ext
+
+
+def test_receiver_polls_its_own_generation_not_leftovers(shm_sender):
+    """Mode B: a new generation's first poll must miss old leftovers.
+
+    The old generation's terminal chunk sits under {ext}_{stage}_old_0; the
+    new receiver polls {ext}_{stage}_new_0 and must get None (park), never
+    the stale finished marker.
+    """
+    adapter, connector = shm_sender
+    ext_id = f"modeb_{uuid.uuid4().hex}"
+
+    old_req = _gen_request("old-2", RequestStatus.RUNNING, ext_id, "old")
+    adapter.save_async(None, old_req)
+    while adapter._pending_save_reqs:
+        adapter._send_single_request(adapter._pending_save_reqs.popleft())
+    old_key = f"{ext_id}_0_old_0"
+    assert old_key in connector._pending_keys  # leftover present
+
+    # The new receiver's key differs by generation, so the poll misses it.
+    assert connector.get("0", "1", f"{ext_id}_0_new_0") is None
+    assert old_key in connector._pending_keys  # untouched by the miss
 
 
 @pytest.mark.parametrize("fail_terminal", [False, True])
@@ -139,7 +238,7 @@ def test_shm_terminal_keeps_payload_only_after_success(shm_sender, monkeypatch, 
     adapter.cleanup_sender(request.external_req_id)
     while adapter._pending_save_reqs:
         adapter._send_single_request(adapter._pending_save_reqs.popleft())
-    result = connector.get("0", "1", f"{request.external_req_id}_0_0")
+    result = connector.get("0", "1", f"{request.external_req_id}_0_0_0")
     assert (result is None) == fail_terminal
     assert not adapter._sender_tokens
 
@@ -777,7 +876,7 @@ def test_load_poll_uses_request_scoped_payload_sender_endpoint(build_adapter):
     connector.get.assert_called_once_with(
         "1",
         "2",
-        "external-1_1_0",
+        "external-1_1_0_0",
         {"source_host": "10.0.0.1", "source_port": 50051},
     )
 
@@ -799,13 +898,13 @@ def test_load_poll_keeps_concurrent_payload_sender_endpoints_distinct(build_adap
         call(
             "1",
             "2",
-            "req-2_1_0",
+            "req-2_1_0_0",
             {"source_host": "10.0.0.2", "source_port": 51051},
         ),
         call(
             "1",
             "2",
-            "req-1_1_0",
+            "req-1_1_0_0",
             {"source_host": "10.0.0.1", "source_port": 50051},
         ),
     ]
@@ -1450,7 +1549,7 @@ def test_save_async_batch_runs_processor_once_and_sends_only_payloads(build_adap
     assert [c[:2] for c in calls] == [(["ext-1", "ext-2"], [False, False])]
     assert [int(t) for t in calls[0][2]] == [1, 2]
     assert connector.put.call_count == 1
-    assert connector.put.call_args.kwargs["put_key"] == "ext-2_0_0"
+    assert connector.put.call_args.kwargs["put_key"] == "ext-2_0_0_0"
     assert adapter.put_req_chunk["ext-2"] == 1 and adapter.put_req_chunk["ext-1"] == 0
 
 
@@ -1482,7 +1581,7 @@ def test_cancel_while_batch_processor_runs_does_not_recreate_state(build_adapter
     adapter._send_single_request(adapter._pending_save_reqs.popleft())
 
     assert "ext-c" not in adapter.request_payload and "ext-c" not in adapter._sender_tokens
-    assert [c.kwargs["put_key"] for c in connector.put.call_args_list] == ["ext-k_0_0"]
+    assert [c.kwargs["put_key"] for c in connector.put.call_args_list] == ["ext-k_0_0_0"]
     assert not adapter._sender_tokens["ext-k"].in_flight
 
 
@@ -1862,7 +1961,7 @@ def test_old_turn_terminal_send_preserves_new_turn_state_and_sender(build_adapte
     assert first_sender_token.cancelled is False
 
     adapter._send_single_request(second_task)
-    assert put_keys == ["ext-live_1_0", "ext-live_1_1"]
+    assert put_keys == ["ext-live_1_0_0", "ext-live_1_0_1"]
 
 
 def test_load_poll_non_ar_merges_into_existing_additional_information(build_adapter):
@@ -2474,7 +2573,7 @@ def test_cleanup_preserves_pending_save(build_adapter):
     req_id, ext_id = "req-4", "ext-4"
     _populate_adapter_state(adapter, req_id, ext_id)
 
-    pending_task = {"put_key": f"{ext_id}_1_0", "data": {"x": 1}}
+    pending_task = {"put_key": f"{ext_id}_1_0_0", "data": {"x": 1}}
     adapter._pending_save_reqs.append(pending_task)
 
     adapter.cleanup(req_id, ext_id)
@@ -2503,7 +2602,7 @@ def test_abort_invalidates_queued_sender_task_before_external_id_reuse(build_ada
     adapter._send_single_request(current_task)
 
     connector.put.assert_called_once()
-    assert connector.put.call_args.kwargs["put_key"] == "ext-reused_1_0"
+    assert connector.put.call_args.kwargs["put_key"] == "ext-reused_1_0_0"
 
 
 def test_finish_requests_does_not_wait_for_inflight_send(build_adapter):
@@ -3086,7 +3185,7 @@ def test_parked_streaming_final_update_emits_downstream_terminal(build_adapter, 
         adapter._send_single_request(adapter._pending_save_reqs.popleft())
 
     connector.put.assert_called_once()
-    assert connector.put.call_args.kwargs["put_key"] == f"ext-parked-final_1_{int(send_first_chunk)}"
+    assert connector.put.call_args.kwargs["put_key"] == f"ext-parked-final_1_0_{int(send_first_chunk)}"
     payload = connector.put.call_args.kwargs["data"]
     assert bool(payload.meta.finished.item()) is True
     assert bool(payload.meta.is_segment_finished.item()) is False
@@ -3282,7 +3381,10 @@ def test_successful_put_keeps_terminal_chunk_sequence(build_adapter, finish_insi
     while adapter._pending_save_reqs:
         adapter._send_single_request(adapter._pending_save_reqs.popleft())
 
-    assert [call.kwargs["put_key"] for call in connector.put.call_args_list] == ["ext-sequence_1_0", "ext-sequence_1_1"]
+    assert [call.kwargs["put_key"] for call in connector.put.call_args_list] == [
+        "ext-sequence_1_0_0",
+        "ext-sequence_1_0_1",
+    ]
     assert receive_next()
     assert downstream.request_id in receiver.upstream_exhausted_requests
     assert not payloads

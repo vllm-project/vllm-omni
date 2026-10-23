@@ -155,18 +155,23 @@ class StageEngineCoreProc(EngineCoreProc):
             if release_overflowed is not None:
                 release_overflowed(request)
 
-    def omni_release_request_resources(self, request_ids: list[str]) -> None:
-        """Release this stage's inter-stage transfer resources for *request_ids*.
+    def omni_release_request_resources(self, releases: list[tuple[str, str | None]] | list[str]) -> None:
+        """Release this stage's inter-stage transfer resources for *releases*.
 
         Invoked over the UTILITY channel by the orchestrator once every stage
         has finished with the request. Idempotent and safe for unknown ids.
+        Each entry is ``(request_id, transfer_gen)``; a bare-id list (older
+        senders) is tolerated and falls back to the adapter's last-seen
+        generation for that external id ("0" once its sender state is
+        cleared).
         """
         adapter = getattr(getattr(self, "scheduler", None), "chunk_transfer_adapter", None)
         if adapter is None:
             return
-        for request_id in request_ids or ():
+        for entry in releases or ():
+            request_id, transfer_gen = entry if isinstance(entry, (tuple, list)) else (entry, None)
             try:
-                adapter.release_shm_resources(request_id)
+                adapter.release_shm_resources(request_id, transfer_gen)
             except Exception as e:
                 logger.debug("omni_release_request_resources(%s) failed: %s", request_id, e)
 

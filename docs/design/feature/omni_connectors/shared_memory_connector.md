@@ -102,7 +102,7 @@ This metadata is passed over the control plane and allows the downstream stage t
 
 #### 4.3 Locking Model
 
-To avoid races between the producer and consumer, the connector uses a lock file per request:
+To avoid races between the producer and consumer, the connector uses a lock file per transfer (one per key):
 
 ```text
 /dev/shm/shm_{put_key}_lockfile.lock
@@ -110,10 +110,32 @@ To avoid races between the producer and consumer, the connector uses a lock file
 
 Locking is done with `fcntl.flock`:
 
-- producer uses `LOCK_EX`
-- consumer uses `LOCK_EX`
+- producer uses `LOCK_EX` (blocks until acquired)
+- consumer uses `LOCK_EX | LOCK_NB` — a contended lock is not waited on: the read returns `None` and never touches the lock
 
 Both sides acquire an exclusive lock. This ensures that the shared-memory segment is not read while it is still being written and makes the handoff safer in a multi-process environment.
+
+Lock-file lifecycle: a lock file has no purpose of its own — it only serializes one transfer, and its reclamation is tied to the segment's, best-effort rather than strict co-presence: a lock may briefly exist before its segment is created and may outlive a reaped segment until a removal path runs. Removal is *attempted*, never guaranteed (failures are swallowed), on: a receiving byte read that returned successfully (`consumed` is set before deserialization, so a later deserialize failure still removes the lock); a read that acquired the lock and then found the segment already gone — both read-path removals run before `LOCK_UN` and re-check the lock file's `(st_ino, st_dev)`, so a lock recreated under the key by a later transfer is never deleted; a key-based poll whose segment is missing, reclaiming an aged orphan; a `put()` whose `shm_write_bytes` raised and left no segment under the key (a helper that raised *after* creating one keeps the lock, so the half-written segment and its lock are reclaimed together); and `cleanup()` / `close()`. Sweeping is lazy and per-process — not a background timer: `_maybe_sweep_stale_lock_files()` fires from `__init__` / `put()` / `get()` at most once per grace interval (a monotonic-clock trigger rate limit, distinct from the orphan-age test, which compares the lock file's mtime against the wall clock). The gate re-arms, so a restart inside the grace window retries young orphans on later calls; with no further calls, or if removals keep failing, no reclamation time is guaranteed. A lock whose segment was reaped externally (e.g. by `resource_tracker` at owner shutdown — itself best-effort) becomes an orphan candidate, reaped with a check–lock–recheck protocol that never touches a young, held, or live-segment lock.
+
+#### 4.4 Key Generation
+
+Connector keys carry a per-admission generation token:
+
+```text
+{external_req_id}_{stage_id}_{transfer_gen}_{chunk_id}
+```
+
+The orchestrator mints a fresh token (`uuid4().hex[:8]`) once per admission
+and stamps it into `payload_sender_info["transfer_gen"]` on every stage
+request it builds from that admission; the sending stage and the receiving
+stage read the same value off their own request objects
+(`_request_transfer_gen`), so a re-used external request id derives fresh
+keys per admission instead of replaying a previous generation's key
+sequence (a collision would need two admissions of the same id to draw the
+same 8-hex token). The orchestrator's release RPC carries the token of the
+generation it is reclaiming, so a delayed release for an old generation
+cannot match a newer generation's keys. `"0"` is the fallback for requests
+that carry no stamp (unit tests, legacy admission paths).
 
 ### 5. Put / Get Flow
 
@@ -124,7 +146,7 @@ The producer-side flow is:
 1. Serialize the input object to bytes.
 2. Compute the payload size.
 3. Acquire the per-request lock file.
-4. Write the bytes into shared memory.
+4. Write the bytes into shared memory. If this write raises, the lock file is removed while still holding it — but only when the write left no segment under the key. A helper that raises *after* creating the segment keeps the lock, so the half-written segment and its lock are reclaimed together by a later path (best-effort); failures before the lock file is created (e.g. serialization) have nothing to clean up.
 5. Return lightweight metadata to the caller.
 
 The returned tuple is:
@@ -143,7 +165,7 @@ The primary consumer path is metadata-driven:
 2. Acquire the exclusive lock.
 3. Read the raw bytes from shared memory.
 4. Deserialize the bytes back into the original Python object.
-5. Remove the lock file if it still exists.
+5. Attempt to remove the lock file while still holding it — after a byte read that returned successfully (a later deserialize failure does not change this) or after a failed read whose segment is already gone — and only after re-checking the lock file's `(st_ino, st_dev)`, so a lock file recreated under the key by a later transfer is never deleted; keep it while the segment still exists so the transfer can be retried — a read blocked on the lock never touches it.
 
 This is the path used by the current stage-to-stage connector flow.
 
@@ -155,7 +177,7 @@ The connector also keeps a compatibility path for callers that only know the key
 2. If the segment exists and has non-zero size, acquire the exclusive lock and read the bytes.
 3. Deserialize the bytes and return the object.
 
-If the segment does not exist or any exception occurs, the call returns `None` immediately. There is no retry loop in this path -- it is a single-attempt open.
+If the segment does not exist or any exception occurs, the call returns `None` immediately. There is no retry loop in this path -- it is a single-attempt open. When the segment is missing (e.g. it was reaped by `resource_tracker` after an abnormal owner exit — itself best-effort), the poll additionally tries to reclaim the orphan lock file once it is older than the 60 s grace window (age is the lock file's mtime against the wall clock; the grace protects a concurrent `put()` between its `open()` and `flock()`).
 
 This path is mainly for older code paths and is not the preferred mode for the current connector pipeline.
 
@@ -166,18 +188,13 @@ This path is mainly for older code paths and is not the preferred mode for the c
 `put()` writes every serialized payload to shared memory. The connector has no
 inline-payload path or size threshold.
 
-#### 6.2 Cleanup Is Currently Passive
+#### 6.2 Cleanup Unlinks the Exact Key
 
-`cleanup()` is currently a no-op. The intended assumption is:
+`cleanup(request_id)` attempts exact-key cleanup for the key passed to `put()` — never a request-id prefix: it pops the tracking record, tries to unlink the segment, then tries to remove the lock file — even when the segment cleanup failed, and without keeping a failure record for a later retry ("segment still exists, lock removed" is possible). It returns whether a segment was actually unlinked. The cleanup is unconditional: the key does not need to be tracked in this connector's `_pending_keys`, so a caller may also target a key it only knows by name. `cleanup_prefix()` and `close()` are the tracked-key operations: the former cleans up only tracked keys of the form `{key_prefix}{chunk_id}`, the latter drains the keys tracked at close time (§6.3). A key the consumer never reads and nobody cleans up stays allocated until the sender's `close()` — or the orphan sweep, once its segment is gone (§4.3).
 
-- the consumer reads the segment
-- the underlying shared-memory helpers unlink it
+#### 6.3 Close Drains Tracked Keys and Wakeups
 
-If the consumer never executes `get()`, the shared-memory segment may remain allocated. This means the connector relies on the normal success path for resource reclamation.
-
-#### 6.3 Close Is Currently Minimal
-
-`close()` is also a no-op. There is no connector-owned background thread, socket, or memory pool to tear down, so the lifecycle is simple. The trade-off is that `close()` does not scan or recover leaked shared-memory resources.
+`close()` snapshots the keys currently tracked in `_pending_keys`, runs the exact-key cleanup for each, then closes the receiver's wakeup FIFO. There is no connector-owned background thread or memory pool, and `close()` does not scan for or guarantee cleanup of untracked leftovers. Crash leftovers beyond the tracked keys are left to the time-gated orphan sweep (best-effort, §4.3).
 
 ### 7. Data Flow in the Pipeline
 
@@ -217,7 +234,10 @@ This is a classic split-control-plane / data-plane design, but constrained to a 
 
 - Same-node only.
 - Full object serialization and deserialization are still required.
-- Resource cleanup depends on the normal consumer path.
+- Resource reclamation is best-effort on every path: the consumer read is
+  the primary one; failed puts, dead-segment reads, the time-gated sweep,
+  and the orchestrator's release RPC cover the failure and crash paths —
+  but no path guarantees a reclamation deadline.
 - Shared memory capacity is limited by host configuration.
 
 ### 9. Summary

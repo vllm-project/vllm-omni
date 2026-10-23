@@ -19,9 +19,9 @@ class _Replica:
             self.gate.set()
         self.fail = fail
 
-    async def call_utility_async(self, method, request_ids):
+    async def call_utility_async(self, method, releases):
         assert method == "omni_release_request_resources"
-        self.calls.append(list(request_ids))
+        self.calls.append(list(releases))
         self.started.set()
         await self.gate.wait()
         if self.fail:
@@ -46,19 +46,19 @@ async def test_hung_replica_does_not_delay_healthy_replica_batches(monkeypatch, 
     warn = []
     monkeypatch.setattr("vllm_omni.engine.stage_pool.logger.warning", lambda *a: warn.append(a))
 
-    pool.schedule_release_request_resources(["a"])
-    pool.schedule_release_request_resources(["a"])
+    pool.schedule_release_request_resources([("a", None)])
+    pool.schedule_release_request_resources([("a", None)])
     await asyncio.wait_for(healthy.started.wait(), timeout=2.0)
     healthy.started.clear()
-    pool.schedule_release_request_resources(["b"])
-    pool.schedule_release_request_resources(["c", "b"])
+    pool.schedule_release_request_resources([("b", None)])
+    pool.schedule_release_request_resources([("c", None), ("b", None)])
     await asyncio.wait_for(healthy.started.wait(), timeout=2.0)
 
-    assert healthy.calls == [["a"], ["b", "c"]]
-    assert hung.calls == [["a"]]
+    assert healthy.calls == [[("a", None)], [("b", None), ("c", None)]]
+    assert hung.calls == [[("a", None)]]
 
     await _settle(pool)
-    assert hung.calls == [["a"], ["b", "c"]]
+    assert hung.calls == [[("a", None)], [("b", None), ("c", None)]]
     assert len(warn) == 2  # both of the hung replica's RPCs timed out
 
 
@@ -68,9 +68,9 @@ async def test_replica_exit_clears_pending_releases(monkeypatch, make_pool, remo
     replica = _Replica(hang=True, fail=not removed)
     pool = make_pool(replica)
 
-    pool.schedule_release_request_resources(["a"])
+    pool.schedule_release_request_resources([("a", None)])
     await asyncio.wait_for(replica.started.wait(), timeout=2.0)
-    pool.schedule_release_request_resources(["b"])
+    pool.schedule_release_request_resources([("b", None)])
     warn = []
     monkeypatch.setattr("vllm_omni.engine.stage_pool.logger.warning", lambda *a: warn.append(a))
     if removed:
@@ -78,12 +78,12 @@ async def test_replica_exit_clears_pending_releases(monkeypatch, make_pool, remo
     replica.gate.set()
     await _settle(pool)
 
-    assert replica.calls == ([["a"]] if removed else [["a"], ["b"]])
+    assert replica.calls == [[("a", None)]] if removed else [[("a", None)], [("b", None)]]
     assert not pool._pending_releases
     assert not pool._release_flushers
     replica.fail = False
-    pool.schedule_release_request_resources(["c"])
+    pool.schedule_release_request_resources([("c", None)])
     await _settle(pool)
     assert len(warn) == (0 if removed else 2)
     if not removed:
-        assert replica.calls == [["a"], ["b"], ["c"]]
+        assert replica.calls == [[("a", None)], [("b", None)], [("c", None)]]

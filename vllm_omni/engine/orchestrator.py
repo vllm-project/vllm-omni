@@ -24,6 +24,7 @@ from contextlib import asynccontextmanager, nullcontext
 from dataclasses import dataclass, field
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, cast
+from uuid import uuid4
 
 import janus
 import torch
@@ -140,6 +141,40 @@ def _build_terminal_empty_output(
     )
 
 
+def _stamp_transfer_gen(request: Any, transfer_gen: str) -> Any:
+    """Merge the admission's transfer generation into a stage request.
+
+    ``payload_sender_info`` is the one dict that survives the
+    EngineCoreRequest -> Request copy chain (request.py) and is already read
+    on both sides of every connector edge (sending: chunk adapter
+    ``save_async``; receiving: ``_LoadEntry``), so the generation token rides
+    it: sender and receiver of one edge derive the same connector keys from
+    their own request objects.  A dict argument — the freshly built
+    ``payload_sender_info`` on the mid-pipeline routing path — is stamped
+    directly.  Best-effort for objects without the attribute; the adapter
+    falls back to "0" there.
+    """
+    if transfer_gen == "0":
+        return request
+    if isinstance(request, dict):
+        request["transfer_gen"] = transfer_gen
+        return request
+    info = getattr(request, "payload_sender_info", None)
+    if isinstance(info, dict):
+        info["transfer_gen"] = transfer_gen
+    else:
+        try:
+            request.payload_sender_info = {"transfer_gen": transfer_gen}
+        except Exception:
+            pass
+    return request
+
+
+def _state_transfer_gen(state: Any) -> str:
+    """Read the admission's generation token; unstamped states read as "0"."""
+    return getattr(state, "transfer_generation", "0")
+
+
 def build_engine_core_request_from_tokens(
     request_id: str,
     prompt: dict[str, Any],
@@ -245,6 +280,12 @@ class OrchestratorRequestState:
     final_stage_id: int = -1
     # Stage the request was admitted to; > 0 when the stages before it are bypassed.
     entry_stage_id: int = 0
+
+    # Per-admission transfer-key generation token.  Connector keys embed it
+    # (chunk_transfer_adapter), so a re-used external request id derives
+    # fresh keys per admission instead of replaying an earlier generation's
+    # key sequence.
+    transfer_generation: str = "0"
     final_output_stage_ids: set[int] = field(default_factory=set)
     finished_final_output_stage_ids: set[int] = field(default_factory=set)
     finished_stage_ids: set[int] = field(default_factory=set)
@@ -750,15 +791,21 @@ class OrchestratorBase:
 
         This is the only point that knows every stage is done with the request,
         so it is the only safe place to reclaim segments a consumer never
-        drained. Queued rather than awaited: reclaim is best-effort and must
-        not add RPC latency to request teardown. Each stage pool batches the
-        release per replica, so a burst of completions costs a few RPCs and a
-        hung replica delays only its own batches.
+        drained. Each release carries the admission's generation token, so it
+        reclaims only that generation's connector keys. Queued rather than
+        awaited: reclaim is best-effort and must not add RPC latency to
+        request teardown. Each stage pool batches the release per replica, so
+        a burst of completions costs a few RPCs and a hung replica delays
+        only its own batches.
         """
         if not request_ids:
             return
+        pairs = []
+        for rid in request_ids:
+            state = self.request_states.get(rid)
+            pairs.append((rid, None if state is None else getattr(state, "transfer_generation", None)))
         for pool in self.stage_pools:
-            pool.schedule_release_request_resources(request_ids)
+            pool.schedule_release_request_resources(pairs)
 
     def _release_request_bindings(self, request_ids: list[str]) -> None:
         """Release all stage-local route bindings for the given request ids."""
@@ -2380,6 +2427,7 @@ class OrchestratorBase:
         )
         request = self._upgrade_processed_stage_request(request, prompt)
         request.external_req_id = req_id
+        _stamp_transfer_gen(request, _state_transfer_gen(req_state))
         return apply_omni_final_stage_metadata(request, req_state.final_stage_id)
 
     def _next_stage_input_is_tokens(self, next_input: Any) -> bool:
@@ -2806,6 +2854,7 @@ class OrchestratorBase:
 
             submit_kwargs = self._diffusion_submit_kwargs(req_id, src_stage_id, next_client, req_state, output)
             payload_sender_info = self._build_payload_sender_info(src_stage_id, request_id=req_id, req_state=req_state)
+            _stamp_transfer_gen(payload_sender_info, _state_transfer_gen(req_state))
             if payload_sender_info is not None:
                 submit_kwargs["payload_sender_info"] = payload_sender_info
             if already_submitted:
@@ -3225,6 +3274,7 @@ class OrchestratorBase:
                 request.payload_sender_info = self._build_payload_sender_info(
                     next_stage_id - 1, request_id=request_id, req_state=req_state
                 )
+                _stamp_transfer_gen(request, _state_transfer_gen(req_state))
                 request.external_req_id = request.request_id
                 submitted = await self._dispatch_or_fail_request(
                     lambda: next_pool.submit_initial(
@@ -3525,6 +3575,7 @@ class Orchestrator(OrchestratorBase):
             mm_features=getattr(prompt, "mm_features", None),
             request_artifact_dirs=set(msg.request_artifact_dirs or ()),
         )
+        req_state.transfer_generation = uuid4().hex[:8]
         self.request_states[request_id] = req_state
         self._maybe_attach_native_kv_transfer_params(req_state, prompt)
         self._register_running_request(req_state)
@@ -3566,6 +3617,7 @@ class Orchestrator(OrchestratorBase):
             req_state.stage_submit_ts[stage_id] = _time.time()
             if mark_submitting is not None:
                 mark_submitting()
+            _stamp_transfer_gen(prompt, _state_transfer_gen(req_state))
             if not await self._dispatch_or_fail_request(
                 lambda: self.stage_pools[stage_id].submit_initial(
                     request_id,
@@ -3654,6 +3706,7 @@ class Orchestrator(OrchestratorBase):
             final_output_stage_ids={0},
             request_timestamp=parent_state.request_timestamp,
         )
+        companion_state.transfer_generation = uuid4().hex[:8]
         self.request_states[companion_id] = companion_state
         companion_state.stage_submit_ts[0] = _time.time()
 
@@ -3664,6 +3717,7 @@ class Orchestrator(OrchestratorBase):
             if pinned_replica_id is not None:
                 self.stage_pools[0].bind_request_to_replica(companion_id, pinned_replica_id)
             route_kwargs: dict[str, Any] = {} if pinned_replica_id is None else {"pinned_replica_id": pinned_replica_id}
+            _stamp_transfer_gen(companion_prompt, _state_transfer_gen(companion_state))
             await self.stage_pools[0].submit_initial(
                 companion_id,
                 companion_state,

@@ -4,12 +4,16 @@
 
 import fcntl
 import os
+import subprocess
+import sys
 import time
 import uuid
+from multiprocessing import shared_memory as shm_pkg
 
 import pytest
 import torch
 
+from vllm_omni.distributed.omni_connectors.connectors import shm_connector as shm_conn_module
 from vllm_omni.distributed.omni_connectors.connectors.shm_connector import (
     SharedMemoryConnector,
 )
@@ -631,3 +635,530 @@ def test_reaping_keeps_consumed_records_bounded_behind_unread_keys(connector):
         assert not connector._pending_keys
     finally:
         receiver.close()
+
+
+# ── Lock-file lifecycle (issue 24 of #7636) ──────────────────────────
+
+
+class TestLockFileLifecycle:
+    """A lock file lives exactly as long as its segment — no longer.
+
+    Covers the removal paths of the lifecycle contract: successful read,
+    failed read with a dead segment, failed ``put()`` (the segment never came
+    to life), the key-based poll reclaim, and the time-gated orphan sweep for
+    leftovers of abnormally terminated processes.
+    """
+
+    @staticmethod
+    def _fresh_key() -> str:
+        return f"lc_{uuid.uuid4().hex[:8]}"
+
+    @staticmethod
+    def _lock_path(key: str) -> str:
+        return f"/dev/shm/shm_{key}_lockfile.lock"
+
+    @staticmethod
+    def _seg_path(key: str) -> str:
+        return f"/dev/shm/{key}"
+
+    @staticmethod
+    def _backdate(path: str, seconds: float = 120.0) -> None:
+        """Pretend *path* was created *seconds* ago (default grace is 60 s)."""
+        stamp = time.time() - seconds
+        os.utime(path, (stamp, stamp))
+
+    @staticmethod
+    def _force_unlink_segment(key: str) -> None:
+        seg = shm_pkg.SharedMemory(name=key)
+        seg.close()
+        seg.unlink()
+
+    def test_roundtrip_removes_lock_and_segment(self, connector):
+        key = self._fresh_key()
+        ok, _, _ = connector.put("s0", "s1", key, {"hello": "lc"})
+        assert ok
+        assert os.path.exists(self._lock_path(key))
+        assert os.path.exists(self._seg_path(key))
+
+        result = connector.get("s0", "s1", key, metadata=None)
+
+        assert result is not None and result[0] == {"hello": "lc"}
+        assert not os.path.exists(self._lock_path(key))
+        assert not os.path.exists(self._seg_path(key))
+
+    def test_put_write_failure_removes_lock_file(self, connector, monkeypatch):
+        def _boom(*args, **kwargs):
+            raise OSError("simulated segment write failure")
+
+        monkeypatch.setattr(shm_conn_module, "shm_write_bytes", _boom)
+        key = self._fresh_key()
+        ok, size, meta = connector.put("s0", "s1", key, {"x": 1})
+
+        assert (ok, size, meta) == (False, 0, None)
+        assert not os.path.exists(self._lock_path(key))
+        assert not os.path.exists(self._seg_path(key))
+
+    def test_put_failure_then_retry_succeeds(self, connector):
+        key = self._fresh_key()
+        orig = shm_conn_module.shm_write_bytes
+
+        def _boom(*args, **kwargs):
+            raise OSError("simulated segment write failure")
+
+        shm_conn_module.shm_write_bytes = _boom
+        try:
+            ok, _, _ = connector.put("s0", "s1", key, {"x": 1})
+        finally:
+            shm_conn_module.shm_write_bytes = orig
+        assert ok is False
+        assert not os.path.exists(self._lock_path(key))
+
+        ok, _, _ = connector.put("s0", "s1", key, {"x": 2})
+        assert ok
+        result = connector.get("s0", "s1", key, metadata=None)
+        assert result is not None and result[0] == {"x": 2}
+        assert not os.path.exists(self._lock_path(key))
+
+    def test_get_failure_dead_segment_removes_lock_file(self, connector):
+        """Metadata path: segment reaped under us, read fails."""
+        key = self._fresh_key()
+        _, _, meta = connector.put("s0", "s1", key, {"data": "w" * 128})
+
+        self._force_unlink_segment(key)
+
+        result = connector.get("s0", "s1", key, metadata=meta)
+        assert result is None
+        assert not os.path.exists(self._lock_path(key))
+
+    def test_get_by_key_dead_segment_reclaims_orphan_lock(self, connector):
+        """Key-based poll (the production path): reclaim the orphan lock.
+
+        ``chunk_transfer_adapter`` polls with ``source_metadata`` that never
+        carries a ``shm`` handle, so ``get(metadata=None)`` /
+        ``_get_by_key`` is the path a live receiver actually takes after the
+        sender's segment was reaped.
+        """
+        key = self._fresh_key()
+        connector.put("s0", "s1", key, {"data": "w" * 128})
+
+        self._force_unlink_segment(key)
+        self._backdate(self._lock_path(key))  # the crash was some time ago
+
+        result = connector.get("s0", "s1", key, metadata=None)
+
+        assert result is None
+        assert not os.path.exists(self._lock_path(key))
+
+    def test_get_by_key_young_orphan_keeps_lock_file(self, connector):
+        """In-flight protection: a young lock is never stolen (grace)."""
+        key = self._fresh_key()
+        try:
+            connector.put("s0", "s1", key, {"data": "y" * 128})
+            self._force_unlink_segment(key)
+
+            result = connector.get("s0", "s1", key, metadata=None)
+
+            assert result is None
+            assert os.path.exists(self._lock_path(key))  # too young to reclaim
+        finally:
+            try:
+                os.remove(self._lock_path(key))
+            except OSError:
+                pass
+
+    def test_get_deserialize_failure_after_read_removes_lock_file(self, connector, monkeypatch):
+        """Guards the consume-after-read unlink: the lock must not survive."""
+        key = self._fresh_key()
+        _, _, _ = connector.put("s0", "s1", key, {"data": "y" * 128})
+
+        def _boom(raw):
+            raise ValueError("corrupted payload")
+
+        monkeypatch.setattr(SharedMemoryConnector, "deserialize_obj", staticmethod(_boom))
+        result = connector.get("s0", "s1", key, metadata=None)
+
+        assert result is None
+        assert not os.path.exists(self._seg_path(key))  # unlinked by the read
+        assert not os.path.exists(self._lock_path(key))  # lock must not outlive it
+
+    def test_get_failure_live_segment_keeps_lock_file(self, connector, monkeypatch):
+        key = self._fresh_key()
+        _, _, _ = connector.put("s0", "s1", key, {"data": "z" * 128})
+        try:
+
+            def _boom(handle):
+                raise OSError("simulated read failure")
+
+            monkeypatch.setattr(shm_conn_module, "shm_read_bytes", _boom)
+            result = connector.get("s0", "s1", key, metadata=None)
+
+            assert result is None
+            assert os.path.exists(self._seg_path(key))
+            assert os.path.exists(self._lock_path(key))  # retry is still possible
+        finally:
+            self._force_unlink_segment(key)
+            try:
+                os.remove(self._lock_path(key))
+            except OSError:
+                pass
+
+    def test_get_blocked_lock_survives_segment_replacement_window(self, connector):
+        """Lock contention must not steal the writer's lock.
+
+        During a same-key replacement the writer holds the lock while the old
+        segment is already unlinked and the new one not yet created; a reader
+        whose flock fails in that window must leave the lock alone.
+        """
+        key = self._fresh_key()
+        lock = self._lock_path(key)
+        try:
+            _, _, meta = connector.put("s0", "s1", key, {"data": "r" * 128})
+            fd = os.open(lock, os.O_RDONLY)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX)  # the "writer" holds the lock
+                self._force_unlink_segment(key)  # old segment gone, new not yet created
+                result = connector.get("s0", "s1", key, metadata=meta)
+                assert result is None
+                assert os.path.exists(lock)  # the held lock must survive
+            finally:
+                os.close(fd)
+        finally:
+            try:
+                os.remove(lock)
+            except OSError:
+                pass
+
+    def test_sweep_removes_stale_lock_without_segment(self):
+        key = self._fresh_key()
+        lock = self._lock_path(key)
+        open(lock, "wb").close()
+        self._backdate(lock)
+
+        removed = shm_conn_module._sweep_stale_lock_files(grace=60.0)
+
+        assert removed >= 1
+        assert not os.path.exists(lock)
+
+    def test_sweep_spares_lock_with_live_segment(self):
+        key = self._fresh_key()
+        seg = shm_pkg.SharedMemory(create=True, size=8, name=key)
+        try:
+            lock = self._lock_path(key)
+            open(lock, "wb").close()
+            self._backdate(lock)
+
+            shm_conn_module._sweep_stale_lock_files(grace=60.0)
+
+            assert os.path.exists(lock)
+            assert os.path.exists(self._seg_path(key))
+        finally:
+            seg.close()
+            seg.unlink()
+            try:
+                os.remove(self._lock_path(key))
+            except OSError:
+                pass
+
+    def test_sweep_spares_fresh_lock(self):
+        key = self._fresh_key()
+        lock = self._lock_path(key)
+        open(lock, "wb").close()
+        try:
+            shm_conn_module._sweep_stale_lock_files(grace=60.0)
+            assert os.path.exists(lock)
+        finally:
+            try:
+                os.remove(lock)
+            except OSError:
+                pass
+
+    def test_sweep_spares_held_lock(self):
+        key = self._fresh_key()
+        lock = self._lock_path(key)
+        open(lock, "wb").close()
+        self._backdate(lock)
+
+        fd = os.open(lock, os.O_RDONLY)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)  # a critical section holds the lock
+            shm_conn_module._sweep_stale_lock_files(grace=60.0)
+            assert os.path.exists(lock)
+        finally:
+            os.close(fd)
+
+        shm_conn_module._sweep_stale_lock_files(grace=60.0)
+        assert not os.path.exists(lock)
+
+    def test_sweep_ignores_unrelated_files(self):
+        extras = [
+            "/dev/shm/lc_dummy.bin",
+            "/dev/shm/shm_x.lock",  # shm_ prefix but not a transfer lock file
+            "/dev/shm/plain_lockfile.lock",
+        ]
+        try:
+            for path in extras:
+                open(path, "wb").close()
+                self._backdate(path)
+
+            shm_conn_module._sweep_stale_lock_files(grace=60.0)
+
+            for path in extras:
+                assert os.path.exists(path)
+        finally:
+            for path in extras:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+
+    def test_sweep_gate_runs_at_most_once_per_grace(self, monkeypatch):
+        calls = []
+
+        def _counting_sweep(*args, **kwargs):
+            calls.append(1)
+            return 0
+
+        monkeypatch.setattr(shm_conn_module, "_sweep_stale_lock_files", _counting_sweep)
+        monkeypatch.setattr(shm_conn_module, "_last_stale_sweep", float("-inf"))
+
+        SharedMemoryConnector({})  # gate open: first sweep
+        SharedMemoryConnector({})  # inside the grace window: no sweep
+        assert len(calls) == 1
+
+        # Pretend the last sweep ran long ago: the gate must reopen.
+        monkeypatch.setattr(shm_conn_module, "_last_stale_sweep", time.monotonic() - 61.0)
+        SharedMemoryConnector({})
+        assert len(calls) == 2
+
+    def test_young_orphan_reclaimed_after_grace_via_gate(self, monkeypatch):
+        """A restart inside the grace window must not strand young orphans.
+
+        The first constructor skips the too-young orphan; once the grace
+        window really elapses, the next gated sweep reclaims it. No clock
+        faking: the grace is shrunk instead.
+        """
+        monkeypatch.setattr(shm_conn_module, "_STALE_LOCK_GRACE_SECONDS", 0.2)
+        monkeypatch.setattr(shm_conn_module, "_last_stale_sweep", float("-inf"))
+        key = self._fresh_key()
+        lock = self._lock_path(key)
+        open(lock, "wb").close()  # young orphan; its segment never existed
+        try:
+            SharedMemoryConnector({})  # sweep runs, lock is too young: kept
+            assert os.path.exists(lock)
+
+            time.sleep(0.3)  # the grace window really elapses
+            SharedMemoryConnector({})  # gated resweep reclaims it now
+            assert not os.path.exists(lock)
+        finally:
+            try:
+                os.remove(lock)
+            except OSError:
+                pass
+
+    def test_crashed_subprocess_lock_swept_by_new_process(self, monkeypatch):
+        monkeypatch.setattr(shm_conn_module, "_STALE_LOCK_GRACE_SECONDS", 0.2)
+        monkeypatch.setattr(shm_conn_module, "_last_stale_sweep", float("-inf"))
+        key = self._fresh_key()
+        lock = self._lock_path(key)
+        # The subprocess only touches the lock file (no vllm_omni import) and
+        # dies via os._exit, skipping every cleanup path — the leak from a
+        # crashed duplex process, reproduced.
+        script = "import os, sys\nopen(sys.argv[1], 'wb').close()\nos._exit(1)\n"
+        proc = subprocess.run([sys.executable, "-c", script, lock])
+        assert proc.returncode == 1
+        assert os.path.exists(lock)
+
+        time.sleep(0.3)  # the restart happens after the grace window
+        SharedMemoryConnector({})  # the new process's gated startup sweep
+
+        assert not os.path.exists(lock)
+
+    def test_known_interleaving_reader_remove_races_same_key_reuse(self, connector, monkeypatch):
+        """Pin the documented µs-interleaving residual and its self-healing.
+
+        A reader in the failure path removes the lock path while a new-round
+        writer has already opened the *same inode* — ``open()`` needs no
+        flock, and ``O_TRUNC`` reuses the inode, so neither the ``locked``
+        gate nor an inode recheck can see it. The writer then publishes a
+        segment whose lock path is gone; that round's ``get()`` returns
+        ``None`` and the sender's ``close()`` reclaims the segment. Same
+        window exists in the pre-PR success path (``if consumed:``).
+        """
+        key = self._fresh_key()
+        lock = self._lock_path(key)
+        seg_path = self._seg_path(key)
+        parked: dict[int, int] = {}
+        real_exists = os.path.exists
+
+        def _park_writer_inside_the_window(path):
+            missing = not real_exists(path)
+            # The connector's finally-block probes the SEGMENT; when it is
+            # gone, a new-round writer's open("wb+") lands right here —
+            # inside the window between the seg_gone check and os.remove().
+            if path == seg_path and missing and not parked:
+                parked["fd"] = os.open(lock, os.O_RDWR | os.O_TRUNC)
+            return real_exists(path)
+
+        monkeypatch.setattr(os.path, "exists", _park_writer_inside_the_window)
+        try:
+            _, _, meta = connector.put("s0", "s1", key, {"data": "w" * 128})
+            self._force_unlink_segment(key)  # old segment gone -> failure path
+
+            result = connector.get("s0", "s1", key, metadata=meta)
+
+            assert result is None
+            assert parked, "the writer's open() should have been injected"
+            assert not real_exists(lock)  # the reader removed the path anyway
+
+            # The parked writer completes its round on the anonymous inode.
+            fcntl.flock(parked["fd"], fcntl.LOCK_EX | fcntl.LOCK_NB)
+            shm_pkg.SharedMemory(create=True, size=16, name=key)
+            # The documented broken state: segment alive, lock path missing.
+            assert real_exists(seg_path) and not real_exists(lock)
+
+            # Self-healing: this round's data is unreadable, no exception is
+            # raised, and the sender's close() reclaims the stranded segment.
+            assert connector.get("s0", "s1", key, metadata=None) is None
+            fcntl.flock(parked["fd"], fcntl.LOCK_UN)
+            os.close(parked.pop("fd"))
+            connector.close()
+            assert not real_exists(seg_path) and not real_exists(lock)
+        finally:
+            if parked:
+                os.close(parked.pop("fd"))
+            if real_exists(seg_path):
+                self._force_unlink_segment(key)
+            if real_exists(lock):
+                os.remove(lock)
+
+    def test_same_key_reuse_storm_keeps_invariants(self, connector):
+        """Concurrent put/get hammering on ONE key must keep hard invariants.
+
+        A background thread re-``put()``s the same key while the main thread
+        keeps destroying the segment and re-reading it (the failure path that
+        removes locks). Any occurrence of the documented µs-interleaving is
+        allowed (that round's read is simply lost); what must NEVER happen:
+        exceptions, or residue left behind after ``close()``.
+        """
+        import threading
+
+        key = self._fresh_key()
+        lock = self._lock_path(key)
+        seg_path = self._seg_path(key)
+        stop = threading.Event()
+        errors: list[BaseException] = []
+
+        def _drop_segment() -> bool:
+            # Concurrency-tolerant: the writer thread may consume/recreate the
+            # segment between the existence check and the attach, and may be
+            # mid-creation (a freshly created 0-byte object mmaps as ValueError).
+            try:
+                seg = shm_pkg.SharedMemory(name=key)
+            except (FileNotFoundError, ValueError):
+                return False
+            seg.close()
+            try:
+                seg.unlink()
+            except FileNotFoundError:
+                # The writer thread's FileExistsError recovery may have
+                # unlinked the same segment between our attach and here.
+                pass
+            return True
+
+        def _writer():
+            while not stop.is_set():
+                try:
+                    connector.put("s0", "s1", key, {"round": 1})
+                except BaseException as exc:  # pragma: no cover - invariant
+                    errors.append(exc)
+                    stop.set()
+
+        thread = threading.Thread(target=_writer)
+        thread.start()
+        lost_rounds = 0
+        try:
+            for _ in range(200):
+                _drop_segment()  # force the failure path when one exists
+                result = connector.get("s0", "s1", key, metadata=None)
+                if result is None and os.path.exists(seg_path):
+                    lost_rounds += 1  # a round lost to the interleaving family
+        finally:
+            stop.set()
+            thread.join(timeout=10)
+            connector.close()
+            _drop_segment()
+            if os.path.exists(lock):
+                os.remove(lock)
+
+        assert not errors
+        assert not os.path.exists(seg_path) and not os.path.exists(lock)
+        # The interleaving is rare by construction; losing rounds is allowed,
+        # residue never. Print for visibility, do not assert on timing.
+        print(f"\nsame-key reuse storm: 200 rounds, {lost_rounds} lost rounds")
+
+    def test_put_failure_keeps_lock_when_old_segment_survives(self, connector, monkeypatch):
+        """F1: a put failure must not drop the lock when a segment exists.
+
+        The raise alone does not prove the name is empty (the FileExistsError
+        recovery may have failed to unlink, or the write may have half-created
+        a segment); a surviving segment under this name is still receivable,
+        so its lock must survive the failed put.
+        """
+        key = self._fresh_key()
+        lock = self._lock_path(key)
+        seg = shm_pkg.SharedMemory(create=True, size=64, name=key)  # old-gen segment
+        try:
+
+            def _boom(*args, **kwargs):
+                raise OSError("simulated segment write failure")
+
+            monkeypatch.setattr(shm_conn_module, "shm_write_bytes", _boom)
+            ok, _, _ = connector.put("s0", "s1", key, {"x": 1})
+
+            assert ok is False
+            assert os.path.exists(lock)  # the lock survives with the segment
+        finally:
+            seg.close()
+            try:
+                seg.unlink()
+            except FileNotFoundError:
+                pass
+            try:
+                os.remove(lock)
+            except OSError:
+                pass
+
+    def test_get_does_not_drop_lock_recreated_after_unlock(self, connector, monkeypatch):
+        """F2: removal is inode-checked and happens while we still hold the lock.
+
+        The patched read unlinks the segment (as the real one does), then
+        re-creates the lock path under a NEW inode — a later transfer that
+        took the path between our operations. Our removal must refuse to drop
+        the new lock.
+        """
+
+        key = self._fresh_key()
+        lock = self._lock_path(key)
+        try:
+            _, _, meta = connector.put("s0", "s1", key, {"data": "z" * 128})
+            real_read = shm_conn_module.shm_read_bytes
+
+            def _read_and_replace_path(handle):
+                data = real_read(handle)
+                # A new writer re-created the lock path under a fresh inode
+                # while we still hold the old one.
+                os.remove(lock)
+                open(lock, "wb").close()
+                return data
+
+            monkeypatch.setattr(shm_conn_module, "shm_read_bytes", _read_and_replace_path)
+
+            result = connector.get("s0", "s1", key, metadata=meta)
+
+            assert result is not None and result[0] == {"data": "z" * 128}
+            assert os.path.exists(lock)  # the new-generation lock survives
+        finally:
+            try:
+                os.remove(lock)
+            except OSError:
+                pass

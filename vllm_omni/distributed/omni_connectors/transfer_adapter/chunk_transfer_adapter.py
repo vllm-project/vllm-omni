@@ -34,9 +34,13 @@ _RECLAIM_WARN_INTERVAL = 1000
 class _SenderGeneration:
     """Fence one external request generation without blocking cleanup."""
 
-    def __init__(self) -> None:
+    def __init__(self, transfer_gen: str = "0") -> None:
         self.in_flight = False
         self.cancelled = False
+        # Connector-key generation stamped at admission; cleanup tasks built
+        # from this token embed it so they match only this generation's keys
+        # — a re-used external id replays no earlier key sequence.
+        self.transfer_gen = transfer_gen
         # A request-terminal chunk is queued but not yet on the wire. The
         # downstream stage has no other way to learn the stream ended -- it
         # polls the connector and parks in WAITING_FOR_CHUNK until a chunk
@@ -49,6 +53,27 @@ class _SenderGeneration:
         self.cleanup_deferred = False
         self.num_puts = 0
         self.terminal_sent = False
+
+
+def _request_transfer_gen(request: Any) -> str:
+    """Connector-key generation token for this request admission.
+
+    The orchestrator mints a fresh token per admission and stamps it into
+    ``payload_sender_info["transfer_gen"]`` on every stage request it builds
+    from that admission, so the sending stage and the receiving stage read
+    the same value off their own request objects.  Connector keys embed it,
+    so a re-used external request id derives fresh keys per admission
+    instead of replaying a previous generation's key sequence (a collision
+    would need two admissions of the same id to draw the same 8-hex token).
+    ``"0"`` is the fallback for requests that carry no stamp (unit tests,
+    legacy admission paths).
+    """
+    info = getattr(request, "payload_sender_info", None)
+    if isinstance(info, dict):
+        gen = info.get("transfer_gen")
+        if gen:
+            return str(gen)
+    return "0"
 
 
 class _LoadEntry:
@@ -153,6 +178,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         # segment's queued or in-flight work after the same request id resumes.
         self._registered_load_entries: dict[str, _LoadEntry] = {}
         self._sender_tokens: dict[str, _SenderGeneration] = {}
+        # Last-seen connector-key generation per external id; the release
+        # fallback uses it when the release payload carries no token.
+        self._transfer_gen_by_ext: dict[str, str] = {}
         self.scheduler_max_num_seqs = vllm_config.scheduler_config.max_num_seqs
         (
             self._max_model_len,
@@ -526,7 +554,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             else:
                 self.requests_num_chunks_sent[external_req_id] = confirmed_num_computed_tokens
                 if sender_token is None:
-                    sender_token = _SenderGeneration()
+                    sender_token = _SenderGeneration(transfer_gen=_request_transfer_gen(request))
                     self._sender_tokens[external_req_id] = sender_token
                 task["sender_token"] = sender_token
                 if is_finished:
@@ -563,7 +591,8 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             external_req_id = entry.external_req_id
             self.request_ids_mapping[req_id] = external_req_id
             chunk_id = self.get_req_chunk[req_id]
-        connector_get_key = f"{external_req_id}_{target_stage_id}_{chunk_id}"
+            transfer_gen = _request_transfer_gen(request)
+        connector_get_key = f"{external_req_id}_{target_stage_id}_{transfer_gen}_{chunk_id}"
 
         # Use timeout=0 for non-blocking poll
         try:
@@ -912,7 +941,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         next_stage_id = stage_id + 1
         external_req_id = request.external_req_id
         chunk_id = self.put_req_chunk[external_req_id]
-        connector_put_key = f"{external_req_id}_{stage_id}_{chunk_id}"
+        transfer_gen = _request_transfer_gen(request)
+        self._transfer_gen_by_ext[external_req_id] = transfer_gen
+        connector_put_key = f"{external_req_id}_{stage_id}_{transfer_gen}_{chunk_id}"
         # Process payload in save_loop thread
         payload_data: OmniPayloadStruct | None = None
         if "payload" in task:
@@ -1162,7 +1193,12 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             and not sender_token.terminal_sent
         ):
             self._pending_save_reqs.append(
-                {"cleanup_shm": (f"{external_req_id}_{self.connector.stage_id}", sender_token.num_puts)}
+                {
+                    "cleanup_shm": (
+                        f"{external_req_id}_{self.connector.stage_id}_{sender_token.transfer_gen}",
+                        sender_token.num_puts,
+                    )
+                }
             )
             with self._save_cond:
                 self._save_cond.notify()
@@ -1179,12 +1215,16 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.ramp_chunk_count.pop(external_req_id, None)
         self._adaptive_states.pop(external_req_id, None)
         self._pending_streaming_prefills.pop(external_req_id, None)
+        # The last-seen generation served any bare-id release that could
+        # arrive while this state lived; keeping it past the request would
+        # leak one entry per finished external id.
+        self._transfer_gen_by_ext.pop(external_req_id, None)
 
         cached_ic = getattr(self, "_cached_ic", None)
         if cached_ic is not None:
             cached_ic.pop(external_req_id, None)
 
-    def release_shm_resources(self, request_id: str) -> None:
+    def release_shm_resources(self, request_id: str, transfer_gen: str | None = None) -> None:
         """Queue reclaim of inter-stage segments this request left unconsumed.
 
         Safe only once every stage has finished with the request: the producer
@@ -1200,7 +1240,8 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         if not isinstance(self.connector, SharedMemoryConnector):
             return
         external_req_id = self.request_ids_mapping.get(request_id, request_id)
-        self._pending_save_reqs.append({"release_shm": f"{external_req_id}_{self.connector.stage_id}_"})
+        gen = transfer_gen if transfer_gen is not None else self._transfer_gen_by_ext.get(external_req_id, "0")
+        self._pending_save_reqs.append({"release_shm": f"{external_req_id}_{self.connector.stage_id}_{gen}_"})
         with self._save_cond:
             self._save_cond.notify()
 
