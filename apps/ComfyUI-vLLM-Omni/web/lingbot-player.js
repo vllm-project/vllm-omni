@@ -1,0 +1,285 @@
+// Adapted from vLLM-Omni's Apache-2.0 streaming_video_generation/video-stream-view.js.
+// Copyright contributors to the vLLM-Omni project.
+
+// Save hands the received fMP4 fragments to the browser as one MP4 download.
+const MAX_RECORDED_BYTES = 256 * 1024 * 1024;
+
+export function cameraEvent(keys, eventId, { fps = 16, speed = 1 } = {}) {
+  if (!Number.isFinite(fps) || fps <= 0 || !Number.isFinite(speed) || speed < 0) {
+    throw new Error("Camera FPS must be positive and speed must be non-negative.");
+  }
+  // The current camera API integrates once per latent frame. LingBot
+  // expands each steady-state latent into four output frames.
+  const controlFps = fps / 4;
+  const step = 0.2 * speed / controlFps;
+  const dx = Number(keys.has("d")) - Number(keys.has("a"));
+  const dz = Number(keys.has("w")) - Number(keys.has("s"));
+  const length = Math.max(1, Math.hypot(dx, dz));
+  const pitch = 16 * speed / controlFps * (Number(keys.has("i")) - Number(keys.has("k"))) * Math.PI / 360;
+  const yaw = 24 * speed / controlFps * (Number(keys.has("l")) - Number(keys.has("j"))) * Math.PI / 360;
+  return {
+    type: "session.interaction",
+    interaction: {
+      event_id: eventId,
+      event: { multi_modal_data: { camera: {
+        mode: "velocity",
+        data: {
+          translation: [step * dx / length, 0, step * dz / length],
+          rotation: [Math.cos(yaw) * Math.sin(pitch), Math.sin(yaw) * Math.cos(pitch),
+            -Math.sin(yaw) * Math.sin(pitch), Math.cos(yaw) * Math.cos(pitch)],
+        },
+      } } },
+    },
+  };
+}
+
+export class VideoSession {
+  constructor(video, report) {
+    this.video = video;
+    this.report = report;
+    this.playbackStarted = false;
+    this.startupBufferSeconds = 1;
+    this.ws = null;
+    this.source = null;
+    this.buffer = null;
+    this.url = null;
+    this.queue = [];
+    this.queuedBytes = 0;
+    this.done = false;
+    this.stopping = false;
+    this.ready = false;
+    this.stopTimer = null;
+    this.startTimer = null;
+    this.pingTimer = null;
+    this.playbackTimer = null;
+    this.lastPlaybackPosition = -1;
+    this.lastProgress = 0;
+    // The take is kept so Save can hand it to the browser as a download.
+    this.recorded = [];
+    this.recordedBytes = 0;
+    this.recordingTruncated = false;
+    // Session identity and progress, read by the interaction panel's stats line.
+    this.requestId = null;
+    this.chunkIndex = null;
+    this.framesReceived = 0;
+    video.addEventListener("play", () => {
+      if (this.source) this.playbackStarted = true;
+    });
+    video.addEventListener("error", () => {
+      if (this.source) this.fail(video.error?.message || "Video loading failed; check the page's media security policy.");
+    });
+    video.addEventListener("ended", () => {
+      if (this.source && this.done && !this.stopping) this.report("Playback complete.");
+    });
+  }
+
+  start(config) {
+    this.dispose();
+    this.recorded = [];
+    this.recordedBytes = 0;
+    this.recordingTruncated = false;
+    this.requestId = null;
+    this.chunkIndex = null;
+    this.framesReceived = 0;
+    if (location.protocol === "https:" && !config.url.startsWith("wss://")) {
+      throw new Error("An HTTPS ComfyUI page requires a wss:// Omni endpoint.");
+    }
+    const mime = ['video/mp4; codecs="avc1.42E01E"', 'video/mp4; codecs="avc1.4D401F"',
+      'video/mp4; codecs="avc1.64001F"'].find(m => window.MediaSource?.isTypeSupported(m));
+    if (!mime) throw new Error("This browser does not support H.264 Media Source Extensions.");
+    this.done = false;
+    this.stopping = false;
+    this.ready = false;
+    this.lastProgress = Date.now();
+    const source = this.source = new MediaSource();
+    this.url = URL.createObjectURL(source);
+    this.video.src = this.url;
+    this.video.autoplay = false;
+    const fps = config.payload.fps || 16;
+    // The server holds the next chunk back when it would push generated media past
+    // this window, so the window must cover the first chunk plus one more, or the
+    // player never buffers enough to start and the session idles out.
+    const windowSeconds = config.payload.streaming_buffer_seconds ?? 1.5;
+    // Start once the first chunk is in: waiting for more than one chunk can deadlock,
+    // because the server holds the next chunk back until playback advances.
+    this.startupBufferSeconds = Math.min(0.5, Math.max(0.25, windowSeconds / 3));
+    this.startTimer = setTimeout(() => this.fail("Timed out opening the video connection."), 15000);
+    source.addEventListener("sourceopen", () => {
+      if (this.source !== source) return;
+      try {
+        this.buffer = source.addSourceBuffer(mime);
+        this.buffer.addEventListener("updateend", () => {
+          if (this.source === source) this.pump();
+        });
+        this.buffer.addEventListener("error", () => {
+          if (this.source === source) this.fail("The browser could not decode the video stream.");
+        });
+        const ws = this.ws = new WebSocket(config.url);
+        ws.binaryType = "arraybuffer";
+        ws.onopen = () => {
+          if (this.ws !== ws) return;
+          clearTimeout(this.startTimer);
+          this.send(config.keyboard
+            ? { ...config.payload, streaming_buffer_seconds: config.payload.streaming_buffer_seconds ?? 1.5 }
+            : config.payload);
+          this.pingTimer = setInterval(() => this.send({ type: "session.ping" }), 20000);
+          if (config.keyboard) this.playbackTimer = setInterval(() => this.sendPlayback(), 100);
+          this.report("Generating the first chunk…");
+        };
+        ws.onmessage = ({ data }) => {
+          if (this.ws !== ws) return;
+          this.lastProgress = Date.now();
+          if (typeof data === "string") {
+            try { this.control(JSON.parse(data)); }
+            catch (error) { this.fail(error.message); }
+          } else {
+            // Keep the bytes even after generation is done, so Save can download the whole take.
+            this.capture(data);
+            if (!this.done && !this.stopping) {
+              this.queue.push(data);
+              this.queuedBytes += data.byteLength;
+              // Guard bytes that have not yet reached MSE, independently of playback feedback.
+              if (this.queuedBytes > 32 * 1024 * 1024) this.fail("Video backlog exceeded 32 MiB; restart with fewer frames.");
+              else this.pump();
+            }
+          }
+        };
+        ws.onerror = () => { if (this.ws === ws) this.fail("WebSocket failed; check the Omni address and server log."); };
+        ws.onclose = () => {
+          if (this.ws !== ws) return;
+          this.ready = false;
+          if (!this.done) this.fail(this.stopping ? "Stopped (connection closed)." : "Connection lost; start a new session.");
+        };
+      } catch (error) { this.fail(error.message); }
+    }, { once: true });
+  }
+
+  control(message) {
+    if (typeof message.request_id === "string") this.requestId = message.request_id;
+    if (message.type === "error") {
+      const detail = message.message || "Server error";
+      // A control that lost the race with the end of the session is not a
+      // failure the viewer can act on; the take is already complete.
+      if (this.done || this.stopping) {
+        this.report(`Ignored after the session ended: ${detail}`);
+        return;
+      }
+      // Only hint at the camera API when the server actually refused it.
+      const camera = /camera|interaction/i.test(detail) ? " Keyboard mode requires Omni camera interaction support." : "";
+      this.fail(`${detail}.${camera}`);
+    } else if (message.type === "video.chunk_metadata") {
+      if (message.kind === "media") {
+        this.ready = !this.stopping;
+        if (Number.isInteger(message.generation_chunk_index)) this.chunkIndex = message.generation_chunk_index;
+        if (Number.isFinite(message.num_frames)) this.framesReceived += message.num_frames;
+        const applied = message.started_event_ids || [];
+        this.report(`Chunk ${message.generation_chunk_index ?? "?"} received` +
+          (applied.length ? `; applied: ${applied.join(", ")}` : ""));
+      }
+    } else if (message.type === "session.interaction.queued") {
+      this.report(`Queued: ${message.event_id}`);
+    } else if (message.type === "session.done") {
+      clearTimeout(this.stopTimer);
+      clearInterval(this.pingTimer);
+      clearInterval(this.playbackTimer);
+      this.done = true;
+      this.ready = false;
+      this.report(message.stopped ? "Stopped." : "Generation complete; playing remaining video.");
+      this.pump();
+      this.ws.close();
+    }
+  }
+
+  sendPlayback() {
+    const position = this.video.currentTime;
+    if (!this.ready || this.done || this.stopping || !Number.isFinite(position) || position < 0 || position <= this.lastPlaybackPosition) return;
+    if (this.send({ type: "session.playback", position_seconds: position })) this.lastPlaybackPosition = position;
+  }
+
+  send(message) {
+    if (this.ws?.readyState !== WebSocket.OPEN) return false;
+    this.ws.send(JSON.stringify(message));
+    return true;
+  }
+
+  pump() {
+    if (!this.buffer || this.buffer.updating || this.source?.readyState !== "open") return;
+    try {
+      // Let MSE manage coded-frame eviction. Arbitrary time-based removal
+      // can discard the only keyframe and all later dependent frames.
+      if (this.queue.length) {
+        const data = this.queue.shift();
+        this.queuedBytes -= data.byteLength;
+        this.buffer.appendBuffer(data);
+      } else if (this.done) this.source.endOfStream();
+      this.playWhenBuffered();
+    } catch (error) { this.fail(error.message); }
+  }
+
+  playWhenBuffered() {
+    if (this.playbackStarted || this.stopping || !this.video.buffered?.length) return;
+    const ahead = this.video.buffered.end(this.video.buffered.length - 1) - this.video.currentTime;
+    if (!this.done && ahead < this.startupBufferSeconds) return;
+    this.playbackStarted = true;
+    const source = this.source;
+    this.video.play().catch(error => {
+      if (this.source === source && error.name === "NotAllowedError") this.report("Click the video play button to allow playback.");
+    });
+  }
+
+  // Save keeps the fMP4 bytes this client received, capped so a long session cannot exhaust memory.
+  capture(data) {
+    if (!(data instanceof ArrayBuffer)) return;
+    if (this.recordedBytes + data.byteLength > MAX_RECORDED_BYTES) {
+      this.recordingTruncated = true;
+      return;
+    }
+    this.recorded.push(data);
+    this.recordedBytes += data.byteLength;
+  }
+
+  recordingBlob() {
+    return this.recorded.length ? new Blob(this.recorded, { type: "video/mp4" }) : null;
+  }
+
+  stop() {
+    this.ready = false;
+    if (this.stopping || this.done) return;
+    this.stopping = true;
+    if (this.send({ type: "session.stop" })) {
+      this.report("Stopping…");
+      this.stopTimer = setTimeout(() => this.fail("Stop timed out; connection closed."), 5000);
+    } else this.fail("Stopped.");
+  }
+
+  fail(message) {
+    this.dispose();
+    this.done = true;
+    this.report(message);
+  }
+
+  dispose() {
+    this.playbackStarted = false;
+    clearTimeout(this.startTimer);
+    clearTimeout(this.stopTimer);
+    clearInterval(this.pingTimer);
+    clearInterval(this.playbackTimer);
+    this.lastPlaybackPosition = -1;
+    const ws = this.ws;
+    this.ws = null;
+    if (ws) {
+      if (ws.readyState === WebSocket.OPEN && !this.done) ws.send(JSON.stringify({ type: "session.stop" }));
+      ws.close();
+    }
+    this.ready = false;
+    this.source = null;
+    this.buffer = null;
+    this.queue = [];
+    this.queuedBytes = 0;
+    this.video.pause();
+    this.video.removeAttribute("src");
+    this.video.load();
+    if (this.url) URL.revokeObjectURL(this.url);
+    this.url = null;
+  }
+}

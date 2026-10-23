@@ -50,6 +50,7 @@ This extension offers the following nodes based on the output modalities (at **C
 - **Generate Image** for text-to-image and image-to-image tasks
 - **Generate Video** for text-to-video, first-frame/image-to-video, and reference-conditioned video
 - **Latent Mask Editing** for MiniMax-H3 latent-mask editing (source media plus video/audio noise masks)
+- **LingBot World** for first-image world generation: a live keyboard-driven session, or shots chained into one rendering with camera moves drawn in the node; see the [LingBot guide](docs/lingbot-world.md)
 - **FastH3 Deployment** for routing text-to-video requests to a MiniMax-H3 server with FastH3 fused at startup
 - **Multimodality Understanding** for multimodality-to-text and multimodality-to-audio tasks
 - **TTS** and **TTS Voice Clone** for TTS tasks
@@ -64,7 +65,7 @@ Every node carries the vLLM-Omni mark in its title bar and is tinted by what it 
 
 | Colour | Nodes | What they produce |
 | --- | --- | --- |
-| Blue | Generate Image, Generate Video, Multimodality Understanding, TTS, TTS Voice Clone | A generated image, video, audio, or text. These are the only nodes that reach a server. |
+| Blue | Generate Image, Generate Video, Multimodality Understanding, TTS, TTS Voice Clone, LingBot World | Generation requests and interactive sessions. The LingBot realtime node starts from its panel; the Render node runs with the workflow. |
 | Amber | AR / Diffusion / Multi-Stage Sampling Params | Sampling parameters that apply to any model |
 | Purple | Qwen TTS Params, Wan Video Params, MiniMax-H3 Video Params | Parameters that only one model family accepts |
 | Red | LoRA, FastH3 Deployment | Which weights the server is expected to have loaded |
