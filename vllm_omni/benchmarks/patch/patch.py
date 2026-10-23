@@ -274,18 +274,34 @@ def _duplex_stall_reason(result: object) -> str | None:
     return None
 
 
+def _duplex_reported_error(result: object) -> str:
+    """Return the part of ``result.error`` that the transport timeouts do not explain.
+
+    ``generate_sample`` folds ``drain_timeout``/``close_timeout`` into
+    ``result.error``, so a merely stalled session reports a non-empty error too.
+    Strip the recorded timeout strings: whatever is left is a failure the
+    session reported (a server error, a response that did not complete), not the
+    stall itself.
+    """
+    metadata = getattr(result, "metadata", None) or {}
+    error = str(getattr(result, "error", "") or "")
+    for key in ("drain_timeout", "close_timeout"):
+        value = metadata.get(key)
+        if value:
+            error = error.replace(str(value), "")
+    return error.strip().strip(";").strip()
+
+
 def _duplex_retryable_stall(result: object) -> str | None:
     """Return the stall worth retrying, if any.
 
-    Only a client-side timeout is retried. ``generate_sample`` folds
-    ``drain_timeout``/``close_timeout`` into ``result.error``, so that string
-    cannot separate a stall from a reported failure; the separately recorded
-    ``server_errors`` entry does. A session that hit a server error is a
-    deterministic failure, and retrying it could turn a reported error into a
-    pass.
+    Only a client-side timeout that came alone is retried. Anything the session
+    reported — a ``server_errors`` entry or any other recorded failure in
+    ``result.error`` — gets exactly one attempt: it is a deterministic failure,
+    and retrying it could turn a reported error into a pass.
     """
     metadata = getattr(result, "metadata", None) or {}
-    if metadata.get("server_errors"):
+    if metadata.get("server_errors") or _duplex_reported_error(result):
         return None
     for key in ("drain_timeout", "close_timeout"):
         value = metadata.get(key)

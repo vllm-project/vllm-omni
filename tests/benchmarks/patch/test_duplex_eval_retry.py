@@ -209,21 +209,29 @@ async def test_missing_response_is_not_retried(monkeypatch) -> None:
     assert output.error == "no completed response"
 
 
-async def test_server_error_with_a_drain_timeout_is_not_retried(monkeypatch) -> None:
-    """A reported server failure stays a single attempt, timeout or not.
+@pytest.mark.parametrize(
+    ("timeout_key", "timeout_text"),
+    [
+        ("drain_timeout", "Timed out waiting for response.done"),
+        ("close_timeout", "Timed out closing the duplex session after 20s"),
+    ],
+)
+async def test_server_error_with_a_transport_timeout_is_not_retried(monkeypatch, timeout_key, timeout_text) -> None:
+    """A reported server failure stays a single attempt, whichever timeout rode with it.
 
-    ``generate_sample`` folds ``drain_timeout`` into ``result.error``, so this is
-    the shape the runner actually produces when the server errors mid-turn and
-    never sends ``response.done``.
+    ``generate_sample`` folds both ``drain_timeout`` and ``close_timeout`` into
+    ``result.error``, so a retry policy has to look at the separately recorded
+    ``server_errors`` entry: a ``session.close`` that never lands looks exactly
+    like a drain that never finished.
     """
     clock = _FakeClock()
     failed = _session_result(
         {
             "response_done": False,
-            "drain_timeout": "Timed out waiting for response.done",
+            timeout_key: timeout_text,
             "server_errors": ["{'type': 'error', 'error': {'code': 'invalid_audio'}}"],
         },
-        error=("{'type': 'error', 'error': {'code': 'invalid_audio'}}; Timed out waiting for response.done"),
+        error=f"{{'type': 'error', 'error': {{'code': 'invalid_audio'}}}}; {timeout_text}",
     )
     returned = iter([failed])
 
@@ -238,3 +246,32 @@ async def test_server_error_with_a_drain_timeout_is_not_retried(monkeypatch) -> 
     assert next(returned, None) is None
     assert output.success is False
     assert "invalid_audio" in output.error
+
+
+async def test_reported_error_beside_a_transport_timeout_is_not_retried(monkeypatch) -> None:
+    """Any recorded failure besides the timeout keeps the sample at one attempt.
+
+    Not every reported failure lands in ``metadata["server_errors"]``: a
+    ``response.done`` whose status is not ``completed`` is recorded in
+    ``result.error`` only. It is a deterministic failure too, so the timeout it
+    came with must not buy it a second attempt.
+    """
+    clock = _FakeClock()
+    timeout_text = "Timed out waiting for response.done"
+    failed = _session_result(
+        {"response_done": False, "drain_timeout": timeout_text},
+        error=f"Response did not complete: {{'id': 'r1', 'status': 'failed'}}; {timeout_text}",
+    )
+    returned = iter([failed])
+
+    async def generate_sample(*_args, **_kwargs):
+        clock.advance(_SESSION_S)
+        return next(returned)
+
+    _install_fakes(monkeypatch, clock, generate_sample)
+    output = await patch._async_request_duplex_eval(_request(), pbar=None)
+
+    assert output.duplex_retries == 0
+    assert next(returned, None) is None
+    assert output.success is False
+    assert "did not complete" in output.error
