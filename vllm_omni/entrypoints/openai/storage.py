@@ -111,7 +111,8 @@ class LocalStorageManager(StorageBaseManager[FileStorageHandle]):
     def get_full_file_path(self, file_name: str) -> str:
         full = os.path.realpath(os.path.join(self.storage_path, file_name))
 
-        if os.path.commonpath([self.storage_path, full]) != self.storage_path:
+        # realpath + startswith is the containment check CodeQL recognizes.
+        if not full.startswith(os.path.join(self.storage_path, "")):
             raise ValueError(f"Illegal storage key: {file_name!r}")
 
         return full

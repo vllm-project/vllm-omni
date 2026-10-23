@@ -1474,6 +1474,7 @@ def test_api_topology_rejects_inconsistent_launch(requested, config):
         ("GET", "/v1/videos"),
         ("GET", "/v1/videos/job"),
         ("GET", "/v1/videos/job/content"),
+        ("GET", "/v1/videos/job/content?variant=lidar"),
         ("DELETE", "/v1/videos/job"),
     ],
 )
