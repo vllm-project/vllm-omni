@@ -469,18 +469,18 @@ Complete examples in the codebase:
 
 ---
 
-## Spatially-Sharded Decode (Wan)
+## Spatially-Sharded Decode and Encode (Wan)
 
-The tile-parallel executor above assigns independent spatial **tiles** to ranks. The Wan VAE additionally supports a **spatially-sharded decode** backend, selected through `DiffusionParallelConfig.vae_parallel_mode` (`"spatial_shard_height"` or `"spatial_shard_width"`; default is `"tile"`).
+The tile-parallel executor above assigns independent spatial **tiles** to ranks. The Wan VAE additionally supports a **spatially-sharded** backend, selected through `DiffusionParallelConfig.vae_parallel_mode` (`"spatial_shard_height"` or `"spatial_shard_width"`; default is `"tile"`).
 
 ### How it differs from tile parallel
 
 | Aspect | Tile parallel (`"tile"`) | Spatially-sharded (`"spatial_shard_height"`/`"spatial_shard_width"`) |
 | -------- | -------------------------- | ----------------------------------------------- |
 | Unit of work | Independent overlapping tiles | A single global feature map sharded along H or W |
-| Cross-rank communication | Gather tiles to rank 0, stitch + blend | Per-conv **halo exchange** of boundary rows/cols (P2P) |
-| Output assembly | Blend overlapping tiles | All-gather shards on rank 0, trim padding (matches `broadcast_result=False`) |
-| Scope | Decode + encode | Decode only |
+| Cross-rank communication | Gather tiles to rank 0, stitch + blend | Per-conv **halo exchange** of boundary rows/cols (P2P; one all-gather on XPU, where XCCL point-to-point latency dominates) |
+| Output assembly | Blend overlapping tiles | Decode: all-gather shards on rank 0, trim padding (matches `broadcast_result=False`). Encode: all-gather on every rank |
+| Scope | Decode + encode | Decode + encode (encode only for stride-aligned shapes) |
 
 Spatial-shard decode swaps the decoder's spatial convolutions/padding for halo-exchanging variants (`WanDistConv2d`, `WanDistCausalConv3d`, `WanDistZeroPad2d`) so each rank only holds a shard of the activations but still sees the correct receptive field at shard boundaries. Implementation lives in `vllm_omni/diffusion/distributed/autoencoders/wan_spatial_shard.py`.
 
@@ -493,15 +493,18 @@ serve.py (--vae-parallel-mode) / OmniEngineArgs
   -> DiffusionParallelConfig.vae_parallel_mode
   -> registry.py: model.vae.set_parallel_size(vae_pp_size, mode=...)
   -> DistributedVaeExecutor.parallel_mode
-  -> DistributedAutoencoderKLWan.tiled_decode dispatch
+  -> DistributedAutoencoderKLWan._decode / _encode dispatch (before the native-tiling check)
 ```
 
 `DistributedAutoencoderKLWan._spatial_shard_decode_enabled()` gates the path: it requires distributed decode to be enabled, a 5D latent, and `vae_patch_parallel_size == DiT group size`. Otherwise it logs a warning and falls back to tile-parallel decode.
 
+`_spatial_shard_encode_enabled()` gates encode the same way and additionally requires the split extent to be divisible by `world_size * 2**downsamples`, so every shard stays even before each stride-2 convolution and needs no padding; it also stands aside when the Wan encoder fast path is installed. Otherwise encode takes the regular path (tile-parallel when `use_tiling` is set).
+
 ### Notes
 
 - The decoder is patched **in place** the first time spatial-shard decode runs and is bound to a single split dimension for the lifetime of the VAE instance.
-- Numerical correctness vs. single-GPU decode is covered by `tests/diffusion/distributed/test_wan_spatial_shard.py::test_spatial_shard_decode_matches_reference` (multi-GPU, nightly `full_model` + `cards_2`).
+- Encode runs on a parameter-sharing copy of the encoder kept outside the module tree, so `state_dict` is unchanged and the original encoder still serves the tile fallback.
+- Numerical correctness vs. single-GPU decode/encode is covered by `tests/diffusion/distributed/test_wan_spatial_shard.py::test_spatial_shard_decode_matches_reference` and `::test_spatial_shard_encode_matches_untiled_reference` (multi-GPU, nightly `full_model` + `cards_2`), and for encode on CPU by `::test_spatial_shard_encode_matches_untiled_encode`.
 
 ---
 
