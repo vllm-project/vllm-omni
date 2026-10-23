@@ -322,17 +322,14 @@ def test_hunyuan_image3_pd_structured_config_projects_vllm_kv_transfer() -> None
     assert decode.scheduler_config.enable_chunked_prefill is True
     assert prefill.cache_config.enable_prefix_caching is False
     assert decode.cache_config.enable_prefix_caching is False
-    for stage, role, rank, port in [
-        (prefill, "kv_producer", 0, 25201),
-        (decode, "kv_consumer", 1, 25202),
+    for stage, role, port in [
+        (prefill, "kv_producer", 25201),
+        (decode, "kv_consumer", 25202),
     ]:
         kv_config = stage.connector_config.kv_transfer_config
         assert kv_config is not None
         assert kv_config.kv_connector == "MooncakeConnector"
         assert kv_config.kv_role == role
-        assert kv_config.kv_rank == rank
-        assert kv_config.kv_parallel_size == 2
-        assert kv_config.kv_ip == "127.0.0.1"
         assert kv_config.kv_connector_extra_config == {"mooncake_bootstrap_port": port}
 
     prefill_args = build_engine_args_dict_from_omni_stage_config(prefill, "dummy-model")

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """CPU generator/wire tests; actual NPU sampler validation runs on the server."""
 
 from types import SimpleNamespace
@@ -269,7 +269,7 @@ def test_schedule_wrapper_transfers_rng_to_worker(monkeypatch, scheduler_cls):
     monkeypatch.setattr(Scheduler, "schedule", lambda self, throttle_prefills=False: upstream, raising=False)
     scheduler = scheduler_cls.__new__(scheduler_cls)
     scheduler.requests = {"req": request}
-    scheduler.max_num_running_reqs = 1
+    scheduler.max_num_active_reqs = 1
     scheduler.waiting, scheduler.running = [], []
     scheduler.chunk_transfer_adapter = scheduler.input_coordinator = None
     scheduler._finish_pd_terminal_receives = Mock()

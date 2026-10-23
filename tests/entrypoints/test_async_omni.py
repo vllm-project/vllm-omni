@@ -188,6 +188,7 @@ def test_generate_propagates_bare_sampling_params_to_pd_decode():
         omni = get_async_omni_instance(fake_add_request=fake_add_request)
         omni.engine.num_stages = 3
         omni.engine.stage_configs = [SimpleNamespace(stage_id=i) for i in range(3)]
+        omni.sampling_constraints_list = [{}, {}, {}]
         omni._pd_separation_pair = (0, 1)
         decode_default = SamplingParams(max_tokens=8192, temperature=0.9)
         diffusion_default = SimpleNamespace(num_inference_steps=50)

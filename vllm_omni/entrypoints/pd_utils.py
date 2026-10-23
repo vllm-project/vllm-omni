@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """PD (Prefill-Decode) disaggregation helpers.
 
 Mixin for OmniBase — keeps omni.py focused on orchestration.

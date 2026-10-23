@@ -177,6 +177,7 @@ def test_build_add_request_message_preserves_kv_hints_after_omni_payload_upgrade
     from vllm.v1.kv_hints import KvHintsEnvelope
 
     engine = object.__new__(AsyncOmniEngine)
+    engine._pd_pair = None
     params = SamplingParams(max_tokens=8)
     engine.default_sampling_params_list = [params]
     engine.stage_metadata = [StageRuntimeInfo(final_output=False, final_output_type=None, stage_type="llm")]
@@ -205,6 +206,7 @@ def test_build_add_request_message_preserves_kv_hints_after_omni_payload_upgrade
 
 def test_build_add_request_message_injects_global_id_before_prompt_transform(mocker: MockerFixture):
     engine = object.__new__(AsyncOmniEngine)
+    engine._pd_pair = None
     params = SamplingParams(max_tokens=8)
     engine.default_sampling_params_list = [params]
     engine.stage_metadata = [StageRuntimeInfo(final_output=False, final_output_type=None, stage_type="llm")]
@@ -452,6 +454,7 @@ def test_build_add_request_message_scopes_mm_uuids_to_selected_stage0_replica(mo
 
 def _two_replica_engine_recording_uuids(mocker: MockerFixture) -> tuple[AsyncOmniEngine, list[str]]:
     engine = object.__new__(AsyncOmniEngine)
+    engine._pd_pair = None
     params = SamplingParams(max_tokens=8)
     engine.model = "test-model"
     engine.default_sampling_params_list = [params]

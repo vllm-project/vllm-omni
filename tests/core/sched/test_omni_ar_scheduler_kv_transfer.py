@@ -112,6 +112,7 @@ def _run_finished_save_step(mocker, request, *, inter_stage_outputs=None):
     adapter._confirmed_num_computed_tokens.return_value = 1
 
     sched = mocker.MagicMock()
+    sched.vllm_config = SimpleNamespace(model_config=SimpleNamespace(stage_id=0))
     sched.requests = {request.request_id: request}
     sched.perf_metrics = None
     sched.defer_block_free = False
@@ -185,6 +186,7 @@ def test_stage_zero_final_skips_inter_stage_output(mocker):
 
 def test_streaming_session_update_invalidates_omits_kv_transfer_cache():
     scheduler = OmniARScheduler.__new__(OmniARScheduler)
+    scheduler.vllm_config = SimpleNamespace(model_config=SimpleNamespace(stage_id=0))
     scheduler._omits_kv_transfer_cache = {}
     scheduler.deferred_waiting = set()
     scheduler.kv_holding_waiting = []
@@ -218,6 +220,7 @@ def test_streaming_session_update_invalidates_omits_kv_transfer_cache():
 
 def test_omits_cache_misses_when_payload_object_is_replaced():
     scheduler = OmniARScheduler.__new__(OmniARScheduler)
+    scheduler.vllm_config = SimpleNamespace(model_config=SimpleNamespace(stage_id=0))
     scheduler._omits_kv_transfer_cache = {}
     tagged = apply_omni_final_stage_metadata(_make_engine_request(), final_stage_id=0)
     request = SimpleNamespace(

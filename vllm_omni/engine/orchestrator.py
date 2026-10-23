@@ -2917,7 +2917,9 @@ class OrchestratorBase:
             if already_submitted:
                 replica_id = await next_pool.submit_update(req_id, req_state, request, **route_kwargs)
             else:
-                replica_id = await next_pool.submit_initial(req_id, req_state, request, prompt_text=None, **route_kwargs)
+                replica_id = await next_pool.submit_initial(
+                    req_id, req_state, request, prompt_text=None, **route_kwargs
+                )
             self._on_stage_submitted(
                 next_logical,
                 req_id,

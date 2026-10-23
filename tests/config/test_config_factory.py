@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 import pytest
 from transformers import PretrainedConfig, Qwen3OmniMoeConfig
+from vllm.config import KVTransferConfig
 
 from tests.helpers.stage_config import get_deploy_config_path, get_deploy_config_stage
 from vllm_omni.config import config_factory as config_factory_module
@@ -607,9 +608,9 @@ class TestPipelineDiscovery:
         assert prefill_kv["kv_connector"] == decode_kv["kv_connector"] == "MooncakeConnector"
         assert prefill_kv["kv_role"] == "kv_producer"
         assert decode_kv["kv_role"] == "kv_consumer"
-        assert (prefill_kv["kv_rank"], decode_kv["kv_rank"]) == (0, 1)
-        assert prefill_kv["kv_parallel_size"] == decode_kv["kv_parallel_size"] == 2
-        assert prefill_kv["kv_ip"] == decode_kv["kv_ip"] == "127.0.0.1"
+        # Validate against vLLM's schema, which rejects removed/unknown fields.
+        assert KVTransferConfig(**prefill_kv).is_kv_producer
+        assert KVTransferConfig(**decode_kv).is_kv_consumer
         assert prefill_kv["kv_connector_extra_config"]["mooncake_bootstrap_port"] == 25201
         assert decode_kv["kv_connector_extra_config"]["mooncake_bootstrap_port"] == 25202
         assert stages[0].yaml_engine_args["tensor_parallel_size"] == 2

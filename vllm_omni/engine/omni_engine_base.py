@@ -17,8 +17,6 @@ from pathlib import Path
 from typing import Any, cast
 
 import janus
-import torch
-from vllm import envs as vllm_envs
 from vllm.logger import init_logger
 from vllm.renderers import BaseRenderer
 from vllm.v1.engine.input_processor import InputProcessor
