@@ -4,6 +4,7 @@
 
 import pytest
 import torch
+import vllm.v1.core.single_type_kv_cache_manager as native_kv_managers
 from vllm.sampling_params import SamplingParams
 from vllm.v1.core.kv_cache_manager import KVCacheManager
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheGroupSpec
@@ -17,6 +18,10 @@ BLOCK = 16
 
 
 def _manager(num_blocks=40, enable_caching=False, groups=1):
+    # vLLM lazily registers built-in KV specs. Another test may already have
+    # registered an out-of-tree spec, so the registry can be non-empty before
+    # FullAttentionSpec has a manager. Initialize the native mappings first.
+    native_kv_managers.register_all_kvcache_specs(None)
     spec = FullAttentionSpec(block_size=BLOCK, num_kv_heads=1, head_size=8, dtype=torch.float16)
     config = KVCacheConfig(
         num_blocks=num_blocks,
