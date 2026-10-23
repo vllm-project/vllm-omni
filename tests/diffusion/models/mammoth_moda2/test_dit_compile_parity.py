@@ -6,18 +6,23 @@ Uses ``fullgraph=True`` so a graph break in ``TransformerBlock`` fails the test
 instead of silently falling back to eager.
 """
 
-import copy
-
 import pytest
 import torch
 
 from vllm_omni.diffusion.compile import regionally_compile
 from vllm_omni.diffusion.config import set_current_diffusion_config
 from vllm_omni.diffusion.data import OmniDiffusionConfig
-from vllm_omni.diffusion.models.mammoth_moda2.mammothmoda2_dit_model import Transformer2DModel
+from vllm_omni.diffusion.models.mammoth_moda2.mammothmoda2_dit_model import Transformer2DModel, TransformerBlock
 from vllm_omni.diffusion.models.mammoth_moda2.rope_real import RotaryPosEmbedReal
 
-pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
+from .helpers import initialize_block_weights
+
+pytestmark = [
+    pytest.mark.core_model,
+    pytest.mark.diffusion,
+    pytest.mark.cpu,
+    pytest.mark.usefixtures("mock_tp1"),
+]
 
 # Small enough for CPU; still builds every block kind (refiners and main layers).
 HIDDEN, HEADS, KV_HEADS = 96, 4, 2
@@ -45,6 +50,9 @@ def _build_model() -> Transformer2DModel:
             axes_lens=AXES_LENS,
             text_feat_dim=TEXT_FEAT_DIM,
         ).eval()
+    # The vLLM linears inside each block expect a checkpoint to fill them; without
+    # this they stay ``torch.empty`` and the eager output is NaN.
+    initialize_block_weights(model)
     return model
 
 
@@ -83,7 +91,13 @@ def _fresh_dynamo():
 
 
 class _CompileCounter:
-    """Count Dynamo frame compilations."""
+    """Count Dynamo frame compilations of ``TransformerBlock.forward``.
+
+    vLLM compiles ``SiluAndMul.forward_native`` on its own (``CustomOp`` with
+    ``compile_native=True``), so counting every frame would credit the first
+    shape with a compilation even with ``_repeated_blocks`` emptied out — the
+    parity cases would then be comparing eager against eager.
+    """
 
     def __init__(self) -> None:
         import torch._dynamo.convert_frame as convert_frame
@@ -94,10 +108,12 @@ class _CompileCounter:
 
     def __enter__(self) -> "_CompileCounter":
         outer = self
+        block_code = TransformerBlock.forward.__code__
 
-        def _tracked(*args, **kwargs):
-            outer.count += 1
-            return outer._original(*args, **kwargs)
+        def _tracked(code, *args, **kwargs):
+            if code is block_code:
+                outer.count += 1
+            return outer._original(code, *args, **kwargs)
 
         self._module._compile = _tracked
         return self
@@ -109,8 +125,10 @@ class _CompileCounter:
 @pytest.mark.parametrize("text_len", [0, 4, 77], ids=["empty_text", "short_text", "recipe_text"])
 def test_forward_regionally_compiled_matches_eager(text_len: int):
     """``text_len=0`` covers the empty-text skip in ``_apply_refiners``."""
+    # ``_build_model`` reseeds, so both models carry identical weights. A deepcopy
+    # cannot be used here: vLLM's ``BasevLLMParameter`` does not survive it.
     eager = _build_model()
-    compiled = copy.deepcopy(eager)
+    compiled = _build_model()
     with set_current_diffusion_config(_SDPA_CONFIG):
         regionally_compile(compiled, dynamic=True, fullgraph=True)
 
