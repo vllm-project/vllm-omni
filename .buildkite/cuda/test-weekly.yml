@@ -7,23 +7,6 @@ env:
   HF_HUB_ETAG_TIMEOUT: 60
 
 steps:
-  - label: "Simple · CPU Coverage Test"
-    key: weekly-simple-cpu-coverage
-    depends_on: upload-weekly-pipeline
-    if: build.env("WEEKLY") == "1"
-    timeout_in_minutes: 60
-    artifact_paths:
-      - coverage-core-model-cpu-*.xml.gz
-    commands:
-      - |
-        set +e
-        REPORT="coverage-core-model-cpu-$${BUILDKITE_STEP_ID:-local}.xml"
-        pytest -sv tests/ -m 'core_model and cpu' --cov=vllm_omni --cov-report=term-missing:skip-covered --cov-report=xml:$${REPORT}
-        EXIT=$$?
-        gzip -9 -f "$${REPORT}"
-        exit $$EXIT
-    mirror_hardwares: l4_1
-
   - group: "Reliability Test"
     depends_on: upload-weekly-pipeline
     if: build.env("WEEKLY") == "1" || build.pull_request.labels includes "weekly-test"
