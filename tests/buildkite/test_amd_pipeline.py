@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import json
 from importlib.util import find_spec, module_from_spec, spec_from_file_location
 from pathlib import Path
 from shlex import split
@@ -1249,3 +1250,27 @@ def test_qwen_image_21_accuracy_is_one_nonblocking_nightly_job() -> None:
     for pipeline_path in (AMD_READY_PIPELINE, AMD_MERGE_PIPELINE):
         text = pipeline_path.read_text(encoding="utf-8")
         assert "Qwen-Image 2.1 Accuracy" not in text
+
+
+def test_qwen3_omni_seed_tts_realtime_perf_is_one_nonblocking_nightly_job() -> None:
+    step = _find_step("Qwen3-Omni Seed-TTS Realtime Perf", AMD_NIGHTLY_PIPELINE)
+    assert step["grade"] == "NonBlocking"
+    assert step["agent_pool"] == "mi300_2"
+    assert step["depends_on"] == "amd-build"
+    assert step["mirror_hardwares"] == ["amdproduction"]
+    assert step["timeout_in_minutes"] == 180
+    commands = "\n".join(step["commands"])
+    assert "full_model and omni and rocm and MI325 and cards_2" in commands
+    assert "--run-level full_model" in commands
+    assert "--collect-only" in commands
+    assert "tests/dfx/perf/tests/test_qwen3_omni_seed_tts.json" in commands
+    assert "test_qwen3_omni_seed_tts_realtime-explicit" in commands
+    assert "test_qwen3_omni_seed_tts_realtime-vad" in commands
+    assert "Expected exactly $${#nodes[@]} Qwen3-Omni Seed-TTS realtime nodes" in commands
+    assert "timeout --signal=TERM --kill-after=2m 165m" in commands
+    config = json.loads(Path("tests/dfx/perf/tests/test_qwen3_omni_seed_tts.json").read_text(encoding="utf-8"))
+    assert config[0]["mark"][0]["hardware_marks"]["res"]["rocm"] == "MI325"
+    assert "baseline" not in config[0]
+    for pipeline_path in (AMD_READY_PIPELINE, AMD_MERGE_PIPELINE):
+        text = pipeline_path.read_text(encoding="utf-8")
+        assert "Qwen3-Omni Seed-TTS Realtime Perf" not in text
