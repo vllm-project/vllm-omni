@@ -5,6 +5,7 @@ and per-request seeds. The model is a stand-in that builds fixed prompt rows."""
 
 from collections.abc import Sequence
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 import pytest
@@ -96,6 +97,8 @@ def test_preempted_request_resumes_with_its_generated_frames(make_state):
     state.buffers.slot_history[1, :3] = codes
     state.buffers.slot_generated[1] = 3
     state.on_request_preempted("a", 1)
+    assert state._suspended["a"].history.device.type == "cpu"
+    assert state._suspended["a"].count.device.type == "cpu"
     # Another request takes the slot before "a" comes back.
     state.buffers.slot_history[1].zero_()
     state.buffers.slot_generated[1] = 0
@@ -115,6 +118,8 @@ def test_preempted_request_resumes_with_its_generated_frames(make_state):
     assert ras[-3:] == main
     # The resumed slot gets its code history back, for a later preemption.
     assert list(state._pending_history) == [2] and torch.equal(state._pending_history[2], codes)
+    state.on_requests_finished({"a"})
+    assert "a" not in state._suspended
 
 
 def test_slot_reused_before_a_step_keeps_only_the_newest_request(make_state):
@@ -213,3 +218,45 @@ def test_max_top_k_is_a_power_of_two_from_the_ras_top_k_to_the_codebook(value, o
     else:
         with pytest.raises(ValueError, match="power of two"):
             max_top_k(config, 4096)
+
+
+def test_npu_device_selects_ascend_model_state(monkeypatch):
+    sentinel = object()
+    from vllm_omni.platforms.npu.models import fish_omni_model_state as npu_ms
+
+    monkeypatch.setattr(npu_ms, "NPUFishOmniModelState", lambda *args, **kwargs: sentinel)
+    assert ms.create_fish_omni_model_state(None, None, None, SimpleNamespace(type="npu")) is sentinel
+
+
+def test_cuda_device_keeps_the_upstream_model_state(monkeypatch):
+    monkeypatch.setattr(ms.FishOmniModelState, "__init__", lambda self, *args, **kwargs: None)
+    state = ms.create_fish_omni_model_state(None, None, None, SimpleNamespace(type="cuda"))
+    assert type(state) is ms.FishOmniModelState
+    assert not getattr(state, "uses_ascend_attn_metadata", False)
+
+
+def test_sampling_noise_is_broadcast_across_tensor_parallel_ranks(make_state):
+    state = make_state()
+    state.add_request(0, _request("s", seed=1))
+    seen = {}
+
+    def broadcast(tensor, src=0):
+        seen["src"] = src
+        seen["shape"] = tuple(tensor.shape)
+        return tensor
+
+    with (
+        patch.object(ms, "_broadcast_tp_tensor", side_effect=lambda tensor: seen.update(called=True) or None),
+    ):
+        state._draw_noise(["s"], np.array([1]), np.array([True]))
+    assert seen["called"] is True
+
+    with (
+        patch("vllm.distributed.parallel_state.model_parallel_is_initialized", return_value=True),
+        patch("vllm.distributed.parallel_state.get_tensor_model_parallel_world_size", return_value=2),
+        patch("vllm.distributed.parallel_state.get_tp_group") as group,
+    ):
+        group.return_value.broadcast = broadcast
+        ms._broadcast_tp_tensor(state.buffers.noise)
+    assert seen["src"] == 0
+    assert seen["shape"] == tuple(state.buffers.noise.shape)

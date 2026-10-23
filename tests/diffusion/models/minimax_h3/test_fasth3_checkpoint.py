@@ -420,6 +420,35 @@ def test_native_local_model_root_keeps_partition_layout(tmp_path):
     assert resolve_minimax_h3_model_root(str(root), None, "fl2va") == str(root / "FL2VA" / "text_encoder")
 
 
+def test_native_local_model_root_with_modular_index_keeps_partition_layout(tmp_path):
+    # The official MiniMaxAI/MiniMax-H3 repository ships modular_model_index.json at its root.
+    root = tmp_path / "MiniMax-H3"
+    (root / "FL2VA" / "text_encoder").mkdir(parents=True)
+    (root / "FL2VA" / "text_encoder" / "config.json").write_text("{}", encoding="utf-8")
+    (root / "FL2VA" / "model_index.json").write_text("{}", encoding="utf-8")
+    (root / "Ref2VA").mkdir()
+    (root / "modular_model_index.json").write_text(
+        json.dumps({"_class_name": "MiniMaxH3ModularPipeline"}),
+        encoding="utf-8",
+    )
+
+    assert is_minimax_h3_modular(str(root)) is False
+    assert resolve_minimax_h3_model_root(str(root), None, "fl2va") == str(root / "FL2VA" / "text_encoder")
+    assert resolve_minimax_h3_diffusion_model_path(str(root), None, "fl2va") == str(root / "FL2VA")
+
+
+def test_empty_partition_dirs_do_not_override_modular_marker(tmp_path):
+    root = tmp_path / "FastH3"
+    (root / "FL2VA").mkdir(parents=True)
+    (root / "Ref2VA").mkdir()
+    (root / "modular_model_index.json").write_text(
+        json.dumps({"_class_name": "MiniMaxH3ModularPipeline"}),
+        encoding="utf-8",
+    )
+
+    assert is_minimax_h3_modular(str(root)) is True
+
+
 def test_diffusion_resolver_returns_local_modular_root_without_partition_files(tmp_path):
     root = tmp_path / "FastH3"
     root.mkdir()

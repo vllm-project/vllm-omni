@@ -2506,11 +2506,11 @@ def test_r7_r8_ref2va_video_segment_matrix(
 def test_ref2va_transcode_zero_frame_count_keeps_video_stream(monkeypatch, tmp_path):
     from vllm_omni.diffusion.models.minimax_h3 import reference_video as reference_video_module
 
-    commands: list[list[str]] = []
+    calls: list[tuple[list[str], dict[str, Any]]] = []
     monkeypatch.setattr(
         reference_video_module.subprocess,
         "run",
-        lambda command, **_kwargs: commands.append(command),
+        lambda command, **kwargs: calls.append((command, kwargs)),
     )
 
     reference_video_module._transcode_reference_video(
@@ -2522,7 +2522,10 @@ def test_ref2va_transcode_zero_frame_count_keeps_video_stream(monkeypatch, tmp_p
         duration_seconds=4.0,
     )
 
-    assert "-frames:v" not in commands[0]
+    command, kwargs = calls[0]
+    assert command[:5] == ["ffmpeg", "-nostdin", "-y", "-loglevel", "error"]
+    assert "-frames:v" not in command
+    assert kwargs["stdin"] is reference_video_module.subprocess.DEVNULL
 
 
 def test_prepared_reference_video_descriptor_round_trip(tmp_path):
@@ -2620,14 +2623,18 @@ def test_ref2va_ffmpeg_decode_reads_exact_rgb_frames(monkeypatch, indices, frame
 
     np.testing.assert_array_equal(actual, expected)
     command, kwargs = observed[0]
-    assert command[0] == "ffmpeg"
+    assert command[:2] == ["ffmpeg", "-nostdin"]
     assert command[command.index("-frames:v") + 1] == "2"
     if indices is None:
         assert "-vf" not in command
     else:
         assert command[command.index("-vf") + 1] == "select=eq(n\\,0)+eq(n\\,12)"
     assert command[-1] == "pipe:1"
-    assert kwargs == {"check": True, "capture_output": True}
+    assert kwargs == {
+        "check": True,
+        "capture_output": True,
+        "stdin": reference_video_module.subprocess.DEVNULL,
+    }
 
 
 def test_ref2va_load_video_frames_uses_ffmpeg_without_decord(monkeypatch):
@@ -2718,6 +2725,7 @@ def test_ref2va_probe_uses_container_frame_count_without_scan(monkeypatch):
     assert metadata["frame_count"] == 3
     assert len(calls) == 1
     assert "-count_frames" not in calls[0][0]
+    assert calls[0][1]["stdin"] is reference_video_module.subprocess.DEVNULL
 
 
 def test_ref2va_probe_counts_frames_only_when_metadata_is_missing(monkeypatch):
@@ -2755,6 +2763,75 @@ def test_ref2va_probe_counts_frames_only_when_metadata_is_missing(monkeypatch):
     assert metadata["frame_count"] == 3
     assert len(calls) == 2
     assert "-count_frames" in calls[1][0]
+    assert all(call[1]["stdin"] is reference_video_module.subprocess.DEVNULL for call in calls)
+
+
+def test_ref2va_audio_probe_runs_noninteractively(monkeypatch):
+    from vllm_omni.diffusion.models.minimax_h3 import reference_video as reference_video_module
+
+    calls: list[tuple[list[str], dict[str, Any]]] = []
+    probe = {
+        "streams": [{"codec_type": "audio", "codec_name": "aac", "duration": "1.0"}],
+        "format": {"format_name": "mov,mp4", "size": "123", "duration": "1.0"},
+    }
+    monkeypatch.setattr(
+        reference_video_module.subprocess,
+        "run",
+        lambda command, **kwargs: _append_and_return(
+            calls,
+            (command, kwargs),
+            SimpleNamespace(stdout=json.dumps(probe)),
+        ),
+    )
+
+    reference_video_module._probe_audio("reference.mp4")
+
+    command, kwargs = calls[0]
+    assert command[0] == "ffprobe"
+    assert kwargs["stdin"] is reference_video_module.subprocess.DEVNULL
+
+
+def test_ref2va_audio_ffmpeg_fallback_runs_noninteractively(monkeypatch):
+    from vllm_omni.diffusion.models.minimax_h3 import reference_video as reference_video_module
+
+    calls: list[tuple[list[str], dict[str, Any]]] = []
+    monkeypatch.setitem(sys.modules, "torchaudio", None)
+
+    def fake_soundfile(path):
+        if path == "reference.mp4":
+            raise RuntimeError("unsupported container")
+        return "waveform", 44100
+
+    monkeypatch.setattr(reference_video_module, "_soundfile_to_waveform", fake_soundfile)
+    monkeypatch.setattr(
+        reference_video_module.subprocess,
+        "run",
+        lambda command, **kwargs: calls.append((command, kwargs)),
+    )
+
+    assert reference_video_module.load_audio_file("reference.mp4") == ("waveform", 44100)
+
+    command, kwargs = calls[0]
+    assert command[:2] == ["ffmpeg", "-nostdin"]
+    assert kwargs["stdin"] is reference_video_module.subprocess.DEVNULL
+
+
+def test_ref2va_video_audio_ffmpeg_runs_noninteractively(monkeypatch):
+    from vllm_omni.diffusion.models.minimax_h3 import reference_video as reference_video_module
+
+    calls: list[tuple[list[str], dict[str, Any]]] = []
+    monkeypatch.setattr(
+        reference_video_module.subprocess,
+        "run",
+        lambda command, **kwargs: calls.append((command, kwargs)),
+    )
+    monkeypatch.setattr(reference_video_module, "load_audio_file", lambda _path: ("waveform", 44100))
+
+    assert reference_video_module.load_video_audio("reference.mp4") == ("waveform", 44100)
+
+    command, kwargs = calls[0]
+    assert command[:2] == ["ffmpeg", "-nostdin"]
+    assert kwargs["stdin"] is reference_video_module.subprocess.DEVNULL
 
 
 def test_ref2va_ffmpeg_decode_rejects_incomplete_output(monkeypatch):
@@ -3470,6 +3547,27 @@ def test_keyframe_encode_cpu_keeps_cudnn_settings(monkeypatch):
             assert cudnn.benchmark
             assert not cudnn.deterministic
             assert not cudnn.allow_tf32
+
+
+def test_keyframe_encode_rocm_does_not_require_deterministic_miopen(monkeypatch):
+    from vllm_omni.diffusion.models.minimax_h3.vae import (
+        _minimax_h3_keyframe_encode_context,
+    )
+    from vllm_omni.platforms import current_omni_platform
+
+    monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: False)
+    cudnn = torch.backends.cudnn
+    with cudnn.flags(enabled=False, benchmark=True, deterministic=True, allow_tf32=False):
+        with _minimax_h3_keyframe_encode_context(torch.device("cuda:0")):
+            assert cudnn.enabled
+            assert not cudnn.benchmark
+            assert not cudnn.deterministic
+            assert cudnn.allow_tf32
+
+        assert not cudnn.enabled
+        assert cudnn.benchmark
+        assert cudnn.deterministic
+        assert not cudnn.allow_tf32
 
 
 def _peer_rank_preencode_pipeline(monkeypatch):

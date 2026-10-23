@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Checkpoint discovery for the Cosmos3 diffusion-step precision policy."""
 
@@ -36,6 +36,7 @@ _SUPPORTED_MODEL_OPT_CONFIGS = frozenset(
     {
         "modelopt",
         "modelopt_fp4",
+        "modelopt_mixed",
     }
 )
 
@@ -156,6 +157,10 @@ def _validate_checkpoint_quantization(od_config: object) -> None:
         tf_config = getattr(od_config, "tf_model_config", None)
         quant_config = getattr(tf_config, "quant_config", None)
 
+    _validate_modelopt_config(quant_config)
+
+
+def _validate_modelopt_config(quant_config: object | None) -> None:
     get_name = getattr(quant_config, "get_name", None)
     name = get_name() if callable(get_name) else None
     if name not in _SUPPORTED_MODEL_OPT_CONFIGS:
@@ -169,6 +174,32 @@ def _validate_checkpoint_quantization(od_config: object) -> None:
             raise ValueError("diffusion_step_policy requires checkpoint-native NVFP4 W4A4 linears")
         _require_serialized(quant_config, "is_checkpoint_nvfp4_serialized", "NVFP4")
         return
+    if name == "modelopt_mixed":
+        layers = getattr(quant_config, "quantized_layers", None)
+        if not isinstance(layers, Mapping) or not layers:
+            raise ValueError("diffusion_step_policy requires serialized ModelOpt FP8 or NVFP4 quantized_layers")
+        subconfigs = {"FP8": "fp8_config", "NVFP4": "nvfp4_config"}
+        algorithms = set()
+        for layer_name, entry in layers.items():
+            algorithm = entry.get("quant_algo") if isinstance(entry, Mapping) else None
+            algorithm = algorithm.upper() if isinstance(algorithm, str) else None
+            if algorithm not in subconfigs:
+                raise ValueError(
+                    f"diffusion_step_policy requires serialized ModelOpt FP8 or NVFP4 layers; "
+                    f"{layer_name!r} declares {algorithm!r}"
+                )
+            algorithms.add(algorithm)
+        if len(algorithms) != 1:
+            raise ValueError("diffusion_step_policy does not support mixing FP8 and NVFP4 quantized layers")
+        # The ModelOpt container also creates unused subconfigs. Validate only
+        # the single quantization format selected by this checkpoint's map.
+        algorithm = algorithms.pop()
+        subconfig = getattr(quant_config, subconfigs[algorithm], None)
+        expected_name = "modelopt" if algorithm == "FP8" else "modelopt_fp4"
+        get_subname = getattr(subconfig, "get_name", None)
+        if not callable(get_subname) or get_subname() != expected_name:
+            raise ValueError(f"diffusion_step_policy requires a serialized ModelOpt {algorithm} subconfig")
+        _validate_modelopt_config(subconfig)
 
 
 def _require_serialized(quant_config: object | None, flag: str, format_name: str) -> None:

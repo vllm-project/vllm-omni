@@ -151,7 +151,10 @@ def _fwd_ctx():
         yield
 
 
-@pytest.mark.parametrize("req_id,expect_validity", [("_warmup_0_", True), ("r1", False)])
+@pytest.mark.parametrize(
+    "req_id,expect_validity",
+    [("_warmup_0_", True), ("_v2_mixed_warmup_decode_", True), ("_v2_mixed_warmup_prefill_", True), ("r1", False)],
+)
 def test_add_request_declared_validity_only_for_warmup(req_id, expect_validity):
     # Real requests must not be masked with a fabricated validity key.
     state = _make_state()
@@ -161,6 +164,25 @@ def test_add_request_declared_validity_only_for_warmup(req_id, expect_validity):
     assert ("meta" in buf) is expect_validity
     if expect_validity:
         assert buf["meta"]["codec_frame_valid"].item() is False
+
+
+@pytest.mark.parametrize("req_id", ["_warmup_0_", "_v2_mixed_warmup_decode_", "_v2_mixed_warmup_prefill_"])
+def test_warmup_skips_model_preprocess_and_postprocess(req_id):
+    state = _make_state(has_preprocess=True, has_postprocess=True)
+    _fill_buffers(state, req_id)
+    state.model.preprocess.side_effect = AssertionError("warmup has no model conditioning")
+    state.model.postprocess.side_effect = AssertionError("warmup must not update model state")
+    state.model.postprocess_batch_mrv2 = MagicMock(side_effect=AssertionError("warmup must not use batch postprocess"))
+    batch = _DummyInputBatch([0], num_computed_tokens_cpu=[0])
+    inputs = {"input_ids": torch.tensor([1]), "inputs_embeds": torch.zeros(1, 4)}
+
+    state.run_preprocess(batch, inputs)
+    state.run_postprocess(torch.zeros(1, 4), batch)
+
+    state.model.preprocess.assert_not_called()
+    state.model.postprocess.assert_not_called()
+    state.model.postprocess_batch_mrv2.assert_not_called()
+    assert state.intermediate_buffer.buffers[0] == {"req_id": req_id}
 
 
 @pytest.mark.parametrize("mode", ["index", "req_id", "unknown"])

@@ -472,6 +472,10 @@ semantic decision from the silence timeout, including whether the preceding
 score was incomplete or inference failed. These diagnostics do not change the
 wire protocol or the endpoint decision.
 
+Only unfinished response-bound append tasks keep the response gate closed.
+A completed task awaiting its cleanup callback does not block a new turn after
+barge-in. Active responses and unplayed output retain their own gates.
+
 ### Experimental output limits
 
 `max_pending_output_bytes_per_session` defaults to 2 MiB and
@@ -677,8 +681,25 @@ support alone is not Qwen tool-call end-to-end support. Accepted results use
 their prepared candidate, while effective epoch cancellation uses
 `retire_pending_function_output` for queued work according to model policy.
 
-Nemotron's function-channel wire output is request-aligned. In runtime batches,
-the worker-provided spans select each request's last scheduled hidden row rather
+JoyAI-VL-Interaction uses the same call book for a different decision shape. Its
+model emits an action token (`</response> <note> </delegation> <question>`), so
+`parse_function_call` reads a call the plugin itself projected, not a native tool
+schema, and the declared function is one opt-in `delegate` entry. A recognised
+call short-circuits the rest of that stage output, so the plugin projects the call
+alone and the spoken note on its own ordinary path; the note therefore still
+reaches the audio stage while the call is published. An accepted result never
+enters `session.history`. It becomes a `[Delegated Results]` block in later JoyAI
+prompts, and `has_pending_tool_followup` reports whether one is still waiting.
+JoyAI's interaction is chunk based: a result is carried by observations until a
+stored reply answers it, reused once inside the chunk that answered it, and
+expired when the turn that asked it is cancelled. The chunk id and the
+"a reply of it stored text" flag live in the session runtime config rather than on
+the plugin, because one plugin instance serves every session of a deployment.
+Every hook that the session installs returns the complete runtime, not just its
+own keys: the session replaces the whole config, so a partial return would drop
+the model's TTS and prompt settings.
+
+Nemotron's function-channel wire output is request-aligned. In runtime batches,the worker-provided spans select each request's last scheduled hidden row rather
 than CUDA-graph padding; the worker's payload split preserves that mapping for
 the session data plane. Intermediate prefill chunks expose no function token
 and keep empty slots in mixed batches. The final prefill chunk and decode frames
