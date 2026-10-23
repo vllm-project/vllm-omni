@@ -220,6 +220,7 @@ def test_capture_uses_distributed_context_and_runner_pool(monkeypatch, tp_size):
 
     monkeypatch.setattr(vllm_parallel_state, "get_tp_group", lambda: CaptureGroup("tp", tp_size))
     monkeypatch.setattr(vllm_parallel_state, "get_pp_group", lambda: CaptureGroup("pp", 1))
+    monkeypatch.setattr(vllm_parallel_state, "get_dp_group", lambda: CaptureGroup("dp", 1))
     monkeypatch.setattr(cuda_graph_module, "model_parallel_is_initialized", lambda: True)
     monkeypatch.setattr(cuda_graph_module, "graph_capture", vllm_parallel_state.graph_capture)
     monkeypatch.setattr(torch.cuda, "CUDAGraph", lambda: graph)
@@ -242,10 +243,12 @@ def test_capture_uses_distributed_context_and_runner_pool(monkeypatch, tp_size):
     assert events == [
         ("tp_enter", tp_size, capture_stream),
         ("pp_enter", 1, capture_stream),
+        ("dp_enter", 1, capture_stream),
         ("forward", 2),
         ("cuda_enter", graph, pool, "thread_local"),
         ("forward", 1),
         ("cuda_exit", graph),
+        ("dp_exit", 1, capture_stream),
         ("pp_exit", 1, capture_stream),
         ("tp_exit", tp_size, capture_stream),
     ]

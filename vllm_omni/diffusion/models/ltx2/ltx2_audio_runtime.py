@@ -725,7 +725,7 @@ class LTXAudioRuntime(
                 audio_timestep=audio_timestep,
                 audio_sigma=audio_sigma,
                 audio_coords=audio_coords,
-                audio_attention_mask=audio_attention_mask,
+                audio_attention_mask=None,
                 perturbation_mask=perturbation_mask,
                 stg_blocks=stg_blocks,
                 audio_static_conditioning=audio_static_conditioning,
