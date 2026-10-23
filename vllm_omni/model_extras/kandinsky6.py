@@ -25,6 +25,8 @@ KANDINSKY6_EXTRA_OUTPUT_PARAMS: frozenset[str] = frozenset()
 
 def get_kandinsky6_video_generation_defaults(
     extra_body: Mapping[str, Any] | None = None,
+    *,
+    requested_size: tuple[int, int] | None = None,
 ) -> VideoGenerationDefaults:
     """Kandinsky 6 Pro production geometry: 480x864, 125 frames @ 24 fps, 50 steps, CFG 5.
 
@@ -33,7 +35,7 @@ def get_kandinsky6_video_generation_defaults(
     is left unset (the serving layer only pins ``num_frames`` for
     fixed-duration pipelines such as MAGI-2).
     """
-    del extra_body
+    del extra_body, requested_size
     return VideoGenerationDefaults(
         width=864,
         height=480,

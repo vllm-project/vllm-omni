@@ -397,13 +397,19 @@ def get_extra_output_params(model_class_name: str | None) -> frozenset[str]:
 def get_video_generation_defaults(
     model_class_name: str | None,
     extra_body: Mapping[str, Any] | None = None,
+    *,
+    requested_size: tuple[int, int] | None = None,
 ) -> VideoGenerationDefaults | None:
-    """Return model-owned defaults for the shared video examples, if declared."""
+    """Return model-owned defaults for the shared video examples, if declared.
+
+    ``requested_size`` is the request's ``(width, height)`` when it sets both;
+    a model may choose its defaults from it.
+    """
     spec = _get_spec(model_class_name)
     if spec is None:
         return None
     builder = spec.get("video_generation_defaults_builder")
-    return builder(extra_body) if builder is not None else None
+    return builder(extra_body, requested_size=requested_size) if builder is not None else None
 
 
 def get_output_tensor_range(model_class_name: str | None) -> OutputTensorRange:

@@ -132,7 +132,7 @@ def test_bundled_flash_attention_requires_cuda_platform(monkeypatch, device_type
     resolver = Mock(return_value=3)
     monkeypatch.setattr(attention, "torch_varlen_attention_with_sink", reference)
     monkeypatch.setattr(attention, "vllm_flash_attn_varlen_with_lse", flash)
-    monkeypatch.setattr(attention, "_resolve_flash_attn_version", resolver)
+    monkeypatch.setattr(attention, "resolve_magi2_flash_attn_version", resolver)
     assert attention.packed_attention_with_sink(q, k, v, varlen) is expected
     if device_type == "cuda" and is_cuda:
         flash.assert_called_once()

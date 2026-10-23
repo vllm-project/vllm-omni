@@ -145,11 +145,16 @@ def _detect_preset(
     model: str,
     model_class_name: str | None = None,
     extra_body: dict[str, Any] | None = None,
+    requested_size: tuple[int, int] | None = None,
 ) -> dict:
     model_lower = model.lower()
     resolved_model_class_name = model_class_name or resolve_model_class_name(model)
     class_lower = (resolved_model_class_name or "").lower()
-    video_defaults = get_video_generation_defaults(resolved_model_class_name, extra_body)
+    video_defaults = get_video_generation_defaults(
+        resolved_model_class_name,
+        extra_body,
+        requested_size=requested_size,
+    )
     if video_defaults is not None:
         return video_defaults.cli_defaults()
     if "sana-video" in model_lower or "sana_video" in model_lower or "sanavideo" in class_lower:
@@ -529,9 +534,14 @@ def main():
     args = parse_args()
     model_class_name = args.model_class_name
     resolved_model_class_name = model_class_name or resolve_model_class_name(args.model)
-    video_defaults = get_video_generation_defaults(resolved_model_class_name, args.extra_body)
+    requested_size = (args.width, args.height) if args.width and args.height else None
+    video_defaults = get_video_generation_defaults(
+        resolved_model_class_name,
+        args.extra_body,
+        requested_size=requested_size,
+    )
 
-    preset = _detect_preset(args.model, resolved_model_class_name, args.extra_body)
+    preset = _detect_preset(args.model, resolved_model_class_name, args.extra_body, requested_size)
     for key, default_val in preset.items():
         if getattr(args, key.replace("-", "_"), None) is None:
             setattr(args, key.replace("-", "_"), default_val)
