@@ -130,6 +130,7 @@ class OmniModelConfig(ModelConfig):
     async_chunk: bool = False
     session_mode: str = "turn"
     retains_state_across_chunks: bool = False
+    supports_pending_generation: bool = False
     supports_running_prefix_cache_reset: bool = True
     use_v2_model_runner: bool = False
     supports_native_mrv2_data_plane: bool = False

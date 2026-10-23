@@ -395,6 +395,17 @@ for queue updates and the final validity check before delivery.
   turn_id)` when it starts and re-checks them before the stage submit and
   before committing ledgers; a task that finds the epoch advanced rolls back
   its PCM reservation and exits.
+- **Buffered commit prefixes.** A model buffer may reserve non-terminal units
+  before its terminal commit payload. The runner submits these in wire order
+  with `force_listen=True` and waits for append acceptance before acknowledging
+  the commit. A commit that must wait for an active response holds those
+  prefixes and submits them, still in wire order, when that response ends,
+  before the retained terminal payload. Reservations keep their normal rollback
+  ownership. MiniCPM uses this path to preserve separate buffered VISION units
+  and a following speech tail in manual commit/response sessions. Native
+  resumable responses also defer video-only commits. If response creation is
+  disabled on the commit, a later explicit `response.create` must drain the
+  held prefixes before submitting the terminal payload.
 - **Cancel is atomic at the session.** `CancelResponse` / `BargeIn` advance
   the epoch, cancel tracked append tasks, abort the owned stage bindings
   through the stage port and emit the cancelled terminal events before
@@ -460,6 +471,10 @@ the turn resets. At commit, session-correlated logs distinguish a complete
 semantic decision from the silence timeout, including whether the preceding
 score was incomplete or inference failed. These diagnostics do not change the
 wire protocol or the endpoint decision.
+
+Only unfinished response-bound append tasks keep the response gate closed.
+A completed task awaiting its cleanup callback does not block a new turn after
+barge-in. Active responses and unplayed output retain their own gates.
 
 ### Experimental output limits
 
@@ -666,8 +681,25 @@ support alone is not Qwen tool-call end-to-end support. Accepted results use
 their prepared candidate, while effective epoch cancellation uses
 `retire_pending_function_output` for queued work according to model policy.
 
-Nemotron's function-channel wire output is request-aligned. In runtime batches,
-the worker-provided spans select each request's last scheduled hidden row rather
+JoyAI-VL-Interaction uses the same call book for a different decision shape. Its
+model emits an action token (`</response> <note> </delegation> <question>`), so
+`parse_function_call` reads a call the plugin itself projected, not a native tool
+schema, and the declared function is one opt-in `delegate` entry. A recognised
+call short-circuits the rest of that stage output, so the plugin projects the call
+alone and the spoken note on its own ordinary path; the note therefore still
+reaches the audio stage while the call is published. An accepted result never
+enters `session.history`. It becomes a `[Delegated Results]` block in later JoyAI
+prompts, and `has_pending_tool_followup` reports whether one is still waiting.
+JoyAI's interaction is chunk based: a result is carried by observations until a
+stored reply answers it, reused once inside the chunk that answered it, and
+expired when the turn that asked it is cancelled. The chunk id and the
+"a reply of it stored text" flag live in the session runtime config rather than on
+the plugin, because one plugin instance serves every session of a deployment.
+Every hook that the session installs returns the complete runtime, not just its
+own keys: the session replaces the whole config, so a partial return would drop
+the model's TTS and prompt settings.
+
+Nemotron's function-channel wire output is request-aligned. In runtime batches,the worker-provided spans select each request's last scheduled hidden row rather
 than CUDA-graph padding; the worker's payload split preserves that mapping for
 the session data plane. Intermediate prefill chunks expose no function token
 and keep empty slots in mixed batches. The final prefill chunk and decode frames

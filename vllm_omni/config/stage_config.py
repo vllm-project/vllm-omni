@@ -354,6 +354,8 @@ class StagePipelineConfig:
     # The model keeps per-request execution state while awaiting the next
     # async chunk, so the parked request continues to consume model capacity.
     retains_state_across_chunks: bool = False
+    # The model may yield output before completing the current input unit.
+    supports_pending_generation: bool = False
     # Some stateful audio stages cannot roll back already consumed frames.
     supports_running_prefix_cache_reset: bool = True
     sampling_constraints: dict[str, Any] = field(default_factory=dict)
@@ -632,6 +634,7 @@ class StageDeployConfig:
     enable_broadcast_weight_load: bool | None = None
     num_weight_load_threads: int | None = None
     diffusion_offload_config: dict[str, Any] | None = None
+    kv_offload_config: dict[str, Any] | None = None
     # Compatibility aliases for existing callers and model-specific stage
     # lifecycles that are broader than the compact dit/text_encoder selector.
     enable_cpu_offload: bool | None = None
@@ -1129,6 +1132,14 @@ def _extract_platform_overrides(ps: dict[str, Any]) -> PlatformOverrides:
     return PlatformOverrides(overrides, ps.get("devices"), ps.get("env"))
 
 
+# Why a platform still rejects Model Runner V2. CUDA API aliases alone do not
+# adapt a platform worker, so an entry is removed only with the real integration.
+# NPU AR stages use the Ascend V2 runner (attention metadata and input state).
+_MRV2_UNSUPPORTED_PLATFORMS = {
+    "xpu": "the platform worker still uses the legacy chunk-transfer data plane",
+}
+
+
 def _apply_platform_overrides(
     deploy: DeployConfig,
     platform: str | None = None,
@@ -1205,11 +1216,9 @@ def _apply_platform_overrides(
         if stage.model_runner is not None and stage.model_runner not in ("v1", "v2"):
             raise ValueError(f"stage {stage.stage_id}: model_runner must be 'v1' or 'v2', got {stage.model_runner!r}")
     uses_v2 = deploy.model_runner == "v2" or any(stage.model_runner == "v2" for stage in deploy.stages)
-    if uses_v2 and platform in {"npu", "xpu"}:
-        raise NotImplementedError(
-            f"Model Runner V2 is not supported on {platform.upper()}: "
-            "the platform worker still uses the legacy chunk-transfer data plane."
-        )
+    reason = _MRV2_UNSUPPORTED_PLATFORMS.get(platform) if uses_v2 else None
+    if reason is not None:
+        raise NotImplementedError(f"Model Runner V2 is not supported on {platform.upper()}: {reason}.")
 
     return deploy
 
@@ -1289,6 +1298,8 @@ def _build_engine_args(
     """
     engine_args: dict[str, Any] = {"model_arch": ps.model_arch or pipeline.model_arch or None}
     engine_args["retains_state_across_chunks"] = ps.retains_state_across_chunks
+    if ps.supports_pending_generation:
+        engine_args["supports_pending_generation"] = True
     if ps.execution_type == StageExecutionType.DIFFUSION and ps.model_arch:
         engine_args.setdefault("model_class_name", ps.model_arch)
     if ps.engine_output_type is not None:

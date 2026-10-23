@@ -12,11 +12,16 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from itertools import count
-from typing import Any, TypeAlias
+from typing import TYPE_CHECKING, Any, Protocol, TypeAlias
 
 import numpy as np
 from omegaconf import OmegaConf
 from vllm.logger import init_logger
+from vllm.utils.import_utils import resolve_obj_by_qualname
+
+if TYPE_CHECKING:
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType, OmniSamplingParams
+    from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
 
@@ -61,6 +66,16 @@ class PolicyServerConfig:
         return _to_builtin_container(self.values)
 
 
+class OpenPIPromptBuilder(Protocol):
+    """Builds the first stage's prompt of a multi-stage policy from an observation.
+
+    Named by ``openpi_prompt_builder`` next to ``policy_server_config`` and
+    constructed with the engine's vLLM ``ModelConfig`` and the handshake values.
+    """
+
+    def build_prompt(self, obs: Mapping[str, Any]) -> OmniPromptType: ...
+
+
 class ServingRealtimeRobotOpenPI:
     """Robot policy serving layer for OpenPI protocol.
 
@@ -74,7 +89,9 @@ class ServingRealtimeRobotOpenPI:
     ) -> None:
         self.engine_client = engine_client
         self.model_name = model_name
-        self.policy_server_config = self._get_policy_server_config(engine_client)
+        policy_model_config = self._get_policy_model_config(engine_client)
+        self.policy_server_config = PolicyServerConfig.from_model_config(policy_model_config)
+        self.prompt_builder = self._load_prompt_builder(engine_client, policy_model_config, self.policy_server_config)
         self._request_counter = count()
 
     @classmethod
@@ -92,7 +109,8 @@ class ServingRealtimeRobotOpenPI:
             return None
 
     @staticmethod
-    def _get_policy_server_config(engine_client: Any) -> PolicyServerConfig:
+    def _get_policy_model_config(engine_client: Any) -> Any:
+        """The model config that declares ``policy_server_config``, normally the diffusion stage's."""
         model_config = None
         get_od_config = getattr(engine_client, "get_diffusion_od_config", None)
         if callable(get_od_config):
@@ -122,7 +140,31 @@ class ServingRealtimeRobotOpenPI:
 
         if model_config is None:
             model_config = getattr(engine_client, "model_config", None)
-        return PolicyServerConfig.from_model_config(model_config)
+        return model_config
+
+    @staticmethod
+    def _load_prompt_builder(
+        engine_client: Any,
+        policy_model_config: Any,
+        policy_server_config: PolicyServerConfig,
+    ) -> OpenPIPromptBuilder | None:
+        """Instantiate the policy's ``openpi_prompt_builder`` (a qualified class name), if any.
+
+        A policy whose first stage is autoregressive needs a prompt (token ids,
+        images) built from the observation; the deploy config names the class
+        next to ``policy_server_config``. It is not sent to clients.
+        """
+        if isinstance(policy_model_config, Mapping):
+            path = policy_model_config.get("openpi_prompt_builder")
+        else:
+            path = getattr(policy_model_config, "openpi_prompt_builder", None)
+        if path is None:
+            return None
+        try:
+            builder_cls = resolve_obj_by_qualname(str(path))
+        except (ImportError, AttributeError, ValueError) as exc:
+            raise RuntimeError(f"Cannot load openpi_prompt_builder {path!r}: {exc}") from exc
+        return builder_cls(getattr(engine_client, "model_config", None), policy_server_config.to_dict())
 
     def reset(self, obs: dict) -> None:
         """Compatibility hook; per-connection state lives in RobotRealtimeConnection."""
@@ -156,17 +198,47 @@ class ServingRealtimeRobotOpenPI:
         result = None
         # OpenPI policy serving is one request -> one action reply. AsyncOmni
         # exposes an async iterator, so consume it to completion and use the
-        # final output, matching other non-streaming OpenAI serving paths.
+        # final output, matching other non-streaming OpenAI serving paths. A
+        # multi-stage policy may also return earlier stages' outputs (for
+        # example reasoning text); the reply comes from the one with actions.
         async for output in self.engine_client.generate(
             prompt=request.prompt,
             request_id=request.request_id,
-            sampling_params_list=[request.sampling_params],
+            sampling_params_list=self._stage_sampling_params_list(request.sampling_params),
         ):
-            result = output
+            if result is None or _has_actions(output) or not _has_actions(result):
+                result = output
         if result is None:
             raise RuntimeError("Robot OpenPI request produced no output.")
 
         return self._extract_actions(result)
+
+    def _stage_sampling_params_list(self, diffusion_params: OmniDiffusionSamplingParams) -> list[OmniSamplingParams]:
+        """One sampling params entry per stage.
+
+        Multi-stage policies get every other stage's deploy defaults; the
+        observation's seed applies to all stages.
+        """
+        from vllm_omni.entrypoints.openai.stage_params import (
+            build_stage_sampling_params_list,
+            get_default_sampling_params_list,
+        )
+        from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+        stage_configs = list(getattr(self.engine_client, "stage_configs", None) or [])
+        if len(stage_configs) <= 1:
+            return [diffusion_params]
+        params_list = build_stage_sampling_params_list(
+            stage_configs,
+            get_default_sampling_params_list(self.engine_client),
+            diffusion_params=diffusion_params,
+            replace_diffusion_params=True,
+        )
+        if diffusion_params.seed is not None:
+            for params in params_list:
+                if not isinstance(params, OmniDiffusionSamplingParams):
+                    params.seed = diffusion_params.seed
+        return params_list
 
     def _next_request_id(self, session_id: str) -> str:
         return f"robot-{session_id}-{next(self._request_counter)}"
@@ -212,7 +284,7 @@ class ServingRealtimeRobotOpenPI:
             }
         )
 
-        prompt = obs.get("prompt", "")
+        prompt = obs.get("prompt", "") if self.prompt_builder is None else self.prompt_builder.build_prompt(robot_obs)
         if seed is not None:
             sampling_params.seed = int(seed)
         if "num_inference_steps" in sampling:
@@ -236,3 +308,8 @@ class ServingRealtimeRobotOpenPI:
         if isinstance(actions, Mapping):
             return {str(key): np.asarray(value, dtype=np.float32) for key, value in actions.items()}
         return np.asarray(actions, dtype=np.float32)
+
+
+def _has_actions(output: OmniRequestOutput) -> bool:
+    multimodal_output = getattr(output, "multimodal_output", None)
+    return isinstance(multimodal_output, Mapping) and multimodal_output.get("actions") is not None

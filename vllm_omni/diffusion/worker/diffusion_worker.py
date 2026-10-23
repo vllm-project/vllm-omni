@@ -94,7 +94,6 @@ from vllm_omni.worker.gpu_memory_utils import get_process_gpu_memory
 if TYPE_CHECKING:
     from multiprocessing.synchronize import Event
 
-    from vllm.device_allocator.cumem import CuMemAllocator
     from vllm.distributed.weight_transfer.base import WeightTransferEngine
 
 logger = init_logger(__name__)
@@ -236,10 +235,10 @@ def _force_cutlass_fp8_linear_kernel(quant_config: object | None) -> Iterator[No
     yield
 
 
-def _get_cumem_allocator_class() -> type[CuMemAllocator]:
-    from vllm.device_allocator.cumem import CuMemAllocator
+def _get_mem_allocator_instance() -> Any:
+    from vllm.device_allocator import get_mem_allocator_instance
 
-    return CuMemAllocator
+    return get_mem_allocator_instance()
 
 
 def _resolve_ir_op_priority(od_config: OmniDiffusionConfig, vllm_config: VllmConfig) -> Any:
@@ -986,8 +985,7 @@ class DiffusionWorker:
             and getattr(self.od_config, "kv_transfer_config", None) is not None
         ):
             raise ValueError("Cannot sleep while native KV connector memory is registered")
-        CuMemAllocator = _get_cumem_allocator_class()
-        allocator = CuMemAllocator.get_instance()
+        allocator = _get_mem_allocator_instance()
 
         usage_before = allocator.get_current_usage()
 
@@ -1038,8 +1036,7 @@ class DiffusionWorker:
             tags: List of memory pool tags to re-activate (e.g., ["weights"]
                   to match Level 1 sleep). If None, all pools are re-activated.
         """
-        CuMemAllocator = _get_cumem_allocator_class()
-        allocator = CuMemAllocator.get_instance()
+        allocator = _get_mem_allocator_instance()
         allocator.wake_up(tags)
         current_omni_platform.synchronize()
         if self.model_runner is not None and (tags is None or "kv_cache" in tags):
@@ -1178,8 +1175,7 @@ class DiffusionWorker:
         if is_sleep_enabled:
             current_omni_platform.synchronize()
             gc.collect()
-            CuMemAllocator = _get_cumem_allocator_class()
-            allocator = CuMemAllocator.get_instance()
+            allocator = _get_mem_allocator_instance()
             if tag == "weights":
                 assert allocator.get_current_usage() == 0, "Sleep mode can only be used for one instance per process."
                 self._owns_sleep_pool = True
@@ -1272,18 +1268,18 @@ class DiffusionWorker:
             logger.exception("Failed to collect diffusion model resources during shutdown")
         if owns_sleep_pool:
             try:
-                CuMemAllocator = _get_cumem_allocator_class()
-                allocator = CuMemAllocator.get_instance()
+                allocator = _get_mem_allocator_instance()
                 if allocator.get_current_usage():
                     gc.collect()
-                from vllm_omni.patch import release_cumem_allocations_for_shutdown
+                if current_omni_platform.is_cuda() or current_omni_platform.is_rocm():
+                    from vllm_omni.patch import release_cumem_allocations_for_shutdown
 
-                retired_bytes = release_cumem_allocations_for_shutdown(allocator)
-                if retired_bytes:
-                    logger.info(
-                        "Diffusion shutdown retired %.2f GiB of remaining CuMem allocations",
-                        retired_bytes / GiB_bytes,
-                    )
+                    retired_bytes = release_cumem_allocations_for_shutdown(allocator)
+                    if retired_bytes:
+                        logger.info(
+                            "Diffusion shutdown retired %.2f GiB of remaining CuMem allocations",
+                            retired_bytes / GiB_bytes,
+                        )
                 allocator.release_pools()
                 self._owns_sleep_pool = False
                 # Re-collect after dropping the pool references so their

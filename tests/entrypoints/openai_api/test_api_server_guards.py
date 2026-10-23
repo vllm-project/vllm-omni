@@ -235,6 +235,7 @@ _MULTISTAGE_APP_STATE_KEYS = {
     "enable_server_load_tracking",
     "server_load_metrics",
 }
+# The OpenPI robot server is None unless the policy declares policy_server_config.
 _MULTISTAGE_MUST_BE_NONE = {
     "openai_serving_duplex",
     "openai_serving_realtime_robot",
@@ -1284,13 +1285,18 @@ async def test_pure_diffusion_speech_forwards_media_access_args(monkeypatch, tmp
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("ming3", [False, True, "tts"])
 @pytest.mark.parametrize("supported_tasks", [("generate",), ("embed",)])
-async def test_multistage_app_state_key_snapshot(monkeypatch, mocker, tmp_path, supported_tasks) -> None:
+@pytest.mark.parametrize("policy_server", [False, True])
+async def test_multistage_app_state_key_snapshot(
+    monkeypatch, mocker, tmp_path, supported_tasks, ming3, policy_server
+) -> None:
     """Lock multi-stage ``app.state`` keys after init, including live vs None.
 
     Fails if chat/speech/video/realtime/tokenization keys disappear or are
     left as None after init refactors — classic “route still registered,
-    handler never wired” failure mode.
+    handler never wired” failure mode. A multi-stage robot policy (one that
+    declares ``policy_server_config``) also gets the OpenPI server.
     """
     engine = _FakeEngineClient(
         stage_configs=[object(), object()],
@@ -1315,6 +1321,9 @@ async def test_multistage_app_state_key_snapshot(monkeypatch, mocker, tmp_path, 
             self.kwargs = kwargs
             self.warmup_calls = 0
 
+        def _has_ming3_talker_stage(self):
+            return ming3 is True
+
         def warmup(self):
             self.warmup_calls += 1
 
@@ -1326,6 +1335,8 @@ async def test_multistage_app_state_key_snapshot(monkeypatch, mocker, tmp_path, 
     class _FakeSpeech(_FakeCtor):
         def __init__(self, *args, **kwargs):
             speech_kwargs.update(kwargs)
+
+        _tts_model_type = "ming3_audio_tts" if ming3 == "tts" else None
 
         async def warmup(self):
             return None
@@ -1352,23 +1363,44 @@ async def test_multistage_app_state_key_snapshot(monkeypatch, mocker, tmp_path, 
     monkeypatch.setattr(api_server, "OmniStreamingSpeechHandler", _FakeCtor)
     monkeypatch.setattr(api_server, "create_streaming_video_handler", lambda **_k: _marker("streaming_video"))
     monkeypatch.setattr(api_server, "OmniOpenAIServingVideo", _FakeCtor)
+    from unittest.mock import AsyncMock
+
+    register = AsyncMock()
+    monkeypatch.setattr("vllm_omni.entrypoints.openai.ming3_voices.register_model_voice_presets", register)
+    if policy_server:
+        monkeypatch.setattr(
+            api_server.ServingRealtimeRobotOpenPI,
+            "create_policy_server",
+            classmethod(lambda cls, *a, **k: _marker("openpi")),
+        )
 
     state = State()
     await api_server.omni_init_app_state(engine, state, _minimal_args(log_error_stack=True))
     assert speech_kwargs["speech_cache_config"].resolve_max_bytes == 1024
     assert speech_kwargs["speech_cache_config"].resolve_max_entries == 2048
     assert speech_kwargs["speech_cache_config"].speaker_max_bytes == 8
+    if (ming3 is True and "generate" in supported_tasks) or ming3 == "tts":
+        register.assert_awaited_once()
+        assert register.call_args.args[0] is state.openai_serving_speech
+        assert register.call_args.args[1] == _minimal_args().model
+        if ming3 is True:
+            assert state.openai_serving_chat._ming3_speech_service is state.openai_serving_speech
+        else:
+            assert not hasattr(state.openai_serving_chat, "_ming3_speech_service")
+    else:
+        register.assert_not_awaited()
 
     disabled = (
         set()
         if "generate" in supported_tasks
         else {"openai_serving_chat", "openai_serving_chat_batch", "openai_streaming_video"}
     )
+    robot = {"openai_serving_realtime_robot"} if policy_server else set()
     _assert_app_state_snapshot(
         state,
         expected_keys=_MULTISTAGE_APP_STATE_KEYS,
-        must_be_wired=_MULTISTAGE_MUST_BE_WIRED - disabled,
-        must_be_none=_MULTISTAGE_MUST_BE_NONE | disabled,
+        must_be_wired=(_MULTISTAGE_MUST_BE_WIRED | robot) - disabled,
+        must_be_none=(_MULTISTAGE_MUST_BE_NONE - robot) | disabled,
     )
     assert state.online_renderer.kwargs["log_error_stack"] is True
     assert state.online_renderer.warmup_calls == 1

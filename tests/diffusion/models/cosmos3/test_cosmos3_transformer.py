@@ -534,6 +534,53 @@ def test_edge_validates_required_relu2_weights() -> None:
     model.validate_loaded_weights(missing_k_norm)
 
 
+def test_edge_weight_validation_skips_pp_missing_layers() -> None:
+    from vllm.model_executor.models.utils import PPMissingLayer
+
+    from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3_edge import (
+        Cosmos3EdgeVFMTransformer,
+    )
+
+    def _make_stage(*, first: bool) -> Cosmos3EdgeVFMTransformer:
+        model = object.__new__(Cosmos3EdgeVFMTransformer)
+        nn.Module.__init__(model)
+        model.num_hidden_layers = 2
+        model.qk_norm_for_diffusion = True
+        model.use_und_k_norm_for_gen = True
+        # PP=2 layout from make_layers: each stage owns one GEN layer and the
+        # UND backbone lives only on the first stage.
+        model.language_model = nn.Linear(1, 1) if first else PPMissingLayer()
+        model.gen_layers = nn.ModuleList(
+            [nn.Linear(1, 1), PPMissingLayer()] if first else [PPMissingLayer(), nn.Linear(1, 1)]
+        )
+        return model
+
+    first_stage = _make_stage(first=True)
+    last_stage = _make_stage(first=False)
+
+    first_loaded = {
+        f"transformer.language_model.layers.{i}.{suffix}.weight"
+        for i in range(2)
+        for suffix in ("mlp.up_proj", "mlp.down_proj", "self_attn.k_norm_und_for_gen")
+    } | {
+        "transformer.gen_layers.0.mlp.up_proj.weight",
+        "transformer.gen_layers.0.mlp.down_proj.weight",
+    }
+    last_loaded = {
+        "transformer.gen_layers.1.mlp.up_proj.weight",
+        "transformer.gen_layers.1.mlp.down_proj.weight",
+    }
+
+    first_stage.validate_loaded_weights(first_loaded)
+    last_stage.validate_loaded_weights(last_loaded)
+
+    # Layers this stage owns are still required.
+    with pytest.raises(ValueError, match=r"gen_layers\.1\.mlp\.up_proj"):
+        last_stage.validate_loaded_weights(last_loaded - {"transformer.gen_layers.1.mlp.up_proj.weight"})
+    with pytest.raises(ValueError, match=r"language_model\.layers\.1\.mlp\.down_proj"):
+        first_stage.validate_loaded_weights(first_loaded - {"transformer.language_model.layers.1.mlp.down_proj.weight"})
+
+
 def test_edge_gen_cached_k_is_normalized_but_reasoner_uses_raw_k() -> None:
     from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import RMSNorm
     from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3_edge import (
@@ -842,8 +889,8 @@ def test_sp_releases_full_gen_embedding_during_stack(
     from vllm_omni.diffusion.hooks import sequence_parallel
     from vllm_omni.diffusion.models.cosmos3 import transformer_cosmos3
 
-    full_refs = []
-    full_pointers = []
+    full_refs: list = []
+    full_pointers: list = []
     layer_calls = 0
     total_length = sequence_length * (control_count + 1)
     uses_sp = control_count <= 1
@@ -1547,6 +1594,138 @@ def test_shard_gen_prep_rejects_inputs_already_in_execution_layout(monkeypatch: 
     # A deferred gather without sharding would gather a full-layout tensor.
     with pytest.raises(RuntimeError, match="_shard_gen_prep"):
         model._run_gen_stack(prep._replace(defer_gen_gather=True))
+
+
+def test_transformer_builds_full_layer_replica_without_pp_init(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm_omni.diffusion.models.cosmos3 import transformer_cosmos3
+
+    model = transformer_cosmos3.Cosmos3VFMTransformer(
+        SimpleNamespace(tf_model_config=_tiny_cosmos3_config(num_hidden_layers=2), dtype=torch.float32)
+    )
+    # No PP group was initialized: the transformer must still construct and
+    # behave like a single-stage pipeline covering every layer.
+    assert model.start_layer == 0
+    assert model.end_layer == 2
+    assert len(model.gen_layers) == 2
+    assert all(not isinstance(layer, transformer_cosmos3.PPMissingLayer) for layer in model.gen_layers)
+
+    assert isinstance(model.gen_sp_prepare, transformer_cosmos3.Cosmos3GenSPPrepare)
+
+
+def test_model_cpu_offload_rejects_pipeline_parallel(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm_omni.diffusion.models.cosmos3 import transformer_cosmos3
+
+    model = transformer_cosmos3.Cosmos3VFMTransformer(
+        SimpleNamespace(tf_model_config=_tiny_cosmos3_config(num_hidden_layers=2), dtype=torch.float32)
+    )
+    monkeypatch.setattr(transformer_cosmos3, "_pp_parallel_active", lambda: True)
+    with pytest.raises(NotImplementedError, match="pipeline parallelism"):
+        model.enable_model_cpu_offload(device=torch.device("cpu"), pin_memory=False)
+    assert not getattr(model, "_model_cpu_offload_enabled", False)
+
+
+def test_build_pp_intermediate_tensors_sends_und_cache_on_first_step_only() -> None:
+    from vllm_omni.diffusion.models.cosmos3 import transformer_cosmos3
+
+    model = transformer_cosmos3.Cosmos3VFMTransformer(
+        SimpleNamespace(tf_model_config=_tiny_cosmos3_config(num_hidden_layers=2), dtype=torch.float32)
+    )
+    model.cached_kv = [(torch.zeros(1), torch.ones(1)) for _ in range(2)]
+    model.cached_freqs_gen = (torch.zeros(1, 2, 1, 8), torch.ones(1, 2, 1, 8))
+    model.reset_pp_step()
+    hidden = torch.randn(1, 4, 8)
+
+    first = model._build_pp_intermediate_tensors(hidden)
+    assert torch.equal(first["hidden_gen"], hidden)
+    assert torch.equal(first["freqs_cos"], model.cached_freqs_gen[0])
+    assert torch.equal(first["freqs_sin"], model.cached_freqs_gen[1])
+    assert torch.equal(first["cached_k_0"], model.cached_kv[0][0])
+    assert torch.equal(first["cached_v_1"], model.cached_kv[1][1])
+
+    second = model._build_pp_intermediate_tensors(hidden)
+    assert set(second.tensors) == {"hidden_gen"}
+
+
+def test_maybe_load_und_cache_and_prep_sizes_from_pp_intermediate_tensors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm_omni.diffusion.models.cosmos3 import transformer_cosmos3
+
+    monkeypatch.setattr(transformer_cosmos3, "_get_ulysses_state", lambda: (1, 0, None))
+
+    model = transformer_cosmos3.Cosmos3VFMTransformer(
+        SimpleNamespace(tf_model_config=_tiny_cosmos3_config(num_hidden_layers=2), dtype=torch.float32)
+    )
+    model.cached_kv = [(torch.zeros(1), torch.ones(1)) for _ in range(2)]
+    model.cached_freqs_gen = (torch.zeros(1, 2, 1, 8), torch.ones(1, 2, 1, 8))
+    model.reset_pp_step()
+    hidden = torch.randn(1, 4, 8)
+    its = model._build_pp_intermediate_tensors(hidden)
+
+    receiver = transformer_cosmos3.Cosmos3VFMTransformer(
+        SimpleNamespace(tf_model_config=_tiny_cosmos3_config(num_hidden_layers=2), dtype=torch.float32)
+    )
+    receiver._maybe_load_und_cache_from_intermediate_tensors(its)
+    assert receiver.cached_kv is not None and len(receiver.cached_kv) == 2
+    assert receiver.cached_freqs_gen == model.cached_freqs_gen
+
+    action = torch.zeros(1, 3, 4)
+    sound = torch.zeros(1, 3, 2)
+    prep = receiver._prep_from_pp_intermediate_tensors(
+        its,
+        (1, 2, 2),
+        action_latents=action,
+        action_domain_ids=torch.tensor([0]),
+        sound_latents=sound,
+    )
+    assert torch.equal(prep.hidden_gen, hidden)
+    assert prep.freqs_gen is None
+    assert (prep.t, prep.h, prep.w) == (1, 2, 2)
+    # latent_patch_size=1: hp*wp == h*w
+    assert prep.s_video == 1 * 2 * 2
+    assert prep.s_action == 3
+    assert prep.s_sound == 2
+    assert prep.has_action and prep.has_sound and not prep.has_control
+
+
+def test_run_gen_layers_rejects_cache_dit_wrapper_under_pp(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm_omni.diffusion.models.cosmos3 import transformer_cosmos3
+
+    monkeypatch.setattr(transformer_cosmos3, "_get_ulysses_state", lambda: (1, 0, None))
+    model = transformer_cosmos3.Cosmos3VFMTransformer(
+        SimpleNamespace(tf_model_config=_tiny_cosmos3_config(num_hidden_layers=2), dtype=torch.float32)
+    )
+    monkeypatch.setattr(transformer_cosmos3, "_pp_parallel_active", lambda: True)
+    model.cached_kv = [(torch.zeros(1), torch.ones(1)) for _ in range(2)]
+    freqs = (torch.zeros(1, 2, 1, 8), torch.ones(1, 2, 1, 8))
+    model.cached_freqs_gen = freqs
+
+    class PassthroughWrapper(nn.Module):
+        def forward(self, hidden, **kwargs):
+            return hidden
+
+    # Cache-dit replaces gen_layers with a single grouped wrapper.
+    model.gen_layers = nn.ModuleList([PassthroughWrapper()])
+
+    model.start_layer, model.end_layer = 0, 1  # a PP rank slice
+    with pytest.raises(NotImplementedError, match="Cache-Dit"):
+        model._run_gen_layers(
+            torch.randn(1, 2, 8),
+            freqs_gen=freqs,
+            gather_output=False,
+        )
+
+    # A full replica slice keeps the wrapper loop working.
+    model.start_layer, model.end_layer = 0, 2
+    hidden = torch.randn(1, 2, 8)
+    torch.testing.assert_close(
+        model._run_gen_layers(
+            hidden,
+            freqs_gen=freqs,
+            gather_output=False,
+        ),
+        hidden,
+    )
 
 
 @pytest.mark.parametrize("grouped", [False, True])

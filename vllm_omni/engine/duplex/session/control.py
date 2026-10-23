@@ -257,6 +257,10 @@ class SessionControl:
     async def on_session_update(self, payload: dict[str, object], *, realtime_event_id: str | None) -> None:
         session = self._ctx.session
         model_state = self._ctx.model_state
+        # Staged detectors have not processed audio, so a rejected candidate
+        # needs no cleanup. Upstream dropped PendingTurnDetectionUpdate.reject.
+        pending_turn_detection: PendingTurnDetectionUpdate | None = None
+
         try:
             pending_turn_detection = PendingTurnDetectionUpdate.prepare(
                 payload,
@@ -311,6 +315,11 @@ class SessionControl:
         except DuplexConfigError as exc:
             self._out.emit_error(exc.code, str(exc) or "session.update was rejected", event_id=realtime_event_id)
             return
+        except Exception as exc:
+            # Still before the live session adopts the candidate. A stamped
+            # error means nothing was applied, including a staged detector.
+            self._out.emit_error("internal_error", str(exc), event_id=realtime_event_id)
+            return
         # Also when the update only turns auto_response on under a live semantic_vad.
         unsupported = self._semantic_vad_unsupported(
             pending_turn_detection.config if pending_turn_detection is not None else self._config,
@@ -352,17 +361,108 @@ class SessionControl:
         except Exception as exc:
             self._out.emit_error("runtime_signal_failed", str(exc), event_id=realtime_event_id)
             return
-        session.replace_config(candidate_config)
-        session.replace_runtime_config(candidate_runtime_config)
         try:
-            session.touch_lease(DuplexLeaseActivity.SIGNAL)
+            # Projection defaults do not depend on the live config. A failure
+            # here is still a rejection: the session has not adopted anything.
+            projector = self._out.require_projector()
+            projector.apply_session_defaults(payload)
+        except Exception as exc:
+            self._out.emit_error("internal_error", str(exc), event_id=realtime_event_id)
+            return
+
+        # Past this point the projector has the new wire defaults. Do not emit
+        # a stamped error: serving would keep the old format and rate.
+        def adopted_session() -> dict[str, object]:
+            # The object serving applies. This is the patch apply_session_defaults
+            # already accepted. Copy so a later mutation cannot rewrite the event.
+            public = dict(payload)
+            public["id"] = session.session_id
+            return public
+
+        def without_turn_detection(public: dict[str, object]) -> dict[str, object]:
+            # Shallow-copy the nested audio maps before dropping turn detection,
+            # so the live payload the projector already read stays intact.
+            public.pop("turn_detection", None)
+            audio = public.get("audio")
+            if isinstance(audio, dict):
+                audio = dict(audio)
+                audio_input = audio.get("input")
+                if isinstance(audio_input, dict):
+                    audio_input = dict(audio_input)
+                    audio_input.pop("turn_detection", None)
+                    audio["input"] = audio_input
+                public["audio"] = audio
+            return public
+
+        previous_config = session.config
+        runtime_adopted = False
+        turn_committed = pending_turn_detection is None
+        try:
+            session.replace_config(candidate_config)
+            session.replace_runtime_config(candidate_runtime_config)
+            runtime_adopted = True
+            try:
+                session.touch_lease(DuplexLeaseActivity.SIGNAL)
+            except Exception:
+                pass
+            if pending_turn_detection is not None:
+                self._config, self._detector = pending_turn_detection.commit(self._detector)
+                turn_committed = True
+            try:
+                public: dict[str, object] = session.as_public_dict()
+            except Exception:
+                logger.exception(
+                    "session.update %s was adopted but its public snapshot failed",
+                    realtime_event_id,
+                )
+                public = adopted_session()
+            self._out.emit({"type": "session.updated", "session": public})
         except Exception:
-            pass
-        if pending_turn_detection is not None:
-            self._config, self._detector = pending_turn_detection.commit(self._detector)
-        projector = self._out.require_projector()
-        projector.apply_session_defaults(payload)
-        self._out.emit({"type": "session.updated", "session": session.as_public_dict()})
+            logger.exception(
+                "session.update %s was adopted but publishing it failed",
+                realtime_event_id,
+            )
+            # replace_config assigns before it can raise. Finish the runtime
+            # config and the staged detector once that assignment happened.
+            # Otherwise the echo would advertise a VAD config that is not live,
+            # and the engine would keep the new config against the old runtime
+            # config. If the runtime replace cannot be finished, put the
+            # previous config back. A staged detector has not processed audio,
+            # so dropping it is enough.
+            if session.config is candidate_config and not runtime_adopted:
+                try:
+                    session.replace_runtime_config(candidate_runtime_config)
+                    runtime_adopted = True
+                except Exception:
+                    logger.exception(
+                        "session.update %s could not finish replacing its runtime config",
+                        realtime_event_id,
+                    )
+                    try:
+                        # Not replace_config: that would count the candidate's
+                        # seed again and bump config_generation a second time.
+                        session.restore_config(previous_config)
+                    except Exception:
+                        logger.exception(
+                            "session.update %s could not restore its previous config",
+                            realtime_event_id,
+                        )
+            if session.config is candidate_config:
+                if pending_turn_detection is not None and not turn_committed:
+                    try:
+                        self._config, self._detector = pending_turn_detection.commit(self._detector)
+                        turn_committed = True
+                    except Exception:
+                        logger.exception(
+                            "session.update %s could not commit its turn detection",
+                            realtime_event_id,
+                        )
+                public = adopted_session()
+                if not turn_committed:
+                    public = without_turn_detection(public)
+            else:
+                public = {"id": session.session_id}
+            self._out.emit({"type": "session.updated", "session": public})
 
     async def _on_conversation_item_create(self, event: dict[str, object]) -> None:
         session = self._ctx.session

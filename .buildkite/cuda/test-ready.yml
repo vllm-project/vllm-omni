@@ -41,6 +41,8 @@ steps:
       - label: "Diffusion · FlashAttention Test"
         timeout_in_minutes: 20
         commands:
+          - uv pip install --system --no-deps 'fastvideo-kernel==0.3.4'
+          - python3 -c 'from fastvideo_kernel.block_sparse_attn import block_sparse_attn_triton'
           - timeout 15m pytest -s -v tests/diffusion/attention/ tests/diffusion/utils/test_chunked_transfer.py -m 'core_model and cuda and L4 and cards_1' --run-level "core_model"
         mirror_hardwares: l4_1
 

@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 from numpy.typing import NDArray
+from vllm.multimodal.image import open_image
 from vllm.multimodal.media import MediaConnector
 from vllm.sampling_params import SamplingParams
 
@@ -41,6 +42,7 @@ from vllm_omni.engine.duplex.plugin import (
     reject_changed_runtime_value,
     reject_private_runtime_keys,
 )
+from vllm_omni.model_executor.common.duplex.payload import payload_audio
 from vllm_omni.model_executor.common.duplex.payload import payload_sample_count as _duplex_pcm_sample_count
 from vllm_omni.model_executor.common.request_outputs import coerce_int as _coerce_int
 from vllm_omni.model_executor.common.request_outputs import coerce_int_list as _coerce_int_list
@@ -144,7 +146,7 @@ def _duplex_base_frame_blocks(frame: str, tile_pixels: int | None) -> int:
 
     try:
         raw = b64decode(frame, validate=True)
-        with Image.open(BytesIO(raw)) as image:
+        with open_image(BytesIO(raw)) as image:
             width, height = image.size
     except (BinasciiError, ValueError, OSError, Image.DecompressionBombError):
         return _DUPLEX_HD_SLICES_PER_BASE_FRAME
@@ -181,6 +183,10 @@ def _duplex_vision_tokens(payload: object, *, tile_pixels: int | None = None) ->
 def duplex_payload_is_exact_chunks(payload: object) -> bool:
     sample_count = _duplex_pcm_sample_count(payload)
     return sample_count is not None and sample_count != 0 and sample_count % _DUPLEX_CHUNK_SAMPLES == 0
+
+
+def _duplex_payload_is_vision_only(payload: object) -> bool:
+    return bool(_duplex_frames(payload)) and payload_audio(payload) is None
 
 
 def duplex_first_append_unit_count(payload: object) -> int | None:
@@ -245,15 +251,32 @@ def build_duplex_data_plane_prompt(
     final: bool,
 ) -> dict[str, object]:
     # Computed once: with a known tile this decodes the stacked pair's first frame.
+    # The buffer marks the first payload that actually carries PCM. A VISION
+    # unit advances the append sequence without opening the mel window, so
+    # ``seq`` alone cannot tell that the following speech is still the first
+    # audio window.
+    first_audio_window = isinstance(payload, dict) and payload.get("first_audio_window") is True
+    if first_audio_window:
+        payload = {key: value for key, value in payload.items() if key != "first_audio_window"}
     vision_tokens = _duplex_vision_tokens(payload, tile_pixels=_duplex_vision_tile_pixels(runtime_config))
     token_budget = _duplex_audio_token_budget(payload) + vision_tokens
-    if seq <= 1:
-        context_reserve = duplex_first_append_context_reserve(runtime_config)
-        token_budget += context_reserve
+    if _duplex_payload_is_vision_only(payload):
+        # Surplus slots are filled with </unit> pad embeddings that stay in the KV.
+        # A VISION unit is <unit> + frame blocks; later units first close the
+        # previous one with its sampled terminator + </unit>.
+        lead_tokens = duplex_first_append_context_reserve(runtime_config) if seq <= 1 else 2
+        token_budget = lead_tokens + 1 + vision_tokens
+    elif seq <= 1 or first_audio_window:
+        # After a VISION unit the session context is already in the KV. The
+        # first audio window still closes that unit (terminator + </unit>)
+        # and then builds fewer units than one per buffered second.
+        lead_tokens = 2 if seq > 1 else duplex_first_append_context_reserve(runtime_config)
         first_units = duplex_first_append_unit_count(payload)
         if first_units is not None:
-            token_budget = context_reserve + first_units * 12 - 1 + vision_tokens
-    if seq > 1 and duplex_payload_is_exact_chunks(payload):
+            token_budget = lead_tokens + first_units * 12 - 1 + vision_tokens
+        else:
+            token_budget += lead_tokens
+    if seq > 1 and not first_audio_window and duplex_payload_is_exact_chunks(payload):
         token_budget += 1
         # Serving already pads the final residual audio. Stage0 does not
         # append another silent unit, so final must not reserve extra slots.

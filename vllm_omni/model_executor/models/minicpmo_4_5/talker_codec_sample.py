@@ -27,9 +27,66 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import torch
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
 
 VOCAB_SIZE = 6562
 HISTORY_WINDOW = 16
+
+# Engine steps 6a+7b run as one Triton kernel on NPU (adopted 2026-10-17 after a
+# 200-case bit-exact verification). Two independent controls:
+#   - ``talker_codec_fused_prelude: false`` in the stage connector's ``extra``
+#     block forces the eager chain (accuracy triage, e.g. after a CANN/torch_npu
+#     upgrade). The key is a no-op off NPU or without Triton.
+#   - ``_FUSED_PRELUDE_OK`` is a process-wide, permanent latch: one failed
+#     compile or launch turns it off and every later step takes the eager chain.
+_FUSED_PRELUDE_OK = True
+_FUSED_PRELUDE_WARMED = False
+_PRELUDE_BLOCK = 1024
+
+try:  # Triton is NPU-only; other backends keep the eager prologue.
+    import triton
+    import triton.language as tl
+
+    @triton.jit
+    def _rep_pen_temp_kernel(
+        x_ptr,
+        hist_ptr,
+        hlen_ptr,
+        pen_ptr,
+        temp_ptr,
+        out_ptr,
+        vocab_size: tl.constexpr,
+        hist_len: tl.constexpr,
+        block_size: tl.constexpr,
+    ):
+        """One pass over the vocab: history-count rep penalty, then /temp.
+
+        Bit-for-bit twin of the eager pair `_repetition_penalty_scaling`
+        plus `logits / temperature`: integer counts, the same exp2/log2 pow
+        form the eager torch.pow compiles to, and the same op order
+        (sign-dependent penalty first, temperature division last).
+        """
+        pid = tl.program_id(0)
+        offs = pid * block_size + tl.arange(0, block_size)
+        mask = offs < vocab_size
+        pen = tl.load(pen_ptr)
+        temp = tl.load(temp_ptr)
+        hlen = tl.load(hlen_ptr)
+        count = tl.zeros([block_size], dtype=tl.int32)
+        for h in tl.static_range(hist_len):
+            tok = tl.load(hist_ptr + h).to(tl.int32)
+            count += tl.where((offs == tok) & (h < hlen), 1, 0)
+        x = tl.load(x_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+        alpha = tl.exp2(tl.log2(pen) * count.to(tl.float32))
+        x = tl.where(x < 0, x * alpha, x / alpha)
+        x = x / temp
+        tl.store(out_ptr + offs, x, mask=mask)
+
+    _HAS_TRITON = True
+except Exception:  # pragma: no cover - triton missing/CPU
+    _HAS_TRITON = False
 
 
 @dataclass(frozen=True)
@@ -97,6 +154,27 @@ def _stop_id_tuple(eos_token_id: int, min_tokens_stop_ids: tuple[int, ...]) -> t
     return tuple(dict.fromkeys((int(eos_token_id), *min_tokens_stop_ids)))
 
 
+# The censoring step runs once per codec frame and the K-step loop calls it
+# once per frame per decode step, so rebuilding the index tensor from the
+# Python tuple with torch.tensor(...) -- a blocking H2D copy -- is the
+# dominant single host cost of this path under py-spy sampling. stop_ids is
+# an immutable tuple of ints and the tensor is only ever consumed as an index
+# (index_select/index_copy read it, never write it), so one tensor per
+# (stop set, device) can be shared across frames and requests; the persistent
+# storage also gives graph capture a stable address.
+_STOP_INDEX_CACHE: dict[tuple[tuple[int, ...], str], torch.Tensor] = {}
+
+
+def _stop_index_tensor(stop_ids: tuple[int, ...], device: torch.device) -> torch.Tensor:
+    """One device index tensor per (stop set, device), built on first use."""
+    key = (stop_ids, str(device))
+    cached = _STOP_INDEX_CACHE.get(key)
+    if cached is None:
+        cached = torch.tensor(stop_ids, dtype=torch.long, device=device)
+        _STOP_INDEX_CACHE[key] = cached
+    return cached
+
+
 def _censor_stop_logits(
     logits: torch.Tensor,
     state: TalkerCodecDeviceState,
@@ -115,7 +193,7 @@ def _censor_stop_logits(
     overrides the floor for the duplex turn-end drain window, which the
     ``step < min_tokens`` criterion cannot express.
     """
-    stop_index = torch.tensor(stop_ids, dtype=torch.long, device=logits.device)
+    stop_index = _stop_index_tensor(stop_ids, logits.device)
     stop_logits = logits.index_select(-1, stop_index)
     if eos_window_masked:
         censored = torch.full_like(stop_logits, float("-inf"))
@@ -205,6 +283,74 @@ def _apply_stream_penalties(
     return logits
 
 
+def _rep_pen_temp_fused(
+    logits: torch.Tensor,
+    state: TalkerCodecDeviceState,
+    repetition_penalty: torch.Tensor,
+    temperature: torch.Tensor,
+) -> torch.Tensor | None:
+    """Fused rep-penalty + temperature prologue on NPU; None if unsupported."""
+    global _FUSED_PRELUDE_OK
+    if not _HAS_TRITON or logits.device.type != "npu":
+        return None
+    vocab = logits.shape[-1]
+    flat = logits.reshape(1, vocab)
+    out = torch.empty_like(flat)
+    grid = (triton.cdiv(vocab, _PRELUDE_BLOCK),)
+    try:
+        _rep_pen_temp_kernel[grid](
+            flat,
+            state.history,
+            state.history_len,
+            repetition_penalty.reshape(1, 1),
+            temperature.reshape(1, 1),
+            out,
+            vocab_size=vocab,
+            hist_len=HISTORY_WINDOW,
+            block_size=_PRELUDE_BLOCK,
+            num_warps=4,
+        )
+    except Exception as exc:
+        # Compile or launch failure. The latch is process-wide and permanent: every
+        # later step in this process takes the eager chain. Failures inside an
+        # already captured graph replay never reach this handler.
+        _FUSED_PRELUDE_OK = False
+        logger.warning("fused talker codec prelude disabled after a kernel failure: %s", exc)
+        return None
+    return out.reshape(logits.shape)
+
+
+def warmup_fused_prelude(device: torch.device, enabled: bool = True) -> None:
+    """Compile the fused kernel once, before any graph capture.
+
+    The first launch pays the Triton compile; running it here settles
+    ``_FUSED_PRELUDE_OK`` outside capture, so a compile failure downgrades the
+    process instead of poisoning a capture that just saw a failed launch.
+    Idempotent, and a no-op off NPU, without Triton, or when disabled -- an
+    eager-only configuration must never touch the kernel, because after a
+    CANN/torch_npu upgrade a broken kernel can fault the device instead of
+    raising.
+    """
+    global _FUSED_PRELUDE_WARMED
+    if not enabled or _FUSED_PRELUDE_WARMED or not _HAS_TRITON or device.type != "npu":
+        return
+    _FUSED_PRELUDE_WARMED = True
+    state = TalkerCodecDeviceState(
+        history=torch.zeros(HISTORY_WINDOW, dtype=torch.long, device=device),
+        history_len=torch.zeros(1, dtype=torch.int32, device=device),
+        step=torch.zeros(1, dtype=torch.int32, device=device),
+        max_tokens=torch.ones(1, dtype=torch.int32, device=device),
+        finished=torch.zeros(1, dtype=torch.bool, device=device),
+    )
+    logits = torch.zeros(1, VOCAB_SIZE, device=device)
+    _rep_pen_temp_fused(
+        logits,
+        state,
+        torch.ones(1, device=device),
+        torch.ones(1, device=device),
+    )
+
+
 def prepare_codec_logits(
     raw_logits: torch.Tensor,
     state: TalkerCodecDeviceState,
@@ -220,6 +366,7 @@ def prepare_codec_logits(
     frequency_penalty: float = 0.0,
     presence_penalty: float = 0.0,
     eos_window_masked: bool = False,
+    fused_prelude: bool = True,
 ) -> torch.Tensor:
     """Prepare and filter logits without changing native NPU RNG semantics.
 
@@ -227,6 +374,8 @@ def prepare_codec_logits(
     which runs after temperature and before top-k/top-p (``builtin.py:102-113``).
     ``min_tokens_stop_ids`` widens the censored stop set beyond the codec EOS;
     ``frequency_penalty``/``presence_penalty`` subtract the whole-stream counts.
+    ``fused_prelude=False`` (stage connector ``extra`` key
+    ``talker_codec_fused_prelude``) forces the eager chain for accuracy triage.
     Every one of them is a no-op at its default value.
     """
     stop_ids = _stop_id_tuple(eos_token_id, min_tokens_stop_ids)
@@ -239,13 +388,25 @@ def prepare_codec_logits(
         stop_ids=stop_ids,
         eos_window_masked=eos_window_masked,
     )
-    # Engine step 6a: repetition penalty over the codec history window.
-    logits = _repetition_penalty_scaling(logits, state, repetition_penalty)
-    # Engine steps 6b/6c: frequency and presence penalties over the whole stream.
-    logits = _apply_stream_penalties(logits, state, frequency_penalty, presence_penalty)
-    # Engine step 7b: temperature is applied after the penalties. The division
-    # also gives the in-place masks below a tensor of their own.
-    logits = logits / temperature.reshape(1, 1)
+    # Engine step 6a + 7b: repetition penalty then temperature. On NPU the
+    # pair runs as one fused Triton kernel when the whole-stream penalties
+    # are no-ops (they sit between the two in the eager order, so non-zero
+    # penalty requests fall back to the eager chain below).
+    fused = (
+        _rep_pen_temp_fused(logits, state, repetition_penalty, temperature)
+        if (fused_prelude and _FUSED_PRELUDE_OK and not frequency_penalty and not presence_penalty)
+        else None
+    )
+    if fused is not None:
+        logits = fused
+    else:
+        # Engine step 6a: repetition penalty over the codec history window.
+        logits = _repetition_penalty_scaling(logits, state, repetition_penalty)
+        # Engine steps 6b/6c: frequency and presence penalties over the whole stream.
+        logits = _apply_stream_penalties(logits, state, frequency_penalty, presence_penalty)
+        # Engine step 7b: temperature is applied after the penalties. The division
+        # also gives the in-place masks below a tensor of their own.
+        logits = logits / temperature.reshape(1, 1)
     # Engine step 7c: min_p. The engine runs it as an argmax-invariant
     # processor, i.e. after temperature and before top-k/top-p, and the greedy
     # branch never sees it -- which is why greedy_codec_sample has no min_p.

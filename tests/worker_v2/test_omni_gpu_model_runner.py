@@ -168,7 +168,8 @@ def test_custom_processor_reads_flushed_request_state(monkeypatch, new_request, 
     assert observed == ([17] if new_request else [0])
 
 
-def test_prepare_native_data_plane_terminal_abort_split_and_warmup_skip():
+@pytest.mark.parametrize("warmup_req_id", ["_warmup_0_", "_v2_mixed_warmup_decode_", "_v2_mixed_warmup_prefill_"])
+def test_prepare_native_data_plane_terminal_abort_split_and_warmup_skip(warmup_req_id):
     runner = _make_runner()
     runner.model_config = object.__new__(OmniModelConfig)
     runner.model_config.async_chunk = True
@@ -180,7 +181,7 @@ def test_prepare_native_data_plane_terminal_abort_split_and_warmup_skip():
     )
     runner._omni_data_plane = plane
     new_req = SimpleNamespace(req_id="r1")
-    warmup_req = SimpleNamespace(req_id="_warmup_0_")
+    warmup_req = SimpleNamespace(req_id=warmup_req_id)
     handle = SimpleNamespace(request_id="r2", external_req_id="ext-r2")
     scheduler_output = SimpleNamespace(
         scheduled_new_reqs=[new_req, warmup_req],

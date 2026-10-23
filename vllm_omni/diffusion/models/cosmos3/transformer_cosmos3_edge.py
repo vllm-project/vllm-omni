@@ -12,6 +12,7 @@ import torch.nn.functional as F
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.linear import ColumnParallelLinear, RowParallelLinear
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+from vllm.model_executor.models.utils import is_pp_missing_parameter
 
 from vllm_omni.diffusion.attention.layer import Attention as FrameworkAttention
 from vllm_omni.diffusion.models.utils import release_module_parameters_to_meta
@@ -386,8 +387,13 @@ class Cosmos3EdgeVFMTransformer(Cosmos3VFMTransformer):
                     *required_markers,
                     f"language_model.layers.{layer_idx}.self_attn.k_norm_und_for_gen.",
                 )
+            # Under pipeline parallelism each rank owns only its stage's layers
+            # (the UND backbone lives on the first stage); markers for layers
+            # that are PPMissingLayer on this rank are not expected here.
             missing.extend(
-                marker.rstrip(".") for marker in required_markers if not any(marker in name for name in loaded)
+                marker.rstrip(".")
+                for marker in required_markers
+                if not is_pp_missing_parameter(marker, self) and not any(marker in name for name in loaded)
             )
         if missing:
             preview = ", ".join(missing[:10])

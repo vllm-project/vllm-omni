@@ -26,6 +26,7 @@ from vllm_omni.experimental.ar_diffusion.capability import (
     SupportsARDiffusionWarmup,
     supports_chunk_step_grouping,
 )
+from vllm_omni.experimental.ar_diffusion.cell_schedule import cfg_step_replicas
 from vllm_omni.experimental.ar_diffusion.kv_cache.config import ARDiffusionKVConfig
 from vllm_omni.experimental.ar_diffusion.kv_cache.manager import ARDiffusionKVCache
 from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import NoisyKVCache, NoisyKVState
@@ -202,11 +203,11 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
     ) -> None:
         spec = capability.ar_diffusion_noisy_kv_spec()
         stage_cfg = self._stage_config()
-        stages = int(stage_cfg.get("stage_parallel_size", 1) or 1)
+        step_replicas = cfg_step_replicas(stage_cfg)
         pp_world = int(getattr(getattr(self.od_config, "parallel_config", None), "pipeline_parallel_size", 1) or 1)
-        if stages < 1 or pp_world % stages != 0:
-            raise ValueError(f"pipeline_parallel_size={pp_world} must be divisible by stage_parallel_size={stages}")
-        layer_groups = pp_world // stages
+        if step_replicas < 1 or pp_world % step_replicas != 0:
+            raise ValueError(f"pipeline_parallel_size={pp_world} must be divisible by step_replicas={step_replicas}")
+        layer_groups = pp_world // step_replicas
         max_batch_size = int(stage_cfg.get("max_batch_size", 1) or 1)
         self._ar_diffusion_cell_capability = capability
         avail = self._available_memory_bytes() if available_bytes is None else available_bytes
@@ -218,7 +219,7 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             device=self.device,
             layer_groups=layer_groups,
             max_batch_size=max_batch_size,
-            stages=stages,
+            step_replicas=step_replicas,
             gpu_memory_fraction=float(stage_cfg.get("gpu_memory_fraction", 1.0)),
             available_bytes=avail,
             layer_offset=layer_offset,
@@ -232,7 +233,7 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             spec.max_history_chunks,
             layer_groups,
             max_batch_size,
-            stages,
+            step_replicas,
             blocks_per_rank,
         )
 
@@ -476,9 +477,9 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
         if self.noisy_kv_cache is None:
             raise RuntimeError("noisy KV cache is not initialized")
         stage_cfg = self._stage_config()
-        stages = int(stage_cfg.get("stage_parallel_size", 1) or 1)
+        step_replicas = cfg_step_replicas(stage_cfg)
         pp_world = int(getattr(getattr(self.od_config, "parallel_config", None), "pipeline_parallel_size", 1) or 1)
-        topology = CellTopology(stages=stages, layer_groups=max(1, pp_world // max(1, stages)))
+        topology = CellTopology(step_replicas=step_replicas, layer_groups=max(1, pp_world // max(1, step_replicas)))
         rank, pp_group = resolve_pp_rank_and_group()
         return ARDiffusionCellContext(
             spec=CellRunSpec(

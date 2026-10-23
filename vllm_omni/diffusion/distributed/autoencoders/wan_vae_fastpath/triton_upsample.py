@@ -28,7 +28,7 @@ from __future__ import annotations
 import torch
 from vllm.triton_utils import HAS_TRITON, tl, triton
 
-from ._utils import _pick_block_width, suggests_channels_last
+from ._utils import _pick_block_width, on_kernel_device, suggests_channels_last
 
 _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 # Input elements loaded per program iteration; each is stored four times, so a
@@ -133,7 +133,7 @@ def upsample_nearest_2x(x: torch.Tensor) -> torch.Tensor | None:
     channels-last contiguous but that ATen does not treat as channels-last
     decline.
     """
-    if not _HAS_INTERLEAVE or x.dim() != 4 or not x.is_cuda or x.dtype not in _SUPPORTED_DTYPES:
+    if not _HAS_INTERLEAVE or x.dim() != 4 or not on_kernel_device(x) or x.dtype not in _SUPPORTED_DTYPES:
         return None
     batch, channels, height, width = x.shape
     if x.numel() == 0:

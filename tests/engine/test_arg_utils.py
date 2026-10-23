@@ -690,3 +690,13 @@ def test_chatterbox_hub_config_that_exists_but_fails_to_load_is_left_alone(monke
     hub = chatterbox_args("ResembleAI/chatterbox-turbo")
     hub._patch_empty_hf_config("chatterbox")
     assert hub.hf_config_path is None
+
+
+def test_native_mrv2_worker_provides_connector_without_legacy_mixin():
+    from vllm_omni.worker.omni_connector_validation import validate_worker_omni_connector
+    from vllm_omni.worker_v2.omni_ar_model_runner import OmniARModelRunner
+
+    class Worker:
+        model_runner_cls = OmniARModelRunner
+
+    validate_worker_omni_connector(Worker, required=True)
