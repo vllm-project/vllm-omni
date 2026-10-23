@@ -472,6 +472,10 @@ semantic decision from the silence timeout, including whether the preceding
 score was incomplete or inference failed. These diagnostics do not change the
 wire protocol or the endpoint decision.
 
+Only unfinished response-bound append tasks keep the response gate closed.
+A completed task awaiting its cleanup callback does not block a new turn after
+barge-in. Active responses and unplayed output retain their own gates.
+
 ### Experimental output limits
 
 `max_pending_output_bytes_per_session` defaults to 2 MiB and

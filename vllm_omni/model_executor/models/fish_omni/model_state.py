@@ -33,6 +33,7 @@ from vllm.v1.worker.gpu.sample.output import SamplerOutput
 
 from vllm_omni.model_executor.output_snapshot import PackedOutputSnapshot, RequestOutputSnapshot
 from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
+from vllm_omni.worker_v2.warmup import is_warmup_request
 
 logger = init_logger(__name__)
 
@@ -163,7 +164,7 @@ class FishOmniModelState(OmniModelState, MambaHybridModelState):
         req_id = str(new_req_data.req_id)
         prompt_ids = list(new_req_data.prompt_token_ids or [])
         token_ids = list(new_req_data.prefill_token_ids or prompt_ids)
-        if req_id.startswith("_warmup_"):
+        if is_warmup_request(req_id):
             # Warmup requests: text rows with zero codes.
             rows = torch.zeros((len(prompt_ids), self.frame_width), dtype=torch.int64)
             rows[:, 0] = torch.tensor(prompt_ids, dtype=torch.int64)

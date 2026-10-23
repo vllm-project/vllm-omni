@@ -1256,3 +1256,155 @@ class TestDiffusionKvCacheQuantization:
                     causal=False,
                     softmax_scale=1.0,
                 )
+
+
+class TestDense4DMaskRouting:
+    """Route a dense 4D mask away from backends that only implement a 2D mask.
+
+    ``Attention._run_local_attention`` must divert exactly one call to
+    ``sdpa_fallback`` when an automatically selected backend reports
+    ``supports_dense_4d_mask() is False``. An explicit selection, an active
+    paged-KV adapter, or a missing SDPA fallback must fail closed instead of
+    reaching the backend kernel. Without these cases the original
+    FlashAttention "attention_mask must be 2D" assertion can come back
+    unnoticed.
+    """
+
+    @staticmethod
+    def _backend(*, supports_4d_mask: bool):
+        class _Backend:
+            supports_piecewise_spans = False
+
+            @classmethod
+            def supports_dense_4d_mask(cls, attention_spec=None):
+                del attention_spec
+                return supports_4d_mask
+
+            @classmethod
+            def supports_attention_mask(cls, attention_spec=None):
+                del attention_spec
+                return True
+
+            @staticmethod
+            def get_name() -> str:
+                return "FAKE_FLASH_BACKEND"
+
+        return _Backend
+
+    def _make_attention(
+        self,
+        monkeypatch,
+        *,
+        supports_4d_mask: bool = False,
+        backend_explicit: bool = False,
+        paged_kv: bool = False,
+        with_sdpa: bool = True,
+    ):
+        attention = Attention.__new__(Attention)
+        attention._has_custom_attention = False
+        attention._explicit_cross_contract = False
+        attention.allow_fp32_fallback = False
+        attention._scheduler_paged_kv = False
+        attention.role = "self"
+        attention.attn_spec = None
+        attention.attn_backend = self._backend(supports_4d_mask=supports_4d_mask)
+        attention.backend_explicit = backend_explicit
+        attention.paged_kv_cache_role = "primary" if paged_kv else None
+        backend_forward = Mock(return_value=torch.ones(1))
+        sdpa_forward = Mock(return_value=torch.zeros(1))
+        attention.attention = SimpleNamespace(forward=backend_forward)
+        attention.sdpa_fallback = SimpleNamespace(forward=sdpa_forward) if with_sdpa else None
+        monkeypatch.setattr(layer_mod, "is_forward_context_available", lambda: True)
+        monkeypatch.setattr(
+            layer_mod,
+            "get_forward_context",
+            lambda: SimpleNamespace(paged_kv_adapter=object(), in_diffusion_kv_memory_profile=False),
+        )
+        return attention, backend_forward, sdpa_forward
+
+    @staticmethod
+    def _tensors():
+        return torch.zeros(2, 4, 2, 8), torch.zeros(2, 4, 2, 8), torch.zeros(2, 4, 2, 8)
+
+    @staticmethod
+    def _dense_4d_mask():
+        return torch.zeros(2, 1, 4, 4, dtype=torch.bool)
+
+    def test_auto_selected_backend_diverts_dense_4d_mask_to_sdpa(self, monkeypatch):
+        attention, backend_forward, sdpa_forward = self._make_attention(monkeypatch)
+        query, key, value = self._tensors()
+        metadata = AttentionMetadata(attn_mask=self._dense_4d_mask())
+
+        output = attention._run_local_attention(query, key, value, metadata)
+
+        assert output is sdpa_forward.return_value
+        sdpa_forward.assert_called_once()
+        forwarded = sdpa_forward.call_args.args
+        assert forwarded[0] is query
+        assert forwarded[1] is key
+        assert forwarded[2] is value
+        assert forwarded[3] is metadata
+        backend_forward.assert_not_called()
+
+    def test_explicit_backend_fails_closed_on_dense_4d_mask(self, monkeypatch):
+        attention, backend_forward, sdpa_forward = self._make_attention(monkeypatch, backend_explicit=True)
+        query, key, value = self._tensors()
+        metadata = AttentionMetadata(attn_mask=self._dense_4d_mask())
+
+        with pytest.raises(NotImplementedError, match="does not support a dense 4D attn_mask"):
+            attention._run_local_attention(query, key, value, metadata)
+
+        backend_forward.assert_not_called()
+        sdpa_forward.assert_not_called()
+
+    def test_active_paged_kv_fails_closed_on_dense_4d_mask(self, monkeypatch):
+        attention, backend_forward, sdpa_forward = self._make_attention(monkeypatch, paged_kv=True)
+        query, key, value = self._tensors()
+        metadata = AttentionMetadata(attn_mask=self._dense_4d_mask())
+
+        with pytest.raises(NotImplementedError, match="paged_kv=True"):
+            attention._run_local_attention(query, key, value, metadata)
+
+        backend_forward.assert_not_called()
+        sdpa_forward.assert_not_called()
+
+    def test_missing_sdpa_fallback_fails_closed_on_dense_4d_mask(self, monkeypatch):
+        attention, backend_forward, _ = self._make_attention(monkeypatch, with_sdpa=False)
+        query, key, value = self._tensors()
+        metadata = AttentionMetadata(attn_mask=self._dense_4d_mask())
+
+        with pytest.raises(NotImplementedError, match="does not support a dense 4D attn_mask"):
+            attention._run_local_attention(query, key, value, metadata)
+
+        backend_forward.assert_not_called()
+
+    def test_2d_mask_is_not_diverted(self, monkeypatch):
+        attention, backend_forward, sdpa_forward = self._make_attention(monkeypatch)
+        query, key, value = self._tensors()
+        metadata = AttentionMetadata(attn_mask=torch.tensor([[True, False, True, False]]))
+
+        output = attention._run_local_attention(query, key, value, metadata)
+
+        assert output is backend_forward.return_value
+        backend_forward.assert_called_once()
+        sdpa_forward.assert_not_called()
+
+    def test_dense_4d_mask_capable_backend_is_not_diverted(self, monkeypatch):
+        attention, backend_forward, sdpa_forward = self._make_attention(monkeypatch, supports_4d_mask=True)
+        query, key, value = self._tensors()
+        metadata = AttentionMetadata(attn_mask=self._dense_4d_mask())
+
+        output = attention._run_local_attention(query, key, value, metadata)
+
+        assert output is backend_forward.return_value
+        backend_forward.assert_called_once()
+        sdpa_forward.assert_not_called()
+
+    @pytest.mark.parametrize("is_npu", [False, True])
+    def test_flash_attention_capability_matches_platform(self, monkeypatch, is_npu):
+        from vllm_omni.diffusion.attention.backends import flash_attn as flash_attn_mod
+
+        # Tie the capability bit to the shipped backend so the routing branch
+        # above cannot become dead code after a platform check regresses.
+        monkeypatch.setattr(flash_attn_mod.current_omni_platform, "is_npu", lambda: is_npu)
+        assert FlashAttentionBackend.supports_dense_4d_mask() is is_npu

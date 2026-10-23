@@ -48,6 +48,7 @@ from vllm_omni.worker_v2.model_states.intermediate_buffer import (
 )
 from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
 from vllm_omni.worker_v2.omni_data_plane import OmniRunnerDataPlane
+from vllm_omni.worker_v2.warmup import is_warmup_request
 
 if TYPE_CHECKING:
     from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
@@ -290,7 +291,7 @@ class OmniGPUModelRunner(GPUModelRunner):
         if plane is None:
             return
         for request_data in getattr(scheduler_output, "scheduled_new_reqs", []):
-            if str(getattr(request_data, "req_id", "")).startswith("_warmup_"):
+            if is_warmup_request(request_data.req_id):
                 continue
             plane.register_request(request_data)
         plane.register_receivers(list(getattr(scheduler_output, "pending_input_registrations", [])))

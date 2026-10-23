@@ -169,6 +169,11 @@ class SDPABackend(AttentionBackend):
         return True
 
     @classmethod
+    def supports_dense_4d_mask(cls, attention_spec: object | None = None) -> bool:
+        del attention_spec
+        return True
+
+    @classmethod
     def supports_cross_kv_mask(cls, attention_spec: object | None = None) -> bool:
         del attention_spec
         return True

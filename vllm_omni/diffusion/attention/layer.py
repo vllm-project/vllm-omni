@@ -794,6 +794,42 @@ class Attention(nn.Module):
                 if blocked is not None:
                     raise NotImplementedError(blocked)
                 return self.sdpa_fallback.forward(query, key, value, attn_metadata)
+        dense_mask = attn_metadata.attn_mask if attn_metadata is not None else None
+        if dense_mask is not None and dense_mask.ndim == 4 and self.attn_backend is not None:
+            # A dense 4D mask (for example a padded DiT batch) is a semantic
+            # requirement, not a backend hint. Backends that only implement a
+            # 2D key-validity mask must not reach their kernel wrapper, which
+            # asserts deeper down. Degrade this single call to SDPA instead;
+            # explicit selections and paged KV must still run or fail.
+            capability = getattr(self.attn_backend, "supports_dense_4d_mask", None)
+            if callable(capability):
+                capability = capability(getattr(self, "attn_spec", None))
+            if capability is False:
+                backend_name = cast(type[AttentionBackend], self.attn_backend).get_name()
+                paged_kv = self.is_paged_kv_active()
+                if self.backend_explicit or self.sdpa_fallback is None or paged_kv:
+                    raise NotImplementedError(
+                        f"Attention backend '{backend_name}' does not support a dense 4D attn_mask "
+                        f"(shape={tuple(dense_mask.shape)}, dtype={dense_mask.dtype}, "
+                        f"backend_explicit={self.backend_explicit}, paged_kv={paged_kv}). "
+                        "Use a mask-capable backend (TORCH_SDPA or CUDNN_ATTN), or avoid padding "
+                        "inside the attention batch."
+                    )
+                logger.warning_once(
+                    "Attention backend '%s' cannot consume a dense 4D attn_mask; "
+                    "falling back to SDPA for this layer. "
+                    "role=%s mask_ndim=%d mask_shape=%s mask_dtype=%s mask_device=%s "
+                    "backend_explicit=%s paged_kv=%s",
+                    backend_name,
+                    getattr(self, "role", None),
+                    dense_mask.ndim,
+                    tuple(dense_mask.shape),
+                    dense_mask.dtype,
+                    dense_mask.device,
+                    self.backend_explicit,
+                    paged_kv,
+                )
+                return cast(AttentionImpl, self.sdpa_fallback).forward(query, key, value, attn_metadata)
         self._assert_metadata_compatible(attn_metadata)
 
         if (
