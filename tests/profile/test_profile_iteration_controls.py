@@ -57,8 +57,12 @@ async def test_frontend_profile_controls_reach_diffusion_profiler(route, control
         assert method == "profile"
         return DiffusionWorker.profile(worker, *args, **(kwargs or {}))
 
-    engine = SimpleNamespace(collective_rpc=worker_rpc)
-    engine.profile = partial(DiffusionEngine.profile, engine)
+    async def async_worker_rpc(**rpc_kwargs):
+        return worker_rpc(**rpc_kwargs)
+
+    engine = SimpleNamespace(collective_rpc=worker_rpc, async_collective_rpc=async_worker_rpc)
+    for name in ("_profile_args", "_profile_failed", "profile", "async_profile"):
+        setattr(engine, name, partial(getattr(DiffusionEngine, name), engine))
     with ThreadPoolExecutor(max_workers=1) as executor:
         client = SimpleNamespace(_engine=engine, _executor=executor, stage_id=1, replica_id=0)
 
