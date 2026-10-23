@@ -814,3 +814,19 @@ class TestDiffusersBackendEndToEndExecution:
 
         # Request config has incomplete width/height, so internal assertion in `send_diffusion_request` is incomplete.
         assert image.size == (512, 512)
+
+
+@pytest.mark.parametrize("role", ["default", "self", "minimax_h3.dit"])
+@pytest.mark.cpu
+@pytest.mark.core_model
+def test_diffusers_rejects_sparse_method_during_construction(role, mocker):
+    sparse = {"name": "block_sparse", "config": {"backend": {"require": "FLASH_ATTN"}}}
+    config = (
+        AttentionConfig(default=sparse)
+        if role == "default"
+        else AttentionConfig(default={"backend": "FLASH_ATTN"}, per_role={role: sparse})
+    )
+    load = mocker.patch.object(DiffusersAdapterPipeline, "_load_pipeline_from_pretrained")
+    with pytest.raises(ValueError, match="does not support block_sparse"):
+        DiffusersAdapterPipeline(od_config=_make_od_config(diffusion_attention_config=config))
+    load.assert_not_called()
