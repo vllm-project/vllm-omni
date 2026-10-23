@@ -28,6 +28,7 @@ from openai.types.chat.chat_completion_content_part_image_param import ImageURL
 from openai.types.chat.chat_completion_content_part_input_audio_param import InputAudio
 from openai.types.realtime.realtime_audio_config_output import Voice
 from openai.types.realtime.realtime_audio_input_turn_detection import SemanticVad, ServerVad
+from openai.types.realtime.realtime_response_create_audio_output import OutputVoiceID
 from openai.types.realtime.realtime_response_create_mcp_tool import RealtimeResponseCreateMcpTool
 from openai.types.realtime.realtime_tools_config_union import Mcp
 from openai.types.responses.tool_choice_mcp import ToolChoiceMcp
@@ -157,6 +158,7 @@ class _ResolvedResponse:
     tool_choice: Any
     metadata: Any
     reasoning_effort: str | None = None
+    voice: str | None = None
 
 
 class OpenAIFullDuplexConnection:
@@ -396,8 +398,8 @@ class OpenAIFullDuplexConnection:
             raise _InvalidOutputSpeedError(speed)
         return speed
 
-    def _validate_voice(self, voice: Voice) -> str | None:
-        """Normalize a session voice, rejecting custom voice references."""
+    def _validate_voice(self, voice: Voice | OutputVoiceID, *, prefix: str = "session") -> str | None:
+        """Normalize a voice name, rejecting custom voice references."""
         if not isinstance(voice, str):
             raise _RealtimeVoiceError(
                 f"No voice found with id '{voice.id}'.",
@@ -411,7 +413,7 @@ class OpenAIFullDuplexConnection:
             raise _RealtimeVoiceError(
                 str(exc),
                 code="invalid_value",
-                param="session.audio.output.voice",
+                param=f"{prefix}.audio.output.voice",
             ) from exc
 
     def _load_supported_speakers(self) -> set[str]:
@@ -740,6 +742,7 @@ class OpenAIFullDuplexConnection:
         response_input = None
         instructions = None
         metadata = None
+        response_voice = None
         if response_cfg is not None:
             if response_cfg.output_modalities is not None:
                 modalities = response_cfg.output_modalities
@@ -757,6 +760,9 @@ class OpenAIFullDuplexConnection:
             output = audio.output if audio is not None else None
             if output is not None and not self._is_pcm16_24khz_format(getattr(output, "format", None)):
                 raise _UnsupportedAudioFormatError("Only 24 kHz PCM16 output audio is supported")
+            if output is not None:
+                voice = output.voice
+                response_voice = self._validate_voice(voice, prefix="response") if voice is not None else None
 
         if tools and tool_choice != "none" and self._tool_call_parser_name is None:
             raise ValueError("Function tools require --enable-auto-tool-choice and --tool-call-parser")
@@ -779,6 +785,7 @@ class OpenAIFullDuplexConnection:
             tool_choice=tool_choice,
             metadata=metadata,
             reasoning_effort=reasoning_effort,
+            voice=response_voice,
         )
 
     async def _truncate_prompt_items(self, response: _ResolvedResponse) -> list[types.ConversationItem] | None:
@@ -800,6 +807,7 @@ class OpenAIFullDuplexConnection:
                     instructions=response.instructions,
                     items=current_items,
                     reasoning_effort=response.reasoning_effort,
+                    voice=response.voice,
                     skip_mm_cache=True,
                 )
             except VLLMValidationError as exc:
@@ -922,6 +930,7 @@ class OpenAIFullDuplexConnection:
                 instructions=response.instructions,
                 items=preflight_items,
                 reasoning_effort=response.reasoning_effort,
+                voice=response.voice,
             )
         except VLLMValidationError as exc:
             await self._send_error(str(exc), "invalid_request_error", event_id=event.event_id)
@@ -1978,6 +1987,7 @@ class OpenAIFullDuplexConnection:
         instructions: str | None = None,
         items: list[types.ConversationItem] | None = None,
         reasoning_effort: str | None = None,
+        voice: str | None = None,
         skip_mm_cache: bool = False,
     ) -> EngineInput:
         """Render the effective conversation through normal chat preprocessing."""
@@ -2067,9 +2077,9 @@ class OpenAIFullDuplexConnection:
         )
         if engine_input.get("prompt_token_ids") is None:
             raise RuntimeError("Realtime renderer did not return prompt token IDs")
-        voice = s.output_voice
-        if voice:
-            set_prompt_speaker(engine_input, voice)
+        effective_voice = voice if voice is not None else s.output_voice
+        if effective_voice:
+            set_prompt_speaker(engine_input, effective_voice)
         return engine_input
 
     # ------------------------------------------------------------------ #

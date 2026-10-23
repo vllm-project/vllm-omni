@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import io
 import json
 import wave
@@ -1046,6 +1047,116 @@ async def test_session_update_keeps_voice_when_update_omits_it() -> None:
     assert updated_session["instructions"] == "be brief"
     engine_input = await connection._build_full_prompt()
     assert engine_input["additional_information"]["speaker"] == ["vivian"]
+
+
+def test_resolve_response_honors_response_level_voice() -> None:
+    connection, _ = _make_connection(hf_config=_SPEAKER_HF_CONFIG)
+    connection.session.config.audio.output.voice = "vivian"
+    response_cfg = types.RealtimeResponseCreateParams.model_validate({"audio": {"output": {"voice": "Ethan"}}})
+
+    assert connection._resolve_response(response_cfg).voice == "ethan"
+
+
+@pytest.mark.parametrize("response_voice", [None, ""])
+def test_resolve_response_leaves_voice_override_unset(response_voice: str | None) -> None:
+    connection, _ = _make_connection(hf_config=_SPEAKER_HF_CONFIG)
+    connection.session.config.audio.output.voice = "vivian"
+    response_cfg = (
+        None
+        if response_voice is None
+        else types.RealtimeResponseCreateParams.model_validate({"audio": {"output": {"voice": response_voice}}})
+    )
+
+    assert connection._resolve_response(response_cfg).voice is None
+
+
+@pytest.mark.asyncio
+async def test_response_create_rejects_unsupported_voice() -> None:
+    websocket = _FakeWebSocket()
+    connection, _ = _make_connection(websocket=websocket, hf_config=_SPEAKER_HF_CONFIG)
+
+    await connection._handle_response_create(
+        types.ResponseCreateEvent(
+            event_id="evt_resp",
+            type="response.create",
+            response=types.RealtimeResponseCreateParams.model_validate({"audio": {"output": {"voice": "uncle_fu"}}}),
+        )
+    )
+
+    error = next(event for event in _websocket_events(websocket) if event["type"] == "error")
+    assert error["error"]["type"] == "invalid_request_error"
+    assert error["error"]["code"] == "invalid_value"
+    assert error["error"]["param"] == "response.audio.output.voice"
+    assert error["error"]["event_id"] == "evt_resp"
+
+
+@pytest.mark.asyncio
+async def test_response_create_rejects_custom_voice_reference() -> None:
+    websocket = _FakeWebSocket()
+    connection, _ = _make_connection(websocket=websocket, hf_config=_SPEAKER_HF_CONFIG)
+
+    await connection._handle_response_create(
+        types.ResponseCreateEvent(
+            event_id="evt_resp",
+            type="response.create",
+            response=types.RealtimeResponseCreateParams.model_validate(
+                {"audio": {"output": {"voice": {"id": "voice_1234"}}}}
+            ),
+        )
+    )
+
+    events = _websocket_events(websocket)
+    assert [event["type"] for event in events] == ["error"]
+    error = events[0]["error"]
+    assert error["type"] == "invalid_request_error"
+    assert error.get("code") is None
+    assert error["param"] == "voice_id"
+    assert error.get("event_id") is None
+    assert error["message"] == "No voice found with id 'voice_1234'."
+    assert connection.session.active_response is None
+
+
+@pytest.mark.asyncio
+async def test_build_full_prompt_applies_response_voice_override() -> None:
+    connection, _ = _make_connection(hf_config=_SPEAKER_HF_CONFIG)
+    connection.session.config.audio.output.voice = "vivian"
+
+    engine_input = await connection._build_full_prompt(voice="ethan")
+
+    assert engine_input["additional_information"]["speaker"] == ["ethan"]
+
+
+@pytest.mark.asyncio
+async def test_response_create_uses_response_voice_for_the_prompt() -> None:
+    websocket = _FakeWebSocket()
+    connection, _ = _make_connection(websocket=websocket, hf_config=_SPEAKER_HF_CONFIG)
+    await connection._handle_session_update(_session_update("vivian"))
+    captured: list[dict[str, Any]] = []
+
+    async def truncate(response: Any) -> list[Any]:
+        return []
+
+    async def build_prompt(**kwargs: Any) -> dict[str, Any]:
+        captured.append(kwargs)
+        return {"prompt_token_ids": []}
+
+    connection._truncate_prompt_items = truncate
+    connection._build_full_prompt = build_prompt
+
+    await connection._handle_response_create(
+        types.ResponseCreateEvent(
+            event_id="evt_resp",
+            type="response.create",
+            response=types.RealtimeResponseCreateParams.model_validate({"audio": {"output": {"voice": "Ethan"}}}),
+        )
+    )
+    if connection._response_task is not None:
+        connection._response_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await connection._response_task
+
+    assert captured[0]["voice"] == "ethan"
+    assert connection.session.output_voice == "vivian"
 
 
 @pytest.mark.asyncio
