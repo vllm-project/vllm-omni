@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ from dataclasses import dataclass
 import pytest
 import torch
 
+from tests.helpers.mark import hardware_test
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_llm import SiglipVisionEmbeddings
 
 pytestmark = [pytest.mark.core_model]
@@ -164,7 +165,7 @@ def test_forward_matches_reference_position_embedding() -> None:
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_cuda_position_ids_match_reference_for_processor_shapes(mocker) -> None:
     embeddings = SiglipVisionEmbeddings(_VisionConfig(image_size=140)).to(device="cuda")
@@ -192,7 +193,7 @@ def test_cuda_position_ids_match_reference_for_processor_shapes(mocker) -> None:
     assert all(call.args[2].device.type == "cpu" for call in grid_builder.call_args_list)
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_cuda_forward_matches_reference_for_processor_shape() -> None:
     torch.manual_seed(0)

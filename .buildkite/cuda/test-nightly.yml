@@ -60,7 +60,10 @@ steps:
           - tests/e2e/accuracy/qwen3_omni/results/qwen_omni_acc/*.json
         commands:
           - export SEED_TTS_WER_EVAL=1
+          - export SEED_TTS_SIM_EVAL=1
+          - export SEED_TTS_UTMOS_EVAL=1
           - export SEED_TTS_EVAL_DEVICE=cuda:1
+          - export SEED_TTS_UTMOS_DEVICE=cuda:1
           - pytest -s -v tests/e2e/accuracy/qwen3_omni/test_qwen3_omni.py -m "full_model and H100 and B200 and cards_2" --run-level full_model
 
       - label: ":full_moon: Omni · MiniCPM-o 4.5 · Accuracy Test"
@@ -70,24 +73,23 @@ steps:
           - tests/e2e/accuracy/minicpmo_4_5/results/*.json
         commands:
           - export SEED_TTS_WER_EVAL=1
+          - export SEED_TTS_SIM_EVAL=1
+          - export SEED_TTS_UTMOS_EVAL=1
           - export SEED_TTS_EVAL_DEVICE=cuda:1
+          - export SEED_TTS_UTMOS_DEVICE=cuda:1
           - pytest -s -v tests/e2e/accuracy/minicpmo_4_5/test_minicpmo_4_5.py -m "full_model and H100 and B200 and cuda and (cards_1 or cards_2)" --run-level full_model
 
       - label: ":full_moon: Omni · Omni-DuplexEval CI Guard"
         source_file_dependencies: omni_duplex_eval_ci
         timeout_in_minutes: 240
-        env:
-          VLLM_DUPLEX_EVAL_JUDGE_URL: "http://127.0.0.1:8001"
+        artifact_paths:
+          - tests/dfx/perf/results/*.json
+          - tests/e2e/accuracy/omni_duplex_eval/results/*.json
+          - tests/dfx/perf/results/omni_duplex_eval_minicpmo_4_5/**/*
         commands:
-          - |
-            set +e
-            pytest -s -v tests/e2e/accuracy/omni_duplex_eval/test_omni_duplex_eval_ci.py \
-              -m "full_model and H100 and B200 and cuda and cards_2" \
-              --run-level full_model \
-              --basetemp /tmp/omni_duplex_ci
-            EXIT=$$?
-            buildkite-agent artifact upload "tests/e2e/accuracy/omni_duplex_eval/results/*.json"
-            exit $$EXIT
+          - export BENCHMARK_DIR=tests/dfx/perf/results
+          - export ACC_BENCH_RESULT_DIR=tests/e2e/accuracy/omni_duplex_eval/results
+          - pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_minicpmo_4_5_omni_duplex_eval.json -m "full_model and H100 and B200 and cuda and omni and cards_2" --run-level full_model
 
       - label: ":full_moon: Omni · Perf Test · No Async Chunk"
         source_file_dependencies: omni_qwen3_omni_perf
@@ -109,6 +111,28 @@ steps:
           - export BENCHMARK_DIR=tests/dfx/perf/results
           - pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_qwen3_omni_async_chunk.json -m "H100 and B200 and full_model and cards_2"
 
+      - label: ":full_moon: Omni · Qwen3-Omni · Duplex OmniInteract Perf Test"
+        source_file_dependencies: omni_qwen3_omni_duplex_perf
+        key: nightly-omni-performance-qwen3-omni-duplex-omniinteract
+        timeout_in_minutes: 180
+        artifact_paths:
+          - tests/dfx/perf/results/*.json
+          - tests/dfx/perf/results/omniinteract_qwen3_omni/**/*
+        commands:
+          - export BENCHMARK_DIR=tests/dfx/perf/results
+          - pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_qwen3_omni_duplex_omniinteract.json -m "full_model and H100 and B200 and cuda and omni and cards_3" --run-level full_model
+
+      - label: ":full_moon: Omni · Qwen3-Omni · Duplex Omni-DuplexEval Perf Test"
+        source_file_dependencies: omni_qwen3_omni_duplex_perf
+        key: nightly-omni-performance-qwen3-omni-duplex-omni-duplex-eval
+        timeout_in_minutes: 180
+        artifact_paths:
+          - tests/dfx/perf/results/*.json
+          - tests/dfx/perf/results/omni_duplex_eval_qwen3_omni/**/*
+        commands:
+          - export BENCHMARK_DIR=tests/dfx/perf/results
+          - pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_qwen3_omni_duplex_omni_duplex_eval.json -m "full_model and H100 and B200 and cuda and omni and cards_3" --run-level full_model
+
       - label: ":full_moon: Omni · MiniCPM-o 4.5 · Perf Test"
         source_file_dependencies: omni_minicpmo_4_5_perf
         key: nightly-omni-performance-minicpmo-4-5
@@ -118,6 +142,16 @@ steps:
         commands:
           - export BENCHMARK_DIR=tests/dfx/perf/results
           - pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_minicpmo_4_5.json -m "H100 and B200 and cards_1"
+
+      - label: ":full_moon: Omni · Qwen3-Omni · Seed-TTS Realtime Perf Test"
+        source_file_dependencies: omni_qwen3_omni_seed_tts_perf
+        key: nightly-omni-performance-qwen3-seed-tts
+        timeout_in_minutes: 180
+        artifact_paths:
+          - tests/dfx/perf/results/*.json
+        commands:
+          - export BENCHMARK_DIR=tests/dfx/perf/results
+          - pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_qwen3_omni_seed_tts.json -m "H100 and B200 and cards_2"
 
       - label: ":full_moon: Omni · MiniCPM-o 4.5 · Duplex Seed-TTS Perf Test"
         source_file_dependencies: omni_minicpmo_4_5_duplex_perf
@@ -268,11 +302,21 @@ steps:
           - pytest -s -v tests/e2e/accuracy/test_qwen_image.py -m "H100 and B200 and cards_1" --run-level full_model
           - pytest -s -v tests/e2e/accuracy/test_diffusers_backend_similarity.py -k '2i_matches_diffusers' -m "full_model and H100 and B200 and cards_1" --run-level full_model
 
-      - label: ":full_moon: JoyAI-Image-Edit · Accuracy Test"
-        source_file_dependencies: diffusion_joy_image_accuracy
+      - label: ":full_moon: Diffusion X2I(&A&T) · Qwen-Image 2.1 Accuracy Test"
+        source_file_dependencies: diffusion_qwen_image_21_accuracy
+        mirror_hardwares: h100_1
         timeout_in_minutes: 180
+        env:
+          QWEN_IMAGE_21_CALIBRATE: "0"
+        artifact_paths:
+          - tests/e2e/accuracy/artifacts/qwen_image_21/**/*
         commands:
-          - pytest -s -v tests/e2e/accuracy/test_joy_image_edit.py -m "full_model and diffusion and H100 and B200 and cards_1" --run-level full_model
+          - >-
+            bash -c 'source tests/e2e/accuracy/qwen_image_21/setup_reference.sh &&
+            exec pytest -sv tests/e2e/accuracy/qwen_image_21/test_qwen_image_21.py
+            -m "full_model and diffusion and H100 and cards_1"
+            --run-level full_model
+            --junitxml=tests/e2e/accuracy/artifacts/qwen_image_21/pytest.xml'
 
       - label: ":full_moon: HunyuanImage3-DIT · Accuracy Test"
         source_file_dependencies: diffusion_hunyuan_image3_accuracy
@@ -307,6 +351,32 @@ steps:
           # Do not pin DIFFUSION_ATTENTION_BACKEND: H100 auto-selects FLASH_ATTN;
           # B200 rejects explicit FLASH_ATTN without FA4 and uses CUDNN/TRTLLM.
           - pytest -s -v tests/dfx/perf/scripts/run_diffusion_benchmark.py --test-config-file tests/dfx/perf/tests/test_qwen_image_vllm_omni.json -m "H100 and B200 and cards_4"
+
+      - label: ":full_moon: Diffusion X2I(&A&T) · Perf Test · Qwen-Image-2.1 · Single-GPU"
+        source_file_dependencies: diffusion_qwen_image_21_perf
+        key: nightly-diffusion-x2iat-performance-qwen-image-21-single
+        timeout_in_minutes: 180
+        # Qwen-Image-2.1 emits a 4D dense attn_mask once a batch mixes prompt
+        # lengths (the 512 high-concurrency sweep). The auto-selected FLASH_ATTN
+        # masked path only accepts 2D masks and asserts. Pin SDPA, which consumes
+        # the 4D mask natively.
+        env:
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+        artifact_paths:
+          - tests/dfx/perf/results/*.json
+        commands:
+          - export BENCHMARK_DIR=tests/dfx/perf/results
+          - pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_qwen_image_21_vllm_omni.json -m "H100 and B200 and cards_1"
+
+      - label: ":full_moon: Diffusion X2I(&A&T) · Perf Test · Qwen-Image-2.1 · 4-GPU"
+        source_file_dependencies: diffusion_qwen_image_21_perf
+        key: nightly-diffusion-x2iat-performance-qwen-image-21-4gpu
+        timeout_in_minutes: 180
+        artifact_paths:
+          - tests/dfx/perf/results/*.json
+        commands:
+          - export BENCHMARK_DIR=tests/dfx/perf/results
+          - pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_qwen_image_21_vllm_omni.json -m "H100 and B200 and cards_4"
 
   - group: ":card_index_dividers: Diffusion X2V Model Test"
     key: nightly-diffusion-x2v-group
@@ -535,6 +605,8 @@ steps:
       - nightly-tts-performance-2gpu
       - nightly-diffusion-x2iat-performance-qwen-image-single
       - nightly-diffusion-x2iat-performance-qwen-image-4gpu
+      - nightly-diffusion-x2iat-performance-qwen-image-21-single
+      - nightly-diffusion-x2iat-performance-qwen-image-21-4gpu
       - nightly-diffusion-x2v-performance-single
       - nightly-diffusion-x2v-performance-2gpu
     if: build.env("NIGHTLY") == "1" && build.env("EMAIL_DISTRIBUTION") == "1"
@@ -551,6 +623,8 @@ steps:
       - buildkite-agent artifact download "tests/dfx/perf/results/*.json" . --step nightly-omni-performance-async-chunk
       - buildkite-agent artifact download "tests/dfx/perf/results/*.json" . --step nightly-diffusion-x2iat-performance-qwen-image-single
       - buildkite-agent artifact download "tests/dfx/perf/results/*.json" . --step nightly-diffusion-x2iat-performance-qwen-image-4gpu
+      - buildkite-agent artifact download "tests/dfx/perf/results/*.json" . --step nightly-diffusion-x2iat-performance-qwen-image-21-single
+      - buildkite-agent artifact download "tests/dfx/perf/results/*.json" . --step nightly-diffusion-x2iat-performance-qwen-image-21-4gpu
       - buildkite-agent artifact download "tests/dfx/perf/results/*.json" . --step nightly-diffusion-x2v-performance-single
       - buildkite-agent artifact download "tests/dfx/perf/results/*.json" . --step nightly-diffusion-x2v-performance-2gpu
       - python tools/nightly/generate_nightly_perf_excel.py

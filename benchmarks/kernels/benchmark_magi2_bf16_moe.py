@@ -163,7 +163,9 @@ def check_and_capture(torch, moe, kernels, data, args):
         actual = moe._bf16_fused_moe_forward(x, probabilities, indices, packed_w13, down, route_buffers)
     if len(sorted_routes) != 1 or len(launches) != 2:
         raise RuntimeError("Unexpected kernel dispatch: benchmark contract needs updating")
-    flat_experts = (indices + torch.arange(args.heads, device=x.device)[:, None, None] * args.experts).flatten()
+    # The fused path stores its routes token-major.
+    head_experts = indices + torch.arange(args.heads, device=x.device)[:, None, None] * args.experts
+    flat_experts = head_experts.transpose(0, 1).flatten()
     order = flat_experts.argsort(stable=True)
     new_routes = launches[1][0][2].reshape(-1, 256).index_select(0, order)
     scatter_ids = gather.long() * args.heads + flat_experts[order] // args.experts

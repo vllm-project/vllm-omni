@@ -8,51 +8,19 @@
 
 from __future__ import annotations
 
-import copy
 import time
 from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
 from torch.cuda import CUDAGraph
-from vllm.compilation.decorators import support_torch_compile
-from vllm.config import CUDAGraphMode, VllmConfig
-from vllm.config.vllm import set_current_vllm_config
+from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 
 from .audio_tokenizer_v2 import MossAudioTokenizerModel as MossAudioTokenizerV2Model
 
 logger = init_logger(__name__)
-
-
-@support_torch_compile(
-    dynamic_arg_dims={
-        "codes": {1: "batch", 2: "frames"},
-        "codes_lengths": {0: "batch"},
-        "state_slot_ids": {0: "batch"},
-        "valid_rows": {0: "batch"},
-    }
-)
-class _MossCodecDecodeCompileAdapter(nn.Module):
-    """Expose the codec streaming hot path to vLLM compile.
-
-    The wrapper preserves the codec dtype: v1 decodes in FP32 to match its
-    quantizer output, while v2 uses BF16.
-    """
-
-    def __init__(self, codec: nn.Module, *, vllm_config: VllmConfig) -> None:
-        super().__init__()
-        self.codec = codec
-
-    def forward(
-        self,
-        codes: torch.Tensor,
-        codes_lengths: torch.Tensor,
-        state_slot_ids: torch.Tensor,
-        valid_rows: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        return self.codec.decode_streaming_tensors(codes, codes_lengths, state_slot_ids, valid_rows)
 
 
 @dataclass
@@ -93,18 +61,9 @@ class CUDAGraphStreamingDecoderWrapper:
         self.graphs: dict[tuple[int, int], _CapturedStreamingDecodeGraph] = {}
         self._pool = None
         self._warmed_up = False
-        # vLLM owns Inductor compilation; this wrapper remains the sole owner
-        # of CUDA Graph capture/replay because it understands persistent codec
-        # state slots. Disable vLLM's CUDA Graph layer to avoid nested graphs.
-        compile_config = copy.copy(vllm_config)
-        compile_config.compilation_config = copy.copy(vllm_config.compilation_config)
-        compile_config.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
-        compile_config.compilation_config.static_forward_context = {}
-        with set_current_vllm_config(compile_config):
-            self._compiled_decode: nn.Module = _MossCodecDecodeCompileAdapter(
-                codec,
-                vllm_config=compile_config,
-            )
+        # This wrapper owns CUDA Graph capture/replay because it understands
+        # persistent codec state slots; the decode runs uncompiled.
+        self._decode = codec.decode_streaming_tensors
 
     @property
     def is_ready(self) -> bool:
@@ -146,8 +105,8 @@ class CUDAGraphStreamingDecoderWrapper:
         with torch.cuda.device(device):
             for batch_size, frame_size in capture_keys:
                 key = (batch_size, frame_size)
-                self._capture_with_decode(batch_size, frame_size, device, self._compiled_decode)
-                logger.info("  Captured compiled MOSS-TTS streaming decoder CUDA graph for (B,T)=%s", key)
+                self._capture_with_decode(batch_size, frame_size, device, self._decode)
+                logger.info("  Captured MOSS-TTS streaming decoder CUDA graph for (B,T)=%s", key)
         self._warmed_up = True
         logger.info(
             "MOSS-TTS streaming decoder CUDA graph warmup complete: %d/%d captured in %.1f ms",

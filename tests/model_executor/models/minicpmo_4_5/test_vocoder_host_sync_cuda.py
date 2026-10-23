@@ -9,10 +9,11 @@ from contextlib import contextmanager
 import pytest
 import torch
 
+from tests.helpers.mark import hardware_marks
 from vllm_omni.model_executor.models.cosyvoice3.code2wav_core import hifigan
 from vllm_omni.worker.gpu_generation_model_runner import _HostCopyBatch
 
-pytestmark = [pytest.mark.core_model, pytest.mark.cuda]
+pytestmark = [pytest.mark.core_model, *hardware_marks(res={"cuda": "L4"}, num_cards=1)]
 
 
 @contextmanager

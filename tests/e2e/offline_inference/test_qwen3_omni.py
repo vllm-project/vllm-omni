@@ -106,7 +106,11 @@ def test_structured_multistage_config_reaches_runtime(omni_runner, offline_clien
     assert thinker_vllm.cache_config.gpu_memory_utilization == 0.9
     assert talker_vllm.cache_config.gpu_memory_utilization == 0.6
     assert code2wav_vllm.cache_config.gpu_memory_utilization == 0.1
-    assert all(config.cache_config.enable_prefix_caching is False for config in engine.stage_vllm_configs)
+    # The production YAML turns the Thinker prefix cache on; the Talker and
+    # Code2Wav stages keep it off.
+    assert thinker_vllm.cache_config.enable_prefix_caching is True
+    assert talker_vllm.cache_config.enable_prefix_caching is False
+    assert code2wav_vllm.cache_config.enable_prefix_caching is False
     assert all(config.model_config.trust_remote_code is True for config in engine.stage_vllm_configs)
     assert code2wav_vllm.scheduler_config.enable_chunked_prefill is False
     assert code2wav_vllm.scheduler_config.async_scheduling is False

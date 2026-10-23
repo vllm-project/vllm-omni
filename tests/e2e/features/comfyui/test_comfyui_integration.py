@@ -16,6 +16,8 @@ import time
 import traceback
 from collections.abc import Iterable, Sequence
 from enum import Enum
+from fractions import Fraction
+from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, NamedTuple
@@ -35,6 +37,7 @@ from comfyui_vllm_omni.nodes import (
     VLLMOmniUnderstanding,
     VLLMOmniVideoReferences,
     VLLMOmniVoiceClone,
+    VLLMOmniYuE2Params,
 )
 from comfyui_vllm_omni.utils.types import (
     AutoregressionSamplingParams,
@@ -48,6 +51,7 @@ from vllm import SamplingParams
 from vllm.outputs import CompletionOutput, RequestOutput
 
 from tests.helpers.runtime import get_open_port
+from vllm_omni.diffusion.models.seedvr2.pipeline_seedvr2 import read_video
 from vllm_omni.entrypoints.async_omni import AsyncOmni as RealAsyncOmni
 from vllm_omni.entrypoints.cli.serve import OmniServeCommand
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniSamplingParams
@@ -85,6 +89,7 @@ class SamplingKind(str, Enum):
     MUSIC_NONE = "music_none"
     VIDEO_NONE = "video_none"
     VIDEO_DIFFUSION_SINGLE = "video_diffusion_single"
+    VIDEO_RESTORATION = "video_restoration"
     VIDEO_FL2VA = "video_fl2va"
     VIDEO_FASTH3 = "video_fasth3"
     VIDEO_REF2VA_IMAGE_AUDIO = "video_ref2va_image_audio"
@@ -419,6 +424,28 @@ def _build_mock_outputs(outputs: Iterable[OmniRequestOutput], sampling_case: Sam
                 LORA_PARAMS,
             )
             _assert_model_param_values(received_sampling_params_list[0], VIDEO_MODEL_PARAMS)
+        elif sampling_case.kind is SamplingKind.VIDEO_RESTORATION:
+            assert len(received_sampling_params_list) == 1
+            _assert_sampling_param_values(
+                received_sampling_params_list[0],
+                {"width": 224, "height": 128, "num_inference_steps": 1, "guidance_scale": 1, "seed": 7723},
+            )
+            assert prompt["prompt"] == " "
+            references = prompt["multi_modal_data"]["video"]
+            assert len(references) == 1
+            frames, source = read_video(references[0])
+            # Keep input admission and output encoding real; replace GPU inference.
+            yield OmniRequestOutput.from_diffusion(
+                request_id="test_req_restoration",
+                images=[torch.zeros((len(frames), 128, 224, 3))],
+                multimodal_output={
+                    "fps": float(source.fps),
+                    "audio": source.audio,
+                    "audio_sample_rate": source.audio_sample_rate,
+                },
+                final_output_type="video",
+            )
+            return
         elif sampling_case.kind is SamplingKind.VIDEO_FL2VA:
             assert len(received_sampling_params_list) == 1
             assert isinstance(prompt, dict)
@@ -630,6 +657,9 @@ def api_server(server_case: ServerCase, mock_async_omni, tmp_path):
     args = parser.parse_args(["serve", server_case.served_model, "--omni", "--port", str(port)])
 
     def run_server():
+        # libgomp is not fork-safe: once the parent has used OpenMP, a parallel
+        # op in this forked child segfaults. Keep the child's torch ops inline.
+        torch.set_num_threads(1)
         try:
             cmd.cmd(args)
         except Exception:
@@ -965,6 +995,57 @@ async def test_video_generation_node(api_server: str, model: str, image_input: b
     assert isinstance(result, tuple)
     assert len(result) == 1
     assert isinstance(result[0], VideoInput)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "server_case",
+    [
+        ServerCase(
+            served_model="seedvr2-alias",
+            stage_list=["diffusion"],
+            stage_configs=[
+                {
+                    "stage_type": "diffusion",
+                    "final_output": True,
+                    "final_output_type": "video",
+                    "engine_args": {"model_class_name": "SeedVR2Pipeline"},
+                }
+            ],
+            outputs=[],
+        )
+    ],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "sampling_case", [SamplingCase(kind=SamplingKind.VIDEO_RESTORATION, sampling_params=None)], indirect=True
+)
+async def test_seedvr2_restoration_node(api_server: str, monkeypatch: pytest.MonkeyPatch):
+    """Exercise the restoration node against the real API with mocked GPU inference."""
+    from comfyui_vllm_omni.nodes import VLLMOmniRestoreVideo
+
+    sample = (Path(__file__).resolve().parents[4] / "apps/ComfyUI-vLLM-Omni/docs/assets/seedvr2-input.mp4").read_bytes()
+    fps = Fraction(30000, 1001)
+    monkeypatch.setattr(VideoInput, "get_frame_rate", lambda self: fps)
+    node = VLLMOmniRestoreVideo()
+    (result,) = await node.restore(VideoInput(sample), api_server, "seedvr2-alias", 224, 128, 7723, 30)
+
+    with av.open(BytesIO(result._data)) as container:
+        video = container.streams.video[0]
+        frames = list(container.decode(video))
+        assert (video.width, video.height) == (224, 128)
+        assert len(frames) == 6
+        assert video.average_rate == fps
+        assert [frame.pts * frame.time_base for frame in frames] == [index / fps for index in range(6)]
+        audio = container.streams.audio[0]
+        assert audio.codec_context.name == "aac"
+        assert audio.sample_rate == 48000
+        assert len(audio.layout.channels) == 1
+        container.seek(0)
+        assert any(abs(frame.to_ndarray()).max() > 0.01 for frame in container.decode(audio))
+
+    with pytest.raises(ValueError, match="status 400:.*Cannot decode SeedVR2 input video"):
+        await node.restore(VideoInput(b"not a video"), api_server, "seedvr2-alias", 224, 128, 7723, 30)
 
 
 @pytest.mark.asyncio
@@ -1307,6 +1388,31 @@ def _build_music_tokenizer():
         return [101, 102, 103]
 
     return SimpleNamespace(encode=encode, convert_tokens_to_ids=special_token_ids.get)
+
+
+@pytest.mark.parametrize("cot", ["off", "melody", "full"])
+def test_yue2_params(cot: str) -> None:
+    abc = "" if cot == "off" else "X:1\nK:C\nC D E F|"
+
+    (params,) = VLLMOmniYuE2Params().get_params(cot=cot, abc=abc)
+
+    expected = {"cot": cot}
+    if abc:
+        expected["abc"] = abc
+    assert params == expected
+
+
+@pytest.mark.parametrize(
+    ("cot", "abc", "message"),
+    [
+        ("off", "X:1\nK:C\nC D E F|", "ABC requires cot=melody or full"),
+        ("melody", "", "requires supplied ABC score text"),
+        ("full", " ", "requires supplied ABC score text"),
+    ],
+)
+def test_yue2_params_rejects_incompatible_abc(cot: str, abc: str, message: str) -> None:
+    with pytest.raises(ValueError, match=message):
+        VLLMOmniYuE2Params().get_params(cot=cot, abc=abc)
 
 
 @pytest.mark.asyncio

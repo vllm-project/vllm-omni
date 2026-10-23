@@ -1,0 +1,142 @@
+meta:
+  title: "Higgs Audio V3 TTS"
+  slug: "higgs-audio-v3-tts-4b"
+  provider: "Boson AI"
+  description: "Boson AI's ~4B Qwen3-backbone text-to-speech model served via vLLM-Omni — 24 kHz speech, 100+ languages, zero-shot voice cloning with inline emotion/style/prosody control tokens — through the OpenAI /v1/audio/speech API."
+  date_added: 2026-06-17
+  date_updated: 2026-06-15
+  tasks:
+    - omni
+  related_recipes:
+    - Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice
+    - fishaudio/s2-pro
+    - zai-org/GLM-TTS
+
+model:
+  model_id: "bosonai/higgs-audio-v3-tts-4b"
+  min_vllm_version: "0.22.0"
+  architecture: dense
+  parameter_count: "4B"
+  active_parameters: "4B"
+  context_length: 0
+  base_args:
+    - "--omni"
+    - "--trust-remote-code"
+  base_env: {}
+
+omni:
+  tasks:
+    - id: t2a
+      label: "Text → Speech"
+      endpoint: "/v1/audio/speech"
+      description: "Higgs Audio V3 TTS via /v1/audio/speech (24 kHz mono)"
+      curl: |
+        curl -X POST http://localhost:8000/v1/audio/speech \
+          -H "Content-Type: application/json" \
+          -d '{
+            "model": "bosonai/higgs-audio-v3-tts-4b",
+            "input": "Hello, how are you?"
+          }' --output hello.wav
+
+dependencies:
+  - note: "vLLM-Omni provides the TTS serving backend and the `--omni` serve path. See the installation guide for pre-built wheels or building from source."
+    command: "uv pip install git+https://github.com/vllm-project/vllm-omni.git"
+
+features: {}
+
+opt_in_features: []
+
+variants:
+  default:
+    precision: bf16
+    vram_minimum_gb: 24
+    description: "BF16 weights — single GPU (reference run on 1x H100 80 GB; ~4B talker + codec decoder share the device)"
+
+compatible_strategies: []
+
+hardware_overrides: {}
+strategy_overrides: {}
+
+guide: |
+  ## Overview
+
+  [Higgs Audio V3 TTS](https://huggingface.co/bosonai/higgs-audio-v3-tts-4b) is
+  Boson AI's multilingual text-to-speech model served through **vLLM-Omni** with
+  the OpenAI-compatible `/v1/audio/speech` API. It generates **24 kHz** speech,
+  supports zero-shot voice cloning from a reference clip, and handles **100+
+  languages** with inline control tokens for emotion, style, and prosody. The
+  architecture is a ~4B Qwen3 backbone with a fused multi-codebook embedding/head
+  (8 codebooks × 1026 vocab, MusicGen-style delay pattern).
+
+  ## Prerequisites
+
+  - **Hardware**: a single CUDA GPU. Reference run: 1x H100 80 GB — Stage 0
+    (talker, ~4B) ~60% GPU memory, Stage 1 (codec decoder) ~25%.
+  - **vLLM-Omni** targeting vLLM >= 0.22.
+  - `--trust-remote-code` is required.
+
+  ## Installation
+
+  ```bash
+  uv venv && source .venv/bin/activate
+  uv pip install git+https://github.com/vllm-project/vllm-omni.git
+  ```
+
+  ## Launch the server
+
+  The deploy config (`vllm_omni/deploy/higgs_multimodal_qwen3.yaml`) is
+  auto-discovered from `model_type=higgs_multimodal_qwen3`:
+
+  ```bash
+  vllm serve bosonai/higgs-audio-v3-tts-4b --omni --trust-remote-code \
+    --host 0.0.0.0 --port 8000
+  ```
+
+  ## Client usage
+
+  ### Basic TTS (curl)
+
+  ```bash
+  curl -X POST http://localhost:8000/v1/audio/speech \
+    -H "Content-Type: application/json" \
+    -d '{"model": "bosonai/higgs-audio-v3-tts-4b", "input": "Hello, how are you?"}' \
+    --output hello.wav
+  ```
+
+  ### Voice clone (Python client)
+
+  ```bash
+  python examples/online_serving/text_to_speech/higgs_audio_v3/batch_speech_client.py \
+    --base-url http://localhost:8000 \
+    --model bosonai/higgs-audio-v3-tts-4b \
+    --ref-audio path/to/reference.wav \
+    --ref-text "Transcript of the reference." \
+    --prompts "Text to clone."
+  ```
+
+  ### Offline batch inference
+
+  ```bash
+  python examples/offline_inference/text_to_speech/higgs_audio_v3/end2end.py \
+    --texts "Hello world." "The quick brown fox jumps over the lazy dog." \
+    --output-dir results/higgs_v3_wavs
+  ```
+
+  `ref_audio` accepts WAV/FLAC/MP3; `ref_text` is optional but improves fidelity.
+
+  ## Known limitations
+
+  - Output is **24 kHz mono** WAV.
+  - The deploy config runs both stages with `enforce_eager: true`
+    (`max_num_seqs=16`). A CUDA graph is available for Stage 0 and helps batch=1
+    (~-13% RTF) but not batch>1 (the model-owned sampler runs outside the graph);
+    Stage 1 (code2wav) must stay eager (`@torch.inference_mode` is incompatible
+    with graph capture).
+  - Async (chunk-based) streaming is not yet implemented; the pipeline is
+    sync-only.
+
+  ## References
+
+  - [Model card](https://huggingface.co/bosonai/higgs-audio-v3-tts-4b)
+  - [vLLM-Omni Higgs Audio V3 online example](https://github.com/vllm-project/vllm-omni/tree/main/examples/online_serving/text_to_speech/higgs_audio_v3)
+  - [vLLM-Omni Higgs Audio V3 offline example](https://github.com/vllm-project/vllm-omni/blob/main/examples/offline_inference/text_to_speech/higgs_audio_v3/end2end.py)

@@ -13,9 +13,13 @@ import torch
 from vllm_omni.diffusion.interaction.coordinator import InteractionCoordinator
 from vllm_omni.diffusion.interaction.mixin import InteractionMixin
 from vllm_omni.diffusion.interaction.modality_handlers.camera import CameraSession, SE3DeltaCameraHandler
-from vllm_omni.diffusion.interaction.modality_handlers.prompt import PromptSession
+from vllm_omni.diffusion.interaction.modality_handlers.prompt import PromptInteractionHandler, PromptSession
 from vllm_omni.diffusion.interaction.registry import STRUCTURED_HANDLER_REGISTRY
-from vllm_omni.diffusion.interaction.types import ChunkMediaSpec, resolve_event_frame_offset
+from vllm_omni.diffusion.interaction.types import (
+    MAX_PENDING_INTERACTION_EVENTS,
+    ChunkMediaSpec,
+    resolve_event_frame_offset,
+)
 from vllm_omni.diffusion.worker.utils import StepRequestState
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
@@ -432,3 +436,44 @@ class TestResolveEventFrameOffset:
         assert resolve_event_frame_offset(received_at=0.1, previous_boundary_at=0.0, num_frames=8, fps=16.0) == 1
         assert resolve_event_frame_offset(received_at=10.0, previous_boundary_at=0.0, num_frames=8, fps=16.0) == 7
         assert resolve_event_frame_offset(received_at=-1.0, previous_boundary_at=0.0, num_frames=8, fps=16.0) == 0
+
+
+def test_delivered_camera_events_are_bounded_before_composite_enqueue():
+    pipeline = _FakePromptPipeline()
+    coordinator = InteractionCoordinator(
+        {"prompt": PromptInteractionHandler.from_pipeline(pipeline), "camera": SE3DeltaCameraHandler()}
+    )
+    state = _make_state()
+    handler = coordinator.get_handler("camera")
+    for index in range(MAX_PENDING_INTERACTION_EVENTS):
+        handler.enqueue(
+            state,
+            event_id=str(index),
+            received_at=float(index),
+            payload=_FORWARD_VELOCITY,
+            transition_chunks=None,
+        )
+    camera = state.interaction_sessions["camera"]
+    assert isinstance(camera, CameraSession)
+    with pytest.raises(ValueError, match="Too many pending camera interactions"):
+        coordinator.enqueue_parts(
+            state,
+            parts=[("prompt", {"prompt": "must not be encoded"}), ("camera", _FORWARD_VELOCITY)],
+            event_id="overflow",
+            received_at=float(MAX_PENDING_INTERACTION_EVENTS),
+            transition_chunks=1,
+        )
+    assert len(camera.pending_events) == MAX_PENDING_INTERACTION_EVENTS
+    assert "prompt" not in state.interaction_sessions
+    pipeline.encode_prompt.assert_not_called()
+    handler.apply_at_chunk_boundary(
+        state, boundary_at=float(MAX_PENDING_INTERACTION_EVENTS), num_media_frames=3, fps=3.0, num_latent_frames=3
+    )
+    handler.enqueue(
+        state,
+        event_id="after-resume",
+        received_at=float(MAX_PENDING_INTERACTION_EVENTS + 1),
+        payload=_FORWARD_VELOCITY,
+        transition_chunks=None,
+    )
+    assert len(camera.pending_events) == 1

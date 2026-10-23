@@ -181,9 +181,6 @@ Requests whose stop conditions or sampling constraints prevent safe early
 publication also retain regular delivery. Stage1 primes its streaming state
 with the same codes and sends subsequent audio without duplicating the first
 frame. Its regular dispatch target is 16 with a maximum wait of 6 ms.
-`local_compile_audio_sampler: true` in the Talker HF overrides compiles the native
-Torch sampler; explicit request generators use the original helper. Set the
-override to `false` in a deployment file to disable that compilation. The setting is enabled in the unified CUDA profile.
 The Stage0 decoder adds approximately 2 GiB of parameter weights for this
 checkpoint, plus buffers and CUDA Graph memory, all included in model memory
 profiling. Its T=1 graph buckets follow the Talker's capture sizes up to the
@@ -207,9 +204,12 @@ capture limit. This keeps new prompt chunks within graph coverage instead
 of letting large prefills monopolize streaming decode. GPU request slots
 retain Local hidden states, audio codes and continuation control. Published
 codes own their storage, so slot reuse cannot overwrite an in-flight output.
-The codec uses `triton_slot` attention, Inductor mode 3 with combo kernels
-disabled, and codec-owned CUDA graphs through batch 128. Cold compilation
-can take several minutes; subsequent starts can reuse the AOT cache.
+Neither stage uses `torch.compile` (`compilation_config.mode: 0`); the
+fusions run as explicit Triton kernels on CUDA: residual + RMSNorm, SiLU-and-mul
+and Q/K norm + RoPE in the Talker backbone, residual + LayerNorm in the Local
+predictor, and in-place RoPE plus layer-scale residual + LayerNorm in the codec.
+The codec uses `triton_slot` attention and codec-owned CUDA graphs through
+batch 128.
 
 The codec coalesces ready streams with
 `connectors.shm.extra.generation_min_batch_size: 16` and
@@ -330,10 +330,15 @@ loaded tokenizer's encoder/quantizer, length buckets and optional compilation
 attention; `VLLM_OMNI_MOSS_REF_ATTN=sdpa` retains the original attention.
 Compilation and attention changes need not produce bit-identical codes.
 
-For multiple API processes, `VLLM_OMNI_MOSS_REF_CODES_SHARED_DIR` enables shared
-reference-code storage and, by default, a single encoder host with four
-workers. Use a dedicated directory per service, checkpoint and encoding
-configuration. Workers have their own graph resources; all graph captures
+With `--api-server-count` above 1, the API processes share reference-code
+storage and, by default, a single encoder host with four workers. The
+directory is created for the server under `/dev/shm` (or `/tmp`) and removed
+at shutdown; it keeps about the 4096 most recently used references.
+`VLLM_OMNI_MOSS_REF_CODES_SHARED_DIR` selects a directory of your own instead
+(use a dedicated one per service, checkpoint and encoding configuration); an
+empty value turns sharing off. The encoder host listens on a Unix socket in
+that directory: if the socket path exceeds 103 bytes, each API process encodes
+its own references and only the codes are shared. Workers have their own graph resources; all graph captures
 complete before serving begins. `VLLM_OMNI_MOSS_REF_SHARED_ENCODER=0` retains
 separate encoders while sharing codes. More workers/graphs consume memory;
 they do not imply more GPUs. Example after selecting an available GPU and
@@ -348,7 +353,6 @@ VLLM_OMNI_MOSS_REF_ENCODER_WORKERS=4 \
 VLLM_OMNI_MOSS_REF_BATCH_WINDOW_MS=0 \
 VLLM_OMNI_MOSS_REF_INFLIGHT=4 \
 VLLM_OMNI_MOSS_REF_HOST_WINDOW_MS=2 \
-VLLM_OMNI_MOSS_REF_CODES_SHARED_DIR=/dev/shm/moss-local-service \
 vllm serve OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5 --omni \
   --api-server-count 4 \
   --deploy-config vllm_omni/deploy/moss_tts_local.yaml \
@@ -411,12 +415,10 @@ quality or that every sentence ended before the cap. Dataset seed 42 does
 not fix an independent sampling seed for every request.
 
 For an attention-only comparison, copy the high-concurrency YAML beside the
-original to preserve relative `base_config` resolution. Change its
-codec `compilation_config.mode` to `0` while retaining `cudagraph_mode: FULL`,
-and compare `codec_attention_backend: triton` against `triton_slot`. Keep all
-other settings, warmup and client concurrency identical. Restart the server
-between configurations and use separate result directories. Comparing the
-compiled slot profile to uncompiled Triton includes both changes.
+original to preserve relative `base_config` resolution and compare
+`codec_attention_backend: triton` against `triton_slot`. Keep all other
+settings, warmup and client concurrency identical. Restart the server between
+configurations and use separate result directories.
 
 Kernel and MHA regression tests require CUDA, compatible vLLM/Triton packages,
 and no model weights:

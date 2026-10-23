@@ -252,6 +252,15 @@ def test_ltx_extra_registry_declares_official_guidance_params() -> None:
         assert get_extra_output_params(pipeline_name) == frozenset()
 
 
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_ltx_t2a_extra_registry_omits_inapplicable_modality_scale() -> None:
+    params = get_extra_body_params("LTX2TextToAudioPipeline")
+
+    assert "audio_modality_scale" not in params
+    assert "audio_cfg_scale" in params
+
+
 @pytest.mark.parametrize(
     ("model_version", "expected"),
     [("2", False), ("2.3", False), ("2.5", True)],

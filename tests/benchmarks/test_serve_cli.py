@@ -132,6 +132,7 @@ def test_extend_omni_choices_updates_tracking_parser_shadow(dataset_name: str) -
         (["--daily-omni-input-mode", "audio"], "daily_omni_input_mode", "audio"),
         (["--omniinteract-subsets", "1qna"], "omniinteract_subsets", ["1qna"]),
         (["--seed-tts-locale", "zh"], "seed_tts_locale", "zh"),
+        (["--seed-tts-reference-as-input"], "seed_tts_reference_as_input", True),
     ],
 )
 def test_add_omni_args_registers_arguments_on_tracking_parser(
@@ -532,3 +533,10 @@ def test_omni_request_timeout_s_flag_defaults_and_parses() -> None:
 
     args = parser.parse_args(["--omni-request-timeout-s", "3600"])
     assert args.omni_request_timeout_s == 3600.0
+
+
+def test_realtime_chat_choice_is_available_without_importing_runtime() -> None:
+    parser = TrackingArgumentParser()
+    parser.add_argument("--backend", choices=["openai-chat-omni"])
+    extend_omni_choices(parser)
+    assert parser.parse_args(["--backend", "openai-realtime-chat"]).backend == "openai-realtime-chat"

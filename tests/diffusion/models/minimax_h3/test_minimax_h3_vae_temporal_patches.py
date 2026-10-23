@@ -271,6 +271,24 @@ def test_decode_fork_rejects_empty_plan():
         _decode_temporal_streaming_uint8(model, torch.randn(1, 3, 0, 4, 4), None, None, 0, 0, None)
 
 
+def test_streaming_uses_released_pixel_transform():
+    from vllm_omni.diffusion.models.minimax_h3.vae_nvfp4 import released_decoder_pixels
+
+    class ReplacementDecoder(_DecodeModel):
+        def _decode_temporal_streaming(self, *args: object) -> torch.Tensor:
+            raise AssertionError("streaming patch was not installed")
+
+        def _adaptive_decode(self, z: torch.Tensor) -> torch.Tensor:
+            return z
+
+    model = ReplacementDecoder()
+    install_temporal_stream_patches(model, pixel_transform=released_decoder_pixels)
+    z = torch.ones(1, 3, 4, 1, 1, dtype=torch.bfloat16)
+    result = model._decode_temporal_streaming(z, None, None, 2, 0, torch.bfloat16)
+    expected = torch.tensor([182, 173, 161], dtype=torch.uint8).view(1, 3, 1, 1, 1).expand_as(result)
+    assert torch.equal(result, expected)
+
+
 # ---------------------------------------------------------------------------
 # install + escape hatch
 # ---------------------------------------------------------------------------

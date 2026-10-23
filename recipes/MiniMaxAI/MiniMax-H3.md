@@ -821,7 +821,7 @@ longer than the generated clip. Use `start_time_seconds` to select a
 synchronized segment; for multiple typed video references, pass one value per
 video in `extra_params.start_time_seconds`.
 
-Reference images accept JPG/JPEG, PNG, WEBP, HEIC, or HEIF up to 30 MiB. Standalone
+Reference images accept JPG/JPEG, PNG, or WEBP up to 30 MiB. Standalone
 audio references accept WAV or MP3 up to 15 MiB, with 2–15 seconds per file and
 at most 15 seconds combined.
 
@@ -1327,156 +1327,13 @@ differ from each other.
 
 ### FastH3 adapter
 
-[FastH3](https://haoailab.com/blogs/fasth3-preview/) is FastVideo's four-step
-DMD2 student of H3-Base. It reuses H3's text encoder, VAEs, tokenizers, and
-schedulers unchanged, replacing 49 denoiser evaluations with four. It is fused
-into the checkpoint at load time rather than switched per request, because it
-carries full-rank deltas that no LoRA layer can express.
-
-The bundle publishes four variants, so download one and point `--lora-path` at
-it; the repository root is refused rather than guessed at:
-
-```bash
-export FASTH3_DIR=/path/to/fasth3
-hf download FastVideo/FastVideo-FastH3-4-step-Preview-v1-LoRA \
-  dense-datafree/adapter_model.safetensors --local-dir "${FASTH3_DIR}"
-export FASTH3_LORA="${FASTH3_DIR}/dense-datafree/adapter_model.safetensors"
-```
-
-Add `--task-type fl2va --lora-path "${FASTH3_LORA}"` to a server command without
-DiT-wide offload. T2VA is served by the FL2VA partition, so `--task-type fl2va` is
-correct even though FastH3 preview v1 distills T2VA only. Because the adapter is
-fused, `--lora-backend` does not apply and a request carrying a `lora=` field is
-rejected rather than served without the adapter it asked for.
-
-```bash
--F 'num_inference_steps=4' \
--F 'extra_params={"task":"t2va","duration":4.4}'
-```
-
-Requests must ask for `num_inference_steps=4` and `task=t2va`: the release's five
-sigma points bound four denoiser evaluations, and that count is what the step
-scheduler admits a request on. The server denoises on the release's own ladder,
-keeping H3's per-modality shifts at the checkpoint values, so a request that
-overrides `flow_shift` or `audio_flow_shift` is rejected - it would sample the
-student at noise levels it was never distilled at.
-
-Only a release that identifies itself as FastH3 is fused; any other
-`fastvideo-lora-v2` adapter stays on the dynamic LoRA route. A claimed artifact
-is then held to its own metadata: one that misdeclares its tensor counts or
-leaves a transformer block unedited is refused at startup instead of serving
-mostly base H3 weights on a four-step schedule. DiT-wide offload is refused for the same
-reason - `--enable-cpu-offload`, `--enable-layerwise-offload` and
-`--enable-distributed-layerwise-offload` all bypass the fusion, so they fail fast.
-
-For the VSA variants, add the following flags to the same command. H3 selects
-FlashInfer BF16 automatically on SM120/SM121 when the required tile64 API is
-installed; otherwise it uses FastVideo's external kernel, supplied by the
-`vllm-omni[vsa]` extra. The video request API is unchanged:
-
-```bash
---diffusion-attention-backend FASTVIDEO_VSA \
---fastvideo-vsa-topk 64
-```
-
-To use approximate Sage attention on SM120, replace those two flags with:
-
-```bash
---diffusion-attention-config '{"default":{"backend":"FASTVIDEO_VSA","fastvideo_vsa_precision":"sage","fastvideo_vsa_topk":64},"per_role":{"minimax_h3.token_refiner":{"backend":"TORCH_SDPA"}}}'
-```
-
-Sage requires a compatible FlashInfer build; BF16 remains the default. See
-[provider selection](../../docs/user_guide/diffusion/attention_backends/fastvideo_vsa.md#automatic-provider-selection)
-for hardware requirements and provider overrides.
-
-FastH3 VSA applies its learned `.set_weight` compression gates to the complete
-packed `[text | cond | audio | video]` document using the official H3 geometry:
-text/condition/audio prefix tiles never cross segment boundaries, and target
-video rows use `(4, 4, 4)` 3-D tiles (64 tokens). Prefix queries remain dense;
-video queries select all prefix tiles plus the configured top-k video tiles.
-Pure Ulysses sequence parallelism is supported: the learned gate follows the
-same sequence-to-head all-to-all as Q/K/V before VSA runs. Ring and all-gather
-SP remain unsupported because they do not present a complete packed sequence
-to each block-sparse kernel rank.
-
-The Dense / Data-Free variant does not require `fastvideo-kernel` and should be
-served with a dense attention backend.
-
-Measured on 8x NVIDIA B300 with USP8, VAE patch-parallel 8, `TRTLLM_ATTN`, at
-1344x768, 4.4 s, seed 1101, one warmup excluded and two runs recorded:
-
-| Adapter | Steps | End-to-end | Diffusion engine |
-| --- | ---: | ---: | ---: |
-| none (base H3) | 50 | 25.8 / 26.4 s | 16.22 / 16.28 s |
-| FastH3 Dense | 4 (5 sigma points) | 11.7 / 11.8 s | 2.37 / 2.36 s |
-
-The denoising speedup is 6.9x. End-to-end is 2.2x because text encoding, VAE
-decoding and muxing are a fixed cost that dominates a clip this short; longer
-generations move the end-to-end figure toward the denoising one. Fusing the
-adapter does not measurably change startup: weight loading took 77.3 s with it
-against 85.8 s without.
+The four-step adapter recipe has moved to the [FastH3 section](../FastVideo/README.md):
+[FastH3](../FastVideo/FastH3.md).
 
 ### FastH3 8-Step V2 full checkpoint
 
-[FastH3 8-Step V2](https://huggingface.co/FastVideo/FastVideo-FastH3-8-Step-V2)
-ships a full Diffusers-format transformer, including learned VSA compression
-gates. Serve the Hugging Face model ID or a downloaded snapshot directly:
-
-```bash
-export FASTH3_V2_MODEL=FastVideo/FastVideo-FastH3-8-Step-V2
-```
-
-Use a Hugging Face account with access to the release, and pin `--revision`
-when reproducing a result. The existing component loader reads its safetensors
-shards; the H3 weight loader maps names and loads Q/K/V and MLP projections into
-native parameters in memory. No conversion command or second transformer
-checkpoint is needed.
-
-The transformer and text components come from the V2 release. To retain Omni's
-native tiled and parallel VAE execution, the loader fetches only the video/audio
-VAEs from the `MiniMaxAI/MiniMax-H3` revision pinned in V2's `provenance.json`.
-Those components use the normal Hugging Face cache. No separate base-model
-argument or full base-transformer download is required. Download time is a
-preparation cost, separate from warmup and request latency.
-
-Install the optional `fastvideo-kernel` build required by the
-`FASTVIDEO_VSA` backend, including its H3 block-map entry point. A four-GPU
-configuration is:
-
-```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3 vllm serve "${FASTH3_V2_MODEL}" --omni \
-  --host 127.0.0.1 --port 8095 --trust-remote-code --task-type fl2va \
-  --served-model-name FastH3-V2 \
-  --num-gpus 4 --usp 4 --ring 1 \
-  --vae-patch-parallel-size 4 --vae-parallel-mode tile --vae-use-tiling \
-  --diffusion-attention-backend FASTVIDEO_VSA
-
-curl --fail-with-body -sS http://127.0.0.1:8095/v1/videos/sync \
-  -F 'model=FastH3-V2' \
-  -F 'prompt=A red fox runs through fresh snow at dawn, with fast pawsteps, winter wind and distant birds.' \
-  -F 'width=1344' -F 'height=768' -F 'aspect_ratio=16:9' -F 'fps=24' \
-  -F 'num_inference_steps=8' -F 'guidance_scale=1' -F 'flow_shift=10' \
-  -F 'seed=1101' \
-  -F 'extra_params={"task":"t2va","duration":4.4,"audio_flow_shift":3.0}' \
-  -o fasth3_v2.mp4
-```
-
-V2 pins video/audio shifts **10/3**, guidance **1**, and the unshifted ladder
-`[0.999, 0.874, 0.749, 0.624, 0.5, 0.375, 0.25, 0.125, 0.0]`.
-Use **`num_inference_steps=8`** in Omni: these nine nodes bound eight model
-evaluations. FastVideo's `--steps 9` counts nodes instead. The existing H3 ODE
-update is reused without stochastic re-noising.
-
-The trained attention policy is **80% sparsity with 64-token video tiles**.
-Omni derives the number of selected video tiles from each request's geometry;
-do not supply a fixed `--fastvideo-vsa-topk`. Text/condition/audio prefix keys
-remain available to every query, and prefix queries remain dense. Missing VSA
-geometry or a failed H3 kernel raises an error instead of serving the student
-with dense attention.
-
-This release supports T2VA only, with local or pure Ulysses attention. Additional
-LoRA adapters, Ref2VA and FL2VA conditioning are unsupported. The legacy
-four-step adapter keeps its original sampling and fixed-top-k behavior.
+See [FastH3 V2 — T2VA](../FastVideo/FastH3-V2.md) in the
+[FastH3 section](../FastVideo/README.md) for the eight-forward full checkpoint.
 
 ### VDN-H3 checkpoint
 
@@ -1558,6 +1415,11 @@ OpenVDN reference implementation on identical inputs. The relative L2 error
 was 1.6e-2 for video and 1.0e-2 for audio, against 1.2e-2 and 1.4e-2 for base
 H3 replayed the same way. Software: Ubuntu 22.04, driver 580.178.04, Python
 3.12, PyTorch 2.13.0+cu130, vLLM 0.30.0.
+
+### FastH3 Omni 8-Step V1 (experimental)
+
+See [FastH3 Omni — Ref2VA](../FastVideo/FastH3-Omni.md) in the
+[FastH3 section](../FastVideo/README.md) for reference-conditioned generation.
 
 ## Key parameters
 

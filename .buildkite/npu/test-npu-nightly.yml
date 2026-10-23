@@ -81,34 +81,43 @@ steps:
           # Pin the Seed-TTS scorer to the second card: _get_eval_device() otherwise
           # auto-picks npu:0, which the omni server under test already fills with its
           # KV cache, so Whisper OOMs on `.to(device)` and every clip reports
-          # "ASR / WER failed".
+          # "ASR / WER failed". UTMOS cannot run the traced graph on logical npu:1
+          # in this process; the worker hides every card except that physical NPU
+          # and rewrites cuda:0 onto npu:0 there. There is no numeric MOS floor
+          # until an A3 run measures one.
           - export SEED_TTS_WER_EVAL=1
+          - export SEED_TTS_SIM_EVAL=1
+          - export SEED_TTS_UTMOS_EVAL=1
           - export SEED_TTS_EVAL_DEVICE=npu:1
+          - export SEED_TTS_UTMOS_DEVICE=npu:1
           - |
             set +e
             pytest -s -v tests/e2e/accuracy/minicpmo_4_5/test_minicpmo_4_5.py -m "full_model and npu and A3" --run-level full_model
             EXIT=$$?
             buildkite-agent artifact upload "tests/e2e/accuracy/minicpmo_4_5/results/*.json"
             exit $$EXIT
-      - label: ":full_moon: Omni · Omni-DuplexEval CI Guard"
-        source_file_dependencies: omni_duplex_eval_ci
-        timeout_in_minutes: 240
-        mirror_hardwares: a3_npu_2
+      - label: ":full_moon: Omni · Qwen3-Omni · Accuracy Test"
+        source_file_dependencies: omni_qwen3_omni_accuracy
+        timeout_in_minutes: 180
+        mirror_hardwares: a3_npu_4
+        artifact_paths:
+          - tests/e2e/accuracy/qwen3_omni/results/qwen_omni_acc/*.json
         env:
           VLLM_WORKER_MULTIPROC_METHOD: spawn
           VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
           HF_TOKEN: "${HF_TOKEN}"
-          VLLM_DUPLEX_EVAL_JUDGE_URL: "http://127.0.0.1:8001"
         commands:
-          - |
-            set +e
-            pytest -s -v tests/e2e/accuracy/omni_duplex_eval/test_omni_duplex_eval_ci.py \
-              -m "full_model and npu and A3 and cards_2" \
-              --run-level full_model \
-              --basetemp /tmp/omni_duplex_ci
-            EXIT=$$?
-            buildkite-agent artifact upload "tests/e2e/accuracy/omni_duplex_eval/results/*.json"
-            exit $$EXIT
+          # Pin the Seed-TTS scorer to the 4th card: _get_eval_device() otherwise
+          # auto-picks npu:0, which the omni server under test already fills with its
+          # KV cache (thinker TP=2 on npu:0-1, talker/code2wav on npu:2), so Whisper
+          # OOMs on `.to(device)` and every clip reports "ASR / WER failed".
+          - export SEED_TTS_WER_EVAL=1
+          - export SEED_TTS_SIM_EVAL=1
+          - export SEED_TTS_EVAL_DEVICE=npu:3
+          # UTMOS is intentionally off on A3: balacoon/utmos is not in the offline
+          # runner cache and no A3 MOS baseline exists yet, so the test skips the
+          # MOS floor on NPU. Re-enable both once the asset is cached.
+          - pytest -s -v tests/e2e/accuracy/qwen3_omni/test_qwen3_omni.py -m "full_model and npu and A3" --run-level full_model
       - label: ":full_moon: Omni · MiniCPM-o 4.5 · Perf Test"
         source_file_dependencies: omni_minicpmo_4_5_perf
         key: nightly-omni-performance-minicpmo-4-5-npu
@@ -190,6 +199,24 @@ steps:
       build.env("NIGHTLY") == "1" ||
       build.pull_request.labels includes "nightly-test"
     steps:
+      - label: ":full_moon: Diffusion X2I(&A&T) · Qwen-Image 2.1 Accuracy Test"
+        source_file_dependencies: diffusion_qwen_image_21_accuracy
+        timeout_in_minutes: 180
+        mirror_hardwares: a3_npu_2
+        env:
+          VLLM_WORKER_MULTIPROC_METHOD: spawn
+          HF_TOKEN: "${HF_TOKEN}"
+          QWEN_IMAGE_21_CALIBRATE: "0"
+          HF_HUB_OFFLINE: "1"
+        artifact_paths:
+          - tests/e2e/accuracy/artifacts/qwen_image_21/**/*
+        commands:
+          - >-
+            bash -c 'source tests/e2e/accuracy/qwen_image_21/setup_reference.sh &&
+            exec pytest -sv tests/e2e/accuracy/qwen_image_21/test_qwen_image_21.py
+            -m "full_model and diffusion and npu and A3 and cards_1"
+            --run-level full_model
+            --junitxml=tests/e2e/accuracy/artifacts/qwen_image_21/pytest.xml'
       - label: ":full_moon: HunyuanImage3-DIT · Accuracy Test"
         source_file_dependencies: diffusion_hunyuan_image3_accuracy
         timeout_in_minutes: 180
@@ -252,6 +279,18 @@ steps:
             buildkite-agent artifact upload "tests/dfx/perf/results/diffusion_result_*.json"
             buildkite-agent artifact upload "tests/dfx/perf/results/logs/*.log"
             exit $$EXIT
+      - label: ":full_moon: Diffusion X2I(&A&T) · Qwen-Image Accuracy Test"
+        source_file_dependencies: diffusion_qwen_image_accuracy
+        key: nightly-diffusion-x2iat-accuracy-qwen-image
+        timeout_in_minutes: 180
+        mirror_hardwares: a3_npu_2
+        env:
+          VLLM_WORKER_MULTIPROC_METHOD: spawn
+          HF_TOKEN: "${HF_TOKEN}"
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+        commands:
+          - pytest -s -v tests/e2e/accuracy/test_qwen_image.py -m "full_model and diffusion and npu and A3 and cards_1" --run-level full_model
+
       - label: ":full_moon: Diffusion X2I(&A&T) · Perf Test · Qwen-Image · Single-NPU"
         source_file_dependencies: diffusion_qwen_image_perf
         key: nightly-diffusion-x2iat-performance-qwen-image-single-npu
@@ -287,6 +326,40 @@ steps:
             EXIT=$$?
             buildkite-agent artifact upload "tests/dfx/perf/results/diffusion_result_*.json"
             buildkite-agent artifact upload "tests/dfx/perf/results/logs/*.log"
+            exit $$EXIT
+      - label: ":full_moon: Diffusion X2I(&A&T) · Perf Test · Qwen-Image-2.1 · Single-NPU"
+        source_file_dependencies: diffusion_qwen_image_21_perf
+        key: nightly-diffusion-x2iat-performance-qwen-image-21-single-npu
+        timeout_in_minutes: 180
+        mirror_hardwares: a3_npu_2
+        env:
+          VLLM_WORKER_MULTIPROC_METHOD: spawn
+          HF_TOKEN: "${HF_TOKEN}"
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+        commands:
+          - export BENCHMARK_DIR=tests/dfx/perf/results
+          - |
+            set +e
+            pytest -s -v tests/dfx/perf/scripts/run_benchmark.py -m "npu and A3 and cards_1" --test-config-file tests/dfx/perf/tests/test_qwen_image_21_vllm_omni.json
+            EXIT=$$?
+            buildkite-agent artifact upload "tests/dfx/perf/results/*.json"
+            exit $$EXIT
+      - label: ":full_moon: Diffusion X2I(&A&T) · Perf Test · Qwen-Image-2.1 · 4-NPU"
+        source_file_dependencies: diffusion_qwen_image_21_perf
+        key: nightly-diffusion-x2iat-performance-qwen-image-21-4npu
+        timeout_in_minutes: 180
+        mirror_hardwares: a3_npu_4
+        env:
+          VLLM_WORKER_MULTIPROC_METHOD: spawn
+          HF_TOKEN: "${HF_TOKEN}"
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+        commands:
+          - export BENCHMARK_DIR=tests/dfx/perf/results
+          - |
+            set +e
+            pytest -s -v tests/dfx/perf/scripts/run_benchmark.py -m "npu and A3 and cards_4" --test-config-file tests/dfx/perf/tests/test_qwen_image_21_vllm_omni.json
+            EXIT=$$?
+            buildkite-agent artifact upload "tests/dfx/perf/results/*.json"
             exit $$EXIT
   - group: ":card_index_dividers: Diffusion X2V Model Test"
     key: nightly-diffusion-x2v-group

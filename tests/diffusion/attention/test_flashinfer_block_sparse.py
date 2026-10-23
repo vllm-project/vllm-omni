@@ -112,6 +112,7 @@ def test_missing_provider_api_is_clear(monkeypatch):
     monkeypatch.setattr(current_omni_platform, "get_device_capability", lambda *_: (12, 0))
     monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: 3)
     monkeypatch.setitem(sys.modules, "flashinfer", None)
+    monkeypatch.setitem(sys.modules, "flashinfer.cute_dsl.sparse", None)
     with pytest.raises(ImportError, match="requires a build with bsa_attn_sm120_blk64_sage_fwd"):
         provider.require_flashinfer_sparse("sage")
 

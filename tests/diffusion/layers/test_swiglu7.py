@@ -4,6 +4,7 @@
 import pytest
 import torch
 
+from tests.helpers.mark import hardware_marks
 from vllm_omni.diffusion.layers import swiglu7 as kernel_module
 from vllm_omni.diffusion.layers.swiglu7 import SwiGLU7
 from vllm_omni.diffusion.models.magi2 import layers as magi2_layers
@@ -106,7 +107,10 @@ def test_compile_keeps_native_pointwise_graph(monkeypatch):
     assert not any("triton" in target or "swiglu7_kernel" in target for target in targets)
 
 
-GPU_DEVICES = [pytest.param("cuda", marks=pytest.mark.cuda), pytest.param("musa", marks=pytest.mark.musa)]
+GPU_DEVICES = [
+    pytest.param("cuda", marks=hardware_marks(res={"cuda": "L4"}, num_cards=1)),
+    pytest.param("musa", marks=hardware_marks(res={"musa": "S5000"}, num_cards=1)),
+]
 
 
 def require_device(name):

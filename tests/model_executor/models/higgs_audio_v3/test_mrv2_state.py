@@ -124,10 +124,11 @@ def test_finalizer_filters_unsampled_prefill_and_keeps_owned_audio():
     assert payload["_higgs_invalid_rows"] == ()
 
 
-def test_upstream_warmup_retains_generic_text_sampling():
+@pytest.mark.parametrize("req_id", ["_warmup_0_", "_v2_mixed_warmup_decode_", "_v2_mixed_warmup_prefill_"])
+def test_upstream_warmup_retains_generic_text_sampling(req_id):
     s = make_state()
-    s.add_request(0, request("_warmup_0_", 0, repetition_penalty=1.2, logprobs=1))
-    batch = SimpleNamespace(req_ids=["_warmup_0_"])
+    s.add_request(0, request(req_id, 0, repetition_penalty=1.2, logprobs=1))
+    batch = SimpleNamespace(req_ids=[req_id])
     sampler, rejection = s.custom_sampler(Mock())
     expected = (object(), torch.ones(1), torch.zeros(1))
     standard = Mock(return_value=expected)
@@ -135,7 +136,7 @@ def test_upstream_warmup_retains_generic_text_sampling():
     assert output.sampler_output is expected[0] and output.multimodal_outputs is None
     assert rejection is None
     standard.assert_called_once_with(None, batch, None)
-    s.remove_request("_warmup_0_")
+    s.remove_request(req_id)
     assert not s.requests
 
 

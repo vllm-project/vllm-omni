@@ -11,7 +11,6 @@ diffusion models (e.g., Qwen-Image) through the same CLI interface.
 from __future__ import annotations
 
 import argparse
-import contextlib
 import json
 import math
 import os
@@ -26,6 +25,11 @@ from vllm.entrypoints.serve.utils.api_utils import VLLM_SUBCMD_PARSER_EPILOG
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.registry import resolve_native_single_file
+from vllm_omni.engine.arg_utils import FRONTEND_ONLY_ID_FILTER, is_frontend_only
+from vllm_omni.entrypoints.api_server_shared_dir import (
+    create_api_server_shared_dir,
+    remove_api_server_shared_dir,
+)
 from vllm_omni.entrypoints.cli.logo import log_logo
 from vllm_omni.entrypoints.openai.api_server import (
     omni_run_server,
@@ -70,6 +74,20 @@ def _parse_stage_overrides(value: str) -> dict[str, dict[str, Any]]:
     if parsed is None:
         raise argparse.ArgumentTypeError("--stage-overrides requires a JSON object")
     return parsed
+
+
+def _parse_stage_id(value: str) -> int:
+    """Parse `--stage-id` as a non-negative int, or `none` (no local stage) as `FRONTEND_ONLY_ID_FILTER`."""
+    if value.lower() == "none":
+        return FRONTEND_ONLY_ID_FILTER
+    msg = f"Stage ID must be a non-negative integer or 'none', got {value!r}"
+    try:
+        stage_id = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(msg) from exc
+    if stage_id < 0:
+        raise argparse.ArgumentTypeError(msg)
+    return stage_id
 
 
 def _nonneg_finite_float(value: str) -> float:
@@ -172,6 +190,8 @@ class OmniServeCommand(CLISubcommand):
 
         if args.stage_id is not None and (args.omni_master_address is None or args.omni_master_port is None):
             raise ValueError("--stage-id requires both --omni-master-address and --omni-master-port to be set")
+        if args.headless and is_frontend_only(args.stage_id):
+            raise ValueError("--stage-id none cannot be used with --headless")
 
         # Require an explicit model under --omni. ``args.model`` always carries
         # vLLM's ModelConfig default (``Qwen/Qwen3-0.6B``), so an omit is silent:
@@ -262,8 +282,8 @@ class OmniServeCommand(CLISubcommand):
         if omni_dp_size_local is not None:
             if omni_dp_size_local < 1:
                 raise ValueError(f"--omni-dp-size-local must be >= 1, got {omni_dp_size_local}")
-            if omni_dp_size_local != 1 and args.stage_id is None:
-                raise ValueError("--omni-dp-size-local != 1 requires --stage-id to be set")
+            if omni_dp_size_local != 1 and (args.stage_id is None or is_frontend_only(args.stage_id)):
+                raise ValueError("--omni-dp-size-local != 1 requires a numeric --stage-id")
 
         # vLLM CLI args that omni does not honor: parallelism comes from the
         # per-stage YAML (parallel_config:, enable_expert_parallel:) and the
@@ -426,9 +446,12 @@ class OmniServeCommand(CLISubcommand):
         )
         omni_config_group.add_argument(
             "--stage-id",
-            type=int,
+            type=_parse_stage_id,
             default=None,
-            help="Select and launch a single stage by stage_id.",
+            help=(
+                "Select and launch a single stage by stage_id. Pass 'none' on the "
+                "head to launch no local stage (API server + orchestrator only)."
+            ),
         )
         omni_config_group.add_argument(
             "--replica-id",
@@ -924,6 +947,15 @@ class OmniServeCommand(CLISubcommand):
             "resident_layers (DiT only).",
         )
         omni_config_group.add_argument(
+            "--kv-offload-config",
+            type=json.loads,
+            default=None,
+            help="MiniMax-H3 reference-KV cache as JSON: mode=on, "
+            "kv_refresh_interval (default 2), kv_host_quantization=none|fp8|int8. "
+            "Reference projections are skipped on reuse steps. "
+            "Omit to keep the existing attention path.",
+        )
+        omni_config_group.add_argument(
             "--enable-cpu-offload",
             action="store_true",
             help="Compatibility alias for model-level CPU offload. New integrations should use "
@@ -1138,15 +1170,6 @@ class OmniServeCommand(CLISubcommand):
             help="Enable orchestrator window monitor and write a JSON log at shutdown.",
         )
 
-        # Supplementary auxiliary text encoder parameters
-        # (e.g., the meta llama/meta llama-3.1-8b-instrument used by hidream)
-        omni_config_group.add_argument(
-            "--auxiliary-text-encoder",
-            type=str,
-            default=None,
-            help="Auxiliary text encoder parameters model name or path (especially for Hidream-l1-full).",
-        )
-
         # Stash via type(self) so the docs hook (which execs this function in a
         # sandboxed globals dict via ``DummySelf``) doesn't fail on a NameError.
         type(self)._parser = serve_parser
@@ -1257,39 +1280,40 @@ def _wait_for_multi_api_server_completion(
                 )
 
 
-def _start_api_server_process_manager(
-    *,
-    cleanup_timeout: float,
-    **manager_kwargs: object,
-) -> APIServerProcessManager:
-    """Construct vLLM's manager with rollback for a partial ``__init__``.
+class _EngineAddressListener:
+    """Present an engine-bound ZMQ address as vLLM's ``ZmqListener`` interface.
 
-    ``APIServerProcessManager`` starts workers one by one in ``__init__`` and
-    installs its finalizer only after every ``Process.start`` succeeds. Keep a
-    reference to the partially initialized object so workers started before a
-    later failure are still terminated.
+    Omni stage engines bind their own ZMQ sockets (stable IPC paths), so the
+    API-server manager receives the already-bound address instead of a
+    frontend-owned listener socket; workers connect by address exactly as
+    before upstream f226af0e11 switched ``APIServerProcessManager`` to
+    inherited listeners.
     """
-    from vllm.v1.utils import APIServerProcessManager, shutdown
 
-    manager = APIServerProcessManager.__new__(APIServerProcessManager)
-    try:
-        APIServerProcessManager.__init__(manager, **manager_kwargs)
-    except BaseException:
-        try:
-            for pipe in getattr(manager, "_address_pipes", ()):
-                with contextlib.suppress(Exception):
-                    pipe.close()
-            # A Process whose start() raised is still present in the upstream
-            # manager's list, but calling is_alive() on it raises because it
-            # has no Popen object. Only hand successfully started children to
-            # vLLM's shutdown helper.
-            started_processes = [process for process in getattr(manager, "processes", ()) if process.pid is not None]
-            if started_processes:
-                shutdown(started_processes, timeout=cleanup_timeout)
-        except Exception:
-            logger.exception("Failed to clean up partially started API server processes")
-        raise
-    return manager
+    def __init__(self, address: str) -> None:
+        self.address = address
+
+    @property
+    def socket(self) -> None:
+        return None
+
+    def close(self) -> None:
+        pass
+
+    def cleanup(self) -> None:
+        pass
+
+
+def _start_api_server_process_manager(**manager_kwargs: object) -> APIServerProcessManager:
+    """Construct vLLM's API server process manager.
+
+    Since upstream f226af0e11 the manager owns its own rollback: when a worker
+    ``Process.start`` fails inside ``__init__``, it shuts down the previously
+    started processes and cleans up every ZMQ listener itself.
+    """
+    from vllm.v1.utils import APIServerProcessManager
+
+    return APIServerProcessManager(**manager_kwargs)
 
 
 def run_multi_api_server_omni(args: TrackingNamespace) -> None:
@@ -1315,6 +1339,9 @@ def run_multi_api_server_omni(args: TrackingNamespace) -> None:
     signal.signal(signal.SIGINT, signal_handler)
 
     listen_address, sock = setup_server(args, reuse_port=True)
+    # API processes share one server-scoped scratch directory.
+    shared_dir = create_api_server_shared_dir()
+    args._omni_api_server_shared_dir = shared_dir
     stage_runtime = None
     api_server_manager = None
     engine_launch = None
@@ -1327,19 +1354,15 @@ def run_multi_api_server_omni(args: TrackingNamespace) -> None:
                 raise RuntimeError("Primary stage engine returned no addresses")
             timeout = float(getattr(args, "shutdown_timeout", 5) or 5)
             api_server_manager = _start_api_server_process_manager(
-                cleanup_timeout=timeout,
                 listen_address=listen_address,
                 sock=sock,
                 args=args,
                 num_servers=num_api_servers,
-                input_addresses=primary_addresses.inputs,
-                output_addresses=primary_addresses.outputs,
+                input_listeners=[_EngineAddressListener(addr) for addr in primary_addresses.inputs],
+                output_listeners=[_EngineAddressListener(addr) for addr in primary_addresses.outputs],
                 target_server_fn=run_omni_api_server_worker_proc,
             )
             engine_launch.watched_frontend_processes.extend(api_server_manager.processes)
-            actual_inputs, actual_outputs = api_server_manager.gather_actual_addresses()
-            primary_addresses.inputs = actual_inputs
-            primary_addresses.outputs = actual_outputs
 
         _wait_for_multi_api_server_completion(api_server_manager, engine_launch)
     finally:
@@ -1351,6 +1374,7 @@ def run_multi_api_server_omni(args: TrackingNamespace) -> None:
         if stage_runtime is not None:
             stage_runtime.shutdown()
         sock.close()
+        remove_api_server_shared_dir(shared_dir)
         if shutdown_requested:
             logger.info("Shared API server shutdown completed")
 
