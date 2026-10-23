@@ -14,24 +14,13 @@ import torch
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline
 from PIL import Image
 
-from tests.e2e.accuracy.helpers import (
-    SimilarityThresholds,
-    assert_images_pixel_close,
-    assert_similarity,
-    baseline_from_similarity_thresholds,
-    measure_image_similarity,
-    measure_images_pixel_close,
-    model_output_dir,
-    resolve_device_profile,
-    resolve_similarity_thresholds,
-    write_accuracy_result,
-)
+from tests.e2e.accuracy.helpers import assert_images_pixel_close, assert_similarity, model_output_dir
 from tests.helpers.clean import cleanup_test_environment
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniServer
 from vllm_omni.platforms import current_omni_platform
 
-pytestmark = [pytest.mark.slow, pytest.mark.diffusion]
+pytestmark = [pytest.mark.full_model, pytest.mark.diffusion]
 
 
 MODEL_ID = "Qwen/Qwen-Image"
@@ -44,22 +33,12 @@ NUM_INFERENCE_STEPS = 20
 TRUE_CFG_SCALE = 4.0
 SEED = 42
 # H100 #17798, eager TORCH_SDPA vs Diffusers native: SSIM 0.989517 / PSNR 34.677647.
-# A3 #9532 and #9545 observed SSIM 0.955357 / PSNR 27.170992. Current Ascend910 /
-# Ascend910_93xx online CI and local NPU runs both measure PSNR 26.36, so the A3
-# gate keeps SSIM >= 0.95 and sets PSNR >= 26.0 just under that measured floor;
-# ROCm stays on its own 27.0 floor.
-# gfx942 MI325 #14411, eager TORCH_SDPA vs Diffusers native: SSIM 0.962854 /
-# PSNR 28.407295. AMD CI also reports MI300X as gfx942, so resolve this policy
-# by architecture rather than marketing name. Keep each accelerator's gate
-# separate rather than weakening the CUDA contract; bounds sit below the exact
-# eager measurements.
+# A3 #9532 and #9545: SSIM 0.955357 / PSNR 27.170992. Bounds sit just under those scores.
 # B200 has no eager measurement yet and uses the H100 bounds.
 _CUDA_SSIM_THRESHOLD = 0.98
 _CUDA_PSNR_THRESHOLD = 34.6
 _NPU_SSIM_THRESHOLD = 0.95
-_NPU_PSNR_THRESHOLD = 26.0
-_ROCM_SSIM_THRESHOLD = 0.95
-_ROCM_PSNR_THRESHOLD = 27.0
+_NPU_PSNR_THRESHOLD = 27.0
 
 PROMPT_PIXELWISE = (
     "A 20-year-old East Asian girl with delicate, charming features and large, bright brown eyes—expressive and "
@@ -74,8 +53,8 @@ NEGATIVE_PROMPT_PIXELWISE = (
     "低分辨率，低画质，肢体畸形，手指畸形，画面过饱和，蜡像感，人脸无细节，过度光滑，画面具有AI感。"
     "构图混乱。文字模糊，扭曲。"
 )
-# CUDA and ROCm keep the 1664x928 case. A3 #9532 OOM there (61.3 GiB,
-# weights 52.48 GiB), so NPU uses 768x432. Prompt and step count stay the same.
+# CUDA keeps the 1664x928 case. A3 #9532 OOM there (61.3 GiB, weights 52.48 GiB),
+# so NPU uses 768x432. Prompt and step count stay the same.
 _CUDA_WIDTH_PIXELWISE = 1664
 _CUDA_HEIGHT_PIXELWISE = 928
 _NPU_WIDTH_PIXELWISE = 768
@@ -85,14 +64,11 @@ TRUE_CFG_SCALE_PIXELWISE = 4.0
 SEED_PIXELWISE = 42
 # H100 #17798 at 1664x928: mean abs 4.108345e-03, p99 3.529412e-02.
 # A3 #9545 at 768x432: mean abs 1.399533e-02, p99 1.882353e-01.
-# gfx942 MI325 #14411 at 1664x928: mean abs 1.401817e-02, p99 1.490196e-01.
-# Bounds sit above those errors with margin for run-to-run variation.
+# Bounds sit just above those errors.
 _CUDA_MEAN_ABS_DIFF_THRESHOLD_PIXELWISE = 1e-2
 _CUDA_P99_ABS_DIFF_THRESHOLD_PIXELWISE = 5e-2
 _NPU_MEAN_ABS_DIFF_THRESHOLD_PIXELWISE = 2e-2
 _NPU_P99_ABS_DIFF_THRESHOLD_PIXELWISE = 2.5e-1
-_ROCM_MEAN_ABS_DIFF_THRESHOLD_PIXELWISE = 2e-2
-_ROCM_P99_ABS_DIFF_THRESHOLD_PIXELWISE = 2e-1
 
 
 def _pixelwise_size() -> tuple[int, int]:
@@ -101,41 +77,16 @@ def _pixelwise_size() -> tuple[int, int]:
     return _CUDA_WIDTH_PIXELWISE, _CUDA_HEIGHT_PIXELWISE
 
 
-_CUDA_SIMILARITY = SimilarityThresholds(ssim=_CUDA_SSIM_THRESHOLD, psnr=_CUDA_PSNR_THRESHOLD)
-SIMILARITY_THRESHOLDS_BY_DEVICE: dict[str, SimilarityThresholds] = {
-    "H100": _CUDA_SIMILARITY,
-    "B200": _CUDA_SIMILARITY,
-    "A3": SimilarityThresholds(ssim=_NPU_SSIM_THRESHOLD, psnr=_NPU_PSNR_THRESHOLD),
-    "gfx942": SimilarityThresholds(ssim=_ROCM_SSIM_THRESHOLD, psnr=_ROCM_PSNR_THRESHOLD),
-    "default": _CUDA_SIMILARITY,
-}
-
-_CUDA_PIXEL = {
-    "mean_abs_diff": _CUDA_MEAN_ABS_DIFF_THRESHOLD_PIXELWISE,
-    "p99_abs_diff": _CUDA_P99_ABS_DIFF_THRESHOLD_PIXELWISE,
-}
-PIXEL_THRESHOLDS_BY_DEVICE: dict[str, dict[str, float]] = {
-    "H100": _CUDA_PIXEL,
-    "B200": _CUDA_PIXEL,
-    "A3": {
-        "mean_abs_diff": _NPU_MEAN_ABS_DIFF_THRESHOLD_PIXELWISE,
-        "p99_abs_diff": _NPU_P99_ABS_DIFF_THRESHOLD_PIXELWISE,
-    },
-    "gfx942": {
-        "mean_abs_diff": _ROCM_MEAN_ABS_DIFF_THRESHOLD_PIXELWISE,
-        "p99_abs_diff": _ROCM_P99_ABS_DIFF_THRESHOLD_PIXELWISE,
-    },
-    "default": _CUDA_PIXEL,
-}
+def _similarity_thresholds() -> tuple[float, float]:
+    if current_omni_platform.is_npu():
+        return _NPU_SSIM_THRESHOLD, _NPU_PSNR_THRESHOLD
+    return _CUDA_SSIM_THRESHOLD, _CUDA_PSNR_THRESHOLD
 
 
-def _similarity_thresholds() -> SimilarityThresholds:
-    return resolve_similarity_thresholds(SIMILARITY_THRESHOLDS_BY_DEVICE)
-
-
-def _pixel_thresholds() -> dict[str, float]:
-    profile = resolve_device_profile(profiles=PIXEL_THRESHOLDS_BY_DEVICE)
-    return PIXEL_THRESHOLDS_BY_DEVICE.get(profile, PIXEL_THRESHOLDS_BY_DEVICE["default"])
+def _pixel_thresholds() -> tuple[float, float]:
+    if current_omni_platform.is_npu():
+        return _NPU_MEAN_ABS_DIFF_THRESHOLD_PIXELWISE, _NPU_P99_ABS_DIFF_THRESHOLD_PIXELWISE
+    return _CUDA_MEAN_ABS_DIFF_THRESHOLD_PIXELWISE, _CUDA_P99_ABS_DIFF_THRESHOLD_PIXELWISE
 
 
 def _model_name() -> str:
@@ -146,10 +97,10 @@ def _local_files_only(model: str) -> bool:
     return Path(model).exists()
 
 
-# Same Omni / Diffusers pair on CUDA (H100, B200), NPU A3, and ROCm MI325.
+# Same Omni / Diffusers pair on CUDA (H100, B200) and NPU A3.
 # FLASH_ATTN_3_HUB is Hopper-only and fails on B200/A100 (#8087). Auto-select
 # can still land on that kernel. TORCH_SDPA matches Diffusers ``native`` and
-# has a binding on all three accelerator families.
+# has a binding on both sides.
 _OMNI_CI_ATTN_BACKEND = "TORCH_SDPA"
 _DIFFUSERS_CI_ATTN_BACKEND = "native"
 _OMNI_CI_ATTN_ENV = {"DIFFUSION_ATTENTION_BACKEND": _OMNI_CI_ATTN_BACKEND}
@@ -296,7 +247,7 @@ def _run_diffusers_qwen_image_pixelwise(*, model: str, output_path: Path) -> Ima
 
 
 @pytest.mark.benchmark
-@hardware_test(res={"cuda": ["H100", "B200"], "npu": "A3", "rocm": "MI325"}, num_cards=1)
+@hardware_test(res={"cuda": ["H100", "B200"], "npu": "A3"}, num_cards=1)
 def test_qwen_image_matches_diffusers(accuracy_artifact_root: Path) -> None:
     model = _model_name()
     output_dir = model_output_dir(accuracy_artifact_root, MODEL_ID)
@@ -304,35 +255,20 @@ def test_qwen_image_matches_diffusers(accuracy_artifact_root: Path) -> None:
     vllm_output = _run_vllm_omni_qwen_image(model=model, output_path=output_dir / "vllm_omni.png")
     diffusers_output = _run_diffusers_qwen_image(model=model, output_path=output_dir / "diffusers.png")
 
-    thresholds = _similarity_thresholds()
-    ssim, psnr = measure_image_similarity(
-        model_name=MODEL_ID,
-        vllm_image=vllm_output,
-        diffusers_image=diffusers_output,
-        width=WIDTH,
-        height=HEIGHT,
-    )
-    write_accuracy_result(
-        model_id=MODEL_ID,
-        dataset="image_similarity",
-        metrics={"ssim": ssim, "psnr": psnr},
-        baseline=baseline_from_similarity_thresholds(SIMILARITY_THRESHOLDS_BY_DEVICE),
-    )
+    ssim_threshold, psnr_threshold = _similarity_thresholds()
     assert_similarity(
         model_name=MODEL_ID,
         vllm_image=vllm_output,
         diffusers_image=diffusers_output,
         width=WIDTH,
         height=HEIGHT,
-        ssim_threshold=thresholds.ssim,
-        psnr_threshold=thresholds.psnr,
-        ssim_score=ssim,
-        psnr_score=psnr,
+        ssim_threshold=ssim_threshold,
+        psnr_threshold=psnr_threshold,
     )
 
 
 @pytest.mark.benchmark
-@hardware_test(res={"cuda": ["H100", "B200"], "npu": "A3", "rocm": "MI325"}, num_cards=1)
+@hardware_test(res={"cuda": ["H100", "B200"], "npu": "A3"}, num_cards=1)
 def test_qwen_image_matches_diffusers_pixelwise(accuracy_artifact_root: Path) -> None:
     model = _model_name()
     output_dir = model_output_dir(accuracy_artifact_root, MODEL_ID)
@@ -346,23 +282,11 @@ def test_qwen_image_matches_diffusers_pixelwise(accuracy_artifact_root: Path) ->
     print(f"  vllm_omni: {vllm_output_path}")
     print(f"  diffusers: {diffusers_output_path}")
 
-    pixel_thresholds = _pixel_thresholds()
-    pixel_metrics = measure_images_pixel_close(
-        model_name=MODEL_ID,
-        vllm_image=vllm_output,
-        diffusers_image=diffusers_output,
-    )
-    write_accuracy_result(
-        model_id=MODEL_ID,
-        dataset="image_pixel",
-        metrics=pixel_metrics,
-        baseline=PIXEL_THRESHOLDS_BY_DEVICE,
-    )
+    mean_threshold, p99_threshold = _pixel_thresholds()
     assert_images_pixel_close(
         model_name=MODEL_ID,
         vllm_image=vllm_output,
         diffusers_image=diffusers_output,
-        mean_threshold=pixel_thresholds["mean_abs_diff"],
-        p99_threshold=pixel_thresholds["p99_abs_diff"],
-        metrics=pixel_metrics,
+        mean_threshold=mean_threshold,
+        p99_threshold=p99_threshold,
     )

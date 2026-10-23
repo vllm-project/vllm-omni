@@ -11,12 +11,7 @@ import torch
 import torch.nn.functional as F
 from vllm.logger import init_logger
 
-from vllm_omni.diffusion.attention.backends.abstract import (
-    AttentionBackend,
-    AttentionImpl,
-    AttentionMetadata,
-    QueryRange,
-)
+from vllm_omni.diffusion.attention.backends.abstract import AttentionBackend, AttentionImpl, AttentionMetadata
 from vllm_omni.diffusion.attention.backends.sdpa import _maybe_reshape_attn_mask
 from vllm_omni.diffusion.attention.backends.utils.piecewise_attn import (
     piecewise_attn,
@@ -37,18 +32,6 @@ from vllm_omni.diffusion.config import get_current_diffusion_config_or_none
 from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
-
-
-def _packed_query_ranges(attn_metadata: AttentionMetadata | None) -> tuple[QueryRange, ...] | None:
-    """Query ranges for the packed resolvers, or None outside SP slicing.
-
-    The AllGather-KV strategies record where the local query shard sits in the
-    global sequence via ``query_ranges``; the packed paths use that to
-    generalize the square [real, pad] contract to local-Q/global-KV.
-    """
-    if attn_metadata is None or attn_metadata.query_ranges is None:
-        return None
-    return tuple(attn_metadata.query_ranges)
 
 
 @cache
@@ -197,50 +180,28 @@ class FlashAttentionBackend(AttentionBackend):
         # CUDA: forward_cuda dispatches the packed cu_seqlens varlen path
         # before ever reading attn_mask. NPU: forward_fa_npu honors the
         # npu_attn_varlen opt-in and rebuilds the padding mask itself if the
-        # packed contract fails. XPU: forward_xpu only takes the packed path
-        # when attn_mask is None, so models must keep constructing it there.
+        # packed contract fails. XPU reads attn_mask, so models must keep
+        # constructing it there.
         return current_omni_platform.is_cuda() or current_omni_platform.is_npu()
 
     @classmethod
-    def supports_multi_doc_packed_varlen(cls, kv_cache_dtype: str | None = None) -> bool:
-        # CUDA / ROCm / MUSA / XPU all dispatch ``_forward_varlen_packed`` ->
-        # ``flash_attn_varlen_func`` over the caller's cu_seqlens without a
-        # mask, so an arbitrary N-document packing keeps its boundaries.
-        # NPU's forward path (``_resolve_packed_seq_npu``) only accepts a
-        # ``[real, pad]`` two-document layout (cu_seqlens shape <= 3) and
-        # otherwise falls back to a padding-mask rebuild that spans the whole
-        # packed row, so N>=2 real documents would silently attend across
-        # request boundaries; NPU stays False here.
-        # The quantized path (``forward_fa_quant_cuda``) is a dense BSHD
-        # kernel: ``_validate_quant_request_cuda`` rejects cu_seqlens
-        # metadata, so a non-float effective policy must use the dense
-        # fallback. Checked first so the answer is testable without an
-        # accelerator.
-        if kv_cache_dtype not in (None, "float", "auto"):
-            return False
-        if current_omni_platform.is_npu():
-            return False
-        from vllm_omni.diffusion.attention.backends.utils.fa import flash_attn_varlen_func
-
-        return flash_attn_varlen_func is not None and (
-            current_omni_platform.is_cuda()
-            or current_omni_platform.is_rocm()
-            or current_omni_platform.is_musa()
-            or current_omni_platform.is_xpu()
-        )
+    def supports_multi_doc_packed_varlen(cls) -> bool:
+        # CUDA / ROCm / MUSA all route through ``forward_cuda``, which
+        # dispatches ``_forward_varlen_packed`` -> ``flash_attn_varlen_func``
+        # over the caller's cu_seqlens without a mask, so an arbitrary
+        # N-document packing keeps its boundaries. NPU's forward path
+        # (``_resolve_packed_seq_npu``) only accepts a ``[real, pad]``
+        # two-document layout (cu_seqlens shape <= 3) and otherwise falls
+        # back to a padding-mask rebuild that spans the whole packed row,
+        # so N>=2 real documents would silently attend across request
+        # boundaries. XPU never consumes cu_seqlens from ``extra``. Both
+        # therefore stay False here.
+        return current_omni_platform.is_cuda() or current_omni_platform.is_rocm() or current_omni_platform.is_musa()
 
     @classmethod
     def supports_attention_mask(cls, attention_spec: object | None = None) -> bool:
         del attention_spec
         return True
-
-    @classmethod
-    def supports_dense_4d_mask(cls, attention_spec: object | None = None) -> bool:
-        del attention_spec
-        # CUDA/ROCm/MUSA route masked attention through the varlen wrapper,
-        # which only accepts a 2D key-validity mask. Ascend feeds the dense
-        # block mask to npu_fusion_attention and accepts 4D directly.
-        return current_omni_platform.is_npu()
 
     @classmethod
     def supports_cross_kv_mask(cls, attention_spec: object | None = None) -> bool:
@@ -412,26 +373,15 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
             context.parallel_strategy is not ParallelStrategy.NONE
             or context.outer_boundaries
             or context.paged_kv
+            or self.causal
             or extra.get("kv_cache_dtype") not in (None, "float", "auto")
+            or (attn_metadata is not None and attn_metadata.full_attn_spans is not None)
         ):
-            return result
-
-        # Match forward_fa_npu: spans take precedence over the global causal flag.
-        if attn_metadata is not None and attn_metadata.full_attn_spans is not None:
-            return replace(
-                result,
-                path="npu_piecewise",
-                support=CapabilityResult.unmigrated(
-                    "NPU piecewise routing only; kernel and compilation validation require Ascend"
-                ),
-            )
-
-        if self.causal:
             return result
 
         path = "npu_masked" if attn_metadata is not None and attn_metadata.attn_mask is not None else "npu_dense"
         if extra.get("npu_attn_varlen", False):
-            if self._resolve_packed_seq_npu(query, key, extra, _packed_query_ranges(attn_metadata)) is not None:
+            if self._resolve_packed_seq_npu(query, key, extra) is not None:
                 path = (
                     "npu_prefix_kv_slice"
                     if os.environ.get("MINDIE_SD_FA_TYPE") == "ascend_laser_attention"
@@ -1043,36 +993,19 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
                 "Otherwise, use SDPA backend by setting DIFFUSION_ATTENTION_BACKEND=TORCH_SDPA"
             )
 
-        metadata_plan = _normalize_flash_attention_metadata(attn_metadata)
-        attention_mask = metadata_plan.attention_mask
-
         # Spans take precedence over attn_mask, matching forward_cuda.
-        if metadata_plan.full_attn_spans is not None:
+        if attn_metadata is not None and attn_metadata.full_attn_spans is not None:
             return piecewise_attn(
                 query,
                 key,
                 value,
-                metadata_plan.full_attn_spans,
+                attn_metadata.full_attn_spans,
                 self.softmax_scale,
                 partial(FlashAttentionImpl._flash_varlen_wrapper, attn_func=flash_attn_varlen_func),
-                query_ranges=None if attn_metadata is None else attn_metadata.query_ranges,
+                query_ranges=attn_metadata.query_ranges,
             )
 
-        # Packed cu_seqlens dispatch mirrors forward_cuda. Only take it when
-        # no attn_mask rides along: callers that still build a padding mask
-        # (e.g. [real, pad] packed layouts on backends without
-        # supports_packed_mask_free) must keep the masked path below.
-        if metadata_plan.packing_mode is not PackingMode.NONE and attention_mask is None:
-            self._warn_fa_deterministic_non_dense("packed-varlen")
-            return self._forward_varlen_packed(
-                query,
-                key,
-                value,
-                cu_seqlens_q=metadata_plan.extra["cu_seqlens_q"],
-                cu_seqlens_k=metadata_plan.extra["cu_seqlens_k"],
-                max_seqlen_q=metadata_plan.extra["max_seqlen_q"],
-                max_seqlen_k=metadata_plan.extra["max_seqlen_k"],
-            )
+        attention_mask = attn_metadata.attn_mask if attn_metadata is not None else None
 
         if attention_mask is not None and torch.any(~attention_mask):
             return self._forward_varlen_masked(
@@ -1169,38 +1102,6 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         # Execution errors propagate. Never retry with another precision.
         return runtime(query, key, value, **kwargs)
 
-    @staticmethod
-    def _npu_fusion_attention(
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        *,
-        atten_mask: torch.Tensor | None,
-        sparse_mode: int,
-        softmax_scale: float,
-        inner_precise: int = 0,
-    ) -> torch.Tensor:
-        """Run ``torch_npu.npu_fusion_attention`` on BSND tensors.
-
-        ``atten_mask`` follows Ascend's convention (True = masked out). When it
-        is ``None`` the sparse mode has no effect and full attention is
-        computed, so no mask needs to be materialized.
-        """
-        import torch_npu
-
-        return torch_npu.npu_fusion_attention(
-            query.contiguous(),
-            key.contiguous(),
-            value.contiguous(),
-            head_num=query.shape[2],
-            input_layout="BSND",
-            atten_mask=atten_mask,
-            scale=float(softmax_scale),
-            keep_prob=1.0,
-            inner_precise=inner_precise,
-            sparse_mode=sparse_mode,
-        )[0]
-
     def forward_fa_npu(
         self,
         query: torch.Tensor,
@@ -1208,14 +1109,10 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         value: torch.Tensor,
         attn_metadata: AttentionMetadata | None = None,
     ) -> torch.Tensor:
-        # Piecewise block-causal attention takes precedence, mirroring
-        # ``forward_cuda``: the caller emitted ``full_attn_spans`` instead of a
-        # mask, so the generic mask handling below cannot express it.
-        if attn_metadata is not None and attn_metadata.full_attn_spans is not None:
-            return self._forward_piecewise_npu(query, key, value, attn_metadata)
-
         attention_mask = attn_metadata.attn_mask if attn_metadata else None
         if self.causal:
+            import torch_npu
+
             if attention_mask is None:
                 # The compressed upper-triangular mask with sparse_mode=3
                 # applies FlashAttention's bottom-right causal alignment when
@@ -1246,15 +1143,18 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
                 # the Sq/Skv relationship.
                 inner_precise = 2
 
-            return self._npu_fusion_attention(
-                query,
-                key,
-                value,
+            return torch_npu.npu_fusion_attention(
+                query.contiguous(),
+                key.contiguous(),
+                value.contiguous(),
+                head_num=query.shape[2],
+                input_layout="BSND",
                 atten_mask=npu_attention_mask,
-                sparse_mode=sparse_mode,
-                softmax_scale=self.softmax_scale,
+                scale=float(self.softmax_scale),
+                keep_prob=1.0,
                 inner_precise=inner_precise,
-            )
+                sparse_mode=sparse_mode,
+            )[0]
 
         from mindiesd import attention_forward
 
@@ -1268,11 +1168,10 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         #     type is honored; the TND varlen op cannot be).
         extra = attn_metadata.extra if attn_metadata else {}
         if extra.get("npu_attn_varlen", False):
-            query_ranges = _packed_query_ranges(attn_metadata)
             if os.environ.get("MINDIE_SD_FA_TYPE") == "ascend_laser_attention":
-                out = self._forward_prefix_kv_slice_npu(query, key, value, extra, query_ranges=query_ranges)
+                out = self._forward_prefix_kv_slice_npu(query, key, value, extra)
             else:
-                out = self._forward_varlen_packed_npu(query, key, value, extra, query_ranges=query_ranges)
+                out = self._forward_varlen_packed_npu(query, key, value, extra)
             if out is not None:
                 return out
         if attention_mask is None and extra.get("npu_attn_varlen", False):
@@ -1281,19 +1180,13 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
             # paths above declined (contract mismatch), so rebuild the padding
             # mask here to keep the masked fallback correct.
             used = extra.get("valid_kv_length")
-            # The mask marks the padding suffix of the K/V domain. With
-            # AllGather-KV SP the K/V domain is the global sequence while the
-            # query is a local shard, so the domain is key.shape[1] (equal to
-            # query.shape[1] in the square non-SP case, where behavior is
-            # unchanged).
-            kv_len = key.shape[1]
-            if not isinstance(used, int) or not 0 < used <= kv_len:
+            if not isinstance(used, int) or not 0 < used <= query.shape[1]:
                 raise ValueError(
                     "npu_attn_varlen packed metadata is unusable and no attn_mask "
-                    f"was constructed (valid_kv_length={used!r}, kv_len={kv_len}); "
+                    f"was constructed (valid_kv_length={used!r}, seq_len={query.shape[1]}); "
                     "refusing to run unmasked attention over padding rows."
                 )
-            attention_mask = torch.arange(kv_len, device=query.device)[None] < used
+            attention_mask = torch.arange(query.shape[1], device=query.device)[None] < used
 
         # NPU aclnnFlashAttentionScore requires mask shape to be one of:
         # [B, N, Sq, Skv], [B, 1, Sq, Skv], [1, 1, Sq, Skv], or [Sq, Skv]
@@ -1312,79 +1205,11 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
             layout=layout,
         )
 
-    def _npu_piecewise_attn_func(
-        self,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        *,
-        causal: bool,
-        softmax_scale: float,
-    ) -> torch.Tensor:
-        """``attn_func`` for ``piecewise_attn`` on Ascend.
-
-        Both segment kinds run on ``npu_fusion_attention``:
-          - causal segments (text runs) carry the shared compressed
-            (2048, 2048) mask with ``sparse_mode=3`` (rightDownCausal).
-            ``piecewise_attn`` gives causal segments ``kv_end == q_end`` in
-            global coordinates, so they always satisfy ``Sq <= Skv``;
-            bottom-right alignment reproduces FlashAttention's
-            ``attn(Q[:, s:e], K[:, :e], causal=True)`` contract for both
-            ``Sq < Skv`` and ``Sq == Skv``.
-          - full segments (condition/target image blocks) pass no mask —
-            ``sparse_mode`` is ignored when ``atten_mask`` is ``None`` — so
-            they are plain bidirectional attention over the truncated K/V
-            prefix.
-
-        Inputs follow the model-side ``(B, S, H, D)`` convention == BSND.
-        """
-        if causal:
-            atten_mask = _get_npu_compressed_causal_mask(query.device)
-            sparse_mode = 3
-        else:
-            atten_mask = None
-            sparse_mode = 0
-        return self._npu_fusion_attention(
-            query,
-            key,
-            value,
-            atten_mask=atten_mask,
-            sparse_mode=sparse_mode,
-            softmax_scale=softmax_scale,
-        )
-
-    def _forward_piecewise_npu(
-        self,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        attn_metadata: AttentionMetadata,
-    ) -> torch.Tensor:
-        """Piecewise block-causal attention on Ascend, mirroring ``forward_cuda``.
-
-        Same segment plan as the CUDA path (``piecewise_attn``); only the
-        per-segment kernel differs (``npu_fusion_attention`` instead of
-        ``flash_attn_func``).
-        """
-        self._warn_fa_deterministic_non_dense("piecewise-npu")
-        logger.debug("Using piecewise NPU attention for mixed causal/full mask")
-        assert attn_metadata.full_attn_spans is not None
-        return piecewise_attn(
-            query,
-            key,
-            value,
-            attn_metadata.full_attn_spans,
-            self.softmax_scale,
-            self._npu_piecewise_attn_func,
-            query_ranges=attn_metadata.query_ranges,
-        )
-
     def _resolve_packed_seq_npu(
         self,
         query: torch.Tensor,
         key: torch.Tensor,
         extra: dict,
-        query_ranges: tuple[QueryRange, ...] | None = None,
     ) -> tuple[list[int], list[int]] | None:
         """Resolve packed document boundaries (cumulative end offsets per doc).
 
@@ -1396,19 +1221,6 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
             padding document as a strict suffix;
           - max_seqlen_q/k are Python ints equal to the real document length
             (so boundaries are derived without any device sync).
-
-        With AllGather-KV sequence parallelism, the kernel sees local Q
-        against global K/V. When ``query_ranges`` carries the single packed
-        range produced by the AllGather-KV strategy, the local Q rows are a
-        contiguous slice of the same global real document, so the [real, pad]
-        contract generalizes: seq_q becomes that slice's [local_real,
-        local_total] pair while seq_k keeps the global [real, pad] pair.
-
-        The generalization is only defined for exactly one range that covers
-        the whole local shard. Joint layouts emit two ranges whose local rows
-        are not a contiguous global slice, and partial coverage leaves rows
-        outside the document; both must decline so the caller rebuilds the
-        mask instead of fabricating square boundaries.
         """
         if self.causal:
             return None
@@ -1425,33 +1237,15 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         # .shape is host-side metadata: counting documents never syncs.
         if cu_q.shape[0] != cu_k.shape[0] or cu_q.shape[0] > 3:
             return None
-        if not (0 < used_q) or not (0 < used_k <= total_k):
+        if not (0 < used_q <= total_q) or not (0 < used_k <= total_k):
             return None
-        if query_ranges is not None:
-            if len(query_ranges) != 1:
-                return None
-            shard = query_ranges[0]
-            # The range must describe exactly the local query shard. A partial
-            # range would leave the uncovered rows outside the document.
-            if (shard.local_start, shard.local_end) != (0, total_q):
-                return None
-            # A single packed range pairs the local Q rows with the same global
-            # document on the key side, so the real lengths must agree.
-            if used_q != used_k:
-                return None
-            q_start = shard.global_start
-            local_real_q = min(used_q - q_start, total_q)
-            if 0 <= q_start < used_q and local_real_q > 0:
-                return [local_real_q, total_q], [used_k, total_k]
-            return None
-        if used_q <= total_q:
-            if used_q == total_q and used_k == total_k:
-                # No padding document: one full-length document.
-                return [total_q], [total_k]
-            if cu_q.shape[0] == 3 and used_q >= total_q - used_q and used_k >= total_k - used_k:
-                # [real, pad] packing: the real document must be the longer one
-                # (consistent with the max_seqlen naming).
-                return [used_q, total_q], [used_k, total_k]
+        if used_q == total_q and used_k == total_k:
+            # No padding document: one full-length document.
+            return [total_q], [total_k]
+        if cu_q.shape[0] == 3 and used_q >= total_q - used_q and used_k >= total_k - used_k:
+            # [real, pad] packing: the real document must be the longer one
+            # (consistent with the max_seqlen naming).
+            return [used_q, total_q], [used_k, total_k]
         return None
 
     def _forward_varlen_packed_npu(
@@ -1460,14 +1254,13 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         key: torch.Tensor,
         value: torch.Tensor,
         extra: dict,
-        query_ranges: tuple[QueryRange, ...] | None = None,
     ) -> torch.Tensor | None:
         """Packed varlen attention on NPU via mindiesd attention_forward_varlen.
 
         Returns None (caller falls back to the mask path) when the packed
         contract does not hold; see _resolve_packed_seq_npu.
         """
-        resolved = self._resolve_packed_seq_npu(query, key, extra, query_ranges)
+        resolved = self._resolve_packed_seq_npu(query, key, extra)
         if resolved is None:
             return None
         seq_q, seq_k = resolved
@@ -1495,7 +1288,6 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         key: torch.Tensor,
         value: torch.Tensor,
         extra: dict,
-        query_ranges: tuple[QueryRange, ...] | None = None,
     ) -> torch.Tensor | None:
         """Mask-free attention by slicing K/V to the valid prefix (zero-copy
         views), then mindiesd attention_forward without a mask.
@@ -1516,7 +1308,7 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         square, and the output is scaled back. Absent or invalid factor means
         no pre-scaling.
         """
-        resolved = self._resolve_packed_seq_npu(query, key, extra, query_ranges)
+        resolved = self._resolve_packed_seq_npu(query, key, extra)
         if resolved is None:
             return None
         _, seq_k = resolved
