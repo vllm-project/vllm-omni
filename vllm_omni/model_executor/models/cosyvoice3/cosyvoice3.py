@@ -65,6 +65,7 @@ from vllm_omni.platforms import current_omni_platform
 from vllm_omni.transformers_utils.configs.cosyvoice3 import CosyVoice3Config
 from vllm_omni.transformers_utils.repo_utils import hf_api
 from vllm_omni.utils.speaker_cache import get_speaker_cache
+from vllm_omni.worker.mixins import CPU_INPUT_IDS_KWARG
 
 logger = init_logger(__name__)
 
@@ -1627,7 +1628,7 @@ class CosyVoice3Model(
             seq_token_counts = kwargs.get("seq_token_counts")
             flat_ids = input_ids.reshape(-1).to(dtype=torch.long)
             request_ids_list = self._split_request_ids(flat_ids, seq_token_counts)
-            cpu_input_ids = kwargs.get("cpu_input_ids")
+            cpu_input_ids = kwargs.get(CPU_INPUT_IDS_KWARG)
             cpu_request_ids_list = None
             if cpu_input_ids is not None:
                 cpu_request_ids_list = self._split_request_ids(

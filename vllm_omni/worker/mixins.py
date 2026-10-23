@@ -26,6 +26,11 @@ class OmniWorkerMixin:
             install_mooncake_cfg_fanout(get_kv_transfer_group())
 
 
+# Model forward kwarg carrying this step's input ids as staged on the host.
+# Runners pass it only to models that set ``requires_cpu_input_ids``.
+CPU_INPUT_IDS_KWARG = "cpu_input_ids"
+
+
 def maybe_unpad_input_ids(model, input_ids, num_tokens_unpadded):
     """Trim cudagraph-bucket padding for models that split a flat ``input_ids``
     by per-request ``seq_token_counts``. See #6712."""

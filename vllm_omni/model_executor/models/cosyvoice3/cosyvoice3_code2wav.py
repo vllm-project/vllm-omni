@@ -825,6 +825,9 @@ class CosyVoice3Code2Wav(nn.Module):
                 for (index, window, mel_offset), speech, carry in zip(group, speeches, carries):
                     state: StreamingHiFTState | None = None
                     if not finalize:
+                        # A first window's mel can slice this step's batched Flow
+                        # output, which the next graph replay overwrites. Copy
+                        # the request's state so it outlives the step.
                         state = {
                             "mel": window.mel.detach().clone(),
                             "mel_offset": mel_offset,

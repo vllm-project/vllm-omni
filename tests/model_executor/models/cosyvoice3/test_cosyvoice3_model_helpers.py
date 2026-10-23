@@ -27,6 +27,7 @@ from vllm_omni.transformers_utils.configs.cosyvoice3 import CosyVoice3Config
 from vllm_omni.worker import gpu_ar_model_runner
 from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
+from vllm_omni.worker.mixins import CPU_INPUT_IDS_KWARG
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -366,7 +367,7 @@ def test_forward_filters_codec_tokens_from_either_copy(with_host_copy):
         }
     ]
     input_ids = torch.tensor([1, 7, 2, 3], dtype=torch.long)
-    kwargs = {"cpu_input_ids": input_ids.clone()} if with_host_copy else {}
+    kwargs = {CPU_INPUT_IDS_KWARG: input_ids.clone()} if with_host_copy else {}
 
     model.forward(
         input_ids=input_ids,

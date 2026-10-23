@@ -16,6 +16,7 @@ from vllm_omni.worker.gpu_generation_model_runner import (
     ExecuteModelState,
     GPUGenerationModelRunner,
 )
+from vllm_omni.worker.mixins import CPU_INPUT_IDS_KWARG
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -377,6 +378,6 @@ def test_models_asking_for_host_input_ids_receive_the_unpadded_host_copy(monkeyp
     seen = _model_inputs_of_a_3_token_step(monkeypatch, model)
 
     if wants_host_copy:
-        assert seen["model_kwargs"]["cpu_input_ids"].tolist() == [10, 11, 12]
+        assert seen["model_kwargs"][CPU_INPUT_IDS_KWARG].tolist() == [10, 11, 12]
     else:
-        assert "cpu_input_ids" not in seen["model_kwargs"]
+        assert CPU_INPUT_IDS_KWARG not in seen["model_kwargs"]
