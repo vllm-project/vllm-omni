@@ -90,12 +90,13 @@ class MergedRowParallelLinear(RowParallelLinear):
     or group scales, packed weights) segment by segment. Parameters with no input
     dimension (bias, per-tensor and per-channel scales) load unchanged.
 
+    Remaining arguments are as for ``RowParallelLinear``; the input is always
+    expected to be already sharded (``input_is_parallel=True``).
+
     Args:
         input_sizes: Logical width of each concatenated input segment. Each must be
             divisible by the TP size.
         output_size: Output width.
-        Remaining arguments are as for ``RowParallelLinear``; the input is always
-        expected to be already sharded (``input_is_parallel=True``).
     """
 
     def __init__(
