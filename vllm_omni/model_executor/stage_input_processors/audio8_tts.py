@@ -12,6 +12,7 @@ from vllm_omni.data_entry_keys import (
     MetaStruct,
     OmniPayloadStruct,
 )
+from vllm_omni.model_executor.stage_input_processors import _common
 
 #: Chunking defaults; ~21.5 codec frames per second, so 25 frames ~= 1.16 s.
 DEFAULT_CHUNK_FRAMES = 25
@@ -49,28 +50,16 @@ def extract_last_frame(multimodal_output: Mapping[str, Any]) -> torch.Tensor | N
 
     Prefill steps emit an all-zero placeholder frame, which must not be
     forwarded to the decoder.
-    """
-    audio_codes = multimodal_output.get("audio_codes")
-    if not isinstance(audio_codes, torch.Tensor) or audio_codes.numel() == 0:
-        return None
-    if audio_codes.ndim == 1:
-        return audio_codes.to(device="cpu", dtype=torch.long).reshape(-1)
-    if audio_codes.ndim != 2:
-        raise ValueError(f"Invalid audio_codes shape for Audio8 TTS async_chunk: {tuple(audio_codes.shape)}")
 
-    frame = audio_codes[-1]
-    if frame.numel() == 0:
-        return None
-    valid = multimodal_output.get("audio_code_valid")
-    if isinstance(valid, torch.Tensor) and valid.numel() > 0:
-        is_valid = bool(valid.reshape(-1)[-1].item())
-    elif valid is not None:
-        is_valid = bool(valid)
-    else:
-        is_valid = bool(frame.any().item())
-    if not is_valid:
-        return None
-    return frame.to(device="cpu", dtype=torch.long).reshape(-1)
+    Delegates to the canonical ``_common.extract_last_codec_frame``.
+    """
+    return _common.extract_last_codec_frame(
+        multimodal_output,
+        key_path=("audio_codes",),
+        validate="valid_mask",
+        to_cpu=True,
+        to_long=True,
+    )
 
 
 def slow_ar_to_codec_decoder_async_chunk(

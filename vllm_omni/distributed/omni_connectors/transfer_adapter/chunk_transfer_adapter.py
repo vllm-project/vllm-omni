@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import copy
-import importlib
 import inspect
 import threading
 import time
@@ -16,6 +15,11 @@ from vllm.v1.request import Request, RequestStatus
 from vllm.v1.utils import ConstantList
 
 from vllm_omni.data_entry_keys import MetaStruct, OmniPayloadStruct, unflatten_payload
+from vllm_omni.model_executor.stage_input_processors import (
+    ProcessorValidationError,
+    resolve_processor,
+)
+from vllm_omni.model_executor.stage_input_processors._registry import _check_async_chunk, import_symbol
 
 from ..adapter import construct_next_stage_streaming_input_prompt
 from ..connectors.shm_connector import SharedMemoryConnector
@@ -29,6 +33,24 @@ from .base import OmniTransferAdapterBase
 logger = get_connector_logger(__name__)
 
 _RECLAIM_WARN_INTERVAL = 1000
+
+
+def _accepts_async_chunk_contract(fn: Callable[..., Any]) -> bool:
+    """Whether *fn* structurally matches the async-chunk producer contract."""
+    try:
+        signature = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return False
+    try:
+        _check_async_chunk(
+            signature,
+            path=getattr(fn, "__qualname__", repr(fn)),
+            kind="producer_async_chunk",
+            stage_config=None,
+        )
+    except ProcessorValidationError:
+        return False
+    return True
 
 
 class _SenderGeneration:
@@ -175,6 +197,10 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             )
         self.connector = self.create_connector(model_config)
         self.receives_chunks = stage_receives_chunks(model_config)
+        # Must exist before super().__init__() starts the save thread, because
+        # _accepts_new_token_ids() is called from _send_single_request() on the
+        # save-loop thread before __init__() would otherwise complete.
+        self._processor_accepts_step_tokens: dict[Callable[..., Any], bool] = {}
         super().__init__(model_config)
         self.model_mode = getattr(model_config, "worker_type", None) or "ar"
         # State specific to Chunk management
@@ -187,13 +213,34 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         # the request snapshot (other ``_batch`` forms serve other callers).
         self.custom_process_next_stage_input_batch_func: Callable[..., list[OmniPayloadStruct | None]] | None = None
         if custom_process_next_stage_input_func:
-            module_path, func_name = custom_process_next_stage_input_func.rsplit(".", 1)
-            module = importlib.import_module(module_path)
-            self.custom_process_next_stage_input_func = getattr(module, func_name)
-            batch_func = getattr(module, f"{func_name}_batch", None)
-            if getattr(batch_func, "per_step_batch", False) is True:
-                self.custom_process_next_stage_input_batch_func = batch_func
-        self._processor_accepts_step_tokens: dict[Callable[..., Any], bool] = {}
+            # Kind inference is name-driven; accept any matching signature, reject only incompatible hooks.
+            spec = resolve_processor(custom_process_next_stage_input_func)
+            if spec.kind == "producer_async_chunk" or _accepts_async_chunk_contract(spec.fn):
+                self.custom_process_next_stage_input_func = spec.fn
+            else:
+                raise ProcessorValidationError(
+                    path=custom_process_next_stage_input_func,
+                    kind="producer_async_chunk",
+                    rule="async_chunk_contract",
+                    message=(
+                        "custom_process_next_stage_input_func does not accept the async-chunk "
+                        "producer call (requires keyword-bindable 'transfer_manager', "
+                        "'multimodal_output', 'request' and a 'is_finished' parameter)"
+                    ),
+                )
+            # Absorb c4871a09b: resolve the same-named ``<func>_batch`` and opt in only
+            # when it declares per-step batch semantics. The batch form is optional, so a
+            # missing attribute must not fail construction. Raw ``import_symbol`` (import +
+            # ``getattr``) is used instead of ``resolve_processor`` because registry kind
+            # inference classifies any ``*_batch`` name as a full-payload producer and would
+            # reject the async-chunk batch signature below.
+            batch_path = f"{custom_process_next_stage_input_func}_batch"
+            try:
+                batch_fn = import_symbol(batch_path)
+            except Exception:
+                batch_fn = None
+            if batch_fn is not None and getattr(batch_fn, "per_step_batch", False) is True:
+                self.custom_process_next_stage_input_batch_func = batch_fn
         # mapping for request id and chunk id
         self.put_req_chunk: dict[str, int] = defaultdict(int)
         self.get_req_chunk: dict[str, int] = defaultdict(int)

@@ -59,6 +59,7 @@ from vllm_omni.entrypoints.stage_utils import _to_dict, set_stage_devices
 from vllm_omni.entrypoints.utils import filter_dataclass_kwargs
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniSamplingParams
 from vllm_omni.inputs.preprocess import build_omni_renderer, omni_renderer_cls
+from vllm_omni.model_executor.stage_input_processors import resolve_processor
 from vllm_omni.outputs.output_processor import MultimodalOutputProcessor
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.quantization.inc_config import OmniINCConfig
@@ -572,6 +573,13 @@ class StageMetadata:
     custom_process_input_func: Callable | None
     model_stage: str | None
     runtime_cfg: Any
+    # Raw ``sync_process_input_func`` path (the ``*_token_only`` placeholder
+    # builder) read by the orchestrator's dead-processor hint.
+    sync_process_input_func: str | None = None
+    # Resolved ``build_prewarm_placeholder`` (the dual-entry ``*_token_only``
+    # builder), so the orchestrator reads it off the stage client instead of
+    # re-resolving per async-chunk prewarm request.
+    prewarm_placeholder_builder: Callable | None = None
     prompt_transform_func: Callable | None = None
     prompt_expand_func: Callable | None = None
     cfg_kv_collect_func: Callable | None = None
@@ -603,6 +611,55 @@ def _apply_rocm_attention_backend(
     # Therefore, we still use TRITON_ATTN as the default attention backend,
     # when the selected_backend is not specified.
     engine_args["attention_backend"] = "TRITON_ATTN"
+
+
+def _resolve_prewarm_placeholder_builder(
+    *,
+    sync_path: str | None,
+    custom_fn: Callable | None,
+    stage_config: Any,
+) -> Callable | None:
+    """Resolve ``build_prewarm_placeholder`` at metadata-extraction time.
+
+    Order mirrors the legacy orchestrator lookup: the registered
+    ``sync_process_input_func`` fn first (with a module-level sibling
+    fallback), then the already-resolved ``custom_process_input_func`` fn.
+    A missing or failing builder only warns — the async-chunk prewarm keeps
+    its inline estimate and never raises on builder resolution.
+    """
+    builder: Callable | None = None
+    if sync_path:
+        try:
+            spec = resolve_processor(sync_path, expected_kind=None, stage_config=stage_config)
+            candidate = getattr(spec.fn, "build_prewarm_placeholder", None)
+            if not callable(candidate):
+                # Module-level sibling (covers paths whose fn does not expose
+                # the attribute directly).
+                candidate = getattr(
+                    importlib.import_module(sync_path.rsplit(".", 1)[0]),
+                    "build_prewarm_placeholder",
+                    None,
+                )
+            if callable(candidate):
+                builder = candidate
+            else:
+                logger.warning(
+                    "sync_process_input_func=%r has no build_prewarm_placeholder; "
+                    "async-chunk prewarm will use the inline estimate",
+                    sync_path,
+                )
+        except Exception as exc:
+            logger.warning(
+                "failed to resolve build_prewarm_placeholder for %r; "
+                "async-chunk prewarm will use the inline estimate: %s",
+                sync_path,
+                exc,
+            )
+    if builder is None and callable(custom_fn):
+        candidate = getattr(custom_fn, "build_prewarm_placeholder", None)
+        if callable(candidate):
+            builder = candidate
+    return builder
 
 
 def extract_legacy_stage_metadata(stage_config: Any) -> StageMetadata:
@@ -640,8 +697,32 @@ def extract_legacy_stage_metadata(stage_config: Any) -> StageMetadata:
     custom_process_input_func: Callable | None = None
     _cpif_path = _get_attr_or_item(stage_config, "custom_process_input_func")
     if _cpif_path:
-        mod_path, fn_name = _cpif_path.rsplit(".", 1)
-        custom_process_input_func = getattr(importlib.import_module(mod_path), fn_name)
+        # Resolve through the stage-input processor registry.  expected_kind is
+        # None here — orchestrator-side processors carry no suffix contract, so
+        # we rely on suffix inference only (compatible with existing configs).
+        # A bad path must **fail fast**: let ProcessorValidationError / ImportError /
+        # AttributeError propagate instead of silently dropping the configured
+        # hook and falling back to ``_default_process_engine_inputs``.  (The
+        # worker-side mixin candidate chain, which *probes* for a ``*_full_payload``
+        # derivative, keeps its own skip-on-mismatch tolerance.)
+        custom_process_input_func = resolve_processor(
+            _cpif_path,
+            expected_kind=None,
+            stage_config=stage_config,
+        ).fn
+
+    sync_process_input_func: str | None = None
+    _spif_path = _get_attr_or_item(stage_config, "sync_process_input_func")
+    if _spif_path:
+        # Keep the raw dotted path (the dead-processor hint reads it); the
+        # dual-entry ``build_prewarm_placeholder`` is resolved once here.
+        sync_process_input_func = _spif_path
+
+    prewarm_placeholder_builder = _resolve_prewarm_placeholder_builder(
+        sync_path=sync_process_input_func,
+        custom_fn=custom_process_input_func,
+        stage_config=stage_config,
+    )
 
     prompt_transform_func: Callable | None = None
     _ptf_path = _get_attr_or_item(stage_config, "prompt_transform_func")
@@ -681,6 +762,8 @@ def extract_legacy_stage_metadata(stage_config: Any) -> StageMetadata:
             final_output_type=final_output_type,
             default_sampling_params=default_params,
             custom_process_input_func=custom_process_input_func,
+            sync_process_input_func=sync_process_input_func,
+            prewarm_placeholder_builder=prewarm_placeholder_builder,
             model_stage=model_stage,
             runtime_cfg=runtime_cfg,
             prompt_transform_func=prompt_transform_func,
@@ -702,6 +785,8 @@ def extract_legacy_stage_metadata(stage_config: Any) -> StageMetadata:
         final_output_type=final_output_type,
         default_sampling_params=default_params,
         custom_process_input_func=custom_process_input_func,
+        sync_process_input_func=sync_process_input_func,
+        prewarm_placeholder_builder=prewarm_placeholder_builder,
         model_stage=model_stage,
         runtime_cfg=runtime_cfg,
         prompt_transform_func=prompt_transform_func,
@@ -736,6 +821,18 @@ def extract_stage_metadata_from_omni_stage_config(
         sampling_params_cls = SamplingParams if stage_type == "llm" else OmniDiffusionSamplingParams
         sampling_params = sampling_params_cls(**(stage_config.model_config.default_sampling_params or {}))
     custom_process_input_func = _resolve_omni_metadata_hook(stage_config.custom_process_input_func)
+    # Carry the raw sync path (dead-processor hint); resolve the dual-entry
+    # ``build_prewarm_placeholder`` once here.
+    sync_process_input_func: str | None = None
+    _spif_path = getattr(stage_config.stage_pipeline_config, "sync_process_input_func", None)
+    if _spif_path:
+        sync_process_input_func = _spif_path
+
+    prewarm_placeholder_builder = _resolve_prewarm_placeholder_builder(
+        sync_path=sync_process_input_func,
+        custom_fn=custom_process_input_func,
+        stage_config=stage_config,
+    )
 
     if stage_type == "diffusion":
         return StageMetadata(
@@ -749,6 +846,8 @@ def extract_stage_metadata_from_omni_stage_config(
             final_output_type=stage_config.final_output_type,
             default_sampling_params=sampling_params,
             custom_process_input_func=custom_process_input_func,
+            sync_process_input_func=sync_process_input_func,
+            prewarm_placeholder_builder=prewarm_placeholder_builder,
             model_stage=stage_config.model_stage,
             runtime_cfg=stage_config.runtime_config,
             prompt_transform_func=_resolve_omni_metadata_hook(stage_config.prompt_transform_func),
@@ -766,6 +865,8 @@ def extract_stage_metadata_from_omni_stage_config(
         final_output_type=stage_config.final_output_type,
         default_sampling_params=sampling_params,
         custom_process_input_func=custom_process_input_func,
+        sync_process_input_func=sync_process_input_func,
+        prewarm_placeholder_builder=prewarm_placeholder_builder,
         model_stage=stage_config.model_stage,
         runtime_cfg=stage_config.runtime_config,
         prompt_transform_func=_resolve_omni_metadata_hook(stage_config.prompt_transform_func),

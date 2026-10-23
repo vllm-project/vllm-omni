@@ -575,6 +575,7 @@ def build_adapter(monkeypatch, mocker: MockerFixture):
         flat_tts_config: bool = False,
         active_stream_window: int = 0,
         connector_extra: dict | None = None,
+        model_config_extra: dict | None = None,
         custom_process_next_stage_input_func: str | None = None,
     ):
         connector = mocker.MagicMock()
@@ -618,6 +619,12 @@ def build_adapter(monkeypatch, mocker: MockerFixture):
                     attention_type=tts_attention_type,
                 )
             )
+        # Both call styles must work: ours-style callers pass the hook via
+        # ``model_config_extra`` while theirs-style callers pass the explicit
+        # ``custom_process_next_stage_input_func`` kwarg. Folding them into one
+        # mapping avoids a duplicate-keyword TypeError when both are supplied.
+        extra = dict(model_config_extra or {})
+        extra.setdefault("custom_process_next_stage_input_func", custom_process_next_stage_input_func)
         model_config = SimpleNamespace(
             worker_type=model_mode,
             max_num_seqs=max_num_seqs,
@@ -625,11 +632,11 @@ def build_adapter(monkeypatch, mocker: MockerFixture):
             hf_config=hf_config,
             hf_config_name="tts_config" if stage_id == 1 else None,
             active_stream_window=active_stream_window,
-            custom_process_next_stage_input_func=custom_process_next_stage_input_func,
             stage_connector_config={
                 "name": "SharedMemoryConnector",
                 "extra": connector_extra or {},
             },
+            **extra,
         )
         scheduler_config = SimpleNamespace(max_num_seqs=max_num_seqs)
         adapter = OmniChunkTransferAdapter(
@@ -638,6 +645,37 @@ def build_adapter(monkeypatch, mocker: MockerFixture):
         return adapter, connector
 
     return _build
+
+
+def pack(transfer_manager, multimodal_output, request, is_finished=False):
+    """Arbitrarily named, structurally compatible async-chunk producer."""
+    del transfer_manager, multimodal_output, request, is_finished
+    return None
+
+
+def _incompatible_hook(transfer_manager, request):
+    """Structurally invalid: no ``multimodal_output`` and no ``is_finished``."""
+    del transfer_manager, request
+    return None
+
+
+def test_adapter_accepts_explicitly_configured_hook_with_arbitrary_name(build_adapter):
+    """A signature-compatible hook without a ``*_async_chunk`` suffix loads."""
+    adapter, _ = build_adapter(model_config_extra={"custom_process_next_stage_input_func": f"{__name__}.pack"})
+
+    assert adapter.custom_process_next_stage_input_func is pack
+
+
+def test_adapter_rejects_structurally_incompatible_hook(build_adapter):
+    """A hook missing required parameters fails fast instead of loading."""
+    from vllm_omni.model_executor.stage_input_processors import ProcessorValidationError
+
+    with pytest.raises(ProcessorValidationError):
+        build_adapter(
+            model_config_extra={
+                "custom_process_next_stage_input_func": f"{__name__}._incompatible_hook",
+            }
+        )
 
 
 @pytest.mark.parametrize("active_stream_window", [0, 2])
@@ -1649,6 +1687,89 @@ def test_send_single_request_personaplex_pending_frame_is_not_segment_boundary(
 
     sent_payload = connector.put.call_args.kwargs["data"]
     assert sent_payload.codes is None
+    assert sent_payload.meta.finished.item() is False
+    assert sent_payload.meta.is_segment_finished.item() is False
+
+
+def test_send_single_request_passes_new_token_ids_to_processor(build_adapter, monkeypatch):
+    """A producer that accepts ``new_token_ids`` receives the step's tokens
+    through the production ``_send_single_request`` path.  The signature cache
+    (``_processor_accepts_step_tokens``) must be initialized in ``__init__``
+    before the base class starts the save thread; without it every send raised
+    AttributeError that ``_send_single_request_for_generation`` swallowed,
+    silently dropping the chunk.
+    """
+    adapter, connector = build_adapter(stage_id=1)
+    request = _req("req-new-tokens", RequestStatus.WAITING, external_req_id="ext-new-tokens")
+
+    seen_kwargs = {}
+
+    def new_tokens_processor(**kwargs):
+        seen_kwargs.update(kwargs)
+        return OmniPayloadStruct(
+            codes=CodesStruct(audio=torch.tensor([1, 2, 3], dtype=torch.long)),
+        )
+
+    adapter.custom_process_next_stage_input_func = new_tokens_processor
+    monkeypatch.setattr(adapter, "cleanup", lambda *a, **kw: None)
+
+    adapter._send_single_request(
+        {
+            "multimodal_output": None,
+            "request": request,
+            "is_finished": False,
+            "is_segment_finished": False,
+            "new_token_ids": (7, 8, 9),
+        }
+    )
+
+    assert seen_kwargs["new_token_ids"] == (7, 8, 9)
+    assert connector.put.called
+    sent_payload = connector.put.call_args.kwargs["data"]
+    assert sent_payload.meta.finished.item() is False
+
+
+def test_send_single_request_normal_chunk_flushes_processor(build_adapter, monkeypatch):
+    """A non-terminal chunk with a producer that does **not** accept
+    ``new_token_ids`` must still reach the wire.  Before the cache
+    re-initialization the ``_accepts_new_token_ids`` probe raised AttributeError
+    on every call, the processor was never invoked, and the ordinary chunk was
+    silently dropped at the ``payload_data is None`` guard.
+    """
+    adapter, connector = build_adapter(stage_id=1)
+    request = _req("req-normal-chunk", RequestStatus.WAITING, external_req_id="ext-normal-chunk")
+
+    processor_calls = []
+
+    def plain_processor(transfer_manager, multimodal_output, request, is_finished):
+        processor_calls.append(
+            {
+                "transfer_manager": transfer_manager,
+                "multimodal_output": multimodal_output,
+                "request": request,
+                "is_finished": is_finished,
+            }
+        )
+        return OmniPayloadStruct(
+            codes=CodesStruct(audio=torch.tensor([4, 5], dtype=torch.long)),
+        )
+
+    adapter.custom_process_next_stage_input_func = plain_processor
+    monkeypatch.setattr(adapter, "cleanup", lambda *a, **kw: None)
+
+    adapter._send_single_request(
+        {
+            "multimodal_output": None,
+            "request": request,
+            "is_finished": False,
+            "is_segment_finished": False,
+        }
+    )
+
+    assert len(processor_calls) == 1
+    assert processor_calls[0]["is_finished"] is False
+    assert connector.put.called
+    sent_payload = connector.put.call_args.kwargs["data"]
     assert sent_payload.meta.finished.item() is False
     assert sent_payload.meta.is_segment_finished.item() is False
 

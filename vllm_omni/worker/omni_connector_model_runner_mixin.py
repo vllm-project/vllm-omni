@@ -23,5 +23,5 @@ class OmniConnectorModelRunnerMixin(_OmniConnectorPayloadTransportMixin):
     """Unified data-plane communication interface for model runners.
 
     Runtime ownership and payload transport live under
-    ``distributed.omni_connectors``.
+    "distributed.omni_connectors".
     """

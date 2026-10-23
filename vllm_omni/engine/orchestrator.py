@@ -140,6 +140,32 @@ def _build_terminal_empty_output(
     )
 
 
+def _custom_hook_is_sync_hook(fn: Any, sync_path: str | None) -> bool:
+    """Whether the custom hook callable *is* the configured sync hook.
+
+    A stage may wire the same ``*_token_only`` processor as both
+    ``custom_process_input_func`` and ``sync_process_input_func`` (the sync hook
+    is pre-selected as the active forward processor).  In that case the custom
+    hook is **not** dead — it is the active processor — so
+    :func:`dead_processor_hint` must not report it.  Comparison is by dotted
+    path first, then by resolving the sync path and identity-checking the
+    callable.  Never raises.
+    """
+    if not callable(fn) or not sync_path:
+        return False
+    module = getattr(fn, "__module__", None)
+    name = getattr(fn, "__qualname__", None) or getattr(fn, "__name__", None)
+    if module and name and f"{module}.{name}" == sync_path:
+        return True
+    try:
+        from vllm_omni.model_executor.stage_input_processors import resolve_processor
+
+        spec = resolve_processor(sync_path, expected_kind=None)
+        return spec.fn is fn
+    except Exception:
+        return False
+
+
 def build_engine_core_request_from_tokens(
     request_id: str,
     prompt: dict[str, Any],
@@ -371,6 +397,9 @@ class OrchestratorBase:
         self.async_chunk = bool(async_chunk)
         self.num_stages = len(stage_pools)
         self.stage_pools: list[StagePool] = stage_pools
+        # Wire the dead-processor hint at startup (warn-only) so a
+        # configured-but-never-invoked custom_process_input_func is surfaced.
+        self._warn_dead_input_processors()
         self.log_stats = log_stats
         if log_stats and not collect_stage_metrics:
             raise ValueError("log_stats=True requires collect_stage_metrics=True")
@@ -2171,6 +2200,59 @@ class OrchestratorBase:
         model_config = getattr(pool.stage_vllm_config, "model_config", None)
         return stage_receives_chunks(model_config)
 
+    def _warn_dead_input_processors(self) -> None:
+        """Startup (M0, warn-only) wiring of :func:`dead_processor_hint`.
+
+        For every stage whose ``custom_process_input_func`` would never be
+        invoked under the current async-chunk / sync wiring (mirroring the
+        ``_route_output`` gate ``(not async_chunk or not
+        _stage_receives_async_chunks(stage_id))``), log a warning so a
+        configured-but-dead hook is not silently dropped.  This is a pure hint
+        (warn-first): the orchestrator never enforces it at runtime.
+        Defensive by design — fake pools / minimal clients in tests or future
+        connectors may not expose ``stage_client``, so the loop never raises.
+        """
+        from vllm_omni.model_executor.stage_input_processors import dead_processor_hint, infer_kind
+
+        for stage_id, pool in enumerate(self.stage_pools):
+            try:
+                client = getattr(pool, "stage_client", None)
+                fn = getattr(client, "custom_process_input_func", None)
+                if fn is None:
+                    continue
+                module = getattr(fn, "__module__", None)
+                name = getattr(fn, "__qualname__", None) or getattr(fn, "__name__", None)
+                if not module or not name:
+                    continue
+                path = f"{module}.{name}"
+                kind = infer_kind(fn, path=path)
+                sync_path = getattr(client, "sync_process_input_func", None)
+                has_sync = bool(sync_path)
+                # Do not report a hook that *is* the selected sync hook: in
+                # non-async mode the sync ``*_token_only`` processor is the
+                # active custom hook, not a dead leftover.
+                custom_is_sync = _custom_hook_is_sync_hook(fn, sync_path)
+                dead = dead_processor_hint(
+                    kind,
+                    async_chunk=self.async_chunk,
+                    downstream_receives_async_chunks=self._stage_receives_async_chunks(stage_id),
+                    has_sync=has_sync,
+                    custom_is_sync=custom_is_sync,
+                )
+                if dead:
+                    logger.warning(
+                        "[Orchestrator] stage-%d custom_process_input_func %r is never invoked "
+                        "under the current async-chunk/sync wiring (dead-processor hint)",
+                        stage_id,
+                        path,
+                    )
+            except Exception as exc:  # pragma: no cover - defensive only
+                logger.debug(
+                    "[Orchestrator] dead-processor hint lookup for stage-%s failed: %s",
+                    stage_id,
+                    exc,
+                )
+
     def _get_stage_input_processor(self, stage_id: int) -> Any:
         processor = self._stage_input_processors.get(stage_id)
         if processor is None:
@@ -2724,20 +2806,22 @@ class OrchestratorBase:
             if next_client is not None and next_client.custom_process_input_func is not None:
                 _t_ar2d = _time.perf_counter()
                 _fn = next_client.custom_process_input_func
-                _extra_kwargs: dict[str, Any] = {}
-                # TODO: replace signature probe with explicit kwarg contract.
-                try:
-                    import inspect as _inspect
+                # Dispatch through the shared contract layer, replacing the
+                # ad-hoc `sampling_params` name probe.
+                from vllm_omni.model_executor.stage_input_processors._dispatch import (
+                    OrchestratorInputContext,
+                    invoke_orchestrator_processor,
+                )
 
-                    if "sampling_params" in _inspect.signature(_fn).parameters:
-                        _extra_kwargs["sampling_params"] = params
-                except (TypeError, ValueError):
-                    pass
-                diffusion_prompt = _fn(
+                _ctx = OrchestratorInputContext(
+                    prompt=req_state.prompt,
+                    requires_multimodal_data=requires_multimodal_data,
+                    sampling_params=params,
+                )
+                diffusion_prompt = invoke_orchestrator_processor(
+                    _fn,
                     diffusion_source_outputs,
-                    req_state.prompt,
-                    requires_multimodal_data,
-                    **_extra_kwargs,
+                    _ctx,
                 )
                 _dt_ar2d = (_time.perf_counter() - _t_ar2d) * 1000
                 req_state.pipeline_timings["ar2diffusion_ms"] = _dt_ar2d
@@ -3157,51 +3241,16 @@ class OrchestratorBase:
                     operation="async-chunk prewarm",
                 )
             else:
-                from vllm_omni.distributed.omni_connectors.adapter import compute_talker_prompt_ids_length
-
-                try:
-                    next_prompt_len = max(1, compute_talker_prompt_ids_length(prompt_token_ids))
-                except Exception:
-                    next_prompt_len = max(1, len(prompt_token_ids))
-                # A stage may size its own prewarmed placeholder prompt via
-                # hf_overrides.async_chunk_prewarm_prompt_len (e.g. a talker
-                # whose engine positions must cover a speaker-prompt prefill;
-                # the model validates the value and reports the right one on
-                # mismatch).
-                prewarm_len = getattr(
-                    getattr(next_pool.stage_vllm_config, "model_config", None),
-                    "hf_config",
-                    None,
+                # Build the prewarm placeholder through the registered
+                # placeholder builder's ``build_prewarm_placeholder`` (resolved
+                # from ``sync_process_input_func``), falling back to the legacy
+                # inline estimate when no builder is available.
+                base_input = self._build_prewarm_placeholder_input(
+                    next_stage_id,
+                    request_id,
+                    prompt_token_ids,
+                    req_state,
                 )
-                prewarm_len = getattr(prewarm_len, "async_chunk_prewarm_prompt_len", None)
-                if prewarm_len is not None and int(prewarm_len) > 1:
-                    next_prompt_len = int(prewarm_len)
-
-                original_prompt = req_state.prompt
-                if isinstance(original_prompt, dict):
-                    from vllm_omni.engine.request_snapshot import copy_request_snapshot
-
-                    # The placeholder replaces the prompt and multimodal fields,
-                    # so they are not copied (multimodal inputs can be megabytes).
-                    # additional_information is serialized below, which copies
-                    # tensor bytes; its containers are copied, its tensors shared.
-                    memo: dict[int, Any] = {}
-                    base_input = copy_request_snapshot(
-                        {k: v for k, v in original_prompt.items() if k not in _PREWARM_UNCOPIED_PROMPT_KEYS},
-                        memo,
-                    )
-                    if "additional_information" in original_prompt:
-                        base_input["additional_information"] = copy_request_snapshot(
-                            original_prompt["additional_information"],
-                            memo,
-                            shared_types=(torch.Tensor,),
-                        )
-                else:
-                    base_input = {}
-
-                base_input["prompt_token_ids"] = [0] * next_prompt_len
-                base_input["multi_modal_data"] = None
-                base_input["mm_processor_kwargs"] = None
                 downstream_resumable = bool(getattr(entry_request, "resumable", req_state.streaming.enabled))
                 # Session-owned and resumable requests keep their downstream
                 # request across turns, so they stay on the chunk-0 path.
@@ -3335,6 +3384,108 @@ class OrchestratorBase:
                 remote_bootstrap_addr=bootstrap_addr_from_kv_transfer_config(config),
             )
         }
+
+    @staticmethod
+    def _apply_prewarm_prompt_len_override(base_input: dict[str, Any], configured_len: int | None) -> dict[str, Any]:
+        """Apply the configured ``async_chunk_prewarm_prompt_len`` override to base_input."""
+        if configured_len is None or int(configured_len) <= 1:
+            return base_input
+        patched = dict(base_input)
+        patched["prompt_token_ids"] = [0] * int(configured_len)
+        return patched
+
+    def _build_prewarm_placeholder_input(
+        self,
+        next_stage_id: int,
+        request_id: str,
+        prompt_token_ids: Any,
+        req_state: OrchestratorRequestState,
+    ) -> dict[str, Any]:
+        """Build the async-chunk prewarm ``base_input`` dict for a downstream stage.
+
+        Uses the registered placeholder builder's ``build_prewarm_placeholder``
+        when available; otherwise (and on any builder failure) falls back to the
+        legacy inline estimate (``max(1, compute_talker_prompt_ids_length(...))``)
+        with a warning — the prewarm path must never raise.
+
+        The configured override is applied after both paths (amy-why-3459 review of HEAD ad81ac3a).
+        """
+        from vllm_omni.model_executor.stage_input_processors import OrchestratorInputContext
+
+        original_prompt = req_state.prompt
+        if isinstance(original_prompt, dict):
+            from vllm_omni.engine.request_snapshot import copy_request_snapshot
+
+            # Discarded fields are skipped; additional_information tensors stay shared.
+            memo: dict[int, Any] = {}
+            base_input = copy_request_snapshot(
+                {k: v for k, v in original_prompt.items() if k not in _PREWARM_UNCOPIED_PROMPT_KEYS},
+                memo,
+            )
+            if "additional_information" in original_prompt:
+                base_input["additional_information"] = copy_request_snapshot(
+                    original_prompt["additional_information"],
+                    memo,
+                    shared_types=(torch.Tensor,),
+                )
+        else:
+            base_input = {}
+
+        # Apply the configured async_chunk_prewarm_prompt_len override on both prewarm paths.
+        stage_vllm_config = getattr(self.stage_pools[next_stage_id], "stage_vllm_config", None)
+        model_config = getattr(stage_vllm_config, "model_config", None)
+        prewarm_len = getattr(getattr(model_config, "hf_config", None), "async_chunk_prewarm_prompt_len", None)
+
+        pool = self.stage_pools[next_stage_id]
+        client = getattr(pool, "stage_client", None)
+        prewarm_builder = getattr(client, "prewarm_placeholder_builder", None)
+        if prewarm_builder is not None:
+            try:
+                ctx = OrchestratorInputContext(
+                    prompt=req_state.prompt,
+                    requires_multimodal_data=False,
+                    streaming_context=None,
+                    target_model_config=model_config,
+                    next_stage_hf_config=getattr(model_config, "hf_config", None),
+                )
+                placeholders = prewarm_builder(
+                    stage0_prompt=prompt_token_ids,
+                    ctx=ctx,
+                    downstream_stage_id=next_stage_id,
+                )
+                placeholder = placeholders[0] if placeholders else None
+                if placeholder is not None:
+                    ph_ids = (
+                        placeholder["prompt_token_ids"]
+                        if isinstance(placeholder, dict)
+                        else getattr(placeholder, "prompt_token_ids", None)
+                    )
+                    if ph_ids:
+                        base_input["prompt_token_ids"] = list(ph_ids)
+                        base_input["multi_modal_data"] = None
+                        base_input["mm_processor_kwargs"] = None
+                        return self._apply_prewarm_prompt_len_override(base_input, prewarm_len)
+            except Exception as exc:
+                logger.warning(
+                    "[Orchestrator] req=%s: prewarm placeholder builder for "
+                    "stage-%s raised; falling back to inline estimate: %s",
+                    request_id,
+                    next_stage_id,
+                    exc,
+                )
+
+        # Legacy inline fallback (warn-and-keep-old behaviour so the prewarm
+        # never regresses on models without a dual-entry builder).
+        from vllm_omni.distributed.omni_connectors.adapter import compute_talker_prompt_ids_length
+
+        try:
+            next_prompt_len = max(1, compute_talker_prompt_ids_length(prompt_token_ids))
+        except Exception:
+            next_prompt_len = max(1, len(prompt_token_ids))
+        base_input["prompt_token_ids"] = [0] * next_prompt_len
+        base_input["multi_modal_data"] = None
+        base_input["mm_processor_kwargs"] = None
+        return self._apply_prewarm_prompt_len_override(base_input, prewarm_len)
 
     def _build_kv_sender_info(
         self,

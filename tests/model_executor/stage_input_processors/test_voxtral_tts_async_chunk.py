@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from collections import defaultdict
 from types import SimpleNamespace
@@ -213,3 +213,96 @@ def test_none_multimodal_output_not_finished_returns_none():
     )
 
     assert payload is None
+
+
+def _compute_mm_logits_payload(batch: int = 1, codebooks: int = 8):
+    """Mirror voxtral_tts_audio_generation.compute_mm_logits() L1075:
+    audio_codes [B, C] -> unsqueeze(1) -> [B, 1, C] -> split -> list of (1, 1, C).
+    """
+    audio_codes = torch.arange(batch * codebooks, dtype=torch.float32).reshape(batch, codebooks)
+    audio_list = list(torch.split(audio_codes.unsqueeze(1), 1, dim=0))
+    return {"codes": {"audio": audio_list}}
+
+
+def test_3d_per_step_frame_list_accepted():
+    """Voxtral P1 regression: compute_mm_logits 3-D per-step [B, 1, C]
+    payload must not raise ValueError; the last frame is extracted as 1-D."""
+    from vllm_omni.model_executor.stage_input_processors import _common
+
+    transfer_manager = _make_transfer_manager()
+    request_id = "rid-3d"
+    request = _req(request_id, finished=False)
+
+    payload = generator2tokenizer_async_chunk(
+        transfer_manager=transfer_manager,
+        multimodal_output=_compute_mm_logits_payload(1, 8),
+        request=request,
+    )
+
+    # The frame is stored as the flat 8-element codec row.
+    assert transfer_manager.code_prompt_token_ids[request_id][-1] == [float(i) for i in range(8)]
+    # One frame < chunk_size_at_begin=5: no emission yet.
+    assert payload is None
+    # Direct helper call: 1-D float frame, precision preserved (to_long=False).
+    frame = _common.extract_last_codec_frame(
+        {"codes": {"audio": torch.zeros(1, 1, 8)}},
+        to_long=False,
+    )
+    assert frame is not None
+    assert frame.shape == (8,)
+    assert frame.dtype == torch.float32
+
+
+def test_3d_direct_tensor_accepted():
+    """A bare 3-D [1, 1, C] tensor is normalized via squeeze(1) and the
+    2-D last-row semantics apply unchanged."""
+    from vllm_omni.model_executor.stage_input_processors import _common
+
+    frame = _common.extract_last_codec_frame(
+        {"codes": {"audio": torch.arange(8, dtype=torch.float32).reshape(1, 1, 8)}},
+        to_long=False,
+    )
+    assert frame is not None
+    assert frame.shape == (8,)
+    assert frame.dtype == torch.float32
+    assert frame.tolist() == [float(i) for i in range(8)]
+
+
+def test_3d_per_step_chunk_emission():
+    """Feeding 5 per-step 3-D frames reaches the codec_chunk_frames_at_begin
+    boundary and emits the standard [ctx_frames, context_length, ...flat] payload."""
+    transfer_manager = _make_transfer_manager(
+        codec_chunk_frames=25,
+        codec_left_context_frames=25,
+        codec_chunk_frames_at_begin=5,
+    )
+    request_id = "rid-3d-chunk"
+    request = _req(request_id, finished=False)
+
+    payload = None
+    for _ in range(5):
+        payload = generator2tokenizer_async_chunk(
+            transfer_manager=transfer_manager,
+            multimodal_output=_compute_mm_logits_payload(1, 8),
+            request=request,
+        )
+
+    assert payload is not None
+    codes = payload.codes.audio
+    assert int(codes[0].item()) == 0  # ctx_frames
+    assert int(codes[1].item()) == 5  # context_length == chunk_size_at_begin
+    assert codes[2:].numel() == 5 * 8  # 5 frames x 8 codebooks
+
+
+def test_3d_non_singleton_frame_dim_raises():
+    """Defensive contract: non per-step 3-D layouts (dim1 != 1) still raise
+    ValueError instead of being silently flattened."""
+    transfer_manager = _make_transfer_manager()
+    request = _req("rid-3d-non-singleton", finished=False)
+
+    with pytest.raises(ValueError):
+        generator2tokenizer_async_chunk(
+            transfer_manager=transfer_manager,
+            multimodal_output={"codes": {"audio": torch.zeros(1, 2, 3)}},
+            request=request,
+        )

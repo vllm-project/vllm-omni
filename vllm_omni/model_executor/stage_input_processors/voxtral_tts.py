@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from collections.abc import Mapping
 from typing import Any
 
@@ -10,33 +13,9 @@ from vllm_omni.data_entry_keys import (
     OmniPayload,
     OmniPayloadStruct,
 )
+from vllm_omni.model_executor.stage_input_processors import _common
 
 logger = init_logger(__name__)
-
-
-def _codec_audio_tensors(multimodal_output: OmniPayload | dict[str, Any]) -> list[torch.Tensor] | None:
-    """Inter-stage codec frames from ``codes.audio``."""
-    if not isinstance(multimodal_output, Mapping):
-        return None
-    codes = multimodal_output.get("codes")
-    if not isinstance(codes, Mapping) or "audio" not in codes:
-        return None
-    audio = codes["audio"]
-    if isinstance(audio, torch.Tensor):
-        return [audio]
-    if isinstance(audio, list) and audio:
-        return audio
-    return None
-
-
-def _extract_last_frame(multimodal_output: OmniPayload | dict[str, Any]) -> torch.Tensor | None:
-    audio_tensors = _codec_audio_tensors(multimodal_output)
-    if not audio_tensors:
-        return None
-    frame = audio_tensors[-1]
-    if not isinstance(frame, torch.Tensor) or frame.numel() == 0:
-        return None
-    return frame.flatten()
 
 
 def generator2tokenizer_async_chunk(
@@ -49,7 +28,7 @@ def generator2tokenizer_async_chunk(
     finished = bool(is_finished or request.is_finished())
 
     if isinstance(multimodal_output, Mapping):
-        frame = _extract_last_frame(multimodal_output)
+        frame = _common.extract_last_codec_frame(multimodal_output, to_long=False)
         if frame is not None:
             codec_codes = frame.cpu().tolist()
             transfer_manager.code_prompt_token_ids[request_id].append(codec_codes)

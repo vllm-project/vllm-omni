@@ -24,6 +24,8 @@ from vllm_omni.data_entry_keys import (
 from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.inputs.data import OmniTokensPrompt
 from vllm_omni.model_executor.models.qwen3_omni.tool_speech import TOOL_CALL_START_TOKEN_ID
+from vllm_omni.model_executor.stage_input_processors import _common
+from vllm_omni.model_executor.stage_input_processors._dispatch import OrchestratorInputContext
 from vllm_omni.model_executor.stage_input_processors.chunk_size_utils import compute_ramp_emit, parse_chunk_ramp
 from vllm_omni.model_executor.stage_input_processors.tts_utils import (
     extract_language_from_prompt,
@@ -48,6 +50,45 @@ _QWEN3_CODEC_BOS_TOKEN_ID = 4197
 _QWEN3_CODEC_EOS_TOKEN_ID = 4198
 
 
+def _assert_codec_token_ids_consistent() -> None:
+    """Fail-fast guard: codec token ids must not drift.
+
+    These ids are model-specific special tokens.  The HF config classes are
+    the single source of truth at runtime -- the talker reads
+    ``codec_pad_id`` / ``codec_bos_id`` / ``codec_eos_token_id`` off
+    ``talker_config``.  The processor keeps its own module-top constants
+    (used by ``talker2code2wav_*`` bookkeeping) and verifies them against
+    both the in-repo Qwen3-TTS config and the transformers
+    ``Qwen3OmniMoeTalkerConfig`` (the config qwen3-omni actually runs with).
+    """
+    from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
+        Qwen3OmniMoeTalkerConfig,
+    )
+
+    from vllm_omni.model_executor.models.qwen3_tts.configuration_qwen3_tts import (
+        Qwen3TTSTalkerConfig,
+    )
+
+    expected = (
+        _QWEN3_CODEC_PAD_TOKEN_ID,
+        _QWEN3_CODEC_BOS_TOKEN_ID,
+        _QWEN3_CODEC_EOS_TOKEN_ID,
+    )
+    for name, cfg in (
+        ("qwen3_tts", Qwen3TTSTalkerConfig()),
+        ("qwen3_omni_moe", Qwen3OmniMoeTalkerConfig()),
+    ):
+        actual = (cfg.codec_pad_id, cfg.codec_bos_id, cfg.codec_eos_token_id)
+        assert actual == expected, (
+            f"{name} codec token ids {actual} drift from the stage_input_processors.qwen3_omni constants {expected}"
+        )
+
+
+# The codec-token consistency guard is intentionally **not** run at import time
+# (it pulls in transformers / the in-repo qwen3-tts config and must not break
+# light imports).  It is invoked explicitly at model-load startup
+# (qwen3_omni_moe_talker) so the processor constants stay in sync with the HF
+# configs the model actually runs with.
 def _layer_tensor(layers: dict[Any, Any], key: str) -> torch.Tensor | None:
     """Fetch layer tensor with tolerant key lookup (str/int/semantic)."""
     if not isinstance(layers, dict):
@@ -88,7 +129,7 @@ _TOOL_SPEECH_CUT = "_qwen3_tool_speech_cut"
 
 def _is_final_token(request: Any) -> bool | None:
     """Whether the token sampled last ends the Thinker's turn (``None``: unknown)."""
-    output_token_ids = _ensure_list(getattr(request, "output_token_ids", None) or [])
+    output_token_ids = _common.ensure_list_unchanged(getattr(request, "output_token_ids", None) or [])
     count = getattr(request, "output_token_count", None)
     count = len(output_token_ids) if count is None else count
     token = getattr(request, "last_output_token_id", None)
@@ -138,7 +179,7 @@ def _sampled_token_is_tool_call(request: Any) -> bool:
 
 def _output_reaches_tool_call(request: Any) -> bool:
     """True once this step's Thinker sample is ``<tool_call>`` or after it."""
-    output_token_ids = _ensure_list(getattr(request, "output_token_ids", None) or [])
+    output_token_ids = _common.ensure_list_unchanged(getattr(request, "output_token_ids", None) or [])
     if TOOL_CALL_START_TOKEN_ID in output_token_ids:
         return True
     return _sampled_token_is_tool_call(request)
@@ -160,55 +201,9 @@ def _sampled_token_embed(thinker_embed: Mapping[str, Any], request: Any) -> torc
     return sampled.detach().cpu()
 
 
-def _compute_talker_prompt_ids_length(info: OmniPayload, device: torch.device | str = "cuda") -> int:
-    im_start_token_id = 151644
-    system_token_id = 8948
-    user_token_id = 872
-    assistant_token_id = 77091
-
-    ids = info.get("ids", {})
-    thinker_sequences = torch.tensor(ids["all"], dtype=torch.long, device=device).unsqueeze(0)  # [1, T]
-
-    input_ids = torch.tensor(ids["prompt"], dtype=torch.long, device=device).unsqueeze(0)  # [1, T]
-
-    im_start_indexes = torch.cat(
-        [
-            torch.nonzero(input_ids[0] == im_start_token_id).squeeze(1),
-            torch.tensor([thinker_sequences.shape[-1]], device=input_ids.device, dtype=input_ids.dtype),
-        ],
-        dim=0,
-    )
-
-    sum_user_len = 0
-    assistant_len = 0
-    for i in range(len(im_start_indexes) - 1):
-        s = int(im_start_indexes[i].item())
-        e = int(im_start_indexes[i + 1].item())
-        role = int(input_ids[0, s + 1].item())
-        if role == system_token_id:
-            continue
-        elif role == user_token_id:
-            sum_user_len += e - s
-        elif role == assistant_token_id and i == len(im_start_indexes) - 2:
-            assistant_len += 9  # 3 + 4 + 1 + 1
-        else:
-            pass
-
-    return sum_user_len + assistant_len
-
-
 # =========================
 # Common helpers
 # =========================
-
-
-def _ensure_list(x):
-    """Convert ConstantList / tensor-like to Python list."""
-    if hasattr(x, "_x"):
-        return list(x._x)
-    elif not isinstance(x, list):
-        return x
-    return list(x)
 
 
 def _as_tensor_or_none(value: Any) -> torch.Tensor | None:
@@ -299,7 +294,7 @@ def _construct_thinker2talker_streaming_input_async_chunk(
     request_id = request.external_req_id
     output_token_ids = request.output_token_ids
     # Convert ConstantList to regular list for OmniSerializer serialization
-    output_token_ids = _ensure_list(output_token_ids)
+    output_token_ids = _common.ensure_list_unchanged(output_token_ids)
     speaker = extract_speaker_from_request(request)
     language = extract_language_from_request(request)
     finished = torch.tensor(is_finished, dtype=torch.bool)
@@ -329,8 +324,8 @@ def _construct_thinker2talker_streaming_input_async_chunk(
                 embed=EmbeddingsStruct(prefill=emb_cpu),
                 hidden_states=HiddenStatesStruct(output=hid_cpu),
                 ids=IdsStruct(
-                    all=_ensure_list(request.all_token_ids[-new_prompt_len - 1 :]),
-                    prompt=_ensure_list(request.prompt_token_ids[-new_prompt_len:]),
+                    all=_common.ensure_list_unchanged(request.all_token_ids[-new_prompt_len - 1 :]),
+                    prompt=_common.ensure_list_unchanged(request.prompt_token_ids[-new_prompt_len:]),
                 ),
                 speaker=speaker,
                 language=language,
@@ -524,8 +519,8 @@ def thinker2talker_async_chunk(
         return t.detach().cpu() if isinstance(t, torch.Tensor) else None
 
     if chunk_id == 0:
-        all_token_ids = _ensure_list(request.all_token_ids)
-        prompt_token_ids = _ensure_list(request.prompt_token_ids)
+        all_token_ids = _common.ensure_list_unchanged(request.all_token_ids)
+        prompt_token_ids = _common.ensure_list_unchanged(request.prompt_token_ids)
         payload = OmniPayloadStruct(
             embed=EmbeddingsStruct(
                 prefill=thinker_emb.detach().cpu(),
@@ -677,10 +672,10 @@ def thinker2talker_full_payload(
         )
         return None
 
-    prompt_token_ids = _ensure_list(getattr(request, "prompt_token_ids", []) or [])
-    all_token_ids = _ensure_list(getattr(request, "all_token_ids", None) or [])
+    prompt_token_ids = _common.ensure_list_unchanged(getattr(request, "prompt_token_ids", []) or [])
+    all_token_ids = _common.ensure_list_unchanged(getattr(request, "all_token_ids", None) or [])
     if not all_token_ids:
-        output_token_ids = _ensure_list(getattr(request, "output_token_ids", []) or [])
+        output_token_ids = _common.ensure_list_unchanged(getattr(request, "output_token_ids", []) or [])
         all_token_ids = list(prompt_token_ids) + list(output_token_ids)
 
     # Drop the terminal stop-token row only when more than one row was
@@ -728,32 +723,24 @@ def thinker2talker_full_payload(
     return payload
 
 
-def thinker2talker_token_only(
+def build_forward_placeholder(
     source_outputs: list[Any],
-    prompt: OmniTokensPrompt | TextPrompt | None = None,
-    requires_multimodal_data: bool = False,
-    streaming_context: Any | None = None,
+    ctx: OrchestratorInputContext,
 ) -> list[OmniTokensPrompt]:
-    """Orchestrator-side placeholder builder for Stage-1 (Talker) when
-    ``async_chunk=False``.
+    """Sync forward placeholder: one KV-sized ``OmniTokensPrompt`` per output.
 
-    After the communication-layer refactor, this function only allocates a
-    placeholder ``prompt_token_ids`` of the correct length so the scheduler can
-    reserve KV-cache slots. It does **not** forward bulk tensors.
-
-    Bulk talker conditioning is sent through the connector. Speaker and
-    language are also copied from the original prompt so they survive when
-    Stage-0 request metadata is unavailable to the connector payload.
-
-    ``prompt`` / ``requires_multimodal_data`` are kept for call-site signature
-    compatibility with other orchestrator input processors; they are unused.
+    Mirrors the legacy ``thinker2talker_token_only`` path; speaker/language are
+    copied from the prompt so they survive without Stage-0 request metadata.
+    Length/packing delegated to ``_common.compute_placeholder_prompt_len(mode="full")``
+    and ``_common.pack_placeholder_prompt``.
     """
     talker_inputs: list[OmniTokensPrompt] = []
+    streaming_context = ctx.streaming_context
     for i, thinker_output in enumerate(source_outputs):
         output = thinker_output.outputs[0]
         req_id = str(getattr(thinker_output, "request_id", f"idx-{i}"))
-        prompt_token_ids = _ensure_list(thinker_output.prompt_token_ids)
-        output_ids = _ensure_list(output.cumulative_token_ids)
+        prompt_token_ids = _common.ensure_list_unchanged(thinker_output.prompt_token_ids)
+        output_ids = _common.ensure_list_unchanged(output.cumulative_token_ids)
         is_streaming_session = bool(getattr(streaming_context, "enabled", False))
         if is_streaming_session:
             prompt_token_ids, output_ids = _get_streaming_talker_tokens(
@@ -767,23 +754,78 @@ def thinker2talker_token_only(
         thinker_sequences = prompt_token_ids + output_ids
         thinker_input_ids = prompt_token_ids
         info_for_len: OmniPayload = {"ids": {"all": thinker_sequences, "prompt": thinker_input_ids}}
-        prompt_len = _compute_talker_prompt_ids_length(info_for_len, device="cpu")
+        prompt_len = _common.compute_placeholder_prompt_len(
+            ids_or_prompt=info_for_len,
+            mode="full",
+            device="cpu",
+        )
         # Keep this fallback until the connector reliably preserves voice metadata.
         additional_information = to_dict(
             OmniPayloadStruct(
-                speaker=extract_speaker_from_prompt(prompt, index=i),
-                language=extract_language_from_prompt(prompt, index=i),
+                speaker=extract_speaker_from_prompt(ctx.prompt, index=i),
+                language=extract_language_from_prompt(ctx.prompt, index=i),
             )
         )
         talker_inputs.append(
-            OmniTokensPrompt(
-                prompt_token_ids=[0] * prompt_len,
-                additional_information=additional_information or None,
-                multi_modal_data=None,
-                mm_processor_kwargs=None,
+            _common.pack_placeholder_prompt(
+                prompt_len=prompt_len,
+                voice_metadata=additional_information or None,
             )
         )
     return talker_inputs
+
+
+def build_prewarm_placeholder(
+    *,
+    stage0_prompt: Any,
+    ctx: OrchestratorInputContext,
+    downstream_stage_id: int,
+) -> list[OmniTokensPrompt]:
+    """Best-effort async-chunk prewarm estimate (no ``source_outputs`` yet).
+
+    Length from ``_common.compute_placeholder_prompt_len(mode="stage0_only")``
+    (the same Qwen scan ``adapter.compute_talker_prompt_ids_length`` runs), so
+    prewarm matches sync-forward and the inline fallback; the connector fixup
+    path replaces it once the upstream chunk arrives.  Voice metadata is not
+    forwarded (matching pre-existing prewarm behaviour); per-edge refinement
+    is out of scope.
+    """
+    del ctx, downstream_stage_id  # Only the stage-0 input estimate is used.
+    if hasattr(stage0_prompt, "prompt_token_ids"):
+        stage0_prompt = stage0_prompt.prompt_token_ids
+    prompt_len = max(
+        1,
+        _common.compute_placeholder_prompt_len(
+            ids_or_prompt=stage0_prompt,
+            mode="stage0_only",
+        ),
+    )
+    return [_common.pack_placeholder_prompt(prompt_len=prompt_len, voice_metadata=None)]
+
+
+def thinker2talker_token_only(
+    source_outputs: list[Any],
+    prompt: OmniTokensPrompt | TextPrompt | None = None,
+    requires_multimodal_data: bool = False,
+    streaming_context: Any | None = None,
+) -> list[OmniTokensPrompt]:
+    """Stage-1 sync placeholder (``async_chunk=False``): KV-sized slot only.
+
+    Thin delegation to :func:`build_forward_placeholder`; legacy params are kept
+    for call-site compatibility and folded into an ``OrchestratorInputContext``.
+    """
+    ctx = OrchestratorInputContext(
+        prompt=prompt,
+        requires_multimodal_data=requires_multimodal_data,
+        streaming_context=streaming_context,
+    )
+    return build_forward_placeholder(source_outputs, ctx)
+
+
+# Expose the dual-entry builders on the resolved ``*_token_only`` fn so the
+# orchestrator's ``sync_process_input_func`` lookup finds them without a scan.
+thinker2talker_token_only.build_forward_placeholder = build_forward_placeholder  # type: ignore[attr-defined]
+thinker2talker_token_only.build_prewarm_placeholder = build_prewarm_placeholder  # type: ignore[attr-defined]
 
 
 # =========================
@@ -805,9 +847,7 @@ def talker2code2wav_async_chunk(
     request: OmniEngineCoreRequest,
     is_finished: bool = False,
 ) -> OmniPayloadStruct | None:
-    """
-    Multimodal output version.
-    """
+    """Async-chunk producer: multimodal output version."""
     request_id = request.external_req_id
     code_predictor_codes = None
     frame_valid = None
@@ -970,7 +1010,7 @@ def talker2code2wav_full_payload(
         )
         return None
 
-    output_token_ids = _ensure_list(getattr(request, "output_token_ids", []) or [])
+    output_token_ids = _common.ensure_list_unchanged(getattr(request, "output_token_ids", []) or [])
     raw_shape = tuple(code_predictor_codes.shape)
     code_predictor_codes, codec_stats = _extract_qwen3_full_payload_codec_rows(
         code_predictor_codes.to(torch.long),
