@@ -300,6 +300,60 @@ def test_cfg_parallel_keeps_diffusion_dp_without_ep(monkeypatch):
 
 @pytest.mark.cpu
 @pytest.mark.core_model
+def test_hsdp_request_dp_is_separate_from_vllm_model_layout_dp(monkeypatch):
+    """HSDP request ranks must not make vLLM partition model parameters."""
+    local_rank = 0
+    world_size = 4
+
+    def fake_init_model_parallel_group(
+        group_ranks,
+        local_rank,
+        backend,
+        parallel_mode=None,
+        group_name=None,
+        **kwargs,
+    ):
+        del backend, group_name
+        return _FakeGroup(
+            [list(ranks) for ranks in group_ranks],
+            local_rank,
+            parallel_mode or "",
+            **kwargs,
+        )
+
+    fake_world_group = SimpleNamespace(
+        rank_in_group=local_rank,
+        local_rank=local_rank,
+        device_group=object(),
+    )
+    monkeypatch.setattr(parallel_state.torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(parallel_state.torch.distributed, "get_world_size", lambda: world_size)
+    monkeypatch.setattr(parallel_state.torch.distributed, "get_backend", lambda *_args, **_kwargs: "gloo")
+    monkeypatch.setattr(parallel_state.torch.distributed, "new_group", lambda ranks: tuple(ranks))
+    monkeypatch.setattr(parallel_state, "get_world_group", lambda: fake_world_group)
+    monkeypatch.setattr(parallel_state, "init_model_parallel_group", fake_init_model_parallel_group)
+
+    for name in ("_DP", "_CFG", "_SP", "_PP", "_EXPERT_PARALLEL_GROUP_RANKS"):
+        monkeypatch.setattr(parallel_state, name, None)
+    for name in ("_TP", "_PCP", "_DP", "_EP", "_PP"):
+        monkeypatch.setattr(parallel_state.vllm_parallel_state, name, None, raising=False)
+
+    parallel_state.initialize_model_parallel(
+        data_parallel_size=world_size,
+        use_hsdp=True,
+        hsdp_data_parallel=True,
+        backend="gloo",
+    )
+
+    assert parallel_state._DP.world_size == world_size
+    assert parallel_state._DP.local_group == list(range(world_size))
+    assert parallel_state.vllm_parallel_state._DP is not parallel_state._DP
+    assert parallel_state.vllm_parallel_state._DP.world_size == 1
+    assert parallel_state.vllm_parallel_state._DP.local_group == [local_rank]
+
+
+@pytest.mark.cpu
+@pytest.mark.core_model
 def test_destroy_model_parallel_clears_vllm_pipeline_group(monkeypatch):
     """A destroyed diffusion PP group must not block the next initialization."""
 

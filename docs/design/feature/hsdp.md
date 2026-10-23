@@ -29,6 +29,10 @@ This enables inference of large models (e.g., Wan2.2 14B) on GPUs with limited m
 - HSDP cannot be used with Tensor Parallelism
 - For standalone HSDP (no other parallelism), `hsdp_shard_size` must be specified explicitly
 
+**Request concurrency (optional):** with `--hsdp-data-parallel`, each HSDP rank runs a
+different compatible request while weights stay sharded. This requires TP, SP, PP and CFG
+parallel sizes of 1. See [HSDP request concurrency](../../configuration/hsdp_request_concurrency.md).
+
 ### Architecture
 
 HSDP implementation relies on:
