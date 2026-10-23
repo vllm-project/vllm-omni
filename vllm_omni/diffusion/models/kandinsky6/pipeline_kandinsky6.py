@@ -38,7 +38,8 @@ from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
-from vllm_omni.diffusion.models.interface import SupportAudioOutput, SupportImageInput, SupportsComponentDiscovery
+from vllm_omni.diffusion.models.base import DiffusionPipelineBase
+from vllm_omni.diffusion.models.interface import SupportAudioOutput, SupportImageInput
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.models.utils import _load_json
 from vllm_omni.diffusion.offloader.config import offload_enabled
@@ -925,11 +926,10 @@ def get_kandinsky6_pre_process_func(od_config: OmniDiffusionConfig):
 
 
 class Kandinsky6TI2VAPipeline(
-    nn.Module,
+    DiffusionPipelineBase,
     CFGParallelMixin,
     ProgressBarMixin,
     DiffusionPipelineProfilerMixin,
-    SupportsComponentDiscovery,
     SupportAudioOutput,
     SupportImageInput,
 ):

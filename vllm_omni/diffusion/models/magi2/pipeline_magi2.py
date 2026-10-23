@@ -37,10 +37,10 @@ from PIL import Image
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+from vllm_omni.diffusion.models.base import DiffusionPipelineBase
 from vllm_omni.diffusion.models.interface import (
     SupportAudioOutput,
     SupportImageInput,
-    SupportsComponentDiscovery,
 )
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.offloader import OffloadPlan, PinnedModuleStager
@@ -493,9 +493,8 @@ class _Magi2StagedComponent(nn.Module):
 
 
 class Magi2Pipeline(
-    nn.Module,
+    DiffusionPipelineBase,
     ProgressBarMixin,
-    SupportsComponentDiscovery,
     DiffusionPipelineProfilerMixin,
     SupportImageInput,
     SupportAudioOutput,
@@ -507,6 +506,7 @@ class Magi2Pipeline(
     than one pipeline must isolate them in separate worker processes.
     """
 
+    default_num_inference_steps = 100
     support_image_input: ClassVar[bool] = True
     support_audio_output: ClassVar[bool] = True
     audio_sample_rate: ClassVar[int] = MAGI2_AUDIO_SAMPLE_RATE

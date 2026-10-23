@@ -23,7 +23,6 @@ import numpy as np
 import torch
 import torchaudio
 from safetensors import safe_open
-from torch import nn
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.compile import regionally_compile
@@ -39,10 +38,10 @@ from vllm_omni.diffusion.models.auk.auk_vae import AuKVAE
 from vllm_omni.diffusion.models.auk.cudagraph_wrapper import AuKCUDAGraphWrapper
 from vllm_omni.diffusion.models.auk.fp8_linear import fp8_supported, quantize_block_linears
 from vllm_omni.diffusion.models.auk.vae_cudagraph import AuKVAEDecodeGraph
+from vllm_omni.diffusion.models.base import DiffusionPipelineBase
 from vllm_omni.diffusion.models.interface import (
     SupportAudioInput,
     SupportAudioOutput,
-    SupportsComponentDiscovery,
 )
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.model_extras.auk import resolve_gen_frames
@@ -161,7 +160,7 @@ def _split_audio(audio: Any, default_sample_rate: int) -> tuple[Any, int]:
     return audio, default_sample_rate
 
 
-class AuKPipeline(nn.Module, SupportAudioInput, SupportAudioOutput, SupportsComponentDiscovery):
+class AuKPipeline(DiffusionPipelineBase, SupportAudioInput, SupportAudioOutput):
     """Instruction-driven audio generation and editing with AuK.
 
     One request per forward: the rectified-flow ODE runs over the whole target
@@ -177,6 +176,7 @@ class AuKPipeline(nn.Module, SupportAudioInput, SupportAudioOutput, SupportsComp
     """
 
     supports_request_batch = False
+    default_num_inference_steps = 32
 
     # Picked up by ``supports_audio_output`` in the diffusion engine so the
     # default stage metadata reports ``final_output_type="audio"`` and the

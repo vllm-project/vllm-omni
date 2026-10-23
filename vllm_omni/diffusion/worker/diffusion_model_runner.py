@@ -716,7 +716,11 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         if num_inference_steps is None and first_req.sampling_params.sigmas is not None:
             num_inference_steps = len(first_req.sampling_params.sigmas)
         if num_inference_steps is None:
-            num_inference_steps = getattr(self.pipeline, "default_num_inference_steps", None)
+            resolver = getattr(self.pipeline, "resolve_default_num_inference_steps", None)
+            if resolver is not None:
+                num_inference_steps = resolver()
+            else:
+                num_inference_steps = getattr(self.pipeline, "default_num_inference_steps", None)
         if num_inference_steps is None and od_config.cache_backend in (
             "tea_cache",
             "sea_cache",

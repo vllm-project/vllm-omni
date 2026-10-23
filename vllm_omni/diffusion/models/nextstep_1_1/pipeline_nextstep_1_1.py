@@ -13,7 +13,6 @@ import torch.nn.functional as F
 import torchvision.transforms as transforms
 from diffusers.image_processor import VaeImageProcessor
 from PIL import Image
-from torch import nn
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer, PreTrainedTokenizer
 from transformers.cache_utils import StaticCache
@@ -28,7 +27,7 @@ from vllm_omni.diffusion.distributed.parallel_state import (
 )
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
-from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
+from vllm_omni.diffusion.models.base import DiffusionPipelineBase
 from vllm_omni.diffusion.models.nextstep_1_1.modeling_flux_vae import AutoencoderKL
 from vllm_omni.diffusion.models.nextstep_1_1.modeling_nextstep import (
     NextStepConfig,
@@ -132,7 +131,7 @@ def get_nextstep11_post_process_func(od_config: OmniDiffusionConfig):
     return post_process_func
 
 
-class NextStep11Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelineProfilerMixin):
+class NextStep11Pipeline(DiffusionPipelineBase, DiffusionPipelineProfilerMixin):
     """
     NextStep-1.1 Pipeline for text-to-image generation.
 
@@ -141,6 +140,7 @@ class NextStep11Pipeline(nn.Module, SupportsComponentDiscovery, DiffusionPipelin
     to generate images autoregressively.
     """
 
+    default_num_inference_steps = 28
     _dit_modules: ClassVar[list[str]] = ["model"]
     _encoder_modules: ClassVar[list[str]] = []
     _vae_modules: ClassVar[list[str]] = ["vae"]

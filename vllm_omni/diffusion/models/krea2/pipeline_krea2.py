@@ -28,7 +28,6 @@ from diffusers.schedulers.scheduling_flow_match_euler_discrete import (
     FlowMatchEulerDiscreteScheduler,
 )
 from diffusers.utils.torch_utils import randn_tensor
-from torch import nn
 from transformers import AutoTokenizer, Qwen3VLModel
 from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm.transformers_utils.config import get_hf_file_to_dict
@@ -38,7 +37,7 @@ from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_qwenimage impor
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
-from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
+from vllm_omni.diffusion.models.base import DiffusionPipelineBase
 from vllm_omni.diffusion.models.krea2.krea2_transformer import Krea2Transformer2DModel
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
@@ -125,7 +124,7 @@ def retrieve_timesteps(
     return timesteps, num_inference_steps
 
 
-class Krea2Pipeline(nn.Module, DiffusionPipelineProfilerMixin, ProgressBarMixin, SupportsComponentDiscovery):
+class Krea2Pipeline(DiffusionPipelineBase, DiffusionPipelineProfilerMixin, ProgressBarMixin):
     """The Krea 2 text-to-image pipeline (vLLM-Omni port of ``diffusers.Krea2Pipeline``).
 
     Components:
@@ -137,6 +136,7 @@ class Krea2Pipeline(nn.Module, DiffusionPipelineProfilerMixin, ProgressBarMixin,
     - ``transformer``: the Krea 2 single-stream MMDiT that predicts the flow-matching velocity.
     """
 
+    default_num_inference_steps = 50
     _dit_modules: ClassVar[list[str]] = ["transformer"]
     _encoder_modules: ClassVar[list[str]] = ["text_encoder"]
     _vae_modules: ClassVar[list[str]] = ["vae"]

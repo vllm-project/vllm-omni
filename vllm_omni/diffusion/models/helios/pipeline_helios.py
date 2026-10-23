@@ -16,7 +16,6 @@ import torch
 import torch.nn.functional as F
 from diffusers import AutoencoderKLWan
 from diffusers.utils.torch_utils import randn_tensor
-from torch import nn
 from transformers import AutoConfig, AutoTokenizer, UMT5EncoderModel
 from typing_extensions import override
 from vllm.model_executor.models.utils import AutoWeightsLoader
@@ -27,13 +26,13 @@ from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.interaction.mixin import InteractionMixin
 from vllm_omni.diffusion.interaction.types import ChunkMediaSpec
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+from vllm_omni.diffusion.models.base import DiffusionPipelineBase
 from vllm_omni.diffusion.models.helios.conditioning_cache import (
     HeliosConditioningCache,
     request_conditioning_cache,
 )
 from vllm_omni.diffusion.models.helios.helios_transformer import HeliosTransformer3DModel
 from vllm_omni.diffusion.models.helios.scheduling_helios import HeliosScheduler
-from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -162,12 +161,11 @@ def get_helios_pre_process_func(
 
 
 class HeliosPipeline(
-    nn.Module,
+    DiffusionPipelineBase,
     CFGParallelMixin,
     ProgressBarMixin,
     DiffusionPipelineProfilerMixin,
     InteractionMixin,
-    SupportsComponentDiscovery,
 ):
     """Helios text-to-video / image-to-video / video-to-video pipeline for vllm-omni.
 
@@ -176,6 +174,7 @@ class HeliosPipeline(
     """
 
     supports_step_execution: ClassVar[bool] = True
+    default_num_inference_steps = 50
     _dit_modules: ClassVar[list[str]] = ["transformer"]
     _encoder_modules: ClassVar[list[str]] = ["text_encoder"]
     _vae_modules: ClassVar[list[str]] = ["vae"]

@@ -35,10 +35,8 @@ from vllm_omni.diffusion.model_loader.hub_prefetch import (
     from_pretrained_with_prefetch,
     prefetch_subfolders,
 )
-from vllm_omni.diffusion.models.interface import (
-    SupportImageInput,
-    SupportsComponentDiscovery,
-)
+from vllm_omni.diffusion.models.base import DiffusionPipelineBase
+from vllm_omni.diffusion.models.interface import SupportImageInput
 from vllm_omni.diffusion.models.joy_image.cfg_parallel import (
     JoyImageEditCFGParallelMixin,
 )
@@ -376,12 +374,12 @@ def retrieve_timesteps(
 
 
 class JoyImageEditPipeline(
-    nn.Module,
+    DiffusionPipelineBase,
     SupportImageInput,
     JoyImageEditCFGParallelMixin,
     DiffusionPipelineProfilerMixin,
-    SupportsComponentDiscovery,
 ):
+    default_num_inference_steps = 50
     _dit_modules = ["transformer"]
     # Joy's VAE is large enough that model-level CPU offload must treat it as
     # mutually exclusive with the DiT, instead of pinning it on GPU.

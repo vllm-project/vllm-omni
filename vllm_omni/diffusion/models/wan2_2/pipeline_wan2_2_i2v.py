@@ -27,8 +27,9 @@ from vllm_omni.diffusion.forward_context import DenoiseProgressMixin
 from vllm_omni.diffusion.lora.loader import WanLoraLoaderMixin
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
+from vllm_omni.diffusion.models.base import DiffusionPipelineBase
 from vllm_omni.diffusion.models.dmd2 import DMD2PipelineMixin
-from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComponentDiscovery
+from vllm_omni.diffusion.models.interface import SupportImageInput
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin, _is_rank_zero
 from vllm_omni.diffusion.models.utils import _load_json
 from vllm_omni.diffusion.models.wan2_2.chunked_mp4 import (
@@ -185,14 +186,13 @@ def get_wan22_i2v_pre_process_func(
 
 
 class Wan22I2VPipeline(
-    nn.Module,
+    DiffusionPipelineBase,
     SupportImageInput,
     PipelineParallelMixin,
     CFGParallelMixin,
     ProgressBarMixin,
     DiffusionPipelineProfilerMixin,
     DenoiseProgressMixin,
-    SupportsComponentDiscovery,
     WanLoraLoaderMixin,
 ):
     """
@@ -202,6 +202,7 @@ class Wan22I2VPipeline(
     Wan2.2-style I2V (with expand_timesteps for TI2V-5B).
     """
 
+    default_num_inference_steps = 40
     supports_request_batch = True
     _dit_modules: ClassVar[list[str]] = ["transformer", "transformer_2"]
     _encoder_modules: ClassVar[list[str]] = ["text_encoder", "image_encoder"]

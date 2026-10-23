@@ -20,7 +20,6 @@ from diffusers.models.embeddings import get_1d_rotary_pos_embed
 from diffusers.pipelines.stable_audio.modeling_stable_audio import StableAudioProjectionModel
 from diffusers.schedulers import CosineDPMSolverMultistepScheduler
 from diffusers.utils.torch_utils import randn_tensor
-from torch import nn
 from transformers import T5EncoderModel, T5TokenizerFast
 from vllm.logger import init_logger
 from vllm.model_executor.models.utils import AutoWeightsLoader
@@ -29,7 +28,8 @@ from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
-from vllm_omni.diffusion.models.interface import SupportAudioOutput, SupportsComponentDiscovery
+from vllm_omni.diffusion.models.base import DiffusionPipelineBase
+from vllm_omni.diffusion.models.interface import SupportAudioOutput
 from vllm_omni.diffusion.models.stable_audio.stable_audio_transformer import (
     StableAudioDiTModel,
     StableAudioSchedulerWrapper,
@@ -65,7 +65,7 @@ def get_stable_audio_post_process_func(
     return post_process_func
 
 
-class StableAudioPipeline(nn.Module, SupportAudioOutput, SupportsComponentDiscovery, DiffusionPipelineProfilerMixin):
+class StableAudioPipeline(DiffusionPipelineBase, SupportAudioOutput, DiffusionPipelineProfilerMixin):
     """
     Pipeline for text-to-audio generation using Stable Audio Open.
 
@@ -78,6 +78,7 @@ class StableAudioPipeline(nn.Module, SupportAudioOutput, SupportsComponentDiscov
     """
 
     supports_request_batch = False
+    default_num_inference_steps = 50
 
     # Picked up by ``supports_audio_output`` in the diffusion engine so the
     # default stage metadata reports ``final_output_type="audio"`` and the

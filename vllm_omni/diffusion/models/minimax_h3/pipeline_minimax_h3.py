@@ -38,11 +38,11 @@ from vllm_omni.diffusion.forward_context import DenoiseProgressMixin
 from vllm_omni.diffusion.model_loader.diffusers_loader import (
     DiffusersPipelineLoader,
 )
+from vllm_omni.diffusion.models.base import DiffusionPipelineBase
 from vllm_omni.diffusion.models.interface import (
     SupportAudioInput,
     SupportAudioOutput,
     SupportImageInput,
-    SupportsComponentDiscovery,
 )
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.offloader import (
@@ -636,17 +636,17 @@ class _SingleRankEncoderGroup:
 
 
 class MiniMaxH3Pipeline(
-    nn.Module,
+    DiffusionPipelineBase,
     DenoiseProgressMixin,
     ProgressBarMixin,
     DiffusionPipelineProfilerMixin,
     SupportImageInput,
     SupportAudioInput,
     SupportAudioOutput,
-    SupportsComponentDiscovery,
 ):
     """CFG-distilled joint video/audio generation for MiniMax H3."""
 
+    default_num_inference_steps = 50
     supports_step_execution: ClassVar[bool] = True
     # DiT implementation constructed for the primary ``transformer``.
     # ``None`` means this module's ``MiniMaxH3DiTModel`` (resolved at call time);

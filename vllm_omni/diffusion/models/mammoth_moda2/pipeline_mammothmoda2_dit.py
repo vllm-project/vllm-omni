@@ -25,7 +25,7 @@ from vllm_omni.diffusion.data import DiffusionCacheConfig, DiffusionOutput, Omni
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.layers.norm import RMSNorm
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
-from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
+from vllm_omni.diffusion.models.base import DiffusionPipelineBase
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.input_batch import InputBatch
@@ -340,7 +340,7 @@ class _RequestConditioning:
     image_mask: torch.Tensor
 
 
-class MammothModa2DiTPipeline(nn.Module, DiffusionPipelineProfilerMixin, SupportsComponentDiscovery):
+class MammothModa2DiTPipeline(DiffusionPipelineBase, DiffusionPipelineProfilerMixin):
     """
     MammothModa2 DiT + VAE generation stage (non-autoregressive).
 
@@ -349,6 +349,7 @@ class MammothModa2DiTPipeline(nn.Module, DiffusionPipelineProfilerMixin, Support
 
     """
 
+    default_num_inference_steps = 50
     _dit_modules: ClassVar[list[str]] = ["gen_transformer"]
     _encoder_modules: ClassVar[list[str]] = ["gen_image_condition_refiner"]
     _vae_modules: ClassVar[list[str]] = ["gen_vae"]

@@ -26,7 +26,8 @@ from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
-from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComponentDiscovery
+from vllm_omni.diffusion.models.base import DiffusionPipelineBase
+from vllm_omni.diffusion.models.interface import SupportImageInput
 from vllm_omni.diffusion.models.ltx2.ltx2_latents import (
     denormalize_latents,
     normalize_latents,
@@ -257,15 +258,15 @@ def get_sana_wm_pre_process_func(od_config: OmniDiffusionConfig):
 
 
 class SanaWmPipeline(
-    nn.Module,
+    DiffusionPipelineBase,
     CFGParallelMixin,
     SupportImageInput,
-    SupportsComponentDiscovery,
     ProgressBarMixin,
     DiffusionPipelineProfilerMixin,
 ):
     """Stage-1 SANA-WM image-to-video pipeline."""
 
+    default_num_inference_steps = 60
     support_image_input: ClassVar[bool] = True
     color_format: ClassVar[str] = "RGB"
     # Skip the startup warmup: the generic dummy request carries a blank image

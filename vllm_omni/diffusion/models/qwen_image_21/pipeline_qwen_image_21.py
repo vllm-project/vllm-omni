@@ -20,7 +20,6 @@ from diffusers.schedulers.scheduling_flow_match_euler_discrete import (
     FlowMatchEulerDiscreteScheduler,
 )
 from diffusers.utils.torch_utils import randn_tensor
-from torch import nn
 from transformers import AutoConfig, AutoModelForImageTextToText, Qwen3VLForConditionalGeneration, Qwen3VLProcessor
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
@@ -33,7 +32,7 @@ from vllm_omni.diffusion.lora.loader import QwenImageLoraLoaderMixin
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
 from vllm_omni.diffusion.model_metadata import QWEN_IMAGE_21_MAX_INPUT_IMAGES
-from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
+from vllm_omni.diffusion.models.base import DiffusionPipelineBase
 from vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image import (
     calculate_shift,
     retrieve_timesteps,
@@ -295,10 +294,9 @@ def get_qwen_image_21_post_process_func(
 
 
 class QwenImage21Pipeline(
-    nn.Module,
+    DiffusionPipelineBase,
     QwenImage21CFGParallelMixin,
     DiffusionPipelineProfilerMixin,
-    SupportsComponentDiscovery,
     QwenImageLoraLoaderMixin,
 ):
     """Text-to-image and image-conditioned generation with Qwen-Image 2.1.
