@@ -454,22 +454,23 @@ def test_load_weights_does_not_sweep(tmp_path, monkeypatch, device_platform):
     assert model._precapture_pending is True
 
 
-@pytest.mark.parametrize(("platform", "expected"), [("npu", True), ("cuda", False)])
-def test_startup_sweep_default_follows_the_platform(tmp_path, monkeypatch, platform, expected):
-    """Ascend has no warmup forward of its own; CUDA V1 warms up before serving."""
+@pytest.mark.parametrize("platform", ["npu", "cuda"])
+def test_startup_sweep_is_on_by_default(tmp_path, monkeypatch, platform):
+    """The sweep matches main's default: on, only moved to the warmup hook."""
     _force_platform(monkeypatch, platform)
     model, calls = _model_with_sweep(tmp_path, monkeypatch, {})
     model.capture_auxiliary_graphs()
-    assert (calls == [1]) is expected
+    assert calls == [1]
 
 
 @pytest.mark.parametrize("platform", ["npu", "cuda"])
-def test_startup_sweep_can_be_forced_anywhere(tmp_path, monkeypatch, platform):
-    """The explicit flag overrides the platform default in both directions."""
+def test_startup_sweep_can_be_disabled_explicitly(tmp_path, monkeypatch, platform):
+    """An overlay can still turn the startup sweep off."""
     _force_platform(monkeypatch, platform)
-    model, calls = _model_with_sweep(tmp_path, monkeypatch, {"cfm_graph_precapture_at_init": "true"})
+    model, calls = _model_with_sweep(tmp_path, monkeypatch, {"cfm_graph_precapture_at_init": "false"})
     model.capture_auxiliary_graphs()
-    assert calls == [1]
+    assert calls == []
+    assert model._precapture_pending is True
 
 
 def test_startup_sweep_matches_the_forward_context(tmp_path, monkeypatch, device_platform):

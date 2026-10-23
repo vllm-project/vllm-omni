@@ -1698,10 +1698,10 @@ class MiniCPMO45Code2Wav(nn.Module):
         reserved footprint by ~4 GiB on CUDA (measured), which is enough to OOM
         at concurrency 8.
 
-        The sweep is platform-gated by ``cfm_graph_precapture_at_init``: on by
-        default on Ascend, off on CUDA, where the V1 runner already warms the
-        model up before it serves and the same ~4 GiB of graph memory would be
-        captured ahead of that warmup.
+        ``cfm_graph_precapture_at_init`` can turn it off. It stays on by default
+        because this is where CUDA V1 already swept: the runner's own warmup has
+        run by now, so the capture reuses the allocator it warmed instead of
+        raising the reserved footprint the way a weight-load-time sweep does.
         """
         if self._extra_config().get("cfm_graph_precapture_after_load") is not None:
             logger.warning_once(
@@ -1713,13 +1713,13 @@ class MiniCPMO45Code2Wav(nn.Module):
         self._precapture_before_serve()
 
     def _startup_sweep_enabled(self) -> bool:
-        """Resolve ``cfm_graph_precapture_at_init``, defaulting per platform."""
-        extra = self._extra_config()
-        if extra.get("cfm_graph_precapture_at_init") is not None:
-            return read_bool_flag(extra, "cfm_graph_precapture_at_init", False)
-        from vllm_omni.platforms import current_omni_platform
+        """Resolve ``cfm_graph_precapture_at_init``, on unless disabled.
 
-        return current_omni_platform.is_npu()
+        The deferred sweep used to wait for a forward that stage 2 never runs, so
+        runners without a warmup forward (Model Runner V2, Ascend) paid for the
+        capture on their first real request. Only an explicit ``false`` opts out.
+        """
+        return read_bool_flag(self._extra_config(), "cfm_graph_precapture_at_init", True)
 
     def _precapture_before_serve(self) -> None:
         """Run the precapture sweep once, under the context ``forward`` uses.
