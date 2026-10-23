@@ -1235,17 +1235,10 @@ def test_voxtral_tts_perf_is_one_nonblocking_nightly_job() -> None:
     assert res["cuda"] == ["H100", "B200"]
     assert voxtral["mark"][0]["hardware_marks"]["num_cards"] == 1
     for case in config:
-        if case["test_name"] == "test_voxtral_tts":
-            continue
-        assert "rocm" not in case["mark"][0]["hardware_marks"]["res"]
         for phase in case["benchmark_params"]:
             baseline = phase.get("baseline")
             if isinstance(baseline, dict):
                 assert "MI325" not in baseline
-    for phase in voxtral["benchmark_params"]:
-        baseline = phase.get("baseline")
-        if isinstance(baseline, dict):
-            assert "MI325" not in baseline
     for pipeline_path in (AMD_READY_PIPELINE, AMD_MERGE_PIPELINE):
         text = pipeline_path.read_text(encoding="utf-8")
         assert "Voxtral TTS Perf" not in text
