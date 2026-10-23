@@ -40,6 +40,7 @@ from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.cache.cachedit import CacheDiTAdapterConfig, SensenovaCachedAdapter
 from vllm_omni.diffusion.layers.fused_moe import FusedMoE
+from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
 
@@ -125,6 +126,38 @@ def rotate_half(x):
 
 
 def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
+    # Reuse the NPU helper's BNSD/BSND tiling selection. In particular, short
+    # sequences and the h/w quarters must not be sent to an unsupported BNSD
+    # tiler. Other shapes and dtypes keep the portable expression below.
+    if (
+        q.device.type == "npu"
+        and k.device == q.device == cos.device == sin.device
+        and q.dtype == k.dtype == cos.dtype == sin.dtype
+        and q.dtype in (torch.float16, torch.bfloat16, torch.float32)
+        and unsqueeze_dim == 1
+        and q.ndim == k.ndim == 4
+        and cos.ndim == sin.ndim == 3
+        and cos.shape == sin.shape
+        and q.shape[0] == k.shape[0]
+        and q.shape[2:] == k.shape[2:]
+        and cos.shape[0] in (1, q.shape[0])
+        and cos.shape[1:] == q.shape[2:]
+        and 0 < q.shape[-1] < 896
+        and q.shape[-1] % 2 == 0
+        and 0 < q.shape[0] < 1000
+        and 0 < q.shape[1] < 1000
+        and 0 < k.shape[1] < 1000
+        and q.shape[2] > 0
+    ):
+        import torch_npu
+
+        if torch_npu.npu.is_jit_compile_false():
+            from vllm_omni.platforms.npu.layers.rotary_embedding import npu_rotary_mul_with_bsnd_fallback
+
+            return (
+                npu_rotary_mul_with_bsnd_fallback(q, cos, sin, unsqueeze_dim),
+                npu_rotary_mul_with_bsnd_fallback(k, cos, sin, unsqueeze_dim),
+            )
     cos = cos.unsqueeze(unsqueeze_dim)
     sin = sin.unsqueeze(unsqueeze_dim)
     return (q * cos) + (rotate_half(q) * sin), (k * cos) + (rotate_half(k) * sin)
@@ -194,6 +227,18 @@ class Qwen3RMSNorm(nn.Module):
         self.variance_epsilon = eps
 
     def forward(self, hidden_states):
+        if (
+            hidden_states.device.type == "npu"
+            and 2 <= hidden_states.ndim <= 8
+            and hidden_states.dtype in (torch.float16, torch.bfloat16, torch.float32)
+            and self.weight.device == hidden_states.device
+            and self.weight.dtype == hidden_states.dtype
+            and hidden_states.shape[-1:] == self.weight.shape
+            and hidden_states.numel() > 0
+        ):
+            import torch_npu
+
+            return torch_npu.npu_rms_norm(hidden_states, self.weight, epsilon=self.variance_epsilon)[0]
         # F.rms_norm keeps the fp32 accumulation internal and rounds once; the
         # cast chain it replaces rounded to bf16 before the weight multiply.
         return F.rms_norm(hidden_states, self.weight.shape, self.weight, self.variance_epsilon)
@@ -420,8 +465,12 @@ class SenseNovaU1Attention(nn.Module):
             # from that check, so it never fires.
             num_kv_heads=self.num_kv_heads,
             prefix=f"{prefix}.attn",
+            qkv_layout="BSND",
         )
-        self.attn.attention = self.attn.sdpa_fallback
+        # Retain the established CPU/CUDA numerics, while letting the shared
+        # dispatcher select NPU attention (including compressed GQA K/V).
+        if not current_omni_platform.is_npu():
+            self.attn.attention = self.attn.sdpa_fallback
 
     @staticmethod
     def _align_mask_dtype(mask: torch.Tensor | None, query: torch.Tensor) -> torch.Tensor | None:
@@ -474,10 +523,22 @@ class SenseNovaU1Attention(nn.Module):
         (cos_t, sin_t), (cos_h, sin_h), (cos_w, sin_w) = position_embeddings
 
         value_states = v.transpose(1, 2)  # [B, H, S, D]
-        try:
-            from .fused_rmsnorm_rope import triton_qk_norm_rope
-        except ImportError:
-            triton_qk_norm_rope = None
+        triton_qk_norm_rope = None
+        # This Triton kernel uses power-of-two reductions and does not broadcast
+        # the batch axis of the position tables. Do not even import it on NPU
+        # or CPU: an installed Triton package does not imply CUDA execution.
+        if (
+            q.is_cuda
+            and q.dtype in (torch.float16, torch.bfloat16, torch.float32)
+            and self.head_dim >= 8
+            and self.head_dim & (self.head_dim - 1) == 0
+            and q.numel() > 0
+            and all(cos.shape[0] == q.shape[0] and cos.stride() == sin.stride() for cos, sin in position_embeddings)
+        ):
+            try:
+                from .fused_rmsnorm_rope import triton_qk_norm_rope
+            except ImportError:
+                pass
         if triton_qk_norm_rope is not None:
             query_states, key_states = triton_qk_norm_rope(
                 q,
@@ -495,8 +556,6 @@ class SenseNovaU1Attention(nn.Module):
                 self.config.rms_norm_eps,
             )
             return query_states, key_states, value_states
-        logger.debug("Triton fused SenseNova qk norm rope unavailable; using PyTorch fallback")
-
         # Split head_dim into t and hw halves
         q_t, q_hw = q.chunk(2, dim=-1)
         k_t, k_hw = k.chunk(2, dim=-1)
