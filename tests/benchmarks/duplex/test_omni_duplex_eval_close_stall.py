@@ -102,6 +102,20 @@ class _StalledSessionClient(_StalledCloseClient):
         return None
 
 
+class _SuppressingAckSessionClient(_StalledSessionClient):
+    """The playback ack swallows its first cancellation and never unwinds."""
+
+    async def acknowledge_playback(self) -> None:
+        self.acks += 1
+        never = asyncio.Event().wait()
+        try:
+            await never
+        except asyncio.CancelledError:
+            # A stuck write does not unwind on cancellation: the coroutine it
+            # waits on keeps running while the task awaiting it is cancelled.
+            await asyncio.shield(asyncio.Event().wait())
+
+
 def _sample() -> DuplexSample:
     return DuplexSample(
         id="s1",
@@ -196,3 +210,58 @@ async def test_clean_close_leaves_the_transport_alone(monkeypatch) -> None:
     assert client.close_calls == 1
     assert client._ws.transport.aborted is False
     assert client._ws.close_calls == 0
+
+
+async def test_sample_survives_an_ack_that_swallows_cancellation(monkeypatch, tmp_path) -> None:
+    """A periodic ack that ignores cancellation costs time, not the sample."""
+    # Keep the default server-turn settle (2s > the 250ms ack period) so the
+    # periodic ack is parked inside acknowledge_playback before cleanup.
+    monkeypatch.setattr(runner, "_FINAL_CLOSE_TIMEOUT_S", _CLOSE_TIMEOUT_S)
+    monkeypatch.setattr(runner, "_FORCE_CLOSE_GRACE_S", _GRACE_S)
+    monkeypatch.setattr(runner, "_FINAL_ACK_TIMEOUT_S", _CLOSE_TIMEOUT_S)
+    created: list[_SuppressingAckSessionClient] = []
+
+    def client_factory(*args, **kwargs):
+        client = _SuppressingAckSessionClient(*args, **kwargs)
+        created.append(client)
+        return client
+
+    monkeypatch.setattr(runner, "RealtimeDuplexClient", client_factory)
+    prepared = PreparedSample(pcm=b"", frames=(), duration=1.0, ref_audio=None, ref_audio_sha256=None)
+    started = time.monotonic()
+
+    result = await asyncio.wait_for(
+        runner.generate_sample(
+            _sample(),
+            url="ws://localhost:8000/v1/realtime",
+            model="test-model",
+            ref_audio=None,
+            output_root=tmp_path,
+            turn_detection=TURN_DETECTION_SERVER_VAD,
+            prepared=prepared,
+        ),
+        timeout=_BUDGET_S,
+    )
+
+    elapsed = time.monotonic() - started
+    client = created[0]
+    assert client.acks >= 1
+    # Bounded by deadline + grace, not by the socket the ack parked on.
+    assert elapsed < _BUDGET_S
+    # The bounded final ack timed out on the same stuck write (asyncio's own
+    # TimeoutError carries no message, so recordability is all there is to see).
+    assert result.metadata["ack_timeout"] is not None
+    assert result.metadata["response_done"] is True
+    assert result.output.exists()
+    assert result.output.with_name("s1.meta.json").exists()
+    # The mocked write answers each cancellation but the last by waiting again,
+    # while a closing loop cancels every remaining task once: hand the tasks
+    # still parked on it one more cancellation, so the suite does not then wait
+    # for an unwind that only a further cancellation would produce.
+    for _unwind in range(2):
+        parked = [task for task in asyncio.all_tasks() if task is not asyncio.current_task()]
+        if not parked:
+            break
+        for task in parked:
+            task.cancel()
+        await asyncio.wait(parked, timeout=_GRACE_S)

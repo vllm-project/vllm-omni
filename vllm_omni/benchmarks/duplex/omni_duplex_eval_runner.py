@@ -519,6 +519,21 @@ async def _discard_close_attempt(task: asyncio.Task, client: RealtimeDuplexClien
     await _force_close_transport(client)
 
 
+async def _bounded_ack_join(task: asyncio.Task) -> None:
+    """Join a cancelled periodic playback ack without waiting on it forever.
+
+    A stuck playback-ack write can swallow its first cancellation, and the
+    ``await ack_task`` cleanup would then park the sample on the same socket
+    the close path already learned to abandon.
+    """
+    _, pending = await asyncio.wait({task}, timeout=_FORCE_CLOSE_GRACE_S)
+    if pending:
+        task.add_done_callback(_consume_task_exception)
+        logger.warning("DuplexEval: the periodic playback ack ignored cancellation")
+    elif not task.cancelled() and task.exception() is not None:
+        raise task.exception()
+
+
 async def _close_duplex_session(client: RealtimeDuplexClient, *, timeout_s: float = _FINAL_CLOSE_TIMEOUT_S) -> None:
     """Close the session within one deadline, the closing write included.
 
@@ -728,17 +743,21 @@ async def generate_sample(
         finally:
             ack_task.cancel()
             try:
-                await ack_task
+                await _bounded_ack_join(ack_task)
             except asyncio.CancelledError:
                 pass
         try:
-            await asyncio.wait_for(client.acknowledge_playback(), timeout=_FINAL_ACK_TIMEOUT_S)
+            ack_probe = asyncio.ensure_future(client.acknowledge_playback())
+            ack_probe.add_done_callback(_consume_task_exception)
+            await asyncio.wait_for(asyncio.shield(ack_probe), timeout=_FINAL_ACK_TIMEOUT_S)
         except TimeoutError as exc:
             # The ack only checkpoints how much audio was played, and it is sent
             # over the same socket the session already used: a stuck write must
             # not cost the sample its artifacts (an unbounded wait here left the
             # sample with no files at all, which the accuracy pass then counted
-            # as skipped rather than as a diagnosable failure).
+            # as skipped rather than as a diagnosable failure). A write that
+            # ignores its cancellation cannot hold this deadline either, so the
+            # probe is shielded and abandoned detached instead of being waited on.
             ack_timeout = str(exc)
             logger.warning("DuplexEval: playback ack not delivered for sample %s: %s", sample.id, exc)
         try:
