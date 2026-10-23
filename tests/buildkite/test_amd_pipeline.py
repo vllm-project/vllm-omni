@@ -1197,3 +1197,30 @@ def test_minimax_h3_accuracy_has_two_nonblocking_nightly_jobs() -> None:
         text = pipeline_path.read_text(encoding="utf-8")
         assert "MiniMax-H3 Timeline Guide Accuracy" not in text
         assert "MiniMax-H3 I2VA Ref2VA Accuracy" not in text
+
+
+def test_minicpmo_accuracy_is_one_nonblocking_nightly_job() -> None:
+    step = _find_step("MiniCPM-o 4.5 Accuracy", AMD_NIGHTLY_PIPELINE)
+    assert step["grade"] == "NonBlocking"
+    assert step["agent_pool"] == "mi300_1"
+    assert step["mirror_hardwares"] == ["amdproduction"]
+    assert step["timeout_in_minutes"] == 180
+    commands = "\n".join(step["commands"])
+    assert "full_model and omni and rocm and MI325 and cards_1" in commands
+    assert "--run-level full_model" in commands
+    assert "--collect-only" in commands
+    assert "exit 5" in commands
+    assert "pytest.xml" in commands
+    assert step["env"]["SEED_TTS_WER_EVAL"] == "1"
+    assert step["env"]["SEED_TTS_SIM_EVAL"] == "1"
+    assert "SEED_TTS_EVAL_DEVICE" not in commands
+    assert "SEED_TTS_UTMOS_EVAL" not in commands
+    assert "Expected exactly $${#nodes[@]} MiniCPM-o 4.5 accuracy nodes" in commands
+    for node in (
+        "test_minicpmo_4_5_daily_omni_accuracy_bench",
+        "test_minicpmo_4_5_seed_tts_wer_bench",
+    ):
+        assert node in commands
+    for pipeline_path in (AMD_READY_PIPELINE, AMD_MERGE_PIPELINE):
+        text = pipeline_path.read_text(encoding="utf-8")
+        assert "MiniCPM-o 4.5 Accuracy" not in text

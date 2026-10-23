@@ -795,7 +795,19 @@ class Attention(nn.Module):
                     raise NotImplementedError(blocked)
                 return self.sdpa_fallback.forward(query, key, value, attn_metadata)
         dense_mask = attn_metadata.attn_mask if attn_metadata is not None else None
-        if dense_mask is not None and dense_mask.ndim == 4 and self.attn_backend is not None:
+        # Piecewise backends honor full_attn_spans ahead of attn_mask and never read the
+        # dense mask (e.g. HunyuanImage3, which sends both), so there is nothing to divert.
+        spans_take_precedence = (
+            attn_metadata is not None
+            and attn_metadata.full_attn_spans is not None
+            and getattr(self.attn_backend, "supports_piecewise_spans", False)
+        )
+        if (
+            dense_mask is not None
+            and dense_mask.ndim == 4
+            and self.attn_backend is not None
+            and not spans_take_precedence
+        ):
             # A dense 4D mask (for example a padded DiT batch) is a semantic
             # requirement, not a backend hint. Backends that only implement a
             # 2D key-validity mask must not reach their kernel wrapper, which
@@ -903,6 +915,13 @@ class Attention(nn.Module):
     def _run_ring_attention(self, query, key, value, attn_metadata):
         if attn_metadata is not None and attn_metadata.attn_mask is not None:
             raise ValueError("Ring attention does not support attn_mask; use Ulysses SP or disable mask_sp_padding.")
+        backend_name = self.attn_backend.get_name() if self.attn_backend is not None else None
+        if backend_name == "SPARGE_ATTN":
+            raise NotImplementedError(
+                "SPARGE_ATTN is not supported with ring sequence parallelism: "
+                "the ring path bypasses the backend, so the sparse config would be silently ignored. "
+                "Use Ulysses SP instead, or disable ring SP."
+            )
         skip = getattr(self.attention, "skip", None)
         if skip is not None and getattr(skip, "configured", False):
             raise NotImplementedError(

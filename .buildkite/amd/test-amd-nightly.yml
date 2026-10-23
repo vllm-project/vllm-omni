@@ -567,6 +567,63 @@ steps:
 
             exit "$$status"
 
+  - group: ":full_moon: MiniCPM-o 4.5 Accuracy MI300 Nightly"
+    steps:
+      - label: "MiniCPM-o 4.5 Accuracy"
+        agent_pool: mi300_1
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 180
+        env:
+          SEED_TTS_WER_EVAL: "1"
+          SEED_TTS_SIM_EVAL: "1"
+        artifact_paths:
+          - artifacts/rocm-minicpmo-accuracy/**/*
+        commands:
+          - export ROCM_MINICPMO_ACCURACY_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-minicpmo-accuracy"
+          - mkdir -p "$$ROCM_MINICPMO_ACCURACY_ARTIFACT_DIR"
+          - |
+            nodes=(
+              "tests/e2e/accuracy/minicpmo_4_5/test_minicpmo_4_5.py::test_minicpmo_4_5_daily_omni_accuracy_bench"
+              "tests/e2e/accuracy/minicpmo_4_5/test_minicpmo_4_5.py::test_minicpmo_4_5_seed_tts_wer_bench"
+            )
+            pytest --collect-only -q "$${nodes[@]}" \
+              -m "full_model and omni and rocm and MI325 and cards_1" --run-level full_model \
+              > "$$ROCM_MINICPMO_ACCURACY_ARTIFACT_DIR/collection.txt"
+            count=$$(awk '/::/ { n++ } END { print n + 0 }' \
+              "$$ROCM_MINICPMO_ACCURACY_ARTIFACT_DIR/collection.txt")
+            if [[ "$$count" != "$${#nodes[@]}" ]]; then
+              echo "Expected exactly $${#nodes[@]} MiniCPM-o 4.5 accuracy nodes, found $$count." >&2
+              cat "$$ROCM_MINICPMO_ACCURACY_ARTIFACT_DIR/collection.txt" >&2
+              exit 5
+            fi
+            for node in "$${nodes[@]}"; do
+              if ! grep -Fq "$$node" "$$ROCM_MINICPMO_ACCURACY_ARTIFACT_DIR/collection.txt"; then
+                echo "MiniCPM-o 4.5 accuracy node was not collected: $$node" >&2
+                cat "$$ROCM_MINICPMO_ACCURACY_ARTIFACT_DIR/collection.txt" >&2
+                exit 5
+              fi
+            done
+          - |
+            set +e
+            nodes=(
+              "tests/e2e/accuracy/minicpmo_4_5/test_minicpmo_4_5.py::test_minicpmo_4_5_daily_omni_accuracy_bench"
+              "tests/e2e/accuracy/minicpmo_4_5/test_minicpmo_4_5.py::test_minicpmo_4_5_seed_tts_wer_bench"
+            )
+            timeout --signal=TERM --kill-after=2m 165m \
+              pytest -s -v "$${nodes[@]}" \
+              -m "full_model and omni and rocm and MI325 and cards_1" --run-level full_model \
+              --junitxml="$$ROCM_MINICPMO_ACCURACY_ARTIFACT_DIR/pytest.xml" \
+              2>&1 | tee "$$ROCM_MINICPMO_ACCURACY_ARTIFACT_DIR/pytest.log"
+            status=$${PIPESTATUS[0]}
+            set -e
+            if [[ -d tests/e2e/accuracy/minicpmo_4_5/results ]]; then
+              mkdir -p "$$ROCM_MINICPMO_ACCURACY_ARTIFACT_DIR/results"
+              cp -a tests/e2e/accuracy/minicpmo_4_5/results/. "$$ROCM_MINICPMO_ACCURACY_ARTIFACT_DIR/results/"
+            fi
+
+            exit "$$status"
+
   - group: ":full_moon: Wan2.2 Accuracy MI300 Nightly"
     steps:
       - label: "Wan2.2 I2V Accuracy 2 GPU"
