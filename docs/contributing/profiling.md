@@ -448,3 +448,17 @@ This monitor is intentionally separate from the existing profiling tools:
 The orchestrator monitor does not use `torch.profiler` because the bottleneck signal lives in the orchestrator process (poll-loop duty cycle and queue depth), not inside stage workers. It complements Prometheus metrics when you need a post-run time series for a benchmark or regression run.
 
 Process liveness monitors (`monitor_engine_liveness`, worker/engine-core monitors) are unrelated: they detect crashed workers, not orchestrator load.
+
+## Post-warmup JIT monitoring
+
+For vLLM-backed AR and generation stages, enable verbose JIT monitoring with:
+
+```bash
+vllm serve <model> --omni --jit-monitor-verbose --jit-monitor-mode warn
+```
+
+These options propagate to each vLLM-backed stage. `warn` keeps execution
+running; `error` raises on monitored post-warmup compilation. Defaults remain
+`warn` and non-verbose. Verbose mode logs every monitored compilation event
+with runtime details and can add logging overhead, so use the same setting
+when comparing benchmark runs. Diffusion stages do not consume these options.

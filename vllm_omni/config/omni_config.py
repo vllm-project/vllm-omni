@@ -25,6 +25,7 @@ from vllm.config import CacheConfig as VllmCacheConfig
 from vllm.config import CompilationConfig as VllmCompilationConfig
 from vllm.config import KernelConfig, KVTransferConfig
 from vllm.config import LoadConfig as VllmLoadConfig
+from vllm.config import ObservabilityConfig as VllmObservabilityConfig
 from vllm.config import ParallelConfig as VllmParallelConfig
 from vllm.config import ProfilerConfig as VllmProfilerConfig
 from vllm.config import SchedulerConfig as VllmSchedulerConfig
@@ -287,6 +288,11 @@ class _ConnectorEngineOverrides(TypedDict, total=False):
     kv_transfer_config: KVTransferConfig | dict[str, Any]
 
 
+class _ObservabilityEngineOverrides(TypedDict, total=False):
+    jit_monitor_mode: Literal["warn", "error"]
+    jit_monitor_verbose: bool
+
+
 @dataclass(frozen=True)
 class _StageEngineValues:
     """Typed projections of legacy flat per-stage ``yaml_engine_args``."""
@@ -297,6 +303,7 @@ class _StageEngineValues:
     pooling: _PoolingEngineOverrides
     cache: _CacheEngineOverrides
     scheduler: _SchedulerEngineOverrides
+    observability: _ObservabilityEngineOverrides
     connector: _ConnectorEngineOverrides
     runtime: _RuntimeEngineOverrides
     parallel: _ParallelEngineOverrides
@@ -608,6 +615,14 @@ class OmniStageSchedulerConfig(_TrackExplicitConfigFields, VllmSchedulerConfig):
             raise ValueError(
                 f"max_num_batched_tokens ({self.max_num_batched_tokens}) must be >= max_num_seqs ({self.max_num_seqs})"
             )
+
+
+@config
+class OmniStageObservabilityConfig(_TrackExplicitConfigFields):
+    """Opt-in JIT monitoring inputs owned by vLLM-backed stages."""
+
+    jit_monitor_mode: Literal["warn", "error"] = VllmObservabilityConfig.jit_monitor_mode
+    jit_monitor_verbose: bool = VllmObservabilityConfig.jit_monitor_verbose
 
 
 @config
@@ -1272,6 +1287,7 @@ _MODEL_ENGINE_FIELDS = frozenset(_ModelEngineOverrides.__annotations__)
 _LOAD_ENGINE_FIELDS = frozenset(_LoadEngineOverrides.__annotations__)
 _CACHE_ENGINE_FIELDS = frozenset(_CacheEngineOverrides.__annotations__)
 _SCHEDULER_ENGINE_FIELDS = frozenset(_SchedulerEngineOverrides.__annotations__)
+_OBSERVABILITY_ENGINE_FIELD_MAP = {name: name for name in _ObservabilityEngineOverrides.__annotations__}
 _POOLING_ENGINE_FIELDS = frozenset(_PoolingEngineOverrides.__annotations__)
 _CONNECTOR_ENGINE_FIELDS = frozenset(_ConnectorEngineOverrides.__annotations__)
 _RUNTIME_ENGINE_FIELDS = frozenset(_RuntimeEngineOverrides.__annotations__)
@@ -1312,6 +1328,7 @@ _LLM_STAGE_ENGINE_FIELDS = (
     | _LLM_SCHEDULER_ENGINE_FIELDS
     | _LLM_PARALLEL_CONFIG_ENGINE_FIELDS
     | _POOLING_ENGINE_FIELDS
+    | frozenset(_OBSERVABILITY_ENGINE_FIELD_MAP.values())
     | {"parallel_config"}
 )
 _DIFFUSION_OWNED_STAGE_ENGINE_FIELDS = (
@@ -1636,6 +1653,10 @@ def _stage_engine_values(
             _SchedulerEngineOverrides,
             _select_engine_overrides(engine, scheduler_engine_fields),
         ),
+        observability=cast(
+            _ObservabilityEngineOverrides,
+            _select_engine_overrides(engine, frozenset(_OBSERVABILITY_ENGINE_FIELD_MAP.values())),
+        ),
         connector=cast(
             _ConnectorEngineOverrides,
             _select_engine_overrides(engine, _CONNECTOR_ENGINE_FIELDS),
@@ -1709,6 +1730,7 @@ class BaseVllmOmniStageConfig:
     scheduler_config: OmniStageSchedulerConfig = field(default_factory=OmniStageSchedulerConfig)
     connector_config: OmniStageConnectorConfig = field(default_factory=OmniStageConnectorConfig)
     pooling_config: OmniStagePoolingConfig = field(default_factory=OmniStagePoolingConfig)
+    observability_config: OmniStageObservabilityConfig = field(default_factory=OmniStageObservabilityConfig)
     runtime_config: OmniStageRuntimeConfig = field(default_factory=OmniStageRuntimeConfig)
     parallel_config: OmniStageParallelConfig = field(default_factory=OmniStageParallelConfig)
     compilation_config: VllmCompilationConfig | None = None
@@ -1867,6 +1889,7 @@ def _build_common_stage_config_kwargs(
             ),
             "load_config": _build_load_config(topology, engine.load),
             "pooling_config": _build_pooling_config(stage_deploy, engine.pooling),
+            "observability_config": OmniStageObservabilityConfig(**_config_kwargs(engine.observability)),
             "cache_config": _build_cache_config(
                 deploy,
                 engine.cache,

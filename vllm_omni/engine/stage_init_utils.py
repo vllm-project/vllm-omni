@@ -44,6 +44,7 @@ from vllm_omni.config.omni_config import (
     _DIFFUSION_PARALLEL_CONFIG_ENGINE_FIELDS,
     _DIFFUSION_SCHEDULER_STAGE_ENGINE_FIELD_MAP,
     _LOAD_STAGE_ENGINE_FIELD_MAP,
+    _OBSERVABILITY_ENGINE_FIELD_MAP,
     _PARALLEL_CONFIG_ENGINE_FIELD_MAP,
     _SCHEDULER_STAGE_ENGINE_FIELD_MAP,
     BaseVllmOmniStageConfig,
@@ -1188,6 +1189,9 @@ def _project_omni_stage_engine_args(
             (stage_config.scheduler_config, _SCHEDULER_STAGE_ENGINE_FIELD_MAP),
         ):
             engine_args.update(_project_upstream_config_fields(config, field_map))
+        engine_args.update(
+            _project_upstream_config_fields(stage_config.observability_config, _OBSERVABILITY_ENGINE_FIELD_MAP)
+        )
 
     # Same category as the two above: vLLM config objects copied verbatim from
     # the stage config into the engine args. Only compilation_config and

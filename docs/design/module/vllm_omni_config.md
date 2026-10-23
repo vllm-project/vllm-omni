@@ -108,3 +108,11 @@ this placeholder page.
   are captured.
 - Allocate an invariant namespace only after those behaviors are enforced and
   owner-approved.
+
+`OmniStageObservabilityConfig` owns `jit_monitor_mode` and
+`jit_monitor_verbose` for AR and generation stages. Global CLI values apply to
+all vLLM-backed stages; stage-scoped overrides and deploy `engine_extras` use
+the same structured owner. Only explicitly supplied values are projected into
+`OmniEngineArgs`, leaving upstream defaults unchanged (`warn`, non-verbose).
+Diffusion stages do not own these vLLM JIT-monitor options. Verbose monitoring
+logs every monitored compilation event and can add logging overhead.

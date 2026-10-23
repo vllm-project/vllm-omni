@@ -1114,6 +1114,7 @@ def test_vllm_omni_stage_config_public_fields_use_typed_stage_realizations():
         "cache_config",
         "scheduler_config",
         "pooling_config",
+        "observability_config",
         "connector_config",
         "runtime_config",
         "parallel_config",
@@ -2565,3 +2566,63 @@ def test_mrv2_duplex_session_validation():
     ps_no_duplex = replace(ps, supports_duplex_mrv2=False)
     with pytest.raises(ValueError, match="supports session_mode 'turn' only"):
         validate_native_mrv2_session(deploy_duplex, ps_no_duplex, "v2")
+
+
+@pytest.mark.parametrize("field,value", [("jit_monitor_verbose", True), ("jit_monitor_mode", "error")])
+@pytest.mark.parametrize("source", ["global", "stage", "deploy"])
+def test_jit_monitor_config_is_owned_and_forwarded(field, value, source):
+    from vllm_omni.engine.arg_utils import OmniEngineArgs
+    from vllm_omni.engine.stage_init_utils import build_engine_args_dict_from_omni_stage_config
+    from vllm_omni.entrypoints.utils import filter_dataclass_kwargs
+
+    pipeline = _resolve_pipeline_or_skip("qwen3_omni_moe", Qwen3OmniMoeConfig())
+    cli = {field: value} if source == "global" else {f"stage_1_{field}": value} if source == "stage" else {}
+    deploy = (
+        DeployConfig(stages=[StageDeployConfig(stage_id=1, engine_extras={field: value})])
+        if source == "deploy"
+        else None
+    )
+    config = VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=deploy, cli_overrides=cli)
+    for stage in config.stage_configs:
+        engine_args = build_engine_args_dict_from_omni_stage_config(stage, model="test-model")
+        if source == "global" or stage.stage_id == 1:
+            assert getattr(stage.observability_config, field) == value
+            assert engine_args[field] == value
+            terminal = OmniEngineArgs(**filter_dataclass_kwargs(OmniEngineArgs, engine_args))
+            assert getattr(terminal, field) == value
+        else:
+            assert field not in engine_args
+
+
+def test_jit_monitor_defaults_and_stage_override_preserve_upstream_behavior():
+    from vllm.config import ObservabilityConfig
+
+    from vllm_omni.engine.stage_init_utils import build_engine_args_dict_from_omni_stage_config
+
+    config = _from_pipeline_key("qwen3_omni_moe", Qwen3OmniMoeConfig())
+    for stage in config.stage_configs:
+        assert stage.observability_config.jit_monitor_verbose == ObservabilityConfig.jit_monitor_verbose
+        assert stage.observability_config.jit_monitor_mode == ObservabilityConfig.jit_monitor_mode
+        args = build_engine_args_dict_from_omni_stage_config(stage, model="test-model")
+        assert "jit_monitor_verbose" not in args
+        assert "jit_monitor_mode" not in args
+    config = _from_pipeline_key(
+        "qwen3_omni_moe",
+        Qwen3OmniMoeConfig(),
+        cli_overrides={
+            "jit_monitor_verbose": True,
+            "stage_1_jit_monitor_verbose": False,
+            "jit_monitor_mode": "error",
+            "stage_1_jit_monitor_mode": "warn",
+        },
+    )
+    args = build_engine_args_dict_from_omni_stage_config(config.stage_by_id(1), model="test-model")
+    assert args["jit_monitor_verbose"] is False
+    assert args["jit_monitor_mode"] == "warn"
+
+
+def test_jit_monitor_rejects_invalid_mode_and_diffusion_ownership():
+    with pytest.raises(ValidationError, match="jit_monitor_mode"):
+        _from_pipeline_key("qwen3_omni_moe", Qwen3OmniMoeConfig(), cli_overrides={"jit_monitor_mode": "ignore"})
+    with pytest.raises(ValueError, match="no structured config owner: jit_monitor_verbose"):
+        _from_pipeline_key("hunyuan_image3_dit", cli_overrides={"jit_monitor_verbose": True})
