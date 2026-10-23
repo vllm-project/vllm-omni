@@ -225,7 +225,15 @@ Record the server commit, model/adapter, input assets, prompt, settings, and out
 alongside the result. Local schema or mocked-server checks do not establish H3
 generation quality or replace this real-model validation.
 
-#### Character Replacement
+#### MiniMax H3 Character Replacement
+
+Download [Character Swap V1.5](https://huggingface.co/akatz-ai/MiniMax-H3-Character-Swap-LoRA) on the machine running vLLM-Omni:
+
+```bash
+hf download akatz-ai/MiniMax-H3-Character-Swap-LoRA h3_character_swap_v1.5.safetensors --local-dir /models
+```
+
+In **LoRA(Character Swap)**, set `local_path` to `/models/h3_character_swap_v1.5.safetensors`, enable the adapter and start with `scale=1.0`. Leave `int_id=0` for automatic identification. Start the service with `--lora-backend peft`; for Swap + Turbo composition, use `--max-cpu-loras 3`. The target image supplies appearance, the video supplies motion and scene structure, and the prompt identifies which person to replace. FastH3-Omni + Swap requires a server that supports request-level LoRA for that checkpoint.
 
 Load [MiniMax-H3 Character Replacement](example_workflows/vLLM-Omni%20MiniMax-H3%20Character%20Replacement.json),
 select your own target image and motion video, and replace both `/models/...`
