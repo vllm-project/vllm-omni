@@ -15,6 +15,7 @@ import threading
 import pytest
 import torch
 
+from tests.helpers.mark import hardware_test
 from vllm_omni.model_executor.models.step_audio2.step_audio2_token2wav import (
     StepAudio2Token2WavCore,
 )
@@ -35,7 +36,6 @@ _HAS_NPU = _npu_available()
 
 pytestmark = [
     pytest.mark.core_model,
-    pytest.mark.npu,
     pytest.mark.skipif(not _HAS_NPU, reason="requires an Ascend NPU (torch_npu)"),
 ]
 
@@ -58,13 +58,12 @@ def _core_on_npu(model) -> StepAudio2Token2WavCore:
     return core
 
 
+@hardware_test(res={"npu": "A2"}, num_cards=1)
 def test_s3_capture_and_replay_match_eager() -> None:
-    # NPUGraph capture needs the graph-capturable ACLNN kernels, the same
-    # runtime contract as _prepare_moss_codec_graph_runtime and
-    # prepare_code2wav_graph_runtime elsewhere in-tree; without it the
-    # aclop-based conv kernels refuse to be captured.
-    torch.npu.config.allow_internal_format = False
-    torch.npu.set_compile_mode(jit_compile=False)
+    # No manual torch.npu.config tweak here on purpose: the capture path
+    # must self-configure the graph-capturable ACLNN runtime via
+    # _prepare_s3_quantize_graph_runtime, and this test would fail
+    # if that self-configuration regressed.
     torch.manual_seed(0)
     model = s3tokenizer.model_v2.S3TokenizerV2("speech_tokenizer_v2_25hz").eval().to("npu")
     core = _core_on_npu(model)

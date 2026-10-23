@@ -14,6 +14,7 @@ same kernels, same comparison, so no pretrained asset is needed.
 import pytest
 import torch
 
+from tests.helpers.mark import hardware_test
 from vllm_omni.model_executor.models.cosyvoice3.speaker_embedding_torch import (
     CampplusTorch,
 )
@@ -33,19 +34,17 @@ _HAS_NPU = _npu_available()
 
 pytestmark = [
     pytest.mark.core_model,
-    pytest.mark.npu,
     pytest.mark.skipif(not _HAS_NPU, reason="requires an Ascend NPU (torch_npu)"),
 ]
 
 
+@hardware_test(res={"npu": "A2"}, num_cards=1)
 @pytest.mark.parametrize("n_frames", (97, 200))
 def test_capture_and_replay_match_eager(n_frames: int) -> None:
-    # NPUGraph capture needs the graph-capturable ACLNN kernels, the same
-    # runtime contract as _prepare_moss_codec_graph_runtime and
-    # prepare_code2wav_graph_runtime elsewhere in-tree; without it the
-    # aclop-based conv kernels refuse to be captured.
-    torch.npu.config.allow_internal_format = False
-    torch.npu.set_compile_mode(jit_compile=False)
+    # No manual torch.npu.config tweak here on purpose: the capture path
+    # must self-configure the graph-capturable ACLNN runtime via
+    # _prepare_speaker_embedding_graph_runtime, and this test would fail
+    # if that self-configuration regressed.
     torch.manual_seed(0)
     wrapper = CampplusTorch(CAMPPlus(feat_dim=80, embedding_size=192).eval(), "npu")
     feat = torch.randn(n_frames, 80)

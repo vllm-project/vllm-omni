@@ -45,6 +45,28 @@ from vllm_omni.model_executor.models.step_audio2.step_audio2_constants import (
 
 logger = init_logger(__name__)
 
+
+def _prepare_s3_quantize_graph_runtime() -> None:
+    """Select graph-capturable ACLNN kernels before S3 quantize capture.
+
+    Mirrors ``prepare_code2wav_graph_runtime`` (minicpmo_4_5_code2wav) and
+    ``_prepare_moss_codec_graph_runtime``: the NPU platform keeps
+    ``allow_internal_format`` on for quantized LLM kernels, but NPUGraph
+    capture of the conv kernels requires it off, plus ``jit_compile=False``.
+    Configure it right here, only when capture is actually enabled, so
+    this path never relies on another stage having done it.
+    """
+    if os.environ.get("ASCEND_LAUNCH_BLOCKING") == "1":
+        raise RuntimeError(
+            "S3 quantize NPUGraph capture is incompatible with "
+            "ASCEND_LAUNCH_BLOCKING=1; unset it or set it to 0 before startup."
+        )
+    npu = torch.npu
+    npu.config.allow_internal_format = False
+    npu.set_compile_mode(jit_compile=False)
+    logger.info("Configured S3 quantize NPUGraph runtime (allow_internal_format=False, jit_compile=False)")
+
+
 # Long-audio boundary of s3tokenizer's quantize() (max_frames = 3000 in
 # s3tokenizer/model.py). The short-audio path below must stay on the same side
 # of that boundary as the library call, so this constant mirrors it; if the
@@ -320,7 +342,7 @@ class StepAudio2Token2WavCore(nn.Module):
         self._spk_event = stream.record_event()
         return out.to(self.device)
 
-    def enable_trt_spk_embedding(self, *, cpu_reference: bool = False) -> None:
+    def enable_trt_spk_embedding(self) -> None:
         """Swap the onnxruntime campplus session for the shared TensorRT engine.
 
         Reuses the CosyVoice3 CAM++ engine wrapper — MiniCPM-o / Step-Audio2
@@ -334,23 +356,20 @@ class StepAudio2Token2WavCore(nn.Module):
         """
         from vllm_omni.model_executor.models.cosyvoice3.speaker_embedding_trt import get_campplus_trt
 
-        self._spk_model = get_campplus_trt(
-            f"{self.model_path}/campplus.onnx", device=self.device, cpu_reference=cpu_reference
-        )
+        self._spk_model = get_campplus_trt(f"{self.model_path}/campplus.onnx", device=self.device)
 
-    def enable_device_spk_embedding(self, *, use_trt: bool = True) -> None:
+    def enable_device_spk_embedding(self) -> None:
         """Swap the CPU onnxruntime campplus session for an on-device model.
 
-        CUDA defaults to the shared TensorRT engine. Set ``use_trt=False``
-        to use torch without a TensorRT dependency.
-        Other devices (e.g. Ascend NPU) use torch CAMPPlus loaded from the same
+        CUDA: shared TensorRT engine (same as :meth:`enable_trt_spk_embedding`).
+        Other devices (e.g. Ascend NPU): torch CAMPPlus loaded from the same
         campplus.onnx weights — same architecture and I/O contract, no
         per-request ``.cpu().numpy()`` host round-trip.
 
         Like :meth:`enable_trt_spk_embedding`, this only installs the callable;
         the remaining token2wav modules stay lazy and load on first forward.
         """
-        if self.device.type == "cuda" and use_trt:
+        if self.device.type == "cuda":
             self.enable_trt_spk_embedding()
             return
         from vllm_omni.model_executor.models.cosyvoice3.speaker_embedding_torch import get_campplus_torch
@@ -401,6 +420,9 @@ class StepAudio2Token2WavCore(nn.Module):
                     return code, code_len
                 # Events only exist on NPU; on other devices the lock alone
                 # is enough (single stream per process).
+                # Capture needs graph-capturable ACLNN kernels; self-configure
+                # here instead of relying on the Code2Wav stage having done it.
+                _prepare_s3_quantize_graph_runtime()
                 stream = torch.npu.current_stream(self.device) if self.device.type == "npu" else None
                 if stream is not None and self._s3_graph_done is not None:
                     stream.wait_event(self._s3_graph_done)

@@ -30,6 +30,27 @@ from vllm_omni.model_executor.models.indextts2.utils.campplus.dtdnn import CAMPP
 logger = init_logger(__name__)
 
 
+def _prepare_speaker_embedding_graph_runtime() -> None:
+    """Select graph-capturable ACLNN kernels before CAM++ graph capture.
+
+    Mirrors ``prepare_code2wav_graph_runtime`` (minicpmo_4_5_code2wav) and
+    ``_prepare_moss_codec_graph_runtime``: the NPU platform keeps
+    ``allow_internal_format`` on for quantized LLM kernels, but NPUGraph
+    capture of the conv kernels requires it off, plus ``jit_compile=False``.
+    Configure it right here, only when capture is actually enabled, so
+    this path never relies on another stage having done it.
+    """
+    if os.environ.get("ASCEND_LAUNCH_BLOCKING") == "1":
+        raise RuntimeError(
+            "CAM++ speaker-embedding NPUGraph capture is incompatible with "
+            "ASCEND_LAUNCH_BLOCKING=1; unset it or set it to 0 before startup."
+        )
+    npu = torch.npu
+    npu.config.allow_internal_format = False
+    npu.set_compile_mode(jit_compile=False)
+    logger.info("Configured CAM++ speaker-embedding NPUGraph runtime (allow_internal_format=False, jit_compile=False)")
+
+
 class CampplusTorch:
     """Callable wrapper matching the CampplusTRT contract: ``[T, 80]`` in, ``[1, 192]`` out."""
 
@@ -95,6 +116,9 @@ class CampplusTorch:
                     return self.model(batch)
                 # Events only exist on NPU; on other devices the lock alone
                 # is enough (single stream per process).
+                # Capture needs graph-capturable ACLNN kernels; self-configure
+                # here instead of relying on the Code2Wav stage having done it.
+                _prepare_speaker_embedding_graph_runtime()
                 stream = torch.npu.current_stream(self.device) if self.device.type == "npu" else None
                 if stream is not None and self._graph_done is not None:
                     stream.wait_event(self._graph_done)

@@ -70,6 +70,15 @@ class _FakeNPUModule:
     """Minimal ``torch.npu`` stand-in: real kernels run eagerly on CPU,
     only the graph bookkeeping is faked."""
 
+    class config:
+        """Mimic ``torch.npu.config`` (the prepare step flips this)."""
+
+        allow_internal_format = True
+
+    @staticmethod
+    def set_compile_mode(jit_compile=False):
+        pass
+
     graph = staticmethod(contextlib.nullcontext)
 
     @staticmethod
