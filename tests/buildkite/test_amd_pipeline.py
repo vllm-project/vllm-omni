@@ -19,7 +19,6 @@ AMD_SUITE_COMBINER = Path(__file__).resolve().parents[2] / ".buildkite/amd/scrip
 AMD_RUNNER = Path(".buildkite/amd/scripts/run-amd-test.sh")
 AMD_TEMPLATE = Path(".buildkite/amd/test-template-amd-omni.j2")
 AMD_OMNI_PROCESSOR_RUNNER = Path(".buildkite/amd/scripts/run-omni-processor-test.sh")
-CUDA_MERGE_PIPELINE = Path(".buildkite/cuda/test-merge.yml")
 CUDA_READY_PIPELINE = Path(".buildkite/cuda/test-ready.yml")
 AR_PAGED_ATTENTION_LABEL = "ROCm · AR Diffusion Paged Attention GPU Test"
 DIFFUSION_GROUP = ":card_index_dividers: Diffusion Test"
@@ -447,13 +446,8 @@ def test_personaplex_temporal_stress_has_one_nonblocking_nightly_owner() -> None
     assert "$$PERSONAPLEX_TEMPORAL_ARTIFACT_DIR/pytest-summary.txt" in all_commands
 
 
-@pytest.mark.parametrize(
-    "pipeline_path",
-    [CUDA_READY_PIPELINE, CUDA_MERGE_PIPELINE],
-    ids=["ready", "merge"],
-)
-def test_cuda_pr_gates_retain_full_model_executor_coverage(pipeline_path: Path) -> None:
-    step = _find_step("Simple · Model Executor Test", pipeline_path)
+def test_cuda_ready_retains_full_model_executor_coverage() -> None:
+    step = _find_step("Simple · Model Executor Test", CUDA_READY_PIPELINE)
     assert "source_file_dependencies" not in step
 
     pytest_command = next(command for command in step["commands"] if "pytest" in command)

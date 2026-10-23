@@ -1,6 +1,7 @@
 # CUDA CI L4 (`full_model`): nightly and release share this file.
 # Uploaded by Upload Nightly Pipeline: NIGHTLY=1, or PR labels (nightly-test / omni-test / ...).
 # Hardware: omit mirror_hardwares to compose from -m SKU + cards_n; or set a preset string to force.
+# Simple · CPU Coverage Test runs only when NIGHTLY=1 (release-line schedule).
 
 env:
   VLLM_WORKER_MULTIPROC_METHOD: spawn
@@ -593,6 +594,23 @@ steps:
         commands:
           - pip install "vllm-gguf-plugin==0.0.4"
           - pytest -sv tests/diffusion/quantization -m 'full_model and cuda and L4 and B200 and cards_1' --run-level "full_model"
+
+  - label: "Simple · CPU Coverage Test"
+    key: nightly-simple-cpu-coverage
+    depends_on: upload-nightly-pipeline
+    if: build.env("NIGHTLY") == "1"
+    timeout_in_minutes: 60
+    artifact_paths:
+      - coverage-core-model-cpu-*.xml.gz
+    commands:
+      - |
+        set +e
+        REPORT="coverage-core-model-cpu-$${BUILDKITE_STEP_ID:-local}.xml"
+        pytest -sv tests/ -m 'core_model and cpu' --cov=vllm_omni --cov-report=term-missing:skip-covered --cov-report=xml:$${REPORT}
+        EXIT=$$?
+        gzip -9 -f "$${REPORT}"
+        exit $$EXIT
+    mirror_hardwares: l4_1
 
   # NOTE: ":email: Nightly Collection & Email" is deprecated and will be removed soon.
   # Do not add new depends_on entries or extend this step.
