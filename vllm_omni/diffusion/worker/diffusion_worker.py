@@ -781,6 +781,26 @@ class DiffusionWorker:
         engine.reset_weight_update_target()
         self._weight_update_active = False
 
+    def _attention_strategy_runners(self):
+        from vllm_omni.diffusion.attention.strategy import iter_attention_strategy_runners
+
+        assert self.model_runner is not None
+        return (
+            (name, runner)
+            for name, runner in iter_attention_strategy_runners(self.model_runner.pipeline)
+            if runner is not None
+        )
+
+    def attention_strategy_status(self):
+        """Read-only evidence; compiled activation alone is not warmup readiness."""
+        return {name: runner.warmup_status() for name, runner in self._attention_strategy_runners()}
+
+    def attention_strategy_warmup(self, active: bool):
+        """Serialized worker RPC, called before admitting serving requests."""
+        for _, runner in self._attention_strategy_runners():
+            runner.set_warmup(active)
+        return self.attention_strategy_status()
+
     def execute_model(
         self,
         req: OmniDiffusionRequest | list[NewRequestData],
