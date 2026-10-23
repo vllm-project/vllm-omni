@@ -202,6 +202,10 @@ def test_decode_to_mp4_batches_consumer_transfers(monkeypatch, decode_dtype):
             return self
 
         owns_chunk_output = True
+
+        def is_distributed_enabled(self):
+            return False
+
         chunk_value_range = (0.0, 1.0)
 
         def __init__(self):
@@ -266,6 +270,9 @@ def test_preencode_starts_before_audio_offload_and_cleans_up_on_video_load_failu
         decode_dtype = torch.float16
         chunk_value_range = (0.0, 1.0)
         owns_chunk_output = True
+
+        def is_distributed_enabled(self):
+            return False
 
         def decode_with_chunks(self, latent, *, on_chunk):
             on_chunk(torch.zeros(1, 3, 4, 16, 32))
@@ -335,6 +342,10 @@ def test_request_video_codec_options_reach_the_preencoded_mp4_encoder(monkeypatc
             return self
 
         owns_chunk_output = True
+
+        def is_distributed_enabled(self):
+            return False
+
         chunk_value_range = (0.0, 1.0)
         decode_dtype = torch.float16
 
@@ -3655,6 +3666,10 @@ def _peer_rank_preencode_pipeline(monkeypatch):
             return self
 
         owns_chunk_output = False
+
+        def is_distributed_enabled(self):
+            return False
+
         chunk_value_range = (0.0, 1.0)
         decode_dtype = torch.float16
 

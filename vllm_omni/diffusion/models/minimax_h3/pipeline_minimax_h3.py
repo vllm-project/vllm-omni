@@ -2347,8 +2347,23 @@ class MiniMaxH3Pipeline(
                     video_codec_options=video_codec_options,
                     crop=(height, width),
                 )
+                start_error: BaseException | None = None
                 if self.video_vae.owns_chunk_output:
-                    session.start(width=width, height=height, batch_size=1)
+                    try:
+                        session.start(width=width, height=height, batch_size=1)
+                    except BaseException as exc:
+                        start_error = exc
+                if self.video_vae.is_distributed_enabled():
+                    # Prestart runs only on the output owner, outside the chunk
+                    # callback's error guard. Agree before any rank enters the
+                    # VAE collectives, including when the owner is not global 0.
+                    group = self.video_vae._native_parallel_state()["sp_process_group"]
+                    failed = torch.tensor([int(start_error is not None)], dtype=torch.int32, device=video_latent.device)
+                    dist.broadcast(failed, src=dist.get_global_rank(group, 0), group=group)
+                    if int(failed.item()) and start_error is None:
+                        raise RuntimeError("MiniMax-H3 MP4 encoder startup failed on the output owner")
+                if start_error is not None:
+                    raise start_error
 
             with self._component_on_device(self.video_vae.decoder_component):
                 with current_omni_platform.create_autocast_context(
