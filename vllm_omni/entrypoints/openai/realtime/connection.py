@@ -41,8 +41,7 @@ from vllm.entrypoints.openai.chat_completion.protocol import (
 )
 from vllm.exceptions import VLLMValidationError
 from vllm.logger import init_logger
-from vllm.sampling_params import RequestOutputKind, SamplingParams, StructuredOutputsParams
-from vllm.tool_parsers import ToolParserManager
+from vllm.sampling_params import RequestOutputKind, SamplingParams
 
 if TYPE_CHECKING:
     from vllm.inputs import EngineInput
@@ -170,8 +169,6 @@ class OpenAIFullDuplexConnection:
         engine: AsyncOmni,
         model_name: str,
         chat_handler: Any,
-        tool_call_parser: str | None = None,
-        enable_auto_tool_choice: bool = False,
         vad_backend_provider: SileroVADBackendProvider | None = None,
         semantic_vad_backend_provider: SmartTurnBackendProvider | None = None,
     ):
@@ -180,7 +177,6 @@ class OpenAIFullDuplexConnection:
         self.model_name = model_name
         self.chat_handler = chat_handler
         self._tokenizer = chat_handler.renderer.get_tokenizer()
-        self._tool_call_parser_name = tool_call_parser if enable_auto_tool_choice else None
         self._vad_backend_provider = vad_backend_provider
         self._semantic_vad_backend_provider = semantic_vad_backend_provider
         self._turn_detector: TurnDetector | None = None
@@ -764,7 +760,8 @@ class OpenAIFullDuplexConnection:
                 voice = output.voice
                 response_voice = self._validate_voice(voice, prefix="response") if voice is not None else None
 
-        if tools and tool_choice != "none" and self._tool_call_parser_name is None:
+        parser_cls = getattr(self.chat_handler, "parser_cls", None)
+        if tools and tool_choice != "none" and (parser_cls is None or parser_cls.tool_parser_cls is None):
             raise ValueError("Function tools require --enable-auto-tool-choice and --tool-call-parser")
 
         reasoning_effort = s.reasoning_effort
@@ -1089,6 +1086,22 @@ class OpenAIFullDuplexConnection:
             opt_kwargs["watermarking"] = model_extra["watermarking"]
         return opt_kwargs
 
+    def _build_response_parser(self, request: ChatCompletionRequest):
+        """Build one combined reasoning/tool parser for this response.
+
+        Mirrors ``OpenAIServingChat._make_parser`` so that response parsing
+        matches the chat-completions path.
+        """
+        parser_cls = getattr(self.chat_handler, "parser_cls", None)
+        if parser_cls is None:
+            return None
+        return parser_cls(
+            self._tokenizer,
+            request.tools,
+            chat_template_kwargs=self.chat_handler._effective_chat_template_kwargs(request),
+            model_config=self.engine.model_config,
+        )
+
     async def _run_response_inner(self, response_id, response, s, active, engine_input: EngineInput):
         previous_item_id = s.items[-1].id if s.items else None
         modalities = response.modalities
@@ -1098,26 +1111,26 @@ class OpenAIFullDuplexConnection:
         active.item_id = item_id
         output_index = 0
 
-        converted_tools = self._convert_tools(tools) if tools else []
-        tool_parser = None
-        structural_tag_json = None
-        if converted_tools and tool_choice != "none" and self._tool_call_parser_name:
-            tool_parser_cls = ToolParserManager.get_tool_parser(self._tool_call_parser_name)
-            strict_tools = [ChatCompletionToolsParam(**t) for t in self._convert_tools(tools, strict=True)]
-            tool_parser = tool_parser_cls(self._tokenizer, tools=strict_tools)
-            parser_request = ChatCompletionRequest(
-                messages=[],
-                tools=strict_tools,
-                tool_choice=self._convert_tool_choice(tool_choice),
-                include_reasoning=False,
-                skip_special_tokens=True,
-            )
-            structure_tag = tool_parser.get_structural_tag(
-                parser_request,
-                reasoning=False,
-            )
-            if structure_tag is not None:
-                structural_tag_json = json.dumps(structure_tag.model_dump())
+        parser_tools = [ChatCompletionToolsParam(**tool) for tool in self._convert_tools(tools)] if tools else None
+        prompt_token_ids = engine_input.get("prompt_token_ids") or []
+        parser_request = ChatCompletionRequest(
+            messages=[],
+            tools=parser_tools,
+            # Chat completions rejects tool_choice without tools, but a session
+            # can still carry "auto" after the client clears its tool list.
+            tool_choice=self._convert_tool_choice(tool_choice) if parser_tools else None,
+            include_reasoning=False,
+            skip_special_tokens=True,
+        )
+        # Talker transcripts are speech, not model reasoning, so audio
+        # responses bypass parsing and stream transcript deltas verbatim.
+        parser = None if is_audio else self._build_response_parser(parser_request)
+        if parser is not None:
+            # Let the parsers apply their own request adjustments: engine-based
+            # parsers need special tokens preserved, and the tool parser builds
+            # the structural tag for the configured tool choice.
+            parser_request = parser.adjust_request(parser_request)
+            parser.set_prompt_token_ids(prompt_token_ids)
 
         item_obj = types.RealtimeConversationItemAssistantMessage(
             type="message",
@@ -1173,8 +1186,7 @@ class OpenAIFullDuplexConnection:
         total_audio_samples = 0
         audio_resampler: StreamingAudioResampler | None = None
 
-        previous_text = ""
-        previous_token_ids: list[int] = []
+        stream_finished = False
         pending_tool_calls: dict[int, dict[str, Any]] = {}
         next_output_index = 1  # 0 is the message item, reserved above
         # Tool-call markup is control output, so suppress its audio after detection.
@@ -1231,7 +1243,7 @@ class OpenAIFullDuplexConnection:
                 )
             )
 
-        async def handle_tool_parser_delta(delta_msg) -> None:
+        async def handle_parser_delta(delta_msg) -> None:
             nonlocal next_output_index, tool_call_seen
             if delta_msg is None:
                 return
@@ -1292,11 +1304,13 @@ class OpenAIFullDuplexConnection:
         for sp in sampling_params_list:
             if isinstance(sp, SamplingParams):
                 sp.output_kind = RequestOutputKind.DELTA
+                if parser is not None and not parser_request.skip_special_tokens:
+                    sp.skip_special_tokens = False
                 if not thinker_params_configured:
                     if isinstance(max_output_tokens, int):
                         sp.max_tokens = max_output_tokens
-                    if structural_tag_json is not None:
-                        sp.structured_outputs = StructuredOutputsParams(structural_tag=structural_tag_json)
+                    if parser_request.structured_outputs is not None:
+                        sp.structured_outputs = parser_request.structured_outputs
                     thinker_params_configured = True
 
         sampling_params_list = self.chat_handler._fix_audio_stream_output_kinds(sampling_params_list, modalities)
@@ -1350,27 +1364,16 @@ class OpenAIFullDuplexConnection:
                     if output.prompt_token_ids:
                         usage.input_tokens = max(usage.input_tokens, len(output.prompt_token_ids))
 
-                    if tool_parser is not None:
-                        # Additive branch: when no tools are configured for
-                        # this response, tool_parser is None and this whole
-                        # block is skipped -- the plain-text path below is
-                        # untouched.
-                        current_text = previous_text + delta_text
-                        current_token_ids = previous_token_ids + delta_token_ids
-                        delta_msg = None
-                        if delta_text or delta_token_ids:
-                            delta_msg = tool_parser.extract_tool_calls_streaming(
-                                previous_text,
-                                current_text,
-                                delta_text,
-                                previous_token_ids,
-                                current_token_ids,
-                                delta_token_ids,
-                                request=parser_request,
-                            )
-                        previous_text = current_text
-                        previous_token_ids = current_token_ids
-                        await handle_tool_parser_delta(delta_msg)
+                    if parser is not None:
+                        stream_finished = first_out.finish_reason is not None
+                        delta_msg = parser.parse_delta(
+                            delta_text=delta_text,
+                            delta_token_ids=delta_token_ids,
+                            request=parser_request,
+                            prompt_token_ids=prompt_token_ids,
+                            finished=stream_finished,
+                        )
+                        await handle_parser_delta(delta_msg)
                     elif delta_text:
                         await emit_content_delta(delta_text)
 
@@ -1384,16 +1387,20 @@ class OpenAIFullDuplexConnection:
                 except Exception:
                     logger.debug("Error closing generator for %s", active.request_id, exc_info=True)
 
-        if tool_parser is not None and getattr(tool_parser, "engine_based_streaming", False):
-            # finish_streaming() only exists on the newer ParserEngine-based
-            # parsers (engine_based_streaming=True, e.g. Qwen3EngineToolParser)
-            # -- the base ToolParser class legacy regex-based parsers extend
-            # (e.g. Hermes2ProToolParser) don't declare it at all and would
-            # raise AttributeError here (confirmed in production logs).
-            await handle_tool_parser_delta(tool_parser.finish_streaming())
-
         if self._response_cancel_event.is_set():
             cancelled = True
+
+        if parser is not None and not stream_finished and not cancelled:
+            # Engine-based parsers hold back trailing content until the stream
+            # ends; flush it when the engine never reported a finish reason.
+            delta_msg = parser.parse_delta(
+                delta_text="",
+                delta_token_ids=[],
+                request=parser_request,
+                prompt_token_ids=prompt_token_ids,
+                finished=True,
+            )
+            await handle_parser_delta(delta_msg)
 
         if audio_resampler is not None and not cancelled:
             tail = audio_resampler.process(np.empty(0, dtype=np.float32), final=True)
@@ -1900,21 +1907,11 @@ class OpenAIFullDuplexConnection:
     # ------------------------------------------------------------------ #
 
     @staticmethod
-    def _convert_tools(tools: list, *, strict: bool = False) -> list[dict]:
+    def _convert_tools(tools: list) -> list[dict]:
         """RealtimeFunctionTool is flat (type/name/description/parameters);
         apply_chat_template(tools=...) and ChatCompletionToolsParam both
         expect the chat-completions nested shape. MCP tools
         (RealtimeResponseCreateMcpTool) are not handled -- skipped.
-
-        strict=True marks every tool as OpenAI chat-completions "strict"
-        function calling -- RealtimeFunctionTool has no such field of its
-        own, but vLLM's structural-tag builder
-        (get_model_structural_tag/_any_tool_strict) only builds a
-        tool_choice="auto" grammar when at least one tool is strict, so
-        callers building guided-decoding tools need this set. Left False
-        for the copy handed to apply_chat_template, which shouldn't show
-        clients an OpenAI-specific field their own tool declaration never
-        asked for.
         """
         converted = []
         for tool in tools:
@@ -1925,15 +1922,15 @@ class OpenAIFullDuplexConnection:
                 "description": tool.description,
                 "parameters": tool.parameters,
             }
-            if strict:
-                function["strict"] = True
             converted.append({"type": "function", "function": function})
         return converted
 
     @staticmethod
     def _convert_tool_choice(
         tool_choice: Any,
-    ) -> str | ChatCompletionNamedToolChoiceParam:
+    ) -> str | ChatCompletionNamedToolChoiceParam | None:
+        if tool_choice is None:
+            return None
         if isinstance(tool_choice, str):
             return tool_choice
         choice_type = getattr(tool_choice, "type", None)

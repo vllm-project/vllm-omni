@@ -15,6 +15,7 @@ from typing import Any
 import numpy as np
 import pytest
 from openai.types import realtime as types
+from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
 from vllm.exceptions import VLLMValidationError
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 
@@ -1323,6 +1324,335 @@ async def test_build_full_prompt_forwards_reasoning_effort() -> None:
     await connection._build_full_prompt(reasoning_effort="high")
 
     assert captured[0].reasoning_effort == "high"
+
+
+class _StubResponseParser:
+    """Combined-parser stand-in: text after END_MARKER is content."""
+
+    END_MARKER = "__END__"
+    END_TOKEN_ID = 999
+
+    class _SubParser:
+        engine_based_streaming = True
+
+    reasoning_parser = _SubParser()
+    tool_parser = None
+
+    def __init__(self, *, preserve_special_tokens: bool = False) -> None:
+        self._reasoning_ended = False
+        self.preserve_special_tokens = preserve_special_tokens
+        self.adjusted = False
+        self.prompt_token_ids_seen: list[int] | None = None
+
+    def adjust_request(self, request):
+        self.adjusted = True
+        if self.preserve_special_tokens:
+            request.skip_special_tokens = False
+        return request
+
+    def set_prompt_token_ids(self, prompt_token_ids):
+        self.prompt_token_ids_seen = list(prompt_token_ids)
+
+    def parse_delta(self, delta_text, delta_token_ids, request, prompt_token_ids=None, *, finished):
+        if prompt_token_ids and self.END_TOKEN_ID in prompt_token_ids:
+            self._reasoning_ended = True
+        if not self._reasoning_ended:
+            if self.END_TOKEN_ID not in delta_token_ids:
+                return None
+            self._reasoning_ended = True
+            delta_text = delta_text.split(self.END_MARKER, 1)[-1]
+        return SimpleNamespace(content=delta_text or None, tool_calls=[])
+
+
+def _stub_parser(parser: _StubResponseParser):
+    def build(request):
+        return parser
+
+    return build
+
+
+def _text_output(text: str, token_ids: list[int], finish_reason: str | None = None) -> Any:
+    return SimpleNamespace(
+        final_output_type="text",
+        prompt_token_ids=[],
+        outputs=[SimpleNamespace(text=text, token_ids=token_ids, finish_reason=finish_reason)],
+    )
+
+
+def _make_run_connection(
+    websocket: _FakeWebSocket,
+    *,
+    sampling_params: list[Any] | None = None,
+) -> OpenAIFullDuplexConnection:
+    engine = SimpleNamespace(
+        model_config=SimpleNamespace(max_model_len=100, multimodal_config=None),
+        default_sampling_params_list=sampling_params or [],
+        generate=None,
+    )
+    connection, _ = _make_connection(websocket=websocket, engine=engine)
+    return connection
+
+
+async def _run_text_response(
+    connection: OpenAIFullDuplexConnection,
+    outputs: list[Any],
+    prompt_token_ids: list[int],
+    submitted_params: list[list[SamplingParams]] | None = None,
+    tool_choice: str | None = "none",
+):
+    async def generate(**kwargs):
+        if submitted_params is not None:
+            submitted_params.append(kwargs["sampling_params_list"])
+        for output in outputs:
+            yield output
+
+    connection.engine.generate = generate
+    response = _ResolvedResponse(
+        input=[],
+        instructions=None,
+        modalities=["text"],
+        max_output_tokens="inf",
+        tools=None,
+        tool_choice=tool_choice,
+        metadata=None,
+    )
+    active = ActiveResponse(response_id="resp_test", request_id="req_test")
+    connection.session.active_response = active
+
+    await connection._run_response(active.response_id, response, {"prompt_token_ids": prompt_token_ids})
+    return active
+
+
+@pytest.mark.asyncio
+async def test_run_response_strips_reasoning_from_text_output(monkeypatch) -> None:
+    websocket = _FakeWebSocket()
+    connection = _make_run_connection(websocket)
+    end = _StubResponseParser.END_MARKER
+    monkeypatch.setattr(connection, "_build_response_parser", _stub_parser(_StubResponseParser()))
+
+    await _run_text_response(
+        connection,
+        [
+            _text_output("weighing the options", [10, 11]),
+            _text_output("more " + end + "Hello", [12, _StubResponseParser.END_TOKEN_ID, 13]),
+            _text_output(" world", [14]),
+        ],
+        prompt_token_ids=[7],
+    )
+
+    events = _websocket_events(websocket)
+    deltas = [event["delta"] for event in events if event["type"] == "response.output_text.delta"]
+    assert deltas == ["Hello", " world"]
+    done = next(event for event in events if event["type"] == "response.output_text.done")
+    assert done["text"] == "Hello world"
+
+
+@pytest.mark.asyncio
+async def test_run_response_accepts_tool_choice_without_tools(monkeypatch) -> None:
+    """Clearing a session's tools must not leave a tool_choice that rejects the request."""
+    websocket = _FakeWebSocket()
+    connection = _make_run_connection(websocket)
+    monkeypatch.setattr(connection, "_build_response_parser", _stub_parser(_StubResponseParser()))
+
+    await _run_text_response(
+        connection,
+        [_text_output("Hello", [7])],
+        prompt_token_ids=[_StubResponseParser.END_TOKEN_ID],
+        tool_choice="auto",
+    )
+
+    events = _websocket_events(websocket)
+    deltas = [event["delta"] for event in events if event["type"] == "response.output_text.delta"]
+    assert deltas == ["Hello"]
+
+
+@pytest.mark.asyncio
+async def test_run_response_emits_content_when_prompt_already_ended_reasoning(monkeypatch) -> None:
+    websocket = _FakeWebSocket()
+    connection = _make_run_connection(websocket)
+    monkeypatch.setattr(connection, "_build_response_parser", _stub_parser(_StubResponseParser()))
+
+    await _run_text_response(
+        connection,
+        [_text_output("Hello", [7])],
+        prompt_token_ids=[_StubResponseParser.END_TOKEN_ID],
+    )
+
+    events = _websocket_events(websocket)
+    deltas = [event["delta"] for event in events if event["type"] == "response.output_text.delta"]
+    assert deltas == ["Hello"]
+
+
+@pytest.mark.asyncio
+async def test_run_response_accepts_unset_tool_choice(monkeypatch) -> None:
+    """A session that never sets tool_choice must not fail request construction."""
+    websocket = _FakeWebSocket()
+    connection = _make_run_connection(websocket)
+    monkeypatch.setattr(connection, "_build_response_parser", _stub_parser(_StubResponseParser()))
+
+    await _run_text_response(
+        connection,
+        [_text_output("Hello", [7])],
+        prompt_token_ids=[_StubResponseParser.END_TOKEN_ID],
+        tool_choice=None,
+    )
+
+    events = _websocket_events(websocket)
+    deltas = [event["delta"] for event in events if event["type"] == "response.output_text.delta"]
+    assert deltas == ["Hello"]
+
+
+@pytest.mark.asyncio
+async def test_run_response_does_not_parse_reasoning_from_audio_transcripts(monkeypatch) -> None:
+    websocket = _FakeWebSocket()
+    connection = _make_run_connection(websocket)
+
+    def fail(request):
+        raise AssertionError("parsing must not run for audio transcripts")
+
+    monkeypatch.setattr(connection, "_build_response_parser", fail)
+    response = _ResolvedResponse(
+        input=[],
+        instructions=None,
+        modalities=["audio"],
+        max_output_tokens="inf",
+        tools=None,
+        tool_choice="none",
+        metadata=None,
+    )
+    active = ActiveResponse(response_id="resp_test", request_id="req_test")
+    connection.session.active_response = active
+
+    async def generate(**_kwargs):
+        yield _text_output("not stripped", [1])
+
+    connection.engine.generate = generate
+    await connection._run_response(active.response_id, response, {"prompt_token_ids": []})
+
+    events = _websocket_events(websocket)
+    transcripts = [event["delta"] for event in events if event["type"] == "response.output_audio_transcript.delta"]
+    assert transcripts == ["not stripped"]
+
+
+@pytest.mark.asyncio
+async def test_run_response_applies_parser_request_adjustments(monkeypatch) -> None:
+    websocket = _FakeWebSocket()
+    connection = _make_run_connection(websocket, sampling_params=[SamplingParams()])
+    parser = _StubResponseParser(preserve_special_tokens=True)
+    monkeypatch.setattr(connection, "_build_response_parser", _stub_parser(parser))
+    submitted: list[list[SamplingParams]] = []
+
+    await _run_text_response(
+        connection,
+        [_text_output("Hi", [7])],
+        prompt_token_ids=[7, 8],
+        submitted_params=submitted,
+    )
+
+    assert parser.adjusted
+    assert parser.prompt_token_ids_seen == [7, 8]
+    assert [params.skip_special_tokens for params in submitted[0]] == [False]
+
+
+class _ToolCallResponseParser(_StubResponseParser):
+    """Combined-parser stand-in that reports one complete tool call."""
+
+    def parse_delta(self, delta_text, delta_token_ids, request, prompt_token_ids=None, *, finished):
+        return SimpleNamespace(
+            content=None,
+            tool_calls=[
+                SimpleNamespace(
+                    index=0,
+                    id="call_1",
+                    function=SimpleNamespace(name="get_time", arguments='{"tz":"UTC"}'),
+                )
+            ],
+        )
+
+
+@pytest.mark.asyncio
+async def test_run_response_streams_tool_calls_from_parser(monkeypatch) -> None:
+    websocket = _FakeWebSocket()
+    connection = _make_run_connection(websocket)
+    monkeypatch.setattr(connection, "_build_response_parser", _stub_parser(_ToolCallResponseParser()))
+
+    await _run_text_response(connection, [_text_output("", [1], finish_reason="stop")], prompt_token_ids=[7])
+
+    events = _websocket_events(websocket)
+    added = [
+        event
+        for event in events
+        if event["type"] == "response.output_item.added" and event["item"]["type"] == "function_call"
+    ]
+    assert [event["item"]["call_id"] for event in added] == ["call_1"]
+    assert [event["item"]["name"] for event in added] == ["get_time"]
+    deltas = [event["delta"] for event in events if event["type"] == "response.function_call_arguments.delta"]
+    assert deltas == ['{"tz":"UTC"}']
+
+
+def test_build_response_parser_matches_chat_path() -> None:
+    calls: dict[str, Any] = {}
+
+    class _ParserCls:
+        reasoning_parser_cls = object()
+
+        def __init__(self, tokenizer: Any, tools: Any, **kwargs: Any) -> None:
+            calls.update(tokenizer=tokenizer, tools=tools, **kwargs)
+
+    websocket = _FakeWebSocket()
+    connection, _ = _make_connection(websocket=websocket)
+    connection.chat_handler.parser_cls = _ParserCls
+    connection.chat_handler._effective_chat_template_kwargs = lambda _request: {"enable_thinking": False}
+    request = ChatCompletionRequest(messages=[])
+
+    parser = connection._build_response_parser(request)
+
+    assert isinstance(parser, _ParserCls)
+    assert calls["tokenizer"] is connection._tokenizer
+    assert calls["tools"] is None
+    assert calls["chat_template_kwargs"] == {"enable_thinking": False}
+    assert calls["model_config"] is connection.engine.model_config
+
+
+def test_build_response_parser_returns_none_without_parser_cls() -> None:
+    websocket = _FakeWebSocket()
+    connection, _ = _make_connection(websocket=websocket)
+    connection.chat_handler.parser_cls = None
+
+    request = ChatCompletionRequest(messages=[])
+
+    assert connection._build_response_parser(request) is None
+
+
+def _function_tool_response() -> types.RealtimeResponseCreateParams:
+    return types.RealtimeResponseCreateParams(
+        tools=[
+            types.RealtimeFunctionTool(
+                type="function",
+                name="get_time",
+                description="Return the current time",
+                parameters={"type": "object", "properties": {}},
+            )
+        ],
+        tool_choice="auto",
+    )
+
+
+def test_resolve_response_rejects_tools_without_a_tool_parser() -> None:
+    connection, _ = _make_connection(websocket=_FakeWebSocket())
+
+    with pytest.raises(ValueError, match="--tool-call-parser"):
+        connection._resolve_response(_function_tool_response())
+
+
+def test_resolve_response_keeps_tools_when_a_tool_parser_is_configured() -> None:
+    connection, _ = _make_connection(websocket=_FakeWebSocket())
+    connection.chat_handler.parser_cls = SimpleNamespace(tool_parser_cls=object)
+
+    resolved = connection._resolve_response(_function_tool_response())
+
+    assert resolved.tools is not None
+    assert resolved.tool_choice == "auto"
 
 
 @pytest.mark.asyncio
