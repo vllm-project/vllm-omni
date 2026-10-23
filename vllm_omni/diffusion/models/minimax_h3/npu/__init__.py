@@ -10,9 +10,9 @@ CPU as well. See ``tests/diffusion/models/minimax_h3/test_minimax_h3_native_lora
 for the platform-agnostic and CUDA coverage that pins this.
 """
 
-from .lora import MINIMAX_H3_NATIVE_INFERENCE_STEPS, load_minimax_h3_native_lora
+from .lora import MINIMAX_H3_NATIVE_INFERENCE_STEPS, load_minimax_h3_native_distilled_lora
 
 __all__ = [
     "MINIMAX_H3_NATIVE_INFERENCE_STEPS",
-    "load_minimax_h3_native_lora",
+    "load_minimax_h3_native_distilled_lora",
 ]

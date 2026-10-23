@@ -8,7 +8,7 @@ https://github.com/ttulttul/ComfyUI-Minimax-H3-Continuation
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -16,6 +16,7 @@ import torch
 from vllm.logger import init_logger
 
 from vllm_omni.errors import OmniClientError
+from vllm_omni.model_executor.models.minimax_h3.conditioning import MiniMaxH3EncoderConditioning
 from vllm_omni.model_executor.models.minimax_h3.long_video import resolve_long_video_mode
 
 from .packed_tokens import minimax_h3_pack_audio_latent, minimax_h3_patchify_video_latent
@@ -86,7 +87,8 @@ def diffuse_continuation(
     *,
     window_frames: int,
     overlap_frames: int,
-    text_conditioning: Sequence[tuple[torch.Tensor, torch.Tensor]] | None = None,
+    window_conditioning: Iterator[MiniMaxH3EncoderConditioning] | None = None,
+    media_time_origin: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Denoise fresh windows; retain old latents and append only new suffixes.
 
@@ -97,11 +99,6 @@ def diffuse_continuation(
     before RoPE is evaluated; text and static image references remain fixed.
     """
     windows = plan_continuation_windows(kwargs["num_frames"], window_frames, overlap_frames)
-    if text_conditioning is not None and len(text_conditioning) != len(windows):
-        raise OmniClientError("MiniMax H3 requires one text conditioning per continuation window")
-    # Different prompts have different prefix lengths. Keep the media clock
-    # anchored after the longest prefix so text length cannot shift AV time.
-    media_time_origin = max(item[0].shape[0] for item in text_conditioning) if text_conditioning else None
     source_rows = kwargs.get("locked_audio_rows")
     source = None if source_rows is None else source_rows.reshape(2, kwargs["audio_t"], 32)
     video = audio = None
@@ -115,8 +112,30 @@ def diffuse_continuation(
             # Keep fractional RoPE units; audio slice indices alone are rounded.
             "temporal_offset": window.start * (40.0 / 24.0),
         }
-        if text_conditioning is not None:
-            args["text_embeddings"], args["text_tags"] = text_conditioning[index]
+        if window_conditioning is not None:
+            if index > 0:
+                condition = next(window_conditioning)
+                visual_shapes = list(condition.visual_condition_shapes)
+                audio_lengths = list(condition.audio_condition_lengths)
+                args.update(
+                    text_embeddings=condition.hidden_states.to(kwargs["text_embeddings"].device),
+                    text_tags=condition.token_tags.to(kwargs["text_embeddings"].device),
+                    visual_condition=(
+                        condition.visual_condition.to(kwargs["text_embeddings"].device)
+                        if condition.visual_condition is not None
+                        else None
+                    ),
+                    visual_condition_shapes=visual_shapes,
+                    audio_condition=(
+                        condition.audio_condition.to(kwargs["text_embeddings"].device)
+                        if condition.audio_condition is not None
+                        else None
+                    ),
+                    audio_condition_lengths=audio_lengths,
+                    ref_blocks=list(condition.ref_blocks),
+                    visual_condition_shape=visual_shapes[0] if len(visual_shapes) == 1 else None,
+                    ref_audio_t=audio_lengths[0] if len(audio_lengths) == 1 else None,
+                )
             args["media_time_origin"] = media_time_origin
         if source is not None:
             args["locked_audio_rows"] = source[:, window.audio_start : window.audio_end].reshape(-1, 32)
@@ -125,15 +144,15 @@ def diffuse_continuation(
             guide_video = minimax_h3_patchify_video_latent(video[:, :, -overlap_v:], patch_size=(1, 2, 2))
             guide_audio = minimax_h3_pack_audio_latent(audio[..., -window.overlap_audio_t :])
             for name, guide in (("visual_condition", guide_video), ("audio_condition", guide_audio)):
-                existing = kwargs.get(name)
+                existing = args.get(name)
                 args[name] = guide if existing is None else torch.cat((existing, guide), dim=0)
             args["visual_condition_shapes"] = [
-                *(kwargs.get("visual_condition_shapes") or []),
+                *(args.get("visual_condition_shapes") or []),
                 (overlap_v, kwargs["latent_h"], kwargs["latent_w"]),
             ]
-            args["audio_condition_lengths"] = [*(kwargs.get("audio_condition_lengths") or []), window.overlap_audio_t]
+            args["audio_condition_lengths"] = [*(args.get("audio_condition_lengths") or []), window.overlap_audio_t]
             args["ref_blocks"] = [
-                *(kwargs.get("ref_blocks") or []),
+                *(args.get("ref_blocks") or []),
                 {
                     "kind": "latent_guide",
                     "latent_t": overlap_v,

@@ -70,6 +70,7 @@ from vllm_omni.diffusion.utils.media_utils import normalize_preencode_batch_fram
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.errors import OmniClientError, client_error_from_metadata
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.lora.utils import filter_active_lora_adapters
 from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
 )
@@ -84,9 +85,11 @@ from vllm_omni.model_executor.models.minimax_h3.conditioning import (
     MiniMaxH3TextConditioning,
 )
 from vllm_omni.model_executor.models.minimax_h3.encoder_processing import (
+    ContinuationReferenceInputs,
     PreparedEncoderInputs,
     encode_media,
     prepare_encoder_inputs,
+    slice_continuation_reference,
 )
 from vllm_omni.model_executor.models.minimax_h3.long_video import validate_encoded_frame_limit
 from vllm_omni.model_executor.models.minimax_h3.preprocessing import (
@@ -140,7 +143,7 @@ from .latent_upscaler import (
     resolve_minimax_h3_latent_upscale_target,
     resolve_minimax_h3_latent_upscaler,
 )
-from .lora import TurboSpec, load_minimax_h3_turbo_lora
+from .lora import TurboSpec, load_minimax_h3_native_adapter, load_minimax_h3_turbo_lora
 from .minimax_h3_transformer import (
     MiniMaxH3Attention,
     MiniMaxH3DiTModel,
@@ -148,7 +151,7 @@ from .minimax_h3_transformer import (
 )
 from .npu.lora import (
     MINIMAX_H3_NATIVE_INFERENCE_STEPS,
-    load_minimax_h3_native_lora,
+    load_minimax_h3_native_distilled_lora,
 )
 from .packed_sequence import (
     MINIMAX_H3_MAX_PAD_SEQ_LEN,
@@ -697,7 +700,7 @@ class MiniMaxH3Pipeline(
         # same client-supplied ID. Every real load replaces the classification.
         self._clear_adaln_caches()
         self._turbo_lora_specs.pop(lora_request.lora_int_id, None)
-        self._native_lora_adapter_ids.discard(lora_request.lora_int_id)
+        self._native_distilled_lora_adapter_ids.discard(lora_request.lora_int_id)
         self._lora_sigma_schedules.pop(lora_request.lora_int_id, None)
         od_config = getattr(self, "od_config", None)
         offload_modes = []
@@ -724,7 +727,7 @@ class MiniMaxH3Pipeline(
         # running platform: the native loader is checkpoint-format parsing with
         # no ``torch_npu`` dependency, so it needs no ``current_omni_platform``
         # dispatch and binds the same adapter on NPU, CUDA and CPU.
-        native_loaded = load_minimax_h3_native_lora(
+        native_loaded = load_minimax_h3_native_distilled_lora(
             partition=self.partition,
             lora_request=lora_request,
             lora_path=lora_path,
@@ -733,10 +736,16 @@ class MiniMaxH3Pipeline(
         )
         if native_loaded is not None:
             lora_model, peft_helper, sigma_schedule = native_loaded
-            self._native_lora_adapter_ids.add(lora_request.lora_int_id)
+            self._native_distilled_lora_adapter_ids.add(lora_request.lora_int_id)
             self._lora_sigma_schedules[lora_request.lora_int_id] = sigma_schedule
             return lora_model, peft_helper
-        return None
+        return load_minimax_h3_native_adapter(
+            transformer=self.transformer,
+            lora_request=lora_request,
+            lora_path=lora_path,
+            dtype=dtype,
+            unsupported_offload_mode=" or ".join(offload_modes) or None,
+        )
 
     def _validate_diffusion_lora_binding(
         self,
@@ -752,7 +761,7 @@ class MiniMaxH3Pipeline(
                     f"bound={len(bound_lora_names)}/{len(lora_model.loras)}, missing={missing[:5]}"
                 )
             return
-        if lora_model.id not in self._native_lora_adapter_ids:
+        if lora_model.id not in self._native_distilled_lora_adapter_ids:
             return
         missing = sorted(set(lora_model.loras) - bound_lora_names)
         if missing:
@@ -768,17 +777,24 @@ class MiniMaxH3Pipeline(
         constrains the task nor imposes its sampler contract.
         """
 
-        lora_request = sampling.lora_request
-        if lora_request is None or math.isclose(0.0, float(sampling.lora_scale)):
-            return None
-        return self._turbo_lora_specs.get(lora_request.lora_int_id)
+        adapters = filter_active_lora_adapters(sampling.lora_request, sampling.lora_scale)
+        specs = [
+            self._turbo_lora_specs[request.lora_int_id]
+            for request, _ in adapters
+            if request.lora_int_id in self._turbo_lora_specs
+        ]
+        if len(specs) > 1:
+            raise OmniClientError("MiniMax-H3 supports at most one Turbo adapter in a composition")
+        if len(adapters) > 1 and any(
+            request.lora_int_id in self._native_distilled_lora_adapter_ids for request, _ in adapters
+        ):
+            raise OmniClientError("MiniMax-H3 native distilled LoRA cannot be composed with other adapters")
+        return specs[0] if specs else None
 
     def _has_active_native_lora(self, sampling: Any) -> bool:
-        lora_request = sampling.lora_request
-        return (
-            lora_request is not None
-            and not math.isclose(0.0, float(sampling.lora_scale))
-            and lora_request.lora_int_id in self._native_lora_adapter_ids
+        return any(
+            request.lora_int_id in self._native_distilled_lora_adapter_ids
+            for request, _ in filter_active_lora_adapters(sampling.lora_request, sampling.lora_scale)
         )
 
     def _validate_native_sampling(self, sampling: Any, *, task: str) -> None:
@@ -786,7 +802,9 @@ class MiniMaxH3Pipeline(
             raise OmniClientError("MiniMax-H3 native LoRA supports T2VA requests only")
         # Derive the expected count from the adapter's own schedule so the
         # message can never disagree with the schedule the denoise loop runs.
-        schedule = self._lora_sigma_schedules.get(sampling.lora_request.lora_int_id)
+        requests = sampling.lora_request
+        request = requests[0] if isinstance(requests, (list, tuple)) else requests
+        schedule = self._lora_sigma_schedules.get(request.lora_int_id)
         expected_steps = MINIMAX_H3_NATIVE_INFERENCE_STEPS if schedule is None else schedule.num_inference_steps
         # Only request mode can take the count from the adapter schedule: step
         # mode admits the request in ``StepScheduler``, which reads
@@ -817,12 +835,9 @@ class MiniMaxH3Pipeline(
             )
 
     def _sigma_schedule_for_request(self, sampling: Any, task: str) -> DMD2SigmaSchedule | None:
-        lora_request = sampling.lora_request
-        if (
-            lora_request is not None
-            and not math.isclose(0.0, float(sampling.lora_scale))
-            and lora_request.lora_int_id in self._lora_sigma_schedules
-        ):
+        adapters = filter_active_lora_adapters(sampling.lora_request, sampling.lora_scale)
+        lora_request = adapters[0][0] if adapters else None
+        if lora_request is not None and lora_request.lora_int_id in self._lora_sigma_schedules:
             adapter_schedule = self._lora_sigma_schedules[lora_request.lora_int_id]
             checkpoint_schedule = self._base_schedule_for_task(task)
             if checkpoint_schedule is not None:
@@ -929,7 +944,7 @@ class MiniMaxH3Pipeline(
             str(od_config.model),
         )
         self._turbo_lora_specs: dict[int, TurboSpec] = {}
-        self._native_lora_adapter_ids: set[int] = set()
+        self._native_distilled_lora_adapter_ids: set[int] = set()
         self._lora_sigma_schedules: dict[int, DMD2SigmaSchedule] = {}
         model_root = _resolve_minimax_h3_model_root(
             str(od_config.model),
@@ -1382,8 +1397,10 @@ class MiniMaxH3Pipeline(
                 cache.clear()
 
     def _prepare_adaln_adapter(self, sampling: OmniDiffusionSamplingParams) -> None:
-        request = getattr(sampling, "lora_request", None)
-        identity = None if request is None else (request.lora_int_id, request.lora_path, float(sampling.lora_scale))
+        identity = tuple(
+            (request.lora_int_id, request.lora_path, scale)
+            for request, scale in filter_active_lora_adapters(sampling.lora_request, sampling.lora_scale)
+        )
         if identity != getattr(self, "_adaln_adapter_identity", None):
             self._clear_adaln_caches()
             self._adaln_adapter_identity = identity
@@ -2606,7 +2623,45 @@ class MiniMaxH3Pipeline(
             raise OmniClientError(str(exc)) from exc
         return videos
 
-    def encode_prompt(self, prepared: PreparedEncoderInputs | None) -> tuple[torch.Tensor, torch.Tensor]:
+    def _prepare_prompt_inputs(
+        self, prepared: PreparedEncoderInputs
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+        """Build CPU processor inputs without running the text encoder."""
+        vision_kwargs: dict[str, torch.Tensor] = {}
+        if prepared.images:
+            vision = self.processor.image_processor(images=prepared.images, return_tensors="pt")
+            vision_kwargs.update(
+                pixel_values=vision["pixel_values"],
+                image_grid_thw=vision["image_grid_thw"],
+            )
+        if prepared.qwen_videos:
+            vision = self.processor.video_processor(
+                videos=[frames for frames, _ in prepared.qwen_videos],
+                do_sample_frames=False,
+                return_tensors="pt",
+            )
+            vision_kwargs.update(
+                pixel_values_videos=vision["pixel_values_videos"],
+                video_grid_thw=vision["video_grid_thw"],
+            )
+        ids, tags = build_minimax_h3_presentation(
+            self.tokenizer,
+            prompt=prepared.prompt,
+            task=prepared.media.task,
+            condition_labels=prepared.condition_labels,
+            image_grid_thw=vision_kwargs.get("image_grid_thw"),
+            video_grid_thw=vision_kwargs.get("video_grid_thw"),
+            video_timestamps=prepared.video_timestamps,
+            merge_size=int(self.processor.image_processor.merge_size),
+        )
+        return ids, tags, vision_kwargs
+
+    def encode_prompt(
+        self,
+        prepared: PreparedEncoderInputs | None,
+        *,
+        processor_inputs: tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         _, rank, _ = _dit_rank_world()
         ids = tags = hidden = None
         vision_kwargs: dict[str, torch.Tensor] = {}
@@ -2615,36 +2670,15 @@ class MiniMaxH3Pipeline(
             try:
                 if prepared is None:
                     raise ValueError("rank 0 must prepare MiniMax H3 text inputs")
-                if prepared.images:
-                    vision = self.processor.image_processor(images=prepared.images, return_tensors="pt")
-                    vision_kwargs.update(
-                        pixel_values=vision["pixel_values"],
-                        image_grid_thw=vision["image_grid_thw"],
-                    )
-                if prepared.qwen_videos:
-                    vision = self.processor.video_processor(
-                        videos=[frames for frames, _ in prepared.qwen_videos],
-                        do_sample_frames=False,
-                        return_tensors="pt",
-                    )
-                    vision_kwargs.update(
-                        pixel_values_videos=vision["pixel_values_videos"],
-                        video_grid_thw=vision["video_grid_thw"],
-                    )
-                ids, tags = build_minimax_h3_presentation(
-                    self.tokenizer,
-                    prompt=prepared.prompt,
-                    task=prepared.media.task,
-                    condition_labels=prepared.condition_labels,
-                    image_grid_thw=vision_kwargs.get("image_grid_thw"),
-                    video_grid_thw=vision_kwargs.get("video_grid_thw"),
-                    video_timestamps=prepared.video_timestamps,
-                    merge_size=int(self.processor.image_processor.merge_size),
+                ids, tags, vision_kwargs = (
+                    self._prepare_prompt_inputs(prepared) if processor_inputs is None else processor_inputs
                 )
             except Exception as exc:
                 error = exc
         _broadcast_rank0_exception(error)
         if rank < self.text_encoder_tp_size:
+            # Distribution mutates the mapping; keep cached processor inputs on CPU.
+            vision_kwargs = dict(vision_kwargs)
             ids = self._distribute_encode_inputs(ids, vision_kwargs)
             hidden = self._encode_text_hidden(ids, vision_kwargs)
         return (
@@ -2756,6 +2790,19 @@ class MiniMaxH3Pipeline(
             shapes.append(self.video_vae.predict_video_latent_shape(frames))
         return tuple(shapes)
 
+    def _encode_continuation_window(
+        self, inputs: ContinuationReferenceInputs, index: int
+    ) -> MiniMaxH3EncoderConditioning:
+        check_request_cancellation()
+        _, rank, _ = _dit_rank_world()
+        prepared = inputs.windows[index] if rank == 0 else None
+        hidden, tags = self.encode_prompt(
+            prepared,
+            processor_inputs=inputs.processor_inputs[index] if rank == 0 else None,
+        )
+        media = self._encode_local_media(prepared.media if rank == 0 else None)
+        return MiniMaxH3EncoderConditioning.from_components(MiniMaxH3TextConditioning(hidden, tags), media)
+
     def _prepare_local_conditioning(
         self,
         raw_prompt: Any,
@@ -2763,10 +2810,10 @@ class MiniMaxH3Pipeline(
         *,
         require_external_text: bool = False,
         request_context: dict[str, Any] | None = None,
-    ) -> tuple[MiniMaxH3EncoderConditioning, list[tuple[torch.Tensor, torch.Tensor]] | None]:
-        """Prepare media once and encode either shared text or each window's text.
+    ) -> tuple[MiniMaxH3EncoderConditioning, list[MiniMaxH3EncoderConditioning] | None]:
+        """Prepare shared conditioning or defer sliced reference window encoding.
 
-        Returns initial conditioning and optional request-owned window embeddings.
+        Returns initial conditioning and optional complete per-window conditions.
         Invalid continuation prompts are broadcast before any encoder collective.
         """
         group, rank, world_size = _dit_rank_world()
@@ -2774,6 +2821,7 @@ class MiniMaxH3Pipeline(
         prepared = text_conditioning = None
         initial_noise_params = None
         visual_noise_params = None
+        reference_windows = None
         error = None
         if rank == 0:
             try:
@@ -2819,6 +2867,15 @@ class MiniMaxH3Pipeline(
                         task=task,
                         step_execution=bool(getattr(self.od_config, "step_execution", False)),
                     )
+                if (sampling.extra_args or {}).get("continuation_slice_reference_video", False):
+                    if continuation is None or not self.load_text_encoder or not self.load_vae_encoder:
+                        raise OmniClientError("Sliced continuation references require local text and VAE encoders")
+                    if not prepared.media.videos or prepared.media.audio_mode != "native":
+                        raise OmniClientError(
+                            "Sliced continuation references require video references and native audio"
+                        )
+                    window, overlap = continuation
+                    reference_windows = plan_continuation_windows(prepared.media.num_frames, window, overlap)
                 if prompts is not None:
                     if continuation is None or not self.load_text_encoder:
                         raise OmniClientError(
@@ -2860,10 +2917,39 @@ class MiniMaxH3Pipeline(
             except Exception as exc:
                 error = exc
         _broadcast_rank0_exception(error)
-        header = [(text_conditioning is not None, initial_noise_params, visual_noise_params)]
+        header = [(text_conditioning is not None, initial_noise_params, visual_noise_params, reference_windows)]
         if world_size > 1:
             dist.broadcast_object_list(header, src=0, group=group)
-        reuse_text, initial_noise_params, visual_noise_params = header[0]
+        reuse_text, initial_noise_params, visual_noise_params, reference_windows = header[0]
+        if reference_windows is not None:
+            processor_inputs = []
+            window_inputs = []
+            error = None
+            if rank == 0:
+                try:
+                    for index, window in enumerate(reference_windows):
+                        window_prepared = slice_continuation_reference(prepared, window.start, window.end)
+                        if prompts is not None:
+                            window_prepared = replace(window_prepared, prompt=prompts[index])
+                        window_inputs.append(window_prepared)
+                        processor_inputs.append(self._prepare_prompt_inputs(window_prepared))
+                except Exception as exc:
+                    error = exc
+            _broadcast_rank0_exception(error)
+            # Preserve the global media clock without encoding future windows.
+            origin = [max(item[0].shape[0] for item in processor_inputs) if rank == 0 else None]
+            if world_size > 1:
+                dist.broadcast_object_list(origin, src=0, group=group)
+            reference_inputs = ContinuationReferenceInputs(
+                window_count=len(reference_windows),
+                windows=window_inputs,
+                processor_inputs=processor_inputs,
+                media_time_origin=origin[0],
+            )
+            first_conditioning = self._encode_continuation_window(reference_inputs, 0)
+            assert request_context is not None
+            request_context["continuation_reference_inputs"] = reference_inputs
+            return first_conditioning, None
         executor = (
             ThreadPoolExecutor(max_workers=1, thread_name_prefix="minimax_h3_initial_noise")
             if initial_noise_params is not None
@@ -2913,22 +2999,30 @@ class MiniMaxH3Pipeline(
                         f"predicted {predicted_shapes}, encoded {actual_shapes}"
                     )
                 request_context["precomputed_visual_condition_noise"] = visual_noise.result()
-            return MiniMaxH3EncoderConditioning.from_components(
-                MiniMaxH3TextConditioning(hidden, tags), media
-            ), window_text
+            conditioning = MiniMaxH3EncoderConditioning.from_components(MiniMaxH3TextConditioning(hidden, tags), media)
+            window_conditioning = (
+                [replace(conditioning, hidden_states=hidden, token_tags=tags) for hidden, tags in window_text]
+                if window_text is not None
+                else None
+            )
+            return conditioning, window_conditioning
         finally:
             if executor is not None:
                 executor.shutdown(wait=True, cancel_futures=True)
 
     def _prepare_request_inputs(self, raw_prompt: Any, sampling: Any) -> dict[str, Any]:
+        if (sampling.extra_args or {}).get("continuation_slice_reference_video", False) and not (
+            self.load_text_encoder and self.load_vae_encoder
+        ):
+            raise OmniClientError("Sliced continuation references require local text and VAE encoders")
         if (getattr(sampling, "extra_args", None) or {}).get(
             "continuation_prompts"
         ) is not None and not self.load_text_encoder:
             raise OmniClientError("continuation_prompts requires continuation mode with a local text encoder")
-        window_text = None
+        window_conditioning = None
         context: dict[str, Any] = {}
         if self.load_text_encoder or self.load_vae_encoder:
-            conditioning, window_text = self._prepare_local_conditioning(
+            conditioning, window_conditioning = self._prepare_local_conditioning(
                 raw_prompt,
                 sampling,
                 require_external_text=not self.load_text_encoder,
@@ -2950,8 +3044,8 @@ class MiniMaxH3Pipeline(
             context["keyframe_images"] = load_minimax_h3_images(images)
             if len(context["keyframe_images"]) != len(context["keyframe_frame_indices"] or ()):
                 raise OmniClientError("MiniMax H3 latent_refine requires the original FL2VA keyframe images")
-        if window_text is not None:
-            context["continuation_text_conditioning"] = window_text
+        if window_conditioning is not None:
+            context["continuation_conditioning"] = window_conditioning
         return context
 
     @staticmethod
@@ -3232,7 +3326,7 @@ class MiniMaxH3Pipeline(
             raise OmniClientError("MiniMax H3 timeline guides do not support cache acceleration")
         if self._fasth3 is not None or self._fasth3_checkpoint is not None:
             raise OmniClientError("MiniMax H3 timeline guides require base H3 weights, not FastH3")
-        active_lora = sampling.lora_request is not None and not math.isclose(float(sampling.lora_scale), 0.0)
+        active_lora = bool(filter_active_lora_adapters(sampling.lora_request, sampling.lora_scale))
         if turbo or native_lora or active_lora:
             raise OmniClientError("MiniMax H3 timeline guides do not support active LoRA/Turbo adapters")
         if self._sigma_schedule_for_request(sampling, task) is not None:
@@ -3333,12 +3427,28 @@ class MiniMaxH3Pipeline(
                 )
             else:
                 window_frames, overlap_frames = context["continuation"]
+                reference_inputs = context.get("continuation_reference_inputs")
+                if reference_inputs is not None:
+                    window_conditioning = (
+                        self._encode_continuation_window(reference_inputs, index)
+                        for index in range(1, reference_inputs.window_count)
+                    )
+                    media_time_origin = reference_inputs.media_time_origin
+                else:
+                    window_conditions = context.get("continuation_conditioning")
+                    window_conditioning = iter(window_conditions[1:]) if window_conditions is not None else None
+                    media_time_origin = (
+                        max(condition.hidden_states.shape[0] for condition in window_conditions)
+                        if window_conditions is not None
+                        else None
+                    )
                 video_latent, audio_latent = diffuse_continuation(
                     self.diffuse,
                     output_kwargs,
                     window_frames=window_frames,
                     overlap_frames=overlap_frames,
-                    text_conditioning=context.get("continuation_text_conditioning"),
+                    window_conditioning=window_conditioning,
+                    media_time_origin=media_time_origin,
                 )
             check_request_cancellation()
             if upscale_target is not None:

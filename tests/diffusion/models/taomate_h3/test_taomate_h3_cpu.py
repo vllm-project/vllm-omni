@@ -521,7 +521,7 @@ def _native_manager_case(tmp_path, monkeypatch, *, merge, scale, device="cpu"):
         pipeline._tm_teacher_graph = pipeline._tm_text_graph = None
         pipeline._tm_teacher = TaoMateAudioTeacher(transformer, manager=None, device=device)
         pipeline._turbo_lora_specs = {}
-        pipeline._native_lora_adapter_ids = set()
+        pipeline._native_distilled_lora_adapter_ids = set()
         base = {name: layer.weight for name, layer in originals.items()}
         manager = DiffusionLoRAManager(pipeline, device, torch.bfloat16, lora_path=adapter_dir, lora_scale=0.0)
         try:

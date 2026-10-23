@@ -221,6 +221,26 @@ Record the server commit, model/adapter, input assets, prompt, settings, and out
 alongside the result. Local schema or mocked-server checks do not establish H3
 generation quality or replace this real-model validation.
 
+#### MiniMax H3 Character Replacement
+
+Download [Character Swap V1.5](https://huggingface.co/akatz-ai/MiniMax-H3-Character-Swap-LoRA) on the machine running vLLM-Omni:
+
+```bash
+hf download akatz-ai/MiniMax-H3-Character-Swap-LoRA h3_character_swap_v1.5.safetensors --local-dir /models
+```
+
+In **LoRA(Character Swap)**, set `local_path` to `/models/h3_character_swap_v1.5.safetensors`, enable the adapter and start with `scale=1.0`. Leave `int_id=0` for automatic identification. Start the service with `--lora-backend peft`; for Swap + Turbo composition, use `--max-cpu-loras 3`. The target image supplies appearance, the video supplies motion and scene structure, and the prompt identifies which person to replace. FastH3-Omni + Swap requires a server that supports request-level LoRA for that checkpoint.
+
+Load [MiniMax-H3 Character Replacement](example_workflows/vLLM-Omni%20MiniMax-H3%20Character%20Replacement.json),
+select your own target image and motion video, and replace both `/models/...`
+adapter paths with server-local files. This template uses reference conditioning,
+not pixel-locked editing, and saves generated audio. Supply the complete reference
+video and target duration. Enable long_video, select continuation, and enable
+continuation_slice_reference_video to match each window to the corresponding
+source interval. Adjust continuation_window_frames and
+continuation_overlap_frames to set the window length and overlap. Inspect
+continuity and source action timing; output may include frame-alignment padding.
+
 ### MiniMax H3 Text to Video
 
 Import [the H3 text-to-video template](example_workflows/MiniMax_H3_Text_to_Video.json)

@@ -11,7 +11,7 @@ import tempfile
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import AbstractContextManager, nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import numpy as np
@@ -458,6 +458,82 @@ class PreparedEncoderInputs:
     condition_labels: list[tuple[str, int]]
 
 
+@dataclass(kw_only=True)
+class ContinuationReferenceInputs:
+    """CPU inputs for lazy encoding of continuation reference windows.
+
+    The two lists share window order and are populated only on rank 0.
+    All ranks retain window_count and media_time_origin for synchronized execution.
+    """
+
+    window_count: int
+    windows: list[PreparedEncoderInputs]
+    processor_inputs: list[tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]]
+    # Longest presentation prefix, anchoring media positions across all windows.
+    media_time_origin: int
+
+
+def _qwen_video_input(sampled_frames: Sequence[np.ndarray]) -> tuple[np.ndarray, dict[str, Any]]:
+    frames = np.stack(sampled_frames)
+    count = len(frames)
+    return frames, {
+        "total_num_frames": count,
+        "fps": MINIMAX_H3_QWEN_VIDEO_SAMPLE_FPS,
+        "duration": count / MINIMAX_H3_QWEN_VIDEO_SAMPLE_FPS,
+        "video_backend": "minimax_h3",
+        "frames_indices": list(range(count)),
+        "do_sample_frames": False,
+    }
+
+
+def slice_continuation_reference(prepared: PreparedEncoderInputs, start: int, end: int) -> PreparedEncoderInputs:
+    """Slice video and its soundtrack on the target's 24-FPS timeline."""
+    videos = []
+    video_audios = []
+    qwen_videos = []
+    timestamps = []
+    for video, audio in zip(prepared.media.videos, prepared.media.video_audios, strict=True):
+        frames = video[start:end]
+        if len(frames) == 0:
+            raise OmniClientError("Continuation reference video does not cover the requested window")
+        frames = frames.contiguous()
+        videos.append(frames)
+        sampled = sample_reference_video_frames("", decoded_frames=frames.numpy())
+        qwen_videos.append(_qwen_video_input(sampled["frames"]))
+        timestamps.append(sampled["block_timestamps"])
+        if audio is None:
+            video_audios.append(None)
+        else:
+            waveform, rate = audio
+            cropped = waveform[..., round(start * rate / MINIMAX_H3_FPS) : round(end * rate / MINIMAX_H3_FPS)]
+            video_audios.append((cropped.contiguous(), rate))
+    return replace(
+        prepared,
+        media=replace(
+            prepared.media,
+            videos=tuple(videos),
+            video_audios=tuple(video_audios),
+        ),
+        qwen_videos=qwen_videos,
+        video_timestamps=timestamps,
+    )
+
+
+def _validate_video_soundtracks(media: MiniMaxH3EncoderMediaInput) -> None:
+    """Validate embedded waveforms against the prepared reference video duration."""
+    limit = max(15.0, sum(len(video) for video in media.videos) / MINIMAX_H3_FPS)
+    total = 0.0
+    for audio in media.video_audios:
+        if audio is None:
+            continue
+        waveform, rate = audio
+        if rate <= 0 or waveform.shape[-1] == 0:
+            raise OmniClientError("Video soundtrack must have a positive sample rate and duration")
+        total += waveform.shape[-1] / rate
+    if total > limit:
+        raise OmniClientError(f"Video soundtracks must be at most {limit:g} seconds in total")
+
+
 def _effective_audio_inputs(
     video_audios: Sequence[tuple[torch.Tensor, int] | None],
     standalone_audios: Sequence[tuple[torch.Tensor, int]],
@@ -612,6 +688,7 @@ def prepare_encoder_inputs(
                         target_frame_count=num_frames,
                         workdir=workdir,
                         start_time_seconds=extra_args.get("start_time_seconds"),
+                        allow_long_video=extra_args.get("long_video", False),
                     )
                 audio_pool = ThreadPoolExecutor(max_workers=1)
                 try:
@@ -637,21 +714,7 @@ def prepare_encoder_inputs(
                             decoded_frames=full_frames,
                         )
                         video_timestamps.append(sampled["block_timestamps"])
-                        frames = np.stack(sampled["frames"])
-                        frame_count = int(frames.shape[0])
-                        qwen_video_inputs.append(
-                            (
-                                frames,
-                                {
-                                    "total_num_frames": frame_count,
-                                    "fps": MINIMAX_H3_QWEN_VIDEO_SAMPLE_FPS,
-                                    "duration": frame_count / MINIMAX_H3_QWEN_VIDEO_SAMPLE_FPS,
-                                    "video_backend": "minimax_h3",
-                                    "frames_indices": list(range(frame_count)),
-                                    "do_sample_frames": False,
-                                },
-                            )
-                        )
+                        qwen_video_inputs.append(_qwen_video_input(sampled["frames"]))
                         if audio_future is not None:
                             waveform, sample_rate = audio_future.result()
                             video_audio_inputs.append((waveform.float().contiguous(), int(sample_rate)))
@@ -745,8 +808,10 @@ def prepare_encoder_inputs(
         max_standalone_seconds=float(media_input.num_frames) / MINIMAX_H3_FPS,
     )
     embedded_audio_count = sum(item is not None for item in media_input.video_audios)
-    # Video soundtracks and standalone references have separate 15-second budgets.
-    validate_reference_audio_waveforms(audio_inputs[:embedded_audio_count])
+    _validate_video_soundtracks(media_input)
+    for waveform, rate in audio_inputs[:embedded_audio_count]:
+        if waveform.shape[-1] < 2 * rate:
+            raise OmniClientError("Uploaded video soundtrack must be at least 2 seconds")
     if not lock_audio:
         validate_reference_audio_waveforms(audio_inputs[embedded_audio_count:])
 
@@ -848,7 +913,7 @@ def encode_media(
         max_standalone_seconds=float(media.num_frames) / MINIMAX_H3_FPS,
     )
     embedded_audio_count = sum(item is not None for item in media.video_audios)
-    validate_reference_audio_waveforms([item for item in media.video_audios if item is not None])
+    _validate_video_soundtracks(media)
     if media.audio_mode != "lock_source":
         validate_reference_audio_waveforms(media.audios)
     visual_rows: list[torch.Tensor] = []
@@ -918,13 +983,6 @@ def encode_media(
         audio_vae=audio_vae,
         component_scope=component_scope,
     )
-    reference_lengths = audio_lengths[:-1] if media.audio_mode == "lock_source" else audio_lengths
-    if reference_lengths:
-        if any(length < 80 or length > 600 for length in reference_lengths):
-            raise ValueError("MiniMax H3 audio references must each be between 2 and 15 seconds")
-        if sum(reference_lengths[:embedded_audio_count]) > 600 or sum(reference_lengths[embedded_audio_count:]) > 600:
-            raise ValueError("MiniMax H3 audio references must be at most 15 seconds in total")
-
     ref_blocks: list[dict[str, Any]] = []
     image_shapes = visual_shapes[: len(media.images)]
     video_shapes = visual_shapes[len(media.images) :]
@@ -941,6 +999,7 @@ def encode_media(
                 "latent_w": shape[2],
             }
         )
+    reference_lengths = audio_lengths[:-1] if media.audio_mode == "lock_source" else audio_lengths
     ref_blocks.extend(
         {
             "kind": "audio",

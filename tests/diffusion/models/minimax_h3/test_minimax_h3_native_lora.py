@@ -13,12 +13,12 @@ from vllm.lora.lora_weights import PackedLoRALayerWeights
 from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager
 from vllm_omni.diffusion.models.minimax_h3.npu import lora as lora_module
-from vllm_omni.diffusion.models.minimax_h3.npu.lora import load_minimax_h3_native_lora
+from vllm_omni.diffusion.models.minimax_h3.npu.lora import load_minimax_h3_native_distilled_lora
 from vllm_omni.diffusion.sched.sigma_schedule import DMD2SigmaSchedule
 from vllm_omni.errors import OmniClientError
 from vllm_omni.lora.request import LoRARequest
 
-pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
 
 _TINY_HIDDEN = 2
 _TINY_FFN = 2
@@ -148,11 +148,12 @@ def _write_tiny_native(
     )
 
 
+@pytest.mark.cpu
 def test_h3_native_loads_and_packs_qkv_and_fc1(tmp_path):
     path = tmp_path / "minimax_h3_t2va_flashgen_4step_v1.0_768p_bf16.safetensors"
     _write_tiny_native(path)
 
-    loaded = load_minimax_h3_native_lora(
+    loaded = load_minimax_h3_native_distilled_lora(
         partition="fl2va",
         lora_request=_request(path),
         lora_path=path,
@@ -181,11 +182,12 @@ def test_h3_native_loads_and_packs_qkv_and_fc1(tmp_path):
     torch.testing.assert_close(fc1.lora_b[1], torch.full((_TINY_FFN, _TINY_RANK), 1.0))
 
 
+@pytest.mark.cpu
 def test_h3_native_rejects_bad_metadata_and_ref2va(tmp_path):
     path = tmp_path / "minimax_h3_t2va_flashgen_4step_v1.0_768p_bf16.safetensors"
     _write_tiny_native(path, metadata={"key_format": "minimax-h3-native", "qkv_layout": "runtime"})
     with pytest.raises(ValueError, match="qkv_layout='grouped'"):
-        load_minimax_h3_native_lora(
+        load_minimax_h3_native_distilled_lora(
             partition="fl2va",
             lora_request=_request(path),
             lora_path=path,
@@ -199,7 +201,7 @@ def test_h3_native_rejects_bad_metadata_and_ref2va(tmp_path):
     valid = valid_dir / "minimax_h3_t2va_flashgen_4step_v1.0_768p_bf16.safetensors"
     _write_tiny_native(valid)
     with pytest.raises(ValueError, match="supports T2VA only"):
-        load_minimax_h3_native_lora(
+        load_minimax_h3_native_distilled_lora(
             partition="ref2va",
             lora_request=_request(valid),
             lora_path=valid,
@@ -209,7 +211,7 @@ def test_h3_native_rejects_bad_metadata_and_ref2va(tmp_path):
     renamed = tmp_path / "renamed.safetensors"
     _write_tiny_native(renamed)
     with pytest.raises(ValueError, match="supports only"):
-        load_minimax_h3_native_lora(
+        load_minimax_h3_native_distilled_lora(
             partition="fl2va",
             lora_request=_request(renamed),
             lora_path=renamed,
@@ -217,11 +219,12 @@ def test_h3_native_rejects_bad_metadata_and_ref2va(tmp_path):
         )
 
 
+@pytest.mark.cpu
 def test_h3_native_rejects_truncated_artifact(tmp_path):
     path = tmp_path / "minimax_h3_t2va_flashgen_4step_v1.0_768p_bf16.safetensors"
     _write_tiny_native(path, omit_target="blocks.49.mlp.fc2")
     with pytest.raises(ValueError, match="target set does not match"):
-        load_minimax_h3_native_lora(
+        load_minimax_h3_native_distilled_lora(
             partition="fl2va",
             lora_request=_request(path),
             lora_path=path,
@@ -229,6 +232,7 @@ def test_h3_native_rejects_truncated_artifact(tmp_path):
         )
 
 
+@pytest.mark.cpu
 def test_h3_native_rejects_schedule_with_wrong_interval_count(tmp_path):
     """A mislabeled schedule must fail closed instead of silently changing steps."""
     path = tmp_path / "minimax_h3_t2va_flashgen_4step_v1.0_768p_bf16.safetensors"
@@ -245,7 +249,7 @@ def test_h3_native_rejects_schedule_with_wrong_interval_count(tmp_path):
         },
     )
     with pytest.raises(ValueError, match="4-interval base_schedule"):
-        load_minimax_h3_native_lora(
+        load_minimax_h3_native_distilled_lora(
             partition="fl2va",
             lora_request=_request(path),
             lora_path=path,
@@ -253,6 +257,7 @@ def test_h3_native_rejects_schedule_with_wrong_interval_count(tmp_path):
         )
 
 
+@pytest.mark.cpu
 @pytest.mark.parametrize(
     ("raw_schedule", "message"),
     [
@@ -283,7 +288,7 @@ def test_h3_native_rejects_malformed_schedule_metadata(tmp_path, raw_schedule, m
     _write_tiny_native(path, metadata=metadata)
 
     with pytest.raises(ValueError, match=message):
-        load_minimax_h3_native_lora(
+        load_minimax_h3_native_distilled_lora(
             partition="fl2va",
             lora_request=_request(path),
             lora_path=path,
@@ -291,11 +296,12 @@ def test_h3_native_rejects_malformed_schedule_metadata(tmp_path, raw_schedule, m
         )
 
 
+@pytest.mark.cpu
 def test_h3_native_declared_file_fails_closed_on_invalid_metadata(tmp_path):
     path = tmp_path / "minimax_h3_t2va_flashgen_4step_v1.0_768p_bf16.safetensors"
     _write_tiny_native(path, metadata={"key_format": "other"})
     with pytest.raises(ValueError, match="requires safetensors metadata"):
-        load_minimax_h3_native_lora(
+        load_minimax_h3_native_distilled_lora(
             partition="fl2va",
             lora_request=_request(path),
             lora_path=path,
@@ -303,6 +309,7 @@ def test_h3_native_declared_file_fails_closed_on_invalid_metadata(tmp_path):
         )
 
 
+@pytest.mark.cpu
 def test_pipeline_native_schedule_and_task_validation(monkeypatch):
     from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
 
@@ -311,7 +318,7 @@ def test_pipeline_native_schedule_and_task_validation(monkeypatch):
     pipeline.partition = "fl2va"
     pipeline.supported_tasks = frozenset({"t2va", "fl2va", "ref2va"})
     pipeline._turbo_lora_specs = {}
-    pipeline._native_lora_adapter_ids = {7}
+    pipeline._native_distilled_lora_adapter_ids = {7}
     pipeline._lora_sigma_schedules = {7: DMD2SigmaSchedule.from_positions([1.0, 0.7, 0.4, 0.15, 0.0])}
     pipeline._base_schedule_by_partition = {"fl2va": None}
 
@@ -340,6 +347,7 @@ def test_pipeline_native_schedule_and_task_validation(monkeypatch):
         pipeline._sigma_schedule_for_request(sampling, "t2va")
 
 
+@pytest.mark.cpu
 def test_pipeline_native_step_count_follows_adapter_schedule():
     """The accepted step count is the adapter's interval count, never a literal."""
     from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
@@ -347,7 +355,7 @@ def test_pipeline_native_step_count_follows_adapter_schedule():
     pipeline = object.__new__(MiniMaxH3Pipeline)
     torch.nn.Module.__init__(pipeline)
     pipeline.partition = "fl2va"
-    pipeline._native_lora_adapter_ids = {7}
+    pipeline._native_distilled_lora_adapter_ids = {7}
     pipeline._lora_sigma_schedules = {7: DMD2SigmaSchedule.from_positions([1.0, 0.5, 0.0])}
     request = LoRARequest("flashgen", 7, "/tmp/native.safetensors")
 
@@ -367,6 +375,7 @@ def test_pipeline_native_step_count_follows_adapter_schedule():
         )
 
 
+@pytest.mark.cpu
 @pytest.mark.parametrize("step_execution", [False, True])
 def test_pipeline_native_omitted_step_count_follows_execution_mode(step_execution):
     """Only request mode can resolve an omitted count from the adapter schedule.
@@ -380,7 +389,7 @@ def test_pipeline_native_omitted_step_count_follows_execution_mode(step_executio
     pipeline = object.__new__(MiniMaxH3Pipeline)
     torch.nn.Module.__init__(pipeline)
     pipeline.partition = "fl2va"
-    pipeline._native_lora_adapter_ids = {7}
+    pipeline._native_distilled_lora_adapter_ids = {7}
     pipeline._lora_sigma_schedules = {7: DMD2SigmaSchedule.from_positions([1.0, 0.7, 0.4, 0.15, 0.0])}
     pipeline.od_config = SimpleNamespace(step_execution=step_execution)
     sampling = SimpleNamespace(
@@ -403,6 +412,7 @@ def test_pipeline_native_omitted_step_count_follows_execution_mode(step_executio
         )
 
 
+@pytest.mark.cpu
 def test_pipeline_replaces_native_classification_after_reload(monkeypatch, tmp_path):
     from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
     from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as pipeline_module
@@ -420,7 +430,7 @@ def test_pipeline_replaces_native_classification_after_reload(monkeypatch, tmp_p
         enable_distributed_layerwise_offload=False,
     )
     pipeline._turbo_lora_specs = {}
-    pipeline._native_lora_adapter_ids = set()
+    pipeline._native_distilled_lora_adapter_ids = set()
     pipeline._lora_sigma_schedules = {}
 
     loaded = pipeline._load_diffusion_lora_adapter(
@@ -429,16 +439,19 @@ def test_pipeline_replaces_native_classification_after_reload(monkeypatch, tmp_p
         dtype=torch.float32,
     )
     assert loaded is not None
-    assert request.lora_int_id in pipeline._native_lora_adapter_ids
+    assert request.lora_int_id in pipeline._native_distilled_lora_adapter_ids
     assert request.lora_int_id in pipeline._lora_sigma_schedules
 
     monkeypatch.setattr(pipeline_module, "load_minimax_h3_turbo_lora", lambda **_: None)
-    monkeypatch.setattr(pipeline_module, "load_minimax_h3_native_lora", lambda **_: None)
+    monkeypatch.setattr(pipeline_module, "load_minimax_h3_native_distilled_lora", lambda **_: None)
+    pipeline.transformer = torch.nn.Module()
+    monkeypatch.setattr(pipeline_module, "load_minimax_h3_native_adapter", lambda **_: None)
     assert pipeline._load_diffusion_lora_adapter(lora_request=request, lora_path=path, dtype=torch.float32) is None
-    assert request.lora_int_id not in pipeline._native_lora_adapter_ids
+    assert request.lora_int_id not in pipeline._native_distilled_lora_adapter_ids
     assert request.lora_int_id not in pipeline._lora_sigma_schedules
 
 
+@pytest.mark.cpu
 @pytest.mark.parametrize(
     "offload_mode",
     [
@@ -451,7 +464,7 @@ def test_h3_native_rejects_offload_modes(tmp_path, offload_mode):
     _write_tiny_native(path)
 
     with pytest.raises(ValueError, match="does not support"):
-        load_minimax_h3_native_lora(
+        load_minimax_h3_native_distilled_lora(
             partition="fl2va",
             lora_request=_request(path),
             lora_path=path,
@@ -460,6 +473,7 @@ def test_h3_native_rejects_offload_modes(tmp_path, offload_mode):
         )
 
 
+@pytest.mark.cpu
 def test_h3_native_allows_distributed_layerwise_offload(monkeypatch):
     """DLO keeps LoRA A/B buffers resident, so native must not fail closed."""
     from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
@@ -474,7 +488,7 @@ def test_h3_native_allows_distributed_layerwise_offload(monkeypatch):
         enable_distributed_layerwise_offload=True,
     )
     pipeline._turbo_lora_specs = {}
-    pipeline._native_lora_adapter_ids = set()
+    pipeline._native_distilled_lora_adapter_ids = set()
     pipeline._lora_sigma_schedules = {}
     captured: dict[str, object] = {}
     schedule = DMD2SigmaSchedule.from_positions([1.0, 0.7, 0.4, 0.15, 0.0])
@@ -484,7 +498,7 @@ def test_h3_native_allows_distributed_layerwise_offload(monkeypatch):
         return object(), object(), schedule
 
     monkeypatch.setattr(pipeline_module, "load_minimax_h3_turbo_lora", lambda **_: None)
-    monkeypatch.setattr(pipeline_module, "load_minimax_h3_native_lora", load_native)
+    monkeypatch.setattr(pipeline_module, "load_minimax_h3_native_distilled_lora", load_native)
 
     request = _request("flashgen")
     loaded = pipeline._load_diffusion_lora_adapter(
@@ -495,10 +509,11 @@ def test_h3_native_allows_distributed_layerwise_offload(monkeypatch):
 
     assert loaded is not None
     assert captured["unsupported_offload_mode"] is None
-    assert request.lora_int_id in pipeline._native_lora_adapter_ids
+    assert request.lora_int_id in pipeline._native_distilled_lora_adapter_ids
     assert pipeline._lora_sigma_schedules[request.lora_int_id] is schedule
 
 
+@pytest.mark.cpu
 def test_h3_native_qkv_reorder_matches_base_loader_contract():
     from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import _reorder_grouped_qkv_to_qkv
 
@@ -521,6 +536,7 @@ def test_h3_native_qkv_reorder_matches_base_loader_contract():
     assert v.reshape(num_query_groups, head_dim)[0, 0] == grouped[0, 2 * head_dim]
 
 
+@pytest.mark.cpu
 def test_native_target_pattern_matches_component_qualified_names():
     """The manager matches "<component>.<module>", so the pattern needs the prefix."""
     import regex as re
@@ -536,6 +552,7 @@ def test_native_target_pattern_matches_component_qualified_names():
     assert re.search(pattern, "transformer.token_refiner.blocks.0.adaln_proj.linear") is None
 
 
+@pytest.mark.cpu
 def test_replace_layers_binds_every_native_target(monkeypatch):
     """Regression for bound=0/259: layer replacement must reach all 259 modules."""
     from vllm.lora.layers import BaseLayerWithLoRA
@@ -596,6 +613,7 @@ def test_replace_layers_binds_every_native_target(monkeypatch):
     assert set(manager._lora_modules) == {f"transformer.{target}" for target in lora_module._NATIVE_EXPECTED_TARGETS}
 
 
+@pytest.mark.cpu
 def test_legacy_manager_uses_native_loader(tmp_path):
     path = tmp_path / "minimax_h3_t2va_flashgen_4step_v1.0_768p_bf16.safetensors"
     _write_tiny_native(path)
@@ -614,7 +632,7 @@ def test_legacy_manager_uses_native_loader(tmp_path):
                 enable_distributed_layerwise_offload=False,
             )
             pipeline._turbo_lora_specs = {}
-            pipeline._native_lora_adapter_ids = set()
+            pipeline._native_distilled_lora_adapter_ids = set()
             pipeline._lora_sigma_schedules = {}
             return pipeline._load_diffusion_lora_adapter(**kwargs)
 
@@ -629,6 +647,7 @@ def test_legacy_manager_uses_native_loader(tmp_path):
     assert len(lora_model.loras) == 259
 
 
+@pytest.mark.cpu
 def test_pipeline_schedule_inactive_when_scale_zero():
     from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
 
@@ -636,7 +655,7 @@ def test_pipeline_schedule_inactive_when_scale_zero():
     torch.nn.Module.__init__(pipeline)
     pipeline.partition = "fl2va"
     pipeline._turbo_lora_specs = {}
-    pipeline._native_lora_adapter_ids = {7}
+    pipeline._native_distilled_lora_adapter_ids = {7}
     pipeline._lora_sigma_schedules = {7: DMD2SigmaSchedule.from_positions([1.0, 0.7, 0.4, 0.15, 0.0])}
     pipeline._base_schedule_by_partition = {"fl2va": None}
 
@@ -649,6 +668,7 @@ def test_pipeline_schedule_inactive_when_scale_zero():
     assert not pipeline._has_active_native_lora(sampling)
 
 
+@pytest.mark.cpu
 def test_pipeline_schedule_falls_back_after_eviction(monkeypatch, tmp_path):
     from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
     from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as pipeline_module
@@ -666,7 +686,7 @@ def test_pipeline_schedule_falls_back_after_eviction(monkeypatch, tmp_path):
         enable_distributed_layerwise_offload=False,
     )
     pipeline._turbo_lora_specs = {}
-    pipeline._native_lora_adapter_ids = set()
+    pipeline._native_distilled_lora_adapter_ids = set()
     pipeline._lora_sigma_schedules = {}
     pipeline._base_schedule_by_partition = {"fl2va": None}
 
@@ -679,7 +699,9 @@ def test_pipeline_schedule_falls_back_after_eviction(monkeypatch, tmp_path):
     assert request.lora_int_id in pipeline._lora_sigma_schedules
 
     monkeypatch.setattr(pipeline_module, "load_minimax_h3_turbo_lora", lambda **_: None)
-    monkeypatch.setattr(pipeline_module, "load_minimax_h3_native_lora", lambda **_: None)
+    monkeypatch.setattr(pipeline_module, "load_minimax_h3_native_distilled_lora", lambda **_: None)
+    pipeline.transformer = torch.nn.Module()
+    monkeypatch.setattr(pipeline_module, "load_minimax_h3_native_adapter", lambda **_: None)
     assert pipeline._load_diffusion_lora_adapter(lora_request=request, lora_path=path, dtype=torch.float32) is None
     assert request.lora_int_id not in pipeline._lora_sigma_schedules
 
@@ -691,15 +713,17 @@ def test_pipeline_schedule_falls_back_after_eviction(monkeypatch, tmp_path):
     assert pipeline._sigma_schedule_for_request(sampling, "t2va") is None
 
 
+@pytest.mark.cpu
 def test_native_packed_qkv_slices_are_tp2_divisible():
     assert lora_module._NATIVE_QKV_SLICE % 2 == 0
     assert lora_module._NATIVE_FFN_HIDDEN_SIZE % 2 == 0
 
 
+@pytest.mark.cpu
 def test_lora_manager_activates_native_packed_qkv(tmp_path):
     path = tmp_path / "minimax_h3_t2va_flashgen_4step_v1.0_768p_bf16.safetensors"
     _write_tiny_native(path)
-    loaded = load_minimax_h3_native_lora(
+    loaded = load_minimax_h3_native_distilled_lora(
         partition="fl2va",
         lora_request=_request(path),
         lora_path=path,
@@ -749,6 +773,7 @@ def test_lora_manager_activates_native_packed_qkv(tmp_path):
     torch.testing.assert_close(lora_b_list[2], packed.lora_b[2] * 0.5)
 
 
+@pytest.mark.cpu
 def test_lora_manager_tp2_splits_native_packed_qkv_per_rank():
     """Each Q/K/V slice must be divisible by TP2 so rank-local layers can shard rows."""
 
@@ -805,6 +830,7 @@ def _iter_native_slice_pairs(lora_model):
             yield module_name, a, b
 
 
+@pytest.mark.cpu
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 def test_native_lora_load_is_platform_agnostic(tmp_path, dtype):
     """The artifact is trained on Ascend, but loading it is not Ascend-only.
@@ -817,7 +843,7 @@ def test_native_lora_load_is_platform_agnostic(tmp_path, dtype):
     path = tmp_path / "minimax_h3_t2va_flashgen_4step_v1.0_768p_bf16.safetensors"
     _write_tiny_native(path)
 
-    loaded = load_minimax_h3_native_lora(
+    loaded = load_minimax_h3_native_distilled_lora(
         partition="fl2va",
         lora_request=_request(path),
         lora_path=path,
@@ -848,7 +874,7 @@ def test_native_lora_delta_matches_between_cpu_and_cuda(tmp_path):
     path = tmp_path / "minimax_h3_t2va_flashgen_4step_v1.0_768p_bf16.safetensors"
     _write_tiny_native(path)
 
-    loaded = load_minimax_h3_native_lora(
+    loaded = load_minimax_h3_native_distilled_lora(
         partition="fl2va",
         lora_request=_request(path),
         lora_path=path,

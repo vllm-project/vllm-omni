@@ -38,13 +38,16 @@ class DiffusionBaseLinearLayerWithLoRA(BaseLinearLayerWithLoRA):
         self._diffusion_lora_buffer_device = device
         self._move_lora_buffers(device)
 
+    def _allocate_lora_buffers(self, max_loras: int, lora_config, model_config=None) -> None:
+        super().create_lora_weights(max_loras, lora_config, model_config)
+
     def create_lora_weights(
         self,
         max_loras: int,
         lora_config,
         model_config=None,
     ) -> None:
-        super().create_lora_weights(max_loras, lora_config, model_config)
+        self._allocate_lora_buffers(max_loras, lora_config, model_config)
         buffer_device = getattr(self, "_diffusion_lora_buffer_device", None)
         if buffer_device is not None:
             self._move_lora_buffers(buffer_device)
@@ -114,7 +117,10 @@ class DiffusionBaseLinearLayerWithLoRA(BaseLinearLayerWithLoRA):
             self._diffusion_lora_active_slices = saved
             self._diffusion_lora_suspended_slices = None
 
-    def apply(self, x: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
+    def _base_output(self, x: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
+        return self.base_layer.quant_method.apply(self.base_layer, x, bias)
+
+    def _add_lora_delta(self, x: torch.Tensor, output: torch.Tensor) -> torch.Tensor:
         """
         override: Use simple matmul instead of punica_wrapper.add_lora_linear().
 
@@ -122,8 +128,6 @@ class DiffusionBaseLinearLayerWithLoRA(BaseLinearLayerWithLoRA):
         for the single-LoRA case. For packed projections (e.g. fused QKV), we
         apply LoRA per-slice using `output_slices`.
         """
-        output = self.base_layer.quant_method.apply(self.base_layer, x, bias)
-
         if not hasattr(self, "lora_a_stacked") or not hasattr(self, "lora_b_stacked"):
             return output
         if not self.lora_a_stacked or not self.lora_b_stacked:
@@ -198,6 +202,10 @@ class DiffusionBaseLinearLayerWithLoRA(BaseLinearLayerWithLoRA):
             offset += slice_size
 
         return y_flat.view(original_shape)
+
+    def apply(self, x: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
+        output = self._base_output(x, bias)
+        return self._add_lora_delta(x, output)
 
     def __getattr__(self, name: str):
         # The diffusion model implementations may access attributes directly

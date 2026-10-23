@@ -18,6 +18,8 @@ import numpy as np
 import torch
 from vllm.multimodal.hasher import MultiModalHasher
 
+from vllm_omni.lora.utils import build_lora_batch_key
+
 if TYPE_CHECKING:
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
@@ -82,13 +84,13 @@ def get_cache_namespace(model_namespace: str, sampling: OmniDiffusionSamplingPar
     """Isolate model semantics and the adapter actually activated by Worker.
 
     Native LoRA block keys use lora_name, but diffusion also supports a scale
-    and identifies loaded adapters by lora_int_id. Keep that difference here.
+    and identifies loaded adapters by lora_int_id, including stacked
+    multi-adapter combinations. Keep that difference here.
     Seeds are NOT global identity inputs: models attach random state only to
     the multimodal features whose computation depends on it.
     """
 
     if not isinstance(model_namespace, str) or not model_namespace:
         raise ValueError("Model cache namespace must be non-empty")
-    lora = sampling.lora_request
-    adapter = None if lora is None else (lora.lora_int_id, float(sampling.lora_scale))
+    adapter = build_lora_batch_key(sampling.lora_request, sampling.lora_scale)
     return hash_prefix_cache_value(("diffusion-prefix-identity-v2", model_namespace, adapter)).hex()
