@@ -390,6 +390,35 @@ async def test_real_executor_rpc_finishes_before_cancellation() -> None:
 
 
 @pytest.mark.asyncio
+async def test_profile_rpc_finishes_before_cancellation() -> None:
+    """Cancelling a profile RPC must wait for the busy-loop profile call."""
+    started = asyncio.Event()
+    release = asyncio.Event()
+    finished = []
+
+    async def async_profile(is_start, profile_prefix):
+        started.set()
+        await release.wait()
+        finished.append((is_start, profile_prefix))
+
+    proc = object.__new__(StageDiffusionProc)
+    proc._engine = SimpleNamespace(async_profile=async_profile)
+    task = asyncio.create_task(proc._handle_collective_rpc("profile", None, (False,), {}))
+    try:
+        await asyncio.wait_for(started.wait(), 1)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done(), "cancellation must wait for the in-flight profile RPC"
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 1)
+        assert finished == [(False, None)]
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
 async def test_proc_shutdown_cancels_waiting_rpc_before_closing_sockets(proc_control_loop, monkeypatch):
     proc, submit, outgoing, request_socket, response_socket, _context = proc_control_loop
     entered = asyncio.Event()

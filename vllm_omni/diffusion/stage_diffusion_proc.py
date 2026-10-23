@@ -269,13 +269,13 @@ class StageDiffusionProc:
 
         loop = asyncio.get_running_loop()
 
-        async def run_executor(method: Callable[..., Any], *method_args: Any) -> Any:
-            """Finish a worker-thread RPC before propagating task cancellation."""
-            future = loop.run_in_executor(self._executor, method, *method_args)
+        async def drain_on_cancel(rpc: Awaitable[Any]) -> Any:
+            """Finish an in-flight RPC before propagating task cancellation."""
+            future = asyncio.ensure_future(rpc)
             try:
                 return await asyncio.shield(future)
             except asyncio.CancelledError:
-                # Cancelling the asyncio wrapper does not cancel the thread.
+                # Cancelling the asyncio wrapper does not cancel the worker.
                 # Drain the shielded future before run_loop closes the engine
                 # and executor, so teardown cannot race a live collective RPC.
                 try:
@@ -284,12 +284,16 @@ class StageDiffusionProc:
                     pass
                 raise
 
+        async def run_executor(method: Callable[..., Any], *method_args: Any) -> Any:
+            """Finish a worker-thread RPC before propagating task cancellation."""
+            return await drain_on_cancel(loop.run_in_executor(self._executor, method, *method_args))
+
         if method == "profile":
             assert self._engine is not None
             is_start = args[0] if args else True
             profile_prefix = args[1] if len(args) > 1 else None
             # Not run_in_executor: the profiler must start on the busy-loop thread.
-            return await self._engine.async_profile(is_start, profile_prefix, **(kwargs or {}))
+            return await drain_on_cancel(self._engine.async_profile(is_start, profile_prefix, **(kwargs or {})))
 
         if method == "add_lora":
             # Reconstruct LoRARequest after IPC if needed.
