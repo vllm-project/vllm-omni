@@ -7,13 +7,18 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tests.helpers.mark import hardware_marks
 from vllm_omni.diffusion.forward_context import ForwardContext, override_forward_context
 
 pytestmark = [pytest.mark.diffusion, pytest.mark.core_model]
 
 
 @pytest.mark.parametrize(
-    "device", [pytest.param("cpu", marks=pytest.mark.cpu), pytest.param("cuda", marks=pytest.mark.cuda)]
+    "device",
+    [
+        pytest.param("cpu", marks=pytest.mark.cpu),
+        pytest.param("cuda", marks=hardware_marks(res={"cuda": "H100"}, num_cards=1)),
+    ],
 )
 @torch.inference_mode()
 def test_invalid_action_request_then_valid_compiled_request(monkeypatch, device):

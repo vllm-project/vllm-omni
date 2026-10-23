@@ -111,7 +111,7 @@ steps:
           - "python -c \"from flash_attn.cute.interface import flash_attn_func; assert callable(flash_attn_func)\""
           - "python -c \"import torch; assert torch.cuda.device_count() >= 1; assert torch.cuda.get_device_capability() == (9, 0)\""
           - "python .buildkite/cuda/scripts/check_vllm_runtime.py"
-          - "timeout 30m pytest -sv tests/diffusion/models/cosmos3/test_cosmos3_sparse_ulysses.py tests/diffusion/models/minimax_h3/test_minimax_h3_sparse_ulysses.py tests/diffusion/models/cosmos3/test_cosmos3_transformer.py tests/diffusion/models/minimax_h3/test_minimax_h3_contract.py -m 'core_model and cuda and H100 and cards_1' --run-level=core_model"
+          - "timeout 30m pytest -sv tests/diffusion/models/cosmos3/test_cosmos3_sparse_ulysses.py tests/diffusion/models/minimax_h3/test_minimax_h3_sparse_ulysses.py tests/diffusion/models/cosmos3/test_cosmos3_transformer.py tests/diffusion/models/minimax_h3/test_minimax_h3_contract.py tests/diffusion/attention/test_cosmos3_action_strategy.py tests/diffusion/models/cosmos3/test_cosmos3_attention_strategy.py tests/diffusion/models/cosmos3/test_cosmos3_strategy_offload.py -m 'core_model and cuda and H100 and cards_1' --run-level=core_model"
         mirror_hardwares: h100_1
 
       - label: "Diffusion · Sparse Models · 2-GPU"
@@ -201,7 +201,7 @@ steps:
 
       - label: "Diffusion · Model Test"
         commands:
-          - timeout 15m pytest -sv tests/diffusion/models/ --ignore=tests/diffusion/models/cosmos3/test_cosmos3_strategy_ulysses.py --ignore=tests/diffusion/models/cosmos3/test_cosmos3_transformer.py --ignore=tests/diffusion/models/minimax_h3/test_minimax_h3_contract.py --ignore=tests/diffusion/models/cosmos3/test_cosmos3_sparse_ulysses.py --ignore=tests/diffusion/models/minimax_h3/test_minimax_h3_sparse_ulysses.py -m 'core_model and cuda' --run-level "core_model"
+          - timeout 15m pytest -sv tests/diffusion/models/ --ignore=tests/diffusion/models/cosmos3/test_cosmos3_strategy_offload.py --ignore=tests/diffusion/models/cosmos3/test_cosmos3_attention_strategy.py --ignore=tests/diffusion/models/cosmos3/test_cosmos3_strategy_ulysses.py --ignore=tests/diffusion/models/cosmos3/test_cosmos3_transformer.py --ignore=tests/diffusion/models/minimax_h3/test_minimax_h3_contract.py --ignore=tests/diffusion/models/cosmos3/test_cosmos3_sparse_ulysses.py --ignore=tests/diffusion/models/minimax_h3/test_minimax_h3_sparse_ulysses.py -m 'core_model and cuda' --run-level "core_model"
         mirror_hardwares: l4_1
 
       - label: "Diffusion · Other Test"
