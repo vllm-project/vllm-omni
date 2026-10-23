@@ -14,6 +14,7 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig
 from vllm_omni.diffusion.forward_context import ForwardContext
+from vllm_omni.diffusion.layers.linear import MergedRowParallelLinear
 from vllm_omni.diffusion.models.flux2_klein import flux2_klein_transformer as klein
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
@@ -116,7 +117,7 @@ def test_packed_checkpoint_reconstruction_and_reload(monkeypatch, tp, name):
 @pytest.mark.parametrize("tp,heads", [(2, 8), (4, 24), (8, 24)])
 @pytest.mark.parametrize("mask_kind", ["none", "3d", "broadcast", "per_head"])
 @torch.inference_mode()
-def test_local_heads_and_gather_order_match_dense_attention(monkeypatch, tp, heads, mask_kind):
+def test_local_heads_and_merged_row_output_match_dense_attention(monkeypatch, tp, heads, mask_kind):
     torch.manual_seed(17)
     dim = heads * 8
     baseline = _attention(monkeypatch, 1, 0, local_tp=False, heads=heads)
@@ -144,32 +145,34 @@ def test_local_heads_and_gather_order_match_dense_attention(monkeypatch, tp, hea
     full_attention, full_mlp = captured[0].split([dim, 3 * dim], dim=-1)
     weights = {name: param.detach().clone() for name, param in baseline.named_parameters()}
 
+    def no_gather(*args, **kwargs):
+        raise AssertionError("local TP keeps attention/MLP sharded; nothing may be all-gathered")
+
+    partials = []
     for rank in range(tp):
         local = _attention(monkeypatch, tp, rank, heads=heads)
+        assert type(local.to_out) is MergedRowParallelLinear
         for name, param in local.named_parameters():
             getattr(param, "weight_loader", default_weight_loader)(param, weights[name])
-        feature_calls: list[int] = []
-        output_calls: list[int] = []
+        to_out_inputs = []
+        hook = local.to_out.register_forward_pre_hook(lambda module, args: to_out_inputs.append(args[0].clone()))
+        reduce_calls: list[int] = []
 
-        def gather_features(value, dim=-1):
-            reference = (full_attention, full_mlp)[len(feature_calls)]
-            torch.testing.assert_close(value, reference.chunk(tp, dim=-1)[rank], rtol=0.02, atol=0.002)
-            feature_calls.append(value.shape[-1])
-            return reference
+        def all_reduce(value):
+            reduce_calls.append(value.shape[-1])
+            return value
 
-        def gather_output(value, dim=-1):
-            torch.testing.assert_close(value, expected.chunk(tp, dim=-1)[rank], rtol=0.02, atol=0.002)
-            output_calls.append(value.shape[-1])
-            return expected
-
-        # Each outgoing tensor must match the independently computed dense
-        # result before the collective supplies the other ranks' slices.
-        monkeypatch.setattr(klein, "tensor_model_parallel_all_gather", gather_features)
-        monkeypatch.setattr(linear, "tensor_model_parallel_all_gather", gather_output)
-        actual = local(hidden, attention_mask=mask, image_rotary_emb=rotary)
-        torch.testing.assert_close(actual, expected)
-        assert feature_calls == [dim // tp, 3 * dim // tp]
-        assert output_calls == [dim // tp]
+        monkeypatch.setattr(linear, "tensor_model_parallel_all_gather", no_gather)
+        monkeypatch.setattr(linear, "tensor_model_parallel_all_reduce", all_reduce)
+        partials.append(local(hidden, attention_mask=mask, image_rotary_emb=rotary).float())
+        hook.remove()
+        # to_out sees this rank's heads and SwiGLU channels, then reduces once.
+        local_reference = torch.cat([full_attention.chunk(tp, dim=-1)[rank], full_mlp.chunk(tp, dim=-1)[rank]], dim=-1)
+        torch.testing.assert_close(to_out_inputs[0], local_reference, rtol=0.02, atol=0.002)
+        assert reduce_calls == [dim]
+    # The identity all-reduce stands in for the collective: the per-rank partial
+    # sums (bias on rank 0 only) must add up to the dense output.
+    torch.testing.assert_close(sum(partials).to(expected.dtype), expected, rtol=0.02, atol=0.002)
 
 
 @pytest.mark.parametrize(
@@ -233,7 +236,7 @@ def test_host_restore_contract_and_model_weight_reload(monkeypatch, tp):
         baseline = klein.Flux2Transformer2DModel(**kwargs)
         model = klein.Flux2Transformer2DModel(**kwargs, local_tp=True)
     assert baseline.host_weight_restore_contract.version == "1"
-    assert model.host_weight_restore_contract.version == ("2-local-single-stream-tp" if tp > 1 else "1")
+    assert model.host_weight_restore_contract.version == ("3-local-single-stream-tp-merged-row-out" if tp > 1 else "1")
     model.validate_restored_host_weights()
     name = "single_transformer_blocks.0.attn.to_qkv_mlp_proj.weight"
     weights = torch.linspace(-1, 1, 576 * 64).reshape(576, 64).to(torch.bfloat16)

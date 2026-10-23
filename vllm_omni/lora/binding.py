@@ -155,6 +155,20 @@ def _expand_expected_modules_for_packed_layers(
     return expanded
 
 
+def _diffusion_lora_classes() -> list[type]:
+    """Wrappers for base layers that live in the diffusion tree.
+
+    ``MergedRowParallelLinear`` subclasses ``RowParallelLinear``, whose upstream
+    wrapper matches the exact type only, so without this wrapper a LoRA on a merged
+    ``proj_out`` would be dropped silently. Imported lazily so the shared binding
+    does not load diffusion code at import time; for every other layer the extra
+    ``can_replace_layer`` check is a type comparison.
+    """
+    from vllm_omni.diffusion.lora.layers import DiffusionMergedRowParallelLinearWithLoRA
+
+    return [DiffusionMergedRowParallelLinearWithLoRA]
+
+
 def from_layer(
     layer: nn.Module,
     max_loras: int,
@@ -249,6 +263,7 @@ def from_layer(
         return instance
 
     lora_classes = [
+        *_diffusion_lora_classes(),
         OmniMergedQKVParallelLinearWithLoRA,
         OmniQKVParallelLinearWithLoRA,
         OmniMergedColumnParallelLinearWithLoRA,
