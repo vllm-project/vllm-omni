@@ -1109,6 +1109,20 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         value: torch.Tensor,
         attn_metadata: AttentionMetadata | None = None,
     ) -> torch.Tensor:
+        # NPU span metadata explicitly selects compiled FlexAttention. The
+        # default model path supplies a dense mask to FA Score below instead.
+        if attn_metadata is not None and attn_metadata.full_attn_spans is not None:
+            from vllm_omni.diffusion.attention.backends.utils.npu_flex_attention import try_npu_flex_attention
+
+            output = try_npu_flex_attention(query, key, value, attn_metadata, self.softmax_scale)
+            if output is None:
+                raise ValueError(
+                    "NPU FlexAttention requires single-sample, unpadded BF16 prefill without SP or quantization. "
+                    "Select the dense-mask path in QwenImage21Transformer2DModel._resolve_attn_path."
+                )
+            logger.info_once("Qwen-Image 2.1 NPU prefill is using FlexAttention (BF16, BlockMask=128).")
+            return output
+
         attention_mask = attn_metadata.attn_mask if attn_metadata else None
         if self.causal:
             import torch_npu

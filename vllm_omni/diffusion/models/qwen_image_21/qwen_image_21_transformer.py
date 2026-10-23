@@ -1123,6 +1123,7 @@ class QwenImage21Transformer2DModel(CachedTransformer):
         attn_path_hint: str,
         has_padding: bool,
         sp_padding: bool,
+        device_type: str,
     ) -> str:
         r"""Choose between the piecewise-span and dense-mask attention paths.
 
@@ -1131,6 +1132,9 @@ class QwenImage21Transformer2DModel(CachedTransformer):
         """
         if not self.causal_block:
             return "key_padding"
+        if device_type == "npu":
+            # Change to "flex" to select compiled NPU FlexAttention.
+            return "mask"
         if attn_path_hint in ("piecewise", "mask"):
             return attn_path_hint
         if attn_path_hint != "auto":
@@ -1350,12 +1354,14 @@ class QwenImage21Transformer2DModel(CachedTransformer):
             if joint_key_valid is not None:
                 attn_metadata = AttentionMetadata(attn_mask=joint_key_valid)
         else:
-            attn_path = self._resolve_attn_path(attn_path_hint, has_padding, sp_padding > 0)
+            attn_path = self._resolve_attn_path(attn_path_hint, has_padding, sp_padding > 0, hidden_states.device.type)
             if kv_cache is not None:
                 cache_write_len = prefix_len
-            if attn_path == "piecewise":
+            if attn_path in ("piecewise", "flex"):
                 spans = self._build_full_attn_spans(image_ids)
                 attn_metadata = AttentionMetadata(full_attn_spans=[list(spans) for _ in range(batch_size)])
+                if attn_path == "flex":
+                    attn_metadata.extra["_qwen_image21_flex_cache"] = {}
             elif attn_path == "mask":
                 attn_metadata = AttentionMetadata(
                     attn_mask=self._build_block_causal_mask(

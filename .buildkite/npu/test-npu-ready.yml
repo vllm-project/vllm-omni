@@ -44,6 +44,7 @@ steps:
           - >-
             pytest -s -v
             tests/diffusion/layers/test_activation.py
+            tests/diffusion/attention/test_flex_attn.py
             -m 'core_model and npu and A5'
             --run-level 'core_model'
 

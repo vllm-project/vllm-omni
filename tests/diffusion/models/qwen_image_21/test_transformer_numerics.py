@@ -13,6 +13,95 @@ pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
 
 
 @pytest.mark.parametrize(
+    "device,attention_device",
+    [
+        pytest.param("cpu", "cpu", marks=pytest.mark.cpu),
+        pytest.param("cpu", "npu", marks=pytest.mark.cpu),
+        pytest.param("cuda", "cuda", marks=hardware_marks(res={"cuda": "L4"}, num_cards=1)),
+    ],
+)
+def test_prefill_attention_metadata(monkeypatch, device, attention_device):
+    seen = []
+
+    class CaptureBlock(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.attn = SimpleNamespace(
+                attn=SimpleNamespace(attn_backend=SimpleNamespace(supports_piecewise_spans=True))
+            )
+
+        def forward(self, hidden_states, attn_metadata, **kwargs):
+            seen.append(attn_metadata)
+            return hidden_states
+
+    class SequencePrepare:
+        def __call__(self, hidden_states, text, layout, img_mask, is_decode):
+            return text, hidden_states, text.new_zeros(2, 1), hidden_states.new_zeros(2, 1)
+
+        @staticmethod
+        def expand_image_pad_mask(mask):
+            return mask
+
+    # Exercise the real model forward and metadata selection without weights.
+    model = object.__new__(transformer.QwenImage21Transformer2DModel)
+    torch.nn.Module.__init__(model)
+    model.parallel_config = None
+    model.causal_block = True
+    model.causal_condition = False
+    model.txt_in = torch.nn.Identity()
+    model.sequence_prepare = SequencePrepare()
+    model.time_text_embed = lambda timestep, hidden_states: timestep
+    model.modulation = torch.nn.Identity()
+    model.transformer_blocks = torch.nn.ModuleList([CaptureBlock()])
+    model.norm_out = lambda hidden_states, *args: hidden_states
+    model.proj_out = torch.nn.Identity()
+
+    if attention_device == "npu":
+        # Exercise NPU routing with CPU tensors and no model weights.
+        resolve_attn_path = model._resolve_attn_path
+        monkeypatch.setattr(
+            model,
+            "_resolve_attn_path",
+            lambda hint, padding, sp_padding, device_type: resolve_attn_path(hint, padding, sp_padding, "npu"),
+        )
+
+    hidden = torch.ones(1, 2, 4, device=device)
+    text = torch.zeros_like(hidden)
+    outputs = []
+    for attention_kwargs in (None, {"attn_path": "piecewise"}):
+        outputs.append(
+            model(
+                hidden_states=hidden,
+                encoder_hidden_states=text,
+                timestep=hidden.new_zeros(1),
+                img_shapes=[[(1, 1, 2)]],
+                img_mask=torch.tensor([[False, False, True, True]], device=device),
+                attention_kwargs=attention_kwargs,
+                return_dict=False,
+            )[0]
+        )
+
+    for metadata in seen:
+        if attention_device == "npu":
+            assert metadata.full_attn_spans is None
+            expected = torch.tensor(
+                [
+                    [True, False, False, False],
+                    [True, True, False, False],
+                    [True, True, True, True],
+                    [True, True, True, True],
+                ],
+                device=device,
+            )[None, None]
+            torch.testing.assert_close(metadata.attn_mask, expected)
+        else:
+            assert metadata.full_attn_spans == [[(2, 4)]]
+            assert metadata.attn_mask is None
+        assert metadata.extra == {}
+    torch.testing.assert_close(outputs[0], outputs[1], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
     "device",
     [
         pytest.param("cpu", marks=pytest.mark.cpu),
