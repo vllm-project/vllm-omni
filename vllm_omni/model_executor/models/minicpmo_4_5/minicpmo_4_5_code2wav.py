@@ -1760,10 +1760,14 @@ class MiniCPMO45Code2Wav(nn.Module):
         # Ascend, where a CUDA-only guard made ``cfm_precapture_empty_cache`` a
         # silent no-op.
         device = torch.device(accelerator.type, torch.accelerator.current_device_index())
+        # Same dispatch as ``_memory_snapshot``: on Ascend the allocator belongs
+        # to ``torch.npu``, so ``torch.accelerator.*`` is not guaranteed to reach
+        # it (and a raise here would make the flag a warning-only no-op).
+        api = torch.npu if device.type == "npu" else torch.accelerator
         try:
-            torch.accelerator.synchronize(device)
+            api.synchronize(device)
             before = _memory_snapshot(device)
-            torch.accelerator.empty_cache()
+            api.empty_cache()
             delta = _format_memory_delta(before, _memory_snapshot(device))
         except Exception:
             logger.warning(

@@ -533,3 +533,36 @@ def test_startup_sweep_does_not_mask_the_sweep_error(tmp_path, monkeypatch, devi
     monkeypatch.setattr(model, "_release_precapture_cache", release)
     with pytest.raises(RuntimeError, match="poisoned wrapper"):
         model.capture_auxiliary_graphs()
+
+
+def test_precapture_cache_release_uses_the_npu_allocator(tmp_path, monkeypatch):
+    """Ascend exposes the allocator through ``torch.npu``, not ``torch.accelerator``."""
+    model, _ = _build_backend(tmp_path, monkeypatch, {"cfm_precapture_empty_cache": "true"})
+    calls: list[str] = []
+
+    class _FakeNpu:
+        @staticmethod
+        def synchronize(device) -> None:
+            calls.append("synchronize")
+
+        @staticmethod
+        def empty_cache() -> None:
+            calls.append("empty_cache")
+
+    monkeypatch.setattr(code2wav_module.torch, "npu", _FakeNpu, raising=False)
+    monkeypatch.setattr(
+        code2wav_module.torch.accelerator,
+        "current_accelerator",
+        lambda: torch.device("npu"),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        code2wav_module.torch.accelerator,
+        "current_device_index",
+        lambda: 0,
+        raising=False,
+    )
+
+    model._release_precapture_cache()
+
+    assert calls == ["synchronize", "empty_cache"]
