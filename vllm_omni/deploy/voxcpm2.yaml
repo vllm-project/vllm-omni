@@ -40,7 +40,6 @@ stages:
           cfg_cutoff_ratio: 1.0
 
           audio_emit_every: 1
-          vae_decode_every: 3
           enable_batched_cfm: true
           enable_batched_vae_decode: true
           coalesce_audio_d2h: true

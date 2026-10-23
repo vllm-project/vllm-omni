@@ -39,7 +39,7 @@ class _VoxCPM2RuntimeConfig:
     deterministic_cfm_noise: bool = False
     deterministic_cfm_seed: int = 20260601
     audio_emit_every: int = 1
-    vae_decode_every: int = 3
+    vae_decode_every: int = 2
     enable_delayed_audio_copy: bool = False
     delayed_audio_copy_use_events: bool = False
     coalesce_audio_d2h: bool = True
