@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """CPU regression coverage for importing a producer's first AR output."""
 
 from collections import defaultdict
@@ -170,6 +170,7 @@ def _receiver(req, scheduler_cls=OmniARScheduler):
     scheduler = scheduler_cls.__new__(scheduler_cls)
     scheduler.vllm_config = SimpleNamespace(kv_transfer_config=None)
     scheduler.defer_block_free = False
+    scheduler._hold_payloadless_outputs = False
     scheduler._spec_token_placeholders = []
     scheduler.max_model_len = 4096
     scheduler.prefix_replay_tokens = 0
@@ -545,6 +546,7 @@ def test_producer_output_carries_rng_with_connector_completion(rng_state):
     scheduler.running = [req]
     scheduler.vllm_config = SimpleNamespace(model_config=SimpleNamespace())
     scheduler._native_data_plane = False
+    scheduler._hold_payloadless_outputs = False
     scheduler.max_model_len = 4096
     scheduler.perf_metrics = None
     scheduler.connector = None
@@ -568,6 +570,7 @@ def test_producer_output_carries_rng_with_connector_completion(rng_state):
     scheduler.make_stats = Mock(return_value=None)
     scheduler._capture_omni_connector_output = Mock()
     schedule = SimpleNamespace(num_scheduled_tokens={"req": 3}, scheduled_spec_decode_tokens={})
+    req.num_computed_tokens = req.num_in_flight_tokens = 3
     worker = SimpleNamespace(
         sampled_token_ids=[[791]],
         req_id_to_index={"req": 0},
