@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from vllm.sampling_params import SamplingParams
 from vllm.v1.engine import FinishReason
 from vllm.v1.request import RequestStatus
 
@@ -27,7 +28,7 @@ AUDIO = torch.arange(6, dtype=torch.float32)
 def _run(spec_decode_tokens: dict) -> tuple[list, dict[str, _Request], SimpleNamespace]:
     requests = [_Request(f"r{i}") for i in range(4)]
     for request in requests:
-        request.sampling_params = SimpleNamespace(num_logprobs=None)
+        request.sampling_params = SamplingParams()
         request.num_computed_tokens = 10
         request.num_in_flight_tokens = 1
     # r3 is still being decoded but its output belongs to a later segment.
