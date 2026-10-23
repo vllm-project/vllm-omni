@@ -168,6 +168,13 @@ class _FakeToken2Wav:
             torch.tensor([4], dtype=torch.int32),
         )
 
+    def _prepare_prompt_host(self, prompt_wav):
+        return prompt_wav
+
+    def _prepare_prompt_device(self, host, *, non_blocking=False):
+        del non_blocking
+        return self._prepare_prompt(host)
+
     def stream(self, *args, **kwargs):
         raise AssertionError("sequential stream fallback must never be called")
 

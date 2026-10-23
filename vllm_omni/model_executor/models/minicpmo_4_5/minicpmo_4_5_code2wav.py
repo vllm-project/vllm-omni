@@ -8,8 +8,9 @@ import json
 import os
 import tempfile
 import time
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from functools import lru_cache, partial
@@ -38,6 +39,7 @@ from .cuda_graph_wrapper import ResidentAttCache, _format_memory_delta, _memory_
 
 if TYPE_CHECKING:
     from vllm_omni.core.sched.output import OmniRequestPrewarm
+    from vllm_omni.model_executor.models.step_audio2.step_audio2_token2wav import PromptHostFeatures
 
 logger = init_logger(__name__)
 
@@ -338,6 +340,21 @@ class _RefPrefetch:
 
 
 @dataclass(frozen=True)
+class _PreparedReference:
+    """A reference prepared on the worker thread, before its device half runs."""
+
+    cache_key: str
+    cache_id: str
+    path: str
+    # None when the prompt features were already cached at preparation time.
+    host: PromptHostFeatures | None
+
+
+# How often the reference-preparation counters are logged, in seconds.
+_REF_STATS_LOG_INTERVAL_S = 30.0
+
+
+@dataclass(frozen=True)
 class _WorkItem:
     output_index: int
     state_id: str
@@ -430,6 +447,27 @@ class MiniCPMO45Code2Wav(nn.Module):
         self._prefetch_setup_holder: str | None = None
         # The holder's prompt features, to check its setup is still cached.
         self._prefetch_setup_features: PromptFeatures | None = None
+        # Asynchronous reference preparation (``token2wav_async_ref_prepare``,
+        # CUDA only). Unlike the idle prefetch above, it also runs while other
+        # streams are live: a worker thread does the host half of the prompt
+        # (normalize, WAV, resample, fbank, mel) and touches no device; the
+        # forward thread then queues the device half on a side stream, and
+        # chunk 0 orders its stream after it with an event instead of
+        # preparing the prompt inside the step. It replaces the idle prefetch.
+        self._async_ref_prepare = read_bool_flag(extra, "token2wav_async_ref_prepare", False)
+        self._async_ref_workers = int(extra.get("token2wav_async_ref_workers", 2))
+        if self._async_ref_workers < 1:
+            raise ValueError("token2wav_async_ref_workers must be >= 1")
+        self._ref_executor: ThreadPoolExecutor | None = None
+        self._ref_jobs: dict[str, Future[_PreparedReference]] = {}
+        self._ref_stream: torch.cuda.Stream | None = None
+        # Prompt key -> event recorded after its device half on the side stream.
+        self._prepared_events: dict[tuple[str, str], torch.cuda.Event] = {}
+        # Prompt keys installed by the preparer whose chunk 0 has not run yet (counters only).
+        self._prepared_keys: set[tuple[str, str]] = set()
+        self._ref_stats: Counter[str] = Counter()
+        self._ref_stats_logged_at = time.monotonic()
+        self._ref_stats_logged: dict[str, int] = {}
         self._connector_config = {
             "codec_chunk_frames": int(extra.get("codec_chunk_frames", 25)),
             "initial_codec_chunk_frames": int(extra.get("initial_codec_chunk_frames", 0)),
@@ -594,11 +632,12 @@ class MiniCPMO45Code2Wav(nn.Module):
     def compute_logits(self, hidden_states: Any, sampling_metadata: Any = None) -> None:
         return None
 
-    def _materialize_runtime_prompt(
-        self,
-        ref_audio: Any,
-        sample_rate: Any,
-    ) -> tuple[str, _RuntimePrompt]:
+    def _runtime_prompt_identity(self, ref_audio: Any, sample_rate: Any) -> tuple[str, str, str, torch.Tensor, int]:
+        """Normalize a reference and name its runtime prompt.
+
+        Returns ``(cache_key, cache_id, path, waveform, sample_rate_hz)``. Reads
+        no mutable state, so the reference-preparation worker may call it.
+        """
         sample_rate_hz = int(_scalar(sample_rate, 0))
         if sample_rate_hz <= 0:
             raise _batch_error("invalid_ref_audio_sample_rate", sample_rate=sample_rate_hz)
@@ -618,31 +657,49 @@ class MiniCPMO45Code2Wav(nn.Module):
         cache_key = digest.hexdigest()
         cache_id = f"runtime-ref-{cache_key[:24]}-{sample_rate_hz}"
         path = str(Path(self._runtime_prompt_dir.name) / f"minicpmo45_ref_{cache_key[:24]}_{sample_rate_hz}.wav")
+        return cache_key, cache_id, path, waveform, sample_rate_hz
+
+    @staticmethod
+    def _write_runtime_prompt(path: str, waveform: torch.Tensor, sample_rate_hz: int) -> None:
+        """Write the prompt WAV once; atomic, so concurrent writers of one path are safe."""
+        prompt_path = Path(path)
+        if prompt_path.is_file():
+            return
+        with tempfile.NamedTemporaryFile(
+            dir=prompt_path.parent,
+            prefix=f".{prompt_path.stem}-",
+            suffix=".wav",
+            delete=False,
+        ) as handle:
+            temporary_path = Path(handle.name)
+        try:
+            sf.write(
+                temporary_path,
+                waveform.numpy(),
+                sample_rate_hz,
+                format="WAV",
+            )
+            os.replace(temporary_path, prompt_path)
+        finally:
+            temporary_path.unlink(missing_ok=True)
+
+    def _runtime_prompt_entry(self, cache_key: str, cache_id: str, path: str) -> _RuntimePrompt:
         entry = self._runtime_prompts.get(cache_key)
         if entry is None:
             entry = _RuntimePrompt(cache_id=cache_id, path=path, owners=set())
             self._runtime_prompts[cache_key] = entry
         else:
             self._runtime_prompts.move_to_end(cache_key)
-        prompt_path = Path(entry.path)
-        if not prompt_path.is_file():
-            with tempfile.NamedTemporaryFile(
-                dir=prompt_path.parent,
-                prefix=f".{prompt_path.stem}-",
-                suffix=".wav",
-                delete=False,
-            ) as handle:
-                temporary_path = Path(handle.name)
-            try:
-                sf.write(
-                    temporary_path,
-                    waveform.numpy(),
-                    sample_rate_hz,
-                    format="WAV",
-                )
-                os.replace(temporary_path, prompt_path)
-            finally:
-                temporary_path.unlink(missing_ok=True)
+        return entry
+
+    def _materialize_runtime_prompt(
+        self,
+        ref_audio: Any,
+        sample_rate: Any,
+    ) -> tuple[str, _RuntimePrompt]:
+        cache_key, cache_id, path, waveform, sample_rate_hz = self._runtime_prompt_identity(ref_audio, sample_rate)
+        entry = self._runtime_prompt_entry(cache_key, cache_id, path)
+        self._write_runtime_prompt(entry.path, waveform, sample_rate_hz)
         return cache_key, entry
 
     def _resolve_prompt(
@@ -690,6 +747,8 @@ class MiniCPMO45Code2Wav(nn.Module):
         self._trim_runtime_prompts()
 
     def _evict_runtime_prompt(self, cache_key: str, entry: _RuntimePrompt) -> None:
+        self._prepared_events.pop((entry.cache_id, entry.path), None)
+        self._prepared_keys.discard((entry.cache_id, entry.path))
         if self.backend is not None:
             self.backend.evict_prompt(entry.cache_id, entry.path)
         Path(entry.path).unlink(missing_ok=True)
@@ -909,7 +968,10 @@ class MiniCPMO45Code2Wav(nn.Module):
         features: list[PromptFeatures] = []
         for row, item in enumerate(items):
             key = (item.prompt_cache_id, item.prompt_wav)
+            if states[row] is None:
+                self._count_chunk0_prompt(key)
             if key not in prompts:
+                self._wait_prepared_prompt(key)
                 prompts[key] = self.backend.prepare_prompt(*key)
             features.append(prompts[key])
             if states[row] is None:
@@ -1062,6 +1124,9 @@ class MiniCPMO45Code2Wav(nn.Module):
             finally:
                 if getattr(self, "_precapture_empty_cache", False):
                     self._release_precapture_cache()
+        # Queue the device half of references the worker finished, before this
+        # step's own work, so a chunk 0 in this step can already use them.
+        self._pump_reference_jobs()
         ids = input_ids if isinstance(input_ids, torch.Tensor) else torch.empty(0, dtype=torch.long)
         segments = self._split_segments(ids, kwargs.get("seq_token_counts"))
         empty = torch.empty(0, dtype=torch.float32, device=ids.device)
@@ -1203,6 +1268,7 @@ class MiniCPMO45Code2Wav(nn.Module):
             maximum=self._initial_batch_size,
         ):
             try:
+                self._wait_prepared_prompt((bucket[0].prompt_cache_id, bucket[0].prompt_wav))
                 features = self.backend.prepare_prompt(
                     bucket[0].prompt_cache_id,
                     bucket[0].prompt_wav,
@@ -1248,7 +1314,10 @@ class MiniCPMO45Code2Wav(nn.Module):
             decode_buckets = merged
         else:
             decode_buckets = buckets.values()
+        if compute_items:
+            self._ref_stats["compute_steps"] += 1
         for bucket in self._iter_decode_batches(decode_buckets):
+            self._ref_stats["decode_batches"] += 1
             batch_size = len(bucket)
             try:
                 states, features = self._prepare_decode_batch(bucket)
@@ -1316,6 +1385,7 @@ class MiniCPMO45Code2Wav(nn.Module):
                 )
 
         self._commit_runtime_prompt_owners(items)
+        self._maybe_log_reference_stats()
         # Only after the request committed its own reference can the prefetch
         # pin go; placeholder steps carry no reference and keep it.
         for item in items:
@@ -1348,20 +1418,29 @@ class MiniCPMO45Code2Wav(nn.Module):
         for request_id in finished_req_ids:
             state_id = str(request_id)
             self._states.pop(state_id, None)
+            job = self._ref_jobs.pop(state_id, None)
+            if job is not None:
+                job.cancel()
             self._release_request_prompt(state_id)
             self._drop_prefetch(state_id)
 
     def on_requests_added(self, prewarms: list[OmniRequestPrewarm]) -> None:
         """Queue reference prefetches for new async-chunk placeholders.
 
-        Only validates and enqueues; :meth:`run_idle_prefetch` does the work
-        (the prompt, plus the setup with ``token2wav_ref_prefetch_setup``).
+        Only validates and enqueues. With ``token2wav_async_ref_prepare`` a
+        worker thread starts the host half at once and the next forward or idle
+        step queues the device half (:meth:`_pump_reference_jobs`); otherwise
+        :meth:`run_idle_prefetch` does the work (the prompt, plus the setup with
+        ``token2wav_ref_prefetch_setup``).
         A bad payload is logged and skipped, never raised. Only the V1 GPU and
         NPU generation runners call this hook and :meth:`run_idle_prefetch`;
         under any other runner (e.g. the MRv2 generation runner) nothing is
         queued and chunk 0 prepares its reference inline.
         """
-        if not self._ref_prefetch_enabled or self.backend is None:
+        async_prepare = self._async_ref_active()
+        if self._async_ref_prepare and not async_prepare and self.backend is not None:
+            self._ref_stats["async_unavailable"] += len(prewarms)
+        if not (self._ref_prefetch_enabled or async_prepare) or self.backend is None:
             return
         for prewarm in prewarms:
             state_id = str(prewarm.request_id)
@@ -1370,6 +1449,7 @@ class MiniCPMO45Code2Wav(nn.Module):
                 or state_id in self._request_prompt_keys
                 or state_id in self._prefetch_queue
                 or state_id in self._prefetch_pins
+                or state_id in self._ref_jobs
             ):
                 continue
             payload = prewarm.payload if isinstance(prewarm.payload, Mapping) else {}
@@ -1385,10 +1465,21 @@ class MiniCPMO45Code2Wav(nn.Module):
             )
             valid_sr = isinstance(sample_rate, int) and not isinstance(sample_rate, bool) and sample_rate > 0
             if not (valid_ref and valid_sr):
+                self._ref_stats["prewarm_rejected"] += 1
                 logger.warning(
                     "MiniCPM-o Code2Wav ignoring invalid reference prefetch payload for request %s",
                     state_id,
                 )
+                continue
+            self._ref_stats["prewarm_accepted"] += 1
+            if async_prepare:
+                if len(self._ref_jobs) >= _MAX_QUEUED_PREFETCHES:
+                    self._ref_stats["async_queue_full"] += 1
+                    continue
+                self._ref_jobs[state_id] = self._reference_executor().submit(
+                    self._prepare_reference_job, ref_audio, sample_rate
+                )
+                self._ref_stats["async_submitted"] += 1
                 continue
             if len(self._prefetch_queue) >= _MAX_QUEUED_PREFETCHES:
                 logger.debug(
@@ -1415,6 +1506,9 @@ class MiniCPMO45Code2Wav(nn.Module):
         runs setup_batch inline. Only with ``token2wav_ref_prefetch_setup``
         does a later call run phase B (setup_batch).
         """
+        if self._async_ref_active():
+            with _stage_matmul_policy(self._tf32_mode):
+                return self._pump_reference_jobs()
         if not self._ref_prefetch_enabled or self.backend is None or not self._prefetch_queue:
             return False
         # Busy gate: start no phase while another request's stream is live
@@ -1485,6 +1579,122 @@ class MiniCPMO45Code2Wav(nn.Module):
             )
             self._drop_prefetch(state_id)
             return True
+
+    def _async_ref_active(self) -> bool:
+        """Whether asynchronous reference preparation can run here now.
+
+        CUDA only, and only while the default dtype is fp32: the worker's host
+        half creates tensors under the process-wide default dtype, which the
+        forward thread switches to fp32 only around its own preparation.
+        """
+        if not self._async_ref_prepare or self.backend is None:
+            return False
+        from vllm_omni.platforms import current_omni_platform
+
+        return current_omni_platform.is_cuda() and torch.get_default_dtype() == torch.float32
+
+    def _reference_executor(self) -> ThreadPoolExecutor:
+        if self._ref_executor is None:
+            self._ref_executor = ThreadPoolExecutor(
+                max_workers=self._async_ref_workers, thread_name_prefix="minicpmo45-ref-prepare"
+            )
+        return self._ref_executor
+
+    def _prepare_reference_job(self, ref_audio: torch.Tensor, sample_rate: int) -> _PreparedReference:
+        """Worker thread: the host half of one reference. Touches no device and no model state."""
+        assert self.backend is not None
+        with torch.inference_mode():
+            cache_key, cache_id, path, waveform, sample_rate_hz = self._runtime_prompt_identity(ref_audio, sample_rate)
+            self._write_runtime_prompt(path, waveform, sample_rate_hz)
+            host = None if self.backend.has_prompt_features(cache_id, path) else self.backend.prepare_prompt_host(path)
+        return _PreparedReference(cache_key=cache_key, cache_id=cache_id, path=path, host=host)
+
+    def _pump_reference_jobs(self) -> bool:
+        """Forward thread: queue the device half of every finished reference job.
+
+        The device half goes to a side stream, so it neither waits for nor
+        delays this step's queued work. Each prepared prompt is pinned to its
+        request until chunk 0 commits it, as an idle prefetch is. Returns
+        whether any device work was queued.
+        """
+        if not self._ref_jobs or self.backend is None:
+            return False
+        installed: list[tuple[str, str]] = []
+        stream: torch.cuda.Stream | None = None
+        for state_id, job in list(self._ref_jobs.items()):
+            if not job.done():
+                continue
+            del self._ref_jobs[state_id]
+            try:
+                prepared = job.result()
+            except Exception:
+                self._ref_stats["async_failed"] += 1
+                logger.warning(
+                    "MiniCPM-o Code2Wav reference preparation failed for request %s; chunk 0 will prepare it inline",
+                    state_id,
+                    exc_info=True,
+                )
+                continue
+            if state_id in self._states or state_id in self._request_prompt_keys:
+                # Chunk 0 already prepared this reference inline.
+                self._ref_stats["async_late"] += 1
+                continue
+            entry = self._runtime_prompt_entry(prepared.cache_key, prepared.cache_id, prepared.path)
+            entry.pins.add(state_id)
+            self._prefetch_pins[state_id] = prepared.cache_key
+            key = (entry.cache_id, entry.path)
+            if prepared.host is None or self.backend.has_prompt_features(*key):
+                self._ref_stats["async_cached"] += 1
+                continue
+            stream = self._reference_stream()
+            self.backend.install_prompt(entry.cache_id, entry.path, prepared.host, stream)
+            self._prepared_keys.add(key)
+            installed.append(key)
+        if installed:
+            if stream is not None:
+                event = torch.cuda.Event()
+                event.record(stream)
+                for key in installed:
+                    self._prepared_events[key] = event
+            self._ref_stats["async_installed"] += len(installed)
+        self._trim_runtime_prompts()
+        return bool(installed)
+
+    def _reference_stream(self) -> torch.cuda.Stream | None:
+        """The side stream for the device half of prepared references.
+
+        None unless the backend runs on CUDA; the device half then runs on the
+        current stream.
+        """
+        if self._ref_stream is None and self.backend is not None and self.backend.speech_window.device.type == "cuda":
+            self._ref_stream = torch.cuda.Stream(device=self.backend.speech_window.device)
+        return self._ref_stream
+
+    def _wait_prepared_prompt(self, key: tuple[str, str]) -> None:
+        """Order this stream after the side-stream device half of ``key``, if one is pending."""
+        event = self._prepared_events.pop(key, None)
+        if event is not None:
+            torch.cuda.current_stream().wait_event(event)
+
+    def _count_chunk0_prompt(self, key: tuple[str, str]) -> None:
+        if key in self._prepared_events or key in self._prepared_keys:
+            self._ref_stats["chunk0_prepared_async"] += 1
+        elif self.backend is not None and self.backend.has_prompt_features(*key):
+            self._ref_stats["chunk0_cached"] += 1
+        else:
+            self._ref_stats["chunk0_inline"] += 1
+        self._prepared_keys.discard(key)
+
+    def _maybe_log_reference_stats(self) -> None:
+        """Log the cumulative reference-preparation counters, at most every 30 s and only when they change."""
+        now = time.monotonic()
+        if now - self._ref_stats_logged_at < _REF_STATS_LOG_INTERVAL_S:
+            return
+        self._ref_stats_logged_at = now
+        stats = dict(self._ref_stats)
+        if stats and stats != self._ref_stats_logged:
+            self._ref_stats_logged = stats
+            logger.info("MiniCPM-o Code2Wav reference preparation: %s", stats)
 
     def _release_evicted_setup_holder(self) -> None:
         """Free the setup slot once the holder's prefetched setup is gone.

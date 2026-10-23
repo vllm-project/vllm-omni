@@ -1,0 +1,42 @@
+# Opt-in single-GPU MiniCPM-o 4.5 profile for high-concurrency CUDA throughput.
+# Same stages as minicpmo_4_5.yaml (duplex sessions plus chat completions),
+# which already enables cuda_mps: one private MPS daemon shared by the three
+# co-located stages, so their kernels can overlap instead of time-slicing the
+# GPU. See that file for the MPS requirements and fallbacks.
+#
+# Code2Wav, the stage that limits throughput from C=8 up, also gets:
+# - token2wav_async_ref_prepare: a new request's reference voice is prepared
+#   when its placeholder arrives (host half on a worker thread, device half
+#   on a side stream) instead of inside the chunk-0 step that every live
+#   stream waits on. Prompt features are bit-identical. CUDA only; other
+#   platforms keep the idle prefetch.
+# - micro_batch_size: 8 (default 4) and cfm_onset_merge: fewer, larger
+#   Whole-Euler solves per step, with first chunks merged into the same solve.
+#   These two apply on every platform; they were measured on CUDA only.
+#
+# Measured on one L20X at 88c9ccd7c against minicpmo_4_5.yaml (Seed-TTS en
+# voice cloning through /v1/chat/completions, 16 requests per concurrency
+# slot, three runs per point): 1110 -> 1364 codec frames/s at C=32 (+23%),
+# 916 -> 1128 at C=16 (+23%), 784 -> 843 at C=8 (+8%); C=1 unchanged (193 vs
+# 192, four runs). GPU memory after startup is about 2.6 GiB higher (the
+# Whole-Euler arena and graphs for 8 rows); the peak at C=32 was within
+# 0.2 GiB of the default profile's.
+# Earlier measurements at 6a56252e6, against the default profile with
+# cuda_mps (now its default):
+# - Seed-TTS WER on the full en set (1088 utterances, C=8): 2.24% -> 2.18%;
+#   paired per utterance, 19 worse and 19 better (95% CI of the difference
+#   -0.28..+0.13 points). Each option alone was also within run-to-run
+#   variation.
+# - Duplex first audio was not slower: over three C=8 runs per config, mean
+#   467 -> 433 ms and p95 580 -> 513 ms; C=1/4 unchanged. Duplex sessions send
+#   no prewarm payload, so there only the batching options apply.
+# - Upstream's opt-in cfm_float16 on top: +9% at C=32, WER within spread, but
+#   one duplex C=4 run was 20% slower.
+base_config: minicpmo_4_5.yaml
+
+connectors:
+  connector_of_shared_memory:
+    extra:
+      token2wav_async_ref_prepare: true
+      micro_batch_size: 8
+      cfm_onset_merge: true

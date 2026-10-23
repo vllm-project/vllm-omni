@@ -40,6 +40,7 @@ from vllm_omni.model_executor.models.step_audio2.step_audio2_constants import (
     STEP_AUDIO2_DEFAULT_PROMPT_WAV,
     STREAM_SOURCE_CACHE_LEN,
 )
+from vllm_omni.utils.device_copy import index_to_device, to_device_nonblocking
 
 logger = init_logger(__name__)
 
@@ -70,6 +71,20 @@ def fade_in_out(
         + fade_out_mel[..., -mel_overlap_len:] * window[mel_overlap_len:]
     )
     return fade_in_mel
+
+
+@dataclass(frozen=True)
+class PromptHostFeatures:
+    """Host half of a prepared prompt: everything computed before any device work.
+
+    Produced by :meth:`StepAudio2Token2WavCore._prepare_prompt_host`, which
+    touches no device, so it can run on a worker thread.
+    """
+
+    mels: torch.Tensor
+    mels_lens: torch.Tensor
+    spk_feat: torch.Tensor
+    prompt_mel: torch.Tensor
 
 
 @dataclass
@@ -299,6 +314,14 @@ class StepAudio2Token2WavCore(nn.Module):
 
     def _prepare_prompt(self, prompt_wav: str):
         """Prepare prompt audio for conditioning"""
+        return self._prepare_prompt_device(self._prepare_prompt_host(prompt_wav))
+
+    def _prepare_prompt_host(self, prompt_wav: str) -> PromptHostFeatures:
+        """Load the prompt and extract its features on the host.
+
+        Touches no device and no lazily loaded model, so it may run on a
+        worker thread while the device is busy.
+        """
         audio_np_raw, sample_rate = load_audio(prompt_wav, sr=None, mono=True)
         sample_rate = int(sample_rate)
 
@@ -307,13 +330,9 @@ class StepAudio2Token2WavCore(nn.Module):
         audio = torch.from_numpy(audio_16k)
         mels = s3tokenizer.log_mel_spectrogram(audio)
         mels, mels_lens = s3tokenizer.padding([mels])
-        prompt_speech_tokens, prompt_speech_tokens_lens = self.audio_tokenizer.quantize(
-            mels.to(self.device), mels_lens.to(self.device)
-        )
 
         spk_feat = kaldi.fbank(audio.unsqueeze(0), num_mel_bins=80, dither=0, sample_frequency=16000)
         spk_feat = spk_feat - spk_feat.mean(dim=0, keepdim=True)
-        spk_emb = self._forward_spk_embedding(spk_feat)
 
         # 24 kHz branch: mel spectrogram for flow model conditioning
         # Must resample from the ORIGINAL audio, not the 16 kHz version.
@@ -334,8 +353,33 @@ class StepAudio2Token2WavCore(nn.Module):
             .transpose(1, 2)
             .squeeze(0)
         )  # [T, num_mels]
-        prompt_mels = prompt_mel.unsqueeze(0).to(self.device)
-        prompt_mels_lens = torch.tensor([prompt_mels.shape[1]], dtype=torch.int32, device=self.device)
+        return PromptHostFeatures(mels=mels, mels_lens=mels_lens, spk_feat=spk_feat, prompt_mel=prompt_mel)
+
+    def _prepare_prompt_device(self, host: PromptHostFeatures, *, non_blocking: bool = False):
+        """Run the device half of prompt preparation on the current stream.
+
+        With ``non_blocking`` the host inputs are staged in pinned memory, so
+        the copies do not wait for device work already queued on the stream.
+        The copied values are the same either way.
+        """
+
+        def to_device(tensor: torch.Tensor) -> torch.Tensor:
+            return to_device_nonblocking(tensor, self.device) if non_blocking else tensor.to(self.device)
+
+        prompt_speech_tokens, prompt_speech_tokens_lens = self.audio_tokenizer.quantize(
+            to_device(host.mels), to_device(host.mels_lens)
+        )
+        spk_feat = host.spk_feat
+        if non_blocking and not isinstance(self.spk_model, onnxruntime.InferenceSession):
+            spk_feat = to_device(spk_feat)
+        spk_emb = self._forward_spk_embedding(spk_feat)
+
+        prompt_mels = to_device(host.prompt_mel.unsqueeze(0))
+        prompt_mels_lens = (
+            index_to_device([prompt_mels.shape[1]], self.device, dtype=torch.int32)
+            if non_blocking
+            else torch.tensor([prompt_mels.shape[1]], dtype=torch.int32, device=self.device)
+        )
         prompt_mels = torch.nn.functional.pad(
             prompt_mels,
             (0, 0, 0, prompt_speech_tokens.shape[1] * self.flow.up_rate - prompt_mels.shape[1]),
