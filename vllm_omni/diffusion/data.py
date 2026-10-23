@@ -2141,6 +2141,47 @@ class BlockSparseSpec:
         self.skip_layer_indices = parse_kv_cache_skip_selector(self.skip_layers)
 
 
+SOL_ATTN_BACKENDS = frozenset({"AITER_SOL"})
+
+
+@dataclass
+class SolAttnSpec:
+    """User-facing controls for Sol-Attn sparse attention backends.
+
+    ``tau`` is the routing threshold in standard deviations (higher keeps fewer
+    exact KV blocks), ``thresh_type`` the routing rule, ``sink_tokens`` /
+    ``sink_start`` a key range every query attends to exactly (``sink_start``
+    None places it at the end of the sequence), ``dense_steps`` keeps the first
+    N denoise steps dense and ``dense_layers`` (an index selector such as
+    "0-1,38") exempts individual DiT blocks. With ``prefix_sink`` the non-video
+    prefix the model publishes as ``AttentionMetadata.video_layout`` (text,
+    conditions, audio) replaces that range and is computed exactly as keys and
+    as queries, as in Sol-H3.
+    """
+
+    tau: float = 1.0
+    thresh_type: str = "diag"
+    sink_tokens: int = 0
+    sink_start: int | None = 0
+    prefix_sink: bool = True
+    dense_steps: int = 10
+    dense_layers: str | int | list[int] | None = "0,1"
+    dense_layer_indices: set[int] | None = field(default=None, repr=False)
+
+    def __post_init__(self) -> None:
+        self.tau = _in_range(self.tau, "sol_attn.tau", 0.0, None) or 0.0
+        if self.thresh_type != "diag":
+            raise ValueError(f"sol_attn.thresh_type must be 'diag'; got {self.thresh_type!r}.")
+        if self.sink_tokens < 0:
+            raise ValueError(f"sol_attn.sink_tokens must be >= 0; got {self.sink_tokens!r}.")
+        if self.sink_start is not None and self.sink_start < 0:
+            raise ValueError(f"sol_attn.sink_start must be >= 0 or None; got {self.sink_start!r}.")
+        if self.dense_steps < 0:
+            raise ValueError(f"sol_attn.dense_steps must be >= 0; got {self.dense_steps!r}.")
+        layers = [self.dense_layers] if isinstance(self.dense_layers, int) else self.dense_layers
+        self.dense_layer_indices = parse_kv_cache_skip_selector(layers)
+
+
 @dataclass
 class AttentionSpec:
     """Specifies a backend and its typed backend-specific config for one attention role."""
@@ -2152,6 +2193,7 @@ class AttentionSpec:
     fastvideo_vsa_provider: str = "auto"
     fastvideo_vsa_precision: str = "bf16"
     block_sparse: BlockSparseSpec | None = None
+    sol_attn: SolAttnSpec | None = None
     skip_calibration: dict | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
@@ -2160,6 +2202,7 @@ class AttentionSpec:
         self.skip_softmax = self._coerce(self.skip_softmax, SkipSoftmaxSpec, "skip_softmax")
         self.quant = self._coerce(self.quant, AttnQuantSpec, "quant")
         self.block_sparse = self._coerce(self.block_sparse, BlockSparseSpec, "block_sparse")
+        self.sol_attn = self._coerce(self.sol_attn, SolAttnSpec, "sol_attn")
         if self.skip_softmax is not None and self.backend.upper() != "TRTLLM_ATTN":
             raise ValueError(
                 f"skip_softmax is only supported by the TRTLLM_ATTN backend, but backend={self.backend!r}. "
@@ -2193,6 +2236,13 @@ class AttentionSpec:
             raise ValueError(
                 f"block_sparse is only supported by the {sorted(BLOCK_SPARSE_BACKENDS)} backends, but "
                 f"backend={self.backend!r}. Remove block_sparse or set a supported backend."
+            )
+        if self.backend.upper() in SOL_ATTN_BACKENDS:
+            self.sol_attn = self.sol_attn or SolAttnSpec()
+        elif self.sol_attn is not None:
+            raise ValueError(
+                f"sol_attn is only supported by the {sorted(SOL_ATTN_BACKENDS)} backends, but "
+                f"backend={self.backend!r}. Remove sol_attn or set a supported backend."
             )
 
     @staticmethod
@@ -2241,6 +2291,17 @@ class AttentionSpec:
             kw["precision"] = bs.precision
             if bs.skip_layer_indices:
                 kw["skip_layers"] = sorted(bs.skip_layer_indices)
+        if self.sol_attn is not None:
+            sol = self.sol_attn
+            kw["sol_attn"] = {
+                "tau": sol.tau,
+                "thresh_type": sol.thresh_type,
+                "sink_tokens": sol.sink_tokens,
+                "sink_start": sol.sink_start,
+                "prefix_sink": sol.prefix_sink,
+                "dense_steps": sol.dense_steps,
+                "dense_layers": sorted(sol.dense_layer_indices or ()),
+            }
 
         return kw or None
 
@@ -2319,6 +2380,7 @@ class AttentionConfig:
             "fastvideo_vsa_provider",
             "fastvideo_vsa_precision",
             "block_sparse",
+            "sol_attn",
         }
         node_dict = dict(node)
         node_keys = set(node_dict)
