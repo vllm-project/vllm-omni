@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import json
 from importlib.util import find_spec, module_from_spec, spec_from_file_location
 from pathlib import Path
 from shlex import split
@@ -1197,3 +1198,47 @@ def test_minimax_h3_accuracy_has_two_nonblocking_nightly_jobs() -> None:
         text = pipeline_path.read_text(encoding="utf-8")
         assert "MiniMax-H3 Timeline Guide Accuracy" not in text
         assert "MiniMax-H3 I2VA Ref2VA Accuracy" not in text
+
+
+def test_voxtral_tts_perf_is_one_nonblocking_nightly_job() -> None:
+    step = _find_step("Voxtral TTS Perf", AMD_NIGHTLY_PIPELINE)
+    assert step["grade"] == "NonBlocking"
+    assert step["agent_pool"] == "mi300_1"
+    assert step["mirror_hardwares"] == ["amdproduction"]
+    assert step["timeout_in_minutes"] == 180
+    assert step["env"]["VLLM_ALLOW_LONG_MAX_MODEL_LEN"] == "1"
+    assert "VLLM_ROCM_USE_AITER" not in step["env"]
+    commands = "\n".join(step["commands"])
+    marker = "full_model and tts and rocm and MI325 and cards_1"
+    assert marker in commands
+    assert "--run-level full_model" in commands
+    assert "--collect-only" in commands
+    assert "exit 5" in commands
+    assert "pytest.xml" in commands
+    assert "tests/dfx/perf/tests/test_tts.json" in commands
+    assert "Expected exactly $${#nodes[@]} Voxtral TTS perf nodes" in commands
+    nodes = (
+        "test_voxtral_tts-default_voice_latency_seed-tts-text",
+        "test_voxtral_tts-default_voice_throughput_seed-tts-text",
+        "test_voxtral_tts-default_voice_stress_seed-tts-text",
+    )
+    for node in nodes:
+        assert commands.count(node) == 2
+    assert "test_qwen3_tts" not in commands
+    assert "cards_2" not in commands
+    nightly = AMD_NIGHTLY_PIPELINE.read_text(encoding="utf-8")
+    assert nightly.count('label: "Voxtral TTS Perf"') == 1
+    config = json.loads(Path("tests/dfx/perf/tests/test_tts.json").read_text(encoding="utf-8"))
+    voxtral = next(case for case in config if case["test_name"] == "test_voxtral_tts")
+    res = voxtral["mark"][0]["hardware_marks"]["res"]
+    assert res["rocm"] == "MI325"
+    assert res["cuda"] == ["H100", "B200"]
+    assert voxtral["mark"][0]["hardware_marks"]["num_cards"] == 1
+    for case in config:
+        for phase in case["benchmark_params"]:
+            baseline = phase.get("baseline")
+            if isinstance(baseline, dict):
+                assert "MI325" not in baseline
+    for pipeline_path in (AMD_READY_PIPELINE, AMD_MERGE_PIPELINE):
+        text = pipeline_path.read_text(encoding="utf-8")
+        assert "Voxtral TTS Perf" not in text

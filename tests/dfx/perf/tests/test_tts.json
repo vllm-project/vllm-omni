@@ -605,7 +605,8 @@
       {
         "hardware_marks": {
           "res": {
-            "cuda": ["H100", "B200"]
+            "cuda": ["H100", "B200"],
+            "rocm": "MI325"
           },
           "num_cards": 1
         }
