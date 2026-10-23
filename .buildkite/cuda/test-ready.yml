@@ -46,6 +46,94 @@ steps:
           - timeout 15m pytest -s -v tests/diffusion/attention/ tests/diffusion/utils/test_chunked_transfer.py -m 'core_model and cuda and L4 and cards_1' --run-level "core_model"
         mirror_hardwares: l4_1
 
+      - label: "Diffusion · Sparse FA4 · Hopper"
+        timeout_in_minutes: 45
+        source_file_dependencies:
+          - .buildkite/
+          - requirements/
+          - pyproject.toml
+          - setup.py
+          - docker/Dockerfile.ci
+          - tests/conftest.py
+          - tests/helpers/
+          - tests/diffusion/attention/
+          - vllm_omni/diffusion/
+        commands:
+          - "python -c \"from importlib.metadata import version; print(chr(10).join(f'{p}=={version(p)}' for p in ('torch', 'triton', 'vllm')))\" > /tmp/sparse-ci-constraints.txt"
+          - "uv pip install --system --constraint /tmp/sparse-ci-constraints.txt -e '.[fa4]'"
+          - "python -c \"from flash_attn.cute.interface import flash_attn_func; assert callable(flash_attn_func)\""
+          - "python -c \"import torch; assert torch.cuda.get_device_capability() == (9, 0)\""
+          - "python .buildkite/cuda/scripts/check_vllm_runtime.py"
+          - "timeout 30m pytest -sv tests/diffusion/attention/test_block_sparse.py tests/diffusion/attention/test_block_sparse_adapters.py -m 'core_model and cuda and H100 and cards_1' --run-level=core_model"
+        mirror_hardwares: h100_1
+
+      - label: "Diffusion · Sparse FA4 · Blackwell"
+        timeout_in_minutes: 45
+        source_file_dependencies:
+          - .buildkite/
+          - requirements/
+          - pyproject.toml
+          - setup.py
+          - docker/Dockerfile.ci
+          - tests/conftest.py
+          - tests/helpers/
+          - tests/diffusion/attention/
+          - vllm_omni/diffusion/
+        commands:
+          - "python -c \"from importlib.metadata import version; print(chr(10).join(f'{p}=={version(p)}' for p in ('torch', 'triton', 'vllm')))\" > /tmp/sparse-ci-constraints.txt"
+          - "uv pip install --system --constraint /tmp/sparse-ci-constraints.txt -e '.[fa4]'"
+          - "python -c \"from flash_attn.cute.interface import flash_attn_func; assert callable(flash_attn_func)\""
+          - "python -c \"import torch; assert torch.cuda.get_device_capability() in ((10, 0), (10, 3))\""
+          - "python .buildkite/cuda/scripts/check_vllm_runtime.py"
+          - "timeout 30m pytest -sv tests/diffusion/attention/test_block_sparse_adapters.py -m 'core_model and cuda and B200 and cards_1' --run-level=core_model"
+        mirror_hardwares: b200_1
+
+      - label: "Diffusion · Sparse Models · 1-GPU"
+        timeout_in_minutes: 45
+        source_file_dependencies:
+          - .buildkite/
+          - requirements/
+          - pyproject.toml
+          - setup.py
+          - docker/Dockerfile.ci
+          - tests/conftest.py
+          - tests/helpers/
+          - tests/diffusion/attention/
+          - vllm_omni/diffusion/
+          - tests/diffusion/models/cosmos3/
+          - tests/diffusion/models/minimax_h3/
+        commands:
+          - "python -c \"from importlib.metadata import version; print(chr(10).join(f'{p}=={version(p)}' for p in ('torch', 'triton', 'vllm')))\" > /tmp/sparse-ci-constraints.txt"
+          - "uv pip install --system --constraint /tmp/sparse-ci-constraints.txt -e '.[fa4]'"
+          - "python -c \"from flash_attn.cute.interface import flash_attn_func; assert callable(flash_attn_func)\""
+          - "python -c \"import torch; assert torch.cuda.device_count() >= 1; assert torch.cuda.get_device_capability() == (9, 0)\""
+          - "python .buildkite/cuda/scripts/check_vllm_runtime.py"
+          - "timeout 30m pytest -sv tests/diffusion/models/cosmos3/test_cosmos3_sparse_ulysses.py tests/diffusion/models/minimax_h3/test_minimax_h3_sparse_ulysses.py tests/diffusion/models/cosmos3/test_cosmos3_transformer.py tests/diffusion/models/minimax_h3/test_minimax_h3_contract.py -m 'core_model and cuda and H100 and cards_1' --run-level=core_model"
+        mirror_hardwares: h100_1
+
+      - label: "Diffusion · Sparse Models · 2-GPU"
+        timeout_in_minutes: 45
+        source_file_dependencies:
+          - .buildkite/
+          - requirements/
+          - pyproject.toml
+          - setup.py
+          - docker/Dockerfile.ci
+          - tests/conftest.py
+          - tests/helpers/
+          - tests/diffusion/attention/
+          - vllm_omni/diffusion/
+          - tests/diffusion/models/cosmos3/
+          - tests/diffusion/models/minimax_h3/
+        commands:
+          - "python -c \"from importlib.metadata import version; print(chr(10).join(f'{p}=={version(p)}' for p in ('torch', 'triton', 'vllm')))\" > /tmp/sparse-ci-constraints.txt"
+          - "uv pip install --system --constraint /tmp/sparse-ci-constraints.txt -e '.[fa4]'"
+          - "python -c \"from flash_attn.cute.interface import flash_attn_func; assert callable(flash_attn_func)\""
+          - "python -c \"import torch; assert torch.cuda.device_count() >= 2; assert torch.cuda.get_device_capability() == (9, 0)\""
+          - "python .buildkite/cuda/scripts/check_vllm_runtime.py"
+          - "timeout 30m pytest -sv tests/diffusion/models/cosmos3/test_cosmos3_sparse_ulysses.py tests/diffusion/models/minimax_h3/test_minimax_h3_sparse_ulysses.py -m 'core_model and cuda and H100 and cards_2' --run-level=core_model"
+        mirror_hardwares: h100_2
+
       - label: "Diffusion · Offloader Test"
         commands:
           - timeout 40m pytest -s -v tests/diffusion/offloader -m "core_model and cuda" --run-level "core_model"
@@ -87,7 +175,7 @@ steps:
 
       - label: "Diffusion · Model Test"
         commands:
-          - timeout 15m pytest -sv tests/diffusion/models/ -m 'core_model and cuda' --run-level "core_model"
+          - timeout 15m pytest -sv tests/diffusion/models/ --ignore=tests/diffusion/models/cosmos3/test_cosmos3_transformer.py --ignore=tests/diffusion/models/minimax_h3/test_minimax_h3_contract.py --ignore=tests/diffusion/models/cosmos3/test_cosmos3_sparse_ulysses.py --ignore=tests/diffusion/models/minimax_h3/test_minimax_h3_sparse_ulysses.py -m 'core_model and cuda' --run-level "core_model"
         mirror_hardwares: l4_1
 
       - label: "Diffusion · Other Test"
@@ -154,7 +242,6 @@ steps:
         commands:
           - timeout 20m pytest -s -v tests/e2e/features/custom_pipeline/ -m "core_model"
         mirror_hardwares: l4_1
-
 
       - label: "RLHF · VeRL-Omni E2E Test"
         source_file_dependencies: rlhf_verl_omni
