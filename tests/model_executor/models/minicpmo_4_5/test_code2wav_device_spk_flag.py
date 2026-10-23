@@ -536,8 +536,14 @@ def test_startup_sweep_does_not_mask_the_sweep_error(tmp_path, monkeypatch, devi
         model.capture_auxiliary_graphs()
 
 
+@pytest.mark.skipif(not current_omni_platform.is_npu(), reason="requires Ascend NPU")
 def test_precapture_cache_release_uses_the_npu_allocator(tmp_path, monkeypatch):
-    """Ascend exposes the allocator through ``torch.npu``, not ``torch.accelerator``."""
+    """Ascend exposes the allocator through ``torch.npu``, not ``torch.accelerator``.
+
+    Skipped on CUDA-only builds: ``_release_precapture_cache`` builds the device
+    with ``torch.device(accelerator.type, ...)``, which raises when no backend
+    registered the ``npu`` device type — the dispatch itself needs that type.
+    """
     model, _ = _build_backend(tmp_path, monkeypatch, {"cfm_precapture_empty_cache": "true"})
     calls: list[str] = []
 
