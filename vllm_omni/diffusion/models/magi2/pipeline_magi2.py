@@ -550,9 +550,11 @@ class Magi2Pipeline(
         if not od_config.model:
             raise ValueError("MAGI-2 requires od_config.model")
         _validate_native_topology(od_config)
-        supported_gpu = current_omni_platform.is_cuda() or current_omni_platform.is_musa()
-        if not supported_gpu or not current_omni_platform.is_available():
-            raise RuntimeError("MAGI-2 Preview requires available CUDA or MUSA GPUs")
+        supported_accelerator = (
+            current_omni_platform.is_cuda() or current_omni_platform.is_musa() or current_omni_platform.is_npu()
+        )
+        if not supported_accelerator or not current_omni_platform.is_available():
+            raise RuntimeError("MAGI-2 Preview requires available CUDA, MUSA, or Ascend NPU")
 
         self.od_config = od_config
         self.dtype = od_config.dtype or torch.bfloat16
@@ -1086,7 +1088,7 @@ class Magi2Pipeline(
         _seed_request(seed)
 
         has_accelerator = (
-            current_omni_platform.is_cuda() or current_omni_platform.is_musa()
+            current_omni_platform.is_cuda() or current_omni_platform.is_musa() or current_omni_platform.is_npu()
         ) and current_omni_platform.is_available()
         device_index = torch.accelerator.current_device_index() if has_accelerator else None
         # Sampling reserved memory is qualification instrumentation, not part

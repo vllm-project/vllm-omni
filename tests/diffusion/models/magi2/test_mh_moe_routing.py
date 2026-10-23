@@ -24,10 +24,8 @@ from vllm_omni.diffusion.models.magi2.fused_moe_kernels import (
     global_sort_routes,
     torch_mh_moe_forward,
 )
-from vllm_omni.diffusion.models.magi2.mh_moe import (
-    _reference_topk_probs_and_indices,
-    compute_topk_probs_and_indices,
-)
+from vllm_omni.diffusion.models.magi2.layers.cuda.mh_moe import compute_topk_probs_and_indices
+from vllm_omni.diffusion.models.magi2.layers.native.mh_moe import _reference_topk_probs_and_indices
 from vllm_omni.platforms import current_omni_platform
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
@@ -399,7 +397,7 @@ triton_utils.HAS_TRITON = False
 triton_utils.triton = TritonPlaceholder()
 triton_utils.tl = TritonLanguagePlaceholder()
 
-import vllm_omni.diffusion.models.magi2.mh_moe  # noqa: F401
+import vllm_omni.diffusion.models.magi2.layers.cuda.mh_moe  # noqa: F401
 """
 
 
