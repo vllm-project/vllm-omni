@@ -80,13 +80,76 @@ __all__ = [
 ]
 
 
-# vLLM's model-inspection subprocess (`python3 -m vllm.model_executor.models.registry`)
-# imports vllm_omni, and on NPU the interpreter aborts while finalizing
-# (SIGABRT, "corrupted size vs. prev_size", exit code 134). vLLM 0.32 treats
-# that exit code as a hard failure ("Model architectures ... failed to be
-# inspected") and refuses to start the engine. The child only prints the
-# registry and exits, so terminate it cleanly right after its work is done;
-# no state needs flushing there.
+def _install_registry_exit_bypass() -> None:
+    """Bypass interpreter finalization in vLLM's model-inspection subprocess.
+
+    vLLM 0.32 spawns ``python3 -m vllm.model_executor.models.registry`` to
+    inspect model architectures; that child imports ``vllm_omni`` through
+    ``load_general_plugins()``. On NPU the child's interpreter aborts while
+    finalizing (SIGABRT, "corrupted size vs. prev_size", exit code 134), and
+    vLLM 0.32 treats that exit code as a hard failure ("Model architectures
+    ... failed to be inspected"), refusing to start the engine.
+
+    The child's whole job is ``_run()`` in
+    ``vllm/model_executor/models/registry.py``::
+
+        def _run() -> None:
+            load_general_plugins()                 # imports vllm_omni (here)
+            fn, output_file = pickle.loads(sys.stdin.buffer.read())
+            result = fn()                          # architecture check
+            with open(output_file, "wb") as f:     # registry serialization
+                f.write(pickle.dumps(result))
+
+    ``atexit`` handlers run only after ``_run()`` has either raised or
+    returned, which gives exactly two exit paths:
+
+    * **success** -- ``_run()`` returned, so the check passed and the registry
+      is already serialized and closed on disk. The handler calls
+      :func:`os._exit` with status 0, skipping the finalization that aborts.
+      stdout/stderr are flushed first so whatever the child printed survives.
+    * **failure** -- ``_run()`` raised, or the child asked for a non-zero
+      status. The handler returns without interfering and the interpreter
+      exits normally: non-zero status plus the original traceback on stderr,
+      which vLLM re-raises as a ``RuntimeError``. Swallowing that status here
+      would hide the real error behind a confusing "output file missing"
+      failure in the parent.
+    """
+    failed = False
+
+    original_excepthook = sys.excepthook
+
+    def _excepthook(exc_type, exc_value, traceback):
+        nonlocal failed
+        failed = True
+        original_excepthook(exc_type, exc_value, traceback)
+
+    sys.excepthook = _excepthook
+
+    # ``SystemExit`` is handled before ``sys.excepthook`` runs, so an explicit
+    # non-zero ``sys.exit(...)`` has to be recorded separately.
+    original_exit = sys.exit
+
+    def _exit(code=None):
+        nonlocal failed
+        if code not in (None, 0):
+            failed = True
+        original_exit(code)
+
+    sys.exit = _exit
+
+    def _bypass_finalization():
+        if failed:
+            return
+        for stream in (sys.stdout, sys.stderr):
+            try:
+                stream.flush()
+            except Exception:  # pragma: no cover - already closed/broken
+                pass
+        os._exit(0)
+
+    atexit.register(_bypass_finalization)
+
+
 if sys.argv and sys.argv[0].endswith("models/registry.py"):
     try:
         import torch as _torch
@@ -95,4 +158,4 @@ if sys.argv and sys.argv[0].endswith("models/registry.py"):
     except Exception:  # pragma: no cover - torch is always importable here
         _on_npu = False
     if _on_npu:
-        atexit.register(lambda: os._exit(0))
+        _install_registry_exit_bypass()
