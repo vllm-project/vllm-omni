@@ -2358,6 +2358,8 @@ class MiniMaxH3Pipeline(
                     # callback's error guard. Agree before any rank enters the
                     # VAE collectives, including when the owner is not global 0.
                     group = self.video_vae._native_parallel_state()["sp_process_group"]
+                    # The current VAE SP group supports tensors on video_latent.device,
+                    # matching the callback-failure broadcast in chunked_decode.
                     failed = torch.tensor([int(start_error is not None)], dtype=torch.int32, device=video_latent.device)
                     dist.broadcast(failed, src=dist.get_global_rank(group, 0), group=group)
                     if int(failed.item()) and start_error is None:
