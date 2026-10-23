@@ -235,6 +235,7 @@ _MULTISTAGE_APP_STATE_KEYS = {
     "enable_server_load_tracking",
     "server_load_metrics",
 }
+# The OpenPI robot server is None unless the policy declares policy_server_config.
 _MULTISTAGE_MUST_BE_NONE = {
     "openai_serving_duplex",
     "openai_serving_realtime_robot",
@@ -1286,12 +1287,16 @@ async def test_pure_diffusion_speech_forwards_media_access_args(monkeypatch, tmp
 @pytest.mark.asyncio
 @pytest.mark.parametrize("ming3", [False, True, "tts"])
 @pytest.mark.parametrize("supported_tasks", [("generate",), ("embed",)])
-async def test_multistage_app_state_key_snapshot(monkeypatch, mocker, tmp_path, supported_tasks, ming3) -> None:
+@pytest.mark.parametrize("policy_server", [False, True])
+async def test_multistage_app_state_key_snapshot(
+    monkeypatch, mocker, tmp_path, supported_tasks, ming3, policy_server
+) -> None:
     """Lock multi-stage ``app.state`` keys after init, including live vs None.
 
     Fails if chat/speech/video/realtime/tokenization keys disappear or are
     left as None after init refactors — classic “route still registered,
-    handler never wired” failure mode.
+    handler never wired” failure mode. A multi-stage robot policy (one that
+    declares ``policy_server_config``) also gets the OpenPI server.
     """
     engine = _FakeEngineClient(
         stage_configs=[object(), object()],
@@ -1362,6 +1367,12 @@ async def test_multistage_app_state_key_snapshot(monkeypatch, mocker, tmp_path, 
 
     register = AsyncMock()
     monkeypatch.setattr("vllm_omni.entrypoints.openai.ming3_voices.register_model_voice_presets", register)
+    if policy_server:
+        monkeypatch.setattr(
+            api_server.ServingRealtimeRobotOpenPI,
+            "create_policy_server",
+            classmethod(lambda cls, *a, **k: _marker("openpi")),
+        )
 
     state = State()
     await api_server.omni_init_app_state(engine, state, _minimal_args(log_error_stack=True))
@@ -1384,11 +1395,12 @@ async def test_multistage_app_state_key_snapshot(monkeypatch, mocker, tmp_path, 
         if "generate" in supported_tasks
         else {"openai_serving_chat", "openai_serving_chat_batch", "openai_streaming_video"}
     )
+    robot = {"openai_serving_realtime_robot"} if policy_server else set()
     _assert_app_state_snapshot(
         state,
         expected_keys=_MULTISTAGE_APP_STATE_KEYS,
-        must_be_wired=_MULTISTAGE_MUST_BE_WIRED - disabled,
-        must_be_none=_MULTISTAGE_MUST_BE_NONE | disabled,
+        must_be_wired=(_MULTISTAGE_MUST_BE_WIRED | robot) - disabled,
+        must_be_none=(_MULTISTAGE_MUST_BE_NONE - robot) | disabled,
     )
     assert state.online_renderer.kwargs["log_error_stack"] is True
     assert state.online_renderer.warmup_calls == 1

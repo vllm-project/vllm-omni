@@ -514,6 +514,118 @@ steps:
             "$$STABLE_AUDIO_OFFLOAD_ARTIFACT_DIR/pytest-summary.txt"
 
 
+  - group: ":full_moon: Qwen-Image Accuracy MI300 Nightly"
+    steps:
+      - label: "Qwen-Image Diffusers Accuracy"
+        agent_pool: mi300_1
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 180
+        env:
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+        artifact_paths:
+          - artifacts/rocm-qwen-image-accuracy/**/*
+        commands:
+          - export ROCM_QWEN_IMAGE_ACCURACY_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-qwen-image-accuracy"
+          - mkdir -p "$$ROCM_QWEN_IMAGE_ACCURACY_ARTIFACT_DIR"
+          - |
+            nodes=(
+              "tests/e2e/accuracy/test_qwen_image.py::test_qwen_image_matches_diffusers"
+              "tests/e2e/accuracy/test_qwen_image.py::test_qwen_image_matches_diffusers_pixelwise"
+            )
+            pytest --collect-only -q "$${nodes[@]}" \
+              -m "full_model and diffusion and rocm and MI325 and cards_1" --run-level full_model \
+              > "$$ROCM_QWEN_IMAGE_ACCURACY_ARTIFACT_DIR/collection.txt"
+            for node in "$${nodes[@]}"; do
+              if ! grep -Fxq "$$node" "$$ROCM_QWEN_IMAGE_ACCURACY_ARTIFACT_DIR/collection.txt"; then
+                echo "Qwen-Image accuracy node was not collected: $$node" >&2
+                cat "$$ROCM_QWEN_IMAGE_ACCURACY_ARTIFACT_DIR/collection.txt" >&2
+                exit 5
+              fi
+            done
+            collected_count=$$(grep -c '::' "$$ROCM_QWEN_IMAGE_ACCURACY_ARTIFACT_DIR/collection.txt" || true)
+            if [[ "$$collected_count" != 2 ]]; then
+              echo "Expected exactly two Qwen-Image accuracy nodes, found $$collected_count." >&2
+              cat "$$ROCM_QWEN_IMAGE_ACCURACY_ARTIFACT_DIR/collection.txt" >&2
+              exit 5
+            fi
+          - |
+            set +e
+            timeout --signal=TERM --kill-after=2m 165m \
+              pytest -s -v \
+              "tests/e2e/accuracy/test_qwen_image.py::test_qwen_image_matches_diffusers" \
+              "tests/e2e/accuracy/test_qwen_image.py::test_qwen_image_matches_diffusers_pixelwise" \
+              -m "full_model and diffusion and rocm and MI325 and cards_1" --run-level full_model \
+              --junitxml="$$ROCM_QWEN_IMAGE_ACCURACY_ARTIFACT_DIR/pytest.xml" \
+              2>&1 | tee "$$ROCM_QWEN_IMAGE_ACCURACY_ARTIFACT_DIR/pytest.log"
+            status=$${PIPESTATUS[0]}
+            set -e
+            if [[ -d tests/e2e/accuracy/artifacts ]]; then
+              mkdir -p "$$ROCM_QWEN_IMAGE_ACCURACY_ARTIFACT_DIR/accuracy"
+              cp -a tests/e2e/accuracy/artifacts/. "$$ROCM_QWEN_IMAGE_ACCURACY_ARTIFACT_DIR/accuracy/"
+            fi
+
+            exit "$$status"
+
+  - group: ":full_moon: Wan2.2 Accuracy MI300 Nightly"
+    steps:
+      - label: "Wan2.2 I2V Accuracy 2 GPU"
+        agent_pool: mi300_2
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 180
+        env:
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+        artifact_paths:
+          - artifacts/rocm-wan22-accuracy-2gpu/**/*
+        commands:
+          - export ROCM_WAN22_ACCURACY_2GPU_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-wan22-accuracy-2gpu"
+          - mkdir -p "$$ROCM_WAN22_ACCURACY_2GPU_ARTIFACT_DIR"
+          # Offline generation is cards_1. Run it in this pod before the
+          # cards_2 online generation and comparison. A missing baseline fails.
+          - |
+            marker="full_model and diffusion and rocm and MI325 and (cards_1 or cards_2)"
+            nodes=(
+              "tests/e2e/accuracy/wan22_i2v/test_wan22_i2v_video_similarity.py::test_wan22_i2v_diffusers_offline_generates_video"
+              "tests/e2e/accuracy/wan22_i2v/test_wan22_i2v_video_similarity.py::test_wan22_i2v_online_serving_generates_video"
+              "tests/e2e/accuracy/wan22_i2v/test_wan22_i2v_video_similarity.py::test_wan22_i2v_serving_matches_diffusers_video_similarity"
+            )
+            pytest --collect-only -q "$${nodes[@]}" \
+              -m "$$marker" --run-level full_model \
+              > "$$ROCM_WAN22_ACCURACY_2GPU_ARTIFACT_DIR/collection.txt"
+            for node in "$${nodes[@]}"; do
+              if ! grep -Fq "$$node" "$$ROCM_WAN22_ACCURACY_2GPU_ARTIFACT_DIR/collection.txt"; then
+                echo "Wan2.2 accuracy node was not collected: $$node" >&2
+                cat "$$ROCM_WAN22_ACCURACY_2GPU_ARTIFACT_DIR/collection.txt" >&2
+                exit 5
+              fi
+            done
+            collected_count=$$(grep -c '::' "$$ROCM_WAN22_ACCURACY_2GPU_ARTIFACT_DIR/collection.txt" || true)
+            if [[ "$$collected_count" != 3 ]]; then
+              echo "Expected exactly three Wan2.2 accuracy nodes, found $$collected_count." >&2
+              cat "$$ROCM_WAN22_ACCURACY_2GPU_ARTIFACT_DIR/collection.txt" >&2
+              exit 5
+            fi
+          - |
+            set +e
+            marker="full_model and diffusion and rocm and MI325 and (cards_1 or cards_2)"
+            timeout --signal=TERM --kill-after=2m 165m \
+              pytest -s -v \
+              "tests/e2e/accuracy/wan22_i2v/test_wan22_i2v_video_similarity.py::test_wan22_i2v_diffusers_offline_generates_video" \
+              "tests/e2e/accuracy/wan22_i2v/test_wan22_i2v_video_similarity.py::test_wan22_i2v_online_serving_generates_video" \
+              "tests/e2e/accuracy/wan22_i2v/test_wan22_i2v_video_similarity.py::test_wan22_i2v_serving_matches_diffusers_video_similarity" \
+              -m "$$marker" --run-level full_model \
+              --junitxml="$$ROCM_WAN22_ACCURACY_2GPU_ARTIFACT_DIR/pytest.xml" \
+              2>&1 | tee "$$ROCM_WAN22_ACCURACY_2GPU_ARTIFACT_DIR/pytest.log"
+            status=$${PIPESTATUS[0]}
+            set -e
+            if [[ -d tests/e2e/accuracy/wan22_i2v/result ]]; then
+              mkdir -p "$$ROCM_WAN22_ACCURACY_2GPU_ARTIFACT_DIR/result"
+              cp -a tests/e2e/accuracy/wan22_i2v/result/. \
+                "$$ROCM_WAN22_ACCURACY_2GPU_ARTIFACT_DIR/result/"
+            fi
+            exit "$$status"
+
   - group: ":full_moon: HunyuanImage3 LoRA MI300 Nightly"
     steps:
       - label: "HunyuanImage3 LoRA Accuracy"
@@ -618,6 +730,102 @@ steps:
             if [[ -d tests/e2e/accuracy/artifacts ]]; then
               mkdir -p "$$ROCM_HUNYUANVIDEO15_ACCURACY_ARTIFACT_DIR/accuracy"
               cp -a tests/e2e/accuracy/artifacts/. "$$ROCM_HUNYUANVIDEO15_ACCURACY_ARTIFACT_DIR/accuracy/"
+            fi
+
+            exit "$$status"
+
+  - group: ":full_moon: MiniMax-H3 Accuracy MI300 Nightly"
+    steps:
+      - label: "MiniMax-H3 Timeline Guide Accuracy"
+        agent_pool: mi300_2
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 180
+        env:
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+        artifact_paths:
+          - artifacts/rocm-minimax-h3-timeline/**/*
+        commands:
+          - export ROCM_MINIMAX_H3_TIMELINE_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-minimax-h3-timeline"
+          - mkdir -p "$$ROCM_MINIMAX_H3_TIMELINE_ARTIFACT_DIR"
+          - |
+            node="tests/e2e/accuracy/minimax_h3/test_minimax_h3_timeline_guides.py::test_minimax_h3_timeline_guides_condition_frames_and_audio"
+            pytest --collect-only -q "$$node" \
+              -m "full_model and diffusion and rocm and MI325 and cards_2" --run-level full_model \
+              > "$$ROCM_MINIMAX_H3_TIMELINE_ARTIFACT_DIR/collection.txt"
+            count=$$(awk -v node="$$node" 'index($$0, node) { n++ } END { print n + 0 }' \
+              "$$ROCM_MINIMAX_H3_TIMELINE_ARTIFACT_DIR/collection.txt")
+            if [[ "$$count" != 1 ]]; then
+              echo "Expected exactly one MiniMax-H3 timeline accuracy node, found $$count." >&2
+              cat "$$ROCM_MINIMAX_H3_TIMELINE_ARTIFACT_DIR/collection.txt" >&2
+              exit 5
+            fi
+          - |
+            set +e
+            node="tests/e2e/accuracy/minimax_h3/test_minimax_h3_timeline_guides.py::test_minimax_h3_timeline_guides_condition_frames_and_audio"
+            timeout --signal=TERM --kill-after=2m 165m \
+              pytest -s -v "$$node" \
+              -m "full_model and diffusion and rocm and MI325 and cards_2" --run-level full_model \
+              --junitxml="$$ROCM_MINIMAX_H3_TIMELINE_ARTIFACT_DIR/pytest.xml" \
+              2>&1 | tee "$$ROCM_MINIMAX_H3_TIMELINE_ARTIFACT_DIR/pytest.log"
+            status=$${PIPESTATUS[0]}
+            set -e
+            if [[ -d tests/e2e/accuracy/artifacts ]]; then
+              mkdir -p "$$ROCM_MINIMAX_H3_TIMELINE_ARTIFACT_DIR/accuracy"
+              cp -a tests/e2e/accuracy/artifacts/. "$$ROCM_MINIMAX_H3_TIMELINE_ARTIFACT_DIR/accuracy/"
+            fi
+
+            exit "$$status"
+      - label: "MiniMax-H3 I2VA Ref2VA Accuracy"
+        agent_pool: mi300_4
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 180
+        env:
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+        artifact_paths:
+          - artifacts/rocm-minimax-h3-i2va/**/*
+        commands:
+          - export ROCM_MINIMAX_H3_I2VA_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-minimax-h3-i2va"
+          - mkdir -p "$$ROCM_MINIMAX_H3_I2VA_ARTIFACT_DIR"
+          - |
+            nodes=(
+              "tests/e2e/accuracy/minimax_h3/test_minimax_h3_i2va_ref2va_similarity.py::test_minimax_h3_i2va_matches_official_reference"
+              "tests/e2e/accuracy/minimax_h3/test_minimax_h3_i2va_ref2va_similarity.py::test_minimax_h3_ref2va_matches_official_reference"
+            )
+            pytest --collect-only -q "$${nodes[@]}" \
+              -m "full_model and diffusion and rocm and MI325 and cards_4" --run-level full_model \
+              > "$$ROCM_MINIMAX_H3_I2VA_ARTIFACT_DIR/collection.txt"
+            count=$$(awk '/::/ { n++ } END { print n + 0 }' \
+              "$$ROCM_MINIMAX_H3_I2VA_ARTIFACT_DIR/collection.txt")
+            if [[ "$$count" != "$${#nodes[@]}" ]]; then
+              echo "Expected exactly $${#nodes[@]} MiniMax-H3 I2VA/Ref2VA nodes, found $$count." >&2
+              cat "$$ROCM_MINIMAX_H3_I2VA_ARTIFACT_DIR/collection.txt" >&2
+              exit 5
+            fi
+            for node in "$${nodes[@]}"; do
+              if ! grep -Fq "$$node" "$$ROCM_MINIMAX_H3_I2VA_ARTIFACT_DIR/collection.txt"; then
+                echo "MiniMax-H3 accuracy node was not collected: $$node" >&2
+                cat "$$ROCM_MINIMAX_H3_I2VA_ARTIFACT_DIR/collection.txt" >&2
+                exit 5
+              fi
+            done
+          - |
+            set +e
+            nodes=(
+              "tests/e2e/accuracy/minimax_h3/test_minimax_h3_i2va_ref2va_similarity.py::test_minimax_h3_i2va_matches_official_reference"
+              "tests/e2e/accuracy/minimax_h3/test_minimax_h3_i2va_ref2va_similarity.py::test_minimax_h3_ref2va_matches_official_reference"
+            )
+            timeout --signal=TERM --kill-after=2m 165m \
+              pytest -s -v "$${nodes[@]}" \
+              -m "full_model and diffusion and rocm and MI325 and cards_4" --run-level full_model \
+              --junitxml="$$ROCM_MINIMAX_H3_I2VA_ARTIFACT_DIR/pytest.xml" \
+              2>&1 | tee "$$ROCM_MINIMAX_H3_I2VA_ARTIFACT_DIR/pytest.log"
+            status=$${PIPESTATUS[0]}
+            set -e
+            if [[ -d tests/e2e/accuracy/artifacts ]]; then
+              mkdir -p "$$ROCM_MINIMAX_H3_I2VA_ARTIFACT_DIR/accuracy"
+              cp -a tests/e2e/accuracy/artifacts/. "$$ROCM_MINIMAX_H3_I2VA_ARTIFACT_DIR/accuracy/"
             fi
 
             exit "$$status"

@@ -98,3 +98,31 @@ stages:
 platforms:
   cuda:
     cuda_mps: true
+  # Stage 0 stays on Model Runner V2. The NPU AR worker builds Ascend input
+  # state and attention metadata. Tensor parallel shards the backbone; expert
+  # parallel puts 128 of the 256 routed experts on each card. vLLM-Ascend
+  # expands those block-FP8 experts to bf16: 256 x 40 x (2 x 512 x 2048 +
+  # 512 x 2048) = 32.2B params, 64.4 GiB in all, 32.2 GiB on each rank, plus
+  # a few GiB of sharded non-expert weights. 0.72 of a 64 GB card is 46 GiB,
+  # so each rank still has KV and activation headroom. The DAC stage shares
+  # the second card; its 0.10 budget (6.4 GiB) fits in the 18 GiB that 0.72
+  # leaves there. Stage 0 replays piecewise ACL graphs. V2 must see the
+  # MoE communication method that set_ascend_forward_context stores on the
+  # forward context, or expert-parallel capture asserts. No MPS on NPU.
+  npu:
+    stages:
+      - stage_id: 0
+        gpu_memory_utilization: 0.72
+        enforce_eager: false
+        tensor_parallel_size: 2
+        enable_expert_parallel: true
+        max_num_seqs: 64
+        max_num_batched_tokens: 4096
+        compilation_config:
+          cudagraph_mode: PIECEWISE
+        devices: "0,1"
+      - stage_id: 1
+        gpu_memory_utilization: 0.10
+        enforce_eager: true
+        max_num_seqs: 64
+        devices: "1"

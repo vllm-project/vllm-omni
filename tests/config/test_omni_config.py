@@ -971,10 +971,37 @@ stages:
     assert all(stage.model_config.use_v2_model_runner is expect_v2 for stage in structured.stage_configs)
 
 
-@pytest.mark.parametrize("platform", ["npu", "xpu"])
-def test_mrv2_fails_fast_on_platforms_without_native_workers(platform: str):
+def test_mrv2_fails_fast_on_xpu():
     with pytest.raises(NotImplementedError, match="Model Runner V2"):
-        _apply_platform_overrides(DeployConfig(model_runner="v2"), platform=platform)
+        _apply_platform_overrides(DeployConfig(model_runner="v2"), platform="xpu")
+
+
+@pytest.mark.parametrize("stage_override", [False, True])
+def test_mrv2_config_is_allowed_on_npu(stage_override):
+    deploy = (
+        DeployConfig(stages=[StageDeployConfig(stage_id=0, model_runner="v2")])
+        if stage_override
+        else DeployConfig(model_runner="v2")
+    )
+    deploy = _apply_platform_overrides(deploy, platform="npu")
+    if stage_override:
+        assert deploy.stages[0].model_runner == "v2"
+    else:
+        assert deploy.model_runner == "v2"
+
+
+def test_fish_omni_npu_profile_is_mrv2_tp_ep():
+    deploy = _apply_platform_overrides(load_deploy_config(_DEPLOY_DIR / "fish_omni.yaml"), platform="npu")
+    stage0, stage1 = deploy.stages
+    assert stage0.model_runner == "v2"
+    assert stage0.tensor_parallel_size == 2
+    assert stage0.enable_expert_parallel is True
+    assert stage0.enforce_eager is False
+    assert stage0.gpu_memory_utilization == 0.72
+    assert stage0.devices == "0,1"
+    assert stage1.model_runner == "v1"
+    assert stage1.gpu_memory_utilization == 0.1
+    assert stage1.devices == "1"
 
 
 def _qwen3_omni_pipeline() -> PipelineConfig:

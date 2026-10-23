@@ -745,7 +745,11 @@ It differs from the MiniCPM-o configuration in three ways:
 ### Seed-TTS reference speech as real audio input
 
 By default the Seed-TTS dataset sends its reference clip as voice-cloning metadata: `ref_audio` / `ref_text` ride the
-request body and the model is asked to synthesize the target text in that voice.
+request body. Voice cloning requires a model and endpoint that support those fields; sending them to Qwen3-Omni chat
+does not enable voice cloning. The default chat system prompt asks the model to read the target text verbatim,
+including questions and instructions, without answering or following them. Override it with `--seed-tts-system-prompt`.
+Use `--seed-tts-wer-save-items` to retain each target, ASR transcript, and WER in the result JSON when investigating
+content errors. WER compares the synthesized speech with the dataset target, not with the model's generated reply.
 
 `--seed-tts-reference-as-input` changes the request shape instead of the request contents. The reference clip becomes an
 ordinary **user audio turn**, `ref_audio` / `ref_text` are dropped entirely, and the system prompt asks the model to read

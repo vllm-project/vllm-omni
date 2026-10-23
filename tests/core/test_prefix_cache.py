@@ -1626,6 +1626,27 @@ def test_delayed_read_after_committed_reuse_serves_preserved():
         got = mgr._fetch_source(src)
     assert torch.equal(got, expected_rows(slots))
     assert all(ref is not src for ref in mgr._pending_reads)
+    assert not any(bool(counts.any()) for counts in mgr._pending_slot_refs.values())
+
+
+def test_pending_slot_counts_drain_with_duplicate_slots():
+    """The per-slot pending-ref counter is the fast-path gate for COW
+    preservation: a ref counts each of its slots, duplicates included, and
+    the fetch's unregister takes the same amount back."""
+    mgr, view = make_manager()
+    s1 = run_step(mgr, view, {"a": ([0], 0, 4)})
+    mgr.materialize(s1, ["a"])
+    slots = view.slots_for("a", 0, 4)
+    dup = torch.cat([slots, slots[:1]])
+    with mgr._state_lock:
+        src = mgr._slot_ref(dup, HIDDEN_KEY, "a")
+    counts = mgr._pending_slot_refs[HIDDEN_KEY]
+    assert counts[slots].tolist() == [2, 1, 1, 1] and int(counts.sum()) == 5
+    with torch.inference_mode():
+        got = mgr._fetch_source(src)
+    assert torch.equal(got, expected_rows(dup))
+    assert not any(bool(c.any()) for c in mgr._pending_slot_refs.values())
+    mgr.shutdown()
 
 
 def test_done_fires_only_after_completion_record_published():
@@ -1871,10 +1892,10 @@ def _bare_controller(eager=True):
 def test_manager_partial_publish_failure_releases_resources(monkeypatch):
     policy = ModelCachePolicy(deferred_keys=frozenset({"k"}))
     mgr, view = make_manager(policy=policy)
-    map_slots = mgr._map_slots
+    claim_slots = mgr._claim_slots
 
-    def fail_publish(slots, tid, keys):
-        map_slots(slots, tid, keys)
+    def fail_publish(slots, keys, spans):
+        claim_slots(slots, keys, spans)
         if "k" in keys:
             raise RuntimeError("partial publish")
 
@@ -1882,7 +1903,7 @@ def test_manager_partial_publish_failure_releases_resources(monkeypatch):
         # Rollback must release both the old and newly appended deferred rows.
         sid = run_step(mgr, view, {"a": ([0], 0, 1)}, mm={"k": torch.ones(1, 2)})
         mgr.materialize(sid, ["a"])
-        monkeypatch.setattr(mgr, "_map_slots", fail_publish)
+        monkeypatch.setattr(mgr, "_claim_slots", fail_publish)
         with pytest.raises(RuntimeError, match="partial publish"):
             run_step(mgr, view, {"a": ([0], 1, 1), "b": ([1], 0, 2)}, mm={"k": torch.ones(3, 2)})
         assert mgr._step_ctxs == {}

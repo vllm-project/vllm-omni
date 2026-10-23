@@ -527,9 +527,10 @@ def initialize_model(
                 vae_pp_size,
                 od_config.model_class_name,
             )
-        if vae_pp_size > 1 and is_distributed_vae and vae_mode != "batch" and not od_config.vae_use_tiling:
+        # Only tile mode distributes the tiled path's tiles; spatial_shard_* decodes the full frame.
+        if vae_pp_size > 1 and is_distributed_vae and vae_mode == "tile" and not od_config.vae_use_tiling:
             logger.info(
-                "vae_patch_parallel_size=%d requires vae_use_tiling; automatically enabling it.",
+                "vae_patch_parallel_size=%d in tile mode requires vae_use_tiling; automatically enabling it.",
                 vae_pp_size,
             )
             od_config.vae_use_tiling = True
@@ -562,15 +563,15 @@ def _apply_wan_vae_fastpath_if_enabled(model, od_config: OmniDiffusionConfig) ->
     """Install independent Wan VAE encoder/decoder fast paths on pipeline VAEs.
 
     Controlled by ``vae_fast_path`` and ``vae_encode_fast_path`` (``off`` /
-    ``lossless`` / ``channels_last``). Only CUDA is supported; other platforms
-    keep the reference implementation. Failures never abort model loading.
+    ``lossless`` / ``channels_last``). Only CUDA and XPU are supported; other
+    platforms keep the reference implementation. Failures never abort model loading.
     """
     level = getattr(od_config, "vae_fast_path", "lossless")
     encode_level = getattr(od_config, "vae_encode_fast_path", "lossless")
     if level == "off" and encode_level == "off":
         return
-    if not current_omni_platform.is_cuda():
-        logger.debug("Wan VAE fast path is only supported on CUDA; skipping")
+    if not (current_omni_platform.is_cuda() or current_omni_platform.is_xpu()):
+        logger.debug("Wan VAE fast path is only supported on CUDA and XPU; skipping")
         return
 
     from diffusers.models.autoencoders import AutoencoderKLWan

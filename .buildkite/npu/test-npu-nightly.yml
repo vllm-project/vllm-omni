@@ -257,6 +257,18 @@ steps:
             buildkite-agent artifact upload "tests/dfx/perf/results/diffusion_result_*.json"
             buildkite-agent artifact upload "tests/dfx/perf/results/logs/*.log"
             exit $$EXIT
+      - label: ":full_moon: Diffusion X2I(&A&T) · Qwen-Image Accuracy Test"
+        source_file_dependencies: diffusion_qwen_image_accuracy
+        key: nightly-diffusion-x2iat-accuracy-qwen-image
+        timeout_in_minutes: 180
+        mirror_hardwares: a3_npu_2
+        env:
+          VLLM_WORKER_MULTIPROC_METHOD: spawn
+          HF_TOKEN: "${HF_TOKEN}"
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+        commands:
+          - pytest -s -v tests/e2e/accuracy/test_qwen_image.py -m "full_model and diffusion and npu and A3 and cards_1" --run-level full_model
+
       - label: ":full_moon: Diffusion X2I(&A&T) · Perf Test · Qwen-Image · Single-NPU"
         source_file_dependencies: diffusion_qwen_image_perf
         key: nightly-diffusion-x2iat-performance-qwen-image-single-npu

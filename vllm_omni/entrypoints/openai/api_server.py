@@ -1285,7 +1285,12 @@ async def omni_init_app_state(
         model_name=served_model_names[0] if served_model_names else None,
         stage_configs=state.stage_configs,
     )
-    state.openai_serving_realtime_robot = None
+    # Policies whose first stage is autoregressive (for example reasoning before
+    # acting) serve OpenPI too; this is None without policy_server_config.
+    state.openai_serving_realtime_robot = ServingRealtimeRobotOpenPI.create_policy_server(
+        engine_client=engine_client,
+        model_name=model_name,
+    )
     state.rl_rollout_serving = None
 
     state.enable_server_load_tracking = args.enable_server_load_tracking
