@@ -11,7 +11,8 @@ from _pytest.mark.expression import Expression
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 AMD_READY_PIPELINE = Path(".buildkite/amd/test-amd-ready.yml")
-R2_01_LABEL = "ROCm · Model Executor GPU Coverage (R2-01)"
+R2_01_LABEL = "ROCm · Model Executor GPU Coverage (R2-01) · Shard %N/%t"
+R2_01_SHARD_SUFFIX = "$${BUILDKITE_PARALLEL_JOB}-of-$${BUILDKITE_PARALLEL_JOB_COUNT}"
 ENGINE_LABEL = "Engine Test"
 SINGLE_GPU_MARKERS = (
     "core_model and cuda and not nvidia_only and not "
@@ -63,6 +64,7 @@ def test_r2_01_is_nonblocking_single_gpu_coverage() -> None:
     step = _find_step(R2_01_LABEL)
 
     assert step["agent_pool"] == "mi300_1"
+    assert step["parallelism"] == 2
     assert step["grade"] == "NonBlocking"
     assert step["timeout_in_minutes"] == 50
     assert step["mirror_hardwares"] == ["amdproduction"]
@@ -76,24 +78,28 @@ def test_dedicated_engine_job_preserves_r2_01_engine_coverage() -> None:
 
 def test_r2_01_runs_once_fails_closed_and_publishes_results() -> None:
     commands = _find_step(R2_01_LABEL)["commands"]
+    joined = "\n".join(commands)
     pytest_commands = [command for command in commands if "pytest " in command]
     assert len(pytest_commands) == 1
     run_command = pytest_commands[0]
+    argv = split(run_command)
     artifact_dir = "$$BUILDKITE_BUILD_CHECKOUT_PATH/artifacts/rocm-r2-01"
 
-    assert split(run_command)[:4] == [
+    assert argv[:4] == [
         "timeout",
         "--signal=TERM",
         "--kill-after=2m",
         "45m",
     ]
     _assert_single_gpu_selection(run_command)
-    assert "--collect-only" not in "\n".join(commands)
-    assert "VLLM_CI_ALLOW_NO_TESTS" not in "\n".join(commands)
+    assert "--num-shards=$$BUILDKITE_PARALLEL_JOB_COUNT" in argv
+    assert "--shard-id=$$BUILDKITE_PARALLEL_JOB" in argv
+    assert "--collect-only" not in joined
+    assert "VLLM_CI_ALLOW_NO_TESTS" not in joined
     assert any(artifact_dir in command for command in commands)
-    assert "-v" in split(run_command)
-    assert "-ra" in split(run_command)
-    assert "--durations=0" in split(run_command)
-    assert "--junitxml=$$R2_01_ARTIFACT_DIR/pytest.xml" in split(run_command)
-    assert "$$R2_01_ARTIFACT_DIR/pytest.log" in run_command
-    assert any("$$R2_01_ARTIFACT_DIR/pytest-summary.txt" in command for command in commands)
+    assert "-v" in argv
+    assert "-ra" in argv
+    assert "--durations=0" in argv
+    assert f"--junitxml=$$R2_01_ARTIFACT_DIR/pytest-{R2_01_SHARD_SUFFIX}.xml" in argv
+    assert f"$$R2_01_ARTIFACT_DIR/pytest-{R2_01_SHARD_SUFFIX}.log" in run_command
+    assert any(f"$$R2_01_ARTIFACT_DIR/pytest-summary-{R2_01_SHARD_SUFFIX}.txt" in command for command in commands)

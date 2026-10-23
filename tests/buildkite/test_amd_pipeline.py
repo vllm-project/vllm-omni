@@ -808,7 +808,6 @@ def test_z_image_merge_timeout_covers_cold_aiter_compile() -> None:
 @pytest.mark.parametrize(
     ("label", "pytest_marker"),
     [
-        ("ROCm · FlashAttention/AITER GPU Coverage", "tests/diffusion/attention/"),
         ("Custom Pipeline Test", "tests/e2e/features/custom_pipeline/"),
         ("Diffusion · Batch Test", "tests/diffusion/batching"),
     ],
@@ -823,17 +822,22 @@ def test_ready_jobs_restore_bf16_aiter_module_without_publishing(label: str, pyt
     assert all("VLLM_ROCM_USE_AITER=0" not in command for command in step["commands"])
 
 
-def test_ready_flashattention_keeps_one_worker_and_mammoth_reuse() -> None:
+def test_ready_flashattention_publishes_bf16_aiter_module_on_success() -> None:
     step = _find_step("ROCm · FlashAttention/AITER GPU Coverage", AMD_READY_PIPELINE)
     pytest_commands = [command for command in step["commands"] if "pytest" in command]
 
+    assert step["agent_pool"] == "mi300_1"
+    assert step["depends_on"] == "amd-build"
+    assert step["mirror_hardwares"] == ["amdproduction"]
     assert step["grade"] == "NonBlocking"
     assert step["timeout_in_minutes"] == 60
     assert "export VLLM_ROCM_USE_AITER=1" in step["commands"]
+    _assert_build_scoped_aiter_mha_cache(step, "tests/diffusion/attention/", publishes=True)
     assert len(pytest_commands) == 2
     assert all("-n 1" in command for command in pytest_commands)
     assert "tests/diffusion/models/mammoth_moda2/test_dit_attention_cuda.py" in pytest_commands[1]
     assert "core_model and rocm and MI325 and cards_1" in pytest_commands[0]
+    assert AITER_MHA_CACHE_PUBLISH not in pytest_commands[1]
 
 
 def test_stable_audio_layerwise_reuses_the_bf16_aiter_module_cache() -> None:
@@ -1008,6 +1012,99 @@ def test_amd_runner_preserves_piped_failures_and_empty_collection() -> None:
     assert template.count("soft_fail: true") == 2
 
 
+def test_qwen_image_diffusers_accuracy_is_one_nonblocking_nightly_job() -> None:
+    step = _find_step("Qwen-Image Diffusers Accuracy", AMD_NIGHTLY_PIPELINE)
+    assert step["grade"] == "NonBlocking"
+    assert step["agent_pool"] == "mi300_1"
+    assert step["mirror_hardwares"] == ["amdproduction"]
+    assert step["timeout_in_minutes"] == 180
+    commands = "\n".join(step["commands"])
+    assert "full_model and diffusion and rocm and MI325 and cards_1" in commands
+    assert "--run-level full_model" in commands
+    assert "--collect-only" in commands
+    nodes = (
+        "tests/e2e/accuracy/test_qwen_image.py::test_qwen_image_matches_diffusers",
+        "tests/e2e/accuracy/test_qwen_image.py::test_qwen_image_matches_diffusers_pixelwise",
+    )
+    pytest_command = commands[commands.index("pytest -s -v") :]
+    offsets = [pytest_command.index(node) for node in nodes]
+    assert offsets == sorted(offsets)
+    assert all(commands.count(f'"{node}"') == 2 for node in nodes)
+    assert "Expected exactly two Qwen-Image accuracy nodes" in commands
+    assert "exit 5" in commands
+    assert "pytest.xml" in commands
+    assert step["env"]["DIFFUSION_ATTENTION_BACKEND"] == "TORCH_SDPA"
+    assert "tests/e2e/accuracy/test_qwen_image.py" in commands
+    assert "test_diffusers_backend_similarity.py" not in commands
+    for pipeline_path in (AMD_READY_PIPELINE, AMD_MERGE_PIPELINE):
+        text = pipeline_path.read_text(encoding="utf-8")
+        assert "Qwen-Image Diffusers Accuracy" not in text
+
+
+WAN22_SIMILARITY = "tests/e2e/accuracy/wan22_i2v/test_wan22_i2v_video_similarity.py"
+WAN22_2GPU_NODES = (
+    f"{WAN22_SIMILARITY}::test_wan22_i2v_diffusers_offline_generates_video",
+    f"{WAN22_SIMILARITY}::test_wan22_i2v_online_serving_generates_video",
+    f"{WAN22_SIMILARITY}::test_wan22_i2v_serving_matches_diffusers_video_similarity",
+)
+
+
+def test_wan22_accuracy_has_one_nonblocking_comparison_job() -> None:
+    two = _find_step("Wan2.2 I2V Accuracy 2 GPU", AMD_NIGHTLY_PIPELINE)
+    group = _find_group(":full_moon: Wan2.2 Accuracy MI300 Nightly", AMD_NIGHTLY_PIPELINE)
+    assert [step["label"] for step in group["steps"]] == ["Wan2.2 I2V Accuracy 2 GPU"]
+    assert two["agent_pool"] == "mi300_2"
+    two_commands = "\n".join(two["commands"])
+    assert two["grade"] == "NonBlocking"
+    assert two["timeout_in_minutes"] == 180
+    assert two["env"]["DIFFUSION_ATTENTION_BACKEND"] == "TORCH_SDPA"
+    two_marker = "full_model and diffusion and rocm and MI325 and (cards_1 or cards_2)"
+    assert two_marker in two_commands
+    assert 'and cards_2"' not in two_commands
+    pytest_command = two_commands[two_commands.index("pytest -s -v") :]
+    offsets = [pytest_command.index(node) for node in WAN22_2GPU_NODES]
+    assert offsets == sorted(offsets)
+    assert two_commands.count(WAN22_2GPU_NODES[0]) == 2
+    assert "tests/e2e/accuracy/wan22_i2v/result" in two_commands
+    assert "test_diffusers_backend_similarity.py" not in two_commands
+    assert "--collect-only" in two_commands
+    assert "Expected exactly three Wan2.2 accuracy nodes" in two_commands
+    assert "exit 5" in two_commands
+    similarity = Path(WAN22_SIMILARITY).read_text(encoding="utf-8")
+    assert "require_similarity_artifacts" in similarity
+    assert "similarity.json" in similarity
+    assert "Missing offline artifacts" not in similarity
+    for pipeline_path in (AMD_READY_PIPELINE, AMD_MERGE_PIPELINE):
+        text = pipeline_path.read_text(encoding="utf-8")
+        assert "Wan2.2 I2V Accuracy" not in text
+
+
+def test_wan22_similarity_fails_when_offline_baseline_is_removed(tmp_path: Path) -> None:
+    from tests.e2e.accuracy.wan22_i2v.prerequisite import require_similarity_artifacts
+
+    online = tmp_path / "online.mp4"
+    online.write_bytes(b"online")
+    with pytest.raises(AssertionError, match="offline.mp4"):
+        require_similarity_artifacts(
+            [
+                online,
+                tmp_path / "offline.mp4",
+                tmp_path / "offline_metadata.json",
+            ]
+        )
+
+
+def test_wan22_similarity_accepts_complete_artifacts(tmp_path: Path) -> None:
+    from tests.e2e.accuracy.wan22_i2v.prerequisite import require_similarity_artifacts
+
+    paths = []
+    for name in ("online.mp4", "offline.mp4", "offline_metadata.json"):
+        path = tmp_path / name
+        path.write_bytes(b"x")
+        paths.append(path)
+    require_similarity_artifacts(paths)
+
+
 def test_hunyuan_image3_lora_accuracy_is_one_nonblocking_nightly_job() -> None:
     step = _find_step("HunyuanImage3 LoRA Accuracy", AMD_NIGHTLY_PIPELINE)
     assert step["grade"] == "NonBlocking"
@@ -1061,3 +1158,42 @@ def test_hunyuanvideo15_accuracy_is_one_nonblocking_nightly_job() -> None:
     for pipeline_path in (AMD_READY_PIPELINE, AMD_MERGE_PIPELINE):
         text = pipeline_path.read_text(encoding="utf-8")
         assert "HunyuanVideo-1.5 Video Similarity" not in text
+
+
+def test_minimax_h3_accuracy_has_two_nonblocking_nightly_jobs() -> None:
+    timeline = _find_step("MiniMax-H3 Timeline Guide Accuracy", AMD_NIGHTLY_PIPELINE)
+    i2va = _find_step("MiniMax-H3 I2VA Ref2VA Accuracy", AMD_NIGHTLY_PIPELINE)
+    assert timeline["agent_pool"] == "mi300_2"
+    assert i2va["agent_pool"] == "mi300_4"
+    pairs = (
+        (
+            timeline,
+            "full_model and diffusion and rocm and MI325 and cards_2",
+            "tests/e2e/accuracy/minimax_h3/test_minimax_h3_timeline_guides.py",
+        ),
+        (
+            i2va,
+            "full_model and diffusion and rocm and MI325 and cards_4",
+            "tests/e2e/accuracy/minimax_h3/test_minimax_h3_i2va_ref2va_similarity.py",
+        ),
+    )
+    for step, marker, path in pairs:
+        assert step["grade"] == "NonBlocking"
+        assert step["timeout_in_minutes"] == 180
+        assert step["env"]["DIFFUSION_ATTENTION_BACKEND"] == "TORCH_SDPA"
+        commands = "\n".join(step["commands"])
+        assert marker in commands
+        assert path in commands
+        assert "--collect-only" in commands
+        assert "exit 5" in commands
+    timeline_commands = "\n".join(timeline["commands"])
+    assert "test_minimax_h3_timeline_guides_condition_frames_and_audio" in timeline_commands
+    assert "Expected exactly one MiniMax-H3 timeline accuracy node" in timeline_commands
+    i2va_commands = "\n".join(i2va["commands"])
+    assert "test_minimax_h3_i2va_matches_official_reference" in i2va_commands
+    assert "test_minimax_h3_ref2va_matches_official_reference" in i2va_commands
+    assert "Expected exactly $${#nodes[@]} MiniMax-H3 I2VA/Ref2VA nodes" in i2va_commands
+    for pipeline_path in (AMD_READY_PIPELINE, AMD_MERGE_PIPELINE):
+        text = pipeline_path.read_text(encoding="utf-8")
+        assert "MiniMax-H3 Timeline Guide Accuracy" not in text
+        assert "MiniMax-H3 I2VA Ref2VA Accuracy" not in text

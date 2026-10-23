@@ -417,6 +417,7 @@ vllm serve fishaudio/drama-3 --omni --port 8091
 ```
 
 The deploy config auto-loads from `vllm_omni/deploy/fish_omni.yaml` (the HF `model_type` on the checkpoint is `fish_omni`).
+On Ascend, the same command uses the `npu` profile: Model Runner V2 with tensor parallel 2 and expert parallel across two 910B cards, and the DAC stage sharing the second card. See the recipe.
 
 ### Voice cloning
 

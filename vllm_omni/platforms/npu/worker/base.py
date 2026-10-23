@@ -23,6 +23,12 @@ class OmniNPUWorkerBase(NPUWorker):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
+        # Ascend inherits vLLM's global runner default (V2 in vLLM 0.32),
+        # while Omni resolves the runner independently for each deploy stage.
+        # Keep runner construction and inherited worker lifecycle methods on
+        # the same stage-selected path, including mixed V2 AR / V1 DAC deploys.
+        self.use_v2_model_runner = bool(getattr(self.vllm_config.model_config, "use_v2_model_runner", False))
+
         # Replace vllm-ascend's profiler with OmniProfiler
         profiler_config = self.vllm_config.profiler_config
         if profiler_config and profiler_config.profiler == "torch":
