@@ -252,6 +252,8 @@ class OrchestratorRequestState:
 
     # Wall-clock timestamp when the client-facing engine request was accepted.
     request_timestamp: float = 0.0
+    # Monotonic frontend enqueue time, retained through central admission.
+    enqueue_ts: float = 0.0
 
     # Metrics: timestamp when request was submitted to each stage.
     stage_submit_ts: dict[int, float] = field(default_factory=dict)
@@ -397,6 +399,7 @@ class OrchestratorBase:
             self._pd_bootstrap_addr = pd_config.get("bootstrap_addr")
             self._pd_prefill_engine_id = pd_config.get("prefill_engine_id")
         self.request_states: dict[str, OrchestratorRequestState] = {}
+        self._tail_aware_admission_tasks: dict[str, asyncio.Task[None]] = {}
         self._init_metrics_state(
             stage_pools,
             running_counter,
@@ -404,6 +407,10 @@ class OrchestratorBase:
             engines_waiting_counter=engines_waiting_counter,
             log_stats=log_stats,
         )
+
+        for pool in stage_pools:
+            if pool.tail_aware_scheduling_enabled:
+                pool.on_admission_waiting_changed = self._sync_engines_waiting_counter
 
         self._cfg_tracker = CfgCompanionTracker()
         self._stage_input_processors: dict[int, Any] = {}
@@ -547,6 +554,13 @@ class OrchestratorBase:
                 await asyncio.gather(*tasks, return_exceptions=True)
             except Exception:
                 pass
+            admission_tasks = list(self._tail_aware_admission_tasks.values())
+            for task in admission_tasks:
+                task.cancel()
+            await asyncio.gather(*admission_tasks, return_exceptions=True)
+            for pool in self.stage_pools:
+                if pool.tail_aware_scheduling_enabled:
+                    pool.close_tail_aware_scheduling()
             await self._shutdown_extensions()
 
             if self._membership is not None:
@@ -567,8 +581,18 @@ class OrchestratorBase:
 
     async def _request_handler(self) -> None:
         """Read messages from the main thread via request_async_queue."""
+        tail_aware = any(pool.tail_aware_scheduling_enabled for pool in self.stage_pools)
+        admission_burst = 0
         while True:
             msg = await self.request_async_queue.get()
+            if tail_aware:
+                admission_burst += 1
+                if admission_burst >= 32:
+                    # A nonempty input queue can complete get() synchronously.
+                    # Give admission/output tasks time even under sustained
+                    # arrivals or repeated queue-full responses.
+                    await asyncio.sleep(0)
+                    admission_burst = 0
             msg_type = msg.type
 
             if await self._dispatch_message(msg):
@@ -1511,11 +1535,15 @@ class OrchestratorBase:
         self._sync_engines_waiting_counter()
 
     def _sync_engines_waiting_counter(self) -> None:
-        """Aggregate per-replica waiting into the counter shared with the
-        frontend so engine-queued requests show as waiting, not running."""
+        """Include central admission and replica queues in frontend waiting."""
         counter = self._engines_waiting_counter
         if counter is not None:
-            counter.value = sum(self._stage_replica_waiting.values())
+            counter.value = sum(self._stage_replica_waiting.values()) + sum(
+                pool.admission_waiting_count for pool in self.stage_pools
+            )
+        for pool in self.stage_pools:
+            if pool.tail_aware_scheduling_enabled:
+                self._set_stage_waiting_total(pool.stage_id)
 
     def _set_stage_waiting_total(self, stage_id: int) -> None:
         if self._prom_metrics is None:
@@ -1525,6 +1553,7 @@ class OrchestratorBase:
             for (snapshot_stage_id, _), n_waiting in self._stage_replica_waiting.items()
             if snapshot_stage_id == stage_id
         )
+        total += self.stage_pools[stage_id].admission_waiting_count
         self._prom_metrics.set_stage_waiting_requests(stage_id, total)
 
     async def _handle_dead_replica(
@@ -1788,6 +1817,36 @@ class OrchestratorBase:
 
     # ---- Shared helpers ----
 
+    async def _run_tail_aware_admission(
+        self, request_id: str, req_state: OrchestratorRequestState, prompt: Any, prompt_text: str | None
+    ) -> None:
+        """Wait for capacity without blocking new arrivals or abort messages."""
+        from vllm_omni.scheduling.controller import TailAwareQueueFullError
+
+        try:
+            await self._dispatch_or_fail_request(
+                lambda: self.stage_pools[0].submit_initial(request_id, req_state, prompt, prompt_text=prompt_text),
+                req_id=request_id,
+                stage_id=0,
+                operation="tail_aware_admission",
+            )
+        except TailAwareQueueFullError as exc:
+            await self._fail_request_client_error(
+                request_id, 0, str(exc), status_code=HTTPStatus.TOO_MANY_REQUESTS.value
+            )
+        except (ValueError, TypeError) as exc:
+            await self._fail_request_client_error(request_id, 0, str(exc))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.exception("[Orchestrator] Admission failed for req=%s", request_id)
+            await self._fail_request_client_error(
+                request_id, 0, str(exc), status_code=HTTPStatus.SERVICE_UNAVAILABLE.value
+            )
+        finally:
+            if self._tail_aware_admission_tasks.get(request_id) is asyncio.current_task():
+                self._tail_aware_admission_tasks.pop(request_id, None)
+
     async def _cleanup_request_ids(
         self,
         request_ids: list[str],
@@ -1838,6 +1897,16 @@ class OrchestratorBase:
                 if cid not in batch:
                     batch.add(cid)
                     cleanup_ids.append(cid)
+        admission_tasks = []
+        for rid in cleanup_ids:
+            task = getattr(self, "_tail_aware_admission_tasks", {}).get(rid)
+            if task is not None and task is not asyncio.current_task():
+                task.cancel()
+                admission_tasks.append(task)
+        if admission_tasks:
+            # Wait for an in-flight backend submission to abort before releasing
+            # its reservation. Otherwise a cancelled request can be resurrected.
+            await asyncio.gather(*admission_tasks, return_exceptions=True)
         abort_outputs: list[OutputMessage] = []
         if abort:
             abort_outputs = await self._abort_request_ids(cleanup_ids)
@@ -3501,6 +3570,21 @@ class Orchestrator(OrchestratorBase):
                     "for that stage",
                 )
                 return
+        pool = self.stage_pools[stage_id]
+        if (
+            pool.tail_aware_scheduling_enabled
+            and len(self._tail_aware_admission_tasks) >= pool.tail_aware_admission_limit
+        ):
+            # Bound waiting plus reserved/submitting tasks before acquire(). A burst
+            # already present on the input queue can otherwise register an
+            # unbounded number of tasks before the controller runs at all.
+            await self._fail_request_client_error(
+                request_id,
+                stage_id,
+                "tail-aware pending request limit reached",
+                status_code=HTTPStatus.TOO_MANY_REQUESTS.value,
+            )
+            return
 
         logger.debug(
             "[Orchestrator] _handle_add_request: stage=%s req=%s "
@@ -3522,6 +3606,7 @@ class Orchestrator(OrchestratorBase):
             entry_stage_id=stage_id,
             final_output_stage_ids=final_output_stage_ids,
             request_timestamp=float(msg.request_timestamp or _time.time()),
+            enqueue_ts=msg.enqueue_ts,
             mm_features=getattr(prompt, "mm_features", None),
             request_artifact_dirs=set(msg.request_artifact_dirs or ()),
         )
@@ -3535,6 +3620,12 @@ class Orchestrator(OrchestratorBase):
         preprocess_ms = msg.preprocess_ms
         if preprocess_ms > 0:
             req_state.pipeline_timings["preprocess_ms"] = preprocess_ms
+        if pool.tail_aware_scheduling_enabled:
+            self._tail_aware_admission_tasks[request_id] = asyncio.create_task(
+                self._run_tail_aware_admission(request_id, req_state, prompt, msg.output_prompt_text),
+                name=f"tail-aware-admission-{request_id}",
+            )
+            return
         input_guard = self._stage_input_submission(stage_id) if stage_id != 0 else nullcontext()
         async with input_guard as mark_submitting:
             expected_replica_id = None
