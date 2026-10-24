@@ -1196,6 +1196,7 @@ class HunyuanImage3Pipeline(
         device=None,
         max_new_tokens=None,
         prepared_layout: HunyuanPreparedLayout | None = None,
+        batch_ar_token_ids: list[tuple[list[int], list[int]] | None] | None = None,
         **kwargs,
     ):
         # 1. Sanity check
@@ -1301,6 +1302,8 @@ class HunyuanImage3Pipeline(
                 batch_cond_image_info=batch_cond_image_info,
                 batch_system_prompt=batch_system_prompt,
                 batch_cot_text=batch_cot_text,
+                batch_ar_token_ids=batch_ar_token_ids,
+                validate_ar_kv_prefix=bool(kwargs.get("ar_kv_data")) or any(kwargs.get("kv_computed_tokens", ())),
                 max_length=kwargs.get("max_length"),
                 bot_task=bot_task,
                 image_base_size=self.config.image_base_size,
@@ -2047,6 +2050,7 @@ class HunyuanImage3Pipeline(
         model_kwargs = self.prepare_model_inputs(
             prompt=prompt,
             cot_text=cot_text,
+            batch_ar_token_ids=request_layout_utils.extract_hunyuan_ar_token_ids([state.prompt]),
             system_prompt=system_prompt,
             mode="gen_image",
             generator=sampling.generator,
@@ -2480,6 +2484,7 @@ class HunyuanImage3Pipeline(
         model_inputs = self.prepare_model_inputs(
             prompt=prompt,
             cot_text=cot_text,
+            batch_ar_token_ids=request_layout_utils.extract_hunyuan_ar_token_ids(req.prompts),
             system_prompt=system_prompt,
             mode="gen_image",
             generator=generator,
