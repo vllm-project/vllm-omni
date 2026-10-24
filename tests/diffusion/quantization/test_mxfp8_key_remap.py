@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Tests for merge_mxfp8_checkpoint.py key-remapping helpers and model metadata.
 
 These are pure-Python unit tests that exercise the transformation functions
@@ -212,3 +212,61 @@ def test_remap_keys_preserves_tensors():
     state = {"blocks.0.self_attn.q.weight": t}
     new_state, _ = _remap_keys(state, {})
     assert torch.equal(new_state["blocks.0.attn1.to_q.weight"], t)
+
+
+def test_remap_keys_smoothquant_multiplier():
+    from vllm_omni.quantization.tools.merge_mxfp8_checkpoint import _remap_keys
+
+    scale = torch.tensor([0.5, 2.0])
+    new_state, new_meta = _remap_keys(
+        {"blocks.0.self_attn.q.div.mul_scale": scale},
+        {"blocks.0.self_attn.q.div.mul_scale": "FLOAT"},
+    )
+    name = "blocks.0.attn1.to_q.mul_scale"
+    assert torch.equal(new_state[name], scale)
+    assert new_meta[name] == "FLOAT"
+
+
+def test_remap_keys_unwraps_msmodelslim_smoothquant_linear():
+    from vllm_omni.quantization.tools.merge_mxfp8_checkpoint import _remap_keys
+
+    state = {
+        "blocks.0.self_attn.q.linear.weight": torch.zeros(2, 4),
+        "blocks.0.self_attn.q.linear.weight_scale": torch.zeros(2, 1, dtype=torch.uint8),
+        "blocks.0.self_attn.q.div.mul_scale": torch.ones(4),
+    }
+    meta = {
+        "blocks.0.self_attn.q.linear.weight": "W8A8_MXFP8",
+        "blocks.0.self_attn.q.linear.weight_scale": "W8A8_MXFP8",
+        "blocks.0.self_attn.q.div.mul_scale": "FLOAT",
+    }
+
+    new_state, new_meta = _remap_keys(state, meta)
+
+    assert "blocks.0.attn1.to_q.weight" in new_state
+    assert "blocks.0.attn1.to_q.weight_scale" in new_state
+    assert "blocks.0.attn1.to_q.mul_scale" in new_state
+    assert "blocks.0.attn1.to_q.linear.weight" not in new_state
+    assert new_meta["blocks.0.attn1.to_q.weight"] == "W8A8_MXFP8"
+
+
+def test_remap_keys_preserves_unrelated_linear_segment():
+    from vllm_omni.quantization.tools.merge_mxfp8_checkpoint import _remap_keys
+
+    state = {"blocks.0.condition_embedder.linear.weight": torch.zeros(1)}
+    new_state, _ = _remap_keys(state, {})
+    assert "blocks.0.condition_embedder.linear.weight" in new_state
+
+
+@pytest.mark.parametrize(
+    ("state", "meta", "expected"),
+    [
+        ({"layer.weight": torch.ones(1), "layer.mul_scale": torch.ones(4)}, {"layer.weight": "W8A8_MXFP8"}, True),
+        ({"layer.weight": torch.ones(1)}, {"layer.weight": "W8A8_MXFP8"}, False),
+        ({"layer.weight": torch.ones(1)}, {"layer.weight": "FLOAT"}, False),
+    ],
+)
+def test_smoothquant_checkpoint_requirement(state, meta, expected):
+    from vllm_omni.quantization.tools.merge_mxfp8_checkpoint import _has_complete_mxfp8_smooth_scales
+
+    assert _has_complete_mxfp8_smooth_scales(state, meta) is expected

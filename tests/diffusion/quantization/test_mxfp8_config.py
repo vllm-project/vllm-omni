@@ -43,6 +43,7 @@ def test_mxfp8_config_from_config_defaults():
     cfg = DiffusionMXFP8Config.from_config({})
     assert cfg.is_checkpoint_mxfp8_serialized is False
     assert cfg.ignored_layers == []
+    assert cfg.require_smooth_scale is False
 
 
 def test_mxfp8_config_from_config_serialized():
@@ -50,6 +51,27 @@ def test_mxfp8_config_from_config_serialized():
 
     cfg = DiffusionMXFP8Config.from_config({"is_checkpoint_mxfp8_serialized": True})
     assert cfg.is_checkpoint_mxfp8_serialized is True
+
+
+def test_mxfp8_config_from_config_require_smooth_scale():
+    from vllm_omni.quantization.mxfp8_config import DiffusionMXFP8Config
+
+    cfg = DiffusionMXFP8Config.from_config({"is_checkpoint_mxfp8_serialized": True, "require_smooth_scale": True})
+    assert cfg.require_smooth_scale is True
+
+
+def test_mxfp8_config_rejects_smooth_scale_for_online_checkpoint():
+    from vllm_omni.quantization.mxfp8_config import DiffusionMXFP8Config
+
+    with pytest.raises(ValueError, match="requires an offline MXFP8 checkpoint"):
+        DiffusionMXFP8Config(require_smooth_scale=True)
+
+
+def test_mxfp8_config_rejects_non_boolean_smooth_scale_requirement():
+    from vllm_omni.quantization.mxfp8_config import DiffusionMXFP8Config
+
+    with pytest.raises(ValueError, match="require_smooth_scale must be a boolean"):
+        DiffusionMXFP8Config(is_checkpoint_mxfp8_serialized=True, require_smooth_scale="true")
 
 
 def test_mxfp8_config_from_config_ignored_layers():
@@ -328,6 +350,87 @@ def test_weight_scale_reshape_contract(n: int, k_groups: int, expected_groups: i
     s = s.reshape(n, k_groups // 2, 2).transpose(0, 1).contiguous()
     assert s.shape == (expected_groups, n, 2)
     assert s.is_contiguous()
+
+
+def test_offline_mxfp8_registers_and_loads_smooth_multiplier():
+    from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+
+    from vllm_omni.quantization.mxfp8_config import DiffusionMXFP8Config, NPUMxfp8LinearMethod
+
+    layer = Module()
+    method = NPUMxfp8LinearMethod(DiffusionMXFP8Config(is_checkpoint_mxfp8_serialized=True))
+    method.create_weights(
+        layer,
+        input_size_per_partition=64,
+        output_partition_sizes=[8],
+        input_size=64,
+        output_size=8,
+        params_dtype=torch.bfloat16,
+        weight_loader=default_weight_loader,
+    )
+
+    assert layer.mul_scale.shape == (64,)
+    assert layer.mul_scale.dtype == torch.float32
+    assert layer.mul_scale.input_dim == 0
+    assert layer.weight_scale.input_dim == 1
+    assert layer.mul_scale.is_checkpoint_optional
+    torch.testing.assert_close(layer.mul_scale, torch.ones(64))
+
+    loaded_scale = torch.linspace(0.5, 2.0, 64)
+    layer.mul_scale.weight_loader(layer.mul_scale, loaded_scale)
+    torch.testing.assert_close(layer.mul_scale, loaded_scale)
+
+
+def test_offline_mxfp8_requires_calibration_when_configured():
+    from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+
+    from vllm_omni.quantization.mxfp8_config import DiffusionMXFP8Config, NPUMxfp8LinearMethod
+
+    layer = Module()
+    method = NPUMxfp8LinearMethod(DiffusionMXFP8Config(is_checkpoint_mxfp8_serialized=True, require_smooth_scale=True))
+    method.create_weights(
+        layer,
+        input_size_per_partition=64,
+        output_partition_sizes=[8],
+        input_size=64,
+        output_size=8,
+        params_dtype=torch.bfloat16,
+        weight_loader=default_weight_loader,
+    )
+    assert not layer.mul_scale.is_checkpoint_optional
+
+
+def test_offline_mxfp8_applies_multiplier_before_activation_quantization(monkeypatch):
+    import sys
+    from types import ModuleType
+
+    from vllm_omni.quantization.mxfp8_config import DiffusionMXFP8Config, NPUMxfp8LinearMethod
+
+    config = DiffusionMXFP8Config(is_checkpoint_mxfp8_serialized=True)
+    method = NPUMxfp8LinearMethod(config)
+    layer = Module()
+    layer.register_buffer("mul_scale", torch.tensor([2.0, 0.5], dtype=torch.float32))
+    layer.register_buffer("weight", torch.zeros(2, 2))
+    layer.register_buffer("weight_scale", torch.zeros(1, 2, 2))
+    observed = []
+    fake_npu = ModuleType("torch_npu")
+    setattr(fake_npu, "float8_e4m3fn", torch.float8_e4m3fn)
+    setattr(fake_npu, "float8_e8m0fnu", torch.uint8)
+
+    def quantize_activation(value, **kwargs):
+        observed.append(value.clone())
+        return value, torch.ones(value.shape[0], 1)
+
+    setattr(fake_npu, "npu_dynamic_mx_quant", quantize_activation)
+    monkeypatch.setitem(sys.modules, "torch_npu", fake_npu)
+    monkeypatch.setattr(method, "_quant_matmul", lambda x_q, *_args: x_q)
+    x = torch.tensor([[[3.0, 4.0], [5.0, 8.0]]], dtype=torch.bfloat16)
+
+    output = method.apply(layer, x)
+
+    expected = x * layer.mul_scale.to(x.dtype)
+    torch.testing.assert_close(observed[0], expected.reshape(-1, 2))
+    torch.testing.assert_close(output, expected)
 
 
 def test_num_groups_formula():
