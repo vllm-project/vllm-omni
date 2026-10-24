@@ -14,6 +14,7 @@ import vllm.distributed.parallel_state as vllm_parallel_state
 from torch import nn
 
 import vllm_omni.diffusion.models.ltx2.ltx2_audio_cuda_graph as cuda_graph_module
+from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.distributed.group_coordinator import GroupCoordinator
 from vllm_omni.diffusion.models.ltx2.ltx2_audio_cuda_graph import (
     LTX2AudioCUDAGraphConfig,
@@ -23,7 +24,10 @@ from vllm_omni.diffusion.models.ltx2.ltx2_audio_cuda_graph import (
 )
 from vllm_omni.diffusion.models.ltx2.ltx2_audio_transformer import LTX2AudioStaticConditioning
 
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
 
+
+@pytest.mark.cpu
 def test_config_defaults_and_preserves_unrelated_additional_config():
     assert LTX2AudioCUDAGraphConfig.from_additional_config(None) == LTX2AudioCUDAGraphConfig()
     assert LTX2AudioCUDAGraphConfig.from_additional_config({"unrelated": {"enabled": True}}) == (
@@ -37,6 +41,7 @@ def test_config_defaults_and_preserves_unrelated_additional_config():
     ) == LTX2AudioCUDAGraphConfig(enabled=True, max_entries=8)
 
 
+@pytest.mark.cpu
 @pytest.mark.parametrize(
     ("additional_config", "error", "message"),
     [
@@ -80,12 +85,14 @@ def _key(inputs):
     )
 
 
+@pytest.mark.cpu
 def test_graph_key_uses_structure_not_values():
     first = _cpu_inputs(mask=True, perturb=True)
     second = _cpu_inputs(mask=True, perturb=True)
     assert _key(first) == _key(second)
 
 
+@pytest.mark.cpu
 @pytest.mark.parametrize(
     ("change", "value"),
     [
@@ -101,6 +108,7 @@ def test_graph_key_changes_for_structural_fields(change, value):
     assert _key(base) != _key(changed)
 
 
+@pytest.mark.cpu
 def test_graph_key_canonicalizes_stg_blocks():
     inputs = _cpu_inputs(perturb=True)
     inputs["stg_blocks"] = [28, 4, 28]
@@ -110,6 +118,7 @@ def test_graph_key_canonicalizes_stg_blocks():
     assert first.stg_blocks == (4, 28)
 
 
+@pytest.mark.cpu
 def test_graph_key_and_static_copy_expand_hidden_batch_without_repeat_tensor():
     inputs = _cpu_inputs()
     source = inputs["audio_hidden_states"]
@@ -134,6 +143,7 @@ class _EagerTransformer:
         return kwargs["audio_hidden_states"] + 1
 
 
+@pytest.mark.cpu
 def test_incompatible_inputs_fall_back_without_failed_key():
     runner = LTX2AudioCUDAGraphRunner(_EagerTransformer(), device="cpu")
     inputs = _cpu_inputs()
@@ -146,6 +156,7 @@ def test_incompatible_inputs_fall_back_without_failed_key():
     assert runner.stats_snapshot()["failed_key_count"] == 0
 
 
+@pytest.mark.cpu
 def test_incompatible_inputs_expand_hidden_batch_for_eager_fallback():
     runner = LTX2AudioCUDAGraphRunner(_EagerTransformer(), device="cpu")
     inputs = _cpu_inputs()
@@ -166,6 +177,7 @@ def test_incompatible_inputs_expand_hidden_batch_for_eager_fallback():
     assert runner.last_call_info["reason"] == "incompatible_inputs"
 
 
+@pytest.mark.cpu
 @pytest.mark.parametrize("tp_size", [1, 2])
 def test_capture_uses_distributed_context_and_runner_pool(monkeypatch, tp_size):
     runner = LTX2AudioCUDAGraphRunner(_EagerTransformer(), device="cuda")
@@ -182,7 +194,7 @@ def test_capture_uses_distributed_context_and_runner_pool(monkeypatch, tp_size):
         "perturbation_mask": None,
         "stg_blocks": None,
     }
-    events = []
+    events: list[tuple[object, ...]] = []
     outputs = [inputs["audio_hidden_states"] + 1, inputs["audio_hidden_states"] + 2]
     pool = object()
     graph = object()
@@ -254,6 +266,7 @@ def test_capture_uses_distributed_context_and_runner_pool(monkeypatch, tp_size):
     ]
 
 
+@pytest.mark.cpu
 def test_capture_context_exits_when_capture_raises(monkeypatch):
     runner = LTX2AudioCUDAGraphRunner(_EagerTransformer(), device="cuda")
     inputs = _cpu_inputs()
@@ -308,6 +321,7 @@ def test_capture_context_exits_when_capture_raises(monkeypatch):
     assert events == ["distributed_enter", "cuda_enter", "cuda_exit", "distributed_exit"]
 
 
+@pytest.mark.cpu
 def test_diffusion_group_capture_hook_uses_shared_context_stream(monkeypatch):
     coordinator = object.__new__(GroupCoordinator)
     coordinator.device = torch.device("cuda")
@@ -337,6 +351,7 @@ def test_diffusion_group_capture_hook_uses_shared_context_stream(monkeypatch):
     assert capture_stream.wait_stream_calls == [current_stream]
 
 
+@pytest.mark.cpu
 def test_mock_cache_hit_lru_and_eviction(monkeypatch):
     runner = LTX2AudioCUDAGraphRunner(_EagerTransformer(), max_graphs=2, device="cuda")
     monkeypatch.setattr(runner, "_inputs_are_compatible", lambda **_kwargs: True)
@@ -379,6 +394,7 @@ def test_mock_cache_hit_lru_and_eviction(monkeypatch):
     assert list(runner._cache)[0] == _key(one)
 
 
+@pytest.mark.cpu
 def test_cache_miss_returns_warmup_output_without_replay(monkeypatch):
     runner = LTX2AudioCUDAGraphRunner(_EagerTransformer(), device="cuda")
     monkeypatch.setattr(runner, "_inputs_are_compatible", lambda **_kwargs: True)
@@ -427,6 +443,7 @@ def test_cache_miss_returns_warmup_output_without_replay(monkeypatch):
     assert runner.last_request_stats == delta
 
 
+@pytest.mark.cpu
 def test_request_scope_copies_static_conditioning_once_per_request(monkeypatch):
     runner = LTX2AudioCUDAGraphRunner(_EagerTransformer(), device="cuda")
     monkeypatch.setattr(runner, "_inputs_are_compatible", lambda **_kwargs: True)
@@ -475,6 +492,7 @@ def test_request_scope_copies_static_conditioning_once_per_request(monkeypatch):
     assert runner.last_request_stats["hits"] == 1
 
 
+@pytest.mark.cpu
 def test_capture_failure_is_bounded_and_not_retried(monkeypatch):
     runner = LTX2AudioCUDAGraphRunner(_EagerTransformer(), max_graphs=1, device="cuda")
     monkeypatch.setattr(runner, "_inputs_are_compatible", lambda **_kwargs: True)
@@ -500,6 +518,7 @@ def test_capture_failure_is_bounded_and_not_retried(monkeypatch):
     assert stats["failed_key_count"] == 1
 
 
+@pytest.mark.cpu
 def test_peer_capture_failure_prevents_local_cache_insertion(monkeypatch):
     runner = LTX2AudioCUDAGraphRunner(_EagerTransformer(), device="cuda")
     inputs = _cpu_inputs()
@@ -531,6 +550,7 @@ def test_peer_capture_failure_prevents_local_cache_insertion(monkeypatch):
     assert runner.stats_snapshot()["failed_key_count"] == 1
 
 
+@pytest.mark.cpu
 def test_capture_result_rejects_different_tp_graph_keys(monkeypatch):
     runner = LTX2AudioCUDAGraphRunner(_EagerTransformer(), device="cuda")
     key = _key(_cpu_inputs(tokens=3))
@@ -551,6 +571,7 @@ def test_capture_result_rejects_different_tp_graph_keys(monkeypatch):
         runner._synchronize_capture_result(key, None)
 
 
+@pytest.mark.cpu
 def test_clear_resets_lifecycle(monkeypatch):
     runner = LTX2AudioCUDAGraphRunner(_EagerTransformer(), device="cpu")
     runner._stats["calls"] = 2
@@ -562,6 +583,7 @@ def test_clear_resets_lifecycle(monkeypatch):
     assert runner.last_request_stats == {}
 
 
+@pytest.mark.cpu
 def test_active_outer_capture_uses_eager_without_mutating_cache(monkeypatch):
     runner = LTX2AudioCUDAGraphRunner(_EagerTransformer(), device="cuda")
     monkeypatch.setattr(runner, "_inputs_are_compatible", lambda **_kwargs: True)
@@ -632,6 +654,7 @@ def _cuda_inputs(*, tokens=3, value=1.0, mask=True, perturb=True):
     }
 
 
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_cuda_graph_matches_eager_and_replay_uses_static_output():
     torch.manual_seed(7)
@@ -673,6 +696,7 @@ def test_cuda_graph_matches_eager_and_replay_uses_static_output():
     assert runner.stats_snapshot()["hits"] == 1
 
 
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_cuda_graph_replays_request_scoped_static_conditioning():
     transformer = _TinyAudioTransformer().eval()
@@ -725,6 +749,7 @@ def test_cuda_graph_replays_request_scoped_static_conditioning():
     assert runner.stats_snapshot()["hits"] == 1
 
 
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_cuda_graph_expands_cfg_hidden_batch_inside_static_buffer():
     transformer = _TinyAudioTransformer().eval()
@@ -755,6 +780,7 @@ def test_cuda_graph_expands_cfg_hidden_batch_inside_static_buffer():
     assert second.data_ptr() == entry.static_output.data_ptr()
 
 
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_cuda_runner_pool_supports_two_serial_signatures():
     transformer = _TinyAudioTransformer().eval()
@@ -772,6 +798,7 @@ def test_cuda_runner_pool_supports_two_serial_signatures():
     assert runner.stats_snapshot()["hits"] == 1
 
 
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_cuda_graph_recaptures_after_clear():
     transformer = _TinyAudioTransformer().eval()
@@ -789,6 +816,7 @@ def test_cuda_graph_recaptures_after_clear():
     assert runner.stats_snapshot()["capture_failures"] == 0
 
 
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_cuda_graph_runners_with_disjoint_lifetimes_capture_independently():
     for _ in range(2):
@@ -802,6 +830,7 @@ def test_cuda_graph_runners_with_disjoint_lifetimes_capture_independently():
         del runner
 
 
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_cuda_graph_can_capture_and_replay_from_sequential_python_threads():
     transformer = _TinyAudioTransformer().eval()
