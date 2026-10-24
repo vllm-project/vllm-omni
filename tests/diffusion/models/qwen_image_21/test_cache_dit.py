@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """CPU integration checks using Cache-DiT's actual adapters and context lifecycle."""
 
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -11,6 +12,10 @@ from torch import nn
 from vllm_omni.diffusion.cache.cachedit import CUSTOM_DIT_ENABLERS, CacheDiTBackend
 from vllm_omni.diffusion.data import DiffusionCacheConfig
 from vllm_omni.diffusion.models.qwen_image_21.cache_dit import enable_qwen_image21_cache
+from vllm_omni.diffusion.models.qwen_image_21.pipeline_qwen_image_21 import QwenImage21Pipeline
+from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
 
 pytestmark = [pytest.mark.cpu, pytest.mark.core_model, pytest.mark.diffusion]
 
@@ -70,6 +75,41 @@ def test_layer_kv_routing_branch_isolation_and_refresh():
         for index, block in enumerate(blocks):
             assert {branch for branch, _ in block.calls} == {"cond", "uncond"}
             assert all(actual is kv[index] for _, actual in block.calls)
+
+
+@pytest.mark.parametrize("sample_sigmas", [None, [1.0, 0.875, 0.75, 0.625, 0.5, 0.375, 0.25, 0.125]])
+def test_runner_refreshes_both_branches_between_default_step_requests(sample_sigmas):
+    pipeline = QwenImage21Pipeline.__new__(QwenImage21Pipeline)
+    nn.Module.__init__(pipeline)
+    pipeline.sample_sigmas = sample_sigmas
+    pipeline.transformer = FakePipeline().transformer
+    backend = CacheDiTBackend(config())
+    backend.enable(pipeline)
+    runner = DiffusionModelRunner.__new__(DiffusionModelRunner)
+    runner.pipeline = pipeline
+    runner.cache_backend = backend
+    blocks = pipeline.transformer.transformer_blocks
+
+    try:
+        for scale in (1, 7):
+            request = OmniDiffusionRequest(
+                prompt=OmniTextPrompt(prompt=f"request {scale}"),
+                sampling_params=OmniDiffusionSamplingParams(num_inference_steps=None),
+                request_id=f"request-{scale}",
+            )
+            runner._refresh_cache_for_requests([request], od_config=SimpleNamespace(cache_backend="cache_dit"))
+            kv = caches(scale)
+            for block in blocks:
+                block.calls.clear()
+            for _ in range(3):
+                for branch in ("cond", "uncond"):
+                    torch.testing.assert_close(decode(pipeline, branch, kv), expected(branch, kv))
+            # Exercise active caching, so stale residuals from the first
+            # request would corrupt the second request's different KV inputs.
+            # Stop before the consecutive-skip limit forces a full compute.
+            assert len(blocks[-1].calls) < len(blocks[0].calls)
+    finally:
+        backend.disable(pipeline)
 
 
 def test_state_dict_and_graph_lifecycle_unchanged_weights():
