@@ -8,12 +8,14 @@ from __future__ import annotations
 import asyncio
 import struct
 import threading
+from collections.abc import Callable
 from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
 import pytest
 from vllm.outputs import CompletionOutput
+from vllm.sampling_params import RequestOutputKind, SamplingParams
 from vllm.v1.engine import FinishReason
 from vllm.v1.engine.exceptions import EngineDeadError
 
@@ -43,6 +45,7 @@ from vllm_omni.engine.duplex.messages import (
 from vllm_omni.engine.duplex_orchestrator import DuplexOrchestrator, DuplexOrchestratorRequestState
 from vllm_omni.engine.messages import AbortRequestMessage, AddCompanionRequestMessage, ShutdownRequestMessage
 from vllm_omni.engine.orchestrator import Orchestrator, OrchestratorRequestState, build_engine_core_request_from_tokens
+from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.engine.stage_pool import StageUnavailableError
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.plugin import MiniCPMO45DuplexPlugin
 from vllm_omni.model_executor.models.qwen3_omni.duplex.plugin import Qwen3OmniDuplexPlugin
@@ -1753,3 +1756,186 @@ async def test_repeated_replica_failure_reports_session_error_and_close_once(
     finally:
         cleanup_gate.set()
         await manager.shutdown()
+
+
+def _qwen_orchestrator(monkeypatch, *, preprocess: Callable[[], None] | None = None, **kwargs):
+    """A three-stage orchestrator whose Stage0 input processor only records what it was given."""
+    from vllm_omni.engine.orchestrator import build_engine_core_request_from_tokens
+    from vllm_omni.model_executor.models.qwen3_omni.duplex.plugin import Qwen3OmniDuplexPlugin
+
+    orchestrator, clients, rpc_q, output_q = _build(stages=3, **kwargs)
+    plugin = Qwen3OmniDuplexPlugin(_encode_audio)
+    plugin.processor = SimpleNamespace(apply_chat_template=lambda messages, **kwargs: "prompt")
+    orchestrator.plugin = orchestrator.session_manager.plugin = plugin
+    seen: list[dict[str, Any]] = []
+
+    def process_inputs(**kwargs):
+        seen.append(kwargs)
+        if preprocess is not None:
+            preprocess()
+        return build_engine_core_request_from_tokens(
+            request_id=kwargs["request_id"],
+            prompt={"prompt_token_ids": [1, 2]},
+            params=kwargs["params"],
+            model_config=orchestrator.stage_pools[0].stage_vllm_config.model_config,
+            resumable=kwargs["resumable"],
+        )
+
+    monkeypatch.setattr(
+        orchestrator, "_get_stage_input_processor", lambda stage_id: SimpleNamespace(process_inputs=process_inputs)
+    )
+    return orchestrator, clients, rpc_q, output_q, seen
+
+
+def _start_warmup(orchestrator: DuplexOrchestrator, params: SamplingParams | None = None) -> asyncio.Task[bool]:
+    return asyncio.create_task(
+        orchestrator.run_prefix_warmup(
+            request_id="warm",
+            session_id=SESSION_ID,
+            prompt={"prompt": "prefix", "multi_modal_data": {"image": ["frame"]}},
+            sampling_params=params or SamplingParams(max_tokens=64),
+        )
+    )
+
+
+async def _until(predicate: Callable[[], object], *, timeout_s: float = 2.0) -> None:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_s
+    while not predicate():
+        assert loop.time() < deadline, "timed out"
+        await asyncio.sleep(0.005)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pinned_replica", [None, 1])
+async def test_prefix_warmup_prefills_stage0_alone_and_never_reaches_a_client(monkeypatch, pinned_replica):
+    config = _placement_config(replica_groups=[{0: 1, 1: 0, 2: 1}, {0: 0, 1: 1, 2: 0}])
+    orchestrator, clients, _, output_q, seen = _qwen_orchestrator(
+        monkeypatch,
+        replicas=2 if pinned_replica is not None else 1,
+        runtime_config=config if pinned_replica is not None else None,
+    )
+    orchestrator.reserve_session(SESSION_ID)
+    stage0 = orchestrator.stage_pools[0].clients[pinned_replica or 0]
+    params = SamplingParams(max_tokens=64)
+    warmup = _start_warmup(orchestrator, params)
+    await _until(lambda: stage0.add_request_calls)
+
+    submitted = stage0.add_request_calls[0][0]
+    assert deserialize_additional_information(submitted.additional_information)["omni_final_stage_id"] == 0
+    assert seen[0]["prompt"]["multi_modal_data"] == {"image": ["frame"]}
+    assert seen[0]["params"].max_tokens == 1
+    assert seen[0]["params"].output_kind == RequestOutputKind.FINAL_ONLY
+    assert params.max_tokens == 64, "the session's sampling params are not the warmup's to change"
+
+    output = SimpleNamespace(request_id="warm", finished=True, outputs=[])
+    await orchestrator._route_output(0, pinned_replica or 0, output, orchestrator.request_states["warm"], None)
+
+    assert await warmup is True
+    assert "warm" not in orchestrator.request_states and not orchestrator._prefix_warmups
+    assert not stage0.abort_calls
+    assert all(
+        not client.add_request_calls
+        for pool in orchestrator.stage_pools
+        for client in pool.clients
+        if client is not stage0
+    )
+    assert output_q.empty()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_prefix_warmup_rolls_back_unsent_media(monkeypatch):
+    """Join preprocessing and invalidate its sender cache before another turn."""
+    started, release = threading.Event(), threading.Event()
+
+    def block() -> None:
+        started.set()
+        assert release.wait(5)
+
+    orchestrator, clients, _, output_q, _ = _qwen_orchestrator(monkeypatch, preprocess=block)
+    cleared: list[int] = []
+    monkeypatch.setattr(orchestrator, "_clear_stage_input_cache", cleared.append)
+    warmup = _start_warmup(orchestrator)
+    await _until(started.is_set)
+    warmup.cancel()
+    await asyncio.sleep(0.02)
+    assert not warmup.done() and not clients[0].abort_calls
+
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await warmup
+
+    assert not clients[0].add_request_calls
+    assert cleared == [0]
+    assert "warm" not in orchestrator.request_states and not orchestrator._prefix_warmups
+    assert output_q.empty()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel_again", [False, True])
+async def test_cancelled_prefix_warmup_aborts_after_submission(monkeypatch, cancel_again):
+    orchestrator, clients, _, output_q, _ = _qwen_orchestrator(monkeypatch)
+    abort_started, release_abort = asyncio.Event(), asyncio.Event()
+    abort = clients[0].abort_requests_async
+
+    async def delayed_abort(request_ids):
+        abort_started.set()
+        await release_abort.wait()
+        await abort(request_ids)
+
+    monkeypatch.setattr(clients[0], "abort_requests_async", delayed_abort)
+    warmup = _start_warmup(orchestrator)
+    await _until(lambda: clients[0].add_request_calls)
+    await asyncio.sleep(0)
+
+    warmup.cancel()
+    await asyncio.wait_for(abort_started.wait(), timeout=2)
+    if cancel_again:
+        warmup.cancel()
+        await asyncio.sleep(0)
+        assert not warmup.done()
+    release_abort.set()
+    with pytest.raises(asyncio.CancelledError):
+        await warmup
+
+    assert clients[0].abort_calls == [["warm"]]
+    assert "warm" not in orchestrator.request_states and not orchestrator._prefix_warmups
+    assert output_q.empty()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["processed_error", "scheduler_error"])
+async def test_failed_prefix_warmup_is_logged_and_leaves_the_session_alone(monkeypatch, failure):
+    orchestrator, clients, rpc_q, output_q, _ = _qwen_orchestrator(monkeypatch)
+    await orchestrator._dispatch_message(
+        OpenDuplexSessionMessage(
+            control_id="open-qwen",
+            session_id=SESSION_ID,
+            session_config=DuplexSessionConfig(model="qwen", modalities=["text", "audio"]),
+            output_buffer=DuplexOutputBuffer(max_bytes=2 * 1024 * 1024, max_events=512),
+        )
+    )
+    assert (await rpc_q.get()).ok
+    await _settle(orchestrator)
+    while not output_q.empty():
+        output_q.get_nowait()
+    try:
+        warmup = _start_warmup(orchestrator)
+        await _until(lambda: clients[0].add_request_calls)
+        state = orchestrator.request_states["warm"]
+        if failure == "processed_error":
+            await orchestrator._handle_stage_error(0, SimpleNamespace(request_id="warm", error="stage crashed"))
+        else:
+            eco = SimpleNamespace(
+                request_id="warm", finish_reason=FinishReason.ERROR, stop_reason="preempted", is_segment_finished=False
+            )
+            await orchestrator._report_duplex_session_request_error(0, 0, eco, state)
+
+        assert await warmup is False
+        assert "warm" not in orchestrator.request_states and not orchestrator._prefix_warmups
+        assert output_q.empty(), "no client owns a warmup, so nothing may be reported to one"
+        session = orchestrator.session_manager.get(SESSION_ID)
+        assert session is not None and session.state != DuplexSessionState.CLOSED
+        assert SESSION_ID in orchestrator.session_manager.runners
+    finally:
+        await _close(orchestrator, rpc_q)

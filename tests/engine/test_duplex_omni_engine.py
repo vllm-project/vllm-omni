@@ -254,7 +254,7 @@ def test_duplex_runtime_uses_tokenizer_owner_model_config(monkeypatch):
     engine = object.__new__(DuplexOmniEngine)
     engine.plugin = object()
     engine.pipeline_config = JOYAI_VL_INTERACTION_ASR_PIPELINE
-    engine.duplex_session_config = object()
+    engine.duplex_session_config = DuplexSessionRuntimeConfig()
     engine._client_config = None
     configs = [object(), object(), object(), object()]
     engine.stage_pools = [SimpleNamespace(stage_vllm_config=SimpleNamespace(model_config=config)) for config in configs]
@@ -372,3 +372,56 @@ async def test_async_wrappers_run_the_blocking_calls_off_the_event_loop() -> Non
     engine.rpc_client.execute = execute
     await engine.touch_session_async("sid", activity="heartbeat")
     assert seen == [False]
+
+
+@pytest.mark.parametrize("supported", [False, True])
+def test_visual_prefix_warmup_needs_a_plugin_that_plans_it(monkeypatch, supported: bool) -> None:
+    from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
+
+    plugin = SimpleNamespace(
+        plugin_id="fake", supports_prefix_warmup=supported, configure_pipeline=lambda pipeline: None
+    )
+    monkeypatch.setattr("vllm_omni.engine.duplex_omni_engine.load_duplex_plugin", lambda path, encoder: plugin)
+    engine = object.__new__(DuplexOmniEngine)
+    engine.model = "duplex-model"
+    engine.single_stage_mode = False
+    engine._audio_encoder = None
+    engine.pipeline_config = SimpleNamespace(duplex_plugin="pkg.mod.Plugin")
+    engine.deploy_config = SimpleNamespace(
+        session_mode="duplex", duplex_session=DuplexSessionRuntimeConfig(visual_prefix_warmup=True)
+    )
+    if supported:
+        engine._validate_deployment()
+        assert engine.plugin is plugin
+    else:
+        with pytest.raises(ValueError, match="not supported by the 'fake' duplex plugin"):
+            engine._validate_deployment()
+
+
+@pytest.mark.parametrize("prefix_caching", [False, True])
+def test_visual_prefix_warmup_needs_stage0_prefix_caching(monkeypatch, prefix_caching: bool) -> None:
+    from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
+
+    built: list[dict[str, Any]] = []
+
+    def build(**kwargs: Any):
+        built.append(kwargs)
+        return SimpleNamespace(replica_placement=None, session_manager=SimpleNamespace(admission_limit=1))
+
+    monkeypatch.setattr("vllm_omni.engine.duplex_orchestrator.DuplexOrchestrator", build)
+    engine = object.__new__(DuplexOmniEngine)
+    engine.plugin = SimpleNamespace()
+    engine.pipeline_config = SimpleNamespace(stages=[SimpleNamespace(stage_id=0, owns_tokenizer=True)])
+    engine._client_config = None
+    engine.duplex_session_config = DuplexSessionRuntimeConfig(visual_prefix_warmup=True)
+    stage0_config = SimpleNamespace(
+        model_config="stage0-model", cache_config=SimpleNamespace(enable_prefix_caching=prefix_caching)
+    )
+    engine.stage_pools = [SimpleNamespace(stage_vllm_config=stage0_config)]
+    if prefix_caching:
+        engine._create_orchestrator()
+        assert built[0]["model_config"] == "stage0-model"
+    else:
+        with pytest.raises(ValueError, match="requires enable_prefix_caching on stage 0"):
+            engine._create_orchestrator()
+        assert not built

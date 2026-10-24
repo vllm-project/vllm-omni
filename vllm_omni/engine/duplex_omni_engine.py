@@ -97,6 +97,10 @@ class DuplexOmniEngine(AsyncOmniEngine):
         self.duplex_session_config = deploy_config.duplex_session
         self.plugin = load_duplex_plugin(plugin_path, self._audio_encoder)
         self.plugin.configure_pipeline(pipeline_config)
+        if self.duplex_session_config.visual_prefix_warmup and not self.plugin.supports_prefix_warmup:
+            raise ValueError(
+                f"duplex_session.visual_prefix_warmup is not supported by the {self.plugin.plugin_id!r} duplex plugin"
+            )
         validate_duplex_replica_policy(self.plugin, self.duplex_session_config, distributed=self.single_stage_mode)
 
     # Any: signature of the ``OmniEngineBase._create_orchestrator`` seam it overrides.
@@ -104,11 +108,21 @@ class DuplexOmniEngine(AsyncOmniEngine):
         from vllm_omni.engine.duplex_orchestrator import DuplexOrchestrator
 
         assert self.plugin is not None, "_validate_deployment() must run before the orchestrator is created"
+        assert self.pipeline_config is not None
         # Match the frontend's comprehension-stage selection. An optional ASR
         # stage does not own the served model's tokenizer or prompt policy.
         model_stage_id = next((stage.stage_id for stage in self.pipeline_config.stages if stage.owns_tokenizer), 0)
         stage_vllm_config = self.stage_pools[model_stage_id].stage_vllm_config if self.stage_pools else None
         model_config = getattr(stage_vllm_config, "model_config", None)
+        stage0_config = self.stage_pools[0].stage_vllm_config if self.stage_pools else None
+        cache_config = getattr(stage0_config, "cache_config", None)
+        if self.duplex_session_config.visual_prefix_warmup and not getattr(
+            cache_config, "enable_prefix_caching", False
+        ):
+            raise ValueError(
+                "duplex_session.visual_prefix_warmup requires enable_prefix_caching on stage 0; "
+                "without it the warmup computes KV blocks that the next turn cannot reuse"
+            )
         client_config = self._client_config or {}
         orchestrator = DuplexOrchestrator(
             plugin=self.plugin,

@@ -359,6 +359,7 @@ class DuplexModelPlugin(ABC):
         return None
 
     projects_intermediate_outputs: bool = False
+    supports_prefix_warmup: bool = False
     plugin_id: str = ""
     private_runtime_config_keys: frozenset[str] = frozenset()
     #: Samples per silence unit the runner appends to keep a model turn going.
@@ -421,6 +422,23 @@ class DuplexModelPlugin(ABC):
     async def prepare_append_plan(self, **kwargs) -> DuplexAppendPlan:
         """Prepare a plan; plugins may offload expensive work on owned snapshots."""
         return self.plan_append(**kwargs)
+
+    async def prepare_prefix_warmup_plan(
+        self,
+        *,
+        request_id: str,
+        session_config: dict[str, object],
+        runtime_config: dict[str, object],
+        state: DuplexModelSessionState,
+    ) -> DuplexAppendPlan | None:
+        """Plan a Stage0 prefill whose prompt is a prefix of the next turn's prompt.
+
+        Runs on the session loop with the same ``session_config`` (including
+        ``conversation``) an append would get, but must leave *state* as it
+        found it. ``None`` means there is nothing worth warming.
+        """
+        del request_id, session_config, runtime_config, state
+        return None
 
     def commit_append_plan(self, request_id: str) -> None:
         """Commit model-owned context after the stage accepts a fenced append."""

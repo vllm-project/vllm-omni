@@ -108,6 +108,7 @@ from vllm_omni.engine.duplex.session.engine_session import DuplexEngineSession
 from vllm_omni.engine.duplex.session.history_calibration import HistoryCalibration
 from vllm_omni.engine.duplex.session.lease import DuplexLeaseActivity
 from vllm_omni.engine.duplex.session.model_channel import ModelChannel
+from vllm_omni.engine.duplex.session.prefix_warmup import PrefixWarmer
 from vllm_omni.engine.duplex.session.tool_calls import (
     LoopTimerScheduler,
     ToolCallLedger,
@@ -285,6 +286,7 @@ class DuplexSessionRunner:
             self.model,
             wait_for_append_tail=self._wait_for_append_tail,
         )
+        self.prefix_warmer = PrefixWarmer(self.ctx, enabled=manager.runtime_config.visual_prefix_warmup)
 
     # ------------------------------------------------------------------ #
     # Public interface                                                   #
@@ -563,6 +565,7 @@ class DuplexSessionRunner:
             item = await self._mailbox.get()
             try:
                 await self._handle_item(item)
+                await self.prefix_warmer.refresh()
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -599,11 +602,12 @@ class DuplexSessionRunner:
             worker.cancel()
             await asyncio.gather(worker, return_exceptions=True)
 
-    def spawn(self, coro: Awaitable[None], *, name: str) -> None:
+    def spawn(self, coro: Awaitable[None], *, name: str) -> asyncio.Future[None]:
         task = asyncio.ensure_future(coro)
         task.set_name(name)
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
+        return task
 
     async def offload(self, fn: Callable[..., _OffloadT], *args: object, **kwargs: object) -> _OffloadT:
         loop = self._loop or asyncio.get_running_loop()
@@ -1098,6 +1102,7 @@ class DuplexSessionRunner:
     # ------------------------------------------------------------------ #
 
     def _begin_close(self, reason: str) -> None:
+        self.prefix_warmer.cancel()
         first_close = not self.run.closing
         if self.ctx.history_calibration is not None:
             self.ctx.history_calibration.close()
@@ -1537,6 +1542,8 @@ class DuplexSessionRunner:
         before_append: Callable[[], bool] | None = None,
         input_audio_parts: dict[str, dict[str, object] | None] | None = None,
     ) -> asyncio.Task[bool]:
+        if final or precreate_response:
+            await self.prefix_warmer.stop()
         session = self.session
         model_state = self.model_state
         if not silence_continuation:

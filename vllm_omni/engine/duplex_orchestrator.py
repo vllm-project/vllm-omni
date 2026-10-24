@@ -12,18 +12,22 @@ and applies the session-owned policy.
 
 from __future__ import annotations
 
+import asyncio
+import copy
 import time as _time
-from collections.abc import Coroutine
+from collections.abc import Coroutine, Mapping
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from vllm.logger import init_logger
+from vllm.sampling_params import RequestOutputKind, SamplingParams
 from vllm.v1.engine import FinishReason
 from vllm.v1.engine.exceptions import EngineDeadError
 
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
 from vllm_omni.engine import OmniEngineCoreOutput, OmniEngineCoreRequest
+from vllm_omni.engine.async_engine_utils import apply_omni_final_stage_metadata
 from vllm_omni.engine.duplex.contracts import (
     DuplexFence,
     DuplexOutputContext,
@@ -63,6 +67,7 @@ class DuplexOrchestratorRequestState(OrchestratorRequestState):
     fence: DuplexFence | None = None
     stage_fences: dict[int, DuplexFence] = field(default_factory=dict)
     config_generation: int = -1
+    prefix_warmup: bool = False
 
 
 class DuplexOrchestrator(Orchestrator, DuplexStagePort):
@@ -86,6 +91,7 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
+        self._prefix_warmups: dict[str, asyncio.Future[bool]] = {}
         self.plugin = plugin
         self.duplex_session_config = duplex_session_config
         self.replica_placement: DuplexReplicaPlacement | None = None
@@ -202,6 +208,10 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
         submit_ts: float | None,
     ) -> bool:
         del replica_id, submit_ts
+        if isinstance(req_state, DuplexOrchestratorRequestState) and req_state.prefix_warmup:
+            if getattr(output, "finished", False):
+                await self._finish_prefix_warmup(req_state.request_id, finished=True)
+            return True
         if not isinstance(req_state, DuplexOrchestratorRequestState) or req_state.fence is None:
             return False
         request_id = output.request_id
@@ -251,6 +261,11 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
         eco: OmniEngineCoreOutput,
         req_state: OrchestratorRequestState,
     ) -> None:
+        if isinstance(req_state, DuplexOrchestratorRequestState) and req_state.prefix_warmup:
+            if getattr(eco, "finish_reason", None) == FinishReason.ERROR:
+                logger.warning("Duplex prefix warmup %s failed: %s", req_state.request_id, eco.stop_reason)
+                await self._finish_prefix_warmup(req_state.request_id, finished=False)
+            return
         if not req_state.session_owned or getattr(eco, "finish_reason", None) != FinishReason.ERROR:
             return
         # Segment boundaries do not terminate a resumable request. Context
@@ -324,6 +339,9 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             self.session_manager.finalize_closed_sessions(closing_session_ids)
         for request_id in cleanup_ids:
             self.session_manager.unregister_request(request_id)
+            warmup = self._prefix_warmups.pop(request_id, None)
+            if warmup is not None and not warmup.done():
+                warmup.set_result(False)
         return outputs
 
     # ------------------------------------------------------------------ #
@@ -612,6 +630,85 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             await super()._route_output(stage_id, replica_id, output, req_state, stage_metrics)
         finally:
             req_state.skip_legacy_stage_forward = False
+
+    async def _finish_prefix_warmup(self, request_id: str, *, finished: bool) -> None:
+        warmup = self._prefix_warmups.get(request_id)
+        if warmup is not None and not warmup.done():
+            warmup.set_result(finished)
+        await self._cleanup_request_ids([request_id])
+
+    async def _handle_stage_error(self, stage_id: int, output: Any, *, error: str | None = None) -> None:
+        req_state = self.request_states.get(output.request_id)
+        if not (isinstance(req_state, DuplexOrchestratorRequestState) and req_state.prefix_warmup):
+            await super()._handle_stage_error(stage_id, output, error=error)
+            return
+        # No client owns a warmup, so its failure is a log line rather than an ErrorMessage.
+        logger.warning(
+            "[DuplexOrchestrator] prefix warmup %s failed at stage-%s: %s",
+            output.request_id,
+            stage_id,
+            error if error is not None else getattr(output, "error", None),
+        )
+        await self._cleanup_request_ids([output.request_id], abort=True)
+
+    async def run_prefix_warmup(
+        self,
+        *,
+        request_id: str,
+        session_id: str,
+        prompt: Mapping[str, object],
+        sampling_params: object,
+    ) -> bool:
+        """Prefill Stage0 only; cancellation drains preprocessing and aborts the request."""
+        if not isinstance(sampling_params, SamplingParams):
+            raise TypeError(f"a prefix warmup needs Stage0 SamplingParams, got {type(sampling_params).__name__}")
+        params = copy.deepcopy(sampling_params)
+        params.max_tokens = 1
+        params.min_tokens = 0
+        params.output_kind = RequestOutputKind.FINAL_ONLY
+        state = DuplexOrchestratorRequestState(
+            request_id=request_id,
+            prompt=dict(prompt),
+            sampling_params_list=[params],
+            final_stage_id=0,
+            request_timestamp=_time.time(),
+            session_owned=True,
+            session_id=session_id,
+            prefix_warmup=True,
+        )
+        finished: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
+        self.request_states[request_id] = state
+        self._prefix_warmups[request_id] = finished
+        try:
+            # Share the real-turn sender-cache guard, including cancellation rollback.
+            async with self._stage_input_submission(0) as mark_submitting:
+                replica_id = self._session_route(0, state)
+                if replica_id is not None:
+                    self.stage_pools[0].bind_request_to_replica(request_id, replica_id)
+                request = await self._build_next_stage_request(request_id, 0, dict(prompt), params, resumable=False)
+                if self.request_states.get(request_id) is not state:
+                    return False
+                request = apply_omni_final_stage_metadata(request, 0)
+                request.external_req_id = request_id
+                mark_submitting()
+                await self.stage_pools[0].submit_initial(
+                    request_id, state, request, prompt_text=None, pinned_replica_id=replica_id
+                )
+                state.stage_submit_ts[0] = _time.time()
+            # Cancelling the caller must not mark the completion future as done.
+            return await asyncio.shield(finished)
+        finally:
+            if self.request_states.get(request_id) is state:
+                cleanup = asyncio.create_task(self._cleanup_request_ids([request_id], abort=True))
+                cancelled = None
+                while not cleanup.done():
+                    try:
+                        await asyncio.shield(cleanup)
+                    except asyncio.CancelledError as exc:
+                        cancelled = exc
+                cleanup.result()
+                if cancelled is not None:
+                    raise cancelled
 
     async def cleanup(self, request_ids: list[str], *, abort: bool = False) -> None:
         await self._cleanup_request_ids(request_ids, abort=abort)

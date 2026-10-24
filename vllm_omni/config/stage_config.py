@@ -711,6 +711,8 @@ class DuplexSessionRuntimeConfig:
     # compile their real shapes. The empty per-stage JIT registry does not.
     # A negative value disables every startup warmup.
     warmup_frames: int = 0
+    # Prefill pending camera frames before commit; requires Stage0 prefix caching.
+    visual_prefix_warmup: bool = False
 
     def __post_init__(self) -> None:
         if self.replica_policy not in ("legacy", "least_sessions"):
@@ -785,6 +787,8 @@ class DuplexSessionRuntimeConfig:
             not isinstance(self.semantic_vad_model_path, str) or not self.semantic_vad_model_path.strip()
         ):
             raise ValueError("duplex_session.semantic_vad_model_path must be a non-empty string or null")
+        if not isinstance(self.visual_prefix_warmup, bool):
+            raise ValueError("duplex_session.visual_prefix_warmup must be a boolean")
         for name, value in positive.items():
             if value <= 0:
                 raise ValueError(f"duplex_session.{name} must be positive")

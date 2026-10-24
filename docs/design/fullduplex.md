@@ -450,6 +450,18 @@ for queue updates and the final validity check before delivery.
   that check under the connection lock, before sequencing and journaling.
   Already sequenced replay entries are unchanged; already delivered audio
   still requires the client to stop its own playback.
+- **Prefix warmup follows the mailbox.** With
+  `duplex_session.visual_prefix_warmup`, the runner calls
+  `PrefixWarmer.refresh()` after every mailbox item. While the unanswered
+  user turn holds a camera frame and nothing else is in flight (no response,
+  append task, bound stream or committed audio), it keeps one background
+  warmup whose prompt the plugin renders as the prefix of the next turn;
+  `stage_port.run_prefix_warmup` prefills it on Stage0 alone. A changed
+  conversation replaces the warmup. Before starting a turn, the runner cancels
+  and drains it so an old warmup cannot outlive its replacement. Cancellation
+  may wait for CPU preprocessing already in flight; it rolls back unsent media
+  through the shared input-submission guard. Its output reaches neither the
+  session nor a client, and its failure is only logged.
 - **Backpressure before the mailbox.** `DuplexSessionManager.dispatch`
   checks `max_pending_input_bytes_per_session` and reserves a pending turn for
   `Commit` before the put; a rejected command is answered with
@@ -630,6 +642,17 @@ carries the session identity (`session_id`, `fence`, `epoch`, `turn_id`,
 `model_turn_id`), the public session config and the server-owned runtime
 config for the worker-side model hooks.
 
+`run_prefix_warmup` is the one port call a session makes for itself rather
+than for a turn. It submits a Stage0-final request (`max_tokens=1`, no
+downstream payload, no KV transfer, no async-chunk prewarm) marked
+`prefix_warmup`, consumes its output in `_intercept_stage_output` and turns a
+stage error into a log line instead of an `ErrorMessage`. The request is not
+a session resource, so its failure never closes the session. Cancelling the
+caller aborts a submitted request. Before submission, cancellation joins CPU
+preprocessing and rolls back the sender cache through the ordinary stage-input
+submission guard, so the next turn cannot omit media the receiver never saw.
+Warmup uses the session's pinned Stage0 replica when replica placement is enabled.
+
 ## Model plugin
 
 `DuplexModelPlugin` (ABC, `engine/duplex/plugin.py`) is the one class a model
@@ -639,7 +662,7 @@ policy that used to be two separately configured objects:
 
 | Half | Members |
 | --- | --- |
-| engine policy | `configure_sampling_params(runtime_config, defaults)`, `plan_append(...) -> DuplexAppendPlan` (the resumable Stage0 prompt for one unit), `decide_output(...) -> DuplexOutputDecision \| None` (e.g. the listen decision on a finished Stage0 segment) |
+| engine policy | `configure_sampling_params(runtime_config, defaults)`, `plan_append(...) -> DuplexAppendPlan` (the resumable Stage0 prompt for one unit), `decide_output(...) -> DuplexOutputDecision \| None` (e.g. the listen decision on a finished Stage0 segment), `prepare_prefix_warmup_plan(...) -> DuplexAppendPlan \| None` (the next turn's reusable prefix) |
 | session policy | `capabilities(max_sessions)`, `validate_client_extra_body`, `prepare_runtime_config(config, model_config)` (server-owned runtime keys, reference audio resolution), `runtime_config_for_update`, `parse_function_call` (recognize one call), `runtime_config_for_function_output` (feed an accepted result back into that model), `note_published_function_call` (plugin stores history length at publish), `has_pending_tool_followup` (plugin still has a tool result to answer), `extra_prompt_config`, `runtime_patch_for_submitted_prompt`, `runtime_config_after_response` (keep or drop a result after the response ends), `runtime_config_after_model_output` (consumption acknowledgement), `create_session_state() -> DuplexModelSessionState`, `data_plane: DuplexDataPlane` (projects raw stage outputs into internal events), `data_plane_context(...)` |
 
 A duplex tool call uses one client sequence. The client supplies tools, receives one function call, runs the function, and sends `function_call_output`. The server does not execute the function. Each model plugin implements both hooks. A recognized call is published through `model_channel._expose_function_call`. Before the plugin sees a `function_call_output`, the session copies `name` and `arguments` from the call origin recorded at publish. Conversation history is not admission authority. The client item stays `call_id` and `output`. Qwen3-Omni `parse_function_call` reads a Hermes `<tool_call>` and returns `{call_id, name, arguments}` without retaining them. One Thinker chunk can carry more than one completed call; each is emitted. `note_published_function_call` stores that call's history length in the Qwen runtime. `runtime_config_for_function_output` reads `name` and `arguments` from the preparation item, refuses when either is absent, and appends one `{history_len, messages}` entry there. The stored length wins over the length at result time. Tool pairs stay out of `session.history`. `has_pending_tool_followup` is how the runner learns that a bare `response.create` may open `{"type":"conversation"}`. `plan_append` splices each turn after the history it was accepted against, and `runtime_patch_for_submitted_prompt` holds those turns aside after the append is accepted. The pair stays owned by that response until playback stores its text. The next prompt puts a still-inflight pair back on the waiting list before the usual splice, and the pair keeps that response id so the playback ACK can drop it once the assistant text is stored. A cancel, a playback clear before any audio is committed, or `realtime_response_conversation: none` stores no text and puts the pair back with that response id. A failure before playback can store the answer puts the pair back without the id, so the retry can own it. `tool_choice: none` is rejected. A result whose published anchor has left the prompt window is refused instead of being attached to the latest question. `runtime_config_after_response` is that step. Nemotron VoiceChat `parse_function_call` reads the data-plane function-channel event, and `runtime_config_for_function_output` places the result on a later frame of the request that is still open. The session call book is #8758.
