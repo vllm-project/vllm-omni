@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from typing import Any, cast
 
 import torch
+from transformers import PretrainedConfig
 from vllm.inputs import TextPrompt
 
 from vllm_omni.data_entry_keys import (
@@ -69,13 +70,43 @@ def _get_embedding_layer_index() -> int:
     return 0
 
 
-def _get_accept_hidden_layer_index(transfer_manager: Any) -> int:
-    """Read accept_hidden_layer index from model config."""
+def _get_hf_config(transfer_manager: Any) -> PretrainedConfig:
     if hasattr(transfer_manager, "_get_model_config"):
         mc = transfer_manager._get_model_config()
     else:
         mc = getattr(transfer_manager, "config", None)
-    return int(mc.hf_config.talker_config.accept_hidden_layer)
+    return mc.hf_config
+
+
+def _get_accept_hidden_layer_index(transfer_manager: Any) -> int:
+    """Read accept_hidden_layer index from model config."""
+    return int(_get_hf_config(transfer_manager).talker_config.accept_hidden_layer)
+
+
+def _merge_talker_prefill_rows(
+    embed: torch.Tensor,
+    hidden: torch.Tensor,
+    prompt_token_ids: list[int],
+    thinker_config: PretrainedConfig,
+) -> torch.Tensor:
+    """Keep, for each prompt row, the one Thinker tensor the Talker reads there.
+
+    The Talker projects the accept-layer hidden state at audio, image and video
+    placeholders and the word embedding at every other row, so sending both
+    [P, H] tensors doubles the chunk-0 handoff. Rows past the prompt (the first
+    sampled token) stay embeddings.
+    """
+    placeholder_ids = torch.tensor(
+        [thinker_config.audio_token_id, thinker_config.image_token_id, thinker_config.video_token_id],
+        device=embed.device,
+    )
+    rows = min(embed.shape[0], hidden.shape[0], len(prompt_token_ids))
+    is_placeholder = torch.isin(torch.tensor(prompt_token_ids[:rows], device=embed.device), placeholder_ids)
+    # One pass into a new buffer: the embedding may be the runner's snapshot.
+    merged = torch.empty_like(embed)
+    torch.where(is_placeholder.unsqueeze(-1), hidden[:rows], embed[:rows], out=merged[:rows])
+    merged[rows:] = embed[rows:]
+    return merged
 
 
 # Set once chunk 0 carried the first generated token taken from the prefill
@@ -541,6 +572,7 @@ def thinker2talker_async_chunk(
         )
         assert payload.embed is not None and payload.embed.prefill is not None
         assert payload.hidden_states is not None and payload.hidden_states.output is not None
+        assert payload.meta is not None
         save_payload = transfer_manager.request_payload.pop(request_id, None)
         if isinstance(save_payload, dict) and "embed" not in save_payload:
             # Handoff flags are not a withheld prefill. A new chunk 0 is a new
@@ -581,6 +613,17 @@ def thinker2talker_async_chunk(
         ):
             transfer_manager.request_payload[request_id] = to_dict(payload)
             return None
+        # Resumable sessions keep both tensors: their later segment chunks
+        # still send hidden_states.output, which the Talker concatenates.
+        if not request.resumable:
+            payload.embed.prefill = _merge_talker_prefill_rows(
+                payload.embed.prefill,
+                payload.hidden_states.output,
+                prompt_token_ids,
+                _get_hf_config(transfer_manager).thinker_config,
+            )
+            payload.hidden_states = None
+            payload.meta.prefill_holds_accept_hidden = True
     else:
         if request.resumable:
             return _construct_thinker2talker_streaming_input_async_chunk(

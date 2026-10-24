@@ -1121,10 +1121,18 @@ class Qwen3OmniMoeForConditionalGeneration(
         thinker_sequence_embeds = to_device_nonblocking(embed["prefill"], talker_device).to(
             torch.bfloat16
         )  # Tensor [P,H]
-        thinker_hidden_states = to_device_nonblocking(hs["output"], talker_device).to(torch.bfloat16)  # Tensor [K,H]
         # Token ids stay on CPU too: prefill parsing reads them on the host.
         thinker_sequences_cpu = None if ids.get("all") is None else _cpu_long(ids["all"])
         thinker_chatml_ids_cpu = None if ids.get("prompt") is None else _cpu_long(ids["prompt"])
+        if meta.get("prefill_holds_accept_hidden") and thinker_chatml_ids_cpu is not None:
+            # Async chunk 0 sent one merged prefill tensor whose placeholder
+            # rows already hold the accept-layer hidden state.
+            thinker_hidden_states = thinker_sequence_embeds[: thinker_chatml_ids_cpu.shape[-1]]
+        else:
+            hidden_output = hs.get("output")
+            thinker_hidden_states = None
+            if hidden_output is not None:
+                thinker_hidden_states = to_device_nonblocking(hidden_output, talker_device).to(torch.bfloat16)  # [K,H]
         thinker_sequences = (
             None if thinker_sequences_cpu is None else to_device_nonblocking(thinker_sequences_cpu, talker_device)
         )
