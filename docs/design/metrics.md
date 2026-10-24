@@ -163,6 +163,8 @@ Upstream vLLM's `Scheduler.make_stats()` runs on every AR generation step, retur
 
 `OmniSchedulerMixin.make_stats()` (in `vllm_omni/core/sched/omni_scheduler_mixin.py`) throttles stats emission to at most once per second **per scheduler** — i.e. per `(stage, replica)` since each replica owns its own scheduler instance. Between intervals it returns `None`, which the engine core skips serializing. This keeps gauges fresh enough for Prometheus scrapes (typically 15-30s intervals) while eliminating the per-step overhead.
 
+The busy → idle tick is the one exception and is never throttled. EngineCore stops stepping once a scheduler has no running or waiting requests, so a tick dropped at that point is never followed by another `make_stats()` call: `vllm:num_requests_running`, `vllm:num_requests_waiting` and `vllm:kv_cache_usage_perc` would stay frozen at their last busy values until the next request arrives. Short requests (e.g. TTS) finish inside the 1 s window after almost every burst. The exception costs at most one extra `SchedulerStats` per busy → idle transition.
+
 The orchestrator side does not add its own throttle on top. Scheduler gauges are
 recorded when `raw_outputs.scheduler_stats is not None` (i.e. this replica's
 scheduler passed its own 1 Hz gate), while output-batch request/token metrics

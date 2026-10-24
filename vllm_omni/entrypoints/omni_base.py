@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any, Literal
 import huggingface_hub
 import vllm.envs as envs
 from omegaconf import OmegaConf
+from vllm.config.model import get_served_model_name
 from vllm.exceptions import RetryableRequestError
 from vllm.logger import init_logger
 from vllm.transformers_utils.repo_utils import file_or_path_exists
@@ -212,8 +213,11 @@ class OmniBase(PDDisaggregationMixin):
         # Construct transfer_metrics first so we can hand it to the engine
         # (which forwards it to the Orchestrator background thread for
         # TX-side emit; see OrchestratorBase._forward_to_next_stage).
-        self.transfer_metrics = OmniTransferMetrics(model_name=model, log_stats=log_stats)
-        self.prom_metrics = OmniPrometheusMetrics(model_name=model, log_stats=log_stats)
+        # Use the same model_name the wrapped upstream vllm:* families get from
+        # ModelConfig.served_model_name, so one model_name selector matches both.
+        self.metrics_model_name = get_served_model_name(model, kwargs.get("served_model_name"))
+        self.transfer_metrics = OmniTransferMetrics(model_name=self.metrics_model_name, log_stats=log_stats)
+        self.prom_metrics = OmniPrometheusMetrics(model_name=self.metrics_model_name, log_stats=log_stats)
         st = time.time()
         self.engine = self._create_engine(
             model=model,
@@ -236,7 +240,7 @@ class OmniBase(PDDisaggregationMixin):
         self.async_chunk = bool(getattr(self.engine, "async_chunk", False))
 
         self.request_states: dict[str, ClientRequestState] = {}
-        self.mod_metrics = OmniModalityMetrics(model_name=model, log_stats=log_stats)
+        self.mod_metrics = OmniModalityMetrics(model_name=self.metrics_model_name, log_stats=log_stats)
 
         self.default_sampling_params_list = self.engine.default_sampling_params_list
         self.sampling_constraints_list = self._get_sampling_constraints_list(self.engine.stage_configs)
