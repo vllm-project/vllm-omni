@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-"""Qwen3-TTS predictor: per-call sampling and opt-in CUDA frame-local KV reuse."""
+"""Qwen3-TTS predictor: per-call sampling and opt-in frame-local KV reuse."""
 
 from __future__ import annotations
 
@@ -55,9 +55,9 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(CodePredictorWrapp
             talker_hidden_size=int(talker_config.hidden_size),
             prefix=prefix,
         )
-        # TTS owns its frame-local cache and overrides _predict_step_logits.
-        # Do not also activate the shared wrapper's Omni incremental loop.
-        self._kv_cache_enabled = False
+        # The explicit eager mode uses the shared portable cache.
+        if not self._eager_kv_cache:
+            self._kv_cache_enabled = False
         # Store talker_config for backward compat (accessed by some callers)
         self.talker_config = talker_config
         self._vllm_config = vllm_config
@@ -72,6 +72,8 @@ class Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM(CodePredictorWrapp
         if self._compiled_model_fwd is not None:
             return
         weight = next(self.model.parameters())
+        if self._eager_kv_cache:
+            return super()._setup_compile()
         supported = (
             current_omni_platform.is_cuda()
             and weight.device.type == "cuda"

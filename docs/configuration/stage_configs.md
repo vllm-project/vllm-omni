@@ -573,12 +573,22 @@ vllm serve Qwen/Qwen2.5-Omni-7B --omni --port 8091 --deploy-config /path/to/depl
 
 ## Qwen3-TTS with Model Runner V2
 
-Qwen3-TTS runs the native CUDA Model Runner V2 pipeline by default on vLLM
-0.29.0. MRV2 is an experimental feature for this model: the bundled default
-profile selects it on CUDA only, and its scheduler and delivery paths are
-still being qualified. Set `model_runner: v1` in a copy of the deploy config
-to opt out; the `platforms:` sections of `qwen3_tts.yaml` keep V1 on NPU, XPU,
-ROCm and MUSA. Select one of these deployment profiles:
+Configure predictor KV reuse with `additional_config.code_predictor_kv_cache`:
+
+| Value | Behavior |
+| --- | --- |
+| `false` | Disable KV reuse; recompute earlier positions at each step (re-prefill). |
+| `true` | Use the CUDA BF16 cache path with Inductor; fall back to re-prefill when unsupported. |
+| `eager` | Reuse KV through native Torch without `torch.compile`. |
+
+FP16 weights always use re-prefill, including when `eager` is selected.
+The predictor cache resets for each audio frame.
+
+Qwen3-TTS uses Model Runner V2 by default. MRV2 remains experimental for this
+model while its scheduler and delivery paths are being qualified. Set
+`model_runner: v1` in a copy of the deploy config to opt out; the `platforms:`
+sections of `qwen3_tts.yaml` keep V1 on NPU, XPU, ROCm and MUSA. Select one of
+these deployment profiles:
 
 | Profile | Runner | Code2Wav graph batches | Intended use |
 | --- | --- | --- | --- |

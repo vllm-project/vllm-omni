@@ -4082,3 +4082,24 @@ stages:
 
         merge_pipeline_deploy(pipeline, deploy)
         assert not deploy.async_chunk
+
+
+@pytest.mark.parametrize("platform", ["mps", "cuda"])
+@pytest.mark.parametrize("explicit", [False, True])
+def test_qwen3_tts_mps_greedy_defaults_preserve_other_platforms(monkeypatch, platform, explicit):
+    from vllm_omni.platforms import current_omni_platform
+
+    monkeypatch.setattr(current_omni_platform, "device_name", platform)
+    pipeline = resolve_pipeline_config("qwen3_tts")
+    path = get_deploy_config_path("qwen3_tts.yaml") if explicit else None
+    stages, _ = StageConfigFactory._create_legacy_from_registry(pipeline, {}, deploy_config_path=path)
+    talker = stages[0]
+    sampling = talker.yaml_extras["default_sampling_params"]
+    assert sampling["temperature"] == (0.0 if platform == "mps" else 0.9)
+    assert sampling["min_tokens"] == (0 if platform == "mps" else 2)
+    assert sampling["repetition_penalty"] == (1.5 if platform == "mps" else 1.05)
+    assert talker.yaml_engine_args["subtalker_sampling_params"]["do_sample"] is (platform != "mps")
+    cache_mode = talker.yaml_engine_args.get("additional_config", {}).get("code_predictor_kv_cache")
+    assert cache_mode == ("eager" if platform == "mps" else None)
+    stages, _ = StageConfigFactory._create_legacy_from_registry(pipeline, {"max_num_seqs": 3}, deploy_config_path=path)
+    assert stages[0].runtime_overrides["max_num_seqs"] == 3

@@ -1476,3 +1476,38 @@ def test_tts_cached_predictor_keeps_its_own_step_dispatch(mocker: MockerFixture,
     assert step.call_count == cp_config.num_code_groups - 1
     assert codes.shape == (1, cp_config.num_code_groups)
     assert predictor._kv_buf is None
+
+
+@torch.inference_mode()
+def test_eager_cache_reuses_positions_and_resets_frames(mocker, loaded_target_classes):
+    """The portable cache must survive batch changes without retaining prior frames."""
+    common = sys.modules["vllm_omni.model_executor.models.common.qwen3_code_predictor"]
+    mocker.patch.object(common.current_omni_platform, "is_cuda", return_value=False)
+    cp_config, talker_config = _make_tiny_config(loaded_target_classes)
+    predictor_class = loaded_target_classes[2]
+    cached_config = _make_vllm_config(mocker)
+    cached_config.additional_config = {"code_predictor_kv_cache": "eager"}
+    reference_config = _make_vllm_config(mocker)
+    reference_config.additional_config = {"code_predictor_kv_cache": False}
+    torch.manual_seed(171)
+    cached = predictor_class(vllm_config=cached_config, config=cp_config, talker_config=talker_config).eval()
+    reference = predictor_class(vllm_config=reference_config, config=cp_config, talker_config=talker_config).eval()
+    reference.load_state_dict(cached.state_dict())
+    lengths = []
+    handle = cached.model.layers[0].self_attn.qkv_proj.register_forward_pre_hook(
+        lambda _, args: lengths.append(args[0].shape[1])
+    )
+    for batch in (1, 4, 8, 1):
+        inputs = (
+            torch.randint(cp_config.vocab_size, (batch, 1)),
+            torch.randn(batch, 1, cp_config.hidden_size),
+            torch.randn(batch, 1, cp_config.hidden_size),
+        )
+        if cached._kv_buf is not None:
+            cached._kv_buf.fill_(torch.nan)
+        lengths.clear()
+        actual = cached(*inputs, do_sample=False)
+        expected = reference(*inputs, do_sample=False)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        assert lengths == [2, 1, 1]
+    handle.remove()
