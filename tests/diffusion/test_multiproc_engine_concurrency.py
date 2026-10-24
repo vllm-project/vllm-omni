@@ -247,6 +247,7 @@ class TestStepModeTimeout:
         failure_callback = Mock()
         executor.register_failure_callback(failure_callback)
         monkeypatch.setattr(executor_module, "_DLO_DP_WAVE_TIMEOUT_S", 0.05)
+        monkeypatch.setattr(executor_module, "_EXECUTE_RPC_TIMEOUT_S", 0.05)
 
         # No worker replies: exercise the real RPC deadline and shutdown path.
         with pytest.raises(TimeoutError, match="timed out"):
@@ -618,14 +619,17 @@ class TestRequestModeDispatch:
         assert executor.collective_rpc.call_args.kwargs["timeout"] == executor_module._DLO_DP_WAVE_TIMEOUT_S
         executor._fail_closed_on_dp_wave_timeout.assert_called_once()
 
-    def test_single_rank_local_request_times_out_and_fails_closed(self):
-        """A no-AllGather wave must be bounded too (#6964).
+    def test_single_rank_local_request_times_out_and_fails_closed(self, monkeypatch):
+        """A no-AllGather wave must be boundable too (#6964).
 
         Without a timeout the dequeue deadline is ``None``, so a rank that
-        never replies leaves ``collective_rpc()`` retrying forever.
+        never replies leaves ``collective_rpc()`` retrying forever. The bound
+        on this path is the general execute timeout, not the DLO wave timeout,
+        because a stuck rank does not poison a collective here.
         """
         from vllm_omni.diffusion.executor import multiproc_executor as executor_module
 
+        monkeypatch.setattr(executor_module, "_EXECUTE_RPC_TIMEOUT_S", 123.0)
         executor, _, _ = _make_executor(num_gpus=2)
         executor.od_config = SimpleNamespace(
             step_execution=False,
@@ -642,17 +646,46 @@ class TestRequestModeDispatch:
         result = executor.execute_request(_make_sched_output("A"))
 
         assert result.runner_outputs[0].result.error == "timed out"
-        assert executor.collective_rpc.call_args.kwargs["timeout"] == executor_module._DLO_DP_WAVE_TIMEOUT_S
+        assert executor.collective_rpc.call_args.kwargs["timeout"] == 123.0
         executor._fail_closed_on_dp_wave_timeout.assert_called_once()
 
-    def test_rank_local_batch_wave_times_out_and_fails_closed(self):
-        """Two concurrent requests take ``execute_model_batch`` (#6964).
+    def test_single_rank_local_request_defaults_to_unbounded(self):
+        """The general execute bound defaults to unlimited (#7745 review).
 
-        That path had no timeout at all, which is why the report only
-        reproduced with concurrency.
+        Request-mode generations routinely exceed the 600s DLO wave bound
+        (a 50-step i2v needs >900s), so a rank-local single request must not
+        inherit it.
         """
         from vllm_omni.diffusion.executor import multiproc_executor as executor_module
 
+        assert executor_module._EXECUTE_RPC_TIMEOUT_S is None
+        executor, _, _ = _make_executor(num_gpus=2)
+        executor.od_config = SimpleNamespace(
+            step_execution=False,
+            parallel_config=SimpleNamespace(data_parallel_size=1),
+            diffusion_offload_config={
+                "mode": "layer",
+                "components": ["dit"],
+                "layer_options": {"dit": {"weight_transfer": "rank-local"}},
+            },
+        )
+        executor.collective_rpc = Mock(return_value=DiffusionOutput(output=None))
+
+        result = executor.execute_request(_make_sched_output("A"))
+
+        assert result.runner_outputs[0].result is not None
+        assert executor.collective_rpc.call_args.kwargs["timeout"] is None
+
+    def test_rank_local_batch_wave_times_out_and_fails_closed(self, monkeypatch):
+        """Two concurrent requests take ``execute_model_batch`` (#6964).
+
+        That path had no timeout at all, which is why the report only
+        reproduced with concurrency. The bound is the general execute
+        timeout, which defaults to unlimited and is opt-in.
+        """
+        from vllm_omni.diffusion.executor import multiproc_executor as executor_module
+
+        monkeypatch.setattr(executor_module, "_EXECUTE_RPC_TIMEOUT_S", 123.0)
         executor, _, _ = _make_executor(num_gpus=2)
         executor.od_config = SimpleNamespace(
             step_execution=False,
@@ -670,7 +703,7 @@ class TestRequestModeDispatch:
             executor.execute_batch(_make_sched_output("A", "B"))
 
         assert executor.collective_rpc.call_args.args[0] == "execute_model_batch"
-        assert executor.collective_rpc.call_args.kwargs["timeout"] == executor_module._DLO_DP_WAVE_TIMEOUT_S
+        assert executor.collective_rpc.call_args.kwargs["timeout"] == 123.0
         executor._fail_closed_on_dp_wave_timeout.assert_called_once()
 
 
