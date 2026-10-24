@@ -92,6 +92,7 @@ def test_graph_vae_updates_only_active_context_and_keeps_last_patch():
     owner.active_slots = torch.tensor([True, False, False])
     owner.model = SimpleNamespace(
         _patch_size=2,
+        _vae_dtype=torch.float32,
         _get_vae_decode_sr_cond=lambda _: None,
         tts=SimpleNamespace(
             audio_vae=SimpleNamespace(

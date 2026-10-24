@@ -292,31 +292,36 @@ class VoxCPM2ModelState(OmniModelState):
         return self.next_embed.index_select(0, indices)
 
     def decode_patch(self, slots, rows_valid, patch):
+        # Keep the decode input in the VAE's configured dtype: the VAE's
+        # weights live in _vae_dtype after the deployment-dtype cast, so an
+        # fp32 patch here would bypass the dtype contract (hard error on
+        # NPU, silent promotion elsewhere). PCM returns on the fp32 boundary.
+        vae_dtype = self.model._vae_dtype
         if getattr(self, "incremental_vae", False):
             valid = rows_valid & self.active_slots.index_select(0, slots)
             sr_cond = self.model._get_vae_decode_sr_cond(patch.device)
             pcm = incremental_vae_decode(
                 self.model.tts.audio_vae,
-                patch.float().transpose(1, 2),
+                patch.to(vae_dtype).transpose(1, 2),
                 self.vae_feature_cache,
                 slots,
                 valid,
                 len(self.slots) + 1,
                 sr_cond,
             )
-            return pcm.reshape(len(slots), -1), valid
+            return pcm.reshape(len(slots), -1).float(), valid
         lengths = self.latent_context_lengths.index_select(0, slots)
         context = self.latent_context.index_select(0, slots)
-        inputs, tail, next_lengths = pack_patch_context(context, lengths, patch.float())
+        inputs, tail, next_lengths = pack_patch_context(context, lengths, patch)
         sr_cond = self.model._get_vae_decode_sr_cond(inputs.device)
-        decoded = self.model.tts.audio_vae.decode(inputs, sr_cond=sr_cond).reshape(len(slots), -1)
+        decoded = self.model.tts.audio_vae.decode(inputs.to(vae_dtype), sr_cond=sr_cond).reshape(len(slots), -1)
         samples = self.model._patch_size * int(self.model.tts.audio_vae.decode_chunk_size)
         offsets = lengths[:, None] * int(self.model.tts.audio_vae.decode_chunk_size)
         pcm = decoded.gather(1, offsets + torch.arange(samples, device=decoded.device)[None, :])
         valid = rows_valid & self.active_slots.index_select(0, slots)
         self.latent_context.index_copy_(0, slots, torch.where(valid[:, None, None], tail, context))
         self.latent_context_lengths.index_copy_(0, slots, torch.where(valid, next_lengths, lengths))
-        return pcm, valid
+        return pcm.float(), valid
 
     def commit_patch(self, slots, valid, next_embed, patch, stop_logits):
         embeds = self.next_embed.index_select(0, slots)
