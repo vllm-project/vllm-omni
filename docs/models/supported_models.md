@@ -92,6 +92,7 @@ th {
 | `FluxPipeline` | FLUX.1-schnell | `black-forest-labs/FLUX.1-schnell` | ✅︎ | ✅︎ | | ✅︎ | — |
 | `OmniGen2Pipeline` | OmniGen2 | `OmniGen2/OmniGen2` | ✅︎ | ✅︎ | | ✅︎ | — |
 | `StableAudioPipeline` | Stable-Audio-Open | `stabilityai/stable-audio-open-1.0` | ✅︎ | ✅︎ | | ✅︎ | — |
+| `StableAudio3Pipeline` | Stable-Audio-3 | `stabilityai/stable-audio-3-medium` | ✅︎ | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/StabilityAI/Stable-Audio-3-Medium.md) |
 | `MiniMaxMusic3ForConditionalGeneration` | MiniMax Music 3 (text-to-music) | `MiniMaxAI/MiniMax-Music3` | ✅︎ | | | ✅︎ | — |
 | `Yue2ForCausalLM` | YuE2-3B (text-to-music with ABC plan) | `m-a-p/YuE2-3B` | ✅︎ | | | ✅︎ | [Recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/m-a-p/YuE2-3B.md) / [Audio-to-score](https://github.com/vllm-project/vllm-omni/blob/main/recipes/m-a-p/SheetSage2-H200.md) |
 | `Qwen3TTSForConditionalGeneration` | Qwen3-TTS-12Hz-1.7B-CustomVoice | `Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice` | ✅︎ | | | ✅︎ | [Published](https://recipes.vllm.ai/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice) |
