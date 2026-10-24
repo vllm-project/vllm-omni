@@ -408,6 +408,20 @@ class GPUARModelRunner(
     def load_model(self, *args, **kwargs) -> None:
         super().load_model(*args, **kwargs)
         self._resolve_duplex_sampling_hook(force=True)
+        if getattr(self, "num_spec_tokens", 0) > 0:
+            from vllm_omni.worker import gpu_talker_multiframe
+
+            gpu_talker_multiframe.ensure_codec_vocab(self)
+
+    def propose_draft_token_ids(self, scheduler_output, sampled_token_ids, *args, **kwargs):
+        from vllm_omni.worker import gpu_talker_multiframe
+
+        drafts = gpu_talker_multiframe.propose_drafts(self, sampled_token_ids)
+        if drafts is not None:
+            self._draft_probs = None
+            self._draft_prob_req_ids = None
+            return drafts
+        return super().propose_draft_token_ids(scheduler_output, sampled_token_ids, *args, **kwargs)
 
     def _make_buffer(self, *size, dtype, numpy=True):
         # Prevent ray from pinning the buffer due to large size
@@ -1502,6 +1516,13 @@ class GPUARModelRunner(
         """
         sampling_metadata = self.input_batch.sampling_metadata
         if spec_decode_metadata is None:
+            from vllm_omni.worker import gpu_talker_multiframe
+
+            # The multi-frame forward already sampled every accepted codec row.
+            # Return it once instead of sampling stale K-wide logits again.
+            sampled = gpu_talker_multiframe.take_sampler_output(self)
+            if sampled is not None:
+                return sampled
             model_sample = getattr(self.model, "sample", None)
             self.input_batch.update_async_output_token_ids()
             if logits is not None and callable(model_sample) and getattr(self.model, "prefer_model_sampler", False):

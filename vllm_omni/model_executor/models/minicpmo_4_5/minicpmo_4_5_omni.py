@@ -991,6 +991,33 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             return frame_outputs
         return self.talker.merge_frame_outputs(frame_outputs, frame_stop_logits)
 
+    # CUDA multi-frame decode (worker/gpu_talker_multiframe.py): the runner
+    # plans frames 1..K-1 of a step from the Talker's codec-EOS state and
+    # commits the frames the scheduler accepts back to it (talker_frame_plan).
+    @property
+    def codec_eos_token_id(self) -> int:
+        return int(self.talker._codec_eos_id)
+
+    @property
+    def codec_vocab_size(self) -> int | None:
+        # The codec head's width. Stage 1's config (MiniCPMTTSConfig) has no
+        # vocab_size, so the CUDA runner takes the stage's vocab size from
+        # here (gpu_talker_multiframe.ensure_codec_vocab).
+        if self.model_stage != "tts" or self.talker is None:
+            return None
+        width = getattr(self.talker, "_num_audio_tokens", None)
+        return int(width) if width is not None else None
+
+    def plan_codec_frames(self, infos, frames: int):
+        from vllm_omni.model_executor.models.minicpmo_4_5.talker_frame_plan import plan_codec_frames
+
+        return plan_codec_frames(self.talker, infos, frames)
+
+    def commit_codec_frames(self, plan, forwarded: list[list[int]]) -> list[bool]:
+        from vllm_omni.model_executor.models.minicpmo_4_5.talker_frame_plan import commit_codec_frames
+
+        return commit_codec_frames(self.talker, plan, forwarded)
+
     def compute_logits(self, hidden_states: torch.Tensor | OmniOutput) -> torch.Tensor | None:
         # Handle OmniOutput type
         if isinstance(hidden_states, OmniOutput):

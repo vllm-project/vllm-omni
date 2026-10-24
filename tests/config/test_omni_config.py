@@ -2565,3 +2565,24 @@ def test_mrv2_duplex_session_validation():
     ps_no_duplex = replace(ps, supports_duplex_mrv2=False)
     with pytest.raises(ValueError, match="supports session_mode 'turn' only"):
         validate_native_mrv2_session(deploy_duplex, ps_no_duplex, "v2")
+
+
+def test_minicpmo_kstep_speculation_survives_typed_engine_projection(monkeypatch):
+    from vllm_omni.engine.stage_init_utils import build_engine_args_dict_from_omni_stage_config
+    from vllm_omni.platforms import current_omni_platform
+
+    monkeypatch.setattr(current_omni_platform, "device_name", "cuda")
+    config = _from_pipeline_key("minicpmo_4_5", deploy_config_path=str(_DEPLOY_DIR / "minicpmo_4_5_kstep.yaml"))
+    stage = config.stage_by_id(1)
+    expected = {
+        "method": "ngram",
+        "num_speculative_tokens": 7,
+        "prompt_lookup_min": 1,
+        "prompt_lookup_max": 1,
+    }
+    assert stage.speculative_config == expected
+    args = build_engine_args_dict_from_omni_stage_config(stage, model="test-model")
+    assert args["speculative_config"] == expected
+    assert args["speculative_config"] is not stage.speculative_config
+    assert config.stage_by_id(0).speculative_config is None
+    assert config.stage_by_id(2).speculative_config is None
