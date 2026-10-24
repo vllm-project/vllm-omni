@@ -10,8 +10,10 @@ resolved from the supplied AttentionConfig, mirroring test_attention_config.py.
 """
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
+import torch
 import torch.nn as nn
 
 import vllm_omni.diffusion.attention.layer as layer_mod
@@ -19,6 +21,7 @@ from vllm_omni.diffusion.attention.backends.abstract import AttentionImpl, Atten
 from vllm_omni.diffusion.attention.capabilities import AttentionComputation
 from vllm_omni.diffusion.attention.layer import Attention, ScheduleCandidate
 from vllm_omni.diffusion.attention.parallel.base import NoParallelAttention
+from vllm_omni.diffusion.attention.schedule import AttentionScheduleRange
 from vllm_omni.diffusion.config import set_current_diffusion_config
 from vllm_omni.diffusion.data import (
     AttentionConfig,
@@ -27,6 +30,11 @@ from vllm_omni.diffusion.data import (
     DiffusionParallelConfig,
     OmniDiffusionConfig,
     SkipSoftmaxSpec,
+)
+from vllm_omni.diffusion.forward_context import (
+    bind_attention_schedule,
+    request_denoise_progress,
+    set_forward_context,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
@@ -203,6 +211,61 @@ def test_allgather_trtllm_candidate_is_rejected(attention_env):
     config = _make_config(schedule=schedule, allgather_degree=2)
     with pytest.raises(ValueError, match="AllGather-KV sequence parallelism"):
         attention_env.build(config)
+
+
+def test_constructed_layer_routes_a_dense_4d_mask_by_the_step_profile(attention_env):
+    """Construction flags reach the dense 4D routing.
+
+    A backend the profile names is explicit and fails closed; a role the profile leaves on the
+    platform default falls back to SDPA; a call outside a scheduled step runs the baseline.
+    """
+    for name, capable in (("SDPA", True), ("PLATFORM_DEFAULT", False), ("FLASH_ATTN", False)):
+        attention_env.monkeypatch.setattr(
+            _fake_backend(name),
+            "supports_dense_4d_mask",
+            staticmethod(lambda spec=None, capable=capable: capable),
+            raising=False,
+        )
+    schedule = AttentionScheduleConfig(
+        profiles={"auto": AttentionConfig(), "pinned": AttentionConfig(default=AttentionSpec(backend="FLASH_ATTN"))},
+        default=[{"start": 0, "end": None, "profile": "auto"}],
+    )
+    layer = attention_env.build(
+        _make_config(baseline=AttentionConfig(default=AttentionSpec(backend="SDPA")), schedule=schedule)
+    )
+    assert layer.backend_explicit is True
+    assert layer._schedule_candidates["auto"].backend_explicit is False
+    assert layer._schedule_candidates["pinned"].backend_explicit is True
+    forwards = {
+        "baseline": Mock(return_value=torch.ones(1)),
+        "sdpa": Mock(return_value=torch.zeros(1)),
+        "auto": Mock(return_value=torch.full((1,), 2.0)),
+        "pinned": Mock(return_value=torch.full((1,), 3.0)),
+    }
+    layer.attention.forward = forwards["baseline"]
+    layer.sdpa_fallback.forward = forwards["sdpa"]
+    for profile in ("auto", "pinned"):
+        layer._schedule_candidates[profile].impl.forward = forwards[profile]
+    query = key = value = torch.zeros(2, 4, 4, 64)
+    metadata = AttentionMetadata(attn_mask=torch.zeros(2, 1, 4, 4, dtype=torch.bool))
+
+    def run(profile):
+        schedule = (AttentionScheduleRange(start=1, end=None, profile=profile),)
+        with set_forward_context(), bind_attention_schedule(schedule), request_denoise_progress(1, 2):
+            return layer._run_local_attention(query, key, value, metadata)
+
+    assert run("auto") is forwards["sdpa"].return_value
+    with pytest.raises(
+        NotImplementedError, match=r"'FLASH_ATTN' does not support a dense 4D attn_mask.*backend_explicit=True"
+    ):
+        run("pinned")
+    assert layer._run_local_attention(query, key, value, metadata) is forwards["baseline"].return_value
+    assert {name: forward.call_count for name, forward in forwards.items()} == {
+        "baseline": 1,
+        "sdpa": 1,
+        "auto": 0,
+        "pinned": 0,
+    }
 
 
 def _pipeline(layer, *, name="attn1"):

@@ -6,8 +6,13 @@ backends. Steps outside a range use the base attention configuration.
 
 MiniMax-H3 publishes progress in request and step modes. Configured profiles
 on any other model fail at startup with an `Unsupported diffusion_attention_schedule`
-error, before weights are loaded. Backend and model requirements still apply;
-selecting a profile does not prevent kernel fallbacks.
+error, before weights are loaded. Backend and model requirements still apply,
+and a backend's own kernel fallbacks still run when a profile selects it.
+A backend that a profile names is an explicit selection: if it cannot use a
+dense 4D attention mask, the step fails instead of falling back to SDPA. A
+role that the profile leaves out uses the platform default and falls back to
+SDPA, as outside a schedule. This is checked on each scheduled step that sends
+such a mask, not at startup.
 
 ## Format
 

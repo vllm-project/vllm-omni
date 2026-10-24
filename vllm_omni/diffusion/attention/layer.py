@@ -978,12 +978,12 @@ class Attention(nn.Module):
         spans_take_precedence = (
             attn_metadata is not None
             and attn_metadata.full_attn_spans is not None
-            and getattr(self.attn_backend, "supports_piecewise_spans", False)
+            and getattr(effective_backend, "supports_piecewise_spans", False)
         )
         if (
             dense_mask is not None
             and dense_mask.ndim == 4
-            and self.attn_backend is not None
+            and effective_backend is not None
             and not spans_take_precedence
         ):
             # A dense 4D mask (for example a padded DiT batch) is a semantic
@@ -991,17 +991,22 @@ class Attention(nn.Module):
             # 2D key-validity mask must not reach their kernel wrapper, which
             # asserts deeper down. Degrade this single call to SDPA instead;
             # explicit selections and paged KV must still run or fail.
-            capability = getattr(self.attn_backend, "supports_dense_4d_mask", None)
+            capability = getattr(effective_backend, "supports_dense_4d_mask", None)
             if callable(capability):
-                capability = capability(getattr(self, "attn_spec", None))
+                capability = capability(effective_spec)
             if capability is False:
-                backend_name = cast(type[AttentionBackend], self.attn_backend).get_name()
+                backend_name = cast(type[AttentionBackend], effective_backend).get_name()
+                # A scheduled candidate is explicit when its profile names a backend for
+                # this layer; a role left on the platform default is not.
+                backend_explicit = (
+                    self.backend_explicit if effective_impl is self.attention else effective_spec is not None
+                )
                 paged_kv = self.is_paged_kv_active()
-                if self.backend_explicit or self.sdpa_fallback is None or paged_kv:
+                if backend_explicit or self.sdpa_fallback is None or paged_kv:
                     raise NotImplementedError(
                         f"Attention backend '{backend_name}' does not support a dense 4D attn_mask "
                         f"(shape={tuple(dense_mask.shape)}, dtype={dense_mask.dtype}, "
-                        f"backend_explicit={self.backend_explicit}, paged_kv={paged_kv}). "
+                        f"backend_explicit={backend_explicit}, paged_kv={paged_kv}). "
                         "Use a mask-capable backend (TORCH_SDPA or CUDNN_ATTN), or avoid padding "
                         "inside the attention batch."
                     )
@@ -1016,7 +1021,7 @@ class Attention(nn.Module):
                     tuple(dense_mask.shape),
                     dense_mask.dtype,
                     dense_mask.device,
-                    self.backend_explicit,
+                    backend_explicit,
                     paged_kv,
                 )
                 return cast(AttentionImpl, self.sdpa_fallback).forward(query, key, value, attn_metadata)
