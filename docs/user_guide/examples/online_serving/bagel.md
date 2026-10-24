@@ -60,16 +60,28 @@ vllm serve ByteDance-Seed/BAGEL-7B-MoT --omni --port 8091 \
 
 See [`bagel_single_stage.yaml`](https://github.com/vllm-project/vllm-omni/tree/main/vllm_omni/deploy/bagel_single_stage.yaml) for configuration. The `pipeline: bagel_single_stage` field selects the single-stage topology from the pipeline registry.
 
+### Single-Stage AllGather-KV
+
+Use the four-GPU AllGather-KV configuration for BAGEL sequence parallelism:
+
+```bash
+vllm serve ByteDance-Seed/BAGEL-7B-MoT --omni --port 8091 \
+    --deploy-config vllm_omni/deploy/bagel_allgather_kv4.yaml
+```
+
 ### Step Execution and Continuous Batching
 
-Image generation supports step execution with all three BAGEL deploy configs.
-The global flag is applied only to diffusion stages:
+Image generation supports step execution with the three non-SP BAGEL deploy
+configs. The global flag is applied only to diffusion stages:
 
 - With `bagel.yaml` or `bagel_think.yaml`, Stage 1 uses step execution and the
   Stage 0 Thinker remains autoregressive.
 - With `bagel_single_stage.yaml`, image requests use step execution in Stage 0.
   Explicit `text2text` and `img2text` requests use the same complete-request
   text path as they do without `--step-execution`.
+
+The fourth config, `bagel_allgather_kv4.yaml`, enables sequence parallelism and
+cannot be combined with `--step-execution`.
 
 Start with the deploy file's default diffusion capacity of one:
 
@@ -352,6 +364,7 @@ python openai_chat_client.py \
 | [`bagel.yaml`](https://github.com/vllm-project/vllm-omni/tree/main/vllm_omni/deploy/bagel.yaml) | Two-stage default (Thinker + DiT on GPU 0) |
 | [`bagel_think.yaml`](https://github.com/vllm-project/vllm-omni/tree/main/vllm_omni/deploy/bagel_think.yaml) | Two-stage think mode (Thinker + DiT) |
 | [`bagel_single_stage.yaml`](https://github.com/vllm-project/vllm-omni/tree/main/vllm_omni/deploy/bagel_single_stage.yaml) | Single-stage (DiT only) |
+| [`bagel_allgather_kv4.yaml`](https://github.com/vllm-project/vllm-omni/tree/main/vllm_omni/deploy/bagel_allgather_kv4.yaml) | Single-stage AllGather-KV sequence parallelism (4 GPUs; no step execution) |
 
 ### Key Deploy YAML Fields
 
