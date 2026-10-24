@@ -97,6 +97,8 @@ class VLLMOmniClient:
         negative_prompt: str | None = None,
         sampling_params: dict | None = None,
         lora: dict | None = None,
+        output_format: str = "png",
+        output_compression: int = 90,
     ) -> torch.Tensor:
         """Run text-to-image generation via DALLE API"""
         await self._check_model_exist(model)
@@ -107,6 +109,8 @@ class VLLMOmniClient:
             "prompt": prompt,
             "size": size,
             "response_format": "b64_json",
+            "output_format": output_format,
+            "output_compression": output_compression,
         }
         if negative_prompt:
             payload["negative_prompt"] = negative_prompt
@@ -167,6 +171,8 @@ class VLLMOmniClient:
         mask: torch.Tensor | None = None,
         sampling_params: dict | None = None,
         lora: dict | None = None,
+        output_format: str = "png",
+        output_compression: int = 90,
     ) -> torch.Tensor:
         """Run image editing via DALLE API"""
         await self._check_model_exist(model)
@@ -183,6 +189,8 @@ class VLLMOmniClient:
         )
         form.add_field("prompt", prompt)
         form.add_field("size", size)
+        form.add_field("output_format", output_format)
+        form.add_field("output_compression", str(output_compression))
         if negative_prompt:
             form.add_field("negative_prompt", negative_prompt)
         if sampling_params is not None:
@@ -243,6 +251,8 @@ class VLLMOmniClient:
         video: VideoInput | None = None,
         sampling_params: dict | list[dict] | None = None,
         lora: dict | None = None,
+        output_format: str = "png",
+        output_compression: int = 90,
     ) -> torch.Tensor:
         payload = VLLMOmniClient._prepare_chat_completion_messages(
             model=model,
@@ -255,6 +265,8 @@ class VLLMOmniClient:
             modalities=["image"],
             # === below are additional `extra_body` fields, handled by **kwargs ===
             lora=lora,
+            output_format=output_format,
+            output_compression=output_compression,
         )
         choices = await self._generate_base_chat_completion(model, payload)
 

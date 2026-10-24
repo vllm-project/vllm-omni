@@ -82,6 +82,14 @@ class VLLMOmniGenerateImage(_VLLMOmniGenerateBase):
                 "negative_prompt": ("STRING", {"multiline": True, "default": ""}),
                 "width": ("INT", {"default": 512, "min": 64, "max": 2048}),
                 "height": ("INT", {"default": 512, "min": 64, "max": 2048}),
+                "output_format": (["png", "webp", "jpeg"], {"default": "png"}),
+                "output_compression": (
+                    ["100", "95", "90", "80"],
+                    {
+                        "default": "90",
+                        "tooltip": "Lossy quality for webp/jpeg; ignored for png.",
+                    },
+                ),
             },
             "optional": {
                 "image": ("IMAGE",),
@@ -104,6 +112,8 @@ class VLLMOmniGenerateImage(_VLLMOmniGenerateBase):
         prompt: str,
         width: int,
         height: int,
+        output_format: str = "png",
+        output_compression: str = "90",
         negative_prompt: str | None = None,
         image: torch.Tensor | None = None,
         mask: torch.Tensor | None = None,
@@ -117,6 +127,7 @@ class VLLMOmniGenerateImage(_VLLMOmniGenerateBase):
             logger.info("Uncaught kwargs: %s", kwargs)
         logger.debug("Got sampling params: %s", sampling_params)
         validate_model_and_sampling_params_types(model, sampling_params)
+        output_compression = int(output_compression)
         if image is None and mask is not None:
             raise ValueError("Mask input provided without an image input.")
 
@@ -142,6 +153,8 @@ class VLLMOmniGenerateImage(_VLLMOmniGenerateBase):
                     negative_prompt=negative_prompt,
                     sampling_params=sampling_params,
                     lora=lora,
+                    output_format=output_format,
+                    output_compression=output_compression,
                 )
                 return (output,)
             elif image is not None and audio is None and video is None:
@@ -157,6 +170,8 @@ class VLLMOmniGenerateImage(_VLLMOmniGenerateBase):
                     mask=mask,
                     sampling_params=sampling_params,
                     lora=lora,
+                    output_format=output_format,
+                    output_compression=output_compression,
                 )
                 return (output,)
 
@@ -175,6 +190,8 @@ class VLLMOmniGenerateImage(_VLLMOmniGenerateBase):
             video=video,
             sampling_params=sampling_params,
             lora=lora,
+            output_format=output_format,
+            output_compression=output_compression,
         )
 
         return (output,)
