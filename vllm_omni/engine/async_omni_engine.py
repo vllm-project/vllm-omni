@@ -41,7 +41,11 @@ class AsyncOmniEngine(OmniEngineBase):
     """Turn-based engine used by ``Omni`` / ``AsyncOmni``."""
 
     def _create_orchestrator(self, **orchestrator_kwargs: Any) -> OrchestratorBase:
-        return Orchestrator(**orchestrator_kwargs)
+        pipeline = self.pipeline_config
+        return Orchestrator(
+            stage_transitions=pipeline.stage_transitions if pipeline is not None else None,
+            **orchestrator_kwargs,
+        )
 
     # ---- request helpers ----
 

@@ -13,6 +13,7 @@ from vllm_omni.distributed.omni_coordinator import ReplicaInfo, ReplicaStatus
 from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.engine.async_engine_utils import scope_stage_replica_mm_uuids
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine, StageRuntimeInfo
+from vllm_omni.engine.orchestrator import OrchestratorRequestState
 from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.engine.stage_pool import StagePool, StageUnavailableError
 from vllm_omni.model_executor.stage_input_processors.bagel import ExpandedPrompt
@@ -590,13 +591,17 @@ async def test_build_add_request_message_scopes_mm_uuids_to_distributed_stage0_r
     assert await stage_pool.pick("req-1") == 0
     assert await stage_pool.pick("req-2") == 1
 
-    # Replica 0 leaves the hub after req-1's keys were scoped to it: a submit pinned to
-    # those keys fails instead of sending them to replica 1, while routing moves on.
+    # Keep the failed route until cleanup; the receiver may know this sender.
     stage_pool.attach_hub(_FakeHub([_replica(addr1)]))
     with pytest.raises(StageUnavailableError):
         await stage_pool.submit_initial(
-            "req-1", mocker.Mock(sampling_params_list=[params]), _make_engine_core_request(), expected_replica_id=0
+            "req-1",
+            OrchestratorRequestState(request_id="req-1", sampling_params_list=[params]),
+            _make_engine_core_request(),
+            expected_replica_id=0,
         )
+    assert stage_pool.get_bound_replica_id("req-1") == 0
+    stage_pool.release("req-1")
     assert stage_pool.get_bound_replica_id("req-1") is None
     assert await stage_pool.pick("req-1") == 1
 

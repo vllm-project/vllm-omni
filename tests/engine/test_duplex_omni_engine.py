@@ -12,7 +12,7 @@ from typing import Any
 
 import pytest
 
-from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
+from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig, PipelineConfig, StagePipelineConfig
 from vllm_omni.engine.duplex.commands import Heartbeat
 from vllm_omni.engine.duplex.config import DuplexCapabilities, DuplexSessionConfig
 from vllm_omni.engine.duplex.delivery import DuplexOutputBuffer
@@ -372,3 +372,16 @@ async def test_async_wrappers_run_the_blocking_calls_off_the_event_loop() -> Non
     engine.rpc_client.execute = execute
     await engine.touch_session_async("sid", activity="heartbeat")
     assert seen == [False]
+
+
+def test_nonsequential_duplex_route_is_rejected_before_loading_plugin():
+    engine = object.__new__(DuplexOmniEngine)
+    engine.model = "test"
+    engine.pipeline_config = PipelineConfig(
+        model_type="test",
+        stages=tuple(StagePipelineConfig(stage_id=sid, model_stage="test", final_output=sid == 2) for sid in range(3)),
+        duplex_plugin="test.plugin",
+        stage_transitions=((0, 2),),
+    )
+    with pytest.raises(ValueError, match="route-aware duplex plugin"):
+        engine._validate_deployment()

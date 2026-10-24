@@ -1193,7 +1193,8 @@ async def test_payload_sender_info_binds_from_explicit_session_state(monkeypatch
         assert pool.get_bound_replica_id(request_id) is None
         with monkeypatch.context() as patch:
             patch.delattr(orchestrator, "request_states")
-            assert orchestrator._build_payload_sender_info(0, request_id=request_id) == {"replica": 0}
+            assert orchestrator._build_payload_sender_info(0) == {"replica": 0}
+            assert orchestrator._build_payload_sender_info(0, request_id=request_id) is None
             assert pool.get_bound_replica_id(request_id) is None
             sender_info = orchestrator._build_payload_sender_info(0, request_id=request_id, req_state=state)
         assert sender_info == {"replica": 1}

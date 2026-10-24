@@ -62,6 +62,10 @@ class StageUnavailableError(RuntimeError):
     """
 
 
+class RequestClosedError(RuntimeError):
+    """The request entered cleanup before stage admission completed."""
+
+
 @dataclass
 class _ReplicaMetrics:
     """Per-replica metrics accumulators owned by a stage pool."""
@@ -336,6 +340,7 @@ class StagePool:
         task: Task | None = None,
         *,
         affinity_request_id: str | None = None,
+        request_state: OrchestratorRequestState | None = None,
     ) -> int:
         """Return a replica id for ``request_id``.
 
@@ -344,34 +349,41 @@ class StagePool:
         ``request_id`` return the same replica. Bounded wait up to
         ``DISPATCH_WAIT_TIMEOUT_S`` when no UP replica is currently usable.
 
-        In non-distributed (legacy) mode: delegates to
-        :meth:`select_replica_id`.
+        With a request state, cleanup stops selection and a lost binding fails
+        the request: receivers may already hold that replica's sender address.
+        Without one, retain the legacy re-selection behavior.
         """
+        if request_state is not None and request_state.closing:
+            raise RequestClosedError(request_id)
         if self._hub is None or self._lb is None:
+            bound = self.get_bound_replica_id(request_id)
+            if request_state is not None and bound is not None and not self.is_replica_available(bound):
+                raise StageUnavailableError(f"stage {self.stage_id} bound replica {bound} is unavailable")
             return self.select_replica_id(request_id, affinity_request_id=affinity_request_id)
 
-        # 1. Sticky: previously bound and still serviceable?
-        bound_addr = self._affinity.get(request_id)
-        if bound_addr is not None:
-            replica_id = self._serviceable_replica_id_for_addr(bound_addr)
-            if replica_id is not None:
-                return replica_id
-            # Bound replica is gone or DOWN — fall through to re-select.
-            self._affinity.pop(request_id, None)
-
-        # 2. Inherited affinity (CFG companion sharing a parent request_id).
-        if affinity_request_id is not None:
-            parent_addr = self._affinity.get(affinity_request_id)
-            if parent_addr is not None:
-                replica_id = self._serviceable_replica_id_for_addr(parent_addr)
-                if replica_id is not None:
-                    self._affinity[request_id] = parent_addr
-                    return replica_id
-
-        # 3. Fresh pick: poll hub + LB with bounded wait.
         task = task or Task(request_id=request_id)
         deadline = _time.monotonic() + self.DISPATCH_WAIT_TIMEOUT_S
         while True:
+            if request_state is not None and request_state.closing:
+                raise RequestClosedError(request_id)
+            # Another admission can establish affinity while this pick waits.
+            bound_addr = self._affinity.get(request_id)
+            if bound_addr is not None:
+                replica_id = self._serviceable_replica_id_for_addr(bound_addr)
+                if replica_id is not None:
+                    return replica_id
+                if request_state is not None:
+                    raise StageUnavailableError(f"stage {self.stage_id} bound replica is no longer serviceable")
+                self._affinity.pop(request_id, None)
+
+            if affinity_request_id is not None:
+                parent_addr = self._affinity.get(affinity_request_id)
+                if parent_addr is not None:
+                    replica_id = self._serviceable_replica_id_for_addr(parent_addr)
+                    if replica_id is not None:
+                        self._affinity[request_id] = parent_addr
+                        return replica_id
+
             candidates = self._collect_serviceable_replicas()
             if candidates:
                 # LB chose an index *into our candidates list*.
@@ -1048,6 +1060,8 @@ class StagePool:
         expected_replica_id: int | None = None,
     ) -> int:
         """Submit a stage-entry request into this pool."""
+        if req_state.closing:
+            raise RequestClosedError(request_id)
         params = params_override if params_override is not None else req_state.sampling_params_list[self.stage_id]
         # Direct engine callers may provide plain vLLM SamplingParams.
         if self.stage_type == "diffusion":
@@ -1065,9 +1079,10 @@ class StagePool:
             if pinned_replica_id is not None:
                 replica_id = self.bind_request_to_replica(request_id, pinned_replica_id)
             else:
-                replica_id = await self._pick_or_select(
+                replica_id = await self.pick(
                     request_id,
                     affinity_request_id=affinity_request_id,
+                    request_state=req_state,
                 )
             client = self._diffusion_client(replica_id)
             await client.add_request_async(request_id, request, params, **submit_kwargs)
@@ -1076,9 +1091,10 @@ class StagePool:
         if pinned_replica_id is not None:
             replica_id = self.bind_request_to_replica(request_id, pinned_replica_id)
         else:
-            replica_id = await self._pick_or_select(
+            replica_id = await self.pick(
                 request_id,
                 affinity_request_id=affinity_request_id,
+                request_state=req_state,
             )
         # A request whose multimodal cache keys name a replica must not move: that
         # replica's sender-cache entries may omit media the new one never received.
@@ -1146,17 +1162,15 @@ class StagePool:
     ) -> int:
         """Submit a streaming update to an already admitted request."""
         submit_kwargs = submit_kwargs or {}
+        if req_state.closing:
+            raise RequestClosedError(request_id)
         params = req_state.sampling_params_list[self.stage_id]
         if self.stage_type == "diffusion":
             params = OmniDiffusionSamplingParams.from_params(params)
         if pinned_replica_id is not None:
             replica_id = self.bind_request_to_replica(request_id, pinned_replica_id)
         else:
-            bound_replica_id = self.get_bound_replica_id(request_id)
-            if bound_replica_id is None or self.clients[bound_replica_id] is None:
-                replica_id = await self._pick_or_select(request_id)
-            else:
-                replica_id = bound_replica_id
+            replica_id = await self.pick(request_id, request_state=req_state)
 
         client = self.clients[replica_id]
         if client is None:
@@ -1205,7 +1219,7 @@ class StagePool:
         """Submit a midway interaction to an active diffusion (typically video generation) request."""
         replica_id = self.get_bound_replica_id(request_id)
         if replica_id is None or self.clients[replica_id] is None:
-            replica_id = await self._pick_or_select(request_id)
+            replica_id = await self.pick(request_id)
 
         client = self._diffusion_client(replica_id)
         result = await client.submit_interaction_async(request_id, interaction)
@@ -1214,17 +1228,6 @@ class StagePool:
             reason = result.get("reason") or "Unknown interaction RPC error"
             raise ValueError(str(reason))
         return replica_id
-
-    async def _pick_or_select(
-        self,
-        request_id: str,
-        *,
-        affinity_request_id: str | None = None,
-    ) -> int:
-        """Bridge to ``pick`` in distributed mode or ``select_replica_id`` legacy."""
-        if self.is_distributed:
-            return await self.pick(request_id, affinity_request_id=affinity_request_id)
-        return self.select_replica_id(request_id, affinity_request_id=affinity_request_id)
 
     # ---- Stage-local polling ----
 
@@ -1359,6 +1362,8 @@ class StagePool:
             request_ids_by_replica.setdefault(replica_id, []).append(request_id)
 
         abort_outputs: list[tuple[str, Any]] = []
+        aborted_request_ids: list[str] = []
+        abort_error: Exception | None = None
         is_diffusion = self.stage_type == "diffusion"
         for replica_id, replica_request_ids in request_ids_by_replica.items():
             # Orchestrator ids are OP external ids; EngineCore may use a
@@ -1389,14 +1394,24 @@ class StagePool:
                         engine_abort_ids = list(aborted)
             client = self.clients[replica_id]
             if client is not None:
-                await client.abort_requests_async(engine_abort_ids)
+                try:
+                    await client.abort_requests_async(engine_abort_ids)
+                except Exception as exc:
+                    logger.warning("[StagePool-%s] abort failed on replica %s: %r", self.stage_id, replica_id, exc)
+                    if abort_error is None:
+                        abort_error = exc
+                    continue
             # An evicted engine cannot produce further output. Release its
             # retained processor state without sending another abort RPC.
             if not is_diffusion and self._output_processor is not None:
                 commit = getattr(self._output_processor, "commit_aborted_request_state", None)
                 if callable(commit):
                     commit(replica_request_ids, internal=False)
+            aborted_request_ids.extend(replica_request_ids)
 
+        if abort_error is not None:
+            self.release_bindings(aborted_request_ids)
+            raise abort_error
         return abort_outputs
 
     def schedule_release_request_resources(self, request_ids: list[str]) -> None:

@@ -392,6 +392,7 @@ class OmniEngineBase:
             single_stage_mode=self.single_stage_mode,
             stage_init_timeout=stage_init_timeout,
             async_chunk=self.async_chunk,
+            stage_transitions=self.pipeline_config.stage_transitions if self.pipeline_config is not None else None,
             tokenizer=self.tokenizer,
             parallel_stage_init=self._parallel_stage_init,
             single_stage_id_filter=self._single_stage_id_filter,
@@ -642,6 +643,7 @@ class OmniEngineBase:
         config_path: str | None,
     ) -> None:
         """Initialize engine-wide settings resolved from pipeline metadata."""
+        self.pipeline_config = pipeline_config
         self.endpoint_restrictions = pipeline_config.endpoint_restrictions if pipeline_config is not None else ()
         # No duplex_runtime_extension / duplex_serving_adapter / duplex_control
         # here: the pre-framework wiring they named is gone, and design rule 3

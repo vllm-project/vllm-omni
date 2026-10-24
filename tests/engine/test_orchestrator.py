@@ -23,6 +23,7 @@ from vllm.v1.engine import EngineCoreOutput, EngineCoreOutputs, EngineCoreReques
 from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.metrics.stats import IterationStats
 
+from vllm_omni.config.stage_routing import StageRouting
 from vllm_omni.engine import OmniEngineCoreOutput
 from vllm_omni.engine.errors import NativeKVHandoffError
 from vllm_omni.engine.messages import (
@@ -237,6 +238,7 @@ class FakeCollectiveRpcStageClient(FakeStageClient):
 
 class FakeOutputProcessor:
     def __init__(self, *, request_outputs: list[Any] | None = None) -> None:
+        self.request_states: dict[str, Any] = {}
         self.request_outputs = list(request_outputs or [])
         self.add_request_calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
         self.abort_calls: list[list[str]] = []
@@ -315,8 +317,8 @@ def _sampling_params(max_tokens: int = 4) -> SamplingParams:
     return SamplingParams(max_tokens=max_tokens)
 
 
-def _engine_core_outputs(tag: str, timestamp: float) -> SimpleNamespace:
-    return SimpleNamespace(outputs=[tag], timestamp=timestamp, scheduler_stats=None, finished_requests=None)
+def _engine_core_outputs(tag: str, timestamp: float) -> EngineCoreOutputs:
+    return EngineCoreOutputs(outputs=[EngineCoreOutput(request_id=tag, new_token_ids=[])], timestamp=timestamp)
 
 
 def _terminal_engine_core_outputs(
@@ -428,6 +430,7 @@ def _build_harness(
     async_chunk: bool = False,
     log_stats: bool = False,
     stage_pools: list[StagePool] | None = None,
+    stage_transitions: tuple[tuple[int, int], ...] | None = None,
 ) -> OrchestratorFixture:
     """Build an Orchestrator test harness.
 
@@ -461,6 +464,7 @@ def _build_harness(
                 output_async_queue=output_queue.async_q,
                 rpc_async_queue=rpc_queue.async_q,
                 stage_pools=stage_pools,
+                stage_transitions=stage_transitions,
                 async_chunk=async_chunk,
                 log_stats=log_stats,
             )
@@ -785,6 +789,7 @@ async def test_replicated_stage1_keys_mm_cache_per_receiving_replica() -> None:
             stage_vllm_config=SimpleNamespace(model_config=SimpleNamespace(multimodal_config=mm_config)),
         ),
     ]
+    orchestrator._stage_routing = StageRouting.from_transitions(len(orchestrator.stage_pools))
     seen_uuids: dict[str, str] = {}
 
     def process_inputs(*, request_id, prompt, params, **kwargs):
@@ -1764,7 +1769,7 @@ async def test_stage_pool_pinned_submit_never_falls_back(operation: str, failure
     async def fail_selection(*args, **kwargs):
         raise AssertionError("pinned dispatch must not select another replica")
 
-    monkeypatch.setattr(pool, "_pick_or_select", fail_selection)
+    monkeypatch.setattr(pool, "pick", fail_selection)
     with pytest.raises(StageUnavailableError, match="pinned replica"):
         await getattr(pool, operation)("pinned", state, request, pinned_replica_id=pinned_replica_id)
 
@@ -1784,7 +1789,7 @@ async def test_stage_pool_pinned_submit_rejects_mismatched_cache_replica(monkeyp
     async def fail_selection(*args, **kwargs):
         raise AssertionError("pinned dispatch must not select another replica")
 
-    monkeypatch.setattr(pool, "_pick_or_select", fail_selection)
+    monkeypatch.setattr(pool, "pick", fail_selection)
     with pytest.raises(StageUnavailableError, match="replica 0 keyed by pinned"):
         await pool.submit_initial("pinned", state, request, pinned_replica_id=1, expected_replica_id=0)
 
@@ -1913,6 +1918,7 @@ async def test_handle_streaming_update_unknown_request_is_dropped() -> None:
     orchestrator.async_chunk = False
     orchestrator.request_states = {}
     orchestrator.stage_pools = [pool]
+    orchestrator._stage_routing = StageRouting.from_transitions(len(orchestrator.stage_pools))
     add_request_calls: list[str] = []
 
     async def record_add_request(msg) -> None:
@@ -1995,6 +2001,7 @@ async def test_add_request_attaches_native_kv_ticket_before_dispatch(mocker, nat
 def test_native_handoff_uses_bound_replica_and_reports_missing_binding(mocker) -> None:
     orchestrator = object.__new__(Orchestrator)
     orchestrator.stage_pools = [mocker.Mock()]
+    orchestrator._stage_routing = StageRouting.from_transitions(len(orchestrator.stage_pools))
     orchestrator.stage_pools[0].get_bound_client.return_value = None
     req_state = SimpleNamespace(native_kv_transfer_id="xfer-req")
     output = SimpleNamespace(kv_transfer_params={"num_transfer_tokens": 4})
@@ -2059,6 +2066,7 @@ async def test_handle_streaming_update_passes_prompt_text_to_stage_pool() -> Non
         )
     }
     orchestrator.stage_pools = [pool]
+    orchestrator._stage_routing = StageRouting.from_transitions(len(orchestrator.stage_pools))
 
     await orchestrator._handle_streaming_update(
         StageSubmissionMessage(
@@ -2103,6 +2111,7 @@ async def test_resumable_segment_boundary_builds_stage_metrics() -> None:
     req_state.stage_submit_ts[0] = time.time()
     orchestrator.request_states = {"req-stream": req_state}
     orchestrator.stage_pools = [pool]
+    orchestrator._stage_routing = StageRouting.from_transitions(len(orchestrator.stage_pools))
     routed: list[Any] = []
 
     async def record_route(_stage_id, _replica_id, _output, _req_state, stage_metrics):
@@ -2150,6 +2159,7 @@ async def test_disabled_stage_metrics_preserve_completion_routing() -> None:
     req_state.stage_submit_ts[0] = time.time()
     orchestrator.request_states = {"req-no-metrics": req_state}
     orchestrator.stage_pools = [pool]
+    orchestrator._stage_routing = StageRouting.from_transitions(len(orchestrator.stage_pools))
     routed: list[Any] = []
 
     async def record_route(_stage_id, _replica_id, _output, _req_state, stage_metrics):
@@ -2558,7 +2568,7 @@ async def test_submit_and_abort_engine_death_evicts_replica_and_fails_request_on
             await super().abort_requests_async(request_ids)
             raise EngineDeadError("engine is still dead during abort")
 
-    dead, survivor = DeadClient(), FakeStageClient()
+    dead, survivor = DeadClient(final_output=True), FakeStageClient(final_output=True)
     processor = MultimodalOutputProcessor(tokenizer=None, log_stats=False)
     pool = StagePool(
         0,
@@ -2713,8 +2723,8 @@ async def test_collective_rpc_ignores_invalid_stage_ids(orchestrator_factory, ca
 @pytest.mark.asyncio
 async def test_multi_replica_cfg_companion_inherits_parent_affinity(orchestrator_factory) -> None:
     """CFG companions should be routed to the same stage-0 replica as their parent."""
-    stage0_r0 = FakeStageClient(stage_type="llm", final_output=False)
-    stage0_r1 = FakeStageClient(stage_type="llm", final_output=False)
+    stage0_r0 = FakeStageClient(stage_type="llm", final_output=True)
+    stage0_r1 = FakeStageClient(stage_type="llm", final_output=True)
     default_vllm_cfg = SimpleNamespace(model_config=SimpleNamespace(max_model_len=64))
     stage_pools = _build_stage_pools(
         [[stage0_r0, stage0_r1]],
@@ -2956,6 +2966,7 @@ async def test_abort_retry_does_not_repeat_successful_stage_abort():
     second = _Pool(fail_once=True)
     orchestrator = object.__new__(Orchestrator)
     orchestrator.stage_pools = [first, second]
+    orchestrator._stage_routing = StageRouting.from_transitions(len(orchestrator.stage_pools))
 
     with pytest.raises(RuntimeError, match="stage abort failed"):
         await orchestrator._abort_request_ids(["req-a"])
@@ -2995,6 +3006,7 @@ async def test_raw_stage_error_reaches_caller_before_normal_terminal_routing(moc
         stage_pools=[],
     )
     orchestrator.stage_pools = pools
+    orchestrator._stage_routing = StageRouting.from_transitions(len(orchestrator.stage_pools))
     orchestrator.request_states["stuck"] = OrchestratorRequestState(request_id="stuck", final_stage_id=1)
     mocker.patch.object(orchestrator, "_handle_kv_ready_raw_outputs", new_callable=mocker.AsyncMock)
     cleanup = mocker.patch.object(orchestrator, "_cleanup_request_ids", new_callable=mocker.AsyncMock)

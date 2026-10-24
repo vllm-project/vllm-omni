@@ -116,12 +116,14 @@ def test_chunk_registration_ready_and_terminal_lifecycle():
     coord = OmniSchedulingCoordinator(scheduler_max_num_seqs=10, stage_id=1, async_chunk=True)
     req = _make_request("internal", status=RequestStatus.WAITING)
     req.external_req_id = "external"
+    req.payload_sender_info = {"host": "10.0.0.1", "zmq_port": 51424}
     waiting = MockQueue([req])
     coord.process_pending_chunks(waiting, [], set(), set())
     assert req.status == RequestStatus.WAITING_FOR_CHUNK
     [handle] = coord.pending_chunk_registrations
     assert isinstance(handle, OmniChunkRecvHandle)
     assert (handle.request_id, handle.external_req_id) == ("internal", "external")
+    assert handle.payload_sender_info == req.payload_sender_info
     coord.restore_queues(waiting, [])
     coord.process_pending_chunks(waiting, [], {"internal"}, set())
     assert req.status == RequestStatus.WAITING
