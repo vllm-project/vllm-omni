@@ -1000,4 +1000,23 @@ steps:
             set -e
             tail -n 100 "$$ROCM_QWEN3_SEED_TTS_PERF_ARTIFACT_DIR/pytest.log" > \
               "$$ROCM_QWEN3_SEED_TTS_PERF_ARTIFACT_DIR/pytest-summary.txt"
+            find "$$BENCHMARK_DIR" -maxdepth 1 -type f \
+              -name 'result_test_qwen3_omni_seed_tts_realtime_*.json' -print | sort > \
+              "$$ROCM_QWEN3_SEED_TTS_PERF_ARTIFACT_DIR/result-files.txt"
+            if [[ "$$status" == 0 ]]; then
+              result_count=$$(wc -l < "$$ROCM_QWEN3_SEED_TTS_PERF_ARTIFACT_DIR/result-files.txt" | tr -d '[:space:]')
+              if [[ "$$result_count" != 2 ]]; then
+                echo "Expected exactly 2 Qwen3-Omni Seed-TTS result JSON files, found $$result_count." >&2
+                cat "$$ROCM_QWEN3_SEED_TTS_PERF_ARTIFACT_DIR/result-files.txt" >&2
+                status=5
+              fi
+              for name in explicit vad; do
+                matches=$$(grep -Fc "_$${name}_" \
+                  "$$ROCM_QWEN3_SEED_TTS_PERF_ARTIFACT_DIR/result-files.txt" || true)
+                if [[ "$$matches" != 1 ]]; then
+                  echo "Expected exactly one Qwen3-Omni Seed-TTS $$name result JSON, found $$matches." >&2
+                  status=5
+                fi
+              done
+            fi
             exit "$$status"
