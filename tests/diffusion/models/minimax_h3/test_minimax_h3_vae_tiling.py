@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """CPU tests for the decoder tile-shortage guard in the MiniMax-H3 video VAE."""
 
@@ -47,7 +47,7 @@ class _FakeCheckpointModel:
 def _vae(parallel_size, state):
     """A stand-in instance: the guard only reads .model/.remote/.parallel_size."""
     module = types.ModuleType("fake_ckpt.parallel")
-    module.get_parallel_state = lambda: state
+    setattr(module, "get_parallel_state", lambda: state)
     sys.modules.setdefault("fake_ckpt", types.ModuleType("fake_ckpt"))
     sys.modules["fake_ckpt.parallel"] = module
 
@@ -212,3 +212,26 @@ def test_decode_latent_leaves_the_group_state_alone_when_the_grid_is_large_enoug
     assert seen["sp_enabled"] is True
     assert seen["sp_process_group"] is state["sp_process_group"]
     assert seen["parallel_tiling"] is True
+
+
+def test_window_policy_observes_request_local_tiling_and_restores_state():
+    vae, state, _ = _dispatch_vae(4)
+    vae.model.training = False
+    vae.model.decoder_parallel = False
+    vae.model.decoder_tiling = True
+    vae.model.stack_tiling = False
+    original_state = dict(state)
+    decisions = []
+
+    def decode_base(sample):
+        decisions.append((vae._temporal_window_enabled(sample), state["sp_size"]))
+        return torch.zeros(1, 3, 2, 4, 4)
+
+    vae.model.decode_base = decode_base
+    # One tile uses rank-local mode; 28 tiles balance across four ranks;
+    # six tiles retain the window. Reuse one adapter across shape changes.
+    for h, w in [(16, 16), (48, 84), (24, 32), (16, 16)]:
+        vae.decode_latent(_latent(h, w))
+        assert state == original_state
+        assert vae.model.parallel_tiling is True
+    assert decisions == [(False, 1), (False, 4), (True, 4), (False, 1)]

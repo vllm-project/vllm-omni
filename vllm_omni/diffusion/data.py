@@ -973,6 +973,8 @@ class OmniDiffusionConfig:
     # VAE memory optimization parameters
     vae_use_slicing: bool = False
     vae_use_tiling: bool = False
+    # MiniMax-H3 full video decode: pool spatial tiles from two temporal clips.
+    vae_temporal_window_size: int = 1
     # Wan VAE decoder fast path. ``"lossless"`` installs the bit-exact fused
     # kernels on every diffusers Wan VAE, ``"channels_last"`` additionally
     # converts decoder convolution weights to channels-last memory format and
@@ -1250,6 +1252,8 @@ class OmniDiffusionConfig:
         )
 
         self.stage_input_payload_keys = tuple(self.stage_input_payload_keys)
+        if type(self.vae_temporal_window_size) is not int or self.vae_temporal_window_size not in (1, 2):
+            raise ValueError("vae_temporal_window_size must be 1 or 2")
         self.stage_input_optional_payload_keys = tuple(self.stage_input_optional_payload_keys)
         self.stage_output_payload_keys = tuple(self.stage_output_payload_keys)
         if self.vae_fast_path not in VAE_FAST_PATH_LEVELS:

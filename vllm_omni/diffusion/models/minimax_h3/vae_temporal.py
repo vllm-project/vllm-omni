@@ -25,9 +25,10 @@ Set ``VLLM_OMNI_VAE_LEGACY_TEMPORAL=1`` to keep the checkpoint's methods.
 from __future__ import annotations
 
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from functools import partial
 from types import MethodType
+from typing import Protocol
 
 import torch
 from vllm.logger import init_logger
@@ -124,6 +125,8 @@ def _decode_temporal_streaming_uint8(
     temporal_cat_dtype,
     *,
     pixel_transform: Callable[[torch.Tensor], torch.Tensor] | None = None,
+    window_decode: Callable[[list[torch.Tensor]], list[torch.Tensor]] | None = None,
+    window_enabled: Callable[[torch.Tensor], bool] | None = None,
 ):
     """Drop-in fork of the checkpoint's ``_decode_temporal_streaming``.
 
@@ -189,18 +192,9 @@ def _decode_temporal_streaming_uint8(
             write_pos += copy_frames
         dropped_frames += part_frames - copy_frames
 
-    for i in range(num_chunks):
-        t_start_idx = i * self.tokens_chunk_size
-        t_end_idx = t_start_idx + self.tokens_chunk_size + self.token_overlap
-        clip_z = z[:, :, t_start_idx:t_end_idx, :, :]
-
-        if i == 0 and z_head is not None:
-            clip_z = torch.cat([z_head, clip_z], dim=2)
-
-        if i == num_chunks - 1 and z_tail is not None:
-            clip_z = torch.cat([clip_z, z_tail], dim=2)
-
-        clip_dec = self._adaptive_decode(clip_z)
+    for i, clip_dec in _iter_decoded_clips(
+        self, z, z_head, z_tail, num_chunks, window_decode, window_enabled=window_enabled
+    ):
         decoded_count += 1
         if temporal_cat_dtype is not None and clip_dec.dtype != temporal_cat_dtype:
             clip_dec = clip_dec.to(temporal_cat_dtype)
@@ -239,7 +233,7 @@ def _decode_temporal_streaming_uint8(
             if dec_tail is not None:
                 write_part(dec_tail)
 
-        del clip_dec, clip_z
+        del clip_dec
 
     if dec is None:
         raise RuntimeError("decode_temporal streaming produced no output tensor")
@@ -254,6 +248,45 @@ def _decode_temporal_streaming_uint8(
     return dec
 
 
+class _TemporalDecoder(Protocol):
+    tokens_chunk_size: int
+    token_overlap: int
+
+    def _adaptive_decode(self, z: torch.Tensor) -> torch.Tensor: ...
+
+
+def _iter_decoded_clips(
+    model: _TemporalDecoder,
+    z: torch.Tensor,
+    z_head: torch.Tensor | None,
+    z_tail: torch.Tensor | None,
+    num_chunks: int,
+    window_decode: Callable[[list[torch.Tensor]], list[torch.Tensor]] | None,
+    *,
+    window_enabled: Callable[[torch.Tensor], bool] | None = None,
+) -> Iterator[tuple[int, torch.Tensor]]:
+    """Keep at most two clips in flight; yield in native temporal order."""
+    if window_decode is not None and window_enabled is not None and not window_enabled(z):
+        window_decode = None
+    window_size = 1 if window_decode is None else 2
+    for start in range(0, num_chunks, window_size):
+        clips = []
+        for i in range(start, min(start + window_size, num_chunks)):
+            offset = i * model.tokens_chunk_size
+            clip = z[:, :, offset : offset + model.tokens_chunk_size + model.token_overlap]
+            if i == 0 and z_head is not None:
+                clip = torch.cat([z_head, clip], dim=2)
+            if i == num_chunks - 1 and z_tail is not None:
+                clip = torch.cat([clip, z_tail], dim=2)
+            clips.append(clip)
+        decoded = [model._adaptive_decode(clips[0])] if window_decode is None else window_decode(clips)
+        if len(decoded) != len(clips):
+            raise RuntimeError("VAE temporal window returned the wrong number of clips")
+        del clips, clip
+        for i in range(len(decoded)):
+            yield start + i, decoded.pop(0)
+
+
 def _processor_denorm_available(model) -> bool:
     transform_rev = getattr(getattr(model, "processor", None), "transform_rev", None)
     mean = getattr(transform_rev, "mean", None)
@@ -262,7 +295,11 @@ def _processor_denorm_available(model) -> bool:
 
 
 def install_temporal_stream_patches(
-    model, *, pixel_transform: Callable[[torch.Tensor], torch.Tensor] | None = None
+    model,
+    *,
+    pixel_transform: Callable[[torch.Tensor], torch.Tensor] | None = None,
+    window_decode: Callable[[list[torch.Tensor]], list[torch.Tensor]] | None = None,
+    window_enabled: Callable[[torch.Tensor], bool] | None = None,
 ) -> None:
     """Install the memory-optimized temporal forks on the checkpoint model.
 
@@ -273,21 +310,34 @@ def install_temporal_stream_patches(
     the native checkpoint's default arithmetic.
     """
     if _legacy_temporal_enabled():
+        if window_decode is not None:
+            raise ValueError("VAE temporal windows cannot be combined with legacy temporal decode")
         logger.info("MiniMax-H3 VAE temporal stream patches disabled by %s", _LEGACY_TEMPORAL_ENV)
         return
+    if window_decode is not None:
+        stream_cat = os.environ.get("MINIMAX_H3_VAE_DECODER_STREAM_TEMPORAL_CAT", "1").strip().lower()
+        if stream_cat in ("0", "false", "no", "off", "disable", "disabled"):
+            raise ValueError("VAE temporal windows require streaming temporal concatenation")
     if callable(getattr(model, "encode_temporal", None)) and hasattr(model, "clip_length"):
         model.encode_temporal = MethodType(_encode_temporal_tail_pad, model)
         logger.info("MiniMax-H3 VAE encode_temporal tail-padding patch installed")
     else:
         logger.warning("MiniMax-H3 VAE encode_temporal contract not found; keeping checkpoint method")
     if callable(getattr(model, "_decode_temporal_streaming", None)) and _processor_denorm_available(model):
-        if pixel_transform is None:
+        if pixel_transform is None and window_decode is None:
             stream_decode = _decode_temporal_streaming_uint8
         else:
-            stream_decode = partial(_decode_temporal_streaming_uint8, pixel_transform=pixel_transform)
+            stream_decode = partial(
+                _decode_temporal_streaming_uint8,
+                pixel_transform=pixel_transform,
+                window_decode=window_decode,
+                window_enabled=window_enabled,
+            )
         model._decode_temporal_streaming = MethodType(stream_decode, model)
         logger.info("MiniMax-H3 VAE streaming uint8 decode patch installed")
     else:
+        if window_decode is not None:
+            raise ValueError("VAE temporal windows require the checkpoint streaming decode contract")
         logger.warning("MiniMax-H3 VAE streaming decode contract not found; keeping checkpoint method")
 
 

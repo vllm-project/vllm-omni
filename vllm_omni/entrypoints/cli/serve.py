@@ -1082,6 +1082,15 @@ class OmniServeCommand(CLISubcommand):
             "Equivalent to setting DiffusionParallelConfig.vae_patch_parallel_size.",
         )
         omni_config_group.add_argument(
+            "--vae-temporal-window-size",
+            type=int,
+            choices=[1, 2],
+            default=1,
+            help="MiniMax-H3 full video VAE decode: 1 preserves per-clip scheduling; "
+            "2 pools tiles across adjacent temporal clips for better tile-rank balance. "
+            "Uses more decode memory. Chunked output is unchanged.",
+        )
+        omni_config_group.add_argument(
             "--text-encoder-tp-size",
             type=int,
             default=None,

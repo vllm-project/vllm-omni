@@ -7,6 +7,7 @@
 - [Example Script](#example-script)
 - [Configuration Parameters](#configuration-parameters)
 - [Batch Parallel Decode](#batch-parallel-decode)
+- [Temporal Tile Windows (MiniMax-H3)](#temporal-tile-windows-minimax-h3)
 - [Spatially-Sharded Decode (Wan)](#spatially-sharded-decode-wan)
 - [Distributed Encode Split (Wan)](#distributed-encode-split-wan)
 - [Best Practices](#best-practices)
@@ -126,6 +127,78 @@ Additional requirements:
     When `vae_patch_parallel_size > 1` and the model has a distributed VAE (`DistributedVaeMixin`), tile mode automatically enables `vae_use_tiling`. Spatial-shard and batch modes preserve the requested tiling setting: spatial-shard decode is full-frame and does not need tiling. In spatial-shard modes the **encode** is distributed only through the tiled path, so set `vae_use_tiling=True` (`--vae-use-tiling`) explicitly if you also want a multi-rank encode; the decode stays spatially sharded either way.
 
 ---
+
+## Temporal Tile Windows (MiniMax-H3)
+
+MiniMax-H3 can distribute spatial tiles from two adjacent temporal clips in
+one scheduling window. Enable this for full video decode with
+`--vae-temporal-window-size 2`, or `vae_temporal_window_size=2` in Python or
+the diffusion stage's `engine_args`. The default is `1`, which preserves
+per-clip scheduling. Supported values are `1` and `2`.
+
+This opt-in currently targets Ascend NPU deployments. Native checkpoint
+correctness and latency have been validated on NPUs; CUDA validation and
+support are outside the scope of this feature.
+
+Use the model's existing tile parallel deployment, including
+`--vae-parallel-mode tile` and `--vae-patch-parallel-size`. The window uses
+the actual VAE tile process group; it does not allocate workers or require
+eight ranks. MiniMax-H3 still requires a VAE degree of one or the full DiT
+group size. Other parallelism constraints of the deployment still apply.
+
+For example, add the opt-in to an otherwise valid four-rank deployment:
+
+```bash
+vllm serve "$MODEL" --omni --trust-remote-code --task-type fl2va \
+  --num-gpus 4 --usp 4 --ring 1 --text-encoder-tp-size 4 \
+  --vae-parallel-mode tile --vae-use-tiling --vae-patch-parallel-size 4 \
+  --vae-temporal-window-size 2
+```
+
+Keep any precision, attention, and offload options required by your platform.
+Omit `--vae-temporal-window-size` or set it to `1` to restore the default.
+
+Tiles keep their original temporal context, spatial overlap, and blend
+order. Only equal-shaped tiles are grouped. For example, twelve spatial
+tiles on eight ranks give some ranks two tasks and others one per clip;
+two equal-shaped clips supply twenty-four tasks, or three per rank.
+This can reduce idle time and gather frequency, at the cost of keeping
+up to two decoded clips in memory. It does not change tile geometry or
+guarantee a speedup, especially for already balanced layouts.
+
+For unstacked tiling, uniform spatial tiles whose count is divisible by the
+actual tile group size use native per-clip streaming even when the opt-in is
+set to `2`. This avoids buffering a second decoded clip when the window cannot
+reduce the busiest rank's tile count. The decision uses each request's shape
+and current tiling mode, so it also follows the small-canvas rank-local guard.
+Stacked tiling keeps window scheduling because changing batch sizes can change
+its compute cost. Neither path changes the output order or tile geometry.
+
+Short tails and different-shaped edge tiles are scheduled separately.
+Buckets with fewer tasks than ranks decode locally on every rank to avoid
+empty-task gathers. The existing small-canvas rank-local guard remains in
+effect. Single-rank or disabled tile parallelism uses native per-clip decode.
+Training, stateful `decoder_parallel`, unsupported checkpoint tile methods,
+and `VLLM_OMNI_VAE_LEGACY_TEMPORAL=1` are incompatible with this opt-in.
+Incremental/chunked output continues to use its existing per-clip path;
+the window applies only to complete-video streaming uint8 decode. Audio
+decode, weight offload, and Encoder/DiT scheduling are unchanged.
+
+For a component-only correctness and latency comparison with a trusted local
+checkpoint, run from the repository root in an accelerator environment:
+
+```bash
+torchrun --nproc-per-node=4 \
+  tests/diffusion/models/minimax_h3/benchmark_vae_temporal_window.py \
+  --model "$MODEL/FL2VA/video_vae" --output /tmp/h3-vae-window \
+  --warmup 1 --repeat 3
+```
+
+This uses deterministic synthetic latents and native checkpoint tiling,
+warms up both modes, alternates their order, and checks identical uint8
+outputs. Per-rank JSON records include synchronized decode latency and peak
+allocated memory. For each repetition, compare the slowest rank; this is
+not an end-to-end or audio/video pipeline benchmark.
 
 ## Batch Parallel Decode
 
