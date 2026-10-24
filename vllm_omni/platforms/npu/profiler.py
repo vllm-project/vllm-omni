@@ -69,14 +69,18 @@ class NPUTorchProfilerWrapper(OmniTorchProfilerWrapper):
 
         return torch_npu.profiler.profile(
             activities=npu_activities,
-            with_stack=False,
+            # Forward the stack flag; without it a trace never carries Python
+            # stacks, no matter what ``torch_profiler_with_stack`` says.
+            with_stack=profiler_config.torch_profiler_with_stack,
             profile_memory=profiler_config.torch_profiler_with_memory,
             # Forward the shape-recording flag; without it the NPU profiler
             # silently ignores ``torch_profiler_record_shapes=True``.
             record_shapes=profiler_config.torch_profiler_record_shapes,
-            # NOTE: torch_npu.profiler.with_modules is equivalent to
-            # torch.profiler.with_stack. The with_stack option in
-            # torch_npu.profiler introduces significant time overhead.
+            # ``with_stack`` and ``with_modules`` are two distinct knobs of
+            # ``torch.profiler.profile``: the first records the Python/C stack
+            # of each op, the second the module hierarchy. Keep the module
+            # hierarchy on the same flag so a stack request also yields the
+            # hierarchy the Ascend trace viewer groups by.
             with_modules=profiler_config.torch_profiler_with_stack,
             experimental_config=experimental_config,
             # Use tensorboard_trace_handler directly - NPU profiler expects
