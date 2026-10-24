@@ -19,6 +19,7 @@ import json
 import os
 import wave
 from contextlib import asynccontextmanager, suppress
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, NamedTuple
 
@@ -390,6 +391,29 @@ def _output_text(response: dict) -> str:
     return "".join(parts)
 
 
+@dataclass
+class _ReplayResponse:
+    """Outcome of one replayed response; times are seconds from the replay start."""
+
+    response_id: str
+    created_s: float
+    text: str = ""
+    delta_count: int = 0
+    first_delta_s: float | None = None
+    done_s: float | None = None
+    status: str | None = None
+
+    def describe(self) -> str:
+        def at(t: float | None) -> str:
+            return "never" if t is None else f"{t:.2f}s"
+
+        return (
+            f"{self.response_id}: status={self.status} created={at(self.created_s)} "
+            f"first_delta={at(self.first_delta_s)} done={at(self.done_s)} "
+            f"deltas={self.delta_count} text={self.text!r}"
+        )
+
+
 async def _run_client_vad_replay(
     host: str,
     port: int,
@@ -397,21 +421,22 @@ async def _run_client_vad_replay(
     replay_path: Path,
     *,
     wait_s: float = 10.0,
-) -> list[str]:
+) -> list[_ReplayResponse]:
     """Replay a captured LiveKit client-VAD session at its original speed."""
     with replay_path.open() as replay_file:
         records = [json.loads(line) for line in replay_file]
     assert records
 
-    answers_by_response_id: dict[str, str] = {}
-    response_order: list[str] = []
-    completed_answers: dict[str, str] = {}
+    responses: dict[str, _ReplayResponse] = {}
     errors: list[dict] = []
 
     async with websockets.connect(
         f"ws://{host}:{port}/v1/realtime?model={model}",
         max_size=64 * 1024 * 1024,
     ) as ws:
+
+        def replay_time() -> float:
+            return asyncio.get_running_loop().time() - replay_start
 
         async def receive_responses() -> None:
             async for message in ws:
@@ -423,26 +448,30 @@ async def _run_client_vad_replay(
                     errors.append(event)
                 elif event_type == "response.created":
                     response_id = event["response"]["id"]
-                    response_order.append(response_id)
-                    answers_by_response_id[response_id] = ""
+                    responses[response_id] = _ReplayResponse(response_id, created_s=replay_time())
                 elif event_type in {
                     "response.audio_transcript.delta",
                     "response.output_audio_transcript.delta",
                     "response.output_text.delta",
                     "transcription.delta",
                 }:
-                    response_id = event.get("response_id")
-                    if response_id in answers_by_response_id:
-                        answers_by_response_id[response_id] += event.get("delta", "")
+                    replayed = responses.get(event.get("response_id"))
+                    if replayed is not None:
+                        if replayed.first_delta_s is None:
+                            replayed.first_delta_s = replay_time()
+                        replayed.delta_count += 1
+                        replayed.text += event.get("delta", "")
                 elif event_type == "response.done":
                     response = event["response"]
-                    response_id = response["id"]
-                    text = answers_by_response_id.get(response_id, "")
-                    completed_answers[response_id] = text or _output_text(response)
+                    replayed = responses.get(response["id"])
+                    if replayed is not None:
+                        replayed.done_s = replay_time()
+                        replayed.status = response.get("status")
+                        replayed.text = replayed.text or _output_text(response)
 
-        receiver = asyncio.create_task(receive_responses())
         capture_start = records[0]["ts"]
         replay_start = asyncio.get_running_loop().time()
+        receiver = asyncio.create_task(receive_responses())
 
         try:
             for record in records:
@@ -464,7 +493,43 @@ async def _run_client_vad_replay(
             await asyncio.gather(receiver, return_exceptions=True)
 
     assert not [error for error in errors if error.get("error", {}).get("type") == "server_error"]
-    return [completed_answers[response_id] for response_id in response_order if response_id in completed_answers]
+    return list(responses.values())
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_client_vad_replay_reports_response_outcomes(tmp_path) -> None:
+    """A stalled response is reported with its timings, not only as a missing answer."""
+    replay_path = tmp_path / "replay.jsonl"
+    replay_path.write_text("\n".join(json.dumps({"ts": ts, "data": {"type": "response.create"}}) for ts in (0.0, 0.1)))
+
+    async def serve(ws) -> None:
+        response_ids = iter(["resp_done", "resp_stalled"])
+        async for message in ws:
+            if json.loads(message)["type"] != "response.create":
+                continue
+            response_id = next(response_ids)
+            await ws.send(json.dumps({"type": "response.created", "response": {"id": response_id}}))
+            if response_id == "resp_done":
+                await ws.send(
+                    json.dumps({"type": "response.output_text.delta", "response_id": response_id, "delta": "Paris"})
+                )
+                await ws.send(
+                    json.dumps({"type": "response.done", "response": {"id": response_id, "status": "completed"}})
+                )
+
+    async def run() -> list[_ReplayResponse]:
+        async with websockets.serve(serve, "127.0.0.1", 0) as server:
+            port = server.sockets[0].getsockname()[1]
+            return await _run_client_vad_replay("127.0.0.1", port, "test", replay_path, wait_s=0.1)
+
+    done, stalled = asyncio.run(run())
+
+    assert (done.status, done.text, done.delta_count) == ("completed", "Paris", 1)
+    assert done.first_delta_s is not None and done.done_s is not None
+    assert (stalled.status, stalled.text, stalled.delta_count) == (None, "", 0)
+    assert stalled.created_s >= 0.1
+    assert "first_delta=never done=never" in stalled.describe()
 
 
 @pytest.fixture(scope="class")
@@ -608,7 +673,7 @@ class TestQwen3OmniRealtimeWebSocket:
     @pytest.mark.parametrize("omni_server", realtime_async_chunk_server_params, indirect=True)
     def test_livekit_client_vad_replay(self, omni_server) -> None:
         """Replay the captured client-VAD session at speed 1 and check its answers."""
-        answers = asyncio.run(
+        responses = asyncio.run(
             _run_client_vad_replay(
                 omni_server.host,
                 omni_server.port,
@@ -616,11 +681,13 @@ class TestQwen3OmniRealtimeWebSocket:
                 CLIENT_VAD_REPLAY_PATH,
             )
         )
+        answers = [response.text for response in responses if response.done_s is not None]
+        outcomes = "\n".join(response.describe() for response in responses)
 
-        assert len(answers) == 3, answers
-        assert "qwen" in answers[0].lower(), answers
-        assert "paris" in answers[1].lower(), answers
-        assert "paris" in answers[2].lower(), answers
+        assert len(answers) == 3, outcomes
+        assert "qwen" in answers[0].lower(), outcomes
+        assert "paris" in answers[1].lower(), outcomes
+        assert "paris" in answers[2].lower(), outcomes
 
     @pytest.mark.advanced_model
     @pytest.mark.omni
