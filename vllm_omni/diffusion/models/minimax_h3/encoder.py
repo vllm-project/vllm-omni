@@ -334,6 +334,10 @@ class MiniMaxH3Qwen3VLRowParallelLinear(LinearBase):
             params_dtype=dtype,
             weight_loader=self.weight_loader,
         )
+        # INT8 per-row scales must be reduced over the ranks that own these
+        # input shards. The text encoder group is independent from the DiT
+        # tensor-parallel group returned by vLLM's get_tp_group().
+        self._int8_scale_tp_group = self.group.device_group
         self._tp_rank = tp_rank
         self._tp_size = tp_size
 
