@@ -151,7 +151,6 @@ def test_host_policy_real_input_batch_and_runner(monkeypatch, repetition_penalty
         device=torch.device("cpu"),
         vocab_size=4,
         block_sizes=[1],
-        kernel_block_sizes=[1],
         max_num_blocks_per_req=[16],
         logitsprocs_need_output_token_ids=False,
     )
