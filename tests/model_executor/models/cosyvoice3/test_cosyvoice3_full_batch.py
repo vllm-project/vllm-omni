@@ -186,3 +186,105 @@ def test_packed_stream_mixed_finalization_and_ragged_requests_stay_aligned(monke
     monkeypatch.setenv("COSYVOICE3_PACKED_STREAMING", "0")
     with pytest.raises(ValueError, match="COSYVOICE3_PACKED_STREAMING"):
         model.forward_batch(items[:1], n_timesteps=3, stream_items=True)
+
+
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@torch.inference_mode()
+def test_incremental_packed_streaming_matches_full_prefix_and_keeps_tail_full(monkeypatch):
+    import vllm_omni.model_executor.models.cosyvoice3.code2wav_core.incremental as incremental
+    from vllm_omni.model_executor.models.cosyvoice3.runtime import cosyvoice3_packed_streaming_enabled
+
+    monkeypatch.setenv("COSYVOICE3_PACKED_STREAMING", "1")
+    monkeypatch.setenv("COSYVOICE3_FLOW_GRAPH", "0")
+    monkeypatch.setenv("COSYVOICE3_FLOW_CUDAGRAPH", "0")
+    if not cosyvoice3_packed_streaming_enabled():
+        pytest.skip("packed FlashAttention is unavailable on this GPU/build")
+    torch.manual_seed(42)
+    model = tiny_flow(monkeypatch).bfloat16()
+    # Isolate Flow parity; HiFT consumes the resulting new-mel slice unchanged.
+    monkeypatch.setattr(
+        model,
+        "_stream_hift_from_feat",
+        lambda feat, cache_state=None, finalize=False: (feat, None if finalize else {}),
+    )
+    base = _items([(7, 80)])[0]
+    tokens = base.pop("token")
+    cache = None
+    offset = 0
+    # 7 prompt tokens: valid combined lengths are 25, 50 and 65 tokens.
+    # The last call leaves a partial attention block, which must not be cached.
+    for length, complete in ((21, 50), (46, 100), (61, 100)):
+        item = dict(base, token=tokens[:, :length], token_offset_tokens=offset, finalize=False)
+        monkeypatch.setenv("COSYVOICE3_INCREMENTAL_FLOW", "0")
+        expected = model.forward_batch([item], n_timesteps=3, stream_items=True)[0][0]
+        monkeypatch.setenv("COSYVOICE3_INCREMENTAL_FLOW", "1")
+        actual, cache = model.forward_batch([dict(item, cache_state=cache)], n_timesteps=3, stream_items=True)[0]
+        torch.testing.assert_close(actual, expected, rtol=3e-2, atol=3e-2)
+        assert cache["flow_cache"].frames == complete
+        assert cache["lookahead_cache"].tokens == 7 + length - 3
+        offset = length - 3
+
+    # Final changes to full-context attention. It must ignore all cached KV.
+    final = dict(base, token=tokens[:, :65], token_offset_tokens=offset, finalize=True)
+    monkeypatch.setenv("COSYVOICE3_INCREMENTAL_FLOW", "0")
+    expected = model.forward_batch([final], n_timesteps=3, stream_items=True)[0][0]
+
+    def unexpected_incremental(*args, **kwargs):
+        pytest.fail("final tail must use the existing full-context solve")
+
+    monkeypatch.setattr(incremental, "solve_flow_euler_incremental", unexpected_incremental)
+    monkeypatch.setattr(model.flow_model.pre_lookahead_layer, "forward_incremental", unexpected_incremental)
+    monkeypatch.setattr(model.flow_model.pre_lookahead_layer, "forward_incremental_packed", unexpected_incremental)
+    monkeypatch.setenv("COSYVOICE3_INCREMENTAL_FLOW", "1")
+    actual, final_cache = model.forward_batch([dict(final, cache_state=cache)], n_timesteps=3, stream_items=True)[0]
+    torch.testing.assert_close(actual, expected, rtol=3e-2, atol=3e-2)
+    assert final_cache is None
+
+
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@torch.inference_mode()
+def test_incremental_packs_ragged_requests_into_one_attention_call_per_layer_step(monkeypatch):
+    import vllm_omni.model_executor.models.cosyvoice3.code2wav_core.incremental as incremental
+    from vllm_omni.model_executor.models.cosyvoice3.runtime import cosyvoice3_packed_streaming_enabled
+
+    monkeypatch.setenv("COSYVOICE3_PACKED_STREAMING", "1")
+    monkeypatch.setenv("COSYVOICE3_FLOW_GRAPH", "0")
+    monkeypatch.setenv("COSYVOICE3_FLOW_CUDAGRAPH", "0")
+    if not cosyvoice3_packed_streaming_enabled():
+        pytest.skip("packed FlashAttention is unavailable on this GPU/build")
+    torch.manual_seed(19)
+    model = tiny_flow(monkeypatch).bfloat16()
+    monkeypatch.setattr(model, "_stream_hift_from_feat", lambda feat, cache_state=None, finalize=False: (feat, {}))
+    bases = _items([(7, 80), (3, 80)])
+    tokens = [item.pop("token") for item in bases]
+    caches = [None, None]
+    offsets = [0, 0]
+    original_attention = incremental.ragged_attention_tensor_geometry
+    query_rows = []
+
+    def attend(query, *args):
+        query_rows.append(query.shape[1])
+        return original_attention(query, *args)
+
+    monkeypatch.setattr(incremental, "ragged_attention_tensor_geometry", attend)
+    for lengths in ((21, 35), (46, 60)):
+        items = [
+            dict(base, token=token[:, :length], token_offset_tokens=offset, finalize=False)
+            for base, token, length, offset in zip(bases, tokens, lengths, offsets)
+        ]
+        monkeypatch.setenv("COSYVOICE3_INCREMENTAL_FLOW", "0")
+        expected = model.forward_batch(items, n_timesteps=3, stream_items=True)
+        old_frames = [0 if cache is None else cache["flow_cache"].frames for cache in caches]
+        query_rows.clear()
+        monkeypatch.setenv("COSYVOICE3_INCREMENTAL_FLOW", "1")
+        actual = model.forward_batch(
+            [dict(item, cache_state=cache) for item, cache in zip(items, caches)], n_timesteps=3, stream_items=True
+        )
+        for (mel, _), (reference, _) in zip(actual, expected):
+            torch.testing.assert_close(mel, reference, rtol=3e-2, atol=3e-2)
+        # Tiny DiT has 2 layers and 3 Euler steps, independent of request count.
+        assert len(query_rows) == 6
+        suffix_lengths = [(prompt + length - 3) * 2 - old for prompt, length, old in zip((7, 3), lengths, old_frames)]
+        assert query_rows == [2 * sum(suffix_lengths)] * 6
+        caches = [cache for _, cache in actual]
+        offsets = [length - 3 for length in lengths]

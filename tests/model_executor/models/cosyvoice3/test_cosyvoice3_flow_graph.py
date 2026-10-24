@@ -63,3 +63,65 @@ def test_flow_graph_replay_matches_eager_solve(monkeypatch, streaming):
             torch.testing.assert_close(output, reference, rtol=1e-2, atol=1e-2)
     runner = model._packed_estimator.graph_runner
     assert len(runner.graphs) == 1
+
+
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@torch.inference_mode()
+def test_incremental_graph_reuses_bucket_with_request_caches(monkeypatch):
+    from vllm_omni.diffusion.models.cosyvoice3_audio.cosyvoice3_dit import DiT
+    from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.incremental import solve_flow_euler_incremental
+    from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.packed_dit import PackedDiT
+    from vllm_omni.model_executor.models.cosyvoice3.runtime import cosyvoice3_packed_streaming_enabled
+
+    monkeypatch.setenv("COSYVOICE3_PACKED_STREAMING", "1")
+    monkeypatch.setenv("DIFFUSION_ATTENTION_BACKEND", "TORCH_SDPA")
+    if not cosyvoice3_packed_streaming_enabled():
+        pytest.skip("packed FlashAttention is unavailable on this GPU/build")
+    torch.manual_seed(71)
+    dit = (
+        DiT(dim=256, depth=2, heads=4, dim_head=64, mel_dim=80, mu_dim=80, spk_dim=80, dropout=0, static_chunk_size=50)
+        .cuda()
+        .bfloat16()
+        .eval()
+    )
+    estimator = PackedDiT(dit)
+    data = [[torch.randn(1, 180, 80, device="cuda", dtype=torch.bfloat16) for _ in range(3)] for _ in range(3)]
+    speakers = [torch.randn(1, 80, device="cuda", dtype=torch.bfloat16) for _ in data]
+    span = torch.linspace(0, 1, 4, device="cuda", dtype=torch.bfloat16)
+    caches, graph_caches = [None] * 3, [None] * 3
+    recorded = None
+    # Three requests occupy four slots; the final two calls reuse one bucket
+    # with different prefix/suffix distributions, including a partial block.
+    for lengths in ((30, 50, 80), (50, 80, 100), (80, 100, 130), (100, 125, 140)):
+        args = (
+            [d[0][:, :n] for d, n in zip(data, lengths)],
+            span,
+            [d[1][:, :n] for d, n in zip(data, lengths)],
+            speakers,
+            [d[2][:, :n] for d, n in zip(data, lengths)],
+        )
+        monkeypatch.setenv("COSYVOICE3_FLOW_GRAPH", "0")
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            expected, caches = solve_flow_euler_incremental(
+                estimator, *args, cfg_rate=0.7, schedule=(3,), caches=caches
+            )
+            monkeypatch.setenv("COSYVOICE3_FLOW_GRAPH", "1")
+            actual, graph_caches = solve_flow_euler_incremental(
+                estimator, *args, cfg_rate=0.7, schedule=(3,), caches=graph_caches
+            )
+        for output, reference in zip(actual, expected):
+            torch.testing.assert_close(output, reference, rtol=3e-2, atol=3e-2)
+        runner = estimator.incremental_runner
+        current = next(reversed(runner.graphs.values()))
+        if lengths == (80, 100, 130):
+            recorded = current
+        elif lengths == (100, 125, 140):
+            assert current is recorded
+        for cache, reference in zip(graph_caches, caches):
+            assert cache.frames == reference.frames
+            for step, ref_step in zip(cache.steps, reference.steps):
+                torch.testing.assert_close(step.conv1_cache, ref_step.conv1_cache, rtol=3e-2, atol=3e-2)
+                torch.testing.assert_close(step.conv2_cache, ref_step.conv2_cache, rtol=3e-2, atol=3e-2)
+                for kv, ref_kv in zip(step.kv, ref_step.kv):
+                    for value, ref_value in zip(kv, ref_kv):
+                        torch.testing.assert_close(value, ref_value, rtol=3e-2, atol=3e-2)

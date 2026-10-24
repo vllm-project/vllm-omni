@@ -12,7 +12,7 @@ This module contains the code2wav (token-to-waveform) stage which uses:
 import os
 from collections import Counter
 from collections.abc import Mapping
-from typing import Any, Literal, TypedDict, cast, overload
+from typing import TYPE_CHECKING, Any, Literal, TypedDict, cast, overload
 
 import numpy as np
 import torch
@@ -31,7 +31,7 @@ from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.hifigan import (
     CausalConvRNNF0Predictor,
     CausalHiFTGenerator,
 )
-from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.layers import PreLookaheadLayer
+from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.layers import PreLookaheadCache, PreLookaheadLayer
 from vllm_omni.model_executor.models.cosyvoice3.runtime import (
     cosyvoice3_batch_flow_debug,
     cosyvoice3_batch_flow_profile,
@@ -40,6 +40,9 @@ from vllm_omni.model_executor.models.cosyvoice3.runtime import (
     cosyvoice3_packed_streaming_enabled,
 )
 from vllm_omni.transformers_utils.configs.cosyvoice3 import CosyVoice3Config
+
+if TYPE_CHECKING:
+    from .code2wav_core.incremental import IncrementalFlowCache
 
 logger = init_logger(__name__)
 
@@ -62,11 +65,13 @@ def _build_dit_estimator(estimator_config: Mapping[str, Any]) -> DiT:
 
 
 class StreamingHiFTState(TypedDict, total=False):
-    """Request-owned mel history, its absolute offset, and oscillator phase."""
+    """Request-owned HiFT history/phase and optional incremental Flow cache."""
 
     mel: torch.Tensor
     mel_offset: int
     phase_acc: torch.Tensor | None
+    flow_cache: "IncrementalFlowCache"
+    lookahead_cache: PreLookaheadCache
 
 
 class StreamingFlowItem(TypedDict, total=False):
@@ -593,16 +598,35 @@ class CosyVoice3Code2Wav(nn.Module):
         flow = self.flow_model
         weight = next(flow.parameters())
         mus, conds, speakers, lengths, prompt_lengths = [], [], [], [], []
-        for item in items:
-            tokens = torch.cat(
+        incremental = (
+            stream_items
+            and not items[0].get("finalize", False)
+            and cosyvoice3_packed_streaming_enabled()
+            and os.getenv("COSYVOICE3_INCREMENTAL_FLOW", "0") == "1"
+        )
+        token_rows = [
+            torch.cat(
                 tuple(item[key].to(device=weight.device, dtype=torch.long) for key in ("prompt_token", "token")), dim=1
             )
-            embedded = flow.input_embedding(tokens.clamp(min=0))
-            if stream_items and not item.get("finalize", False) and int(flow.pre_lookahead_len) > 0:
-                lookahead = int(flow.pre_lookahead_len)
-                hidden = flow.pre_lookahead_layer(embedded[:, :-lookahead], context=embedded[:, -lookahead:])
+            for item in items
+        ]
+        lookahead_caches = []
+        if incremental:
+            previous = [(item.get("cache_state") or {}).get("lookahead_cache") for item in items]
+            pending = [tokens[:, 0 if cache is None else cache.tokens :] for tokens, cache in zip(token_rows, previous)]
+            embedded = flow.input_embedding(torch.cat(pending, dim=1).clamp(min=0))
+            embeddings = list(torch.split(embedded, [value.shape[1] for value in pending], dim=1))
+            hidden_rows, lookahead_caches = flow.pre_lookahead_layer.forward_incremental_packed(embeddings, previous)
+        for row, (item, tokens) in enumerate(zip(items, token_rows)):
+            if incremental:
+                hidden = hidden_rows[row]
             else:
-                hidden = flow.pre_lookahead_layer(embedded)
+                embedded = flow.input_embedding(tokens.clamp(min=0))
+                if stream_items and not item.get("finalize", False) and int(flow.pre_lookahead_len) > 0:
+                    lookahead = int(flow.pre_lookahead_len)
+                    hidden = flow.pre_lookahead_layer(embedded[:, :-lookahead], context=embedded[:, -lookahead:])
+                else:
+                    hidden = flow.pre_lookahead_layer(embedded)
             mu = hidden.repeat_interleave(self.token_mel_ratio, dim=1)
             prompt = item["prompt_feat"].to(device=weight.device, dtype=mu.dtype)
             cond = torch.zeros_like(mu)
@@ -633,6 +657,46 @@ class CosyVoice3Code2Wav(nn.Module):
             if not hasattr(self, "_packed_estimator"):
                 self._packed_estimator = PackedDiT(flow.decoder.estimator)
                 self._packed_estimator.compile(mu.dtype)
+            if incremental:
+                from .code2wav_core.incremental import solve_flow_euler_incremental
+
+                time_span = torch.linspace(0, 1, n_timesteps + 1, device=mu.device, dtype=mu.dtype)
+                if flow.decoder.t_scheduler == "cosine":
+                    time_span = 1 - torch.cos(time_span * 0.5 * torch.pi)
+                schedule = (
+                    n_timesteps,
+                    flow.decoder.t_scheduler,
+                    flow.decoder.inference_cfg_rate,
+                    self._packed_estimator.dit.static_chunk_size,
+                    mu.dtype,
+                    mu.device,
+                )
+                row_mus = [value.transpose(1, 2) for value in mus]
+                row_conds = [value.transpose(1, 2) for value in conds]
+                noises = [self._stream_position_noise(n, value).transpose(1, 2) for n, value in zip(lengths, row_mus)]
+                with torch.autocast("cuda", dtype=mu.dtype):
+                    mels, flow_caches = solve_flow_euler_incremental(
+                        self._packed_estimator,
+                        noises,
+                        time_span,
+                        row_mus,
+                        speakers,
+                        row_conds,
+                        cfg_rate=flow.decoder.inference_cfg_rate,
+                        schedule=schedule,
+                        caches=[(item.get("cache_state") or {}).get("flow_cache") for item in items],
+                    )
+                results = []
+                for row, (item, mel, flow_cache) in enumerate(zip(items, mels, flow_caches)):
+                    start = prompt_lengths[row] + max(0, int(item.get("token_offset_tokens", 0))) * self.token_mel_ratio
+                    speech, hift_cache = self._stream_hift_from_feat(
+                        mel.transpose(1, 2)[:, :, start:].float(), cache_state=item.get("cache_state"), finalize=False
+                    )
+                    if hift_cache is not None:
+                        hift_cache["flow_cache"] = flow_cache
+                        hift_cache["lookahead_cache"] = lookahead_caches[row]
+                    results.append((speech, hift_cache))
+                return results
             rows = pack_rows(lengths, mu.device)
             if stream_items:
                 noise = self._stream_position_noise(width, mu).expand(len(items), -1, -1)
