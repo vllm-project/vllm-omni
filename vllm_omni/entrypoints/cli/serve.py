@@ -890,6 +890,17 @@ class OmniServeCommand(CLISubcommand):
             help="Enable VAE tiling for memory optimization (useful for mitigating OOM issues).",
         )
         omni_config_group.add_argument(
+            "--light-vae-path",
+            type=str,
+            default=None,
+            help=(
+                "MiniMax-H3 only: directory of a decode-only lightweight video VAE "
+                "(diffusers AutoencoderKLMiniMaxH3 + decode_config.json). When set, "
+                "decode uses this VAE; the official video VAE is still used for "
+                "reference encoding. Unset keeps the official video VAE for decode."
+            ),
+        )
+        omni_config_group.add_argument(
             "--vae-fast-path",
             choices=("off", "lossless", "channels_last"),
             default="lossless",

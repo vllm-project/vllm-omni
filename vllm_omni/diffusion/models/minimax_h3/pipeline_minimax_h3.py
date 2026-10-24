@@ -171,7 +171,13 @@ from .time_request import (
     MINIMAX_H3_SHAPE_PLANNER,
     minimax_h3_time_shift_sigmas,
 )
-from .vae import MiniMaxH3AudioVAE, MiniMaxH3VideoVAE, _load_component_config, _VideoVAEPartProxy
+from .vae import (
+    MiniMaxH3AudioVAE,
+    MiniMaxH3LightVideoVAE,
+    MiniMaxH3VideoVAE,
+    _load_component_config,
+    _VideoVAEPartProxy,
+)
 from .vdnh3 import VDNCheckpoint
 
 if TYPE_CHECKING:
@@ -1181,6 +1187,7 @@ class MiniMaxH3Pipeline(
         component_load_device = torch.device("cpu") if legacy_manual_components else self.device
         self.video_vae = None
         self.audio_vae = None
+        self.light_video_vae = None
         if self.load_vae_decoder:
             self.video_vae = MiniMaxH3VideoVAE(
                 os.path.join(vae_model_path, "video_vae"),
@@ -1202,8 +1209,25 @@ class MiniMaxH3Pipeline(
                 decode_only=not self.load_vae_encoder,
                 trust_remote_code=od_config.trust_remote_code,
             )
+            light_vae_path = getattr(od_config, "light_vae_path", None)
+            if light_vae_path:
+                if not os.path.isfile(os.path.join(light_vae_path, "decode_config.json")):
+                    raise ValueError(f"--light-vae-path {light_vae_path!r} is missing decode_config.json")
+                self.light_video_vae = MiniMaxH3LightVideoVAE(
+                    light_vae_path,
+                    device=self.device,
+                    load_device=component_load_device,
+                )
+                logger.info("MiniMax-H3 light video VAE enabled for decode: %s", light_vae_path)
         # Registry-side VAE patch-parallel discovery uses ``pipeline.vae``.
         self.vae = self.video_vae
+        if self.light_video_vae is not None:
+            # The registry configures only ``pipeline.vae`` (the official video
+            # VAE). Mirror the tile-parallel settings onto the light decode VAE
+            # so it also decodes across the SP ranks instead of rank-locally.
+            _pc = self.parallel_config
+            self.light_video_vae.use_tiling = bool(getattr(od_config, "vae_use_tiling", False))
+            self.light_video_vae.set_parallel_size(int(_pc.vae_patch_parallel_size), mode=_pc.vae_parallel_mode)
 
         # Optional learned latent super-resolution, run between the denoise
         # loop and the VAE. Absent unless --additional-config names a
@@ -1231,6 +1255,7 @@ class MiniMaxH3Pipeline(
                     self.text_encoder,
                     self.video_vae,
                     self.audio_vae,
+                    *([self.light_video_vae] if self.light_video_vae is not None else []),
                 )
             elif offloads_text_encoder:
                 _register_dlo_component_cache(self._dlo_component_cache, self.text_encoder)
@@ -1655,7 +1680,7 @@ class MiniMaxH3Pipeline(
 
     @contextmanager
     def _component_on_device(self, component: nn.Module):
-        if getattr(self, "_model_cpu_offload_modules", None):
+        if getattr(self, "_model_cpu_offload_modules", None) and component is not self.light_video_vae:
             # Sequential offload hooks whole modules (enable_omni_model_cpu_offload
             # registers them on the discovered components, e.g. the real
             # video_vae). Split-residency proxies carry no hook, so unwrap to the
@@ -1668,7 +1693,7 @@ class MiniMaxH3Pipeline(
             with sequential_offload_component(component):
                 yield
             return
-        staged = self._uses_manual_component_offload(component)
+        staged = self._uses_manual_component_offload(component) or component is self.light_video_vae
         try:
             if staged:
                 component.load_to_device()
@@ -2359,13 +2384,17 @@ class MiniMaxH3Pipeline(
         # through the VAE decode peak. Decoding needs only the ViT decoder
         # half of the VAE, so the CNN encoder stays off the device.
         self._release_stage_cache()
-        with self._component_on_device(self.video_vae.decoder_component):
+        decode_vae = self.light_video_vae if self.light_video_vae is not None else self.video_vae
+        # The official video VAE exposes per-half residency proxies; the light
+        # VAE manages its own whole-module residency.
+        decode_component = getattr(decode_vae, "decoder_component", decode_vae)
+        with self._component_on_device(decode_component):
             with current_omni_platform.create_autocast_context(
                 device_type=self.device.type,
                 dtype=self.video_vae.decode_dtype,
                 enabled=True,
             ):
-                video = self.video_vae.decode_latent(video_latent)
+                video = decode_vae.decode_latent(video_latent)
         video = video[..., :height, :width].contiguous()
         with self._component_on_device(self.audio_vae):
             audio = self.audio_vae.decode_latent(audio_latent)

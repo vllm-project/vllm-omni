@@ -8,6 +8,7 @@ from typing import ClassVar
 
 import torch
 from torch import nn
+from vllm.logger import init_logger
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
@@ -23,7 +24,9 @@ from .pipeline_minimax_h3 import (
     _prepare_minimax_h3_video_output,
     get_minimax_h3_post_process_func,
 )
-from .vae import MiniMaxH3AudioVAE, MiniMaxH3VideoVAE
+from .vae import MiniMaxH3AudioVAE, MiniMaxH3LightVideoVAE, MiniMaxH3VideoVAE
+
+logger = init_logger(__name__)
 
 
 def resolve_minimax_h3_decoder_model_path(
@@ -77,6 +80,7 @@ class MiniMaxH3DecoderPipeline(
         model_path = Path(
             resolve_minimax_h3_decoder_model_path(str(od_config.model), od_config.revision, od_config.task_type)
         )
+        self.light_video_vae = None
         self.video_vae = MiniMaxH3VideoVAE(
             str(model_path / "video_vae"),
             device=self.device,
@@ -89,7 +93,17 @@ class MiniMaxH3DecoderPipeline(
             decode_only=True,
             trust_remote_code=od_config.trust_remote_code,
         )
+        light_vae_path = getattr(od_config, "light_vae_path", None)
+        if light_vae_path:
+            if not (Path(light_vae_path) / "decode_config.json").is_file():
+                raise ValueError(f"--light-vae-path {light_vae_path!r} is missing decode_config.json")
+            self.light_video_vae = MiniMaxH3LightVideoVAE(light_vae_path, device=self.device)
         self.vae = self.video_vae
+        if self.light_video_vae is not None:
+            self.light_video_vae.use_tiling = bool(getattr(od_config, "vae_use_tiling", False))
+            self.light_video_vae.set_parallel_size(
+                int(self.parallel_config.vae_patch_parallel_size), mode=self.parallel_config.vae_parallel_mode
+            )
         self.weights_sources = []
         self.setup_diffusion_pipeline_profiler(
             enable_diffusion_pipeline_profiler=od_config.enable_diffusion_pipeline_profiler
@@ -109,6 +123,11 @@ class MiniMaxH3DecoderPipeline(
         for video_latent, audio_latent in zip(payload["video_latents"], payload["audio_latents"], strict=True):
             video_latent = video_latent.to(self.device)
             audio_latent = audio_latent.to(self.device)
+            if payload["preencode_mp4"] and self.light_video_vae is not None:
+                logger.warning_once(
+                    "MiniMax-H3 decoder-only preencoded MP4 output uses the official video VAE; "
+                    "--light-vae-path applies to full decode only."
+                )
             if payload["preencode_mp4"]:
                 videos.append(
                     self.decode_to_mp4(

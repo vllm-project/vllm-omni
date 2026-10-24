@@ -6,7 +6,9 @@ from __future__ import annotations
 
 import importlib
 import json
+import math
 import os
+import time
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from pathlib import Path
@@ -1243,4 +1245,583 @@ class MiniMaxH3AudioVAE(nn.Module):
         return waveform.permute(1, 0, 2).contiguous().float()
 
 
-__all__ = ["MiniMaxH3AudioVAE", "MiniMaxH3VideoVAE"]
+def _light_vae_opt_enabled() -> bool:
+    """Single switch for the Light VAE decode optimizations.
+
+    When enabled (default), the Light VAE applies its persistent weights,
+    8-rank window balancing and FP16 decoder-block weight materialization
+    together. Set ``MINIMAX_H3_LIGHT_VAE_OPT=0`` to run the Light VAE without
+    any of them (for A/B comparisons).
+    """
+    return os.environ.get("MINIMAX_H3_LIGHT_VAE_OPT", "1").strip().lower() not in (
+        "0",
+        "off",
+        "false",
+        "no",
+    )
+
+
+class MiniMaxH3LightVideoVAE(nn.Module, DistributedVaeMixin):
+    """Lightweight decode-only MiniMax-H3 video VAE.
+
+    Wraps the diffusers :class:`AutoencoderKLMiniMaxH3` release (unchanged H3
+    encoder + distilled 26-block video decoder) and exposes the same
+    ``decode_latent`` contract as :class:`MiniMaxH3VideoVAE`, so the H3 pipeline
+    can swap only the decode path while keeping the official VAE for reference
+    encoding. Latents are de-normalized with ``latents_mean``/``latents_std``
+    here (the diffusers ``decode`` consumes raw latents), and the decoded
+    ``(B, C, T, H, W)`` output is returned directly (the pipeline converts it to
+    the channel-last layout itself).
+
+    Decoding is tile-parallel across the SP group: the spatial tile grid is
+    distributed over the ranks (:class:`DistributedVaeExecutor`) and stitched
+    back on rank 0, so every rank decodes roughly ``1/N`` of the tiles instead of
+    the full video.
+    """
+
+    def __init__(
+        self,
+        component_path: str,
+        *,
+        device: torch.device,
+        load_device: torch.device | None = None,
+    ) -> None:
+        super().__init__()
+        from diffusers import AutoencoderKLMiniMaxH3
+
+        self._device_target = device
+        self.config_dict = _load_component_config(component_path)
+        channels = int(self.config_dict["latent_channels"])
+        self._channels = channels
+        self.register_buffer(
+            "_latents_mean",
+            torch.tensor(self.config_dict["latents_mean"], dtype=torch.float32).view(1, channels, 1, 1, 1),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_latents_std",
+            torch.tensor(self.config_dict["latents_std"], dtype=torch.float32).view(1, channels, 1, 1, 1),
+            persistent=False,
+        )
+        initial_device = load_device or device
+        model = AutoencoderKLMiniMaxH3.from_pretrained(
+            component_path,
+            torch_dtype=torch.float16,
+            low_cpu_mem_usage=True,
+        )
+        model.eval()
+        # Decode is not guaranteed to run under an autocast context (for
+        # example in quantized deployments), so normalize every floating
+        # submodule to fp16. Otherwise a residual fp32 Conv3d such as
+        # ``post_quant_conv`` would mix with the fp16 inputs.
+        model.to(torch.float16)
+        # Persist the fp16 decoder-block Linear weights once so the fp16
+        # autocast decode stops re-casting fp32 weights on every call.
+        # Bit-exact vs the autocast path.
+        _fp16w = _light_vae_opt_enabled()
+        if _fp16w:
+            _blocks = getattr(getattr(model, "decoder", None), "transformer_blocks", None)
+            if isinstance(_blocks, torch.nn.ModuleList):
+                _n = 0
+                for _blk in _blocks:
+                    for _m in _blk.modules():
+                        if isinstance(_m, torch.nn.Linear):
+                            _m.weight.data = _m.weight.data.to(torch.float16)
+                            if _m.bias is not None:
+                                _m.bias.data = _m.bias.data.to(torch.float16)
+                            _n += 1
+                logger.info("MiniMax-H3 light VAE: materialized %d decoder-block Linear weights in fp16", _n)
+        _attn_backend = os.environ.get("MINIMAX_H3_LIGHT_VAE_ATTN", "off").strip().lower()
+        if _attn_backend and _attn_backend not in ("off", "none", "0", "native"):
+            try:
+                model.set_attention_backend(_attn_backend)
+                logger.info("MiniMax-H3 light VAE: attention backend=%s", _attn_backend)
+            except Exception as exc:  # pragma: no cover
+                logger.warning_once("MiniMax-H3 light VAE: set_attention_backend(%s) failed: %s", _attn_backend, exc)
+        try:
+            model.enable_tiling()
+        except Exception:  # pragma: no cover
+            logger.warning_once("MiniMax-H3 light VAE: enable_tiling() unavailable")
+        model.to(initial_device)
+        self.model = model
+        self._stager = None
+        if initial_device.type == "cpu" and device.type not in ("cpu", "meta"):
+            self._stager = PinnedModuleStager(model, device, pin_memory=True)
+        self.use_tiling = True
+        try:
+            self._light_settings = json.loads((Path(component_path) / "decode_config.json").read_text())
+        except Exception:
+            self._light_settings = {}
+        _tile_env = os.environ.get("MINIMAX_H3_LIGHT_VAE_TILE", "").strip().lower()
+        self._tile_off = _tile_env in ("off", "none", "0")
+        self._tile_layout = "adaptive"
+        self._tile_explicit = None
+        if _tile_env and not self._tile_off:
+            if _tile_env in ("native", "adaptive"):
+                self._tile_layout = _tile_env
+            elif "," in _tile_env:
+                try:
+                    self._tile_explicit = tuple(int(v) for v in _tile_env.split(","))
+                except Exception:
+                    self._tile_explicit = None
+        self.init_distributed()
+        self._resident = _light_vae_opt_enabled()
+        self._on_device = self._stager is None and initial_device.type == device.type
+        if self._resident:
+            if self._stager is not None:
+                self._stager.load()
+            elif device.type != "cpu":
+                self.model.to(self._device_target)
+            self._on_device = device.type != "cpu"
+
+    def load_to_device(self) -> None:
+        if self._on_device:
+            return
+        if self._stager is not None:
+            self._stager.load()
+        else:
+            self.model.to(self._device_target)
+        self._on_device = True
+
+    def offload_to_cpu(self) -> None:
+        if self._resident:
+            return
+        if not self._on_device or self._device_target.type == "cpu":
+            return
+        if self._stager is not None:
+            self._stager.offload()
+        else:
+            self.model.to("cpu")
+        self._on_device = False
+
+    def set_omni_component_cache(self, cache: Any) -> None:
+        self._omni_component_cache = cache
+        if self._stager is not None:
+            self._stager.set_cache_retention(cache)
+
+    @staticmethod
+    def _profile_enabled() -> bool:
+        return os.environ.get("MINIMAX_H3_VAE_PROFILE", "0").strip().lower() in ("1", "true", "yes")
+
+    @staticmethod
+    def _profile_stamp(enabled: bool) -> float:
+        if not enabled:
+            return 0.0
+        torch.accelerator.synchronize()
+        return time.perf_counter()
+
+    # -- batched, tile-parallel decode --------------------------------------
+    def _tile_geometry(self, frames: int, height: int, width: int):
+        m = self.model
+        if self._tile_explicit is not None:
+            return self._tile_explicit
+        if self._tile_layout == "native":
+            return (
+                m.tile_sample_min_height,
+                m.tile_sample_min_width,
+                m.tile_sample_min_overlap_height,
+                m.tile_sample_min_overlap_width,
+            )
+        s = self._light_settings
+        if frames == 1:
+            return (
+                s["image_tile_size"],
+                s["image_long_axis_tile"],
+                s["student_tile_overlap"],
+                s["student_tile_overlap"],
+            )
+        short, long = s["student_tile_size"], s["student_long_axis_tile"]
+        ov_short, ov_long = s["student_short_axis_overlap"], s["student_long_axis_overlap"]
+        if height < width:
+            return short, long, ov_short, ov_long
+        if height > width:
+            return long, short, ov_long, ov_short
+        ov = max(ov_short, ov_long)
+        return short, short, ov, ov
+
+    def _split_tiles(self, length: int, size: int, overlap: int):
+        m = self.model
+        if self._tile_off:
+            return [0], [length], []
+        if self._tile_layout == "native" and self._tile_explicit is None:
+            return m._split_tiles(length, size, overlap)
+        # adaptive (trained LightX2V) splitter
+        if length <= size + overlap:
+            return [0], [length], []
+        ratio = int(m.spatial_compression_ratio)
+        count = math.ceil(length / size)
+        required = math.ceil((length + overlap * (count - 1)) / count / ratio) * ratio
+        if required > size + overlap:
+            required = size
+        size = max(size, required)
+        while size * count - overlap * (count - 1) < length:
+            count += 1
+        overlaps = [overlap] * (count - 1)
+        remaining = size * count - sum(overlaps) - length
+        for i in range(remaining // ratio):
+            overlaps[i % (count - 1)] += ratio
+        starts = [0]
+        for value in overlaps:
+            starts.append(starts[-1] + size - value)
+        return starts, [size] * count, overlaps
+
+    def _stitch_tiles(self, tiles, height_overlaps, width_overlaps):
+        # Match the reference blend order but write directly into one canvas to
+        # avoid repeatedly copying complete rows and videos through torch.cat.
+        sample = tiles[0][0]
+        row_heights = [
+            row[0].shape[-2] - (height_overlaps[i] if i < len(tiles) - 1 else 0) for i, row in enumerate(tiles)
+        ]
+        column_widths = [
+            tile.shape[-1] - (width_overlaps[j] if j < len(tiles[0]) - 1 else 0) for j, tile in enumerate(tiles[0])
+        ]
+        canvas = sample.new_empty((*sample.shape[:-2], sum(row_heights), sum(column_widths)))
+        out_y = 0
+        for i, row in enumerate(tiles):
+            out_x = 0
+            for j, tile in enumerate(row):
+                if i and height_overlaps[i - 1] > 0:
+                    tile = self.model._blend(tiles[i - 1][j], tile, height_overlaps[i - 1], dim=-2)
+                if j and width_overlaps[j - 1] > 0:
+                    tile = self.model._blend(row[j - 1], tile, width_overlaps[j - 1], dim=-1)
+                if i < len(tiles) - 1 and height_overlaps[i] > 0:
+                    tile = tile[..., : -height_overlaps[i], :]
+                if j < len(row) - 1 and width_overlaps[j] > 0:
+                    tile = tile[..., :, : -width_overlaps[j]]
+                canvas[..., out_y : out_y + tile.shape[-2], out_x : out_x + tile.shape[-1]].copy_(tile)
+                out_x += tile.shape[-1]
+            out_y += row_heights[i]
+        return canvas
+
+    def _gather_tiles(self, dec, local, n, group):
+        size = dist.get_world_size(group)
+        counts = [len(range(r, n, size)) for r in range(size)]
+        maxc = max(counts)
+        with self.distributed_executor.sync_errors("light VAE tile gather allocation"):
+            if dec.shape[0] != counts[dist.get_rank(group)]:
+                raise RuntimeError(
+                    f"local Light VAE tile count changed: got {dec.shape[0]}, expected {counts[dist.get_rank(group)]}"
+                )
+            if dec.shape[0] < maxc:
+                pad = dec.new_zeros((maxc - dec.shape[0],) + tuple(dec.shape[1:]))
+                dec = torch.cat([dec, pad], dim=0)
+            dec = dec.contiguous()
+            storage = torch.empty((size, *dec.shape), device=dec.device, dtype=dec.dtype)
+            buffers = [storage[r] for r in range(size)]
+        dist.all_gather(buffers, dec, group=group)
+        out = [None] * n
+        for r in range(size):
+            for k, i in enumerate(range(r, n, size)):
+                out[i] = storage[r, k : k + 1]
+        return out
+
+    @staticmethod
+    def _window_balance_enabled() -> bool:
+        return _light_vae_opt_enabled()
+
+    @staticmethod
+    def _window_batch_cap() -> int:
+        try:
+            return max(1, int(os.environ.get("MINIMAX_H3_LIGHT_VAE_WINDOW_BATCH", "6")))
+        except Exception:
+            return 6
+
+    def _sync_decode_errors(self, stage: str, distributed: bool):
+        if not distributed:
+            return nullcontext()
+        return self.distributed_executor.sync_errors(stage)
+
+    def _temporal_plan(self, latent_t: int):
+        m = self.model
+        tcs = int(m.tokens_chunk_size)
+        drop = int(m.config.token_drop)
+        tratio = int(m.temporal_compression_ratio)
+        overlap = int(m.token_overlap)
+        num_tokens = latent_t + drop
+        pad = (-num_tokens) % tcs
+        num_chunks = (num_tokens + pad) // tcs - int(drop > 0)
+        if num_chunks <= 0:
+            return None
+        padded_t = num_tokens + pad
+        for w in range(num_chunks):
+            if min(tcs + overlap, padded_t - w * tcs) != tcs + overlap:
+                return None
+        return dict(
+            T=latent_t,
+            tcs=tcs,
+            drop=drop,
+            tratio=tratio,
+            overlap=overlap,
+            chunk_num_frames=tcs * tratio,
+            num_chunks=num_chunks,
+            pad_tokens=pad,
+            frame_pre_padding=int(m.frame_pre_padding),
+            frame_overlap=int(m.frame_overlap),
+            intra_tail=int(m.config.clip_length % tratio),
+        )
+
+    @staticmethod
+    def _pad_temporal(z: torch.Tensor, plan) -> torch.Tensor:
+        if plan["pad_tokens"] > 0:
+            return torch.cat([z, z[:, :, -1:].repeat(1, 1, plan["pad_tokens"], 1, 1)], dim=2)
+        return z
+
+    @staticmethod
+    def _window_latent(zpad: torch.Tensor, ranges, tile_id: int, window: int, plan) -> torch.Tensor:
+        y0, y1, x0, x1 = ranges[tile_id]
+        tile = zpad[..., y0:y1, x0:x1]
+        start = window * plan["tcs"]
+        return tile[:, :, start : start + plan["tcs"] + plan["overlap"]]
+
+    def _gather_window_clips(self, local_clips, tasks, assigned, size, rank, group, n, w_count):
+        counts = [len(assigned[r]) for r in range(size)]
+        maxc = max(counts)
+        with self.distributed_executor.sync_errors("light VAE window gather allocation"):
+            local = torch.cat(local_clips, dim=0) if len(local_clips) > 1 else local_clips[0]
+            if local.shape[0] < maxc:
+                pad = local.new_zeros((maxc - local.shape[0],) + tuple(local.shape[1:]))
+                local = torch.cat([local, pad], dim=0)
+            local = local.contiguous()
+            storage = torch.empty((size, *local.shape), device=local.device, dtype=local.dtype)
+            buffers = [storage[r] for r in range(size)]
+        dist.all_gather(buffers, local, group=group)
+        out = [None] * len(tasks)
+        for r in range(size):
+            for k, (t, w) in enumerate(assigned[r]):
+                out[t * w_count + w] = storage[r, k : k + 1]
+        return out
+
+    def _fold_window_clips(self, clips, plan) -> torch.Tensor:
+        m = self.model
+        just_first = int(plan["drop"] > 0) + 1
+        decoded = []
+        overlap = None
+        pre = plan["frame_pre_padding"]
+        fo = plan["frame_overlap"]
+        cnf = plan["chunk_num_frames"]
+        for clip in clips:
+            for j in range(just_first):
+                frame_start = j * cnf
+                chunk = clip[:, :, frame_start : frame_start + cnf]
+                chunk = chunk[:, :, pre:]
+                if j == 0:
+                    if overlap is not None:
+                        chunk = m._blend(overlap, chunk, fo, dim=-3)
+                    decoded.append(chunk)
+                else:
+                    overlap = chunk
+        if overlap is not None:
+            decoded.append(overlap)
+        out = torch.cat(decoded, dim=2)
+        if plan["pad_tokens"] > 0:
+            tcs = plan["tcs"]
+            tratio = plan["tratio"]
+            intra = plan["intra_tail"]
+            num_tokens_before_pad = plan["T"]
+            pad_frames = sum(
+                intra if intra and (num_tokens_before_pad + k) % tcs == 0 else tratio for k in range(plan["pad_tokens"])
+            )
+            out = out[:, :, :-pad_frames]
+        return out
+
+    def _decode_video_balanced(self, z, ys, hs, y_ov, xs, ws, x_ov, group, size, rank, profile, started):
+        m = self.model
+        plan = self._temporal_plan(int(z.shape[2]))
+        if plan is None:
+            return None
+        ratio = int(m.spatial_compression_ratio)
+        zpad = self._pad_temporal(z, plan)
+        ranges = [
+            (y // ratio, y // ratio + h // ratio, x // ratio, x // ratio + w // ratio)
+            for y, h in zip(ys, hs)
+            for x, w in zip(xs, ws)
+        ]
+        n = len(ranges)
+        w_count = plan["num_chunks"]
+        tasks = [(t, w) for t in range(n) for w in range(w_count)]
+        assigned = [[] for _ in range(size)]
+        for idx, task in enumerate(tasks):
+            assigned[idx % size].append(task)
+        mine = assigned[rank]
+        dtype = next(m.decoder.parameters()).dtype
+        cap = self._window_batch_cap()
+        prev = m.use_tiling
+        m.use_tiling = False
+        local_clips = []
+        try:
+            with self._sync_decode_errors("light VAE window decode", True):
+                pos = 0
+                for start in range(0, len(mine), cap):
+                    batch = mine[start : start + cap]
+                    packed = torch.cat([self._window_latent(zpad, ranges, t, w, plan) for (t, w) in batch], dim=0)
+                    out = m._decode_clip(packed.to(dtype=dtype))
+                    for k in range(out.shape[0]):
+                        local_clips.append(out[k : k + 1])
+                        pos += 1
+        finally:
+            m.use_tiling = prev
+        decoder_done = self._profile_stamp(profile)
+        all_clips = self._gather_window_clips(local_clips, tasks, assigned, size, rank, group, n, w_count)
+        gather_done = self._profile_stamp(profile)
+        tile_out = []
+        for t in range(n):
+            tile_out.append(self._fold_window_clips([all_clips[t * w_count + w] for w in range(w_count)], plan))
+        rows = [[tile_out[i * len(xs) + j] for j in range(len(xs))] for i in range(len(ys))]
+        output = self._stitch_tiles(rows, y_ov, x_ov)
+        stitch_done = self._profile_stamp(profile)
+        if profile:
+            self._last_decode_profile = {
+                "rank": rank,
+                "world_size": size,
+                "latent_shape": list(z.shape),
+                "output_shape_fp16": list(output.shape),
+                "tiles": n,
+                "local_tiles": len(mine),
+                "decoder_batch": min(cap, len(mine)),
+                "balanced": True,
+                "split_pack_ms": 0.0,
+                "decoder_ms": (decoder_done - started) * 1000,
+                "gather_ms": (gather_done - decoder_done) * 1000,
+                "stitch_ms": (stitch_done - gather_done) * 1000,
+            }
+        return output
+
+    def _decode_video(self, z: torch.Tensor) -> torch.Tensor:
+        profile = self._profile_enabled()
+        started = self._profile_stamp(profile)
+        m = self.model
+        # This decode-only VAE is not part of the module discovery used by the
+        # distributed layer-wise offload backend, and the pinned stager's
+        # device binding can go stale when weights are re-materialized after
+        # construction. Trust the real tensor device and stage before decoding.
+        if self._device_target.type != "cpu" and next(m.decoder.parameters()).device != self._device_target:
+            m.to(self._device_target)
+        ratio = int(m.spatial_compression_ratio)
+        height = int(z.shape[-2]) * ratio
+        width = int(z.shape[-1]) * ratio
+        th, tw, oh, ow = self._tile_geometry(int(z.shape[2]), height, width)
+        ys, hs, y_ov = self._split_tiles(height, th, oh)
+        xs, ws, x_ov = self._split_tiles(width, tw, ow)
+        tiles = [
+            z[..., y // ratio : y // ratio + h // ratio, x // ratio : x // ratio + w // ratio]
+            for y, h in zip(ys, hs)
+            for x, w in zip(xs, ws)
+        ]
+        n = len(tiles)
+        group, size, rank = None, 1, 0
+        if self.is_distributed_enabled():
+            group = self.distributed_executor.group
+            size = dist.get_world_size(group)
+            rank = dist.get_rank(group)
+        distributed = group is not None and size > 1 and n >= size
+        if distributed and self._window_balance_enabled() and int(z.shape[2]) >= m.tokens_chunk_size + m.token_overlap:
+            balanced = self._decode_video_balanced(z, ys, hs, y_ov, xs, ws, x_ov, group, size, rank, profile, started)
+            if balanced is not None:
+                return balanced
+        local = list(range(rank, n, size)) if distributed else list(range(n))
+        prev = m.use_tiling
+        m.use_tiling = False  # tiles are pre-cut; avoid a second spatial split
+        try:
+            with self._sync_decode_errors("light VAE tile decode", distributed):
+                packed = torch.cat([tiles[i] for i in local], dim=0)
+                single = packed.shape[2] == 1
+                if single:
+                    packed = packed.expand(
+                        -1, -1, int(self._light_settings["image_context_tokens"]), -1, -1
+                    ).contiguous()
+                dtype = next(m.decoder.parameters()).dtype
+                packed = packed.to(dtype=dtype)
+                packed_done = self._profile_stamp(profile)
+                if packed.shape[2] < m.tokens_chunk_size + m.token_overlap:
+                    dec = m._decode_clip(packed)
+                    start = (
+                        int(self._light_settings["image_context_output_phase"]) if single else int(m.frame_pre_padding)
+                    )
+                    dec = dec[:, :, start : start + 1] if single else dec[:, :, start:]
+                else:
+                    dec = m._decode(packed)
+        finally:
+            m.use_tiling = prev
+        decoder_done = self._profile_stamp(profile)
+        if distributed:
+            gathered = self._gather_tiles(dec, local, n, group)
+        else:
+            gathered = list(dec.split(1, dim=0))
+        gather_done = self._profile_stamp(profile)
+        rows = [[gathered[i * len(xs) + j] for j in range(len(xs))] for i in range(len(ys))]
+        output = self._stitch_tiles(rows, y_ov, x_ov)
+        stitch_done = self._profile_stamp(profile)
+        if profile:
+            self._last_decode_profile = {
+                "rank": rank,
+                "world_size": size,
+                "latent_shape": list(z.shape),
+                "output_shape_fp16": list(output.shape),
+                "tiles": n,
+                "local_tiles": len(local),
+                "decoder_batch": int(packed.shape[0]),
+                "split_pack_ms": (packed_done - started) * 1000,
+                "decoder_ms": (decoder_done - packed_done) * 1000,
+                "gather_ms": (gather_done - decoder_done) * 1000,
+                "stitch_ms": (stitch_done - gather_done) * 1000,
+            }
+        return output
+
+    @torch.inference_mode()
+    def decode_latent(self, latent: torch.Tensor) -> torch.Tensor:
+        _dump = os.environ.get("MINIMAX_H3_LIGHT_VAE_DUMP")
+        if _dump and not os.path.exists(_dump):
+            try:
+                if (not dist.is_initialized()) or dist.get_rank() == 0:
+                    torch.save({"latent": latent.detach().cpu()}, _dump)
+            except Exception:
+                pass
+        profile = self._profile_enabled()
+        started = self._profile_stamp(profile)
+        mean = self._latents_mean.to(device=latent.device, dtype=latent.dtype)
+        std = self._latents_std.to(device=latent.device, dtype=latent.dtype)
+        z = latent * std + mean
+        latent_done = self._profile_stamp(profile)
+        # The reference keeps decode/blend/stitch in fp16 and promotes only the
+        # assembled result. This also halves tile-parallel communication.
+        frames = self._decode_video(z).float()
+        cast_done = self._profile_stamp(profile)
+        if frames.ndim != 5:
+            raise ValueError(f"unexpected decoded video shape {tuple(frames.shape)}")
+        _img_std = frames.new_tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1, 1)
+        _img_mean = frames.new_tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1, 1)
+        frames = frames * _img_std + _img_mean
+        denorm_done = self._profile_stamp(profile)
+        if profile:
+            record = dict(getattr(self, "_last_decode_profile", {}))
+            record.update(
+                latent_denorm_ms=(latent_done - started) * 1000,
+                fp16_to_fp32_ms=0.0,
+                image_denorm_ms=(denorm_done - cast_done) * 1000,
+                internal_total_ms=(denorm_done - started) * 1000,
+            )
+            # `_decode_video` ends on a synchronized timestamp. Derive the cast
+            # cost from its component sum rather than adding another state field.
+            inner_ms = sum(record.get(key, 0.0) for key in ("split_pack_ms", "decoder_ms", "gather_ms", "stitch_ms"))
+            record["fp16_to_fp32_ms"] = max(
+                0.0,
+                record["internal_total_ms"] - record["latent_denorm_ms"] - inner_ms - record["image_denorm_ms"],
+            )
+            logger.info("[LightVAEProfile] %s", json.dumps(record, sort_keys=True))
+        if self._resident:
+            try:
+                rank = dist.get_rank() if dist.is_initialized() else 0
+                peak_alloc = torch.accelerator.max_memory_allocated(self._device_target) / (1024**3)
+                reserved = torch.accelerator.memory_reserved(self._device_target) / (1024**3)
+                logger.info(
+                    "[LightVAEHBM] rank=%d peak_alloc_gib=%.2f reserved_gib=%.2f",
+                    rank,
+                    peak_alloc,
+                    reserved,
+                )
+            except Exception:
+                logger.debug("LightVAEHBM logging unavailable", exc_info=True)
+        return frames.float()
+
+
+__all__ = ["MiniMaxH3AudioVAE", "MiniMaxH3LightVideoVAE", "MiniMaxH3VideoVAE"]

@@ -636,3 +636,24 @@ def test_requested_model_offload_without_backend_uses_resident_components():
     assert actual is expected
     pipeline.text_encoder.load_to_device.assert_called_once_with()
     pipeline.text_encoder.encode_ids.assert_called_once()
+
+
+@pytest.mark.parametrize("with_light_vae", [False, True])
+def test_encode_text_hidden_with_model_offload_and_optional_light_vae(with_light_vae):
+    from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
+
+    pipeline = object.__new__(MiniMaxH3Pipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline._model_cpu_offload_modules = [Mock()]
+    pipeline.light_video_vae = Mock() if with_light_vae else None
+    pipeline.text_encoder = Mock()
+    expected = torch.ones(2, 3)
+    pipeline.text_encoder.return_value = expected
+    input_ids = torch.tensor([1, 2])
+    vision_kwargs = {"pixel_values": torch.ones(1)}
+
+    actual = pipeline._encode_text_hidden(input_ids, vision_kwargs)
+
+    assert actual is expected
+    pipeline.text_encoder.assert_called_once_with(input_ids, **vision_kwargs)
+    pipeline.text_encoder.encode_ids.assert_not_called()
