@@ -15,7 +15,6 @@ import copy
 import fcntl
 import importlib
 import json
-import multiprocessing as mp
 import os
 import tempfile
 import time
@@ -775,18 +774,10 @@ def extract_stage_metadata_from_omni_stage_config(
 
 
 def prepare_engine_environment() -> None:
-    """One-time global setup: load plugins, set multiprocessing spawn method."""
+    """One-time global setup: load plugins. The multiprocessing start method is left to get_mp_context()."""
     from vllm_omni.plugins import load_omni_general_plugins
 
     load_omni_general_plugins()
-
-    if os.environ.get("VLLM_WORKER_MULTIPROC_METHOD") != "spawn":
-        os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-        logger.info("[stage_init] Set VLLM_WORKER_MULTIPROC_METHOD=spawn")
-    try:
-        mp.set_start_method("spawn", force=True)
-    except RuntimeError:
-        pass
 
 
 def _maybe_set_qwen3_omni_moe_backend(
