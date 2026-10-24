@@ -67,6 +67,106 @@ def test_packed_denoise_gate_uses_each_documents_time(monkeypatch, timesteps):
         assert calls[0][1] == 0.04
 
 
+@pytest.mark.parametrize("kv_lengths", [(3, 4), (5, 2), (5, 6)])
+def test_mixed_gate_preserves_metadata_and_independent_kv_boundaries(monkeypatch, kv_lengths):
+    calls, child_metadata = [], []
+
+    def attention(q, k, v, workspace, seq_lens, cuq, cuk, *args):
+        calls.append((cuq.tolist(), cuk.tolist(), seq_lens.tolist(), args[3:6], args[8]))
+        return F.scaled_dot_product_attention(
+            q.transpose(0, 1), k.transpose(0, 1), v.transpose(0, 1), scale=128**-0.5
+        ).transpose(0, 1)
+
+    monkeypatch.setattr(tg, "HAS_FLASHINFER", True)
+    monkeypatch.setattr(tg, "_trtllm_ragged_attention_op", attention)
+    monkeypatch.setattr(tg.TrtllmAttentionImpl, "_get_workspace", classmethod(lambda *_: torch.zeros(1)))
+    q, k, v = _inputs(7, sum(kv_lengths), dtype=torch.float32)
+    opaque = object()
+    metadata = AttentionMetadata(
+        extra={
+            "cu_seqlens_q": torch.tensor([0, 3, 7], dtype=torch.int32),
+            "cu_seqlens_k": torch.tensor([0, kv_lengths[0], sum(kv_lengths)], dtype=torch.int32),
+            "max_seqlen_q": 4,
+            "max_seqlen_k": max(kv_lengths),
+            "valid_kv_length": sum(kv_lengths),
+            "producer_extension": opaque,
+        },
+        cross_kv_rows_validated=True,
+        denoise_progress=(DenoiseProgress(3, 0, 0.9, 10), DenoiseProgress(4, 7, 0.3, 10)),
+    )
+    impl = _impl(backend_kwargs={"skip_softmax_threshold": 0.01, "disabled_until_timestep": 0.6})
+    forward = impl.forward_cuda
+
+    def record_child(q, k, v, child):
+        child_metadata.append(child)
+        return forward(q, k, v, child)
+
+    monkeypatch.setattr(impl, "forward_cuda", record_child)
+    actual = forward(q, k, v, metadata)
+    expected = torch.cat(
+        [
+            F.scaled_dot_product_attention(qi.transpose(1, 2), ki.transpose(1, 2), vi.transpose(1, 2)).transpose(1, 2)
+            for qi, ki, vi in zip(q.split((3, 4), dim=1), k.split(kv_lengths, dim=1), v.split(kv_lengths, dim=1))
+        ],
+        dim=1,
+    )
+    torch.testing.assert_close(actual, expected)
+    assert calls == [
+        ([0, 3], [0, kv_lengths[0]], [kv_lengths[0]], (3, kv_lengths[0], 1), -1.0),
+        ([0, 4], [0, kv_lengths[1]], [kv_lengths[1]], (4, kv_lengths[1], 1), 0.01 * kv_lengths[1]),
+    ]
+    for child, kv_length in zip(child_metadata, kv_lengths):
+        assert child.extra["producer_extension"] is opaque
+        assert child.extra["valid_kv_length"] == kv_length
+        assert child.cross_kv_rows_validated
+        assert child.extra is not metadata.extra
+    assert metadata.extra["cu_seqlens_q"].tolist() == [0, 3, 7]
+    assert metadata.extra["valid_kv_length"] == sum(kv_lengths)
+    assert len(metadata.denoise_progress) == 2
+
+
+def test_mixed_gate_rejects_progress_with_wrong_document_boundaries(monkeypatch):
+    monkeypatch.setattr(tg, "HAS_FLASHINFER", True)
+    monkeypatch.setattr(tg.TrtllmAttentionImpl, "_get_workspace", classmethod(lambda *_: torch.zeros(1)))
+
+    def unexpected_kernel(*args):
+        pytest.fail("Invalid packed boundaries must be rejected before executing attention")
+
+    monkeypatch.setattr(tg, "_trtllm_ragged_attention_op", unexpected_kernel)
+    bounds = torch.tensor([0, 3, 7], dtype=torch.int32)
+    metadata = AttentionMetadata(
+        extra={"cu_seqlens_q": bounds, "cu_seqlens_k": bounds, "max_seqlen_q": 4, "max_seqlen_k": 4},
+        denoise_progress=(DenoiseProgress(2, 0, 0.9, 10), DenoiseProgress(5, 7, 0.3, 10)),
+    )
+    impl = _impl(backend_kwargs={"skip_softmax_threshold": 0.01, "disabled_until_timestep": 0.6})
+    with pytest.raises(ValueError, match="progress.*boundaries"):
+        impl.forward_cuda(*_inputs(7, 7), metadata)
+
+
+def test_denoise_gate_preserves_packed_padding(monkeypatch):
+    calls = []
+
+    def attention(q, k, v, workspace, seq_lens, cuq, cuk, *args):
+        calls.append((q.shape[0], k.shape[0], cuq.tolist(), cuk.tolist(), args[8]))
+        return q.clone()
+
+    monkeypatch.setattr(tg, "HAS_FLASHINFER", True)
+    monkeypatch.setattr(tg, "_trtllm_ragged_attention_op", attention)
+    monkeypatch.setattr(tg.TrtllmAttentionImpl, "_get_workspace", classmethod(lambda *_: torch.zeros(1)))
+    q, k, v = _inputs(5, 7)
+    cuq, cuk = torch.tensor([0, 3], dtype=torch.int32), torch.tensor([0, 4], dtype=torch.int32)
+    metadata = AttentionMetadata(
+        extra={"cu_seqlens_q": cuq, "cu_seqlens_k": cuk, "max_seqlen_q": 3, "max_seqlen_k": 4, "valid_kv_length": 4},
+        packed_padding=PackedPaddingMetadata(3, 4, cuq, cuk),
+        denoise_progress=(DenoiseProgress(3, 0, 0.9, 10), DenoiseProgress(2, 7, 0.3, 10)),
+    )
+    impl = _impl(backend_kwargs={"skip_softmax_threshold": 0.01, "disabled_until_timestep": 0.6})
+    actual = impl.forward_cuda(q, k, v, metadata)
+    torch.testing.assert_close(actual[:, :3], q[:, :3])
+    assert torch.count_nonzero(actual[:, 3:]) == 0
+    assert calls == [(3, 4, [0, 3], [0, 4], -1.0)]
+
+
 @pytest.fixture
 def dispatcher(monkeypatch, tmp_path):
     marker = tmp_path / "kernel"

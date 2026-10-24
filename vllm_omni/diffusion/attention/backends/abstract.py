@@ -223,10 +223,13 @@ class PackedPaddingMetadata:
 
 @dataclass(frozen=True)
 class DenoiseProgress:
-    """Read-only progress for one packed document, including its host-side length.
+    """Read-only progress for one packed document, including its host-side Q length.
 
     ``timestep`` is the model adapter's normalized descending noise time for
     this evaluation; it can change within one sampler step (e.g. Heun).
+    Entries follow packed document order. ``sequence_length`` describes Q;
+    it does not replace ``AttentionMetadata.extra``'s independent Q/KV
+    boundaries or ``packed_padding``'s valid-token layout.
     """
 
     sequence_length: int

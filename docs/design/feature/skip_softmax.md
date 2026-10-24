@@ -152,6 +152,23 @@ call; differing decisions use separate document calls with their own skip
 factors. Step indices and total steps remain request-local, and Heun's second
 evaluation carries its provisional noise time without advancing the step.
 
+The TRTLLM mixed-gate fallback is model-independent: packed `cu_seqlens_q`
+and `cu_seqlens_k` remain the source of truth for document boundaries, and
+Q and KV document lengths may differ. Progress lengths must match the Q
+documents. Each document call preserves the original metadata and extension
+keys, with independently rebased Q/KV boundaries, local maximum lengths,
+and a local `valid_kv_length` when supplied. The caller's metadata is unchanged.
+The ordinary TRTLLM restrictions, including rejection of explicit attention
+masks, still apply; copying metadata does not add support for other attention
+semantics. Outer-layer metadata continues to be handled by the outer layer.
+
+`PackedPaddingMetadata` describes a single real document plus unused suffix
+padding. It retains the original padding-aware execution path, using only the
+real document's timestep, trimming invalid Q/KV rows and zero-filling output
+padding. An optional progress entry for that padding never enables a separate
+attention call. Mixed-gate splitting reads packed offsets on the host; equal
+gate decisions retain the existing packed path.
+
 The default `disabled_until_timestep = 0` is a sentinel rather than a cutoff: the gate is off, the
 timestep is never read, and Skip-Softmax runs on every step. Any positive value enables the gate.
 `disabled_until_timestep = 1.0` therefore also yields no dense steps on a pipeline that publishes
