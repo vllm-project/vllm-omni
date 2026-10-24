@@ -48,6 +48,7 @@ from vllm_omni.engine.stage_init_deadline import wait_for_engine_startup_with_de
 from vllm_omni.engine.stage_init_utils import set_death_signal
 from vllm_omni.errors import client_error_metadata
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.logger import configure_subprocess_logging
 from vllm_omni.metrics.utils import diffusion_exception_metrics
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -697,6 +698,7 @@ class StageDiffusionProc:
         shutdown_requested = False
 
         set_death_signal(signal.SIGTERM)
+        configure_subprocess_logging()
 
         def signal_handler(signum: int, frame: Any) -> None:
             nonlocal shutdown_requested

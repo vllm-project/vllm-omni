@@ -86,6 +86,7 @@ from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunn
 from vllm_omni.diffusion.worker.utils import BaseRunnerOutput, BatchRunnerOutput
 from vllm_omni.engine.stage_init_utils import set_death_signal
 from vllm_omni.inputs.data import OmniInteractionPrompt
+from vllm_omni.logger import configure_subprocess_logging
 from vllm_omni.lora.request import LoRARequest
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.profiler import OmniTorchProfilerWrapper, create_omni_profiler
@@ -1826,6 +1827,7 @@ class WorkerProc:
         signal.signal(signal.SIGINT, signal_handler)
 
         set_death_signal(signal.SIGTERM)
+        configure_subprocess_logging()
 
         _setup_diffusion_worker_proc_title_and_log_prefix(
             enable_ep=od_config.parallel_config.enable_expert_parallel,
