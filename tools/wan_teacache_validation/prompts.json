@@ -1,0 +1,42 @@
+{
+  "calibration": [
+    "A red sailboat glides across a calm lake at sunrise.",
+    "A brown dog runs through a grassy meadow.",
+    "A waterfall flows between mossy rocks.",
+    "A chef chops carrots in a bright kitchen.",
+    "A cyclist rides down a quiet city street.",
+    "A butterfly flutters above purple flowers.",
+    "Snow falls gently on a wooden cabin.",
+    "A steam train travels across a stone bridge.",
+    "A dancer turns slowly in a sunlit studio.",
+    "Golden wheat sways in a summer breeze.",
+    "A cat stretches on a windowsill.",
+    "Ocean waves roll onto a sandy beach.",
+    "A potter shapes a clay bowl on a spinning wheel.",
+    "A hummingbird hovers near a red flower.",
+    "A small robot walks across a laboratory floor.",
+    "Clouds drift over a mountain valley.",
+    "A horse trots along a wooden fence.",
+    "A fountain sprays water in a town square.",
+    "A child flies a colorful kite in a park.",
+    "A fox walks through an autumn forest.",
+    "A canoe moves slowly along a misty river.",
+    "A glass marble rolls across a tiled floor.",
+    "A librarian turns the pages of an old book.",
+    "A windmill rotates above green fields."
+  ],
+  "validation": [
+    "A yellow tram passes through a rainy European street.",
+    "Two penguins waddle across fresh snow.",
+    "A violinist plays beside an open window.",
+    "A sea turtle swims through clear blue water.",
+    "A white scarf flutters on a clothesline.",
+    "A red panda climbs a leafy tree branch.",
+    "A baker pours flour into a mixing bowl.",
+    "A hot air balloon floats above a desert.",
+    "A silver fish swims among aquarium plants.",
+    "A person folds a paper crane on a desk.",
+    "Sunlight flickers through palm leaves in the wind.",
+    "A toy truck drives around a circular track."
+  ]
+}
