@@ -162,6 +162,7 @@ from vllm_omni.outputs.output_metadata import DiffusionMetadataMapping, Diffusio
 from vllm_omni.utils.audio import audio_chunk_pcm_bytes, audio_chunk_sample_rate
 from vllm_omni.utils.speakers import (
     get_supported_speakers_from_hf_config,
+    set_prompt_speaker,
     validate_requested_speaker,
 )
 
@@ -1139,8 +1140,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         speaker = getattr(request, "voice", None) or getattr(request, "speaker", None)
         normalized = validate_requested_speaker(speaker, self._get_supported_speakers())
         if normalized is not None:
-            prompt_additional_information = self._ensure_prompt_additional_information(engine_prompt)
-            prompt_additional_information["speaker"] = [normalized]
+            set_prompt_speaker(engine_prompt, normalized)
 
         language = getattr(request, "language", None)
         if language is not None and isinstance(language, str) and language.strip():

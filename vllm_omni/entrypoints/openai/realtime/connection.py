@@ -26,7 +26,12 @@ from openai.types.chat import (
 )
 from openai.types.chat.chat_completion_content_part_image_param import ImageURL
 from openai.types.chat.chat_completion_content_part_input_audio_param import InputAudio
+from openai.types.realtime.realtime_audio_config_output import Voice
 from openai.types.realtime.realtime_audio_input_turn_detection import SemanticVad, ServerVad
+from openai.types.realtime.realtime_response_create_audio_output import OutputVoiceID
+from openai.types.realtime.realtime_response_create_mcp_tool import RealtimeResponseCreateMcpTool
+from openai.types.realtime.realtime_tools_config_union import Mcp
+from openai.types.responses.tool_choice_mcp import ToolChoiceMcp
 from pydantic import TypeAdapter
 from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionNamedToolChoiceParam,
@@ -35,8 +40,7 @@ from vllm.entrypoints.openai.chat_completion.protocol import (
 )
 from vllm.exceptions import VLLMValidationError
 from vllm.logger import init_logger
-from vllm.sampling_params import RequestOutputKind, SamplingParams, StructuredOutputsParams
-from vllm.tool_parsers import ToolParserManager
+from vllm.sampling_params import RequestOutputKind, SamplingParams
 
 if TYPE_CHECKING:
     from vllm.inputs import EngineInput
@@ -51,6 +55,8 @@ from vllm_omni.engine.duplex.turn_detection import (
     TurnDetector,
 )
 from vllm_omni.entrypoints.async_omni import AsyncOmni
+from vllm_omni.entrypoints.openai.audio_utils_mixin import AudioMixin
+from vllm_omni.entrypoints.openai.protocol.audio import CreateAudio
 from vllm_omni.entrypoints.openai.realtime.session import (
     ActiveResponse,
     AudioFullDuplexSessionState,
@@ -61,14 +67,24 @@ from vllm_omni.entrypoints.openai.realtime.session import (
 )
 from vllm_omni.utils.audio import audio_chunk_sample_rate
 from vllm_omni.utils.audio_resample import StreamingAudioResampler
+from vllm_omni.utils.speakers import (
+    get_supported_speakers_from_hf_config,
+    set_prompt_speaker,
+    validate_requested_speaker,
+)
 
 logger = init_logger(__name__)
 
 _CLIENT_EVENT_ADAPTER: TypeAdapter[types.RealtimeClientEvent] = TypeAdapter(types.RealtimeClientEvent)
 
+_MCP_UNSUPPORTED_MESSAGE = "Remote MCP tools are not supported"
+
 # The Realtime PCM contract is mono signed PCM16 at 24 kHz.
 SAMPLE_RATE_HZ = 24000
 BYTES_PER_SAMPLE_PCM16 = 2
+# OpenAI's Realtime contract allows playback speed in this range.
+MIN_OUTPUT_SPEED = 0.25
+MAX_OUTPUT_SPEED = 1.5
 # Application safety caps for one append and the complete pending input turn.
 MAX_AUDIO_APPEND_BYTES = 15 * 1024 * 1024
 MAX_INPUT_AUDIO_BUFFER_BYTES = 64 * 1024 * 1024
@@ -84,8 +100,49 @@ def _is_prompt_limit_error(exc: VLLMValidationError) -> bool:
     return exc.parameter in {"input_text", "input_tokens"}
 
 
-class _UnsupportedAudioFormatError(ValueError):
+class _RealtimeRequestError(ValueError):
+    """Realtime error carrying the OpenAI error-envelope fields."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str | None,
+        param: str | None = None,
+        client_event: bool = True,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.param = param
+        self.client_event = client_event
+
+
+class _UnsupportedAudioFormatError(_RealtimeRequestError):
     """The Realtime endpoint only accepts mono PCM16 audio at 24 kHz."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message, code="unsupported_audio_format")
+
+
+class _RealtimeVoiceError(_RealtimeRequestError):
+    """Voice selection rejected in the OpenAI Realtime error shape."""
+
+
+class _InvalidOutputSpeedError(_RealtimeRequestError):
+    """The requested playback speed is outside the supported range."""
+
+    def __init__(self, speed: float) -> None:
+        if speed > MAX_OUTPUT_SPEED:
+            code = "decimal_above_max_value"
+            detail = f"decimal above maximum value. Expected a value <= {MAX_OUTPUT_SPEED}, but got {speed} instead."
+        else:
+            code = "decimal_below_min_value"
+            detail = f"decimal below minimum value. Expected a value >= {MIN_OUTPUT_SPEED}, but got {speed} instead."
+        super().__init__(
+            f"Invalid 'session.audio.output.speed': {detail}",
+            code=code,
+            param="session.audio.output.speed",
+        )
 
 
 @dataclass(slots=True)
@@ -97,6 +154,8 @@ class _ResolvedResponse:
     tools: list[Any] | None
     tool_choice: Any
     metadata: Any
+    reasoning_effort: str | None = None
+    voice: str | None = None
 
 
 class OpenAIFullDuplexConnection:
@@ -108,8 +167,6 @@ class OpenAIFullDuplexConnection:
         engine: AsyncOmni,
         model_name: str,
         chat_handler: Any,
-        tool_call_parser: str | None = None,
-        enable_auto_tool_choice: bool = False,
         vad_backend_provider: SileroVADBackendProvider | None = None,
         semantic_vad_backend_provider: SmartTurnBackendProvider | None = None,
     ):
@@ -118,11 +175,11 @@ class OpenAIFullDuplexConnection:
         self.model_name = model_name
         self.chat_handler = chat_handler
         self._tokenizer = chat_handler.renderer.get_tokenizer()
-        self._tool_call_parser_name = tool_call_parser if enable_auto_tool_choice else None
         self._vad_backend_provider = vad_backend_provider
         self._semantic_vad_backend_provider = semantic_vad_backend_provider
         self._turn_detector: TurnDetector | None = None
         self._speech_item_id: str | None = None
+        self._supported_speakers = self._load_supported_speakers()
 
         self.session = AudioFullDuplexSessionState()
         self.session.config.model = model_name
@@ -219,9 +276,17 @@ class OpenAIFullDuplexConnection:
         s = self.session
         candidate_config = merge_session_config(s.config, event.session)
         try:
-            candidate_config = self._sanitize_session_config(candidate_config, s.config)
-        except _UnsupportedAudioFormatError as exc:
-            await self._send_error(str(exc), "unsupported_audio_format", event_id=event.event_id)
+            candidate_config = self._sanitize_session_config(candidate_config)
+        except _RealtimeRequestError as exc:
+            await self._send_error(
+                str(exc),
+                exc.code,
+                event_id=event.event_id if exc.client_event else None,
+                param=exc.param,
+            )
+            return
+        except ValueError as exc:
+            await self._send_error(str(exc), "invalid_request_error", event_id=event.event_id)
             return
         try:
             turn_detection_config = self._build_turn_detection_config(candidate_config)
@@ -244,7 +309,11 @@ class OpenAIFullDuplexConnection:
             if turn_detector.config.type == turn_detection_config.type:
                 turn_detector.reconfigure(turn_detection_config)
             else:
-                turn_detector.reset()
+                # The replacement detector has not seen the current onset, so
+                # drop the item id owned by the detector being replaced;
+                # otherwise a later onset cannot report speech_started and the
+                # buffered speech never commits.
+                self._reset_turn_detection()
                 turn_detector = turn_detection_config.build_detector(
                     self._vad_backend_provider,
                     self._semantic_vad_backend_provider,
@@ -257,18 +326,14 @@ class OpenAIFullDuplexConnection:
     def _sanitize_session_config(
         self,
         config: types.RealtimeSessionCreateRequest,
-        previous: types.RealtimeSessionCreateRequest,
     ) -> types.RealtimeSessionCreateRequest:
         """Normalize supported session settings while keeping Pydantic models intact."""
         sanitized = config.model_copy(deep=True)
 
-        if sanitized.model != self.model_name:
-            sanitized.model = previous.model
+        # session.update cannot change model; like OpenAI, echo the connection's model.
+        sanitized.model = self.model_name
 
-        if sanitized.tools is not None:
-            sanitized.tools = [tool for tool in sanitized.tools if getattr(tool, "type", None) != "mcp"]
-        if getattr(sanitized.tool_choice, "type", None) == "mcp":
-            sanitized.tool_choice = previous.tool_choice
+        self._reject_mcp(sanitized, prefix="session")
 
         audio = sanitized.audio
         if audio is None:
@@ -284,13 +349,47 @@ class OpenAIFullDuplexConnection:
 
         audio_output = audio.output
         if audio_output is not None:
-            if audio_output.speed not in (None, 1):
-                previous_output = previous.audio.output if previous.audio is not None else None
-                audio_output.speed = previous_output.speed if previous_output is not None else None
+            if audio_output.speed is not None:
+                audio_output.speed = self._validate_output_speed(audio_output.speed)
             if not self._is_pcm16_24khz_format(audio_output.format):
                 raise _UnsupportedAudioFormatError("Only 24 kHz PCM16 output audio is supported")
+            if audio_output.voice is not None:
+                audio_output.voice = self._validate_voice(audio_output.voice)
 
         return sanitized
+
+    @staticmethod
+    def _validate_output_speed(speed: float) -> float:
+        """Reject playback speeds outside the Realtime API's supported range."""
+        if not MIN_OUTPUT_SPEED <= speed <= MAX_OUTPUT_SPEED:
+            raise _InvalidOutputSpeedError(speed)
+        return speed
+
+    def _validate_voice(self, voice: Voice | OutputVoiceID, *, prefix: str = "session") -> str | None:
+        """Normalize a voice name, rejecting custom voice references."""
+        if not isinstance(voice, str):
+            raise _RealtimeVoiceError(
+                f"No voice found with id '{voice.id}'.",
+                code=None,
+                param="voice_id",
+                client_event=False,
+            )
+        try:
+            return validate_requested_speaker(voice, self._supported_speakers)
+        except ValueError as exc:
+            raise _RealtimeVoiceError(
+                str(exc),
+                code="invalid_value",
+                param=f"{prefix}.audio.output.voice",
+            ) from exc
+
+    def _load_supported_speakers(self) -> set[str]:
+        """Read the checkpoint's speaker list, falling back to no validation."""
+        try:
+            return get_supported_speakers_from_hf_config(self.engine.model_config.hf_config)
+        except Exception:
+            logger.warning("Could not read the checkpoint's speaker list", exc_info=True)
+            return set()
 
     def _build_turn_detection_config(self, config: types.RealtimeSessionCreateRequest) -> TurnDetectionConfig | None:
         audio_input = config.audio.input if config.audio is not None else None
@@ -360,15 +459,28 @@ class OpenAIFullDuplexConnection:
         return format_type in ("audio/pcm", "pcm16") and rate == SAMPLE_RATE_HZ
 
     @staticmethod
-    def _uses_mcp(config: Any) -> bool:
-        return (
-            any(getattr(tool, "type", None) == "mcp" for tool in (getattr(config, "tools", None) or []))
-            or getattr(getattr(config, "tool_choice", None), "type", None) == "mcp"
-        )
+    def _reject_mcp(
+        config: types.RealtimeSessionCreateRequest | types.RealtimeResponseCreateParams,
+        *,
+        prefix: str,
+    ) -> None:
+        """Reject remote MCP tools, which require server-side support we lack."""
+        if any(isinstance(tool, (Mcp, RealtimeResponseCreateMcpTool)) for tool in config.tools or ()):
+            raise _RealtimeRequestError(
+                _MCP_UNSUPPORTED_MESSAGE,
+                code="unsupported_feature",
+                param=f"{prefix}.tools",
+            )
+        if isinstance(config.tool_choice, ToolChoiceMcp):
+            raise _RealtimeRequestError(
+                _MCP_UNSUPPORTED_MESSAGE,
+                code="unsupported_feature",
+                param=f"{prefix}.tool_choice",
+            )
 
     async def _send_unsupported_mcp(self, event_id: str | None) -> None:
         await self._send_error(
-            "Remote MCP tools are not supported",
+            _MCP_UNSUPPORTED_MESSAGE,
             "unsupported_feature",
             event_id=event_id,
         )
@@ -573,25 +685,31 @@ class OpenAIFullDuplexConnection:
     # ------------------------------------------------------------------ #
 
     @staticmethod
-    def _resolve_tools_and_choice(s: AudioFullDuplexSessionState, response_cfg: Any):
+    def _resolve_tools_and_choice(
+        s: AudioFullDuplexSessionState,
+        response_cfg: types.RealtimeResponseCreateParams | None,
+    ):
         """Per-response overrides win over session.config, same pattern as
         output_modalities/max_output_tokens below."""
         tools = s.config.tools
-        if response_cfg is not None and getattr(response_cfg, "tools", None) is not None:
+        if response_cfg is not None and response_cfg.tools is not None:
             tools = response_cfg.tools
         tool_choice = s.config.tool_choice
-        if response_cfg is not None and getattr(response_cfg, "tool_choice", None) is not None:
+        if response_cfg is not None and response_cfg.tool_choice is not None:
             tool_choice = response_cfg.tool_choice
         return tools, tool_choice
 
-    def _resolve_response(self, response_cfg: Any) -> _ResolvedResponse:
+    def _resolve_response(self, response_cfg: types.RealtimeResponseCreateParams | None) -> _ResolvedResponse:
         s = self.session
+        if response_cfg is not None:
+            self._reject_mcp(response_cfg, prefix="response")
         tools, tool_choice = self._resolve_tools_and_choice(s, response_cfg)
         modalities = s.config.output_modalities
         max_output_tokens = s.config.max_output_tokens
         response_input = None
         instructions = None
         metadata = None
+        response_voice = None
         if response_cfg is not None:
             if response_cfg.output_modalities is not None:
                 modalities = response_cfg.output_modalities
@@ -602,16 +720,28 @@ class OpenAIFullDuplexConnection:
             if response_cfg.conversation == "none":
                 raise ValueError("Out-of-band responses are not supported")
             metadata = response_cfg.metadata
-            audio = getattr(response_cfg, "audio", None)
+            audio = response_cfg.audio
             unsupported = self._unsupported_audio_option(audio)
             if unsupported is not None:
                 raise ValueError(f"{unsupported} is not supported")
-            output = getattr(audio, "output", None) if audio is not None else None
+            output = audio.output if audio is not None else None
             if output is not None and not self._is_pcm16_24khz_format(getattr(output, "format", None)):
                 raise _UnsupportedAudioFormatError("Only 24 kHz PCM16 output audio is supported")
+            if output is not None:
+                voice = output.voice
+                response_voice = self._validate_voice(voice, prefix="response") if voice is not None else None
 
-        if tools and tool_choice != "none" and self._tool_call_parser_name is None:
+        parser_cls = getattr(self.chat_handler, "parser_cls", None)
+        if tools and tool_choice != "none" and (parser_cls is None or parser_cls.tool_parser_cls is None):
             raise ValueError("Function tools require --enable-auto-tool-choice and --tool-call-parser")
+
+        reasoning_effort = s.reasoning_effort
+        if response_cfg is not None and response_cfg.reasoning is not None:
+            reasoning_effort = response_cfg.reasoning.effort
+        if reasoning_effort is not None and "audio" in modalities:
+            # Thinker reasoning tokens are fed to the Talker, which would speak
+            # them. Only honor reasoning for text-only responses.
+            reasoning_effort = None
 
         resolved_input = self._resolve_response_input(response_input) if response_input is not None else None
         return _ResolvedResponse(
@@ -622,6 +752,8 @@ class OpenAIFullDuplexConnection:
             tools=tools,
             tool_choice=tool_choice,
             metadata=metadata,
+            reasoning_effort=reasoning_effort,
+            voice=response_voice,
         )
 
     async def _truncate_prompt_items(self, response: _ResolvedResponse) -> list[types.ConversationItem] | None:
@@ -642,6 +774,8 @@ class OpenAIFullDuplexConnection:
                     tools=response.tools,
                     instructions=response.instructions,
                     items=current_items,
+                    reasoning_effort=response.reasoning_effort,
+                    voice=response.voice,
                     skip_mm_cache=True,
                 )
             except VLLMValidationError as exc:
@@ -714,14 +848,15 @@ class OpenAIFullDuplexConnection:
         s = self.session
         response_cfg = event.response
 
-        if response_cfg is not None and self._uses_mcp(response_cfg):
-            await self._send_unsupported_mcp(event.event_id)
-            return
-
         try:
             response = self._resolve_response(response_cfg)
-        except _UnsupportedAudioFormatError as exc:
-            await self._send_error(str(exc), "unsupported_audio_format", event_id=event.event_id)
+        except _RealtimeRequestError as exc:
+            await self._send_error(
+                str(exc),
+                exc.code,
+                event_id=event.event_id if exc.client_event else None,
+                param=exc.param,
+            )
             return
         except ValueError as exc:
             await self._send_error(str(exc), "invalid_request_error", event_id=event.event_id)
@@ -762,6 +897,8 @@ class OpenAIFullDuplexConnection:
                 tools=response.tools,
                 instructions=response.instructions,
                 items=preflight_items,
+                reasoning_effort=response.reasoning_effort,
+                voice=response.voice,
             )
         except VLLMValidationError as exc:
             await self._send_error(str(exc), "invalid_request_error", event_id=event.event_id)
@@ -897,6 +1034,22 @@ class OpenAIFullDuplexConnection:
         except Exception:
             logger.debug("Failed to send failure response.done for %s", response_id, exc_info=True)
 
+    def _build_response_parser(self, request: ChatCompletionRequest):
+        """Build one combined reasoning/tool parser for this response.
+
+        Mirrors ``OpenAIServingChat._make_parser`` so that response parsing
+        matches the chat-completions path.
+        """
+        parser_cls = getattr(self.chat_handler, "parser_cls", None)
+        if parser_cls is None:
+            return None
+        return parser_cls(
+            self._tokenizer,
+            request.tools,
+            chat_template_kwargs=self.chat_handler._effective_chat_template_kwargs(request),
+            model_config=self.engine.model_config,
+        )
+
     async def _run_response_inner(self, response_id, response, s, active, engine_input: EngineInput):
         previous_item_id = s.items[-1].id if s.items else None
         modalities = response.modalities
@@ -906,26 +1059,26 @@ class OpenAIFullDuplexConnection:
         active.item_id = item_id
         output_index = 0
 
-        converted_tools = self._convert_tools(tools) if tools else []
-        tool_parser = None
-        structural_tag_json = None
-        if converted_tools and tool_choice != "none" and self._tool_call_parser_name:
-            tool_parser_cls = ToolParserManager.get_tool_parser(self._tool_call_parser_name)
-            strict_tools = [ChatCompletionToolsParam(**t) for t in self._convert_tools(tools, strict=True)]
-            tool_parser = tool_parser_cls(self._tokenizer, tools=strict_tools)
-            parser_request = ChatCompletionRequest(
-                messages=[],
-                tools=strict_tools,
-                tool_choice=self._convert_tool_choice(tool_choice),
-                include_reasoning=False,
-                skip_special_tokens=True,
-            )
-            structure_tag = tool_parser.get_structural_tag(
-                parser_request,
-                reasoning=False,
-            )
-            if structure_tag is not None:
-                structural_tag_json = json.dumps(structure_tag.model_dump())
+        parser_tools = [ChatCompletionToolsParam(**tool) for tool in self._convert_tools(tools)] if tools else None
+        prompt_token_ids = engine_input.get("prompt_token_ids") or []
+        parser_request = ChatCompletionRequest(
+            messages=[],
+            tools=parser_tools,
+            # Chat completions rejects tool_choice without tools, but a session
+            # can still carry "auto" after the client clears its tool list.
+            tool_choice=self._convert_tool_choice(tool_choice) if parser_tools else None,
+            include_reasoning=False,
+            skip_special_tokens=True,
+        )
+        # Talker transcripts are speech, not model reasoning, so audio
+        # responses bypass parsing and stream transcript deltas verbatim.
+        parser = None if is_audio else self._build_response_parser(parser_request)
+        if parser is not None:
+            # Let the parsers apply their own request adjustments: engine-based
+            # parsers need special tokens preserved, and the tool parser builds
+            # the structural tag for the configured tool choice.
+            parser_request = parser.adjust_request(parser_request)
+            parser.set_prompt_token_ids(prompt_token_ids)
 
         item_obj = types.RealtimeConversationItemAssistantMessage(
             type="message",
@@ -981,8 +1134,7 @@ class OpenAIFullDuplexConnection:
         total_audio_samples = 0
         audio_resampler: StreamingAudioResampler | None = None
 
-        previous_text = ""
-        previous_token_ids: list[int] = []
+        stream_finished = False
         pending_tool_calls: dict[int, dict[str, Any]] = {}
         next_output_index = 1  # 0 is the message item, reserved above
         # Tool-call markup is control output, so suppress its audio after detection.
@@ -1039,7 +1191,7 @@ class OpenAIFullDuplexConnection:
                 )
             )
 
-        async def handle_tool_parser_delta(delta_msg) -> None:
+        async def handle_parser_delta(delta_msg) -> None:
             nonlocal next_output_index, tool_call_seen
             if delta_msg is None:
                 return
@@ -1100,14 +1252,17 @@ class OpenAIFullDuplexConnection:
         for sp in sampling_params_list:
             if isinstance(sp, SamplingParams):
                 sp.output_kind = RequestOutputKind.DELTA
+                if parser is not None and not parser_request.skip_special_tokens:
+                    sp.skip_special_tokens = False
                 if not thinker_params_configured:
                     if isinstance(max_output_tokens, int):
                         sp.max_tokens = max_output_tokens
-                    if structural_tag_json is not None:
-                        sp.structured_outputs = StructuredOutputsParams(structural_tag=structural_tag_json)
+                    if parser_request.structured_outputs is not None:
+                        sp.structured_outputs = parser_request.structured_outputs
                     thinker_params_configured = True
 
         sampling_params_list = self.chat_handler._fix_audio_stream_output_kinds(sampling_params_list, modalities)
+        output_speed = self.session.output_speed
         gen = self.engine.generate(
             prompt=engine_input,
             request_id=active.request_id,
@@ -1125,13 +1280,15 @@ class OpenAIFullDuplexConnection:
                 if output_type == "audio":
                     audio_chunks = self._extract_audio_deltas(output)
                     if audio_chunks:
+                        sample_rate = audio_chunk_sample_rate(output)
                         if audio_resampler is None:
                             audio_resampler = StreamingAudioResampler(
-                                audio_chunk_sample_rate(output),
+                                sample_rate,
                                 SAMPLE_RATE_HZ,
                             )
                         for chunk in audio_chunks:
-                            await emit_audio_delta(audio_resampler.process(chunk))
+                            stretched = self._stretch_audio_delta(chunk, sample_rate, output_speed)
+                            await emit_audio_delta(audio_resampler.process(stretched))
                     continue
 
                 if output.outputs:
@@ -1153,27 +1310,16 @@ class OpenAIFullDuplexConnection:
                     if output.prompt_token_ids:
                         usage.input_tokens = max(usage.input_tokens, len(output.prompt_token_ids))
 
-                    if tool_parser is not None:
-                        # Additive branch: when no tools are configured for
-                        # this response, tool_parser is None and this whole
-                        # block is skipped -- the plain-text path below is
-                        # untouched.
-                        current_text = previous_text + delta_text
-                        current_token_ids = previous_token_ids + delta_token_ids
-                        delta_msg = None
-                        if delta_text or delta_token_ids:
-                            delta_msg = tool_parser.extract_tool_calls_streaming(
-                                previous_text,
-                                current_text,
-                                delta_text,
-                                previous_token_ids,
-                                current_token_ids,
-                                delta_token_ids,
-                                request=parser_request,
-                            )
-                        previous_text = current_text
-                        previous_token_ids = current_token_ids
-                        await handle_tool_parser_delta(delta_msg)
+                    if parser is not None:
+                        stream_finished = first_out.finish_reason is not None
+                        delta_msg = parser.parse_delta(
+                            delta_text=delta_text,
+                            delta_token_ids=delta_token_ids,
+                            request=parser_request,
+                            prompt_token_ids=prompt_token_ids,
+                            finished=stream_finished,
+                        )
+                        await handle_parser_delta(delta_msg)
                     elif delta_text:
                         await emit_content_delta(delta_text)
 
@@ -1187,16 +1333,20 @@ class OpenAIFullDuplexConnection:
                 except Exception:
                     logger.debug("Error closing generator for %s", active.request_id, exc_info=True)
 
-        if tool_parser is not None and getattr(tool_parser, "engine_based_streaming", False):
-            # finish_streaming() only exists on the newer ParserEngine-based
-            # parsers (engine_based_streaming=True, e.g. Qwen3EngineToolParser)
-            # -- the base ToolParser class legacy regex-based parsers extend
-            # (e.g. Hermes2ProToolParser) don't declare it at all and would
-            # raise AttributeError here (confirmed in production logs).
-            await handle_tool_parser_delta(tool_parser.finish_streaming())
-
         if self._response_cancel_event.is_set():
             cancelled = True
+
+        if parser is not None and not stream_finished and not cancelled:
+            # Engine-based parsers hold back trailing content until the stream
+            # ends; flush it when the engine never reported a finish reason.
+            delta_msg = parser.parse_delta(
+                delta_text="",
+                delta_token_ids=[],
+                request=parser_request,
+                prompt_token_ids=prompt_token_ids,
+                finished=True,
+            )
+            await handle_parser_delta(delta_msg)
 
         if audio_resampler is not None and not cancelled:
             tail = audio_resampler.process(np.empty(0, dtype=np.float32), final=True)
@@ -1703,21 +1853,11 @@ class OpenAIFullDuplexConnection:
     # ------------------------------------------------------------------ #
 
     @staticmethod
-    def _convert_tools(tools: list, *, strict: bool = False) -> list[dict]:
+    def _convert_tools(tools: list) -> list[dict]:
         """RealtimeFunctionTool is flat (type/name/description/parameters);
         apply_chat_template(tools=...) and ChatCompletionToolsParam both
         expect the chat-completions nested shape. MCP tools
         (RealtimeResponseCreateMcpTool) are not handled -- skipped.
-
-        strict=True marks every tool as OpenAI chat-completions "strict"
-        function calling -- RealtimeFunctionTool has no such field of its
-        own, but vLLM's structural-tag builder
-        (get_model_structural_tag/_any_tool_strict) only builds a
-        tool_choice="auto" grammar when at least one tool is strict, so
-        callers building guided-decoding tools need this set. Left False
-        for the copy handed to apply_chat_template, which shouldn't show
-        clients an OpenAI-specific field their own tool declaration never
-        asked for.
         """
         converted = []
         for tool in tools:
@@ -1728,15 +1868,15 @@ class OpenAIFullDuplexConnection:
                 "description": tool.description,
                 "parameters": tool.parameters,
             }
-            if strict:
-                function["strict"] = True
             converted.append({"type": "function", "function": function})
         return converted
 
     @staticmethod
     def _convert_tool_choice(
         tool_choice: Any,
-    ) -> str | ChatCompletionNamedToolChoiceParam:
+    ) -> str | ChatCompletionNamedToolChoiceParam | None:
+        if tool_choice is None:
+            return None
         if isinstance(tool_choice, str):
             return tool_choice
         choice_type = getattr(tool_choice, "type", None)
@@ -1789,6 +1929,8 @@ class OpenAIFullDuplexConnection:
         *,
         instructions: str | None = None,
         items: list[types.ConversationItem] | None = None,
+        reasoning_effort: str | None = None,
+        voice: str | None = None,
         skip_mm_cache: bool = False,
     ) -> EngineInput:
         """Render the effective conversation through normal chat preprocessing."""
@@ -1857,7 +1999,11 @@ class OpenAIFullDuplexConnection:
                 if text:
                     messages.append({"role": "system", "content": text})
 
-        request = ChatCompletionRequest(model=self.model_name, messages=messages)
+        request = ChatCompletionRequest(
+            model=self.model_name,
+            messages=messages,
+            reasoning_effort=reasoning_effort,
+        )
         _, (engine_input,) = await chat_handler._preprocess_chat(
             request,
             messages,
@@ -1869,6 +2015,9 @@ class OpenAIFullDuplexConnection:
         )
         if engine_input.get("prompt_token_ids") is None:
             raise RuntimeError("Realtime renderer did not return prompt token IDs")
+        effective_voice = voice if voice is not None else s.output_voice
+        if effective_voice:
+            set_prompt_speaker(engine_input, effective_voice)
         return engine_input
 
     # ------------------------------------------------------------------ #
@@ -1942,6 +2091,30 @@ class OpenAIFullDuplexConnection:
         pcm16 = (clipped * 32767.0).astype(np.int16)
         return base64.b64encode(pcm16.tobytes()).decode()
 
+    @staticmethod
+    def _stretch_audio_delta(chunk: np.ndarray, sample_rate: int, speed: float) -> np.ndarray:
+        """Time-stretch one audio delta through the shared encoder's speed control.
+
+        Each delta is stretched independently, so chunk boundaries are not
+        phase-continuous. A stateful streaming stretcher is the proper fix.
+        """
+        if speed == 1.0:
+            return chunk
+
+        response = AudioMixin().create_audio(
+            CreateAudio(
+                audio_tensor=np.asarray(chunk, dtype=np.float32),
+                sample_rate=sample_rate,
+                response_format="pcm",
+                speed=speed,
+                base64_encode=False,
+            )
+        )
+        audio_data = response.audio_data
+        assert isinstance(audio_data, bytes)
+        pcm16 = np.frombuffer(audio_data, dtype=np.int16)
+        return pcm16.astype(np.float32) / 32768.0
+
     # ------------------------------------------------------------------ #
     #  Server event emission                                              #
     # ------------------------------------------------------------------ #
@@ -1999,16 +2172,17 @@ class OpenAIFullDuplexConnection:
     async def _send_error(
         self,
         message: str,
-        code: str = "server_error",
+        code: str | None = "server_error",
         event_id: str | None = None,
         *,
         error_type: str = "invalid_request_error",
+        param: str | None = None,
     ) -> None:
         error_data: dict[str, Any] = {
             "type": error_type,
             "code": code,
             "message": message,
-            "param": None,
+            "param": param,
             "event_id": event_id,
         }
         await self._send_event(

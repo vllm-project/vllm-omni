@@ -446,6 +446,39 @@ async def test_server_vad_disable_resets_state_and_commits_pending_audio_with_ne
 
 
 @pytest.mark.asyncio
+async def test_turn_detector_type_switch_mid_utterance_clears_speech_item_id(monkeypatch) -> None:
+    websocket = _FakeWebSocket()
+    provider = SmartTurnBackendProvider()
+    connection = _make_connection(websocket, semantic_vad_backend_provider=provider)
+    detector = _FakeTurnDetector([_speech_started_result()])
+    connection._turn_detector = detector
+    resumed = _FakeSemanticTurnDetector([_speech_started_result()])
+
+    def build_detector(self, backend_provider=None, semantic_backend_provider=None):
+        return resumed
+
+    monkeypatch.setattr(TurnDetectionConfig, "build_detector", build_detector)
+    await connection._handle_audio_append(_audio_event(b"\x00\x00"))
+    started = json.loads(websocket.messages[0])
+    assert started["type"] == "input_audio_buffer.speech_started"
+
+    await connection._handle_session_update(_session_update_event({"type": "semantic_vad", "eagerness": "high"}))
+
+    events = [json.loads(message) for message in websocket.messages]
+    assert events[-1]["type"] == "session.updated"
+    assert detector.reset_count == 1
+    assert connection._speech_item_id is None
+    assert connection.session.input_audio_buffer == bytearray(b"\x00\x00")
+    assert connection._turn_detector is resumed
+
+    await connection._handle_audio_append(_audio_event(b"\x00\x00"))
+
+    restarted = json.loads(websocket.messages[-1])
+    assert restarted["type"] == "input_audio_buffer.speech_started"
+    assert restarted["item_id"] != started["item_id"]
+
+
+@pytest.mark.asyncio
 async def test_semantic_vad_without_interrupt_response_is_rejected_without_mutating_state() -> None:
     websocket = _FakeWebSocket()
     connection = _make_connection(websocket)

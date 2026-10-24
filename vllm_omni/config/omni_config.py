@@ -84,6 +84,8 @@ _NON_STAGE_ENGINE_CLI_FIELDS = frozenset(
         "model_tag",
         "omni",
         "output_modalities",
+        "reasoning_parser",
+        "reasoning_parser_plugin",
         "stage_id",
         "subparser",
         "tokenizer",
