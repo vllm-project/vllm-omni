@@ -81,6 +81,7 @@ for RTX 4090, RTX 5090, DGX Spark, and RTX PRO 6000 Blackwell.
 | [`MiniMaxAI/MiniMax-H3-MUSA.md`](./MiniMaxAI/MiniMax-H3-MUSA.md) | MiniMax H3 T2VA, FL2VA, and Ref2VA on MUSA | 4x MTT S5000 (TP4 Ref2VA profile) |
 | [`krea/Krea-2.md`](./krea/Krea-2.md) | Text-to-image (Turbo + Raw), offline + online, with LoRA | 1x H100 80GB / 1x Intel Arc Pro B70 32GB |
 | [`Kandinsky/Kandinsky6-TI2VA.md`](./Kandinsky/Kandinsky6-TI2VA.md) | Text/image-to-video-and-audio, offline and `/v1/videos` | 1x H100 80GB with CPU offload; 2x H100 for parallel modes |
+| [`kyutai/Moshi-H100.md`](./kyutai/Moshi-H100.md) | Full-duplex speech dialogue over `/v1/realtime?duplex=1` (Moshi) | 1x H100 80GB |
 | [`LTX/LTX-2.md`](./LTX/LTX-2.md) | LTX-2/LTX-2.3 text-to-video and image-to-video with synchronized audio | H200 141GB / 96GB-class GPU / 1x Intel Arc Pro B70 32GB |
 | [`LTX/LTX-2.5.md`](./LTX/LTX-2.5.md) | LTX-2.5-Diffusers: Full/SFT one-stage and distilled two-stage T2V/I2V with synchronized audio | NVIDIA B300; cuDNN-qualified / 1x Intel Arc Pro B70 32GB |
 | [`JD/JoyAI-Image-Edit.md`](./JD/JoyAI-Image-Edit.md) | Text-guided single-image editing | 1x H800 PCIe 80GB |

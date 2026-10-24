@@ -24,6 +24,8 @@ from vllm_omni.model_executor.models.personaplex.duplex.config import (
 )
 from vllm_omni.model_executor.models.personaplex.duplex.policy import (
     AUDIO_SILENCE_FRAME_CNT,
+    INITIAL_AUDIO_TOKEN,
+    MOSHI_DEPFORMER_STEPS,
     SILENCE_TOKENS,
     SINE_TOKENS,
     ZERO_TEXT_TOKEN,
@@ -200,6 +202,30 @@ def _cached_voice_embedding_rows(model_path: str, voice: str) -> int:
     return int(embeddings.shape[0])
 
 
+@lru_cache(maxsize=8)
+def checkpoint_depformer_steps(model_path: str) -> int | None:
+    """Depformer weight sets in the checkpoint's ``model.safetensors`` (header only); None without it."""
+    path = Path(model_path) / "model.safetensors"
+    if not path.is_file():
+        return None
+    from safetensors import safe_open
+
+    with safe_open(str(path), framework="pt") as weights:
+        steps = {key.split(".")[1] for key in weights.keys() if key.startswith("linears.")}
+    return len(steps) or None
+
+
+def is_moshi_checkpoint(model_path: str) -> bool:
+    """Whether ``model_path`` is a kyutai Moshi checkpoint (``kyutai/moshiko-pytorch-bf16``).
+
+    Moshi's depformer predicts only its own 8 codebooks, so ``LMGen`` takes the
+    user's codes as temporal input in the step that receives them, and a
+    conversation starts from the initial-token frame with no voice or persona
+    prompt. PersonaPlex checkpoints train 16 depformer steps (agent and user).
+    """
+    return checkpoint_depformer_steps(model_path) == MOSHI_DEPFORMER_STEPS
+
+
 def personaplex_prefill_slots(model_path: str, voice: str, persona: str) -> int:
     """Scheduler slots the first append of a session needs for the voice + persona prefill.
 
@@ -220,6 +246,11 @@ class PersonaPlexStage0DuplexRuntime:
     inactive and keep their state) and builds their frame inputs in one batched
     pass, and ``prepare_append`` consumes the result. The state a row carries to
     its next frame stays in device buffers indexed by its slot.
+
+    A kyutai Moshi checkpoint (``moshi``) follows ``moshi.server``: the first
+    append is the initial-token frame alone (the session's first 80 ms of audio
+    lands on that step and is not read), and later frames read the user's cb0
+    from the same frame and cb1..7 from the previous one.
     """
 
     def __init__(
@@ -234,6 +265,7 @@ class PersonaPlexStage0DuplexRuntime:
         tokenizer=None,
         voice_loader=None,
         codec_cuda_graphs: bool = False,
+        moshi: bool | None = None,
     ) -> None:
         if max_sessions <= 0:
             raise ValueError("PersonaPlex Stage 0 max_sessions must be positive")
@@ -247,6 +279,8 @@ class PersonaPlexStage0DuplexRuntime:
         self._free_slots: list[int] = list(reversed(range(max_sessions)))
         self._tokenizer = tokenizer
         self._voice_loader = voice_loader
+        self.moshi = is_moshi_checkpoint(model_path) if moshi is None else bool(moshi)
+        self._initial_embed: Any | None = None
         self._voice_embeddings_cache: OrderedDict[tuple[Any, ...], Any] = OrderedDict()
         self._prefill_embeds_cache: OrderedDict[tuple[Any, ...], Any] = OrderedDict()
         self.sessions: dict[tuple[str, int], PersonaPlexStage0SessionState] = {}
@@ -258,6 +292,7 @@ class PersonaPlexStage0DuplexRuntime:
         self._slot_device = self._last_text = self._last_agent = self._user_history = None
         self._teacher_tokens = self._teacher_provided = self._silence = self._sine = None
         self._live_provided = self._silence_cpu = self._zero_ids = self._live_embeds = None
+        self._initial_audio = self._moshi_start_provided = None
         if codec is not None:
             codec.streaming_init(max_sessions, decode=False)
             self._codec = codec
@@ -303,6 +338,9 @@ class PersonaPlexStage0DuplexRuntime:
                 continue
             identity = (epoch, seq)
             if seq <= state.last_seq:
+                continue
+            if self.moshi and state.last_seq == 0:
+                # Moshi's initial-token step; prepare_append builds its row.
                 continue
             if id(state) in seen:
                 continue
@@ -404,6 +442,8 @@ class PersonaPlexStage0DuplexRuntime:
             return state.prepared
         if seq <= state.last_seq:
             raise ValueError(f"PersonaPlex duplex append seq must increase: last={state.last_seq}, got={seq}")
+        if self.moshi and state.last_seq == 0:
+            return self._prepare_moshi_start(state, identity, prompt_len=prompt_len)
 
         if state.encoded_identity != identity:
             self._encode_rows([(state, identity)], self._decode_pcm_rows([duplex.get("payload")]))
@@ -450,6 +490,54 @@ class PersonaPlexStage0DuplexRuntime:
         state.prepared = prepared
         state.last_seq = seq
         return prepared
+
+    def _prepare_moshi_start(
+        self,
+        state: PersonaPlexStage0SessionState,
+        identity: tuple[int, int],
+        *,
+        prompt_len: int,
+    ) -> PersonaPlexStage0PreparedAppend:
+        """The first append of a Moshi session: one initial-token frame, nothing encoded.
+
+        Its step samples the text token and agent cb0 the next frame reads.
+        Agent cb1..7 are delayed one frame, so that frame still reads the initial
+        token there: the depformer is forced to it, which also makes the commit
+        store it.
+        """
+        prompt_offset = int(prompt_len) - 1
+        if prompt_offset < 0:
+            raise ValueError(f"PersonaPlex scheduler prompt reservation mismatch: reserved={prompt_len}, prepared=1")
+        device, dtype = self._model_device_dtype()
+        self._slot_buffers()
+        self._teacher_tokens[state.slot] = self._initial_audio.repeat(2)
+        self._teacher_provided[state.slot] = self._moshi_start_provided
+        epoch, seq = identity
+        info = (self._silence_cpu, 0, 0, state.session_id, epoch, seq)
+        prepared = PersonaPlexStage0PreparedAppend(
+            input_ids=self._zero_input_ids(1),
+            inputs_embeds=self._initial_frame_embed(device, dtype),
+            user_frame=None,
+            info_update=_info_update(*info, first_append=True),
+            prefill_applied=True,
+            prompt_offset=prompt_offset,
+        )
+        state.prefill_slots = 0
+        state.prepared_identity = identity
+        state.prepared = prepared
+        state.last_seq = seq
+        return prepared
+
+    def _initial_frame_embed(self, device: Any, dtype: Any):
+        """``[1, hidden]`` embedding of Moshi's initial-token frame, built once."""
+        embed = self._initial_embed
+        if embed is None or embed.device != device or embed.dtype != dtype:
+            import torch
+
+            with torch.no_grad():
+                embed = self.stage_model._initial_frame_embed(device).to(dtype=dtype)
+            self._initial_embed = embed
+        return embed
 
     def _zero_input_ids(self, length: int):
         """``[length]`` zero placeholder ids: a view of one shared buffer, never written.
@@ -690,12 +778,14 @@ class PersonaPlexStage0DuplexRuntime:
         # effective agent frame. User cb0 trails the frame being appended by one
         # tick and user cb1..7 trail it by two ticks. Before live user frames
         # fill those slots, text-prompt prefill leaves encoded sine on user rows
-        # (the history starts as sine).
+        # (the history starts as sine). Moshi reads the user's codes one tick
+        # earlier, as LMGen input, with the initial token before the first frame.
+        lag = 0 if self.moshi else 1
         embeds = self.stage_model._build_frame_embeds(
             self._last_text[slots],
             self._last_agent[slots],
-            user_d0=history[:, 1],
-            user_d1=history[:, 2],
+            user_d0=history[:, lag],
+            user_d1=history[:, lag + 1],
         )
         # Agent rows: silence; user rows: this frame's cb0 and the previous
         # frame's cb1..7.
@@ -733,6 +823,10 @@ class PersonaPlexStage0DuplexRuntime:
         self._teacher_tokens = self._silence.repeat(rows, 2)
         self._teacher_provided = torch.zeros((rows, 16), dtype=torch.bool, device=device)
         self._live_provided = torch.tensor([False] * 8 + [True] * 8, dtype=torch.bool, device=device)
+        self._initial_audio = torch.full((8,), INITIAL_AUDIO_TOKEN, dtype=torch.long, device=device)
+        self._moshi_start_provided = torch.tensor([False] + [True] * 7 + [False] * 8, dtype=torch.bool, device=device)
+        if self.moshi:
+            self._user_history = self._initial_audio.repeat(rows, 3, 1)
         self._slot_device = device
         return device
 
@@ -740,7 +834,7 @@ class PersonaPlexStage0DuplexRuntime:
         self._slot_buffers()
         self._last_text[slot].fill_(ZERO_TEXT_TOKEN)
         self._last_agent[slot] = self._silence
-        self._user_history[slot] = self._sine
+        self._user_history[slot] = self._initial_audio if self.moshi else self._sine
 
     def _index(self, values: list[int]):
         import torch
@@ -799,9 +893,13 @@ class PersonaPlexStage0DuplexRuntime:
         """Build and cache the first-append prefill of ``(voice, persona)`` once the weights are loaded.
 
         The defaults are what the duplex plugin sends for a session that names no
-        voice or instructions.
+        voice or instructions. A Moshi session has no prefill; its initial-token
+        frame is built instead.
         """
         device, dtype = self._model_device_dtype()
+        if self.moshi:
+            self._initial_frame_embed(device, dtype)
+            return
         self._prefill_embeds(voice, persona, device, dtype)
 
     def _prefill_embeds(self, voice: str, persona: str, device: Any, dtype: Any):
@@ -939,6 +1037,8 @@ __all__ = [
     "PersonaPlexStage0DuplexRuntime",
     "PersonaPlexStage0PreparedAppend",
     "PersonaPlexStage0SessionState",
+    "checkpoint_depformer_steps",
+    "is_moshi_checkpoint",
     "load_personaplex_tokenizer",
     "load_personaplex_voice_state",
     "personaplex_prefill_slots",

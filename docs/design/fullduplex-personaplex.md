@@ -150,6 +150,25 @@ per-frame user codes and prompt embeddings through the request's
 `model_intermediate_buffer`; the normal vLLM runner remains authoritative for
 attention metadata, block tables, KV allocation, scheduling and sampling.
 
+**Kyutai Moshi checkpoints.** `kyutai/moshiko-pytorch-bf16` loads into the
+same talker, depformer and Mimi codec. Its depformer has 8 weight sets (its own
+codebooks) where PersonaPlex has 16, and that changes two things, both
+following `moshi.server` and `LMGen` (moshi 0.2.13):
+
+- There is no prefill. The first append of an epoch is Moshi's initial-token
+  frame alone; the session's first 80 ms of audio lands on that step and is
+  not read, and the Mimi encoder starts at the second frame. The depformer is
+  forced to the initial token on agent cb1..7 for that step, since those
+  codebooks have delay 1 and the next frame must still read it.
+- The user's codes enter as temporal input: a frame reads cb0 of the frame it
+  brings and cb1..7 of the previous one, one tick earlier than PersonaPlex,
+  whose user stream comes through the depformer.
+
+`stage0.is_moshi_checkpoint` counts the depformer sets in the
+`model.safetensors` header. The plugin uses the same check: a Moshi session
+reserves one slot on its first append and refuses `voice` and `instructions`
+(`voice_unsupported`, `instructions_unsupported`).
+
 **Epochs.** The framework identifies a Stage 0 request by
 `(session_id, epoch)`; `response.cancel` and `output_audio_buffer.clear`
 advance the epoch, abort the current request and start the next append at
