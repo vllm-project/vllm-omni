@@ -893,6 +893,7 @@ class MiniMaxH3Pipeline(
             raise ValueError(
                 "MiniMax H3 external decoding requires vae_encoder=false and external encoder conditioning"
             )
+        self.offload_text_encoder = bool(getattr(od_config, "offload_text_encoder", False))
         if self.load_vae_encoder is False and self.load_text_encoder is True:
             raise ValueError(
                 "MiniMax H3 does not support local text encoding with external media conditioning; "
@@ -1304,6 +1305,11 @@ class MiniMaxH3Pipeline(
                 )
             if missing_gates := required_gates - transformer_loaded:
                 raise ValueError(f"FastH3 V2 checkpoint is missing compression gates: {sorted(missing_gates)}")
+        if getattr(self, "offload_text_encoder", False) and getattr(self, "text_encoder", None) is not None:
+            logger.info("Initial offload of MiniMax H3 Qwen3-VL text encoder to CPU after weights loaded...")
+            self.text_encoder.offload_to_cpu()
+            self._release_stage_cache()
+            logger.info("Initial text encoder offload complete.")
         return loaded_with_prefix
 
     @property
@@ -1580,6 +1586,8 @@ class MiniMaxH3Pipeline(
         return self.text_encoder.encode_ids(input_ids, **vision_kwargs)
 
     def _uses_manual_component_offload(self, component: nn.Module) -> bool:
+        if getattr(self, "offload_text_encoder", False) and component is getattr(self, "text_encoder", None):
+            return True
         od_config = getattr(self, "od_config", None)
         if od_config is None:
             return False
@@ -1669,6 +1677,9 @@ class MiniMaxH3Pipeline(
                 yield
             return
         staged = self._uses_manual_component_offload(component)
+        is_text_encoder = getattr(self, "offload_text_encoder", False) and component is getattr(
+            self, "text_encoder", None
+        )
         try:
             if staged:
                 component.load_to_device()
@@ -1685,6 +1696,11 @@ class MiniMaxH3Pipeline(
                         cache.release_if_needed(force=True)
                     except BaseException:
                         logger.exception("Failed to release retained allocator cache after component failure")
+                elif is_text_encoder:
+                    try:
+                        self._release_stage_cache()
+                    except BaseException:
+                        logger.exception("Failed to release allocator cache after component failure")
             raise
         else:
             if staged:
@@ -1697,7 +1713,14 @@ class MiniMaxH3Pipeline(
                             cache.release_if_needed(force=True)
                         except BaseException:
                             logger.exception("Failed to release retained allocator cache after offload failure")
+                    elif is_text_encoder:
+                        try:
+                            self._release_stage_cache()
+                        except BaseException:
+                            logger.exception("Failed to release allocator cache after offload failure")
                     raise
+                if is_text_encoder:
+                    self._release_stage_cache()
 
     @staticmethod
     def _is_output_owner_rank() -> bool:
