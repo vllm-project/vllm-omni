@@ -690,6 +690,12 @@ class GPUARModelRunner(
 
         CUDAGraphWrapper.clear_all_graphs()
         BreakableCUDAGraphWrapper.clear_all_graphs()
+        # The encoder graph manager holds the model and its own graph pool;
+        # upstream drops it only on ROCm.
+        encoder_manager = getattr(self, "encoder_cudagraph_manager", None)
+        if encoder_manager is not None:
+            encoder_manager.clear()
+            self.encoder_cudagraph_manager = None
 
         # 6. Stop the prefix-cache committer before the CUDA context and the
         # tensors it copies from are torn down.
