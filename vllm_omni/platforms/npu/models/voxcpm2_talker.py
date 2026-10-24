@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import os
 from types import MethodType
 from typing import Any
 
@@ -13,6 +14,21 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 _MAX_GRAPHS = 8
+
+
+def _resolve_max_graphs() -> int:
+    """Max cached graphs, operator-tunable via env; default matches the
+    validated CANN-stable limit for the LocDiT estimator shapes."""
+    raw = os.environ.get("VLLM_OMNI_VOXCPM2_LOC_DIT_MAX_GRAPHS")
+    if raw is None:
+        return _MAX_GRAPHS
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        logger.warning("Invalid VLLM_OMNI_VOXCPM2_LOC_DIT_MAX_GRAPHS=%r; using %d", raw, _MAX_GRAPHS)
+        return _MAX_GRAPHS
+
+
 _PATCHED = False
 _original_init = None
 
@@ -36,6 +52,12 @@ def apply_voxcpm2_talker_patch() -> None:
     """Install the Ascend LocDiT adapter before VoxCPM2 is constructed."""
     global _PATCHED, _original_init
     if _PATCHED:
+        return
+    # Escape hatch: the runner's disable_config_hint points operators here.
+    # Without it, a failed graph capture leaves no way to run eagerly short
+    # of rebuilding the image.
+    if os.environ.get("VLLM_OMNI_DISABLE_VOXCPM2_NPU_PATCH", "0") == "1":
+        logger.info("VoxCPM2 NPU patch disabled via VLLM_OMNI_DISABLE_VOXCPM2_NPU_PATCH")
         return
 
     # Call this only after platform initialization: the model's transitive
@@ -61,11 +83,14 @@ def setup_voxcpm2_loc_dit_npu_graph(model: object) -> None:
         raise TypeError("expected a VoxCPM2 talker with tts.feat_decoder.estimator")
     if getattr(estimator, "_voxcpm2_npu_graph_runner", None) is not None:
         return
+    if os.environ.get("VLLM_OMNI_DISABLE_VOXCPM2_NPU_PATCH", "0") == "1":
+        return
 
+    max_graphs = _resolve_max_graphs()
     graph_runner = _get_npu_exact_graph_runner_cls()(
-        max_graphs=_MAX_GRAPHS,
+        max_graphs=max_graphs,
         component_name="VoxCPM2 LocDiT",
-        disable_config_hint="disable the VoxCPM2 NPU model patch",
+        disable_config_hint="set VLLM_OMNI_DISABLE_VOXCPM2_NPU_PATCH=1",
     )
     if not graph_runner.is_supported():
         logger.warning("VoxCPM2 LocDiT NPUGraph APIs are unavailable; using eager execution")
@@ -91,4 +116,4 @@ def setup_voxcpm2_loc_dit_npu_graph(model: object) -> None:
 
     estimator.forward = MethodType(_forward, estimator)
     estimator._voxcpm2_npu_graph_runner = graph_runner
-    logger.info("VoxCPM2 LocDiT NPUGraph replay enabled (max_graphs=%d)", _MAX_GRAPHS)
+    logger.info("VoxCPM2 LocDiT NPUGraph replay enabled (max_graphs=%d)", max_graphs)
