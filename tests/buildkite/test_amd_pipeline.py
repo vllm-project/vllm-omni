@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import json
 from importlib.util import find_spec, module_from_spec, spec_from_file_location
 from pathlib import Path
 from shlex import split
@@ -1158,6 +1159,66 @@ def test_hunyuanvideo15_accuracy_is_one_nonblocking_nightly_job() -> None:
     for pipeline_path in (AMD_READY_PIPELINE, AMD_MERGE_PIPELINE):
         text = pipeline_path.read_text(encoding="utf-8")
         assert "HunyuanVideo-1.5 Video Similarity" not in text
+
+
+def test_qwen3_tts_perf_is_one_nonblocking_nightly_job() -> None:
+    step = _find_step("Qwen3-TTS Perf", AMD_NIGHTLY_PIPELINE)
+    assert step["grade"] == "NonBlocking"
+    assert step["agent_pool"] == "mi300_2"
+    assert step["mirror_hardwares"] == ["amdproduction"]
+    assert step["timeout_in_minutes"] == 180
+    assert step["env"]["VLLM_ALLOW_LONG_MAX_MODEL_LEN"] == "1"
+    assert "VLLM_ROCM_USE_AITER" not in step["env"]
+    commands = "\n".join(step["commands"])
+    marker = "full_model and tts and rocm and MI325 and cards_2"
+    assert marker in commands
+    assert "--run-level full_model" in commands
+    assert "--collect-only" in commands
+    assert "exit 5" in commands
+    assert "pytest.xml" in commands
+    assert "tests/dfx/perf/tests/test_tts.json" in commands
+    assert "Expected exactly $${#nodes[@]} Qwen3-TTS perf nodes" in commands
+    nodes = (
+        "test_qwen3_tts_base-voice_clone_latency_seed-tts",
+        "test_qwen3_tts_base-voice_clone_throughput_seed-tts",
+        "test_qwen3_tts_customvoice-default_voice_latency_seed-tts-text",
+        "test_qwen3_tts_customvoice-default_voice_throughput_seed-tts-text",
+        "test_qwen3_tts_customvoice-default_voice_stress_seed-tts-text",
+        "test_qwen3_tts_voicedesign-voice_design_latency_seed-tts-design",
+        "test_qwen3_tts_voicedesign-voice_design_throughput_seed-tts-design",
+        "test_qwen3_tts_voicedesign-voice_design_stress_seed-tts-design",
+    )
+    for node in nodes:
+        assert commands.count(node) == 2
+    assert "test_voxtral_tts" not in commands
+    assert "cards_1" not in commands
+    assert "quality" not in commands
+    nightly = AMD_NIGHTLY_PIPELINE.read_text(encoding="utf-8")
+    assert nightly.count('label: "Qwen3-TTS Perf"') == 1
+    config = json.loads(Path("tests/dfx/perf/tests/test_tts.json").read_text(encoding="utf-8"))
+    selected = {
+        "test_qwen3_tts_base",
+        "test_qwen3_tts_customvoice",
+        "test_qwen3_tts_voicedesign",
+    }
+    seen: set[str] = set()
+    for case in config:
+        name = case["test_name"]
+        res = case["mark"][0]["hardware_marks"]["res"]
+        if name in selected:
+            seen.add(name)
+            assert res["rocm"] == "MI325"
+            assert case["mark"][0]["hardware_marks"]["num_cards"] == 2
+        for phase in case["benchmark_params"]:
+            if phase.get("eval_phase") == "quality":
+                assert phase.get("enabled") is False
+            baseline = phase.get("baseline")
+            if isinstance(baseline, dict):
+                assert "MI325" not in baseline
+    assert seen == selected
+    for pipeline_path in (AMD_READY_PIPELINE, AMD_MERGE_PIPELINE):
+        text = pipeline_path.read_text(encoding="utf-8")
+        assert "Qwen3-TTS Perf" not in text
 
 
 def test_minimax_h3_accuracy_has_two_nonblocking_nightly_jobs() -> None:
