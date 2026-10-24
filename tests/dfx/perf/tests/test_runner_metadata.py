@@ -48,6 +48,58 @@ def test_task_excluded_from_cli_args():
     assert "--dataset-name" in args
 
 
+def test_default_runner_discovery_excludes_sglang():
+    from tests.dfx.perf.scripts import run_benchmark
+
+    assert run_benchmark.SERVER_TYPE == "vllm-omni"
+    assert all(cfg.get("server_type", "vllm-omni") == "vllm-omni" for cfg in run_benchmark.BENCHMARK_CONFIGS)
+
+
+@pytest.mark.parametrize(
+    ("config_name", "model_type"),
+    [("test_qwen3_tts_sglang.json", "tts"), ("test_qwen3_omni_sglang.json", "omni")],
+)
+def test_explicit_sglang_config_uses_shared_marks(monkeypatch, config_name: str, model_type: str):
+    import runpy
+    import sys
+    from pathlib import Path
+
+    config = Path(__file__).with_name(config_name)
+    runner = Path(__file__).parents[1] / "scripts" / "run_benchmark.py"
+    monkeypatch.setattr(sys, "argv", ["pytest", "--test-config-file", str(config)])
+    module = runpy.run_path(str(runner))
+    assert module["SERVER_TYPE"] == "sglang-omni"
+    assert len(module["paired_benchmark_params"]) == 1
+    names = {mark.name for mark in module["paired_benchmark_params"][0].marks}
+    assert {"gpu", "cuda", "H100", "cards_2", "full_model", model_type} <= names
+
+
+def test_sglang_uses_common_client_metadata(monkeypatch):
+    from tests.dfx.perf.scripts import run_benchmark
+    from tests.dfx.perf.scripts.sglang_omni_server import SglangOmniServer
+
+    monkeypatch.setattr(run_benchmark, "SERVER_TYPE", "sglang-omni")
+    monkeypatch.setattr(run_benchmark, "get_runtime_resource_label", lambda: "H200")
+    calls = []
+
+    def benchmark(**kwargs):
+        calls.append(kwargs)
+        return {"completed": 1}
+
+    monkeypatch.setattr(run_benchmark, "run_benchmark", benchmark)
+    run_benchmark.test_performance_benchmark(
+        SglangOmniServer({"model": "test-model", "serve_args": [], "env": {}}),
+        {
+            "test_name": "sglang_smoke",
+            "params": {"dataset_name": "seed-tts", "num_prompts": [1], "max_concurrency": [1], "num_warmups": 0},
+        },
+    )
+    assert len(calls) == 1
+    assert calls[0]["resource_label"] == "H200"
+    assert calls[0]["num_warmups"] == 0
+    assert calls[0]["args"].count("--model") == 1
+
+
 def test_enabled_false_entry_is_skipped():
     """benchmark_params entry with enabled=false should be skipped."""
     import sys

@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: Apache-2.0
+config_cls: Qwen3TTSPipelineConfig
+model_path: Qwen/Qwen3-TTS-12Hz-1.7B-Base
+# Match the nightly baseline's two-GPU stage split; keep preprocessing with
+# the engine and move the vocoder into its own process on the second GPU.
+stages:
+  tts_engine:
+    process: pipeline
+    gpu: 0
+  vocoder:
+    process: vocoder
+    gpu: 1

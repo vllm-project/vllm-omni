@@ -13,14 +13,17 @@ from typing import Any, TypeGuard
 import pytest
 
 from tests.dfx.conftest import (
+    create_paired_benchmark_pytest_params,
     create_paired_omni_benchmark_pytest_params,
     create_test_parameter_mapping,
     get_benchmark_params_for_server,
     get_runtime_resource_label,
     is_diffusion_perf_config,
     load_benchmark_configs,
+    resolve_pytest_marks,
     run_benchmark,
 )
+from tests.dfx.perf.scripts.sglang_omni_server import SglangOmniServer, sglang_server_entries
 from tests.helpers.runtime import OmniServer
 
 # Optional JSON field ``mark`` is applied as pytest marks via
@@ -48,11 +51,15 @@ _PERF_TESTS_DIR = Path(__file__).resolve().parent.parent / "tests"
 CONFIG_FILE_PATH = _get_config_file_from_argv()
 if CONFIG_FILE_PATH is None:
     _all_configs = load_benchmark_configs(config_dir=_PERF_TESTS_DIR)
-    BENCHMARK_CONFIGS = [cfg for cfg in _all_configs if not is_diffusion_perf_config(cfg)]
+    BENCHMARK_CONFIGS = [
+        cfg
+        for cfg in _all_configs
+        if not is_diffusion_perf_config(cfg) and cfg.get("server_type", "vllm-omni") == "vllm-omni"
+    ]
     print(
         f"No --test-config-file: loaded {len(BENCHMARK_CONFIGS)} omni/tts/generation case(s) from "
-        f"{_PERF_TESTS_DIR}/*.json (skipped {len(_all_configs) - len(BENCHMARK_CONFIGS)} diffusion; "
-        f"use -m to filter, e.g. -m tts)"
+        f"{_PERF_TESTS_DIR}/*.json (skipped {len(_all_configs) - len(BENCHMARK_CONFIGS)} diffusion/other backends; "
+        f"use -m to filter, e.g. -m tts; select SGLang-Omni with --test-config-file)"
     )
 else:
     _loaded = load_benchmark_configs(CONFIG_FILE_PATH)
@@ -66,7 +73,19 @@ else:
 
 DEPLOY_CONFIGS_DIR = Path(__file__).parent.parent / "deploy"
 server_to_benchmark_mapping = create_test_parameter_mapping(BENCHMARK_CONFIGS)
-paired_benchmark_params = create_paired_omni_benchmark_pytest_params(BENCHMARK_CONFIGS, DEPLOY_CONFIGS_DIR)
+_server_types = {config.get("server_type", "vllm-omni") for config in BENCHMARK_CONFIGS}
+if len(_server_types) > 1:
+    raise ValueError(f"A benchmark config file must use one server type, got: {sorted(_server_types)}")
+SERVER_TYPE = next(iter(_server_types), "vllm-omni")
+if SERVER_TYPE == "sglang-omni":
+    _server_entries = sglang_server_entries(BENCHMARK_CONFIGS)
+    paired_benchmark_params = create_paired_benchmark_pytest_params(
+        _server_entries,
+        {name: get_benchmark_params_for_server(name, server_to_benchmark_mapping) for _, name in _server_entries},
+        {config["test_name"]: resolve_pytest_marks(config.get("mark")) for config in BENCHMARK_CONFIGS},
+    )
+else:
+    paired_benchmark_params = create_paired_omni_benchmark_pytest_params(BENCHMARK_CONFIGS, DEPLOY_CONFIGS_DIR)
 
 _omni_server_lock = threading.Lock()
 
@@ -299,6 +318,9 @@ def omni_server_context():
 
 @pytest.fixture
 def omni_server(request, omni_server_context):
+    if SERVER_TYPE == "sglang-omni":
+        key = json.dumps(request.param, sort_keys=True)
+        return omni_server_context.acquire(key, lambda: SglangOmniServer(request.param))
     return omni_server_context.acquire(request.param, lambda: _start_omni_server(request.param))
 
 

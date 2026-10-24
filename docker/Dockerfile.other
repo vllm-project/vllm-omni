@@ -1,0 +1,43 @@
+# Same CUDA 13 base as the pinned SGLang-Omni docker/Dockerfile.
+ARG SGLANG_BASE_IMAGE=lmsysorg/sglang@sha256:b1259f3ea3275f66237c498ea388919729018bc9f01c3d638391e06e2cf3f469
+FROM ${SGLANG_BASE_IMAGE}
+
+ARG APP_DIR=/opt/vllm-omni
+ARG SGLANG_OMNI_COMMIT=22d4ace88f9547777b819a69d7691204bb9ce847
+# Match docker/Dockerfile.ci and the shared GPU runtime check.
+ARG VLLM_PRECOMPILED_WHEEL_COMMIT=5df63a7203cdb9328d824a27b682e77c7b9928be
+ARG VLLM_VERSION=0.32.0
+
+ENV VLLM_OMNI_VENV=/opt/vllm-omni-benchmark
+ENV SGLANG_OMNI_EXECUTABLE=/opt/sglang/bin/sgl-omni
+ENV VLLM_OMNI_VERSION_OVERRIDE=0.0.0
+
+WORKDIR ${APP_DIR}
+COPY . .
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends espeak-ng ffmpeg git jq sox libsox-fmt-all && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+RUN uv pip install --python /opt/sglang/bin/python3 --prerelease=allow \
+      "sglang-omni @ git+https://github.com/sgl-project/sglang-omni.git@${SGLANG_OMNI_COMMIT}" \
+      "pytest>=8" && \
+    uv pip install --python /opt/sglang/bin/python3 --no-deps "qwen-tts==0.1.1" && \
+    uv pip uninstall --python /opt/sglang/bin/python3 flashinfer-cubin flashinfer-jit-cache && \
+    uv venv --python /opt/sglang/bin/python3 "${VLLM_OMNI_VENV}" && \
+    VLLM_OMNI_TARGET_DEVICE=cuda uv pip install --python "${VLLM_OMNI_VENV}/bin/python" \
+      "vllm @ https://wheels.vllm.ai/${VLLM_PRECOMPILED_WHEEL_COMMIT}/vllm-${VLLM_VERSION}-cp38-abi3-manylinux_2_28_$(uname -m).whl" \
+      -e ".[dev]"
+
+RUN "${VLLM_OMNI_VENV}/bin/python" -c "from vllm._version import __commit_id__; commit = (__commit_id__ or '').removeprefix('g'); assert len(commit) >= 8 and '${VLLM_PRECOMPILED_WHEEL_COMMIT}'.startswith(commit), __commit_id__"
+
+# Keep fixed-output benchmark requests from stopping at EOS in the Thinker.
+RUN cd "$(/opt/sglang/bin/python3 -c 'import sysconfig; print(sysconfig.get_path("purelib"))')" && \
+    git apply "${APP_DIR}/docker/patches/sglang-omni-ignore-eos.patch"
+
+RUN CUDA_VISIBLE_DEVICES="" HF_HUB_OFFLINE=1 /opt/sglang/bin/python3 -m pytest \
+      --noconftest -o addopts='' -q tests/dfx/perf/tests/test_sglang_sampling.py
+
+# pytest and the common benchmark client use vLLM; only the server uses SGLang.
+ENV PATH=${VLLM_OMNI_VENV}/bin:${PATH}
+ENTRYPOINT []
