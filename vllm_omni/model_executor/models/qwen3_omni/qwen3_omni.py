@@ -111,10 +111,13 @@ logger = init_logger(__name__)
 _THINKER_ENCODER_CUDAGRAPH_MEMBERS = (
     "supports_encoder_cudagraph",
     "encoder_cudagraph_single_replay",
+    "encoder_cudagraph_group_eligible",
     "get_encoder_cudagraph_config",
     "get_input_modality",
     "get_max_frames_per_video",
     "get_encoder_cudagraph_budget_range",
+    "get_encoder_cudagraph_path_max_budget",
+    "get_encoder_cudagraph_path_budgets",
     "get_encoder_cudagraph_item_specs",
     "select_encoder_cudagraph_items",
     "prepare_encoder_cudagraph_capture_inputs",
