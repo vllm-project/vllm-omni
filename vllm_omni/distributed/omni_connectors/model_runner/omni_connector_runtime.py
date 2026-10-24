@@ -28,6 +28,7 @@ logger = init_logger("vllm_omni.worker.omni_connector_model_runner_mixin")
 
 if TYPE_CHECKING:
     from vllm_omni.config.model import OmniModelConfig
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
     from vllm_omni.distributed.omni_connectors.connectors.base import (
         OmniConnectorBase,
     )
@@ -172,7 +173,7 @@ class _OmniConnectorRuntimeMixin:
 
     def init_omni_connectors(
         self,
-        model_config: OmniModelConfig,
+        model_config: OmniModelConfig | OmniDiffusionConfig,
         kv_transfer_manager: OmniKVTransferManager | None = None,
         *,
         synchronous: bool = False,

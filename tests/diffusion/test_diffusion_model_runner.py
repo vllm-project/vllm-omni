@@ -226,6 +226,36 @@ def test_release_captured_graphs_tolerates_a_pipeline_without_captures():
     assert not hasattr(runner, "graph_runners")
 
 
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_release_step_requests_routes_popped_states_to_the_pipeline_hook():
+    """Every popped state reaches ``pipeline.release_step_request`` (#8859).
+
+    With the ``weakref`` backstop gone from ``prepare_encode``, this hook is
+    what releases an aborted or failed SenseNova request's caches; a runner
+    test has to pin it because the pipeline-side tests call the method
+    directly.
+    """
+    retired = StepRequestState(request_id="req", sampling=SimpleNamespace(), prompt="p")
+    uncached = StepRequestState(request_id="uncached", sampling=SimpleNamespace(), prompt="p")
+    received: list[StepRequestState] = []
+    runner = object.__new__(DiffusionModelRunner)
+    runner.state_cache = {"req": retired, "uncached": uncached}
+    runner.input_batch = None
+    runner.pipeline = SimpleNamespace(release_step_request=received.append)
+
+    released = runner.release_step_requests(["req", "gone", "uncached", "req"])
+
+    assert released == 2
+    # The caller's order survives the dedup (dict.fromkeys), and a duplicate
+    # id neither retires twice nor double-notifies the hook.
+    assert received == [retired, uncached]
+    assert runner.state_cache == {}
+    # A later cleanup of the same ids finds no state and stays silent.
+    assert runner.release_step_requests(["req", "uncached"]) == 0
+    assert received == [retired, uncached]
+
+
 def _make_runner(cache_backend, cache_backend_name: str | None, enable_cache_dit_summary: bool = True):
     runner = object.__new__(DiffusionModelRunner)
     runner.vllm_config = object()
@@ -934,17 +964,67 @@ def test_profile_run_executes_maximum_step_batch_without_resetting_peak(monkeypa
     monkeypatch.setattr(model_runner_module.current_omni_platform, "max_memory_allocated", lambda: 0)
     synchronize = Mock()
     monkeypatch.setattr(model_runner_module.current_omni_platform, "synchronize", synchronize)
+    retired = []
+    monkeypatch.setattr(runner.pipeline, "release_step_request", retired.append, raising=False)
 
     runner.profile_run(requests)
 
     assert observed_batch_rows == [(2, 2)]
+    # Every profile state retires through the pipeline hook exactly once,
+    # whether the wave or the finally block is what ended it.
+    assert sorted(state.request_id for state in retired) == ["profile-0", "profile-1"]
+    assert len(retired) == 2
     assert runner.state_cache == {}
     assert runner.input_batch is None
-    assert len(forward_context_calls) == 1
-    assert forward_context_calls[0][1]["in_diffusion_kv_memory_profile"] is True
+    # Both preparation and denoising must retain the startup profiling scope.
+    assert len(forward_context_calls) == 2
+    assert all(kwargs["in_diffusion_kv_memory_profile"] is True for _, kwargs in forward_context_calls)
     runner._validate_diffusion_kv_metadata.assert_not_called()
     reset_peak_memory_stats.assert_not_called()
     synchronize.assert_called_once_with()
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_profile_run_retires_unfinished_states_through_the_hook(monkeypatch):
+    """Profiling stops after the first denoise batch, before post_decode.
+
+    With a schedule longer than one step the requests are still mid-flight
+    when the profile ends, so the ``finally`` block is the only retirement
+    they get — it must reach the pipeline hook rather than bare-pop them.
+    """
+
+    class _TwoStepPipeline(_FinalOnlyStepPipeline):
+        def prepare_encode(self, state):
+            state = super().prepare_encode(state)
+            state.timesteps = torch.tensor([1.0, 0.5])
+            return state
+
+    runner = _make_runner(cache_backend=None, cache_backend_name=None)
+    runner.pipeline = _TwoStepPipeline()
+    runner.od_config.step_execution = True
+    requests = [_make_request(), _make_request()]
+    requests[0].request_id = "profile-0"
+    requests[1].request_id = "profile-1"
+    for request in requests:
+        request.sampling_params.num_inference_steps = 2
+
+    monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+    monkeypatch.setattr(model_runner_module.current_omni_platform, "max_memory_reserved", lambda: 0)
+    monkeypatch.setattr(model_runner_module.current_omni_platform, "max_memory_allocated", lambda: 0)
+    monkeypatch.setattr(model_runner_module.current_omni_platform, "synchronize", Mock())
+    runner._validate_diffusion_kv_metadata = Mock(side_effect=AssertionError("profile must bypass admission"))
+    retired = []
+    monkeypatch.setattr(runner.pipeline, "release_step_request", retired.append, raising=False)
+
+    runner.profile_run(requests)
+
+    # The first denoise wave built the batch; neither request finished, so
+    # only the profile's finally retired them — through the hook.
+    assert [state.request_id for state in retired] == ["profile-0", "profile-1"]
+    assert all(state.step_index == 1 for state in retired)
+    assert runner.state_cache == {}
+    assert runner.input_batch is None
 
 
 class _BatchPipeline:

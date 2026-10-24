@@ -603,6 +603,13 @@ class DiffusionWorker:
         assert self.model_runner is not None, "Model runner not initialized"
         return self.model_runner.remove_diffusion_kv_requests(request_ids)
 
+    def release_step_requests(self, request_ids: list[str]) -> int:
+        """Release step state and LoRA identities without touching native KV."""
+        assert self.model_runner is not None, "Model runner not initialized"
+        for request_id in request_ids:
+            self._step_lora_state.pop(request_id, None)
+        return self.model_runner.release_step_requests(request_ids)
+
     def prepare_kv_for_forward(self, scheduler_output: DiffusionSchedulerOutput):
         runner = self.model_runner
         assert runner is not None, "Model runner not initialized"
@@ -871,32 +878,24 @@ class DiffusionWorker:
     def execute_stepwise(self, scheduler_output: DiffusionSchedulerOutput) -> BaseRunnerOutput:
         """Execute one diffusion step by delegating to the model runner."""
         assert self.model_runner is not None, "Model runner not initialized"
-        self._activate_step_lora(scheduler_output)
-        profiler = self._get_profiler()
-        ctx = profiler.annotate_context_manager("diffusion_step") if profiler else nullcontext()
         try:
+            self._activate_step_lora(scheduler_output)
+            profiler = self._get_profiler()
+            ctx = profiler.annotate_context_manager("diffusion_step") if profiler else nullcontext()
             with ctx:
                 output = self.model_runner.execute_stepwise(scheduler_output)
+            terminal_ids = [
+                request_id
+                for request_id in scheduler_output.scheduled_request_ids
+                if (request_output := output.get_request_output(request_id)) is not None and request_output.finished
+            ]
+            self.release_step_requests(terminal_ids)
+            if profiler:
+                profiler.step()
+            return output
         except Exception:
-            # The engine terminates every scheduled request when execution raises.
-            for request_id in scheduler_output.scheduled_request_ids:
-                self._step_lora_state.pop(request_id, None)
+            self.release_step_requests(scheduler_output.scheduled_request_ids)
             raise
-        # The runner owns model state; retire the worker's metadata before idle.
-        for request_id in scheduler_output.scheduled_request_ids:
-            request_output = output.get_request_output(request_id)
-            if request_output is not None and request_output.finished:
-                self._step_lora_state.pop(request_id, None)
-        if profiler:
-            profiler.step()
-        return output
-
-    def release_step_requests(self, request_ids: list[str]) -> None:
-        """Retire cancelled step state at the serialized worker-call boundary."""
-        assert self.model_runner is not None, "Model runner not initialized"
-        self.model_runner.release_step_requests(request_ids)
-        for request_id in request_ids:
-            self._step_lora_state.pop(request_id, None)
 
     def _activate_step_lora(self, scheduler_output: DiffusionSchedulerOutput) -> None:
         """Activate the LoRA adapter for the scheduled step batch.

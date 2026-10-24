@@ -239,8 +239,8 @@ class _AutoDenoiseProfilerPipeline(DiffusionPipelineProfilerMixin):
 class _InterruptingStepPipeline(_StepPipeline):
     interrupt = True
 
-    def denoise_step(self, state, **kwargs):
-        del state, kwargs
+    def denoise_step(self, input_batch, **kwargs):
+        del input_batch, kwargs
         self.denoise_calls += 1
         return None
 
@@ -414,6 +414,7 @@ def _make_runner(
     runner.cache_backend = None
     runner.offload_backend = None
     runner.state_cache = {}
+    runner.input_batch = None
     runner.kv_transfer_manager = SimpleNamespace(
         receive_multi_kv_cache_distributed=lambda req, cfg_kv_collect_func=None, target_device=None: None
     )
@@ -434,6 +435,7 @@ def _make_distributed_runner(mode: str, device: torch.device):
     runner.cache_backend = None
     runner.offload_backend = None
     runner.state_cache = {}
+    runner.input_batch = None
     runner.kv_transfer_manager = SimpleNamespace(
         receive_multi_kv_cache_distributed=lambda req, cfg_kv_collect_func=None, target_device=None: None
     )
@@ -1194,6 +1196,8 @@ class TestRunner:
         kv_payload = object()
 
         class _CapturingStepPipeline(_StepPipeline):
+            device: torch.device
+
             def prepare_encode(self, state, **kwargs):
                 captured["past_key_values"] = getattr(state.sampling, "past_key_values", None)
                 return super().prepare_encode(state, **kwargs)
@@ -1312,7 +1316,10 @@ def _make_step_worker(lora_manager=None, *, expected_output=None):
     worker.lora_manager = lora_manager
     worker._step_lora_state = {}
     output = expected_output if expected_output is not None else RunnerOutput(request_id="req-1")
-    worker.model_runner = SimpleNamespace(execute_stepwise=lambda arg: output)
+    worker.model_runner = SimpleNamespace(
+        execute_stepwise=lambda arg: output,
+        release_step_requests=lambda request_ids: 0,
+    )
     return worker
 
 
