@@ -39,6 +39,7 @@ from vllm_omni.diffusion.sched.interface import (
     _AdmissionWaitDecision,
 )
 from vllm_omni.diffusion.worker.utils import BaseRunnerOutput
+from vllm_omni.lora.utils import build_lora_batch_key
 
 logger = init_logger(__name__)
 
@@ -48,7 +49,7 @@ BatchSamplingParamsKey = StepBatchSamplingParamsKey | RequestBatchSamplingParams
 # sampling-param fields, so they must be resolved separately from the bulk lookup.
 _STEP_BATCH_SAMPLING_PARAMS_KEY_FIELD_NAMES = frozenset(field.name for field in fields(StepBatchSamplingParamsKey)) - {
     "condition_key",
-    "lora_int_id",
+    "lora_key",
     "use_step_execution",
 }
 
@@ -751,7 +752,7 @@ class BaseScheduler(ABC):
         lora_request = getattr(sampling, "lora_request", None)
         return StepBatchSamplingParamsKey(
             condition_key=getattr(request, "batch_compatibility_key", None),
-            lora_int_id=lora_request.lora_int_id if lora_request is not None else None,
+            lora_key=build_lora_batch_key(lora_request, getattr(sampling, "lora_scale", None)),
             use_step_execution=getattr(request, "use_step_execution", True),
             **{name: getattr(sampling, name) for name in _STEP_BATCH_SAMPLING_PARAMS_KEY_FIELD_NAMES},
         )

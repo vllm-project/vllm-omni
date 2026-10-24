@@ -70,6 +70,7 @@ from vllm_omni.diffusion.utils.media_utils import normalize_preencode_batch_fram
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.errors import OmniClientError, client_error_from_metadata
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.lora.utils import filter_active_lora_adapters
 from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
 )
@@ -140,7 +141,7 @@ from .latent_upscaler import (
     resolve_minimax_h3_latent_upscale_target,
     resolve_minimax_h3_latent_upscaler,
 )
-from .lora import TurboSpec, load_minimax_h3_turbo_lora
+from .lora import TurboSpec, load_minimax_h3_native_adapter, load_minimax_h3_turbo_lora
 from .minimax_h3_transformer import (
     MiniMaxH3Attention,
     MiniMaxH3DiTModel,
@@ -148,7 +149,7 @@ from .minimax_h3_transformer import (
 )
 from .npu.lora import (
     MINIMAX_H3_NATIVE_INFERENCE_STEPS,
-    load_minimax_h3_native_lora,
+    load_minimax_h3_native_distilled_lora,
 )
 from .packed_sequence import (
     MINIMAX_H3_MAX_PAD_SEQ_LEN,
@@ -697,7 +698,7 @@ class MiniMaxH3Pipeline(
         # same client-supplied ID. Every real load replaces the classification.
         self._clear_adaln_caches()
         self._turbo_lora_specs.pop(lora_request.lora_int_id, None)
-        self._native_lora_adapter_ids.discard(lora_request.lora_int_id)
+        self._native_distilled_lora_adapter_ids.discard(lora_request.lora_int_id)
         self._lora_sigma_schedules.pop(lora_request.lora_int_id, None)
         od_config = getattr(self, "od_config", None)
         offload_modes = []
@@ -724,7 +725,7 @@ class MiniMaxH3Pipeline(
         # running platform: the native loader is checkpoint-format parsing with
         # no ``torch_npu`` dependency, so it needs no ``current_omni_platform``
         # dispatch and binds the same adapter on NPU, CUDA and CPU.
-        native_loaded = load_minimax_h3_native_lora(
+        native_loaded = load_minimax_h3_native_distilled_lora(
             partition=self.partition,
             lora_request=lora_request,
             lora_path=lora_path,
@@ -733,10 +734,16 @@ class MiniMaxH3Pipeline(
         )
         if native_loaded is not None:
             lora_model, peft_helper, sigma_schedule = native_loaded
-            self._native_lora_adapter_ids.add(lora_request.lora_int_id)
+            self._native_distilled_lora_adapter_ids.add(lora_request.lora_int_id)
             self._lora_sigma_schedules[lora_request.lora_int_id] = sigma_schedule
             return lora_model, peft_helper
-        return None
+        return load_minimax_h3_native_adapter(
+            transformer=self.transformer,
+            lora_request=lora_request,
+            lora_path=lora_path,
+            dtype=dtype,
+            unsupported_offload_mode=" or ".join(offload_modes) or None,
+        )
 
     def _validate_diffusion_lora_binding(
         self,
@@ -752,7 +759,7 @@ class MiniMaxH3Pipeline(
                     f"bound={len(bound_lora_names)}/{len(lora_model.loras)}, missing={missing[:5]}"
                 )
             return
-        if lora_model.id not in self._native_lora_adapter_ids:
+        if lora_model.id not in self._native_distilled_lora_adapter_ids:
             return
         missing = sorted(set(lora_model.loras) - bound_lora_names)
         if missing:
@@ -768,17 +775,24 @@ class MiniMaxH3Pipeline(
         constrains the task nor imposes its sampler contract.
         """
 
-        lora_request = sampling.lora_request
-        if lora_request is None or math.isclose(0.0, float(sampling.lora_scale)):
-            return None
-        return self._turbo_lora_specs.get(lora_request.lora_int_id)
+        adapters = filter_active_lora_adapters(sampling.lora_request, sampling.lora_scale)
+        specs = [
+            self._turbo_lora_specs[request.lora_int_id]
+            for request, _ in adapters
+            if request.lora_int_id in self._turbo_lora_specs
+        ]
+        if len(specs) > 1:
+            raise OmniClientError("MiniMax-H3 supports at most one Turbo adapter in a composition")
+        if len(adapters) > 1 and any(
+            request.lora_int_id in self._native_distilled_lora_adapter_ids for request, _ in adapters
+        ):
+            raise OmniClientError("MiniMax-H3 native distilled LoRA cannot be composed with other adapters")
+        return specs[0] if specs else None
 
     def _has_active_native_lora(self, sampling: Any) -> bool:
-        lora_request = sampling.lora_request
-        return (
-            lora_request is not None
-            and not math.isclose(0.0, float(sampling.lora_scale))
-            and lora_request.lora_int_id in self._native_lora_adapter_ids
+        return any(
+            request.lora_int_id in self._native_distilled_lora_adapter_ids
+            for request, _ in filter_active_lora_adapters(sampling.lora_request, sampling.lora_scale)
         )
 
     def _validate_native_sampling(self, sampling: Any, *, task: str) -> None:
@@ -786,7 +800,9 @@ class MiniMaxH3Pipeline(
             raise OmniClientError("MiniMax-H3 native LoRA supports T2VA requests only")
         # Derive the expected count from the adapter's own schedule so the
         # message can never disagree with the schedule the denoise loop runs.
-        schedule = self._lora_sigma_schedules.get(sampling.lora_request.lora_int_id)
+        requests = sampling.lora_request
+        request = requests[0] if isinstance(requests, (list, tuple)) else requests
+        schedule = self._lora_sigma_schedules.get(request.lora_int_id)
         expected_steps = MINIMAX_H3_NATIVE_INFERENCE_STEPS if schedule is None else schedule.num_inference_steps
         # Only request mode can take the count from the adapter schedule: step
         # mode admits the request in ``StepScheduler``, which reads
@@ -817,12 +833,9 @@ class MiniMaxH3Pipeline(
             )
 
     def _sigma_schedule_for_request(self, sampling: Any, task: str) -> DMD2SigmaSchedule | None:
-        lora_request = sampling.lora_request
-        if (
-            lora_request is not None
-            and not math.isclose(0.0, float(sampling.lora_scale))
-            and lora_request.lora_int_id in self._lora_sigma_schedules
-        ):
+        adapters = filter_active_lora_adapters(sampling.lora_request, sampling.lora_scale)
+        lora_request = adapters[0][0] if adapters else None
+        if lora_request is not None and lora_request.lora_int_id in self._lora_sigma_schedules:
             adapter_schedule = self._lora_sigma_schedules[lora_request.lora_int_id]
             checkpoint_schedule = self._base_schedule_for_task(task)
             if checkpoint_schedule is not None:
@@ -929,7 +942,7 @@ class MiniMaxH3Pipeline(
             str(od_config.model),
         )
         self._turbo_lora_specs: dict[int, TurboSpec] = {}
-        self._native_lora_adapter_ids: set[int] = set()
+        self._native_distilled_lora_adapter_ids: set[int] = set()
         self._lora_sigma_schedules: dict[int, DMD2SigmaSchedule] = {}
         model_root = _resolve_minimax_h3_model_root(
             str(od_config.model),
@@ -1382,8 +1395,10 @@ class MiniMaxH3Pipeline(
                 cache.clear()
 
     def _prepare_adaln_adapter(self, sampling: OmniDiffusionSamplingParams) -> None:
-        request = getattr(sampling, "lora_request", None)
-        identity = None if request is None else (request.lora_int_id, request.lora_path, float(sampling.lora_scale))
+        identity = tuple(
+            (request.lora_int_id, request.lora_path, scale)
+            for request, scale in filter_active_lora_adapters(sampling.lora_request, sampling.lora_scale)
+        )
         if identity != getattr(self, "_adaln_adapter_identity", None):
             self._clear_adaln_caches()
             self._adaln_adapter_identity = identity
@@ -3232,7 +3247,7 @@ class MiniMaxH3Pipeline(
             raise OmniClientError("MiniMax H3 timeline guides do not support cache acceleration")
         if self._fasth3 is not None or self._fasth3_checkpoint is not None:
             raise OmniClientError("MiniMax H3 timeline guides require base H3 weights, not FastH3")
-        active_lora = sampling.lora_request is not None and not math.isclose(float(sampling.lora_scale), 0.0)
+        active_lora = bool(filter_active_lora_adapters(sampling.lora_request, sampling.lora_scale))
         if turbo or native_lora or active_lora:
             raise OmniClientError("MiniMax H3 timeline guides do not support active LoRA/Turbo adapters")
         if self._sigma_schedule_for_request(sampling, task) is not None:
