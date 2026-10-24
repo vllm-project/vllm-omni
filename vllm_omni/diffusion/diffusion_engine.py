@@ -524,7 +524,9 @@ class DiffusionEngine:
 
         diffusion_engine_start_time = time.perf_counter()
 
-        preprocess_time = 0.0
+        # None means the interval was not observed: no pre-processor ran, or the
+        # output needed no async wait. Such keys are left out of the metrics.
+        preprocess_time: float | None = None
         has_preprocessor = getattr(self, "pre_process_func", None) is not None
         preprocess_start_time = time.perf_counter() if has_preprocessor else None
         request = self._prepare_request_for_admission(request)
@@ -536,10 +538,11 @@ class DiffusionEngine:
         request_id = self._add_prepared_request(request)
         generator = self.get_output_stream(request_id)
         async for output in generator:
+            # None when the stream did not wait for an async output.
             output_ready_wait_time = output.output_ready_wait_time
             # The stream now materializes async outputs before yielding. Keep
             # that wait separate from execution time in the timing breakdown.
-            exec_total_time = time.perf_counter() - exec_start_time - output_ready_wait_time
+            exec_total_time = time.perf_counter() - exec_start_time - (output_ready_wait_time or 0.0)
             postprocess_start_time = time.perf_counter()
             scheduler_metrics = diffusion_scheduler_waiting_metrics(getattr(self, "_scheduler_num_waiting_reqs", 0))
             try:
@@ -555,20 +558,22 @@ class DiffusionEngine:
                 "DiffusionEngine.step_streaming breakdown: preprocess=%.2f ms, "
                 "add_req_and_wait=%.2f ms, output_ready_wait=%.2f ms, "
                 "postprocess=%.2f ms, total=%.2f ms",
-                preprocess_time * 1000,
+                (preprocess_time or 0.0) * 1000,
                 exec_total_time * 1000,
-                output_ready_wait_time * 1000,
+                (output_ready_wait_time or 0.0) * 1000,
                 postprocess_time * 1000,
                 step_total_ms,
             )
             for request_output in formatted_outputs:
                 metrics_update = {
-                    "preprocess_time_ms": preprocess_time * 1000,
                     "diffusion_engine_exec_time_ms": exec_total_time * 1000,
-                    "output_ready_wait_time_ms": output_ready_wait_time * 1000,
                     "postprocess_time_ms": postprocess_time * 1000,
                     **scheduler_metrics,
                 }
+                if preprocess_time is not None:
+                    metrics_update["preprocess_time_ms"] = preprocess_time * 1000
+                if output_ready_wait_time is not None:
+                    metrics_update["output_ready_wait_time_ms"] = output_ready_wait_time * 1000
                 if request.scheduler_queue_wait_ms is not None:
                     metrics_update["scheduler_queue_wait_ms"] = request.scheduler_queue_wait_ms
                 vae_decode_ms = extract_diffusion_vae_decode_ms(output)
