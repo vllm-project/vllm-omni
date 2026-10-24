@@ -16,6 +16,7 @@ Two groups:
 import os
 import zlib
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -134,6 +135,120 @@ def test_component_discovery_declarations():
     assert BooguImagePipeline._dit_modules == ["transformer"]
     assert BooguImagePipeline._encoder_modules == ["mllm"]
     assert BooguImagePipeline._vae_modules == ["vae"]
+
+
+def test_offload_plan_declared():
+    from vllm_omni.diffusion.models.boogu_image import BooguImagePipeline
+
+    # mllm/vae are intentionally NOT on-demand: staged offload requires
+    # load_to_device()/offload_to_cpu() which the stock Qwen3VL/AutoencoderKL
+    # modules do not implement.
+    plan = BooguImagePipeline._offload_plan
+    assert "mllm" not in plan.on_demand_component_paths
+    assert "vae" not in plan.on_demand_component_paths
+    assert "transformer" in plan.resident_dit_paths
+    assert plan.block_attrs == {"transformer": ("single_stream_layers", "double_stream_layers")}
+
+
+def test_dlo_resident_layers_attach_a_residency_controller(monkeypatch):
+    """``--dlo-resident-layers`` reaches Boogu's declared plan: the distributed
+    layerwise backend keeps the leading declared blocks resident and attaches
+    itself as the controller the denoise wrapper loads and releases."""
+    from tests.diffusion.offloader.helpers import patch_offload_runtime
+    from vllm_omni.diffusion.models.boogu_image import BooguImagePipeline
+    from vllm_omni.diffusion.offloader import distributed_layerwise_backend as dlo_module
+    from vllm_omni.diffusion.offloader.base import OffloadConfig, OffloadStrategy
+    from vllm_omni.diffusion.offloader.distributed_layerwise_backend import (
+        DistributedLayerwiseOffloadBackend,
+    )
+
+    patch_offload_runtime(monkeypatch, dlo_module.current_omni_platform, synchronize=True)
+
+    class _Transformer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.single_stream_layers = nn.ModuleList([nn.Linear(2, 2) for _ in range(2)])
+            self.double_stream_layers = nn.ModuleList([nn.Linear(2, 2) for _ in range(2)])
+
+    class _Pipeline(nn.Module):
+        # Exactly the plan the Boogu pipelines ship.
+        _offload_plan = BooguImagePipeline._offload_plan
+
+        def __init__(self):
+            super().__init__()
+            self.transformer = _Transformer()
+
+    pipeline = _Pipeline()
+    backend = DistributedLayerwiseOffloadBackend(
+        OffloadConfig(
+            strategy=OffloadStrategy.DISTRIBUTED_LAYER_WISE,
+            pin_cpu_memory=False,
+            dlo_use_allgather=False,
+            dlo_resident_layers=1,
+        ),
+        torch.device("cpu"),
+    )
+
+    backend.enable(pipeline)
+
+    assert len(backend._resident_blocks) == 1
+    assert pipeline._dlo_residency_controller is backend
+
+    backend.disable()
+    assert getattr(pipeline, "_dlo_residency_controller", None) is None
+
+
+@pytest.mark.parametrize("offload_field", ["enable_cpu_offload", "enable_layerwise_offload"])
+def test_pipeline_respects_offload_managed_component_placement(offload_field, mocker, mock_dependencies):
+    """With offload enabled the backend owns placement: __init__ must not
+    eagerly move the mllm/vae to the device."""
+    from vllm_omni.diffusion.models.boogu_image.pipeline_boogu_image import (
+        BooguImagePipeline,
+    )
+
+    mllm_inner = mock_dependencies["mllm_wrapper"].model
+    vae = mock_dependencies["vae"]
+
+    od_config = OmniDiffusionConfig(
+        model="dummy-boogu",
+        tf_model_config=TransformerConfig(params={}),
+        dtype=torch.float32,
+        num_gpus=1,
+        **{offload_field: True},
+    )
+    BooguImagePipeline(od_config=od_config)
+
+    assert mllm_inner.to.call_count == 0
+    assert vae.to.call_count == 0
+
+
+@pytest.mark.parametrize("offload_field", ["enable_cpu_offload", "enable_layerwise_offload"])
+def test_online_mllm_quantization_respects_offload_placement(offload_field, mock_dependencies):
+    """The online FP8 builder materializes real parameters, so an offload-owned
+    mllm must be constructed on CPU instead of on the execution device."""
+    from vllm_omni.diffusion.models.boogu_image.pipeline_boogu_image import (
+        BooguImagePipeline,
+    )
+
+    od_config = OmniDiffusionConfig(
+        model="dummy-boogu",
+        tf_model_config=TransformerConfig(params={}),
+        dtype=torch.bfloat16,
+        quantization_config="fp8",
+        **{offload_field: True},
+    )
+    pipeline = BooguImagePipeline(od_config=od_config)
+
+    assert pipeline._managed_component_placement
+    builder = mock_dependencies["mllm_builder"]
+    builder.assert_called_once()
+    assert builder.call_args.kwargs["device"] == torch.device("cpu")
+
+
+def test_pipeline_moves_components_without_offload(boogu_pipeline, mock_dependencies):
+    """Without offload the pipeline keeps the eager placement it always had."""
+    assert mock_dependencies["mllm_wrapper"].model.to.call_count == 1
+    assert mock_dependencies["vae"].to.call_count == 1
 
 
 def test_constructor_wires_components(boogu_pipeline, mock_dependencies):
@@ -918,6 +1033,90 @@ def _make_turbo_forward_pipeline():
     pipeline = _make_forward_pipeline(BooguImageTurboPipeline)
     pipeline.transformer = _RecordingDMDTransformer(velocity=0.125)
     return pipeline
+
+
+def _residency_recorder(events):
+    """Controller stand-in that timestamps the residency stage boundaries."""
+    controller = MagicMock(name="dlo_residency_controller")
+    controller.load_resident_layers.side_effect = lambda: events.append("load")
+    controller.offload_resident_layers.side_effect = lambda: events.append("offload")
+    return controller
+
+
+class _StepRecordingTransformer(_FakeTransformer):
+    """Fake DiT that timestamps every denoise step into ``self.events``."""
+
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
+
+    def __call__(self, *args, **kwargs):
+        self.events.append("step")
+        return super().__call__(*args, **kwargs)
+
+
+class _StepRecordingDMDTransformer(_RecordingDMDTransformer):
+    """Turbo DMD DiT that timestamps every student step."""
+
+    def __init__(self, events: list[str], velocity: float = 0.0) -> None:
+        super().__init__(velocity=velocity)
+        self.events = events
+
+    def __call__(self, *args, **kwargs):
+        self.events.append("step")
+        return super().__call__(*args, **kwargs)
+
+
+class _DecodeRecordingVAE(_FakeDecodeVAE):
+    """Fake VAE that timestamps the decode stage."""
+
+    def __init__(self, events: list[str]) -> None:
+        super().__init__()
+        self.events = events
+
+    def decode(self, *args, **kwargs):
+        self.events.append("decode")
+        return super().decode(*args, **kwargs)
+
+
+def test_base_denoise_loop_brackets_the_residency_window():
+    """DLO resident blocks load for the denoise loop and release before decode."""
+    events: list[str] = []
+    pipeline = _make_forward_pipeline()
+    pipeline.transformer = _StepRecordingTransformer(events)
+    pipeline.vae = _DecodeRecordingVAE(events)
+    controller = _residency_recorder(events)
+    pipeline._dlo_residency_controller = controller
+    req = _make_request_batch("a cat", height=64, width=64, num_inference_steps=2)
+
+    pipeline.forward(req)
+
+    controller.load_resident_layers.assert_called_once_with()
+    controller.offload_resident_layers.assert_called_once_with()
+    # One window covering exactly the DiT steps: the blocks are released before
+    # VAE decode so the decode stage can reuse the HBM.
+    assert events[0] == "load"
+    assert events[-2:] == ["offload", "decode"]
+    assert set(events[1:-2]) == {"step"}
+
+
+def test_turbo_dmd_loop_brackets_the_residency_window():
+    """Turbo returns before the shared residency wrapper, so the DMD loop needs
+    its own window: resident blocks are placeholders until ``load`` runs."""
+    events: list[str] = []
+    pipeline = _make_turbo_forward_pipeline()
+    pipeline.transformer = _StepRecordingDMDTransformer(events, velocity=0.125)
+    pipeline.vae = _DecodeRecordingVAE(events)
+    controller = _residency_recorder(events)
+    pipeline._dlo_residency_controller = controller
+    req = _make_request_batch("a cat", height=64, width=64, generator=torch.Generator(device="cpu").manual_seed(7))
+
+    pipeline.forward(req)
+
+    controller.load_resident_layers.assert_called_once_with()
+    controller.offload_resident_layers.assert_called_once_with()
+    assert events[0] == "load"
+    assert events[-2:] == ["offload", "decode"]
+    assert events[1:-2] == ["step"] * 4
 
 
 def test_turbo_dmd_uses_four_steps_with_real_rope_without_regular_scheduler():
