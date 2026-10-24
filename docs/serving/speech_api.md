@@ -282,11 +282,15 @@ Upload a new voice sample for voice cloning in Base task TTS requests.
 
 | Parameter | Type | Required | Description |
 | ----------- | ------ | ---------- | ------------- |
-| `audio_sample` | file | Yes | Audio file (max 10MB, supported formats: wav, mp3, flac, ogg, aac, webm, mp4) |
+| `audio_sample` | file | Yes | Audio file (size limit described below; supported formats: wav, mp3, flac, ogg, aac, webm, mp4) |
 | `consent` | string | Yes | Consent recording ID |
 | `name` | string | Yes | Name for the new voice |
 | `ref_text` | string | No | Transcript of the audio. When provided, enables in-context voice cloning (higher quality). Without it, only the speaker embedding is extracted. |
 | `speaker_description` | string | No | Free-form description of the voice (e.g. "warm narrator", "energetic presenter"). Stored as metadata and returned in `GET /v1/audio/voices`. |
+
+The upload size limit is 10 MiB per 30 seconds of the model's reference-duration
+cap: 10 MiB by default, or 20 MiB for VibeVoice's 60-second cap. File size is
+checked before decoding; the decoded duration must also fit the model's cap.
 
 **Response Example:**
 

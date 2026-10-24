@@ -450,6 +450,17 @@ source_file_dependencies:
 
   tts_vibevoice_function:
     - tests/e2e/offline_inference/test_vibevoice_tts.py
+    - tests/e2e/online_serving/test_vibevoice_tts.py
+    - tests/helpers/mark.py
+    - tests/helpers/runtime.py
+    - tests/helpers/stage_config.py
+    - tests/helpers/client.py
+    - tests/helpers/assertions.py
+    - vllm_omni/entrypoints/openai/tts_adapters/vibevoice.py
+    - vllm_omni/entrypoints/openai/tts_adapters/base.py
+    - vllm_omni/entrypoints/openai/tts_adapters/__init__.py
+    - vllm_omni/entrypoints/openai/serving_speech.py
+    - vllm_omni/entrypoints/openai/protocol/audio.py
     - tests/assets/qwen3_tts/clone_2.wav
     - vllm_omni/model_executor/models/vibevoice/
     - vllm_omni/model_executor/models/registry.py

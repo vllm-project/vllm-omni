@@ -27,10 +27,20 @@ For the full list of supported architectures across all modalities, see
 | MOSS-TTS-Nano | `OpenMOSS-Team/MOSS-TTS-Nano` | ✓ (`ref_audio` required) | ✓ (PCM stream) | — | ✓ |
 | OmniVoice | `k2-fsa/OmniVoice` | ✓ | — | — | — |
 | Qwen3-TTS | `Qwen/Qwen3-TTS-12Hz-1.7B-{CustomVoice,VoiceDesign,Base}` | ✓ (Base) | ✓ (PCM + WebSocket) | ✓ (presets + `/v1/audio/voices` upload) | ✓ (standard + FastRTC) |
+| VibeVoice-1.5B | `vibevoice/VibeVoice-1.5B-hf` | ✓ (optional, up to four speakers) | ✓ (SSE / PCM / WAV) | uploaded audio voice for single-speaker requests; no presets | — |
 | VoxCPM2 | `openbmb/VoxCPM2` | ✓ | ✓ (AudioWorklet via gradio) | — | ✓ |
 | Voxtral TTS | `mistralai/Voxtral-4B-TTS-2603` | ✓ (gated upstream) | ✓ | ✓ (presets) | ✓ |
 
 CosyVoice3 is intentionally absent: no online example exists for it yet. See its [offline section](../../offline_inference/text_to_speech/README.md#cosyvoice3) instead.
+
+## VibeVoice
+
+See the [H100 recipe](../../../recipes/Microsoft/VibeVoice-1.5B-H100.md#online-serving)
+for launch and request examples. Use plain text or `Speaker N:` dialogue
+(up to four distinct speakers). Omit `voice` and `ref_audio` for native
+no-reference generation; no default voice is substituted. Reference lists
+condition speakers in first-appearance order. Output is 24 kHz mono;
+non-streaming, SSE and raw PCM/WAV streaming are supported.
 
 ## Common Quick Start
 

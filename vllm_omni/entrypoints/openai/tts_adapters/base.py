@@ -276,6 +276,13 @@ class TTSModelAdapter(ABC):
     #: Target sample rates validated for this adapter's output path. An empty
     #: set means that the adapter does not expose per-request resampling.
     supported_output_sample_rates: ClassVar[frozenset[int]] = frozenset()
+    #: Maximum reference-audio duration (seconds) this model accepts via
+    #: ``/v1/audio/speech``. ``None`` keeps the shared serving default
+    #: (``_REF_AUDIO_MAX_DURATION``), so existing models are unchanged. A
+    #: model whose offline processor allows a longer reference sets this so
+    #: the shared online resolver does not reject valid clips before the
+    #: adapter runs.
+    max_reference_duration: ClassVar[float | None] = None
 
     max_new_tokens_min = 1
 

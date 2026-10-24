@@ -313,6 +313,9 @@ def test_app(mocker: MockerFixture, tmp_path, monkeypatch):
     # multiple valid dimensions. Supply the adapter contract without imposing
     # one real model's fixed embedding dimension on this shared fixture.
     speech_server._adapter = mocker.MagicMock()
+    # Keep the shared 30 s reference cap: a bare MagicMock's
+    # max_reference_duration would be a truthy Mock, not a float.
+    speech_server._adapter.max_reference_duration = None
     speech_server._adapter.validate_tts_embedding_dim.return_value = None
     speech_server._tts_tokenizer = lambda text, padding=False: {"input_ids": text.split()}
 
@@ -771,7 +774,7 @@ class TestSpeechAPI:
         assert response.status_code == 400
         result = response.json()
         assert "detail" in result
-        assert "10MB" in result["detail"]
+        assert "10 MiB" in result["detail"]
 
     def test_upload_voice_invalid_mime_type(self, client):
         """Test voice upload with invalid MIME type."""
