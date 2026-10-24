@@ -66,6 +66,7 @@ from vllm_omni.entrypoints.utils import prepare_stage_config_inputs
 from vllm_omni.inputs.data import OmniSamplingParams
 from vllm_omni.inputs.preprocess import build_omni_renderer
 from vllm_omni.metrics.prometheus import OmniRequestCounter
+from vllm_omni.scheduling.config import TailAwareSchedulingConfig
 
 logger = init_logger(__name__)
 
@@ -125,6 +126,8 @@ class OmniEngineBase:
     _enable_orch_monitor: bool = False
     _client_config: OmniClientConfig | None = None
     _output_sink: OutputQueueSink | None = None
+    _tail_aware_scheduling_config: TailAwareSchedulingConfig = TailAwareSchedulingConfig()
+    _tail_aware_model_class: str | None = None
 
     def __init__(
         self,
@@ -289,6 +292,17 @@ class OmniEngineBase:
             )
             for stage in self.stage_configs
         )
+        from vllm_omni.engine.tail_aware_runtime import prepare_tail_aware_stages
+
+        self._tail_aware_model_class = prepare_tail_aware_stages(
+            self.stage_configs,
+            self._tail_aware_scheduling_config,
+            model=self.model,
+            distributed=self.single_stage_mode or self._omni_master_address is not None,
+            async_chunk=self.async_chunk,
+            session_mode=getattr(self.deploy_config, "session_mode", "turn"),
+            api_client_count=int((self._client_config or {}).get("client_count", 1)),
+        )
         self.stage_pools: list[StagePool] = []
         self.stage_clients: list[StageClient] = []  # logical-stage view for external readers
         self.input_processor: InputProcessor | None = None
@@ -408,6 +422,11 @@ class OmniEngineBase:
 
         self.num_stages = len(self.stage_configs)
         self.stage_pools = self._runtime.stage_pools
+        if self._tail_aware_model_class is not None:
+            self.stage_pools[0].configure_tail_aware_scheduling(
+                self._tail_aware_scheduling_config,
+                model_class_name=self._tail_aware_model_class,
+            )
         self.stage_clients = [
             cast(StageClient, pool.stage_client) for pool in self.stage_pools if pool.stage_client is not None
         ]
@@ -686,6 +705,7 @@ class OmniEngineBase:
         )
         if isinstance(resolution, OmniConfigResolution):
             self._config_resolution = resolution
+            self._tail_aware_scheduling_config = resolution.tail_aware_scheduling_config
             config_path = resolution.config_path
             stage_configs = list(resolution.stage_configs)
             strategy_lb_policy = resolution.omni_lb_policy

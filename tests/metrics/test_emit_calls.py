@@ -327,8 +327,10 @@ class TestStageWaitingAggregation:
     @staticmethod
     def _make_orchestrator(mocker):
         from vllm_omni.engine.orchestrator import Orchestrator
+        from vllm_omni.engine.stage_pool import StagePool
 
         orchestrator = object.__new__(Orchestrator)
+        orchestrator.stage_pools = [StagePool(stage_id, []) for stage_id in range(3)]
         orchestrator._prom_metrics = mocker.Mock()
         orchestrator._stage_replica_waiting = {}
         return orchestrator
