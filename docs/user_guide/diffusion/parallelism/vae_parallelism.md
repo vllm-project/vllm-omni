@@ -188,7 +188,7 @@ outputs when selecting a deployment configuration.
 
 ---
 
-## Spatially-Sharded Decode (Wan)
+## Spatially-Sharded Decode and Encode (Wan)
 
 The default `vae_parallel_mode="tile"` distributes whole tiles across ranks. For the **Wan** VAE there is an alternative decode strategy, **spatially-sharded decode**, selected via `vae_parallel_mode="spatial_shard_height"` or `vae_parallel_mode="spatial_shard_width"`.
 
@@ -219,7 +219,8 @@ vllm serve Wan-AI/Wan2.1-T2V-1.3B-Diffusers --omni \
 
 **Constraints and behavior:**
 
-- Spatial-shard decode is **decode-only** and currently implemented for the **Wan** VAE. Other models ignore `spatial_shard_*` modes.
+- Spatial-shard modes are implemented for the **Wan** VAE. Other models ignore `spatial_shard_*` modes.
+- **Encode** (I2V/TI2V conditioning) is sharded the same way when the split extent divides into equal shards that stay even through every stride-2 downsample: `world_size * 8` for the Wan2.1 VAE (A14B), `world_size * 16` for the Wan2.2 TI2V VAE. The result matches untiled encode within numerical tolerance. Other shapes take the regular encode path (tile-parallel when `vae_use_tiling` is set, otherwise a full-frame encode on every rank); for example 1280x720 on 4 or 8 ranks qualifies with `spatial_shard_width` but not `spatial_shard_height`.
 - It requires `vae_patch_parallel_size` to **match the DiT process group size**. If it does not, the VAE logs a warning and **falls back to tile-parallel decode** at runtime for latents larger than one tile, whether or not `vae_use_tiling` is set. Chunked (streaming) decode has no tile-parallel path: there it decodes locally on every rank, or raises if `vae_use_tiling` is set.
 - `spatial_shard_height` and `spatial_shard_width` are mutually exclusive for a given VAE instance (the decoder is patched in place for a single split dimension).
 

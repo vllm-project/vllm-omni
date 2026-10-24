@@ -1099,7 +1099,8 @@ class OmniServeCommand(CLISubcommand):
             "'batch' distributes complete images for AutoencoderKL/Flux2 with DP/PP/CFG sizes of 1; "
             "'spatial_shard_height'/'spatial_shard_width' use spatially-sharded decode that splits "
             "decoder feature maps along height/width and exchanges halo regions. The "
-            "'spatial_shard_*' modes require vae_patch_parallel_size to match the DiT group size. "
+            "'spatial_shard_*' modes require vae_patch_parallel_size to match the DiT group size; "
+            "for Wan they also shard encode when the split extent divides into stride-aligned shards. "
             "Equivalent to setting DiffusionParallelConfig.vae_parallel_mode.",
         )
 
