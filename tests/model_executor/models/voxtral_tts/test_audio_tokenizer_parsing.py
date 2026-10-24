@@ -227,8 +227,17 @@ def audio_tokenizer(monkeypatch: pytest.MonkeyPatch):
     "model_dtype", [torch.float16, torch.bfloat16, torch.float32], ids=["float16", "bfloat16", "float32"]
 )
 @pytest.mark.parametrize("frame_counts", [(116,), (380, 0, 7, 3)], ids=["warmup", "mixed_chunks"])
-def test_batch_decode_matches_decoder_dtype(audio_tokenizer, model_dtype: torch.dtype, frame_counts: tuple[int, ...]):
+def test_batch_decode_matches_decoder_dtype(
+    audio_tokenizer, model_dtype: torch.dtype, frame_counts: tuple[int, ...], monkeypatch: pytest.MonkeyPatch
+):
     audio_tokenizer.to(dtype=model_dtype)
+    decode = audio_tokenizer.decode
+
+    def checked_decode(codes: torch.Tensor, dtype: torch.dtype = torch.float32) -> torch.Tensor:
+        assert dtype == model_dtype
+        return decode(codes, dtype=dtype)
+
+    monkeypatch.setattr(audio_tokenizer, "decode", checked_decode)
     codes_list = []
     expected = []
     for frames in frame_counts:

@@ -1060,7 +1060,7 @@ class VoxtralTTSAudioGenerationForConditionalGeneration(nn.Module, SupportsMulti
             llm_hidden=hidden_states,
             cfg_alpha=cfg_alpha,
         )
-        # These flags are written back into hidden_states with indexed assignment.
+        # Match hidden_states.dtype for the caller's indexed write-back into channel 0.
         fake_eos = (audio_codes[:, 0] == self._end_audio_token_id).to(dtype=hidden_states.dtype)
         # BxC -> Bx1xC since this is per-step
         # Make it a list for vllm-omni processing
