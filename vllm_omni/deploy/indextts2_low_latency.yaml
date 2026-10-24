@@ -31,6 +31,8 @@ stages:
     enforce_eager: false
     attention_backend: FLASHINFER
     async_scheduling: false
+    # IndexTTS prefill does not support chunked prefill (see indextts2.yaml).
+    enable_chunked_prefill: false
     max_num_batched_tokens: 4096
     max_model_len: 2560
     devices: "0"
