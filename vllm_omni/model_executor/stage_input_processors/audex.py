@@ -22,6 +22,7 @@ from vllm.logger import init_logger
 from vllm_omni.data_entry_keys import CodesStruct, MetaStruct, OmniPayloadStruct
 from vllm_omni.inputs.data import OmniTokensPrompt
 from vllm_omni.model_executor.stage_input_processors.bagel import ExpandedPrompt
+from vllm_omni.model_executor.stage_input_processors.tts_utils import per_request_initial_chunk_size_override
 
 logger = init_logger(__name__)
 
@@ -179,6 +180,7 @@ def thinker2code2wav_async_chunk(
     cfg = _connector_extra(transfer_manager)
     chunk_frames = int(cfg.get("codec_chunk_frames", 25))
     initial_chunk_frames = int(cfg.get("initial_codec_chunk_frames", chunk_frames))
+    initial_chunk_frames, _ = per_request_initial_chunk_size_override(request, initial_chunk_frames)
     codec_offset = int(cfg.get("codec_token_offset", _DEFAULT_CODEC_TOKEN_OFFSET))
     codec_size = int(cfg.get("codec_vocab_size", _DEFAULT_CODEC_VOCAB_SIZE))
     if chunk_frames <= 0 or initial_chunk_frames <= 0:
