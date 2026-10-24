@@ -61,12 +61,12 @@ def _sdpa_attention(
     enable_gqa = False
     if query.shape[1] != key.shape[1]:
         enable_gqa = True
+        if query.shape[1] % key.shape[1] != 0:
+            raise ValueError(
+                "GQA requires query heads to be a multiple of KV heads, "
+                f"got q_heads={query.shape[1]} and kv_heads={key.shape[1]}."
+            )
         if _sdpa_uses_expanded_kv(query, key, value, attention_mask, causal):
-            if query.shape[1] % key.shape[1] != 0:
-                raise ValueError(
-                    "GQA requires query heads to be a multiple of KV heads, "
-                    f"got q_heads={query.shape[1]} and kv_heads={key.shape[1]}."
-                )
             repeat_num = query.shape[1] // key.shape[1]
             key = key.repeat_interleave(repeat_num, dim=1)
             value = value.repeat_interleave(repeat_num, dim=1)

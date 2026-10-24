@@ -3,10 +3,12 @@
 
 from contextlib import nullcontext
 from functools import cache
+from importlib.metadata import PackageNotFoundError, version
 from typing import Any
 
 import torch
 import torch.nn as nn
+from packaging.version import InvalidVersion, Version
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.v1.kv_cache_interface import FullAttentionSpec
@@ -67,6 +69,15 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
 
     _omni_enum = OmniPlatformEnum.NPU
     dist_backend: str = "hccl"
+
+    @classmethod
+    @cache
+    def supports_sdpa_native_gqa(cls) -> bool:
+        # Older torch-npu SDPA bindings require explicit K/V expansion.
+        try:
+            return Version(version("torch-npu")) >= Version("2.10.0")
+        except (PackageNotFoundError, InvalidVersion):
+            return False
 
     @classmethod
     def get_attn_backend_cls(cls, selected_backend, attn_selector_config, num_heads: int | None = None):
