@@ -40,7 +40,10 @@ ENV VLLM_OMNI_TARGET_DEVICE=xpu
 # Keep the upstream oneCCL, torch and Triton packages paired. The final
 # vLLM XPU wheel requires triton==3.8.0+xpu; installing the old triton-xpu
 # overlay would replace that runtime with an incompatible version.
+# The kernels egg_info hook imports kernels_data. Install that runtime before
+# building Omni without isolation in the shared environment.
 RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install "kernels-data>=0.14.0.dev1" && \
     uv pip install --no-build-isolation --excludes <(printf "torch\ntriton-xpu\n") \
     ".[dev]"
 
