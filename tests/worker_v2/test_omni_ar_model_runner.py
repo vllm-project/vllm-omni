@@ -148,6 +148,7 @@ def test_voxcpm2_streaming_output_owns_channels_and_finalizes_once(monkeypatch, 
         assert output.multimodal_outputs == [{}, {}]
 
 
+@hardware_test(res={"cuda": "L4"})
 @pytest.mark.parametrize("needs_history", [False, True])
 def test_last_pp_rank_orchestration_and_kv_resolver(monkeypatch, needs_history) -> None:
     runner = OmniARModelRunner.__new__(OmniARModelRunner)
