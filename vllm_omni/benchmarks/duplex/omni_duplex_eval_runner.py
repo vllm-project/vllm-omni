@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pybase64 as base64
+from vllm.logger import init_logger
 
 from vllm_omni.benchmarks.duplex.omni_duplex_eval_dataset import DuplexSample
 from vllm_omni.benchmarks.duplex_session_inputs import (
@@ -64,8 +65,20 @@ DEFAULT_INSTRUCTIONS = "Streaming Omni Conversation."
 MIX_QUESTION = "question"
 MIX_SOUNDTRACK = "soundtrack"
 MIX_MODES = (MIX_QUESTION, MIX_SOUNDTRACK)
+logger = init_logger(__name__)
+
 _SERVER_TURN_SETTLE_S = 2.0
 _COMPLETION_SETTLE_S = 2.0
+# Bound the closing playback ack: it rides the session socket, so a stuck write
+# must not hold the sample open until the benchmark's per-request timeout.
+_FINAL_ACK_TIMEOUT_S = 20.0
+# The same bound for the closing write path. ``close_session`` awaits an
+# unbounded ``send({"type": "session.close"})`` before its own timeout starts,
+# so the deadline has to cover the send as well (see ``_close_duplex_session``).
+_FINAL_CLOSE_TIMEOUT_S = 20.0
+# How long a cancelled close may take to unwind before the transport is torn
+# down underneath it.
+_FORCE_CLOSE_GRACE_S = 5.0
 # Events that can still open or extend a response after the commit. Playback
 # acknowledgements are omitted: the runner sends one every 250 ms for any
 # response that produced audio, and the server echoes each one, so counting
@@ -350,6 +363,91 @@ async def _wait_for_server_turns(client: RealtimeDuplexClient, *, timeout_s: flo
     raise TimeoutError("Timed out waiting for server-detected turns to finish")
 
 
+def _consume_task_exception(task: asyncio.Task) -> None:
+    """Retrieve a task failure nobody awaits, so asyncio does not warn about it."""
+    if not task.cancelled():
+        task.exception()
+
+
+async def _force_close_transport(client: RealtimeDuplexClient) -> None:
+    """Tear the WebSocket down underneath a session whose writes are stuck.
+
+    A stuck write cannot answer a close handshake, and the client's own exit
+    path awaits one: waiting for it would cost the sample both its result and
+    its artifacts. Aborting the transport closes the connection without the
+    peer's cooperation, which is what lets the (bounded) close afterwards
+    return.
+    """
+    ws = getattr(client, "_ws", None)
+    if ws is None:
+        return
+    transport = getattr(ws, "transport", None)
+    if transport is not None:
+        transport.abort()
+    try:
+        await asyncio.wait_for(ws.close(), timeout=_FORCE_CLOSE_GRACE_S)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - a dead socket can raise anything
+        logger.warning("DuplexEval: closed the realtime transport without a handshake: %s", exc)
+
+
+async def _discard_close_attempt(task: asyncio.Task, client: RealtimeDuplexClient) -> None:
+    """Cancel a close that is not coming back and tear its transport down."""
+    task.cancel()
+    _, pending = await asyncio.wait({task}, timeout=_FORCE_CLOSE_GRACE_S)
+    logger.warning(
+        "DuplexEval: the session close %s; tearing the transport down",
+        "ignored cancellation" if pending else "was cancelled",
+    )
+    # Even a close that noticed the cancellation leaves a socket whose write is
+    # stuck: the client's exit path would await the handshake on it. The session
+    # is over either way, so take the connection down here.
+    await _force_close_transport(client)
+
+
+async def _bounded_ack_join(task: asyncio.Task) -> None:
+    """Join a cancelled periodic playback ack without waiting on it forever.
+
+    A stuck playback-ack write can swallow its first cancellation, and the
+    ``await ack_task`` cleanup would then park the sample on the same socket
+    the close path already learned to abandon.
+    """
+    _, pending = await asyncio.wait({task}, timeout=_FORCE_CLOSE_GRACE_S)
+    if pending:
+        task.add_done_callback(_consume_task_exception)
+        logger.warning("DuplexEval: the periodic playback ack ignored cancellation")
+    elif not task.cancelled() and task.exception() is not None:
+        raise task.exception()
+
+
+async def _close_duplex_session(client: RealtimeDuplexClient, *, timeout_s: float = _FINAL_CLOSE_TIMEOUT_S) -> None:
+    """Close the session within one deadline, the closing write included.
+
+    :meth:`RealtimeDuplexClient.close_session` awaits an unbounded
+    ``send({"type": "session.close"})`` before its own timeout starts, so the
+    write that already stalled the playback ack stalls here as well. Running it
+    as a task puts the deadline over the whole path and lets a stuck write be
+    torn down instead of waited on: the sample then still returns a result and
+    writes its artifacts, and an outer cancellation does not wait indefinitely
+    for the close to unwind either.
+    """
+    task = asyncio.ensure_future(client.close_session(timeout_s=timeout_s))
+    task.add_done_callback(_consume_task_exception)
+    try:
+        await asyncio.wait_for(asyncio.shield(task), timeout=timeout_s)
+        return
+    except TimeoutError:
+        pass
+    except BaseException:
+        # Cancelled from outside (per-request timeout): still leave no socket
+        # behind that the client's exit path would wait on.
+        await _discard_close_attempt(task, client)
+        raise
+    await _discard_close_attempt(task, client)
+    raise TimeoutError(f"Timed out closing the duplex session after {timeout_s:g}s")
+
+
 async def generate_sample(
     sample: DuplexSample,
     *,
@@ -425,6 +523,9 @@ async def generate_sample(
     response_done = False
     drain_timeout = None
     close_timeout = None
+    ack_timeout = None
+    server_errors: list[str] = []
+    input_committed = False
     stream_start: float | None = None
     async with client:
         await client.configure(
@@ -485,6 +586,7 @@ async def generate_sample(
                     response_done = client.events.count("response.done") > 0
                 else:
                     await client.commit()
+                    input_committed = True
                     await wait_for(
                         responses_finished,
                         timeout_s=max(20.0, prepared.duration + 20.0),
@@ -496,14 +598,31 @@ async def generate_sample(
         finally:
             ack_task.cancel()
             try:
-                await ack_task
+                await _bounded_ack_join(ack_task)
             except asyncio.CancelledError:
                 pass
-        await client.acknowledge_playback()
         try:
-            await client.close_session(timeout_s=20.0)
+            ack_probe = asyncio.ensure_future(client.acknowledge_playback())
+            ack_probe.add_done_callback(_consume_task_exception)
+            await asyncio.wait_for(asyncio.shield(ack_probe), timeout=_FINAL_ACK_TIMEOUT_S)
         except TimeoutError as exc:
+            # The ack only checkpoints how much audio was played, and it is sent
+            # over the same socket the session already used: a stuck write must
+            # not cost the sample its artifacts (an unbounded wait here left the
+            # sample with no files at all, which the accuracy pass then counted
+            # as skipped rather than as a diagnosable failure). A write that
+            # ignores its cancellation cannot hold this deadline either, so the
+            # probe is shielded and abandoned detached instead of being waited on.
+            ack_timeout = str(exc)
+            logger.warning("DuplexEval: playback ack not delivered for sample %s: %s", sample.id, exc)
+        try:
+            await _close_duplex_session(client, timeout_s=_FINAL_CLOSE_TIMEOUT_S)
+        except TimeoutError as exc:
+            # Same socket, same stall as the ack above: a close that never lands
+            # is recorded and the transport is torn down, so the sample still
+            # produces a result and its artifacts.
             close_timeout = str(exc)
+            logger.warning("DuplexEval: session close not delivered for sample %s: %s", sample.id, exc)
         events = list(client.events.events)
         collector = _event_collector_from_realtime(client.events)
     timed = [sentence.as_dict() for sentence in extract_timed_sentences(events, clock=clock)]
@@ -521,8 +640,11 @@ async def generate_sample(
         "frame_transport": frame_transport,
         "instructions": instructions,
         "response_done": response_done,
+        "input_committed": input_committed,
         "drain_timeout": drain_timeout,
         "close_timeout": close_timeout,
+        "ack_timeout": ack_timeout,
+        "server_errors": server_errors,
         "ref_audio_sha256": prepared.ref_audio_sha256,
     }
     from vllm_omni.benchmarks.duplex_session_metrics import collect_duplex_session_metrics
@@ -533,13 +655,17 @@ async def generate_sample(
         session_id=sample.id,
     )
     errors = []
+    # Server-side failures are recorded apart from the timeouts below: the
+    # timeout strings are folded into ``error``, so a retry policy cannot tell a
+    # client-side stall from a reported server failure by that string alone.
     for event in client.events.errors():
         error = event.get("error")
         code = error.get("code") if isinstance(error, dict) else event.get("code")
         # As in OmniInteract, an ACK racing a later commit is harmless. All
         # other server errors still make the serving sample unsuccessful.
         if code not in {"playback_ack_too_late", "playback_item_not_found"}:
-            errors.append(str(event))
+            server_errors.append(str(event))
+    errors.extend(server_errors)
     errors.extend(str(error) for error in (drain_timeout, close_timeout) if error)
     finished = set()
     for event in events:
