@@ -13,6 +13,8 @@ from vllm_omni.experimental.ar_diffusion.cell_schedule import (
     group_of_block,
     is_group_boundary,
     max_local_blocks,
+    rank_of_block,
+    replica_of,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -395,3 +397,37 @@ def test_wait_ready_nonempty_after_cell_expand():
     )
     wait_entries = sum(len(plan.wait_ready(slot, rank)) for slot in range(plan.num_slots) for rank in range(plan.world))
     assert wait_entries > 0
+
+
+@pytest.mark.parametrize("groups", [1, 2, 4])
+def test_four_step_same_step_has_local_history(groups):
+    schedule = CellSchedule(
+        chunks=24,
+        num_denoise_steps=4,
+        step_replicas=4,
+        layer_groups=groups,
+        ordering=Ordering.SAME_STEP,
+        kv_history_chunks=18,
+        blocks=groups * 2,
+    )
+    plan = build_cell_plan(schedule)
+    tasks = set()
+    for tick in range(plan.num_ticks):
+        assert plan.transfers(tick) == ()
+        for rank in range(plan.world):
+            assert plan.wait_ready(tick, rank) == frozenset()
+            task = plan.task(tick, rank)
+            if task is None:
+                continue
+            assert task not in tasks
+            tasks.add(task)
+            chunk, step, block = task
+            assert 0 <= step < 4
+            assert replica_of(step, schedule) == rank // groups
+            assert rank_of_block(step, block, schedule) == rank
+            expected = {(prev, step, block) for prev in range(max(0, chunk - 18), chunk)}
+            sources = plan.sources(task, rank)
+            assert {source.version for source in sources} == expected
+            assert all(source.owner == rank for source in sources)
+            assert all(plan.completion_tick(source.version) < tick for source in sources)
+    assert len(tasks) == 24 * 4 * schedule.num_blocks
