@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import os
 import tempfile
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, nullcontext
 from unittest.mock import patch
 
 import pytest
@@ -19,6 +19,7 @@ from torch.distributed.fsdp import MixedPrecisionPolicy
 import vllm_omni.diffusion.offloader.distributed_layerwise_backend as dlo_module
 from tests.diffusion.models.magi2.test_native_distributed_parity import (
     _current_group,
+    _musa_ulysses_layouts,
     _new_groups,
     _patched_groups,
 )
@@ -147,14 +148,17 @@ def _distributed_worker(rank: int, rendezvous: str) -> None:
             _enable_dlo(model, dp_group=dp_process_group, dp_size=len(dp_ranks), dp_rank=dp_ranks.index(rank))
 
         variants = (
-            ("dlo_rank_local_sp2", sp_group, dlo_rank_local),
-            ("dlo_allgather_dp2sp2", sp_group, dlo_allgather),
-            ("hsdp4", singleton, _enable_hsdp),
+            ("dlo_rank_local_sp2", sp_group, dlo_rank_local, False),
+            ("dlo_rank_local_sp2_musa_ulysses", sp_group, dlo_rank_local, True),
+            ("dlo_allgather_dp2sp2", sp_group, dlo_allgather, False),
+            ("hsdp4", singleton, _enable_hsdp, False),
         )
-        for name, ulysses_group, enable in variants:
+        eager_outputs = {}
+        for name, ulysses_group, enable, musa_ulysses in variants:
             with ExitStack() as stack:
                 stack.enter_context(_patched_groups(singleton, ulysses_group))
                 stack.enter_context(_cpu_offload_runtime())
+                stack.enter_context(_musa_ulysses_layouts() if musa_ulysses else nullcontext())
                 outputs = {}
                 for compile_regions in (False, True):
                     model = Magi2PreviewTransformer(_tiny_config())
@@ -163,7 +167,14 @@ def _distributed_worker(rank: int, rendezvous: str) -> None:
                     outputs[compile_regions] = _run(model, compile_regions=compile_regions)
             _assert_same(outputs[False], expected, exact=False, label=f"{name} eager vs single-rank oracle")
             _assert_same(outputs[True], outputs[False], exact=True, label=f"{name} compiled vs eager")
+            eager_outputs[name] = outputs[False]
             dist.barrier()
+        _assert_same(
+            eager_outputs["dlo_rank_local_sp2_musa_ulysses"],
+            eager_outputs["dlo_rank_local_sp2"],
+            exact=True,
+            label="MUSA Ulysses layouts vs dlo_rank_local_sp2",
+        )
     finally:
         dist.destroy_process_group()
 
