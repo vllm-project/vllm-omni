@@ -130,7 +130,7 @@ def test_block_forward_hands_native_kv_heads_to_shared_layer(monkeypatch, modula
 
     monkeypatch.setattr(block.attn.omni_attn, "forward", spy)
     with torch.no_grad():
-        out = block(hidden, mask, rotary, temb)
+        out = block(hidden, mask, rotary, temb, attention_mask_mode="padding")
     assert out.shape == hidden.shape and torch.isfinite(out).all()
     assert len(seen) == 1
     q_shape, k_shape, v_shape, metadata = seen[0]
@@ -138,6 +138,7 @@ def test_block_forward_hands_native_kv_heads_to_shared_layer(monkeypatch, modula
     assert k_shape == v_shape == (BATCH, SEQ, 2, block.head_dim)
     assert metadata is not None and metadata.attn_mask.dtype == torch.bool
     assert torch.equal(metadata.attn_mask, mask)
+    assert metadata.extra["attention_mask_mode"] == "padding"
 
 
 def test_empty_text_stream_skips_the_entire_context_refiner():
@@ -158,7 +159,14 @@ def test_empty_text_stream_skips_the_entire_context_refiner():
     image = torch.zeros(BATCH, SEQ, DIM)
 
     refined_text, refined_image = model._apply_refiners(
-        text, text_mask, torch.empty(1, 0, DIM), image, None, None, None
+        text,
+        text_mask,
+        torch.empty(1, 0, DIM),
+        image,
+        None,
+        None,
+        None,
+        context_attention_mask_mode="none",
     )
 
     assert refined_text.shape == text.shape
