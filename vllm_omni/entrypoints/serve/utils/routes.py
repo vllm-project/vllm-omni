@@ -13,6 +13,18 @@ from fastapi import APIRouter, FastAPI
 from starlette.routing import Route
 
 
+def route_is_mounted(
+    app: FastAPI,
+    path: str,
+    methods: Set[str],
+) -> bool:
+    """Whether the app already serves one of ``methods`` on ``path``."""
+    return any(
+        isinstance(route, Route) and route.path == path and route.methods is not None and route.methods & methods
+        for route in app.routes
+    )
+
+
 def remove_route_from_app(
     app: FastAPI,
     path: str,
