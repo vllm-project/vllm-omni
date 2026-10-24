@@ -1271,9 +1271,9 @@ class TestDense4DMaskRouting:
     """
 
     @staticmethod
-    def _backend(*, supports_4d_mask: bool):
+    def _backend(*, supports_4d_mask: bool, piecewise: bool = False):
         class _Backend:
-            supports_piecewise_spans = False
+            supports_piecewise_spans = piecewise
 
             @classmethod
             def supports_dense_4d_mask(cls, attention_spec=None):
@@ -1296,6 +1296,7 @@ class TestDense4DMaskRouting:
         monkeypatch,
         *,
         supports_4d_mask: bool = False,
+        piecewise: bool = False,
         backend_explicit: bool = False,
         paged_kv: bool = False,
         with_sdpa: bool = True,
@@ -1307,7 +1308,7 @@ class TestDense4DMaskRouting:
         attention._scheduler_paged_kv = False
         attention.role = "self"
         attention.attn_spec = None
-        attention.attn_backend = self._backend(supports_4d_mask=supports_4d_mask)
+        attention.attn_backend = self._backend(supports_4d_mask=supports_4d_mask, piecewise=piecewise)
         attention.backend_explicit = backend_explicit
         attention.paged_kv_cache_role = "primary" if paged_kv else None
         backend_forward = Mock(return_value=torch.ones(1))
@@ -1398,6 +1399,44 @@ class TestDense4DMaskRouting:
 
         assert output is backend_forward.return_value
         backend_forward.assert_called_once()
+        sdpa_forward.assert_not_called()
+
+    @pytest.mark.parametrize("backend_explicit", [False, True])
+    def test_piecewise_spans_reach_backend_despite_dense_4d_mask(self, monkeypatch, backend_explicit):
+        # HunyuanImage3 sends a dense 4D mask together with full_attn_spans; a piecewise
+        # backend honors the spans and never reads the mask, so the call must not be
+        # diverted to SDPA or rejected for an explicit FLASH_ATTN selection.
+        attention, backend_forward, sdpa_forward = self._make_attention(
+            monkeypatch, piecewise=True, backend_explicit=backend_explicit
+        )
+        query, key, value = self._tensors()
+        metadata = AttentionMetadata(attn_mask=self._dense_4d_mask(), full_attn_spans=[[(1, 3)], [(1, 3)]])
+
+        output = attention._run_local_attention(query, key, value, metadata)
+
+        assert output is backend_forward.return_value
+        backend_forward.assert_called_once()
+        sdpa_forward.assert_not_called()
+
+    def test_piecewise_backend_without_spans_still_diverts_dense_4d_mask(self, monkeypatch):
+        attention, backend_forward, sdpa_forward = self._make_attention(monkeypatch, piecewise=True)
+        query, key, value = self._tensors()
+        metadata = AttentionMetadata(attn_mask=self._dense_4d_mask())
+
+        output = attention._run_local_attention(query, key, value, metadata)
+
+        assert output is sdpa_forward.return_value
+        backend_forward.assert_not_called()
+
+    def test_spans_on_non_piecewise_backend_still_fail_closed(self, monkeypatch):
+        attention, backend_forward, sdpa_forward = self._make_attention(monkeypatch, backend_explicit=True)
+        query, key, value = self._tensors()
+        metadata = AttentionMetadata(attn_mask=self._dense_4d_mask(), full_attn_spans=[[(1, 3)], [(1, 3)]])
+
+        with pytest.raises(NotImplementedError, match="does not support a dense 4D attn_mask"):
+            attention._run_local_attention(query, key, value, metadata)
+
+        backend_forward.assert_not_called()
         sdpa_forward.assert_not_called()
 
     @pytest.mark.parametrize("is_npu", [False, True])
