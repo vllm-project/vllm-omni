@@ -287,16 +287,25 @@ def resolve_vllm_flash_attn_version(requested: str | int | None = None) -> int:
     return _choose_vllm_flash_attn_version(capability.major, requested, supported_versions)
 
 
+@cache
+def _vllm_varlen_dispatcher() -> FlashAttnFn | None:
+    """Cache dispatcher availability for the lifetime of this process."""
+    # Failed imports are removed from sys.modules. Cache None too, so ROCm
+    # does not retry the unavailable CUDA extensions on every attention call.
+    try:
+        from vllm.vllm_flash_attn import flash_attn_varlen_func as vllm_func
+    except ImportError:
+        return None
+    return vllm_func
+
+
 def _is_vllm_flash_attn_varlen(attn_func: FlashAttnFn) -> bool:
     """Return whether ``attn_func`` is vLLM's versioned varlen dispatcher.
 
     Identity by design; compiled-specs variants intentionally fall through.
     """
-    try:
-        from vllm.vllm_flash_attn import flash_attn_varlen_func as vllm_func
-    except ImportError:
-        return False
-    return attn_func is vllm_func
+    vllm_func = _vllm_varlen_dispatcher()
+    return vllm_func is not None and attn_func is vllm_func
 
 
 def vllm_varlen_version_kwargs(attn_func: FlashAttnFn | None) -> dict[str, int]:
