@@ -3528,6 +3528,8 @@ class Orchestrator(OrchestratorBase):
         self.request_states[request_id] = req_state
         self._maybe_attach_native_kv_transfer_params(req_state, prompt)
         self._register_running_request(req_state)
+        for role, companion_id in (msg.cfg_companion_ids or {}).items():
+            self._cfg_tracker.register_companion(request_id, role, companion_id)
         req_state.streaming.enabled = bool(getattr(prompt, "resumable", False))
         enqueue_ts = msg.enqueue_ts
         if enqueue_ts > 0:
