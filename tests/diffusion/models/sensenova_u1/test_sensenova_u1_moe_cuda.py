@@ -1,17 +1,29 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""CUDA numerics for SenseNova-U1-A3B FusedMoE vs. the official Qwen3-MoE loop.
+"""Deploy-selected SenseNova-U1-A3B FusedMoE vs. the official Qwen3-MoE loop.
 
 Collected by the ready ``Diffusion · Model Test`` job
 (``tests/diffusion/models/ -m 'core_model and cuda'``), not by the CPU simple lane.
 """
+
+import json
 
 import pytest
 import torch
 import torch.nn.functional as F
 
 from tests.helpers.mark import hardware_test
+from vllm_omni.config.omni_config import VllmOmniConfig, extract_diffusion_stage_config_kwargs
+from vllm_omni.config.stage_config import (
+    PipelineConfig,
+    StageExecutionType,
+    StagePipelineConfig,
+    load_deploy_config,
+)
+from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.models.sensenova_u1.pipeline_sensenova_u1 import SenseNovaU1Pipeline
+from vllm_omni.diffusion.vllm_config import create_diffusion_vllm_config
+from vllm_omni.engine.stage_init_utils import build_engine_args_dict_from_omni_stage_config
 from vllm_omni.transformers_utils.configs.sensenova_u1 import SenseNovaU1MoELLMConfig
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
@@ -60,8 +72,8 @@ def _reference_qwen3_moe(
 
 
 @pytest.fixture
-def cuda_vllm_env(monkeypatch):
-    from vllm.config import DeviceConfig, VllmConfig, set_current_vllm_config
+def cuda_vllm_env(monkeypatch, tmp_path):
+    from vllm.config import set_current_vllm_config
     from vllm.distributed.parallel_state import (
         cleanup_dist_env_and_memory,
         init_distributed_environment,
@@ -71,7 +83,37 @@ def cuda_vllm_env(monkeypatch):
 
     monkeypatch.setenv("MASTER_ADDR", "localhost")
     monkeypatch.setenv("MASTER_PORT", "29617")
-    vllm_config = VllmConfig(device_config=DeviceConfig(device="cuda"))
+    deploy_path = tmp_path / "diffusion-moe.yaml"
+    deploy_path.write_text(
+        "dtype: bfloat16\n"
+        "stages:\n"
+        "  - stage_id: 0\n"
+        "    linear_backend: TORCH\n"
+        "    moe_backend: TRITON\n"
+        "    enforce_eager: true\n",
+        encoding="utf-8",
+    )
+    pipeline = PipelineConfig(
+        model_type="sensenova_u1",
+        stages=(
+            StagePipelineConfig(
+                stage_id=0,
+                model_stage="model",
+                execution_type=StageExecutionType.DIFFUSION,
+                final_output=True,
+            ),
+        ),
+    )
+    stage = VllmOmniConfig.from_pipeline_config(
+        pipeline, user_deploy_config=load_deploy_config(str(deploy_path))
+    ).stage_configs[0]
+    args = build_engine_args_dict_from_omni_stage_config(stage, model=str(tmp_path))
+    diffusion_config = OmniDiffusionConfig.from_kwargs(
+        **extract_diffusion_stage_config_kwargs(args, stage_id=0, include_engine_adapter_metadata=True)
+    )
+    vllm_config = create_diffusion_vllm_config(torch.device("cuda"), diffusion_config)
+    assert vllm_config.kernel_config.linear_backend == "torch"
+    assert vllm_config.kernel_config.moe_backend == "triton"
     with set_current_vllm_config(vllm_config):
         init_distributed_environment(world_size=1, rank=0, local_rank=0, distributed_init_method="env://")
         initialize_model_parallel()
@@ -87,12 +129,16 @@ def cuda_vllm_env(monkeypatch):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for FusedMoE")
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
-def test_sparse_moe_block_matches_reference_after_checkpoint_loading(cuda_vllm_env):
+def test_sparse_moe_block_matches_reference_after_checkpoint_loading(cuda_vllm_env, mocker):
     """Checkpoint-format expert shards, loaded through the production loader, must
     reproduce the reference Qwen3-MoE output. Covers the w13 gate/up order, the
     expert-id mapping and the routing math in one pass."""
     import vllm.forward_context as vllm_forward_context
+    from vllm.model_executor.layers.fused_moe.experts.triton_moe import TritonExperts
+    from vllm.model_executor.layers.fused_moe.oracle.unquantized import UnquantizedMoeBackend
+    from vllm.model_executor.layers.linear import UnquantizedLinearMethod
     from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
+    from vllm.model_executor.layers.utils import default_unquantized_gemm
 
     from vllm_omni.diffusion.layers.fused_moe import FusedMoE
     from vllm_omni.diffusion.models.sensenova_u1.sensenova_u1_transformer import SenseNovaU1SparseMoeBlock
@@ -143,10 +189,27 @@ def test_sparse_moe_block_matches_reference_after_checkpoint_loading(cuda_vllm_e
         if isinstance(quant_method, QuantizeMethodBase):
             quant_method.process_weights_after_loading(module)
 
+    linear_method = block.gate.quant_method
+    assert isinstance(linear_method, UnquantizedLinearMethod)
+    assert linear_method._gemm_impl is default_unquantized_gemm
+    expert_method = block.experts.routed_experts.quant_method
+    assert expert_method.moe.moe_backend == "triton"
+    assert expert_method.unquantized_backend is UnquantizedMoeBackend.TRITON
+    assert isinstance(expert_method.moe_kernel.fused_experts, TritonExperts)
+    # Spies delegate to the selected implementations, retaining real expert math.
+    gemm = mocker.spy(linear_method, "_gemm_impl")
+    expert_apply = mocker.spy(expert_method.moe_kernel, "apply")
     x = torch.randn(num_tokens, hidden, device="cuda", dtype=torch.bfloat16)
     with torch.no_grad(), vllm_forward_context.set_forward_context(None, cuda_vllm_env):
         router_logits, _ = block.gate(x)
+        gemm.reset_mock()
         actual = block(x).float()
+        assert vllm_forward_context.get_forward_context().num_tokens == num_tokens
+
+    gemm.assert_called_once()
+    expert_apply.assert_called_once()
+    assert actual.shape == x.shape
+    assert torch.isfinite(actual).all()
 
     expected = _reference_qwen3_moe(x, router_logits, gate_w, up_w, down_w, top_k)
     rel_err = ((actual - expected).norm() / expected.norm()).item()
@@ -155,4 +218,20 @@ def test_sparse_moe_block_matches_reference_after_checkpoint_loading(cuda_vllm_e
 
     # The tolerance must be able to fail: swapping gate and up breaks SwiGLU.
     swapped = _reference_qwen3_moe(x, router_logits, up_w, gate_w, down_w, top_k)
-    assert ((actual - swapped).norm() / swapped.norm()).item() > 0.1
+    swapped_rel_err = ((actual - swapped).norm() / swapped.norm()).item()
+    assert swapped_rel_err > 0.1
+    print(
+        json.dumps(
+            {
+                "linear_backend": cuda_vllm_env.kernel_config.linear_backend,
+                "moe_backend": cuda_vllm_env.kernel_config.moe_backend,
+                "moe_impl": type(expert_method.moe_kernel.fused_experts).__qualname__,
+                "gemm_calls": gemm.call_count,
+                "expert_calls": expert_apply.call_count,
+                "output_shape": list(actual.shape),
+                "relative_error": rel_err,
+                "swapped_gate_up_relative_error": swapped_rel_err,
+            },
+            sort_keys=True,
+        )
+    )

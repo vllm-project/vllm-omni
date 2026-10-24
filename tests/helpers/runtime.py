@@ -25,7 +25,7 @@ import numpy as np
 import psutil
 import yaml
 from filelock import FileLock, Timeout
-from vllm import TextPrompt
+from vllm import SamplingParams, TextPrompt
 from vllm.logger import init_logger
 
 from tests.helpers.clean import (
@@ -1130,6 +1130,29 @@ class AsyncOmniRunner(_EngineWorkerOwner):
         if engine is None or name.startswith("__"):
             raise AttributeError(name)
         return getattr(engine, name)
+
+    async def send_token_ids_request(self, request_config: dict[str, Any]) -> OmniRequestOutput:
+        """Generate a fixed token budget without a tokenizer or text assertions."""
+        max_tokens = request_config["max_tokens"]
+        sampling_params = SamplingParams(
+            temperature=0,
+            max_tokens=max_tokens,
+            ignore_eos=True,
+            detokenize=False,
+        )
+        final_output = None
+        async for output in self.engine.generate(
+            {"prompt_token_ids": request_config["prompt_token_ids"]},
+            sampling_params=sampling_params,
+            request_id=request_config["request_id"],
+        ):
+            if output.finished:
+                final_output = output
+        assert final_output is not None, "token request returned no completed output"
+        assert final_output.error is None, final_output.error
+        assert len(final_output.outputs) == 1
+        assert len(final_output.outputs[0].token_ids) == max_tokens
+        return final_output
 
     def close(self) -> None:
         """Shut down, stop leftover owned engine workers, and reset the device. Idempotent."""
