@@ -1246,6 +1246,10 @@ def _project_omni_stage_engine_args(
         )
 
     quantization_config = stage_config.quantization_config
+    if not is_diffusion and isinstance(quantization_config, Mapping) and "method" in quantization_config:
+        quantization_config = dict(quantization_config)
+        engine_args["quantization"] = quantization_config.pop("method")
+        quantization_config = quantization_config or None
     if quantization_config is not None:
         quantization_key = (
             "quantization" if isinstance(quantization_config, str) and not is_diffusion else "quantization_config"
