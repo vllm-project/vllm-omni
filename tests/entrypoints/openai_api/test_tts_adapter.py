@@ -61,6 +61,7 @@ from vllm_omni.entrypoints.openai.tts_adapters.qwen3_tts import (
 )
 from vllm_omni.entrypoints.openai.tts_adapters.step_audio2 import StepAudio2Adapter
 from vllm_omni.entrypoints.openai.tts_adapters.voxtral import VoxtralTTSAdapter
+from vllm_omni.entrypoints.openai.tts_adapters.yue2 import Yue2Adapter
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.model_executor.models.indextts2 import prompt_utils
 from vllm_omni.model_executor.models.indextts2.tokenizer_v2_5 import (
@@ -1533,3 +1534,48 @@ def test_ming3_tts_defaults_to_ip_voice_without_reference():
     assert info["prompt_audio_mode"] == "none"
     assert info["speaker_conditioning"] == "mute"
     assert "reference_audio" not in info
+
+
+def _yue2_request(**overrides: Any) -> OpenAICreateSpeechRequest:
+    fields: dict[str, Any] = {
+        "input": "[Verse]\nTwinkle, twinkle, little star",
+        "instructions": "gentle acoustic folk, 90 BPM",
+    }
+    fields.update(overrides)
+    return OpenAICreateSpeechRequest(**fields)
+
+
+@pytest.mark.parametrize(
+    "overrides, err_substr",
+    [
+        pytest.param({"duration_seconds": 30.0}, "max_new_tokens", id="duration_seconds"),
+        pytest.param({"speaker_embedding": [0.1] * 16}, "speaker_embedding", id="speaker_embedding"),
+        pytest.param({"x_vector_only_mode": True}, "x_vector_only_mode", id="x_vector_only_mode"),
+        pytest.param({"ambient_sound": "rain"}, "ambient_sound", id="ambient_sound"),
+        pytest.param({"initial_codec_chunk_frames": 10}, "initial_codec_chunk_frames", id="initial_codec_chunk_frames"),
+        pytest.param({"non_streaming_mode": False}, "non_streaming_mode", id="non_streaming_mode"),
+        pytest.param({"ref_audio_2": "data:audio/wav;base64,AA=="}, "ref_audio_2", id="ref_audio_2"),
+        pytest.param(
+            {"extra_params": {"cot": "off", "yue2_max_audio_frames": 500}},
+            "yue2_max_audio_frames",
+            id="extra_params_unknown_key",
+        ),
+        pytest.param(
+            {"extra_params": {"temperature": 0.3, "foo": 1}},
+            "fixed sampling",
+            id="extra_params_sampling_key_reported_first",
+        ),
+    ],
+)
+def test_yue2_validate_rejects_unused_fields(overrides: dict[str, object], err_substr: str) -> None:
+    err = Yue2Adapter(SimpleNamespace()).validate(_yue2_request(**overrides))
+    assert err is not None
+    assert err_substr in err
+
+
+def test_yue2_validate_accepts_supported_request() -> None:
+    adapter = Yue2Adapter(SimpleNamespace())
+    assert adapter.validate(_yue2_request()) is None
+    full = _yue2_request(max_new_tokens=400, seed=7, extra_params={"cot": "full", "abc": "X:1\nK:C\nCDEF|"})
+    assert adapter.validate(full) is None
+    assert adapter.validate(_yue2_request(extra_params={"cot": "off", "foo": None})) is None
