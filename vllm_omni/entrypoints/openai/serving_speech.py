@@ -69,7 +69,7 @@ from vllm_omni.entrypoints.openai.tts_adapters import (
     resolve_adapter,
     tts_entry_stage_archs,
 )
-from vllm_omni.entrypoints.openai.tts_adapters.base import validate_tts_request
+from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, conditioning_cache_salt, validate_tts_request
 from vllm_omni.entrypoints.openai.tts_adapters.omnivoice import OmniVoiceAdapter
 from vllm_omni.entrypoints.utils import coerce_param_message_types
 from vllm_omni.metrics.modality import observe_audio_first_packet, observe_audio_streaming_finalize
@@ -326,6 +326,20 @@ class _SpeechStreamingResponse(StreamingResponse):
             # Close it explicitly, even inside Starlette's cancelled scope.
             with anyio.CancelScope(shield=True):
                 await cast(Any, self.body_iterator).aclose()
+
+
+def _ensure_cache_salt(adapter, request, prompt: dict, tts_params: dict | None) -> None:
+    # KV prefix-cache salt precedence: adapter-computed wins; otherwise a
+    # caller namespace composed with the derived conditioning identity.
+    # Talker prompts are placeholder token IDs, so an unsalted request
+    # collides with every other; diffusion pipelines never reach here.
+    # Composing (not replacing) keeps voice/input isolation when a caller
+    # salt narrows sharing further (tenants, sessions).
+    if not isinstance(adapter, ARTTSAdapter) or "cache_salt" in prompt:
+        return
+    derived = conditioning_cache_salt(request, tts_params)
+    client_salt = request.cache_salt
+    prompt["cache_salt"] = f"{client_salt}:{derived}" if client_salt else derived
 
 
 class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
@@ -2229,6 +2243,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             tts_params = prepared.tts_params
             model_type = prepared.model_type
             output_policy = prepared.output_policy
+            _ensure_cache_salt(adapter, request, prompt, tts_params)
         else:
             # Qwen omni models (Qwen3-Omni, Qwen2.5-Omni) use a "talker"
             # stage whose preprocess requires chat-templated tokens.  The
