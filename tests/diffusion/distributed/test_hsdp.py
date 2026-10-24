@@ -77,6 +77,22 @@ def test_hsdp_keeps_packed_and_scalar_parameters_local(cpu_process_group):
     assert not isinstance(model.block.input_global_scale, DTensor)
 
 
+def test_hsdp_auxiliary_forward_unshards_root_parameters(cpu_process_group):
+    class AuxiliaryModel(nn.Linear):
+        _hsdp_forward_methods = ("encode",)
+
+        def encode(self, value):
+            return torch.nn.functional.linear(value, self.weight, self.bias)
+
+    model = AuxiliaryModel(2, 2)
+    value = torch.ones(1, 2)
+    expected = model.encode(value)
+    hsdp_module.finalize_hsdp_root(model, hsdp_module.HSDPShardContext(hsdp_kwargs={"mesh": DeviceMesh("cpu", [0])}))
+    assert isinstance(model.weight, DTensor)
+    with torch.no_grad():
+        torch.testing.assert_close(model.encode(value), expected)
+
+
 def test_hsdp_resolves_nested_ignored_module_and_preserves_mixed_dtypes(
     cpu_process_group,
     monkeypatch: pytest.MonkeyPatch,
