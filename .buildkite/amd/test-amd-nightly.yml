@@ -960,6 +960,12 @@ steps:
         commands:
           - export ROCM_QWEN3_SEED_TTS_PERF_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-qwen3-omni-seed-tts-perf"
           - mkdir -p "$$ROCM_QWEN3_SEED_TTS_PERF_ARTIFACT_DIR/benchmark-results"
+          - >-
+            python3 -c 'from huggingface_hub import hf_hub_download;
+            from vllm_omni.engine.duplex.vad import SILERO_VAD_FILENAME, SILERO_VAD_REPO_ID,
+            SILERO_VAD_REVISION, SileroVADBackendProvider;
+            path = hf_hub_download(repo_id=SILERO_VAD_REPO_ID, filename=SILERO_VAD_FILENAME,
+            revision=SILERO_VAD_REVISION); SileroVADBackendProvider().get(); print(path)'
           # Measure the explicit and VAD realtime cases. No MI300 baseline yet.
           - |
             nodes=(

@@ -1268,6 +1268,9 @@ def test_qwen3_omni_seed_tts_realtime_perf_is_one_nonblocking_nightly_job() -> N
     assert "--run-level full_model" in commands
     assert "--collect-only" in commands
     assert "tests/dfx/perf/tests/test_qwen3_omni_seed_tts.json" in commands
+    assert "hf_hub_download" in commands
+    assert "SILERO_VAD_REVISION" in commands
+    assert "SileroVADBackendProvider().get()" in commands
     assert "test_qwen3_omni_seed_tts_realtime-explicit" in commands
     assert "test_qwen3_omni_seed_tts_realtime-vad" in commands
     assert "Expected exactly $${#nodes[@]} Qwen3-Omni Seed-TTS realtime nodes" in commands
