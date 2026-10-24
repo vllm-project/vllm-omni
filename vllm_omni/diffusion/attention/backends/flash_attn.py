@@ -513,6 +513,36 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
             return out_unpad.reshape(batch_size, query_length, *out_unpad.shape[1:])
         return _pad_input(out_unpad, indices_q, batch_size, query_length)
 
+    def _forward_4d_masked_sdpa(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run an arbitrary 4D attention mask through the SDPA backend.
+
+        FlashAttention's varlen path only accepts a 2D key-padding mask, but
+        models like Qwen-Image-2.1 build dense 4D block-causal masks
+        ``(batch, 1, seq_q, seq_k)`` for padded batches. SDPA consumes those
+        masks natively, so we delegate here to keep semantics exact.
+        """
+        import torch.nn.functional as F
+
+        # query/key/value are (batch, seq, heads, head_dim); SDPA wants (batch, heads, seq, dim).
+        q = query.transpose(1, 2)
+        k = key.transpose(1, 2)
+        v = value.transpose(1, 2)
+
+        out = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=attention_mask,
+            scale=self.softmax_scale,
+        )
+        return out.transpose(1, 2).contiguous()
+
     def _forward_varlen_packed(
         self,
         query: torch.Tensor,
@@ -788,6 +818,16 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
             )
         if use_masked_path:
             self._warn_fa_deterministic_non_dense("masked-varlen")
+            if attention_mask.ndim != 2:
+                # A 4D block-causal / attention mask (e.g. Qwen-Image-2.1's
+                # `_build_block_causal_mask` on padded batches) cannot be
+                # expressed as the 2D key-padding mask the FlashAttention
+                # varlen path requires (`_unpad_input` filters query and key
+                # with the same per-key mask). Fall back to the SDPA backend,
+                # which consumes arbitrary 4D masks directly, preserving the
+                # block-causal semantics.
+                self._warn_fa_deterministic_non_dense("masked-sdpa-fallback")
+                return self._forward_4d_masked_sdpa(query, key, value, attention_mask)
             return self._forward_varlen_masked(
                 query,
                 key,
