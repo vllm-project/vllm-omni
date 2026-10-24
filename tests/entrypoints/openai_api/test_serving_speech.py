@@ -94,6 +94,27 @@ from vllm_omni.outputs.output_processor import MultimodalOutputProcessor
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model", [None, "test-model", "alias", "missing-model"])
+async def test_diffusion_speech_checks_all_served_model_names(mocker, monkeypatch, tmp_path, model):
+    monkeypatch.setenv("SPEAKER_SAMPLES_DIR", str(tmp_path))
+    server = OmniOpenAIServingSpeech.for_diffusion(
+        diffusion_engine=mocker.MagicMock(),
+        model_name="test-model",
+        served_model_names=["test-model", "alias"],
+    )
+    generation = mocker.patch.object(server, "_create_diffusion_speech", new_callable=mocker.AsyncMock)
+    response = await server.create_speech(OpenAICreateSpeechRequest(input="Hello", model=model))
+    if model == "missing-model":
+        assert response.status_code == 404
+        assert json.loads(response.body)["error"]["type"] == "NotFoundError"
+        generation.assert_not_awaited()
+    else:
+        assert response is generation.return_value
+        generation.assert_awaited_once()
+
+
 logger = logging.getLogger(__name__)
 
 

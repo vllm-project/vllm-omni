@@ -585,6 +585,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         allowed_media_domains: list[str] | None = None,
         speech_cache_config: SpeechCacheConfig | None = None,
         request_logger: RequestLogger | None = None,
+        served_model_names: list[str] | None = None,
     ) -> "OmniOpenAIServingSpeech":
         """Create a speech serving instance for pure diffusion TTS models.
 
@@ -596,6 +597,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         instance.speech_cache_config = speech_cache_config or SpeechCacheConfig()
         instance._diffusion_mode = True
         instance._diffusion_engine = diffusion_engine
+        instance._diffusion_model_names = frozenset(served_model_names or [model_name])
         instance._allowed_local_media_path = allowed_local_media_path
         instance._media_connector = MediaConnector(
             allowed_local_media_path=allowed_local_media_path,
@@ -2712,7 +2714,10 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 client-input validation failures so the response semantics match
                 the OpenAI-compatible behavior used by ``create_speech``.
         """
-        err_type = "BadRequestError" if 400 <= status_code < 500 else "server_error"
+        if status_code == 404:
+            err_type = "NotFoundError"
+        else:
+            err_type = "BadRequestError" if 400 <= status_code < 500 else "server_error"
         error_body = json.dumps({"error": {"message": message, "type": err_type, "param": None, "code": status_code}})
         return Response(content=error_body, media_type="application/json", status_code=status_code)
 
@@ -2772,6 +2777,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             return self.create_error_response(sample_rate_error)
 
         if self._diffusion_mode:
+            if request.model is not None and request.model not in self._diffusion_model_names:
+                return self._diffusion_error_response(f"The model `{request.model}` does not exist.", status_code=404)
             return await self._create_diffusion_speech(request)
 
         error_check_ret = await self._check_model(request)
