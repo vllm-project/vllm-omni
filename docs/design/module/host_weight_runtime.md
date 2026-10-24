@@ -307,6 +307,43 @@ Explicit cleanup uses the locked move and retries exact-key
 `.cleanup.*` tombstones left by an interrupted removal; a later build performs
 the same tombstone reconciliation before producing replacement content.
 
+Failure-quarantined entries remain until explicitly selected for removal;
+ordinary `cleanup(identity)` does not remove that diagnostic history.
+`FilesystemHostWeightStore.cleanup_quarantined(storage_name)` accepts one
+quarantined inventory basename and preserves the current artifact, deny marker,
+and other failure-quarantined entries. It takes the same nonblocking build and
+exclusive artifact locks, so an active builder or lease returns a typed refusal.
+Malformed names are rejected before mutation, and symlinks are not followed.
+
+Selected entries move through the existing `.cleanup.*` tombstone protocol.
+Retrying the original name reconciles pending cleanup tombstones for that key,
+even if the original entry disappeared during an earlier attempt. A missing
+selection is otherwise an idempotent success. Existing cleanup intents for the
+key may be completed along with the selection; other quarantine history is
+retained. Parent synchronization is retried even when an earlier deletion
+removed the last tombstone before its sync failed.
+
+For a configured store, operators can inspect and deliberately select an entry:
+
+```python
+from vllm_omni.host_weight_runtime import ArtifactInventoryState, HostWeightError
+
+for entry in store.inspect_domain().inventory:
+    if entry.state is ArtifactInventoryState.QUARANTINED:
+        print(entry.storage_name, entry.size_bytes)
+
+selected_storage_name = input("Quarantined entry to remove: ")
+failure = store.cleanup_quarantined(selected_storage_name)
+if failure is not None:
+    raise HostWeightError(failure)
+```
+
+Use the same authoritative domain and capacity policy as the service. Review
+inventory sizes and inspect again after cleanup before explicitly retrying a
+build or startup. These are logical-byte, point-in-time observations; concurrent
+activity can affect the difference and physical disk/RAM reclamation is not
+implied. This operation adds no automatic retention policy or service retry.
+
 An operational failure while inspecting a noncooperative competing publication
 is a retryable storage failure. The competing entry remains authoritative and
 is not mislabeled as corrupt or quarantined merely because its manifest could
