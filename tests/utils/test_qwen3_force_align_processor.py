@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import pytest
 
 from vllm_omni.utils import qwen3_force_align_processor as processor
@@ -53,10 +56,21 @@ def test_segment_words_falls_back_to_port_without_qwen_asr(monkeypatch):
     assert processor.segment_words("U.S.A is here", "auto") == ["USA", "is", "here"]
 
 
-def test_fix_timestamp_repairs_dip_onto_monotonic_sequence():
-    # 200 dips below the preceding 400; it snaps back up to 400.
-    assert processor.fix_timestamp([0, 400, 200, 800]) == [0, 400, 400, 800]
-
-
-def test_fix_timestamp_passes_through_monotonic():
-    assert processor.fix_timestamp([0, 100, 100, 250]) == [0, 100, 100, 250]
+@pytest.mark.parametrize(
+    "values,expected",
+    [
+        ([], []),
+        ([7], [7]),
+        # Equal values must extend the subsequence.
+        ([0, 100, 100, 100, 250], [0, 100, 100, 100, 250]),
+        # Keep the first endpoint when all subsequences have length one.
+        ([400, 300, 200, 100], [400, 400, 400, 400]),
+        # Keep the first predecessor, rather than the smallest tail value.
+        ([0, 400, 200, 800], [0, 400, 400, 800]),
+        ([4, 1, 3, 2, 5], [1, 1, 3, 3, 5]),
+        # A run of three rejected values uses interpolation.
+        ([0, 800, 700, 600, 500, 1000], [0, 800, 850, 900, 950, 1000]),
+    ],
+)
+def test_fix_timestamp_preserves_sequence_selection(values, expected):
+    assert processor.fix_timestamp(values) == expected
