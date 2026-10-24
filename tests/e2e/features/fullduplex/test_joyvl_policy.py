@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import asyncio
 
@@ -10,6 +10,7 @@ from vllm_omni.experimental.fullduplex.joyvl.bridges.delegation import (
     ImageEditDelegationBridge,
     ImageGenDelegationBridge,
     OpenAIDelegationBridge,
+    RoutingDelegationBridge,
 )
 from vllm_omni.experimental.fullduplex.joyvl.decision.policy import JoyVLPolicy, sample_frames
 
@@ -185,6 +186,37 @@ async def test_routing_delegation_dispatches_by_request():
     assert await route("把你看到的画面变成卡通风格") == "edit"  # restyle current view
     assert await route("画一只红色的龙") == "image"  # generate a new image
     assert await route("这道数学题的答案是什么") == "chat"  # hard question -> chat brain
+
+
+@pytest.mark.asyncio
+async def test_routing_delegation_aclose_attempts_all_bridges_and_raises_first_error():
+    events: list[str] = []
+    first_error = RuntimeError("chat close failed")
+    second_error = RuntimeError("edit close failed")
+
+    class _CloseBridge:
+        def __init__(self, name, error=None):
+            self.name = name
+            self.error = error
+
+        async def aclose(self):
+            assert not router._route
+            events.append(self.name)
+            if self.error is not None:
+                raise self.error
+
+    chat = _CloseBridge("chat", first_error)
+    image = _CloseBridge("image")
+    edit = _CloseBridge("edit", second_error)
+    router = RoutingDelegationBridge(chat=chat, image=image, edit=edit)
+    router._route["pending"] = (chat, "inner")
+
+    with pytest.raises(RuntimeError) as exc_info:
+        await router.aclose()
+
+    assert router._route == {}
+    assert events == ["chat", "image", "edit"]
+    assert exc_info.value is first_error
 
 
 class _Delegation:
