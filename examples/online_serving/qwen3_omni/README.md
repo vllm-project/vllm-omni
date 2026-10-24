@@ -564,8 +564,12 @@ Both benchmarks replay recorded clips into one duplex session. Qwen answers
 committed turns, so run them with server VAD turn detection: the client never
 commits, and frames reach Qwen as `input_image` items (it refuses
 `video_frames` on audio appends). Qwen refuses a reference voice, so omit it.
-Serve `vllm_omni/deploy/qwen3_omni_duplex.yaml` (one session at a time) and
-keep client concurrency at 1.
+Serve `vllm_omni/deploy/qwen3_omni_duplex.yaml`. It admits eight duplex sessions,
+the size of the checked-in CI jobs. Eight-session memory on the 2x H100 layout
+this file targets has not been measured.
+The checked-in OmniInteract jobs run eight cases at `--max-concurrency 8`.
+The checked-in Omni-DuplexEval job replays the same 66 CI sample ids as MiniCPM-o,
+also at `--max-concurrency 8`.
 
 ```bash
 vllm bench serve --omni \
@@ -575,11 +579,14 @@ vllm bench serve --omni \
     --duplex-eval-turn-detection server_vad \
     --duplex-eval-instructions "You are a real-time video assistant. Reply to the user's latest request briefly, in one or two spoken sentences." \
     --dataset-name omni-duplex-eval --dataset-path Hothan/Omni-DuplexEval \
-    --duplex-eval-split PR_correction \
+    --duplex-eval-split all \
     --duplex-eval-response-root ./duplex-eval-qwen3 \
-    --num-prompts 3 --disable-shuffle --max-concurrency 1 --num-warmups 0 \
+    --num-prompts 66 --disable-shuffle --max-concurrency 8 --num-warmups 0 \
     --ready-check-timeout-sec 0 --save-result
 ```
+
+The nightly job does not take the first 66 rows. It passes the same 66 CI sample
+ids as `tests/dfx/perf/tests/test_minicpmo_4_5_omni_duplex_eval.json`.
 
 For metrics, post-run judging and the nightly performance configuration, see
 [Omni-DuplexEval serving benchmarks](../../../docs/cli/bench/serve.md#omni-duplexeval-realtime-benchmark).

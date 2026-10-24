@@ -37,10 +37,10 @@
         "backend": "openai-realtime-duplex",
         "endpoint": "/v1/realtime",
         "num_prompts": [
-          4
+          8
         ],
         "max_concurrency": [
-          1
+          8
         ],
         "num_warmups": 1,
         "disable_shuffle": true,
@@ -60,10 +60,10 @@
         "backend": "openai-realtime-duplex",
         "endpoint": "/v1/realtime",
         "num_prompts": [
-          4
+          8
         ],
         "max_concurrency": [
-          1
+          8
         ],
         "num_warmups": 0,
         "disable_shuffle": true,
@@ -82,10 +82,10 @@
         "backend": "openai-realtime-duplex",
         "endpoint": "/v1/realtime",
         "num_prompts": [
-          2
+          8
         ],
         "max_concurrency": [
-          1
+          8
         ],
         "num_warmups": 0,
         "disable_shuffle": true,

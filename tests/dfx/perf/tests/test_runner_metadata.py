@@ -867,6 +867,58 @@ def test_minicpmo_duplex_eval_config_replays_accuracy_ids_at_c8(monkeypatch):
     assert call["accuracy_baseline"] == accuracy["baseline"]
 
 
+def test_qwen3_duplex_eval_config_matches_ci_ids_and_judge_name(monkeypatch):
+    from dataclasses import dataclass
+    from pathlib import Path
+
+    from tests.dfx.perf.scripts import run_benchmark
+    from vllm_omni.entrypoints.cli.benchmark.serve import OmniBenchmarkServingSubcommand
+    from vllm_omni.utils.tracking_parser import TrackingArgumentParser
+
+    test_root = Path(__file__).resolve().parents[3]
+    config = json.loads((Path(__file__).parent / "test_qwen3_omni_duplex_omni_duplex_eval.json").read_text())[0]
+    minicpm = json.loads((Path(__file__).parent / "test_minicpmo_4_5_omni_duplex_eval.json").read_text())[0]
+    accuracy = json.loads((test_root / "e2e/accuracy/omni_duplex_eval/omni_duplex_eval_ci_config.json").read_text())
+    ids = {str(sample_id) for values in accuracy["sample_ids_per_split"].values() for sample_id in values}
+    params = config["benchmark_params"][0]
+    judge = config["judge_server_params"]
+    extra = list(judge.get("extra_cli_args") or [])
+    if "--served-model-name" in extra:
+        served_name = extra[extra.index("--served-model-name") + 1]
+    else:
+        served_name = judge["model"]
+    assert params["duplex_eval_judge_model"] == served_name
+    assert set(params["duplex_eval_ids"]) == set(minicpm["benchmark_params"][0]["duplex_eval_ids"]) == ids
+    assert params["num_prompts"] == [66]
+    assert params["max_concurrency"] == [8]
+    assert "duplex_eval_accuracy_config" not in params
+
+    @dataclass
+    class ServerEndpoint:
+        host: str = "localhost"
+        port: int = 8000
+        model: str = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
+        judge_base_url: str = "http://localhost:8001"
+
+    calls = []
+    monkeypatch.setattr(run_benchmark, "BENCHMARK_CONFIGS", [config])
+    monkeypatch.setattr(run_benchmark, "get_runtime_resource_label", lambda: "H100")
+
+    def benchmark(**kwargs):
+        calls.append(kwargs)
+        return {"completed": 66}
+
+    monkeypatch.setattr(run_benchmark, "run_benchmark", benchmark)
+    monkeypatch.setattr(run_benchmark, "assert_result", lambda *args: None)
+    run_benchmark.test_performance_benchmark(ServerEndpoint(), {"test_name": config["test_name"], "params": params})
+    parser = TrackingArgumentParser()
+    OmniBenchmarkServingSubcommand.add_cli_args(parser)
+    args = parser.parse_args(calls[0]["args"])
+    assert args.duplex_eval_judge_model == served_name
+    assert args.num_prompts == 66
+    assert args.max_concurrency == 8
+
+
 @pytest.mark.parametrize("device_env", ["CUDA_VISIBLE_DEVICES", "ASCEND_RT_VISIBLE_DEVICES"])
 def test_judge_uses_allocated_second_device(monkeypatch, device_env):
     from tests.dfx.perf.scripts import run_benchmark as runner

@@ -1,6 +1,11 @@
 # Concurrent input / interruptible VAD turns; not native streaming input KV.
 base_config: qwen3_omni_moe.yaml
 session_mode: duplex
+duplex_session:
+  # Sized for the OmniInteract and Omni-DuplexEval CI jobs. This file is also
+  # what the README tells users to serve, so the cap applies outside CI.
+  # Eight-session memory on the 2x H100 layout is not yet measured.
+  max_sessions: 8
 stages:
   - stage_id: 0
     # The base profile's Thinker prefix cache is validated for turn serving only.
