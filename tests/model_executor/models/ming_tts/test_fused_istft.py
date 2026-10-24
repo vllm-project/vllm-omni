@@ -1,12 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import contextlib
+
 import pytest
 import torch
 from vllm.triton_utils import HAS_TRITON
 
 from tests.helpers.mark import hardware_marks, hardware_test
 from vllm_omni.model_executor.models.common.ming.audio_dsp import ISTFT
+from vllm_omni.model_executor.models.common.ming.fused_istft import deferred_envelope_checks
 
 pytestmark = [pytest.mark.core_model, pytest.mark.tts]
 cuda = pytest.mark.skipif(
@@ -97,6 +100,27 @@ def test_fused_istft_silence_and_invalid_envelope(invalid):
     else:
         _assert_outputs_close(module(spec), module.forward_native(spec))
         assert torch.count_nonzero(module(spec)[0]) == 0
+
+
+@cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@pytest.mark.parametrize("invalid", [False, True])
+@torch.inference_mode()
+def test_fused_istft_deferred_envelope_check(invalid):
+    module = ISTFT(1280, 320, 1280).cuda()
+    spec = torch.randn(1, 641, 25, device="cuda", dtype=torch.complex64)
+    expected = module(spec)
+    if invalid:
+        module.window.zero_()
+    with contextlib.ExitStack() as stack:
+        if invalid:
+            stack.enter_context(pytest.raises(RuntimeError, match="window envelope underflowed"))
+        with deferred_envelope_checks():
+            # Reported once at the end of the block, not by each call.
+            outputs = [module(spec) for _ in range(3)]
+    if not invalid:
+        for output in outputs:
+            _assert_outputs_close(output, expected)
 
 
 @pytest.mark.parametrize(

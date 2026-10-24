@@ -128,6 +128,66 @@ audio latent promptly, then resumes normal VAE batching. BF16 VAE results can
 vary with chunk boundaries; do not assume bitwise-identical waveforms across
 chunk partitions. Cache checkpoints and graph buffers also consume GPU memory.
 
+### Concurrent serving
+
+`ming3_audio_flash_batched.yaml` serves concurrent ASR, speech-QA and speech
+replies on two H200 GPUs with CUDA Model Runner V2: one TP=2 Thinker and one
+Talker sharing the second GPU. This throughput profile uses an 8192-token
+context, a 2048-token prefill budget, one audio clip per request, and no prefix
+caching. Its default sampling is greedy with a 256-token output limit. Use the
+base profiles for 128K context and conversation-prefix reuse.
+
+- The Thinker schedules up to 32 sequences with async scheduling, and captures
+  CUDA graphs up to 1024 tokens so that steps carrying an audio prefill replay
+  piecewise graphs instead of running eagerly. Unless the stage is eager, the
+  audio encoder and projector of a clip up to 30 seconds also replay a graph
+  captured for its padded length.
+- While at least 4 requests run, the Thinker admits new ones together, once 8
+  wait or the oldest has waited 100 ms (`ar_prefill_admission_*` in the stage's
+  `additional_config`). A step that carries prefills reads most MoE experts
+  whatever its token count, so fewer of them leave the GPUs to decode steps and
+  the Talker; the first token of a request can wait up to 100 ms longer.
+  Set `ar_prefill_admission_min_batch: 0` to disable admission batching.
+- Concurrent speech replies share one Talker batch. Each Talker step advances
+  every active reply by one latent; the Qwen2 decode, CFM, aggregator and stop
+  head run as one CUDA graph per batch size, with the flow head and Qwen2 layer
+  work compiled by `torch.compile` first (`compile_flow`, about a minute at
+  startup; the Inductor cache shortens later starts). The prompts of new
+  replies are prefilled together by graphs captured for packed token counts.
+  Capture runs after weight loading and eval, before worker readiness.
+- The new latents of all replies are decoded by one sliding-window AudioVAE
+  pass per runner step, also replayed from graphs captured per packed frame
+  count; each reply keeps its own upsampler and ISTFT state.
+  `low_latency_streaming` sends each reply's first audio as soon as it exists.
+- Any Talker stage with `max_num_seqs` above one uses the batched path, also in
+  `ming3_audio_tts_batched.yaml` for standalone TTS.
+
+Batched decoding uses FlashAttention over per-request KV rows, so results differ
+from the single-request path at bf16 rounding level: greedy text can diverge
+between batch compositions, and seeded audio depends on which requests share a
+step. This profile requires CUDA and the native Bailing/KDA kernels.
+
+```bash
+vllm serve inclusionAI/Ming-3.0-audio-flash --omni \
+    --deploy-config ming3_audio_flash_batched.yaml \
+    --served-model-name ming3-audio-flash --port 8091
+```
+
+The Talker shares its GPU with a Thinker rank. Without NVIDIA MPS the two
+processes time-slice that GPU; MPS allows their kernels to run concurrently.
+For MPS deployments, follow the [NVIDIA MPS deployment guide](https://docs.nvidia.com/deploy/mps/)
+and isolate the daemon to the deployment's GPUs.
+
+For throughput-oriented deployments, `--no-collect-stage-metrics
+--disable-log-stats` removes the per-request stage metrics and statistics
+logging from the API server.
+
+To serve 64 concurrent requests, raise `max_num_seqs` to 64 for both stages.
+On two GPUs (Thinker TP=2) the Talker shares a GPU with a Thinker rank that
+holds most of it, so also lower the Thinker's `gpu_memory_utilization` to 0.87
+to leave room for the Talker's 64 rows; running out of memory on one Thinker
+rank stalls the other in its next all-reduce.
+
 ### Deployment profiles
 
 Select a profile with `--deploy-config`. ASR profiles run only the Thinker for
@@ -303,7 +363,7 @@ LLM tokenizer, AudioVAE and speaker extractor. The Ming3-specific profile loads
 only the Talker assets, without loading Thinker weights. The resolver also accepts
 a local export with the same layout; `--revision` selects the Hub snapshot.
 
-The resolver stores generated config views and asset symlinks under `VLLM_CACHE_ROOT/ming_talker`, using vLLM's standard cache root.
+The resolver stores generated config views and asset symlinks under `~/.cache/vllm/ming_talker`.
 Checkpoint files stay in the original local export or HF cache; they are not copied into the config view. The same checkpoint and config reuse the existing view.
 
 ```bash
@@ -321,7 +381,8 @@ curl http://localhost:8091/v1/audio/speech \
 For concurrent clients, `ming3_audio_tts_batched.yaml` serves up to 64
 requests in one shared Talker batch: each step advances every active request by
 one latent, with the Qwen2 decode, CFM, aggregator and stop head captured as one
-CUDA graph per batch size. AudioVAE decoding stays per request. Batched decoding
+CUDA graph per batch size. AudioVAE uses packed sliding-window passes when
+supported, with per-request upsampler and ISTFT state. Batched decoding
 uses FlashAttention over a per-request KV row, so latents differ from the
 single-request path at bf16 rounding level, and seeded results depend on which
 requests share a step. `max_num_seqs: 1` keeps the single-request path. In the

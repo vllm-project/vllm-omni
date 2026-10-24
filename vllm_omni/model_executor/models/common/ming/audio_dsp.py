@@ -193,6 +193,16 @@ class ISTFTHead(FourierHead):
         self.out = torch.nn.Linear(dim, out_dim)
         self.istft = ISTFT(n_fft=n_fft, hop_length=hop_length, win_length=n_fft, padding=padding)
 
+    def spectrum(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return complex spectrum and raw coefficients for ``[..., frames, dim]``."""
+        x_pred = self.out(x).transpose(-1, -2)
+        mag, phase = x_pred.chunk(2, dim=-2)
+        mag = torch.clip(torch.exp(mag), max=1e2)
+        # Keep exp and trigonometry in the projection dtype. Float32 operands
+        # then produce complex64, avoiding bcomplex32 unsupported by torch.fft.
+        spectrum = mag.float() * (torch.cos(phase).float() + 1j * torch.sin(phase).float())
+        return spectrum, x_pred
+
     def forward(
         self,
         x: torch.Tensor,
@@ -211,23 +221,9 @@ class ISTFTHead(FourierHead):
         Returns:
             Audio, predicted spectrogram coefficients, and streaming buffers.
         """
-        x_pred = self.out(x)
-        x_pred = x_pred.transpose(1, 2)
-        mag, p = x_pred.chunk(2, dim=1)
-        mag = torch.exp(mag)
-        mag = torch.clip(mag, max=1e2)  # safeguard to prevent excessively large magnitudes
-        # wrapping happens here. These two lines produce real and imaginary value
-        x = torch.cos(p)
-        y = torch.sin(p)
-        # recalculating phase here does not produce anything new
-        # only costs time
-        # phase = torch.atan2(y, x)
-        # S = mag * torch.exp(phase * 1j)
-        # better directly produce the complex value
-        # float32 operands: bf16 promotes to bcomplex32, which torch.fft cannot handle
-        S = mag.float() * (x.float() + 1j * y.float())
+        spectrum, x_pred = self.spectrum(x)
         audio, audio_buffer, window_buffer = self.istft(
-            S, audio_buffer=audio_buffer, window_buffer=window_buffer, streaming=streaming, last_chunk=last_chunk
+            spectrum, audio_buffer=audio_buffer, window_buffer=window_buffer, streaming=streaming, last_chunk=last_chunk
         )
         return audio.unsqueeze(1), x_pred, audio_buffer, window_buffer
 

@@ -1,0 +1,49 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+# Opt-in concurrent serving for Ming-3.0-audio-flash on 2x H200, CUDA Model Runner V2.
+# The Thinker schedules up to 32 sequences with async scheduling and captures
+# CUDA graphs up to 1024 tokens, so steps that carry an audio prefill replay
+# piecewise graphs instead of running eagerly. Concurrent speech replies share
+# one Talker AR batch with a compiled flow head (compile_flow, about a minute at
+# startup) and low-latency audio collection.
+base_config: ming3_audio_flash.yaml
+
+stages:
+  - stage_id: 0
+    devices: "0,1"
+    tensor_parallel_size: 2
+    # Keep this throughput profile independent of the base 128K/cache profile.
+    max_model_len: 8192
+    max_num_batched_tokens: 2048
+    gpu_memory_utilization: 0.88
+    limit_mm_per_prompt:
+      audio: 1
+    enable_prefix_caching: false
+    engine_extras:
+      mamba_cache_mode: none
+    default_sampling_params:
+      temperature: 0.0
+      max_tokens: 256
+    max_num_seqs: 32
+    model_runner: v2
+    async_scheduling: true
+    compilation_config:
+      cudagraph_mode: FULL_AND_PIECEWISE
+      cudagraph_capture_sizes: [1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64, 96, 128, 192, 256, 384, 512, 768, 1024]
+    # While >= 4 requests run, arrivals are admitted together once 8 wait or
+    # the oldest has waited 100 ms: a step with prefills reads most MoE experts
+    # whatever its token count, so fewer such steps leave the GPUs to decode
+    # steps and the Talker. ASR first tokens wait up to 100 ms longer.
+    additional_config:
+      ar_prefill_admission_min_batch: 8
+      ar_prefill_admission_max_wait_ms: 100
+      ar_prefill_admission_min_running: 4
+  - stage_id: 1
+    devices: "1"
+    gpu_memory_utilization: 0.10
+    max_num_seqs: 32
+    model_runner: v2
+    engine_extras:
+      hf_overrides:
+        compile_flow: true
+        low_latency_streaming: true

@@ -92,3 +92,40 @@ def test_batched_tts_profile_only_widens_the_talker_batch():
     for key in ("devices", "gpu_memory_utilization", "max_num_batched_tokens", "default_sampling_params"):
         assert stage[key] == base["stages"][0][key]
     assert batched["pipeline"] == base["pipeline"]
+
+
+def test_flash_batched_profile_widens_both_stages_and_keeps_talker_overrides():
+    base = resolve_deploy_yaml(_DEPLOY / "ming3_audio_flash.yaml")
+    batched = resolve_deploy_yaml(_DEPLOY / "ming3_audio_flash_batched.yaml")
+    thinker, talker = batched["stages"]
+    assert thinker["max_num_seqs"] == talker["max_num_seqs"] == 32
+    assert thinker["model_runner"] == talker["model_runner"] == "v2"
+    assert thinker["async_scheduling"] is True
+    # Audio prefills reach hundreds of tokens; they must stay within the graphs.
+    assert max(thinker["compilation_config"]["cudagraph_capture_sizes"]) >= 1024
+    assert thinker["compilation_config"]["cudagraph_mode"] == base["stages"][0]["compilation_config"]["cudagraph_mode"]
+    overrides = talker["engine_extras"]["hf_overrides"]
+    assert overrides["compile_flow"] is True and overrides["low_latency_streaming"] is True
+    base_overrides = base["stages"][1]["engine_extras"]["hf_overrides"]
+    assert {key: overrides[key] for key in base_overrides if key != "low_latency_streaming"} == {
+        key: value for key, value in base_overrides.items() if key != "low_latency_streaming"
+    }
+    assert thinker["devices"] == "0,1" and thinker["tensor_parallel_size"] == 2
+    assert talker["devices"] == "1"
+    deploy = load_deploy_config(_DEPLOY / "ming3_audio_flash_batched.yaml")
+    pipeline = resolve_pipeline_config(deploy.pipeline)
+    legacy = merge_pipeline_deploy(pipeline, deploy)
+    structured = VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=deploy)
+    stage = structured.stage_by_id(0)
+    assert stage.scheduler_config.max_model_len == legacy[0].yaml_engine_args["max_model_len"] == 8192
+    assert stage.scheduler_config.max_num_batched_tokens == legacy[0].yaml_engine_args["max_num_batched_tokens"] == 2048
+    assert stage.cache_config.enable_prefix_caching is legacy[0].yaml_engine_args["enable_prefix_caching"] is False
+    assert stage.cache_config.mamba_cache_mode == legacy[0].yaml_engine_args["mamba_cache_mode"] == "none"
+    assert stage.model_config.limit_mm_per_prompt == {"audio": 1}
+    assert stage.model_config.default_sampling_params["temperature"] == 0.0
+    assert stage.model_config.default_sampling_params["max_tokens"] == 256
+    assert thinker["additional_config"] == {
+        "ar_prefill_admission_min_batch": 8,
+        "ar_prefill_admission_max_wait_ms": 100,
+        "ar_prefill_admission_min_running": 4,
+    }

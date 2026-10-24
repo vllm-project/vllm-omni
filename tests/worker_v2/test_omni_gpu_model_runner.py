@@ -336,6 +336,29 @@ def test_auxiliary_default_state_has_omni_lifecycle_but_preserves_upstream_state
         assert state is upstream_state
 
 
+@pytest.mark.parametrize("lifecycle", [False, True])
+def test_hybrid_omni_stage_keeps_recurrent_state_and_omni_lifecycle(monkeypatch, lifecycle):
+    from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
+
+    from vllm_omni.worker_v2.model_states.omni_mamba_hybrid import OmniMambaHybridModelState
+
+    class HybridConfig(OmniModelConfig):
+        is_hybrid = True
+
+    upstream = MagicMock(side_effect=AssertionError("hybrid Omni stage used the upstream state"))
+    monkeypatch.setattr("vllm_omni.worker_v2.model_states._upstream_init_model_state", upstream)
+    monkeypatch.setattr(OmniMambaHybridModelState, "__init__", lambda *_args: None)
+    model = SimpleNamespace(**({"have_multimodal_outputs": True} if lifecycle else {}))
+    state = init_omni_model_state(
+        SimpleNamespace(model_config=object.__new__(HybridConfig)), model, None, torch.device("cpu")
+    )
+    assert isinstance(state, OmniModelState) and isinstance(state, MambaHybridModelState)
+    mro = type(state).__mro__
+    # Omni hooks wrap the hybrid state's add_request/prepare_attn via super().
+    assert mro.index(OmniModelState) < mro.index(MambaHybridModelState) < mro.index(DefaultModelState)
+    assert callable(state.run_preprocess) and callable(state.postprocess_state)
+
+
 def test_finish_requests_notifies_model_and_cleans_only_known_slots(monkeypatch):
     runner = _make_runner()
     calls = []

@@ -32,12 +32,24 @@ def init_omni_model_state(
     """Create the appropriate ``ModelState`` for *model*.
 
     Returns an ``OmniModelState`` when the model declares Omni lifecycle
-    capabilities. Otherwise delegates to the upstream v2 factory, wrapping
-    its default state for auxiliary Omni stages.
+    capabilities, and an ``OmniMambaHybridModelState`` for hybrid models of an
+    Omni stage. Otherwise delegates to the upstream v2 factory, wrapping its
+    default state for auxiliary Omni stages.
     """
     factory = getattr(model, "create_omni_model_state", None)
     if factory is not None:
         return factory(vllm_config, encoder_cache, device)
+    model_config = getattr(vllm_config, "model_config", None)
+    if (
+        isinstance(model_config, OmniModelConfig)
+        and getattr(model_config, "is_hybrid", False) is True
+        and not hasattr(model, "get_model_state_cls")
+    ):
+        # Upstream picks MambaHybridModelState for hybrid recurrent layers
+        # (e.g. KDA); the Omni runner needs OmniModelState's lifecycle too.
+        from vllm_omni.worker_v2.model_states.omni_mamba_hybrid import OmniMambaHybridModelState
+
+        return OmniMambaHybridModelState(vllm_config, model, encoder_cache, device)
     uses_omni_lifecycle = any(
         getattr(model, flag, False) is True for flag in ("has_preprocess", "has_postprocess", "have_multimodal_outputs")
     )

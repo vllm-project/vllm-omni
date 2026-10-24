@@ -345,7 +345,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         return is_final
 
     def _init_prefill_admission_policy(self) -> None:
-        """Optional prefill batching under load (stage connector ``extra``).
+        """Optional prefill batching under load (stage connector ``extra`` or ``additional_config``).
 
         While at least ``ar_prefill_admission_min_running`` requests run, a new
         request waits until ``ar_prefill_admission_min_batch`` requests wait or
@@ -359,6 +359,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             if isinstance(connector_config, dict)
             else getattr(connector_config, "extra", None)
         ) or {}
+        # A stage without a configured connector edge sets the same keys in additional_config.
+        additional = getattr(self.vllm_config, "additional_config", None)
+        extra = {**(additional if isinstance(additional, dict) else {}), **extra}
         self._prefill_admission_min_batch = int(extra.get("ar_prefill_admission_min_batch", 0) or 0)
         self._prefill_admission_max_wait_s = float(extra.get("ar_prefill_admission_max_wait_ms", 0) or 0) / 1000
         self._prefill_admission_min_running = int(extra.get("ar_prefill_admission_min_running", 0) or 0)
@@ -366,6 +369,13 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             raise ValueError("ar_prefill_admission_min_batch > 1 needs ar_prefill_admission_max_wait_ms > 0")
         if self._prefill_admission_min_running < 0:
             raise ValueError("ar_prefill_admission_min_running must be >= 0")
+        if self._prefill_admission_min_batch > 1:
+            logger.info(
+                "Prefill admission batching: %d requests or %.0f ms while >= %d run",
+                self._prefill_admission_min_batch,
+                self._prefill_admission_max_wait_s * 1000,
+                self._prefill_admission_min_running,
+            )
 
     def _should_defer_waiting_admission(self) -> bool:
         min_batch = getattr(self, "_prefill_admission_min_batch", 0)

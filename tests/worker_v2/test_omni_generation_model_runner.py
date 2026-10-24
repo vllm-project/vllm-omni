@@ -399,3 +399,28 @@ def test_exact_input_shape_models_reject_padded_batches(exact):
             check_exact_input_shape(model, torch.zeros(48, dtype=torch.long), 32)
     else:
         check_exact_input_shape(model, torch.zeros(48, dtype=torch.long), 32)
+
+
+@pytest.mark.parametrize("retained", [False, True])
+def test_pending_generation_reruns_its_unit_and_keeps_its_slot(retained):
+    output = OmniOutput(
+        text_hidden_states=torch.empty(0),
+        multimodal_outputs={"audio": [torch.zeros(2), torch.ones(2)]},
+    )
+    runner = _make_runner(output, num_reqs=2)
+    runner._retains_state_across_chunks = retained
+    runner.model = SimpleNamespace(get_pending_generation_request_ids=lambda: {"req-1", "other"})
+    runner.model_config.async_chunk = True
+    runner._remove_request = MagicMock()
+    runner._reserve_native_data_plane_outputs = MagicMock()
+    runner._finalize_native_data_plane_output = MagicMock(side_effect=lambda value: value)
+
+    result = OmniGenerationModelRunner.sample_tokens(runner)
+
+    assert result.pending_generation_req_ids == {"req-1"}
+    # The finished unit is marked computed; the pending one is re-run.
+    assert runner.req_states.num_computed_tokens.np.tolist() == [10, 0]
+    if retained:
+        runner._remove_request.assert_not_called()
+    else:
+        runner._remove_request.assert_called_once_with("req-0")
