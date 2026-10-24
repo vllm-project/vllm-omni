@@ -8,6 +8,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 from torch import nn
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from vllm_omni.diffusion.media import VideoValueRange
 from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
@@ -168,6 +169,25 @@ def test_output_shape_is_checked(pipeline):
     pipeline.pipe.inference.return_value = torch.zeros(1, 3, 4, 32, 32)
     with pytest.raises(RuntimeError, match="expected"):
         pipeline(make_batch())
+
+
+@pytest.mark.parametrize("fails", [False, True])
+def test_reference_sdpa_policy_is_scoped_to_inference(pipeline, fails):
+    def inference(**kwargs):
+        assert torch.backends.cuda.cudnn_sdp_enabled()
+        if fails:
+            raise RuntimeError("injected failure")
+        return torch.zeros(1, 3, 5, 32, 32)
+
+    pipeline.pipe.inference.side_effect = inference
+    with sdpa_kernel([SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]):
+        assert not torch.backends.cuda.cudnn_sdp_enabled()
+        if fails:
+            with pytest.raises(RuntimeError, match="injected failure"):
+                pipeline(make_batch())
+        else:
+            pipeline(make_batch())
+        assert not torch.backends.cuda.cudnn_sdp_enabled()
 
 
 @pytest.mark.parametrize("components", [None, frozenset({"dit"}), frozenset({"text_encoder"})])

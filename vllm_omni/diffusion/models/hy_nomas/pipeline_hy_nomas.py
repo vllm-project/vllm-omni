@@ -8,6 +8,7 @@ from typing import ClassVar
 import torch
 from omegaconf import DictConfig
 from torch import nn
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
@@ -178,22 +179,31 @@ class HyNomasPipeline(nn.Module, SupportsComponentDiscovery):
         request = normalize_request(req.prompts[0], req.sampling_params)
         self._reset_cache()
         try:
-            video = self.pipe.inference(
-                prompts=request.prompts,
-                num_frames=request.num_frames,
-                height=request.height,
-                width=request.width,
-                guidance_scale=1.0,
-                camera_guidance_scale=1.0,
-                num_inference_steps=request.steps,
-                flow_shift=5.0,
-                seed=request.seed,
-                negative_prompt=request.negative_prompt,
-                segment_frame_boundaries=request.boundaries,
-                camera_trajectory=request.camera_trajectory,
-                segment_has_camera=request.segment_has_camera,
-                preserve_kv_cache=False,
-            )
+            # vLLM 导入时关闭 cuDNN SDPA；此处恢复参考实现的后端集合，退出后还原。
+            with sdpa_kernel(
+                [
+                    SDPBackend.CUDNN_ATTENTION,
+                    SDPBackend.FLASH_ATTENTION,
+                    SDPBackend.EFFICIENT_ATTENTION,
+                    SDPBackend.MATH,
+                ]
+            ):
+                video = self.pipe.inference(
+                    prompts=request.prompts,
+                    num_frames=request.num_frames,
+                    height=request.height,
+                    width=request.width,
+                    guidance_scale=1.0,
+                    camera_guidance_scale=1.0,
+                    num_inference_steps=request.steps,
+                    flow_shift=5.0,
+                    seed=request.seed,
+                    negative_prompt=request.negative_prompt,
+                    segment_frame_boundaries=request.boundaries,
+                    camera_trajectory=request.camera_trajectory,
+                    segment_has_camera=request.segment_has_camera,
+                    preserve_kv_cache=False,
+                )
         finally:
             self._reset_cache()
         expected = (1, 3, request.num_frames, request.height, request.width)
