@@ -37,19 +37,20 @@ Cache methods trade minimal quality for significant speedup. Quality loss is typ
 [KV prefix caching](../design/feature/prefix_caching.md#diffusion-kv-prefix-caching)
 reuses stable context KV across requests, rather than approximating denoise
 steps. Enable `diffusion_kv_mode: paged_scheduler` and `enable_prefix_caching: true`
-on the HunyuanImage3 standalone DiT stage. This is separate from the AR stage-output
+on supported standalone DiT stages (`HunyuanImage3` and `QwenImage21Pipeline`). This is separate from the AR stage-output
 cache, TeaCache and Cache-DiT.
 
 | Model / combination | Scope |
 |---------------------|-------|
 | HunyuanImage3 standalone DiT | Stable text/reference-image prefix reuse; dynamic image tokens are excluded |
-| TP4/SP1 + EP, CFGP1 | Validated reference-image prefix hits |
+| Qwen-Image 2.1 (`QwenImage21Pipeline`) | Block-causal reference-image and text prefix reuse across requests (TP1/TP2, Ulysses SP2, CFG=1 and CFG>1); skips condition-image VAE encoding when the cached prefix covers all reference images |
+| TP4/SP1 + EP, CFGP1 | Validated reference-image prefix hits (HunyuanImage3) |
 | TP2/SP2 (Ulysses) + EP, CFGP1 | Validated reference-image prefix hits; CFG guidance does not require CFG parallelism |
 | Other SP/TP combinations, CFGP>1 | Prefix-hit E2E accuracy not yet validated |
 | AR-imported KV / cross-stage missing-page transfer | Not covered by local prefix caching |
 | Sleep mode | Rejected with prefix caching; discarded KV pages would leave stale cache hits |
 | TeaCache / Cache-DiT, offload, quantization | Not validated with prefix hits |
-| Step execution | Not supported with HunyuanImage3 paged KV; use request-level execution |
+| Step execution | Not supported with paged KV; use request-level execution |
 | Other diffusion models | No prefix-cache model adapter yet |
 
 This table describes prefix-cache scope; the general parallelism tables below do

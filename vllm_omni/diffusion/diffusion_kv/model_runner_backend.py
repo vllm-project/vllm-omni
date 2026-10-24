@@ -11,10 +11,12 @@ from typing import Any
 import torch
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.distributed import get_dcp_group
+from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
 from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig, KVCacheSpec
 from vllm.v1.worker import block_table as native_block_table
 from vllm.v1.worker.gpu.attn_utils import init_attn_backend, init_kv_cache
 from vllm.v1.worker.gpu.block_table import BlockTables
+from vllm.v1.worker.utils import copy_kv_cache_blocks_inplace
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode, is_scheduler_paged_kv_mode
@@ -30,6 +32,8 @@ from vllm_omni.diffusion.diffusion_kv.paged_attention_adapter import (
     DiffusionPagedAttentionRowBinding,
     DiffusionPagedAttentionRuntime,
 )
+from vllm_omni.diffusion.forward_context import vllm_batch_invariant_scope
+from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
 from vllm_omni.platforms import current_omni_platform
 
 DiffusionKVIdentity = tuple[str, int | None, str | None]
@@ -71,6 +75,14 @@ class DiffusionKVModelRunnerBackend:
         self._diffusion_kv_identity_to_row: dict[DiffusionKVIdentity, int] = {}
         self._diffusion_kv_free_rows: list[int] = []
         self._diffusion_kv_request_states: dict[str, _DiffusionKVRequestState] = {}
+        model_metadata = get_diffusion_model_metadata(getattr(od_config, "model_class_name", None))
+        parallel_config = getattr(od_config, "parallel_config", None)
+        self._batch_invariant_paged_attention = bool(
+            model_metadata.requires_batch_invariant_paged_hsdp_ulysses
+            and getattr(od_config, "diffusion_kv_mode", None) is DiffusionKVCacheMode.PAGED_SCHEDULER
+            and getattr(parallel_config, "use_hsdp", False)
+            and int(getattr(parallel_config, "ulysses_degree", 1) or 1) > 1
+        )
 
     def register_kv_cache_layers(
         self,
@@ -111,7 +123,10 @@ class DiffusionKVModelRunnerBackend:
         )
         adapters: dict[str, DiffusionPagedAttentionLayerAdapter] = {}
         try:
-            with set_current_vllm_config(self.vllm_config):
+            with (
+                vllm_batch_invariant_scope(self._batch_invariant_paged_attention),
+                set_current_vllm_config(self.vllm_config),
+            ):
                 for layer_name, (layer, spec) in layers.items():
                     adapters[layer_name] = DiffusionPagedAttentionLayerAdapter(
                         layer_name=layer_name,
@@ -292,6 +307,7 @@ class DiffusionKVModelRunnerBackend:
                     attn_groups=attn_groups,
                     layers=self._kv_cache_layer_adapters,
                     resolve_row=self._resolve_paged_attention_row,
+                    batch_invariant=self._batch_invariant_paged_attention,
                 )
                 # f2aad6aa70 (#56888): first arg is forward_context; caches
                 # are returned as a dict instead of appended to a runner list.
@@ -448,6 +464,21 @@ class DiffusionKVModelRunnerBackend:
                 )
             )
 
+        block_copy_snapshot: list[tuple[int, int]] = []
+        for block_copy in metadata.block_copies:
+            if not isinstance(block_copy, KVCacheBlockCopy):
+                raise ValueError(f"Invalid diffusion KV block copy {block_copy!r}")
+            src_block_id, dst_block_id = block_copy
+            if (
+                type(src_block_id) is not int
+                or type(dst_block_id) is not int
+                or not 0 <= src_block_id < self.kv_cache_config.num_blocks
+                or not 0 <= dst_block_id < self.kv_cache_config.num_blocks
+                or src_block_id == dst_block_id
+            ):
+                raise ValueError(f"Invalid diffusion KV block copy {block_copy!r}")
+            block_copy_snapshot.append((src_block_id, dst_block_id))
+
         max_rows_per_request = self._get_max_rows_per_request()
         if len(installs) > max_rows_per_request:
             raise ValueError(
@@ -458,6 +489,7 @@ class DiffusionKVModelRunnerBackend:
             metadata.request_id,
             tuple(sequence_snapshots),
             tuple(context_snapshots),
+            tuple(block_copy_snapshot),
         )
         return installs, snapshot
 
@@ -540,6 +572,13 @@ class DiffusionKVModelRunnerBackend:
             )
 
         rows = list(reversed(self._diffusion_kv_free_rows[-len(installs) :])) if installs else []
+        if metadata.block_copies:
+            assert self.kv_cache_config is not None
+            copy_kv_cache_blocks_inplace(
+                self.kv_caches,
+                self.kv_cache_config.num_blocks,
+                metadata.block_copies,
+            )
         if rows:
             self._apply_rows(rows, installs)
 

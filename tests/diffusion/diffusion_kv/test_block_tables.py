@@ -7,11 +7,13 @@ import math
 from contextlib import nullcontext
 from dataclasses import replace
 from types import SimpleNamespace
+from typing import cast
 from unittest.mock import Mock
 
 import numpy as np
 import pytest
 import torch
+from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
 from vllm.v1.kv_cache_interface import FullAttentionSpec
 from vllm.v1.worker import block_table as native_block_table
 
@@ -186,12 +188,12 @@ class _FakeBlockTables:
 
     def __init__(self, **kwargs: object) -> None:
         self.kwargs = kwargs
-        self.block_sizes = list(kwargs["block_sizes"])
-        self.max_num_reqs = int(kwargs["max_num_reqs"])
-        self.max_num_batched_tokens = int(kwargs["max_num_batched_tokens"])
-        self.cp_size = int(kwargs["cp_size"])
-        self.cp_rank = int(kwargs["cp_rank"])
-        self.cp_interleave = int(kwargs["cp_interleave"])
+        self.block_sizes = list(cast(list[int], kwargs["block_sizes"]))
+        self.max_num_reqs = int(cast(int, kwargs["max_num_reqs"]))
+        self.max_num_batched_tokens = int(cast(int, kwargs["max_num_batched_tokens"]))
+        self.cp_size = int(cast(int, kwargs["cp_size"]))
+        self.cp_rank = int(cast(int, kwargs["cp_rank"]))
+        self.cp_interleave = int(cast(int, kwargs["cp_interleave"]))
         self.blocks_per_kv_block = [1] * len(self.block_sizes)
         self.block_tables = [_FakeStagedTable() for _ in self.block_sizes]
         self.num_blocks = _FakeNumBlocks(len(self.block_sizes), self.max_num_reqs)
@@ -595,6 +597,7 @@ def test_generation_is_idempotent_stale_safe_and_conflict_safe(monkeypatch: pyte
         (_metadata(sequence_block_ids=([1, 2, 3],)), "block groups"),
         (_metadata(sequence_block_ids=([1, 2], [4, 5])), "expected 3"),
         (_metadata(sequence_block_ids=([1, 2, 32], [4, 5])), "outside"),
+        (replace(_metadata(), block_copies=(KVCacheBlockCopy(1, 32),)), "block copy"),
         (
             _metadata(
                 seq_len=17,
