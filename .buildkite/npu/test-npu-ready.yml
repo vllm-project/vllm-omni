@@ -21,6 +21,7 @@ steps:
           - >-
             pytest -s -v
             tests/diffusion/layers/test_activation.py
+            tests/diffusion/layers/test_fused_qk_norm_rope_npu.py
             -m 'core_model and npu and A2'
             --run-level 'core_model'
 
@@ -44,6 +45,7 @@ steps:
           - >-
             pytest -s -v
             tests/diffusion/layers/test_activation.py
+            tests/diffusion/layers/test_fused_qk_norm_rope_npu.py
             -m 'core_model and npu and A5'
             --run-level 'core_model'
 
@@ -130,6 +132,15 @@ steps:
                 pytest -s -v tests/e2e/online_serving/test_qwen_image.py -m 'core_model and npu' --run-level 'core_model'
                 "
         timeout_in_minutes: 60
+
+      - label: "Diffusion · Qwen Image 2.1 Offline Test"
+        source_file_dependencies: diffusion_qwen_image_21_function
+        mirror_hardwares: a5_npu_2
+        timeout_in_minutes: 40
+        commands:
+          - >-
+            timeout 35m pytest -sv tests/e2e/offline_inference/test_qwen_image_21.py
+            -m 'core_model and npu and A5 and cards_1' --run-level core_model
 
       - label: "Diffusion · Wan22 Test"
         mirror_hardwares: a3_npu_2

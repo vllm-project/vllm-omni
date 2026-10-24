@@ -266,6 +266,15 @@ steps:
             "
         mirror_hardwares: h100_2
 
+      - label: "Diffusion · Qwen Image 2.1 Offline Test"
+        source_file_dependencies: diffusion_qwen_image_21_function
+        mirror_hardwares: h100_1
+        timeout_in_minutes: 40
+        commands:
+          - >-
+            timeout 35m pytest -sv tests/e2e/offline_inference/test_qwen_image_21.py
+            -m 'core_model and cuda and H100 and cards_1' --run-level core_model
+
       - label: "Diffusion · Qwen Image Test"
         source_file_dependencies: diffusion_qwen_image_function
         commands:

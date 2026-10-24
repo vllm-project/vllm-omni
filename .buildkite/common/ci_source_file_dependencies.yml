@@ -150,6 +150,7 @@ x-qwen-image: &qwen_image
   - vllm_omni/diffusion/distributed/autoencoders/autoencoder_kl_qwenimage.py
 
 x-qwen-image-21: &qwen_image_21
+  - vllm_omni/diffusion/layers/fused_qk_norm_rope.py
   - vllm_omni/diffusion/models/qwen_image_21/
   - vllm_omni/diffusion/models/qwen_image/
   - vllm_omni/diffusion/distributed/autoencoders/autoencoder_kl_qwenimage21.py
@@ -522,6 +523,12 @@ source_file_dependencies:
     - *qwen_image
     - tests/e2e/accuracy/test_qwen_image.py
     - tests/e2e/accuracy/test_diffusers_backend_similarity.py
+
+  diffusion_qwen_image_21_function:
+    - *qwen_image_21
+    - tests/e2e/offline_inference/test_qwen_image_21.py
+    - tests/helpers/
+    - tests/conftest.py
 
   diffusion_qwen_image_21_accuracy:
     - *qwen_image_21
