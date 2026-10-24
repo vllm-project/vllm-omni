@@ -902,7 +902,7 @@ class MiniCPMO45Code2Wav(nn.Module):
     def _prepare_decode_batch(
         self, items: list[_WorkItem]
     ) -> tuple[list[BatchedToken2WavState], PromptFeatures | list[PromptFeatures]]:
-        """Prepare each voice separately, then keep conditioning in request order."""
+        """Prepare references and keep their conditioning and states in request order."""
         prompts: dict[tuple[str, str], PromptFeatures] = {}
         fresh: dict[tuple[str, str], list[int]] = {}
         states = [item.previous.token2wav if item.previous is not None else None for item in items]
@@ -914,8 +914,9 @@ class MiniCPMO45Code2Wav(nn.Module):
             features.append(prompts[key])
             if states[row] is None:
                 fresh.setdefault(key, []).append(row)
-        for key, rows in fresh.items():
-            for row, state in zip(rows, self.backend.setup_batch(prompts[key], len(rows)), strict=True):
+        initial = self.backend.setup_references([prompts[key] for key in fresh])
+        for rows, state in zip(fresh.values(), initial, strict=True):
+            for row in rows:
                 states[row] = state
         if any(state is None for state in states):
             raise _batch_error("incomplete_setup")

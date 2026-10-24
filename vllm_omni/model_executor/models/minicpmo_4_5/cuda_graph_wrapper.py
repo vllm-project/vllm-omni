@@ -1885,8 +1885,9 @@ class WholeEulerCFMGraphWrapper:
         max_graph_bytes: int = 1 << 30,
         keep: tuple[int, int] | None = None,
         tail_frames: int = 0,
+        setup_frames: int = 0,
     ) -> int:
-        """Capture Whole-Euler graphs for one prompt before serving. Returns the capture count."""
+        """Capture decode graphs, then optional non-slot setup shapes within the same budget."""
         if not self.enabled:
             return 0
         if self.att_slots and keep is not None and self._ensure_slot_pool(keep) is not None:
@@ -1905,6 +1906,11 @@ class WholeEulerCFMGraphWrapper:
             keys.extend(
                 (b, w, o) for b in sorted(self._graph_batches(), reverse=True) for w in tail_widths for o in grid
             )
+        if setup_frames > 0:
+            # Decode keeps priority. Reserve M=1 setup before larger batches so
+            # a tight budget still permits the existing per-reference solver.
+            setup_width = _capture_query_width(setup_frames, widths)
+            keys.extend((b, setup_width, 0) for b in sorted(self._graph_batches()))
         room = self.max_graphs - (len(self._cache) + len(self._slot_graphs))
         if len(keys) > room:
             logger.warning(

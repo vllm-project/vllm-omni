@@ -10,7 +10,7 @@ from collections import OrderedDict
 from collections.abc import Mapping
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import Any, cast
+from typing import Any, Literal, cast, overload
 
 import torch
 import torch.nn as nn
@@ -59,6 +59,8 @@ _TIMESTEP_MAX_PERIOD = 10000
 # Short histories did not show a repeatable gain on Ascend 910B; only use
 # strided in-place attention once eliminating history copies pays for it.
 _NPU_IN_PLACE_ATTENTION_MIN_CACHE_FRAMES = 512
+
+_CFMOutput = tuple[torch.Tensor, torch.Tensor, torch.Tensor | list[torch.Tensor]]
 
 
 def _scale_shift(x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor) -> torch.Tensor:
@@ -1345,6 +1347,36 @@ class BatchedToken2Wav(nn.Module):
             self._timeline_cache[key] = cached
         return cached
 
+    @overload
+    def _decode_cfm(
+        self,
+        mu: torch.Tensor,
+        speakers: torch.Tensor,
+        cond: torch.Tensor,
+        *,
+        cnn_cache: torch.Tensor | None,
+        att_cache: torch.Tensor | list[torch.Tensor] | None,
+        valid_lengths: list[int] | None = None,
+        att_keep: tuple[int, int] | None = None,
+        prompt_lengths: list[int] | None = None,
+        whole_euler_only: Literal[False] = False,
+    ) -> _CFMOutput: ...
+
+    @overload
+    def _decode_cfm(
+        self,
+        mu: torch.Tensor,
+        speakers: torch.Tensor,
+        cond: torch.Tensor,
+        *,
+        cnn_cache: torch.Tensor | None,
+        att_cache: torch.Tensor | list[torch.Tensor] | None,
+        valid_lengths: list[int] | None = None,
+        att_keep: tuple[int, int] | None = None,
+        prompt_lengths: list[int] | None = None,
+        whole_euler_only: bool,
+    ) -> _CFMOutput | None: ...
+
     @_cfm_matmul_tf32
     def _decode_cfm(
         self,
@@ -1357,17 +1389,16 @@ class BatchedToken2Wav(nn.Module):
         valid_lengths: list[int] | None = None,
         att_keep: tuple[int, int] | None = None,
         prompt_lengths: list[int] | None = None,
-    ) -> tuple[
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor | list[torch.Tensor],
-    ]:
+        whole_euler_only: bool = False,
+    ) -> _CFMOutput | None:
         """Run the CFM Euler solve for one chunk.
 
         ``att_cache`` may be the stacked estimator cache or one tensor per
         request (the Whole-Euler path). A Whole-Euler solve returns the new
         cache in the same form, already trimmed by ``att_keep``; the eager
         path returns it stacked and untrimmed (ragged: per request, untrimmed).
+        ``whole_euler_only`` returns ``None`` on refused replay, allowing cold
+        reference setup to retain its scalar step/eager fallback policy.
         """
         if self._cfm_only_float16:
             mu, speakers, cond = mu.half(), speakers.half(), cond.half()
@@ -1477,6 +1508,8 @@ class BatchedToken2Wav(nn.Module):
             )
             if whole_euler_result is not None:
                 return whole_euler_result
+        if whole_euler_only:
+            return None
         # Whole-Euler builds its capture mask directly from mel_frames.
         # Only a refused replay needs the separate step/eager padding mask.
         if pad_frames:
@@ -1712,6 +1745,17 @@ class BatchedToken2Wav(nn.Module):
         """Whether Whole-Euler graphs also solve ragged (per-row length) batches."""
         return self._whole_euler_active() and self._whole_euler_graph_wrapper.ragged_body is not None
 
+    def _batch_reference_setup_enabled(self) -> bool:
+        """Whether reference setup can use the validated batched CFM solver."""
+        return (
+            not self.float16
+            and self._cfm_tf32
+            and self._ragged_fused_body
+            and self._whole_euler_ragged_active()
+            and self._whole_euler_graph_wrapper.device.type == "cuda"
+            and self._cfm_graph_bucket_frames == 0
+        )
+
     def _ragged_merge_fits(self, states: list[BatchedToken2WavState], token_counts: list[int]) -> bool:
         """Ragged Whole-Euler is on, the rows share a CNN cache shape, and each row's tokens encode at once."""
         return (
@@ -1774,14 +1818,15 @@ class BatchedToken2Wav(nn.Module):
                 spk_dim=int(self.flow.spk_embed_affine_layer.out_features),
                 keep=(prompt_len, _CACHE_TRIM_SUFFIX),
                 tail_frames=(self._pre_lookahead_len() or 0) * int(getattr(self.flow, "token_mel_ratio", 2)),
+                setup_frames=prompt_len if self._batch_reference_setup_enabled() else 0,
             )
 
-    def _create_initial_states(
+    def _encode_initial_prompt(
         self,
         features: PromptFeatures,
         batch_size: int,
-    ) -> list[BatchedToken2WavState]:
-        prompt_tokens, speakers, prompt_mels = self._repeat_prompt(features, batch_size)
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        prompt_tokens, speakers, _ = self._repeat_prompt(features, batch_size)
         lookahead_width = self._pre_lookahead_len()
         lookahead = prompt_tokens.new_full(
             (batch_size, 3 if lookahead_width is None else lookahead_width),
@@ -1795,16 +1840,51 @@ class BatchedToken2Wav(nn.Module):
                 att_cache=None,
             )
             projected_speakers = self._project_speakers(speakers)
+        return hidden, conformer_cnn, conformer_att, projected_speakers
+
+    def _create_initial_states(
+        self,
+        features: PromptFeatures | list[PromptFeatures],
+        batch_size: int,
+        *,
+        encoded_prompt: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+    ) -> list[BatchedToken2WavState]:
+        """Solve prompt states, reusing an M=1 encoding after a batched graph refusal."""
+        if isinstance(features, list):
+            # Preserve each reference's M=1 encoder and speaker projection.
+            # _encode_chunk owns its outputs, including graph replay outputs.
+            encoded = [self._encode_initial_prompt(feature, 1) for feature in features]
+            hidden = torch.cat([row[0] for row in encoded])
+            conformer_cnn = torch.cat([row[1] for row in encoded])
+            conformer_att = torch.cat([row[2] for row in encoded], dim=1)
+            projected_speakers = torch.cat([row[3] for row in encoded])
+            prompt_mels = torch.cat([feature.mels for feature in features])
+        else:
+            if encoded_prompt is None:
+                encoded_prompt = self._encode_initial_prompt(features, batch_size)
+            hidden, conformer_cnn, conformer_att, projected_speakers = encoded_prompt
+            prompt_mels = features.mels.expand(batch_size, -1, -1)
+        with self._autocast(prompt_mels.device):
             # The prompt cache never reaches the trim length; ``att_keep`` only
             # tells the Whole-Euler arena the steady cache length to reserve.
-            _, estimator_cnn, estimator_att = self._decode_cfm(
+            initial = self._decode_cfm(
                 hidden.transpose(1, 2).contiguous(),
                 projected_speakers,
                 prompt_mels.transpose(1, 2).contiguous(),
                 cnn_cache=None,
                 att_cache=None,
                 att_keep=(int(prompt_mels.shape[1]), _CACHE_TRIM_SUFFIX),
+                whole_euler_only=isinstance(features, list),
             )
+        if initial is None:
+            # A full graph budget or failed capture can refuse this batch even
+            # while M=1 graphs remain usable. Preserve each reference's solver.
+            assert isinstance(features, list)
+            return [
+                self._create_initial_states(feature, 1, encoded_prompt=row)[0]
+                for feature, row in zip(features, encoded, strict=True)
+            ]
+        _, estimator_cnn, estimator_att = initial
         flow_cache = {
             "conformer_cnn_cache": conformer_cnn,
             "conformer_att_cache": conformer_att,
@@ -1812,6 +1892,12 @@ class BatchedToken2Wav(nn.Module):
             "estimator_att_cache": estimator_att,
         }
         split = self._split_flow_cache(flow_cache, batch_size)
+        if isinstance(features, list):
+            # Cached references have independent lifetimes. Do not let a row
+            # retain the other references' buffers after their LRU eviction.
+            for row in split:
+                for name in ("conformer_cnn_cache", "conformer_att_cache", "estimator_cnn_cache"):
+                    row[name] = row[name].clone()
         mel_channels = int(prompt_mels.shape[2])
         return [
             BatchedToken2WavState(
@@ -1862,6 +1948,49 @@ class BatchedToken2Wav(nn.Module):
                 while len(self._setup_cache) > self._setup_cache_size:
                     self._setup_cache.popitem(last=False)
         return [state] * batch_size
+
+    def setup_references(self, features: list[PromptFeatures]) -> list[BatchedToken2WavState]:
+        """Initialize unique references in order, batching compatible cold CFM solves."""
+        wrapper = self._whole_euler_graph_wrapper
+        # Keep other precision policies on their existing M=1 setup path.
+        if len(features) < 2 or not self._batch_reference_setup_enabled():
+            return [self.setup_batch(feature, 1)[0] for feature in features]
+
+        keys = [self._setup_cache_key(feature) for feature in features]
+        # Hold every hit before publishing misses can evict it from the LRU.
+        states = [self._setup_cache.get(key) for key in keys]
+        groups: dict[tuple[tuple[torch.Size, torch.dtype, torch.device], ...], list[int]] = {}
+        for row, (feature, state) in enumerate(zip(features, states, strict=True)):
+            if state is None:
+                signature = tuple(
+                    (tensor.shape, tensor.dtype, tensor.device)
+                    for tensor in (feature.speech_tokens, feature.speaker_embedding, feature.mels)
+                )
+                groups.setdefault(signature, []).append(row)
+        # A disabled graph batch budget keeps the existing singleton fallback.
+        maximum = max(1, min(wrapper.micro_batch_size, wrapper.max_graph_batch))
+        for rows in groups.values():
+            for start in range(0, len(rows), maximum):
+                indices = rows[start : start + maximum]
+                pending = [features[row] for row in indices]
+                # Capture can disable Whole-Euler during an earlier solve.
+                if len(pending) > 1 and self._whole_euler_ragged_active():
+                    created = self._create_initial_states(pending, len(pending))
+                else:
+                    created = [self._create_initial_states(feature, 1)[0] for feature in pending]
+                for row, state in zip(indices, created, strict=True):
+                    states[row] = state
+
+        result = cast(list[BatchedToken2WavState], states)
+        # Publish only after every solve succeeded, in the caller's reference
+        # order rather than shape-group order. Local references survive eviction.
+        if self._setup_cache_size > 0:
+            for key, state in zip(keys, result, strict=True):
+                self._setup_cache[key] = state
+                self._setup_cache.move_to_end(key)
+                while len(self._setup_cache) > self._setup_cache_size:
+                    self._setup_cache.popitem(last=False)
+        return result
 
     @staticmethod
     def _fade_in_out(
