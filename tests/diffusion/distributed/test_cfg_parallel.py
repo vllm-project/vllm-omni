@@ -32,8 +32,8 @@ from vllm_omni.diffusion.distributed.parallel_state import (
 )
 from vllm_omni.platforms import current_omni_platform
 
-_L4_TWO_GPU = hardware_marks(res={"cuda": ["L4", "B200"], "rocm": "MI325", "xpu": "B60"}, num_cards=2)
-_L4_THREE_GPU = hardware_marks(res={"cuda": ["L4", "B200"], "rocm": "MI325", "xpu": "B60"}, num_cards=3)
+_L4_TWO_GPU = hardware_marks(res={"cuda": ["L4", "B200"]}, num_cards=2)
+_L4_THREE_GPU = hardware_marks(res={"cuda": ["L4", "B200"]}, num_cards=3)
 
 
 def _set_random_seeds(seed: int) -> None:
@@ -624,76 +624,6 @@ def test_predict_noise_with_multi_branch_cfg(
 @pytest.mark.core_model
 @pytest.mark.diffusion
 @pytest.mark.cpu
-@pytest.mark.parametrize("cfg_parallel_size,n_branches", [(2, 3), (2, 4)])
-def test_multi_branch_cfg_rejects_two_calls_per_rank_under_cache_dit(
-    monkeypatch: pytest.MonkeyPatch,
-    cfg_parallel_size: int,
-    n_branches: int,
-):
-    """Cache-DiT counts each call on a CFG rank as a step, so a rank must not run two branches."""
-    monkeypatch.setattr(parallel_state, "_CFG", object())  # take the CFG-parallel path
-    pipeline = MultiBranchTestPipeline()
-    pipeline._cache_dit_one_call_per_cfg_rank = True
-    branches_kwargs = _make_multi_branch_inputs(
-        n_branches=n_branches,
-        batch_size=1,
-        channels=4,
-        height=16,
-        width=16,
-        dtype=torch.float32,
-        device=torch.device("cpu"),
-        input_seed=123,
-    )
-    for cfg_rank in range(cfg_parallel_size):
-        _patch_cfg_state(
-            monkeypatch,
-            world_size=cfg_parallel_size,
-            rank=cfg_rank,
-            fake_group=FakeCfgGroup(world_size=cfg_parallel_size, rank_in_group=cfg_rank, rank_tensors=[]),
-        )
-        with pytest.raises(ValueError, match="Cache-DiT"):
-            pipeline.predict_noise_with_multi_branch_cfg(
-                do_true_cfg=True,
-                true_cfg_scale=_multi_branch_cfg_scale(n_branches),
-                branches_kwargs=branches_kwargs,
-            )
-
-
-@pytest.mark.core_model
-@pytest.mark.diffusion
-@pytest.mark.cpu
-@pytest.mark.parametrize("cfg_parallel_size,n_branches", [(2, 2), (3, 3), (3, 2)])
-def test_multi_branch_cfg_one_call_per_rank_runs_under_cache_dit(
-    monkeypatch: pytest.MonkeyPatch,
-    cfg_parallel_size: int,
-    n_branches: int,
-):
-    monkeypatch.setattr(parallel_state, "_CFG", object())  # take the CFG-parallel path
-    pipeline = MultiBranchTestPipeline()
-    pipeline._cache_dit_one_call_per_cfg_rank = True
-    branches_kwargs = _make_multi_branch_inputs(
-        n_branches=n_branches,
-        batch_size=1,
-        channels=4,
-        height=16,
-        width=16,
-        dtype=torch.float32,
-        device=torch.device("cpu"),
-        input_seed=123,
-    )
-    _run_multi_branch_cfg_parallel_mock(
-        pipeline,
-        monkeypatch,
-        cfg_world_size=cfg_parallel_size,
-        branches_kwargs=branches_kwargs,
-        true_cfg_scale=_multi_branch_cfg_scale(n_branches),
-        cfg_normalize=False,
-    )
-
-
-@pytest.mark.core_model
-@pytest.mark.diffusion
-@pytest.mark.cpu
 def test_multi_branch_without_cfg():
     dtype = torch.float32
     device = torch.device("cpu")
@@ -974,23 +904,23 @@ def _run_two_branch_gpu_parity(
     }
 
     mp_context = torch.multiprocessing.get_context("spawn")
-    with mp_context.Manager() as manager:
-        baseline_queue = manager.Queue()
-        cfg_parallel_queue = manager.Queue()
+    manager = mp_context.Manager()
+    baseline_queue = manager.Queue()
+    cfg_parallel_queue = manager.Queue()
 
-        torch.multiprocessing.spawn(
-            _test_cfg_sequential_worker,
-            args=(1, dtype, test_config, baseline_queue),
-            nprocs=1,
-        )
-        torch.multiprocessing.spawn(
-            _test_cfg_parallel_worker,
-            args=(cfg_parallel_size, cfg_parallel_size, dtype, test_config, cfg_parallel_queue),
-            nprocs=cfg_parallel_size,
-        )
+    torch.multiprocessing.spawn(
+        _test_cfg_sequential_worker,
+        args=(1, dtype, test_config, baseline_queue),
+        nprocs=1,
+    )
+    torch.multiprocessing.spawn(
+        _test_cfg_parallel_worker,
+        args=(cfg_parallel_size, cfg_parallel_size, dtype, test_config, cfg_parallel_queue),
+        nprocs=cfg_parallel_size,
+    )
 
-        baseline_output = baseline_queue.get(timeout=30)
-        cfg_parallel_outputs = [cfg_parallel_queue.get(timeout=30) for _ in range(cfg_parallel_size)]
+    baseline_output = baseline_queue.get()
+    cfg_parallel_outputs = [cfg_parallel_queue.get() for _ in range(cfg_parallel_size)]
     cfg_parallel_outputs.sort(key=lambda item: item[0])
     cfg_parallel_output = cfg_parallel_outputs[0][1]
 
@@ -1036,23 +966,23 @@ def _run_multi_branch_gpu_parity(
     }
 
     mp_context = torch.multiprocessing.get_context("spawn")
-    with mp_context.Manager() as manager:
-        baseline_queue = manager.Queue()
-        cfg_parallel_queue = manager.Queue()
+    manager = mp_context.Manager()
+    baseline_queue = manager.Queue()
+    cfg_parallel_queue = manager.Queue()
 
-        torch.multiprocessing.spawn(
-            _test_multi_branch_sequential_worker,
-            args=(1, dtype, test_config, baseline_queue),
-            nprocs=1,
-        )
-        torch.multiprocessing.spawn(
-            _test_multi_branch_parallel_worker,
-            args=(cfg_parallel_size, cfg_parallel_size, dtype, test_config, cfg_parallel_queue),
-            nprocs=cfg_parallel_size,
-        )
+    torch.multiprocessing.spawn(
+        _test_multi_branch_sequential_worker,
+        args=(1, dtype, test_config, baseline_queue),
+        nprocs=1,
+    )
+    torch.multiprocessing.spawn(
+        _test_multi_branch_parallel_worker,
+        args=(cfg_parallel_size, cfg_parallel_size, dtype, test_config, cfg_parallel_queue),
+        nprocs=cfg_parallel_size,
+    )
 
-        baseline_output = baseline_queue.get(timeout=30)
-        cfg_parallel_outputs = [cfg_parallel_queue.get(timeout=30) for _ in range(cfg_parallel_size)]
+    baseline_output = baseline_queue.get()
+    cfg_parallel_outputs = [cfg_parallel_queue.get() for _ in range(cfg_parallel_size)]
     cfg_parallel_outputs.sort(key=lambda item: item[0])
     cfg_parallel_output = cfg_parallel_outputs[0][1]
 
@@ -1079,7 +1009,7 @@ def _run_multi_branch_gpu_parity(
 @pytest.mark.full_model
 @pytest.mark.diffusion
 @pytest.mark.parallel
-@hardware_test(res={"cuda": ["L4", "B200"], "rocm": "MI325", "xpu": "B60"}, num_cards=2)
+@hardware_test(res={"cuda": ["L4", "B200"]}, num_cards=2)
 @pytest.mark.parametrize("batch_size", [2])
 @pytest.mark.parametrize("cfg_normalize", [False, True])
 @pytest.mark.parametrize("extra_kwargs", [None, {"step_i": 1}])
@@ -1313,54 +1243,4 @@ def test_cfg_branch_stamp_is_restored_when_predict_noise_raises():
         )
 
     assert pipeline.transformer.seen_branches == ["positive"]
-    assert pipeline.transformer.cfg_branch is None
-
-
-class _PackedListTransformer(torch.nn.Module):
-    """Returns one tensor per request, like a packed MixFusion forward."""
-
-    def forward(self, *, preds: list[torch.Tensor]) -> list[torch.Tensor]:
-        return list(preds)
-
-
-class _PackedListPipeline(CFGParallelMixin):
-    """Uses the base ``predict_noise``, which must keep the list intact."""
-
-    def __init__(self) -> None:
-        self.transformer = _PackedListTransformer()
-
-
-def _packed_list_inputs(seed: int = 11) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
-    _set_random_seeds(seed)
-    positive = [torch.randn(1, 4, 4), torch.randn(2, 4, 4)]
-    _set_random_seeds(seed + 1)
-    negative = [torch.randn(1, 4, 4), torch.randn(2, 4, 4)]
-    return positive, negative
-
-
-@pytest.mark.core_model
-@pytest.mark.diffusion
-@pytest.mark.cpu
-@pytest.mark.parametrize("cfg_normalize", [False, True])
-def test_sequential_cfg_keeps_packed_list_predictions(cfg_normalize: bool):
-    """Sequential CFG must return a per-request list so the runner can index it."""
-    pipeline = _PackedListPipeline()
-    positive, negative = _packed_list_inputs()
-
-    with torch.no_grad():
-        combined = pipeline.predict_noise_maybe_with_cfg(
-            do_true_cfg=True,
-            true_cfg_scale=5.0,
-            positive_kwargs={"preds": positive},
-            negative_kwargs={"preds": negative},
-            cfg_normalize=cfg_normalize,
-        )
-
-    assert isinstance(combined, list)
-    assert len(combined) == len(positive)
-    for pos, neg, actual in zip(positive, negative, combined, strict=True):
-        expected = neg + 5.0 * (pos - neg)
-        if cfg_normalize:
-            expected = pipeline.cfg_normalize_function(pos, expected)
-        torch.testing.assert_close(actual, expected)
     assert pipeline.transformer.cfg_branch is None

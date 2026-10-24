@@ -204,6 +204,14 @@ class FlashAttentionBackend(AttentionBackend):
         return True
 
     @classmethod
+    def supports_dense_4d_mask(cls, attention_spec: object | None = None) -> bool:
+        del attention_spec
+        # CUDA/ROCm/MUSA route masked attention through the varlen wrapper,
+        # which only accepts a 2D key-validity mask. Ascend feeds the dense
+        # block mask to npu_fusion_attention and accepts 4D directly.
+        return current_omni_platform.is_npu()
+
+    @classmethod
     def supports_cross_kv_mask(cls, attention_spec: object | None = None) -> bool:
         del attention_spec
         if not current_omni_platform.is_cuda():

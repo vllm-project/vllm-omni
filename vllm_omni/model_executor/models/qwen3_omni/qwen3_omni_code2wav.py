@@ -272,6 +272,35 @@ class Qwen3OmniMoeCode2Wav(nn.Module, Qwen3OmniNestedSupportsQuant):
             capability.minor,
         )
 
+    def _apply_cudnn_dtype_workaround(self, vllm_config: VllmConfig) -> None:
+        """Promote this decoder on the exact stack reported in issue #8935."""
+        # cuDNN 9.20.0 produces incorrect low-precision Conv1d results for some
+        # Code2Wav window lengths on SM100/SM103 (issue #8935). Apply the
+        # known FP32 workaround before weight loading, Snake caches and graph
+        # capture, including the optional first-frame copy inside the Talker.
+        if (
+            self.code_embedding.weight.dtype not in (torch.bfloat16, torch.float16)
+            or not current_omni_platform.is_cuda()
+            or torch.backends.cudnn.version() != 92000
+        ):
+            return
+        device = torch.device(vllm_config.device_config.device)
+        if device.type != "cuda":
+            return
+        device_id = device.index if device.index is not None else torch.accelerator.current_device_index()
+        capability = current_omni_platform.get_device_capability(device_id)
+        if capability is None or (capability.major, capability.minor) not in ((10, 0), (10, 3)):
+            return
+        self.float()
+        logger.warning_once(
+            "Using float32 for Qwen3-Omni Code2Wav to avoid incorrect cuDNN 9.20.0 "
+            "low-precision Conv1d results on SM%d%d. This increases decoder memory "
+            "use. This fallback applies only to cuDNN 9.20.0. Set "
+            "codec_cudnn_fp32_fallback=false in connector extra to retain the requested dtype.",
+            capability.major,
+            capability.minor,
+        )
+
     def precompute_snake_caches(self):
         """Precompute exp(alpha) and 1/(exp(beta)+eps) for all SnakeBeta modules."""
         count = 0

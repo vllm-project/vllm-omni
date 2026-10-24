@@ -401,6 +401,33 @@ class OmniPlatform(Platform):
 
         return CUDAGraphWrapper
 
+    def capture_graph(
+        self, capture: Callable[[], None], generators: Sequence[torch.Generator] = ()
+    ) -> torch.cuda.CUDAGraph | None:
+        """Capture ``capture`` into a model-owned device graph.
+
+        Returns ``None`` when the platform cannot capture; ``replay_graph`` then
+        runs the eager callable on the same static buffers instead.
+        """
+        from vllm.platforms import current_platform
+
+        if not self.is_cuda_alike():
+            return None
+        graph = torch.cuda.CUDAGraph()
+        for generator in generators:
+            graph.register_generator_state(generator)
+        # Share vLLM's pool, which is cached per platform class, with the runner's graphs.
+        with torch.cuda.graph(graph, pool=current_platform.get_global_graph_pool(), capture_error_mode="thread_local"):
+            capture()
+        return graph
+
+    @classmethod
+    def replay_graph(cls, graph: torch.cuda.CUDAGraph | None, eager: Callable[[], None]) -> None:
+        if graph is None:
+            eager()
+            return
+        graph.replay()
+
     @classmethod
     def get_graphed_forward_cls(cls) -> type:
         """Return the capture-and-replay class for keyword-only module forwards.
