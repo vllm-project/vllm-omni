@@ -309,6 +309,12 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
     @torch.inference_mode()
     def _create_encoder_cudagraph_manager(self):
         raw_model = self.get_model()
+        if self.compilation_config.cudagraph_mm_encoder and self.supports_mm_inputs:
+            factory = getattr(raw_model, "create_encoder_cudagraph_manager", None)
+            if factory is not None:
+                if not current_omni_platform.is_cuda():
+                    return None
+                return factory(self.vllm_config, self.device, self.dtype)
         if not getattr(raw_model, "encoder_cudagraph_single_replay", False):
             return super()._create_encoder_cudagraph_manager()
         from vllm.model_executor.models.interfaces import supports_encoder_cudagraph
