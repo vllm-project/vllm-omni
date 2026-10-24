@@ -1,12 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Characterization tests for ``vllm_omni.worker.base.OmniGPUWorkerBase``.
+"""Tests for ``vllm_omni.worker.base.OmniGPUWorkerBase``.
 
-Pins the CURRENT behaviour of ``determine_available_memory`` (device-level
-profiling is the only path — the NVML / process-scoped arm was removed with
-parallel stage init, which coordinates concurrent same-device measurement via
-admission + SH/EX device locks instead), plus the
-memory-pool / sleep / wake-up plumbing that a later change may touch.
+Pins the behaviour of ``determine_available_memory`` (the KV budget comes from
+upstream's ``non_kv_cache_memory`` aggregate; device-level profiling is the only
+path — the NVML / process-scoped arm was removed with parallel stage init, which
+coordinates concurrent same-device measurement via admission + SH/EX device locks
+instead), plus the memory-pool / sleep / wake-up plumbing that a later change may
+touch.
 
 Workers are constructed via ``object.__new__`` with only the attributes each
 method reads; module-level collaborators are monkeypatched. Pure CPU.
@@ -41,17 +42,27 @@ def _fresh_once_loggers():
         getattr(vllm_logger, name).cache_clear()
 
 
-def _fake_memory_profiling(*, non_torch: int, torch_peak: int):
-    """A stand-in for ``vllm.utils.mem_utils.memory_profiling`` context manager."""
+def _fake_memory_profiling(
+    *, non_torch: int, torch_peak: int, total_consumed: int | None = None, transient_headroom: int = 0
+):
+    """A stand-in for ``vllm.utils.mem_utils.memory_profiling`` context manager.
+
+    ``non_kv_cache_memory`` mirrors upstream's aggregate: ``total_consumed +
+    transient_peak_headroom``. ``total_consumed`` defaults to the profiling-window
+    delta (``torch_peak + non_torch``) for tests where nothing predates the
+    window; pass it explicitly to exercise persistent runner buffers, the case
+    #7839 reports.
+    """
 
     @contextmanager
     def _mp(snapshot, weights_memory):  # noqa: ARG001 - signature parity only
-        # total_consumed mirrors upstream vllm.utils.mem_utils.MemoryProfilingResult
-        # (added by upstream 58b2012aa2) and is read by OmniGPUWorkerBase.
+        consumed = torch_peak + non_torch if total_consumed is None else total_consumed
         yield SimpleNamespace(
             non_torch_increase=non_torch,
             torch_peak_increase=torch_peak,
-            total_consumed=torch_peak + non_torch,
+            total_consumed=consumed,
+            transient_peak_headroom=transient_headroom,
+            non_kv_cache_memory=consumed + transient_headroom,
         )
 
     return _mp
@@ -90,15 +101,34 @@ def test_no_process_scoped_collaborators_remain():
     assert not hasattr(base, "get_process_gpu_memory")
 
 
-def test_determine_available_memory_profiling_path(monkeypatch):
-    """available = requested - (weights + peak + non_torch); the only path."""
+def test_determine_available_memory_uses_non_kv_cache_memory(monkeypatch):
+    """The budget comes from upstream's ``non_kv_cache_memory`` aggregate, which
+    covers allocations made before the profiling window (runner buffers), not the
+    legacy weights + peak + non-torch sum.
+
+    Replays #7839's accounting example (GiB): 30 requested, 10 weights, 2 of
+    persistent runner buffers allocated after the initial snapshot, another 1
+    persistent + 1 non-torch during the window, transient headroom of 2.
+    -> total_consumed = 14, non_kv_cache_memory = 16, budget = 14.
+    The legacy sum (10+3+1=14) would leave 16, over-allocating the 2 GiB.
+    """
     worker = _make_worker(requested_memory=30 * GIB, model_memory_usage=10 * GIB)
-    monkeypatch.setattr(base, "memory_profiling", _fake_memory_profiling(non_torch=1 * GIB, torch_peak=2 * GIB))
+    monkeypatch.setattr(
+        base,
+        "memory_profiling",
+        _fake_memory_profiling(
+            non_torch=1 * GIB,
+            torch_peak=3 * GIB,
+            total_consumed=14 * GIB,
+            transient_headroom=2 * GIB,
+        ),
+    )
 
     out = OmniGPUWorkerBase.determine_available_memory(worker)
 
-    profiled = 10 * GIB + 2 * GIB + 1 * GIB
-    assert out == 30 * GIB - profiled
+    assert out == 14 * GIB
+    assert worker.total_consumed == 14 * GIB
+    assert worker.peak_activation_memory == 2 * GIB  # transient headroom, not torch_peak_increase
 
 
 def test_determine_available_memory_populates_total_consumed(monkeypatch):
@@ -114,7 +144,7 @@ def test_determine_available_memory_populates_total_consumed(monkeypatch):
 def test_determine_available_memory_clamps_to_zero(monkeypatch):
     """Over-subscription clamps the KV budget to 0, never negative."""
     worker = _make_worker(requested_memory=5 * GIB, model_memory_usage=8 * GIB)
-    monkeypatch.setattr(base, "memory_profiling", _fake_memory_profiling(non_torch=0, torch_peak=0))
+    monkeypatch.setattr(base, "memory_profiling", _fake_memory_profiling(non_torch=3 * GIB, torch_peak=3 * GIB))
 
     out = OmniGPUWorkerBase.determine_available_memory(worker)
 
@@ -139,7 +169,11 @@ def test_determine_available_memory_reserves_cudagraph_memory(monkeypatch, apply
     @contextmanager
     def profile_memory(snapshot, weights_memory):
         calls.append("profile-enter")
-        with _fake_memory_profiling(non_torch=1 * GIB, torch_peak=2 * GIB)(snapshot, weights_memory) as result:
+        with _fake_memory_profiling(
+            non_torch=1 * GIB,
+            torch_peak=2 * GIB,
+            total_consumed=13 * GIB,  # weights (10) are resident before the profile window
+        )(snapshot, weights_memory) as result:
             yield result
         calls.append("profile-exit")
 
@@ -149,9 +183,10 @@ def test_determine_available_memory_reserves_cudagraph_memory(monkeypatch, apply
         out = worker.determine_available_memory()
         assert out == (13 if apply_estimate else 17) * GIB
         assert worker.cudagraph_memory_estimate == (4 if apply_estimate else 0) * GIB
-        # Warmup adds the actual graph memory separately when suggesting a KV budget.
-        assert worker.peak_activation_memory == 2 * GIB
-        assert worker.total_consumed == 3 * GIB
+        # peak_activation_memory carries upstream's transient-headroom semantics,
+        # not the profiling-window peak; the graph reserve lands in profiled_usage.
+        assert worker.peak_activation_memory == 0
+        assert worker.total_consumed == 13 * GIB
     # With the reserve off there is no extra capture pass at all.
     assert calls == ["profile-enter", "model", "profile-exit", *(["graphs"] if apply_estimate else [])] * 2
 
@@ -170,7 +205,11 @@ def test_determine_available_memory_skips_unavailable_cudagraphs(monkeypatch, cu
 
     worker.model_runner.profile_cudagraph_memory = profile_graphs
     monkeypatch.setattr(base, "current_omni_platform", SimpleNamespace(is_cuda_alike=lambda: cuda_alike))
-    monkeypatch.setattr(base, "memory_profiling", _fake_memory_profiling(non_torch=1 * GIB, torch_peak=2 * GIB))
+    monkeypatch.setattr(
+        base,
+        "memory_profiling",
+        _fake_memory_profiling(non_torch=1 * GIB, torch_peak=2 * GIB, total_consumed=13 * GIB),
+    )
 
     assert worker.determine_available_memory() == 17 * GIB
     assert worker.cudagraph_memory_estimate == 0
@@ -182,7 +221,11 @@ def test_determine_available_memory_cudagraph_estimate_can_exhaust_budget(monkey
     worker.model_runner.profile_cudagraph_memory = lambda: 4 * GIB
     monkeypatch.setattr(base, "current_omni_platform", SimpleNamespace(is_cuda_alike=lambda: True))
     monkeypatch.setenv("VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS", "1")
-    monkeypatch.setattr(base, "memory_profiling", _fake_memory_profiling(non_torch=1 * GIB, torch_peak=2 * GIB))
+    monkeypatch.setattr(
+        base,
+        "memory_profiling",
+        _fake_memory_profiling(non_torch=1 * GIB, torch_peak=2 * GIB, total_consumed=13 * GIB),
+    )
 
     assert worker.determine_available_memory() == 0
 
@@ -195,7 +238,11 @@ def test_a_negative_graph_estimate_does_not_raise_the_budget(monkeypatch):
     worker.model_runner.profile_cudagraph_memory = lambda: -2 * GIB
     monkeypatch.setattr(base, "current_omni_platform", SimpleNamespace(is_cuda_alike=lambda: True))
     monkeypatch.setenv("VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS", "1")
-    monkeypatch.setattr(base, "memory_profiling", _fake_memory_profiling(non_torch=1 * GIB, torch_peak=2 * GIB))
+    monkeypatch.setattr(
+        base,
+        "memory_profiling",
+        _fake_memory_profiling(non_torch=1 * GIB, torch_peak=2 * GIB, total_consumed=13 * GIB),
+    )
 
     assert worker.determine_available_memory() == 17 * GIB
     assert worker.cudagraph_memory_estimate == 0
@@ -265,7 +312,11 @@ def test_disabling_the_reserve_skips_the_graph_profile(monkeypatch, caplog):
     worker.model_runner.profile_cudagraph_memory = lambda: pytest.fail("the reserve is disabled")
     monkeypatch.setattr(base, "current_omni_platform", SimpleNamespace(is_cuda_alike=lambda: True))
     monkeypatch.setenv("VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS", "0")
-    monkeypatch.setattr(base, "memory_profiling", _fake_memory_profiling(non_torch=1 * GIB, torch_peak=2 * GIB))
+    monkeypatch.setattr(
+        base,
+        "memory_profiling",
+        _fake_memory_profiling(non_torch=1 * GIB, torch_peak=2 * GIB, total_consumed=13 * GIB),
+    )
 
     with caplog.at_level("INFO", logger=base.logger.name):
         assert worker.determine_available_memory() == 17 * GIB
@@ -415,7 +466,11 @@ def test_a_capped_budget_is_not_told_to_raise_utilization(monkeypatch, caplog):
     worker.model_runner.profile_cudagraph_memory = lambda: 4 * GIB
     monkeypatch.setattr(base, "current_omni_platform", SimpleNamespace(is_cuda_alike=lambda: True))
     monkeypatch.setenv("VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS", "1")
-    monkeypatch.setattr(base, "memory_profiling", _fake_memory_profiling(non_torch=1 * GIB, torch_peak=2 * GIB))
+    monkeypatch.setattr(
+        base,
+        "memory_profiling",
+        _fake_memory_profiling(non_torch=1 * GIB, torch_peak=2 * GIB, total_consumed=13 * GIB),
+    )
 
     with caplog.at_level("INFO", logger=base.logger.name):
         budget = worker.determine_available_memory()
