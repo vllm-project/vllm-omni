@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Interactive tool to configure multi-stage TTS/Omni pipelines.
 
 Detects GPUs, shows available memory, and helps configure:
@@ -8,7 +8,10 @@ Detects GPUs, shows available memory, and helps configure:
   - gpu_memory_utilization per stage
   - async_chunk (streaming vs non-streaming)
   - enforce_eager vs CUDA graph compilation
-  - max_batch_size per stage
+  - max_num_seqs per stage
+
+The config is a deploy YAML (``vllm_omni/deploy/*.yaml``) with a top-level
+``stages:`` list.
 
 Usage:
     python tools/configure_stage_memory.py --config qwen3_tts.yaml
@@ -81,13 +84,22 @@ def print_gpu_table(gpus: list[dict]) -> None:
     print()
 
 
+def _fmt(value: object, spec: str = "") -> str:
+    """Format a stage value, showing unset (model default) values as ``-``."""
+    if value is None:
+        return "-"
+    if isinstance(value, bool):
+        return "yes" if value else "no"
+    return format(value, spec)
+
+
 def print_config_summary(config: dict, stages: list[dict]) -> None:
     """Print full config summary."""
     async_chunk = config.get("async_chunk", False)
     print(f"  async_chunk: {async_chunk}")
     print(
         f"  {'Stage':>5}  {'Model Stage':<15}  {'Device':>6}  {'GPU Mem':>8}"
-        f"  {'Eager':>6}  {'Async Sched':>11}  {'Batch':>5}"
+        f"  {'Eager':>6}  {'Async Sched':>11}  {'Seqs':>5}"
     )
     print(
         f"  {'-----':>5}  {'-----------':<15}  {'------':>6}  {'-------':>8}"
@@ -96,30 +108,55 @@ def print_config_summary(config: dict, stages: list[dict]) -> None:
     for s in stages:
         print(
             f"  {s['stage_id']:>5}  {s['model_stage']:<15}  {s['device']:>6}"
-            f"  {s['gpu_mem']:>7.3f}  {'yes' if s['enforce_eager'] else 'no':>6}"
-            f"  {'yes' if s['async_scheduling'] else 'no':>11}"
-            f"  {s['max_batch_size']:>5}"
+            f"  {_fmt(s['gpu_mem'], '.3f'):>8}  {_fmt(s['enforce_eager']):>6}"
+            f"  {_fmt(s['async_scheduling']):>11}"
+            f"  {_fmt(s['max_num_seqs']):>5}"
         )
     print()
 
 
+def _get_stage_value(stage: dict, key: str, default: object = None) -> object:
+    """Read an engine knob with the precedence ``load_deploy_config`` uses."""
+    engine_args = stage.get("engine_args") or {}
+    if key in engine_args:
+        return engine_args[key]
+    return stage.get(key, default)
+
+
+def _set_stage_value(stage: dict, key: str, value: object) -> None:
+    """Write an engine knob where ``load_deploy_config`` will read it."""
+    engine_args = stage.get("engine_args")
+    if isinstance(engine_args, dict) and key in engine_args:
+        engine_args[key] = value
+    else:
+        stage[key] = value
+
+
 def extract_stages(config: dict) -> list[dict]:
-    """Extract stage info from config."""
+    """Extract stage info from a deploy config.
+
+    Knobs a stage does not set are kept as ``None`` so they are not written
+    back and the stage keeps its model / vLLM default.
+    """
+    if "stage_args" in config:
+        raise ValueError(
+            "This config uses the removed `stage_args` schema, which vLLM-Omni no "
+            "longer loads. Use a deploy YAML with a top-level `stages:` list "
+            "(see vllm_omni/deploy/)."
+        )
     stages = []
-    for stage_arg in config.get("stage_args", []):
-        ea = stage_arg.get("engine_args", {})
-        rt = stage_arg.get("runtime", {})
+    for stage in config.get("stages") or []:
+        runtime = stage.get("runtime") or {}
         stages.append(
             {
-                "stage_id": stage_arg.get("stage_id", 0),
-                "stage_type": stage_arg.get("stage_type", "llm"),
-                "model_stage": ea.get("model_stage", "unknown"),
-                "device": str(rt.get("devices", "0")),
-                "gpu_mem": ea.get("gpu_memory_utilization", 0.9),
-                "enforce_eager": ea.get("enforce_eager", False),
-                "async_scheduling": ea.get("async_scheduling", False),
-                "max_batch_size": rt.get("max_batch_size", 1),
-                "worker_type": ea.get("worker_type", "ar"),
+                "stage_id": stage.get("stage_id", 0),
+                "model_stage": _get_stage_value(stage, "model_stage", "-"),
+                "device": str(runtime.get("devices", stage.get("devices", "0"))),
+                "gpu_mem": _get_stage_value(stage, "gpu_memory_utilization"),
+                "enforce_eager": _get_stage_value(stage, "enforce_eager"),
+                "async_scheduling": _get_stage_value(stage, "async_scheduling"),
+                "max_num_seqs": _get_stage_value(stage, "max_num_seqs"),
+                "worker_type": _get_stage_value(stage, "worker_type"),
             }
         )
     return stages
@@ -236,8 +273,9 @@ def interactive_configure(config: dict, stages: list[dict], gpus: list[dict]) ->
             except ValueError:
                 print("    Invalid number")
 
-        # enforce_eager
-        if s["worker_type"] == "ar":
+        # enforce_eager (deploy YAMLs do not record the worker type, so ask
+        # for every stage unless it is known to be a generation stage)
+        if s["worker_type"] in ("ar", None):
             current = s["enforce_eager"]
             hint = "no=CUDA graphs (faster), yes=eager (debug)" if not current else "yes=eager, no=CUDA graphs (faster)"
             val = input(f"    enforce_eager [{('yes' if current else 'no')}] ({hint}): ").strip().lower()
@@ -246,12 +284,11 @@ def interactive_configure(config: dict, stages: list[dict], gpus: list[dict]) ->
             elif val in ("n", "no", "false", "0"):
                 s["enforce_eager"] = False
 
-        # max_batch_size
-        current_bs = s["max_batch_size"]
-        val = input(f"    max_batch_size [{current_bs}]: ").strip()
+        # max_num_seqs
+        val = input(f"    max_num_seqs [{_fmt(s['max_num_seqs'])}]: ").strip()
         if val:
             try:
-                s["max_batch_size"] = int(val)
+                s["max_num_seqs"] = int(val)
             except ValueError:
                 pass
 
@@ -263,13 +300,20 @@ def interactive_configure(config: dict, stages: list[dict], gpus: list[dict]) ->
 def apply_to_config(config: dict, stages: list[dict]) -> dict:
     """Apply stage settings back to config dict."""
     config = copy.deepcopy(config)
-    for stage_arg, s in zip(config["stage_args"], stages):
-        stage_arg.setdefault("runtime", {})["devices"] = s["device"]
-        stage_arg.setdefault("runtime", {})["max_batch_size"] = s["max_batch_size"]
-        ea = stage_arg.setdefault("engine_args", {})
-        ea["gpu_memory_utilization"] = s["gpu_mem"]
-        ea["enforce_eager"] = s["enforce_eager"]
-        ea["async_scheduling"] = s["async_scheduling"]
+    for stage, s in zip(config["stages"], stages):
+        runtime = stage.get("runtime")
+        if isinstance(runtime, dict) and "devices" in runtime:
+            runtime["devices"] = s["device"]
+        else:
+            stage["devices"] = s["device"]
+        for key, value in (
+            ("gpu_memory_utilization", s["gpu_mem"]),
+            ("enforce_eager", s["enforce_eager"]),
+            ("async_scheduling", s["async_scheduling"]),
+            ("max_num_seqs", s["max_num_seqs"]),
+        ):
+            if value is not None:
+                _set_stage_value(stage, key, value)
     return config
 
 
@@ -318,7 +362,11 @@ Examples:
         sys.exit(1)
 
     config = OmegaConf.to_container(OmegaConf.load(config_path), resolve=True)
-    stages = extract_stages(config)
+    try:
+        stages = extract_stages(config)
+    except ValueError as e:
+        print(f"Error: {config_path}: {e}", file=sys.stderr)
+        sys.exit(1)
     gpus = get_gpu_info()
 
     if not gpus:
