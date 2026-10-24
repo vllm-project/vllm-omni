@@ -127,6 +127,7 @@ class DiffusionKVRequest:
         self.num_tokens = seq_len
         self.num_prompt_tokens = prefix_len
         self.num_computed_tokens = 0
+        self.allocation_generation = 0
         self.block_hashes = list(block_hashes)
         self.skip_reading_prefix_cache = not self.block_hashes
         self.status = RequestStatus.WAITING

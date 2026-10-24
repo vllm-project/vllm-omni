@@ -10,8 +10,9 @@ import sys
 import threading
 import time
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import msgspec
 import torch
@@ -19,6 +20,18 @@ import zmq
 
 from ..utils.logging import get_connector_logger
 from .base import OmniConnectorBase
+from .paged_transfer import (
+    KVPagePool,
+    PageGeometry,
+    PageOffer,
+    PageReadyEvent,
+    Region,
+    ReservedKVPages,
+    coalesce_page_regions,
+)
+
+if TYPE_CHECKING:
+    from nixl._api import nixl_prepped_dlist_handle, nixl_xfer_handle
 
 logger = get_connector_logger(__name__)
 
@@ -34,6 +47,7 @@ _TUPLE_MARKER = "__nixl_tuple__"
 # before READ, even with out-of-band metadata, and acknowledge completion here.
 _GET_META_MSG = b"nixl_get_meta"
 _XFER_DONE_MSG = b"nixl_xfer_done"
+_PAGE_GEOMETRY_MISMATCH = b"nixl_page_geometry_mismatch"
 _META_NOT_FOUND = b"nixl_meta_not_found"
 _ACK = b"nixl_ack"
 
@@ -61,6 +75,27 @@ class _PendingPayload:
     deadline: float
     generation: str = field(default_factory=lambda: uuid.uuid4().hex)
     claims: set[str] = field(default_factory=set)
+    page_pool: KVPagePool | None = None
+    expected_readers: int = 0
+    page_claim_ids: frozenset[str] | None = None
+
+
+@dataclass
+class _PageClaim:
+    offer: PageOffer
+    readers: frozenset[str]
+    endpoint: tuple[str, int]
+
+
+@dataclass
+class _PageRead:
+    key: str
+    offer: PageOffer
+    target: ReservedKVPages
+    handle: nixl_xfer_handle | None = None
+    dlists: list[nixl_prepped_dlist_handle] = field(default_factory=list)
+    remote_agent: str | None = None
+    dma_done: bool = False
 
 
 class NixlConnector(OmniConnectorBase):
@@ -82,11 +117,13 @@ class NixlConnector(OmniConnectorBase):
     """
 
     supports_raw_data: bool = True
+    page_offer_type: type[PageOffer] = PageOffer
 
     def __init__(self, config: dict[str, Any]):
         self.config = dict(config or {})
         self.stage_id = int(self.config.get("stage_id", 0))
         self._closed = True
+        self._closing = False
         self._registered_descs: list[Any] = []
         self._pending: dict[str, _PendingPayload] = {}
         self._published: dict[str, dict[str, Any]] = {}
@@ -94,11 +131,26 @@ class NixlConnector(OmniConnectorBase):
         self._close_lock = threading.Lock()
         self._close_thread: threading.Thread | None = None
         self._remote_agents: list[str] = []
+        self._remote_agent_names: dict[bytes, str] = {}
+        self._remote_agent_users: dict[str, int] = {}
+        self._page_pools: set[KVPagePool] = set()
+        self._page_remote_agents: dict[tuple[KVPagePool, bytes], str] = {}
+        self._page_reads: dict[str, _PageRead] = {}
+        self._page_claims: dict[tuple[str, str, str], _PageClaim] = {}
         self._metrics: dict[str, int] = {
             "puts": 0,
             "gets": 0,
             "errors": 0,
             "bytes_transferred": 0,
+            "page_exports": 0,
+            "page_reads": 0,
+            "page_descriptors_submitted": 0,
+            "page_claim_queries": 0,
+            "page_claim_cache_hits": 0,
+            "page_pool_registrations": 0,
+            "page_bytes_published": 0,
+            "page_bytes_completed": 0,
+            "page_regions_completed": 0,
         }
 
         from vllm.distributed.nixl_utils import NixlWrapper, nixl_agent_config
@@ -338,6 +390,274 @@ class NixlConnector(OmniConnectorBase):
         finally:
             self._req_local.deadline = None
 
+    def register_page_pool(self, pool: KVPagePool) -> None:
+        """Register native allocations once, without taking allocator ownership."""
+        with self._state_lock:
+            if self._closed or self._closing:
+                raise RuntimeError("Cannot register pages: NixlConnector is closed")
+            if pool in self._page_pools:
+                return
+            if pool.registrations:
+                raise ValueError("KV pool is already registered with another connector")
+            memory_type = self._resolve_memory_type(next(iter(pool.caches.values())))
+            regions = [(address, size, device, "") for address, size, device in pool.registration_regions()]
+            descs = self._agent.get_reg_descs(regions, memory_type)
+            self._agent.register_memory(descs, backends=self._backends)
+            pool.registrations.append(descs)
+            self._page_pools.add(pool)
+            self._metrics["page_pool_registrations"] += 1
+
+    def export_pages(
+        self,
+        key: str,
+        pool: KVPagePool,
+        block_ids: Sequence[int],
+        num_tokens: int,
+        *,
+        expected_readers: int,
+        ready: PageReadyEvent,
+        generation: str | None = None,
+    ) -> PageOffer:
+        """Publish a fenced native block lease on the existing control plane."""
+        regions = pool.regions(block_ids)
+        if not 0 < num_tokens <= len(block_ids) * pool.block_size or expected_readers < 1:
+            raise ValueError("A page export requires valid tokens and at least one reader")
+        ready.synchronize()
+        with self._state_lock:
+            if self._closed or self._closing or pool not in self._page_pools or not self._serving_handshake:
+                raise RuntimeError("Page exports require an open producer and a registered pool")
+            if key in self._pending:
+                raise ValueError(f"NIXL page export key {key!r} is still owned")
+            generation = generation or uuid.uuid4().hex
+            if generation in pool.exports:
+                raise ValueError("Source KV allocation generation is already exported")
+            offer = PageOffer(
+                _SCHEMA_VERSION,
+                "pages",
+                generation,
+                pool.epoch,
+                pool.geometry,
+                num_tokens,
+                len(block_ids),
+                expected_readers,
+                regions,
+                self._agent.get_agent_metadata(),
+                str(self.host),
+                int(self._zmq_port),
+            )
+            pool.exports.add(generation)
+            self._pending[key] = _PendingPayload(
+                list(pool.caches.values()),
+                [],
+                math.inf,
+                generation=generation,
+                page_pool=pool,
+                expected_readers=expected_readers,
+            )
+            self._published[key] = msgspec.structs.asdict(offer)
+            self._metrics["page_exports"] += 1
+            self._metrics["page_bytes_published"] += sum(region[1] for region in regions)
+        return offer
+
+    def claim_pages(
+        self,
+        key: str,
+        host: str,
+        port: int,
+        *,
+        generation: str,
+        claim_id: str,
+        page_claim_ids: tuple[str, ...],
+        geometry: PageGeometry,
+    ) -> PageOffer | None:
+        """Claim every CFG reader atomically before the first page READ."""
+        readers = frozenset(page_claim_ids)
+        with self._state_lock:
+            submitted = {(read.key, read.offer.generation, read.offer.claim_id) for read in self._page_reads.values()}
+            if (key, generation, claim_id) in submitted:
+                return None
+            cached = self._page_claims.get((key, generation, claim_id))
+            if (
+                cached is not None
+                and cached.readers == readers
+                and cached.endpoint == (host, port)
+                and cached.offer.geometry == geometry
+            ):
+                self._metrics["page_claim_cache_hits"] += 1
+                return cached.offer
+        if self._zmq_ctx is None:
+            with self._state_lock:
+                if self._zmq_ctx is None:
+                    self._zmq_ctx = zmq.Context()
+        self._metrics["page_claim_queries"] += 1
+        metadata = self._query_metadata_at(
+            key,
+            host,
+            port,
+            generation=generation,
+            claim_id=claim_id,
+            page_claim_ids=page_claim_ids,
+            geometry=geometry,
+        )
+        if metadata is None:
+            return None
+        offer = msgspec.convert(metadata, type=self.page_offer_type)
+        with self._state_lock:
+            live_readers = msgspec.convert(metadata.get("page_claim_ids", (offer.claim_id,)), type=tuple[str, ...])
+            submitted = {(read.key, read.offer.generation, read.offer.claim_id) for read in self._page_reads.values()}
+            for reader in live_readers:
+                if (key, offer.generation, reader) in submitted:
+                    continue
+                claimed = msgspec.structs.replace(offer, claim_id=reader)
+                self._page_claims[(key, offer.generation, reader)] = _PageClaim(claimed, readers, (host, port))
+        return offer
+
+    def cancel_page_claim(self, key: str, offer: PageOffer) -> bool:
+        """ACK an unsubmitted claim; active or ambiguous DMA cannot be cancelled."""
+        claim = (key, offer.generation, offer.claim_id)
+        with self._state_lock:
+            if any(read.key == key and read.offer == offer for read in self._page_reads.values()):
+                raise RuntimeError("Cannot cancel a submitted NIXL page READ")
+            cached = self._page_claims.get(claim)
+            if cached is None:
+                return True
+            if cached.offer != offer:
+                raise ValueError("Cannot cancel a different NIXL page claim")
+            if not self._notify_transfer_done(key, msgspec.structs.asdict(offer)):
+                return False
+            del self._page_claims[claim]
+        return True
+
+    def _reserve_page_read(self, key: str, offer: PageOffer, target: ReservedKVPages) -> tuple[str, tuple[Region, ...]]:
+        """Consume a claim and pin its native destination before submitting DMA."""
+        pool = target.pool
+        regions = pool.validate_offer(offer, target.block_ids)
+        if not offer.claim_id or target.allocation_generation < 0:
+            raise ValueError("Page READ requires a source claim and a destination allocation generation")
+        with self._state_lock:
+            if self._closed or self._closing or pool not in self._page_pools:
+                raise RuntimeError("Page READ requires an open receiver and a registered pool")
+            if target.request_id in pool.reservations or any(
+                set(target.block_ids).intersection(blocks) for _, blocks in pool.reservations.values()
+            ):
+                raise ValueError("Destination KV pages are still owned by a previous transfer or computation")
+            claim = (key, offer.generation, offer.claim_id)
+            cached = self._page_claims.get(claim)
+            if cached is None or cached.offer != offer:
+                raise ValueError("Stale or already submitted NIXL page claim")
+            del self._page_claims[claim]
+            read_id = uuid.uuid4().hex
+            read = _PageRead(key, offer, target)
+            # Ownership precedes any call that can submit DMA. Failed or unknown
+            # submissions retain these native allocations until proven drained.
+            pool.reservations[target.request_id] = (target.allocation_generation, target.block_ids)
+            pool.reads.add(read_id)
+            self._page_reads[read_id] = read
+        return read_id, regions
+
+    def read_into(self, key: str, offer: PageOffer, target: ReservedKVPages) -> str:
+        """READ directly into a Scheduler reservation; no full-size receive tensor."""
+        with self._state_lock:
+            read_id, regions = self._reserve_page_read(key, offer, target)
+            read = self._page_reads[read_id]
+            pool = target.pool
+            peer = (pool, offer.agent_metadata)
+            if peer not in self._page_remote_agents:
+                self._page_remote_agents[peer] = self._acquire_remote_agent(offer.agent_metadata)
+            read.remote_agent = self._acquire_remote_agent(offer.agent_metadata)
+            memory_type = self._resolve_memory_type(next(iter(pool.caches.values())))
+            local_regions, remote_regions = coalesce_page_regions(
+                regions, offer.regions, len(regions) // len(pool.geometry.layers)
+            )
+            local_descs = self._agent.get_xfer_descs(local_regions, memory_type)
+            remote_descs = self._agent.get_xfer_descs(remote_regions, memory_type)
+            read.dlists.append(self._agent.prep_xfer_dlist(_INIT_AGENT, local_descs))
+            read.dlists.append(self._agent.prep_xfer_dlist(read.remote_agent, remote_descs))
+            read.handle = self._agent.make_prepped_xfer(
+                "READ",
+                read.dlists[0],
+                list(range(len(local_regions))),
+                read.dlists[1],
+                list(range(len(remote_regions))),
+            )
+            self._agent.transfer(read.handle)
+            self._metrics["page_reads"] += 1
+            self._metrics["page_descriptors_submitted"] += len(local_regions)
+        return read_id
+
+    def poll_page_read(self, read_id: str) -> bool:
+        """Only DONE permits ACK; timeout and unknown state keep both pools pinned."""
+        with self._state_lock:
+            read = self._page_reads[read_id]
+            if not read.dma_done:
+                if read.handle is None:
+                    raise RuntimeError("NIXL page submission did not return a transfer handle")
+                state = self._agent.check_xfer_state(read.handle)
+                if state == "PROC":
+                    return False
+                if state != "DONE":
+                    raise RuntimeError(f"NIXL page READ state={state}; native pages remain pinned")
+                self._agent.release_xfer_handle(read.handle)
+                for dlist in read.dlists:
+                    self._agent.release_dlist_handle(dlist)
+                assert read.remote_agent is not None
+                self._release_remote_agent(read.remote_agent)
+                read.dma_done = True
+            if not self._notify_transfer_done(read.key, msgspec.structs.asdict(read.offer)):
+                return False
+            read.target.pool.reads.remove(read_id)
+            del self._page_reads[read_id]
+            self._metrics["bytes_transferred"] += sum(region[1] for region in read.offer.regions)
+            self._metrics["page_bytes_completed"] += sum(region[1] for region in read.offer.regions)
+            self._metrics["page_regions_completed"] += len(read.offer.regions)
+        return True
+
+    def retire_pages(self, target: ReservedKVPages) -> None:
+        """Release borrowed ownership after the final computation on these pages."""
+        with self._state_lock:
+            if target.pool.reservations.get(target.request_id) != (target.allocation_generation, target.block_ids):
+                raise ValueError("Cannot retire a stale destination KV allocation")
+            if any(read.target == target for read in self._page_reads.values()):
+                raise RuntimeError("Cannot retire native KV pages with unfinished DMA or ACK")
+            del target.pool.reservations[target.request_id]
+
+    def unregister_page_pool(self, pool: KVPagePool) -> None:
+        with self._state_lock:
+            if pool.exports or pool.reads or pool.reservations:
+                raise RuntimeError("Cannot deregister a KV pool owned by transfers or computation")
+            for descs in pool.registrations:
+                self._agent.deregister_memory(descs)
+            for peer, name in list(self._page_remote_agents.items()):
+                if peer[0] is pool:
+                    self._release_remote_agent(name)
+                    del self._page_remote_agents[peer]
+            pool.registrations.clear()
+            self._page_pools.discard(pool)
+
+    def _acquire_remote_agent(self, metadata: bytes) -> str:
+        with self._state_lock:
+            name = self._remote_agent_names.get(metadata)
+            if name is None:
+                name = self._agent.add_remote_agent(metadata)
+                self._remote_agent_names[metadata] = name
+                if name not in self._remote_agents:
+                    self._remote_agents.append(name)
+            self._remote_agent_users[name] = self._remote_agent_users.get(name, 0) + 1
+            return name
+
+    def _release_remote_agent(self, name: str) -> None:
+        with self._state_lock:
+            users = self._remote_agent_users[name]
+            if users > 1:
+                self._remote_agent_users[name] = users - 1
+                return
+            self._agent.remove_remote_agent(name)
+            del self._remote_agent_users[name]
+            self._remote_agent_names = {
+                metadata: agent for metadata, agent in self._remote_agent_names.items() if agent != name
+            }
+            self._remote_agents.remove(name)
+
     def abandon_get(self, get_key: str) -> None:
         claims = getattr(self._req_local, "claims", {})
         with self._state_lock:
@@ -369,6 +689,8 @@ class NixlConnector(OmniConnectorBase):
                 return None
 
             source_metadata = metadata
+            if metadata.get("kind") == "pages":
+                raise ValueError("KV page offers require read_into() and scheduler-reserved destination pages")
             deadline = getattr(self._req_local, "deadline", None)
             if deadline is not None and time.monotonic() >= deadline:
                 return None
@@ -380,8 +702,7 @@ class NixlConnector(OmniConnectorBase):
 
             local_tensors = [self._allocate_tensor_from_spec(spec, metadata.get("kind")) for spec in tensor_specs]
             if descriptor_groups:
-                remote_agent = self._agent.add_remote_agent(metadata["agent_metadata"])
-                self._remote_agents.append(remote_agent)
+                remote_agent = self._acquire_remote_agent(metadata["agent_metadata"])
             for descriptor_group in descriptor_groups:
                 remote_memory_type = descriptor_group["memory_type"]
                 indexed_regions = list(
@@ -467,9 +788,7 @@ class NixlConnector(OmniConnectorBase):
             for dlist_handle in dlist_handles:
                 self._safe_call(self._agent.release_dlist_handle, dlist_handle)
             if remote_agent is not None:
-                self._safe_call(self._agent.remove_remote_agent, remote_agent)
-                if remote_agent in self._remote_agents:
-                    self._remote_agents.remove(remote_agent)
+                self._safe_call(self._release_remote_agent, remote_agent)
             for local_reg_descs in local_reg_descs_list:
                 self._safe_call(self._agent.deregister_memory, local_reg_descs)
             if source_metadata is not None:
@@ -489,6 +808,8 @@ class NixlConnector(OmniConnectorBase):
         self._release_pending(pending)
 
     def _release_pending(self, pending: _PendingPayload) -> None:
+        if pending.page_pool is not None:
+            pending.page_pool.exports.discard(pending.generation)
         for reg_descs in pending.registrations:
             self._safe_call(self._agent.deregister_memory, reg_descs)
             with self._state_lock:
@@ -500,7 +821,7 @@ class NixlConnector(OmniConnectorBase):
             pending = self._pending.get(request_id)
             if pending is None or (expected is not None and pending is not expected):
                 return None
-            if pending.claims:
+            if pending.claims or (pending.page_pool is not None and pending.page_claim_ids is None):
                 return None
             self._published.pop(request_id, None)
             return self._pending.pop(request_id)
@@ -525,6 +846,12 @@ class NixlConnector(OmniConnectorBase):
     def _close_once(self) -> None:
         if self._closed:
             return
+        if self._page_reads or any(pool.exports or pool.reservations for pool in self._page_pools):
+            _RETAINED_PRODUCERS.add(self)
+            self._closing = True
+            return
+        for pool in list(self._page_pools):
+            self.unregister_page_pool(pool)
         self._closed = True
         # Keep completion ACKs available until the automatic closer drains ownership.
         for request_id in list(self._pending):
@@ -649,7 +976,15 @@ class NixlConnector(OmniConnectorBase):
         return self._query_metadata_at(get_key, *endpoint)
 
     def _query_metadata_at(
-        self, get_key: str, host: str, port: int, *, generation: str | None = None, claim_id: str | None = None
+        self,
+        get_key: str,
+        host: str,
+        port: int,
+        *,
+        generation: str | None = None,
+        claim_id: str | None = None,
+        page_claim_ids: tuple[str, ...] | None = None,
+        geometry: PageGeometry | None = None,
     ) -> dict[str, Any] | None:
         """Fetch transfer metadata for ``get_key`` from a producer's ROUTER socket.
 
@@ -663,9 +998,16 @@ class NixlConnector(OmniConnectorBase):
             claims = {}
             self._req_local.claims = claims
         query_key = (zmq_addr, get_key, generation)
-        claim_id = claims.setdefault(query_key, claim_id or uuid.uuid4().hex)
+        if page_claim_ids is None:
+            claim_id = claims.setdefault(query_key, claim_id or uuid.uuid4().hex)
         request = _GET_META_MSG + msgspec.msgpack.encode(
-            {"key": get_key, "generation": generation, "claim_id": claim_id}
+            {
+                "key": get_key,
+                "generation": generation,
+                "claim_id": claim_id,
+                "page_claim_ids": page_claim_ids,
+                "page_geometry": geometry,
+            }
         )
         try:
             sock = self._get_req_socket(zmq_addr, self._metadata_query_timeout_ms)
@@ -678,6 +1020,9 @@ class NixlConnector(OmniConnectorBase):
         if reply == _META_NOT_FOUND:
             claims.pop(query_key, None)
             return None
+        if reply.startswith(_PAGE_GEOMETRY_MISMATCH):
+            source = msgspec.msgpack.decode(reply[len(_PAGE_GEOMETRY_MISMATCH) :], type=PageGeometry)
+            raise ValueError(f"Incompatible NIXL KV page geometry: source={source}, destination={geometry}")
         metadata = msgspec.msgpack.decode(reply)
         claims.pop(query_key, None)
         return metadata
@@ -754,12 +1099,32 @@ class NixlConnector(OmniConnectorBase):
                     or not claim
                     or request.get("generation") not in (None, pending.generation)
                     or (not pending.claims and time.monotonic() >= pending.deadline)
-                    or ((self._closed or getattr(self, "_closing", False)) and claim not in pending.claims)
+                    or ((self._closed or self._closing) and claim not in pending.claims and pending.page_pool is None)
                 ):
                     return _META_NOT_FOUND
                 # Publish ownership before descriptors can leave this lock.
                 # Failed/lost replies retain the claim conservatively.
-                reply = msgspec.msgpack.encode({**metadata, "claim_id": claim})
+                if pending.page_pool is not None:
+                    readers = request.get("page_claim_ids")
+                    if (
+                        not isinstance(readers, (tuple, list))
+                        or len(set(readers)) != pending.expected_readers
+                        or claim not in readers
+                        or (pending.page_claim_ids is not None and frozenset(readers) != pending.page_claim_ids)
+                    ):
+                        return _META_NOT_FOUND
+                    geometry = msgspec.convert(request["page_geometry"], type=PageGeometry)
+                    if geometry != pending.page_pool.geometry:
+                        return _PAGE_GEOMETRY_MISMATCH + msgspec.msgpack.encode(pending.page_pool.geometry)
+                    if pending.page_claim_ids is None:
+                        pending.page_claim_ids = frozenset(readers)
+                        pending.claims.update(readers)
+                    elif claim not in pending.claims:
+                        return _META_NOT_FOUND
+                reply_metadata = {**metadata, "claim_id": claim}
+                if pending.page_pool is not None:
+                    reply_metadata["page_claim_ids"] = tuple(pending.claims)
+                reply = msgspec.msgpack.encode(reply_metadata)
                 pending.claims.add(claim)
                 return reply
         if payload.startswith(_XFER_DONE_MSG):
@@ -868,7 +1233,12 @@ class NixlConnector(OmniConnectorBase):
             now = time.monotonic()
             with self._state_lock:
                 next_deadline = min(
-                    (pending.deadline for pending in self._pending.values() if not pending.claims), default=None
+                    (
+                        pending.deadline
+                        for pending in self._pending.values()
+                        if not pending.claims and pending.page_pool is None
+                    ),
+                    default=None,
                 )
             if next_deadline is None:
                 timeout = None
@@ -938,12 +1308,10 @@ class NixlConnector(OmniConnectorBase):
         transfer.dlists = self._release_owned_resources(self._agent.release_dlist_handle, transfer.dlists)
         if transfer.remote_agent is not None:
             try:
-                self._agent.remove_remote_agent(transfer.remote_agent)
+                self._release_remote_agent(transfer.remote_agent)
             except Exception:
                 logger.debug("Failed to remove deferred NIXL remote agent", exc_info=True)
             else:
-                if transfer.remote_agent in self._remote_agents:
-                    self._remote_agents.remove(transfer.remote_agent)
                 transfer.remote_agent = None
         transfer.registrations = self._release_owned_resources(self._agent.deregister_memory, transfer.registrations)
 
