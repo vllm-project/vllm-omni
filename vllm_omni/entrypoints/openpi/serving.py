@@ -253,6 +253,10 @@ class ServingRealtimeRobotOpenPI:
         Returns an `OmniDiffusionRequest` payload consumed by
         `AsyncOmni.generate()` and routed to the diffusion stage.
         """
+        from vllm_omni.diffusion.batch_invariance import (
+            diffusion_batch_invariant_enabled,
+            validate_batch_invariant_diffusion_request,
+        )
         from vllm_omni.diffusion.request import OmniDiffusionRequest
         from vllm_omni.entrypoints.openai.stage_params import (
             clone_sampling_params,
@@ -286,15 +290,18 @@ class ServingRealtimeRobotOpenPI:
 
         prompt = obs.get("prompt", "") if self.prompt_builder is None else self.prompt_builder.build_prompt(robot_obs)
         if seed is not None:
-            sampling_params.seed = int(seed)
+            sampling_params.seed = seed if diffusion_batch_invariant_enabled() else int(seed)
         if "num_inference_steps" in sampling:
             sampling_params.num_inference_steps = sampling["num_inference_steps"]
         sampling_params.extra_args = extra_args
-        return OmniDiffusionRequest(
+        request = OmniDiffusionRequest(
             prompt=prompt,
             sampling_params=sampling_params,
             request_id=self._next_request_id(session_id),
         )
+        # Check provenance before AsyncOmni forwards params without this request.
+        validate_batch_invariant_diffusion_request(request)
+        return request
 
     def _extract_actions(self, result: Any) -> ActionOutput:
         """Extract actions from engine result."""

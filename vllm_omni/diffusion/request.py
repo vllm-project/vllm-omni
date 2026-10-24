@@ -8,6 +8,7 @@ import random
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
+from vllm_omni.diffusion.batch_invariance import diffusion_batch_invariant_enabled
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType
 
 if TYPE_CHECKING:
@@ -56,6 +57,7 @@ class OmniDiffusionRequest:
     request_id: str
     kv_sender_info: dict[str, Any] | None = None
     payload_sender_info: dict[str, Any] | None = None
+    seed_was_explicit: bool = field(init=False, repr=False)
     # Optional opaque, model-owned input prepared before Scheduler admission.
     # Model code validates its concrete type when consuming it on the Worker.
     prepared_layout: Any | None = None
@@ -92,9 +94,16 @@ class OmniDiffusionRequest:
         if not isinstance(self.request_id, str) or not self.request_id:
             raise ValueError("OmniDiffusionRequest.request_id must be a non-empty string.")
 
+        self.seed_was_explicit = self.sampling_params.seed is not None
+
         # When neither a generator nor a seed is provided, assign a random seed
-        # so that all ranks derive the same generator state.
-        if self.sampling_params.generator is None and self.sampling_params.seed is None:
+        # so that all ranks derive the same generator state. BIC leaves missing
+        # seeds unset so rejected requests cannot seed reused params.
+        if (
+            self.sampling_params.generator is None
+            and self.sampling_params.seed is None
+            and (self.is_dummy_run() or not diffusion_batch_invariant_enabled())
+        ):
             self.sampling_params.seed = random.randint(0, 2**31 - 1)
 
         # Detect whether the caller explicitly provided guidance_scale before
