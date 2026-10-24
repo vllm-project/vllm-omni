@@ -21,6 +21,7 @@ steps:
           - >-
             pytest -s -v
             tests/diffusion/layers/test_activation.py
+            tests/diffusion/models/qwen_image_21/test_npu_fused_ops.py
             -m 'core_model and npu and A2'
             --run-level 'core_model'
 
