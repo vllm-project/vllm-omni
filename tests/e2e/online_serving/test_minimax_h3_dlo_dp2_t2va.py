@@ -27,44 +27,51 @@ FPS = 24
 NUM_INFERENCE_STEPS = 4
 REQUEST_TIMEOUT_SECONDS = 1800
 H100_TWO_CARD_MARKS = hardware_marks(res={"cuda": "H100"}, num_cards=2)
+A3_FOUR_CARD_MARKS = hardware_marks(res={"npu": "A3"}, num_cards=4)
 MI300_FOUR_CARD_MARKS = hardware_marks(res={"rocm": "MI325"}, num_cards=4)
 
-SERVER_ARGS = [
-    "--trust-remote-code",
-    "--task-type",
-    "fl2va",
-    "--num-gpus",
-    "2",
-    "--tensor-parallel-size",
-    "1",
-    "--data-parallel-size",
-    "2",
-    "--request-batch-max-wait-ms",
-    "500",
-    "--usp",
-    "1",
-    "--ring",
-    "1",
-    "--text-encoder-tp-size",
-    "1",
-    "--vae-patch-parallel-size",
-    "1",
-    "--vae-parallel-mode",
-    "tile",
-    "--vae-use-tiling",
-    "--diffusion-offload-config",
-    json.dumps(
-        {
-            "mode": "layer",
-            "components": ["dit", "text_encoder"],
-            "layer_options": {
-                "dit": {"weight_transfer": "allgather"},
-                "text_encoder": {"weight_transfer": "rank-local"},
+
+def _dlo_dp2_server_args(ulysses_degree: int = 1) -> list[str]:
+    """Use two DP replicas, each with the requested sequence-parallel size."""
+    return [
+        "--trust-remote-code",
+        "--task-type",
+        "fl2va",
+        "--num-gpus",
+        str(2 * ulysses_degree),
+        "--tensor-parallel-size",
+        "1",
+        "--data-parallel-size",
+        "2",
+        "--request-batch-max-wait-ms",
+        "500",
+        "--usp",
+        str(ulysses_degree),
+        "--ring",
+        "1",
+        "--text-encoder-tp-size",
+        "1",
+        "--vae-patch-parallel-size",
+        "1",
+        "--vae-parallel-mode",
+        "tile",
+        "--vae-use-tiling",
+        "--diffusion-offload-config",
+        json.dumps(
+            {
+                "mode": "layer",
+                "components": ["dit", "text_encoder"],
+                "layer_options": {
+                    "dit": {"weight_transfer": "allgather"},
+                    "text_encoder": {"weight_transfer": "rank-local"},
+                },
             },
-        },
-        separators=(",", ":"),
-    ),
-]
+            separators=(",", ":"),
+        ),
+    ]
+
+
+SERVER_ARGS = _dlo_dp2_server_args()
 
 ROCM_SERVER_ARGS = [
     "--trust-remote-code",
@@ -145,7 +152,26 @@ def _run_t2va_request(client: OpenAIClientHandler, seed: int) -> bytes:
             ),
             id="minimax_h3_dlo_dp2_t2va",
             marks=H100_TWO_CARD_MARKS,
-        )
+        ),
+        pytest.param(
+            OmniServerParams(
+                model=MODEL,
+                # Four NPUs form two DP replicas with USP2 per replica.
+                # Keep the CUDA offload policy and shared request assertions.
+                server_args=[*_dlo_dp2_server_args(ulysses_degree=2), "--diffusion-attention-backend", "FLASH_ATTN"],
+                env_dict={
+                    "MINDIE_SD_FA_TYPE": "ascend_laser_attention",
+                    "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
+                    "HCCL_NPU_SOCKET_PORT_RANGE": "auto",
+                    "VLLM_OMNI_VIDEO_SYNC_TIMEOUT": str(REQUEST_TIMEOUT_SECONDS),
+                    "VLLM_OMNI_DLO_DP_WAVE_TIMEOUT": str(REQUEST_TIMEOUT_SECONDS),
+                },
+                stage_init_timeout=1800,
+                init_timeout=1800,
+            ),
+            id="minimax_h3_dlo_dp2_t2va_a3",
+            marks=A3_FOUR_CARD_MARKS,
+        ),
     ],
     indirect=True,
 )

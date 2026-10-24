@@ -163,6 +163,10 @@ x-hunyuan-image3: &hunyuan_image3
 x-minimax-h3: &minimax_h3
   - vllm_omni/diffusion/models/minimax_h3/
   - vllm_omni/diffusion/layers/indexed_modulation.py
+  - vllm_omni/platforms/npu/models/minimax_h3.py
+  - vllm_omni/platforms/npu/platform.py
+  - vllm_omni/diffusion/attention/backends/flash_attn.py
+  - vllm_omni/diffusion/attention/backends/rainfusion_attn.py
 
 x-hunyuan-video: &hunyuan_video
   - vllm_omni/diffusion/models/hunyuan_video/
@@ -595,6 +599,10 @@ source_file_dependencies:
     - vllm_omni/diffusion/lora/
     - vllm_omni/diffusion/offloader/
     - vllm_omni/diffusion/distributed/
+    - vllm_omni/diffusion/data.py
+    - vllm_omni/diffusion/diffusion_engine.py
+    - vllm_omni/diffusion/executor/
+    - vllm_omni/diffusion/worker/
     - vllm_omni/entrypoints/openai/
 
   diffusion_minimax_h3_accuracy:
@@ -603,6 +611,14 @@ source_file_dependencies:
 
   diffusion_minimax_h3_perf:
     - *minimax_h3
+    - vllm_omni/diffusion/data.py
+    - vllm_omni/diffusion/diffusion_engine.py
+    - vllm_omni/diffusion/executor/
+    - vllm_omni/diffusion/worker/
+    - vllm_omni/diffusion/offloader/
+    - vllm_omni/diffusion/distributed/
+    - vllm_omni/quantization/int8_config.py
+    - vllm_omni/entrypoints/openai/
     - tests/dfx/perf/scripts/run_benchmark.py
     - tests/dfx/perf/tests/test_minimax_h3_vllm_omni.json
 

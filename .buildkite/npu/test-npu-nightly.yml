@@ -368,6 +368,28 @@ steps:
       build.env("NIGHTLY") == "1" ||
       build.pull_request.labels includes "nightly-test"
     steps:
+      - label: ":full_moon: Diffusion X2V · Perf Test · MiniMax-H3"
+        source_file_dependencies: diffusion_minimax_h3_perf
+        key: nightly-diffusion-x2v-performance-minimax-h3-npu
+        timeout_in_minutes: 300
+        mirror_hardwares: a3_npu_4
+        env:
+          VLLM_WORKER_MULTIPROC_METHOD: spawn
+          MINDIE_SD_FA_TYPE: ascend_laser_attention
+          DIFFUSION_ATTENTION_BACKEND: FLASH_ATTN
+          PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
+          HCCL_NPU_SOCKET_PORT_RANGE: auto
+          VLLM_OMNI_VIDEO_SYNC_TIMEOUT: "4000"
+        artifact_paths:
+          - tests/dfx/perf/results/*.json
+        commands:
+          - export BENCHMARK_DIR=tests/dfx/perf/results
+          - >-
+            pytest -s -v tests/dfx/perf/scripts/run_benchmark.py
+            --test-config-file tests/dfx/perf/tests/test_minimax_h3_vllm_omni.json
+            -m 'full_model and diffusion and npu and A3 and cards_4'
+            --run-level full_model
+
       - label: ":full_moon: Diffusion X2V · HunyuanVideo-1.5 Function Test"
         source_file_dependencies: diffusion_hunyuan_video_function
         timeout_in_minutes: 180

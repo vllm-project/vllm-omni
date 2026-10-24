@@ -8,7 +8,8 @@
             "cuda": [
               "H100",
               "B200"
-            ]
+            ],
+            "npu": "A3"
           },
           "num_cards": 4
         }
@@ -16,7 +17,7 @@
       "full_model",
       "diffusion"
     ],
-    "description": "MiniMax-H3 T2VA text-to-video+audio on 4 GPUs (USP4 + HSDP4, encoder-TP4, VAE-PP4 tile)",
+    "description": "MiniMax-H3 T2VA text-to-video+audio on 4 CUDA GPUs or A3 NPUs (USP4 + HSDP4, encoder-TP4, VAE-PP4 tile)",
     "server_params": {
       "model": "MiniMaxAI/MiniMax-H3",
       "serve_args": {
@@ -77,7 +78,8 @@
             "cuda": [
               "H100",
               "B200"
-            ]
+            ],
+            "npu": "A3"
           },
           "num_cards": 4
         }
@@ -85,7 +87,7 @@
       "full_model",
       "diffusion"
     ],
-    "description": "MiniMax-H3 FL2VA first-frame image-to-video+audio on 4 GPUs (USP4 + HSDP4, encoder-TP4, VAE-PP4 tile)",
+    "description": "MiniMax-H3 FL2VA first-frame image-to-video+audio on 4 CUDA GPUs or A3 NPUs (USP4 + HSDP4, encoder-TP4, VAE-PP4 tile)",
     "server_params": {
       "model": "MiniMaxAI/MiniMax-H3",
       "serve_args": {
@@ -155,7 +157,8 @@
             "cuda": [
               "H100",
               "B200"
-            ]
+            ],
+            "npu": "A3"
           },
           "num_cards": 4
         }
@@ -163,7 +166,7 @@
       "full_model",
       "diffusion"
     ],
-    "description": "MiniMax-H3 Ref2VA video-reference-to-video+audio on 4 GPUs (USP4 + HSDP4, encoder-TP4, VAE-PP4 tile)",
+    "description": "MiniMax-H3 Ref2VA video-reference-to-video+audio on 4 CUDA GPUs or A3 NPUs (USP4 + HSDP4, encoder-TP4, VAE-PP4 tile)",
     "server_params": {
       "model": "MiniMaxAI/MiniMax-H3",
       "serve_args": {
@@ -233,7 +236,8 @@
             "cuda": [
               "H100",
               "B200"
-            ]
+            ],
+            "npu": "A3"
           },
           "num_cards": 4
         }
@@ -293,6 +297,87 @@
             "mean_e2el_ms": 38208.9,
             "mean_peak_memory_mb": 29538.6667
           }
+        }
+      }
+    ]
+  },
+  {
+    "test_name": "test_minimax_h3_v2v_dlo_int8_rainfusion_4npu_a3",
+    "mark": [
+      {
+        "hardware_marks": {
+          "res": {
+            "npu": "A3"
+          },
+          "num_cards": 4
+        }
+      },
+      "full_model",
+      "diffusion"
+    ],
+    "description": "MiniMax-H3 Ref2VA video-reference-to-video+audio with DLO, INT8 and RainFusion on 4 A3 NPUs (USP4, encoder-TP4, VAE-PP4 tile); 5s reference input and requested 5s output (124 aligned frames at 24 FPS); 8 steps exercise sparse attention after 2 dense warmup steps",
+    "server_params": {
+      "model": "MiniMaxAI/MiniMax-H3",
+      "serve_args": {
+        "trust-remote-code": true,
+        "task-type": "ref2va",
+        "num-gpus": 4,
+        "usp": 4,
+        "ring": 1,
+        "text-encoder-tp-size": 4,
+        "vae-patch-parallel-size": 4,
+        "vae-parallel-mode": "tile",
+        "vae-use-tiling": true,
+        "stage-init-timeout": 1800,
+        "init-timeout": 1800,
+        "enable-diffusion-pipeline-profiler": true,
+        "enable-distributed-layerwise-offload": true,
+        "diffusion-quantization-config": {
+          "transformer": {
+            "method": "int8"
+          }
+        },
+        "diffusion-attention-config": {
+          "default": {
+            "backend": "RAINFUSION_ATTN",
+            "block_sparse": {
+              "sparsity": 0.8,
+              "start_step": 2
+            }
+          }
+        }
+      }
+    },
+    "benchmark_params": [
+      {
+        "name": "1344x768_frames124_steps8",
+        "dataset_name": "random-mm",
+        "tokenizer": "gpt2",
+        "endpoint": "/v1/videos",
+        "num_prompts": 3,
+        "max_concurrency": 1,
+        "num_warmups": 1,
+        "random_input_len": 8,
+        "random_output_len": 1,
+        "random_range_ratio": 0.0,
+        "percentile_metrics": "e2el",
+        "random_mm_base_items_per_request": 1,
+        "random_mm_num_mm_items_range_ratio": 0,
+        "random_mm_limit_mm_per_prompt": {
+          "video": 1
+        },
+        "random_mm_bucket_config": {
+          "(480, 832, 150)": 1.0
+        },
+        "extra_body": {
+          "width": 1344,
+          "height": 768,
+          "num_inference_steps": 8,
+          "num_frames": 124,
+          "fps": 24,
+          "seed": 42,
+          "flow_shift": 12.0,
+          "extra_params": "{\"task\":\"ref2va\",\"duration\":5.0,\"aspect_ratio\":\"16:9\",\"audio_flow_shift\":3.0}"
         }
       }
     ]
