@@ -333,6 +333,8 @@ class _RequestState:
     prefill_masks: tuple | None = None
     is_stopping: bool = False
     precomputed_is_stopping: bool | None = None
+    pending_stop_mask_cpu: torch.Tensor | None = None
+    pending_stop_mask_event: object | None = None
     prefill_embeds: torch.Tensor | None = None
     # Flush tail audio when the scheduler reaches the generation length limit.
     audio_length_limit_reached: bool = False
@@ -1182,6 +1184,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
             return
         state = self._active_states.pop(request_id, None)
         if state is not None:
+            self._discard_pending_stop_mask(state)
             state.pending_audio_chunks_gpu.clear()
             state.pending_audio_copies.clear()
             state.pending_vae_latents_gpu.clear()
@@ -3170,6 +3173,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
             return
         state.precomputed_stop_logits = stop_logits
         state.precomputed_is_stopping = None
+        self._discard_pending_stop_mask(state)
         state.curr_embed_for_next = next_embed.detach()
         state.prev_feat_embed = next_embed.detach()
         state.curr_prefix_feat_cond = pred_feat[0].detach()
@@ -3278,6 +3282,12 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         return torch.cat([chunk.reshape(-1) for chunk in chunks], dim=0)
 
     def _precompute_stop_flags_for_audio_collect(self, states: list[_RequestState]) -> None:
+        # Local import: upstream has both `from vllm_omni.platforms import
+        # current_omni_platform` and `import vllm_omni.platforms as
+        # omni_platform` styles across revisions; a function-local import
+        # resolves against either.
+        from vllm_omni.platforms import current_omni_platform
+
         model_state = getattr(self, "_mrv2_model_state", None)
         if model_state is not None and model_state.per_patch_audio:
             return
@@ -3305,20 +3315,86 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
             stacked = model_state.stop_logits.index_select(0, indices)
         else:
             stacked = torch.stack([stop_logits[0] for _, stop_logits in pending], dim=0)
-        stop_mask = stacked[:, 1] > stacked[:, 0]
-        stop_mask_cpu = stop_mask.cpu()
+
+        device_module = torch.get_device_module(current_omni_platform.get_torch_device())
+
+        # If a previous batch's copy is still in flight (a consumer was
+        # cleared without reading), sync it before replacing the single-slot
+        # device source below, or the stale copy could read freed memory.
+        prev_event = getattr(self, "_pending_stop_mask_event", None)
+        if prev_event is not None:
+            prev_event.synchronize()
+            self._pending_stop_mask_event = None
+
+        # Compute the mask and stage the D2H copy on a dedicated side stream:
+        # the compute stream (VAE decode etc.) never queues behind the copy,
+        # and the consumer's event wait only covers the tiny transfer.
+        if getattr(self, "_stop_mask_stream", None) is None:
+            self._stop_mask_stream = device_module.Stream()
+        fork = device_module.Event()
+        fork.record()
+        copy_done = device_module.Event()
+        with device_module.stream(self._stop_mask_stream):
+            self._stop_mask_stream.wait_event(fork)
+            stop_mask_gpu = stacked[:, 1] > stacked[:, 0]
+            # The side stream reads tensors that live on the compute stream;
+            # record_stream defers allocator reuse until the read completes
+            # even if the states drop their references.
+            for _, stop_logits in pending:
+                stop_logits.record_stream(self._stop_mask_stream)
+            if model_state is not None:
+                stacked.record_stream(self._stop_mask_stream)
+            stop_mask_cpu = torch.empty(len(pending), dtype=torch.bool, pin_memory=True)
+            # Canary: a host read that races ahead of the DMA observes True —
+            # a deterministic wrong value for keep-going requests, caught by
+            # the latch test's expected-value assertion (instead of
+            # uninitialized garbage that can accidentally match).
+            stop_mask_cpu.fill_(True)
+            stop_mask_cpu.copy_(stop_mask_gpu, non_blocking=True)
+            copy_done.record(self._stop_mask_stream)
+
         for i, (state, _) in enumerate(pending):
-            is_stopping = bool(stop_mask_cpu[i])
-            state.precomputed_is_stopping = is_stopping
-            if is_stopping:
-                state.is_stopping = True
+            state.pending_stop_mask_cpu = stop_mask_cpu[i : i + 1]
+            state.pending_stop_mask_event = copy_done
+        # Keep the GPU source tensors alive until the side-stream copy lands.
+        self._pending_stop_mask_source = (stacked, stop_mask_gpu)
+        self._pending_stop_mask_event = copy_done
+
+    def _discard_pending_stop_mask(self, state: _RequestState) -> None:
+        """Synchronize any in-flight stop-mask copy before dropping the
+        pending view, so the single-slot device source can be safely
+        replaced and no copy is left reading soon-to-be-reused memory."""
+        event = state.pending_stop_mask_event
+        if event is not None:
+            event.synchronize()
+        state.pending_stop_mask_cpu = None
+        state.pending_stop_mask_event = None
 
     def _should_stop_from_cached_logits(self, state: _RequestState) -> bool:
-        if state.is_stopping or state.audio_length_limit_reached:
+        if state.is_stopping:
+            return True
+        if state.audio_length_limit_reached:
+            # The request stops at its length limit; discard any pending
+            # stop-mask copy (with its event synchronized) so the in-flight
+            # D2H is not left writing into soon-to-be-reused memory.
+            self._discard_pending_stop_mask(state)
             return True
         cached = state.precomputed_is_stopping
         if cached is not None:
             return cached
+        if state.pending_stop_mask_cpu is not None:
+            # Block the host until the async D2H copy has landed, mirroring
+            # the delayed-audio path's event wait before host-buffer reads.
+            event = state.pending_stop_mask_event
+            if event is not None:
+                event.synchronize()
+                state.pending_stop_mask_event = None
+            is_stopping = bool(state.pending_stop_mask_cpu[0])
+            state.pending_stop_mask_cpu = None
+            state.precomputed_is_stopping = is_stopping
+            if is_stopping:
+                state.is_stopping = True
+            return is_stopping
         stop_logits = self._state_tensor(state, "precomputed_stop_logits")
         if stop_logits is None:
             return False
@@ -3595,6 +3671,15 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
 
         model_state = getattr(self, "_mrv2_model_state", None)
         if model_state is not None and hidden_states.is_cuda:
+            # The MRV2 path decides stops via model_state directly, but a
+            # pending stop-mask D2H may still carry an unresolved positive
+            # decision. RESOLVE it here (synchronize + latch into
+            # is_stopping) — build_stop_logits only forces the stop when
+            # state.is_stopping is already true (metadata mode 2) — rather
+            # than discarding the mask and silently dropping the stop.
+            for state in self._active_states.values():
+                if state.pending_stop_mask_cpu is not None:
+                    self._should_stop_from_cached_logits(state)
             return model_state.build_stop_logits(hidden_states)
 
         bsz = hidden_states.shape[0]
@@ -3612,14 +3697,18 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
                         logits[i, 1] = 1.0
                         self._clear_state_tensor(state, "precomputed_stop_logits")
                         state.precomputed_is_stopping = None
+                        self._discard_pending_stop_mask(state)
                     else:
                         logits[i, 0] = stop_logits[0, 0]
                         logits[i, 1] = stop_logits[0, 1]
                         if state is not None:
+                            if state.pending_stop_mask_cpu is not None:
+                                self._should_stop_from_cached_logits(state)
                             if state.precomputed_is_stopping is not None:
                                 state.is_stopping = state.precomputed_is_stopping
                             self._clear_state_tensor(state, "precomputed_stop_logits")
                             state.precomputed_is_stopping = None
+                            self._discard_pending_stop_mask(state)
                 elif state and state.prefill_completed:
                     logits[i, 1] = 1.0
                 else:
@@ -3945,6 +4034,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
                 state.decode_step_count = 0
                 state.precomputed_stop_logits = None
                 state.precomputed_is_stopping = None
+                self._discard_pending_stop_mask(state)
                 state.last_audio_patch_gpu = None
                 # SamplingParams.seed reaches vLLM's own sampler but never the
                 # CFM noise draws below, so a seeded request threads its seed

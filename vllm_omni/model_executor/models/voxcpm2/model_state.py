@@ -351,6 +351,14 @@ class VoxCPM2ModelState(OmniModelState):
         slots = input_batch.idx_mapping[:count].long()
         rows = input_batch.idx_mapping_np[:count]
         ended = sampled_token_ids[:count].reshape(count, -1)[:, 0] == 1
+        # Resolve any in-flight stop-mask D2H before reading the latched bit:
+        # with sparse-audio paths (this PR's async transfer) a decision may
+        # still be mid-copy here, and discarding it unresolved would drop a
+        # positive stop and let the request run on.
+        for row in rows:
+            state = self.slots[int(row)]
+            if getattr(state, "pending_stop_mask_cpu", None) is not None:
+                self.model._should_stop_from_cached_logits(state)
         host_end = self.model._audio_length_limit_reached(
             input_batch.num_computed_tokens_np[:count],
             np.asarray(input_batch.num_scheduled_tokens[:count]),
