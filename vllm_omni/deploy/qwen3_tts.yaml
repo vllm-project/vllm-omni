@@ -65,6 +65,40 @@ connectors:
       #   decode_cudagraph_batch_sizes: [1, 2, 4]
       # Limit eager batches to reduce temporary stateful cache allocations; CUDA Graph batching uses the buckets above.
       decode_batch_max_size: 4
+      # NPU codec options are ignored on CUDA. The code_predictor_* options
+      # below are shared with the CUDA predictor.
+      # Eager Snake was slower than the unfused activation, so leave it off.
+      npu_fused_snake: false
+      # Exact [batch, frames] pairs for the default streaming chunks:
+      # xvec first chunk (1), the 1+25 frame step (26), and the steady
+      # 25-frame chunk plus 12 frames of downstream context (37).
+      # ICL's first window is the 72-frame sliding window plus the first chunk.
+      # Other shapes replay the eager conv. Batches follow decode_batch_max_size.
+      npu_conv_graph_shapes:
+        - [1, 1]
+        - [1, 26]
+        - [1, 37]
+        - [1, 73]
+        - [2, 1]
+        - [2, 26]
+        - [2, 37]
+        - [2, 73]
+        - [4, 1]
+        - [4, 26]
+        - [4, 37]
+        - [4, 73]
+      # Eager incremental KV skips the predictor NPU graphs. Re-prefill
+      # replay is the fast path; the flag stays off.
+      code_predictor_kv_cache: false
+      code_predictor_fused_sampling: true
+      # One graph for all 15 residual codebooks. The NPU runner already
+      # captures the whole MTP call, and a concurrency-1 run stayed at
+      # RTF 0.45, so leave this off.
+      code_predictor_frame_graph: false
+      # Incremental decode reduces repeated codec work, but this alone does
+      # not establish an end-to-end gain. Leave this off: the earlier
+      # concurrency 1/16/32 experiments did not consistently beat baseline.
+      npu_incremental_codec: false
 
 stages:
   - stage_id: 0

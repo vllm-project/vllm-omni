@@ -734,9 +734,42 @@ class EuclideanCodebook(nn.Module):
 
         self.cluster_usage = nn.Parameter(torch.ones(codebook_size))
         self.embedding_sum = nn.Parameter(torch.zeros(codebook_size, dim))
+        self.register_buffer("_normalized_embedding", None, persistent=False)
+
+    def precompute_embedding(self) -> None:
+        """Cache fixed inference weights after loading and dtype/device conversion."""
+        with torch.no_grad():
+            self._normalized_embedding = self.embedding_sum / self.cluster_usage.clamp(min=self.epsilon)[:, None]
+
+    def _apply(self, fn: Callable[[torch.Tensor], torch.Tensor], recurse: bool = True) -> "EuclideanCodebook":
+        # Recompute from converted parameters, rather than casting the quotient.
+        self._normalized_embedding = None
+        return super()._apply(fn, recurse=recurse)
+
+    def _load_from_state_dict(
+        self,
+        state_dict: dict[str, torch.Tensor],
+        prefix: str,
+        local_metadata: dict,
+        strict: bool,
+        missing_keys: list[str],
+        unexpected_keys: list[str],
+        error_msgs: list[str],
+    ) -> None:
+        self._normalized_embedding = None
+        super()._load_from_state_dict(
+            state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
+        )
+
+    def train(self, mode: bool = True) -> "EuclideanCodebook":
+        if mode:
+            self._normalized_embedding = None
+        return super().train(mode)
 
     def decode(self, codes: torch.Tensor) -> torch.Tensor:
-        embedding = self.embedding_sum / self.cluster_usage.clamp(min=self.epsilon)[:, None]
+        embedding = self._normalized_embedding
+        if embedding is None or self.training or torch.is_grad_enabled():
+            embedding = self.embedding_sum / self.cluster_usage.clamp(min=self.epsilon)[:, None]
         quantized = F.embedding(codes, embedding)
         return quantized
 
@@ -915,6 +948,8 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         self.post_init()
 
         # CUDA Graph support
+        self._npu_conv_graphs = None
+        self._npu_incremental = None
         self._cudagraph_enabled = False
         self._cudagraph_wrapper = None
 
@@ -1011,8 +1046,22 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         self._time_major_stack = TimeMajorConvStack(self)
         logger.info("Qwen3-TTS decoder: time-major (GEMM) conv stack enabled")
 
+    def _apply(self, fn: Callable[[torch.Tensor], torch.Tensor], recurse: bool = True):
+        if self._npu_conv_graphs is not None:
+            self._npu_conv_graphs.close()
+            self._npu_conv_graphs = None
+        if self._npu_incremental is not None:
+            self._npu_incremental.close()
+            self._npu_incremental = None
+        return super()._apply(fn, recurse=recurse)
+
     def _conv_decode(self, hidden: torch.Tensor) -> torch.Tensor:
         """Pre-transformer output ``[B, T, latent]`` -> unclamped waveform ``[B, 1, T * total_upsample]``."""
+        if self._npu_conv_graphs is not None and not self.training:
+            return self._npu_conv_graphs(hidden)
+        return self._conv_decode_eager(hidden)
+
+    def _conv_decode_eager(self, hidden: torch.Tensor) -> torch.Tensor:
         if self._time_major_stack is not None:
             return self._time_major_stack(hidden)
         hidden = hidden.permute(0, 2, 1)
@@ -1666,6 +1715,9 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
                 left_context_size=left_context_size,
                 max_batch_size=max_batch_size,
             )
+
+        if caches is not None and self._npu_incremental is not None:
+            return self._npu_incremental.decode_requests(codes, lengths, caches)
 
         if caches is not None:
             prefix_length = int(getattr(self.config, "sliding_window", 0) or 0)

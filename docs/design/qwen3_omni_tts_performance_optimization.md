@@ -608,3 +608,73 @@ bash benchmarks/qwen3-tts/vllm_omni/run_stacked_benchmark.sh
 ```
 
 This cycles through four configs (Baseline -> + Batch -> + CUDA Graph -> + Async Chunk + Streaming), benchmarks each at the specified concurrency levels, and generates all comparison figures automatically.
+
+## Qwen3-TTS NPU codec kernels
+
+On NPU, Code2Wav prepares normalized codebook embeddings after loading weights
+and applying the final decoder dtype. The cache is non-persistent and preserves
+the reference division and residual accumulation order. Module conversion,
+state-dict reload, or entering training invalidates it; the NPU weight loader
+rebuilds it after each load, including in-place parameter updates. Gradient-enabled
+calls bypass the cache. Other in-place weight mutations must explicitly refresh
+`precompute_embedding()` before inference. Such mutations are not supported
+while a captured graph is active.
+
+Qwen3-TTS provides an opt-in Ascend SnakeBeta kernel for contiguous, nonempty NCT
+BF16 inference tensors within its validated grid size. The kernel preserves
+BF16 rounding between multiply, sine, square, scale and addition. Unsupported
+dtypes/layouts and training or gradient-enabled calls retain the existing path;
+other models do not opt into this NPU kernel. Set `npu_fused_snake: true` in the
+Code2Wav stage connector `extra` configuration to enable it. The default is false:
+eager Triton dispatch overhead can outweigh the reduced device work. Measure
+your graph mode and workload before enabling it. If Triton is unavailable, the NPU
+loader keeps the eager path. CUDA behavior is unchanged. Runtime compilation
+errors are surfaced rather than silently hidden.
+
+These changes reduce repeated codec work; they do not establish an end-to-end
+throughput gain without matched model-level measurements and audio validation.
+
+### Optional NPU graph and predictor paths
+
+The Code2Wav connector `extra` can set `npu_conv_graph_shapes`, a list of exact
+`[batch, hidden_frames]` shapes (for example `[[1, 1], [1, 25]]`). These are the
+convolution segment inputs, not necessarily the new codec chunk lengths: suffix
+context can increase the frame dimension. An empty list disables this path;
+the shipped `qwen3_tts.yaml` enables a set of streaming shapes.
+Selected shapes are captured at model load, after weight and coefficient
+preparation; unseen shapes remain eager rather than capturing on a live request.
+`enforce_eager=true` is incompatible with this option. Explicit shape selection
+bounds graph memory; include only shapes observed for the target workload.
+
+The graph owns only scratch activations, not request IDs or streaming state.
+Its output is copied before returning so a later replay cannot overwrite a
+previous request's audio. The decoder keeps its existing per-request cache,
+sliding-window and tail handling. Outer NPU graph capture uses the eager body
+to avoid nested replay; reload or module conversion releases the inner graphs.
+This is a stateless convolution graph optimization, not a replacement of the
+streaming cache with fixed request slots.
+
+On NPU BF16, `code_predictor_kv_cache: true` currently retains graphed
+re-prefill: the eager incremental KV path was slower in the measured workload.
+`code_predictor_fused_sampling: true` enables a separate sampling kernel and is
+enabled in the shipped YAML. Sampling retains the original per-request uniform
+tensor, ATen scaling and logarithms, and top-k threshold. The NPU kernel combines
+threshold masking, score subtraction and first-index argmax. It reads the top-k
+threshold directly from its strided column without materializing a copy.
+Unsupported input shapes/dtypes use the reference.
+
+`code_predictor_frame_graph: true` optionally captures all residual codebook
+steps together and disables the outer MTP graph. It is disabled in the shipped
+YAML; it requires matching temperature/top-k, top-p of 1, and supplied uniforms.
+
+`npu_incremental_codec: true` optionally retains convolution tails and
+sliding-window KV in per-request slots. It is disabled in the shipped YAML.
+Only full chunks and single frames are captured at startup for batches up to
+`decode_batch_max_size`; other lengths run eagerly without capturing on live
+requests. Request completion releases and resets the slot; loading weights or
+converting the decoder releases its graphs. This path changes the streaming
+execution strategy and needs paired audio validation for the target workload.
+
+Compare actual graph coverage, startup cost, memory, latency and audio quality
+on the deployed model before changing these settings; synthetic tests alone do
+not establish a service-level improvement.
