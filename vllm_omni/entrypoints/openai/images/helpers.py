@@ -32,6 +32,7 @@ import pybase64 as base64
 from fastapi import HTTPException, Request
 from PIL import Image
 from vllm.logger import init_logger
+from vllm.multimodal.image import open_image
 
 from vllm_omni.entrypoints.openai.app_state import _get_diffusion_od_config
 
@@ -196,7 +197,7 @@ async def _load_input_images(
             try:
                 _, b64_data = inp.split(",", 1)
                 image_bytes = base64.b64decode(b64_data)
-                img = Image.open(io.BytesIO(image_bytes))
+                img = open_image(io.BytesIO(image_bytes))
                 images.append(img)
             except Exception as e:
                 raise ValueError(f"Invalid base64 image: {e}")
@@ -207,7 +208,7 @@ async def _load_input_images(
                 try:
                     resp = await client.get(inp)
                     resp.raise_for_status()
-                    img = Image.open(io.BytesIO(resp.content))
+                    img = open_image(io.BytesIO(resp.content))
                     images.append(img)
                 except Exception as e:
                     raise ValueError(f"Failed to download image from URL {inp}: {e}")
@@ -216,7 +217,7 @@ async def _load_input_images(
         elif hasattr(inp, "file"):
             try:
                 img_data = await inp.read()
-                img = Image.open(io.BytesIO(img_data))
+                img = open_image(io.BytesIO(img_data))
                 images.append(img)
             except Exception as e:
                 raise ValueError(f"Failed to open uploaded file: {e}")
@@ -231,7 +232,7 @@ async def _load_input_images(
         return images
 
     # Match the offline HunyuanImage3 image-edit example path, which eagerly
-    # normalizes input files with ``Image.open(...).convert("RGB")`` before
+    # normalizes input files with ``open_image(...).convert("RGB")`` before
     # they reach the AR stage. Keeping uploads as RGBA/P PIL objects makes
     # online IT2I observe a different visual input than offline (for example
     # transparent-logo uploads alpha-composited over white instead of black),

@@ -7,6 +7,7 @@ import pytest
 import torch
 from diffusers.models.normalization import RMSNorm
 
+from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.layers import exact_bf16_pointwise as pointwise
 from vllm_omni.diffusion.layers import exact_bf16_qk_norm_rope as fused_qk
 from vllm_omni.diffusion.models.qwen_image_21 import qwen_image_21_transformer as transformer
@@ -70,8 +71,41 @@ def test_unqualified_device_declines_before_allocation(monkeypatch, capability, 
     backend.get_device_capability.assert_called_once_with(device)
 
 
-@pytest.mark.cuda
-@pytest.mark.gpu
+@pytest.mark.cpu
+@torch.no_grad()
+def test_validated_pointwise_declines_kernels_while_compiling(monkeypatch):
+    forbidden = Mock()
+    forbidden.__getitem__ = Mock(side_effect=AssertionError("user Triton kernel launched while compiling"))
+    monkeypatch.setattr(pointwise, "_residual_kernel", forbidden, raising=False)
+    monkeypatch.setattr(pointwise, "_silu_mul_kernel", forbidden, raising=False)
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
+    x, y, gate = (torch.randn(4, 8, dtype=torch.bfloat16) for _ in range(3))
+
+    torch.testing.assert_close(pointwise.residual(x, y, gate, _validated=True), x + gate * y, rtol=0, atol=0)
+    torch.testing.assert_close(
+        pointwise.silu_mul(gate, y, _validated=True), torch.nn.functional.silu(gate) * y, rtol=0, atol=0
+    )
+
+
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@torch.no_grad()
+def test_validated_pointwise_compiles_with_inductor():
+    """Eager callers may validate once and pass the flag into regionally compiled blocks."""
+    torch.manual_seed(0)
+    x, y, gate = (torch.randn(2, 1024, device="cuda", dtype=torch.bfloat16) for _ in range(3))
+
+    def block(x, y, gate):
+        return pointwise.residual(x, pointwise.silu_mul(gate, y, _validated=True), gate, _validated=True)
+
+    def reference(x, y, gate):
+        return x + gate * (torch.nn.functional.silu(gate) * y)
+
+    compiled = torch.compile(block, backend="inductor", fullgraph=True)
+    expected = torch.compile(reference, backend="inductor", fullgraph=True)(x, y, gate)
+    torch.testing.assert_close(compiled(x, y, gate), expected, rtol=0, atol=0)
+
+
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @torch.no_grad()
 def test_unqualified_attention_uses_reference_norm_and_rope(monkeypatch):
     sequence = 17

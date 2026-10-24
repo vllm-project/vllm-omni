@@ -184,15 +184,23 @@ steps:
         - export VLLM_ROCM_USE_AITER=1
         - export TORCH_EXTENSIONS_DIR="/tmp/vllm-omni-torch-extensions-$$BUILDKITE_JOB_ID"
         - mkdir -p "$$TORCH_EXTENSIONS_DIR"
+        # Restore a provenance-checked Buildkite artifact into a job-local
+        # directory. A miss still compiles there. Publish only when the
+        # attention suite returns 0 so later READY/MERGE jobs can hit this ABI.
         - eval "$$(python .buildkite/amd/scripts/aiter_mha_cache.py prepare)"
-        - >-
-          timeout --signal=TERM --kill-after=2m 55m
-          pytest -s -v -n 1
-          tests/diffusion/attention/
-          -m 'core_model and rocm and MI325 and cards_1'
-          --run-level "core_model"
+        - |
+          if timeout --signal=TERM --kill-after=2m 55m \
+            pytest -s -v -n 1 \
+            tests/diffusion/attention/ \
+            -m 'core_model and rocm and MI325 and cards_1' \
+            --run-level "core_model"; then
+            python .buildkite/amd/scripts/aiter_mha_cache.py publish
+          else
+            pytest_status=$$?
+            exit "$${pytest_status}"
+          fi
         # MammothModa2 exercises the same two AITER MHA modules built by the
-        # preceding suite. Keep its default-backend run in this job so a cold
+        # attention suite. Keep its default-backend run in this job so a cold
         # worker compiles each module once instead of timing out the generic
         # model job.
         - >-
@@ -208,7 +216,7 @@ steps:
       depends_on: amd-build
       mirror_hardwares: [amdproduction]
       grade: Blocking
-      timeout_in_minutes: 20
+      timeout_in_minutes: 25
       commands:
         - export VLLM_ROCM_USE_AITER=1
         - export VLLM_OMNI_AR_FA_REQUIRED=1
@@ -218,6 +226,11 @@ steps:
         - >-
           timeout --signal=TERM --kill-after=2m 15m
           pytest -sv tests/diffusion/ar_diffusion/test_paged_attention.py
+          -m 'core_model and rocm and MI325 and cards_1' --run-level core_model
+        # Keep the pinned-ring device contract blocking without making the
+        # cold, experimental AITER coverage lane a required check.
+        - >-
+          timeout --signal=TERM --kill-after=1m 5m pytest -sv tests/diffusion/utils/test_chunked_transfer.py
           -m 'core_model and rocm and MI325 and cards_1' --run-level core_model
 
     - label: "Diffusion · Batch Test"
@@ -229,7 +242,7 @@ steps:
         # Restore the unmasked BF16 AITER module into a job-local directory.
         # This consumer does not publish a duplicate artifact.
         - eval "$$(python .buildkite/amd/scripts/aiter_mha_cache.py prepare)"
-        - pytest -sv tests/diffusion/batching -m 'core_model and cuda' --run-level "core_model"
+        - pytest -sv tests/diffusion/batching -m 'core_model and rocm and MI325 and cards_1' --run-level "core_model"
 
     - label: "Diffusion · Offloader Test"
       agent_pool: mi300_1
@@ -239,7 +252,7 @@ steps:
       commands:
         - export VLLM_LOGGING_LEVEL=DEBUG
         - export VLLM_WORKER_MULTIPROC_METHOD=spawn
-        - pytest -s -v tests/diffusion/offloader -m "core_model and cuda" --run-level "core_model"
+        - pytest -s -v tests/diffusion/offloader -m "core_model and rocm and MI325 and cards_1" --run-level "core_model"
 
     - label: "Diffusion · Cache Test"
       agent_pool: mi300_1
@@ -250,7 +263,7 @@ steps:
         - export GPU_ARCHS=gfx942
         - export VLLM_LOGGING_LEVEL=DEBUG
         - export VLLM_WORKER_MULTIPROC_METHOD=spawn
-        - pytest -sv tests/diffusion/cache -m 'core_model and cuda' --run-level "core_model"
+        - pytest -sv tests/diffusion/cache -m 'core_model and rocm and MI325 and cards_1' --run-level "core_model"
 
     - label: "Diffusion Sequence Parallelism Test"
       agent_pool: mi300_2
@@ -271,6 +284,21 @@ steps:
           tests/diffusion/models/ltx2/test_ltx2_transformer_ulysses.py
           -m 'core_model and rocm and cards_2'
           --run-level "core_model"
+
+    - label: "ROCm · Ulysses UAA Attention · 2-GPU"
+      agent_pool: mi300_2
+      depends_on: amd-build
+      mirror_hardwares: [amdproduction]
+      grade: Blocking
+      timeout_in_minutes: 25
+      commands:
+        - export VLLM_WORKER_MULTIPROC_METHOD=spawn
+        - >-
+          timeout --signal=TERM --kill-after=2m 20m pytest -s -v
+          tests/diffusion/attention/test_ulysses_uaa.py
+          tests/diffusion/attention/test_attention_sp.py
+          -m 'core_model and rocm and MI325 and cards_2'
+          --run-level "core_model" --durations=20
 
     - label: "Diffusion GPU Worker Test"
       agent_pool: mi300_2
@@ -332,13 +360,15 @@ steps:
 #     - export VLLM_WORKER_MULTIPROC_METHOD=spawn
 #     - timeout 20m pytest -s -v tests/e2e/offline_inference/test_stable_audio_expansion.py -m "advanced_model and diffusion and L4" --run-level advanced_model
 
-- label: "ROCm · Model Executor GPU Coverage (R2-01)"
+- label: "ROCm · Model Executor GPU Coverage (R2-01) · Shard %N/%t"
   agent_pool: mi300_1
+  parallelism: 2
   depends_on: amd-build
   mirror_hardwares: [amdproduction]
   grade: NonBlocking
-  # Build 13918 selected 1635 cases and was killed at 20 minutes while AITER
-  # compiled the masked varlen module, with about half the nodes still queued.
+  # Build 14388 at 798fef99 selected 1811 cases and completed pytest in
+  # 34m21s. A pytest-shard 0.1.2 replay projects 20.10m/13.92m of timed work;
+  # actual per-shard GPU and end-to-end timings remain to be measured.
   # The command timeout leaves five minutes for the summary artifact.
   timeout_in_minutes: 50
   artifact_paths:
@@ -362,11 +392,14 @@ steps:
       (cards_2 or cards_3 or cards_4 or cards_5 or cards_6 or cards_7 or cards_8)'
       --run-level "core_model"
       --durations=0
-      --junitxml="$$R2_01_ARTIFACT_DIR/pytest.xml"
-      2>&1 | tee "$$R2_01_ARTIFACT_DIR/pytest.log"
+      --num-shards=$$BUILDKITE_PARALLEL_JOB_COUNT
+      --shard-id=$$BUILDKITE_PARALLEL_JOB
+      --junitxml="$$R2_01_ARTIFACT_DIR/pytest-$${BUILDKITE_PARALLEL_JOB}-of-$${BUILDKITE_PARALLEL_JOB_COUNT}.xml"
+      2>&1 | tee "$$R2_01_ARTIFACT_DIR/pytest-$${BUILDKITE_PARALLEL_JOB}-of-$${BUILDKITE_PARALLEL_JOB_COUNT}.log"
     - >-
-      tail -n 100 "$$R2_01_ARTIFACT_DIR/pytest.log" >
-      "$$R2_01_ARTIFACT_DIR/pytest-summary.txt"
+      tail -n 100
+      "$$R2_01_ARTIFACT_DIR/pytest-$${BUILDKITE_PARALLEL_JOB}-of-$${BUILDKITE_PARALLEL_JOB_COUNT}.log"
+      > "$$R2_01_ARTIFACT_DIR/pytest-summary-$${BUILDKITE_PARALLEL_JOB}-of-$${BUILDKITE_PARALLEL_JOB_COUNT}.txt"
 
 - label: "Engine Test"
   agent_pool: mi300_1

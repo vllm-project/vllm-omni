@@ -309,7 +309,7 @@ curl -s http://localhost:8091/v1/videos/sync \
   `video`, or `audio`, each `{"upload_index": N}`. `image` and `video` cannot be
   combined. An upload may be reused by several entries but only for one
   modality; every upload must be referenced. At most 8 entries and 16 uploads.
-- Images use JPEG/PNG/WEBP/HEIC/HEIF (30 MiB), clips MP4/MOV (50 MiB), and audio
+- Images use JPEG/PNG/WEBP (30 MiB), clips MP4/MOV (50 MiB), and audio
   WAV/MP3/FLAC (15 MiB). A clip's soundtrack is never used; upload audio
   explicitly.
 - Let `N` be the aligned output frame count. A negative `frame_index` resolves

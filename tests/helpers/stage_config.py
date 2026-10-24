@@ -292,6 +292,14 @@ _CI_OVERLAYS: dict[str, dict[str, Any]] = {
             },
         ],
         "platforms": {
+            "rocm": {
+                # ROCm documentation examples request two cards. Share the
+                # Talker's card with Code2Wav and reserve its DiT workspace.
+                "stages": [
+                    {"stage_id": 1, "gpu_memory_utilization": 0.3},
+                    {"stage_id": 2, "devices": "1"},
+                ],
+            },
             "xpu": {
                 "stages": [
                     {

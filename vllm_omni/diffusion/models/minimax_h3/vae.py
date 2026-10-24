@@ -7,7 +7,7 @@ from __future__ import annotations
 import importlib
 import json
 import os
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from pathlib import Path
 from typing import Any, ClassVar
@@ -59,16 +59,19 @@ def _minimax_h3_keyframe_encode_context(
 
     # Deterministic cuDNN algorithms can still use reduced-precision TF32.
     # On Hopper, TF32 can shift the keyframe latent enough to push I2VA below
-    # the reference accuracy thresholds. Use FP32 convolutions for this
-    # sensitive encode only; preserve the existing math mode elsewhere.
+    # the reference accuracy thresholds. Use FP32 deterministic convolutions
+    # for this sensitive CUDA encode only. MIOpen has no deterministic
+    # algorithm for the MI325 timeline-guide convolution, so applying the
+    # cuDNN policy on ROCm raises ``miopenStatusUnknownError``.
+    deterministic = current_omni_platform.is_cuda()
     allow_tf32 = True
-    if current_omni_platform.is_cuda():
+    if deterministic:
         capability = current_omni_platform.get_device_capability(device.index or 0)
         allow_tf32 = capability is None or capability.major != 9
     with torch.backends.cudnn.flags(
         enabled=True,
         benchmark=False,
-        deterministic=True,
+        deterministic=deterministic,
         allow_tf32=allow_tf32,
     ):
         yield
@@ -260,9 +263,12 @@ class _AudioVAEDeterminismContext(AbstractContextManager):
         backends.cuda.enable_flash_sdp(False)
         backends.cuda.enable_mem_efficient_sdp(False)
         backends.cuda.enable_math_sdp(True)
+        self._jit_executor = torch.jit.optimized_execution(False)
+        self._jit_executor.__enter__()
         return self
 
     def __exit__(self, exc_type, exc, traceback):
+        self._jit_executor.__exit__(exc_type, exc, traceback)
         backends = torch.backends
         (
             backends.cuda.matmul.allow_tf32,
@@ -326,6 +332,9 @@ class _VideoVAEPartProxy(nn.Module):
 class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
     """Adapter around the checkpoint's native parallel-tiled video VAE."""
 
+    decode_dtype: torch.dtype = torch.float16
+    _pixel_transform: Callable[[torch.Tensor], torch.Tensor] | None = None
+
     def __init__(
         self,
         component_path: str,
@@ -335,6 +344,7 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         encode_only: bool = False,
         decode_only: bool = False,
         trust_remote_code: bool = False,
+        decoder_source: str | Mapping[str, str] | None = None,
     ) -> None:
         super().__init__()
         self._device_target = device
@@ -342,6 +352,16 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         self.decode_only = bool(decode_only)
         if self.encode_only and self.decode_only:
             raise ValueError("MiniMax H3 video VAE cannot be both encode-only and decode-only")
+        from .vae_nvfp4 import (
+            install_nvfp4_video_decoder,
+            released_decoder_pixels,
+            resolve_video_decoder_checkpoint,
+        )
+
+        decoder_path = resolve_video_decoder_checkpoint(decoder_source, device)
+        self._pixel_transform = released_decoder_pixels if decoder_path is not None else None
+        if self.encode_only and decoder_path is not None:
+            raise ValueError("An encode-only VAE cannot load a replacement video decoder")
         self.config_dict = _load_component_config(component_path)
         _check_trust_remote_code(component_path, self.config_dict, trust_remote_code)
         if self.encode_only:
@@ -355,14 +375,19 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         # weights may be materialized in FP16 because reference decode casts
         # those same tensors through CUDA autocast on every tile.
         initial_device = load_device or device
-        self.remote.eval().to(device=initial_device, dtype=torch.float32)
+        weight_device = torch.device("cpu") if decoder_path is not None else initial_device
+        self.remote.eval().to(device=weight_device, dtype=torch.float32)
+        if decoder_path is not None:
+            install_nvfp4_video_decoder(self.remote.model, decoder_path)
+            self.decode_dtype = torch.bfloat16
+            self.remote.to(device=initial_device)
         decoder = getattr(self.remote.model, "decoder", None)
-        if decoder is not None:
+        if decoder is not None and decoder_path is None:
             install_h3_vae_optimizations(
                 decoder,
                 device=device,
             )
-        install_temporal_stream_patches(self.remote.model)
+        install_temporal_stream_patches(self.remote.model, pixel_transform=self._pixel_transform)
         self.model = self.remote.model
         self._stager = None
         self._encoder_stager = None
@@ -1045,6 +1070,13 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         with self._decode_tiling_context(z):
             decode_h3_chunks(self, z, on_chunk, group=group)
 
+    def _revert_decoded(self, decoded: torch.Tensor) -> torch.Tensor:
+        """Preserve chunk storage that the temporal decoder may still use."""
+        if self._pixel_transform is not None:
+            return self._pixel_transform(decoded)
+        processor = getattr(self.model, "processor", None)
+        return decoded if processor is None else processor.revert_tensor(decoded)
+
     def _revert_decoded_inplace(self, decoded: torch.Tensor) -> torch.Tensor:
         """In-place counterpart of the processor's ``revert_tensor``.
 
@@ -1060,6 +1092,8 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         Falls back to ``processor.revert_tensor`` when the checkpoint's
         denormalization constants are not discoverable.
         """
+        if self._pixel_transform is not None:
+            return self._pixel_transform(decoded)
         processor = getattr(self.model, "processor", None)
         transform_rev = getattr(processor, "transform_rev", None)
         mean = getattr(transform_rev, "mean", None)
@@ -1200,7 +1234,10 @@ class MiniMaxH3AudioVAE(nn.Module):
             device=latent.device,
             dtype=latent.dtype,
         ).view(1, channels, 1)
-        waveform = self.remote.decode(latent * std + mean)
+        # The remote decoder's TorchScript activations round differently on
+        # their first (unfused) call; keep every request on the same path.
+        with torch.jit.optimized_execution(False):
+            waveform = self.remote.decode(latent * std + mean)
         if waveform.ndim != 3 or waveform.shape[1] != 1:
             raise ValueError(f"unexpected decoded audio shape {tuple(waveform.shape)}")
         return waveform.permute(1, 0, 2).contiguous().float()

@@ -50,6 +50,9 @@ from vllm_omni.entrypoints.async_omni import AsyncOmni
 logger = init_logger(__name__)
 
 _DEFAULT_CONTROL_TIMEOUT_S = 10.0
+# A cold engine can spend tens of seconds initializing per-session state before
+# the first open lands; control ops on a live session keep the short budget.
+_DEFAULT_OPEN_TIMEOUT_S = 60.0
 
 
 class DuplexSessionHandle:
@@ -243,6 +246,33 @@ class DuplexSessionHandle:
         """Recheck held audio while committing its delivery; never await inside this guard."""
         return self._outbox.guard(event)
 
+    def _latest_accepted_session(self) -> tuple[int, dict[str, object] | None]:
+        """Newest accepted ``session.updated`` payload for wire-default apply.
+
+        Serving-only. Not part of the public handle (``submit`` / ``events``).
+        """
+        return self._outbox.latest_accepted_session()
+
+    def _observation_seq(self) -> int:
+        """How many ``session.updated`` / ``error`` events this session has enqueued."""
+        return self._outbox.observation_seq()
+
+    async def _wait_for_observation(self, seen: int) -> bool:
+        """Wait for a control event newer than ``seen``. False if the outbox is closed."""
+        return await self._outbox.wait_for_observation(seen)
+
+    def _arm_observation_retention(self, after_seq: int, event_id: str) -> None:
+        """Keep one update's outcome until the serving reader consumes it."""
+        self._outbox.arm_observation_retention(after_seq, event_id)
+
+    def _disarm_observation_retention(self) -> None:
+        """Drop the retained update outcome."""
+        self._outbox.disarm_observation_retention()
+
+    def _retained_observations_after(self, seq: int) -> tuple[DuplexEvent, ...]:
+        """Control events kept for the outstanding update."""
+        return self._outbox.retained_observations_after(seq)
+
     async def __aenter__(self) -> DuplexSessionHandle:
         return self
 
@@ -348,7 +378,7 @@ class DuplexOmni(AsyncOmni):
         self,
         config: DuplexSessionConfig | Mapping[str, object] | None = None,
         *,
-        timeout: float | None = _DEFAULT_CONTROL_TIMEOUT_S,
+        timeout: float | None = _DEFAULT_OPEN_TIMEOUT_S,
     ) -> DuplexSessionHandle:
         """Open an engine-resident session and return its handle.
 

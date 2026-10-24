@@ -12,6 +12,11 @@ This guide focuses on vLLM-Omni's primary task endpoints. Compatible models
 may also expose standard routes inherited from vLLM, such as
 `POST /v1/completions`; those routes remain model- and task-dependent.
 
+`POST /tokenize`, `POST /detokenize`, and the opt-in `GET /tokenizer_info`
+require a model with a configured tokenization handler. Pure diffusion servers
+do not expose these routes and return HTTP 404; token counting is unavailable
+for those servers.
+
 ## Start and Verify the Server
 
 Start a model with the shared serving command:

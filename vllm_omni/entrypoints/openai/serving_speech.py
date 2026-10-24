@@ -1136,6 +1136,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         *,
         ref_text: str | None = None,
         speaker_description: str | None = None,
+        model_preset_fingerprint: str | None = None,
     ) -> dict:
         """Upload a new voice sample."""
         name = _validate_speaker_name(name)
@@ -1235,6 +1236,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             }
             if speaker_description:
                 speaker_data["speaker_description"] = speaker_description
+            if model_preset_fingerprint:
+                speaker_data["model_preset_fingerprint"] = model_preset_fingerprint
 
             try:
                 from safetensors.torch import save_file
@@ -2583,8 +2586,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             # to allow tests to catch invalid voices generally
             request.voice = self._get_normalized_voice(request.voice)
 
-            # Assume that this will follow the same adapter pattern
-            # once all RFC is implemented
+            assert self._adapter is not None
             validation_error = validate_tts_request(self._adapter, request)
             if validation_error is not None:
                 raise ValueError(validation_error)

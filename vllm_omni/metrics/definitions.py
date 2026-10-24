@@ -158,6 +158,11 @@ REQUESTS_SUCCESS = METRIC_PREFIX + "requests_success"
 PROMPT_TOKENS = METRIC_PREFIX + "prompt_tokens"
 GENERATION_TOKENS = METRIC_PREFIX + "generation_tokens"
 
+# Session placement families are registered only when the opt-in policy emits.
+DUPLEX_RESERVED_SESSIONS = METRIC_PREFIX + "duplex_reserved_sessions"
+DUPLEX_ADMISSION_REJECTED = METRIC_PREFIX + "duplex_admission_rejected"
+DUPLEX_ADMISSION_REJECT_REASONS = frozenset({"global_capacity_exhausted", "replica_capacity_exhausted", "unknown"})
+
 
 # ============================================================================
 # Audio family (per-stage + per-replica audio path metrics)

@@ -813,7 +813,10 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         inter_stage_outputs = getattr(model_runner_output, "inter_stage_outputs", None)
         # Token-only processors need sampled IDs even without a tensor payload.
         processor = getattr(getattr(self, "chunk_transfer_adapter", None), "custom_process_next_stage_input_func", None)
-        requires_token_updates = getattr(processor, "requires_token_updates", False) is True
+        requires_token_updates = (
+            getattr(processor, "requires_token_updates", False) is True
+            or getattr(processor, "_requires_full_token_history", False) is True
+        )
         num_nans_in_logits = model_runner_output.num_nans_in_logits
         kv_connector_output = model_runner_output.kv_connector_output
         ec_connector_output = getattr(model_runner_output, "ec_connector_output", None)

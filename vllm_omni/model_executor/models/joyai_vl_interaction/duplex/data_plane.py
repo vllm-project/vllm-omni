@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import uuid
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 
@@ -12,6 +13,10 @@ import numpy as np
 from vllm_omni.engine.duplex.contracts import duplex_resource_request_belongs_to_session
 from vllm_omni.engine.duplex.plugin import DefaultDuplexModelSessionState, DuplexDataPlane, DuplexDataPlaneContext
 from vllm_omni.experimental.fullduplex.joyvl.decision.output_parser import Action, ParsedAction, parse_action
+from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.delegation import (
+    DELEGATION_TOOL_NAME,
+    delegation_arguments,
+)
 from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.input import JoyAIFrameBuffer
 
 
@@ -23,6 +28,27 @@ class JoyAISessionState(DefaultDuplexModelSessionState):
     last_response_text: str = ""
 
 
+def advance_chunk(*, current: object, spoken: bool, has_camera: bool) -> tuple[str, bool]:
+    """Return the ``(chunk id, spoken)`` pair the next observation belongs to.
+
+    JoyAI answers the goal of the current chunk and keeps that answer as the
+    goal until the chunk closes. The chunk closes when a reply of it stored
+    text and the next observation arrives with a new camera frame: that is the
+    same point at which the retained-answer deduplication lets a reply be
+    repeated.
+
+    The pair lives in the session runtime config, not on a plugin-level slot:
+    one plugin instance serves every session of a deployment, so a shared slot
+    would let one session advance another session's chunk.
+    """
+    chunk = current if isinstance(current, str) and current else "chunk-0"
+    if not spoken or not has_camera:
+        return chunk, spoken
+    index = chunk.removeprefix("chunk-")
+    next_index = int(index) + 1 if index.isdigit() else 1
+    return f"chunk-{next_index}", False
+
+
 @dataclass
 class Observation:
     state: JoyAISessionState | None = None
@@ -30,7 +56,10 @@ class Observation:
     conversation_images: tuple[str, ...] = ()
     modalities: tuple[str, ...] = ("text", "audio")
     previous_response: str = ""
+    delegation_tools: bool = False
+    chunk_id: str | None = None
     text_sent: bool = False
+    call_sent: bool = False
     response_text: str = ""
 
     def parse(self, output: object) -> ParsedAction:
@@ -89,14 +118,20 @@ class JoyAIDataPlane(DuplexDataPlane):
                 "end_of_turn": False,
             }
             if stage_id == self.joyai_stage_id:
+                action = observation.parse(output)
+                if observation.delegation_tools and action.action is Action.DELEGATE:
+                    # The call is one result of its own: the recognised call
+                    # short-circuits the rest of this output, so a spoken note
+                    # is projected separately and may still enter TTS.
+                    yield from self._project_delegation(observation, action, event, context)
+                    continue
                 if observation.text_sent:
                     continue
-                action = observation.parse(output)
                 observation.text_sent = True
                 if action.action is Action.DELEGATE:
                     event.update(
                         error_code="unsupported_tool_call",
-                        error="JoyAI delegation requires the tool adapter",
+                        error="JoyAI delegation requires the session to declare the delegate tool",
                         end_of_turn=True,
                     )
                 elif action.action is Action.SILENCE or not action.text or observation.is_repeat(action):
@@ -110,6 +145,7 @@ class JoyAIDataPlane(DuplexDataPlane):
                 else:
                     observation.response_text = action.text
                     event["text"] = action.text
+                    event["model_context_text"] = action.text
                     event["text_requires_complete_audio"] = "audio" in context.modalities
                     if "audio" not in observation.modalities:
                         event["end_of_turn"] = True
@@ -155,3 +191,75 @@ class JoyAIDataPlane(DuplexDataPlane):
                     end_of_turn=bool(output.finished),
                 )
                 yield event
+
+    def _project_delegation(
+        self,
+        observation: Observation,
+        action: ParsedAction,
+        event: dict[str, object],
+        context: DuplexDataPlaneContext,
+    ) -> Iterator[dict[str, object]]:
+        """Project one delegated action as a call plus, at most, its spoken note.
+
+        A recognised call short-circuits the rest of the output, so the call
+        result carries the whole output's ``end_of_turn``: nothing else of this
+        output will carry it. The note is the ordinary spoken reply that
+        follows, so it carries the text of its own response whenever the audio
+        stage is going to render it. A delegation without a note still owes the
+        observation a terminal of its own: the call is published, but the shared
+        call handler returns before the response lifecycle runs, so an empty
+        terminal releases the request instead of leaving it open.
+        """
+        if observation.call_sent or observation.text_sent:
+            return
+        audio = "audio" in context.modalities
+        call_event = dict(event)
+        note_event = dict(event)
+        note_event.update(
+            text=action.text,
+            model_context_text=action.text,
+            # The call already ended the turn; only a text-only observation
+            # has no audio stage left to produce the terminal.
+            end_of_turn=not audio,
+            # Without this the session would commit the note as spoken history
+            # when its audio never completed, e.g. a cancel between projection
+            # and the first Code2Wav output.
+            text_requires_complete_audio=audio,
+        )
+        arguments = delegation_arguments(action)
+        observation.call_sent = True
+        call_event["end_of_turn"] = True
+        if arguments is None:
+            # Nothing to hand over: the note is an ordinary observation and no
+            # call is exposed.
+            observation.text_sent = True
+            if not action.text:
+                note_event.update(
+                    text="",
+                    model_context_text="",
+                    end_of_turn=True,
+                    text_requires_complete_audio=False,
+                )
+            yield note_event
+            return
+        observation.text_sent = True
+        observation.response_text = action.text
+        call_event["joyai_function_call"] = {
+            "call_id": f"call_{uuid.uuid4().hex}",
+            "name": DELEGATION_TOOL_NAME,
+            "arguments": arguments,
+        }
+        yield call_event
+        if action.text:
+            yield note_event
+            return
+        # A note-free call still ends its observation. The call result above is
+        # published, but nothing else of this output will produce a terminal.
+        terminal_event = dict(event)
+        terminal_event.update(
+            text="",
+            model_context_text="",
+            end_of_turn=True,
+            text_requires_complete_audio=False,
+        )
+        yield terminal_event

@@ -15,6 +15,7 @@ import multiprocessing.connection
 import signal
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
@@ -29,7 +30,6 @@ from vllm.v1.engine.utils import (
     CoreEngine,
     CoreEngineLaunch,
     EngineZmqAddresses,
-    wait_for_engine_startup,
 )
 from vllm.v1.utils import shutdown
 
@@ -44,6 +44,7 @@ from vllm_omni.distributed.omni_connectors.utils.serialization import (
     OmniMsgpackEncoder,
 )
 from vllm_omni.distributed.omni_coordinator import OmniCoordClientForStage
+from vllm_omni.engine.stage_init_deadline import wait_for_engine_startup_with_deadline
 from vllm_omni.engine.stage_init_utils import set_death_signal
 from vllm_omni.errors import client_error_metadata
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -263,7 +264,7 @@ class StageDiffusionProc:
         """
         # Feedback only changes condition-protected host state and must not
         # wait behind an executor RPC for the current GPU chunk.
-        if method in ("update_streaming_playback", "release_streaming_output"):
+        if method in ("update_streaming_playback", "track_streaming_interaction", "release_streaming_output"):
             assert self._engine is not None
             return getattr(self._engine, method)(*args, **(kwargs or {}))
 
@@ -285,9 +286,10 @@ class StageDiffusionProc:
                 raise
 
         if method == "profile":
+            assert self._engine is not None
             is_start = args[0] if args else True
             profile_prefix = args[1] if len(args) > 1 else None
-            return await run_executor(self._engine.profile, is_start, profile_prefix)
+            return await run_executor(partial(self._engine.profile, is_start, profile_prefix, **(kwargs or {})))
 
         if method == "add_lora":
             # Reconstruct LoRARequest after IPC if needed.
@@ -561,6 +563,7 @@ class StageDiffusionProc:
                 elif msg_type == "collective_rpc":
                     if msg["method"] in (
                         "update_streaming_playback",
+                        "track_streaming_interaction",
                         "release_streaming_output",
                     ):
                         await _dispatch_rpc(msg)
@@ -867,7 +870,7 @@ class StageDiffusionProcManager:
     def _wait_until_started(self, handshake_address: str, stage_init_timeout: int) -> None:
         try:
             with zmq_socket_ctx(handshake_address, zmq.ROUTER, bind=True) as handshake_socket:
-                wait_for_engine_startup(
+                wait_for_engine_startup_with_deadline(
                     handshake_socket,
                     [CoreEngine(index=0, local=True)],
                     SimpleNamespace(
@@ -888,6 +891,9 @@ class StageDiffusionProcManager:
                         # during handshake is still detected.
                         watched_frontend_processes=[self.proc],
                     ),
+                    timeout=stage_init_timeout,
+                    kill_processes=lambda: shutdown([self.proc]),
+                    stage_label=f"Diffusion stage process {self.proc.name}",
                 )
         except Exception:
             shutdown([self.proc])
