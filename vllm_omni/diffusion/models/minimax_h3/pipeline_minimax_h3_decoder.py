@@ -118,11 +118,18 @@ class MiniMaxH3DecoderPipeline(
                         width=payload["width"],
                         video_codec_options=payload["video_codec_options"],
                         batch_frames=payload["preencode_batch_frames"],
+                        crop_offset=payload.get("crop_offset", (0, 0)),
                     )
                 )
                 audios.append(None)
             else:
-                video, audio = self.decode(video_latent, audio_latent, height=payload["height"], width=payload["width"])
+                video, audio = self.decode(
+                    video_latent,
+                    audio_latent,
+                    height=payload["height"],
+                    width=payload["width"],
+                    crop_offset=payload.get("crop_offset", (0, 0)),
+                )
                 video = self._offload_model_cpu_stage_output(_prepare_minimax_h3_video_output(video))
                 videos.append(video)
                 audios.append(audio)
