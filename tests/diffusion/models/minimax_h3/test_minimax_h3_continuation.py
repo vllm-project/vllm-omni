@@ -96,8 +96,15 @@ def test_latent_guide_shares_target_clock_and_remains_condition_only(temporal_of
         ({"long_video_mode": "bad"}, False),
         ({"long_video_mode": "continuation"}, True),
         ({"long_video_mode": "continuation", "continuation_overlap_frames": 23}, False),
+        ({"long_video_mode": "continuation", "continuation_window_frames": 999}, False),
         ({"long_video_mode": "continuation", "continuation_window_frames": True}, False),
+        ({"long_video_mode": "continuation", "continuation_overlap_frames": True}, False),
+        ({"long_video_mode": "continuation", "continuation_window_frames": 277.0}, False),
+        ({"long_video_mode": "continuation", "continuation_overlap_frames": "22"}, False),
         ({"long_video_mode": "continuation", "continuation_overlap_frames": 277}, False),
+        ({"long_video_mode": "continuation", "continuation_overlap_frames": 294}, False),
+        ({"long_video_mode": "continuation", "continuation_window_frames": 90}, False),
+        ({"long_video_mode": "continuation", "continuation_window_frames": 362}, False),
     ],
 )
 def test_invalid_continuation_options(extra, step):
