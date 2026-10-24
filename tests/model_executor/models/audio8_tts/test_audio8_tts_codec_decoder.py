@@ -24,13 +24,13 @@ class _FakeCodec:
     """Returns ``SAMPLES_PER_FRAME`` ramp samples per frame."""
 
     def __init__(self):
-        self.calls: list[tuple[int, ...]] = []
+        self.calls: list[list[tuple[int, ...]]] = []
 
-    def decode(self, codes_bqf: torch.Tensor) -> torch.Tensor:
-        self.calls.append(tuple(codes_bqf.shape))
-        frames = int(codes_bqf.shape[-1])
-        total = frames * SAMPLES_PER_FRAME
-        return torch.arange(total, dtype=torch.float32).view(1, 1, total)
+    def decode(self, codes_qf: list[torch.Tensor]) -> list[torch.Tensor]:
+        self.calls.append([tuple(codes.shape) for codes in codes_qf])
+        return [
+            torch.arange(codes.shape[-1] * SAMPLES_PER_FRAME, dtype=torch.float32).view(1, -1) for codes in codes_qf
+        ]
 
 
 def _make_decoder(codec: _FakeCodec, num_codebooks: int = NUM_CODEBOOKS, splits=None):
@@ -65,7 +65,7 @@ def test_left_context_frames_are_trimmed_from_the_emitted_chunk():
     assert len(audios) == 1
     # 4 frames decoded, 3 of context trimmed => 1 frame of new audio.
     assert audios[0].shape[0] == SAMPLES_PER_FRAME
-    assert codec.calls == [(1, NUM_CODEBOOKS, 4)]
+    assert codec.calls == [[(NUM_CODEBOOKS, 4)]]
 
 
 def test_tensor_codes_from_runtime_info_win_over_input_ids():
@@ -75,7 +75,7 @@ def test_tensor_codes_from_runtime_info_win_over_input_ids():
         input_ids=torch.zeros(64, dtype=torch.long),
         runtime_additional_information=[{"codes": {"audio": torch.tensor([[1, 2], [3, 4]], dtype=torch.long)}}],
     )
-    assert codec.calls == [(1, 2, 2)]
+    assert codec.calls == [[(2, 2)]]
     assert out.multimodal_outputs["model_outputs"][0].shape[0] == 2 * SAMPLES_PER_FRAME
 
 
@@ -83,7 +83,7 @@ def test_flat_input_ids_are_reshaped_codebook_major():
     codec = _FakeCodec()
     decoder = _make_decoder(codec, num_codebooks=2)
     out = decoder.forward(input_ids=torch.arange(6, dtype=torch.long), runtime_additional_information=[{}])
-    assert codec.calls == [(1, 2, 3)]
+    assert codec.calls == [[(2, 3)]]
     assert out.multimodal_outputs["model_outputs"][0].shape[0] == 3 * SAMPLES_PER_FRAME
 
 
@@ -137,5 +137,28 @@ def test_codes_with_wrong_codebook_count_fall_back_to_input_ids():
         input_ids=torch.arange(4, dtype=torch.long),
         runtime_additional_information=[{"codes": {"audio": torch.zeros((5, 3), dtype=torch.long)}}],
     )
-    assert codec.calls == [(1, 2, 2)]
+    assert codec.calls == [[(2, 2)]]
     assert out.multimodal_outputs["model_outputs"][0].shape[0] == 2 * SAMPLES_PER_FRAME
+
+
+def test_mixed_lengths_decode_once_and_trim_per_request_context():
+    codec = _FakeCodec()
+    decoder = _make_decoder(codec)
+    codes_a = torch.arange(NUM_CODEBOOKS * 3).reshape(NUM_CODEBOOKS, 3)
+    codes_b = torch.arange(NUM_CODEBOOKS * 5).reshape(NUM_CODEBOOKS, 5)
+    out = decoder.forward(
+        input_ids=torch.zeros(3, dtype=torch.long),
+        seq_token_counts=[1, 1, 1],
+        runtime_additional_information=[
+            {"codes": {"audio": codes_a}, "meta": {"left_context_size": 1}},
+            {},
+            {"codes": {"audio": codes_b}, "meta": {"left_context_size": 2}},
+        ],
+    )
+
+    assert codec.calls == [[(NUM_CODEBOOKS, 3), (NUM_CODEBOOKS, 5)]]
+    audios = out.multimodal_outputs["model_outputs"]
+    assert len(audios) == len(out.multimodal_outputs["sr"]) == 3
+    torch.testing.assert_close(audios[0], torch.arange(300, dtype=torch.float32)[100:])
+    assert audios[1].numel() == 0
+    torch.testing.assert_close(audios[2], torch.arange(500, dtype=torch.float32)[200:])

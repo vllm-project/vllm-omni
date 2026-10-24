@@ -25,6 +25,8 @@ from torch import Tensor
 from torch.nn.utils import weight_norm as legacy_weight_norm
 from torch.nn.utils.parametrizations import weight_norm
 
+from .cudagraph_wrapper import Audio8CodecCUDAGraphWrapper
+
 # The codec's own transformer blocks always use base 10000, independent of the
 # 1e6 rope_base of the DualAR language model.
 _CODEC_ROPE_BASE = 10000.0
@@ -551,9 +553,19 @@ class ArkttsCodec(nn.Module):
             post_intermediate_size=post_intermediate_size,
         )
         self.decoder = ArkttsDecoder()
+        self._cudagraph_wrapper: Audio8CodecCUDAGraphWrapper | None = None
 
     @torch.inference_mode()
-    def encode(self, audio: Tensor, audio_lengths: Tensor | None = None) -> tuple[Tensor, Tensor]:
+    def encode(
+        self, audio: Tensor | list[Tensor], audio_lengths: Tensor | None = None
+    ) -> tuple[Tensor, Tensor] | list[Tensor]:
+        if isinstance(audio, list):
+            if self._cudagraph_wrapper is not None:
+                return self._cudagraph_wrapper.encode(audio)
+            return [self._encode_eager(item.reshape(1, 1, -1))[0][0] for item in audio]
+        return self._encode_eager(audio, audio_lengths)
+
+    def _encode_eager(self, audio: Tensor, audio_lengths: Tensor | None = None) -> tuple[Tensor, Tensor]:
         """Encode ``[B, 1, samples]`` (or ``[B, samples]``) to ``[B, 10, frames]``."""
         if audio.ndim == 2:
             audio = audio[:, None]
@@ -574,7 +586,16 @@ class ArkttsCodec(nn.Module):
         return torch.where(valid, codes, torch.full_like(codes, -1)), code_lengths
 
     @torch.inference_mode()
-    def decode(self, codes: Tensor) -> Tensor:
+    def decode(self, codes: Tensor | list[Tensor]) -> Tensor | list[Tensor]:
+        if isinstance(codes, list):
+            if self._cudagraph_wrapper is not None:
+                return self._cudagraph_wrapper.decode(codes)
+            return [self._decode_eager(item.unsqueeze(0))[0] for item in codes]
+        if self._cudagraph_wrapper is not None:
+            return torch.stack(self._cudagraph_wrapper.decode([item for item in codes]))
+        return self._decode_eager(codes)
+
+    def _decode_eager(self, codes: Tensor) -> Tensor:
         """Decode ``[B, 10, frames]`` to ``[B, 1, samples]``."""
         return self.decoder(self.quantizer.decode(codes.long()))
 

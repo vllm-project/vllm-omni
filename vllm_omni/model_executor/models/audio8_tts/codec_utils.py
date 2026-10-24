@@ -12,11 +12,13 @@ from __future__ import annotations
 
 import os
 from functools import lru_cache
+from typing import Any
 
 import numpy as np
 import torch
 import torch.nn as nn
 from torch.nn.utils.parametrize import remove_parametrizations
+from vllm.config import VllmConfig
 from vllm.logger import init_logger
 
 from vllm_omni.model_executor.models.audio8_tts.codec import ArkttsCodec, build_arktts_codec
@@ -29,7 +31,7 @@ logger = init_logger(__name__)
 
 CODEC_FILENAME = "codec.pth"
 
-_codec_cache: dict[tuple[str, str, str, str], ArkttsCodec] = {}
+_codec_cache: dict[tuple[Any, ...], ArkttsCodec] = {}
 
 
 def resolve_codec_path(model_path: str, filename: str = CODEC_FILENAME) -> str:
@@ -67,6 +69,7 @@ def load_arktts_codec(
     device: torch.device | str = "cpu",
     dtype: torch.dtype = torch.float32,
     role: str = "decode",
+    vllm_config: VllmConfig | None = None,
     post_n_layer: int = 8,
     post_n_head: int = 16,
     post_n_local_heads: int = 8,
@@ -81,7 +84,34 @@ def load_arktts_codec(
     if role not in {"encode", "decode", "both"}:
         raise ValueError(f"role must be encode/decode/both, got {role!r}")
     device = torch.device(device)
-    cache_key = (model_path, str(device), str(dtype), role)
+    model_config = getattr(vllm_config, "model_config", None)
+    use_graph = (
+        not getattr(model_config, "enforce_eager", False)
+        and bool(getattr(model_config, "async_chunk", False))
+        and device.type == "cuda"
+    )
+    connector = getattr(model_config, "stage_connector_config", None)
+    extra = connector.get("extra", connector) if isinstance(connector, dict) else {}
+    extra = extra if isinstance(extra, dict) else {}
+    batch_size = int(getattr(getattr(vllm_config, "scheduler_config", None), "max_num_seqs", 1))
+    graph_config = (
+        int(extra.get("codec_chunk_frames", 25)),
+        int(extra.get("codec_left_context_frames", 25)),
+        int(extra.get("initial_codec_chunk_frames", 0)),
+    )
+    cache_key = (
+        model_path,
+        str(device),
+        str(dtype),
+        role,
+        post_n_layer,
+        post_n_head,
+        post_n_local_heads,
+        post_intermediate_size,
+        use_graph,
+        batch_size if use_graph else None,
+        graph_config if use_graph else None,
+    )
     cached_codec = _codec_cache.get(cache_key)
     if cached_codec is not None:
         return cached_codec
@@ -112,6 +142,13 @@ def load_arktts_codec(
 
     codec = codec.to(device=device, dtype=dtype)
     codec.eval()
+    if use_graph:
+        from .cudagraph_wrapper import Audio8CodecCUDAGraphWrapper, decoder_capture_sizes
+
+        sizes = decoder_capture_sizes(*graph_config) if role in {"decode", "both"} else ()
+        codec._cudagraph_wrapper = Audio8CodecCUDAGraphWrapper(codec, batch_size=batch_size, decoder_sizes=sizes)
+        if sizes:
+            codec._cudagraph_wrapper.capture_decoder()
     _codec_cache[cache_key] = codec
     logger.info(
         "Loaded Audio8 TTS codec from %s (role=%s, device=%s, dtype=%s, baked_weight_norms=%d)",
@@ -177,6 +214,7 @@ def encode_reference_audio_codes(
     sample_rate: int,
     *,
     device: torch.device | str,
+    vllm_config: Any = None,
     **codec_kwargs: int,
 ) -> torch.Tensor:
     """Encode reference audio into codec codes.
@@ -185,12 +223,18 @@ def encode_reference_audio_codes(
         ``[frames, num_codebooks]`` int64 codes on ``device``.
     """
     device = torch.device(device)
-    codec = load_arktts_codec(model_path, device=device, dtype=torch.float32, role="encode", **codec_kwargs)
+    codec = load_arktts_codec(
+        model_path,
+        device=device,
+        dtype=torch.float32,
+        role="encode",
+        vllm_config=vllm_config,
+        **codec_kwargs,
+    )
     wav = prepare_reference_waveform(wav_samples, sample_rate, device=device)
-    lengths = torch.tensor([wav.numel()], device=device, dtype=torch.long)
-    codes, code_lengths = codec.encode(wav.reshape(1, 1, -1), lengths)
-    frames = int(code_lengths[0].item())
-    codes_fq = codes[0, :, :frames].transpose(0, 1).to(dtype=torch.long).contiguous()
+    frames = -(-wav.numel() // ARKTTS_CODEC_FRAME_SIZE)
+    codes_qf = codec.encode([wav])[0]
+    codes_fq = codes_qf[:, :frames].transpose(0, 1).to(dtype=torch.long).contiguous()
     logger.info(
         "Encoded Audio8 TTS reference audio: %d samples @ %d Hz -> frames=%d codebooks=%d",
         int(wav.numel()),
