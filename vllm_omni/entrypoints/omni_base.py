@@ -333,6 +333,15 @@ class OmniBase(PDDisaggregationMixin):
         for pool in pools:
             if self._stage_has_no_live_replica(pool):
                 raise EngineDeadError(f"Stage-{pool.stage_id} has no live replica")
+            # Request-scoped failure breaker (#7618): a worker that survived
+            # a per-request failure but is corrupted never trips the
+            # replica-liveness checks above; surface it here so /health
+            # reflects the stage's repeated failures.
+            if pool.is_circuit_open():
+                raise OmniEngineDeadError(
+                    pool.circuit_breaker_message(),
+                    error_stage_id=pool.stage_id,
+                )
 
     def resolve_sampling_params_list(
         self,
@@ -585,6 +594,15 @@ class OmniBase(PDDisaggregationMixin):
             stage_id,
             error_text,
         )
+        # A tripped stage circuit breaker (#7618) means the stage worker is
+        # corrupted; surface the breaker message instead of whatever
+        # unrelated error the corrupted stage produced for this request.
+        pools = getattr(self.engine, "stage_pools", None) or []
+        if stage_id < len(pools) and pools[stage_id].is_circuit_open():
+            raise OmniEngineDeadError(
+                pools[stage_id].circuit_breaker_message(),
+                error_stage_id=stage_id,
+            )
         # NOTE: O(n_stages) check for every error.
         if self.errored:
             raise OmniEngineDeadError(

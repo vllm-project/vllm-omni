@@ -1457,6 +1457,11 @@ class OrchestratorBase:
                 await self._handle_stage_error(stage_id, output)
                 continue
 
+            # A successful execution resets the stage's consecutive-failure
+            # counter (see StagePool.record_stage_failure); a completed
+            # request proves the stage worker is still healthy.
+            self.stage_pools[stage_id].record_stage_success()
+
             stage_metrics = None
             segment_finished = req_state.streaming.enabled and req_state.streaming.segment(stage_id).finished
             if output.finished or segment_finished:
@@ -1474,6 +1479,12 @@ class OrchestratorBase:
 
     async def _handle_stage_error(self, stage_id: int, output: Any, *, error: str | None = None) -> None:
         """Emit a frontend-visible error and clean up request state."""
+        # Client mistakes (4xx validation, guardrails) are request-scoped and
+        # retryable; only server-side stage failures count toward the
+        # stage's circuit breaker (#7618).
+        status_code = getattr(output, "error_status_code", None)
+        if status_code is None or status_code >= 500:
+            self.stage_pools[stage_id].record_stage_failure()
         if self._cfg_tracker.is_companion(output.request_id):
             parent_id = self._cfg_tracker.get_parent_id(output.request_id) or output.request_id
         else:
