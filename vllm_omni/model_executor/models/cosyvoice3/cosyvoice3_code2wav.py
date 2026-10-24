@@ -62,8 +62,9 @@ def _build_dit_estimator(estimator_config: Mapping[str, Any]) -> DiT:
 
 
 class StreamingHiFTState(TypedDict, total=False):
-    """Request-owned mel history, its absolute offset, and oscillator phase."""
+    """Request-owned flow/HiFT mel histories, HiFT offset, and oscillator phase."""
 
+    flow_mel: torch.Tensor
     mel: torch.Tensor
     mel_offset: int
     phase_acc: torch.Tensor | None
@@ -97,9 +98,10 @@ class CosyVoice3Code2Wav(nn.Module):
     # the tensors and copy to host without taking another device snapshot.
     owns_generation_output_storage = True
 
-    def __init__(self, config: CosyVoice3Config):
+    def __init__(self, config: CosyVoice3Config, *, flow_left_context_tokens: int = 0):
         super().__init__()
         self.config = config
+        self.flow_left_context_tokens = flow_left_context_tokens
 
         # Build flow matching components
         pre_lookahead_layer = PreLookaheadLayer(**config.flow["pre_lookahead_layer"])
@@ -362,6 +364,56 @@ class CosyVoice3Code2Wav(nn.Module):
         }
         return emitted_speech.reshape(emitted_speech.shape[0], 1, -1), new_state
 
+    def _condition_streaming_flow(
+        self,
+        token: torch.Tensor,
+        prompt_token: torch.Tensor,
+        prompt_feat: torch.Tensor,
+        cache_state: StreamingHiFTState | None,
+        token_offset_tokens: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+        """Move bounded left context into the prompt, paired with previously decoded mel.
+
+        The unbounded and packed paths retain prefix regeneration. A nonzero
+        bounded offset requires matching request history; missing history raises
+        rather than silently regenerating audio that has already been emitted.
+        """
+        window = getattr(self, "flow_left_context_tokens", 0)
+        if window <= 0 or cosyvoice3_packed_streaming_enabled():
+            return token, prompt_token, prompt_feat, token_offset_tokens
+        if token_offset_tokens < 0 or token_offset_tokens > min(window, token.shape[1]):
+            raise ValueError("Bounded flow left context exceeds the token window")
+        if token_offset_tokens == 0:
+            return token, prompt_token, prompt_feat, 0
+        history = None if cache_state is None else cache_state.get("flow_mel")
+        frames = token_offset_tokens * int(self.token_mel_ratio)
+        if history is None or history.shape[-1] < frames:
+            raise ValueError("Bounded flow left context is missing its previously decoded mel")
+        device = next(self.flow_model.parameters()).device
+        token = token.to(device=device)
+        prompt_token = prompt_token.to(device=device)
+        prompt_feat = prompt_feat.to(device=device)
+        prompt_token = torch.cat([prompt_token, token[:, :token_offset_tokens].to(prompt_token)], dim=1)
+        prompt_feat = torch.cat([prompt_feat, history[..., -frames:].transpose(1, 2).to(prompt_feat)], dim=1)
+        return token[:, token_offset_tokens:], prompt_token, prompt_feat, 0
+
+    def _stream_hift_with_flow_context(
+        self,
+        feat: torch.Tensor,
+        *,
+        cache_state: StreamingHiFTState | None,
+        finalize: bool,
+    ) -> tuple[torch.Tensor, StreamingHiFTState | None]:
+        """Vocode new mel and retain only the bounded, decoded flow context per request."""
+        audio, new_state = self._stream_hift_from_feat(feat, cache_state=cache_state, finalize=finalize)
+        window = getattr(self, "flow_left_context_tokens", 0)
+        if new_state is not None and window > 0 and not cosyvoice3_packed_streaming_enabled():
+            history = None if cache_state is None else cache_state.get("flow_mel")
+            mel = feat if history is None else torch.cat([history.to(feat), feat], dim=-1)
+            # Own the bounded tail: no batch-output alias or retained full allocation.
+            new_state["flow_mel"] = mel[..., -window * int(self.token_mel_ratio) :].detach().clone()
+        return audio, new_state
+
     @torch.inference_mode()
     def forward_streaming_batch(
         self,
@@ -398,6 +450,20 @@ class CosyVoice3Code2Wav(nn.Module):
         results: list[tuple[torch.Tensor, StreamingHiFTState | None] | None] = [None] * len(items)
         groups: dict[tuple[int, int, int, bool], list[tuple[int, StreamingFlowItem]]] = {}
         for index, item in enumerate(items):
+            token, prompt_token, prompt_feat, offset = self._condition_streaming_flow(
+                item["token"],
+                item["prompt_token"],
+                item["prompt_feat"],
+                item.get("cache_state"),
+                int(item.get("token_offset_tokens", 0)),
+            )
+            item = {
+                **item,
+                "token": token,
+                "prompt_token": prompt_token,
+                "prompt_feat": prompt_feat,
+                "token_offset_tokens": offset,
+            }
             assert isinstance(item["token"], torch.Tensor)
             assert isinstance(item["prompt_token"], torch.Tensor)
             assert isinstance(item["prompt_feat"], torch.Tensor)
@@ -488,7 +554,7 @@ class CosyVoice3Code2Wav(nn.Module):
                 row_feat = feat[row : row + 1, :, :valid_mel]
                 if trim_mel > 0:
                     row_feat = row_feat[:, :, trim_mel:]
-                results[index] = self._stream_hift_from_feat(
+                results[index] = self._stream_hift_with_flow_context(
                     row_feat,
                     cache_state=item.get("cache_state"),
                     finalize=finalize,
@@ -510,14 +576,10 @@ class CosyVoice3Code2Wav(nn.Module):
         token_offset_tokens: int = 0,
         finalize: bool = False,
     ) -> tuple[torch.Tensor, StreamingHiFTState | None]:
-        """Decode streaming audio using cumulative mel + emitted-speech offset.
-
-        This mirrors upstream CosyVoice3 streaming semantics more closely than
-        waveform-domain overlap-add: keep a cumulative mel history per request,
-        re-run causal HiFT on the history, and emit only the newly grown speech
-        suffix. That preserves causal look-right handling without double
-        trimming or duplicated overlap at chunk boundaries.
-        """
+        """Emit only new audio, conditioning bounded flow on request-owned prior mel."""
+        token, prompt_token, prompt_feat, token_offset_tokens = self._condition_streaming_flow(
+            token, prompt_token, prompt_feat, cache_state, token_offset_tokens
+        )
         feat = self._forward_mel(
             token=token,
             prompt_token=prompt_token,
@@ -528,7 +590,7 @@ class CosyVoice3Code2Wav(nn.Module):
             streaming=True,
             finalize=finalize,
         )
-        return self._stream_hift_from_feat(feat, cache_state=cache_state, finalize=finalize)
+        return self._stream_hift_with_flow_context(feat, cache_state=cache_state, finalize=finalize)
 
     @torch.inference_mode()
     def _stream_position_noise(self, width: int, like: torch.Tensor) -> torch.Tensor:

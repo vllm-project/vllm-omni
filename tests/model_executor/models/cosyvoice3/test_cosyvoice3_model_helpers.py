@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from collections import OrderedDict
+from pathlib import Path
 from threading import Lock
 from types import SimpleNamespace
 
@@ -18,10 +19,13 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.worker.gpu_input_batch import InputBatch
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
+import vllm_omni
 from vllm_omni.config.model import OmniModelConfig
+from vllm_omni.config.stage_config import resolve_deploy_yaml
 from vllm_omni.data_entry_keys import to_struct
 from vllm_omni.model_executor.models.cosyvoice3 import cosyvoice3, cosyvoice3_talker
 from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3 import CosyVoice3Model, _normalize_request_conditioning
+from vllm_omni.model_executor.models.cosyvoice3.runtime import cosyvoice3_flow_left_context
 from vllm_omni.transformers_utils.configs.cosyvoice3 import CosyVoice3Config
 from vllm_omni.worker import gpu_ar_model_runner
 from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
@@ -1120,3 +1124,46 @@ def test_generation_output_ownership_is_exposed_only_for_owned_codec(stage, owne
     if stage == "cosyvoice3_code2wav":
         model.code2wav = SimpleNamespace(owns_generation_output_storage=owned)
     assert model.owns_generation_output_storage is (stage == "cosyvoice3_code2wav" and owned)
+
+
+@pytest.mark.parametrize(
+    ("packed_streaming", "extra", "raises"),
+    [
+        (True, {"codec_left_context_frames": 25}, True),
+        # The window defaults on, so a connector that omits the key is bounded too.
+        (True, {"codec_chunk_frames": 25}, True),
+        (True, {"codec_left_context_frames": 0}, False),
+        # Empty extra still selects the default bounded window.
+        (True, {}, True),
+        (False, {"codec_left_context_frames": 25}, False),
+    ],
+)
+def test_flow_window_is_exclusive_with_packed_streaming(monkeypatch, packed_streaming, extra, raises):
+    monkeypatch.setattr(cosyvoice3, "cosyvoice3_packed_streaming_enabled", lambda: packed_streaming)
+
+    if raises:
+        with pytest.raises(ValueError, match="codec_left_context_frames"):
+            CosyVoice3Model._check_flow_window_vs_packed(extra)
+    else:
+        CosyVoice3Model._check_flow_window_vs_packed(extra)
+
+
+@pytest.mark.parametrize("connector", [{"extra": {}}, {"name": "SharedMemoryConnector"}, {"extra": {"stage_id": 1}}])
+def test_packed_guard_reads_default_window_from_connector(monkeypatch, connector):
+    monkeypatch.setattr(cosyvoice3, "cosyvoice3_packed_streaming_enabled", lambda: True)
+    config = SimpleNamespace(model_config=SimpleNamespace(stage_connector_config=connector))
+    with pytest.raises(ValueError, match="codec_left_context_frames=25"):
+        CosyVoice3Model._check_flow_window_vs_packed(CosyVoice3Model._connector_extra(config))
+
+
+@pytest.mark.parametrize(
+    "deploy",
+    ["cosyvoice3_packed_streaming.yaml", "cosyvoice3_packed_streaming_optimized_standard.yaml"],
+)
+def test_packed_streaming_deploys_disable_flow_window(deploy):
+    deploy_dir = Path(vllm_omni.__file__).parent / "deploy"
+    extra = resolve_deploy_yaml(deploy_dir / deploy)["connectors"]["connector_of_shared_memory"]["extra"]
+
+    assert cosyvoice3_flow_left_context(extra) == 0
+    # The base profile still bounds its window; only the streaming overlay opts out.
+    assert extra["codec_chunk_frames"] == 25
