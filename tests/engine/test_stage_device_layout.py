@@ -20,13 +20,14 @@ from unittest import mock
 import pytest
 from pytest_mock import MockerFixture
 
-from vllm_omni.engine import stage_init_utils
+from vllm_omni.engine import stage_init_utils, stage_runtime
 from vllm_omni.engine.stage_init_utils import (
     _check_stage_device_layout,
     build_vllm_config,
     compute_replica_layout,
     get_stage_devices_per_replica,
 )
+from vllm_omni.engine.stage_runtime import StageRuntime
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -277,3 +278,30 @@ def test_build_vllm_config_proceeds_on_consistent_layout(mocker: MockerFixture) 
     assert vllm_config is fake_config
     assert executor_class is sentinel_executor
     assert captured_api_process_config == {"count": 3, "rank": 2}
+
+
+@pytest.mark.parametrize(
+    ("devices", "launch_mode", "visible_devices", "raises"),
+    [
+        ("1", "local", None, True),  # single-GPU host with a multi-GPU deploy default
+        ("0", "local", None, False),
+        ("1", "remote", None, False),  # remote replicas use the remote node's devices
+        ("1", "local", "0", False),  # logical IDs are remapped onto CUDA_VISIBLE_DEVICES instead
+    ],
+)
+def test_validate_local_devices_rejects_missing_gpu(monkeypatch, devices, launch_mode, visible_devices, raises):
+    platform = types.SimpleNamespace(device_control_env_var="CUDA_VISIBLE_DEVICES", get_device_count=lambda: 1)
+    monkeypatch.setattr(stage_runtime, "current_omni_platform", platform)
+    if visible_devices is None:
+        monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    else:
+        monkeypatch.setenv("CUDA_VISIBLE_DEVICES", visible_devices)
+    metadata = types.SimpleNamespace(stage_id=1, runtime_cfg={"devices": devices})
+    plans = [types.SimpleNamespace(replicas=[types.SimpleNamespace(metadata=metadata, launch_mode=launch_mode)])]
+    runtime = StageRuntime.__new__(StageRuntime)
+
+    if raises:
+        with pytest.raises(ValueError, match=re.escape("Stage 1 is placed on device(s) [1]")):
+            runtime._validate_local_devices(plans)
+    else:
+        runtime._validate_local_devices(plans)
