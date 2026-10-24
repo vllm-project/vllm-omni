@@ -50,6 +50,9 @@ class _RecordingPool:
     def __init__(self) -> None:
         self.built_for: list[str] = []
 
+    def record_stage_success(self) -> None:
+        pass
+
     def build_stage_metrics(self, outputs: list[_StageOutput], **_kwargs: object) -> _StageMetrics:
         self.built_for.extend(output.request_id for output in outputs)
         return _StageMetrics()

@@ -17,10 +17,14 @@ def build():
     o = Orchestrator.__new__(Orchestrator)
     o.stage_pools = [
         SimpleNamespace(
-            final_output=False, build_stage_metrics=lambda *a, **k: SimpleNamespace(stage_id=0, num_tokens_out=42)
+            final_output=False,
+            build_stage_metrics=lambda *a, **k: SimpleNamespace(stage_id=0, num_tokens_out=42),
+            record_stage_success=lambda: None,
         ),
         SimpleNamespace(
-            final_output=True, build_stage_metrics=lambda *a, **k: SimpleNamespace(stage_id=1, num_tokens_out=0)
+            final_output=True,
+            build_stage_metrics=lambda *a, **k: SimpleNamespace(stage_id=1, num_tokens_out=0),
+            record_stage_success=lambda: None,
         ),
     ]
     state = OrchestratorRequestState(

@@ -2092,6 +2092,9 @@ async def test_resumable_segment_boundary_builds_stage_metrics() -> None:
         def __init__(self) -> None:
             self.calls: list[list[Any]] = []
 
+        def record_stage_success(self) -> None:
+            pass
+
         def build_stage_metrics(self, outputs, **_kwargs):
             self.calls.append(outputs)
             return built_metrics
@@ -2139,6 +2142,9 @@ async def test_disabled_stage_metrics_preserve_completion_routing() -> None:
     class RecordingPool:
         def __init__(self) -> None:
             self.calls: list[list[Any]] = []
+
+        def record_stage_success(self) -> None:
+            pass
 
         def build_stage_metrics(self, outputs, **_kwargs):
             self.calls.append(outputs)

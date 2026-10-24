@@ -60,6 +60,9 @@ class _CodecPool:
     def schedule_release_request_resources(self, request_ids):
         pass
 
+    def record_stage_failure(self) -> None:
+        pass
+
     async def process_llm_raw_outputs(self, replica_id, raw, **kwargs):
         assert replica_id == self.replica_id
         return self.output_processor.process_outputs(raw.outputs, raw.timestamp).request_outputs
@@ -68,7 +71,11 @@ class _CodecPool:
 def _orchestrator(output_kind=RequestOutputKind.DELTA, *, registered=True, replica_id=2, final_stage_id=1):
     obj = Orchestrator.__new__(Orchestrator)
     obj.stage_pools = [
-        SimpleNamespace(final_output=False, schedule_release_request_resources=lambda request_ids: None),
+        SimpleNamespace(
+            final_output=False,
+            schedule_release_request_resources=lambda request_ids: None,
+            record_stage_failure=lambda: None,
+        ),
         _CodecPool(output_kind, registered, replica_id),
     ]
     obj.request_states = {"r": OrchestratorRequestState(request_id="r", final_stage_id=final_stage_id)}
@@ -264,6 +271,7 @@ async def test_first_audio_flush_uses_set_with_real_raw_terminal_handlers(termin
     await obj._route_upstream_first_audio(0, 0, _raw(first=True, samples=(10, 11)))
 
     obj._finish_raw_terminal_requests.assert_awaited_once()
+    assert obj._finish_raw_terminal_requests.await_args is not None
     stage, replica, terminals = obj._finish_raw_terminal_requests.await_args.args
     assert (stage, replica) == (1, 2)
     assert isinstance(terminals, set)
