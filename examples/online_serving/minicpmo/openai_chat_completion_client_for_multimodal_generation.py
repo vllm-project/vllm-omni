@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """OpenAI chat-completions client for MiniCPM-o 4.5 online serving.
 
 Thin wrapper around the shared multimodal client helpers, with MiniCPM-specific
@@ -120,7 +120,8 @@ def run_multimodal_generation(args, client: OpenAI) -> None:
                         f.write(audio_data)
                     print(f"Audio saved to {audio_file_path}")
                     count += 1
-                elif choice.message.content:
+                # A choice can contain both audio and text.
+                if choice.message.content:
                     print("Chat completion output from text:", choice.message.content)
     else:
         printed_content = False

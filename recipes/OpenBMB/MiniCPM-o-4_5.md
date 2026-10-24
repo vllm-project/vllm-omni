@@ -254,10 +254,9 @@ When using the OpenAI Python SDK, the same flag can also be sent as
 `extra_body={"chat_template_kwargs": {"use_tts_template": True}}`
 because the client merges `extra_body` into the request root.
 
-Response carries text in one choice's `message.content` and base64 WAV
-in another choice's `message.audio.data` (24 kHz mono, see Notes). With
-`modalities: ["text", "audio"]` you typically get two `choices` entries
-(one text, one audio).
+With `modalities: ["text", "audio"]` a non-streaming response has one choice
+that carries both the text in `message.content` and base64 WAV in
+`message.audio.data` (24 kHz mono, see Notes).
 
 **Streaming text + speech** (use `--stream`):
 
@@ -388,17 +387,20 @@ vllm serve openbmb/MiniCPM-o-4_5 --omni \
       work slows the Stage-0 thinker when all stages share one GPU (about +16%
       text TTFT at concurrency 1 on an H100), so it is off by default.
 
-- **Talker sampling**: codec-token sampling reads the checkpoint `tts_config`
-  and defaults to deterministic seed 42. Stage-1 deploy sampling parameters
-  control only vLLM's binary continue/stop token.
+- **Talker sampling**: Stage 1's `default_sampling_params` in the deploy
+  YAML set the Talker's codec sampling (temperature, top-p, top-k,
+  repetition penalty, `min_tokens`, seed). A stage-1 entry in a request's
+  `sampling_params_list` overrides only the fields it names and keeps the
+  other deploy defaults.
 
 - **Output audio**: 24 kHz mono. On `/v1/chat/completions` it is base64 WAV
   inside the OpenAI-style `message.audio.data` (the Gradio demo's WAV player
   decodes this automatically); on a duplex session it streams as base64
   `response.audio.delta` events; offline `Omni.generate` returns WAV.
-- **Response choices**: on `/v1/chat/completions` text and audio are separate
-  choices. SDK clients should select the choice whose `message.audio.data` is
-  populated rather than assuming `choices[0]` contains audio.
+- **Response choices**: on non-streaming `/v1/chat/completions` text and audio
+  come back in the same choice (`message.content` and `message.audio.data`).
+  SDK clients should read both fields of a choice rather than treating them
+  as alternatives.
 
 - **Routing**: MiniCPM-o 4.5 and 2.6 both ship `architectures=
   ["MiniCPMO"]` in HF config; routing is disambiguated by

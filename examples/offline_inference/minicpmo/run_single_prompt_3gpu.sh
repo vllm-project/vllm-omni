@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
-# Single-prompt offline run with thinker tensor-parallel (3-GPU layout).
-# Thinker on GPU 0,1 (TP=2); talker + Token2Wav on GPU 2.
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
+# Single-prompt offline run on the 3-GPU layout: one GPU per stage
+# (Thinker on GPU 0, Talker on GPU 1, Code2Wav on GPU 2).
 set -euo pipefail
 cd "$(dirname "$0")"
 
