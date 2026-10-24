@@ -14,7 +14,50 @@ from __future__ import annotations
 
 from typing import Any
 
-from transformers import PretrainedConfig
+from transformers import FalconH1Config, PretrainedConfig
+
+#: Flat ``arktts`` fields forwarded verbatim into ``FalconH1Config`` when the
+#: checkpoint declares ``slow_backbone == "falcon_h1"``. The names are already
+#: shared between the two configs (verified against the 0.1b ``config.json``).
+_HYBRID_PASSTHROUGH_FIELDS = (
+    "attention_bias",
+    "attention_dropout",
+    "attention_in_multiplier",
+    "attention_o_bias",
+    "attention_out_multiplier",
+    "attention_qk_norm",
+    "attention_qkv_bias",
+    "bos_token_id",
+    "expansion_factor",
+    "initializer_range",
+    "key_multiplier",
+    "embedding_multiplier",
+    "lm_head_multiplier",
+    "mamba_chunk_size",
+    "mamba_conv_bias",
+    "mamba_d_conv",
+    "mamba_d_head",
+    "mamba_d_ssm",
+    "mamba_d_state",
+    "mamba_expand",
+    "mamba_n_groups",
+    "mamba_n_heads",
+    "mamba_norm_before_gate",
+    "mamba_proj_bias",
+    "mamba_rms_norm",
+    "mamba_use_mlp",
+    "mlp_bias",
+    "mlp_multipliers",
+    "projectors_bias",
+    "ssm_in_multiplier",
+    "ssm_multipliers",
+    "ssm_out_multiplier",
+    "time_step_floor",
+    "time_step_max",
+    "time_step_min",
+    "time_step_rank",
+    "use_cache",
+)
 
 #: Codec frame stride in waveform samples (encoder rates 2*4*8*8 = 512 times the
 #: quantizer's 2*2 downsample). 44100 / 2048 ~= 21.5 frames per second.
@@ -88,6 +131,52 @@ class Audio8TTSSlowARConfig(PretrainedConfig):
         )
 
 
+class Audio8TTSHybridSlowARConfig(FalconH1Config):
+    """Slow AR config for the hybrid-Mamba2 checkpoint variant (0.1b).
+
+    Subclasses :class:`transformers.FalconH1Config` so the backbone can be
+    handed to vLLM's native ``FalconH1ForCausalLM`` unchanged -- the same
+    wrapping pattern ``nemotron_voicechat_thinker`` uses for
+    ``NemotronHForCausalLM`` -- while still carrying the ``arktts``-specific
+    fields the stage logic reads.
+
+    SCAFFOLD: not yet exercised on hardware. See the design note on issue
+    #6495 for the open parity items (muP scalars, RoPE style, compact head).
+    """
+
+    model_type = "arktts_slow_ar_hybrid"
+
+    def __init__(
+        self,
+        *,
+        codebook_size: int = ARKTTS_SEMANTIC_CODEBOOK_SIZE,
+        num_codebooks: int = 10,
+        semantic_begin_id: int = 65537,
+        semantic_end_id: int = 69632,
+        eos_token_id: int = 228,
+        pad_token_id: int = 0,
+        norm_fastlayer_input: bool = False,
+        **kwargs: Any,
+    ) -> None:
+        self.codebook_size = int(codebook_size)
+        self.num_codebooks = int(num_codebooks)
+        self.semantic_begin_id = int(semantic_begin_id)
+        self.semantic_end_id = int(semantic_end_id)
+        # muP scalars are absent from the 0.6b config (treated as 1.0 there) and
+        # non-trivial on the 0.1b; the audio8 stage code must apply both.
+        self.embedding_multiplier = float(kwargs.get("embedding_multiplier", 1.0))
+        self.lm_head_multiplier = float(kwargs.get("lm_head_multiplier", 1.0))
+        # ``max_seq_len`` is the arktts spelling of the HF field.
+        if "max_seq_len" in kwargs and "max_position_embeddings" not in kwargs:
+            kwargs["max_position_embeddings"] = kwargs.pop("max_seq_len")
+        kwargs.pop("slow_backbone", None)
+        super().__init__(
+            eos_token_id=int(eos_token_id),
+            pad_token_id=int(pad_token_id),
+            **kwargs,
+        )
+
+
 class Audio8TTSFastARConfig(PretrainedConfig):
     """Fast AR config: the ``n_fast_layer`` residual-codebook predictor."""
 
@@ -145,6 +234,7 @@ class Audio8TTSConfig(PretrainedConfig):
         self,
         text_config: dict | Audio8TTSSlowARConfig | None = None,
         fast_ar_config: dict | Audio8TTSFastARConfig | None = None,
+        slow_backbone: str | None = None,
         vocab_size: int = 155776,
         dim: int = 896,
         n_head: int = 14,
@@ -190,6 +280,33 @@ class Audio8TTSConfig(PretrainedConfig):
         if isinstance(fast_ar_config, dict):
             fast_ar_config = Audio8TTSFastARConfig(**fast_ar_config)
 
+        # The 0.1b checkpoint is flat with ``slow_backbone = "falcon_h1"``: build
+        # the hybrid Slow AR config from the same flat fields. NOTE: the
+        # ``sub_configs`` mapping above still points ``text_config`` at the dense
+        # class, so a checkpoint that ships a *nested* text_config dict would
+        # land in the dense class -- the 0.1b does not.
+        if text_config is None and slow_backbone == "falcon_h1":
+            text_config = Audio8TTSHybridSlowARConfig(
+                vocab_size=vocab_size,
+                hidden_size=dim,
+                num_hidden_layers=n_layer,
+                num_attention_heads=n_head,
+                num_key_value_heads=n_local_heads,
+                head_dim=head_dim,
+                intermediate_size=intermediate_size,
+                max_position_embeddings=max_seq_len,
+                rms_norm_eps=norm_eps,
+                rope_theta=rope_base,
+                hidden_act="silu",
+                codebook_size=codebook_size,
+                num_codebooks=num_codebooks,
+                semantic_begin_id=semantic_begin_id,
+                semantic_end_id=semantic_end_id,
+                eos_token_id=eos_token_id,
+                pad_token_id=pad_token_id,
+                **{k: kwargs[k] for k in _HYBRID_PASSTHROUGH_FIELDS if k in kwargs},
+            )
+
         self.text_config = text_config or Audio8TTSSlowARConfig(
             vocab_size=vocab_size,
             dim=dim,
@@ -227,6 +344,7 @@ class Audio8TTSConfig(PretrainedConfig):
         )
 
         # Fields the stages read directly off the top-level config.
+        self.slow_backbone = str(slow_backbone) if slow_backbone is not None else None
         self.codebook_size = int(codebook_size)
         self.num_codebooks = int(num_codebooks)
         self.semantic_begin_id = int(semantic_begin_id)
@@ -263,5 +381,6 @@ __all__ = [
     "ARKTTS_SEMANTIC_CODEBOOK_SIZE",
     "Audio8TTSConfig",
     "Audio8TTSFastARConfig",
+    "Audio8TTSHybridSlowARConfig",
     "Audio8TTSSlowARConfig",
 ]

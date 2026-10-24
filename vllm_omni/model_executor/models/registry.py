@@ -351,6 +351,12 @@ _OMNI_MODELS = {
         "audio8_tts_slow_ar",
         "Audio8TTSSlowARForConditionalGeneration",
     ),
+    ## audio8_tts hybrid variant (Audio8 TTS Preview 0.1B, slow_backbone=falcon_h1)
+    "Audio8TTSHybridSlowARForConditionalGeneration": (
+        "audio8_tts",
+        "audio8_tts_hybrid_slow_ar",
+        "Audio8TTSHybridSlowARForConditionalGeneration",
+    ),
     "Audio8TTSCodecDecoder": (
         "audio8_tts",
         "audio8_tts_codec_decoder",
