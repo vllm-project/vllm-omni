@@ -7,7 +7,9 @@ import asyncio
 import os
 import threading
 import time
+from contextlib import contextmanager
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -23,6 +25,174 @@ from vllm_omni.model_executor.models.moss_tts.reference_encoder import (
 from vllm_omni.utils.speaker_cache import SpeakerEmbeddingCache
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.tts]
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32, None])
+@pytest.mark.parametrize("shared_worker", [False, True])
+@pytest.mark.parametrize("fails", [False, True])
+async def test_npu_eager_encoding_uses_tokenizer_device_and_compute_dtype(
+    make_encoder, monkeypatch, dtype, shared_worker, fails
+):
+    state = {"device": None, "dtype": None}
+    device = SimpleNamespace(type="npu", index=3)
+
+    class Tokenizer(torch.nn.Module):
+        compute_dtype = dtype
+
+        def parameters(self, recurse=True):
+            return iter([SimpleNamespace(device=device)])
+
+    @contextmanager
+    def device_context(selected):
+        assert selected is device
+        state["device"] = selected
+        try:
+            yield
+        finally:
+            state["device"] = None
+
+    @contextmanager
+    def autocast(*, device_type, dtype):
+        assert device_type == "npu"
+        assert state["device"] is device
+        state["dtype"] = dtype
+        try:
+            yield
+        finally:
+            state["dtype"] = None
+
+    proc = _FakeProcessor()
+    if fails:
+        proc.set_fail_values({1})
+    proc.audio_tokenizer = Tokenizer()
+    original = proc.encode_audios_from_wav
+
+    def encode(wavs, sampling_rate, n_vq):
+        assert state["device"] is device
+        assert state["dtype"] == (dtype if dtype in (torch.bfloat16, torch.float16) else None)
+        assert not torch.is_grad_enabled()
+        return original(wavs, sampling_rate, n_vq)
+
+    proc.encode_audios_from_wav = encode
+    monkeypatch.setattr(torch, "get_device_module", lambda name: SimpleNamespace(device=device_context))
+    monkeypatch.setattr(torch, "autocast", autocast)
+    enc = make_encoder(proc)
+    if shared_worker:
+        # Shared host workers call this callback without the local stream wrapper.
+        monkeypatch.setattr(enc, "_graph_capable", lambda: False)
+        callback, warmup = enc._host_workers()[0]
+        assert warmup is None
+    else:
+        callback = enc._encode_shared_or_local
+    result = await asyncio.to_thread(callback, [torch.ones(1, 10)])
+    if fails:
+        assert isinstance(result[0], RuntimeError)
+        assert "content 1" in str(result[0])
+    else:
+        assert torch.equal(result[0], torch.ones((3, _N_VQ), dtype=torch.long))
+    assert state == {"device": None, "dtype": None}
+
+
+async def test_cpu_reference_encoder_does_not_add_autocast(make_encoder, monkeypatch):
+    proc = _FakeProcessor()
+    proc.audio_tokenizer = torch.nn.Linear(1, 1)
+    proc.audio_tokenizer.compute_dtype = torch.bfloat16
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError("CPU encoding must retain the processor's own precision policy")
+
+    monkeypatch.setattr(torch, "autocast", unexpected)
+    monkeypatch.setattr(torch, "get_device_module", unexpected)
+    result = make_encoder(proc)._encode_prepared([torch.ones(1, 10)])
+    assert result[0].dtype == torch.long
+
+
+@pytest.mark.parametrize(
+    "variant,shared,supported,enabled,expected",
+    [
+        ("local", False, True, True, True),
+        ("local", False, True, False, False),
+        ("local", True, True, True, False),
+        ("local", False, False, True, False),
+        ("tts", False, True, True, False),
+        ("realtime", False, True, True, False),
+    ],
+)
+async def test_npu_reference_graph_eligibility(
+    make_encoder, monkeypatch, variant, shared, supported, enabled, expected
+):
+    from vllm_omni.platforms.npu.graph_tools import NPUExactGraphRunner
+
+    class Tokenizer(torch.nn.Module):
+        def parameters(self, recurse=True):
+            return iter([SimpleNamespace(device=SimpleNamespace(type="npu", index=3))])
+
+        def _codec_inference_autocast(self):
+            raise AssertionError("Eligibility must not execute the tokenizer")
+
+    monkeypatch.setattr(NPUExactGraphRunner, "is_supported", staticmethod(lambda: supported))
+    monkeypatch.setenv("VLLM_OMNI_MOSS_REF_SHARED_ENCODER", "1")
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError("NPU must not install CUDA FlashAttention")
+
+    monkeypatch.setattr(
+        "vllm_omni.model_executor.models.moss_tts.reference_encoder.install_windowed_attention", unexpected
+    )
+    proc = _FakeProcessor()
+    proc.audio_tokenizer = Tokenizer()
+    enc = make_encoder(proc, variant=variant)
+    enc._graphs_enabled = enabled
+    enc._shares_encoder = shared
+    assert enc._graph_capable() is expected
+
+
+async def test_npu_reference_graph_capture_failure_retains_failed_runner(make_encoder, monkeypatch):
+    from vllm_omni.platforms.npu.models import moss_tts_reference_encoder_graphs as backend
+
+    class Tokenizer(torch.nn.Module):
+        def parameters(self, recurse=True):
+            return iter([SimpleNamespace(device=SimpleNamespace(type="npu", index=3))])
+
+    class FailedGraphs:
+        calls = 0
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def capture(self):
+            self.calls += 1
+            raise RuntimeError("capture failed")
+
+    proc = _FakeProcessor()
+    proc.audio_tokenizer = Tokenizer()
+    enc = make_encoder(proc)
+    monkeypatch.setattr(enc, "_graph_capable", lambda: True)
+    monkeypatch.setattr(backend, "MossNPUReferenceEncoderGraphs", FailedGraphs)
+    with pytest.raises(RuntimeError, match="capture failed"):
+        enc._reference_graphs()
+    failed = enc._graphs
+    assert failed is not None
+    assert enc._reference_graphs() is failed
+    assert failed.calls == 1
+
+
+async def test_npu_reference_graph_miss_uses_original_prepared_clip(make_encoder, monkeypatch):
+    proc = _FakeProcessor()
+    enc = make_encoder(proc)
+    hit = torch.full((2, _N_VQ), 9, dtype=torch.long)
+
+    class Graphs:
+        def encode(self, wavs):
+            assert torch.equal(wavs[0], torch.full((1, 10), 101.0))
+            return [None, hit]
+
+    monkeypatch.setattr(enc, "_finish_prepare", lambda wav: wav + 100)
+    outputs = enc._encode_prepared([torch.ones(1, 10), torch.full((1, 10), 2.0)], Graphs())
+    assert torch.equal(outputs[0], torch.ones((3, _N_VQ), dtype=torch.long))
+    assert outputs[1] is hit
+    assert proc.total_items == 1
+
 
 _SR = 24000
 _N_VQ = 4

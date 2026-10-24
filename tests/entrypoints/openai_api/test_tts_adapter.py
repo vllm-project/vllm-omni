@@ -646,8 +646,22 @@ def _moss_adapter_with_stage_configs(stage_configs, mocker):
 
 
 def _moss_cuda_available(mocker, device_count=8):
-    mocker.patch("torch.cuda.is_available", return_value=True)
-    mocker.patch("torch.accelerator.device_count", return_value=device_count)
+    return _moss_omni_platform(mocker, "cuda", device_count)
+
+
+def _moss_omni_platform(mocker, backend, device_count=8):
+    platform = mocker.Mock()
+    platform.is_cuda.return_value = backend == "cuda"
+    platform.is_rocm.return_value = backend == "rocm"
+    platform.is_npu.return_value = backend == "npu"
+    platform.get_device_count.return_value = device_count
+    platform.device_type = "cuda" if backend == "rocm" else backend
+    # CPU-only torch cannot construct an NPU device without torch_npu.
+    platform.get_torch_device.side_effect = lambda index: (
+        SimpleNamespace(type="npu", index=index) if backend == "npu" else torch.device(platform.device_type, index)
+    )
+    mocker.patch("vllm_omni.platforms.current_omni_platform", platform)
+    return platform
 
 
 @pytest.mark.parametrize(
@@ -706,11 +720,52 @@ def test_moss_ref_encoder_device_cpu_when_cuda_unavailable(mocker):
     import torch
 
     mocker.patch("torch.cuda.is_available", return_value=False)
+    _moss_omni_platform(mocker, "cpu", device_count=0)
     adapter = _moss_adapter_with_stage_configs(
         [SimpleNamespace(model_stage="moss_tts_local_codec", runtime_config=SimpleNamespace(devices="3"))],
         mocker,
     )
     assert adapter._resolve_ref_encoder_device() == torch.device("cpu")
+
+
+@pytest.mark.parametrize("devices,index", [("3,4", 3), (None, 0), ("", 0)])
+def test_moss_ref_encoder_device_follows_npu_codec_stage(devices, index, mocker):
+    mocker.patch("torch.cuda.is_available", return_value=False)
+    platform = _moss_omni_platform(mocker, "npu")
+    adapter = _moss_adapter_with_stage_configs(
+        [SimpleNamespace(model_stage="moss_tts_local_codec", runtime={"devices": devices})], mocker
+    )
+    device = adapter._resolve_ref_encoder_device()
+    assert (device.type, device.index) == ("npu", index)
+    platform.get_torch_device.assert_called_once_with(index)
+
+
+@pytest.mark.parametrize("devices,count", [("3", 2), (None, 0), ("cpu", 8), ("npu:0", 8), ("-1", 8)])
+def test_moss_ref_encoder_device_npu_cpu_fallback(devices, count, mocker):
+    platform = _moss_omni_platform(mocker, "npu", device_count=count)
+    adapter = _moss_adapter_with_stage_configs(
+        [SimpleNamespace(model_stage="moss_tts_local_codec", runtime={"devices": devices})], mocker
+    )
+    assert adapter._resolve_ref_encoder_device() == torch.device("cpu")
+    platform.get_torch_device.assert_not_called()
+
+
+def test_moss_ref_encoder_device_preserves_rocm(mocker):
+    _moss_cuda_available(mocker)
+    _moss_omni_platform(mocker, "rocm")
+    adapter = _moss_adapter_with_stage_configs(
+        [SimpleNamespace(model_stage="moss_tts_local_codec", runtime={"devices": "2"})], mocker
+    )
+    assert adapter._resolve_ref_encoder_device() == torch.device("cuda:2")
+
+
+@pytest.mark.parametrize("variant", ["realtime", "tts", "ttsd", "sound_effect", "voice_generator"])
+def test_moss_ref_encoder_device_keeps_other_npu_variants_on_cpu(variant, mocker):
+    platform = _moss_omni_platform(mocker, "npu")
+    adapter = _moss_adapter_with_stage_configs([], mocker)
+    adapter._moss_variant = variant
+    assert adapter._resolve_ref_encoder_device() == torch.device("cpu")
+    platform.get_device_count.assert_not_called()
 
 
 def test_moss_ref_encoder_device_cpu_when_index_out_of_range(mocker):
