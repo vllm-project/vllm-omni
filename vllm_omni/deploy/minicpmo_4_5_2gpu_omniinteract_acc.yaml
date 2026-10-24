@@ -1,0 +1,20 @@
+# Opt-in 2-GPU profile for MiniCPM-o OmniInteract Accuracy at concurrency 8.
+# Thinker on GPU 0; Talker and Code2Wav share GPU 1. Stock
+# minicpmo_4_5_2gpu.yaml stays at max_sessions: 4 / idle 300s.
+# duplex_session is replaced, not deep-merged.
+base_config: minicpmo_4_5_2gpu.yaml
+duplex_session:
+  max_sessions: 8
+  idle_ttl_s: 300
+stages:
+  - stage_id: 0
+    max_num_seqs: 8
+    interleave_mm_strings: true
+    media_io_kwargs:
+      video:
+        fps: 1
+        num_frames: 128
+  - stage_id: 1
+    max_num_seqs: 8
+  - stage_id: 2
+    max_num_seqs: 8
