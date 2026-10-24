@@ -288,6 +288,43 @@ def test_tf32_mode_is_resolved_once_and_reused(tmp_path, monkeypatch, device_pla
     assert model._tf32_mode == "off"
 
 
+@pytest.mark.parametrize("platform", ["cuda", "npu", "cpu"])
+@pytest.mark.parametrize("precision_flag", ["token2wav_float16", "cfm_float16"])
+@pytest.mark.parametrize("value", [True, "true", False, "false"])
+@pytest.mark.parametrize("tf32_source", ["extra", "env"])
+def test_fused_body_default_with_tf32_disabled(tmp_path, monkeypatch, platform, precision_flag, value, tf32_source):
+    monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: platform == "cuda")
+    monkeypatch.setattr(current_omni_platform, "is_npu", lambda: platform == "npu")
+    monkeypatch.delenv("MINICPMO_CODE2WAV_TF32", raising=False)
+    extra = {precision_flag: value}
+    if tf32_source == "env":
+        monkeypatch.setenv("MINICPMO_CODE2WAV_TF32", "off")
+    else:
+        extra["token2wav_allow_tf32"] = False
+
+    model, _ = _build_backend(tmp_path, monkeypatch, extra)
+
+    assert model._tf32_mode == "off"
+    expected = platform == "npu" or (platform == "cuda" and value in (True, "true"))
+    assert model.backend.kwargs["cfm_graph_config"]["fused_body"] is expected
+    assert model.backend.kwargs["cfm_tf32"] is False
+
+
+@pytest.mark.parametrize("precision_flag", ["token2wav_float16", "cfm_float16"])
+@pytest.mark.parametrize("value,expected", [(True, True), ("true", True), (False, False), ("false", False)])
+def test_fp16_fused_body_explicit_override(tmp_path, monkeypatch, precision_flag, value, expected):
+    monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(current_omni_platform, "is_npu", lambda: False)
+    monkeypatch.setenv("MINICPMO_CODE2WAV_TF32", "off")
+    model, _ = _build_backend(
+        tmp_path,
+        monkeypatch,
+        {precision_flag: True, "cfm_fused_body": value},
+    )
+    assert model.backend.kwargs["cfm_graph_config"]["fused_body"] is expected
+    assert model.backend.kwargs["cfm_tf32"] is False
+
+
 @pytest.mark.parametrize("value,enabled", [(True, True), ("true", True), (False, False), ("false", False)])
 def test_speaker_graph_flag_reaches_selected_backend(tmp_path, monkeypatch, value, enabled):
     monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: True)

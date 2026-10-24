@@ -12,6 +12,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5.dit_fused import (
     blocks_forward_chunk_fused,
     dit_modulation,
     supports_fused_body,
+    tiled_attention_supported,
 )
 
 pytestmark = [pytest.mark.core_model, *hardware_marks(res={"cuda": "L4"}, num_cards=1)]
@@ -100,11 +101,23 @@ def test_ragged_body_reuses_modulation_without_recomputing_adaln(monkeypatch, ca
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_fp16_fused_body_matches_fp16_ragged_body(monkeypatch):
+    from vllm_omni.model_executor.models.minicpmo_4_5.cfm_attention import cfm_attention
+
     estimator = _upstream_dit("cuda").half()
     driver = BatchedToken2Wav.__new__(BatchedToken2Wav)
     nn.Module.__init__(driver)
     driver._ragged_fused_body = True
     calls = []
+    attention_calls = []
+
+    def tiled(*args, **kwargs):
+        attention_calls.append(True)
+        return cfm_attention(*args, **kwargs)
+
+    monkeypatch.setattr(
+        "vllm_omni.model_executor.models.minicpmo_4_5.cfm_attention.cfm_attention",
+        tiled,
+    )
 
     def fused(*args, **kwargs):
         calls.append(True)
@@ -125,6 +138,7 @@ def test_fp16_fused_body_matches_fp16_ragged_body(monkeypatch):
         )
         actual = _run(driver._ragged_body, estimator, rows=4, frames=6, cached=5, lengths=[6, 4])
     assert calls, "FP16 service dispatch must use the fused body"
+    assert bool(attention_calls) == tiled_attention_supported(torch.accelerator.current_device_index())
     for want, got in zip(expected, actual, strict=True):
         torch.testing.assert_close(got, want, rtol=2e-3, atol=2e-3)
 
@@ -157,3 +171,81 @@ def test_cfm_only_fp16_preserves_encoder_precision_and_returns_half_caches():
         )
     assert mel.dtype == cnn.dtype == att.dtype == torch.float16
     assert token2wav.flow.encoder.anchor.dtype == torch.float32
+
+
+@pytest.mark.skipif("cuda" not in _DEVICES, reason="requires CUDA")
+@pytest.mark.parametrize("precision_flag", ["cfm_float16", "token2wav_float16"])
+@pytest.mark.parametrize("tf32_source", ["extra", "env"])
+def test_tf32_disabled_fp16_default_initializes_fused_body(tmp_path, monkeypatch, caplog, precision_flag, tf32_source):
+    from tests.model_executor.models.minicpmo_4_5.test_code2wav_batching import _config, _FakeToken2Wav
+    from vllm_omni.model_executor.models.minicpmo_4_5 import (
+        batched_token2wav,
+        minicpmo_4_5_token2wav,
+    )
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_code2wav import MiniCPMO45Code2Wav
+
+    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
+    monkeypatch.setattr(torch.backends.cudnn, "allow_tf32", False)
+    monkeypatch.delenv("MINICPMO_CODE2WAV_TF32", raising=False)
+    config = _config()
+    config.model_config.model = str(tmp_path)
+    extra = config.model_config.stage_connector_config["extra"]
+    extra.pop("prompt_wav")
+    extra.update({precision_flag: True, "enable_cfm_graph": True, "token2wav_device_spk": False})
+    if tf32_source == "env":
+        monkeypatch.setenv("MINICPMO_CODE2WAV_TF32", "off")
+    else:
+        extra["token2wav_allow_tf32"] = False
+    (tmp_path / "assets" / "token2wav").mkdir(parents=True)
+    (tmp_path / "assets" / "HT_ref_audio.wav").touch()
+
+    def load_assets(path, **kwargs):
+        token2wav = _FakeToken2Wav()
+        token2wav.float16 = kwargs["float16"]
+        token2wav.flow.encoder.register_parameter("anchor", nn.Parameter(torch.ones(1, device="cuda")))
+        token2wav.flow.decoder.estimator = _upstream_dit("cuda")
+        token2wav.flow.decoder.rand_noise = torch.randn(1, 80, 100, device="cuda")
+        # Match the asset loader's full-flow conversion. CFM-only conversion
+        # must instead happen in the real BatchedToken2Wav constructor below.
+        if token2wav.float16:
+            token2wav.flow.half()
+        return token2wav
+
+    monkeypatch.setattr(minicpmo_4_5_token2wav, "MiniCPMO45Token2wav", load_assets)
+    monkeypatch.setattr(batched_token2wav.logger, "propagate", True)
+    model = MiniCPMO45Code2Wav(vllm_config=config)
+    model._build_backend()
+    backend = model.backend
+    assert isinstance(backend, BatchedToken2Wav)
+    assert model._tf32_mode == "off"
+    assert not backend._cfm_tf32
+    assert backend._ragged_fused_body
+    assert "cfm_fused_body requested but unsupported here" not in caplog.text
+    assert backend._estimator_att_compute_dtype == backend._estimator_att_cache_dtype == torch.float16
+    estimator = backend.flow.decoder.estimator
+    assert all(p.dtype == torch.float16 for p in estimator.parameters())
+    encoder_dtype = torch.float32 if precision_flag == "cfm_float16" else torch.float16
+    assert backend.flow.encoder.anchor.dtype == encoder_dtype
+
+    fused_calls = []
+
+    def fused(*args, **kwargs):
+        assert not torch.backends.cuda.matmul.allow_tf32
+        assert not torch.backends.cudnn.allow_tf32
+        fused_calls.append(True)
+        return blocks_forward_chunk_fused(*args, **kwargs)
+
+    monkeypatch.setattr(batched_token2wav, "blocks_forward_chunk_fused", fused)
+    with torch.inference_mode(), backend._cfm_autocast(next(estimator.parameters()).device):
+        expected = _run(
+            BatchedToken2Wav._blocks_forward_chunk_ragged,
+            estimator,
+            rows=4,
+            frames=6,
+            cached=5,
+            lengths=[6, 4],
+        )
+        actual = _run(backend._ragged_body, estimator, rows=4, frames=6, cached=5, lengths=[6, 4])
+    assert fused_calls
+    for want, got in zip(expected, actual, strict=True):
+        torch.testing.assert_close(got, want, rtol=2e-3, atol=2e-3)

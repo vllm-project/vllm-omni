@@ -23,11 +23,12 @@ not establish duplex performance or interruption correctness.
 
 The shared Code2Wav backend defaults to the fused CFM body on both CUDA and
 NPU, subject to architecture and attention-cache eligibility. CUDA accepts
-matching FP32 or FP16 estimator/cache types; NPU retains FP32 eligibility. CUDA also
-requires TF32 to be allowed; NPU fusion is independent of TF32. Set
+matching FP32 or FP16 estimator/cache types; NPU retains FP32 eligibility. CUDA
+FP32 fusion requires TF32 to be allowed. With `token2wav_float16: true` or
+`cfm_float16: true`, CUDA fusion is independent of TF32, as is NPU fusion. Set
 `cfm_fused_body: false` in the stage connector extra to restore the original
 body. On CUDA, disabling `token2wav_allow_tf32` or setting
-`MINICPMO_CODE2WAV_TF32=off` also disables the default fusion choice; an explicit
+`MINICPMO_CODE2WAV_TF32=off` disables the default fusion choice only for FP32; an explicit
 `cfm_fused_body` setting takes precedence. Startup precapture includes query
 buckets for final chunks with encoder lookahead, after steady-state buckets
 and within `cfm_max_graphs`. Capture logs report host warmup and capture times.
@@ -44,14 +45,16 @@ apply to V1 when async chunking/scheduling is enabled. Default V1 behavior must
 therefore be included in end-to-end regression validation.
 
 CFM graph execution defaults to the fused DiT body on CUDA (when TF32 is
-allowed) and on NPU. NVIDIA SM80+ uses tiled TF32 attention; older CUDA devices
-use the fused body's SDPA fallback. NPU uses packed QKV, in-place KV and ACLNN
+allowed or FP16 CFM is selected) and on NPU. NVIDIA SM80+ uses the existing
+tiled attention kernel for both FP32 and FP16 Q/K/V, including the non-pooled
+CFM arena. FP32 uses TF32 dots; FP16 uses FP16 dots with FP32 accumulation.
+Older CUDA devices use the fused body's SDPA fallback. NPU uses packed QKV, in-place KV and ACLNN
 AddLayerNorm, independent of TF32. Unsupported DiT layouts and cache types
 retain the original body. CUDA supports matching FP32 or FP16 estimator/cache
 types; NPU supports FP32. Other platforms retain their existing default.
 Set `cfm_fused_body: false` in connector `extra` to restore the original body.
 On CUDA, disabling TF32 with `token2wav_allow_tf32: false` or
-`MINICPMO_CODE2WAV_TF32=off` also disables the default fusion choice; an explicit
+`MINICPMO_CODE2WAV_TF32=off` disables the default fusion choice only for FP32; an explicit
 `cfm_fused_body: true` overrides that choice and may use TF32 attention.
 Slot pooling and its `cfm_row_offset_merge` option remain opt-in. Fusion changes
 floating-point rounding and does not promise identical waveforms.
