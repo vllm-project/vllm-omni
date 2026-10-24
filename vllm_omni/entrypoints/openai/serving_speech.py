@@ -2224,6 +2224,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             validation_error = validate_tts_request(adapter, request)
             if validation_error:
                 raise ValueError(validation_error)
+            if request.temperature is not None and not adapter.supports_temperature:
+                raise ValueError(f"Model '{adapter.name}' does not support 'temperature'")
             prepared = await adapter.build(request, sampling_params_list, has_inline_ref_audio)
             prompt = prepared.prompt
             tts_params = prepared.tts_params
@@ -2264,9 +2266,17 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             text = request.input[: max(cap - base_len, 0)]
             logger.debug("TTS speech request %s: text=%r", request_id, text)
 
+        # Top-level temperature takes precedence over the legacy extra_params
+        # spelling. Merge into a request-local dict so both sampling consumers
+        # see the same value without mutating the caller's request.
+        extra_params = request.extra_params
+        if request.temperature is not None:
+            extra_params = dict(extra_params or {})
+            extra_params["temperature"] = request.temperature
+
         # Apply model-specific extra parameters
-        if request.extra_params is not None and sampling_params_list:
-            if not isinstance(request.extra_params, dict):
+        if extra_params is not None and sampling_params_list:
+            if not isinstance(extra_params, dict):
                 raise HTTPException(
                     status_code=HTTPStatus.BAD_REQUEST.value,
                     detail="extra_params must be a JSON object/dict.",
@@ -2275,12 +2285,12 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
             sampling_params_list = copy.deepcopy(sampling_params_list)
             for name in ("temperature", "top_p", "top_k"):
-                if (value := request.extra_params.get(name)) is not None:
+                if (value := extra_params.get(name)) is not None:
                     setattr(sampling_params_list[0], name, value)
             if sampling_params_list[0].extra_args is None:
                 sampling_params_list[0].extra_args = {}
-            sampling_params_list[0].extra_args.update(request.extra_params)
-            logger.info("Applied extra_params: %s", request.extra_params)
+            sampling_params_list[0].extra_args.update(extra_params)
+            logger.info("Applied extra_params: %s", extra_params)
 
         # Apply adapter-owned sampling overrides, including request-level token
         # limits and model-specific dynamic token or stop-token configuration.
@@ -2614,6 +2624,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 cap = raw_max if isinstance(raw_max, int) else 200
                 text = request.input[: max(cap - base_len, 0)]
                 logger.debug("Diffusion TTS speech request %s: text=%r", request_id, text)
+            if request.temperature is not None:
+                raise ValueError("Diffusion TTS models do not support 'temperature'")
             if request.extra_params is not None and not isinstance(request.extra_params, dict):
                 raise ValueError("extra_params must be a JSON object/dict.")
             extra = dict(request.extra_params or {})

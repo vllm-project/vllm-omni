@@ -193,6 +193,15 @@ class OpenAICreateSpeechRequest(BaseModel):
         le=_INT64_MAX,
         description="Maximum tokens to generate",
     )
+    temperature: float | None = Field(
+        default=None,
+        ge=0.0,
+        allow_inf_nan=False,
+        description=(
+            "Sampling temperature for the first autoregressive stage; 0 selects greedy sampling. "
+            "Overrides extra_params.temperature when provided; otherwise keeps the configured default."
+        ),
+    )
     seed: int | None = Field(
         default=None,
         ge=_INT64_MIN,

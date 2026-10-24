@@ -18,6 +18,9 @@ if TYPE_CHECKING:
 class VoxtralTTSAdapter(ARTTSAdapter):
     stage_keys = frozenset({"audio_generation"})
     name = "voxtral_tts"
+    # Stage-0 logits are fixed (audio-token / EOS); acoustic frames come from
+    # the flow-matching transformer, so SamplingParams.temperature has no effect.
+    supports_temperature = False
 
     def __init__(self, ctx) -> None:
         super().__init__(ctx)

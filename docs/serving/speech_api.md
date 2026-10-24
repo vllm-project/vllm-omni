@@ -148,6 +148,7 @@ Content-Type: application/json
 | `language` | string | "Auto" | Language (see supported languages below) |
 | `instructions` | string | "" | Voice style/emotion instructions |
 | `max_new_tokens` | integer | 2048 | Maximum tokens to generate |
+| `temperature` | float | null | Sampling temperature for the first autoregressive stage. Must be finite and nonnegative; `0` selects greedy sampling. A non-null top-level value overrides `extra_params.temperature`; otherwise the legacy nested value or deployment default is used. Does not change Qwen3-TTS residual Code Predictor sampling. Models whose generation does not consume it (MiniMax Music 3, OmniVoice, VoxCPM2, Voxtral TTS, Ming TTS / Ming-flash-omni TTS, MOSS-TTS family, Higgs Audio v2) and pure-diffusion TTS deployments reject this field with HTTP 400. For Audex with `cfg_scale > 1`, an explicit value overrides the tuned default of 0.05. |
 | `initial_codec_chunk_frames` | integer | null | Per-request initial chunk size override for TTFA tuning. When null, IC is computed dynamically based on server load. |
 | `non_streaming_mode` | bool | null | Qwen3-TTS prompt construction mode override. Does not affect HTTP response streaming or async-chunk pipelining. When null, Qwen3-TTS uses model defaults: Base=false, CustomVoice/VoiceDesign=true. |
 | `stream` | bool | false | When true, stream OpenAI `speech.audio.*` SSE events (requires `response_format="pcm"` or `"wav"`). For raw PCM/WAV byte streaming, set `stream_format="audio"`. |
