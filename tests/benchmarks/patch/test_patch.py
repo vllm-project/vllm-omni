@@ -7,8 +7,10 @@ Unit tests for patch.py
 
 import asyncio
 import base64
+import io
 import json
 import time
+import wave
 from argparse import Namespace
 from types import SimpleNamespace
 
@@ -2307,3 +2309,45 @@ async def test_benchmark_preserves_stage_metrics_request_order_and_missing_snaps
 def test_compact_request_stage_metrics_drops_empty_snapshots(snapshot):
     """Empty chat-omni snapshots must not make every result persist request_stage_metrics."""
     assert patch._compact_request_stage_metrics(snapshot) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid_kind", ["empty", "malformed_wav", "empty_wav", "invalid_base64", "inconsistent_wav"])
+async def test_chat_audio_timing_ignores_unplayable_chunks(mocker: MockerFixture, invalid_kind: str):
+    def wav_content(frames: int, rate: int = 24000) -> str:
+        buffer = io.BytesIO()
+        with wave.open(buffer, "wb") as writer:
+            writer.setnchannels(1)
+            writer.setsampwidth(2)
+            writer.setframerate(rate)
+            writer.writeframes(b"\x00\x00" * frames)
+        return base64.b64encode(buffer.getvalue()).decode()
+
+    invalid = {
+        "empty": "",
+        "malformed_wav": base64.b64encode(b"not a wav").decode(),
+        "empty_wav": wav_content(0),
+        "invalid_base64": "!!!!",
+        "inconsistent_wav": wav_content(24000, 48000),
+    }[invalid_kind]
+    # Empty/invalid leading packets must not start TTFA; dropped trailing
+    # packets must not extend the generation interval used by RTF.
+    leading = "" if invalid_kind == "inconsistent_wav" else invalid
+    events = [("audio", leading), ("text", "hello"), ("audio", wav_content(24000)), ("audio", invalid)]
+    chunks = [
+        create_sse_chunk({"modality": modality, "choices": [{"delta": {"content": content}}]})
+        for modality, content in events
+    ]
+    session = mocker.Mock()
+    session.post.return_value = MockResponse(200, chunks + [b"data: [DONE]\n\n"])
+    mocker.patch.object(patch, "time", SimpleNamespace(perf_counter=iter([10.0, 11.0, 12.0, 13.0, 14.0]).__next__))
+
+    output = await async_request_openai_chat_omni_completions(_seed_tts_request_func_input(), session)
+
+    assert output.success
+    assert output.audio_ttfp == pytest.approx(3.0)
+    assert output.audio_duration == pytest.approx(1.0)
+    assert output.audio_rtf == pytest.approx(3.0)
+    assert output.audio_frames == 24000
+    assert output.generated_text == "hello"
+    assert output.ttft == pytest.approx(2.0)

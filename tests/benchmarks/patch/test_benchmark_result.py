@@ -3,6 +3,7 @@
 
 """Verify metric sample counts survive benchmark JSON serialization."""
 
+import argparse
 import asyncio
 import json
 import time
@@ -128,3 +129,84 @@ def test_benchmark_result_flattens_duplex_per_response_latency(monkeypatch):
     assert saved_result["mean_duplex_client_ttfp_ms"] == pytest.approx(600.0)
     assert saved_result["mean_duplex_response_ttft_ms"] == pytest.approx(60.0)
     assert saved_result["p99_duplex_client_ttft_ms"] == pytest.approx(320.0)
+
+
+@pytest.mark.parametrize(
+    "selected_metrics,has_audio",
+    [("audio_ttfp,audio_rtf", True), ("audio_ttfp", False), ("ttft", True), ("ttft", False)],
+)
+def test_audio_request_metrics_survive_detailed_result_save(monkeypatch, tmp_path, selected_metrics, has_audio):
+    from vllm.benchmarks import serve as upstream_serve
+
+    from vllm_omni.benchmarks import serve
+    from vllm_omni.entrypoints.cli.benchmark.serve import OmniBenchmarkServingSubcommand
+
+    requests = [SampleRequest(prompt="hi", prompt_len=2, expected_output_len=3, request_id=f"r{i}") for i in range(3)]
+    outputs = [
+        patch.MixRequestFuncOutput(
+            success=True,
+            latency=0.5,
+            audio_ttfp=0.1 if has_audio else 0.0,
+            audio_rtf=0.2 if has_audio else 0.0,
+            audio_duration=2.0 if has_audio else 0.0,
+            audio_frames=48000 if has_audio else 0,
+        ),
+        patch.MixRequestFuncOutput(success=True, latency=0.7),
+        patch.MixRequestFuncOutput(
+            success=False, error="stream failed", latency=0.8, audio_ttfp=float("nan"), audio_rtf=float("inf")
+        ),
+    ]
+
+    async def request_func(request_func_input, session, pbar=None):
+        output = outputs[int(request_func_input.request_id[1:])]
+        output.start_time = time.perf_counter()
+        return output
+
+    monkeypatch.setattr(upstream_serve, "get_samples", lambda args, tokenizer: requests)
+    monkeypatch.setitem(patch.ASYNC_REQUEST_FUNCS, "openai-chat-omni", request_func)
+    parser = argparse.ArgumentParser()
+    OmniBenchmarkServingSubcommand.add_cli_args(parser)
+    args = parser.parse_args(
+        [
+            "--model",
+            "test-model",
+            "--backend",
+            "openai-chat-omni",
+            "--skip-tokenizer-init",
+            "--disable-tqdm",
+            "--num-prompts",
+            "3",
+            "--num-warmups",
+            "0",
+            "--max-concurrency",
+            "1",
+            "--ready-check-timeout-sec",
+            "0",
+            "--percentile-metrics",
+            selected_metrics,
+            "--save-result",
+            "--save-detailed",
+            "--result-dir",
+            str(tmp_path),
+            "--result-filename",
+            "audio.json",
+        ]
+    )
+    result = serve.main(args)
+    saved = json.loads((tmp_path / "audio.json").read_text())
+    if not has_audio and selected_metrics == "ttft":
+        assert "audio_request_metrics" not in saved
+        return
+    rows = saved["audio_request_metrics"]
+    assert rows == result["audio_request_metrics"]
+    assert [row["request_index"] for row in rows] == [0, 1, 2]
+    assert [row["request_id"] for row in rows] == ["r0", "r1", "r2"]
+    assert all(row["start_time"] > 0 for row in rows)
+    assert [row["success"] for row in rows] == [True, True, False]
+    assert [row["latency"] for row in rows] == [0.5, 0.7, 0.8]
+    assert rows[2]["error"] == "stream failed"
+    fields = ("audio_ttfp", "audio_rtf", "audio_duration", "audio_frames")
+    expected_audio: list[float | None] = [0.1, 0.2, 2.0, 48000] if has_audio else [None] * 4
+    assert [rows[0][field] for field in fields] == expected_audio
+    assert all(row[field] is None for row in rows[1:] for field in fields)
+    json.dumps(rows, allow_nan=False)
