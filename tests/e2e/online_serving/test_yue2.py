@@ -317,7 +317,7 @@ async def test_yue2_preemption_and_synthesis_abort(chunked, enforce_eager, monke
                         "cudagraph_mode": "NONE" if enforce_eager else "FULL_AND_PIECEWISE",
                     },
                     "enable_chunked_prefill": chunked,
-                    "async_scheduling": True,
+                    "async_scheduling": False,
                     "max_num_batched_tokens": 256 if chunked else 1024,
                     "max_model_len": 1000,
                     "num_gpu_blocks_override": 64,
