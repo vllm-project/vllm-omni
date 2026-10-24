@@ -154,6 +154,9 @@ class OmniEngineCoreOutput(EngineCoreOutput):
     num_generation_tokens: int | None = None
     # Coalesced decode steps have no recoverable per-step ITL samples.
     is_coalesced: bool = False
+    # Engine-core monotonic time at which the stage's input gate first saw the
+    # request's input ready. Sent with the engine-core events (QUEUED, SCHEDULED).
+    input_ready_ts: float | None = None
 
 
 class OmniEngineCoreOutputs(EngineCoreOutputs):

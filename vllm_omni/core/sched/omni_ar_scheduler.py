@@ -748,6 +748,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # requests in the waiting/running queues temporarily.
         self._drop_aborted_queued_requests()
         self._process_pending_omni_inputs(model_mode="ar")
+        # Upstream schedule() takes its SCHEDULED timestamp after this.
+        self._stamp_input_ready(time.monotonic())
         self._drop_aborted_queued_requests()
         self._resync_streaming_input_counter()
         # Talker K-frame guard: a step whose decode spans would be uneven

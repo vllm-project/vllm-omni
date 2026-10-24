@@ -228,6 +228,12 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
             self.input_coordinator = OmniSchedulingCoordinator(
                 stage_id=getattr(model_config, "stage_id", 0),
             )
+        # The gates above hold a request until its stage input arrives only
+        # after stage 0 (both return early for stage 0).
+        self._gates_stage_input = getattr(model_config, "stage_id", 0) != 0 and (
+            self.input_coordinator is not None
+            or (self.chunk_transfer_adapter is not None and stage_receives_chunks(model_config))
+        )
         self._latest_omni_connector_output: OmniConnectorOutput | None = None
         self._init_omni_connector_output_inbox()
         self._pending_data_plane_terminal_req_ids: set[str] = set()
@@ -467,6 +473,28 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
             self._reset_ready_async_chunk_replacements()
             self._process_pending_chunk_timeouts()
             self._log_failed_chunk_sends()
+
+    def _stamp_input_ready(self, now: float) -> None:
+        """Record when each request's first stage input was seen ready.
+
+        Call right after ``_process_pending_omni_inputs``, with a time no
+        later than the SCHEDULED timestamp of the same step.
+
+        A downstream stage can hold a request before its input exists: the
+        async-chunk prewarm submits it together with stage 0, and a
+        full-payload stage waits for the connector. The input gates park such
+        a request outside the waiting queues until its input lands, so a
+        request left in a waiting queue as ``WAITING`` after the gates ran has
+        its input ready. Only the first time is kept; waits for later chunks
+        are not recorded. The time leaves with the engine-core events (see
+        ``_make_omni_engine_output``) and splits ``vllm_queued_ms``.
+        """
+        if not (getattr(self, "log_stats", False) and getattr(self, "_gates_stage_input", False)):
+            return
+        for request_queue in (self.kv_holding_waiting, self.waiting):
+            for request in request_queue:
+                if request.status == RequestStatus.WAITING and getattr(request, "omni_input_ready_ts", None) is None:
+                    request.omni_input_ready_ts = now
 
     def _process_chunk_receive_failures(self) -> None:
         """Fail requests whose consumed streaming input violated its contract."""
@@ -832,6 +860,7 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
         if isinstance(pooling_output, dict):
             pooling_output_payload = serialize_additional_information(pooling_output)
             pooling_output = None
+        events = request.take_events()
 
         return OmniEngineCoreOutput(
             request_id=request.request_id,
@@ -844,7 +873,8 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
             pooling_output_payload=pooling_output_payload,
             multimodal_output=multimodal_output,
             stop_reason=stop_reason,
-            events=request.take_events(),
+            events=events,
+            input_ready_ts=getattr(request, "omni_input_ready_ts", None) if events else None,
             prefill_stats=prefill_stats,
             kv_transfer_params=kv_transfer_params,
             ec_transfer_params=ec_transfer_params,

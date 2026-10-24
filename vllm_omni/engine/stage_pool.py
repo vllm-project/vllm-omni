@@ -793,6 +793,8 @@ class StagePool:
         stage_metrics.vllm_prefill_ms = native_text_metrics.get(defs.VLLM_PREFILL_MS)
         stage_metrics.vllm_decode_ms = native_text_metrics.get(defs.VLLM_DECODE_MS)
         stage_metrics.vllm_num_preemptions = native_text_metrics.get(defs.VLLM_NUM_PREEMPTIONS)
+        stage_metrics.vllm_input_wait_ms = native_text_metrics.get(defs.VLLM_INPUT_WAIT_MS)
+        stage_metrics.vllm_ready_queued_ms = native_text_metrics.get(defs.VLLM_READY_QUEUED_MS)
         return stage_metrics
 
     def _infer_output_unit_type(self, request_outputs: list[Any], *, token_count: int) -> str:

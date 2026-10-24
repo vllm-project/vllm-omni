@@ -20,7 +20,7 @@ from vllm.v1.utils import ConstantList
 from tests.helpers.omni_scheduler import bind_omits_transfer_helpers
 from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
 from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler
-from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
+from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin, _OmniWaitingQueue
 from vllm_omni.data_entry_keys import CodesStruct, MetaStruct, OmniPayload, OmniPayloadStruct
 from vllm_omni.distributed.omni_connectors.adapter import construct_next_stage_streaming_input_prompt
 from vllm_omni.distributed.omni_connectors.connectors.shm_connector import SharedMemoryConnector
@@ -4028,3 +4028,71 @@ def test_save_async_boundary_holds_generation_without_request_counter(build_adap
 
     assert len(adapter._pending_save_reqs) == queued_before + 1
     assert adapter._pending_save_reqs[-1]["request"] is follow_up
+
+
+def _input_ready_scheduler(adapter) -> OmniARScheduler:
+    scheduler = OmniARScheduler.__new__(OmniARScheduler)
+    scheduler.waiting = create_request_queue(SchedulingPolicy.FCFS)
+    scheduler.kv_holding_waiting = create_request_queue(SchedulingPolicy.FCFS)
+    scheduler.deferred_waiting = set()
+    scheduler.running = []
+    scheduler.chunk_transfer_adapter = adapter
+    scheduler.input_coordinator = None
+    scheduler.log_stats = True
+    scheduler._gates_stage_input = True
+    scheduler.requests = {}
+    return scheduler
+
+
+def _add_input_ready_request(scheduler: OmniARScheduler, request_id: str) -> Request:
+    request = Request(request_id, [], SamplingParams(max_tokens=1), pooling_params=None)
+    scheduler.requests[request_id] = request
+    scheduler._enqueue_waiting_request(request)
+    return request
+
+
+def _input_ready_step(scheduler: OmniARScheduler, now: float) -> None:
+    """Chunk gate, input-ready stamp and restore of one scheduler step."""
+    adapter = scheduler.chunk_transfer_adapter
+    adapter.process_pending_chunks(
+        _OmniWaitingQueue(scheduler), scheduler.running, scheduler_requests=scheduler.requests
+    )
+    scheduler._stamp_input_ready(now)
+    adapter.restore_queues(_OmniWaitingQueue(scheduler), scheduler.running, scheduler_requests=scheduler.requests)
+
+
+@pytest.mark.parametrize("model_mode", ["ar", "generation"])
+def test_input_ready_time_is_the_step_that_sees_the_first_chunk(build_adapter, model_mode):
+    adapter, _ = build_adapter(stage_id=1, model_mode=model_mode, max_num_seqs=4)
+    scheduler = _input_ready_scheduler(adapter)
+    request = _add_input_ready_request(scheduler, "downstream")
+
+    _input_ready_step(scheduler, 1.0)
+    assert request.status == RequestStatus.WAITING_FOR_CHUNK
+    _input_ready_step(scheduler, 2.0)
+    assert getattr(request, "omni_input_ready_ts", None) is None
+
+    adapter._finished_load_reqs.add("downstream")
+    _input_ready_step(scheduler, 3.0)
+    assert request.status == RequestStatus.WAITING
+    assert request.omni_input_ready_ts == 3.0
+
+    _input_ready_step(scheduler, 4.0)
+    assert request.omni_input_ready_ts == 3.0
+
+
+def test_active_stream_slot_wait_counts_as_input_wait(build_adapter):
+    adapter, _ = build_adapter(stage_id=1, model_mode="generation", max_num_seqs=2, active_stream_window=1)
+    scheduler = _input_ready_scheduler(adapter)
+    active = _add_input_ready_request(scheduler, "active")
+    parked = _add_input_ready_request(scheduler, "parked")
+
+    _input_ready_step(scheduler, 1.0)
+    assert active.status == RequestStatus.WAITING_FOR_CHUNK
+    # Without an active-stream slot the request is parked and loads nothing.
+    assert getattr(parked, "omni_input_ready_ts", None) is None
+
+    adapter._finished_load_reqs.add("active")
+    _input_ready_step(scheduler, 2.0)
+    assert active.omni_input_ready_ts == 2.0
+    assert getattr(parked, "omni_input_ready_ts", None) is None

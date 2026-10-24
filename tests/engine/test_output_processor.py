@@ -1530,6 +1530,175 @@ def test_generation_stage_phase_split_spans_streaming_segments():
     )
 
 
+_INPUT_SPLIT_KEYS = ("vllm_input_wait_ms", "vllm_ready_queued_ms")
+
+
+def _input_split(record: dict) -> dict:
+    return {key: record[key] for key in _INPUT_SPLIT_KEYS if key in record}
+
+
+@pytest.mark.parametrize(
+    ("input_ready_ts", "expected"),
+    [
+        pytest.param(10.4, {"vllm_input_wait_ms": 400.0, "vllm_ready_queued_ms": 100.0}, id="delayed_input"),
+        # Scheduled in the step that saw the input: a measured zero.
+        pytest.param(10.5, {"vllm_input_wait_ms": 500.0, "vllm_ready_queued_ms": 0.0}, id="scheduled_when_ready"),
+        pytest.param(10.0, {"vllm_input_wait_ms": 0.0, "vllm_ready_queued_ms": 500.0}, id="ready_when_queued"),
+        # Stage 0, or a stage without an input gate: nothing to split.
+        pytest.param(0.0, {}, id="no_input_gate"),
+        # From an earlier streaming segment.
+        pytest.param(9.0, {}, id="ready_before_queued"),
+        # Stamped after the first scheduling: not a wait before it.
+        pytest.param(10.6, {}, id="ready_after_scheduled"),
+    ],
+)
+def test_native_phase_split_separates_input_wait(input_ready_ts, expected):
+    stats = RequestStateStats(queued_ts=10.0, scheduled_ts=10.5, first_token_ts=11.0, last_token_ts=12.0)
+
+    metrics = output_processor._native_phase_metrics(stats, input_ready_ts)
+
+    assert metrics["vllm_queued_ms"] == pytest.approx(500.0)
+    assert _input_split(metrics) == pytest.approx(expected)
+    if expected:
+        assert metrics["vllm_input_wait_ms"] + metrics["vllm_ready_queued_ms"] == pytest.approx(
+            metrics["vllm_queued_ms"]
+        )
+
+
+def test_native_phase_split_needs_queued_event_for_input_wait():
+    stats = RequestStateStats(scheduled_ts=10.5, first_token_ts=11.0, last_token_ts=12.0)
+
+    assert not _input_split(output_processor._native_phase_metrics(stats, 10.4))
+
+
+@pytest.mark.parametrize(
+    "make_state",
+    [_make_text_stage_state, lambda: _make_no_detok_state(RequestOutputKind.CUMULATIVE)],
+    ids=["ar_text_path", "mm_only_path"],
+)
+def test_input_ready_time_reaches_native_phase_split(make_state):
+    # A downstream stage queued before its first input: QUEUED at 1.0, input
+    # seen ready at 1.4, scheduled at 1.5.
+    processor = _stats_processor(make_state())
+    first = _stats_output(
+        events=[
+            EngineCoreEvent(EngineCoreEventType.QUEUED, 1.0),
+            EngineCoreEvent(EngineCoreEventType.SCHEDULED, 1.5),
+        ]
+    )
+    first.input_ready_ts = 1.4
+    first = MsgpackDecoder(OmniEngineCoreOutput).decode(MsgpackEncoder().encode(first))
+    processor.process_outputs([first], engine_core_timestamp=2.0, iteration_stats=IterationStats())
+    iteration_stats = IterationStats()
+    processor.process_outputs(
+        [_stats_output(finish_reason=FinishReason.STOP)], engine_core_timestamp=3.0, iteration_stats=iteration_stats
+    )
+
+    record = processor.pop_native_text_metrics("r")
+
+    assert _input_split(record) == pytest.approx({"vllm_input_wait_ms": 400.0, "vllm_ready_queued_ms": 100.0})
+    (finished,) = iteration_stats.finished_requests
+    assert record["vllm_input_wait_ms"] + record["vllm_ready_queued_ms"] == pytest.approx(finished.queued_time * 1000.0)
+
+
+def test_input_ready_time_is_ignored_without_stats():
+    state = _make_no_detok_state(RequestOutputKind.CUMULATIVE)
+    processor = _stats_processor(state)
+    output = _stats_output(events=[EngineCoreEvent(EngineCoreEventType.QUEUED, 1.0)])
+    output.input_ready_ts = 1.4
+
+    processor.process_outputs([output], engine_core_timestamp=2.0, iteration_stats=None)
+
+    assert state.native_input_ready_ts == 0.0
+
+
+def test_text_path_streaming_update_drops_earlier_input_ready_time():
+    # The input gate records only the first input. After a streaming update
+    # restarts the AR stats, the re-sent first-input time precedes the new
+    # QUEUED event and must not split the later segment.
+    state = _make_text_stage_state(stream_input=True)
+    processor = _stats_processor(state)
+    first = _stats_output(
+        events=[
+            EngineCoreEvent(EngineCoreEventType.QUEUED, 1.0),
+            EngineCoreEvent(EngineCoreEventType.SCHEDULED, 1.25),
+        ]
+    )
+    first.input_ready_ts = 1.1
+    processor.process_outputs([first], engine_core_timestamp=1.75, iteration_stats=IterationStats())
+    assert state.native_input_ready_ts == pytest.approx(1.1)
+    processor.process_outputs(
+        [_stats_output(finish_reason=FinishReason.STOP, is_segment_finished=True)],
+        engine_core_timestamp=3.0,
+        iteration_stats=IterationStats(),
+    )
+    processor.pop_native_text_metrics("r")
+
+    processor.add_request(_streaming_input(3.4), prompt=None)
+    assert state.native_input_ready_ts == 0.0
+    processor.add_request(_streaming_input(4.1, resumable=False), prompt=None)
+    second = _stats_output(
+        events=[
+            EngineCoreEvent(EngineCoreEventType.QUEUED, 3.5),
+            EngineCoreEvent(EngineCoreEventType.SCHEDULED, 4.0),
+        ]
+    )
+    second.input_ready_ts = 1.1
+    processor.process_outputs([second], engine_core_timestamp=4.5, iteration_stats=IterationStats())
+    processor.process_outputs(
+        [_stats_output(finish_reason=FinishReason.STOP)], engine_core_timestamp=6.0, iteration_stats=IterationStats()
+    )
+    record = processor.pop_native_text_metrics("r")
+
+    assert record["vllm_queued_ms"] == pytest.approx(500.0)
+    assert not _input_split(record)
+
+
+def test_generation_stage_input_split_follows_queued_interval_across_segments():
+    # Generation-stage stats span all segments. The first input splits the
+    # first queued interval; a later QUEUED event that removes vllm_queued_ms
+    # removes the input split too, so the two never disagree.
+    def _run(second_segment_queued: bool) -> dict:
+        state = OmniRequestState(**_NO_DETOK_STATE_KWARGS, output_kind=RequestOutputKind.CUMULATIVE, stream_input=True)
+        processor = _stats_processor(state)
+        first = _stats_output(
+            events=[
+                EngineCoreEvent(EngineCoreEventType.QUEUED, 1.0),
+                EngineCoreEvent(EngineCoreEventType.SCHEDULED, 1.25),
+            ]
+        )
+        first.input_ready_ts = 1.2
+        processor.process_outputs([first], engine_core_timestamp=1.75, iteration_stats=IterationStats())
+        processor.process_outputs(
+            [_stats_output(finish_reason=FinishReason.STOP, is_segment_finished=True)],
+            engine_core_timestamp=3.0,
+            iteration_stats=IterationStats(),
+        )
+        processor.pop_native_text_metrics("r")
+        processor.add_request(_streaming_input(3.4), prompt=None)
+        processor.add_request(_streaming_input(4.1, resumable=False), prompt=None)
+        events = [EngineCoreEvent(EngineCoreEventType.SCHEDULED, 4.0)]
+        if second_segment_queued:
+            events.insert(0, EngineCoreEvent(EngineCoreEventType.QUEUED, 3.5))
+        second = _stats_output(events=events)
+        second.input_ready_ts = 1.2
+        processor.process_outputs([second], engine_core_timestamp=4.5, iteration_stats=IterationStats())
+        processor.process_outputs(
+            [_stats_output(finish_reason=FinishReason.STOP)],
+            engine_core_timestamp=6.0,
+            iteration_stats=IterationStats(),
+        )
+        return processor.pop_native_text_metrics("r")
+
+    spans_first = _run(second_segment_queued=False)
+    assert spans_first["vllm_queued_ms"] == pytest.approx(250.0)
+    assert _input_split(spans_first) == pytest.approx({"vllm_input_wait_ms": 200.0, "vllm_ready_queued_ms": 50.0})
+
+    requeued = _run(second_segment_queued=True)
+    assert "vllm_queued_ms" not in requeued
+    assert not _input_split(requeued)
+
+
 def test_ec_transfer_params_survive_both_construction_paths():
     """v0.28 contract: encoder-cache transfer metadata must reach
     RequestOutput.ec_transfer_params through BOTH omni construction paths —

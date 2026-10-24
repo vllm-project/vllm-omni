@@ -35,6 +35,7 @@ from vllm.sampling_params import SamplingParams
 from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.request_queue import SchedulingPolicy
+from vllm.v1.engine import EngineCoreEventType
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
@@ -189,3 +190,18 @@ def test_generation_schedule_sweeps_and_resyncs_around_pending_inputs() -> None:
     OmniGenerationScheduler.schedule(sched)
 
     assert calls == ["sweep", "generation", "sweep", "resync"]
+
+
+def test_generation_schedule_stamps_input_ready_with_the_scheduled_timestamp() -> None:
+    # The fast path takes its SCHEDULED timestamp before the input gates run;
+    # the input-ready stamp must use the same time, not a later one.
+    sched, request = _make_fast_path_sched(defer_block_free=False)
+    sched.log_stats = True
+    calls: list[object] = []
+    sched._process_pending_omni_inputs.side_effect = lambda model_mode: calls.append(model_mode)
+    sched._stamp_input_ready.side_effect = lambda now: calls.append(now)
+
+    OmniGenerationScheduler.schedule(sched)
+
+    (scheduled,) = [event for event in request.take_events() if event.type == EngineCoreEventType.SCHEDULED]
+    assert calls == ["generation", scheduled.timestamp]

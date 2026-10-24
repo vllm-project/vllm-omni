@@ -288,8 +288,10 @@ With `--log-stats`, a stage served by a vLLM engine core (AR and generation stag
 | `vllm_prefill_ms` | First `SCHEDULED` event to first engine-core output (the first token for an AR stage) |
 | `vllm_decode_ms` | First engine-core output to last engine-core output |
 | `vllm_num_preemptions` | Number of `PREEMPTED` events |
+| `vllm_input_wait_ms` | `QUEUED` event to the step in which the stage's input gate first saw the input ready |
+| `vllm_ready_queued_ms` | That step to first `SCHEDULED` event |
 
-The intervals match upstream `FinishedRequestStats`, so time spent preempted stays inside prefill or decode. The wrapped `vllm:request_queue_time_seconds`, `vllm:request_prefill_time_seconds`, `vllm:request_decode_time_seconds`, and `vllm:request_num_preemptions` histograms, which already carry `{stage, replica}` labels, use the same intervals. Two differences: upstream subtracts an unobserved timestamp as `0.0`, and it reports a negative interval as is, while these fields leave either interval out. No Prometheus family is added.
+The first four fields match upstream `FinishedRequestStats`, so time spent preempted stays inside prefill or decode. The wrapped `vllm:request_queue_time_seconds`, `vllm:request_prefill_time_seconds`, `vllm:request_decode_time_seconds`, and `vllm:request_num_preemptions` histograms, which already carry `{stage, replica}` labels, use the same intervals. Two differences: upstream subtracts an unobserved timestamp as `0.0`, and it reports a negative interval as is, while these fields leave either interval out. The last two fields split `vllm_queued_ms` at a time recorded by the Omni scheduler, described below; upstream has no counterpart. No Prometheus family is added.
 
 The first engine-core output ends prefill even when it carries no token. A generation stage that emits one output when it stops therefore reports its whole run as `vllm_prefill_ms`, with a measured `vllm_decode_ms` of `0`.
 
@@ -298,7 +300,11 @@ The first engine-core output ends prefill even when it carries no token. A gener
 - With `async_chunk`, a downstream stage that receives chunks is submitted together with stage 0, and the request stays in `WAITING_FOR_CHUNK` until the first upstream chunk arrives. Later waits for the next chunk fall inside `vllm_decode_ms`.
 - A stage with `requires_full_payload_input` stays in `WAITING_FOR_INPUT` until the connector delivers the payload.
 
-For these stages `vllm_queued_ms` includes input wait, and with `async_chunk` so does `vllm_decode_ms`; neither measures scheduler contention alone. The split does not separate input wait. `vllm_queued_ms` is also separate from the orchestration-layer wait in `vllm_omni:request_queue_wait_s` (`pipeline_timings["queue_wait_ms"]`) and from the diffusion scheduler wait in `vllm_omni:stage_in_queue_s`.
+For these stages `vllm_queued_ms` includes input wait, and with `async_chunk` so does `vllm_decode_ms`; neither measures scheduler contention alone. `vllm_queued_ms` is also separate from the orchestration-layer wait in `vllm_omni:request_queue_wait_s` (`pipeline_timings["queue_wait_ms"]`) and from the diffusion scheduler wait in `vllm_omni:stage_in_queue_s`.
+
+`vllm_input_wait_ms` and `vllm_ready_queued_ms` separate the first input wait. The scheduler of such a stage checks its input gate once per step, before scheduling, and records the first step in which the request's input is ready: the first chunk for an `async_chunk` receiver, the payload for a `requires_full_payload_input` stage. `vllm_input_wait_ms` runs from `QUEUED` to that step, and `vllm_ready_queued_ms` from that step to the first `SCHEDULED` event; when both are set they add up to `vllm_queued_ms`. The recorded time is the step that saw the input, not the arrival itself. With `active_stream_window`, a request that waits for an active-stream slot does not receive chunks until it gets one, so that wait counts as input wait.
+
+Both fields are `None` on stage 0 and on a downstream stage without an input gate, where `vllm_queued_ms` holds no input wait. They are also `None` when the input-ready time was not observed or falls outside the queued interval, for example when an AR streaming-input split covers a later segment.
 
 These intervals can overlap with other timings of the same request: the upstream stage's run, the transfer times in `TransferEdgeStats` and `vllm_omni:transfer_tx_s` / `vllm_omni:transfer_rx_s`, and stage-to-stage handoff events. Do not add them together into an end-to-end breakdown of a request unless the intervals are known not to overlap and use the same clock.
 

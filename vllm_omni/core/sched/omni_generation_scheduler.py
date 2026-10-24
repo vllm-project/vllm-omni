@@ -456,6 +456,10 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         self._drop_aborted_queued_requests()
         self._requeue_completed_native_chunks()
         self._process_pending_omni_inputs(model_mode="generation")
+        # SCHEDULED below carries scheduled_timestamp, taken before the input
+        # gates ran; stamp with it so a request scheduled in the step its input
+        # arrived reports input ready == scheduled, not later.
+        self._stamp_input_ready(scheduled_timestamp)
         if getattr(self, "_generation_defer_batch", False):
             token_budget = 0
         max_regular = getattr(self, "_generation_max_regular_batch", 0)
