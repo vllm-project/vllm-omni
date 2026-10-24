@@ -35,6 +35,12 @@ from vllm_omni.model_executor.stage_input_processors.cosyvoice3 import talker2co
 from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import (
     OmniChunkTransferAdapter,
 )
+from tests.helpers.duplex_scheduler import (
+    DUPLEX_MAX_MODEL_LEN,
+    append_duplex_frame,
+    join_duplex_sessions,
+    make_engine_duplex_scheduler,
+)
 from tests.helpers.omni_scheduler import bind_omits_transfer_helpers
 
 # isort: on
@@ -1673,6 +1679,61 @@ def test_context_overflow_emits_an_error_output_with_the_reason() -> None:
 
     sched._emit_streaming_context_overflow_outputs(outputs)
     assert len(outputs[2]) == 1
+
+
+def test_duplex_session_samples_its_last_frame_at_max_model_len_then_fails_cleanly(tmp_path) -> None:
+    """A PersonaPlex-shaped session (one placeholder per 80 ms frame, one
+    greedy token per frame) through the real scheduler and KV manager: the last
+    frame it may run is the one whose sample lands exactly on max_model_len;
+    the next append fails only that session, with an explicit error, and a
+    concurrent session keeps running on the same engine."""
+    sched = make_engine_duplex_scheduler(tmp_path)
+    # "long" joins ten frames short of the context; "short" is a later caller.
+    join_duplex_sessions(sched, {"long": DUPLEX_MAX_MODEL_LEN - 10, "short": 100})
+
+    last_sample = None
+    for _ in range(20):
+        sampled_at, outputs = append_duplex_frame(sched)
+        if "long" in sampled_at:
+            last_sample = sampled_at["long"]
+        if "long" not in sched.requests:
+            break
+    else:
+        pytest.fail("the long session never reached max_model_len")
+
+    # Prompt 2999 samples position 3000: the last one the worker can book.
+    assert last_sample == DUPLEX_MAX_MODEL_LEN - 1
+    error = outputs["long"]
+    assert error.finish_reason == FinishReason.ERROR
+    assert error.stop_reason.startswith(OmniARScheduler.STREAMING_CONTEXT_OVERFLOW_STOP_REASON)
+    assert f"grow to {DUPLEX_MAX_MODEL_LEN} tokens" in error.stop_reason
+    assert f"max_model_len {DUPLEX_MAX_MODEL_LEN}" in error.stop_reason
+
+    # The other session was in the same step and keeps running afterwards.
+    assert "short" in sampled_at
+    for _ in range(3):
+        sampled_at, _ = append_duplex_frame(sched)
+        assert set(sampled_at) == {"short"}
+
+
+def test_duplex_session_without_the_sample_reserve_crashes_on_the_exact_fill(tmp_path, monkeypatch) -> None:
+    """Root cause of ``Sampled token IDs exceed the max model length. Total
+    number of tokens: 3001 > max_model_len: 3000`` on builds before the
+    streaming overflow guard: nothing stopped the append whose prompt fills
+    max_model_len exactly, and the token that frame samples is position 3001.
+    The guard therefore has to reserve the sampled token, not only the prompt
+    (the test above)."""
+    monkeypatch.setattr(OmniARScheduler, "_streaming_update_overflows", lambda *_args, **_kwargs: False)
+    sched = make_engine_duplex_scheduler(tmp_path)
+    join_duplex_sessions(sched, {"long": DUPLEX_MAX_MODEL_LEN - 10})
+
+    for _ in range(9):
+        append_duplex_frame(sched)
+    assert sched.requests["long"].num_prompt_tokens == DUPLEX_MAX_MODEL_LEN - 1
+
+    with pytest.raises(AssertionError, match=r"Total number of tokens: 3001 > max_model_len: 3000"):
+        append_duplex_frame(sched)
+    assert sched.requests["long"].num_prompt_tokens == DUPLEX_MAX_MODEL_LEN
 
 
 @pytest.mark.parametrize("native", [True, False])
