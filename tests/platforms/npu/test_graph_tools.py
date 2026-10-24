@@ -494,3 +494,149 @@ def test_estimator_graph_distinguishes_padding_and_reuses_embedding(monkeypatch,
     )
     torch.testing.assert_close(embedding, supplied)
     assert runner.stats == {"captures": 2, "failed": 0, "hits": 2}
+
+
+def _install_fake_npu(monkeypatch, *, with_pool_handle: bool = True):
+    """Install a fake torch.npu whose graph() records the capture pool."""
+    seen_pools = []
+    handles = iter(range(1000, 2000))
+    synchronizations = 0
+
+    class _Graph:
+        def replay(self):
+            pass
+
+    @contextmanager
+    def graph_context(graph, *, pool):
+        del graph
+        seen_pools.append(pool)
+        yield
+
+    def synchronize():
+        nonlocal synchronizations
+        synchronizations += 1
+
+    npu_members = {
+        "NPUGraph": _Graph,
+        "graph": graph_context,
+        "synchronize": synchronize,
+        "is_current_stream_capturing": lambda: False,
+    }
+    if with_pool_handle:
+        npu_members["graph_pool_handle"] = lambda: next(handles)
+    fake_npu = SimpleNamespace(**npu_members)
+    monkeypatch.setattr(torch, "npu", fake_npu, raising=False)
+
+    import vllm.platforms
+
+    global_pool = object()
+    monkeypatch.setattr(
+        vllm.platforms,
+        "current_platform",
+        SimpleNamespace(get_global_graph_pool=lambda: global_pool),
+    )
+    return seen_pools, global_pool
+
+
+def test_dedicated_pool_runners_use_distinct_handles(monkeypatch):
+    seen_pools, global_pool = _install_fake_npu(monkeypatch)
+
+    runner_a = NPUExactGraphRunner(use_shared_pool=False, component_name="A")
+    runner_b = NPUExactGraphRunner(use_shared_pool=False, component_name="B")
+
+    for runner in (runner_a, runner_b):
+        runner.capture((torch.tensor([1.0]),), lambda value: (value + 1,))
+        # Second capture on the same runner must reuse its own handle.
+        runner.capture((torch.tensor([2.0, 3.0]),), lambda value: (value + 1,))
+
+    # Two captures per runner: one dedicated handle per runner, reused.
+    assert len(seen_pools) == 4
+    handles_a = [id(p) for p in seen_pools[:2]]
+    handles_b = [id(p) for p in seen_pools[2:]]
+    assert handles_a[0] == handles_a[1], "runner A must reuse its dedicated handle"
+    assert handles_b[0] == handles_b[1], "runner B must reuse its dedicated handle"
+    assert handles_a[0] != handles_b[0], "dedicated handles must be distinct per runner"
+    assert all(p is not global_pool for p in seen_pools), "dedicated runners must not touch the global pool"
+
+
+def test_dedicated_pool_missing_handle_warns_and_falls_back(monkeypatch):
+    seen_pools, global_pool = _install_fake_npu(monkeypatch, with_pool_handle=False)
+
+    import vllm_omni.platforms.npu.graph_tools as graph_tools_module
+
+    warnings = []
+    monkeypatch.setattr(
+        graph_tools_module.logger,
+        "warning",
+        lambda *args, **kwargs: warnings.append(args),
+    )
+
+    runner = NPUExactGraphRunner(use_shared_pool=False, component_name="fallback-check")
+    runner.capture((torch.tensor([1.0]),), lambda value: (value + 1,))
+
+    assert seen_pools == [global_pool]
+    assert warnings, "the shared-pool fallback must be announced, not silent"
+    assert "graph_pool_handle" in str(warnings[0][0])
+
+
+def test_vae_npu_graph_runner_is_per_instance(monkeypatch):
+    """Two AudioVAE instances must never share (or cross-replay) a runner.
+
+    Regression test for the process-global runner singleton: identical input
+    signatures across instances must still bind each decode callable to its
+    own instance's runner, so a second model can never replay the first
+    model's captured weights.
+    """
+    seen_pools, _ = _install_fake_npu(monkeypatch)
+
+    import vllm_omni.model_executor.models.voxcpm2.voxcpm2_talker as talker_module
+    from vllm_omni.platforms import current_omni_platform
+    from vllm_omni.platforms.npu import graph_tools as graph_tools_module
+
+    monkeypatch.setattr(current_omni_platform, "is_npu", lambda: True)
+    monkeypatch.setenv("VLLM_OMNI_DISABLE_VAE_NPU_GRAPH", "0")
+
+    class _FakeRunner:
+        def __init__(self, *, max_graphs, component_name, disable_config_hint, use_shared_pool):
+            self.use_shared_pool = use_shared_pool
+            self.bound_compute = None
+
+        def is_supported(self):
+            return True
+
+        def run(self, operation, inputs, constants, compute):
+            self.bound_compute = compute
+            return compute(*inputs)
+
+    constructed = []
+    monkeypatch.setattr(
+        graph_tools_module,
+        "NPUExactGraphRunner",
+        lambda **kwargs: (constructed.append(kwargs) or _FakeRunner(**kwargs)),
+    )
+
+    class _FakeVae:
+        def __init__(self, tag):
+            self.tag = tag
+
+        def decode(self, z, sr_cond=None):
+            return torch.full_like(z, self.tag)
+
+    vae_a = _FakeVae(1.0)
+    vae_b = _FakeVae(2.0)
+
+    runner_a = talker_module._vae_npu_graph_runner_for(vae_a)
+    runner_b = talker_module._vae_npu_graph_runner_for(vae_b)
+
+    assert runner_a is not runner_b, "each AudioVAE instance must own its runner"
+    assert runner_a is not False and runner_b is not False
+    assert len(constructed) == 2, "one runner per instance, not one shared singleton"
+    assert all(kwargs["use_shared_pool"] is False for kwargs in constructed)
+
+    out_a = runner_a.run("decode", (torch.zeros(1),), (), lambda z, sr=None: (vae_a.decode(z),))[0]
+    out_b = runner_b.run("decode", (torch.zeros(1),), (), lambda z, sr=None: (vae_b.decode(z),))[0]
+    torch.testing.assert_close(out_a, torch.tensor([1.0]))
+    torch.testing.assert_close(out_b, torch.tensor([2.0]))
+
+    # The same instance returns the same runner on repeated calls (memoized).
+    assert talker_module._vae_npu_graph_runner_for(vae_a) is runner_a
