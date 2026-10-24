@@ -85,6 +85,19 @@ subset. For example, `DIFFUSION_ATTENTION_BACKEND=TRTLLM_ATTN` with
 Explicit `diffusion_attention_config.default` takes precedence over both
 environment variables.
 
+### Diffusion seed contract
+
+| Name | Type and default | Applies to and read time | Precedence and invalid values | Lifecycle |
+| --- | --- | --- | --- | --- |
+| `VLLM_OMNI_DIFFUSION_BATCH_INVARIANT` | Boolean: `1`, `true`, `yes`, `on`, `0`, `false`, `no`, or `off`; unset follows `VLLM_BATCH_INVARIANT` (normally disabled) | Read on each diffusion submit/update; image routes check before seed fallback | Overrides `VLLM_BATCH_INVARIANT`. Whitespace/case ignored; empty or unknown values raise `ValueError`. | Experimental |
+
+When enabled, require an explicit integer `seed` in `[-2**63, 2**64 - 1]`.
+Boolean seeds and caller-provided `generator` inputs raise client errors (HTTP 400).
+Image generation/editing check before random seed fallback; HTTP schema rules still apply.
+When disabled, behavior is unchanged. Warmup/dummy seed fallback is preserved.
+
+The seed contract alone does not guarantee bitwise-identical model outputs.
+
 ### Serving and runtime
 
 | Name | Type and default | Applies to and read time | Precedence and invalid values | Lifecycle |

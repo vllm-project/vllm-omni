@@ -2169,6 +2169,12 @@ async def generate_images(
         )
 
     try:
+        from vllm_omni.diffusion.batch_invariance import validate_batch_invariant_diffusion_seed
+
+        if any(get_stage_type(cfg) == "diffusion" for cfg in stage_configs):
+            validate_batch_invariant_diffusion_seed(
+                OmniDiffusionSamplingParams(seed=request.seed), request_id="images/generations"
+            )
         width: int | None = None
         height: int | None = None
         # Unify request construction for any multi-stage pipeline to avoid
@@ -2433,6 +2439,10 @@ async def edit_images(
             detail="stream=true is only supported for multi-stage image editing pipelines.",
         )
     try:
+        from vllm_omni.diffusion.batch_invariance import validate_batch_invariant_diffusion_seed
+
+        if any(get_stage_type(cfg) == "diffusion" for cfg in stage_configs):
+            validate_batch_invariant_diffusion_seed(OmniDiffusionSamplingParams(seed=seed), request_id="images/edits")
         # 2. Build prompt & images params
         cot_output = None
         omni_prompt = OmniTextPrompt(prompt=prompt, modalities=["image"])
