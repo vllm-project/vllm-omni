@@ -170,6 +170,14 @@ def resolve_block_sparse_provider(
     """
     if block_size not in (64, 128):
         raise ValueError("block_size must be 64 or 128")
+    if device.type == "npu" and provider == "auto":
+        if block_size != 128 or precision != "bf16" or dtype != torch.bfloat16 or head_size != 128:
+            raise ValueError("NPU VSA requires tile128, BF16 and head dimension 128")
+        import torch_npu
+
+        if not hasattr(torch_npu, "npu_block_sparse_attention"):
+            raise ImportError("NPU VSA requires torch_npu.npu_block_sparse_attention")
+        return "npu"
     if provider == "triton":
         from .triton_block_sparse import require_triton_sparse
 
@@ -299,6 +307,10 @@ def block_sparse_attn_bshd(
     """
     if block_size not in (64, 128):
         raise ValueError("block_size must be 64 or 128")
+    if provider == "npu":
+        from .npu_block_sparse import npu_block_sparse_attention
+
+        return npu_block_sparse_attention(query, key, value, block_map, block_sizes, softmax_scale)
     if provider == "triton":
         from .triton_block_sparse import triton_block_sparse_attention
 

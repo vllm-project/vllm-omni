@@ -3,11 +3,13 @@
 [FastH3 family](README.md) · [Single-card guide](<FastH3 RefOmni Single Card.md>)
 
 Run [FastH3 Omni](https://huggingface.co/FastVideo/FastVideo-FastH3-Omni-8-Step-V1)
-on eight GPUs to generate video and audio from a prompt and reference image.
+on eight GPUs or eight Ascend A3 NPUs to generate video and audio from a prompt and reference image.
 For RTX 4090, RTX 5090, DGX Spark, or RTX PRO 6000 Blackwell single-card
 serving, use the [single-card guide](<FastH3 RefOmni Single Card.md>).
 
-## Install
+## CUDA deployment
+
+### Install
 
 Follow the [CUDA installation guide](../../docs/getting_started/installation/gpu.md)
 and install `ffmpeg`. From the vLLM-Omni repository root, install the
@@ -20,7 +22,7 @@ uv pip install -e '.[cudnn-bsa]'
 If Hugging Face requests access, accept the model's access terms and run
 `hf auth login` once. The server downloads the required model components.
 
-## Start the server
+### Start the server
 
 ```bash
 VLLM_WORKER_MULTIPROC_METHOD=spawn VLLM_OMNI_VIDEO_SYNC_TIMEOUT=7200 \
@@ -31,6 +33,27 @@ vllm serve FastVideo/FastVideo-FastH3-Omni-8-Step-V1 --omni \
 The configuration handles eight-GPU placement, eight inference steps, and
 video decoding. Wait for `Application startup complete` before sending a
 request. To change the default port, add `--port 8001`.
+
+## Ascend NPU deployment
+
+Follow the [NPU installation guide](../../docs/getting_started/installation/npu.md) and install `ffmpeg`. The configuration below was tested on eight Atlas 800I A3 NPUs with BF16, USP8 and distributed layerwise offload.
+
+```bash
+VLLM_WORKER_MULTIPROC_METHOD=spawn VLLM_OMNI_VIDEO_SYNC_TIMEOUT=7200 \
+vllm serve FastVideo/FastVideo-FastH3-Omni-8-Step-V1 --omni \
+  --trust-remote-code \
+  --task-type ref2va \
+  --num-gpus 8 --usp 8 --ring 1 \
+  --text-encoder-tp-size 8 \
+  --enable-distributed-layerwise-offload \
+  --vae-parallel-mode tile --vae-use-tiling \
+  --vae-patch-parallel-size 8 \
+  --diffusion-attention-backend FASTVIDEO_VSA \
+  --default-sampling-params '{"0":{"num_inference_steps":8,"guidance_scale":1}}' \
+  --init-timeout 1800 --stage-init-timeout 1800
+```
+
+NPU sparse execution supports BF16, logical tile size 128 and head dimension 128, as used by FastH3-Omni. The provider is selected automatically. Wait for `Application startup complete`, then use the same HTTP request below.
 
 ## Generate video and audio
 

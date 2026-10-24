@@ -730,6 +730,14 @@ class MiniMaxH3Attention(nn.Module):
                     and FlashAttentionBackend.supports_packed_mask_free()
                 )
             )
+            if current_omni_platform.is_npu():
+                from .attention.fastvideo_h3 import MiniMaxH3VSAImpl
+
+                mask_free_packed_padding = mask_free_packed_padding or (
+                    not use_ring
+                    and self.vsa_tile_size == 128
+                    and isinstance(self.attention.attention, MiniMaxH3VSAImpl)
+                )
             no_mask = not use_ring and (
                 self.attention.attn_backend.supports_prefix_kv_slicing or mask_free_packed_padding
             )

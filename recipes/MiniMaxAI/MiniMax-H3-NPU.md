@@ -287,7 +287,6 @@ kernel's fp16 workspace cannot overflow on outlier activations. Measured on
 the FastH3 four-step Dense configuration below, T2VA 15 s at 1344x768, this
 kernel reduced end-to-end latency from ~73 s to ~57 s (about 22%).
 
-
 ## FastH3 four-step on A3
 
 [FastH3](https://haoailab.com/blogs/fasth3-preview/) is FastVideo's four-step
@@ -459,8 +458,8 @@ These describe the validated shapes rather than a general throughput guarantee.
 > through the offload backend's per-tensor transform hook, but is left as future
 > work pending upstream design discussion.
 
+## Task selection
 
-## HTTP API examples
 Switch tasks via `extra_params.task` (`t2va` / `fl2va` / `ref2va`); FL2VA and
 Ref2VA additionally pass `input_references` (first-frame image, reference
 video/audio). The full parameter table lives in the GPU recipe.
@@ -596,6 +595,8 @@ logs. A successful HTTP response alone does not prove the cache was used.
   Ref2VA; use the lossless configuration for FL2VA or re-validate first.
 
 ## Additional resources
+
+- [FastH3-Omni on Ascend NPU](../FastVideo/FastH3-Omni.md#ascend-npu-deployment) — eight-step Ref2VA with native NPU block-sparse attention
 
 - [MiniMax-H3.md](MiniMax-H3.md) — full GPU guide
 - [MiniMax-H3-NPU-950PR.md](MiniMax-H3-NPU-950PR.md) — four-card

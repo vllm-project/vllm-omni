@@ -206,9 +206,9 @@ class MiniMaxH3VSAImpl(FastVideoVSAImpl):
         q_tiled = torch.zeros(target_shape, device=query.device, dtype=query.dtype)
         k_tiled = torch.zeros_like(q_tiled)
         v_tiled = torch.zeros_like(q_tiled)
-        q_tiled[:, non_pad] = query[:, partition]
-        k_tiled[:, non_pad] = key[:, partition]
-        v_tiled[:, non_pad] = value[:, partition]
+        q_tiled[:, non_pad] = query.index_select(1, partition)
+        k_tiled[:, non_pad] = key.index_select(1, partition)
+        v_tiled[:, non_pad] = value.index_select(1, partition)
 
         q_pool = mean_pool_tiles(q_tiled[:, : logical_blocks * block_size], sizes, block_size=block_size)
         k_pool = mean_pool_tiles(k_tiled[:, : logical_blocks * block_size], sizes, block_size=block_size)
@@ -255,7 +255,7 @@ class MiniMaxH3VSAImpl(FastVideoVSAImpl):
 
         if gate is not None:
             gate_tiled = torch.zeros_like(q_tiled[:, : logical_blocks * block_size])
-            gate_tiled[:, non_pad] = gate[:, partition]
+            gate_tiled[:, non_pad] = gate.index_select(1, partition)
             v_pool = mean_pool_tiles(v_tiled[:, : logical_blocks * block_size], sizes, block_size=block_size)
             compressed = torch.matmul(torch.softmax(scores, dim=-1), v_pool)
             compressed = compressed.permute(0, 2, 1, 3).to(output.dtype)
@@ -266,9 +266,9 @@ class MiniMaxH3VSAImpl(FastVideoVSAImpl):
                     gate_tiled.shape[0], logical_blocks, block_size, gate_tiled.shape[2], gate_tiled.shape[3]
                 )
             ).view_as(output)
-        return output[:, untile].contiguous()
+        return output.index_select(1, untile).contiguous()
 
-    def forward_cuda(
+    def forward_sparse(
         self,
         query: torch.Tensor,
         key: torch.Tensor,
@@ -325,3 +325,29 @@ class MiniMaxH3VSAImpl(FastVideoVSAImpl):
             return self._fallback(
                 original_query, original_key, original_value, attn_metadata, f"VSA-H3 kernel failed: {exc}"
             )
+
+    def forward_cuda(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: AttentionMetadata | None = None,
+    ) -> torch.Tensor:
+        return self.forward_sparse(query, key, value, attn_metadata)
+
+    def forward_npu(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: AttentionMetadata | None = None,
+    ) -> torch.Tensor:
+        if attn_metadata is None or attn_metadata.extra.get("vsa_h3_tile_size", 64) != 128:
+            return super().forward_npu(query, key, value, attn_metadata)
+        valid = attn_metadata.extra.get("valid_kv_length", query.shape[1])
+        output = self.forward_sparse(query[:, :valid], key[:, :valid], value[:, :valid], attn_metadata)
+        if valid == query.shape[1]:
+            return output
+        restored = torch.zeros_like(query)
+        restored[:, :valid] = output
+        return restored
