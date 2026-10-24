@@ -50,6 +50,7 @@ from vllm_omni.config.omni_config import (
     VllmOmniDiffusionStageConfig,
 )
 from vllm_omni.config.stage_config import StageType
+from vllm_omni.config.watermarking import WatermarkConfig
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.distributed.omni_connectors.utils.config import (
     TRANSFER_ENGINE_CONNECTOR_NAMES,
@@ -63,6 +64,7 @@ from vllm_omni.outputs.output_processor import MultimodalOutputProcessor
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.quantization.inc_config import OmniINCConfig
 from vllm_omni.transformers_utils.repo_utils import hf_api
+from vllm_omni.watermarking.utils import to_vllm_watermark_config
 
 logger = init_logger(__name__)
 
@@ -1540,6 +1542,7 @@ def build_vllm_config(
     headless: bool = False,
     api_process_count: int = 1,
     api_process_rank: int = 0,
+    watermark_config: WatermarkConfig | None = None,
 ) -> tuple[Any, type]:
     """Build engine args, then create VllmConfig and executor_class.
 
@@ -1573,6 +1576,14 @@ def build_vllm_config(
         filtered_engine_args_dict["structured_outputs_config"] = StructuredOutputsConfig(**soc)
 
     omni_engine_args = OmniEngineArgs(**filtered_engine_args_dict)
+
+    # extract the vLLM config arg from Omni's watermark config if we have text watermarking enabled
+    # NOTE: text watermarking in vLLM is only implemented for model runner v2.
+    omni_engine_args.watermark_config = to_vllm_watermark_config(
+        watermark_config,
+        stage_config.final_output_type,
+        omni_engine_args.use_v2_model_runner,
+    )
 
     # Guard against a per-stage world size that its assigned ``devices`` cannot
     # satisfy (issue #5003). A top-level ``--tensor-parallel-size`` is broadcast
