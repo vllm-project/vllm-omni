@@ -28,9 +28,10 @@ path still requires FlashAttention 2. Verify imports before loading weights:
 python -c 'from hymm.pipeline.causal_ar import CPTCausalInferencePipeline'
 ```
 
-The current development checks do not establish runtime compatibility of the
-reference package with every vLLM-Omni dependency version. GPU generation and
-reference-output comparison remain required before treating this draft as validated.
+The validated environment uses Python 3.12, PyTorch 2.13.0/CUDA 13.0, vLLM 0.32.0,
+Transformers 5.16.1, Diffusers 0.40.0, and FlashAttention 2.8.3 on H200.
+The adapter scopes PyTorch SDPA backend selection to each inference call to preserve
+the reference's cuDNN-enabled policy, then restores the previous settings.
 
 ## Checkpoints
 
@@ -68,7 +69,7 @@ the reference dataset/benchmark prompt-file loader.
 `num_frames`, and provide one interval per segment. Internal boundaries must be
 multiples of four. A single segment defaults to `[0, num_frames]`.
 
-Optional `extra_body` fields `camera_trajectory` and `segment_has_camera` are
+Optional offline `--extra-body` fields `camera_trajectory` and `segment_has_camera` are
 forwarded to the reference camera-conditioning path. The trajectory is a reference
 generator name such as `pan_left`, or a JSON/NPZ trajectory path accessible to the
 worker. `segment_has_camera`, when specified, contains one boolean per segment.
@@ -92,7 +93,30 @@ curl -sS http://localhost:8098/v1/videos \
 
 Use the returned `id` with `GET /v1/videos/{id}` until its status is `completed`
 or `failed`. Download completed output from `GET /v1/videos/{id}/content`.
-Multi-segment and camera parameters use the endpoint's JSON `extra_body` form field.
+Multi-segment and camera parameters use the endpoint's JSON `extra_params` form field,
+for example `-F 'extra_params={"segment_frame_boundaries":[0,60,121],"camera_trajectory":"pan_left","segment_has_camera":[true,true]}'`
+with a two-segment prompt and 121 frames.
+
+## CPU offload
+
+Use the public module-offload configuration to select DiT and text encoder weights:
+
+```bash
+vllm serve tencent/Hy-Nomas --omni --enforce-eager \
+  --diffusion-offload-config '{"mode":"module","components":["dit","text_encoder"]}'
+```
+
+The compatibility option `--enable-cpu-offload` stages the DiT, text encoder, and
+PixelUMM decoder. The DiT stays on the device for the complete camera-projection,
+denoising, and KV-write phase. Text encoding and VAE decoding use their own component
+contexts, including cleanup after exceptions. Explicit component selection covers
+only the named DiT/text encoder and leaves the VAE resident, as defined by the
+shared offload API.
+
+Offload reduces generation-time weight residency and adds host-device transfers.
+Checkpoint initialization still uses the reference loaders on the GPU; allow enough
+memory for all components during loading. Layerwise and distributed offload are not
+supported.
 
 ## Scope and validation
 
@@ -106,23 +130,28 @@ Multi-segment and camera parameters use the endpoint's JSON `extra_body` form fi
 - Generic startup warmup is disabled because its two-step, CFG-zero request is
   outside the distilled model's sampling contract. The first real request includes
   reference-kernel compilation.
-- Parallelism, vLLM-Omni offload, quantization, LoRA, Cache-DiT, latent output,
+- Parallelism, quantization, LoRA, Cache-DiT, latent output,
   input images, and incremental streaming are not supported by this adapter.
 
-CPU contract tests run in the existing L1 diffusion-model job. GPU tests are local
-validation cases while the reference dependencies and generation remain unverified:
+CPU contract tests run in the existing L1 diffusion-model job. GPU tests require
+the external reference runtime and are selected explicitly with `local_model`:
 
 ```bash
 pytest tests/diffusion/models/hy_nomas/test_hy_nomas.py -m 'core_model and cpu' --run-level core_model
 pytest tests/diffusion/models/hy_nomas/test_reference_config.py -m 'local_model and cpu' --run-level core_model
+pytest tests/diffusion/models/hy_nomas/test_reference_parity.py -m 'local_model and cuda' --run-level core_model
 pytest tests/e2e/offline_inference/test_hy_nomas.py tests/e2e/online_serving/test_hy_nomas.py \
   -m 'local_model and cuda' --run-level core_model
 ```
 
 GPU validation requires the reference runtime, model weights, text encoder, and a
 CUDA device with enough memory for all three components plus KV history. The local
-test configuration targets one H200. The 256×256, nine-frame cases check execution
-and request isolation, not generation quality. Quality acceptance additionally
+test configuration targets one H200. The reference-parity test loads independent
+upstream and Omni instances, and checks exact decoded-frame equality for text,
+segments, and camera control in resident and offload modes. It requires memory for
+both model instances; set `HY_NOMAS_MODEL` and optionally `HY_NOMAS_TEXT_ENCODER` to
+local checkpoint directories. The 256×256, nine-frame cases check execution,
+4/6-step sampling, and sequential requests in resident and offload modes. Quality acceptance additionally
 requires identical seeds, structured segment prompts, dimensions, frame boundaries,
 sampling parameters, and camera trajectories in reference and Omni runs, including
 a longer multi-segment sequence.
