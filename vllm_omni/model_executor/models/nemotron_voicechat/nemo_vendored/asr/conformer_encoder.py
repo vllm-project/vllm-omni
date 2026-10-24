@@ -1,5 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2020 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -599,7 +600,7 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
             device (torch.device): Device to use for computations.
         """
         # Find global max audio length across all nodes
-        if self.sync_max_audio_length and torch.distributed.is_initialized():
+        if self.sync_max_audio_length and torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
             global_max_len = torch.tensor([seq_length], dtype=torch.float32, device=device)
 
             # Update across all ranks in the distributed system

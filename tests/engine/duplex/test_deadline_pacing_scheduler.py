@@ -113,7 +113,7 @@ async def test_normal_cadence_keeps_deadlines_aligned(monkeypatch: pytest.Monkey
         h.runner.model_state.last_native_submit_monotonic = 100.0
         clock.value = 100.4
 
-        # First continuation: due at 101.0, so only 0.6 s of sleep remains.
+        # First continuation includes 5 ms of input-arrival grace.
         scheduled = await h.runner._schedule_silence_continuation(
             h.runner.model.silence_unit_payload(),
             **_continuation_kwargs(h),
@@ -122,13 +122,11 @@ async def test_normal_cadence_keeps_deadlines_aligned(monkeypatch: pytest.Monkey
         first_task = h.runner.tasks.append_tail
         assert first_task is not None
         assert await first_task
-        # The accepted unit re-anchored the chain to its own submission time
-        # (101.0) and stored the following deadline (102.0).
-        assert h.runner.model_state.last_native_submit_monotonic == pytest.approx(101.0)
-        assert h.runner.model_state.silence_deadline_monotonic == pytest.approx(102.0)
+        assert h.runner.model_state.last_native_submit_monotonic == pytest.approx(101.005)
+        assert h.runner.model_state.silence_deadline_monotonic == pytest.approx(102.005)
 
         # Model produces the continuation's audio; the next unit is planned
-        # from the stored deadline (no drift): the following deadline is 103.0.
+        # from the stored deadline; the initial grace does not accumulate.
         clock.value = 101.3
         scheduled = await h.runner._schedule_silence_continuation(
             h.runner.model.silence_unit_payload(),
@@ -138,7 +136,7 @@ async def test_normal_cadence_keeps_deadlines_aligned(monkeypatch: pytest.Monkey
         second_task = h.runner.tasks.append_tail
         assert second_task is not None
         assert await second_task
-        assert h.runner.model_state.silence_deadline_monotonic == pytest.approx(103.0)
+        assert h.runner.model_state.silence_deadline_monotonic == pytest.approx(103.005)
     finally:
         await close_harness(h)
 
@@ -211,8 +209,7 @@ async def test_in_flight_real_append_skips_outdated_silence(monkeypatch: pytest.
         assert state.silence_deadline_monotonic is None
 
         # A fresh continuation uses the new anchor. The clock is left at t+1.1:
-        # the scheduler sleeps the remaining 0.7 s (deadline t+1.8), which
-        # verifies re-anchoring controls the wait. Following deadline t+2.8.
+        # A fresh input-arrival grace makes the next deadline t+1.805.
         scheduled = await h.runner._schedule_silence_continuation(
             h.runner.model.silence_unit_payload(),
             **_continuation_kwargs(h),
@@ -221,8 +218,8 @@ async def test_in_flight_real_append_skips_outdated_silence(monkeypatch: pytest.
         fresh_task = h.runner.tasks.append_tail
         assert fresh_task is not None
         assert await fresh_task
-        assert state.last_native_submit_monotonic == pytest.approx(201.8)
-        assert state.silence_deadline_monotonic == pytest.approx(202.8)
+        assert state.last_native_submit_monotonic == pytest.approx(201.805)
+        assert state.silence_deadline_monotonic == pytest.approx(202.805)
     finally:
         release.set()
         await close_harness(h)
@@ -259,10 +256,9 @@ async def test_long_stall_saves_future_deadline_from_actual_submission(
         append_task = h.runner.tasks.append_tail
         assert append_task is not None
         assert await append_task
-        # anchor + 3.0 > anchor + 2.0 (planned deadline + period) -> save
-        # submit_time + period = anchor + 4.0.
-        assert state.last_native_submit_monotonic == pytest.approx(anchor + 3.0)
-        assert state.silence_deadline_monotonic == pytest.approx(anchor + 4.0)
+        # A long stall restarts from the actual submission, including its grace.
+        assert state.last_native_submit_monotonic == pytest.approx(anchor + 3.005)
+        assert state.silence_deadline_monotonic == pytest.approx(anchor + 4.005)
     finally:
         await close_harness(h)
 
@@ -298,8 +294,8 @@ async def test_small_wakeup_delay_preserves_planned_deadline(
 
         # Submitted at anchor + period + 0.2 (within one period): the planned
         # following deadline is kept.
-        assert state.last_native_submit_monotonic == pytest.approx(anchor + CHUNK_PERIOD_S + 0.2)
-        assert state.silence_deadline_monotonic == pytest.approx(anchor + 2 * CHUNK_PERIOD_S)
+        assert state.last_native_submit_monotonic == pytest.approx(anchor + CHUNK_PERIOD_S + 0.205)
+        assert state.silence_deadline_monotonic == pytest.approx(anchor + 2 * CHUNK_PERIOD_S + 0.005)
     finally:
         await close_harness(h)
 
@@ -334,8 +330,8 @@ async def test_exact_one_period_late_preserves_planned_deadline(
         assert await append_task
 
         # Submitted exactly at the planned following deadline: kept.
-        assert state.last_native_submit_monotonic == pytest.approx(anchor + 2 * CHUNK_PERIOD_S)
-        assert state.silence_deadline_monotonic == pytest.approx(anchor + 2 * CHUNK_PERIOD_S)
+        assert state.last_native_submit_monotonic == pytest.approx(anchor + 2 * CHUNK_PERIOD_S + 0.005)
+        assert state.silence_deadline_monotonic == pytest.approx(anchor + 2 * CHUNK_PERIOD_S + 0.005)
     finally:
         await close_harness(h)
 
@@ -366,5 +362,86 @@ async def test_failed_append_leaves_timing_unchanged(monkeypatch: pytest.MonkeyP
         assert await append_task is False
         assert state.last_native_submit_monotonic == before_anchor
         assert state.silence_deadline_monotonic == before_deadline
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_queued_audio_blocks_silence_before_pcm_buffering() -> None:
+    h = await open_harness()
+    try:
+        h.submit(append_audio())
+        assert not h.runner.model_state.audio_buffer.has_pending()
+        assert not h.runner.model_state.audio_buffer.has_reserved()
+        assert h.runner._real_input_waiting()
+        await h.settle()
+        assert not h.runner._real_input_waiting()
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid_audio", [False, True])
+async def test_decoding_audio_blocks_silence_until_handled(monkeypatch, invalid_audio) -> None:
+    h = await open_harness()
+    entered, release = asyncio.Event(), asyncio.Event()
+    original = h.runner.offload
+
+    async def convert(*args, **kwargs):
+        entered.set()
+        await release.wait()
+        if invalid_audio:
+            raise ValueError("invalid audio")
+        return await original(*args, **kwargs)
+
+    monkeypatch.setattr(h.runner, "offload", convert)
+    try:
+        h.submit(append_audio())
+        await asyncio.wait_for(entered.wait(), timeout=2)
+        assert h.session.pending_input_bytes == 0
+        assert not h.runner.model_state.audio_buffer.has_pending()
+        assert not h.runner.model_state.audio_buffer.has_reserved()
+        assert h.runner._real_input_waiting()
+        release.set()
+        await h.settle()
+        assert not h.runner._real_input_waiting()
+    finally:
+        release.set()
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_input_boundary_grace_does_not_submit_silence(monkeypatch) -> None:
+    clock = FakeClock(start=700)
+    real_sleep = asyncio.sleep
+    _install_fake_clock(monkeypatch, clock=clock, real_sleep=real_sleep)
+    h = await _active_response_harness()
+    anchor = clock.value
+    h.runner.model_state.last_native_submit_monotonic = anchor
+    h.runner.model_state.silence_deadline_monotonic = None
+    nominal_deadline = anchor + CHUNK_PERIOD_S
+    clock.value = nominal_deadline
+    arrival = nominal_deadline + 0.002
+    received = False
+
+    async def sleep_with_input(delay):
+        nonlocal received
+        wake = clock.value + delay
+        if not received and clock.value < arrival <= wake:
+            clock.value = arrival
+            h.submit(append_audio())
+            received = True
+            await real_sleep(0)
+        clock.value = wake
+        await real_sleep(0)
+
+    monkeypatch.setattr(asyncio, "sleep", sleep_with_input)
+    try:
+        scheduled = await h.runner._schedule_silence_continuation(
+            h.runner.model.silence_unit_payload(), **_continuation_kwargs(h)
+        )
+        assert scheduled is False
+        assert received
+        assert h.runner.model_state.silence_deadline_monotonic is None
     finally:
         await close_harness(h)

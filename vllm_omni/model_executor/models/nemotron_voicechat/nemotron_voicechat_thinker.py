@@ -53,6 +53,11 @@ from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 
 from vllm_omni.model_executor.duplex_sampling import DuplexSamplingRow
+from vllm_omni.model_executor.models.nemotron_voicechat.perception_cudagraph import (
+    PerceptionCudaGraph,
+    make_perception_graph,
+    perception_step,
+)
 from vllm_omni.model_executor.models.nemotron_voicechat.runtime_info import (
     merge_runtime_info,
     require_request_id,
@@ -302,6 +307,7 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
         streaming_preprocessor_cfg.dither = 0.0
         streaming_preprocessor_cfg.pad_to = 0
         self._streaming_preprocessor = self.perception.from_config_dict(streaming_preprocessor_cfg)
+        self._perception_graph: PerceptionCudaGraph | None = None
 
         # AddFusion weights (the checkpoint uses fuse_method="add" defaults;
         # the same duplex_*_weight keys double as the fusion weights).
@@ -678,24 +684,13 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
                     raise RuntimeError("Nemotron VoiceChat perception cache is missing")
 
             encoder_dtype = next(encoder.parameters()).dtype
-            encoded, encoded_len, cache_channel, cache_time, cache_channel_len = encoder.cache_aware_stream_step(
-                processed_signal=mel_chunk.to(encoder_dtype),
-                processed_signal_length=torch.tensor(
-                    [mel_chunk.shape[-1]],
-                    device=device,
-                    dtype=torch.long,
-                ),
-                cache_last_channel=caches[0],
-                cache_last_time=caches[1],
-                cache_last_channel_len=caches[2],
-                keep_all_outputs=True,
-                drop_extra_pre_encoded=drop_extra_pre_encoded,
-            )
-            encoded, encoded_len = self.perception.modality_adapter(
-                audio_signal=encoded,
-                length=encoded_len,
-            )
-            stable = self.perception.proj(encoded.transpose(1, 2))
+            mel_chunk = mel_chunk.to(encoder_dtype)
+            graph = self._perception_graph
+            if graph is None:
+                frame = perception_step(self.perception, mel_chunk, caches, drop_extra_pre_encoded)
+            else:
+                frame = graph.run(mel_chunk, caches, drop_extra_pre_encoded)
+            stable, encoded_len, cache_channel, cache_time, cache_channel_len = frame
 
         frame_count = int(encoded_len.reshape(-1)[0])
         if frame_count != 1 or stable.shape[1] != 1:
@@ -1176,6 +1171,15 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
         self._streaming_preprocessor.to(device=device, dtype=torch.float32).eval()
         self.embed_tokens.to(device=device, dtype=self._dtype)
         self.function_head.to(device=device, dtype=self._dtype)
+        streaming = self.perception.encoder.streaming_cfg
+        phases = (
+            (_streaming_cfg_at(streaming.chunk_size, 0) + _streaming_cfg_at(streaming.pre_encode_cache_size, 0), 0),
+            (
+                _streaming_cfg_at(streaming.chunk_size, 1) + _streaming_cfg_at(streaming.pre_encode_cache_size, 1),
+                int(streaming.drop_extra_pre_encoded),
+            ),
+        )
+        self._perception_graph = make_perception_graph(self.perception, self.vllm_config, phases)
         loaded |= {f"perception.{n}" for n in perception_state}
         logger.info(
             "NemotronVoiceChat thinker loaded: %d backbone tensors, %d perception tensors, "

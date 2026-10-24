@@ -161,6 +161,7 @@ class _DeferredSilenceContinuation:
 
 
 _CANCEL_EVENTS = frozenset({"input.cancel", "response.cancel", "barge_in", "output_audio_buffer.clear"})
+_INPUT_ARRIVAL_GRACE_S = 0.005
 
 
 def compute_silence_continuation_deadline(
@@ -172,21 +173,19 @@ def compute_silence_continuation_deadline(
 ) -> tuple[float, float]:
     """Return the silence continuation schedule ``(delay_s, next_silence_deadline)``.
 
-    The first continuation anchors to the latest accepted append's submission
-    time (``last_submit + chunk_period_s``), falling back to ``now`` when no
-    submission exists. Later continuations advance from the current deadline
-    instead of from ``now``, so pipeline processing time does not accumulate
-    as timer drift. When the schedule is more than one period overdue it is
-    stale: one continuation submits immediately and the schedule restarts
-    from ``now`` (``next_silence_deadline = now + chunk_period_s``) instead of
-    firing a burst of catch-ups.
+    The first continuation allows up to 5 ms for WebSocket/IPC input at the next frame boundary.
 
-    ``delay_s`` is the wait before this continuation and
-    ``next_silence_deadline`` the deadline for the following one.
+    Later deadlines keep the original period. Without a prior submission, the first deadline anchors to now.
+
+    A schedule more than one period overdue restarts from now instead of firing a burst of catch-ups.
+
+    ``delay_s`` is the wait; ``next_silence_deadline`` is the following frame's deadline.
     """
     if current_deadline is None:
         base = last_submit if last_submit is not None else now
         deadline = base + chunk_period_s
+        if last_submit is not None:
+            deadline += min(_INPUT_ARRIVAL_GRACE_S, chunk_period_s)
     else:
         deadline = current_deadline
     if now - deadline > chunk_period_s:
@@ -1781,10 +1780,8 @@ class DuplexSessionRunner:
         # accepted between the snapshot and this continuation's submission
         # re-anchors the chain; _still_valid() then skips the stale unit.
         anchor = model_state.last_native_submit_monotonic
-        # Align the next silence unit to submission_time_N + chunk_period and
-        # sleep only the remaining budget. The deadline is stored by the
-        # acceptance callback when the append actually submits, so skipped or
-        # stale continuations never advance the clock.
+        # Keep the deadline cadence after the initial input-arrival grace.
+        # Acceptance commits the next deadline, so skipped continuations do not advance the clock.
         delay_s, next_silence_deadline = compute_silence_continuation_deadline(
             chunk_period_s=chunk_period_s,
             now=time.monotonic(),
