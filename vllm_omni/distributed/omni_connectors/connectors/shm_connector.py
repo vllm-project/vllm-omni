@@ -22,6 +22,32 @@ from .base import OmniConnectorBase
 logger = get_connector_logger(__name__)
 
 
+_SAFE_SEGMENT_CHARS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.-")
+# "/dev/shm/shm_{name}_lockfile.lock" must fit in NAME_MAX (255).
+_MAX_SEGMENT_NAME = 255 - len("shm__lockfile.lock")
+_HASHED_SEGMENT_PREFIX = "omni_shm_key_"
+
+
+def _segment_name(key: str) -> str:
+    """Map a transfer key to a valid POSIX SHM name.
+
+    Keys embed client-supplied request ids, which may contain ``/`` or exceed
+    the file-name limit. Safe keys are used unchanged; others are hashed.
+    """
+    if (
+        key
+        and len(key) <= _MAX_SEGMENT_NAME
+        and not key.startswith((".", _HASHED_SEGMENT_PREFIX))
+        and set(key) <= _SAFE_SEGMENT_CHARS
+    ):
+        return key
+    return _HASHED_SEGMENT_PREFIX + hashlib.sha256(key.encode("utf-8", "surrogatepass")).hexdigest()
+
+
+def _lock_path(name: str) -> str:
+    return f"/dev/shm/shm_{name}_lockfile.lock"
+
+
 def _wakeup_enabled() -> bool:
     return os.environ.get("VLLM_OMNI_SHM_WAKEUP", "1") == "1"
 
@@ -206,10 +232,10 @@ class SharedMemoryConnector(OmniConnectorBase):
             payload = self.serialize_obj(data)
             size = len(payload)
 
-            lock_file = f"/dev/shm/shm_{put_key}_lockfile.lock"
-            with open(lock_file, "wb+") as lockf:
+            name = _segment_name(put_key)
+            with open(_lock_path(name), "wb+") as lockf:
                 fcntl.flock(lockf, fcntl.LOCK_EX)
-                meta = shm_write_bytes(payload, name=put_key)
+                meta = shm_write_bytes(payload, name=name)
                 fcntl.flock(lockf, fcntl.LOCK_UN)
 
             # meta contains {'name': ..., 'size': ...}
@@ -253,8 +279,8 @@ class SharedMemoryConnector(OmniConnectorBase):
     def _get_by_key(self, get_key: str) -> tuple[Any, int] | None:
         """Read a SHM segment addressed purely by *get_key*."""
         # Take the publication lock before opening a possibly unsized segment.
-        lock_file = f"/dev/shm/shm_{get_key}_lockfile.lock"
-        result = self._get_data_with_lock(lock_file, {"name": get_key})
+        name = _segment_name(get_key)
+        result = self._get_data_with_lock(_lock_path(name), {"name": name})
         if result is not None:
             with self._pending_keys_lock:
                 self._pending_keys.pop(get_key, None)
@@ -273,7 +299,7 @@ class SharedMemoryConnector(OmniConnectorBase):
 
             if isinstance(metadata, dict) and "shm" in metadata:
                 shm_handle = metadata["shm"]
-                lock_file = f"/dev/shm/shm_{shm_handle['name']}_lockfile.lock"
+                lock_file = _lock_path(shm_handle["name"])
                 result = self._get_data_with_lock(lock_file, shm_handle)
                 if result is not None:
                     with self._pending_keys_lock:
@@ -294,11 +320,12 @@ class SharedMemoryConnector(OmniConnectorBase):
         Returns True when an unconsumed segment was actually unlinked.
         """
         key = request_id
+        name = _segment_name(key)
         unlinked = False
         with self._pending_keys_lock:
             self._pending_keys.pop(key, None)
             try:
-                seg = shm_pkg.SharedMemory(name=key)
+                seg = shm_pkg.SharedMemory(name=name)
                 seg.close()
                 seg.unlink()
                 logger.debug("cleanup: unlinked unconsumed SHM segment %s", key)
@@ -307,7 +334,7 @@ class SharedMemoryConnector(OmniConnectorBase):
                 pass
             except Exception as e:
                 logger.debug("cleanup: failed to unlink SHM segment %s: %s", key, e)
-            lock_file = f"/dev/shm/shm_{key}_lockfile.lock"
+            lock_file = _lock_path(name)
             if os.path.exists(lock_file):
                 try:
                     os.remove(lock_file)
@@ -339,7 +366,7 @@ class SharedMemoryConnector(OmniConnectorBase):
         with self._pending_keys_lock:
             for _ in range(min(max_keys, len(self._pending_keys))):
                 key, _ = self._pending_keys.popitem(last=False)
-                if os.path.exists(f"/dev/shm/{key}"):
+                if os.path.exists(f"/dev/shm/{_segment_name(key)}"):
                     self._pending_keys[key] = None
 
     def health(self) -> dict[str, Any]:
