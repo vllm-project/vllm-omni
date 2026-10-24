@@ -381,10 +381,21 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
             context.parallel_strategy is not ParallelStrategy.NONE
             or context.outer_boundaries
             or context.paged_kv
-            or self.causal
             or extra.get("kv_cache_dtype") not in (None, "float", "auto")
-            or (attn_metadata is not None and attn_metadata.full_attn_spans is not None)
         ):
+            return result
+
+        # Match forward_fa_npu: spans take precedence over the global causal flag.
+        if attn_metadata is not None and attn_metadata.full_attn_spans is not None:
+            return replace(
+                result,
+                path="npu_piecewise",
+                support=CapabilityResult.unmigrated(
+                    "NPU piecewise routing only; kernel and compilation validation require Ascend"
+                ),
+            )
+
+        if self.causal:
             return result
 
         path = "npu_masked" if attn_metadata is not None and attn_metadata.attn_mask is not None else "npu_dense"
@@ -1110,6 +1121,38 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         # Execution errors propagate. Never retry with another precision.
         return runtime(query, key, value, **kwargs)
 
+    @staticmethod
+    def _npu_fusion_attention(
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        *,
+        atten_mask: torch.Tensor | None,
+        sparse_mode: int,
+        softmax_scale: float,
+        inner_precise: int = 0,
+    ) -> torch.Tensor:
+        """Run ``torch_npu.npu_fusion_attention`` on BSND tensors.
+
+        ``atten_mask`` follows Ascend's convention (True = masked out). When it
+        is ``None`` the sparse mode has no effect and full attention is
+        computed, so no mask needs to be materialized.
+        """
+        import torch_npu
+
+        return torch_npu.npu_fusion_attention(
+            query.contiguous(),
+            key.contiguous(),
+            value.contiguous(),
+            head_num=query.shape[2],
+            input_layout="BSND",
+            atten_mask=atten_mask,
+            scale=float(softmax_scale),
+            keep_prob=1.0,
+            inner_precise=inner_precise,
+            sparse_mode=sparse_mode,
+        )[0]
+
     def forward_fa_npu(
         self,
         query: torch.Tensor,
@@ -1117,10 +1160,14 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         value: torch.Tensor,
         attn_metadata: AttentionMetadata | None = None,
     ) -> torch.Tensor:
+        # Piecewise block-causal attention takes precedence, mirroring
+        # ``forward_cuda``: the caller emitted ``full_attn_spans`` instead of a
+        # mask, so the generic mask handling below cannot express it.
+        if attn_metadata is not None and attn_metadata.full_attn_spans is not None:
+            return self._forward_piecewise_npu(query, key, value, attn_metadata)
+
         attention_mask = attn_metadata.attn_mask if attn_metadata else None
         if self.causal:
-            import torch_npu
-
             if attention_mask is None:
                 # The compressed upper-triangular mask with sparse_mode=3
                 # applies FlashAttention's bottom-right causal alignment when
@@ -1151,18 +1198,15 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
                 # the Sq/Skv relationship.
                 inner_precise = 2
 
-            return torch_npu.npu_fusion_attention(
-                query.contiguous(),
-                key.contiguous(),
-                value.contiguous(),
-                head_num=query.shape[2],
-                input_layout="BSND",
+            return self._npu_fusion_attention(
+                query,
+                key,
+                value,
                 atten_mask=npu_attention_mask,
-                scale=float(self.softmax_scale),
-                keep_prob=1.0,
-                inner_precise=inner_precise,
                 sparse_mode=sparse_mode,
-            )[0]
+                softmax_scale=self.softmax_scale,
+                inner_precise=inner_precise,
+            )
 
         from mindiesd import attention_forward
 
@@ -1211,6 +1255,73 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
             opt_mode="manual",
             op_type="fused_attn_score",
             layout=layout,
+        )
+
+    def _npu_piecewise_attn_func(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        *,
+        causal: bool,
+        softmax_scale: float,
+    ) -> torch.Tensor:
+        """``attn_func`` for ``piecewise_attn`` on Ascend.
+
+        Both segment kinds run on ``npu_fusion_attention``:
+          - causal segments (text runs) carry the shared compressed
+            (2048, 2048) mask with ``sparse_mode=3`` (rightDownCausal).
+            ``piecewise_attn`` gives causal segments ``kv_end == q_end`` in
+            global coordinates, so they always satisfy ``Sq <= Skv``;
+            bottom-right alignment reproduces FlashAttention's
+            ``attn(Q[:, s:e], K[:, :e], causal=True)`` contract for both
+            ``Sq < Skv`` and ``Sq == Skv``.
+          - full segments (condition/target image blocks) pass no mask —
+            ``sparse_mode`` is ignored when ``atten_mask`` is ``None`` — so
+            they are plain bidirectional attention over the truncated K/V
+            prefix.
+
+        Inputs follow the model-side ``(B, S, H, D)`` convention == BSND.
+        """
+        if causal:
+            atten_mask = _get_npu_compressed_causal_mask(query.device)
+            sparse_mode = 3
+        else:
+            atten_mask = None
+            sparse_mode = 0
+        return self._npu_fusion_attention(
+            query,
+            key,
+            value,
+            atten_mask=atten_mask,
+            sparse_mode=sparse_mode,
+            softmax_scale=softmax_scale,
+        )
+
+    def _forward_piecewise_npu(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+    ) -> torch.Tensor:
+        """Piecewise block-causal attention on Ascend, mirroring ``forward_cuda``.
+
+        Same segment plan as the CUDA path (``piecewise_attn``); only the
+        per-segment kernel differs (``npu_fusion_attention`` instead of
+        ``flash_attn_func``).
+        """
+        assert attn_metadata.full_attn_spans is not None
+        self._warn_fa_deterministic_non_dense("piecewise-npu")
+        logger.debug("Using piecewise NPU attention for mixed causal/full mask")
+        return piecewise_attn(
+            query,
+            key,
+            value,
+            attn_metadata.full_attn_spans,
+            self.softmax_scale,
+            self._npu_piecewise_attn_func,
+            query_ranges=attn_metadata.query_ranges,
         )
 
     def _resolve_packed_seq_npu(

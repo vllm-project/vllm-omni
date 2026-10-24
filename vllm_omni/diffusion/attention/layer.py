@@ -771,7 +771,19 @@ class Attention(nn.Module):
                     raise NotImplementedError(blocked)
                 return self.sdpa_fallback.forward(query, key, value, attn_metadata)
         dense_mask = attn_metadata.attn_mask if attn_metadata is not None else None
-        if dense_mask is not None and dense_mask.ndim == 4 and self.attn_backend is not None:
+        # Piecewise backends honor full_attn_spans ahead of attn_mask and never read the
+        # dense mask (e.g. HunyuanImage3, which sends both), so there is nothing to divert.
+        spans_take_precedence = (
+            attn_metadata is not None
+            and attn_metadata.full_attn_spans is not None
+            and getattr(self.attn_backend, "supports_piecewise_spans", False)
+        )
+        if (
+            dense_mask is not None
+            and dense_mask.ndim == 4
+            and self.attn_backend is not None
+            and not spans_take_precedence
+        ):
             # A dense 4D mask (for example a padded DiT batch) is a semantic
             # requirement, not a backend hint. Backends that only implement a
             # 2D key-validity mask must not reach their kernel wrapper, which

@@ -1,14 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-import copy
 from dataclasses import MISSING, field
 from typing import Any, Literal
 
 from pydantic import ConfigDict, TypeAdapter
 from transformers import PretrainedConfig
 from vllm.config import ModelConfig
-from vllm.config.utils import CompileFactors, config
+from vllm.config.utils import config
 from vllm.logger import init_logger
 from vllm.transformers_utils.config import (
     get_hf_text_config,
@@ -131,10 +130,9 @@ class OmniModelConfig(ModelConfig):
     async_chunk: bool = False
     session_mode: str = "turn"
     retains_state_across_chunks: bool = False
-    supports_pending_generation: bool = False
     supports_running_prefix_cache_reset: bool = True
     recompute_preemption: Literal["allow", "fail"] = "allow"
-    use_v2_model_runner: bool = True
+    use_v2_model_runner: bool = False
     supports_native_mrv2_data_plane: bool = False
     # Stage-1 active stream slots; 0 keeps legacy chunk-level round-robin.
     active_stream_window: int = 0
@@ -168,31 +166,6 @@ class OmniModelConfig(ModelConfig):
     # ``cfg_role`` for classifier-free-guidance request pairs).
     sampling_extra_args_keys: tuple[str, ...] = ()
     requires_full_payload_input: bool = False
-    scheduling_metadata_adapter: str | None = None
-
-    def compile_factors(self) -> CompileFactors:
-        """Compile factors for the Omni Model config, used for the compile cache.
-
-        v0.34 replaced ``ModelConfig.compute_hash``/``VllmConfig.compute_hash``
-        with ``compile_factors()`` + ``vllm.config.utils.hash_config``; this
-        ports the connector normalization that used to live in the removed
-        ``compute_hash`` override.
-        """
-        from vllm_omni.distributed.omni_connectors.utils.config import connector_hash_factors
-
-        # Remove hash factors on a copy of the object, then use the mutated copy to get the factors.
-        # This is a workaround to vLLM's ModelConfig not having a clean way of changing its config
-        # factors.
-        hashed = copy.copy(self)
-
-        # connector config are handled here to ensure UUIDs don't cause compile cache misses
-        hashed.stage_connector_config = connector_hash_factors(self.stage_connector_config)
-        if self.omni_kv_config and self.omni_kv_config.get("connector_config"):
-            # Create a copy of the omni kv config dict, since the hashed object is a shallow copy
-            hashed.omni_kv_config = dict(self.omni_kv_config)
-            hashed.omni_kv_config["connector_config"] = connector_hash_factors(self.omni_kv_config["connector_config"])
-
-        return super(OmniModelConfig, hashed).compile_factors()
 
     @property
     def registry(self):

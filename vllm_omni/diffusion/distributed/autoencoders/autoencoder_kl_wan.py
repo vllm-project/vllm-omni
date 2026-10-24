@@ -281,6 +281,10 @@ class OmniAutoencoderKLWan(AutoencoderKLWan):
         """Realign 1x1 Wan attention inputs before the first encode or decode."""
         install_wan_attention_sdpa_alignment(self)
 
+    def _install_attention_alignment(self) -> None:
+        """Realign 1x1 Wan attention inputs before the first encode or decode."""
+        install_wan_attention_sdpa_alignment(self)
+
     def encode(self, x: torch.Tensor, return_dict: bool = True):
         with self._execution_context():
             return super().encode(x, return_dict=return_dict)
