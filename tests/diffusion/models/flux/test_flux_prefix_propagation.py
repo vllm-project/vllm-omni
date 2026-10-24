@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Tests that FLUX transformer blocks correctly propagate `quant_config` and
 `prefix` through all sub-layers.
 
@@ -104,7 +104,7 @@ def test_flux_single_transformer_block_passes_prefix():
         f"norm.linear.* not found in params: {sorted(params)}"
     )
 
-    # proj_mlp (ReplicatedLinear) should have weight
+    # proj_mlp (ColumnParallelLinear) should have weight
     assert any(name.startswith("proj_mlp.") for name in params), f"proj_mlp.* not found in params: {sorted(params)}"
 
     # attn should have QKV projection

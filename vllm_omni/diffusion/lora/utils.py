@@ -15,6 +15,7 @@ from vllm_omni.diffusion.lora.layers import (
     DiffusionColumnParallelLinearWithLoRA,
     DiffusionMergedColumnParallelLinearWithLoRA,
     DiffusionMergedQKVParallelLinearWithLoRA,
+    DiffusionMergedRowParallelLinearWithLoRA,
     DiffusionQKVParallelLinearWithLoRA,
     DiffusionReplicatedLinearWithLoRA,
     DiffusionRowParallelLinearWithLoRA,
@@ -208,6 +209,7 @@ def from_layer_diffusion(
         DiffusionQKVParallelLinearWithLoRA,
         DiffusionMergedColumnParallelLinearWithLoRA,
         DiffusionColumnParallelLinearWithLoRA,
+        DiffusionMergedRowParallelLinearWithLoRA,
         DiffusionRowParallelLinearWithLoRA,
         DiffusionReplicatedLinearWithLoRA,
     ]
