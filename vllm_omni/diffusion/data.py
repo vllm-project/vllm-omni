@@ -951,6 +951,8 @@ class OmniDiffusionConfig:
     enable_layerwise_offload: bool = False
     # Distributed layer-wise offloading with H2D + AllGather overlap (RFC-1)
     enable_distributed_layerwise_offload: bool = False
+    dlo_vae_resident: bool = False
+    dlo_text_encoder_resident: bool = False
     # If True: shard weights 1/dp_size + AllGather (saves CPU memory, requires
     # concurrent requests in DP mode). If False: each rank streams the standard
     # loader's rank-local tensors (including TP-local shards) via H2D only.
@@ -973,6 +975,9 @@ class OmniDiffusionConfig:
     # VAE memory optimization parameters
     vae_use_slicing: bool = False
     vae_use_tiling: bool = False
+    vae_tile_size: int | None = None
+    vae_tile_overlap: int | None = None
+    vae_tile_batch_size: int = 1
     # Wan VAE decoder fast path. ``"lossless"`` installs the bit-exact fused
     # kernels on every diffusers Wan VAE, ``"channels_last"`` additionally
     # converts decoder convolution weights to channels-last memory format and
@@ -1240,6 +1245,16 @@ class OmniDiffusionConfig:
         from vllm_omni.diffusion.kv_offload_config import parse_reference_kv_config
 
         parse_reference_kv_config(self.kv_offload_config)
+        if type(self.dlo_vae_resident) is not bool:
+            raise ValueError("dlo_vae_resident must be a boolean")
+        if type(self.dlo_text_encoder_resident) is not bool:
+            raise ValueError("dlo_text_encoder_resident must be a boolean")
+        if self.vae_tile_size is not None and (type(self.vae_tile_size) is not int or self.vae_tile_size <= 0):
+            raise ValueError("vae_tile_size must be a positive integer when set")
+        if self.vae_tile_overlap is not None and (type(self.vae_tile_overlap) is not int or self.vae_tile_overlap < 0):
+            raise ValueError("vae_tile_overlap must be a nonnegative integer when set")
+        if type(self.vae_tile_batch_size) is not int or self.vae_tile_batch_size < 1:
+            raise ValueError("vae_tile_batch_size must be a positive integer")
         if self.hsdp_weight_load_strategy not in {"full", "pre_sharded"}:
             raise ValueError(
                 f"hsdp_weight_load_strategy must be 'full' or 'pre_sharded', got {self.hsdp_weight_load_strategy!r}"

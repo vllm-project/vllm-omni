@@ -544,6 +544,19 @@ def initialize_model(
         if is_distributed_vae:
             model.vae.set_parallel_size(vae_pp_size, mode=vae_mode)
 
+        vae = getattr(model, "vae", None)
+        if od_config.vae_tile_size is not None or od_config.vae_tile_overlap is not None:
+            tiling_setter = getattr(vae, "set_tiling_config", None)
+            if not callable(tiling_setter):
+                raise ValueError("This VAE does not support vae_tile_size or vae_tile_overlap")
+            tiling_setter(tile_size=od_config.vae_tile_size, tile_overlap=od_config.vae_tile_overlap)
+        if vae is not None:
+            tile_batch_setter = getattr(vae, "set_tile_batch_size", None)
+            if callable(tile_batch_setter):
+                tile_batch_setter(od_config.vae_tile_batch_size)
+            elif od_config.vae_tile_batch_size > 1:
+                raise ValueError("This VAE does not support vae_tile_batch_size > 1")
+
         # Apply sequence parallelism if enabled
         # This follows diffusers' pattern where enable_parallelism() is called
         # at model loading time, not inside individual model files

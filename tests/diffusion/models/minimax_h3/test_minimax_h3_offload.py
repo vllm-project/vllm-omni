@@ -636,3 +636,145 @@ def test_requested_model_offload_without_backend_uses_resident_components():
     assert actual is expected
     pipeline.text_encoder.load_to_device.assert_called_once_with()
     pipeline.text_encoder.encode_ids.assert_called_once()
+
+
+@pytest.mark.parametrize("resident", [False, True])
+@pytest.mark.parametrize("text_resident", [False, True])
+@pytest.mark.parametrize("name", ["video_vae", "encoder_component", "decoder_component", "audio_vae", "text_encoder"])
+@pytest.mark.parametrize("fails", [False, True])
+def test_dlo_component_residency_context(mocker, resident, text_resident, name, fails):
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
+    from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
+    from vllm_omni.diffusion.models.minimax_h3.vae import _VideoVAEPartProxy
+
+    pipeline = object.__new__(MiniMaxH3Pipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.od_config = OmniDiffusionConfig(
+        enable_distributed_layerwise_offload=True,
+        dlo_vae_resident=resident,
+        dlo_text_encoder_resident=text_resident,
+    )
+    for module_name in ("video_vae", "audio_vae", "text_encoder"):
+        module = torch.nn.Module()
+        module.load_to_device = mocker.Mock()
+        module.offload_to_cpu = mocker.Mock()
+        setattr(pipeline, module_name, module)
+    for part in ("encoder", "decoder"):
+        proxy = _VideoVAEPartProxy(pipeline.video_vae, part)
+        proxy.load_to_device = mocker.Mock()
+        proxy.offload_to_cpu = mocker.Mock()
+        setattr(pipeline.video_vae, f"{part}_component", proxy)
+    component = getattr(pipeline.video_vae, name) if name.endswith("_component") else getattr(pipeline, name)
+    should_stage = not text_resident if name == "text_encoder" else not resident
+
+    for _ in range(2):
+        with pytest.raises(RuntimeError, match="decode failed") if fails else nullcontext():
+            with pipeline._component_on_device(component):
+                if fails:
+                    raise RuntimeError("decode failed")
+    assert component.load_to_device.call_count == 2 * should_stage
+    assert component.offload_to_cpu.call_count == 2 * should_stage
+
+
+@pytest.mark.parametrize("option", ["dlo_vae_resident", "dlo_text_encoder_resident"])
+def test_dlo_residency_requires_dlo(option):
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
+    from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
+
+    with pytest.raises(ValueError, match="requires distributed layerwise offload"):
+        MiniMaxH3Pipeline(od_config=OmniDiffusionConfig(**{option: True}))
+
+
+def test_dlo_text_residency_rejects_explicit_encoder_offload():
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
+    from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
+
+    config = OmniDiffusionConfig(
+        dlo_text_encoder_resident=True,
+        diffusion_offload_config={
+            "mode": "layer",
+            "components": ["dit", "text_encoder"],
+            "layer_options": {"dit": {"weight_transfer": "allgather"}},
+        },
+    )
+    with pytest.raises(ValueError, match="conflicts with diffusion_offload_config selecting text_encoder"):
+        MiniMaxH3Pipeline(od_config=config)
+
+
+@pytest.mark.parametrize("text_resident", [False, True])
+@pytest.mark.parametrize("vae_resident", [False, True])
+@pytest.mark.parametrize("encoder_loaded", [False, True])
+@pytest.mark.parametrize("compact", [False, True])
+def test_dlo_text_residency_plan_and_placement(
+    monkeypatch, mocker, text_resident, vae_resident, encoder_loaded, compact
+):
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
+    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as pipeline_module
+    from vllm_omni.diffusion.offloader.base import OffloadConfig
+    from vllm_omni.diffusion.offloader.component_utils import prepare_pipeline_components
+    from vllm_omni.diffusion.offloader.plan_resolver import resolve_offload_plan
+
+    # Stop after the real constructor builds its per-instance component plan,
+    # before it resolves or loads checkpoints.
+    monkeypatch.setattr(pipeline_module, "get_local_device", lambda: torch.device("cpu"))
+    monkeypatch.setattr(
+        pipeline_module, "is_minimax_h3_modular", mocker.Mock(side_effect=RuntimeError("stop after component plan"))
+    )
+    config = OmniDiffusionConfig(
+        model="unused",
+        enable_distributed_layerwise_offload=not compact,
+        diffusion_offload_config=(
+            {"mode": "layer", "components": ["dit"], "layer_options": {"dit": {"weight_transfer": "allgather"}}}
+            if compact
+            else None
+        ),
+        dlo_text_encoder_resident=text_resident,
+        dlo_vae_resident=vae_resident,
+        model_loaded={"text_encoder": encoder_loaded},
+    )
+    pipeline = object.__new__(pipeline_module.MiniMaxH3Pipeline)
+    original_plan = pipeline._offload_plan
+    with pytest.raises(RuntimeError, match="stop after component plan"):
+        pipeline.__init__(od_config=config)
+    assert pipeline._encoder_modules == (["text_encoder"] if encoder_loaded else [])
+    assert ("text_encoder" in pipeline._offload_plan.encoder_block_attrs) is (encoder_loaded and not text_resident)
+    assert ("text_encoder" in pipeline._offload_plan.on_demand_component_paths) is (
+        encoder_loaded and not text_resident
+    )
+    assert ("video_vae" in pipeline._offload_plan.on_demand_component_paths) is (not vae_resident)
+    assert "text_encoder" in original_plan.encoder_block_attrs
+    assert original_plan.on_demand_component_paths == {"text_encoder", "video_vae", "audio_vae"}
+
+    class _DiT(torch.nn.Module):
+        _layerwise_offload_blocks_attrs = ["blocks"]
+
+    pipeline.transformer = _DiT()
+    pipeline.transformer.blocks = torch.nn.ModuleList([torch.nn.Linear(2, 2) for _ in range(2)])
+    pipeline.transformers_ref = None
+    for name in ("text_encoder", "video_vae", "audio_vae"):
+        module = torch.nn.Module()
+        module.load_to_device = mocker.Mock()
+        module.offload_to_cpu = mocker.Mock()
+        module.to = mocker.Mock(wraps=module.to)
+        setattr(pipeline, name, module)
+    pipeline.text_encoder.vision = torch.nn.Module()
+    pipeline.text_encoder.vision.blocks = torch.nn.ModuleList([torch.nn.Linear(2, 2) for _ in range(2)])
+    pipeline.text_encoder.text_model = torch.nn.Module()
+    pipeline.text_encoder.text_model.layers = torch.nn.ModuleList([torch.nn.Linear(2, 2) for _ in range(2)])
+    resolved = resolve_offload_plan(pipeline, OffloadConfig.from_od_config(config))
+    encoder_streamed = encoder_loaded and not text_resident and not compact
+    assert bool(resolved.encoders) is encoder_loaded
+    if encoder_loaded:
+        assert bool(resolved.encoders[0].stacks) is encoder_streamed
+        assert resolved.encoders[0].on_demand is encoder_streamed
+    assert bool(resolved.dits[0].stacks)
+    assert resolved.dits[0].selected
+    assert all(component.on_demand is (not vae_resident and not compact) for component in resolved.vaes)
+
+    install_encoder_hooks = mocker.Mock(return_value=True)
+    prepare_pipeline_components(
+        resolved, device=torch.device("cpu"), staged_components=[], enable_encoder_blocks=install_encoder_hooks
+    )
+    assert install_encoder_hooks.call_count == int(encoder_streamed)
+    assert pipeline.text_encoder.offload_to_cpu.call_count == int(encoder_streamed)
+    assert pipeline.text_encoder.to.call_count == int(encoder_loaded and not encoder_streamed)

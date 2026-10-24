@@ -65,6 +65,13 @@ Search by using: `--help=<ConfigGroup>` to explore options by section (e.g.,
 """
 
 
+def _positive_tile_batch_size(value: str) -> int:
+    parsed = int(value)
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("vae-tile-batch-size must be a positive integer")
+    return parsed
+
+
 def _parse_stage_overrides(value: str) -> dict[str, dict[str, Any]]:
     """Adapt shared stage-override validation to argparse's error type."""
     try:
@@ -890,6 +897,29 @@ class OmniServeCommand(CLISubcommand):
             help="Enable VAE tiling for memory optimization (useful for mitigating OOM issues).",
         )
         omni_config_group.add_argument(
+            "--vae-tile-size",
+            type=int,
+            default=None,
+            help="Spatial tile edge length in pixels for MiniMax H3 video VAE encoding and decoding. "
+            "Must be positive, divisible by the VAE spatial compression ratio, and larger than both minimum overlaps. "
+            "Unset preserves checkpoint defaults; does not enable VAE tiling.",
+        )
+        omni_config_group.add_argument(
+            "--vae-tile-overlap",
+            type=int,
+            default=None,
+            help="Minimum spatial tile overlap in pixels for MiniMax H3 video VAE encoding and decoding. "
+            "Must be nonnegative, divisible by the VAE spatial compression ratio, and smaller than both tile sizes. "
+            "Unset preserves checkpoint defaults; does not enable VAE tiling.",
+        )
+        omni_config_group.add_argument(
+            "--vae-tile-batch-size",
+            type=_positive_tile_batch_size,
+            default=None,
+            help="Maximum decoder spatial tiles per rank per forward (MiniMax H3). "
+            "Requires VAE tiling; defaults to 1. The final batch uses only remaining tiles.",
+        )
+        omni_config_group.add_argument(
             "--vae-fast-path",
             choices=("off", "lossless", "channels_last"),
             default="lossless",
@@ -972,6 +1002,20 @@ class OmniServeCommand(CLISubcommand):
             action="store_true",
             help="Compatibility alias for distributed layerwise CPU offload. "
             "New integrations should use mode=layer and configure weight transfer per component.",
+        )
+        omni_config_group.add_argument(
+            "--dlo-vae-resident",
+            action=argparse.BooleanOptionalAction,
+            default=False,
+            help="Keep loaded MiniMax H3 video and audio VAEs resident on device during "
+            "distributed layerwise offload. Requires additional device memory.",
+        )
+        omni_config_group.add_argument(
+            "--dlo-text-encoder-resident",
+            action=argparse.BooleanOptionalAction,
+            default=False,
+            help="Keep the loaded MiniMax H3 text encoder, including its vision module, resident on device "
+            "during distributed layerwise offload. Requires additional device memory.",
         )
         omni_config_group.add_argument(
             "--dlo-use-allgather",

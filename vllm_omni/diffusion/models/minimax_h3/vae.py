@@ -10,7 +10,7 @@ import os
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import numpy as np
 import torch
@@ -37,6 +37,10 @@ from .chunked_decode import decode_h3_chunks
 from .ops import install_h3_vae_optimizations
 from .packed_tokens import minimax_h3_patchify_video_latent
 from .vae_temporal import install_temporal_stream_patches
+from .vae_tiling import TileBatchExecutor
+
+if TYPE_CHECKING:
+    from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
 MINIMAX_H3_KEYFRAME_ENCODE_SEED = 42
 MINIMAX_H3_AUDIO_SAMPLE_RATE = 32000
@@ -345,6 +349,7 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         decode_only: bool = False,
         trust_remote_code: bool = False,
         decoder_source: str | Mapping[str, str] | None = None,
+        quant_config: QuantizationConfig | None = None,
     ) -> None:
         super().__init__()
         self._device_target = device
@@ -352,6 +357,20 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         self.decode_only = bool(decode_only)
         if self.encode_only and self.decode_only:
             raise ValueError("MiniMax H3 video VAE cannot be both encode-only and decode-only")
+        if quant_config is not None:
+            from .vae_int8 import (
+                install_h3_video_vae_int8,
+                validate_h3_video_vae_quant_config,
+            )
+
+            # Validate before loading native weights or resolving the alternative
+            # NVFP4 decoder, including its CUDA-only capability check.
+            validate_h3_video_vae_quant_config(
+                quant_config,
+                device=device,
+                encode_only=self.encode_only,
+                decoder_source=decoder_source,
+            )
         from .vae_nvfp4 import (
             install_nvfp4_video_decoder,
             released_decoder_pixels,
@@ -375,14 +394,57 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         # weights may be materialized in FP16 because reference decode casts
         # those same tensors through CUDA autocast on every tile.
         initial_device = load_device or device
-        weight_device = torch.device("cpu") if decoder_path is not None else initial_device
+        # Convert one decoder Linear at a time on the NPU rather than staging
+        # the entire floating-point VAE there before online INT8 conversion.
+        weight_device = torch.device("cpu") if decoder_path is not None or quant_config is not None else initial_device
         self.remote.eval().to(device=weight_device, dtype=torch.float32)
         if decoder_path is not None:
             install_nvfp4_video_decoder(self.remote.model, decoder_path)
             self.decode_dtype = torch.bfloat16
             self.remote.to(device=initial_device)
         decoder = getattr(self.remote.model, "decoder", None)
-        if decoder is not None and decoder_path is None:
+        use_omni_ops = os.environ.get("MINIMAX_H3_VAE_USE_OMNI_OPS", "0").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        if use_omni_ops:
+            # Check the execution target, not CPU checkpoint/offload storage.
+            if (
+                not self.encode_only
+                and decoder is not None
+                and decoder_path is None
+                and device.type == "npu"
+                and current_omni_platform.is_npu()
+            ):
+                from .vae_ops import patch_minimax_h3_video_vae
+
+                patch_minimax_h3_video_vae(self.remote.model)
+            else:
+                logger.info(
+                    "Skip MiniMax H3 VAE Omni ops: encode_only=%s, decoder=%s, replacement=%s, "
+                    "target=%s, platform_npu=%s",
+                    self.encode_only,
+                    decoder is not None,
+                    decoder_path is not None,
+                    device,
+                    current_omni_platform.is_npu(),
+                )
+        if quant_config is not None:
+            self._int8_report = install_h3_video_vae_int8(
+                decoder,
+                quant_config,
+                quant_device=device,
+                storage_device=initial_device,
+                compute_dtype=self.decode_dtype,
+            )
+            # Preserve registered INT8 weights and FP32 scales/biases. All
+            # replacements must precede the residency stagers' snapshots.
+            self.remote.to(device=initial_device)
+            if not self.decode_only and next(self.remote.parameters()).dtype != torch.float32:
+                raise ValueError("MiniMax H3 INT8 video VAE requires an FP32 encoder/boundary first parameter")
+        if decoder is not None and decoder_path is None and quant_config is None:
             install_h3_vae_optimizations(
                 decoder,
                 device=device,
@@ -403,6 +465,7 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         self._tile_gather_workspace: torch.Tensor | None = None
         self._tile_gather_stats = {"hits": 0, "allocs": 0, "workspace_bytes": 0}
         self._checkpoint_tile_gather = None
+        self._tile_batch_executor: TileBatchExecutor | None = None
         if self._tile_gather_reuse_enabled():
             self._install_persistent_tile_gather()
 
@@ -533,6 +596,72 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
             tp_rank=0,
         )
         self.model.parallel_tiling = enabled
+
+    def set_tiling_config(self, *, tile_size: int | None = None, tile_overlap: int | None = None) -> None:
+        """Validate spatial overrides together before changing either VAE grid."""
+        if tile_size is None and tile_overlap is None:
+            return
+        if tile_size is not None and (type(tile_size) is not int or tile_size <= 0):
+            raise ValueError("vae_tile_size must be a positive integer")
+        if tile_overlap is not None and (type(tile_overlap) is not int or tile_overlap < 0):
+            raise ValueError("vae_tile_overlap must be a nonnegative integer")
+        model = self.model
+        ratio = int(model.vae_ratio)
+        if ratio <= 0:
+            raise ValueError("VAE spatial compression ratio must be positive")
+        if tile_size is not None and tile_size % ratio != 0:
+            raise ValueError(f"vae_tile_size must be divisible by the VAE spatial compression ratio ({ratio})")
+        if tile_overlap is not None and tile_overlap % ratio != 0:
+            raise ValueError(f"vae_tile_overlap must be divisible by the VAE spatial compression ratio ({ratio})")
+
+        encoder_size = model.tile_size if tile_size is None else tile_size
+        decoder_size = model.decoder_tile_size if tile_size is None else tile_size
+        encoder_overlap = model.tile_overlap_min if tile_overlap is None else tile_overlap
+        decoder_overlap = model.decoder_tile_overlap_min if tile_overlap is None else tile_overlap
+        if encoder_size <= encoder_overlap or decoder_size <= decoder_overlap:
+            raise ValueError("vae_tile_size must exceed vae_tile_overlap on both encoder and decoder grids")
+
+        # The checkpoint copies tile_size to decoder_tile_size only at init.
+        if tile_size is not None:
+            model.tile_size = tile_size
+            model.decoder_tile_size = tile_size
+        if tile_overlap is not None:
+            model.tile_overlap_min = tile_overlap
+            model.decoder_tile_overlap_min = tile_overlap
+        logger.info(
+            "MiniMax H3 VAE tile sizes: encoder=%d, decoder=%d pixels; "
+            "minimum overlaps: encoder=%d, decoder=%d; spatial ratio=%d",
+            model.tile_size,
+            model.decoder_tile_size,
+            model.tile_overlap_min,
+            model.decoder_tile_overlap_min,
+            ratio,
+        )
+
+    def set_tile_batch_size(self, batch_size: int) -> None:
+        """Bound the number of decoder spatial tiles in each rank-local forward."""
+        if type(batch_size) is not int or batch_size < 1:
+            raise ValueError("vae_tile_batch_size must be a positive integer")
+        if self.encode_only:
+            return
+        if self._tile_batch_executor is not None:
+            raise RuntimeError("VAE tile batch executor has already been configured")
+        if batch_size == 1:
+            return
+        if not self.use_tiling or not self.model.decoder_tiling:
+            raise ValueError("vae_tile_batch_size > 1 requires decoder VAE tiling")
+        cpu_group = None
+        if self.parallel_size > 1:
+            world = get_world_group()
+            cpu_group = world.cpu_group
+            device_group = self._native_parallel_state()["sp_process_group"]
+            if dist.get_backend(cpu_group) != "gloo" or dist.get_process_group_ranks(
+                cpu_group
+            ) != dist.get_process_group_ranks(device_group):
+                raise ValueError("VAE tile batching requires a matching Gloo CPU control group")
+        self._tile_batch_executor = TileBatchExecutor(self.model, batch_size, cpu_group)
+        self.model._run_tile_tasks = self._tile_batch_executor.run
+        logger.info("MiniMax H3 decoder vae_tile_batch_size=%d per rank; tail batches are unpadded", batch_size)
 
     def _native_parallel_state(self) -> dict[str, Any]:
         """Return the checkpoint's own mutable parallel-state dict."""

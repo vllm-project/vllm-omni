@@ -175,6 +175,26 @@ This mode means:
 
 ### Component allocator-cache retention
 
+MiniMax H3's compatibility DLO lifecycle stages VAEs on demand by default.
+With `dlo_vae_resident=true`, the pipeline initializes loaded Video and Audio
+VAEs on the device, removes them from its instance's on-demand plan, and skips
+runtime staging for both the whole VAEs and the Video VAE encode/decode proxies.
+This trades persistent per-rank device memory for eliminating repeated VAE
+weight transfers. DiT/text-encoder offload and allocator-cache cleanup are
+unchanged; cache cleanup does not free live resident weights. Omitted VAE
+components remain omitted, and non-DLO MiniMax H3 configurations reject the flag.
+
+Independently, `dlo_text_encoder_resident=true` removes the loaded MiniMax H3
+encoder's block-stack and on-demand declarations from the instance plan and skips
+its manual staging lifecycle. Component discovery still identifies it as an
+encoder. Shared backend preparation places it on the device without installing
+encoder block hooks; subsequent resident encode calls reuse those weights.
+The vision module is resident together with the language model, preserving
+encoder TP ownership and unloaded stubs. The default is false, an effective DLO
+strategy is required, and explicit `text_encoder` offload selection conflicts
+with residency. The VAE flag and DiT offload remain independent. Allocator-cache
+registration and cleanup do not evict these live resident weights.
+
 MiniMax-H3 DLO keeps one bounded PyTorch allocator cache across its staged
 encoder, DiT, and VAE component boundaries so allocations released by one
 component can be reused by the next. The DiT prefetch path and its two shared
