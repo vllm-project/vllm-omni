@@ -712,8 +712,9 @@ class DistributedLayerwiseOffloadHook(ModelHook):
             slot_contaminated = True
             if self._shared_slot_group is not None:
                 slot_contaminated = weights_overwritten or self._shared_slot_group[self.current_slot] != self._group_id
-            if slot_contaminated:
-                # Another group (or no group) wrote to our slot — re-fetch
+            if slot_contaminated or not self.is_materialized:
+                # A failed pass can offload the first block before the tail
+                # prefetches it again, while the slot still belongs to this group.
                 self._prev_hook.prefetch_layer(self.current_slot, non_blocking=False)
             # Always wait for data to be ready (handles both sync and async paths)
             self._prev_hook._wait_for_weights(self.current_slot)
