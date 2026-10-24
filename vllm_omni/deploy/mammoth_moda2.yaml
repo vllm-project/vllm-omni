@@ -25,6 +25,10 @@ stages:
     # Optional online FP8 quantization for the DiT stage only; uncomment to
     # enable. Keep the stage-0 AR model in BF16.
     # quantization: fp8
+    # Optional regional torch.compile of the DiT blocks (compiles once at
+    # startup). Set instead of `enforce_eager: true` above; combines with
+    # Cache-DiT below.
+    # enforce_eager: false
     # Optional Cache-DiT acceleration for the DiT stage (~2x faster denoise,
     # training-free). Request mode only; uncomment to enable.
     # guidance=1.0 requests bypass it. Use mammoth_moda2_step.yaml for step mode.
