@@ -554,18 +554,20 @@ class Attention(nn.Module):
                 "declare local_q_replicated_kv when K/V is replicated on each rank"
             )
         paged_adapter = self._active_paged_kv_adapter()
-        in_kv_memory_profile = is_forward_context_available() and get_forward_context().in_diffusion_kv_memory_profile
+        profile_paged_attention = self._is_paged_kv_memory_profile()
         if (
             self._scheduler_paged_kv
             and self.paged_kv_cache_role is not None
             and paged_adapter is None
-            and not in_kv_memory_profile
+            and not profile_paged_attention
         ):
             raise RuntimeError(
                 "Scheduler-paged diffusion attention reached model forward without an active Worker adapter. "
                 "Only the startup KV memory profile may execute before paged KV initialization."
             )
-        use_paged_attention = paged_adapter is not None and self.paged_kv_cache_role is not None
+        use_paged_attention = self.paged_kv_cache_role is not None and (
+            paged_adapter is not None or profile_paged_attention
+        )
         if use_paged_attention and not getattr(self.attn_backend, "supports_paged_kv", False):
             backend_name = (
                 self.attn_backend.get_name() if self.attn_backend is not None else type(self.attention).__name__
@@ -648,7 +650,12 @@ class Attention(nn.Module):
         # 2. This is the shared GPU/NPU boundary. The Worker adapter prepares
         # the native page-table context after SP has produced rank-local Q/K/V;
         # backend resolution below selects CUDA or Ascend execution.
-        if use_paged_attention:
+        if profile_paged_attention:
+            # Capacity profiling needs model activations and collectives, not
+            # KV contents or an attention result. Avoid cache allocation,
+            # writes, and backend workspaces until the native pool exists.
+            out = torch.zeros_like(query)
+        elif use_paged_attention:
             assert paged_adapter is not None
             paged_kv_context = paged_adapter.prepare_layer_context(
                 self.prefix,
@@ -779,9 +786,19 @@ class Attention(nn.Module):
         return getattr(get_forward_context(), "paged_kv_adapter", None)
 
     def is_paged_kv_active(self) -> bool:
-        """Return whether this layer will use Scheduler-managed paged KV."""
+        """Select paged model semantics, including the pre-allocation profile."""
 
-        return self.paged_kv_cache_role is not None and self._active_paged_kv_adapter() is not None
+        return self.paged_kv_cache_role is not None and (
+            self._active_paged_kv_adapter() is not None or self._is_paged_kv_memory_profile()
+        )
+
+    def _is_paged_kv_memory_profile(self) -> bool:
+        return (
+            self._scheduler_paged_kv
+            and self.paged_kv_cache_role is not None
+            and is_forward_context_available()
+            and get_forward_context().in_diffusion_kv_memory_profile
+        )
 
     def _run_local_attention(self, query, key, value, attn_metadata):
         if self._has_custom_attention:
@@ -863,27 +880,6 @@ class Attention(nn.Module):
             )
         ):
             logger.warning_once("Using SDPA for this layer's FP32 input with automatic CUDA FlashAttention selection.")
-            return cast(AttentionImpl, self.sdpa_fallback).forward(query, key, value, attn_metadata)
-
-        in_kv_memory_profile = is_forward_context_available() and get_forward_context().in_diffusion_kv_memory_profile
-        # The startup KV-capacity profile needs tensor shapes, not a paged
-        # attention result. If dense FLASH_ATTN deps are absent (NPU MindIE-SD
-        # or CUDA CuTe FA4), SDPA provides that profile forward. Formal paged
-        # requests never use this branch because their Worker adapter is active.
-        # A user-explicit backend must run or raise.
-        if (
-            self._scheduler_paged_kv
-            and self.paged_kv_cache_role is not None
-            and in_kv_memory_profile
-            and self.attn_backend is not None
-            and self.attn_backend.get_name() == "FLASH_ATTN"
-            and not current_omni_platform.supports_diffusion_dense_flash_attention()
-        ):
-            assert self.sdpa_fallback is not None
-            logger.warning_once(
-                "The startup KV memory profile is using SDPA because dense FLASH_ATTN is unavailable. "
-                "Formal paged requests still use the platform-native paged attention backend."
-            )
             return cast(AttentionImpl, self.sdpa_fallback).forward(query, key, value, attn_metadata)
 
         return self.attention.forward(query, key, value, attn_metadata)

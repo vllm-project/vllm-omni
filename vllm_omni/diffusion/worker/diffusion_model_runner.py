@@ -1001,9 +1001,12 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         This deliberately bypasses Scheduler admission and Diffusion KV
         metadata validation because cache capacity has not been sized yet.
         It otherwise uses the normal execution-mode path so model inputs,
-        collective communication, backend workspaces, denoising, and decode
-        allocations contribute to the observed peak. Step execution profiles
-        one fused ``InputBatch`` instead of sequential single-request forwards.
+        collective communication, denoising, and decode allocations contribute
+        to the observed peak. Marked paged attention returns zero outputs
+        without reading or writing KV; real attention kernels run after cache
+        allocation, during valid startup warmup or on the first real request
+        when the model skips warmup. Step execution profiles one fused
+        ``InputBatch`` instead of sequential single-request forwards.
         """
 
         if not requests:

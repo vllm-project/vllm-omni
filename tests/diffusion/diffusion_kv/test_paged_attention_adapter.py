@@ -1325,7 +1325,8 @@ def test_layer_adapter_accepts_platform_native_backend_and_uses_rank_local_heads
     assert impl_kwargs["num_kv_heads"] == 2
 
 
-def test_omni_attention_wraps_paged_kernel_with_sp_hooks() -> None:
+@pytest.mark.parametrize("memory_profile", [False, True])
+def test_omni_attention_wraps_paged_kernel_with_sp_hooks(memory_profile) -> None:
     events: list[str] = []
 
     class Strategy:
@@ -1356,6 +1357,7 @@ def test_omni_attention_wraps_paged_kernel_with_sp_hooks() -> None:
     layer = Attention.__new__(Attention)
     nn.Module.__init__(layer)
     layer._explicit_cross_contract = False
+    layer._scheduler_paged_kv = True
     layer.prefix = "layer-0"
     layer.paged_kv_cache_role = "primary"
     layer.attn_backend = SimpleNamespace(supports_paged_kv=True, get_name=lambda: "FLASH_ATTN")
@@ -1366,15 +1368,19 @@ def test_omni_attention_wraps_paged_kernel_with_sp_hooks() -> None:
     layer._with_kv_cache_dtype = lambda metadata: metadata
     original = torch.zeros(1, 2, 2, 4)
 
-    with set_forward_context(), override_paged_kv_adapter(Adapter()):
+    with (
+        set_forward_context(in_diffusion_kv_memory_profile=memory_profile),
+        nullcontext() if memory_profile else override_paged_kv_adapter(Adapter()),
+    ):
         assert layer.is_paged_kv_active()
         output = layer._forward_impl(original, original, original)
 
-    assert events == ["pre", "prepare", "kernel", "post"]
-    assert torch.equal(output, torch.full_like(original, 6))
+    assert events == (["pre", "post"] if memory_profile else ["pre", "prepare", "kernel", "post"])
+    assert torch.equal(output, torch.full_like(original, 4 if memory_profile else 6))
 
 
-def test_omni_attention_strips_paged_ulysses_padding_around_kernel() -> None:
+@pytest.mark.parametrize("memory_profile", [False, True])
+def test_omni_attention_strips_paged_ulysses_padding_around_kernel(memory_profile) -> None:
     events: list[tuple[str, tuple[int, ...]]] = []
 
     class Strategy:
@@ -1403,6 +1409,7 @@ def test_omni_attention_strips_paged_ulysses_padding_around_kernel() -> None:
     layer = Attention.__new__(Attention)
     nn.Module.__init__(layer)
     layer._explicit_cross_contract = False
+    layer._scheduler_paged_kv = True
     layer.prefix = "layer-0"
     layer.paged_kv_cache_role = "primary"
     layer.attn_backend = SimpleNamespace(supports_paged_kv=True, get_name=lambda: "FLASH_ATTN")
@@ -1412,12 +1419,16 @@ def test_omni_attention_strips_paged_ulysses_padding_around_kernel() -> None:
     layer._get_active_parallel_strategy = lambda: Strategy()
     tensor = torch.arange(5, dtype=torch.float32).reshape(1, 5, 1, 1)
 
-    with set_forward_context(), override_paged_kv_adapter(Adapter()):
+    with (
+        set_forward_context(in_diffusion_kv_memory_profile=memory_profile),
+        nullcontext() if memory_profile else override_paged_kv_adapter(Adapter()),
+    ):
         get_forward_context().sp_padding_size = 1
         output = layer._forward_impl(tensor, tensor, tensor)
 
-    assert events == [("kernel_input", (1, 4, 1, 1)), ("post", (1, 5, 1, 1))]
-    assert output.flatten().tolist() == [0.0, 1.0, 2.0, 3.0, 0.0]
+    expected_events = [] if memory_profile else [("kernel_input", (1, 4, 1, 1))]
+    assert events == expected_events + [("post", (1, 5, 1, 1))]
+    assert output.flatten().tolist() == ([0.0] * 5 if memory_profile else [0.0, 1.0, 2.0, 3.0, 0.0])
 
 
 def test_omni_attention_rejects_paged_request_for_backend_without_paged_support() -> None:

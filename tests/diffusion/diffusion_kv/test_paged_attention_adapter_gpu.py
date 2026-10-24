@@ -18,6 +18,9 @@ from tests.helpers.kv_layout import build_kv_cache_tensor
 from tests.helpers.mark import hardware_marks
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.backends.flash_attn import FlashAttentionImpl
+from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.config import set_current_diffusion_config
+from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.diffusion_kv.layout import resolve_diffusion_kv_cache_layout
 from vllm_omni.diffusion.diffusion_kv.paged_attention_adapter import (
     DiffusionPagedAttentionAdapter,
@@ -25,6 +28,7 @@ from vllm_omni.diffusion.diffusion_kv.paged_attention_adapter import (
     DiffusionPagedAttentionRow,
     DiffusionPagedAttentionRowBinding,
 )
+from vllm_omni.diffusion.forward_context import override_paged_kv_adapter, set_forward_context
 from vllm_omni.diffusion.vllm_config import _DiffusionVllmModelConfig
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, *hardware_marks(res={"cuda": "L4"}, num_cards=1)]
@@ -118,6 +122,7 @@ def _native_adapter(num_rows: int = 1):
         )
         block_tables = BlockTables(
             block_sizes=[_BLOCK_SIZE],
+            kernel_block_sizes=kernel_block_sizes,
             max_num_reqs=num_rows,
             max_num_batched_tokens=32 * num_rows,
             max_num_blocks_per_group=[2],
@@ -140,6 +145,41 @@ def _native_adapter(num_rows: int = 1):
         ),
     )
     return adapter, diffusion_layer, device
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for native paged attention")
+def test_empty_kv_profile_then_native_paged_attention() -> None:
+    device = torch.device("cuda", torch.accelerator.current_device_index())
+    config = OmniDiffusionConfig(diffusion_kv_mode="paged_scheduler", diffusion_kv_max_rows_per_request=2)
+    with set_current_diffusion_config(config):
+        attention = Attention(
+            num_heads=_NUM_HEADS,
+            head_size=_HEAD_SIZE,
+            causal=False,
+            softmax_scale=_HEAD_SIZE**-0.5,
+            prefix=_LAYER_NAME,
+            paged_kv_cache_role="primary",
+            skip_sequence_parallel=True,
+        )
+    qkv = torch.randn(3, 1, 19, _NUM_HEADS, _HEAD_SIZE, device=device, dtype=torch.float16)
+    query, key, value = qkv.unbind(0)
+    with set_forward_context(in_diffusion_kv_memory_profile=True):
+        assert attention.is_paged_kv_active()
+        profiled = attention(query, key, value)
+    torch.testing.assert_close(profiled, torch.zeros_like(query), rtol=0, atol=0)
+    assert not attention.is_paged_kv_active()
+
+    # Allocate the real native cache only after the empty-KV forward.
+    adapter, _, _ = _native_adapter()
+    batch = adapter.prepare_batch(
+        [DiffusionPagedAttentionRow(request_id="after-profile", sequence_id=0, query_len=19, seq_len=19)]
+    )
+    with set_forward_context(), adapter.activate(batch), override_paged_kv_adapter(adapter):
+        actual = attention(query, key, value)
+    reference = F.scaled_dot_product_attention(
+        query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2)
+    ).transpose(1, 2)
+    torch.testing.assert_close(actual, reference, rtol=2e-2, atol=2e-2)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for native paged attention")
