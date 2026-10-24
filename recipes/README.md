@@ -91,6 +91,7 @@ for RTX 4090, RTX 5090, DGX Spark, and RTX PRO 6000 Blackwell.
 | [`meituan-longcat/LongCat-Video-Avatar-1.5.md`](./meituan-longcat/LongCat-Video-Avatar-1.5.md) | Audio-driven avatar video generation (AT2V / AI2V, single- and multi-speaker, AVC continuation) | 1x H100 80GB |
 | [`mistralai/Voxtral-TTS.md`](./mistralai/Voxtral-TTS.md) | Online serving for TTS | 1x RTX 4090 24GB |
 | [`Robbyant/LingBot-Video.md`](./Robbyant/LingBot-Video.md) | Native dense and MoE text-to-video serving | Dense: 1x L20X; MoE: 1x L20X (~67.7 GiB peak) |
+| [`Robbyant/LingBot-VLA-2.0-H200.md`](./Robbyant/LingBot-VLA-2.0-H200.md) | Online OpenPI serving for the LingBot-VLA 2.0 vision-language-action policy | 1x H200 141GB |
 | [`SandAI/MAGI-2-preview-L20X.md`](./SandAI/MAGI-2-preview-L20X.md) | Native Preview-stage text/image-to-video-and-audio generation | 1x/4x NVIDIA L20X 140 GiB qualified |
 | [`Robbyant/LingBot-World-2.0.md`](./Robbyant/LingBot-World-2.0.md) | Offline and experimental realtime interactive world generation | 1x H200/B200 or 2x B200 for TP=2 |
 | [`TaoLiveAIGC/TaoMate-H3.md`](./TaoLiveAIGC/TaoMate-H3.md) | Realtime streaming presenter: MiniMax-H3 + TaoMate LoRA on the AR-Diffusion runtime | 2x H200-class FP8 (USP2) or 4x BF16 (USP4) |

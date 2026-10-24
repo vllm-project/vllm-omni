@@ -1242,6 +1242,8 @@ class OnlineOmniClient:
         ``request_config`` keys:
 
         - ``operations``: optional sequence of ``{"endpoint": "infer"|"reset", "payload": {...}}``.
+          An operation with ``"expect_error": True`` must be rejected by the server; its error
+          message is recorded as ``{"type": "error", "message": ...}`` and the session continues.
         - ``run_default_policy_session``: when true and ``operations`` is omitted, run infer then reset
           using :func:`build_openpi_droid_observation`.
         - ``run_dreamzero_policy_session``: when true and ``operations`` is omitted, run the DreamZero
@@ -1300,7 +1302,15 @@ class OnlineOmniClient:
             for operation in operations:
                 endpoint = str(operation["endpoint"])
                 payload = dict(operation.get("payload") or {})
-                response = session._send_operation(endpoint, payload)
+                if operation.get("expect_error"):
+                    try:
+                        session._send_operation(endpoint, payload)
+                    except RuntimeError as error:
+                        operation_responses.append({"type": "error", "message": str(error)})
+                        continue
+                    raise AssertionError(f"OpenPI {endpoint!r} succeeded, but the operation expected an error")
+                else:
+                    response = session._send_operation(endpoint, payload)
                 operation_responses.append(response)
                 if endpoint == "infer":
                     if isinstance(response, dict):

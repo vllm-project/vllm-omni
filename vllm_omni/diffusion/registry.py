@@ -256,6 +256,11 @@ _DIFFUSION_MODELS = {
         "pipeline_gr00t",
         "Gr00tN1d7Pipeline",
     ),
+    "LingBotVLAV2Pipeline": (
+        "lingbot_vla_v2",
+        "pipeline_lingbot_vla_v2",
+        "LingBotVLAV2Pipeline",
+    ),
     "Pi0Pipeline": (
         "pi0",
         "pipeline_pi0",
@@ -454,6 +459,9 @@ _NO_CACHE_ACCELERATION = {
     # Pipelines that do not support cache acceleration (cache_dit / tea_cache).
     "NextStep11Pipeline",
     "AnimaPipeline",
+    # LingBot-VLA 2.0 samples actions in its own flow-matching loop over a cached
+    # prefix; it has no DiT block list for cache_dit / tea_cache to wrap.
+    "LingBotVLAV2Pipeline",
     "LTX2TextToAudioPipeline",
     # π0 is a flow-matching VLA with a self-contained sample_actions loop and no
     # DiT-style ``.transformer`` block list, so cache_dit / tea_cache cannot apply
@@ -738,6 +746,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "MingImagePipeline": "get_ming_image_post_process_func",
     "MingImageDiffusionPipeline": "get_ming_image_post_process_func",
     "InternVLAA1Pipeline": "get_internvla_a1_post_process_func",
+    "LingBotVLAV2Pipeline": "get_lingbot_vla_v2_post_process_func",
     "Pi0Pipeline": "get_pi0_post_process_func",
     "Pi05Pipeline": "get_pi05_post_process_func",
     "LongCatImageEditPipeline": "get_longcat_image_post_process_func",
