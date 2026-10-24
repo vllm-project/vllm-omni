@@ -286,6 +286,42 @@ async def test_generate_rejects_unreadable_cached_mix(tmp_path, monkeypatch):
         )
 
 
+@pytest.mark.parametrize(
+    ("flag", "expected"),
+    [
+        ([], cli.DEFAULT_JUDGE_FRAME_MAX_SIDE),
+        (["--judge-frame-max-side", "768"], 768),
+        (["--judge-frame-max-side", "0"], None),
+    ],
+)
+def test_cli_evaluate_forwards_judge_frame_max_side(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, flag: list[str], expected: int | None
+):
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(json.dumps([{"id": "s", "split": "PR_correction", "question_text": "q"}]), encoding="utf-8")
+    seen = []
+    monkeypatch.setattr(cli, "DuplexJudge", lambda *args, **kwargs: object())
+    monkeypatch.setattr(cli, "evaluate_sample", lambda *args, **kwargs: seen.append(kwargs["judge_frame_max_side"]))
+
+    parser = argparse.ArgumentParser()
+    OmniDuplexEvalSubcommand.add_cli_args(parser)
+    args = ["evaluate", "--dataset", str(manifest), "--family", "pr", "--response-root", str(tmp_path / "r")]
+    args += ["--score-root", str(tmp_path / "s"), "--judge-model", "mock-judge", *flag]
+    OmniDuplexEvalSubcommand.cmd(parser.parse_args(args))
+    assert seen == [expected]
+
+
+def test_cli_evaluate_rejects_negative_judge_frame_max_side(tmp_path: Path):
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(json.dumps([{"id": "s", "split": "PR_correction", "question_text": "q"}]), encoding="utf-8")
+    parser = argparse.ArgumentParser()
+    OmniDuplexEvalSubcommand.add_cli_args(parser)
+    args = ["evaluate", "--dataset", str(manifest), "--family", "pr", "--response-root", str(tmp_path / "r")]
+    args += ["--score-root", str(tmp_path / "s"), "--judge-model", "mock-judge", "--judge-frame-max-side", "-1"]
+    with pytest.raises(ValueError, match="--judge-frame-max-side"):
+        OmniDuplexEvalSubcommand.cmd(parser.parse_args(args))
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("cached", [False, True])
 async def test_generate_rejects_unpaced_server_vad_before_preparation_or_cache(tmp_path, monkeypatch, cached):
