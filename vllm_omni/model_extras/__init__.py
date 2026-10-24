@@ -12,9 +12,11 @@ from vllm_omni.model_extras.registry import (
     get_extra_output_params,
     get_model_class_name,
     get_output_tensor_range,
+    get_reference_image_resizer,
     get_transformer_config_subfolder,
     get_video_generation_defaults,
     get_x_to_text_model_family,
+    resize_reference_images,
     should_init_extra_args_for_non_diffusion_stages,
     should_preserve_reference_image_size,
 )
@@ -30,9 +32,11 @@ __all__ = [
     "get_extra_output_params",
     "get_model_class_name",
     "get_output_tensor_range",
+    "get_reference_image_resizer",
     "get_transformer_config_subfolder",
     "get_video_generation_defaults",
     "get_x_to_text_model_family",
+    "resize_reference_images",
     "should_init_extra_args_for_non_diffusion_stages",
     "should_preserve_reference_image_size",
 ]
