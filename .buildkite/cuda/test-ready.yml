@@ -276,6 +276,16 @@ steps:
             "
         mirror_hardwares: h100_1
 
+      - label: "Diffusion · Qwen Image 2.1 Cache-DiT Test"
+        source_file_dependencies: diffusion_qwen_image_21_function
+        timeout_in_minutes: 40
+        commands:
+          - |
+            export VLLM_IMAGE_FETCH_TIMEOUT=60
+            export QWEN_IMAGE_21_TEST_MODEL=Qwen/Qwen-Image-2.1
+            pytest -s -v tests/e2e/online_serving/test_qwen_image_21.py::test_text_to_image_cache_dit -m 'core_model and cuda and diffusion and cache' --run-level 'core_model'
+        mirror_hardwares: h100_1
+
       - label: "Diffusion · HunyuanVideo-1.5 Test"
         source_file_dependencies: diffusion_hunyuan_video_function
         commands:

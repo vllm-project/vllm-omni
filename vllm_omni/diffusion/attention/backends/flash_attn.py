@@ -477,7 +477,13 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
 
         if flash_attn_varlen_func is None:
             raise ImportError("Masked variable-length attention requires flash_attn_varlen_func")
-        assert attention_mask.ndim == 2, "attention_mask must be 2D, (batch_size, seq_len)"
+        if attention_mask.ndim == 4:
+            raise NotImplementedError(
+                "FlashAttention cannot consume a dense [B, H, Q, KV] attention mask. "
+                "Use TORCH_SDPA or allow automatic backend selection to fall back for this call."
+            )
+        if attention_mask.ndim != 2:
+            raise ValueError(f"attention_mask must be 2D, (batch_size, seq_len); got {attention_mask.ndim}D")
         batch_size, query_length = query.shape[:2]
         if not self.is_cross_attn and query_length == key.size(1):
             q, k, v, indices_q, (cu_seq_lens_q, cu_seq_lens_k), (max_length_q, max_length_k) = _upad_input(
