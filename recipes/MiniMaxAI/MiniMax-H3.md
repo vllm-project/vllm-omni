@@ -1268,6 +1268,61 @@ fixed HBM usage. Model-level and standard layerwise offload remain unsupported.
 The requested sigma points always number one more than the artifact's denoiser
 evaluations.
 
+### Larry v4 LoRA
+
+The original [Larry v4-600 EMA artifact](https://huggingface.co/larryvrh/MiniMax-H3-Turbo-Lora)
+can be loaded as a single file, without conversion or an adapter configuration:
+
+```bash
+export LARRY_LORA=/path/to/minimax_h3_turbo_v4_step600_ema.safetensors
+```
+
+Add `--lora-backend peft --lora-path "${LARRY_LORA}"` to an existing original-H3
+server command. For image references, use the dedicated `Ref2VA` checkpoint and
+`--task-type ref2va`; a combined server's Ref2VA transformer is not targeted by
+this adapter. For T2VA/FL2VA, use the `FL2VA` checkpoint and
+`--task-type fl2va`. Keep the original checkpoint without a pinned
+`base_schedule`; do not apply the adapter to an already distilled base.
+
+Starting from the [Ref2VA request](#3-ref2va-image-only-imageaudio-or-mixed-references),
+keep its reference input and override the sampling and LoRA fields:
+
+```bash
+-F 'num_inference_steps=8' \
+-F 'flow_shift=12' \
+-F 'extra_params={"task":"ref2va","duration":5.2,"audio_flow_shift":3.0,"sampler":"euler"}' \
+-F "lora={\"name\":\"larry-v4-600-ema\",\"path\":\"${LARRY_LORA}\",\"scale\":1.0}"
+```
+
+Requests accept 4–8 denoising updates; start with 6 or 8. Eight updates use nine
+sigma boundaries including the terminal zero. Euler is also selected when the
+sampler is omitted or null. Wrong shifts, a different sampler, or steps outside
+4–8 are rejected while Larry is active; scale zero leaves base sampling alone.
+
+The dynamic loader includes all 259 attention, MLP and AdaLN targets, preserves
+mixed ranks with `alpha/rank=1`, and validates complete binding. Standard
+model-level CPU and layerwise DiT offload are rejected. See the
+[LoRA guide](../../docs/user_guide/diffusion/lora.md#minimax-h3-adapter-declared-schedules)
+for the distinction from LightX2V and FlashGen layouts.
+
+A contributor validated the patched nightly loader on NVIDIA A800 80 GB. The
+supplied serving log records this successful functional request:
+
+| Field | Recorded value |
+| --- | --- |
+| Task | T2VA |
+| Sampling | 8 denoising updates, Euler, audio shift 3, seed 1101 |
+| Requested duration | 4 seconds |
+| Video response | 107 frames, 768 × 1344, 24 FPS |
+| Audio response | Present, 32000 Hz |
+| API result | `POST /v1/videos/sync` returned HTTP 200 |
+
+The run was performed on the contributor's patched nightly deployment; its
+exact source revision and parallel layout are not included in the supplied
+log. This is a functional check, not a baseline quality or speed comparison.
+The documented Ref2VA path is covered by CPU contract tests; this GPU log
+records T2VA.
+
 ### FlashGen native LoRA
 
 The FlashGen 4-step T2VA artifact uses the native MiniMax-H3 module layout and
