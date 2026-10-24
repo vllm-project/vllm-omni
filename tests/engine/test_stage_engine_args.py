@@ -24,9 +24,11 @@ from vllm.model_executor.models.utils import extract_layer_index
 
 from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
 from vllm_omni.config.omni_config import (
+    _LLM_LORA_ENGINE_FIELDS,
     _LLM_STAGE_ENGINE_FIELDS,
     OmniStageCacheConfig,
     OmniStageLoadConfig,
+    OmniStageLoRAConfig,
     OmniStageParallelConfig,
     OmniStageSchedulerConfig,
     VllmOmniARStageConfig,
@@ -342,6 +344,7 @@ def test_typed_llm_projection_discovers_explicit_upstream_config_fields():
             data_parallel_master_ip="10.0.0.1",
             enable_dbo=True,
         ),
+        lora_config=OmniStageLoRAConfig(max_lora_rank=64, target_modules=["o_proj"]),
     )
 
     engine_args = stage_init_utils._project_omni_stage_engine_args(stage_config)
@@ -353,6 +356,11 @@ def test_typed_llm_projection_discovers_explicit_upstream_config_fields():
     assert engine_args["scheduling_policy"] == "priority"
     assert engine_args["data_parallel_address"] == "10.0.0.1"
     assert engine_args["enable_dbo"] is True
+    assert engine_args["enable_lora"] is True
+    assert engine_args["max_lora_rank"] == 64
+    assert engine_args["lora_target_modules"] == ["o_proj"]
+    # vLLM resolves the remaining LoRA inputs while building its LoRAConfig.
+    assert {"max_loras", "max_cpu_loras", "lora_dtype"}.isdisjoint(engine_args)
 
 
 def test_typed_llm_projection_does_not_emit_inherited_upstream_defaults():
@@ -375,6 +383,7 @@ def test_typed_llm_projection_does_not_emit_inherited_upstream_defaults():
         "enable_dbo",
     }
     assert inherited_defaults.isdisjoint(engine_args)
+    assert _LLM_LORA_ENGINE_FIELDS.isdisjoint(engine_args)
 
 
 def test_typed_llm_projection_omits_diffusion_only_and_process_only_defaults():
@@ -540,6 +549,26 @@ def test_typed_llm_engine_args_preserve_legacy_adapter_behavior(tmp_path):
     assert talker_args["worker_cls"] == "test.generation.Worker"
     assert talker_args["disable_hybrid_kv_cache_manager"] is True
     assert talker_args["enable_prefix_caching"] is False
+
+
+def test_stage_lora_reaches_projected_engine_args_only_on_owning_stage(tmp_path):
+    pipeline, deploy, model = _engine_arg_inputs(tmp_path)
+    deploy.stages[0].engine_extras.update({"enable_lora": True, "max_lora_rank": 64, "max_loras": 2})
+    omni_config = VllmOmniConfig.from_pipeline_config(
+        pipeline, user_deploy_config=deploy, cli_overrides={"model": model}
+    )
+
+    thinker_args, talker_args, diffusion_args = (
+        stage_init_utils._project_omni_stage_engine_args(omni_config.stage_by_id(stage_id)) for stage_id in (0, 1, 2)
+    )
+    assert {name: thinker_args[name] for name in ("enable_lora", "max_lora_rank", "max_loras")} == {
+        "enable_lora": True,
+        "max_lora_rank": 64,
+        "max_loras": 2,
+    }
+    # Stages without a lora_config keep vLLM's enable_lora=False default.
+    assert _LLM_LORA_ENGINE_FIELDS.isdisjoint(talker_args)
+    assert "enable_lora" not in diffusion_args
 
 
 def test_typed_diffusion_engine_args_use_structured_diffusion_config(tmp_path):
