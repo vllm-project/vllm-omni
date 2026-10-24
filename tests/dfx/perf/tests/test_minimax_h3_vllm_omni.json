@@ -233,7 +233,8 @@
             "cuda": [
               "H100",
               "B200"
-            ]
+            ],
+            "npu": "A3"
           },
           "num_cards": 4
         }
@@ -243,7 +244,7 @@
     ],
     "description": "MiniMax-H3 T2VA with 4-card distributed layerwise offload (DLO), 8 denoise steps (USP4 + HSDP4, encoder-TP4, VAE-PP4 tile)",
     "server_params": {
-      "model": "MiniMaxAI/MiniMax-H3",
+      "model": "MiniMaxAI/MiniMax-H3/FL2VA",
       "serve_args": {
         "trust-remote-code": true,
         "task-type": "fl2va",
