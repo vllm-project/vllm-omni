@@ -3,7 +3,7 @@
 
 # Copyright 2025 Xiaomi Corporation.
 import os
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Hashable, Iterable, Mapping, Sequence
 from functools import cached_property
 from typing import Any
 
@@ -17,7 +17,7 @@ from vllm.inputs import ModalityData, MultiModalDataDict
 from vllm.logger import init_logger
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.models import SupportsPP
-from vllm.model_executor.models.interfaces import SupportsMultiModal
+from vllm.model_executor.models.interfaces import SupportsEncoderCudaGraph, SupportsMultiModal
 from vllm.model_executor.models.utils import init_vllm_registered_model
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import (
@@ -42,6 +42,12 @@ from vllm.utils.collection_utils import is_list_of
 from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
+from vllm.v1.worker.encoder_cudagraph_defs import (
+    EncoderCudaGraphCaptureInputs,
+    EncoderCudaGraphConfig,
+    EncoderCudaGraphReplayBuffers,
+    EncoderItemSpec,
+)
 
 from vllm_omni.inputs.mm_processor import OmniDummyInputsBuilder, OmniMultiModalProcessor
 from vllm_omni.model_executor.custom_process_mixin import CustomProcessMixin
@@ -501,6 +507,7 @@ class MiMoAudioForConditionalGeneration(
     nn.Module,
     SupportsPP,
     SupportsMultiModal,
+    SupportsEncoderCudaGraph,
     CustomProcessMixin,
 ):
     packed_modules_mapping = {
@@ -568,6 +575,7 @@ class MiMoAudioForConditionalGeneration(
             )
             self.token2wav = None
             self.model = self.fused_thinker_talker
+            self.supports_cudagraph_full = False
 
         elif self.model_stage == "code2wav":
             self.fused_thinker_talker = None
@@ -696,6 +704,64 @@ class MiMoAudioForConditionalGeneration(
     def embed_multimodal(self, **kwargs):
         # Delegate to thinker model for multimodal processing
         return self.model.embed_multimodal(**kwargs)
+
+    def _get_fused_thinker_talker(self) -> Any:
+        model = self.fused_thinker_talker
+        if model is None:
+            raise RuntimeError("MiMo input-local encoder graphs require the fused_thinker_talker stage")
+        return model
+
+    def get_encoder_cudagraph_config(self) -> EncoderCudaGraphConfig:
+        return self._get_fused_thinker_talker().get_encoder_cudagraph_config()
+
+    def get_input_modality(self, mm_kwargs: dict[str, Any]) -> str:
+        return self._get_fused_thinker_talker().get_input_modality(mm_kwargs)
+
+    def get_max_frames_per_video(self) -> int:
+        return self._get_fused_thinker_talker().get_max_frames_per_video()
+
+    def get_encoder_cudagraph_budget_range(self, vllm_config: VllmConfig) -> tuple[int, int]:
+        return self._get_fused_thinker_talker().get_encoder_cudagraph_budget_range(vllm_config)
+
+    def get_encoder_cudagraph_item_specs(self, mm_kwargs: dict[str, Any]) -> list[EncoderItemSpec]:
+        return self._get_fused_thinker_talker().get_encoder_cudagraph_item_specs(mm_kwargs)
+
+    def select_encoder_cudagraph_items(self, mm_kwargs: dict[str, Any], indices: list[int]) -> dict[str, Any]:
+        return self._get_fused_thinker_talker().select_encoder_cudagraph_items(mm_kwargs, indices)
+
+    def prepare_encoder_cudagraph_capture_inputs(
+        self,
+        token_budget: int,
+        max_batch_size: int,
+        max_frames_per_batch: int,
+        device: torch.device,
+        dtype: torch.dtype,
+        path: str = "default",
+        axis_keys: tuple[Hashable, ...] | None = None,
+    ) -> EncoderCudaGraphCaptureInputs:
+        return self._get_fused_thinker_talker().prepare_encoder_cudagraph_capture_inputs(
+            token_budget, max_batch_size, max_frames_per_batch, device, dtype, path, axis_keys
+        )
+
+    def prepare_encoder_cudagraph_replay_buffers(
+        self,
+        mm_kwargs: dict[str, Any],
+        max_batch_size: int,
+        max_frames_per_batch: int,
+        path: str = "default",
+    ) -> EncoderCudaGraphReplayBuffers:
+        return self._get_fused_thinker_talker().prepare_encoder_cudagraph_replay_buffers(
+            mm_kwargs, max_batch_size, max_frames_per_batch, path
+        )
+
+    def encoder_cudagraph_forward(self, inputs: dict[str, torch.Tensor], path: str = "default") -> torch.Tensor:
+        return self._get_fused_thinker_talker().encoder_cudagraph_forward(inputs, path)
+
+    def encoder_eager_forward(self, mm_kwargs: dict[str, Any], path: str = "default") -> torch.Tensor:
+        return self._get_fused_thinker_talker().encoder_eager_forward(mm_kwargs, path)
+
+    def set_input_local_transformer_cudagraph_manager(self, manager: Any) -> None:
+        self._get_fused_thinker_talker().set_input_local_transformer_cudagraph_manager(manager)
 
     def last_index_of(self, list, value):
         return len(list) - 1 - list[::-1].index(value)
