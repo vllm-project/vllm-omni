@@ -11,11 +11,15 @@ from unittest.mock import MagicMock
 import numpy as np
 import pytest
 import torch
+from vllm.config import CUDAGraphMode
 from vllm.distributed.aux_output_connector.connector import AuxRequestOutput
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.outputs import OmniModelRunnerOutput
+from vllm_omni.worker.base import OmniGPUWorkerBase
+from vllm_omni.worker.gpu_generation_worker import GPUGenerationWorker
 from vllm_omni.worker_v2.omni_generation_model_runner import OmniGenerationModelRunner, check_exact_input_shape
+from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -32,6 +36,128 @@ def test_profile_run_accepts_release_flag_without_running_codec(monkeypatch, ran
     runner.profile_run(randomize_inputs=randomize_inputs)
     synchronize.assert_called_once_with()
     runner.model.assert_not_called()
+
+
+class _GraphModel:
+    supports_model_local_cudagraph = True
+
+    def get_model_local_cudagraph_components(self):
+        return ()
+
+
+def _graph_runner(
+    *,
+    enabled: bool = True,
+    enforce_eager: bool = False,
+    mode: CUDAGraphMode = CUDAGraphMode.FULL,
+) -> OmniGenerationModelRunner:
+    runner = object.__new__(OmniGenerationModelRunner)
+    runner.device = torch.device("cpu")
+    runner.model = _GraphModel()
+    runner.model_config = SimpleNamespace(
+        enforce_eager=enforce_eager,
+        model_local_cudagraph={"decode": {}} if enabled else None,
+    )
+    runner.compilation_config = SimpleNamespace(cudagraph_mode=mode)
+    runner.vllm_config = SimpleNamespace()
+    runner.model_local_cudagraph_manager = None
+    return runner
+
+
+def test_model_local_graph_load_prepares_manager_only_when_configured(monkeypatch):
+    from vllm_omni.worker_v2 import omni_generation_model_runner as generation_runner
+
+    class FakeManager:
+        def __init__(self, *, vllm_config, device):
+            assert vllm_config is runner.vllm_config
+            assert device == runner.device
+            self.prepared_model = None
+
+        def prepare(self, model):
+            self.prepared_model = model
+
+    monkeypatch.setattr(OmniGPUModelRunner, "load_model", lambda self, *args, **kwargs: None)
+    monkeypatch.setattr(generation_runner, "ModelLocalCUDAGraphManager", FakeManager)
+    runner = _graph_runner()
+    runner.load_model()
+    assert runner.model_local_cudagraph_manager.prepared_model is runner.model
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"enabled": False},
+        {"enforce_eager": True},
+        {"mode": CUDAGraphMode.NONE},
+    ],
+)
+def test_model_local_graph_disabled_keeps_upstream_lifecycle(monkeypatch, kwargs):
+    monkeypatch.setattr(OmniGPUModelRunner, "load_model", lambda self, *args, **kwargs: None)
+    monkeypatch.setattr(OmniGPUModelRunner, "needs_cudagraph_capture", lambda self: False)
+    monkeypatch.setattr(OmniGPUModelRunner, "profile_cudagraph_memory", lambda self: 7)
+    monkeypatch.setattr(OmniGPUModelRunner, "capture_model", lambda self: 11)
+    runner = _graph_runner(**kwargs)
+    runner.load_model()
+    assert runner.model_local_cudagraph_manager is None
+    assert not runner.needs_cudagraph_capture()
+    assert runner.profile_cudagraph_memory() == 7
+    assert runner.capture_model() == 11
+
+
+def test_model_local_graph_profile_capture_and_shutdown_use_local_manager(monkeypatch):
+    from vllm_omni.worker_v2 import omni_generation_model_runner as generation_runner
+
+    runner = _graph_runner()
+    events = []
+    manager = SimpleNamespace(
+        profile_memory=lambda: events.append("profile") or 123,
+        capture_and_bind=lambda: events.append("capture"),
+        clear=lambda: events.append("clear"),
+    )
+    runner.model_local_cudagraph_manager = manager
+    monkeypatch.setattr(generation_runner, "freeze_gc_for_cudagraph_capture", nullcontext)
+    monkeypatch.setattr(generation_runner, "graph_capture", lambda **kwargs: nullcontext())
+    monkeypatch.setattr(generation_runner, "lock_workspace", lambda: events.append("lock_workspace"))
+    monkeypatch.setattr(generation_runner, "set_cudagraph_capturing_enabled", lambda value: events.append(value))
+    monkeypatch.setattr(torch.accelerator, "synchronize", lambda: None)
+    monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
+    memory_info = iter(((1000, 0), (900, 0)))
+    monkeypatch.setattr(torch.accelerator, "get_memory_info", lambda: next(memory_info))
+    monkeypatch.setattr(OmniGPUModelRunner, "shutdown", lambda self: events.append("shutdown"))
+
+    assert runner.needs_cudagraph_capture()
+    assert runner.profile_cudagraph_memory() == 123
+    assert runner.capture_model() == 100
+    runner.shutdown()
+    assert runner.model_local_cudagraph_manager is None
+    assert events == [True, "profile", False, True, "capture", False, "lock_workspace", "clear", "shutdown"]
+
+
+@pytest.mark.parametrize("has_manager", [True, False])
+def test_v2_generation_worker_captures_only_with_model_local_manager(has_manager):
+    worker = object.__new__(GPUGenerationWorker)
+    worker.use_v2_model_runner = True
+    worker.model_config = SimpleNamespace(enforce_eager=False)
+    events = []
+    worker.model_runner = SimpleNamespace(
+        model_local_cudagraph_manager=object() if has_manager else None,
+        profile_run=lambda: events.append("profile"),
+        capture_model=lambda: events.append("capture"),
+    )
+    worker._get_cudagraph_capture_context = nullcontext
+    worker._capture_auxiliary_graphs = lambda: events.append("auxiliary")
+
+    worker.compile_or_warm_up_model()
+
+    assert events == (["profile", "capture", "auxiliary"] if has_manager else ["profile", "auxiliary"])
+
+
+def test_generation_worker_uses_base_memory_profiling_without_second_profile(monkeypatch):
+    monkeypatch.setattr(OmniGPUWorkerBase, "determine_available_memory", lambda self: 377)
+    worker = object.__new__(GPUGenerationWorker)
+    worker.model_runner = SimpleNamespace(profile_cudagraph_memory=MagicMock())
+    assert worker.determine_available_memory() == 377
+    worker.model_runner.profile_cudagraph_memory.assert_not_called()
 
 
 class _FakeStagedField:

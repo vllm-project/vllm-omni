@@ -309,6 +309,43 @@ def _build_single_diffusion_config(
     )
 
 
+def test_model_local_cudagraph_config_is_generation_stage_local(tmp_path: Path) -> None:
+    deploy_path = tmp_path / "qwen3-tts-vocoder-graph.yaml"
+    deploy_path.write_text(
+        """
+async_chunk: false
+stages:
+  - stage_id: 1
+    model_local_cudagraph:
+      qwen3_tts.stateless:
+        capture_bucket_sizes: [150, 325]
+""",
+        encoding="utf-8",
+    )
+
+    omni_config = _from_pipeline_key("qwen3_tts", deploy_config_path=str(deploy_path))
+
+    assert omni_config.stage_by_id(0).model_config.model_local_cudagraph is None
+    assert omni_config.stage_by_id(1).model_config.model_local_cudagraph == {
+        "qwen3_tts.stateless": {"capture_bucket_sizes": [150, 325]},
+    }
+
+
+def test_model_local_cudagraph_config_rejects_ar_stage(tmp_path: Path) -> None:
+    deploy_path = tmp_path / "qwen3-tts-ar-vocoder-graph.yaml"
+    deploy_path.write_text(
+        """
+stages:
+  - stage_id: 0
+    model_local_cudagraph: {}
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="only for LLM_GENERATION"):
+        _from_pipeline_key("qwen3_tts", deploy_config_path=str(deploy_path))
+
+
 @pytest.mark.parametrize("model_type", sorted(OMNI_PIPELINES))
 def test_vllm_omni_config_from_pipeline_config_matches_merge_pipeline_deploy(model_type: str):
     pipeline = _resolve_pipeline_or_skip(model_type)
@@ -1233,6 +1270,7 @@ def test_sub_config_fields_match_structured_scopes():
         "model_subdir",
         "tokenizer_subdir",
         "requires_full_payload_input",
+        "model_local_cudagraph",
         "served_model_name",
         "allowed_local_media_path",
         "allowed_media_domains",

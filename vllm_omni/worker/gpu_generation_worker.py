@@ -126,5 +126,11 @@ class GPUGenerationWorker(OmniWorkerMixin, OmniGPUWorkerBase):
 
         start = time.perf_counter()
         self.model_runner.profile_run()
+        if (
+            getattr(self.model_runner, "model_local_cudagraph_manager", None) is not None
+            and not self.model_config.enforce_eager
+        ):
+            with self._get_cudagraph_capture_context():
+                self.model_runner.capture_model()
         self._capture_auxiliary_graphs()
         return CompilationTimes(language_model=time.perf_counter() - start, encoder=0.0)
