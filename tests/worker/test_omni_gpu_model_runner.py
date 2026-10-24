@@ -1639,10 +1639,10 @@ def test_restore_remaps_mm_layers_to_flattened_payload_keys():
 
 def test_pooler_payload_casts_restored_prefix_to_batch_dtype(monkeypatch):
     """#5: LMCache returns CPU float32; prepending onto bf16 activations must not raise."""
-    import vllm_omni.worker.gpu_ar_model_runner as ar_mod
+    import vllm_omni.worker.async_omni_output as async_output_mod
 
     monkeypatch.setattr(
-        ar_mod, "build_omni_mm_payload", lambda **kwargs: {"mm0": torch.ones(2, 2, dtype=torch.bfloat16)}
+        async_output_mod, "build_omni_mm_payload", lambda **kwargs: {"mm0": torch.ones(2, 2, dtype=torch.bfloat16)}
     )
 
     runner = object.__new__(GPUARModelRunner)

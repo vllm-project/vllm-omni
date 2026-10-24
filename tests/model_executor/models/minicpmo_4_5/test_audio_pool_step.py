@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Regression tests for MiniCPM-o 4.5 audio placeholder pooling."""
 
 from __future__ import annotations
@@ -69,3 +69,16 @@ def test_audio_placeholders_follow_checkpoint_pool_step(
 
 def test_minicpmo_4_5_pool_step_defaults_to_checkpoint_value() -> None:
     assert MiniCPMOConfig().audio_pool_step == 5
+
+
+def test_thinker_reports_closed_form_mm_token_budgets() -> None:
+    """Stage-0 init must not fall back to dummy image/video generation."""
+    info = object.__new__(MiniCPMO45OmniLLMProcessingInfo)
+    info.get_max_image_tokens = lambda: 640
+    info.get_max_audio_tokens = lambda: 570
+    info.get_max_video_tokens = lambda seq_len, mm_counts: 128 * 64
+
+    tokens = info.get_mm_max_tokens_per_item(40960, {"image": 1, "audio": 1, "video": 1})
+
+    assert tokens == {"image": 640, "audio": 570, "video": 8192}
+    assert info.get_mm_max_tokens_per_item(40960, {"image": 1}) == {"image": 640}

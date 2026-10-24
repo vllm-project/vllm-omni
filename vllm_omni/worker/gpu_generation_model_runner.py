@@ -42,13 +42,13 @@ from vllm.v1.worker.utils import sanity_check_mm_encoder_outputs
 
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.utils.mm_outputs import partition_payload_list, split_mapping_outputs
-from vllm_omni.worker.gpu_ar_model_runner import (
-    ExecuteModelState,
+from vllm_omni.worker.async_omni_output import (
     _AsyncCPUPayloadSnapshot,
     _copy_tensor_payload_to_cpu,
     _ensure_tensor_values,
     _snapshot_tensor_payload_to_cpu_async,
 )
+from vllm_omni.worker.gpu_ar_model_runner import ExecuteModelState
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
 from vllm_omni.worker.mixins import maybe_unpad_input_ids
 from vllm_omni.worker.omni_connector_model_runner_mixin import (
@@ -213,7 +213,7 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
         scheduler_output: SchedulerOutput,
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> OmniModelRunnerOutput | IntermediateTensors:
-        if self.execute_model_state is not None:
+        if self.execute_model_state is not None:  # type: ignore[has-type]
             raise RuntimeError("State error: sample_tokens() must be called after execute_model() returns None.")
 
         if hasattr(self, "_omni_connector"):
@@ -518,7 +518,7 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
             slot_mappings,  # OMNI: unpack slot_mappings for upstream v1 API compatibility
             _prefix_cache_step_id,  # generation stages never save to the prefix cache
         ) = self.execute_model_state
-        self.execute_model_state = None
+        self.execute_model_state = None  # type: ignore[assignment]
 
         # Finalize KV connector (wait_for_save + clear metadata) after
         # draft model runs. Deferred from target model forward.
@@ -602,6 +602,8 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
         inter_stage_outputs: list[dict[str, object] | None] | None
         multimodal_outputs: list[dict[str, object] | None] | None
         if self._async_chunk:
+            # partition_payload_list keeps one slot per request and uses None
+            # for an empty half.
             inter_stage_outputs, multimodal_outputs = partition_payload_list(per_req_payloads)
         else:
             # See gpu_ar_model_runner: non-async-chunk ships the full payload to the next
