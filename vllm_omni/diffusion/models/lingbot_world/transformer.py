@@ -382,9 +382,19 @@ class LingBotSelfAttention(nn.Module):
                 # (FlashAttention on CUDA, the fused kernel on NPU) so direct
                 # replay is a numerical oracle for paged execution, rather
                 # than a comparison between two different attention kernels.
-                block_size = key.shape[1]
-                key_cache = visible_key[0].unflatten(0, (-1, block_size))
-                value_cache = visible_value[0].unflatten(0, (-1, block_size))
+                # A chunk that is not a legal page (FA2 pages only in
+                # multiples of 16 tokens) is paged at the kernel's finest unit
+                # instead; the padding past ``seq_lens`` is never read.
+                from vllm_omni.experimental.ar_diffusion.runner import paging_block_size  # noqa: PLC0415
+
+                block_size = paging_block_size(key.shape[1])
+                padding = -visible_key.shape[1] % block_size
+                key_pages, value_pages = visible_key[0], visible_value[0]
+                if padding:
+                    key_pages = F.pad(key_pages, (0, 0, 0, 0, 0, padding))
+                    value_pages = F.pad(value_pages, (0, 0, 0, 0, 0, padding))
+                key_cache = key_pages.unflatten(0, (-1, block_size))
+                value_cache = value_pages.unflatten(0, (-1, block_size))
                 block_count = key_cache.shape[0]
                 block_table = torch.arange(
                     block_count,

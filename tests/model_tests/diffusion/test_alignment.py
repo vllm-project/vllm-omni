@@ -92,6 +92,10 @@ EXCLUDED_MODELS = [
     # Requires full MiniMax-H3 FL2VA weights, the TaoMate LoRA, and AR sessions;
     # covered by tests/diffusion/models/taomate_h3 and manual real-checkpoint E2E.
     "TaoMateH3Pipeline",
+    # The transformer accepts only the released 1.3B geometry, so no tiny
+    # checkpoint loads; covered by tests/diffusion/models/self_forcing and the
+    # real-checkpoint E2E test.
+    "SelfForcingPipeline",
     # The 270+ GiB multimodal checkpoint needs 4/8-way native sequence/head
     # parallel execution; covered by focused native contract and GPU tests.
     "Magi2Pipeline",
