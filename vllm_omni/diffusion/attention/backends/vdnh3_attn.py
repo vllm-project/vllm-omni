@@ -179,7 +179,7 @@ class VDNAttentionBackend(FlashAttentionBackend):
     supported_platforms = ("cuda",)
 
     @classmethod
-    def supports_multi_doc_packed_varlen(cls) -> bool:
+    def supports_multi_doc_packed_varlen(cls, kv_cache_dtype: str | None = None) -> bool:
         # The window describes one document; co-batched requests run apart.
         return False
 

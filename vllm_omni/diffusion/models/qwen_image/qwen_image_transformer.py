@@ -3,8 +3,10 @@
 
 from __future__ import annotations
 
+import math
 from collections import OrderedDict
 from collections.abc import Callable, Iterable
+from dataclasses import dataclass
 from math import prod
 from typing import TYPE_CHECKING, Any
 
@@ -44,6 +46,7 @@ from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelOutput,
 )
 from vllm_omni.diffusion.forward_context import get_forward_context
+from vllm_omni.diffusion.hooks import module_has_active_hooks
 from vllm_omni.diffusion.layers.adalayernorm import AdaLayerNorm
 from vllm_omni.diffusion.layers.fused_qk_norm_rope import (
     QK_NORM_ROPE_TABLE_KEY,
@@ -117,7 +120,12 @@ def _qwen_image_qk_norm_rope(
     ):
         num_kv_heads = k.shape[2]
         rope_table = torch.cat((freqs.real, freqs.imag), dim=-1)
-        rope_table = rope_table.unsqueeze(0).expand(batch, -1, -1).reshape(tokens, rotary_dim)
+        if rope_table.dim() == 3:
+            # Per-token freqs (mixfusion): every batch row carries its own
+            # positions, so no shared-table expand is needed.
+            rope_table = rope_table.reshape(tokens, rotary_dim)
+        else:
+            rope_table = rope_table.unsqueeze(0).expand(batch, -1, -1).reshape(tokens, rotary_dim)
         fused_q, fused_k = fused_qk_norm_rope(
             q.reshape(tokens, num_heads, head_dim),
             k.reshape(tokens, num_kv_heads, head_dim),
@@ -139,7 +147,86 @@ def _qwen_image_qk_norm_rope(
     k = norm_k(k)
     cos = torch.real(freqs).to(q.dtype)
     sin = torch.imag(freqs).to(q.dtype)
+    if cos.dim() == 3:
+        # Per-token freqs (mixfusion): each batch row has its own positions,
+        # but the rope kernels strip a 3-D cos down to cos[0] assuming a shared
+        # table — flatten to per-token rows so every row keeps its own angle.
+        kv_heads = k.shape[2]
+        q = rope(
+            q.reshape(tokens, num_heads, head_dim),
+            cos.reshape(tokens, -1),
+            sin.reshape(tokens, -1),
+        ).reshape(q.shape)
+        k = rope(
+            k.reshape(tokens, kv_heads, head_dim),
+            cos.reshape(tokens, -1),
+            sin.reshape(tokens, -1),
+        ).reshape(k.shape)
+        return q, k
     return rope(q, cos, sin), rope(k, cos, sin)
+
+
+@dataclass
+class MixFusionPlan:
+    """Per-step MixFusion packing layout, computed once and shared by all blocks.
+
+    Holds the flat varlen sequence layout (cu_seqlens / max_seq_len) plus the
+    index tensors that recover per-request text rows and per-chunk image rows
+    from the packed attention output, so per-block work stays on-GPU.
+    """
+
+    cu_seqlens: list[int]
+    cu_seqlens_tensor: torch.Tensor
+    max_seq_len: int
+    request_chunk_ranges: list[tuple[int, int]]
+    real_txt_lens: list[int]
+    seq_len_txt: int
+    chunk_size: int
+    chunk_to_request: torch.Tensor
+    txt_out_idx: torch.Tensor
+    img_out_idx: torch.Tensor
+    # Target rows in the padded [num_requests * seq_len_txt] text-output space,
+    # or None when every request uses the full padded text length (no mask).
+    txt_pad_idx: torch.Tensor | None
+
+
+def build_mixfusion_plan(
+    *,
+    seq_len_txt: int,
+    chunk_size: int,
+    request_chunk_ranges: list[tuple[int, int]],
+    real_txt_lens: list[int],
+    chunk_to_request: torch.Tensor,
+    device: torch.device,
+) -> MixFusionPlan:
+    cu_seqlens = [0]
+    txt_out_rows: list[int] = []
+    img_out_rows: list[int] = []
+    txt_pad_rows: list[int] = []
+    max_seq_len = 0
+    for req_idx, (chunk_start, chunk_end) in enumerate(request_chunk_ranges):
+        txt_len = int(real_txt_lens[req_idx])
+        img_len = (chunk_end - chunk_start) * chunk_size
+        base = cu_seqlens[-1]
+        txt_out_rows.extend(range(base, base + txt_len))
+        img_out_rows.extend(range(base + txt_len, base + txt_len + img_len))
+        cu_seqlens.append(base + txt_len + img_len)
+        max_seq_len = max(max_seq_len, txt_len + img_len)
+        txt_pad_rows.extend(range(req_idx * seq_len_txt, req_idx * seq_len_txt + txt_len))
+    needs_padding = any(txt_len < seq_len_txt for txt_len in real_txt_lens)
+    return MixFusionPlan(
+        cu_seqlens=cu_seqlens,
+        cu_seqlens_tensor=torch.tensor(cu_seqlens, dtype=torch.int32, device=device),
+        max_seq_len=max_seq_len,
+        request_chunk_ranges=request_chunk_ranges,
+        real_txt_lens=real_txt_lens,
+        seq_len_txt=seq_len_txt,
+        chunk_size=chunk_size,
+        chunk_to_request=chunk_to_request,
+        txt_out_idx=torch.tensor(txt_out_rows, dtype=torch.long, device=device),
+        img_out_idx=torch.tensor(img_out_rows, dtype=torch.long, device=device),
+        txt_pad_idx=torch.tensor(txt_pad_rows, dtype=torch.long, device=device) if needs_padding else None,
+    )
 
 
 def _normalize_qwen_image_weight_name(name: str) -> str:
@@ -880,6 +967,120 @@ class QwenImageCrossAttention(nn.Module):
 
         return img_attn_output, txt_attn_output
 
+    def forward_mixfusion(
+        self,
+        image_chunks: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        image_freq_chunks: torch.Tensor,
+        text_freqs: torch.Tensor,
+        plan: MixFusionPlan,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run Qwen joint attention with chunked image tokens and request-level text.
+
+        Text/prompt tokens are projected once per request. Image tokens stay in
+        MixFusion chunks for token-wise projections, then each request is
+        recovered to ``text + full image`` immediately before attention so the
+        attention semantics match independent dense execution.
+        ``plan`` carries the per-step packing layout shared by all blocks.
+        """
+
+        img_qkv, _ = self.to_qkv(image_chunks)
+        q_size = self.query_num_heads * self.head_dim
+        kv_size = self.kv_num_heads * self.head_dim
+        img_query, img_key, img_value = img_qkv.split([q_size, kv_size, kv_size], dim=-1)
+
+        txt_qkv, _ = self.add_kv_proj(encoder_hidden_states)
+        add_q_size = self.add_query_num_heads * self.head_dim
+        add_kv_size = self.add_kv_num_heads * self.head_dim
+        txt_query, txt_key, txt_value = txt_qkv.split([add_q_size, add_kv_size, add_kv_size], dim=-1)
+
+        img_query = img_query.unflatten(-1, (self.query_num_heads, self.head_dim))
+        img_key = img_key.unflatten(-1, (self.kv_num_heads, self.head_dim))
+        img_value = img_value.unflatten(-1, (self.kv_num_heads, self.head_dim))
+
+        txt_query = txt_query.unflatten(-1, (self.add_query_num_heads, self.head_dim))
+        txt_key = txt_key.unflatten(-1, (self.add_kv_num_heads, self.head_dim))
+        txt_value = txt_value.unflatten(-1, (self.add_kv_num_heads, self.head_dim))
+
+        # Norm + rope before packing, sharing the fused Triton kernel with the
+        # standard forward path (same per-token math; RMS norm and rotary are
+        # per-token ops and commute with the concatenation). Keeps image
+        # freqs in [B_chunk, chunk_size, D/2] chunk order and text freqs in
+        # [num_requests, seq_len_txt, D/2] request order, so no flat cos/sin
+        # packing is needed.
+        img_query, img_key = _qwen_image_qk_norm_rope(
+            img_query,
+            img_key,
+            self.norm_q,
+            self.norm_k,
+            image_freq_chunks,
+            self.rope,
+            self.eps,
+            use_fused=self.qk_norm,
+        )
+        txt_query, txt_key = _qwen_image_qk_norm_rope(
+            txt_query,
+            txt_key,
+            self.norm_added_q,
+            self.norm_added_k,
+            text_freqs,
+            self.rope,
+            self.eps,
+        )
+
+        flat_queries: list[torch.Tensor] = []
+        flat_keys: list[torch.Tensor] = []
+        flat_values: list[torch.Tensor] = []
+        for req_idx, (chunk_start, chunk_end) in enumerate(plan.request_chunk_ranges):
+            txt_len = int(plan.real_txt_lens[req_idx])
+            req_img_query = img_query[chunk_start:chunk_end].reshape(-1, self.query_num_heads, self.head_dim)
+            req_img_key = img_key[chunk_start:chunk_end].reshape(-1, self.kv_num_heads, self.head_dim)
+            req_img_value = img_value[chunk_start:chunk_end].reshape(-1, self.kv_num_heads, self.head_dim)
+            flat_queries.append(torch.cat([txt_query[req_idx, :txt_len], req_img_query], dim=0))
+            flat_keys.append(torch.cat([txt_key[req_idx, :txt_len], req_img_key], dim=0))
+            flat_values.append(torch.cat([txt_value[req_idx, :txt_len], req_img_value], dim=0))
+
+        joint_query = torch.cat(flat_queries, dim=0)
+        joint_key = torch.cat(flat_keys, dim=0)
+        joint_value = torch.cat(flat_values, dim=0)
+
+        num_requests = encoder_hidden_states.shape[0]
+        del flat_queries, flat_keys, flat_values
+
+        # One packed forward: the attention layer routes varlen-capable
+        # backends to a single varlen kernel and serves every other backend
+        # with equal-length bucketed dense attention that keeps the same
+        # document isolation. Either way the result is the flat joint layout.
+        joint_hidden_states = self.attn.forward_packed(
+            joint_query,
+            joint_key,
+            joint_value,
+            cu_seqlens=plan.cu_seqlens_tensor,
+            max_seqlen=plan.max_seq_len,
+        )
+
+        # Recover rows with one gather each: text rows in request order,
+        # image rows in chunk order. No mask -> the text gather is already
+        # the padded layout, just reshape; otherwise copy into a zero
+        # buffer at the precomputed padded positions.
+        txt_rows = joint_hidden_states.index_select(0, plan.txt_out_idx)
+        img_rows = joint_hidden_states.index_select(0, plan.img_out_idx)
+        if plan.txt_pad_idx is None:
+            txt_attn_output = txt_rows.view(num_requests, plan.seq_len_txt, self.add_query_num_heads, self.head_dim)
+        else:
+            txt_buffer = txt_rows.new_zeros(num_requests * plan.seq_len_txt, self.add_query_num_heads, self.head_dim)
+            txt_buffer.index_copy_(0, plan.txt_pad_idx, txt_rows)
+            txt_attn_output = txt_buffer.view(num_requests, plan.seq_len_txt, self.add_query_num_heads, self.head_dim)
+        img_attn_output = img_rows.view(image_chunks.shape[0], plan.chunk_size, self.query_num_heads, self.head_dim)
+
+        txt_attn_output = txt_attn_output.flatten(2, 3).to(txt_query.dtype)
+        img_attn_output = img_attn_output.flatten(2, 3).to(img_query.dtype)
+
+        img_attn_output = self.to_out(img_attn_output)
+        txt_attn_output = self.to_add_out(txt_attn_output)
+
+        return img_attn_output, txt_attn_output
+
 
 class QwenImageTransformerBlock(nn.Module):
     def __init__(
@@ -1069,6 +1270,54 @@ class QwenImageTransformerBlock(nn.Module):
 
         return encoder_hidden_states, hidden_states
 
+    def forward_mixfusion(
+        self,
+        image_chunks: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        image_freq_chunks: torch.Tensor,
+        text_freqs: torch.Tensor,
+        plan: MixFusionPlan,
+        temb: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        img_mod_params = self.img_mod(temb)
+        txt_mod_params = self.txt_mod(temb)
+
+        img_mod_params = img_mod_params.index_select(0, plan.chunk_to_request)
+        img_mod1, img_mod2 = img_mod_params.chunk(2, dim=-1)
+        txt_mod1, txt_mod2 = txt_mod_params.chunk(2, dim=-1)
+
+        img_scale1, img_shift1, img_gate1 = self._modulate(img_mod1)
+        img_modulated = self.img_norm1(image_chunks, img_scale1, img_shift1)
+
+        txt_scale1, txt_shift1, txt_gate1 = self._modulate(txt_mod1)
+        txt_modulated = self.txt_norm1(encoder_hidden_states, txt_scale1, txt_shift1)
+
+        img_attn_output, txt_attn_output = self.attn.forward_mixfusion(
+            image_chunks=img_modulated,
+            encoder_hidden_states=txt_modulated,
+            image_freq_chunks=image_freq_chunks,
+            text_freqs=text_freqs,
+            plan=plan,
+        )
+
+        image_chunks = image_chunks + img_gate1 * img_attn_output
+        encoder_hidden_states = encoder_hidden_states + txt_gate1 * txt_attn_output
+
+        img_scale2, img_shift2, img_gate2 = self._modulate(img_mod2)
+        img_modulated2 = self.img_norm2(image_chunks, img_scale2, img_shift2)
+        image_chunks = image_chunks + img_gate2 * self.img_mlp(img_modulated2)
+
+        txt_scale2, txt_shift2, txt_gate2 = self._modulate(txt_mod2)
+        txt_modulated2 = self.txt_norm2(encoder_hidden_states, txt_scale2, txt_shift2)
+        encoder_hidden_states = encoder_hidden_states + txt_gate2 * self.txt_mlp(txt_modulated2)
+
+        if encoder_hidden_states.dtype == torch.float16:
+            encoder_hidden_states = encoder_hidden_states.clip(-65504, 65504)
+        if image_chunks.dtype == torch.float16:
+            image_chunks = image_chunks.clip(-65504, 65504)
+
+        return encoder_hidden_states, image_chunks
+
 
 # Note: inheriting from CachedTransformer only when we support caching
 class QwenImageTransformer2DModel(CachedTransformer):
@@ -1244,9 +1493,179 @@ class QwenImageTransformer2DModel(CachedTransformer):
         # Only active when zero_cond_t=True (image editing models)
         self.modulate_index_prepare = ModulateIndexPrepare(zero_cond_t=zero_cond_t)
 
+    @staticmethod
+    def _mixfusion_chunk_size(hidden_states: list[torch.Tensor]) -> int:
+        chunk_size = int(hidden_states[0].shape[1])
+        for sample in hidden_states[1:]:
+            chunk_size = math.gcd(chunk_size, int(sample.shape[1]))
+        return chunk_size
+
+    def has_active_block_hooks(self) -> bool:
+        """Whether any layerwise-offloadable block carries a registered hook.
+
+        ``_forward_mixfusion`` invokes ``block.forward_mixfusion`` directly,
+        which bypasses the HookRegistry wrapper installed around
+        ``block.forward`` and any PyTorch-native forward hooks on the block.
+        Omni hooks such as layerwise offload (block-weight prefetch) would
+        therefore never fire and offloaded blocks would run with empty weight
+        storage; HSDP's ``fully_shard`` registers native forward pre-hooks to
+        all-gather sharded weights, so hooked blocks would run on sharded
+        weights. Callers must fall back to the standard forward path when this
+        returns True.
+        """
+        for attr in self._layerwise_offload_blocks_attrs:
+            for block in getattr(self, attr, []):
+                if module_has_active_hooks(block):
+                    return True
+                # PyTorch-native hooks (e.g. FSDP2 fully_shard's unshard
+                # pre-hook) live in the module's own hook dicts, not the
+                # Omni registry, and are equally bypassed by the direct
+                # forward_mixfusion call.
+                if getattr(block, "_forward_pre_hooks", None) or getattr(block, "_forward_hooks", None):
+                    return True
+        return False
+
+    def _forward_mixfusion(
+        self,
+        hidden_states: list[torch.Tensor],
+        encoder_hidden_states: torch.Tensor,
+        encoder_hidden_states_mask: torch.Tensor | None,
+        timestep: torch.LongTensor,
+        img_shapes: list[tuple[int, int, int]] | None,
+        txt_seq_lens: list[int] | None,
+        guidance: torch.Tensor | None,
+        additional_t_cond=None,
+    ) -> list[torch.Tensor]:
+        if self.zero_cond_t:
+            raise ValueError("Qwen MixFusion does not support zero_cond_t/editing path yet.")
+        if self.parallel_config is not None and self.parallel_config.sequence_parallel_size > 1:
+            raise ValueError("Qwen MixFusion requires sequence parallel disabled.")
+        if self.has_active_block_hooks():
+            raise ValueError(
+                "Qwen MixFusion packed forward bypasses block forward hooks "
+                "(e.g. layerwise offload or HSDP fully_shard); fall back to "
+                "the standard forward path."
+            )
+        if not hidden_states:
+            raise ValueError("Qwen MixFusion requires at least one hidden-state tensor.")
+        if img_shapes is None or txt_seq_lens is None:
+            raise ValueError("Qwen MixFusion requires img_shapes and txt_seq_lens.")
+
+        # Expand each state's latents into one row per requested image so that every
+        # image gets its own prompt row (encoder_hidden_states / temb are already
+        # per-image) and its own chunk mapping.
+        image_rows: list[torch.Tensor] = []
+        image_row_states: list[int] = []
+        total_images = 0
+        for state_idx, sample in enumerate(hidden_states):
+            for img_idx in range(int(sample.shape[0])):
+                image_rows.append(sample[img_idx : img_idx + 1])
+                image_row_states.append(state_idx)
+            total_images += int(sample.shape[0])
+
+        if total_images != int(encoder_hidden_states.shape[0]):
+            raise ValueError(
+                f"Qwen MixFusion prompt rows ({encoder_hidden_states.shape[0]}) do not "
+                f"match total requested images ({total_images})."
+            )
+
+        chunk_size = self._mixfusion_chunk_size(image_rows)
+        image_chunks: list[torch.Tensor] = []
+        image_freq_chunks: list[torch.Tensor] = []
+        chunk_to_request: list[int] = []
+        request_chunk_ranges: list[tuple[int, int]] = []
+        seq_len_txt = int(encoder_hidden_states.shape[1])
+        text_freqs: list[torch.Tensor] = []
+
+        for row_idx, sample in enumerate(image_rows):
+            seq_len = int(sample.shape[1])
+            if seq_len % chunk_size != 0:
+                raise ValueError(f"Qwen MixFusion seq_len={seq_len} is not divisible by chunk_size={chunk_size}.")
+            chunk_start = len(image_chunks)
+            image_chunks.extend(sample.split(chunk_size, dim=1))
+            chunk_end = len(image_chunks)
+            request_chunk_ranges.append((chunk_start, chunk_end))
+            chunk_to_request.extend([row_idx] * (chunk_end - chunk_start))
+
+            # img_shapes / txt_seq_lens are per-state; images of the same request
+            # share the same resolution and prompt.
+            state_idx = image_row_states[row_idx]
+            req_vid_freqs, req_txt_freqs = self.pos_embed(img_shapes[state_idx], [seq_len_txt], device=sample.device)
+            image_freq_chunks.extend(req_vid_freqs.split(chunk_size, dim=0))
+            text_freqs.append(req_txt_freqs[:seq_len_txt])
+
+        image_chunks_tensor = torch.cat(image_chunks, dim=0)
+        image_chunks_tensor = self.img_in(image_chunks_tensor)
+        image_freq_chunks_tensor = torch.stack(image_freq_chunks, dim=0)
+        text_freqs_tensor = torch.stack(text_freqs, dim=0)
+        chunk_to_request_tensor = torch.tensor(chunk_to_request, dtype=torch.long, device=image_chunks_tensor.device)
+
+        timestep = timestep.to(device=image_chunks_tensor.device, dtype=image_chunks_tensor.dtype)
+        encoder_hidden_states = self.txt_norm(encoder_hidden_states)
+        encoder_hidden_states = self.txt_in(encoder_hidden_states)
+
+        if guidance is not None:
+            guidance = guidance.to(image_chunks_tensor.dtype) * 1000
+
+        temb = (
+            self.time_text_embed(timestep, image_chunks_tensor, additional_t_cond)
+            if guidance is None
+            else self.time_text_embed(timestep, guidance, image_chunks_tensor, additional_t_cond)
+        )
+
+        if encoder_hidden_states_mask is not None and encoder_hidden_states_mask.all():
+            encoder_hidden_states_mask = None
+
+        if encoder_hidden_states_mask is not None:
+            real_txt_lens = encoder_hidden_states_mask.sum(dim=1).tolist()
+        else:
+            real_txt_lens = [seq_len_txt] * encoder_hidden_states.shape[0]
+
+        # Packing layout is identical across blocks and steps: build it once
+        # per forward (cu_seqlens / out-gather indices as device tensors) so
+        # the 60 blocks run pure GPU work.
+        plan = build_mixfusion_plan(
+            seq_len_txt=seq_len_txt,
+            chunk_size=chunk_size,
+            request_chunk_ranges=request_chunk_ranges,
+            real_txt_lens=real_txt_lens,
+            chunk_to_request=chunk_to_request_tensor,
+            device=image_chunks_tensor.device,
+        )
+
+        for block in self.transformer_blocks:
+            encoder_hidden_states, image_chunks_tensor = block.forward_mixfusion(
+                image_chunks=image_chunks_tensor,
+                encoder_hidden_states=encoder_hidden_states,
+                image_freq_chunks=image_freq_chunks_tensor,
+                text_freqs=text_freqs_tensor,
+                plan=plan,
+                temb=temb,
+            )
+
+        chunk_temb = temb.index_select(0, chunk_to_request_tensor)
+        image_chunks_tensor = self.norm_out(image_chunks_tensor, chunk_temb)
+        image_chunks_tensor = self.proj_out(image_chunks_tensor)
+
+        # Reassemble outputs per request: each request owns num_images image rows,
+        # whose chunks are contiguous in request_chunk_ranges. Rebuild the
+        # [num_images, seq, C] latent per request to preserve the external
+        # contract (one tensor per request).
+        outputs: list[torch.Tensor] = []
+        row_idx = 0
+        for sample in hidden_states:
+            num_images = int(sample.shape[0])
+            rows = []
+            for _ in range(num_images):
+                chunk_start, chunk_end = request_chunk_ranges[row_idx]
+                row_idx += 1
+                rows.append(image_chunks_tensor[chunk_start:chunk_end].reshape(1, -1, image_chunks_tensor.shape[-1]))
+            outputs.append(torch.cat(rows, dim=0) if num_images > 1 else rows[0])
+        return outputs
+
     def forward(
         self,
-        hidden_states: torch.Tensor,
+        hidden_states: torch.Tensor | list[torch.Tensor],
         encoder_hidden_states: torch.Tensor = None,
         encoder_hidden_states_mask: torch.Tensor = None,
         timestep: torch.LongTensor = None,
@@ -1256,7 +1675,7 @@ class QwenImageTransformer2DModel(CachedTransformer):
         attention_kwargs: dict[str, Any] | None = None,
         additional_t_cond=None,
         return_dict: bool = True,
-    ) -> torch.Tensor | Transformer2DModelOutput:
+    ) -> torch.Tensor | Transformer2DModelOutput | list[torch.Tensor]:
         """
         The [`QwenTransformer2DModel`] forward method.
 
@@ -1281,6 +1700,18 @@ class QwenImageTransformer2DModel(CachedTransformer):
             If `return_dict` is True, an [`~models.transformer_2d.Transformer2DModelOutput`] is returned, otherwise a
             `tuple` where the first element is the sample tensor.
         """
+        if isinstance(hidden_states, list):
+            return self._forward_mixfusion(
+                hidden_states=hidden_states,
+                encoder_hidden_states=encoder_hidden_states,
+                encoder_hidden_states_mask=encoder_hidden_states_mask,
+                timestep=timestep,
+                img_shapes=img_shapes,
+                txt_seq_lens=txt_seq_lens,
+                guidance=guidance,
+                additional_t_cond=additional_t_cond,
+            )
+
         # if attention_kwargs is not None:
         #     attention_kwargs = attention_kwargs.copy()
         #     lora_scale = attention_kwargs.pop("scale", 1.0)

@@ -180,23 +180,37 @@ class FlashAttentionBackend(AttentionBackend):
         # CUDA: forward_cuda dispatches the packed cu_seqlens varlen path
         # before ever reading attn_mask. NPU: forward_fa_npu honors the
         # npu_attn_varlen opt-in and rebuilds the padding mask itself if the
-        # packed contract fails. XPU reads attn_mask, so models must keep
-        # constructing it there.
+        # packed contract fails. XPU: forward_xpu only takes the packed path
+        # when attn_mask is None, so models must keep constructing it there.
         return current_omni_platform.is_cuda() or current_omni_platform.is_npu()
 
     @classmethod
-    def supports_multi_doc_packed_varlen(cls) -> bool:
-        # CUDA / ROCm / MUSA all route through ``forward_cuda``, which
-        # dispatches ``_forward_varlen_packed`` -> ``flash_attn_varlen_func``
-        # over the caller's cu_seqlens without a mask, so an arbitrary
-        # N-document packing keeps its boundaries. NPU's forward path
-        # (``_resolve_packed_seq_npu``) only accepts a ``[real, pad]``
-        # two-document layout (cu_seqlens shape <= 3) and otherwise falls
-        # back to a padding-mask rebuild that spans the whole packed row,
-        # so N>=2 real documents would silently attend across request
-        # boundaries. XPU never consumes cu_seqlens from ``extra``. Both
-        # therefore stay False here.
-        return current_omni_platform.is_cuda() or current_omni_platform.is_rocm() or current_omni_platform.is_musa()
+    def supports_multi_doc_packed_varlen(cls, kv_cache_dtype: str | None = None) -> bool:
+        # CUDA / ROCm / MUSA / XPU all dispatch ``_forward_varlen_packed`` ->
+        # ``flash_attn_varlen_func`` over the caller's cu_seqlens without a
+        # mask, so an arbitrary N-document packing keeps its boundaries.
+        # NPU's forward path (``_resolve_packed_seq_npu``) only accepts a
+        # ``[real, pad]`` two-document layout (cu_seqlens shape <= 3) and
+        # otherwise falls back to a padding-mask rebuild that spans the whole
+        # packed row, so N>=2 real documents would silently attend across
+        # request boundaries; NPU stays False here.
+        # The quantized path (``forward_fa_quant_cuda``) is a dense BSHD
+        # kernel: ``_validate_quant_request_cuda`` rejects cu_seqlens
+        # metadata, so a non-float effective policy must use the dense
+        # fallback. Checked first so the answer is testable without an
+        # accelerator.
+        if kv_cache_dtype not in (None, "float", "auto"):
+            return False
+        if current_omni_platform.is_npu():
+            return False
+        from vllm_omni.diffusion.attention.backends.utils.fa import flash_attn_varlen_func
+
+        return flash_attn_varlen_func is not None and (
+            current_omni_platform.is_cuda()
+            or current_omni_platform.is_rocm()
+            or current_omni_platform.is_musa()
+            or current_omni_platform.is_xpu()
+        )
 
     @classmethod
     def supports_attention_mask(cls, attention_spec: object | None = None) -> bool:
@@ -529,6 +543,11 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         Some diffusion transformers already maintain exact packed-document
         boundaries. Reusing those boundaries avoids rebuilding boolean masks
         and gathering/scattering Q/K/V in every attention layer.
+
+        Accepts either a flat packed ``[total_tokens, heads, head_dim]`` layout
+        (dynamic multi-document batching) or a single packed row
+        ``[1, total_tokens, heads, head_dim]``; both return the same layout as
+        their input.
         """
         from vllm_omni.diffusion.attention.backends.utils.fa import (
             flash_attn_varlen_func,
@@ -537,13 +556,29 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
 
         if flash_attn_varlen_func is None:
             raise ImportError("Packed variable-length attention requires flash_attn_varlen_func")
-        if query.shape[0] != 1 or key.shape[0] != 1 or value.shape[0] != 1:
-            raise ValueError("Packed variable-length attention currently requires batch size 1")
+        if query.ndim == 3 and key.ndim == 3 and value.ndim == 3:
+            q_flat, k_flat, v_flat = query, key, value
+            out_shape = None
+        elif (
+            query.ndim == 4
+            and key.ndim == 4
+            and value.ndim == 4
+            and query.shape[0] == 1
+            and key.shape[0] == 1
+            and value.shape[0] == 1
+        ):
+            q_flat, k_flat, v_flat = query.flatten(0, 1), key.flatten(0, 1), value.flatten(0, 1)
+            out_shape = query.shape
+        else:
+            raise ValueError(
+                "Packed variable-length attention expects flat [total_tokens, heads, head_dim] "
+                "or [1, total_tokens, heads, head_dim] Q/K/V."
+            )
 
         out = flash_attn_varlen_func(
-            q=query.flatten(0, 1),
-            k=key.flatten(0, 1),
-            v=value.flatten(0, 1),
+            q=q_flat,
+            k=k_flat,
+            v=v_flat,
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_k=cu_seqlens_k,
             max_seqlen_q=max_seqlen_q,
@@ -553,7 +588,9 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
             **vllm_varlen_version_kwargs(flash_attn_varlen_func),
         )
         out = self._unwrap_flash_output(out)
-        return out.reshape_as(query)
+        if out_shape is not None:
+            out = out.reshape(out_shape)
+        return out
 
     def _forward_varlen_dense(
         self,
@@ -768,6 +805,11 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
             )
 
         if metadata_plan.packing_mode is not PackingMode.NONE:
+            if query.ndim == 3 and attention_mask is not None:
+                raise ValueError(
+                    "Flat packed varlen attention cannot apply an attention mask; "
+                    "pass the document boundaries via cu_seqlens instead."
+                )
             self._warn_fa_deterministic_non_dense("packed-varlen")
             return self._forward_varlen_packed(
                 query,
@@ -1012,19 +1054,36 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
                 "Otherwise, use SDPA backend by setting DIFFUSION_ATTENTION_BACKEND=TORCH_SDPA"
             )
 
+        metadata_plan = _normalize_flash_attention_metadata(attn_metadata)
+        attention_mask = metadata_plan.attention_mask
+
         # Spans take precedence over attn_mask, matching forward_cuda.
-        if attn_metadata is not None and attn_metadata.full_attn_spans is not None:
+        if metadata_plan.full_attn_spans is not None:
             return piecewise_attn(
                 query,
                 key,
                 value,
-                attn_metadata.full_attn_spans,
+                metadata_plan.full_attn_spans,
                 self.softmax_scale,
                 partial(FlashAttentionImpl._flash_varlen_wrapper, attn_func=flash_attn_varlen_func),
-                query_ranges=attn_metadata.query_ranges,
+                query_ranges=None if attn_metadata is None else attn_metadata.query_ranges,
             )
 
-        attention_mask = attn_metadata.attn_mask if attn_metadata is not None else None
+        # Packed cu_seqlens dispatch mirrors forward_cuda. Only take it when
+        # no attn_mask rides along: callers that still build a padding mask
+        # (e.g. [real, pad] packed layouts on backends without
+        # supports_packed_mask_free) must keep the masked path below.
+        if metadata_plan.packing_mode is not PackingMode.NONE and attention_mask is None:
+            self._warn_fa_deterministic_non_dense("packed-varlen")
+            return self._forward_varlen_packed(
+                query,
+                key,
+                value,
+                cu_seqlens_q=metadata_plan.extra["cu_seqlens_q"],
+                cu_seqlens_k=metadata_plan.extra["cu_seqlens_k"],
+                max_seqlen_q=metadata_plan.extra["max_seqlen_q"],
+                max_seqlen_k=metadata_plan.extra["max_seqlen_k"],
+            )
 
         if attention_mask is not None and torch.any(~attention_mask):
             return self._forward_varlen_masked(

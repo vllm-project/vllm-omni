@@ -598,6 +598,92 @@ class TestRequestBatchCapability:
         warmup.assert_called_once_with()
 
 
+class _MixfusionCapablePipeline:
+    supports_mixfusion = True
+
+
+class TestMixFusionCapability:
+    pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
+
+    def test_engine_rejects_server_level_mixfusion_on_unsupported_pipeline(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        od_config = SimpleNamespace(
+            model_class_name="PlainPipeline",
+            custom_pipeline_args=None,
+            enable_mixfusion=True,
+            streaming_output=False,
+            max_num_seqs=1,
+        )
+        monkeypatch.setattr(
+            diffusion_engine_module.DiffusionModelRegistry,
+            "_try_load_model_cls",
+            lambda model_class_name: _SingleRequestPipeline,
+        )
+
+        engine = DiffusionEngine.__new__(DiffusionEngine)
+        with pytest.raises(ValueError, match="does not support MixFusion"):
+            engine._resolve_execution_mode(od_config)
+
+    def test_server_level_mixfusion_enables_step_execution(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # MixFusion mixes resolutions inside a step; request-mode batching keys on
+        # height/width, so accepting enable_mixfusion without step execution would
+        # silently never fuse. Step execution must be enabled automatically.
+        od_config = SimpleNamespace(
+            model_class_name="MixfusionPipeline",
+            custom_pipeline_args=None,
+            enable_mixfusion=True,
+            step_execution=False,
+            streaming_output=False,
+            max_num_seqs=1,
+        )
+        monkeypatch.setattr(
+            diffusion_engine_module.DiffusionModelRegistry,
+            "_try_load_model_cls",
+            lambda model_class_name: _MixfusionCapablePipeline,
+        )
+
+        engine = DiffusionEngine.__new__(DiffusionEngine)
+        assert engine._resolve_execution_mode(od_config) is DiffusionExecutionMode.STEP_BATCH
+        assert od_config.step_execution is True
+        assert engine.step_execution is True
+
+    def test_mixfusion_respects_explicit_step_execution(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        od_config = SimpleNamespace(
+            model_class_name="MixfusionPipeline",
+            custom_pipeline_args=None,
+            enable_mixfusion=True,
+            step_execution=True,
+            streaming_output=False,
+            max_num_seqs=1,
+        )
+        monkeypatch.setattr(
+            diffusion_engine_module.DiffusionModelRegistry,
+            "_try_load_model_cls",
+            lambda model_class_name: _MixfusionCapablePipeline,
+        )
+
+        engine = DiffusionEngine.__new__(DiffusionEngine)
+        assert engine._resolve_execution_mode(od_config) is DiffusionExecutionMode.STEP_BATCH
+
+    def test_engine_ignores_mixfusion_check_when_flag_is_off(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # enable_mixfusion unset on an unsupported pipeline must not raise.
+        od_config = SimpleNamespace(
+            model_class_name="PlainPipeline",
+            custom_pipeline_args=None,
+            streaming_output=False,
+            max_num_seqs=1,
+        )
+        monkeypatch.setattr(
+            diffusion_engine_module.DiffusionModelRegistry,
+            "_try_load_model_cls",
+            lambda model_class_name: _SingleRequestPipeline,
+        )
+
+        engine = DiffusionEngine.__new__(DiffusionEngine)
+        assert engine._resolve_execution_mode(od_config) is DiffusionExecutionMode.REQUEST_BATCH
+
+
 class TestDiffusionCompileConfig:
     pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Base hook classes for model forward interception.
 
 This module provides the foundational hook mechanism that allows intercepting
@@ -139,6 +139,17 @@ class _WrappedForward:
         if registry is None or not registry._hooks:
             return self.module._omni_original_forward(*args, **kwargs)
         return registry.dispatch(*args, **kwargs)
+
+
+def module_has_active_hooks(module: nn.Module) -> bool:
+    """Whether this module's hook registry holds any registered hook.
+
+    Path-specific forwards that bypass the wrapped ``module.forward`` (and thus
+    the registry's dispatch) must check this before running, so that hooks such
+    as layerwise offload keep firing.
+    """
+    registry: HookRegistry | None = getattr(module, "_hook_registry", None)
+    return registry is not None and bool(registry._hooks)
 
 
 def sort_hooks_after_call(func):

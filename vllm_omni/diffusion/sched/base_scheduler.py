@@ -26,6 +26,7 @@ from vllm_omni.diffusion.diffusion_kv.kv_connector import (
 )
 from vllm_omni.diffusion.diffusion_kv.manager import DiffusionKVCacheManager
 from vllm_omni.diffusion.diffusion_kv.metadata import DiffusionKVMetadata
+from vllm_omni.diffusion.registry import supports_mixfusion
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import (
     CachedRequestData,
@@ -53,11 +54,50 @@ _STEP_BATCH_SAMPLING_PARAMS_KEY_FIELD_NAMES = frozenset(field.name for field in 
 }
 
 
+def _apply_mixfusion_shape_relaxation(
+    request: OmniDiffusionRequest,
+    values: dict,
+    *,
+    relax_shapes: bool = True,
+    server_default: bool = False,
+    mixfusion_supported: bool = True,
+) -> dict | None:
+    sampling = request.sampling_params
+    extra_args = getattr(sampling, "extra_args", {}) or {}
+    # A request-level enable_mixfusion flag on a pipeline without the
+    # capability degrades to a no-op: resolution stays in the batch key, so
+    # requests simply group by shape as if MixFusion were off. (Server-level
+    # enable_mixfusion on such a pipeline is rejected at engine startup.)
+    if not mixfusion_supported or not bool(extra_args.get("enable_mixfusion", server_default)):
+        return values
+
+    prompt = request.prompt
+    if isinstance(prompt, dict) and prompt.get("additional_information"):
+        return None
+
+    if not relax_shapes:
+        # Only the step-execution batch handles mixed resolutions correctly
+        # (packed mixfusion and serial-ragged both resolve shapes per request).
+        # Request-mode batches run one full forward per batch whose height/width
+        # is resolved from the first request's sampling params, so resolution
+        # must keep splitting the key until that path supports mixed shapes.
+        return values
+
+    values["height"] = None
+    values["width"] = None
+    values["resolution"] = None
+    return values
+
+
 class BaseScheduler(ABC):
     """Shared queue/state bookkeeping for diffusion schedulers."""
 
     def __init__(self) -> None:
         self.od_config: OmniDiffusionConfig | None = None
+        # Fail-safe default until initialize() resolves the pipeline class:
+        # without the MixFusion capability, resolution must keep splitting the
+        # batch key.
+        self._mixfusion_supported: bool = False
         self._request_states: dict[str, SchedulerRequestState] = {}
         self._step_id: int = 0
         self._waiting: deque[str] = deque()
@@ -87,6 +127,7 @@ class BaseScheduler(ABC):
         kv_vllm_config: VllmConfig | None = None,
     ) -> None:
         self.od_config = od_config
+        self._mixfusion_supported = supports_mixfusion(od_config)
         self._native_prefetch_enabled = native_prefetch_enabled(od_config)
         self._native_prefetch_request_id = None
         self._request_states.clear()
@@ -744,16 +785,25 @@ class BaseScheduler(ABC):
 
     def _build_sampling_params_key(
         self, request: OmniDiffusionRequest
-    ) -> StepBatchSamplingParamsKey | RequestBatchSamplingParamsKey:  # return type loosened for subclassing
+    ) -> StepBatchSamplingParamsKey | RequestBatchSamplingParamsKey | None:  # return type loosened for subclassing
         """Build a step-batch compatibility key from sampling parameters."""
         sampling = request.sampling_params
         # LoRA identity is optional on sampling params (and on test stubs).
         lora_request = getattr(sampling, "lora_request", None)
+        key_kwargs = {name: getattr(sampling, name) for name in _STEP_BATCH_SAMPLING_PARAMS_KEY_FIELD_NAMES}
+        key_kwargs = _apply_mixfusion_shape_relaxation(
+            request,
+            key_kwargs,
+            server_default=bool(getattr(self.od_config, "enable_mixfusion", False)),
+            mixfusion_supported=self._mixfusion_supported,
+        )
+        if key_kwargs is None:
+            return None
         return StepBatchSamplingParamsKey(
             condition_key=getattr(request, "batch_compatibility_key", None),
             lora_int_id=lora_request.lora_int_id if lora_request is not None else None,
             use_step_execution=getattr(request, "use_step_execution", True),
-            **{name: getattr(sampling, name) for name in _STEP_BATCH_SAMPLING_PARAMS_KEY_FIELD_NAMES},
+            **key_kwargs,
         )
 
 

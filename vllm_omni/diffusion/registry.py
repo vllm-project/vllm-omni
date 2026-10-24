@@ -7,6 +7,7 @@ import torch.nn as nn
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader.utils import configure_quant_config
 from vllm.model_executor.models.registry import _LazyRegisteredModel, _ModelRegistry
+from vllm.utils.import_utils import resolve_obj_by_qualname
 
 from vllm_omni.diffusion.config import set_current_diffusion_config
 from vllm_omni.diffusion.data import OmniDiffusionConfig, uses_diffusers_adapter
@@ -449,6 +450,47 @@ DiffusionModelRegistry = _ModelRegistry(
         for model_arch, (mod_folder, mod_relname, cls_name) in _DIFFUSION_MODELS.items()
     }
 )
+
+
+def resolve_diffusion_pipeline_cls(od_config: OmniDiffusionConfig) -> type | None:
+    """Resolve the pipeline class ``od_config`` selects, without instantiating it.
+
+    Resolution order mirrors model-load time: an explicit
+    ``custom_pipeline_args['pipeline_class']``, then the diffusers adapter,
+    then the native registry lookup by ``model_class_name``. Returns ``None``
+    when no class can be resolved.
+    """
+    custom_pipeline_args = getattr(od_config, "custom_pipeline_args", None)
+    if custom_pipeline_args and "pipeline_class" in custom_pipeline_args:
+        pipeline_cls = custom_pipeline_args["pipeline_class"]
+        if isinstance(pipeline_cls, type):
+            return pipeline_cls
+        if isinstance(pipeline_cls, str):
+            try:
+                return resolve_obj_by_qualname(pipeline_cls)
+            except (AttributeError, ImportError, ValueError) as exc:
+                raise ValueError(f"Failed to resolve custom diffusion pipeline class {pipeline_cls!r}.") from exc
+        raise TypeError(
+            "custom_pipeline_args['pipeline_class'] must be a qualified name string or a class, "
+            f"got {type(pipeline_cls).__name__}"
+        )
+
+    if uses_diffusers_adapter(od_config):
+        return DiffusionModelRegistry._try_load_model_cls("DiffusersAdapterPipeline")
+
+    return DiffusionModelRegistry._try_load_model_cls(getattr(od_config, "model_class_name", None))
+
+
+def supports_mixfusion(od_config: OmniDiffusionConfig) -> bool:
+    """Return whether the resolved pipeline opts into MixFusion packed batching.
+
+    Pipelines declare the capability with the optional class attribute
+    ``supports_mixfusion = True``; anything without it (or unresolvable) is
+    treated as unsupported.
+    """
+    model_cls = resolve_diffusion_pipeline_cls(od_config)
+    return model_cls is not None and bool(getattr(model_cls, "supports_mixfusion", False))
+
 
 _NO_CACHE_ACCELERATION = {
     # Pipelines that do not support cache acceleration (cache_dit / tea_cache).

@@ -649,6 +649,80 @@ def test_serve_parser_accepts_ulysses_a2a_permute() -> None:
     assert args.get_explicit_kwargs_dict()["ulysses_a2a_permute"] is True
 
 
+def test_serve_parser_accepts_server_level_mixfusion_flags() -> None:
+    """The server-level MixFusion knobs are modeled on ``OrchestratorArgs`` and
+    ``StageDeployConfig`` but must also be registered in the serve parser, so
+    ``vllm serve ... --omni --enable-mixfusion`` parses and the explicit values
+    reach a diffusion stage's runtime overrides."""
+    from vllm_omni.config.omni_config import StageExecutionType, _stage_cli_overrides
+
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="subparser")
+    OmniServeCommand().subparser_init(subparsers)
+
+    args = parser.parse_args(
+        [
+            "serve",
+            "fake-model",
+            "--omni",
+            "--enable-mixfusion",
+            "--mixfusion-min-chunk-tokens",
+            "512",
+            "--mixfusion-max-chunks",
+            "64",
+        ]
+    )
+
+    assert args.enable_mixfusion is True
+    assert args.mixfusion_min_chunk_tokens == 512
+    assert args.mixfusion_max_chunks == 64
+
+    # The explicit flags survive the orchestrator blacklist (they are
+    # deploy-schema keys) and the diffusion stage's CLI field gate.
+    explicit = args.get_explicit_kwargs_dict()
+    stage_overrides = _stage_cli_overrides(0, explicit, execution_type=StageExecutionType.DIFFUSION)
+    assert stage_overrides["enable_mixfusion"] is True
+    assert stage_overrides["mixfusion_min_chunk_tokens"] == 512
+    assert stage_overrides["mixfusion_max_chunks"] == 64
+
+
+def test_serve_parser_mixfusion_flags_absent_leave_deploy_yaml_in_force() -> None:
+    """Unset MixFusion flags must stay out of the explicit kwargs dict so the
+    deploy YAML's per-stage ``enable_mixfusion`` values apply unchanged."""
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="subparser")
+    OmniServeCommand().subparser_init(subparsers)
+
+    args = parser.parse_args(["serve", "fake-model", "--omni"])
+
+    assert args.enable_mixfusion is None
+    assert args.mixfusion_min_chunk_tokens is None
+    assert args.mixfusion_max_chunks is None
+    explicit = args.get_explicit_kwargs_dict()
+    assert "enable_mixfusion" not in explicit
+    assert "mixfusion_min_chunk_tokens" not in explicit
+    assert "mixfusion_max_chunks" not in explicit
+
+
+def test_serve_parser_accepts_no_enable_mixfusion() -> None:
+    """``--no-enable-mixfusion`` carries an explicit False so a deploy YAML
+    stage enabled with ``enable_mixfusion: true`` can be disabled from the CLI."""
+    from vllm_omni.config.omni_config import StageExecutionType, _stage_cli_overrides
+
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="subparser")
+    OmniServeCommand().subparser_init(subparsers)
+
+    args = parser.parse_args(["serve", "fake-model", "--omni", "--no-enable-mixfusion"])
+
+    assert args.enable_mixfusion is False
+    explicit = args.get_explicit_kwargs_dict()
+    assert explicit["enable_mixfusion"] is False
+
+    stage_overrides = _stage_cli_overrides(0, explicit, execution_type=StageExecutionType.DIFFUSION)
+    assert stage_overrides["enable_mixfusion"] is False
+
+
 def test_serve_parser_accepts_diffusion_quantization_config() -> None:
     parser = TrackingArgumentParser()
     subparsers = parser.add_subparsers(dest="subcommand")

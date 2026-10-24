@@ -648,6 +648,10 @@ class StageDeployConfig:
     dlo_host_registration_limit_gib: float | None = None
     # Diffusion-specific debug and observability knobs.
     enable_diffusion_pipeline_profiler: bool | None = None
+    # Mixed-resolution batch packing (MixFusion) server-level defaults.
+    enable_mixfusion: bool | None = None
+    mixfusion_min_chunk_tokens: int | None = None
+    mixfusion_max_chunks: int | None = None
 
     # Modality/service constraints consumed outside the core engine config.
     max_generated_image_size: int | None = None

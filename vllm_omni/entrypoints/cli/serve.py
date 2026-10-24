@@ -877,6 +877,39 @@ class OmniServeCommand(CLISubcommand):
             "requests to accumulate before scheduling a fused forward wave. "
             "0 disables admission (default).",
         )
+        # Server-level MixFusion defaults. Unset flags leave the deploy YAML's
+        # per-stage ``enable_mixfusion`` / ``mixfusion_min_chunk_tokens`` /
+        # ``mixfusion_max_chunks`` values in force; per-request extra_args still
+        # take precedence over this server default.
+        omni_config_group.add_argument(
+            "--enable-mixfusion",
+            action=argparse.BooleanOptionalAction,
+            default=None,
+            help=(
+                "Enable mixed-resolution batch packing (MixFusion) in the diffusion scheduler "
+                "as the server-level default (default: disabled). MixFusion requires step "
+                "execution, which is enabled automatically when this flag is set. "
+                "--no-enable-mixfusion overrides a deploy YAML stage enabled with enable_mixfusion."
+            ),
+        )
+        omni_config_group.add_argument(
+            "--mixfusion-min-chunk-tokens",
+            type=int,
+            default=None,
+            help=(
+                "MixFusion packing: minimum token budget per ragged-latent chunk (default: 256). "
+                "Unset leaves the deploy YAML value in force."
+            ),
+        )
+        omni_config_group.add_argument(
+            "--mixfusion-max-chunks",
+            type=int,
+            default=None,
+            help=(
+                "MixFusion packing: maximum number of chunks packed into one fused forward "
+                "(default: 128). Unset leaves the deploy YAML value in force."
+            ),
+        )
 
         # VAE memory optimization parameters
         omni_config_group.add_argument(
