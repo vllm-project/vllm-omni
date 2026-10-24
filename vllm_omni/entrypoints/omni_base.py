@@ -43,6 +43,7 @@ from vllm_omni.metrics.utils import (
     observe_stage_workload_metrics,
 )
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
+from vllm_omni.model_extras.hy_nomas import HY_NOMAS_MODEL_ID
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.utils.tracking_parser import TrackingNamespace
 
@@ -87,6 +88,10 @@ def omni_snapshot_download(model_id: str) -> str:
     # as a Hugging Face repo here either fails validation or downloads through
     # the wrong backend before the stage processes are created.
     if is_runai_obj_uri(model_id):
+        return model_id
+
+    # Hy-Nomas 的仓库还包含基础模型、量化权重和 PE；由 pipeline 只下载推理所需组件。
+    if model_id.rstrip("/").lower() == HY_NOMAS_MODEL_ID.lower():
         return model_id
 
     # TODO: this is just a workaround for quickly use modelscope, we should support

@@ -40,6 +40,7 @@ from vllm_omni.model_extras.hunyuan_image3 import build_x_to_text_prompt as buil
 from vllm_omni.model_extras.hunyuan_image3 import (
     validate_ar_tokenizer as validate_hunyuan_image3_ar_tokenizer,
 )
+from vllm_omni.model_extras.hy_nomas import HY_NOMAS_EXTRA_BODY_PARAMS, get_hy_nomas_video_generation_defaults
 from vllm_omni.model_extras.kandinsky6 import (
     KANDINSKY6_EXTRA_BODY_PARAMS,
     KANDINSKY6_EXTRA_OUTPUT_PARAMS,
@@ -249,6 +250,11 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
         "extra_output_params": MAGI2_EXTRA_OUTPUT_PARAMS,
         "video_generation_defaults_builder": get_magi2_video_generation_defaults,
         "reference_image_size_resolver": magi2_preserves_reference_image_size,
+    },
+    "HyNomasPipeline": {
+        "extra_body_params": HY_NOMAS_EXTRA_BODY_PARAMS,
+        "video_generation_defaults_builder": get_hy_nomas_video_generation_defaults,
+        "output_tensor_range": "zero_to_one",
     },
     "HeliosPipeline": {
         "extra_body_params": HELIOS_EXTRA_BODY_PARAMS,
