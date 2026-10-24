@@ -24,6 +24,8 @@ connectors:
   connector_of_shared_memory:
     name: SharedMemoryConnector
     extra:
+      # Opt in to the stateful streaming decoder on CUDA.
+      decode_streaming: false
       talker_first_audio: true
       codec_streaming: true
       connector_get_sleep_s: 0.01
