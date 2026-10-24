@@ -2471,18 +2471,17 @@ def test_diffuse_drops_session_when_progress_iteration_fails(make_cosmos3_pipeli
     assert "request-that-fails" not in pipeline._memory_manager
 
 
-@pytest.mark.parametrize("guidance_scale", [0.0, 1.0, 3.0, 5.0])
+@pytest.mark.parametrize("guidance_scale", [1.0, 3.0, 5.0])
 @pytest.mark.parametrize("cfg_normalize", [False, True])
-def test_transfer_control_delta_is_independent_of_text_guidance(
+def test_transfer_control_increment_is_independent_of_text_guidance(
     make_cosmos3_pipeline, guidance_scale, cfg_normalize
 ) -> None:
     pipeline = make_cosmos3_pipeline()
     cond_no_control = torch.tensor([2.0, 4.0])
     cond_full = torch.tensor([6.0, 10.0])
     uncond_full = torch.tensor([1.0, 3.0])
-    expected = uncond_full + guidance_scale * (cond_no_control - uncond_full)
-    if guidance_scale != 0.0:
-        expected += 1.5 * (cond_full - cond_no_control)
+    expected = uncond_full + guidance_scale * (cond_full - uncond_full)
+    expected += (1.5 - 1.0) * (cond_full - cond_no_control)
     if cfg_normalize:
         expected = pipeline.cfg_normalize_function(cond_full, expected)
 
@@ -2492,6 +2491,43 @@ def test_transfer_control_delta_is_independent_of_text_guidance(
         cfg_normalize=cfg_normalize,
     )
     torch.testing.assert_close(actual, expected)
+
+
+def test_transfer_combined_cfg_rejects_zero_text_guidance(make_cosmos3_pipeline) -> None:
+    pipeline = make_cosmos3_pipeline()
+    predictions = [torch.tensor([6.0]), torch.tensor([2.0]), torch.tensor([1.0])]
+
+    with pytest.raises(ValueError, match="nonzero text guidance scale"):
+        pipeline.combine_multi_branch_cfg_noise(
+            predictions,
+            {"mode": "cosmos3_transfer", "guidance_scale": 0.0, "control_guidance": 1.5},
+        )
+
+
+@pytest.mark.parametrize("text_cfg_below_one", [False, True])
+def test_diffuse_transfer_rejects_zero_text_guidance_with_active_control(
+    make_cosmos3_pipeline, text_cfg_below_one
+) -> None:
+    pipeline = make_cosmos3_pipeline()
+    latents = torch.zeros(1, 2, 1, 1, 1)
+    with pytest.raises(ValueError, match="nonzero text guidance scale"):
+        pipeline.diffuse_transfer(
+            latents=latents,
+            timesteps=torch.tensor([7]),
+            cond_ids=_ids(2),
+            cond_mask=_mask(),
+            uncond_ids=_ids(1),
+            uncond_mask=_mask(),
+            guidance_scale=0.0,
+            control_guidance=1.5,
+            control_guidance_interval=None,
+            control_latents=[torch.zeros_like(latents)],
+            shared_kwargs={},
+            velocity_mask=torch.ones(1, 1, 1, 1, 1),
+            condition_latents=torch.zeros_like(latents),
+            text_cfg_below_one=text_cfg_below_one,
+        )
+    assert pipeline.transformer.calls == []
 
 
 def test_diffuse_transfer_applies_control_cfg(make_cosmos3_pipeline, sequential_cfg_parallel) -> None:
@@ -2524,7 +2560,7 @@ def test_diffuse_transfer_applies_control_cfg(make_cosmos3_pipeline, sequential_
     assert pipeline.transformer.calls[0]["kwargs"]["control_weights"] == [1.0]
     assert "control_weights" not in pipeline.transformer.calls[1]["kwargs"]
     assert pipeline.transformer.calls[2]["kwargs"]["control_weights"] == [1.0]
-    torch.testing.assert_close(result, torch.full_like(latents, -46.0))
+    torch.testing.assert_close(result, torch.full_like(latents, 154.0))
 
 
 def test_diffuse_transfer_uses_named_seacache_contexts(make_cosmos3_pipeline, sequential_cfg_parallel) -> None:
@@ -2675,7 +2711,7 @@ def test_diffuse_transfer_interval_switches_branch_counts(make_cosmos3_pipeline,
         (2, False),
         (2, True),
     ]
-    torch.testing.assert_close(result, torch.full_like(latents, 208.0))
+    torch.testing.assert_close(result, torch.full_like(latents, 408.0))
 
 
 @pytest.mark.parametrize(

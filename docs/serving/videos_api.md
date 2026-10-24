@@ -195,8 +195,13 @@ may specify its own `control_path` and `control_weight`. Request-level transfer
 options include
 `control_guidance`, `control_guidance_interval`,
 `emphasize_control_in_prompt`, `num_video_frames_per_chunk`,
-`num_conditional_frames`, `show_control_condition`, and `show_input`. Transfer
-uses its transfer-specific system prompt and, by default, appends a
+`num_conditional_frames`, `show_control_condition`, and `show_input`.
+Cosmos3 transfer raises `ValueError` before model forwards when a denoising
+step has effective text `guidance_scale=0` and active `control_guidance != 1`.
+Use a nonzero text guidance scale when control guidance is active; the check
+uses the effective scales after applying guidance intervals.
+
+Transfer uses its transfer-specific system prompt and, by default, appends a
 control-adherence directive to the positive prompt. It adds duration/FPS and
 resolution metadata to both CFG branches but does not add a negative prompt
 automatically. The Cosmos3 recipe includes an optional reference negative
