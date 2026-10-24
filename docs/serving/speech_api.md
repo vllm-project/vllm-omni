@@ -50,6 +50,9 @@ vllm serve FunAudioLLM/Fun-CosyVoice3-0.5B-2512 \
 vllm-omni serve nineninesix/gepard-1.0 --omni --port 8091 --trust-remote-code \
     --stage-init-timeout 900 \
     --deploy-config vllm_omni/deploy/gepard.yaml
+
+# Chatterbox Turbo (built-in voice or one reference recording; `pip install 'vllm-omni[chatterbox]'`)
+vllm serve ResembleAI/chatterbox-turbo --omni --port 8091
 ```
 
 ### Generate Speech
@@ -1050,6 +1053,35 @@ parity should be checked against the upstream adapter on your deployment.
 | Model | Description |
 | ------- | ------------- |
 | `BreezeBlue/Breeze-TTS-2` | Two-stage AR TTS (T5Gemma2 + Qwen3 talker with a depth decoder, bundled Qwen3-TTS codec) at 24 kHz. Four modes are selected from the request fields: plain (`input` + speaker tag `voice`, `S0`..`S9`), voice design (`instructions`), voice clone (`ref_audio` + `ref_text`, exactly one clip), and voice direction (reference + `instructions`). Greedy decoding only: `sample_rate` must be `24000`, `speed` must be `1.0`, and `guidance_scale`/`cfg_scale` other than `1.0`, `negative_prompt`, `temperature`/`top_p`/`top_k` overrides, `language`, and `speaker_embedding` are rejected. Streaming returns PCM `speech.audio.delta` events. See [`recipes/BreezeBlue/Breeze-TTS-2.md`](https://github.com/vllm-project/vllm-omni/blob/main/recipes/BreezeBlue/Breeze-TTS-2.md). |
+
+### Chatterbox Turbo and Original
+
+| Model | Description |
+| ------- | ------------- |
+| `ResembleAI/chatterbox-turbo` | GPT-2 T3 with the two-step meanflow S3Gen decoder; English, built-in voice or voice cloning from one reference recording |
+| `ResembleAI/chatterbox` | Llama T3 with paired classifier-free guidance and the ten-step S3Gen decoder; adds `exaggeration` and `cfg_weight` controls |
+
+`ResembleAI/chatterbox-turbo` and `ResembleAI/chatterbox` serve English speech
+at 24 kHz through `/v1/audio/speech` and the shared sentence-segmented WebSocket
+frontend. Use `voice: "default"` for the built-in voice, or one `ref_audio`
+recording (URL or data URL) without `ref_text`. Both use the shared one-second
+minimum; Turbo repeats a clip of five seconds or less until it is longer, where
+upstream refuses it.
+
+Non-streaming formats are WAV, PCM, MP3 and FLAC. Streaming uses
+`stream: true`, `stream_format: "audio"` and `response_format: "pcm"` or `"wav"`.
+PCM is mono signed 16-bit little-endian at 24 kHz. Other output sample rates
+are unsupported by this adapter.
+
+Original accepts nonnegative finite `extra_params.exaggeration` and
+`extra_params.cfg_weight`; a request without them gets the deploy file's stage 0
+`additional_config` values (0.5 each, upstream's defaults). Turbo rejects those fields.
+Both reject VoiceDesign, free-form instructions and multilingual synthesis.
+`max_new_tokens` accepts 1 to 1000 speech tokens, upstream's generation cap,
+and defaults to 1000. Admission capacity does not guarantee real-time playback.
+
+See the [online examples](../user_guide/examples/online_serving/text_to_speech.md#chatterbox-turbo-and-original)
+and the [H100 recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/ResembleAI/Chatterbox-H100.md).
 
 ## Error Responses
 

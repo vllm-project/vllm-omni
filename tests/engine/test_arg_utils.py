@@ -19,7 +19,7 @@ from unittest.mock import Mock
 import pytest
 from omegaconf import OmegaConf
 from pydantic import ValidationError
-from transformers import PretrainedConfig, Qwen3OmniMoeConfig
+from transformers import AutoConfig, PretrainedConfig, Qwen3OmniMoeConfig
 from vllm.config import VllmConfig
 from vllm.engine.arg_utils import EngineArgs
 from vllm.exceptions import VLLMValidationError
@@ -28,9 +28,10 @@ from vllm.v1.worker.gpu.sample.logit_bias import LogitBiasState
 
 from tests.helpers.mock import patch_hf_snapshot_download
 from vllm_omni.config.model import OmniModelConfig
-from vllm_omni.engine.arg_utils import OmniEngineArgs
+from vllm_omni.engine.arg_utils import _ARCH_TO_MODEL_TYPE, OmniEngineArgs
 from vllm_omni.engine.stage_init_utils import build_engine_args_dict
 from vllm_omni.platforms import current_omni_platform
+from vllm_omni.transformers_utils.configs.chatterbox import ChatterboxConfig
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -615,6 +616,80 @@ def test_text_encoder_tp_size_reaches_default_diffusion_parallel_config():
 
     parallel_config = stage_cfg["engine_args"]["parallel_config"]
     assert parallel_config["text_encoder_tp_size"] == 2
+
+
+# Chatterbox's Hub repository ships no config.json, so a config-less
+# directory or Hub id gets one written; a config.json that exists but fails
+# to load stays on vLLM's error path.
+def chatterbox_args(model: str, model_arch: str = "ChatterboxForConditionalGeneration") -> OmniEngineArgs:
+    return OmniEngineArgs(model=model, model_arch=model_arch, skip_tokenizer_init=True)
+
+
+def _patched_config(args: OmniEngineArgs) -> dict:
+    with open(os.path.join(args.hf_config_path, "config.json"), encoding="utf-8") as config_file:
+        return json.load(config_file)
+
+
+def test_config_less_chatterbox_directory_gets_a_config_written(tmp_path):
+    """The engine writes a config.json naming the model type, loads the directory through it, and removes it."""
+    args = chatterbox_args(str(tmp_path))
+
+    model_config = args.create_model_config()
+
+    config = model_config.hf_config
+    assert isinstance(config, ChatterboxConfig)
+    assert config.architectures == model_config.architectures == ["ChatterboxForConditionalGeneration"]
+    assert not os.path.exists(args.hf_config_path) and not hasattr(args, "_temp_config_dir")
+
+
+# The Hub is a remote service: its answers for the Hub id (no config.json, or
+# one that exists but cannot be fetched) are stood in for here.
+def no_config(cls, model, **kwargs):
+    """The Hub's answer for a repository without a config.json."""
+    raise OSError("no config")
+
+
+def test_config_less_chatterbox_hub_id_gets_a_config_written(monkeypatch):
+    monkeypatch.setattr(PretrainedConfig, "get_config_dict", classmethod(no_config))
+    monkeypatch.setattr("vllm_omni.engine.arg_utils.file_or_path_exists", lambda *a, **k: False)
+    args = chatterbox_args("ResembleAI/chatterbox-turbo")
+    try:
+        # As create_model_config calls it: the model type comes from the architecture.
+        args._patch_empty_hf_config(_ARCH_TO_MODEL_TYPE[args.model_arch])
+        assert _patched_config(args) == {
+            "model_type": "chatterbox",
+            "architectures": ["ChatterboxForConditionalGeneration"],
+        }
+        # The engine then loads the written directory through AutoConfig.
+        monkeypatch.undo()
+        config = AutoConfig.from_pretrained(args.hf_config_path)
+        assert isinstance(config, ChatterboxConfig)
+        assert config.architectures == ["ChatterboxForConditionalGeneration"]
+    finally:
+        if hasattr(args, "_temp_config_dir"):
+            shutil.rmtree(args._temp_config_dir, ignore_errors=True)
+
+
+@pytest.mark.parametrize("model_arch", ["ChatterboxForConditionalGeneration", "CosyVoice3Model"])
+def test_a_config_that_exists_but_fails_to_load_is_left_alone(tmp_path, model_arch):
+    """The engine writes no config over a broken one; loading the directory fails on the file itself."""
+    (tmp_path / "config.json").write_text("{")
+    args = chatterbox_args(str(tmp_path), model_arch)
+
+    with pytest.raises((OSError, ValueError)):
+        args.create_model_config()
+
+    assert args.hf_config_path is None
+    assert not hasattr(args, "_temp_config_dir")
+
+
+def test_chatterbox_hub_config_that_exists_but_fails_to_load_is_left_alone(monkeypatch):
+    # The file exists but the Hub refuses it, as for a gated repository.
+    monkeypatch.setattr(PretrainedConfig, "get_config_dict", classmethod(no_config))
+    monkeypatch.setattr("vllm_omni.engine.arg_utils.file_or_path_exists", lambda *a, **k: True)
+    hub = chatterbox_args("ResembleAI/chatterbox-turbo")
+    hub._patch_empty_hf_config("chatterbox")
+    assert hub.hf_config_path is None
 
 
 def test_native_mrv2_worker_provides_connector_without_legacy_mixin():

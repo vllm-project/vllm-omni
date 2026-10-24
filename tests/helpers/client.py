@@ -2279,6 +2279,8 @@ class OfflineOmniClient:
                 audio = torch.cat(chunks, dim=0)
             wav = torch.as_tensor(audio).float().cpu().reshape(-1)
             assert wav.numel() > 0, f"Request {index}: decoded audio is empty"
+            assert torch.isfinite(wav).all(), f"Request {index}: decoded audio has non-finite samples"
+            assert wav.abs().max().item() > 0, f"Request {index}: decoded audio is silent"
             wavs.append(wav)
 
             sr_raw = multimodal_output.get("sr")
@@ -2314,13 +2316,12 @@ class OfflineOmniClient:
         if request_config.get("assert_distinct_outputs") and len(wavs) > 1:
             # Distinct inputs must decode to distinct audio. Leaked per-request
             # codec state shows up as two requests producing (near-)identical
-            # waveforms; different lengths already prove distinctness.
+            # waveforms; unequal lengths are compared over their common prefix.
             for i in range(len(wavs)):
                 for j in range(i + 1, len(wavs)):
                     a, b = wavs[i], wavs[j]
-                    if a.numel() != b.numel():
-                        continue
-                    max_diff = (a - b).abs().max().item()
+                    common = min(a.numel(), b.numel())
+                    max_diff = (a[:common] - b[:common]).abs().max().item()
                     assert max_diff > 1e-3, (
                         f"Requests {i} and {j} produced near-identical audio "
                         f"(max sample diff {max_diff:.2e}); possible codec-state crosstalk"

@@ -17,6 +17,7 @@ list of supported architectures across all modalities, see
 | --- | --- | --- | --- | --- | --- | --- |
 | VoxCPM2 | `openbmb/VoxCPM2` | single (native AR) | ✓ | — | continuation (`--ref-audio` + `--ref-text`) | 48 kHz |
 | CosyVoice3 | `FunAudioLLM/Fun-CosyVoice3-0.5B-2512` | 2 (talker + code2wav) | ✓ | ✓ (`async_chunk: true` default) | — | 22.05 kHz |
+| Chatterbox Turbo / Original | `ResembleAI/chatterbox-turbo`, `ResembleAI/chatterbox` | 2 (AR + S3Gen/HiFT) | ✓ (no transcript) | ✓ (async chunk) | English; Original CFG / exaggeration | 24 kHz |
 | Fish Audio Drama 3 | `fishaudio/drama-3` | 2 (AR + DAC codec) | ✓ | ✓ (online) | speaker and event tags; no example script | 44.1 kHz |
 | Fish Speech S2 Pro | `fishaudio/s2-pro` | dual-AR | ✓ | ✓ (`--streaming`) | — | 44.1 kHz |
 | GLM-TTS | `zai-org/GLM-TTS` | 2 (AR + DiT) | ✓ (required) | ✓ | — | 24 kHz |
@@ -24,6 +25,23 @@ list of supported architectures across all modalities, see
 | Qwen3-TTS | `Qwen/Qwen3-TTS-12Hz-1.7B-{CustomVoice,VoiceDesign,Base}` | 2 (talker + code2wav) | ✓ (Base) | ✓ | 3 task variants (`--query-type`) | 24 kHz |
 | Voxtral TTS | `mistralai/Voxtral-4B-TTS-2603` | varies | ✓ | ✓ | voice presets (`--voice`) | 24 kHz |
 | higgs-audio v2 | `bosonai/higgs-audio-v2-generation-3B-base` (+ `k2-fsa/OmniVoice/audio_tokenizer/` codec) | 2 (talker + code2wav, DualFFN) | ✓ (`--ref-audio` + `--ref-text`) | — | — | 24 kHz |
+
+## Chatterbox Turbo and Original
+
+Two-stage English speech synthesis at 24 kHz, with a built-in voice or a single
+reference recording. No reference transcript is needed. Install the conditioning
+extra with `uv pip install -e '.[chatterbox]'`.
+
+Use the production `load_text_tokenizer`, `tokenize_text`, `build_prompt`, and
+`VoiceConditioning` helpers with `Omni.generate`; Original's `build_prompt` takes
+`exaggeration` and `cfg_weight` (upstream's defaults are 0.5 each). The [offline command in the
+H100 recipe](https://github.com/vllm-project/vllm-omni/tree/main/recipes/ResembleAI/Chatterbox-H100.md#command)
+saves a complete mono 24 kHz WAV and uses the same preparation as serving.
+
+See the [H100 recipe](https://github.com/vllm-project/vllm-omni/tree/main/recipes/ResembleAI/Chatterbox-H100.md) for
+profiles, qualification scope and concurrency limitations.
+
+---
 
 ## Common Quick Start
 

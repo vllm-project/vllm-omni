@@ -190,7 +190,9 @@ steps:
     steps:
 
       - label: ":full_moon: TTS · Function Test with L4"
-        source_file_dependencies: tts_qwen3_tts_function
+        source_file_dependencies:
+          - tts_qwen3_tts_function
+          - tts_chatterbox_function
         timeout_in_minutes: 120
         env:
           VLLM_OMNI_FAILED_SPEECH_AUDIO_DIR: .
