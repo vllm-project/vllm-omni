@@ -26,7 +26,6 @@ import PIL.Image
 import torch
 import torch.nn as nn
 from diffusers.image_processor import VaeImageProcessor
-from diffusers.models.autoencoders.autoencoder_kl_flux2 import AutoencoderKLFlux2
 from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion import retrieve_timesteps
 from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_img2img import retrieve_latents
 from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
@@ -249,13 +248,8 @@ class Flux2KleinPipeline(
             subfolder="tokenizer",
             local_files_only=local_files_only,
         )
-        vae_class = (
-            DistributedAutoencoderKLFlux2
-            if od_config.parallel_config.vae_parallel_mode == "batch"
-            else AutoencoderKLFlux2
-        )
         self.vae = from_pretrained_with_prefetch(
-            vae_class.from_pretrained,
+            DistributedAutoencoderKLFlux2.from_pretrained,
             model,
             subfolder="vae",
             prefetch_list=flux2_subfolders,
