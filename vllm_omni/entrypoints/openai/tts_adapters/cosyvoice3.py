@@ -125,7 +125,13 @@ class CosyVoice3Adapter(ARTTSAdapter):
         self, request: "OpenAICreateSpeechRequest", sampling_params_list: list, has_inline_ref_audio: bool
     ) -> PreparedRequest:
         prompt = await self._build_prompt(request, has_inline_ref_audio=has_inline_ref_audio)
-        return PreparedRequest(prompt=prompt, tts_params={}, model_type="cosyvoice3")
+        tts_params: dict[str, Any] = {}
+        if request.initial_codec_chunk_frames is not None:
+            tts_params["initial_codec_chunk_frames"] = [request.initial_codec_chunk_frames]
+            info = dict(prompt.get("additional_information") or {})
+            info["initial_codec_chunk_frames"] = [request.initial_codec_chunk_frames]
+            prompt["additional_information"] = info
+        return PreparedRequest(prompt=prompt, tts_params=tts_params, model_type="cosyvoice3")
 
     def apply_sampling_overrides(
         self,
