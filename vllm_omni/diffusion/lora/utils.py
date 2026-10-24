@@ -3,11 +3,14 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 import torch
 import torch.nn as nn
 from transformers import PretrainedConfig
 from vllm.config.lora import LoRAConfig
 from vllm.lora.layers.fused_moe import FusedMoEWithLoRA
+from vllm.lora.lora_weights import LoRALayerWeights
 from vllm.model_executor.layers.fused_moe import MoERunner
 from vllm.platforms import current_platform
 
@@ -224,3 +227,27 @@ def from_layer_diffusion(
             return instance
 
     return layer
+
+
+def validate_generic_peft_ranks(loras: Mapping[str, LoRALayerWeights]) -> None:
+    """Check raw 2D factors against each layer's already-resolved PEFT rank.
+
+    LoRAModel resolves rank/alpha patterns before this check. Keep its rank and
+    scaling intact; non-2D fused tensors retain the existing loader checks.
+    """
+    mismatched = []
+    for name, weights in loras.items():
+        a, b = weights.lora_a, weights.lora_b
+        if a is None or b is None or a.ndim != 2 or b.ndim != 2:
+            continue
+        if a.shape[0] != weights.rank or b.shape[1] != weights.rank:
+            mismatched.append(
+                f"{name} (resolved rank={weights.rank}, lora_A rows={a.shape[0]}, lora_B columns={b.shape[1]})"
+            )
+    if mismatched:
+        detail = "; ".join(mismatched[:8])
+        raise ValueError(
+            "LoRA factors do not match their resolved PEFT ranks: "
+            f"{detail}. Supply matching weights or a model-specific "
+            "_load_diffusion_lora_adapter hook for nonstandard layouts."
+        )

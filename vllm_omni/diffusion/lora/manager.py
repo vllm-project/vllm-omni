@@ -29,6 +29,7 @@ from vllm_omni.diffusion.lora.utils import (
     _expand_expected_modules_for_packed_layers,
     _match_target_modules,
     from_layer_diffusion,
+    validate_generic_peft_ranks,
 )
 from vllm_omni.lora.utils import stable_lora_int_id
 
@@ -466,6 +467,10 @@ class DiffusionLoRAManager:
                 model_vocab_size=None,
                 weights_mapper=None,
             )
+
+            # The loader has already resolved per-module rank/alpha patterns.
+            # Validate the raw factors without replacing their rank or scaling.
+            validate_generic_peft_ranks(lora_model.loras)
         else:
             lora_model, peft_helper = loaded
 
