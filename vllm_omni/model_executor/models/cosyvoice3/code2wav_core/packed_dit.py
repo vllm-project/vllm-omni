@@ -16,11 +16,21 @@ from dataclasses import dataclass
 import torch
 import torch._dynamo as dynamo
 import torch.nn.functional as F
-from vllm.vllm_flash_attn import flash_attn_varlen_func
 
 from .packed_conv import pack_conv_weight, packed_causal_conv_mish
 
 FA3_PAGE_SIZE = 1
+
+
+def to_device_async(host: torch.Tensor, device: torch.device) -> torch.Tensor:
+    """Copy host metadata to ``device`` without waiting for its queued kernels.
+
+    A pageable host-to-device copy blocks the host until every kernel already
+    queued on the stream has run; staging through pinned memory does not.
+    """
+    if torch.device(device).type != "cuda":
+        return host.to(device)
+    return host.pin_memory().to(device, non_blocking=True)
 
 
 class RaggedRowAttention:
@@ -52,10 +62,10 @@ class RaggedRowAttention:
                 segment_rows.append(row)
                 segment_ends.append(end)
                 offsets.append(offsets[-1] + end - start)
-        self.cache_seqlens = torch.tensor(segment_ends, dtype=torch.int32, device=device)
-        self.cu_seqlens_q = torch.tensor(offsets, dtype=torch.int32, device=device)
+        self.cache_seqlens = to_device_async(torch.tensor(segment_ends, dtype=torch.int32), device)
+        self.cu_seqlens_q = to_device_async(torch.tensor(offsets, dtype=torch.int32), device)
         self.max_seqlen_q = max(b - a for a, b in zip(offsets, offsets[1:]))
-        starts = rows.starts_host[segment_rows].to(device)
+        starts = to_device_async(rows.starts_host[segment_rows], device)
         page = torch.arange(width or max(segment_ends), dtype=torch.int32, device=device)
         self.page_table = torch.where(page[None] < self.cache_seqlens[:, None], starts[:, None] + page[None], 0)
 
@@ -192,6 +202,8 @@ def packed_fa3(
     max_seqlen_q: int,
 ) -> torch.Tensor:
     """Alias-free FA3 boundary for the compiled PackedDiT path."""
+    from vllm.vllm_flash_attn import flash_attn_varlen_func
+
     return flash_attn_varlen_func(
         q,
         k_cache,
@@ -295,11 +307,11 @@ class PackedRows:
 def pack_rows(lengths: Sequence[int], device: torch.device) -> PackedRows:
     lengths = tuple(int(length) for length in lengths)
     starts_host = F.pad(torch.tensor(lengths, dtype=torch.int64).cumsum(0), (1, 0))
-    starts = starts_host.to(device)
+    starts = to_device_async(starts_host, device)
     total = int(starts_host[-1])
     row_ids = torch.repeat_interleave(
         torch.arange(len(lengths), device=device),
-        torch.tensor(lengths, dtype=torch.int64, device=device),
+        to_device_async(torch.tensor(lengths, dtype=torch.int64), device),
         output_size=total,
     )
     positions = torch.arange(total, device=device) - starts[row_ids]
@@ -650,6 +662,14 @@ def flow_graph_total(total: int) -> int:
     return -(-total // step) * step
 
 
+def flow_graph_totals(limit: int) -> list[int]:
+    """Every packed-length bucket up to the one holding ``limit`` frames."""
+    totals = [flow_graph_total(1)]
+    while totals[-1] < limit:
+        totals.append(flow_graph_total(totals[-1] + 1))
+    return totals
+
+
 @dataclass
 class _FlowGraph:
     graph: torch.cuda.CUDAGraph
@@ -793,6 +813,25 @@ class FlowGraphRunner:
             modulations,
             cfg_rate,
         )
+
+    def capture(
+        self,
+        slots: int,
+        total: int,
+        like: torch.Tensor,
+        speaker_dim: int,
+        time_span: torch.Tensor,
+        *,
+        cfg_rate: float,
+        key: tuple,
+    ) -> None:
+        """Record the full-context solve of ``slots`` row slots and ``total``
+        packed frames (a bucket) before serving, from one zero batch in it."""
+        lengths = (total - slots + 1,) + (1,) * (slots - 1)
+        zeros = like.new_zeros((1, total, like.shape[-1]))
+        speakers = like.new_zeros((slots, speaker_dim))
+        rows = pack_rows(lengths, like.device)
+        self.run(zeros, time_span, zeros, speakers, zeros, rows, cfg_rate=cfg_rate, streaming=False, key=key)
 
     def run(
         self,

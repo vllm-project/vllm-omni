@@ -12,7 +12,7 @@ buffer and lifecycle hooks.
 from __future__ import annotations
 
 from dataclasses import replace
-from typing import Any
+from typing import Any, Protocol
 
 import numpy as np
 import torch
@@ -35,6 +35,7 @@ from vllm_omni.core.sched.output import OmniCachedRequestData, OmniNewRequestDat
 from vllm_omni.data_entry_keys import flatten_payload
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.outputs import OmniModelRunnerOutput
+from vllm_omni.worker.mixins import CPU_INPUT_IDS_KWARG
 from vllm_omni.worker_v2.omni_ar_model_runner import (
     _async_copy_mm,
     _ensure_tensor_values,
@@ -55,6 +56,40 @@ def _contains_cuda_tensor(value: Any) -> bool:
     if isinstance(value, (list, tuple)):
         return any(_contains_cuda_tensor(v) for v in value)
     return False
+
+
+class ScheduledRows(Protocol):
+    """The batch rows ``scheduled_cpu_input_ids`` reads; MRv2's ``InputBatch`` provides them."""
+
+    req_ids: list[str]
+    num_computed_tokens_np: np.ndarray
+    num_scheduled_tokens: np.ndarray
+
+
+def scheduled_cpu_input_ids(scheduler_output: SchedulerOutput, input_batch: ScheduledRows) -> torch.Tensor | None:
+    """This step's input ids, in batch order, from the scheduler's host-side token lists.
+
+    Generation chunks arrive as new requests (``prefill_token_ids``) or as
+    re-filled cached requests (``prompt_token_ids``), and the device batch is
+    gathered from those same lists. Models that filter tokens by value read
+    this copy so the step does not block on the device one. None when a row's
+    tokens are not in this scheduler output.
+    """
+    tokens: dict[str, list[int]] = {}
+    for request in scheduler_output.scheduled_new_reqs:
+        ids = request.prefill_token_ids or request.prompt_token_ids
+        if ids is not None:
+            tokens[request.req_id] = ids
+    tokens.update(getattr(scheduler_output.scheduled_cached_reqs, "prompt_token_ids", None) or {})
+    rows: list[list[int]] = []
+    for row, req_id in enumerate(input_batch.req_ids):
+        ids = tokens.get(req_id)
+        start = int(input_batch.num_computed_tokens_np[row])
+        count = int(input_batch.num_scheduled_tokens[row])
+        if ids is None or start + count > len(ids):
+            return None
+        rows.append(list(ids[start : start + count]))
+    return torch.tensor([token for row in rows for token in row], dtype=torch.int64)
 
 
 def check_exact_input_shape(model: Any, input_ids: torch.Tensor | None, num_tokens: int) -> None:
@@ -419,6 +454,10 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
             # Request-owned model state (e.g. MiniCPM-o's vocoder caches) is
             # keyed by the scheduler request id, in batch order.
             model_inputs["request_ids"] = list(input_batch.req_ids)
+        if getattr(self.model, "requires_cpu_input_ids", False) and not dummy_run:
+            cpu_input_ids = scheduled_cpu_input_ids(scheduler_output, input_batch)
+            if cpu_input_ids is not None:
+                model_inputs[CPU_INPUT_IDS_KWARG] = cpu_input_ids
         self._add_legacy_forward_inputs(model_inputs, input_batch)
 
         eplb = getattr(self, "eplb", None)

@@ -72,7 +72,7 @@ class _States:
 
 def _ras_sampler(tokens, prompt_len, total_len, temperature, top_k, top_p, seeds, vocab):
     return SimpleNamespace(
-        logit_bias_state=SimpleNamespace(apply_logit_bias=lambda *args: None),
+        logits_processors=[],
         sampling_states=_States(temperature, top_k, top_p, seeds, vocab),
         req_states=SimpleNamespace(
             all_token_ids=SimpleNamespace(gpu=tokens),
@@ -96,7 +96,8 @@ def _sample(sampler, logits, pos, fused):
         pos,
         None,
         None,
-        not fused,  # logprobs keep the tensor path
+        np.full(rows, 64),
+        return_logprobs=not fused,  # logprobs keep the tensor path
         default_top_p=0.8,
         default_top_k=25,
         win_size=10,

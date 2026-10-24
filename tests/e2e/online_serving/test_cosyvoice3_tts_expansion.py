@@ -75,7 +75,16 @@ tts_async_chunk_server_params = [
             server_args=["--trust-remote-code"],
         ),
         id="cosyvoice3_async_chunk",
-    )
+    ),
+    pytest.param(
+        OmniServerParams(
+            model=MODEL,
+            stage_config_path=get_stage_config("cosyvoice3_mrv2.yaml"),
+            server_args=["--trust-remote-code"],
+        ),
+        id="cosyvoice3_async_chunk_mrv2",
+        marks=pytest.mark.skipif(not current_omni_platform.is_cuda(), reason="MRv2 streaming profile requires CUDA"),
+    ),
 ]
 
 

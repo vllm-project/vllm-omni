@@ -129,6 +129,49 @@ def test_full_payload_abort_discards_partial_and_late_outputs(plane):
     assert not plane._pending_full_payload_send
 
 
+@pytest.mark.parametrize("requires_tokens", [False, True])
+def test_native_token_only_steps_respect_processor_opt_in(plane, requires_tokens):
+    def processor():
+        pass
+
+    processor.requires_token_updates = requires_tokens  # type: ignore[attr-defined]
+    plane._custom_process_func = processor
+    request = _new_request()
+    request.resumable = False
+    plane.register_request(request)
+    # Simulate a first chunk already sent: subsequent snapshots carry deltas.
+    plane._put_req_chunk["external"] = 1
+    plane.reserve_outputs(["internal"])
+    assert _complete(plane, [None], token=21) == int(requires_tokens)
+    if requires_tokens:
+        [(snapshot, payload)] = plane.record.batches[0]
+        assert payload is None
+        assert snapshot.output_token_ids == []
+        assert snapshot.output_token_count == 1
+        assert snapshot.sampled_token_ids == [21]
+    else:
+        assert not plane.record.batches
+
+
+def test_token_only_stop_fences_later_steps_before_terminal(plane):
+    plane._custom_process_func = SimpleNamespace(requires_token_updates=True)
+    request = _new_request()
+    request.resumable = False
+    plane.register_request(request)
+    plane.reserve_outputs(["internal"])
+    plane.complete_outputs(req_ids=["internal"], inter_stage_outputs=None, sampled_token_ids=[[21, 2150, 99]])
+    [(snapshot, _)] = plane.record.batches[0]
+    assert snapshot.sampled_token_ids == [21, 2150]
+    assert snapshot.output_token_ids == [21, 2150]
+    plane.reserve_outputs(["internal"])
+    assert _complete(plane, [None], token=99) == 0
+    assert len(plane.record.batches) == 1
+    assert plane.request_terminal({"internal"}) == 1
+    [(terminal, _)] = plane.record.batches[-1]
+    assert terminal.is_finished()
+    assert terminal.sampled_token_ids == []
+
+
 @pytest.mark.parametrize("async_chunk", [False, True])
 @pytest.mark.parametrize("stop", ["token", "length"])
 def test_non_resumable_output_stops_before_scheduler_terminal(plane, async_chunk, stop):

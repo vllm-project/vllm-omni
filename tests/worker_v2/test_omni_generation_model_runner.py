@@ -5,6 +5,7 @@
 CPU-sync vs CUDA-async dispatch, and async-chunk slot recycling."""
 
 from contextlib import nullcontext
+from dataclasses import dataclass, replace
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -12,10 +13,16 @@ import numpy as np
 import pytest
 import torch
 from vllm.distributed.aux_output_connector.connector import AuxRequestOutput
+from vllm.v1.core.sched.output import SchedulerOutput
 
+from vllm_omni.core.sched.output import OmniCachedRequestData, OmniNewRequestData
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.outputs import OmniModelRunnerOutput
-from vllm_omni.worker_v2.omni_generation_model_runner import OmniGenerationModelRunner, check_exact_input_shape
+from vllm_omni.worker_v2.omni_generation_model_runner import (
+    OmniGenerationModelRunner,
+    check_exact_input_shape,
+    scheduled_cpu_input_ids,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -399,3 +406,66 @@ def test_exact_input_shape_models_reject_padded_batches(exact):
             check_exact_input_shape(model, torch.zeros(48, dtype=torch.long), 32)
     else:
         check_exact_input_shape(model, torch.zeros(48, dtype=torch.long), 32)
+
+
+@dataclass
+class _Rows:
+    """The ``ScheduledRows`` fields of an MRv2 input batch."""
+
+    req_ids: list[str]
+    num_computed_tokens_np: np.ndarray
+    num_scheduled_tokens: np.ndarray
+
+
+def _scheduled(new_reqs: list[tuple[str, list[int]]], cached_ids: dict[str, list[int]]) -> SchedulerOutput:
+    new = [
+        OmniNewRequestData(
+            req_id=req_id,
+            prompt_token_ids=None,
+            mm_features=[],
+            sampling_params=None,
+            pooling_params=None,
+            block_ids=(),
+            num_computed_tokens=0,
+            lora_request=None,
+            prefill_token_ids=ids,
+        )
+        for req_id, ids in new_reqs
+    ]
+    cached = OmniCachedRequestData(
+        req_ids=list(cached_ids),
+        resumed_req_ids=set(),
+        new_token_ids=[],
+        all_token_ids={},
+        new_block_ids=[None] * len(cached_ids),
+        num_computed_tokens=[0] * len(cached_ids),
+        num_output_tokens=[0] * len(cached_ids),
+        prompt_token_ids=cached_ids,
+        additional_information={},
+    )
+    return replace(SchedulerOutput.make_empty(), scheduled_new_reqs=new, scheduled_cached_reqs=cached)
+
+
+def test_scheduled_cpu_input_ids_follow_batch_order_and_scheduled_spans():
+    """New chunks and re-filled cached chunks both contribute their scheduled
+    span, in batch order (not scheduler order)."""
+    scheduler_output = _scheduled([("a", [1, 2, 3])], {"b": [7, 8, 9, 10]})
+    input_batch = _Rows(
+        req_ids=["b", "a"],
+        num_computed_tokens_np=np.array([1, 0]),
+        num_scheduled_tokens=np.array([3, 3]),
+    )
+    assert scheduled_cpu_input_ids(scheduler_output, input_batch).tolist() == [8, 9, 10, 1, 2, 3]
+
+
+@pytest.mark.parametrize("missing", ["request", "span"])
+def test_scheduled_cpu_input_ids_give_up_when_a_row_is_not_covered(missing):
+    """Without every row's tokens the model must keep using the device ids."""
+    scheduler_output = _scheduled([("a", [1, 2])], {})
+    req_ids = ["a", "b"] if missing == "request" else ["a"]
+    input_batch = _Rows(
+        req_ids=req_ids,
+        num_computed_tokens_np=np.zeros(len(req_ids), dtype=np.int64),
+        num_scheduled_tokens=np.array([2, 1] if missing == "request" else [3]),
+    )
+    assert scheduled_cpu_input_ids(scheduler_output, input_batch) is None

@@ -16,6 +16,7 @@ from vllm_omni.model_executor.stage_input_processors.cosyvoice3 import (
 )
 from vllm_omni.outputs.mm_outputs import MultimodalPayload
 from vllm_omni.request import OmniRequest
+from vllm_omni.worker_v2.omni_data_plane import _NativeRequestState
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -375,7 +376,76 @@ def test_talker2code2wav_async_chunk_emits_terminal_eof_without_duplicate_audio(
     assert payload_stream.codes.audio.tolist() == [3, 4]
     assert payload_final is not None
     assert payload_final.meta.finished.item() is True
-    assert payload_final.codes.audio.tolist() == []
+    # Re-submit the prefix with every mel frame trimmed. HiFT must still run
+    # finalize to release its withheld samples at an exact chunk boundary.
+    assert payload_final.codes.audio.tolist() == [3, 4]
+    assert payload_final.meta.left_context_size == 2
+    assert payload_final.meta.stream_finished.item() is True
+
+
+def test_native_deltas_keep_codes_after_first_chunk_and_flush_once():
+    manager = _transfer_manager(pre_lookahead_frames=1)
+    state = _NativeRequestState("internal", "external", [100])
+    state.accept_tokens([1, 2, 3])
+    first = talker2code2wav_async_chunk(manager, None, state.snapshot(include_token_history=True))
+    assert first.codes.audio.tolist() == [1, 2, 3]
+    state.accept_tokens([4, 5])
+    delta = state.snapshot(include_token_history=False, sampled_token_ids=[4, 5])
+    middle = talker2code2wav_async_chunk(manager, None, delta)
+    assert middle.codes.audio.tolist() == [1, 2, 3, 4, 5]
+    assert middle.meta.left_context_size == 2
+    assert talker2code2wav_async_chunk(manager, None, delta) is None
+    state.accept_tokens([6562])
+    assert (
+        talker2code2wav_async_chunk(
+            manager, None, state.snapshot(include_token_history=False, sampled_token_ids=[6562])
+        )
+        is None
+    )
+    state.finished = True
+    final = talker2code2wav_async_chunk(manager, None, state.snapshot(include_token_history=False))
+    assert final.codes.audio.tolist() == [1, 2, 3, 4, 5]
+    assert final.meta.left_context_size == 4
+    assert final.meta.stream_finished.item() is True
+    assert talker2code2wav_async_chunk(manager, None, state.snapshot(include_token_history=False)) is None
+
+
+def test_native_first_delta_without_tensor_payload_seeds_conditioning():
+    manager = _transfer_manager()
+    conditioning = {
+        "embed": {
+            "speech_token": torch.tensor([[10, 11]]),
+            "speech_feat": torch.ones(1, 4, 2),
+            "embedding": torch.ones(1, 2),
+        }
+    }
+    state = _NativeRequestState("internal", "external", [100], model_intermediate_buffer=conditioning)
+    state.accept_tokens([1, 2])
+    payload = talker2code2wav_async_chunk(
+        manager, None, state.snapshot(include_token_history=False, sampled_token_ids=[1, 2])
+    )
+    assert payload.codes.audio.tolist() == [1, 2]
+    torch.testing.assert_close(payload.embed.embedding, conditioning["embed"]["embedding"])
+
+
+def test_native_cancel_does_not_flush_buffered_speech():
+    manager = _transfer_manager(chunk_frames=25)
+    state = _NativeRequestState("internal", "external", [100])
+    state.accept_tokens([1, 2])
+    assert talker2code2wav_async_chunk(manager, None, state.snapshot(include_token_history=True)) is None
+    state.finished = state.aborted = True
+    payload = talker2code2wav_async_chunk(manager, None, state.snapshot(include_token_history=False))
+    assert payload.meta.finished.item() is True
+    assert payload.codes is None
+
+
+def test_native_missing_delta_fails_instead_of_truncating_audio():
+    state = _NativeRequestState("internal", "external", [100])
+    state.accept_tokens([1, 2, 3])
+    with pytest.raises(ValueError, match="missing codec token delta"):
+        talker2code2wav_async_chunk(
+            _transfer_manager(), None, state.snapshot(include_token_history=False, sampled_token_ids=[3])
+        )
 
 
 def test_interleaved_token_only_requests_keep_conditioning_and_eof_separate():

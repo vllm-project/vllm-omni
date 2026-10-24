@@ -173,6 +173,29 @@ vllm serve FunAudioLLM/Fun-CosyVoice3-0.5B-2512 --omni --port 8091 --trust-remot
 
 Batching preserves output lengths and streaming cache alignment, but the different GEMM shapes can produce small waveform differences compared with processing each request separately. Use `--deploy-config cosyvoice3.yaml` and leave `COSYVOICE3_BATCH_FLOW` unset (or set it to `0`) when request-independent numerical behavior is required. Set `COSYVOICE3_BATCH_FLOW_DEBUG=1` to log the observed group-size distribution and enable detailed Stage-1 profiler scopes; diagnostics are disabled by default to avoid per-step profiling overhead.
 
+For an experimental CUDA deployment with both Talker and Code2Wav on Model
+Runner V2, select the explicit streaming profile:
+
+```bash
+vllm serve FunAudioLLM/Fun-CosyVoice3-0.5B-2512 --omni \
+  --deploy-config cosyvoice3_mrv2.yaml --port 8091 --trust-remote-code
+```
+
+This profile retains the generic RAS sampling policy and concurrency of 8,
+disables chunked prefill, and enables cross-request Flow batching. MRv2
+schedules complete ready codec chunks together; Flow groups compatible
+conditioning shapes and finalization states before decoding. Audio outputs
+remain PCM deltas, and request-owned reference and HiFT state survive between
+chunks and are released on finish or cancellation. Throughput and first-audio
+latency require measurement on the target GPU; this profile supplies no
+benchmark claim. Non-CUDA platform overrides retain V1.
+
+Streaming here means incremental **audio output from a complete text
+request** (`stream=true`). CosyVoice3 has no native duplex model plugin;
+resumable text input and `session_mode: duplex` are not supported on this
+MRv2 path. A duplex application can submit and cancel independent TTS
+requests, with a new request for the next utterance.
+
 ### CLI client
 
 The client defaults to the official upstream zero-shot prompt, so it runs without extra flags:

@@ -16,6 +16,7 @@ from vllm_omni.worker.gpu_generation_model_runner import (
     ExecuteModelState,
     GPUGenerationModelRunner,
 )
+from vllm_omni.worker.mixins import CPU_INPUT_IDS_KWARG
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -280,23 +281,16 @@ class TestSampleTokensBatched:
             GPUGenerationModelRunner.sample_tokens(runner)
 
 
-@pytest.mark.parametrize("exact_shape, expected_len", [(True, 3), (False, 4)])
-def test_exact_shape_models_receive_unpadded_input_ids(monkeypatch, exact_shape, expected_len):
-    """#6712: the cudagraph dispatcher rounds a 3-token batch up to a capture
-    size of 4, so ``_preprocess`` returns a 4-element ``input_ids`` while
-    ``seq_token_counts`` stays ``[3]``. Models opting into
-    ``requires_exact_input_shape`` must receive the trimmed view; everything
-    else must keep the padded buffer.
-    """
+def _model_inputs_of_a_3_token_step(monkeypatch, model):
+    """Run execute_model on a stubbed runner whose cudagraph dispatcher pads a
+    3-token batch to 4; return what reached the model."""
     monkeypatch.setattr(gen_runner_module, "has_ec_transfer", lambda: False)
     monkeypatch.setattr(gen_runner_module, "has_kv_transfer_group", lambda: False)
 
     runner = _make_guard_runner()
-    runner.model = SimpleNamespace(
-        has_preprocess=True,
-        requires_request_ids=False,
-        requires_exact_input_shape=exact_shape,
-    )
+    runner.model = model
+    # The host staging buffer: three real tokens, then padding and stale slots.
+    runner.input_ids = SimpleNamespace(cpu=torch.tensor([10, 11, 12, 0, 99, 99]))
     runner.num_prompt_logprobs = None
     runner.vllm_config = None
     runner.parallel_config = SimpleNamespace(
@@ -344,15 +338,46 @@ def test_exact_shape_models_receive_unpadded_input_ids(monkeypatch, exact_shape,
 
     def _capture(self, **kwargs):
         seen["input_ids"] = kwargs["input_ids"]
-        seen["counts"] = kwargs["model_kwargs"]["seq_token_counts"]
+        seen["model_kwargs"] = kwargs["model_kwargs"]
         raise _StopExecutionError
 
     monkeypatch.setattr(GPUGenerationModelRunner, "_run_generation_model", _capture)
 
     with pytest.raises(_StopExecutionError):
         GPUGenerationModelRunner.execute_model(runner, _StubSchedulerOutput(3))
+    return seen
+
+
+@pytest.mark.parametrize("exact_shape, expected_len", [(True, 3), (False, 4)])
+def test_exact_shape_models_receive_unpadded_input_ids(monkeypatch, exact_shape, expected_len):
+    """#6712: the cudagraph dispatcher rounds a 3-token batch up to a capture
+    size of 4, so ``_preprocess`` returns a 4-element ``input_ids`` while
+    ``seq_token_counts`` stays ``[3]``. Models opting into
+    ``requires_exact_input_shape`` must receive the trimmed view; everything
+    else must keep the padded buffer.
+    """
+    model = SimpleNamespace(has_preprocess=True, requires_request_ids=False, requires_exact_input_shape=exact_shape)
+    seen = _model_inputs_of_a_3_token_step(monkeypatch, model)
 
     assert seen["input_ids"].numel() == expected_len
-    assert seen["counts"] == [3]
+    assert seen["model_kwargs"]["seq_token_counts"] == [3]
     if exact_shape:
-        assert sum(seen["counts"]) == seen["input_ids"].numel()
+        assert sum(seen["model_kwargs"]["seq_token_counts"]) == seen["input_ids"].numel()
+
+
+@pytest.mark.parametrize("wants_host_copy", [False, True])
+def test_models_asking_for_host_input_ids_receive_the_unpadded_host_copy(monkeypatch, wants_host_copy):
+    """Models that filter tokens by value read the host copy, so the step does
+    not block on the device copy; it covers the real tokens, not the padding."""
+    model = SimpleNamespace(
+        has_preprocess=True,
+        requires_request_ids=False,
+        requires_exact_input_shape=False,
+        requires_cpu_input_ids=wants_host_copy,
+    )
+    seen = _model_inputs_of_a_3_token_step(monkeypatch, model)
+
+    if wants_host_copy:
+        assert seen["model_kwargs"][CPU_INPUT_IDS_KWARG].tolist() == [10, 11, 12]
+    else:
+        assert CPU_INPUT_IDS_KWARG not in seen["model_kwargs"]

@@ -38,6 +38,7 @@ COSYVOICE3_PIPELINE = PipelineConfig(
             input_sources=(),
             owns_tokenizer=True,
             engine_output_type="latent",
+            supports_native_mrv2_data_plane=True,
             async_chunk_process_next_stage_input_func=(f"{_PROC}.talker2code2wav_async_chunk"),
             custom_process_next_stage_input_func=f"{_PROC}.text2flow_full_payload",
             sampling_constraints={
@@ -54,6 +55,11 @@ COSYVOICE3_PIPELINE = PipelineConfig(
             final_output=True,
             final_output_type="audio",
             engine_output_type="latent",
+            supports_native_mrv2_data_plane=True,
+            # Streaming HiFT state, Flow prefix pages and reference conditioning
+            # are request-owned until completion, so a parked stream keeps its
+            # admission slot. Required for generation batch waiting.
+            retains_state_across_chunks=True,
             sync_process_input_func=f"{_PROC}.text2flow_token_only",
             requires_full_payload_input=True,
         ),
