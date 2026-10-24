@@ -245,9 +245,9 @@ class OffloadBackend(ABC):
         raise NotImplementedError
 
     def shutdown(self) -> None:
-        """Release offload resources at process exit.
+        """Release resources when the pipeline will no longer be used.
 
-        Backends may skip work that only matters for a later ``enable``.
+        Backends may discard weights instead of restoring a reusable model.
         """
         self.disable()
 
