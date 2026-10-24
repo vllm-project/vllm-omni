@@ -29,6 +29,40 @@ from vllm_omni.outputs import OmniRequestOutput
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
+@pytest.mark.parametrize("sample_rate", [32000, np.int32(32000), np.int64(32000)])
+def test_extract_audio_preserves_integer_sample_rate(sample_rate):
+    audio = np.zeros((1000, 2), dtype=np.float32)
+    result = OmniRequestOutput.from_diffusion(
+        request_id="audio-rate",
+        images=[],
+        multimodal_output={"audio": audio, "metadata": {"audio": {"sample_rate": sample_rate}}},
+    )
+    extracted, rate = OmniStreamingVideoOutputHandler._extract_audio_output(result)
+    assert extracted is audio
+    assert rate == 32000 and isinstance(rate, int)
+
+
+@pytest.mark.parametrize("sample_rate", [0, -32000, True, 32000.5, "32000"])
+def test_extract_audio_rejects_invalid_sample_rate(sample_rate):
+    result = OmniRequestOutput.from_diffusion(
+        request_id="audio-rate",
+        images=[],
+        multimodal_output={
+            "audio": np.zeros((1000, 2), dtype=np.float32),
+            "metadata": {"audio": {"sample_rate": sample_rate}},
+        },
+    )
+    with pytest.raises(ValueError, match="positive integer"):
+        OmniStreamingVideoOutputHandler._extract_audio_output(result)
+
+
+def test_extract_audio_keeps_missing_rate_unspecified():
+    result = OmniRequestOutput.from_diffusion(
+        request_id="audio-rate", images=[], multimodal_output={"audio": np.zeros((1000, 2), dtype=np.float32)}
+    )
+    assert OmniStreamingVideoOutputHandler._extract_audio_output(result)[1] is None
+
+
 def _fake_video_frames(num_frames: int = 2) -> list[np.ndarray]:
     return [np.full((4, 4, 3), fill_value=i, dtype=np.uint8) for i in range(num_frames)]
 
@@ -64,7 +98,9 @@ def _build_test_app(
     class FakeStreamingVideoEncoder:
         encode_calls: list[int] = []
 
-        def encode(self, video):
+        def encode(self, video, audio=None, *, audio_sample_rate=None):
+            assert audio is None
+            assert audio_sample_rate is None
             del video
             idx = len(self.encode_calls)
             self.encode_calls.append(idx)
@@ -538,7 +574,9 @@ def _build_handler_for_async_tests(
         def __init__(self) -> None:
             self.encode_calls = 0
 
-        def encode(self, video):
+        def encode(self, video, audio=None, *, audio_sample_rate=None):
+            assert audio is None
+            assert audio_sample_rate is None
             del video
             idx = self.encode_calls
             self.encode_calls += 1

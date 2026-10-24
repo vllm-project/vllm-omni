@@ -766,6 +766,7 @@ def prepare_encode_pipeline(monkeypatch):
     pipe._tm_output_rank = True
     pipe._tm_audio_kv_reset_requests = 12
     pipe._tm_pad_text_tokens = 0
+    pipe._tm_vae_cuda_graph = False
     pipe.transformer = SimpleNamespace(
         arch=SimpleNamespace(num_layers=1, attention_head_dim=4), streaming_local_heads=1
     )
@@ -1048,7 +1049,8 @@ def test_prepare_ahead_layout_matches_a_fresh_one_and_noise_is_reused(ahead_sess
     # Across the request boundary: the noise draws of request 1 are made ahead and consumed.
     session.begin_phase(3, transformer=transformer, device=device)
     session.prepare_ahead(completed_phase_index=3)
-    assert session.noise_ahead is not None and session.noise_ahead[0] == 1
+    assert session.noise_ahead is not None
+    assert session.noise_ahead.result()[0] == 1
     expected_audio, expected_video = session._request_noise(1)
     session.finish_request()
     request = session.begin_request(

@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable, Iterator, Sequence
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, ClassVar, Literal, cast
@@ -36,6 +37,7 @@ import numpy as np
 import torch
 from vllm.logger import init_logger
 
+from vllm_omni.diffusion.cancellation import check_request_cancellation
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.interaction.mixin import InteractionMixin
 from vllm_omni.diffusion.interaction.modality_handlers.taomate_h3_prompt import sync_prompt_length
@@ -93,8 +95,9 @@ from .lora import MergedStudentWeights, prepare_taomate_lora
 from .packed import taomate_phase_packed_layout
 from .schedule import euler_eta0_update_, student_sigmas
 from .stream_decode import StreamingAudioDecoder, StreamingVideoDecoder, samples_at_frame
+from .student_inputs import student_forward_kwargs
 from .text_encode import GraphSafeTextEncode, cudnn_sdp_enabled
-from .transformer import TaoMateH3DiTModel
+from .transformer import TaoMateH3DiTModel, local_embed_plan
 
 logger = init_logger(__name__)
 
@@ -243,7 +246,8 @@ class _Session:
         # decodes the current one: ``(key, packed layout)`` and the next
         # request's noise draws. See ``prepare_ahead``.
         self.layout_ahead: tuple[tuple[Any, ...], dict[str, Any]] | None = None
-        self.noise_ahead: tuple[int, torch.Tensor, torch.Tensor] | None = None
+        self.noise_ahead: Future[tuple[int, torch.Tensor, torch.Tensor]] | None = None
+        self._noise_executor: ThreadPoolExecutor | None = None
         # Timing bookkeeping (taomate_h3_log_timings): the last phase
         # preparation and the wall-clock end of the last logged phase.
         self.prepare_seconds = 0.0
@@ -272,8 +276,9 @@ class _Session:
         audio_seed = self.seed + index
         ahead = self.noise_ahead
         self.noise_ahead = None
-        if ahead is not None and ahead[0] == index:
-            official_audio, video_noise = ahead[1], ahead[2]
+        if ahead is not None:
+            ahead_index, official_audio, video_noise = ahead.result()
+            assert ahead_index == index
         else:
             official_audio, video_noise = self._request_noise(index)
         audio_rows = (
@@ -311,6 +316,15 @@ class _Session:
         video_noise, _ = official_request_noise(seed=video_seed, canvas=self.canvas)
         return official_audio, video_noise
 
+    def _start_noise_ahead_thread(self, request_index: int) -> None:
+        if self._noise_executor is None:
+            self._noise_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="taomate-noise-ahead")
+
+        def draw() -> tuple[int, torch.Tensor, torch.Tensor]:
+            return request_index, *self._request_noise(request_index)
+
+        self.noise_ahead = self._noise_executor.submit(draw)
+
     def _phase_layout(self, phase: StreamPhase, text_len: int, video_offset: int, audio_offset: int) -> dict[str, Any]:
         assert self.media_time_origin is not None
         return taomate_phase_packed_layout(
@@ -344,7 +358,7 @@ class _Session:
             video_offset = self.video_latent_offset + request.plan.video_latent_count
             audio_offset = self.audio_latent_offset + request.plan.audio_latent_count
             plan = request_plan(request_index)
-            self.noise_ahead = (request_index, *self._request_noise(request_index))
+            self._start_noise_ahead_thread(request_index)
         self.layout_ahead = (
             (request_index, phase_index, request.text_len, self.media_time_origin),
             self._phase_layout(plan.phases[phase_index], request.text_len, video_offset, audio_offset),
@@ -458,6 +472,10 @@ class _Session:
         return (current - mean).div(std).mul(anchor_std).add(anchor_mean).to(dtype=rows.dtype)
 
     def close(self) -> None:
+        if self._noise_executor is not None:
+            self._noise_executor.shutdown(wait=True, cancel_futures=True)
+            self._noise_executor = None
+        self.noise_ahead = None
         # Physical KV lifetime belongs to the AR runner; only retire model state.
         self.history.clear()
         self.video_decoder.reset()
@@ -535,6 +553,26 @@ def validate_vae_tile_value(value: Any, name: str, *, minimum: int) -> int | Non
     return int(value)
 
 
+class _KeywordTileDecode:
+    """Keyword-only graph target around the checkpoint VAE's per-tile ``decode``."""
+
+    def __init__(self, decode: Any) -> None:
+        self._decode = decode
+
+    def __call__(self, *, z: torch.Tensor) -> torch.Tensor:
+        return self._decode(z)
+
+
+class _TiledDecodeShim:
+    """Positional shim so the checkpoint's ``forward_fn(tile)`` call sites hit the graph."""
+
+    def __init__(self, graph: GraphedForward) -> None:
+        self._graph = graph
+
+    def __call__(self, z: torch.Tensor) -> torch.Tensor:
+        return self._graph(z=z)
+
+
 class TaoMateH3Pipeline(MiniMaxH3Pipeline, SupportsStepExecution, InteractionMixin):
     """Streaming TaoMate-H3 on the AR-Diffusion runtime."""
 
@@ -555,9 +593,9 @@ class TaoMateH3Pipeline(MiniMaxH3Pipeline, SupportsStepExecution, InteractionMix
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = "") -> None:
         _validate_parallel_config(od_config)
         if bool(getattr(od_config, "step_execution", False)) is False:
-            logger.warning(
-                "TaoMate-H3 is a streaming model; serve it with step_execution=true and streaming_output=true "
-                "on the AR-Diffusion engine (see vllm_omni/deploy/taomate_h3_usp4_realtime.yaml)."
+            logger.info(
+                "TaoMate-H3 full-request mode returns joined audio/video. For incremental output, use "
+                "step_execution=true and streaming_output=true (see vllm_omni/deploy/taomate_h3_usp4_realtime.yaml)."
             )
         super().__init__(od_config=od_config, prefix=prefix)
         model_config = dict(getattr(od_config, "model_config", None) or {})
@@ -593,6 +631,12 @@ class TaoMateH3Pipeline(MiniMaxH3Pipeline, SupportsStepExecution, InteractionMix
         # before the clean-commit forward, so the launch-bound commit and the
         # device-bound decode overlap (the decode only needs the clean latents).
         self._tm_decode_overlap = bool(model_config.get("taomate_h3_decode_overlap", False))
+        # Capture the checkpoint video-VAE tile decode (self.decode) into CUDA
+        # graphs: every rank reaches it in lockstep with a fixed tile-batch
+        # shape, so the launch-bound conv stack replays while the tile gather
+        # collectives stay outside the graph.
+        self._tm_vae_cuda_graph = bool(model_config.get("taomate_h3_vae_cuda_graph", False))
+        self._tm_vae_decode_graph: GraphedForward | None = None
         # Profile one chunk (phase) with torch.profiler: the three student
         # forwards, the commit forward and the decode of chunk index
         # taomate_h3_profile_chunk; writes a kernel table and a Chrome trace
@@ -602,6 +646,7 @@ class TaoMateH3Pipeline(MiniMaxH3Pipeline, SupportsStepExecution, InteractionMix
         self._tm_profile_dir = str(model_config.get("taomate_h3_profile_dir", "/tmp/taomate_h3_profile"))
         self._tm_profiler: Any = None
         self._tm_decode_stream: Any = None
+        self._tm_audio_decode_stream: Any = None
         # Merge the LoRA delta into a second weight set for the student (per
         # target a shadow linear quantized like the base by the loader); the
         # base weights stay for the audio teacher. Removes the hook GEMMs.
@@ -787,6 +832,30 @@ class TaoMateH3Pipeline(MiniMaxH3Pipeline, SupportsStepExecution, InteractionMix
                 logger.info("TaoMate-H3: AdaLN projection cache off (taomate_h3_adaln_cache: false)")
         self._tm_teacher = TaoMateAudioTeacher(self.transformer, manager=None, device=self.device, graph=graph)
         return loaded
+
+    def _tm_vae_graph(self) -> GraphedForward | None:
+        """Lazily build the shared video-VAE tile decode graph and patch it onto the checkpoint model.
+
+        The tiled decoder batches each rank's tiles into one ``self.decode`` call
+        between the tile gather collectives, so graphing that call removes the
+        launch-bound conv stack while every collective stays outside the graph.
+        The original bound method stays reachable through the shim's eager
+        fallback inside GraphedForward.
+        """
+        if not self._tm_vae_cuda_graph or self.device.type != "cuda":
+            return None
+        if self._tm_vae_decode_graph is None:
+            _, _, group = _ulysses_state()
+            graph = GraphedForward(
+                _KeywordTileDecode(self.video_vae.model.decode),
+                device=self.device,
+                max_entries=self._tm_cuda_graph_max_entries,
+                group=group,
+                name="TaoMate-H3 video VAE",
+            )
+            self.video_vae.model.decode = _TiledDecodeShim(graph)
+            self._tm_vae_decode_graph = graph
+        return self._tm_vae_decode_graph
 
     def _build_text_encoder_graph(self) -> GraphedForward | None:
         if not self._tm_text_encoder_cuda_graph:
@@ -1025,6 +1094,7 @@ class TaoMateH3Pipeline(MiniMaxH3Pipeline, SupportsStepExecution, InteractionMix
         last: DiffusionOutput | None = None
         while not state.request_denoise_completed:
             for _ in range(STUDENT_STEPS):
+                check_request_cancellation()
                 velocity = self.denoise_step(cast(InputBatch, None), states=[state])
                 assert velocity is not None
                 self.step_scheduler(state, velocity)
@@ -1117,6 +1187,7 @@ class TaoMateH3Pipeline(MiniMaxH3Pipeline, SupportsStepExecution, InteractionMix
         hidden, tags = self.encode_prompt(prompt=prompt_text)
         state.prompt_embeds = hidden
         session_id = self._bound_session_id(state)
+        self._tm_vae_graph()
         if session_id in self._tm_sessions:
             self._release_session(session_id)
             # Request mode may reuse the runner's default session ID for a
@@ -1249,6 +1320,12 @@ class TaoMateH3Pipeline(MiniMaxH3Pipeline, SupportsStepExecution, InteractionMix
         if self._tm_decode_stream is None:
             self._tm_decode_stream = torch.cuda.Stream(device=self.device)
         return self._tm_decode_stream
+
+    def _audio_decode_stream(self) -> Any:
+        # Called on the output rank only, on the CUDA decode-overlap path.
+        if self._tm_audio_decode_stream is None:
+            self._tm_audio_decode_stream = torch.cuda.Stream(device=self.device)
+        return self._tm_audio_decode_stream
 
     def _warm_teacher_shapes(self, session: _Session, request: _RequestState) -> None:
         graph = self._tm_teacher_graph
@@ -1429,18 +1506,29 @@ class TaoMateH3Pipeline(MiniMaxH3Pipeline, SupportsStepExecution, InteractionMix
         t_audio = 1.0 - session.sigmas_audio[step]
         if "rope_table" not in phase_state.branch.static_kwargs:
             phase_state.branch.prepare_rope_table(self.transformer)
-        forward_kwargs = phase_state.branch.forward_kwargs(
+        forward_kwargs = student_forward_kwargs(
+            phase_state.branch,
             video_rows=state.latents,
             audio_rows=state.extra["audio_rows"],
             t_video=t_video,
             t_audio=t_audio,
-            imgvid_cond_timestep=t_video,
-            audio_ref_cond_timestep=1.0,
         )
         if self._tm_lora_manager is not None:
             self._tm_lora_manager.set_request_adapter(None)
+        if not hasattr(phase_state.branch, "taomate_embed_plan"):
+            phase_state.branch.taomate_embed_plan = self.transformer.plan_local_embed(
+                img_pos=phase_state.branch.img_pos,
+                audio_pos=phase_state.branch.audio_pos,
+                text_pos=phase_state.branch.text_pos_dev,
+                seq_len=phase_state.branch.seq_len,
+                device=self.device,
+            )
         started = time.perf_counter()
-        with stream_context(session.stream_context(StreamMode.NOISY)), torch.inference_mode():
+        with (
+            local_embed_plan(phase_state.branch.taomate_embed_plan),
+            stream_context(session.stream_context(StreamMode.NOISY)),
+            torch.inference_mode(),
+        ):
             velocity_video, _ = self.transformer(**forward_kwargs)
         if self._tm_log_timings:
             # Host time spent issuing the forward (before waiting for the device):
@@ -1495,6 +1583,9 @@ class TaoMateH3Pipeline(MiniMaxH3Pipeline, SupportsStepExecution, InteractionMix
         decode_started = time.perf_counter()
         frames_device: Any = None
         frame_start = 0
+        audio_stream: Any = None
+        audio_device: torch.Tensor | None = None
+        audio_started = 0.0
         if decode_stream is not None:
             # Queue the decode first, on its own stream: it waits for the clean
             # latents and then runs alongside the launch-bound commit forward.
@@ -1502,6 +1593,27 @@ class TaoMateH3Pipeline(MiniMaxH3Pipeline, SupportsStepExecution, InteractionMix
             with torch.cuda.stream(decode_stream):
                 latent.record_stream(decode_stream)
                 frame_start, frames_device = session.video_decoder.push_device(latent)
+                if state.chunk_index + 1 >= state.total_chunks:
+                    flush_start, flushed = session.video_decoder.flush_device()
+                    if flushed is not None:
+                        if frames_device is None:
+                            frames_device = flushed
+                            frame_start = flush_start
+                        elif isinstance(frames_device, torch.Tensor):
+                            frames_device = torch.cat((frames_device, flushed), dim=0)
+                        else:
+                            frames_device = np.concatenate((frames_device, flushed), axis=0)
+            if self._tm_output_rank:
+                # The shape is already known on the host; derive the exact audio sample range before fetching the video.
+                frame_count = 0 if frames_device is None else int(frames_device.shape[0])
+                audio_stream = self._audio_decode_stream()
+                audio_stream.wait_stream(torch.cuda.current_stream(self.device))
+                audio_started = time.perf_counter()
+                with torch.cuda.stream(audio_stream):
+                    session.audio_decoder.latents.record_stream(audio_stream)
+                    audio_device = session.audio_decoder.decode_range_device(
+                        samples_at_frame(frame_start), samples_at_frame(frame_start + frame_count)
+                    )
         # Sigma-zero forward: recompute this chunk's K/V from its clean latents
         # and append them to the persistent history.
         cache = session.cache
@@ -1510,15 +1622,19 @@ class TaoMateH3Pipeline(MiniMaxH3Pipeline, SupportsStepExecution, InteractionMix
         commit_started = time.perf_counter()
         session.history.begin_commit(audio_tokens=int(audio_rows.shape[0]), video_tokens=int(clean_video.shape[0]))
         try:
-            forward_kwargs = phase_state.branch.forward_kwargs(
+            forward_kwargs = student_forward_kwargs(
+                phase_state.branch,
                 video_rows=clean_video,
                 audio_rows=audio_rows,
                 t_video=1.0,
                 t_audio=1.0,
-                imgvid_cond_timestep=1.0,
-                audio_ref_cond_timestep=1.0,
             )
-            with stream_context(session.stream_context(StreamMode.CLEAN_COMMIT)), torch.inference_mode():
+            commit_ctx = session.stream_context(StreamMode.CLEAN_COMMIT)
+            with (
+                local_embed_plan(phase_state.branch.taomate_embed_plan),
+                stream_context(commit_ctx),
+                torch.inference_mode(),
+            ):
                 self.transformer(**forward_kwargs)
             if self._tm_log_timings:
                 phase_state.timings["commit_launch"] = time.perf_counter() - commit_started
@@ -1551,18 +1667,24 @@ class TaoMateH3Pipeline(MiniMaxH3Pipeline, SupportsStepExecution, InteractionMix
         state.chunk_index += 1
         last_phase = (completed_chunk_index % NUM_PHASES) == NUM_PHASES - 1
         session_done = state.request_denoise_completed
-        if session_done:
+        if session_done and decode_stream is None:
             flush_start, flushed = session.video_decoder.flush()
             if flushed is not None:
                 frames = flushed if frames is None else np.concatenate((frames, flushed), axis=0)
                 if frames is flushed:
                     frame_start = flush_start
         num_frames = 0 if frames is None else int(frames.shape[0])
-        audio_started = time.perf_counter()
+        if audio_stream is None:
+            audio_started = time.perf_counter()
         if self._tm_output_rank:
-            audio = session.audio_decoder.decode_range(
-                samples_at_frame(frame_start), samples_at_frame(frame_start + num_frames)
-            )
+            if audio_stream is None:
+                audio = session.audio_decoder.decode_range(
+                    samples_at_frame(frame_start), samples_at_frame(frame_start + num_frames)
+                )
+            else:
+                with torch.cuda.stream(audio_stream):
+                    audio = audio_device.cpu().numpy()
+                torch.cuda.current_stream(self.device).wait_stream(audio_stream)
         else:
             # The executor returns rank 0's output; peers keep the decoder
             # timeline but skip the waveform decode.
