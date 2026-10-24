@@ -3,6 +3,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """
+DEPRECATED: Use `vllm bench serve --omni --diffusion-task t2i` instead.
+
+This standalone script is maintained as a fallback for advanced diffusion-only workflows
+not yet covered by the unified CLI. For new benchmarks, prefer `vllm bench serve --omni`.
+
 Benchmark online serving for diffusion models (Image/Video Generation).
 If you want to use i2v, i2i dataset, you should `uv pip install gdown` first
 
