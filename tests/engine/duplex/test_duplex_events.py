@@ -153,6 +153,8 @@ def test_error_event_maps_codes_to_openai_error_types_and_echoes_client_event_id
     assert REALTIME_ERROR_TYPES_BY_CODE["resource_exhausted"] == "rate_limit_error"
     assert REALTIME_ERROR_TYPES_BY_CODE["internal_error"] == "server_error"
     assert REALTIME_ERROR_TYPES_BY_CODE["bad_event"] == "invalid_request_error"
+    # A control timeout is the server failing to answer, not a bad request.
+    assert REALTIME_ERROR_TYPES_BY_CODE["timeout"] == "server_error"
 
     error = ErrorEvent(
         code="resource_exhausted",
@@ -177,6 +179,15 @@ def test_error_event_maps_codes_to_openai_error_types_and_echoes_client_event_id
     assert wire["error"] == error.error
     # The server event id and the echoed client event id are distinct.
     assert wire["event_id"] != "evt_client"
+
+    # The bucket must survive the envelope serialization, not only the lookup:
+    # a control timeout is the server failing to answer, not a bad request.
+    timeout_wire = ErrorEvent(code="timeout", message="handshake timed out").to_realtime()
+    assert timeout_wire["error"]["type"] == "server_error"
+    assert timeout_wire["error"]["code"] == "timeout"
+    # ``config_timeout`` is the caller's own budget and stays a client error.
+    assert REALTIME_ERROR_TYPES_BY_CODE["config_timeout"] == "invalid_request_error"
+
     assert ErrorEvent(code="never-seen-code").error_type == "invalid_request_error"
 
 
