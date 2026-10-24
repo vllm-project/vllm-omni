@@ -171,6 +171,26 @@ def qk_norm_rope_kernel(
     tl.store(out_base + offs * tl.where(is_q, query_stride_d, key_stride_d), out)
 
 
+def _batch_stride(table: torch.Tensor, batch_size: int) -> int:
+    """Broadcast singleton RoPE tables; otherwise require one row per query batch."""
+    if table.shape[0] == 1:
+        return 0
+    if table.shape[0] != batch_size:
+        raise ValueError(f"RoPE table has {table.shape[0]} batches but the query batch is {batch_size}")
+    return table.stride(0)
+
+
+def _cos_sin_batch_stride(cos: torch.Tensor, sin: torch.Tensor, batch_size: int) -> int:
+    """The kernel indexes both tables with the cos strides."""
+    if sin.shape != cos.shape:
+        raise ValueError(
+            f"cos and sin RoPE tables must have the same shape, got {tuple(cos.shape)} and {tuple(sin.shape)}"
+        )
+    if sin.stride() != cos.stride():
+        raise ValueError(f"cos and sin RoPE tables must have the same strides, got {cos.stride()} and {sin.stride()}")
+    return _batch_stride(cos, batch_size)
+
+
 def triton_qk_norm_rope(
     q,
     k,
@@ -188,6 +208,10 @@ def triton_qk_norm_rope(
 ):
     batch_size, seq_len, head_q, head_dim = q.shape
     head_k = k.shape[2]
+
+    cos_t_batch = _cos_sin_batch_stride(cos_t, sin_t, batch_size)
+    cos_h_batch = _cos_sin_batch_stride(cos_h, sin_h, batch_size)
+    cos_w_batch = _cos_sin_batch_stride(cos_w, sin_w, batch_size)
 
     query = torch.empty((batch_size, head_q, seq_len, head_dim), device=q.device, dtype=q.dtype)
     key = torch.empty((batch_size, head_k, seq_len, head_dim), device=k.device, dtype=k.dtype)
@@ -228,13 +252,13 @@ def triton_qk_norm_rope(
         key.stride(1),
         key.stride(2),
         key.stride(3),
-        cos_t.stride(0),
+        cos_t_batch,
         cos_t.stride(1),
         cos_t.stride(2),
-        cos_h.stride(0),
+        cos_h_batch,
         cos_h.stride(1),
         cos_h.stride(2),
-        cos_w.stride(0),
+        cos_w_batch,
         cos_w.stride(1),
         cos_w.stride(2),
         head_q=head_q,
