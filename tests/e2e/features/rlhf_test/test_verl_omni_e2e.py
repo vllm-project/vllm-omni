@@ -157,11 +157,19 @@ def init_server():
         cuda_visible_devices="0",
     )
 
-    ray.get(server.launch_server.remote())
-
-    yield server
-
-    ray.shutdown()
+    try:
+        ray.get(server.launch_server.remote())
+        yield server
+    finally:
+        # Stop the engine's multiprocessing workers before terminating Ray.
+        # Ray shutdown alone can leave the diffusion subprocesses orphaned.
+        try:
+            ray.get(server.shutdown.remote(), timeout=60)
+        finally:
+            try:
+                ray.kill(server, no_restart=True)
+            finally:
+                ray.shutdown()
 
 
 @pytest.mark.core_model

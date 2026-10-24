@@ -491,6 +491,82 @@ steps:
 
 - group: ":card_index_dividers: E2E Test"
   steps:
+    - label: "ROCm · VeRL-Omni E2E Coverage"
+      agent_pool: mi300_1
+      depends_on: amd-build
+      mirror_hardwares: [amdproduction]
+      grade: NonBlocking
+      timeout_in_minutes: 30
+      artifact_paths:
+        - "artifacts/rocm-verl-omni-e2e/**/*"
+      commands:
+        # Exercise the Ray/server contract without paying for a cold AITER
+        # attention build inside the test's existing inference deadline.
+        - export DIFFUSION_ATTENTION_BACKEND=TORCH_SDPA
+        - export ROCM_VERL_ARTIFACT_DIR="$$BUILDKITE_BUILD_CHECKOUT_PATH/artifacts/rocm-verl-omni-e2e"
+        - mkdir -p "$$ROCM_VERL_ARTIFACT_DIR"
+        # Ray appends a session/socket suffix; the native TMPDIR prefix is too
+        # long for Linux's 107-byte Unix socket path limit.
+        - export RAY_TMPDIR=$$(mktemp -d /tmp/vo-ray.XXXXXXXX)
+        - trap 'rm -rf -- "$$RAY_TMPDIR"' EXIT
+        - python3 -m pip install --no-deps "ray==2.56.1" "omegaconf==2.3.0"
+        - python3 -m pip show vllm ray omegaconf > "$$ROCM_VERL_ARTIFACT_DIR/dependencies.txt"
+        - |
+          {
+            printf 'source_commit=%s\n' "$${BUILDKITE_COMMIT:-unknown}"
+            printf 'ray_tmpdir=%s\n' "$$RAY_TMPDIR"
+            printf 'diffusion_attention_backend=%s\n' "$$DIFFUSION_ATTENTION_BACKEND"
+          } > "$$ROCM_VERL_ARTIFACT_DIR/environment.txt"
+        - >-
+          ps -eo pid=,ppid=,lstart=,stat=,comm= >
+          "$$ROCM_VERL_ARTIFACT_DIR/processes-before.txt"
+        - >-
+          pytest -s -v -ra
+          tests/e2e/features/rlhf_test/test_verl_omni_e2e.py
+          --durations=0
+          --junitxml="$$ROCM_VERL_ARTIFACT_DIR/pytest.xml"
+          2>&1 | tee "$$ROCM_VERL_ARTIFACT_DIR/pytest.log"
+        - >-
+          tail -n 100 "$$ROCM_VERL_ARTIFACT_DIR/pytest.log" >
+          "$$ROCM_VERL_ARTIFACT_DIR/pytest-summary.txt"
+        - |
+          rm -rf -- "$$RAY_TMPDIR"
+          if [[ -e "$$RAY_TMPDIR" ]]; then
+            printf 'status=FAIL ray_tmpdir_removed=0\n' > "$$ROCM_VERL_ARTIFACT_DIR/ray-cleanup.txt"
+            false
+          else
+            printf 'status=PASS ray_tmpdir_removed=1\n' > "$$ROCM_VERL_ARTIFACT_DIR/ray-cleanup.txt"
+          fi
+        - |
+          sleep 5
+          ps -eo pid=,ppid=,lstart=,stat=,comm= > "$$ROCM_VERL_ARTIFACT_DIR/processes-after.txt"
+          # Compare PID plus process start time so PID reuse cannot hide a leak.
+          # Double dollars preserve awk field references through Buildkite interpolation.
+          awk '
+            NR == FNR {
+              if ($$9 != "ps") {
+                baseline[$$1 "|" $$3 "|" $$4 "|" $$5 "|" $$6 "|" $$7] = 1
+              }
+              next
+            }
+            $$9 != "ps" {
+              identity = $$1 "|" $$3 "|" $$4 "|" $$5 "|" $$6 "|" $$7
+              if (!(identity in baseline)) {
+                print
+                leaked = 1
+              }
+            }
+            END {
+              if (leaked) {
+                print "status=FAIL leaked_processes_detected=1"
+                exit 1
+              }
+              print "status=PASS leaked_processes=0"
+            }
+          ' "$$ROCM_VERL_ARTIFACT_DIR/processes-before.txt" \
+            "$$ROCM_VERL_ARTIFACT_DIR/processes-after.txt" \
+            2>&1 | tee "$$ROCM_VERL_ARTIFACT_DIR/process-cleanup.txt"
+
     - label: "Qwen3-TTS E2E Test"
       agent_pool: mi300_1
       depends_on: amd-build
