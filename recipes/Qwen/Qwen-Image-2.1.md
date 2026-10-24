@@ -32,6 +32,8 @@ text-to-image.
   [`docs/models/supported_models.md`](../../docs/models/supported_models.md)
 - Feature compatibility matrix:
   [`docs/user_guide/diffusion_features.md`](../../docs/user_guide/diffusion_features.md)
+- Experimental Ascend A5 FFN option:
+  [Eagle FFN configuration and limits](../../docs/user_guide/diffusion/qwen_image_21_eagle_ffn.md)
 - Sibling recipes: [`Qwen-Image.md`](./Qwen-Image.md),
   [`Qwen-Image-Edit.md`](./Qwen-Image-Edit.md)
 

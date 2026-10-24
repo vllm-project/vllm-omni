@@ -68,6 +68,23 @@ upstream WTE can track layer completion and preserve live storage. See the
 [weight-transfer contract](../../feature/weight_transfer.md#diffusion-loading-contract)
 for support limits and validation requirements.
 
+## Optional complete FFN backends
+
+Qwen-Image-2.1's optional Eagle FFN uses the shared `FusedSwiGLU` layer and
+the public MindIE-SD API. The model owns eligibility and checkpoint loading;
+the shared layer owns hardware capability and optional operator resolution.
+The default stays native. The opt-in path requires BF16 eager execution,
+TP1/SP1, resident unquantized weights, and no LoRA/HSDP. It bypasses the
+three projection modules, so unsupported configurations retain native execution.
+
+Packing after loading preserves original checkpoint keys and aliases the
+gate/up parameters to a single nonpersistent buffer. The packed projections
+retain ND storage; other eligible linears can still use automatic NZ conversion.
+Moving or replacing storage invalidates fusion until weights are prepared
+again. Selected operator errors propagate. See the
+[Eagle FFN guide](../../../user_guide/diffusion/qwen_image_21_eagle_ffn.md)
+for configuration, rollback, and validation limits.
+
 ## Exact conditioning projection reuse
 
 Models with repeated conditioning projections can use `ExactProjectionCache`
