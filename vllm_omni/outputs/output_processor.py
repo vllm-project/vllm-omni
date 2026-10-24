@@ -137,6 +137,11 @@ class OmniRequestState(RequestState):
         super().__init__(*args, **kwargs)
         self.is_pooling_request = False
         self.native_text_stats = RequestStateStats(arrival_time=float(arrival_time or 0.0))
+        # Prefill flag of native_text_stats. vLLM clears ``is_prefilling`` on
+        # every processed output, also on one processed without IterationStats
+        # (the upstream first-audio frame fed into a codec stage), which would
+        # record the stage's first engine-core output as a decode step.
+        self.native_is_prefilling = True
         # Omni-specific: multimodal output accumulation
         # TODO: mm_type is per-request, not per-key. If a model ever produces
         # both audio and latent outputs, the modality type would flip on each
@@ -148,6 +153,7 @@ class OmniRequestState(RequestState):
     def apply_streaming_update(self, update) -> None:
         super().apply_streaming_update(update)
         self.native_text_stats = RequestStateStats(arrival_time=float(update.arrival_time or 0.0))
+        self.native_is_prefilling = True
 
     def add_multimodal_tensor(self, payload: Any | None, mm_type: str | None) -> None:
         """Accumulate a multimodal tensor payload into the request state.
@@ -851,7 +857,6 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
         engine_core_timestamp: float | None,
         iteration_stats: IterationStats | None,
     ):
-        was_prefilling = req_state.is_prefilling
         native_stats = req_state.native_text_stats if isinstance(req_state, OmniRequestState) else None
         previous_last_token_ts = native_stats.last_token_ts if native_stats is not None else 0.0
         previous_num_generation_tokens = int(native_stats.num_generation_tokens) if native_stats is not None else 0
@@ -878,6 +883,10 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
         if iteration_stats is None or engine_core_timestamp is None or native_stats is None:
             return
 
+        assert isinstance(req_state, OmniRequestState)
+        # Not ``req_state.is_prefilling``: see ``OmniRequestState.native_is_prefilling``.
+        was_prefilling = req_state.native_is_prefilling
+        req_state.native_is_prefilling = False
         is_coalesced = getattr(engine_core_output, "is_coalesced", False) is True
         num_itls_before = len(iteration_stats.inter_token_latencies_iter) if is_coalesced else 0
         iteration_stats.update_from_output(

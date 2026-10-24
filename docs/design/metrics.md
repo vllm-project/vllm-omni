@@ -285,13 +285,15 @@ With `--log-stats`, a stage served by a vLLM engine core (AR and generation stag
 | Field | Interval |
 | ----- | -------- |
 | `vllm_queued_ms` | `QUEUED` event to first `SCHEDULED` event |
-| `vllm_prefill_ms` | First `SCHEDULED` event to first engine-core output (the first token for an AR stage) |
+| `vllm_prefill_ms` | First `SCHEDULED` event to first engine-core output |
 | `vllm_decode_ms` | First engine-core output to last engine-core output |
 | `vllm_num_preemptions` | Number of `PREEMPTED` events |
 
 The intervals match upstream `FinishedRequestStats`, so time spent preempted stays inside prefill or decode. The wrapped `vllm:request_queue_time_seconds`, `vllm:request_prefill_time_seconds`, `vllm:request_decode_time_seconds`, and `vllm:request_num_preemptions` histograms, which already carry `{stage, replica}` labels, use the same intervals. Two differences: upstream subtracts an unobserved timestamp as `0.0`, and it reports a negative interval as is, while these fields leave either interval out. No Prometheus family is added.
 
-The first engine-core output ends prefill even when it carries no token. A generation stage that emits one output when it stops therefore reports its whole run as `vllm_prefill_ms`, with a measured `vllm_decode_ms` of `0`.
+For an AR stage that emits an output every step, the first engine-core output carries its first token. The first engine-core output ends prefill even when it carries no token. A generation stage that emits one output when it stops therefore reports its whole run as `vllm_prefill_ms`, with a measured `vllm_decode_ms` of `0`. The same holds for an AR stage that does not emit per-step outputs: with Model Runner V2 and `async_chunk`, a non-final AR stage (for example the Qwen3-TTS talker) emits one output when it stops, so its `vllm_prefill_ms` also covers its decode steps, and its `vllm_ttft_ms` is the time to that output.
+
+With talker first audio (`talker_first_audio`), the orchestrator feeds the upstream stage's first audio frame into the codec stage's output processor. That frame is not an engine-core output of the codec stage and does not end its prefill: the codec stage's split, its `vllm_ttft_ms`, and the samples it adds to the wrapped vLLM histograms start at the codec's own first engine-core output. Codec outputs that arrive before the frame are held until it has been processed, then processed in arrival order, each with the engine-core timestamp of the batch it arrived in, so the split and the inter-token latencies leave out the wait for the frame. `vllm_ttft_ms` and its histogram sample include that wait: as in vLLM, TTFT runs from the request's arrival to the time the output processor handles the first output, which for a held output is after the frame.
 
 `vllm_queued_ms` runs from the stage's engine core accepting the request to its first scheduling. For stage 0 this is scheduler wait. A downstream stage can also wait there for its input:
 
