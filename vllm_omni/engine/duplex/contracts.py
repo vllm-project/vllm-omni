@@ -102,9 +102,22 @@ class DuplexOutputContext:
     segment_finished: bool
     segment_token_ids: tuple[int, ...] = ()
     segment_output_metadata: Mapping[str, object] = field(default_factory=dict)
+    # Session stats (RFC #8325): (stage_id, epoch, seq, start_ns, duration_ns) step
+    # spans that arrived with this output, and the chunk this stage last produced
+    # for (an output whose spans already left with an earlier one carries none).
+    stage_work: tuple[tuple[int, int, int, int, int], ...] = ()
+    output_chunk: tuple[int, int] | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "segment_token_ids", tuple(self.segment_token_ids))
+        object.__setattr__(self, "stage_work", tuple(self.stage_work))
+
+    def perf_chunks(self) -> set[tuple[int, int]]:
+        """Chunks this output finishes handling for: every span's chunk and the producing one."""
+        chunks = {(row[1], row[2]) for row in self.stage_work}
+        if self.output_chunk is not None:
+            chunks.add(self.output_chunk)
+        return chunks
         object.__setattr__(
             self,
             "segment_output_metadata",

@@ -197,6 +197,8 @@ class Harness:
         segment_token_ids: Sequence[int] = (),
         epoch: int | None = None,
         metrics: Any = None,
+        stage_work: Sequence[tuple[int, int, int, int, int]] = (),
+        output_chunk: tuple[int, int] | None = None,
     ) -> bool:
         session = self.session
         fence = session.fence if epoch is None else session.fence.__class__(SESSION_ID, epoch=epoch)
@@ -206,6 +208,8 @@ class Harness:
             segment_finished=segment_finished,
             segment_token_ids=tuple(segment_token_ids),
             segment_output_metadata=dict(segment_output_metadata or {}),
+            stage_work=tuple(stage_work),
+            output_chunk=output_chunk,
         )
         request_id = getattr(output, "request_id", None)
         if not isinstance(request_id, str):
@@ -280,6 +284,114 @@ async def open_harness(
 
 async def close_harness(harness: Harness) -> None:
     await harness.manager.shutdown()
+
+
+# --------------------------------------------------------------------------- #
+# Session stats (RFC #8325)                                                   #
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_session_stats_get_is_refused_when_the_deployment_does_not_collect() -> None:
+    h = await open_harness()
+    try:
+        assert h.session.perf is None
+        assert h.session.capabilities.supports_session_stats is False
+        events = await h.run(commands.GetSessionStats(event_id="evt_stats"))
+        assert types(events) == ["error"]
+        assert events[0].code == "session_stats_disabled"
+        assert events[0].related_event_id == "evt_stats"
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_session_stats_report_each_chunks_stage_work_and_audio_by_turn() -> None:
+    from vllm_omni.benchmarks.duplex_session_metrics import session_stats_turn_metrics
+
+    h = await open_harness(runtime_config=DuplexSessionRuntimeConfig(collect_stats=True))
+    try:
+        ledger = h.session.perf
+        assert ledger is not None
+        assert h.session.capabilities.supports_session_stats is True
+        await h.run(append_audio())
+        # The append carries its chunk id so every stage can time its steps.
+        assert h.port.submissions[0].prompt["model_intermediate_buffer"]["duplex"]["perf_chunk"] == [0, 1]
+
+        before = await h.run(commands.GetSessionStats(event_id="evt_before"))
+        assert types(before) == ["session.stats"]
+        (turn,) = before[0].stats["turns"]
+        (chunk,) = turn["chunks"]
+        assert (turn["status"], chunk["seq"], chunk["complete"]) == ("open", 1, False)
+        assert chunk["done_ns"] is None
+        assert session_stats_turn_metrics(turn) == {"final": False, "epoch": 0, "turn_id": 0}
+
+        start = ledger.opened_at_ns + chunk["submitted_ns"]
+        ms = 1_000_000
+        request_id = h.stage0_request_id()
+        stage_work = ((0, 0, 1, start + 10 * ms, 50 * ms), (1, 0, 1, start + 40 * ms, 100 * ms))
+        await h.deliver_and_settle(tts_output(request_id, samples=24000, text="hello"), stage_work=stage_work)
+        events = await h.deliver_and_settle(tts_output(request_id, samples=24000, text="hello", turn_end=True))
+        done = find(events, "response.done")
+
+        reply = await h.run(commands.GetSessionStats(event_id="evt_after"))
+        assert types(reply) == ["session.stats"]
+        assert reply[0].request_event_id == "evt_after"
+        stats = reply[0].stats
+        assert [stage["stage_id"] for stage in stats["stages"]] == [0, 1]
+        (turn,) = stats["turns"]
+        assert (turn["epoch"], turn["turn_id"], turn["status"]) == (0, 0, "done")
+        assert turn["response_ids"] == [done.response_id]
+        (chunk,) = turn["chunks"]
+        assert chunk["complete"] is True and chunk["done_ns"] >= chunk["submitted_ns"]
+        assert chunk["stage_work"] == [
+            {"stage_id": 0, "spans": [[chunk["submitted_ns"] + 10 * ms, 50 * ms]]},
+            {"stage_id": 1, "spans": [[chunk["submitted_ns"] + 40 * ms, 100 * ms]]},
+        ]
+        assert sum(piece["duration_ms"] for piece in turn["audio"]) == 1000
+        assert all(piece["response_id"] == done.response_id for piece in turn["audio"])
+
+        metrics = session_stats_turn_metrics(turn)
+        assert metrics["final"] is True
+        # Stage spans overlap from 40 ms to 60 ms: the union is 130 ms, not 150 ms.
+        assert metrics["generation_ms"] == 130.0
+        assert metrics["busy_rtf"] == 0.13
+        assert metrics["stall_ratio"] == pytest.approx(metrics["stall_ms"] / 1000.0)
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_an_output_without_spans_still_marks_its_chunk_handled() -> None:
+    h = await open_harness(runtime_config=DuplexSessionRuntimeConfig(collect_stats=True))
+    try:
+        ledger = h.session.perf
+        assert ledger is not None
+        await h.run(append_audio())
+        start = ledger.opened_at_ns + ledger.snapshot()["turns"][0]["chunks"][0]["submitted_ns"]
+        request_id = h.stage0_request_id()
+        # The step's spans left with an earlier output; the audio output carries none.
+        h.deliver(listen_output(request_id), stage_id=0, stage_work=((0, 0, 1, start, 1),), output_chunk=(0, 1))
+        first = ledger._chunk(0, 1)[1].handled_ns
+        await h.deliver_and_settle(tts_output(request_id, samples=24000, text="hi"), output_chunk=(0, 1))
+        assert ledger._chunk(0, 1)[1].handled_ns > first
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_session_stats_mark_barge_in_turns_cancelled() -> None:
+    h = await open_harness(runtime_config=DuplexSessionRuntimeConfig(collect_stats=True))
+    try:
+        await h.run(append_audio())
+        assert h.session.perf is not None
+        h.session.barge_in()
+        (turn,) = h.session.perf.snapshot()["turns"]
+        # No abort-completion signal: a cancelled turn reports raw data but never numbers.
+        assert (turn["epoch"], turn["status"], turn["final"]) == (0, "cancelled", False)
+        assert turn["chunks"][0]["complete"] is False
+    finally:
+        await close_harness(h)
 
 
 # --------------------------------------------------------------------------- #

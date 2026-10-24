@@ -54,6 +54,7 @@ from vllm_omni.engine.duplex.session.context import CommittedInputContinuation, 
 from vllm_omni.engine.duplex.session.emitter import SessionEmitter
 from vllm_omni.engine.duplex.session.engine_session import DuplexEngineSession, DuplexFenceMismatchError
 from vllm_omni.engine.duplex.session.lease import DuplexLeaseActivity
+from vllm_omni.engine.duplex.session.perf_ledger import with_perf_chunk
 from vllm_omni.engine.duplex.session.tool_calls import ToolCallOrigin, ToolCallRegistrationError
 from vllm_omni.metrics.stats import OrchestratorAggregator, StageRequestStats
 from vllm_omni.outputs import OmniRequestOutput
@@ -327,6 +328,8 @@ class ModelChannel:
     ) -> dict[str, object] | None:
         """Submit one planned append to the stage port and bind the resulting stage request."""
         session = self._ctx.session
+        # Session stats: the chunk's in-engine interval starts when its append is taken up.
+        accepted_ns = session.perf.now_ns() if session.perf is not None else 0
         if self._ctx.stage_port.stage_count == 0:
             raise RuntimeError("duplex_data_plane_has_no_stage")
         fence = helpers.append_fence(session, payload)
@@ -439,6 +442,8 @@ class ModelChannel:
             if not isinstance(append_plan, DuplexAppendPlan):
                 raise TypeError("duplex plugin plan_append() must return DuplexAppendPlan")
             prompt = dict(append_plan.prompt)
+            if session.perf is not None:
+                prompt = with_perf_chunk(prompt, (fence.epoch, reservation.update.seq))
             runtime_patch = self._ctx.plugin.runtime_patch_for_submitted_prompt(prompt)
             submission = DuplexStageSubmission(
                 context=request_context,
@@ -473,6 +478,14 @@ class ModelChannel:
                         if bound is not None:
                             session.replace_runtime_config(bound)
                 update = session.commit_append(reservation)
+                if session.perf is not None:
+                    session.perf.open_chunk(
+                        epoch=fence.epoch,
+                        seq=update.seq,
+                        turn_id=update.turn_id,
+                        turn_seq=update.turn_seq,
+                        submitted_ns=accepted_ns,
+                    )
                 session.bind_stage_request(stage_id, request_id, fence=fence)
                 self._ctx.plugin.commit_append_plan(request_id)
             except BaseException:
@@ -698,6 +711,15 @@ class ModelChannel:
         return engine_output
 
     async def on_stage_output_item(self, item: StageOutput) -> CommittedInputContinuation | None:
+        perf = self._ctx.session.perf
+        try:
+            return await self._on_stage_output_item(item)
+        finally:
+            if perf is not None:
+                # Handling (projection, audio encoding, emission) is part of the chunk's in-engine time.
+                perf.mark_handled(item.context.perf_chunks())
+
+    async def _on_stage_output_item(self, item: StageOutput) -> CommittedInputContinuation | None:
         session = self._ctx.session
         if session.state == DuplexSessionState.CLOSED or self._ctx.run.closing:
             return None
@@ -1359,6 +1381,8 @@ class ModelChannel:
             response_request_metrics=response_request_metrics,
         )
         self._out.emit(payload)
+        if session.perf is not None and mark_duration_ms is not None and isinstance(response_id, str):
+            session.perf.record_audio(response_id=response_id, duration_ms=mark_duration_ms - previous_sent_ms)
         if self._ctx.run.closing:
             return close_reason, emitted_response
         if (
@@ -1411,6 +1435,8 @@ class ModelChannel:
                             "playback": playback,
                         }
                     )
+                    if session.perf is not None:
+                        session.perf.end_response(drained_response_id)
                 return close_reason, emitted_response
             if isinstance(data_plane_request_id, str) and not auto_response:
                 data_plane.close_stream(data_plane_request_id)

@@ -18,6 +18,7 @@ from vllm.v1.request import Request, RequestStatus
 from vllm.v1.utils import ConstantList
 
 from tests.helpers.omni_scheduler import bind_omits_transfer_helpers
+from vllm_omni.core.sched.duplex_stage_work import set_request_perf_chunk
 from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
 from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler
 from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
@@ -1383,6 +1384,28 @@ def test_save_without_custom_processor_does_not_snapshot_request(build_adapter, 
 
     snapshot.assert_not_called()
     assert adapter._pending_save_reqs.popleft()["request"] is request
+
+
+def test_save_stamps_the_producing_steps_chunk_not_a_queued_update(build_adapter, monkeypatch):
+    """Session stats (RFC #8325): a resumable stop can apply the queued chunk-B update to
+    the Talker request before chunk A's final output is saved; the payload must still name A."""
+    adapter, connector = build_adapter(stage_id=1)
+    request = _req("req-talker", RequestStatus.RUNNING, external_req_id="ext-talker")
+    set_request_perf_chunk(request, (0, 2))
+    adapter.custom_process_next_stage_input_func = lambda **kwargs: OmniPayloadStruct(
+        codes=CodesStruct(audio=torch.tensor([1, 2], dtype=torch.long)),
+    )
+    monkeypatch.setattr(adapter, "cleanup", lambda *a, **kw: None)
+
+    adapter.save_async(multimodal_output=None, request=request, duplex_perf_chunk=(0, 1))
+    task = adapter._pending_save_reqs.popleft()
+    assert task["duplex_perf_chunk"] == (0, 1)
+    adapter._send_single_request_for_generation(task)
+    assert connector.put.call_args.kwargs["data"].meta.duplex_perf_chunk == [0, 1]
+
+    # Without an explicit chunk the request's current one is used.
+    adapter.save_async(multimodal_output=None, request=request)
+    assert adapter._pending_save_reqs.popleft()["duplex_perf_chunk"] == (0, 2)
 
 
 def test_send_single_request_terminal_chunk_still_flushes_processor(build_adapter, monkeypatch):

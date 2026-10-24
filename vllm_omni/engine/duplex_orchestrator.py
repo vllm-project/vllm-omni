@@ -23,6 +23,7 @@ from vllm.v1.engine import FinishReason
 from vllm.v1.engine.exceptions import EngineDeadError
 
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
+from vllm_omni.core.sched.duplex_stage_work import PERF_CHUNK_KEY, stage_work_rows
 from vllm_omni.engine import OmniEngineCoreOutput, OmniEngineCoreRequest
 from vllm_omni.engine.duplex.contracts import (
     DuplexFence,
@@ -63,6 +64,10 @@ class DuplexOrchestratorRequestState(OrchestratorRequestState):
     fence: DuplexFence | None = None
     stage_fences: dict[int, DuplexFence] = field(default_factory=dict)
     config_generation: int = -1
+    # Session stats (RFC #8325): spans not yet handed to the runner, and the chunk
+    # of each stage's latest producing step.
+    pending_stage_work: list[tuple[int, int, int, int, int]] = field(default_factory=list)
+    stage_output_chunks: dict[int, tuple[int, int]] = field(default_factory=dict)
 
 
 class DuplexOrchestrator(Orchestrator, DuplexStagePort):
@@ -116,6 +121,15 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             admission_limit=admission_limit,
             log_stats=self.log_stats,
         )
+
+    def duplex_stage_names(self) -> list[str]:
+        """Each stage's model role (``thinker``, ``talker``, ...) for session stats."""
+        names = []
+        for stage_id, pool in enumerate(self.stage_pools):
+            model_config = getattr(getattr(pool, "stage_vllm_config", None), "model_config", None)
+            name = getattr(model_config, "model_stage", None)
+            names.append(name if isinstance(name, str) and name else f"stage{stage_id}")
+        return names
 
     # ------------------------------------------------------------------ #
     # Template seams                                                     #
@@ -233,6 +247,8 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             segment_finished=finished,
             segment_token_ids=tuple(segment.token_ids),
             segment_output_metadata=segment.output_metadata,
+            stage_work=self._take_stage_work(req_state, stage_id),
+            output_chunk=req_state.stage_output_chunks.get(stage_id),
         )
         return runner.on_stage_output(
             stage_id,
@@ -243,6 +259,54 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             input_transcript=transcript,
             input_item_id=item_id if isinstance(item_id, str) else None,
         )
+
+    def _collect_duplex_stage_work(
+        self,
+        stage_id: int,
+        eco: Any,
+        req_state: OrchestratorRequestState,
+    ) -> None:
+        if not isinstance(req_state, DuplexOrchestratorRequestState):
+            return
+        rows = stage_work_rows(eco.stage_work)
+        if not rows:
+            return
+        req_state.pending_stage_work.extend((stage_id, *row) for row in rows)
+        # The recorder puts the producing step's chunk last.
+        req_state.stage_output_chunks[stage_id] = (rows[-1][0], rows[-1][1])
+
+    @staticmethod
+    def _take_stage_work(
+        req_state: DuplexOrchestratorRequestState,
+        stage_id: int,
+    ) -> tuple[tuple[int, int, int, int, int], ...]:
+        """Drain the spans of ``stage_id``; outputs and raw outputs need not pair one to one."""
+        taken = tuple(row for row in req_state.pending_stage_work if row[0] == stage_id)
+        if taken:
+            req_state.pending_stage_work = [row for row in req_state.pending_stage_work if row[0] != stage_id]
+        return taken
+
+    def _annotate_next_stage_inputs(
+        self,
+        src_stage_id: int,
+        req_state: OrchestratorRequestState,
+        next_inputs: list[Any],
+    ) -> None:
+        """Carry the source step's chunk id into the forwarded duplex envelope (RFC #8325)."""
+        if not isinstance(req_state, DuplexOrchestratorRequestState):
+            return
+        chunk = req_state.stage_output_chunks.get(src_stage_id)
+        if chunk is None:
+            return
+        for next_input in next_inputs:
+            buffer = next_input.get("model_intermediate_buffer") if isinstance(next_input, dict) else None
+            duplex = buffer.get("duplex") if isinstance(buffer, dict) else None
+            if isinstance(buffer, dict) and isinstance(duplex, dict):
+                # Copy both levels: the stage-input processor may share them with bridge state.
+                next_input["model_intermediate_buffer"] = {
+                    **buffer,
+                    "duplex": {**duplex, PERF_CHUNK_KEY: list(chunk)},
+                }
 
     async def _report_duplex_session_request_error(
         self,
