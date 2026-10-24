@@ -828,3 +828,28 @@ class TestMagCacheBackend:
 
         assert backend.enabled is True
         mock_apply_hook.assert_called_once()
+
+
+class TestAlignCacheSelector:
+    @pytest.mark.parametrize("config", [None, {}, DiffusionCacheConfig()])
+    def test_shared_defaults_construct_without_loading_a_model(self, config):
+        from vllm_omni.diffusion.cache.aligncache.backend import AlignCacheBackend
+
+        backend = get_cache_backend("align_cache", config)
+        assert isinstance(backend, AlignCacheBackend)
+        assert backend.align_config.profile == "wan21_reference_v1"
+        assert not backend.is_enabled()
+
+    @pytest.mark.parametrize("name", [None, "none"])
+    def test_disabled_selector_ignores_cache_settings(self, name):
+        assert get_cache_backend(name, {"align_cache": {"mode": "trace"}}) is None
+
+    @pytest.mark.parametrize("config", [{"rel_l1_thresh": 0.2}, {"align_cache": {"mode": "unknown"}}])
+    def test_incompatible_or_invalid_options_fail(self, config):
+        with pytest.raises(ValueError, match="cache_config|align_cache"):
+            get_cache_backend("align_cache", config)
+
+    def test_legacy_backend_inherits_noop_request_context(self):
+        backend = TeaCacheBackend(DiffusionCacheConfig())
+        with backend.request_context(object(), object()):
+            assert not backend.is_enabled()

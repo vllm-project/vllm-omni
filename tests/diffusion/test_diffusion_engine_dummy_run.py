@@ -300,3 +300,27 @@ def test_paged_kv_admission_accepts_shape_at_profile_envelope() -> None:
     )
 
     assert engine._prepare_request_for_admission(request) is request
+
+
+@pytest.mark.parametrize("backend", ["none", "align_cache"])
+def test_wan_aligncache_startup_warmup_uses_supported_cfg(monkeypatch, backend):
+    from vllm_omni.diffusion.data import DiffusionOutput
+
+    engine = object.__new__(DiffusionEngine)
+    engine.od_config = OmniDiffusionConfig(model_class_name="WanPipeline", cache_backend=backend, enforce_eager=True)
+    monkeypatch.setattr("vllm_omni.diffusion.diffusion_engine.supports_multimodal_input", lambda config: (False, False))
+    monkeypatch.setattr("vllm_omni.diffusion.diffusion_engine.get_dummy_run_num_frames", lambda *args: 1)
+    received = []
+
+    def forward(request):
+        received.append(request)
+        if backend == "align_cache":
+            assert request.sampling_params.guidance_scale > 1, "Wan AlignCache requires serial CFG during startup"
+        return DiffusionOutput(output=None)
+
+    engine.add_req_and_wait_for_response = forward
+    engine._dummy_run()
+    assert len(received) == 1
+    assert received[0].sampling_params.num_inference_steps == 2
+    if backend == "none":
+        assert received[0].sampling_params.guidance_scale == 0

@@ -81,6 +81,7 @@ nav:
       - Cache Acceleration:
         - TeaCache: user_guide/diffusion/cache_acceleration/teacache.md
         - Cache-DiT: user_guide/diffusion/cache_acceleration/cache_dit.md
+        - AlignCache (experimental): user_guide/diffusion/cache_acceleration/aligncache.md
       - KV Cache:
         - Scheduler-Managed Paged KV Cache: user_guide/diffusion/paged_kv_cache.md
       - Parallelism:

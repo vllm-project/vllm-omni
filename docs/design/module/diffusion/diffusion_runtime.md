@@ -369,6 +369,14 @@ distributed initialization, model-runner construction, LoRA activation,
 profiling, and memory sleep/wake. It delegates actual model work to
 `DiffusionModelRunner`.
 
+Direct worker messages carry an `OmniDiffusionRequest` or a list of
+`NewRequestData`; other types return a request error without entering the
+runner. Sleep/wake parse failures return an error ACK with the task ID, and a
+custom pipeline reload sets the old pipeline to `None` before loading.
+
+The dynamic PEFT manager accepts one adapter path and a scalar scale; singleton
+lists are normalized at the worker boundary. LoRA fused at load time bypasses it.
+
 The runner owns long-lived model-side state:
 
 - the loaded pipeline and compilation setup;

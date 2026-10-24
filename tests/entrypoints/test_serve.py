@@ -106,7 +106,7 @@ def _parse_serve_args(argv: list[str]) -> TrackingNamespace:
     """Parse a ``serve`` argv through the real Omni parser, returning the
     TrackingNamespace (with ``explicit_keys``) that ``validate`` receives."""
     parser = TrackingArgumentParser()
-    subparsers = parser.add_subparsers(dest="subcommand")
+    subparsers = parser.add_subparsers(dest="subparser")
     OmniServeCommand().subparser_init(subparsers)
     return parser.parse_args(argv)
 
@@ -1296,3 +1296,39 @@ def test_tracking_namespace_copy_preserves_tracking(deep):
     restored = copy.deepcopy(namespace) if deep else copy.copy(namespace)
     assert restored.get_explicit_kwargs_dict() == {"api_server_count": 2}
     assert restored.model == "example"
+
+
+def test_aligncache_cli_reaches_terminal_diffusion_config():
+    from vllm_omni.config.config_factory import StageConfigFactory
+    from vllm_omni.config.omni_config import extract_diffusion_stage_config_kwargs
+    from vllm_omni.diffusion.cache.aligncache.config import AlignCacheConfig
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
+
+    args = _parse_serve_args(
+        [
+            "serve",
+            "fake-model",
+            "--omni",
+            "--enforce-eager",
+            "--cache-backend",
+            "align_cache",
+            "--cache-config",
+            '{"align_cache":{"profile":"qwen21_reference_v1","warmup_steps":7}}',
+        ]
+    )
+    stage = StageConfigFactory.create_default_diffusion(args.get_explicit_kwargs_dict())[0]
+    terminal = OmniDiffusionConfig.from_kwargs(
+        **extract_diffusion_stage_config_kwargs(stage["engine_args"], stage_id=0)
+    )
+    assert terminal.cache_backend == "align_cache"
+    assert terminal.enforce_eager
+    assert AlignCacheConfig.parse(terminal.cache_config).warmup_steps == 7
+
+
+@pytest.mark.parametrize("value", ["{", "[]", "true"])
+def test_aligncache_cli_invalid_json_fails_at_config_ingress(value):
+    args = _parse_serve_args(
+        ["serve", "fake-model", "--omni", "--cache-backend", "align_cache", "--cache-config", value]
+    )
+    with pytest.raises(ValueError, match="cache_config"):
+        normalize_and_validate_diffusion_engine_ingress_kwargs(args.get_explicit_kwargs_dict(), stage_id=0)

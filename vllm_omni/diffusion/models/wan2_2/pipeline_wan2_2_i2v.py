@@ -382,6 +382,26 @@ class Wan22I2VPipeline(
     ) -> torch.Tensor | AsyncLatents:
         if attention_kwargs is None:
             attention_kwargs = {}
+        runtime = getattr(self, "_aligncache_runtime", None)
+        if runtime is not None:
+            # forward() may rebuild the scheduler from request extra_args after admission.
+            if self._sample_solver != "unipc":
+                raise ValueError("align_cache: Wan requires the native UniPC sampler")
+            if image_embeds is not None:
+                raise ValueError("align_cache: Wan2.2 I2V-A14B does not admit CLIP image embeddings")
+            runtime.bind_schedule(
+                self,
+                timesteps,
+                latents,
+                prompt_embeds,
+                negative_prompt_embeds,
+                guidance_low,
+                guidance_high,
+                boundary_timestep,
+                dtype,
+                condition,
+                first_frame_mask,
+            )
         with self.progress_bar(total=len(timesteps)) as pbar:
             for step_idx, t in enumerate(timesteps):
                 self._current_timestep = t
@@ -434,13 +454,24 @@ class Wan22I2VPipeline(
                     negative_kwargs = None
 
                 # Predict noise with automatic CFG parallel handling
-                noise_pred = self.predict_noise_maybe_with_cfg(
-                    do_true_cfg=do_true_cfg,
-                    true_cfg_scale=current_guidance_scale,
-                    positive_kwargs=positive_kwargs,
-                    negative_kwargs=negative_kwargs,
-                    cfg_normalize=False,
-                )
+                if runtime is None:
+                    noise_pred = self.predict_noise_maybe_with_cfg(
+                        do_true_cfg=do_true_cfg,
+                        true_cfg_scale=current_guidance_scale,
+                        positive_kwargs=positive_kwargs,
+                        negative_kwargs=negative_kwargs,
+                        cfg_normalize=False,
+                    )
+                else:
+                    noise_pred = runtime.predict_noise(
+                        self,
+                        step_idx,
+                        t,
+                        current_guidance_scale,
+                        positive_kwargs,
+                        negative_kwargs,
+                        latents=latent_model_input[:, : latents.shape[1]],
+                    )
 
                 # Compute the previous noisy sample x_t -> x_t-1 with automatic CFG sync
                 latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg)
@@ -815,6 +846,9 @@ class Wan22I2VPipeline(
         """
         if current_model is None:
             current_model = self.transformer
+        runtime = getattr(self, "_aligncache_runtime", None)
+        if runtime is not None:
+            runtime.record_forward(current_model)
         result = current_model(**kwargs)
         return result if isinstance(result, IntermediateTensors) else result[0]
 

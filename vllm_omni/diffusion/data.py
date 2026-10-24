@@ -126,12 +126,18 @@ def normalize_omni_diffusion_kwargs(
         config_kwargs["cache_backend"] = "none"
 
     cache_config = config_kwargs.get("cache_config")
-    if isinstance(cache_config, str):
+    if config_kwargs.get("cache_backend") == "align_cache":
+        from vllm_omni.diffusion.cache.aligncache.config import normalize_cache_config
+
+        config_kwargs["cache_config"] = normalize_cache_config(cache_config)
+    elif isinstance(cache_config, str):
         try:
             config_kwargs["cache_config"] = json.loads(cache_config)
         except json.JSONDecodeError:
-            logger.warning("Invalid cache_config JSON, using backend defaults.")
-            config_kwargs.pop("cache_config", None)
+            # Defer to the resolved backend so strict backends report the original error.
+            if apply_defaults or "cache_backend" in config_kwargs:
+                logger.warning("Invalid cache_config JSON, using backend defaults.")
+                config_kwargs.pop("cache_config", None)
 
     if config_kwargs.get("streaming_output") is None and config_kwargs.get("diffusion_streaming_output") is not None:
         config_kwargs["streaming_output"] = config_kwargs["diffusion_streaming_output"]
@@ -658,6 +664,9 @@ class DiffusionCacheConfig:
     # "repeat" refreshes every force_refresh_step_hint steps.
     force_refresh_step_policy: str = "once"
 
+    # Independent namespace; never shared across config instances.
+    align_cache: dict[str, Any] = field(default_factory=dict)
+    _explicit_fields: tuple[str, ...] = field(default_factory=tuple, repr=False)
     # step_cache parameters [step_cache only] — DreamZero velocity schedule
     step_cache_dit_enabled: bool = True
     velocity_sim_thresholds: list[float] = field(default_factory=lambda: [0.95, 0.93])
@@ -693,7 +702,11 @@ class DiffusionCacheConfig:
 
         # Create instance with known params (missing ones will use defaults)
         # Then update _extra_params after creation since it's a private field
-        instance = cls(**known_params, _extra_params=extra_params)
+        instance = cls(
+            **known_params,
+            _extra_params={**data.get("_extra_params", {}), **extra_params},
+            _explicit_fields=tuple(data.get("_explicit_fields", known_params)),
+        )
         return instance
 
     def __getattr__(self, item: str) -> Any:
@@ -1412,6 +1425,11 @@ class OmniDiffusionConfig:
             else:
                 logger.warning(f"Unknown dtype string '{self.dtype}', defaulting to bfloat16")
                 self.dtype = torch.bfloat16
+
+        if self.cache_backend == "align_cache":
+            from vllm_omni.diffusion.cache.aligncache.config import normalize_cache_config
+
+            self.cache_config = normalize_cache_config(self.cache_config)
 
         # Convert cache_config dict to DiffusionCacheConfig if needed
         if isinstance(self.cache_config, dict):

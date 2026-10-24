@@ -1014,6 +1014,11 @@ class _DiffusionConfigProjection(_TrackExplicitConfigFields):
             }
             self.dtype = dtype_map.get(self.dtype.lower(), torch.bfloat16)
 
+        if self.cache_backend == "align_cache":
+            from vllm_omni.diffusion.cache.aligncache.config import normalize_cache_config
+
+            self.cache_config = normalize_cache_config(self.cache_config)
+
         if isinstance(self.cache_config, Mapping):
             self.cache_config = DiffusionCacheConfig.from_dict(dict(self.cache_config))
         elif not isinstance(self.cache_config, DiffusionCacheConfig):
