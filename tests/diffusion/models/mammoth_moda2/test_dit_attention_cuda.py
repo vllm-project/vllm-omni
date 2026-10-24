@@ -24,7 +24,6 @@ from .test_dit_attention import _reference_attention
 pytestmark = [
     pytest.mark.core_model,
     pytest.mark.advanced_model,
-    pytest.mark.cuda,
     pytest.mark.usefixtures("mock_tp1"),
     *hardware_marks(res={"cuda": "L4"}, num_cards=1),
 ]
@@ -128,6 +127,7 @@ def test_production_rope_uses_fused_qk_norm_rope(monkeypatch, force_native):
         .to(torch.bfloat16)
         .eval()
     )
+    initialize_block_weights(block)
     hidden = torch.randn(2, seq, DIM, device="cuda", dtype=torch.bfloat16)
     mask = torch.ones(2, seq, dtype=torch.bool, device="cuda")
     mask[0, -37:] = False
