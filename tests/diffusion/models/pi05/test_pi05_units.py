@@ -24,19 +24,23 @@ behaviour still produces a well-shaped, finite action chunk:
 from __future__ import annotations
 
 import logging
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
 import pytest
 import torch
 
+from vllm_omni.diffusion.models.pi05 import exact_qk_pi05 as exact_qk
 from vllm_omni.diffusion.models.pi05 import modeling_pi05
+from vllm_omni.diffusion.models.pi05 import precision_kernels_pi05 as kernels
 from vllm_omni.diffusion.models.pi05.config import (
     Pi05Config,
     UnsupportedCheckpointCapabilityError,
     load_lerobot_norm_stats,
     resolve_excluded_action_indices,
 )
+from vllm_omni.diffusion.models.pi05.cuda_graph_pi05 import Pi05CUDAGraphs
 from vllm_omni.diffusion.models.pi05.modeling_pi05 import (
     GemmaVariantConfig,
     Pi05AdaRMSNorm,
@@ -57,8 +61,668 @@ from vllm_omni.diffusion.models.pi05.processor_pi05 import (
     discretize_state,
     resize_with_pad,
 )
+from vllm_omni.diffusion.models.pi05.runtime_pi05 import Pi05RuntimeOptions
+from vllm_omni.diffusion.models.pi05.vision_pi05 import Pi05VisionOptions
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+@pytest.mark.parametrize("args", [{"pi05_vision_precision": "bf16"}, {"pi05_batch_cameras": "false"}])
+def test_p0_rejects_invalid_vision_options(args):
+    with pytest.raises(ValueError):
+        Pi05VisionOptions.from_pipeline_args(args)
+
+
+def _p0_vision_model():
+    """Small real SigLIP; no checkpoint or multi-billion-parameter backbone."""
+    from transformers import SiglipVisionConfig, SiglipVisionModel
+
+    model = object.__new__(Pi05ForActionPrediction)
+    torch.nn.Module.__init__(model)
+    backbone = object.__new__(modeling_pi05.PaliGemmaWithActionExpertPi05)
+    torch.nn.Module.__init__(backbone)
+    backbone.paligemma = torch.nn.Module()
+    backbone.paligemma.model = torch.nn.Module()
+    pg = backbone.paligemma.model
+    pg.vision_tower = SiglipVisionModel(
+        SiglipVisionConfig(
+            hidden_size=16,
+            intermediate_size=32,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            image_size=8,
+            patch_size=4,
+            vision_use_head=False,
+        )
+    )
+    pg.multi_modal_projector = torch.nn.Linear(16, 8)
+    pg.language_model = torch.nn.Module()
+    pg.language_model.embed_tokens = torch.nn.Embedding(32, 8).to(torch.bfloat16)
+    backbone.gemma_expert = torch.nn.Linear(8, 8).to(torch.bfloat16)
+    backbone.vision_options = Pi05VisionOptions()
+    model.paligemma_with_expert = backbone
+    model.config = Pi05Config()
+    model.cuda_graphs = None
+    model._vision_configured = False
+    return model.eval()
+
+
+@pytest.mark.parametrize("precision", ["fp32", "bf16_autocast", "selective_bf16"])
+@pytest.mark.parametrize("batch_cameras", [False, True])
+def test_p0_vision_policies_preserve_prefix_interface(precision, batch_cameras):
+    model = _p0_vision_model()
+    backbone = model.paligemma_with_expert
+    expert_before = backbone.gemma_expert.weight.detach().clone()
+    model.configure_vision(Pi05VisionOptions(precision, batch_cameras))
+    tower = backbone.paligemma.model.vision_tower
+    vision = getattr(tower, "vision_model", tower)
+    assert vision.embeddings.patch_embedding.weight.dtype == torch.float32
+    assert vision.embeddings.position_embedding.weight.dtype == torch.float32
+    expected = torch.bfloat16 if precision == "selective_bf16" else torch.float32
+    assert vision.encoder.layers[0].self_attn.q_proj.weight.dtype == expected
+    assert backbone.paligemma.model.multi_modal_projector.weight.dtype == expected
+    torch.testing.assert_close(backbone.gemma_expert.weight, expert_before, rtol=0, atol=0)
+    images = [torch.randn(2, 3, 8, 8) for _ in range(3)]
+    masks = [torch.tensor([True, False]), torch.tensor([False, True]), torch.tensor([True, True])]
+    with torch.no_grad():
+        embs, pad, att = model.embed_prefix(
+            images, masks, torch.zeros(2, 2, dtype=torch.long), torch.ones(2, 2, dtype=torch.bool)
+        )
+    assert embs.dtype == torch.float32 and torch.isfinite(embs).all()
+    assert embs.shape == (2, 14, 8)
+    for index, mask in enumerate(masks):
+        torch.testing.assert_close(pad[:, index * 4 : (index + 1) * 4], mask[:, None].expand(2, 4))
+    assert not att.any()
+    with pytest.raises(RuntimeError, match="initialization-only"):
+        model.configure_vision(Pi05VisionOptions())
+
+
+@pytest.mark.parametrize("num_real_views", [1, 2, 3])
+def test_p0_camera_batching_preserves_slot_and_sample_order(num_real_views):
+    from types import SimpleNamespace
+
+    calls = []
+
+    def embed_image(image):
+        calls.append(image.shape[0])
+        return image[:, :1, :1, :1].reshape(-1, 1, 1).expand(-1, 2, 2)
+
+    backbone = SimpleNamespace(
+        vision_options=Pi05VisionOptions(),
+        embed_image=embed_image,
+        embed_language_tokens=lambda tokens: torch.zeros(tokens.shape[0], tokens.shape[1], 2),
+    )
+    model = SimpleNamespace(config=Pi05Config(), paligemma_with_expert=backbone)
+    images = [
+        torch.tensor([10 * camera, 10 * camera + 1], dtype=torch.float32).reshape(2, 1, 1, 1) for camera in range(3)
+    ]
+    masks = [torch.tensor([camera < num_real_views] * 2) for camera in range(3)]
+    tokens, lang_mask = torch.zeros(2, 1, dtype=torch.long), torch.ones(2, 1, dtype=torch.bool)
+    sequential = Pi05ForActionPrediction.embed_prefix(model, images, masks, tokens, lang_mask)
+    assert calls == [2, 2, 2]
+    calls.clear()
+    backbone.vision_options = Pi05VisionOptions(batch_cameras=True)
+    batched = Pi05ForActionPrediction.embed_prefix(model, images, masks, tokens, lang_mask)
+    assert calls == [6]
+    for actual, expected in zip(batched, sequential):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_p0_cannot_change_vision_options_after_graph_install():
+    model = _p0_vision_model()
+    model.cuda_graphs = object()
+    with pytest.raises(RuntimeError, match="initialization-only"):
+        model.configure_vision(Pi05VisionOptions(precision="selective_bf16"))
+
+
+def _p0_runtime_model(dtype, lm_precision="legacy"):
+    """Real small Gemma/SigLIP with nonzero conditioning, preserving model APIs."""
+    from types import SimpleNamespace
+
+    from transformers import GemmaConfig, SiglipVisionConfig, SiglipVisionModel
+    from transformers.models.gemma.modeling_gemma import GemmaForCausalLM
+
+    from vllm_omni.diffusion.models.pi05.pipeline_pi05 import _set_inference_dtype
+
+    variant = GemmaVariantConfig(16, 2, 32, 2, 1, 8)
+    config = GemmaConfig(
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=8,
+        vocab_size=32,
+        hidden_activation="gelu_pytorch_tanh",
+    )
+    backbone = object.__new__(modeling_pi05.PaliGemmaWithActionExpertPi05)
+    torch.nn.Module.__init__(backbone)
+    backbone.paligemma = torch.nn.Module()
+    backbone.paligemma.model = torch.nn.Module()
+    pg = backbone.paligemma.model
+    pg.language_model = GemmaForCausalLM(config).model
+    pg.vision_tower = SiglipVisionModel(
+        SiglipVisionConfig(
+            hidden_size=16,
+            intermediate_size=32,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            image_size=8,
+            patch_size=4,
+            vision_use_head=False,
+        )
+    )
+    pg.multi_modal_projector = torch.nn.Linear(16, 16)
+    backbone.paligemma.config = SimpleNamespace(text_config=config, vision_config=pg.vision_tower.config)
+    backbone.gemma_expert = GemmaForCausalLM(config)
+    backbone.gemma_expert.model.embed_tokens = None
+    backbone.adarms_cond_dim = 16
+    backbone._install_adarms_norms(variant)
+    backbone.fused_kernels = False
+    backbone.vision_options = Pi05VisionOptions()
+    with torch.no_grad():
+        for layer in backbone.gemma_expert.modules():
+            if isinstance(layer, Pi05AdaRMSNorm):
+                layer.dense.weight.normal_(std=0.04)
+                layer.dense.bias.normal_(std=0.03)
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(modeling_pi05, "get_gemma_config", lambda _variant: variant)
+        patch.setattr(modeling_pi05, "PaliGemmaWithActionExpertPi05", lambda *_args: backbone)
+        model = Pi05ForActionPrediction(
+            Pi05Config(
+                max_action_dim=4,
+                max_state_dim=4,
+                chunk_size=4,
+                n_action_steps=4,
+                tokenizer_max_length=4,
+                image_resolution=(8, 8),
+                num_inference_steps=10,
+                lm_precision=lm_precision,
+            )
+        )
+    _set_inference_dtype(model, dtype)
+    model.eval()
+    model.kv_cache = model.new_kv_cache(batch_size=1)
+    return model
+
+
+@pytest.mark.parametrize("value", ["bf16", None, False, ["lerobot_bf16"]])
+def test_lm_precision_rejects_unknown_values(value):
+    with pytest.raises(ValueError, match="lm_precision"):
+        Pi05Config(lm_precision=value)
+
+
+@pytest.mark.parametrize("mode", ["legacy", "lerobot_bf16"])
+def test_lm_precision_pipeline_argument_reaches_config(mode):
+    from types import SimpleNamespace
+
+    from vllm_omni.diffusion.models.pi05.pipeline_pi05 import Pi05Pipeline
+
+    pipeline = object.__new__(Pi05Pipeline)
+    pipeline.model_dir = None
+    args = SimpleNamespace(model_config={}, custom_pipeline_args={"pi05_lm_precision": mode})
+    assert pipeline._build_config(args).lm_precision == mode
+    assert args.model_config == {}  # Resolving an option must not mutate the caller.
+    assert Pi05Config().lm_precision == "legacy"
+
+
+@pytest.mark.parametrize("mode", ["legacy", "lerobot_bf16"])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_lm_precision_controls_prefix_and_expert_norm_residual_dtype(mode, dtype):
+    model = _p0_runtime_model(dtype, mode)
+    backbone = model.paligemma_with_expert
+    expected_dtype = torch.bfloat16 if mode == "lerobot_bf16" and dtype == torch.bfloat16 else torch.float32
+    observed = []
+    handles: list[torch.utils.hooks.RemovableHandle] = []
+
+    def record(_module, args, result):
+        values = result if isinstance(result, tuple) else (result,)
+        observed.append((args[0].dtype, tuple(value.dtype for value in values if value is not None)))
+
+    for lm in (backbone.paligemma.model.language_model, backbone.gemma_expert.model):
+        for layer in lm.layers:
+            handles.extend(
+                norm.register_forward_hook(record) for norm in (layer.input_layernorm, layer.post_attention_layernorm)
+            )
+        handles.append(lm.norm.register_forward_hook(record))
+
+    prefix = torch.randn(1, 16, 16)
+    suffix = torch.randn(1, 4, 16)
+    cond = torch.randn(1, 16)  # The factory uses nonzero AdaRMS weights and biases.
+    cache = model.new_kv_cache(batch_size=1)
+    try:
+        prefix_output, _ = backbone.forward(
+            inputs_embeds=[prefix, None],
+            attention_mask=torch.zeros(1, 1, 16, 16),
+            position_ids=torch.arange(16)[None],
+            past_key_values=cache,
+            use_cache=True,
+        )
+        suffix_output, _ = backbone.forward(
+            inputs_embeds=[None, suffix],
+            attention_mask=torch.zeros(1, 1, 4, 20),
+            position_ids=torch.arange(16, 20)[None],
+            past_key_values=cache,
+            adarms_cond=cond,
+        )
+    finally:
+        for handle in handles:
+            handle.remove()
+    assert prefix_output[0].dtype == suffix_output[1].dtype == expected_dtype
+    assert len(observed) == 10
+    assert all(input_dtype == expected_dtype for input_dtype, _ in observed)
+    assert all(all(output_dtype == expected_dtype for output_dtype in outputs) for _, outputs in observed)
+    assert prefix.dtype == suffix.dtype == cond.dtype == torch.float32
+    assert model.action_in_proj.weight.dtype == model.action_out_proj.weight.dtype == torch.float32
+    prefix_rope = model.prepare_prefix_rotary(prefix, torch.arange(16)[None])
+    context = model.prepare_denoise_context(torch.ones(1, 16, dtype=torch.bool))
+    assert prefix_rope[0].dtype == prefix_rope[1].dtype == dtype
+    assert context.cos.dtype == context.sin.dtype == dtype
+
+
+def test_legacy_lm_precision_keeps_original_prefix_hidden_and_kv_exact():
+    model = _p0_runtime_model(torch.bfloat16)
+    backbone = model.paligemma_with_expert
+    prefix = torch.randn(1, 16, 16)
+    mask = torch.zeros(1, 1, 16, 16)
+    positions = torch.arange(16)[None]
+    hidden = prefix
+    expected_kv = []
+    for index in range(2):
+        hidden, kv = modeling_pi05._compute_layer_prefix_only(index, hidden, mask, positions, backbone.paligemma)
+        expected_kv.append(kv)
+    hidden = backbone.paligemma.model.language_model.norm(hidden)
+    cache = model.new_kv_cache(batch_size=1)
+    output, _ = backbone.forward(
+        inputs_embeds=[prefix, None],
+        attention_mask=mask,
+        position_ids=positions,
+        past_key_values=cache,
+        use_cache=True,
+    )
+    torch.testing.assert_close(output[0], hidden, rtol=0, atol=0)
+    for index, (key, value) in enumerate(expected_kv):
+        torch.testing.assert_close(cache.key[index, :, :, :16], key, rtol=0, atol=0)
+        torch.testing.assert_close(cache.value[index, :, :, :16], value, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_lm_precision_leaves_vision_timestep_and_fp32_execution_unchanged(dtype):
+    import copy
+
+    torch.manual_seed(421)
+    legacy = _p0_runtime_model(dtype)
+    aligned = copy.deepcopy(legacy)
+    aligned.paligemma_with_expert.lm_precision = "lerobot_bf16"
+    inputs = dict(
+        images=[torch.randn(1, 3, 8, 8) for _ in range(3)],
+        image_masks=[torch.tensor([True]), torch.tensor([False]), torch.tensor([True])],
+        lang_tokens=torch.tensor([[1, 2, 3, 4]]),
+        lang_masks=torch.tensor([[True, True, False, False]]),
+    )
+    for actual, expected in zip(aligned.embed_prefix(**inputs), legacy.embed_prefix(**inputs)):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    for model in (legacy, aligned):
+        model.configure_runtime(Pi05RuntimeOptions(precompute_adarms=True))
+        model.prepare_runtime_caches()
+    for actual, expected in zip(aligned.runtime_step_table(10, 1), legacy.runtime_step_table(10, 1)):
+        for name in ("timestep", "time_cond", "modulations"):
+            torch.testing.assert_close(getattr(actual, name), getattr(expected, name), rtol=0, atol=0)
+    noise = torch.randn(1, 4, 4)
+    original = legacy.sample_actions(**inputs, noise=noise)
+    result = aligned.sample_actions(**inputs, noise=noise)
+    if dtype == torch.float32:
+        torch.testing.assert_close(result, original, rtol=0, atol=0)
+    else:
+        assert not torch.equal(result, original), "The BF16 decoder-entry policy must actually affect execution."
+    assert result.dtype == torch.float32  # FP32 Euler integration and action output are preserved.
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_p0_precomputed_adarms_matches_nonzero_live_projections(dtype):
+    model = _p0_runtime_model(dtype)
+    model.configure_runtime(Pi05RuntimeOptions(precompute_adarms=True))
+    model.prepare_runtime_caches()
+    table = model.runtime_step_table(num_steps=10, batch_size=1)
+    assert table is not None and len(table) == 10
+    expert = model.paligemma_with_expert.gemma_expert.model
+    norms = [norm for layer in expert.layers for norm in (layer.input_layernorm, layer.post_attention_layernorm)]
+    norms.append(expert.norm)
+    for index, data in enumerate(table):
+        torch.testing.assert_close(data.timestep, torch.full((1,), 1.0 + index * (-1.0 / 10)), rtol=0, atol=0)
+        expected_cond = model.embed_timestep(data.timestep)
+        torch.testing.assert_close(data.time_cond, expected_cond, rtol=0, atol=0)
+        assert torch.count_nonzero(data.modulations)
+        for row, norm in zip(data.modulations, norms):
+            expected_modulation = norm.dense(expected_cond.to(norm.dense.weight.dtype))
+            torch.testing.assert_close(row, expected_modulation, rtol=0, atol=0)
+            x = torch.randn(1, 4, 16)
+            expected = norm(x, expected_cond)
+            actual = norm(x, modulation=row)
+            for lhs, rhs in zip(actual, expected):
+                torch.testing.assert_close(lhs, rhs, rtol=0, atol=0)
+    assert model.runtime_step_table(num_steps=1, batch_size=1) is None
+    assert model.runtime_step_table(num_steps=4, batch_size=1) is None
+    assert model.runtime_step_table(num_steps=10, batch_size=2) is None
+
+
+@pytest.mark.parametrize("mutation", ["inplace", "replace", "dtype"])
+def test_p0_precomputed_tables_are_invalidated_after_parameter_changes(mutation):
+    model = _p0_runtime_model(torch.bfloat16)
+    model.configure_runtime(Pi05RuntimeOptions(precompute_adarms=True))
+    model.prepare_runtime_caches()
+    assert model.runtime_step_table(num_steps=10, batch_size=1) is not None
+    dense = model.paligemma_with_expert.gemma_expert.model.layers[0].input_layernorm.dense
+    if mutation == "inplace":
+        with torch.no_grad():
+            dense.weight.add_(0.01)
+    elif mutation == "replace":
+        dense.weight = torch.nn.Parameter(dense.weight.detach().clone())
+    else:
+        model.to(dtype=torch.float32)
+    assert model.runtime_step_table(num_steps=10, batch_size=1) is None
+
+
+def test_p0_pipeline_precompute_survives_outer_inference_mode(monkeypatch, tmp_path):
+    from vllm_omni.diffusion.models.pi05 import pipeline_pi05
+
+    def load_checkpoint(_pipeline, model):
+        # Use a different weight from construction to prove preparation follows
+        # loading. These are real tiny-model parameters, not inference tensors.
+        assert not torch.is_inference(model.time_mlp_in.weight)
+        model.time_mlp_in.weight.fill_(0.07)
+
+    (tmp_path / "model.safetensors").touch()
+    pipeline = object.__new__(pipeline_pi05.Pi05Pipeline)
+    pipeline.model_dir = str(tmp_path)
+    pipeline.config = object()
+    pipeline.vision_options = Pi05VisionOptions(precision="selective_bf16", batch_cameras=True)
+    pipeline.runtime_options = Pi05RuntimeOptions(precompute_adarms=True)
+    pipeline._device = torch.device("cpu")
+    pipeline._torch_dtype = torch.bfloat16
+    monkeypatch.setattr(pipeline_pi05, "Pi05ForActionPrediction", lambda _config: _p0_runtime_model(torch.bfloat16))
+    monkeypatch.setattr(pipeline_pi05.Pi05Pipeline, "_load_checkpoint", load_checkpoint)
+    with torch.inference_mode():
+        model = pipeline._initialize_model()
+        assert all(not torch.is_inference(param) for param in model.parameters())
+        table = model.runtime_step_table(num_steps=10, batch_size=1)
+        assert table is not None
+        for data in table:
+            assert not torch.is_inference(data.modulations)
+            torch.testing.assert_close(data.time_cond, model.embed_timestep(data.timestep), rtol=0, atol=0)
+
+
+def _p0_pipeline_with_runtime_model(*, captured):
+    from vllm_omni.diffusion.models.pi05.pipeline_pi05 import Pi05Pipeline
+
+    pipeline = object.__new__(Pi05Pipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.model = _p0_runtime_model(torch.bfloat16)
+    pipeline.model.configure_runtime(Pi05RuntimeOptions(precompute_adarms=True))
+    pipeline.model.prepare_runtime_caches()
+    if captured:
+        # Exercise the real adapter/model guards without pretending CPU can
+        # capture a CUDA graph. Actual loader/capture coverage runs on GPU.
+        pipeline.model.cuda_graphs = Pi05CUDAGraphs(pipeline.model)
+    return pipeline
+
+
+def test_p0_pipeline_accepts_loader_noop_placement_without_touching_graph_inputs():
+    pipeline = _p0_pipeline_with_runtime_model(captured=True)
+    model = pipeline.model
+    graphs, rows = model.cuda_graphs, model.runtime_step_table(10, 1)
+    tensors = list(pipeline.parameters()) + list(pipeline.buffers()) + [model.kv_cache.key, model.kv_cache.value]
+    before = [(tensor.data_ptr(), tensor.dtype, tensor._version) for tensor in tensors]
+    assert pipeline.to(torch.device("cpu")) is pipeline
+    assert pipeline.to(device="cpu", non_blocking=True) is pipeline
+    assert pipeline.to() is pipeline
+    assert [(tensor.data_ptr(), tensor.dtype, tensor._version) for tensor in tensors] == before
+    assert model.cuda_graphs is graphs and model.runtime_step_table(10, 1) is rows
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"device": "meta"},
+        {"dtype": torch.float32},
+        {"dtype": torch.bfloat16},
+        {"memory_format": torch.channels_last},
+    ],
+)
+def test_p0_pipeline_rejects_conversion_after_capture(kwargs):
+    pipeline = _p0_pipeline_with_runtime_model(captured=True)
+    with pytest.raises(RuntimeError, match="require a new pipeline"):
+        pipeline.to(**kwargs)
+    assert pipeline.model.runtime_step_table(10, 1) is not None
+    assert pipeline.model.action_in_proj.weight.device.type == "cpu"
+    assert pipeline.model.action_in_proj.weight.dtype == torch.float32
+
+
+def test_p0_pipeline_noop_placement_validates_buffers_and_unknown_arguments():
+    pipeline = _p0_pipeline_with_runtime_model(captured=True)
+    with pytest.raises(TypeError):
+        pipeline.to(device="cpu", unexpected_option=True)
+    with pytest.raises(RuntimeError, match="copy argument"):
+        pipeline.to(device="cpu", copy=True)
+    pipeline.register_buffer("other_device_buffer", torch.empty(0, device="meta"))
+    with pytest.raises(RuntimeError, match="require a new pipeline"):
+        pipeline.to("cpu")
+
+
+def test_p0_pipeline_noop_cuda_device_resolves_current_index(monkeypatch):
+    from types import SimpleNamespace
+
+    pipeline = _p0_pipeline_with_runtime_model(captured=True)
+    monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: 3)
+    # Only the placement metadata is simulated here; the preceding tests use
+    # real tensors and verify pointer/version/cache preservation.
+    monkeypatch.setattr(pipeline, "parameters", lambda: iter([SimpleNamespace(device=torch.device("cuda:3"))]))
+    monkeypatch.setattr(pipeline, "buffers", lambda: iter([]))
+    assert pipeline.to("cuda") is pipeline
+    with pytest.raises(RuntimeError, match="require a new pipeline"):
+        pipeline.to("cuda:4")
+
+
+def test_p0_pipeline_ordinary_conversion_before_capture_is_unchanged():
+    pipeline = _p0_pipeline_with_runtime_model(captured=False)
+    assert pipeline.to(dtype=torch.float32) is pipeline
+    assert all(parameter.dtype == torch.float32 for parameter in pipeline.parameters())
+    assert pipeline.model.runtime_step_table(10, 1) is None
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("num_steps", [1, 4, 10])
+@pytest.mark.parametrize("lm_precision", ["legacy", "lerobot_bf16"])
+@pytest.mark.parametrize(
+    "flags",
+    [
+        {"precompute_adarms": True},
+        {"hoist_denoise_invariants": True},
+        {"prefix_kv_only": True},
+        {"precompute_adarms": True, "hoist_denoise_invariants": True, "prefix_kv_only": True},
+    ],
+)
+def test_p0_runtime_flags_preserve_actions_across_requests(dtype, num_steps, lm_precision, flags):
+    import copy
+
+    model = _p0_runtime_model(dtype, lm_precision)
+    optimized = copy.deepcopy(model)
+    optimized.configure_runtime(Pi05RuntimeOptions(**flags))
+    optimized.prepare_runtime_caches()
+    images = [torch.randn(1, 3, 8, 8) for _ in range(3)]
+    tokens = torch.tensor([[1, 2, 3, 4]])
+    noise = torch.randn(1, 4, 4)
+    requests = [
+        ([True, False, True], [True, True, False, False]),
+        ([False, True, False], [True, True, True, True]),
+        ([True, False, True], [True, True, False, False]),
+    ]
+    outputs = []
+    for camera_masks, text_mask in requests:
+        inputs = dict(
+            images=images,
+            image_masks=[torch.tensor([mask]) for mask in camera_masks],
+            lang_tokens=tokens,
+            lang_masks=torch.tensor([text_mask]),
+            noise=noise,
+            num_steps=num_steps,
+        )
+        expected = model.sample_actions(**inputs)
+        actual = optimized.sample_actions(**inputs)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        outputs.append(actual.clone())
+    torch.testing.assert_close(outputs[0], outputs[2], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("lm_precision", ["legacy", "lerobot_bf16"])
+def test_p0_prefix_kv_only_keeps_general_forward_and_skips_unused_modules(dtype, lm_precision, monkeypatch):
+    model = _p0_runtime_model(dtype, lm_precision)
+    backbone = model.paligemma_with_expert
+    embs = torch.randn(1, 16, 16)
+    position_ids = torch.arange(16)[None, :]
+    attention_mask = torch.zeros(1, 1, 16, 16)
+    cache = model.new_kv_cache(batch_size=1)
+    inputs = dict(
+        inputs_embeds=[embs, None],
+        position_ids=position_ids,
+        attention_mask=attention_mask,
+        past_key_values=cache,
+        use_cache=True,
+    )
+    full_hidden, _ = backbone.forward(**inputs)
+    assert full_hidden[0] is not None and full_hidden[0].shape == embs.shape
+    expected_k, expected_v = cache.key.clone(), cache.value.clone()
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError("KV-only executed unused final prefix hidden-state work")
+
+    final_layer = backbone.paligemma.model.language_model.layers[-1]
+    for module in (
+        final_layer.self_attn.q_proj,
+        final_layer.self_attn.o_proj,
+        final_layer.mlp,
+        backbone.paligemma.model.language_model.norm,
+    ):
+        monkeypatch.setattr(module, "forward", unexpected)
+    result, _ = backbone.forward(**inputs, prefix_kv_only=True)
+    assert result[0] is None
+    torch.testing.assert_close(cache.key[..., :16, :], expected_k[..., :16, :], rtol=0, atol=0)
+    torch.testing.assert_close(cache.value[..., :16, :], expected_v[..., :16, :], rtol=0, atol=0)
+
+
+class _P0GraphAdapterModel:
+    """Records adapter fallbacks; no mocked model math is treated as parity."""
+
+    def __init__(self, options):
+        from types import SimpleNamespace
+
+        self.runtime_options = options
+        self.calls = []
+        self.paligemma_with_expert = SimpleNamespace(forward=self.forward)
+
+    def forward(self, **kwargs):
+        self.calls.append(("prefix", kwargs))
+        return [torch.tensor(123), None], kwargs["past_key_values"]
+
+    def denoise_step(self, **kwargs):
+        self.calls.append(("denoise", kwargs))
+        return torch.tensor(-999)
+
+
+def _p0_graph_context(value):
+    return modeling_pi05.Pi05DenoiseContext(
+        torch.full((1, 1, 2, 5), value, dtype=torch.float32),
+        torch.full((1, 2), value, dtype=torch.long),
+        torch.full((1, 2, 4), value, dtype=torch.float32),
+        torch.full((1, 2, 4), -value, dtype=torch.float32),
+    )
+
+
+def _p0_graph_step(value):
+    return modeling_pi05.Pi05DenoiseStepData(
+        torch.tensor([1.0 - value / 10]),
+        torch.full((1, 2), value, dtype=torch.float32),
+        torch.full((3, 1, 6), value, dtype=torch.float32),
+    )
+
+
+def test_p0_graph_adapter_refreshes_steps_and_request_invariants(monkeypatch):
+    from types import SimpleNamespace
+
+    from vllm_omni.diffusion.models.pi05 import cuda_graph_pi05 as adapter
+
+    model = _P0GraphAdapterModel(Pi05RuntimeOptions(True, True, True))
+    graphs = Pi05CUDAGraphs(model)
+    cache = object()
+    context, row = _p0_graph_context(0), _p0_graph_step(0)
+    mask, actions, output = torch.ones(1, 3, dtype=torch.bool), torch.zeros(1, 2, 2), torch.zeros(1)
+    loads = []
+    original_load = adapter._load
+
+    def load(static, source):
+        if static is not source:
+            loads.append(static.data_ptr())
+        original_load(static, source)
+
+    def replay():
+        output.copy_(row.modulations.sum() + row.time_cond.sum() + context.attention_mask.sum())
+
+    monkeypatch.setattr(adapter, "_load", load)
+    graphs._denoise_step = adapter._DenoiseStepGraph(
+        SimpleNamespace(replay=replay), mask, cache, actions, row.timestep, output, context, row
+    )
+    results = []
+    for request in (_p0_graph_context(2), _p0_graph_context(7), _p0_graph_context(2)):
+        prepared = graphs.prepare_denoise_context(request)
+        assert prepared is context
+        before = len(loads)
+        values = []
+        for value in (1, 2, 3):
+            step = _p0_graph_step(value)
+            result = graphs.denoise_step(
+                mask.clone(), cache, actions.clone(), step.timestep, context=prepared, step_data=step
+            )
+            expected = step.modulations.sum() + step.time_cond.sum() + request.attention_mask.sum()
+            torch.testing.assert_close(result[0], expected, rtol=0, atol=0)
+            values.append(result.clone())
+        # x_t, timestep, time_cond, one complete modulation tensor per step;
+        # the request's mask/position/RoPE are not recopied each step.
+        assert len(loads) - before == 12
+        results.append(values)
+    assert loads.count(row.modulations.data_ptr()) == 9
+    assert graphs.num_replays["denoise_step"] == 9
+    for index in range(3):
+        torch.testing.assert_close(results[0][index], results[2][index], rtol=0, atol=0)
+        assert not torch.equal(results[0][index], results[1][index])
+    assert not torch.equal(results[0][0], results[0][1])
+    graphs.denoise_step(mask, cache, actions, row.timestep, context=context)
+    assert model.calls[-1][0] == "denoise" and graphs.num_replays["denoise_step"] == 9
+
+
+def test_p0_graph_kv_only_capture_preserves_general_forward_fallback():
+    from types import SimpleNamespace
+
+    from vllm_omni.diffusion.models.pi05 import cuda_graph_pi05 as adapter
+
+    model = _P0GraphAdapterModel(Pi05RuntimeOptions(prefix_kv_only=True))
+    graphs = Pi05CUDAGraphs(model)
+    cache = object()
+    mask, positions, embeddings = torch.zeros(1, 1, 3, 3), torch.zeros(1, 3, dtype=torch.long), torch.zeros(1, 3, 4)
+    graphs._prefix_forward = adapter._PrefixForwardGraph(
+        SimpleNamespace(replay=lambda: None), mask, positions, embeddings, cache, ([None, None], cache), True
+    )
+    inputs = dict(
+        attention_mask=mask,
+        position_ids=positions,
+        past_key_values=cache,
+        inputs_embeds=[embeddings, None],
+        use_cache=True,
+    )
+    full, _ = graphs.prefix_forward(**inputs)
+    assert full[0].item() == 123 and graphs.num_replays["prefix_forward"] == 0
+    kv, _ = graphs.prefix_forward(**inputs, prefix_kv_only=True)
+    assert kv[0] is None and graphs.num_replays["prefix_forward"] == 1
 
 
 # ----------------------------------------------------------------------------
@@ -382,6 +1046,73 @@ def test_pipeline_crops_actions_to_checkpoint_output_schema(monkeypatch):
     result = pipeline.forward(request)
 
     assert result.output["actions"].shape == (config.chunk_size, 7)
+
+
+class _GraphTarget:
+    """Stands in for the model: all ``_install_cuda_graphs`` touches are the
+    graph slot and the fused-kernel switch, whose calls ``events`` records."""
+
+    cuda_graphs = None
+
+    def __init__(self, events: list, fused_kernels_error: Exception | None = None):
+        self.events = events
+        self.fused_kernels_error = fused_kernels_error
+
+    def enable_fused_kernels(self):
+        if self.fused_kernels_error is not None:
+            raise self.fused_kernels_error
+        self.events.append("enable_fused_kernels")
+
+
+def _graph_install_pipeline(device: str, events: list, monkeypatch, fused_kernels_error=None):
+    from vllm_omni.diffusion.models.pi05.pipeline_pi05 import Pi05Pipeline
+
+    # Capture needs a GPU; test_pi05_cuda_graph_parity.py runs the real one.
+    monkeypatch.setattr(Pi05CUDAGraphs, "capture", lambda graphs: events.append("capture"))
+    pipeline = object.__new__(Pi05Pipeline)
+    pipeline._device = torch.device(device)
+    pipeline.model = _GraphTarget(events, fused_kernels_error)
+    return pipeline
+
+
+@pytest.mark.parametrize(
+    "enforce_eager,device,installed",
+    [
+        (True, "cuda", False),
+        (False, "cuda", True),
+        # No CUDA device: the knob asks for graphs, the pipeline stays eager.
+        (False, "cpu", False),
+        (True, "cpu", False),
+    ],
+)
+def test_pipeline_installs_cuda_graphs_unless_enforce_eager(enforce_eager, device, installed, monkeypatch):
+    """The optimized path is the fused kernels with CUDA graphs captured over
+    them: the kernels are enabled first, then the graphs are captured at init
+    and installed. The eager baseline gets neither."""
+    from types import SimpleNamespace
+
+    events: list[str] = []
+    pipeline = _graph_install_pipeline(device, events, monkeypatch)
+
+    pipeline._install_cuda_graphs(SimpleNamespace(enforce_eager=enforce_eager))
+
+    assert isinstance(pipeline.model.cuda_graphs, Pi05CUDAGraphs) is installed
+    assert events == (["enable_fused_kernels", "capture"] if installed else [])
+
+
+def test_pipeline_fails_when_the_fused_kernels_cannot_run(monkeypatch):
+    """``enforce_eager=False`` asks for the optimized path: kernels that cannot
+    run must stop startup rather than silently serve eagerly."""
+    from types import SimpleNamespace
+
+    events: list[str] = []
+    pipeline = _graph_install_pipeline("cuda", events, monkeypatch, fused_kernels_error=RuntimeError("no Triton"))
+
+    with pytest.raises(RuntimeError, match="enforce_eager") as excinfo:
+        pipeline._install_cuda_graphs(SimpleNamespace(enforce_eager=False))
+    assert "no Triton" in str(excinfo.value.__cause__)
+    assert events == []
+    assert pipeline.model.cuda_graphs is None
 
 
 def test_load_lerobot_norm_stats_unknown_mode_raises(tmp_path):
@@ -850,6 +1581,145 @@ def test_sample_actions_uses_request_generator(tiny_model):
     assert not torch.equal(first, different)
 
 
+class _RecordingCUDAGraphs(Pi05CUDAGraphs):
+    """Records which ``sample_actions`` region runs through the graph path."""
+
+    def __init__(self, model):
+        super().__init__(model)
+        self.calls: list[str] = []
+
+    def embed_prefix(self, *args, **kwargs):
+        self.calls.append("embed_prefix")
+        return super().embed_prefix(*args, **kwargs)
+
+    def prefix_forward(self, *args, **kwargs):
+        self.calls.append("prefix_forward")
+        return super().prefix_forward(*args, **kwargs)
+
+    def denoise_step(self, *args, **kwargs):
+        self.calls.append("denoise_step")
+        return super().denoise_step(*args, **kwargs)
+
+
+@pytest.mark.slow
+def test_sample_actions_routes_each_region_through_cuda_graphs(tiny_model):
+    """Once installed, every region goes through ``cuda_graphs`` (the denoise
+    step once per step), and falling back to eager reproduces the baseline bit
+    for bit. The real-checkpoint check is ``test_pi05_cuda_graph_parity.py``."""
+    model = tiny_model.eval()
+    images = [torch.zeros(1, 3, 224, 224) for _ in range(3)]
+    masks = [torch.tensor([True]), torch.tensor([False]), torch.tensor([False])]
+    lang = torch.zeros(1, 200, dtype=torch.long)
+    lang_mask = torch.ones(1, 200, dtype=torch.bool)
+    noise = torch.randn(1, 4, 8, generator=torch.Generator().manual_seed(42))
+
+    def run():
+        return model.sample_actions(
+            images=images, image_masks=masks, lang_tokens=lang, lang_masks=lang_mask, noise=noise, num_steps=3
+        )
+
+    graphs = _RecordingCUDAGraphs(model)
+    with torch.no_grad():
+        eager = run()
+        model.cuda_graphs = graphs
+        try:
+            optimized = run()
+        finally:
+            model.cuda_graphs = None
+
+    assert graphs.calls == ["embed_prefix", "prefix_forward"] + ["denoise_step"] * 3
+    assert torch.equal(optimized, eager)
+
+
+@pytest.mark.slow
+def test_cuda_graph_capture_failure_raises(tiny_model):
+    """``enforce_eager=False`` asks for the graph path: a failed capture must
+    stop startup rather than silently serve eagerly."""
+    assert tiny_model.kv_cache is None
+    with pytest.raises(RuntimeError, match="enforce_eager"):
+        Pi05CUDAGraphs(tiny_model).capture()
+
+
+@pytest.mark.slow
+def test_preallocated_kv_cache_is_rewritten_every_call():
+    """``sample_actions`` writes every K/V slot it reads before reading it, so
+    the preallocated cache reproduces a one-off cache bit for bit whatever an
+    earlier call left in it."""
+    model = _tiny_pi05_model().eval()
+    # AdaRMS ``dense`` is zero-initialized, which closes every expert gate and
+    # leaves the chunk independent of the K/V. Open the gates.
+    generator = torch.Generator().manual_seed(0)
+    for module in model.modules():
+        if isinstance(module, Pi05AdaRMSNorm) and module.dense is not None:
+            module.dense.weight.data.normal_(std=0.02, generator=generator)
+    images = [torch.zeros(1, 3, 224, 224) for _ in range(3)]
+    masks = [torch.tensor([True]), torch.tensor([False]), torch.tensor([False])]
+    lang_mask = torch.ones(1, 200, dtype=torch.bool)
+    noise = torch.randn(1, 4, 8, generator=torch.Generator().manual_seed(42))
+
+    def run(lang_tokens):
+        return model.sample_actions(
+            images=images, image_masks=masks, lang_tokens=lang_tokens, lang_masks=lang_mask, noise=noise, num_steps=2
+        )
+
+    prompt = torch.zeros(1, 200, dtype=torch.long)
+    other_prompt = torch.ones(1, 200, dtype=torch.long)
+    with torch.no_grad():
+        one_off = run(prompt)
+        cache = model.new_kv_cache(batch_size=1)
+        assert cache.fits(1, 3 * 256 + 200)
+        cache.key.fill_(float("nan"))
+        cache.value.fill_(float("nan"))
+        model.kv_cache = cache
+        preallocated = run(prompt)
+        other = run(other_prompt)
+        after_other = run(prompt)
+
+    assert torch.isfinite(cache.key).all() and torch.isfinite(cache.value).all()
+    assert torch.equal(preallocated, one_off)
+    assert not torch.equal(other, one_off)
+    assert torch.equal(after_other, one_off)
+
+
+@pytest.mark.slow
+def test_forward_requires_a_kv_cache(tiny_model):
+    backbone = tiny_model.paligemma_with_expert
+    with pytest.raises(TypeError, match="Pi05KVCache"):
+        backbone.forward(inputs_embeds=[torch.zeros(1, 4, tiny_model.vlm_width), None], use_cache=True)
+    with pytest.raises(TypeError, match="Pi05KVCache"):
+        backbone.forward(inputs_embeds=[None, torch.zeros(1, 4, tiny_model.expert_width)], past_key_values=[])
+
+
+@pytest.mark.slow
+def test_fused_kernels_are_off_until_enabled_and_need_cuda():
+    """The eager baseline never runs the fused kernels; enabling them on a
+    model they cannot serve raises and leaves it on the baseline. The kernels
+    themselves are ``test_pi05_fused_kernels.py``'s (CUDA)."""
+    model = _tiny_pi05_model()
+    assert model.paligemma_with_expert.fused_kernels is False
+    with pytest.raises(RuntimeError, match="not a CUDA device"):
+        model.enable_fused_kernels()
+    assert model.paligemma_with_expert.fused_kernels is False
+
+
+@pytest.mark.slow
+def test_fused_kernels_serve_only_batch_one_on_a_single_head_kv_cache(tiny_model):
+    """Calls the kernels do not cover run eagerly even once they are enabled."""
+    backbone = tiny_model.paligemma_with_expert
+    serve = modeling_pi05._fused_kernels_serve
+    cache = tiny_model.new_kv_cache(batch_size=1)
+    backbone.fused_kernels = True
+    try:
+        assert serve(backbone, cache, batch_size=1)
+        assert not serve(backbone, cache, batch_size=2)
+        assert not serve(backbone, tiny_model.new_kv_cache(batch_size=2), batch_size=2)
+        assert not serve(backbone, [], batch_size=1)
+        backbone.fused_kernels = False
+        assert not serve(backbone, cache, batch_size=1)
+    finally:
+        backbone.fused_kernels = False
+
+
 # ----------------------------------------------------------------------------
 # Serving dtype
 # ----------------------------------------------------------------------------
@@ -910,6 +1780,15 @@ def test_bfloat16_layout_is_applied_before_checkpoint_load(monkeypatch, tmp_path
             self.time_mlp_in = torch.nn.Linear(2, 2)
             self.time_mlp_out = torch.nn.Linear(2, 2)
 
+        def configure_vision(self, options):
+            assert options.precision == "fp32" and not options.batch_cameras
+
+        def configure_runtime(self, options):
+            assert not any((options.precompute_adarms, options.hoist_denoise_invariants, options.prefix_kv_only))
+
+        def prepare_runtime_caches(self):
+            assert not self.training
+
     # DiffusersLoader constructs custom pipelines under the requested default
     # dtype. Start fully in bfloat16 to verify that the helper restores every
     # float32-retained tensor rather than relying on the construction default.
@@ -923,6 +1802,8 @@ def test_bfloat16_layout_is_applied_before_checkpoint_load(monkeypatch, tmp_path
     pipeline = object.__new__(pipeline_pi05.Pi05Pipeline)
     pipeline.model_dir = str(tmp_path)
     pipeline.config = object()
+    pipeline.vision_options = pipeline_pi05.Pi05VisionOptions()
+    pipeline.runtime_options = pipeline_pi05.Pi05RuntimeOptions()
     pipeline._device = torch.device("cpu")
     pipeline._torch_dtype = torch.bfloat16
     monkeypatch.setattr(pipeline_pi05, "Pi05ForActionPrediction", lambda _config: model)
@@ -1105,3 +1986,389 @@ def test_request_denoising_steps_must_be_a_positive_integer(bad):
     with pytest.raises(ValueError, match="num_inference_steps must be a positive integer"):
         _spy_pipeline(spy).forward(_spy_request(bad))
     assert spy.seen == []
+
+
+def _exact_norm_reference(x, weight, add=None, shift=None, eps=1e-6):
+    residual = x if add is None else x + add
+    value = residual.float()
+    value = value * torch.rsqrt(value.square().mean(-1, keepdim=True) + eps)
+    value = value * (1.0 + weight.float())
+    if shift is not None:
+        value = value + shift.float()
+    return residual, value.to(residual.dtype)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("shape", [(3, 17), (15, 1024), (2, 16, 2048)])
+@pytest.mark.parametrize("adaptive", [False, True])
+def test_exact_norm_cpu_fallback(dtype, shape, adaptive):
+    generator = torch.Generator().manual_seed(419)
+    x = torch.randn(shape, generator=generator).to(dtype)
+    add = torch.randn(shape, generator=generator).to(dtype)
+    weight = torch.randn(shape[-1], generator=generator) * 0.2
+    shift = torch.randn(shape[-1], generator=generator) * 0.2 if adaptive else None
+    assert not kernels.can_use_exact_rms_norm(x, weight, add=add, shift=shift)
+    actual = kernels.residual_rms_norm(x, weight, add=add, shift=shift)
+    expected = _exact_norm_reference(x, weight, add, shift)
+    assert all(torch.equal(a, b) for a, b in zip(actual, expected))
+
+
+def test_exact_norm_fallback_preserves_autograd_and_input_ownership():
+    x = torch.randn(16, 17, requires_grad=True)
+    weight = torch.randn(17, requires_grad=True)
+    residual, actual = kernels.residual_rms_norm(x, weight)
+    _, expected = _exact_norm_reference(x, weight)
+    assert residual is x
+    assert torch.equal(actual, expected)
+    actual_grads = torch.autograd.grad(actual.sum(), (x, weight), retain_graph=True)
+    expected_grads = torch.autograd.grad(expected.sum(), (x, weight))
+    assert all(torch.equal(a, b) for a, b in zip(actual_grads, expected_grads))
+
+
+@pytest.mark.parametrize("version", ["2.11.0+cu128", "2.13.1", "2.14.0.dev20261012", "3.0.0"])
+def test_exact_norm_unknown_torch_release_uses_fallback(monkeypatch, version):
+    monkeypatch.setattr(torch, "__version__", version)
+    assert not kernels._supported_torch_reduction()
+
+
+def test_exact_norm_amd_uses_fallback(monkeypatch):
+    monkeypatch.setattr(torch, "__version__", "2.13.0+rocm7.0")
+    monkeypatch.setattr(torch.version, "hip", "7.0")
+    assert not kernels._supported_torch_reduction()
+
+
+def test_exact_norm_batched_modulation_fallback():
+    x = torch.randn(2, 16, 1024).to(torch.bfloat16)
+    scale = torch.randn(2, 1, 1024)
+    shift = torch.randn_like(scale)
+    actual = kernels.residual_rms_norm(x, scale, shift=shift)
+    expected = _exact_norm_reference(x, scale, shift=shift)
+    assert all(torch.equal(a, b) for a, b in zip(actual, expected))
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("mask_kind", ["none", "broadcast", "strided"])
+@pytest.mark.parametrize("output_dtype", [None, torch.float32])
+def test_exact_softmax_cpu_fallback(dtype, mask_kind, output_dtype):
+    generator = torch.Generator().manual_seed(193)
+    scores = torch.randn(2, 3, 5, 17, generator=generator).to(dtype)
+    mask = None if mask_kind == "none" else torch.randn(2, 1, 5, 17, generator=generator)
+    if mask_kind == "strided":
+        mask = torch.stack((mask, mask), dim=-1)[..., 0]
+        assert not mask.is_contiguous()
+    assert not kernels.can_use_exact_scaled_masked_softmax(scores, mask, 0.3, output_dtype=output_dtype)
+    expected = scores * 0.3
+    if mask is not None:
+        expected = expected + mask
+    expected = torch.softmax(expected, dim=-1, dtype=torch.float32).to(output_dtype or dtype)
+    actual = kernels.scaled_masked_softmax(scores, mask, 0.3, output_dtype=output_dtype)
+    assert torch.equal(actual, expected)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_exact_softmax_fallback_preserves_autograd(dtype):
+    scores = torch.randn(1, 2, 3, 11).to(dtype).requires_grad_()
+    mask = torch.randn(1, 1, 3, 11, requires_grad=True)
+    actual = kernels.scaled_masked_softmax(scores, mask, 1.0 / 16)
+    expected = torch.softmax(scores * (1.0 / 16) + mask, dim=-1, dtype=torch.float32).to(dtype)
+    grad = torch.randn_like(actual)
+    actual_grads = torch.autograd.grad(actual, (scores, mask), grad, retain_graph=True)
+    expected_grads = torch.autograd.grad(expected, (scores, mask), grad)
+    assert torch.equal(actual, expected)
+    assert all(torch.equal(a, b) for a, b in zip(actual_grads, expected_grads))
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_exact_softmax_attend_opt_in_keeps_default_path(monkeypatch, dtype):
+    query = torch.randn(1, 2, 3, 8).to(dtype)
+    key = torch.randn(1, 1, 7, 8).to(dtype)
+    value = torch.randn_like(key)
+    # An oversized mask must still be sliced at the KV boundary.
+    mask = torch.randn(1, 1, 3, 9)
+    calls = []
+    original = modeling_pi05.scaled_masked_softmax
+
+    def record(scores, sliced_mask, scale, **kwargs):
+        calls.append((scores.shape, sliced_mask.shape, kwargs))
+        return original(scores, sliced_mask, scale, **kwargs)
+
+    monkeypatch.setattr(modeling_pi05, "scaled_masked_softmax", record)
+    expected = modeling_pi05._attend(query, key, value, mask, 2, 1.0 / 16)
+    assert not calls
+    actual = modeling_pi05._attend(query, key, value, mask, 2, 1.0 / 16, exact_bf16_softmax=True)
+    assert calls == [((1, 2, 3, 7), (1, 1, 3, 7), {"output_dtype": dtype})]
+    assert torch.equal(actual, expected)
+
+
+@pytest.mark.parametrize("candidate_available", [False, True])
+def test_exact_qk_attention_dispatch_preserves_pv_and_default(monkeypatch, candidate_available):
+    """Observe routing with real CPU attention math; this does not test a CUDA kernel."""
+    query = torch.randn(1, 2, 3, 8).to(torch.bfloat16)
+    key = torch.randn(1, 1, 7, 8).to(torch.bfloat16)
+    value = torch.randn_like(key)
+    mask = torch.randn(1, 1, 3, 9)
+    original_matmul = torch.matmul
+    qk_calls, matmul_shapes = [], []
+
+    def candidate(q, k, *, num_kv_groups, h100_score_kernel):
+        assert q is query and k is key and num_kv_groups == 2
+        assert h100_score_kernel is vars(modeling_pi05).get("_attn_scores_kernel")
+        qk_calls.append(True)
+        if candidate_available:
+            return original_matmul(q, modeling_pi05._repeat_kv(k, num_kv_groups).transpose(2, 3))
+        return None
+
+    def matmul(left, right):
+        matmul_shapes.append((left.shape, right.shape))
+        return original_matmul(left, right)
+
+    monkeypatch.setattr(modeling_pi05, "try_exact_bf16_qk", candidate)
+    monkeypatch.setattr(torch, "matmul", matmul)
+    expected = modeling_pi05._attend(query, key, value, mask, 2, 1.0 / 16)
+    assert not qk_calls and len(matmul_shapes) == 2
+    matmul_shapes.clear()
+    actual = modeling_pi05._attend(query, key, value, mask, 2, 1.0 / 16, exact_bf16_softmax=True, exact_bf16_qk=True)
+    assert qk_calls == [True]
+    assert len(matmul_shapes) == (1 if candidate_available else 2)
+    assert matmul_shapes[-1] == ((1, 2, 3, 7), (1, 2, 7, 8))
+    assert torch.equal(actual, expected)
+
+
+@pytest.mark.parametrize("capability", [(9, 0), (12, 0), (8, 0)])
+@pytest.mark.parametrize(
+    "unsupported",
+    [
+        None,
+        "no_triton",
+        "torch",
+        "cuda",
+        "hip",
+        "no_gluon",
+        "old_triton",
+        "cpu",
+        "device",
+        "dtype",
+        "query_shape",
+        "key_shape",
+        "groups",
+        "query_stride",
+        "key_stride",
+        "noncontiguous",
+        "query_alignment",
+        "key_alignment",
+        "gradient",
+    ],
+)
+def test_exact_qk_guard(monkeypatch, capability, unsupported):
+    """CUDA metadata only; no JIT or GPU memory is used by these guard checks."""
+
+    def tensor(shape, strides):
+        return SimpleNamespace(
+            shape=shape,
+            dtype=torch.bfloat16,
+            device=torch.device("cuda:1"),
+            is_contiguous=lambda: True,
+            stride=lambda: strides,
+            data_ptr=lambda: 4096,
+            requires_grad=False,
+        )
+
+    query = tensor((1, 8, 50, 256), (102400, 12800, 256, 1))
+    key = tensor((1, 1, 1018, 256), (260608, 260608, 256, 1))
+    groups = 8
+    monkeypatch.setattr(exact_qk, "HAS_TRITON", True)
+    monkeypatch.setattr(exact_qk, "HAS_GLUON", True)
+    monkeypatch.setattr(exact_qk, "triton", SimpleNamespace(__version__="3.7.1"))
+    monkeypatch.setattr(torch, "__version__", "2.13.0+cu132")
+    monkeypatch.setattr(torch.version, "cuda", "13.2")
+    monkeypatch.setattr(torch.version, "hip", None)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: capability)
+    if unsupported == "no_triton":
+        monkeypatch.setattr(exact_qk, "HAS_TRITON", False)
+    elif unsupported == "torch":
+        monkeypatch.setattr(torch, "__version__", "2.13.1")
+    elif unsupported == "cuda":
+        monkeypatch.setattr(torch.version, "cuda", "13.1")
+    elif unsupported == "hip":
+        monkeypatch.setattr(torch.version, "hip", "7.0")
+    elif unsupported == "no_gluon":
+        monkeypatch.setattr(exact_qk, "HAS_GLUON", False)
+    elif unsupported == "old_triton":
+        monkeypatch.setattr(exact_qk, "triton", SimpleNamespace(__version__="3.6.0"))
+    elif unsupported == "cpu":
+        query.device = key.device = torch.device("cpu")
+    elif unsupported == "device":
+        key.device = torch.device("cuda:0")
+    elif unsupported == "dtype":
+        key.dtype = torch.float32
+    elif unsupported == "query_shape":
+        query.shape = (1, 8, 49, 256)
+    elif unsupported == "key_shape":
+        key.shape = (1, 1, 1017, 256)
+    elif unsupported == "groups":
+        groups = 4
+    elif unsupported == "query_stride":
+        query.stride = lambda: (102400, 256, 2048, 1)
+    elif unsupported == "key_stride":
+        key.stride = lambda: (260608, 260608, 1, 1018)
+    elif unsupported == "noncontiguous":
+        key.is_contiguous = lambda: False
+    elif unsupported == "query_alignment":
+        query.data_ptr = lambda: 4098
+    elif unsupported == "key_alignment":
+        key.data_ptr = lambda: 4098
+    elif unsupported == "gradient":
+        key.requires_grad = True
+    expected = capability in ((9, 0), (12, 0)) and (
+        unsupported is None or (capability == (9, 0) and unsupported in ("no_gluon", "old_triton"))
+    )
+    with torch.enable_grad():
+        assert exact_qk.can_use_exact_bf16_qk(query, key, groups) == expected
+        if not expected:
+            assert exact_qk.exact_bf16_qk(query, key, num_kv_groups=groups) is None
+
+
+def test_exact_qk_missing_gluon_import_preserves_torch_fallback(monkeypatch):
+    import builtins
+    import importlib.util
+
+    import vllm.triton_utils as triton_utils
+
+    original_import = builtins.__import__
+
+    def without_gluon(name, *args, **kwargs):
+        if name.startswith("triton.experimental"):
+            raise ImportError("Gluon intentionally unavailable in this import test")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(triton_utils, "HAS_TRITON", True)
+    monkeypatch.setattr(builtins, "__import__", without_gluon)
+    spec = importlib.util.spec_from_file_location("pi05_qk_without_gluon", exact_qk.__file__)
+    assert spec is not None and spec.loader is not None
+    isolated = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(isolated)
+    assert not isolated.HAS_GLUON
+    assert not hasattr(isolated, "_native_k8_kernel")
+    query = torch.randn(1, 2, 3, 8, requires_grad=True)
+    key = torch.randn(1, 1, 7, 8, requires_grad=True)
+    value = torch.randn_like(key, requires_grad=True)
+    mask = torch.zeros(1, 1, 3, 7)
+    monkeypatch.setattr(modeling_pi05, "try_exact_bf16_qk", isolated.exact_bf16_qk)
+    expected = modeling_pi05._attend(query, key, value, mask, 2, 1.0 / 16)
+    actual = modeling_pi05._attend(query, key, value, mask, 2, 1.0 / 16, exact_bf16_qk=True)
+    assert torch.equal(actual, expected)
+    gradient = torch.randn_like(actual)
+    actual_grads = torch.autograd.grad(actual, (query, key, value), gradient, retain_graph=True)
+    expected_grads = torch.autograd.grad(expected, (query, key, value), gradient)
+    assert all(torch.equal(a, b) for a, b in zip(actual_grads, expected_grads))
+
+
+@pytest.mark.parametrize("shape", [(50, 1018), (968, 968)])
+@pytest.mark.parametrize("unsupported", [None, "cuda_build", "other_geometry", "broadcast_mask", "gradient"])
+def test_exact_softmax_geometry_guard(monkeypatch, shape, unsupported):
+    """Metadata-only CUDA dispatch checks; numerical fallback tests use real tensors."""
+    device = torch.device("cuda:0")
+
+    def tensor(dimensions):
+        return SimpleNamespace(
+            shape=dimensions,
+            dtype=torch.bfloat16,
+            device=device,
+            is_contiguous=lambda: True,
+            requires_grad=False,
+        )
+
+    scores, mask = tensor((1, 8, *shape)), tensor((1, 1, *shape))
+    mask.dtype = torch.float32
+    monkeypatch.setattr(kernels, "HAS_TRITON", True)
+    monkeypatch.setattr(torch, "__version__", "2.13.0+cu132")
+    monkeypatch.setattr(torch.version, "cuda", "13.2")
+    monkeypatch.setattr(torch.version, "hip", None)
+    if unsupported == "cuda_build":
+        monkeypatch.setattr(torch.version, "cuda", "13.1")
+    elif unsupported == "other_geometry":
+        other_shape = (968, 968) if shape == (50, 1018) else (50, 1018)
+        mask.shape = (1, 1, *other_shape)
+    elif unsupported == "broadcast_mask":
+        mask.shape = (1, 1, 1, shape[-1])
+    elif unsupported == "gradient":
+        scores.requires_grad = True
+    expected = unsupported is None or (shape == (50, 1018) and unsupported == "cuda_build")
+    with torch.enable_grad():
+        assert kernels.can_use_exact_scaled_masked_softmax(scores, mask, 1.0 / 16) == expected
+
+
+@pytest.mark.parametrize(
+    "unsupported",
+    [
+        None,
+        "torch",
+        "cuda",
+        "hip",
+        "sm",
+        "cpu",
+        "dtype",
+        "rows",
+        "width",
+        "stride",
+        "bias",
+        "weight",
+        "device",
+        "heads",
+        "rope",
+    ],
+)
+def test_accurate_expert_qkv_guard(monkeypatch, unsupported):
+    """Metadata-only checks; these stand-ins never execute CUDA or GEMM math."""
+    device = torch.device("cuda:1")
+
+    def tensor(shape):
+        return SimpleNamespace(shape=shape, dtype=torch.bfloat16, device=device, is_contiguous=lambda: True)
+
+    x, cos, sin = tensor((50, 1024)), tensor((50, 256)), tensor((50, 256))
+    q, k, v = tensor((8, 50, 256)), tensor((50, 256)), tensor((50, 256))
+    attn = SimpleNamespace(
+        **{
+            name: SimpleNamespace(weight=tensor(shape), bias=None)
+            for name, shape in (("q_proj", (2048, 1024)), ("k_proj", (256, 1024)), ("v_proj", (256, 1024)))
+        }
+    )
+    monkeypatch.setattr(modeling_pi05, "HAS_TRITON", True)
+    monkeypatch.setattr(torch, "__version__", "2.13.0+cu132")
+    monkeypatch.setattr(torch.version, "cuda", "13.2")
+    monkeypatch.setattr(torch.version, "hip", None)
+    queried_devices = []
+
+    def capability(requested_device):
+        queried_devices.append(requested_device)
+        return (12, 0) if unsupported == "sm" else (9, 0)
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", capability)
+    if unsupported == "torch":
+        monkeypatch.setattr(torch, "__version__", "2.13.1+cu132")
+    elif unsupported == "cuda":
+        monkeypatch.setattr(torch.version, "cuda", "13.3")
+    elif unsupported == "hip":
+        monkeypatch.setattr(torch.version, "hip", "7.0")
+    elif unsupported == "cpu":
+        x.device = torch.device("cpu")
+    elif unsupported == "dtype":
+        x.dtype = torch.float32
+    elif unsupported == "rows":
+        x.shape = (49, 1024)
+    elif unsupported == "width":
+        x.shape = (50, 2048)
+    elif unsupported == "stride":
+        k.is_contiguous = lambda: False
+    elif unsupported == "bias":
+        attn.k_proj.bias = tensor((256,))
+    elif unsupported == "weight":
+        attn.v_proj.weight.shape = (512, 1024)
+    elif unsupported == "device":
+        attn.q_proj.weight.device = torch.device("cuda:0")
+    elif unsupported == "heads":
+        q.shape = (4, 50, 256)
+    elif unsupported == "rope":
+        cos.dtype = torch.float32
+    assert modeling_pi05._can_use_accurate_expert_triton_qkv(x, attn, cos, sin, q, k, v) == (unsupported is None)
+    assert queried_devices == ([device] if unsupported in (None, "sm") else [])
