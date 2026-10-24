@@ -854,6 +854,7 @@ def _init_chat_services(
         enable_force_include_usage=args.enable_force_include_usage,
         enable_log_outputs=args.enable_log_outputs,
         enable_log_deltas=args.enable_log_deltas,
+        enable_per_request_metrics=getattr(args, "enable_per_request_metrics", False),
     )
     state.openai_serving_chat = OmniOpenAIServingChat(**chat_kwargs) if enable_chat else None
     state.openai_serving_chat_batch = (
@@ -1104,7 +1105,9 @@ async def omni_init_app_state(
             reasoning_parser=args.structured_outputs_config.reasoning_parser,
             enable_prompt_tokens_details=args.enable_prompt_tokens_details,
             enable_force_include_usage=args.enable_force_include_usage,
+            enable_per_request_metrics=getattr(args, "enable_per_request_metrics", False),
             enable_log_outputs=args.enable_log_outputs,
+            default_chat_template_kwargs=args.default_chat_template_kwargs,
         )
         if "generate" in supported_tasks
         else None
@@ -1119,6 +1122,7 @@ async def omni_init_app_state(
             return_tokens_as_token_ids=args.return_tokens_as_token_ids,
             enable_prompt_tokens_details=args.enable_prompt_tokens_details,
             enable_force_include_usage=args.enable_force_include_usage,
+            enable_per_request_metrics=getattr(args, "enable_per_request_metrics", False),
         )
         if "generate" in supported_tasks
         else None
@@ -1162,6 +1166,7 @@ async def omni_init_app_state(
             request_logger=request_logger,
             chat_template_config=chat_template_config,
             log_error_stack=args.log_error_stack,
+            enable_flash_late_interaction=getattr(args, "enable_flash_late_interaction", True),
         )
         if any(t in supported_tasks for t in ("embed", "score", "token_embed"))
         else None
