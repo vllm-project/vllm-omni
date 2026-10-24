@@ -23,7 +23,7 @@ Window-aligned SP instead assigns **whole windows** to ranks:
 
 ## Window layouts
 
-`nadit.py` ports the reference windowing verbatim (Apache-2.0,
+`window_geometry.py` ports the reference windowing verbatim (Apache-2.0,
 ByteDance SeedVR2). For a post-patch token grid `(T, H, W)`:
 
 ```text
@@ -55,7 +55,7 @@ Consequences that matter (all verified against the reference):
 
 ## Planner
 
-`nadit.py` implements a deterministic LPT assignment:
+`window_sp.py` implements a deterministic LPT assignment:
 
 ```text
 windows sorted by (-video_token_count, original_window_id)
