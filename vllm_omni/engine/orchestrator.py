@@ -2037,6 +2037,26 @@ class OrchestratorBase:
         req_state: OrchestratorRequestState,
         stage_metrics: Any,
     ) -> None:
+        """Time per-request output routing, then delegate to the route implementation."""
+        started = _time.perf_counter()
+        try:
+            await self._route_output_impl(stage_id, replica_id, output, req_state, stage_metrics)
+        finally:
+            elapsed_ms = (_time.perf_counter() - started) * 1000.0
+            req_state.pipeline_timings["output_routing_ms"] = (
+                req_state.pipeline_timings.get("output_routing_ms", 0.0) + elapsed_ms
+            )
+            if stage_metrics is not None:
+                stage_metrics.pipeline_timings = dict(req_state.pipeline_timings)
+
+    async def _route_output_impl(
+        self,
+        stage_id: int,
+        replica_id: int,
+        output: Any,
+        req_state: OrchestratorRequestState,
+        stage_metrics: Any,
+    ) -> None:
         """Route a processed output: send to frontend and/or forward."""
         req_id = output.request_id
         finished = output.finished
@@ -3514,6 +3534,7 @@ class Orchestrator(OrchestratorBase):
             len(sampling_params_list),
         )
 
+        _t_orchestrator_setup = _time.perf_counter()
         req_state = OrchestratorRequestState(
             request_id=request_id,
             prompt=original_prompt,
@@ -3528,6 +3549,7 @@ class Orchestrator(OrchestratorBase):
         self.request_states[request_id] = req_state
         self._maybe_attach_native_kv_transfer_params(req_state, prompt)
         self._register_running_request(req_state)
+        req_state.pipeline_timings["orchestrator_setup_ms"] = (_time.perf_counter() - _t_orchestrator_setup) * 1000.0
         req_state.streaming.enabled = bool(getattr(prompt, "resumable", False))
         enqueue_ts = msg.enqueue_ts
         if enqueue_ts > 0:
@@ -3566,6 +3588,7 @@ class Orchestrator(OrchestratorBase):
             req_state.stage_submit_ts[stage_id] = _time.time()
             if mark_submitting is not None:
                 mark_submitting()
+            _t_stage_submission = _time.perf_counter()
             if not await self._dispatch_or_fail_request(
                 lambda: self.stage_pools[stage_id].submit_initial(
                     request_id,
@@ -3581,6 +3604,7 @@ class Orchestrator(OrchestratorBase):
                 if stage_id != 0:
                     await asyncio.to_thread(self._clear_stage_input_cache, stage_id)
                 return
+            req_state.pipeline_timings["stage_submission_ms"] = (_time.perf_counter() - _t_stage_submission) * 1000.0
 
         if self.async_chunk and final_stage_id > stage_id:
             await self._prewarm_async_chunk_stages(request_id, prompt, req_state, attach_prewarm_payload=True)
