@@ -58,6 +58,16 @@ cross-stage routing.
 Test registry selection, checkpoint loading, minimal inference, input and output
 contracts, and every declared optional capability.
 
+## Weight reloading
+
+Pipelines that support live RL weight updates opt in with
+`supports_weight_reload`. The shared loader integration records upstream vLLM
+reload metadata before external checkpoint loading and postprocessing. Their
+`load_weights` implementation must dispatch through parameter weight loaders so
+upstream WTE can track layer completion and preserve live storage. See the
+[weight-transfer contract](../../feature/weight_transfer.md#diffusion-loading-contract)
+for support limits and validation requirements.
+
 ## Exact conditioning projection reuse
 
 Models with repeated conditioning projections can use `ExactProjectionCache`

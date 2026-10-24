@@ -52,8 +52,14 @@ class BoundedAllocatorCache:
         self.min_free_fraction = min_free_fraction
 
     def _should_release(self) -> bool:
-        reserved = int(torch.accelerator.memory_reserved(self.device))
-        allocated = int(torch.accelerator.memory_allocated(self.device))
+        if self.device.type == "npu":
+            # The NPU allocator does not implement the generic DeviceAllocator interface.
+            device_module = torch.get_device_module(self.device)
+            reserved = int(device_module.memory_reserved(self.device))
+            allocated = int(device_module.memory_allocated(self.device))
+        else:
+            reserved = int(torch.accelerator.memory_reserved(self.device))
+            allocated = int(torch.accelerator.memory_allocated(self.device))
         free, total = current_omni_platform.get_device_memory(self.device)
         cached = max(0, reserved - allocated)
         return cached > int(total * self.max_cached_fraction) or free < int(total * self.min_free_fraction)
@@ -66,7 +72,7 @@ class BoundedAllocatorCache:
                     return False
             except Exception as exc:
                 # Preserve the pre-retention behavior on platforms that do not
-                # expose allocator telemetry through torch.accelerator.
+                # expose allocator telemetry.
                 logger.debug("Allocator cache telemetry unavailable; releasing cache: %s", exc)
         current_omni_platform.empty_cache()
         return True

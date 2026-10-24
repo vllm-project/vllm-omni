@@ -10,12 +10,13 @@ import pytest
 import torch
 import torch.nn as nn
 
+from tests.helpers.mark import hardware_marks
 from tests.model_executor.models.minicpmo_4_5.test_talker_host_sync import _EOS, _infos, _make_talker, _states, _step
 from vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni import _extract_codec_delta
 from vllm_omni.utils.device_copy import index_to_device
 from vllm_omni.utils.mm_outputs import to_payload_element
 
-pytestmark = [pytest.mark.core_model, pytest.mark.cuda]
+pytestmark = [pytest.mark.core_model, *hardware_marks(res={"cuda": "L4"}, num_cards=1)]
 
 
 def _assert_device_states_match_scalar(talker, expected_states) -> None:

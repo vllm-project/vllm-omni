@@ -8,6 +8,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tests.helpers.mark import hardware_test
+
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
 # Small mock dimensions (head_dim = HIDDEN_SIZE / NUM_HEADS = 16 must equal
@@ -857,7 +859,7 @@ def _operand_ulp_bound(x, weight, cos, sin):
     return 2.0**-6 * torch.stack((even_mag, odd_mag), dim=-1).flatten(-2) + 1e-6
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_packed_rope_table_layout(monkeypatch):
     from vllm_omni.diffusion.models.boogu_image.boogu_image_transformer import (
@@ -883,7 +885,7 @@ def test_packed_rope_table_layout(monkeypatch):
     assert len(short) == 2
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_fused_qk_norm_rope_matches_eager_chain():
     """The fused path vs the previous eager chain at real Boogu shapes.
@@ -916,7 +918,7 @@ def test_fused_qk_norm_rope_matches_eager_chain():
         assert (diff <= bound).all(), "fused path beyond one operand ulp of the eager chain"
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_fallback_with_no_packed_table():
     """Without a packed table the helper is bit-exact to the old chain."""

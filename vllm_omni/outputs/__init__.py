@@ -65,6 +65,9 @@ class OmniModelRunnerOutput(ModelRunnerOutput):
     # MRv2 consumers must treat the value as immutable and must not perform
     # another device-to-host conversion or rebuild it from sampler tensors.
     sampled_token_ids_materialized: bool = False
+    # Self-contained generation models may yield multiple outputs for one
+    # input unit. Keep these requests scheduled until the model finishes.
+    pending_generation_req_ids: set[str] = field(default_factory=set)
     # Request-local sampler failures, resolved at the existing token-copy boundary.
     invalid_logits_req_ids: set[str] = field(default_factory=set)
 

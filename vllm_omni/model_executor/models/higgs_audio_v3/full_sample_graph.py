@@ -245,6 +245,13 @@ def run_dense_sample(model, hidden, logits, metadata, force_audio_inputs=False, 
     return SamplerOutput(sampled_token_ids=output.sampled_token_ids.clone(), logprobs_tensors=None)
 
 
+def release_sample_graphs(model):
+    """Drop the sampler graphs so ``capture_sample_graphs`` captures them again."""
+    model._dense_sample_graphs = {}
+    model._dense_sample_metadata_sources = {}
+    model._sample_graphs_ready = False
+
+
 @torch.inference_mode()
 def capture_sample_graphs(model, max_num_reqs):
     """Warm the MRv2 sampler without consuming request RNG or decode state."""

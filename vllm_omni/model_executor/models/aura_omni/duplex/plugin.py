@@ -11,6 +11,7 @@ from typing import Any
 
 import numpy as np
 import pybase64 as base64
+from vllm.multimodal.image import open_image
 from vllm.sampling_params import SamplingParams
 
 from vllm_omni.engine.duplex.config import DuplexCapabilities, DuplexSessionConfig
@@ -76,8 +77,6 @@ def _video_frames_to_mm(frames: object) -> dict[str, object]:
         return {}
     from io import BytesIO
 
-    from PIL import Image
-
     images: list[object] = []
     for frame in frames:
         if not isinstance(frame, str) or not frame:
@@ -87,7 +86,7 @@ def _video_frames_to_mm(frames: object) -> dict[str, object]:
         except (binascii.Error, ValueError):
             continue
         try:
-            images.append(np.asarray(Image.open(BytesIO(raw)).convert("RGB")))
+            images.append(np.asarray(open_image(BytesIO(raw)).convert("RGB")))
         except Exception:
             continue
     if not images:

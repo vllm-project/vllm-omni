@@ -42,6 +42,7 @@ import torch
 from PIL import Image, UnidentifiedImageError
 from vllm import envs
 from vllm.logger import init_logger
+from vllm.multimodal.image import open_image
 from vllm.multimodal.video import (
     VIDEO_LOADER_REGISTRY,
     VideoBackend,
@@ -121,7 +122,7 @@ def positive_float(value: Any) -> float | None:
 
 def _decode_image_bytes(image_bytes: bytes, *, source: str) -> Image.Image:
     try:
-        with Image.open(BytesIO(image_bytes)) as image:
+        with open_image(BytesIO(image_bytes)) as image:
             _validate_image_pixel_limit(image)
             return image.convert("RGB")
     except _ImagePixelLimitError:

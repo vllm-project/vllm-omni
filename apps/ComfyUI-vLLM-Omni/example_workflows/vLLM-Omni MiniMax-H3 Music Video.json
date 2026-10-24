@@ -1,0 +1,2152 @@
+{
+  "id": "5c2d7e41-0b6a-4e8f-a3d2-9f1b6c0e8a03",
+  "revision": 0,
+  "last_node_id": 53,
+  "last_link_id": 36,
+  "nodes": [
+    {
+      "id": 1,
+      "type": "PrimitiveString",
+      "pos": [
+        40,
+        120
+      ],
+      "size": [
+        330,
+        82
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "value",
+          "name": "value",
+          "type": "STRING",
+          "widget": {
+            "name": "value"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "STRING",
+          "name": "STRING",
+          "type": "STRING",
+          "links": [
+            6,
+            16,
+            26
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "PrimitiveString"
+      },
+      "widgets_values": [
+        "http://localhost:8000/v1"
+      ],
+      "title": "Server URL"
+    },
+    {
+      "id": 2,
+      "type": "PrimitiveString",
+      "pos": [
+        40,
+        250
+      ],
+      "size": [
+        330,
+        82
+      ],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "value",
+          "name": "value",
+          "type": "STRING",
+          "widget": {
+            "name": "value"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "STRING",
+          "name": "STRING",
+          "type": "STRING",
+          "links": [
+            7,
+            17,
+            27
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "PrimitiveString"
+      },
+      "widgets_values": [
+        "MiniMaxAI/MiniMax-H3"
+      ],
+      "title": "Served model name"
+    },
+    {
+      "id": 3,
+      "type": "PrimitiveFloat",
+      "pos": [
+        40,
+        380
+      ],
+      "size": [
+        330,
+        82
+      ],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "value",
+          "name": "value",
+          "type": "FLOAT",
+          "widget": {
+            "name": "value"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "FLOAT",
+          "name": "FLOAT",
+          "type": "FLOAT",
+          "links": [
+            2,
+            8,
+            12,
+            18,
+            22,
+            28
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "PrimitiveFloat"
+      },
+      "widgets_values": [
+        5.167
+      ],
+      "title": "Shot duration seconds (5.167 = 124 frames)"
+    },
+    {
+      "id": 4,
+      "type": "VLLMOmniDiffusionSampling",
+      "pos": [
+        40,
+        510
+      ],
+      "size": [
+        330,
+        280
+      ],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "n",
+          "name": "n",
+          "type": "INT",
+          "widget": {
+            "name": "n"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "num_inference_steps",
+          "name": "num_inference_steps",
+          "type": "INT",
+          "widget": {
+            "name": "num_inference_steps"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "guidance_scale",
+          "name": "guidance_scale",
+          "type": "FLOAT",
+          "widget": {
+            "name": "guidance_scale"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "true_cfg_scale",
+          "name": "true_cfg_scale",
+          "type": "FLOAT",
+          "widget": {
+            "name": "true_cfg_scale"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "vae_use_slicing",
+          "name": "vae_use_slicing",
+          "type": "BOOLEAN",
+          "widget": {
+            "name": "vae_use_slicing"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "vae_use_tiling",
+          "name": "vae_use_tiling",
+          "type": "BOOLEAN",
+          "widget": {
+            "name": "vae_use_tiling"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "seed",
+          "name": "seed",
+          "type": "INT",
+          "widget": {
+            "name": "seed"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "diffusion sampling params",
+          "name": "diffusion sampling params",
+          "type": "SAMPLING_PARAMS",
+          "links": [
+            9,
+            19,
+            29
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VLLMOmniDiffusionSampling"
+      },
+      "widgets_values": [
+        1,
+        50,
+        1.0,
+        1.0,
+        false,
+        false,
+        42,
+        "fixed"
+      ],
+      "title": "Base H3 sampling (50 steps)"
+    },
+    {
+      "id": 5,
+      "type": "VLLMOmniMiniMaxH3Params",
+      "pos": [
+        40,
+        830
+      ],
+      "size": [
+        330,
+        140
+      ],
+      "flags": {},
+      "order": 4,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "audio_flow_shift",
+          "name": "audio_flow_shift",
+          "type": "FLOAT",
+          "widget": {
+            "name": "audio_flow_shift"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "flow_shift",
+          "name": "flow_shift",
+          "type": "FLOAT",
+          "widget": {
+            "name": "flow_shift"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "audio_mode",
+          "name": "audio_mode",
+          "type": "COMBO",
+          "widget": {
+            "name": "audio_mode"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "MiniMax-H3 video params",
+          "name": "MiniMax-H3 video params",
+          "type": "VIDEO_PARAMS",
+          "links": [
+            10,
+            20,
+            30
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VLLMOmniMiniMaxH3Params"
+      },
+      "widgets_values": [
+        3.0,
+        12.0,
+        "lock_source"
+      ],
+      "title": "H3 params - lock_source drives each shot with its slice"
+    },
+    {
+      "id": 6,
+      "type": "LoadImage",
+      "pos": [
+        40,
+        1010
+      ],
+      "size": [
+        330,
+        320
+      ],
+      "flags": {},
+      "order": 5,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "image",
+          "name": "image",
+          "type": "COMBO",
+          "widget": {
+            "name": "image"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "upload",
+          "name": "upload",
+          "type": "IMAGEUPLOAD",
+          "widget": {
+            "name": "upload"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "IMAGE",
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            3,
+            13,
+            23
+          ]
+        },
+        {
+          "localized_name": "MASK",
+          "name": "MASK",
+          "type": "MASK",
+          "links": null
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "LoadImage"
+      },
+      "widgets_values": [
+        "h3_mv_reference.png",
+        "image"
+      ],
+      "title": "Character / style reference"
+    },
+    {
+      "id": 7,
+      "type": "LoadAudio",
+      "pos": [
+        40,
+        1370
+      ],
+      "size": [
+        330,
+        160
+      ],
+      "flags": {},
+      "order": 6,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "audio",
+          "name": "audio",
+          "type": "COMBO",
+          "widget": {
+            "name": "audio"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "audioUI",
+          "name": "audioUI",
+          "type": "AUDIO_UI",
+          "widget": {
+            "name": "audioUI"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "upload",
+          "name": "upload",
+          "type": "AUDIOUPLOAD",
+          "widget": {
+            "name": "upload"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "AUDIO",
+          "name": "AUDIO",
+          "type": "AUDIO",
+          "links": [
+            1,
+            11,
+            21,
+            34
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "LoadAudio"
+      },
+      "widgets_values": [
+        "h3_mv_track.mp3",
+        null,
+        ""
+      ],
+      "title": "Supplied music track"
+    },
+    {
+      "id": 10,
+      "type": "TrimAudioDuration",
+      "pos": [
+        620,
+        120
+      ],
+      "size": [
+        330,
+        130
+      ],
+      "flags": {},
+      "order": 8,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "audio",
+          "name": "audio",
+          "type": "AUDIO",
+          "link": 1
+        },
+        {
+          "localized_name": "start_index",
+          "name": "start_index",
+          "type": "FLOAT",
+          "widget": {
+            "name": "start_index"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "duration",
+          "name": "duration",
+          "type": "FLOAT",
+          "widget": {
+            "name": "duration"
+          },
+          "link": 2
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "AUDIO",
+          "name": "AUDIO",
+          "type": "AUDIO",
+          "links": [
+            4
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "TrimAudioDuration"
+      },
+      "widgets_values": [
+        0.0,
+        5.167
+      ],
+      "title": "Shot 1 - music slice"
+    },
+    {
+      "id": 11,
+      "type": "VLLMOmniVideoReferences",
+      "pos": [
+        980,
+        120
+      ],
+      "size": [
+        300,
+        365
+      ],
+      "flags": {},
+      "order": 12,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "image_1",
+          "name": "image_1",
+          "shape": 7,
+          "type": "IMAGE",
+          "link": 3
+        },
+        {
+          "localized_name": "image_2",
+          "name": "image_2",
+          "shape": 7,
+          "type": "IMAGE",
+          "link": null
+        },
+        {
+          "localized_name": "audio_1",
+          "name": "audio_1",
+          "shape": 7,
+          "type": "AUDIO",
+          "link": 4
+        },
+        {
+          "localized_name": "audio_2",
+          "name": "audio_2",
+          "shape": 7,
+          "type": "AUDIO",
+          "link": null
+        },
+        {
+          "localized_name": "video_1",
+          "name": "video_1",
+          "shape": 7,
+          "type": "VIDEO",
+          "link": null
+        },
+        {
+          "localized_name": "video_2",
+          "name": "video_2",
+          "shape": 7,
+          "type": "VIDEO",
+          "link": null
+        },
+        {
+          "localized_name": "image_3",
+          "name": "image_3",
+          "shape": 7,
+          "type": "IMAGE",
+          "link": null
+        },
+        {
+          "localized_name": "image_4",
+          "name": "image_4",
+          "shape": 7,
+          "type": "IMAGE",
+          "link": null
+        },
+        {
+          "localized_name": "image_5",
+          "name": "image_5",
+          "shape": 7,
+          "type": "IMAGE",
+          "link": null
+        },
+        {
+          "localized_name": "image_6",
+          "name": "image_6",
+          "shape": 7,
+          "type": "IMAGE",
+          "link": null
+        },
+        {
+          "localized_name": "image_7",
+          "name": "image_7",
+          "shape": 7,
+          "type": "IMAGE",
+          "link": null
+        },
+        {
+          "localized_name": "image_8",
+          "name": "image_8",
+          "shape": 7,
+          "type": "IMAGE",
+          "link": null
+        },
+        {
+          "localized_name": "image_9",
+          "name": "image_9",
+          "shape": 7,
+          "type": "IMAGE",
+          "link": null
+        },
+        {
+          "localized_name": "audio_3",
+          "name": "audio_3",
+          "shape": 7,
+          "type": "AUDIO",
+          "link": null
+        },
+        {
+          "localized_name": "video_3",
+          "name": "video_3",
+          "shape": 7,
+          "type": "VIDEO",
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "references",
+          "name": "references",
+          "type": "VIDEO_REFERENCES",
+          "links": [
+            5
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VLLMOmniVideoReferences"
+      },
+      "widgets_values": [],
+      "title": "Shot 1 - reference image + driving audio"
+    },
+    {
+      "id": 12,
+      "type": "VLLMOmniGenerateVideo",
+      "pos": [
+        1320,
+        120
+      ],
+      "size": [
+        440,
+        500
+      ],
+      "flags": {},
+      "order": 15,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "frame",
+          "name": "frame",
+          "shape": 7,
+          "type": "IMAGE",
+          "link": null
+        },
+        {
+          "localized_name": "first_frame",
+          "name": "first_frame",
+          "shape": 7,
+          "type": "IMAGE",
+          "link": null
+        },
+        {
+          "localized_name": "last_frame",
+          "name": "last_frame",
+          "shape": 7,
+          "type": "IMAGE",
+          "link": null
+        },
+        {
+          "localized_name": "references",
+          "name": "references",
+          "shape": 7,
+          "type": "VIDEO_REFERENCES",
+          "link": 5
+        },
+        {
+          "localized_name": "sampling_params",
+          "name": "sampling_params",
+          "shape": 7,
+          "type": "SAMPLING_PARAMS",
+          "link": 9
+        },
+        {
+          "localized_name": "lora",
+          "name": "lora",
+          "shape": 7,
+          "type": "REMOTE_LORA",
+          "link": null
+        },
+        {
+          "localized_name": "model_params",
+          "name": "model_params",
+          "shape": 7,
+          "type": "VIDEO_PARAMS",
+          "link": 10
+        },
+        {
+          "localized_name": "fast_h3",
+          "name": "fast_h3",
+          "shape": 7,
+          "type": "FASTH3_DEPLOYMENT",
+          "link": null
+        },
+        {
+          "localized_name": "latent_edit",
+          "name": "latent_edit",
+          "shape": 7,
+          "type": "LATENT_MASK_EDITING",
+          "link": null
+        },
+        {
+          "localized_name": "url",
+          "name": "url",
+          "type": "STRING",
+          "widget": {
+            "name": "url"
+          },
+          "link": 6
+        },
+        {
+          "localized_name": "model",
+          "name": "model",
+          "type": "STRING",
+          "widget": {
+            "name": "model"
+          },
+          "link": 7
+        },
+        {
+          "localized_name": "prompt",
+          "name": "prompt",
+          "type": "STRING",
+          "widget": {
+            "name": "prompt"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "negative_prompt",
+          "name": "negative_prompt",
+          "type": "STRING",
+          "widget": {
+            "name": "negative_prompt"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "width",
+          "name": "width",
+          "type": "INT",
+          "widget": {
+            "name": "width"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "height",
+          "name": "height",
+          "type": "INT",
+          "widget": {
+            "name": "height"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "fps",
+          "name": "fps",
+          "type": "INT",
+          "widget": {
+            "name": "fps"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "duration",
+          "name": "duration",
+          "type": "FLOAT",
+          "widget": {
+            "name": "duration"
+          },
+          "link": 8
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "video",
+          "name": "video",
+          "type": "VIDEO",
+          "links": [
+            31
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VLLMOmniGenerateVideo"
+      },
+      "widgets_values": [
+        "http://localhost:8000/v1",
+        "MiniMaxAI/MiniMax-H3",
+        "The singer from <Picture 1> stands on a rain-soaked rooftop at night and sings toward the camera while neon signs flicker behind them. Slow push-in, cinematic lighting; their movement follows the rhythm of the music.",
+        "",
+        1344,
+        768,
+        24,
+        5.167
+      ],
+      "title": "Shot 1 - Generate Video"
+    },
+    {
+      "id": 20,
+      "type": "TrimAudioDuration",
+      "pos": [
+        620,
+        760
+      ],
+      "size": [
+        330,
+        130
+      ],
+      "flags": {},
+      "order": 9,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "audio",
+          "name": "audio",
+          "type": "AUDIO",
+          "link": 11
+        },
+        {
+          "localized_name": "start_index",
+          "name": "start_index",
+          "type": "FLOAT",
+          "widget": {
+            "name": "start_index"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "duration",
+          "name": "duration",
+          "type": "FLOAT",
+          "widget": {
+            "name": "duration"
+          },
+          "link": 12
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "AUDIO",
+          "name": "AUDIO",
+          "type": "AUDIO",
+          "links": [
+            14
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "TrimAudioDuration"
+      },
+      "widgets_values": [
+        5.17,
+        5.167
+      ],
+      "title": "Shot 2 - music slice"
+    },
+    {
+      "id": 21,
+      "type": "VLLMOmniVideoReferences",
+      "pos": [
+        980,
+        760
+      ],
+      "size": [
+        300,
+        365
+      ],
+      "flags": {},
+      "order": 13,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "image_1",
+          "name": "image_1",
+          "shape": 7,
+          "type": "IMAGE",
+          "link": 13
+        },
+        {
+          "localized_name": "image_2",
+          "name": "image_2",
+          "shape": 7,
+          "type": "IMAGE",
+          "link": null
+        },
+        {
+          "localized_name": "audio_1",
+          "name": "audio_1",
+          "shape": 7,
+          "type": "AUDIO",
+          "link": 14
+        },
+        {
+          "localized_name": "audio_2",
+          "name": "audio_2",
+          "shape": 7,
+          "type": "AUDIO",
+          "link": null
+        },
+        {
+          "localized_name": "video_1",
+          "name": "video_1",
+          "shape": 7,
+          "type": "VIDEO",
+          "link": null
+        },
+        {
+          "localized_name": "video_2",
+          "name": "video_2",
+          "shape": 7,
+          "type": "VIDEO",
+          "link": null
+        },
+        {
+          "localized_name": "image_3",
+          "name": "image_3",
+          "shape": 7,
+          "type": "IMAGE",
+          "link": null
+        },
+        {
+          "localized_name": "image_4",
+          "name": "image_4",
+          "shape": 7,
+          "type": "IMAGE",
+          "link": null
+        },
+        {
+          "localized_name": "image_5",
+          "name": "image_5",
+          "shape": 7,
+          "type": "IMAGE",
+          "link": null
+        },
+        {
+          "localized_name": "image_6",
+          "name": "image_6",
+          "shape": 7,
+          "type": "IMAGE",
+          "link": null
+        },
+        {
+          "localized_name": "image_7",
+          "name": "image_7",
+          "shape": 7,
+          "type": "IMAGE",
+          "link": null
+        },
+        {
+          "localized_name": "image_8",
+          "name": "image_8",
+          "shape": 7,
+          "type": "IMAGE",
+          "link": null
+        },
+        {
+          "localized_name": "image_9",
+          "name": "image_9",
+          "shape": 7,
+          "type": "IMAGE",
+          "link": null
+        },
+        {
+          "localized_name": "audio_3",
+          "name": "audio_3",
+          "shape": 7,
+          "type": "AUDIO",
+          "link": null
+        },
+        {
+          "localized_name": "video_3",
+          "name": "video_3",
+          "shape": 7,
+          "type": "VIDEO",
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "references",
+          "name": "references",
+          "type": "VIDEO_REFERENCES",
+          "links": [
+            15
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VLLMOmniVideoReferences"
+      },
+      "widgets_values": [],
+      "title": "Shot 2 - reference image + driving audio"
+    },
+    {
+      "id": 22,
+      "type": "VLLMOmniGenerateVideo",
+      "pos": [
+        1320,
+        760
+      ],
+      "size": [
+        440,
+        500
+      ],
+      "flags": {},
+      "order": 16,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "frame",
+          "name": "frame",
+          "shape": 7,
+          "type": "IMAGE",
+          "link": null
+        },
+        {
+          "localized_name": "first_frame",
+          "name": "first_frame",
+          "shape": 7,
+          "type": "IMAGE",
+          "link": null
+        },
+        {
+          "localized_name": "last_frame",
+          "name": "last_frame",
+          "shape": 7,
+          "type": "IMAGE",
+          "link": null
+        },
+        {
+          "localized_name": "references",
+          "name": "references",
+          "shape": 7,
+          "type": "VIDEO_REFERENCES",
+          "link": 15
+        },
+        {
+          "localized_name": "sampling_params",
+          "name": "sampling_params",
+          "shape": 7,
+          "type": "SAMPLING_PARAMS",
+          "link": 19
+        },
+        {
+          "localized_name": "lora",
+          "name": "lora",
+          "shape": 7,
+          "type": "REMOTE_LORA",
+          "link": null
+        },
+        {
+          "localized_name": "model_params",
+          "name": "model_params",
+          "shape": 7,
+          "type": "VIDEO_PARAMS",
+          "link": 20
+        },
+        {
+          "localized_name": "fast_h3",
+          "name": "fast_h3",
+          "shape": 7,
+          "type": "FASTH3_DEPLOYMENT",
+          "link": null
+        },
+        {
+          "localized_name": "latent_edit",
+          "name": "latent_edit",
+          "shape": 7,
+          "type": "LATENT_MASK_EDITING",
+          "link": null
+        },
+        {
+          "localized_name": "url",
+          "name": "url",
+          "type": "STRING",
+          "widget": {
+            "name": "url"
+          },
+          "link": 16
+        },
+        {
+          "localized_name": "model",
+          "name": "model",
+          "type": "STRING",
+          "widget": {
+            "name": "model"
+          },
+          "link": 17
+        },
+        {
+          "localized_name": "prompt",
+          "name": "prompt",
+          "type": "STRING",
+          "widget": {
+            "name": "prompt"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "negative_prompt",
+          "name": "negative_prompt",
+          "type": "STRING",
+          "widget": {
+            "name": "negative_prompt"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "width",
+          "name": "width",
+          "type": "INT",
+          "widget": {
+            "name": "width"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "height",
+          "name": "height",
+          "type": "INT",
+          "widget": {
+            "name": "height"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "fps",
+          "name": "fps",
+          "type": "INT",
+          "widget": {
+            "name": "fps"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "duration",
+          "name": "duration",
+          "type": "FLOAT",
+          "widget": {
+            "name": "duration"
+          },
+          "link": 18
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "video",
+          "name": "video",
+          "type": "VIDEO",
+          "links": [
+            32
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VLLMOmniGenerateVideo"
+      },
+      "widgets_values": [
+        "http://localhost:8000/v1",
+        "MiniMaxAI/MiniMax-H3",
+        "Close-up of the singer from <Picture 1>, lip-syncing precisely to the vocals. Wind moves their hair and city lights blur in the background; the handheld camera sways gently with the beat.",
+        "",
+        1344,
+        768,
+        24,
+        5.167
+      ],
+      "title": "Shot 2 - Generate Video"
+    },
+    {
+      "id": 30,
+      "type": "TrimAudioDuration",
+      "pos": [
+        620,
+        1400
+      ],
+      "size": [
+        330,
+        130
+      ],
+      "flags": {},
+      "order": 10,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "audio",
+          "name": "audio",
+          "type": "AUDIO",
+          "link": 21
+        },
+        {
+          "localized_name": "start_index",
+          "name": "start_index",
+          "type": "FLOAT",
+          "widget": {
+            "name": "start_index"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "duration",
+          "name": "duration",
+          "type": "FLOAT",
+          "widget": {
+            "name": "duration"
+          },
+          "link": 22
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "AUDIO",
+          "name": "AUDIO",
+          "type": "AUDIO",
+          "links": [
+            24
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "TrimAudioDuration"
+      },
+      "widgets_values": [
+        10.33,
+        5.167
+      ],
+      "title": "Shot 3 - music slice"
+    },
+    {
+      "id": 31,
+      "type": "VLLMOmniVideoReferences",
+      "pos": [
+        980,
+        1400
+      ],
+      "size": [
+        300,
+        365
+      ],
+      "flags": {},
+      "order": 14,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "image_1",
+          "name": "image_1",
+          "shape": 7,
+          "type": "IMAGE",
+          "link": 23
+        },
+        {
+          "localized_name": "image_2",
+          "name": "image_2",
+          "shape": 7,
+          "type": "IMAGE",
+          "link": null
+        },
+        {
+          "localized_name": "audio_1",
+          "name": "audio_1",
+          "shape": 7,
+          "type": "AUDIO",
+          "link": 24
+        },
+        {
+          "localized_name": "audio_2",
+          "name": "audio_2",
+          "shape": 7,
+          "type": "AUDIO",
+          "link": null
+        },
+        {
+          "localized_name": "video_1",
+          "name": "video_1",
+          "shape": 7,
+          "type": "VIDEO",
+          "link": null
+        },
+        {
+          "localized_name": "video_2",
+          "name": "video_2",
+          "shape": 7,
+          "type": "VIDEO",
+          "link": null
+        },
+        {
+          "localized_name": "image_3",
+          "name": "image_3",
+          "shape": 7,
+          "type": "IMAGE",
+          "link": null
+        },
+        {
+          "localized_name": "image_4",
+          "name": "image_4",
+          "shape": 7,
+          "type": "IMAGE",
+          "link": null
+        },
+        {
+          "localized_name": "image_5",
+          "name": "image_5",
+          "shape": 7,
+          "type": "IMAGE",
+          "link": null
+        },
+        {
+          "localized_name": "image_6",
+          "name": "image_6",
+          "shape": 7,
+          "type": "IMAGE",
+          "link": null
+        },
+        {
+          "localized_name": "image_7",
+          "name": "image_7",
+          "shape": 7,
+          "type": "IMAGE",
+          "link": null
+        },
+        {
+          "localized_name": "image_8",
+          "name": "image_8",
+          "shape": 7,
+          "type": "IMAGE",
+          "link": null
+        },
+        {
+          "localized_name": "image_9",
+          "name": "image_9",
+          "shape": 7,
+          "type": "IMAGE",
+          "link": null
+        },
+        {
+          "localized_name": "audio_3",
+          "name": "audio_3",
+          "shape": 7,
+          "type": "AUDIO",
+          "link": null
+        },
+        {
+          "localized_name": "video_3",
+          "name": "video_3",
+          "shape": 7,
+          "type": "VIDEO",
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "references",
+          "name": "references",
+          "type": "VIDEO_REFERENCES",
+          "links": [
+            25
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VLLMOmniVideoReferences"
+      },
+      "widgets_values": [],
+      "title": "Shot 3 - reference image + driving audio"
+    },
+    {
+      "id": 32,
+      "type": "VLLMOmniGenerateVideo",
+      "pos": [
+        1320,
+        1400
+      ],
+      "size": [
+        440,
+        500
+      ],
+      "flags": {},
+      "order": 17,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "frame",
+          "name": "frame",
+          "shape": 7,
+          "type": "IMAGE",
+          "link": null
+        },
+        {
+          "localized_name": "first_frame",
+          "name": "first_frame",
+          "shape": 7,
+          "type": "IMAGE",
+          "link": null
+        },
+        {
+          "localized_name": "last_frame",
+          "name": "last_frame",
+          "shape": 7,
+          "type": "IMAGE",
+          "link": null
+        },
+        {
+          "localized_name": "references",
+          "name": "references",
+          "shape": 7,
+          "type": "VIDEO_REFERENCES",
+          "link": 25
+        },
+        {
+          "localized_name": "sampling_params",
+          "name": "sampling_params",
+          "shape": 7,
+          "type": "SAMPLING_PARAMS",
+          "link": 29
+        },
+        {
+          "localized_name": "lora",
+          "name": "lora",
+          "shape": 7,
+          "type": "REMOTE_LORA",
+          "link": null
+        },
+        {
+          "localized_name": "model_params",
+          "name": "model_params",
+          "shape": 7,
+          "type": "VIDEO_PARAMS",
+          "link": 30
+        },
+        {
+          "localized_name": "fast_h3",
+          "name": "fast_h3",
+          "shape": 7,
+          "type": "FASTH3_DEPLOYMENT",
+          "link": null
+        },
+        {
+          "localized_name": "latent_edit",
+          "name": "latent_edit",
+          "shape": 7,
+          "type": "LATENT_MASK_EDITING",
+          "link": null
+        },
+        {
+          "localized_name": "url",
+          "name": "url",
+          "type": "STRING",
+          "widget": {
+            "name": "url"
+          },
+          "link": 26
+        },
+        {
+          "localized_name": "model",
+          "name": "model",
+          "type": "STRING",
+          "widget": {
+            "name": "model"
+          },
+          "link": 27
+        },
+        {
+          "localized_name": "prompt",
+          "name": "prompt",
+          "type": "STRING",
+          "widget": {
+            "name": "prompt"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "negative_prompt",
+          "name": "negative_prompt",
+          "type": "STRING",
+          "widget": {
+            "name": "negative_prompt"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "width",
+          "name": "width",
+          "type": "INT",
+          "widget": {
+            "name": "width"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "height",
+          "name": "height",
+          "type": "INT",
+          "widget": {
+            "name": "height"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "fps",
+          "name": "fps",
+          "type": "INT",
+          "widget": {
+            "name": "fps"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "duration",
+          "name": "duration",
+          "type": "FLOAT",
+          "widget": {
+            "name": "duration"
+          },
+          "link": 28
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "video",
+          "name": "video",
+          "type": "VIDEO",
+          "links": [
+            33
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VLLMOmniGenerateVideo"
+      },
+      "widgets_values": [
+        "http://localhost:8000/v1",
+        "MiniMaxAI/MiniMax-H3",
+        "Wide shot: the singer from <Picture 1> dances across the rooftop as the chorus builds. Coloured lights pulse in time with the music while the camera circles around them.",
+        "",
+        1344,
+        768,
+        24,
+        5.167
+      ],
+      "title": "Shot 3 - Generate Video"
+    },
+    {
+      "id": 50,
+      "type": "TrimAudioDuration",
+      "pos": [
+        1840,
+        120
+      ],
+      "size": [
+        330,
+        130
+      ],
+      "flags": {},
+      "order": 11,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "audio",
+          "name": "audio",
+          "type": "AUDIO",
+          "link": 34
+        },
+        {
+          "localized_name": "start_index",
+          "name": "start_index",
+          "type": "FLOAT",
+          "widget": {
+            "name": "start_index"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "duration",
+          "name": "duration",
+          "type": "FLOAT",
+          "widget": {
+            "name": "duration"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "AUDIO",
+          "name": "AUDIO",
+          "type": "AUDIO",
+          "links": [
+            35
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "TrimAudioDuration"
+      },
+      "widgets_values": [
+        0.0,
+        15.5
+      ],
+      "title": "Full soundtrack (track start, shots x 5.1667 s)"
+    },
+    {
+      "id": 51,
+      "type": "ConcatenateVideo",
+      "pos": [
+        1840,
+        300
+      ],
+      "size": [
+        330,
+        210
+      ],
+      "flags": {},
+      "order": 18,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "video0",
+          "name": "videos.video0",
+          "type": "VIDEO",
+          "link": 31
+        },
+        {
+          "localized_name": "video1",
+          "name": "videos.video1",
+          "type": "VIDEO",
+          "shape": 7,
+          "link": 32
+        },
+        {
+          "localized_name": "video2",
+          "name": "videos.video2",
+          "type": "VIDEO",
+          "shape": 7,
+          "link": 33
+        },
+        {
+          "localized_name": "video3",
+          "name": "videos.video3",
+          "type": "VIDEO",
+          "shape": 7,
+          "link": null
+        },
+        {
+          "localized_name": "codec",
+          "name": "codec",
+          "type": "COMBO",
+          "widget": {
+            "name": "codec"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "complete_audio",
+          "name": "complete_audio",
+          "shape": 7,
+          "type": "AUDIO",
+          "link": 35
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "VIDEO",
+          "name": "VIDEO",
+          "type": "VIDEO",
+          "links": [
+            36
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "ConcatenateVideo"
+      },
+      "widgets_values": [
+        "auto"
+      ],
+      "title": "Concatenate shots + replace audio"
+    },
+    {
+      "id": 52,
+      "type": "SaveVideo",
+      "pos": [
+        2210,
+        120
+      ],
+      "size": [
+        380,
+        420
+      ],
+      "flags": {},
+      "order": 19,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "video",
+          "name": "video",
+          "type": "VIDEO",
+          "link": 36
+        },
+        {
+          "localized_name": "filename_prefix",
+          "name": "filename_prefix",
+          "type": "STRING",
+          "widget": {
+            "name": "filename_prefix"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "format",
+          "name": "format",
+          "type": "COMBO",
+          "widget": {
+            "name": "format"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "codec",
+          "name": "codec",
+          "type": "COMFY_DYNAMICCOMBO_V3",
+          "widget": {
+            "name": "codec"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "video",
+          "name": "video",
+          "type": "VIDEO",
+          "links": null
+        }
+      ],
+      "properties": {},
+      "widgets_values": [
+        "video/MiniMax-H3-MV",
+        "mp4",
+        "h264"
+      ],
+      "title": "Save music video"
+    },
+    {
+      "id": 53,
+      "type": "MarkdownNote",
+      "pos": [
+        1840,
+        600
+      ],
+      "size": [
+        750,
+        1320
+      ],
+      "flags": {},
+      "order": 7,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "properties": {},
+      "widgets_values": [
+        "## MiniMax-H3 music video (H3-03, supplied audio)\nTurns a supplied music track into a 3-shot music video. Each shot is a Ref2VA request that uses the shared character/style image and its own slice of the track as driving audio (`audio_mode=lock_source`), so the visuals follow that part of the music. Concatenate Video joins the shots and replaces their audio with the original track.\n\n**Server:** a Ref2VA-capable H3 service (combined, or `--task-type ref2va`). Requires ComfyUI v0.36.0+ for Concatenate Video.\n\n**Inputs:** select your track in *Supplied music track* (WAV/MP3) and your subject in *Character / style reference*. Write one prompt per shot; name the subject `<Picture 1>`.\n\n**Synchronization:** every shot is 124 frames = 124/24 s. Shot *i* (from 0) starts at `track start + i x 5.1667` s, so the slice starts are 0, 5.17 and 10.33 s and the final soundtrack is 3 x 5.1667 = 15.5 s. Keep these in step if you change the shot length, the shot count, or the track start.\n\n**Audio:** *replace* (default) puts the original recording on the final MP4. Disconnect `complete_audio` to keep each shot's returned audio instead: H3's reconstruction of the same slice, which can differ slightly at shot boundaries. `lock_source` keeps the driving audio fixed, so H3 does not add new sound on top of it.\n\n**More shots:** duplicate a shot group, move its slice start by 5.1667 s, connect it to the next free Concatenate Video input, and lengthen the full-track trim.\n\nSee `docs/h3-03-music-video.md`."
+      ],
+      "title": "How to use this graph"
+    }
+  ],
+  "links": [
+    [
+      1,
+      7,
+      0,
+      10,
+      0,
+      "AUDIO"
+    ],
+    [
+      2,
+      3,
+      0,
+      10,
+      2,
+      "FLOAT"
+    ],
+    [
+      3,
+      6,
+      0,
+      11,
+      0,
+      "IMAGE"
+    ],
+    [
+      4,
+      10,
+      0,
+      11,
+      2,
+      "AUDIO"
+    ],
+    [
+      5,
+      11,
+      0,
+      12,
+      3,
+      "VIDEO_REFERENCES"
+    ],
+    [
+      6,
+      1,
+      0,
+      12,
+      9,
+      "STRING"
+    ],
+    [
+      7,
+      2,
+      0,
+      12,
+      10,
+      "STRING"
+    ],
+    [
+      8,
+      3,
+      0,
+      12,
+      16,
+      "FLOAT"
+    ],
+    [
+      9,
+      4,
+      0,
+      12,
+      4,
+      "SAMPLING_PARAMS"
+    ],
+    [
+      10,
+      5,
+      0,
+      12,
+      6,
+      "VIDEO_PARAMS"
+    ],
+    [
+      11,
+      7,
+      0,
+      20,
+      0,
+      "AUDIO"
+    ],
+    [
+      12,
+      3,
+      0,
+      20,
+      2,
+      "FLOAT"
+    ],
+    [
+      13,
+      6,
+      0,
+      21,
+      0,
+      "IMAGE"
+    ],
+    [
+      14,
+      20,
+      0,
+      21,
+      2,
+      "AUDIO"
+    ],
+    [
+      15,
+      21,
+      0,
+      22,
+      3,
+      "VIDEO_REFERENCES"
+    ],
+    [
+      16,
+      1,
+      0,
+      22,
+      9,
+      "STRING"
+    ],
+    [
+      17,
+      2,
+      0,
+      22,
+      10,
+      "STRING"
+    ],
+    [
+      18,
+      3,
+      0,
+      22,
+      16,
+      "FLOAT"
+    ],
+    [
+      19,
+      4,
+      0,
+      22,
+      4,
+      "SAMPLING_PARAMS"
+    ],
+    [
+      20,
+      5,
+      0,
+      22,
+      6,
+      "VIDEO_PARAMS"
+    ],
+    [
+      21,
+      7,
+      0,
+      30,
+      0,
+      "AUDIO"
+    ],
+    [
+      22,
+      3,
+      0,
+      30,
+      2,
+      "FLOAT"
+    ],
+    [
+      23,
+      6,
+      0,
+      31,
+      0,
+      "IMAGE"
+    ],
+    [
+      24,
+      30,
+      0,
+      31,
+      2,
+      "AUDIO"
+    ],
+    [
+      25,
+      31,
+      0,
+      32,
+      3,
+      "VIDEO_REFERENCES"
+    ],
+    [
+      26,
+      1,
+      0,
+      32,
+      9,
+      "STRING"
+    ],
+    [
+      27,
+      2,
+      0,
+      32,
+      10,
+      "STRING"
+    ],
+    [
+      28,
+      3,
+      0,
+      32,
+      16,
+      "FLOAT"
+    ],
+    [
+      29,
+      4,
+      0,
+      32,
+      4,
+      "SAMPLING_PARAMS"
+    ],
+    [
+      30,
+      5,
+      0,
+      32,
+      6,
+      "VIDEO_PARAMS"
+    ],
+    [
+      31,
+      12,
+      0,
+      51,
+      0,
+      "VIDEO"
+    ],
+    [
+      32,
+      22,
+      0,
+      51,
+      1,
+      "VIDEO"
+    ],
+    [
+      33,
+      32,
+      0,
+      51,
+      2,
+      "VIDEO"
+    ],
+    [
+      34,
+      7,
+      0,
+      50,
+      0,
+      "AUDIO"
+    ],
+    [
+      35,
+      50,
+      0,
+      51,
+      5,
+      "AUDIO"
+    ],
+    [
+      36,
+      51,
+      0,
+      52,
+      0,
+      "VIDEO"
+    ]
+  ],
+  "groups": [
+    {
+      "id": 1,
+      "title": "Shared settings and inputs",
+      "bounding": [
+        20,
+        40,
+        560,
+        1520
+      ],
+      "color": "#3f789e",
+      "font_size": 24,
+      "flags": {}
+    },
+    {
+      "id": 2,
+      "title": "Shot 1: Ref2VA driven by its music slice",
+      "bounding": [
+        600,
+        40,
+        1180,
+        600
+      ],
+      "color": "#a1309b",
+      "font_size": 24,
+      "flags": {}
+    },
+    {
+      "id": 3,
+      "title": "Shot 2: Ref2VA driven by its music slice",
+      "bounding": [
+        600,
+        680,
+        1180,
+        600
+      ],
+      "color": "#a1309b",
+      "font_size": 24,
+      "flags": {}
+    },
+    {
+      "id": 4,
+      "title": "Shot 3: Ref2VA driven by its music slice",
+      "bounding": [
+        600,
+        1320,
+        1180,
+        600
+      ],
+      "color": "#a1309b",
+      "font_size": 24,
+      "flags": {}
+    },
+    {
+      "id": 5,
+      "title": "Assembly: concatenate and attach soundtrack",
+      "bounding": [
+        1820,
+        40,
+        790,
+        1900
+      ],
+      "color": "#8A8",
+      "font_size": 24,
+      "flags": {}
+    }
+  ],
+  "config": {},
+  "extra": {
+    "workflowRendererVersion": "LG",
+    "ds": {
+      "scale": 0.55,
+      "offset": [
+        60,
+        40
+      ]
+    }
+  },
+  "version": 0.4
+}
