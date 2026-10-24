@@ -25,6 +25,10 @@ class OmniWorkerMixin:
 
             install_mooncake_cfg_fanout(get_kv_transfer_group())
 
+    def release_request_resources(self, request_ids: list[str]) -> None:
+        """Release native transport through the worker that owns it."""
+        getattr(self, "model_runner")._omni_data_plane.release_request_resources(request_ids)
+
 
 def maybe_unpad_input_ids(model, input_ids, num_tokens_unpadded):
     """Trim cudagraph-bucket padding for models that split a flat ``input_ids``

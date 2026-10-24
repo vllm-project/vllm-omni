@@ -350,6 +350,27 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
                 terminal_req_ids=active_req_ids,
             )
 
+    def release_request_resources(self, request_ids: list[str]) -> None:
+        """Reclaim unconsumed publications once all stages have finished."""
+        cleanup_prefix = getattr(self._omni_connector, "cleanup_prefix", None)
+        if cleanup_prefix is None:
+            return
+        external_ids = set(request_ids)
+        with self._native_output_lock:
+            internal_ids = {
+                req_id for req_id, state in self._native_requests.items() if state.external_req_id in external_ids
+            }
+            with self._lock:
+                internal_ids.update(
+                    req_id for req_id, external_id in self._request_ids_mapping.items() if external_id in external_ids
+                )
+            # Stop pending output before retiring its prefix; queued late batches
+            # no longer have request state and cannot publish another terminal.
+            self.abort_requests(internal_ids)
+        # Native destruction must not hold the output lock of other requests.
+        for request_id in external_ids:
+            cleanup_prefix(f"{request_id}_{self._stage_id}_")
+
     def complete_outputs(
         self,
         *,
