@@ -341,6 +341,38 @@ vllm_omni/
   the token belongs to the attachment registry, the lease generation is the
   engine-side compare-and-swap.
 
+### Authoritative history snapshots
+
+`DuplexEngineSession.history_snapshot()` synchronously captures a
+`DuplexHistorySnapshot` on the session owner's loop, without an `await`.
+Its aligned tuple columns are `messages`, public `item_ids` (possibly `None`),
+internal `source_ids`, and `source_revisions`, together with one
+`history_revision`. Unresolved history placeholders are omitted from every
+column. The record is frozen; nested protocol dictionaries and lists are
+detached, mutable copies for plugin compatibility. Text, bytes and opaque
+media payloads are shared, rather than cloned. Consumers must treat opaque
+payloads as read-only. Session mutation methods own authoritative writes.
+
+A source ID is allocated monotonically when a message becomes visible and
+is never reused within that session. Replacing a public item's contents
+preserves its source ID. Deleting it retires the source; recreating the same
+public item ID allocates a new source ID. A late item-ID binding preserves
+the source ID and advances its revision. New sources start at revision zero.
+
+Content edits, accepted changes to heard-prefix evidence, and tighter
+permanent audio cutoffs advance the affected source revision and the global
+history revision. A cutoff change can advance revisions even when the text
+stays equal. Appending or deleting a source advances the global revision.
+Equal-value replacements, rejected operations, hidden reservations, and
+internal playback/cache cleanup alone do not. Revisions are monotonic change
+tokens, not operation counts; one operation can perform multiple writes.
+
+Epoch changes fence in-flight work independently of source validity.
+Re-leasing the same live session on resume preserves IDs and revisions;
+dropping the session drops this state. Snapshots do not imply persistence
+across process restarts. Existing prompt construction remains unchanged;
+memory or stage-view consumers can adopt the snapshot in their own changes.
+
 ## Session lifecycle
 
 ```text
