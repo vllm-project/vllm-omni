@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unified OmniConnector and KV cache transfer management."""
 
 import enum
@@ -1938,6 +1938,8 @@ class OmniKVTransferManager:
         self, req: Any, target_device: torch.device | None = None, *, received: bool = False
     ) -> dict[str, Any] | None:
         """Distribute KV LEADER→FOLLOWER. No-op for LOCAL/pure TP."""
+        if not self.config.need_recv_cache:
+            return None
         pt = self.topo_config
 
         # LOCAL: no distribution.
