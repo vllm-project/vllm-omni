@@ -1321,6 +1321,7 @@ class MiniMaxH3FinalLayer(nn.Module):
         t_emb: torch.Tensor,
         inverse_indices: torch.Tensor,
         pdd_step: int | None = None,
+        pdd_adapter_id: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """x: [T, H] -> (video_logits [T, 96] fp32, audio_logits [T, 32] fp32).
 
@@ -1334,6 +1335,10 @@ class MiniMaxH3FinalLayer(nn.Module):
         h = h.to(_FP32_DTYPE)
         if self.pdd_steps is not None:
             return self.video_out(h, pdd_step), self.audio_out(h, pdd_step)
+        if pdd_adapter_id is not None:
+            video, _ = self.video_out(h, pdd_step, pdd_adapter_id)
+            audio, _ = self.audio_out(h, pdd_step, pdd_adapter_id)
+            return video, audio
         video, _ = self.video_out(h)
         audio, _ = self.audio_out(h)
         return video, audio
@@ -1992,7 +1997,9 @@ class MiniMaxH3DiTModel(nn.Module):
             device=device,
         )
 
-    def forward(self, *, pdd_step: int | None = None, **kwargs: Any) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self, *, pdd_step: int | None = None, pdd_adapter_id: int | None = None, **kwargs: Any
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Packed inference forward.
 
         Keyword names follow the checkpoint's serving contract.
@@ -2223,6 +2230,7 @@ class MiniMaxH3DiTModel(nn.Module):
                 t_emb=t_emb,
                 inverse_indices=final_inverse_indices,
                 pdd_step=pdd_step,
+                pdd_adapter_id=pdd_adapter_id,
             )
             if active_positions is not None:
                 compact_video = video_logits
@@ -2240,6 +2248,7 @@ class MiniMaxH3DiTModel(nn.Module):
                 t_emb=t_emb,
                 inverse_indices=local_inverse_indices,
                 pdd_step=pdd_step,
+                pdd_adapter_id=pdd_adapter_id,
             )
             compact_logits = torch.cat((video_logits, audio_logits), dim=-1)
             compact_logits = self.sp_gather(compact_logits)
@@ -2261,6 +2270,7 @@ class MiniMaxH3DiTModel(nn.Module):
                 t_emb=t_emb,
                 inverse_indices=local_inverse_indices,
                 pdd_step=pdd_step,
+                pdd_adapter_id=pdd_adapter_id,
             )
             compact_logits = torch.cat((video_logits, audio_logits), dim=-1)
             compact_logits = self.sp_gather(compact_logits)

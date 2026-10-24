@@ -235,6 +235,10 @@ class DiffusionLoRAManager:
             replace_submodule(self.pipeline, name, layer.base_layer)
         self._merged_adapters.clear()
         self._lora_modules.clear()
+        remove_model_adapter = getattr(self.pipeline, "_remove_diffusion_lora_adapter", None)
+        if callable(remove_model_adapter):
+            for adapter_id in self._registered_adapters:
+                remove_model_adapter(adapter_id)
         self._registered_adapters.clear()
         self._adapter_scales.clear()
         self._adapter_access_order.clear()
@@ -1237,6 +1241,11 @@ class DiffusionLoRAManager:
         bank = self._merged_adapters.pop(adapter_id, None)
         if bank is not None:
             bank.close()
+
+        # Model-specific loaders may own tensors outside the generic cache.
+        remove_model_adapter = getattr(self.pipeline, "_remove_diffusion_lora_adapter", None)
+        if callable(remove_model_adapter):
+            remove_model_adapter(adapter_id)
 
         del self._registered_adapters[adapter_id]
         self._adapter_scales.pop(adapter_id, None)
