@@ -19,12 +19,17 @@ def test_configuration_matches_reference_hydra_composition(tmp_path):
         config = compose(config_name="config", overrides=["+experiment=inference"])
     config.dit_weight = str(tmp_path / "DiT/distilled/diffusion_pytorch_model_ema_0_995.safetensors")
     config.model.vae.checkpoint = str(tmp_path / "VAE/PixelUMM_FT/diffusion_pytorch_model.safetensors")
+    config.model.vae.parallel_mode = "none"
     config.model.text_encoder.model_name = "Qwen/Qwen2.5-VL-7B-Instruct"
     config.model.dit.seg_ar_attention_backend = "flex"
     config.parallelism.sp_size = 1
+    config.parallelism.shard_text_encoder = False
     config.inference.save_latents = False
     config.inference.save_prompt_txt = False
     config.inference.video_size = [704, 1280]
     expected = reference._flatten_cfg(config)
     actual = build_reference_config(tmp_path, "Qwen/Qwen2.5-VL-7B-Instruct")
+    assert actual.vae.parallel_mode == "none"
+    assert actual.parallelism.sp_size == 1
+    assert actual.parallelism.shard_text_encoder is False
     assert OmegaConf.to_container(actual, resolve=True) == OmegaConf.to_container(expected, resolve=True)

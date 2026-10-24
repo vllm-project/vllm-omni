@@ -11,6 +11,7 @@ from torch import nn
 
 from vllm_omni.diffusion.media import VideoValueRange
 from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
+from vllm_omni.diffusion.models.hy_nomas import pipeline_hy_nomas
 from vllm_omni.diffusion.models.hy_nomas.pipeline_hy_nomas import HyNomasPipeline, validate_config
 from vllm_omni.diffusion.models.hy_nomas.request import normalize_request
 from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -42,6 +43,13 @@ def test_public_defaults():
     assert (defaults.height, defaults.width, defaults.num_frames) == (704, 1280, 121)
     assert (defaults.num_inference_steps, defaults.guidance_scale, defaults.fps) == (8, 1.0, 24.0)
     assert "segment_frame_boundaries" in get_extra_body_params("HyNomasPipeline")
+
+
+@pytest.mark.parametrize("as_list", [False, True])
+def test_generator_seed_from_shared_video_example(as_list):
+    generator = torch.Generator().manual_seed(123)
+    params = OmniDiffusionSamplingParams(num_frames=9, generator=[generator] if as_list else generator)
+    assert normalize_request("A forest", params).seed == 123
 
 
 def test_segment_and_camera_request():
@@ -162,6 +170,36 @@ def test_output_shape_is_checked(pipeline):
         pipeline(make_batch())
 
 
+@pytest.mark.parametrize("components", [None, frozenset({"dit"}), frozenset({"text_encoder"})])
+def test_module_offload_selects_components_and_removes_hooks(monkeypatch, components):
+    pipeline = HyNomasPipeline.__new__(HyNomasPipeline)
+    nn.Module.__init__(pipeline)
+    pipeline.pipe = nn.Module()
+    pipeline.pipe.transformer = nn.Linear(2, 2)
+    pipeline.pipe.text_encoder = nn.Linear(2, 2)
+    pipeline.pipe.vae = nn.Linear(2, 2)
+    pipeline.pipe.omni_cpu_offload = False
+    enable = Mock()
+    disable = Mock()
+    monkeypatch.setattr(pipeline_hy_nomas, "apply_sequential_offload", enable)
+    monkeypatch.setattr(pipeline_hy_nomas, "remove_sequential_offload", disable)
+    pipeline.enable_omni_model_cpu_offload(device=torch.device("cuda:0"), offload_components=components)
+    selected = enable.call_args.kwargs
+    assert selected["offload_dit_modules"] == (
+        [pipeline.pipe.transformer] if components is None or "dit" in components else []
+    )
+    expected_stages = (
+        [pipeline.pipe.text_encoder, pipeline.pipe.vae]
+        if components is None
+        else ([pipeline.pipe.text_encoder] if "text_encoder" in components else [])
+    )
+    assert selected["offload_encoder_modules"] == expected_stages
+    assert pipeline.pipe.omni_cpu_offload
+    pipeline.disable_omni_model_cpu_offload()
+    disable.assert_called_once_with([pipeline.pipe.transformer, pipeline.pipe.text_encoder, pipeline.pipe.vae])
+    assert not pipeline.pipe.omni_cpu_offload
+
+
 @pytest.mark.parametrize(
     "overrides,match",
     [
@@ -171,6 +209,7 @@ def test_output_shape_is_checked(pipeline):
         ({"quantization_config": "int8"}, "unquantized"),
         ({"lora_path": "adapter"}, "LoRA"),
         ({"custom_pipeline_args": {"arbitrary": True}}, "text_encoder"),
+        ({"enable_layerwise_offload": True}, "layer offload"),
     ],
 )
 def test_unsupported_engine_features(overrides, match):

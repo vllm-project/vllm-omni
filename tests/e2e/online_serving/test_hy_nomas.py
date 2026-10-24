@@ -6,7 +6,7 @@ import os
 import pytest
 
 from tests.helpers.mark import hardware_marks
-from tests.helpers.runtime import OmniServerParams, OnlineOmniClient
+from tests.helpers.runtime import OmniServer, OmniServerParams, OnlineOmniClient
 
 pytestmark = [pytest.mark.local_model, pytest.mark.diffusion, *hardware_marks(res={"cuda": "H200"}, num_cards=1)]
 
@@ -14,10 +14,10 @@ MODEL = os.environ.get("HY_NOMAS_MODEL", "tencent/Hy-Nomas")
 
 
 @pytest.mark.parametrize("omni_server", [OmniServerParams(model=MODEL, server_args=["--enforce-eager"])], indirect=True)
-def test_video_job(openai_client: OnlineOmniClient):
-    openai_client.send_video_diffusion_request(
+def test_video_job(omni_server: OmniServer, online_client: OnlineOmniClient):
+    online_client.send_video_diffusion_request(
         {
-            "model": MODEL,
+            "model": omni_server.model,
             "form_data": {
                 "prompt": "A forest beside a river.",
                 "size": "256x256",

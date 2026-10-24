@@ -3,6 +3,8 @@
 
 from dataclasses import dataclass
 
+import torch
+
 from vllm_omni.diffusion.request import resolve_video_num_frames
 from vllm_omni.errors import OmniClientError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType
@@ -90,7 +92,14 @@ def normalize_request(prompt: OmniPromptType, params: OmniDiffusionSamplingParam
         raise OmniClientError(
             "segment_has_camera requires one boolean per segment and a trajectory for camera segments."
         )
-    seed = 42 if params.seed is None else params.seed
+    generator = params.generator
+    if isinstance(generator, list):
+        if len(generator) != 1:
+            raise OmniClientError("Hy-Nomas accepts one generator per request.")
+        generator = generator[0]
+    if generator is not None and not isinstance(generator, torch.Generator):
+        raise OmniClientError("Hy-Nomas generator must be a torch.Generator.")
+    seed = generator.initial_seed() if generator is not None else (42 if params.seed is None else params.seed)
     if type(seed) is not int or not 0 <= seed < 2**63:
         raise OmniClientError("Hy-Nomas seed must be an integer in [0, 2**63).")
     negative = "" if isinstance(prompt, str) else prompt.get("negative_prompt", "")

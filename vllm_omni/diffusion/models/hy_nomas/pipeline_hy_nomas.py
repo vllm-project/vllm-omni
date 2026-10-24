@@ -21,7 +21,13 @@ from vllm_omni.diffusion.media import (
 )
 from vllm_omni.diffusion.models.hy_nomas.request import normalize_request
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
-from vllm_omni.diffusion.offloader.config import offload_enabled
+from vllm_omni.diffusion.offloader.config import (
+    DIT_COMPONENT,
+    TEXT_ENCODER_COMPONENT,
+    OffloadStrategy,
+    resolve_offload_strategy,
+)
+from vllm_omni.diffusion.offloader.sequential_backend import apply_sequential_offload, remove_sequential_offload
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 from vllm_omni.model_extras.hy_nomas import HY_NOMAS_DECODER_FILE, HY_NOMAS_DIT_FILE
@@ -40,9 +46,11 @@ def build_reference_config(model_root: Path, text_encoder: str) -> DictConfig:
     config = OmegaConf.merge(base, inference)
     config.dit_weight = str(model_root / HY_NOMAS_DIT_FILE)
     config.model.vae.checkpoint = str(model_root / HY_NOMAS_DECODER_FILE)
+    config.model.vae.parallel_mode = "none"
     config.model.text_encoder.model_name = text_encoder
     config.model.dit.seg_ar_attention_backend = "flex"
     config.parallelism.sp_size = 1
+    config.parallelism.shard_text_encoder = False
     config.inference.save_latents = False
     config.inference.save_prompt_txt = False
     config.inference.video_size = [704, 1280]
@@ -60,8 +68,8 @@ def validate_config(config: OmniDiffusionConfig) -> None:
         raise ValueError("Hy-Nomas does not support a diffusion cache backend.")
     if config.quantization_config is not None or config.lora_path:
         raise ValueError("Hy-Nomas currently supports the unquantized distilled checkpoint without LoRA.")
-    if offload_enabled(config):
-        raise ValueError("Hy-Nomas CPU offload is not supported by this integration.")
+    if resolve_offload_strategy(config) not in (OffloadStrategy.NONE, OffloadStrategy.MODEL_LEVEL):
+        raise ValueError("Hy-Nomas supports module CPU offload; layer offload is not supported.")
     custom = config.custom_pipeline_args or {}
     if custom.keys() - {"text_encoder"}:
         raise ValueError("Hy-Nomas custom_pipeline_args only supports text_encoder.")
@@ -81,7 +89,7 @@ class HyNomasPipeline(nn.Module, SupportsComponentDiscovery):
         if self.device.type != "cuda":
             raise ValueError("Hy-Nomas requires CUDA.")
         # 必需依赖直接导入；安装固定参考版本的方法见模型使用文档。
-        from hymm.pipeline.causal_ar import CPTCausalInferencePipeline
+        from vllm_omni.diffusion.models.hy_nomas.runtime import HyNomasRuntime
 
         root = Path(od_config.model)
         required = [HY_NOMAS_DIT_FILE, HY_NOMAS_DECODER_FILE]
@@ -102,7 +110,43 @@ class HyNomasPipeline(nn.Module, SupportsComponentDiscovery):
         if not isinstance(text_encoder, str) or not text_encoder:
             raise ValueError("Hy-Nomas text_encoder must be a nonempty model ID or local path.")
         config = build_reference_config(root, text_encoder)
-        self.pipe = CPTCausalInferencePipeline(args=config, device=self.device, dit_model_path=config.dit_weight).eval()
+        self.pipe = HyNomasRuntime(args=config, device=self.device, dit_model_path=config.dit_weight).eval()
+
+    def enable_omni_model_cpu_offload(
+        self,
+        *,
+        device: torch.device,
+        pin_memory: bool = True,
+        use_hsdp: bool = False,
+        offload_components: frozenset[str] | None = None,
+    ) -> None:
+        if use_hsdp:
+            raise ValueError("Hy-Nomas does not support HSDP.")
+        if self.pipe.omni_cpu_offload:
+            return
+        dit = self.pipe.transformer
+        stages = [self.pipe.text_encoder, self.pipe.vae]
+        selected_dits = [dit] if offload_components is None or DIT_COMPONENT in offload_components else []
+        selected_stages = (
+            stages
+            if offload_components is None
+            else ([self.pipe.text_encoder] if TEXT_ENCODER_COMPONENT in offload_components else [])
+        )
+        apply_sequential_offload(
+            dit_modules=[dit],
+            encoder_modules=stages,
+            device=device,
+            pin_memory=pin_memory,
+            offload_initial_dits=bool(selected_dits),
+            offload_dit_modules=selected_dits,
+            offload_encoder_modules=selected_stages,
+        )
+        self.pipe.omni_cpu_offload = True
+
+    def disable_omni_model_cpu_offload(self) -> None:
+        if self.pipe.omni_cpu_offload:
+            remove_sequential_offload([self.pipe.transformer, self.pipe.text_encoder, self.pipe.vae])
+            self.pipe.omni_cpu_offload = False
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         # 参考实现已在构造时加载三个组件，禁止标准 loader 再传入另一组权重。
