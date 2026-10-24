@@ -66,6 +66,12 @@ Accuracy benchmarks for image generation/editing models, adapting external suite
 - **Layout**: `accuracy/text_to_image/` (GEBench), `accuracy/image_to_image/` (GEdit-Bench)
 - **Method**: generation and judge scoring both run through local `vllm-omni serve` endpoints
 
+### [SocialOmni](socialomni/README.md) — Audio-Visual Social Interaction
+
+Speaker attribution, turn-entry decisions, and response quality through the
+chat completions endpoint. Level 2 uses video prefixes and a fixed three-judge
+panel, with separate decision, generation, and scoring phases.
+
 ### [MammothModa2](mammoth_moda2/README.md) — Startup and Weight Loading
 
 Startup / model-loading benchmark for the two-stage MammothModa2 (AR → DiT) deployment, plus a raw safetensors loading micro-benchmark.
