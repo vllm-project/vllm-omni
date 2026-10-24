@@ -86,6 +86,20 @@ _fa4_dense_attention_op = torch.ops.vllm_omni.fa4_dense_attention
 _PACKED_KEYS = ("cu_seqlens_q", "cu_seqlens_k", "max_seqlen_q", "max_seqlen_k")
 
 
+class _Qwen21DecodeVarlen(NamedTuple):
+    """Read-only metadata shared by layers within one forward and CFG branch.
+
+    K/V values remain layer-owned; only mask indices and sequence lengths are
+    shared. The producer must rebuild these fields if mask contents change.
+    """
+
+    indices_k: torch.Tensor
+    cu_seqlens_k: torch.Tensor
+    max_seqlen_k: int
+    cu_seqlens_q: torch.Tensor
+    max_seqlen_q: int
+
+
 class _FlashAttentionMetadataPlan(NamedTuple):
     attention_mask: torch.Tensor | None
     mask_mode: MaskMode
@@ -465,6 +479,7 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         key: torch.Tensor,
         value: torch.Tensor,
         attention_mask: torch.Tensor,
+        qwen21_decode_varlen: _Qwen21DecodeVarlen | None = None,
     ) -> torch.Tensor:
         from vllm_omni.diffusion.attention.backends.utils.fa import (
             _index_first_axis,
@@ -485,12 +500,24 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
             )
         else:
             # Cross-attention: the mask covers keys only, so keep every query row.
-            k, indices_k, cu_seq_lens_k, max_length_k, _ = _unpad_input(key, attention_mask)
+            # The producer supplies metadata from this forward's mask. These
+            # geometry checks cannot detect stale metadata for a same-shaped mask.
+            if (
+                qwen21_decode_varlen is not None
+                and query_length != key.size(1)
+                and qwen21_decode_varlen.max_seqlen_q == query_length
+                and attention_mask.shape == key.shape[:2]
+                and qwen21_decode_varlen.cu_seqlens_q.numel() == batch_size + 1
+            ):
+                indices_k, cu_seq_lens_k, max_length_k, cu_seq_lens_q, _ = qwen21_decode_varlen
+                k = _index_first_axis(key, indices_k)
+            else:
+                k, indices_k, cu_seq_lens_k, max_length_k, _ = _unpad_input(key, attention_mask)
+                cu_seq_lens_q = torch.arange(
+                    0, (batch_size + 1) * query_length, query_length, dtype=torch.int32, device=query.device
+                )
             v = _index_first_axis(value, indices_k)
             q = query.flatten(0, 1)
-            cu_seq_lens_q = torch.arange(
-                0, (batch_size + 1) * query_length, query_length, dtype=torch.int32, device=query.device
-            )
             max_length_q = query_length
             indices_q = None
 
@@ -512,6 +539,39 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         if indices_q is None:
             return out_unpad.reshape(batch_size, query_length, *out_unpad.shape[1:])
         return _pad_input(out_unpad, indices_q, batch_size, query_length)
+
+    def _forward_4d_masked_sdpa(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run a dense 4D visibility mask with PyTorch SDPA.
+
+        FlashAttention's varlen path only accepts a 2D key-padding mask, but
+        models like Qwen-Image-2.1 build dense 4D block-causal masks
+        ``(batch, 1, seq_q, seq_k)`` for padded batches. SDPA consumes those
+        masks natively, so we delegate here to keep semantics exact.
+        """
+        import torch.nn.functional as F
+
+        # query/key/value are (batch, seq, heads, head_dim); SDPA wants (batch, heads, seq, dim).
+        q = query.transpose(1, 2)
+        k = key.transpose(1, 2)
+        v = value.transpose(1, 2)
+
+        # Qwen's boolean mask already includes block-causal visibility and
+        # padding (True means visible). A triangular is_causal mask would
+        # incorrectly restrict its bidirectional image-token blocks.
+        out = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=attention_mask,
+            scale=self.softmax_scale,
+        )
+        return out.transpose(1, 2).contiguous()
 
     def _forward_varlen_packed(
         self,
@@ -788,11 +848,18 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
             )
         if use_masked_path:
             self._warn_fa_deterministic_non_dense("masked-varlen")
+            if attention_mask.ndim != 2:
+                # Varlen unpadding removes invalid tokens; it cannot express
+                # visibility that differs per query row. Pass Qwen's complete
+                # block-causal mask directly to PyTorch SDPA.
+                self._warn_fa_deterministic_non_dense("masked-sdpa-fallback")
+                return self._forward_4d_masked_sdpa(query, key, value, attention_mask)
             return self._forward_varlen_masked(
                 query,
                 key,
                 value,
                 attention_mask,
+                qwen21_decode_varlen=extra.get("qwen21_decode_varlen"),
             )
 
         # optional_fa3_fwd_dense_func is consulted only here so masked/packed/

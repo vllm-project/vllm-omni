@@ -122,6 +122,29 @@ missing-kernel errors remain startup failures, not runtime fallbacks.
 Use a new backend for a new provider/capability contract. `custom_attention`
 instead owns communication and requires `skip_sequence_parallel=True`.
 
+### Qwen-Image-2.1 masked attention
+
+Qwen-Image-2.1's padded prefill uses a complete 4D boolean visibility mask.
+The FlashAttention masked route passes that mask to PyTorch SDPA because
+2D varlen unpadding cannot express its block-causal structure. Padded cached
+decode only needs a 2D key-validity mask. On CUDA and ROCm, SP1 forwards
+with a resolved `FLASH_ATTN` backend, the model prepares
+`qwen21_decode_varlen` once per forward and CFG branch and shares it across
+layers. Each layer still gathers its own K/V and invokes the existing varlen
+provider. Metadata is rebuilt from the current mask, never cached by shape.
+The shared metadata does not change the provider's FlashAttention version selection.
+Metadata depends only on the mask and sequence layout; it is independent of
+activation dtype, prefix-cache storage dtype, and whether gradients are enabled.
+Quantized prefix K/V is dequantized before attention, and each layer's gathers
+remain differentiable. Attention dtype and backward support remain the selected
+provider's responsibility.
+Publishing `attention_mask_mode="padding"` also avoids each layer checking
+mask contents to select the masked route.
+Preparation is skipped for SDPA, including platform fallback, and when the
+whole transformer is being compiled. Regional block
+compilation can consume the prepared metadata; padded decode still uses the
+existing eager fallback instead of captured decode graphs.
+
 ## Adding or changing a backend
 
 An implementation change is complete only when it:
