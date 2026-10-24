@@ -452,25 +452,46 @@ class EagerMTPState:
             first_audio.index_copy_(0, last_tokens, scheduled.to(first_audio.dtype))
 
     def _embedding_weight(self) -> torch.Tensor | None:
-        inner = getattr(self.owner.model, "model", None)
-        embed = getattr(inner, "embed_tokens", None)
+        get_embedding = getattr(self.owner.model, "get_eager_mtp_embedding", None)
+        if callable(get_embedding):
+            embed = get_embedding()
+        else:
+            inner = getattr(self.owner.model, "model", None)
+            embed = getattr(inner, "embed_tokens", None)
         weight = getattr(embed, "weight", None)
         method = getattr(embed, "quant_method", None)
         unquantized = method is None or type(method).__name__ == "UnquantizedEmbeddingMethod"
         tp = getattr(embed, "tp_size", 1)
-        if isinstance(weight, torch.Tensor) and weight.ndim == 2 and unquantized and tp == 1:
+        if isinstance(weight, torch.Tensor) and weight.ndim == 2 and weight.is_contiguous() and unquantized and tp == 1:
             return weight
         return None
 
+    def _codebook_size(self) -> int | None:
+        return getattr(
+            self.owner.model, "eager_mtp_codebook_size", getattr(self.owner.model, "_codebook_vocab_size", None)
+        )
+
     def _fast_path_ok(self, codes_out: torch.Tensor, text_hidden: torch.Tensor) -> bool:
         if self._fast_ok is None:
+            codebook_size = self._codebook_size()
             self._fast_ok = (
                 text_hidden.is_cuda
                 and not self.owner.vllm_config.cache_config.enable_prefix_caching
                 and self._embedding_weight() is not None
-                and hasattr(self.owner.model, "_codebook_vocab_size")
+                and isinstance(codebook_size, int)
+                and codebook_size > 0
             )
-        return self._fast_ok and codes_out.ndim == 2 and text_hidden.is_contiguous()
+        weight = self._embedding_weight() if self._fast_ok else None
+        return (
+            self._fast_ok
+            and codes_out.ndim == 2
+            and codes_out.is_contiguous()
+            and text_hidden.ndim == 2
+            and text_hidden.is_contiguous()
+            and weight is not None
+            and weight.device == text_hidden.device
+            and weight.shape[1] == text_hidden.shape[1]
+        )
 
     def _run_eager_mtp_fused(
         self,
@@ -572,7 +593,7 @@ class EagerMTPState:
             meta, bsz, last_tokens, layer0, frame_embeds.reshape(frame_embeds.shape[0], -1).contiguous(),
             self.embeds, codes.contiguous(), codes_out, input_ids, valid_out,
             first_audio if fa_in_kernel else None, self._first_audio_valid if fa_in_kernel else None,
-            owner.model._codebook_vocab_size, codes32=frame_codes,
+            self._codebook_size(), codes32=frame_codes,
             codec_slots=codec_slots, codec_pos=codec_pos, scratch=stream.scratch_slot if stream is not None else 0,
         )  # fmt: skip
         self.ready.update(zip(rows_req_idx, rows_req_id))
