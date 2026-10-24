@@ -2772,6 +2772,10 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             return self.create_error_response(sample_rate_error)
 
         if self._diffusion_mode:
+            if request.word_timestamps:
+                return self._diffusion_error_response(
+                    "word_timestamps is not supported by diffusion speech models.", status_code=400
+                )
             return await self._create_diffusion_speech(request)
 
         error_check_ret = await self._check_model(request)
