@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import time as _time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 
@@ -138,12 +138,20 @@ class StagePool:
         self.clients: list[StagePoolClient | None] = list(normalized_clients)
         self._output_processor = output_processor
         self._stage_vllm_config = stage_vllm_config
+        self.collect_stage_metrics = True
         self._has_chunk_transfer_adapter = bool(
             getattr(getattr(stage_vllm_config, "model_config", None), "async_chunk", False)
         )
+        # Per-replica release batching: ids waiting for the replica's next RPC
+        # and the task sending them (also the strong reference keeping it alive).
+        self._pending_releases: dict[int, dict[str, None]] = {}
+        self._release_flushers: dict[int, asyncio.Task[None]] = {}
         self._next_replica_id = 0
         self._request_bindings: dict[str, int] = {}
         self._unavailable_replicas: set[int] = set()
+        # Invoked whenever the replica set changes, so the event-driven loop can
+        # re-bind its readers without waiting for a tick. Must be thread-safe.
+        self.membership_listener: Callable[[], None] | None = None
         self._replica_metrics: list[_ReplicaMetrics] = [_ReplicaMetrics() for _ in self.clients]
         self._output_timestamps_by_request: dict[str, list[float]] = {}
         self._non_empty_first_output_timestamps_by_request: dict[str, float] = {}
@@ -253,6 +261,11 @@ class StagePool:
                 return addr
         return None
 
+    def _notify_membership_changed(self) -> None:
+        listener = self.membership_listener
+        if listener is not None:
+            listener()
+
     def add_client(self, input_addr: str, client: Any, *, replica_id: int | None = None) -> int:
         """Register a head-side client for ``input_addr``.
 
@@ -288,6 +301,7 @@ class StagePool:
         self.clients[replica_id] = client
         self._addr_to_replica_id[input_addr] = replica_id
         self._unavailable_replicas.discard(replica_id)
+        self._notify_membership_changed()
         return replica_id
 
     def remove_client(self, input_addr: str) -> Any | None:
@@ -300,6 +314,7 @@ class StagePool:
             return None
         client = self.clients[replica_id]
         self.clients[replica_id] = None
+        self._notify_membership_changed()
         return client
 
     def get_client_by_addr(self, input_addr: str) -> Any | None:
@@ -465,6 +480,26 @@ class StagePool:
 
     # ---- Legacy (non-distributed) route binding ----
 
+    def bind_request_to_replica(self, request_id: str, replica_id: int) -> int:
+        """Bind a real request to a required local replica, without selecting a fallback.
+
+        Call before input preprocessing or sender metadata construction, then
+        pass the same pin to submission to recheck availability. Session
+        reservations belong to the duplex placement owner, not this ledger.
+        """
+        if self._hub is not None or self._lb is not None:
+            raise StageUnavailableError("pinned replica routing is only supported for local stage pools")
+        if not self.is_replica_available(replica_id):
+            raise StageUnavailableError(f"stage {self.stage_id} pinned replica {replica_id} is unavailable")
+        bound = self.get_bound_replica_id(request_id)
+        if bound is not None and bound != replica_id:
+            raise StageUnavailableError(
+                f"stage {self.stage_id} request {request_id} is bound to replica {bound}, "
+                f"conflicting with pinned replica {replica_id}"
+            )
+        self._request_bindings[request_id] = replica_id
+        return replica_id
+
     def get_bound_replica_id(self, request_id: str) -> int | None:
         """Return the currently bound replica id for *request_id* if present.
 
@@ -559,6 +594,7 @@ class StagePool:
         """Evict a failed replica from admission and release its bindings."""
         if 0 <= replica_id < self.num_replicas:
             self._unavailable_replicas.add(replica_id)
+            self._notify_membership_changed()
         return self.release_replica_bindings(replica_id)
 
     def is_replica_available(self, replica_id: int) -> bool:
@@ -633,12 +669,7 @@ class StagePool:
         """Build stage metrics for outputs produced on one replica."""
         now = _time.time()
         stage_gen_time_ms = (now - submit_ts) * 1000.0
-
         request_id = str(getattr(request_outputs[0], "request_id", "")) if request_outputs else ""
-        output_timestamps = self._output_timestamps_by_request.pop(request_id, []) if request_id else []
-        non_empty_first_output_ts = (
-            self._non_empty_first_output_timestamps_by_request.pop(request_id, None) if request_id else None
-        )
         native_text_metrics = {}
         if request_id:
             pop_native_text_metrics = getattr(self.output_processor, "pop_native_text_metrics", None)
@@ -658,6 +689,47 @@ class StagePool:
             max(int(native_generation_tokens), 0)
             if isinstance(native_generation_tokens, int) and not isinstance(native_generation_tokens, bool)
             else count_tokens_from_outputs(request_outputs)
+        )
+        num_tokens_in = 0
+        if self.stage_id == 0:
+            for ro in request_outputs:
+                ptids = getattr(ro, "prompt_token_ids", None)
+                if ptids is not None:
+                    num_tokens_in += len(ptids)
+
+        metrics = self._replica_metrics[replica_id]
+        metrics.batch_seq += 1
+        batch_id = metrics.batch_seq
+        metrics.agg_total_tokens += num_tokens_out
+        metrics.agg_total_gen_time_ms += stage_gen_time_ms
+
+        # Preserve required fields and completion/usage without optional diagnostics.
+        stage_metrics = StageRequestMetrics(
+            num_tokens_in=num_tokens_in,
+            num_tokens_out=num_tokens_out,
+            finish_reason=finish_reason,
+            replica_id=replica_id,
+            batch_id=batch_id,
+            # This event summarizes one completed request. Execution batching
+            # happens inside the model runner and is not observable here.
+            batch_size=1,
+            stage_gen_time_ms=stage_gen_time_ms,
+            rx_transfer_bytes=0,
+            rx_decode_time_ms=0.0,
+            rx_in_flight_time_ms=0.0,
+            stage_stats=StageStats(
+                total_token=metrics.agg_total_tokens,
+                total_gen_time_ms=metrics.agg_total_gen_time_ms,
+            ),
+        )
+
+        # Lightweight path which skips optional telemetry
+        if not self.collect_stage_metrics:
+            return stage_metrics
+
+        output_timestamps = self._output_timestamps_by_request.pop(request_id, []) if request_id else []
+        non_empty_first_output_ts = (
+            self._non_empty_first_output_timestamps_by_request.pop(request_id, None) if request_id else None
         )
         output_unit_type = self._infer_output_unit_type(request_outputs, token_count=num_tokens_out)
         output_unit_count = self._count_output_units(
@@ -700,53 +772,28 @@ class StagePool:
         inter_output_latency_ms = (
             sum(inter_output_latencies_ms) / float(len(inter_output_latencies_ms)) if inter_output_latencies_ms else 0.0
         )
-        num_tokens_in = 0
-        if self.stage_id == 0:
-            for ro in request_outputs:
-                ptids = getattr(ro, "prompt_token_ids", None)
-                if ptids is not None:
-                    num_tokens_in += len(ptids)
-
-        metrics = self._replica_metrics[replica_id]
-        metrics.batch_seq += 1
-        batch_id = metrics.batch_seq
-        metrics.agg_total_tokens += num_tokens_out
-        metrics.agg_total_gen_time_ms += stage_gen_time_ms
-
-        return StageRequestMetrics(
-            num_tokens_in=num_tokens_in,
-            num_tokens_out=num_tokens_out,
-            stage_gen_time_ms=stage_gen_time_ms,
-            batch_id=batch_id,
-            # This event summarizes one completed request. Execution batching
-            # happens inside the model runner and is not observable here.
-            batch_size=1,
-            replica_id=replica_id,
-            finish_reason=finish_reason,
-            rx_decode_time_ms=0.0,
-            rx_transfer_bytes=0,
-            rx_in_flight_time_ms=0.0,
-            stage_stats=StageStats(
-                total_token=metrics.agg_total_tokens,
-                total_gen_time_ms=metrics.agg_total_gen_time_ms,
-            ),
-            audio_generated_frames=audio_generated_frames,
-            audio_sample_rate=audio_sample_rate,
-            audio_duration_s=audio_duration_s,
-            image_pixels=image_pixels,
-            num_inference_steps=num_inference_steps,
-            output_unit_type=output_unit_type,
-            output_unit_count=output_unit_count,
-            serving_time_to_first_output_ms=serving_time_to_first_output_ms,
-            image_time_to_first_output_ms=image_time_to_first_output_ms,
-            time_per_output_unit_ms=time_per_output_unit_ms,
-            inter_output_latency_ms=inter_output_latency_ms,
-            inter_output_latencies_ms=inter_output_latencies_ms,
-            vllm_ttft_ms=float(native_text_metrics.get("vllm_ttft_ms") or 0.0),
-            vllm_tpot_ms=float(native_text_metrics.get("vllm_tpot_ms") or 0.0),
-            vllm_itl_ms=float(native_text_metrics.get("vllm_itl_ms") or 0.0),
-            vllm_itls_ms=list(native_text_metrics.get("vllm_itls_ms") or []),
-        )
+        stage_metrics.audio_generated_frames = audio_generated_frames
+        stage_metrics.audio_sample_rate = audio_sample_rate
+        stage_metrics.audio_duration_s = audio_duration_s
+        stage_metrics.image_pixels = image_pixels
+        stage_metrics.num_inference_steps = num_inference_steps
+        stage_metrics.output_unit_type = output_unit_type
+        stage_metrics.output_unit_count = output_unit_count
+        stage_metrics.serving_time_to_first_output_ms = serving_time_to_first_output_ms
+        stage_metrics.image_time_to_first_output_ms = image_time_to_first_output_ms
+        stage_metrics.time_per_output_unit_ms = time_per_output_unit_ms
+        stage_metrics.inter_output_latency_ms = inter_output_latency_ms
+        stage_metrics.inter_output_latencies_ms = inter_output_latencies_ms
+        stage_metrics.vllm_ttft_ms = float(native_text_metrics.get("vllm_ttft_ms") or 0.0)
+        stage_metrics.vllm_tpot_ms = float(native_text_metrics.get("vllm_tpot_ms") or 0.0)
+        stage_metrics.vllm_itl_ms = float(native_text_metrics.get("vllm_itl_ms") or 0.0)
+        stage_metrics.vllm_itls_ms = list(native_text_metrics.get("vllm_itls_ms") or [])
+        # An absent key means the phase was not observed; keep it None, not 0.
+        stage_metrics.vllm_queued_ms = native_text_metrics.get(defs.VLLM_QUEUED_MS)
+        stage_metrics.vllm_prefill_ms = native_text_metrics.get(defs.VLLM_PREFILL_MS)
+        stage_metrics.vllm_decode_ms = native_text_metrics.get(defs.VLLM_DECODE_MS)
+        stage_metrics.vllm_num_preemptions = native_text_metrics.get(defs.VLLM_NUM_PREEMPTIONS)
+        return stage_metrics
 
     def _infer_output_unit_type(self, request_outputs: list[Any], *, token_count: int) -> str:
         final_output_type = getattr(self.stage_client, "final_output_type", None)
@@ -835,7 +882,7 @@ class StagePool:
 
     def _infer_audio_sample_rate(
         self,
-        mm_output: dict[str, Any] | None = None,
+        mm_output: Mapping[str, Any] | None = None,
         *,
         use_default: bool = True,
     ) -> int:
@@ -965,6 +1012,8 @@ class StagePool:
 
     def record_output_timestamps(self, request_outputs: list[Any], *, output_ts: float | None = None) -> None:
         """Record all output timestamps and the first non-empty output timestamp."""
+        if not self.collect_stage_metrics:
+            return
         output_ts = _time.time() if output_ts is None else output_ts
         for request_output in request_outputs:
             request_id = getattr(request_output, "request_id", None)
@@ -993,8 +1042,10 @@ class StagePool:
         *,
         prompt_text: Any = None,
         affinity_request_id: str | None = None,
+        pinned_replica_id: int | None = None,
         submit_kwargs: dict[str, Any] | None = None,
         params_override: Any = None,
+        expected_replica_id: int | None = None,
     ) -> int:
         """Submit a stage-entry request into this pool."""
         params = params_override if params_override is not None else req_state.sampling_params_list[self.stage_id]
@@ -1011,20 +1062,33 @@ class StagePool:
             payload_sender_info = getattr(request, "payload_sender_info", None)
             if payload_sender_info is not None:
                 submit_kwargs.setdefault("payload_sender_info", payload_sender_info)
-            replica_id = await self._pick_or_select(
-                request_id,
-                affinity_request_id=affinity_request_id,
-            )
+            if pinned_replica_id is not None:
+                replica_id = self.bind_request_to_replica(request_id, pinned_replica_id)
+            else:
+                replica_id = await self._pick_or_select(
+                    request_id,
+                    affinity_request_id=affinity_request_id,
+                )
             client = self._diffusion_client(replica_id)
             await client.add_request_async(request_id, request, params, **submit_kwargs)
             return replica_id
 
-        replica_id = await self._pick_or_select(
-            request_id,
-            affinity_request_id=affinity_request_id,
-        )
-        client = self.clients[replica_id]
-        if client is None:
+        if pinned_replica_id is not None:
+            replica_id = self.bind_request_to_replica(request_id, pinned_replica_id)
+        else:
+            replica_id = await self._pick_or_select(
+                request_id,
+                affinity_request_id=affinity_request_id,
+            )
+        # A request whose multimodal cache keys name a replica must not move: that
+        # replica's sender-cache entries may omit media the new one never received.
+        if expected_replica_id is not None and replica_id != expected_replica_id:
+            self.release_binding(request_id)
+            raise StageUnavailableError(
+                f"stage {self.stage_id} replica {expected_replica_id} keyed by {request_id} became "
+                "unavailable before submit"
+            )
+        if self.clients[replica_id] is None:
             raise StageUnavailableError(f"stage {self.stage_id} replica {replica_id} is not attached")
         try:
             self.output_processor.add_request(
@@ -1040,19 +1104,33 @@ class StagePool:
 
         try:
             await self._llm_client(replica_id).add_request_async(request, **submit_kwargs)
-        except Exception:
-            self.release_binding(request_id)
-            rollback = getattr(self.output_processor, "remove_request", None)
-            if callable(rollback):
-                try:
-                    rollback(request_id)
-                except Exception as rollback_error:
-                    logger.warning(
-                        "[StagePool] Failed to rollback output processor state for req=%s stage-%s: %s",
-                        request_id,
-                        self.stage_id,
-                        rollback_error,
-                    )
+        except BaseException:
+            # Sending can fail or be cancelled after the engine accepted the
+            # request. Abort while its replica binding is still available.
+            try:
+                await self.abort_requests([request_id])
+            except (Exception, asyncio.CancelledError) as abort_error:
+                # Keep routing and processor state so owner cleanup can retry.
+                # A second cancellation must not replace the submission error.
+                logger.warning(
+                    "[StagePool] Failed to abort rejected submission for req=%s stage-%s: %r",
+                    request_id,
+                    self.stage_id,
+                    abort_error,
+                )
+            else:
+                self.release_binding(request_id)
+                rollback = getattr(self.output_processor, "remove_request", None)
+                if callable(rollback):
+                    try:
+                        rollback(request_id)
+                    except Exception as rollback_error:
+                        logger.warning(
+                            "[StagePool] Failed to rollback output processor state for req=%s stage-%s: %s",
+                            request_id,
+                            self.stage_id,
+                            rollback_error,
+                        )
             raise
         return replica_id
 
@@ -1063,6 +1141,7 @@ class StagePool:
         request: Any,
         *,
         prompt_text: Any = None,
+        pinned_replica_id: int | None = None,
         submit_kwargs: dict[str, Any] | None = None,
     ) -> int:
         """Submit a streaming update to an already admitted request."""
@@ -1070,9 +1149,14 @@ class StagePool:
         params = req_state.sampling_params_list[self.stage_id]
         if self.stage_type == "diffusion":
             params = OmniDiffusionSamplingParams.from_params(params)
-        replica_id = self.get_bound_replica_id(request_id)
-        if replica_id is None or self.clients[replica_id] is None:
-            replica_id = await self._pick_or_select(request_id)
+        if pinned_replica_id is not None:
+            replica_id = self.bind_request_to_replica(request_id, pinned_replica_id)
+        else:
+            bound_replica_id = self.get_bound_replica_id(request_id)
+            if bound_replica_id is None or self.clients[bound_replica_id] is None:
+                replica_id = await self._pick_or_select(request_id)
+            else:
+                replica_id = bound_replica_id
 
         client = self.clients[replica_id]
         if client is None:
@@ -1144,8 +1228,12 @@ class StagePool:
 
     # ---- Stage-local polling ----
 
-    async def _poll_stage_raw(self, client: StagePoolLLMClient) -> EngineCoreOutputs | None:
-        """Pull raw EngineCoreOutputs from a stage replica without processing."""
+    async def read_llm_raw_output(self, client: StagePoolLLMClient) -> EngineCoreOutputs | None:
+        """Await one raw EngineCore batch from *client*; ``None`` if it is empty.
+
+        Untimed read shared by both orchestration loops; the legacy loop bounds
+        it through ``poll_llm_raw_output``.
+        """
         outputs = await client.get_output_async()
         # Keep scheduler-only / finished-only batches. Omni schedulers mirror
         # upstream by emitting SchedulerStats on throttled ticks even when no
@@ -1222,7 +1310,7 @@ class StagePool:
         client = cast(StagePoolLLMClient, raw_client)
         try:
             return await asyncio.wait_for(
-                self._poll_stage_raw(client),
+                self.read_llm_raw_output(client),
                 timeout=timeout_s,
             )
         except asyncio.TimeoutError:
@@ -1231,7 +1319,7 @@ class StagePool:
             raise
         except Exception:
             logger.exception(
-                "[StagePool] _poll_stage_raw failed for stage-%s replica-%s",
+                "[StagePool] read_llm_raw_output failed for stage-%s replica-%s",
                 self.stage_id,
                 replica_id,
             )
@@ -1265,7 +1353,7 @@ class StagePool:
         request_ids_by_replica: dict[int, list[str]] = {}
         for request_id in request_ids:
             replica_id = self.get_bound_replica_id(request_id)
-            if replica_id is None or self.clients[replica_id] is None:
+            if replica_id is None:
                 logger.debug("[StagePool] abort: no live binding for req=%s in stage-%s", request_id, self.stage_id)
                 continue
             request_ids_by_replica.setdefault(replica_id, []).append(request_id)
@@ -1300,9 +1388,10 @@ class StagePool:
                     if aborted:
                         engine_abort_ids = list(aborted)
             client = self.clients[replica_id]
-            if client is None:
-                continue
-            await client.abort_requests_async(engine_abort_ids)
+            if client is not None:
+                await client.abort_requests_async(engine_abort_ids)
+            # An evicted engine cannot produce further output. Release its
+            # retained processor state without sending another abort RPC.
             if not is_diffusion and self._output_processor is not None:
                 commit = getattr(self._output_processor, "commit_aborted_request_state", None)
                 if callable(commit):
@@ -1310,27 +1399,64 @@ class StagePool:
 
         return abort_outputs
 
-    async def release_request_resources(self, request_ids: list[str]) -> None:
-        """Ask every live replica to drop transfer resources for *request_ids*.
+    def schedule_release_request_resources(self, request_ids: list[str]) -> None:
+        """Queue a best-effort release of *request_ids* on every live replica.
 
         Broadcast rather than binding-routed: the orchestrator releases route
         bindings as part of the same teardown, so a binding lookup here would
         race it. The engine-core handler is idempotent for unknown ids.
+
+        Each replica batches independently: ids of requests that finish while
+        its release RPC is in flight go out together in its next RPC, and a
+        hung replica delays only its own batches (bounded by
+        ``RELEASE_RPC_TIMEOUT_S`` per RPC).
         """
         if not request_ids or not self._has_chunk_transfer_adapter:
             return
-        ids = list(request_ids)
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            logger.warning(
+                "[StagePool-%s] no running event loop; skipped reclaim of transfer resources for %s",
+                self.stage_id,
+                request_ids,
+            )
+            return
+        for replica_id in self.live_replica_ids():
+            pending = self._pending_releases.setdefault(replica_id, {})
+            pending.update(dict.fromkeys(request_ids))
+            if replica_id not in self._release_flushers:
+                self._release_flushers[replica_id] = loop.create_task(self._flush_replica_releases(replica_id))
 
-        async def release(replica_id: int, call: Any) -> None:
-            try:
-                await asyncio.wait_for(call("omni_release_request_resources", ids), timeout=self.RELEASE_RPC_TIMEOUT_S)
-            except Exception as e:
-                logger.warning(
-                    "[StagePool-%s] release_request_resources on replica %s failed: %r", self.stage_id, replica_id, e
-                )
-
-        calls = [(i, getattr(self.clients[i], "call_utility_async", None)) for i in self.live_replica_ids()]
-        await asyncio.gather(*(release(i, call) for i, call in calls if call is not None))
+    async def _flush_replica_releases(self, replica_id: int) -> None:
+        pending = self._pending_releases[replica_id]
+        try:
+            while pending:
+                # Let completions handled in this loop pass join the batch.
+                await asyncio.sleep(0)
+                ids = list(pending)
+                pending.clear()
+                # Resolve the client per RPC: the replica may have been removed or replaced.
+                client = self.clients[replica_id] if replica_id < len(self.clients) else None
+                call = getattr(client, "call_utility_async", None)
+                if call is None:
+                    return
+                try:
+                    await asyncio.wait_for(
+                        call("omni_release_request_resources", ids), timeout=self.RELEASE_RPC_TIMEOUT_S
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "[StagePool-%s] release_request_resources on replica %s failed: %r",
+                        self.stage_id,
+                        replica_id,
+                        e,
+                    )
+        finally:
+            # No await from here on, so a concurrent schedule cannot slip in
+            # between: the next one starts a fresh batch and sender.
+            del self._pending_releases[replica_id]
+            del self._release_flushers[replica_id]
 
     async def collective_rpc(
         self,
@@ -1428,3 +1554,4 @@ class StagePool:
             raise ValueError(f"evict_replica: replica_id {replica_id} out of range (num_replicas={len(self.clients)})")
         self.shutdown_replica(replica_id)
         self.clients[replica_id] = None
+        self._notify_membership_changed()

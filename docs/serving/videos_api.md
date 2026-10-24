@@ -68,6 +68,8 @@ curl -L "http://localhost:8091/v1/videos/${video_id}/content" -o output.mp4
 | Parameter | Type | Default | Description |
 | ----------- | ------ | --------- | ------------- |
 | `input_reference` | file | null | Uploaded reference image or video for image-to-video/video-to-video requests |
+| `timeline_guides` | string | null | MiniMax H3 JSON manifest of ordered timeline guides; see [MiniMax H3 Timeline Guides](#minimax-h3-timeline-guides) |
+| `guide_files` | repeated file | null | Guide uploads addressed by zero-based `upload_index` in `timeline_guides` |
 | `control_reference` | file | null | Optional uploaded image/video control, up to 512 MiB, for models that declare control-upload support |
 | `control_type` | string | null | Model control name associated with `control_reference`; currently Cosmos3 supports `edge`, `blur`, `depth`, `seg`, and `wsm` |
 | `image_reference` | string | null | JSON-encoded reference image payload; do not combine with `input_reference` or `video_reference` |
@@ -280,6 +282,51 @@ For example, each mask file in the request above may contain the JSON scalar
 The server streams source files to temporary request-scoped storage and removes
 them after synchronous or asynchronous generation finishes. Models that do not
 declare latent-mask editing support reject these fields.
+
+### MiniMax H3 Timeline Guides
+
+MiniMax H3 accepts ordered timeline guides: a still image or a clip, optionally
+plus audio, anchored at an explicit pixel frame of the generated video. Guides
+are clean conditions packed ahead of any references; they never enter the Qwen
+reference presentation or change `<Picture N>` labels. Send the manifest as the
+`timeline_guides` JSON form field and the media as repeated `guide_files`
+uploads:
+
+```bash
+curl -s http://localhost:8091/v1/videos/sync \
+  -F 'prompt=A bird flies across the lake and lands beside the reeds.' \
+  -F 'width=1344' -F 'height=768' -F 'num_frames=124' -F 'fps=24' \
+  -F 'num_inference_steps=50' -F 'seed=1101' -F 'quality=lossless' \
+  -F 'extra_params={"task":"t2va","aspect_ratio":"16:9"}' \
+  -F 'timeline_guides=[{"frame_index":36,"image":{"upload_index":0}},{"frame_index":-22,"video":{"upload_index":1},"audio":{"upload_index":2}}]' \
+  -F 'guide_files=@middle.png;type=image/png' \
+  -F 'guide_files=@tail.mp4;type=video/mp4' \
+  -F 'guide_files=@tail.flac;type=audio/flac' \
+  -o guided.mp4
+```
+
+- Each entry has a JSON integer `frame_index` and at least one of `image`,
+  `video`, or `audio`, each `{"upload_index": N}`. `image` and `video` cannot be
+  combined. An upload may be reused by several entries but only for one
+  modality; every upload must be referenced. At most 8 entries and 16 uploads.
+- Images use JPEG/PNG/WEBP (30 MiB), clips MP4/MOV (50 MiB), and audio
+  WAV/MP3/FLAC (15 MiB). A clip's soundtrack is never used; upload audio
+  explicitly.
+- Let `N` be the aligned output frame count. A negative `frame_index` resolves
+  to `N + frame_index`. Clips are decoded at 24 FPS, center-cropped to the
+  output canvas and shortened to `5 + 17k` frames (1-4 frames keep the first
+  frame); the result must fit in `[start, N)`. Audio starts at the same frame
+  and is cropped to the remaining timeline.
+- Guided requests need base H3 weights, `quality=lossless`, and the media
+  encoder in the diffusion stage. Cache acceleration, FastH3, LoRA/Turbo,
+  distilled schedules, continuation, latent refine/upscale, latent-mask editing,
+  and `audio_mode=lock_source` are rejected. With first/last frames, the FL2VA
+  keyframes are packed as image guides; with references, references are scaled
+  down to the output area.
+
+Guide uploads use the same request-scoped temporary storage and cleanup as
+latent-mask editing sources. Models that do not declare timeline-guide support
+reject these fields.
 
 ### Speech-to-Video
 

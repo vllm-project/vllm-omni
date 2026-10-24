@@ -13,6 +13,8 @@ stages:
     # Exact conditioned Talker inputs for preemption replay are allocated
     # after KV profiling: 16 MiB per active request at 1.7B/max_model_len=4096
     # (~2 GiB at 128 requests), in addition to codec state and output buffers.
+    # MRv2 fused CUDA also builds a ~0.6 GB projected text table before KV
+    # profiling. V1 and two-stage deployments do not allocate that table.
     # Keep headroom when increasing gpu_memory_utilization or capacity.
     gpu_memory_utilization: 0.5
     trust_remote_code: true
@@ -30,8 +32,13 @@ stages:
       code_predictor_kv_cache: true
       code_predictor_fused_sampling: true
       code_predictor_fused: true
-    # Talker decode contexts are short (~100-700 tokens): FA3 split-KV plus
-    # its combine kernel costs more than one pass per head.
+      # Serving-side runaway ceiling for requests without max_new_tokens:
+      # max(codec_budget_min_frames, codec_budget_frames_per_text_token *
+      # input text tokens) codec frames, capped by max_tokens below. Each
+      # key takes a number (all tasks) or a per-task mapping; a rate of 0
+      # disables the ceiling. Defaults:
+      # codec_budget_frames_per_text_token: {Base: 12, CustomVoice: 40, VoiceDesign: 40}
+      # codec_budget_min_frames: {Base: 192, CustomVoice: 400, VoiceDesign: 400}
     attention_config:
       flash_attn_max_num_splits_for_cuda_graph: 1
     async_scheduling: true

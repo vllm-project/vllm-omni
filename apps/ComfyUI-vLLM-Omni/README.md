@@ -49,6 +49,8 @@ This extension offers the following nodes based on the output modalities (at **C
 
 - **Generate Image** for text-to-image and image-to-image tasks
 - **Generate Video** for text-to-video, first-frame/image-to-video, and reference-conditioned video
+- **Restore Video (SeedVR2)** for remote VIDEO restoration with source FPS and audio;
+  see the [standalone and H3 chaining guide](docs/seedvr2-restoration.md).
 - **Latent Mask Editing** for MiniMax-H3 latent-mask editing (source media plus video/audio noise masks)
 - **FastH3 Deployment** for routing text-to-video requests to a MiniMax-H3 server with FastH3 fused at startup
 - **Multimodality Understanding** for multimodality-to-text and multimodality-to-audio tasks
@@ -64,13 +66,15 @@ Every node carries the vLLM-Omni mark in its title bar and is tinted by what it 
 
 | Colour | Nodes | What they produce |
 | --- | --- | --- |
-| Blue | Generate Image, Generate Video, Multimodality Understanding, TTS, TTS Voice Clone | A generated image, video, audio, or text. These are the only nodes that reach a server. |
+| Blue | Generate Image, Generate Video, Restore Video, Multimodality Understanding, TTS, TTS Voice Clone | A generated or restored image, video, audio, or text. These are the only nodes that reach a server. |
 | Amber | AR / Diffusion / Multi-Stage Sampling Params | Sampling parameters that apply to any model |
 | Purple | Qwen TTS Params, Wan Video Params, MiniMax-H3 Video Params | Parameters that only one model family accepts |
 | Red | LoRA, FastH3 Deployment | Which weights the server is expected to have loaded |
 | Teal | Video References, Latent Mask Editing | Reference media |
 
 Recolouring a node by hand (right click -> Colors) overrides its tint, and the choice is kept.
+
+The `model` field of every node that talks to a server doubles as a dropdown of what the server actually serves: the list is fetched through the ComfyUI backend (so `localhost` resolves to the host running ComfyUI, not to the machine the browser is on), refetched when the `url` field changes or the **↻ refresh models** button is clicked, and falls back to plain free text whenever the list cannot be fetched -- a server that is down must never make the node unfillable. A value saved in a workflow is always kept, even when it is not in the fetched list.
 
 **Generate Video** takes a clip length in seconds (`duration`), not a frame count. Frames stay the wire unit and are derived with the node's `fps`, so the length is always measured against the rate that is actually served; models that accept only certain frame counts still round to their own lattice server-side. Graphs saved before this widget existed stored `num_frames` in its place and are converted on load, using the fps recorded alongside it -- the browser console names every node it rewrites.
 
@@ -176,6 +180,9 @@ drop the server's audio while decoding the response.
    Keep the references connected to **Generate Video** and leave `frame` disconnected.
 4. Match prompt tags such as `<Picture 1>`, `<Video 1>`, and `<Audio 1>` to the
    connected references, counting each media type separately and skipping empty slots.
+   To drive the clip with a soundtrack instead, connect exactly one audio and set
+   **MiniMax-H3 Video Params → audio_mode** to `lock_source`; that audio is not
+   counted as an `<Audio N>` reference.
 5. Run the workflow. **Save Video** writes an MP4 under `output/video/` and preserves
    the generated audio when the audio-output prerequisite is installed.
 
@@ -225,6 +232,14 @@ optional Turbo sampling, H3 parameters, and Remote LoRA nodes. See the
 [workflow guide](docs/minimax-h3-t2v.md) for server setup, artifact-specific Turbo
 settings, and saved-video/audio validation. Set Remote LoRA’s `local_path` to
 the downloaded Turbo artifact on your server before enabling Turbo.
+
+#### H3 all-in-one (H3-06)
+
+The **vLLM-Omni MiniMax-H3 All-in-One** template puts T2VA, first/last-frame FL2VA, and mixed-reference Ref2VA in one graph. The server URL, served model name, duration, sampling, and flow shifts are set once and shared by all modes; enable the group for the mode you want to run. It does not include a prompt LLM. See [workflow setup](docs/h3-06-all-in-one.md).
+
+#### H3 music video from a supplied track (H3-03)
+
+The **vLLM-Omni MiniMax-H3 Music Video** template cuts a supplied music track into 124-frame slices, generates one Ref2VA shot per slice with a shared character/style image, and joins the shots with the original track as the soundtrack. Each shot sets **MiniMax-H3 Video Params → audio_mode** to `lock_source`, so its slice drives generation instead of acting as a short reference. Requires ComfyUI v0.36.0+ for Concatenate Video. See [workflow setup](docs/h3-03-music-video.md).
 
 #### H3 video upscale (WF-07)
 
@@ -290,14 +305,45 @@ The node requires at least one mask; the server then enforces the cross-field ru
 > [!TIP]
 > There is a dedicated node for VoiceClone tasks with reference audio input. Other simple text-to-speech tasks should use the regular TTS node.
 
-### Music generation (e.g., MiniMax Music 3)
+### Text to Music (e.g., MiniMax Music 3/YuE2)
 
-(Also available at **ComfyUI sidebar->Template->vLLM-Omni->vLLM-Omni Music Generation**)
+Open **ComfyUI sidebar->Template->vLLM-Omni** and select:
+
+- **vLLM-Omni Text to Music(MiniMax Music3)** — the existing MiniMax Music 3 template.
+- **vLLM-Omni Text to Music(YuE2)** — uses YuE2 Params with `cot=off` by default.
+
+Set Generate Music's URL and model to the running service. Caption and lyrics
+map to `instructions` and `input`. For YuE2, connect YuE2 Params to the optional
+`model_specific_params` input. Leave ABC empty for `off`; `melody/full` require
+ABC score text, pasted or connected as STRING, not a file path.
+
+See the [YuE2 recipe](../../recipes/m-a-p/YuE2-3B.md) for deployment details.
 
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" src="https://raw.githubusercontent.com/vllm-project/vllm-omni/refs/heads/main/apps/ComfyUI-vLLM-Omni/docs/images/comfyui-music-generation.jpg">
-    <img alt="vLLM-Omni Music Generation" src="https://raw.githubusercontent.com/vllm-project/vllm-omni/refs/heads/main/apps/ComfyUI-vLLM-Omni/docs/images/comfyui-music-generation.jpg" width=55%>
+    <source media="(prefers-color-scheme: dark)" src="https://raw.githubusercontent.com/vllm-project/vllm-omni/refs/heads/main/apps/ComfyUI-vLLM-Omni/docs/images/comfyui-text-to-music.jpg">
+    <img alt="vLLM-Omni Text to Music(MiniMax Music3)" src="https://raw.githubusercontent.com/vllm-project/vllm-omni/refs/heads/main/apps/ComfyUI-vLLM-Omni/docs/images/comfyui-text-to-music.jpg" width=55%>
+  </picture>
+</p>
+
+### Music Cover (e.g. YuE2)
+
+Open **ComfyUI sidebar->Template->vLLM-Omni->vLLM-Omni Music Cover(YuE2)**.
+
+The template uses native Load Audio, Audio Encoder Loader and SheetSage2 Audio
+to ABC nodes locally, followed by remote YuE2 generation. Download
+[sheetsage2_bf16.safetensors](https://huggingface.co/Comfy-Org/YuE2/resolve/main/audio_encoders/sheetsage2_bf16.safetensors)
+into `models/audio_encoders/`, select it and upload your source audio.
+
+Keep SheetSage2 mode and YuE2 Params cot matched; both default to `melody`.
+Provide lyrics separately. The remote service receives ABC text rather than the
+source recording, and returns audio without generated ABC or truncation metadata.
+Save Audio previews and saves the result.
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" src="https://raw.githubusercontent.com/vllm-project/vllm-omni/refs/heads/main/apps/ComfyUI-vLLM-Omni/docs/images/comfyui-music-cover.jpg">
+    <img alt="vLLM-Omni Music Cover(YuE2)" src="https://raw.githubusercontent.com/vllm-project/vllm-omni/refs/heads/main/apps/ComfyUI-vLLM-Omni/docs/images/comfyui-music-cover.jpg" width=55%>
   </picture>
 </p>
 

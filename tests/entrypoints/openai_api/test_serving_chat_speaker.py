@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Tests for chat endpoint speaker validation."""
 
 import asyncio
@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import pytest
 from pytest_mock import MockerFixture
 
-from vllm_omni.entrypoints.openai.utils import (
+from vllm_omni.utils.speakers import (
     get_supported_speakers_from_hf_config,
     validate_requested_speaker,
 )

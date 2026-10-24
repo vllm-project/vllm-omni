@@ -12,17 +12,18 @@ import torch.nn.functional as F
 from vllm.platforms import current_platform
 
 import vllm_omni.model_executor.models.minicpmo_4_5.cuda_graph_wrapper as wrapper_module
+from tests.helpers.mark import hardware_marks
 from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.hifigan import (
     HiFTGenerator,
 )
-from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import BatchedToken2Wav
+from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import BatchedToken2Wav, _trim_streaming_cache
 from vllm_omni.model_executor.models.minicpmo_4_5.cuda_graph_wrapper import (
     CFMGraphWrapper,
     HiFTGraphWrapper,
     WholeEulerCFMGraphWrapper,
 )
 
-pytestmark = [pytest.mark.core_model, pytest.mark.cuda]
+pytestmark = [pytest.mark.core_model, *hardware_marks(res={"cuda": "L4"}, num_cards=1)]
 
 
 class _F0Predictor(nn.Module):
@@ -134,6 +135,7 @@ class _FakeGraph:
 def _fake_wrapper(monkeypatch: pytest.MonkeyPatch) -> HiFTGraphWrapper:
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     wrapper = object.__new__(HiFTGraphWrapper)
+    wrapper.device = torch.device("cpu")
     wrapper.capture_batch_sizes = [1]
     wrapper._legit_shapes = {(7, 0), (9, 0)}
     wrapper.graph = {}
@@ -2356,6 +2358,195 @@ def test_whole_euler_ragged_rows_match_per_row_exact_solves(monkeypatch: pytest.
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for graph capture")
+def test_whole_euler_mixed_histories_match_independent_streams(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Different reference lengths share a graph without exposing padded history."""
+    pool = torch.cuda.graph_pool_handle()
+    monkeypatch.setattr(current_platform, "get_global_graph_pool", lambda: pool)
+    estimator = _tiny_upstream_dit()
+    wrapper = WholeEulerCFMGraphWrapper(
+        estimator=estimator,
+        n_timesteps=10,
+        max_graphs=8,
+        query_bucket_frames=16,
+        ragged_body=BatchedToken2Wav._blocks_forward_chunk_ragged,
+    )
+    batch_size, width = 3, 8
+    # Reuse the arena after longer histories have filled its padding columns.
+    for offsets in ([12, 9, 6], [8, 5, 3]):
+        histories = []
+        for offset in offsets:
+            first = _whole_euler_chunk(1, offset)
+            histories.append(
+                _eager_solve_euler(
+                    estimator,
+                    first["x"],
+                    first["mu_cfg"],
+                    first["speakers_cfg"],
+                    first["cond_cfg"],
+                    None,
+                    None,
+                    None,
+                    wrapper.timeline,
+                )[1:]
+            )
+        cnn = torch.cat(
+            [torch.cat([row[0][:, :, cfg : cfg + 1] for row in histories], dim=2) for cfg in range(2)],
+            dim=2,
+        )
+        lengths = [8, 6, 4]
+        current = _whole_euler_chunk(batch_size, width)
+        query_valid = torch.arange(width, device="cuda")[None, :] < torch.tensor(lengths * 2, device="cuda")[:, None]
+        history_valid = (
+            torch.arange(max(offsets), device="cuda")[None, :] < torch.tensor(offsets * 2, device="cuda")[:, None]
+        )
+        mask = query_valid[:, :, None] & torch.cat((query_valid, history_valid), dim=1)[:, None, :]
+        result = wrapper.replay(
+            **current,
+            cnn_cache=cnn,
+            att_cache=[row[1].clone() for row in histories],
+            attn_mask=mask,
+            valid_lengths=lengths,
+        )
+        assert result is not None
+        out_x, out_cnn, out_att = result
+        out_cnn_rows = _split_cfg_rows(out_cnn, batch_size)
+        for row, (length, offset) in enumerate(zip(lengths, offsets, strict=True)):
+            cfg = [row, batch_size + row]
+            expected_x, expected_cnn, expected_att = _eager_solve_euler(
+                estimator,
+                current["x"][row : row + 1, :, :length],
+                current["mu_cfg"][cfg, :, :length],
+                current["speakers_cfg"][cfg],
+                current["cond_cfg"][cfg, :, :length],
+                *histories[row],
+                None,
+                wrapper.timeline,
+            )
+            torch.testing.assert_close(out_x[row : row + 1, :, :length], expected_x, rtol=1e-4, atol=1e-5)
+            torch.testing.assert_close(out_cnn_rows[row], expected_cnn, rtol=1e-4, atol=1e-5)
+            assert out_att[row].shape[4] == offset + length
+            torch.testing.assert_close(out_att[row], expected_att, rtol=1e-4, atol=1e-5)
+    wrapper._flush()
+
+
+def test_whole_euler_mixed_histories_do_not_enable_npu_arena(monkeypatch: pytest.MonkeyPatch) -> None:
+    device = SimpleNamespace(type="npu")
+    wrapper = SimpleNamespace(
+        enabled=True,
+        device=device,
+        _stats={"calls": 0},
+        max_graph_batch=8,
+        _plan_groups=lambda batch: [(0, batch)],
+        row_offsets=False,
+        ragged_body=object(),
+        query_widths=(8,),
+    )
+    monkeypatch.setattr(
+        wrapper_module, "_graph_api", lambda _: SimpleNamespace(is_current_stream_capturing=lambda: False)
+    )
+    prepare = Mock(side_effect=AssertionError("mixed NPU histories must not enter the arena"))
+    monkeypatch.setattr(wrapper_module, "_pad_query_for_capture", prepare)
+    result = WholeEulerCFMGraphWrapper.replay(
+        wrapper,
+        x=SimpleNamespace(device=device, shape=(2, 4, 8)),
+        mu_cfg=torch.zeros(4, 4, 8),
+        speakers_cfg=torch.zeros(4, 4),
+        cond_cfg=torch.zeros(4, 4, 8),
+        cnn_cache=None,
+        att_cache=[torch.zeros(1, 1, 2, 1, length, 2) for length in [4, 8]],
+        valid_lengths=[8, 8],
+        attn_mask=torch.ones(4, 8, 16, dtype=torch.bool),
+    )
+    assert result is None
+    prepare.assert_not_called()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for graph capture")
+def test_whole_euler_mixed_prompts_reuse_caches_after_streaming_trim(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Mixed prompt lengths retain exact per-row caches through steady-state trimming."""
+    pool = torch.cuda.graph_pool_handle()
+    monkeypatch.setattr(current_platform, "get_global_graph_pool", lambda: pool)
+    torch.manual_seed(37)
+    estimator = _tiny_upstream_dit()
+    wrapper = WholeEulerCFMGraphWrapper(
+        estimator=estimator,
+        n_timesteps=10,
+        max_graphs=16,
+        query_bucket_frames=16,
+        ragged_body=BatchedToken2Wav._blocks_forward_chunk_ragged,
+    )
+    prompt_lengths = [4, 8, 12]
+    histories = []
+    for length in prompt_lengths:
+        prompt = _whole_euler_chunk(1, length)
+        histories.append(
+            _eager_solve_euler(
+                estimator,
+                prompt["x"],
+                prompt["mu_cfg"],
+                prompt["speakers_cfg"],
+                prompt["cond_cfg"],
+                None,
+                None,
+                None,
+                wrapper.timeline,
+            )[1:]
+        )
+    cnn = torch.cat([torch.cat([row[0][:, :, cfg : cfg + 1] for row in histories], dim=2) for cfg in range(2)], dim=2)
+    att = [row[1].clone() for row in histories]
+    pointers = None
+    batch_size, width = 3, 25
+    lengths = [25, 23, 21]
+    for _ in range(8):
+        offsets = [cache.shape[4] for cache in att]
+        current = _whole_euler_chunk(batch_size, width)
+        query_valid = torch.arange(width, device="cuda")[None, :] < torch.tensor(lengths * 2, device="cuda")[:, None]
+        history_valid = (
+            torch.arange(max(offsets), device="cuda")[None, :] < torch.tensor(offsets * 2, device="cuda")[:, None]
+        )
+        mask = query_valid[:, :, None] & torch.cat((query_valid, history_valid), dim=1)[:, None, :]
+        result = wrapper.replay(
+            **current,
+            cnn_cache=cnn,
+            att_cache=att,
+            attn_mask=mask,
+            valid_lengths=lengths,
+            att_keep=(max(prompt_lengths), 100),
+            prompt_lengths=prompt_lengths,
+        )
+        assert result is not None
+        out_x, cnn, att = result
+        cnn_rows = _split_cfg_rows(cnn, batch_size)
+        next_histories = []
+        for row, (length, prompt_length) in enumerate(zip(lengths, prompt_lengths, strict=True)):
+            cfg = [row, batch_size + row]
+            expected_x, expected_cnn, expected_att = _eager_solve_euler(
+                estimator,
+                current["x"][row : row + 1, :, :length],
+                current["mu_cfg"][cfg, :, :length],
+                current["speakers_cfg"][cfg],
+                current["cond_cfg"][cfg, :, :length],
+                *histories[row],
+                None,
+                wrapper.timeline,
+            )
+            expected_att = _trim_streaming_cache(expected_att, prompt_length)
+            next_histories.append((expected_cnn, expected_att))
+            torch.testing.assert_close(out_x[row : row + 1, :, :length], expected_x, rtol=1e-4, atol=1e-5)
+            torch.testing.assert_close(cnn_rows[row], expected_cnn, rtol=1e-4, atol=1e-5)
+            torch.testing.assert_close(att[row], expected_att, rtol=1e-4, atol=1e-5)
+            trimmed = _trim_streaming_cache(att[row], prompt_length)
+            assert trimmed.data_ptr() == att[row].data_ptr()
+        current_pointers = [cache.untyped_storage().data_ptr() for cache in att]
+        if pointers is not None:
+            assert current_pointers == pointers
+        pointers = current_pointers
+        histories = next_histories
+    assert [cache.shape[4] for cache in att] == [length + 100 for length in prompt_lengths]
+    wrapper._flush()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for graph capture")
 def test_whole_euler_padded_ragged_replay_after_a_wider_replay(monkeypatch: pytest.MonkeyPatch) -> None:
     """A padded ragged replay is exact after a wider replay of the same graph batch.
 
@@ -2472,9 +2663,13 @@ def test_whole_euler_groups_are_acquired_again_after_a_flush() -> None:
 
 
 @pytest.mark.parametrize("fail", [False, True])
-def test_vocoder_restores_tf32_policy(fail):
+def test_vocoder_restores_tf32_policy(fail, monkeypatch):
     from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_code2wav import MiniCPMO45Code2Wav
+    from vllm_omni.platforms import current_omni_platform
 
+    # The policy is a no-op off CUDA; pin it so the restore path stays covered
+    # on every CI platform.
+    monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: True)
     previous = torch.backends.cuda.matmul.allow_tf32
 
     def forward(*args, **kwargs):
@@ -2483,7 +2678,9 @@ def test_vocoder_restores_tf32_policy(fail):
             raise RuntimeError("injected")
         return "ok"
 
-    model = SimpleNamespace(_extra_config=lambda: {"token2wav_allow_tf32": True}, _forward_impl=forward)
+    # `_tf32_mode` is resolved in `__init__` now, so the stub model carries the
+    # resolved value instead of a config the policy would re-read per forward.
+    model = SimpleNamespace(_tf32_mode="tf32", _forward_impl=forward)
     if fail:
         with pytest.raises(RuntimeError, match="injected"):
             MiniCPMO45Code2Wav.forward(model)

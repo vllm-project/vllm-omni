@@ -50,6 +50,7 @@ from vllm_omni.model_executor.models.bagel.pipeline import (
     BAGEL_THINK_PIPELINE,
 )
 from vllm_omni.model_executor.models.breeze_tts_2.pipeline import BREEZE_TTS_2_PIPELINE
+from vllm_omni.model_executor.models.causvid_wan.pipeline import CAUSVID_WAN_PIPELINE
 from vllm_omni.model_executor.models.cosmos3.pipeline import (
     COSMOS3_OMNI_DEPLOY_PIPELINE,
     COSMOS3_POLICY_PIPELINE,
@@ -57,6 +58,7 @@ from vllm_omni.model_executor.models.cosmos3.pipeline import (
 from vllm_omni.model_executor.models.cosyvoice3.pipeline import resolve_cosyvoice3_pipeline
 from vllm_omni.model_executor.models.covo_audio.pipeline import COVO_AUDIO_PIPELINE
 from vllm_omni.model_executor.models.dreamzero.pipeline import DREAMZERO_PIPELINE
+from vllm_omni.model_executor.models.fish_omni.pipeline import FISH_OMNI_PIPELINE
 from vllm_omni.model_executor.models.fish_speech.pipeline import FISH_SPEECH_PIPELINE
 from vllm_omni.model_executor.models.gepard.pipeline import GEPARD_PIPELINE
 from vllm_omni.model_executor.models.glm_image.pipeline import GLM_IMAGE_PIPELINE
@@ -75,6 +77,7 @@ from vllm_omni.model_executor.models.indextts2.pipeline import (
     INDEXTTS25_PIPELINE,
 )
 from vllm_omni.model_executor.models.joyai_vl_interaction.pipeline import (
+    JOYAI_VL_INTERACTION_ASR_PIPELINE,
     JOYAI_VL_INTERACTION_PIPELINE,
 )
 from vllm_omni.model_executor.models.lance.pipeline import LANCE_PIPELINE
@@ -84,6 +87,12 @@ from vllm_omni.model_executor.models.mammoth_moda2.pipeline import (
     MAMMOTH_MODA2_PIPELINE,
 )
 from vllm_omni.model_executor.models.mimo_audio.pipeline import MIMO_AUDIO_PIPELINE
+from vllm_omni.model_executor.models.ming3_audio.pipeline import (
+    MING3_AUDIO_FLASH_PIPELINE,
+    MING3_AUDIO_FLASH_THINKER_ONLY_PIPELINE,
+    MING3_AUDIO_TTS_PIPELINE,
+)
+from vllm_omni.model_executor.models.ming3_tts.pipeline import MING3_TTS_PIPELINE
 from vllm_omni.model_executor.models.ming_flash_omni.pipeline import (
     MING_FLASH_OMNI_IMAGE_PIPELINE,
     MING_FLASH_OMNI_PIPELINE,
@@ -99,9 +108,9 @@ from vllm_omni.model_executor.models.minicpmo_4_5.pipeline import MINICPMO_4_5_P
 from vllm_omni.model_executor.models.minimax_h3.pipeline import MINIMAX_H3_DECODE_PIPELINE, MINIMAX_H3_PIPELINE
 from vllm_omni.model_executor.models.minimax_music3.pipeline import MINIMAX_MUSIC3_PIPELINE
 from vllm_omni.model_executor.models.moss_tts.pipeline import (
+    MOSS_TTS_LOCAL_PIPELINE,
     MOSS_TTS_PIPELINE,
     MOSS_TTS_REALTIME_PIPELINE,
-    resolve_moss_tts_local_pipeline,
 )
 from vllm_omni.model_executor.models.moss_tts_nano.pipeline import MOSS_TTS_NANO_PIPELINE
 from vllm_omni.model_executor.models.nemotron_voicechat.pipeline import (
@@ -122,9 +131,16 @@ from vllm_omni.model_executor.models.step_audio2.pipeline import (
     STEP_AUDIO2_ASR_PIPELINE,
     STEP_AUDIO2_PIPELINE,
 )
+from vllm_omni.model_executor.models.taomate_h3.pipeline import TAOMATE_H3_PIPELINE
+from vllm_omni.model_executor.models.vibevoice.pipeline import VIBEVOICE_PIPELINE
 from vllm_omni.model_executor.models.voxcpm2.pipeline import VOXCPM2_PIPELINE
 from vllm_omni.model_executor.models.voxtral_tts.pipeline import VOXTRAL_TTS_PIPELINE
-from vllm_omni.model_executor.models.wan2_2.pipeline import WAN2_2_TI2V_PIPELINE
+from vllm_omni.model_executor.models.wan2_2.pipeline import (
+    WAN2_2_EG_PIPELINE,
+    WAN2_2_EGD_PIPELINE,
+    WAN2_2_PIPELINE,
+    WAN2_2_TI2V_PIPELINE,
+)
 from vllm_omni.model_executor.models.yue2.pipeline import YUE2_PIPELINE
 
 logger = init_logger(__name__)
@@ -143,7 +159,10 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "bagel": BAGEL_PIPELINE,
     "bagel_single_stage": BAGEL_SINGLE_STAGE_PIPELINE,
     "bagel_think": BAGEL_THINK_PIPELINE,
+    "bailing_moe_v3_audio": MING3_AUDIO_FLASH_PIPELINE,
+    "bailing_moe_v3_audio_thinker_only": MING3_AUDIO_FLASH_THINKER_ONLY_PIPELINE,
     "breeze": BREEZE_TTS_2_PIPELINE,
+    "causvid_wan": CAUSVID_WAN_PIPELINE,
     # Cosmos3 policy / omni-deploy topologies share HF metadata with video
     # Cosmos3 checkpoints (which stay on the single-stage diffusion fallback),
     # so these entries are only reachable through a deploy yaml's ``pipeline:``
@@ -153,6 +172,7 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "cosyvoice3": resolve_cosyvoice3_pipeline,
     "covo_audio": COVO_AUDIO_PIPELINE,
     "dreamzero": DREAMZERO_PIPELINE,
+    "fish_omni": FISH_OMNI_PIPELINE,
     "fish_qwen3_omni": FISH_SPEECH_PIPELINE,
     "gepard": GEPARD_PIPELINE,
     "glm_image": GLM_IMAGE_PIPELINE,
@@ -167,11 +187,16 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "indextts2": INDEXTTS2_PIPELINE,
     "indextts2_5": INDEXTTS25_PIPELINE,
     "joyai_vl_interaction": JOYAI_VL_INTERACTION_PIPELINE,
+    "joyai_vl_interaction_asr": JOYAI_VL_INTERACTION_ASR_PIPELINE,
     "lance": LANCE_PIPELINE,
     "lingbot_world": LINGBOT_WORLD_PIPELINE,
+    # Public Ming-3.0-tts-tiny still serializes the former config name.
+    "lingv3_tts": MING3_TTS_PIPELINE,
     "mammoth_moda2": MAMMOTH_MODA2_PIPELINE,
     "mammoth_moda2_ar": MAMMOTH_MODA2_AR_PIPELINE,
     "mimo_audio": MIMO_AUDIO_PIPELINE,
+    "ming3_audio_tts": MING3_AUDIO_TTS_PIPELINE,
+    "ming3_tts": MING3_TTS_PIPELINE,
     "ming_flash_omni": MING_FLASH_OMNI_PIPELINE,
     "ming_flash_omni_image": MING_FLASH_OMNI_IMAGE_PIPELINE,
     "ming_flash_omni_thinker_only": MING_FLASH_OMNI_THINKER_ONLY_PIPELINE,
@@ -184,7 +209,7 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "minimax_h3_disaggregated_decode": MINIMAX_H3_DECODE_PIPELINE,
     "minimax_music3": MINIMAX_MUSIC3_PIPELINE,
     "moss_tts_delay": MOSS_TTS_PIPELINE,
-    "moss_tts_local": resolve_moss_tts_local_pipeline,
+    "moss_tts_local": MOSS_TTS_LOCAL_PIPELINE,
     "moss_tts_nano": MOSS_TTS_NANO_PIPELINE,
     "moss_tts_realtime": MOSS_TTS_REALTIME_PIPELINE,
     # Alias: the Nemotron-Labs-Audex-2B repo-root config.json reports
@@ -208,8 +233,14 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "qwen3_tts_fused": QWEN3_TTS_FUSED_PIPELINE,
     "step_audio_2": STEP_AUDIO2_PIPELINE,
     "step_audio_2_asr": STEP_AUDIO2_ASR_PIPELINE,
+    "taomate_h3": TAOMATE_H3_PIPELINE,
+    "vibevoice": VIBEVOICE_PIPELINE,
     "voxcpm2": VOXCPM2_PIPELINE,
     "voxtral_tts": VOXTRAL_TTS_PIPELINE,
+    "wan2_2": WAN2_2_PIPELINE,
+    # Disaggregated diffusion variant (opt-in): Wan Encode/Generation split.
+    "wan2_2_eg": WAN2_2_EG_PIPELINE,
+    "wan2_2_egd": WAN2_2_EGD_PIPELINE,
     "wan2_2_ti2v": WAN2_2_TI2V_PIPELINE,
     "yue2": YUE2_PIPELINE,
 }

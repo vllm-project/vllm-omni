@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 OmniVoice Decoder (Stage 1) - Audio token to waveform conversion.
 
@@ -23,49 +23,10 @@ import torch
 import torch.nn as nn
 from vllm.logger import init_logger
 
+from vllm_omni.model_executor.models.higgs_audio_v2.higgs_audio_decoder import HiggsAudioRVQ
 from vllm_omni.transformers_utils.configs.omnivoice import OmniVoiceConfig
 
 logger = init_logger(__name__)
-
-
-class HiggsAudioVQLayer(nn.Module):
-    """Single VQ layer: codebook lookup + project_out."""
-
-    def __init__(self, codebook_size: int = 1024, codebook_dim: int = 64, hidden_size: int = 1024):
-        super().__init__()
-        self.codebook = nn.Embedding(codebook_size, codebook_dim)
-        self.project_out = nn.Linear(codebook_dim, hidden_size)
-
-    def decode(self, indices: torch.Tensor) -> torch.Tensor:
-        """indices: [B, T] → [B, hidden_size, T]"""
-        quantized = self.codebook(indices)  # [B, T, codebook_dim]
-        quantized = self.project_out(quantized)  # [B, T, hidden_size]
-        return quantized.permute(0, 2, 1)  # [B, hidden_size, T]
-
-
-class HiggsAudioRVQ(nn.Module):
-    """Residual Vector Quantizer with 8 codebook layers."""
-
-    def __init__(
-        self, num_quantizers: int = 8, codebook_size: int = 1024, codebook_dim: int = 64, hidden_size: int = 1024
-    ):
-        super().__init__()
-        self.quantizers = nn.ModuleList(
-            [HiggsAudioVQLayer(codebook_size, codebook_dim, hidden_size) for _ in range(num_quantizers)]
-        )
-
-    def decode(self, codes: torch.Tensor) -> torch.Tensor:
-        """codes: [num_quantizers, B, T] → [B, hidden_size, T]"""
-        result = torch.zeros(
-            codes.shape[1],
-            self.quantizers[0].project_out.out_features,
-            codes.shape[2],
-            device=codes.device,
-            dtype=torch.float32,
-        )
-        for i, quantizer in enumerate(self.quantizers):
-            result = result + quantizer.decode(codes[i])
-        return result
 
 
 class OmniVoiceDecoder(nn.Module):

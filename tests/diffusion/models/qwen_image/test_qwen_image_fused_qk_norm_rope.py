@@ -8,7 +8,9 @@ from dataclasses import dataclass
 import pytest
 import torch
 import torch.nn as nn
+from vllm.platforms import current_platform
 
+from tests.helpers.mark import hardware_marks, hardware_test
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 from vllm_omni.diffusion.models.qwen_image import qwen_image_transformer as qwen_mod
 from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
@@ -16,7 +18,7 @@ from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
     _qwen_image_qk_norm_rope,
 )
 
-pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
+pytestmark = [pytest.mark.core_model, *hardware_marks(res={"cuda": "L4"}, num_cards=1), pytest.mark.diffusion]
 
 BATCH = 2
 Q_HEADS = 24
@@ -108,14 +110,38 @@ def _run(data: QwenImageQKInput, *, use_fused: bool = True) -> tuple[torch.Tenso
     )
 
 
+MIN_TOKENS_ENV = "VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS"
+
+
+def _nvidia_cuda_available() -> bool:
+    """True only where the fused QK-norm RoPE CUDA kernel can run."""
+    return bool(torch.cuda.is_available() and torch.version.hip is None and current_platform.is_cuda())
+
+
+def _rocm_available() -> bool:
+    """True on a ROCm platform with an available HIP-backed GPU."""
+    return bool(torch.cuda.is_available() and torch.version.hip is not None and current_platform.is_rocm())
+
+
+_REQUIRES_NVIDIA_CUDA = pytest.mark.skipif(
+    not _nvidia_cuda_available(),
+    reason="NVIDIA CUDA fused QK-norm RoPE kernel",
+)
+
+_REQUIRES_ROCM = pytest.mark.skipif(
+    not _rocm_available(),
+    reason="ROCm GPU required",
+)
+
+
 @pytest.fixture
 def force_always_fuse(monkeypatch):
-    """Disable the short-seq host gate so fused-kernel correctness tests keep
-    exercising the Triton path on tiny shapes."""
-    monkeypatch.setattr(qwen_mod, "fused_qk_norm_rope_min_tokens", lambda _default: 0)
+    """Exercise Triton on small test inputs."""
+    monkeypatch.delenv(MIN_TOKENS_ENV, raising=False)
+    monkeypatch.setattr(qwen_mod, "_FUSED_MIN_TOKENS", 0)
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_qwen_image_qk_norm_rope_cuda_fp32_fallback_matches_reference():
     data = _make_input(
@@ -132,7 +158,7 @@ def test_qwen_image_qk_norm_rope_cuda_fp32_fallback_matches_reference():
     torch.testing.assert_close(actual_k, expected_k, atol=1e-5, rtol=1e-5)
 
 
-@pytest.mark.cuda
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_qwen_image_qk_norm_rope_cuda_fp16_fallback_matches_reference():
     data = _make_input(
@@ -149,8 +175,8 @@ def test_qwen_image_qk_norm_rope_cuda_fp16_fallback_matches_reference():
     torch.testing.assert_close(actual_k, expected_k, atol=1e-3, rtol=1e-3)
 
 
-@pytest.mark.cuda
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@_REQUIRES_NVIDIA_CUDA
 @pytest.mark.parametrize("seq_len", [1, 7, 257, 1024])
 @pytest.mark.parametrize("packed_qkv_view", [False, True])
 def test_qwen_image_fused_qk_norm_rope_cuda_matches_fp32_rope_reference(
@@ -172,8 +198,8 @@ def test_qwen_image_fused_qk_norm_rope_cuda_matches_fp32_rope_reference(
     torch.testing.assert_close(actual_k, expected_k, atol=0.0625, rtol=0.02)
 
 
-@pytest.mark.cuda
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@_REQUIRES_NVIDIA_CUDA
 def test_qwen_image_fused_qk_norm_rope_torch_compile_fullgraph_capture(force_always_fuse):
     data = _make_input(
         seq_len=257,
@@ -206,11 +232,11 @@ def test_qwen_image_fused_qk_norm_rope_torch_compile_fullgraph_capture(force_alw
     torch.testing.assert_close(actual_k, expected_k, atol=0.0625, rtol=0.02)
 
 
-@pytest.mark.cuda
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@_REQUIRES_NVIDIA_CUDA
 def test_qwen_image_short_seq_default_gate_uses_eager_path(monkeypatch):
     """Below _FUSED_MIN_TOKENS the helper must stay on the eager chain (#7780)."""
-    monkeypatch.delenv("VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS", raising=False)
+    monkeypatch.delenv(MIN_TOKENS_ENV, raising=False)
     # BATCH*seq_len = 2*512 = 1024 < 2048
     data = _make_input(
         seq_len=512,
@@ -227,10 +253,10 @@ def test_qwen_image_short_seq_default_gate_uses_eager_path(monkeypatch):
     torch.testing.assert_close(actual_k, expected_k, atol=0, rtol=0)
 
 
-@pytest.mark.cuda
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@_REQUIRES_NVIDIA_CUDA
 def test_qwen_image_above_gate_uses_fused_path(monkeypatch):
-    monkeypatch.delenv("VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS", raising=False)
+    monkeypatch.delenv(MIN_TOKENS_ENV, raising=False)
     # BATCH*seq_len = 2*1024 = 2048 == _FUSED_MIN_TOKENS → fuse
     data = _make_input(
         seq_len=1024,
@@ -245,3 +271,156 @@ def test_qwen_image_above_gate_uses_fused_path(monkeypatch):
 
     torch.testing.assert_close(actual_q, expected_q, atol=0.0625, rtol=0.02)
     torch.testing.assert_close(actual_k, expected_k, atol=0.0625, rtol=0.02)
+
+
+# --- joint (text + image) launch ------------------------------------------
+
+
+def _joint_reference(txt: QwenImageQKInput, img: QwenImageQKInput, *, use_fused: bool):
+    """What the block does today: one `_qwen_image_qk_norm_rope` per stream,
+    then three `torch.cat`s into the joint sequence attention consumes."""
+    rope = RotaryEmbedding(is_neox_style=False)
+    img_q, img_k = _qwen_image_qk_norm_rope(
+        img.q, img.k, img.norm_q, img.norm_k, img.freqs, rope, EPS, use_fused=use_fused
+    )
+    txt_q, txt_k = _qwen_image_qk_norm_rope(
+        txt.q, txt.k, txt.norm_q, txt.norm_k, txt.freqs, rope, EPS, use_fused=use_fused
+    )
+    return torch.cat([txt_q, img_q], dim=1), torch.cat([txt_k, img_k], dim=1)
+
+
+@_REQUIRES_NVIDIA_CUDA
+@pytest.mark.parametrize("txt_len,img_len", [(512, 4096), (77, 1024)])
+def test_joint_launch_matches_per_stream_then_cat(txt_len, img_len, force_always_fuse):
+    """The joint op replaces two per-stream launches plus three cats; its Q/K
+    must equal the per-stream fused path's, bitwise."""
+    from vllm_omni.diffusion.layers.fused_qk_norm_rope import fused_joint_qkv_norm_rope
+    from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import _packed_qk_norm_rope_table
+
+    device = torch.device("cuda")
+    txt = _make_input(seq_len=txt_len, dtype=torch.bfloat16, device=device, packed_qkv_view=True)
+    img = _make_input(seq_len=img_len, dtype=torch.bfloat16, device=device, packed_qkv_view=True)
+    txt_v = torch.randn_like(txt.q)
+    img_v = torch.randn_like(img.q)
+
+    table = _packed_qk_norm_rope_table(img.freqs, txt.freqs, BATCH, torch.bfloat16)
+    assert table is not None and table.shape == (BATCH * (txt_len + img_len), HEAD_DIM)
+
+    joint_q, joint_k, joint_v = fused_joint_qkv_norm_rope(
+        txt.q,
+        txt.k,
+        txt_v,
+        img.q,
+        img.k,
+        img_v,
+        txt.norm_q.weight,
+        txt.norm_k.weight,
+        img.norm_q.weight,
+        img.norm_k.weight,
+        table,
+        EPS,
+    )
+    exp_q, exp_k = _joint_reference(txt, img, use_fused=True)
+    assert torch.equal(joint_q, exp_q)
+    assert torch.equal(joint_k, exp_k)
+    assert torch.equal(joint_v, torch.cat([txt_v, img_v], dim=1))
+
+
+def test_packed_table_skipped_when_fused_path_unavailable(force_always_fuse):
+    """No table, no allocation, where the CUDA kernel cannot run."""
+    from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import _packed_qk_norm_rope_table
+
+    vid = torch.polar(torch.ones(64, HEAD_DIM // 2), torch.randn(64, HEAD_DIM // 2))
+    txt = torch.polar(torch.ones(16, HEAD_DIM // 2), torch.randn(16, HEAD_DIM // 2))
+    assert _packed_qk_norm_rope_table(vid, txt, 1, torch.bfloat16) is None  # CPU
+    if _nvidia_cuda_available():
+        vid, txt = vid.cuda(), txt.cuda()
+        assert _packed_qk_norm_rope_table(vid, txt, 1, torch.float16) is None  # non-bf16 activations
+        table = _packed_qk_norm_rope_table(vid, txt, 1, torch.bfloat16)
+        assert table is not None and table.dtype == torch.float32  # same dtype as the per-stream table
+        expected = torch.cat((torch.cat((txt, vid)).real, torch.cat((txt, vid)).imag), dim=-1)
+        assert torch.equal(table, expected)  # text first, as the eager cat
+    elif _rocm_available():
+        vid, txt = vid.cuda(), txt.cuda()
+        assert _packed_qk_norm_rope_table(vid, txt, 1, torch.bfloat16) is None
+
+
+@_REQUIRES_NVIDIA_CUDA
+def test_packed_table_respects_token_gate(monkeypatch):
+    """The joint launch keeps the per-stream gate: below it main's eager chain runs."""
+    from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import _packed_qk_norm_rope_table
+
+    monkeypatch.delenv(MIN_TOKENS_ENV, raising=False)
+    vid = torch.polar(torch.ones(64, HEAD_DIM // 2), torch.randn(64, HEAD_DIM // 2)).cuda()
+    txt = torch.polar(torch.ones(16, HEAD_DIM // 2), torch.randn(16, HEAD_DIM // 2)).cuda()
+    assert 2 * 80 < _FUSED_MIN_TOKENS
+    assert _packed_qk_norm_rope_table(vid, txt, 2, torch.bfloat16) is None
+    monkeypatch.setattr(qwen_mod, "_FUSED_MIN_TOKENS", 160)
+    assert _packed_qk_norm_rope_table(vid, txt, 2, torch.bfloat16).shape == (160, HEAD_DIM)
+    assert _packed_qk_norm_rope_table(vid, txt, 1, torch.bfloat16) is None
+
+
+# --- VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS override -----------------------
+
+
+@_REQUIRES_NVIDIA_CUDA
+def test_min_tokens_env_large_value_disables_both_paths(monkeypatch):
+    """A value above every sequence keeps both the joint and the per-stream path on the eager chain."""
+    from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import _packed_qk_norm_rope_table
+
+    monkeypatch.setenv(MIN_TOKENS_ENV, str(1 << 40))
+    # per stream: BATCH*1024 = 2048 fuses by default, not under the override
+    data = _make_input(seq_len=1024, dtype=torch.bfloat16, device=torch.device("cuda:0"), packed_qkv_view=False)
+    actual_q, actual_k = _run(data, use_fused=True)
+    expected_q, expected_k = _eager_rotary(data)
+    torch.testing.assert_close(actual_q, expected_q, atol=0, rtol=0)
+    torch.testing.assert_close(actual_k, expected_k, atol=0, rtol=0)
+    # joint: 1*(48+2000) = 2048 positions packs by default, not under the override
+    vid = torch.polar(torch.ones(2000, HEAD_DIM // 2), torch.randn(2000, HEAD_DIM // 2)).cuda()
+    txt = torch.polar(torch.ones(48, HEAD_DIM // 2), torch.randn(48, HEAD_DIM // 2)).cuda()
+    assert _packed_qk_norm_rope_table(vid, txt, 1, torch.bfloat16) is None
+    monkeypatch.delenv(MIN_TOKENS_ENV)
+    assert _packed_qk_norm_rope_table(vid, txt, 1, torch.bfloat16).shape == (2048, HEAD_DIM)
+
+
+@_REQUIRES_NVIDIA_CUDA
+def test_min_tokens_env_zero_forces_both_paths(monkeypatch):
+    """``0`` removes the threshold for the joint and the per-stream path alike."""
+    from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import _packed_qk_norm_rope_table
+
+    monkeypatch.setenv(MIN_TOKENS_ENV, "0")
+    # per stream: BATCH*512 = 1024 < 2048 stays eager by default, fuses under the override
+    data = _make_input(seq_len=512, dtype=torch.bfloat16, device=torch.device("cuda:0"), packed_qkv_view=False)
+    actual_q, actual_k = _run(data, use_fused=True)
+    expected_q, expected_k = _fused_kernel_reference(data)
+    torch.testing.assert_close(actual_q, expected_q, atol=0.0625, rtol=0.02)
+    torch.testing.assert_close(actual_k, expected_k, atol=0.0625, rtol=0.02)
+    # joint: 1*(16+64) = 80 positions is far below the default gate
+    vid = torch.polar(torch.ones(64, HEAD_DIM // 2), torch.randn(64, HEAD_DIM // 2)).cuda()
+    txt = torch.polar(torch.ones(16, HEAD_DIM // 2), torch.randn(16, HEAD_DIM // 2)).cuda()
+    assert _packed_qk_norm_rope_table(vid, txt, 1, torch.bfloat16).shape == (80, HEAD_DIM)
+
+
+@_REQUIRES_ROCM
+def test_packed_table_is_none_on_rocm(force_always_fuse):
+    """The token gate is open, but ROCm has no fused CUDA kernel."""
+    from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import _packed_qk_norm_rope_table
+
+    assert torch.version.hip is not None
+    vid = torch.polar(torch.ones(64, HEAD_DIM // 2), torch.randn(64, HEAD_DIM // 2)).cuda()
+    txt = torch.polar(torch.ones(16, HEAD_DIM // 2), torch.randn(16, HEAD_DIM // 2)).cuda()
+    assert _packed_qk_norm_rope_table(vid, txt, 1, torch.bfloat16) is None
+
+
+def test_min_tokens_env_invalid_value_raises(monkeypatch):
+    """Both paths surface the shared parser's ``ValueError`` before touching the tensors."""
+    from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import _packed_qk_norm_rope_table
+
+    monkeypatch.setenv(MIN_TOKENS_ENV, "many")
+    data = _make_input(seq_len=8, dtype=torch.bfloat16, device=torch.device("cpu"), packed_qkv_view=False)
+    with pytest.raises(ValueError, match=MIN_TOKENS_ENV):
+        _run(data, use_fused=True)
+    vid = torch.polar(torch.ones(64, HEAD_DIM // 2), torch.randn(64, HEAD_DIM // 2))
+    txt = torch.polar(torch.ones(16, HEAD_DIM // 2), torch.randn(16, HEAD_DIM // 2))
+    with pytest.raises(ValueError, match=MIN_TOKENS_ENV):
+        _packed_qk_norm_rope_table(vid, txt, 1, torch.bfloat16)

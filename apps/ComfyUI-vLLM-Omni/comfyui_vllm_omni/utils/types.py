@@ -18,6 +18,10 @@ class DiffusionSamplingParams(dict):
     pass
 
 
+class YuE2ModelSpecificParams(dict[str, str]):
+    """YuE2 music conditioning parameters."""
+
+
 class QwenTTSModelSpecificParams(dict):
     pass
 

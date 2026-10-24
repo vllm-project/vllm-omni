@@ -51,8 +51,6 @@ def _serving(metrics: _MetricsStub, *, adapter=None) -> OmniOpenAIServingSpeech:
         audio_data=b"\0\0" * int(audio_obj.audio_tensor.size),
         media_type="audio/pcm",
     )
-    serving._mark_ref_audio_artifact_ready_for_request = lambda request_id: None
-    serving._discard_ref_audio_artifact_warmup = lambda request_id: None
     return serving
 
 

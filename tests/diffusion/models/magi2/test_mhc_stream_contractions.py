@@ -8,6 +8,7 @@ from functools import partial
 import pytest
 import torch
 
+from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.layers.mhc import MHCMix
 from vllm_omni.diffusion.models.magi2 import layers
 
@@ -186,7 +187,7 @@ def test_musa_mix_is_an_fp32_contraction(dtype):
     torch.testing.assert_close(branch, torch.einsum("tn,tc->tnc", post, branch_output), rtol=0, atol=0)
 
 
-@pytest.mark.musa
+@hardware_test(res={"musa": "S5000"}, num_cards=1)
 @pytest.mark.parametrize("dtype", DTYPES)
 def test_musa_device_contractions_are_as_accurate_as_einsum(dtype):
     if not hasattr(torch, "musa") or not torch.musa.is_available():
@@ -361,7 +362,7 @@ def _region_inputs(tokens, hidden, device, seed=10):
     )
 
 
-@pytest.mark.musa
+@hardware_test(res={"musa": "S5000"}, num_cards=1)
 @pytest.mark.parametrize("tokens", [1031, 3702])
 @pytest.mark.parametrize(
     "group_sizes",
