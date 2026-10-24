@@ -46,7 +46,49 @@ import torch
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 
+from vllm_omni.diffusion.offloader.config import OffloadStrategy, resolve_offload_strategy
 from vllm_omni.platforms import current_omni_platform
+
+
+def decode_graph_config_eligible(od_config) -> bool:
+    """Return whether Qwen-Image-2.1 decode graphs are viable from config alone.
+
+    This is shared with request admission, which runs before the transformer is
+    loaded and cannot inspect its parameters or installed hooks. Runtime-only
+    restrictions remain checked by the manager below.
+    """
+    if not getattr(od_config, "enable_cuda_graph_decode", True) or getattr(od_config, "enforce_eager", False):
+        return False
+    if not current_omni_platform.is_cuda():
+        return False
+
+    parallel = getattr(od_config, "parallel_config", None)
+    if parallel is not None and (
+        (getattr(parallel, "tensor_parallel_size", 1) or 1) > 1
+        or (getattr(parallel, "sequence_parallel_size", 1) or 1) > 1
+        or (getattr(parallel, "ring_degree", 1) or 1) > 1
+        or getattr(parallel, "use_hsdp", False)
+    ):
+        return False
+
+    # The manager cannot capture quantized prefix KV; reject configured KV
+    # quantization before token lengths are incorporated into scheduler keys.
+    extras = getattr(od_config, "extras", None) or {}
+    if extras.get("prefix_kv_cache_dtype") not in (None, "auto"):
+        return False
+    if getattr(od_config, "diffusion_kv_cache_dtype", None) not in (None, "auto"):
+        return False
+
+    # Model-level offload installs persistent staging for graph-enabled CUDA
+    # DiTs. Layer-wise offload does not preserve captured weight pointers.
+    if resolve_offload_strategy(od_config) not in {
+        OffloadStrategy.NONE,
+        OffloadStrategy.MODEL_LEVEL,
+        OffloadStrategy.DISTRIBUTED_LAYER_WISE,
+    }:
+        return False
+    return True
+
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.models.qwen_image_21.qwen_image_21_transformer import (
@@ -216,6 +258,11 @@ class QwenImage21DecodeGraphManager:
     def _check_static_eligibility(self) -> bool:
         """One-time checks that cannot change after weights are loaded."""
         model = self.model
+        if not getattr(model, "_decode_graph_config_eligible", True):
+            logger.warning_once(
+                "Qwen-Image-2.1 CUDA graph decode disabled by configuration. Falling back to eager decode."
+            )
+            return False
         reason = self._offload_reason()
         param = next(model.parameters(), None)
         if reason is None and (param is None or param.device.type != "cuda"):
