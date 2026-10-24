@@ -39,6 +39,11 @@ from vllm.config import VllmConfig
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 
+from vllm_omni.metrics.duplex_frame_timing import (
+    frame_timing_clock,
+    frame_timing_synchronize,
+    log_stage1_decode_event,
+)
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.utils.device_copy import HostCopyBatch
 
@@ -275,7 +280,15 @@ class PersonaPlexCode2Wav(nn.Module):
                 self._consumed_full_payload_requests.add(state_id)
             pending.append((i, state_id, codes_kf))
 
-        for i, wav in self._decode_pending(pending):
+        # One span covers the whole batched stage-1 decode of this forward;
+        # close it with a host sync so decode_ms covers GPU execution,
+        # serializing stage-1 decode while timing is on.
+        decode_t0 = frame_timing_clock()
+        decoded = self._decode_pending(pending)
+        frame_timing_synchronize()
+        for _, state_id, codes in pending:
+            log_stage1_decode_event(state_id, int(codes.shape[1]), decode_t0, num_req)
+        for i, wav in decoded:
             audios[i] = wav
 
         return OmniOutput(
@@ -331,7 +344,14 @@ class PersonaPlexCode2Wav(nn.Module):
         if not spans:
             return decoded
         rows = [self._lease_row(state_id) for _, state_id, _, _ in spans]
-        for (i, _, _, _), wav in zip(spans, self._decode_spans(ids, spans, rows), strict=True):
+        # One span covers the whole batched decode of this async-chunk step;
+        # close it with a host sync so decode_ms covers GPU execution,
+        # serializing stage-1 decode while timing is on.
+        decode_t0 = frame_timing_clock()
+        wavs = self._decode_spans(ids, spans, rows)
+        frame_timing_synchronize()
+        for (i, state_id, _, span_frames), wav in zip(spans, wavs, strict=True):
+            log_stage1_decode_event(state_id, span_frames, decode_t0, len(counts))
             decoded[i] = wav
         return decoded
 
