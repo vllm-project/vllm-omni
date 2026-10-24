@@ -215,3 +215,86 @@ def test_cache_reset_failure_is_serialized_and_pool_remains_usable(method, failu
         assert await pool.collective_rpc(0, "is_sleeping") == {"via": "collective"}
 
     asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_collective_rpc_add_lora_routes_through_typed_client_helper():
+    """#9242: the generic collective path nests the LoRARequest in an untyped
+    args tuple and the worker decodes it as a plain list. The dispatch must hand
+    it to the typed utility call so the adapter survives as a struct."""
+
+    from vllm.lora.request import LoRARequest
+
+    async def run() -> None:
+        add_lora = AsyncMock(return_value=True)
+        pool, client = _make_pool(add_lora_async=add_lora)
+        request = LoRARequest(lora_name="adapter", lora_int_id=1, lora_path="/tmp/adapter")
+
+        result = await pool.collective_rpc(0, "add_lora", args=(request,))
+
+        assert result is True
+        add_lora.assert_awaited_once_with(request)
+        client.collective_rpc_async.assert_not_awaited()
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_collective_rpc_add_lora_on_diffusion_stage_keeps_generic_path():
+    """Diffusion stages keep the generic collective path; only LLM/AR stages
+    take the typed helper (their current not-implemented shape is unchanged)."""
+
+    from vllm.lora.request import LoRARequest
+
+    async def run() -> None:
+        add_lora = AsyncMock(return_value=True)
+        pool, client = _make_pool(stage_type="diffusion", add_lora_async=add_lora)
+        request = LoRARequest(lora_name="adapter", lora_int_id=1, lora_path="/tmp/adapter")
+
+        result = await pool.collective_rpc(0, "add_lora", args=(request,))
+
+        assert result == {"via": "collective"}
+        add_lora.assert_not_awaited()
+        client.collective_rpc_async.assert_awaited_once_with(
+            method="add_lora",
+            timeout=None,
+            args=(request,),
+            kwargs={},
+        )
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_collective_rpc_add_lora_without_a_struct_falls_back_to_generic_path():
+    async def run() -> None:
+        add_lora = AsyncMock(return_value=True)
+        pool, client = _make_pool(add_lora_async=add_lora)
+
+        result = await pool.collective_rpc(0, "add_lora", args=("not-a-request",))
+
+        assert result == {"via": "collective"}
+        add_lora.assert_not_awaited()
+        client.collective_rpc_async.assert_awaited_once()
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_collective_rpc_add_lora_honors_timeout():
+    async def run() -> None:
+        from vllm.lora.request import LoRARequest
+
+        async def slow_add(*_args, **_kwargs):
+            await asyncio.sleep(1.0)
+            return True
+
+        pool, _client = _make_pool(add_lora_async=AsyncMock(side_effect=slow_add))
+        request = LoRARequest(lora_name="adapter", lora_int_id=1, lora_path="/tmp/adapter")
+        # Non-control methods convert a timeout into the same error shape the
+        # generic path produces.
+        result = await pool.collective_rpc(0, "add_lora", timeout=0.01, args=(request,))
+        assert result["supported"] is False
+        assert "timed out" in result["error"]
+
+    asyncio.run(run())
