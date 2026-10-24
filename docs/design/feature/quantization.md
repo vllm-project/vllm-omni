@@ -171,6 +171,16 @@ resolved through `quantization_config`; runtime attention/KV-cache quantization
 is configured by the diffusion attention configuration and must be validated
 independently.
 
+MiniMax-H3's offline SVDQuant candidate has a separate serialized contract:
+rank-32 NVFP4 W4A4 DiT weights, encoder-local W4A16 metadata, exact BF16 AdaLN
+timestep tables, and an explicitly configured FP16 video decoder. Global DiT
+SVDQuant metadata keeps an ordinary encoder in BF16. CPU offload loads the
+packed checkpoint on CPU and stages each linear on the execution device for
+backend layout processing. The W4A16 implementation temporarily dequantizes
+one linear for BF16 GEMM; it does not claim a native fused weight-only kernel.
+See the [recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/MiniMaxAI/MiniMax-H3-SVDQuant.md) for schedule,
+parallelism and validation limits.
+
 ## Platform and parallelism boundaries
 
 Platform checks belong in the method implementation rather than in the common

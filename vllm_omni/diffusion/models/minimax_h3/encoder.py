@@ -1137,6 +1137,9 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
             )
             self.quant_config = quant_config
         _validate_encoder_quant_config(quant_config)
+        weight_only_nvfp4 = quant_config is not None and quant_config.get_name() == "svdquant"
+        if weight_only_nvfp4 and (quant_config.activation_bits != 16 or self._tp_size != 1):
+            raise ValueError("MiniMax-H3 serialized NVFP4 encoder requires W4A16 and text_encoder_tp_size=1")
         dtype = torch.bfloat16
         self.vision = MiniMaxH3Qwen3VLVisionModel(config.vision_config)
         self.vision.to(dtype=dtype)
@@ -1147,7 +1150,7 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
             dtype,
             quant_config=quant_config,
         )
-        if not isinstance(quant_config, FastH3NVFP4Config):
+        if not weight_only_nvfp4 and not isinstance(quant_config, FastH3NVFP4Config):
             self.text_model.to(dtype=dtype)
         logger.info(
             "MiniMax H3 Qwen3-VL encoder: %d retained decoder layers, text_encoder_tp_size=%d, vision replicated",
@@ -1209,6 +1212,8 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
         serialized_map = self.quant_config.weight_map if isinstance(self.quant_config, FastH3NVFP4Config) else {}
         params = dict(self.named_parameters())
         loaded: set[str] = set()
+        quant_config = getattr(self, "quant_config", None)
+        serialized_fused = quant_config is not None and quant_config.get_name() == "svdquant"
         # Seeded from modules that own a multi-shard loader, so a fused weight
         # receiving no source shard is caught as well as a partially filled one.
         expected_fused_shards: dict[str, tuple[tuple[str, str | int], ...]] = {
@@ -1232,7 +1237,11 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
             if param is None:
                 logger.warning("MiniMax H3 text encoder weight %s has no target parameter", name)
                 continue
-            weight_loader = getattr(param, "weight_loader", _default_weight_loader)
+            weight_loader = (
+                _default_weight_loader
+                if serialized_fused and shard_id is None
+                else getattr(param, "weight_loader", _default_weight_loader)
+            )
             weight_loader(param, tensor, shard_id)
             loaded.add(param_name)
             if shard_id is not None and param_name in loaded_fused_shards:
