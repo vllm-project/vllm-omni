@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import copy
 from dataclasses import MISSING, field
 from typing import Any, Literal
 
@@ -18,6 +19,7 @@ from vllm.transformers_utils.model_arch_config_convertor import (
 )
 
 import vllm_omni.model_executor.models as me_models
+from vllm_omni.distributed.omni_connectors.utils.config import connector_hash_factors
 
 logger = init_logger(__name__)
 
@@ -167,6 +169,21 @@ class OmniModelConfig(ModelConfig):
     # ``cfg_role`` for classifier-free-guidance request pairs).
     sampling_extra_args_keys: tuple[str, ...] = ()
     requires_full_payload_input: bool = False
+
+    def compute_hash(self) -> str:
+        """Compute the hash for the Omni Model config to be used for the compile cache."""
+        # Remove hash factors on a copy of the object, then use the mutated copy to get the hash.
+        # This is a workaround to vLLM's ModelConfig not having a clean way of changing its config
+        # factors. See: https://github.com/vllm-project/vllm/blob/v0.31.0/vllm/config/model.py#L434
+        hashed = copy.copy(self)
+        # connector config are handled here to ensure UUIDs don't cause compile cache misses
+        hashed.stage_connector_config = connector_hash_factors(self.stage_connector_config)
+        if self.omni_kv_config and self.omni_kv_config.get("connector_config"):
+            hashed.omni_kv_config = {
+                **self.omni_kv_config,
+                "connector_config": connector_hash_factors(self.omni_kv_config["connector_config"]),
+            }
+        return super(OmniModelConfig, hashed).compute_hash()
 
     @property
     def registry(self):
