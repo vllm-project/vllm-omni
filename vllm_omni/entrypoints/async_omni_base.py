@@ -108,6 +108,9 @@ class AsyncOmniBase(OmniBase):
     def __init__(self, *args: Any, model: str = "", **kwargs: Any) -> None:
         OmniBase.__init__(self, model=model, **kwargs)
         self.final_output_task: asyncio.Task | None = None
+        # Serving loop that owns the per-request queues; captured when the
+        # output handler starts so shutdown() can enqueue thread-safely.
+        self._loop: asyncio.AbstractEventLoop | None = None
         self.event_resolver = AsyncEventResolver(orchestrator=self)
         self.config_path = self.engine.config_path
         self.input_processor = self.engine.input_processor
@@ -322,6 +325,7 @@ class AsyncOmniBase(OmniBase):
         if self.final_output_task is not None:
             return
 
+        self._loop = asyncio.get_running_loop()
         engine = self.engine
 
         async def _final_output_loop():
@@ -578,7 +582,34 @@ class AsyncOmniBase(OmniBase):
 
     def shutdown(self, timeout: float | None = None) -> None:
         """Shutdown the engine."""
+        self._fail_pending_requests("server is shutting down")
         if self.final_output_task is not None:
             self.final_output_task.cancel()
             self.final_output_task = None
         OmniBase.shutdown(self)
+
+    def _fail_pending_requests(self, reason: str) -> None:
+        """Resolve every in-flight request with a terminal fatal error.
+
+        The output pump is the only writer to the per-request queues and it is
+        about to be torn down, so without this a request blocked in
+        ``_process_orchestrator_results`` would wait on its queue forever and
+        the graceful HTTP shutdown would in turn wait on the request (#8912).
+        """
+        if not self.request_states:
+            return
+        logger.info(
+            "[%s] Failing %d in-flight request(s): %s",
+            self._name,
+            len(self.request_states),
+            reason,
+        )
+        loop = self._loop
+        for req_state in list(self.request_states.values()):
+            msg = ErrorMessage(error=reason, fatal=True, request_id=req_state.request_id)
+            if loop is not None and loop.is_running():
+                # The launcher calls shutdown() on an executor thread; enqueue
+                # thread-safely so the waiting coroutine wakes in its own loop.
+                loop.call_soon_threadsafe(req_state.queue.put_nowait, msg)
+            else:
+                req_state.queue.put_nowait(msg)

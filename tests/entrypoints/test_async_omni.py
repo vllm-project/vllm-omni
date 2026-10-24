@@ -944,3 +944,86 @@ async def test_paced_output_credit_waits_for_consumer(mocker):
         await anext(outputs)
     assert rpc.await_count == 2
     assert rpc.call_args.kwargs["args"] == (submitted[0]["request_id"], 1)
+
+
+@pytest.mark.cpu
+def test_shutdown_fails_pending_requests():
+    """shutdown() resolves in-flight requests with a terminal fatal error: the
+    output pump is the only writer to the per-request queues and it stops
+    during teardown, so without this a request blocked on its queue would hang
+    the graceful HTTP shutdown (#8912)."""
+    omni = object.__new__(AsyncOmni)
+    omni._loop = None
+    omni.final_output_task = None
+    omni.request_states = {}
+    shutdown_calls = []
+    omni.engine = SimpleNamespace(shutdown=lambda *a, **k: shutdown_calls.append(1))
+
+    for rid in ("req-1", "req-2"):
+        omni.request_states[rid] = SimpleNamespace(request_id=rid, queue=asyncio.Queue())
+
+    omni.shutdown()
+
+    from vllm_omni.engine.messages import ErrorMessage
+
+    for rid in ("req-1", "req-2"):
+        msg = omni.request_states[rid].queue.get_nowait()
+        assert isinstance(msg, ErrorMessage)
+        assert msg.fatal
+        assert msg.request_id == rid
+    assert shutdown_calls == [1]
+
+
+@pytest.mark.cpu
+def test_shutdown_fails_pending_requests_from_foreign_thread():
+    """The launcher runs shutdown() on an executor thread while the serving
+    loop is alive with a request already blocked on its queue; the terminal
+    error must be enqueued via call_soon_threadsafe so the waiter wakes in
+    its own loop and teardown completes (#8912). A direct put_nowait from the
+    executor thread must fail this test."""
+
+    import threading
+
+    async def run():
+        omni = object.__new__(AsyncOmni)
+        omni._loop = asyncio.get_running_loop()
+        omni.request_states = {"req-1": SimpleNamespace(request_id="req-1", queue=asyncio.Queue())}
+        omni.engine = SimpleNamespace(shutdown=lambda *a, **k: None)
+        # A live output pump that shutdown() must cancel.
+        pump = asyncio.create_task(asyncio.Event().wait())
+        omni.final_output_task = pump
+
+        # The request waiter is demonstrably blocked before shutdown runs.
+        waiter = asyncio.create_task(omni.request_states["req-1"].queue.get())
+        await asyncio.sleep(0)
+        assert not waiter.done()
+
+        # Record which thread the enqueue is scheduled from: the regression
+        # binds to call_soon_threadsafe being used from the executor thread.
+        scheduled_from = []
+        orig_call_soon_threadsafe = omni._loop.call_soon_threadsafe
+
+        def spy(callback, *args, **kwargs):
+            scheduled_from.append(threading.get_ident())
+            return orig_call_soon_threadsafe(callback, *args, **kwargs)
+
+        omni._loop.call_soon_threadsafe = spy
+        main_thread = threading.get_ident()
+        try:
+            await asyncio.wait_for(omni._loop.run_in_executor(None, omni.shutdown), timeout=5)
+            msg = await asyncio.wait_for(waiter, timeout=5)
+        finally:
+            omni._loop.call_soon_threadsafe = orig_call_soon_threadsafe
+
+        from vllm_omni.engine.messages import ErrorMessage
+
+        assert isinstance(msg, ErrorMessage)
+        assert msg.fatal
+        # The enqueue went through call_soon_threadsafe from the executor
+        # thread, not put_nowait on the loop thread (and not inline).
+        assert scheduled_from and scheduled_from[0] != main_thread
+        # The live output pump was cancelled during teardown.
+        assert omni.final_output_task is None
+        assert pump.done() and pump.cancelled()
+
+    asyncio.run(run())
