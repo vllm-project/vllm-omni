@@ -1686,3 +1686,130 @@ def test_execute_stepwise_with_cfg_parallel():
         args=(world_size, "cfg", "29542"),
         nprocs=world_size,
     )
+
+
+class _RankLocalPrepareFailurePipeline(_PerRequestErrorStepPipeline):
+    """Fails ``req-bad`` in ``prepare_encode`` on rank 1 only."""
+
+    def __init__(self, rank: int):
+        super().__init__()
+        self.rank = rank
+
+    def prepare_encode(self, state, **kwargs):
+        if self.rank == 1 and state.request_id == "req-bad":
+            raise RuntimeError("rank-local prepare_encode failure")
+        return super().prepare_encode(state, **kwargs)
+
+
+class _RankLocalChunkFailurePipeline(_PerRequestErrorStepPipeline):
+    """Interactive pipeline that fails ``req-bad`` in ``prepare_next_chunk`` on rank 1 only."""
+
+    def __init__(self, rank: int):
+        super().__init__()
+        self.rank = rank
+
+    def peek_chunk_media(self, state):
+        from vllm_omni.diffusion.interaction.types import ChunkMediaSpec
+
+        del state
+        return ChunkMediaSpec(num_media_frames=8, fps=16.0, num_latent_frames=8)
+
+    def apply_interaction_at_chunk_boundary(self, state):
+        del state
+
+    def prepare_next_chunk(self, state):
+        if self.rank == 1 and state.request_id == "req-bad":
+            raise RuntimeError("rank-local prepare_next_chunk failure")
+
+
+class _InitialSessionCoordinator:
+    def maybe_prepare_initial_session(self, state, pipeline):
+        from vllm_omni.diffusion.interaction.types import InteractionChunkMetadata
+
+        del state, pipeline
+        return InteractionChunkMetadata(started_event_ids=[], active_event_ids=[], completed_event_ids=[])
+
+
+def _rank_local_prepare_failure_worker(rank: int, rendezvous: str, results) -> None:
+    import traceback
+    from datetime import timedelta
+
+    from vllm_omni.diffusion.distributed import parallel_state
+
+    torch.set_num_threads(1)
+    model_runner_module.set_forward_context = _noop_forward_context
+    torch.distributed.init_process_group(
+        "gloo", init_method=f"file://{rendezvous}", rank=rank, world_size=2, timeout=timedelta(seconds=30)
+    )
+    parallel_state._WORLD = parallel_state.init_world_group([0, 1], rank, "gloo")
+    # Production device groups are NCCL; any collective on this sentinel fails,
+    # so the vote must run on the Gloo group.
+    parallel_state._WORLD.device_group = object()
+    try:
+        observed = {}
+        for failing_hook in ("prepare_encode", "prepare_next_chunk"):
+            runner = _make_runner()
+            if failing_hook == "prepare_encode":
+                runner.pipeline = _RankLocalPrepareFailurePipeline(rank)
+            else:
+                runner.pipeline = _RankLocalChunkFailurePipeline(rank)
+                runner._interaction_coordinator = _InitialSessionCoordinator()
+            reqs = [_make_step_request(), _make_step_request()]
+            reqs[0].request_id, reqs[1].request_id = "req-bad", "req-good"
+            result = DiffusionModelRunner.execute_stepwise(runner, _make_batch_scheduler_output(reqs))
+            bad, good = result.get_request_output("req-bad"), result.get_request_output("req-good")
+            observed[failing_hook] = {
+                "bad_finished": bad.finished,
+                "bad_error": None if bad.result is None else bad.result.error,
+                "good": (good.finished, good.step_index),
+                "state_cache": sorted(runner.state_cache),
+                "denoise_calls": runner.pipeline.denoise_calls,
+            }
+        results.put((rank, observed))
+    except BaseException:
+        results.put((rank, traceback.format_exc()))
+    finally:
+        parallel_state._WORLD = None
+        torch.distributed.destroy_process_group()
+
+
+@pytest.mark.cpu
+def test_rank_local_prepare_failure_is_agreed_across_dit_ranks(tmp_path):
+    """A request whose preparation fails on one DiT rank only, outside pipeline collectives, is dropped on every rank.
+
+    Uses real Gloo collectives rather than patching ``_dit_any_rank_failed``: a
+    rank that keeps the request would enter the denoise collectives alone.
+    """
+    import multiprocessing as mp
+
+    ctx = mp.get_context("spawn")
+    results = ctx.Queue()
+    workers = [
+        ctx.Process(target=_rank_local_prepare_failure_worker, args=(rank, str(tmp_path / "rendezvous"), results))
+        for rank in range(2)
+    ]
+    try:
+        for worker in workers:
+            worker.start()
+        observed = dict(results.get(timeout=240) for _ in workers)
+        for worker in workers:
+            worker.join(timeout=60)
+            assert worker.exitcode == 0
+    finally:
+        for worker in workers:
+            if worker.is_alive():
+                worker.kill()
+
+    for rank in range(2):
+        assert isinstance(observed[rank], dict), observed[rank]
+        for failing_hook in ("prepare_encode", "prepare_next_chunk"):
+            rank_view = observed[rank][failing_hook]
+            assert rank_view["bad_finished"] is True, observed
+            expected_error = (
+                f"rank-local {failing_hook} failure" if rank == 1 else "Stepwise preparation failed on another DiT rank"
+            )
+            assert expected_error in (rank_view["bad_error"] or ""), observed
+            # The healthy request in the same tick still runs its first step on both ranks.
+            assert rank_view["good"] == (False, 1), observed
+            assert rank_view["state_cache"] == ["req-good"], observed
+            assert rank_view["denoise_calls"] == 1, observed
