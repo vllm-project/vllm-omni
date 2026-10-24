@@ -677,5 +677,38 @@ def test_profiler_stage_durations_print_without_print_stage(capsys) -> None:
     assert "stage_0_gen_ms" not in metrics.stage_durations_mean
 
 
+@pytest.mark.parametrize(
+    "intervals,expected_peak",
+    [
+        ([(i / 8, 0.125) for i in range(5)], 1),
+        ([(0.0, 0.25), (0.25, 0.25)], 1),
+        ([(0.25, 0.5), (0.0, 0.5), (0.125, 0.25)], 3),
+        ([(0.0, 0.0)], 0),
+        ([(0.0, 0.5)] * 64 + [(0.5, 0.25)] * 64, 64),
+    ],
+)
+def test_peak_concurrency_counts_overlapping_intervals_not_bucket_visits(intervals, expected_peak):
+    outputs = []
+    for start, latency in intervals:
+        output = _make_output(1, output_tokens=1)
+        output.start_time = 100.0 + start
+        output.latency = latency
+        output.ttft = 0.0
+        outputs.append(output)
+    # Preserve the existing successful-request population.
+    failed = _make_output(1, output_tokens=1)
+    failed.success = False
+    failed.start_time = 100.0
+    failed.latency = 1.0
+    outputs.append(failed)
+
+    metrics = _calculate_test_metrics(outputs)
+
+    assert metrics.max_concurrent_requests == expected_peak
+    # Every successful request emits one token within the same second; token
+    # throughput deliberately retains its existing one-second bucketing.
+    assert metrics.max_output_tokens_per_s == len(intervals)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-s"])

@@ -1078,6 +1078,7 @@ def calculate_metrics(
         duration_seconds = int(np.ceil(max_end_time - min_start_time)) + 1
         tokens_per_second = np.zeros(duration_seconds)
         concurrent_requests_per_second = np.zeros(duration_seconds)
+        request_events: list[tuple[float, int]] = []
 
         for i, output in enumerate(successful_outputs):
             session_metrics = getattr(output, "duplex_session_metrics", None)
@@ -1107,21 +1108,30 @@ def calculate_metrics(
                         if 0 <= second_bucket < duration_seconds:
                             tokens_per_second[second_bucket] += 1
 
-            # Track concurrent requests for each second this request was active
+            if output.latency > 0:
+                request_events.append((output.start_time, 1))
+                request_events.append((output.start_time + output.latency, -1))
+
+            # Count requests touching each bucket for the activity plot only.
             request_start_second = int(output.start_time - min_start_time)
             request_end_second = int((output.start_time + output.latency) - min_start_time)
 
             for second in range(request_start_second, request_end_second + 1):
                 concurrent_requests_per_second[second] += 1
 
-        # Find the maximum tokens per second and corresponding
-        # concurrent requests
+        # Half-open intervals: finishing requests leave before starts at the
+        # same timestamp. Bucket visits overcount sequential short requests.
+        active_requests = 0
+        for _, delta in sorted(request_events):
+            active_requests += delta
+            max_concurrent_requests = max(max_concurrent_requests, active_requests)
+
+        # Keep token throughput's one-second buckets unchanged.
         if len(tokens_per_second) > 0:
             if token_timeline_available:
                 max_output_tokens_per_s = float(np.max(tokens_per_second))
             else:
                 max_output_tokens_per_s = float("nan")
-            max_concurrent_requests = int(np.max(concurrent_requests_per_second))
 
         if TERM_PLOTLIB_AVAILABLE:
             import termplotlib as tpl
@@ -1136,7 +1146,7 @@ def calculate_metrics(
             fig.plot(
                 np.arange(len(concurrent_requests_per_second)),
                 concurrent_requests_per_second,
-                title="Concurrent requests per second",
+                title="Requests touching each second",
             )
             fig.show()
         else:
