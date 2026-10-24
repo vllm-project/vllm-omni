@@ -33,6 +33,7 @@ from transformers.modeling_utils import PreTrainedAudioTokenizerBase
 from transformers.utils import ModelOutput, auto_docstring, logging
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+from vllm.triton_utils import tldevice as libdevice
 
 from .configuration_moss_audio_tokenizer_v2 import MossAudioTokenizerConfig
 from .triton_launch import cuda_pdl_launch_kwargs
@@ -1545,6 +1546,178 @@ def add_layer_norm(
     return res, out
 
 
+def packed_entry_capacity(num_tokens: int, factor: int, block_m: int, num_segments: int) -> int:
+    """Attention programs that cover any split of ``num_tokens`` into ``num_segments`` segments.
+
+    Each non-empty segment adds at most one partial block and holds at least one
+    code frame (``factor`` tokens), so at most ``num_tokens // factor`` segments do.
+    """
+    return num_tokens // block_m + min(num_segments, num_tokens // factor)
+
+
+@triton.jit
+def _packed_stage_metadata(
+    offsets_src_ptr,
+    slots_ptr,
+    frames_ptr,
+    starts_ptr,
+    frame_segments_ptr,
+    freqs_ptr,
+    offsets_ptr,
+    lengths_ptr,
+    tok_starts_ptr,
+    cos_ptr,
+    sin_ptr,
+    entry_seg_ptr,
+    entry_blk_ptr,
+    num_tokens,
+    num_segments,
+    capacity,
+    token_programs,
+    factor: tl.constexpr,
+    block_m: tl.constexpr,
+    half: tl.constexpr,
+    sp: tl.constexpr,
+    bt: tl.constexpr,
+    be: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    if pid < token_programs:
+        # RoPE table at each token's absolute position (as ``rope_angles_at``).
+        t = pid * bt + tl.arange(0, bt)
+        valid = t < num_tokens
+        seg = tl.load(frame_segments_ptr + t // factor, valid, 0)
+        offset = tl.load(offsets_src_ptr + tl.load(slots_ptr + seg, valid, 0), valid, 0)
+        position = offset + t - tl.load(starts_ptr + seg, valid, 0) * factor
+        d = tl.arange(0, half)
+        angles = tl.load(freqs_ptr + d)[None, :] * position.to(tl.float32)[:, None]
+        index = t[:, None] * half + d[None, :]
+        tl.store(cos_ptr + index, libdevice.cos(angles), valid[:, None])
+        tl.store(sin_ptr + index, libdevice.sin(angles), valid[:, None])
+    else:
+        s = tl.arange(0, sp)
+        live = s < num_segments
+        lengths = tl.load(frames_ptr + s, live, 0) * factor
+        blocks = (lengths + block_m - 1) // block_m
+        ends = tl.cumsum(blocks, 0)
+        program = pid - token_programs
+        if program == 0:
+            tl.store(offsets_ptr + s, tl.load(offsets_src_ptr + tl.load(slots_ptr + s, live, 0), live, 0), live)
+            tl.store(lengths_ptr + s, lengths, live)
+            tl.store(tok_starts_ptr + s, tl.load(starts_ptr + s, live, 0) * factor, live)
+        # ``packed_block_entries``: segment = searchsorted(ends, entry, right=True).
+        e = program * be + tl.arange(0, be)
+        owner = tl.sum(((ends[None, :] <= e[:, None]) & live[None, :]).to(tl.int32), 1)
+        owner = tl.minimum(owner, num_segments - 1)
+        hit = s[None, :] == owner[:, None]
+        first_block = tl.sum(tl.where(hit, ends[None, :] - blocks[None, :], 0), 1)
+        blk = tl.where(e < tl.sum(blocks, 0), e - first_block, capacity)
+        tl.store(entry_seg_ptr + e, owner.to(tl.int32), e < capacity)
+        tl.store(entry_blk_ptr + e, blk.to(tl.int32), e < capacity)
+
+
+def packed_stage_metadata(
+    offsets_src: torch.Tensor,
+    slots: torch.Tensor,
+    frames: torch.Tensor,
+    starts: torch.Tensor,
+    frame_segments: torch.Tensor,
+    freqs: torch.Tensor,
+    num_tokens: int,
+    factor: int,
+    block_m: int,
+):
+    """One launch for a transformer's packed-decode metadata.
+
+    Returns ``(offsets, lengths, tok_starts, (cos, sin), entry_seg, entry_blk)`` exactly as
+    ``MossAudioTokenizerTransformer._forward_packed`` builds them with eager ops: slot offsets,
+    token lengths and starts per segment, the ``rope_angles_at`` table of every token, and
+    ``packed_block_entries`` for ``packed_entry_capacity`` attention programs.
+    """
+    num_segments = slots.shape[0]
+    capacity = packed_entry_capacity(num_tokens, factor, block_m, num_segments)
+    half = freqs.shape[0]
+    device = slots.device
+    offsets = torch.empty_like(slots)
+    lengths = torch.empty_like(frames)
+    tok_starts = torch.empty_like(starts)
+    cos = torch.empty((1, num_tokens, 1, half), dtype=torch.float32, device=device)
+    sin = torch.empty_like(cos)
+    entry_seg = torch.empty(capacity, dtype=torch.int32, device=device)
+    entry_blk = torch.empty_like(entry_seg)
+    sp = triton.next_power_of_2(num_segments)
+    bt, be = 64, (64 if sp <= 256 else 32)
+    token_programs = triton.cdiv(num_tokens, bt)
+    _packed_stage_metadata[(token_programs + triton.cdiv(capacity, be),)](
+        offsets_src,
+        slots,
+        frames,
+        starts,
+        frame_segments,
+        freqs,
+        offsets,
+        lengths,
+        tok_starts,
+        cos,
+        sin,
+        entry_seg,
+        entry_blk,
+        num_tokens,
+        num_segments,
+        capacity,
+        token_programs,
+        factor,
+        block_m,
+        half,
+        sp,
+        bt,
+        be,
+        num_warps=4,
+    )
+    return offsets, lengths, tok_starts, (cos, sin), entry_seg, entry_blk
+
+
+@triton.jit
+def _commit_packed_offsets(
+    block_ptr,
+    slots_ptr,
+    offsets_ptr,
+    lengths_ptr,
+    valid_ptr,
+    rows,
+    row_stride,
+    num_segments,
+    sp: tl.constexpr,
+    br: tl.constexpr,
+):
+    s = tl.arange(0, sp)
+    live = s < num_segments
+    offset = tl.load(offsets_ptr + s, live, 0)
+    nxt = tl.where(tl.load(valid_ptr + s, live, 0) != 0, offset + tl.load(lengths_ptr + s, live, 0), offset)
+    r = tl.program_id(0) * br + tl.arange(0, br)
+    index = r[:, None] * row_stride + tl.load(slots_ptr + s, live, 0)[None, :]
+    tl.store(block_ptr + index, tl.broadcast_to(nxt[None, :], (br, sp)), (r[:, None] < rows) & live[None, :])
+
+
+def commit_packed_offsets(block, slots, offsets, lengths, valid) -> None:
+    """``block[:, slots] = where(valid, offsets + lengths, offsets)`` for every row, one launch."""
+    num_segments = slots.shape[0]
+    br = 8
+    _commit_packed_offsets[(triton.cdiv(block.shape[0], br),)](
+        block,
+        slots,
+        offsets,
+        lengths,
+        valid.view(torch.uint8),
+        block.shape[0],
+        block.stride(0),
+        num_segments,
+        triton.next_power_of_2(num_segments),
+        br,
+        num_warps=4,
+    )
+
+
 def enable_gelu_epilogue(model: nn.Module) -> int:
     """Fuse each eligible CUDA FFN GELU into its up-projection GEMM.
 
@@ -1796,19 +1969,34 @@ class MossAudioTokenizerTransformer(StreamingModule):
         block_m = int(self._packed_block_m)
         assert context.segment_starts is not None and context.frame_segments is not None
         slots = context.state_slot_ids
-        offsets = state.offsets.index_select(0, slots)
-        lengths = context.segment_frames * f
-        tok_starts = context.segment_starts * f
-        tokens = torch.arange(x.shape[1], device=x.device)
-        segment = context.frame_segments[tokens // f] if f > 1 else context.frame_segments
-        positions = offsets[segment] + (tokens - tok_starts[segment])
-        table = rope_angles_at(positions, self._head_dim, float(self.rope.max_period))
-        entry_seg, entry_blk = packed_block_entries(lengths, block_m, x.shape[1] // block_m + slots.shape[0])
         # Rows of the decoder's slot-offset storage holding this transformer's
         # and its layers' offsets (see ``_centralize_decoder_slot_offsets``):
         # they are equal per slot, so the layers take ``offsets`` and one
         # launch advances them all.
         block = getattr(self, "_packed_offset_block", None)
+        if x.is_cuda:
+            offsets, lengths, tok_starts, table, entry_seg, entry_blk = packed_stage_metadata(
+                state.offsets,
+                slots,
+                context.segment_frames,
+                context.segment_starts,
+                context.frame_segments,
+                self._packed_rope_freqs(x.device),
+                x.shape[1],
+                f,
+                block_m,
+            )
+        else:
+            offsets = state.offsets.index_select(0, slots)
+            lengths = context.segment_frames * f
+            tok_starts = context.segment_starts * f
+            tokens = torch.arange(x.shape[1], device=x.device)
+            segment = context.frame_segments[tokens // f] if f > 1 else context.frame_segments
+            positions = offsets[segment] + (tokens - tok_starts[segment])
+            table = rope_angles_at(positions, self._head_dim, float(self.rope.max_period))
+            entry_seg, entry_blk = packed_block_entries(
+                lengths, block_m, packed_entry_capacity(x.shape[1], f, block_m, slots.shape[0])
+            )
         context = dataclasses.replace(
             context,
             rope_table=table,
@@ -1820,12 +2008,24 @@ class MossAudioTokenizerTransformer(StreamingModule):
         else:
             for layer in self.layers:
                 x = layer(x, execution_context=context)
+        if block is not None and x.is_cuda:
+            commit_packed_offsets(block, slots, offsets, lengths, context.valid_rows)
+            return x
         next_offsets = torch.where(context.valid_rows, offsets + lengths, offsets)
         if block is not None:
             block.index_copy_(1, slots, next_offsets.unsqueeze(0).expand(block.shape[0], -1))
         else:
             state.offsets.index_copy_(0, slots, next_offsets)
         return x
+
+    def _packed_rope_freqs(self, device: torch.device) -> torch.Tensor:
+        """``rope_angles_at``'s inverse frequencies, computed once with the same ops."""
+        freqs = self.__dict__.get("_packed_freqs")
+        if freqs is None or freqs.device != device:
+            ds = torch.arange(self._head_dim // 2, device=device, dtype=torch.float32)
+            freqs = torch.exp(ds * (-math.log(float(self.rope.max_period)) * 2 / self._head_dim))
+            self.__dict__["_packed_freqs"] = freqs
+        return freqs
 
 
 class MossAudioTokenizerProjectedTransformer(StreamingContainer):

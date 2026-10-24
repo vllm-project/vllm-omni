@@ -110,9 +110,10 @@ class _UvaIndexPools:
         self.mtp = pool((capacity, 2))
         self.eager_slots = pool(capacity)
         self.eager_offsets = pool(capacity)
-        self.eager_mtp_slots = pool(capacity)
-        self.rows = pool(capacity)
-        self.keep = pool(capacity)
+        # (slot, token offset), (slot, completes prefill) and (slot, batch row).
+        self.eager_embed = pool((capacity, 2))
+        self.eager_mtp = pool((capacity, 2))
+        self.output_rows = pool((capacity, 2))
 
 
 class MossLocalModelState(OmniModelState):
@@ -190,6 +191,9 @@ class MossLocalModelState(OmniModelState):
         self._eager_host = [False] * capacity
         self._first_mtp_slots = set()
         self._mtp_dispatcher = None
+        # Per slot: whether the current request's MTP seed was resolved, and if it has one.
+        self._mtp_seed_resolved = np.zeros(capacity, dtype=np.bool_)
+        self._mtp_has_seed = np.zeros(capacity, dtype=np.bool_)
 
     def sample_determined_tokens(self, batch, sampler):
         """Skip full-vocabulary sampling only for unconstrained Local tokens.
@@ -274,12 +278,18 @@ class MossLocalModelState(OmniModelState):
         packed = device[:count]
         positions = packed[:, 0]
         audio = self.model._audio_embed(packed[:, 1:])
+        if embeds.is_cuda:
+            from vllm_omni.model_executor.models.moss_tts.local_state_kernels import add_rows
+
+            add_rows(positions, audio, embeds)
+            return
         embeds.index_copy_(0, positions, embeds.index_select(0, positions) + audio)
 
     def add_request(self, req_index, new_req_data):
         super().add_request(req_index, new_req_data)
         self._active_host[req_index] = True
         self._eager_host[req_index] = False
+        self._mtp_seed_resolved[req_index] = False
         self._first_mtp_slots.discard(req_index)
         if self._uva is not None:
             # Applied by one fused kernel at the start of the next preprocess,
@@ -475,13 +485,19 @@ class MossLocalModelState(OmniModelState):
             eager_rows = [row for row in decode_rows if self._eager_host[int(input_batch.idx_mapping_np[row])]]
             canonical_rows = [row for row in decode_rows if not self._eager_host[int(input_batch.idx_mapping_np[row])]]
             self._local_eager_rows = eager_rows
-            if eager_rows:
+            if eager_rows and self._uva is not None:
                 # Their frame was sampled after the previous forward.
-                slots = self._select_rows(input_batch.idx_mapping, eager_rows, self._uva and self._uva.eager_slots)
+                from vllm_omni.model_executor.models.moss_tts.local_state_kernels import add_rows
+
+                index = np.empty((len(eager_rows), 2), dtype=np.int64)
+                index[:, 0] = input_batch.idx_mapping_np[eager_rows]
+                index[:, 1] = input_batch.query_start_loc_np[eager_rows]
+                index = self._uva.eager_embed.copy_to_uva(index)
+                add_rows(index[:, 1], self._eager_emb_pool, embeds, src_index=index[:, 0])
+            elif eager_rows:
+                slots = self._select_rows(input_batch.idx_mapping, eager_rows)
                 offsets = self._mtp_offsets[: len(eager_rows)]
-                offsets.copy_(
-                    self._select_rows(input_batch.query_start_loc, eager_rows, self._uva and self._uva.eager_offsets)
-                )
+                offsets.copy_(self._select_rows(input_batch.query_start_loc, eager_rows))
                 embeds.index_copy_(
                     0, offsets, embeds.index_select(0, offsets) + self._eager_emb_pool.index_select(0, slots)
                 )
@@ -566,27 +582,58 @@ class MossLocalModelState(OmniModelState):
         text embedding. A decode row emits only if its previous frame did.
         """
         bsz = len(rows)
-        slots = self._select_rows(batch.idx_mapping, rows, self._uva and self._uva.eager_mtp_slots)
         ids, emb = self._mtp_input_ids[:bsz], self._mtp_input_embeds[:bsz]
         hidden, step = self._mtp_hidden[:bsz], self._mtp_text_step[:bsz]
-        ids.zero_()  # the MTP does not read token ids
-        emb.zero_()
-        torch.index_select(self._hidden_pool, 0, slots, out=hidden)
-        gate = self._keep_pool.index_select(0, slots)
-        if completing:
-            first = _metadata_to_device(
-                np.asarray([row in completing for row in rows], dtype=np.bool_),
-                gate.device,
-            )
-            gate = gate | first
-        step[:, 0].copy_(self._active_pool.index_select(0, slots) & gate)
+        index = None
+        if self._uva is not None:
+            from vllm_omni.model_executor.models.moss_tts.local_state_kernels import gather_eager_mtp
 
-        buffers = [self.intermediate_buffer.buffers[int(batch.idx_mapping_np[row])] for row in rows]
-        req_ids = [str(buf["req_id"]) for buf in buffers]
-        generators = [
-            self._get_mtp_generator(req_id, buf.get("sampling_params"), ids.device)
-            for req_id, buf in zip(req_ids, buffers, strict=True)
-        ]
+            host = np.zeros((bsz, 2), dtype=np.int64)
+            host[:, 0] = batch.idx_mapping_np[rows]
+            if completing:
+                host[:, 1] = [row in completing for row in rows]
+            index = self._uva.eager_mtp.copy_to_uva(host)
+            gather_eager_mtp(index, self._hidden_pool, self._keep_pool, self._active_pool, ids, emb, hidden, step)
+        else:
+            slots = self._select_rows(batch.idx_mapping, rows)
+            ids.zero_()  # the MTP does not read token ids
+            emb.zero_()
+            torch.index_select(self._hidden_pool, 0, slots, out=hidden)
+            gate = self._keep_pool.index_select(0, slots)
+            if completing:
+                first = _metadata_to_device(
+                    np.asarray([row in completing for row in rows], dtype=np.bool_),
+                    gate.device,
+                )
+                gate = gate | first
+            step[:, 0].copy_(self._active_pool.index_select(0, slots) & gate)
+
+        early = getattr(self, "_early_first_audio", None)
+        slot_ids = batch.idx_mapping_np[rows]
+        per_request = getattr(self.model, "mtp_accepts_req_infos", False)
+        if not per_request and self._mtp_seed_resolved[slot_ids].all() and not self._mtp_has_seed[slot_ids].any():
+            # Known unseeded rows need no per-request sampling state; first audio needs only request IDs.
+            buffers, generators = [], [None] * bsz
+            req_ids = []
+            if early is not None and early.waiting:
+                names = getattr(batch, "req_ids", None)
+                if names is None:
+                    names = {
+                        row: str(self.intermediate_buffer.buffers[int(batch.idx_mapping_np[row])]["req_id"])
+                        for row in rows
+                    }
+                req_ids = [names[row] for row in rows]
+        else:
+            buffers = [self.intermediate_buffer.buffers[int(batch.idx_mapping_np[row])] for row in rows]
+            req_ids = [str(buf["req_id"]) for buf in buffers]
+            generators = [
+                self._get_mtp_generator(req_id, buf.get("sampling_params"), ids.device)
+                for req_id, buf in zip(req_ids, buffers, strict=True)
+            ]
+            if not per_request:
+                # A request's MTP seed is fixed by its sampling params; cleared on slot admission.
+                self._mtp_has_seed[slot_ids] = [g is not None for g in generators]
+                self._mtp_seed_resolved[slot_ids] = True
         dispatcher = self._mtp_dispatcher
         can_graph = self._is_mtp_graph_runner() and not any(g is not None for g in generators)
         desc = dispatcher(bsz) if can_graph and dispatcher is not None else None
@@ -605,9 +652,21 @@ class MossLocalModelState(OmniModelState):
                 generators=generators,
             )
         codes = codes[:bsz]
-        early = getattr(self, "_early_first_audio", None)
-        if early is not None:
+        if early is not None and req_ids:
             early.after_mtp(req_ids, codes)
+        if index is not None:
+            from vllm_omni.model_executor.models.moss_tts.local_state_kernels import scatter_eager_mtp
+
+            scatter_eager_mtp(
+                index,
+                contribution[:bsz],
+                codes,
+                self._eager_emb_pool,
+                self._codes_pool,
+                self._keep_pool,
+                self.model.audio_pad_token_id,
+            )
+            return
         self._eager_emb_pool.index_copy_(0, slots, contribution[:bsz])
         self._codes_pool.index_copy_(0, slots, codes)
         self._keep_pool.index_copy_(0, slots, codes.ne(self.model.audio_pad_token_id).any(dim=-1))
@@ -615,10 +674,21 @@ class MossLocalModelState(OmniModelState):
     def run_postprocess(self, hidden_states, input_batch):
         # query_start_loc is already device-resident and authoritative for
         # mixed/chunked-prefill batches. index_copy snapshots graph outputs.
-        last = input_batch.query_start_loc[1 : input_batch.num_reqs + 1] - 1
-        self._hidden_pool.index_copy_(
-            0, input_batch.idx_mapping[: input_batch.num_reqs].long(), hidden_states.index_select(0, last)
-        )
+        if hidden_states.is_cuda:
+            from vllm_omni.model_executor.models.moss_tts.local_state_kernels import snapshot_hidden
+
+            snapshot_hidden(
+                input_batch.query_start_loc,
+                input_batch.idx_mapping,
+                hidden_states,
+                self._hidden_pool,
+                input_batch.num_reqs,
+            )
+        else:
+            last = input_batch.query_start_loc[1 : input_batch.num_reqs + 1] - 1
+            self._hidden_pool.index_copy_(
+                0, input_batch.idx_mapping[: input_batch.num_reqs].long(), hidden_states.index_select(0, last)
+            )
         if self._local_eager_mtp:
             completing = self._completing_rows
             rows = sorted(self._local_eager_rows + completing)
@@ -651,20 +721,29 @@ class MossLocalModelState(OmniModelState):
             return model_output, {}
         # This gather is an owned snapshot. Later slot writes cannot change
         # data already handed to the runner, even before its D2H completes.
-        slots = self._select_rows(input_batch.idx_mapping, self._decode_rows, self._uva and self._uva.rows)
-        codes = self._codes_pool.index_select(0, slots)
-        keep = codes.ne(model.audio_pad_token_id).any(dim=-1)
-        if self._decode_rows == list(range(input_batch.num_reqs)):
-            model._batch_should_continue = keep
+        if self._uva is not None:
+            from vllm_omni.model_executor.models.moss_tts.local_state_kernels import gather_codes
+
+            index = np.empty((len(self._decode_rows), 2), dtype=np.int64)
+            index[:, 0] = input_batch.idx_mapping_np[self._decode_rows]
+            index[:, 1] = self._decode_rows
+            codes = self._codes_pool.new_empty((len(self._decode_rows), self._codes_pool.shape[1]))
+            gather_codes(
+                self._uva.output_rows.copy_to_uva(index),
+                self._codes_pool,
+                codes,
+                model._batch_should_continue,
+                model.audio_pad_token_id,
+            )
         else:
-            if self._uva is not None:
-                rows = self._uva.keep.copy_to_uva(np.asarray(self._decode_rows, dtype=np.int64))
+            slots = self._select_rows(input_batch.idx_mapping, self._decode_rows)
+            codes = self._codes_pool.index_select(0, slots)
+            keep = codes.ne(model.audio_pad_token_id).any(dim=-1)
+            if self._decode_rows == list(range(input_batch.num_reqs)):
+                model._batch_should_continue = keep
             else:
-                rows = _metadata_to_device(
-                    np.asarray(self._decode_rows, dtype=np.int64),
-                    codes.device,
-                )
-            model._batch_should_continue.index_copy_(0, rows, keep)
+                rows = _metadata_to_device(np.asarray(self._decode_rows, dtype=np.int64), codes.device)
+                model._batch_should_continue.index_copy_(0, rows, keep)
         early = getattr(self, "_early_first_audio", None)
         first_audio = early.take_flags(input_batch.req_ids, codes.device) if early is not None else None
         return model_output, _CodeRowsSnapshot(
