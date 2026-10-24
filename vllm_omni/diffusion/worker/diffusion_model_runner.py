@@ -44,6 +44,7 @@ from vllm_omni.diffusion.diffusion_kv.paged_attention_adapter import (
 )
 from vllm_omni.diffusion.distributed.parallel_state import get_classifier_free_guidance_rank
 from vllm_omni.diffusion.forward_context import set_forward_context
+from vllm_omni.diffusion.graph import warn_if_denoise_graph_unsupported
 from vllm_omni.diffusion.interaction.coordinator import InteractionCoordinator
 from vllm_omni.diffusion.interaction.types import InteractionPayload
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
@@ -372,6 +373,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         )
         self.model_memory_usage = int(m.consumed_memory)
         logger.info("Model runner: Model loaded successfully.")
+        warn_if_denoise_graph_unsupported(self.od_config, self.pipeline)
 
         if self.od_config.streaming_output and not getattr(self.od_config, "step_execution", False):
             logger.warning("streaming_output=True requires step_execution=True; enabling step execution.")

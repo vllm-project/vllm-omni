@@ -82,6 +82,7 @@ from vllm_omni.diffusion.forward_context import (
     paged_kv_prefill,
     set_forward_context_denoise_step_idx,
 )
+from vllm_omni.diffusion.graph import is_capturing, write_through
 from vllm_omni.diffusion.layers.fused_moe import FusedMoE
 from vllm_omni.diffusion.layers.norm import RMSNorm
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
@@ -826,30 +827,20 @@ class HunYuanRotary2DEmbedder:
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
-        self.custom_pos_emb: tuple[torch.Tensor, torch.Tensor] | None = None
         self.rope = RotaryEmbedding(is_neox_style=True)
 
     def _prepare_cos_sin(
         self,
         custom_pos_emb: tuple[torch.Tensor, torch.Tensor],
-        first_step: bool,
         device: torch.device,
     ):
-        """Returns cos/sin on the target device based on first_step and caching strategy."""
-        if first_step:
-            cos_input, sin_input = custom_pos_emb
-            cos = cos_input.to(device)
-            sin = sin_input.to(device)
-            self.custom_pos_emb = None
-        else:
-            if self.custom_pos_emb is None:
-                cos_input, sin_input = custom_pos_emb
-                cos = cos_input.to(device)
-                sin = sin_input.to(device)
-                self.custom_pos_emb = (cos, sin)
-            else:
-                cos, sin = self.custom_pos_emb
-        return cos, sin
+        """Returns cos/sin on the target device.
+
+        Stateless on purpose: a cache held across steps would pin a captured
+        denoise graph to tensors that the next request frees.
+        """
+        cos_input, sin_input = custom_pos_emb
+        return cos_input.to(device), sin_input.to(device)
 
     def __call__(
         self,
@@ -864,10 +855,9 @@ class HunYuanRotary2DEmbedder:
         if kwargs.get("mode", "gen_text") != "gen_image":
             return q, k
 
-        first_step = kwargs.get("first_step", False)
         device = q.device
         # 1. Prepare cos/sin
-        cos, sin = self._prepare_cos_sin(custom_pos_emb, first_step, device)
+        cos, sin = self._prepare_cos_sin(custom_pos_emb, device)
 
         # 2. Shape validation
         query_lens: list[int] = kwargs.get("query_lens")
@@ -917,8 +907,16 @@ class ImageKVCacheManager(nn.Module):
         self.scaling = scaling
         # cache related
         self.image_token_len: int = image_token_len
+        # The active prompt KV cache. Its backing storage is owned separately,
+        # because clearing the active pointers for a new request must not orphan
+        # buffers whose addresses a captured denoise graph is holding.
         self.image_kv_cache_map: tuple[torch.Tensor, torch.Tensor] | None = None
         self.image_kv_cache_lens: torch.Tensor | None = None
+        self._prompt_kv_storage: tuple[torch.Tensor, torch.Tensor] | None = None
+        self._prompt_kv_lens_storage: torch.Tensor | None = None
+        # Set when that storage had to move; read and cleared by the pipeline, which
+        # then drops any graph whose recorded kernels point at the old buffers.
+        self.prompt_kv_reallocated: bool = False
         self._injected_ar_kv: list[tuple[torch.Tensor, torch.Tensor]] | None = None
 
         self.sp_size = get_sequence_parallel_world_size()
@@ -1001,9 +999,26 @@ class ImageKVCacheManager(nn.Module):
             cached_prompt_len = int(cached_prompt_lens[b].item())
             cached_key[b, :cached_prompt_len] = key[b, :cached_prompt_len]
             cached_value[b, :cached_prompt_len] = value[b, :cached_prompt_len]
-        self.image_kv_cache_map = (cached_key, cached_value)
-        self.image_kv_cache_lens = cached_prompt_lens
+        self.set_prompt_kv_cache(cached_key, cached_value, cached_prompt_lens)
         return key, value
+
+    def set_prompt_kv_cache(self, key: torch.Tensor, value: torch.Tensor, lens: torch.Tensor) -> None:
+        """Publish the prompt KV for the denoise steps, keeping the storage put.
+
+        The denoise steps read these buffers off the module rather than off their
+        arguments, so a captured graph holds their addresses directly: reusing the
+        storage whenever the shape allows is what lets one capture serve more than
+        one request. Where it cannot be reused, ``prompt_kv_reallocated`` says so
+        and the pipeline drops the graphs that just became stale.
+        """
+        prev_key, prev_value = self._prompt_kv_storage or (None, None)
+        reused_key = write_through(prev_key, key)
+        reused_value = write_through(prev_value, value)
+        self.prompt_kv_reallocated = reused_key is key or reused_value is value
+        self._prompt_kv_storage = (reused_key, reused_value)
+        self._prompt_kv_lens_storage = write_through(self._prompt_kv_lens_storage, lens)
+        self.image_kv_cache_map = self._prompt_kv_storage
+        self.image_kv_cache_lens = self._prompt_kv_lens_storage
 
     def _reuse_prompt_kv(
         self,
@@ -1037,7 +1052,9 @@ class ImageKVCacheManager(nn.Module):
         assert self.image_kv_cache_lens is not None
         if position_ids is not None:
             assert position_ids.shape == (bs, q_len)
-            if logger.isEnabledFor(logging.DEBUG):
+            # Reading the comparison back to the host synchronizes, which a graph capture rejects;
+            # the eager warm-up run right before each capture still performs the check.
+            if logger.isEnabledFor(logging.DEBUG) and not is_capturing(position_ids.device):
                 assert torch.all(position_ids[:, 0] == self.image_kv_cache_lens.to(position_ids.device)), (
                     "The first current position must immediately follow each sample's cached prompt KV."
                 )
@@ -1078,7 +1095,11 @@ class ImageKVCacheManager(nn.Module):
         return key, value
 
     def clear_legacy_prompt_kv_cache(self) -> None:
-        """Drop model-owned dense KV state before Scheduler-paged execution."""
+        """Drop model-owned dense KV state before Scheduler-paged execution.
+
+        Only the active pointers: ``_prompt_kv_storage`` keeps the buffers so the
+        next prefill can write through them instead of stranding a captured graph.
+        """
 
         self.image_kv_cache_map = None
         self.image_kv_cache_lens = None
@@ -3331,7 +3352,7 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
                     )
 
                     with torch.autocast(device_type=self.device.type, dtype=torch.bfloat16, enabled=True):
-                        model_output = self.model.forward_call(**model_inputs, first_step=(i == 0))
+                        model_output = self.model._denoise_forward(model_inputs, first_step=(i == 0))
                         pred = model_output["diffusion_prediction"]
                     pred = pred.to(dtype=torch.float32)
 

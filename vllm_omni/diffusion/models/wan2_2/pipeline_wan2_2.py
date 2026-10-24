@@ -26,6 +26,7 @@ from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.pipeline_parallel import AsyncLatents, PipelineParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.forward_context import DenoiseProgressMixin
+from vllm_omni.diffusion.graph import build_denoise_graph_runner
 from vllm_omni.diffusion.lora.loader import WanLoraLoaderMixin
 from vllm_omni.diffusion.media import (
     DiffusionMediaOutput,
@@ -657,6 +658,14 @@ class Wan22Pipeline(
 
         self.setup_diffusion_pipeline_profiler(
             enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler
+        )
+        self._denoise_graph_runner = build_denoise_graph_runner(
+            od_config,
+            self._denoise_graph_forward,
+            "Wan DiT",
+            refusal=None
+            if type(self) is Wan22Pipeline
+            else f"{type(self).__name__} is not validated with denoise graphs",
         )
 
     def _create_transformer(self, config: dict, component: str = "transformer") -> WanTransformer3DModel:
@@ -1587,8 +1596,15 @@ class Wan22Pipeline(
         """
         if current_model is None:
             current_model = self.transformer
+        if getattr(self, "_denoise_graph_runner", None) is not None:
+            # CFG replays the same graph for both branches; the next replay would overwrite this output.
+            return self._denoise_graph_runner(current_model=current_model, **kwargs).clone()
         result = current_model(**kwargs)
         return result if isinstance(result, IntermediateTensors) else result[0]
+
+    @staticmethod
+    def _denoise_graph_forward(current_model: nn.Module, **kwargs: Any) -> torch.Tensor:
+        return current_model(**kwargs)[0]
 
     def encode_prompt(
         self,

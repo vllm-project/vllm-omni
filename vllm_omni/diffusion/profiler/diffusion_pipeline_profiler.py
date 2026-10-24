@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import functools
 import re
 import time
@@ -5,11 +8,38 @@ from collections.abc import Callable
 from threading import Lock
 from typing import Any
 
+import torch
 from vllm.logger import init_logger
 
 from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
+
+
+def _capture_in_flight() -> bool:
+    """True while a device graph capture is recording on the current stream.
+
+    A host synchronize inside a capture is not merely a stall, it is an error:
+    Level Zero rejects it with UR_RESULT_ERROR_UNSUPPORTED_FEATURE, which would
+    take down capture of any region that contains a profiled target. Skipping it
+    costs nothing that matters, because capture records kernels without running
+    them -- there is no device work for the sync to wait on.
+    """
+    for mod in (torch.xpu, torch.cuda):
+        is_capturing = getattr(mod, "is_current_stream_capturing", None)
+        if is_capturing is None or not mod.is_available():
+            continue
+        try:
+            if is_capturing():
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _sync_if_useful() -> None:
+    if current_omni_platform.is_available() and not _capture_in_flight():
+        current_omni_platform.synchronize()
 
 
 def profiler(name: str, func: Callable, instance: Any) -> Callable:
@@ -20,14 +50,12 @@ def profiler(name: str, func: Callable, instance: Any) -> Callable:
     def wrapper(*args, **kwargs) -> Any:
         if name == f"{instance.__class__.__name__}.forward":
             instance.clear_profiler_records()
-        if current_omni_platform.is_available():
-            current_omni_platform.synchronize()
+        _sync_if_useful()
         start_time = time.perf_counter()
         try:
             return func(*args, **kwargs)
         finally:
-            if current_omni_platform.is_available():
-                current_omni_platform.synchronize()
+            _sync_if_useful()
             duration = time.perf_counter() - start_time
             logger.info(f"[DiffusionPipelineProfiler] {metric_name} took {duration:.6f}s")
             # record the profiling data: duration of stages

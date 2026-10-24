@@ -1011,6 +1011,13 @@ class OmniDiffusionConfig:
     # provide its own setup_compile() implementation.
     diffusion_compile_granularity: str = "regional"
     diffusion_compile_dynamic: bool = True
+    # Capture the per-step denoise forward into a device graph (CUDA graph /
+    # XPU graph) and replay it for the remaining steps. Only the steps after the
+    # first are eligible; the first one builds the prompt KV cache and has a
+    # different shape. Off by default: it only pays on a launch-bound denoise
+    # step, and pipelines must opt in explicitly (see
+    # vllm_omni/diffusion/graph.py for the safety requirements).
+    diffusion_use_graph: bool = False
 
     # Parallel weight loading (for faster diffusion model startup)
     enable_multithread_weight_load: bool = True
@@ -1269,6 +1276,8 @@ class OmniDiffusionConfig:
             )
         if not isinstance(self.diffusion_compile_dynamic, bool):
             raise TypeError(f"diffusion_compile_dynamic must be a bool, got {type(self.diffusion_compile_dynamic)!r}")
+        if not isinstance(self.diffusion_use_graph, bool):
+            raise TypeError(f"diffusion_use_graph must be a bool, got {type(self.diffusion_use_graph)!r}")
         self.diffusion_kv_mode = parse_diffusion_kv_cache_mode(self.diffusion_kv_mode)
         if not isinstance(self.enable_prefix_caching, bool):
             raise TypeError("enable_prefix_caching must be a bool")
