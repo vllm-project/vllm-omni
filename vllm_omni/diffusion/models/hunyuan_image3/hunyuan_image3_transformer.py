@@ -895,12 +895,23 @@ class HunYuanRotary2DEmbedder:
 def _require_attention_mask_support(record: ScheduleCandidate) -> str | None:
     """Schedule candidate check for ImageKVCacheManager.attn (see Attention.add_schedule_candidate_check).
 
-    The dense path sends a 4D attention mask on every forward. The paged path sends none; there,
-    startup validation already requires every candidate to match the baseline paged backend.
+    The dense path sends a 4D attention mask with ``full_attn_spans`` on every forward. A backend that honors
+    the spans or declares dense 4D mask support runs it only if it also takes the mask. Any other backend
+    raises at the first dense forward that selects the profile if the profile names it; if the role uses the
+    platform default, that forward falls back to SDPA as outside a schedule, so the check accepts it. The
+    paged path sends no mask; there, startup validation already requires every candidate to match the
+    baseline paged backend.
     """
-    if record.backend_cls.supports_attention_mask(record.spec):
+    backend_cls = record.backend_cls
+    if backend_cls.supports_piecewise_spans or backend_cls.supports_dense_4d_mask(record.spec):
+        if backend_cls.supports_attention_mask(record.spec):
+            return None
+    elif record.spec is None:
         return None
-    return "HunyuanImage3 image attention sends a 4D attention mask on every dense forward"
+    return (
+        "HunyuanImage3 image attention sends a 4D attention mask with full_attn_spans on every dense "
+        "forward, so the backend must take the mask and either honor full_attn_spans or consume a dense 4D mask"
+    )
 
 
 class ImageKVCacheManager(nn.Module):
@@ -949,7 +960,8 @@ class ImageKVCacheManager(nn.Module):
             # bfloat16 autocast, independent of the weight-loading dtype.
             paged_kv_cache_dtype=torch.bfloat16,
         )
-        # The dense image attention path always sends a mask. Startup validation runs this check only with a schedule.
+        # The dense image attention path always sends a 4D mask together with full_attn_spans.
+        # Startup validation runs this check only with a schedule.
         self.attn.add_schedule_candidate_check(_require_attention_mask_support)
 
     @staticmethod
