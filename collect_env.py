@@ -694,6 +694,19 @@ def get_env_info():
     )
 
 
+musa_info_fmt = """
+==============================
+         MUSA Info
+==============================
+MUSA available               : {musa_available}
+MUSA runtime version         : {musa_runtime_version}
+Torch-MUSA package version   : {musa_package_version}
+MUSA driver version          : {musa_driver_version}
+MUSA GPU models              : {musa_gpu_models}
+MUSA visible devices         : {musa_visible_devices}
+""".strip()
+
+
 env_info_fmt = """
 ==============================
         System Info
@@ -730,18 +743,7 @@ cuDNN version                : {cudnn_version}
 HIP runtime version          : {hip_runtime_version}
 MIOpen runtime version       : {miopen_runtime_version}
 Is XNNPACK available         : {is_xnnpack_available}
-
-==============================
-         MUSA Info
-==============================
-MUSA available               : {musa_available}
-MUSA runtime version         : {musa_runtime_version}
-Torch-MUSA package version   : {musa_package_version}
-MUSA driver version          : {musa_driver_version}
-MUSA GPU models              : {musa_gpu_models}
-MUSA visible devices         : {musa_visible_devices}
-
-==============================
+{musa_info}==============================
           CPU Info
 ==============================
 {cpu_info}
@@ -815,17 +817,26 @@ def pretty_str(envinfo):
     mutable_dict["nvidia_gpu_models"] = maybe_start_on_next_line(envinfo.nvidia_gpu_models)
     mutable_dict["musa_gpu_models"] = maybe_start_on_next_line(envinfo.musa_gpu_models)
 
-    # MUSA probes are optional. Preserve their explicit None contract in the
-    # report instead of applying the legacy generic collection-failure text.
-    for field in (
+    musa_optional_fields = (
         "musa_runtime_version",
         "musa_package_version",
         "musa_driver_version",
         "musa_gpu_models",
         "musa_visible_devices",
-    ):
+    )
+    has_musa_info = mutable_dict["musa_available"] not in (None, "N/A") or any(
+        mutable_dict[field] is not None for field in musa_optional_fields
+    )
+
+    # MUSA probes are optional. Preserve their explicit None contract in the
+    # report instead of applying the legacy generic collection-failure text.
+    for field in musa_optional_fields:
         if mutable_dict[field] is None:
             mutable_dict[field] = "None"
+    if has_musa_info:
+        mutable_dict["musa_info"] = "\n{}\n\n".format(musa_info_fmt.format(**mutable_dict))
+    else:
+        mutable_dict["musa_info"] = "\n"
 
     # If the machine doesn't have CUDA, report some fields as 'No CUDA'
     dynamic_cuda_fields = [

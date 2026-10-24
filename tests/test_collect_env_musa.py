@@ -285,6 +285,43 @@ def test_pretty_str_includes_labeled_musa_block(monkeypatch):
     assert "MUSA visible devices         : MTHREADS_VISIBLE_DEVICES=1,2,3" in output
 
 
+def test_pretty_str_omits_musa_block_without_musa_signals(monkeypatch):
+    collect_env = load_collect_env(monkeypatch)
+    env = collect_env.SystemEnv(*(["value"] * len(collect_env.SystemEnv._fields)))._replace(
+        musa_available="N/A",
+        musa_runtime_version=None,
+        musa_package_version=None,
+        musa_driver_version=None,
+        musa_gpu_models=None,
+        musa_visible_devices=None,
+    )
+
+    output = collect_env.pretty_str(env)
+
+    assert "MUSA Info" not in output
+    assert "MUSA available" not in output
+    assert ("Is XNNPACK available         : value\n\n==============================\n          CPU Info") in output
+
+
+def test_pretty_str_includes_musa_block_for_partial_installation(monkeypatch):
+    collect_env = load_collect_env(monkeypatch)
+    env = collect_env.SystemEnv(*(["value"] * len(collect_env.SystemEnv._fields)))._replace(
+        musa_available="N/A",
+        musa_runtime_version=None,
+        musa_package_version="2.11.0.post1+musa5.2.0",
+        musa_driver_version=None,
+        musa_gpu_models=None,
+        musa_visible_devices=None,
+    )
+
+    output = collect_env.pretty_str(env)
+
+    assert "MUSA Info" in output
+    assert "MUSA available               : N/A" in output
+    assert "Torch-MUSA package version   : 2.11.0.post1+musa5.2.0" in output
+    assert ("Is XNNPACK available         : value\n\n==============================\n         MUSA Info") in output
+
+
 def test_environment_inventory_includes_musa_prefixes(monkeypatch):
     collect_env = load_collect_env(monkeypatch)
     monkeypatch.setenv("MUSA_VISIBLE_DEVICES", "0,2")
