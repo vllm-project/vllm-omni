@@ -71,6 +71,31 @@ def _dynamic_lora_wrappers_present(module: torch.nn.Module) -> bool:
     return any(isinstance(m, BaseLayerWithLoRA) for m in module.modules())
 
 
+_WARMUP_STREAMS: dict[int | None, torch.cuda.Stream] = {}
+
+
+def _get_warmup_stream(device: torch.device) -> torch.cuda.Stream:
+    """Return the warm-up stream for ``device``, creating it on first use.
+
+    ``Entry.capture`` warms up on a side stream before recording. Creating a fresh
+    ``torch.cuda.Stream()`` per call adds a new ``(cuBLAS handle, stream)`` key to
+    the process-wide cuBLAS workspace map, and each new key keeps one more
+    workspace allocated for the life of the process (32 MiB by default), so the
+    resident footprint grew with the number of graphs ever captured and was not
+    bounded by ``max_entries`` (vllm-omni#8750). Reusing one stream per device
+    keeps that map at a single entry.
+
+    The cache is keyed by device index and populated lazily, so a process that
+    forks before its first capture still creates its stream in the child.
+    """
+    index = device.index
+    stream = _WARMUP_STREAMS.get(index)
+    if stream is None:
+        stream = torch.cuda.Stream(device=device)
+        _WARMUP_STREAMS[index] = stream
+    return stream
+
+
 class QwenImage21DecodeGraphEntry:
     """Static state for one captured decode graph.
 
@@ -141,7 +166,7 @@ class QwenImage21DecodeGraphEntry:
         nothing to the cache (prefix K/V are read-only), so warm-up is
         idempotent.
         """
-        side = torch.cuda.Stream()
+        side = _get_warmup_stream(self.hidden.device)
         side.wait_stream(torch.cuda.current_stream())
         try:
             with torch.cuda.stream(side), torch.inference_mode(False), torch.no_grad():
