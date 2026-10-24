@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """HF-compatible configs synthesized from the NeMo-style NemotronVoiceChat checkpoint.
 
 The ``nvidia/NVIDIA-NemotronLabs-VoiceChat-11B`` checkpoint ships a NeMo training
@@ -23,6 +23,7 @@ fusion weights, TTS generation parameters, codec architecture).
 
 from __future__ import annotations
 
+import logging
 import os
 from typing import Any
 
@@ -42,6 +43,36 @@ _DEFAULT_LLM_ID = "nvidia/NVIDIA-Nemotron-Nano-9B-v2"
 # Env override for air-gapped runs: local directory containing the Nemotron
 # backbone's config.json (and optionally tokenizer files).
 _LLM_PATH_ENV = "NEMOTRON_VOICECHAT_LLM_PATH"
+
+logger = logging.getLogger(__name__)
+
+# get_text_config() is called several times per stage during startup; log the
+# resolved backbone config once per (type, source) instead of on every call.
+_LOGGED_TEXT_CONFIG_SOURCES: set[str] = set()
+
+
+def _text_config_source(config: NemotronVoiceChatConfig) -> str:
+    """Describe where the thinker backbone config came from."""
+    if not config.stt_cfg:
+        return "skeleton config (no NeMo 'model' section)"
+    return os.environ.get(_LLM_PATH_ENV) or config.stt_cfg.get("pretrained_llm") or _DEFAULT_LLM_ID
+
+
+def _normalize_text_config(config: PretrainedConfig) -> PretrainedConfig:
+    """Return a config that exposes attention head counts.
+
+    Some checkpoints serve a composite config whose head counts live on a nested
+    ``text_config``. vLLM only inspects the object returned by
+    ``get_text_config()`` (it does not recurse), so unwrap up to two levels here.
+    """
+    for _ in range(2):
+        if getattr(config, "num_attention_heads", None) is not None:
+            return config
+        nested = getattr(config, "text_config", None)
+        if not isinstance(nested, PretrainedConfig):
+            break
+        config = nested
+    return config
 
 
 class NemotronVoiceChatTalkerConfig(PretrainedConfig):
@@ -208,4 +239,26 @@ class NemotronVoiceChatConfig(PretrainedConfig):
 
     def get_text_config(self, **_: Any) -> PretrainedConfig:
         text_config = self.__dict__.get("thinker_text_config")
-        return text_config if text_config is not None else self
+        if text_config is None:
+            return self
+        # vLLM inspects the returned object directly (``hasattr`` only), so the
+        # adapter must hand over a config that carries the head counts.
+        text_config = _normalize_text_config(text_config)
+        if getattr(text_config, "num_attention_heads", None) is None:
+            source = _text_config_source(self)
+            raise ValueError(
+                f"Resolved NemotronVoiceChat thinker text config is {type(text_config).__name__!r}, "
+                f"which has no `num_attention_heads` (source={source!r}). Expected a NemotronH "
+                f"backbone config: check whatever serves that repo (HF mirror/cache), or set "
+                f"{_LLM_PATH_ENV} to a local directory containing the correct config.json."
+            )
+        source = _text_config_source(self)
+        log_key = f"{type(text_config).__name__}:{source}"
+        if log_key not in _LOGGED_TEXT_CONFIG_SOURCES:
+            _LOGGED_TEXT_CONFIG_SOURCES.add(log_key)
+            logger.info(
+                "nemotron_voicechat: thinker text config = %s (source=%s)",
+                type(text_config).__name__,
+                source,
+            )
+        return text_config
