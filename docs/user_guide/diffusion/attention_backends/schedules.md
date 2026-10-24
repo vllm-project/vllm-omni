@@ -16,7 +16,9 @@ A backend that a profile names is an explicit selection: if it cannot use a
 dense 4D attention mask, the step fails instead of falling back to SDPA. A
 role that the profile leaves out uses the platform default and falls back to
 SDPA, as outside a schedule. This is checked on each scheduled step that sends
-such a mask, not at startup.
+such a mask, not at startup. HunyuanImage-3.0 image attention, which sends the
+mask with `full_attn_spans`, checks named backends at startup instead (see
+[Compatibility limits](#compatibility-limits)).
 
 ## Format
 
@@ -177,7 +179,12 @@ these errors on the job record rather than the creation response.
   Ring and scheduler-managed paged KV require profiles equivalent to the base
   backend and options. AllGather-KV rejects TRTLLM and sparse RainFusion.
   Configured KV-cache quantization requires dtype support in every candidate.
-- Hunyuan image attention requires mask support. Wan T2V, I2V and VACE VSA
+- Hunyuan image attention requires a backend that a profile names to take the
+  attention mask and either honor `full_attn_spans` or consume a dense 4D mask,
+  such as FLASH_ATTN, CUDNN_ATTN or TORCH_SDPA; a profile that names
+  FLASHINFER_ATTN is rejected. A role that the profile leaves out uses the
+  platform default, which falls back to SDPA where it cannot use the mask.
+  Wan T2V, I2V and VACE VSA
   profiles require a VSA base that constructs its gate; Wan S2V passes no VSA
   metadata, so VSA falls back to SDPA there. H3 DiT profiles must exclude packed padding;
   VSA profiles require the VSA gate or a VSA base, and gated FastH3 layers accept only VSA.

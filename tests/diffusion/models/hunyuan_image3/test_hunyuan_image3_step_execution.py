@@ -778,8 +778,14 @@ def test_request_loop_rejects_schedule_past_actual_steps_before_any_forward(monk
 
 
 class _SpecDependentMaskBackend:
+    supports_piecewise_spans = False
+
     @classmethod
     def supports_attention_mask(cls, attention_spec=None) -> bool:
+        return attention_spec.backend == "TORCH_SDPA"
+
+    @classmethod
+    def supports_dense_4d_mask(cls, attention_spec=None) -> bool:
         return attention_spec.backend == "TORCH_SDPA"
 
 
