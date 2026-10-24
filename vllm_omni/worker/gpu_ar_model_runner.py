@@ -201,6 +201,20 @@ class _OmniOutputTensorSnapshot(NamedTuple):
     async_payload: _AsyncCPUPayloadSnapshot | None = None
 
 
+class _SamplingFeedbackOutput(AsyncModelRunnerOutput):
+    """Commit conditional RNG at the existing async output completion boundary."""
+
+    def __init__(self, output: AsyncModelRunnerOutput, feedback: Any):
+        self.output = output
+        self.feedback = feedback
+
+    def get_output(self) -> OmniModelRunnerOutput:
+        output = self.output.get_output()
+        self.feedback.commit(ready=True)
+        output.invalid_logits_req_ids = {output.req_ids[row] for row in self.feedback.invalid_rows()}
+        return output
+
+
 class OmniAsyncGPUModelRunnerOutput(AsyncGPUModelRunnerOutput):
     def __init__(
         self,
@@ -1500,6 +1514,9 @@ class GPUARModelRunner(
         fallthrough is load-bearing, not an error path; it is logged once per
         model for visibility.
         """
+        commit_sampling = getattr(self.model, "commit_deferred_sampling", None)
+        if callable(commit_sampling):
+            commit_sampling()
         sampling_metadata = self.input_batch.sampling_metadata
         if spec_decode_metadata is None:
             model_sample = getattr(self.model, "sample", None)
@@ -1523,7 +1540,8 @@ class GPUARModelRunner(
                     logits,
                     prepared_sampling_metadata,
                     input_batch=self.input_batch,
-                    requests=getattr(self, "requests", None),
+                    requests=self.requests,
+                    defer_rng=True,
                 )
                 if sampler_output is not None:
                     return sampler_output
@@ -2202,6 +2220,11 @@ class GPUARModelRunner(
         with record_function_or_nullcontext("gpu_model_runner: sample"):
             sampler_output = self._sample(logits, spec_decode_metadata)
 
+        # Commit conditional RNG before bookkeeping can roll back discarded draws.
+        finalize_sampling = getattr(self.model, "finalize_deferred_sampling", None)
+        sampling_feedback = None
+        if not self.use_async_scheduling and callable(finalize_sampling):
+            sampling_feedback = finalize_sampling(sampler_output.sampled_token_ids)
         self._update_states_after_model_execute(sampler_output.sampled_token_ids, scheduler_output)
         if self.use_async_scheduling:
             pp = get_pp_group()
@@ -2435,6 +2458,8 @@ class GPUARModelRunner(
                     restored_mm=restored_mm_snapshot,
                 )
             output.omni_connector_output = omni_connector_output
+            if sampling_feedback is not None:
+                output.invalid_logits_req_ids = {req_ids_output_copy[row] for row in sampling_feedback.invalid_rows()}
             return output
 
         if not use_async_omni_output:
@@ -2471,6 +2496,11 @@ class GPUARModelRunner(
                 async_output.async_copy_ready_event,
             )
 
+        stage_sampling = getattr(self.model, "stage_deferred_sampling", None)
+        if callable(stage_sampling):
+            feedback = stage_sampling(self.async_output_copy_stream, async_output.async_copy_ready_event)
+            if feedback is not None:
+                return _SamplingFeedbackOutput(async_output, feedback)
         return async_output
 
     def _resolve_global_request_id(self, req_id: str) -> str:

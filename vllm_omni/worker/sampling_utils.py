@@ -76,7 +76,7 @@ def build_model_sampler_extra_args(input_batch: Any, requests: Any) -> list[dict
     """Return per-request ``SamplingParams.extra_args`` in batch-row order."""
     request_states = requests or {}
     per_req_extra_args: list[dict | None] = []
-    for req_id in getattr(input_batch, "req_ids", []):
+    for req_id in input_batch.req_ids:
         state = request_states.get(req_id)
         params = getattr(state, "sampling_params", None)
         per_req_extra_args.append(getattr(params, "extra_args", None))
@@ -91,6 +91,7 @@ def call_model_sampler(
     *,
     input_batch: Any,
     requests: Any,
+    defer_rng: bool = False,
 ) -> Any:
     """Call an opted-in model sampler with per-request host arguments.
 
@@ -99,6 +100,9 @@ def call_model_sampler(
     """
     wants_extra_args = getattr(model, "model_sampler_wants_extra_args", False)
     wants_sampling_params = getattr(model, "model_sampler_wants_sampling_params", False)
+    can_defer_rng = getattr(model, "model_sampler_can_defer_rng", False)
+    if defer_rng and not can_defer_rng:
+        logger.debug("Model %s does not support deferred sampling RNG; using immediate RNG.", type(model).__name__)
     if not wants_extra_args and not wants_sampling_params:
         return model_sample(logits, sampling_metadata)
     kwargs: dict[str, Any] = {}
@@ -107,9 +111,10 @@ def call_model_sampler(
     if wants_sampling_params:
         request_states = requests or {}
         kwargs["per_req_sampling_params"] = [
-            getattr(request_states.get(req_id), "sampling_params", None)
-            for req_id in getattr(input_batch, "req_ids", [])
+            getattr(request_states.get(req_id), "sampling_params", None) for req_id in input_batch.req_ids
         ]
+    if defer_rng and can_defer_rng:
+        kwargs["defer_rng"] = True
     return model_sample(logits, sampling_metadata, **kwargs)
 
 
