@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import re
 from importlib.util import find_spec, module_from_spec, spec_from_file_location
 from pathlib import Path
 from shlex import split
@@ -15,6 +16,7 @@ AMD_NIGHTLY_PIPELINE = Path(".buildkite/amd/test-amd-nightly.yml")
 AMD_WEEKLY_PIPELINE = Path(".buildkite/amd/test-amd-weekly.yml")
 AMD_READY_PIPELINE = Path(".buildkite/amd/test-amd-ready.yml")
 AMD_BOOTSTRAP = Path(".buildkite/amd/scripts/bootstrap-amd-omni.sh")
+AMD_COLLECTION_GUARD = Path(".buildkite/amd/scripts/assert-pytest-collection.sh")
 AMD_SUITE_COMBINER = Path(__file__).resolve().parents[2] / ".buildkite/amd/scripts/combine_test_suites.py"
 AMD_RUNNER = Path(".buildkite/amd/scripts/run-amd-test.sh")
 AMD_TEMPLATE = Path(".buildkite/amd/test-template-amd-omni.j2")
@@ -92,6 +94,23 @@ def _walk_steps(steps: list[dict]):
     for step in steps:
         yield step
         yield from _walk_steps(step.get("steps", []))
+
+
+_MARK_EXPRESSION = re.compile(r"(?:^|\s)-m\s+(['\"])(.*?)\1", re.DOTALL)
+
+
+def _marker_expressions(step: dict) -> list[str]:
+    return [match.group(2) for command in step.get("commands", []) for match in _MARK_EXPRESSION.finditer(command)]
+
+
+def _amd_marker_selector_inventory(marker: str) -> set[tuple[Path, str, str]]:
+    return {
+        (pipeline_path, step["label"], expression)
+        for pipeline_path in (AMD_READY_PIPELINE, AMD_MERGE_PIPELINE)
+        for step in _walk_steps(yaml.safe_load(pipeline_path.read_text(encoding="utf-8"))["steps"])
+        for expression in _marker_expressions(step)
+        if re.search(rf"\b{re.escape(marker)}\b", expression)
+    }
 
 
 def _steps_selecting_node(pipeline_path: Path, node: str) -> list[dict]:
@@ -565,9 +584,122 @@ def test_joy_gpu_suite_remains_selected_by_cuda_model_lane() -> None:
     assert "pytest.mark.cpu" not in Path(JOY_GPU_PATH).read_text(encoding="utf-8")
 
 
+# These jobs previously selected CUDA-marked items on AMD. Each migrated lane
+# now selects its qualified ROCm variants and verifies the exact collection
+# before running the GPU workload.
+_ROCM_MIGRATED_AMD_GPU_JOBS = (
+    (
+        "Diffusion · Model Test",
+        AMD_READY_PIPELINE,
+        "Blocking",
+        117,
+        "core_model and rocm and MI325 and not nvidia_only and not "
+        "(cards_2 or cards_3 or cards_4 or cards_5 or cards_6 or cards_7 or cards_8)",
+    ),
+    (
+        "ROCm · Model Executor GPU Coverage (R2-01) · Shard %N/%t",
+        AMD_READY_PIPELINE,
+        "NonBlocking",
+        1400,
+        "core_model and rocm and MI325 and not nvidia_only and not "
+        "(cards_2 or cards_3 or cards_4 or cards_5 or cards_6 or cards_7 or cards_8)",
+    ),
+    (
+        "ROCm · Entrypoints GPU Coverage (R2-02)",
+        AMD_READY_PIPELINE,
+        "NonBlocking",
+        3,
+        "core_model and rocm and MI325 and not nvidia_only and not "
+        "(cards_2 or cards_3 or cards_4 or cards_5 or cards_6 or cards_7 or cards_8)",
+    ),
+    (
+        "Diffusion · LoRA Test",
+        AMD_MERGE_PIPELINE,
+        "Blocking",
+        1,
+        "advanced_model and rocm and MI325 and cards_1 and not nvidia_only",
+    ),
+    (
+        "Diffusion · Wan22 Offline Test",
+        AMD_MERGE_PIPELINE,
+        "Blocking",
+        2,
+        "advanced_model and rocm and MI325 and cards_1 and diffusion and not nvidia_only",
+    ),
+    (
+        "Diffusion · Wan22 Online Test",
+        AMD_MERGE_PIPELINE,
+        "Blocking",
+        1,
+        "advanced_model and rocm and MI325 and cards_1 and diffusion and not nvidia_only",
+    ),
+    (
+        "Omni Model Test Qwen3-Omni",
+        AMD_MERGE_PIPELINE,
+        "Blocking",
+        16,
+        "advanced_model and rocm and MI325 and not nvidia_only",
+    ),
+    (
+        "Qwen3-TTS Base E2E Test",
+        AMD_MERGE_PIPELINE,
+        "Blocking",
+        3,
+        "advanced_model and rocm and MI325 and cards_1 and not nvidia_only",
+    ),
+)
+
+
+def test_ready_and_merge_pipelines_have_no_cuda_marker_selectors() -> None:
+    assert _amd_marker_selector_inventory("cuda") == set()
+
+
+def test_migrated_amd_gpu_jobs_select_exact_rocm_collections() -> None:
+    for label, pipeline_path, grade, expected_count, marker_expression in _ROCM_MIGRATED_AMD_GPU_JOBS:
+        step = _find_step(label, pipeline_path)
+        assert step.get("grade") == grade
+
+        collect_commands = [command for command in step["commands"] if AMD_COLLECTION_GUARD.name in command]
+        run_commands = [
+            command
+            for command in step["commands"]
+            if AMD_COLLECTION_GUARD.name not in command
+            and marker_expression in _marker_expressions({"commands": [command]})
+        ]
+        assert len(collect_commands) == 1
+        assert len(run_commands) == 1
+        assert _marker_expressions({"commands": collect_commands}) == [marker_expression]
+        assert _marker_expressions({"commands": run_commands}) == [marker_expression]
+
+        collect_argv = split(collect_commands[0])
+        assert collect_argv[:2] == ["bash", str(AMD_COLLECTION_GUARD)]
+        assert collect_argv[2] == str(expected_count)
+
+
+def test_amd_collection_guard_rejects_empty_and_changed_collections() -> None:
+    guard = AMD_COLLECTION_GUARD.read_text(encoding="utf-8")
+    assert "set -euo pipefail" in guard
+    assert 'pytest --collect-only -q "$@"' in guard
+    assert "^tests\\/.*::" in guard
+    assert '"${actual_count}" != "${expected_count}"' in guard
+
+
+def test_wan_sdpa_alignment_cpu_case_stays_shared_and_cuda_kernel_stays_nvidia() -> None:
+    cpu_case = Path("tests/diffusion/distributed/test_wan_attention_sdpa_alignment.py").read_text(encoding="utf-8")
+    cuda_case = Path("tests/diffusion/distributed/test_wan_attention_sdpa_alignment_cuda.py").read_text(
+        encoding="utf-8"
+    )
+    assert "pytest.mark.cpu" in cpu_case
+    assert "rocm" not in cpu_case
+    assert 'res={"cuda": "L4"}' in cuda_case
+    assert "rocm" not in cuda_case
+
+
 def test_joy_gpu_suite_is_not_duplicated_in_amd_model_lane() -> None:
     step = _find_step("Diffusion · Model Test", AMD_READY_PIPELINE)
-    argv = split(next(command for command in step["commands"] if "tests/diffusion/models/" in split(command)))
+    argv = split(
+        next(command for command in step["commands"] if split(command)[:4] == ["timeout", "15m", "pytest", "-sv"])
+    )
 
     assert step["grade"] == "Blocking"
     assert step["agent_pool"] == "mi300_1"
@@ -576,7 +708,8 @@ def test_joy_gpu_suite_is_not_duplicated_in_amd_model_lane() -> None:
     assert "--ignore=tests/diffusion/models/auk/test_auk_vae_fastpath.py" in argv
     assert "--ignore=tests/diffusion/models/mammoth_moda2/test_dit_attention_cuda.py" in argv
     assert argv[argv.index("-m") + 1] == (
-        "core_model and cuda and not (cards_2 or cards_3 or cards_4 or cards_5 or cards_6 or cards_7 or cards_8)"
+        "core_model and rocm and MI325 and not nvidia_only and not "
+        "(cards_2 or cards_3 or cards_4 or cards_5 or cards_6 or cards_7 or cards_8)"
     )
     assert argv[argv.index("--run-level") + 1] == "core_model"
 
@@ -652,12 +785,12 @@ def test_qwen3_tts_base_preserves_advanced_model_arguments() -> None:
     commands = step["commands"]
 
     assert all("bash -c" not in command for command in commands)
-    pytest_command = next(command for command in commands if "pytest" in command)
+    pytest_command = next(command for command in commands if "pytest" in split(command))
     argv = split(pytest_command)
 
     marker_index = argv.index("-m")
     run_level_index = argv.index("--run-level")
-    assert argv[marker_index + 1] == "advanced_model and cuda"
+    assert argv[marker_index + 1] == "advanced_model and rocm and MI325 and cards_1 and not nvidia_only"
     assert argv[run_level_index + 1] == "advanced_model"
 
 

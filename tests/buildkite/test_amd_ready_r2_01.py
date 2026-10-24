@@ -15,7 +15,7 @@ R2_01_LABEL = "ROCm · Model Executor GPU Coverage (R2-01) · Shard %N/%t"
 R2_01_SHARD_SUFFIX = "$${BUILDKITE_PARALLEL_JOB}-of-$${BUILDKITE_PARALLEL_JOB_COUNT}"
 ENGINE_LABEL = "Engine Test"
 SINGLE_GPU_MARKERS = (
-    "core_model and cuda and not nvidia_only and not "
+    "core_model and rocm and MI325 and not nvidia_only and not "
     "(cards_2 or cards_3 or cards_4 or cards_5 or cards_6 or cards_7 or cards_8)"
 )
 
@@ -49,10 +49,12 @@ def _assert_single_gpu_selection(command: str) -> None:
 @pytest.mark.parametrize(
     ("marks", "selected"),
     [
-        ({"core_model", "cuda", "nvidia_only", "L4", "cards_1"}, False),
-        ({"core_model", "cuda"}, True),
-        ({"core_model", "cuda", "L4", "MI325", "cards_1"}, True),
-        ({"core_model", "cuda", "cards_2"}, False),
+        ({"core_model", "rocm", "nvidia_only", "MI325", "cards_1"}, False),
+        ({"core_model", "rocm", "MI325"}, True),
+        ({"core_model", "rocm", "MI325", "cards_1"}, True),
+        ({"core_model", "rocm", "MI325", "cards_2"}, False),
+        ({"core_model", "rocm", "cards_1"}, False),
+        ({"core_model", "cuda", "L4", "cards_1"}, False),
     ],
 )
 def test_r2_01_marker_selection_contract(marks: set[str], selected: bool) -> None:
