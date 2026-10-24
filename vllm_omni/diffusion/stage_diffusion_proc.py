@@ -81,7 +81,7 @@ class StageDiffusionProc:
         self._engine: DiffusionEngine | None = None
         self._executor: ThreadPoolExecutor | None = None
         self._closed = False
-        # Set by ``run_loop`` to the live dispatch task dict so
+        # Set by ``_run_loop`` to the live dispatch task dict so
         # :attr:`queue_length` can report in-flight requests for the
         # OmniCoordinator heartbeat hook.
         self._active_tasks: dict[str, asyncio.Task] | None = None
@@ -370,12 +370,50 @@ class StageDiffusionProc:
     ) -> None:
         """Async event loop handling ZMQ messages from StageDiffusionClient."""
         ctx = zmq.asyncio.Context()
+        request_socket: zmq.asyncio.Socket | None = None
+        response_socket: zmq.asyncio.Socket | None = None
+        response_connected = False
 
-        request_socket = ctx.socket(zmq.PULL)
-        request_socket.connect(request_address)
+        try:
+            request_socket = ctx.socket(zmq.PULL)
+            response_socket = ctx.socket(zmq.PUSH)
+            # Connect the response side first so a request-side connect
+            # failure can still be reported to the client.
+            response_socket.connect(response_address)
+            response_connected = True
+            request_socket.connect(request_address)
+            await self._run_loop(request_socket, response_socket)
+        except Exception:
+            # Send the death sentinel so the client can detect the fatal
+            # failure promptly, including failures while the loop initializes
+            # (mirrors EngineCoreProc._send_engine_dead). A PUSH socket without
+            # a connected peer blocks on send, so skip the sentinel in that
+            # case and bound the send so a stuck client cannot hang teardown.
+            if response_connected and response_socket is not None:
+                try:
+                    response_socket.setsockopt(zmq.LINGER, 4000)
+                    await asyncio.wait_for(
+                        response_socket.send(StageDiffusionProc.DIFFUSION_PROC_DEAD),
+                        timeout=5.0,
+                    )
+                except Exception:
+                    logger.warning("Failed to send DIFFUSION_PROC_DEAD sentinel to client.")
+            raise
+        finally:
+            self._active_tasks = None
+            self._fatal_event = None
+            if request_socket is not None:
+                request_socket.close()
+            if response_socket is not None:
+                response_socket.close()
+            ctx.term()
 
-        response_socket = ctx.socket(zmq.PUSH)
-        response_socket.connect(response_address)
+    async def _run_loop(
+        self,
+        request_socket: zmq.asyncio.Socket,
+        response_socket: zmq.asyncio.Socket,
+    ) -> None:
+        """Initialize and dispatch requests within the transport lifetime."""
 
         encoder = OmniMsgpackEncoder()
         decoder = OmniMsgpackDecoder()
@@ -584,27 +622,11 @@ class StageDiffusionProc:
                 elif msg_type == "shutdown":
                     break
 
-        except Exception:
-            # Send the death sentinel so the client can detect the
-            # fatal failure promptly (mirrors EngineCoreProc._send_engine_dead).
-            try:
-                response_socket.setsockopt(zmq.LINGER, 4000)
-                await response_socket.send(StageDiffusionProc.DIFFUSION_PROC_DEAD)
-            except Exception:
-                logger.warning("Failed to send DIFFUSION_PROC_DEAD sentinel to client.")
-            raise
-
         finally:
             rpc_task.cancel()
             for task in tasks.values():
                 task.cancel()
             await asyncio.gather(rpc_task, *tasks.values(), return_exceptions=True)
-
-            self._active_tasks = None
-            self._fatal_event = None
-            request_socket.close()
-            response_socket.close()
-            ctx.term()
 
     # ------------------------------------------------------------------
     # Lifecycle
