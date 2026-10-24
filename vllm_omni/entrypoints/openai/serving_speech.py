@@ -4,6 +4,7 @@
 import asyncio
 import base64
 import contextlib
+import copy
 import hashlib
 import io
 import json
@@ -2617,16 +2618,19 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             if request.extra_params is not None and not isinstance(request.extra_params, dict):
                 raise ValueError("extra_params must be a JSON object/dict.")
             extra = dict(request.extra_params or {})
+            seed = extra.pop("seed", None)
             if request.seed is not None:
-                extra["seed"] = request.seed
+                seed = request.seed
             # Apply extra_params from the request to sampling params
             sampling_params_list = self._diffusion_engine.default_sampling_params_list
-            if extra:
-                import copy
-
+            if extra or seed is not None:
                 sampling_params_list = copy.deepcopy(sampling_params_list)
+                if seed is not None:
+                    sampling_params_list[0].seed = seed
                 if sampling_params_list[0].extra_args is None:
                     sampling_params_list[0].extra_args = {}
+                if seed is not None and "seed" in sampling_params_list[0].extra_args:
+                    sampling_params_list[0].extra_args["seed"] = seed
                 sampling_params_list[0].extra_args.update(extra)
 
                 sampling = sampling_params_list[0]
@@ -2647,7 +2651,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     except (TypeError, ValueError) as exc:
                         raise ValueError("guidance_scale must be a number") from exc
 
-                logger.info("Applied extra_params to diffusion: %s", extra)
+                logger.info("Applied diffusion speech params: seed=%s extra_params=%s", seed, extra)
 
             generator = self._diffusion_engine.generate(
                 prompt=prompt,
