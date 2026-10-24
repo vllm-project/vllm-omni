@@ -101,15 +101,9 @@ Offline text-to-video at a reduced 576x320, 17-frame shape. Layerwise offload
 streams the two 14B expert transformers; VAE slicing bounds the decode
 activations.
 
-#### Environment
-
-- OS: Linux
-- Python: 3.10+
-- torch: 2.13.0+xpu
-- vLLM: 0.29.0 (`98dff2a8`)
-- vLLM-Omni: `main` at `4c7a98c2`
-
 #### Command
+
+**Without CFG:**
 
 ```bash
 python examples/offline_inference/text_to_video/text_to_video.py \
@@ -156,6 +150,30 @@ Confirm `wan22_t2v_output.mp4` decodes and that frame 0 is clean.
 - Known limitations: only offline T2V at 576x320 was qualified. Larger shapes,
   TI2V, HSDP, CFG parallelism, and online serving are out of scope for this
   profile.
+
+### 4x Intel Arc Pro B70 (32 GB)
+
+#### Command
+
+```bash
+VLLM_WORKER_MULTIPROC_METHOD=spawn \
+python examples/offline_inference/text_to_video/text_to_video.py \
+  --model Wan-AI/Wan2.2-T2V-A14B-Diffusers \
+  --negative-prompt "blurry, noisy, artifacts, distorted, low quality, streaks, sparkles, blocky, pixelated" \
+  --guidance-scale 3.0 \
+  --guidance-scale-high 4.0 \
+  --height 480 \
+  --width 832 \
+  --num-frames 33 \
+  --tensor-parallel-size 2 \
+  --cfg-parallel-size 2 \
+  --enable-cpu-offload \
+  --enforce-eager \
+  --flow-shift 12.0 \
+  --vae-use-slicing \
+  --fps 16 \
+  --output wan22_t2v_cfg2_q40.mp4
+```
 
 ## Accelerating with TRTLLM_ATTN + Skip-Softmax (datacenter Blackwell)
 
