@@ -440,6 +440,8 @@ def _bf16_fused_moe_forward(
         top_k=top_k,
         config=config,
         fuse_swiglu=True,
+        # MUSA: separate gate and up register accumulators keep SwiGLU7 from staging the FP32 tile in shared memory.
+        split_gate_up=current_omni_platform.is_musa(),
     )
     route_output = torch.empty((num_tokens * num_heads, top_k, hidden_size), device=x_heads.device, dtype=x_heads.dtype)
     invoke_fused_moe_bf16(
