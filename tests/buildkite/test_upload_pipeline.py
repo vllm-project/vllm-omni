@@ -840,6 +840,33 @@ def test_source_filter_strips_deps_and_expands_hardware(monkeypatch: pytest.Monk
     assert z_image["agents"]["queue"] == "l4-k8s"
 
 
+@pytest.mark.parametrize(
+    ("changed_file", "expected"),
+    [
+        ("vllm_omni/model_executor/models/mammoth_moda2/mammoth_moda2.py", True),
+        ("vllm_omni/diffusion/models/mammoth_moda2/mammothmoda2_dit_model.py", True),
+        ("tests/e2e/offline_inference/test_mammoth_moda2_fp8_quantization.py", True),
+        ("vllm_omni/deploy/mammoth_moda2_ar.yaml", True),
+        ("tests/e2e/offline_inference/test_qwen3_omni.py", False),
+        ("docs/README.md", False),
+    ],
+)
+def test_mammoth_moda2_nightly_source_filter(
+    monkeypatch: pytest.MonkeyPatch,
+    changed_file: str,
+    expected: bool,
+) -> None:
+    monkeypatch.setattr("upload_pipeline._get_mirror_hw_selector", lambda: "")
+    doc = yaml.safe_load(NIGHTLY_YAML.read_text(encoding="utf-8"))
+    rendered = _render_test_pipeline(doc, changed_files=[changed_file], pipeline_path=NIGHTLY_YAML)
+    selected = any(
+        "test_mammoth_moda2_fp8_quantization.py" in command
+        for step in _iter_steps(rendered)
+        for command in step.get("commands", [])
+    )
+    assert selected is expected
+
+
 def test_source_filter_respects_force_all_and_uses_diff_on_main(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
