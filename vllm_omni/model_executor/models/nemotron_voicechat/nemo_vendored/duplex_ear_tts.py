@@ -1,5 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -44,7 +45,7 @@ from .tokenizer import AutoTokenizer
 
 
 class DuplexEARTTS(nn.Module):
-    def __init__(self, cfg: dict) -> None:
+    def __init__(self, cfg: dict, *, initialize_audio_prompt_projection: bool = True) -> None:
         assert isinstance(cfg, dict), (
             "You must pass the config to DuplexEARTTS as a Python dict to support hyperparameter serialization "
             f"in PTL checkpoints (we got: '{type(cfg)=}')."
@@ -89,7 +90,11 @@ class DuplexEARTTS(nn.Module):
         )  # Note that we are using fast tokenizer
 
         # Instantiate TTS model
-        self.tts_model = RVQEARTTSModel(DictConfig(self.cfg.tts_config), tokenizer=self.tokenizer)
+        self.tts_model = RVQEARTTSModel(
+            DictConfig(self.cfg.tts_config),
+            tokenizer=self.tokenizer,
+            initialize_audio_prompt_projection=initialize_audio_prompt_projection,
+        )
         # Load and initialize audio codec, and bind RVQ embeddings to the TTS model
         setup_audio_codec(self)
 
