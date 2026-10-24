@@ -1260,10 +1260,17 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
         return finished
 
     def make_stats(self, *args, **kwargs) -> SchedulerStats | None:
+        # If the step emptying the stage is throttled, the scheduler gauges become stuck showing busy values
+        # until the next request because reports are throttled to once per _STATS_INTERVAL_S and idle engines stop
+        # stepping. The additional `just_drained` check lets the draining step's report through the throttle.
+        idle = not self.has_unfinished_requests()
+        just_drained = idle and not getattr(self, "_last_stats_was_idle", idle)
         now = time.monotonic()
-        if now - getattr(self, "_last_stats_time", 0.0) < _STATS_INTERVAL_S:
+        throttled = now - getattr(self, "_last_stats_time", 0.0) < _STATS_INTERVAL_S
+        if throttled and not just_drained:
             return None
         self._last_stats_time = now
+        self._last_stats_was_idle = idle
         return super().make_stats(*args, **kwargs)
 
     def _realign_request_status_to_queues(
