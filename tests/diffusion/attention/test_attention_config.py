@@ -10,6 +10,7 @@ Tests cover:
 - AttentionMetadata.extra field
 """
 
+import sys
 from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
@@ -18,6 +19,8 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+import vllm_omni.diffusion.attention.backends.abstract as abstract_mod
+import vllm_omni.diffusion.attention.backends.flash_attn as flash_attn_mod
 import vllm_omni.diffusion.attention.layer as layer_mod
 import vllm_omni.diffusion.attention.selector as selector_mod
 from vllm_omni.diffusion.attention.backends.abstract import (
@@ -1024,7 +1027,8 @@ class TestAttentionInitUsesCurrentDiffusionConfig:
             Attention._assert_metadata_compatible(fake_attention, metadata)
 
     @pytest.mark.parametrize("backend_explicit", [False, True])
-    def test_dense_mask_fallback_respects_explicit_backend(self, backend_explicit):
+    def test_dense_mask_fallback_respects_explicit_backend(self, monkeypatch, backend_explicit):
+        monkeypatch.setattr(flash_attn_mod, "current_omni_platform", SimpleNamespace(is_npu=lambda: False))
         sentinel = torch.randn(1, 2, 4, 8)
         fake_attention = SimpleNamespace(
             attn_backend=FlashAttentionBackend,
@@ -1049,6 +1053,44 @@ class TestAttentionInitUsesCurrentDiffusionConfig:
             assert output is sentinel
             fake_attention.sdpa_fallback.forward.assert_called_once_with(query, query, query, metadata)
         fake_attention.attention.forward.assert_not_called()
+
+    @pytest.mark.parametrize("backend_explicit", [False, True])
+    @pytest.mark.parametrize("kv_length", [3, 5])
+    def test_npu_dense_mask_reaches_mindiesd(self, monkeypatch, backend_explicit, kv_length):
+        platform = SimpleNamespace(is_rocm=lambda: False, is_cuda=lambda: False, is_npu=lambda: True)
+        monkeypatch.setattr(flash_attn_mod, "current_omni_platform", platform)
+        monkeypatch.setattr(abstract_mod, "current_omni_platform", platform)
+        query = torch.randn(2, 3, 2, 4)
+        key = torch.randn(2, kv_length, 2, 4)
+        value = torch.randn_like(key)
+        mask = torch.ones(2, 1, 3, kv_length, dtype=torch.bool)
+        mask[:, :, 0, -1] = False
+        metadata = AttentionMetadata(attn_mask=mask)
+        sentinel = torch.randn_like(query)
+        kernel = Mock(return_value=sentinel)
+        monkeypatch.setitem(sys.modules, "mindiesd", SimpleNamespace(attention_forward=kernel))
+
+        layer = Attention.__new__(Attention)
+        torch.nn.Module.__init__(layer)
+        layer.attn_backend = FlashAttentionBackend
+        layer.attn_spec = None
+        layer.backend_explicit = backend_explicit
+        layer._has_custom_attention = False
+        layer._explicit_cross_contract = False
+        layer.allow_fp32_fallback = False
+        layer._scheduler_paged_kv = False
+        layer.attention = flash_attn_mod.FlashAttentionImpl(
+            num_heads=2, head_size=4, softmax_scale=0.5, causal=False, qkv_layout="BSND"
+        )
+        layer.sdpa_fallback = SimpleNamespace(forward=lambda *args: pytest.fail("unexpected SDPA fallback"))
+
+        output = layer._run_local_attention(query, key, value, metadata)
+
+        assert output is sentinel
+        kernel.assert_called_once_with(
+            query, key, value, attn_mask=mask, opt_mode="manual", op_type="fused_attn_score", layout="BSND"
+        )
+        assert kernel.call_args.kwargs["attn_mask"] is mask
 
     def test_ring_attention_rejects_mask_instead_of_ignoring_it(self):
         fake_attention = SimpleNamespace(attention=SimpleNamespace(skip=None), ring_runner=None)

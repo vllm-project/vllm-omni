@@ -64,6 +64,13 @@ cuDNN version probe belongs to automatic Blackwell fallback selection.
 The selector must not duplicate device capability or package-availability
 policy that belongs to the platform.
 
+For calls with a dense four-dimensional attention mask, `Attention` checks
+`supports_dense_attention_mask()` before dispatch. An unsupported automatic
+selection falls back to SDPA; an unsupported explicit selection raises.
+This capability is platform-dependent: `FLASH_ATTN` preserves the NPU path
+that forwards dense masks to MindIE-SD (or `torch_npu` for causal attention),
+while its CUDA padding-only varlen path cannot consume dense QK masks.
+
 ## Typed backend options
 
 Backend-specific settings remain typed fields on `AttentionSpec` rather than

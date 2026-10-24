@@ -920,15 +920,16 @@ class QwenImage21Pipeline(
 
     @property
     def default_num_inference_steps(self):
-        """Step count implied by the model-level sampling grid, when present.
+        """Default step count from the sampling grid or the 50-step fallback.
 
         The model runner falls back to this when the request carries neither
-        num_inference_steps, timesteps, nor sigmas.
+        num_inference_steps, timesteps, nor sigmas. Keep the fallback aligned
+        with forward so request-boundary cache refresh is never skipped.
         """
         sample_sigmas = getattr(self, "sample_sigmas", None)
         if sample_sigmas is not None:
             return len(sample_sigmas)
-        return None
+        return 50
 
     @property
     def num_timesteps(self):
