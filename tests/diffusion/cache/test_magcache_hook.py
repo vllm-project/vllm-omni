@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """
 Unit tests for the MagCache hook forward numerics.
@@ -10,6 +10,8 @@ once; every other hooked block must pass its inputs through unchanged,
 matching the reference implementation in diffusers.hooks.mag_cache.
 """
 
+import logging
+
 import pytest
 import torch
 import torch.nn as nn
@@ -17,9 +19,12 @@ import torch.nn as nn
 from vllm_omni.diffusion.cache.magcache.config import MagCacheConfig
 from vllm_omni.diffusion.cache.magcache.hook import (
     _MAG_CACHE_LEADER_BLOCK_HOOK,
+    MagCacheBlockHook,
+    MagCacheHeadHook,
     apply_mag_cache_hook,
 )
-from vllm_omni.diffusion.hooks.base import HookRegistry
+from vllm_omni.diffusion.cache.magcache.state import MagCacheState
+from vllm_omni.diffusion.hooks.base import HookRegistry, StateManager
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -69,6 +74,27 @@ def _make_config(num_inference_steps: int = 2) -> MagCacheConfig:
         num_inference_steps=num_inference_steps,
         mag_ratios=torch.ones(num_inference_steps),
     )
+
+
+@pytest.mark.parametrize("as_tuple", [False, True])
+@pytest.mark.parametrize("debug_enabled", [False, True])
+def test_residual_debug_norms_run_only_at_debug(caplog, mocker, as_tuple, debug_enabled):
+    caplog.set_level(logging.DEBUG if debug_enabled else logging.INFO, logger="vllm_omni.diffusion.cache.magcache.hook")
+    norm = mocker.spy(torch, "norm")
+    state = MagCacheState()
+    residual = torch.ones(1, 2, 3)
+    if as_tuple:
+        residual = (residual, residual)
+    state.previous_residual = residual
+    output = torch.zeros(1, 2, 3)
+    head = MagCacheHeadHook(StateManager(MagCacheState), _make_config())
+    tail = MagCacheBlockHook(StateManager(MagCacheState))
+
+    assert head.log_cache_miss(state, output) is output
+    assert tail.log_residual_computed(state, residual) is None
+    assert norm.call_count == (2 * (2 if as_tuple else 1) if debug_enabled else 0)
+    assert state.previous_residual is residual
+    assert state.step_index == 0
 
 
 def test_skipped_step_applies_full_stack_residual_once():
