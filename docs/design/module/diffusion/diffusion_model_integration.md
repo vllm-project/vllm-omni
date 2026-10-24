@@ -58,6 +58,22 @@ cross-stage routing.
 Test registry selection, checkpoint loading, minimal inference, input and output
 contracts, and every declared optional capability.
 
+## HunyuanImage3 AR KV token identity
+
+The HunyuanImage3 AR-to-DiT bridge carries the original prompt and generated
+token IDs alongside display text. Scheduler preparation and worker execution
+use those generated IDs for CoT sections, then build the uncached image suffix
+with the existing template. Decoding and re-encoding generated text is not an
+identity operation, even when the token count stays the same.
+
+Before importing AR KV, the conditional prefix must match the original AR
+sequence token by token. Dense reuse is bounded by the actual key and value
+coverage of every decoder layer; native transfer uses confirmed computed-token
+coverage. The closing CoT token remains outside the reused prefix. Dropping
+cached thought tokens or receiving incomplete image/CFG coverage is rejected
+before injection. Full recomputation can still drop thoughts. Standalone text
+requests and AR outputs without a completed CoT retain their template path.
+
 ## Weight reloading
 
 Pipelines that support live RL weight updates opt in with
