@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import os
 from pathlib import Path
 
 import pytest
@@ -56,10 +57,15 @@ def test_pipeline_on_supported_tasks(
     if settings.checkpoint_filename is not None:
         model_path = str(Path(model_path) / settings.checkpoint_filename)
         model_kwargs["model_class_name"] = model_name
+    timeout_kwargs = {}
+    for name in ("init_timeout", "stage_init_timeout"):
+        if value := os.environ.get(f"VLLM_OMNI_TEST_{name.upper()}"):
+            timeout_kwargs[name] = int(value)
     omni = build_omni_from_diff_accelerations(
         accelerations=accelerations,
         model=model_path,
         enforce_eager=True,
+        **timeout_kwargs,
         **model_kwargs,
     )
     try:

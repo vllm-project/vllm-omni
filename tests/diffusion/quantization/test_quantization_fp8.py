@@ -282,6 +282,10 @@ def test_single_stage_zimage_fp8():
 
 
 @hardware_test(res={"cuda": ["L4", "B200"]})
+@pytest.mark.skipif(
+    current_omni_platform.is_rocm(),
+    reason="CUDA peak-memory comparison is not portable to ROCm",
+)
 def test_single_stage_zimage_fp8_uses_less_memory():
     """FP8 should use less peak memory than BF16 for Z-Image-Turbo."""
     _, mem_bf16 = _generate_single_stage_image(
@@ -358,6 +362,10 @@ def test_single_stage_flux_fp8_uses_less_memory():
 
 
 @hardware_test(res={"cuda": ["H100", "B200"]})
+@pytest.mark.skipif(
+    current_omni_platform.is_rocm(),
+    reason="CUDA peak-memory comparison is not portable to ROCm",
+)
 def test_single_stage_ltx2_fp8_uses_less_memory():
     """FP8 should use less peak memory than BF16 for LTX-2."""
     _, mem_bf16 = _generate_single_stage_video(
