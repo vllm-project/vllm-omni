@@ -218,7 +218,7 @@ are the MAGI-2-specific qualified combinations.
 | --- | --- | --- |
 | Sequence parallel | Resident SP4 default; compatible SP8 configuration | [Sequence parallel](../../docs/user_guide/diffusion/parallelism/sequence_parallel.md) |
 | Tensor parallel | TP4 or TP2SP2 on four workers | [Tensor parallel](../../docs/user_guide/diffusion/parallelism/tensor_parallel.md) |
-| DLO | DP4/DP2SP2 AllGather; SP4 rank-local requires `--dlo-no-use-allgather` | [Distributed layerwise offload](../../docs/design/feature/distributed_layerwise_offload.md) |
+| DLO | DP4/DP2SP2 AllGather; SP4 rank-local requires `--dlo-no-use-allgather` | [Distributed layerwise offload](../../docs/design/feature/offloader/distributed_layerwise_offload.md) |
 | HSDP | HSDP4+SP4; alternative to TP and DLO | [HSDP](../../docs/user_guide/diffusion/parallelism/hsdp.md) |
 | CFG parallel | CFG2xSP2 on four workers; CFG2xSP4 requires eight | [CFG parallel](../../docs/user_guide/diffusion/parallelism/cfg_parallel.md) |
 | VAE patch parallel | TurboVAE tile decode across the complete worker group | [VAE parallelism](../../docs/user_guide/diffusion/parallelism/vae_parallelism.md) |
