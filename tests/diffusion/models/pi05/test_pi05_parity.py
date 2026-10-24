@@ -38,7 +38,7 @@ pytestmark = [pytest.mark.local_model, pytest.mark.diffusion, pytest.mark.cpu]
 
 
 # ─── Config (fixed; matches LeRobot defaults for a π0.5 checkpoint) ────
-DEVICE = "cpu"
+DEVICE = os.environ.get("PI_PARITY_DEVICE", "cpu")
 DTYPE_STR = "float32"
 ATOL = 1e-4
 BF16_ATOL = 5e-2  # measured 2.95e-2, reproducible; margin is for version drift
@@ -117,7 +117,10 @@ def _instantiate_lerobot(use_relative_actions: bool = False, action_feature_name
     from lerobot.policies.pi05 import PI05Policy
     from lerobot.policies.pi05.processor_pi05 import make_pi05_pre_post_processors
 
-    policy = PI05Policy.from_pretrained(MODEL_PATH, strict=True, dtype=dtype)
+    config = PI05Policy.config_class.from_pretrained(MODEL_PATH)
+    config.dtype = dtype
+    config.device = DEVICE
+    policy = PI05Policy.from_pretrained(MODEL_PATH, config=config, strict=True)
     policy.to(DEVICE)
     policy.config.device = DEVICE
     policy.config.use_relative_actions = use_relative_actions
@@ -132,6 +135,13 @@ def _instantiate_lerobot(use_relative_actions: bool = False, action_feature_name
         policy.config.action_feature_names = action_feature_names
     policy.eval()
 
+    reference_q_dtype = policy.model.paligemma_with_expert.paligemma.model.language_model.layers[
+        0
+    ].self_attn.q_proj.weight.dtype
+    assert reference_q_dtype == getattr(torch, dtype), (
+        f"LeRobot reference requested {dtype}, but layer-0 Q projection uses {reference_q_dtype}."
+    )
+
     pre, post = make_pi05_pre_post_processors(config=policy.config, dataset_stats=_dummy_dataset_stats())
     return policy, pre, post
 
@@ -142,8 +152,8 @@ def _instantiate_vllm_omni(
     dtype: str = DTYPE_STR,
 ):
     """Build the vllm-omni π0.5 model in isolation (no pipeline, no engine)."""
+    from vllm_omni.diffusion.models.pi.common import inference_dtype
     from vllm_omni.diffusion.models.pi05 import Pi05Config, Pi05ForActionPrediction
-    from vllm_omni.diffusion.models.pi05.pipeline_pi05 import _set_inference_dtype
 
     cfg = Pi05Config(
         max_action_dim=ACTION_DIM,
@@ -158,7 +168,7 @@ def _instantiate_vllm_omni(
         action_feature_names=action_feature_names,
     )
     model = Pi05ForActionPrediction(cfg)
-    _set_inference_dtype(model, getattr(torch, dtype))
+    inference_dtype.apply_pi_inference_dtype(model, getattr(torch, dtype))
     model.to(device=DEVICE)
     _load_lerobot_weights(model)
     model.eval()
@@ -234,7 +244,9 @@ def test_pi05_vllm_omni_vs_lerobot(num_views):
 
 
 @pytest.mark.skipif(not _HAS_LEROBOT, reason="lerobot not installed (run in a lerobot venv).")
-def test_pi05_bfloat16_matches_lerobot_bfloat16():
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Pi0.5 BF16 reference parity requires CUDA.")
+@pytest.mark.parametrize("num_views", [1, 2, 3])
+def test_pi05_bfloat16_matches_lerobot_bfloat16(num_views):
     """Both sides in bfloat16, so this compares implementations rather than
     measuring bfloat16's drift from float32."""
     # LeRobot applies the layout in PaliGemmaWithExpertModel.__init__ from
@@ -243,7 +255,7 @@ def test_pi05_bfloat16_matches_lerobot_bfloat16():
 
     omni_model, _ = _instantiate_vllm_omni(dtype="bfloat16")
 
-    raw_batch = _create_dummy_batch(num_views=3)
+    raw_batch = _create_dummy_batch(num_views=num_views)
     processed = lerobot_pre(copy.deepcopy(raw_batch))
     images, img_masks, lang_tokens, lang_masks = _extract_lerobot_model_inputs(lerobot_policy, processed)
     noise = _make_fixed_noise(raw_batch["observation.state"].shape[0], DEVICE)
@@ -262,7 +274,7 @@ def test_pi05_bfloat16_matches_lerobot_bfloat16():
         )
 
     diff = (lerobot_actions.float() - omni_actions.float()).abs()
-    print(f"[parity] bfloat16 |Δ| max={diff.max().item():.2e} mean={diff.mean().item():.2e}")
+    print(f"[parity] bfloat16 views={num_views} |Δ| max={diff.max().item():.2e} mean={diff.mean().item():.2e}")
     assert torch.allclose(lerobot_actions.float(), omni_actions.float(), atol=BF16_ATOL), (
         f"bfloat16 actions differ beyond atol={BF16_ATOL}; max_diff={diff.max().item():.2e}"
     )
@@ -276,7 +288,6 @@ def test_pi05_prompt_parity():
     small, plausible-looking action difference.
     """
     from transformers import AutoTokenizer
-
     from vllm_omni.diffusion.models.pi05.processor_pi05 import (
         apply_norm,
         build_norm_stats,
@@ -317,7 +328,6 @@ def test_pi05_prompt_parity_across_state_widths(state_dim):
     from lerobot.lerobot_types import TransitionKey
     from lerobot.policies.pi05.processor_pi05 import Pi05PrepareStateTokenizerProcessorStep
     from lerobot.utils.constants import OBS_STATE
-
     from vllm_omni.diffusion.models.pi05.processor_pi05 import build_pi05_prompt
 
     g = torch.Generator().manual_seed(state_dim)
@@ -374,7 +384,6 @@ def test_pi05_state_normalization_parity(lerobot_mode, stats, ours, state, state
     from lerobot.configs.types import FeatureType, NormalizationMode, PolicyFeature
     from lerobot.processor.normalize_processor import NormalizerProcessorStep
     from lerobot.utils.constants import OBS_STATE
-
     from vllm_omni.diffusion.models.pi05.processor_pi05 import apply_norm, build_norm_stats
 
     step = NormalizerProcessorStep(
@@ -400,7 +409,6 @@ def test_pi05_relative_actions_parity():
         OBS_LANGUAGE_ATTENTION_MASK,
         OBS_LANGUAGE_TOKENS,
     )
-
     from vllm_omni.diffusion.models.pi05.processor_pi05 import (
         Pi05RelativeActions,
         apply_norm,
@@ -470,7 +478,16 @@ def _diagnose_divergence(lerobot_flow_model, omni_model, images, img_masks, lang
     )
 
     lr_embs, lr_pad, lr_att = lerobot_flow_model.embed_prefix(images, img_masks, lang_tokens, lang_masks)
-    sg_embs, sg_pad, sg_att = omni_model.embed_prefix(images, img_masks, lang_tokens, lang_masks)
+    from vllm_omni.diffusion.models.pi.common import backbone
+
+    sg_embs, sg_pad, sg_att = backbone.embed_multimodal_prefix(
+        images,
+        img_masks,
+        lang_tokens,
+        lang_masks,
+        paligemma=omni_model.paligemma_with_expert.paligemma,
+        expected_num_views=int(omni_model.config.max_cameras),
+    )
     print(f"[diag] prefix_embs max|Δ| = {(lr_embs.float() - sg_embs.float()).abs().max().item():.2e}")
     print(f"[diag] prefix_pad_masks equal: {torch.equal(lr_pad, sg_pad)}")
 
