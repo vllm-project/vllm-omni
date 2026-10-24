@@ -1207,6 +1207,15 @@ class _FakeStagePool:
     def __init__(self, clients: list, stage_id: int = 0):
         self.clients = clients
         self.stage_id = stage_id
+        # Request-scoped failure breaker (#7618); closed unless a test opts in.
+        self.circuit_open = False
+        self.circuit_message = ""
+
+    def is_circuit_open(self) -> bool:
+        return self.circuit_open
+
+    def circuit_breaker_message(self) -> str:
+        return self.circuit_message
 
 
 def test_async_omni_errored_property_alive():
@@ -1338,6 +1347,20 @@ def test_check_health_passes_when_all_healthy():
     healthy_stage = SimpleNamespace(check_health=lambda: None)
     base.engine.stage_pools = [_FakeStagePool([healthy_stage])]
     base.check_health()  # should not raise
+
+
+def test_check_health_raises_when_stage_circuit_open():
+    # Request-scoped failure breaker (#7618): repeated stage failures trip
+    # the breaker even though every replica process is still alive.
+    base = _make_base()
+    base.engine.is_alive.return_value = True
+    healthy_stage = SimpleNamespace(check_health=lambda: None)
+    pool = _FakeStagePool([healthy_stage], stage_id=1)
+    pool.circuit_open = True
+    pool.circuit_message = "Stage-1 failed 2 consecutive stage executions; the stage worker is likely corrupted."
+    base.engine.stage_pools = [pool]
+    with pytest.raises(EngineDeadError, match="consecutive"):
+        base.check_health()
 
 
 def test_check_health_raises_when_stage_dead():

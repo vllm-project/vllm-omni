@@ -38,7 +38,7 @@ from vllm_omni.engine.orchestrator import (
     OrchestratorRequestState,
     cleanup_request_artifact_dirs,
 )
-from vllm_omni.engine.stage_pool import StageUnavailableError
+from vllm_omni.engine.stage_pool import StagePool, StageUnavailableError
 from vllm_omni.errors import OmniClientError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.inputs.preprocess import OmniRenderer
@@ -59,6 +59,7 @@ from .test_orchestrator import (
     _enqueue_add_request,
     _get_output_message,
     _processed_request,
+    _shutdown_orchestrator,
     _wait_for,
 )
 
@@ -1526,3 +1527,104 @@ async def test_downstream_sender_clear_failure_is_nonfatal(failure):
     finally:
         for q in queues:
             q.close()
+
+
+def test_stage_pool_failure_circuit_breaker_threshold() -> None:
+    """One failure keeps the breaker closed; the second consecutive failure
+    opens it, and successes do not close an already-open breaker (#7618)."""
+    pool = StagePool(0, FakeStageClient(stage_type="diffusion", final_output=True))
+    assert not pool.is_circuit_open()
+
+    pool.record_stage_failure()
+    assert not pool.is_circuit_open()
+    assert pool.consecutive_stage_failures == 1
+
+    pool.record_stage_failure()
+    assert pool.is_circuit_open()
+    assert "Stage-0" in pool.circuit_breaker_message()
+    assert "consecutive" in pool.circuit_breaker_message()
+
+    pool.record_stage_success()
+    assert pool.is_circuit_open()
+
+
+@pytest.mark.asyncio
+async def test_consecutive_stage_failures_open_circuit_breaker(orchestrator_factory) -> None:
+    """Two consecutive server-side stage failures trip the breaker; a 4xx
+    client error in between must not count toward it (#7618)."""
+    stage0 = FakeStageClient(stage_type="diffusion", final_output=True, final_output_type="image")
+    orchestrator_fixture = orchestrator_factory([stage0])
+    params = OmniDiffusionSamplingParams()
+    pool = orchestrator_fixture.orchestrator.stage_pools[0]
+
+    try:
+        for i, (req_id, status) in enumerate(
+            [
+                ("req-fail-0", None),
+                ("req-400", 400),
+                ("req-fail-1", None),
+            ]
+        ):
+            await _enqueue_add_request(
+                orchestrator_fixture,
+                request_id=req_id,
+                prompt={"prompt": "draw a cat"},
+                original_prompt={"prompt": "draw a cat"},
+                sampling_params_list=[params],
+                final_stage_id=0,
+            )
+            await _wait_for(lambda: len(stage0.add_request_calls) == i + 1)
+            stage0.push_diffusion_output(
+                OmniRequestOutput.from_error(
+                    req_id,
+                    "gpu fault" if status is None else "bad input",
+                    status_code=status,
+                    error_type=None if status is None else "BadRequestError",
+                )
+            )
+            await _get_any_output_message(orchestrator_fixture)
+
+        assert pool.is_circuit_open()
+        assert "Stage-0" in pool.circuit_breaker_message()
+    finally:
+        await _shutdown_orchestrator(orchestrator_fixture)
+
+
+@pytest.mark.asyncio
+async def test_stage_success_resets_failure_counter(orchestrator_factory) -> None:
+    """A successful execution between failures resets the counter, so
+    transient blips do not trip the breaker (#7618)."""
+    stage0 = FakeStageClient(stage_type="diffusion", final_output=True, final_output_type="image")
+    orchestrator_fixture = orchestrator_factory([stage0])
+    params = OmniDiffusionSamplingParams()
+    pool = orchestrator_fixture.orchestrator.stage_pools[0]
+
+    try:
+        for i, req_id in enumerate(["req-fail", "req-ok", "req-fail"]):
+            await _enqueue_add_request(
+                orchestrator_fixture,
+                request_id=req_id,
+                prompt={"prompt": "draw a cat"},
+                original_prompt={"prompt": "draw a cat"},
+                sampling_params_list=[params],
+                final_stage_id=0,
+            )
+            await _wait_for(lambda: len(stage0.add_request_calls) == i + 1)
+            if req_id == "req-ok":
+                stage0.push_diffusion_output(
+                    OmniRequestOutput.from_diffusion(
+                        request_id=req_id,
+                        images=[],
+                        final_output_type="image",
+                    )
+                )
+            else:
+                stage0.push_diffusion_output(OmniRequestOutput.from_error(req_id, "gpu fault"))
+            await _get_any_output_message(orchestrator_fixture)
+            if req_id == "req-ok":
+                assert pool.consecutive_stage_failures == 0
+
+        assert not pool.is_circuit_open()
+        assert pool.consecutive_stage_failures == 1
+    finally:
+        await _shutdown_orchestrator(orchestrator_fixture)

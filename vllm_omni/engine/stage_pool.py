@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 import time as _time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -47,6 +48,13 @@ if TYPE_CHECKING:
     from vllm_omni.engine.orchestrator import OrchestratorRequestState
 
 logger = init_logger(__name__)
+
+# Consecutive failed stage executions after which the stage's circuit breaker
+# opens and new work is rejected until the engine is restarted (#7618). A
+# worker that survives a per-request failure (e.g. an NPU OOM caught inside
+# the worker) can stay alive in a corrupted state; one failure may be a
+# transient blip, so the breaker only trips on repeats.
+STAGE_FAILURE_CIRCUIT_THRESHOLD = 2
 
 
 class StageUnavailableError(RuntimeError):
@@ -173,6 +181,54 @@ class StagePool:
         # Kept separate from the legacy ``_request_bindings`` so the two
         # binding shapes do not collide.
         self._affinity: dict[str, str] = {}
+
+        # Request-scoped failure circuit breaker (#7618). The orchestrator
+        # thread records stage-level failures/successes; the serving thread
+        # reads the breaker state through ``OmniBase.check_health``.
+        self._stage_failure_lock = threading.Lock()
+        self.consecutive_stage_failures = 0
+        self.circuit_open = False
+        self.circuit_message = ""
+
+    # ---- Stage failure circuit breaker ----
+
+    def record_stage_failure(self, *, threshold: int = STAGE_FAILURE_CIRCUIT_THRESHOLD) -> None:
+        """Record one failed stage execution.
+
+        After ``threshold`` consecutive failures the breaker opens and stays
+        open until the engine is restarted; transient blips self-heal while
+        the breaker is still closed because any successful execution resets
+        the counter.
+        """
+        with self._stage_failure_lock:
+            self.consecutive_stage_failures += 1
+            if self.consecutive_stage_failures < threshold or self.circuit_open:
+                return
+            self.circuit_open = True
+            self.circuit_message = (
+                f"Stage-{self.stage_id} failed {self.consecutive_stage_failures} consecutive "
+                "stage executions; the stage worker is likely corrupted. Rejecting "
+                "further requests until the engine is restarted."
+            )
+            logger.warning(self.circuit_message)
+
+    def record_stage_success(self) -> None:
+        """Reset the consecutive-failure counter after a successful execution.
+
+        An already-open breaker is not closed by successes: a worker that
+        survived into a corrupted state must be recovered by an engine
+        restart, not by optimistic counting.
+        """
+        with self._stage_failure_lock:
+            self.consecutive_stage_failures = 0
+
+    def is_circuit_open(self) -> bool:
+        with self._stage_failure_lock:
+            return self.circuit_open
+
+    def circuit_breaker_message(self) -> str:
+        with self._stage_failure_lock:
+            return self.circuit_message
 
     # ---- Stage-level properties ----
 
