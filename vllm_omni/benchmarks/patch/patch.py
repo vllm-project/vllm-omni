@@ -2090,11 +2090,14 @@ async def async_request_openai_chat_omni_completions(
                                         if has_text_content:
                                             generated_text += content
                                     elif modality == "audio":
-                                        if output.audio_ttfp == 0.0:
-                                            output.audio_ttfp = timestamp - st
-                                        audio_generate_time = timestamp - st
                                         if content:
-                                            audio_bytes = base64.b64decode(content)
+                                            try:
+                                                audio_bytes = base64.b64decode(content, validate=True)
+                                            except ValueError as ex:
+                                                logger.warning("Failed to decode base64 audio chunk: %s", ex)
+                                                continue
+                                            if not audio_bytes:
+                                                continue
                                             if response_format == "wav":
                                                 try:
                                                     with wave.open(io.BytesIO(audio_bytes), "rb") as wav_reader:
@@ -2103,6 +2106,9 @@ async def async_request_openai_chat_omni_completions(
                                                             wav_reader.getsampwidth(),
                                                             wav_reader.getframerate(),
                                                         )
+                                                        pcm_bytes = wav_reader.readframes(wav_reader.getnframes())
+                                                        if len(pcm_bytes) < params[0] * params[1]:
+                                                            continue
                                                         if wav_audio_params is None:
                                                             wav_audio_params = params
                                                         elif wav_audio_params != params:
@@ -2110,13 +2116,16 @@ async def async_request_openai_chat_omni_completions(
                                                             if first_inconsistent_wav_params is None:
                                                                 first_inconsistent_wav_params = params
                                                             continue
-                                                        wav_pcm_buffer.extend(
-                                                            wav_reader.readframes(wav_reader.getnframes())
-                                                        )
+                                                        wav_pcm_buffer.extend(pcm_bytes)
                                                 except Exception as ex:
                                                     logger.warning("Failed to parse wav audio chunk: %s", ex)
+                                                    continue
                                             else:
                                                 audio_bytes_buffer.extend(audio_bytes)
+                                            # Count only chunks accepted into the audio buffers.
+                                            if output.audio_ttfp == 0.0:
+                                                output.audio_ttfp = timestamp - st
+                                            audio_generate_time = timestamp - st
                                     elif modality == "image":
                                         output.image_count += 1
                                         content_image_ms = _image_generation_ms_from_content(content)
@@ -3855,6 +3864,33 @@ async def benchmark(
             "input_lens": [output.prompt_len for output in outputs],
             "errors": [output.error for output in outputs],
         }
+
+    # Keep per-request audio evidence, including failed or audio-less replies.
+    # Times use seconds (start_time uses perf_counter); RTF is dimensionless.
+    # Zero is the output dataclass's unmeasured sentinel, not an observation.
+    def measured_audio_value(output: RequestFuncOutput, field: str) -> int | float | None:
+        value = getattr(output, field, None)
+        if isinstance(value, int | float) and not isinstance(value, bool) and np.isfinite(value) and value > 0:
+            return value
+        return None
+
+    audio_fields = ("audio_ttfp", "audio_rtf", "audio_duration", "audio_frames")
+    if any(metric.startswith("audio") for metric in selected_percentile_metrics) or any(
+        measured_audio_value(output, field) is not None for output in outputs for field in audio_fields
+    ):
+        result["audio_request_metrics"] = [
+            {
+                "request_index": index,
+                "request_id": getattr(request, "request_id", None),
+                "success": output.success,
+                "error": output.error,
+                "start_time": measured_audio_value(output, "start_time"),
+                "latency": measured_audio_value(output, "latency"),
+                **{field: measured_audio_value(output, field) for field in audio_fields},
+            }
+            for index, (request, output) in enumerate(zip(input_requests, outputs))
+        ]
+
     # Preserve request order, including missing snapshots, so CI can verify
     # fixed stage workloads without parsing logs or storing audio payloads.
     request_stage_metrics = [
