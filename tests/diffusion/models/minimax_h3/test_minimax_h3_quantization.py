@@ -161,6 +161,15 @@ class _WeightTarget(nn.Module):
         self.weight.weight_loader = loader
 
 
+class _MultiWeightTarget(nn.Module):
+    def __init__(self, loaders):
+        super().__init__()
+        for name, loader in loaders.items():
+            parameter = nn.Parameter(torch.empty(1))
+            parameter.weight_loader = loader
+            self.register_parameter(name, parameter)
+
+
 def test_model_load_weights_transforms_before_calling_vllm_loader():
     from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import (
         MiniMaxH3DiTArchConfig,
@@ -210,6 +219,57 @@ def test_model_load_weights_transforms_before_calling_vllm_loader():
         (0, [0, 1]),
         (1, [2, 3]),
     ]
+
+
+def test_model_load_weights_reorders_serialized_svd_qkv_tensors():
+    from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import (
+        MiniMaxH3DiTArchConfig,
+        MiniMaxH3DiTModel,
+    )
+
+    calls = {}
+
+    def capture(name):
+        def loader(param, loaded_weight):
+            del param
+            calls[name] = loaded_weight.clone()
+
+        return loader
+
+    model = object.__new__(MiniMaxH3DiTModel)
+    nn.Module.__init__(model)
+    model.arch = MiniMaxH3DiTArchConfig(
+        hidden_size=1,
+        num_attention_heads=2,
+        attention_head_dim=1,
+        ffn_hidden_size=2,
+    )
+    model.blocks = nn.ModuleList([nn.Module()])
+    model.blocks[0].attn = nn.Module()
+    model.blocks[0].attn.qkv_proj = _MultiWeightTarget(
+        {name: capture(name) for name in ("qweight", "wscales", "proj_up", "bias", "wcscales")}
+    )
+
+    qweight = torch.arange(12, dtype=torch.int8).reshape(6, 2)
+    wscales = torch.arange(18, dtype=torch.uint8).reshape(3, 6)
+    proj_up = torch.arange(6, dtype=torch.bfloat16).reshape(6, 1)
+    bias = torch.arange(6, dtype=torch.bfloat16)
+    wcscales = torch.arange(6, dtype=torch.bfloat16)
+    names = ("qweight", "wscales", "proj_up", "bias", "wcscales")
+    loaded = model.load_weights(
+        [
+            (f"blocks.0.attn.qkv_proj.{name}", tensor)
+            for name, tensor in zip(names, (qweight, wscales, proj_up, bias, wcscales))
+        ]
+    )
+
+    assert loaded == {f"blocks.0.attn.qkv_proj.{name}" for name in names}
+    expected_rows = [0, 3, 1, 4, 2, 5]
+    assert calls["qweight"][:, 0].tolist() == [row * qweight.shape[1] for row in expected_rows]
+    assert calls["proj_up"][:, 0].tolist() == expected_rows
+    assert calls["bias"].tolist() == expected_rows
+    assert calls["wcscales"].tolist() == expected_rows
+    assert calls["wscales"][0, :].tolist() == expected_rows
 
 
 def test_loader_adapter_declares_equivalent_direct_mmap_transform(monkeypatch):
