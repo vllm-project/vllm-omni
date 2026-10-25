@@ -397,9 +397,15 @@ class Qwen3TTSCode2Wav(nn.Module):
         self._batch_stats_actual_frames.update(actual_frames)
         self._batch_stats_bucket_groups[(group_size, bucket_frames)] += 1
 
+    def _drop_decoder_state(self, req_id: str) -> None:
+        state = self._decoder_state_cache.pop(req_id, None)
+        incremental = getattr(self.decoder, "_npu_incremental", None)
+        if incremental is not None and isinstance(state, dict) and "npu_slot" in state:
+            incremental.release(int(state["npu_slot"]))
+
     def on_requests_finished(self, finished_req_ids: set[str] | list[str]) -> None:
         for req_id in finished_req_ids:
-            self._decoder_state_cache.pop(req_id, None)
+            self._drop_decoder_state(req_id)
             self._rho_stats.on_request_finished(req_id)
 
     def log_decode_batch_stats(self) -> None:
@@ -614,7 +620,7 @@ class Qwen3TTSCode2Wav(nn.Module):
                 strict=False,
             ):
                 if req_id is not None and (finished or segment_finished):
-                    self._decoder_state_cache.pop(req_id, None)
+                    self._drop_decoder_state(req_id)
                     self._rho_stats.on_boundary(req_id, finished=finished, segment_finished=segment_finished)
             return OmniOutput(
                 text_hidden_states=None,
@@ -730,7 +736,7 @@ class Qwen3TTSCode2Wav(nn.Module):
             strict=False,
         ):
             if req_id is not None and (finished or segment_finished):
-                self._decoder_state_cache.pop(req_id, None)
+                self._drop_decoder_state(req_id)
                 self._rho_stats.on_boundary(req_id, finished=finished, segment_finished=segment_finished)
 
         return OmniOutput(

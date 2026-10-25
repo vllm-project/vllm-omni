@@ -66,6 +66,12 @@ def _prepare_npu_decoder_weights(decoder: nn.Module) -> None:
 
 def _patched_load_weights(self, weights):
     assert _original_load_weights is not None
+    if self.decoder._npu_conv_graphs is not None:
+        self.decoder._npu_conv_graphs.close()
+        self.decoder._npu_conv_graphs = None
+    if self.decoder._npu_incremental is not None:
+        self.decoder._npu_incremental.close()
+        self.decoder._npu_incremental = None
     loaded = _original_load_weights(self, weights)
     device = self.vllm_config.device_config.device
     platform_dtype_override = getattr(self, "_npu_decoder_runtime_dtype", None)
@@ -76,6 +82,63 @@ def _patched_load_weights(self, weights):
         if hasattr(self.decoder, "precompute_snake_caches"):
             self.decoder.precompute_snake_caches()
     _prepare_npu_decoder_weights(self.decoder)
+    # Weight loaders can update parameters in place: rebuild after every load,
+    # including the 310P dtype override above, and before graph capture.
+    from vllm.triton_utils import HAS_TRITON
+
+    from vllm_omni.model_executor.models.common.snake_activation import SnakeBeta
+    from vllm_omni.model_executor.models.qwen3_tts.tokenizer_12hz.modeling_qwen3_tts_tokenizer_v2 import (
+        EuclideanCodebook,
+    )
+
+    connector = getattr(self.vllm_config.model_config, "stage_connector_config", None)
+    extra = connector.get("extra", connector) if isinstance(connector, dict) else {}
+    fused_snake = extra.get("npu_fused_snake", False)
+    if not isinstance(fused_snake, bool):
+        raise ValueError("npu_fused_snake must be a boolean")
+    for module in self.decoder.modules():
+        if isinstance(module, EuclideanCodebook):
+            module.precompute_embedding()
+        elif isinstance(module, SnakeBeta):
+            module.npu_fused = fused_snake and HAS_TRITON
+    incremental = extra.get("npu_incremental_codec", False)
+    if not isinstance(incremental, bool):
+        raise ValueError("npu_incremental_codec must be a boolean")
+    if incremental:
+        # The conv-tail graphs replay work this path no longer performs.
+        from vllm_omni.platforms.npu.layers.incremental_codec import NPUIncrementalCodec
+
+        slots = int(self.vllm_config.scheduler_config.max_num_seqs)
+        chunk_frames = int(extra.get("codec_chunk_frames") or 25)
+        max_batch = int(extra.get("decode_batch_max_size") or 1)
+        with torch.inference_mode():
+            self.decoder._npu_incremental = NPUIncrementalCodec(
+                self.decoder,
+                slots=slots,
+                max_batch=max(1, min(max_batch, slots)),
+                chunk_frames=chunk_frames,
+            )
+    shapes = [] if incremental else extra.get("npu_conv_graph_shapes", [])
+    if shapes:
+        if not isinstance(shapes, list) or any(
+            not isinstance(pair, (list, tuple))
+            or len(pair) != 2
+            or any(type(value) is not int or value < 1 for value in pair)
+            for pair in shapes
+        ):
+            raise ValueError("npu_conv_graph_shapes must contain positive [batch, frames] pairs")
+        if getattr(self.vllm_config.model_config, "enforce_eager", False):
+            raise ValueError("npu_conv_graph_shapes requires enforce_eager=false")
+        from vllm_omni.platforms.npu.layers.codec_graph import NPUCodecGraphs
+
+        with torch.inference_mode():
+            self.decoder._npu_conv_graphs = NPUCodecGraphs(
+                self.decoder._conv_decode_eager,
+                next(self.decoder.parameters()),
+                self.decoder.config.latent_dim,
+                [tuple(pair) for pair in shapes],
+            )
+        logger.info("Prepared Qwen3-TTS NPU conv graphs for %s", shapes)
     actual_dtype = next(self.decoder.parameters()).dtype
     logger.info("Prepared NPU Code2Wav decoder with runtime dtype %s", actual_dtype)
     return loaded
