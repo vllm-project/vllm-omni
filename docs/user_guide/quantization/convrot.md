@@ -2,13 +2,15 @@
 
 ConvRot ([arXiv:2512.03673](https://arxiv.org/abs/2512.03673)) is a
 training-free, rotation-based quantization method for diffusion transformers.
-vLLM-Omni implements it as two online methods that quantize a BF16/FP16
+vLLM-Omni implements it as four online methods that quantize a BF16/FP16
 checkpoint while loading:
 
 | Method | Weights | Activations | GEMM |
 | --- | --- | --- | --- |
 | `convrot_int8` | INT8, per output channel | INT8, dynamic per token | vLLM INT8 kernels |
 | `convrot_int4` | INT4, per output channel, packed two per byte | INT4, dynamic per token | INT8 tensor cores on the INT4 values |
+| `convrot_mxfp4` | MXFP4 (E2M1), block-32 E8M0 scales | MXFP4, block-32 E8M0 scales | Blackwell MXFP4 tensor cores |
+| `convrot_mxfp8` | MXFP8 (E4M3), block-32 E8M0 scales | MXFP8, block-32 E8M0 scales | Blackwell MXFP8 tensor cores |
 
 Before quantization, the input dimension of every linear layer is split into
 groups of `rotation_group_size` channels, and each group of both the
@@ -25,11 +27,17 @@ matrix instructions such as Hopper. Its `int8_layers` option runs selected
 layers on rotated INT8 instead, the paper's mixed W4A4 + INT8 setting for
 sensitive layers.
 
+On Blackwell, `convrot_mxfp4` and `convrot_mxfp8` use the native block-32
+microscaling GEMMs. `convrot_mxfp4` accepts `mxfp8_layers` to keep selected
+sensitive layers on rotated MXFP8 while the remaining layers use MXFP4.
+
 ## Usage
 
 ```bash
 vllm serve <model> --omni --quantization convrot_int8
 vllm serve <model> --omni --quantization convrot_int4
+vllm serve <model> --omni --quantization convrot_mxfp4
+vllm serve <model> --omni --quantization convrot_mxfp8
 ```
 
 ```python
@@ -45,6 +53,15 @@ omni = Omni(
         "ignored_layers": ["proj_out"],
     },
 )
+omni = Omni(
+    model="<model>",
+    quantization_config={
+        "method": "convrot_mxfp4",
+        "mxfp4_scale_method": "quest",
+        "mxfp8_layers": ["attn.out_proj", "mlp.fc2"],
+        "ignored_layers": ["proj_out"],
+    },
+)
 ```
 
 | Option | Default | Meaning |
@@ -52,6 +69,8 @@ omni = Omni(
 | `rotation_group_size` | `256` | Power of four. A layer whose input it does not tile uses the largest smaller power of four that does, or no rotation. The paper uses 1024 for layers with larger outliers. |
 | `ignored_layers` | `[]` | Layers kept in BF16/FP16. A name matches every module path containing it as whole components: `attn.to_out` selects it in every block, `token_refiner` every layer below it. |
 | `int8_layers` | `[]` | `convrot_int4` only: layers run on rotated INT8, matched like `ignored_layers`. |
+| `mxfp8_layers` | `[]` | `convrot_mxfp4` only: layers run on rotated MXFP8 while the rest use MXFP4, matched like `ignored_layers`. |
+| `mxfp4_scale_method` | `quest` | `convrot_mxfp4` only: `quest` or `abs_max` activation/weight block-scale selection. |
 
 ## Validation
 
@@ -88,8 +107,9 @@ after unpacking; it saves memory but is not faster than `convrot_int8` there.
 
 ## Limitations
 
-- CUDA only (compute capability 8.0+). Weights are quantized online; ConvRot
-  checkpoints are not serialized.
+- `convrot_int8` and `convrot_int4` require CUDA 8.0+; the MXFP methods require
+  Blackwell (SM100+). Weights are quantized online; ConvRot checkpoints are not
+  serialized.
 - Rotation, activation quantization and, for `convrot_int4`, weight unpacking
   run as separate operations around the GEMM; they are not fused.
 - INT4 activations have a coarse per-token resolution. Compare against BF16 on

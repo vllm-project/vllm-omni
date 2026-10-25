@@ -116,6 +116,20 @@ def _build_convrot_int4(**kw: Any) -> QuantizationConfig:
     return DiffusionConvRotInt4Config(**kw)
 
 
+def _build_convrot_mxfp4(**kw: Any) -> QuantizationConfig:
+    """Lazy import for ConvRot rotated MXFP4, optionally mixed with MXFP8 (Blackwell CUDA only)."""
+    from .convrot_config import DiffusionConvRotMxfp4Config
+
+    return DiffusionConvRotMxfp4Config(**kw)
+
+
+def _build_convrot_mxfp8(**kw: Any) -> QuantizationConfig:
+    """Lazy import for ConvRot rotated W8A8 MXFP8 diffusion config (Blackwell CUDA only)."""
+    from .convrot_config import DiffusionConvRotMxfp8Config
+
+    return DiffusionConvRotMxfp8Config(**kw)
+
+
 def _build_bitsandbytes(**kw: Any) -> QuantizationConfig:
     """Lazy import for BitsAndBytes 4-bit diffusion config (CUDA only)."""
     from .bitsandbytes_config import DiffusionBitsAndBytesConfig
@@ -200,6 +214,8 @@ _OVERRIDES: dict[str, Callable[..., QuantizationConfig]] = {
     "int8": _build_int8,
     "convrot_int8": _build_convrot_int8,
     "convrot_int4": _build_convrot_int4,
+    "convrot_mxfp4": _build_convrot_mxfp4,
+    "convrot_mxfp8": _build_convrot_mxfp8,
     "bitsandbytes": _build_bitsandbytes,
     "mxfp8": _build_mxfp8,
     "mxfp4": _build_mxfp4,
