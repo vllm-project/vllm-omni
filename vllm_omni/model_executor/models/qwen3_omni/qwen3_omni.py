@@ -433,6 +433,17 @@ class Qwen3OmniMoeForConditionalGeneration(
         """Rows whose CB0 is a codec id rather than codec EOS (or another special id)."""
         return (layer0 >= 0) & (layer0 < self._codec_codebook_size)
 
+    @property
+    def eager_mtp_codebook_size(self) -> int | None:
+        """Valid codec range for the shared eager-MTP gather/scatter kernels."""
+        return self._codec_codebook_size if self.model_stage == "talker" else None
+
+    def get_eager_mtp_embedding(self) -> nn.Module | None:
+        """Expose CB0 embeddings; the runner checks layout, quantization and TP."""
+        if self.model_stage != "talker":
+            return None
+        return self.talker.language_model.model.codec_embedding
+
     def _thinker_capture_layer_indices(self) -> list[int]:
         accept_layer = getattr(self.talker_config, "accept_hidden_layer", None)
         return [0, int(accept_layer)] if self.is_staged_run and accept_layer is not None else []
