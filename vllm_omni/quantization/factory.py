@@ -117,14 +117,14 @@ def _build_convrot_int4(**kw: Any) -> QuantizationConfig:
 
 
 def _build_convrot_mxfp4(**kw: Any) -> QuantizationConfig:
-    """Lazy import for ConvRot rotated MXFP4, optionally mixed with MXFP8 (Blackwell CUDA only)."""
+    """Lazy import for ConvRot rotated MXFP4, optionally mixed with MXFP8 (device kernel from vLLM)."""
     from .convrot_config import DiffusionConvRotMxfp4Config
 
     return DiffusionConvRotMxfp4Config(**kw)
 
 
 def _build_convrot_mxfp8(**kw: Any) -> QuantizationConfig:
-    """Lazy import for ConvRot rotated W8A8 MXFP8 diffusion config (Blackwell CUDA only)."""
+    """Lazy import for ConvRot rotated W8A8 MXFP8 diffusion config (device kernel from vLLM)."""
     from .convrot_config import DiffusionConvRotMxfp8Config
 
     return DiffusionConvRotMxfp8Config(**kw)
