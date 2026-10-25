@@ -5,6 +5,7 @@
 
 import json
 from contextlib import contextmanager
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -910,6 +911,92 @@ def test_omniinteract_result_rejects_incomplete_artifacts():
         )
 
 
+def _pinned_acc_samples() -> list[dict[str, str]]:
+    return [
+        {"subset": "1q1a", "video_rel": "videos/0035.mp4", "output_name": "1q1a/videos__0035"},
+        {"subset": "1q1a", "video_rel": "videos/0038.mp4", "output_name": "1q1a/videos__0038"},
+        {"subset": "1q1a_math", "video_rel": "videos/0001.mp4", "output_name": "1q1a_math/videos__0001"},
+        {
+            "subset": "1qna",
+            "video_rel": "videos_bench/captaincook4d/Blender_Banana_Pancakes-21_44.mp4",
+            "output_name": "1qna/captaincook4d__Blender_Banana_Pancakes-21_44",
+        },
+        {"subset": "1q1a", "video_rel": "videos/0124.mp4", "output_name": "1q1a/videos__0124"},
+        {"subset": "1q1a", "video_rel": "videos/0064.mp4", "output_name": "1q1a/videos__0064"},
+        {"subset": "1q1a", "video_rel": "videos/0100.mp4", "output_name": "1q1a/videos__0100"},
+        {"subset": "1q1a", "video_rel": "videos/0053.mp4", "output_name": "1q1a/videos__0053"},
+    ]
+
+
+def test_omniinteract_internal_keys_excluded_from_cli_args():
+    from tests.dfx.perf.scripts.run_benchmark import _benchmark_cli_args
+
+    params = {
+        "dataset_name": "omniinteract",
+        "omniinteract_samples": _pinned_acc_samples(),
+        "omniinteract_dataset": "lucky-lance/OmniInteract",
+        "omniinteract_require_full_coverage": True,
+        "omniinteract_max_audio_rtf": 1,
+        "omniinteract_video_list": "/tmp/omniinteract_pinned_video_list.jsonl",
+        "extra_body": {},
+        "percentile-metrics": ["ttft", "audio_rtf"],
+    }
+    args = _benchmark_cli_args(params)
+    assert "--omniinteract-samples" not in args
+    assert "--omniinteract-dataset" not in args
+    assert "--omniinteract-require-full-coverage" not in args
+    assert "--omniinteract-max-audio-rtf" not in args
+    assert "--extra-body" not in args
+    assert "--omniinteract-video-list" in args
+    metrics_at = args.index("--percentile-metrics")
+    assert args[metrics_at : metrics_at + 3] == ["--percentile-metrics", "ttft", "audio_rtf"]
+
+
+def test_prepare_omniinteract_bench_params_writes_video_list(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    from tests.dfx.perf.scripts.run_benchmark import _prepare_omniinteract_bench_params
+
+    samples = _pinned_acc_samples()
+    dataset_root = tmp_path / "omniinteract-data"
+    for sample in samples:
+        video = dataset_root / sample["subset"] / sample["video_rel"]
+        video.parent.mkdir(parents=True, exist_ok=True)
+        video.write_bytes(b"")
+    monkeypatch.setenv("VLLM_OMNIINTERACT_DATA_ROOT", str(dataset_root))
+    monkeypatch.setenv("BENCHMARK_DIR", str(tmp_path / "results"))
+    prepared = _prepare_omniinteract_bench_params(
+        {
+            "dataset_name": "omniinteract",
+            "omniinteract_dataset": "lucky-lance/OmniInteract",
+            "omniinteract_samples": samples,
+            "omniinteract_output_dir": str(tmp_path / "omniinteract-output"),
+        }
+    )
+    video_list = Path(prepared["omniinteract_video_list"])
+    assert video_list.is_file()
+    rows = [json.loads(line) for line in video_list.read_text(encoding="utf-8").splitlines() if line]
+    assert [row["output_name"] for row in rows] == [sample["output_name"] for sample in samples]
+    assert [row["subset"] for row in rows] == [sample["subset"] for sample in samples]
+    for row, sample in zip(rows, samples, strict=True):
+        video_path = Path(row["video_path"])
+        assert video_path.is_file()
+        assert video_path.name == Path(sample["video_rel"]).name
+    assert (tmp_path / "omniinteract-output").is_dir()
+
+
+def test_prepare_omniinteract_bench_params_rejects_dataset_path():
+    from tests.dfx.perf.scripts.run_benchmark import _prepare_omniinteract_bench_params
+
+    with pytest.raises(ValueError, match="cannot be combined with dataset_path"):
+        _prepare_omniinteract_bench_params(
+            {
+                "dataset_name": "omniinteract",
+                "dataset_path": "lucky-lance/OmniInteract",
+                "omniinteract_dataset": "lucky-lance/OmniInteract",
+                "omniinteract_samples": _pinned_acc_samples(),
+            }
+        )
+
+
 def test_omniinteract_result_accepts_accuracy_at_floor():
     from tests.dfx.perf.scripts.run_benchmark import assert_result
 
@@ -966,6 +1053,224 @@ def test_omniinteract_result_rejects_failed_accuracy():
             {"dataset_name": "omniinteract", "omniinteract_evaluate": True, "omniinteract_min_ia_qtf1": 0.0},
             4,
         )
+
+
+def _omniinteract_paq_result(paq: float) -> dict[str, object]:
+    return {
+        "completed": 4,
+        "omniinteract": {
+            "total": 4,
+            "success": 4,
+            "failed": 0,
+            "artifacts_complete": True,
+            "accuracy": {
+                "status": "ok",
+                "failed": 0,
+                "evaluated": 4,
+                "summary": {"IA_QTF1": 0.5, "interruption": {"PAQ": paq}},
+            },
+        },
+    }
+
+
+def test_omniinteract_result_accepts_paq_at_floor():
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    assert_result(
+        _omniinteract_paq_result(0.4),
+        {"dataset_name": "omniinteract", "omniinteract_evaluate": True, "omniinteract_min_paq": 0.4},
+        4,
+    )
+
+
+def test_omniinteract_result_rejects_paq_below_floor():
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    with pytest.raises(AssertionError, match="PAQ"):
+        assert_result(
+            _omniinteract_paq_result(0.39),
+            {"dataset_name": "omniinteract", "omniinteract_evaluate": True, "omniinteract_min_paq": 0.4},
+            4,
+        )
+
+
+def _omniinteract_csm_as_result(csm_as: float) -> dict[str, object]:
+    return {
+        "completed": 4,
+        "omniinteract": {
+            "total": 4,
+            "success": 4,
+            "failed": 0,
+            "artifacts_complete": True,
+            "accuracy": {
+                "status": "ok",
+                "failed": 0,
+                "evaluated": 4,
+                "summary": {"IA_QTF1": 0.5, "interruption": {"CSM_AS": csm_as}},
+            },
+        },
+    }
+
+
+def test_omniinteract_result_accepts_csm_as_at_ceiling():
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    assert_result(
+        _omniinteract_csm_as_result(12),
+        {"dataset_name": "omniinteract", "omniinteract_evaluate": True, "omniinteract_max_csm_as": 12},
+        4,
+    )
+
+
+def test_omniinteract_result_rejects_csm_as_above_ceiling():
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    with pytest.raises(AssertionError, match="CSM-AS"):
+        assert_result(
+            _omniinteract_csm_as_result(12.1),
+            {"dataset_name": "omniinteract", "omniinteract_evaluate": True, "omniinteract_max_csm_as": 12},
+            4,
+        )
+
+
+def _omniinteract_audio_rtf_result(mean_audio_rtf: float) -> dict[str, object]:
+    return {
+        "completed": 4,
+        "mean_audio_rtf": mean_audio_rtf,
+        "omniinteract": {"total": 4, "success": 4, "failed": 0, "artifacts_complete": True},
+    }
+
+
+def test_omniinteract_result_accepts_mean_audio_rtf_below_limit():
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    assert_result(
+        _omniinteract_audio_rtf_result(0.999),
+        {"dataset_name": "omniinteract", "omniinteract_max_audio_rtf": 1},
+        4,
+    )
+
+
+def test_omniinteract_result_rejects_mean_audio_rtf_at_limit():
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    with pytest.raises(AssertionError, match="mean_audio_rtf"):
+        assert_result(
+            _omniinteract_audio_rtf_result(1.0),
+            {"dataset_name": "omniinteract", "omniinteract_max_audio_rtf": 1},
+            4,
+        )
+
+
+def _full_coverage_params() -> dict[str, object]:
+    return {
+        "dataset_name": "omniinteract",
+        "omniinteract_evaluate": True,
+        "omniinteract_require_full_coverage": True,
+        "omniinteract_samples": _pinned_acc_samples(),
+        "omniinteract_min_ia_qtf1": 0.3,
+        "omniinteract_min_paq": 0.4,
+        "omniinteract_max_csm_as": 12,
+    }
+
+
+_PINNED_SAMPLE_IDS = {
+    "1q1a/videos__0035": "1q1a__videos__0035--650365db",
+    "1q1a/videos__0038": "1q1a__videos__0038--b883ec91",
+    "1q1a_math/videos__0001": "1q1a_math__videos__0001--c8cf86b2",
+    "1qna/captaincook4d__Blender_Banana_Pancakes-21_44": (
+        "1qna__videos_bench__captaincook4d__Blender_Banana_Pancakes-21_44--55844d33"
+    ),
+    "1q1a/videos__0124": "1q1a__videos__0124--b8fb919b",
+    "1q1a/videos__0064": "1q1a__videos__0064--0be0d0f5",
+    "1q1a/videos__0100": "1q1a__videos__0100--36db4520",
+    "1q1a/videos__0053": "1q1a__videos__0053--8045b863",
+}
+
+
+def _full_coverage_item(output_name: str) -> dict[str, str]:
+    return {"sample_id": _PINNED_SAMPLE_IDS[output_name], "status": "ok"}
+
+
+def _full_coverage_result(
+    *,
+    evaluated: int,
+    skipped: int,
+    items: list[dict[str, str]],
+) -> dict[str, object]:
+    count = len(_pinned_acc_samples())
+    return {
+        "completed": count,
+        "omniinteract": {
+            "total": count,
+            "success": count,
+            "failed": 0,
+            "artifacts_complete": True,
+            "accuracy": {
+                "status": "ok",
+                "failed": 0,
+                "evaluated": evaluated,
+                "skipped": skipped,
+                "total": count,
+                "summary": {
+                    "IA_QTF1": 0.5,
+                    "interruption": {"PAQ": 0.5, "CSM_AS": 1.0},
+                },
+                "items": items,
+            },
+        },
+    }
+
+
+def test_omniinteract_result_accepts_complete_pinned_coverage():
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    samples = _pinned_acc_samples()
+    items = [_full_coverage_item(sample["output_name"]) for sample in samples]
+    assert_result(
+        _full_coverage_result(evaluated=len(samples), skipped=0, items=items),
+        _full_coverage_params(),
+        len(samples),
+    )
+
+
+def test_omniinteract_result_rejects_survivor_only_coverage():
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    samples = _pinned_acc_samples()
+    items = [_full_coverage_item(samples[2]["output_name"])]
+    with pytest.raises(AssertionError, match="pinned coverage"):
+        assert_result(
+            _full_coverage_result(evaluated=1, skipped=len(samples) - 1, items=items),
+            _full_coverage_params(),
+            len(samples),
+        )
+
+
+def test_omniinteract_result_allows_skipped_cases_without_full_coverage():
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    assert_result(
+        {
+            "completed": 4,
+            "omniinteract": {
+                "total": 4,
+                "success": 4,
+                "failed": 0,
+                "artifacts_complete": True,
+                "accuracy": {
+                    "status": "ok",
+                    "failed": 0,
+                    "evaluated": 1,
+                    "skipped": 3,
+                    "total": 4,
+                    "summary": {"IA_QTF1": 0.5},
+                },
+            },
+        },
+        {"dataset_name": "omniinteract", "omniinteract_evaluate": True},
+        4,
+    )
 
 
 def test_omniinteract_result_rejects_ia_qtf1_below_floor():

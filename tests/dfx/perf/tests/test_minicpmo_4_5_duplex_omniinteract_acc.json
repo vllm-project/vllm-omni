@@ -1,0 +1,106 @@
+[
+  {
+    "test_name": "test_minicpmo_4_5_duplex_omniinteract_acc",
+    "description": "OmniInteract accuracy nightly for MiniCPM-o duplex: eight pinned 1q1a / 1q1a_math / 1qna cases at concurrency 8 on the 2-GPU Thinker/Talker split, judge on the third GPU. Gates mean_audio_rtf < 1. Seed-TTS still owns the historical RTF regression baseline.",
+    "mark": [
+      {
+        "hardware_marks": {
+          "res": {
+            "cuda": ["H100", "B200"]
+          },
+          "num_cards": 3
+        }
+      },
+      "full_model",
+      "omni"
+    ],
+    "server_params": {
+      "model": "openbmb/MiniCPM-o-4_5",
+      "extra_cli_args": [
+        "--deploy-config",
+        "vllm_omni/deploy/minicpmo_4_5_2gpu_omniinteract_acc.yaml",
+        "--trust-remote-code"
+      ]
+    },
+    "judge_server_params": {
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "use_omni": false,
+      "cuda_visible_devices": "2",
+      "extra_cli_args": [
+        "--served-model-name",
+        "Qwen2.5-7B-Instruct"
+      ]
+    },
+    "benchmark_params": [
+      {
+        "dataset_name": "omniinteract",
+        "omniinteract_dataset": "lucky-lance/OmniInteract",
+        "backend": "openai-realtime-duplex",
+        "endpoint": "/v1/realtime",
+        "num_prompts": [
+          8
+        ],
+        "max_concurrency": [
+          8
+        ],
+        "num_warmups": 0,
+        "ready_check_timeout_sec": 0,
+        "disable_shuffle": true,
+        "trust_remote_code": true,
+        "omniinteract_samples": [
+          {
+            "subset": "1q1a",
+            "video_rel": "videos/0035.mp4",
+            "output_name": "1q1a/videos__0035"
+          },
+          {
+            "subset": "1q1a",
+            "video_rel": "videos/0038.mp4",
+            "output_name": "1q1a/videos__0038"
+          },
+          {
+            "subset": "1q1a_math",
+            "video_rel": "videos/0001.mp4",
+            "output_name": "1q1a_math/videos__0001"
+          },
+          {
+            "subset": "1qna",
+            "video_rel": "videos_bench/captaincook4d/Blender_Banana_Pancakes-21_44.mp4",
+            "output_name": "1qna/captaincook4d__Blender_Banana_Pancakes-21_44"
+          },
+          {
+            "subset": "1q1a",
+            "video_rel": "videos/0124.mp4",
+            "output_name": "1q1a/videos__0124"
+          },
+          {
+            "subset": "1q1a",
+            "video_rel": "videos/0064.mp4",
+            "output_name": "1q1a/videos__0064"
+          },
+          {
+            "subset": "1q1a",
+            "video_rel": "videos/0100.mp4",
+            "output_name": "1q1a/videos__0100"
+          },
+          {
+            "subset": "1q1a",
+            "video_rel": "videos/0053.mp4",
+            "output_name": "1q1a/videos__0053"
+          }
+        ],
+        "omniinteract_ref_audio": "tests/assets/minicpmo_4_5/response_required_16k.wav",
+        "omniinteract_output_dir": "tests/dfx/perf/results/omniinteract_acc",
+        "omniinteract_max_video_duration_s": 600,
+        "omniinteract_evaluate": true,
+        "omniinteract_require_full_coverage": true,
+        "omniinteract_judge_model": "Qwen2.5-7B-Instruct",
+        "omniinteract_min_ia_qtf1": 0.3,
+        "omniinteract_min_paq": 0.3,
+        "omniinteract_max_csm_as": 12,
+        "omniinteract_max_audio_rtf": 1,
+        "percentile-metrics": "ttft,tpot,itl,e2el,audio_ttfp,audio_rtf,audio_duration"
+      }
+    ]
+  }
+]
