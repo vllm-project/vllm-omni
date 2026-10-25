@@ -81,6 +81,22 @@ def _tp_range(group: Any) -> tuple[int, int]:
     return group.rank_in_group, group.world_size
 
 
+_QKV_PROJECTION_RE = re.compile(
+    r"^(layers\.\d+\.self_attn\.)(?P<part>[qkv])_proj\.(?P<kind>weight(?:_packed|_scale)?)$"
+)
+_GATE_UP_PROJECTION_RE = re.compile(
+    r"^(layers\.\d+\.mlp\.)(?P<part>gate|up)_proj\.(?P<kind>weight(?:_packed|_scale)?)$"
+)
+_MINIMAX_H3_TEXT_LAYER_PREFIX = "text_encoder.text_model.layers"
+
+
+def _is_serialized_mxfp_auto_round(config: Any) -> bool:
+    if not isinstance(config, dict):
+        return False
+    method = str(config.get("quant_method", "")).lower().replace("_", "-")
+    return method in {"auto-round", "inc"} and "mx_fp" in str(config.get("data_type", "")).lower()
+
+
 # ---------------------------------------------------------------------------
 # Tensor-parallel primitives bound to the encoder process group.
 #
@@ -1136,13 +1152,25 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
         self._tp_size = int(encoder_group.world_size) if encoder_group is not None else 1
         from .checkpoint_quantization import FastH3NVFP4Config
 
-        if getattr(config, "quantization_config", {}).get("quant_method") == "nvfp4":
+        hf_quant_config = getattr(config, "quantization_config", None)
+        if not isinstance(hf_quant_config, dict):
+            hf_quant_config = {}
+        if hf_quant_config.get("quant_method") == "nvfp4":
             from .vae_nvfp4 import require_nvfp4_linear
 
             require_nvfp4_linear(device)
             quant_config = FastH3NVFP4Config.from_encoder(
                 Path(model_path), rank=encoder_group.rank_in_group if encoder_group is not None else 0
             )
+            self.quant_config = quant_config
+        elif _is_serialized_mxfp_auto_round(hf_quant_config):
+            from vllm_omni.quantization.inc_config import OmniINCConfig
+
+            quant_config = OmniINCConfig.from_config(hf_quant_config)
+            # The checkpoint names blocks under the HF namespace while this
+            # encoder builds them under text_model. Scope the serialized MXFP4
+            # quantization to those decoder layers.
+            quant_config.block_name_to_quantize = [_MINIMAX_H3_TEXT_LAYER_PREFIX]
             self.quant_config = quant_config
         _validate_encoder_quant_config(quant_config)
         dtype = torch.bfloat16
@@ -1183,30 +1211,17 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
             match = re.match(r"layers\.(\d+)\.", rest)
             if match is not None and int(match.group(1)) >= MINIMAX_H3_QWEN3VL_SELECTED_LM_LAYER:
                 return None
-            if ".self_attn.q_proj.weight" in rest:
+            match = _QKV_PROJECTION_RE.match(rest)
+            if match is not None:
                 return (
-                    "text_model." + rest.replace(".self_attn.q_proj.weight", ".self_attn.qkv_proj.weight"),
-                    "q",
+                    "text_model." + match.group(1) + "qkv_proj." + match.group("kind"),
+                    match.group("part"),
                 )
-            if ".self_attn.k_proj.weight" in rest:
+            match = _GATE_UP_PROJECTION_RE.match(rest)
+            if match is not None:
                 return (
-                    "text_model." + rest.replace(".self_attn.k_proj.weight", ".self_attn.qkv_proj.weight"),
-                    "k",
-                )
-            if ".self_attn.v_proj.weight" in rest:
-                return (
-                    "text_model." + rest.replace(".self_attn.v_proj.weight", ".self_attn.qkv_proj.weight"),
-                    "v",
-                )
-            if ".mlp.gate_proj.weight" in rest:
-                return (
-                    "text_model." + rest.replace(".mlp.gate_proj.weight", ".mlp.gate_up_proj.weight"),
-                    0,
-                )
-            if ".mlp.up_proj.weight" in rest:
-                return (
-                    "text_model." + rest.replace(".mlp.up_proj.weight", ".mlp.gate_up_proj.weight"),
-                    1,
+                    "text_model." + match.group(1) + "gate_up_proj." + match.group("kind"),
+                    0 if match.group("part") == "gate" else 1,
                 )
             return ("text_model." + rest, None)
         return None
@@ -1219,11 +1234,15 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
         loaded: set[str] = set()
         # Seeded from modules that own a multi-shard loader, so a fused weight
         # receiving no source shard is caught as well as a partially filled one.
-        expected_fused_shards: dict[str, tuple[tuple[str, str | int], ...]] = {
-            f"{module_name}.weight": sources
-            for module_name, module in self.named_modules()
-            if (sources := _fused_source_shards(module)) is not None and f"{module_name}.weight" in params
-        }
+        expected_fused_shards: dict[str, tuple[tuple[str, str | int], ...]] = {}
+        for module_name, module in self.named_modules():
+            sources = _fused_source_shards(module)
+            if sources is None:
+                continue
+            for suffix in ("weight", "weight_packed", "weight_scale"):
+                param_name = f"{module_name}.{suffix}"
+                if param_name in params:
+                    expected_fused_shards[param_name] = sources
         loaded_fused_shards: dict[str, set[str | int]] = {name: set() for name in expected_fused_shards}
         for name, tensor in weights:
             if name in serialized_map:
