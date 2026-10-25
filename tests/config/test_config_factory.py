@@ -1539,9 +1539,8 @@ class TestDeployConfigLoading:
         sampler, which asserts on its codec ids (device-side assert out of
         ``get_token_bin_counts_and_mask``).
 
-        Stage 0's prefix caching is NPU-scoped for the same reason: a CUDA
-        stage-0 prefix hit hands the Thinker an empty tts handoff, and the
-        Talker then indexes past the codec vocab.
+        This base profile also leaves stage-0 prefix caching off on CUDA; the
+        CUDA turn profile enables it (see test_thinker_prefix_cache_defaults).
         """
         deploy = _apply_platform_overrides(
             load_deploy_config(Path(get_deploy_config_path("minicpmo_4_5.yaml"))),
@@ -2021,6 +2020,46 @@ stages:
         assert deploy.stages[0].devices == "0,1"
         assert deploy.stages[0].tensor_parallel_size == 2
         assert deploy.stages[1].devices == "1"
+
+    @pytest.mark.parametrize(
+        ("yaml_name", "platform", "enabled"),
+        [
+            ("qwen3_omni_moe.yaml", "cuda", True),
+            *(("qwen3_omni_moe.yaml", platform, False) for platform in ("npu", "rocm", "xpu", "musa")),
+            ("qwen3_omni_moe_mrv2.yaml", "cuda", False),
+            ("qwen3_omni_duplex.yaml", "cuda", False),
+            ("qwen3_omni_duplex_mrv2.yaml", "cuda", False),
+            ("minicpmo_4_5_turn.yaml", "cuda", True),
+            *(("minicpmo_4_5_turn.yaml", platform, False) for platform in ("npu", "rocm", "xpu", "musa")),
+            ("minicpmo_4_5_turn_mrv2.yaml", "cuda", False),
+            ("minicpmo_4_5_turn_mrv2_h200.yaml", "cuda", False),
+            ("minicpmo_4_5.yaml", "cuda", False),
+            ("minicpmo_4_5_duplex_h200.yaml", "cuda", False),
+        ],
+    )
+    def test_thinker_prefix_cache_defaults(self, monkeypatch, yaml_name: str, platform: str, enabled: bool):
+        """Stage-0 prefix caching ships on only for the validated V1 turn profiles.
+
+        Checked on the final engine args: the stage value rides in
+        ``engine_extras`` and must keep winning over the pipeline-wide flag.
+        """
+        from vllm_omni import platforms
+
+        # merge_pipeline_deploy runs its own override pass for the host platform;
+        # pin it so the row does not depend on the machine running the test.
+        monkeypatch.setattr(platforms.current_omni_platform, "device_name", platform)
+        deploy = _apply_platform_overrides(
+            load_deploy_config(Path(get_deploy_config_path(yaml_name))), platform=platform
+        )
+        # The Qwen3-Omni profiles carry no ``pipeline:`` key; serving resolves it from the model config.
+        pipeline = (
+            resolve_pipeline_config(deploy.pipeline)
+            if deploy.pipeline
+            else resolve_pipeline_config("qwen3_omni_moe", Q3_OMNI_ALL_STAGES_HF_CONFIG)
+        )
+        assert pipeline is not None
+        stage0 = next(stage for stage in merge_pipeline_deploy(pipeline, deploy) if stage.stage_id == 0)
+        assert stage0.yaml_engine_args["enable_prefix_caching"] is enabled
 
     def test_step_audio2_online_ci_deploy_is_single_thinker(self):
         deploy = load_deploy_config(Path(get_deploy_config_path("step_audio2_ci.yaml")))
@@ -2789,6 +2828,25 @@ class TestMingFlashOmniPipeline:
 class TestBaseConfigInheritance:
     """Test deploy YAML base_config inheritance."""
 
+    @pytest.mark.parametrize(
+        ("platform", "expected_devices", "talker_memory"),
+        [
+            ("rocm", ["0", "1", "1"], 0.3),
+            ("cuda", ["0", "1", "2"], 0.4),
+            ("xpu", ["0", "1", "2"], 0.5),
+        ],
+    )
+    def test_qwen2_5_omni_ci_placement(self, monkeypatch, platform, expected_devices, talker_memory):
+        """The two-card ROCm examples must colocate Code2Wav without changing other platforms."""
+        from vllm_omni import platforms
+
+        monkeypatch.setattr(platforms.current_omni_platform, "device_name", platform)
+        deploy = load_deploy_config(get_deploy_config_path("ci/qwen2_5_omni.yaml"))
+        stages = merge_pipeline_deploy(resolve_pipeline_config("qwen2_5_omni"), deploy)
+
+        assert [stage.yaml_runtime["devices"] for stage in stages] == expected_devices
+        assert stages[1].yaml_engine_args["gpu_memory_utilization"] == talker_memory
+
     def test_minicpmo_overlays_inherit_talker_sampling_params(self):
         """Overlays must keep the base Talker codec Sampler knobs."""
         for filename in (
@@ -3150,7 +3208,7 @@ class TestPlatformOverrides:
             assert args["hf_overrides"]["mrv2_gpu_slot_state"] is True
             assert args["hf_overrides"]["mrv2_batch_prefill"] is True
             assert args["hf_overrides"]["mrv2_direct_tokens"] is True
-            assert args["hf_overrides"]["local_compile_audio_sampler"] is True
+            assert "local_compile_audio_sampler" not in args["hf_overrides"]
             extra = deploy.connectors["shm"]["extra"]
             assert extra["generation_min_batch_size"] == 16
             assert extra["generation_max_wait_ms"] == 6
@@ -3173,8 +3231,12 @@ class TestPlatformOverrides:
             "mrv2_gpu_slot_state": True,
             "mrv2_batch_prefill": True,
             "mrv2_direct_tokens": True,
-            "local_compile_audio_sampler": True,
+            "mrv2_eager_mtp": True,
         }
+        # Both CUDA stages run without torch.compile; explicit kernels replace the fusions.
+        assert args["compilation_config"]["mode"] == 0
+        assert args["compilation_config"]["cudagraph_mode"] == "FULL"
+        assert "inductor_compile_config" not in args["compilation_config"]
         extra = deploy.connectors["shm"]["extra"]
         assert extra["initial_codec_chunk_frames"] == 1
         assert extra["codec_chunk_frames"] == 15
@@ -3187,10 +3249,10 @@ class TestPlatformOverrides:
         assert codec_args["max_num_seqs"] == 128
         assert codec_args["hf_overrides"]["codec_attention_backend"] == "triton_slot"
         compilation = codec_args["compilation_config"]
-        assert compilation["mode"] == 3 and compilation["backend"] == "inductor"
+        assert compilation["mode"] == 0 and "backend" not in compilation
         assert compilation["cudagraph_mode"] == "FULL"
         assert max(compilation["cudagraph_capture_sizes"]) == 128
-        assert compilation["inductor_compile_config"] == {"combo_kernels": False, "benchmark_combo_kernel": False}
+        assert "inductor_compile_config" not in compilation
         for variant in ("moss_tts_delay", "moss_tts_realtime"):
             assert not any(stage.supports_native_mrv2_data_plane for stage in resolve_pipeline_config(variant).stages)
 

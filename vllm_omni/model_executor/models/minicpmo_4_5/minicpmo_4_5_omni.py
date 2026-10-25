@@ -629,6 +629,11 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         takes the staged results and builds or reports anything skipped here.
         """
         del device
+        if self.model_stage == "tts":
+            # Full device-graph replay skips Talker.forward's Python cleanup.
+            # Release finished requests before preprocessing can reuse slots.
+            self.talker._flush_deferred_cleanup()
+            return
         if self.model_stage != "llm":
             return
         infos = [model_intermediate_buffer.get(req_id) for req_id in req_ids]

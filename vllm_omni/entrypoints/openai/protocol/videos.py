@@ -373,6 +373,9 @@ class VideoGenerationRequest(BaseModel):
     # request-owned temporary files here.
     _timeline_guide_input: Any = PrivateAttr(default=None)
 
+    # Cleanup paths are populated by the multipart parser, never by clients.
+    _control_reference_paths: list[str] = PrivateAttr(default_factory=list)
+
     # Generic model-specific parameters
     extra_params: dict[str, Any] | None = Field(
         default=None,

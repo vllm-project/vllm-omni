@@ -9,6 +9,7 @@ import asyncio
 import base64
 import json
 from pathlib import Path
+from typing import TypedDict
 
 import pytest
 import websockets
@@ -23,7 +24,9 @@ from tests.e2e.online_serving.helpers.minicpmo_4_5_duplex import (
     validated_input_wav,
 )
 from tests.e2e.online_serving.helpers.minicpmo_realtime_duplex_scenarios import (
+    _read_wav_pcm16,
     _ref_audio_data_url,
+    _send_pcm16,
     run_demo,
 )
 from tests.e2e.online_serving.run_minicpmo_realtime_duplex_multi_session import (
@@ -174,6 +177,20 @@ async def _run_text_only_response_create(
         return await asyncio.wait_for(receive_outcome(), timeout=timeout_s)
 
 
+class _SeededAudioResult(TypedDict):
+    audio_bytes: int
+    transcript: str
+    output_text: str
+    event_types: list[str]
+
+
+class _SeededTurnResult(TypedDict):
+    audio_bytes: int
+    transcript: str
+    output_text: str
+    event_types: list[str]
+
+
 async def _run_seeded_text_to_audio(
     *,
     url: str,
@@ -183,7 +200,7 @@ async def _run_seeded_text_to_audio(
     modalities: tuple[str, ...] = ("audio", "text"),
     silence_seconds: float = 12.0,
     timeout_s: float = 180.0,
-) -> dict[str, object]:
+) -> _SeededAudioResult:
     """Speak a seeded text: the duplex route's text-to-speech shape.
 
     A model-native session takes its text once, in the session context
@@ -307,10 +324,9 @@ def test_duplex_single_session_response_required(omni_server, tmp_path: Path) ->
         output_dir=tmp_path / "single_session",
     )
     args.turns = 2
-    # Every turn replays the same active-speech window as the first one. The default
-    # shorter follow-up window is a different mid-utterance slice, which the native
-    # duplex model may legitimately answer with "listen" instead of a response.
-    args.turn_duration_ms = [args.first_turn_ms] * args.turns
+    # Require a response to a complete utterance. Cropping this 5.47 s fixture
+    # at 1.4 s can legitimately leave the native model listening on a later turn.
+    args.turn_duration_ms = [0] * args.turns
     result = asyncio.run(run_demo(args))
     assert result["ok"] is True
     _assert_positive_int(result["audio_delta_count"])
@@ -358,6 +374,184 @@ def test_duplex_single_session_video_input(omni_server, tmp_path: Path) -> None:
     assert result["transcript_delta_done_ok"] is True
     _assert_request_metrics(result["request_metrics"], expected_count=2)
     _assert_session_metrics(result["session_metrics"], expected_count=2)
+
+
+def _duplex_decisions(events: list[dict[str, object]]) -> int:
+    """Units that reached a listen-or-speak outcome, not an open response."""
+    return sum(event.get("type") in {"response.listen", "response.done"} for event in events)
+
+
+def _open_responses(events: list[dict[str, object]]) -> int:
+    created = sum(event.get("type") == "response.created" for event in events)
+    done = sum(event.get("type") == "response.done" for event in events)
+    return created - done
+
+
+def _audio_delta_bytes(events: list[dict[str, object]]) -> int:
+    total = 0
+    for event in events:
+        if event.get("type") != "response.output_audio.delta":
+            continue
+        delta = event.get("delta")
+        if isinstance(delta, str):
+            total += len(base64.b64decode(delta))
+    return total
+
+
+async def _collect_socket_events(ws, events: list[dict[str, object]], stop: asyncio.Event) -> None:
+    try:
+        while not stop.is_set():
+            raw = await ws.recv()
+            if not isinstance(raw, str):
+                continue
+            event = json.loads(raw)
+            if isinstance(event, dict):
+                events.append(event)
+    except websockets.exceptions.ConnectionClosed:
+        return
+
+
+async def _wait_for_events(events: list[dict[str, object]], predicate, *, timeout_s: float, label: str) -> None:
+    async def wait() -> None:
+        while not predicate():
+            if any(event.get("type") == "error" for event in events):
+                raise AssertionError(next(event for event in events if event.get("type") == "error"))
+            await asyncio.sleep(0.05)
+
+    try:
+        await asyncio.wait_for(wait(), timeout=timeout_s)
+    except TimeoutError as exc:
+        seen = [event.get("type") for event in events]
+        raise AssertionError(f"timed out waiting for {label}; events={seen}") from exc
+
+
+class _VideoThenAudioResult(TypedDict):
+    vision_decisions: int
+    audio_bytes: int
+    error_count: int
+
+
+async def _run_video_only_then_audio(
+    *,
+    url: str,
+    model: str,
+    ref_audio: Path,
+    frames: list[str],
+    speech_pcm16: bytes,
+) -> _VideoThenAudioResult:
+    """VISION units with no PCM, then one speech turn on the same session.
+
+    Each frame is its own append and must settle (listen, or a speak response
+    that finishes) before the next input. The committed speech turn then has to
+    produce audio on that same session.
+    """
+    events: list[dict[str, object]] = []
+    speech_at = 0
+    stop = asyncio.Event()
+    websocket_url = build_realtime_url(url, model, autostart=False)
+    async with websockets.connect(websocket_url, max_size=64 * 1024 * 1024) as ws:
+        reader = asyncio.create_task(_collect_socket_events(ws, events, stop))
+        try:
+            await ws.send(
+                json.dumps(
+                    {
+                        "type": "session.update",
+                        "session": {
+                            "model": model,
+                            "modalities": ["audio", "text"],
+                            "input_audio_format": "pcm16",
+                            "output_audio_format": "pcm16",
+                            "turn_detection": None,
+                            "temperature": 0.0,
+                            "ref_audio": _ref_audio_data_url(str(ref_audio)),
+                            "extra_body": {"auto_response": True, "force_listen_count": 0},
+                        },
+                    }
+                )
+            )
+            await _wait_for_events(
+                events,
+                lambda: any(event.get("type") == "session.created" for event in events),
+                timeout_s=60,
+                label="session.created",
+            )
+            for index, frame in enumerate(frames):
+                decisions_before = _duplex_decisions(events)
+                await ws.send(json.dumps({"type": "input_audio_buffer.append", "video_frames": [frame]}))
+                await _wait_for_events(
+                    events,
+                    lambda decisions_before=decisions_before: (
+                        _duplex_decisions(events) > decisions_before and _open_responses(events) == 0
+                    ),
+                    timeout_s=180,
+                    label=f"vision unit {index} decision",
+                )
+            speech_at = len(events)
+            await _send_pcm16(
+                ws,
+                speech_pcm16,
+                chunk_ms=200,
+                realtime_delay=True,
+                hints={"transcript": "duplex CI speech"},
+            )
+            await ws.send(json.dumps({"type": "input_audio_buffer.commit", "final": True}))
+            await _wait_for_events(
+                events,
+                lambda: (
+                    _audio_delta_bytes(events[speech_at:]) > 0
+                    and any(event.get("type") == "response.done" for event in events[speech_at:])
+                ),
+                timeout_s=180,
+                label="audio response after the vision units",
+            )
+            await ws.send(json.dumps({"type": "session.close"}))
+            await _wait_for_events(
+                events,
+                lambda: any(event.get("type") == "session.closed" for event in events),
+                timeout_s=60,
+                label="session.closed",
+            )
+        finally:
+            stop.set()
+            reader.cancel()
+            try:
+                await reader
+            except asyncio.CancelledError:
+                pass
+    return {
+        "vision_decisions": _duplex_decisions(events[:speech_at]),
+        "audio_bytes": _audio_delta_bytes(events[speech_at:]),
+        "error_count": sum(event.get("type") == "error" for event in events),
+    }
+
+
+@pytest.mark.advanced_model
+@hardware_test(res={"cuda": "H100", "npu": "A3"}, num_cards=1)
+@pytest.mark.parametrize("omni_server", SERVER_PARAMS, indirect=True)
+def test_duplex_video_only_units_then_audio_input(omni_server, tmp_path: Path) -> None:
+    """Frame-only VISION units, then the speech turn the audio duplex test uses.
+
+    A muted camera and a clip with no soundtrack send frames without PCM. The
+    following speech turn is the same committed full utterance as
+    ``test_duplex_single_session_response_required``, so a session that accepted
+    video still has to answer audio. A cropped window can legitimately leave the
+    native model listening.
+    """
+    frames = duplex_camera_frames(seconds=2, cache_dir=tmp_path / "camera")
+    speech = _read_wav_pcm16(validated_input_wav())
+    result = asyncio.run(
+        _run_video_only_then_audio(
+            url=realtime_url(omni_server),
+            model=omni_server.model,
+            ref_audio=resolve_ref_audio(),
+            frames=frames,
+            speech_pcm16=speech,
+        )
+    )
+
+    assert result["error_count"] == 0
+    assert result["vision_decisions"] == 2
+    assert result["audio_bytes"] > 0
 
 
 @pytest.mark.advanced_model

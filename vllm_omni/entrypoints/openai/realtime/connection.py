@@ -26,7 +26,7 @@ from openai.types.chat import (
 )
 from openai.types.chat.chat_completion_content_part_image_param import ImageURL
 from openai.types.chat.chat_completion_content_part_input_audio_param import InputAudio
-from openai.types.realtime.realtime_audio_input_turn_detection import ServerVad
+from openai.types.realtime.realtime_audio_input_turn_detection import SemanticVad, ServerVad
 from pydantic import TypeAdapter
 from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionNamedToolChoiceParam,
@@ -42,11 +42,13 @@ if TYPE_CHECKING:
     from vllm.inputs import EngineInput
 
 from vllm_omni.engine.duplex.turn_detection import (
-    ServerTurnDetector,
+    SemanticVADUnavailableError,
     ServerVADUnavailableError,
     SileroVADBackendProvider,
+    SmartTurnBackendProvider,
     TurnDetectionConfig,
     TurnDetectionResult,
+    TurnDetector,
 )
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.openai.realtime.session import (
@@ -62,7 +64,7 @@ from vllm_omni.utils.audio_resample import StreamingAudioResampler
 
 logger = init_logger(__name__)
 
-_CLIENT_EVENT_ADAPTER = TypeAdapter(types.RealtimeClientEvent)
+_CLIENT_EVENT_ADAPTER: TypeAdapter[types.RealtimeClientEvent] = TypeAdapter(types.RealtimeClientEvent)
 
 # The Realtime PCM contract is mono signed PCM16 at 24 kHz.
 SAMPLE_RATE_HZ = 24000
@@ -109,6 +111,7 @@ class OpenAIFullDuplexConnection:
         tool_call_parser: str | None = None,
         enable_auto_tool_choice: bool = False,
         vad_backend_provider: SileroVADBackendProvider | None = None,
+        semantic_vad_backend_provider: SmartTurnBackendProvider | None = None,
     ):
         self.ws = websocket
         self.engine = engine
@@ -117,7 +120,8 @@ class OpenAIFullDuplexConnection:
         self._tokenizer = chat_handler.renderer.get_tokenizer()
         self._tool_call_parser_name = tool_call_parser if enable_auto_tool_choice else None
         self._vad_backend_provider = vad_backend_provider
-        self._turn_detector: ServerTurnDetector | None = None
+        self._semantic_vad_backend_provider = semantic_vad_backend_provider
+        self._turn_detector: TurnDetector | None = None
         self._speech_item_id: str | None = None
 
         self.session = AudioFullDuplexSessionState()
@@ -232,9 +236,19 @@ class OpenAIFullDuplexConnection:
             self._reset_turn_detection()
             turn_detector = None
         elif turn_detector is None:
-            turn_detector = turn_detection_config.build_detector(self._vad_backend_provider)
+            turn_detector = turn_detection_config.build_detector(
+                self._vad_backend_provider,
+                self._semantic_vad_backend_provider,
+            )
         elif turn_detector.config != turn_detection_config:
-            turn_detector.reconfigure(turn_detection_config)
+            if turn_detector.config.type == turn_detection_config.type:
+                turn_detector.reconfigure(turn_detection_config)
+            else:
+                turn_detector.reset()
+                turn_detector = turn_detection_config.build_detector(
+                    self._vad_backend_provider,
+                    self._semantic_vad_backend_provider,
+                )
 
         s.config = candidate_config
         self._turn_detector = turn_detector
@@ -283,6 +297,17 @@ class OpenAIFullDuplexConnection:
         turn_detection = audio_input.turn_detection if audio_input is not None else None
         if turn_detection is None:
             return None
+        if isinstance(turn_detection, SemanticVad):
+            if turn_detection.interrupt_response is False:
+                raise ValueError("semantic_vad requires interrupt_response=true")
+            return TurnDetectionConfig(
+                type="semantic_vad",
+                eagerness="auto" if turn_detection.eagerness is None else str(turn_detection.eagerness),
+                create_response=True if turn_detection.create_response is None else turn_detection.create_response,
+                interrupt_response=(
+                    True if turn_detection.interrupt_response is None else turn_detection.interrupt_response
+                ),
+            )
         if not isinstance(turn_detection, ServerVad):
             raise ValueError("Only server_vad turn detection is supported")
 
@@ -374,6 +399,11 @@ class OpenAIFullDuplexConnection:
                     fmt="pcm16",
                     sample_rate_hz=SAMPLE_RATE_HZ,
                 )
+            except SemanticVADUnavailableError as exc:
+                self._turn_detector = None
+                self._speech_item_id = None
+                await self._send_error(str(exc), "semantic_vad_unavailable", event_id=event.event_id)
+                return
             except ServerVADUnavailableError as exc:
                 self._turn_detector = None
                 self._speech_item_id = None
@@ -1077,9 +1107,7 @@ class OpenAIFullDuplexConnection:
                         sp.structured_outputs = StructuredOutputsParams(structural_tag=structural_tag_json)
                     thinker_params_configured = True
 
-        sampling_params_list = self.chat_handler._fix_minicpmo45_audio_stream_output_kinds(
-            sampling_params_list, modalities
-        )
+        sampling_params_list = self.chat_handler._fix_audio_stream_output_kinds(sampling_params_list, modalities)
         gen = self.engine.generate(
             prompt=engine_input,
             request_id=active.request_id,

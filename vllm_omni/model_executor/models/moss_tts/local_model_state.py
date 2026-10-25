@@ -24,6 +24,7 @@ from vllm.v1.worker.gpu.sample.sampler import Sampler
 
 from vllm_omni.model_executor.output_snapshot import PackedOutputSnapshot, RequestOutputSnapshot
 from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
+from vllm_omni.worker_v2.warmup import is_warmup_request
 
 logger = init_logger(__name__)
 
@@ -42,13 +43,21 @@ class _CodeRowsSnapshot(PackedOutputSnapshot):
     The generic snapshot flattens every per-request leaf, concatenates them
     into a slab and slices each back, then slices each again after the D2H.
     Here the gathered ``[decode_rows, n_vq]`` tensor is already owned, so the
-    copy is a single D2H and the per-request views come from one ``split``.
+    copy is a single D2H and the per-request rows are cut from the host copy.
+    The runner only ever copies this snapshot to the host, so the device-side
+    mapping exposes the gathered tensor instead of per-request device views.
+
+    With ``partitioned`` (async-chunk runners), the host copy is returned as
+    the runner's already-partitioned flat payloads, so output materialization
+    does not clone, flatten and partition every request's row again. The rows
+    are NumPy views of the per-output pinned host copy, which no later step
+    reuses; the raw-codec stage-input processor consumes NumPy rows directly.
     """
 
     def __init__(
         self, codes: torch.Tensor, decode_rows: list[int], num_reqs: int, first_audio=None, *, partitioned: bool = False
     ) -> None:
-        dict.__init__(self, {"codes": {"audio": self._rows(codes, decode_rows, num_reqs)}})
+        dict.__init__(self, {"codes": {"audio": codes}})
         self._first_audio = first_audio
         if first_audio is not None:
             self["meta"] = {"first_audio": list(first_audio.unbind())}
@@ -66,16 +75,20 @@ class _CodeRowsSnapshot(PackedOutputSnapshot):
         return outputs
 
     def copy_to_cpu(self, copy_tensor):
-        rows = self._rows(copy_tensor(self._codes), self._decode_rows, self._num_reqs)
+        host = copy_tensor(self._codes)
         first_audio = list(copy_tensor(self._first_audio).unbind()) if self._first_audio is not None else None
         if self._partitioned:
+            array = host.numpy()
+            rows = [array[:0]] * self._num_reqs
+            for index, batch_row in enumerate(self._decode_rows):
+                rows[batch_row] = array[index : index + 1]
             payloads = [{"codes.audio": row} for row in rows]
             if first_audio is not None:
                 for payload, flag in zip(payloads, first_audio, strict=True):
                     payload["meta.first_audio"] = flag
             return RequestOutputSnapshot(payloads)
-        payload = {"codes": {"audio": rows}}
-        if self._first_audio is not None:
+        payload = {"codes": {"audio": self._rows(host, self._decode_rows, self._num_reqs)}}
+        if first_audio is not None:
             payload["meta"] = {"first_audio": first_audio}
         return payload
 
@@ -140,6 +153,13 @@ class MossLocalModelState(OmniModelState):
             self._early_first_audio.set_sink(sink)
         else:
             super().set_first_audio_sink(sink)
+
+    def close_first_audio_sender(self) -> None:
+        try:
+            if self._early_first_audio is not None and self._first_audio_sender is not None:
+                self._first_audio_sender.close()
+        finally:
+            super().close_first_audio_sender()
 
     def _init_slot_buffers(self, capacity, hidden_size, device, dtype):
         self._hidden_pool = torch.zeros((capacity, hidden_size), dtype=dtype, device=device)
@@ -313,6 +333,36 @@ class MossLocalModelState(OmniModelState):
         # vLLM 0.31 uses int32 slot mappings; index_copy_ requires int64.
         return selected.long()
 
+    def _row_progress(self, input_batch, req_states):
+        """Per-row prompt lengths and computed-token counts as Python lists.
+
+        Same values as the per-row ``_get_req_state_value`` lookups with their
+        input-batch fallback; ``None`` keeps those lookups. MRV2 computed
+        counts live in a device staged-write tensor, so the per-row lookup
+        raises and falls back to the batch-ordered host mirror on every row.
+        """
+        if req_states is None:
+            return None
+        num_reqs = input_batch.num_reqs
+        slots = input_batch.idx_mapping_np[:num_reqs]
+        prompt = getattr(req_states, "prompt_len", None)
+        prompt = getattr(prompt, "np", prompt)
+        if not isinstance(prompt, np.ndarray):
+            return None
+        computed = getattr(req_states, "num_computed_tokens", None)
+        computed = getattr(computed, "np", computed)
+        if isinstance(computed, np.ndarray):
+            computed = computed[slots]
+        elif (
+            not hasattr(type(computed), "__getitem__") and getattr(input_batch, "num_computed_tokens_cpu", None) is None
+        ):
+            computed = getattr(input_batch, "num_computed_tokens_np", None)
+            if not isinstance(computed, np.ndarray) or len(computed) != num_reqs:
+                return None
+        else:
+            return None
+        return prompt[slots].tolist(), computed[:num_reqs].tolist()
+
     def run_preprocess(self, input_batch, model_inputs, req_states=None, mtp_batch_descriptor_dispatcher=None):
         if self._uva is not None:
             self._flush_pending_resets(self._uva)
@@ -329,23 +379,29 @@ class MossLocalModelState(OmniModelState):
         decode_rows = []
         completing_rows = []
         references = []
+        progress = self._row_progress(input_batch, req_states)
         for row in range(input_batch.num_reqs):
             slot = int(input_batch.idx_mapping_np[row])
             buf = self.intermediate_buffer.buffers[slot]
-            if not buf or str(buf.get("req_id", "")).startswith("_warmup_"):
+            if not buf or is_warmup_request(buf.get("req_id", "")):
                 continue
             start = int(input_batch.query_start_loc_np[row])
             count = int(input_batch.num_scheduled_tokens[row])
-            prompt_len = (
-                None if req_states is None else self._get_req_state_value(getattr(req_states, "prompt_len", None), slot)
-            )
-            computed = (
-                None
-                if req_states is None
-                else self._get_req_state_value(getattr(req_states, "num_computed_tokens", None), slot)
-            )
-            if computed is None:
-                computed = self._get_input_batch_num_computed(input_batch, slot, row)
+            if progress is not None:
+                prompt_len, computed = progress[0][row], progress[1][row]
+            else:
+                prompt_len = (
+                    None
+                    if req_states is None
+                    else self._get_req_state_value(getattr(req_states, "prompt_len", None), slot)
+                )
+                computed = (
+                    None
+                    if req_states is None
+                    else self._get_req_state_value(getattr(req_states, "num_computed_tokens", None), slot)
+                )
+                if computed is None:
+                    computed = self._get_input_batch_num_computed(input_batch, slot, row)
             prefill = computed < prompt_len if computed is not None and prompt_len is not None else count > 1
             if prefill and computed is not None and prompt_len is not None and computed + count >= prompt_len:
                 completing_rows.append(row)

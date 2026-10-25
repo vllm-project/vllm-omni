@@ -73,6 +73,86 @@ This experimental mode stores the final noisy probe's KV rather than clean
 `x0` KV, so generated outputs can differ. The four denoising steps, chunk
 boundaries, and paged-context finalization remain the same.
 
+## Experimental Ascend SP8 output paths
+
+Two independent, default-disabled options are available for the eight-rank
+streaming path. They are candidates for device validation and do not establish
+a measured speedup or realtime acceptance. A working NPU attention backend is
+a prerequisite; the NPU enablement work is tracked in
+[#8112](https://github.com/vllm-project/vllm-omni/pull/8112).
+
+Set these on the streaming stage's `model_config`, rather than per-request
+`extra_args`:
+
+```yaml
+model_config:
+  lingbot_npu_pixel_output_mode: native
+  lingbot_npu_leased_post_attention: false
+```
+
+`lingbot_npu_pixel_output_mode` accepts:
+
+| Mode | Final output behavior |
+| --- | --- |
+| `native` | Existing floating-point All-Gather and pixel conversion on every rank. |
+| `root_float` | Preserve the floating-point All-Gather; only group rank zero assembles, converts and copies pixels to CPU. |
+| `root_uint8_allgather` | Convert each spatial shard to uint8 before the final All-Gather; rank zero assembles and copies the result. |
+| `root_uint8_p2p` | Convert each shard to uint8, then use batched point-to-point send/receive to collect only on rank zero. |
+
+The non-native modes require eight-rank NPU width sharding, a streaming VAE
+with `patch_size: null`, and a request-owned decode cache. Unsupported geometry selects
+the native path before decoder execution. Every rank still runs the complete
+local decoder, halo exchange and temporal-cache update. Non-output ranks
+return chunk metadata without a video payload. VAE attention collectives,
+frame counts, encoding FPS and camera sampling stay on their existing paths.
+Pixel conversion retains the original clamp, decoder-precision arithmetic,
+FP32 scaling and rounding order.
+
+`lingbot_npu_leased_post_attention: true` requires SP8, TP1 and the native
+BF16 `self.o` projection. It captures projection, residual, camera affine and
+normalization using two independent buffer slots and graph pools. The reverse
+All-to-All reassembly writes the fixed projection input; cross-attention reads
+borrowed graph outputs until its residual has been submitted. Completion events
+prevent slot reuse while any consumer remains in flight. The graph does not
+capture communication, KV writeback or VAE-cache advancement.
+
+Changed parameter owners, callable code, LayerNorm backend settings, or an
+execution failure abort the candidate; there is no mid-execution fallback.
+After a submitted operation fails, failure handling retains active tensor owners
+until process teardown, and the caller propagates the original exception.
+
+Failure handling is local to the LingBot model implementation and requires no
+environment variables or file-reporting channel. The serving deployment remains
+responsible for terminating its eight-worker launch and starting fresh workers
+before admitting another request after an irrecoverable execution failure.
+Automatic worker restart is not part of these experimental output paths.
+
+These experimental modes require eight-rank correctness, paired model timing
+and lifecycle validation before enabling them in a serving deployment. CPU
+ownership tests alone do not provide that acceptance.
+
+Validate each pixel mode independently against `native`, with leased graphs
+disabled. Validate leased graphs separately with native pixel output before
+testing a combination. Use consecutive chunks and compare latent tensors,
+pre-encoding RGB bytes, frame counts, and PTS; also exercise cancellation,
+disconnect, close/reopen, window sliding, and prompt changes. All eight ranks
+must retain their decoder and temporal-cache work throughout these checks.
+
+The CPU contracts can be run without weights or NPU initialization:
+
+```bash
+TORCH_DEVICE_BACKEND_AUTOLOAD=0 OMP_NUM_THREADS=1 python -m pytest \
+  --noconftest -c pyproject.toml -o addopts='' \
+  tests/diffusion/models/lingbot_world/test_lingbot_pixel_output.py \
+  tests/diffusion/models/lingbot_world/test_lingbot_leased_post_attention.py \
+  tests/diffusion/models/lingbot_world/test_lingbot_world_imports.py -q
+```
+
+This isolated command omits the repository's integration fixtures. In a full
+development environment, run the same files with the normal fixtures and
+`-m "core_model and diffusion and cpu" --run-level=core_model` instead. Neither
+command establishes eight-rank HCCL or model-performance acceptance.
+
 ## Realtime in-process generation (deprecated)
 
 Prefer [Streaming video serving](#streaming-video-serving) for mid-session

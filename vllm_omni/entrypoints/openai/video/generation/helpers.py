@@ -41,6 +41,7 @@ from pydantic import TypeAdapter, ValidationError
 from vllm.entrypoints.launchers.launcher import terminate_if_errored
 from vllm.entrypoints.serve import create_error_response
 from vllm.logger import init_logger
+from vllm.multimodal.image import open_image
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 
 from vllm_omni.diffusion.models.interface import ReferenceVideoDecodeSpec
@@ -89,7 +90,7 @@ MINIMAX_H3_MAX_REFERENCE_AUDIO_BYTES = 15 * 1024 * 1024
 
 MINIMAX_H3_MAX_REFERENCE_COUNT = 12
 
-MINIMAX_H3_REFERENCE_IMAGE_FORMATS = frozenset({"jpeg", "png", "webp", "heic", "heif"})
+MINIMAX_H3_REFERENCE_IMAGE_FORMATS = frozenset({"jpeg", "png", "webp"})
 
 MINIMAX_H3_REFERENCE_VIDEO_SUFFIXES = frozenset({".mp4", ".mov"})
 
@@ -366,7 +367,7 @@ async def _cleanup_video(video_id: str):
 def _cleanup_video_references(
     reference_video: ReferenceVideo | None,
     reference_audio: ReferenceAudio | None,
-    control_path: str | list[str] | None = None,
+    request: VideoGenerationRequest,
     latent_edit_input: LatentEditInput | None = None,
 ) -> None:
     if reference_video is not None:
@@ -378,7 +379,7 @@ def _cleanup_video_references(
         for path in cleanup_paths:
             if os.path.exists(path):
                 os.unlink(path)
-    for path in _reference_list(control_path):
+    for path in request._control_reference_paths:
         if os.path.exists(path):
             os.unlink(path)
     if latent_edit_input is not None:
@@ -422,14 +423,13 @@ async def _run_video_generation_job(
     reference_image: ReferenceImage | None = None,
     reference_video: ReferenceVideo | None = None,
     reference_audio: ReferenceAudio | None = None,
-    control_path: str | list[str] | None = None,
     app_state: Any | None = None,
     latent_edit_input: LatentEditInput | None = None,
 ) -> None:
     job = await VIDEO_STORE.get(video_id)
     if job is None:
         logger.warning("Video job %s missing before generation task started; skipping", video_id)
-        _cleanup_video_references(reference_video, reference_audio, control_path, latent_edit_input)
+        _cleanup_video_references(reference_video, reference_audio, request, latent_edit_input)
         _cleanup_timeline_guides(request)
         return
 
@@ -507,7 +507,7 @@ async def _run_video_generation_job(
         await VIDEO_STORE.pop(video_id)
         raise
     finally:
-        _cleanup_video_references(reference_video, reference_audio, control_path, latent_edit_input)
+        _cleanup_video_references(reference_video, reference_audio, request, latent_edit_input)
         _cleanup_timeline_guides(request)
 
 
@@ -587,11 +587,8 @@ async def _persist_uploaded_control_reference(
             status_code=HTTPStatus.BAD_REQUEST.value,
             detail=f"{field_name} must be an image or video file.",
         )
-    # Persist a trusted suffix rather than text from the upload filename.
-    suffix = next(
-        (allowed for allowed in supported_suffixes if allowed == suffix),
-        ".png" if kind == "image" else ".mp4",
-    )
+    if not suffix:
+        suffix = ".png" if kind == "image" else ".mp4"
     return await _persist_uploaded_reference(
         upload,
         field_name=field_name,
@@ -795,6 +792,8 @@ def _uploaded_media_kind(upload: UploadFile) -> str:
     if content_type.startswith("audio/"):
         return "audio"
     suffix = Path(upload.filename or "").suffix.lower()
+    # HEIC/HEIF are classified as images so they take the image validation path;
+    # the decoder allowlist below does not accept those formats.
     if suffix in {".png", ".jpg", ".jpeg", ".webp", ".heic", ".heif"}:
         return "image"
     if suffix in {".wav", ".mp3", ".m4a", ".aac", ".flac", ".ogg"}:
@@ -847,7 +846,7 @@ def _validate_minimax_h3_image_payload(
 ) -> None:
     """Validate a H3 image before converting it to a format-less PIL image."""
     try:
-        with Image.open(io.BytesIO(payload)) as image:
+        with open_image(io.BytesIO(payload)) as image:
             image_format = str(image.format or "").lower()
             if image_format in MINIMAX_H3_REFERENCE_IMAGE_FORMATS:
                 _validate_image_pixel_limit(image)
@@ -861,15 +860,15 @@ def _validate_minimax_h3_image_payload(
     except (OSError, ValueError) as exc:
         if allow_non_image:
             return
-        raise HTTPException(400, detail=f"Invalid uploaded image reference: {filename}") from exc
+        raise HTTPException(
+            HTTPStatus.BAD_REQUEST.value,
+            detail=(f"Invalid uploaded image reference: {filename}. Expected a JPG, JPEG, PNG, or WEBP image."),
+        ) from exc
 
     if image_format not in MINIMAX_H3_REFERENCE_IMAGE_FORMATS:
         raise HTTPException(
             status_code=HTTPStatus.BAD_REQUEST.value,
-            detail=(
-                "MiniMax H3 reference images must use JPG, JPEG, PNG, WEBP, HEIC, or HEIF; "
-                f"got {image_format or 'unknown'}."
-            ),
+            detail=(f"MiniMax H3 reference images must use JPG, JPEG, PNG, or WEBP; got {image_format or 'unknown'}."),
         )
 
 
@@ -1117,7 +1116,6 @@ async def _parse_video_form(
     ReferenceImage | None,
     ReferenceVideo | None,
     ReferenceAudio | None,
-    str | list[str] | None,
     LatentEditInput | None,
 ]:
     """FastAPI dependency that parses video form data, validates inputs,
@@ -1155,6 +1153,8 @@ async def _parse_video_form(
             ),
         )
 
+    if model == "auto":
+        model = None
     request_data: dict[str, Any] = {
         "prompt": prompt,
         "model": model,
@@ -1367,7 +1367,7 @@ async def _parse_video_form(
             for audio_reference in _reference_list(request.audio_reference):
                 audio_paths.append(await decode_audio_url(audio_reference.audio_url))
         except InvalidInputReferenceError as exc:
-            _cleanup_video_references(reference_video, reference_audio)
+            _cleanup_video_references(reference_video, reference_audio, request)
             cleanup_paths = set(() if reference_audio is None else reference_audio.cleanup_paths)
             for path in audio_paths:
                 if path not in cleanup_paths and os.path.exists(path):
@@ -1385,7 +1385,7 @@ async def _parse_video_form(
             cleanup_paths=cleanup_paths,
         )
 
-    control_paths: list[str] = []
+    control_paths = request._control_reference_paths
     if normalized_control_type is not None:
         try:
             for role, upload in (
@@ -1408,12 +1408,11 @@ async def _parse_video_form(
                 assert request.extra_params is not None
                 request.extra_params[normalized_control_type][f"{role}_path"] = path
         except InvalidInputReferenceError as exc:
-            _cleanup_video_references(reference_video, reference_audio, control_paths)
+            _cleanup_video_references(reference_video, reference_audio, request)
             raise HTTPException(400, detail=str(exc)) from exc
         except (asyncio.CancelledError, HTTPException, OSError, TypeError, ValueError):
-            _cleanup_video_references(reference_video, reference_audio, control_paths)
+            _cleanup_video_references(reference_video, reference_audio, request)
             raise
-    control_path = control_paths or None
 
     latent_edit_input: LatentEditInput | None = None
     if has_latent_edit:
@@ -1444,7 +1443,7 @@ async def _parse_video_form(
             for path in source_paths:
                 with suppress(OSError):
                     os.unlink(path)
-            _cleanup_video_references(reference_video, reference_audio, control_path)
+            _cleanup_video_references(reference_video, reference_audio, request)
             raise
 
     if parsed_timeline_guides is not None:
@@ -1452,7 +1451,7 @@ async def _parse_video_form(
         try:
             request._timeline_guide_input = await _persist_timeline_guides(guides, kinds, guide_files or [])
         except (asyncio.CancelledError, Exception):
-            _cleanup_video_references(reference_video, reference_audio, control_path, latent_edit_input)
+            _cleanup_video_references(reference_video, reference_audio, request, latent_edit_input)
             raise
 
     return (
@@ -1462,6 +1461,5 @@ async def _parse_video_form(
         reference_image,
         reference_video,
         reference_audio,
-        control_path,
         latent_edit_input,
     )

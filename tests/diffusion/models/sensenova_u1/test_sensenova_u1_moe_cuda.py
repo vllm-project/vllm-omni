@@ -86,7 +86,7 @@ def cuda_vllm_env(monkeypatch):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for FusedMoE")
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 def test_sparse_moe_block_matches_reference_after_checkpoint_loading(cuda_vllm_env):
     """Checkpoint-format expert shards, loaded through the production loader, must
     reproduce the reference Qwen3-MoE output. Covers the w13 gate/up order, the

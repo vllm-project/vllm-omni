@@ -76,6 +76,7 @@ from vllm_omni.model_executor.models.fish_speech.prompt_utils import (
     FISH_TEXT_ONLY_SYSTEM_PROMPT,
     build_fish_voice_clone_prompt_ids,
 )
+from vllm_omni.model_executor.models.ming_flash_omni.reference_audio import unpack_reference_audio
 from vllm_omni.model_executor.models.ming_tts.constants import (
     KEY_SPEAKER_EMBEDDING,
     KEY_SPEAKER_SAMPLE_RATES,
@@ -602,6 +603,7 @@ class TestSpeechAPI:
         assert response.json()["voices"] == ["alice", "bob", "carol", "default"]
         assert response.json()["uploaded_voices"] == [
             {
+                "id": "carol",
                 "name": "Carol",
                 "consent": "",
                 "created_at": 1,
@@ -955,13 +957,36 @@ class TestSpeechAPI:
         assert b"Invalid voice" in response.body
 
     @pytest.mark.asyncio
-    async def test_create_diffusion_speech_extra_params(self, mocker: MockerFixture):
-        """Test diffusion parameters reach StepScheduler as standard fields."""
+    @pytest.mark.parametrize(
+        ("request_seed", "extra_seed", "expected_seed"),
+        [
+            (None, None, 99),
+            (None, 17, 17),
+            (42, 17, 42),
+            (None, -1, -1),
+            (None, -(2**63), -(2**63)),
+            (-1, 17, -1),
+            (-(2**63), 17, -(2**63)),
+        ],
+    )
+    @pytest.mark.parametrize("default_legacy_seed", [None, 3])
+    async def test_create_diffusion_speech_extra_params(
+        self,
+        mocker: MockerFixture,
+        request_seed,
+        extra_seed,
+        expected_seed,
+        default_legacy_seed,
+    ):
+        """Test diffusion speech extra_params and seed propagation."""
         # Mock the engine client
         mock_engine = mocker.MagicMock()
 
         # Mock default sampling params
-        mock_sampling_param = OmniDiffusionSamplingParams(extra_args={"existing_arg": "value"})
+        default_extra = {"existing_arg": "value"}
+        if default_legacy_seed is not None:
+            default_extra["seed"] = default_legacy_seed
+        mock_sampling_param = OmniDiffusionSamplingParams(seed=99, extra_args=default_extra.copy())
         mock_engine.default_sampling_params_list = [mock_sampling_param]
 
         # Mock generate to yield a valid OmniRequestOutput
@@ -977,14 +1002,18 @@ class TestSpeechAPI:
             server, "create_audio", return_value=mocker.MagicMock(audio_data=b"dummy", media_type="audio/wav")
         )
 
+        extra_params = {
+            "new_arg": 123,
+            "existing_arg": "new_value",
+            "num_inference_steps": 12,
+            "guidance_scale": 7.0,
+        }
+        if extra_seed is not None:
+            extra_params["seed"] = extra_seed
         req = OpenAICreateSpeechRequest(
             input="Hello",
-            extra_params={
-                "new_arg": 123,
-                "existing_arg": "new_value",
-                "num_inference_steps": 12,
-                "guidance_scale": 7.0,
-            },
+            seed=request_seed,
+            extra_params=extra_params,
         )
 
         response = await server.create_speech(req)
@@ -1002,12 +1031,20 @@ class TestSpeechAPI:
 
         # Verify it was deepcopied and updated
         assert passed_params is not mock_engine.default_sampling_params_list
-        assert passed_params[0].extra_args == {
+        assert passed_params[0].seed == expected_seed
+        expected_extra = {
             "existing_arg": "new_value",
             "new_arg": 123,
             "num_inference_steps": 12,
             "guidance_scale": 7.0,
         }
+        if default_legacy_seed is not None:
+            expected_extra["seed"] = (
+                expected_seed if request_seed is not None or extra_seed is not None else default_legacy_seed
+            )
+        assert passed_params[0].extra_args == expected_extra
+        assert mock_sampling_param.seed == 99
+        assert mock_sampling_param.extra_args == default_extra
         assert passed_params[0].num_inference_steps == 12
         assert passed_params[0].guidance_scale == 7.0
 
@@ -5464,8 +5501,8 @@ class TestMingTTSServing:
         assert sampling_params.max_tokens == 8
 
 
-@pytest.fixture
-def ming_flash_omni_tts_server(mocker: MockerFixture):
+@pytest.fixture(params=["ming_tts", "ming3_tts"], ids=["ming2", "ming3"])
+def ming_flash_omni_tts_server(request: pytest.FixtureRequest, mocker: MockerFixture):
     mocker.patch(
         "vllm_omni.entrypoints.openai.tts_adapters.base.load_supported_speakers",
         return_value=set(),
@@ -5487,7 +5524,7 @@ def ming_flash_omni_tts_server(mocker: MockerFixture):
     mock_engine_client.generate = mocker.MagicMock(return_value="generator")
     mock_engine_client.stage_configs = [
         SimpleNamespace(
-            engine_args=SimpleNamespace(model_stage="ming_tts"),
+            engine_args=SimpleNamespace(model_stage=request.param),
             tts_args={},
         )
     ]
@@ -5509,11 +5546,23 @@ class TestMingFlashOmniTTSServing:
         assert error is not None
         assert "ref_text" in error
 
-    def test_validate_ming_flash_omni_tts_rejects_ref_audio(self, ming_flash_omni_tts_server):
+    def test_validate_ming_ref_audio_support(self, ming_flash_omni_tts_server, mocker: MockerFixture):
         request = OpenAICreateSpeechRequest(input="Hello", ref_audio="data:audio/wav;base64,abc")
         error = ming_flash_omni_tts_server._validate_tts_request(request)
-        assert error is not None
-        assert "ref_audio" in error
+        if ming_flash_omni_tts_server._tts_model_type == "ming_flash_omni_tts":
+            assert error is not None
+            assert "not yet supported" in error
+        else:
+            assert error is None
+            ming_flash_omni_tts_server._resolve_ref_audio_array = mocker.AsyncMock(
+                return_value=([0.1, -0.1], 16000, "cache-key")
+            )
+            asyncio.run(ming_flash_omni_tts_server._prepare_speech_generation(request))
+            prompt = ming_flash_omni_tts_server.engine_client.generate.call_args.kwargs["prompt"]
+            reference = unpack_reference_audio(prompt["additional_information"])[0]
+            assert reference["sample_rate"] == 16000
+            torch.testing.assert_close(reference["samples"], torch.tensor([0.1, -0.1]))
+            assert prompt["additional_information"]["speaker_conditioning"] == "prompt"
 
     def test_ming_flash_omni_tts_adapter_builds_prompt(self, ming_flash_omni_tts_server):
         request = OpenAICreateSpeechRequest(input="Hello", voice="test")
@@ -5522,7 +5571,15 @@ class TestMingFlashOmniTTSServing:
         prompt = ming_flash_omni_tts_server.engine_client.generate.call_args.kwargs["prompt"]
         assert prompt["prompt_token_ids"] == [0]
         assert prompt["additional_information"]["text"] == "Hello"
-        assert prompt["additional_information"]["voice_name"] == "test"
+        info = prompt["additional_information"]
+        if ming_flash_omni_tts_server._tts_model_type == "ming_flash_omni_tts":
+            assert info["voice_name"] == "test"
+            assert json.loads(info["instruction"])["audio_sequence"][0]["IP"] is None
+            assert "speaker_conditioning" not in info
+        else:
+            assert info["voice_name"] is None
+            assert json.loads(info["instruction"])["audio_sequence"][0]["IP"] == "test"
+            assert info["speaker_conditioning"] == "mute"
 
 
 class TestTTSAsyncOffloading:

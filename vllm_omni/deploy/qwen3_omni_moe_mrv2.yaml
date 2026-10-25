@@ -35,6 +35,8 @@ connectors:
 stages:
   - stage_id: 0
     model_runner: v2
+    # The base profile's Thinker prefix cache is validated on V1 only.
+    enable_prefix_caching: false
   - stage_id: 1
     model_runner: v2
   - stage_id: 2

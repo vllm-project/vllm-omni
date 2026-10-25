@@ -65,7 +65,7 @@ class AsyncEventResolver:
         }
         return fut
 
-    async def resolve(self, ack: OmniACK):
+    async def resolve(self, ack: OmniACK | dict[str, Any]):
         tid = getattr(ack, "task_id", None)
 
         if tid is None and isinstance(ack, dict):

@@ -2210,6 +2210,7 @@ def test_example_demo_extracts_video_soundtrack_only_when_wav_is_absent(tmp_path
         assert video_path == Path("/tmp/clip.mp4")
         return extracted, ["v0"], ["s0"]
 
+    monkeypatch.setattr(demo, "_video_has_audio", lambda path: True)
     monkeypatch.setattr(demo, "_extract_video_input", fake_extract)
 
     wav_out, frames, stacked = demo._resolve_duplex_av_inputs(

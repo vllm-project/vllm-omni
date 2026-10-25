@@ -8,6 +8,7 @@ from __future__ import annotations
 from collections import defaultdict
 from collections.abc import Callable
 from types import MethodType, SimpleNamespace
+from typing import Any
 
 import numpy as np
 import pytest
@@ -102,8 +103,10 @@ class _Request:
         # vLLM 0.27 (a0c092ee72): Request gained num_stale_output_tokens to
         # track in-flight outputs discarded at preemption/streaming-stop.
         self.num_stale_output_tokens = 0
+        self.drop_stale_output = False
         self.has_encoder_inputs = False
-        self.pooling_params = None
+        self.use_structured_output = False
+        self.pooling_params: Any = None
         self.resumable = True
         self.stop_reason = None
         self.trace_headers = None

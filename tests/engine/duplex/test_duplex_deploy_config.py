@@ -32,6 +32,10 @@ def test_duplex_session_runtime_defaults_are_typed_and_immutable(tmp_path) -> No
     assert deploy.duplex_session.max_pending_input_bytes_per_session == 16 * 1024 * 1024
     assert deploy.duplex_session.max_pending_turns_per_session == 4
     assert deploy.duplex_session.max_sessions == 1
+    assert deploy.duplex_session.replica_policy == "legacy"
+    assert deploy.duplex_session.max_sessions_per_replica is None
+    assert deploy.duplex_session.replica_groups is None
+    assert deploy.duplex_session.worker_max_sessions == 1
     assert deploy.duplex_session.completed_append_cache_size == 256
     assert deploy.duplex_session.server_vad_model_path is None
     with pytest.raises(FrozenInstanceError):
@@ -45,6 +49,71 @@ def test_duplex_session_runtime_accepts_disabled_idle_expiry(tmp_path) -> None:
     deploy = load_deploy_config(deploy_path)
 
     assert deploy.duplex_session.idle_ttl_s is None
+
+
+def test_duplex_session_runtime_loads_replica_placement_fields(tmp_path) -> None:
+    deploy_path = tmp_path / "duplex.yaml"
+    deploy_path.write_text(
+        "session_mode: duplex\n"
+        "duplex_session:\n"
+        "  max_sessions: 9\n"
+        "  replica_policy: least_sessions\n"
+        "  max_sessions_per_replica: 3\n"
+        "  replica_groups:\n"
+        "    - {0: 0, 1: 0}\n"
+        "    - {0: 1, 1: 0}\n"
+        "stages: []\n",
+        encoding="utf-8",
+    )
+
+    config = load_deploy_config(deploy_path).duplex_session
+
+    assert config.replica_policy == "least_sessions"
+    assert config.max_sessions == 9
+    assert config.max_sessions_per_replica == 3
+    assert config.worker_max_sessions == 3
+    assert config.replica_groups == [{0: 0, 1: 0}, {0: 1, 1: 0}]
+
+
+@pytest.mark.parametrize("policy", ["round_robin", "", None, True])
+def test_duplex_replica_policy_rejects_unknown_values(policy) -> None:
+    with pytest.raises(ValueError, match="duplex_session.replica_policy"):
+        DuplexSessionRuntimeConfig(replica_policy=policy)
+
+
+def test_duplex_least_sessions_requires_replica_capacity() -> None:
+    with pytest.raises(ValueError, match="max_sessions_per_replica is required"):
+        DuplexSessionRuntimeConfig(replica_policy="least_sessions")
+
+
+@pytest.mark.parametrize("capacity", [0, -1, True, False, 1.5, "2"])
+def test_duplex_replica_capacity_rejects_non_positive_or_non_integer_values(capacity) -> None:
+    with pytest.raises(ValueError, match="max_sessions_per_replica must be an integer >= 1"):
+        DuplexSessionRuntimeConfig(replica_policy="least_sessions", max_sessions_per_replica=capacity)
+
+
+@pytest.mark.parametrize(
+    "groups",
+    [
+        [],
+        {0: 0},
+        [{0: 0}, []],
+        [{}],
+        [{"0": 0}],
+        [{True: 0}],
+        [{-1: 0}],
+        [{0: "0"}],
+        [{0: True}],
+        [{0: -1}],
+    ],
+)
+def test_duplex_replica_groups_reject_malformed_mappings(groups) -> None:
+    with pytest.raises(ValueError, match="duplex_session.replica_groups"):
+        DuplexSessionRuntimeConfig(
+            replica_policy="least_sessions",
+            max_sessions_per_replica=1,
+            replica_groups=groups,
+        )
 
 
 def test_duplex_session_runtime_accepts_local_server_vad_model(tmp_path) -> None:
@@ -107,3 +176,27 @@ def test_deploy_duplex_max_sessions_tracks_the_deploy_config(deploy_yaml: str, e
     # or an overlay inheriting one from its base must surface here rather than
     # as another nightly duplex admission timeout.
     assert get_deploy_duplex_max_sessions(deploy_yaml) == expected
+
+
+@pytest.mark.parametrize(
+    "patch",
+    [
+        {"history_asr_url": "file:///tmp/model", "history_asr_model": "asr"},
+        {"history_asr_url": "http://localhost/transcribe"},
+        {"history_calibration_timeout_ms": 0},
+        {"history_calibration_timeout_ms": float("nan")},
+        {"history_audio_max_bytes_per_session": True},
+        {"history_asr_max_concurrency": 0},
+        {"history_asr_max_concurrency": True},
+        {"history_asr_max_concurrency": 1.5},
+        {"history_ms_per_token": 0},
+        {"history_ms_per_token": True},
+        {"history_ms_per_token": "260"},
+        {"history_ms_per_token": float("nan")},
+        {"history_ms_per_token": float("inf")},
+        {"history_ms_per_token": 260, "history_asr_url": "http://localhost/transcribe", "history_asr_model": "asr"},
+    ],
+)
+def test_history_calibration_requires_bounded_server_configuration(patch):
+    with pytest.raises(ValueError):
+        DuplexSessionRuntimeConfig(**patch)

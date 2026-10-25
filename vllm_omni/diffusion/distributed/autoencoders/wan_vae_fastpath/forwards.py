@@ -218,6 +218,22 @@ def _conv_without_bias(conv: nn.Conv3d, x: torch.Tensor) -> torch.Tensor:
     return F.conv3d(x, conv.weight, None, conv.stride, conv.padding, conv.dilation, conv.groups)
 
 
+def _may_defer_conv_bias(owner: nn.Module, x: torch.Tensor) -> bool:
+    """Whether the bias of a convolution in ``owner`` may be left for a later kernel to add.
+
+    ATen's CUDA convolution adds the bias in a separate pass after cuDNN rounds
+    the output, so adding it later (inside the norm or residual kernel) gives
+    the same bits. oneDNN on XPU adds it inside the fp32 accumulator before the
+    one rounding; deferring it changes ~27% of bf16/fp16 outputs by an ulp, so
+    the lossless level keeps the bias in the convolution there. The
+    ``channels_last`` level is tolerance-based and defers everywhere.
+    """
+    if x.device.type != "xpu":
+        return True
+    cfg = getattr(owner, CFG_ATTR, None)
+    return cfg is not None and cfg.channels_last
+
+
 def _deferred_conv_bias(conv: nn.Module, output: torch.Tensor) -> torch.Tensor | None:
     """Round a deferred bias as autocast would inside the producing convolution.
 
@@ -433,14 +449,19 @@ def _run_cached_causal_conv(
         and x.dim() == 5
         and (payload is None or (payload.device == x.device and payload.dtype == x.dtype))
     ):
-        fold_bias = return_bias and conv.bias is not None
+        fold_bias = return_bias and conv.bias is not None and _may_defer_conv_bias(conv, x)
         bias = None if fold_bias else conv.bias
+
+        def with_bias(out: torch.Tensor) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]:
+            if not return_bias:
+                return out
+            return out, _deferred_conv_bias(conv, out) if fold_bias else None
 
         if payload is None:
             first_frame = _first_frame_conv2d(conv, x, bias)
             if first_frame is not None:
                 out, cache_list[index] = first_frame
-                return (out, _deferred_conv_bias(conv, out)) if return_bias else out
+                return with_bias(out)
 
         # Preferred: temporal concat only (aligned plane copies) + cuDNN spatial
         # padding, once verified bitwise for this (conv, shape).
@@ -451,13 +472,13 @@ def _run_cached_causal_conv(
             if pair is not None:
                 assembled, cache_list[index] = pair
                 out = _conv_with_spatial_padding(conv, assembled, bias, verdicts, key)
-                return (out, _deferred_conv_bias(conv, out)) if return_bias else out
+                return with_bias(out)
 
         pair = dm.cat_pad_5d(x, payload, conv._padding, keep_cache_frames=CACHE_T)
         if pair is not None:
             conv_input, cache_list[index] = pair
             out = F.conv3d(conv_input, conv.weight, bias, conv.stride, conv.padding, conv.dilation, conv.groups)
-            return (out, _deferred_conv_bias(conv, out)) if return_bias else out
+            return with_bias(out)
 
     cache_x = x[:, :, -CACHE_T:, :, :].clone()
     if cache_x.shape[2] < CACHE_T and payload is not None:
@@ -536,8 +557,11 @@ def _run_norm_act_cached_conv(
                 )
                 if pair is not None:
                     assembled, cache_list[index] = pair
-                    out = _conv_with_spatial_padding(conv, assembled, None if return_bias else conv.bias, verdicts, key)
-                    return (out, _deferred_conv_bias(conv, out)) if return_bias else out
+                    fold_bias = return_bias and _may_defer_conv_bias(norm, x)
+                    out = _conv_with_spatial_padding(conv, assembled, None if fold_bias else conv.bias, verdicts, key)
+                    if not return_bias:
+                        return out
+                    return out, _deferred_conv_bias(conv, out) if fold_bias else None
 
     x = _norm_act(norm, act, x, pending_bias=pending_bias)
     if after_norm is not None:
@@ -743,6 +767,7 @@ def resample_forward(
         and _is_upsample_conv_pair(self.resample)
         and not _has_forward_hooks(self.resample, self.resample[1])
         and _kernels_allowed(x)
+        and _may_defer_conv_bias(self, x)
     ):
         upsample, conv = self.resample[0], self.resample[1]
         x = F.conv2d(upsample(x), conv.weight, None, conv.stride, conv.padding, conv.dilation, conv.groups)
@@ -807,6 +832,7 @@ def residual_block_forward(
         and not any(shortcut._padding)
         and not _has_forward_hooks(shortcut)
         and _kernels_allowed(x)
+        and _may_defer_conv_bias(shortcut, x)
     ):
         residual = _conv_without_bias(shortcut, x)
         residual_bias = _deferred_conv_bias(shortcut, residual)

@@ -23,6 +23,7 @@ from vllm_omni.diffusion.attention.backends.abstract import (
     PackedPaddingMetadata,
     VideoTokenLayout,
 )
+from vllm_omni.diffusion.attention.backends.flash_attn import FlashAttentionBackend
 from vllm_omni.diffusion.attention.backends.vdnh3_attn import VDNLayout
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
@@ -42,6 +43,8 @@ from .vdnh3 import VDNConfig, VDNH3HybridAttention
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+
+    from .reference_kv_cache import MiniMaxH3ReferenceKVTier2State
 
 _BF16_DTYPE = torch.bfloat16
 _FP32_DTYPE = torch.float32
@@ -113,6 +116,7 @@ class MiniMaxH3DiTArchConfig:
     norm_eps: float = 1e-5
     qk_norm_eps: float = 1e-5
     final_norm_eps: float = 1e-5
+    pdd_steps: int | None = None
 
     @classmethod
     def from_mapping(cls, config: Mapping[str, Any]) -> MiniMaxH3DiTArchConfig:
@@ -148,6 +152,9 @@ def _norm(size: int, *, eps: float, dtype: torch.dtype = _BF16_DTYPE) -> RMSNorm
 class MiniMaxH3Attention(nn.Module):
     # Full sparse checkpoints pin a ratio; legacy adapters use backend top-k.
     vsa_sparsity: float | None = None
+    vsa_tile_size: int = 64
+    vsa_ref_policy: str | None = None
+    vsa_ref_keep_rate: float | None = None
 
     def __init__(
         self,
@@ -235,7 +242,8 @@ class MiniMaxH3Attention(nn.Module):
             quant_config=self._gate_quant_config,
             prefix=self._gate_prefix,
         )
-        nn.init.zeros_(self.to_gate_compress.weight)
+        if hasattr(self.to_gate_compress, "weight"):
+            nn.init.zeros_(self.to_gate_compress.weight)
 
     def enable_vdn(self, config: VDNConfig) -> None:
         """Attach the learned half of VDN-H3 hybrid attention (see ``vdnh3.py``)."""
@@ -278,35 +286,44 @@ class MiniMaxH3Attention(nn.Module):
         video_layout: VideoTokenLayout | None = None,
         vsa_prefix_segments: tuple[int, ...] = (),
         gate_compress: torch.Tensor | None = None,
+        reference_kv_state: MiniMaxH3ReferenceKVTier2State | None = None,
+        reference_kv_layer_index: int | None = None,
+        reference_kv_compact: bool = False,
         vdn_window: VDNLayout | None = None,
     ) -> torch.Tensor:
         """Run packed attention as a small eager island.
 
-        The scalar packed-layout metadata and backend-specific attention
-        kernels are intentionally opaque to Dynamo. Keeping this boundary
-        narrow lets regional compile fuse projections, norms, RoPE, and the
-        surrounding DiT block without repeated graph breaks.
+        On a compact reuse step Q contains target rows only. Tier2 captures
+        reference K/V after Ulysses has exchanged sequence rows for head shards,
+        then prepends the balanced cached head shard as a K/V-only prefix. This
+        avoids both rebuilding reference QKV and redistributing cached K/V.
         """
-        # max_seqlen is already the longest packed document length. Do not read
-        # the CUDA cu_seqlens scalars here: this function runs once per layer
-        # and .item() would serialize every attention launch. ``num_requests``
-        # is carried as a Python int for the same reason.
         if not 0 < max_seqlen <= packed_total:
             raise ValueError(
                 f"max_seqlen must be within the packed sequence, got {max_seqlen} for length {packed_total}"
             )
+        if reference_kv_compact and num_requests != 1:
+            raise ValueError("compacted reference KV currently supports one request")
+
+        reference_rows = 0
+        if reference_kv_state is not None:
+            if reference_kv_layer_index is None:
+                raise RuntimeError("reference-KV cache requires a main-DiT layer index")
+            if reference_kv_compact:
+                reference_rows = reference_kv_state.global_reference_rows
+
+        kv_total = packed_total + reference_rows
+        kv_max_seqlen = max_seqlen + reference_rows
+        if reference_rows:
+            kv_cu_seqlens = cu_seqlens.clone()
+            kv_cu_seqlens[1:] += reference_rows
+        else:
+            kv_cu_seqlens = cu_seqlens
+
         attn_mask = None
         mask_free_packed_padding = False
         use_ring = _ring_sequence_parallel_is_active(self.attention)
         if num_requests > 1:
-            # A step-mode batch packs one document per request, so its valid
-            # rows are block-diagonal rather than a prefix: neither a KV prefix
-            # length nor a 1-D key mask can describe them. Such a layout is
-            # only correct on a backend that actually attends by cu_seqlens as
-            # a block-diagonal plan. Check the capability (not the backend
-            # name): FLASH_ATTN's NPU/XPU variants would otherwise silently
-            # fall back to a padding-mask rebuild that spans the whole packed
-            # row and attend across request boundaries.
             if not _attention_isolates_packed_requests(self.attention):
                 backend_name = self.attention.attn_backend.get_name()
                 raise ValueError(
@@ -315,66 +332,73 @@ class MiniMaxH3Attention(nn.Module):
                     "does not isolate multi-document packed cu_seqlens. Run one request "
                     "per forward on this backend."
                 )
-            used = packed_total
+            used_q = packed_total
+            used_kv = kv_total
         else:
-            used = min(max_seqlen, packed_total)
-            # Ring attention can dispatch to a different implementation from the
-            # configured backend, so the no-mask fast paths are local-only.
-            # supports_prefix_kv_slicing: backend slices K/V itself (cuDNN).
-            # supports_packed_mask_free: backend consumes the packed metadata
-            # without ever reading attn_mask (CUDA packed varlen, NPU
-            # npu_attn_varlen opt-in with its own fallback rebuild).
-            mask_free_packed_padding = not use_ring and self.attention.attn_backend.supports_packed_mask_free()
+            used_q = min(max_seqlen, packed_total)
+            used_kv = min(kv_max_seqlen, kv_total)
+            mask_free_packed_padding = not use_ring and (
+                self.attention.attn_backend.supports_packed_mask_free()
+                or (
+                    reference_kv_compact
+                    and self.attention.attn_backend.get_name() == "RAINFUSION_ATTN"
+                    and FlashAttentionBackend.supports_packed_mask_free()
+                )
+            )
             no_mask = not use_ring and (
                 self.attention.attn_backend.supports_prefix_kv_slicing or mask_free_packed_padding
             )
             # Hybrid Ulysses reshards Q to one ring partition before the ring
-            # kernel runs, so a global [packed_total] mask cannot pass its
-            # query-length check. Ring consumes valid_kv_length directly and
-            # trims the circulated K/V blocks instead.
-            if used < packed_total and not no_mask and not use_ring:
-                attn_mask = torch.arange(packed_total, device=q.device)[None] < used
+            # kernel runs, so a global key mask cannot pass its query-length
+            # check. Ring consumes valid_kv_length directly.
+            if used_kv < kv_total and not no_mask and not use_ring:
+                attn_mask = torch.arange(kv_total, device=q.device)[None] < used_kv
+
+        extra: dict[str, Any] = {
+            "cu_seqlens_q": cu_seqlens,
+            "cu_seqlens_k": kv_cu_seqlens,
+            "max_seqlen_q": max_seqlen,
+            "max_seqlen_k": kv_max_seqlen,
+            "valid_kv_length": used_kv,
+            "npu_attn_varlen": not use_ring,
+            "laser_input_scale": MINIMAX_H3_LASER_INPUT_SCALE,
+            **({"vsa_h3_sparsity": self.vsa_sparsity} if self.vsa_sparsity is not None else {}),
+            "vsa_h3_tile_size": self.vsa_tile_size,
+            "vsa_h3_ref_policy": self.vsa_ref_policy,
+            "vsa_h3_ref_keep_rate": self.vsa_ref_keep_rate,
+        }
+        if gate_compress is not None:
+            extra["gate_compress"] = gate_compress.unsqueeze(0)
+            if video_layout is not None and video_layout.video_spans:
+                extra["vsa_h3_prefix_segments"] = vsa_prefix_segments
+        if vdn_window is not None:
+            extra["vdn_window"] = vdn_window
+        if reference_kv_compact:
+            extra["minimax_h3_compact_reference_rows"] = reference_rows
+        if reference_kv_state is not None:
+            extra["minimax_h3_reference_kv_post_parallel"] = (
+                reference_kv_state,
+                reference_kv_layer_index,
+                reference_kv_compact,
+            )
+            if reference_kv_compact:
+                kv_video_layout = getattr(reference_kv_state, "_reference_kv_video_layout", None)
+                if kv_video_layout is not None:
+                    extra["minimax_h3_reference_kv_video_layout"] = kv_video_layout
+
         metadata = AttentionMetadata(
             attn_mask=attn_mask,
             packed_padding=(
                 PackedPaddingMetadata(
-                    q_length=used,
-                    kv_length=used,
+                    q_length=used_q,
+                    kv_length=used_kv,
                     cu_seqlens_q=cu_seqlens[:2],
-                    cu_seqlens_k=cu_seqlens[:2],
+                    cu_seqlens_k=kv_cu_seqlens[:2],
                 )
                 if mask_free_packed_padding
                 else None
             ),
-            extra={
-                "cu_seqlens_q": cu_seqlens,
-                "cu_seqlens_k": cu_seqlens,
-                "max_seqlen_q": max_seqlen,
-                "max_seqlen_k": max_seqlen,
-                "valid_kv_length": used,
-                # Opt the NPU flash backend into the packed varlen path so the
-                # quadratic full_qk mask is never materialized. Ring attention
-                # is excluded: it keeps the aligned padding rows for its
-                # fixed-size P2P buffers and still needs the mask.
-                "npu_attn_varlen": not use_ring,
-                # fp16-range protection for the ascend_laser_attention kernel
-                # (see MINIMAX_H3_LASER_INPUT_SCALE). Ignored by every other
-                # backend/path.
-                "laser_input_scale": MINIMAX_H3_LASER_INPUT_SCALE,
-                **({"vsa_h3_sparsity": self.vsa_sparsity} if self.vsa_sparsity is not None else {}),
-                # Present only for a VSA artifact; the VSA backend reads it as
-                # the learned compression gate and every other backend ignores it.
-                **({"gate_compress": gate_compress.unsqueeze(0)} if gate_compress is not None else {}),
-                # FastH3 uses segment-pure prefix chunks. The target video and
-                # its true 3-D shape remain in the shared typed video layout.
-                **(
-                    {"vsa_h3_prefix_segments": vsa_prefix_segments}
-                    if gate_compress is not None and video_layout is not None and video_layout.video_spans
-                    else {}
-                ),
-                # The VDNH3_ATTN frame window; every other backend ignores it.
-                **({"vdn_window": vdn_window} if vdn_window is not None else {}),
-            },
+            extra=extra,
             video_layout=video_layout,
         )
         return self.attention(
@@ -384,31 +408,10 @@ class MiniMaxH3Attention(nn.Module):
             metadata,
         ).squeeze(0)
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        *,
-        rope_table: torch.Tensor | None,
-        cu_seqlens: torch.Tensor,
-        max_seqlen: int,
-        packed_total: int | None = None,
-        num_requests: int = 1,
-        sp_seq_lens: list[int] | None = None,
-        video_layout: VideoTokenLayout | None = None,
-        vsa_prefix_segments: tuple[int, ...] = (),
-        vdn_window: VDNLayout | None = None,
-    ) -> torch.Tensor:
-        """x: [T, hidden] packed thd rows -> [T, hidden].
-
-        Operation order: fused qkv projection -> per-head q/k RMSNorm -> RoPE
-        on q/k -> variable-length non-causal flash attention -> output projection.
-
-        With Ulysses sequence parallelism, x holds this rank's row shard;
-        qkv/norm/RoPE run locally, an all-to-all trades sequence for heads.
-        Each rank attends the full sequence with heads/world_size local heads,
-        so cu_seqlens retains global packed-document semantics. The inverse
-        all-to-all restores the row shard before the output projection.
-        """
+    def _project_qkv(
+        self, x: torch.Tensor, rope_table: torch.Tensor | None, vdn_window: VDNLayout | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Project/normalize/rotate QKV, retaining raw Q/K for the VDN branch."""
         total = x.shape[0]
         qkv, _ = self.qkv_proj(x)
         q_size = self.num_heads * self.head_dim
@@ -433,6 +436,46 @@ class MiniMaxH3Attention(nn.Module):
                 rope_table,
                 self.q_norm.variance_epsilon,
             )
+        return q, k, v, q_raw, k_raw
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        *,
+        rope_table: torch.Tensor | None,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
+        packed_total: int | None = None,
+        num_requests: int = 1,
+        sp_seq_lens: list[int] | None = None,
+        video_layout: VideoTokenLayout | None = None,
+        vsa_prefix_segments: tuple[int, ...] = (),
+        reference_kv_state: MiniMaxH3ReferenceKVTier2State | None = None,
+        reference_kv_layer_index: int | None = None,
+        reference_kv_compact: bool = False,
+        vdn_window: VDNLayout | None = None,
+    ) -> torch.Tensor:
+        """x: [T, hidden] packed thd rows -> [T, hidden].
+
+        Operation order: fused qkv projection -> per-head q/k RMSNorm -> RoPE
+        on q/k -> variable-length non-causal flash attention -> output projection.
+
+        With Ulysses sequence parallelism, x holds this rank's row shard;
+        qkv/norm/RoPE run locally, an all-to-all trades sequence for heads.
+        Each rank attends the full sequence with heads/world_size local heads,
+        so cu_seqlens retains global packed-document semantics. The inverse
+        all-to-all restores the row shard before the output projection.
+        """
+        total = x.shape[0]
+        if reference_kv_compact:
+            if reference_kv_state is None or reference_kv_layer_index is None:
+                raise RuntimeError("compacted reference KV requires state and layer index")
+            reference_kv_state.record_projection_skip(
+                reference_kv_layer_index,
+                reference_kv_state.local_sequence_rows,
+                projected_rows=total,
+            )
+        q, k, v, q_raw, k_raw = self._project_qkv(x, rope_table, vdn_window)
 
         # The gate is projected from the same local rows as Q. Pure Ulysses
         # reshards it alongside Q/K/V in UlyssesParallelAttention so each VSA
@@ -460,6 +503,9 @@ class MiniMaxH3Attention(nn.Module):
             video_layout=video_layout,
             vsa_prefix_segments=vsa_prefix_segments,
             gate_compress=gate_compress,
+            reference_kv_state=reference_kv_state,
+            reference_kv_layer_index=reference_kv_layer_index,
+            reference_kv_compact=reference_kv_compact,
             vdn_window=vdn_window,
         )
         if self.vdn is not None:
@@ -645,14 +691,20 @@ class MiniMaxH3DiTBlock(nn.Module):
         quant_config: QuantizationConfig | None,
         *,
         prefix: str,
+        layer_index: int,
         adaln_cache: MiniMaxH3RuntimeAdalnCache | None = None,
+        attention_cls: type[MiniMaxH3Attention] = MiniMaxH3Attention,
     ) -> None:
         super().__init__()
+        self.layer_index = int(layer_index)
         self.norm1 = _norm(arch.hidden_size, eps=arch.norm_eps)
         self.norm2 = _norm(arch.hidden_size, eps=arch.norm_eps)
         # The prefix also carries the block index that block-sparse attention
         # backends match against their skip_layers selector.
-        self.attn = MiniMaxH3Attention(
+        # ``attention_cls`` lets a derived model (for example the TaoMate-H3
+        # streaming variant) swap in a subclass of ``MiniMaxH3Attention`` that
+        # keeps the checkpoint layout but changes the attention kernel path.
+        self.attn = attention_cls(
             arch,
             quant_config,
             prefix=f"{prefix}.attn",
@@ -686,6 +738,8 @@ class MiniMaxH3DiTBlock(nn.Module):
         sp_seq_lens: list[int] | None = None,
         video_layout: VideoTokenLayout | None = None,
         vsa_prefix_segments: tuple[int, ...] = (),
+        reference_kv_state: MiniMaxH3ReferenceKVTier2State | None = None,
+        reference_kv_compact: bool = False,
         vdn_window: VDNLayout | None = None,
     ) -> torch.Tensor:
         """x: [T, H]; t_emb: [M, t_dim]; combined_indices: [T]
@@ -723,6 +777,9 @@ class MiniMaxH3DiTBlock(nn.Module):
             sp_seq_lens=sp_seq_lens,
             video_layout=video_layout,
             vsa_prefix_segments=vsa_prefix_segments,
+            reference_kv_state=reference_kv_state,
+            reference_kv_layer_index=self.layer_index,
+            reference_kv_compact=reference_kv_compact,
             vdn_window=vdn_window,
         )
         x, h = indexed_gate_rms_norm_scale_shift(

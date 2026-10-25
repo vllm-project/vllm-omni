@@ -43,7 +43,9 @@ def test_mrv2_duplex_overlapping_turns(omni_server, tmp_path: Path, sessions: in
     )
     args.sessions = sessions
     args.turns = 2
-    args.turn_duration_ms = [args.first_turn_ms] * args.turns
+    # Keep the complete response-required utterance. The 1.4 s active slice
+    # can end mid-utterance, so the native policy may legitimately keep listening.
+    args.turn_duration_ms = [0] * args.turns
     args.synchronized_start = True
     args.disconnect_session_index = None
     args.takeover_session_index = None

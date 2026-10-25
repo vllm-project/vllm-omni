@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import threading
+from contextlib import nullcontext
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, cast
 
@@ -29,6 +30,9 @@ from vllm.v1.worker.gpu.model_runner import (
     IntermediateTensors,
     build_slot_mappings_by_layer,
 )
+from vllm.v1.worker.gpu.sample.bad_words import BadWordsState
+from vllm.v1.worker.gpu.sample.logit_bias import LogitBiasState
+from vllm.v1.worker.gpu.sample.penalties import PenaltiesState
 from vllm.v1.worker.gpu.sample.sampler import Sampler
 
 from vllm_omni.core.sched.omni_scheduling_coordinator import (
@@ -37,12 +41,14 @@ from vllm_omni.core.sched.omni_scheduling_coordinator import (
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.worker.runner_assisted_metadata import RunnerAssistedFullAttentionMetadataRequest
 from vllm_omni.worker.sampling_utils import sanitize_sampling_params_min_tokens_stop_ids
+from vllm_omni.worker_v2 import staged_writes
 from vllm_omni.worker_v2.model_states import init_omni_model_state
 from vllm_omni.worker_v2.model_states.intermediate_buffer import (
     _resolve_additional_information,
 )
 from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
 from vllm_omni.worker_v2.omni_data_plane import OmniRunnerDataPlane
+from vllm_omni.worker_v2.warmup import is_warmup_request
 
 if TYPE_CHECKING:
     from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
@@ -202,7 +208,11 @@ class OmniGPUModelRunner(GPUModelRunner):
         return input_ids, inputs_embeds, ec_connector_output
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
-        super().__init__(*args, **kwargs)
+        # Before the runner builds its staged-write state tensors.
+        staged_writes.install()
+        self._staged_writes = staged_writes.StagedWrites()
+        with self._staged_writes.activate():
+            super().__init__(*args, **kwargs)
         self._validate_parallel_support()
         self._omni_data_plane = (
             OmniRunnerDataPlane(self.vllm_config, self.model_config)
@@ -226,15 +236,17 @@ class OmniGPUModelRunner(GPUModelRunner):
                 "use model_runner: v1 when prefill_context_parallel_size > 1"
             )
 
+    @staged_writes.runner_context
     def add_requests(self, scheduler_output: SchedulerOutput) -> None:
         # The upstream Sampler stages static parameters only in add_request.
         # With no new requests, its UVA snapshots remain valid and immutable.
         # Keep the upstream path for custom/speculative samplers, whose staged
         # writes may have a different lifecycle.
         sampler = getattr(self, "sampler", None)
-        if not scheduler_output.scheduled_new_reqs and (
-            type(sampler) is Sampler or getattr(sampler, "omni_static_staged_writes", False)
-        ):
+        static_staged_writes = (type(sampler) is Sampler or getattr(sampler, "omni_static_staged_writes", False)) and [
+            type(p) for p in getattr(sampler, "logits_processors", ())
+        ] == [LogitBiasState, PenaltiesState, BadWordsState]
+        if not scheduler_output.scheduled_new_reqs and static_staged_writes:
             return
         logits_processor = getattr(self.model, "logits_processor", None)
         logits_vocab = getattr(logits_processor, "vocab_size", None)
@@ -249,31 +261,37 @@ class OmniGPUModelRunner(GPUModelRunner):
                         sampling_params,
                         logits_vocab,
                     )
-        super().add_requests(scheduler_output)
+        # Custom processors may read request tokens in apply_staged_writes;
+        # preserve upstream's request-state flush before their callback.
+        with self._staged_writes.deferred() if static_staged_writes else nullcontext():
+            super().add_requests(scheduler_output)
 
     def shutdown(self) -> None:
-        sender = getattr(getattr(self, "model_state", None), "_first_audio_sender", None)
-        if sender is not None:
-            sender.close()
         # Every owner must release its resources even if an earlier drain fails.
         try:
-            worker = getattr(self, "_native_output_materializer", None)
-            if worker is not None:
-                worker.close()
+            state = getattr(self, "model_state", None)
+            close = getattr(state, "close_first_audio_sender", None)
+            if close is not None:
+                close()
         finally:
-            self._native_output_materializer = None
             try:
-                if self._omni_data_plane is not None:
-                    self._omni_data_plane.close()
+                worker = getattr(self, "_native_output_materializer", None)
+                if worker is not None:
+                    worker.close()
             finally:
-                super().shutdown()
+                self._native_output_materializer = None
+                try:
+                    if self._omni_data_plane is not None:
+                        self._omni_data_plane.close()
+                finally:
+                    super().shutdown()
 
     def _prepare_native_data_plane(self, scheduler_output: SchedulerOutput) -> None:
         plane = getattr(self, "_omni_data_plane", None)
         if plane is None:
             return
         for request_data in getattr(scheduler_output, "scheduled_new_reqs", []):
-            if str(getattr(request_data, "req_id", "")).startswith("_warmup_"):
+            if is_warmup_request(request_data.req_id):
                 continue
             plane.register_request(request_data)
         plane.register_receivers(list(getattr(scheduler_output, "pending_input_registrations", [])))
@@ -411,6 +429,7 @@ class OmniGPUModelRunner(GPUModelRunner):
         }
         logger.info("Excluded FULL CUDA graph capture for Omni model. PIECEWISE graphs will still be captured.")
 
+    @staged_writes.runner_context
     def capture_model(self, *, profile_only: bool = False) -> int:
         """Handle CUDA graph capture for Omni models.
 
@@ -500,6 +519,30 @@ class OmniGPUModelRunner(GPUModelRunner):
             0,
         )
 
+    def _make_dummy_input_batch(
+        self,
+        num_reqs: int,
+        num_tokens: int,
+        *,
+        max_query_len: int | None,
+        is_padding: bool,
+    ) -> Any:
+        from vllm.v1.worker.gpu.input_batch import InputBatch
+
+        return InputBatch.make_dummy(
+            num_reqs,
+            num_tokens,
+            self.input_buffers,
+            max_query_len=max_query_len,
+            is_padding=is_padding,
+        )
+
+    def _forward_context(self, attn_metadata: Any, vllm_config: Any, **kwargs: Any):
+        """Forward-context scope. NPU replaces this with the Ascend context."""
+        kwargs.pop("in_profile_run", None)
+        kwargs.pop("num_actual_tokens", None)
+        return set_forward_context(attn_metadata, vllm_config, **kwargs)
+
     def _dispatch_batch_descriptor(
         self,
         *,
@@ -523,6 +566,7 @@ class OmniGPUModelRunner(GPUModelRunner):
         )
 
     @torch.inference_mode()
+    @staged_writes.runner_context
     def execute_model(
         self,
         scheduler_output: SchedulerOutput,
@@ -647,12 +691,9 @@ class OmniGPUModelRunner(GPUModelRunner):
                 )
                 self._set_active_loras(*lora_inputs)
         else:
-            from vllm.v1.worker.gpu.input_batch import InputBatch
-
-            input_batch = InputBatch.make_dummy(
+            input_batch = self._make_dummy_input_batch(
                 batch_desc.num_reqs or num_reqs,
                 batch_desc.num_tokens,
-                self.input_buffers,
                 max_query_len=batch_desc.max_query_len,
                 is_padding=not is_profile,
             )
@@ -681,7 +722,7 @@ class OmniGPUModelRunner(GPUModelRunner):
         # metadata even when the v2 runner itself is executing eagerly. Only
         # pad request/token metadata to the model-owned unified graph bucket.
         runner_assisted_full_attn = runner_assisted_request is not None
-        runner_assisted_capture = runner_assisted_full_attn and runner_assisted_request.for_cudagraph_capture
+        runner_assisted_capture = runner_assisted_request is not None and runner_assisted_request.for_cudagraph_capture
         if not (dummy_run and skip_attn_for_dummy_run):
             assert slot_mappings is not None
             slot_mappings_by_layer = build_slot_mappings_by_layer(slot_mappings, self.kv_cache_config)
@@ -747,10 +788,12 @@ class OmniGPUModelRunner(GPUModelRunner):
                     self.model.set_runner_assisted_full_attention_metadata_context(
                         enabled=True, num_reqs=input_batch.num_reqs
                     )
-                with set_forward_context(
+                with self._forward_context(
                     attn_metadata,
                     self.vllm_config,
                     num_tokens=input_batch.num_tokens_after_padding,
+                    num_actual_tokens=input_batch.num_tokens,
+                    in_profile_run=is_profile,
                     cudagraph_runtime_mode=CUDAGraphMode.FULL if runner_assisted_full_attn else batch_desc.cg_mode,
                     num_tokens_across_dp=dp_sync.num_tokens_across_dp if dp_sync is not None else None,
                     batch_descriptor=batch_descriptor,
@@ -793,10 +836,11 @@ class OmniGPUModelRunner(GPUModelRunner):
             slot_mappings_by_layer=slot_mappings_by_layer,
             hidden_states=hidden_states,
             aux_hidden_states=None,
+            dp_sync_state=dp_sync,
             finished_req_ids=scheduler_output.finished_req_ids,
-            dp_sync=dp_sync,
             ec_connector_output=ec_connector_output,
             cudagraph_stats=None,
+            num_spec_tokens_to_schedule=scheduler_output.num_spec_tokens_to_schedule,
         )
 
         assert isinstance(hidden_states, torch.Tensor)
