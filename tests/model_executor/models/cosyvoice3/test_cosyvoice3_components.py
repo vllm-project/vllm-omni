@@ -16,6 +16,7 @@ from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.hifigan import (
     CausalHiFTGenerator,
     HiFTGenerator,
 )
+from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3_code2wav import CosyVoice3Code2Wav
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -762,3 +763,111 @@ def test_code2wav_streaming_batch_pads_codec_tokens_and_preserves_lengths():
     assert torch.equal(call["token_lens"], torch.tensor([3, 5], dtype=torch.int32))
     assert results[0][0].shape[-1] == 4
     assert results[1][0].shape[-1] == 8
+
+
+@pytest.fixture
+def bounded_flow(monkeypatch):
+    """Keep the production flow dispatch/cropping, exposing mel at the vocoder boundary."""
+
+    class TokenMelFlow(nn.Module):
+        token_mel_ratio = 2
+        pre_lookahead_len = 1
+
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.ones(1))
+            self.calls = []
+
+        def inference(self, **kwargs):
+            self.calls.append(kwargs)
+            token = kwargs["token"]
+            if not kwargs["finalize"]:
+                token = token[:, : -self.pre_lookahead_len]
+            mel = token.float().repeat_interleave(self.token_mel_ratio, dim=1)
+            return mel[:, None, :].expand(-1, 80, -1), None
+
+    monkeypatch.setenv("COSYVOICE3_PACKED_STREAMING", "0")
+    model = object.__new__(CosyVoice3Code2Wav)
+    nn.Module.__init__(model)
+    model.flow_left_context_tokens = 3
+    model.flow_model = TokenMelFlow()
+    monkeypatch.setattr(
+        model, "_stream_hift_from_feat", lambda mel, cache_state, finalize: (mel, None if finalize else {})
+    )
+    return model
+
+
+def _flow_context_item(tokens, *, cache=None, offset=0, finalize=False):
+    return dict(
+        token=torch.tensor([tokens], dtype=torch.int32),
+        prompt_token=torch.tensor([[1, 2]], dtype=torch.int32),
+        prompt_feat=torch.full((1, 4, 80), -1.0),
+        embedding=torch.ones(1, 192),
+        cache_state=cache,
+        token_offset_tokens=offset,
+        finalize=finalize,
+    )
+
+
+def test_bounded_flow_conditions_on_previous_mel_and_emits_only_suffix(bounded_flow):
+    model = bounded_flow
+    first, cache = model.forward_streaming(**_flow_context_item([10, 11, 12, 99]))
+    assert first[0, 0].tolist() == [10, 10, 11, 11, 12, 12]
+    second, next_cache = model.forward_streaming(**_flow_context_item([10, 11, 12, 13, 14, 98], cache=cache, offset=3))
+    call = model.flow_model.calls[-1]
+    assert call["token"].tolist() == [[13, 14, 98]]
+    assert call["prompt_token"].tolist() == [[1, 2, 10, 11, 12]]
+    torch.testing.assert_close(call["prompt_feat"][:, :4], torch.full((1, 4, 80), -1.0))
+    torch.testing.assert_close(call["prompt_feat"][:, 4:], first.transpose(1, 2))
+    assert second[0, 0].tolist() == [13, 13, 14, 14]
+    assert next_cache["flow_mel"][0, 0].tolist() == [12, 12, 13, 13, 14, 14]
+    # Persist owned storage, exclude lookahead, and leave the prior request state intact.
+    with torch.inference_mode():
+        second.fill_(0)
+    assert next_cache["flow_mel"][0, 0].tolist() == [12, 12, 13, 13, 14, 14]
+    assert cache["flow_mel"][0, 0].tolist() == [10, 10, 11, 11, 12, 12]
+
+
+def test_bounded_flow_short_history_and_finalization(bounded_flow):
+    model = bounded_flow
+    _, cache = model.forward_streaming(**_flow_context_item([10, 11, 99]))
+    final, state = model.forward_streaming(**_flow_context_item([10, 11, 12], cache=cache, offset=2, finalize=True))
+    assert final[0, 0].tolist() == [12, 12]
+    assert state is None
+    assert model.flow_model.calls[-1]["prompt_feat"][0, 4:, 0].tolist() == [10, 10, 11, 11]
+
+
+def test_bounded_flow_batch_preserves_request_history_and_order(bounded_flow):
+    model = bounded_flow
+    _, a = model.forward_streaming(**_flow_context_item([10, 11, 12, 99]))
+    _, b = model.forward_streaming(**_flow_context_item([20, 21, 22, 99]))
+    items = [
+        _flow_context_item([10, 11, 12, 13, 14, 99], cache=a, offset=3),
+        _flow_context_item([20, 21, 22, 23, 99], cache=b, offset=3),
+    ]
+    expected = [model.forward_streaming(**item) for item in items]
+    for ordered, references in [(items, expected), (items[::-1], expected[::-1])]:
+        actual = model.forward_streaming_batch(ordered)
+        call = model.flow_model.calls[-1]
+        assert call["token"].shape[0] == 2  # Exercise a real multi-row flow dispatch.
+        for (audio, state), (ref_audio, ref_state), item in zip(actual, references, ordered):
+            torch.testing.assert_close(audio, ref_audio)
+            torch.testing.assert_close(state["flow_mel"], ref_state["flow_mel"])
+        assert items[0]["token_offset_tokens"] == 3  # Caller payloads remain unchanged.
+
+
+@pytest.mark.parametrize("offset", [1, 4])
+def test_bounded_flow_rejects_missing_or_invalid_context(bounded_flow, offset):
+    with pytest.raises(ValueError, match="Bounded flow left context"):
+        bounded_flow.forward_streaming(**_flow_context_item([10, 11, 12, 99], offset=offset))
+
+
+@pytest.mark.parametrize("window", [0, -1])
+def test_unbounded_flow_keeps_prefix_regeneration(bounded_flow, window):
+    model = bounded_flow
+    model.flow_left_context_tokens = window
+    audio, state = model.forward_streaming(**_flow_context_item([10, 11, 12, 99], offset=2))
+    assert model.flow_model.calls[-1]["token"].tolist() == [[10, 11, 12, 99]]
+    assert model.flow_model.calls[-1]["prompt_feat"].shape[1] == 4
+    assert audio[0, 0].tolist() == [12, 12]
+    assert "flow_mel" not in state

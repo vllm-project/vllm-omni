@@ -954,6 +954,16 @@ Drama 3 uses `ref_audio` and `ref_text` for voice cloning, like Fish Speech S2 P
 | ------- | ------------- |
 | `FunAudioLLM/Fun-CosyVoice3-0.5B-2512` | Voice cloning from `ref_audio` + `ref_text`. No built-in voice presets — upload a voice or pass `ref_audio`/`ref_text` per request. |
 
+The default streaming deployment bounds flow left context with the connector's
+`codec_left_context_frames` (25 tokens, about 1 s). Stage 1 pairs these historical
+tokens with request-owned, previously decoded mel as additional prompt
+conditioning, then passes only the new mel suffix to HiFT. The same conditioning
+applies when `COSYVOICE3_BATCH_FLOW=1`; requests are grouped by their augmented
+prompt shapes. This drops older context and remains a quality/performance trade-off.
+Set `codec_left_context_frames: 0` to restore unbounded prefix regeneration.
+Packed streaming requires an unbounded window and rejects a positive value,
+including the default when the connector's `extra` is empty.
+
 ### Gepard-1.0
 
 | Model | Description |
