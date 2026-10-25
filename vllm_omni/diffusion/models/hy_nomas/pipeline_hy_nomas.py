@@ -20,6 +20,8 @@ from vllm_omni.diffusion.media import (
     VideoTensorSpec,
     VideoValueRange,
 )
+from vllm_omni.diffusion.models.hy_nomas.configuration_hy_nomas import DECODER_FILE, DIT_FILE, REQUIRED_FILES
+from vllm_omni.diffusion.models.hy_nomas.parallel import initialize_reference_parallelism
 from vllm_omni.diffusion.models.hy_nomas.request import normalize_request
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.offloader.config import (
@@ -30,11 +32,11 @@ from vllm_omni.diffusion.offloader.config import (
 )
 from vllm_omni.diffusion.offloader.sequential_backend import apply_sequential_offload, remove_sequential_offload
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+from vllm_omni.errors import OmniClientError
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
-from vllm_omni.model_extras.hy_nomas import HY_NOMAS_DECODER_FILE, HY_NOMAS_DIT_FILE
 
 
-def build_reference_config(model_root: Path, text_encoder: str) -> DictConfig:
+def build_reference_config(model_root: Path, text_encoder: str, sp_size: int = 1) -> DictConfig:
     from configs import config as reference_config
     from omegaconf import OmegaConf
 
@@ -45,12 +47,12 @@ def build_reference_config(model_root: Path, text_encoder: str) -> DictConfig:
     del base["defaults"]
     del inference["defaults"]
     config = OmegaConf.merge(base, inference)
-    config.dit_weight = str(model_root / HY_NOMAS_DIT_FILE)
-    config.model.vae.checkpoint = str(model_root / HY_NOMAS_DECODER_FILE)
+    config.dit_weight = str(model_root / DIT_FILE)
+    config.model.vae.checkpoint = str(model_root / DECODER_FILE)
     config.model.vae.parallel_mode = "none"
     config.model.text_encoder.model_name = text_encoder
     config.model.dit.seg_ar_attention_backend = "flex"
-    config.parallelism.sp_size = 1
+    config.parallelism.sp_size = sp_size
     config.parallelism.shard_text_encoder = False
     config.inference.save_latents = False
     config.inference.save_prompt_txt = False
@@ -61,8 +63,15 @@ def build_reference_config(model_root: Path, text_encoder: str) -> DictConfig:
 
 
 def validate_config(config: OmniDiffusionConfig) -> None:
-    if config.parallel_config.world_size != 1 or config.parallel_config.use_hsdp:
-        raise ValueError("Hy-Nomas currently supports a single CUDA device.")
+    parallel = config.parallel_config
+    if parallel.world_size != parallel.ulysses_degree or parallel.use_hsdp:
+        raise ValueError("Hy-Nomas only supports Ulysses SP, without TP, PP, DP, CFG parallelism or HSDP.")
+    if 16 % parallel.ulysses_degree:
+        raise ValueError("Hy-Nomas ulysses_degree must divide its 16 attention heads.")
+    if parallel.ulysses_mode != "strict" or parallel.ulysses_a2a_permute:
+        raise ValueError("Hy-Nomas requires strict Ulysses SP with the reference all-to-all implementation.")
+    if parallel.vae_patch_parallel_size != 1 or parallel.text_encoder_tp_size != 1 or parallel.enable_expert_parallel:
+        raise ValueError("Hy-Nomas does not support VAE, text encoder or expert parallelism.")
     if config.dtype != torch.bfloat16:
         raise ValueError("Hy-Nomas requires dtype=bfloat16.")
     if config.cache_backend not in (None, "none"):
@@ -93,25 +102,28 @@ class HyNomasPipeline(nn.Module, SupportsComponentDiscovery):
         from vllm_omni.diffusion.models.hy_nomas.runtime import HyNomasRuntime
 
         root = Path(od_config.model)
-        required = [HY_NOMAS_DIT_FILE, HY_NOMAS_DECODER_FILE]
         if not root.is_dir():
             root = Path(
                 download_weights_from_hf_specific(
                     od_config.model,
                     cache_dir=None,
-                    allow_patterns=required,
+                    allow_patterns=list(REQUIRED_FILES),
                     revision=od_config.revision,
                     require_all=True,
                 )
             )
-        for relative in required:
+        for relative in REQUIRED_FILES:
             if not (root / relative).is_file():
                 raise FileNotFoundError(f"Missing Hy-Nomas checkpoint: {root / relative}")
         text_encoder = (od_config.custom_pipeline_args or {}).get("text_encoder", "Qwen/Qwen2.5-VL-7B-Instruct")
         if not isinstance(text_encoder, str) or not text_encoder:
             raise ValueError("Hy-Nomas text_encoder must be a nonempty model ID or local path.")
-        config = build_reference_config(root, text_encoder)
-        self.pipe = HyNomasRuntime(args=config, device=self.device, dit_model_path=config.dit_weight).eval()
+        self.sp_size = od_config.parallel_config.ulysses_degree
+        mesh = initialize_reference_parallelism(self.sp_size, self.device)
+        config = build_reference_config(root, text_encoder, self.sp_size)
+        self.pipe = HyNomasRuntime(
+            args=config, device=self.device, dit_model_path=config.dit_weight, world_mesh=mesh
+        ).eval()
 
     def enable_omni_model_cpu_offload(
         self,
@@ -177,6 +189,15 @@ class HyNomasPipeline(nn.Module, SupportsComponentDiscovery):
         if req.num_reqs != 1:
             raise ValueError("Hy-Nomas processes one request at a time.")
         request = normalize_request(req.prompts[0], req.sampling_params)
+        if self.sp_size > 1:
+            tokens_per_frame = (request.height // self.pipe.s_ratio // self.pipe.patch_size[1]) * (
+                request.width // self.pipe.s_ratio // self.pipe.patch_size[2]
+            )
+            if tokens_per_frame % self.sp_size:
+                raise OmniClientError(
+                    f"Hy-Nomas spatial tokens per frame ({tokens_per_frame}) must be divisible by "
+                    f"ulysses_degree ({self.sp_size})."
+                )
         self._reset_cache()
         try:
             # vLLM 导入时关闭 cuDNN SDPA；此处恢复参考实现的后端集合，退出后还原。

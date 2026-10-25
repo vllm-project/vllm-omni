@@ -12,12 +12,12 @@ from vllm.utils.torch_utils import set_default_torch_dtype
 from tests.helpers.mark import hardware_marks
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
+from vllm_omni.diffusion.models.hy_nomas.configuration_hy_nomas import DECODER_FILE, DIT_FILE, MODEL_ID, REQUIRED_FILES
 from vllm_omni.diffusion.models.hy_nomas.pipeline_hy_nomas import HyNomasPipeline
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
-from vllm_omni.model_extras.hy_nomas import HY_NOMAS_DECODER_FILE, HY_NOMAS_DIT_FILE, HY_NOMAS_MODEL_ID
 
 pytestmark = [pytest.mark.local_model, pytest.mark.diffusion, *hardware_marks(res={"cuda": "H200"}, num_cards=1)]
 
@@ -28,21 +28,21 @@ def pipelines():
     from hydra import compose, initialize_config_dir
     from hymm.pipeline.causal_ar import CPTCausalInferencePipeline
 
-    root = Path(os.environ.get("HY_NOMAS_MODEL", HY_NOMAS_MODEL_ID))
+    root = Path(os.environ.get("HY_NOMAS_MODEL", MODEL_ID))
     if not root.is_dir():
         root = Path(
             download_weights_from_hf_specific(
                 str(root),
                 cache_dir=None,
-                allow_patterns=[HY_NOMAS_DIT_FILE, HY_NOMAS_DECODER_FILE],
+                allow_patterns=list(REQUIRED_FILES),
                 require_all=True,
             )
         )
     text_encoder = os.environ.get("HY_NOMAS_TEXT_ENCODER", "Qwen/Qwen2.5-VL-7B-Instruct")
     with initialize_config_dir(config_dir=str(Path(reference_config.__file__).parent), version_base="1.3"):
         config = compose(config_name="config", overrides=["+experiment=inference"])
-    config.dit_weight = str(root / HY_NOMAS_DIT_FILE)
-    config.model.vae.checkpoint = str(root / HY_NOMAS_DECODER_FILE)
+    config.dit_weight = str(root / DIT_FILE)
+    config.model.vae.checkpoint = str(root / DECODER_FILE)
     config.model.vae.parallel_mode = "none"
     config.model.text_encoder.model_name = text_encoder
     config.model.dit.seg_ar_attention_backend = "flex"

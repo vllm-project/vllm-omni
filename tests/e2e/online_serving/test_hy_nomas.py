@@ -9,12 +9,27 @@ import pytest
 from tests.helpers.mark import hardware_marks
 from tests.helpers.runtime import OmniServer, OmniServerParams, OnlineOmniClient
 
-pytestmark = [pytest.mark.local_model, pytest.mark.diffusion, *hardware_marks(res={"cuda": "H200"}, num_cards=1)]
+pytestmark = [pytest.mark.local_model, pytest.mark.diffusion]
 
 MODEL = os.environ.get("HY_NOMAS_MODEL", "tencent/Hy-Nomas")
 
 
-@pytest.mark.parametrize("omni_server", [OmniServerParams(model=MODEL, server_args=["--enforce-eager"])], indirect=True)
+@pytest.mark.parametrize(
+    "omni_server",
+    [
+        pytest.param(
+            OmniServerParams(model=MODEL, server_args=["--enforce-eager"]),
+            id="single_device",
+            marks=hardware_marks(res={"cuda": "H200"}, num_cards=1),
+        ),
+        pytest.param(
+            OmniServerParams(model=MODEL, server_args=["--enforce-eager", "--ulysses-degree", "2"]),
+            id="sp2",
+            marks=hardware_marks(res={"cuda": "H200"}, num_cards=2),
+        ),
+    ],
+    indirect=True,
+)
 @pytest.mark.parametrize(
     "prompt,extra",
     [

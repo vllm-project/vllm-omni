@@ -5,9 +5,6 @@ from collections.abc import Mapping
 
 from vllm_omni.model_extras.video_generation import VideoGenerationDefaults
 
-HY_NOMAS_MODEL_ID = "tencent/Hy-Nomas"
-HY_NOMAS_DIT_FILE = "DiT/distilled/diffusion_pytorch_model_ema_0_995.safetensors"
-HY_NOMAS_DECODER_FILE = "VAE/PixelUMM_FT/diffusion_pytorch_model.safetensors"
 HY_NOMAS_EXTRA_BODY_PARAMS = frozenset(
     {"segment_frame_boundaries", "camera_trajectory", "segment_has_camera", "flow_shift"}
 )

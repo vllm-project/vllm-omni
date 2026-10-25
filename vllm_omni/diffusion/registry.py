@@ -20,6 +20,12 @@ from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
 
+# 不带根目录配置的模型在各自目录声明 Hub ID 和本地权重特征；识别时不导入 pipeline。
+NATIVE_MODEL_CONFIGS = {
+    "HyNomasPipeline": "vllm_omni.diffusion.models.hy_nomas.configuration_hy_nomas",
+    "Magi2Pipeline": "vllm_omni.diffusion.models.magi2.configuration_magi2",
+}
+
 _NATIVE_SINGLE_FILE_MODELS = {
     "AnimaPipeline": ("AnimaModularPipeline",),
 }
@@ -550,6 +556,8 @@ def initialize_model(
     Raises:
         ValueError: If the model class is not found in the registry.
     """
+    if od_config.model_class_name is None:
+        raise ValueError("model_class_name must be resolved before initializing a diffusion model.")
     model_class = DiffusionModelRegistry._try_load_model_cls(od_config.model_class_name)
     if model_class is not None:
         _prepare_diffusion_quant_config(od_config, model_class)

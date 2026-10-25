@@ -10,7 +10,7 @@ from tests.helpers.mark import hardware_marks
 from tests.helpers.runtime import OmniRunner
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
-pytestmark = [pytest.mark.local_model, pytest.mark.diffusion, *hardware_marks(res={"cuda": "H200"}, num_cards=1)]
+pytestmark = [pytest.mark.local_model, pytest.mark.diffusion]
 
 MODEL = os.environ.get("HY_NOMAS_MODEL", "tencent/Hy-Nomas")
 
@@ -18,8 +18,30 @@ MODEL = os.environ.get("HY_NOMAS_MODEL", "tencent/Hy-Nomas")
 @pytest.mark.parametrize(
     "omni_runner",
     [
-        pytest.param((MODEL, None, {"enforce_eager": True}), id="resident"),
-        pytest.param((MODEL, None, {"enforce_eager": True, "enable_cpu_offload": True}), id="cpu_offload"),
+        pytest.param(
+            (MODEL, None, {"enforce_eager": True}),
+            id="resident",
+            marks=hardware_marks(res={"cuda": "H200"}, num_cards=1),
+        ),
+        pytest.param(
+            (MODEL, None, {"enforce_eager": True, "enable_cpu_offload": True}),
+            id="cpu_offload",
+            marks=hardware_marks(res={"cuda": "H200"}, num_cards=1),
+        ),
+        pytest.param(
+            (MODEL, None, {"enforce_eager": True, "parallel_config": {"ulysses_degree": 2}}),
+            id="sp2",
+            marks=hardware_marks(res={"cuda": "H200"}, num_cards=2),
+        ),
+        pytest.param(
+            (
+                MODEL,
+                None,
+                {"enforce_eager": True, "parallel_config": {"ulysses_degree": 2}, "enable_cpu_offload": True},
+            ),
+            id="sp2_cpu_offload",
+            marks=hardware_marks(res={"cuda": "H200"}, num_cards=2),
+        ),
     ],
     indirect=True,
 )

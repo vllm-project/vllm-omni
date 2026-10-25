@@ -97,6 +97,29 @@ Multi-segment and camera parameters use the endpoint's JSON `extra_params` form 
 for example `-F 'extra_params={"segment_frame_boundaries":[0,60,121],"camera_trajectory":"pan_left","segment_has_camera":[true,true]}'`
 with a two-segment prompt and 121 frames.
 
+## Sequence parallelism
+
+Use two CUDA devices with the shared offline example's `--ulysses-degree 2`,
+or start a two-device server:
+
+```bash
+vllm serve tencent/Hy-Nomas --omni --enforce-eager --ulysses-degree 2
+```
+
+For the Python API, pass `parallel_config={"ulysses_degree": 2}` to `Omni`.
+The adapter reuses the worker's Ulysses process group for the reference DiT's
+sequence splitting, all-to-all attention, and output gathering. Text encoding and
+PixelUMM decoding run independently on each device. Weights remain replicated.
+
+The degree must divide the DiT's 16 attention heads. The number of spatial tokens
+per latent frame must also divide evenly across devices; invalid dimensions are
+rejected before inference. The default 704×1280 shape meets these constraints.
+Use strict Ulysses with the reference all-to-all implementation. Ring attention,
+AllGather-KV, UAA, tensor/pipeline/data/CFG parallelism, HSDP, text encoder sharding,
+and VAE parallelism are not supported by this adapter.
+Real-model validation covers Ulysses degree two on H200; larger degrees have not
+been measured.
+
 ## CPU offload
 
 Use the public module-offload configuration to select DiT and text encoder weights:
@@ -115,12 +138,13 @@ shared offload API.
 
 Offload reduces generation-time weight residency and adds host-device transfers.
 Checkpoint initialization still uses the reference loaders on the GPU; allow enough
-memory for all components during loading. Layerwise and distributed offload are not
-supported.
+memory for all components during loading. Module CPU offload can be combined with
+Ulysses SP; each rank stages its own component copies. Layerwise and distributed
+layerwise offload are not supported.
 
 ## Scope and validation
 
-- Single CUDA device, BF16 distilled DiT, BF16 PixelUMM, one output per request.
+- CUDA, BF16 distilled DiT, BF16 PixelUMM, one output per request.
 - Four, six, or eight denoising steps; guidance scale one and flow shift five.
 - 24 fps, dimensions divisible by 32, and `num_frames=4*n+1` with `n >= 1`.
   The reference's 720-pixel height is reduced to 704 by its 32-pixel latent grid;
@@ -130,7 +154,7 @@ supported.
 - Generic startup warmup is disabled because its two-step, CFG-zero request is
   outside the distilled model's sampling contract. The first real request includes
   reference-kernel compilation.
-- Parallelism, quantization, LoRA, Cache-DiT, latent output,
+- Quantization, LoRA, Cache-DiT, latent output,
   input images, and incremental streaming are not supported by this adapter.
 
 CPU contract tests run in the existing L1 diffusion-model job. GPU tests require
@@ -139,6 +163,7 @@ the external reference runtime and are selected explicitly with `local_model`:
 ```bash
 pytest tests/diffusion/models/hy_nomas/test_hy_nomas.py -m 'core_model and cpu' --run-level core_model
 pytest tests/diffusion/models/hy_nomas/test_reference_config.py -m 'local_model and cpu' --run-level core_model
+pytest tests/diffusion/models/hy_nomas/test_reference_parallel.py -m 'local_model and cpu' --run-level core_model
 pytest tests/diffusion/models/hy_nomas/test_reference_parity.py -m 'local_model and cuda' --run-level core_model
 pytest tests/e2e/offline_inference/test_hy_nomas.py tests/e2e/online_serving/test_hy_nomas.py \
   -m 'local_model and cuda' --run-level core_model
@@ -146,7 +171,9 @@ pytest tests/e2e/offline_inference/test_hy_nomas.py tests/e2e/online_serving/tes
 
 GPU validation requires the reference runtime, model weights, text encoder, and a
 CUDA device with enough memory for all three components plus KV history. The local
-test configuration targets one H200. The reference-parity test loads independent
+test configuration targets one H200 for single-device cases and two H200s for SP.
+Select SP endpoint tests with `-m 'local_model and cuda and cards_2'`.
+The reference-parity test loads independent
 upstream and Omni instances, and checks exact decoded-frame equality for text,
 segments, and camera control in resident and offload modes. It requires memory for
 both model instances; set `HY_NOMAS_MODEL` and optionally `HY_NOMAS_TEXT_ENCODER` to

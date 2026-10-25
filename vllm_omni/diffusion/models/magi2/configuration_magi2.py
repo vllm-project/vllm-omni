@@ -15,6 +15,15 @@ from dataclasses import dataclass, field
 
 import torch
 
+MODEL_ID = "sand-ai/MAGI-2-preview"
+MODEL_ALIASES = (f"https://huggingface.co/{MODEL_ID}",)
+REQUIRED_FILES = (
+    "preview/model.safetensors.index.json",
+    "text_encoder/config.json",
+    "vae/Wan2.2_VAE.pth",
+    "turbo_vae/checkpoint.ckpt",
+)
+
 
 @dataclass(frozen=True)
 class Magi2MHCConfig:

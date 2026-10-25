@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import importlib
 import os
 from collections.abc import Mapping
 from functools import lru_cache
@@ -8,21 +9,11 @@ from functools import lru_cache
 from vllm.logger import init_logger
 from vllm.transformers_utils.config import get_hf_file_to_dict
 
-from vllm_omni.model_extras.hy_nomas import HY_NOMAS_DECODER_FILE, HY_NOMAS_DIT_FILE, HY_NOMAS_MODEL_ID
-
 logger = init_logger(__name__)
 
 DIFFUSION_MODEL_INDEX_FILES = (
     "model_index.json",
     "modular_model_index.json",
-)
-
-_MAGI2_MODEL_ID = "sand-ai/MAGI-2-preview"
-_MAGI2_REQUIRED_FILES = (
-    "preview/model.safetensors.index.json",
-    "text_encoder/config.json",
-    "vae/Wan2.2_VAE.pth",
-    "turbo_vae/checkpoint.ckpt",
 )
 
 
@@ -59,38 +50,37 @@ def _looks_like_bagel(model_name: str) -> bool:
         return False
 
 
-def _looks_like_magi2(model_name: str) -> bool:
-    """Detect the official Hub ID or a complete local Preview checkpoint."""
+def resolve_native_diffusion_model_class(model_name: str) -> str | None:
+    """Resolve native checkpoints that have no root HF or Diffusers config."""
+    from vllm_omni.diffusion.registry import NATIVE_MODEL_CONFIGS
+    from vllm_omni.diffusion.models.video_depth_anything.checkpoints import resolve_checkpoint
+
     normalized = str(model_name).strip().rstrip("/")
     hub_prefix = "https://huggingface.co/"
     if normalized.lower().startswith(hub_prefix):
         normalized = normalized[len(hub_prefix) :]
         normalized = normalized.split("/tree/", 1)[0]
-    if normalized.lower() == _MAGI2_MODEL_ID.lower():
-        return True
-    return os.path.isdir(normalized) and all(
-        os.path.isfile(os.path.join(normalized, *relative.split("/"))) for relative in _MAGI2_REQUIRED_FILES
-    )
-
-
-def resolve_native_diffusion_model_class(model_name: str) -> str | None:
-    """Resolve native checkpoints that have no root HF or Diffusers config."""
-    from vllm_omni.diffusion.models.video_depth_anything.checkpoints import resolve_checkpoint
-
-    normalized = str(model_name).rstrip("/")
-    if normalized.lower() == HY_NOMAS_MODEL_ID.lower() or (
-        os.path.isdir(normalized)
-        and all(
-            os.path.isfile(os.path.join(normalized, relative))
-            for relative in (HY_NOMAS_DIT_FILE, HY_NOMAS_DECODER_FILE)
-        )
-    ):
-        return "HyNomasPipeline"
-    if _looks_like_magi2(model_name):
-        return "Magi2Pipeline"
+    for model_class, module_name in NATIVE_MODEL_CONFIGS.items():
+        config = importlib.import_module(module_name)
+        model_ids = (config.MODEL_ID, *getattr(config, "MODEL_ALIASES", ()))
+        if normalized.lower() in (model_id.lower() for model_id in model_ids) or (
+            os.path.isdir(normalized)
+            and all(os.path.isfile(os.path.join(normalized, relative)) for relative in config.REQUIRED_FILES)
+        ):
+            return model_class
     if resolve_checkpoint(model_name) is not None:
         return "VideoDepthAnythingPipeline"
     return None
+
+
+def should_defer_native_model_download(model_name: str) -> bool:
+    from vllm_omni.diffusion.registry import NATIVE_MODEL_CONFIGS
+
+    model_class = resolve_native_diffusion_model_class(model_name)
+    if model_class is None:
+        return False
+    config = importlib.import_module(NATIVE_MODEL_CONFIGS[model_class])
+    return getattr(config, "DEFER_DOWNLOAD", False)
 
 
 def _looks_like_dreamzero(model_name: str) -> bool:

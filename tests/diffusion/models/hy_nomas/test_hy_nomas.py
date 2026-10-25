@@ -7,12 +7,15 @@ from unittest.mock import Mock
 
 import pytest
 import torch
+from omegaconf import DictConfig
 from torch import nn
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
+from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig
 from vllm_omni.diffusion.media import VideoValueRange
 from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
 from vllm_omni.diffusion.models.hy_nomas import pipeline_hy_nomas
+from vllm_omni.diffusion.models.hy_nomas.configuration_hy_nomas import REQUIRED_FILES
 from vllm_omni.diffusion.models.hy_nomas.pipeline_hy_nomas import HyNomasPipeline, validate_config
 from vllm_omni.diffusion.models.hy_nomas.request import normalize_request
 from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -21,7 +24,6 @@ from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.errors import OmniClientError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.model_extras import get_extra_body_params, get_video_generation_defaults
-from vllm_omni.model_extras.hy_nomas import HY_NOMAS_DECODER_FILE, HY_NOMAS_DIT_FILE
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
@@ -30,7 +32,7 @@ def test_discovery_without_model_index(tmp_path):
     assert resolve_native_diffusion_model_class("tencent/Hy-Nomas") == "HyNomasPipeline"
     assert is_diffusion_model("tencent/Hy-Nomas")
     assert resolve_native_diffusion_model_class(str(tmp_path)) is None
-    for relative in (HY_NOMAS_DIT_FILE, HY_NOMAS_DECODER_FILE):
+    for relative in REQUIRED_FILES:
         path = tmp_path / relative
         path.parent.mkdir(parents=True, exist_ok=True)
         path.touch()
@@ -44,6 +46,33 @@ def test_public_defaults():
     assert (defaults.height, defaults.width, defaults.num_frames) == (704, 1280, 121)
     assert (defaults.num_inference_steps, defaults.guidance_scale, defaults.fps) == (8, 1.0, 24.0)
     assert "segment_frame_boundaries" in get_extra_body_params("HyNomasPipeline")
+
+
+def test_pipeline_downloads_only_distilled_weights(tmp_path, monkeypatch):
+    for relative in REQUIRED_FILES:
+        path = tmp_path / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.touch()
+    download = Mock(return_value=str(tmp_path))
+    runtime = ModuleType("vllm_omni.diffusion.models.hy_nomas.runtime")
+    monkeypatch.setattr(runtime, "HyNomasRuntime", Mock(return_value=nn.Module()), raising=False)
+    monkeypatch.setitem(sys.modules, runtime.__name__, runtime)
+    monkeypatch.setattr(pipeline_hy_nomas, "get_local_device", lambda: torch.device("cuda:0"))
+    monkeypatch.setattr(pipeline_hy_nomas, "initialize_reference_parallelism", Mock(return_value=None))
+    monkeypatch.setattr(pipeline_hy_nomas, "download_weights_from_hf_specific", download)
+    monkeypatch.setattr(
+        pipeline_hy_nomas, "build_reference_config", Mock(return_value=DictConfig({"dit_weight": "dit"}))
+    )
+    monkeypatch.setattr("huggingface_hub.constants.HF_HUB_OFFLINE", False)
+    config = OmniDiffusionConfig(model="tencent/Hy-Nomas", revision="test-revision", dtype=torch.bfloat16)
+    HyNomasPipeline(od_config=config)
+    download.assert_called_once_with(
+        "tencent/Hy-Nomas",
+        cache_dir=None,
+        allow_patterns=list(REQUIRED_FILES),
+        revision="test-revision",
+        require_all=True,
+    )
 
 
 @pytest.mark.parametrize("as_list", [False, True])
@@ -120,6 +149,7 @@ def pipeline(monkeypatch):
     pipeline = HyNomasPipeline.__new__(HyNomasPipeline)
     nn.Module.__init__(pipeline)
     pipeline.pipe = Mock()
+    pipeline.sp_size = 1
     pipeline.pipe.inference.return_value = torch.linspace(0, 1, 1 * 3 * 5 * 32 * 32).reshape(1, 3, 5, 32, 32)
     return pipeline
 
@@ -169,6 +199,15 @@ def test_output_shape_is_checked(pipeline):
     pipeline.pipe.inference.return_value = torch.zeros(1, 3, 4, 32, 32)
     with pytest.raises(RuntimeError, match="expected"):
         pipeline(make_batch())
+
+
+def test_sp_rejects_uneven_tokens_before_inference(pipeline):
+    pipeline.sp_size = 2
+    pipeline.pipe.s_ratio = 32
+    pipeline.pipe.patch_size = (1, 1, 1)
+    with pytest.raises(OmniClientError, match="spatial tokens per frame"):
+        pipeline(make_batch())
+    pipeline.pipe.inference.assert_not_called()
 
 
 @pytest.mark.parametrize("fails", [False, True])
@@ -223,7 +262,13 @@ def test_module_offload_selects_components_and_removes_hooks(monkeypatch, compon
 @pytest.mark.parametrize(
     "overrides,match",
     [
-        ({"parallel_config": SimpleNamespace(world_size=2, use_hsdp=False)}, "single CUDA"),
+        ({"parallel_config": DiffusionParallelConfig(tensor_parallel_size=2)}, "only supports Ulysses"),
+        ({"parallel_config": DiffusionParallelConfig(ring_degree=2)}, "only supports Ulysses"),
+        ({"parallel_config": DiffusionParallelConfig(allgather_degree=2)}, "only supports Ulysses"),
+        ({"parallel_config": DiffusionParallelConfig(ulysses_degree=3)}, "16 attention heads"),
+        ({"parallel_config": DiffusionParallelConfig(ulysses_mode="advanced_uaa")}, "strict Ulysses"),
+        ({"parallel_config": DiffusionParallelConfig(ulysses_a2a_permute=True)}, "strict Ulysses"),
+        ({"parallel_config": DiffusionParallelConfig(vae_patch_parallel_size=2)}, "VAE"),
         ({"dtype": torch.float32}, "bfloat16"),
         ({"cache_backend": "cache_dit"}, "cache backend"),
         ({"quantization_config": "int8"}, "unquantized"),
@@ -234,7 +279,7 @@ def test_module_offload_selects_components_and_removes_hooks(monkeypatch, compon
 )
 def test_unsupported_engine_features(overrides, match):
     config = SimpleNamespace(
-        parallel_config=SimpleNamespace(world_size=1, use_hsdp=False),
+        parallel_config=DiffusionParallelConfig(data_parallel_size=1),
         dtype=torch.bfloat16,
         cache_backend="none",
         quantization_config=None,
@@ -244,3 +289,13 @@ def test_unsupported_engine_features(overrides, match):
     config.__dict__.update(overrides)
     with pytest.raises(ValueError, match=match):
         validate_config(config)
+
+
+@pytest.mark.parametrize("sp_size", [1, 2, 4, 8, 16])
+def test_supported_ulysses_config(sp_size):
+    validate_config(
+        OmniDiffusionConfig(
+            parallel_config=DiffusionParallelConfig(ulysses_degree=sp_size),
+            dtype=torch.bfloat16,
+        )
+    )

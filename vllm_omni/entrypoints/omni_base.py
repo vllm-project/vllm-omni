@@ -22,6 +22,7 @@ from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 
 from vllm_omni.config.stage_config import merge_sampling_constraints
 from vllm_omni.config.watermarking import WatermarkConfig
+from vllm_omni.diffusion.utils.hf_utils import should_defer_native_model_download
 from vllm_omni.engine.messages import (
     EngineQueueMessage,
     ErrorMessage,
@@ -43,7 +44,6 @@ from vllm_omni.metrics.utils import (
     observe_stage_workload_metrics,
 )
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
-from vllm_omni.model_extras.hy_nomas import HY_NOMAS_MODEL_ID
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.utils.tracking_parser import TrackingNamespace
 
@@ -90,8 +90,8 @@ def omni_snapshot_download(model_id: str) -> str:
     if is_runai_obj_uri(model_id):
         return model_id
 
-    # Hy-Nomas 的仓库还包含基础模型、量化权重和 PE；由 pipeline 只下载推理所需组件。
-    if model_id.rstrip("/").lower() == HY_NOMAS_MODEL_ID.lower():
+    # 原生模型由各自的组件 loader 解析目录、版本和所需权重。
+    if should_defer_native_model_download(model_id):
         return model_id
 
     # TODO: this is just a workaround for quickly use modelscope, we should support

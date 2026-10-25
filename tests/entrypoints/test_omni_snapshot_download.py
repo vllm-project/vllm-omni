@@ -95,12 +95,16 @@ def download_backend(monkeypatch: pytest.MonkeyPatch):
 
     picked: list[str] = []
 
+    def snapshot_download(model_id: str) -> str:
+        picked.append("modelscope")
+        return model_id
+
     snapshot_module = types.ModuleType("modelscope.hub.snapshot_download")
-    snapshot_module.snapshot_download = lambda model_id: picked.append("modelscope") or model_id
+    monkeypatch.setattr(snapshot_module, "snapshot_download", snapshot_download, raising=False)
     hub_module = types.ModuleType("modelscope.hub")
-    hub_module.snapshot_download = snapshot_module
+    monkeypatch.setattr(hub_module, "snapshot_download", snapshot_module, raising=False)
     root_module = types.ModuleType("modelscope")
-    root_module.hub = hub_module
+    monkeypatch.setattr(root_module, "hub", hub_module, raising=False)
     for name, module in (
         ("modelscope", root_module),
         ("modelscope.hub", hub_module),
@@ -119,9 +123,9 @@ def download_backend(monkeypatch: pytest.MonkeyPatch):
         lambda *_args, **_kwargs: False,
     )
 
-    def run() -> str:
+    def run(model_id: str = MODEL_ID) -> str:
         picked.clear()
-        omni_base.omni_snapshot_download(MODEL_ID)
+        omni_base.omni_snapshot_download(model_id)
         return picked[0] if picked else "none"
 
     return run
@@ -147,6 +151,11 @@ def test_unset_defaults_to_huggingface(monkeypatch, download_backend):
     monkeypatch.delenv("VLLM_USE_MODELSCOPE", raising=False)
 
     assert download_backend() == "huggingface"
+
+
+def test_native_model_without_deferral_keeps_modelscope(monkeypatch, download_backend):
+    monkeypatch.setenv("VLLM_USE_MODELSCOPE", "true")
+    assert download_backend("sand-ai/MAGI-2-preview") == "modelscope"
 
 
 def test_modular_diffusers_defers_component_download(monkeypatch, download_backend):
