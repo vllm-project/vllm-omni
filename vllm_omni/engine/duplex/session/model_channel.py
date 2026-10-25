@@ -55,6 +55,7 @@ from vllm_omni.engine.duplex.session.emitter import SessionEmitter
 from vllm_omni.engine.duplex.session.engine_session import DuplexEngineSession, DuplexFenceMismatchError
 from vllm_omni.engine.duplex.session.lease import DuplexLeaseActivity
 from vllm_omni.engine.duplex.session.tool_calls import ToolCallOrigin, ToolCallRegistrationError
+from vllm_omni.metrics.duplex_frame_timing import log_audio_emit_event
 from vllm_omni.metrics.stats import OrchestratorAggregator, StageRequestStats
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.outputs.duplex import attach_duplex_output_decision
@@ -1359,6 +1360,20 @@ class ModelChannel:
             response_request_metrics=response_request_metrics,
         )
         self._out.emit(payload)
+        # Timing hook, placed after acceptance and response resolution: the
+        # line must attribute to the response that owns this chunk (the
+        # draining one during overlap, never the newer active response) and
+        # carry that response's pre-emit watermark — previous_sent_ms, read
+        # above before mark_audio_sent advanced it.
+        log_audio_emit_event(
+            session.session_id,
+            session.epoch,
+            data_plane_request_id if isinstance(data_plane_request_id, str) else None,
+            model_result,
+            session.capabilities.chunk_period_ms,
+            previous_sent_ms,
+            response_id=response_id,
+        )
         if self._ctx.run.closing:
             return close_reason, emitted_response
         if (
