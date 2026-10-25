@@ -3,6 +3,7 @@
 
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
@@ -134,6 +135,65 @@ async def test_changed_content_at_same_locator_does_not_reuse_embedding():
     assert wrapper._speaker_extractor.call_count == 2
     assert not torch.equal(first[0], second[0])
     torch.testing.assert_close(second[0], repeated[0])
+
+
+@pytest.mark.asyncio
+async def test_changed_sample_rate_does_not_reuse_embedding():
+    from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
+
+    samples = np.array([0.25, 0.5], dtype=np.float32)
+    references = {
+        str(rate): (
+            samples.tolist(),
+            rate,
+            OmniOpenAIServingSpeech._make_ref_audio_artifact_cache_key(samples, rate),
+        )
+        for rate in (16000, 24000)
+    }
+    adapter, _, _ = _adapter(references)
+    wrapper = _wrapper()
+
+    for rate, expected_calls in ((16000, 1), (24000, 2), (16000, 2)):
+        info = await _build_and_roundtrip(adapter, _request(ref_audio=str(rate)))
+        _resolve_speaker_embeddings(wrapper, info)
+        assert wrapper._speaker_extractor.call_count == expected_calls
+
+    assert wrapper._speaker_cache.stats()["entries"] == 2
+
+
+@pytest.mark.asyncio
+async def test_disabled_reference_cache_extracts_each_time():
+    adapter, _, _ = _adapter({"reference-a": ([0.25, 0.5], 16000, "content-a")})
+    wrapper = _wrapper(cache=SpeakerEmbeddingCache(max_bytes=0))
+
+    for expected_calls in (1, 2):
+        info = await _build_and_roundtrip(adapter, _request())
+        embeddings = _resolve_speaker_embeddings(wrapper, info)
+        assert embeddings[0].shape == (SPEAKER_EMBEDDING_DIM,)
+        assert wrapper._speaker_extractor.call_count == expected_calls
+
+    assert wrapper._speaker_cache.stats()["entries"] == 0
+
+
+@pytest.mark.asyncio
+async def test_evicted_reference_is_extracted_again():
+    adapter, _, _ = _adapter(
+        {
+            "reference-a": ([0.25, 0.5], 16000, "content-a"),
+            "reference-b": ([0.75, 0.5], 16000, "content-b"),
+        }
+    )
+    embedding_bytes = torch.empty(SPEAKER_EMBEDDING_DIM, dtype=torch.float32).nbytes
+    wrapper = _wrapper(cache=SpeakerEmbeddingCache(max_bytes=embedding_bytes))
+
+    for expected_calls, source in enumerate(("reference-a", "reference-b", "reference-a"), start=1):
+        info = await _build_and_roundtrip(adapter, _request(ref_audio=source))
+        embeddings = _resolve_speaker_embeddings(wrapper, info)
+        expected = 0.25 if source == "reference-a" else 0.75
+        torch.testing.assert_close(embeddings[0], torch.full((SPEAKER_EMBEDDING_DIM,), expected))
+        assert wrapper._speaker_extractor.call_count == expected_calls
+        assert wrapper._speaker_cache.stats()["entries"] == 1
+        assert wrapper._speaker_cache.memory_bytes() == embedding_bytes
 
 
 @pytest.mark.asyncio
