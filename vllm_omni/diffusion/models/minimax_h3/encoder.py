@@ -358,7 +358,15 @@ class MiniMaxH3Qwen3VLRowParallelLinear(LinearBase):
         self, param: nn.Parameter, loaded_weight: torch.Tensor, loaded_shard_id: str | None = None
     ) -> None:
         del loaded_shard_id
-        shard_size = self.input_size_per_partition
+        # The stored width is input_size_per_partition for BF16 weights and
+        # input_size_per_partition/{2,32} for MXFP4 packed weights/scales.
+        shard_size = param.data.shape[1]
+        expected_size = shard_size * self._tp_size
+        if loaded_weight.shape[1] != expected_size:
+            raise ValueError(
+                f"row-parallel weight width {loaded_weight.shape[1]} does not match "
+                f"TP{self._tp_size} shard width {shard_size}"
+            )
         start_idx = self._tp_rank * shard_size
         param.data.copy_(loaded_weight.narrow(1, start_idx, shard_size))
 
