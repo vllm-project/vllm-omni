@@ -120,31 +120,6 @@ def cache_summary(pipeline: SupportsComponentDiscovery, details: bool = True) ->
         logger.warning("CacheDiT summary failed; this pipeline has no defined transformer attribute")
 
 
-def set_separate_cfg(transformer: nn.Module, do_true_cfg: bool) -> None:
-    """Tell Cache-DiT whether the next request runs CFG.
-
-    Cache-DiT tells the conditional and unconditional passes apart purely by
-    transformer-forward parity, so ``enable_separate_cfg`` has to match the
-    forwards the request makes on this rank: two per step for sequential CFG,
-    one without CFG, and one under CFG parallel, where each rank runs a single
-    branch (see ``resolve_has_separate_cfg``). A pipeline whose CFG mode is only
-    known per request calls this after the runner's step refresh and before the
-    denoise loop. It rebuilds the installed cache context, which drops any
-    cached residuals, so it must not be called inside the loop. Only
-    ``enable_separate_cfg`` changes in the rebuilt context, and it stays until
-    the next call, so call it for every request. Does nothing when Cache-DiT is
-    not enabled on ``transformer``.
-    """
-    if not BlockAdapter.is_cached(transformer):
-        return
-    # Same rule as resolve_has_separate_cfg, without its log line: this runs once per request.
-    enable_separate_cfg = do_true_cfg and _cfg_parallel_world_size() == 1
-    cache_dit.refresh_context(
-        transformer,
-        cache_config=DBCacheConfig().reset(enable_separate_cfg=enable_separate_cfg),
-    )
-
-
 def _default_get_pipeline_transformer(
     pipeline: SupportsComponentDiscovery,
 ) -> nn.Module:
@@ -352,19 +327,7 @@ class CacheDiTBackend(CacheBackend):
                 self._cache_targets = list(result.targets)
             else:
                 self._refresh_funcs = [result]
-                # An enabler that only returns a refresh func decides for itself
-                # which DiT modules it wraps, so discover the targets rather than
-                # assuming ``pipeline.transformer``: that attribute is None for a
-                # Wan2.2 MoE run with boundary_ratio pinned to 1.0 (low-noise
-                # expert only), and it also misses ``transformer_2`` in the normal
-                # dual-expert case, leaving the second expert's hooks installed
-                # after ``disable()``.  ``is_cached`` keeps enablers that
-                # intentionally wrap a subset out of the target list.
-                self._cache_targets = [
-                    transformer
-                    for transformer in (attrgetter(name)(pipeline) for name in _dit_module_names(pipeline))
-                    if BlockAdapter.is_cached(transformer)
-                ]
+                self._cache_targets = [_default_get_pipeline_transformer(pipeline)]
         else:
             for name in _dit_module_names(pipeline):
                 get_transformer = _make_pipeline_transformer_getter(name)
@@ -412,8 +375,6 @@ class CacheDiTBackend(CacheBackend):
             if hasattr(pipeline, "_cache_dit_targets"):
                 del pipeline._cache_dit_targets
             pipeline._cache_dit_one_call_per_cfg_rank = False
-            if hasattr(pipeline, "_cache_dit_refresh_for_schedule"):
-                del pipeline._cache_dit_refresh_for_schedule
             self.enabled = False
 
     def refresh(self, pipeline: SupportsComponentDiscovery, num_inference_steps: int, verbose: bool = True) -> None:
@@ -436,5 +397,4 @@ __all__ = [
     "CacheDiTBackend",
     "cache_summary",
     "enable_cache_for_dit",
-    "set_separate_cfg",
 ]

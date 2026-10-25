@@ -624,6 +624,76 @@ def test_predict_noise_with_multi_branch_cfg(
 @pytest.mark.core_model
 @pytest.mark.diffusion
 @pytest.mark.cpu
+@pytest.mark.parametrize("cfg_parallel_size,n_branches", [(2, 3), (2, 4)])
+def test_multi_branch_cfg_rejects_two_calls_per_rank_under_cache_dit(
+    monkeypatch: pytest.MonkeyPatch,
+    cfg_parallel_size: int,
+    n_branches: int,
+):
+    """Cache-DiT counts each call on a CFG rank as a step, so a rank must not run two branches."""
+    monkeypatch.setattr(parallel_state, "_CFG", object())  # take the CFG-parallel path
+    pipeline = MultiBranchTestPipeline()
+    pipeline._cache_dit_one_call_per_cfg_rank = True
+    branches_kwargs = _make_multi_branch_inputs(
+        n_branches=n_branches,
+        batch_size=1,
+        channels=4,
+        height=16,
+        width=16,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+        input_seed=123,
+    )
+    for cfg_rank in range(cfg_parallel_size):
+        _patch_cfg_state(
+            monkeypatch,
+            world_size=cfg_parallel_size,
+            rank=cfg_rank,
+            fake_group=FakeCfgGroup(world_size=cfg_parallel_size, rank_in_group=cfg_rank, rank_tensors=[]),
+        )
+        with pytest.raises(ValueError, match="Cache-DiT"):
+            pipeline.predict_noise_with_multi_branch_cfg(
+                do_true_cfg=True,
+                true_cfg_scale=_multi_branch_cfg_scale(n_branches),
+                branches_kwargs=branches_kwargs,
+            )
+
+
+@pytest.mark.core_model
+@pytest.mark.diffusion
+@pytest.mark.cpu
+@pytest.mark.parametrize("cfg_parallel_size,n_branches", [(2, 2), (3, 3), (3, 2)])
+def test_multi_branch_cfg_one_call_per_rank_runs_under_cache_dit(
+    monkeypatch: pytest.MonkeyPatch,
+    cfg_parallel_size: int,
+    n_branches: int,
+):
+    monkeypatch.setattr(parallel_state, "_CFG", object())  # take the CFG-parallel path
+    pipeline = MultiBranchTestPipeline()
+    pipeline._cache_dit_one_call_per_cfg_rank = True
+    branches_kwargs = _make_multi_branch_inputs(
+        n_branches=n_branches,
+        batch_size=1,
+        channels=4,
+        height=16,
+        width=16,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+        input_seed=123,
+    )
+    _run_multi_branch_cfg_parallel_mock(
+        pipeline,
+        monkeypatch,
+        cfg_world_size=cfg_parallel_size,
+        branches_kwargs=branches_kwargs,
+        true_cfg_scale=_multi_branch_cfg_scale(n_branches),
+        cfg_normalize=False,
+    )
+
+
+@pytest.mark.core_model
+@pytest.mark.diffusion
+@pytest.mark.cpu
 def test_multi_branch_without_cfg():
     dtype = torch.float32
     device = torch.device("cpu")

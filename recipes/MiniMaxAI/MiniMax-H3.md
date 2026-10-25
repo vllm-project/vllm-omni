@@ -821,7 +821,7 @@ longer than the generated clip. Use `start_time_seconds` to select a
 synchronized segment; for multiple typed video references, pass one value per
 video in `extra_params.start_time_seconds`.
 
-Reference images accept JPG/JPEG, PNG, WEBP, HEIC, or HEIF up to 30 MiB. Standalone
+Reference images accept JPG/JPEG, PNG, or WEBP up to 30 MiB. Standalone
 audio references accept WAV or MP3 up to 15 MiB, with 2–15 seconds per file and
 at most 15 seconds combined.
 

@@ -368,6 +368,14 @@ class CFGParallelMixin(metaclass=ABCMeta):
         assignments = _dispatch_branches(n_branches, cfg_world_size)
         my_branch_ids = assignments[cfg_rank]
         max_per_rank = max(len(a) for a in assignments)
+        if max_per_rank > 1 and getattr(self, "_cache_dit_one_call_per_cfg_rank", False):
+            # Cache-DiT counts every transformer call on a CFG rank as a denoise step, so a rank
+            # running two branches would exhaust its cache budget early while the others don't.
+            raise ValueError(
+                f"Cache-DiT with cfg_parallel_size={cfg_world_size} does not support {n_branches}-branch CFG: "
+                f"a rank would run {max_per_rank} branches per step. Set cfg_parallel_size to at least "
+                f"{n_branches}, or disable cache_dit."
+            )
 
         # Run assigned branches
         my_preds: list[tuple[torch.Tensor, ...]] = []
