@@ -116,6 +116,14 @@ class FeedForward(nn.Module):
 
 
 class FluxAttention(torch.nn.Module):
+    # How the double-stream blocks attend over the two streams. The default concatenates the query
+    # streams, runs one attention over the joint keys/values and splits the result. With this set,
+    # each query stream attends separately over the same joint keys/values and nothing is split:
+    # the same function row for row (softmax over the same keys), spelled as the two joint
+    # attentions a fused kernel takes (one query set over two key/value sets). A platform plugin
+    # flips this class attribute at registration.
+    attention_per_query_stream: bool = False
+
     def __init__(
         self,
         query_dim: int,
@@ -206,6 +214,25 @@ class FluxAttention(torch.nn.Module):
             num_kv_heads=self.to_qkv.num_kv_heads,
         )
 
+    def _attend_per_query_stream(self, query, key, value, encoder_query, encoder_key, encoder_value, rotary):
+        """One attention per query stream over the joint keys/values (`attention_per_query_stream`).
+
+        `rotary` is the pair of per-stream `(cos, sin)` tables, text then image. RoPE is applied per
+        stream, only the keys and values are concatenated, and nothing is split: each stream's rows
+        are the same softmax rows the concatenated form computes.
+        """
+        text_rotary, image_rotary = rotary
+        query, key = apply_rope_to_qk(self.rope, query, key, image_rotary)
+        encoder_query, encoder_key = apply_rope_to_qk(self.rope, encoder_query, encoder_key, text_rotary)
+        key = torch.cat([encoder_key, key], dim=1)
+        value = torch.cat([encoder_value, value], dim=1)
+        hidden_states = self.attn(query, key, value, None).flatten(2, 3).to(query.dtype)
+        encoder_hidden_states = self.attn(encoder_query, key, value, None).flatten(2, 3).to(query.dtype)
+        hidden_states = self.to_out[0](hidden_states.contiguous())
+        hidden_states = self.to_out[1](hidden_states)
+        encoder_hidden_states = self.to_add_out(encoder_hidden_states.contiguous())
+        return hidden_states, encoder_hidden_states
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -243,6 +270,11 @@ class FluxAttention(torch.nn.Module):
 
             encoder_query = self.norm_added_q(encoder_query)
             encoder_key = self.norm_added_k(encoder_key)
+
+            if self.attention_per_query_stream and attention_mask is None:
+                return self._attend_per_query_stream(
+                    query, key, value, encoder_query, encoder_key, encoder_value, image_rotary_emb
+                )
 
             query = torch.cat([encoder_query, query], dim=1)
             key = torch.cat([encoder_key, key], dim=1)
@@ -419,13 +451,24 @@ class FluxSingleTransformerBlock(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        encoder_hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor | None,
         temb: torch.Tensor,
         image_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
         joint_attention_kwargs: dict[str, Any] | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        text_seq_len = encoder_hidden_states.shape[1]
-        hidden_states = torch.cat([encoder_hidden_states, hidden_states], dim=1)
+    ) -> tuple[torch.Tensor, torch.Tensor] | torch.Tensor:
+        """Run the block on the joint stream.
+
+        With ``encoder_hidden_states`` the two streams are joined here and split again on the way
+        out, and the block returns ``(encoder_hidden_states, hidden_states)``: the per-block form the
+        cache hooks and extractors drive. With ``encoder_hidden_states=None``, ``hidden_states`` is
+        the already-joined stream and the block returns it joined: the transformer joins once before
+        its single blocks and splits once after, which saves 37 redundant cat/split pairs per step and
+        keeps a compiled graph free of a slice composed onto a concatenation.
+        """
+        joined = encoder_hidden_states is None
+        if not joined:
+            text_seq_len = encoder_hidden_states.shape[1]
+            hidden_states = torch.cat([encoder_hidden_states, hidden_states], dim=1)
 
         residual = hidden_states
         norm_hidden_states, gate = self.norm(hidden_states, emb=temb)
@@ -444,6 +487,8 @@ class FluxSingleTransformerBlock(nn.Module):
         if hidden_states.dtype == torch.float16:
             hidden_states = hidden_states.clip(-65504, 65504)
 
+        if joined:
+            return hidden_states
         encoder_hidden_states, hidden_states = hidden_states[:, :text_seq_len], hidden_states[:, text_seq_len:]
         return encoder_hidden_states, hidden_states
 
@@ -522,6 +567,15 @@ class FluxTransformer2DModel(nn.Module):
     # used for torch compile optimizations
     _repeated_blocks = ["FluxTransformerBlock"]
     _layerwise_offload_blocks_attrs = ["transformer_blocks", "single_transformer_blocks"]
+
+    # The order of the two streams in the joint sequence the single blocks run on. Joint attention
+    # is permutation-equivariant given the RoPE ids and every other op in a single block is
+    # token-wise, so `[img, txt]` computes the same function as the default `[txt, img]` (up to
+    # floating-point summation order inside attention). With the image first the final split is a
+    # head slice, which an external `torch.compile` backend whose e-graph composes a trailing
+    # offset slice onto the stream (Luminal's Trainium backend today) needs; a platform plugin
+    # flips this class attribute at registration.
+    single_blocks_image_first: bool = False
 
     @staticmethod
     def _is_transformer_block(name: str, module) -> bool:
@@ -610,6 +664,39 @@ class FluxTransformer2DModel(nn.Module):
         )
         self.proj_out = nn.Linear(self.inner_dim, patch_size * patch_size * self.out_channels, bias=True)
 
+    def _join_streams(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        image_rotary_emb: tuple[torch.Tensor, torch.Tensor],
+        txt_ids: torch.Tensor,
+        img_ids: torch.Tensor,
+    ):
+        """The joint stream for the single blocks, its RoPE table, and the split that returns the
+        image stream afterwards (see `single_blocks_image_first`)."""
+        text_seq_len, image_seq_len = encoder_hidden_states.shape[1], hidden_states.shape[1]
+        if self.single_blocks_image_first:
+            joined = torch.cat([hidden_states, encoder_hidden_states], dim=1)
+            (text_cos, text_sin), (image_cos, image_sin) = self._stream_rotary_tables(txt_ids, img_ids)
+            rotary = (torch.cat([image_cos, text_cos], dim=0), torch.cat([image_sin, text_sin], dim=0))
+            return joined, rotary, lambda joint: joint[:, :image_seq_len]
+        joined = torch.cat([encoder_hidden_states, hidden_states], dim=1)
+        if isinstance(image_rotary_emb[0], tuple):  # per-stream tables: the joint table is their concatenation
+            (text_cos, text_sin), (image_cos, image_sin) = image_rotary_emb
+            image_rotary_emb = (torch.cat([text_cos, image_cos], dim=0), torch.cat([text_sin, image_sin], dim=0))
+        return joined, image_rotary_emb, lambda joint: joint[:, text_seq_len:]
+
+    def _stream_rotary_tables(self, txt_ids: torch.Tensor, img_ids: torch.Tensor):
+        """The `(cos, sin)` RoPE tables of the text and the image stream, separately."""
+        return self.pos_embed(txt_ids), self.pos_embed(img_ids)
+
+    def _double_block_rotary(self, txt_ids: torch.Tensor, img_ids: torch.Tensor):
+        """What the double blocks take: one joint table over `cat(txt_ids, img_ids)`, or -- when
+        their attention runs per query stream -- the pair of per-stream tables."""
+        if FluxAttention.attention_per_query_stream:
+            return self._stream_rotary_tables(txt_ids, img_ids)
+        return self.pos_embed(torch.cat((txt_ids, img_ids), dim=0))
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -684,7 +771,7 @@ class FluxTransformer2DModel(nn.Module):
             freqs_cos, freqs_sin = self.pos_embed(ids.cpu())
             image_rotary_emb = (freqs_cos.npu(), freqs_sin.npu())
         else:
-            image_rotary_emb = self.pos_embed(ids)
+            image_rotary_emb = self._double_block_rotary(txt_ids, img_ids)
 
         for index_block, block in enumerate(self.transformer_blocks):
             encoder_hidden_states, hidden_states = block(
@@ -695,14 +782,20 @@ class FluxTransformer2DModel(nn.Module):
                 joint_attention_kwargs=joint_attention_kwargs,
             )
 
+        # The single blocks work on the joint stream: join once, split once (see
+        # FluxSingleTransformerBlock.forward and `single_blocks_image_first`).
+        hidden_states, single_rotary_emb, split = self._join_streams(
+            hidden_states, encoder_hidden_states, image_rotary_emb, txt_ids, img_ids
+        )
         for index_block, block in enumerate(self.single_transformer_blocks):
-            encoder_hidden_states, hidden_states = block(
+            hidden_states = block(
                 hidden_states=hidden_states,
-                encoder_hidden_states=encoder_hidden_states,
+                encoder_hidden_states=None,
                 temb=temb,
-                image_rotary_emb=image_rotary_emb,
+                image_rotary_emb=single_rotary_emb,
                 joint_attention_kwargs=joint_attention_kwargs,
             )
+        hidden_states = split(hidden_states)
 
         hidden_states = self.norm_out(hidden_states, temb)
         output = self.proj_out(hidden_states)
@@ -827,8 +920,7 @@ class FluxKontextTransformer2DModel(FluxTransformer2DModel):
             )
             img_ids = img_ids[0]
 
-        ids = torch.cat((txt_ids, img_ids), dim=0)
-        image_rotary_emb = self.pos_embed(ids)
+        image_rotary_emb = self._double_block_rotary(txt_ids, img_ids)
 
         for block in self.transformer_blocks:
             encoder_hidden_states, hidden_states = block(
@@ -839,14 +931,20 @@ class FluxKontextTransformer2DModel(FluxTransformer2DModel):
                 joint_attention_kwargs=joint_attention_kwargs,
             )
 
+        # join once, split once around the single blocks (see FluxSingleTransformerBlock.forward
+        # and `single_blocks_image_first`)
+        hidden_states, single_rotary_emb, split = self._join_streams(
+            hidden_states, encoder_hidden_states, image_rotary_emb, txt_ids, img_ids
+        )
         for block in self.single_transformer_blocks:
-            encoder_hidden_states, hidden_states = block(
+            hidden_states = block(
                 hidden_states=hidden_states,
-                encoder_hidden_states=encoder_hidden_states,
+                encoder_hidden_states=None,
                 temb=temb,
-                image_rotary_emb=image_rotary_emb,
+                image_rotary_emb=single_rotary_emb,
                 joint_attention_kwargs=joint_attention_kwargs,
             )
+        hidden_states = split(hidden_states)
         hidden_states = self.norm_out(hidden_states, temb)
         output = self.proj_out(hidden_states)
 
