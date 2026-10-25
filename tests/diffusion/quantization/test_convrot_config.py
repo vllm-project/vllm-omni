@@ -7,6 +7,7 @@ import math
 import pytest
 import torch
 from pytest_mock import MockerFixture
+from vllm.model_executor.kernels.linear import MxFp4LinearKernel, Mxfp8LinearKernel
 from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
 
 from vllm_omni.platforms import current_omni_platform
@@ -106,15 +107,9 @@ def test_factory_builds_all_methods():
     mxfp4 = build_quant_config(
         {"method": "convrot_mxfp4", "rotation_group_size": 64, "ignored_layers": ["proj_out"]}
     )
-    assert (mxfp4.get_name(), mxfp4.rotation_group_size, mxfp4.mxfp4_scale_method) == ("convrot_mxfp4", 64, "quest")
-    assert (
-        build_quant_config({"method": "convrot_mxfp4", "mxfp4_scale_method": "abs_max"}).mxfp4_scale_method
-        == "abs_max"
-    )
+    assert (mxfp4.get_name(), mxfp4.rotation_group_size) == ("convrot_mxfp4", 64)
     with pytest.raises(ValueError, match="int8_layers"):
         build_quant_config({"method": "convrot_mxfp4", "int8_layers": ["to_out"]})
-    with pytest.raises(ValueError, match="mxfp4_scale_method"):
-        build_quant_config({"method": "convrot_mxfp4", "mxfp4_scale_method": "bad"})
 
     mixed = build_quant_config(
         {
@@ -246,7 +241,7 @@ class TestCudaConvRot:
 
 @cuda_available
 class TestCudaConvRotMxfp4:
-    """Real MXFP4 tensor-core kernels on Blackwell."""
+    """Real MXFP4 kernels selected by vLLM for the current device."""
 
     @staticmethod
     def _layer(weight):
@@ -279,58 +274,31 @@ class TestCudaConvRotMxfp4:
         assert out.shape == (*x.shape[:-1], weight.shape[0]) and out.dtype == torch.bfloat16
         return layer, self._error(out, torch.nn.functional.linear(x, weight, bias))
 
-    @staticmethod
-    def _dequantize(packed, scales, divisor):
-        grid = torch.tensor(
-            [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
-            dtype=torch.float32,
-            device=packed.device,
-        )
-        values = packed.to(torch.int16)
-        codes = torch.stack((values & 0xF, (values >> 4) & 0xF), dim=-1).flatten(-2)
-        return (
-            grid[codes.long()].reshape(*codes.shape[:-1], -1, 32) * scales.float()[..., None]
-        ).flatten(-2) / divisor
-
-    @pytest.mark.parametrize("scale_method", ["quest", "abs_max"])
-    def test_gemm_matches_the_dequantized_payload(self, scale_method):
-        from vllm import _custom_ops as ops
-
+    def test_selects_a_vllm_mxfp4_kernel(self):
         x, weight, bias = self._inputs()
-        config = build_quant_config({"method": "convrot_mxfp4", "mxfp4_scale_method": scale_method})
-        method = ConvRotMxfp4OnlineLinearMethod(config)
-        h = regular_hadamard(256).to(dtype=weight.dtype, device=weight.device)
-        identity = torch.eye(32, dtype=weight.dtype, device=weight.device)
-        rotated_weight = rotate(weight, h).contiguous()
-        qweight, weight_scales = ops.fusedQuantizeMx(rotated_weight, identity, method=scale_method)
-        rotated_x = rotate(x, h).reshape(-1, x.shape[-1]).contiguous()
-        qx, x_scales = ops.fusedQuantizeMx(rotated_x, identity, method=scale_method)
-
+        method = ConvRotMxfp4OnlineLinearMethod(build_quant_config("convrot_mxfp4"))
         layer = self._layer(weight)
         method.process_weights_after_loading(layer)
         out = method.apply(layer, x, bias)
-        divisor = 1.0 if scale_method == "quest" else 3.0
-        weight_dequant = self._dequantize(qweight, weight_scales[: weight.shape[0], :], divisor)
-        x_dequant = self._dequantize(qx, x_scales[: rotated_x.shape[0], :], divisor)
-        ref = x_dequant @ weight_dequant.T + bias
-        assert self._error(out.reshape(-1, weight.shape[0]), ref) < 5e-3
+        assert isinstance(method.kernel, MxFp4LinearKernel)
+        assert out.shape == (*x.shape[:-1], weight.shape[0])
+        assert self._error(out, torch.nn.functional.linear(x, weight, bias)) < 0.3
 
-    @pytest.mark.parametrize("scale_method", ["quest", "abs_max"])
-    def test_rotation_bounds_mxfp4_error_on_outliers(self, scale_method):
+    def test_rotation_bounds_mxfp4_error_on_outliers(self):
         x, weight, bias = self._inputs()
-        config = build_quant_config({"method": "convrot_mxfp4", "mxfp4_scale_method": scale_method})
+        config = build_quant_config("convrot_mxfp4")
         unrotated = ConvRotMxfp4OnlineLinearMethod(config)
         unrotated.rotation_group_size = 1
         _, plain = self._quantized_error(unrotated, weight, x, bias)
-        layer, rotated = self._quantized_error(ConvRotMxfp4OnlineLinearMethod(config), weight, x, bias)
-        assert layer.weight.dtype == torch.uint8 and layer.weight.shape == (768, 512)
-        assert layer.weight_scale.dtype == torch.float8_e8m0fnu
+        method = ConvRotMxfp4OnlineLinearMethod(config)
+        _, rotated = self._quantized_error(method, weight, x, bias)
+        assert isinstance(method.kernel, MxFp4LinearKernel)
         assert rotated < 0.3 and rotated < plain / 1.8
 
 
 @cuda_available
 class TestCudaConvRotMxfp8:
-    """Real MXFP8 tensor-core kernels on Blackwell."""
+    """Real MXFP8 kernels selected by vLLM for the current device."""
 
     @staticmethod
     def _layer(weight):
@@ -388,21 +356,18 @@ class TestCudaConvRotMxfp8:
         unrotated = ConvRotMxfp8OnlineLinearMethod(build_quant_config("convrot_mxfp8"))
         unrotated.rotation_group_size = 1
         _, plain = self._quantized_error(unrotated, weight, x, bias)
-        layer, rotated = self._quantized_error(
-            ConvRotMxfp8OnlineLinearMethod(build_quant_config("convrot_mxfp8")), weight, x, bias
-        )
-        assert layer.weight.dtype == torch.float8_e4m3fn and layer.weight.shape == weight.shape
-        assert layer.weight_scale.dtype == torch.uint8
+        method = ConvRotMxfp8OnlineLinearMethod(build_quant_config("convrot_mxfp8"))
+        _, rotated = self._quantized_error(method, weight, x, bias)
+        assert isinstance(method.kernel, Mxfp8LinearKernel)
         # MXFP8's E4M3 range and block-32 scales already tolerate these
         # outliers, so rotation need not beat unrotated quantization here.
         assert plain < 0.1 and rotated < 0.1
 
-    def test_unaligned_output_width_is_padded_and_sliced(self):
+    def test_unaligned_output_width_is_supported(self):
         x = torch.randn(2, 1024, dtype=torch.bfloat16, device="cuda")
         weight = torch.randn(504, 1024, dtype=torch.bfloat16, device="cuda") / 32
         bias = torch.randn(504, dtype=torch.bfloat16, device="cuda")
-        layer, error = self._quantized_error(
+        _, error = self._quantized_error(
             ConvRotMxfp8OnlineLinearMethod(build_quant_config("convrot_mxfp8")), weight, x, bias
         )
-        assert layer.weight.shape == (512, 1024)
         assert error < 0.12
