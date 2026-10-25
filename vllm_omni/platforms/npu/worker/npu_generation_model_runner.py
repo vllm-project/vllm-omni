@@ -9,6 +9,7 @@ import time
 from collections.abc import Mapping
 from copy import copy
 from dataclasses import replace
+from typing import cast
 
 import numpy as np
 import torch
@@ -36,9 +37,14 @@ from vllm_ascend.utils import enable_sp, lmhead_tp_enable
 from vllm_ascend.worker.model_runner_v1 import SEQ_LEN_WITH_MAX_PA_WORKSPACE
 
 from vllm_omni.outputs import OmniModelRunnerOutput
-from vllm_omni.platforms.npu.worker.npu_ar_model_runner import ExecuteModelState, _ensure_tensor_values
+from vllm_omni.platforms.npu.worker.npu_ar_model_runner import ExecuteModelState
 from vllm_omni.platforms.npu.worker.npu_model_runner import OmniNPUModelRunner
 from vllm_omni.utils.mm_outputs import partition_payload_list, split_mapping_outputs
+from vllm_omni.worker.async_omni_output import (
+    _AsyncCPUPayloadSnapshot,
+    _ensure_tensor_values,
+    _snapshot_tensor_payload_to_cpu_async,
+)
 from vllm_omni.worker.mixins import maybe_unpad_input_ids
 from vllm_omni.worker.omni_connector_model_runner_mixin import (
     OmniConnectorModelRunnerMixin,
@@ -46,63 +52,15 @@ from vllm_omni.worker.omni_connector_model_runner_mixin import (
 )
 
 
-class _NPUHostCopyBatch:
-    """Copy a step on its producer stream, with one completion event.
+class _AsyncGenerationOutput(AsyncModelRunnerOutput):
+    """Publish generation metadata now; wait for host payloads on consumption."""
 
-    Keeping D2H on the producer stream orders it before the next forward can
-    overwrite graph-owned outputs. CPU metadata is cloned when completion is
-    deferred, and device sources stay alive until the consumer waits.
-    """
-
-    def __init__(self, device: torch.device, *, pin_memory: bool, snapshot_cpu: bool = False):
-        self.device = device
-        self.pin_memory = pin_memory
-        self.snapshot_cpu = snapshot_cpu
-        self.sources: list[torch.Tensor] = []
-        self.stream = None
-        self.event = None
-
-    def __enter__(self):
-        return self
-
-    def copy(self, value: torch.Tensor) -> torch.Tensor:
-        tensor = value.detach()
-        if tensor.device.type != "npu" or tensor.device != self.device or not self.pin_memory:
-            host = tensor.to("cpu").contiguous()
-            return host.clone() if self.snapshot_cpu and tensor.device.type == "cpu" else host
-        if self.stream is None:
-            self.stream = torch.npu.current_stream(self.device)
-        host = torch.empty(tensor.shape, dtype=tensor.dtype, device="cpu", pin_memory=True)
-        self.sources.append(tensor)
-        host.copy_(tensor, non_blocking=True)
-        # Also protect allocator reuse if a queued output is discarded unread.
-        tensor.record_stream(self.stream)
-        return host
-
-    def __exit__(self, exc_type, exc, traceback):
-        if self.stream is not None:
-            if exc_type is not None:
-                # A malformed later payload must not release earlier in-flight sources.
-                self.stream.synchronize()
-                self.sources.clear()
-            else:
-                self.event = torch.npu.Event()
-                self.event.record(self.stream)
-
-    def wait(self) -> None:
-        if self.event is not None:
-            self.event.synchronize()
-            self.event = None
-        self.sources.clear()
-
-
-class _AsyncNPUGenerationOutput(AsyncModelRunnerOutput):
-    def __init__(self, output: OmniModelRunnerOutput, copies: _NPUHostCopyBatch):
+    def __init__(self, output: OmniModelRunnerOutput, snapshot: _AsyncCPUPayloadSnapshot):
         self._output = output
-        self._copies = copies
+        self._snapshot = snapshot
 
     def get_output(self) -> OmniModelRunnerOutput:
-        self._copies.wait()
+        self._snapshot.wait()
         return self._output
 
 
@@ -179,7 +137,7 @@ class NPUGenerationModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin
             else:
                 self._sync_device()
                 self._execution_start_time = time.perf_counter()
-        if self.execute_model_state is not None:
+        if self.execute_model_state is not None:  # type: ignore[has-type]
             raise RuntimeError("State error: sample_tokens() must be called after execute_model() returns None.")
 
         if self.speculative_config is not None and self.speculative_config.use_ngram_gpu():
@@ -543,73 +501,94 @@ class NPUGenerationModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin
             output.kv_connector_output = kv_connector_output
             return self.attach_omni_connector_output(output)
 
-        # Unpack ephemeral state.
-        (
-            scheduler_output,
-            logits,
-            spec_decode_metadata,
-            spec_decode_common_attn_metadata,
-            hidden_states,
-            sample_hidden_states,
-            aux_hidden_states,
-            attn_metadata,
-            positions,
-            ec_connector_output,
-            cudagraph_stats,
-            _batch_desc,
-            multimodal_outputs_raw,  # Omni-Specific
-            _prefix_cache_step_id,  # generation stages never save to the prefix cache
-        ) = self.execute_model_state
+        # AR state can gain fields that generation stages do not use. Read
+        # the shared fields by name instead of unpacking its positional schema.
+        state = self.execute_model_state
+        scheduler_output = state.scheduler_output
+        ec_connector_output = state.ec_connector_output
+        cudagraph_stats = state.cudagraph_stats
+        multimodal_outputs_raw = state.multimodal_outputs
         pending_aux_output = self._prepare_omni_aux_output()
         # Clear ephemeral state.
-        self.execute_model_state = None
+        self.execute_model_state = None  # type: ignore[assignment]
 
         #  -------------------------------------- Omni-new -------------------------------------------------
         # Build per-request multimodal_outputs list (dedicated channel).
         # pooler_output is no longer used for multimodal data.
         per_req_payloads: list[dict[str, object]] = []
-        pin_memory = is_pin_memory_available()
+        pin_memory = is_pin_memory_available() if self.use_async_scheduling else False
         accumulate_full_payload = self._should_accumulate_full_payload_output()
         use_async_output = (
-            self.use_async_scheduling
-            and pin_memory
-            and not accumulate_full_payload
-            and not (profiling_chunk_config.enabled and profiling_chunk_config.need_timing)
+            self.use_async_scheduling and self.device.type == "npu" and pin_memory and not accumulate_full_payload
         )
-        with _NPUHostCopyBatch(self.device, pin_memory=pin_memory, snapshot_cpu=use_async_output) as to_host:
-            if isinstance(multimodal_outputs_raw, torch.Tensor):
-                assert multimodal_outputs_raw.shape[0] == 1, (
-                    "model should return a single tensor, to return multiple tensors, use a dict"
-                )
-                assert multimodal_outputs_raw.shape[0] == self.input_batch.num_reqs
-                for i in range(self.input_batch.num_reqs):
-                    per_req_payloads.append({"model_outputs": to_host.copy(multimodal_outputs_raw[i])})
-            elif isinstance(multimodal_outputs_raw, list):
-                assert len(multimodal_outputs_raw) == 1, (
-                    "model should return a single list, to return multiple lists, use a dict"
-                )
-                for out in multimodal_outputs_raw:
-                    per_req_payloads.append({"model_outputs": to_host.copy(out) if out is not None else None})
-            elif isinstance(multimodal_outputs_raw, Mapping):
-                per_req_payloads = [
-                    _ensure_tensor_values(payload)
-                    for payload in split_mapping_outputs(
-                        multimodal_outputs_raw,
-                        self.input_batch.num_reqs,
-                        lambda tensor: tensor.detach().to("cpu").contiguous(),
-                    )
-                ]
-            else:
-                raise RuntimeError("Unsupported diffusion output type")
-        if not use_async_output:
-            to_host.wait()
 
+        # Validate and split the payload before launching any asynchronous copies.
+        def copy_tensor(value: torch.Tensor) -> torch.Tensor:
+            if use_async_output:
+                return value.detach()
+            return value.detach().to("cpu").contiguous()
+
+        if isinstance(multimodal_outputs_raw, torch.Tensor):
+            # One row per request. The old asserts (`shape[0] == 1` AND
+            # `shape[0] == num_reqs`) jointly forced num_reqs == 1, silently
+            # rejecting batched steps the generation scheduler does admit.
+            num_reqs = self.input_batch.num_reqs
+            if multimodal_outputs_raw.shape[0] != num_reqs:
+                raise ValueError(
+                    f"Multimodal output tensor has leading dim {multimodal_outputs_raw.shape[0]} "
+                    f"but the batch has {num_reqs} requests (one row per request; "
+                    "to return multiple tensors per request, use a dict)."
+                )
+            for i in range(num_reqs):
+                per_req_payloads.append({"model_outputs": copy_tensor(multimodal_outputs_raw[i])})
+        elif isinstance(multimodal_outputs_raw, list):
+            # One entry per request. The old `len == 1` assert did not check
+            # num_reqs, so a batched step built a length-1 payload list that
+            # misaligned with `req_ids` downstream.
+            num_reqs = self.input_batch.num_reqs
+            if len(multimodal_outputs_raw) != num_reqs:
+                raise ValueError(
+                    f"Multimodal output list has length {len(multimodal_outputs_raw)} "
+                    f"but the batch has {num_reqs} requests (one entry per request; "
+                    "to return multiple lists per request, use a dict)."
+                )
+            for out in multimodal_outputs_raw:
+                per_req_payloads.append({"model_outputs": copy_tensor(out) if out is not None else None})
+        elif isinstance(multimodal_outputs_raw, Mapping):
+            per_req_payloads = [
+                _ensure_tensor_values(payload)
+                for payload in split_mapping_outputs(multimodal_outputs_raw, self.input_batch.num_reqs, copy_tensor)
+            ]
+        else:
+            raise RuntimeError("Unsupported diffusion output type")
+        snapshot = None
+        if use_async_output:
+            # The NPU helper queues small D2H copies on the producer stream;
+            # larger payloads get owned snapshots on the copy stream. Both
+            # remain safe when the next forward reuses graph output storage.
+            if isinstance(multimodal_outputs_raw, torch.Tensor) and multimodal_outputs_raw.is_contiguous():
+                snapshot = _snapshot_tensor_payload_to_cpu_async(
+                    multimodal_outputs_raw, copy_stream=self.async_output_copy_stream, pin_memory=pin_memory
+                )
+                per_req_payloads = [{"model_outputs": row} for row in snapshot.payload.unbind(0)]
+            else:
+                snapshot = _snapshot_tensor_payload_to_cpu_async(
+                    per_req_payloads, copy_stream=self.async_output_copy_stream, pin_memory=pin_memory
+                )
+                per_req_payloads = snapshot.payload
+
+        inter_stage_outputs: list[dict[str, object] | None] | None
+        multimodal_outputs: list[dict[str, object]] | None
         if self._async_chunk:
-            inter_stage_outputs, multimodal_outputs = partition_payload_list(per_req_payloads)
+            partitioned_inter, partitioned_client = partition_payload_list(per_req_payloads)
+            inter_stage_outputs = partitioned_inter
+            # Client payloads use None for an empty half; the wire field omits that inner Optional.
+            multimodal_outputs = cast(list[dict[str, object]] | None, partitioned_client)
         else:
             # See npu_ar_model_runner: non-async-chunk ships the full payload to the next
             # stage; #4527's (None, per_req_payloads) starved the downstream stage. (PR #4792)
-            inter_stage_outputs, multimodal_outputs = per_req_payloads, per_req_payloads
+            inter_stage_outputs = cast(list[dict[str, object] | None], per_req_payloads)
+            multimodal_outputs = per_req_payloads
         # [Omni] Copy req_id mappings to avoid async scheduling mutation.
         req_ids_output_copy = self.input_batch.req_ids.copy()
         req_id_to_index_output_copy = self.input_batch.req_id_to_index.copy()
@@ -654,11 +633,13 @@ class NPUGenerationModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin
                 self.eplb_updator.forward_end(self.eplb_heat_collection_status)
 
         self._finalize_dump_data()
+        if snapshot is not None:
+            return _AsyncGenerationOutput(output, snapshot)
         if not self.use_async_scheduling:
             return output
-        # Generation stages do not sample tokens. Avoid constructing an empty
-        # token tensor and a second copy-stream event just to wrap the payload.
-        return _AsyncNPUGenerationOutput(output, to_host)
+        # Generation stages do not sample tokens. The fallback payload is
+        # already on CPU, so no token-feedback event or CUDA wrapper is needed.
+        return _AsyncGenerationOutput(output, _AsyncCPUPayloadSnapshot(None, None, []))
 
     def _run_generation_model(
         self,

@@ -5,7 +5,7 @@ import torch
 
 from tests.helpers.mark import hardware_marks
 from vllm_omni.model_executor.models.moss_tts.modeling_moss_tts_talker import MossTTSLocalTalkerForGeneration
-from vllm_omni.worker.gpu_ar_model_runner import _snapshot_tensor_payload_to_cpu_async
+from vllm_omni.worker.async_omni_output import _snapshot_tensor_payload_to_cpu_async
 
 pytestmark = [pytest.mark.core_model, *hardware_marks(res={"cuda": "L4"}, num_cards=1)]
 
