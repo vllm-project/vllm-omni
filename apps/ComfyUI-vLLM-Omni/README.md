@@ -371,6 +371,19 @@ model. Neither replaces a real-model run: generate against H3, save with
 `ffprobe -v error -count_frames -show_streams -show_format -of json "$OUTPUT"`
 and `ffmpeg -v error -i "$OUTPUT" -f null -`, and watch and listen to it.
 
+#### Multiframe reference (WF-04)
+
+The [WF-04 template](example_workflows/vLLM-Omni%20MiniMax-H3%20Multiframe%20Reference.json)
+recreates the [official Multiframe Reference workflow](https://docs.comfy.org/tutorials/video/minimax/minimax-h3-multiframe)
+on the remote server. One image is the identity reference and three timeline
+guides pin the composition at 1.5 s, 3.0 s, and 5.0 s of a 124-frame, 24 FPS
+clip. Guides are clean timeline conditions rather than `<Picture N>` references,
+so the prompt tags only `<Picture 1>` and refers to the later anchors by time.
+Guided requests need base H3 weights: FastH3, a request LoRA (including Turbo),
+and latent-mask editing reject guides. See the
+[workflow guide](docs/wf04-h3-multiframe.md) for the anchor mapping, settings,
+and validation.
+
 ### TTS (e.g., Qwen TTS series)
 
 (Also available at **ComfyUI sidebar->Template->vLLM-Omni->vLLM-Omni TTS**)
