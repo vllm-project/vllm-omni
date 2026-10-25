@@ -20,9 +20,15 @@ from vllm_omni.diffusion.media import (
     VideoTensorSpec,
     VideoValueRange,
 )
-from vllm_omni.diffusion.models.hy_nomas.configuration_hy_nomas import DECODER_FILE, DIT_FILE, REQUIRED_FILES
+from vllm_omni.diffusion.models.hy_nomas.configuration_hy_nomas import (
+    DECODER_FILE,
+    DIT_FILE,
+    REQUIRED_FILES,
+    TEXT_ENCODER_ID,
+)
 from vllm_omni.diffusion.models.hy_nomas.parallel import initialize_reference_parallelism
 from vllm_omni.diffusion.models.hy_nomas.request import normalize_request
+from vllm_omni.diffusion.models.hy_nomas.weights import validate_dit_checkpoint
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
 from vllm_omni.diffusion.offloader.config import (
     DIT_COMPONENT,
@@ -78,11 +84,18 @@ def validate_config(config: OmniDiffusionConfig) -> None:
         raise ValueError("Hy-Nomas does not support a diffusion cache backend.")
     if config.quantization_config is not None or config.lora_path:
         raise ValueError("Hy-Nomas currently supports the unquantized distilled checkpoint without LoRA.")
+    if config.flow_shift not in (None, 5.0):
+        raise ValueError("Hy-Nomas requires flow_shift=5.")
+    if not config.enforce_eager and config.diffusion_compile_granularity == "full":
+        raise ValueError("Hy-Nomas does not support full transformer compilation; use enforce_eager=True.")
     if resolve_offload_strategy(config) not in (OffloadStrategy.NONE, OffloadStrategy.MODEL_LEVEL):
         raise ValueError("Hy-Nomas supports module CPU offload; layer offload is not supported.")
     custom = config.custom_pipeline_args or {}
     if custom.keys() - {"text_encoder"}:
         raise ValueError("Hy-Nomas custom_pipeline_args only supports text_encoder.")
+    text_encoder = custom.get("text_encoder", TEXT_ENCODER_ID)
+    if not isinstance(text_encoder, str) or not text_encoder.strip():
+        raise ValueError("Hy-Nomas text_encoder must be a nonempty model ID or local path.")
 
 
 class HyNomasPipeline(nn.Module, SupportsComponentDiscovery):
@@ -115,15 +128,20 @@ class HyNomasPipeline(nn.Module, SupportsComponentDiscovery):
         for relative in REQUIRED_FILES:
             if not (root / relative).is_file():
                 raise FileNotFoundError(f"Missing Hy-Nomas checkpoint: {root / relative}")
-        text_encoder = (od_config.custom_pipeline_args or {}).get("text_encoder", "Qwen/Qwen2.5-VL-7B-Instruct")
-        if not isinstance(text_encoder, str) or not text_encoder:
-            raise ValueError("Hy-Nomas text_encoder must be a nonempty model ID or local path.")
+        text_encoder = (od_config.custom_pipeline_args or {}).get("text_encoder", TEXT_ENCODER_ID)
         self.sp_size = od_config.parallel_config.ulysses_degree
         mesh = initialize_reference_parallelism(self.sp_size, self.device)
         config = build_reference_config(root, text_encoder, self.sp_size)
         self.pipe = HyNomasRuntime(
             args=config, device=self.device, dit_model_path=config.dit_weight, world_mesh=mesh
         ).eval()
+        validate_dit_checkpoint(self.pipe.transformer, root / DIT_FILE)
+
+    def setup_compile(self) -> None:
+        raise NotImplementedError(
+            "Hy-Nomas calls the reference forward_with_cache method; use enforce_eager=True. "
+            "The reference FlexAttention kernel retains its own compilation."
+        )
 
     def enable_omni_model_cpu_offload(
         self,
@@ -161,11 +179,10 @@ class HyNomasPipeline(nn.Module, SupportsComponentDiscovery):
             remove_sequential_offload([self.pipe.transformer, self.pipe.text_encoder, self.pipe.vae])
             self.pipe.omni_cpu_offload = False
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> None:
         # 参考实现已在构造时加载三个组件，禁止标准 loader 再传入另一组权重。
         if next(iter(weights), None) is not None:
             raise ValueError("Hy-Nomas loads weights through its reference component loaders.")
-        return set(dict(self.named_parameters()))
 
     def _reset_cache(self) -> None:
         from hymm.models.dit.modules.attention.range_attention import clear_range_cache

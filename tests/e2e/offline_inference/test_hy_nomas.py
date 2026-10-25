@@ -2,9 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import os
+import threading
+from collections.abc import Iterator
 
 import pytest
 import torch
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from tests.helpers.mark import hardware_marks
 from tests.helpers.runtime import OmniRunner
@@ -13,6 +16,27 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 pytestmark = [pytest.mark.local_model, pytest.mark.diffusion]
 
 MODEL = os.environ.get("HY_NOMAS_MODEL", "tencent/Hy-Nomas")
+
+
+@pytest.fixture
+def caller_sdpa_changes() -> Iterator[threading.Event]:
+    changed = threading.Event()
+    stop = threading.Event()
+
+    def observe() -> None:
+        while not stop.wait(0.005):
+            if torch.backends.cuda.cudnn_sdp_enabled():
+                changed.set()
+
+    with sdpa_kernel([SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]):
+        observer = threading.Thread(target=observe, daemon=True)
+        observer.start()
+        try:
+            yield changed
+        finally:
+            stop.set()
+            observer.join(timeout=5)
+            assert not observer.is_alive()
 
 
 @pytest.mark.parametrize(
@@ -45,7 +69,7 @@ MODEL = os.environ.get("HY_NOMAS_MODEL", "tencent/Hy-Nomas")
     ],
     indirect=True,
 )
-def test_two_segments_then_independent_request(omni_runner: OmniRunner):
+def test_two_segments_then_independent_request(omni_runner: OmniRunner, caller_sdpa_changes: threading.Event):
     for prompt, extra, steps in (
         ("A forest beside a river. ||| The camera moves along the river.", {"segment_frame_boundaries": [0, 4, 9]}, 4),
         ("A beach at sunrise.", {}, 6),
@@ -72,3 +96,4 @@ def test_two_segments_then_independent_request(omni_runner: OmniRunner):
         assert frames.shape == (1, 9, 3, 256, 256)
         assert torch.isfinite(frames).all()
         assert frames.min() >= 0 and frames.max() <= 1
+    assert not caller_sdpa_changes.is_set(), "Inference changed the calling process's SDPA backend policy"

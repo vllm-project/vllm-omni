@@ -28,6 +28,7 @@ class _FakeODConfig:
         self.distributed_executor_backend = backend
         self.worker_extension_cls = None
         self.custom_pipeline_args = None
+        self.model_class_name: str | None = None
 
 
 def _od_config(num_gpus: int = 1, backend: str | None = None) -> _FakeODConfig:
@@ -44,6 +45,20 @@ def test_explicit_mp_is_honored_on_single_gpu():
 
 def test_multi_gpu_defaults_to_multiproc():
     assert DiffusionExecutor.get_class(_od_config(num_gpus=2)) is MultiprocDiffusionExecutor
+
+
+def test_model_requiring_isolation_defaults_to_multiproc():
+    config = _od_config(num_gpus=1)
+    config.model_class_name = "HyNomasPipeline"
+    assert DiffusionExecutor.get_class(config) is MultiprocDiffusionExecutor
+
+
+@pytest.mark.parametrize("backend", ["uni", UniProcDiffusionExecutor])
+def test_model_requiring_isolation_rejects_uniproc(backend):
+    config = _od_config(num_gpus=1, backend=backend)
+    config.model_class_name = "HyNomasPipeline"
+    with pytest.raises(ValueError, match="requires process isolation"):
+        DiffusionExecutor.get_class(config)
 
 
 def test_explicit_uni_backend_is_honored():

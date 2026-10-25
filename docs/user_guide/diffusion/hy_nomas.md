@@ -30,8 +30,9 @@ python -c 'from hymm.pipeline.causal_ar import CPTCausalInferencePipeline'
 
 The validated environment uses Python 3.12, PyTorch 2.13.0/CUDA 13.0, vLLM 0.32.0,
 Transformers 5.16.1, Diffusers 0.40.0, and FlashAttention 2.8.3 on H200.
-The adapter scopes PyTorch SDPA backend selection to each inference call to preserve
-the reference's cuDNN-enabled policy, then restores the previous settings.
+Hy-Nomas defaults to the `mp` executor even on one GPU. Its reference runtime uses
+process-global Torch state, so the `uni` executor is rejected. SDPA backend selection
+is scoped to inference inside the isolated worker to preserve the reference policy.
 
 ## Checkpoints
 
@@ -40,6 +41,8 @@ two checkpoint files are requested by the pipeline:
 
 - `DiT/distilled/diffusion_pytorch_model_ema_0_995.safetensors`
 - `VAE/PixelUMM_FT/diffusion_pytorch_model.safetensors`
+
+The DiT checkpoint must contain every required parameter, including camera weights.
 
 The text encoder separately loads `Qwen/Qwen2.5-VL-7B-Instruct`. A local Hy-Nomas
 directory must retain the same two relative paths. To use a local text encoder,
@@ -97,6 +100,12 @@ Multi-segment and camera parameters use the endpoint's JSON `extra_params` form 
 for example `-F 'extra_params={"segment_frame_boundaries":[0,60,121],"camera_trajectory":"pan_left","segment_has_camera":[true,true]}'`
 with a two-segment prompt and 121 frames.
 
+The standard `seconds` field is also supported: `-F 'seconds=4'` resolves to 97
+frames at 24 fps, including the initial frame. Offline callers can pass
+`--extra-body '{"duration":4}'`. An explicit `num_frames` must agree with the
+duration; fractional durations must span a positive multiple of four frame
+intervals. `generate_sound=false` is accepted; audio generation is unsupported.
+
 ## Sequence parallelism
 
 Use two CUDA devices with the shared offline example's `--ulysses-degree 2`,
@@ -146,6 +155,7 @@ layerwise offload are not supported.
 
 - CUDA, BF16 distilled DiT, BF16 PixelUMM, one output per request.
 - Four, six, or eight denoising steps; guidance scale one and flow shift five.
+  Engine-level and request-level flow-shift overrides use the same constraint.
 - 24 fps, dimensions divisible by 32, and `num_frames=4*n+1` with `n >= 1`.
   The reference's 720-pixel height is reduced to 704 by its 32-pixel latent grid;
   this API requires the actual output height explicitly and defaults to 704.
@@ -154,6 +164,10 @@ layerwise offload are not supported.
 - Generic startup warmup is disabled because its two-step, CFG-zero request is
   outside the distilled model's sampling contract. The first real request includes
   reference-kernel compilation.
+- Use `--enforce-eager`. Full-transformer compilation is rejected. A request for
+  generic regional compilation reports that the reference cached forward method
+  is unsupported and keeps the reference execution path; FlexAttention kernels
+  retain their own compilation.
 - Quantization, LoRA, Cache-DiT, latent output,
   input images, and incremental streaming are not supported by this adapter.
 

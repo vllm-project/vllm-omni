@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import json
+import os
+import subprocess
 import sys
 from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock
@@ -8,6 +11,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 from omegaconf import DictConfig
+from safetensors.torch import save_file
 from torch import nn
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
@@ -15,7 +19,7 @@ from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfi
 from vllm_omni.diffusion.media import VideoValueRange
 from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
 from vllm_omni.diffusion.models.hy_nomas import pipeline_hy_nomas
-from vllm_omni.diffusion.models.hy_nomas.configuration_hy_nomas import REQUIRED_FILES
+from vllm_omni.diffusion.models.hy_nomas.configuration_hy_nomas import DIT_FILE, REQUIRED_FILES
 from vllm_omni.diffusion.models.hy_nomas.pipeline_hy_nomas import HyNomasPipeline, validate_config
 from vllm_omni.diffusion.models.hy_nomas.request import normalize_request
 from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -41,6 +45,50 @@ def test_discovery_without_model_index(tmp_path):
     assert get_diffusion_model_metadata("HyNomasPipeline").final_output_type == "video"
 
 
+def test_native_discovery_does_not_import_runtime_registry():
+    code = (
+        "import sys; "
+        "from vllm_omni.diffusion.utils.hf_utils import resolve_native_diffusion_model_class; "
+        "assert resolve_native_diffusion_model_class('tencent/Hy-Nomas') == 'HyNomasPipeline'; "
+        "assert resolve_native_diffusion_model_class('other/model') is None; "
+        "assert 'vllm_omni.diffusion.registry' not in sys.modules; "
+        "assert 'hymm' not in sys.modules"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, env={**os.environ, "CUDA_VISIBLE_DEVICES": ""}
+    )
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize("modelscope", ["false", "true"])
+def test_native_configuration_does_not_probe_remote_root_configs(monkeypatch, modelscope):
+    from vllm import envs
+
+    envs.disable_envs_cache()
+    monkeypatch.setenv("VLLM_USE_MODELSCOPE", modelscope)
+    monkeypatch.setattr("huggingface_hub.constants.HF_HUB_OFFLINE", False)
+    probe = Mock(side_effect=AssertionError("Native checkpoint discovery must not fetch root configs"))
+    monkeypatch.setattr("vllm_omni.diffusion.utils.hf_utils.get_diffusion_model_index", probe)
+    monkeypatch.setattr("vllm.transformers_utils.config.get_hf_file_to_dict", probe)
+    config = OmniDiffusionConfig(model="tencent/Hy-Nomas")
+    config.enrich_config()
+    assert config.model_class_name == "HyNomasPipeline"
+    probe.assert_not_called()
+
+
+def test_local_pipeline_index_keeps_precedence_over_native_signature(tmp_path):
+    for relative in REQUIRED_FILES:
+        path = tmp_path / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.touch()
+    (tmp_path / "model_index.json").write_text(
+        json.dumps({"_class_name": "QwenImagePipeline", "_diffusers_version": "0.40.0"})
+    )
+    config = OmniDiffusionConfig(model=str(tmp_path))
+    config.enrich_config()
+    assert config.model_class_name == "QwenImagePipeline"
+
+
 def test_public_defaults():
     defaults = get_video_generation_defaults("HyNomasPipeline")
     assert (defaults.height, defaults.width, defaults.num_frames) == (704, 1280, 121)
@@ -54,8 +102,11 @@ def test_pipeline_downloads_only_distilled_weights(tmp_path, monkeypatch):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.touch()
     download = Mock(return_value=str(tmp_path))
+    reference = nn.Module()
+    reference.transformer = nn.Linear(2, 2, bias=False)
+    save_file(reference.transformer.state_dict(), str(tmp_path / DIT_FILE))
     runtime = ModuleType("vllm_omni.diffusion.models.hy_nomas.runtime")
-    monkeypatch.setattr(runtime, "HyNomasRuntime", Mock(return_value=nn.Module()), raising=False)
+    monkeypatch.setattr(runtime, "HyNomasRuntime", Mock(return_value=reference), raising=False)
     monkeypatch.setitem(sys.modules, runtime.__name__, runtime)
     monkeypatch.setattr(pipeline_hy_nomas, "get_local_device", lambda: torch.device("cuda:0"))
     monkeypatch.setattr(pipeline_hy_nomas, "initialize_reference_parallelism", Mock(return_value=None))
@@ -73,6 +124,31 @@ def test_pipeline_downloads_only_distilled_weights(tmp_path, monkeypatch):
         revision="test-revision",
         require_all=True,
     )
+
+
+@pytest.mark.parametrize("encoder", ["", " ", 42, None])
+def test_invalid_encoder_fails_before_download(monkeypatch, encoder):
+    download = Mock()
+    monkeypatch.setattr(pipeline_hy_nomas, "download_weights_from_hf_specific", download)
+    config = OmniDiffusionConfig(dtype=torch.bfloat16, custom_pipeline_args={"text_encoder": encoder})
+    with pytest.raises(ValueError, match="text_encoder must be"):
+        HyNomasPipeline(od_config=config)
+    download.assert_not_called()
+
+
+@pytest.mark.parametrize("duration,frames", [(4, 97), (8, 193), (0.5, 13)])
+def test_duration_resolves_frame_count(duration, frames):
+    params = OmniDiffusionSamplingParams(extra_args={"duration": duration, "generate_sound": False})
+    assert normalize_request("A forest", params).num_frames == frames
+    params.num_frames = frames + 4
+    with pytest.raises(OmniClientError, match="conflicts with duration"):
+        normalize_request("A forest", params)
+
+
+@pytest.mark.parametrize("duration", [0, -1, True, "bad", float("inf"), 1.1])
+def test_invalid_duration(duration):
+    with pytest.raises(OmniClientError, match="duration"):
+        normalize_request("A forest", OmniDiffusionSamplingParams(extra_args={"duration": duration}))
 
 
 @pytest.mark.parametrize("as_list", [False, True])
@@ -118,6 +194,7 @@ def test_segment_and_camera_request():
         ({"extra_args": {"segment_frame_boundaries": [0, 120]}}, "boundaries"),
         ({"extra_args": {"segment_has_camera": [True]}}, "segment_has_camera"),
         ({"extra_args": {"camera_trajectory": ""}}, "camera_trajectory"),
+        ({"extra_args": {"generate_sound": True}}, "without audio"),
     ],
 )
 def test_invalid_sampling(overrides, match):
@@ -275,6 +352,8 @@ def test_module_offload_selects_components_and_removes_hooks(monkeypatch, compon
         ({"lora_path": "adapter"}, "LoRA"),
         ({"custom_pipeline_args": {"arbitrary": True}}, "text_encoder"),
         ({"enable_layerwise_offload": True}, "layer offload"),
+        ({"flow_shift": 3.0}, "flow_shift=5"),
+        ({"enforce_eager": False, "diffusion_compile_granularity": "full"}, "full transformer compilation"),
     ],
 )
 def test_unsupported_engine_features(overrides, match):
@@ -285,6 +364,9 @@ def test_unsupported_engine_features(overrides, match):
         quantization_config=None,
         lora_path=None,
         custom_pipeline_args={},
+        flow_shift=None,
+        enforce_eager=True,
+        diffusion_compile_granularity="regional",
     )
     config.__dict__.update(overrides)
     with pytest.raises(ValueError, match=match):

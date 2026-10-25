@@ -1130,6 +1130,28 @@ def test_magi2_serving_applies_native_defaults_and_rejects_explicit_frame_mismat
         )
 
 
+@pytest.mark.parametrize(
+    "fields,frames",
+    [
+        ({"seconds": "4"}, 97),
+        ({"seconds": "4", "num_frames": 97}, 97),
+        ({"extra_params": {"duration": 4}}, 97),
+        ({"generate_sound": False}, 121),
+    ],
+)
+def test_hy_nomas_standard_video_fields_reach_model_validation(fields, frames):
+    from vllm_omni.diffusion.models.hy_nomas.request import normalize_request
+
+    engine = FakeAsyncOmni()
+    engine.model_class_name = "HyNomasPipeline"
+    handler = OmniOpenAIServingVideo.for_diffusion(engine, model_name="tencent/Hy-Nomas")
+    asyncio.run(handler._run_and_extract(VideoGenerationRequest(prompt="A forest", **fields), "hy-standard"))
+    assert engine.captured_sampling_params_list is not None
+    sampling = engine.captured_sampling_params_list[0]
+    assert sampling.num_frames == frames
+    assert normalize_request(engine.captured_prompt, sampling).num_frames == frames
+
+
 def test_kandinsky6_serving_applies_defaults_but_allows_explicit_frame_count():
     """Kandinsky 6 publishes Pro-geometry defaults (480x864, 125 frames, 50
     steps) but is not a fixed-duration model: an explicit ``num_frames``
@@ -1157,6 +1179,7 @@ def test_kandinsky6_serving_applies_defaults_but_allows_explicit_frame_count():
             "explicit",
         )
     )
+    assert engine.captured_sampling_params_list is not None
     sampling = engine.captured_sampling_params_list[-1]
     assert (sampling.width, sampling.height) == (512, 320)
     assert sampling.num_frames == 25

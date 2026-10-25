@@ -8,7 +8,7 @@ import torch
 from vllm_omni.diffusion.request import resolve_video_num_frames
 from vllm_omni.errors import OmniClientError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType
-from vllm_omni.model_extras.hy_nomas import HY_NOMAS_EXTRA_BODY_PARAMS
+from vllm_omni.model_extras.hy_nomas import HY_NOMAS_EXTRA_BODY_PARAMS, get_hy_nomas_video_generation_defaults
 
 
 @dataclass(frozen=True)
@@ -40,6 +40,12 @@ def normalize_request(prompt: OmniPromptType, params: OmniDiffusionSamplingParam
     unknown = extra.keys() - HY_NOMAS_EXTRA_BODY_PARAMS
     if unknown:
         raise OmniClientError(f"Unsupported Hy-Nomas extra_args: {sorted(unknown)}")
+    try:
+        defaults = get_hy_nomas_video_generation_defaults(extra)
+    except (TypeError, ValueError) as exc:
+        raise OmniClientError(str(exc)) from exc
+    if extra.get("generate_sound") not in (None, False):
+        raise OmniClientError("Hy-Nomas generates video without audio; generate_sound must be false.")
     if params.num_outputs_per_prompt != 1:
         raise OmniClientError("Hy-Nomas supports one output per prompt.")
     if params.output_type == "latent":
@@ -50,15 +56,17 @@ def normalize_request(prompt: OmniPromptType, params: OmniDiffusionSamplingParam
         raise OmniClientError("Hy-Nomas uses the reference flow_shift=5.")
     if params.resolved_frame_rate not in (None, 24.0):
         raise OmniClientError("Hy-Nomas uses 24 fps for text and camera conditioning.")
-    frames = resolve_video_num_frames(params.num_frames, default_num_frames=121, is_dummy_run=False)
+    frames = resolve_video_num_frames(params.num_frames, default_num_frames=defaults.num_frames, is_dummy_run=False)
     if type(frames) is not int or frames < 5 or (frames - 1) % 4:
         raise OmniClientError("Hy-Nomas num_frames must be 4*n+1 with n >= 1.")
-    height = 704 if params.height is None else params.height
-    width = 1280 if params.width is None else params.width
+    if extra.get("duration") is not None and frames != defaults.num_frames:
+        raise OmniClientError("Hy-Nomas num_frames conflicts with duration at 24 fps (four frame intervals plus one).")
+    height = defaults.height if params.height is None else params.height
+    width = defaults.width if params.width is None else params.width
     for name, value in (("height", height), ("width", width)):
         if type(value) is not int or value < 32 or value % 32:
             raise OmniClientError(f"Hy-Nomas {name} must be a positive multiple of 32.")
-    steps = 8 if params.num_inference_steps is None else params.num_inference_steps
+    steps = defaults.num_inference_steps if params.num_inference_steps is None else params.num_inference_steps
     if type(steps) is not int or steps not in (4, 6, 8):
         raise OmniClientError("Hy-Nomas distilled inference supports 4, 6, or 8 steps.")
     boundaries = extra.get("segment_frame_boundaries")

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+from collections.abc import Iterator
 from dataclasses import dataclass
 
 
@@ -37,6 +38,9 @@ class DiffusionModelMetadata:
     # Whether ``/v1/videos/depth`` may serve this model: it takes one video path
     # and returns a ``video_depth`` payload of per-frame depth maps.
     supports_video_depth: bool = False
+    native_config_module: str | None = None
+    # External models with process-scoped runtime state need process isolation.
+    requires_process_isolation: bool = False
 
 
 # ``extra_args`` keys that only name a request (the video API's job-id tag for
@@ -58,7 +62,11 @@ BOOGU_IMAGE_MAX_INPUT_IMAGES = 1
 
 
 _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
-    "HyNomasPipeline": DiffusionModelMetadata(final_output_type="video"),
+    "HyNomasPipeline": DiffusionModelMetadata(
+        final_output_type="video",
+        native_config_module="vllm_omni.diffusion.models.hy_nomas.configuration_hy_nomas",
+        requires_process_isolation=True,
+    ),
     "SeedVR2Pipeline": DiffusionModelMetadata(supports_multimodal_inputs=True, final_output_type="video"),
     "Sam3Pipeline": DiffusionModelMetadata(
         supports_multimodal_inputs=True,
@@ -135,6 +143,7 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
         supports_multimodal_inputs=True,
         max_multimodal_image_inputs=1,
         final_output_type="video",
+        native_config_module="vllm_omni.diffusion.models.magi2.configuration_magi2",
     ),
     # Joint text/image-to-video-and-audio, same shape as MiniMaxH3Pipeline
     # above (an MP4 with both tracks) — declared "video" for the same reason:
@@ -200,6 +209,12 @@ _DIFFUSION_MODEL_METADATA_ALIASES = {
     "LingBotWorldCausalDMDPipeline": "LingBotVideoPipeline",
     "BooguImageTurboPipeline": "BooguImagePipeline",
 }
+
+
+def iter_native_model_configs() -> Iterator[tuple[str, str]]:
+    for model_class, metadata in _DIFFUSION_MODEL_METADATA.items():
+        if metadata.native_config_module is not None:
+            yield model_class, metadata.native_config_module
 
 
 def get_diffusion_model_metadata(model_class_name: str | None) -> DiffusionModelMetadata:

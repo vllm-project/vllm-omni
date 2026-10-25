@@ -9,6 +9,8 @@ from functools import lru_cache
 from vllm.logger import init_logger
 from vllm.transformers_utils.config import get_hf_file_to_dict
 
+from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata, iter_native_model_configs
+
 logger = init_logger(__name__)
 
 DIFFUSION_MODEL_INDEX_FILES = (
@@ -52,15 +54,13 @@ def _looks_like_bagel(model_name: str) -> bool:
 
 def resolve_native_diffusion_model_class(model_name: str) -> str | None:
     """Resolve native checkpoints that have no root HF or Diffusers config."""
-    from vllm_omni.diffusion.registry import NATIVE_MODEL_CONFIGS
     from vllm_omni.diffusion.models.video_depth_anything.checkpoints import resolve_checkpoint
-
     normalized = str(model_name).strip().rstrip("/")
     hub_prefix = "https://huggingface.co/"
     if normalized.lower().startswith(hub_prefix):
         normalized = normalized[len(hub_prefix) :]
         normalized = normalized.split("/tree/", 1)[0]
-    for model_class, module_name in NATIVE_MODEL_CONFIGS.items():
+    for model_class, module_name in iter_native_model_configs():
         config = importlib.import_module(module_name)
         model_ids = (config.MODEL_ID, *getattr(config, "MODEL_ALIASES", ()))
         if normalized.lower() in (model_id.lower() for model_id in model_ids) or (
@@ -74,12 +74,12 @@ def resolve_native_diffusion_model_class(model_name: str) -> str | None:
 
 
 def should_defer_native_model_download(model_name: str) -> bool:
-    from vllm_omni.diffusion.registry import NATIVE_MODEL_CONFIGS
-
     model_class = resolve_native_diffusion_model_class(model_name)
     if model_class is None:
         return False
-    config = importlib.import_module(NATIVE_MODEL_CONFIGS[model_class])
+    module_name = get_diffusion_model_metadata(model_class).native_config_module
+    assert module_name is not None
+    config = importlib.import_module(module_name)
     return getattr(config, "DEFER_DOWNLOAD", False)
 
 

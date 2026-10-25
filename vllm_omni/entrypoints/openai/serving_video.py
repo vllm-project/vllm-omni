@@ -11,9 +11,11 @@ from dataclasses import dataclass
 from functools import cached_property
 from http import HTTPStatus
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, SupportsIndex, SupportsInt, cast
 
+import numpy as np
 import pybase64 as base64
+import torch
 from fastapi import HTTPException
 from PIL import Image
 from vllm.engine.protocol import EngineClient
@@ -223,7 +225,11 @@ class OmniOpenAIServingVideo:
         od_config = self._resolve_diffusion_od_config()
         model_class_name = None if od_config is None else getattr(od_config, "model_class_name", None)
         try:
-            return get_video_generation_defaults(model_class_name, request.extra_params)
+            extra_params = request.extra_params
+            if request.seconds is not None:
+                extra_params = dict(extra_params or {})
+                extra_params.setdefault("duration", float(request.seconds))
+            return get_video_generation_defaults(model_class_name, extra_params)
         except (TypeError, ValueError) as exc:
             raise HTTPException(
                 status_code=HTTPStatus.BAD_REQUEST.value,
@@ -360,7 +366,7 @@ class OmniOpenAIServingVideo:
         self._video_frame_converter.shutdown()
 
     async def abort_request(self, request_id: str) -> None:
-        await self._engine_client.abort(request_id, timeout=ABORT_TIMEOUT_S)
+        await cast(AsyncOmni, self._engine_client).abort(request_id, timeout=ABORT_TIMEOUT_S)
 
     async def _run_and_extract(
         self,
@@ -379,7 +385,7 @@ class OmniOpenAIServingVideo:
                 status_code=HTTPStatus.BAD_REQUEST.value,
                 detail="streaming_buffer_seconds is only supported by /v1/realtime/video; use session.playback.",
             )
-        prompt: OmniTextPrompt = OmniTextPrompt(prompt=request.prompt, modalities=["video"])
+        prompt = cast(OmniTextPrompt, {"prompt": request.prompt, "modalities": ["video"]})
         if request.negative_prompt is not None:
             prompt["negative_prompt"] = request.negative_prompt
 
@@ -596,7 +602,9 @@ class OmniOpenAIServingVideo:
         metadata = multimodal_output.get("metadata") if isinstance(multimodal_output, dict) else {}
         common_metadata = metadata.get("common") if isinstance(metadata, dict) else {}
         action_only = bool(isinstance(common_metadata, dict) and common_metadata.get("action_only_output"))
-        videos = [{"action_only_output": True}] if action_only else self._extract_video_outputs(result)
+        videos: list[DiffusionPayloadValue] = (
+            [{"action_only_output": True}] if action_only else self._extract_video_outputs(result)
+        )
         audios = self._extract_audio_outputs(result, expected_count=len(videos))
         actions = self._extract_action_outputs(result, expected_count=len(videos))
         audio_sample_rate = self._resolve_audio_sample_rate(result)
@@ -859,23 +867,23 @@ class OmniOpenAIServingVideo:
     def _normalize_video_outputs(videos: DiffusionPayloadValue | None) -> list[DiffusionPayloadValue]:
         if videos is None:
             return []
-        if hasattr(videos, "ndim") and videos.ndim == 5:
+        if isinstance(videos, (np.ndarray, torch.Tensor)) and videos.ndim == 5:
             return [videos[i] for i in range(videos.shape[0])]
         if isinstance(videos, list):
             if not videos:
                 return []
             first = videos[0]
-            if hasattr(first, "ndim") and first.ndim == 5:
+            if isinstance(first, (np.ndarray, torch.Tensor)) and first.ndim == 5:
                 flattened: list[DiffusionPayloadValue] = []
                 for item in videos:
-                    if hasattr(item, "ndim") and item.ndim == 5:
+                    if isinstance(item, (np.ndarray, torch.Tensor)) and item.ndim == 5:
                         flattened.extend([item[i] for i in range(item.shape[0])])
                     else:
                         flattened.append(item)
                 return flattened
             if isinstance(first, list):
                 return videos
-            if hasattr(first, "ndim") and first.ndim == 3:
+            if isinstance(first, (np.ndarray, torch.Tensor)) and first.ndim == 3:
                 return [videos]
             if isinstance(first, Image.Image):
                 return [videos]
@@ -1018,6 +1026,8 @@ class OmniOpenAIServingVideo:
 
     @staticmethod
     def _index_action(action: DiffusionPayloadValue, index: int) -> DiffusionPayloadValue | None:
+        if not isinstance(action, (np.ndarray, torch.Tensor, list, tuple, str, bytes)):
+            return None
         try:
             return action[index]
         except (IndexError, KeyError, TypeError):
@@ -1025,15 +1035,13 @@ class OmniOpenAIServingVideo:
 
     @classmethod
     def _to_jsonable(cls, value: DiffusionPayloadValue) -> DiffusionPayloadValue:
-        if hasattr(value, "detach"):
-            value = value.detach()
-        if hasattr(value, "cpu"):
-            value = value.cpu()
-        if hasattr(value, "tolist"):
+        if isinstance(value, torch.Tensor):
+            value = value.detach().cpu()
+        if isinstance(value, (np.ndarray, torch.Tensor)):
             return cls._to_jsonable(value.tolist())
         if isinstance(value, (list, tuple)):
             return [cls._to_jsonable(item) for item in value]
-        if hasattr(value, "item"):
+        if isinstance(value, np.generic):
             try:
                 return value.item()
             except (TypeError, ValueError):
@@ -1065,6 +1073,8 @@ class OmniOpenAIServingVideo:
             return None
         try:
             value = value.item() if hasattr(value, "item") else value
+            if not isinstance(value, (str, bytes, bytearray, SupportsInt, SupportsIndex)):
+                return None
             return int(value)
         except (TypeError, ValueError):
             return None

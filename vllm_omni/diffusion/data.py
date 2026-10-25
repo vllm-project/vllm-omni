@@ -20,6 +20,7 @@ from PIL import Image
 from pydantic import model_validator
 from typing_extensions import Self
 from vllm.config import KernelConfig
+from vllm.config.kernel import LinearBackend, MoEBackend
 from vllm.config.utils import config
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.base_config import (
@@ -992,8 +993,8 @@ class OmniDiffusionConfig:
     skip_time_steps: int = 15
 
     # Reuse upstream kernel selection; "auto" preserves platform defaults.
-    moe_backend: str = "auto"
-    linear_backend: str = "auto"
+    moe_backend: MoEBackend = "auto"
+    linear_backend: LinearBackend = "auto"
 
     # Compilation
     enforce_eager: bool = False
@@ -1580,6 +1581,7 @@ class OmniDiffusionConfig:
 
     def _load_component_transformer_config(self) -> bool:
         """Load a registered pipeline's component-level DiT configuration."""
+        assert self.model is not None
         from vllm.transformers_utils.config import get_hf_file_to_dict
 
         from vllm_omni.model_extras import get_transformer_config_subfolder
@@ -1625,21 +1627,39 @@ class OmniDiffusionConfig:
         """
         from vllm.transformers_utils.config import get_hf_file_to_dict
 
-        from vllm_omni.diffusion.registry import resolve_native_single_file
         from vllm_omni.diffusion.utils.hf_utils import (
+            DIFFUSION_MODEL_INDEX_FILES,
             get_diffusion_model_index,
             resolve_native_diffusion_model_class,
         )
 
         assert self.model is not None
 
-        native_single_file_model = resolve_native_single_file(self.model_class_name)
-        if self.is_single_file and native_single_file_model is not None:
-            self.diffusion_load_format = "default"
-            self.model_class_name = native_single_file_model
+        native_model_class = resolve_native_diffusion_model_class(self.model)
+        if (
+            native_model_class is not None
+            and self.diffusion_load_format != "diffusers"
+            and self.model_class_name in (None, native_model_class)
+            and not any(
+                os.path.isfile(os.path.join(self.model, name)) for name in (*DIFFUSION_MODEL_INDEX_FILES, "config.json")
+            )
+        ):
+            self.model_class_name = native_model_class
             self.diffusers_pipeline_cls = None
             self.set_tf_model_config(TransformerConfig())
+            self.update_multimodal_support()
             return
+
+        if self.is_single_file:
+            from vllm_omni.diffusion.registry import resolve_native_single_file
+
+            native_single_file_model = resolve_native_single_file(self.model_class_name)
+            if native_single_file_model is not None:
+                self.diffusion_load_format = "default"
+                self.model_class_name = native_single_file_model
+                self.diffusers_pipeline_cls = None
+                self.set_tf_model_config(TransformerConfig())
+                return
 
         try:
             config_dict = get_diffusion_model_index(
@@ -1694,12 +1714,6 @@ class OmniDiffusionConfig:
             else:
                 cfg = get_hf_file_to_dict("config.json", self.model, revision=self.revision)
                 if cfg is None:
-                    native_model_class = resolve_native_diffusion_model_class(self.model)
-                    if native_model_class is not None:
-                        self.model_class_name = native_model_class
-                        self.set_tf_model_config(TransformerConfig())
-                        self.update_multimodal_support()
-                        return
                     # Lance ships its top-level config.json one directory above
                     # the per-checkpoint subfolders (``Lance_3B/`` or
                     # ``Lance_3B_Video/``).  Try to recover that case before

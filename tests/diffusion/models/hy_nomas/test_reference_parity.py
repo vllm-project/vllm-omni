@@ -9,6 +9,7 @@ import torch
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from vllm.utils.torch_utils import set_default_torch_dtype
 
+from tests.helpers.clean import cleanup_test_environment
 from tests.helpers.mark import hardware_marks
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
@@ -23,7 +24,17 @@ pytestmark = [pytest.mark.local_model, pytest.mark.diffusion, *hardware_marks(re
 
 
 @pytest.fixture(scope="module")
-def pipelines():
+def model_cleanup():
+    cleanup_test_environment()
+    try:
+        yield
+    finally:
+        # pipelines 的 fixture 引用已释放，再回收 offload hook 的引用环。
+        cleanup_test_environment()
+
+
+@pytest.fixture(scope="module")
+def pipelines(model_cleanup):
     from configs import config as reference_config
     from hydra import compose, initialize_config_dir
     from hymm.pipeline.causal_ar import CPTCausalInferencePipeline
@@ -49,17 +60,22 @@ def pipelines():
     config.parallelism.sp_size = 1
     config.parallelism.shard_text_encoder = False
     device = get_local_device()
-    reference = CPTCausalInferencePipeline(reference_config._flatten_cfg(config), device, config.dit_weight).eval()
     omni_config = OmniDiffusionConfig(
         model=str(root),
         dtype=torch.bfloat16,
         enforce_eager=True,
         custom_pipeline_args={"text_encoder": text_encoder},
     )
-    with set_default_torch_dtype(torch.bfloat16):
-        candidate = HyNomasPipeline(od_config=omni_config)
-    yield reference, candidate, device
-    del reference, candidate
+    reference = candidate = None
+    try:
+        reference = CPTCausalInferencePipeline(reference_config._flatten_cfg(config), device, config.dit_weight).eval()
+        with set_default_torch_dtype(torch.bfloat16):
+            candidate = HyNomasPipeline(od_config=omni_config)
+        yield reference, candidate, device
+    finally:
+        if candidate is not None:
+            candidate.disable_omni_model_cpu_offload()
+        reference = candidate = None
 
 
 @pytest.mark.parametrize("offload", [False, True], ids=["resident", "cpu_offload"])
