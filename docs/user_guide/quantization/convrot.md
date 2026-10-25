@@ -30,10 +30,10 @@ sensitive layers.
 `convrot_mxfp4` and `convrot_mxfp8` delegate kernel selection to vLLM's
 `init_mxfp4_linear_kernel` and `init_mxfp8_linear_kernel` factories. This
 selects the best available backend for the current device and weight shape.
-Native W4A4/W8A8 kernels are used where available; other CUDA devices may
-select weight-only Marlin or emulation fallbacks. `convrot_mxfp4` accepts
-`mxfp8_layers` to keep selected sensitive layers on rotated MXFP8 while the
-remaining layers use MXFP4.
+Native W4A4/W8A8 kernels are used where available, including the XPU kernels
+on Intel Arc GPUs; other CUDA devices may select weight-only Marlin or
+emulation fallbacks. `convrot_mxfp4` accepts `mxfp8_layers` to keep selected
+sensitive layers on rotated MXFP8 while the remaining layers use MXFP4.
 
 ## Usage
 
@@ -111,9 +111,9 @@ after unpacking; it saves memory but is not faster than `convrot_int8` there.
 
 - `convrot_int8` and `convrot_int4` require CUDA 8.0+. MXFP device support is
   determined by vLLM's selected linear kernel; native W4A4/W8A8 support is
-  currently available on Blackwell, while other backends may use weight-only or
-  emulated kernels. Weights are quantized online; ConvRot checkpoints are not
-  serialized.
+  currently available on Blackwell and Intel XPU, while other backends may use
+  weight-only or emulated kernels. Weights are quantized online; ConvRot
+  checkpoints are not serialized.
 - Rotation, activation quantization and, for `convrot_int4`, weight unpacking
   run as separate operations around the GEMM; they are not fused.
 - INT4 activations have a coarse per-token resolution. Compare against BF16 on

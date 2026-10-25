@@ -29,6 +29,14 @@ from vllm_omni.quantization.factory import SUPPORTED_QUANTIZATION_METHODS
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
 cuda_available = pytest.mark.skipif(not current_omni_platform.is_cuda(), reason="GPU platform not available.")
+accelerator_available = pytest.mark.skipif(
+    not (current_omni_platform.is_cuda() or current_omni_platform.is_xpu()),
+    reason="GPU platform not available.",
+)
+
+
+def accelerator_device() -> str:
+    return "xpu" if current_omni_platform.is_xpu() else "cuda"
 
 
 @pytest.mark.parametrize("size", [4, 16, 64, 256, 1024])
@@ -239,9 +247,9 @@ class TestCudaConvRot:
         assert layer.weight.dtype == torch.int8 and error < 0.02
 
 
-@cuda_available
-class TestCudaConvRotMxfp4:
-    """Real MXFP4 kernels selected by vLLM for the current device."""
+@accelerator_available
+class TestGpuConvRotMxfp4:
+    """Real MXFP4 kernels selected by vLLM for the current accelerator."""
 
     @staticmethod
     def _layer(weight):
@@ -256,11 +264,11 @@ class TestCudaConvRotMxfp4:
     @staticmethod
     def _inputs():
         torch.manual_seed(0)
-        x = torch.randn(4, 64, 1024, dtype=torch.bfloat16, device="cuda")
+        x = torch.randn(4, 64, 1024, dtype=torch.bfloat16, device=accelerator_device())
         x[..., [3, 500, 777]] *= 80.0
-        weight = torch.randn(768, 1024, dtype=torch.bfloat16, device="cuda") / 32
+        weight = torch.randn(768, 1024, dtype=torch.bfloat16, device=accelerator_device()) / 32
         weight[:, 11] *= 30.0
-        bias = torch.randn(768, dtype=torch.bfloat16, device="cuda")
+        bias = torch.randn(768, dtype=torch.bfloat16, device=accelerator_device())
         return x, weight, bias
 
     @staticmethod
@@ -296,9 +304,9 @@ class TestCudaConvRotMxfp4:
         assert rotated < 0.3 and rotated < plain / 1.8
 
 
-@cuda_available
-class TestCudaConvRotMxfp8:
-    """Real MXFP8 kernels selected by vLLM for the current device."""
+@accelerator_available
+class TestGpuConvRotMxfp8:
+    """Real MXFP8 kernels selected by vLLM for the current accelerator."""
 
     @staticmethod
     def _layer(weight):
@@ -313,11 +321,11 @@ class TestCudaConvRotMxfp8:
     @staticmethod
     def _inputs():
         torch.manual_seed(0)
-        x = torch.randn(4, 64, 1024, dtype=torch.bfloat16, device="cuda")
+        x = torch.randn(4, 64, 1024, dtype=torch.bfloat16, device=accelerator_device())
         x[..., [3, 500, 777]] *= 80.0
-        weight = torch.randn(768, 1024, dtype=torch.bfloat16, device="cuda") / 32
+        weight = torch.randn(768, 1024, dtype=torch.bfloat16, device=accelerator_device()) / 32
         weight[:, 11] *= 30.0
-        bias = torch.randn(768, dtype=torch.bfloat16, device="cuda")
+        bias = torch.randn(768, dtype=torch.bfloat16, device=accelerator_device())
         return x, weight, bias
 
     @staticmethod
@@ -364,9 +372,9 @@ class TestCudaConvRotMxfp8:
         assert plain < 0.1 and rotated < 0.1
 
     def test_unaligned_output_width_is_supported(self):
-        x = torch.randn(2, 1024, dtype=torch.bfloat16, device="cuda")
-        weight = torch.randn(504, 1024, dtype=torch.bfloat16, device="cuda") / 32
-        bias = torch.randn(504, dtype=torch.bfloat16, device="cuda")
+        x = torch.randn(2, 1024, dtype=torch.bfloat16, device=accelerator_device())
+        weight = torch.randn(504, 1024, dtype=torch.bfloat16, device=accelerator_device()) / 32
+        bias = torch.randn(504, dtype=torch.bfloat16, device=accelerator_device())
         _, error = self._quantized_error(
             ConvRotMxfp8OnlineLinearMethod(build_quant_config("convrot_mxfp8")), weight, x, bias
         )

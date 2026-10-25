@@ -437,7 +437,9 @@ class ConvRotMxfp4OnlineLinearMethod(LazyWeightMixin, BaseInt8LinearMethod):
     def apply(self, layer: torch.nn.Module, x: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
         if layer.convrot_hadamard is not None:
             x = rotate(x, layer.convrot_hadamard)
-        return self.kernel.apply_weights(layer, x, bias)
+        rows = x.reshape(-1, x.shape[-1]).contiguous()
+        out = self.kernel.apply_weights(layer, rows, bias)
+        return out.reshape(*x.shape[:-1], out.shape[-1])
 
 
 class ConvRotMxfp8OnlineLinearMethod(LazyWeightMixin, BaseInt8LinearMethod):
@@ -469,4 +471,6 @@ class ConvRotMxfp8OnlineLinearMethod(LazyWeightMixin, BaseInt8LinearMethod):
     def apply(self, layer: torch.nn.Module, x: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
         if layer.convrot_hadamard is not None:
             x = rotate(x, layer.convrot_hadamard)
-        return self.kernel.apply_weights(layer, x, bias)
+        rows = x.reshape(-1, x.shape[-1]).contiguous()
+        out = self.kernel.apply_weights(layer, rows, bias)
+        return out.reshape(*x.shape[:-1], out.shape[-1])
