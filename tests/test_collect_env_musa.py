@@ -148,6 +148,62 @@ def test_musa_package_version_uses_distribution_metadata(monkeypatch):
     assert collect_env.get_musa_package_version() == "2.11.0.post1+musa5.2.0"
 
 
+def test_pip_inventory_excludes_musa_specific_packages_by_default(monkeypatch):
+    collect_env = load_collect_env(monkeypatch)
+    package_output = "\n".join(
+        (
+            "torchada==1.0.0",
+            "mthreads-ml-py==2.0.0",
+            "unrelated-package==3.0.0",
+        )
+    )
+
+    _, output = collect_env.get_pip_packages(lambda _: (0, package_output, ""))
+
+    assert output == ""
+
+
+def test_pip_inventory_includes_musa_specific_packages_when_requested(monkeypatch):
+    collect_env = load_collect_env(monkeypatch)
+    package_output = "\n".join(("torchada==1.0.0", "mthreads-ml-py==2.0.0"))
+    patterns = collect_env.DEFAULT_PIP_PATTERNS | {"torchada", "mthreads-ml-py"}
+
+    _, output = collect_env.get_pip_packages(lambda _: (0, package_output, ""), patterns)
+
+    assert output == "torchada==1.0.0\nmthreads-ml-py==2.0.0"
+
+
+def test_conda_inventory_excludes_musa_specific_packages_by_default(monkeypatch):
+    collect_env = load_collect_env(monkeypatch)
+    package_output = "\n".join(
+        (
+            "# packages in environment",
+            "torchada                   1.0.0",
+            "mthreads-ml-py             2.0.0",
+            "unrelated-package          3.0.0",
+        )
+    )
+
+    output = collect_env.get_conda_packages(lambda _: (0, package_output, ""))
+
+    assert output == ""
+
+
+def test_conda_inventory_includes_musa_specific_packages_when_requested(monkeypatch):
+    collect_env = load_collect_env(monkeypatch)
+    package_output = "\n".join(
+        (
+            "torchada                   1.0.0",
+            "mthreads-ml-py             2.0.0",
+        )
+    )
+    patterns = collect_env.DEFAULT_CONDA_PATTERNS | {"torchada", "mthreads-ml-py"}
+
+    output = collect_env.get_conda_packages(lambda _: (0, package_output, ""), patterns)
+
+    assert output == "torchada                   1.0.0\nmthreads-ml-py             2.0.0"
+
+
 def test_musa_package_version_falls_back_to_module_version(monkeypatch):
     collect_env = load_collect_env(monkeypatch)
     torch_musa = ModuleType("torch_musa")
@@ -217,6 +273,7 @@ def test_get_env_info_collects_musa_fields_once(monkeypatch):
         "get_musa_visible_devices": "MTHREADS_VISIBLE_DEVICES=1,2,3",
     }
     calls = {name: 0 for name in values}
+    collected_patterns = {}
 
     for name, value in values.items():
 
@@ -226,9 +283,18 @@ def test_get_env_info_collects_musa_fields_once(monkeypatch):
 
         monkeypatch.setattr(collect_env, name, probe)
 
+    def get_pip_packages(_run_lambda, patterns=None):
+        collected_patterns["pip"] = patterns
+        return "pip", ""
+
+    def get_conda_packages(_run_lambda, patterns=None):
+        collected_patterns["conda"] = patterns
+        return ""
+
+    monkeypatch.setattr(collect_env, "get_pip_packages", get_pip_packages)
+    monkeypatch.setattr(collect_env, "get_conda_packages", get_conda_packages)
+
     simple_probes = {
-        "get_pip_packages": ("pip", ""),
-        "get_conda_packages": "",
         "get_rocm_version": None,
         "get_vllm_version": "dev",
         "get_vllm_omni_version": "dev",
@@ -262,6 +328,8 @@ def test_get_env_info_collects_musa_fields_once(monkeypatch):
     assert env.musa_gpu_models == "MTT S5000"
     assert env.musa_visible_devices == "MTHREADS_VISIBLE_DEVICES=1,2,3"
     assert calls == {name: 1 for name in values}
+    assert {"torchada", "mthreads-ml-py"} <= collected_patterns["pip"]
+    assert {"torchada", "mthreads-ml-py"} <= collected_patterns["conda"]
 
 
 def test_pretty_str_includes_labeled_musa_block(monkeypatch):

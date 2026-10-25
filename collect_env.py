@@ -105,6 +105,16 @@ DEFAULT_PIP_PATTERNS = {
     "flashinfer-python",
 }
 
+MUSA_PACKAGE_PATTERNS = {"torchada", "mthreads-ml-py"}
+
+
+def _matches_package_pattern(line, patterns):
+    normalized_line = line.lower()
+    for package in MUSA_PACKAGE_PATTERNS:
+        if package in normalized_line and package not in patterns:
+            return False
+    return any(name in normalized_line for name in patterns)
+
 
 def run(command):
     """Return (return-code, stdout, stderr)."""
@@ -168,7 +178,7 @@ def get_conda_packages(run_lambda, patterns=None):
         return out
 
     return "\n".join(
-        line for line in out.splitlines() if not line.startswith("#") and any(name in line for name in patterns)
+        line for line in out.splitlines() if not line.startswith("#") and _matches_package_pattern(line, patterns)
     )
 
 
@@ -342,6 +352,26 @@ def get_musa_driver_version(run_lambda):
         run_lambda,
         "cat /proc/driver/musa/version",
         r"(?:package|driver) version:\s*(\S+)",
+    )
+
+
+def _has_musa_info(
+    musa_available,
+    musa_runtime_version,
+    musa_package_version,
+    musa_driver_version,
+    musa_gpu_models,
+    musa_visible_devices,
+):
+    return musa_available not in (None, "N/A") or any(
+        value is not None
+        for value in (
+            musa_runtime_version,
+            musa_package_version,
+            musa_driver_version,
+            musa_gpu_models,
+            musa_visible_devices,
+        )
     )
 
 
@@ -538,7 +568,7 @@ def get_pip_packages(run_lambda, patterns=None):
             raise RuntimeError("Could not collect pip list output (pip or uv module not available)")
 
         out = run_and_read_all(run_lambda, cmd)
-        return "\n".join(line for line in out.splitlines() if any(name in line for name in patterns))
+        return "\n".join(line for line in out.splitlines() if _matches_package_pattern(line, patterns))
 
     pip_version = "pip3" if sys.version[0] == "3" else "pip"
     out = run_with_pip()
@@ -613,7 +643,6 @@ def get_env_vars():
 
 def get_env_info():
     run_lambda = run
-    pip_version, pip_list_output = get_pip_packages(run_lambda)
 
     if TORCH_AVAILABLE:
         version_str = torch.__version__
@@ -637,22 +666,35 @@ def get_env_info():
         version_str = debug_mode_str = cuda_available_str = cuda_version_str = "N/A"
         hip_compiled_version = hip_runtime_version = miopen_runtime_version = "N/A"
 
-    sys_version = sys.version.replace("\n", " ")
-
-    conda_packages = get_conda_packages(run_lambda)
-
-    rocm_version = get_rocm_version(run_lambda)
-    vllm_version = get_vllm_version()
-    vllm_omni_version = get_vllm_omni_version(run_lambda)
-    vllm_build_flags = summarize_vllm_build_flags()
-    gpu_topo = get_gpu_topo(run_lambda)
     musa_available = get_musa_available()
     musa_runtime_version = getattr(torch.version, "musa", None) if TORCH_AVAILABLE else None
     musa_package_version = get_musa_package_version()
     musa_driver_version = get_musa_driver_version(run_lambda)
     musa_gpu_models = get_musa_gpu_info()
     musa_visible_devices = get_musa_visible_devices()
+    package_patterns = (
+        MUSA_PACKAGE_PATTERNS
+        if _has_musa_info(
+            musa_available,
+            musa_runtime_version,
+            musa_package_version,
+            musa_driver_version,
+            musa_gpu_models,
+            musa_visible_devices,
+        )
+        else set()
+    )
+    pip_version, pip_list_output = get_pip_packages(run_lambda, DEFAULT_PIP_PATTERNS | package_patterns)
 
+    sys_version = sys.version.replace("\n", " ")
+
+    conda_packages = get_conda_packages(run_lambda, DEFAULT_CONDA_PATTERNS | package_patterns)
+
+    rocm_version = get_rocm_version(run_lambda)
+    vllm_version = get_vllm_version()
+    vllm_omni_version = get_vllm_omni_version(run_lambda)
+    vllm_build_flags = summarize_vllm_build_flags()
+    gpu_topo = get_gpu_topo(run_lambda)
     return SystemEnv(
         torch_version=version_str,
         is_debug_build=debug_mode_str,
@@ -824,8 +866,9 @@ def pretty_str(envinfo):
         "musa_gpu_models",
         "musa_visible_devices",
     )
-    has_musa_info = mutable_dict["musa_available"] not in (None, "N/A") or any(
-        mutable_dict[field] is not None for field in musa_optional_fields
+    has_musa_info = _has_musa_info(
+        mutable_dict["musa_available"],
+        *(mutable_dict[field] for field in musa_optional_fields),
     )
 
     # MUSA probes are optional. Preserve their explicit None contract in the
