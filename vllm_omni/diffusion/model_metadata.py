@@ -37,8 +37,6 @@ class DiffusionModelMetadata:
     # Whether ``/v1/videos/depth`` may serve this model: it takes one video path
     # and returns a ``video_depth`` payload of per-frame depth maps.
     supports_video_depth: bool = False
-    # Isolate external runtimes that modify process-global state.
-    requires_process_isolation: bool = False
 
 
 # ``extra_args`` keys that only name a request (the video API's job-id tag for
@@ -60,10 +58,7 @@ BOOGU_IMAGE_MAX_INPUT_IMAGES = 1
 
 
 _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
-    "HyNomasPipeline": DiffusionModelMetadata(
-        final_output_type="video",
-        requires_process_isolation=True,
-    ),
+    "HyNomasPipeline": DiffusionModelMetadata(final_output_type="video"),
     "SeedVR2Pipeline": DiffusionModelMetadata(supports_multimodal_inputs=True, final_output_type="video"),
     "Sam3Pipeline": DiffusionModelMetadata(
         supports_multimodal_inputs=True,

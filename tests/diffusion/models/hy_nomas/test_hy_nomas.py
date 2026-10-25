@@ -5,6 +5,7 @@ import json
 import os
 import subprocess
 import sys
+from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock
 
@@ -15,13 +16,14 @@ from safetensors.torch import save_file
 from torch import nn
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
+from tests.diffusion.models.hy_nomas.test_ar import PipelineWithCPUComponents
 from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig, resolve_model_class_name
 from vllm_omni.diffusion.media import VideoValueRange
 from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
 from vllm_omni.diffusion.models.hy_nomas import pipeline_hy_nomas
 from vllm_omni.diffusion.models.hy_nomas.configuration_hy_nomas import DIT_FILE, REQUIRED_FILES
 from vllm_omni.diffusion.models.hy_nomas.pipeline_hy_nomas import HyNomasPipeline, validate_config
-from vllm_omni.diffusion.models.hy_nomas.request import normalize_request
+from vllm_omni.diffusion.models.hy_nomas.processing_hy_nomas import normalize_request
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.utils.hf_utils import (
     _looks_like_hy_nomas,
@@ -122,21 +124,40 @@ def test_pipeline_downloads_only_distilled_weights(tmp_path, monkeypatch):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.touch()
     download = Mock(return_value=str(tmp_path))
-    reference = nn.Module()
-    reference.transformer = nn.Linear(2, 2, bias=False)
-    save_file(reference.transformer.state_dict(), str(tmp_path / DIT_FILE))
-    runtime = ModuleType("vllm_omni.diffusion.models.hy_nomas.runtime")
-    monkeypatch.setattr(runtime, "HyNomasRuntime", Mock(return_value=reference), raising=False)
-    monkeypatch.setitem(sys.modules, runtime.__name__, runtime)
+    transformer = nn.Linear(2, 2, bias=False)
+    transformer.patch_size = (1, 1, 1)
+    transformer.config = SimpleNamespace(in_channels=2)
+    transformer.double_blocks = []
+    transformer.heads_num = 1
+    transformer.hidden_size = 2
+    save_file(transformer.state_dict(), str(tmp_path / DIT_FILE))
+    text_encoder = nn.Linear(2, 2)
+    vae = nn.Linear(2, 2)
+    vae.spatial_compression_ratio = 32
+    loader = ModuleType("hymm.models.checkpointing.load")
+    monkeypatch.setattr(loader, "load_text_encoder", Mock(return_value=text_encoder), raising=False)
+    decoder = ModuleType("hymm.models.vae.pixelumm_decoder")
+    monkeypatch.setattr(decoder, "maybe_load_pixelumm_decoder", Mock(return_value=vae), raising=False)
+    monkeypatch.setitem(sys.modules, loader.__name__, loader)
+    monkeypatch.setitem(sys.modules, decoder.__name__, decoder)
+    monkeypatch.setattr(pipeline_hy_nomas, "build_transformer", Mock(return_value=transformer))
     monkeypatch.setattr(pipeline_hy_nomas, "get_local_device", lambda: torch.device("cuda:0"))
     monkeypatch.setattr(pipeline_hy_nomas, "initialize_reference_parallelism", Mock(return_value=None))
     monkeypatch.setattr(pipeline_hy_nomas, "download_weights_from_hf_specific", download)
     monkeypatch.setattr(
-        pipeline_hy_nomas, "build_reference_config", Mock(return_value=DictConfig({"dit_weight": "dit"}))
+        pipeline_hy_nomas,
+        "build_reference_config",
+        Mock(return_value=DictConfig({"inference": {"cache_noise_sigma": 0.206897}})),
     )
     monkeypatch.setattr("huggingface_hub.constants.HF_HUB_OFFLINE", False)
-    config = OmniDiffusionConfig(model="tencent/Hy-Nomas", revision="test-revision", dtype=torch.bfloat16)
-    HyNomasPipeline(od_config=config)
+    config = OmniDiffusionConfig(
+        model="tencent/Hy-Nomas", revision="test-revision", dtype=torch.bfloat16, distributed_executor_backend="mp"
+    )
+    pipeline = HyNomasPipeline(od_config=config)
+    assert pipeline.transformer is transformer and pipeline.text_encoder is text_encoder and pipeline.vae is vae
+    [source] = pipeline.weights_sources
+    assert source.subfolder == "DiT/distilled" and source.prefix == "transformer."
+    assert source.allow_patterns_overrides == [Path(DIT_FILE).name]
     download.assert_called_once_with(
         "tencent/Hy-Nomas",
         cache_dir=None,
@@ -150,7 +171,9 @@ def test_pipeline_downloads_only_distilled_weights(tmp_path, monkeypatch):
 def test_invalid_encoder_fails_before_download(monkeypatch, encoder):
     download = Mock()
     monkeypatch.setattr(pipeline_hy_nomas, "download_weights_from_hf_specific", download)
-    config = OmniDiffusionConfig(dtype=torch.bfloat16, custom_pipeline_args={"text_encoder": encoder})
+    config = OmniDiffusionConfig(
+        dtype=torch.bfloat16, distributed_executor_backend="mp", custom_pipeline_args={"text_encoder": encoder}
+    )
     with pytest.raises(ValueError, match="text_encoder must be"):
         HyNomasPipeline(od_config=config)
     download.assert_not_called()
@@ -243,12 +266,8 @@ def pipeline(monkeypatch):
     module = ModuleType("hymm.models.dit.modules.attention.range_attention")
     monkeypatch.setattr(module, "clear_range_cache", Mock(), raising=False)
     monkeypatch.setitem(sys.modules, module.__name__, module)
-    pipeline = HyNomasPipeline.__new__(HyNomasPipeline)
-    nn.Module.__init__(pipeline)
+    pipeline = PipelineWithCPUComponents()
     pipeline.initialize_ar({})
-    pipeline.pipe = Mock()
-    pipeline.sp_size = 1
-    pipeline.pipe.inference.return_value = torch.linspace(0, 1, 1 * 3 * 5 * 32 * 32).reshape(1, 3, 5, 32, 32)
     return pipeline
 
 
@@ -264,59 +283,56 @@ def make_batch():
     )
 
 
-def test_forward_preserves_display_range_and_passes_reference_arguments(pipeline):
+def test_forward_preserves_display_range_and_sampling_arguments(pipeline):
     result = pipeline(make_batch())
     result.media.validate()
     assert result.media.video.spec.value_range is VideoValueRange.ZERO_TO_ONE
-    torch.testing.assert_close(result.media.video.tensor, pipeline.pipe.inference.return_value)
-    kwargs = pipeline.pipe.inference.call_args.kwargs
-    assert kwargs["segment_frame_boundaries"] == [0, 5]
-    assert kwargs["preserve_kv_cache"] is False
-    assert (kwargs["seed"], kwargs["flow_shift"], kwargs["num_inference_steps"]) == (7, 5.0, 8)
-    assert pipeline.pipe.kv_cache is None
+    noise = torch.randn((1, 2, 2, 1, 1), generator=torch.Generator().manual_seed(7))
+    latents = noise.clone()
+    for _ in range(8):
+        latents -= 0.25 / 8
+    expected = (pipeline.decode(latents).sample[:, :, :5] * 0.5 + 0.5).clamp(0, 1)
+    torch.testing.assert_close(result.media.video.tensor, expected, rtol=0, atol=0)
+    assert len(pipeline.calls) == 9 and pipeline.calls[-1]["commit"]
+    assert pipeline.encoded == ["A forest"]
+    assert pipeline._offline_session is None
 
 
 def test_failure_releases_cache_and_allows_next_request(pipeline):
-    def fail(**kwargs):
-        pipeline.pipe.kv_cache = [torch.zeros(4)]
-        pipeline.pipe.cache_valid_len = 4
-        pipeline.pipe.global_frame_counter = 4
-        raise RuntimeError("reference failure")
-
-    pipeline.pipe.inference.side_effect = fail
-    with pytest.raises(RuntimeError, match="reference failure"):
+    pipeline.fail_clean = True
+    with pytest.raises(RuntimeError, match="injected clean-forward failure"):
         pipeline(make_batch())
-    assert pipeline.pipe.kv_cache is None
-    assert pipeline.pipe.cache_mask_list is None
-    assert pipeline.pipe.cache_valid_len == pipeline.pipe.global_frame_counter == 0
-    pipeline.pipe.inference.side_effect = None
+    assert pipeline._offline_session is None
+    assert not pipeline._ar_sessions
+    pipeline.fail_clean = False
     pipeline(make_batch()).media.validate()
 
 
 def test_output_shape_is_checked(pipeline):
-    pipeline.pipe.inference.return_value = torch.zeros(1, 3, 4, 32, 32)
+    pipeline.vae.decode = lambda latents: SimpleNamespace(sample=torch.zeros(1, 3, 4, 32, 32))
     with pytest.raises(RuntimeError, match="expected"):
         pipeline(make_batch())
 
 
 def test_sp_rejects_uneven_tokens_before_inference(pipeline):
     pipeline.sp_size = 2
-    pipeline.pipe.s_ratio = 32
-    pipeline.pipe.patch_size = (1, 1, 1)
     with pytest.raises(OmniClientError, match="spatial tokens per frame"):
         pipeline(make_batch())
-    pipeline.pipe.inference.assert_not_called()
+    assert not pipeline.calls
 
 
 @pytest.mark.parametrize("fails", [False, True])
-def test_reference_sdpa_policy_is_scoped_to_inference(pipeline, fails):
-    def inference(**kwargs):
+def test_reference_sdpa_policy_is_scoped_to_inference(pipeline, fails, monkeypatch):
+    original = pipeline.transformer.forward_with_cache
+
+    def forward_with_cache(**kwargs):
         assert torch.backends.cuda.cudnn_sdp_enabled()
         if fails:
             raise RuntimeError("injected failure")
-        return torch.zeros(1, 3, 5, 32, 32)
+        return original(**kwargs)
 
-    pipeline.pipe.inference.side_effect = inference
+    monkeypatch.setattr(pipeline, "_component_context", HyNomasPipeline._component_context.__get__(pipeline))
+    pipeline.transformer.forward_with_cache = forward_with_cache
     with sdpa_kernel([SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]):
         assert not torch.backends.cuda.cudnn_sdp_enabled()
         if fails:
@@ -331,11 +347,10 @@ def test_reference_sdpa_policy_is_scoped_to_inference(pipeline, fails):
 def test_module_offload_selects_components_and_removes_hooks(monkeypatch, components):
     pipeline = HyNomasPipeline.__new__(HyNomasPipeline)
     nn.Module.__init__(pipeline)
-    pipeline.pipe = nn.Module()
-    pipeline.pipe.transformer = nn.Linear(2, 2)
-    pipeline.pipe.text_encoder = nn.Linear(2, 2)
-    pipeline.pipe.vae = nn.Linear(2, 2)
-    pipeline.pipe.omni_cpu_offload = False
+    pipeline.transformer = nn.Linear(2, 2)
+    pipeline.text_encoder = nn.Linear(2, 2)
+    pipeline.vae = nn.Linear(2, 2)
+    pipeline._cpu_offload = False
     enable = Mock()
     disable = Mock()
     monkeypatch.setattr(pipeline_hy_nomas, "apply_sequential_offload", enable)
@@ -343,18 +358,18 @@ def test_module_offload_selects_components_and_removes_hooks(monkeypatch, compon
     pipeline.enable_omni_model_cpu_offload(device=torch.device("cuda:0"), offload_components=components)
     selected = enable.call_args.kwargs
     assert selected["offload_dit_modules"] == (
-        [pipeline.pipe.transformer] if components is None or "dit" in components else []
+        [pipeline.transformer] if components is None or "dit" in components else []
     )
     expected_stages = (
-        [pipeline.pipe.text_encoder, pipeline.pipe.vae]
+        [pipeline.text_encoder, pipeline.vae]
         if components is None
-        else ([pipeline.pipe.text_encoder] if "text_encoder" in components else [])
+        else ([pipeline.text_encoder] if "text_encoder" in components else [])
     )
     assert selected["offload_encoder_modules"] == expected_stages
-    assert pipeline.pipe.omni_cpu_offload
+    assert pipeline._cpu_offload
     pipeline.disable_omni_model_cpu_offload()
-    disable.assert_called_once_with([pipeline.pipe.transformer, pipeline.pipe.text_encoder, pipeline.pipe.vae])
-    assert not pipeline.pipe.omni_cpu_offload
+    disable.assert_called_once_with([pipeline.transformer, pipeline.text_encoder, pipeline.vae])
+    assert not pipeline._cpu_offload
 
 
 @pytest.mark.parametrize(
@@ -379,6 +394,9 @@ def test_module_offload_selects_components_and_removes_hooks(monkeypatch, compon
 )
 def test_unsupported_engine_features(overrides, match):
     config = SimpleNamespace(
+        distributed_executor_backend="mp",
+        model_class_name=None,
+        num_gpus=1,
         parallel_config=DiffusionParallelConfig(data_parallel_size=1),
         dtype=torch.bfloat16,
         cache_backend="none",
@@ -400,6 +418,7 @@ def test_unsupported_engine_features(overrides, match):
 def test_supported_ulysses_config(sp_size):
     validate_config(
         OmniDiffusionConfig(
+            distributed_executor_backend="mp",
             parallel_config=DiffusionParallelConfig(ulysses_degree=sp_size),
             dtype=torch.bfloat16,
         )

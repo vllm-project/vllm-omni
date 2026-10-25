@@ -4,7 +4,9 @@
 from pathlib import Path
 
 import pytest
+import torch
 
+from vllm_omni.diffusion.models.hy_nomas.hy_nomas_transformer import build_transformer
 from vllm_omni.diffusion.models.hy_nomas.pipeline_hy_nomas import build_reference_config
 
 pytestmark = [pytest.mark.local_model, pytest.mark.cpu, pytest.mark.diffusion]
@@ -34,3 +36,13 @@ def test_configuration_matches_reference_hydra_composition(tmp_path, sp_size):
     assert actual.parallelism.sp_size == sp_size
     assert actual.parallelism.shard_text_encoder is False
     assert OmegaConf.to_container(actual, resolve=True) == OmegaConf.to_container(expected, resolve=True)
+
+
+def test_reference_transformer_factory_places_every_parameter(tmp_path):
+    pytest.importorskip("hymm.models.dit.modules")
+    config = build_reference_config(tmp_path, "Qwen/Qwen2.5-VL-7B-Instruct")
+    transformer = build_transformer(config, torch.device("meta"))
+    parameters = dict(transformer.named_parameters())
+    assert len(parameters) == 2268
+    assert all(parameter.device.type == "meta" for parameter in parameters.values())
+    assert all(parameter.dtype == torch.bfloat16 for parameter in parameters.values())

@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import json
 from dataclasses import dataclass
+from typing import Any
 
 import torch
 
@@ -121,3 +123,146 @@ def normalize_request(prompt: OmniPromptType, params: OmniDiffusionSamplingParam
     if not isinstance(negative, str):
         raise OmniClientError("negative_prompt must be a string.")
     return HyNomasRequest(prompts, list(boundaries), frames, height, width, steps, seed, negative, camera, camera_flags)
+
+
+@dataclass(frozen=True)
+class HyNomasChunk:
+    segment: int
+    start: int
+    end: int
+    pixel_frames: int
+
+
+def plan_chunks(request: HyNomasRequest, chunk_latents: int) -> list[HyNomasChunk]:
+    boundaries = [value // 4 for value in request.boundaries[:-1]] + [(request.num_frames - 1) // 4 + 1]
+    chunks = []
+    for segment, (start, end) in enumerate(zip(boundaries, boundaries[1:])):
+        for left in range(start, end, chunk_latents):
+            right = min(left + chunk_latents, end)
+            chunks.append(HyNomasChunk(segment, left, right, min(request.num_frames, 4 * right) - 4 * left))
+    return chunks
+
+
+def action_conditioning(
+    prompt: str, text_encoder: Any, text_length: int, segment_frames: int
+) -> tuple[int, list[int] | None, list[list[int]] | None]:
+    # Plain captions have no structured action mask.
+    try:
+        obj = json.loads(prompt)
+    except json.JSONDecodeError:
+        return -1, None, None
+    segments = obj.get("segments") if isinstance(obj, dict) else None
+    if not isinstance(segments, list) or not segments or not isinstance(segments[0], dict):
+        return -1, None, None
+    segment = segments[0]
+    actions = segment.get("contained_actions")
+    if not isinstance(actions, (dict, list)) or not actions:
+        return -1, None, None
+
+    inputs = text_encoder.text2tokens([prompt], data_type="video", max_length=text_length)
+    full_ids = inputs["input_ids"][0].tolist()
+    template = text_encoder.prompt_template_video
+    crop = max(0, int(template.get("crop_start", 0) or 0)) if isinstance(template, dict) else 0
+    offsets = []
+    for count in range(len(actions)):
+        truncated = dict(segment)
+        if count == 0:
+            truncated.pop("contained_actions")
+        else:
+            truncated["contained_actions"] = (
+                dict(list(actions.items())[:count]) if isinstance(actions, dict) else actions[:count]
+            )
+        variant = json.dumps(
+            {key: [truncated] if key == "segments" else value for key, value in obj.items()}, ensure_ascii=False
+        )
+        ids = text_encoder.text2tokens([variant], data_type="video", max_length=text_length)["input_ids"][0].tolist()
+        common = 0
+        for left, right in zip(full_ids, ids):
+            if left != right:
+                break
+            common += 1
+        offsets.append(max(offsets[-1] if offsets else 0, min(text_length - 1, max(0, common - crop))))
+    start = offsets[0]
+    mask = inputs.get("attention_mask")
+    offsets.append(min(int(mask[0].sum()) if mask is not None else text_length, text_length))
+
+    from hymm.inference import _parse_timestamp
+
+    action_list = list(actions.values()) if isinstance(actions, dict) else actions
+    spans = []
+    for index, action in enumerate(action_list):
+        if not isinstance(action, dict) or "start_time" not in action or "end_time" not in action:
+            return start, None, None
+        left = min(segment_frames, int(max(0, _parse_timestamp(action["start_time"])) * 24) // 4)
+        right = min(segment_frames, int(max(0, _parse_timestamp(action["end_time"])) * 24) // 4)
+        if right > left:
+            spans.append([left, right, index])
+    if not spans:
+        return start, None, None
+    spans.sort()
+    windows = []
+    cursor = 0
+    for left, right, index in spans:
+        if left < cursor:
+            raise OmniClientError("Hy-Nomas action video windows must not overlap.")
+        if left > cursor:
+            windows.append([cursor, left, -1])
+        windows.append([left, right, index])
+        cursor = right
+    if cursor < segment_frames:
+        windows.append([cursor, segment_frames, -1])
+    if len(windows) == 1 and windows[0][2] == 0 and len(actions) == 1:
+        return start, None, None
+    return start, offsets, windows
+
+
+def prepare_camera(
+    transformer: Any,
+    config: Any,
+    trajectory: str | None,
+    *,
+    num_frames: int,
+    latent_h: int,
+    latent_w: int,
+    boundaries: list[int] | None,
+    device: torch.device,
+) -> torch.Tensor | None:
+    if trajectory is None:
+        return None
+    if transformer.camera_injection_mode != "extrinsics_attn":
+        raise ValueError("Hy-Nomas camera control requires extrinsics_attn.")
+    from hymm.pipeline.bidirectional import prepare_camera_inputs
+
+    inference = config.inference
+    camera = prepare_camera_inputs(
+        trajectory_source=trajectory,
+        num_frames=num_frames,
+        device=device,
+        dtype=torch.bfloat16,
+        normalize_relative_to_first_frame=inference.normalize_relative_to_first_frame,
+        normalize_framewise=inference.normalize_framewise,
+        normalize_displacement=inference.normalize_displacement,
+        normalize_displacement_per_video=bool(config.get("normalize_displacement_per_video", False)),
+        segment_boundaries_pixel=boundaries,
+        translation_scale=float(inference.trajectory_translation_scale),
+        rotation_scale=float(inference.trajectory_rotation_scale),
+    )
+    offsets = camera.get("turn_camera_offsets", [0, camera["num_frames"]])
+    with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+        embeddings = [
+            transformer._preprocess_camera(
+                norm_extrinsics=camera["norm_extrinsics"][:, start:end],
+                norm_intrinsics=camera["norm_intrinsics"][:, start:end],
+                action_onehot=camera["action_onehot"][:, start:end],
+                oh=latent_h,
+                ow=latent_w,
+                img_dtype=torch.bfloat16,
+                device=device,
+            )
+            for start, end in zip(offsets, offsets[1:])
+        ]
+    result = torch.cat(embeddings, dim=1)
+    expected = (num_frames - 1) // 4 + 1
+    if result.shape[1] != expected:
+        raise OmniClientError(f"Hy-Nomas camera trajectory has {result.shape[1]} latent frames; expected {expected}.")
+    return result

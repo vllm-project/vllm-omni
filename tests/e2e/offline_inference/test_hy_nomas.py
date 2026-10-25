@@ -43,12 +43,12 @@ def caller_sdpa_changes() -> Iterator[threading.Event]:
     "omni_runner",
     [
         pytest.param(
-            (MODEL, None, {"enforce_eager": True}),
+            (MODEL, None, {"enforce_eager": True, "distributed_executor_backend": "mp"}),
             id="resident",
             marks=hardware_marks(res={"cuda": "H200"}, num_cards=1),
         ),
         pytest.param(
-            (MODEL, None, {"enforce_eager": True, "enable_cpu_offload": True}),
+            (MODEL, None, {"enforce_eager": True, "enable_cpu_offload": True, "distributed_executor_backend": "mp"}),
             id="cpu_offload",
             marks=hardware_marks(res={"cuda": "H200"}, num_cards=1),
         ),

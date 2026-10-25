@@ -19,7 +19,7 @@ MODEL = os.environ.get("HY_NOMAS_MODEL", "tencent/Hy-Nomas")
     "omni_server",
     [
         pytest.param(
-            OmniServerParams(model=MODEL, server_args=["--enforce-eager"]),
+            OmniServerParams(model=MODEL, server_args=["--deploy-config", "vllm_omni/deploy/hy_nomas.yaml"]),
             id="single_device",
             marks=hardware_marks(res={"cuda": "H200"}, num_cards=1),
         ),

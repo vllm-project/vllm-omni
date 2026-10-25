@@ -1141,7 +1141,7 @@ def test_magi2_serving_applies_native_defaults_and_rejects_explicit_frame_mismat
     ],
 )
 def test_hy_nomas_model_parameters_reach_model_validation(fields, frames):
-    from vllm_omni.diffusion.models.hy_nomas.request import normalize_request
+    from vllm_omni.diffusion.models.hy_nomas.processing_hy_nomas import normalize_request
 
     engine = FakeAsyncOmni()
     engine.model_class_name = "HyNomasPipeline"
@@ -1154,7 +1154,7 @@ def test_hy_nomas_model_parameters_reach_model_validation(fields, frames):
 
 
 def test_hy_nomas_rejects_conflicting_frame_count_and_model_duration():
-    from vllm_omni.diffusion.models.hy_nomas.request import normalize_request
+    from vllm_omni.diffusion.models.hy_nomas.processing_hy_nomas import normalize_request
     from vllm_omni.errors import OmniClientError
 
     engine = FakeAsyncOmni()

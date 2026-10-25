@@ -15,15 +15,15 @@ pytestmark = [pytest.mark.local_model, pytest.mark.cpu, pytest.mark.diffusion]
 def _check_reference_parallelism(rank, rendezvous):
     from hymm.distributed.parallel_states import get_sequence_parallel_state, nccl_info
 
-    from vllm_omni.diffusion.models.hy_nomas import parallel
+    from vllm_omni.diffusion.models.hy_nomas import hy_nomas_transformer
 
     dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=2, timeout=timedelta(seconds=60))
     try:
         with pytest.MonkeyPatch.context() as patch:
             patch.setenv("RANK", "0")
             group = Mock(ulysses_group=dist.group.WORLD, ulysses_world_size=2, world_size=2)
-            patch.setattr(parallel, "get_sp_group", lambda: group)
-            mesh = parallel.initialize_reference_parallelism(2, torch.device("cpu"))
+            patch.setattr(hy_nomas_transformer, "get_sp_group", lambda: group)
+            mesh = hy_nomas_transformer.initialize_reference_parallelism(2, torch.device("cpu"))
             assert mesh.get_group("sp") is dist.group.WORLD
             assert nccl_info.sp_group is dist.group.WORLD
             assert nccl_info.sp_size == 2
@@ -34,7 +34,7 @@ def _check_reference_parallelism(rank, rendezvous):
             dist.all_reduce(value, group=nccl_info.sp_group)
             assert value.item() == 3
 
-            assert parallel.initialize_reference_parallelism(1, torch.device("cpu")) is None
+            assert hy_nomas_transformer.initialize_reference_parallelism(1, torch.device("cpu")) is None
             assert not get_sequence_parallel_state()
             assert nccl_info.sp_size == 1
             assert nccl_info.sp_group is None
@@ -43,7 +43,7 @@ def _check_reference_parallelism(rank, rendezvous):
 
             group.ulysses_world_size = 4
             with pytest.raises(ValueError, match="match ulysses_degree"):
-                parallel.initialize_reference_parallelism(2, torch.device("cpu"))
+                hy_nomas_transformer.initialize_reference_parallelism(2, torch.device("cpu"))
     finally:
         dist.destroy_process_group()
 

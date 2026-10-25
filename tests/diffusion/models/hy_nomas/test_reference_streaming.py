@@ -56,11 +56,12 @@ def test_reference_pixelumm_stable_prefix_and_final_tail(lengths, pixels):
 
 
 def test_reference_component_sdpa_policy_is_scoped_after_failure():
-    pytest.importorskip("hymm.pipeline.causal_ar")
-    from vllm_omni.diffusion.models.hy_nomas.runtime import HyNomasRuntime
+    from vllm_omni.diffusion.models.hy_nomas.pipeline_hy_nomas import HyNomasPipeline
 
-    runtime = HyNomasRuntime.__new__(HyNomasRuntime)
+    runtime = HyNomasPipeline.__new__(HyNomasPipeline)
     nn.Module.__init__(runtime)
+    runtime._cpu_offload = False
+    runtime.initialize_ar({})
     with sdpa_kernel([SDPBackend.MATH]):
         assert not torch.backends.cuda.cudnn_sdp_enabled()
         with pytest.raises(RuntimeError, match="component failed"), runtime._component_context(nn.Linear(2, 2)):

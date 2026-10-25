@@ -9,6 +9,7 @@ import numpy as np
 import pytest
 import torch
 from omegaconf import OmegaConf
+from safetensors import safe_open
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from vllm.utils.torch_utils import set_default_torch_dtype
 
@@ -26,6 +27,7 @@ from vllm_omni.experimental.ar_diffusion.kv_cache.state import ARDiffusionKVStat
 from vllm_omni.experimental.ar_diffusion.tick_protocol import ARDiffusionTickRequest
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
+from vllm_omni.platforms import current_omni_platform
 
 pytestmark = [pytest.mark.local_model, pytest.mark.diffusion, *hardware_marks(res={"cuda": "H200"}, num_cards=1)]
 
@@ -70,6 +72,7 @@ def pipelines(model_cleanup):
     omni_config = OmniDiffusionConfig(
         model=str(root),
         dtype=torch.bfloat16,
+        distributed_executor_backend="mp",
         enforce_eager=True,
         custom_pipeline_args={"text_encoder": text_encoder},
     )
@@ -78,6 +81,8 @@ def pipelines(model_cleanup):
         reference = CPTCausalInferencePipeline(reference_config._flatten_cfg(config), device, config.dit_weight).eval()
         with set_default_torch_dtype(torch.bfloat16):
             candidate = HyNomasPipeline(od_config=omni_config)
+        with safe_open(str(root / DIT_FILE), framework="pt", device="cpu") as weights:
+            candidate.load_weights((f"transformer.{name}", weights.get_tensor(name)) for name in weights.keys())
         yield reference, candidate, device
     finally:
         if candidate is not None:
@@ -165,17 +170,24 @@ def test_ar_continuation_latents_match_reference(pipelines, monkeypatch, offload
     candidate.initialize_ar({"ar_height": 384, "ar_width": 640, "ar_max_latent_frames": 32, "ar_max_segments": 4})
     spec = candidate.ar_diffusion_kv_cache_spec()
     cache = ARDiffusionKVCache(
-        ARDiffusionKVConfig(enable=True),
+        ARDiffusionKVConfig(
+            enable=True,
+            chunk_size=spec.tokens_per_frame,
+            window_chunks=spec.window_frames,
+            sink_chunks=spec.sink_frames,
+            warmup_cudagraph=False,
+        ),
         num_layers=spec.num_layers,
         num_kv_heads=spec.num_kv_heads,
         head_size=spec.head_size,
         dtype=torch.bfloat16,
         block_size=spec.segmented.block_size,
         max_model_len=spec.segmented.initial_staging_tokens,
-        available_bytes=16 * 1024**3,
+        available_bytes=current_omni_platform.mem_get_info()[0],
         kv_branches=spec.kv_branches,
         session_capacity=1,
         device=device,
+        model_owned_state_bytes_per_session=spec.model_owned_state_bytes_per_session,
         segmented=spec.segmented,
     )
     owner = ARDiffusionKVState(

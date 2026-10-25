@@ -2,8 +2,10 @@
 
 Hy-Nomas generates video autoregressively across text-controlled segments, with
 optional camera trajectories. This integration exposes the distilled checkpoint
-through `Omni` and `/v1/videos`. It calls Tencent's reference DiT, Qwen text encoder,
-Euler sampler, and PixelUMM decoder; the reference package is a runtime dependency.
+through `Omni`, `/v1/videos`, and AR-Diffusion. The pipeline owns the DiT, Qwen text
+encoder, PixelUMM decoder, and generation loop. Component implementations and the
+Euler scheduler come from the pinned reference package, which is a runtime dependency.
+The DiT uses the standard `weights_sources` and `load_weights` interfaces.
 
 ## Installation
 
@@ -30,9 +32,10 @@ python -c 'from hymm.pipeline.causal_ar import CPTCausalInferencePipeline'
 
 The validated environment uses Python 3.12, PyTorch 2.13.0/CUDA 13.0, vLLM 0.32.0,
 Transformers 5.16.1, Diffusers 0.40.0, and FlashAttention 2.8.3 on H200.
-Hy-Nomas defaults to the `mp` executor even on one GPU. Its reference runtime uses
-process-global Torch state, so the `uni` executor is rejected. SDPA backend selection
-is scoped to inference inside the isolated worker to preserve the reference policy.
+The supplied deployment profiles select the `mp` executor. Python callers must set
+`distributed_executor_backend="mp"` for single-device execution. The pipeline checks
+process isolation before importing reference components, which use process-global
+Torch state. SDPA backend selection is scoped to component execution inside the worker.
 
 ## Checkpoints
 
@@ -69,6 +72,7 @@ Run the shared text-to-video example from the vLLM-Omni repository:
 ```bash
 python examples/offline_inference/text_to_video/text_to_video.py \
   --model ./Hy-Nomas-weights --enforce-eager \
+  --deploy-config vllm_omni/deploy/hy_nomas.yaml \
   --prompt 'A forest beside a river. ||| The camera moves along the river.' \
   --height 704 --width 1280 --num-frames 121 --num-inference-steps 8 \
   --guidance-scale 1 --fps 24 --seed 42 \
@@ -95,7 +99,8 @@ worker. `segment_has_camera`, when specified, contains one boolean per segment.
 Start the server:
 
 ```bash
-vllm serve ./Hy-Nomas-weights --omni --enforce-eager --port 8098
+vllm serve ./Hy-Nomas-weights --omni --port 8098 \
+  --deploy-config vllm_omni/deploy/hy_nomas.yaml
 ```
 
 In another terminal, submit a video job:
@@ -149,13 +154,14 @@ been measured.
 Use the public module-offload configuration to select DiT and text encoder weights:
 
 ```bash
-vllm serve ./Hy-Nomas-weights --omni --enforce-eager \
+vllm serve ./Hy-Nomas-weights --omni \
+  --deploy-config vllm_omni/deploy/hy_nomas.yaml \
   --diffusion-offload-config '{"mode":"module","components":["dit","text_encoder"]}'
 ```
 
 The compatibility option `--enable-cpu-offload` stages the DiT, text encoder, and
-PixelUMM decoder. Ordinary request inference keeps the DiT on the device for the
-complete camera-projection, denoising, and KV-write phase. AR step execution obtains
+PixelUMM decoder. Ordinary request inference keeps the DiT on the device throughout
+each chunk's denoising and KV writes. Camera projection uses its own context. AR step execution obtains
 a residency context for each DiT call, so module offload adds weight transfers per
 step. Text encoding and VAE decoding use their own component contexts, including
 cleanup after exceptions. Explicit component selection covers
@@ -163,7 +169,7 @@ only the named DiT/text encoder and leaves the VAE resident, as defined by the
 shared offload API.
 
 Offload reduces generation-time weight residency and adds host-device transfers.
-Checkpoint initialization still uses the reference loaders on the GPU; allow enough
+Checkpoint initialization places components on the GPU; allow enough
 memory for all components during loading. Module CPU offload can be combined with
 Ulysses SP; each rank stages its own component copies. Layerwise and distributed
 layerwise offload are not supported.

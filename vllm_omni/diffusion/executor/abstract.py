@@ -14,7 +14,6 @@ from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import KVConnectorOutput
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
-from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
 from vllm_omni.diffusion.sched.interface import CachedRequestData
 
 if TYPE_CHECKING:
@@ -32,7 +31,6 @@ class DiffusionExecutor(ABC):
     def get_class(od_config: OmniDiffusionConfig) -> type[DiffusionExecutor]:
         executor_class: type[DiffusionExecutor]
         distributed_executor_backend = od_config.distributed_executor_backend
-        requires_isolation = get_diffusion_model_metadata(od_config.model_class_name).requires_process_isolation
         # Mirror vLLM's `world_size == 1 -> "uni"` default
         # (vllm/config/parallel.py). A single-GPU diffusion deployment has
         # nothing to distribute: spawning a worker only adds MessageQueues,
@@ -41,7 +39,7 @@ class DiffusionExecutor(ABC):
         # to "mp".
         if distributed_executor_backend is None:
             num_gpus = od_config.num_gpus or 1
-            distributed_executor_backend = "uni" if num_gpus == 1 and not requires_isolation else "mp"
+            distributed_executor_backend = "uni" if num_gpus == 1 else "mp"
 
         if isinstance(distributed_executor_backend, type):
             if not issubclass(distributed_executor_backend, DiffusionExecutor):
@@ -79,13 +77,6 @@ class DiffusionExecutor(ABC):
                 )
         else:
             raise ValueError(f"Unknown distributed executor backend: {distributed_executor_backend}")
-        if requires_isolation:
-            from vllm_omni.diffusion.executor.uniproc_executor import UniProcDiffusionExecutor
-
-            if issubclass(executor_class, UniProcDiffusionExecutor):
-                raise ValueError(
-                    f"{od_config.model_class_name} requires process isolation; use the mp or ray executor."
-                )
         return executor_class
 
     def __init__(self, od_config: OmniDiffusionConfig) -> None:

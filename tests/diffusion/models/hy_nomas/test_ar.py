@@ -10,19 +10,20 @@ import av
 import numpy as np
 import pytest
 import torch
+from torch import nn
 from vllm.utils.torch_utils import set_default_torch_dtype
 
 from tests.diffusion.ar_diffusion.test_capability_runner import make_runner
 from vllm_omni.config.resolver import resolve_omni_config
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.interaction.coordinator import InteractionCoordinator
-from vllm_omni.diffusion.models.hy_nomas.ar import HyNomasAR, HyNomasARConfig, plan_chunks
-from vllm_omni.diffusion.models.hy_nomas.configuration_hy_nomas import REQUIRED_FILES
+from vllm_omni.diffusion.models.hy_nomas.configuration_hy_nomas import REQUIRED_FILES, HyNomasARConfig
 from vllm_omni.diffusion.models.hy_nomas.interaction import (
     HyNomasCameraInteractionHandler,
     HyNomasPromptInteractionHandler,
 )
-from vllm_omni.diffusion.models.hy_nomas.request import normalize_request
+from vllm_omni.diffusion.models.hy_nomas.pipeline_hy_nomas import HyNomasPipeline
+from vllm_omni.diffusion.models.hy_nomas.processing_hy_nomas import normalize_request, plan_chunks
 from vllm_omni.diffusion.models.interface import supports_interaction_apply, supports_step_execution
 from vllm_omni.diffusion.output_formatter import format_diffusion_outputs, normalize_diffusion_postprocess_output
 from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -70,8 +71,8 @@ class SchedulerStub:
         return (sample.float() - model_output.float() / len(self.timesteps),)
 
 
-class RuntimeStub:
-    """CPU DiT/encoder/decoder dependencies around the real AR state machine."""
+class PipelineWithCPUComponents(HyNomasPipeline):
+    """Learned components are substituted; the pipeline's generation and session methods are real."""
 
     target_dtype = torch.float32
     in_channels = 2
@@ -83,49 +84,39 @@ class RuntimeStub:
     cache_noise_sigma = 0.206897
 
     def __init__(self):
+        nn.Module.__init__(self)
         self.args = SimpleNamespace(text_len=8)
         self.transformer = SimpleNamespace(
-            config=SimpleNamespace(out_channels=2), camera_injection_mode="extrinsics_attn"
+            config=SimpleNamespace(out_channels=2),
+            camera_injection_mode="extrinsics_attn",
+            forward_with_cache=self.transformer_forward,
         )
-        self.vae = SimpleNamespace(create_streaming_decode_session=lambda **kwargs: DecoderStub())
+        self.vae = SimpleNamespace(create_streaming_decode_session=lambda **kwargs: DecoderStub(), decode=self.decode)
+        self.text_encoder = SimpleNamespace()
         self.calls = []
         self.encoded = []
         self.camera_calls = []
         self.fail_clean = False
+        self.device = torch.device("cpu")
+        self.sp_size = 1
+        self._cpu_offload = False
 
     def _encode_prompt(self, text, *args, **kwargs):
         self.encoded.append(text)
         length = 7 if text == "longer prompt" else 4
         return {"text_states": torch.ones(1, length, 2), "text_mask": torch.tensor([[1] * (length - 1) + [0]])}
 
-    def _cross_segment_text_head_only_enabled(self):
-        return True
-
-    def _compute_action_start(self, text):
-        return 2
-
-    def _intra_seg_enabled(self):
-        return False
-
-    def _dit_denoise_residency(self):
-        return nullcontext()
-
     def _component_context(self, component):
         return nullcontext()
 
-    def _prepare_camera_keyboard(self, camera, *, num_frames, **kwargs):
+    def prepare_camera(self, transformer, config, camera, *, num_frames, **kwargs):
         self.camera_calls.append((camera, num_frames))
         return None if camera is None else torch.arange((num_frames - 1) // 4 + 1).reshape(1, -1, 1)
 
-    def _slice_chunk_camera(self, *, camera_embedding_full, chunk_latent_start, chunk_latent_end, **kwargs):
-        if camera_embedding_full is None:
-            return None, None
-        return camera_embedding_full[:, chunk_latent_start:chunk_latent_end], None
-
-    def omni_scheduler(self, steps):
+    def _new_scheduler(self, steps):
         return SchedulerStub(steps)
 
-    def omni_forward_with_cache(self, **kwargs):
+    def transformer_forward(self, **kwargs):
         hidden = kwargs["hidden_states"]
         start = kwargs["cache_valid_len"]
         image = hidden.shape[2]
@@ -156,16 +147,17 @@ class RuntimeStub:
     def _prepare_vae_decode_latents(self, latents):
         return latents
 
-    def _postprocess_vae_video(self, pixels):
-        return (pixels * 0.5 + 0.5).clamp(0, 1)
+    def decode(self, latents):
+        return SimpleNamespace(sample=latents[:, :1].repeat_interleave(4, 2).expand(-1, 3, -1, 32, 32))
 
 
 @pytest.fixture
-def pipeline():
-    pipeline = HyNomasAR()
-    pipeline.device = torch.device("cpu")
-    pipeline.sp_size = 1
-    pipeline.pipe = RuntimeStub()
+def pipeline(monkeypatch):
+    pipeline = PipelineWithCPUComponents()
+    monkeypatch.setattr("vllm_omni.diffusion.models.hy_nomas.pipeline_hy_nomas.prepare_camera", pipeline.prepare_camera)
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.models.hy_nomas.pipeline_hy_nomas.action_conditioning", lambda *args: (2, None, None)
+    )
     pipeline.initialize_ar(
         {
             "ar_height": 32,
@@ -214,7 +206,7 @@ def batch(*, session="s", index=0, close=False, seed=7, prompt="forest", control
 
 def execute(runner, request, session="s"):
     with runner._bound_ar_session(session, description="test"):
-        return runner.pipeline.forward_ar(request)
+        return runner.pipeline.forward(request)
 
 
 def step_chunk(pipeline, state, cached=None):
@@ -282,7 +274,7 @@ def test_continuation_keeps_real_kv_noise_and_decoder_timeline(runner):
     assert second.output["metadata"]["hy_nomas"]["frame_start"] == 6
     assert second.output["metadata"]["ar_diffusion"]["applied_event_ids"] == [1]
     assert runner.pipeline._ar_state is None
-    calls = runner.pipeline.pipe.calls
+    calls = runner.pipeline.calls
     assert len(calls) == 10 and sum(call["commit"] for call in calls) == 2
     assert calls[5]["position"] == 3
     assert calls[5]["mask"].tolist() == [[True, True, True, True, True, False, False]]
@@ -294,7 +286,7 @@ def test_interleaved_sessions_restore_their_own_pages(runner):
     execute(runner, batch(index=1))
     assert runner.pipeline._ar_sessions["s"].latent_frames == 6
     assert runner.pipeline._ar_sessions["other"].latent_frames == 3
-    torch.testing.assert_close(runner.pipeline.pipe.calls[-5]["history"], torch.ones(1, 7, 2, 4))
+    torch.testing.assert_close(runner.pipeline.calls[-5]["history"], torch.ones(1, 7, 2, 4))
 
 
 @pytest.mark.parametrize("bad", ["seed", "index", "shape", "capacity"])
@@ -314,7 +306,7 @@ def test_invalid_continuation_fails_closed(runner, bad):
 def test_clean_forward_failure_releases_kv_and_decoder(runner):
     free = runner.kv_cache.manager.block_pool.get_num_free_blocks()
     execute(runner, batch())
-    runner.pipeline.pipe.fail_clean = True
+    runner.pipeline.fail_clean = True
     with pytest.raises(RuntimeError, match="injected clean-forward failure"):
         execute(runner, batch(index=1))
     assert runner.kv_cache.manager.block_pool.get_num_free_blocks() == free
@@ -350,7 +342,7 @@ def test_live_chunks_flush_tail_and_update_prompt_without_trimming(runner):
         assert inputs.prompt_embeds.shape[1] == 7
         assert second.finished and len(second.output["payload"]["video"]) == 12
         assert second.output["metadata"]["hy_nomas"]["withheld_frames"] == 0
-        assert pipeline.pipe.calls[-5]["text_length"] == 7
+        assert pipeline.calls[-5]["text_length"] == 7
 
 
 def test_unchanged_prompt_is_cached_once_and_camera_is_sliced(runner):
@@ -362,16 +354,16 @@ def test_unchanged_prompt_is_cached_once_and_camera_is_sliced(runner):
         pipeline.prepare_encode(state)
         step_chunk(pipeline, state)
         step_chunk(pipeline, state)
-        assert pipeline.pipe.encoded == ["forest"]
-        assert pipeline.pipe.camera_calls == [("pan_left", 21)]
-        assert not pipeline.pipe.calls[-5]["cache_txt"]
+        assert pipeline.encoded == ["forest"]
+        assert pipeline.camera_calls == [("pan_left", 21)]
+        assert not pipeline.calls[-5]["cache_txt"]
         assert state.extra["hy_nomas_camera"].flatten().tolist() == [3, 4, 5]
 
 
 def test_camera_tick_and_live_updates(runner):
     control = ARDiffusionControlInput("camera", "hy_nomas.camera.v1", {"camera_trajectory": "pan_left"})
     execute(runner, batch(controls=(control,)))
-    assert runner.pipeline.pipe.camera_calls == [("pan_left", 9)]
+    assert runner.pipeline.camera_calls == [("pan_left", 9)]
     state = StepRequestState(request_id="live", sampling=sampling(), prompt="forest")
     handler = HyNomasCameraInteractionHandler()
     for event_id, timestamp, camera in [("old", 1, "pan_left"), ("new", 2, None)]:
@@ -436,7 +428,7 @@ def test_incomplete_chunk_cannot_commit(runner):
 
 
 def test_empty_decoder_chunk_preserves_tick_metadata(runner):
-    runner.pipeline.pipe.vae.create_streaming_decode_session = lambda **kwargs: DecoderStub(hold_frames=100)
+    runner.pipeline.vae.create_streaming_decode_session = lambda **kwargs: DecoderStub(hold_frames=100)
     request = batch()
     output = execute(runner, request)
     [formatted] = format_diffusion_outputs(
@@ -473,6 +465,26 @@ def test_public_deploy_resolution_preserves_ar_configuration(tmp_path):
     assert stage.diffusion_config.custom_pipeline_args["ar_max_latent_frames"] == 120
 
 
+def test_offline_deploy_selects_isolated_executor(tmp_path):
+    for relative in REQUIRED_FILES:
+        path = tmp_path / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.touch()
+    deployment = Path(__file__).resolve().parents[4] / "vllm_omni/deploy/hy_nomas.yaml"
+    resolution = resolve_omni_config(
+        str(tmp_path),
+        trust_remote_code=None,
+        deploy_config_path=str(deployment),
+        cli_overrides={},
+        stage_overrides=None,
+        strategy_config_path=None,
+    )
+    [stage] = resolution.stage_configs
+    assert stage.diffusion_config.distributed_executor_backend == "mp"
+    assert stage.model_config.enforce_eager
+    assert not stage.diffusion_config.step_execution
+
+
 @pytest.mark.parametrize("local_failure", [False, True])
 def test_decode_failure_is_propagated_to_every_sp_rank(runner, monkeypatch, local_failure):
     flags = []
@@ -485,7 +497,8 @@ def test_decode_failure_is_propagated_to_every_sp_rank(runner, monkeypatch, loca
         raise RuntimeError("injected decode failure")
 
     monkeypatch.setattr(
-        "vllm_omni.diffusion.models.hy_nomas.ar.get_sp_group", lambda: SimpleNamespace(all_reduce=reduce_status)
+        "vllm_omni.diffusion.models.hy_nomas.pipeline_hy_nomas.get_sp_group",
+        lambda: SimpleNamespace(all_reduce=reduce_status),
     )
     state = StepRequestState(request_id="live", sampling=sampling(), prompt="forest")
     free = runner.kv_cache.manager.block_pool.get_num_free_blocks()
@@ -520,5 +533,5 @@ def test_stable_video_stream_accepts_empty_chunks_without_losing_frames():
 def test_cache_commit_timestep_keeps_reference_precision(runner):
     with set_default_torch_dtype(torch.bfloat16):
         execute(runner, batch())
-    assert runner.pipeline.pipe.calls[-1]["commit"]
-    assert runner.pipeline.pipe.calls[-1]["timestep_dtype"] == torch.float32
+    assert runner.pipeline.calls[-1]["commit"]
+    assert runner.pipeline.calls[-1]["timestep_dtype"] == torch.float32

@@ -40,6 +40,7 @@ async def main():
         model=args.model,
         enforce_eager=True,
         dtype="bfloat16",
+        distributed_executor_backend="mp",
         max_num_seqs=1,
         engine_backend="vllm_omni.experimental.ar_diffusion.engine.ARDiffusionEngine",
         step_execution=False,
