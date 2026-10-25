@@ -139,6 +139,17 @@ settings.
 Omni-owned variable, even though vLLM-Omni supplies a persistent default when
 it is unset.
 
+### MiniMax-H3 weight layout
+
+These apply only to the MiniMax-H3 DiT. The switch is opt-in and off by
+default; both names are read once at DiT weight load and at distributed
+layerwise offload hook construction, so restart the worker after changing one.
+
+| Name | Type and default | Applies to and read time | Precedence and invalid values | Lifecycle |
+| --- | --- | --- | --- | --- |
+| `VLLM_OMNI_MINIMAX_H3_WEIGHT_NZ` | Boolean truthy spellings: `1`, `true`, `yes`, `on`; default false | Gives the DiT's linear weights the `FRACTAL_NZ` layout: once after the checkpoint loads when the DiT is device-resident, or on every layerwise upload when an offload backend owns the parameters; read at weight load and hook construction | Environment-only. Any other value means false. Values are unchanged (bit-identical), and only the DiT is touched. Only bf16/fp16/int8 weights qualify. Requires `torch.npu.config.allow_internal_format`, which `NPUPlatform` enables. | Experimental performance control |
+| `VLLM_OMNI_MINIMAX_H3_WEIGHT_NZ_MODE` | `reactor` (default) or `cast` | How `VLLM_OMNI_MINIMAX_H3_WEIGHT_NZ` reaches `FRACTAL_NZ` on the layerwise offload path; resolved once when the offload hook is constructed | Environment-only. Unrecognised values fall back to `reactor`. `reactor` permutes the checkpoint bytes on the host and re-labels the uploaded buffer, issuing no transdata on the upload path; `cast` converts per upload instead, and is also the fallback for shapes the reactor cannot hold. Both cover bf16/fp16 and int8 weights. Ignored when `VLLM_OMNI_MINIMAX_H3_WEIGHT_NZ` is off. | Experimental performance control |
+
 ### Torch compilation
 
 | Name | Type and default | Applies to and read time | Precedence and invalid values | Lifecycle |

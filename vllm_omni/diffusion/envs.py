@@ -16,6 +16,8 @@ if TYPE_CHECKING:
     CUDA_HOME: str | None = None
     LOCAL_RANK: int = 0
     VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS: str | None = None
+    VLLM_OMNI_MINIMAX_H3_WEIGHT_NZ: str | None = None
+    VLLM_OMNI_MINIMAX_H3_WEIGHT_NZ_MODE: str | None = None
 
 environment_variables: dict[str, Callable[[], Any]] = {
     # ================== Runtime Env Vars ==================
@@ -34,6 +36,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # "0" = always fuse; unset = each consumer's own measured default. Raw
     # string or None; validated by fused_qk_norm_rope_min_tokens().
     "VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS": lambda: os.environ.get("VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS", None),
+    # Set "1" to give the MiniMax-H3 DiT's linear weights the FRACTAL_NZ
+    # layout: once after load when they are device-resident, or on every
+    # layerwise upload when an offload backend owns them. Values are unchanged
+    # (bit-identical). The quantized int8 weights gain 13-17% on their matmul;
+    # the dense bf16 ones net out flat.
+    "VLLM_OMNI_MINIMAX_H3_WEIGHT_NZ": lambda: os.environ.get("VLLM_OMNI_MINIMAX_H3_WEIGHT_NZ", None),
+    # How the NZ layout is reached. "reactor" (default) permutes the
+    # checkpoint bytes on the host and only re-labels the uploaded buffer, so
+    # no transdata is issued on the upload path; "cast" converts per upload
+    # instead (the earlier behaviour, and the fallback for dtypes and shapes
+    # the reactor cannot hold).
+    "VLLM_OMNI_MINIMAX_H3_WEIGHT_NZ_MODE": lambda: os.environ.get("VLLM_OMNI_MINIMAX_H3_WEIGHT_NZ_MODE", None),
 }
 
 

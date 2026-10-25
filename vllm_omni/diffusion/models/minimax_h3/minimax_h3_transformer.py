@@ -1725,6 +1725,13 @@ class MiniMaxH3DiTModel(nn.Module):
         for name, buffer in self.named_buffers():
             if name in MINIMAX_H3_FP32_BUFFER_NAMES and buffer.dtype != _FP32_DTYPE:
                 raise ValueError(f"{name} must stay fp32 after load, got {buffer.dtype}.")
+        # Opt-in ND -> FRACTAL_NZ weight layout; a no-op unless the env enables
+        # it. Runs once here, with every weight loaded and on the device.
+        # Imported locally: the ``npu`` package initializer pulls in ``lora``,
+        # which imports this module back.
+        from .npu.weight_nz import install_minimax_h3_dit_weight_nz
+
+        install_minimax_h3_dit_weight_nz(self, od_config=self.od_config)
 
     def validate_restored_host_weights(self) -> None:
         """Validate mixed-precision invariants after lease-backed restore."""
