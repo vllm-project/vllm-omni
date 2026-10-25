@@ -23,7 +23,7 @@ class HyNomasRuntime(CPTCausalInferencePipeline):
             return super()._encode_prompt(prompt, negative_prompt, data_type, encode_negative)
 
     def _dit_denoise_residency(self):
-        # 相机投影和全部分段的去噪、KV 写入共享一次 DiT 驻留。
+        # Keep the DiT resident through camera projection, segment denoising, and KV writes.
         return self._component_context(self.transformer)
 
     def _decode_latents(self, latents: torch.Tensor, num_frames: int) -> torch.Tensor:

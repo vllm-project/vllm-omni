@@ -18,7 +18,7 @@ _DIT_NAMES = WeightsMapper(
 
 
 def validate_dit_checkpoint(transformer: nn.Module, checkpoint: Path) -> None:
-    # 参考 loader 允许训练时新增 camera 参数；完整蒸馏推理必须加载这些参数。
+    # The training loader allows new camera parameters; distilled inference requires every parameter.
     with safe_open(str(checkpoint), framework="pt", device="cpu") as weights:
         loaded_names = set(_DIT_NAMES.apply_list(list(weights.keys())))
     missing = set(dict(transformer.named_parameters())) - loaded_names

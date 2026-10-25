@@ -23,14 +23,14 @@ def initialize_reference_parallelism(sp_size: int, device: torch.device) -> Devi
         group = get_sp_group()
         if group.ulysses_world_size != sp_size or group.world_size != sp_size:
             raise ValueError("Hy-Nomas requires the initialized SP group to match ulysses_degree.")
-        # 复用 worker 已有的通信组；进程组的创建和销毁仍由 vLLM-Omni 管理。
+        # Reuse the worker's group; vLLM-Omni owns its creation and destruction.
         mesh = DeviceMesh.from_group(group.ulysses_group, device.type, mesh_dim_names=("sp",))
         dims.sp_mesh = mesh
         dims.sp_group = group.ulysses_group
     else:
         dims.sp_group = None
     dims.device_mesh = mesh
-    # 上游单卡初始化不会清理旧组或关闭 SP，重新加载模型时需要显式重置。
+    # The upstream single-device path leaves stale SP state when a model is reloaded.
     set_sequence_parallel_state(False)
     set_tensor_parallel_state(False)
     nccl_info.sp_group = None
@@ -39,6 +39,6 @@ def initialize_reference_parallelism(sp_size: int, device: torch.device) -> Devi
     nccl_info.sp_stream = None
     nccl_info.sp_rank_list = None
     initialize_sequence_parallel_state_v2(dims, mesh)
-    # worker 的全局 rank 以已初始化的通信环境为准，不依赖 torchrun 的 RANK。
+    # Use the initialized worker rank instead of the torchrun RANK environment variable.
     nccl_info.global_rank = dist.get_rank() if dist.is_initialized() else 0
     return mesh

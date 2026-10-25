@@ -29,7 +29,7 @@ def model_cleanup():
     try:
         yield
     finally:
-        # pipelines 的 fixture 引用已释放，再回收 offload hook 的引用环。
+        # Collect offload-hook cycles after the pipeline fixture releases its references.
         cleanup_test_environment()
 
 
@@ -90,7 +90,7 @@ def test_reference_decoded_video(pipelines, scenario, offload):
         boundaries = [0, 24, 49]
     camera = "pan_left" if scenario == "camera" else None
     camera_flags = [True, True] if camera else None
-    # pytest 已导入 vLLM；参考调用显式恢复独立上游进程的默认 SDPA 后端集合。
+    # pytest has imported vLLM; restore the SDPA backends used by a standalone reference process.
     with sdpa_kernel(
         [SDPBackend.CUDNN_ATTENTION, SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]
     ):

@@ -49,7 +49,7 @@ def build_reference_config(model_root: Path, text_encoder: str, sp_size: int = 1
     directory = Path(reference_config.__file__).parent
     base = OmegaConf.load(directory / "config.yaml")
     inference = OmegaConf.load(directory / "experiment" / "inference.yaml")
-    # 固定版本的配置仅合并这两个文件，不读取进程命令行或修改 Hydra 全局状态。
+    # Match the pinned reference config without reading CLI arguments or changing Hydra's global state.
     del base["defaults"]
     del inference["defaults"]
     config = OmegaConf.merge(base, inference)
@@ -99,7 +99,7 @@ def validate_config(config: OmniDiffusionConfig) -> None:
 
 
 class HyNomasPipeline(nn.Module, SupportsComponentDiscovery):
-    # 通用预热使用两步和 CFG=0，不属于该蒸馏模型的有效采样配置。
+    # Generic warmup uses two steps and CFG=0, which the distilled checkpoint does not support.
     dummy_run_num_frames: ClassVar[int] = 0
     _dit_modules: ClassVar[list[str]] = ["pipe.transformer"]
     _encoder_modules: ClassVar[list[str]] = ["pipe.text_encoder"]
@@ -111,7 +111,7 @@ class HyNomasPipeline(nn.Module, SupportsComponentDiscovery):
         self.device = get_local_device()
         if self.device.type != "cuda":
             raise ValueError("Hy-Nomas requires CUDA.")
-        # 必需依赖直接导入；安装固定参考版本的方法见模型使用文档。
+        # Defer the external dependency until this pipeline is initialized.
         from vllm_omni.diffusion.models.hy_nomas.runtime import HyNomasRuntime
 
         root = Path(od_config.model)
@@ -180,7 +180,7 @@ class HyNomasPipeline(nn.Module, SupportsComponentDiscovery):
             self.pipe.omni_cpu_offload = False
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> None:
-        # 参考实现已在构造时加载三个组件，禁止标准 loader 再传入另一组权重。
+        # The reference constructor loads all components; reject a second weight stream.
         if next(iter(weights), None) is not None:
             raise ValueError("Hy-Nomas loads weights through its reference component loaders.")
 
@@ -217,7 +217,7 @@ class HyNomasPipeline(nn.Module, SupportsComponentDiscovery):
                 )
         self._reset_cache()
         try:
-            # vLLM 导入时关闭 cuDNN SDPA；此处恢复参考实现的后端集合，退出后还原。
+            # vLLM disables cuDNN SDPA on import; use the reference backend set for this call.
             with sdpa_kernel(
                 [
                     SDPBackend.CUDNN_ATTENTION,

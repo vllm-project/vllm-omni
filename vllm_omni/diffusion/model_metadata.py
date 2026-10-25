@@ -37,7 +37,7 @@ class DiffusionModelMetadata:
     # Whether ``/v1/videos/depth`` may serve this model: it takes one video path
     # and returns a ``video_depth`` payload of per-frame depth maps.
     supports_video_depth: bool = False
-    # External models with process-scoped runtime state need process isolation.
+    # Isolate external runtimes that modify process-global state.
     requires_process_isolation: bool = False
 
 
