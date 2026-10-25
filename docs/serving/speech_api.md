@@ -1248,6 +1248,14 @@ it uses reference-audio conditioning instead. Keep this choice consistent when
 comparing benchmarks. Supplying inline `ref_audio` overrides the uploaded voice
 and does not use the named-voice cache shortcut.
 
+Ming-TTS (dense) can reuse a worker-cached speaker embedding for a single inline
+`ref_audio` when the resolver provides the same decoded-audio content key, even
+if the request text or audio locator changes. This avoids repeated speaker
+embedding extraction; the waveform is still resolved and sent to the worker.
+If the resolver provides no content key or the worker entry is evicted, the
+embedding is extracted again. Multi-reference requests retain their existing
+extraction behavior.
+
 The separate decoded-waveform resolve cache defaults to **4 GiB and 2048 entries
 per speech server instance**. These are LRU limits, not preallocated memory or a
 limit on total server RSS. Waveforms retain their source sampling rate and are
