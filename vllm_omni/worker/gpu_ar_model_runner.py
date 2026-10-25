@@ -15,7 +15,7 @@ from collections.abc import Callable, Mapping, Sequence
 from contextlib import nullcontext
 from copy import copy
 from dataclasses import replace
-from typing import TYPE_CHECKING, Any, NamedTuple, cast
+from typing import Any, NamedTuple, cast
 
 import numpy as np
 import torch
@@ -64,14 +64,12 @@ from vllm_omni.worker.omni_connector_model_runner_mixin import (
 from vllm_omni.worker.output.payload_build import build_omni_mm_payload
 from vllm_omni.worker.runner_assisted_metadata import RunnerAssistedFullAttentionMetadataRequest
 from vllm_omni.worker.sampling_utils import (
+    SamplingFeedback,
     call_model_sampler,
     clamp_prompt_ids_to_penalty_padding,
     sanitize_min_tokens_stop_ids,
 )
 from vllm_omni.worker.sparse_audio import resolve_sparse_mm_routing
-
-if TYPE_CHECKING:
-    from vllm_omni.model_executor.models.cosyvoice3.v1_sampling import DeferredRejection
 
 logger = init_logger(__name__)
 
@@ -207,7 +205,7 @@ class _OmniOutputTensorSnapshot(NamedTuple):
 class _SamplingFeedbackOutput(AsyncModelRunnerOutput):
     """Commit conditional RNG at the existing async output completion boundary."""
 
-    def __init__(self, output: AsyncModelRunnerOutput, feedback: DeferredRejection):
+    def __init__(self, output: AsyncModelRunnerOutput, feedback: SamplingFeedback):
         self.output = output
         self.feedback = feedback
 

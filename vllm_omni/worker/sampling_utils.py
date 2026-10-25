@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Sampling helpers shared by the GPU and NPU AR model runners."""
 
-from typing import Any
+from typing import Any, Protocol
 
 import torch
 from vllm.logger import init_logger
@@ -12,6 +12,7 @@ from vllm.v1.sample.logits_processor import LogitsProcessors, MinTokensLogitsPro
 logger = init_logger(__name__)
 
 __all__ = [
+    "SamplingFeedback",
     "apply_fixed_seed_to_sampling_params",
     "get_tts_local_seed",
     "clamp_prompt_ids_to_penalty_padding",
@@ -20,6 +21,14 @@ __all__ = [
     "build_model_sampler_extra_args",
     "call_model_sampler",
 ]
+
+
+class SamplingFeedback(Protocol):
+    """Deferred sampling feedback consumed at token completion."""
+
+    def commit(self, *, ready: bool = False) -> None: ...
+
+    def invalid_rows(self) -> list[int]: ...
 
 
 def get_tts_local_seed(sampling_params: Any) -> int | None:
