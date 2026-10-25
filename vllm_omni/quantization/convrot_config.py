@@ -37,6 +37,8 @@ import torch
 from torch.nn import Module
 from vllm import _custom_ops as ops
 from vllm.model_executor.kernels.linear import (
+    MxFp4LinearKernel,
+    Mxfp8LinearKernel,
     init_mxfp4_linear_kernel,
     init_mxfp8_linear_kernel,
 )
@@ -290,9 +292,7 @@ class DiffusionConvRotMxfp4Config(DiffusionConvRotConfig):
             config, ["modules_to_not_convert"], None
         )
         return cls(
-            rotation_group_size=cls.get_from_keys_or(
-                config, ["rotation_group_size"], DEFAULT_ROTATION_GROUP_SIZE
-            ),
+            rotation_group_size=cls.get_from_keys_or(config, ["rotation_group_size"], DEFAULT_ROTATION_GROUP_SIZE),
             ignored_layers=ignored_layers,
             mxfp8_layers=cls.get_from_keys_or(config, ["mxfp8_layers"], None),
         )
@@ -344,9 +344,7 @@ class DiffusionConvRotMxfp8Config(DiffusionConvRotConfig):
             config, ["modules_to_not_convert"], None
         )
         return cls(
-            rotation_group_size=cls.get_from_keys_or(
-                config, ["rotation_group_size"], DEFAULT_ROTATION_GROUP_SIZE
-            ),
+            rotation_group_size=cls.get_from_keys_or(config, ["rotation_group_size"], DEFAULT_ROTATION_GROUP_SIZE),
             ignored_layers=ignored_layers,
         )
 
@@ -414,7 +412,7 @@ class ConvRotMxfp4OnlineLinearMethod(LazyWeightMixin, BaseInt8LinearMethod):
     def __init__(self, quant_config: DiffusionConvRotMxfp4Config):
         super().__init__(quant_config._int8)
         self.rotation_group_size = quant_config.rotation_group_size
-        self.kernel = None
+        self.kernel: MxFp4LinearKernel | None = None
 
     def process_weights_after_loading(self, layer: Module) -> None:
         if getattr(layer, "_already_called_process_weights_after_loading", False):
@@ -426,19 +424,23 @@ class ConvRotMxfp4OnlineLinearMethod(LazyWeightMixin, BaseInt8LinearMethod):
         if weight.shape[-1] % 32:
             raise ValueError(f"convrot_mxfp4 needs an input size divisible by 32, got {weight.shape[-1]}")
 
-        self.kernel = init_mxfp4_linear_kernel(activation_quant_key=kMxfp4Dynamic)
+        kernel = init_mxfp4_linear_kernel(activation_quant_key=kMxfp4Dynamic)
+        self.kernel = kernel
         qweight, weight_scale = mxfp4_quantize(weight)
         layer.params_dtype = layer.orig_dtype
         replace_parameter(layer, "weight", torch.nn.Parameter(qweight, requires_grad=False))
         replace_parameter(layer, "weight_scale", torch.nn.Parameter(weight_scale, requires_grad=False))
-        self.kernel.process_weights_after_loading(layer)
+        kernel.process_weights_after_loading(layer)
         layer._already_called_process_weights_after_loading = True
 
     def apply(self, layer: torch.nn.Module, x: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
+        kernel = self.kernel
+        if kernel is None:
+            raise RuntimeError("convrot_mxfp4 linear kernel is not initialized; process weights first")
         if layer.convrot_hadamard is not None:
             x = rotate(x, layer.convrot_hadamard)
         rows = x.reshape(-1, x.shape[-1]).contiguous()
-        out = self.kernel.apply_weights(layer, rows, bias)
+        out = kernel.apply_weights(layer, rows, bias)
         return out.reshape(*x.shape[:-1], out.shape[-1])
 
 
@@ -448,7 +450,7 @@ class ConvRotMxfp8OnlineLinearMethod(LazyWeightMixin, BaseInt8LinearMethod):
     def __init__(self, quant_config: DiffusionConvRotConfig):
         super().__init__(quant_config._int8)
         self.rotation_group_size = quant_config.rotation_group_size
-        self.kernel = None
+        self.kernel: Mxfp8LinearKernel | None = None
 
     def process_weights_after_loading(self, layer: Module) -> None:
         if getattr(layer, "_already_called_process_weights_after_loading", False):
@@ -460,17 +462,21 @@ class ConvRotMxfp8OnlineLinearMethod(LazyWeightMixin, BaseInt8LinearMethod):
         if weight.shape[-1] % 32:
             raise ValueError(f"convrot_mxfp8 needs an input size divisible by 32, got {weight.shape[-1]}")
 
-        self.kernel = init_mxfp8_linear_kernel(weight_shape=tuple(weight.shape))
+        kernel = init_mxfp8_linear_kernel(weight_shape=tuple(weight.shape))
+        self.kernel = kernel
         qweight, weight_scale = mxfp8_e4m3_quantize(weight)
         layer.params_dtype = layer.orig_dtype
         replace_parameter(layer, "weight", torch.nn.Parameter(qweight, requires_grad=False))
         replace_parameter(layer, "weight_scale", torch.nn.Parameter(weight_scale, requires_grad=False))
-        self.kernel.process_weights_after_loading(layer)
+        kernel.process_weights_after_loading(layer)
         layer._already_called_process_weights_after_loading = True
 
     def apply(self, layer: torch.nn.Module, x: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
+        kernel = self.kernel
+        if kernel is None:
+            raise RuntimeError("convrot_mxfp8 linear kernel is not initialized; process weights first")
         if layer.convrot_hadamard is not None:
             x = rotate(x, layer.convrot_hadamard)
         rows = x.reshape(-1, x.shape[-1]).contiguous()
-        out = self.kernel.apply_weights(layer, rows, bias)
+        out = kernel.apply_weights(layer, rows, bias)
         return out.reshape(*x.shape[:-1], out.shape[-1])

@@ -93,9 +93,7 @@ def test_int4_quantization_is_symmetric_per_row():
 
 
 def test_factory_builds_all_methods():
-    assert {"convrot_int8", "convrot_int4", "convrot_mxfp4", "convrot_mxfp8"} <= set(
-        SUPPORTED_QUANTIZATION_METHODS
-    )
+    assert {"convrot_int8", "convrot_int4", "convrot_mxfp4", "convrot_mxfp8"} <= set(SUPPORTED_QUANTIZATION_METHODS)
     int8 = build_quant_config("convrot_int8")
     assert int8.get_name() == "convrot_int8" and int8.rotation_group_size == 256
     int4 = build_quant_config(
@@ -112,9 +110,7 @@ def test_factory_builds_all_methods():
     with pytest.raises(ValueError, match="power of four"):
         build_quant_config({"method": "convrot_int4", "rotation_group_size": 128})
 
-    mxfp4 = build_quant_config(
-        {"method": "convrot_mxfp4", "rotation_group_size": 64, "ignored_layers": ["proj_out"]}
-    )
+    mxfp4 = build_quant_config({"method": "convrot_mxfp4", "rotation_group_size": 64, "ignored_layers": ["proj_out"]})
     assert (mxfp4.get_name(), mxfp4.rotation_group_size) == ("convrot_mxfp4", 64)
     with pytest.raises(ValueError, match="int8_layers"):
         build_quant_config({"method": "convrot_mxfp4", "int8_layers": ["to_out"]})
@@ -128,9 +124,7 @@ def test_factory_builds_all_methods():
         }
     )
     assert mixed.mxfp8_layers == ["attn.out_proj"]
-    mxfp8 = build_quant_config(
-        {"method": "convrot_mxfp8", "rotation_group_size": 64, "ignored_layers": ["proj_out"]}
-    )
+    mxfp8 = build_quant_config({"method": "convrot_mxfp8", "rotation_group_size": 64, "ignored_layers": ["proj_out"]})
     assert (mxfp8.get_name(), mxfp8.rotation_group_size, mxfp8.ignored_layers) == (
         "convrot_mxfp8",
         64,
