@@ -27,6 +27,7 @@ from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.kv_cache_interface import KVCacheConfig
 
+from vllm_omni.diffusion.batch_invariance import validate_batch_invariant_diffusion_request
 from vllm_omni.diffusion.cancellation import RequestCancellationRegistry
 from vllm_omni.diffusion.data import (
     DIFFUSION_REQUEST_LIFECYCLE_KEY,
@@ -1395,6 +1396,10 @@ class DiffusionEngine:
 
     def _prepare_request_for_admission(self, request: OmniDiffusionRequest) -> OmniDiffusionRequest:
         """Run model-owned preprocessing once, before entering Engine locks."""
+
+        # Validate before preprocessing creates generators and rebuilds requests.
+        if not request.is_dummy_run():
+            validate_batch_invariant_diffusion_request(request)
 
         pre_process_func = getattr(self, "pre_process_func", None)
         if pre_process_func is not None:

@@ -110,6 +110,27 @@ _ASYNC_OUTPUT_DRAIN_TIMEOUT_S = 10.0
 _MEMORY_RELEASING_METHODS = frozenset({"sleep", "handle_sleep_task"})
 
 
+def _initialize_batch_invariance(device: torch.device) -> None:
+    """Initialize native vLLM BIC after CUDA selection and before distributed init."""
+    from vllm_omni.diffusion.batch_invariance import diffusion_batch_invariant_enabled
+
+    if not diffusion_batch_invariant_enabled():
+        return
+    if device.type != "cuda" or torch.version.hip is not None:
+        # CUDA overrides only; other platforms can opt out of the seed contract.
+        return
+
+    # Installing overrides does not validate a pipeline's batch invariance.
+    from vllm.model_executor.determinism.batch_invariant import init_batch_invariance
+
+    # init_batch_invariance() re-reads envs.VLLM_BATCH_INVARIANT itself, so the
+    # diffusion-only switch has to align it or the op replacement silently no-ops.
+    # vllm.envs resolves this name lazily from os.environ, and its parser is
+    # bool(int(...)), so the value must stay int-parsable.
+    os.environ["VLLM_BATCH_INVARIANT"] = "1"
+    init_batch_invariance()
+
+
 def _cleanup_after_execution_error(exc: Exception) -> None:
     """Release device tensors retained by a failed execution traceback."""
     exc.__traceback__ = None
@@ -372,6 +393,7 @@ class DiffusionWorker:
         # Setup device
         self.device = current_omni_platform.get_torch_device(self.local_rank)
         current_omni_platform.set_device(self.device)
+        _initialize_batch_invariance(self.device)
 
         # Create vllm_config for parallel configuration. Pass explicit device_config
         # so DeviceConfig does not rely on current_platform in worker subprocesses.
