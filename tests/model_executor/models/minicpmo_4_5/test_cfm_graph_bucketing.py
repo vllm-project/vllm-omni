@@ -305,8 +305,9 @@ def test_zero_padded_cnn_cache_uniform_blocks_use_one_write():
     assert torch.count_nonzero(cache[..., 3:]) == 0
 
 
-@pytest.mark.parametrize("max_graphs", [15, 32])
-def test_precapture_covers_final_chunk_without_displacing_steady_graphs(monkeypatch, max_graphs):
+@pytest.mark.parametrize("max_graphs", [15, 30, 31, 35])
+@pytest.mark.parametrize("setup_frames", [0, 273])
+def test_precapture_covers_final_chunk_without_displacing_steady_graphs(monkeypatch, max_graphs, setup_frames):
     from vllm_omni.model_executor.models.minicpmo_4_5 import cuda_graph_wrapper as graph_module
 
     captured = []
@@ -336,14 +337,24 @@ def test_precapture_covers_final_chunk_without_displacing_steady_graphs(monkeypa
     )
     monkeypatch.setattr(graph_module, "_memory_snapshot", lambda device: None)
     count = WholeEulerCFMGraphWrapper.precapture(
-        wrapper, offsets=range(300, 401), steady=400, channels=4, spk_dim=4, tail_frames=6
+        wrapper,
+        offsets=range(300, 401),
+        steady=400,
+        channels=4,
+        spk_dim=4,
+        tail_frames=6,
+        setup_frames=setup_frames,
     )
     assert captured[:15] == [(b, 50, o) for b in [16, 8, 4, 2, 1] for o in [400, 350, 300]]
-    assert count == min(max_graphs, 30)
+    expected = [(b, 50, o) for b in [16, 8, 4, 2, 1] for o in [400, 350, 300]]
+    expected += [(b, 100, o) for b in [16, 8, 4, 2, 1] for o in [400, 350, 300]]
+    if setup_frames:
+        expected += [(b, 300, 0) for b in [1, 2, 4, 8, 16]]
+    assert captured == expected[:max_graphs]
+    assert count == len(captured)
     assert wrapper.query_widths == (50,)
-    if max_graphs == 32:
+    if max_graphs >= 30:
         assert (1, 100, 350) in captured
-        assert captured[15:] == [(b, 100, o) for b in [16, 8, 4, 2, 1] for o in [400, 350, 300]]
 
 
 @pytest.mark.parametrize("width,valid", [(0, 0), (3, 2), (8, 8)])
