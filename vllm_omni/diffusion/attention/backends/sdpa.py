@@ -400,3 +400,13 @@ class SDPAImpl(AttentionImpl):
             length = attn_metadata.packed_padding.kv_length
             return self._forward_impl(query, key[:, :length], value[:, :length])
         return self._forward_impl(query, key, value, attn_metadata, mask_mode="full_qk")
+
+    def forward_oot(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: AttentionMetadata | None = None,
+    ) -> torch.Tensor:
+        # Pure-PyTorch SDPA for out-of-tree platforms (CPU-hosted pipelines included).
+        return self._forward_impl(query, key, value, attn_metadata, mask_mode="broadcast_k")
