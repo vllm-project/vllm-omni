@@ -188,6 +188,23 @@ class _MXFlattenedLinearMethod(INCLinearMethod):
     only the reshape is added.
     """
 
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if getattr(layer, "_already_called_process_weights_after_loading", False):
+            return
+        if not hasattr(layer, "weight_packed") and hasattr(layer, "weight"):
+            from vllm.model_executor.layers.quantization.inc.schemes.inc_mxfp4_linear import (
+                INCMxfp4LinearMethod,
+            )
+
+            if isinstance(self.scheme, INCMxfp4LinearMethod):
+                # INCMxfp4LinearMethod destructively replaces weight_packed with
+                # weight. A second finalize (generic post-load plus an explicit
+                # repack) would otherwise raise AttributeError.
+                layer._already_called_process_weights_after_loading = True
+                return
+        super().process_weights_after_loading(layer)
+        layer._already_called_process_weights_after_loading = True
+
     def apply(
         self,
         layer: torch.nn.Module,
