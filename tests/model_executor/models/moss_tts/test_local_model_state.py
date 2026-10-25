@@ -14,6 +14,8 @@ from vllm.v1.worker.gpu.model_states.default import DefaultModelState
 from tests.helpers.mark import hardware_marks, hardware_test
 from vllm_omni.model_executor.models.moss_tts.local_model_state import MossLocalModelState
 from vllm_omni.model_executor.models.moss_tts.modeling_moss_tts_talker import MossTTSLocalTalkerForGeneration
+from vllm_omni.model_executor.output_snapshot import PackedOutputSnapshot
+from vllm_omni.utils.device_copy import DeviceStager
 from vllm_omni.worker_v2.model_states import init_omni_model_state
 from vllm_omni.worker_v2.model_states.eager_mtp import EagerMTPState
 from vllm_omni.worker_v2.model_states.intermediate_buffer import OmniIntermediateBuffer
@@ -25,7 +27,7 @@ pytestmark = pytest.mark.core_model
 @pytest.fixture(
     params=[
         pytest.param("cpu", marks=pytest.mark.cpu),
-        pytest.param("cuda", marks=hardware_marks(res={"cuda": "L4"}, num_cards=1)),
+        pytest.param("cuda", marks=hardware_marks(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)),
     ]
 )
 def device(request):
@@ -80,6 +82,9 @@ def _state(cls, device):
         setattr(state, name, torch.zeros(5, 4, device=device, dtype=state.dtype))
     state._mtp_runner = state._mtp_sample_uniforms = None
     state._mtp_generators = {}
+    state._mtp_seeded = set()
+    state._mtp_replays = {}
+    state._stage_offsets = DeviceStager()
     state._stream_pos = {}
     state._stream_decode_event = None
     state._eager_state = EagerMTPState(state)
@@ -124,6 +129,10 @@ def _step(state, batch, req_states, dispatcher=None):
         hidden = inputs["inputs_embeds"] + 0.25
         state.run_postprocess(hidden, batch)
         _, payload = state.postprocess_model_output(hidden, batch, req_states)
+        if isinstance(payload, PackedOutputSnapshot):
+            # The runner only reads a snapshot through its host copy plan; an
+            # identity copy keeps the rows as views of the owned gathered tensor.
+            payload = payload.copy_to_cpu(lambda tensor: tensor)
         last = batch.query_start_loc[1:] - 1
         tokens = state.model.compute_logits(hidden.index_select(0, last)).argmax(-1)
         result = inputs["inputs_embeds"].clone(), payload, tokens
@@ -219,7 +228,7 @@ def test_local_seeded_mtp_keeps_per_row_generators_in_one_batch(state_cls):
     assert frame.call_args.kwargs["generator"] is None
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 def test_slot_mtp_graph_padding_reorder_and_owned_output():
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")

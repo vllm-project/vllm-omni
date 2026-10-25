@@ -37,6 +37,7 @@ def test_asr_to_joyai_combines_transcript_with_deferred_visuals() -> None:
     client = object.__new__(StageEngineCoreClient)
     client.custom_process_input_func = joyai_bridge.asr_to_joyai
     client.requires_multimodal_data = True
+    client.vllm_config = SimpleNamespace(model_config=None)
 
     def joyai_prompt(system_prompt: str, user_turn: str) -> str:
         return (
@@ -78,6 +79,75 @@ def test_asr_to_joyai_combines_transcript_with_deferred_visuals() -> None:
         assert client.process_engine_inputs([SimpleNamespace(outputs=[completion])], prompt=prompt) == [expected]
 
 
+def test_asr_handoff_preserves_session_prompt_and_checks_final_budget(monkeypatch):
+    monkeypatch.setattr(
+        joyai_bridge,
+        "cached_processor_from_config",
+        lambda config: SimpleNamespace(
+            apply_chat_template=lambda messages, **kwargs: repr(messages),
+            tokenizer=lambda **kwargs: {"input_ids": [list(kwargs["text"][0])]},
+        ),
+    )
+    prompt = {
+        "additional_information": {
+            "joyai_prompt_context": {
+                "system": "standing instruction",
+                "history": [{"role": "assistant", "content": "played history"}],
+                "query": "",
+            },
+            "joyai_prompt_budget": 500,
+            "joyai_image_token_counts": [21],
+            "deferred_multi_modal_data": {"image": ["original-frame"]},
+        }
+    }
+    output = SimpleNamespace(outputs=[SimpleNamespace(text="language English<asr_text>Watch the pot.")])
+    (result,) = joyai_bridge.asr_to_joyai([output], prompt)
+    assert all(text in result["prompt"] for text in ("standing instruction", "played history", "Watch the pot."))
+    assert result["multi_modal_data"] == {"image": ["original-frame"]}
+    prompt["additional_information"]["joyai_prompt_budget"] = 30
+    with pytest.raises(joyai_bridge.OmniClientError, match="context budget"):
+        joyai_bridge.asr_to_joyai([output], prompt)
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {"joyai_prompt_context": {}},
+        {"joyai_prompt_context": None},
+        {"joyai_prompt_context": []},
+        {"joyai_prompt_context": {"system": "policy"}},
+        {"joyai_prompt_context": {"system": 1, "history": []}},
+        {"joyai_prompt_context": {"system": "policy", "history": {}}},
+        {"joyai_prompt_context": {"system": "policy", "history": [None]}},
+        {"joyai_prompt_context": {"system": "policy", "history": [{"content": "hello"}]}},
+        {"joyai_prompt_context": {"system": "policy", "history": [{"role": [], "content": "hello"}]}},
+        {"joyai_prompt_context": {"system": "policy", "history": [{"role": "user", "content": None}]}},
+        {"joyai_prompt_budget": None},
+        {"joyai_prompt_budget": "invalid"},
+        {"joyai_prompt_budget": True},
+        {"joyai_prompt_budget": 0},
+        {"joyai_image_token_counts": None},
+        {"joyai_image_token_counts": ["21"]},
+        {"joyai_image_token_counts": [-1]},
+        {"joyai_image_token_counts": []},
+    ],
+)
+def test_asr_handoff_rejects_malformed_session_metadata(monkeypatch, metadata):
+    # No tokenizer is needed to reject invalid client-supplied metadata.
+    monkeypatch.setattr(joyai_bridge, "cached_processor_from_config", lambda _: None)
+    info = {
+        "joyai_prompt_context": {"system": "policy", "history": []},
+        "joyai_prompt_budget": 500,
+        "joyai_image_token_counts": [21],
+        "deferred_multi_modal_data": {"image": ["frame"]},
+        **metadata,
+    }
+    output = SimpleNamespace(outputs=[SimpleNamespace(text="What is this?")])
+    with pytest.raises(joyai_bridge.OmniClientError, match="joyai_") as error:
+        joyai_bridge.asr_to_joyai([output], {"additional_information": info})
+    assert error.value.status_code == 400
+
+
 def test_joyai_action_to_tts_bridge(monkeypatch: pytest.MonkeyPatch) -> None:
     """Convert each JoyAI action through the real stage-client entry point."""
     target_model_config = SimpleNamespace(
@@ -87,6 +157,7 @@ def test_joyai_action_to_tts_bridge(monkeypatch: pytest.MonkeyPatch) -> None:
     prompt_lengths = {
         "Colored squares are visible.": 12,
         "I am checking this request now.": 18,
+        "Why don't scientists trust atoms? Because they make up everything!": 24,
     }
 
     def compute_prompt_length(metadata, model_config):
@@ -105,6 +176,12 @@ def test_joyai_action_to_tts_bridge(monkeypatch: pytest.MonkeyPatch) -> None:
     client.vllm_config = SimpleNamespace(model_config=target_model_config)
 
     cases = [
+        (
+            "</response> Why don't scientists trust atoms?\n\nBecause they make up everything!",
+            None,
+            {},
+            ("Why don't scientists trust atoms? Because they make up everything!", "Auto", "Vivian"),
+        ),
         (
             "</response> Colored squares are visible.",
             None,

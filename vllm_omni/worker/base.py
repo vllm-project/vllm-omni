@@ -117,15 +117,24 @@ class OmniGPUWorkerBase(GPUWorker):
 
             self.profiler = CudaProfilerWrapper(profiler_config)
 
-    def profile(self, is_start: bool = True, profile_prefix: str | None = None):
+    def profile(
+        self,
+        is_start: bool = True,
+        profile_prefix: str | None = None,
+        *,
+        delay_iterations: int | None = None,
+        max_iterations: int | None = None,
+    ):
         """Override to set trace filename before starting the profiler.
 
         Args:
             is_start: True to start profiling, False to stop.
             profile_prefix: Optional prefix for trace filename (vLLM compat).
+            delay_iterations: Optional per-session delayed start (vLLM compat).
+            max_iterations: Optional per-session iteration cap (vLLM compat).
 
-        vLLM's profile() only passes is_start, so we generate a descriptive
-        trace filename here before delegating to the profiler.
+        Generate a stage-specific trace filename before delegating the
+        lifecycle and iteration controls to the profiler.
         """
         if self.profiler is None:
             raise RuntimeError(
@@ -141,7 +150,12 @@ class OmniGPUWorkerBase(GPUWorker):
                 stage_id = getattr(self.vllm_config.model_config, "stage_id", 0)
                 filename = profile_prefix or f"stage{stage_id}_rank{self.rank}_{int(time.time())}"
                 self.profiler.set_trace_filename(filename)
-            self.profiler.start()
+            kwargs: dict[str, int] = {}
+            if delay_iterations is not None:
+                kwargs["delay_iterations"] = delay_iterations
+            if max_iterations is not None:
+                kwargs["max_iterations"] = max_iterations
+            self.profiler.start(**kwargs)
         else:
             self.profiler.stop()
 
@@ -315,9 +329,9 @@ class OmniGPUWorkerBase(GPUWorker):
         if is_sleep_enabled:
             current_omni_platform.synchronize()
             gc.collect()
-            from vllm.device_allocator.cumem import CuMemAllocator
+            from vllm.device_allocator import get_mem_allocator_instance
 
-            allocator = CuMemAllocator.get_instance()
+            allocator = get_mem_allocator_instance()
             logger.info(f"[LLM Worker {self.rank}] Sleep Mode ENABLED. Activating CuMem pool for tag: {tag}")
             return allocator.use_memory_pool(tag=tag)
         else:
@@ -330,7 +344,7 @@ class OmniGPUWorkerBase(GPUWorker):
         Args:
             level: 1 (Offload weights to CPU), level: 2 (Total Discard).
         """
-        from vllm.device_allocator.cumem import CuMemAllocator
+        from vllm.device_allocator import get_mem_allocator_instance
 
         # Drain in-flight kernels before CuMem unmap. Abort/decode can still
         # have GPU work after the scheduler reports idle; unmapping then
@@ -340,7 +354,7 @@ class OmniGPUWorkerBase(GPUWorker):
 
         mem_before = current_omni_platform.get_current_memory_usage(self.device)
         offload_tags = ("weights",) if level == 1 else tuple()
-        allocator = CuMemAllocator.get_instance()
+        allocator = get_mem_allocator_instance()
         allocator.sleep(offload_tags=offload_tags)
         # allocator.sleep already gc.collects and empty_cache()s. A second
         # empty_cache on the pluggable allocator is a known CUDA invalid
@@ -358,9 +372,9 @@ class OmniGPUWorkerBase(GPUWorker):
 
     def wake_up(self, tags: list[str] | None = None) -> bool:
         "Physical video memory reloading logic"
-        from vllm.device_allocator.cumem import CuMemAllocator
+        from vllm.device_allocator import get_mem_allocator_instance
 
-        allocator = CuMemAllocator.get_instance()
+        allocator = get_mem_allocator_instance()
         allocator.wake_up(tags)
         current_omni_platform.synchronize()
         logger.info(f"[LLM Worker {self.rank}] Wake-up complete.")

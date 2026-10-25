@@ -93,7 +93,7 @@ steps:
     command: |
       python3 .buildkite/common/scripts/upload_pipeline.py --upload .buildkite/npu/test-npu-ready.yml
 
-  # L4 Test — main+NIGHTLY=1 (scheduled), or PR nightly-test label
+  # L4 Test — release-line+NIGHTLY=1 (scheduled), or PR nightly-test label
   - label: "Upload Nightly Pipeline"
     depends_on:
       - image-build-a2
@@ -103,8 +103,10 @@ steps:
     key: upload-nightly-pipeline
     commands:
       - |
+        # shellcheck disable=SC1091
+        source .buildkite/common/scripts/release_line_branch.sh
         EXTRA=""
-        if [ "${NIGHTLY:-}" = "1" ] && [ "${BUILDKITE_BRANCH}" = "main" ]; then
+        if [ "${NIGHTLY:-}" = "1" ] && is_release_line_push; then
           EXTRA="--all"
         fi
         python3 .buildkite/common/scripts/upload_pipeline.py --upload $$EXTRA .buildkite/npu/test-npu-nightly.yml

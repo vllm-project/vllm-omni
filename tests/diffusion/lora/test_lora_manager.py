@@ -203,6 +203,209 @@ def test_lora_manager_keeps_dlo_lora_buffers_on_compute_device(monkeypatch):
     assert pipeline.transformer.foo.lora_buffer_device == torch.device("cpu")
 
 
+@pytest.mark.parametrize(
+    "target_modules",
+    [
+        ["experts.0.gate_proj"],
+        r".*\.experts\.\d+\.gate_proj$",
+    ],
+)
+def test_lora_manager_matches_scoped_moe_targets(monkeypatch, target_modules):
+    import vllm.model_executor.layers.fused_moe as upstream_moe
+
+    import vllm_omni.diffusion.lora.manager as manager_mod
+
+    class _TargetMoERunner(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.moe_config = SimpleNamespace(
+                is_act_and_mul=True,
+                num_experts=2,
+            )
+            self.global_num_experts = 2
+
+    monkeypatch.setattr(upstream_moe, "MoERunner", _TargetMoERunner)
+    monkeypatch.setattr(manager_mod, "BaseLayerWithLoRA", _DummyBaseLayerWithLoRA)
+    monkeypatch.setattr(
+        manager_mod,
+        "from_layer_diffusion",
+        lambda *, layer, **_kwargs: _DummyBaseLayerWithLoRA(layer),
+    )
+    monkeypatch.setattr(
+        manager_mod,
+        "replace_submodule",
+        lambda root, name, sub: fake_replace_submodule(root, name, sub),
+    )
+
+    pipeline = torch.nn.Module()
+    pipeline.transformer = torch.nn.Module()
+    pipeline.transformer.experts = _TargetMoERunner()
+    manager = DiffusionLoRAManager(
+        pipeline=pipeline,
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+    )
+
+    peft_helper = type(
+        "_PH",
+        (),
+        {"r": 1, "target_modules": target_modules},
+    )()
+    manager._replace_layers_with_lora(peft_helper)
+
+    assert "transformer.experts" in manager._lora_modules
+    assert isinstance(pipeline.transformer.experts, _DummyBaseLayerWithLoRA)
+
+
+def test_moe_punica_initializes_public_mapping_metadata(monkeypatch):
+    import vllm.lora.punica_wrapper as punica_module
+
+    class _FakePunica:
+        def __init__(self):
+            self.update_calls = []
+
+        def update_metadata(self, mapping, lora_index_to_id, max_loras, vocab_size):
+            self.update_calls.append((mapping, lora_index_to_id, max_loras, vocab_size))
+
+    punica = _FakePunica()
+    monkeypatch.setattr(punica_module, "get_punica_wrapper", lambda *args, **kwargs: punica)
+
+    manager = object.__new__(DiffusionLoRAManager)
+    manager._moe_punica_wrapper = None
+    manager._max_lora_rank = 8
+    manager.max_cached_adapters = 1
+    manager.dtype = torch.bfloat16
+    manager.device = torch.device("cpu")
+    manager._max_num_batched_tokens = 8
+
+    assert manager._get_moe_punica_wrapper() is punica
+    assert len(punica.update_calls) == 1
+    mapping, lora_index_to_id, max_loras, vocab_size = punica.update_calls[0]
+    assert mapping.index_mapping == (1,) * 8
+    assert mapping.prompt_mapping == (1,)
+    assert lora_index_to_id == [1]
+    assert max_loras == 1
+    assert vocab_size == 0
+
+
+def test_moe_lora_token_capacity_is_validated_before_forward(monkeypatch):
+    import vllm_omni.diffusion.lora.utils as utils_mod
+
+    class _Runner(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.register_forward_pre_hook(lambda *_args: None)
+
+        def forward(self, hidden_states):
+            return hidden_states
+
+    class _Wrapper(torch.nn.Module):
+        def __init__(self, base_layer):
+            super().__init__()
+            self.base_layer = base_layer
+            self.adapter_enabled = torch.ones(1, dtype=torch.int)
+
+        def create_lora_weights(self, *_args, **_kwargs):
+            pass
+
+        def set_lora(self, *_args, **_kwargs):
+            pass
+
+        def reset_lora(self, *_args, **_kwargs):
+            pass
+
+    monkeypatch.setattr(utils_mod, "MoERunner", _Runner)
+    monkeypatch.setattr(utils_mod, "_select_moe_lora_wrapper_cls", lambda: _Wrapper)
+
+    wrapper = utils_mod.from_layer_diffusion(
+        _Runner(),
+        max_loras=1,
+        lora_config=SimpleNamespace(),  # type: ignore[arg-type]
+        packed_modules_list=[],
+        max_num_batched_tokens=8,
+    )
+
+    assert wrapper(torch.zeros((8, 4))).shape == (8, 4)
+    with pytest.raises(ValueError, match="token count 9 exceeds the configured capacity 8"):
+        wrapper(torch.zeros((9, 4)))
+
+
+def test_move_moe_lora_buffers_keeps_all_stacks_and_views_on_device():
+    from vllm_omni.diffusion.lora.utils import _move_moe_lora_buffers
+
+    wrapper = SimpleNamespace(
+        max_loras=1,
+        local_num_experts=2,
+        enable_moe_shared_loras=False,
+        _w13_slices=2,
+        w13_lora_a_stacked=(torch.ones((1, 2, 3, 4)), torch.ones((1, 2, 3, 4))),
+        w13_lora_b_stacked=(torch.ones((1, 2, 5, 3)), torch.ones((1, 2, 5, 3))),
+        w2_lora_a_stacked=(torch.ones((1, 2, 3, 5)),),
+        w2_lora_b_stacked=(torch.ones((1, 2, 4, 3)),),
+        adapter_enabled=torch.ones(2, dtype=torch.int),
+    )
+
+    _move_moe_lora_buffers(wrapper, torch.device("meta"))  # type: ignore[arg-type]
+
+    for stacks in (
+        wrapper.w13_lora_a_stacked,
+        wrapper.w13_lora_b_stacked,
+        wrapper.w2_lora_a_stacked,
+        wrapper.w2_lora_b_stacked,
+    ):
+        assert all(tensor.device.type == "meta" for tensor in stacks)
+    assert wrapper.adapter_enabled.device.type == "meta"
+    assert len(wrapper.lora_a_stacked) == len(wrapper.lora_b_stacked) == 6
+    assert [tensor.shape for tensor in wrapper.lora_a_stacked] == [
+        (3, 4),
+        (3, 5),
+        (3, 4),
+        (3, 4),
+        (3, 5),
+        (3, 4),
+    ]
+
+
+def test_lora_manager_homes_lora_buffers_to_compute_device_without_dlo(monkeypatch):
+    # Non-DLO deployments used to leave `_resident_lora_device` unset, so
+    # buffers created while the base weights were offloaded stayed on CPU
+    # after wake, and rank-growth reinit re-stranded them (#8817).
+    import vllm_omni.diffusion.lora.manager as manager_mod
+
+    class _LoRALayer(DummyBaseLayerWithLoRA):
+        lora_buffer_device = None
+
+        def _set_diffusion_lora_buffer_device(self, device):
+            self.lora_buffer_device = device
+            self._diffusion_lora_buffer_device = device
+
+    monkeypatch.setattr(manager_mod, "BaseLayerWithLoRA", _LoRALayer)
+    monkeypatch.setattr(
+        manager_mod,
+        "from_layer_diffusion",
+        lambda *, layer, **_kwargs: _LoRALayer(layer),
+    )
+
+    pipeline = torch.nn.Module()
+    pipeline.transformer = torch.nn.Module()
+    pipeline.transformer.foo = _FakeLinearBase()
+    compute = torch.device("meta")
+    manager = DiffusionLoRAManager(
+        pipeline=pipeline,
+        device=compute,
+        dtype=torch.bfloat16,
+    )
+
+    manager._replace_layers_with_lora(type("_PH", (), {"r": 1})())
+
+    layer = pipeline.transformer.foo
+    assert layer.lora_buffer_device == compute
+    # The recorded device is what create_lora_weights consults when a later
+    # rank increase re-allocates the buffers, so the second exposure from
+    # #8817 is pinned by this attribute as well.
+    assert layer._diffusion_lora_buffer_device == compute
+
+
 def test_lora_manager_replaces_packed_layer_when_targeting_sublayers(monkeypatch):
     import vllm_omni.diffusion.lora.manager as manager_mod
 
@@ -882,16 +1085,46 @@ def test_lora_manager_scales_correctly_with_rank_changes(monkeypatch):
     assert torch.all(lora_a == 1)
     assert torch.all(lora_b == initial_scale)
 
-    # Increase the rank; this resets the buffers, so the adapter is activated again
+    # Increase the rank; this resets the buffers, so the adapter is activated again.
     manager._ensure_max_lora_rank(8)
 
     # Ensure we actually took the rank expansion path, which recreates
-    # and sets the weight buffets, but that the scale didn't change
+    # and sets the weight buffers, but that the scale didn't change.
     assert lora_model.transformer.foo.create_calls == 1
     assert len(lora_model.transformer.foo.set_calls) == 2
     lora_a, lora_b = lora_model.transformer.foo.set_calls[1]
     assert torch.all(lora_a == 1)
     assert torch.all(lora_b == initial_scale)
+
+
+def test_rank_growth_invalidates_moe_punica_before_republish(monkeypatch):
+    adapter_id = 7
+    lora_model = _DummyLM(rank=8)
+    manager = DiffusionLoRAManager(
+        pipeline=_DummyPipeline(),
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+    )
+    manager._max_lora_rank = 8
+    manager._lora_modules = {"transformer.foo": lora_model.transformer.foo}
+    manager._registered_adapters = {adapter_id: lora_model}
+    manager._active_adapter_id = adapter_id
+    manager._adapter_scales = {adapter_id: 0.5}
+    manager._moe_punica_wrapper = object()
+
+    published_cache_values = []
+
+    def _publish_with_current_rank():
+        published_cache_values.append(manager._moe_punica_wrapper)
+        manager._moe_punica_wrapper = SimpleNamespace(max_lora_rank=manager._max_lora_rank)
+
+    monkeypatch.setattr(manager, "_bind_adapter_weights", lambda *_args: None)
+    monkeypatch.setattr(manager, "_publish_moe_lora_context", _publish_with_current_rank)
+
+    manager._ensure_max_lora_rank(128)
+
+    assert published_cache_values == [None]
+    assert manager._moe_punica_wrapper.max_lora_rank == 128
 
 
 def test_scale_keys_are_rounded():
@@ -1084,6 +1317,20 @@ def test_reactivating_same_adapter_resumes_without_rebinding(monkeypatch):
     assert layer.active_slices == (True,)
     assert manager._active_adapter_id == adapter_id
     assert manager._suspended_adapter_id is None
+
+
+def test_suspended_scope_restores_exact_scale_after_another_adapter(monkeypatch):
+    manager, layer = _suspend_harness(monkeypatch)
+    manager._registered_adapters[8] = manager._registered_adapters[7]
+    manager.set_active_adapter(_dummy_lora_request(7), lora_scale=0.123456)
+    original_b = layer.set_calls[-1][1].clone()
+    with manager.suspended():
+        manager.set_active_adapter(_dummy_lora_request(8), lora_scale=0.7)
+        with manager.suspended():
+            assert manager._active_adapter_id is None
+        assert manager._active_adapter_id == 8
+    assert manager._active_adapter_id == 7
+    torch.testing.assert_close(layer.set_calls[-1][1], original_b, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("second_scale", [0.5, 0.25])

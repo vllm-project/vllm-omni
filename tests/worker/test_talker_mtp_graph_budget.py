@@ -27,6 +27,7 @@ import vllm_omni.worker.gpu_ar_model_runner as ar_runner_module
 from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner as OmniV1Runner
 from vllm_omni.worker_v2.omni_model_runner import OmniGPUModelRunner as OmniV2Runner
+from vllm_omni.worker_v2.staged_writes import StagedWrites
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -257,6 +258,7 @@ def test_profiling_and_dummy_run_share_one_talker_mtp_predicate(has_talker, has_
 
 def _make_v2_runner(monkeypatch, device_memory, *, decoder_size, mtp_size):
     runner = object.__new__(OmniV2Runner)
+    runner._staged_writes = StagedWrites()
     runner._exclude_full_graph = False
     runner._model_returns_tuple = False
     events: list = []

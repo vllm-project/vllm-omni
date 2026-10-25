@@ -11,7 +11,7 @@ import inspect
 import pytest
 
 from vllm_omni.engine.duplex import events as events_module
-from vllm_omni.engine.duplex.commands import ClearOutputAudio, TruncateItem
+from vllm_omni.engine.duplex.commands import CancelResponse, ClearOutputAudio, DeleteItem, TruncateItem
 from vllm_omni.engine.duplex.events import (
     REALTIME_ERROR_TYPES_BY_CODE,
     AudioDelta,
@@ -42,11 +42,16 @@ from vllm_omni.engine.duplex.events import (
 )
 from vllm_omni.engine.duplex.realtime_events import (
     RealtimeProjectionState,
+    discard_pending_commit_item,
     project_internal_event,
+    realtime_session_payload,
+    resolve_cancel_response,
     resolve_clear_output_audio,
+    resolve_delete_item,
     resolve_truncate_item,
     retrieve_item_events,
 )
+from vllm_omni.protocol.realtime.session import RealtimeInputDefaults
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -467,7 +472,7 @@ def test_one_truncate_command_truncates_retrieved_transcript_once():
         "content": [{"type": "output_audio", "transcript": "abcdefghij", "audio_duration_ms": 10_000}],
     }
 
-    control = resolve_truncate_item(state, TruncateItem(item_id="item_resp_1", audio_end_ms=4_000))
+    control = resolve_truncate_item(state, TruncateItem(item_id="item_resp_1", audio_end_ms=4_000), has_audio=True)
     # The runner executes this signal and projects its acknowledgement.
     signal = control.payloads[0]
     payload = signal["payload"]
@@ -492,6 +497,131 @@ def test_projection_leaves_error_to_typed_emit_sites():
     assert isinstance(projected[0], DuplexRawEvent)
     assert projected[0].type == "duplex.error"
     assert projected[0].to_realtime()["event"]["code"] == "bad_event"
+
+
+def test_queued_conversation_item_events_are_snapshots_not_shared_with_state():
+    """#7636 Issue 11: later deltas must not rewrite already-queued item events."""
+    state = RealtimeProjectionState(session_id="duplex-snap")
+    created = project_internal_event(
+        state, {"type": "response.created", "response_id": "resp_1", "modalities": ["audio", "text"]}
+    )
+    added = next(event for event in created if isinstance(event, ItemAdded))
+    output_added = next(event for event in created if isinstance(event, OutputItemAdded))
+    queued_item = added.item
+    assert queued_item is output_added.item or queued_item == output_added.item
+    assert queued_item is not state.conversation_items["item_resp_1"]
+
+    pcm = base64.b64encode(b"\x00\x10" * 8).decode("ascii")
+    project_internal_event(
+        state,
+        {
+            "type": "response.output_audio.delta",
+            "response_id": "resp_1",
+            "audio": pcm,
+            "text": "later",
+            "format": "pcm16",
+        },
+    )
+
+    assert state.conversation_items["item_resp_1"]["content"][0]["transcript"] == "later"
+    # Queued event still shows the snapshot taken at response.created.
+    assert queued_item["content"] == []
+    assert queued_item["status"] == "in_progress"
+
+
+def test_explicit_input_committed_id_removes_matching_pending_commit():
+    """#7636 Issue 12: explicit realtime_item_id must still pop the pending queue."""
+    state = RealtimeProjectionState(session_id="duplex-commit")
+    state.pending_commit_item_ids.extend(["item_a", "item_b"])
+
+    committed = project_internal_event(
+        state,
+        {
+            "type": "input.committed",
+            "realtime_item_id": "item_a",
+            "message": {"role": "user", "content": "hello"},
+        },
+    )
+
+    assert state.pending_commit_item_ids == ["item_b"]
+    assert committed[0].item_id == "item_a"
+
+    # Without an explicit id, FIFO still pairs with the remaining pending entry.
+    second = project_internal_event(
+        state,
+        {"type": "input.committed", "message": {"role": "user", "content": "world"}},
+    )
+    assert state.pending_commit_item_ids == []
+    assert second[0].item_id == "item_b"
+
+
+def test_projected_session_updated_keeps_the_nested_input_sample_rate():
+    """A flat ``pcm16`` must not hide ``audio.input.format.rate`` on the projected session.
+
+    ``session.updated`` keeps the client's nested format object and also fills
+    ``input_audio_format``. ``audio/pcm`` becomes ``pcm16``, which has no rate,
+    so the 24000 Hz declaration has to survive into the append defaults.
+    """
+    state = RealtimeProjectionState(session_id="duplex-rate", model="test-model")
+    nested_audio = {"input": {"format": {"type": "audio/pcm", "rate": 24000}}}
+    state.apply_session_defaults({"audio": nested_audio})
+    # ``as_public_dict`` retains that audio block; projection then adds the flat format.
+    session = realtime_session_payload(
+        state,
+        {"id": "duplex-rate", "model": "test-model", "audio": nested_audio, "response_format": "wav"},
+    )
+    assert session["input_audio_format"] == "pcm16"
+    assert session["audio"]["input"]["format"] == {"type": "audio/pcm", "rate": 24000}
+
+    defaults = RealtimeInputDefaults().with_session_payload(session)
+    assert defaults.input_audio_format == "pcm16"
+    assert defaults.input_sample_rate_hz == 24000
+
+
+def test_flat_format_does_not_borrow_a_different_nested_rate():
+    """A fresh defaults object ignores a mismatched nested rate and stays at 16000.
+
+    There is no previously accepted rate, so the dataclass default remains.
+    """
+    defaults = RealtimeInputDefaults().with_session_payload(
+        {
+            "input_audio_format": "pcm_f32le",
+            "audio": {"input": {"format": {"type": "audio/pcm", "rate": 24000}}},
+        }
+    )
+    assert defaults.input_audio_format == "pcm_f32le"
+    assert defaults.input_sample_rate_hz == 16000
+
+
+def test_flat_format_switch_keeps_a_previously_accepted_rate():
+    """A later flat switch that omits a rate keeps the rate already accepted.
+
+    Format and rate are partial updates. The leftover nested ``audio/pcm`` rate
+    is a different encoding, so it is not borrowed, but the connection does not
+    fall back to 16000 either.
+    """
+    accepted = RealtimeInputDefaults().with_session_payload(
+        {"audio": {"input": {"format": {"type": "audio/pcm", "rate": 24000}}}}
+    )
+    assert accepted.input_sample_rate_hz == 24000
+    switched = accepted.with_session_payload(
+        {
+            "input_audio_format": "pcm_f32le",
+            "audio": {"input": {"format": {"type": "audio/pcm", "rate": 24000}}},
+        }
+    )
+    assert switched.input_audio_format == "pcm_f32le"
+    assert switched.input_sample_rate_hz == 24000
+
+
+def test_discard_pending_commit_item_clears_aborted_head():
+    """#7636 Issue 12: commit_aborted must not leave a pending id behind."""
+    state = RealtimeProjectionState(session_id="duplex-abort")
+    state.pending_commit_item_ids.extend(["item_abort", "item_keep"])
+    discard_pending_commit_item(state)
+    assert state.pending_commit_item_ids == ["item_keep"]
+    discard_pending_commit_item(state, "item_keep")
+    assert state.pending_commit_item_ids == []
 
 
 def test_response_speak_projection_keeps_vllm_omni_request_metrics():
@@ -576,3 +706,48 @@ def test_text_then_audio_projects_ttft_on_transcript_and_ttfp_on_audio_delta():
     audio_metrics = audio_delta.to_realtime()["metadata"]["vllm_omni"]["response_request_metrics"]
     assert audio_metrics["ttft_ms"] == 200.0
     assert audio_metrics["ttfp_ms"] == 400.0
+
+
+@pytest.mark.parametrize("terminal", ["response.done", "audio.cancelled", "audio_end_of_turn"])
+def test_completed_projections_release_buffers_and_reject_late_output(terminal):
+    state = RealtimeProjectionState(session_id="duplex-retention")
+    for index in range(32):
+        response_id = f"finished-{index}"
+        item_id = f"item_{response_id}"
+        project_internal_event(state, {"type": "response.created", "response_id": response_id})
+        project_internal_event(state, {"type": "response.text.delta", "response_id": response_id, "delta": "hello"})
+        project_internal_event(
+            state, {"type": "response.output_audio.delta", "response_id": response_id, "text": "hello"}
+        )
+        ending = (
+            {"type": "response.output_audio.delta", "end_of_turn": True}
+            if terminal == "audio_end_of_turn"
+            else {"type": terminal}
+        )
+        events = project_internal_event(state, {**ending, "response_id": response_id})
+        assert _types(events).count("response.done") == 1
+        assert response_id not in state.response_states
+        assert retrieve_item_events(state, {"item_id": item_id})[0].to_realtime()["item"]["content"]
+        resolve_delete_item(state, DeleteItem(item_id=item_id))
+        for late_type in ("response.done", "response.text.delta", "response.output_audio.delta", "response.speak"):
+            assert (
+                project_internal_event(
+                    state, {"type": late_type, "response_id": response_id, "delta": "late", "text": "late"}
+                )
+                == []
+            )
+        assert item_id not in state.conversation_items
+        assert not state.response_states
+
+    # An arbitrarily old deleted response remains inactive without tombstones.
+    cancelled = resolve_cancel_response(state, CancelResponse(response_id="finished-0"))
+    assert not cancelled.payloads
+    assert cancelled.events[0].code == "response_not_active"
+    # Retiring an older draining reply must preserve the newer live reply.
+    project_internal_event(state, {"type": "response.created", "response_id": "draining"})
+    project_internal_event(state, {"type": "response.created", "response_id": "active"})
+    project_internal_event(state, {"type": "response.done", "response_id": "draining"})
+    assert set(state.response_states) == {"active"}
+    assert state.active_response_id == "active"
+    project_internal_event(state, {"type": "response.done", "response_id": "active"})
+    assert not state.response_states

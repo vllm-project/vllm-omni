@@ -14,8 +14,14 @@ The artifact service, rather than a PR-writable shared filesystem, owns the
 cross-build provenance boundary. A consumer accepts artifacts only from:
 
 * an earlier build of the same PR, head commit, merge base, and checkout; or
-* a Buildkite build whose server metadata names the exact trusted upstream
-  ``main`` commit supplied by the bootstrap.
+* a non-PR Buildkite build of the exact trusted commit on ``main``, or on the
+  current release line (``release/vX.Y.Z``) when this build is itself a non-PR
+  release-line push; or
+* a recent non-PR build on those trusted branches whose published ABI identity
+  matches this runtime. The ``.so`` is produced by AITER inside the ROCm image,
+  so the identity hash—not the Omni merge-base SHA—is the compatibility gate.
+  Exact trusted-commit sources are tried first; ABI-compatible recent main
+  (or release-line) publishes fill the gap when the merge-base never published.
 
 Every consumer receives a writable job-local copy. Checksums, ``gfx942``
 device code, runtime ABI identity, Buildkite source metadata, and the recorded
@@ -44,6 +50,12 @@ from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+_COMMON_SCRIPTS = Path(__file__).resolve().parents[2] / "common" / "scripts"
+if str(_COMMON_SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(_COMMON_SCRIPTS))
+
+from ci_conditions import is_release_line_push  # noqa: E402, I001
 
 MODULE_NAME = "mha_fwd_bf16_nbias_nmask_nlse_ndropout_nqscale"
 ARCH = "gfx942"
@@ -512,6 +524,18 @@ def _source_from_details(
     return BuildSource(build_id, number, commit, branch, pull_request, exact_checkout)
 
 
+def _build_numbers_from_listing(listing: str) -> list[int]:
+    return list(
+        dict.fromkeys(
+            int(value)
+            for value in re.findall(
+                rf'href="/vllm/{re.escape(BUILDKITE_PIPELINE_SLUG)}/builds/([0-9]+)"',
+                listing,
+            )
+        )
+    )
+
+
 def discover_build_sources(
     *,
     branch: str,
@@ -526,24 +550,16 @@ def discover_build_sources(
     query = urllib.parse.urlencode({"branch": branch, "commit": commit})
     try:
         listing = fetch(f"{BUILDKITE_PIPELINE_URL}/builds?{query}")
-    except (OSError, UnicodeError, ValueError, urllib.error.URLError) as exc:
-        log(f"could not query Buildkite artifacts for {commit[:12]}: {exc}")
+    except (OSError, UnicodeError, ValueError, urllib.error.URLError):
+        # Commit, branch, and exception text can contain sensitive values.
+        log("could not query exact Buildkite artifact candidates")
         return []
-    numbers = list(
-        dict.fromkeys(
-            int(value)
-            for value in re.findall(
-                rf'href="/vllm/{re.escape(BUILDKITE_PIPELINE_SLUG)}/builds/([0-9]+)"',
-                listing,
-            )
-        )
-    )
     sources: list[BuildSource] = []
-    for number in numbers[:10]:
+    for number in _build_numbers_from_listing(listing)[:10]:
         try:
             details = json.loads(fetch(f"{BUILDKITE_PIPELINE_URL}/builds/{number}.json"))
-        except (json.JSONDecodeError, OSError, UnicodeError, ValueError, urllib.error.URLError) as exc:
-            log(f"could not verify Buildkite build #{number}: {exc}")
+        except (json.JSONDecodeError, OSError, UnicodeError, ValueError, urllib.error.URLError):
+            log(f"could not verify Buildkite build #{number}")
             continue
         if not isinstance(details, dict):
             continue
@@ -557,6 +573,64 @@ def discover_build_sources(
         if source is not None and source.build_id != current_build_id:
             sources.append(source)
     return sources
+
+
+def discover_recent_branch_sources(
+    *,
+    branch: str,
+    current_build_id: str,
+    limit: int = 15,
+    fetch: Callable[[str], str] = _fetch_text,
+) -> list[BuildSource]:
+    """Return recent non-PR builds on ``branch`` for ABI-compatible fallback.
+
+    Used when the exact trusted merge-base never published (common right after
+    an ROCm image ABI change). Callers still verify identity and provenance.
+    """
+    if not branch or limit <= 0:
+        return []
+    query = urllib.parse.urlencode({"branch": branch})
+    try:
+        listing = fetch(f"{BUILDKITE_PIPELINE_URL}/builds?{query}")
+    except (OSError, UnicodeError, ValueError, urllib.error.URLError):
+        # The branch and exception may contain credentials or other secrets.
+        log("could not query recent trusted-branch Buildkite builds")
+        return []
+    sources: list[BuildSource] = []
+    for number in _build_numbers_from_listing(listing)[:limit]:
+        try:
+            details = json.loads(fetch(f"{BUILDKITE_PIPELINE_URL}/builds/{number}.json"))
+        except (json.JSONDecodeError, OSError, UnicodeError, ValueError, urllib.error.URLError):
+            log(f"could not verify recent Buildkite build #{number}")
+            continue
+        if not isinstance(details, dict):
+            continue
+        commit = str(details.get("commit_id") or "")
+        if not _SHA_PATTERN.fullmatch(commit):
+            continue
+        if _pull_request(details.get("pull_request")):
+            continue
+        source = _source_from_details(
+            details,
+            commit=commit,
+            branch=branch,
+            pull_request="",
+            exact_checkout=False,
+        )
+        if source is not None and source.build_id != current_build_id:
+            sources.append(source)
+    return sources
+
+
+def _trusted_branches(branch: str, pull_request: str) -> tuple[str, ...]:
+    """Non-PR branches that may publish the trusted parent artifact.
+
+    A non-PR ``release/vX.Y.Z`` push looks up its own previous build first, then
+    ``main``. A pull request opened from that branch trusts only ``main``.
+    """
+    if branch != "main" and is_release_line_push(branch, pull_request):
+        return (branch, "main")
+    return ("main",)
 
 
 def candidate_sources(
@@ -581,17 +655,34 @@ def candidate_sources(
     )
 
     trusted = values.get("VLLM_OMNI_AITER_MHA_TRUSTED_COMMIT", "")
-    if _SHA_PATTERN.fullmatch(trusted) and not (branch == "main" and trusted == commit):
-        sources.extend(
-            discover_build_sources(
-                branch="main",
-                commit=trusted,
-                pull_request="",
-                current_build_id=current_build_id,
-                exact_checkout=False,
-                fetch=fetch,
+    if _SHA_PATTERN.fullmatch(trusted):
+        for trusted_branch in _trusted_branches(branch, pull_request):
+            # The exact-checkout query above already covered this commit.
+            if trusted_branch == branch and trusted == commit:
+                continue
+            sources.extend(
+                discover_build_sources(
+                    branch=trusted_branch,
+                    commit=trusted,
+                    pull_request="",
+                    current_build_id=current_build_id,
+                    exact_checkout=False,
+                    fetch=fetch,
+                )
             )
-        )
+        # After an image ABI bump the merge-base often has no publish yet.
+        # Recent non-PR builds on the trusted branches can still restore a
+        # module whose identity matches this runtime.
+        seen = {source.build_id for source in sources}
+        for trusted_branch in _trusted_branches(branch, pull_request):
+            for source in discover_recent_branch_sources(
+                branch=trusted_branch,
+                current_build_id=current_build_id,
+                fetch=fetch,
+            ):
+                if source.build_id not in seen:
+                    sources.append(source)
+                    seen.add(source.build_id)
     return list({source.build_id: source for source in sources}.values())
 
 
@@ -699,12 +790,21 @@ def provenance_matches_source(
         if provenance["checkout_commit"] != checkout or provenance["trusted_commit"] != trusted:
             log(f"artifact is not from the same checkout/base identity: build #{source.number}")
             return False
-    elif (
-        source.branch != "main"
-        or source.pull_request
-        or source.commit != values.get("VLLM_OMNI_AITER_MHA_TRUSTED_COMMIT", "")
-    ):
-        return False
+    else:
+        # Trusted-branch non-PR producers. Exact trusted-commit sources are
+        # preferred in candidate_sources ordering; ABI-compatible recent
+        # main/release publishes are also accepted because AITER compiles the
+        # module from the image stack, not from the Omni merge-base tree.
+        # publication_matches already verified the runtime identity hash.
+        trusted_branches = _trusted_branches(
+            values.get("BUILDKITE_BRANCH", ""),
+            values.get("BUILDKITE_PULL_REQUEST", ""),
+        )
+        trusted = values.get("VLLM_OMNI_AITER_MHA_TRUSTED_COMMIT", "")
+        if source.branch not in trusted_branches or source.pull_request:
+            return False
+        if not _SHA_PATTERN.fullmatch(trusted):
+            return False
     return True
 
 
