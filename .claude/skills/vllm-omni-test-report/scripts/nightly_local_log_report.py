@@ -53,6 +53,7 @@ from nightly_job_pytest_table import (  # noqa: E402
     PIPELINE,
     collect_nightly_job_log_analyses,
     fetch_nightly_build,
+    http_json,
 )
 from pytest_log_parse import (  # noqa: E402
     extract_pytest_counts,
@@ -3201,20 +3202,6 @@ def _perf_pct(v: Any) -> str:
     return "N/A"
 
 
-def _format_update_date(s: Any) -> str:
-    """Date-only prefix of a history record's ``date`` (e.g. '2026-09-27').
-
-    Used by the "All major regressions" perf table's "Updated" column so the
-    reader can see whether a row's latest value is fresh or stale. Returns
-    '—' when the value is empty/blank/not a string.
-    """
-    if isinstance(s, str):
-        text = s.strip()
-        if text:
-            return text[:10]
-    return "—"
-
-
 def _as_num(value: Any) -> float | None:
     if isinstance(value, bool):
         return None
@@ -3412,21 +3399,6 @@ _PERF_TABLE_HEADERS = [
     "vs baseline",
     "Status",
 ]
-_FOCUS_TABLE_HEADERS = (
-    "Source",
-    "Model",
-    "Hardware",
-    "Type",
-    "Config",
-    "Test",
-    "Metric",
-    "latest",
-    "Updated",
-    "baseline",
-    "vs baseline",
-    "Status",
-    "Days failing",
-)
 _CONSEC_FAIL_DAY_MAX = 5
 _CONSEC_FAIL_THRESHOLD_PCT = 10.0
 _CONSEC_FAIL_LOOKUP_LIMIT_PER_FILE = 5000
@@ -3629,48 +3601,6 @@ def _consec_fail_days_from_history(
         else:
             break
     return count
-
-
-def _format_consec_fail_days(days: int) -> str:
-    """Format consecutive-failure count for table cell display.
-
-    Display rule:
-      - 0 days  → "—"  (no streak, ignore)
-      - 1 day   → "1 day"
-      - 2 days  → "2 days"
-      - 3 days  → "3 days"  (boundary: still show the exact count)
-      - >= 4 days → "3 days+"  (cap at 3 to keep the table cell compact;
-        the underlying ``consec_fail_days`` counter still grows so the CSS
-        streak class escalates correctly)
-    """
-    if days <= 0:
-        return "—"
-    if days == 1:
-        return "1 day"
-    if days >= 4:
-        return "3 days+"
-    return f"{days} days"
-
-
-def _consec_fail_color_class(days: int) -> str:
-    """Map consecutive-failure count to the CSS modifier class.
-
-    Display rule (also mirrored by :func:`_format_consec_fail_days`):
-      - 0       → ``""``                 (no streak)
-      - 1       → ``regression-streak--1d``  (yellow, single day)
-      - 2       → ``regression-streak--2d``  (orange, two days)
-      - 3       → ``regression-streak--3d``  (red, exactly three days)
-      - >= 4    → ``regression-streak--3d-plus``  (purple, **3 days+** cap)
-    """
-    if days >= 4:
-        return "regression-streak--3d-plus"
-    if days >= 3:
-        return "regression-streak--3d"
-    if days == 2:
-        return "regression-streak--2d"
-    if days == 1:
-        return "regression-streak--1d"
-    return ""
 
 
 def _normalize_focus_key(parts: tuple[str, str, str, str]) -> tuple[str, str, str, str]:
@@ -3907,120 +3837,6 @@ def _select_focus_perf_items(items: list[NightlyFocusItem]) -> tuple[str, list[N
     return "empty", []
 
 
-def _render_focus_perf_table_html(items: list[NightlyFocusItem]) -> str:
-    models = sorted({item.model for item in items if item.model})
-    model_checks = []
-    for model in models:
-        val = html.escape(model, quote=True)
-        model_checks.append(
-            '<label class="focus-model-check">'
-            f'<input type="checkbox" data-filter-key="model" value="{val}">'
-            f"<span>{html.escape(model)}</span></label>"
-        )
-    hardware_buckets: list[str] = []
-    seen_hardware: set[str] = set()
-    has_unknown = False
-    for item in items:
-        bucket = _norm_focus_hardware(item.hardware)
-        if bucket == "unknown":
-            has_unknown = True
-            continue
-        if bucket in seen_hardware:
-            continue
-        seen_hardware.add(bucket)
-        hardware_buckets.append(bucket)
-    hardware_buckets.sort()
-    if has_unknown:
-        hardware_buckets.append("unknown")
-    hardware_checks: list[str] = []
-    for bucket in hardware_buckets:
-        val = html.escape(bucket, quote=True)
-        label = "Unknown" if bucket == "unknown" else bucket
-        hardware_checks.append(
-            '<label class="focus-hardware-check">'
-            f'<input type="checkbox" data-filter-key="hardware" value="{val}">'
-            f"<span>{html.escape(label)}</span></label>"
-        )
-    parts: list[str] = [
-        '<div class="perf-filter-scope focus-filter-scope" data-perf-filter-scope="daily-focus-regressions">',
-        '<div class="perf-filter-bar focus-filter-bar">',
-        '<fieldset class="focus-model-filter"><legend>Model <span>No selection = All</span></legend>',
-        "".join(model_checks),
-        "</fieldset>",
-    ]
-    if hardware_checks:
-        legend = "Hardware" if not has_unknown else "Hardware (Unknown last)"
-        parts.append(
-            f'<fieldset class="focus-hardware-filter"><legend>{html.escape(legend)} '
-            "<span>No selection = All</span></legend>"
-        )
-        parts.append("".join(hardware_checks))
-        parts.append("</fieldset>")
-    parts.append(
-        '<button type="button" class="focus-expand-btn" data-focus-expand="0" '
-        'aria-expanded="false">Expand table</button>'
-    )
-    parts.append("</div>")
-    parts.append('<div class="table-scroll">')
-    parts.append('<table class="summary focus-table">')
-    parts.append("<thead><tr>")
-    for header in _FOCUS_TABLE_HEADERS:
-        parts.append(f"<th>{html.escape(header)}</th>")
-    parts.append("</tr></thead><tbody>")
-    for item in items:
-        model = html.escape(item.model, quote=True)
-        hardware_bucket = _norm_focus_hardware(item.hardware)
-        hardware_attr = html.escape(hardware_bucket, quote=True)
-        row_class = "summary-row--fail" if item.status == "fail" else "summary-row--unknown"
-        streak_class = _consec_fail_color_class(item.consec_fail_days)
-        row_classes = [row_class]
-        if streak_class:
-            row_classes.append(streak_class)
-        row_class_attr = " ".join(row_classes)
-        days = item.consec_fail_days
-        days_text = _format_consec_fail_days(days)
-        days_attr = (
-            f' data-consec-days="{days}" data-consec-color="{html.escape(streak_class or "none")}"'
-            if streak_class
-            else f' data-consec-days="{days}"'
-        )
-        parts.append(
-            f'<tr class="{row_class_attr}" data-perf-row="1" data-model="{model}" '
-            f'data-hardware="{hardware_attr}"{days_attr}>'
-        )
-        cells = [
-            item.source,
-            item.model,
-            hardware_bucket,
-            item.model_type,
-            item.config,
-            item.test,
-            item.metric,
-            _perf_num(item.latest),
-            _format_update_date(item.date),
-            _perf_num(item.baseline),
-            _perf_pct(item.vs_baseline_pct),
-            item.status,
-        ]
-        for cell in cells:
-            parts.append(f"<td>{html.escape(str(cell))}</td>")
-        if streak_class:
-            title = "Consecutive failing days from *_history.json (today + 2 previous days max)."
-            cell_attrs = f' class="{html.escape(streak_class)}" title="{html.escape(title, quote=True)}"'
-        else:
-            cell_attrs = ""
-        parts.append(f"<td{cell_attrs}>{html.escape(days_text)}</td>")
-        parts.append("</tr>")
-    parts.extend(
-        [
-            "</tbody></table></div>",
-            '<p class="note perf-filter-empty" data-perf-empty hidden>No rows match filters.</p>',
-            "</div>",
-        ]
-    )
-    return "\n".join(parts)
-
-
 def _daily_focus_data(
     *,
     bk_jobs: list[dict[str, Any]] | None,
@@ -4034,7 +3850,7 @@ def _daily_focus_data(
     local_perf_summary, _ = _buildkite_perf_rows(kanban_cfg, log_dir=log_dir)
     history_fail_lookup = _compute_history_fail_lookup(kanban_cfg.assets_dir)
     focus_items = _focus_perf_items(bk_perf_summary, local_perf_summary, history_fail_lookup)
-    focus_kind, top_items = _select_focus_perf_items(focus_items)
+    focus_kind, _ = _select_focus_perf_items(focus_items)
     bk_job_counts = _buildkite_job_counts(bk_jobs)
     local_job_counts = _local_job_counts(local_job_rows)
     bk_perf_counts = _perf_counts(bk_perf_summary)
@@ -4048,7 +3864,10 @@ def _daily_focus_data(
         )
         severity = "fail"
     elif focus_kind == "normal":
-        conclusion = "No major performance regressions; minor fluctuations listed below for observation."
+        conclusion = (
+            "No major performance regressions; minor fluctuations remain visible in the "
+            "per-model performance tables."
+        )
         severity = "normal"
     elif focus_items:
         conclusion = "No major performance regressions detected."
@@ -4060,7 +3879,6 @@ def _daily_focus_data(
         "conclusion": conclusion,
         "severity": severity,
         "focus_kind": focus_kind,
-        "top_items": top_items,
         "bk_job_counts": bk_job_counts,
         "local_job_counts": local_job_counts,
         "bk_perf_counts": bk_perf_counts,
@@ -4184,29 +4002,17 @@ def _render_daily_focus_html(data: dict[str, Any]) -> str:
     parts.append('<div class="focus-card-grid">')
     parts.append("\n".join(cards))
     parts.append("</div>")
-    top_items: list[NightlyFocusItem] = data.get("top_items") or []
-    if top_items:
-        label = "All major regressions" if data.get("focus_kind") == "fail" else "Minor fluctuation watchlist"
-        parts.extend(
-            [
-                f'<h3 class="focus-table-title">{html.escape(label)}</h3>',
-                _render_focus_perf_table_html(top_items),
-            ]
+    notes = []
+    if data.get("bk_perf_status") != "ok" and data.get("bk_perf_message"):
+        notes.append(f"Buildkite perf: {data['bk_perf_message']}")
+    if data.get("local_perf_status") != "ok" and data.get("local_perf_message"):
+        notes.append(f"Local perf: {data['local_perf_message']}")
+    if notes:
+        parts.append(
+            '<div class="note"><strong>Data note:</strong><ul>'
+            + "".join(f"<li>{html.escape(str(note))}</li>" for note in notes)
+            + "</ul></div>"
         )
-    else:
-        notes = []
-        if data.get("bk_perf_status") != "ok" and data.get("bk_perf_message"):
-            notes.append(f"Buildkite perf: {data['bk_perf_message']}")
-        if data.get("local_perf_status") != "ok" and data.get("local_perf_message"):
-            notes.append(f"Local perf: {data['local_perf_message']}")
-        if notes:
-            parts.append(
-                '<div class="note"><strong>Data note:</strong><ul>'
-                + "".join(f"<li>{html.escape(str(note))}</li>" for note in notes)
-                + "</ul></div>"
-            )
-        else:
-            parts.append('<p class="note">No performance regressions require top-level display.</p>')
     parts.append("</section>")
     return "\n".join(parts)
 
@@ -4824,13 +4630,21 @@ def _render_buildkite_section_html(
     target: BkTarget,
     log_dir: Path | None = None,
     open_default: bool = False,
+    chapter_title: str | None = None,
+    chapter_sub: str | None = None,
+    include_perf: bool = True,
+    report_kind: str = "scheduled nightly",
+    details_class_suffix: str = "",
 ) -> str:
     """Render one Buildkite chapter as a collapsible ``<details>`` block.
 
-    Each chapter (CUDA / NPU) is wrapped in its own ``<details>`` element so
-    the user can fold or expand the whole chapter independently. Inner
-    sub-cards (Summary / Performance / Failure analysis) retain their
-    existing per-section collapsibility.
+    Each chapter (CUDA / NPU nightly, CUDA weekly builds) is wrapped in its
+    own ``<details>`` element so the user can fold or expand the whole
+    chapter independently. Inner sub-cards (Summary / Performance / Failure
+    analysis) retain their existing per-section collapsibility.
+    ``chapter_title`` / ``chapter_sub`` / ``report_kind`` /
+    ``details_class_suffix`` customize the weekly-build variants; the
+    defaults reproduce the scheduled-nightly CUDA/NPU chapters.
     """
     summary_inner: list[str] = []
     fail_inner = '<p class="note">No data: Buildkite step logs were not loaded.</p>'
@@ -4909,7 +4723,7 @@ def _render_buildkite_section_html(
                 _render_failures_table_html(
                     info,
                     report_context=(
-                        f"Buildkite ({target.label}) scheduled nightly · build #{bn} · step: {rec['name']}"
+                        f"Buildkite ({target.label}) {report_kind} · build #{bn} · step: {rec['name']}"
                     ),
                     issue_env="ci",
                     issue_vllm_version=(rec.get("ci_versions") or {}).get("vllm", ""),
@@ -4936,8 +4750,8 @@ def _render_buildkite_section_html(
     chapter_heading = _heading_html(
         "h3",
         _SVG_CLOUD,
-        html.escape(f"Buildkite ({target.label})"),
-        sub=html.escape(f"{target.org}/{target.pipeline} · latest scheduled nightly"),
+        html.escape(chapter_title or f"Buildkite ({target.label})"),
+        sub=html.escape(chapter_sub or f"{target.org}/{target.pipeline} · latest scheduled nightly"),
         klass="bk-chapter-heading",
     )
     sub_cards: list[str] = [
@@ -4958,8 +4772,9 @@ def _render_buildkite_section_html(
     ]
     # CUDA keeps the kanban-backed Performance baseline comparison.
     # NPU pipeline has no kanban-side perf history yet, so the perf sub-card
-    # is omitted there. Toggle by adding/removing this `if` branch.
-    if target is not NPU_TARGET:
+    # is omitted there; weekly-build chapters opt out via ``include_perf``.
+    # Toggle by adding/removing this `if` branch.
+    if target is not NPU_TARGET and include_perf:
         sub_cards.insert(
             1,
             _details_subcard(
@@ -4978,7 +4793,7 @@ def _render_buildkite_section_html(
 
     op = " open" if open_default else ""
     return (
-        f'<details class="bk-chapter bk-chapter--{target.label.lower()}"{op}>'
+        f'<details class="bk-chapter bk-chapter--{target.label.lower()}{details_class_suffix}"{op}>'
         f'<summary class="bk-chapter-summary">{chapter_heading}</summary>'
         f'<div class="bk-chapter-body">'
         f"{chapter_body}"
@@ -5026,6 +4841,7 @@ def emit_report_html(
     out_fp: Any,
     bk_results: dict[BkTarget, tuple[dict[str, Any] | None, list[dict[str, Any]] | None, str | None]] | None = None,
     kanban_cfg: KanbanAssetsConfig | None = None,
+    weekly_results: dict[str, tuple[dict[str, Any] | None, list[dict[str, Any]] | None, str | None]] | None = None,
 ) -> None:
     # Manifest-driven job list: ``timing_summary.log`` is the source of truth
     # for the job list + status; ``.log`` files are only parsed for FAILED
@@ -5148,7 +4964,7 @@ def emit_report_html(
             "h2",
             _SVG_CLOUD,
             html.escape("Buildkite Test"),
-            sub=html.escape("Scheduled nightly — CUDA & NPU chapters (click to expand)"),
+            sub=html.escape("Scheduled nightly & weekly — CUDA & NPU chapters (click to expand)"),
         )
     )
     body_parts.append("</summary>")
@@ -5165,6 +4981,29 @@ def emit_report_html(
                 log_dir=log_dir,
             )
         )
+        if target is CUDA_TARGET:
+            # CUDA weekly-build chapters (Scheduled weekly / Scheduled
+            # Non-Critical weekly). A kind with no matching build inside the
+            # daily scan window is hidden entirely — no placeholder chapter.
+            for kind, wk_label, _pattern in WEEKLY_BUILD_KINDS:
+                wk_build, wk_jobs, wk_note = (weekly_results or {}).get(kind) or (None, None, None)
+                if wk_build is None and wk_jobs is None and not wk_note:
+                    continue
+                body_parts.append(
+                    _render_buildkite_section_html(
+                        wk_build,
+                        wk_jobs,
+                        note=wk_note,
+                        kanban_cfg=kanban_cfg,
+                        target=CUDA_TARGET,
+                        log_dir=None,
+                        chapter_title=f"Buildkite (CUDA) · {wk_label} build",
+                        chapter_sub=f"{CUDA_TARGET.org}/{CUDA_TARGET.pipeline} · latest {wk_label} build",
+                        include_perf=False,
+                        report_kind=f"{wk_label} build",
+                        details_class_suffix=f"-{kind}",
+                    )
+                )
     body_parts.append("</div>")
     body_parts.append("</details>")
 
@@ -5345,6 +5184,80 @@ def _resolve_buildkite_for_report(
     return {t: _resolve_buildkite_target(tok, t, build_no) for t in targets}
 
 
+# CUDA weekly-build chapters: (kind-slug, display label, anchored message regex).
+# The anchors deliberately exclude variants like "Scheduled weekly build(Release)".
+WEEKLY_BUILD_KINDS: tuple[tuple[str, str, str], ...] = (
+    ("weekly", "Scheduled weekly", r"^scheduled\s+weekly\s+build$"),
+    ("noncritical-weekly", "Scheduled Non-Critical weekly", r"^scheduled\s+non-critical\s+weekly\s+build$"),
+)
+
+
+def _resolve_latest_build_matching_message(
+    tok: str,
+    target: BkTarget,
+    pattern: str,
+    *,
+    scan_limit: int = 50,
+) -> dict[str, Any] | None:
+    """Return the newest build on ``target.branch`` whose message matches ``pattern``.
+
+    Scans the newest ``scan_limit`` builds and refetches the full build
+    object for the first match. ``None`` means no build in the window
+    matches — callers treat that as "hide the chapter", not an error.
+    """
+    url = (
+        f"https://api.buildkite.com/v2/organizations/{target.org}/pipelines/{target.pipeline}"
+        f"/builds?branch={target.branch}&per_page={scan_limit}"
+    )
+    builds = http_json(url, tok)
+    rx = re.compile(pattern, re.I)
+    for b in builds:
+        if rx.search(b.get("message") or ""):
+            n = int(b["number"])
+            return fetch_nightly_build(tok, n, org=target.org, pipeline=target.pipeline, branch=target.branch)
+    return None
+
+
+def _resolve_weekly_builds_for_report(
+    include: bool,
+) -> dict[str, tuple[dict[str, Any] | None, list[dict[str, Any]] | None, str | None]]:
+    """Resolve the latest CUDA weekly builds for the weekly chapters.
+
+    Returns a mapping keyed by the ``WEEKLY_BUILD_KINDS`` slug →
+    ``(build, jobs, note)``. A kind whose message matches no build in the
+    daily scan window maps to ``(None, None, None)`` and its chapter is
+    hidden entirely (display only when the daily builds contain a matching
+    build). API errors map to a note so the chapter explains itself.
+    """
+    empty = {kind: (None, None, None) for kind, _label, _pattern in WEEKLY_BUILD_KINDS}
+    if not include:
+        return dict(empty)
+    tok = _buildkite_token()
+    if not tok:
+        # No token → cannot scan; hide the weekly chapters (the nightly
+        # chapters already render their own skip note).
+        return dict(empty)
+    results: dict[str, tuple[dict[str, Any] | None, list[dict[str, Any]] | None, str | None]] = {}
+    for kind, label, pattern in WEEKLY_BUILD_KINDS:
+        try:
+            build = _resolve_latest_build_matching_message(tok, CUDA_TARGET, pattern)
+        except Exception as e:  # noqa: BLE001 — one kind failing must not kill the rest
+            results[kind] = (None, None, f"Buildkite (CUDA) {label} build section failed: {e}")
+            continue
+        if build is None:
+            results[kind] = (None, None, None)
+            continue
+        try:
+            jobs = collect_nightly_job_log_analyses(
+                build, tok, org=CUDA_TARGET.org, pipeline=CUDA_TARGET.pipeline
+            )
+        except Exception as e:  # noqa: BLE001
+            results[kind] = (None, None, f"Buildkite (CUDA) {label} build section failed: {e}")
+            continue
+        results[kind] = (build, jobs, None)
+    return results
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Emit HTML by default (use --html-report or stdout). "
@@ -5462,6 +5375,7 @@ def main() -> None:
         build_no=args.buildkite_build,
         targets=ALL_BK_TARGETS,
     )
+    weekly_results = _resolve_weekly_builds_for_report(include=not args.no_buildkite)
     kanban_cfg = KanbanAssetsConfig(
         assets_dir=args.kanban_assets_dir.resolve() if args.kanban_assets_dir else None,
         repo_root=args.kanban_repo_root.resolve() if args.kanban_repo_root else None,
@@ -5489,6 +5403,7 @@ def main() -> None:
                 out_fp=fp,
                 bk_results=bk_results,
                 kanban_cfg=kanban_cfg,
+                weekly_results=weekly_results,
             )
         print(f"Wrote {out}")
     else:
@@ -5499,6 +5414,7 @@ def main() -> None:
             out_fp=sys.stdout,
             bk_results=bk_results,
             kanban_cfg=kanban_cfg,
+            weekly_results=weekly_results,
         )
 
 
