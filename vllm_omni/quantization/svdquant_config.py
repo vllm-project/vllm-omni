@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Serialized SVDQuant NVFP4 support for diffusion transformers.
+"""Serialized SVDQuant NVFP4 and MXFP4 support for diffusion transformers.
 
-The checkpoint stores NVFP4 weights plus a rank-R correction for each
-quantized linear. The four-bit GEMM uses vLLM's existing NVFP4 kernel
+The checkpoint stores four-bit weights plus a rank-R correction for each
+quantized linear. The four-bit GEMM uses vLLM's existing NVFP4 or MXFP4 kernel
 registry, while the rank correction uses ordinary BF16 matrix multiplication.
 Native SVDQuant fusion is a separate optimization and is not required to load
 or run the checkpoint.
@@ -25,7 +25,9 @@ from vllm.model_executor.kernels.linear import (
     FlashInferCuteDslNvFp4LinearKernel,
     FlashInferCutlassNvFp4LinearKernel,
     FlashInferTrtllmNvFp4LinearKernel,
+    MxFp4LinearKernel,
     NvFp4LinearKernel,
+    init_mxfp4_linear_kernel,
     init_nvfp4_linear_kernel,
 )
 from vllm.model_executor.layers.linear import (
@@ -39,6 +41,7 @@ from vllm.model_executor.layers.quantization.base_config import (
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     is_layer_skipped,
+    kMxfp4Dynamic,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.utils import set_weight_attrs
@@ -50,7 +53,11 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-_SUPPORTED_CAPABILITIES = {(10, 3)}
+_NVFP4_BLOCK_SIZE = 16
+_MXFP4_BLOCK_SIZE = 32
+_SUPPORTED_PRECISIONS = ("nvfp4", "mxfp4")
+_NVFP4_CAPABILITIES = {(10, 3)}
+_MXFP4_CAPABILITIES = {(10, 0), (10, 3)}
 _COMPATIBLE_NVFP4_KERNELS = (
     CutlassNvFp4LinearKernel,
     FbgemmNvFp4LinearKernel,
@@ -62,25 +69,27 @@ _COMPATIBLE_NVFP4_KERNELS = (
 )
 
 
-def _supports_capability(capability: DeviceCapability | None) -> bool:
+def _supports_capability(capability: DeviceCapability | None, supported: set[tuple[int, int]]) -> bool:
     return (
         capability is not None
         and (
             capability.major,
             capability.minor,
         )
-        in _SUPPORTED_CAPABILITIES
+        in supported
     )
 
 
-def _assert_supported() -> None:
+def _assert_supported(precision: str) -> None:
+    supported = _MXFP4_CAPABILITIES if precision == "mxfp4" else _NVFP4_CAPABILITIES
     if not current_platform.is_cuda():
-        raise RuntimeError("SVDQuant NVFP4 requires a CUDA device")
+        raise RuntimeError(f"SVDQuant {precision} requires a CUDA device")
     capability = current_platform.get_device_capability()
-    if not _supports_capability(capability):
+    if not _supports_capability(capability, supported):
         device = current_platform.device_name
         sm = capability.to_int() if capability is not None else "unknown"
-        raise RuntimeError(f"SVDQuant NVFP4 is validated on SM103 only; got {device!r} (SM{sm})")
+        expected = ", ".join(f"SM{major}{minor}" for major, minor in sorted(supported))
+        raise RuntimeError(f"SVDQuant {precision} is validated on {expected} only; got {device!r} (SM{sm})")
 
 
 @functools.cache
@@ -95,8 +104,14 @@ def _nvfp4_kernel() -> NvFp4LinearKernel:
     return kernel
 
 
+@functools.cache
+def _mxfp4_kernel() -> MxFp4LinearKernel:
+    """Select vLLM's MXFP4 backend for the current device (same path as online MXFP4)."""
+    return init_mxfp4_linear_kernel(activation_quant_key=kMxfp4Dynamic)
+
+
 class DiffusionSVDQuantConfig(QuantizationConfig):
-    """Configuration for serialized NVFP4 W4A4 plus low-rank correction."""
+    """Configuration for serialized NVFP4 or MXFP4 W4A4 plus low-rank correction."""
 
     def __init__(
         self,
@@ -108,10 +123,8 @@ class DiffusionSVDQuantConfig(QuantizationConfig):
         super().__init__()
         if rank <= 0:
             raise ValueError(f"SVDQuant rank must be positive, got {rank}")
-        if precision != "nvfp4":
-            raise ValueError(
-                f"Phase 1 SVDQuant supports serialized NVFP4 checkpoints only; got precision={precision!r}"
-            )
+        if precision not in _SUPPORTED_PRECISIONS:
+            raise ValueError(f"SVDQuant supports serialized {_SUPPORTED_PRECISIONS} checkpoints; got {precision!r}")
         if act_unsigned:
             raise ValueError("Phase 1 SVDQuant does not support unsigned activations")
         self.rank = rank
@@ -131,7 +144,9 @@ class DiffusionSVDQuantConfig(QuantizationConfig):
 
     @classmethod
     def get_min_capability(cls) -> int:
-        return 103
+        # MXFP4 kernels exist from SM100; the per-precision check in
+        # _assert_supported() keeps NVFP4 restricted to SM103.
+        return 100
 
     @classmethod
     def get_config_filenames(cls) -> list[str]:
@@ -170,7 +185,7 @@ class DiffusionSVDQuantLinearMethod(LinearMethodBase):
     """Load and execute a serialized SVDQuant linear layer."""
 
     def __init__(self, quant_config: DiffusionSVDQuantConfig) -> None:
-        _assert_supported()
+        _assert_supported(quant_config.precision)
         self.quant_config = quant_config
 
     def create_weights(
@@ -188,10 +203,12 @@ class DiffusionSVDQuantLinearMethod(LinearMethodBase):
             "weight_loader",
             default_weight_loader,
         )
-        if input_size_per_partition % 16 != 0:
+        precision = self.quant_config.precision
+        block_size = _MXFP4_BLOCK_SIZE if precision == "mxfp4" else _NVFP4_BLOCK_SIZE
+        if input_size_per_partition % block_size != 0:
             raise ValueError(
-                "SVDQuant NVFP4 requires each input partition to be divisible "
-                f"by the block size 16; got {input_size_per_partition}"
+                f"SVDQuant {precision} requires each input partition to be divisible "
+                f"by the block size {block_size}; got {input_size_per_partition}"
             )
         output_size_per_partition = sum(output_partition_sizes)
         rank = self.quant_config.rank
@@ -215,9 +232,9 @@ class DiffusionSVDQuantLinearMethod(LinearMethodBase):
 
         wscales = Parameter(
             torch.empty(
-                input_size_per_partition // 16,
+                input_size_per_partition // block_size,
                 output_size_per_partition,
-                dtype=torch.float8_e4m3fn,
+                dtype=torch.uint8 if precision == "mxfp4" else torch.float8_e4m3fn,
             ),
             requires_grad=False,
         )
@@ -277,40 +294,43 @@ class DiffusionSVDQuantLinearMethod(LinearMethodBase):
             },
         )
 
-        wcscales = Parameter(
-            torch.ones(
-                output_size_per_partition,
-                dtype=torch.bfloat16,
-            ),
-            requires_grad=False,
-        )
-        set_weight_attrs(
-            wcscales,
-            {
-                "output_dim": 0,
-                "weight_loader": weight_loader,
-            },
-        )
+        if precision == "nvfp4":
+            wcscales = Parameter(
+                torch.ones(
+                    output_size_per_partition,
+                    dtype=torch.bfloat16,
+                ),
+                requires_grad=False,
+            )
+            set_weight_attrs(
+                wcscales,
+                {
+                    "output_dim": 0,
+                    "weight_loader": weight_loader,
+                },
+            )
 
-        wtscale = Parameter(
-            torch.ones(1, dtype=torch.bfloat16),
-            requires_grad=False,
-        )
-        set_weight_attrs(wtscale, {"weight_loader": default_weight_loader})
+            wtscale = Parameter(
+                torch.ones(1, dtype=torch.bfloat16),
+                requires_grad=False,
+            )
+            set_weight_attrs(wtscale, {"weight_loader": default_weight_loader})
 
         layer.register_parameter("qweight", qweight)
         layer.register_parameter("wscales", wscales)
         layer.register_parameter("proj_down", proj_down)
         layer.register_parameter("proj_up", proj_up)
         layer.register_parameter("smooth_factor", smooth_factor)
-        layer.register_parameter("wcscales", wcscales)
-        layer.register_parameter("wtscale", wtscale)
+        if precision == "nvfp4":
+            layer.register_parameter("wcscales", wcscales)
+            layer.register_parameter("wtscale", wtscale)
 
         del input_size, output_size
         layer.output_size_per_partition = output_size_per_partition
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        """Adapt the canonical row-major checkpoint to vLLM's NVFP4 ABI."""
+        """Adapt the canonical row-major checkpoint to the selected vLLM FP4 ABI."""
+        precision = self.quant_config.precision
         qweight = layer.qweight
         wscales = layer.wscales
         del layer.qweight
@@ -329,6 +349,15 @@ class DiffusionSVDQuantLinearMethod(LinearMethodBase):
                 requires_grad=False,
             ),
         )
+
+        if precision == "mxfp4":
+            kernel = _mxfp4_kernel()
+            kernel.process_weights_after_loading(layer)
+            logger.info_once(
+                "SVDQuant MXFP4 is using %s; the rank correction is not fused into the GEMM.",
+                type(kernel).__name__,
+            )
+            return
 
         layer.register_parameter(
             "input_global_scale_inv",
@@ -370,9 +399,9 @@ class DiffusionSVDQuantLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Compute the base NVFP4 GEMM plus the BF16 rank correction."""
+        """Compute the base four-bit GEMM plus the BF16 rank correction."""
         if x.dtype != torch.bfloat16:
-            raise ValueError(f"SVDQuant NVFP4 requires BF16 activations; got {x.dtype}")
+            raise ValueError(f"SVDQuant {self.quant_config.precision} requires BF16 activations; got {x.dtype}")
 
         original_shape = x.shape
         x_2d = x.reshape(-1, original_shape[-1]).contiguous()
@@ -380,7 +409,8 @@ class DiffusionSVDQuantLinearMethod(LinearMethodBase):
         # The residual branch consumes the original activation. Only the
         # four-bit base GEMM consumes the smoothed activation.
         smoothed = x_2d / layer.smooth_factor
-        out = _nvfp4_kernel().apply_weights(
+        kernel = _mxfp4_kernel() if self.quant_config.precision == "mxfp4" else _nvfp4_kernel()
+        out = kernel.apply_weights(
             layer=layer,
             x=smoothed,
             bias=None,
