@@ -23,7 +23,7 @@ mkdir -p "$(dirname "$LOG")"
 echo "[$(date -u '+%F %T')] ssh ${ALIAS} -> docker exec ${CONTAINER} (base ${BASE})" | tee "$LOG"
 
 ssh -o BatchMode=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=20 \
-    "$ALIAS" "docker exec -i ${CONTAINER} bash -s" <<'REMOTE' 2>&1 | tee -a "$LOG"
+    "$ALIAS" "docker exec -i -e BASE='${BASE}' ${CONTAINER} bash -s" <<'REMOTE' 2>&1 | tee -a "$LOG"
 set -uo pipefail
 
 # 1. source .venv/bin/activate
