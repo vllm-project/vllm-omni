@@ -119,6 +119,7 @@ def _make_talker_model() -> CosyVoice3Model:
     model = object.__new__(CosyVoice3Model)
     nn.Module.__init__(model)
     model._pending_rejection_rng = None
+    model._sampled_token_feedback = None
     model.model_stage = "cosyvoice3_talker"
     model.config = SimpleNamespace(
         llm={

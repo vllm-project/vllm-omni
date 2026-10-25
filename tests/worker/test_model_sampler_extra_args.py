@@ -120,7 +120,7 @@ def test_opted_in_sampler_receives_host_sampling_params_in_row_order(mocker, wit
 def test_unsupported_deferred_rng_is_logged_without_changing_contract(mocker, opted_in):
     model = SimpleNamespace(model_sampler_wants_sampling_params=opted_in)
     model_sample = mocker.Mock(return_value="sampled")
-    debug = mocker.patch.object(sampling_utils.logger, "debug")
+    debug = mocker.patch.object(sampling_utils.logger, "debug_once")
     logits = torch.empty(0)
     metadata = SimpleNamespace()
     result = call_model_sampler(
@@ -135,7 +135,7 @@ def test_unsupported_deferred_rng_is_logged_without_changing_contract(mocker, op
 def test_supported_deferred_rng_is_forwarded(mocker):
     model = SimpleNamespace(model_sampler_wants_sampling_params=True, model_sampler_can_defer_rng=True)
     model_sample = mocker.Mock(return_value="sampled")
-    debug = mocker.patch.object(sampling_utils.logger, "debug")
+    debug = mocker.patch.object(sampling_utils.logger, "debug_once")
     logits = torch.empty(0)
     metadata = SimpleNamespace()
     result = call_model_sampler(

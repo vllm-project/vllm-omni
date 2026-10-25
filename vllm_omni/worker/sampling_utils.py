@@ -102,7 +102,7 @@ def call_model_sampler(
     wants_sampling_params = getattr(model, "model_sampler_wants_sampling_params", False)
     can_defer_rng = getattr(model, "model_sampler_can_defer_rng", False)
     if defer_rng and not can_defer_rng:
-        logger.debug("Model %s does not support deferred sampling RNG; using immediate RNG.", type(model).__name__)
+        logger.debug_once("Model %s does not support deferred sampling RNG; using immediate RNG.", type(model).__name__)
     if not wants_extra_args and not wants_sampling_params:
         return model_sample(logits, sampling_metadata)
     kwargs: dict[str, Any] = {}

@@ -783,6 +783,7 @@ class CosyVoice3Model(
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         self._pending_rejection_rng: DeferredRejection | None = None
+        self._sampled_token_feedback: tuple[torch.Tensor, list[list[int]]] | None = None
         self.config = vllm_config.model_config.hf_config
         standard_sampling = cosyvoice3_standard_sampling(self.config)
         logger.info("CosyVoice3 sampling policy: %s", "standard" if standard_sampling else "ras")
@@ -1123,7 +1124,7 @@ class CosyVoice3Model(
         return SamplerOutput(sampled_token_ids=sampled.unsqueeze(-1), logprobs_tensors=None)
 
     def finalize_deferred_sampling(self, sampled_token_ids: torch.Tensor) -> DeferredRejection | None:
-        """Share one feedback copy/wait for tokens and conditional RNG commits."""
+        """Commit synchronous feedback and cache host tokens at token completion."""
         pending = self._pending_rejection_rng
         if pending is None:
             return
@@ -1143,19 +1144,22 @@ class CosyVoice3Model(
         return pending
 
     def stage_deferred_sampling(self, stream: torch.cuda.Stream, ready: torch.Event) -> DeferredRejection | None:
+        """Stage async rejection flags on the token-copy stream and event."""
         pending = self._pending_rejection_rng
         if pending is not None:
             pending.stage(stream, ready)
         return pending
 
     def commit_deferred_sampling(self) -> None:
+        """Commit the previous step once before reserving RNG for the next sample."""
         pending = self._pending_rejection_rng
         if pending is not None:
             pending.commit()
             self._pending_rejection_rng = None
 
     def consume_sampled_token_ids_cpu_override(self, sampled_token_ids: torch.Tensor) -> list[list[int]] | None:
-        feedback = getattr(self, "_sampled_token_feedback", None)
+        """Consume cached host tokens once for their originating sample tensor."""
+        feedback = self._sampled_token_feedback
         if feedback is None:
             return None
         self._sampled_token_feedback = None
