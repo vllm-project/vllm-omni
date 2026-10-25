@@ -13,9 +13,6 @@ checkpoints and compare BF16 vs FP8 generation, scoped to the AR stage:
   stage to emit visual tokens, which exercises the generation experts
   (``gen_mlp``) and the extra vocabulary/head (``gen_embed_tokens`` /
   ``gen_head``) under FP8, and compares the decoded image.
-
-The CPU-only structural unit tests live in
-``tests/model_executor/models/mammoth_moda2/test_mammoth_moda2_quantization.py``.
 """
 
 from __future__ import annotations
