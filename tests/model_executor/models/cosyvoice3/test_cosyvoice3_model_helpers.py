@@ -7,6 +7,7 @@ from collections import OrderedDict
 from threading import Lock
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 import torch.nn as nn
@@ -26,6 +27,7 @@ from vllm_omni.transformers_utils.configs.cosyvoice3 import CosyVoice3Config
 from vllm_omni.worker import gpu_ar_model_runner
 from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
+from vllm_omni.worker.mixins import CPU_INPUT_IDS_KWARG
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -43,6 +45,7 @@ class _DummyCode2Wav:
         self.forward_calls: list[dict[str, object]] = []
         self.forward_streaming_calls: list[dict[str, object]] = []
         self.forward_streaming_batch_calls: list[list[dict[str, object]]] = []
+        self.released_states: list[dict[str, object] | None] = []
 
     def forward(self, **kwargs):
         self.forward_calls.append(kwargs)
@@ -82,6 +85,9 @@ class _DummyCode2Wav:
             for item in items
         ]
 
+    def release_flow_prefix(self, cache_state):
+        self.released_states.append(cache_state)
+
 
 def _make_code2wav_model(
     *,
@@ -110,6 +116,7 @@ def _make_code2wav_model(
     model._stream_audio_cache_by_req = {}
     model._stream_audio_cache_lock = Lock()
     model._stream_vocoder_cache_by_req = {}
+    model._stream_conditioning_by_req = {}
     return model
 
 
@@ -342,6 +349,36 @@ def test_forward_prefers_token_offset_when_present():
     assert call["token"].shape == (1, 3)
     assert call["token_offset_tokens"] == 2
     assert call["finalize"] is False
+
+
+@pytest.mark.parametrize("with_host_copy", [False, True])
+def test_forward_filters_codec_tokens_from_either_copy(with_host_copy):
+    """Non-code tokens (here 7 with a vocabulary of 4) are dropped the same way
+    whether the runner passes the host copy of the input ids or not."""
+    model = _make_code2wav_model()
+    runtime_info = [
+        {
+            "embed": {
+                "speech_token": torch.tensor([[1, 2, 3]], dtype=torch.long),
+                "speech_feat": torch.tensor([[[0.1, 0.2], [0.3, 0.4]]], dtype=torch.float32),
+                "embedding": torch.tensor([[0.5, 0.6]], dtype=torch.float32),
+            },
+            "meta": {"left_context_size": 0},
+        }
+    ]
+    input_ids = torch.tensor([1, 7, 2, 3], dtype=torch.long)
+    kwargs = {CPU_INPUT_IDS_KWARG: input_ids.clone()} if with_host_copy else {}
+
+    model.forward(
+        input_ids=input_ids,
+        positions=torch.arange(4),
+        model_intermediate_buffer=runtime_info,
+        seq_token_counts=[4],
+        **kwargs,
+    )
+
+    call = model.code2wav.forward_streaming_calls[0]
+    assert call["token"].tolist() == [[1, 2, 3]]
 
 
 def test_forward_falls_back_to_left_context_size_for_backward_compat():
@@ -589,6 +626,85 @@ def test_forward_batches_streaming_flow_items(monkeypatch):
     assert batch_items[1]["token_offset_tokens"] == 1
     assert "rid-a" in model._stream_vocoder_cache_by_req
     assert "rid-b" in model._stream_vocoder_cache_by_req
+
+
+@pytest.mark.parametrize("batch_flow", ["0", "1"])
+@pytest.mark.parametrize("different_ids", [False, True])
+def test_mrv2_streaming_slots_preserve_request_state_across_reordered_batches(monkeypatch, batch_flow, different_ids):
+    monkeypatch.setenv("COSYVOICE3_BATCH_FLOW", batch_flow)
+    model = _make_code2wav_model()
+    first_infos = [
+        {
+            "embed": {
+                "speech_token": torch.tensor([[1, 2]]),
+                "speech_feat": torch.ones(1, 4, 2),
+                "embedding": torch.full((1, 2), float(index)),
+            },
+            "meta": {
+                "req_id": [f"external-{index}" if different_ids else ("internal-a" if index == 0 else "internal-b")],
+                "stream_finished": torch.tensor(False),
+                "left_context_size": 0,
+            },
+        }
+        for index in range(2)
+    ]
+    model.forward(
+        input_ids=torch.tensor([0, 1, 2, 3]),
+        positions=torch.arange(4),
+        seq_token_counts=[2, 2],
+        request_ids=["internal-a", "internal-b"],
+        model_intermediate_buffer=first_infos,
+    )
+    previous_states = dict(model._stream_vocoder_cache_by_req)
+    assert set(previous_states) == {"internal-a", "internal-b"}
+    # The runner released both slots; continuation receives no conditioning.
+    # B continues while A ends exactly at its earlier two-token boundary.
+    result = model.forward(
+        input_ids=torch.tensor([2, 3, 0, 0, 1]),
+        positions=torch.arange(5),
+        seq_token_counts=[3, 2],
+        request_ids=["internal-b", "internal-a"],
+        model_intermediate_buffer=[
+            {"meta": {"stream_finished": torch.tensor(False), "left_context_size": 2}},
+            {"meta": {"stream_finished": torch.tensor(True), "left_context_size": 2}},
+        ],
+    )
+    calls = model.code2wav.forward_streaming_calls[-2:]
+    assert calls[0]["cache_state"] is previous_states["internal-b"]
+    assert calls[1]["cache_state"] is previous_states["internal-a"]
+    assert calls[0]["embedding"].tolist() == [[1.0, 1.0]]
+    assert calls[1]["embedding"].tolist() == [[0.0, 0.0]]
+    assert calls[1]["finalize"] is True
+    assert calls[1]["token_offset_tokens"] == 2
+    assert len(result.multimodal_outputs["audio"]) == 2
+    assert set(model._stream_vocoder_cache_by_req) == {"internal-b"}
+    assert set(model._stream_conditioning_by_req) == {"internal-b"}
+    model.on_requests_finished({"internal-b"})
+    assert not model._stream_vocoder_cache_by_req
+    assert not model._stream_conditioning_by_req
+    # A new utterance after interruption starts without reference/phase state.
+    model.forward(
+        input_ids=torch.tensor([2, 3]),
+        positions=torch.arange(2),
+        seq_token_counts=[2],
+        request_ids=["internal-next"],
+        model_intermediate_buffer=[first_infos[1]],
+    )
+    assert model.code2wav.forward_streaming_calls[-1]["cache_state"] is None
+    assert set(model._stream_conditioning_by_req) == {"internal-next"}
+
+
+@pytest.mark.parametrize("request_ids", [["a"], ["a", "a"]])
+def test_mrv2_code2wav_rejects_misaligned_runner_ids(request_ids):
+    model = _make_code2wav_model()
+    with pytest.raises(ValueError, match="one unique runner request ID"):
+        model.forward(
+            input_ids=torch.tensor([0, 1, 2, 3]),
+            positions=torch.arange(4),
+            seq_token_counts=[2, 2],
+            request_ids=request_ids,
+            model_intermediate_buffer=[{}, {}],
+        )
 
 
 def test_sample_uses_ras_rejection_for_recent_repetition():
@@ -1045,13 +1161,19 @@ def test_sampling_mode_preserves_or_merges_control_logits(mode):
 
 
 def test_cancelled_stream_releases_only_its_vocoder_state():
+    cancelled_state = {"mel": torch.ones(2)}
     model = SimpleNamespace(
         _stream_audio_cache_lock=Lock(),
-        _stream_vocoder_cache_by_req={"cancelled": {"mel": torch.ones(2)}, "live": {"mel": torch.zeros(2)}},
+        _stream_vocoder_cache_by_req={"cancelled": cancelled_state, "live": {"mel": torch.zeros(2)}},
+        _stream_conditioning_by_req={"cancelled": object(), "live": object()},
+        code2wav=_DummyCode2Wav(vocab_size=4),
     )
+    model._set_stream_state = lambda req_id, state: CosyVoice3Model._set_stream_state(model, req_id, state)
     CosyVoice3Model.on_requests_finished(model, {"cancelled", "unknown"})
     CosyVoice3Model.on_requests_finished(model, {"cancelled"})
     assert set(model._stream_vocoder_cache_by_req) == {"live"}
+    assert model.code2wav.released_states == [cancelled_state]
+    assert set(model._stream_conditioning_by_req) == {"live"}
 
 
 @pytest.mark.parametrize("mrv2,packed", [(False, False), (False, True), (True, False)])
@@ -1120,3 +1242,101 @@ def test_generation_output_ownership_is_exposed_only_for_owned_codec(stage, owne
     if stage == "cosyvoice3_code2wav":
         model.code2wav = SimpleNamespace(owns_generation_output_storage=owned)
     assert model.owns_generation_output_storage is (stage == "cosyvoice3_code2wav" and owned)
+
+
+def test_ras_mrv2_sample_takes_the_positional_arguments_of_sampler_sample():
+    """MRv2 calls ``sampler.sample`` positionally, then ``return_logprobs=``;
+    a missing positional parameter shifts the rest onto ``return_logprobs``."""
+    import inspect
+
+    from vllm.v1.worker.gpu.sample.sampler import Sampler
+
+    def positional(fn):
+        return [
+            p.name
+            for p in inspect.signature(fn).parameters.values()
+            if p.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
+        ][1:]
+
+    assert positional(cosyvoice3._ras_mrv2_sample) == positional(Sampler.sample)
+
+
+def test_ras_mrv2_sample_applies_logit_bias_and_no_other_logits_processor(monkeypatch):
+    from vllm.v1.worker.gpu.sample import gumbel
+    from vllm.v1.worker.gpu.sample.logit_bias import LogitBiasState
+
+    vocab = 8
+    seen = []
+
+    class Bias(LogitBiasState):
+        def __init__(self):
+            pass
+
+        def apply(self, logits, ctx):
+            seen.append(ctx)
+            logits[:, 5] += 100.0
+            return logits
+
+    class Penalty:
+        def apply(self, logits, ctx):
+            raise AssertionError("RAS applies no penalties")
+
+    # A deterministic stand-in for the device Gumbel kernel.
+    monkeypatch.setattr(gumbel, "gumbel_sample", lambda logits, *args, **kwargs: logits.argmax(dim=-1))
+    top_k = torch.full((2,), vocab, dtype=torch.int32)
+    top_p = torch.ones(2)
+    states = SimpleNamespace(
+        vocab_size=vocab,
+        temperature=SimpleNamespace(gpu=torch.ones(2)),
+        seeds=SimpleNamespace(gpu=torch.zeros(2, dtype=torch.int64)),
+        top_k=SimpleNamespace(gpu=top_k, np=top_k.numpy()),
+        top_p=SimpleNamespace(gpu=top_p, np=top_p.numpy()),
+        get_top_k_top_p=lambda rows, rows_np: (top_k[rows.long()], top_p[rows.long()]),
+    )
+    sampler = SimpleNamespace(
+        logits_processors=[Bias(), Penalty()],
+        sampling_states=states,
+        req_states=SimpleNamespace(
+            all_token_ids=SimpleNamespace(gpu=torch.zeros((2, 16), dtype=torch.int64)),
+            prompt_len=SimpleNamespace(gpu=torch.full((2,), 4)),
+            total_len=SimpleNamespace(gpu=torch.full((2,), 4)),
+        ),
+    )
+    idx = torch.arange(2, dtype=torch.int32)
+    sampled, _ = cosyvoice3._ras_mrv2_sample(
+        sampler,
+        torch.zeros(2, vocab),
+        idx,
+        idx,
+        np.arange(2),
+        torch.zeros(2, dtype=torch.int64),
+        torch.zeros(2, dtype=torch.int64),
+        torch.zeros(2, dtype=torch.int64),
+        np.full(2, 16),
+        return_logprobs=True,
+        default_top_p=0.8,
+        default_top_k=25,
+        win_size=10,
+        tau_r=0.1,
+        eps=1e-5,
+    )
+    assert sampled.tolist() == [5, 5]
+    assert seen[0].seq_lens_upper_bound_np.tolist() == [16, 16]
+
+
+def test_request_conditioning_keeps_only_the_payload_fields():
+    """The MRv2 per-request buffer adds the runner's request metadata and the
+    engine's request tag to the stage payload; the payload schema rejects
+    unknown fields."""
+    raw = {
+        "global_request_id": ["speech-1"],
+        "req_id": "speech-1-0",
+        "sampling_params": object(),
+        "mm_features": [],
+        "prompt_embeds_cpu": torch.zeros(1),
+        "meta": {"left_context_size": 2},
+        "embed": {"speech_token": [torch.tensor([[1, 2]])]},
+    }
+    payload = to_struct(_normalize_request_conditioning(raw))
+    assert payload.meta.left_context_size == 2
+    assert payload.embed.speech_token.tolist() == [[1, 2]]

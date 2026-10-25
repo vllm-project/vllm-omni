@@ -50,7 +50,7 @@ from vllm_omni.worker.gpu_ar_model_runner import (
     _snapshot_tensor_payload_to_cpu_async,
 )
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
-from vllm_omni.worker.mixins import maybe_unpad_input_ids
+from vllm_omni.worker.mixins import CPU_INPUT_IDS_KWARG, maybe_unpad_input_ids
 from vllm_omni.worker.omni_connector_model_runner_mixin import (
     OmniConnectorModelRunnerMixin,
     needs_omni_connector,
@@ -427,6 +427,12 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
             model_kwargs["seq_token_counts"] = tokens
             if getattr(self.model, "requires_request_ids", False):
                 model_kwargs["request_ids"] = list(req_ids)
+            if getattr(self.model, "requires_cpu_input_ids", False):
+                # This step's input_ids as staged on the host. Models that split
+                # or filter tokens by value read them here: data-dependent
+                # indexing of the device copy blocks the host until the GPU
+                # finishes the previous step, so steps could not overlap.
+                model_kwargs[CPU_INPUT_IDS_KWARG] = self.input_ids.cpu[:num_tokens_unpadded]
 
         # Run the model.
         # Use persistent buffers for CUDA graphs.

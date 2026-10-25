@@ -1,0 +1,24 @@
+# Opt-in CUDA MRv2 streaming profile. Both Talker and Code2Wav use the
+# native data plane; ready codec chunks share generation-stage batches.
+# Retains the generic RAS policy and enables cross-request Flow batching.
+base_config: cosyvoice3.yaml
+model_runner: v2
+
+stages:
+  - stage_id: 0
+    # CosyVoice3 rearranges the complete text/reference prefill block.
+    enable_chunked_prefill: false
+  - stage_id: 1
+    enable_chunked_prefill: false
+    env:
+      COSYVOICE3_BATCH_FLOW: "1"
+
+platforms:
+  npu:
+    model_runner: v1
+  xpu:
+    model_runner: v1
+  rocm:
+    model_runner: v1
+  musa:
+    model_runner: v1

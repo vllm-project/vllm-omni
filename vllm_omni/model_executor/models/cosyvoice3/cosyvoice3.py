@@ -42,6 +42,7 @@ from vllm.v1.sample.sampler import Sampler
 
 from vllm_omni.data_entry_keys import EmbeddingsStruct, OmniPayloadStruct, to_dict, to_struct
 from vllm_omni.inputs.mm_processor import OmniDummyInputsBuilder, OmniMultiModalProcessor
+from vllm_omni.model_executor.models.cosyvoice3.code2wav_core.packed_dit import to_device_async
 from vllm_omni.model_executor.models.cosyvoice3.ras_sampler import MAX_FUSED_TOP_K, fused_ras_sample
 from vllm_omni.model_executor.models.cosyvoice3.runtime import (
     cosyvoice3_batch_flow_debug,
@@ -64,6 +65,7 @@ from vllm_omni.platforms import current_omni_platform
 from vllm_omni.transformers_utils.configs.cosyvoice3 import CosyVoice3Config
 from vllm_omni.transformers_utils.repo_utils import hf_api
 from vllm_omni.utils.speaker_cache import get_speaker_cache
+from vllm_omni.worker.mixins import CPU_INPUT_IDS_KWARG
 
 logger = init_logger(__name__)
 
@@ -86,7 +88,14 @@ def _normalize_request_conditioning(payload: dict) -> dict:
     The code2wav schema consumes one request, so that wrapper carries no
     batch dimension. A multi-item list here is an unsplit batch and must
     fail instead of silently choosing another request's voice.
+
+    On the native MRv2 data plane the per-request buffer also carries the
+    runner's request metadata (``req_id``, ``sampling_params``,
+    ``mm_features``, ...) and the engine's ``global_request_id`` tag next to
+    the stage payload. Only the payload schema's fields are kept; the runner
+    passes request ids separately.
     """
+    payload = {key: value for key, value in payload.items() if key in OmniPayloadStruct.__struct_fields__}
     embed = payload.get("embed")
     if not isinstance(embed, Mapping):
         return payload
@@ -232,6 +241,7 @@ def _ras_mrv2_sample(
     pos: torch.Tensor,
     input_ids: torch.Tensor,
     expanded_local_pos: torch.Tensor,
+    seq_lens_upper_bound_np: np.ndarray,
     return_logprobs: bool = False,
     *,
     default_top_p: float,
@@ -248,12 +258,27 @@ def _ras_mrv2_sample(
     distribution. History is read from the runner's token table and rejection
     is resolved per row on the device, so no step waits on the host. Penalties
     are not applied, as in V1 RAS. Draws use the request seed and position; the
-    replacement draw uses a disjoint noise stream.
+    replacement draw uses a disjoint noise stream. The positional parameters
+    are those ``Sampler.sample`` receives; only logit bias, of the sampler's
+    logits processors, applies.
     """
     from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
+    from vllm.v1.worker.gpu.sample.logit_bias import LogitBiasState
+    from vllm.v1.worker.gpu.sample.logits_processor.interface import LogitsContext
 
     logits = torch.empty_like(logits, dtype=torch.float32).copy_(logits)
-    sampler.logit_bias_state.apply_logit_bias(logits, expanded_idx_mapping, idx_mapping_np, pos)
+    context = LogitsContext(
+        expanded_idx_mapping=expanded_idx_mapping,
+        idx_mapping=idx_mapping,
+        idx_mapping_np=idx_mapping_np,
+        expanded_local_pos=expanded_local_pos,
+        input_ids=input_ids,
+        pos=pos,
+        seq_lens_upper_bound_np=seq_lens_upper_bound_np,
+    )
+    for processor in sampler.logits_processors:
+        if isinstance(processor, LogitBiasState):
+            logits = processor.apply(logits, context)
     states = sampler.sampling_states
     temperature = states.temperature.gpu
     req_states = sampler.req_states
@@ -751,6 +776,15 @@ class CosyVoice3Model(
     _sampling_eps = 1e-5
 
     @property
+    def requires_request_ids(self) -> bool:
+        """Key streaming caches by the same IDs used for runner cleanup."""
+        return self.model_stage == "cosyvoice3_code2wav"
+
+    @property
+    def requires_exact_input_shape(self) -> bool:
+        return self.model_stage == "cosyvoice3_code2wav"
+
+    @property
     def owns_generation_output_storage(self) -> bool:
         """Expose the codec's ownership contract on the model seen by the runner."""
         return self.model_stage == "cosyvoice3_code2wav" and (
@@ -770,6 +804,11 @@ class CosyVoice3Model(
             return None
         return int(self.config.llm["speech_token_size"]) + 200
 
+    def capture_auxiliary_graphs(self) -> None:
+        """Record the codec's packed streaming CUDA graphs during worker warmup."""
+        if self.model_stage == "cosyvoice3_code2wav":
+            self.code2wav.capture_graphs()
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         self.config = vllm_config.model_config.hf_config
@@ -779,6 +818,8 @@ class CosyVoice3Model(
         # Full-response codec consumes tokens and conditioning, not LLM hidden states.
         self.omni_pooler_payload_include_hidden = not cosyvoice3_packed_inference_enabled()
         self.model_stage = vllm_config.model_config.model_stage
+        # The codec reads its codec tokens from the host copy (see _sanitize_codec_tokens).
+        self.requires_cpu_input_ids = self.model_stage == "cosyvoice3_code2wav"
         model_dir = vllm_config.model_config.model
         if not os.path.isdir(model_dir):
             model_dir = hf_api().snapshot_download(model_dir)
@@ -822,6 +863,7 @@ class CosyVoice3Model(
 
             self._stream_audio_cache_lock = Lock()
             self._stream_vocoder_cache_by_req: dict[str, dict[str, torch.Tensor]] = {}
+            self._stream_conditioning_by_req: dict[str, EmbeddingsStruct] = {}
         else:
             raise ValueError(f"Model stage not supported {self.model_stage}")
 
@@ -847,9 +889,26 @@ class CosyVoice3Model(
     def on_requests_finished(self, request_ids: set[str]) -> None:
         """Release per-request vocoder state on completion, cancellation or error."""
         if hasattr(self, "_stream_vocoder_cache_by_req"):
-            with self._stream_audio_cache_lock:
-                for request_id in request_ids:
-                    self._stream_vocoder_cache_by_req.pop(request_id, None)
+            for request_id in request_ids:
+                self._set_stream_state(request_id, None)
+
+    def _set_stream_state(self, req_id: str, state: dict | None) -> None:
+        """Replace (or drop, with None) a request's streaming state.
+
+        The state owns the request's Flow prefix cache pages; return them once
+        no remaining state refers to them.
+        """
+        with self._stream_audio_cache_lock:
+            old = self._stream_vocoder_cache_by_req.pop(req_id, None)
+            if state is not None:
+                self._stream_vocoder_cache_by_req[req_id] = state
+            else:
+                # A finished or cancelled request also drops its reference conditioning.
+                self._stream_conditioning_by_req.pop(req_id, None)
+        if old is None:
+            return
+        if state is None or old.get("flow_prefix") is not state.get("flow_prefix"):
+            self.code2wav.release_flow_prefix(old)
 
     def _stitch_stream_audio(self, req_id: str | None, audio: torch.Tensor, stream_finished: bool) -> torch.Tensor:
         """Pass-through stitching for async_chunk.
@@ -859,8 +918,7 @@ class CosyVoice3Model(
         duplicated overlap (if no tail trim) or duration shrink (if tail trim).
         """
         if req_id is not None and stream_finished and hasattr(self, "_stream_vocoder_cache_by_req"):
-            with self._stream_audio_cache_lock:
-                self._stream_vocoder_cache_by_req.pop(req_id, None)
+            self._set_stream_state(req_id, None)
         return audio
 
     @staticmethod
@@ -883,11 +941,19 @@ class CosyVoice3Model(
 
         return [ids]
 
-    def _sanitize_codec_tokens(self, req_ids: torch.Tensor) -> torch.Tensor:
-        """Filter non-code tokens before feeding flow token embedding."""
+    def _sanitize_codec_tokens(self, req_ids: torch.Tensor, cpu_req_ids: torch.Tensor | None = None) -> torch.Tensor:
+        """Filter non-code tokens before feeding flow token embedding.
+
+        The filtered length depends on the token values. Filtering the host
+        copy (``cpu_req_ids``) and copying the result asynchronously keeps the
+        host free; masking the device copy waits for all queued GPU work.
+        """
         vocab_size = int(self.code2wav.input_embedding.num_embeddings)
-        valid_mask = (req_ids >= 0) & (req_ids < vocab_size)
-        return req_ids[valid_mask]
+        if cpu_req_ids is None:
+            valid_mask = (req_ids >= 0) & (req_ids < vocab_size)
+            return req_ids[valid_mask]
+        valid = cpu_req_ids[(cpu_req_ids >= 0) & (cpu_req_ids < vocab_size)].to(dtype=req_ids.dtype)
+        return to_device_async(valid, req_ids.device)
 
     @staticmethod
     def _req_scalar(param: torch.Tensor | None, req_idx: int, default: float | int) -> float | int:
@@ -1533,6 +1599,7 @@ class CosyVoice3Model(
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
         additional_information: dict[str, object] | None = None,
+        request_ids: list[str] | None = None,
         **kwargs: object,
     ) -> torch.Tensor | OmniOutput:
         if self.model_stage == "cosyvoice3_talker":
@@ -1561,8 +1628,17 @@ class CosyVoice3Model(
             seq_token_counts = kwargs.get("seq_token_counts")
             flat_ids = input_ids.reshape(-1).to(dtype=torch.long)
             request_ids_list = self._split_request_ids(flat_ids, seq_token_counts)
+            cpu_input_ids = kwargs.get(CPU_INPUT_IDS_KWARG)
+            cpu_request_ids_list = None
+            if cpu_input_ids is not None:
+                cpu_request_ids_list = self._split_request_ids(
+                    cpu_input_ids.reshape(-1).to(torch.long), seq_token_counts
+                )
 
             num_reqs = max(1, len(request_ids_list))
+            if request_ids is not None:
+                if len(request_ids) != num_reqs or len(set(request_ids)) != num_reqs:
+                    raise ValueError("CosyVoice3 code2wav requires one unique runner request ID per batch row")
             debug_batch_flow = cosyvoice3_batch_flow_debug()
             if debug_batch_flow:
                 logger.info(
@@ -1585,10 +1661,20 @@ class CosyVoice3Model(
                 meta = payload.meta
                 embed = payload.embed
 
-                req_id = meta.req_id[0] if (meta and meta.req_id) else None
+                req_id = (
+                    request_ids[idx]
+                    if request_ids is not None
+                    else (meta.req_id[0] if (meta and meta.req_id) else None)
+                )
                 stream_finished = (
                     bool(meta.stream_finished.item()) if (meta and meta.stream_finished is not None) else False
                 )
+                # MRv2 releases the generation slot after each chunk. Keep
+                # reference conditioning with the request, alongside HiFT
+                # state, so the next slot needs only its current codec prefix.
+                if embed is None and req_id is not None:
+                    with self._stream_audio_cache_lock:
+                        embed = self._stream_conditioning_by_req.get(req_id)
                 speech_token = embed.speech_token if embed else None
                 speech_feat = embed.speech_feat if embed else None
                 embedding = embed.embedding if embed else None
@@ -1599,8 +1685,7 @@ class CosyVoice3Model(
                     )
                 if speech_token is None or speech_feat is None or embedding is None:
                     if stream_finished and req_id is not None and hasattr(self, "_stream_vocoder_cache_by_req"):
-                        with self._stream_audio_cache_lock:
-                            self._stream_vocoder_cache_by_req.pop(req_id, None)
+                        self._set_stream_state(req_id, None)
                     audios[idx] = self._stitch_stream_audio(req_id, empty_audio, stream_finished)
                     if req_ids.numel() > 0 and (
                         (meta and meta.left_context_size is not None) or payload.generated_len is not None
@@ -1616,7 +1701,8 @@ class CosyVoice3Model(
                         )
                     continue
 
-                token = self._sanitize_codec_tokens(req_ids)
+                cpu_req_ids = None if cpu_request_ids_list is None else cpu_request_ids_list[idx]
+                token = self._sanitize_codec_tokens(req_ids, cpu_req_ids)
                 if token.numel() == 0:
                     audios[idx] = self._stitch_stream_audio(req_id, empty_audio, stream_finished)
                     if req_ids.numel() > 0:
@@ -1643,6 +1729,9 @@ class CosyVoice3Model(
                     if req_id is not None and hasattr(self, "_stream_vocoder_cache_by_req"):
                         with self._stream_audio_cache_lock:
                             cache_state = self._stream_vocoder_cache_by_req.get(req_id)
+                            self._stream_conditioning_by_req[req_id] = EmbeddingsStruct(
+                                speech_token=speech_token, speech_feat=speech_feat, embedding=embedding
+                            )
 
                     streaming_flow_items.append(
                         {
@@ -1719,11 +1808,10 @@ class CosyVoice3Model(
                     req_id = item.get("req_id")
                     stream_finished = bool(item.get("stream_finished", False))
                     if req_id is not None and hasattr(self, "_stream_vocoder_cache_by_req"):
-                        with self._stream_audio_cache_lock:
-                            if new_cache_state is None or stream_finished:
-                                self._stream_vocoder_cache_by_req.pop(req_id, None)
-                            else:
-                                self._stream_vocoder_cache_by_req[req_id] = new_cache_state
+                        if stream_finished:
+                            self._set_stream_state(req_id, None)
+                        else:
+                            self._set_stream_state(req_id, new_cache_state)
 
                     audio = tts_speech.reshape(-1).to(dtype=torch.float32)
                     audios[idx] = self._stitch_stream_audio(req_id, audio, stream_finished)

@@ -19,6 +19,16 @@ def cosyvoice3_batch_flow_enabled() -> bool:
     return _env_flag("COSYVOICE3_BATCH_FLOW", "0")
 
 
+def cosyvoice3_hift_batch_enabled() -> bool:
+    """Run packed streaming's non-final HiFT windows as one batched call per step."""
+    return _env_flag("COSYVOICE3_HIFT_BATCH", "0")
+
+
+def cosyvoice3_hift_stream_enabled() -> bool:
+    """Run packed streaming's HiFT on its own CUDA stream, overlapping later Flow groups."""
+    return _env_flag("COSYVOICE3_HIFT_STREAM", "0")
+
+
 def cosyvoice3_batch_flow_debug() -> bool:
     """Return whether Stage-1 batching diagnostics are enabled."""
     return _env_flag("COSYVOICE3_BATCH_FLOW_DEBUG", "0")
@@ -47,6 +57,15 @@ def cosyvoice3_packed_streaming_enabled() -> bool:
         and torch.cuda.is_available()
         and torch.cuda.get_device_capability()[0] == 9
     )
+
+
+def cosyvoice3_flow_prefix_cache_bytes() -> int:
+    """Pool size of the packed-streaming Flow prefix cache; 0 disables it.
+
+    Every cached frame keeps K/V of all DiT layers for each Euler step and CFG
+    branch (about 1.8 MiB per mel frame for the released 22-layer BF16 DiT).
+    """
+    return int(float(os.environ.get("COSYVOICE3_FLOW_PREFIX_CACHE_GIB", "0")) * 2**30)
 
 
 def cosyvoice3_packed_inference_enabled() -> bool:

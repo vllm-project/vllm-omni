@@ -546,10 +546,13 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
             # Native transport runs ahead of scheduler consumption. Its
             # terminal notification fences resource cleanup, not the sampled
             # token boundary: a later in-flight frame must not reach the codec.
+            accepted_tokens: list[int] = []
             if state.output_stopped:
                 payload = None
             else:
+                previous_count = len(state.output_token_ids)
                 state.accept_tokens(sampled_by_req.get(req_id, []))
+                accepted_tokens = state.output_token_ids[previous_count:]
                 payload = payload_by_req.get(req_id)
             if not self._async_chunk:
                 # Full-payload consumers execute once, after the producer has
@@ -563,13 +566,17 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
                 payload = self._materialize_full_payload_entry(accumulated)[0] if accumulated is not None else None
             if self._async_chunk and isinstance(payload, dict):
                 payload = unflatten_payload(payload)
-            token_only_producer = bool(
-                getattr(getattr(self, "_custom_process_func", None), "_requires_full_token_history", False)
+            # Token-only processors dispatch without a payload: full-history
+            # producers on every step, token-update producers on new tokens.
+            processor = getattr(self, "_custom_process_func", None)
+            full_token_history = getattr(processor, "_requires_full_token_history", False) is True
+            token_update = full_token_history or bool(
+                self._async_chunk and accepted_tokens and getattr(processor, "requires_token_updates", False) is True
             )
-            if payload is None and not state.finished and not token_only_producer:
+            if payload is None and not state.finished and not token_update:
                 continue
             include_token_history = bool(
-                token_only_producer
+                full_token_history
                 or not self._async_chunk
                 or state.resumable
                 or self._put_req_chunk.get(state.external_req_id, 0) == 0
@@ -578,7 +585,7 @@ class OmniRunnerDataPlane(OmniConnectorModelRunnerMixin):
                 (
                     state.snapshot(
                         include_token_history=include_token_history,
-                        sampled_token_ids=sampled_by_req.get(req_id) if not state.finished else None,
+                        sampled_token_ids=accepted_tokens,
                     ),
                     payload,
                 )
