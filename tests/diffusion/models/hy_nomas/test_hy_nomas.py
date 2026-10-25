@@ -245,6 +245,7 @@ def pipeline(monkeypatch):
     monkeypatch.setitem(sys.modules, module.__name__, module)
     pipeline = HyNomasPipeline.__new__(HyNomasPipeline)
     nn.Module.__init__(pipeline)
+    pipeline.initialize_ar({})
     pipeline.pipe = Mock()
     pipeline.sp_size = 1
     pipeline.pipe.inference.return_value = torch.linspace(0, 1, 1 * 3 * 5 * 32 * 32).reshape(1, 3, 5, 32, 32)
@@ -370,7 +371,7 @@ def test_module_offload_selects_components_and_removes_hooks(monkeypatch, compon
         ({"cache_backend": "cache_dit"}, "cache backend"),
         ({"quantization_config": "int8"}, "unquantized"),
         ({"lora_path": "adapter"}, "LoRA"),
-        ({"custom_pipeline_args": {"arbitrary": True}}, "text_encoder"),
+        ({"custom_pipeline_args": {"arbitrary": True}}, "custom_pipeline_args"),
         ({"enable_layerwise_offload": True}, "layer offload"),
         ({"flow_shift": 3.0}, "flow_shift=5"),
         ({"enforce_eager": False, "diffusion_compile_granularity": "full"}, "full transformer compilation"),
@@ -387,6 +388,8 @@ def test_unsupported_engine_features(overrides, match):
         flow_shift=None,
         enforce_eager=True,
         diffusion_compile_granularity="regional",
+        step_execution=False,
+        streaming_output=False,
     )
     config.__dict__.update(overrides)
     with pytest.raises(ValueError, match=match):

@@ -40,6 +40,11 @@ def normalize_request(prompt: OmniPromptType, params: OmniDiffusionSamplingParam
     unknown = extra.keys() - HY_NOMAS_EXTRA_BODY_PARAMS
     if unknown:
         raise OmniClientError(f"Unsupported Hy-Nomas extra_args: {sorted(unknown)}")
+    if "session_id" in extra and (not isinstance(extra["session_id"], str) or not extra["session_id"].strip()):
+        raise OmniClientError("Hy-Nomas session_id must be a nonempty string.")
+    for name in ("reset", "close_session"):
+        if name in extra and type(extra[name]) is not bool:
+            raise OmniClientError(f"Hy-Nomas {name} must be a boolean.")
     try:
         defaults = get_hy_nomas_video_generation_defaults(extra)
     except (TypeError, ValueError) as exc:

@@ -7,7 +7,18 @@ from collections.abc import Mapping
 from vllm_omni.model_extras.video_generation import VideoGenerationDefaults
 
 HY_NOMAS_EXTRA_BODY_PARAMS = frozenset(
-    {"segment_frame_boundaries", "camera_trajectory", "segment_has_camera", "flow_shift", "duration", "generate_sound"}
+    {
+        "segment_frame_boundaries",
+        "camera_trajectory",
+        "segment_has_camera",
+        "flow_shift",
+        "duration",
+        "generate_sound",
+        "session_id",
+        "ar_diffusion_tick",
+        "reset",
+        "close_session",
+    }
 )
 
 

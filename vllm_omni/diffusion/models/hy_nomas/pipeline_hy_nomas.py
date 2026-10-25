@@ -20,6 +20,7 @@ from vllm_omni.diffusion.media import (
     VideoTensorSpec,
     VideoValueRange,
 )
+from vllm_omni.diffusion.models.hy_nomas.ar import HyNomasAR, HyNomasARConfig
 from vllm_omni.diffusion.models.hy_nomas.configuration_hy_nomas import (
     DECODER_FILE,
     DIT_FILE,
@@ -91,14 +92,23 @@ def validate_config(config: OmniDiffusionConfig) -> None:
     if resolve_offload_strategy(config) not in (OffloadStrategy.NONE, OffloadStrategy.MODEL_LEVEL):
         raise ValueError("Hy-Nomas supports module CPU offload; layer offload is not supported.")
     custom = config.custom_pipeline_args or {}
-    if custom.keys() - {"text_encoder"}:
-        raise ValueError("Hy-Nomas custom_pipeline_args only supports text_encoder.")
+    allowed = {"text_encoder", *(f"ar_{name}" for name in HyNomasARConfig.__dataclass_fields__)}
+    if custom.keys() - allowed:
+        raise ValueError(f"Unsupported Hy-Nomas custom_pipeline_args: {sorted(custom.keys() - allowed)}")
+    HyNomasARConfig.from_args(custom)
+    if config.step_execution and not config.streaming_output:
+        raise ValueError("Hy-Nomas step execution requires streaming_output=true.")
+    if config.step_execution and config.engine_backend not in (
+        "ar_diffusion",
+        "vllm_omni.experimental.ar_diffusion.engine.ARDiffusionEngine",
+    ):
+        raise ValueError("Hy-Nomas step execution requires the ARDiffusionEngine backend.")
     text_encoder = custom.get("text_encoder", TEXT_ENCODER_ID)
     if not isinstance(text_encoder, str) or not text_encoder.strip():
         raise ValueError("Hy-Nomas text_encoder must be a nonempty model ID or local path.")
 
 
-class HyNomasPipeline(nn.Module, SupportsComponentDiscovery):
+class HyNomasPipeline(nn.Module, HyNomasAR, SupportsComponentDiscovery):
     # Generic warmup uses two steps and CFG=0, which the distilled checkpoint does not support.
     dummy_run_num_frames: ClassVar[int] = 0
     _dit_modules: ClassVar[list[str]] = ["pipe.transformer"]
@@ -108,6 +118,7 @@ class HyNomasPipeline(nn.Module, SupportsComponentDiscovery):
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = ""):
         super().__init__()
         validate_config(od_config)
+        self.initialize_ar(od_config.custom_pipeline_args or {})
         self.device = get_local_device()
         if self.device.type != "cuda":
             raise ValueError("Hy-Nomas requires CUDA.")
@@ -203,9 +214,13 @@ class HyNomasPipeline(nn.Module, SupportsComponentDiscovery):
 
     @torch.no_grad()
     def forward(self, req: DiffusionRequestBatch) -> DiffusionOutput:
+        if self._ar_state is not None:
+            return self.forward_ar(req)
         if req.num_reqs != 1:
             raise ValueError("Hy-Nomas processes one request at a time.")
         request = normalize_request(req.prompts[0], req.sampling_params)
+        if req.sampling_params.extra_args.keys() & {"session_id", "ar_diffusion_tick", "reset", "close_session"}:
+            raise OmniClientError("Hy-Nomas session requests require the ARDiffusionEngine backend.")
         if self.sp_size > 1:
             tokens_per_frame = (request.height // self.pipe.s_ratio // self.pipe.patch_size[1]) * (
                 request.width // self.pipe.s_ratio // self.pipe.patch_size[2]

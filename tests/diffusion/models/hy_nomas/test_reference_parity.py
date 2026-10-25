@@ -2,10 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import os
+from copy import deepcopy
 from pathlib import Path
 
+import numpy as np
 import pytest
 import torch
+from omegaconf import OmegaConf
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from vllm.utils.torch_utils import set_default_torch_dtype
 
@@ -17,6 +20,10 @@ from vllm_omni.diffusion.models.hy_nomas.configuration_hy_nomas import DECODER_F
 from vllm_omni.diffusion.models.hy_nomas.pipeline_hy_nomas import HyNomasPipeline
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+from vllm_omni.experimental.ar_diffusion.kv_cache.config import ARDiffusionKVConfig
+from vllm_omni.experimental.ar_diffusion.kv_cache.manager import ARDiffusionKVCache
+from vllm_omni.experimental.ar_diffusion.kv_cache.state import ARDiffusionKVState
+from vllm_omni.experimental.ar_diffusion.tick_protocol import ARDiffusionTickRequest
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 
@@ -138,6 +145,126 @@ def test_reference_decoded_video(pipelines, scenario, offload):
         assert torch.isfinite(actual).all()
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     finally:
+        if offload:
+            candidate.disable_omni_model_cpu_offload()
+            candidate.to(device)
+
+
+@pytest.mark.parametrize("offload", [False, True], ids=["resident", "cpu_offload"])
+@torch.no_grad()
+def test_ar_continuation_latents_match_reference(pipelines, monkeypatch, offload):
+    reference, candidate, device = pipelines
+    config = deepcopy(reference.args)
+    OmegaConf.set_struct(config, False)
+    config.inference.rollout_type = "chunk_ar"
+    config.inference_chunk_size = 16
+    config.inference.interactive_noise_max_seconds = 32 / 6
+    config.inference.interactive_noise_hard_max_seconds = 32 / 6
+    monkeypatch.setattr(reference, "args", config)
+    reference.kv_cache = None
+    candidate.initialize_ar({"ar_height": 384, "ar_width": 640, "ar_max_latent_frames": 32, "ar_max_segments": 4})
+    spec = candidate.ar_diffusion_kv_cache_spec()
+    cache = ARDiffusionKVCache(
+        ARDiffusionKVConfig(enable=True),
+        num_layers=spec.num_layers,
+        num_kv_heads=spec.num_kv_heads,
+        head_size=spec.head_size,
+        dtype=torch.bfloat16,
+        block_size=spec.segmented.block_size,
+        max_model_len=spec.segmented.initial_staging_tokens,
+        available_bytes=16 * 1024**3,
+        kv_branches=spec.kv_branches,
+        session_capacity=1,
+        device=device,
+        segmented=spec.segmented,
+    )
+    owner = ARDiffusionKVState(
+        cache, "ar-parity", {"cond": cache.begin_request("ar-parity")}, num_layers=spec.num_layers
+    )
+    expected_latents, actual_latents = [], []
+    reference_decode, candidate_decode = reference._decode_latents, candidate.post_decode
+
+    def record_reference(latents, num_frames):
+        expected_latents.append(latents.detach().cpu().clone())
+        return reference_decode(latents, num_frames)
+
+    def record_candidate(state, **kwargs):
+        actual_latents.append(state.latents.detach().cpu().clone())
+        return candidate_decode(state, **kwargs)
+
+    monkeypatch.setattr(reference, "_decode_latents", record_reference)
+    monkeypatch.setattr(candidate, "post_decode", record_candidate)
+    prompts = ["A forest beside a clear river, daylight.", "The camera approaches a wooden bridge beside the river."]
+    outputs = []
+    if offload:
+        candidate.enable_omni_model_cpu_offload(device=device)
+    try:
+        for index, prompt in enumerate(prompts):
+            with sdpa_kernel(
+                [
+                    SDPBackend.CUDNN_ATTENTION,
+                    SDPBackend.FLASH_ATTENTION,
+                    SDPBackend.EFFICIENT_ATTENTION,
+                    SDPBackend.MATH,
+                ]
+            ):
+                reference.inference(
+                    prompts=[prompt],
+                    num_frames=49,
+                    height=384,
+                    width=640,
+                    guidance_scale=1,
+                    num_inference_steps=8,
+                    flow_shift=5,
+                    seed=42,
+                    segment_frame_boundaries=[0, 49],
+                    camera_trajectory="pan_left",
+                    preserve_kv_cache=True,
+                )
+            tick = ARDiffusionTickRequest("ar-parity", f"turn-{index}", index, prompt=prompt, close_session=index == 1)
+            params = OmniDiffusionSamplingParams(
+                num_frames=49,
+                height=384,
+                width=640,
+                num_inference_steps=8,
+                guidance_scale=1,
+                seed=42,
+                extra_args={**tick.to_extra_args(), "camera_trajectory": "pan_left"},
+            )
+            with candidate.bind_ar_diffusion_state("ar-parity", owner):
+                output = candidate(
+                    DiffusionRequestBatch(
+                        [OmniDiffusionRequest(prompt=prompt, sampling_params=params, request_id=tick.request_id)]
+                    )
+                )
+            outputs.append(output.output["payload"]["video"])
+            torch.testing.assert_close(actual_latents[-1], expected_latents[-1], rtol=0, atol=0)
+        assert len(outputs[0]) > 0
+        assert sum(len(video) for video in outputs) == 98
+        assert output.output["metadata"]["hy_nomas"]["withheld_frames"] == 0
+        reference_stream = reference.vae.create_streaming_decode_session(to_cpu=True, retain_history=False)
+        expected_pixels = []
+        with sdpa_kernel(
+            [SDPBackend.CUDNN_ATTENTION, SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]
+        ):
+            for index, latents in enumerate(expected_latents):
+                reference_stream.final_segment = index + 1 == len(expected_latents)
+                pixels = reference_stream.push(
+                    reference._prepare_vae_decode_latents(latents.to(device)), pixel_frames=49
+                )
+                if pixels.numel():
+                    expected_pixels.append(pixels)
+            tail = reference_stream.finish()
+            if tail.numel():
+                expected_pixels.append(tail)
+        expected = reference._postprocess_vae_video(torch.cat(expected_pixels, 2))
+        expected = expected[0].permute(1, 2, 3, 0).float().mul(255).round().to(torch.uint8).numpy()
+        np.testing.assert_array_equal(np.concatenate(outputs), expected)
+    finally:
+        owner.close()
+        candidate.close_ar_diffusion_session("ar-parity")
+        reference.kv_cache = None
+        reference._reset_interactive_noise_state()
         if offload:
             candidate.disable_omni_model_cpu_offload()
             candidate.to(device)

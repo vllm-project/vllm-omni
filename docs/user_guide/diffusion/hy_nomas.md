@@ -154,9 +154,11 @@ vllm serve ./Hy-Nomas-weights --omni --enforce-eager \
 ```
 
 The compatibility option `--enable-cpu-offload` stages the DiT, text encoder, and
-PixelUMM decoder. The DiT stays on the device for the complete camera-projection,
-denoising, and KV-write phase. Text encoding and VAE decoding use their own component
-contexts, including cleanup after exceptions. Explicit component selection covers
+PixelUMM decoder. Ordinary request inference keeps the DiT on the device for the
+complete camera-projection, denoising, and KV-write phase. AR step execution obtains
+a residency context for each DiT call, so module offload adds weight transfers per
+step. Text encoding and VAE decoding use their own component contexts, including
+cleanup after exceptions. Explicit component selection covers
 only the named DiT/text encoder and leaves the VAE resident, as defined by the
 shared offload API.
 
@@ -166,6 +168,92 @@ memory for all components during loading. Module CPU offload can be combined wit
 Ulysses SP; each rank stages its own component copies. Layerwise and distributed
 layerwise offload are not supported.
 
+## Streaming and live interaction
+
+Use the AR-Diffusion deployment to stream video through `/v1/realtime/video`:
+
+```bash
+vllm serve ./Hy-Nomas-weights --omni --port 8098 \
+  --deploy-config vllm_omni/deploy/hy_nomas_ar.yaml
+```
+
+The deployment uses two GPUs with Ulysses SP. Each chunk contains up to 16 latent
+frames. `denoise_step` performs one DiT forward, and `step_scheduler` performs one
+reference Euler update. At the chunk boundary, the adapter recomputes KV using the
+reference cache-noise setting and commits every layer atomically into AR-Diffusion's
+paged storage. Text is cached once per prompt segment; a live prompt update starts
+a new segment at the next boundary.
+
+PixelUMM emits only stable frames through `push()`. Its overlapping temporal windows
+retain a tail between chunks, so the number of output frames can vary and short
+chunks can emit no frames. Completing the request calls `finish()` and emits the
+remaining tail. Frames already sent are never replaced. Stopping or disconnecting
+cancels the request and releases its session, including any withheld tail.
+
+The existing client supports prompt and camera updates:
+
+```bash
+python examples/online_serving/streaming_video_generation/streaming_video_client.py \
+  --model ./Hy-Nomas-weights --port 8098 --no-helios-distilled-preset \
+  --prompt 'A forest beside a river.' --height 704 --width 1280 \
+  --num-frames 241 --num-inference-steps 8 --guidance-scale 1 --fps 24 --seed 42 \
+  --prompt-updates '[{"at":2,"prompt":"The camera approaches a wooden bridge.","transition_chunks":0}]' \
+  --camera-updates '[{"at":3,"camera":{"camera_trajectory":"pan_left"},"transition_chunks":0}]' \
+  --output /path/to/results/hy_nomas_stream.mp4
+```
+
+Hy-Nomas applies discrete updates with `transition_chunks=0` (or omitted when
+sending protocol messages directly). A camera update uses
+`event.multi_modal_data.camera={"camera_trajectory":"pan_left"}`; a null
+`camera_trajectory` disables camera control. The payload accepts the same reference
+generator names and trajectory files as offline generation. A composite prompt and
+camera update is validated before either part is queued. Chunk metadata acknowledges
+applied and coalesced event IDs.
+
+The deployment reserves history for up to 120 latent frames (approximately 20 seconds),
+16 prompt segments, and one active session. Configure `ar_height`, `ar_width`,
+`ar_chunk_latent_frames`, `ar_max_latent_frames`, `ar_max_segments`, and
+`ar_session_capacity` under `custom_pipeline_args`. Requests must fit the deployed
+spatial limits. Capacity exhaustion returns an error; it does not silently discard
+history. Increasing these limits increases the required memory. The fixed noise
+timeline uses `ar_max_latent_frames`, so keep it fixed when comparing seeds.
+
+## Multi-turn continuation
+
+Persistent turns use the AR-Diffusion tick protocol with `step_execution=false`.
+Every tick supplies a `session_id`, consecutive `chunk_index` starting at zero,
+and its prompt/control snapshot. The worker retains KV, the noise generator and
+PixelUMM decoder across turns. Height, width and seed remain fixed until reset.
+Each tick must fit one chunk; the default 16-latent limit accepts up to 61 frames.
+
+Run the session example with two successive prompts:
+
+```bash
+python examples/offline_inference/diffusion/hy_nomas_session.py \
+  --model ./Hy-Nomas-weights --ulysses-degree 2 \
+  --prompts 'A forest beside a river.' 'The camera approaches a wooden bridge.' \
+  --height 704 --width 1280 --num-frames 49 --num-inference-steps 8 \
+  --output-dir /path/to/results/hy_nomas_session
+```
+
+The example uses `ARDiffusionOmniTickConsumer` and writes each newly stable chunk,
+the complete video, and frame/identity metadata. Its final tick sets
+`close_session=true`, which flushes the decoder before the runner releases the
+session. `reset=true` starts a fresh timeline for the same ID. Explicit lifecycle
+close, cancellation, failed forwards and runner eviction discard model state and
+release KV pages. The streaming request API owns one active request; persistent
+tick sessions use their separate IDs and lifecycle calls.
+
+For typed camera controls, use `track="camera"`, `schema="hy_nomas.camera.v1"`, and
+`data={"camera_trajectory":"pan_left"}`. Prompt snapshots use the tick's `prompt`
+field. The returned `metadata.ar_diffusion` preserves tick identity and applied
+event IDs. A turn can include frames withheld from the previous turn; concatenate
+the returned chunks in order, using `metadata.hy_nomas.frame_start`.
+
+AR mode uses the reference chunk-AR schedule. The ordinary request path continues
+to use the reference segment-AR schedule; comparisons must use matching chunk
+boundaries, noise capacity, prompts, camera inputs, sampling steps and precision.
+
 ## Scope and validation
 
 - CUDA, BF16 distilled DiT, BF16 PixelUMM, one output per request.
@@ -174,8 +262,8 @@ layerwise offload are not supported.
 - 24 fps, dimensions divisible by 32, and `num_frames=4*n+1` with `n >= 1`.
   The reference's 720-pixel height is reduced to 704 by its 32-pixel latent grid;
   this API requires the actual output height explicitly and defaults to 704.
-- KV history is shared between segments within one request and released on success
-  or failure. Requests do not share an interactive session.
+- Ordinary requests release their reference KV history after completion. AR-Diffusion
+  owns persistent KV and session cleanup for streaming and continuation.
 - Generic startup warmup is disabled because its two-step, CFG-zero request is
   outside the distilled model's sampling contract. The first real request includes
   reference-kernel compilation.
@@ -183,8 +271,7 @@ layerwise offload are not supported.
   generic regional compilation reports that the reference cached forward method
   is unsupported and keeps the reference execution path; FlexAttention kernels
   retain their own compilation.
-- Quantization, LoRA, Cache-DiT, latent output,
-  input images, and incremental streaming are not supported by this adapter.
+- Quantization, LoRA, Cache-DiT, latent output, and input images are unsupported.
 
 CPU contract tests run in the existing L1 diffusion-model job. GPU tests require
 the external reference runtime and are selected explicitly with `local_model`:
@@ -193,6 +280,8 @@ the external reference runtime and are selected explicitly with `local_model`:
 pytest tests/diffusion/models/hy_nomas/test_hy_nomas.py -m 'core_model and cpu' --run-level core_model
 pytest tests/diffusion/models/hy_nomas/test_reference_config.py -m 'local_model and cpu' --run-level core_model
 pytest tests/diffusion/models/hy_nomas/test_reference_parallel.py -m 'local_model and cpu' --run-level core_model
+pytest tests/diffusion/models/hy_nomas/test_ar.py -m 'core_model and cpu' --run-level core_model
+pytest tests/diffusion/models/hy_nomas/test_reference_streaming.py -m 'local_model and cpu' --run-level core_model
 pytest tests/diffusion/models/hy_nomas/test_reference_parity.py -m 'local_model and cuda' --run-level core_model
 pytest tests/e2e/offline_inference/test_hy_nomas.py tests/e2e/online_serving/test_hy_nomas.py \
   -m 'local_model and cuda' --run-level core_model
@@ -211,3 +300,9 @@ local checkpoint directories. The 256×256, nine-frame cases check execution,
 requires identical seeds, structured segment prompts, dimensions, frame boundaries,
 sampling parameters, and camera trajectories in reference and Omni runs, including
 a longer multi-segment sequence.
+
+The AR CPU tests exercise the real KV allocator, state binding, failure cleanup,
+interactions and batch metadata with substituted learned model components. The
+reference streaming CPU tests exercise PixelUMM's actual window bookkeeping with
+a substituted window predictor. Neither validates learned video quality or GPU
+collectives; streaming and continuation require separate real-model acceptance.
