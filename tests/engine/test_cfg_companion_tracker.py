@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import pytest
 
 from vllm_omni.engine.cfg_companion_tracker import CfgCompanionTracker
@@ -67,3 +70,33 @@ def test_companion_completion_without_registered_parent_asserts():
 
     with pytest.raises(AssertionError, match="completed before parent req1 was registered"):
         tracker.on_companion_completed("req1__cfg_text")
+
+
+def test_redefer_preserves_original_deadline_and_updates_output():
+    tracker = CfgCompanionTracker(clock=lambda: 100.0)
+    tracker.register_companion("req1", "negative", "req1-negative")
+
+    tracker.defer_parent("req1", {"attempt": 1}, stage_id=0)
+    tracker.defer_parent("req1", {"attempt": 2}, stage_id=1)
+
+    assert tracker.pop_expired_parents(10.0, now=109.999) == []
+    expired = tracker.pop_expired_parents(10.0, now=110.0)
+    assert expired == [
+        (
+            "req1",
+            {
+                "engine_outputs": {"attempt": 2},
+                "stage_id": 1,
+                "deferred_at": 100.0,
+            },
+        )
+    ]
+    assert tracker.pop_expired_parents(10.0, now=120.0) == []
+
+
+@pytest.mark.parametrize("timeout", [0.0, float("nan"), float("inf")])
+def test_pop_expired_parents_rejects_non_positive_or_non_finite_timeout(timeout: float):
+    tracker = CfgCompanionTracker()
+
+    with pytest.raises(ValueError, match="timeout_s must be finite and > 0"):
+        tracker.pop_expired_parents(timeout)
