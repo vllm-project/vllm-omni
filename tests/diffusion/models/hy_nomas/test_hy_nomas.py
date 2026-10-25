@@ -15,7 +15,7 @@ from safetensors.torch import save_file
 from torch import nn
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
-from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig
+from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig, resolve_model_class_name
 from vllm_omni.diffusion.media import VideoValueRange
 from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
 from vllm_omni.diffusion.models.hy_nomas import pipeline_hy_nomas
@@ -23,7 +23,11 @@ from vllm_omni.diffusion.models.hy_nomas.configuration_hy_nomas import DIT_FILE,
 from vllm_omni.diffusion.models.hy_nomas.pipeline_hy_nomas import HyNomasPipeline, validate_config
 from vllm_omni.diffusion.models.hy_nomas.request import normalize_request
 from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.diffusion.utils.hf_utils import is_diffusion_model, resolve_native_diffusion_model_class
+from vllm_omni.diffusion.utils.hf_utils import (
+    _looks_like_hy_nomas,
+    is_diffusion_model,
+    resolve_native_diffusion_model_class,
+)
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.errors import OmniClientError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -33,10 +37,13 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
 
 def test_discovery_without_model_index(tmp_path):
+    assert _looks_like_hy_nomas("tencent/Hy-Nomas")
+    assert _looks_like_hy_nomas(" TENCENT/Hy-Nomas/ ")
     assert resolve_native_diffusion_model_class("tencent/Hy-Nomas") == "HyNomasPipeline"
     assert is_diffusion_model("tencent/Hy-Nomas")
     assert resolve_native_diffusion_model_class(str(tmp_path)) is None
     for relative in REQUIRED_FILES:
+        assert not _looks_like_hy_nomas(str(tmp_path))
         path = tmp_path / relative
         path.parent.mkdir(parents=True, exist_ok=True)
         path.touch()
@@ -61,7 +68,7 @@ def test_native_discovery_does_not_import_runtime_registry():
 
 
 @pytest.mark.parametrize("modelscope", ["false", "true"])
-def test_native_configuration_does_not_probe_remote_root_configs(monkeypatch, modelscope):
+def test_hy_nomas_class_resolution_does_not_probe_remote_root_configs(monkeypatch, modelscope):
     from vllm import envs
 
     envs.disable_envs_cache()
@@ -70,10 +77,21 @@ def test_native_configuration_does_not_probe_remote_root_configs(monkeypatch, mo
     probe = Mock(side_effect=AssertionError("Native checkpoint discovery must not fetch root configs"))
     monkeypatch.setattr("vllm_omni.diffusion.utils.hf_utils.get_diffusion_model_index", probe)
     monkeypatch.setattr("vllm.transformers_utils.config.get_hf_file_to_dict", probe)
-    config = OmniDiffusionConfig(model="tencent/Hy-Nomas")
+    assert resolve_model_class_name("tencent/Hy-Nomas") == "HyNomasPipeline"
+    probe.assert_not_called()
+
+
+def test_local_hy_nomas_configuration_uses_existing_native_resolution(tmp_path, monkeypatch):
+    for relative in REQUIRED_FILES:
+        path = tmp_path / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.touch()
+    hub_api = Mock(side_effect=AssertionError("Local checkpoint configuration must not create a Hub client"))
+    monkeypatch.setattr("vllm.transformers_utils.repo_utils.hf_api", hub_api)
+    config = OmniDiffusionConfig(model=str(tmp_path))
     config.enrich_config()
     assert config.model_class_name == "HyNomasPipeline"
-    probe.assert_not_called()
+    hub_api.assert_not_called()
 
 
 def test_local_pipeline_index_keeps_precedence_over_native_signature(tmp_path):
@@ -84,6 +102,8 @@ def test_local_pipeline_index_keeps_precedence_over_native_signature(tmp_path):
     (tmp_path / "model_index.json").write_text(
         json.dumps({"_class_name": "QwenImagePipeline", "_diffusers_version": "0.40.0"})
     )
+    assert not _looks_like_hy_nomas(str(tmp_path))
+    assert resolve_model_class_name(str(tmp_path)) == "QwenImagePipeline"
     config = OmniDiffusionConfig(model=str(tmp_path))
     config.enrich_config()
     assert config.model_class_name == "QwenImagePipeline"

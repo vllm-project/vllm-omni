@@ -5,5 +5,4 @@ MODEL_ID = "tencent/Hy-Nomas"
 DIT_FILE = "DiT/distilled/diffusion_pytorch_model_ema_0_995.safetensors"
 DECODER_FILE = "VAE/PixelUMM_FT/diffusion_pytorch_model.safetensors"
 REQUIRED_FILES = (DIT_FILE, DECODER_FILE)
-DEFER_DOWNLOAD = True
 TEXT_ENCODER_ID = "Qwen/Qwen2.5-VL-7B-Instruct"

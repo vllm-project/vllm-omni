@@ -36,11 +36,24 @@ is scoped to inference inside the isolated worker to preserve the reference poli
 
 ## Checkpoints
 
-`tencent/Hy-Nomas` is recognized without a generated `model_index.json`. Only these
-two checkpoint files are requested by the pipeline:
+`tencent/Hy-Nomas` and a local checkpoint directory are recognized without a generated
+`model_index.json`. The pipeline requires these two checkpoint files:
 
 - `DiT/distilled/diffusion_pytorch_model_ema_0_995.safetensors`
 - `VAE/PixelUMM_FT/diffusion_pytorch_model.safetensors`
+
+Download these files into a local directory before using the shared entrypoints:
+
+```bash
+hf download tencent/Hy-Nomas \
+  DiT/distilled/diffusion_pytorch_model_ema_0_995.safetensors \
+  VAE/PixelUMM_FT/diffusion_pytorch_model.safetensors \
+  --local-dir ./Hy-Nomas-weights
+```
+
+Passing a Hub ID directly to `Omni` or `vllm serve` follows the standard snapshot
+download behavior and can fetch other checkpoint variants. Using the prepared local
+directory limits the download to the inference files above.
 
 The DiT checkpoint must contain every required parameter, including camera weights.
 
@@ -55,7 +68,7 @@ Run the shared text-to-video example from the vLLM-Omni repository:
 
 ```bash
 python examples/offline_inference/text_to_video/text_to_video.py \
-  --model tencent/Hy-Nomas --enforce-eager \
+  --model ./Hy-Nomas-weights --enforce-eager \
   --prompt 'A forest beside a river. ||| The camera moves along the river.' \
   --height 704 --width 1280 --num-frames 121 --num-inference-steps 8 \
   --guidance-scale 1 --fps 24 --seed 42 \
@@ -82,7 +95,7 @@ worker. `segment_has_camera`, when specified, contains one boolean per segment.
 Start the server:
 
 ```bash
-vllm serve tencent/Hy-Nomas --omni --enforce-eager --port 8098
+vllm serve ./Hy-Nomas-weights --omni --enforce-eager --port 8098
 ```
 
 In another terminal, submit a video job:
@@ -100,11 +113,13 @@ Multi-segment and camera parameters use the endpoint's JSON `extra_params` form 
 for example `-F 'extra_params={"segment_frame_boundaries":[0,60,121],"camera_trajectory":"pan_left","segment_has_camera":[true,true]}'`
 with a two-segment prompt and 121 frames.
 
-The standard `seconds` field is also supported: `-F 'seconds=4'` resolves to 97
-frames at 24 fps, including the initial frame. Offline callers can pass
-`--extra-body '{"duration":4}'`. An explicit `num_frames` must agree with the
-duration; fractional durations must span a positive multiple of four frame
-intervals. `generate_sound=false` is accepted; audio generation is unsupported.
+Specify the frame count with `num_frames`, or omit it and pass
+`-F 'extra_params={"duration":4}'` to request 97 frames at 24 fps, including the
+initial frame. Offline callers can pass `--extra-body '{"duration":4}'`.
+An explicit `num_frames` must agree with `duration`; fractional durations must
+span a positive multiple of four frame intervals. Use these model parameters
+instead of the top-level `seconds` field to select the clip length.
+`generate_sound=false` is accepted; audio generation is unsupported.
 
 ## Sequence parallelism
 
@@ -112,7 +127,7 @@ Use two CUDA devices with the shared offline example's `--ulysses-degree 2`,
 or start a two-device server:
 
 ```bash
-vllm serve tencent/Hy-Nomas --omni --enforce-eager --ulysses-degree 2
+vllm serve ./Hy-Nomas-weights --omni --enforce-eager --ulysses-degree 2
 ```
 
 For the Python API, pass `parallel_config={"ulysses_degree": 2}` to `Omni`.
@@ -134,7 +149,7 @@ been measured.
 Use the public module-offload configuration to select DiT and text encoder weights:
 
 ```bash
-vllm serve tencent/Hy-Nomas --omni --enforce-eager \
+vllm serve ./Hy-Nomas-weights --omni --enforce-eager \
   --diffusion-offload-config '{"mode":"module","components":["dit","text_encoder"]}'
 ```
 
