@@ -795,6 +795,9 @@ class OrchestratorArgs:
     diffusion_attention_schedule: dict[str, Any] | None = None
     diffusion_compile_granularity: str | None = None
     diffusion_compile_dynamic: bool | None = None
+    # A registered torch.compile backend name for the diffusion transformers;
+    # None lets the platform choose (inductor, or an out-of-tree platform's own).
+    diffusion_compile_backend: str | None = None
     # CUDA graph capture of fixed-shape KV-cache decode steps (Qwen-Image-2.1
     # today). None defers to the OmniDiffusionConfig default (enabled);
     # --enforce-eager also disables it.

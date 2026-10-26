@@ -29,6 +29,12 @@ still contain graph breaks; it does not force one graph. It is rejected when
 HSDP, sequence parallelism, CPU offload, or layerwise offload is enabled. Use
 regional scope with those features.
 
+The backend is the platform's choice (inductor on GPU platforms; an out-of-tree
+platform may compile the transformers with its own backend, see
+`OmniPlatform.get_torch_compile_kwargs`). `--diffusion-compile-backend <name>` or
+`diffusion_compile_backend: <name>` in the deploy configuration names a registered
+`torch.compile` backend explicitly and takes precedence.
+
 These settings control the generic model-runner compilation path. Pipelines
 that provide their own `setup_compile()` implementation manage their compilation
 policy independently. Compilation is lazy, so backend or graph errors can first
