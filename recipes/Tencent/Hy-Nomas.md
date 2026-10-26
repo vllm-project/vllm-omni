@@ -6,7 +6,7 @@
 - Model: [`tencent/Hy-Nomas-Diffusers`](https://huggingface.co/tencent/Hy-Nomas-Diffusers), BF16 distilled checkpoint
 - Task: text-to-video with segment prompts and optional camera control
 - Modes: offline generation, `/v1/videos`, realtime streaming, and multi-turn continuation
-- Target hardware: one or two NVIDIA H200 GPUs, 141 GB per device
+- Hardware: one or two NVIDIA H200 GPUs, 141 GB per device
 - Runtime: `HyNomasPipeline`, BF16, with the pinned Hy-Nomas reference package
 - Maintainer: vLLM-Omni community
 
@@ -58,20 +58,22 @@ instead of the video endpoint's top-level `seconds` field.
 | Realtime streaming | 2 H200 | `hy_nomas_ar.yaml`, Ulysses degree 2 | Prompt/camera updates, cancellation, and a subsequent request |
 | Multi-turn continuation | 2 H200 | Session example, Ulysses degree 2 | Successive turns with a final decoder flush |
 
-GPU qualification of the converted checkpoint is pending. The prior native
-checkpoint's GPU results do not qualify this checkpoint migration.
+The converted checkpoint was qualified on one and two H200s at vLLM-Omni commit
+`81620d2d69dc661d694fdc66ae737be0c7d8993d`. See [Verification](#verification)
+for the tested workloads.
 
 Weights, text encoding, and PixelUMM decoding remain replicated with sequence
 parallelism. The degree must divide the DiT's 16 attention heads and the spatial
-token count per latent frame. The supplied profiles target degrees one and two.
-Device interconnect, peak memory, and host memory are not qualified for this conversion.
+token count per latent frame. Real-model validation covers degrees one and two.
+Device interconnect, peak memory, and host memory were not measured in these checks.
 CPU offload requires sufficient GPU memory for initial component loading and host
 memory for the staged weights.
 
 ## Software and checkpoints
 
-The development environment uses Linux, Python 3.12.13, PyTorch 2.13.0+cu130, CUDA 13.0,
+Validation used Linux, Python 3.12.13, PyTorch 2.13.0+cu130, CUDA 13.0,
 vLLM 0.32.0, Transformers 5.16.1, Diffusers 0.40.0, and FlashAttention 2.8.3.
+The NVIDIA driver was 570.133.20.
 
 Install vLLM-Omni first, then install the pinned reference checkout without
 replacing the environment's existing dependency versions:
@@ -250,11 +252,26 @@ and four steps. Verify that the output has nine frames at 24 fps. This checks
 execution; it does not establish video quality or performance.
 
 CPU coverage checks modular discovery, sharded component loading, parameter-name
-mapping, component initialization, and AR state handling. The GPU accuracy tests
-compare the converted checkpoint against the independent original checkpoint,
-including resident/offload generation and two-turn continuation. Offline and
-video API tests cover one and two H200s. These GPU checks have not yet run for
-the converted checkpoint; generation quality and performance remain unqualified.
+mapping, component initialization, and AR state handling. All 18 GPU cases passed
+with the converted checkpoint:
+
+- Six reference comparisons cover text, multiple prompt segments, and camera
+  control in resident and CPU-offload modes. Complete decoded videos match the
+  independent original checkpoint exactly at 384×640, 49 frames, eight steps,
+  BF16, and seed 42 (`rtol=0`, `atol=0`).
+- Two continuation comparisons cover resident and CPU-offload modes. Per-turn
+  latents and the complete 98-frame output match the reference exactly across
+  two 49-frame turns with a prompt change and camera control.
+- Ten offline and video API cases cover single-device and Ulysses degree-two
+  generation, including CPU offload, segment/camera inputs, and duration requests.
+
+On two H200s at 1280×704 and 24 fps, the session example produced 147 frames
+across three turns, emitted as stable chunks of 12, 49, and 86 frames. Closing
+the session flushed all withheld frames. Realtime acceptance completed a
+477-frame request with prompt/camera updates, stopped a separate request after
+23 decoded frames, and completed another 477-frame request on the same service.
+Update acknowledgements, stop status, transport order, and decoded frame counts
+were checked. These checks do not establish latency or throughput performance.
 
 ## References
 

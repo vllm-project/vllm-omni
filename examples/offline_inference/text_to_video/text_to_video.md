@@ -12,7 +12,7 @@ A unified script for text-to-video generation. Supports multiple models with mod
 | `Lightricks/LTX-2` | 512x768 | 121 | 40 | video 3.0 / audio 7.0 | Model-dependent |
 | `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_t2v` | 480x832 | 121 | 50 | 6.0 | 1×A100 80GB |
 | `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-720p_t2v` | 720x1280 | 121 | 50 | 6.0 | FP8 + VAE tiling required |
-| `tencent/Hy-Nomas-Diffusers` | 704x1280 | 121 | 8 | 1.0 | 1× or 2×H200 target; GPU qualification pending |
+| `tencent/Hy-Nomas-Diffusers` | 704x1280 | 121 | 8 | 1.0 | 1× or 2×H200 qualified |
 | `nvidia/Cosmos3-Nano` | 720x1280 | 189 | 35 | 6.0 | ~46 GiB (peak, 720p) |
 | `BestWishYsh/Helios-Base` / `Helios-Mid` / `Helios-Distilled` | 384x640 | 99 | 50 | 5.0 / 5.0 / 1.0 | — |
 | `kandinskylab/Kandinsky-6.0-Pro-5s-Diffusers` | 480x864 | 125 | 50 | 5.0 | ~75 GiB reserved (H100, CPU offload, SDPA) |
