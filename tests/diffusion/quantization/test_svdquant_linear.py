@@ -34,6 +34,15 @@ class _FakeNvfp4Kernel:
         return torch.mm(x, self.base_weight)
 
 
+class _FakeMarlinBiasKernel(_FakeNvfp4Kernel):
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        super().process_weights_after_loading(layer)
+        bias = getattr(layer, "bias", None)
+        if bias is not None:
+            padded = torch.nn.functional.pad(bias.detach(), (0, 1))
+            layer.bias = torch.nn.Parameter(padded.flip(0).contiguous(), requires_grad=False)
+
+
 def _register_parameter(
     layer: torch.nn.Module,
     name: str,
@@ -185,6 +194,37 @@ def test_mxfp4_compatibility_path_applies_rank_correction(
     expected = expected + bias
     torch.testing.assert_close(actual, expected)
     torch.testing.assert_close(kernel.last_input, smoothed)
+
+
+def test_mxfp4_preserves_logical_bias_when_kernel_repacks_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base_weight = torch.tensor(
+        [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]],
+        dtype=torch.bfloat16,
+    )
+    kernel = _FakeMarlinBiasKernel(base_weight)
+    monkeypatch.setattr(svdquant, "_assert_supported", lambda precision: None)
+    monkeypatch.setattr(svdquant, "_mxfp4_kernel", lambda: kernel)
+    method = svdquant.DiffusionSVDQuantLinearMethod(svdquant.DiffusionSVDQuantConfig(precision="mxfp4"))
+
+    layer = torch.nn.Module()
+    _register_parameter(layer, "qweight", torch.zeros((3, 1), dtype=torch.int8))
+    _register_parameter(layer, "wscales", torch.zeros((2, 3), dtype=torch.uint8))
+    _register_parameter(layer, "bias", torch.tensor([1.0, 2.0, 3.0], dtype=torch.bfloat16))
+    layer.smooth_factor = torch.ones(2, dtype=torch.bfloat16)
+    layer.proj_down = torch.zeros((2, 1), dtype=torch.bfloat16)
+    layer.proj_up = torch.zeros((3, 1), dtype=torch.bfloat16)
+    layer.output_size_per_partition = 3
+
+    method.process_weights_after_loading(layer)
+    assert layer.bias.shape == (4,)
+
+    x = torch.tensor([[2.0, 4.0]], dtype=torch.bfloat16)
+    actual = method.apply(layer, x, layer.bias)
+    expected = torch.mm(x, base_weight) + torch.tensor([1.0, 2.0, 3.0], dtype=torch.bfloat16)
+
+    torch.testing.assert_close(actual, expected)
 
 
 def test_compatibility_path_applies_qkv_scale_and_rank_correction(

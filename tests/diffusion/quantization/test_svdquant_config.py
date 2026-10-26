@@ -116,6 +116,8 @@ def test_linear_method_creates_canonical_partitioned_weights(
     assert layer.wcscales.shape == (128,)
     assert layer.wtscale.shape == (1,)
 
+    assert layer.input_size_per_partition == 128
+    assert layer.output_size_per_partition == 128
     assert layer.qweight.input_dim == 1
     assert layer.qweight.output_dim == 0
     assert layer.wscales.input_dim == 0
@@ -150,6 +152,8 @@ def test_linear_method_creates_mxfp4_block32_weights_without_global_scales(
     assert layer.smooth_factor.shape == (128,)
     assert not hasattr(layer, "wcscales")
     assert not hasattr(layer, "wtscale")
+    assert layer.input_size_per_partition == 128
+    assert layer.output_size_per_partition == 128
 
 
 def test_linear_method_rejects_misaligned_input_partition(

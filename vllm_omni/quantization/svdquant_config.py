@@ -326,6 +326,7 @@ class DiffusionSVDQuantLinearMethod(LinearMethodBase):
             layer.register_parameter("wtscale", wtscale)
 
         del input_size, output_size
+        layer.input_size_per_partition = input_size_per_partition
         layer.output_size_per_partition = output_size_per_partition
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
@@ -351,6 +352,11 @@ class DiffusionSVDQuantLinearMethod(LinearMethodBase):
         )
 
         if precision == "mxfp4":
+            # Marlin replaces layer.bias with a padded and permuted Parameter.
+            # Keep the logical bias for the post-GEMM add in apply().
+            bias = getattr(layer, "bias", None)
+            if bias is not None:
+                layer._svdquant_bias = bias.detach().clone()
             kernel = _mxfp4_kernel()
             kernel.process_weights_after_loading(layer)
             logger.info_once(
@@ -428,8 +434,9 @@ class DiffusionSVDQuantLinearMethod(LinearMethodBase):
             correction_input,
             layer.proj_up.transpose(0, 1),
         )
-        if bias is not None:
-            out.add_(bias)
+        bias_to_add = getattr(layer, "_svdquant_bias", bias) if bias is not None else None
+        if bias_to_add is not None:
+            out.add_(bias_to_add)
         return out.reshape(
             *original_shape[:-1],
             layer.output_size_per_partition,
