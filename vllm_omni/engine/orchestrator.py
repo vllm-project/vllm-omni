@@ -1581,23 +1581,29 @@ class OrchestratorBase:
                 release_owners=True,
             )
 
-    async def _fail_request_dead_stage(self, req_id: str, stage_id: int) -> None:
-        """Fail one request whose target stage has no live replica (#4285).
+    async def _fail_request_dead_stage(self, req_id: str, stage_id: int, reason: str | None = None) -> None:
+        """Fail one request whose target stage cannot accept it (#4285).
 
-        Used at dispatch sites so a fully dead stage fails just that request
+        Used at dispatch sites so an unusable stage fails just that request
         instead of raising out of the request/orchestration task and tearing
-        down the server. The cleanup releases the running counter, PD/CFG state,
-        and bindings across every stage pool; it is a no-op for a request that
-        was never registered.
+        down the server. ``reason`` replaces the default no-live-replica
+        text — the stage failure breaker (#7618) passes its stage-scoped
+        corruption message so clients do not mistake an open breaker for a
+        dead worker. The cleanup releases the running counter, PD/CFG state,
+        and bindings across every stage pool; it is a no-op for a request
+        that was never registered.
         """
+        if reason is None:
+            reason = f"Stage-{stage_id} has no live replica"
         logger.error(
-            "[Orchestrator] req=%s: stage-%d has no live replica; failing the request",
+            "[Orchestrator] req=%s: failing request at stage-%d: %s",
             req_id,
             stage_id,
+            reason,
         )
         await self.output_async_queue.put(
             ErrorMessage(
-                error=f"Stage-{stage_id} has no live replica",
+                error=reason,
                 fatal=True,
                 request_id=req_id,
                 stage_id=stage_id,
@@ -1689,7 +1695,10 @@ class OrchestratorBase:
             return False
         except StageUnavailableError as e:
             # No specific replica to evict: the stage already has no live
-            # replica or the chosen slot was evicted. Fail just this request.
+            # replica, the chosen slot was evicted, or the stage's failure
+            # breaker is open (#7618). Fail just this request, carrying the
+            # raise site's message — an open breaker must surface its
+            # corruption text, not a false no-live-replica signal.
             logger.error(
                 "[Orchestrator] %s dispatch for req=%s hit unavailable stage-%s: %s",
                 operation,
@@ -1697,7 +1706,7 @@ class OrchestratorBase:
                 stage_id,
                 e,
             )
-            await self._fail_request_dead_stage(req_id, stage_id)
+            await self._fail_request_dead_stage(req_id, stage_id, reason=str(e))
             return False
         except EngineDeadError as e:
             # A live replica died mid-submit before the poll loop evicted it.

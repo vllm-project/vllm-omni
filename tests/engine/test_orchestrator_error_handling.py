@@ -471,7 +471,10 @@ async def test_async_chunk_prewarm_failure_reports_failing_downstream_stage(orch
         error_msg = await _wait_for_error_message(orchestrator_fixture, request_id="req-x")
         assert error_msg.fatal is True
         assert error_msg.stage_id == 2
-        assert "Stage-2" in error_msg.error
+        # The dispatch failure propagates the raise site's message (the
+        # unavailable stage client's own text) instead of the generic
+        # no-live-replica replacement.
+        assert "no live replica" in error_msg.error
 
         # Stage 1 prewarm ran before the stage-2 failure; server stays up.
         assert len(stage1.add_request_calls) == 1
@@ -1688,5 +1691,41 @@ async def test_lifecycle_start_does_not_reset_failure_counter(orchestrator_facto
         assert pool.consecutive_stage_failures == 2
         assert pool.is_circuit_open()
         assert "Stage-0" in pool.circuit_breaker_message()
+    finally:
+        await _shutdown_orchestrator(orchestrator_fixture)
+
+
+@pytest.mark.asyncio
+async def test_open_breaker_dispatch_failure_keeps_breaker_message(orchestrator_factory) -> None:
+    """A dispatch rejected by an open breaker fails the request with the
+    breaker's corruption message, not a false no-live-replica signal (#7618)."""
+    orchestrator_fixture = orchestrator_factory([FakeStageClient(stage_type="diffusion", final_output=True)])
+    orchestrator = orchestrator_fixture.orchestrator
+    pool = orchestrator.stage_pools[0]
+    pool.record_stage_failure()
+    pool.record_stage_failure()
+    assert pool.is_circuit_open()
+
+    req_state = OrchestratorRequestState(
+        request_id="req-brk",
+        sampling_params_list=[OmniDiffusionSamplingParams()],
+        final_stage_id=0,
+    )
+
+    async def dispatch() -> None:
+        await pool.submit_initial("req-brk", req_state, request=object(), pinned_replica_id=0)
+
+    try:
+        dispatched = await orchestrator._dispatch_or_fail_request(
+            dispatch,
+            req_id="req-brk",
+            stage_id=0,
+            operation="test",
+        )
+        assert dispatched is False
+
+        message = await _wait_for_error_message(orchestrator_fixture, request_id="req-brk")
+        assert "consecutive" in message.error
+        assert "no live replica" not in message.error
     finally:
         await _shutdown_orchestrator(orchestrator_fixture)
