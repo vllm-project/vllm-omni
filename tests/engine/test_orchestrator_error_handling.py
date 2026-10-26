@@ -1625,3 +1625,68 @@ async def test_stage_success_resets_failure_counter(orchestrator_factory) -> Non
         assert pool.consecutive_stage_failures == 1
     finally:
         await _shutdown_orchestrator(orchestrator_fixture)
+
+
+@pytest.mark.asyncio
+async def test_open_circuit_rejects_stage_submission() -> None:
+    """An open breaker rejects submit_initial/submit_update before the stage
+    client sees the request; a healthy stage keeps accepting (#7618)."""
+    open_pool = StagePool(0, FakeStageClient(stage_type="diffusion", final_output=True))
+    healthy_pool = StagePool(1, FakeStageClient(stage_type="diffusion", final_output=True))
+    open_pool.record_stage_failure()
+    open_pool.record_stage_failure()
+    assert open_pool.is_circuit_open()
+    open_client = open_pool.clients[0]
+    healthy_client = healthy_pool.clients[0]
+
+    req_state = OrchestratorRequestState(
+        request_id="req-blocked",
+        sampling_params_list=[OmniDiffusionSamplingParams(), OmniDiffusionSamplingParams()],
+        final_stage_id=0,
+    )
+    with pytest.raises(StageUnavailableError, match="consecutive"):
+        await open_pool.submit_initial("req-blocked", req_state, request=object(), pinned_replica_id=0)
+    with pytest.raises(StageUnavailableError, match="consecutive"):
+        await open_pool.submit_update("req-blocked", req_state, request=object(), pinned_replica_id=0)
+    assert open_client.add_request_calls == []
+
+    replica_id = await healthy_pool.submit_initial("req-healthy", req_state, request=object(), pinned_replica_id=0)
+    assert replica_id == 0
+    assert len(healthy_client.add_request_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_start_does_not_reset_failure_counter(orchestrator_factory) -> None:
+    """A request-start lifecycle notification must not reset the failure
+    counter; otherwise repeated start→fail requests never trip the
+    breaker (#7618). Replays the production output handler directly, the
+    same way as the review finding's CPU probe."""
+    orchestrator_fixture = orchestrator_factory([FakeStageClient(stage_type="diffusion", final_output=True)])
+    orchestrator = orchestrator_fixture.orchestrator
+    pool = orchestrator.stage_pools[0]
+
+    started = OmniRequestOutput.from_diffusion(
+        request_id="req-lc",
+        images=[],
+        final_output_type="image",
+        finished=False,
+    )
+    error = OmniRequestOutput.from_error("req-lc", "gpu fault")
+
+    try:
+        # First start→fail round: the start notification leaves the counter
+        # untouched; the server-side failure counts.
+        orchestrator.request_states["req-lc"] = OrchestratorRequestState(request_id="req-lc", final_stage_id=0)
+        await orchestrator._handle_processed_outputs(0, 0, [started, error])
+        assert pool.consecutive_stage_failures == 1
+        assert not pool.is_circuit_open()
+
+        # Second start→fail round: with the old reset-on-start behavior the
+        # counter would stay at 1 forever and the breaker would never open.
+        orchestrator.request_states["req-lc"] = OrchestratorRequestState(request_id="req-lc", final_stage_id=0)
+        await orchestrator._handle_processed_outputs(0, 0, [started, error])
+        assert pool.consecutive_stage_failures == 2
+        assert pool.is_circuit_open()
+        assert "Stage-0" in pool.circuit_breaker_message()
+    finally:
+        await _shutdown_orchestrator(orchestrator_fixture)
