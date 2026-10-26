@@ -16,7 +16,6 @@ from vllm_omni.quantization.int8_config import DiffusionInt8Config
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
 
-
 class _StoredInt8Linear(nn.Module):
     """Storage fixture; numerical delegation is covered by adapter tests."""
 
