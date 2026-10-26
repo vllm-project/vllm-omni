@@ -890,6 +890,9 @@ full decoded long video in the API process. It does not reduce the denoiser's
 sequence length. For Turbo adapters, use the matching adapter's step count
 and flow shift from the Turbo table below.
 
+H3 also starts AAC encoding of the decoded audio early, overlapping it with video
+VAE decoding.
+
 The [RunningHub workflow](https://www.runninghub.cn/post/2100530217365364737/)
 uses T8's `MiniMaxH3AudioConditioningT8`, a full-length latent, and
 `MiniMaxH3DualClockSamplerT8`; its `remix_source` strength is zero, equivalent

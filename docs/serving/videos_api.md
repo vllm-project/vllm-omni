@@ -372,6 +372,8 @@ With `preencode_mp4` enabled, each committed VAE chunk leaves the accelerator an
 is encoded while later chunks are still decoding, so host transfer and CPU
 encoding overlap the remaining decode instead of following it. The response is
 unchanged: the same complete MP4, byte-for-byte equivalent frames.
+MiniMax-H3 also starts AAC encoding of the decoded audio early, overlapping it
+with video VAE decoding.
 
 ```bash
 curl -X POST http://localhost:8091/v1/videos/sync \
