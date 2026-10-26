@@ -671,13 +671,14 @@ class FluxTransformer2DModel(nn.Module):
         image_rotary_emb: tuple[torch.Tensor, torch.Tensor],
         txt_ids: torch.Tensor,
         img_ids: torch.Tensor,
+        stream_rotary_emb=None,
     ):
         """The joint stream for the single blocks, its RoPE table, and the split that returns the
         image stream afterwards (see `single_blocks_image_first`)."""
         text_seq_len, image_seq_len = encoder_hidden_states.shape[1], hidden_states.shape[1]
         if self.single_blocks_image_first:
             joined = torch.cat([hidden_states, encoder_hidden_states], dim=1)
-            (text_cos, text_sin), (image_cos, image_sin) = self._stream_rotary_tables(txt_ids, img_ids)
+            (text_cos, text_sin), (image_cos, image_sin) = self._stream_rotary_tables(txt_ids, img_ids, stream_rotary_emb)
             rotary = (torch.cat([image_cos, text_cos], dim=0), torch.cat([image_sin, text_sin], dim=0))
             return joined, rotary, lambda joint: joint[:, :image_seq_len]
         joined = torch.cat([encoder_hidden_states, hidden_states], dim=1)
@@ -686,16 +687,35 @@ class FluxTransformer2DModel(nn.Module):
             image_rotary_emb = (torch.cat([text_cos, image_cos], dim=0), torch.cat([text_sin, image_sin], dim=0))
         return joined, image_rotary_emb, lambda joint: joint[:, text_seq_len:]
 
-    def _stream_rotary_tables(self, txt_ids: torch.Tensor, img_ids: torch.Tensor):
-        """The `(cos, sin)` RoPE tables of the text and the image stream, separately."""
+    def _stream_rotary_tables(self, txt_ids: torch.Tensor, img_ids: torch.Tensor, stream_rotary_emb=None):
+        """The `(cos, sin)` RoPE tables of the text and the image stream, separately: the caller's
+        (`stream_rotary_emb`, see `forward`) or computed here from the ids."""
+        if stream_rotary_emb is not None:
+            return stream_rotary_emb
         return self.pos_embed(txt_ids), self.pos_embed(img_ids)
 
-    def _double_block_rotary(self, txt_ids: torch.Tensor, img_ids: torch.Tensor):
+    def _double_block_rotary(self, txt_ids: torch.Tensor, img_ids: torch.Tensor, stream_rotary_emb=None):
         """What the double blocks take: one joint table over `cat(txt_ids, img_ids)`, or -- when
-        their attention runs per query stream -- the pair of per-stream tables."""
+        their attention runs per query stream -- the pair of per-stream tables. The tables depend on
+        the ids alone, so a caller that knows them (a pipeline, once per request) passes
+        `stream_rotary_emb` and `pos_embed` is not evaluated in the forward at all; that keeps a
+        compiled forward free of the position-embedding sub-graph."""
         if FluxAttention.attention_per_query_stream:
-            return self._stream_rotary_tables(txt_ids, img_ids)
+            return self._stream_rotary_tables(txt_ids, img_ids, stream_rotary_emb)
+        if stream_rotary_emb is not None:
+            (text_cos, text_sin), (image_cos, image_sin) = stream_rotary_emb
+            return torch.cat([text_cos, image_cos], dim=0), torch.cat([text_sin, image_sin], dim=0)
         return self.pos_embed(torch.cat((txt_ids, img_ids), dim=0))
+
+    def stream_rotary_emb(self, txt_ids: torch.Tensor, img_ids: torch.Tensor):
+        """The per-stream RoPE tables `forward` accepts as `stream_rotary_emb`, for a caller to
+        compute once per request (they depend on the ids alone). Ids with the deprecated batch
+        dimension are read as `forward` reads them."""
+        if txt_ids.ndim == 3:
+            txt_ids = txt_ids[0]
+        if img_ids.ndim == 3:
+            img_ids = img_ids[0]
+        return self.pos_embed(txt_ids), self.pos_embed(img_ids)
 
     def forward(
         self,
@@ -708,6 +728,7 @@ class FluxTransformer2DModel(nn.Module):
         guidance: torch.Tensor | None = None,
         joint_attention_kwargs: dict[str, Any] | None = None,
         return_dict: bool = True,
+        stream_rotary_emb: tuple[tuple[torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor]] | None = None,
     ) -> torch.Tensor | Transformer2DModelOutput:
         """
         The [`FluxTransformer2DModel`] forward method.
@@ -734,6 +755,10 @@ class FluxTransformer2DModel(nn.Module):
             return_dict (`bool`, *optional*, defaults to `True`):
                 Whether or not to return a [`~models.transformer_2d.Transformer2DModelOutput`] instead of a plain
                 tuple.
+            stream_rotary_emb (`((cos, sin), (cos, sin))`, *optional*):
+                The RoPE tables of the text and the image stream, as `stream_rotary_emb(txt_ids, img_ids)` computes
+                them. They depend on the ids alone; a caller that passes them keeps the position embedding out of
+                the forward (and out of a compiled forward).
 
         Returns:
             If `return_dict` is True, an [`~models.transformer_2d.Transformer2DModelOutput`] is returned, otherwise a
@@ -771,7 +796,7 @@ class FluxTransformer2DModel(nn.Module):
             freqs_cos, freqs_sin = self.pos_embed(ids.cpu())
             image_rotary_emb = (freqs_cos.npu(), freqs_sin.npu())
         else:
-            image_rotary_emb = self._double_block_rotary(txt_ids, img_ids)
+            image_rotary_emb = self._double_block_rotary(txt_ids, img_ids, stream_rotary_emb)
 
         for index_block, block in enumerate(self.transformer_blocks):
             encoder_hidden_states, hidden_states = block(
@@ -785,7 +810,7 @@ class FluxTransformer2DModel(nn.Module):
         # The single blocks work on the joint stream: join once, split once (see
         # FluxSingleTransformerBlock.forward and `single_blocks_image_first`).
         hidden_states, single_rotary_emb, split = self._join_streams(
-            hidden_states, encoder_hidden_states, image_rotary_emb, txt_ids, img_ids
+            hidden_states, encoder_hidden_states, image_rotary_emb, txt_ids, img_ids, stream_rotary_emb
         )
         for index_block, block in enumerate(self.single_transformer_blocks):
             hidden_states = block(
@@ -894,6 +919,7 @@ class FluxKontextTransformer2DModel(FluxTransformer2DModel):
         guidance: torch.Tensor | None = None,
         joint_attention_kwargs: dict[str, Any] | None = None,
         return_dict: bool = True,
+        stream_rotary_emb: tuple[tuple[torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor]] | None = None,
     ) -> torch.Tensor | Transformer2DModelOutput:
         hidden_states = self.x_embedder(hidden_states)
         timestep = timestep.to(hidden_states.dtype) * 1000
@@ -920,7 +946,7 @@ class FluxKontextTransformer2DModel(FluxTransformer2DModel):
             )
             img_ids = img_ids[0]
 
-        image_rotary_emb = self._double_block_rotary(txt_ids, img_ids)
+        image_rotary_emb = self._double_block_rotary(txt_ids, img_ids, stream_rotary_emb)
 
         for block in self.transformer_blocks:
             encoder_hidden_states, hidden_states = block(
@@ -934,7 +960,7 @@ class FluxKontextTransformer2DModel(FluxTransformer2DModel):
         # join once, split once around the single blocks (see FluxSingleTransformerBlock.forward
         # and `single_blocks_image_first`)
         hidden_states, single_rotary_emb, split = self._join_streams(
-            hidden_states, encoder_hidden_states, image_rotary_emb, txt_ids, img_ids
+            hidden_states, encoder_hidden_states, image_rotary_emb, txt_ids, img_ids, stream_rotary_emb
         )
         for block in self.single_transformer_blocks:
             hidden_states = block(

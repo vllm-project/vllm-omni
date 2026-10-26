@@ -483,6 +483,7 @@ class FluxKontextPipeline(
         img_ids: torch.Tensor,
         joint_attention_kwargs: dict[str, Any] | None,
         return_dict: bool = False,
+        stream_rotary_emb=None,
     ) -> torch.Tensor:
         return self.transformer(
             hidden_states=hidden_states,
@@ -494,6 +495,7 @@ class FluxKontextPipeline(
             img_ids=img_ids,
             joint_attention_kwargs=joint_attention_kwargs,
             return_dict=return_dict,
+            stream_rotary_emb=stream_rotary_emb,
         )[0]
 
     def diffuse(
@@ -515,6 +517,12 @@ class FluxKontextPipeline(
         callback_on_step_end_tensor_inputs: list[str] = ["latents"],
     ) -> torch.Tensor:
         self.scheduler.set_begin_index(0)
+        # The RoPE tables depend on the ids alone: once per request, not once per step, and not
+        # inside the transformer's (possibly compiled) forward.
+        stream_rotary_emb = self.transformer.stream_rotary_emb(text_ids, latent_ids)
+        negative_stream_rotary_emb = (
+            self.transformer.stream_rotary_emb(negative_text_ids, latent_ids) if do_true_cfg and negative_text_ids is not None else None
+        )
         with self.progress_bar(total=len(timesteps)) as pbar:
             for i, t in enumerate(timesteps):
                 if self.interrupt:
@@ -536,6 +544,7 @@ class FluxKontextPipeline(
                     "img_ids": latent_ids,
                     "joint_attention_kwargs": self.joint_attention_kwargs,
                     "return_dict": False,
+                    "stream_rotary_emb": stream_rotary_emb,
                 }
                 negative_kwargs = None
                 if do_true_cfg:
@@ -549,6 +558,7 @@ class FluxKontextPipeline(
                         "img_ids": latent_ids,
                         "joint_attention_kwargs": self.joint_attention_kwargs,
                         "return_dict": False,
+                        "stream_rotary_emb": negative_stream_rotary_emb,
                     }
 
                 noise_pred = self.predict_noise_maybe_with_cfg(
