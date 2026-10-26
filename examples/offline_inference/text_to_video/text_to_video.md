@@ -29,7 +29,7 @@ constraints, and eight-GPU validation status are documented in the
 ### Hy-Nomas
 
 Use this shared runner with `--deploy-config vllm_omni/deploy/hy_nomas.yaml`.
-The [H200 recipe](../../../recipes/Tencent/Hy-Nomas-H200.md) covers installation,
+The [Hy-Nomas recipe](../../../recipes/Tencent/Hy-Nomas.md) covers installation,
 checkpoint preparation, segment prompts, camera control, and online serving.
 For persistent multi-turn generation, use the
 [`hy_nomas_session.py`](hy_nomas_session.py) example in this directory.
