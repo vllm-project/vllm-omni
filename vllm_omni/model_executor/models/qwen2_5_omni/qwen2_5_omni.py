@@ -701,6 +701,39 @@ class Qwen2_5OmniForConditionalGeneration(
             return talker_hf_config.tts_text_start_token_id
         return self.tts_text_spk_token_ids[voice_type]
 
+    def _condition_thinker_hidden_states(
+        self,
+        hidden_states: torch.Tensor,
+        token_ids: list[int] | torch.Tensor,
+        *,
+        mask_multimodal_tokens: bool,
+    ) -> torch.Tensor:
+        """Match the reference thinker-to-talker text conditioning.
+
+        The talker consumes the sum of the thinker's last hidden state and the
+        corresponding text-token embedding. Prompt-side multimodal placeholder
+        embeddings are zeroed because their modality features are already
+        represented in the thinker hidden state.
+        """
+        embedding_device = self.thinker_embedding.weight.device
+        token_ids_tensor = torch.as_tensor(token_ids, dtype=torch.long, device=embedding_device).reshape(-1)
+        if hidden_states.ndim != 2 or hidden_states.shape[0] != token_ids_tensor.numel():
+            raise ValueError(
+                "Thinker hidden states and token ids must have matching rows: "
+                f"hidden_shape={tuple(hidden_states.shape)}, token_count={token_ids_tensor.numel()}"
+            )
+
+        token_embeds = self.thinker_embedding(token_ids_tensor).to(dtype=hidden_states.dtype)
+        if mask_multimodal_tokens and token_ids_tensor.numel() > 0:
+            multimodal_mask = torch.zeros_like(token_ids_tensor, dtype=torch.bool)
+            for token_attr in ("audio_token_index", "image_token_index", "video_token_index"):
+                token_id = getattr(self.thinker_config, token_attr, None)
+                if isinstance(token_id, int):
+                    multimodal_mask |= token_ids_tensor == token_id
+            token_embeds = token_embeds.masked_fill(multimodal_mask.unsqueeze(-1), 0)
+
+        return hidden_states.to(embedding_device) + token_embeds
+
     def talker_preprocess(
         self,
         input_ids: torch.Tensor,
@@ -743,17 +776,17 @@ class Qwen2_5OmniForConditionalGeneration(
 
         update_dict = {}
 
-        prompt_embeds = embed.get("prefill")  # Tensor [P,H]
-        thinker_result = hs.get("output")  # Tensor [K,H]
+        prompt_hidden_states = embed.get("prefill")  # Tensor [P,H]
+        thinker_hidden_states = hs.get("output")  # Tensor [K,H]
         prompt_token_ids = ids.get("prompt")  # list[int]
         thinker_output_token_ids = ids.get("output")  # list[int]
 
-        if not isinstance(prompt_embeds, torch.Tensor):
-            prompt_embeds = torch.zeros(
+        if not isinstance(prompt_hidden_states, torch.Tensor):
+            prompt_hidden_states = torch.zeros(
                 0, self.talker.config.hidden_size, dtype=input_embeds.dtype, device=self._module_device(self.model)
             )
-        if not isinstance(thinker_result, torch.Tensor):
-            thinker_result = torch.zeros(
+        if not isinstance(thinker_hidden_states, torch.Tensor):
+            thinker_hidden_states = torch.zeros(
                 0, self.talker.config.hidden_size, dtype=input_embeds.dtype, device=self._module_device(self.model)
             )
         if not isinstance(prompt_token_ids, (list, torch.Tensor)):
@@ -761,16 +794,36 @@ class Qwen2_5OmniForConditionalGeneration(
         if not isinstance(thinker_output_token_ids, (list, torch.Tensor)):
             thinker_output_token_ids = []
 
+        prompt_conditioning = self._condition_thinker_hidden_states(
+            prompt_hidden_states.to(input_embeds.dtype),
+            prompt_token_ids,
+            mask_multimodal_tokens=True,
+        )
+        reply_conditioning = self._condition_thinker_hidden_states(
+            thinker_hidden_states.to(input_embeds.dtype),
+            thinker_output_token_ids,
+            mask_multimodal_tokens=False,
+        )
+
         req_input_ids, req_embeds = self._thinker_to_talker_prefill(
             speaker=resolve_speaker(payload.get("speaker")),
-            output_prompt_embeds=thinker_result.to(input_embeds.dtype).to(self._module_device(self.model)),
+            output_prompt_embeds=reply_conditioning,
             output_token_ids=thinker_output_token_ids,
-            thinker_prompt_embeds=prompt_embeds.to(input_embeds.dtype).to(self._module_device(self.model)),
+            thinker_prompt_embeds=prompt_conditioning,
             prompt_token_ids=prompt_token_ids,
         )
 
-        if thinker_result.ndim == 2 and thinker_result.shape[0] > 0:
-            update_dict.setdefault("embed", {})["thinker_reply"] = thinker_result[1:].detach().to("cpu").contiguous()
+        if reply_conditioning.shape[0] > 0:
+            terminal_conditioning = torch.cat(
+                [
+                    self.embed_text_eos_token.to(dtype=input_embeds.dtype, device=reply_conditioning.device),
+                    self.embed_text_pad_token.to(dtype=input_embeds.dtype, device=reply_conditioning.device),
+                ],
+                dim=0,
+            )
+            update_dict.setdefault("embed", {})["thinker_reply"] = (
+                torch.cat([reply_conditioning[1:], terminal_conditioning], dim=0).detach().to("cpu").contiguous()
+            )
 
         return req_input_ids, req_embeds, update_dict
 

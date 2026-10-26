@@ -277,7 +277,7 @@ def test_evaluation_reuses_selected_samples_and_existing_scores(tmp_path, prepar
     assert json.loads((score_root / "evaluation_summary.json").read_text()) == accuracy
 
 
-@pytest.mark.parametrize("failure", ["generation", "publication", "judge", "clock"])
+@pytest.mark.parametrize("failure", ["generation", "publication", "judge", "invalid_judge", "clock"])
 def test_evaluation_reports_incomplete_coverage(tmp_path, prepared, monkeypatch, failure):
     samples = [
         replace(sample, evaluation=adapter.DuplexEvalEvaluation("http://judge", "judge"))
@@ -304,6 +304,8 @@ def test_evaluation_reports_incomplete_coverage(tmp_path, prepared, monkeypatch,
         calls += 1
         if failure == "judge" and calls == 1:
             raise ConnectionError("judge unavailable")
+        if failure == "invalid_judge" and calls == 1:
+            return '{"success_score": "bad"}'
         return '{"success_score": 1}'
 
     monkeypatch.setattr(adapter, "write_sample_result", write)
@@ -312,7 +314,7 @@ def test_evaluation_reports_incomplete_coverage(tmp_path, prepared, monkeypatch,
     assert accuracy["status"] == "partial" and accuracy["total"] == 2
     assert accuracy["evaluated"] == accuracy["samples"] == 1
     assert accuracy["skipped"] == int(failure in {"generation", "publication"})
-    assert accuracy["failed"] == len(accuracy["errors"]) == int(failure in {"judge", "clock"})
+    assert accuracy["failed"] == len(accuracy["errors"]) == int(failure in {"judge", "invalid_judge", "clock"})
     assert outputs[1].success
 
 
@@ -899,7 +901,14 @@ async def test_benchmark_socket_lifecycle_excludes_warmups(
         # the previously captured benchmark duration or throughput denominator.
         BenchmarkTime.offset = 3600.0
         return web.json_response(
-            {"choices": [{"message": {"content": json.dumps({"success_score": len(judge_calls) % 2})}}]},
+            {
+                "choices": [
+                    {
+                        "message": {"content": json.dumps({"success_score": len(judge_calls) % 2})},
+                        "finish_reason": "stop",
+                    }
+                ]
+            },
             status=judge_status,
         )
 
