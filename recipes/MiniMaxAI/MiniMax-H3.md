@@ -1216,8 +1216,11 @@ H3 text encoder with no `<d>`-mark preprocessing, and the official Ref2VA
 processor contains no dialogue parsing either. Prompts that deviate from the
 contract surface as audio artifacts (#8905): narrative text outside `<d>`
 spoken verbatim, dialogue lines repeated, and filler syllables around the
-clip. The same prompts behave the same way across serving stacks and
-attention backends, so rewrite the prompt rather than changing serve flags.
+clip. #8905 reports these artifacts on NPU across the attention and cache
+variants it tried, and a separate GPU report shows a bare English prompt
+spoken as well; `vllm_omni` forwards the raw prompt to the text encoder
+unchanged on every stack, so rewrite the prompt into the official format
+first, before changing serve flags.
 
 The contract rules that matter for Ref2VA dialogue:
 
