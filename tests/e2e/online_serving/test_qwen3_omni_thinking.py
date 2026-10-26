@@ -35,6 +35,12 @@ from openai.types.realtime.realtime_conversation_item_user_message import Conten
 
 from tests.helpers.mark import hardware_test
 from tests.helpers.media import generate_synthetic_audio, generate_synthetic_image, generate_synthetic_video
+from tests.helpers.realtime import (
+    WEATHER_TOOL_ANSWER,
+    WEATHER_TOOL_OUTPUT,
+    WEATHER_TOOL_PROMPT,
+    WEATHER_TOOL_SPEC,
+)
 from tests.helpers.runtime import OmniServerParams, dummy_messages_from_mix_data
 from tests.helpers.stage_config import get_deploy_config_path
 
@@ -313,25 +319,13 @@ def test_analyse_video_with_audio_input(omni_server, openai_client):
 REASONING_PROMPT = "What is 17 * 23? Think it through, then reply with only the number."
 REASONING_ANSWER = "391"
 # One unambiguous tool and an explicit prompt, so tool_choice can stay 'auto'.
-TOOL_PROMPT = "What is the weather in Paris right now? Use the get_weather tool."
-TOOL_OUTPUT = "Sunny, 22C."
-TOOL_ANSWER = "22"
 RECALL_PROMPT = "Which city did I ask about? Reply with only the city name."
 RECALL_ANSWER = "Paris"
 # Qwen3 wraps reasoning in  thinking...</think> and calls in <tool_call>{...}</tool_call>.
 # If the parsers are missing or broken, that raw markup reaches the text deltas.
 THINK_END_MARKER = "</think>"
 TOOL_CALL_MARKER = "<tool_call>"
-TOOL_SPEC = RealtimeFunctionTool(
-    type="function",
-    name="get_weather",
-    description="Return the current weather for a city.",
-    parameters={
-        "type": "object",
-        "properties": {"city": {"type": "string", "description": "City name"}},
-        "required": ["city"],
-    },
-)
+TOOL_SPEC = RealtimeFunctionTool(**WEATHER_TOOL_SPEC)
 
 
 @dataclass
@@ -510,8 +504,8 @@ def _tool_result_failures(tool: Turn, turn: Turn) -> list[str]:
         failures.append("tool result: no text reached the client")
     if THINK_END_MARKER in turn.text or TOOL_CALL_MARKER in turn.text:
         failures.append("tool result: markup leaked into output text")
-    if turn.text.strip() and TOOL_ANSWER not in turn.text:
-        failures.append(f"tool result: expected the tool output {TOOL_ANSWER} in the answer, got {turn.text!r}")
+    if turn.text.strip() and WEATHER_TOOL_ANSWER not in turn.text:
+        failures.append(f"tool result: expected the tool output {WEATHER_TOOL_ANSWER} in the answer, got {turn.text!r}")
     return failures
 
 
@@ -541,12 +535,12 @@ async def run_parser_checks(
             await start_turn(conn, prompt=REASONING_PROMPT)
             reasoning = await collect_turn(conn, timeout)
 
-            await start_turn(conn, prompt=TOOL_PROMPT, tools=[TOOL_SPEC], tool_choice="auto")
+            await start_turn(conn, prompt=WEATHER_TOOL_PROMPT, tools=[TOOL_SPEC], tool_choice="auto")
             tool = await collect_turn(conn, timeout)
 
             tool_result = Turn()
             if tool.tool_calls:
-                await send_tool_output(conn, tool.tool_calls[0], TOOL_OUTPUT)
+                await send_tool_output(conn, tool.tool_calls[0], WEATHER_TOOL_OUTPUT)
                 tool_result = await collect_turn(conn, timeout)
 
             await start_turn(conn, prompt=RECALL_PROMPT)

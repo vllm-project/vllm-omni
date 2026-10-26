@@ -1300,6 +1300,14 @@ def test_resolve_response_drops_response_level_reasoning_for_audio() -> None:
     assert connection._resolve_response(response_cfg).reasoning_effort is None
 
 
+def test_resolve_response_drops_session_reasoning_for_audio() -> None:
+    connection, _ = _make_connection()
+    connection.session.config.output_modalities = ["audio"]
+    connection.session.config.reasoning = types.RealtimeReasoning(effort="high")
+
+    assert connection._resolve_response(None).reasoning_effort is None
+
+
 def test_resolve_response_applies_session_reasoning_to_text_only_override() -> None:
     connection, _ = _make_connection()
     connection.session.config.output_modalities = ["audio"]
@@ -1379,6 +1387,15 @@ def _text_output(text: str, token_ids: list[int], finish_reason: str | None = No
     )
 
 
+def _audio_output(chunk: np.ndarray, sample_rate: int) -> Any:
+    multimodal_output = {"audio": chunk, "sample_rate": sample_rate}
+    return SimpleNamespace(
+        final_output_type="audio",
+        multimodal_output=multimodal_output,
+        outputs=[SimpleNamespace(multimodal_output=multimodal_output)],
+    )
+
+
 def _make_run_connection(
     websocket: _FakeWebSocket,
     *,
@@ -1399,6 +1416,8 @@ async def _run_text_response(
     prompt_token_ids: list[int],
     submitted_params: list[list[SamplingParams]] | None = None,
     tool_choice: str | None = "none",
+    modalities: list[str] | None = None,
+    reasoning_effort: str | None = None,
 ):
     async def generate(**kwargs):
         if submitted_params is not None:
@@ -1410,11 +1429,12 @@ async def _run_text_response(
     response = _ResolvedResponse(
         input=[],
         instructions=None,
-        modalities=["text"],
+        modalities=modalities or ["text"],
         max_output_tokens="inf",
         tools=None,
         tool_choice=tool_choice,
         metadata=None,
+        reasoning_effort=reasoning_effort,
     )
     active = ActiveResponse(response_id="resp_test", request_id="req_test")
     connection.session.active_response = active
@@ -1503,35 +1523,33 @@ async def test_run_response_accepts_unset_tool_choice(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_run_response_does_not_parse_reasoning_from_audio_transcripts(monkeypatch) -> None:
+async def test_run_response_strips_reasoning_from_audio_transcripts(monkeypatch) -> None:
     websocket = _FakeWebSocket()
     connection = _make_run_connection(websocket)
+    end = _StubResponseParser.END_MARKER
+    parser_requests: list[ChatCompletionRequest] = []
 
-    def fail(request):
-        raise AssertionError("parsing must not run for audio transcripts")
+    def build(request: ChatCompletionRequest):
+        parser_requests.append(request)
+        return _StubResponseParser()
 
-    monkeypatch.setattr(connection, "_build_response_parser", fail)
-    response = _ResolvedResponse(
-        input=[],
-        instructions=None,
+    monkeypatch.setattr(connection, "_build_response_parser", build)
+
+    await _run_text_response(
+        connection,
+        [
+            _text_output("weighing the options", [10, 11]),
+            _text_output("more " + end + "Hello", [12, _StubResponseParser.END_TOKEN_ID, 13]),
+        ],
+        prompt_token_ids=[7],
         modalities=["audio"],
-        max_output_tokens="inf",
-        tools=None,
-        tool_choice="none",
-        metadata=None,
+        reasoning_effort=None,
     )
-    active = ActiveResponse(response_id="resp_test", request_id="req_test")
-    connection.session.active_response = active
 
-    async def generate(**_kwargs):
-        yield _text_output("not stripped", [1])
-
-    connection.engine.generate = generate
-    await connection._run_response(active.response_id, response, {"prompt_token_ids": []})
-
+    assert parser_requests[0].reasoning_effort is None
     events = _websocket_events(websocket)
     transcripts = [event["delta"] for event in events if event["type"] == "response.output_audio_transcript.delta"]
-    assert transcripts == ["not stripped"]
+    assert transcripts == ["Hello"]
 
 
 @pytest.mark.asyncio
@@ -1588,6 +1606,34 @@ async def test_run_response_streams_tool_calls_from_parser(monkeypatch) -> None:
     assert [event["item"]["name"] for event in added] == ["get_time"]
     deltas = [event["delta"] for event in events if event["type"] == "response.function_call_arguments.delta"]
     assert deltas == ['{"tz":"UTC"}']
+
+
+@pytest.mark.asyncio
+async def test_run_response_streams_tool_calls_from_audio(monkeypatch) -> None:
+    websocket = _FakeWebSocket()
+    connection = _make_run_connection(websocket)
+    monkeypatch.setattr(connection, "_build_response_parser", _stub_parser(_ToolCallResponseParser()))
+
+    await _run_text_response(
+        connection,
+        [_text_output("", [1], finish_reason="stop"), _audio_output(np.zeros(240, dtype=np.float32), 24000)],
+        prompt_token_ids=[7],
+        modalities=["audio"],
+        reasoning_effort=None,
+    )
+
+    events = _websocket_events(websocket)
+    added = [
+        event
+        for event in events
+        if event["type"] == "response.output_item.added" and event["item"]["type"] == "function_call"
+    ]
+    assert [event["item"]["call_id"] for event in added] == ["call_1"]
+    assert [event["item"]["name"] for event in added] == ["get_time"]
+    deltas = [event["delta"] for event in events if event["type"] == "response.function_call_arguments.delta"]
+    assert deltas == ['{"tz":"UTC"}']
+    assert not [event for event in events if event["type"] == "response.output_audio_transcript.delta"]
+    assert not [event for event in events if event["type"] == "response.output_audio.delta"]
 
 
 def test_build_response_parser_matches_chat_path() -> None:

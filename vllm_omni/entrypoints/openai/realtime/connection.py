@@ -768,8 +768,10 @@ class OpenAIFullDuplexConnection:
         if response_cfg is not None and response_cfg.reasoning is not None:
             reasoning_effort = response_cfg.reasoning.effort
         if reasoning_effort is not None and "audio" in modalities:
-            # Thinker reasoning tokens are fed to the Talker, which would speak
-            # them. Only honor reasoning for text-only responses.
+            # enable_thinking=False appends an empty think block to the rendered
+            # prompt, and Qwen3-Omni's audio path then prefixes the transcript
+            # with prompt-template text. Keep the template default; the
+            # reasoning parser still strips think blocks from the transcript.
             reasoning_effort = None
 
         resolved_input = self._resolve_response_input(response_input) if response_input is not None else None
@@ -1119,12 +1121,11 @@ class OpenAIFullDuplexConnection:
             # Chat completions rejects tool_choice without tools, but a session
             # can still carry "auto" after the client clears its tool list.
             tool_choice=self._convert_tool_choice(tool_choice) if parser_tools else None,
+            reasoning_effort=response.reasoning_effort,
             include_reasoning=False,
             skip_special_tokens=True,
         )
-        # Talker transcripts are speech, not model reasoning, so audio
-        # responses bypass parsing and stream transcript deltas verbatim.
-        parser = None if is_audio else self._build_response_parser(parser_request)
+        parser = self._build_response_parser(parser_request)
         if parser is not None:
             # Let the parsers apply their own request adjustments: engine-based
             # parsers need special tokens preserved, and the tool parser builds
