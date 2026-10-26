@@ -12,16 +12,14 @@ selects between them from the checkpoint config, since both checkpoints share
 ``model_type = "arktts"``.
 """
 
-from typing import TYPE_CHECKING
-
 from vllm_omni.config.stage_config import (
     PipelineConfig,
     StageExecutionType,
     StagePipelineConfig,
+    pipeline_cfg_resolver,
 )
 
-if TYPE_CHECKING:
-    from transformers import PretrainedConfig
+from .configuration_audio8_tts import Audio8TTSConfig
 
 _PROC = "vllm_omni.model_executor.stage_input_processors.audio8_tts"
 
@@ -88,13 +86,16 @@ AUDIO8_TTS_HYBRID_PIPELINE = PipelineConfig(
 )
 
 
-def resolve_audio8_pipeline(config: "PretrainedConfig | None") -> PipelineConfig:
+@pipeline_cfg_resolver(config_type=Audio8TTSConfig)
+def resolve_audio8_pipeline(config: Audio8TTSConfig) -> PipelineConfig:
     """Pick the Audio8 topology from the checkpoint config.
 
     Both checkpoints declare ``model_type = "arktts"``; the distinguishing field
     is ``slow_backbone`` (absent on the 0.6b, ``"falcon_h1"`` on the 0.1b).
+    The decorator returns ``None`` for a config of any other type, which is the
+    contract ``test_all_resolvers_reject_bad_types`` enforces for every
+    registered resolver.
     """
-    slow_backbone = getattr(config, "slow_backbone", None) if config is not None else None
-    if slow_backbone == "falcon_h1":
+    if getattr(config, "slow_backbone", None) == "falcon_h1":
         return AUDIO8_TTS_HYBRID_PIPELINE
     return AUDIO8_TTS_PIPELINE
