@@ -8,6 +8,7 @@ Only device kernels are numerical doubles; no NPU accuracy or speed is claimed.
 import sys
 from contextlib import contextmanager
 from copy import deepcopy
+from importlib.util import find_spec
 from types import SimpleNamespace
 
 import pytest
@@ -16,11 +17,15 @@ import torch.nn.functional as F
 from torch import nn
 
 from vllm_omni.diffusion.layers.norm import RMSNorm
-from vllm_omni.diffusion.models.minimax_h3 import vae_int8, vae_ops
+from vllm_omni.diffusion.models.minimax_h3 import vae_ops
 from vllm_omni.quantization import int8_config
 from vllm_omni.quantization.int8_config import DiffusionInt8Config, NPUInt8OnlineLinearMethod
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
+
+HAS_VAE_INT8 = find_spec("vllm_omni.diffusion.models.minimax_h3.vae_int8") is not None
+if HAS_VAE_INT8:
+    from vllm_omni.diffusion.models.minimax_h3 import vae_int8
 
 
 @pytest.fixture(autouse=True)
@@ -666,6 +671,7 @@ def cpu_int8_kernels(monkeypatch):
     return state
 
 
+@pytest.mark.skipif(not HAS_VAE_INT8, reason="Requires VAE INT8")
 @pytest.mark.parametrize("ignored", [False, True])
 def test_combo_uses_real_int8_install_and_all_four_linears(cpu_int8_kernels, ignored):
     torch.manual_seed(17)

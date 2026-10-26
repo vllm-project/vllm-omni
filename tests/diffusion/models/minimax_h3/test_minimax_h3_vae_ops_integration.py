@@ -23,7 +23,6 @@ if HAS_VAE_INT8:
 INT8_CASES = [False, pytest.param(True, marks=pytest.mark.skipif(not HAS_VAE_INT8, reason="Requires VAE INT8"))]
 
 
-
 class _StoredInt8Linear(nn.Module):
     """Storage fixture; numerical delegation is covered by adapter tests."""
 
