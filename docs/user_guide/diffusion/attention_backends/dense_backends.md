@@ -49,7 +49,7 @@ they do not trigger a retry. Packed/varlen and quantized attention retain their
 separate dispatch contracts.
 
 For the BF16 TP1/TP2 SenseNova workload and its validation limits, see the
-[SenseNova-U1.5 recipe](../../../../recipes/SenseNova/SenseNova-U1.5.md).
+[SenseNova-U1.5 recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/SenseNova/SenseNova-U1.5.md).
 
 ### FlashAttention 4 on Blackwell
 
