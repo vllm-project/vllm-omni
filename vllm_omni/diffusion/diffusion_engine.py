@@ -1835,7 +1835,9 @@ class DiffusionEngine:
         req = self._make_dummy_request(
             height=int(additional_config.get("diffusion_warmup_height", 512)),
             width=int(additional_config.get("diffusion_warmup_width", 512)),
-            guidance_scale=0.0,
+            # the guidance scale decides the transformer's inputs for a guidance-embedded model:
+            # warm up at the scale the requests will use (``diffusion_warmup_guidance_scale``)
+            guidance_scale=float(additional_config.get("diffusion_warmup_guidance_scale", 0.0)),
             # Dummy warmup must exercise at least one denoising iteration in
             # every execution mode. Some pipelines (for example BAGEL) perform
             # ``num_inference_steps - 1`` scheduler updates and reject an empty
