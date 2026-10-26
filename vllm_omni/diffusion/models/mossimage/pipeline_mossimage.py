@@ -387,7 +387,9 @@ class MOSSImagePipeline(nn.Module, SkipLayerGuidanceMixin, DiffusionPipelineProf
         if height <= 0 or width <= 0 or height % 16 or width % 16:
             raise ValueError("height and width must be positive multiples of 16.")
         num_inference_steps = sampling.num_inference_steps or _DEFAULT_NUM_INFERENCE_STEPS
-        guidance_scale = sampling.guidance_scale if sampling.guidance_scale is not None else _DEFAULT_GUIDANCE_SCALE
+        guidance_scale = sampling.guidance_scale if sampling.guidance_scale_provided else _DEFAULT_GUIDANCE_SCALE
+        if not math.isfinite(guidance_scale) or guidance_scale < 0:
+            raise ValueError(f"Invalid guidance scale: {guidance_scale}")
         num_images_per_prompt = max(sampling.num_outputs_per_prompt, 1)
         max_sequence_length = sampling.max_sequence_length or _MAX_SEQUENCE_LENGTH
         max_sequence_length = max(1, min(max_sequence_length, _MAX_SEQUENCE_LENGTH))
@@ -540,7 +542,7 @@ class MOSSImagePipeline(nn.Module, SkipLayerGuidanceMixin, DiffusionPipelineProf
         if height <= 0 or width <= 0 or height % 16 or width % 16:
             raise ValueError("height and width must be positive multiples of 16.")
         num_inference_steps = sampling.num_inference_steps or _DEFAULT_NUM_INFERENCE_STEPS
-        guidance_scale = sampling.guidance_scale if sampling.guidance_scale is not None else _DEFAULT_GUIDANCE_SCALE
+        guidance_scale = sampling.guidance_scale if sampling.guidance_scale_provided else _DEFAULT_GUIDANCE_SCALE
         if not math.isfinite(guidance_scale) or guidance_scale < 0:
             raise ValueError(f"Invalid guidance scale: {guidance_scale}")
         num_images_per_prompt = max(sampling.num_outputs_per_prompt, 1)

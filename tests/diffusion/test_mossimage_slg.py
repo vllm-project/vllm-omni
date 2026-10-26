@@ -95,6 +95,21 @@ def request(params, request_id="req"):
     return OmniDiffusionRequest(prompt="positive", sampling_params=params, request_id=request_id)
 
 
+def step_state(request_id, params, prompt="positive"):
+    """Build a StepRequestState the way the engine does.
+
+    The request layer (OmniDiffusionRequest.__post_init__) is what sets
+    guidance_scale_provided; states built from a bare
+    OmniDiffusionSamplingParams would present the flag as False even when
+    guidance_scale was passed explicitly, which is a shape the engine never
+    produces (see boogu_image test_pipeline_boogu_image.py:868 for the same
+    emulation).
+    """
+    req = request(params, request_id=request_id)
+    req.prompt = prompt
+    return StepRequestState(request_id=request_id, sampling=req.sampling_params, prompt=prompt)
+
+
 @pytest.mark.parametrize("cfg", [1.0, 4.0])
 @pytest.mark.parametrize("rescale", [0.0, 0.7])
 @pytest.mark.parametrize("outputs", [1, 2])
@@ -104,7 +119,7 @@ def test_full_forward_and_step_execution_match(cfg, rescale, outputs, mode):
     full, step = pipeline(), pipeline()
     params = sampling(cfg=cfg, rescale=rescale, outputs=outputs, mode=mode)
     expected = full(DiffusionRequestBatch([request(copy.deepcopy(params))])).output
-    state = StepRequestState(request_id="req", sampling=copy.deepcopy(params), prompt="positive")
+    state = step_state("req", copy.deepcopy(params))
     step.prepare_encode(state)
     batch = None
     while state.step_index < len(state.timesteps):
@@ -149,7 +164,7 @@ def test_mixed_step_activity_matches_isolated_requests_and_selected_order(cfg, m
     for i, step_index in enumerate((0, 2, 49)):
         params = sampling(cfg=cfg, rescale=0.7, interval=(0.01, 0.15), seed=i, mode=mode)
         params.num_inference_steps = 50
-        state = StepRequestState(request_id=str(i), sampling=params, prompt="positive")
+        state = step_state(str(i), params)
         model.prepare_encode(state)
         state.step_index = step_index
         states.append(state)
@@ -197,7 +212,7 @@ def test_incompatible_slg_configs_are_rejected_even_without_preprocessing(stepwi
     params = [sampling(scale=3), sampling(scale=2)]
     with pytest.raises(ValueError, match="identical SLG"):
         if stepwise:
-            states = [StepRequestState(request_id=str(i), sampling=p, prompt="positive") for i, p in enumerate(params)]
+            states = [step_state(str(i), p) for i, p in enumerate(params)]
             for state in states:
                 model.prepare_encode(state)
             model.denoise_step(InputBatch.make_batch(states))
