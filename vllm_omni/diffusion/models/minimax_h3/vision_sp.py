@@ -10,7 +10,7 @@ inputs; A2 and other shapes still require their own bitwise runtime validation.
 import torch
 import torch.nn.functional as F
 
-from .vision_parallel import VisionAllToAll, build_vision_plan, gather_vision_outputs
+from .vision_parallel import VisionAllToAll, build_vision_plan, gather_vision_outputs, vision_permutation_enabled
 
 
 def segment_attention(q, k, v):
@@ -26,7 +26,12 @@ def forward_sp8(model, pixels, grid, *, group):
     """Shard whole spatial merger groups, exchange heads, then gather all outputs."""
     lengths = tuple(h * w for t, h, w in grid.cpu().tolist() for _ in range(t))
     plan = build_vision_plan(lengths, 8, num_heads=model.config.num_heads, merge_size=model.spatial_merge_size)
-    transport = VisionAllToAll(plan, group=group)
+    transport = VisionAllToAll(
+        plan,
+        group=group,
+        use_permutation=vision_permutation_enabled(),
+        verify_permutation=vision_permutation_enabled("VLLM_OMNI_H3_VISION_PERMUTE_VERIFY"),
+    )
     ids = plan.rank_token_indices[transport.rank]
     select = torch.tensor(ids, dtype=torch.long, device=pixels.device)
     hidden = model.patch_embed(pixels.index_select(0, select))
