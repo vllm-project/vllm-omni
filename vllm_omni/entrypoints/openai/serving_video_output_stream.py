@@ -546,6 +546,7 @@ class OmniStreamingVideoOutputHandler:
             # A rejection that arrives after the queued ack is reported as a
             # correlated error; the generation keeps streaming.
             logger.info("Interaction %s rejected for request %s: %s", event_id, request_id, reason)
+            interaction_event_ids.discard(event_id)
             await self._send_error(
                 websocket,
                 "Failed to apply interaction",

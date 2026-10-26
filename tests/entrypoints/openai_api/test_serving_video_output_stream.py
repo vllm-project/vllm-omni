@@ -1053,7 +1053,9 @@ class TestStreamingVideoOutputPromptUpdate:
             while not submissions:
                 await asyncio.sleep(0.01)
             await submissions[0]("ui-update-42", "Failed interaction for request req-ws: prompt embeds are not ready")
-            await asyncio.sleep(0.2)  # let the queued error frame go out before chunk 1
+            # The rejected event_id is free again; wait for its resubmission.
+            while len(submissions) < 2:
+                await asyncio.sleep(0.01)
             yield OmniRequestOutput.from_diffusion(
                 request_id="req-ws",
                 images=[_fake_video_frames(2)],
@@ -1087,12 +1089,15 @@ class TestStreamingVideoOutputPromptUpdate:
                 assert err["event_id"] == "ui-update-42"
                 assert "Failed to apply interaction" in err["message"]
 
+                ws.send_json(interaction)
+                assert ws.receive_json()["type"] == "session.interaction.queued"
+
                 assert _receive_video_chunk(ws)[1] == b"mp4-chunk-1"
                 done = ws.receive_json()
                 assert done["type"] == "session.done"
                 assert done["chunks"] == 2
 
-        engine_client.submit_interaction_async.assert_awaited_once()
+        assert engine_client.submit_interaction_async.await_count == 2
 
     @pytest.mark.asyncio
     async def test_prompt_update_accepted_via_async_handler(self, mocker: MockerFixture):

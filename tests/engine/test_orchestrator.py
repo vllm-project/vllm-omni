@@ -3190,7 +3190,8 @@ async def test_interaction_backlog_is_bounded_without_blocking_dispatch() -> Non
         )
     error = errors.get_nowait()
     assert error.request_id == "video"
-    assert error.event_id == "64"
+    # Request-scoped, not event-scoped, so the overloaded stream still ends.
+    assert error.event_id is None
     assert error.fatal is False
     assert error.error == "Too many pending interactions"
 

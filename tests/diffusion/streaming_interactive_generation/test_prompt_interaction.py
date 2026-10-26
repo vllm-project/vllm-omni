@@ -44,6 +44,7 @@ from vllm_omni.engine.orchestrator import Orchestrator, OrchestratorRequestState
 from vllm_omni.engine.stage_client import StagePoolClient
 from vllm_omni.engine.stage_init_utils import StageMetadata
 from vllm_omni.engine.stage_pool import StagePool
+from vllm_omni.entrypoints import async_omni_base
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.async_omni_base import AsyncEventResolver
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniInteractionPrompt
@@ -733,6 +734,63 @@ class TestPromptUpdateIntegration:
                 assert len(rejections) == 1
                 assert rejections[0][0] == "ui-update-1"
                 assert "prompt embeds are not ready" in rejections[0][1]
+        finally:
+            if generate_task is not None and not generate_task.done():
+                generate_task.cancel()
+                await asyncio.gather(generate_task, return_exceptions=True)
+            await self._shutdown_pipeline_omni_harness(omni, fixture, inline_client)
+
+    @pytest.mark.asyncio
+    async def test_pending_rejection_callback_is_cancelled_when_generation_ends(
+        self, pipeline: HeliosPipeline, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A rejection callback still running when the stream ends must not hold up ``generate()``."""
+        monkeypatch.setattr(async_omni_base, "INTERACTION_ERROR_DRAIN_TIMEOUT_S", 0.05)
+        pipeline.encode_prompt = MagicMock(  # pyright: ignore[reportAttributeAccessIssue]
+            side_effect=ValueError("prompt embeds are not ready")
+        )
+        runner = _make_diffusion_model_runner(pipeline=pipeline)
+        started: list[str] = []
+        cancelled: list[str] = []
+
+        async def on_error(event_id: str, reason: str) -> None:
+            del reason
+            started.append(event_id)
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.append(event_id)
+                raise
+
+        prompt_update_engine = self._PromptUpdateEngine(
+            self._IncrementalStreamingPipeline(),
+            runner,
+            ready_for_next_chunk=lambda _state: bool(started),
+        )
+        inline_client = self._make_inline_pipeline_client(prompt_update_engine)
+        fixture = _build_harness([inline_client])
+        omni = self._make_async_omni(self._OrchestratorBridgeEngine(fixture))
+
+        generate_task: asyncio.Task[list[OmniRequestOutput]] | None = None
+        try:
+            generate_task = asyncio.create_task(self._collect_generate_outputs(omni))
+            await _wait_for(
+                lambda: (
+                    len(runner.state_cache) > 0
+                    and any(state.external_request_id == "req-omni" for state in omni.request_states.values())
+                )
+            )
+            await omni.submit_interaction_async(
+                "req-omni",
+                interaction=_prompt_interaction("new scene", event_id="ui-update-1"),
+                on_error=on_error,
+            )
+            outputs = await asyncio.wait_for(generate_task, 5)
+
+            assert [output.custom_output["chunk"] for output in outputs] == [0, 1]
+            assert started == ["ui-update-1"]
+            assert cancelled == ["ui-update-1"]
+            assert not omni.request_states
         finally:
             if generate_task is not None and not generate_task.done():
                 generate_task.cancel()
