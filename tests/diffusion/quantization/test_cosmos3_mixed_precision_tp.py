@@ -107,7 +107,7 @@ class _LinearCase:
     atol: float
 
 
-def _fp8_case(kind, k, n, topology, sp_rank, cfg_rank):
+def _fp8_case(kind, k, n, topology, sp_rank, cfg_rank, *, native_fused_bias):
     tp, sp, cfg = topology
     # Exactly representable values isolate sharding/reduction errors
     # from activation quantization noise. Each rank receives the same
@@ -120,29 +120,30 @@ def _fp8_case(kind, k, n, topology, sp_rank, cfg_rank):
     branches, x = parallel_inputs(k, sp, cfg, sp_rank, cfg_rank, "FP8")
     dense_weight = (weight.float() * weight_scale).to(torch.bfloat16)
 
-    def dense_reference(activations):
+    def dense_reference(activations, *, fused_bias):
         if kind == "column":
-            return F.linear(activations, dense_weight, bias)
+            output = F.linear(activations, dense_weight, bias if fused_bias else None)
+            return output if fused_bias else output + bias
         # BF16 partial GEMMs round before TP reduction. Derive them
         # independently; a full GEMM differs after CFG amplification.
         inputs = activations.chunk(tp, dim=-1)
         weights = dense_weight.chunk(tp, dim=1)
-        partials = [
-            F.linear(part_x.contiguous(), part_weight.contiguous(), bias if i == 0 else None)
-            for i, (part_x, part_weight) in enumerate(zip(inputs, weights))
-        ]
+        partials = []
+        for i, (part_x, part_weight) in enumerate(zip(inputs, weights)):
+            output = F.linear(part_x.contiguous(), part_weight.contiguous(), bias if fused_bias and i == 0 else None)
+            if not fused_bias and i == 0:
+                output = output + bias
+            partials.append(output)
         return sum(partials[1:], partials[0])
 
-    reference = dense_reference(x)
-    references = [dense_reference(branch) for branch in branches]
     return _LinearCase(
         checkpoint={"weight": weight, "weight_scale": weight_scale, "input_scale": input_scale, "bias": bias},
         dense_weight=dense_weight,
         inputs=x,
-        high_reference=reference,
-        native_reference=reference,
-        high_references=references,
-        native_references=references,
+        high_reference=dense_reference(x, fused_bias=True),
+        native_reference=dense_reference(x, fused_bias=native_fused_bias),
+        high_references=[dense_reference(branch, fused_bias=True) for branch in branches],
+        native_references=[dense_reference(branch, fused_bias=native_fused_bias) for branch in branches],
         rtol=0.02,
         atol=0.003,
     )
@@ -272,7 +273,6 @@ def _run_parallel(
     if backend is not None:
         config.kernel_config.linear_backend = backend
     quant = _quant_config(precision)
-    make_case = _fp8_case if precision == "fp8" else _nvfp4_case
     try:
         with set_current_vllm_config(config), torch.device(f"cuda:{rank}"), torch.inference_mode():
             config.model_config = SimpleNamespace(dtype=torch.bfloat16)
@@ -295,7 +295,20 @@ def _run_parallel(
                 runtime = Cosmos3MixedPrecisionRuntime(Cosmos3MixedPrecisionConfig())
                 runtime.install(transformer)
 
-                case = make_case(kind, k, n, topology, sp_rank, cfg_rank)
+                if precision == "fp8":
+                    from vllm.model_executor.kernels.linear.scaled_mm.flashinfer import (
+                        FlashInferFP8ScaledMMLinearKernel,
+                    )
+
+                    kernel = generation.quant_method.base_method.kernel
+                    # FlashInfer rounds the GEMM to BF16 before adding bias.
+                    # CUTLASS and Omni's Quack override fuse the bias epilogue.
+                    native_fused_bias = not isinstance(kernel, FlashInferFP8ScaledMMLinearKernel) or getattr(
+                        kernel.apply_scaled_mm, "_omni_quack_patched", False
+                    )
+                    case = _fp8_case(kind, k, n, topology, sp_rank, cfg_rank, native_fused_bias=native_fused_bias)
+                else:
+                    case = _nvfp4_case(kind, k, n, topology, sp_rank, cfg_rank)
                 local_dense = case.dense_weight.chunk(tp, dim=0 if kind == "column" else 1)[tp_rank]
                 local_x = (
                     case.inputs.chunk(tp, dim=-1)[tp_rank].contiguous() if kind == "row_partitioned" else case.inputs

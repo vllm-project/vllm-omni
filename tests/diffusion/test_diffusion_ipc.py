@@ -456,3 +456,127 @@ def test_pack_value_packs_non_contiguous_large_tensor_values() -> None:
         torch.testing.assert_close(unpacked, tensor)
     finally:
         _cleanup_shm_handle(packed)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("strided", [False, True])
+def test_cpu_tensor_with_d2h_stream_never_allocates_pinned_copy(monkeypatch, dtype, strided) -> None:
+    from typing import cast
+
+    from vllm_omni.diffusion import ipc
+
+    count = _large_numel(dtype)
+    source = torch.arange(count * 2, dtype=torch.float32).to(dtype)[::2]
+    if not strided:
+        source = source.contiguous()
+
+    def forbidden_accelerator_access(*args, **kwargs):
+        pytest.fail("Packing a CPU tensor must not access accelerator streams or allocate a pinned CPU copy")
+
+    monkeypatch.setattr(torch.accelerator, "current_stream", forbidden_accelerator_access)
+    monkeypatch.setattr(torch.accelerator, "set_stream", forbidden_accelerator_access)
+    original_empty = torch.empty
+
+    def no_pinned_empty(*args, pin_memory=False, **kwargs):
+        if pin_memory:
+            pytest.fail("A CPU output must not be duplicated into pinned storage")
+        return original_empty(*args, pin_memory=pin_memory, **kwargs)
+
+    monkeypatch.setattr(torch, "empty", no_pinned_empty)
+    handle = None
+    try:
+        handle = ipc._tensor_to_shm(source, d2h_stream=cast(torch.Stream, object()))
+        actual = ipc._tensor_from_shm(handle)
+        handle = None
+        assert actual.device.type == "cpu" and actual.dtype == dtype
+        torch.testing.assert_close(actual, source, rtol=0, atol=0)
+    finally:
+        _cleanup_shm_handle(handle)
+
+
+@pytest.mark.parametrize("strided", [False, True])
+@pytest.mark.parametrize("async_copy", [False, True])
+def test_cpu_bfloat16_transport_avoids_full_float_staging(monkeypatch, strided, async_copy) -> None:
+    """A BF16 video must not coexist with a full widened staging tensor and SHM."""
+    from typing import cast
+
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    from vllm_omni.diffusion import ipc
+
+    bits = torch.tensor([0, 0x8000, 0x3F80, 0xBF80, 0x7F80, 0xFF80, 0x7FC1, 0x7F81], dtype=torch.uint16)
+    source = bits.view(torch.bfloat16).repeat(64).reshape(1, 2, 8, 32)
+    if strided:
+        source = source[..., ::2]
+    expected_wire = source.float().numpy().copy()
+    expected_restored_bits = source.float().bfloat16().view(torch.uint16)
+
+    class ForbidFullFloatStaging(TorchDispatchMode):
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            kwargs = kwargs or {}
+            if (
+                func == torch.ops.aten._to_copy.default
+                and args[0].device.type == "cpu"
+                and args[0].dtype == torch.bfloat16
+                and kwargs.get("dtype") == torch.float32
+                and args[0].numel() == source.numel()
+            ):
+                pytest.fail("BF16 transport allocated a full FP32 staging tensor before SHM")
+            return func(*args, **kwargs)
+
+    handle = None
+    try:
+        with ForbidFullFloatStaging():
+            handle = ipc._tensor_to_shm(source, d2h_stream=cast(torch.Stream, object()) if async_copy else None)
+        assert handle["numpy_dtype"] == "float32"
+        assert handle["torch_dtype"] == "torch.bfloat16"
+        shm = shared_memory.SharedMemory(name=handle["name"])
+        try:
+            wire = np.ndarray(handle["shape"], dtype=np.float32, buffer=shm.buf)
+            assert wire.tobytes() == expected_wire.tobytes()
+            del wire
+        finally:
+            shm.close()
+        restored = ipc._tensor_from_shm(handle)
+        handle = None
+        assert torch.equal(restored.view(torch.uint16), expected_restored_bits)
+    finally:
+        _cleanup_shm_handle(handle)
+
+
+def test_cpu_bfloat16_shm_conversion_failure_unlinks_segment(monkeypatch) -> None:
+    from vllm_omni.diffusion import ipc
+
+    source = torch.ones(32, dtype=torch.bfloat16)
+    created_names: list[str] = []
+    original_new = ipc._new_shm_array
+    original_copy = torch.Tensor.copy_
+
+    def track_segment(*args, **kwargs):
+        shm, array, handle = original_new(*args, **kwargs)
+        created_names.append(shm.name)
+        return shm, array, handle
+
+    def fail_conversion(destination, value, *args, **kwargs):
+        if destination.dtype == torch.float32 and value.dtype == torch.bfloat16:
+            raise RuntimeError("injected BF16 conversion failure")
+        return original_copy(destination, value, *args, **kwargs)
+
+    monkeypatch.setattr(ipc, "_new_shm_array", track_segment)
+    monkeypatch.setattr(torch.Tensor, "copy_", fail_conversion)
+    try:
+        with pytest.raises(RuntimeError, match="injected BF16 conversion failure"):
+            ipc._tensor_to_shm(source)
+        assert torch.equal(source, torch.ones_like(source))
+        assert created_names
+        for name in created_names:
+            with pytest.raises(FileNotFoundError):
+                shared_memory.SharedMemory(name=name)
+    finally:
+        for name in created_names:
+            try:
+                shm = shared_memory.SharedMemory(name=name)
+            except FileNotFoundError:
+                continue
+            shm.close()
+            shm.unlink()
