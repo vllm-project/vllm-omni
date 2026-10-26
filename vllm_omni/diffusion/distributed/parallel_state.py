@@ -62,6 +62,7 @@ _CFG: GroupCoordinator | None = None
 _DP: GroupCoordinator | None = None
 _FS: GroupCoordinator | None = None  # Fully Sharded (HSDP shard dimension)
 _HSDP_REPLICATE: GroupCoordinator | None = None  # HSDP replica dimension
+_TEXT_ENCODER_TP: GroupCoordinator | None = None  # generic HF text-encoder TP
 
 # Rank-layout metadata for expert parallelism. This is not a process group;
 # it is reused by platform-specific runtimes that must build companion groups
@@ -379,6 +380,36 @@ def is_dp_last_group():
 
 
 # * SET
+
+
+def get_text_encoder_tp_group(tp_size: int) -> GroupCoordinator:
+    """Return the text-encoder tensor-parallel group, creating it on first use.
+
+    The groups tile the diffusion world into consecutive blocks of ``tp_size``
+    ranks (``[0..n-1], [n..2n-1], ...``), so every rank belongs to exactly one
+    group and gets the full encoder output without a broadcast.  Creation is a
+    collective: every world rank must call this with the same ``tp_size``.
+    """
+    global _TEXT_ENCODER_TP
+    if _TEXT_ENCODER_TP is not None:
+        if _TEXT_ENCODER_TP.world_size != tp_size:
+            raise ValueError(
+                f"text encoder TP group already initialized with size {_TEXT_ENCODER_TP.world_size}, got {tp_size}"
+            )
+        return _TEXT_ENCODER_TP
+    world = get_world_group()
+    if tp_size < 1 or world.world_size % tp_size != 0:
+        raise ValueError(
+            f"text_encoder_tp_size ({tp_size}) must evenly divide the diffusion world size ({world.world_size})"
+        )
+    group_ranks = [world.ranks[i : i + tp_size] for i in range(0, world.world_size, tp_size)]
+    _TEXT_ENCODER_TP = init_model_parallel_group(
+        group_ranks=group_ranks,
+        local_rank=world.local_rank,
+        backend=torch.distributed.get_backend(world.device_group),
+        parallel_mode="tensor",
+    )
+    return _TEXT_ENCODER_TP
 
 
 def init_world_group(ranks: list[int], local_rank: int, backend: str) -> GroupCoordinator:
@@ -1124,7 +1155,7 @@ def initialize_model_parallel(
 
 def destroy_model_parallel():
     """Set the groups to none and destroy them."""
-    global _DP, _CFG, _SP, _PP, _FS, _HSDP_REPLICATE, _EXPERT_PARALLEL_GROUP_RANKS
+    global _DP, _CFG, _SP, _PP, _FS, _HSDP_REPLICATE, _TEXT_ENCODER_TP, _EXPERT_PARALLEL_GROUP_RANKS
 
     if vllm_parallel_state._DP and vllm_parallel_state._DP is not _DP:
         vllm_parallel_state._DP.destroy()
@@ -1141,6 +1172,10 @@ def destroy_model_parallel():
     if _HSDP_REPLICATE:
         _HSDP_REPLICATE.destroy()
     _HSDP_REPLICATE = None
+
+    if _TEXT_ENCODER_TP:
+        _TEXT_ENCODER_TP.destroy()
+    _TEXT_ENCODER_TP = None
 
     if _CFG:
         _CFG.destroy()

@@ -296,11 +296,15 @@ class DiffusionParallelConfig:
     text_encoder_tp_size: int = 1
     """Number of ranks used to tensor-parallel shard the diffusion text encoder.
 
-    Ranks are the first ``text_encoder_tp_size`` DiT ranks.  Defaults to 1,
-    which keeps the encoder fully resident on the DiT main rank (historical
-    behavior).  Values > 1 shard the Qwen3-VL encoder across the encoder TP
-    ranks and run the encode with distributed collectives over the encoder
-    process group.
+    Defaults to 1, which keeps a full encoder copy (historical behavior).
+    Values > 1 shard the encoder and run the encode with collectives over the
+    encoder process group:
+
+    - MiniMax-H3 shards its Qwen3-VL encoder across the first
+      ``text_encoder_tp_size`` DiT ranks.
+    - Pipelines using ``maybe_shard_text_encoder`` (Qwen-Image family) shard a
+      Hugging Face encoder with its ``base_model_tp_plan``; groups tile the DiT
+      world, so the size must divide the world size.
     """
 
     vae_parallel_mode: str = "tile"
