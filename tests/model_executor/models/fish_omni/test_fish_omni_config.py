@@ -191,3 +191,27 @@ def test_tensor_parallel_is_allowed_on_npu_only(monkeypatch):
         fish_model._reject_unsupported_fish_parallel(
             SimpleNamespace(pipeline_parallel_size=1, prefill_context_parallel_size=2)
         )
+
+
+def test_npu_deploy_captures_full_decode_graphs():
+    """Stage 0 must replay FULL decode graphs on Ascend.
+
+    Decode is one frame per stream per step: 40 backbone layers and 13 tower
+    layers of small kernels, where per-kernel launch cost dominates. The NPU
+    override in ``deploy/fish_omni.yaml`` has to ask for FULL capture and stop
+    the capture sizes at ``max_num_seqs``; a PIECEWISE-only override silently
+    keeps decode eager and costs roughly a third of single-stream throughput.
+    """
+    from pathlib import Path
+
+    import yaml
+
+    deploy_path = Path(__file__).resolve().parents[4] / "vllm_omni" / "deploy" / "fish_omni.yaml"
+    deploy = yaml.safe_load(deploy_path.read_text())
+    npu = deploy["platforms"]["npu"]
+    stage0 = next(stage for stage in npu["stages"] if stage["stage_id"] == 0)
+    compilation = stage0["compilation_config"]
+
+    assert str(compilation["cudagraph_mode"]).upper() == "FULL_AND_PIECEWISE"
+    assert compilation["max_cudagraph_capture_size"] == stage0["max_num_seqs"]
+    assert max(compilation["cudagraph_capture_sizes"]) == stage0["max_num_seqs"]

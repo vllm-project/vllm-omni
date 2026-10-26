@@ -13,6 +13,23 @@ from vllm.v1.outputs import ModelRunnerOutput
 from vllm_omni.inputs.data import OmniPromptType
 
 
+@dataclass(frozen=True)
+class SchedulingMetadataUpdate:
+    """Typed scheduler-visible effects derived from a received payload."""
+
+    prompt_token_ids: tuple[int, ...] | None = None
+    resize_prompt_to: int | None = None
+    input_terminal: bool = False
+
+
+@dataclass
+class StagePostWarmupMemoryStats:
+    """Model-owned allocator snapshot captured after stage warmup."""
+
+    allocated_bytes: int
+    reserved_bytes: int
+
+
 @dataclass
 class OmniConnectorOutput:
     """Communication results from Model Runner to Scheduler.
@@ -23,9 +40,8 @@ class OmniConnectorOutput:
     Attributes:
         chunk_ready_req_ids: Request IDs with newly arrived chunks this cycle.
         chunk_finished_req_ids: Request IDs whose final chunk has arrived.
-        request_metadata: Lightweight scheduling metadata keyed by request ID
-            (e.g. next_stage_prompt_len, code_predictor_codes, left_context_size).
-            Full payloads are owned by the Model Runner's local cache.
+        request_metadata: Typed scheduling updates keyed by request ID. Full
+            payloads remain owned by the Model Runner's local cache.
         kv_sent_req_ids: Request IDs whose KV cache was successfully sent.
         stage_recv_req_ids: Request IDs that received batch stage inputs.
         has_pending_kv_work: True if the mixin has pending, active, or
@@ -34,7 +50,7 @@ class OmniConnectorOutput:
 
     chunk_ready_req_ids: set[str] = field(default_factory=set)
     chunk_finished_req_ids: set[str] = field(default_factory=set)
-    request_metadata: dict[str, dict[str, Any]] = field(default_factory=dict)
+    request_metadata: dict[str, SchedulingMetadataUpdate] = field(default_factory=dict)
     kv_sent_req_ids: list[str] = field(default_factory=list)
     stage_recv_req_ids: set[str] = field(default_factory=set)
     has_pending_kv_work: bool = False
@@ -68,6 +84,8 @@ class OmniModelRunnerOutput(ModelRunnerOutput):
     # Self-contained generation models may yield multiple outputs for one
     # input unit. Keep these requests scheduled until the model finishes.
     pending_generation_req_ids: set[str] = field(default_factory=set)
+    # Request-local sampler failures, resolved at the existing token-copy boundary.
+    invalid_logits_req_ids: set[str] = field(default_factory=set)
 
     @classmethod
     def with_kv_conn_output_only(cls, kv_connector_output: Any) -> "OmniModelRunnerOutput":

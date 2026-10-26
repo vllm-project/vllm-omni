@@ -260,3 +260,51 @@ def test_sampling_noise_is_broadcast_across_tensor_parallel_ranks(make_state):
         ms._broadcast_tp_tensor(state.buffers.noise)
     assert seen["src"] == 0
     assert seen["shape"] == tuple(state.buffers.noise.shape)
+
+
+def test_pipeline_capacity_preemption_restores_frames_after_slot_reuse(make_state):
+    from vllm.sampling_params import SamplingParams
+    from vllm.v1.request import Request, RequestStatus
+
+    from tests.core.sched.test_omni_recompute_preemption import _output, _scheduler
+    from vllm_omni.model_executor.models.fish_omni.pipeline import FISH_OMNI_PIPELINE
+
+    stage = FISH_OMNI_PIPELINE.get_stage(0)
+    scheduler = _scheduler(stage.recompute_preemption, block_size=4, num_blocks=3)
+    scheduler.use_v2_model_runner = True
+    state = make_state()
+    # Hold one of two usable blocks: prefill fits, first decode cannot extend.
+    blocker = Request("blocker", [1] * 4, SamplingParams(max_tokens=8), None)
+    assert scheduler.kv_cache_manager.allocate_slots(blocker, 4) is not None
+    request = Request("a", [1] * 4, SamplingParams(max_tokens=8), None)
+    scheduler.add_request(request)
+    prefill = scheduler.schedule()
+    state.add_request(1, prefill.scheduled_new_reqs[0])
+    codes = torch.tensor([[5, 6, 7]], dtype=torch.int16)
+    state.buffers.slot_history[1, :1] = codes
+    state.buffers.slot_generated[1] = 1
+    scheduler.update_from_output(prefill, _output(request))
+
+    preempt = scheduler.schedule()
+    assert request.status == RequestStatus.PREEMPTED
+    assert preempt.preempted_req_ids == {"a"}
+    assert scheduler.update_from_output(preempt, _output()) == {}
+    state.on_request_preempted("a", 1)
+    # Reuse the former slot for another request before resuming in a new slot.
+    state.add_request(1, _request("other"))
+    state.buffers.slot_history[1].fill_(99)
+    state.buffers.slot_generated[1] = 0
+    scheduler.kv_cache_manager.free(blocker)
+
+    resumed = scheduler.schedule()
+    assert request.status == RequestStatus.RUNNING
+    assert resumed.num_scheduled_tokens == {"a": 5}
+    state.add_request(2, resumed.scheduled_new_reqs[0])
+    assert np.array_equal(state.prompts[2][:4], PROMPT.numpy())
+    assert state.prompts[2][4:, 0].tolist() == list(request.output_token_ids)
+    assert np.array_equal(state.prompts[2][4:, 1:], codes.numpy())
+    assert torch.equal(state._pending_history[2], codes)
+    assert state._pending_slots[2][1][1] == 1
+    assert "a" not in state._suspended
+    outputs = scheduler.update_from_output(resumed, _output(request))
+    assert all(output.finish_reason is None for batch in outputs.values() for output in batch.outputs)

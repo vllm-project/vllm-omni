@@ -251,6 +251,16 @@ def add_multi_stage_cli_args(parser: argparse.ArgumentParser) -> None:
             "omitted; set <= 0 to restore the legacy 6 h cap."
         ),
     )
+    group.add_argument(
+        "--omni-fail-fast-on-timeout",
+        action="store_true",
+        default=False,
+        help=(
+            "After the first timed-out benchmark request, cancel all remaining queued or in-flight requests. "
+            "Completed outputs and partial result metrics are retained. Supported only with "
+            "--backend openai-chat-omni, --request-rate inf, and non-self-timed workloads."
+        ),
+    )
 
 
 def add_diffusion_cli_args(parser: argparse.ArgumentParser) -> None:

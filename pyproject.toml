@@ -82,6 +82,8 @@ dev = [
     # whose top-level stepaudio2 package conflicts with this distribution.
     "step-audio2==1.0.0", # Step-Audio2 / MiniCPM-o 4.5 Token2Wav (flashcosyvoice / hyperpyyaml)
     "pyloudnorm==0.1.1",
+    # Hopper dense FA3. Optional at runtime (#7735, #9201); nightly installs [dev].
+    "fa3-fwd==0.0.3",
 ]
 
 demo = [
@@ -412,6 +414,9 @@ fullset = "fullset"
 Vai = "Vai"
 tockens = "tockens"
 CANN = "CANN"
+# Ascend TBE (Tensor Boost Engine), the CANN operator compiler — an
+# abbreviation, not a typo of "the".
+TBE = "TBE"
 # Step-Audio reasoning parser streams `</think>` tokens split across chunks
 # (e.g. "</" + "thi" + "nk>"). The fragment "thi" appears literally in its
 # parser logic and tests and is not a typo of "the"/"this".
