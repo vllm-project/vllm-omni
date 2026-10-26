@@ -1140,7 +1140,9 @@ def test_judge_exercises_openai_http_schema():
         def do_POST(self):
             length = int(self.headers["Content-Length"])
             requests.append((self.path, self.headers["Authorization"], json.loads(self.rfile.read(length))))
-            payload = json.dumps({"choices": [{"message": {"content": '{"success_score": 1}'}}]}).encode()
+            payload = json.dumps(
+                {"choices": [{"message": {"content": '{"success_score": 1}'}, "finish_reason": "stop"}]}
+            ).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(payload)))
