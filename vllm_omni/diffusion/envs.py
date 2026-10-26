@@ -15,6 +15,8 @@ if TYPE_CHECKING:
     MASTER_PORT: int | None = None
     CUDA_HOME: str | None = None
     LOCAL_RANK: int = 0
+    VLLM_OMNI_MINIMAX_H3_WEIGHT_NZ: str | None = None
+    VLLM_OMNI_MINIMAX_H3_WEIGHT_NZ_MODE: str | None = None
     VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS: str | None = None
 
 environment_variables: dict[str, Callable[[], Any]] = {
