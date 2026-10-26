@@ -1144,8 +1144,8 @@ def test_hy_nomas_model_parameters_reach_model_validation(fields, frames):
     from vllm_omni.diffusion.models.hy_nomas.processing_hy_nomas import normalize_request
 
     engine = FakeAsyncOmni()
-    engine.model_class_name = "HyNomasPipeline"
-    handler = OmniOpenAIServingVideo.for_diffusion(engine, model_name="tencent/Hy-Nomas")
+    engine.model_class_name = "HyNomasModularPipeline"
+    handler = OmniOpenAIServingVideo.for_diffusion(engine, model_name="tencent/Hy-Nomas-Diffusers")
     asyncio.run(handler._run_and_extract(VideoGenerationRequest(prompt="A forest", **fields), "hy-standard"))
     assert engine.captured_sampling_params_list is not None
     sampling = engine.captured_sampling_params_list[0]
@@ -1158,8 +1158,8 @@ def test_hy_nomas_rejects_conflicting_frame_count_and_model_duration():
     from vllm_omni.errors import OmniClientError
 
     engine = FakeAsyncOmni()
-    engine.model_class_name = "HyNomasPipeline"
-    handler = OmniOpenAIServingVideo.for_diffusion(engine, model_name="tencent/Hy-Nomas")
+    engine.model_class_name = "HyNomasModularPipeline"
+    handler = OmniOpenAIServingVideo.for_diffusion(engine, model_name="tencent/Hy-Nomas-Diffusers")
     request = VideoGenerationRequest(prompt="A forest", num_frames=121, extra_params={"duration": 4})
     asyncio.run(handler._run_and_extract(request, "hy-conflicting-duration"))
     assert engine.captured_sampling_params_list is not None

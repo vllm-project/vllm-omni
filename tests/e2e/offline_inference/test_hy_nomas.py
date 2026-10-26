@@ -15,7 +15,7 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.local_model, pytest.mark.diffusion]
 
-MODEL = os.environ.get("HY_NOMAS_MODEL", "tencent/Hy-Nomas")
+MODEL = os.environ.get("HY_NOMAS_MODEL", "tencent/Hy-Nomas-Diffusers")
 
 
 @pytest.fixture

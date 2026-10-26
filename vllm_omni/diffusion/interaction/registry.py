@@ -24,6 +24,10 @@ STRUCTURED_HANDLER_REGISTRY: dict[str, dict[str, type[InteractionHandler]]] = {
         "prompt": HyNomasPromptInteractionHandler,
         "camera": HyNomasCameraInteractionHandler,
     },
+    "HyNomasModularPipeline": {
+        "prompt": HyNomasPromptInteractionHandler,
+        "camera": HyNomasCameraInteractionHandler,
+    },
     # Pipeline class name -> modality -> handler class.
     "HeliosPipeline": {
         "prompt": PromptInteractionHandler,

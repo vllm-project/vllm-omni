@@ -256,6 +256,11 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
         "video_generation_defaults_builder": get_hy_nomas_video_generation_defaults,
         "output_tensor_range": "zero_to_one",
     },
+    "HyNomasModularPipeline": {
+        "extra_body_params": HY_NOMAS_EXTRA_BODY_PARAMS,
+        "video_generation_defaults_builder": get_hy_nomas_video_generation_defaults,
+        "output_tensor_range": "zero_to_one",
+    },
     "HeliosPipeline": {
         "extra_body_params": HELIOS_EXTRA_BODY_PARAMS,
         "extra_output_params": HELIOS_EXTRA_OUTPUT_PARAMS,

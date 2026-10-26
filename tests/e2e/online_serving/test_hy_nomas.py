@@ -12,7 +12,7 @@ from tests.helpers.runtime import OmniServer, OmniServerParams, OnlineOmniClient
 
 pytestmark = [pytest.mark.local_model, pytest.mark.diffusion]
 
-MODEL = os.environ.get("HY_NOMAS_MODEL", "tencent/Hy-Nomas")
+MODEL = os.environ.get("HY_NOMAS_MODEL", "tencent/Hy-Nomas-Diffusers")
 
 
 @pytest.mark.parametrize(

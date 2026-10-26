@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import json
 from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
@@ -445,7 +446,9 @@ def test_public_deploy_resolution_preserves_ar_configuration(tmp_path):
     for relative in REQUIRED_FILES:
         path = tmp_path / relative
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.touch()
+        path.write_text(
+            json.dumps({"_class_name": "HyNomasModularPipeline"}) if relative == "modular_model_index.json" else "{}"
+        )
     deployment = Path(__file__).resolve().parents[4] / "vllm_omni/deploy/hy_nomas_ar.yaml"
     resolution = resolve_omni_config(
         str(tmp_path),
@@ -466,7 +469,9 @@ def test_offline_deploy_selects_isolated_executor(tmp_path):
     for relative in REQUIRED_FILES:
         path = tmp_path / relative
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.touch()
+        path.write_text(
+            json.dumps({"_class_name": "HyNomasModularPipeline"}) if relative == "modular_model_index.json" else "{}"
+        )
     deployment = Path(__file__).resolve().parents[4] / "vllm_omni/deploy/hy_nomas.yaml"
     resolution = resolve_omni_config(
         str(tmp_path),

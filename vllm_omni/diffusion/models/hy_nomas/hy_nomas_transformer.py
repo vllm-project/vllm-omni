@@ -18,6 +18,8 @@ from vllm_omni.experimental.ar_diffusion.kv_cache.segmented import ARDiffusionSe
 
 _DIT_NAMES = WeightsMapper(
     orig_to_new_regex={
+        re.compile(r"^(double_blocks\.\d+)\.attn\.((?:img|txt)_attn_.+)$"): r"\1.\2",
+        re.compile(r"^(txt_in\.individual_token_refiner\.blocks\.\d+)\.attn\.(self_attn_.+)$"): r"\1.\2",
         re.compile(r"^double_blocks\.(\d+)\.action_module\.(.+)$"): r"action_modules.\1.\2",
         re.compile(r"\._checkpoint_wrapped_module\."): ".",
         re.compile(r"_checkpoint_wrapped_module\."): "",
@@ -25,10 +27,47 @@ _DIT_NAMES = WeightsMapper(
 )
 
 
-def build_transformer(config: DictConfig, device: torch.device) -> nn.Module:
-    from hymm.models.dit.modules import load_model
+def build_transformer(config: DictConfig, device: torch.device, model_config: dict) -> nn.Module:
+    from hymm.models.dit.nomas_cpt import CPTHYNomasDiffusionTransformer
 
-    transformer = load_model(config.dit.model_type, config, {"device": device, "dtype": torch.bfloat16})
+    transformer = CPTHYNomasDiffusionTransformer(
+        in_channels=model_config["in_channels"],
+        out_channels=model_config["out_channels"],
+        mm_double_blocks_depth=model_config["num_layers"],
+        mm_single_blocks_depth=0,
+        rope_dim_list=model_config["rope_axes_dim"],
+        rope_theta=model_config["rope_theta"],
+        hidden_size=model_config["num_attention_heads"] * model_config["attention_head_dim"],
+        heads_num=model_config["num_attention_heads"],
+        mlp_width_ratio=model_config["mlp_ratio"],
+        patch_size=[1, 1, 1],
+        text_states_dim=model_config["text_embed_dim"],
+        attn_mode=config.dit.attn_mode,
+        seg_ar_attention_backend="flex",
+        is_reshape_temporal_channels=False,
+        unpad_zero_tokens=True,
+        text_seg_pos_emb_num=0,
+        camera_injection_mode="extrinsics_attn",
+        action_config={
+            "keyboard_dim_in": 64,
+            "hidden_size": model_config["camera_embed_dim"],
+            "img_hidden_size": model_config["num_attention_heads"] * model_config["attention_head_dim"],
+            "keyboard_hidden_dim": model_config["camera_attention_dim"],
+            "heads_num": model_config["camera_num_attention_heads"],
+            "patch_size": [1, 1, 1],
+            "qk_norm": True,
+            "qk_norm_type": "rms",
+            "qkv_bias": False,
+            "rope_dim_list": model_config["camera_rope_axes_dim"],
+            "rope_theta": model_config["rope_theta"],
+            "per_segment_camera_attn": config.camera.per_segment_camera_attn,
+            "per_chunk_camera_attn": config.camera.per_chunk_camera_attn,
+            "camera_chunk_size": config.camera.camera_chunk_size,
+            "seg_ar_attention_backend": "flex",
+        },
+        device=device,
+        dtype=torch.bfloat16,
+    )
     transformer.nomas_sparse_config = {"enabled": False}
     transformer.sparse_optim = {"enabled": False}
     transformer.sparse_optim_counts = Counter()
@@ -39,20 +78,24 @@ def build_transformer(config: DictConfig, device: torch.device) -> nn.Module:
 
 
 def load_transformer_weights(transformer: nn.Module, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-    parameters = dict(transformer.named_parameters())
-    buffers = dict(transformer.named_buffers())
+    return load_component_weights(transformer, _DIT_NAMES.apply(weights))
+
+
+def load_component_weights(module: nn.Module, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+    parameters = dict(module.named_parameters())
+    buffers = dict(module.named_buffers())
     loaded = set()
-    for name, tensor in _DIT_NAMES.apply(weights):
+    for name, tensor in weights:
         if name in loaded:
-            raise ValueError(f"Duplicate Hy-Nomas DiT parameter after normalization: {name}")
+            raise ValueError(f"Duplicate Hy-Nomas parameter after normalization: {name}")
         target = parameters.get(name, buffers.get(name))
         if target is None:
-            raise ValueError(f"Unexpected Hy-Nomas DiT weight: {name}")
+            raise ValueError(f"Unexpected Hy-Nomas weight: {name}")
         default_weight_loader(target, tensor)
         loaded.add(name)
     missing = parameters.keys() - loaded
     if missing:
-        raise ValueError(f"Hy-Nomas checkpoint is missing {len(missing)} DiT parameters: {sorted(missing)[:10]}")
+        raise ValueError(f"Hy-Nomas checkpoint is missing {len(missing)} parameters: {sorted(missing)[:10]}")
     return loaded
 
 

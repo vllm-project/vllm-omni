@@ -8,9 +8,6 @@ from functools import lru_cache
 from vllm.logger import init_logger
 from vllm.transformers_utils.config import get_hf_file_to_dict
 
-from vllm_omni.diffusion.models.hy_nomas.configuration_hy_nomas import MODEL_ID as HY_NOMAS_MODEL_ID
-from vllm_omni.diffusion.models.hy_nomas.configuration_hy_nomas import REQUIRED_FILES as HY_NOMAS_REQUIRED_FILES
-
 logger = init_logger(__name__)
 
 DIFFUSION_MODEL_INDEX_FILES = (
@@ -74,26 +71,12 @@ def _looks_like_magi2(model_name: str) -> bool:
     )
 
 
-def _looks_like_hy_nomas(model_name: str) -> bool:
-    """Detect the official Hub ID or a complete local distilled checkpoint."""
-    normalized = str(model_name).strip().rstrip("/")
-    return normalized.lower() == HY_NOMAS_MODEL_ID.lower() or (
-        os.path.isdir(normalized)
-        and not any(
-            os.path.isfile(os.path.join(normalized, name)) for name in (*DIFFUSION_MODEL_INDEX_FILES, "config.json")
-        )
-        and all(os.path.isfile(os.path.join(normalized, relative)) for relative in HY_NOMAS_REQUIRED_FILES)
-    )
-
-
 def resolve_native_diffusion_model_class(model_name: str) -> str | None:
     """Resolve native checkpoints that have no root HF or Diffusers config."""
     from vllm_omni.diffusion.models.video_depth_anything.checkpoints import resolve_checkpoint
 
     if _looks_like_magi2(model_name):
         return "Magi2Pipeline"
-    if _looks_like_hy_nomas(model_name):
-        return "HyNomasPipeline"
     if resolve_checkpoint(model_name) is not None:
         return "VideoDepthAnythingPipeline"
     return None

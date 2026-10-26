@@ -19,7 +19,7 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 async def main():
     parser = argparse.ArgumentParser(description="Continue a Hy-Nomas AR session and save each stable video chunk.")
-    parser.add_argument("--model", default="tencent/Hy-Nomas")
+    parser.add_argument("--model", default="tencent/Hy-Nomas-Diffusers")
     parser.add_argument("--prompts", nargs="+", required=True)
     parser.add_argument("--camera", default=None, help="Reference camera trajectory or generator, such as pan_left.")
     parser.add_argument("--output-dir", type=Path, required=True)
@@ -29,13 +29,16 @@ async def main():
     parser.add_argument("--num-inference-steps", type=int, choices=(4, 6, 8), default=8)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--ulysses-degree", type=int, default=2)
-    parser.add_argument("--text-encoder", default="Qwen/Qwen2.5-VL-7B-Instruct")
+    parser.add_argument("--text-encoder", help="Override the checkpoint's bundled text encoder and tokenizer.")
     args = parser.parse_args()
     if args.num_frames < 5 or (args.num_frames - 1) % 4 or args.num_frames > 61:
         parser.error("--num-frames must be 4*n+1 in [5, 61].")
     if len(args.prompts) * ((args.num_frames - 1) // 4 + 1) > 120 or len(args.prompts) > 16:
         parser.error("The example session must fit 120 latent frames and 16 prompt segments.")
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    pipeline_args: dict[str, int | str] = {"ar_height": args.height, "ar_width": args.width}
+    if args.text_encoder is not None:
+        pipeline_args["text_encoder"] = args.text_encoder
     engine = AsyncOmni(
         model=args.model,
         enforce_eager=True,
@@ -45,7 +48,7 @@ async def main():
         engine_backend="vllm_omni.experimental.ar_diffusion.engine.ARDiffusionEngine",
         step_execution=False,
         parallel_config={"ulysses_degree": args.ulysses_degree},
-        custom_pipeline_args={"text_encoder": args.text_encoder, "ar_height": args.height, "ar_width": args.width},
+        custom_pipeline_args=pipeline_args,
         model_config={"ar_diffusion_kv_config": {"gpu_memory_fraction": 0.02, "warmup_cudagraph": False}},
     )
     lifecycle = ARDiffusionWorkerLifecycle(engine, stage_ids=[0], timeout=180)

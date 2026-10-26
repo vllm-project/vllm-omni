@@ -3,9 +3,11 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
+from itertools import groupby
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -15,6 +17,7 @@ from omegaconf import DictConfig
 from torch import nn
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from vllm.logger import init_logger
+from vllm.utils.torch_utils import set_default_torch_dtype
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.parallel_state import get_sp_group
@@ -31,16 +34,14 @@ from vllm_omni.diffusion.media import (
 )
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.hy_nomas.configuration_hy_nomas import (
-    DECODER_FILE,
-    DIT_FILE,
     REQUIRED_FILES,
-    TEXT_ENCODER_ID,
     HyNomasARConfig,
 )
 from vllm_omni.diffusion.models.hy_nomas.hy_nomas_transformer import (
     build_transformer,
     commit_cache,
     initialize_reference_parallelism,
+    load_component_weights,
     load_transformer_weights,
     reference_cache_views,
 )
@@ -89,8 +90,8 @@ def build_reference_config(model_root: Path, text_encoder: str, sp_size: int = 1
     del base["defaults"]
     del inference["defaults"]
     config = OmegaConf.merge(base, inference)
-    config.dit_weight = str(model_root / DIT_FILE)
-    config.model.vae.checkpoint = str(model_root / DECODER_FILE)
+    config.dit_weight = str(model_root / "transformer")
+    config.model.vae.checkpoint = str(model_root / "decoder")
     config.model.vae.parallel_mode = "none"
     config.model.text_encoder.model_name = text_encoder
     config.model.dit.seg_ar_attention_backend = "flex"
@@ -102,6 +103,43 @@ def build_reference_config(model_root: Path, text_encoder: str, sp_size: int = 1
     config = reference_config._flatten_cfg(config)
     OmegaConf.set_struct(config, True)
     return config
+
+
+def read_component_config(root: Path, component: str, filename: str, class_name: str) -> dict[str, Any]:
+    path = root / component / filename
+    config = json.loads(path.read_text())
+    if not isinstance(config, dict) or config.get("_class_name") != class_name:
+        raise ValueError(f"Hy-Nomas expects {class_name} in {path}.")
+    return config
+
+
+def build_decoder(config: dict[str, Any], device: torch.device) -> nn.Module:
+    from hymm.models.vae.pixelumm_decoder.autoencoder import PixelUMMDCAELatentDecoder
+    from hymm.models.vae.pixelumm_decoder.model import DCAEVPixelUMMDecoder, GenExpertArch
+
+    arch = GenExpertArch(**{name: config[name] for name in GenExpertArch.__dataclass_fields__})
+    local_pixels = config["local_attention_tile_pixels"]
+    if type(local_pixels) is not int or local_pixels < 0 or local_pixels % 16:
+        raise ValueError("Hy-Nomas local_attention_tile_pixels must be a nonnegative multiple of 16.")
+    with set_default_torch_dtype(torch.bfloat16), torch.device(device):
+        decoder = DCAEVPixelUMMDecoder(arch, local_attention_tile=local_pixels // 16)
+    vae = PixelUMMDCAELatentDecoder(
+        decoder,
+        **{
+            name: config[name]
+            for name in (
+                "denoising_step_list",
+                "num_steps",
+                "seed",
+                "temporal_window_latents",
+                "temporal_overlap_latents",
+                "decoder_tile_pixels",
+                "decoder_tile_overlap_pixels",
+                "tail_hold_latents",
+            )
+        },
+    )
+    return vae.to(device=device, dtype=torch.bfloat16).eval().requires_grad_(False)
 
 
 def validate_config(config: OmniDiffusionConfig) -> None:
@@ -145,8 +183,8 @@ def validate_config(config: OmniDiffusionConfig) -> None:
         "vllm_omni.experimental.ar_diffusion.engine.ARDiffusionEngine",
     ):
         raise ValueError("Hy-Nomas step execution requires the ARDiffusionEngine backend.")
-    text_encoder = custom.get("text_encoder", TEXT_ENCODER_ID)
-    if not isinstance(text_encoder, str) or not text_encoder.strip():
+    text_encoder = custom.get("text_encoder")
+    if "text_encoder" in custom and (not isinstance(text_encoder, str) or not text_encoder.strip()):
         raise ValueError("Hy-Nomas text_encoder must be a nonempty model ID or local path.")
 
 
@@ -189,12 +227,16 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
         self.target_dtype = torch.bfloat16
         self._cpu_offload = False
         root = Path(od_config.model)
+        text_encoder_override = (od_config.custom_pipeline_args or {}).get("text_encoder")
         if not root.is_dir():
             root = Path(
                 download_weights_from_hf_specific(
                     od_config.model,
                     cache_dir=None,
-                    allow_patterns=list(REQUIRED_FILES),
+                    allow_patterns=[
+                        *REQUIRED_FILES,
+                        *([] if text_encoder_override is not None else ["text_encoder/*", "tokenizer/*"]),
+                    ],
                     revision=od_config.revision,
                     require_all=True,
                 )
@@ -202,28 +244,69 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
         for relative in REQUIRED_FILES:
             if not (root / relative).is_file():
                 raise FileNotFoundError(f"Missing Hy-Nomas checkpoint: {root / relative}")
-        text_encoder = (od_config.custom_pipeline_args or {}).get("text_encoder", TEXT_ENCODER_ID)
+        index = json.loads((root / "modular_model_index.json").read_text())
+        if not isinstance(index, dict) or index.get("_class_name") != "HyNomasModularPipeline":
+            raise ValueError("Hy-Nomas requires a HyNomasModularPipeline checkpoint.")
+        transformer_config = read_component_config(root, "transformer", "config.json", "HyNomasTransformer3DModel")
+        decoder_config = read_component_config(root, "decoder", "config.json", "PixelUMMDecoder")
+        scheduler_config = read_component_config(
+            root, "scheduler", "scheduler_config.json", "FlowMatchEulerDiscreteScheduler"
+        )
+        if scheduler_config.get("shift") != 5.0 or scheduler_config.get("num_train_timesteps") != 1000:
+            raise ValueError("Hy-Nomas requires a 1000-timestep Euler scheduler with shift=5.")
+        if any(
+            scheduler_config.get(name)
+            for name in (
+                "use_dynamic_shifting",
+                "invert_sigmas",
+                "shift_terminal",
+                "stochastic_sampling",
+                "use_beta_sigmas",
+                "use_exponential_sigmas",
+                "use_karras_sigmas",
+            )
+        ):
+            raise ValueError("Hy-Nomas requires the checkpoint's standard deterministic Euler schedule.")
+        text_encoder = text_encoder_override or str(root / "text_encoder")
         initialize_reference_parallelism(self.sp_size, self.device)
         self.args = build_reference_config(root, text_encoder, self.sp_size)
         self.weights_sources = [
             DiffusersPipelineLoader.ComponentSource(
-                model_or_path=str(root),
-                subfolder="DiT/distilled",
-                revision=None,
-                prefix="transformer.",
+                model_or_path=od_config.model,
+                subfolder=component,
+                revision=od_config.revision,
+                prefix=prefix,
                 fall_back_to_pt=False,
-                allow_patterns_overrides=[Path(DIT_FILE).name],
             )
+            for component, prefix in (("transformer", "transformer."), ("decoder", "vae."))
         ]
-        from hymm.models.checkpointing.load import load_text_encoder
-        from hymm.models.vae.pixelumm_decoder import maybe_load_pixelumm_decoder
+        from configs.constants import PROMPT_TEMPLATE
+        from hymm.models.text_encoder import TextEncoder
 
-        self.transformer = build_transformer(self.args, self.device)
-        self.text_encoder = load_text_encoder(self.device, logger, self.args).eval().requires_grad_(False)
-        self.vae = maybe_load_pixelumm_decoder(self.args, device=self.device, logger=logger)
-        if self.vae is None:
-            raise ValueError("Hy-Nomas requires the PixelUMM decoder.")
-        self.vae.eval().requires_grad_(False)
+        self.transformer = build_transformer(self.args, self.device, transformer_config)
+        text_config = self.args.text_encoder
+        self.text_encoder = (
+            TextEncoder(
+                text_encoder_type=self.args.text_encoder_type,
+                text_encoder_path=text_encoder,
+                tokenizer_type=text_config.tokenizer,
+                tokenizer_path=text_encoder_override or str(root / "tokenizer"),
+                max_length=text_config.text_len if not text_config.use_ll_cap_dataset else text_config.text_len_ll_cap,
+                text_encoder_precision=text_config.text_encoder_precision,
+                prompt_template=PROMPT_TEMPLATE[text_config.prompt_template] if text_config.prompt_template else None,
+                prompt_template_video=PROMPT_TEMPLATE[text_config.prompt_template_video]
+                if text_config.prompt_template_video
+                else None,
+                hidden_state_skip_layer=2,
+                apply_final_norm=False,
+                reproduce=False,
+                logger=logger,
+                device=self.device,
+            )
+            .eval()
+            .requires_grad_(False)
+        )
+        self.vae = build_decoder(decoder_config, self.device)
         self.s_ratio = self.vae.spatial_compression_ratio
         self.patch_size = self.transformer.patch_size
         self.in_channels = self.transformer.config.in_channels
@@ -233,15 +316,22 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
         self.cache_noise_sigma = float(self.args.inference.cache_noise_sigma)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        def transformer_weights():
-            for name, tensor in weights:
-                if not name.startswith("transformer."):
-                    raise ValueError(f"Unexpected Hy-Nomas component weight: {name}")
-                yield name.removeprefix("transformer."), tensor
-
-        loaded = {f"transformer.{name}" for name in load_transformer_weights(self.transformer, transformer_weights())}
+        loaded = set()
+        components = set()
+        for component, entries in groupby(weights, key=lambda item: item[0].partition(".")[0]):
+            if component not in {"transformer", "vae"}:
+                raise ValueError(f"Unexpected Hy-Nomas component weight: {component}")
+            if component in components:
+                raise ValueError(f"Duplicate Hy-Nomas component weight stream: {component}")
+            components.add(component)
+            loader = load_transformer_weights if component == "transformer" else load_component_weights
+            names = loader(getattr(self, component), ((name.partition(".")[2], value) for name, value in entries))
+            loaded.update(f"{component}.{name}" for name in names)
+        if components != {"transformer", "vae"}:
+            raise ValueError(
+                f"Hy-Nomas checkpoint is missing component weights: {sorted({'transformer', 'vae'} - components)}"
+            )
         loaded.update(f"text_encoder.{name}" for name, _ in self.text_encoder.named_parameters())
-        loaded.update(f"vae.{name}" for name, _ in self.vae.named_parameters())
         return loaded
 
     def setup_compile(self) -> None:

@@ -3,16 +3,20 @@
 ## Summary
 
 - Vendor: Tencent Hunyuan
-- Model: [`tencent/Hy-Nomas`](https://huggingface.co/tencent/Hy-Nomas), distilled checkpoint
+- Model: [`tencent/Hy-Nomas-Diffusers`](https://huggingface.co/tencent/Hy-Nomas-Diffusers), BF16 distilled checkpoint
 - Task: text-to-video with segment prompts and optional camera control
 - Modes: offline generation, `/v1/videos`, realtime streaming, and multi-turn continuation
-- Hardware: one or two NVIDIA H200 GPUs, 141 GB per device
+- Target hardware: one or two NVIDIA H200 GPUs, 141 GB per device
 - Runtime: `HyNomasPipeline`, BF16, with the pinned Hy-Nomas reference package
 - Maintainer: vLLM-Omni community
 
 Use this recipe for text-controlled video generation and interactive continuation.
-The pipeline manages generation and component loading; the DiT, text encoder,
-PixelUMM decoder, and Euler scheduler implementations require the reference package.
+The pipeline manages generation and loads the DiT and PixelUMM shards through
+vLLM-Omni's component weight loader. It uses the checkpoint's bundled text encoder
+and tokenizer. Model computation, text preprocessing, and the Euler scheduler
+retain the pinned Hy-Nomas reference implementation.
+`HyNomasModularPipeline` in the checkpoint index selects this vLLM-Omni pipeline.
+The author's Diffusers fork is not needed for this integration.
 
 ## Supported model contract
 
@@ -47,26 +51,27 @@ instead of the video endpoint's top-level `seconds` field.
 
 ## Deployment profiles
 
-| Profile | Devices | Configuration | Qualification |
+| Profile | Devices | Configuration | Behavior |
 | --- | --- | --- | --- |
 | Ordinary generation | 1 H200 | `hy_nomas.yaml`, BF16, `mp`, eager | Offline and video API, resident and CPU offload |
 | Sequence parallel generation | 2 H200 | `hy_nomas.yaml` plus `--ulysses-degree 2` | Offline and video API, resident and CPU offload |
 | Realtime streaming | 2 H200 | `hy_nomas_ar.yaml`, Ulysses degree 2 | Prompt/camera updates, cancellation, and a subsequent request |
-| Multi-turn continuation | 2 H200 | Session example, Ulysses degree 2 | Three 49-frame turns with a final decoder flush |
+| Multi-turn continuation | 2 H200 | Session example, Ulysses degree 2 | Successive turns with a final decoder flush |
+
+GPU qualification of the converted checkpoint is pending. The prior native
+checkpoint's GPU results do not qualify this checkpoint migration.
 
 Weights, text encoding, and PixelUMM decoding remain replicated with sequence
 parallelism. The degree must divide the DiT's 16 attention heads and the spatial
-token count per latent frame. Only degrees one and two have real-model qualification.
-Device interconnect, peak memory, and host memory were not recorded for these checks.
+token count per latent frame. The supplied profiles target degrees one and two.
+Device interconnect, peak memory, and host memory are not qualified for this conversion.
 CPU offload requires sufficient GPU memory for initial component loading and host
 memory for the staged weights.
 
 ## Software and checkpoints
 
-Qualification used Linux, Python 3.12.13, PyTorch 2.13.0+cu130, CUDA 13.0,
+The development environment uses Linux, Python 3.12.13, PyTorch 2.13.0+cu130, CUDA 13.0,
 vLLM 0.32.0, Transformers 5.16.1, Diffusers 0.40.0, and FlashAttention 2.8.3.
-The qualified vLLM-Omni implementation is commit
-`9a2b1f2fada0abeb3db0ccb5b3ade14ee50c398b`; the driver version was not recorded.
 
 Install vLLM-Omni first, then install the pinned reference checkout without
 replacing the environment's existing dependency versions:
@@ -87,21 +92,23 @@ Verify imports before loading weights:
 python -c 'from hymm.pipeline.causal_ar import CPTCausalInferencePipeline'
 ```
 
-Download the distilled DiT and PixelUMM checkpoints:
+Download the component checkpoint:
 
 ```bash
-hf download tencent/Hy-Nomas \
-  DiT/distilled/diffusion_pytorch_model_ema_0_995.safetensors \
-  VAE/PixelUMM_FT/diffusion_pytorch_model.safetensors \
-  --local-dir ./Hy-Nomas-weights
+hf download tencent/Hy-Nomas-Diffusers \
+  --revision a1ae04d11ae4ea176d1f76de634c115944f9882d \
+  --local-dir ./Hy-Nomas-Diffusers
 ```
 
-The local directory must retain these relative paths. The checkpoint must include
-all DiT parameters, including camera weights. Both this layout and the Hub ID are
-recognized without `model_index.json`. Passing the Hub ID to the shared entrypoints
-uses the standard snapshot download and may fetch additional checkpoint variants.
+Keep `modular_model_index.json` and the `transformer/`, `decoder/`, `text_encoder/`,
+`tokenizer/`, and `scheduler/` directories. The pipeline uses each weight index to
+load its shards and checks required parameters, duplicate names, and tensor shapes.
+The published DiT attention names are mapped to the reference component's names.
+The Hub ID also works directly; standard modular-checkpoint discovery selects the
+pipeline without a generated index or model-name special case.
 
-The text encoder separately loads `Qwen/Qwen2.5-VL-7B-Instruct`. To use a local copy,
+The bundled text encoder is `Qwen2_5_VLTextModel`. To override it with an existing
+Qwen text encoder and its tokenizer,
 pass `--custom-pipeline-args '{"text_encoder":"/path/to/Qwen2.5-VL-7B-Instruct"}'`
 to the server, or `custom_pipeline_args={"text_encoder": "/path/to/Qwen2.5-VL-7B-Instruct"}`
 to the Python API.
@@ -112,7 +119,7 @@ Run commands from the vLLM-Omni repository:
 
 ```bash
 python examples/offline_inference/text_to_video/text_to_video.py \
-  --model ./Hy-Nomas-weights \
+  --model ./Hy-Nomas-Diffusers \
   --deploy-config vllm_omni/deploy/hy_nomas.yaml \
   --prompt 'A forest beside a river. ||| The camera moves along the river.' \
   --height 704 --width 1280 --num-frames 121 --num-inference-steps 8 \
@@ -134,7 +141,7 @@ sampling parameters are outside this checkpoint's contract.
 ## Online generation
 
 ```bash
-vllm serve ./Hy-Nomas-weights --omni --port 8098 \
+vllm serve ./Hy-Nomas-Diffusers --omni --port 8098 \
   --deploy-config vllm_omni/deploy/hy_nomas.yaml
 ```
 
@@ -159,7 +166,7 @@ with a two-segment prompt and 121 frames. `generate_sound=false` is accepted.
 Select the components to offload with the shared configuration:
 
 ```bash
-vllm serve ./Hy-Nomas-weights --omni \
+vllm serve ./Hy-Nomas-Diffusers --omni \
   --deploy-config vllm_omni/deploy/hy_nomas.yaml \
   --diffusion-offload-config '{"mode":"module","components":["dit","text_encoder"]}'
 ```
@@ -174,7 +181,7 @@ DiT weights for each forward, increasing transfer overhead.
 Start the two-GPU AR-Diffusion deployment:
 
 ```bash
-vllm serve ./Hy-Nomas-weights --omni --port 8098 \
+vllm serve ./Hy-Nomas-Diffusers --omni --port 8098 \
   --deploy-config vllm_omni/deploy/hy_nomas_ar.yaml
 ```
 
@@ -182,7 +189,7 @@ Connect the shared streaming client:
 
 ```bash
 python examples/online_serving/streaming_video_generation/streaming_video_client.py \
-  --model ./Hy-Nomas-weights --port 8098 --no-helios-distilled-preset \
+  --model ./Hy-Nomas-Diffusers --port 8098 --no-helios-distilled-preset \
   --prompt 'A forest beside a river.' --height 704 --width 1280 \
   --num-frames 241 --num-inference-steps 8 --guidance-scale 1 --fps 24 --seed 42 \
   --prompt-updates '[{"at":2,"prompt":"The camera approaches a wooden bridge.","transition_chunks":0}]' \
@@ -210,7 +217,7 @@ noise timeline.
 
 ```bash
 python examples/offline_inference/text_to_video/hy_nomas_session.py \
-  --model ./Hy-Nomas-weights --ulysses-degree 2 \
+  --model ./Hy-Nomas-Diffusers --ulysses-degree 2 \
   --prompts 'A forest beside a river.' 'The camera approaches a wooden bridge.' \
   --height 704 --width 1280 --num-frames 49 --num-inference-steps 8 \
   --output-dir /path/to/results/hy_nomas_session
@@ -231,7 +238,7 @@ order. `metadata.ar_diffusion` preserves tick identity and applied event IDs.
 
 | Feature | Hy-Nomas support |
 | --- | --- |
-| [Sequence parallelism](../../docs/user_guide/diffusion/parallelism/sequence_parallel.md) | Strict Ulysses with the existing worker group; H200 qualification at degree 2. Ring, AllGather-KV, and UAA are unsupported. |
+| [Sequence parallelism](../../docs/user_guide/diffusion/parallelism/sequence_parallel.md) | Strict Ulysses with the existing worker group. Ring, AllGather-KV, and UAA are unsupported. |
 | [CPU offload](../../docs/user_guide/diffusion/cpu_offload.md) | Module offload, including with SP; layerwise and distributed layerwise offload are unsupported. |
 | [Other parallelism](../../docs/user_guide/diffusion/parallelism/overview.md) | TP, PP, DP, CFG, HSDP, text encoder sharding, and VAE parallelism are unsupported. |
 | [Other acceleration](../../docs/user_guide/diffusion_features.md) | Quantization, LoRA, and Cache-DiT are unsupported. Use eager execution; full-transformer compilation is rejected and generic regional compilation leaves the cached reference forward unchanged. FlexAttention retains its own kernel compilation. |
@@ -242,18 +249,12 @@ For a quick check, change the offline command to one prompt, 256×256, nine fram
 and four steps. Verify that the output has nine frames at 24 fps. This checks
 execution; it does not establish video quality or performance.
 
-Real-model qualification at the commit above passed 18 GPU cases: six ordinary
-reference comparisons, two AR continuation comparisons, and ten offline/API cases
-across one and two H200s. The reference comparisons cover resident and CPU-offload
-execution. Ordinary comparisons use 384×640, 49 frames, eight steps, and seed 42;
-AR comparisons check two 49-frame turns. Decoded frames match exactly, and AR
-latents also match exactly. Ordinary and AR modes use different reference schedules;
-comparisons require matching segment/chunk boundaries and noise capacity.
-
-The two-GPU session example produced 147 frames across three turns. Realtime
-validation covered a 477-frame request with live prompt/camera updates,
-cancellation after initial output, and a subsequent 477-frame request.
-These checks provide no latency or throughput benchmark.
+CPU coverage checks modular discovery, sharded component loading, parameter-name
+mapping, component initialization, and AR state handling. The GPU accuracy tests
+compare the converted checkpoint against the independent original checkpoint,
+including resident/offload generation and two-turn continuation. Offline and
+video API tests cover one and two H200s. These GPU checks have not yet run for
+the converted checkpoint; generation quality and performance remain unqualified.
 
 ## References
 
