@@ -91,6 +91,23 @@ def _supports_video_spans(sparse_attention: Any) -> bool:
         return False
 
 
+@functools.cache
+def _mindiesd_supports_pre_rearranged() -> bool:
+    """Whether the installed MindIE-SD accepts pre_rearranged=.
+
+    An older release swallows it through ``**kwargs`` and reorders rows that
+    the model already reordered, which is silently wrong output rather than a
+    missed optimization. The probe is cached because the answer cannot change
+    within a process.
+    """
+    try:
+        from mindiesd import sparse_attention
+
+        return "pre_rearranged" in inspect.signature(sparse_attention).parameters
+    except (ImportError, TypeError, ValueError):
+        return False
+
+
 @dataclass(frozen=True)
 class RainFusionConfig:
     """Resolved RainFusion controls for one attention layer.
@@ -131,6 +148,7 @@ class RainFusionPlan:
     prefix_len: int | None = None
     latent_shape: list[int] | None = None
     video_spans: list[dict[str, object]] | None = None
+    pre_rearranged: bool = False
 
 
 class RainFusionAttentionBackend(AttentionBackend):
@@ -274,6 +292,8 @@ class RainFusionAttentionImpl(AttentionImpl):
             int(attn_metadata.extra.get("minimax_h3_compact_reference_rows", 0)) if attn_metadata is not None else 0
         )
         if reference_rows:
+            # reference_rows is only nonzero when attn_metadata was present.
+            assert attn_metadata is not None
             if self.qkv_layout != _INPUT_LAYOUT:
                 raise ValueError("RainFusion reference-KV reuse requires BSND layout")
             if key.shape != value.shape or key.shape[1] != query.shape[1] + reference_rows:
@@ -617,7 +637,11 @@ class RainFusionAttentionImpl(AttentionImpl):
             dense_context_seqlen,
             int(used_len),
         )
-        return RainFusionPlan(used_len=int(used_len), video_spans=spans)
+        return RainFusionPlan(
+            used_len=int(used_len),
+            video_spans=spans,
+            pre_rearranged=bool(layout.pre_rearranged),
+        )
 
     def _forward_sparse_npu(
         self,
@@ -633,6 +657,12 @@ class RainFusionAttentionImpl(AttentionImpl):
             raise ImportError(_MISSING_MINDIESD)
         if plan.video_spans is not None and not _supports_video_spans(sparse_attention):
             raise ValueError(_INCOMPATIBLE_MINDIESD)
+        if plan.pre_rearranged and not _mindiesd_supports_pre_rearranged():
+            raise ValueError(
+                "RainFusion was told its rows are already reordered, but the installed MindIE-SD "
+                "sparse_attention does not accept pre_rearranged=. It would reorder them again and "
+                "produce wrong output. Upgrade MindIE-SD or unset the row-reorder hoist."
+            )
         extra = attn_metadata.extra if attn_metadata else {}
         requested = extra.get("kv_cache_dtype", self.rainfusion.precision)
         reason = None
@@ -683,6 +713,7 @@ class RainFusionAttentionImpl(AttentionImpl):
                 v,
                 sparse_type="rf_v2",
                 video_spans=plan.video_spans,
+                pre_rearranged=plan.pre_rearranged,
                 **common_kwargs,
             )
         else:

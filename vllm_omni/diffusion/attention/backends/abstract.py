@@ -211,6 +211,11 @@ class VideoTokenLayout:
     Ref2VA layout instead publishes ``used_len`` and every physical video
     span, so audio and image rows between videos remain dense.
 
+    ``pre_rearranged`` says the model has already applied the backend's row
+    permutation to the whole packed sequence, so a backend that would reorder
+    rows per call can skip it. ``video_spans`` still describes pre-reorder
+    coordinates.
+
     Plain ints, so reading it never forces a device-to-host sync.
     """
 
@@ -218,6 +223,7 @@ class VideoTokenLayout:
     latent_grid: tuple[int, int, int] | None = None
     used_len: int | None = None
     video_spans: tuple[VideoTokenSpan, ...] = ()
+    pre_rearranged: bool = False
 
 
 @dataclass(frozen=True, slots=True)

@@ -123,6 +123,21 @@ def test_ref2va_multi_video_spans_resolve():
     ]
 
 
+def test_ref2va_multi_video_plan_forwards_pre_rearranged():
+    layout = VideoTokenLayout(
+        used_len=12000,
+        video_spans=(
+            VideoTokenSpan(start=128, latent_grid=(4, 16, 64), role="reference"),
+            VideoTokenSpan(start=5000, latent_grid=(4, 16, 64), role="target"),
+        ),
+        pre_rearranged=True,
+    )
+    plan = make_impl()._resolve_plan(AttentionMetadata(extra={"max_seqlen_q": 12000}, video_layout=layout))
+
+    assert plan is not None
+    assert plan.pre_rearranged is True
+
+
 def test_invalid_ref2va_video_spans_fall_back_to_dense():
     layout = VideoTokenLayout(
         used_len=12000,
@@ -342,3 +357,64 @@ def test_precision_non_bf16_passes_gate_when_supported():
             # The gate must pass; the fake mindiesd returns None so no crash.
             out = impl._forward_sparse_npu(q, q, q, plan)
             assert out is None
+
+
+# pre_rearranged capability gate: an older mindiesd would swallow the flag and
+# reorder already-reordered rows, so an explicit hoist request must fail fast.
+
+
+def _recording_mindiesd_module():
+    """Install a stand-in whose sparse_attention records the hoist kwarg."""
+    import types
+
+    calls: list[dict] = []
+
+    def sparse_attention(
+        q,
+        k,
+        v,
+        *,
+        video_spans=None,
+        pre_rearranged=False,
+        **kwargs,
+    ):
+        calls.append({"video_spans": video_spans, "pre_rearranged": pre_rearranged, **kwargs})
+        return q
+
+    fake = types.ModuleType("mindiesd")
+    setattr(fake, "sparse_attention", sparse_attention)
+    return fake, calls
+
+
+def test_pre_rearranged_requires_mindiesd_support():
+    import sys
+
+    impl = make_impl()
+    plan = RainFusionPlan(
+        used_len=8,
+        video_spans=[{"start": 0, "latent_shape": [2, 2, 2]}],
+        pre_rearranged=True,
+    )
+    with mock.patch.dict(sys.modules, {"mindiesd": _recording_mindiesd_module()[0]}):
+        with mock.patch.object(rainfusion_attn, "_mindiesd_supports_pre_rearranged", return_value=False):
+            with pytest.raises(ValueError, match="pre_rearranged"):
+                impl._forward_sparse_npu(torch.randn(1, 8, 4, 128), None, None, plan)
+
+
+def test_pre_rearranged_is_forwarded_to_sparse_attention():
+    import sys
+
+    impl = make_impl()
+    q = torch.randn(1, 8, 4, 128)
+    plan = RainFusionPlan(
+        used_len=8,
+        video_spans=[{"start": 0, "latent_shape": [2, 2, 2]}],
+        pre_rearranged=True,
+    )
+    fake, calls = _recording_mindiesd_module()
+    with mock.patch.dict(sys.modules, {"mindiesd": fake}):
+        with mock.patch.object(rainfusion_attn, "_mindiesd_supports_pre_rearranged", return_value=True):
+            out = impl._forward_sparse_npu(q, q, q, plan)
+
+    assert torch.equal(out, q)
+    assert calls[0]["pre_rearranged"] is True
