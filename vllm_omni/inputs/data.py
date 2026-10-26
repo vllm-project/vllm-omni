@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import copy
+import math
 import pprint
 from dataclasses import asdict, dataclass, field
 from typing import Any, TypeAlias
@@ -55,6 +56,7 @@ class OmniInteractionPrompt(TypedDict):
     event_id: str
     event: OmniInteractionEvent
     transition_chunks: NotRequired[int]
+    received_at: NotRequired[float]  # Internal engine-clock ingress stamp; never trusted from clients.
 
 
 class OmniTokensPrompt(TokensPrompt):
@@ -134,6 +136,12 @@ class OmniCustomPrompt(TypedDict, total=False):
 
     Allows users to pass pre-tokenized prompt IDs, attention masks, and extra
     arguments directly, bypassing the tokenization stage in the pipeline.
+
+    ``prompt_ids`` / ``negative_prompt_ids`` are honored only by pipelines that
+    declare ``supports_pre_tokenized_prompt_ids = True``. The diffusion engine
+    rejects a request that sets them for any other in-tree pipeline (HTTP 400)
+    instead of silently generating from an empty or text-only condition. A
+    user-supplied custom pipeline is not checked unless it declares the flag.
 
     Attributes:
         prompt_ids: Pre-tokenized prompt token IDs (single or batched)
@@ -354,7 +362,37 @@ class OmniDiffusionSamplingParams:
     # first admits this request for execution.
     emit_request_lifecycle: bool = False
 
+    # Opt-in playback feedback for a single interactive video stream. The
+    # engine starts another chunk only while generated media is below this
+    # many seconds ahead of the client's reported playback position.
+    streaming_buffer_seconds: float | None = None
+    streaming_max_output_bytes: int = 64 * 1024 * 1024
+    streaming_idle_timeout_s: float = 30.0
+    # AsyncOmni releases each output only after its consumer resumes iteration.
+    streaming_output_ack: bool = False
+
     def __post_init__(self) -> None:
+        buffer = self.streaming_buffer_seconds
+        if buffer is not None and (
+            isinstance(buffer, bool)
+            or not isinstance(buffer, (int, float))
+            or not math.isfinite(buffer)
+            or not 0 < buffer <= 10
+        ):
+            raise ValueError("streaming_buffer_seconds must be finite and in (0, 10]")
+        if (
+            isinstance(self.streaming_max_output_bytes, bool)
+            or not isinstance(self.streaming_max_output_bytes, int)
+            or not 0 < self.streaming_max_output_bytes <= 2**63 - 1
+        ):
+            raise ValueError("streaming_max_output_bytes must be a positive integer")
+        if (
+            isinstance(self.streaming_idle_timeout_s, bool)
+            or not isinstance(self.streaming_idle_timeout_s, (int, float))
+            or not math.isfinite(self.streaming_idle_timeout_s)
+            or self.streaming_idle_timeout_s <= 0
+        ):
+            raise ValueError("streaming_idle_timeout_s must be finite and positive")
         if self.quality is not None and self.quality not in DIFFUSION_QUALITY_LEVELS:
             raise ValueError(f"quality must be one of {list(DIFFUSION_QUALITY_LEVELS)}, got {self.quality!r}")
 

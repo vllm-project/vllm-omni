@@ -535,9 +535,10 @@ def _async_copy_tensor(
         pin_memory = PIN_MEMORY
     cpu = torch.empty_like(x, device="cpu", pin_memory=pin_memory)
     cpu.copy_(x, non_blocking=pin_memory)
-    if copy_stream is None:
-        copy_stream = torch.cuda.current_stream()
-    x.record_stream(copy_stream)
+    if pin_memory:
+        if copy_stream is None:
+            copy_stream = torch.cuda.current_stream()
+        x.record_stream(copy_stream)
     return cpu
 
 
@@ -748,8 +749,10 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
         self._has_fault: torch.Tensor | None = None
 
         # Snapshot input_batch metadata needed for pooler_output slicing
-        self._need_pooler = text_hidden is not None or (
-            (self._async_chunk or finalize_multimodal is not None) and bool(multimodal_outputs)
+        self._need_pooler = (
+            streaming_audio is not None
+            or text_hidden is not None
+            or ((self._async_chunk or finalize_multimodal is not None) and bool(multimodal_outputs))
         )
         self._query_start_loc_np: np.ndarray | None = None
         self._num_scheduled_tokens: np.ndarray | None = None
@@ -841,7 +844,9 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
                 if streaming_audio is not None
                 else None
             )
-            if self._need_pooler and (self._async_chunk or self._finalize_multimodal is not None):
+            if self._need_pooler and (
+                self._async_chunk or self._finalize_multimodal is not None or self._streaming_audio is not None
+            ):
                 # CUDA graph replay reuses the model's output buffers. Take
                 # ownership directly in pinned host memory on the output copy
                 # stream so deferred finalization never performs a blocking
@@ -926,7 +931,9 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
         #   * pooler_output  -> sync/full-payload path (inline pooling_output bridge)
         #   * multimodal_outputs -> wire multimodal_output, which the async_chunk
         #     stage-input processor (talker2code2wav_async_chunk) reads for codes.
-        if self._need_pooler and (self._async_chunk or self._finalize_multimodal is not None):
+        if self._need_pooler and (
+            self._async_chunk or self._finalize_multimodal is not None or self._streaming_audio is not None
+        ):
             if self._finalize_multimodal is not None:
                 self._mm_snapshot = self._finalize_multimodal(self._mm_snapshot, num_sampled_tokens)
             pooler_inter: list[dict[str, Any] | None] | None
@@ -950,12 +957,19 @@ class OmniAsyncOutput(AsyncModelRunnerOutput):
                 )
             if self._streaming_audio is not None:
                 pooler_inter, pooler_client = None, self._streaming_audio.get_output()
+                # PCM chunks are host tensors this output owns (fresh, or views of its
+                # own D2H copy) and the sample rate is a shared read-only scalar:
+                # publish them without a per-request host copy.
+                copy_payload = _ensure_tensor_values
+            else:
+
+                def copy_payload(payload: dict[str, Any]) -> dict[str, torch.Tensor]:
+                    return _ensure_tensor_values(_async_copy_mm_value(payload))
+
             self.model_runner_output.pooler_output = None if self._async_chunk else pooler_inter
             self.model_runner_output.inter_stage_outputs = pooler_inter
             self.model_runner_output.multimodal_outputs = (
-                [_ensure_tensor_values(_async_copy_mm_value(p)) if p else {} for p in pooler_client]
-                if pooler_client
-                else None
+                [copy_payload(p) if p else {} for p in pooler_client] if pooler_client else None
             )
         elif self._need_pooler and self._hidden_cpu is not None:
             pooler_output = OmniARModelRunner._build_pooler_output_from_cpu(

@@ -28,6 +28,7 @@
         "dataset_name": "random",
         "backend": "openai-chat-omni",
         "endpoint": "/v1/chat/completions",
+        "extra_body": {"speaker": "ethan"},
         "num_prompts": [128, 128, 128, 128],
         "max_concurrency": [8, 16, 24, 32],
         "random_input_len": 2500,
@@ -36,9 +37,7 @@
         "percentile-metrics": "ttft,tpot,itl,e2el,audio_rtf,audio_ttfp,audio_duration",
         "baseline": {
             "H100": {
-                "mean_tpot_ms": [7.6955, 10.6457, 12.7363, 15.1608],
-                "mean_audio_ttfp_ms": [325.1624, 602.5192, 699.3891, 1024.088],
-                "mean_audio_rtf": [0.1689, 0.2088, 0.2397, 0.2791]
+                "mean_tpot_ms": [7.6955, 10.6457, 12.7363, 15.1608]
             }
         }
       },
@@ -46,6 +45,7 @@
         "dataset_name": "random-mm",
         "backend": "openai-chat-omni",
         "endpoint": "/v1/chat/completions",
+        "extra_body": {"speaker": "ethan"},
         "num_prompts": [10],
         "request_rate": [0.1],
         "random_input_len": 100,
@@ -61,17 +61,13 @@
           "(0, 60, 3)": 1.0
         },
         "percentile-metrics": "ttft,tpot,itl,e2el,audio_rtf,audio_ttfp,audio_duration",
-        "baseline": {
-            "H100": {
-                "mean_audio_ttfp_ms": [436.4663],
-                "mean_audio_rtf": [0.1069]
-            }
-        }
+        "baseline": {}
       },
       {
         "dataset_name": "random-mm",
         "backend": "openai-chat-omni",
         "endpoint": "/v1/chat/completions",
+        "extra_body": {"speaker": "ethan"},
         "num_prompts": [40],
         "request_rate": [0.5],
         "random_input_len": 100,
@@ -89,17 +85,13 @@
           "(720, 1280, 2)": 0.5
         },
         "percentile-metrics": "ttft,tpot,itl,e2el,audio_rtf,audio_ttfp,audio_duration",
-        "baseline": {
-            "H100": {
-                "mean_audio_ttfp_ms": [376.4911],
-                "mean_audio_rtf": [0.1145]
-            }
-        }
+        "baseline": {}
       },
       {
         "dataset_name": "random-mm",
         "backend": "openai-chat-omni",
         "endpoint": "/v1/chat/completions",
+        "extra_body": {"speaker": "ethan"},
         "num_prompts": [100],
         "request_rate": [1.0],
         "random_input_len": 100,
@@ -119,12 +111,7 @@
           "(0, 60, 3)": 0.33
         },
         "percentile-metrics": "ttft,tpot,itl,e2el,audio_rtf,audio_ttfp,audio_duration",
-        "baseline": {
-            "H100": {
-                "mean_audio_ttfp_ms": [638.2227],
-                "mean_audio_rtf": [0.1438]
-            }
-        }
+        "baseline": {}
       }
     ]
   }

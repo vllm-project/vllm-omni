@@ -9,6 +9,7 @@ from typing import Any
 import pytest
 import torch
 
+from tests.helpers.mark import hardware_marks
 from vllm_omni.diffusion.attention.backends.utils import fa
 
 pytestmark = [pytest.mark.diffusion, pytest.mark.core_model]
@@ -183,7 +184,11 @@ def test_malformed_lse_results_are_rejected(monkeypatch, result):
 
 
 @pytest.mark.parametrize(
-    "device_kind", [pytest.param("cuda", marks=pytest.mark.cuda), pytest.param("musa", marks=pytest.mark.musa)]
+    "device_kind",
+    [
+        pytest.param("cuda", marks=hardware_marks(res={"cuda": "L4"}, num_cards=1)),
+        pytest.param("musa", marks=hardware_marks(res={"musa": "S5000"}, num_cards=1)),
+    ],
 )
 @pytest.mark.parametrize("causal", [False, True])
 def test_standalone_gpu_lse_parity(device_kind, causal):

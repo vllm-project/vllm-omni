@@ -83,7 +83,7 @@ class Qwen3TTSTokenizerV2EncoderOutput(ModelOutput):
 class Qwen3TTSTokenizerV2DecoderOutput(ModelOutput):
     r"""
     audio_values (`List[torch.FloatTensor]`):
-        Decoded audio values, obtained using the decoder part of Qwen3TTSTokenizerV1.
+        Decoded audio values, obtained using the decoder part of Qwen3TTSTokenizerV2.
         Each tensor has shape (segment_length_i).
     """
 

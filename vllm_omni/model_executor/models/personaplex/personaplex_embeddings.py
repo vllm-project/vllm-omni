@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """PersonaPlex input embeddings (Moshi ``embed_codes``).
 
-The temporal transformer (:class:`HeliumForCausalLM`) consumes precomputed
+The temporal transformer (:class:`HeliumModel`) consumes precomputed
 ``inputs_embeds`` rather than token ids. Those embeddings come from Moshi's
 ``embed_codes``: a per-frame ``[B, 1 + n_q, S]`` token stack (row 0 = text,
 rows 1..n_q = audio codebooks) is mapped through one text embedding plus ``n_q``

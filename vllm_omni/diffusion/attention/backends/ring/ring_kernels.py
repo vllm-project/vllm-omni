@@ -1,10 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Copyright (c) 2024, Jiarui Fang.
 # Adapted from https://github.com/feifeibear/long-context-attention
 
 import math
 
 import torch
+
+from vllm_omni.diffusion.attention.backends.utils.fa import vllm_flash_attn_dense_with_lse
 
 from .ring_globals import (
     HAS_AITER,
@@ -179,9 +182,10 @@ def flash_attn_forward(
 def fa3_forward(q, k, v, dropout_p, softmax_scale, causal, window_size, softcap, alibi_slopes, return_softmax):
     """FA3 forward pass for inference.
 
-    FA3 supports Ampere, Ada, and Hopper GPUs. Dropout is ignored since FA3 is inference-only.
-    Uses low-level API (_flash_attn_forward) which always returns softmax_lse,
-    required for Ring Attention's correct accumulation.
+    This optional source-built FA3 fallback supports Hopper GPUs. Dropout is
+    ignored since FA3 is inference-only. Its low-level API
+    (``_flash_attn_forward``) always returns the softmax LSE required for Ring
+    Attention's correct accumulation.
     """
     assert HAS_FA3, "FA3 is not available"
     assert fa3_fwd_func is not None, "FA3 low-level API (fa3_fwd_func) not available"
@@ -200,6 +204,30 @@ def fa3_forward(q, k, v, dropout_p, softmax_scale, causal, window_size, softcap,
 
     # FA3 softmax_lse is (B, H, S).
     return out, softmax_lse
+
+
+def vllm_flash_attn_forward(
+    q,
+    k,
+    v,
+    dropout_p=0.0,
+    softmax_scale=None,
+    causal=False,
+    window_size=(-1, -1),
+    softcap=None,
+    alibi_slopes=None,
+    return_softmax=False,
+):
+    """vLLM-bundled FlashAttention forward pass with ring-compatible LSE."""
+    del dropout_p, window_size, alibi_slopes, return_softmax
+    return vllm_flash_attn_dense_with_lse(
+        q,
+        k,
+        v,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        softcap=softcap or 0.0,
+    )
 
 
 # Legacy alias for backward compatibility

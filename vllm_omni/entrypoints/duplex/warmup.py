@@ -3,14 +3,16 @@
 """Startup warmup probe for duplex ``/v1/realtime``.
 
 Moved out of ``api_server.py`` under P0.2 of #5227. The
-``omni_run_server_worker`` scheduling and ``/v1/realtime`` hold-clients
-preamble stay in ``api_server.py`` until P0.3.
+``omni_run_server_worker`` scheduling stays in ``api_server.py`` until P0.3;
+the hold-clients preamble is ``wait_for_duplex_warmup`` here.
 
 Video-required models default to one short audio-plus-frame turn so the four
 pipeline stages compile real shapes before a client is accepted. That is
 separate from the per-stage JIT kernel registry, which can finish in ~0.01 s
 without compiling anything.
 """
+
+from __future__ import annotations
 
 import asyncio
 import json
@@ -19,10 +21,14 @@ import struct
 import time
 import uuid
 from io import BytesIO
+from typing import TYPE_CHECKING, TypedDict, cast
 
 import httpx
 import pybase64 as base64
 from vllm.logger import init_logger
+
+if TYPE_CHECKING:
+    from vllm_omni.entrypoints.duplex_omni import DuplexOmni
 
 logger = init_logger(__name__)
 
@@ -39,6 +45,13 @@ _WARMUP_AUDIO_SECONDS = 0.4
 _WARMUP_FRAME_WIDTH = 640
 _WARMUP_FRAME_HEIGHT = 480
 _WARMUP_INSTRUCTIONS = "启动暖机。请只用这四个字回答，不要输出 silent：暖机完成。"
+
+
+class _WarmupAudioAppendKwargs(TypedDict, total=False):
+    format: str
+    sample_rate_hz: int
+    is_speech: bool
+    video_frames: list[str]
 
 
 def lookup_duplex_plugin(engine_client: object) -> object | None:
@@ -114,16 +127,148 @@ def warmup_silence_unit(plugin: object | None) -> dict[str, object]:
     }
 
 
+async def wait_for_duplex_warmup(websocket) -> None:
+    """Wait at most ``DUPLEX_WARMUP_CLIENT_WAIT_S`` (180 s) for startup warmup.
+
+    Single-frontend probes mark their connection with ``vllm_omni_warmup=1``.
+    Multiple frontends use local engine probes, so no connection bypasses the gate.
+    """
+    warmup_done = getattr(websocket.app.state, "duplex_warmup_done", None)
+    if warmup_done is None or warmup_done.is_set():
+        return
+    # Multiple frontends use local probes that never enter through a websocket,
+    # so only single-frontend probes may bypass the wait.
+    if (
+        int(getattr(websocket.app.state, "api_server_count", 1) or 1) == 1
+        and websocket.query_params.get("vllm_omni_warmup") == "1"
+    ):
+        return
+    try:
+        await asyncio.wait_for(warmup_done.wait(), timeout=DUPLEX_WARMUP_CLIENT_WAIT_S)
+    except (TimeoutError, asyncio.TimeoutError):
+        logger.warning(
+            "Duplex warmup still running after %d s; admitting the client anyway.",
+            DUPLEX_WARMUP_CLIENT_WAIT_S,
+        )
+
+
+async def _warmup_local_duplex(engine_client: DuplexOmni, plugin: object | None, kind: str, warmup_frames: int) -> None:
+    """Warm each owned group through this frontend's engine, without HTTP.
+
+    Before client admission, sequential open/close advances the placement
+    cursor over all owned groups without exposing a forced-group API.
+    """
+    engine = engine_client.engine
+    if (
+        engine_client.duplex_session_config.replica_policy != "least_sessions"
+        or engine_client.duplex_capabilities.supports_session_resume is not False
+    ):
+        logger.warning(
+            "Duplex local warmup skipped: multiple frontends require least_sessions and a non-resumable model."
+        )
+        return
+    if engine.duplex_frontend_max_sessions == 0:
+        return
+    group_count = engine.duplex_frontend_group_count
+    unit = warmup_silence_unit(plugin)
+    capabilities = getattr(plugin, "capabilities", None)
+    native_append = (
+        bool(capabilities(max_sessions=1).supports_core_resumable_request) if callable(capabilities) else True
+    )
+    session: dict[str, object] = {
+        "modalities": ["audio", "text"],
+        "input_audio_format": unit["format"],
+        "output_audio_format": "pcm16",
+        "sample_rate_hz": unit["sample_rate_hz"],
+        "audio": {"input": {"sample_rate_hz": unit["sample_rate_hz"]}},
+        "idle_timeout_s": 60,
+        "turn_detection": None,
+        "extra_body": {"auto_response": native_append},
+    }
+    audio = base64.b64decode(str(unit["audio"]))
+    append_kwargs: _WarmupAudioAppendKwargs = {
+        "format": str(unit["format"]),
+        "sample_rate_hz": int(cast(int, unit["sample_rate_hz"])),
+    }
+    if kind == "video_turn":
+        session.update(
+            input_audio_format="pcm_f32le",
+            sample_rate_hz=_WARMUP_SAMPLE_RATE_HZ,
+            audio={"input": {"sample_rate_hz": _WARMUP_SAMPLE_RATE_HZ}},
+            instructions=_WARMUP_INSTRUCTIONS,
+            extra_body={"auto_response": True},
+        )
+        audio = base64.b64decode(_short_pcm_f32le_b64())
+        append_kwargs = {
+            "format": "pcm_f32le",
+            "sample_rate_hz": _WARMUP_SAMPLE_RATE_HZ,
+            "is_speech": True,
+            "video_frames": [_warmup_jpeg_b64()],
+        }
+    for group_number in range(group_count):
+        handle = await engine_client.open_session(session, timeout=30)
+        saw_audio = asyncio.Event()
+
+        async def drain_events() -> None:
+            async for event in handle.events():
+                if event.type == "error":
+                    raise RuntimeError(f"Duplex local warmup rejected: {event}")
+                if event.type == "response.output_audio.delta":
+                    saw_audio.set()
+
+        pump = asyncio.create_task(drain_events())
+        audio_ready = asyncio.create_task(saw_audio.wait())
+        try:
+            for _ in range(1 if kind == "video_turn" else warmup_frames):
+                if pump.done():
+                    pump.result()
+                await asyncio.wait_for(handle.append_audio(audio, **append_kwargs), timeout=30)
+                if kind != "video_turn":
+                    await asyncio.sleep(0.08)
+            if not native_append:
+                await asyncio.wait_for(
+                    handle.commit(final=True, create_response=True if kind == "video_turn" else None), timeout=30
+                )
+            done, _ = await asyncio.wait(
+                (pump, audio_ready), timeout=DUPLEX_WARMUP_AUDIO_WAIT_S, return_when=asyncio.FIRST_COMPLETED
+            )
+            if pump in done:
+                pump.result()
+            logger.info(
+                "Duplex local warmup group %d/%d: first audio %s.",
+                group_number + 1,
+                group_count,
+                "received" if saw_audio.is_set() else "NOT received",
+            )
+        finally:
+            try:
+                await handle.close(reason="warmup_complete", timeout=10)
+            finally:
+                pump.cancel()
+                audio_ready.cancel()
+                await asyncio.gather(pump, audio_ready, return_exceptions=True)
+
+
 async def _warmup_duplex_realtime(app, args, warmup_frames: int) -> None:
-    """Run one throwaway realtime session before real clients are admitted.
+    """Run throwaway realtime sessions before real clients are admitted.
 
     Video-required models send one short non-silent audio chunk and one image
     so each stage compiles the shape a real turn uses. Audio-primary models
     keep the opt-in silent-frame path. ``/v1/realtime`` holds other connections
     until this finishes (see ``duplex_warmup_done``).
+    Multiple frontends each probe their owned groups through the local engine;
+    the single-frontend path retains its public websocket probe.
     """
     warmup_done = getattr(app.state, "duplex_warmup_done", None)
     try:
+        count = int(getattr(app.state, "api_server_count", None) or getattr(args, "api_server_count", 1) or 1)
+        if count > 1:
+            engine_client = app.state.engine_client
+            plugin = lookup_duplex_plugin(engine_client)
+            kind = startup_warmup_kind(plugin, warmup_frames)
+            if kind is not None:
+                await _warmup_local_duplex(engine_client, plugin, kind, warmup_frames)
+            return
         try:
             import websockets
         except ImportError:
@@ -288,5 +433,6 @@ __all__ = [
     "_warmup_duplex_realtime",
     "lookup_duplex_plugin",
     "startup_warmup_kind",
+    "wait_for_duplex_warmup",
     "warmup_silence_unit",
 ]
