@@ -66,9 +66,32 @@ class Audio8TTSHybridSlowARForConditionalGeneration(nn.Module, HasInnerState, Is
 
     @classmethod
     def get_mamba_state_shape_from_config(cls, vllm_config: VllmConfig) -> tuple[tuple[int, int], tuple[int, int, int]]:
-        from vllm.model_executor.models.falcon_h1 import FalconH1ForCausalLM
+        """Size the mamba caches from the hybrid text config.
 
-        return FalconH1ForCausalLM.get_mamba_state_shape_from_config(vllm_config)
+        ``FalconH1ForCausalLM.get_mamba_state_shape_from_config`` reads
+        ``model_config.hf_config`` directly, which here is the outer
+        ``Audio8TTSConfig`` -- it carries no ``mamba_*`` fields (they live on
+        ``get_text_config()``), so delegating would raise ``AttributeError``.
+        Mirrors vLLM's own body with the config swapped for the text config.
+        """
+        from vllm.model_executor.layers.mamba.mamba_utils import MambaStateShapeCalculator
+
+        hf_config = vllm_config.model_config.hf_config.get_text_config()
+        intermediate_size = (
+            int(hf_config.mamba_expand * hf_config.hidden_size)
+            if hf_config.mamba_d_ssm is None
+            else hf_config.mamba_d_ssm
+        )
+        return MambaStateShapeCalculator.mamba2_state_shape(
+            intermediate_size=intermediate_size,
+            tp_world_size=vllm_config.parallel_config.tensor_parallel_size,
+            n_groups=hf_config.mamba_n_groups,
+            num_heads=hf_config.mamba_n_heads,
+            head_dim=hf_config.mamba_d_head,
+            state_size=hf_config.mamba_d_state,
+            conv_kernel=hf_config.mamba_d_conv,
+            num_spec=vllm_config.num_speculative_tokens,
+        )
 
     @classmethod
     def get_mamba_state_copy_func(cls):
@@ -150,12 +173,10 @@ class Audio8TTSHybridSlowARForConditionalGeneration(nn.Module, HasInnerState, Is
         inputs_embeds: torch.Tensor | None = None,
         **_: Any,
     ):
-        # NOTE the muP embedding scale is applied here; the reference does it in
-        # ``_slow_backbone`` (``hidden * self.slow.embedding_multiplier``). If
-        # vLLM's FalconH1Model turns out to apply the same scalar internally,
-        # this must be dropped (design note §4.4).
-        if inputs_embeds is not None:
-            inputs_embeds = inputs_embeds * self.embedding_multiplier
+        # vLLM's ``FalconH1Model.forward`` already multiplies by
+        # ``config.embedding_multiplier`` on both the token-id and the
+        # ``inputs_embeds`` path, so scaling here would apply it twice
+        # (0.1089^2) on the embeddings path. Nothing to do in the wrapper.
         return self.model(input_ids, positions, intermediate_tensors, inputs_embeds)
 
     def compute_logits(self, hidden_states: torch.Tensor, **_: Any) -> torch.Tensor:

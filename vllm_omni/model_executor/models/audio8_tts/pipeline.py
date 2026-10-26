@@ -75,7 +75,10 @@ AUDIO8_TTS_PIPELINE = PipelineConfig(
 #: Hybrid-Mamba2 variant (0.1b). Same topology, FalconH1 slow AR.
 AUDIO8_TTS_HYBRID_PIPELINE = PipelineConfig(
     model_type="arktts",
-    default_deploy_config_name="audio8_tts_hybrid.yaml",
+    # Ships with the runtime wiring PR, together with the registry entry:
+    # an intake-only checkout must fail as "unsupported architecture", not
+    # as a missing deploy config.
+    default_deploy_config_name=None,
     model_arch="Audio8TTSHybridSlowARForConditionalGeneration",
     stages=_stages(
         slow_ar_stage="audio8_tts_hybrid_slow_ar",
