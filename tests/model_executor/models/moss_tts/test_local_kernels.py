@@ -6,14 +6,17 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from tests.helpers.mark import hardware_marks, hardware_test
+
 pytestmark = [
     pytest.mark.core_model,
     pytest.mark.tts,
-    pytest.mark.cuda,
+    *hardware_marks(res={"cuda": "L4"}, num_cards=1),
     pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
 ]
 
 
+@hardware_test(res={"rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("batch", [1, 8, 64])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @torch.inference_mode()
@@ -46,6 +49,7 @@ def test_fused_lookup_attention_every_position(batch, dtype):
             torch.testing.assert_close(value[:, :, : pos + 1], expected_v[:, :, : pos + 1], atol=0, rtol=0)
 
 
+@hardware_test(res={"rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("batch,k", [(1, 2560), (2, 2560), (1, 9728)])
 @pytest.mark.parametrize("add_residual", [False, True])
 @torch.inference_mode()
@@ -78,6 +82,7 @@ def _reference_sample(logits, uniforms, top_k, temperature, top_p):
     return ids.gather(1, indices[:, None]).squeeze(1)
 
 
+@hardware_test(res={"rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("top_k,top_p", [(1, 0.8), (25, 0.8), (32, 1.0)])
 @torch.inference_mode()
 def test_fused_sampling_distribution_and_ties(top_k, top_p):
@@ -94,6 +99,7 @@ def test_fused_sampling_distribution_and_ties(top_k, top_p):
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
+@hardware_test(res={"rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("width", [513, 1024, 4096])
 @pytest.mark.parametrize("top_k,top_p", [(1, 0.8), (25, 0.8), (32, 1.0)])
 @torch.inference_mode()
@@ -111,6 +117,7 @@ def test_bf16_compact_sort_keys_match_float32_sampling(width, top_k, top_p):
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
+@hardware_test(res={"rocm": "MI325"}, num_cards=1)
 @torch.inference_mode()
 def test_fused_sampling_graph_rng():
     from vllm_omni.model_executor.models.moss_tts.local_kernels import fused_sample
@@ -133,15 +140,15 @@ def test_fused_sampling_graph_rng():
     assert ((result >= 0) & (result < 25)).all()
 
 
+@pytest.mark.nvidia_only
 @torch.inference_mode()
-def test_fused_frame_compilation_sampling_and_replay():
+def test_fused_frame_sampling_and_replay():
     from tests.model_executor.models.moss_tts.test_local_depth_qkv_lookup import _models
 
     model, embeddings, heads, stop_head = _models(12, "cuda", torch.bfloat16)
     model.prepare_qkv_lookup(embeddings, 12)
     model._fused_attention = True
     model._fused_sampling = True
-    model.setup_compile()
     graphs = []
     for batch in (1, 4):
         hidden = torch.randn(batch, 32, device="cuda", dtype=torch.bfloat16)
@@ -169,6 +176,7 @@ def test_fused_frame_compilation_sampling_and_replay():
         assert ((codes >= 0) & (codes < 19)).all()
 
 
+@hardware_test(res={"rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 @pytest.mark.parametrize("width", [513, 1024])
 @pytest.mark.parametrize("top_k,top_p", [(1, 0.8), (25, 0.8), (32, 1.0)])
@@ -184,6 +192,7 @@ def test_fused_sampling_signed_zero_ties(dtype, width, top_k, top_p):
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
+@hardware_test(res={"rocm": "MI325"}, num_cards=1)
 @torch.inference_mode()
 def test_frame_explicit_generator_is_reproducible():
     from tests.model_executor.models.moss_tts.test_local_depth_qkv_lookup import _models
@@ -206,6 +215,7 @@ def test_frame_explicit_generator_is_reproducible():
             torch.testing.assert_close(actual_tensor, expected_tensor, rtol=0, atol=0)
 
 
+@hardware_test(res={"rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("top_k", [16, 33])
 @torch.inference_mode()
 def test_frame_per_row_generators_follow_request_rows(top_k):
@@ -238,6 +248,7 @@ def test_frame_per_row_generators_follow_request_rows(top_k):
         torch.testing.assert_close(generator.get_state(), generators[row].get_state(), rtol=0, atol=0)
 
 
+@hardware_test(res={"rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("top_k", [16, 33])
 @torch.inference_mode()
 def test_frame_mixed_generators_preserve_seeded_row(top_k):
@@ -263,6 +274,7 @@ def test_frame_mixed_generators_preserve_seeded_row(top_k):
         torch.testing.assert_close(a[1], b[1], rtol=0, atol=0)
 
 
+@hardware_test(res={"rocm": "MI325"}, num_cards=1)
 @torch.inference_mode()
 def test_frame_all_none_generators_keep_shared_generator():
     from tests.model_executor.models.moss_tts.test_local_depth_qkv_lookup import _models
@@ -280,6 +292,7 @@ def test_frame_all_none_generators_keep_shared_generator():
         torch.testing.assert_close(a, b, rtol=0, atol=0)
 
 
+@hardware_test(res={"rocm": "MI325"}, num_cards=1)
 @torch.inference_mode()
 def test_frame_rejects_generator_count_before_consuming_rng():
     from tests.model_executor.models.moss_tts.test_local_depth_qkv_lookup import _models
@@ -293,6 +306,7 @@ def test_frame_rejects_generator_count_before_consuming_rng():
     torch.testing.assert_close(torch.cuda.get_rng_state(), before, rtol=0, atol=0)
 
 
+@hardware_test(res={"rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("options", [{"top_k": 0}, {"top_k": 33}, {"do_sample": False}, {"repetition_penalty": 1.1}])
 @torch.inference_mode()
 def test_unsupported_sampling_uses_reference_helper(monkeypatch, options):
@@ -310,3 +324,20 @@ def test_unsupported_sampling_uses_reference_helper(monkeypatch, options):
     _, codes = model.generate_frame(hidden, heads, embeddings, stop_head, n_vq=12, **options)
     assert codes.shape == (4, 12)
     assert ((codes >= 0) & (codes < 19)).all()
+
+
+@hardware_test(res={"rocm": "MI325"}, num_cards=1)
+@pytest.mark.parametrize("rows", [1, 64])
+def test_add_layer_norm_matches_residual_add_and_layer_norm(rows):
+    from vllm_omni.model_executor.models.moss_tts.local_kernels import add_layer_norm
+
+    torch.manual_seed(0)
+    norm = torch.nn.LayerNorm(2560, eps=1e-5, device="cuda", dtype=torch.bfloat16)
+    with torch.no_grad():
+        norm.weight.uniform_(0.5, 1.5)
+        norm.bias.uniform_(-0.1, 0.1)
+    x = torch.randn(rows, 2560, device="cuda", dtype=torch.bfloat16)
+    update = torch.randn_like(x)
+    residual, out = add_layer_norm(x, update, norm)
+    torch.testing.assert_close(residual, x + update, atol=0, rtol=0)
+    torch.testing.assert_close(out, norm(x + update), atol=2e-2, rtol=2e-2)

@@ -42,6 +42,9 @@ RUNNER_PATH = REPO_ROOT / "examples" / "offline_inference" / "text_to_video" / "
 RESULT_ROOT = Path(__file__).parent / "result"
 ARTIFACT_DIR = RESULT_ROOT / "cat_grass"
 VIDEO_TIMEOUT_SECONDS = 60 * 60
+# A cold MI325 load can spend more than ten minutes reading the seven DiT
+# shards (AMD Buildkite #14270). Bound real hangs without failing that path.
+ENGINE_INIT_TIMEOUT_SECONDS = 30 * 60
 SERVER_CASES = [
     pytest.param(
         OmniServerParams(
@@ -52,6 +55,8 @@ SERVER_CASES = [
             ],
             env_dict={"VLLM_OMNI_STORAGE_PATH": str(RESULT_ROOT / "storage")},
             use_omni=True,
+            init_timeout=ENGINE_INIT_TIMEOUT_SECONDS,
+            stage_init_timeout=ENGINE_INIT_TIMEOUT_SECONDS,
         ),
         id="hunyuanvideo15_t2v_default",
     )
@@ -97,6 +102,10 @@ def _build_offline_command(*, output_path: Path) -> list[str]:
         str(GUIDANCE_SCALE),
         "--flow-shift",
         str(FLOW_SHIFT),
+        "--init-timeout",
+        str(ENGINE_INIT_TIMEOUT_SECONDS),
+        "--stage-init-timeout",
+        str(ENGINE_INIT_TIMEOUT_SECONDS),
         "--fps",
         str(FPS),
         "--seed",
@@ -144,7 +153,7 @@ def _generate_online_video(*, omni_server, online_client, timeout_seconds: int) 
 
 
 @pytest.mark.benchmark
-@hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=1)
+@hardware_test(res={"cuda": ["H100", "B200"], "rocm": "MI325"}, num_cards=1)
 def test_hunyuanvideo15_t2v_diffusers_offline_generates_video() -> None:
     if not torch.cuda.is_available():
         pytest.skip("HunyuanVideo-1.5 T2V offline accuracy test requires CUDA.")
@@ -160,7 +169,7 @@ def test_hunyuanvideo15_t2v_diffusers_offline_generates_video() -> None:
 
 
 @pytest.mark.benchmark
-@hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=1)
+@hardware_test(res={"cuda": ["H100", "B200"], "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", SERVER_CASES, indirect=True)
 def test_hunyuanvideo15_t2v_online_serving_generates_video(
     omni_server,
@@ -182,7 +191,7 @@ def test_hunyuanvideo15_t2v_online_serving_generates_video(
 
 
 @pytest.mark.benchmark
-@hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=1)
+@hardware_test(res={"cuda": ["H100", "B200"], "rocm": "MI325"}, num_cards=1)
 def test_hunyuanvideo15_t2v_serving_matches_offline_video_similarity() -> None:
     if not torch.cuda.is_available():
         pytest.skip("HunyuanVideo-1.5 T2V video similarity test requires CUDA.")

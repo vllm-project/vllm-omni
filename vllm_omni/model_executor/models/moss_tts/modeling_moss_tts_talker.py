@@ -38,6 +38,7 @@ from vllm_omni.model_executor.models.moss_tts.modeling_moss_tts_local_depth impo
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.worker.sampling_utils import get_tts_local_seed
+from vllm_omni.worker_v2.first_audio_sender import supports_in_process_first_audio
 
 logger = init_logger(__name__)
 
@@ -1307,6 +1308,7 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
         super().__init__()
         self.vllm_config = vllm_config
         self.config: MossTTSLocalConfig = vllm_config.model_config.hf_config
+        self.first_frame_decoder = None
 
         qwen3_cfg = self.config.qwen3_config
         hidden_size = int(qwen3_cfg.hidden_size)
@@ -1322,7 +1324,15 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
         # Qwen3 backbone. get_text_config() is sufficient for vLLM to size
         # KV cache / heads correctly, as long as AutoConfig resolves to the
         # local MossTTSLocalConfig rather than the HF remote-code class.
-        self.model = Qwen3Model(
+        # On CUDA the backbone runs explicit kernels instead of vLLM's custom
+        # ops for its norms, activation and Q/K norm + RoPE.
+        if current_omni_platform.is_cuda():
+            from .modeling_moss_tts_backbone import MossQwen3Model
+
+            backbone_cls = MossQwen3Model
+        else:
+            backbone_cls = Qwen3Model
+        self.model = backbone_cls(
             vllm_config=vllm_config,
             prefix=_maybe_prefix(prefix, "model"),
         )
@@ -1349,11 +1359,7 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
             [nn.Linear(hidden_size, self.audio_vocab_size, bias=False) for _ in range(self.n_vq)]
         )
         self.local_text_lm_head = nn.Linear(hidden_size, 2, bias=False)
-        self.local_transformer = MossTTSLocalDepthTransformer(
-            self.config.gpt2_config,
-            hidden_size=hidden_size,
-            compile_audio_sampler=getattr(self.config, "local_compile_audio_sampler", None),
-        )
+        self.local_transformer = MossTTSLocalDepthTransformer(self.config.gpt2_config, hidden_size=hidden_size)
 
         self._batch_state: list[dict[str, Any]] | None = None
         # Stacked embedding cache built after load_weights() for vectorised
@@ -1487,6 +1493,14 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
         (outside the valid embedding range). Returns the ``(T, H)`` additive
         audio embedding, masking out pad positions per codebook.
         """
+        if (
+            self._stacked_audio_emb_w is not None
+            and self._stacked_audio_emb_w.dtype in (torch.bfloat16, torch.float16)
+            and codes.device.type == "cuda"
+        ):
+            from vllm_omni.model_executor.models.moss_tts.audio_embed_kernel import audio_embed
+
+            return audio_embed(codes, self._stacked_audio_emb_w, self.audio_pad_token_id)
         device = codes.device
         valid_mask = codes.ne(self.audio_pad_token_id)  # (T, n_vq)
         safe_codes = codes.masked_fill(~valid_mask, 0).clamp(0, self.audio_vocab_size - 1)
@@ -1643,7 +1657,6 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
             device=input_embeds.device,
             dtype=input_embeds.dtype,
         )
-        active_mask = text_step.reshape(bsz, -1)[:, :1] > 0
 
         # Match MOSS-TTS Local v1.5's model-card/SGLang defaults. The generic
         # stage SamplingParams are for the backbone token loop and should not
@@ -1669,6 +1682,25 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
             generators=generators,
         )
         new_codes = new_codes.to(device=input_embeds.device, dtype=torch.long)
+        stacked = getattr(self, "_stacked_audio_emb_w", None)
+        if (
+            getattr(self.local_transformer, "fused_depth", False)
+            and stacked is not None
+            and new_codes.is_cuda
+            and stacked.dtype == input_embeds_out.dtype
+            and stacked.device == new_codes.device
+        ):
+            from vllm_omni.model_executor.models.moss_tts.local_kernels import mtp_epilogue
+
+            return mtp_epilogue(
+                new_codes,
+                should_continue_t.reshape(bsz),
+                text_step.reshape(bsz, -1),
+                input_embeds_out,
+                stacked,
+                self.audio_pad_token_id,
+            )
+        active_mask = text_step.reshape(bsz, -1)[:, :1] > 0
         emit_mask = active_mask & should_continue_t.reshape(bsz, 1)
         audio_embed = self._audio_embed(new_codes).to(dtype=input_embeds_out.dtype)
         input_embeds_out = input_embeds_out + audio_embed * emit_mask.to(dtype=input_embeds_out.dtype)
@@ -1830,15 +1862,13 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
             [e.weight.detach() for e in self.audio_embeddings], dim=0
         )  # (n_vq, audio_vocab_size, hidden_size)
 
-        # Build derived tables after loading, before compiling/capturing MTP.
+        # Build derived tables after loading, before capturing MTP.
         # Other devices and FP32 retain the existing frame-local KV path.
         if current_omni_platform.is_cuda() and self.local_transformer.ln_f.weight.dtype in (
             torch.bfloat16,
             torch.float16,
         ):
             self.local_transformer.prepare_qkv_lookup(self.audio_embeddings, self.n_vq)
-        if not self.vllm_config.model_config.enforce_eager:
-            self.local_transformer.setup_compile()
 
         logger.info(
             "[MossTTSLocal] loaded %d/%d params; skipped=%d (first 5: %s)",
@@ -1850,6 +1880,27 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
         not_loaded = [n for n in params_dict if n not in loaded]
         if not_loaded:
             logger.warning("[MossTTSLocal] %d params NOT loaded (first 5: %s)", len(not_loaded), not_loaded[:5])
+        # First audio is part of the MRV2 streaming slot-state path. Load it
+        # here so its weights and graphs count toward model memory profiling.
+        model_config = self.vllm_config.model_config
+        if (
+            model_config.use_v2_model_runner
+            and model_config.async_chunk
+            and getattr(self.config, "mrv2_gpu_slot_state", False)
+            and supports_in_process_first_audio(self.vllm_config)
+        ):
+            from .first_frame_decoder import MossFirstFrameDecoder
+
+            self.first_frame_decoder = MossFirstFrameDecoder(
+                getattr(
+                    self.config,
+                    "codec_model_name_or_path",
+                    getattr(self.config, "audio_tokenizer_name_or_path", "OpenMOSS-Team/MOSS-Audio-Tokenizer"),
+                ),
+                self.n_vq,
+            )
+            first_loaded = self.first_frame_decoder.load(self.vllm_config)
+            loaded.update("first_frame_decoder." + name for name in first_loaded)
         return loaded
 
 

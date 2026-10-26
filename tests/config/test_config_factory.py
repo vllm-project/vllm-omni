@@ -1527,6 +1527,62 @@ class TestDeployConfigLoading:
         assert stages[1].yaml_extras["default_sampling_params"]["stop_token_ids"] == [6561]
         assert "codec_sampling_params" not in stages[1].yaml_engine_args
 
+    @pytest.mark.parametrize("platform", ["cuda", "npu"])
+    def test_minicpmo_talker_multi_frame_is_npu_scoped(self, platform: str):
+        """Stage 1's K-frame decode needs the NPU worker to inject constant
+        continue drafts, so the deploy block that arms it must not sit in the
+        platform-shared stage.
+
+        On NPU the ``speculative_config`` is a fingerprint: the worker replays
+        the decode graph and vLLM's n-gram proposer is never consulted. On CUDA
+        the same block hands the Talker to the real proposer plus the rejection
+        sampler, which asserts on its codec ids (device-side assert out of
+        ``get_token_bin_counts_and_mask``).
+
+        This base profile also leaves stage-0 prefix caching off on CUDA; the
+        CUDA turn profile enables it (see test_thinker_prefix_cache_defaults).
+        """
+        deploy = _apply_platform_overrides(
+            load_deploy_config(Path(get_deploy_config_path("minicpmo_4_5.yaml"))),
+            platform=platform,
+        )
+        # Check the deploy-side stop id before the merge: afterwards it is
+        # unioned with the pipeline's codec-EOS default.
+        deploy_stage1 = next(stage for stage in deploy.stages if stage.stage_id == 1)
+        stages = merge_pipeline_deploy(resolve_pipeline_config("minicpmo_4_5"), deploy)
+
+        if platform == "npu":
+            assert deploy_stage1.default_sampling_params["stop_token_ids"] == [1]
+            # The armed head ends on 1; the union keeps the codec EOS inert
+            # (the collapsed head cannot sample it).
+            assert stages[1].yaml_extras["default_sampling_params"]["stop_token_ids"] == [1, 6561]
+            # The duplex KV-window contract requires prefix caching off, and the
+            # NPU overlay states that explicitly so a stage-level value can
+            # never turn it back on for this stage.
+            assert stages[0].yaml_engine_args.get("enable_prefix_caching") is not True
+            assert stages[1].yaml_engine_args["speculative_config"] == {
+                "method": "ngram",
+                "num_speculative_tokens": 7,
+                "prompt_lookup_min": 1,
+                "prompt_lookup_max": 1,
+            }
+            assert stages[1].yaml_engine_args["async_scheduling"] is False
+            assert [stage.yaml_engine_args["max_num_seqs"] for stage in stages] == [8, 8, 8]
+        else:
+            assert "stop_token_ids" not in (deploy_stage1.default_sampling_params or {})
+            # Without the block the head is the full codec vocabulary, so the
+            # codec EOS is the only stop id -- the marker would end a request
+            # on an ordinary codec id.
+            assert stages[1].yaml_extras["default_sampling_params"]["stop_token_ids"] == [6561]
+            # Either absent (falls back to the top-level false) or explicitly
+            # false; the regression this guards against is true.
+            assert stages[0].yaml_engine_args.get("enable_prefix_caching") is not True
+            assert "speculative_config" not in stages[1].yaml_engine_args
+            assert stages[1].yaml_engine_args["async_scheduling"] is True
+            # Base concurrency stays 16; only the NPU overlay lowers it to 8,
+            # so a CUDA deployment keeps the pipeline default.
+            assert [stage.yaml_engine_args["max_num_seqs"] for stage in stages] == [16, 16, 16]
+
     @pytest.mark.parametrize(
         ("filename", "stage0_devices", "stage1_devices", "stage2_devices", "stage1_replicas"),
         [
@@ -1964,6 +2020,46 @@ stages:
         assert deploy.stages[0].devices == "0,1"
         assert deploy.stages[0].tensor_parallel_size == 2
         assert deploy.stages[1].devices == "1"
+
+    @pytest.mark.parametrize(
+        ("yaml_name", "platform", "enabled"),
+        [
+            ("qwen3_omni_moe.yaml", "cuda", True),
+            *(("qwen3_omni_moe.yaml", platform, False) for platform in ("npu", "rocm", "xpu", "musa")),
+            ("qwen3_omni_moe_mrv2.yaml", "cuda", False),
+            ("qwen3_omni_duplex.yaml", "cuda", False),
+            ("qwen3_omni_duplex_mrv2.yaml", "cuda", False),
+            ("minicpmo_4_5_turn.yaml", "cuda", True),
+            *(("minicpmo_4_5_turn.yaml", platform, False) for platform in ("npu", "rocm", "xpu", "musa")),
+            ("minicpmo_4_5_turn_mrv2.yaml", "cuda", False),
+            ("minicpmo_4_5_turn_mrv2_h200.yaml", "cuda", False),
+            ("minicpmo_4_5.yaml", "cuda", False),
+            ("minicpmo_4_5_duplex_h200.yaml", "cuda", False),
+        ],
+    )
+    def test_thinker_prefix_cache_defaults(self, monkeypatch, yaml_name: str, platform: str, enabled: bool):
+        """Stage-0 prefix caching ships on only for the validated V1 turn profiles.
+
+        Checked on the final engine args: the stage value rides in
+        ``engine_extras`` and must keep winning over the pipeline-wide flag.
+        """
+        from vllm_omni import platforms
+
+        # merge_pipeline_deploy runs its own override pass for the host platform;
+        # pin it so the row does not depend on the machine running the test.
+        monkeypatch.setattr(platforms.current_omni_platform, "device_name", platform)
+        deploy = _apply_platform_overrides(
+            load_deploy_config(Path(get_deploy_config_path(yaml_name))), platform=platform
+        )
+        # The Qwen3-Omni profiles carry no ``pipeline:`` key; serving resolves it from the model config.
+        pipeline = (
+            resolve_pipeline_config(deploy.pipeline)
+            if deploy.pipeline
+            else resolve_pipeline_config("qwen3_omni_moe", Q3_OMNI_ALL_STAGES_HF_CONFIG)
+        )
+        assert pipeline is not None
+        stage0 = next(stage for stage in merge_pipeline_deploy(pipeline, deploy) if stage.stage_id == 0)
+        assert stage0.yaml_engine_args["enable_prefix_caching"] is enabled
 
     def test_step_audio2_online_ci_deploy_is_single_thinker(self):
         deploy = load_deploy_config(Path(get_deploy_config_path("step_audio2_ci.yaml")))
@@ -2732,6 +2828,25 @@ class TestMingFlashOmniPipeline:
 class TestBaseConfigInheritance:
     """Test deploy YAML base_config inheritance."""
 
+    @pytest.mark.parametrize(
+        ("platform", "expected_devices", "talker_memory"),
+        [
+            ("rocm", ["0", "1", "1"], 0.3),
+            ("cuda", ["0", "1", "2"], 0.4),
+            ("xpu", ["0", "1", "2"], 0.5),
+        ],
+    )
+    def test_qwen2_5_omni_ci_placement(self, monkeypatch, platform, expected_devices, talker_memory):
+        """The two-card ROCm examples must colocate Code2Wav without changing other platforms."""
+        from vllm_omni import platforms
+
+        monkeypatch.setattr(platforms.current_omni_platform, "device_name", platform)
+        deploy = load_deploy_config(get_deploy_config_path("ci/qwen2_5_omni.yaml"))
+        stages = merge_pipeline_deploy(resolve_pipeline_config("qwen2_5_omni"), deploy)
+
+        assert [stage.yaml_runtime["devices"] for stage in stages] == expected_devices
+        assert stages[1].yaml_engine_args["gpu_memory_utilization"] == talker_memory
+
     def test_minicpmo_overlays_inherit_talker_sampling_params(self):
         """Overlays must keep the base Talker codec Sampler knobs."""
         for filename in (
@@ -2890,10 +3005,10 @@ class TestPlatformOverrides:
         deploy_path = Path(get_deploy_config_path("higgs_multimodal_qwen3.yaml"))
 
         base = load_deploy_config(deploy_path)
-        assert base.stages[0].engine_extras["attention_backend"] == "FLASHINFER"
+        assert base.stages[0].attention_backend == "FLASHINFER"
 
         rocm = _apply_platform_overrides(base, platform="rocm")
-        assert rocm.stages[0].engine_extras["attention_backend"] == "TRITON_ATTN"
+        assert rocm.stages[0].attention_backend == "TRITON_ATTN"
 
         pipeline = resolve_pipeline_config("higgs_multimodal_qwen3")
         assert isinstance(pipeline, PipelineConfig)
@@ -2944,20 +3059,20 @@ class TestPlatformOverrides:
             assert talker_sampling["temperature"] > 0.0, "talker is expected to sample, not decode greedily"
             assert talker_sampling.get("seed") == 42, f"talker sampling lost its seed on {platform}"
 
-    def test_minicpmo_4_5_cuda_caps_talker_kv_cache(self):
+    @pytest.mark.parametrize("platform", ["cuda", "npu"])
+    def test_minicpmo_4_5_caps_talker_kv_cache(self, platform):
         pipeline = resolve_pipeline_config("minicpmo_4_5")
         assert isinstance(pipeline, PipelineConfig)
         deploy_path = Path(get_deploy_config_path("minicpmo_4_5.yaml"))
 
-        cuda = _apply_platform_overrides(load_deploy_config(deploy_path), platform="cuda")
-        cuda_stages = merge_pipeline_deploy(pipeline, cuda)
-        assert cuda_stages[1].yaml_engine_args["kv_cache_memory_bytes"] == 4 * 1024**3
+        deploy = _apply_platform_overrides(load_deploy_config(deploy_path), platform=platform)
+        stages = merge_pipeline_deploy(pipeline, deploy)
+        # Both single-device profiles reserve headroom for colocated Code2Wav.
+        assert stages[1].yaml_engine_args["kv_cache_memory_bytes"] == 4 * 1024**3
 
-        # The CUDA memory budget must not leak into the existing NPU profile.
-        npu = _apply_platform_overrides(load_deploy_config(deploy_path), platform="npu")
-        npu_stages = merge_pipeline_deploy(pipeline, npu)
-        assert "kv_cache_memory_bytes" not in npu_stages[1].yaml_engine_args
-
+    def test_minicpmo_4_5_cuda_replicas_use_automatic_talker_kv_cache(self):
+        pipeline = resolve_pipeline_config("minicpmo_4_5")
+        assert isinstance(pipeline, PipelineConfig)
         # Multi-GPU replica profiles place Talker on dedicated devices and
         # preserve their previous automatic KV-cache sizing.
         for filename in (
@@ -2982,12 +3097,7 @@ class TestPlatformOverrides:
         "filename,pipeline_key",
         [
             ("qwen3_tts_mrv2.yaml", "qwen3_tts"),
-            ("moss_tts_local_mrv2.yaml", "moss_tts_local"),
-            ("moss_tts_local_mrv2_high_concurrency.yaml", "moss_tts_local"),
-            ("moss_tts_local_mrv2_low_latency.yaml", "moss_tts_local"),
-            ("moss_tts_local_mrv2_optimized.yaml", "moss_tts_local"),
             ("moss_tts_local.yaml", "moss_tts_local"),
-            ("moss_tts_local_mrv2_high_concurrency_mps.yaml", "moss_tts_local"),
         ],
     )
     @pytest.mark.parametrize("platform", ["cuda", "npu", "xpu", "rocm", "musa"])
@@ -3007,52 +3117,33 @@ class TestPlatformOverrides:
             # v2 only engages the native plane on stages declaring support.
             assert all(ps.supports_native_mrv2_data_plane for ps in pipeline.stages)
 
-    @pytest.mark.parametrize("memory_gib", [24, 80, 139, 140, 141, None])
-    @pytest.mark.parametrize("mps_available", [False, True])
-    def test_moss_local_cuda_default_selects_mrv2_capacity_and_mps(self, monkeypatch, memory_gib, mps_available):
+    def test_moss_local_cuda_default_uses_one_profile_without_hardware_dispatch(self, monkeypatch):
         from vllm.platforms import current_platform
 
         from vllm_omni.platforms import current_omni_platform
 
         monkeypatch.setattr(current_omni_platform, "device_name", "cuda")
 
-        def memory():
-            if memory_gib is None:
-                raise RuntimeError("NVML unavailable")
-            return memory_gib * 1024**3
+        def unexpected_probe(*args):
+            pytest.fail("Pipeline selection must not probe CUDA memory or MPS")
 
-        monkeypatch.setattr(current_platform, "get_device_total_memory", memory)
-        monkeypatch.setattr(
-            "shutil.which", lambda command: "/usr/bin/nvidia-cuda-mps-control" if mps_available else None
-        )
+        monkeypatch.setattr(current_platform, "get_device_total_memory", unexpected_probe)
+        monkeypatch.setattr("shutil.which", unexpected_probe)
         pipeline = resolve_pipeline_config("moss_tts_local")
-        high_capacity = mps_available and memory_gib is not None and memory_gib >= 140
-        capacity = 128 if high_capacity else 64
+        assert pipeline.default_deploy_config_name == "moss_tts_local.yaml"
         config = VllmOmniConfig.from_pipeline_config(pipeline)
         talker, codec = config.stage_configs
-        assert talker.scheduler_config.max_num_seqs == codec.scheduler_config.max_num_seqs == capacity
-        assert talker.cache_config.kv_cache_memory_bytes == (32 * 1024**3 if high_capacity else None)
-        assert talker.cache_config.gpu_memory_utilization == 0.60
-        assert codec.cache_config.gpu_memory_utilization == 0.30
-        assert talker.cache_config.enable_prefix_caching is high_capacity
+        assert talker.scheduler_config.max_num_seqs == codec.scheduler_config.max_num_seqs == 128
+        assert talker.cache_config.kv_cache_memory_bytes == 32 * 1024**3
+        assert talker.cache_config.enable_prefix_caching
         assert not codec.cache_config.enable_prefix_caching
         for stage in config.stage_configs:
             assert stage.model_config.use_v2_model_runner
-            assert stage.runtime_config.cuda_mps is mps_available
-            assert not stage.runtime_config.env
-        overrides = talker.model_config.hf_overrides or {}
-        assert overrides.get("mrv2_batch_prefill", False) is high_capacity
-        assert overrides.get("mrv2_direct_tokens", False) is high_capacity
-        assert overrides.get("local_compile_audio_sampler", False) is high_capacity
-
-        # The serving engine still consumes the legacy representation.
+            assert stage.runtime_config.cuda_mps
         stages, _ = StageConfigFactory._create_legacy_from_registry(pipeline, {})
-        for stage in stages:
-            assert stage.yaml_engine_args["max_num_seqs"] == capacity
-            assert stage.yaml_engine_args["use_v2_model_runner"]
-            assert stage.yaml_runtime.get("cuda_mps", False) is mps_available
-        assert stages[0].yaml_engine_args.get("kv_cache_memory_bytes") == (32 * 1024**3 if high_capacity else None)
-        assert stages[0].yaml_engine_args["enable_prefix_caching"] is high_capacity
+        assert all(stage.yaml_engine_args["max_num_seqs"] == 128 for stage in stages)
+        assert all(stage.yaml_engine_args["use_v2_model_runner"] for stage in stages)
+        assert all(stage.yaml_runtime["cuda_mps"] for stage in stages)
 
     @pytest.mark.parametrize("platform", ["cpu", "npu", "xpu", "rocm", "musa"])
     def test_moss_local_non_cuda_default_preserves_v1(self, monkeypatch, platform):
@@ -3078,39 +3169,33 @@ class TestPlatformOverrides:
         assert all(not stage.yaml_engine_args["use_v2_model_runner"] for stage in stages)
         assert all(not stage.yaml_runtime.get("cuda_mps", False) for stage in stages)
 
-    @pytest.mark.parametrize(
-        "filename,runner,mps,capacity",
-        [
-            ("moss_tts_local_v1.yaml", False, False, 64),
-            ("moss_tts_local_mrv2.yaml", True, False, 64),
-            ("moss_tts_local_mrv2_high_concurrency.yaml", True, False, 128),
-        ],
-    )
-    def test_moss_local_explicit_profile_overrides_cuda_default(self, monkeypatch, filename, runner, mps, capacity):
-        from vllm.platforms import current_platform
-
+    def test_moss_local_custom_deploy_overrides_default(self, monkeypatch, tmp_path):
         from vllm_omni.platforms import current_omni_platform
 
         monkeypatch.setattr(current_omni_platform, "device_name", "cuda")
-        monkeypatch.setattr(current_platform, "get_device_total_memory", lambda: 141 * 1024**3)
-        monkeypatch.setattr("shutil.which", lambda command: "/usr/bin/nvidia-cuda-mps-control")
+        base_path = get_deploy_config_path("moss_tts_local.yaml")
+        path = tmp_path / "custom_moss.yaml"
+        path.write_text(
+            f"base_config: {base_path}\n"
+            "platforms:\n  cuda:\n    model_runner: v1\n    cuda_mps: false\n"
+            "    stages:\n      - stage_id: 0\n        max_num_seqs: 32\n"
+            "      - stage_id: 1\n        max_num_seqs: 32\n"
+        )
         pipeline = resolve_pipeline_config("moss_tts_local")
-        path = get_deploy_config_path(filename)
         config = VllmOmniConfig.from_pipeline_config(pipeline, deploy_config_path=path)
         for stage in config.stage_configs:
-            assert stage.model_config.use_v2_model_runner is runner
-            assert stage.runtime_config.cuda_mps is mps
-            assert stage.scheduler_config.max_num_seqs == capacity
+            assert not stage.model_config.use_v2_model_runner
+            assert not stage.runtime_config.cuda_mps
+            assert stage.scheduler_config.max_num_seqs == 32
         stages, _ = StageConfigFactory._create_legacy_from_registry(pipeline, {}, deploy_config_path=path)
-        for stage in stages:
-            assert stage.yaml_engine_args["use_v2_model_runner"] is runner
-            assert stage.yaml_runtime.get("cuda_mps", False) is mps
-            assert stage.yaml_engine_args["max_num_seqs"] == capacity
+        assert all(not stage.yaml_engine_args["use_v2_model_runner"] for stage in stages)
+        assert all(not stage.yaml_runtime.get("cuda_mps", False) for stage in stages)
+        assert all(stage.yaml_engine_args["max_num_seqs"] == 32 for stage in stages)
 
     @pytest.mark.parametrize("platform", ["cuda", "npu", "xpu", "rocm", "musa"])
     def test_moss_local_system_profile_reaches_native_runner_and_cuda_only_mps(self, platform):
         pipeline = resolve_pipeline_config("moss_tts_local")
-        path = Path(get_deploy_config_path("moss_tts_local_mrv2_optimized.yaml"))
+        path = Path(get_deploy_config_path("moss_tts_local.yaml"))
         deploy = _apply_platform_overrides(load_deploy_config(path), platform=platform)
         stages = merge_pipeline_deploy(pipeline, deploy)
         is_cuda = platform == "cuda"
@@ -3123,10 +3208,8 @@ class TestPlatformOverrides:
             assert args["hf_overrides"]["mrv2_gpu_slot_state"] is True
             assert args["hf_overrides"]["mrv2_batch_prefill"] is True
             assert args["hf_overrides"]["mrv2_direct_tokens"] is True
-            assert deploy.connectors["shm"]["extra"]["codec_first_chunk_fast_path"] == 1
-            assert args["hf_overrides"]["local_compile_audio_sampler"] is True
+            assert "local_compile_audio_sampler" not in args["hf_overrides"]
             extra = deploy.connectors["shm"]["extra"]
-            assert extra["codec_first_chunk_max_active_streams"] == 32
             assert extra["generation_min_batch_size"] == 16
             assert extra["generation_max_wait_ms"] == 6
             assert not stages[0].yaml_runtime.get("env")
@@ -3134,65 +3217,50 @@ class TestPlatformOverrides:
             assert all(not stage.yaml_engine_args["enable_prefix_caching"] for stage in stages)
             assert all(not stage.yaml_runtime.get("env") for stage in stages)
 
-    def test_platform_mps_rejects_non_boolean(self):
-        deploy = load_deploy_config(get_deploy_config_path("moss_tts_local_mrv2_optimized.yaml"))
-        deploy.platforms["cuda"]["cuda_mps"] = "true"
-        with pytest.raises(ValueError, match="platform cuda_mps must be a boolean"):
-            _apply_platform_overrides(deploy, platform="cuda")
-
-    def test_moss_local_mrv2_preserves_base_profile_and_variant_scope(self):
+    def test_moss_local_first_audio_preserves_prefix_cache_and_runner_options(self):
         pipeline = resolve_pipeline_config("moss_tts_local")
-        base_path = Path(get_deploy_config_path("moss_tts_local_v1.yaml"))
-        candidate_path = Path(get_deploy_config_path("moss_tts_local_mrv2.yaml"))
-        base = load_deploy_config(base_path)
-        candidate = load_deploy_config(candidate_path)
-        assert base.model_runner == "v1"
-        assert candidate.stages == base.stages
-        assert candidate.connectors == base.connectors
-        assert candidate.async_chunk == base.async_chunk
-        cuda = _apply_platform_overrides(candidate, platform="cuda")
-        stages = merge_pipeline_deploy(pipeline, cuda)
-        assert stages[0].yaml_engine_args["max_num_batched_tokens"] == 512
-        codec_args = stages[1].yaml_engine_args
-        assert codec_args["max_num_seqs"] == 64
-        assert codec_args["enforce_eager"] is False
-        assert codec_args["compilation_config"] == {
-            "mode": 0,
-            "cudagraph_mode": "FULL",
-            "cudagraph_capture_sizes": [1, 2, 4, 8, 16, 32, 64],
-            "cudagraph_num_of_warmups": 1,
+        path = get_deploy_config_path("moss_tts_local.yaml")
+        deploy = _apply_platform_overrides(load_deploy_config(path), platform="cuda")
+        talker, codec = merge_pipeline_deploy(pipeline, deploy)
+        args = talker.yaml_engine_args
+        assert args["enable_prefix_caching"] is True
+        assert args["use_v2_model_runner"] is True
+        assert args["max_num_seqs"] == 128
+        assert args["max_num_batched_tokens"] == 512
+        assert args["hf_overrides"] == {
+            "mrv2_gpu_slot_state": True,
+            "mrv2_batch_prefill": True,
+            "mrv2_direct_tokens": True,
+            "mrv2_eager_mtp": True,
         }
-        for platform in ("npu", "xpu", "rocm", "musa"):
-            # Platform resolution mutates the deployment; each server loads
-            # a fresh profile before applying its own platform overrides.
-            fallback = _apply_platform_overrides(load_deploy_config(candidate_path), platform=platform)
-            original = _apply_platform_overrides(load_deploy_config(base_path), platform=platform)
-            assert fallback.stages == original.stages
+        # Both CUDA stages run without torch.compile; explicit kernels replace the fusions.
+        assert args["compilation_config"]["mode"] == 0
+        assert args["compilation_config"]["cudagraph_mode"] == "FULL"
+        assert "inductor_compile_config" not in args["compilation_config"]
+        extra = deploy.connectors["shm"]["extra"]
+        assert extra["initial_codec_chunk_frames"] == 1
+        assert extra["codec_chunk_frames"] == 15
+        assert extra["generation_min_batch_size"] == 16
+        assert extra["generation_max_wait_ms"] == 6
+        assert codec.yaml_engine_args["use_v2_model_runner"] is True
+        assert deploy.cuda_mps is True
+        assert args["kv_cache_memory_bytes"] == 32 * 1024**3
+        codec_args = codec.yaml_engine_args
+        assert codec_args["max_num_seqs"] == 128
+        assert codec_args["hf_overrides"]["codec_attention_backend"] == "triton_slot"
+        compilation = codec_args["compilation_config"]
+        assert compilation["mode"] == 0 and "backend" not in compilation
+        assert compilation["cudagraph_mode"] == "FULL"
+        assert max(compilation["cudagraph_capture_sizes"]) == 128
+        assert "inductor_compile_config" not in compilation
         for variant in ("moss_tts_delay", "moss_tts_realtime"):
             assert not any(stage.supports_native_mrv2_data_plane for stage in resolve_pipeline_config(variant).stages)
 
-    def test_moss_local_high_concurrency_resolves_slot_compile_and_memory_budget(self):
-        pipeline = resolve_pipeline_config("moss_tts_local")
-        path = Path(get_deploy_config_path("moss_tts_local_mrv2_high_concurrency.yaml"))
-        deploy = _apply_platform_overrides(load_deploy_config(path), platform="cuda")
-        talker, codec = merge_pipeline_deploy(pipeline, deploy)
-        assert talker.yaml_engine_args["max_num_seqs"] == codec.yaml_engine_args["max_num_seqs"] == 128
-        assert talker.yaml_engine_args["hf_overrides"]["mrv2_batch_prefill"] is True
-        assert talker.yaml_engine_args["hf_overrides"]["mrv2_direct_tokens"] is True
-        assert talker.yaml_engine_args["hf_overrides"]["mrv2_gpu_slot_state"] is True
-        assert talker.yaml_engine_args["max_num_batched_tokens"] == 512
-        assert talker.yaml_engine_args["kv_cache_memory_bytes"] == 32 * 1024**3
-        assert codec.yaml_engine_args["hf_overrides"]["codec_attention_backend"] == "triton_slot"
-        compilation = codec.yaml_engine_args["compilation_config"]
-        assert compilation["mode"] == 3 and compilation["backend"] == "inductor"
-        assert compilation["cudagraph_mode"] == "FULL"
-        assert compilation["cudagraph_capture_sizes"] == [1, 2, 4, 6, 8, 12, 16, 24, 32, 64, 128]
-        assert compilation["inductor_compile_config"] == {"combo_kernels": False, "benchmark_combo_kernel": False}
-        base_path = Path(get_deploy_config_path("moss_tts_local_v1.yaml"))
-        for platform in ("npu", "xpu", "rocm", "musa"):
-            actual = _apply_platform_overrides(load_deploy_config(path), platform=platform)
-            expected = _apply_platform_overrides(load_deploy_config(base_path), platform=platform)
-            assert actual.stages == expected.stages
+    def test_platform_mps_rejects_non_boolean(self):
+        deploy = load_deploy_config(get_deploy_config_path("moss_tts_local.yaml"))
+        deploy.platforms["cuda"]["cuda_mps"] = "true"
+        with pytest.raises(ValueError, match="platform cuda_mps must be a boolean"):
+            _apply_platform_overrides(deploy, platform="cuda")
 
     @pytest.mark.parametrize("runner,native", [("v1", False), ("v2", False), ("v2", True)])
     def test_mrv2_undeclared_transport_warns(self, monkeypatch, runner, native):

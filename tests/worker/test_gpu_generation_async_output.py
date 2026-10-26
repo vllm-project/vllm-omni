@@ -7,10 +7,11 @@ from unittest.mock import patch
 import pytest
 import torch
 
+from tests.helpers.mark import hardware_marks
 from tests.worker.test_gpu_generation_model_runner import _make_runner
 from vllm_omni.worker.gpu_generation_model_runner import _AsyncGenerationOutput
 
-pytestmark = [pytest.mark.core_model, pytest.mark.cuda]
+pytestmark = [pytest.mark.core_model, *hardware_marks(res={"cuda": "L4"}, num_cards=1)]
 
 
 @pytest.mark.parametrize("kind", ["tensor", "list", "mapping"])

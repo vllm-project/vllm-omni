@@ -629,6 +629,44 @@ def test_empty_source_prefix_keeps_full_model_strict_check():
         loader.load_weights(model)
 
 
+def test_safetensors_name_filter_yields_only_selected_tensors(tmp_path, monkeypatch):
+    checkpoint = tmp_path / "diffusion_pytorch_model.safetensors"
+    save_file(
+        {
+            "proj_in.weight": torch.zeros(2, 2),
+            "audio_proj_in.weight": torch.ones(2, 2),
+            "transformer_blocks.0.audio_ff.weight": torch.full((2, 2), 2.0),
+            "transformer_blocks.0.audio_to_video_attn.weight": torch.full((2, 2), 3.0),
+        },
+        checkpoint,
+    )
+    od_config = SimpleNamespace(
+        enable_multithread_weight_load=True,
+        parallel_config=SimpleNamespace(use_hsdp=False),
+        quantization_config=None,
+    )
+    loader = DiffusersPipelineLoader(LoadConfig(), od_config)
+    monkeypatch.setattr(
+        loader,
+        "_prepare_weights",
+        lambda *_args, **_kwargs: (tmp_path, [str(checkpoint)], True),
+    )
+    source = DiffusersPipelineLoader.ComponentSource(
+        model_or_path=str(tmp_path),
+        subfolder=None,
+        revision=None,
+        prefix="transformer.",
+        weight_name_patterns=("audio_*", "transformer_blocks.*.audio_ff.*"),
+    )
+
+    weights = list(loader._get_weights_iterator(source))
+
+    assert [name for name, _tensor in weights] == [
+        "transformer.audio_proj_in.weight",
+        "transformer.transformer_blocks.0.audio_ff.weight",
+    ]
+
+
 def test_stream_online_quant_weights_offloads_layers_after_processing():
     from vllm.model_executor.model_loader.reload.layerwise import (
         get_layerwise_info,
@@ -674,6 +712,82 @@ def test_stream_online_quant_weights_offloads_layers_after_processing():
     with pytest.raises(StopIteration):
         next(streamed)
     assert events == ["first", "second"]
+
+
+def test_online_quant_finalizes_padded_layers_without_accumulating(monkeypatch):
+    from vllm.model_executor.model_loader.reload import layerwise
+
+    resident: set[nn.Module] = set()
+    finalized: set[nn.Module] = set()
+
+    class _OnlineQuantMethod:
+        uses_meta_device = True
+
+    class _PaddedLayer(nn.Linear):
+        def __init__(self):
+            super().__init__(2, 3, bias=False)
+            self.quant_method = _OnlineQuantMethod()
+            info = layerwise.get_layerwise_info(self)
+            info.load_numel_total = self.weight.numel()
+            info.load_numel = 4  # The checkpoint omits two padding elements.
+
+        def to(self, device):
+            assert device == "cpu"
+            assert self in finalized
+            resident.remove(self)
+            return super().to(device)
+
+    model = nn.Sequential(_PaddedLayer(), _PaddedLayer(), _PaddedLayer())
+
+    def finalize(module, model_config):
+        assert model_config is None
+        assert not resident, "previous deferred layer must be offloaded before the next"
+        resident.add(module)
+        finalized.add(module)
+        layerwise.get_layerwise_info(module).reset()
+
+    monkeypatch.setattr(layerwise, "finalize_layerwise_processing", finalize)
+    monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
+
+    DiffusersPipelineLoader._finalize_online_quant_weights_to_cpu(model)
+    assert finalized == set(model)
+    assert not resident
+
+
+def test_online_quant_finalization_waits_for_buffered_weight_consumer(monkeypatch):
+    from vllm.model_executor.model_loader.reload import layerwise
+
+    class _BufferedModel(nn.Module):
+        consumed = False
+
+        def __init__(self):
+            super().__init__()
+            self.layer = nn.Linear(2, 2, bias=False)
+            self.layer.quant_method = SimpleNamespace(uses_meta_device=True)
+            layerwise.get_layerwise_info(self.layer).load_numel_total = 6
+
+        def load_weights(self, weights):
+            buffered = list(weights)
+            assert not self.consumed
+            assert len(buffered) == 1
+            self.layer.weight.data.copy_(buffered[0][1])
+            layerwise.get_layerwise_info(self.layer).load_numel = 4
+            self.consumed = True
+            return None
+
+    model = _BufferedModel()
+    loader = _make_loader_with_weights(["weight"])
+    finalized = []
+
+    def finalize(layer, model_config):
+        assert layer is model.layer and model_config is None
+        assert model.consumed, "iterator exhaustion does not mean the consumer finished"
+        finalized.append(layer)
+        layerwise.get_layerwise_info(layer).reset()
+
+    monkeypatch.setattr(layerwise, "finalize_layerwise_processing", finalize)
+    loader.load_weights(model, stream_online_quant_to_cpu=True)
+    assert finalized == [model.layer]
 
 
 def test_process_weights_skips_completed_online_quant_layer(monkeypatch):
@@ -757,6 +871,7 @@ def test_load_model_custom_pipeline_sets_current_diffusion_config(monkeypatch):
         dtype=torch.float32,
         parallel_config=SimpleNamespace(use_hsdp=False),
         quantization_config=None,
+        weight_transfer_config=None,
     )
 
     loader = DiffusersPipelineLoader(LoadConfig(), od_config)

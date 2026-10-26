@@ -15,10 +15,12 @@ from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_qu
 from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
 from vllm.v1.metrics.stats import PrefillStats, PromptTokenStats
 from vllm.v1.request import Request, RequestStatus
+from vllm.v1.utils import ConstantList
 
 from tests.helpers.omni_scheduler import bind_omits_transfer_helpers
 from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
 from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler
+from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
 from vllm_omni.data_entry_keys import CodesStruct, MetaStruct, OmniPayload, OmniPayloadStruct
 from vllm_omni.distributed.omni_connectors.adapter import construct_next_stage_streaming_input_prompt
 from vllm_omni.distributed.omni_connectors.connectors.shm_connector import SharedMemoryConnector
@@ -573,6 +575,7 @@ def build_adapter(monkeypatch, mocker: MockerFixture):
         flat_tts_config: bool = False,
         active_stream_window: int = 0,
         connector_extra: dict | None = None,
+        custom_process_next_stage_input_func: str | None = None,
     ):
         connector = mocker.MagicMock()
         connector.stage_id = stage_id
@@ -622,6 +625,7 @@ def build_adapter(monkeypatch, mocker: MockerFixture):
             hf_config=hf_config,
             hf_config_name="tts_config" if stage_id == 1 else None,
             active_stream_window=active_stream_window,
+            custom_process_next_stage_input_func=custom_process_next_stage_input_func,
             stage_connector_config={
                 "name": "SharedMemoryConnector",
                 "extra": connector_extra or {},
@@ -1130,6 +1134,87 @@ def test_load_poll_generation_empty_nonterminal_chunk_keeps_polling(build_adapte
     assert adapter.get_req_chunk[request.request_id] == 2
 
 
+@pytest.mark.parametrize("left_context", [0, 2])
+@pytest.mark.parametrize("frames", [2, 5])
+def test_generation_window_ending_the_audio_is_not_decoded_again(build_adapter, left_context, frames):
+    """Drama 3 audio that ends exactly at a window (ramp 2, 3): the finished marker that
+    follows is an empty [codebooks, 0] window through the real chunker and SHM transport,
+    so it replaces the last window's codes and Stage 1 has nothing left to decode."""
+    from vllm_omni.core.sched.omni_generation_scheduler import _has_async_chunk_payload_to_run
+    from vllm_omni.model_executor.stage_input_processors.fish_omni import (
+        NUM_CODEBOOKS,
+        SEMANTIC_BEGIN_ID,
+        fish_omni_to_dac_decoder_async_chunk,
+    )
+
+    manager = SimpleNamespace(
+        connector=SimpleNamespace(
+            config={
+                "extra": {
+                    "codec_chunk_ramp": "2,3",
+                    "codec_chunk_frames": 4,
+                    "codec_left_context_frames": left_context,
+                }
+            }
+        ),
+        request_payload={},
+    )
+    producer = SimpleNamespace(external_req_id="tail", is_finished=lambda: False)
+
+    def frame(main: int) -> dict:
+        return {"codes.audio": torch.cat((torch.tensor([main]), torch.arange(NUM_CODEBOOKS))).unsqueeze(0)}
+
+    windows = [fish_omni_to_dac_decoder_async_chunk(manager, frame(SEMANTIC_BEGIN_ID), producer) for _ in range(frames)]
+    end_of_speech = SEMANTIC_BEGIN_ID - 1
+    windows.append(fish_omni_to_dac_decoder_async_chunk(manager, frame(end_of_speech), producer, is_finished=True))
+    windows = [window for window in windows if window is not None]
+
+    shm = SharedMemoryConnector({"stage_id": 0})
+    received = []
+    try:
+        for index, window in enumerate(windows):
+            key = f"tail_{uuid.uuid4().hex}_{index}"
+            assert shm.put("0", "1", key, window)[0]
+            received.append(shm.get("0", "1", key))
+            shm.cleanup(key)
+    finally:
+        shm.close()
+
+    adapter, connector = build_adapter(stage_id=1, model_mode="generation")
+    request = _req("tail", RequestStatus.WAITING)
+    connector.get.side_effect = received
+    # Each window is registered and received as the scheduler asks for the next one.
+    for _ in received[:-1]:
+        assert adapter._poll_single_request(_dequeue_load_entry(adapter, request))
+        assert request.prompt_token_ids == [0]
+        assert _has_async_chunk_payload_to_run(request)
+    assert adapter._poll_single_request(_dequeue_load_entry(adapter, request))
+    assert connector.get.call_count == len(received)
+    assert request.prompt_token_ids == []
+    assert not _has_async_chunk_payload_to_run(request)
+    assert request.additional_information["codes"]["audio"].shape == (NUM_CODEBOOKS, 0)
+
+
+_PROCESSORS = "vllm_omni.model_executor.stage_input_processors"
+
+
+@pytest.mark.parametrize(
+    "processor, batch_form",
+    [
+        (f"{_PROCESSORS}.fish_omni.fish_omni_to_dac_decoder_async_chunk", "fish_omni_to_dac_decoder_async_chunk_batch"),
+        # These modules' batch forms serve the MRv2 native output worker; their
+        # scalar builders read the live request, so per-step saves leave them alone.
+        (f"{_PROCESSORS}.qwen3_tts.talker2code2wav_async_chunk", None),
+        (f"{_PROCESSORS}.higgs_audio_v3.talker2code2wav_async_chunk", None),
+        (f"{_PROCESSORS}.moss_tts.talker2codec_raw_async_chunk", None),
+    ],
+)
+def test_per_step_saves_take_only_opted_in_batch_forms(build_adapter, processor, batch_form):
+    adapter, _ = build_adapter(stage_id=0, custom_process_next_stage_input_func=processor)
+    batch = adapter.custom_process_next_stage_input_batch_func
+    assert (batch.__name__ if batch is not None else None) == batch_form
+
+
 def test_save_async(build_adapter):
     adapter, _ = build_adapter(stage_id=1)
     request = _req("req-1", RequestStatus.WAITING, external_req_id="external-1")
@@ -1197,16 +1282,21 @@ def test_segment_boundary_starts_new_send_watermark_before_background_flush(buil
     assert adapter.requests_num_chunks_sent["ext-stream"] == 3
 
 
-def test_background_send_uses_enqueued_request_snapshot(build_adapter):
+@pytest.mark.parametrize("prompt_token_ids", [[], [1, 2], list(range(2508))], ids=["empty", "short", "long"])
+@pytest.mark.parametrize("wrap_prompt", [False, True], ids=["list", "constant-list"])
+def test_background_send_uses_enqueued_request_snapshot(build_adapter, prompt_token_ids, wrap_prompt, mocker):
     """A queued segment must not observe later in-place request mutations."""
     adapter, _ = build_adapter(stage_id=1)
+    live_prompt_token_ids = prompt_token_ids.copy()
     request = Request(
         request_id="req-stream",
-        prompt_token_ids=[1, 2],
+        prompt_token_ids=live_prompt_token_ids,
         sampling_params=SamplingParams(max_tokens=8),
         pooling_params=None,
         resumable=True,
     )
+    if wrap_prompt:
+        mocker.patch.object(request, "prompt_token_ids", ConstantList(live_prompt_token_ids))
     request.external_req_id = "ext-stream"
     ref_audio = torch.tensor([0.1, -0.1])
     request.additional_information = {"codes": {"ref": ref_audio}, "meta": {"segment": "old"}}
@@ -1233,7 +1323,7 @@ def test_background_send_uses_enqueued_request_snapshot(build_adapter):
         is_segment_finished=True,
     )
     request.additional_information["meta"]["segment"] = "next"
-    request.prompt_token_ids.append(3)
+    live_prompt_token_ids.append(3)
     request.append_output_token_ids([8])
     request._omni_segment_generation = 1
     adapter.save_async(
@@ -1242,7 +1332,7 @@ def test_background_send_uses_enqueued_request_snapshot(build_adapter):
         is_segment_finished=True,
     )
     request.additional_information["meta"]["segment"] = "later"
-    request.prompt_token_ids.append(4)
+    live_prompt_token_ids.append(4)
     request.append_output_token_ids([9])
 
     assert len(adapter._pending_save_reqs) == 2
@@ -1255,9 +1345,29 @@ def test_background_send_uses_enqueued_request_snapshot(build_adapter):
     adapter._send_single_request(second_task)
 
     assert seen_requests == [
-        ("old", [1, 2], [7], [1, 2, 7], True),
-        ("next", [1, 2, 3], [7, 8], [1, 2, 7, 8], True),
+        ("old", prompt_token_ids, [7], prompt_token_ids + [7], True),
+        ("next", prompt_token_ids + [3], [7, 8], prompt_token_ids + [7, 8], True),
     ]
+
+
+def test_request_snapshot_preserves_embeddings_only_prompt():
+    prompt_embeds = torch.zeros(2, 4)
+    request = Request(
+        request_id="req-embeds",
+        prompt_token_ids=None,
+        prompt_embeds=prompt_embeds,
+        sampling_params=SamplingParams(max_tokens=8),
+        pooling_params=None,
+    )
+    request.append_output_token_ids([7])
+
+    snapshot = OmniChunkTransferAdapter._snapshot_processor_request(request)
+    request.append_output_token_ids([8])
+
+    assert snapshot.prompt_token_ids is None
+    assert snapshot.prompt_embeds is prompt_embeds
+    assert list(snapshot.output_token_ids) == [7]
+    assert snapshot.output_token_count == 1
 
 
 def test_save_without_custom_processor_does_not_snapshot_request(build_adapter, mocker):
@@ -1304,6 +1414,122 @@ def test_send_single_request_terminal_chunk_still_flushes_processor(build_adapte
     sent_payload = connector.put.call_args.kwargs["data"]
     assert bool(sent_payload.meta.finished.item()) is True
     assert bool(sent_payload.meta.is_segment_finished.item()) is False
+
+
+def test_save_async_batch_runs_processor_once_and_sends_only_payloads(build_adapter, monkeypatch):
+    """A step's requests go through the batch processor in one call; only returned payloads are put."""
+    adapter, connector = build_adapter(stage_id=0)
+    first = _req("req-1", RequestStatus.RUNNING, external_req_id="ext-1")
+    second = _req("req-2", RequestStatus.RUNNING, external_req_id="ext-2")
+    calls = []
+
+    def batch_processor(transfer_manager, outputs, requests, is_finished):
+        calls.append(([r.external_req_id for r in requests], list(is_finished), [o["codes"]["audio"] for o in outputs]))
+        return [None, OmniPayloadStruct(codes=CodesStruct(audio=torch.tensor([7], dtype=torch.long)))]
+
+    adapter.custom_process_next_stage_input_func = lambda **kwargs: pytest.fail("single processor called")
+    adapter.custom_process_next_stage_input_batch_func = batch_processor
+    monkeypatch.setattr(adapter, "cleanup", lambda *a, **kw: None)
+    snapshots = []
+
+    def snapshot(request):
+        snapshots.append(request)
+        return request
+
+    monkeypatch.setattr(adapter, "_snapshot_processor_request", snapshot)
+
+    adapter.save_async_batch(
+        [
+            {"multimodal_output": {"codes.audio": torch.tensor([1])}, "request": first, "is_segment_finished": False},
+            {"multimodal_output": {"codes.audio": torch.tensor([2])}, "request": second, "is_segment_finished": False},
+        ]
+    )
+    assert len(adapter._pending_save_reqs) == 1 and not snapshots
+    adapter._send_single_request(adapter._pending_save_reqs.popleft())
+
+    assert [c[:2] for c in calls] == [(["ext-1", "ext-2"], [False, False])]
+    assert [int(t) for t in calls[0][2]] == [1, 2]
+    assert connector.put.call_count == 1
+    assert connector.put.call_args.kwargs["put_key"] == "ext-2_0_0"
+    assert adapter.put_req_chunk["ext-2"] == 1 and adapter.put_req_chunk["ext-1"] == 0
+
+
+def test_cancel_while_batch_processor_runs_does_not_recreate_state(build_adapter, monkeypatch):
+    """The scheduler's cleanup during the batch processor defers to the save thread,
+    so the processor cannot recreate the cancelled request's state."""
+    adapter, connector = build_adapter(stage_id=0)
+    monkeypatch.setattr(adapter, "cleanup", lambda *a, **kw: None)
+    cancelled = _req("req-c", RequestStatus.RUNNING, external_req_id="ext-c")
+    kept = _req("req-k", RequestStatus.RUNNING, external_req_id="ext-k")
+
+    def batch_processor(transfer_manager, outputs, requests, is_finished):
+        transfer_manager.cleanup_sender("ext-c")  # scheduler thread, while the processor runs
+        payloads = []
+        for request in requests:
+            state = transfer_manager.request_payload.setdefault(request.external_req_id, {}).setdefault("frames", [])
+            state.append(1)
+            payloads.append(OmniPayloadStruct(codes=CodesStruct(audio=torch.tensor([len(state)]))))
+        return payloads
+
+    adapter.custom_process_next_stage_input_func = lambda **kwargs: pytest.fail("single processor called")
+    adapter.custom_process_next_stage_input_batch_func = batch_processor
+    adapter.save_async_batch(
+        [
+            {"multimodal_output": {"codes.audio": torch.tensor([1])}, "request": r, "is_segment_finished": False}
+            for r in (cancelled, kept)
+        ]
+    )
+    adapter._send_single_request(adapter._pending_save_reqs.popleft())
+
+    assert "ext-c" not in adapter.request_payload and "ext-c" not in adapter._sender_tokens
+    assert [c.kwargs["put_key"] for c in connector.put.call_args_list] == ["ext-k_0_0"]
+    assert not adapter._sender_tokens["ext-k"].in_flight
+
+
+def _fish_omni_frame(index: int) -> dict:
+    from vllm_omni.model_executor.stage_input_processors.fish_omni import SEMANTIC_BEGIN_ID
+
+    codes = torch.arange(10) + 100 * index
+    return {"codes.audio": torch.cat((torch.tensor([SEMANTIC_BEGIN_ID + index]), codes)).unsqueeze(0)}
+
+
+def _fish_omni_adapter(build_adapter, monkeypatch, ramp="1"):
+    from vllm_omni.model_executor.stage_input_processors import fish_omni
+
+    adapter, connector = build_adapter(stage_id=0, connector_extra={"codec_chunk_ramp": ramp})
+    adapter.custom_process_next_stage_input_func = fish_omni.fish_omni_to_dac_decoder_async_chunk
+    adapter.custom_process_next_stage_input_batch_func = fish_omni.fish_omni_to_dac_decoder_async_chunk_batch
+    monkeypatch.setattr(adapter, "cleanup", lambda *a, **kw: None)
+    return adapter, connector
+
+
+def _send_step(adapter, requests, frame_index):
+    adapter.save_async_batch(
+        [
+            {"multimodal_output": _fish_omni_frame(frame_index), "request": r, "is_segment_finished": False}
+            for r in requests
+        ]
+    )
+    adapter._send_single_request(adapter._pending_save_reqs.popleft())
+
+
+def test_cancelled_fish_omni_streams_leave_no_frame_history(build_adapter, monkeypatch):
+    """Cancelling and cleaning a request drops its frame history; a reused id starts fresh."""
+    adapter, connector = _fish_omni_adapter(build_adapter, monkeypatch, ramp="4")
+    requests = [_req(f"req-{i}", RequestStatus.RUNNING, external_req_id=f"ext-{i}") for i in range(100)]
+    for index in range(3):  # below the first window: nothing is sent yet
+        _send_step(adapter, requests, index)
+    assert len(adapter.request_payload) == 100
+    for request in requests:
+        adapter.cleanup_sender(request.external_req_id)
+    assert not adapter.request_payload and not adapter._sender_tokens
+
+    reused = _req("req-new", RequestStatus.RUNNING, external_req_id="ext-0")
+    for index in range(50, 54):
+        _send_step(adapter, [reused], index)
+    payload = connector.put.call_args.kwargs["data"]
+    codes = payload["codes"]["audio"] if isinstance(payload, dict) else payload.codes.audio
+    assert (codes[0] // 100).tolist() == [50, 51, 52, 53]
 
 
 def test_send_single_request_struct_without_meta_does_not_crash(build_adapter, monkeypatch):
@@ -3240,6 +3466,52 @@ def _build_deferred_finish_scheduler(mocker, *, running, pending_finish_reqs):
         req_id_to_index={},
     )
     return scheduler, scheduler_output, model_runner_output, cleanup_calls
+
+
+def test_generation_holds_sentence_until_final_output(build_adapter, mocker: MockerFixture):
+    adapter, _ = build_adapter(model_mode="generation")
+    request = Request("sentence-stream", [0], SamplingParams(max_tokens=8), pooling_params=None)
+    request.status = RequestStatus.RUNNING
+    request.additional_information = {"text": "first sentence"}
+    adapter.requests_with_ready_chunks.add(request.request_id)
+    scheduler, schedule, output, _ = _build_deferred_finish_scheduler(mocker, running=[request], pending_finish_reqs=[])
+    scheduler.chunk_transfer_adapter = adapter
+    scheduler._supports_pending_generation = True
+    scheduler._native_data_plane = False
+    scheduler._express_min_slack_s = 0
+    scheduler._async_chunk_transport_enabled.return_value = True
+    scheduler._input_execution_is_terminal.return_value = False
+    schedule.num_scheduled_tokens = {request.request_id: 1}
+    schedule.scheduled_new_reqs = []
+    schedule.scheduled_cached_reqs = SimpleNamespace(req_ids=[request.request_id])
+    output.req_id_to_index = {request.request_id: 0}
+    output.routed_experts = None
+
+    def receive_next_sentence(req):
+        req.additional_information = {"text": "second sentence"}
+        req.num_computed_tokens = 0
+
+    adapter.load_async = mocker.Mock(side_effect=receive_next_sentence)
+    for pending in (True, True, False):
+        request.num_computed_tokens += 1
+        request.num_in_flight_tokens += 1
+        OmniSchedulerMixin._postprocess_omni_schedule_output(scheduler, schedule, consume_chunks=False)
+
+        # A scheduler tick may run before the previous GPU result is applied.
+        adapter.process_pending_chunks(DummyWaitingQueue(), scheduler.running)
+        adapter.load_async.assert_not_called()
+        assert request.additional_information == {"text": "first sentence"}
+
+        output.pending_generation_req_ids = {request.request_id} if pending else set()
+        OmniGenerationScheduler.update_from_output(scheduler, schedule, output)
+        assert request.num_in_flight_tokens == 0
+        assert request.num_computed_tokens == (0 if pending else 1)
+        assert (request.request_id in adapter.requests_with_ready_chunks) == pending
+
+    adapter.process_pending_chunks(DummyWaitingQueue(), scheduler.running)
+    adapter.load_async.assert_called_once_with(request)
+    assert request.additional_information == {"text": "second sentence"}
+    assert request.num_computed_tokens == 0
 
 
 def test_deferred_finish_emits_finished_output(mocker: MockerFixture):

@@ -38,6 +38,7 @@ event is base64-encoded raw PCM16.
 | Client to server | `session.update` | Selects and validates the served model. Configures system prompt and tools |
 | Client to server | `input_audio_buffer.append` | Appends base64 PCM16 audio |
 | Client to server | `input_audio_buffer.commit` | Starts generation over the incoming stream |
+| Client to server | `conversation.item.create` | Adds a text, audio, or image item to the conversation |
 | Server to client | `transcription.delta` | Carries incremental response text |
 | Server to client | `transcription.done` | Carries final text and token usage |
 | Server to client | `response.output_audio.delta` | Carries incremental PCM16 response audio |
@@ -64,6 +65,15 @@ the default `/v1/realtime` handler in all supported models.
 - Read `sample_rate_hz` from each audio event instead of assuming an output
   rate. Qwen3-Omni output is typically 24 kHz.
 - Concatenate audio deltas in receive order to construct the output waveform.
+
+## Conversation Items and Image Input
+
+Use `conversation.item.create` to add `input_text` or `input_image` content to
+the conversation history. Images do not start a response; send
+`response.create` after adding the item. The `input_image.image_url` value is
+passed through the model's chat multimodal renderer, which validates and
+materializes supported image URLs. Image understanding requires a model with
+image input support.
 
 ## Availability and Limitations
 

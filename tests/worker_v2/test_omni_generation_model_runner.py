@@ -23,6 +23,9 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 @pytest.mark.parametrize("randomize_inputs", [False, True])
 def test_profile_run_accepts_release_flag_without_running_codec(monkeypatch, randomize_inputs):
     runner = object.__new__(OmniGenerationModelRunner)
+    from vllm_omni.worker_v2.staged_writes import StagedWrites
+
+    runner._staged_writes = StagedWrites()
     runner.model = MagicMock(side_effect=AssertionError("profiling ran codec model"))
     synchronize = MagicMock()
     monkeypatch.setattr(torch.accelerator, "synchronize", synchronize)
@@ -47,6 +50,11 @@ class _FakeStagedField:
 
 def _make_runner(model_output, num_reqs=1, prompt_len=10):
     runner = object.__new__(OmniGenerationModelRunner)
+    runner._retains_state_across_chunks = False
+    runner._remove_request = MagicMock()
+    from vllm_omni.worker_v2.staged_writes import StagedWrites
+
+    runner._staged_writes = StagedWrites()
     runner.device = torch.device("cpu")
     runner.model_config = MagicMock(hf_text_config=None)
     del runner.model_config.eos_token_id
@@ -69,6 +77,9 @@ def _make_runner(model_output, num_reqs=1, prompt_len=10):
 @pytest.mark.parametrize("aux_enabled", [False, True])
 def test_control_only_step_keeps_lifecycle_and_skips_input_construction(aux_enabled):
     runner = object.__new__(OmniGenerationModelRunner)
+    from vllm_omni.worker_v2.staged_writes import StagedWrites
+
+    runner._staged_writes = StagedWrites()
     order = []
     for name in (
         "_prepare_native_data_plane",
@@ -103,32 +114,36 @@ def test_control_only_step_keeps_lifecycle_and_skips_input_construction(aux_enab
         runner.aux_output_connector.begin_step.assert_called_once_with(metadata)
 
 
-def test_released_chunk_reuses_scheduler_output_and_slot_recycle_clears_state():
+@pytest.mark.parametrize("slot_exists", [False, True])
+def test_cached_chunk_updates_request_and_model_state_with_or_without_slot(slot_exists):
     from vllm.v1.core.sched.output import SchedulerOutput
 
     from vllm_omni.core.sched.output import OmniCachedRequestData
 
     runner = object.__new__(OmniGenerationModelRunner)
-    runner.model = SimpleNamespace(logits_processor=None)
+    from vllm_omni.worker_v2.staged_writes import StagedWrites
+
+    runner._staged_writes = StagedWrites()
+    runner.add_requests = MagicMock()
     runner._remove_request = MagicMock()
-    req_id_to_index = MagicMock()
-    req_id_to_index.get.return_value = None
     runner.req_states = SimpleNamespace(
-        add_request=MagicMock(), req_id_to_index=req_id_to_index, apply_staged_writes=MagicMock()
+        req_id_to_index={"req": 0} if slot_exists else {},
+        max_seq_len=torch.tensor([999]),
+        draft_tokens=torch.ones(1, 2, dtype=torch.long),
+        prompt_len=SimpleNamespace(np=[999]),
+        prefill_len=SimpleNamespace(np=[999]),
+        total_len=MagicMock(),
+        all_token_ids=MagicMock(),
+        num_computed_tokens=MagicMock(),
+        num_computed_prefill_tokens=[999],
+        apply_staged_writes=MagicMock(),
     )
-    runner.pooling_runner = None
-    runner.encoder_cache = None
+
     runner.model_state = SimpleNamespace(
         add_request=MagicMock(),
         apply_staged_writes=MagicMock(),
         remove_request=MagicMock(),
-        intermediate_buffer=SimpleNamespace(remove_request=MagicMock()),
     )
-    runner.block_tables = SimpleNamespace(append_block_ids=MagicMock())
-    runner.lora_state = SimpleNamespace(add_request=MagicMock())
-    runner.is_last_pp_rank = False
-    runner.adaptive_verification = None
-    runner.sampler = None
     cached = OmniCachedRequestData(
         req_ids=["req"],
         resumed_req_ids=set(),
@@ -151,9 +166,109 @@ def test_released_chunk_reuses_scheduler_output_and_slot_recycle_clears_state():
         finished_req_ids=set(),
         free_encoder_mm_hashes=[],
     )
+    writes = []
+    if slot_exists:
+        runner.req_states.apply_staged_writes.side_effect = lambda: writes.append(("req", runner._staged_writes.depth))
+        runner.model_state.apply_staged_writes.side_effect = lambda: writes.append(
+            ("model", runner._staged_writes.depth)
+        )
     runner._handle_async_chunk_updates(scheduler_output)
-    added = runner.model_state.add_request.call_args.args[1]
+    if slot_exists:
+        assert writes == [("req", 1), ("model", 1)]
+        assert runner.req_states.req_id_to_index == {"req": 0}
+        assert runner.req_states.max_seq_len.tolist() == [2]
+        assert not runner.req_states.draft_tokens.any()
+        assert runner.req_states.prompt_len.np == [1]
+        assert runner.req_states.prefill_len.np == [1]
+        assert runner.req_states.num_computed_prefill_tokens == [0]
+        runner.req_states.total_len.stage_write_elem.assert_called_once_with(0, 1)
+        runner.req_states.all_token_ids.stage_write.assert_called_once_with(0, 0, [1])
+        runner.req_states.num_computed_tokens.stage_write_elem.assert_called_once_with(0, 0)
+        runner._remove_request.assert_not_called()
+        runner.model_state.remove_request.assert_called_once_with(0)
+        runner.add_requests.assert_not_called()
+        runner.model_state.add_request.assert_called_once()
+        added = runner.model_state.add_request.call_args.args[1]
+    else:
+        runner.add_requests.assert_called_once()
+        submitted = runner.add_requests.call_args.args[0]
+        assert len(submitted.scheduled_new_reqs) == 1
+        added = submitted.scheduled_new_reqs[0]
+        runner.model_state.add_request.assert_not_called()
+        runner.model_state.remove_request.assert_not_called()
+        runner.req_states.apply_staged_writes.assert_not_called()
     assert (added.req_id, added.prompt_token_ids) == ("req", [1])
+    assert added.prefill_token_ids == [1]
+    assert added.num_computed_tokens == 0
+    assert added.sampling_params is None
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize("retained", [False, True])
+def test_generation_retains_slot_until_finish(monkeypatch, device, retained):
+    from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+
+    from vllm_omni.worker_v2 import omni_generation_model_runner as module
+
+    output = OmniOutput(text_hidden_states=torch.empty(0), multimodal_outputs={})
+    runner = _make_runner(output)
+    runner._retains_state_across_chunks = retained
+    runner.model_config.async_chunk = True
+    runner.model = SimpleNamespace(on_requests_finished=MagicMock())
+    runner._reserve_native_data_plane_outputs = MagicMock()
+    runner._finalize_native_data_plane_output = lambda value: value
+    runner._remove_request = GPUModelRunner._remove_request.__get__(runner)
+    mapping = {"req-0": 0}
+    free_indices = []
+
+    def remove_req(req_id):
+        idx = mapping.pop(req_id, None)
+        if idx is not None:
+            free_indices.append(idx)
+        return idx
+
+    runner.req_states.req_id_to_index = mapping
+    runner.req_states.remove_request = MagicMock(side_effect=remove_req)
+    model_inputs = {0: [9] * 10}
+    removed_inputs = []
+
+    def remove_model(req):
+        idx = req if isinstance(req, int) else mapping.get(req)
+        if idx in model_inputs:
+            removed_inputs.append(model_inputs.pop(idx))
+
+    runner.model_state = SimpleNamespace(remove_request=MagicMock(side_effect=remove_model))
+    runner.pooling_runner = None
+    runner.pp_handler = None
+    runner.encoder_cache = None
+    runner.prompt_logprobs_worker = None
+    runner.lora_state = SimpleNamespace(remove_request=MagicMock())
+    if device == "cuda":
+        runner.device = SimpleNamespace(type="cuda")
+        runner.main_stream = object()
+        runner.output_copy_stream = object()
+        monkeypatch.setattr(module, "_contains_cuda_tensor", lambda _: True)
+        monkeypatch.setattr(module, "OmniGenerationAsyncOutput", lambda **kwargs: SimpleNamespace(**kwargs))
+
+    runner.sample_tokens()
+    if not retained:
+        assert mapping == {}
+        assert model_inputs == {}
+        assert free_indices == [0]
+        runner.req_states.remove_request.assert_called_once_with("req-0")
+    else:
+        assert mapping == {"req-0": 0}
+        assert free_indices == []
+        runner.model_state.remove_request.assert_not_called()
+        runner.req_states.remove_request.assert_not_called()
+    # Both completion and abort arrive at the runner as finished_req_ids.
+    terminal = SimpleNamespace(finished_req_ids={"req-0"}, preempted_req_ids=set())
+    runner.finish_requests(terminal)
+    assert mapping == {}
+    assert model_inputs == {}
+    assert free_indices == [0]
+    assert removed_inputs == [[9] * 10]
+    runner.model.on_requests_finished.assert_called_once_with({"req-0"})
 
 
 def test_sample_tokens_cpu_sync_owns_outputs_and_runs_connector_last():

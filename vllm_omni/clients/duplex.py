@@ -40,9 +40,11 @@ import random
 import time
 import wave
 from abc import ABC, abstractmethod
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Sequence
+from bisect import bisect_left, bisect_right, insort
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TypedDict
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from uuid import uuid4
 
@@ -243,6 +245,9 @@ class SessionConfig:
     playback_commit_policy: str | None = None
     turn_detection: dict[str, object] | None = None
     idle_timeout_s: float | None = None
+    #: Caps the response length for every turn in the session. Left unset the
+    #: server decides, so existing callers send exactly what they sent before.
+    max_output_tokens: int | None = None
     extra_body: dict[str, object] = field(default_factory=dict)
 
     def to_session_payload(self, *, model: str) -> dict[str, object]:
@@ -276,6 +281,8 @@ class SessionConfig:
             payload["playback_commit_policy"] = self.playback_commit_policy
         if self.idle_timeout_s is not None:
             payload["idle_timeout_s"] = self.idle_timeout_s
+        if self.max_output_tokens is not None:
+            payload["max_output_tokens"] = self.max_output_tokens
         extra_body: dict[str, object] = {"auto_response": self.auto_response}
         extra_body.update(self.extra_body)
         payload["extra_body"] = extra_body
@@ -667,6 +674,11 @@ class DuplexClientBase(ABC):
         self._closed = asyncio.Event()
         self._closed_marker: _ClosedMarker | None = None
         self._last_error_reason: str | None = None
+        self._event_collector: EventCollector | None = None
+
+    def attach_event_collector(self, collector: EventCollector) -> None:
+        """Record successful append sends on ``collector`` (probe / bench)."""
+        self._event_collector = collector
 
     # -- transport hooks ------------------------------------------------------
 
@@ -795,6 +807,8 @@ class DuplexClientBase(ABC):
         is_speech: bool | None = None,
         video_frames: Sequence[str] | None = None,
         stacked_video_frames: Sequence[str | None] | None = None,
+        media_origin_ms: float = 0.0,
+        unit_index: int = 0,
     ) -> int:
         """Slice ``pcm`` into ``chunk_ms`` chunks, pace, append; interleave frames.
 
@@ -815,6 +829,10 @@ class DuplexClientBase(ABC):
 
         Returns the number of base frames actually sent (a clip shorter than
         the frame list leaves the tail unsent).
+
+        ``media_origin_ms`` and ``unit_index`` continue a previous call's
+        media clock. A tail streamed on its own otherwise restarts at unit 0,
+        so the append that closes the next whole second carries no frame.
         """
         input_format = self.config.input_audio
         chunk_bytes = max(input_format.byte_count(chunk_ms), input_format.bytes_per_sample)
@@ -822,8 +840,8 @@ class DuplexClientBase(ABC):
         stacked = list(stacked_video_frames or [])
 
         def units() -> Iterator[tuple[bytes, list[str] | None]]:
-            audio_end_ms = 0.0
-            frames_sent = 0
+            audio_end_ms = media_origin_ms
+            frames_sent = unit_index
             for offset in range(0, len(pcm), chunk_bytes):
                 chunk = pcm[offset : offset + chunk_bytes]
                 audio_end_ms += input_format.duration_ms(len(chunk))
@@ -839,6 +857,8 @@ class DuplexClientBase(ABC):
                 yield chunk, [frames[index]] if composite is None else [frames[index], composite]
 
         frames_sent = 0
+        stream_started_at = time.monotonic()
+        sent_duration_s = 0.0
         for chunk, unit_frames in units():
             if not chunk:
                 continue
@@ -846,7 +866,11 @@ class DuplexClientBase(ABC):
             if unit_frames:
                 frames_sent += 1
             if realtime:
-                await asyncio.sleep(input_format.duration_ms(len(chunk)) / 1000.0)
+                # Relative sleeps accumulate encoding, send, and scheduling
+                # overhead, progressively slowing the input media clock.
+                sent_duration_s += input_format.duration_ms(len(chunk)) / 1000.0
+                delay_s = stream_started_at + sent_duration_s - time.monotonic()
+                await asyncio.sleep(max(0.0, delay_s))
         return frames_sent
 
     async def commit(self, *, final: bool = True, create_response: bool | None = None) -> None:
@@ -951,7 +975,8 @@ class DuplexClientBase(ABC):
             marker = self._closed_marker
             raise DuplexSessionClosedError(marker.reason if marker else "closed")
         payload = dict(event)
-        payload.setdefault("event_id", f"evt_{uuid4().hex}")
+        # setdefault returns the caller's id when it supplied one, ours otherwise.
+        event_id = str(payload.setdefault("event_id", f"evt_{uuid4().hex}"))
         try:
             await self._send_command(payload)
         except asyncio.CancelledError:
@@ -960,7 +985,10 @@ class DuplexClientBase(ABC):
             raise
         except Exception as exc:
             raise DuplexConnectionError(f"send failed: {exc}") from exc
-        return payload["event_id"]
+        collector = self._event_collector
+        if collector is not None and payload.get("type") == "input_audio_buffer.append":
+            collector.note_client_append({"sent_at_s": time.monotonic(), "event_id": event_id})
+        return event_id
 
     # -- internals ---------------------------------------------------------------
 
@@ -1026,6 +1054,9 @@ class DuplexClientBase(ABC):
         if not self._accept_event(data):
             return
         event = wrap_event(data)
+        # Shared across the branches below: created makes one, the rest look an
+        # existing one up and may not find it.
+        handle: ResponseHandle | None
 
         if isinstance(event, SessionResumed):
             self._adopt_session(event)
@@ -1110,12 +1141,20 @@ class DuplexClientBase(ABC):
         for handle in self._responses.values():
             handle._finish(None)
         self._responses.clear()
-        for queue in (*self._subscribers, self._response_queue):
+        # Subscriber and response queues carry different item types; the marker
+        # goes to both, so widen to the common Queue rather than to object.
+        queues: tuple[asyncio.Queue, ...] = (*self._subscribers, self._response_queue)
+        for queue in queues:
             _put_drop_oldest(queue, marker)
 
 
 class DuplexClient(DuplexClientBase):
-    """Async client for one duplex session over ``/v1/realtime?duplex=1``."""
+    """Async client for one duplex session over ``/v1/realtime?duplex=1``.
+
+    ``extra_headers`` are sent on initial and resumed WebSocket handshakes by
+    the built-in transport. A custom ``connect`` callback owns its connection
+    options, including headers.
+    """
 
     def __init__(
         self,
@@ -1123,6 +1162,7 @@ class DuplexClient(DuplexClientBase):
         *,
         model: str,
         config: SessionConfig | None = None,
+        extra_headers: Mapping[str, str] | None = None,
         reconnect: ReconnectPolicy | None = ReconnectPolicy(),
         heartbeat_interval_s: float | None = 30.0,
         handshake_timeout_s: float = 30.0,
@@ -1130,6 +1170,7 @@ class DuplexClient(DuplexClientBase):
     ) -> None:
         super().__init__(model=model, config=config, handshake_timeout_s=handshake_timeout_s)
         self.url = url
+        self._extra_headers = dict(extra_headers) if extra_headers is not None else None
         self.resume_token: str | None = None
         self._reconnect = reconnect
         self._heartbeat_interval_s = heartbeat_interval_s
@@ -1193,7 +1234,7 @@ class DuplexClient(DuplexClientBase):
         except ImportError as exc:  # pragma: no cover - websockets is a pinned dep
             raise DuplexConnectionError("The duplex client requires the 'websockets' package") from exc
         try:
-            return await websockets.connect(url, max_size=_MAX_FRAME_BYTES)
+            return await websockets.connect(url, additional_headers=self._extra_headers, max_size=_MAX_FRAME_BYTES)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -1233,7 +1274,13 @@ class DuplexClient(DuplexClientBase):
         while True:
             try:
                 while True:
-                    raw = await self._ws.recv()
+                    # Re-read per message: _attempt_resume swaps the transport.
+                    # Raising here lands in the same handler an AttributeError
+                    # on a missing transport used to.
+                    ws = self._ws
+                    if ws is None:
+                        raise DuplexConnectionError("transport is not connected")
+                    raw = await ws.recv()
                     if isinstance(raw, (bytes, bytearray)):
                         continue
                     try:
@@ -1395,6 +1442,24 @@ def _event_response_request_metrics(event: dict[str, object]) -> dict[str, objec
     return None
 
 
+class ClientAppendStamp(TypedDict):
+    """One successful ``input_audio_buffer.append`` send on the client clock."""
+
+    sent_at_s: float
+    event_id: str
+
+
+_CLIENT_APPEND_TTFP_ORIGIN = (
+    "last input_audio_buffer.append client send before this response.created receive "
+    "(after the previous response.created receive or after_s) to first audio packet"
+)
+_CLIENT_APPEND_RTF_ORIGIN = (
+    "last input_audio_buffer.append client send before this response.created receive "
+    "(after the previous response.created receive or after_s) to last audio packet "
+    "divided by emitted audio duration"
+)
+
+
 class EventCollector:
     """Accumulate events for assertions and latency summaries (tests/benchmarks).
 
@@ -1408,6 +1473,38 @@ class EventCollector:
         self.response_audio: dict[str, list[bytes]] = {}
         self.response_ids: list[str] = []
         self.output_sample_rate_hz = 24_000
+        self.client_appends: list[ClientAppendStamp] = []
+        self._append_sent_at_s: list[float] = []
+        self._response_created_at_s: dict[str, float] = {}
+
+    def note_client_append(self, record: ClientAppendStamp) -> None:
+        """Record one successful append send (same monotonic clock as ``add``)."""
+        sent_at_s = float(record["sent_at_s"])
+        self.client_appends.append(record)
+        insort(self._append_sent_at_s, sent_at_s)
+
+    def _client_append_origin_s(
+        self,
+        *,
+        after_s: float,
+        response_created_at_s: float | None,
+        response_id: str | None,
+    ) -> float | None:
+        if response_created_at_s is None:
+            return None
+        prev_created_at_s = after_s
+        if response_id is not None:
+            try:
+                previous_index = self.response_ids.index(response_id) - 1
+            except ValueError:
+                previous_index = -1
+            if previous_index >= 0:
+                prev_created_at_s = self._response_created_at_s.get(self.response_ids[previous_index], after_s)
+        lo = bisect_left(self._append_sent_at_s, prev_created_at_s)
+        hi = bisect_right(self._append_sent_at_s, response_created_at_s)
+        if lo >= hi:
+            return None
+        return self._append_sent_at_s[hi - 1]
 
     async def consume(self, client: DuplexClientBase) -> None:
         """Subscribe to ``client`` and collect until the session ends."""
@@ -1433,6 +1530,7 @@ class EventCollector:
         response_id = wrapped.response_id
         if stored_event.get("type") == "response.created" and response_id and response_id not in self.response_ids:
             self.response_ids.append(response_id)
+            self._response_created_at_s[response_id] = received_at
         if stored_event.get("type") in _AUDIO_DELTA_TYPES:
             chunk = wrapped.audio
             if chunk and response_id:
@@ -1753,6 +1851,24 @@ class EventCollector:
                         stage0_metrics.get("vllm_tpot_ms"),
                         nonnegative=True,
                     )
+                client_started_at_s = self._client_append_origin_s(
+                    after_s=after_s,
+                    response_created_at_s=response_created_at_s,
+                    response_id=response_id,
+                )
+                if client_started_at_s is not None:
+                    request_metrics = result["request_metrics"]
+                    assert isinstance(request_metrics, dict)
+                    request_metrics["client_ttfp_ms"] = _rounded_ms(
+                        (audio_received_at_s[0] - client_started_at_s) * 1000.0
+                    )
+                    request_metrics["client_audio_generation_ms"] = _rounded_ms(
+                        max(0.0, (audio_received_at_s[-1] - client_started_at_s) * 1000.0)
+                    )
+                    request_metrics["client_measurement_origin"] = {
+                        "ttfp": _CLIENT_APPEND_TTFP_ORIGIN,
+                        "rtf": _CLIENT_APPEND_RTF_ORIGIN,
+                    }
         return result
 
     def _format_for_bytes(self) -> AudioFormat:
@@ -1896,6 +2012,10 @@ def summarize_session_request_metrics(
         "ttfp_ms": distribution_summary(_finite_metric_values(request_metrics, "ttfp_ms")),
         "rtf": distribution_summary(_finite_metric_values(request_metrics, "rtf"), digits=6),
     }
+    if (client_ttfp := distribution_summary(_finite_metric_values(request_metrics, "client_ttfp_ms"))) is not None:
+        summary["client_ttfp_ms"] = client_ttfp
+    if (client_rtf := distribution_summary(_finite_metric_values(request_metrics, "client_rtf"), digits=6)) is not None:
+        summary["client_rtf"] = client_rtf
     if (tpot := distribution_summary(_finite_metric_values(request_metrics, "tpot_ms", positive=True))) is not None:
         summary["tpot_ms"] = tpot
     if (stages := summarize_stage_metrics(request_metrics)) is not None:

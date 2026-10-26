@@ -1,0 +1,128 @@
+# Fish Audio Drama 3 deploy: async-chunk streaming fish_omni → dac_decoder.
+# Stage 0 (Qwen3.5 MoE backbone + codebook tower, Model Runner V2) streams
+# frames to Stage 1 (the S2 Pro DAC codec). Tuned on 1× H200.
+# On CUDA both stages share the GPU through a private MPS daemon, so codec
+# kernels overlap the AR step instead of time-slicing against it.
+async_chunk: true
+enable_chunked_prefill: true
+
+connectors:
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+    extra:
+      codec_streaming: true
+      # ~21.5 Hz codec (46.4 ms per frame). Windows ramp 6, 8, 12, 16, 24, 32
+      # frames, then 64; each carries up to 32 earlier frames as left
+      # context. A window must arrive before the audio already sent runs out:
+      # at 128 streams a request gets ~1.45 frames per frame of playback, so
+      # each cumulative boundary stays under first + 1.45 x previous (a
+      # 4-frame first window or a 6 -> 18 jump stalls most streams).
+      codec_chunk_ramp: "6,8,12,16,24,32"
+      codec_chunk_frames: 64
+      codec_left_context_frames: 32
+      # Under load (>= 32 running) arrivals are admitted together once 6
+      # wait or the oldest has waited 100 ms: each mixed step re-reads every
+      # expert and runs the tower over the prompt rows, but the wait counts
+      # against a first chunk of ~250 ms (-11% RTF at 128 streams without it).
+      ar_prefill_admission_min_batch: 6
+      ar_prefill_admission_max_wait_ms: 100
+      ar_prefill_admission_min_running: 32
+      fish_speech_dac_dtype: fp16
+      # CUDA: the codec decodes channels-last, replayed from its own CUDA
+      # graphs per (batch, frames) bucket of these windows.
+      fish_speech_dac_cuda_graphs: true
+      # Each stream keeps its convolution history and window-transformer
+      # keys / values between windows: a window decodes only its new frames
+      # and windows splice as in decoding the whole utterance at once.
+      fish_speech_dac_stateful: true
+
+stages:
+  - stage_id: 0
+    model_runner: v2
+    max_num_seqs: 128
+    gpu_memory_utilization: 0.78
+    enforce_eager: false
+    trust_remote_code: false
+    # Prompt rows carry ten codes per audio row that token-id prefix hashing
+    # does not see.
+    enable_prefix_caching: false
+    # The CPU staging of step N+1 overlaps step N on the GPU.
+    async_scheduling: true
+    max_num_batched_tokens: 4096
+    # GDN recurrent states in bf16 (the checkpoint keeps fp32): half the state
+    # traffic of every GDN layer, +7% / +13% audio-s/s at 64 / 128 streams.
+    # On Seed-TTS-Eval en, WER and speaker similarity match the fp32 pool.
+    # Set float32 to keep the checkpoint's state dtype.
+    mamba_ssm_cache_dtype: bfloat16
+    max_model_len: 8192
+    devices: "0"
+    # Decode steps replay one FULL graph (<= max_num_seqs); prefill / mixed
+    # steps replay PIECEWISE backbone graphs up to the token budget, since a
+    # new voice-clone prompt alone is a few hundred rows.
+    compilation_config:
+      cudagraph_mode: FULL_AND_PIECEWISE
+      max_cudagraph_capture_size: 4096
+      cudagraph_capture_sizes: [1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, 128,
+        160, 192, 224, 256, 320, 384, 448, 512, 640, 768, 896, 1024, 1280, 1536, 1792, 2048, 2560, 3072, 3584, 4096]
+    output_connectors:
+      to_stage_1: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 1.0
+      top_k: 30
+      top_p: 0.9
+      max_tokens: 500
+      repetition_penalty: 1.0
+
+  - stage_id: 1
+    model_runner: v1
+    max_num_seqs: 128
+    gpu_memory_utilization: 0.1
+    # The codec decode replays its own CUDA graphs per (batch, frames) bucket.
+    enforce_eager: true
+    trust_remote_code: false
+    enable_prefix_caching: false
+    # Waveform copies to the host overlap the next decode.
+    async_scheduling: true
+    max_num_batched_tokens: 65536
+    max_model_len: 65536
+    devices: "0"
+    input_connectors:
+      from_stage_0: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 65536
+      repetition_penalty: 1.0
+
+platforms:
+  cuda:
+    cuda_mps: true
+  # Stage 0 stays on Model Runner V2. The NPU AR worker builds Ascend input
+  # state and attention metadata. Tensor parallel shards the backbone; expert
+  # parallel puts 128 of the 256 routed experts on each card. vLLM-Ascend
+  # expands those block-FP8 experts to bf16: 256 x 40 x (2 x 512 x 2048 +
+  # 512 x 2048) = 32.2B params, 64.4 GiB in all, 32.2 GiB on each rank, plus
+  # a few GiB of sharded non-expert weights. 0.72 of a 64 GB card is 46 GiB,
+  # so each rank still has KV and activation headroom. The DAC stage shares
+  # the second card; its 0.10 budget (6.4 GiB) fits in the 18 GiB that 0.72
+  # leaves there. Stage 0 replays piecewise ACL graphs. V2 must see the
+  # MoE communication method that set_ascend_forward_context stores on the
+  # forward context, or expert-parallel capture asserts. No MPS on NPU.
+  npu:
+    stages:
+      - stage_id: 0
+        gpu_memory_utilization: 0.72
+        enforce_eager: false
+        tensor_parallel_size: 2
+        enable_expert_parallel: true
+        max_num_seqs: 64
+        max_num_batched_tokens: 4096
+        compilation_config:
+          cudagraph_mode: PIECEWISE
+        devices: "0,1"
+      - stage_id: 1
+        gpu_memory_utilization: 0.10
+        enforce_eager: true
+        max_num_seqs: 64
+        devices: "1"
