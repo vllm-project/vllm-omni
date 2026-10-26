@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import gc
 import weakref
 
 import pytest
@@ -61,6 +62,13 @@ def register(manager, cache, layout=(1, 2, 2)):
     )
 
 
+def entry_key(manager, layout):
+    want = (tuple(layout),)
+    matches = [key for key in manager.entries if key[3] == want]
+    assert len(matches) == 1, matches
+    return matches[0]
+
+
 def decode(manager, cache, layout=(1, 2, 2)):
     device = cache[0]["cond"]["key"].device
     return manager.try_decode(
@@ -72,6 +80,43 @@ def decode(manager, cache, layout=(1, 2, 2)):
         img_mask=torch.tensor([[False, False, True]], device=device),
         encoder_hidden_states_mask=None,
     )
+
+
+@pytest.mark.cpu
+def test_release_idle_entries_drops_dead_owners_and_keeps_live_ones(graph_case):
+    manager, device, cleanup = graph_case
+    manager.max_entries = 8
+    other = (1, 2, 2)
+    live = (1, 4, 2)
+    same_key_later = (1, 8, 2)
+
+    finished = make_cache(device, 1.0)
+    register(manager, finished, other)
+    other_key = entry_key(manager, other)
+    static_prefix = weakref.ref(manager.entries[other_key].k[0])
+    del finished
+
+    still_running = make_cache(device, 2.0)
+    register(manager, still_running, live)
+    live_key = entry_key(manager, live)
+
+    finished_same_shape = make_cache(device, 3.0)
+    register(manager, finished_same_shape, same_key_later)
+    same_key = entry_key(manager, same_key_later)
+    same_static = weakref.ref(manager.entries[same_key].k[0])
+    del finished_same_shape
+    gc.collect()
+
+    manager.release_idle_entries()
+
+    assert other_key not in manager.entries
+    assert same_key not in manager.entries
+    gc.collect()
+    assert static_prefix() is None
+    assert same_static() is None
+    assert live_key in manager.entries
+    assert manager._owners[live_key]() is still_running[0]["cond"]["key"]
+    assert cleanup
 
 
 @pytest.mark.cpu
@@ -164,7 +209,7 @@ def test_registration_preserves_request_cache_and_separates_layouts(graph_case):
     assert not torch.equal(entries[0].freqs, entries[1].freqs)
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("failure_phase", ["warmup", "capture"])
 def test_capture_failure_releases_buffers_and_keeps_request_cache(graph_case, monkeypatch, failure_phase):
     manager, device, cleanup = graph_case
@@ -192,7 +237,7 @@ def test_capture_failure_releases_buffers_and_keeps_request_cache(graph_case, mo
     assert bool((cache[0]["cond"]["key"] == 1).all())
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 def test_replay_uses_active_request_and_layout(graph_case):
     manager, device, _ = graph_case
     first, second = make_cache(device, 1.0), make_cache(device, 5.0)
@@ -277,7 +322,7 @@ def test_all_valid_mask_shares_graph_entry_and_padding_falls_back(graph_case):
         assert entry.attn_metadata is None
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 def test_batch_changes_and_padding_do_not_reuse_stale_prefix(graph_case):
     manager, device, _ = graph_case
     first = make_cache(device, 1.0)
@@ -329,7 +374,7 @@ class WorkspaceGemmModel(DecodeModel):
         return super()._decode_graph_forward(entry) + torch.mm(self.lhs, self.rhs).float().mean()
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 def test_evicting_a_graph_keeps_survivor_workspace_when_warmup_aliases_capture(graph_case, monkeypatch):
     manager, device, _ = graph_case
     manager.model = WorkspaceGemmModel(device)

@@ -370,7 +370,23 @@ sample can contain a single user statement, so a blanket two-response minimum is
 not valid. Deterministic CPU tests cover adjacent speech boundaries separately.
 
 Inputs retain the standalone runner's real-time pacing, question audio, media
-clock and 1 FPS default (`--duplex-eval-fps`). Each session decodes its media in a
+clock and 1 FPS default (`--duplex-eval-fps`). `--duplex-eval-mix` selects the
+session audio: `question` (default) streams only the instruction audio, while
+`soundtrack` sums it with the clip's own audio track, sample by sample with int16
+clipping. The dataset pads each instruction to the clip length. Clip audio is placed
+at its presentation time relative to the video start, including a leading silence
+when the track starts later, so the overlay keeps the original timestamps. Use
+`soundtrack` for samples that depend on what is said
+or heard in the clip, such as the word-repetition prompts in
+`PR_post_event_reminder` and `RTD_Omni`; a clip without an audio track keeps the
+instruction alone. The standalone `generate` command accepts the same choice as `--mix`.
+The MiniCPM-o Omni-DuplexEval nightly (`tests/dfx/perf/tests/test_minicpmo_4_5_omni_duplex_eval.json`)
+runs with `soundtrack`; the Qwen3-Omni `server_vad` nightly keeps `question`.
+Its DFX config uses `duplex_eval_score_floor_hardware` to enforce calibrated
+quality floors on H100, B200 and A3 while ROCm burn-in still requires complete
+generation, publication and judging but records scores without a quality floor.
+
+Each session decodes its media in a
 worker thread after acquiring a concurrency slot, and releases the decoded input
 when the request finishes. `--max-concurrency` therefore bounds the number of
 decoded clips held in memory; the reference audio is encoded once and shared.
@@ -394,13 +410,22 @@ response without failing the sample; its collected text remains available to the
 judge. The runner drains active responses before closing the session. Responses
 created during close are recorded in `unfinished_response_ids` in the metadata;
 server errors, failed responses, and drain/close timeouts still fail the sample.
+Failed measured sessions write a compact control-state trace under
+`failed_sessions/<split>/<id>.json`. These files record the committed event,
+response IDs and statuses, listen metadata, open responses, and quiet-window
+timing, but are never passed to the judge.
 
 `--duplex-eval-response-root` is a **parent directory** and may already exist.
 Each invocation creates an exclusive `run-*` subdirectory, so repeated runs and
 concurrency/QPS sweeps do not overwrite or reuse earlier responses. The actual
 run path is logged and returned in `omni_duplex_eval.response_root` in the saved
 benchmark result. Only successful measured sessions publish `<split>/<id>.json`
-and `<id>.meta.json`, using the existing judge format. Publication occurs after benchmark timing, alongside
+and `<id>.meta.json`, using the upstream judge format: RTD scoring reads its
+`sentences`, and PR scoring places its per-output `chunks` (`text`,
+`current_time`) in the 10-second reminder window. A response that is a bare
+sentence list is scored by sentence start. The standalone `generate` command
+refuses to reuse a proactive-reminder response that has no `chunks`; RTD
+responses are reused from their sentences. Publication occurs after benchmark timing, alongside
 `duplex_metrics.json`; artifact errors are recorded in the saved result's
 `omni_duplex_eval` summary without discarding service measurements.
 
@@ -456,19 +481,39 @@ unpublished sessions. To automatically score the actual successfully published
 samples, including shuffled or partially successful runs, use
 `--duplex-eval-evaluate` during `bench serve`.
 
-The standalone `generate` command remains available, including its existing
-skip-existing/overwrite behavior. This integration does not change scoring rules
-or enable new nightly jobs.
+The standalone `generate` command remains available. It still skips an existing
+sample unless `--overwrite` is set, and it reuses that sample only when the
+recorded mix matches (metadata without a mix counts as `question`). A different
+mix is rejected instead of returning the other artifact. This integration does
+not add nightly jobs. The MiniCPM-o job above selects `soundtrack`.
 
 For shuffled runs, use `evaluate --ids` with the successful selected sample IDs
 instead of `--limit`. Failed sessions have no judge input; do not silently drop
 them when reporting coverage or accuracy.
 
-This adapter retains the standalone runner's completion policy: it waits for a
-`response.done`, not an independently correlated final-input acknowledgment.
-A successful transport/session result is therefore not proof that every final
-input produced a response, nor an accuracy score. Final-input lifecycle
-hardening is separate from this entrypoint integration.
+This adapter retains the standalone runner's completion policy. Without
+`server_vad`, a session finishes once every created response has its
+`response.done`, no commit, listen, or response event has arrived for 2 seconds,
+and the residual unit flushed by the commit has decided. That decision is a
+`response.done` for a response created after `input_audio_buffer.committed`, or a
+`response.listen` with `model_listen` after every reply that was still open at
+that commit has finished. A reply already open when the clip ends does not
+decide the session: completing it normally is what starts the residual unit, and
+that unit can still open a response. A cancelled reply does not decide the
+session either: barge-in cancels that turn, and the residual response can still
+open afterwards. If the full drain timeout expires with every created response
+finished, no completion activity during the same 2-second quiet window, and no
+later response open, the runner accepts the settled terminal silence after the
+in-flight reply completes or is cancelled instead of reporting a drain timeout.
+It never takes this fallback during the normal wait. A failed reply does end the
+wait. The server does not promote another unit after a failure, and a failed
+response created after the commit is itself the residual. The listening outcome is
+a session in which the model never spoke; it publishes empty judge input and
+scores 0 instead of failing on the drain timeout. The runner withholds the last
+PCM sample when the clip ends on a model-unit boundary, so the commit always
+flushes a residual unit and that decision covers the end of the clip. A
+successful transport/session result is therefore not proof that every final
+input produced a response, nor an accuracy score.
 
 ### OmniInteract Realtime Benchmark
 
@@ -711,7 +756,11 @@ It differs from the MiniCPM-o configuration in three ways:
 ### Seed-TTS reference speech as real audio input
 
 By default the Seed-TTS dataset sends its reference clip as voice-cloning metadata: `ref_audio` / `ref_text` ride the
-request body and the model is asked to synthesize the target text in that voice.
+request body. Voice cloning requires a model and endpoint that support those fields; sending them to Qwen3-Omni chat
+does not enable voice cloning. The default chat system prompt asks the model to read the target text verbatim,
+including questions and instructions, without answering or following them. Override it with `--seed-tts-system-prompt`.
+Use `--seed-tts-wer-save-items` to retain each target, ASR transcript, and WER in the result JSON when investigating
+content errors. WER compares the synthesized speech with the dataset target, not with the model's generated reply.
 
 `--seed-tts-reference-as-input` changes the request shape instead of the request contents. The reference clip becomes an
 ordinary **user audio turn**, `ref_audio` / `ref_text` are dropped entirely, and the system prompt asks the model to read

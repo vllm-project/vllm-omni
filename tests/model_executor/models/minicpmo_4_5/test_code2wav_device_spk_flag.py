@@ -12,7 +12,8 @@ embedding path gets enabled.
 
 from __future__ import annotations
 
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -37,19 +38,39 @@ class _FakeToken2Wav:
         self.device_spk_calls = 0
         self.trt_spk_calls = 0
         self.device_spk_use_trt = None
+        self.speaker_graph_config = None
 
     def enable_device_spk_embedding(self, *, use_trt=True):
         self.device_spk_calls += 1
         self.device_spk_use_trt = use_trt
 
-    def enable_trt_spk_embedding(self):
+    def enable_speaker_cuda_graph(self, config):
+        self.speaker_graph_config = config
+
+    def enable_trt_spk_embedding(self, *, cpu_reference=False):
         self.trt_spk_calls += 1
+        self.trt_cpu_reference = cpu_reference
+
+    @property
+    def flow(self):
+        estimator = SimpleNamespace()
+        decoder = SimpleNamespace(estimator=estimator)
+        return SimpleNamespace(
+            parameters=lambda: iter([SimpleNamespace(device="cuda")]),
+            decoder=decoder,
+        )
 
 
 class _FakeBackend:
     def __init__(self, token2wav, **kwargs):
         self.token2wav = token2wav
         self.kwargs = kwargs
+
+
+@pytest.fixture(autouse=True)
+def tensorrt_importable(monkeypatch):
+    """Backend selection probes ``import tensorrt``; CPU CI images do not ship it."""
+    monkeypatch.setitem(sys.modules, "tensorrt", ModuleType("tensorrt"))
 
 
 @pytest.fixture(params=["cuda", "npu"])
@@ -149,6 +170,8 @@ def test_cuda_speaker_backend_preserves_lazy_model_loading(tmp_path, monkeypatch
 
 
 _OTHER_DEFAULTS = {
+    "token2wav_spk_cuda_graph",
+    "token2wav_spk_cpu_reference",
     "token2wav_float16",
     "token2wav_trt",
     "code2wav_bfloat16_attention_cache",
@@ -263,3 +286,119 @@ def test_tf32_mode_is_resolved_once_and_reused(tmp_path, monkeypatch, device_pla
     # Mutating the stage config afterwards must not re-read it per forward.
     model.vllm_config.model_config.stage_connector_config["extra"]["token2wav_allow_tf32"] = True
     assert model._tf32_mode == "off"
+
+
+@pytest.mark.parametrize("value,enabled", [(True, True), ("true", True), (False, False), ("false", False)])
+def test_speaker_graph_flag_reaches_selected_backend(tmp_path, monkeypatch, value, enabled):
+    monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(current_omni_platform, "is_npu", lambda: False)
+    model, speaker = _build_backend(tmp_path, monkeypatch, {"token2wav_spk_cuda_graph": value})
+    assert speaker.device_spk_calls == 1
+    assert speaker.speaker_graph_config is (model.vllm_config if enabled else None)
+
+
+def test_cpu_reference_speaker_accepts_the_default_six_second_window(tmp_path, monkeypatch):
+    """598 fbank frames fit the CAM++ profile, so the opt-in still installs."""
+    monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(current_omni_platform, "is_npu", lambda: False)
+    _, token2wav = _build_backend(
+        tmp_path,
+        monkeypatch,
+        {"token2wav_spk_cpu_reference": True, "ref_audio_max_seconds": 6},
+    )
+    assert token2wav.trt_spk_calls == 1
+    assert token2wav.trt_cpu_reference is True
+
+
+def test_cpu_reference_speaker_rejects_a_31_second_window(tmp_path, monkeypatch):
+    """31 s is 3098 fbank frames, past the profile max of 3000."""
+    monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(current_omni_platform, "is_npu", lambda: False)
+    with pytest.raises(ValueError, match="3098"):
+        _build_backend(
+            tmp_path,
+            monkeypatch,
+            {"token2wav_spk_cpu_reference": True, "ref_audio_max_seconds": 31},
+        )
+
+
+def test_trt_speaker_rejects_frames_outside_the_profile():
+    import torch
+
+    from vllm_omni.model_executor.models.cosyvoice3.speaker_embedding_trt import CampplusTRT
+
+    speaker = CampplusTRT.__new__(CampplusTRT)
+    with pytest.raises(ValueError, match=r"4\.\.3000"):
+        speaker(torch.zeros(3098, 80))
+
+
+@pytest.mark.parametrize("value", [True, "true", 1])
+def test_cpu_reference_speaker_is_explicit_cuda_opt_in(tmp_path, monkeypatch, value):
+    monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(current_omni_platform, "is_npu", lambda: False)
+    _, token2wav = _build_backend(tmp_path, monkeypatch, {"token2wav_spk_cpu_reference": value})
+    assert token2wav.trt_spk_calls == 1
+    assert token2wav.trt_cpu_reference is True
+    assert token2wav.device_spk_calls == 0
+
+
+def test_device_spk_false_overrides_cpu_reference_speaker(tmp_path, monkeypatch):
+    """The CPU onnxruntime triage switch still wins after the reference flag is set."""
+    monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(current_omni_platform, "is_npu", lambda: False)
+    _, token2wav = _build_backend(
+        tmp_path,
+        monkeypatch,
+        {"token2wav_spk_cpu_reference": True, "token2wav_device_spk": False},
+    )
+    assert token2wav.trt_spk_calls == 0
+    assert token2wav.device_spk_calls == 0
+
+
+@pytest.mark.parametrize(
+    "extra,env",
+    [({"token2wav_trt": True}, None), ({}, "1")],
+)
+def test_full_dit_trt_overrides_cpu_reference_speaker(tmp_path, monkeypatch, extra, env):
+    """MINICPMO_TOKEN2WAV_TRT and token2wav_trt keep the full DiT TensorRT path."""
+    monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(current_omni_platform, "is_npu", lambda: False)
+    if env is None:
+        monkeypatch.delenv("MINICPMO_TOKEN2WAV_TRT", raising=False)
+    else:
+        monkeypatch.setenv("MINICPMO_TOKEN2WAV_TRT", env)
+    from vllm_omni.model_executor.models.step_audio2 import step_audio2_dit_trt
+
+    monkeypatch.setattr(step_audio2_dit_trt, "build_dit_trt_stepper", lambda *args, **kwargs: object())
+    _, token2wav = _build_backend(tmp_path, monkeypatch, {"token2wav_spk_cpu_reference": True, **extra})
+    assert token2wav.trt_spk_calls == 1
+    assert token2wav.trt_cpu_reference is False
+
+
+def test_cpu_reference_speaker_falls_back_without_tensorrt(tmp_path, monkeypatch):
+    """The default profile stays loadable in images that do not ship TensorRT."""
+    monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(current_omni_platform, "is_npu", lambda: False)
+    monkeypatch.setitem(sys.modules, "tensorrt", None)
+    _, token2wav = _build_backend(tmp_path, monkeypatch, {"token2wav_spk_cpu_reference": True})
+    assert token2wav.trt_spk_calls == 0
+    assert token2wav.device_spk_calls == 1
+    assert token2wav.device_spk_use_trt is False
+
+
+def test_cpu_reference_speaker_is_ignored_off_cuda(tmp_path, monkeypatch):
+    """A shared config may set the flag; NPU must keep its device backend."""
+    monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: False)
+    monkeypatch.setattr(current_omni_platform, "is_npu", lambda: True)
+    _, token2wav = _build_backend(tmp_path, monkeypatch, {"token2wav_spk_cpu_reference": True})
+    assert token2wav.trt_spk_calls == 0
+    assert token2wav.device_spk_calls == 1
+
+
+@pytest.mark.parametrize("cpu_reference", [False, True])
+def test_facade_forwards_speaker_reference_policy(mocker, cpu_reference):
+    core = mocker.Mock(spec=token2wav_module.StepAudio2Token2WavCore)
+    facade = token2wav_module.MiniCPMO45Token2wav.__new__(token2wav_module.MiniCPMO45Token2wav)
+    facade._core = core
+    facade.enable_trt_spk_embedding(cpu_reference=cpu_reference)
+    core.enable_trt_spk_embedding.assert_called_once_with(cpu_reference=cpu_reference)

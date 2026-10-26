@@ -27,7 +27,7 @@ pytestmark = pytest.mark.core_model
 @pytest.fixture(
     params=[
         pytest.param("cpu", marks=pytest.mark.cpu),
-        pytest.param("cuda", marks=hardware_marks(res={"cuda": "L4"}, num_cards=1)),
+        pytest.param("cuda", marks=hardware_marks(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)),
     ]
 )
 def device(request):
@@ -228,7 +228,7 @@ def test_local_seeded_mtp_keeps_per_row_generators_in_one_batch(state_cls):
     assert frame.call_args.kwargs["generator"] is None
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 def test_slot_mtp_graph_padding_reorder_and_owned_output():
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")

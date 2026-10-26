@@ -397,6 +397,7 @@ def test_minicpmo_non_duplex_sample_skips_duplex_row_scan():
 
     calls = []
     runner = GPUARModelRunner.__new__(GPUARModelRunner)
+    runner.requests = {}
     runner.input_batch = SimpleNamespace(
         sampling_metadata=SimpleNamespace(output_token_ids=[]),
         update_async_output_token_ids=lambda: None,
@@ -424,6 +425,7 @@ def test_minicpmo_duplex_sample_clears_stale_rows_once_without_scanning():
 
     calls = []
     runner = GPUARModelRunner.__new__(GPUARModelRunner)
+    runner.requests = {}
     runner.input_batch = SimpleNamespace(
         sampling_metadata=SimpleNamespace(output_token_ids=[]),
         update_async_output_token_ids=lambda: None,

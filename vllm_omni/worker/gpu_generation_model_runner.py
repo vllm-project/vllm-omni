@@ -635,6 +635,12 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
         )
         output.omni_connector_output = self.get_omni_connector_output()
 
+        model = getattr(self, "model", None)
+        if model is not None and hasattr(model, "get_pending_generation_request_ids"):
+            output.pending_generation_req_ids = set(req_ids_output_copy).intersection(
+                model.get_pending_generation_request_ids()
+            )
+
         if snapshot is not None:
             return _AsyncGenerationOutput(output, snapshot)
 

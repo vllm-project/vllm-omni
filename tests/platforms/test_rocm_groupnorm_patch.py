@@ -20,6 +20,14 @@ _SPEC.loader.exec_module(patch_groupnorm)
 patch_groupnorm._registry_mod.initialize_model = patch_groupnorm._original_initialize_model
 
 
+@pytest.fixture(autouse=True)
+def aiter_available(monkeypatch):
+    # Exercise replacement on CPU so a missing Hunyuan guard cannot pass silently.
+    aiter_ops = types.ModuleType("vllm._aiter_ops")
+    setattr(aiter_ops, "is_aiter_found_and_supported", lambda: True)
+    monkeypatch.setitem(sys.modules, "vllm._aiter_ops", aiter_ops)
+
+
 def test_hunyuan_image3_keeps_pytorch_groupnorm(monkeypatch):
     model = types.SimpleNamespace(vae=nn.Sequential(nn.GroupNorm(4, 8)))
     monkeypatch.setattr(patch_groupnorm, "_original_initialize_model", lambda _: model)
@@ -46,10 +54,6 @@ def test_other_models_keep_aiter_groupnorm_patch(monkeypatch):
         return True
 
     monkeypatch.setattr(patch_groupnorm, "_replace_groupnorm_with_aiter", replace_groupnorm)
-    aiter_ops = types.ModuleType("vllm._aiter_ops")
-    setattr(aiter_ops, "is_aiter_found_and_supported", lambda: True)
-    monkeypatch.setitem(sys.modules, "vllm._aiter_ops", aiter_ops)
-
     od_config = types.SimpleNamespace(model_class_name="OtherDiffusionModel")
     assert patch_groupnorm._patched_initialize_model(od_config) is model
     assert replaced
