@@ -129,6 +129,8 @@ class OmniModelConfig(ModelConfig):
     hf_text_config: PretrainedConfig = field(init=False)
     async_chunk: bool = False
     session_mode: str = "turn"
+    # Resolved per-stage runner-owned model-local CUDA Graph configuration.
+    model_local_cudagraph: dict[str, Any] | None = None
     retains_state_across_chunks: bool = False
     supports_pending_generation: bool = False
     supports_running_prefix_cache_reset: bool = True

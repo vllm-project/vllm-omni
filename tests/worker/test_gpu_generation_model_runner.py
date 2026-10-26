@@ -160,6 +160,7 @@ def _make_guard_runner():
     runner._update_states = lambda scheduler_output: None
     runner.synchronize_input_prep = contextlib.nullcontext
     runner.attach_omni_connector_output = lambda result: result
+    runner.model_local_cudagraph_manager = None
     return runner
 
 
