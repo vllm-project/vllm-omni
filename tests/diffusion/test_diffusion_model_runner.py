@@ -329,9 +329,7 @@ def _make_compile_runner(
 def _neutral_compile_platform(monkeypatch):
     """The default platform's compile policy (inductor, the configured dynamism): the installed
     platform may be an out-of-tree one that adds its own backend."""
-    monkeypatch.setattr(
-        model_runner_module.current_omni_platform, "get_torch_compile_kwargs", classmethod(lambda cls, od_config: {})
-    )
+    monkeypatch.setattr(model_runner_module.current_omni_platform, "get_torch_compile_kwargs", lambda od_config: {})
 
 
 class _PlatformWithCompileBackend:
