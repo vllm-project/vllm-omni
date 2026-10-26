@@ -82,6 +82,10 @@ logger = init_logger(__name__)
 
 
 def _build_fp8(**kw: Any) -> QuantizationConfig:
+    if kw.get("weight_scheme") == "per_channel":
+        from .fp8_config import SerializedPerChannelFp8Config
+
+        return SerializedPerChannelFp8Config.from_config(kw)
     if kw.get("is_checkpoint_fp8_serialized", False):
         from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 
@@ -96,6 +100,20 @@ def _build_int8(**kw: Any) -> QuantizationConfig:
     from .int8_config import DiffusionInt8Config
 
     return DiffusionInt8Config(**kw)
+
+
+def _build_convrot_int8(**kw: Any) -> QuantizationConfig:
+    """Lazy import for ConvRot rotated W8A8 diffusion config (CUDA only)."""
+    from .convrot_config import DiffusionConvRotInt8Config
+
+    return DiffusionConvRotInt8Config(**kw)
+
+
+def _build_convrot_int4(**kw: Any) -> QuantizationConfig:
+    """Lazy import for ConvRot rotated W4A4 (+ optional INT8 layers) diffusion config (CUDA only)."""
+    from .convrot_config import DiffusionConvRotInt4Config
+
+    return DiffusionConvRotInt4Config(**kw)
 
 
 def _build_bitsandbytes(**kw: Any) -> QuantizationConfig:
@@ -180,6 +198,8 @@ def _build_torchao_float8_weight_only(**kw: Any) -> QuantizationConfig:
 _OVERRIDES: dict[str, Callable[..., QuantizationConfig]] = {
     "fp8": _build_fp8,
     "int8": _build_int8,
+    "convrot_int8": _build_convrot_int8,
+    "convrot_int4": _build_convrot_int4,
     "bitsandbytes": _build_bitsandbytes,
     "mxfp8": _build_mxfp8,
     "mxfp4": _build_mxfp4,

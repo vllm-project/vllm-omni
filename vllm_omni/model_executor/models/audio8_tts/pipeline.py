@@ -44,6 +44,10 @@ def _stages(*, slow_ar_stage: str, slow_ar_arch: str, eos_token_id: int) -> tupl
                 "detokenize": False,
                 "stop_token_ids": [eos_token_id],
             },
+            # talker_mtp folds the sampled codebook embeddings into this
+            # step's inputs_embeds; a replay rebuilds only the text part and
+            # pads the rest (vllm-project/vllm-omni#6179).
+            recompute_preemption="fail",
         ),
         StagePipelineConfig(
             stage_id=1,

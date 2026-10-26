@@ -80,18 +80,39 @@ class TestKeyBasedReadWrite:
         result = connector.get("s0", "s1", "no_such_key_xyz", metadata=None)
         assert result is None
 
-    def test_get_empty_shm_race_returns_none(self, connector, monkeypatch):
-        def raise_empty_file(*args, **kwargs):
-            raise ValueError("cannot mmap an empty file")
+    def test_get_does_not_open_shm_before_writer_sizes_it(self, connector, tmp_path, monkeypatch, mocker):
+        import threading
 
-        monkeypatch.setattr(
-            "vllm_omni.distributed.omni_connectors.connectors.shm_connector.shm_pkg.SharedMemory",
-            raise_empty_file,
-        )
+        from vllm_omni.distributed.omni_connectors.connectors import shm_connector as module
 
-        result = connector.get("s0", "s1", "not_ready_yet", metadata=None)
+        # Isolate the publication lock from the host's coordination directory.
+        monkeypatch.setattr(module, "open", lambda path, mode: (tmp_path / "writer.lock").open(mode), raising=False)
+        entered, release = threading.Event(), threading.Event()
+        original = os.ftruncate
+        opens = mocker.spy(module.shm_pkg, "SharedMemory")
 
-        assert result is None
+        def pause_size(fd, size):
+            entered.set()
+            assert release.wait(timeout=5)
+            return original(fd, size)
+
+        key = "sizing_" + uuid.uuid4().hex[:16]
+        result = []
+        with monkeypatch.context() as patch:
+            patch.setattr(os, "ftruncate", pause_size)
+            writer = threading.Thread(target=lambda: result.append(connector.put("0", "1", key, {"ready": True})))
+            writer.start()
+            try:
+                assert entered.wait(timeout=5)
+                before_read = opens.call_count
+                assert connector.get("0", "1", key) is None
+                assert opens.call_count == before_read
+            finally:
+                release.set()
+                writer.join(timeout=5)
+        assert not writer.is_alive()
+        assert result[0][0]
+        assert connector.get("0", "1", key, metadata=result[0][2])[0] == {"ready": True}
 
     def test_rank_aware_keys_independent(self, connector):
         """Each TP rank writes/reads its own key — simulates homogeneous TP."""

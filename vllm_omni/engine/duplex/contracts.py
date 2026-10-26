@@ -115,6 +115,15 @@ class DuplexOutputContext:
 class DuplexStagePort(ABC):
     """Narrow stage-management surface the session runner/manager use (implemented by DuplexOrchestrator)."""
 
+    def reserve_session(self, session_id: str) -> None:
+        """Atomically reserve capacity, leaving none on error; legacy ports do nothing."""
+
+    def release_session(self, session_id: str) -> None:
+        """Idempotently release a session's replica reservation after cleanup."""
+
+    def reject_session(self, reason: str) -> None:
+        """Observe admission rejection when the stage port enables placement."""
+
     @property
     @abstractmethod
     def stage_count(self) -> int: ...

@@ -19,6 +19,14 @@ of this package still succeeds without vllm; materialize of leftover
 mm does not.
 """
 
+from vllm_omni.core.prefix_cache.adapter import (
+    PrefixCacheEventKind,
+    PrefixCacheRequestEvent,
+    PrefixCacheSchedulerAdapter,
+    PrefixCacheStep,
+    PrefixCacheWrite,
+    PrefixCacheWriteLayout,
+)
 from vllm_omni.core.prefix_cache.block_pool import PrefixBlockPool
 from vllm_omni.core.prefix_cache.controller import OmniPrefixCacheController
 from vllm_omni.core.prefix_cache.group_view import (
@@ -45,6 +53,12 @@ __all__ = [
     "ModelCachePolicy",
     "OmniPrefixCacheController",
     "OmniPrefixCacheManager",
+    "PrefixCacheEventKind",
+    "PrefixCacheRequestEvent",
+    "PrefixCacheSchedulerAdapter",
+    "PrefixCacheStep",
+    "PrefixCacheWrite",
+    "PrefixCacheWriteLayout",
     "OmniPrefixCacheStagingTimeoutError",
     "OmniPrefixCacheUnmatchError",
     "StageCacheOutputs",
