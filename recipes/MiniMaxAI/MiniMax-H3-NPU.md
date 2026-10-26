@@ -547,6 +547,38 @@ recommended lossy configuration. Memory figures are per device.
 These numbers describe the validated shapes rather than a general throughput
 guarantee.
 
+## Experimental reference-KV offload
+
+MiniMax-H3 can periodically reuse visual-reference K/V on intermediate denoise
+steps. This is opt-in and lossy because its bidirectional attention makes the
+reference K/V change as target tokens evolve. Omit `--kv-offload-config` for the
+existing full-compute path. For an experiment with the two-layer staging ring:
+
+```bash
+vllm serve /path/to/MiniMax-H3 --omni --task-type ref2va \
+  --kv-offload-config '{"mode":"on","kv_refresh_interval":8,"kv_host_quantization":"int8"}'
+```
+
+The JSON object accepts three keys:
+
+| Key | Values | Default | Meaning |
+| --- | --- | --- | --- |
+| `mode` | `on` | required | Cache reference K/V after Ulysses and prefetch layers into a fixed two-slot device ring. |
+| `kv_refresh_interval` | integer >= 0 | `2` | Refresh every N denoise steps. `0` populates only at step 0 and has the highest quality risk. |
+| `kv_host_quantization` | `none`, `fp8`, `int8` | `none` | Host-cache storage format; quantization may fall back at runtime. |
+
+Reuse steps skip reference-token QKV projection and reference-query attention. This is lossy.
+The current implementation requires one request per forward and either no
+sequence parallelism or pure Ulysses; Ring and AllGather-KV are unsupported.
+
+The former MiniMax-H3 reference-KV and RainFusion hybrid environment variables
+are no longer used. The experimental RainFusion hybrid uses its validated BSA
+kernel and FP16 kernel input only on compact reference-KV reuse steps; the
+ordinary RainFusion path is unchanged when reference-KV offload is disabled.
+Warm up each configuration before comparing timings and inspect per-request
+reference row counts, refresh counts, and effective host quantization in worker
+logs. A successful HTTP response alone does not prove the cache was used.
+
 ## Known limitations
 
 - Task serving is partitioned by `--task-type`: T2VA/FL2VA and Ref2VA load

@@ -19,7 +19,7 @@ source .venv/bin/activate
 vLLM-Omni is quickly evolving, please see the [installation guide](../getting_started/installation/README.md) for details. It's recommended to build from source to provide the latest development environment.
 
 !!! tip
-    vLLM-Omni is compatible with Python versions 3.10 to 3.12. However, we recommend developing with Python 3.12 to minimize the chance of your local environment clashing with our CI environment.
+    This source checkout requires Python 3.11 to 3.13, matching the Python floor of vLLM 0.32. We recommend developing with Python 3.12 to match our CI environment.
 
 ### Adding a new model to vLLM-Omni
 
@@ -298,6 +298,8 @@ If you encounter a bug or have a feature request, please search existing issues 
     Do not report suspected security vulnerabilities through a public issue, pull request, discussion, or Slack channel. Follow the [security disclosure instructions](../community/contact_us.md#security-disclosures) to arrange a private report.
 
 ## Pull Requests & Code Reviews
+
+For maintainer triage, merge gates, and post-merge quality watch, see the [PR merge loop](./ci/pr_merge_loop.md).
 
 Thank you for your contribution to vLLM-Omni! Before submitting the pull request, please ensure the PR meets the following criteria. This helps vLLM-Omni maintain the code quality and improve the efficiency of the review process.
 

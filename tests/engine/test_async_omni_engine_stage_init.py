@@ -1093,9 +1093,11 @@ def test_stage_runtime_launches_shared_engines_with_per_client_addresses(monkeyp
                     "output_address": f"ipc://stage{stage_id}-output-{client_index}",
                 }
 
-    assert events == (
-        [(event, stage_id) for event in ("enter", "exit") for stage_id in stage_ids] if client_count > 1 else expected
-    )
+    if client_count > 1:
+        assert events[: len(stage_ids)] == [("enter", stage_id) for stage_id in stage_ids]
+        assert sorted(events[len(stage_ids) :]) == [("exit", stage_id) for stage_id in stage_ids]
+    else:
+        assert events == expected
     assert not hasattr(stage_plans[0].replicas[0].stage_vllm_config.parallel_config, "_api_process_count")
     assert not hasattr(stage_plans[0].replicas[0].stage_vllm_config.parallel_config, "_api_process_rank")
     assert all(
@@ -1104,8 +1106,8 @@ def test_stage_runtime_launches_shared_engines_with_per_client_addresses(monkeyp
     )
     assert captured_launch_env == ["enabled" if stage_id == 0 else None for stage_id in stage_ids]
     assert os.environ.get("VLLM_OMNI_TEST_STAGE_RUNTIME_ENV") is None
-    # Pre-spawned replicas are answered in launch order, after every earlier
-    # replica is ready, so each may wait for all of their initializations.
+    # Pre-spawned replicas may wait for earlier members of their device group;
+    # the conservative multi-API handshake budget still covers every replica.
     expected_handshake_timeout = runtime._stage_init_timeout * len(stage_ids) if client_count > 1 else None
     assert [kwargs["handshake_timeout_s"] for kwargs in captured_launch_kwargs] == [expected_handshake_timeout] * len(
         stage_ids
@@ -1586,7 +1588,8 @@ def test_initialize_stages_cleans_up_late_successful_replicas_after_early_multi_
     assert captured_cleanup == [[initialized_client]]
 
 
-def test_initialize_local_llm_replica_passes_stage_init_timeout_to_complete_stage_handshake(monkeypatch):
+@pytest.mark.parametrize("log_stats", [False, True])
+def test_initialize_local_llm_replica_passes_launch_options(monkeypatch, log_stats):
     import vllm_omni.engine.stage_runtime as runtime_mod
     from vllm_omni.platforms import current_omni_platform
 
@@ -1596,12 +1599,14 @@ def test_initialize_local_llm_replica_passes_stage_init_timeout_to_complete_stag
         config_path="dummy-config",
         stage_init_timeout=1,
         async_chunk=False,
+        log_stats=log_stats,
     )
     stage_init_timeout = 302
 
     fake_vllm_config = types.SimpleNamespace()
     fake_addresses = types.SimpleNamespace(inputs=["in"], outputs=["out"], frontend_stats_publish_address=None)
     captured_timeout: int | None = None
+    captured_log_stats: bool | None = None
 
     plan = ReplicaInitPlan(
         replica_id=0,
@@ -1630,7 +1635,9 @@ def test_initialize_local_llm_replica_passes_stage_init_timeout_to_complete_stag
     from vllm_omni.engine.stage_engine_startup import StageReplicaResources
 
     @contextlib.contextmanager
-    def _fake_launch_stage_replica(**_kwargs):
+    def _fake_launch_stage_replica(**kwargs):
+        nonlocal captured_log_stats
+        captured_log_stats = kwargs["log_stats"]
         yield StageReplicaResources(
             manager=types.SimpleNamespace(shutdown=lambda: None),
             addresses=fake_addresses,
@@ -1652,6 +1659,7 @@ def test_initialize_local_llm_replica_passes_stage_init_timeout_to_complete_stag
             os.environ[device_env_var] = prev_device_env
 
     assert captured_timeout == stage_init_timeout
+    assert captured_log_stats is log_stats
 
 
 def test_build_engine_args_cli_tokenizer_overrides_inferred_base_tokenizer(tmp_path):
@@ -2662,7 +2670,6 @@ def test_native_kv_producer_replica_identity_and_bootstrap_are_isolated(mocker, 
         kv_connector="MooncakeConnector",
         kv_role="kv_producer",
         engine_id="ar",
-        kv_ip="127.0.0.1",
         kv_connector_extra_config={"bootstrap_port": 9100},
     )
     if typed:

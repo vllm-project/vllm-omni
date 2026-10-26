@@ -20,7 +20,7 @@ import socket
 import time
 from argparse import Namespace
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from http import HTTPStatus
 from pathlib import Path
 from typing import Annotated, Any, Literal
@@ -35,7 +35,6 @@ from starlette.datastructures import State
 from starlette.types import ASGIApp, Receive, Scope, Send
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.anthropic.serving import AnthropicServingMessages
-from vllm.entrypoints.chat_utils import ChatTemplateConfig, load_chat_template
 from vllm.entrypoints.generate.base.protocol import RequestResponseMetadata
 from vllm.entrypoints.launchers.cli_args import make_arg_parser
 from vllm.entrypoints.launchers.launcher import serve_http
@@ -81,6 +80,7 @@ from vllm.entrypoints.speech_to_text.translation.serving import (
     OpenAIServingTranslation,
 )
 from vllm.logger import configure_logging_from_args, init_logger
+from vllm.renderers.chat_utils import ChatTemplateConfig, load_chat_template
 from vllm.renderers.online_renderer import OnlineRenderer
 from vllm.tasks import POOLING_TASKS
 from vllm.tool_parsers import ToolParserManager
@@ -96,7 +96,10 @@ from vllm_omni.config.stage_config import load_deploy_config
 from vllm_omni.engine.stage_init_utils import set_death_signal
 from vllm_omni.engine.stage_runtime import OmniClientConfig
 from vllm_omni.entrypoints.async_omni import ABORT_TIMEOUT_S, AsyncOmni
-from vllm_omni.entrypoints.duplex.openai import dispatch_realtime_websocket
+from vllm_omni.entrypoints.duplex.openai import (
+    OpenAIRealtimeHandler,
+    _reject_unavailable_realtime_websocket,
+)
 from vllm_omni.entrypoints.duplex.serving import OmniDuplexSessionHandler
 from vllm_omni.entrypoints.duplex.warmup import (
     _warmup_duplex_realtime,
@@ -190,7 +193,10 @@ from vllm_omni.entrypoints.openai.storage import STORAGE_MANAGER, FileStorageHan
 from vllm_omni.entrypoints.openai.stores import VIDEO_STORE, VIDEO_TASKS
 from vllm_omni.entrypoints.openai.utils import get_stage_type
 from vllm_omni.entrypoints.openai.video.generation.helpers import (
+    VIDEO_DELETE_TIMEOUT_S,
     VIDEO_SYNC_TIMEOUT_S,
+    _cleanup_timeline_guides,
+    _cleanup_video,
     _cleanup_video_references,
     _parse_video_form,
     _run_video_generation_job,
@@ -199,6 +205,7 @@ from vllm_omni.entrypoints.openai.video.generation.helpers import (
     video_response_from_request,
 )
 from vllm_omni.entrypoints.openpi.serving import ServingRealtimeRobotOpenPI
+from vllm_omni.entrypoints.serve import weight_transfer_api
 from vllm_omni.entrypoints.serve.omni_control.protocol import OmniSleepRequest, OmniWakeupRequest
 from vllm_omni.entrypoints.serve.profile.protocol import ProfileRequest
 from vllm_omni.entrypoints.serve.profile.utils import _should_enable_profiler_endpoints
@@ -405,11 +412,29 @@ async def omni_run_server_worker(
 
             register_routes(app, args.port)
 
+        # OMNI: Mount the weight-transfer admin routes only when the feature
+        # is enabled via weight_transfer_config (mirrors upstream vLLM, which
+        # keeps weight-mutation endpoints behind an explicit opt-in).
+        if getattr(engine_client, "weight_transfer_enabled", False):
+            logger.warning(
+                "SECURITY WARNING: weight transfer endpoints are enabled! "
+                "These mutate model weights and must not be exposed in "
+                "untrusted environments."
+            )
+            app.include_router(weight_transfer_api.router)
+
         # OMNI: Override upstream exception handlers with Omni-aware versions
         # that understand the multi-stage orchestrator lifecycle.
         _register_omni_exception_handlers(app)
 
         await omni_init_app_state(engine_client, app.state, args)
+
+        # The inherited routes assume a tokenization handler. Pure diffusion
+        # has none; omit those capabilities instead of dereferencing None.
+        if getattr(app.state, "serving_tokenization", None) is None:
+            remove_route_from_app(app, "/tokenize", {"POST"})
+            remove_route_from_app(app, "/detokenize", {"POST"})
+            remove_route_from_app(app, "/tokenizer_info", {"GET"})
 
         # After initializing the app state, shut down any endpoints that are model specific
         if hasattr(engine_client, "endpoint_restrictions"):
@@ -488,9 +513,9 @@ async def omni_run_server_worker(
         app.state.duplex_warmup_done = asyncio.Event() if warmup_kind is not None else None
         warmup_task: asyncio.Task | None = None
         if warmup_kind is not None:
-            # Scheduled before serve_http (which may not return until
-            # shutdown); the coroutine retries its self-connect until the
-            # server socket is accepting.
+            # Scheduled before serve_http (which may not return until shutdown).
+            # One frontend retries a self-connect; multiple frontends warm
+            # their owned replica groups through the local engine.
             warmup_task = asyncio.create_task(_warmup_duplex_realtime(app, args, duplex_warmup_frames))
 
         shutdown_task = await serve_http(
@@ -864,15 +889,17 @@ async def omni_init_app_state(
     # Get vllm_config from engine_client (following 0.14.0 pattern)
     vllm_config = await openai_app_state._get_vllm_config(engine_client)
 
-    # Detect if it's pure Diffusion mode (single stage and is Diffusion)
+    # Detect if it's Diffusion mode (every stage is a diffusion stage). This
+    # covers both single-stage diffusion and multi-stage diffusion pipelines
+    # such as the Wan Encode/Generation (EG) (text_encode + dit) disaggregation,
+    # which must use the diffusion serving path (no vllm_config) rather than the
+    # LLM/multi-stage path.
     is_pure_diffusion = False
     if hasattr(engine_client, "stage_configs") and engine_client.stage_configs:
         stage_configs = engine_client.stage_configs
-        if len(stage_configs) == 1:
-            stage_type = get_stage_type(stage_configs[0])
-            if stage_type == "diffusion":
-                is_pure_diffusion = True
-                logger.info("Detected pure diffusion mode (single diffusion stage)")
+        if all(get_stage_type(sc) == "diffusion" for sc in stage_configs):
+            is_pure_diffusion = True
+            logger.info("Detected diffusion mode (%d diffusion stage(s))", len(stage_configs))
 
     if args.served_model_name is not None:
         served_model_names = args.served_model_name
@@ -885,6 +912,7 @@ async def omni_init_app_state(
         request_logger = None
 
     base_model_paths = [BaseModelPath(name=name, model_path=args.model) for name in served_model_names]
+    state.openai_realtime_handler = OpenAIRealtimeHandler.from_engine_client(engine_client)
     state.engine_client = engine_client
     state.log_stats = not args.disable_log_stats
     state.args = args
@@ -941,6 +969,7 @@ async def omni_init_app_state(
         state.openai_serving_speech = OmniOpenAIServingSpeech.for_diffusion(
             diffusion_engine=engine_client,
             model_name=model_name,
+            served_model_names=served_model_names,
             stage_configs=diffusion_stage_configs,
             speech_cache_config=speech_cache_config,
             allowed_local_media_path=getattr(args, "allowed_local_media_path", ""),
@@ -1216,6 +1245,22 @@ async def omni_init_app_state(
         is not None,
     )
 
+    has_ming3_chat = (
+        state.openai_serving_chat is not None
+        and getattr(state.openai_serving_chat, "_has_ming3_talker_stage", lambda: False)()
+    )
+    if has_ming3_chat or getattr(state.openai_serving_speech, "_tts_model_type", None) == "ming3_audio_tts":
+        from vllm_omni.entrypoints.openai.ming3_voices import register_model_voice_presets
+
+        await register_model_voice_presets(
+            state.openai_serving_speech,
+            args.model,
+            revision=getattr(args, "revision", None),
+            cache_dir=getattr(args, "download_dir", None),
+        )
+        if has_ming3_chat and state.openai_serving_chat is not None:
+            state.openai_serving_chat._ming3_speech_service = state.openai_serving_speech
+
     # Warm up speech pipeline (CUDA Graph capture, torch.compile) so the first
     # real user request is fast instead of paying a 100s compilation tax.
     await state.openai_serving_speech.warmup()
@@ -1241,7 +1286,12 @@ async def omni_init_app_state(
         model_name=served_model_names[0] if served_model_names else None,
         stage_configs=state.stage_configs,
     )
-    state.openai_serving_realtime_robot = None
+    # Policies whose first stage is autoregressive (for example reasoning before
+    # acting) serve OpenPI too; this is None without policy_server_config.
+    state.openai_serving_realtime_robot = ServingRealtimeRobotOpenPI.create_policy_server(
+        engine_client=engine_client,
+        model_name=model_name,
+    )
     state.rl_rollout_serving = None
 
     state.enable_server_load_tracking = args.enable_server_load_tracking
@@ -1289,6 +1339,8 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
                 detail="The model does not support Chat Completions API",
             )
         return base_server.create_error_response(message="The model does not support Chat Completions API")
+    if request.model == "auto":
+        request.model = None
     try:
         generator = await handler.create_chat_completion(request, raw_request)
     except (EngineGenerateError, EngineDeadError) as exc:
@@ -1429,6 +1481,9 @@ async def create_speech(request: OpenAICreateSpeechRequest, raw_request: Request
     handler = Omnispeech(raw_request)
     if handler is None:
         return _unsupported_api_response(raw_request, "Speech API")
+    if request.model == "auto":
+        request.model = None
+
     try:
         result = await handler.create_speech(request, raw_request)
         if isinstance(result, ErrorResponse):
@@ -1456,6 +1511,9 @@ async def create_speech_batch(request: BatchSpeechRequest, raw_request: Request)
     handler = Omnispeech(raw_request)
     if handler is None:
         return _unsupported_api_response(raw_request, "Speech API")
+    if request.model == "auto":
+        request.model = None
+
     try:
         result = await handler.create_speech_batch(request)
         if isinstance(result, ErrorResponse):
@@ -1534,6 +1592,7 @@ async def list_voices(raw_request: Request):
     if hasattr(handler, "uploaded_speakers"):
         for voice_name, info in handler.uploaded_speakers.items():
             voice_entry = {
+                "id": voice_name,
                 "name": info.get("name", voice_name),
                 "consent": info.get("consent", ""),
                 "created_at": info.get("created_at", 0),
@@ -1632,7 +1691,6 @@ async def upload_voice(
     Returns:
         JSON response with voice information
     """
-    _reject_process_local_state_with_multiple_api_workers(raw_request, "Runtime voice upload")
     handler = Omnispeech(raw_request)
     if handler is None:
         return _create_speech_error_json_response(
@@ -1657,6 +1715,7 @@ async def upload_voice(
         else:
             return _create_speech_error_json_response("Either 'audio_sample' or 'speaker_embedding' must be provided")
 
+        result["id"] = name.strip().lower()
         return JSONResponse(content={"success": True, "voice": result})
 
     except ValueError as e:
@@ -1692,7 +1751,6 @@ async def delete_voice(name: str, raw_request: Request):
     Returns:
         JSON response indicating success or failure
     """
-    _reject_process_local_state_with_multiple_api_workers(raw_request, "Runtime voice deletion")
     handler = Omnispeech(raw_request)
     if handler is None:
         return _create_speech_error_json_response(
@@ -1805,7 +1863,19 @@ async def realtime_websocket(websocket: WebSocket):
         await websocket.close(code=1008)
         return
 
-    await dispatch_realtime_websocket(websocket)
+    chat = getattr(websocket.app.state, "openai_serving_chat", None)
+    if chat is not None and getattr(chat, "_ming3_speech_service", None) is not None:
+        from vllm_omni.entrypoints.openai.ming3_realtime import Ming3RealtimeConnection
+
+        await Ming3RealtimeConnection(websocket, chat).handle_connection()
+        return
+
+    realtime_handler = getattr(websocket.app.state, "openai_realtime_handler", None)
+    if realtime_handler is None:
+        await _reject_unavailable_realtime_websocket(websocket)
+        return
+
+    await realtime_handler.handle_websocket(websocket)
 
 
 @router.websocket("/v1/duplex")
@@ -1854,16 +1924,27 @@ async def realtime_robot_openpi(websocket: WebSocket):
 
 
 async def _reject_multi_api_duplex(websocket: WebSocket) -> bool:
-    # Session credentials and replay state are local to each frontend; a shared
-    # listening socket cannot route reconnects back to the session owner.
     count = getattr(websocket.app.state, "api_server_count", None)
     if count is None or (type(count) is int and count == 1):
         return False
+    error = "Duplex sessions require initialized API worker topology."
+    if type(count) is int and count > 1:
+        engine_client = getattr(websocket.app.state, "engine_client", None)
+        config = getattr(engine_client, "duplex_session_config", None)
+        capabilities = getattr(engine_client, "duplex_capabilities", None)
+        if getattr(config, "replica_policy", None) != "least_sessions":
+            error = "Duplex sessions with multiple API workers require replica_policy=least_sessions."
+        elif getattr(capabilities, "supports_session_resume", None) is not False:
+            # Session credentials and replay state are local to each frontend;
+            # the shared socket cannot route reconnects back to their owner.
+            error = "Duplex session resume routing across API workers is not supported."
+        else:
+            return False
     await websocket.accept()
     await websocket.send_json(
         {
             "type": "error",
-            "error": "Duplex sessions require a single API worker with initialized topology.",
+            "error": error,
             "code": "multi_api_duplex_unsupported",
         }
     )
@@ -2079,6 +2160,9 @@ async def generate_images(
     # Get engine client (AsyncOmni) from app state
     engine_client, model_name, stage_configs = _get_engine_and_model(raw_request)
 
+    if request.model == "auto":
+        request.model = None
+
     if request.model is not None and request.model != model_name:
         raise HTTPException(
             status_code=HTTPStatus.BAD_REQUEST.value,
@@ -2291,7 +2375,7 @@ async def edit_images(
     url: list[str] | None = Form(None),
     url_array: list[str] | None = Form(None, alias="url[]"),
     prompt: str = Form(...),
-    model: str = Form(None),
+    model: str | None = Form(None),
     n: int = Form(1),
     size: str = Form("auto"),
     response_format: str = Form("b64_json"),
@@ -2330,6 +2414,8 @@ async def edit_images(
     # 1. get engine and model
     request_timestamp = float(getattr(raw_request.state, "request_timestamp", time.time()))
     engine_client, model_name, stage_configs = _get_engine_and_model(raw_request)
+    if model == "auto":
+        model = None
     if model is not None and model != model_name:
         raise HTTPException(
             status_code=HTTPStatus.BAD_REQUEST.value,
@@ -2687,22 +2773,41 @@ async def create_video(
         control_path,
         latent_edit_input,
     ) = ctx
-    ref = video_response_from_request(effective_model_name, request)
-    await VIDEO_STORE.upsert(ref.id, ref)
-    task = asyncio.create_task(
-        _run_video_generation_job(
-            handler,
-            request,
-            ref.id,
-            reference_image,
-            reference_video,
-            reference_audio,
-            control_path,
-            app_state=raw_request.app.state,
-            latent_edit_input=latent_edit_input,
+
+    def _cleanup_request_resources() -> None:
+        _cleanup_video_references(reference_video, reference_audio, control_path, latent_edit_input)
+        _cleanup_timeline_guides(request)
+
+    task: asyncio.Task[None] | None = None
+    ref = None
+    try:
+        ref = video_response_from_request(effective_model_name, request)
+        await VIDEO_STORE.upsert(ref.id, ref)
+        task = asyncio.create_task(
+            _run_video_generation_job(
+                handler,
+                request,
+                ref.id,
+                reference_image,
+                reference_video,
+                reference_audio,
+                control_path,
+                app_state=raw_request.app.state,
+                latent_edit_input=latent_edit_input,
+            )
         )
-    )
-    await VIDEO_TASKS.upsert(ref.id, task)
+        # A task cancelled before its first step never enters its finally block.
+        task.add_done_callback(lambda _: _cleanup_request_resources())
+        await VIDEO_TASKS.upsert(ref.id, task)
+    except BaseException:
+        if task is not None:
+            task.cancel()
+            with suppress(asyncio.CancelledError, Exception):
+                await task
+        _cleanup_request_resources()
+        if ref is not None:
+            await VIDEO_STORE.pop(ref.id)
+        raise
     return ref
 
 
@@ -2784,6 +2889,7 @@ async def create_video_sync(
         ) from exc
     finally:
         _cleanup_video_references(reference_video, reference_audio, control_path, latent_edit_input)
+        _cleanup_timeline_guides(request)
     inference_time_s = time.perf_counter() - started_at
 
     return Response(
@@ -2902,12 +3008,13 @@ async def delete_video(video_id: str, raw_request: Request) -> VideoDeleteRespon
         if task is not None:
             task.cancel()
             try:
-                # Cancel cleanup may spend a full abort budget; +2s covers scheduling slack.
-                await asyncio.wait_for(task, timeout=VIDEO_ABORT_TIMEOUT_S + 2.0)
+                # Allow the abort budget while shielding artifact cleanup from a second cancellation.
+                await asyncio.wait_for(asyncio.shield(task), timeout=VIDEO_ABORT_TIMEOUT_S + VIDEO_DELETE_TIMEOUT_S)
             except asyncio.TimeoutError:
                 raise HTTPException(status_code=409, detail="Cancellation in progress. Please try again later.")
             except asyncio.CancelledError:
-                pass
+                if not task.cancelled():
+                    raise
 
         job = await VIDEO_STORE.get(video_id)
         if job is None:
@@ -2917,12 +3024,8 @@ async def delete_video(video_id: str, raw_request: Request) -> VideoDeleteRespon
             return VideoDeleteResponse(id=job.id, deleted=True)
 
     if job.status is VideoGenerationStatus.FAILED:
-        if job.file_name is not None:
-            try:
-                await STORAGE_MANAGER.delete(video_id)
-            except Exception:
-                logger.warning("Failed to delete stored artifact for failed video job %s", video_id, exc_info=True)
-
+        # Partial artifacts may exist before their descriptors are published.
+        await _cleanup_video(video_id)
         await VIDEO_STORE.pop(video_id)
         return VideoDeleteResponse(id=job.id, deleted=True)
 

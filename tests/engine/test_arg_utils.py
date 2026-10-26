@@ -89,8 +89,8 @@ def test_default_stage_id_is_concrete_int():
     assert cfg.stage_id == 0
 
 
-def test_full_payload_capability_reaches_omni_model_config(monkeypatch):
-    """Keep the pipeline capability intact through the engine adapter."""
+def test_topology_owned_model_fields_reach_omni_model_config(monkeypatch):
+    """Keep pipeline-owned model fields intact through the engine adapter."""
     captured: dict[str, object] = {}
     baseline_config = Mock()
     worker_module = types.ModuleType("test_connector_worker")
@@ -121,10 +121,12 @@ def test_full_payload_capability_reaches_omni_model_config(monkeypatch):
     OmniEngineArgs(
         stage_id=1,
         requires_full_payload_input=True,
+        scheduling_metadata_adapter="pipeline.Adapter",
         worker_cls="test_connector_worker.ConnectorWorker",
     ).create_model_config()
 
     assert captured["requires_full_payload_input"] is True
+    assert captured["scheduling_metadata_adapter"] == "pipeline.Adapter"
 
 
 def test_stage_without_connector_configuration_accepts_plain_runner(monkeypatch):
@@ -615,3 +617,13 @@ def test_text_encoder_tp_size_reaches_default_diffusion_parallel_config():
 
     parallel_config = stage_cfg["engine_args"]["parallel_config"]
     assert parallel_config["text_encoder_tp_size"] == 2
+
+
+def test_native_mrv2_worker_provides_connector_without_legacy_mixin():
+    from vllm_omni.worker.omni_connector_validation import validate_worker_omni_connector
+    from vllm_omni.worker_v2.omni_ar_model_runner import OmniARModelRunner
+
+    class Worker:
+        model_runner_cls = OmniARModelRunner
+
+    validate_worker_omni_connector(Worker, required=True)

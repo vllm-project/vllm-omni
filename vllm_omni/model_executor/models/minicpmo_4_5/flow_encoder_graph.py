@@ -86,7 +86,8 @@ class FlowEncoderGraphs:
 
     ``encode_fn(tokens, cnn_cache=, att_cache=)`` supplies the continuation
     body. ``chunk_forward`` additionally accepts ``last_chunk`` for generic
-    calls. Startup capture freezes admission; unseen shapes then run eager.
+    calls. Startup capture freezes admission by default; opt-in exact-shape capture
+    can retain repeated tail and prompt shapes in a separate bounded cache.
 
     Caches use the encoder layouts: ``cnn_cache`` ``(rows, channels, width)``,
     ``att_cache`` ``(depth, rows, heads, frames, 2 * head_dim)``; a chunk of
@@ -106,6 +107,7 @@ class FlowEncoderGraphs:
         held_tensors: Callable[[], Sequence[torch.Tensor]] = tuple,
         max_graphs: int = 8,
         capture_after: int = 2,
+        capture_after_precapture: bool = False,
         eager_min_batch: int | None = None,
         chunk_forward: Callable | None = None,
     ) -> None:
@@ -135,7 +137,8 @@ class FlowEncoderGraphs:
         self.eager_min_batch = None if eager_min_batch is None else int(eager_min_batch)
         if self.eager_min_batch is not None and self.eager_min_batch < 1:
             raise ValueError("encoder graph eager_min_batch must be >= 1")
-        # Startup precapture turns this off so serving only replays those graphs.
+        # Keep runtime capture opt-in after the shared continuation arena is ready.
+        self.capture_after_precapture = bool(capture_after_precapture)
         self.capture_on_request = True
         self.exact_graphs = {}
         self.seen = OrderedDict()
@@ -291,7 +294,8 @@ class FlowEncoderGraphs:
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
         """The continuation chunk of these streams (one cache row each) from its graph, or ``None`` (run eager).
 
-        Returns the shared result views: copy what must outlive the next replay.
+        Exact batches return shared views: copy what must outlive the next replay.
+        Larger batches replay smaller exact graphs and return owned results.
         """
         if self._failed:
             raise RuntimeError("Code2Wav encoder graph capture failed; restart the stage before retrying")
@@ -313,7 +317,31 @@ class FlowEncoderGraphs:
             return None
         key = (rows, int(tokens.shape[1]), int(att_rows[0].shape[3]) if att_rows[0].dim() == 5 else -1)
         if (entry := self.graphs.get(key)) is None:
-            return None
+            # Large serving batches reuse the small startup arena. Never pad
+            # conformer cache lengths: relative attention depends on them.
+            sizes = sorted((r for r, w, f in self.graphs if (w, f) == key[1:]), reverse=True)
+            if not sizes or rows <= sizes[0] or 1 not in sizes:
+                return None
+            outputs = None
+            start = 0
+            while start < rows:
+                count = next(size for size in sizes if size <= rows - start)
+                stop = start + count
+                part = self.run(tokens[start:stop], cnn_rows[start:stop], att_rows[start:stop])
+                if part is None:
+                    return None
+                if outputs is None:
+                    outputs = []
+                    for value, dim in zip(part, (0, 0, 1), strict=True):
+                        shape = list(value.shape)
+                        shape[dim] = rows
+                        outputs.append(value.new_empty(shape))
+                # Each replay overwrites the shared results. Copy directly
+                # into the final batch, without retaining per-chunk clones.
+                for target, value, dim in zip(outputs, part, (0, 0, 1), strict=True):
+                    target.narrow(dim, start, count).copy_(value)
+                start = stop
+            return tuple(outputs)
         graph, views = entry
         static_att, static_cnn = views["att"], views["cnn"]
         att_shape, cnn_shape = (static_att.shape[0], 1, *static_att.shape[2:]), (1, *static_cnn.shape[1:])

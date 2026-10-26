@@ -70,10 +70,50 @@ steps:
           -m 'core_model and cpu and not (cards_2 or cards_3 or cards_4 or cards_5 or cards_6 or cards_7 or cards_8)'
           --ignore=tests/diffusion/cache/test_teacache_extractors.py
           --ignore=tests/diffusion/models/pi05/test_pi05_units.py
+          --deselect='tests/diffusion/distributed/test_wan_vae_fastpath_install.py::test_omni_wan_vae_decode_override_is_bitwise_exact[dtype0]'
+          --deselect='tests/diffusion/distributed/test_wan_vae_fastpath_install.py::test_omni_wan_vae_decode_override_is_bitwise_exact[dtype1]'
+          --deselect='tests/diffusion/distributed/test_wan_decoder_fast_path.py::test_sharded_fast_path_on_every_rank[True-exact]'
+          --deselect='tests/diffusion/models/lingbot_world/test_pipeline_lingbot_world.py::test_condition_continues_real_causal_vae_beyond_initial_horizon[realtime]'
+          --deselect='tests/diffusion/models/lingbot_world/test_pipeline_lingbot_world.py::test_condition_continues_real_causal_vae_beyond_initial_horizon[stepwise]'
+          --deselect='tests/diffusion/models/lingbot_world/test_pipeline_lingbot_world.py::test_condition_encoder_stops_at_its_fixed_point_and_restarts_with_the_session'
           --num-shards=$$BUILDKITE_PARALLEL_JOB_COUNT
           --shard-id=$$BUILDKITE_PARALLEL_JOB
           --durations=50
           --junitxml="$$DIFFUSION_CPU_ARTIFACT_DIR/pytest-$${BUILDKITE_PARALLEL_JOB}-of-$${BUILDKITE_PARALLEL_JOB_COUNT}.xml"
+
+    # Hash sharding put these six CPU cases on shard 2/5. Main builds 13600 and
+    # 13615 spent about 15 and 23 minutes on them. A separate job keeps that
+    # cost off the five-way critical path.
+    - label: "Simple · Diffusion Slow CPU Test"
+      agent_pool: mi300_1
+      depends_on: amd-build
+      mirror_hardwares: [amdproduction]
+      grade: Blocking
+      timeout_in_minutes: 40
+      artifact_paths:
+        - "artifacts/amd-diffusion-slow-cpu/pytest.xml"
+      # Same exit-134 retry as the five-way shards. Buildkite cannot prove
+      # every 134 is a GPU hang. Assertions (1), timeouts (124), and OOMs
+      # (137) remain non-retryable.
+      retry:
+        automatic:
+          - exit_status: 134
+            limit: 1
+      commands:
+        - export VLLM_ROCM_USE_AITER=0
+        - export DIFFUSION_SLOW_CPU_ARTIFACT_DIR="$$BUILDKITE_BUILD_CHECKOUT_PATH/artifacts/amd-diffusion-slow-cpu"
+        - mkdir -p "$$DIFFUSION_SLOW_CPU_ARTIFACT_DIR"
+        - >-
+          pytest -sv
+          'tests/diffusion/distributed/test_wan_vae_fastpath_install.py::test_omni_wan_vae_decode_override_is_bitwise_exact[dtype0]'
+          'tests/diffusion/distributed/test_wan_vae_fastpath_install.py::test_omni_wan_vae_decode_override_is_bitwise_exact[dtype1]'
+          'tests/diffusion/distributed/test_wan_decoder_fast_path.py::test_sharded_fast_path_on_every_rank[True-exact]'
+          'tests/diffusion/models/lingbot_world/test_pipeline_lingbot_world.py::test_condition_continues_real_causal_vae_beyond_initial_horizon[realtime]'
+          'tests/diffusion/models/lingbot_world/test_pipeline_lingbot_world.py::test_condition_continues_real_causal_vae_beyond_initial_horizon[stepwise]'
+          'tests/diffusion/models/lingbot_world/test_pipeline_lingbot_world.py::test_condition_encoder_stops_at_its_fixed_point_and_restarts_with_the_session'
+          -m 'core_model and cpu and not (cards_2 or cards_3 or cards_4 or cards_5 or cards_6 or cards_7 or cards_8)'
+          --durations=20
+          --junitxml="$$DIFFUSION_SLOW_CPU_ARTIFACT_DIR/pytest.xml"
 
     - label: "Diffusion · AuK VAE GPU Test"
       agent_pool: mi300_1
@@ -117,7 +157,7 @@ steps:
       depends_on: amd-build
       mirror_hardwares: [amdproduction]
       grade: Blocking
-      timeout_in_minutes: 20
+      timeout_in_minutes: 25
       commands:
         - export VLLM_ROCM_USE_AITER=1
         - export VLLM_OMNI_AR_FA_REQUIRED=1
@@ -128,6 +168,11 @@ steps:
           timeout --signal=TERM --kill-after=2m 15m
           pytest -sv tests/diffusion/ar_diffusion/test_paged_attention.py
           -m 'core_model and rocm and MI325 and cards_1' --run-level core_model
+        # Keep the pinned-ring device contract blocking without making the
+        # cold, experimental AITER coverage lane a required check.
+        - >-
+          timeout --signal=TERM --kill-after=1m 5m pytest -sv tests/diffusion/utils/test_chunked_transfer.py
+          -m 'core_model and rocm and MI325 and cards_1' --run-level core_model
 
     - label: "Diffusion · LoRA Test"
       agent_pool: mi300_1
@@ -137,7 +182,15 @@ steps:
       artifact_paths:
         - lora-server.log
       commands:
-        - pytest -sv tests/diffusion/lora/ -m 'advanced_model and cuda' --run-level "advanced_model" 2>&1 | tee lora-server.log
+        - >-
+          bash .buildkite/amd/scripts/assert-pytest-collection.sh 1
+          tests/diffusion/lora/
+          -m 'advanced_model and rocm and MI325 and cards_1 and not nvidia_only'
+          --run-level "advanced_model"
+        - >-
+          pytest -sv tests/diffusion/lora/
+          -m 'advanced_model and rocm and MI325 and cards_1 and not nvidia_only'
+          --run-level "advanced_model" 2>&1 | tee lora-server.log
 
     - label: "Diffusion Model CPU offloading Test"
       agent_pool: mi300_1
@@ -162,6 +215,9 @@ steps:
       commands:
         - export VLLM_LOGGING_LEVEL=DEBUG
         - export VLLM_WORKER_MULTIPROC_METHOD=spawn
+        # Restore a provenance-checked Buildkite artifact into a job-local
+        # AITER_JIT_DIR. This consumer never publishes a duplicate artifact.
+        - eval "$$(python .buildkite/amd/scripts/aiter_mha_cache.py prepare)"
         - >-
           pytest -s -v
           'tests/diffusion/offloader/test_diffusion_layerwise_offload.py::test_layerwise_offload_diffusion_model[stabilityai/stable-audio-open-1.0]'
@@ -188,6 +244,23 @@ steps:
         - export VLLM_WORKER_MULTIPROC_METHOD=spawn
         - pytest -s -v tests/diffusion/distributed/test_ulysses_uaa_perf.py
 
+    # Four-GPU jobs remain merge-only because mi300_4 capacity is scarce.
+    # The blocking two-GPU ready lane covers two-rank UAA/SP variants.
+    - label: "ROCm · Ulysses UAA Attention · 4-GPU"
+      agent_pool: mi300_4
+      depends_on: amd-build
+      mirror_hardwares: [amdproduction]
+      grade: Blocking
+      timeout_in_minutes: 25
+      commands:
+        - export VLLM_WORKER_MULTIPROC_METHOD=spawn
+        - >-
+          timeout --signal=TERM --kill-after=2m 20m pytest -s -v
+          tests/diffusion/attention/test_ulysses_uaa.py
+          tests/diffusion/attention/test_attention_sp.py
+          -m 'core_model and rocm and MI325 and cards_4'
+          --run-level "core_model" --durations=20
+
     # merge-only tests
     - label: "Diffusion Tensor Parallelism Test"
       agent_pool: mi300_2
@@ -208,9 +281,20 @@ steps:
       mirror_hardwares: [amdproduction]
       grade: Blocking
       commands:
-        # A cold Z-Image run spends about six minutes loading weights before
-        # the first-request AITER compilation, which can itself exceed 23m.
-        - timeout 55m pytest -s -v tests/e2e/offline_inference/test_z_image.py
+        # A miss still spends about six minutes loading weights and can spend
+        # more than 23 minutes compiling the unmasked BF16 AITER MHA module.
+        # A verified build-scoped artifact restores that module before pytest.
+        - eval "$$(python .buildkite/amd/scripts/aiter_mha_cache.py prepare)"
+        # The runner continues after a failed command. Publish only when
+        # pytest returns 0, and exit with that status otherwise. Buildkite
+        # scopes the artifact to this exact build and job.
+        - |
+          if timeout 55m pytest -s -v tests/e2e/offline_inference/test_z_image.py; then
+            python .buildkite/amd/scripts/aiter_mha_cache.py publish
+          else
+            pytest_status=$$?
+            exit "$${pytest_status}"
+          fi
 
     - label: "Diffusion GPU Worker Test"
       agent_pool: mi300_2
@@ -226,10 +310,15 @@ steps:
       mirror_hardwares: [amdproduction]
       grade: Blocking
       commands:
+        - >-
+          bash .buildkite/amd/scripts/assert-pytest-collection.sh 2
+          tests/e2e/offline_inference/test_wan22_t2v.py
+          -m 'advanced_model and rocm and MI325 and cards_1 and diffusion and not nvidia_only'
+          --run-level 'advanced_model'
         - |
           timeout 40m bash -c "
             export VLLM_IMAGE_FETCH_TIMEOUT=60
-            pytest -s -v tests/e2e/offline_inference/test_wan22_t2v.py -m 'advanced_model and cuda and diffusion' --run-level 'advanced_model'
+            pytest -s -v tests/e2e/offline_inference/test_wan22_t2v.py -m 'advanced_model and rocm and MI325 and cards_1 and diffusion and not nvidia_only' --run-level 'advanced_model'
           "
 
     - label: "Diffusion · Wan22 Online Test"
@@ -238,10 +327,15 @@ steps:
       mirror_hardwares: [amdproduction]
       grade: Blocking
       commands:
+        - >-
+          bash .buildkite/amd/scripts/assert-pytest-collection.sh 1
+          tests/e2e/online_serving/test_wan22_t2v.py
+          -m 'advanced_model and rocm and MI325 and cards_1 and diffusion and not nvidia_only'
+          --run-level 'advanced_model'
         - |
           timeout 40m bash -c "
             export VLLM_IMAGE_FETCH_TIMEOUT=60
-            pytest -s -v tests/e2e/online_serving/test_wan22_t2v.py -m 'advanced_model and cuda and diffusion' --run-level 'advanced_model'
+            pytest -s -v tests/e2e/online_serving/test_wan22_t2v.py -m 'advanced_model and rocm and MI325 and cards_1 and diffusion and not nvidia_only' --run-level 'advanced_model'
           "
 
 ## ISSUE depends on `diffusers` package: https://github.com/huggingface/diffusers/issues/13274
@@ -286,7 +380,20 @@ steps:
       grade: Blocking
       commands:
         - export VLLM_WORKER_MULTIPROC_METHOD=spawn
-        - pytest -s -v tests/e2e/offline_inference/test_qwen3_omni.py tests/e2e/online_serving/test_qwen3_omni.py tests/e2e/offline_inference/test_qwen3_omni_colocate_async.py -m 'advanced_model and cuda' --run-level 'advanced_model'
+        - >-
+          bash .buildkite/amd/scripts/assert-pytest-collection.sh 16
+          tests/e2e/offline_inference/test_qwen3_omni.py
+          tests/e2e/online_serving/test_qwen3_omni.py
+          tests/e2e/offline_inference/test_qwen3_omni_colocate_async.py
+          -m 'advanced_model and rocm and MI325 and not nvidia_only'
+          --run-level 'advanced_model'
+        - >-
+          pytest -s -v
+          tests/e2e/offline_inference/test_qwen3_omni.py
+          tests/e2e/online_serving/test_qwen3_omni.py
+          tests/e2e/offline_inference/test_qwen3_omni_colocate_async.py
+          -m 'advanced_model and rocm and MI325 and not nvidia_only'
+          --run-level 'advanced_model'
 
     - label: "Qwen3-TTS CustomVoice E2E Test · Shard %N/%t"
       agent_pool: mi300_1
@@ -337,7 +444,18 @@ steps:
         - export VLLM_LOGGING_LEVEL=DEBUG
         - export VLLM_WORKER_MULTIPROC_METHOD=spawn
         - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
-        - timeout 40m pytest -s -v tests/e2e/online_serving/test_qwen3_tts_base.py tests/e2e/offline_inference/test_qwen3_tts_base.py -m "advanced_model and cuda" --run-level "advanced_model"
+        - >-
+          bash .buildkite/amd/scripts/assert-pytest-collection.sh 3
+          tests/e2e/online_serving/test_qwen3_tts_base.py
+          tests/e2e/offline_inference/test_qwen3_tts_base.py
+          -m 'advanced_model and rocm and MI325 and cards_1 and not nvidia_only'
+          --run-level "advanced_model"
+        - >-
+          timeout 40m pytest -s -v
+          tests/e2e/online_serving/test_qwen3_tts_base.py
+          tests/e2e/offline_inference/test_qwen3_tts_base.py
+          -m 'advanced_model and rocm and MI325 and cards_1 and not nvidia_only'
+          --run-level "advanced_model"
 
 # TODO: Bagel test on ROCm is very unstable. @tjtanaa
 # Need to debug before reneable numerical changes across large PRs

@@ -385,3 +385,21 @@ so Omni payload materialization remains synchronous.
   Optimization context and controlled performance results.
 - [PR #4476](https://github.com/vllm-project/vllm-omni/pull/4476): Feature
   implementation, validation, and review history.
+
+## NPU generation output copies
+
+`NPUGenerationModelRunner` has a separate path for non-autoregressive outputs
+such as Code2Wav waveforms. With asynchronous scheduling and pinned host memory,
+it submits D2H copies on the producer NPU stream and returns an
+`AsyncModelRunnerOutput`. `get_output()` waits for a completion event before
+exposing CPU tensors to the consumer. The copies precede the next forward on
+that stream, including graph replay that overwrites static output buffers.
+Device sources remain referenced until completion, CPU metadata is snapshotted,
+and request mappings are copied before returning.
+
+Synchronous scheduling waits once for the batch of copies. Full-payload
+accumulation and execution-time measurement also retain synchronous readiness;
+without pinned memory, copies remain blocking. These guards prevent accumulation
+or serialization from observing unfinished CPU tensors. This changes where the
+host waits, not the amount of NPU model computation or the D2H dependency on it.
+A shorter `sample_tokens()` interval alone is not an end-to-end speedup.

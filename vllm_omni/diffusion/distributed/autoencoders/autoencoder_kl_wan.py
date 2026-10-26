@@ -12,12 +12,15 @@ from diffusers.models.autoencoders.vae import DecoderOutput
 from diffusers.utils.accelerate_utils import apply_forward_hook
 from vllm.logger import init_logger
 
-from vllm_omni.diffusion.distributed.autoencoders import wan_spatial_shard
+from vllm_omni.diffusion.distributed.autoencoders import wan_encode_split, wan_spatial_shard
 from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor import (
     DistributedOperator,
     DistributedVaeMixin,
     GridSpec,
     TileTask,
+)
+from vllm_omni.diffusion.distributed.autoencoders.wan_sdpa_alignment import (
+    install_wan_attention_sdpa_alignment,
 )
 from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath import (
     can_encode_frames,
@@ -49,6 +52,10 @@ class OmniAutoencoderKLWan(AutoencoderKLWan):
             enabled=True,
         )
 
+    def _install_attention_alignment(self) -> None:
+        """Realign 1x1 Wan attention inputs before the first encode or decode."""
+        install_wan_attention_sdpa_alignment(self)
+
     def encode(self, x: torch.Tensor, return_dict: bool = True):
         with self._execution_context():
             return super().encode(x, return_dict=return_dict)
@@ -56,6 +63,7 @@ class OmniAutoencoderKLWan(AutoencoderKLWan):
     def _encode(self, x: torch.Tensor):
         # Keep the parent's tiling dispatch and patchified tile coordinates.
         # Only the untiled, supported inference schedule uses preallocation.
+        self._install_attention_alignment()
         if not is_encoder_installed(self):
             return super()._encode(x)
         if can_encode_frames(self, x):
@@ -76,6 +84,7 @@ class OmniAutoencoderKLWan(AutoencoderKLWan):
 
     def _decode(self, z: torch.Tensor, return_dict: bool = True):
         """Decode one latent batch, preserving the parent Diffusers contract."""
+        self._install_attention_alignment()
         _, _, _, height, width = z.shape
         tile_latent_min_height = self.tile_sample_min_height // self.spatial_compression_ratio
         tile_latent_min_width = self.tile_sample_min_width // self.spatial_compression_ratio
@@ -191,6 +200,7 @@ class OmniAutoencoderKLWan(AutoencoderKLWan):
 
     def _decode_with_chunks(self, z: torch.Tensor, *, on_chunk: DecodedChunkConsumer) -> None:
         """Run the temporal streaming primitive without API or hook handling."""
+        self._install_attention_alignment()
         distributed_enabled = False
         if hasattr(self, "is_distributed_enabled"):
             distributed_enabled = self.is_distributed_enabled()
@@ -217,6 +227,24 @@ class DistributedAutoencoderKLWan(OmniAutoencoderKLWan, DistributedVaeMixin):
         model = super().from_pretrained(*args, **kwargs)
         model.init_distributed()
         return model
+
+    def retain_stage_components(self, *, encode: bool) -> None:
+        """Prune the unused Wan half before device placement/offload discovery.
+
+        Diffusers 0.40 caches encoder/decoder convolution counts separately;
+        both encode and decode call clear_cache, but neither executes the other
+        half. Keep the public attributes and zero only the removed cache count.
+        This reduces resident weights, NOT from_pretrained's peak host memory:
+        the ordinary checkpoint loader still loads both halves first.
+        """
+        removed = "decoder" if encode else "encoder"
+        projection = "post_quant_conv" if encode else "quant_conv"
+        if not isinstance(getattr(self, "_cached_conv_counts", None), dict):
+            raise RuntimeError("Wan stage VAE pruning requires Diffusers' cached encoder/decoder conv counts.")
+        setattr(self, removed, None)
+        setattr(self, projection, None)
+        self._cached_conv_counts[removed] = 0
+        self.clear_cache()
 
     def tile_split(self, z: torch.Tensor) -> tuple[list[TileTask], GridSpec]:
         _, _, num_frames, height, width = z.shape
@@ -466,6 +494,31 @@ class DistributedAutoencoderKLWan(OmniAutoencoderKLWan, DistributedVaeMixin):
             return False
         return True
 
+    def _exceeds_tile(self, z: torch.Tensor) -> bool:
+        tile_latent_min_height = self.tile_sample_min_height // self.spatial_compression_ratio
+        tile_latent_min_width = self.tile_sample_min_width // self.spatial_compression_ratio
+        return z.shape[-1] > tile_latent_min_width or z.shape[-2] > tile_latent_min_height
+
+    def _decode(self, z: torch.Tensor, return_dict: bool = True):
+        """Run the spatially sharded decode on the un-tiled path; it decodes the full frame."""
+        # A directly constructed VAE has no distributed state; decode it like the parent does.
+        if getattr(self, "distributed_executor", None) is not None and self._spatial_shard_decode_split_dim():
+            if self._spatial_shard_decode_enabled(z):
+                split_dim = self._spatial_shard_decode_split_dim()
+                assert split_dim is not None
+                logger.debug("Decode running with Wan VAE spatial_shard_%s mode (un-tiled)", split_dim)
+                return wan_spatial_shard.spatial_shard_decode(
+                    self,
+                    z,
+                    group=self.distributed_executor.group,
+                    return_dict=return_dict,
+                    split_dim=split_dim,
+                )
+            # A partial VAE group cannot shard; keep the tile-parallel fallback even without native tiling.
+            if self.is_distributed_enabled() and self._exceeds_tile(z):
+                return self._tile_parallel_decode(z, return_dict=return_dict)
+        return super()._decode(z, return_dict=return_dict)
+
     def tiled_decode(self, z: torch.Tensor, return_dict: bool = True):
         if not self.is_distributed_enabled():
             return super().tiled_decode(z, return_dict=return_dict)
@@ -482,7 +535,9 @@ class DistributedAutoencoderKLWan(OmniAutoencoderKLWan, DistributedVaeMixin):
                 return_dict=return_dict,
                 split_dim=split_dim,
             )
+        return self._tile_parallel_decode(z, return_dict=return_dict)
 
+    def _tile_parallel_decode(self, z: torch.Tensor, return_dict: bool = True):
         logger.debug("Decode running with distributed executor")
         result = self.distributed_executor.execute(
             z,
@@ -494,6 +549,13 @@ class DistributedAutoencoderKLWan(OmniAutoencoderKLWan, DistributedVaeMixin):
 
         return DecoderOutput(sample=result)
 
+    def _decode_with_chunks(self, z: torch.Tensor, *, on_chunk: DecodedChunkConsumer) -> None:
+        """Stream spatial-shard decode before the native-tiling check; it decodes the full frame."""
+        if getattr(self, "distributed_executor", None) is not None and self._spatial_shard_decode_enabled(z):
+            self._spatial_shard_decode_with_chunks(z, on_chunk=on_chunk)
+            return
+        super()._decode_with_chunks(z, on_chunk=on_chunk)
+
     def _tiled_decode_with_chunks(self, z: torch.Tensor, *, on_chunk: DecodedChunkConsumer) -> None:
         """Decode tiled latents and deliver temporal chunks to ``on_chunk``."""
         if not self.is_distributed_enabled():
@@ -502,7 +564,9 @@ class DistributedAutoencoderKLWan(OmniAutoencoderKLWan, DistributedVaeMixin):
         spatial_shard_enabled = self._spatial_shard_decode_enabled(z)
         if not spatial_shard_enabled:
             raise ValueError("Wan chunk callbacks require spatial-shard decode when tiling is enabled")
+        self._spatial_shard_decode_with_chunks(z, on_chunk=on_chunk)
 
+    def _spatial_shard_decode_with_chunks(self, z: torch.Tensor, *, on_chunk: DecodedChunkConsumer) -> None:
         split_dim = self._spatial_shard_decode_split_dim()
         assert split_dim is not None
         logger.debug("Decode running with Wan VAE spatial_shard_%s mode", split_dim)
@@ -529,6 +593,12 @@ class DistributedAutoencoderKLWan(OmniAutoencoderKLWan, DistributedVaeMixin):
         result = self.distributed_executor.execute(
             x,
             DistributedOperator(
+                split=lambda x: wan_encode_split.rank_split(self, x),
+                exec=self.encode_tile_exec,
+                merge=wan_encode_split.rank_merge,
+            )
+            if wan_encode_split.encode_split_mode() == "rank"
+            else DistributedOperator(
                 split=self.encode_tile_split,
                 exec=self.encode_tile_exec,
                 merge=self.encode_tile_merge,

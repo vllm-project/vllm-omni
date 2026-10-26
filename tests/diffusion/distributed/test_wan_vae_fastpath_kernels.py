@@ -18,31 +18,45 @@ from diffusers.models.autoencoders.autoencoder_kl_wan import (
 )
 from torch import nn
 from torch.nn.attention import SDPBackend, sdpa_kernel
+from vllm.triton_utils import tl, triton
 
 from tests.diffusion.distributed.wan_vae_fastpath_helpers import (  # noqa: F401
     original_wan_rms_norm,
     unpatched_wan_rms_norm,
 )
-from tests.helpers.mark import hardware_test
+from tests.helpers.mark import hardware_marks, hardware_test
 from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath import forwards as fp
 from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath import (
     install_wan_vae_fastpath,
 )
 from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath import triton_data_movement as dm
-from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath import triton_rms_norm as rn
 from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath import triton_rms_norm_cl as cl
 from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath import triton_upsample as up
+from vllm_omni.diffusion.layers import vae_norm_epilogue as rn
+
+# The kernels run on CUDA and XPU (wan_vae_fastpath._utils.KERNEL_DEVICE_TYPES).
+DEVICE = "xpu" if hasattr(torch, "xpu") and torch.xpu.is_available() else "cuda"
 
 pytestmark = [
     pytest.mark.usefixtures("unpatched_wan_rms_norm"),
     pytest.mark.core_model,
-    pytest.mark.cuda,
+    *hardware_marks(res={"cuda": "L4"}, num_cards=1),
     pytest.mark.diffusion,
-    pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
+    pytest.mark.skipif(DEVICE == "cuda" and not torch.cuda.is_available(), reason="CUDA or XPU required"),
 ]
 
 LOW_PRECISION = [torch.bfloat16, torch.float16]
+# oneDNN adds a convolution's bias inside its accumulator, so the lossless level never
+# defers it on XPU (forwards._may_defer_conv_bias); test_xpu_lossless_keeps_conv_bias_in_the_conv
+# covers that side.
+_LOSSLESS_DEFERS_CONV_BIAS = pytest.mark.skipif(
+    DEVICE == "xpu", reason="lossless keeps the conv bias inside the convolution on XPU"
+)
 ALL_DTYPES = [torch.bfloat16, torch.float16, torch.float32]
+# Intel CI runs only the tests marked _XPU_CI (under a minute on one B60): enough to show
+# that the fast path is bit-exact on XPU, including the XPU-specific divide and conv-bias
+# rules. Every test still runs on XPU when invoked directly.
+_XPU_CI = hardware_test(res={"xpu": "B60"}, num_cards=1)
 # Cosmos3 720p decoder stages, spatially scaled down so the suite stays fast.
 NORM_SHAPES = [
     (1, 1024, 1, 45, 80),
@@ -75,10 +89,44 @@ def _reference_rms_norm(norm: WanRMS_norm, x: torch.Tensor) -> torch.Tensor:
 
 
 def _make_norm(channels: int, dtype: torch.dtype, images: bool = False) -> WanRMS_norm:
-    norm = WanRMS_norm(channels, images=images).to(device="cuda", dtype=dtype)
+    norm = WanRMS_norm(channels, images=images).to(device=DEVICE, dtype=dtype)
     with torch.no_grad():
         norm.gamma.copy_(torch.randn_like(norm.gamma) * 0.5 + 1.0)
     return norm
+
+
+@triton.jit
+def _div_rn_kernel(X, Y, OUT, n, BLOCK: tl.constexpr):  # noqa: N803
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < n
+    x = tl.load(X + offs, mask=mask, other=0.0)
+    y = tl.load(Y + offs, mask=mask, other=1.0)
+    tl.store(OUT + offs, rn.div_rn(x, y), mask=mask)
+
+
+@_XPU_CI
+@torch.no_grad()
+def test_div_rn_matches_aten_fp32_division() -> None:
+    """Every bit-exact epilogue relies on ``rn.div_rn`` being IEEE round-to-nearest.
+
+    triton-xpu 3.8 lowers ``tl.math.div_rn`` to an approximate divide on XPU, so this
+    pins the helper itself rather than leaving it to the downstream norm tests.
+    """
+    torch.manual_seed(0)
+    n = 1 << 20
+    x = torch.randn(n, device=DEVICE)
+    y = torch.rand(n, device=DEVICE) * 30 + 0.5
+    special = torch.tensor(
+        [0.0, -0.0, 1e-45, -1e-45, 1e-38, 3e38, float("inf"), -float("inf"), 1.0, 7.0, 1e-30], device=DEVICE
+    )
+    x[: special.numel() ** 2] = special.repeat_interleave(special.numel())
+    y[: special.numel() ** 2] = special.repeat(special.numel())
+    out = torch.empty_like(x)
+    _div_rn_kernel[(triton.cdiv(n, 1024),)](x, y, out, n, BLOCK=1024)
+    expected = x / y
+    nan = torch.isnan(expected)
+    assert torch.equal(torch.isnan(out), nan)
+    assert _bits_equal(out[~nan], expected[~nan])
 
 
 # --------------------------------------------------------------------------- #
@@ -92,7 +140,7 @@ def _make_norm(channels: int, dtype: torch.dtype, images: bool = False) -> WanRM
 def test_vector_norm_from_low_precision_matches_fp32_normalize_denominator(dtype: torch.dtype, shape) -> None:
     """The fast path relies on ATen running the same reduction for both inputs."""
     torch.manual_seed(0)
-    x = torch.randn(shape, device="cuda").to(dtype)
+    x = torch.randn(shape, device=DEVICE).to(dtype)
     expected = x.float().norm(2, dim=1, keepdim=True)
     actual = torch.linalg.vector_norm(x, dim=1, keepdim=True, dtype=torch.float32)
     assert torch.equal(actual, expected)
@@ -102,6 +150,7 @@ def test_vector_norm_from_low_precision_matches_fp32_normalize_denominator(dtype
     assert torch.equal(actual, expected)
 
 
+@_XPU_CI
 @torch.no_grad()
 @pytest.mark.parametrize("dtype", ALL_DTYPES)
 @pytest.mark.parametrize("shape", NORM_SHAPES)
@@ -110,10 +159,10 @@ def test_vector_norm_from_low_precision_matches_fp32_normalize_denominator(dtype
 def test_rms_norm_fastpath_is_bitwise_exact(dtype: torch.dtype, shape, layout: str, autocast: bool) -> None:
     torch.manual_seed(0)
     norm = _make_norm(shape[1], dtype)
-    x = _with_negative_zeros(torch.randn(shape, device="cuda").to(dtype))
+    x = _with_negative_zeros(torch.randn(shape, device=DEVICE).to(dtype))
     if layout == "frame_major":
         x = x.permute(0, 2, 1, 3, 4).contiguous().permute(0, 2, 1, 3, 4)
-    with torch.autocast("cuda", dtype=dtype if dtype is not torch.float32 else torch.bfloat16, enabled=autocast):
+    with torch.autocast(DEVICE, dtype=dtype if dtype is not torch.float32 else torch.bfloat16, enabled=autocast):
         expected = _reference_rms_norm(norm, x)
         actual = fp.rms_norm_fastpath(norm, x)
     assert actual is not None
@@ -127,21 +176,55 @@ def test_rms_norm_fastpath_is_bitwise_exact(dtype: torch.dtype, shape, layout: s
 def test_rms_norm_fastpath_handles_attention_block_4d_input(dtype: torch.dtype) -> None:
     torch.manual_seed(0)
     norm = _make_norm(1024, dtype, images=True)
-    x = torch.randn(2, 1024, 45, 80, device="cuda").to(dtype)
+    x = torch.randn(2, 1024, 45, 80, device=DEVICE).to(dtype)
     expected = _reference_rms_norm(norm, x)
     actual = fp.rms_norm_fastpath(norm, x)
     assert actual is not None and _bits_equal(actual, expected)
 
 
 @torch.no_grad()
+@pytest.mark.parametrize("dtype", ALL_DTYPES)
+@pytest.mark.parametrize("layout", ["contiguous", "frame_major", "attention_4d"])
+@pytest.mark.parametrize("silu", [False, True])
+@pytest.mark.parametrize("decline_kernel", [False, True])
+def test_shared_norm_preserves_pending_bias_and_fallback(monkeypatch, dtype, layout, silu, decline_kernel):
+    """Wan's deferred conv bias must be added exactly once through the shared helper."""
+    torch.manual_seed(7)
+    images = layout == "attention_4d"
+    shape = (2, 32, 7, 9) if images else (1, 32, 3, 7, 9)
+    norm = _make_norm(32, dtype, images=images)
+    x = torch.randn(shape, device=DEVICE, dtype=dtype)
+    if layout == "frame_major":
+        x = x.permute(0, 2, 1, 3, 4).contiguous().permute(0, 2, 1, 3, 4)
+    bias = torch.randn(32, device=DEVICE, dtype=dtype) * 0.1
+    expected = _reference_rms_norm(norm, x + bias.view(1, -1, *([1] * (x.dim() - 2))))
+    if silu:
+        expected = F.silu(expected)
+
+    if decline_kernel:
+        monkeypatch.setattr(rn, "rms_norm_scale", lambda *args, **kwargs: None)
+    elif DEVICE == "xpu" and silu and dtype is torch.float32:
+        # Lossless never fuses an fp32 SiLU: fused_silu_dtypes only holds the bf16/fp16 that pass
+        # the exhaustive silu_epilogue_is_exact check, and Triton-XPU's fp32 SiLU differs from ATen's.
+        pytest.skip("Triton-XPU's fp32 SiLU is not bitwise ATen's; never fused at the lossless level")
+    actual = fp.rms_norm_fastpath(norm, x, silu=silu, bias=bias)
+
+    assert actual is not None
+    assert actual.dtype == expected.dtype
+    assert actual.stride() == expected.stride()
+    assert _bits_equal(actual, expected)
+
+
+@_XPU_CI
+@torch.no_grad()
 @pytest.mark.parametrize("dtype", LOW_PRECISION)
 def test_fused_silu_epilogue_matches_silu_of_reference(dtype: torch.dtype) -> None:
-    device = torch.device("cuda")
+    device = torch.device(DEVICE)
     if not rn.silu_epilogue_is_exact(device, dtype):
         pytest.skip(f"fused SiLU epilogue is not bit-exact for {dtype} on this toolkit; fusion stays disabled")
     torch.manual_seed(0)
     norm = _make_norm(256, dtype)
-    x = _with_negative_zeros(torch.randn(1, 256, 4, 90, 160, device="cuda").to(dtype))
+    x = _with_negative_zeros(torch.randn(1, 256, 4, 90, 160, device=DEVICE).to(dtype))
     expected = F.silu(_reference_rms_norm(norm, x))
     actual = fp.rms_norm_fastpath(norm, x, silu=True)
     assert actual is not None and _bits_equal(actual, expected)
@@ -155,7 +238,7 @@ def test_channels_last_rms_norm_is_close_and_keeps_layout(dtype: torch.dtype, sh
     torch.manual_seed(0)
     norm = _make_norm(shape[1], dtype, images=len(shape) == 4)
     memory_format = torch.channels_last_3d if len(shape) == 5 else torch.channels_last
-    x = torch.randn(shape, device="cuda").to(dtype).contiguous(memory_format=memory_format)
+    x = torch.randn(shape, device=DEVICE).to(dtype).contiguous(memory_format=memory_format)
     expected = _reference_rms_norm(norm, x)
     if silu:
         expected = F.silu(expected)
@@ -170,8 +253,8 @@ def test_channels_last_rms_norm_is_close_and_keeps_layout(dtype: torch.dtype, sh
         torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
     # Declines channels-first input and too many channels.
     assert cl.rms_norm_channels_last(x.contiguous(), norm.gamma, norm.scale) is None
-    wide = torch.randn(1, 2048, 1, 4, 4, device="cuda", dtype=dtype).contiguous(memory_format=torch.channels_last_3d)
-    assert cl.rms_norm_channels_last(wide, torch.ones(2048, device="cuda", dtype=dtype), 1.0) is None
+    wide = torch.randn(1, 2048, 1, 4, 4, device=DEVICE, dtype=dtype).contiguous(memory_format=torch.channels_last_3d)
+    assert cl.rms_norm_channels_last(wide, torch.ones(2048, device=DEVICE, dtype=dtype), 1.0) is None
 
 
 @torch.no_grad()
@@ -181,8 +264,8 @@ def test_channels_last_rms_norm_absorbs_conv_bias(dtype: torch.dtype, silu: bool
     torch.manual_seed(0)
     shape = (1, 256, 4, 90, 160)
     norm = _make_norm(shape[1], dtype)
-    x = torch.randn(shape, device="cuda").to(dtype).contiguous(memory_format=torch.channels_last_3d)
-    bias = (torch.randn(shape[1], device="cuda") * 0.1).to(dtype)
+    x = torch.randn(shape, device=DEVICE).to(dtype).contiguous(memory_format=torch.channels_last_3d)
+    bias = (torch.randn(shape[1], device=DEVICE) * 0.1).to(dtype)
     # Reference: ATen adds the conv bias in place (one rounding) before the norm.
     expected = _reference_rms_norm(norm, x + bias.view(1, -1, 1, 1, 1))
     if silu:
@@ -204,17 +287,17 @@ def test_channels_last_rms_norm_absorbs_conv_bias(dtype: torch.dtype, silu: bool
 def test_channels_last_residual_block_folds_conv1_bias(dtype: torch.dtype, monkeypatch) -> None:
     """The conv1 bias is left un-added and consumed by norm2's kernel (rounded like ATen); output stays close."""
     torch.manual_seed(0)
-    block = WanResidualBlock(64, 64, dropout=0.0).eval().to(device="cuda", dtype=dtype)
+    block = WanResidualBlock(64, 64, dropout=0.0).eval().to(device=DEVICE, dtype=dtype)
     with torch.no_grad():
         for conv in (block.conv1, block.conv2):
             conv.bias.copy_(torch.randn_like(conv.bias) * 0.1)
-    x = torch.randn(1, 64, 4, 24, 40, device="cuda", dtype=dtype)
+    x = torch.randn(1, 64, 4, 24, 40, device=DEVICE, dtype=dtype)
     expected = WanResidualBlock.forward(block, x, feat_cache=[None, None], feat_idx=[0])
 
     for conv in (block.conv1, block.conv2):  # as the installer does: conv weights only
         conv.to(memory_format=torch.channels_last_3d)
     cfg = fp.FastPathConfig(channels_last=True)
-    for module in (block, block.norm1, block.norm2):
+    for module in (block, block.norm1, block.norm2, block.conv1, block.conv2):  # the installer binds all five
         setattr(module, fp.CFG_ATTR, cfg)
     seen: list[torch.Tensor | None] = []
     original = fp.rms_norm_fastpath
@@ -236,15 +319,15 @@ def test_channels_last_residual_block_folds_conv1_bias(dtype: torch.dtype, monke
 
 
 def test_rms_norm_scale_declines_bad_operands() -> None:
-    x = torch.randn(1, 8, 16, device="cuda", dtype=torch.bfloat16)
-    denom = torch.ones(1, 1, 16, device="cuda")
-    gamma = torch.ones(8, device="cuda", dtype=torch.bfloat16)
+    x = torch.randn(1, 8, 16, device=DEVICE, dtype=torch.bfloat16)
+    denom = torch.ones(1, 1, 16, device=DEVICE)
+    gamma = torch.ones(8, device=DEVICE, dtype=torch.bfloat16)
     assert rn.rms_norm_scale(x, denom, gamma, 1.0) is not None
     assert rn.rms_norm_scale(x.cpu(), denom.cpu(), gamma.cpu(), 1.0) is None
     assert rn.rms_norm_scale(x, denom.to(torch.bfloat16), gamma, 1.0) is None
     assert rn.rms_norm_scale(x, denom, gamma.float(), 1.0) is None
     assert rn.rms_norm_scale(x.transpose(1, 2), denom, gamma, 1.0) is None
-    assert rn.rms_norm_scale(x, torch.ones(1, 1, 8, device="cuda"), gamma, 1.0) is None
+    assert rn.rms_norm_scale(x, torch.ones(1, 1, 8, device=DEVICE), gamma, 1.0) is None
 
 
 # --------------------------------------------------------------------------- #
@@ -253,7 +336,7 @@ def test_rms_norm_scale_declines_bad_operands() -> None:
 
 
 def _dense_5d(shape, dtype: torch.dtype, channels_last: bool) -> torch.Tensor:
-    tensor = torch.randn(shape, device="cuda", dtype=dtype)
+    tensor = torch.randn(shape, device=DEVICE, dtype=dtype)
     if channels_last:
         return tensor.contiguous(memory_format=torch.channels_last_3d)
     return tensor.contiguous()
@@ -292,7 +375,7 @@ def test_cat_pad_5d_is_bitwise_and_layout_exact(
     torch.manual_seed(0)
     channels_last = layout == "channels_last"
     if layout == "frame_major":
-        x = torch.randn((1, frames, channels, height, width), device="cuda", dtype=dtype).permute(0, 2, 1, 3, 4)
+        x = torch.randn((1, frames, channels, height, width), device=DEVICE, dtype=dtype).permute(0, 2, 1, 3, 4)
     else:
         x = _dense_5d((1, channels, frames, height, width), dtype, channels_last)
     cache = None
@@ -342,9 +425,9 @@ def test_cat_pad_5d_assembles_channels_last_output_from_channels_first_input(
     torch.manual_seed(0)
     padding = (1, 1, 1, 1, 2, 0)
     if layout == "frame_major":
-        x = torch.randn((1, frames, channels, height, width), device="cuda", dtype=dtype).permute(0, 2, 1, 3, 4)
+        x = torch.randn((1, frames, channels, height, width), device=DEVICE, dtype=dtype).permute(0, 2, 1, 3, 4)
     else:
-        x = torch.randn((1, channels, frames, height, width), device="cuda", dtype=dtype)
+        x = torch.randn((1, channels, frames, height, width), device=DEVICE, dtype=dtype)
     cache = None
     if cache_frames:
         cache = _dense_5d((1, channels, cache_frames, height, width), dtype, cache_layout == "channels_last")
@@ -369,12 +452,12 @@ def test_cat_pad_5d_assembles_channels_last_output_from_channels_first_input(
 @pytest.mark.parametrize("layout", ["contiguous", "frame_major"])
 def test_conv_out_channels_last_verdict_is_recorded_and_exact(layout: str) -> None:
     torch.manual_seed(0)
-    conv = WanCausalConv3d(64, 12, 3, padding=1).to(device="cuda", dtype=torch.bfloat16)
+    conv = WanCausalConv3d(64, 12, 3, padding=1).to(device=DEVICE, dtype=torch.bfloat16)
     if layout == "frame_major":
-        chunk = torch.randn(1, 4, 64, 24, 40, device="cuda", dtype=torch.bfloat16).permute(0, 2, 1, 3, 4)
+        chunk = torch.randn(1, 4, 64, 24, 40, device=DEVICE, dtype=torch.bfloat16).permute(0, 2, 1, 3, 4)
     else:
-        chunk = torch.randn(1, 64, 4, 24, 40, device="cuda", dtype=torch.bfloat16)
-    cache = torch.randn(1, 64, 2, 24, 40, device="cuda", dtype=torch.bfloat16)
+        chunk = torch.randn(1, 64, 4, 24, 40, device=DEVICE, dtype=torch.bfloat16)
+    cache = torch.randn(1, 64, 2, 24, 40, device=DEVICE, dtype=torch.bfloat16)
     reference = WanCausalConv3d.forward(conv, chunk, cache)
     fast_cache = [cache.clone()]
     out = fp._run_conv_out_channels_last(conv, chunk, fast_cache, 0)
@@ -409,7 +492,7 @@ def test_cat_time_5d_is_bitwise_and_layout_exact(
     torch.manual_seed(0)
     channels_last = layout == "channels_last"
     if layout == "frame_major":
-        x = torch.randn((1, frames, channels, height, width), device="cuda", dtype=dtype).permute(0, 2, 1, 3, 4)
+        x = torch.randn((1, frames, channels, height, width), device=DEVICE, dtype=dtype).permute(0, 2, 1, 3, 4)
     else:
         x = _dense_5d((1, channels, frames, height, width), dtype, channels_last)
     cache = _dense_5d((1, channels, cache_frames, height, width), dtype, channels_last) if cache_frames else None
@@ -440,8 +523,8 @@ def test_cat_time_5d_is_bitwise_and_layout_exact(
 def test_input_assembly_keeps_aten_layout_for_1x1_activations(dtype: torch.dtype, cache_frames: int) -> None:
     """A contiguous ``(b, c, 1, 1, 1)`` tensor has ``stride(1) == 1`` but ATen lays it out channels-first."""
     torch.manual_seed(0)
-    x = torch.randn(1, 16, 1, 1, 1, device="cuda", dtype=dtype)
-    cache = torch.randn(1, 16, cache_frames, 1, 1, device="cuda", dtype=dtype) if cache_frames else None
+    x = torch.randn(1, 16, 1, 1, 1, device=DEVICE, dtype=dtype)
+    cache = torch.randn(1, 16, cache_frames, 1, 1, device=DEVICE, dtype=dtype) if cache_frames else None
     padding = (1, 1, 1, 1, 2, 0)
     reference = _reference_cat_pad(x, cache, padding)
     pair = dm.cat_pad_5d(x, cache, padding, keep_cache_frames=CACHE_T)
@@ -491,12 +574,12 @@ def test_cat_time_5d_exceeds_grid_y_limit(monkeypatch: pytest.MonkeyPatch, cache
 @torch.no_grad()
 def test_cached_conv_spatial_padding_verdict_is_recorded_and_exact() -> None:
     torch.manual_seed(0)
-    conv = WanCausalConv3d(64, 64, 3, padding=1).to(device="cuda", dtype=torch.bfloat16)
+    conv = WanCausalConv3d(64, 64, 3, padding=1).to(device=DEVICE, dtype=torch.bfloat16)
     for layout in (torch.contiguous_format, torch.channels_last_3d):
         if layout is torch.channels_last_3d:
             conv.to(memory_format=torch.channels_last_3d)
-        chunk = torch.randn(1, 64, 4, 24, 40, device="cuda", dtype=torch.bfloat16).contiguous(memory_format=layout)
-        cache = torch.randn(1, 64, 2, 24, 40, device="cuda", dtype=torch.bfloat16).contiguous(memory_format=layout)
+        chunk = torch.randn(1, 64, 4, 24, 40, device=DEVICE, dtype=torch.bfloat16).contiguous(memory_format=layout)
+        cache = torch.randn(1, 64, 2, 24, 40, device=DEVICE, dtype=torch.bfloat16).contiguous(memory_format=layout)
         reference_cache = [cache.clone()]
         reference = WanCausalConv3d.forward(conv, chunk, cache)  # upstream pre-padded path
         fast_cache = [cache.clone()]
@@ -517,11 +600,11 @@ def test_cached_conv_spatial_padding_verdict_is_recorded_and_exact() -> None:
 def test_causal_conv_forward_spatial_padding_is_exact(dtype: torch.dtype, layout, history: int) -> None:
     """Normally called (e.g. hooked) convolutions use the verified cuDNN padding path too."""
     torch.manual_seed(0)
-    conv = WanCausalConv3d(64, 64, 3, padding=1).to(device="cuda", dtype=dtype)
+    conv = WanCausalConv3d(64, 64, 3, padding=1).to(device=DEVICE, dtype=dtype)
     conv.to(memory_format=layout)
-    x = torch.randn(1, 64, 4, 24, 40, device="cuda", dtype=dtype).contiguous(memory_format=layout)
+    x = torch.randn(1, 64, 4, 24, 40, device=DEVICE, dtype=dtype).contiguous(memory_format=layout)
     cache = (
-        torch.randn(1, 64, history, 24, 40, device="cuda", dtype=dtype).contiguous(memory_format=layout)
+        torch.randn(1, 64, history, 24, 40, device=DEVICE, dtype=dtype).contiguous(memory_format=layout)
         if history
         else None
     )
@@ -545,8 +628,8 @@ def test_conv_verdicts_hold_after_degenerate_first_call(dtype: torch.dtype, path
     the first call alone returned different bytes for the second one.
     """
     torch.manual_seed(0)
-    conv = WanCausalConv3d(160, 160, 3, padding=1).to(device="cuda", dtype=dtype)
-    x = torch.randn(1, 160, 4, 8, 8, device="cuda", dtype=dtype)
+    conv = WanCausalConv3d(160, 160, 3, padding=1).to(device=DEVICE, dtype=dtype)
+    x = torch.randn(1, 160, 4, 8, 8, device=DEVICE, dtype=dtype)
     trained = conv.weight.clone()
     if degenerate == "weight":
         conv.weight.zero_()
@@ -602,14 +685,14 @@ def test_dup_up3d_add_is_bitwise_and_layout_exact(
     source = _dense_5d((1, in_channels, frames, height, width), dtype, main_layout == "channels_last")
     if main_layout == "frame_major":
         # The previous block's output is frame-major too in the lossless level.
-        source = torch.randn((1, frames, in_channels, height, width), device="cuda", dtype=dtype)
+        source = torch.randn((1, frames, in_channels, height, width), device=DEVICE, dtype=dtype)
         source = source.permute(0, 2, 1, 3, 4)
     out_frames = frames * factor_temporal - (factor_temporal - 1 if drop_first else 0)
     shape = (1, out_channels, out_frames, height * factor_spatial, width * factor_spatial)
     if main_layout == "channels_last":
         main = _dense_5d(shape, dtype, True)
     elif main_layout == "frame_major":
-        main = torch.randn((shape[0], shape[2], shape[1], shape[3], shape[4]), device="cuda", dtype=dtype)
+        main = torch.randn((shape[0], shape[2], shape[1], shape[3], shape[4]), device=DEVICE, dtype=dtype)
         main = main.permute(0, 2, 1, 3, 4)
     else:
         main = _dense_5d(shape, dtype, False)
@@ -623,7 +706,7 @@ def test_dup_up3d_add_is_bitwise_and_layout_exact(
     bias = None
     biased_main = main
     if with_bias:
-        bias = (torch.randn(out_channels, device="cuda") * 0.1).to(dtype)
+        bias = (torch.randn(out_channels, device=DEVICE) * 0.1).to(dtype)
         biased_main = main.clone()
         biased_main.add_(bias.view(1, -1, 1, 1, 1))  # ATen's conv bias add
     reference = biased_main + shortcut
@@ -635,15 +718,15 @@ def test_dup_up3d_add_is_bitwise_and_layout_exact(
 
 
 def test_dup_up3d_add_declines_unsupported_cases() -> None:
-    main = torch.randn(1, 8, 2, 10, 14, device="cuda", dtype=torch.bfloat16)
-    source = torch.randn(1, 32, 2, 5, 7, device="cuda", dtype=torch.bfloat16)
+    main = torch.randn(1, 8, 2, 10, 14, device=DEVICE, dtype=torch.bfloat16)
+    source = torch.randn(1, 32, 2, 5, 7, device=DEVICE, dtype=torch.bfloat16)
     # repeats (1) below the spatial factor: the source channel would change along a row.
     assert dm.dup_up3d_add(main, source, 1, 2, 1, False) is None
-    source = torch.randn(1, 8, 2, 5, 7, device="cuda", dtype=torch.bfloat16)
+    source = torch.randn(1, 8, 2, 5, 7, device=DEVICE, dtype=torch.bfloat16)
     assert dm.dup_up3d_add(main, source, 1, 2, 4, False) is not None
     # Mixed layouts, wrong bias shape, wrong main shape.
     assert dm.dup_up3d_add(main.contiguous(memory_format=torch.channels_last_3d), source, 1, 2, 4, False) is None
-    assert dm.dup_up3d_add(main, source, 1, 2, 4, False, main_bias=torch.ones(7, device="cuda")) is None
+    assert dm.dup_up3d_add(main, source, 1, 2, 4, False, main_bias=torch.ones(7, device=DEVICE)) is None
     assert dm.dup_up3d_add(main[:, :, :1], source, 1, 2, 4, False) is None
 
 
@@ -670,13 +753,13 @@ def test_upsample_nearest_2x_is_bitwise_and_layout_exact(dtype, layout, frames, 
     torch.manual_seed(0)
     if layout == "frame_major":
         # The strided ``(t, c, h, w)`` view ``WanResample`` hands the upsampler in the lossless level.
-        x = fp._merge_batch_and_frames(torch.randn((1, channels, frames, height, width), device="cuda", dtype=dtype))
+        x = fp._merge_batch_and_frames(torch.randn((1, channels, frames, height, width), device=DEVICE, dtype=dtype))
         assert frames == 1 or not x.is_contiguous()
     elif layout == "channels_last":
-        x = torch.randn((frames, channels, height, width), device="cuda", dtype=dtype)
+        x = torch.randn((frames, channels, height, width), device=DEVICE, dtype=dtype)
         x = x.contiguous(memory_format=torch.channels_last)
     else:
-        x = torch.randn((frames, channels, height, width), device="cuda", dtype=dtype)
+        x = torch.randn((frames, channels, height, width), device=DEVICE, dtype=dtype)
     for mode in ("nearest-exact", "nearest"):
         reference = F.interpolate(x, scale_factor=(2.0, 2.0), mode=mode)
         output = up.upsample_nearest_2x(x)
@@ -686,7 +769,7 @@ def test_upsample_nearest_2x_is_bitwise_and_layout_exact(dtype, layout, frames, 
 
 
 def test_upsample_nearest_2x_declines_unsupported_inputs() -> None:
-    x = torch.randn(2, 8, 6, 10, device="cuda", dtype=torch.bfloat16)
+    x = torch.randn(2, 8, 6, 10, device=DEVICE, dtype=torch.bfloat16)
     assert up.upsample_nearest_2x(x) is not None
     assert up.upsample_nearest_2x(x.cpu()) is None
     assert up.upsample_nearest_2x(x.unsqueeze(2)) is None
@@ -700,7 +783,7 @@ def test_upsample_nearest_2x_declines_unsupported_inputs() -> None:
 def test_upsample_nearest_2x_follows_aten_layout_for_ambiguous_strides(dtype: torch.dtype) -> None:
     """Channels-last contiguous strides that ATen treats as channels-first must not produce NHWC output."""
     torch.manual_seed(0)
-    frame = torch.randn(1, 16, 1, 6, 10, device="cuda", dtype=dtype).contiguous(memory_format=torch.channels_last_3d)
+    frame = torch.randn(1, 16, 1, 6, 10, device=DEVICE, dtype=dtype).contiguous(memory_format=torch.channels_last_3d)
     # Upstream's merge of one channels-last frame: the size-1 batch keeps a
     # non-canonical stride, and ``F.interpolate`` writes NCHW for it.
     merged = frame.permute(0, 2, 1, 3, 4).reshape(1, 16, 6, 10)
@@ -708,7 +791,7 @@ def test_upsample_nearest_2x_follows_aten_layout_for_ambiguous_strides(dtype: to
     assert F.interpolate(merged, scale_factor=(2.0, 2.0), mode="nearest-exact").is_contiguous()
     assert up.upsample_nearest_2x(merged) is None
 
-    single_pixels = torch.randn(3, 16, 1, 1, device="cuda", dtype=dtype)
+    single_pixels = torch.randn(3, 16, 1, 1, device=DEVICE, dtype=dtype)
     for x in (single_pixels, single_pixels.contiguous(memory_format=torch.channels_last)):
         reference = F.interpolate(x, scale_factor=(2.0, 2.0), mode="nearest-exact")
         output = up.upsample_nearest_2x(x)
@@ -721,7 +804,7 @@ def test_upsample_nearest_2x_follows_aten_layout_for_ambiguous_strides(dtype: to
 @pytest.mark.parametrize("dtype", ALL_DTYPES)
 def test_upsample_forward_matches_wan_upsample(dtype: torch.dtype) -> None:
     torch.manual_seed(0)
-    x = torch.randn(3, 64, 10, 14, device="cuda", dtype=dtype)
+    x = torch.randn(3, 64, 10, 14, device=DEVICE, dtype=dtype)
     for layout in (torch.contiguous_format, torch.channels_last):
         x = x.contiguous(memory_format=layout)
         module = WanUpsample(scale_factor=(2.0, 2.0), mode="nearest-exact")
@@ -734,15 +817,16 @@ def test_upsample_forward_matches_wan_upsample(dtype: torch.dtype) -> None:
         assert torch.equal(fp.upsample_forward(other, x), WanUpsample.forward(other, x))
 
 
+@_LOSSLESS_DEFERS_CONV_BIAS
 @torch.no_grad()
 @pytest.mark.parametrize("dtype", ALL_DTYPES)
 @pytest.mark.parametrize("mode", ["upsample2d", "upsample3d"])
 def test_resample_forward_can_leave_conv_bias_pending(dtype: torch.dtype, mode: str) -> None:
     torch.manual_seed(0)
-    resample = WanResample(32, mode=mode).eval().to(device="cuda", dtype=dtype)
+    resample = WanResample(32, mode=mode).eval().to(device=DEVICE, dtype=dtype)
     setattr(resample, fp.CFG_ATTR, fp.FastPathConfig())
-    x = torch.randn(1, 32, 2, 10, 14, device="cuda", dtype=dtype)
-    cache = [torch.randn(1, 32, 2, 10, 14, device="cuda", dtype=dtype)] if mode == "upsample3d" else [None]
+    x = torch.randn(1, 32, 2, 10, 14, device=DEVICE, dtype=dtype)
+    cache = [torch.randn(1, 32, 2, 10, 14, device=DEVICE, dtype=dtype)] if mode == "upsample3d" else [None]
     expected = WanResample.forward(
         resample, x, feat_cache=[c.clone() if c is not None else None for c in cache], feat_idx=[0]
     )
@@ -756,20 +840,21 @@ def test_resample_forward_can_leave_conv_bias_pending(dtype: torch.dtype, mode: 
     assert _bits_equal(plain, expected)
 
 
+@_LOSSLESS_DEFERS_CONV_BIAS
 @torch.no_grad()
 @pytest.mark.parametrize("dtype", LOW_PRECISION)
 @pytest.mark.parametrize("force_prepad", [False, True])
 def test_cached_conv_deferred_bias_matches_autocast(dtype: torch.dtype, force_prepad: bool, monkeypatch) -> None:
     """FP32 parameters and inputs must defer the bias in the convolution's output dtype."""
     torch.manual_seed(8)
-    conv = WanCausalConv3d(32, 32, 3, padding=1).cuda().eval()
+    conv = WanCausalConv3d(32, 32, 3, padding=1).to(DEVICE).eval()
     conv.bias.copy_(torch.randn_like(conv.bias))
     if force_prepad:
         monkeypatch.setattr(dm, "cat_time_5d", lambda *args, **kwargs: None)
     cache = [None]
-    with torch.autocast("cuda", dtype=dtype):
+    with torch.autocast(DEVICE, dtype=dtype):
         for _ in range(2):
-            x = torch.randn(1, 32, 2, 6, 10, device="cuda")
+            x = torch.randn(1, 32, 2, 6, 10, device=DEVICE)
             expected = conv(x, cache[0])
             out, bias = fp._run_cached_causal_conv(conv, x, cache, 0, return_bias=True)
             assert out.dtype == dtype and bias is not None and bias.dtype == dtype
@@ -778,19 +863,42 @@ def test_cached_conv_deferred_bias_matches_autocast(dtype: torch.dtype, force_pr
             assert _bits_equal(actual.contiguous(), expected.contiguous())
 
 
+@_XPU_CI
+@torch.no_grad()
+@pytest.mark.skipif(DEVICE != "xpu", reason="XPU only: oneDNN adds the conv bias inside the accumulator")
+@pytest.mark.parametrize("dtype", LOW_PRECISION)
+@pytest.mark.parametrize("force_prepad", [False, True])
+def test_xpu_lossless_keeps_conv_bias_in_the_conv(dtype: torch.dtype, force_prepad: bool, monkeypatch) -> None:
+    """A lossless cached conv asked for its bias keeps it in the convolution and returns ``None``."""
+    torch.manual_seed(8)
+    conv = WanCausalConv3d(32, 32, 3, padding=1).to(DEVICE).eval()
+    conv.bias.copy_(torch.randn_like(conv.bias))
+    setattr(conv, fp.CFG_ATTR, fp.FastPathConfig())
+    if force_prepad:
+        monkeypatch.setattr(dm, "cat_time_5d", lambda *args, **kwargs: None)
+    cache = [None]
+    with torch.autocast(DEVICE, dtype=dtype):
+        for _ in range(2):
+            x = torch.randn(1, 32, 2, 6, 10, device=DEVICE)
+            expected = conv(x, cache[0])
+            out, bias = fp._run_cached_causal_conv(conv, x, cache, 0, return_bias=True)
+            assert bias is None
+            assert _bits_equal(out.contiguous(), expected.contiguous())
+
+
 @torch.no_grad()
 @pytest.mark.parametrize("dtype", LOW_PRECISION)
 @pytest.mark.parametrize("channels_last", [False, True])
 def test_residual_block_deferred_bias_matches_autocast(dtype: torch.dtype, channels_last: bool) -> None:
     """Exercise conv1/conv2 and a non-identity shortcut with FP32 weights under autocast."""
     torch.manual_seed(8)
-    block = WanResidualBlock(32, 64, dropout=0.0).cuda().eval()
+    block = WanResidualBlock(32, 64, dropout=0.0).to(DEVICE).eval()
     for conv in (block.conv1, block.conv2, block.conv_shortcut):
         conv.bias.copy_(torch.randn_like(conv.bias))
         if channels_last:
             conv.to(memory_format=torch.channels_last_3d)
-    x = torch.randn(1, 32, 2, 6, 10, device="cuda")
-    with torch.autocast("cuda", dtype=dtype):
+    x = torch.randn(1, 32, 2, 6, 10, device=DEVICE)
+    with torch.autocast(DEVICE, dtype=dtype):
         expected = block(x, feat_cache=[None, None], feat_idx=[0])
         setattr(block, fp.CFG_ATTR, fp.FastPathConfig(channels_last=channels_last))
         actual = fp.residual_block_forward(block, x, feat_cache=[None, None], feat_idx=[0])
@@ -798,19 +906,20 @@ def test_residual_block_deferred_bias_matches_autocast(dtype: torch.dtype, chann
     assert _bits_equal(actual.contiguous(), expected.contiguous())
 
 
+@_LOSSLESS_DEFERS_CONV_BIAS
 @torch.no_grad()
 @pytest.mark.parametrize("dtype", LOW_PRECISION)
 @pytest.mark.parametrize("mode", ["upsample2d", "upsample3d"])
 def test_resample_deferred_bias_matches_autocast(dtype: torch.dtype, mode: str) -> None:
     """The upsampler's FP32 bias must be rounded before its deferred addition."""
     torch.manual_seed(8)
-    resample = WanResample(32, mode=mode).cuda().eval()
+    resample = WanResample(32, mode=mode).to(DEVICE).eval()
     resample.resample[1].bias.copy_(torch.randn_like(resample.resample[1].bias))
     reference_cache = [None]
     candidate_cache = [None]
-    with torch.autocast("cuda", dtype=dtype):
+    with torch.autocast(DEVICE, dtype=dtype):
         for _ in range(2):
-            x = torch.randn(1, 32, 1, 6, 10, device="cuda")
+            x = torch.randn(1, 32, 1, 6, 10, device=DEVICE)
             expected = resample(x, feat_cache=reference_cache, feat_idx=[0])
             out, bias = fp.resample_forward(resample, x, candidate_cache, [0], return_bias=True)
             assert out.dtype == dtype and bias is not None and bias.dtype == dtype
@@ -825,10 +934,10 @@ def test_resample_deferred_bias_matches_autocast(dtype: torch.dtype, mode: str) 
 def test_add_bias_residual_matches_aten_rounding(dtype: torch.dtype, with_bias_x: bool, with_bias_h: bool) -> None:
     torch.manual_seed(0)
     shape = (1, 256, 4, 45, 80)
-    x = torch.randn(shape, device="cuda").to(dtype)
-    h = torch.randn(shape, device="cuda").to(dtype)
-    bias_x = torch.randn(256, device="cuda").to(dtype) if with_bias_x else None
-    bias_h = torch.randn(256, device="cuda").to(dtype) if with_bias_h else None
+    x = torch.randn(shape, device=DEVICE).to(dtype)
+    h = torch.randn(shape, device=DEVICE).to(dtype)
+    bias_x = torch.randn(256, device=DEVICE).to(dtype) if with_bias_x else None
+    bias_h = torch.randn(256, device=DEVICE).to(dtype) if with_bias_h else None
     expected_x = x.clone()
     expected_h = h.clone()
     if bias_x is not None:
@@ -862,7 +971,7 @@ def test_cached_conv_chunk_loop_matches_reference_including_mixed_paths(
         conv = WanCausalConv3d(channels, 2 * channels, (3, 1, 1), padding=(1, 0, 0))
     else:
         conv = WanCausalConv3d(channels, channels, 3, padding=1)
-    conv = conv.to(device="cuda", dtype=torch.float32)
+    conv = conv.to(device=DEVICE, dtype=torch.float32)
     chunks = [_dense_5d((1, channels, 1, 10, 14), torch.float32, channels_last) for _ in range(4)]
 
     decline = lambda *a, **k: None  # noqa: E731
@@ -894,7 +1003,7 @@ def test_cached_conv_chunk_loop_matches_reference_including_mixed_paths(
 def _first_frame_test_conv(dtype: torch.dtype, **kwargs) -> WanCausalConv3d:
     options = dict(kernel_size=3, padding=1)
     options.update(kwargs)
-    conv = WanCausalConv3d(16, 32, **options).eval().to(device="cuda", dtype=dtype)
+    conv = WanCausalConv3d(16, 32, **options).eval().to(device=DEVICE, dtype=dtype)
     conv.to(memory_format=torch.channels_last_3d)
     setattr(conv, fp.CFG_ATTR, fp.FastPathConfig(channels_last=True))
     return conv
@@ -949,7 +1058,7 @@ def test_first_frame_conv2d_deferred_bias_matches_autocast(dtype, with_bias) -> 
         conv.register_parameter("bias", None)
     x = _dense_5d((1, 16, 1, 7, 11), torch.float32, True)
     cache = [None]
-    with torch.autocast("cuda", dtype=dtype):
+    with torch.autocast(DEVICE, dtype=dtype):
         expected = WanCausalConv3d.forward(conv, x)
         out, bias = fp._run_cached_causal_conv(conv, x, cache, 0, return_bias=True)
         assert out.dtype == expected.dtype == dtype
@@ -1041,12 +1150,13 @@ TINY_WAN21 = dict(base_dim=8, z_dim=4, dim_mult=[1, 2], num_res_blocks=1, temper
 
 def _build_pair(config: dict, dtype: torch.dtype):
     torch.manual_seed(0)
-    reference = AutoencoderKLWan(**config).eval().to(device="cuda", dtype=dtype)
-    candidate = AutoencoderKLWan(**config).eval().to(device="cuda", dtype=dtype)
+    reference = AutoencoderKLWan(**config).eval().to(device=DEVICE, dtype=dtype)
+    candidate = AutoencoderKLWan(**config).eval().to(device=DEVICE, dtype=dtype)
     candidate.load_state_dict(reference.state_dict())
     return reference, candidate
 
 
+@_XPU_CI
 @torch.no_grad()
 @pytest.mark.parametrize("config", [TINY_RESIDUAL, TINY_WAN21], ids=["residual_patch2", "wan21"])
 @pytest.mark.parametrize("dtype", ALL_DTYPES)
@@ -1056,9 +1166,9 @@ def test_lossless_decoder_is_bitwise_exact_on_cuda(config: dict, dtype: torch.dt
     report = install_wan_vae_fastpath(candidate, level="lossless")
     assert report.installed, report
     torch.manual_seed(1)
-    latents = torch.randn(1, config["z_dim"], frames, 6, 10, device="cuda").to(dtype)
+    latents = torch.randn(1, config["z_dim"], frames, 6, 10, device=DEVICE).to(dtype)
     autocast = dtype is not torch.float32
-    with torch.autocast("cuda", dtype=dtype, enabled=autocast):
+    with torch.autocast(DEVICE, dtype=dtype, enabled=autocast):
         expected = reference.decode(latents, return_dict=False)[0]
         actual = candidate.decode(latents, return_dict=False)[0]
     assert actual.stride() == expected.stride()
@@ -1086,14 +1196,14 @@ def test_lossless_decoder_is_bitwise_exact_for_channels_last_and_1x1_latents(
     assert report.installed, report
     torch.manual_seed(1)
     height, width = (1, 1) if latents_kind == "1x1" else (6, 10)
-    latents = torch.randn(batch, config["z_dim"], frames, height, width, device="cuda").to(dtype)
+    latents = torch.randn(batch, config["z_dim"], frames, height, width, device=DEVICE).to(dtype)
     if latents_kind == "channels_last_3d":
         latents = latents.contiguous(memory_format=torch.channels_last_3d)
     autocast = dtype is not torch.float32
     # For a single spatial position the (unpatched) attention block hands SDPA a
     # query with sequence stride 1, which the fp32 memory-efficient kernel rejects
     # for the reference too ("query is not correctly aligned (strideM)").
-    with torch.autocast("cuda", dtype=dtype, enabled=autocast), sdpa_kernel(SDPBackend.MATH):
+    with torch.autocast(DEVICE, dtype=dtype, enabled=autocast), sdpa_kernel(SDPBackend.MATH):
         expected = reference.decode(latents, return_dict=False)[0]
         actual = candidate.decode(latents, return_dict=False)[0]
     assert actual.stride() == expected.stride()
@@ -1117,7 +1227,7 @@ def test_forward_hooks_registered_after_install_see_every_decoder_module_call(
     reference, candidate = _build_pair(TINY_RESIDUAL, torch.bfloat16)
     assert install_wan_vae_fastpath(candidate, level="lossless").installed
     torch.manual_seed(1)
-    latents = torch.randn(1, TINY_RESIDUAL["z_dim"], 3, 6, 10, device="cuda", dtype=torch.bfloat16)
+    latents = torch.randn(1, TINY_RESIDUAL["z_dim"], 3, 6, 10, device=DEVICE, dtype=torch.bfloat16)
     calls: list[str] = []
 
     def run(vae: AutoencoderKLWan) -> tuple[torch.Tensor, list[str]]:
@@ -1153,29 +1263,37 @@ def test_forward_hooks_registered_after_install_see_every_decoder_module_call(
     assert any(assembled)
 
 
+@_XPU_CI
 @torch.no_grad()
 @pytest.mark.parametrize("dtype", ALL_DTYPES)
 def test_omni_wan_vae_decode_is_bitwise_exact_on_cuda(dtype: torch.dtype) -> None:
     from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import OmniAutoencoderKLWan
 
     torch.manual_seed(0)
-    reference = AutoencoderKLWan(**TINY_RESIDUAL).eval().to(device="cuda", dtype=dtype)
-    candidate = OmniAutoencoderKLWan(**TINY_RESIDUAL).eval().to(device="cuda", dtype=dtype)
+    reference = AutoencoderKLWan(**TINY_RESIDUAL).eval().to(device=DEVICE, dtype=dtype)
+    candidate = OmniAutoencoderKLWan(**TINY_RESIDUAL).eval().to(device=DEVICE, dtype=dtype)
     candidate.load_state_dict(reference.state_dict())
     install_wan_vae_fastpath(candidate)
-    latents = torch.randn(1, TINY_RESIDUAL["z_dim"], 5, 6, 10, device="cuda").to(dtype)
-    with torch.autocast("cuda", dtype=dtype, enabled=dtype is not torch.float32):
+    latents = torch.randn(1, TINY_RESIDUAL["z_dim"], 5, 6, 10, device=DEVICE).to(dtype)
+    with torch.autocast(DEVICE, dtype=dtype, enabled=dtype is not torch.float32):
         expected = reference.decode(latents, return_dict=False)[0]
     actual = candidate.decode(latents, return_dict=False)[0]  # applies its own autocast context
     assert actual.stride() == expected.stride()
     assert _bits_equal(actual, expected)
 
 
+@_XPU_CI
 @torch.no_grad()
 @pytest.mark.parametrize(
     ("dtype", "allow_tf32", "tolerance"),
     [
-        pytest.param(torch.bfloat16, True, 3e-2, id="bf16"),
+        pytest.param(
+            torch.bfloat16,
+            True,
+            3e-2,
+            id="bf16",
+            marks=pytest.mark.skip(reason="https://github.com/vllm-project/vllm-omni/issues/8841"),
+        ),
         # With TF32 disabled the only difference is cuDNN's channels-last algorithm
         # choice and the norm kernel's reduction order.
         pytest.param(torch.float32, False, 2e-4, id="fp32"),
@@ -1210,10 +1328,10 @@ def test_channels_last_decoder_keeps_layout_and_stays_close(
         if isinstance(module, (nn.Conv2d, nn.Conv3d))
     ]
     torch.manual_seed(1)
-    latents = torch.randn(1, TINY_RESIDUAL["z_dim"], 3, 6, 10, device="cuda").to(dtype)
+    latents = torch.randn(1, TINY_RESIDUAL["z_dim"], 3, 6, 10, device=DEVICE).to(dtype)
     with (
         torch.backends.cudnn.flags(enabled=True, allow_tf32=allow_tf32),
-        torch.autocast("cuda", dtype=dtype, enabled=dtype is not torch.float32),
+        torch.autocast(DEVICE, dtype=dtype, enabled=dtype is not torch.float32),
     ):
         expected = reference.decode(latents, return_dict=False)[0]
         actual = candidate.decode(latents, return_dict=False)[0]

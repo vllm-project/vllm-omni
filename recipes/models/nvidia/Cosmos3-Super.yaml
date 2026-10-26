@@ -1,0 +1,202 @@
+meta:
+  title: "Cosmos3-Super"
+  slug: "cosmos3-super"
+  provider: "NVIDIA"
+  description: "Frontier-scale 64B omnimodal world model (Mixture-of-Transformers) for advanced multimodal understanding, world simulation, future prediction, action reasoning, and Physical AI"
+  date_added: 2026-06-02
+  date_updated: 2026-06-02
+  tasks:
+    - omni
+  performance_headline: "64B omnimodal world model — ~55s/video on 8×H200 with HSDP + ulysses"
+  related_recipes:
+    - nvidia/Cosmos3-Nano
+    - nvidia/Cosmos3-Super-Text2Image
+    - nvidia/Cosmos3-Super-Image2Video
+  hardware:
+    h200: verified
+    h100: verified
+
+model:
+  model_id: "nvidia/Cosmos3-Super"
+  min_vllm_version: "0.21.0"
+  docker_image: "vllm/vllm-omni:cosmos3"
+  install:
+    docker:
+      note: "Release-tested vLLM-Omni image bundling the Cosmos3 omni handlers."
+    pip:
+  architecture: dense
+  parameter_count: "64B"
+  active_parameters: "64B"
+  context_length: 262144
+  base_args:
+    - "--host"
+    - "0.0.0.0"
+    - "--port"
+    - "8000"
+    - "--cfg-parallel-size"
+    - "2"
+    - "--ulysses-degree"
+    - "4"
+    - "--use-hsdp"
+    - "--hsdp-shard-size"
+    - "8"
+    - "--init-timeout"
+    - "1800"
+  base_env: {}
+
+omni:
+  # Cosmos3-Super is the frontier-scale model: the documented profile is an
+  # 8×H200/H100/A100 node with CFG-parallel + ulysses context parallelism +
+  # HSDP sharding (encoded in base_args). Both video tasks hit /v1/videos/sync;
+  # audio is muxed into the output MP4.
+  tasks:
+    - id: t2v
+      description: "Text → video (audio muxed into the MP4)"
+      curl: |
+        curl -X POST http://localhost:8000/v1/videos/sync \
+          -H "Accept: video/mp4" \
+          -F "prompt=$(cat assets/example_t2v_prompt.json)" \
+          -F "negative_prompt=$(cat assets/negative_prompt.json)" \
+          -F "size=1280x720" \
+          -F "num_frames=189" \
+          -F "fps=24" \
+          -F "num_inference_steps=35" \
+          -F "guidance_scale=6.0" \
+          -F "max_sequence_length=4096" \
+          -F "flow_shift=10.0" \
+          -F "seed=123" \
+          --output output.mp4
+    - id: i2v
+      description: "Image → video (temporally coherent, audio muxed in)"
+      curl: |
+        curl -X POST http://localhost:8000/v1/videos/sync \
+          -H "Accept: video/mp4" \
+          -F "input_reference=@assets/example_i2v_input.jpg" \
+          -F "prompt=$(cat assets/example_i2v_prompt.json)" \
+          -F "negative_prompt=$(cat assets/negative_prompt.json)" \
+          -F "size=1280x720" \
+          -F "num_frames=189" \
+          -F "fps=24" \
+          -F "num_inference_steps=35" \
+          -F "guidance_scale=6.0" \
+          -F "max_sequence_length=4096" \
+          -F "flow_shift=10.0" \
+          -F "seed=1111" \
+          --output output.mp4
+
+features: {}
+
+opt_in_features: []
+
+variants:
+  default:
+    precision: bf16
+    vram_minimum_gb: 154
+    description: "BF16 weights — frontier-scale; 8×H200/H100/A100 node recommended"
+
+compatible_strategies: []
+
+hardware_overrides: {}
+
+strategy_overrides: {}
+
+guide: |
+  ## Overview
+
+  **Cosmos3-Super** is the frontier-scale (64B) member of NVIDIA's Cosmos3 family
+  of **omnimodal world models**. Built on a Mixture-of-Transformers (MoT)
+  architecture — an autoregressive tower for discrete-token generation paired
+  with a diffusion tower for continuous modalities — it generates coherent text,
+  images, video, audio, and action commands from combinations of text, image,
+  video, and action-trajectory inputs, for advanced world understanding,
+  simulation, future prediction, and action reasoning.
+
+  This recipe covers the **vLLM-Omni** serving path (video + muxed-audio
+  generation). The same checkpoint also serves a text/multimodal **Reasoner**
+  endpoint via standard vLLM — see [Reasoner mode](#reasoner-mode-multimodal-understanding)
+  below.
+
+  ## Prerequisites
+
+  - 8× H200, H100, or A100 for the documented full-node profile
+  - The release-tested `vllm/vllm-omni:cosmos3` container, or vLLM-Omni installed
+    on top of `vllm==0.21.0`
+  - Prompts should be JSON-upsampled for best quality (see
+    [cosmos-framework prompt upsampling](https://github.com/NVIDIA/cosmos-framework/blob/main/docs/prompt_upsampling.md))
+
+  ## Launch command (vLLM-Omni)
+
+  Recommended configuration on 8×H200, 8×H100, or 8×A100:
+
+  ```bash
+  docker pull vllm/vllm-omni:cosmos3
+
+  vllm serve nvidia/Cosmos3-Super \
+    --omni \
+    --host 0.0.0.0 \
+    --port 8000 \
+    --cfg-parallel-size 2 \
+    --ulysses-degree 4 \
+    --use-hsdp \
+    --hsdp-shard-size 8 \
+    --init-timeout 1800
+  ```
+
+  With this configuration, 50-step video generation takes ~55 seconds on H200.
+  For **2×H200**, use `--cfg-parallel-size 2 --use-hsdp --hsdp-shard-size 2`
+  (a video takes ~3 minutes). Tensor parallelism is also supported via
+  `--tensor-parallel-size`. On memory-constrained GPUs,
+  `--enable-layerwise-offload` reduces VRAM usage at a performance cost.
+
+  ### Example: text-to-video
+
+  ```bash
+  curl -X POST http://localhost:8000/v1/videos/sync \
+    -H "Accept: video/mp4" \
+    -F "prompt=$(cat assets/example_t2v_prompt.json)" \
+    -F "negative_prompt=$(cat assets/negative_prompt.json)" \
+    -F "size=1280x720" \
+    -F "num_frames=189" \
+    -F "fps=24" \
+    -F "num_inference_steps=35" \
+    -F "guidance_scale=6.0" \
+    -F "max_sequence_length=4096" \
+    -F "flow_shift=10.0" \
+    -F "seed=123" \
+    --output output.mp4
+  ```
+
+  Image-to-video uses the same endpoint with an `input_reference` file part.
+  Audio is generated jointly and muxed into the output MP4 (48 kHz stereo AAC).
+
+  ## Reasoner mode (multimodal understanding)
+
+  The same checkpoint serves a text/multimodal **Reasoner** via the standard
+  `vllm` package (not vLLM-Omni):
+
+  ```bash
+  # CUDA 13 drivers:
+  uv pip install --torch-backend=cu130 "vllm==0.21.0" \
+    "vllm-cosmos3 @ git+https://github.com/NVIDIA/cosmos-framework.git#subdirectory=packages/vllm-cosmos3" \
+    openai
+  # CUDA 12.8 drivers: use --torch-backend=cu128 "vllm==0.19.1"
+
+  vllm serve nvidia/Cosmos3-Super \
+    --hf-overrides '{"architectures": ["Cosmos3ReasonerForConditionalGeneration"]}' \
+    --tensor-parallel-size 4 \
+    --mm-encoder-tp-mode data \
+    --async-scheduling \
+    --allowed-local-media-path / \
+    --media-io-kwargs '{"video": {"num_frames": -1}}' \
+    --port 8000
+  ```
+
+  Then query the OpenAI-compatible `/v1/chat/completions` endpoint with text +
+  image/video content.
+
+  ## References
+
+  - [Model card](https://huggingface.co/nvidia/Cosmos3-Super)
+  - [vLLM-Omni](https://github.com/vllm-project/vllm-omni)
+  - [cosmos-framework](https://github.com/NVIDIA/cosmos-framework)
+  - [Cosmos](https://github.com/nvidia/cosmos)

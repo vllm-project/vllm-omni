@@ -94,7 +94,8 @@ environment variables.
 | `VLLM_OMNI_ABORT_TIMEOUT` | Float seconds; default `2` | Engine abort wait for Videos DELETE and `generate()` cancel/error cleanup; read when `async_omni` imports | Environment-only setting. A non-float raises `ValueError` during import. | Experimental |
 | `VLLM_OMNI_API_SERVER_TORCH_THREADS` | Non-negative integer; default `4`; `0` disables the cap | Process-wide Torch intra-op pool; read at API worker startup, including inline diffusion stages | Caps the existing count without increasing a lower count (e.g. from `OMP_NUM_THREADS`). Set a higher cap for CPU-heavy preprocessing or postprocessing; `0` preserves the existing count. A non-integer or negative value raises `ValueError` at startup. Separate stage processes are unaffected. | Stable operational control |
 | `VLLM_OMNI_ASYNC_OUTPUT_TIMEOUT` | Float seconds; default `600` | Diffusion engine async-output wait in `step_streaming`; resolved per call on the request path, not at import | Environment-only setting. A non-float or `<=0` value warns once and uses the default. | Experimental |
-| `VLLM_OMNI_EVENT_DRIVEN_ORCH` | `1`, `true`, `yes` or `on` enables; defaults to on for Qwen3-TTS and off for other pipelines | Orchestrator stage-output loop; pipeline default computed from `pipeline_config.model_type` at engine initialization, env override resolved at `Orchestrator` construction | An explicit env value wins; otherwise the engine's pipeline default applies. Values are stripped and case-normalized; any unrecognized value selects the legacy poll loop. The serving-side final-output loop always wakes on orchestrator output, independent of this setting. Set before server startup. | Experimental |
+| `VLLM_OMNI_CODE2WAV_WATCHDOG_TIMEOUT_S` | Positive finite seconds; unset or `<=0` disables | MiniCPM-o 4.5 Code2Wav stage; read when each Code2Wav model instance initializes | Reports the current phase, bounded request details, and the blocked owner-thread Python stack once per operation without interrupting it. Invalid or non-finite values raise `ValueError` at model startup. | Diagnostic |
+| `VLLM_OMNI_EVENT_DRIVEN_ORCH` | Defaults to on; `0`, `false`, `no` or `off` selects the legacy poll loop | Orchestrator stage-output loop; resolved at `Orchestrator` construction | Unset selects event-driven orchestration for every pipeline. Values are stripped and case-normalized; `1`, `true`, `yes` or `on` keep it enabled and any other value selects the legacy poll loop. The serving-side final-output loop always wakes on orchestrator output, independent of this setting. Set before server startup. | Experimental |
 | `VLLM_OMNI_INPUT_WAIT_TIMEOUT_S` | Float seconds; default `600`; `<=0` disables | Full-payload input coordinator, not async-chunk transfer; read when the scheduler module imports in each worker | Environment-only setting. A non-float logs a warning and uses `600`. | Stable operational control |
 | `VLLM_OMNI_ORCH_MONITOR_PATH` | Filesystem path; default `<current-working-directory>/vllm_omni_orch_monitor_<timestamp>.json` | Orchestrator monitor enabled by `--enable-orch-monitor`; read when the monitor is created | Environment-only path override. Parent directories are created; write errors are logged. | Diagnostic |
 | `VLLM_OMNI_SPEAKER_REGISTRATION_POLICY` | `overwrite` or `immutable`; default `overwrite` | Speech server; read when speaker storage initializes | Environment-only setting. `immutable` rejects re-registering an existing uploaded voice name until it is deleted; any other value raises `ValueError` at startup. | Experimental |
@@ -131,7 +132,7 @@ settings.
 
 | Name | Type and default | Applies to and read time | Precedence and invalid values | Lifecycle |
 | --- | --- | --- | --- | --- |
-| `VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS` | Non-negative integer; unset or empty means each consumer's own default (Boogu-Image: `2048`; MammothModa2: `0`) | Token gate of the shared `fused_qk_norm_rope` op: a rotary table is packed for the fused kernel only when it spans at least this many positions (`B*S`); read at forward time | Environment-only. `0` = always fuse; a very large value disables the fused path. Any other value raises `ValueError` on the first forward. The crossover is host-dependent; re-benchmark before overriding. | Experimental performance control |
+| `VLLM_OMNI_FUSED_QK_NORM_ROPE_MIN_TOKENS` | Non-negative integer; unset or empty means each consumer's own default (Boogu-Image: `2048`; MammothModa2: `0`; Qwen-Image: `2048`; Z-Image: `0`) | Token gate of the shared `fused_qk_norm_rope` op: a rotary table is packed for the fused kernel only when it spans at least this many positions (`B*S` per stream; for Qwen-Image's joint text/image launch the combined `B*(S_txt+S_img)`); read at forward time | Environment-only. `0` = always fuse; a very large value disables the fused path. Any other value raises `ValueError` on the first forward. The crossover is host-dependent; re-benchmark before overriding. | Experimental performance control |
 | `VLLM_OMNI_SKIP_NVFP4_NAN_CLAMP` | Boolean truthy spellings: `1`, `true`, `yes`, `on`; default false | ModelOpt NVFP4 compatibility patch; read when `vllm_omni.patch` imports | Environment-only escape hatch. Any other value means false. Set only to diagnose the upstream NaN-scale issue. | Diagnostic and temporary |
 | `VLLM_OMNI_USE_QUACK_FP8` | Boolean truthy spellings: `1`, `true`, `yes`, `on`; unset means hardware auto-detection | FP8 scaled matrix multiplication; evaluated when quack capability is selected | A set value overrides auto-detection. Any non-truthy value forces quack off. If quack cannot load, vLLM-Omni warns and falls back to FlashInfer. | Experimental performance control |
 
@@ -187,7 +188,7 @@ their keys only.
 ## Inherited vLLM variables
 
 vLLM-Omni also reads variables through its aligned vLLM dependency. Refer to
-the [vLLM 0.31 environment-variable reference](https://docs.vllm.ai/en/v0.31.0/configuration/env_vars.html)
+the [vLLM 0.32 environment-variable reference](https://docs.vllm.ai/en/v0.32.0/configuration/env_vars.html)
 for their definitions. This includes vLLM launch, cache, logging, plugin, ROCm,
 XPU, ModelScope, and FlashInfer workspace settings.
 
@@ -215,7 +216,7 @@ collection, examples, bug reports, or logs.
 
 ## Model-specific variables
 
-The inventory includes 93 variables read by a single model or pipeline family. They are
+The inventory includes 95 variables read by a single model or pipeline family. They are
 not listed as public usage options here because doing so would turn implementation
 escape hatches into an accidental compatibility contract.
 
@@ -224,10 +225,10 @@ Every audited model-specific name has a migration disposition in the
 
 | Disposition | Count | Required outcome |
 | --- | ---: | --- |
-| Promote | 64 | Move a stable setting into typed stage or model configuration. |
+| Promote | 67 | Move a stable setting into typed stage or model configuration. |
 | Request scope | 5 | Move request-varying behavior into a declared request-option schema. |
 | External | 0 | Retain only when a supported third-party library owns the contract. |
-| Internalize | 17 | Keep a debug or diagnostic switch out of public documentation and configuration. |
+| Internalize | 16 | Keep a debug or diagnostic switch out of public documentation and configuration. |
 | Deprecate/remove | 7 | Remove a compatibility escape hatch that has no continuing contract. |
 
 The disposition is a migration target, not a statement that the existing

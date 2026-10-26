@@ -62,11 +62,12 @@ def live_workers() -> Generator[list[subprocess.Popen[bytes]], None, None]:
 def _start_engine_worker(
     workers: list[subprocess.Popen[bytes]], *, ignore_terminate: bool = False
 ) -> subprocess.Popen[bytes]:
-    script = "import signal, time; "
+    # Engine workers are recognised by process title, as set by vLLM's ``set_process_title``.
+    script = "import signal, sys, time, setproctitle; setproctitle.setproctitle(sys.argv[1]); "
     if ignore_terminate:
         script += "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
     script += "print('ready', flush=True); time.sleep(90)"
-    worker = subprocess.Popen([sys.executable, "-c", script, "enginecore"], stdout=subprocess.PIPE)
+    worker = subprocess.Popen([sys.executable, "-c", script, "VLLM::EngineCore"], stdout=subprocess.PIPE)
     workers.append(worker)
     assert worker.stdout is not None
     assert worker.stdout.readline() == b"ready\n"
@@ -124,6 +125,46 @@ def test_runner_startup_failure_cleans_only_new_workers(
 
     assert owned[0].poll() is not None
     assert unrelated.poll() is None
+
+
+def test_runner_startup_failure_cleans_reparented_workers(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A worker whose parent died during startup is still stopped by the rollback."""
+    worker_script = (
+        "import sys, time, setproctitle; setproctitle.setproctitle(sys.argv[1]); "
+        "print('ready', flush=True); time.sleep(90)"
+    )
+    # Starts a titled worker, prints its pid and exits, which orphans the worker.
+    parent_script = (
+        "import subprocess, sys; "
+        "worker = subprocess.Popen([sys.executable, '-c', sys.argv[1], sys.argv[2]], stdout=subprocess.PIPE); "
+        "worker.stdout.readline(); print(worker.pid, flush=True)"
+    )
+    orphans: list[psutil.Process] = []
+    monkeypatch.setattr("tests.helpers.runtime.cleanup_test_environment", lambda: None)
+
+    class _FailingOmni:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            done = subprocess.run(
+                [sys.executable, "-c", parent_script, worker_script, "VLLM::EngineCore"],
+                stdout=subprocess.PIPE,
+                check=True,
+                timeout=30,
+            )
+            orphans.append(psutil.Process(int(done.stdout)))
+            raise RuntimeError("startup failed")
+
+    monkeypatch.setattr("vllm_omni.entrypoints.omni.Omni", _FailingOmni)
+    try:
+        with pytest.raises(RuntimeError, match="startup failed"):
+            OmniRunner("fake-model")
+        _, alive = psutil.wait_procs(orphans, timeout=10)
+        assert not alive
+    finally:
+        for orphan in orphans:
+            try:
+                orphan.kill()
+            except psutil.NoSuchProcess:
+                pass
 
 
 def test_runner_cleanup_rejects_stale_process_identity(live_workers: list[subprocess.Popen[bytes]]) -> None:
