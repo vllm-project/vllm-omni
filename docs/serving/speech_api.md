@@ -1256,6 +1256,12 @@ If the resolver provides no content key or the worker entry is evicted, the
 embedding is extracted again. Multi-reference requests retain their existing
 extraction behavior.
 
+Remote URLs are keyed by their raw URL string in the separate waveform resolve
+cache. A hit returns the cached waveform without fetching or decoding it again;
+the server does not check whether content at the same URL has changed. Ming's
+speaker cache uses the content key of the waveform returned by that resolver.
+It does not change remote URL refresh behavior.
+
 The separate decoded-waveform resolve cache defaults to **4 GiB and 2048 entries
 per speech server instance**. These are LRU limits, not preallocated memory or a
 limit on total server RSS. Waveforms retain their source sampling rate and are

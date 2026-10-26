@@ -123,7 +123,8 @@ async def test_inline_reference_reuses_embedding_across_text_and_locator_changes
 
 
 @pytest.mark.asyncio
-async def test_changed_content_at_same_locator_does_not_reuse_embedding():
+async def test_changed_supplied_content_key_does_not_reuse_embedding():
+    """The stub supplies a new waveform/key; this does not test remote URL refresh."""
     references = {"reference-a": ([0.25, 0.5], 16000, "content-a")}
     adapter, _, _ = _adapter(references)
     wrapper = _wrapper()
