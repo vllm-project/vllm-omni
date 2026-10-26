@@ -1,5 +1,64 @@
 import torch
 
+# OmniCustomPrompt spelling takes precedence over native vLLM token IDs.
+PROMPT_ID_KEYS = ("prompt_ids", "prompt_token_ids")
+NEGATIVE_PROMPT_ID_KEYS = ("negative_prompt_ids", "negative_prompt_token_ids")
+
+
+def _single_prompt_ids(ids: object, *, key: str) -> list[int]:
+    """Unwrap the single prompt a diffusion request carries and cast it to ``int``."""
+    if not isinstance(ids, (list, tuple)) or not ids:
+        raise ValueError(f"`{key}` must be a non-empty list or tuple of token ids, got {ids!r}")
+    first = ids[0]
+    if isinstance(first, (list, tuple)):
+        if len(ids) != 1:
+            raise ValueError(f"`{key}` holds {len(ids)} prompts, but a diffusion request carries a single prompt")
+        ids = first
+        if not ids:
+            raise ValueError(f"`{key}` must be a non-empty list or tuple of token ids, got {ids!r}")
+    return [int(token_id) for token_id in ids]
+
+
+def _pre_tokenized_ids(prompt: object, *, keys: tuple[str, ...], mask_key: str) -> list[int] | None:
+    if not isinstance(prompt, dict):
+        return None
+    for key in keys:
+        ids = prompt.get(key)
+        if ids:
+            ids = _single_prompt_ids(ids, key=key)
+            mask = prompt.get(mask_key)
+            if mask is not None:
+                if not isinstance(mask, torch.Tensor):
+                    raise ValueError(f"`{mask_key}` must be an attention mask tensor")
+                if mask.ndim == 2 and mask.shape[0] == 1:
+                    mask = mask.squeeze(0)
+                if mask.ndim != 1 or mask.numel() != len(ids):
+                    raise ValueError(f"`{mask_key}` must have shape ({len(ids)},) or (1, {len(ids)})")
+                if not torch.all((mask == 0) | (mask == 1)):
+                    raise ValueError(f"`{mask_key}` must contain only 0 or 1")
+                ids = [token_id for token_id, keep in zip(ids, mask.tolist()) if keep]
+                if not ids:
+                    raise ValueError(f"`{mask_key}` must retain at least one token in `{key}`")
+            return ids
+    return None
+
+
+def pre_tokenized_prompt_ids(prompt: object) -> list[int] | None:
+    """Return the pre-tokenized prompt ids of ``prompt``, if it carries any.
+
+    ``OmniCustomPrompt`` exists so that a caller who has already tokenized the
+    prompt can stop the pipeline from tokenizing it again. Pipelines that
+    support that use the unmasked ids verbatim, so the caller owns the exact
+    token sequence, wrappers included. Masks are binary tensors of shape (L,)
+    or (1, L); masked-out tokens are removed before packing.
+    """
+    return _pre_tokenized_ids(prompt, keys=PROMPT_ID_KEYS, mask_key="prompt_mask")
+
+
+def pre_tokenized_negative_prompt_ids(prompt: object) -> list[int] | None:
+    """Return the pre-tokenized negative prompt ids of ``prompt``, if it carries any."""
+    return _pre_tokenized_ids(prompt, keys=NEGATIVE_PROMPT_ID_KEYS, mask_key="negative_prompt_mask")
+
 
 def validate_prompt_sequence_lengths(
     attention_mask: torch.Tensor,
