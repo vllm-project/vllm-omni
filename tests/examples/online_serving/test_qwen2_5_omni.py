@@ -88,8 +88,12 @@ def test_send_multimodal_request_002(omni_server) -> None:
         omni_server.model,
         "--query-type",
         "use_mixed_modalities",
+        "--seed",
+        "42",
+        "--temperature",
+        "0",
         "--prompt",
-        "Analyze all the media content and provide a comprehensive summary.",
+        "Summarize all media in at most 60 words.",
     ]
     result = run_cmd(command)
 
