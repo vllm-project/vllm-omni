@@ -1104,6 +1104,11 @@ class StagePool:
         expected_replica_id: int | None = None,
     ) -> int:
         """Submit a stage-entry request into this pool."""
+        # An open stage circuit breaker (#7618) rejects new work outright:
+        # the stage worker survived into a corrupted state and must not
+        # receive further requests until the engine is restarted.
+        if self.is_circuit_open():
+            raise StageUnavailableError(self.circuit_breaker_message())
         params = params_override if params_override is not None else req_state.sampling_params_list[self.stage_id]
         # Direct engine callers may provide plain vLLM SamplingParams.
         if self.stage_type == "diffusion":
@@ -1201,6 +1206,10 @@ class StagePool:
         submit_kwargs: dict[str, Any] | None = None,
     ) -> int:
         """Submit a streaming update to an already admitted request."""
+        # An open stage circuit breaker (#7618) rejects further work for the
+        # corrupted stage, including streaming updates to admitted requests.
+        if self.is_circuit_open():
+            raise StageUnavailableError(self.circuit_breaker_message())
         submit_kwargs = submit_kwargs or {}
         params = req_state.sampling_params_list[self.stage_id]
         if self.stage_type == "diffusion":

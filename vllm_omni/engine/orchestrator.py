@@ -1457,14 +1457,15 @@ class OrchestratorBase:
                 await self._handle_stage_error(stage_id, output)
                 continue
 
-            # A successful execution resets the stage's consecutive-failure
-            # counter (see StagePool.record_stage_failure); a completed
-            # request proves the stage worker is still healthy.
-            self.stage_pools[stage_id].record_stage_success()
-
             stage_metrics = None
             segment_finished = req_state.streaming.enabled and req_state.streaming.segment(stage_id).finished
             if output.finished or segment_finished:
+                # A completed execution resets the stage's consecutive-failure
+                # counter (see StagePool.record_stage_failure). Request-start
+                # notifications and unfinished streaming progress do not
+                # count: a request that starts and then fails must not erase
+                # the previous failure (#7618).
+                self.stage_pools[stage_id].record_stage_success()
                 stage_metrics = pool.build_stage_metrics(
                     [output],
                     submit_ts=req_state.stage_submit_ts.get(stage_id, _time.time()),
