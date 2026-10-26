@@ -8,6 +8,7 @@ inputs; A2 and other shapes still require their own bitwise runtime validation.
 """
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 
 from .vision_parallel import VisionAllToAll, build_vision_plan, gather_vision_outputs, vision_permutation_enabled
@@ -35,7 +36,29 @@ def forward_sp8(model, pixels, grid, *, group):
     ids = plan.rank_token_indices[transport.rank]
     select = torch.tensor(ids, dtype=torch.long, device=pixels.device)
     hidden = model.patch_embed(pixels.index_select(0, select))
-    hidden = hidden + model.fast_pos_embed_interpolate(grid).index_select(0, select)
+    local_pos = vision_permutation_enabled("VLLM_OMNI_H3_VISION_LOCAL_POS")
+    verify_pos = vision_permutation_enabled("VLLM_OMNI_H3_VISION_LOCAL_POS_VERIFY")
+    position = (
+        model.fast_pos_embed_interpolate(grid, token_indices=ids)
+        if local_pos
+        else model.fast_pos_embed_interpolate(grid).index_select(0, select)
+    )
+    if verify_pos:
+        if not local_pos:
+            raise ValueError("VLLM_OMNI_H3_VISION_LOCAL_POS_VERIFY requires VLLM_OMNI_H3_VISION_LOCAL_POS=1")
+        reference = model.fast_pos_embed_interpolate(grid).index_select(0, select)
+        failed = (
+            position.shape != reference.shape
+            or position.dtype != reference.dtype
+            or position.stride() != reference.stride()
+            or not torch.equal(position.contiguous().view(torch.uint8), reference.contiguous().view(torch.uint8))
+        )
+        # All ranks fail together before entering attention collectives.
+        status = torch.tensor([int(failed)], dtype=torch.int32, device=position.device)
+        dist.all_reduce(status, op=dist.ReduceOp.MAX, group=group)
+        if status.item():
+            raise RuntimeError("vision local position interpolation changed bytes or strides")
+    hidden = hidden + position
     rope = model.rot_pos_emb(grid).reshape(sum(lengths), -1)
     emb = torch.cat((rope, rope), dim=-1)
     cos, sin = emb.cos().index_select(0, select), emb.sin().index_select(0, select)
