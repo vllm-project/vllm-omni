@@ -31,11 +31,21 @@ code 1008. Live sessions need a single API server process
 ```yaml
 live_session_config:
   session_lifetime_s: 1800   # hard limit; fills expires_at
-  max_sessions: null         # concurrent Live sessions on this API server; null is unbounded
+  max_sessions: 8            # concurrent Live sessions on this API server
+  max_input_backlog_s: 10    # input audio queued behind the model before the session closes
 ```
 
-On PersonaPlex, `max_sessions` also sizes the Stage 0 streaming Mimi encoder
-and the Code2Wav decoders (one Mimi instance per session), so it must be set.
+All three keys are required. `max_sessions` also sizes per-session model
+state: on PersonaPlex, the Stage 0 streaming Mimi encoder and the Code2Wav
+decoders (one Mimi instance per session).
+
+Size `max_sessions` so that every admitted session fits in Stage 0's KV cache
+at its context length. Sessions that don't fit stall when Stage 0 runs out of
+KV cache: a waiting Live request keeps its blocks and vLLM does not preempt it,
+so the stalled sessions are ended by `max_input_backlog_s` (see below). The
+MiniCPM-o overlay admits 8 sessions with a 16,384-token Stage 0 context, about
+18 GiB of KV cache, for one 96 GB GPU; lower `max_sessions` or the Stage 0
+`max_model_len` on smaller GPUs.
 
 ## Protocol
 
@@ -65,6 +75,15 @@ When `max_sessions` sessions are active, a `session.start` gets an `error`
 (`type: "server_error"`, `code: "session_limit_reached"`, `client_event_id`
 set) and the socket closes with 1013 (Try Again Later); no `session.closed` is
 sent.
+
+A running session the server can't keep going is ended with an `error`
+(`type: "server_error"`, `code: "internal_server_error"`) and close 1013; the
+client may start a new session. This happens when more than
+`max_input_backlog_s` of input audio is queued behind the model (the client
+sends faster than real time, or the server falls behind), or when its stage 0
+request was preempted and lost its context. The cause is not sent to the
+client; the server logs it and counts it in `vllm_omni:live_errors{reason}`
+(`backlog`, `preempted`).
 
 ### Server events
 
@@ -97,7 +116,8 @@ history and resubmits it as a new request, the unit that did not fit included:
   `instructions` and text `input` become the duplex system prompt, with the
   checkpoint's `assets/HT_ref_audio.wav` as reference voice. Each session holds
   an audio-encoder cache of up to ~150 MB on the Stage 0 GPU that vLLM's
-  memory profiling does not count.
+  memory profiling does not count. The Live overlay sets Stage 0
+  `max_model_len: 16384`.
 - **PersonaPlex**: voices are the bundled voice prompts (`NATF2`, ...);
   `instructions` is the persona. Output audio trails the input by one extra
   frame (80 ms): a frame's agent codes are produced when the next frame
@@ -112,4 +132,5 @@ agent (`GPTLiveModel`) against this endpoint.
 
 `vllm_omni:live_active_sessions`, `vllm_omni:live_rejected_sessions`,
 `vllm_omni:live_audio_seconds{direction}`, `vllm_omni:live_context_trims` and
-`vllm_omni:live_errors{reason}`, labelled by `model_name`.
+`vllm_omni:live_errors{reason}`, labelled by `model_name`. `live_errors`
+reasons include `backlog` and `preempted`.

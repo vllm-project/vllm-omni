@@ -3,26 +3,30 @@
 
 """GPU coverage for PersonaPlex on the OpenAI Live endpoint (``/v1/live/sessions``).
 
-One server for the module: ``personaplex_live.yaml`` (``max_sessions: 2``, which
-also sizes the Stage 0 Mimi encoder rows and the Code2Wav decoders) with Stage 0
-at ``max_model_len: 600`` frames, so a session overflows after about 41 s of
-audio (the voice and persona prefill takes the first 89 frames). PersonaPlex
-streams audio for every 80 ms frame, so replies are checked for voiced output,
-not for audio events. The checkpoint is gated: the tests run only when
-``PERSONAPLEX_MODEL_PATH`` points at a local copy of ``nvidia/personaplex-7b-v1``.
+Two servers, both ``personaplex_live.yaml`` (``max_sessions: 2``, which also
+sizes the Stage 0 Mimi encoder rows and the Code2Wav decoders) with Stage 0 at
+``max_model_len: 600`` frames, so a session overflows after about 41 s of audio
+(the voice and persona prefill takes the first 89 frames). The second also caps
+the Stage 0 KV cache at one full context, so two growing sessions run it out
+and stall. PersonaPlex streams audio for every 80 ms frame, so replies are
+checked for voiced output, not for audio events. The model is
+``PERSONAPLEX_MODEL_PATH`` when set, else the gated ``nvidia/personaplex-7b-v1``
+from Hugging Face.
 """
 
 from __future__ import annotations
 
 import asyncio
 import os
-from pathlib import Path
 
 import pytest
 
 from tests.e2e.online_serving.helpers.live_sessions import (
     LiveSession,
+    assert_ended_by_server,
     context_trims,
+    converse_until_server_ends_one,
+    live_errors,
     live_url,
     load_speech,
     metrics_url,
@@ -35,29 +39,40 @@ from tests.helpers.stage_config import get_deploy_config_path, write_deploy_over
 
 pytestmark = pytest.mark.omni
 
-MODEL_PATH = os.environ.get("PERSONAPLEX_MODEL_PATH", "")
-MODEL = MODEL_PATH or "nvidia/personaplex-7b-v1"
+MODEL = os.environ.get("PERSONAPLEX_MODEL_PATH") or "nvidia/personaplex-7b-v1"
 VOICE = "NATF2"
+STARVE_WINDOW_S = 120.0
 LIVE_DEPLOY = write_deploy_overlay(
     get_deploy_config_path("personaplex_live.yaml"),
     {"stages": [{"stage_id": 0, "max_model_len": 600}]},
 )
-SERVER_PARAMS = [
-    pytest.param(
+# 40 blocks of 16 frames: one full 600-frame context (vLLM keeps two blocks
+# back here, so 38 would admit only 576 frames). Two growing sessions
+# run it out and stall (waiting Live requests keep their blocks and are not
+# preempted) until the backlog limit ends them.
+STARVE_DEPLOY = write_deploy_overlay(
+    get_deploy_config_path("personaplex_live.yaml"),
+    {
+        "live_session_config": {"session_lifetime_s": 1800, "max_sessions": 2, "max_input_backlog_s": 10},
+        "stages": [{"stage_id": 0, "max_model_len": 600, "block_size": 16, "num_gpu_blocks_override": 40}],
+    },
+)
+
+
+def _server(deploy: str, server_id: str):
+    return pytest.param(
         OmniServerParams(
             model=MODEL,
-            stage_config_path=LIVE_DEPLOY,
+            stage_config_path=deploy,
             use_stage_cli=False,
             server_args=["--trust-remote-code"],
         ),
-        id="live-600",
+        id=server_id,
     )
-]
 
-requires_checkpoint = pytest.mark.skipif(
-    not MODEL_PATH or not Path(MODEL_PATH).is_dir(),
-    reason="set PERSONAPLEX_MODEL_PATH to a local nvidia/personaplex-7b-v1 checkout",
-)
+
+SERVER_PARAMS = [_server(LIVE_DEPLOY, "live-600")]
+STARVE_SERVER_PARAMS = [_server(STARVE_DEPLOY, "live-600-kv-640")]
 
 
 def _assert_healthy(session: LiveSession) -> None:
@@ -71,7 +86,6 @@ def _assert_answered(session: LiveSession) -> None:
         assert session.answered(utterance), f"{session.name}: no voiced reply to {utterance}"
 
 
-@requires_checkpoint
 @pytest.mark.advanced_model
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", SERVER_PARAMS, indirect=True)
@@ -94,7 +108,6 @@ def test_personaplex_live_conversation(omni_server) -> None:
     assert session.close_code == 1000
 
 
-@requires_checkpoint
 @pytest.mark.advanced_model
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", SERVER_PARAMS, indirect=True)
@@ -126,7 +139,6 @@ def test_personaplex_live_context_trim(omni_server) -> None:
     assert any(session.answered(u) for u in after_trim), f"no voiced reply after the trim at {trimmed[0]:.0f} s"
 
 
-@requires_checkpoint
 @pytest.mark.advanced_model
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", SERVER_PARAMS, indirect=True)
@@ -165,3 +177,28 @@ def test_personaplex_live_concurrent_sessions(omni_server) -> None:
     assert close_code == 1013
     for session in sessions:
         _assert_answered(session)
+
+
+@pytest.mark.advanced_model
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@pytest.mark.parametrize("omni_server", STARVE_SERVER_PARAMS, indirect=True)
+def test_personaplex_live_kv_exhaustion_ends_stalled_sessions(omni_server) -> None:
+    """Sessions stalled on a full Stage 0 KV cache are ended by the backlog limit; the server recovers."""
+    speech = load_speech()
+    url = live_url(omni_server)
+    metrics = metrics_url(omni_server)
+    before = live_errors(metrics, "backlog")
+
+    async def run() -> tuple[list[LiveSession], LiveSession]:
+        sessions = await converse_until_server_ends_one(url, MODEL, VOICE, speech, gap_s=5.0, window_s=STARVE_WINDOW_S)
+        async with LiveSession(url, MODEL, VOICE, name="after") as after:
+            await after.silence(1.0)
+            await after.say(speech, gap_s=5.0)
+            await after.close()
+        return sessions, after
+
+    sessions, after = asyncio.run(run())
+
+    assert_ended_by_server(sessions, STARVE_WINDOW_S)
+    assert live_errors(metrics, "backlog") > before, "the backlog limit did not end the stalled sessions"
+    _assert_answered(after)

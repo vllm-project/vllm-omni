@@ -2070,7 +2070,6 @@ class OrchestratorBase:
                 metrics=stage_metrics,
                 finished=request_finished,
                 stage_submit_ts=submit_ts,
-                segment_finished=segment_finished,
             )
             if (
                 request_finished

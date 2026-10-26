@@ -21,6 +21,8 @@ import numpy as np
 import torch
 from vllm.logger import init_logger
 
+from vllm_omni.config.live_session import LIVE_PREEMPTED_KEY
+
 logger = init_logger(__name__)
 
 LIVE_AUDIO_KEY = "minicpmo_live_audio"
@@ -35,6 +37,9 @@ class LiveEncoderState:
     seq: int | None = None
     embeds: torch.Tensor | None = None
     cursor: int = 0
+    # Set once a preemption recompute re-ran rows whose embeddings are gone;
+    # the API server cancels the session (``live_preempted_rows``).
+    preempted: bool = False
 
 
 def _ensure_dynamic_cache_compat() -> None:
@@ -108,13 +113,17 @@ def apply_live_audio(
     count = int(rows.numel())
     if count > available:
         # A recompute after preemption re-runs earlier units' rows, whose
-        # embeddings are gone; they keep the placeholder embedding.
-        logger.warning(
-            "MiniCPM-o Live: %d unit audio rows scheduled but %d embeddings left (request %s)",
-            count,
-            available,
-            info.get("request_id"),
-        )
+        # embeddings are gone. They keep the placeholder embedding; the
+        # session is cancelled, so the request's context no longer matters.
+        if not state.preempted:
+            logger.warning(
+                "MiniCPM-o Live: request %s was preempted (%d unit audio rows scheduled, %d embeddings left); "
+                "cancelling its session",
+                info.get("request_id"),
+                count,
+                available,
+            )
+        state.preempted = True
         rows = rows[-available:] if available > 0 else rows[:0]
         count = int(rows.numel())
     embeds = input_embeds.clone()
@@ -123,3 +132,12 @@ def apply_live_audio(
         embeds[rows] = chunk.to(device=embeds.device, dtype=embeds.dtype)
         state.cursor += count
     return embeds, {LIVE_ENCODER_KEY: state}
+
+
+def live_preempted_rows(request_infos: list[Any]) -> dict[str, Any]:
+    """Stage-0 output rows (batch order) flagging preempted Live requests."""
+    flags = [
+        isinstance(info, dict) and isinstance(state := info.get(LIVE_ENCODER_KEY), LiveEncoderState) and state.preempted
+        for info in request_infos
+    ]
+    return {LIVE_PREEMPTED_KEY: flags} if any(flags) else {}

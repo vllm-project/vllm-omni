@@ -23,7 +23,7 @@ _context_trims = Counter(
     defs.LIVE_CONTEXT_TRIMS, "History trims and resubmissions after context_length_exceeded.", labelnames=_LABELS
 )
 _errors = Counter(
-    defs.LIVE_ERRORS, "Live sessions ended by an internal error, by reason.", labelnames=[*_LABELS, "reason"]
+    defs.LIVE_ERRORS, "Live sessions ended by a server-side error, by reason.", labelnames=[*_LABELS, "reason"]
 )
 
 

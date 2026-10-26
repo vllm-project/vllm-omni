@@ -44,6 +44,7 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.utils import PPMissingLayer, maybe_prefix
 from vllm.sequence import IntermediateTensors
 
+from vllm_omni.config.live_session import LIVE_PREEMPTED_KEY
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.model_executor.models.personaplex.configuration_personaplex import (
     PersonaPlexConfig,
@@ -217,10 +218,16 @@ class PersonaPlexTalkerForConditionalGeneration(nn.Module):
             # the codes of the frame this step's preprocess finished, if any.
             empty = torch.empty((0, self.dep_q), dtype=torch.long, device=hidden.device)
             per_request = []
+            preempted = []
             for info in info_dicts:
-                codes = live.take_codes(info.get("request_id")) if isinstance(info, dict) else None
+                request_id = info.get("request_id") if isinstance(info, dict) else None
+                codes = live.take_codes(request_id)
                 per_request.append(codes if codes is not None else empty)
-            return OmniOutput(text_hidden_states=hidden, multimodal_outputs={"codes": {"audio": per_request}})
+                preempted.append(live.is_preempted(request_id))
+            outputs: dict[str, Any] = {"codes": {"audio": per_request}}
+            if any(preempted):
+                outputs[LIVE_PREEMPTED_KEY] = preempted
+            return OmniOutput(text_hidden_states=hidden, multimodal_outputs=outputs)
         audio_codes_list: list[torch.Tensor] = []
         for info in info_dicts:
             if not isinstance(info, dict):

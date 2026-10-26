@@ -12,7 +12,12 @@ import pytest
 from fastapi import WebSocketDisconnect
 from vllm import SamplingParams
 
-from vllm_omni.config.live_session import LiveSessionConfig, LiveSessionDeployConfig, UnsupportedFeatures
+from vllm_omni.config.live_session import (
+    LIVE_PREEMPTED_KEY,
+    LiveSessionConfig,
+    LiveSessionDeployConfig,
+    UnsupportedFeatures,
+)
 from vllm_omni.entrypoints.openai.live import protocol as proto
 from vllm_omni.entrypoints.openai.live.handler import LiveSessionHandler, SessionSlots
 from vllm_omni.entrypoints.openai.live.processor import LiveSessionProcessor, ProcessorContext
@@ -23,6 +28,7 @@ MODEL = "test-model"
 RATE = 16_000
 UNIT_MS = 100
 UNIT_SAMPLES = RATE * UNIT_MS // 1000
+BACKLOG_S = 1.0
 
 
 class _FakeWebSocket:
@@ -115,8 +121,10 @@ class _UnitProcessor(LiveSessionProcessor):
         return 100
 
 
-def _stage0(token_ids, finish_reason=None):
-    completion = SimpleNamespace(token_ids=token_ids, text="", finish_reason=finish_reason)
+def _stage0(token_ids, finish_reason=None, text="", multimodal_output=None):
+    completion = SimpleNamespace(
+        token_ids=token_ids, text=text, finish_reason=finish_reason, multimodal_output=multimodal_output
+    )
     return SimpleNamespace(stage_id=0, outputs=[completion], final_output_type="text", multimodal_output=None)
 
 
@@ -155,7 +163,9 @@ class _Session:
             engine=self.engine,
             model_name=MODEL,
             live_config=live_config,
-            deploy_config=LiveSessionDeployConfig(),
+            deploy_config=LiveSessionDeployConfig(
+                session_lifetime_s=1800, max_sessions=4, max_input_backlog_s=BACKLOG_S
+            ),
             processor_cls=_UnitProcessor,
             processor_context=ProcessorContext(tokenizer=None, max_model_len=300, model_name=MODEL, model_path=MODEL),
             slots=slots,
@@ -356,7 +366,7 @@ async def test_engine_error_fails_the_session():
 
 
 async def test_session_close_aborts_the_request():
-    slots = SessionSlots(None)
+    slots = SessionSlots(4)
     async with _Session(slots) as session:
         await session.start()
         session.ws.send(_append_event())
@@ -370,6 +380,54 @@ async def test_session_close_aborts_the_request():
         assert session.engine.requests[0].closed
         assert session.ws.close_code == proto.CLOSE_NORMAL
     assert slots.active == 0
+
+
+async def test_input_backlog_over_the_limit_closes_with_try_again_later(mocker):
+    async with _Session() as session:
+        await session.start()
+        errors = mocker.spy(session.handler.metrics, "error")
+        # The model never finishes a segment: one unit is in flight, the rest queue.
+        session.ws.send(_append_event(units=5))
+        await _until(lambda: session.engine.requests and session.engine.requests[0].inputs)
+        assert session.errors() == []
+
+        session.ws.send(_append_event(units=7))
+        await session.finished()
+
+        assert session.errors() == ["internal_server_error"]
+        assert session.ws.close_code == proto.CLOSE_TRY_AGAIN_LATER
+        assert session.engine.requests[0].closed
+        errors.assert_called_once_with("backlog")
+
+
+async def test_preempted_request_cancels_the_session(mocker):
+    async with _Session() as session:
+        await session.start()
+        errors = mocker.spy(session.handler.metrics, "error")
+        session.ws.send(_append_event())
+        await _until(lambda: session.engine.requests and session.engine.requests[0].inputs)
+
+        session.engine.requests[0].emit(_stage0([7], text="hello", multimodal_output={LIVE_PREEMPTED_KEY: True}))
+        await session.finished()
+
+        assert session.errors() == ["internal_server_error"]
+        assert session.ws.close_code == proto.CLOSE_TRY_AGAIN_LATER
+        assert session.ws.of_type("session.output_transcript.delta") == []
+        assert session.engine.requests[0].closed
+        errors.assert_called_once_with("preempted")
+
+
+async def test_unpreempted_stage0_output_is_forwarded():
+    async with _Session() as session:
+        await session.start()
+        session.ws.send(_append_event())
+        await _until(lambda: session.engine.requests and session.engine.requests[0].inputs)
+
+        session.engine.requests[0].emit(_stage0([7], text="hello", multimodal_output={LIVE_PREEMPTED_KEY: False}))
+        await _until(lambda: session.ws.of_type("session.output_transcript.delta"))
+
+        assert session.errors() == []
+        assert session.ws.close_code is None
 
 
 async def test_audio_output_is_sent_and_counted():

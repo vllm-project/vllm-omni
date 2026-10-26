@@ -9,3 +9,6 @@ live_session_config:
   # Sizes the Stage 0 streaming Mimi encoder rows and the Code2Wav decoders
   # (one Mimi instance each); each session also holds one Stage 0 KV window.
   max_sessions: 2
+  # Input audio queued behind the model before the session is closed (a
+  # server error to the client); a real-time client stays under 1 s.
+  max_input_backlog_s: 10

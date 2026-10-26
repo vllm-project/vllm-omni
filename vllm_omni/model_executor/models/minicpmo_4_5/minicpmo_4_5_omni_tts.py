@@ -1232,11 +1232,12 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 request_states = {}
                 self._request_audio_states = request_states
             request_states[request_id] = state
-            if native_duplex:
-                # A new duplex condition starts a fresh codec segment: drop the
-                # sampler's device-side caches for this request so the next
-                # decode rebuilds them from this condition's state (step, EOS
-                # floor, limits) instead of resuming the previous segment's.
+            if native_duplex or live_budget is not None:
+                # A new duplex condition, or a new Live unit's re-prefill,
+                # starts a fresh codec segment: drop the sampler's device-side
+                # caches for this request so the next decode rebuilds them from
+                # this condition's state (step, EOS floor, limits) instead of
+                # resuming the previous segment's.
                 # The repetition-penalty window is carried through the state
                 # and ``codes`` above, so only the counters and the cached
                 # input tensors reset.

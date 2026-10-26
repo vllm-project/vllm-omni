@@ -7,7 +7,19 @@ session_mode: turn
 
 live_session_config:
   session_lifetime_s: 1800
-  # Each session keeps a streaming audio-encoder cache of up to ~150 MB on the
-  # Stage 0 GPU that vLLM's memory profiling does not count. Set a bound when
-  # the Stage 0 headroom is tight.
-  max_sessions: null
+  # Sized for one 96 GB GPU (RTX PRO 6000 / H100-class). Stage 0 KV cache:
+  # 8 sessions x 16,384 tokens x ~144 KB/token (36 layers, 8 KV heads, head dim
+  # 128, bf16) is ~18 GiB. Each session also keeps a streaming audio-encoder
+  # cache of up to ~150 MB on the Stage 0 GPU that vLLM's memory profiling does
+  # not count (~1.2 GB for 8). On smaller GPUs lower max_sessions or Stage 0
+  # max_model_len: sessions that do not fit stall until max_input_backlog_s
+  # closes them.
+  max_sessions: 8
+  # Input audio queued behind the model before the session is closed (a
+  # server error to the client); a real-time client stays under 1 s.
+  max_input_backlog_s: 10
+
+stages:
+  - stage_id: 0
+    # A session trims its oldest units when it reaches this context.
+    max_model_len: 16384

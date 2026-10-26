@@ -125,6 +125,13 @@ x-live-sessions: &live_sessions
   - tests/e2e/online_serving/helpers/live_sessions.py
   - tests/helpers/stage_config.py
 
+x-personaplex: &personaplex
+  - vllm_omni/engine/async_omni_engine.py
+  - vllm_omni/entrypoints/omni_base.py
+  - vllm_omni/model_executor/models/personaplex/
+  - vllm_omni/model_executor/stage_input_processors/personaplex.py
+  - vllm_omni/deploy/personaplex.yaml
+
 x-qwen2-5-omni: &qwen2_5_omni
   - vllm_omni/engine/async_omni_engine.py
   - vllm_omni/entrypoints/omni_base.py
@@ -430,6 +437,13 @@ source_file_dependencies:
     - vllm_omni/deploy/minicpmo_4_5_live.yaml
     - tests/e2e/online_serving/test_minicpmo_4_5_live.py
     - tests/e2e/online_serving/helpers/minicpmo_4_5_duplex.py
+    - tests/assets/minicpmo_4_5/
+
+  omni_personaplex_live_function:
+    - *personaplex
+    - *live_sessions
+    - vllm_omni/deploy/personaplex_live.yaml
+    - tests/e2e/online_serving/test_personaplex_live.py
     - tests/assets/minicpmo_4_5/
 
   omni_minicpmo_4_5_duplex_mrv2_function:

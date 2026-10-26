@@ -1291,7 +1291,7 @@ def _select_processor_funcs(
 
 
 def live_session_capacity(deploy: DeployConfig) -> int | None:
-    """Concurrent Live sessions a Live deployment bounds, if it does."""
+    """A Live deployment's ``max_sessions``; None when Live is off."""
     live = deploy.live_session_config
     return live.max_sessions if live is not None else None
 
@@ -1300,7 +1300,8 @@ def streaming_session_capacity(deploy: DeployConfig) -> int:
     """Capacity of model-owned per-session streaming state (codec rows)."""
     if deploy.session_mode == "duplex":
         return deploy.duplex_session.worker_max_sessions
-    return live_session_capacity(deploy) or 1
+    live = live_session_capacity(deploy)
+    return live if live is not None else 1
 
 
 def add_live_session_logits_processor(

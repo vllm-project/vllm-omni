@@ -24,6 +24,7 @@ from typing import Any
 
 import numpy as np
 import torch
+from vllm.logger import init_logger
 
 from vllm_omni.model_executor.models.personaplex.prompting import (
     AUDIO_SILENCE_FRAME_CNT,
@@ -36,6 +37,8 @@ from vllm_omni.model_executor.models.personaplex.prompting import (
     personaplex_model_dir,
     wrap_with_system_tags,
 )
+
+logger = init_logger(__name__)
 
 LIVE_KEY = "personaplex_live"
 _AGENT_CODEBOOKS = 8
@@ -56,6 +59,9 @@ class _LiveSession:
     encoded_seq: int = 0
     encoded: torch.Tensor | None = None
     codes: torch.Tensor | None = None
+    # A preemption recompute re-ran frames whose embeddings are gone; the API
+    # server cancels the session.
+    preempted: bool = False
 
 
 class PersonaPlexLiveStage0:
@@ -217,13 +223,31 @@ class PersonaPlexLiveStage0:
             self._prepare(request_id, session, live, info)
             session.prompt_offset = int(info["_omni_prompt_len"]) - int(session.embeds.shape[0])
         local = int(info["_omni_num_computed_tokens"]) - session.prompt_offset
+        if local < 0:
+            # A recompute after preemption re-runs earlier frames, whose
+            # embeddings are gone. Fill the span with zeros: the session is
+            # cancelled, so the request's context no longer matters.
+            if not session.preempted:
+                logger.warning(
+                    "PersonaPlex Live: request %s was preempted (span starts %d rows before the current frame); "
+                    "cancelling its session",
+                    request_id,
+                    -local,
+                )
+            session.preempted = True
+            hidden = int(session.embeds.shape[1])
+            return input_ids, torch.zeros((span, hidden), device=input_ids.device, dtype=self.model._dtype), {}
         embeds = session.embeds[local : local + span]
-        if local < 0 or embeds.shape[0] != span:
+        if embeds.shape[0] != span:
             raise ValueError(
                 f"PersonaPlex Live span [{local}, {local + span}) is outside the prepared frame "
                 f"({session.embeds.shape[0]} rows) of {request_id}"
             )
         return input_ids, embeds.to(device=input_ids.device, dtype=self.model._dtype), {}
+
+    def is_preempted(self, request_id: str | None) -> bool:
+        session = self.sessions.get(request_id) if request_id is not None else None
+        return session is not None and session.preempted
 
     def take_codes(self, request_id: str | None) -> torch.Tensor | None:
         session = self.sessions.get(request_id) if request_id is not None else None

@@ -224,3 +224,53 @@ async def watch_context_trims(url: str, session: LiveSession, stop: asyncio.Even
         except TimeoutError:
             pass
     return changes
+
+
+def error_codes(session: LiveSession) -> list[str]:
+    return [event["error"]["code"] for event in session.errors()]
+
+
+async def converse_until_server_ends_one(
+    url: str, model: str, voice: str, speech: np.ndarray, *, gap_s: float, window_s: float
+) -> list[LiveSession]:
+    """Two sessions talk until the server ends one of them, or ``window_s`` passes.
+
+    Meant for a server whose Stage 0 KV cache holds one full context: the two
+    growing requests run it out, and the stalled sessions are ended by the
+    backlog limit.
+    """
+    done = asyncio.Event()
+
+    async def converse(session: LiveSession, lead_s: float) -> None:
+        await session.silence(lead_s)
+        while not done.is_set() and not session.closed_by_server and session.now() < window_s:
+            await session.say(speech, gap_s=gap_s)
+        done.set()
+
+    async with (
+        LiveSession(url, model, voice, name="a") as a,
+        LiveSession(url, model, voice, name="b") as b,
+    ):
+        await asyncio.gather(converse(a, 1.0), converse(b, 1.5))
+    return [a, b]
+
+
+def live_errors(url: str, reason: str) -> float:
+    """``vllm_omni:live_errors`` for ``reason``, summed over its series (0 before the first)."""
+    with urllib.request.urlopen(url, timeout=10) as resp:
+        text = resp.read().decode()
+    pattern = re.compile(
+        r'^vllm_omni:live_errors(?:_total)?\{[^}]*reason="' + re.escape(reason) + r'"[^}]*\}\s+(\S+)$', re.M
+    )
+    return sum(float(value) for value in pattern.findall(text))
+
+
+def assert_ended_by_server(sessions: list[LiveSession], window_s: float) -> None:
+    """At least one session was ended with a generic server error and close 1013, and nothing else went wrong."""
+    codes = {session.name: error_codes(session) for session in sessions}
+    ended = [session for session in sessions if session.closed_by_server]
+    assert ended, f"no session was ended by the server within {window_s:.0f} s: {codes}"
+    assert all(set(found) <= {"internal_server_error"} for found in codes.values()), codes
+    for session in ended:
+        assert codes[session.name] == ["internal_server_error"], (session.name, codes[session.name])
+        assert session.close_code == 1013, (session.name, session.close_code)

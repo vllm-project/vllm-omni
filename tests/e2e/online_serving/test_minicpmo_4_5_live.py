@@ -3,9 +3,11 @@
 
 """GPU coverage for MiniCPM-o 4.5 on the OpenAI Live endpoint (``/v1/live/sessions``).
 
-One server for the module: ``minicpmo_4_5_live.yaml`` with Stage 0 at
-``max_model_len: 1024`` (the first context trim comes about a minute into a
-session, so the short scenarios stay below it) and ``max_sessions: 2``.
+Two servers, both ``minicpmo_4_5_live.yaml`` with Stage 0 at ``max_model_len:
+1024`` (the first context trim comes about a minute into a session, so the
+short scenarios stay below it) and ``max_sessions: 2``. The second also caps
+the Stage 0 KV cache at one full context, so two growing sessions run it out
+and stall.
 """
 
 from __future__ import annotations
@@ -17,7 +19,10 @@ import pytest
 from tests.e2e.online_serving.helpers.live_sessions import (
     LiveSession,
     Utterance,
+    assert_ended_by_server,
     context_trims,
+    converse_until_server_ends_one,
+    live_errors,
     live_url,
     load_speech,
     metrics_url,
@@ -33,26 +38,44 @@ pytestmark = pytest.mark.omni
 
 VOICE = "default"
 MAX_SESSIONS = 2
+STARVE_WINDOW_S = 120.0
+# The base limits (64 images and audios, a 128-frame video) cannot fit 1024
+# tokens; Live prompts carry one audio item, the reference voice.
+STAGE0 = {"stage_id": 0, "max_model_len": 1024, "limit_mm_per_prompt": {"image": 0, "audio": 1, "video": 0}}
 LIVE_DEPLOY = write_deploy_overlay(
     get_deploy_config_path("minicpmo_4_5_live.yaml"),
     {
-        "live_session_config": {"session_lifetime_s": 1800, "max_sessions": MAX_SESSIONS},
-        # The base limits (64 images and audios, a 128-frame video) cannot fit
-        # 1024 tokens; Live prompts carry one audio item, the reference voice.
-        "stages": [{"stage_id": 0, "max_model_len": 1024, "limit_mm_per_prompt": {"image": 0, "audio": 1, "video": 0}}],
+        "live_session_config": {"session_lifetime_s": 1800, "max_sessions": MAX_SESSIONS, "max_input_backlog_s": 10},
+        "stages": [STAGE0],
     },
 )
-SERVER_PARAMS = [
-    pytest.param(
+# 65 blocks of 16 tokens: one full 1024-token context (vLLM keeps one block
+# back, so 64 would not admit a 1024-token request). Two growing sessions
+# run it out and stall (waiting Live requests keep their blocks and are not
+# preempted) until the backlog limit ends them.
+STARVE_DEPLOY = write_deploy_overlay(
+    get_deploy_config_path("minicpmo_4_5_live.yaml"),
+    {
+        "live_session_config": {"session_lifetime_s": 1800, "max_sessions": MAX_SESSIONS, "max_input_backlog_s": 10},
+        "stages": [{**STAGE0, "block_size": 16, "num_gpu_blocks_override": 65}],
+    },
+)
+
+
+def _server(deploy: str, server_id: str):
+    return pytest.param(
         OmniServerParams(
             model=MODEL,
-            stage_config_path=LIVE_DEPLOY,
+            stage_config_path=deploy,
             use_stage_cli=False,
             server_args=["--trust-remote-code"],
         ),
-        id="live-1024",
+        id=server_id,
     )
-]
+
+
+SERVER_PARAMS = [_server(LIVE_DEPLOY, "live-1024")]
+STARVE_SERVER_PARAMS = [_server(STARVE_DEPLOY, "live-1024-kv-1024")]
 
 
 def _assert_healthy(session: LiveSession) -> None:
@@ -165,3 +188,28 @@ def test_minicpmo_live_concurrent_sessions(omni_server) -> None:
     assert close_code == 1013
     for session in sessions:
         _assert_answered(session)
+
+
+@pytest.mark.advanced_model
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@pytest.mark.parametrize("omni_server", STARVE_SERVER_PARAMS, indirect=True)
+def test_minicpmo_live_kv_exhaustion_ends_stalled_sessions(omni_server) -> None:
+    """Sessions stalled on a full Stage 0 KV cache are ended by the backlog limit; the server recovers."""
+    speech = load_speech()
+    url = live_url(omni_server)
+    metrics = metrics_url(omni_server)
+    before = live_errors(metrics, "backlog")
+
+    async def run() -> tuple[list[LiveSession], LiveSession]:
+        sessions = await converse_until_server_ends_one(url, MODEL, VOICE, speech, gap_s=6.0, window_s=STARVE_WINDOW_S)
+        async with LiveSession(url, MODEL, VOICE, name="after") as after:
+            await after.silence(1.0)
+            await after.say(speech, gap_s=6.0)
+            await after.close()
+        return sessions, after
+
+    sessions, after = asyncio.run(run())
+
+    assert_ended_by_server(sessions, STARVE_WINDOW_S)
+    assert live_errors(metrics, "backlog") > before, "the backlog limit did not end the stalled sessions"
+    _assert_answered(after)

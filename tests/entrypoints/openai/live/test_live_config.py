@@ -22,33 +22,42 @@ from vllm_omni.model_executor.models.personaplex.pipeline import PERSONAPLEX_PIP
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 _LOGITS = "pkg.mod:Live"
+_DEPLOY = {"session_lifetime_s": 60, "max_sessions": 2, "max_input_backlog_s": 5}
 
 
-def test_deploy_config_defaults():
-    config = LiveSessionDeployConfig.from_dict(None)
-
-    assert config.session_lifetime_s == 1800
-    assert config.max_sessions is None
+def _live(max_sessions: int = 3) -> LiveSessionDeployConfig:
+    return LiveSessionDeployConfig(session_lifetime_s=1800, max_sessions=max_sessions, max_input_backlog_s=10)
 
 
 def test_deploy_config_from_dict():
-    config = LiveSessionDeployConfig.from_dict({"session_lifetime_s": 60, "max_sessions": 2})
+    config = LiveSessionDeployConfig.from_dict(_DEPLOY)
 
-    assert (config.session_lifetime_s, config.max_sessions) == (60, 2)
+    assert (config.session_lifetime_s, config.max_sessions, config.max_input_backlog_s) == (60, 2, 5)
+
+
+@pytest.mark.parametrize("key", list(_DEPLOY))
+def test_deploy_config_requires_every_key(key):
+    raw = {name: value for name, value in _DEPLOY.items() if name != key}
+
+    with pytest.raises(ValueError, match=f"missing required keys: \\['{key}'\\]"):
+        LiveSessionDeployConfig.from_dict(raw)
 
 
 @pytest.mark.parametrize(
-    ("raw", "match"),
+    ("override", "match"),
     [
         pytest.param({"session_cap": 2}, "Unknown live_session_config keys", id="unknown-key"),
-        pytest.param({"session_lifetime_s": 0}, "session_lifetime_s must be positive", id="lifetime-zero"),
-        pytest.param({"max_sessions": 0}, "max_sessions must be positive or null", id="max-sessions-zero"),
-        pytest.param({"max_sessions": -1}, "max_sessions must be positive or null", id="max-sessions-negative"),
+        pytest.param({"session_lifetime_s": 0}, "session_lifetime_s must be a positive number", id="lifetime-zero"),
+        pytest.param({"max_sessions": None}, "max_sessions must be a positive number", id="max-sessions-null"),
+        pytest.param({"max_sessions": 0}, "max_sessions must be a positive number", id="max-sessions-zero"),
+        pytest.param({"max_sessions": 1.5}, "max_sessions must be an integer", id="max-sessions-float"),
+        pytest.param({"max_input_backlog_s": 0}, "max_input_backlog_s must be a positive number", id="backlog-zero"),
+        pytest.param({"max_input_backlog_s": -1}, "max_input_backlog_s must be a positive number", id="backlog-neg"),
     ],
 )
-def test_deploy_config_rejects(raw, match):
+def test_deploy_config_rejects(override, match):
     with pytest.raises(ValueError, match=match):
-        LiveSessionDeployConfig.from_dict(raw)
+        LiveSessionDeployConfig.from_dict({**_DEPLOY, **override})
 
 
 @pytest.mark.parametrize(
@@ -83,14 +92,18 @@ def test_bundled_pipelines_declare_a_loadable_live_processor(pipeline):
 
 
 @pytest.mark.parametrize(
-    ("deploy", "max_sessions"),
-    [("minicpmo_4_5_live.yaml", None), ("personaplex_live.yaml", 2)],
+    ("deploy", "max_sessions", "stage0_max_model_len"),
+    [("minicpmo_4_5_live.yaml", 8, 16384), ("personaplex_live.yaml", 2, 3000)],
 )
-def test_bundled_live_deploy_configs(deploy, max_sessions):
+def test_bundled_live_deploy_configs(deploy, max_sessions, stage0_max_model_len):
     config = load_deploy_config(get_deploy_config_path(deploy))
+    stage0 = next(stage for stage in config.stages if stage.stage_id == 0)
 
     assert config.session_mode == "turn"
-    assert config.live_session_config == LiveSessionDeployConfig(session_lifetime_s=1800, max_sessions=max_sessions)
+    assert config.live_session_config == LiveSessionDeployConfig(
+        session_lifetime_s=1800, max_sessions=max_sessions, max_input_backlog_s=10
+    )
+    assert stage0.max_model_len == stage0_max_model_len
 
 
 def _deploy(live=None, session_mode="turn", worker_max_sessions=4):
@@ -105,8 +118,7 @@ def _deploy(live=None, session_mode="turn", worker_max_sessions=4):
     ("deploy", "live", "streaming"),
     [
         pytest.param(_deploy(), None, 1, id="chat"),
-        pytest.param(_deploy(LiveSessionDeployConfig()), None, 1, id="live-unbounded"),
-        pytest.param(_deploy(LiveSessionDeployConfig(max_sessions=3)), 3, 3, id="live-bounded"),
+        pytest.param(_deploy(_live(3)), 3, 3, id="live"),
         pytest.param(_deploy(session_mode="duplex", worker_max_sessions=5), None, 5, id="duplex"),
     ],
 )
@@ -125,7 +137,7 @@ def test_logits_processor_added_on_live_deployments_only():
     live_args: dict = {}
 
     add_live_session_logits_processor(chat_args, 0, pipeline, _deploy())
-    add_live_session_logits_processor(live_args, 0, pipeline, _deploy(LiveSessionDeployConfig()))
+    add_live_session_logits_processor(live_args, 0, pipeline, _deploy(_live()))
 
     assert chat_args == {}
     assert live_args == {"logits_processors": [_LOGITS]}
@@ -134,14 +146,14 @@ def test_logits_processor_added_on_live_deployments_only():
 def test_logits_processor_only_on_its_stage():
     args: dict = {}
 
-    add_live_session_logits_processor(args, 1, _pipeline({0: _LOGITS}), _deploy(LiveSessionDeployConfig()))
+    add_live_session_logits_processor(args, 1, _pipeline({0: _LOGITS}), _deploy(_live()))
 
     assert args == {}
 
 
 def test_logits_processor_appended_once_to_existing_ones():
     args = {"logits_processors": ["other:Proc"]}
-    deploy = _deploy(LiveSessionDeployConfig())
+    deploy = _deploy(_live())
 
     add_live_session_logits_processor(args, 0, _pipeline({0: _LOGITS}), deploy)
     add_live_session_logits_processor(args, 0, _pipeline({0: _LOGITS}), deploy)
@@ -152,8 +164,6 @@ def test_logits_processor_appended_once_to_existing_ones():
 def test_logits_processor_skipped_without_pipeline_live_config():
     args: dict = {}
 
-    add_live_session_logits_processor(
-        args, 0, SimpleNamespace(live_session_config=None), _deploy(LiveSessionDeployConfig())
-    )
+    add_live_session_logits_processor(args, 0, SimpleNamespace(live_session_config=None), _deploy(_live()))
 
     assert args == {}

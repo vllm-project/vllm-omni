@@ -104,7 +104,7 @@ class ResumableRequestDriver:
         task, self._task, self._queue = self._task, None, None
         if task is None or task is asyncio.current_task():
             # Called from the request's own output/error callback: the task
-            # is already unwinding and closes its generator in ``finally``.
+            # stops after the callback and closes its generator in ``finally``.
             return
         if not task.done():
             task.cancel()
@@ -141,18 +141,20 @@ class ResumableRequestDriver:
                     completions = getattr(output, "outputs", None) or ()
                     first = completions[0] if completions else None
                     logger.debug(
-                        "Live %s output: stage=%s type=%s tokens=%s finish=%s finished=%s segment=%s mm=%s",
+                        "Live %s output: stage=%s type=%s tokens=%s finish=%s finished=%s mm=%s",
                         request_id,
                         getattr(output, "stage_id", None),
                         getattr(output, "final_output_type", None),
                         list(getattr(first, "token_ids", None) or ()),
                         getattr(first, "finish_reason", None),
                         getattr(output, "finished", None),
-                        getattr(output, "segment_finished", None),
                         sorted((getattr(output, "multimodal_output", None) or {}).keys()),
                     )
                 self._track(output)
                 await self._on_output(epoch, output)
+                if self._task is not asyncio.current_task():
+                    # The callback aborted or replaced this request.
+                    break
             logger.info("Live request %s ended", request_id)
         except asyncio.CancelledError:
             raise

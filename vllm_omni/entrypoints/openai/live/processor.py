@@ -13,13 +13,14 @@ from __future__ import annotations
 import copy
 import importlib
 from abc import ABC, abstractmethod
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, ClassVar
 
 import numpy as np
 from vllm.logger import init_logger
 
+from vllm_omni.config.live_session import LIVE_PREEMPTED_KEY
 from vllm_omni.entrypoints.openai.live.protocol import LiveProtocolError
 from vllm_omni.entrypoints.openai.live.session import LiveSessionState, NativeUnitItem
 
@@ -229,3 +230,12 @@ class LiveSessionProcessor(ABC):
     def observe_multimodal_output(self, state: LiveSessionState, output: Any) -> str:
         """Record per-stream model outputs; returns transcript text, if any."""
         return ""
+
+    def is_preempted(self, output: Any) -> bool:
+        """Whether a stage-0 output reports that the model lost the request's
+        context to a preemption recompute."""
+        completion = output.outputs[0] if getattr(output, "outputs", None) else None
+        for mm in (getattr(output, "multimodal_output", None), getattr(completion, "multimodal_output", None)):
+            if isinstance(mm, Mapping) and bool(mm.get(LIVE_PREEMPTED_KEY, False)):
+                return True
+        return False

@@ -55,12 +55,12 @@ BACKLOG_WARNING_UNITS = 3
 class SessionSlots:
     """Live sessions admitted on this API server, bounded by ``max_sessions``."""
 
-    def __init__(self, limit: int | None) -> None:
+    def __init__(self, limit: int) -> None:
         self.limit = limit
         self.active = 0
 
     def acquire(self) -> bool:
-        if self.limit is not None and self.active >= self.limit:
+        if self.active >= self.limit:
             return False
         self.active += 1
         return True
@@ -99,7 +99,7 @@ class LiveSessionHandler:
         self.deploy = deploy_config
         self.processor_cls = processor_cls
         self.processor_context = processor_context
-        self.slots = slots or SessionSlots(None)
+        self.slots = slots or SessionSlots(deploy_config.max_sessions)
         self.metrics = metrics or LiveSessionMetrics(model_name, log_stats=False)
 
         self.state: LiveSessionState | None = None
@@ -180,6 +180,17 @@ class LiveSessionHandler:
         self.metrics.error(reason)
         await self._send_error(proto.internal_error())
         await self._close(None, send_closed=False, code=proto.CLOSE_INTERNAL_ERROR)
+
+    async def _abort(self, reason: str, detail: str) -> None:
+        """End the session for a server-side cause the client is not told:
+        generic ``internal_server_error``, then close with 1013 (the client may
+        start a new session). The cause goes to the log and the metric."""
+        if self._closing:
+            return
+        logger.error("Live session %s ended (%s): %s", self._session_id, reason, detail)
+        self.metrics.error(reason)
+        await self._send_error(proto.internal_error())
+        await self._close(None, send_closed=False, code=proto.CLOSE_TRY_AGAIN_LATER)
 
     async def _close(
         self,
@@ -461,6 +472,12 @@ class LiveSessionHandler:
             processor.push_audio(model_samples, start_ms)
         while (unit := processor.next_unit()) is not None:
             self._pending.append(unit)
+        backlog_s = sum(unit.end_ms - unit.start_ms for unit in self._pending) / 1000.0
+        if backlog_s > self.deploy.max_input_backlog_s:
+            await self._abort(
+                "backlog", f"{backlog_s:.1f} s of input audio queued, limit {self.deploy.max_input_backlog_s:g} s"
+            )
+            return
         if len(self._pending) > max(BACKLOG_WARNING_UNITS, self._backlog_warned):
             self._backlog_warned = len(self._pending)
             logger.warning("Live session %s: model is %d units behind real time", state.id, len(self._pending))
@@ -573,6 +590,9 @@ class LiveSessionHandler:
         start_ms, end_ms = (unit.start_ms, unit.end_ms) if unit is not None else (state.now_ms,) * 2
         if getattr(output, "stage_id", None) == 0 and getattr(output, "outputs", None):
             completion = output.outputs[0]
+            if processor.is_preempted(output):
+                await self._abort("preempted", "the stage-0 request was preempted and lost its context")
+                return
             if self._prefix_open:
                 if finish_reason_str(getattr(completion, "finish_reason", None)) is not None:
                     await self._on_prefix_finished()

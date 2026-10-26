@@ -38,7 +38,11 @@ from vllm.v1.sample.metadata import SamplingMetadata
 
 from vllm_omni.model_executor.duplex_sampling import DuplexSamplingRow
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import MiniCPMO45DuplexPolicy
-from vllm_omni.model_executor.models.minicpmo_4_5.live.encoder import LIVE_AUDIO_KEY, apply_live_audio
+from vllm_omni.model_executor.models.minicpmo_4_5.live.encoder import (
+    LIVE_AUDIO_KEY,
+    apply_live_audio,
+    live_preempted_rows,
+)
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_llm import (
     MiniCPMO45OmniLLMDummyInputsBuilder,
     MiniCPMO45OmniLLMMultiModalProcessor,
@@ -863,6 +867,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             runtime_info = kwargs.get("runtime_additional_information")
             if runtime_info and isinstance(runtime_info, list) and len(runtime_info) > 0:
                 multimodal_outputs.update(_duplex_row_outputs(runtime_info))
+                multimodal_outputs.update(live_preempted_rows(runtime_info))
             return OmniOutput(
                 text_hidden_states=text_hidden_states,
                 multimodal_outputs=multimodal_outputs,
