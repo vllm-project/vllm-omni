@@ -6,6 +6,7 @@ Padding is removed before attention, never masked
 into the model's sequence. Equal-sized A2A avoids variable-split HCCL calls.
 """
 
+import os
 from dataclasses import dataclass
 
 import torch
@@ -58,7 +59,9 @@ def pack_heads(local, size, capacity):
     return output
 
 
-def unpack_tokens(received, plan, *, token_indices=None):
+def unpack_tokens(received, plan, *, token_indices=None, permutation=None):
+    if permutation is not None:
+        return received.flatten(0, 1).index_select(0, permutation)
     output = received.new_empty((sum(plan.segment_lengths), *received.shape[2:]))
     for rank, indices in enumerate(plan.rank_token_indices):
         ids = (
@@ -70,8 +73,16 @@ def unpack_tokens(received, plan, *, token_indices=None):
     return output
 
 
-def pack_tokens(full, plan, *, token_indices=None):
+def pack_tokens(full, plan, *, token_indices=None, permutation=None, padding_mask=None):
     capacity = max(1, max(map(len, plan.rank_token_indices)))
+    if permutation is not None:
+        shape = (len(plan.rank_token_indices), capacity, *full.shape[1:])
+        if full.shape[0] == 0:
+            return full.new_zeros(shape)
+        packed = full.index_select(0, permutation)
+        if padding_mask is not None:
+            packed.masked_fill_(padding_mask.reshape(-1, *([1] * (full.ndim - 1))), 0)
+        return packed.reshape(shape)
     output = full.new_zeros((len(plan.rank_token_indices), capacity, *full.shape[1:]))
     for rank, indices in enumerate(plan.rank_token_indices):
         ids = (
@@ -90,12 +101,23 @@ def unpack_heads(received, count):
     return received[:, :count].permute(1, 0, 2, 3).reshape(count, size * heads, dim).contiguous()
 
 
+def vision_permutation_enabled(name="VLLM_OMNI_H3_VISION_PERMUTE"):
+    """Keep the candidate opt-in until device correctness and performance gates pass."""
+    value = os.environ.get(name, "0")
+    if value not in ("0", "1"):
+        raise ValueError(f"{name} must be 0 or 1")
+    return value == "1"
+
+
 class VisionAllToAll:
     """Explicit-group transport; callers coordinate validation failures."""
 
-    def __init__(self, plan, *, group=None):
+    def __init__(self, plan, *, group=None, use_permutation=False, verify_permutation=False):
         self.plan = plan
         self.group = group
+        self.use_permutation = use_permutation
+        self.verify_permutation = verify_permutation
+        self._verified_layouts: set[tuple] = set()
         self.rank = dist.get_rank(group=group)
         self.size = dist.get_world_size(group=group)
         if self.size != len(plan.rank_token_indices):
@@ -107,6 +129,28 @@ class VisionAllToAll:
         # or indices across requests with different segment layouts.
         self._token_indices_device: torch.device | None = None
         self._token_indices: tuple[torch.Tensor, ...] = ()
+        self._permutation_device: torch.device | None = None
+        self._permutation: tuple[torch.Tensor, torch.Tensor, torch.Tensor | None] | None = None
+
+    def _permutation_for(self, device):
+        if device != self._permutation_device:
+            inverse = [0] * sum(self.plan.segment_lengths)
+            source = []
+            padding = []
+            for rank, indices in enumerate(self.plan.rank_token_indices):
+                for slot, token in enumerate(indices):
+                    inverse[token] = rank * self.capacity + slot
+                source.extend(indices)
+                source.extend([0] * (self.capacity - len(indices)))
+                padding.extend([False] * len(indices) + [True] * (self.capacity - len(indices)))
+            self._permutation = (
+                torch.tensor(inverse, dtype=torch.long, device=device),
+                torch.tensor(source, dtype=torch.long, device=device),
+                torch.tensor(padding, dtype=torch.bool, device=device) if any(padding) else None,
+            )
+            self._permutation_device = device
+        assert self._permutation is not None
+        return self._permutation
 
     def _indices_for(self, device):
         if device != self._token_indices_device:
@@ -123,7 +167,37 @@ class VisionAllToAll:
         self.sent_bytes += packed.numel() * packed.element_size()
         return received
 
+    def _verify_layout(self, operation, value, result):
+        # Diagnostic only: never enable this synchronization in performance runs.
+        key = (operation, tuple(value.shape), value.stride(), value.dtype, value.device)
+        if not self.verify_permutation:
+            return
+        failed = False
+        if key not in self._verified_layouts:
+            indices = self._indices_for(value.device)
+            reference = (
+                unpack_tokens(value, self.plan, token_indices=indices)
+                if operation == "unpack"
+                else pack_tokens(value, self.plan, token_indices=indices)
+            )
+            failed = result.stride() != reference.stride() or not torch.equal(
+                result.contiguous().view(torch.uint8), reference.contiguous().view(torch.uint8)
+            )
+        # Every rank participates on every diagnostic call, even when its shape
+        # was checked before. Uneven shards can have different cache keys.
+        status = torch.tensor([int(failed)], dtype=torch.int32, device=value.device)
+        dist.all_reduce(status, op=dist.ReduceOp.MAX, group=self.group)
+        if status.item():
+            raise RuntimeError(f"vision {operation} permutation changed bytes or strides")
+        self._verified_layouts.add(key)
+
     def to_heads(self, local):
+        if self.use_permutation:
+            inverse, _, _ = self._permutation_for(local.device)
+            received = self.exchange(pack_heads(local, self.size, self.capacity))
+            result = unpack_tokens(received, self.plan, permutation=inverse)
+            self._verify_layout("unpack", received, result)
+            return result
         return unpack_tokens(
             self.exchange(pack_heads(local, self.size, self.capacity)),
             self.plan,
@@ -131,6 +205,11 @@ class VisionAllToAll:
         )
 
     def to_tokens(self, full):
+        if self.use_permutation:
+            _, source, padding = self._permutation_for(full.device)
+            packed = pack_tokens(full, self.plan, permutation=source, padding_mask=padding)
+            self._verify_layout("pack", full, packed)
+            return unpack_heads(self.exchange(packed), len(self.plan.rank_token_indices[self.rank]))
         packed = pack_tokens(full, self.plan, token_indices=self._indices_for(full.device))
         return unpack_heads(self.exchange(packed), len(self.plan.rank_token_indices[self.rank]))
 
