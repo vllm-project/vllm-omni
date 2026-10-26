@@ -54,6 +54,24 @@ def _text(items: list[dict[str, Any]]) -> str:
     return " ".join(str(item.get("sentence", item.get("text", ""))).strip() for item in items).strip()
 
 
+def _gt_references(answers: list[object]) -> list[str]:
+    """Mirror the official evaluator's reference handling.
+
+    Drop empty strings (order-preserving, strip-based) then deduplicate while
+    keeping the first occurrence, as ``non_empty_strings`` followed by
+    ``load_reference_texts`` does in OpenBMB/Omni-DuplexEval. Numbering an
+    empty or repeated answer would deviate from the pinned content prompt.
+    """
+    references = []
+    for answer in answers:
+        if answer is None:
+            continue
+        text = str(answer).strip()
+        if text:
+            references.append(text)
+    return list(dict.fromkeys(references))
+
+
 def evaluate_sample(
     sample: DuplexSample,
     response_path: Path,
@@ -146,7 +164,9 @@ def evaluate_sample(
         content_frames = None
         if judge_video_mode == "frame-sample":
             content_frames = _extract_frames(video_path, _content_frame_times(duration))
-        content_prompt = build_content_prompt(_text(items), sample.question_text, [sample.answer1, sample.answer2])
+        content_prompt = build_content_prompt(
+            _text(items), sample.question_text, _gt_references([sample.answer1, sample.answer2])
+        )
         try:
             content = judge_result(
                 lambda: judge.content(content_prompt, video_path, frames=content_frames, mode=judge_video_mode),

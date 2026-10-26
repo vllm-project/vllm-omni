@@ -1141,12 +1141,14 @@ def _project_omni_stage_engine_args(
                         stacklevel=2,
                     )
     if not is_diffusion:
-        # These values configure OmniDiffusionConfig or its worker process;
-        # OmniEngineArgs has no matching fields for LLM stages.
+        # These defaults configure diffusion loading or its worker process.
+        # Do not project them onto LLM stages, even when OmniEngineArgs also
+        # declares a field to preserve explicit diffusion CLI values.
         model_excluded_fields.update(
             {
                 "disable_autocast",
                 "enable_multithread_weight_load",
+                "enable_broadcast_weight_load",
                 "num_weight_load_threads",
             }
         )

@@ -319,10 +319,14 @@ for the command and configuration requirements.
 
 #### Compare MiniCPM-o attention backends
 
-The MiniCPM-o profiles leave CUDA Thinker attention selection to vLLM. To
-compare a specific backend, use a deployment overlay that changes only stage 0.
-For example, save the following as `minicpmo_thinker_triton.yaml`, replacing the
-base path with your checkout:
+The default `minicpmo_4_5.yaml` selects Triton attention for the CUDA Thinker
+(stage 0). The Talker's backend selection and graph settings are unchanged.
+The vision tower defaults to SDPA on all platforms; explicit engine or
+vision overrides still win. The turn-mode profile inherits this CUDA default
+from the base deployment too. NPU backend selection is unchanged.
+
+To compare vLLM's automatic Thinker backend selection, save the following as
+`minicpmo_thinker_auto.yaml`, replacing the base path with your checkout:
 
 ```yaml
 base_config: /path/to/vllm-omni/vllm_omni/deploy/minicpmo_4_5.yaml
@@ -330,15 +334,13 @@ platforms:
   cuda:
     stages:
       - stage_id: 0
-        attention_backend: TRITON_ATTN
+        attention_backend: null
 ```
 
-Pass `--deploy-config minicpmo_thinker_triton.yaml` to the server command above.
-The overlay preserves the Talker's backend selection and the profile's graph
-settings. A server-wide `--attention-backend` override also affects the Talker,
-so it is a different experiment. Check each stage's startup log for the actual
-backend and graph mode. The turn-mode profile inherits the base deployment too;
-changing the base profile affects both serving modes.
+Pass `--deploy-config minicpmo_thinker_auto.yaml` to the server command above.
+A server-wide `--attention-backend` override also affects the Talker, so it is
+a different experiment. Check each stage's startup log for the actual backend
+and graph mode.
 
 For a quality comparison, keep the source and model revisions, reference audio,
 input audio/video, frame rate, pacing, window settings and sampling parameters
