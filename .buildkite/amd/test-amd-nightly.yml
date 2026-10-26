@@ -19,6 +19,7 @@ steps:
         mirror_hardwares: [amdproduction]
         grade: NonBlocking
         timeout_in_minutes: 180
+        source_file_dependencies: omni_qwen3_omni_function
         commands:
           - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
           - pytest -s -v tests/e2e/online_serving/test_qwen3_omni_expansion.py -m "full_model and rocm and MI325 and cards_2" --run-level "full_model"
@@ -29,6 +30,7 @@ steps:
         mirror_hardwares: [amdproduction]
         grade: NonBlocking
         timeout_in_minutes: 180
+        source_file_dependencies: omni_qwen3_omni_accuracy
         artifact_paths:
           - tests/e2e/accuracy/qwen3_omni/results/qwen_omni_acc/*.json
         commands:
@@ -51,6 +53,7 @@ steps:
         mirror_hardwares: [amdproduction]
         grade: NonBlocking
         timeout_in_minutes: 120
+        source_file_dependencies: omni_qwen3_omni_doc
         commands:
           - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
           - pytest -s -v tests/examples/online_serving/test_qwen3_omni.py -m "full_model and rocm and MI325 and cards_2" --run-level "full_model"
@@ -61,6 +64,7 @@ steps:
         mirror_hardwares: [amdproduction]
         grade: NonBlocking
         timeout_in_minutes: 90
+        source_file_dependencies: omni_qwen3_omni_function
         commands:
           - export VLLM_ROCM_USE_AITER=1
           - pytest -s -v tests/e2e/online_serving/test_qwen3_omni_expansion.py::test_text_to_text_audio_001 -m "full_model and rocm and MI325 and cards_2" --run-level "full_model"
@@ -76,6 +80,7 @@ steps:
         mirror_hardwares: [amdproduction]
         grade: NonBlocking
         timeout_in_minutes: 120
+        source_file_dependencies: omni_qwen2_5_omni_doc
         artifact_paths:
           - "artifacts/rocm-qwen2-5-omni-doc/**/*"
         commands:
@@ -131,6 +136,7 @@ steps:
         mirror_hardwares: [amdproduction]
         grade: NonBlocking
         timeout_in_minutes: 90
+        source_file_dependencies: tts_cosyvoice3_function
         retry:
           automatic:
             - exit_status: 134
@@ -145,6 +151,7 @@ steps:
         mirror_hardwares: [amdproduction]
         grade: NonBlocking
         timeout_in_minutes: 90
+        source_file_dependencies: tts_cosyvoice3_function
         retry:
           automatic:
             - exit_status: 134
@@ -174,6 +181,7 @@ steps:
         mirror_hardwares: [amdproduction]
         grade: NonBlocking
         timeout_in_minutes: 90
+        source_file_dependencies: diffusion_joy_image_function
         artifact_paths:
           - "artifacts/joy-image-gpu/*.xml"
         commands:
@@ -198,6 +206,7 @@ steps:
         mirror_hardwares: [amdproduction]
         grade: NonBlocking
         timeout_in_minutes: 60
+        source_file_dependencies: diffusion_pi05_unit
         commands:
           - export VLLM_ROCM_USE_AITER=0
           - "pytest -sv tests/diffusion/models/pi05/test_pi05_units.py -m 'core_model and cpu'"
@@ -212,6 +221,7 @@ steps:
         mirror_hardwares: [amdproduction]
         grade: NonBlocking
         timeout_in_minutes: 60
+        source_file_dependencies: omni_processor_function
         env:
           VLLM_OMNI_AMD_PROCESSOR_TIMING: "1"
         artifact_paths:
@@ -230,6 +240,7 @@ steps:
         mirror_hardwares: [amdproduction]
         grade: NonBlocking
         timeout_in_minutes: 120
+        source_file_dependencies: omni_personaplex_temporal_function
         artifact_paths:
           - "artifacts/personaplex-temporal-streaming/**/*"
         commands:
@@ -258,6 +269,7 @@ steps:
         mirror_hardwares: [amdproduction]
         grade: NonBlocking
         timeout_in_minutes: 90
+        source_file_dependencies: diffusion_lingbot_function
         artifact_paths:
           - artifacts/rocm-lingbot-nightly/**/*
         commands:
@@ -275,6 +287,7 @@ steps:
         mirror_hardwares: [amdproduction]
         grade: NonBlocking
         timeout_in_minutes: 90
+        source_file_dependencies: diffusion_hunyuan_video_function
         env:
           DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
         artifact_paths:
@@ -294,6 +307,7 @@ steps:
         mirror_hardwares: [amdproduction]
         grade: NonBlocking
         timeout_in_minutes: 120
+        source_file_dependencies: diffusion_minimax_h3_function
         artifact_paths:
           - artifacts/rocm-minimax-h3-nightly/**/*
         commands:
@@ -381,6 +395,7 @@ steps:
         mirror_hardwares: [amdproduction]
         grade: NonBlocking
         timeout_in_minutes: 90
+        source_file_dependencies: diffusion_qwen_image_function
         env:
           VLLM_ROCM_USE_AITER: "1"
           DIFFUSION_ATTENTION_BACKEND: FLASH_ATTN
@@ -421,6 +436,7 @@ steps:
         mirror_hardwares: [amdproduction]
         grade: NonBlocking
         timeout_in_minutes: 90
+        source_file_dependencies: diffusion_cosmos3_function
         artifact_paths:
           - artifacts/rocm-cosmos3-nightly/**/*
         commands:
@@ -454,6 +470,7 @@ steps:
         mirror_hardwares: [amdproduction]
         grade: NonBlocking
         timeout_in_minutes: 180
+        source_file_dependencies: diffusion_hunyuan_image3_accuracy
         env:
           HUNYUAN_IMAGE3_MODEL: "tencent/HunyuanImage-3.0-Instruct"
           HUNYUAN_IMAGE3_DEVICES: "0,1,2,3"
@@ -479,6 +496,9 @@ steps:
         mirror_hardwares: [amdproduction]
         grade: NonBlocking
         timeout_in_minutes: 60
+        source_file_dependencies:
+          - diffusion_offloader
+          - diffusion_stable_audio_function
         artifact_paths:
           - artifacts/rocm-stable-audio-cpu-offload/**/*
         commands:
@@ -521,6 +541,7 @@ steps:
         mirror_hardwares: [amdproduction]
         grade: NonBlocking
         timeout_in_minutes: 180
+        source_file_dependencies: diffusion_qwen_image_accuracy
         env:
           DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
         artifact_paths:
@@ -574,9 +595,11 @@ steps:
         mirror_hardwares: [amdproduction]
         grade: NonBlocking
         timeout_in_minutes: 180
+        source_file_dependencies: omni_minicpmo_4_5_accuracy
         env:
           SEED_TTS_WER_EVAL: "1"
           SEED_TTS_SIM_EVAL: "1"
+          VLLM_OMNI_CODE2WAV_WATCHDOG_TIMEOUT_S: "60"
         artifact_paths:
           - artifacts/rocm-minicpmo-accuracy/**/*
         commands:
@@ -631,6 +654,7 @@ steps:
         mirror_hardwares: [amdproduction]
         grade: NonBlocking
         timeout_in_minutes: 180
+        source_file_dependencies: diffusion_wan22_accuracy
         env:
           DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
         artifact_paths:
@@ -690,6 +714,7 @@ steps:
         mirror_hardwares: [amdproduction]
         grade: NonBlocking
         timeout_in_minutes: 180
+        source_file_dependencies: diffusion_hunyuan_image3_accuracy
         env:
           HUNYUAN_IMAGE3_MODEL: "tencent/HunyuanImage-3.0-Instruct"
           HUNYUAN_IMAGE3_DEVICES: "0,1,2,3"
@@ -734,6 +759,7 @@ steps:
         mirror_hardwares: [amdproduction]
         grade: NonBlocking
         timeout_in_minutes: 180
+        source_file_dependencies: diffusion_hunyuan_video_accuracy
         env:
           DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
         artifact_paths:
@@ -798,6 +824,7 @@ steps:
         mirror_hardwares: [amdproduction]
         grade: NonBlocking
         timeout_in_minutes: 180
+        source_file_dependencies: diffusion_minimax_h3_accuracy
         env:
           DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
         artifact_paths:
@@ -838,6 +865,7 @@ steps:
         mirror_hardwares: [amdproduction]
         grade: NonBlocking
         timeout_in_minutes: 180
+        source_file_dependencies: diffusion_minimax_h3_accuracy
         env:
           DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
         artifact_paths:
@@ -894,6 +922,7 @@ steps:
         mirror_hardwares: [amdproduction]
         grade: NonBlocking
         timeout_in_minutes: 180
+        source_file_dependencies: diffusion_qwen_image_21_accuracy
         env:
           QWEN_IMAGE_21_CALIBRATE: "0"
           DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
@@ -945,6 +974,70 @@ steps:
 
             exit "$$status"
 
+  - group: ":microscope: Tiny Diffusion Multi-GPU MI300 Nightly"
+    steps:
+      - label: "ROCm · Tiny Diffusion Multi-GPU · 2-GPU"
+        agent_pool: mi300_2
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 40
+        source_file_dependencies: diffusion_tiny_model
+        artifact_paths:
+          - artifacts/rocm-tiny-diffusion-2gpu/**/*
+        commands:
+          - export ROCM_TINY_DIFFUSION_2GPU_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-tiny-diffusion-2gpu"
+          - mkdir -p "$$ROCM_TINY_DIFFUSION_2GPU_ARTIFACT_DIR"
+          - |
+            bash .buildkite/amd/scripts/assert-pytest-collection.sh 12 \
+              tests/model_tests/diffusion/test_common_offline.py \
+              -m "full_model and diffusion and rocm and MI325 and cards_2 and not nvidia_only" \
+              --run-level core_model \
+              | tee "$$ROCM_TINY_DIFFUSION_2GPU_ARTIFACT_DIR/collection.txt"
+          - |
+            set +e
+            timeout --signal=TERM --kill-after=2m 30m \
+              pytest -s -v -ra tests/model_tests/diffusion/test_common_offline.py \
+              -m "full_model and diffusion and rocm and MI325 and cards_2 and not nvidia_only" \
+              --run-level core_model --durations=20 \
+              --junitxml="$$ROCM_TINY_DIFFUSION_2GPU_ARTIFACT_DIR/pytest.xml" \
+              2>&1 | tee "$$ROCM_TINY_DIFFUSION_2GPU_ARTIFACT_DIR/pytest.log"
+            status=$${PIPESTATUS[0]}
+            set -e
+            tail -n 100 "$$ROCM_TINY_DIFFUSION_2GPU_ARTIFACT_DIR/pytest.log" > \
+              "$$ROCM_TINY_DIFFUSION_2GPU_ARTIFACT_DIR/pytest-summary.txt"
+            exit "$$status"
+
+      - label: "ROCm · Tiny Diffusion Multi-GPU · 4-GPU"
+        agent_pool: mi300_4
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 40
+        source_file_dependencies: diffusion_tiny_model
+        artifact_paths:
+          - artifacts/rocm-tiny-diffusion-4gpu/**/*
+        commands:
+          - export ROCM_TINY_DIFFUSION_4GPU_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-tiny-diffusion-4gpu"
+          - mkdir -p "$$ROCM_TINY_DIFFUSION_4GPU_ARTIFACT_DIR"
+          - |
+            bash .buildkite/amd/scripts/assert-pytest-collection.sh 11 \
+              tests/model_tests/diffusion/test_common_offline.py \
+              -m "full_model and diffusion and rocm and MI325 and cards_4 and not nvidia_only" \
+              --run-level core_model \
+              | tee "$$ROCM_TINY_DIFFUSION_4GPU_ARTIFACT_DIR/collection.txt"
+          - |
+            set +e
+            timeout --signal=TERM --kill-after=2m 30m \
+              pytest -s -v -ra tests/model_tests/diffusion/test_common_offline.py \
+              -m "full_model and diffusion and rocm and MI325 and cards_4 and not nvidia_only" \
+              --run-level core_model --durations=20 \
+              --junitxml="$$ROCM_TINY_DIFFUSION_4GPU_ARTIFACT_DIR/pytest.xml" \
+              2>&1 | tee "$$ROCM_TINY_DIFFUSION_4GPU_ARTIFACT_DIR/pytest.log"
+            status=$${PIPESTATUS[0]}
+            set -e
+            tail -n 100 "$$ROCM_TINY_DIFFUSION_4GPU_ARTIFACT_DIR/pytest.log" > \
+              "$$ROCM_TINY_DIFFUSION_4GPU_ARTIFACT_DIR/pytest-summary.txt"
+            exit "$$status"
+
   - group: ":full_moon: Qwen3-Omni Seed-TTS Realtime Perf MI300 Nightly"
     steps:
       - label: "Qwen3-Omni Seed-TTS Realtime Perf"
@@ -953,6 +1046,7 @@ steps:
         mirror_hardwares: [amdproduction]
         grade: NonBlocking
         timeout_in_minutes: 180
+        source_file_dependencies: omni_qwen3_omni_seed_tts_perf
         env:
           BENCHMARK_DIR: "$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-qwen3-omni-seed-tts-perf/benchmark-results"
         artifact_paths:
@@ -1034,6 +1128,7 @@ steps:
         mirror_hardwares: [amdproduction]
         grade: NonBlocking
         timeout_in_minutes: 240
+        source_file_dependencies: omni_duplex_eval_ci
         env:
           BENCHMARK_DIR: tests/dfx/perf/results
           ACC_BENCH_RESULT_DIR: tests/e2e/accuracy/omni_duplex_eval/results

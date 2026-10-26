@@ -206,6 +206,7 @@ def _run_seed_tts_wer_bench(omni_server) -> None:
             str(_MIN_SEED_TTS_MEAN_SIM),
             "--seed-extra-body-json",
             json.dumps(_SEED_EXTRA_BODY, separators=(",", ":")),
+            "--omni-fail-fast-on-timeout",
             "--trust-remote-code",
         ]
     )
