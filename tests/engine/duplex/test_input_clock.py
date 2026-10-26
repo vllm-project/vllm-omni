@@ -975,6 +975,48 @@ def test_held_final_segment_ends_are_replayed_to_their_own_units() -> None:
     assert _decisions(sent) == [[("speak", None), ("speak", None)]]
 
 
+@pytest.mark.parametrize("hooks", [_DefaultHooksPlugin, _NeedsUpstreamAndFinal], ids=["default", "needs_both"])
+def test_a_final_segment_end_waits_for_an_older_units_upstream_decision(
+    hooks: type[DuplexModelPlugin],
+) -> None:
+    """A and B speak; A's Talker ends A silently, so only B reaches the final stage.
+
+    B's final segment end arrives before A's Talker decision. It must wait for
+    that decision instead of going to A: A then completes as ``silent`` and B,
+    with all of its output, completes on its own Talker segment end.
+    """
+    clock, sent = _clock(_plugin(hooks))
+    first, second = _append(clock, units=2)
+    _progress(clock, stage_id=0, final_stage_id=2)  # A speaks
+    _progress(clock, stage_id=0, final_stage_id=2)  # B speaks
+    _progress(clock, stage_id=2, final_stage_id=2)  # B's final segment end, ahead of A's Talker decision
+    assert sent == [] and not first.complete and not second.complete
+
+    _progress(clock, stage_id=1, final_stage_id=2, decision="silent")  # A's Talker ends A
+    assert first.complete and first.decision == "silent" and not second.complete
+    _progress(clock, stage_id=1, final_stage_id=2)  # B's Talker segment end
+
+    assert second.complete
+    assert _decisions(sent) == [[("silent", None), ("speak", None)]]
+
+
+def test_a_final_segment_end_whose_waited_for_unit_left_upstream_is_held_for_the_next_speaker() -> None:
+    """A speaks and B is still undecided at Stage 0; the final end that waited for A is B's."""
+    clock, sent = _clock(_plugin(_NeedsUpstreamAndFinal))
+    first, second = _append(clock, units=2)
+    _progress(clock, stage_id=0, final_stage_id=2)  # A speaks
+    _progress(clock, stage_id=2, final_stage_id=2)  # B's final segment end, ahead of B's Stage-0 segment end
+    _progress(clock, stage_id=1, final_stage_id=2, decision="silent")  # A's Talker ends A
+    assert first.complete and first.decision == "silent" and not second.complete
+
+    _progress(clock, stage_id=0, final_stage_id=2)  # B speaks: the held end is B's
+    assert not second.complete, "B still waits for its Talker segment end"
+    _progress(clock, stage_id=1, final_stage_id=2)  # B's Talker segment end
+
+    assert second.complete and not clock._uncredited_final_ends and not clock._held
+    assert _decisions(sent) == [[("silent", None), ("speak", None)]]
+
+
 def test_later_stage_progress_with_no_undecided_stage0_submission_is_dropped() -> None:
     """A stray final segment end cannot be the next unit's: that unit was not even submitted yet."""
     clock, sent = _clock()

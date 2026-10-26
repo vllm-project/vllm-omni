@@ -331,9 +331,11 @@ class DuplexUnitOutputs:
     index: int
     #: Whether the stage just before the final stage reported its segment end for this unit.
     upstream_segment_finished: bool
-    #: Whether this unit's final-stage segment end arrived: the final stage's n-th segment end
-    #: of the epoch goes to the n-th speaking unit (held until that unit speaks), even while
-    #: an older unit still waits for its upstream segment end.
+    #: Whether this unit's final-stage segment end arrived: the final stage's segment ends go,
+    #: in order, to the speaking units that reach the final stage (held until that unit speaks),
+    #: even while an older unit still waits for its upstream segment end. With a stage between
+    #: Stage 0 and the final stage, an end is credited to a unit only once the stage before the
+    #: final stage reported that unit's segment end, since a decision there can still end the unit.
     final_segment_finished: bool
     #: Session epoch the unit was submitted in (a cancel starts a new one).
     epoch: int = 0
