@@ -88,6 +88,11 @@ TALKER_MAPPER = WeightsMapper(
     }
 )
 
+H3_ENCODER_PREFIX_MAP = {
+    "model.language_model.": "text_encoder.text_model.",
+    "model.visual.": "text_encoder.vision.",
+}
+
 
 # ===================================================================
 # 1. OmniINCConfig.apply_vllm_mapper
@@ -203,6 +208,52 @@ class TestApplyVllmMapper:
         runtime_name = "thinker.language_model.model.layers.0.mlp.gate"
         matched = any(re.search(k, runtime_name) for k in cfg.extra_config)
         assert matched
+
+
+class TestApplyPrefixMap:
+    def test_remaps_blocks_and_plain_extra_config(self):
+        cfg = _make_inc_config(
+            "model.language_model.layers",
+            extra_config={"model.language_model.layers.0.mlp.down_proj": {"bits": 16}},
+        )
+
+        cfg.apply_prefix_map(H3_ENCODER_PREFIX_MAP)
+
+        assert cfg.block_name_to_quantize == ["text_encoder.text_model.layers"]
+        assert cfg.extra_config == {"text_encoder.text_model.layers.0.mlp.down_proj": {"bits": 16}}
+
+    def test_extra_config_override_resolves_at_runtime_prefix(self):
+        cfg = _make_inc_config(
+            "model.language_model.layers",
+            extra_config={"model.language_model.layers.0.mlp.down_proj": {"bits": 16}},
+        )
+
+        cfg.apply_prefix_map(H3_ENCODER_PREFIX_MAP)
+
+        assert not cfg.config_parser.resolve(object(), "text_encoder.text_model.layers.0.mlp.down_proj").quantized
+        assert cfg.config_parser.resolve(object(), "text_encoder.text_model.layers.1.mlp.down_proj").quantized
+
+    def test_remaps_regex_extra_config_keys(self):
+        key = r".*model\.language_model\.layers\.0\.mlp\.down_proj.*"
+        cfg = _make_inc_config(
+            "model.language_model.layers",
+            extra_config={key: {"bits": 16}},
+        )
+
+        cfg.apply_prefix_map(H3_ENCODER_PREFIX_MAP)
+
+        assert list(cfg.extra_config) == [r".*text_encoder\.text_model\.layers\.0\.mlp\.down_proj.*"]
+
+    def test_leaves_unmatched_entries_unchanged(self):
+        cfg = _make_inc_config(
+            "lm_head",
+            extra_config={"lm_head": {"bits": 16}},
+        )
+
+        cfg.apply_prefix_map(H3_ENCODER_PREFIX_MAP)
+
+        assert cfg.block_name_to_quantize == ["lm_head"]
+        assert cfg.extra_config == {"lm_head": {"bits": 16}}
 
 
 # ===================================================================
@@ -484,9 +535,9 @@ class TestComponentResolve:
 
     def test_min_capability(self):
         a = _MockQuantConfig("a")
-        a.get_min_capability = lambda: 80
+        a.get_min_capability = lambda: 80  # type: ignore[method-assign]
         b = _MockQuantConfig("b")
-        b.get_min_capability = lambda: 70
+        b.get_min_capability = lambda: 70  # type: ignore[method-assign]
         cqc = ComponentQuantizationConfig(component_configs={"x": a, "y": b})
         assert cqc.get_min_capability() == 70
 

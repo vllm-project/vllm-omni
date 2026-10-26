@@ -3,6 +3,7 @@
 """Tests for INC/AutoRound quantization via the unified framework."""
 
 import pytest
+import torch
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
@@ -204,3 +205,42 @@ def test_integration_autodetect_from_transformer_config():
     od_config = OmniDiffusionConfig(model="test", tf_model_config=tf_config)
     assert isinstance(od_config.quantization_config, INCConfig)
     assert od_config.quantization_config.weight_bits == 4
+
+
+def test_mxfp_flattened_finalize_runs_once():
+    from torch import nn
+
+    from vllm_omni.quantization.inc_config import _MXFlattenedLinearMethod
+
+    calls = []
+
+    class _Scheme:
+        def process_weights_after_loading(self, layer):
+            calls.append(layer)
+
+    method = _MXFlattenedLinearMethod(_Scheme())
+    layer = nn.Module()
+    layer.weight_packed = nn.Parameter(torch.zeros(2, 2), requires_grad=False)
+
+    method.process_weights_after_loading(layer)
+    method.process_weights_after_loading(layer)
+
+    assert calls == [layer]
+
+
+def test_mxfp_flattened_finalize_skips_repeated_destructive_repack():
+    from torch import nn
+    from vllm.model_executor.layers.quantization.inc.schemes.inc_mxfp4_linear import (
+        INCMxfp4LinearMethod,
+    )
+
+    from vllm_omni.quantization.inc_config import _MXFlattenedLinearMethod
+
+    method = _MXFlattenedLinearMethod(object.__new__(INCMxfp4LinearMethod))
+    layer = nn.Module()
+    layer.weight = nn.Parameter(torch.zeros(2, 2), requires_grad=False)
+
+    method.process_weights_after_loading(layer)
+    method.process_weights_after_loading(layer)
+
+    assert layer._already_called_process_weights_after_loading is True

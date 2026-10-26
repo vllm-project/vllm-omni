@@ -1167,10 +1167,19 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
             from vllm_omni.quantization.inc_config import OmniINCConfig
 
             quant_config = OmniINCConfig.from_config(hf_quant_config)
-            # The checkpoint names blocks under the HF namespace while this
-            # encoder builds them under text_model. Scope the serialized MXFP4
-            # quantization to those decoder layers.
-            quant_config.block_name_to_quantize = [_MINIMAX_H3_TEXT_LAYER_PREFIX]
+            # The checkpoint names modules under the HF ``model.language_model``
+            # and ``model.visual`` namespaces while this encoder builds them
+            # under ``text_encoder.text_model`` and ``text_encoder.vision``.
+            # Remap the full config so per-layer ``extra_config`` exceptions
+            # (for example a BF16 ``down_proj``) still resolve at runtime.
+            quant_config.apply_prefix_map(
+                {
+                    "model.language_model.": "text_encoder.text_model.",
+                    "model.visual.": "text_encoder.vision.",
+                }
+            )
+            if not quant_config.block_name_to_quantize:
+                quant_config.block_name_to_quantize = [_MINIMAX_H3_TEXT_LAYER_PREFIX]
             self.quant_config = quant_config
         _validate_encoder_quant_config(quant_config)
         dtype = torch.bfloat16
