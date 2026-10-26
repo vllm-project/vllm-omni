@@ -8,6 +8,8 @@ import pytest
 from transformers import AutoConfig, Qwen3_5MoeTextConfig
 
 import vllm_omni.transformers_utils.configs  # noqa: F401  (registers fish_omni)
+from tests.helpers.stage_config import get_deploy_config_path
+from vllm_omni.config.stage_config import load_deploy_config
 from vllm_omni.model_executor.models.fish_omni.configuration_fish_omni import (
     FishOmniAudioDecoderConfig,
     FishOmniConfig,
@@ -202,13 +204,8 @@ def test_npu_deploy_captures_full_decode_graphs():
     the capture sizes at ``max_num_seqs``; a PIECEWISE-only override silently
     keeps decode eager and costs roughly a third of single-stream throughput.
     """
-    from pathlib import Path
-
-    import yaml
-
-    deploy_path = Path(__file__).resolve().parents[4] / "vllm_omni" / "deploy" / "fish_omni.yaml"
-    deploy = yaml.safe_load(deploy_path.read_text())
-    npu = deploy["platforms"]["npu"]
+    deploy = load_deploy_config(get_deploy_config_path("fish_omni.yaml"))
+    npu = deploy.platforms["npu"]
     stage0 = next(stage for stage in npu["stages"] if stage["stage_id"] == 0)
     compilation = stage0["compilation_config"]
 
