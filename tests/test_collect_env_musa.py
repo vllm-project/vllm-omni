@@ -126,6 +126,29 @@ def test_musa_runtime_errors_do_not_abort_collection(monkeypatch):
     assert collect_env.get_musa_gpu_info() is None
 
 
+@pytest.mark.parametrize(
+    "error",
+    [
+        AssertionError("libmusart functions unavailable"),
+        type("DeferredMusaCallError", (Exception,), {})("deferred MUSA call failed"),
+    ],
+)
+def test_musa_device_name_lazy_init_failures_do_not_abort(monkeypatch, error):
+    class BrokenMusa:
+        def is_available(self):
+            return True
+
+        def device_count(self):
+            return 1
+
+        def get_device_name(self, _index):
+            raise error
+
+    collect_env = load_collect_env(monkeypatch, BrokenMusa())
+
+    assert collect_env.get_musa_gpu_info() is None
+
+
 def test_musa_import_attribute_error_does_not_abort_runtime_probes(monkeypatch):
     collect_env = load_collect_env(monkeypatch, musa=None)
     original_import = builtins.__import__

@@ -329,7 +329,11 @@ def get_musa_gpu_info():
         if device_count == 0:
             return None
         return "\n".join(musa.get_device_name(index) for index in range(device_count))
-    except (RuntimeError, OSError, AttributeError):
+    except Exception:  # noqa: BLE001
+        # Device-name lookup may trigger Torch-MUSA lazy initialization,
+        # which raises version-specific exceptions such as AssertionError or
+        # DeferredMusaCallError. This is an optional diagnostic probe and must
+        # not prevent the rest of the environment report from being collected.
         return None
 
 
