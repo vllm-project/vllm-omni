@@ -5079,9 +5079,14 @@ def _issue_alert_match_score(issue: dict[str, Any], group: _IssueAlertGroup) -> 
             sig += 1
     title_hits = sum(1 for t in group.sig_tokens if _issue_alert_has(t, title))
     body_hits = sum(1 for t in group.sig_tokens if _issue_alert_has(t, body))
-    sig += min(4, title_hits * 2)
+    # cap 6 (3 tokens): a title quoting 3 identifier tokens from the reason
+    # (e.g. "Cache-DiT SenseNovaU1Pipeline SenseNovaU1ForCausalLM") is a
+    # near-verbatim failure quote and counts even when the exc class differs
+    # (a wrapper RuntimeError around the root ValueError). 2 tokens (4) or
+    # an exc-class-only title (3) never clear the keyless threshold of 5.
+    sig += min(6, title_hits * 2)
     sig += min(2, body_hits)
-    title_sig += min(4, title_hits * 2)
+    title_sig += min(6, title_hits * 2)
     return score + sig, key_strength, sig, title_sig
 
 
