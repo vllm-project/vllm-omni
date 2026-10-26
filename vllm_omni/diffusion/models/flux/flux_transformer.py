@@ -707,15 +707,20 @@ class FluxTransformer2DModel(nn.Module):
             return torch.cat([text_cos, image_cos], dim=0), torch.cat([text_sin, image_sin], dim=0)
         return self.pos_embed(torch.cat((txt_ids, img_ids), dim=0))
 
-    def stream_rotary_emb(self, txt_ids: torch.Tensor, img_ids: torch.Tensor):
+    def stream_rotary_emb(self, txt_ids: torch.Tensor, img_ids: torch.Tensor, dtype: torch.dtype | None = None):
         """The per-stream RoPE tables `forward` accepts as `stream_rotary_emb`, for a caller to
         compute once per request (they depend on the ids alone). Ids with the deprecated batch
-        dimension are read as `forward` reads them."""
+        dimension are read as `forward` reads them. `pos_embed` computes in float64; the tables
+        are returned in `dtype` (the model's parameter dtype by default), which is the cast every
+        block makes on use (`apply_rope_to_qk`), so the values are the same and a compiled forward
+        has no float64 input."""
         if txt_ids.ndim == 3:
             txt_ids = txt_ids[0]
         if img_ids.ndim == 3:
             img_ids = img_ids[0]
-        return self.pos_embed(txt_ids), self.pos_embed(img_ids)
+        if dtype is None:
+            dtype = next(self.parameters()).dtype
+        return tuple(tuple(table.to(dtype) for table in self.pos_embed(ids)) for ids in (txt_ids, img_ids))
 
     def forward(
         self,
