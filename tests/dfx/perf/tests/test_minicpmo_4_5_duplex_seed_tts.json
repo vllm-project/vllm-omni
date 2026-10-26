@@ -1,6 +1,7 @@
 [
   {
     "test_name": "test_minicpmo_4_5_duplex_seed_tts",
+    "description": "H100 references use Buildkite build 17017 (commit c5e0bd7c2c3dd297adfbf36a40f3b7a19bf94d24); A3 references use vllm-omni-npu-ci build 8873 (commit 26237d470651a841534abbddfb70301580a0227d). Latency and audio RTF are measured x 1.10, rounded to 4 decimals. These historical runs are reference measurements, not validation of the current revision. B200 remains without a baseline pending measurements; its workload and completion checks remain enabled. WER is collected without a calibrated quality threshold.",
     "mark": [
       {
         "hardware_marks": {
@@ -29,21 +30,72 @@
         "backend": "openai-realtime-tts",
         "endpoint": "/v1/realtime",
         "num_prompts": [
-          1
+          4,
+          16,
+          32
         ],
         "max_concurrency": [
-          1
+          1,
+          4,
+          8
         ],
         "no_oversample": true,
         "disable_shuffle": true,
         "trust_remote_code": true,
         "seed_tts_locale": "en",
+        "seed_tts_wer_eval": true,
         "seed_tts_turns_per_session": 4,
         "expected_duplex_audio_turns_per_session": 4,
         "extra_body": {
           "save_duplex_request_metrics": true
         },
-        "percentile-metrics": "ttft,tpot,itl,e2el,audio_ttfp,audio_rtf,audio_duration"
+        "percentile-metrics": "ttft,tpot,itl,e2el,audio_ttfp,audio_rtf,audio_duration",
+        "baseline": {
+          "H100": {
+            "mean_ttft_ms": [
+              322.2417,
+              408.3143,
+              668.0144
+            ],
+            "mean_e2el_ms": [
+              19218.0923,
+              19008.5836,
+              18894.4847
+            ],
+            "mean_audio_ttfp_ms": [
+              322.2417,
+              408.3143,
+              668.0144
+            ],
+            "mean_audio_rtf": [
+              1.1491,
+              1.1585,
+              1.2367
+            ]
+          },
+          "A3": {
+            "mean_ttft_ms": [
+              804.4443,
+              611.1337,
+              626.0064
+            ],
+            "mean_e2el_ms": [
+              20488.5406,
+              25724.8852,
+              45008.1518
+            ],
+            "mean_audio_ttfp_ms": [
+              804.4443,
+              611.1337,
+              626.0064
+            ],
+            "mean_audio_rtf": [
+              1.2772,
+              1.7064,
+              3.0622
+            ]
+          }
+        }
       }
     ]
   }

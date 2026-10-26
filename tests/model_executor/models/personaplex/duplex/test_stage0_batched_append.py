@@ -33,7 +33,7 @@ class _FakeCodec:
         self.encode_calls = 0
         self.frames: list[int] = []
 
-    def streaming_init(self, batch_size: int) -> None:
+    def streaming_init(self, batch_size: int, *, decode: bool = True) -> None:
         self.frames = [0] * batch_size
 
     def encode_frame(self, pcm: torch.Tensor, active: torch.Tensor) -> torch.Tensor:
@@ -73,6 +73,7 @@ class _EmbeddingTalker:
         return values[:, None].expand(-1, _WIDTH).contiguous()
 
     _build_frame_embed = PersonaPlexTalkerForConditionalGeneration._build_frame_embed
+    _build_frame_embeds = PersonaPlexTalkerForConditionalGeneration._build_frame_embeds
 
 
 def _depformer(text_token, hidden, *, audio_tokens, audio_provided, num_steps):
@@ -151,14 +152,33 @@ def _run_step(
             "duplex_prompt_len": prompt_len,
             "duplex_token_offset": prompt_len - spans[request_id],
         }
+    offsets = list(np.cumsum([0, *spans.values()]))
+    batch_embeds = torch.zeros(offsets[-1], _WIDTH)
+    handled = set()
     if batched:
-        talker.preprocess_batch(req_ids=list(infos), model_intermediate_buffer=infos, device=torch.device("cpu"))
+        handled = talker.preprocess_batch(
+            req_ids=list(infos),
+            model_intermediate_buffer=infos,
+            device=torch.device("cpu"),
+            input_ids=torch.zeros(offsets[-1], dtype=torch.long),
+            inputs_embeds=batch_embeds,
+            token_offsets=offsets[:-1],
+            num_scheduled_tokens=list(spans.values()),
+            num_computed_tokens=[info["duplex_token_offset"] for info in infos.values()],
+            prompt_lens=[info["duplex_prompt_len"] for info in infos.values()],
+        )
     else:
         runtime.encode_appends([info["duplex"] for info in infos.values()])
     embeds, req_infos = {}, []
-    for request_id, info in infos.items():
-        input_ids = torch.zeros(spans[request_id], dtype=torch.long)
-        _, embed, update = talker.preprocess(input_ids, None, _omni_is_prefill=True, **info)
+    for index, (request_id, info) in enumerate(infos.items()):
+        if request_id in handled:
+            # The production runner skips scalar preprocessing for rows the
+            # batch hook filled, leaving their prepared metadata on device.
+            embed = batch_embeds[offsets[index] : offsets[index + 1]]
+            update = info
+        else:
+            input_ids = torch.zeros(spans[request_id], dtype=torch.long)
+            _, embed, update = talker.preprocess(input_ids, None, _omni_is_prefill=True, **info)
         embeds[request_id] = embed
         req_infos.append(update)
     received = {}
@@ -180,7 +200,7 @@ def _run_step(
         audio_tokens=received["audio_tokens"],
         audio_provided=received["audio_provided"],
         codes=codes,
-        agents={key: state.last_agent_codes.clone() for key, state in runtime.sessions.items()},
+        agents={key: runtime._last_agent[state.slot].clone() for key, state in runtime.sessions.items()},
     )
 
 
@@ -198,7 +218,7 @@ def _assert_same(batched: _StepResult, reference: _StepResult) -> None:
 
 def _device_prepared(talker, key: tuple[str, int]) -> bool:
     state = talker._personaplex_duplex_stage0_runtime.sessions[key]
-    return state.prepared.depformer_audio_tokens_device is not None
+    return state.live_prepared is not None
 
 
 def test_mixed_prefill_and_live_steps_match_the_per_request_path() -> None:
@@ -220,15 +240,17 @@ def test_mixed_prefill_and_live_steps_match_the_per_request_path() -> None:
 
     assert _device_prepared(batched, ("a", 0)) and _device_prepared(batched, ("c", 0))
     assert not _device_prepared(reference, ("a", 0))
-    # Batched live appends publish no host teacher-forcing copies; the per-request path still does.
+    # Both paths keep teacher forcing in the shared device slot state.
     host_fields = {"pplex_depformer_audio_tokens", "pplex_depformer_audio_provided"}
     batched_info = batched._personaplex_duplex_stage0_runtime.sessions[("a", 0)].prepared.info_update
     reference_info = reference._personaplex_duplex_stage0_runtime.sessions[("a", 0)].prepared.info_update
     assert host_fields.isdisjoint(batched_info)
-    assert host_fields <= reference_info.keys()
+    # The shared slot state keeps teacher forcing on device on both paths.
+    assert host_fields.isdisjoint(reference_info)
     runtime = batched._personaplex_duplex_stage0_runtime
     assert runtime._shared_codec().encode_calls == len(steps)
-    assert len(runtime.sessions[("a", 0)].user_history_device) == 2
+    # One current frame and two causal-history frames per shared slot.
+    assert runtime._user_history[runtime.sessions[("a", 0)].slot].shape == (3, 8)
     # Live embeds carry the causal user delay: cb0 from the previous frame, cb1..7 from the one before.
     a4 = result.embeds["a"][0]
     assert a4[9].item() == 3 * 16 + 1
@@ -243,10 +265,13 @@ def test_second_append_reads_sine_for_the_missing_user_history() -> None:
 
     first = _run_step(talker, [("a", _append("a", 1), 18)], batched=True, text_base=100)
     # The first append forces agent cb1..7 to silence; cb0 is sampled.
-    assert state_of().last_agent_codes.tolist() == [first.codes[0, 0].item(), *SILENCE_TOKENS[1:]]
+    assert talker._personaplex_duplex_stage0_runtime._last_agent[state_of().slot].tolist() == [
+        first.codes[0, 0].item(),
+        *SILENCE_TOKENS[1:],
+    ]
     result = _run_step(talker, [("a", _append("a", 2), 19)], batched=True, text_base=101)
     # Live appends force only the user codebooks, so the sampled agent frame is kept as is.
-    assert torch.equal(state_of().last_agent_codes, result.codes[0])
+    assert torch.equal(talker._personaplex_duplex_stage0_runtime._last_agent[state_of().slot], result.codes[0])
 
     embed = result.embeds["a"][0]
     assert embed[0].item() == 100
@@ -296,17 +321,20 @@ def test_prepare_live_appends_ignores_empty_first_and_unencoded_appends() -> Non
     talker = _talker(max_sessions=2)
     runtime = talker._personaplex_duplex_stage0_runtime
 
-    assert runtime.prepare_live_appends([]) == 0
+    assert runtime.prepare_live_appends([]) == ([], None)
     talker.preprocess_batch(req_ids=["x"], model_intermediate_buffer={"x": {}}, device=torch.device("cpu"))
     assert runtime.sessions == {}
 
     runtime.encode_appends([_append("a", 1)])
-    assert runtime.prepare_live_appends([_append("a", 1)]) == 0  # the first append keeps the prefill path
+    assert runtime.prepare_live_appends([("a", _append("a", 1), 18)]) == (
+        [],
+        None,
+    )  # the first append keeps the prefill path
     _run_step(talker, [("a", _append("a", 1), 18)], batched=False, text_base=100)
     # Not encoded in this step: left to prepare_append.
-    assert runtime.prepare_live_appends([_append("a", 2)]) == 0
+    assert runtime.prepare_live_appends([("a", _append("a", 2), 19)]) == ([], None)
     runtime.encode_appends([_append("a", 2)])
-    assert runtime.prepare_live_appends([_append("a", 2), _append("a", 2)]) == 1
+    assert runtime.prepare_live_appends([("a", _append("a", 2), 19), ("a", _append("a", 2), 19)])[0] == [0]
     # Already prepared: a repeat in a later step is a no-op.
-    assert runtime.prepare_live_appends([_append("a", 2)]) == 0
+    assert runtime.prepare_live_appends([("a", _append("a", 2), 19)]) == ([], None)
     assert runtime.prepare_append(_append("a", 2), prompt_len=19, request_id="a").prompt_offset == 18

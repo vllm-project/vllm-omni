@@ -38,6 +38,7 @@ from vllm_omni.core.prefix_cache.runner_mixin import PrefixCacheRunnerMixin
 from vllm_omni.data_entry_keys import OmniPayload
 from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.model_executor.layers.rotary_embedding.mrope import OmniMRotaryEmbedding as MRotaryEmbedding
+from vllm_omni.model_executor.models.interfaces import requires_request_sample_eligibility
 from vllm_omni.model_executor.models.model_local_kv import collect_model_local_kv_specs
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.platforms import current_omni_platform
@@ -98,6 +99,13 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
         # Output-payload constant snapshotted once in load_model; the cache
         # policy counterpart lives on PrefixCacheRunnerMixin.
         self._pooler_payload_include_hidden_flag = True
+        self._has_lmcache = False
+
+    def shutdown(self) -> None:
+        # Also inherited by OmniNPUModelRunner. GPU AR stops the cache
+        # earlier in its teardown; the shared helper is idempotent.
+        self._shutdown_omni_prefix_cache()
+        super().shutdown()
 
     def _to_list(self, sampled_token_ids: torch.Tensor) -> list[list[int]]:
         override_fn = self._sampled_token_ids_cpu_override
@@ -143,9 +151,19 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
             model_config=self.model_config,
             is_pooling_model=self.is_pooling_model,
             speculative_config=self.speculative_config,
+            model_cache_policy=self._omni_cache_policy,
         )
         if cfg is not None:
             self._omni_prefix_cache_cfg = cfg
+
+        self._setup_lmcache_hidden_state_offload()
+
+    def _setup_lmcache_hidden_state_offload(self) -> None:
+        """No-op hook; overridden by LMCacheHiddenStateMixin on the AR runner."""
+        self._has_lmcache = False
+
+    def _drop_hs_pending_state(self, req_id: str) -> None:
+        """No-op hook; overridden by LMCacheHiddenStateMixin on the AR runner."""
 
     @instrument(span_name="Loading (GPU)")
     def load_model(self, *args, **kwargs) -> None:
@@ -239,6 +257,11 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
     def _maybe_enable_output_token_ids_for_model_sampler(self) -> None:
         if getattr(self.model, "logitsprocs_need_output_token_ids", False):
             self.input_batch.logitsprocs_need_output_token_ids = True
+
+    def _talker_mtp_runs_in_dummy_run(self) -> bool:
+        # _dummy_run calls talker_mtp only for models with a separate talker, so
+        # FULL decoder captures already hold the MTP graphs for those sizes.
+        return getattr(self.model, "talker", None) is not None and bool(self.has_talker_mtp)
 
     def _init_talker_mtp(self) -> None:
         # TODO move this model specific logic to a separate class
@@ -549,6 +572,7 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
                 self._talker_mtp_generators.pop(req_id, None)
             if cleanup_finished_request is not None:
                 cleanup_finished_request(req_id)
+            self._drop_hs_pending_state(req_id)
 
         self.late_interaction_runner.on_requests_finished(scheduler_output.finished_req_ids)
         # Remove the finished requests from the persistent batch.
@@ -602,6 +626,8 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
             req_id = new_req_data.req_id
             if req_id in self.requests:
                 self._update_streaming_input_additional_info(new_req_data, req_id)
+                if self._resume_streaming_row_in_place(req_id, new_req_data, scheduler_output):
+                    continue
                 req_state = self._update_streaming_request(req_id, new_req_data)
                 reqs_to_add.append(req_state)
                 continue
@@ -1197,7 +1223,7 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
                     slot_mapping=slot_mappings,
                 ),
             ):
-                if getattr(self.model, "talker", None) is not None and self.has_talker_mtp:
+                if self._talker_mtp_runs_in_dummy_run():
                     num_tokens_padded_talker_mtp = num_tokens_padded
                     if num_tokens_padded_talker_mtp == self.max_num_tokens:
                         num_tokens_padded_talker_mtp = self.talker_mtp_input_ids.gpu.shape[0]
@@ -1423,13 +1449,58 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
         if nstp is not None and len(nstp) == len(self.input_batch.req_ids):
             try:
                 model_kwargs_extra["request_token_spans"] = self._compute_request_token_spans(nstp)
-                if getattr(self.model, "requires_request_sample_eligibility", False):
+                if requires_request_sample_eligibility(self.model):
                     model_kwargs_extra["request_sample_eligible"] = [
                         bool(
                             (req := self.requests.get(req_id)) is not None
                             and int(req.num_computed_tokens) + int(nstp[req_index]) >= int(req.num_tokens)
                         )
                         for req_index, req_id in enumerate(self.input_batch.req_ids)
+                    ]
+                    # Effective per-request sampling params (stage defaults
+                    # merged with request overrides) for in-model sampling
+                    # paths, so the K-step codec sampler keeps the
+                    # single-frame configuration contract. Same order as
+                    # request_sample_eligible / request_token_spans.
+                    model_kwargs_extra["request_sampling_params"] = [
+                        req.sampling_params if (req := self.requests.get(req_id)) is not None else None
+                        for req_id in self.input_batch.req_ids
+                    ]
+                    # Remaining request output budget per request, so the
+                    # in-model K-step codec loop stops emitting frames where the
+                    # engine stops accepting tokens: the scheduler truncates the
+                    # sampled ids at the request limit, but the connector still
+                    # concatenates every emitted codec frame (PR #7929 review).
+                    # Both of the engine's length stops are folded in
+                    # (v1/core/sched/utils.py:111-117): the request's
+                    # max_tokens - num_output_tokens, and the context's
+                    # max_model_len - num_tokens. None means the request carries
+                    # no max_tokens, which leaves the stage-resolved codec budget
+                    # in charge. Same order as request_sampling_params.
+                    context_budget = [
+                        (
+                            self.max_model_len - int(req.num_tokens)
+                            if (req := self.requests.get(req_id)) is not None
+                            else None
+                        )
+                        for req_id in self.input_batch.req_ids
+                    ]
+                    model_kwargs_extra["request_max_tokens_remaining"] = [
+                        (
+                            max(
+                                min(
+                                    int(req.sampling_params.max_tokens) - len(req.output_token_ids),
+                                    context_budget[index],
+                                ),
+                                0,
+                            )
+                            if (req := self.requests.get(req_id)) is not None
+                            and req.sampling_params is not None
+                            and req.sampling_params.max_tokens is not None
+                            and context_budget[index] is not None
+                            else None
+                        )
+                        for index, req_id in enumerate(self.input_batch.req_ids)
                     ]
             except Exception as e:
                 # Visible on purpose: the fallback is the equal rows-per-request
@@ -1591,21 +1662,45 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
 
         return req_infos
 
-    def _maybe_run_batch_preprocess(self, req_ids: list[str], device: torch.device) -> None:
+    def _maybe_run_batch_preprocess(
+        self,
+        req_ids: list[str],
+        device: torch.device,
+        input_ids: torch.Tensor,
+        inputs_embeds: torch.Tensor | None,
+        num_scheduled_tokens_np: np.ndarray,
+    ) -> frozenset[str]:
         """Run an optional model-specific batch preprocess hook.
 
         The generic runner only supplies current request ids and the runner-owned
         intermediate buffer; model-specific code decides whether there is any
         batchable work.
+
+        A model with ``preprocess_batch_fills_rows`` also gets the step's buffers
+        and token layout, may write whole requests' rows itself, and returns their
+        ids; the per-request ``preprocess`` loop skips those requests.
         """
         preprocess_batch = getattr(self.model, "preprocess_batch", None)
         if not callable(preprocess_batch):
-            return
-        preprocess_batch(
+            return frozenset()
+        layout: dict[str, Any] = {}
+        if inputs_embeds is not None and getattr(self.model, "preprocess_batch_fills_rows", False):
+            num_reqs = len(req_ids)
+            layout = dict(
+                input_ids=input_ids,
+                inputs_embeds=inputs_embeds,
+                token_offsets=self.query_start_loc.cpu[:num_reqs].tolist(),
+                num_scheduled_tokens=num_scheduled_tokens_np[:num_reqs].tolist(),
+                num_computed_tokens=[int(n) for n in self.input_batch.num_computed_tokens_cpu[:num_reqs]],
+                prompt_lens=[len(self.requests[req_id].prompt_token_ids or ()) for req_id in req_ids],
+            )
+        handled = preprocess_batch(
             req_ids=req_ids,
             model_intermediate_buffer=self.model_intermediate_buffer,
             device=device,
+            **layout,
         )
+        return frozenset(handled or ()) if layout else frozenset()
 
     def _embed_multimodal_input_ids(self, num_scheduled_tokens, mm_embeds, is_mm_embed):
         embedding_kwargs = {}
@@ -1762,7 +1857,9 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
             # need the scheduled token ids to build or replace those embeddings.
             preprocess_input_ids = input_ids if input_ids is not None else self.input_ids.gpu[:num_input_tokens]
             preprocess_device = preprocess_input_ids.device
-            self._maybe_run_batch_preprocess(self.input_batch.req_ids, preprocess_device)
+            batch_filled_req_ids = self._maybe_run_batch_preprocess(
+                req_ids, preprocess_device, preprocess_input_ids, inputs_embeds, num_scheduled_tokens_np
+            )
 
             # Overlay custom prompt_embeds per request for the prompt portion;
             # collect additional_information (tensor/list) for prefill portion only
@@ -1855,6 +1952,10 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
 
             preprocess_input_ids = input_ids if input_ids is not None else self.input_ids.gpu[:num_input_tokens]
             for req_index, req_id in enumerate(self.input_batch.req_ids):
+                if req_id in batch_filled_req_ids:
+                    # Rows preprocess_batch wrote also end a (contiguous) decode group.
+                    flush_decode_batch()
+                    continue
                 req_infos = self.model_intermediate_buffer.get(req_id, {})
 
                 # mimo-audio check
@@ -2228,6 +2329,82 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
             snapshot["meta"] = meta
         self.model_intermediate_buffer[req_id] = snapshot
         setattr(req_state, "additional_information_cpu", snapshot)
+
+    def _resume_streaming_row_in_place(
+        self,
+        req_id: str,
+        new_req_data: Any,
+        scheduler_output: "SchedulerOutput",
+    ) -> bool:
+        """Opt-in (``resume_streaming_rows_in_place``): resume a grown prompt in its batch row.
+
+        The remove and re-add of ``_update_streaming_request`` copies the whole
+        prompt per frame. When the scheduler only extended the same prompt list,
+        write the new tail, the block row and the counters instead, leaving the
+        row as the re-add would. Returns False to take the re-add path.
+        """
+        if not getattr(self.model, "resume_streaming_rows_in_place", False):
+            return False
+        input_batch = self.input_batch
+        req_index = input_batch.req_id_to_index.get(req_id)
+        req_state = self.requests[req_id]
+        prompt = new_req_data.prompt_token_ids
+        sampling_params = new_req_data.sampling_params
+        if (
+            req_index is None
+            or self.uses_mrope
+            or self.speculative_config is not None
+            or getattr(input_batch, "use_replayssm", False)
+            # The prompt tokens feed the penalties' sampling metadata, which
+            # is only rebuilt when the batch changes.
+            or not input_batch.no_penalties
+            # The scheduler extends a session's prompt list in place; a new
+            # list is a replaced prompt.
+            or prompt is None
+            or prompt is not req_state.prompt_token_ids
+            or new_req_data.prompt_embeds is not None
+            or req_state.prompt_embeds is not None
+            or getattr(new_req_data, "prompt_is_token_ids", None) is not None
+            or new_req_data.pooling_params is not None
+            or sampling_params is None
+            # Re-adding would re-register the row with the logits processors
+            # and the thinking budget, which these do not repeat.
+            or sampling_params != req_state.sampling_params
+            or sampling_params.min_tokens
+            or getattr(sampling_params, "thinking_token_budget", None) is not None
+        ):
+            return False
+        old_len = int(input_batch.num_prompt_tokens[req_index])
+        new_len = len(prompt)
+        if new_len < old_len or new_req_data.num_computed_tokens < old_len:
+            return False
+
+        # The cached state, as _update_streaming_request leaves it.
+        req_state.mm_features = new_req_data.mm_features
+        req_state.sampling_params = sampling_params
+        self.late_interaction_runner.register_request(req_id, req_state.pooling_params)
+        req_state.block_ids = new_req_data.block_ids
+        req_state.num_computed_tokens = new_req_data.num_computed_tokens
+        req_state.num_prompt_tokens = new_len
+        req_state.output_token_ids.clear()
+
+        # The batch row, as remove_request + add_request leave it. The row
+        # already holds the prompt up to old_len; the rest of the old row was
+        # the discarded sampled token.
+        if new_len > old_len:
+            input_batch.token_ids_cpu[req_index, old_len:new_len] = prompt[old_len:new_len]
+            input_batch.is_token_ids[req_index, old_len:new_len] = True
+        input_batch.num_prompt_tokens[req_index] = new_len
+        input_batch.num_tokens_no_spec[req_index] = req_state.num_tokens
+        input_batch.num_computed_tokens_cpu[req_index] = req_state.num_computed_tokens
+        input_batch.req_output_token_ids[req_index] = req_state.output_token_ids
+        input_batch.block_table.clear_row(req_index)
+        input_batch.block_table.add_row(req_state.block_ids, req_index)
+        input_batch.num_accepted_tokens_cpu[req_index] = 1
+        if input_batch.prev_req_id_to_index is not None:
+            input_batch.prev_req_id_to_index.pop(req_id, None)
+        input_batch.update_req_spec_token_ids(req_state, scheduler_output.scheduled_spec_decode_tokens)
+        return True
 
     def _update_streaming_input_additional_info(self, new_req_data, req_id):
         # For streaming input prefill case only. Update buffer from last segment input.

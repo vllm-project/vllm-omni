@@ -16,6 +16,7 @@ For the full list of supported architectures across all modalities, see
 | --- | --- | --- | --- | --- | --- |
 | Breeze-TTS-2 | `BreezeBlue/Breeze-TTS-2` | ✓ (`ref_audio`+`ref_text`) | ✓ (PCM stream) | speaker tags (`S0`..`S9`, default `S0`) | — |
 | Audio8 TTS Preview | `Audio8/Audio8-TTS-Preview-0.6b` | ✓ (`ref_audio`+`ref_text`) | ✓ (PCM stream) | uploaded audio voice only; no presets | ✓ |
+| Fish Audio Drama 3 | `fishaudio/drama-3` | ✓ (`ref_audio`+`ref_text`) | ✓ (PCM stream) | speaker and event tags in `input` | — |
 | Fish Speech S2 Pro | `fishaudio/s2-pro` | ✓ (`ref_audio`+`ref_text`) | ✓ (PCM stream) | — | ✓ |
 | Gepard-1.0 | `nineninesix/gepard-1.0` | — (zero-shot default voice) | ✓ (PCM / WAV stream) | `default` only | — |
 | GLM-TTS | `zai-org/GLM-TTS` | ✓ (`ref_audio`+`ref_text`, required) | ✓ (PCM stream) | — | ✓ |
@@ -400,6 +401,55 @@ rare sub-300 ms gap.
 
 ---
 
+## Fish Audio Drama 3
+
+35B-total / 3B-active MoE TTS at 44.1 kHz: a Qwen3.5 MoE backbone samples one
+semantic token per frame and a codebook tower predicts the other 9 codebooks.
+It shares the DAC codec stage with Fish Speech S2 Pro. Speaker tags
+(`<|speaker:0|>` to `<|speaker:15|>`) and inline event tags such as `[sighs]`
+go in `input`. See the [Drama 3 recipe](../../../recipes/fishaudio/Drama-3.md) for measured
+performance and known limitations.
+
+### Launch
+
+```bash
+vllm serve fishaudio/drama-3 --omni --port 8091
+```
+
+The deploy config auto-loads from `vllm_omni/deploy/fish_omni.yaml` (the HF `model_type` on the checkpoint is `fish_omni`).
+On Ascend, the same command uses the `npu` profile: Model Runner V2 with tensor parallel 2 and expert parallel across two 910B cards, and the DAC stage sharing the second card. See the recipe.
+
+### Voice cloning
+
+```bash
+curl -X POST http://localhost:8091/v1/audio/speech \
+    -H "Content-Type: application/json" \
+    -d '{
+        "model": "fishaudio/drama-3",
+        "input": "[sighs] Fine. If we miss it, it is on you.",
+        "ref_audio": "https://huggingface.co/datasets/zhaochenyang20/seed-tts-eval-mini/resolve/main/en/prompt-wavs/common_voice_en_10119832.wav",
+        "ref_text": "We asked over twenty different people, and they all said it was his.",
+        "response_format": "wav"
+    }' --output cloned.wav
+```
+
+### CLI client
+
+The Fish Speech client works unchanged with `--model fishaudio/drama-3`:
+
+```bash
+cd examples/online_serving/text_to_speech/fish_speech
+python speech_client.py --model fishaudio/drama-3 --text "<|speaker:0|> Hi. <|speaker:1|> Hello."
+python speech_client.py --model fishaudio/drama-3 --text "Hello world" --stream --output output.pcm
+```
+
+### Notes
+
+- Output: 44.1 kHz mono. Streaming PCM players must use `-r 44100`.
+- `ref_audio` needs `ref_text` (the transcript of the reference audio).
+
+---
+
 ## Fish Speech S2 Pro
 
 4B dual-AR TTS at 44.1 kHz. Server uses the DAC codec, which is vendored in
@@ -574,7 +624,7 @@ For a single H200, the default
 deployment places both the talker and codec on logical GPU 0:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 VLLM_OMNI_EVENT_DRIVEN_ORCH=1 \
+CUDA_VISIBLE_DEVICES=0 \
     vllm serve OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5 \
     --omni --trust-remote-code \
     --deploy-config vllm_omni/deploy/moss_tts_local.yaml \
@@ -582,7 +632,7 @@ CUDA_VISIBLE_DEVICES=0 VLLM_OMNI_EVENT_DRIVEN_ORCH=1 \
 ```
 
 Run from the repository root and select an available physical GPU with
-`CUDA_VISIBLE_DEVICES`. The command enables event-driven orchestration and
+`CUDA_VISIBLE_DEVICES`. The command
 disables detailed per-request statistics logging to reduce CPU overhead at
 high concurrency. Remove `--disable-log-stats` when those statistics are needed;
 keep these settings identical when comparing performance.
@@ -677,7 +727,7 @@ Then open <http://localhost:7860> in your browser.
 
 ## OmniVoice
 
-Zero-shot multilingual TTS (600+ languages). Online serving currently exposes **auto voice** only; voice cloning and voice design are available offline.
+OmniVoice creates speech in more than 600 languages. It supports text-to-speech without a reference clip, voice cloning, and voice design.
 
 ### Prerequisites
 
@@ -685,7 +735,7 @@ Zero-shot multilingual TTS (600+ languages). Online serving currently exposes **
 huggingface-cli download k2-fsa/OmniVoice
 ```
 
-Voice cloning (offline) needs `transformers>=5.3.0`; auto voice works with `transformers>=4.57.0`.
+Voice cloning needs `transformers>=5.3.0`. The default OmniVoice deploy config loads `openai/whisper-large-v3-turbo` lazily on the worker device when `ref_text` is missing. Set `load_asr_on_startup: true` in `additional_config.omnivoice_asr` to load it during worker startup. Set `asr_device: "cuda:0"` or `asr_device: "cpu"` in the same block to override the worker device.
 
 ### Launch
 
@@ -710,6 +760,11 @@ python speech_client.py \
 --ref-audio /path/to/ref_audio.wav \
 --ref-text "Bonjour, comment allez-vous?"
 
+# Voice cloning with automatic reference transcription
+python speech_client.py \
+--text "hello" \
+--ref-audio /path/to/ref_audio.wav
+
 # Style instruction (voice design-style control)
 python speech_client.py \
 --text "Bonjour, comment allez-vous?" \
@@ -721,6 +776,23 @@ python speech_client.py --text "Hello, how are you?" --seed 42
 ```
 
 The client supports `--api-base`, `--model`, `--text`, `--response-format`, `--language`, `--voice`, `--ref-audio`, `--ref-text`, `--instructions`, `--seed`, and `--output`.
+
+### Reference audio and output processing
+
+The explicit `--ref-text` path avoids Whisper. With the default config, missing `ref_text` loads `openai/whisper-large-v3-turbo` on the worker device during the first request that needs transcription. Set `load_asr_on_startup: true` in `additional_config.omnivoice_asr` to move that load to worker startup. Set `asr_device` in the same block to choose another GPU or the CPU.
+
+OmniVoice prepares the reference clip before it transcribes the clip or builds the voice cloning input. It performs these steps:
+
+- It converts the clip to mono and resamples it to 24 kHz.
+- It measures the original root mean square (RMS) level. When the RMS is greater than zero and below `0.1`, it raises the waveform level to `0.1` and keeps the original RMS for output volume control.
+- When `--ref-text` is omitted, it trims a clip longer than 20 seconds at a detected silence. Supplied text skips this special long-audio trim.
+- It removes middle silence and trims silence at both edges whether the transcript is automatic or supplied by the caller.
+- It aligns the sample count down to the audio tokenizer hop size.
+- When `--ref-text` is omitted, it sends the prepared waveform to Whisper.
+- It adds a final period for English text or a Chinese full stop for Chinese text when the reference text has no ending punctuation.
+- It sends the same prepared waveform to the audio tokenizer.
+
+After decoding, OmniVoice applies silence removal, RMS scaling, fades, and padding only to voice-cloning output. Text-only output returns the decoder tensor unchanged. Output audio is mono at 24 kHz.
 
 ## Qwen3-TTS
 
@@ -753,10 +825,10 @@ vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \
 ```
 
 This mode supports local EngineCore stages only; headless or remote stage
-deployments are not supported. Runtime voice upload and deletion are disabled
-with multiple API frontends because their registries are process-local.
-Built-in voices, inline `ref_audio`, and voices restored from `custom_voice_dir`
-at startup are supported.
+deployments are not supported. Built-in voices, inline `ref_audio`, voices
+restored from `custom_voice_dir` at startup, and runtime voice upload and
+deletion are supported: all API frontends share the uploaded-voice directory
+(`SPEAKER_SAMPLES_DIR`).
 
 ### Executor backend
 
@@ -812,9 +884,9 @@ checkpoint. When a request names an uploaded voice, the server infers
 `task_type="Base"`. Built-in presets such as `vivian` and `ryan` remain
 CustomVoice speakers and require a CustomVoice checkpoint.
 
-The runtime upload and delete routes require a single API frontend; with
-`--api-server-count > 1`, use inline `ref_audio` or restore precomputed voices
-from `custom_voice_dir` at startup.
+Uploaded voices live in `SPEAKER_SAMPLES_DIR`; with `--api-server-count > 1`
+every API process shares that directory, so a voice uploaded or deleted through
+one process is used or rejected consistently by all of them.
 
 ### Precomputed custom voices
 

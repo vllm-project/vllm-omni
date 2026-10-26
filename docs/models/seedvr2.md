@@ -47,7 +47,7 @@ vllm serve "$MODEL_DIR" --omni \
   --num-gpus 1 --host 127.0.0.1 --port 8098
 
 curl --fail-with-body http://127.0.0.1:8098/v1/videos/sync \
-  -F 'prompt= ' \
+  --form-string 'prompt= ' \
   -F 'input_references=@input.mp4;type=video/mp4' \
   -F 'size=224x128' -F 'num_inference_steps=1' \
   -F 'guidance_scale=1' -F 'seed=7723' \
@@ -108,7 +108,7 @@ on by default; pass `extra_params={"color_correction_method":"wavelet"}` to choo
 
 ```bash
 curl --fail-with-body http://127.0.0.1:8098/v1/videos/sync \
-  -F 'prompt= ' -F 'input_references=@input.mp4;type=video/mp4' \
+  --form-string 'prompt= ' -F 'input_references=@input.mp4;type=video/mp4' \
   -F 'size=224x128' -F 'num_inference_steps=1' -F 'guidance_scale=1' \
   -F 'seed=7723' -F 'extra_params={"color_correction_method":"wavelet"}' \
   --output restored.mp4

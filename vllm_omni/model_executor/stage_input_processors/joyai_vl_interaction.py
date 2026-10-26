@@ -1,15 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Build Qwen3-TTS Talker inputs from completed JoyAI actions."""
+"""Build JoyAI inputs from Qwen3-ASR transcripts and Qwen3-TTS Talker inputs from JoyAI actions."""
 
+from collections.abc import Sequence
 from typing import Any
 
 from vllm.outputs import RequestOutput
 from vllm.tokenizers import cached_tokenizer_from_config
+from vllm.transformers_utils.processor import cached_processor_from_config
 
 from vllm_omni.errors import OmniClientError
 from vllm_omni.experimental.fullduplex.joyvl.decision.output_parser import (
     parse_action,
+)
+from vllm_omni.experimental.fullduplex.joyvl.decision.prompts import (
+    DEFAULT_SYSTEM_PROMPT,
+    USER_QUERY_HEADER,
 )
 from vllm_omni.inputs.data import OmniTokensPrompt
 from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import (
@@ -22,12 +28,154 @@ _DEFAULT_TTS_TASK_TYPE = "CustomVoice"
 _DEFAULT_TTS_LANGUAGE = "Auto"
 _DEFAULT_TTS_SPEAKER = "Vivian"
 
+# Qwen3-ASR emits ``language <Lang><asr_text><transcript>``.
+_ASR_TEXT_TAG = "<asr_text>"
+# JoyAI uses the Qwen3-VL chat template: one placeholder per visual input.
+_IMAGE_PLACEHOLDER = "<|vision_start|><|image_pad|><|vision_end|>"
+_VIDEO_PLACEHOLDER = "<|vision_start|><|video_pad|><|vision_end|>"
+
 
 def _extract_completed_action_text(joyai_output: RequestOutput) -> str:
     """Return the final JoyAI action text, using cumulative text when available."""
     completion = joyai_output.outputs[0]
     action_text = getattr(completion, "cumulative_text", None) or completion.text
     return action_text if isinstance(action_text, str) else ""
+
+
+def _clean_qwen3_asr_transcript(raw_text: str) -> str:
+    """Drop the Qwen3-ASR language prefix and normalize whitespace."""
+    return " ".join(raw_text.rsplit(_ASR_TEXT_TAG, 1)[-1].replace("</asr_text>", "").split())
+
+
+def render_joyai_session_prompt(
+    processor: Any,
+    *,
+    system: str,
+    history: list[dict[str, Any]],
+    query: str,
+    images: list[Any],
+    image_token_counts: list[int],
+    budget: int,
+    context_blocks: Sequence[str] = (),
+) -> tuple[str, list[Any]]:
+    """Fit the actual query, keeping system policy and the latest observation.
+
+    ``context_blocks`` are model-specific context sections (today: accepted
+    delegated results). They are not history and are never evicted, so they are
+    validated against the budget before this call keeps trimming history.
+    """
+    blocks = [block for block in context_blocks if block]
+    history, images, image_token_counts = list(history), list(images), list(image_token_counts)
+    while True:
+        content = [{"type": "image"} for _ in images]
+        content.extend({"type": "text", "text": block} for block in blocks)
+        content.append(
+            {
+                "type": "text",
+                "text": f"{USER_QUERY_HEADER}\n{query}"
+                if query
+                else "Observe the current scene and choose whether to speak or stay silent.",
+            }
+        )
+        messages = [{"role": "system", "content": system}, *history, {"role": "user", "content": content}]
+        rendered = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        text_tokens = processor.tokenizer(text=[rendered])["input_ids"][0]
+        if len(text_tokens) + sum(image_token_counts) - len(images) <= budget:
+            return rendered, images
+        if history:
+            history.pop(0)
+            while history and history[0]["role"] == "assistant":
+                history.pop(0)
+        elif len(images) > 1:
+            images.pop(0)
+            image_token_counts.pop(0)
+        else:
+            raise OmniClientError("JoyAI instruction and current observation exceed the context budget")
+
+
+def asr_to_joyai(
+    source_outputs: list[RequestOutput],
+    prompt: object | None = None,
+    requires_multimodal_data: bool = True,
+    *,
+    target_model_config: Any = None,
+) -> list[dict[str, Any]]:
+    """Build JoyAI prompts from Qwen3-ASR transcripts and the deferred image/video inputs;
+    ``additional_information["joyai_system_prompt"]`` overrides the default system prompt."""
+    request_prompts = prompt if isinstance(prompt, list) else [prompt] * len(source_outputs)
+    joyai_inputs: list[dict[str, Any]] = []
+    for request_index, asr_output in enumerate(source_outputs):
+        request_prompt = request_prompts[request_index] if request_index < len(request_prompts) else None
+        request_prompt = request_prompt if isinstance(request_prompt, dict) else {}
+        additional_info = request_prompt.get("additional_information") or {}
+        system_prompt = str(first_value(additional_info.get("joyai_system_prompt"), DEFAULT_SYSTEM_PROMPT))
+        delegation_context = additional_info.get("joyai_delegation_context")
+        if delegation_context is not None and not isinstance(delegation_context, str):
+            raise OmniClientError("joyai_delegation_context must be a string")
+        transcript = _clean_qwen3_asr_transcript(_extract_completed_action_text(asr_output))
+        deferred = additional_info.get("deferred_multi_modal_data") or {}
+        visual_inputs = {modality: deferred[modality] for modality in ("image", "video") if deferred.get(modality)}
+        user_turn = f"{USER_QUERY_HEADER}\n{transcript}" if transcript else ""
+        user_turn += _IMAGE_PLACEHOLDER * len(visual_inputs.get("image", ()))
+        user_turn += _VIDEO_PLACEHOLDER * len(visual_inputs.get("video", ()))
+        joyai_input: dict[str, Any] = {
+            "prompt": (
+                f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
+                f"<|im_start|>user\n{user_turn}<|im_end|>\n"
+                "<|im_start|>assistant\n"
+            ),
+        }
+        context = additional_info.get("joyai_prompt_context")
+        if "joyai_prompt_context" in additional_info:
+            # Chat clients can also supply this metadata. Reject malformed
+            # session context as a request error before invoking the processor.
+            if (
+                not isinstance(context, dict)
+                or not isinstance(context.get("system"), str)
+                or not isinstance(context.get("history"), list)
+                or any(
+                    not isinstance(message, dict)
+                    or message.get("role") not in ("user", "assistant")
+                    or not isinstance(message.get("content"), str)
+                    for message in context["history"]
+                )
+            ):
+                raise OmniClientError(
+                    "joyai_prompt_context requires a string system and a history of user/assistant text messages"
+                )
+            budget = additional_info.get("joyai_prompt_budget")
+            if type(budget) is not int or budget <= 0:
+                raise OmniClientError("joyai_prompt_budget must be a positive integer")
+            image_token_counts = additional_info.get("joyai_image_token_counts")
+            images = visual_inputs.get("image", [])
+            if (
+                not isinstance(image_token_counts, list)
+                or not isinstance(images, list)
+                or len(image_token_counts) != len(images)
+                or any(type(count) is not int or count < 0 for count in image_token_counts)
+            ):
+                raise OmniClientError("joyai_image_token_counts must contain one non-negative integer per image")
+            # ASR determines the query length. Apply the same history/visual
+            # eviction policy as direct observations only once it is known.
+            joyai_input["prompt"], images = render_joyai_session_prompt(
+                cached_processor_from_config(target_model_config),
+                system=context["system"],
+                history=context["history"],
+                query=transcript,
+                images=images,
+                image_token_counts=image_token_counts,
+                budget=budget,
+                context_blocks=(delegation_context,) if delegation_context else (),
+            )
+            visual_inputs = {"image": images} if images else {}
+        if requires_multimodal_data and visual_inputs:
+            joyai_input["multi_modal_data"] = visual_inputs
+        if request_prompt.get("mm_processor_kwargs") is not None:
+            joyai_input["mm_processor_kwargs"] = request_prompt["mm_processor_kwargs"]
+        if request_prompt.get("cache_salt") is not None:
+            joyai_input["cache_salt"] = request_prompt["cache_salt"]
+        joyai_inputs.append(joyai_input)
+    return joyai_inputs
 
 
 def _build_tts_metadata(request_prompt: object, spoken_text: str) -> dict[str, list[str]]:

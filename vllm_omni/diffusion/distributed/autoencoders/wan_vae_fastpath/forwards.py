@@ -8,7 +8,7 @@ function at the ``lossless`` level reproduces the diffusers 0.40 operation
 order exactly and only differs in how the bytes move:
 
 * ``WanRMS_norm``: fp32 ``vector_norm`` straight from the low-precision tensor
-  plus one fused Triton epilogue (see :mod:`.triton_rms_norm`), optionally with
+  plus one fused Triton epilogue (see :mod:`vllm_omni.diffusion.layers.vae_norm_epilogue`), optionally with
   the following SiLU folded in. At the ``channels_last`` level the single-pass
   kernel also absorbs the bias of the ``conv1`` that feeds ``norm2``.
 * ``WanCausalConv3d`` and every cached call site: the ``clone`` + ``cat`` +
@@ -52,9 +52,11 @@ from diffusers.models.autoencoders.autoencoder_kl_wan import (
 )
 from vllm.logger import init_logger
 
+from vllm_omni.diffusion.layers.vae_rms_norm import kernels_allowed as _kernels_allowed
+from vllm_omni.diffusion.layers.vae_rms_norm import rms_norm_fastpath as shared_rms_norm_fastpath
+
 from . import triton_data_movement as dm
 from . import triton_norm_cache as nc
-from . import triton_rms_norm as rn
 from . import triton_rms_norm_cl as cl
 from . import triton_upsample as up
 from ._utils import suggests_channels_last
@@ -108,46 +110,9 @@ def _has_forward_hooks(*modules: nn.Module | None) -> bool:
     return any(m is not None and (m._forward_pre_hooks or m._forward_hooks) for m in modules)
 
 
-def _kernels_allowed(x: torch.Tensor) -> bool:
-    return x.is_cuda and not torch.is_grad_enabled() and not torch.compiler.is_compiling()
-
-
 # --------------------------------------------------------------------------- #
 # WanRMS_norm
 # --------------------------------------------------------------------------- #
-
-
-def _as_rows(
-    x: torch.Tensor, denom: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor, Callable[[torch.Tensor], torch.Tensor]] | None:
-    """View ``x``/``denom`` as contiguous ``(N, C, S)`` / ``(N, 1, S)`` without copying.
-
-    Handles the dense layouts the decoder produces: plain contiguous 4D/5D
-    tensors and the frame-major 5D view ``WanResample`` emits
-    (``permute(0, 2, 1, 3, 4)`` of a contiguous ``(b, t, c, h, w)`` buffer).
-    Returns the two views and a function mapping a kernel output back to
-    ``x``'s shape and strides, or ``None`` for any other layout.
-    """
-    if x.dim() == 5:
-        b, c, t, h, w = x.shape
-        if x.is_contiguous():
-            spatial = t * h * w
-            return x.view(b, c, spatial), denom.view(b, 1, spatial), lambda out: out.view(b, c, t, h, w)
-        frame_major = x.permute(0, 2, 1, 3, 4)
-        denom_frame_major = denom.permute(0, 2, 1, 3, 4)
-        if frame_major.is_contiguous() and denom_frame_major.is_contiguous():
-            spatial = h * w
-            return (
-                frame_major.view(b * t, c, spatial),
-                denom_frame_major.view(b * t, 1, spatial),
-                lambda out: out.view(b, t, c, h, w).permute(0, 2, 1, 3, 4),
-            )
-        return None
-    if x.dim() == 4 and x.is_contiguous():
-        n, c, h, w = x.shape
-        spatial = h * w
-        return x.view(n, c, spatial), denom.view(n, 1, spatial), lambda out: out.view(n, c, h, w)
-    return None
 
 
 def _add_channel_bias(x: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
@@ -185,28 +150,7 @@ def rms_norm_fastpath(
         out = cl.rms_norm_channels_last(x, gamma, norm.scale, silu=silu, bias=bias, exact_bf16=cfg.exact_bf16_norm)
         if out is not None:
             return out
-    if bias is not None:
-        x = _add_channel_bias(x, bias)
-
-    # Same reduction kernel as ``F.normalize(x.float(), dim=1)`` runs, reading
-    # the low-precision tensor once instead of materializing an fp32 copy.
-    denom = torch.linalg.vector_norm(x, dim=1, keepdim=True, dtype=torch.float32).clamp_min_(1e-12)
-
-    if _kernels_allowed(x):
-        rows = _as_rows(x, denom)
-        if rows is not None:
-            x_rows, denom_rows, restore = rows
-            out = rn.rms_norm_scale(x_rows, denom_rows, gamma.reshape(-1), norm.scale, silu=silu)
-            if out is not None:
-                return restore(out)
-
-    # Exact PyTorch restructuring: the divide computes in fp32 opmath and rounds
-    # once on store, exactly like ``(x.float() / denom).to(x.dtype)``; the
-    # epilogue is upstream's own expression.
-    normalized = torch.empty_like(x)
-    torch.div(x, denom, out=normalized)
-    out = normalized * norm.scale * gamma + norm_bias
-    return F.silu(out) if silu else out
+    return shared_rms_norm_fastpath(norm, x, silu=silu, bias=bias)
 
 
 def rms_norm_forward(self: nn.Module, x: torch.Tensor) -> torch.Tensor:
@@ -272,6 +216,22 @@ def causal_conv_forward(self: WanCausalConv3d, x: torch.Tensor, cache_x: torch.T
 def _conv_without_bias(conv: nn.Conv3d, x: torch.Tensor) -> torch.Tensor:
     """The cuDNN call ``nn.Conv3d.forward`` makes, minus ATen's separate ``add_(bias)``."""
     return F.conv3d(x, conv.weight, None, conv.stride, conv.padding, conv.dilation, conv.groups)
+
+
+def _may_defer_conv_bias(owner: nn.Module, x: torch.Tensor) -> bool:
+    """Whether the bias of a convolution in ``owner`` may be left for a later kernel to add.
+
+    ATen's CUDA convolution adds the bias in a separate pass after cuDNN rounds
+    the output, so adding it later (inside the norm or residual kernel) gives
+    the same bits. oneDNN on XPU adds it inside the fp32 accumulator before the
+    one rounding; deferring it changes ~27% of bf16/fp16 outputs by an ulp, so
+    the lossless level keeps the bias in the convolution there. The
+    ``channels_last`` level is tolerance-based and defers everywhere.
+    """
+    if x.device.type != "xpu":
+        return True
+    cfg = getattr(owner, CFG_ATTR, None)
+    return cfg is not None and cfg.channels_last
 
 
 def _deferred_conv_bias(conv: nn.Module, output: torch.Tensor) -> torch.Tensor | None:
@@ -489,14 +449,19 @@ def _run_cached_causal_conv(
         and x.dim() == 5
         and (payload is None or (payload.device == x.device and payload.dtype == x.dtype))
     ):
-        fold_bias = return_bias and conv.bias is not None
+        fold_bias = return_bias and conv.bias is not None and _may_defer_conv_bias(conv, x)
         bias = None if fold_bias else conv.bias
+
+        def with_bias(out: torch.Tensor) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]:
+            if not return_bias:
+                return out
+            return out, _deferred_conv_bias(conv, out) if fold_bias else None
 
         if payload is None:
             first_frame = _first_frame_conv2d(conv, x, bias)
             if first_frame is not None:
                 out, cache_list[index] = first_frame
-                return (out, _deferred_conv_bias(conv, out)) if return_bias else out
+                return with_bias(out)
 
         # Preferred: temporal concat only (aligned plane copies) + cuDNN spatial
         # padding, once verified bitwise for this (conv, shape).
@@ -507,13 +472,13 @@ def _run_cached_causal_conv(
             if pair is not None:
                 assembled, cache_list[index] = pair
                 out = _conv_with_spatial_padding(conv, assembled, bias, verdicts, key)
-                return (out, _deferred_conv_bias(conv, out)) if return_bias else out
+                return with_bias(out)
 
         pair = dm.cat_pad_5d(x, payload, conv._padding, keep_cache_frames=CACHE_T)
         if pair is not None:
             conv_input, cache_list[index] = pair
             out = F.conv3d(conv_input, conv.weight, bias, conv.stride, conv.padding, conv.dilation, conv.groups)
-            return (out, _deferred_conv_bias(conv, out)) if return_bias else out
+            return with_bias(out)
 
     cache_x = x[:, :, -CACHE_T:, :, :].clone()
     if cache_x.shape[2] < CACHE_T and payload is not None:
@@ -592,8 +557,11 @@ def _run_norm_act_cached_conv(
                 )
                 if pair is not None:
                     assembled, cache_list[index] = pair
-                    out = _conv_with_spatial_padding(conv, assembled, None if return_bias else conv.bias, verdicts, key)
-                    return (out, _deferred_conv_bias(conv, out)) if return_bias else out
+                    fold_bias = return_bias and _may_defer_conv_bias(norm, x)
+                    out = _conv_with_spatial_padding(conv, assembled, None if fold_bias else conv.bias, verdicts, key)
+                    if not return_bias:
+                        return out
+                    return out, _deferred_conv_bias(conv, out) if fold_bias else None
 
     x = _norm_act(norm, act, x, pending_bias=pending_bias)
     if after_norm is not None:
@@ -799,6 +767,7 @@ def resample_forward(
         and _is_upsample_conv_pair(self.resample)
         and not _has_forward_hooks(self.resample, self.resample[1])
         and _kernels_allowed(x)
+        and _may_defer_conv_bias(self, x)
     ):
         upsample, conv = self.resample[0], self.resample[1]
         x = F.conv2d(upsample(x), conv.weight, None, conv.stride, conv.padding, conv.dilation, conv.groups)
@@ -863,6 +832,7 @@ def residual_block_forward(
         and not any(shortcut._padding)
         and not _has_forward_hooks(shortcut)
         and _kernels_allowed(x)
+        and _may_defer_conv_bias(shortcut, x)
     ):
         residual = _conv_without_bias(shortcut, x)
         residual_bias = _deferred_conv_bias(shortcut, residual)

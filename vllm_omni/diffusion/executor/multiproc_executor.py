@@ -614,7 +614,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                             request_id=new_req.request_id,
                             step_index=None,
                             finished=True,
-                            result=DiffusionOutput(error=str(exc)),
+                            result=DiffusionOutput.from_exception(exc),
                         )
                     )
             return BatchRunnerOutput.from_list(runner_outputs)
@@ -662,7 +662,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                         request_id=new_req.request_id,
                         step_index=None,
                         finished=True,
-                        result=DiffusionOutput(error=str(exc)),
+                        result=DiffusionOutput.from_exception(exc),
                     )
                 )
 
@@ -1130,6 +1130,10 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         fresh one that would never complete.
         """
         with self._futures_lock:
+            if self._closed:
+                closed: concurrent.futures.Future[DiffusionOutput] = concurrent.futures.Future()
+                closed.set_exception(RuntimeError("Executor shut down"))
+                return closed
             cached = self._completed_outputs.pop(async_output_id, None)
             if cached is not None:
                 return cached
