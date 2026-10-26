@@ -5,25 +5,33 @@ import json
 import os
 import subprocess
 import sys
+from datetime import timedelta
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 import torch
-from omegaconf import DictConfig
-from safetensors.torch import save_file
+import torch.distributed as dist
+import torch.multiprocessing as mp
+from omegaconf import DictConfig, OmegaConf
+from safetensors.torch import load_file, save_file
 from torch import nn
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
-from tests.diffusion.models.hy_nomas.test_ar import PipelineWithCPUComponents
 from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig, resolve_model_class_name
+from vllm_omni.diffusion.executor.uniproc_executor import UniProcDiffusionExecutor
 from vllm_omni.diffusion.media import VideoValueRange
 from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
 from vllm_omni.diffusion.models.hy_nomas import pipeline_hy_nomas
 from vllm_omni.diffusion.models.hy_nomas.configuration_hy_nomas import DIT_FILE, REQUIRED_FILES
-from vllm_omni.diffusion.models.hy_nomas.pipeline_hy_nomas import HyNomasPipeline, validate_config
-from vllm_omni.diffusion.models.hy_nomas.processing_hy_nomas import normalize_request
+from vllm_omni.diffusion.models.hy_nomas.hy_nomas_transformer import build_transformer, load_transformer_weights
+from vllm_omni.diffusion.models.hy_nomas.pipeline_hy_nomas import (
+    HyNomasPipeline,
+    build_reference_config,
+    validate_config,
+)
+from vllm_omni.diffusion.models.hy_nomas.processing_hy_nomas import action_conditioning, normalize_request
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.utils.hf_utils import (
     _looks_like_hy_nomas,
@@ -263,6 +271,8 @@ def test_invalid_prompt(prompt):
 
 @pytest.fixture
 def pipeline(monkeypatch):
+    from tests.diffusion.models.hy_nomas.test_ar import PipelineWithCPUComponents
+
     module = ModuleType("hymm.models.dit.modules.attention.range_attention")
     monkeypatch.setattr(module, "clear_range_cache", Mock(), raising=False)
     monkeypatch.setitem(sys.modules, module.__name__, module)
@@ -423,3 +433,189 @@ def test_supported_ulysses_config(sp_size):
             dtype=torch.bfloat16,
         )
     )
+
+
+class CustomUniExecutor(UniProcDiffusionExecutor):
+    pass
+
+
+@pytest.mark.parametrize(
+    "backend",
+    [
+        None,
+        "uni",
+        UniProcDiffusionExecutor,
+        CustomUniExecutor,
+        "vllm_omni.diffusion.executor.uniproc_executor.UniProcDiffusionExecutor",
+    ],
+)
+def test_model_rejects_in_process_execution_before_initializing_components(monkeypatch, backend):
+    device = Mock(side_effect=AssertionError("Component initialization must not start"))
+    monkeypatch.setattr(pipeline_hy_nomas, "get_local_device", device)
+    config = OmniDiffusionConfig(dtype=torch.bfloat16, distributed_executor_backend=backend)
+    with pytest.raises(ValueError, match="requires process isolation"):
+        HyNomasPipeline(od_config=config)
+    device.assert_not_called()
+
+
+@pytest.mark.parametrize("backend", ["mp", "ray"])
+def test_model_accepts_isolated_executor(backend):
+    validate_config(OmniDiffusionConfig(dtype=torch.bfloat16, distributed_executor_backend=backend))
+
+
+def make_transformer():
+    transformer = nn.Module()
+    transformer.base = nn.Linear(2, 2, bias=False)
+    transformer.action_modules = nn.ModuleList([nn.Linear(2, 2, bias=False)])
+    return transformer
+
+
+@pytest.mark.parametrize("camera_name", ["action_modules.0.weight", "double_blocks.0.action_module.weight"])
+def test_complete_dit_checkpoint_with_reference_aliases(tmp_path, camera_name):
+    model = make_transformer()
+    checkpoint = tmp_path / "model.safetensors"
+    save_file({"base.weight": model.base.weight, camera_name: model.action_modules[0].weight}, str(checkpoint))
+    expected = {name: value.clone() for name, value in model.state_dict().items()}
+    for parameter in model.parameters():
+        parameter.data.zero_()
+    assert load_transformer_weights(model, load_file(str(checkpoint)).items()) == set(expected)
+    for name, value in model.state_dict().items():
+        torch.testing.assert_close(value, expected[name], rtol=0, atol=0)
+
+
+def test_missing_camera_weights_are_rejected(tmp_path):
+    model = make_transformer()
+    checkpoint = tmp_path / "model.safetensors"
+    save_file({"base.weight": model.base.weight}, str(checkpoint))
+    with pytest.raises(ValueError, match="action_modules.0.weight"):
+        load_transformer_weights(model, load_file(str(checkpoint)).items())
+
+
+def test_standard_loader_accounts_for_all_components():
+    pipeline = HyNomasPipeline.__new__(HyNomasPipeline)
+    nn.Module.__init__(pipeline)
+    pipeline.transformer = make_transformer()
+    pipeline.text_encoder = nn.Linear(2, 2)
+    pipeline.vae = nn.Linear(2, 2)
+    weights = [(f"transformer.{name}", tensor.clone()) for name, tensor in pipeline.transformer.state_dict().items()]
+    loaded = pipeline.load_weights(weights)
+    assert loaded == set(dict(pipeline.named_parameters()))
+    with pytest.raises(ValueError, match="Unexpected Hy-Nomas component"):
+        pipeline.load_weights(iter((("weight", torch.zeros(1)),)))
+    with pytest.raises(ValueError, match="missing"):
+        pipeline.load_weights(iter(()))
+
+
+@pytest.mark.parametrize("kind", ["duplicate", "unknown", "shape"])
+def test_malformed_dit_weight_stream_is_rejected(kind):
+    transformer = make_transformer()
+    weights = list(transformer.state_dict().items())
+    if kind == "duplicate":
+        weights.append(("double_blocks.0.action_module.weight", weights[1][1]))
+    elif kind == "unknown":
+        weights.append(("extra.weight", torch.zeros(2, 2)))
+    else:
+        weights[0] = (weights[0][0], torch.zeros(3, 3))
+    with pytest.raises((ValueError, AssertionError)):
+        load_transformer_weights(transformer, weights)
+
+
+class TokenizerStub:
+    prompt_template_video = {"crop_start": 3}
+
+    def text2tokens(self, prompts, *, max_length, **kwargs):
+        ids = [list(text.encode())[:max_length] for text in prompts]
+        return {"input_ids": torch.tensor(ids), "attention_mask": torch.ones(1, len(ids[0]))}
+
+
+@pytest.mark.local_model
+@pytest.mark.parametrize("structured", ["caption", "empty", "list", "mapping", "single", "overlap", "missing_time"])
+def test_action_masks_match_reference_helpers(structured):
+    reference = pytest.importorskip("hymm.pipeline.base")
+    model = reference.BasePipeline.__new__(reference.BasePipeline)
+    nn.Module.__init__(model)
+    model.args = OmegaConf.create({"text_len": 1280, "inference": {"video_fps": 24}})
+    model.text_encoder = TokenizerStub()
+    model.t_ratio = 4
+    actions: list[dict[str, str | float]] = [
+        {"start_time": "00:00.5", "end_time": "00:01.0", "action_description": "walk"},
+        {"start_time": "00:01.0", "end_time": "00:01.5", "action_description": "turn"},
+    ]
+    if structured == "single":
+        actions = [{"start_time": 0, "end_time": 10, "action_description": "walk"}]
+    elif structured == "overlap":
+        actions[1]["start_time"] = 0.5
+    elif structured == "missing_time":
+        del actions[0]["start_time"]
+    contained_actions = (
+        {f"Action{index}": action for index, action in enumerate(actions)} if structured == "mapping" else actions
+    )
+    prompt = json.dumps({"segments": [{"description": "A forest", "contained_actions": contained_actions}]})
+    if structured == "caption":
+        prompt = "A forest beside a river."
+    elif structured == "empty":
+        prompt = json.dumps({"segments": []})
+    if structured == "overlap":
+        with pytest.raises(ValueError, match="Overlapping"):
+            model._compute_action_video_windows(prompt, 0, 12)
+        with pytest.raises(ValueError, match="overlap"):
+            action_conditioning(prompt, model.text_encoder, 1280, 12)
+        return
+    start = model._compute_action_start(prompt)
+    offsets = model._compute_action_text_offsets(prompt)
+    windows = model._compute_action_video_windows(prompt, 0, 12)
+    expected = (start, offsets, windows) if offsets is not None and windows is not None else (start, None, None)
+    assert action_conditioning(prompt, model.text_encoder, 1280, 12) == expected
+
+
+@pytest.mark.local_model
+def test_reference_transformer_factory_places_every_parameter(tmp_path):
+    pytest.importorskip("hymm.models.dit.modules")
+    config = build_reference_config(tmp_path, "Qwen/Qwen2.5-VL-7B-Instruct")
+    transformer = build_transformer(config, torch.device("meta"))
+    parameters = dict(transformer.named_parameters())
+    assert len(parameters) == 2268
+    assert all(parameter.device.type == "meta" for parameter in parameters.values())
+    assert all(parameter.dtype == torch.bfloat16 for parameter in parameters.values())
+
+
+def _check_reference_parallelism(rank, rendezvous):
+    from hymm.distributed.parallel_states import get_sequence_parallel_state, nccl_info
+
+    from vllm_omni.diffusion.models.hy_nomas import hy_nomas_transformer
+
+    dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=2, timeout=timedelta(seconds=60))
+    try:
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setenv("RANK", "0")
+            group = Mock(ulysses_group=dist.group.WORLD, ulysses_world_size=2, world_size=2)
+            patch.setattr(hy_nomas_transformer, "get_sp_group", lambda: group)
+            mesh = hy_nomas_transformer.initialize_reference_parallelism(2, torch.device("cpu"))
+            assert mesh.get_group("sp") is dist.group.WORLD
+            assert nccl_info.sp_group is dist.group.WORLD
+            assert nccl_info.sp_size == 2
+            assert nccl_info.rank_within_spgroup == nccl_info.global_rank == rank
+            assert nccl_info.parallel_dims.sp_group is dist.group.WORLD
+            assert get_sequence_parallel_state()
+            value = torch.tensor(rank + 1)
+            dist.all_reduce(value, group=nccl_info.sp_group)
+            assert value.item() == 3
+
+            assert hy_nomas_transformer.initialize_reference_parallelism(1, torch.device("cpu")) is None
+            assert not get_sequence_parallel_state()
+            assert nccl_info.sp_size == 1
+            assert nccl_info.sp_group is None
+            assert nccl_info.device_mesh is None
+            assert dist.is_initialized()
+
+            group.ulysses_world_size = 4
+            with pytest.raises(ValueError, match="match ulysses_degree"):
+                hy_nomas_transformer.initialize_reference_parallelism(2, torch.device("cpu"))
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.local_model
+def test_reference_reuses_process_group_and_resets_single_device(tmp_path):
+    pytest.importorskip("hymm.distributed.parallel_states", reason="Install the pinned Hy-Nomas reference checkout")
+    mp.spawn(_check_reference_parallelism, args=((tmp_path / "rendezvous").as_uri(),), nprocs=2, join=True)

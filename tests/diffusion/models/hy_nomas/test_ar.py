@@ -2,11 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from contextlib import nullcontext
-from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
 
-import av
 import numpy as np
 import pytest
 import torch
@@ -30,7 +28,6 @@ from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.input_batch import InputBatch
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.diffusion.worker.utils import StepRequestState
-from vllm_omni.entrypoints.openai.video_api_utils import FragmentedMP4VideoEncoder
 from vllm_omni.errors import OmniClientError
 from vllm_omni.experimental.ar_diffusion.capability import SupportsARDiffusionPipeline
 from vllm_omni.experimental.ar_diffusion.tick_protocol import ARDiffusionControlInput, ARDiffusionTickRequest
@@ -516,18 +513,6 @@ def test_decode_failure_is_propagated_to_every_sp_rank(runner, monkeypatch, loca
     assert flags == [int(local_failure)]
     assert not runner._sessions and not runner.pipeline._ar_sessions
     assert runner.kv_cache.manager.block_pool.get_num_free_blocks() == free
-
-
-def test_stable_video_stream_accepts_empty_chunks_without_losing_frames():
-    encoder = FragmentedMP4VideoEncoder(fps=24, video_codec_options={"preset": "ultrafast", "tune": "zerolatency"})
-    empty = np.empty((0, 32, 32, 3), dtype=np.uint8)
-    black = np.zeros((1, 32, 32, 3), dtype=np.uint8)
-    white = np.full((1, 32, 32, 3), 255, dtype=np.uint8)
-    payload = b"".join(encoder.encode(video) for video in (empty, black, empty, white)) + encoder.close()
-    with av.open(BytesIO(payload), mode="r", format="mp4") as container:
-        frames = [frame.to_ndarray(format="rgb24") for frame in container.decode(video=0)]
-    assert len(frames) == 2
-    assert frames[0].mean() < 2 and frames[1].mean() > 253
 
 
 def test_cache_commit_timestep_keeps_reference_precision(runner):

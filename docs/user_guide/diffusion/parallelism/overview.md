@@ -15,7 +15,3 @@ This guide covers the parallelism methods in vLLM-Omni for speeding up diffusion
 | **[Expert Parallelism](expert_parallel.md)**       | Shards MoE expert blocks across GPUs for MoE models (e.g. HunyuanImage3.0)                                          |
 
 See [Supported Models](../../diffusion_features.md#supported-models) for per-model compatibility.
-
-[Hy-Nomas](../hy_nomas.md#sequence-parallelism) uses the reference DiT's Ulysses
-implementation with the worker's existing process group. Select it with
-`--ulysses-degree 2`; text encoding and PixelUMM decoding remain replicated.

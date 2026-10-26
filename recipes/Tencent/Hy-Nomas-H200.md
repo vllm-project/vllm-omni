@@ -1,0 +1,263 @@
+# Hy-Nomas video generation — H200
+
+## Summary
+
+- Vendor: Tencent Hunyuan
+- Model: [`tencent/Hy-Nomas`](https://huggingface.co/tencent/Hy-Nomas), distilled checkpoint
+- Task: text-to-video with segment prompts and optional camera control
+- Modes: offline generation, `/v1/videos`, realtime streaming, and multi-turn continuation
+- Hardware: one or two NVIDIA H200 GPUs, 141 GB per device
+- Runtime: `HyNomasPipeline`, BF16, with the pinned Hy-Nomas reference package
+- Maintainer: vLLM-Omni community
+
+Use this recipe for text-controlled video generation and interactive continuation.
+The pipeline manages generation and component loading; the DiT, text encoder,
+PixelUMM decoder, and Euler scheduler implementations require the reference package.
+
+## Supported model contract
+
+| Task | Entrypoint | Input | Output |
+| --- | --- | --- | --- |
+| Video generation | Shared `text_to_video.py` or `/v1/videos` | One prompt or multiple text segments; optional camera trajectory | One silent video |
+| Live interaction | `/v1/realtime/video` and the shared streaming client | Initial prompt, then prompt/camera updates at chunk boundaries | Stable video chunks followed by the final decoder tail |
+| Multi-turn continuation | `hy_nomas_session.py` using AR-Diffusion ticks | Successive prompt/control snapshots with one session ID | Stable video chunks sharing the session history |
+
+| Parameter | Contract |
+| --- | --- |
+| Geometry | Height and width divisible by 32; default 704×1280 |
+| Frame count | `num_frames=4*n+1`, with `n >= 1`; default 121 |
+| Frame rate | 24 fps |
+| Sampling | 4, 6, or 8 steps; default 8; guidance scale 1 and flow shift 5 |
+| Segment boundaries | Pixel-frame indices starting at 0 and ending at `num_frames`; internal boundaries divisible by 4 |
+| Camera | Reference generator name, such as `pan_left`, or a worker-accessible JSON/NPZ trajectory file |
+| Persistent turn | At most 61 frames with the default 16-latent chunk; height, width, and seed remain fixed within a session |
+| Default AR capacity | 120 latent frames, 16 prompt segments, one active session, 704×1280 spatial limits |
+
+Each `|||`-separated text describes one segment. Supply prepared reference segment
+JSON as its text when using structured prompts. Prompt enhancement with Nomas-PE
+and the reference dataset prompt-file loader are separate upstream tools.
+Input images, audio generation, and latent output are unsupported.
+
+The reference's 720-pixel height is reduced to 704 by its latent grid; this API
+requires the actual output height. To specify duration, omit `num_frames` and pass
+`duration` in model extras: 4 seconds gives 97 frames, including the initial frame.
+An explicit frame count must agree with duration; fractional durations must span
+a positive multiple of four frame intervals. Use these parameters for clip length
+instead of the video endpoint's top-level `seconds` field.
+
+## Deployment profiles
+
+| Profile | Devices | Configuration | Qualification |
+| --- | --- | --- | --- |
+| Ordinary generation | 1 H200 | `hy_nomas.yaml`, BF16, `mp`, eager | Offline and video API, resident and CPU offload |
+| Sequence parallel generation | 2 H200 | `hy_nomas.yaml` plus `--ulysses-degree 2` | Offline and video API, resident and CPU offload |
+| Realtime streaming | 2 H200 | `hy_nomas_ar.yaml`, Ulysses degree 2 | Prompt/camera updates, cancellation, and a subsequent request |
+| Multi-turn continuation | 2 H200 | Session example, Ulysses degree 2 | Three 49-frame turns with a final decoder flush |
+
+Weights, text encoding, and PixelUMM decoding remain replicated with sequence
+parallelism. The degree must divide the DiT's 16 attention heads and the spatial
+token count per latent frame. Only degrees one and two have real-model qualification.
+Device interconnect, peak memory, and host memory were not recorded for these checks.
+CPU offload requires sufficient GPU memory for initial component loading and host
+memory for the staged weights.
+
+## Software and checkpoints
+
+Qualification used Linux, Python 3.12.13, PyTorch 2.13.0+cu130, CUDA 13.0,
+vLLM 0.32.0, Transformers 5.16.1, Diffusers 0.40.0, and FlashAttention 2.8.3.
+The qualified vLLM-Omni implementation is commit
+`9a2b1f2fada0abeb3db0ccb5b3ade14ee50c398b`; the driver version was not recorded.
+
+Install vLLM-Omni first, then install the pinned reference checkout without
+replacing the environment's existing dependency versions:
+
+```bash
+git clone https://github.com/Tencent-Hunyuan/Hy-Nomas.git
+git -C Hy-Nomas checkout --detach 911cea6458a89c2663513ff7099561ec190dd491
+python -m pip install --no-deps -e ./Hy-Nomas
+python -m pip install hydra-core==1.3.2 omegaconf==2.3.0 loguru einops
+```
+
+Keep the editable checkout: the integration reads its configuration files.
+Install FlashAttention 2 for the environment's PyTorch/CUDA versions using the
+[reference installation instructions](https://github.com/Tencent-Hunyuan/Hy-Nomas/tree/911cea6458a89c2663513ff7099561ec190dd491).
+Verify imports before loading weights:
+
+```bash
+python -c 'from hymm.pipeline.causal_ar import CPTCausalInferencePipeline'
+```
+
+Download the distilled DiT and PixelUMM checkpoints:
+
+```bash
+hf download tencent/Hy-Nomas \
+  DiT/distilled/diffusion_pytorch_model_ema_0_995.safetensors \
+  VAE/PixelUMM_FT/diffusion_pytorch_model.safetensors \
+  --local-dir ./Hy-Nomas-weights
+```
+
+The local directory must retain these relative paths. The checkpoint must include
+all DiT parameters, including camera weights. Both this layout and the Hub ID are
+recognized without `model_index.json`. Passing the Hub ID to the shared entrypoints
+uses the standard snapshot download and may fetch additional checkpoint variants.
+
+The text encoder separately loads `Qwen/Qwen2.5-VL-7B-Instruct`. To use a local copy,
+pass `--custom-pipeline-args '{"text_encoder":"/path/to/Qwen2.5-VL-7B-Instruct"}'`
+to the server, or `custom_pipeline_args={"text_encoder": "/path/to/Qwen2.5-VL-7B-Instruct"}`
+to the Python API.
+
+## Offline generation
+
+Run commands from the vLLM-Omni repository:
+
+```bash
+python examples/offline_inference/text_to_video/text_to_video.py \
+  --model ./Hy-Nomas-weights \
+  --deploy-config vllm_omni/deploy/hy_nomas.yaml \
+  --prompt 'A forest beside a river. ||| The camera moves along the river.' \
+  --height 704 --width 1280 --num-frames 121 --num-inference-steps 8 \
+  --guidance-scale 1 --fps 24 --seed 42 \
+  --extra-body '{"segment_frame_boundaries":[0,60,121]}' \
+  --output /path/to/results/hy_nomas.mp4
+```
+
+Add `--ulysses-degree 2` for two GPUs. The default single-segment boundary is
+`[0, num_frames]`. Optional `camera_trajectory` and `segment_has_camera` fields
+go in `--extra-body`; the latter contains one boolean per segment.
+
+The deployment selects the `mp` executor and eager execution. Python callers
+must set `distributed_executor_backend="mp"` and `enforce_eager=True`.
+The reference package needs process isolation. The first real request includes
+reference-kernel compilation; generic startup warmup is disabled because its
+sampling parameters are outside this checkpoint's contract.
+
+## Online generation
+
+```bash
+vllm serve ./Hy-Nomas-weights --omni --port 8098 \
+  --deploy-config vllm_omni/deploy/hy_nomas.yaml
+```
+
+Submit a video job from another terminal:
+
+```bash
+curl -sS http://localhost:8098/v1/videos \
+  -F 'prompt=A forest beside a river.' -F 'size=1280x704' \
+  -F 'num_frames=121' -F 'fps=24' -F 'num_inference_steps=8' \
+  -F 'guidance_scale=1' -F 'seed=42'
+```
+
+Poll `GET /v1/videos/{id}` until the returned job is `completed` or `failed`.
+Download completed output with `GET /v1/videos/{id}/content`.
+Model extras use the JSON `extra_params` form field, for example
+`-F 'extra_params={"duration":4}'` when `num_frames` is omitted, or
+`-F 'extra_params={"segment_frame_boundaries":[0,60,121],"camera_trajectory":"pan_left","segment_has_camera":[true,true]}'`
+with a two-segment prompt and 121 frames. `generate_sound=false` is accepted.
+
+## CPU offload
+
+Select the components to offload with the shared configuration:
+
+```bash
+vllm serve ./Hy-Nomas-weights --omni \
+  --deploy-config vllm_omni/deploy/hy_nomas.yaml \
+  --diffusion-offload-config '{"mode":"module","components":["dit","text_encoder"]}'
+```
+
+This configuration leaves PixelUMM resident. The compatibility flag
+`--enable-cpu-offload` stages all three components. Module offload also works
+with Ulysses SP; each rank stages its own weights. AR step execution transfers
+DiT weights for each forward, increasing transfer overhead.
+
+## Streaming and live interaction
+
+Start the two-GPU AR-Diffusion deployment:
+
+```bash
+vllm serve ./Hy-Nomas-weights --omni --port 8098 \
+  --deploy-config vllm_omni/deploy/hy_nomas_ar.yaml
+```
+
+Connect the shared streaming client:
+
+```bash
+python examples/online_serving/streaming_video_generation/streaming_video_client.py \
+  --model ./Hy-Nomas-weights --port 8098 --no-helios-distilled-preset \
+  --prompt 'A forest beside a river.' --height 704 --width 1280 \
+  --num-frames 241 --num-inference-steps 8 --guidance-scale 1 --fps 24 --seed 42 \
+  --prompt-updates '[{"at":2,"prompt":"The camera approaches a wooden bridge.","transition_chunks":0}]' \
+  --camera-updates '[{"at":3,"camera":{"camera_trajectory":"pan_left"},"transition_chunks":0}]' \
+  --output /path/to/results/hy_nomas_stream.mp4
+```
+
+Updates take effect at chunk boundaries. Set `transition_chunks=0`, or omit it
+when sending protocol messages directly. A camera event uses
+`event.multi_modal_data.camera={"camera_trajectory":"pan_left"}`; a null
+`camera_trajectory` disables camera control. Composite prompt/camera updates
+are validated together. Chunk metadata acknowledges applied and coalesced event IDs.
+
+PixelUMM emits stable frames and retains an overlapping tail between chunks.
+Short chunks may emit no frames. Completion flushes the tail; cancellation or
+disconnect releases the session and discards the withheld tail.
+
+Change `ar_height`, `ar_width`, `ar_chunk_latent_frames`, `ar_max_latent_frames`,
+`ar_max_segments`, and `ar_session_capacity` through `custom_pipeline_args`.
+Requests must fit the configured limits; increasing capacity requires more memory.
+Keep `ar_max_latent_frames` fixed when comparing seeds because it determines the
+noise timeline.
+
+## Multi-turn continuation
+
+```bash
+python examples/offline_inference/text_to_video/hy_nomas_session.py \
+  --model ./Hy-Nomas-weights --ulysses-degree 2 \
+  --prompts 'A forest beside a river.' 'The camera approaches a wooden bridge.' \
+  --height 704 --width 1280 --num-frames 49 --num-inference-steps 8 \
+  --output-dir /path/to/results/hy_nomas_session
+```
+
+The example uses `ARDiffusionOmniTickConsumer` with `step_execution=false` and
+writes stable chunks, `session.mp4`, and `chunks.json`. Ticks share a `session_id`
+and use consecutive `chunk_index` values starting at zero. The last tick sets
+`close_session=true` to flush the decoder; `reset=true` starts a fresh timeline.
+Close, cancellation, failure, and eviction release the session's KV and decoder state.
+
+Typed camera controls use `track="camera"`, `schema="hy_nomas.camera.v1"`, and
+`data={"camera_trajectory":"pan_left"}`. A turn can include frames withheld from
+the previous turn; concatenate returned chunks in `metadata.hy_nomas.frame_start`
+order. `metadata.ar_diffusion` preserves tick identity and applied event IDs.
+
+## Supported features
+
+| Feature | Hy-Nomas support |
+| --- | --- |
+| [Sequence parallelism](../../docs/user_guide/diffusion/parallelism/sequence_parallel.md) | Strict Ulysses with the existing worker group; H200 qualification at degree 2. Ring, AllGather-KV, and UAA are unsupported. |
+| [CPU offload](../../docs/user_guide/diffusion/cpu_offload.md) | Module offload, including with SP; layerwise and distributed layerwise offload are unsupported. |
+| [Other parallelism](../../docs/user_guide/diffusion/parallelism/overview.md) | TP, PP, DP, CFG, HSDP, text encoder sharding, and VAE parallelism are unsupported. |
+| [Other acceleration](../../docs/user_guide/diffusion_features.md) | Quantization, LoRA, and Cache-DiT are unsupported. Use eager execution; full-transformer compilation is rejected and generic regional compilation leaves the cached reference forward unchanged. FlexAttention retains its own kernel compilation. |
+
+## Verification
+
+For a quick check, change the offline command to one prompt, 256×256, nine frames,
+and four steps. Verify that the output has nine frames at 24 fps. This checks
+execution; it does not establish video quality or performance.
+
+Real-model qualification at the commit above passed 18 GPU cases: six ordinary
+reference comparisons, two AR continuation comparisons, and ten offline/API cases
+across one and two H200s. The reference comparisons cover resident and CPU-offload
+execution. Ordinary comparisons use 384×640, 49 frames, eight steps, and seed 42;
+AR comparisons check two 49-frame turns. Decoded frames match exactly, and AR
+latents also match exactly. Ordinary and AR modes use different reference schedules;
+comparisons require matching segment/chunk boundaries and noise capacity.
+
+The two-GPU session example produced 147 frames across three turns. Realtime
+validation covered a 477-frame request with live prompt/camera updates,
+cancellation after initial output, and a subsequent 477-frame request.
+These checks provide no latency or throughput benchmark.
+
+## References
+
+- [Canonical reference implementation](https://github.com/Tencent-Hunyuan/Hy-Nomas/tree/911cea6458a89c2663513ff7099561ec190dd491)
+- [Shared text-to-video example](../../examples/offline_inference/text_to_video/text_to_video.md)
+- [Multi-turn session example](../../examples/offline_inference/text_to_video/hy_nomas_session.py)
+- [Streaming client](../../examples/online_serving/streaming_video_generation/streaming_video_client.py)
