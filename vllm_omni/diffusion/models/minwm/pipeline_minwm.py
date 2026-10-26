@@ -50,12 +50,7 @@ class MinWMAction2VPipeline(SelfForcingPipeline):
             return None
         if not isinstance(trajectory, str) or not trajectory.strip():
             raise ValueError("extra_params.trajectory must be a non-empty string such as 'a*4,w*8,s*7'.")
-        viewmats, intrinsics = trajectory_cameras(trajectory)
-        if viewmats.shape[0] != num_latent_frames:
-            raise ValueError(
-                f"trajectory {trajectory!r} describes {viewmats.shape[0]} latent frames (its steps plus the "
-                f"starting pose), but the request generates {num_latent_frames}."
-            )
+        viewmats, intrinsics = trajectory_cameras(trajectory, num_latent_frames=num_latent_frames)
         return PRoPECameras.from_views(
             viewmats.to(self.device), intrinsics.to(self.device), dtype=self.transformer.dtype
         )

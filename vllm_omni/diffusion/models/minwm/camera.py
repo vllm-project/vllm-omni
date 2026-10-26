@@ -34,9 +34,9 @@ _SEGMENT = re.compile(r"([a-z]+)\*(\d+)")
 _INTRINSICS = np.array([[0.5, 0.0, 0.5], [0.0, 0.5, 0.5], [0.0, 0.0, 1.0]], dtype=np.float32)
 
 
-def trajectory_viewmats(trajectory: str) -> np.ndarray:
-    """Parse a trajectory string into ``[steps + 1, 4, 4]`` float32 world-to-camera matrices."""
-    motions: list[tuple[str, float]] = []
+def trajectory_viewmats(trajectory: str, *, num_latent_frames: int) -> np.ndarray:
+    """Parse a trajectory string into ``[num_latent_frames, 4, 4]`` float32 world-to-camera matrices."""
+    segments: list[tuple[str, int]] = []
     for segment in trajectory.strip().split(","):
         match = _SEGMENT.fullmatch(segment.strip())
         if match is None:
@@ -44,6 +44,17 @@ def trajectory_viewmats(trajectory: str) -> np.ndarray:
         token, count = match.group(1), int(match.group(2))
         if token not in _MOTIONS:
             raise ValueError(f"Unknown trajectory direction {token!r}; valid: {sorted(_MOTIONS)}.")
+        segments.append((token, count))
+
+    # Summed before the counts are repeated, so an oversized request builds no poses.
+    steps = sum(count for _, count in segments)
+    if steps + 1 != num_latent_frames:
+        raise ValueError(
+            f"trajectory {trajectory!r} describes {steps + 1} latent frames (its steps plus the starting "
+            f"pose), but the request generates {num_latent_frames}."
+        )
+    motions: list[tuple[str, float]] = []
+    for token, count in segments:
         motions.extend([_MOTIONS[token]] * count)
 
     camera_to_world = np.eye(4)
@@ -64,9 +75,9 @@ def trajectory_viewmats(trajectory: str) -> np.ndarray:
     return np.stack([np.linalg.inv(pose) for pose in poses]).astype(np.float32)
 
 
-def trajectory_cameras(trajectory: str) -> tuple[torch.Tensor, torch.Tensor]:
+def trajectory_cameras(trajectory: str, *, num_latent_frames: int) -> tuple[torch.Tensor, torch.Tensor]:
     """Return float32 ``[frames, 4, 4]`` view matrices and ``[frames, 3, 3]`` intrinsics of a trajectory."""
-    viewmats = torch.from_numpy(trajectory_viewmats(trajectory))
+    viewmats = torch.from_numpy(trajectory_viewmats(trajectory, num_latent_frames=num_latent_frames))
     intrinsics = torch.from_numpy(np.tile(_INTRINSICS, (viewmats.shape[0], 1, 1)))
     return viewmats, intrinsics
 
