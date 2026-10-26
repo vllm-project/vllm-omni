@@ -10,6 +10,7 @@ import pytest
 import torch
 from vllm.triton_utils import tl, triton
 
+from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.layers.mhc import MHCPostResidual
 from vllm_omni.diffusion.models.magi2 import layers, mhc_sinkhorn
 from vllm_omni.diffusion.models.magi2.layers.musa import mhc as musa_mhc_module
@@ -309,7 +310,7 @@ def _launches(code):
     return re.findall(r"^\s+(\w+)\.run\(", code, re.M)
 
 
-@pytest.mark.musa
+@hardware_test(res={"musa": "S5000"}, num_cards=1)
 @pytest.mark.parametrize("tokens,spread", [(3702, 1.0), (3702, 0.01), (3702, 50.0), (3651, 1.0), (129, 50.0), (1, 1.0)])
 @pytest.mark.parametrize("out_dtype", [torch.float32, torch.bfloat16])
 def test_real_musa_compiled_post_residual_is_bitwise_unchanged(tokens, spread, out_dtype):
@@ -329,7 +330,7 @@ def test_real_musa_compiled_post_residual_is_bitwise_unchanged(tokens, spread, o
     torch._dynamo.reset()
 
 
-@pytest.mark.musa
+@hardware_test(res={"musa": "S5000"}, num_cards=1)
 @pytest.mark.parametrize("tokens", [3702, 3651])
 def test_real_musa_compiled_hyper_connection_is_bitwise_unchanged(tokens):
     if not _musa_available():
@@ -362,7 +363,7 @@ def test_real_musa_compiled_hyper_connection_is_bitwise_unchanged(tokens):
     torch._dynamo.reset()
 
 
-@pytest.mark.musa
+@hardware_test(res={"musa": "S5000"}, num_cards=1)
 def test_real_musa_compiled_post_residual_launches_one_sinkhorn_kernel():
     if not _musa_available():
         pytest.skip("requires a MUSA device")
