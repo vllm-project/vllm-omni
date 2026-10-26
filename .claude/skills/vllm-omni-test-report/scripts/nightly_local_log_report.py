@@ -4892,11 +4892,11 @@ class _IssueAlertGroup:
 
 
 _ISSUE_ALERT_VERDICTS: dict[str, tuple[str, str, str]] = {
-    "tracked": ("已跟踪", "issue-alert-badge--tracked", "已有 open issue 跟踪,无需新增"),
-    "recurred": ("疑似复发", "issue-alert-badge--recurred", "匹配到已关闭 issue — 建议核实后 reopen 或补充新 issue"),
-    "new": ("建议新增", "issue-alert-badge--new", "未找到重复 issue — 建议新增"),
-    "env-local": ("本地环境", "issue-alert-badge--env", "本地环境签名(如 HF 缓存锁权限)— 通常无需建仓内 issue"),
-    "unknown": ("未匹配", "issue-alert-badge--unknown", "issue 搜索失败 — 需人工判断"),
+    "tracked": ("Tracked", "issue-alert-badge--tracked", "An open issue already tracks this failure - no new issue needed"),
+    "recurred": ("Recurred?", "issue-alert-badge--recurred", "Matches a CLOSED issue - verify, then reopen it or file a new one"),
+    "new": ("Recommend new", "issue-alert-badge--new", "No duplicate issue found - recommend filing a new issue"),
+    "env-local": ("Local env", "issue-alert-badge--env", "Local environment signature (e.g. HF cache-lock permission) - usually no repo issue needed"),
+    "unknown": ("No match", "issue-alert-badge--unknown", "Issue search failed - needs manual review"),
 }
 _ISSUE_ALERT_VERDICT_ORDER = {"new": 0, "recurred": 1, "env-local": 2, "unknown": 3, "tracked": 4}
 
@@ -4930,6 +4930,13 @@ _ISSUE_ALERT_CSS = """
 .issue-alert-related { margin-top: 0.2rem; font-size: 0.78rem; color: var(--dashboard-soft-text, #64748b); }
 table.fail-table tr.row-alert-new td { background: rgba(239, 68, 68, 0.045); }
 table.fail-table tr.row-alert-recurred td { background: rgba(245, 158, 11, 0.05); }
+table.fail-table tr[data-alert-nodes] { cursor: pointer; }
+table.fail-table tr[data-alert-nodes]:hover td { background: rgba(59, 130, 246, 0.07); }
+@keyframes issue-alert-row-flash {
+  0% { background: rgba(59, 130, 246, 0.30); }
+  100% { background: transparent; }
+}
+table.fail-table tr.issue-alert-flash td { animation: issue-alert-row-flash 1.5s ease-out 2; }
 """
 
 
@@ -5302,7 +5309,7 @@ def _render_issue_alert_html(groups: list[_IssueAlertGroup], *, note: str | None
     counts: dict[str, int] = {}
     for g in groups:
         counts[g.verdict] = counts.get(g.verdict, 0) + 1
-    chips: list[str] = [f'<span class="issue-alert-chip"><strong>{len(groups)}</strong> 失败组</span>']
+    chips: list[str] = [f'<span class="issue-alert-chip"><strong>{len(groups)}</strong> failure groups</span>']
     for verdict in ("new", "recurred", "tracked", "env-local", "unknown"):
         if counts.get(verdict):
             label = _ISSUE_ALERT_VERDICTS[verdict][0]
@@ -5321,7 +5328,7 @@ def _render_issue_alert_html(groups: list[_IssueAlertGroup], *, note: str | None
             '<th><span class="th-lbl">Failing tests</span></th>',
             '<th><span class="th-lbl">First error</span></th>',
             '<th><span class="th-lbl">Matched issue</span></th>',
-            '<th><span class="th-lbl">结论</span></th>',
+            '<th><span class="th-lbl">Verdict</span></th>',
             "</tr></thead>",
             "<tbody>",
         ]
@@ -5360,10 +5367,12 @@ def _render_issue_alert_html(groups: list[_IssueAlertGroup], *, note: str | None
                 issue_cell = '<span class="issue-alert-nodes">—</span>'
             if g.related:
                 rel = " ".join(_issue_alert_issue_link(it, with_state=False) for _s, it in g.related)
-                issue_cell += f'<br><span class="issue-alert-related">可能相关: {rel}</span>'
+                issue_cell += f'<br><span class="issue-alert-related">Possibly related: {rel}</span>'
+            nodes_attr = html.escape(json.dumps(g.nodes[:12]), quote=True)
             head.extend(
                 [
-                    f'<tr class="row-alert-{g.verdict}">',
+                    f'<tr class="row-alert-{g.verdict}" data-alert-nodes="{nodes_attr}"'
+                    ' title="Click to jump to the Submit-issue button row">',
                     f"<td>{src}</td>",
                     f"<td>{tests_cell}</td>",
                     reason_cell,
@@ -5380,27 +5389,87 @@ def _render_issue_alert_html(groups: list[_IssueAlertGroup], *, note: str | None
     if note:
         notes_html = f'<p class="note">{html.escape(note)}</p>'
     intro = (
-        '<p class="hint">每个失败组按「测试文件 + 异常类型 + 签名」聚合,并与 '
-        f"{_ISSUE_ALERT_REPO} 的 issue(含已关闭)只读搜索比对:"
-        "节点 ID / 异常类 / 签名 token 命中达到阈值判为重复。"
-        "自动匹配仅供参考,新增/ reopened 判断以人工为准。</p>"
+        '<p class="hint">Each failure group is clustered by (test file &middot; exception class '
+        "&middot; signature) and matched, read-only, against "
+        f"{_ISSUE_ALERT_REPO} issues (closed ones included): a duplicate requires node-id / "
+        "exception-class / signature-token agreement above the thresholds. Automatic matching "
+        "is advisory &mdash; the file-vs-reopen call stays manual. Click a row to jump to its "
+        "Submit-issue button in the failure tables below.</p>"
     )
+    jump_script = """
+<script>
+(function () {
+  function normNode(s) {
+    return (s || "").replace(/\\s+/g, " ").trim().replace(/\\s*\\(ERROR\\)\\s*$/i, "");
+  }
+  function stripParam(s) {
+    return normNode(s).replace(/\\[[^\\]]*\\]$/, "");
+  }
+  function buildIndex() {
+    var idx = {};
+    var rows = document.querySelectorAll("tr[data-row-id]");
+    for (var i = 0; i < rows.length; i++) {
+      var tr = rows[i];
+      if (!tr.querySelector(".btn-github-issue") || !tr.cells || !tr.cells[0]) continue;
+      var key = normNode(tr.cells[0].innerText);
+      if (key && !idx[key]) idx[key] = tr;
+    }
+    return idx;
+  }
+  var cached = null;
+  document.addEventListener("click", function (ev) {
+    if (ev.target.closest && ev.target.closest("a, button, summary, input, select, textarea")) return;
+    var tr = ev.target.closest && ev.target.closest("tr[data-alert-nodes]");
+    if (!tr) return;
+    var nodes;
+    try { nodes = JSON.parse(tr.getAttribute("data-alert-nodes") || "[]"); } catch (e) { return; }
+    if (!nodes.length) return;
+    if (!cached) cached = buildIndex();
+    var target = null;
+    for (var i = 0; i < nodes.length && !target; i++) target = cached[normNode(nodes[i])];
+    if (!target) {
+      for (var j = 0; j < nodes.length && !target; j++) {
+        var want = stripParam(nodes[j]);
+        for (var k in cached) {
+          if (stripParam(k) === want) { target = cached[k]; break; }
+        }
+      }
+    }
+    if (!target) return;
+    var el = target;
+    while (el) {
+      if (el.tagName === "DETAILS") el.open = true;
+      el = el.parentElement;
+    }
+    target.scrollIntoView({ behavior: "smooth", block: "center" });
+    target.classList.remove("issue-alert-flash");
+    void target.offsetWidth;
+    target.classList.add("issue-alert-flash");
+  });
+})();
+</script>
+"""
     return "\n".join(
         [
-            '<section class="panel nightly-root nightly-root--issue-alert">',
+            '<details class="bk-section panel nightly-root nightly-root--issue-alert" open>',
+            '<summary class="bk-section-summary">',
             _heading_html(
                 "h2",
                 _SVG_ALERT,
-                html.escape("Issue Alert · 失败去重与 issue 建议"),
-                sub=html.escape("哪些失败仓里已有 issue 跟踪 · 哪些建议新增 issue"),
+                html.escape("Issue Alert · failure dedup & issue recommendations"),
+                sub=html.escape("Which failures are already tracked by issues · which need new ones (click to fold)"),
             ),
+            "</summary>",
+            '<div class="bk-section-body">',
             '<div class="issue-alert-root">',
             intro,
             notes_html,
             chip_row,
             body,
             "</div>",
-            "</section>",
+            "</div>",
+            "</details>",
+            jump_script,
         ]
     )
 
@@ -5545,8 +5614,8 @@ def emit_report_html(
                 _analyze_issue_alert_groups(alert_groups, gh_token)
             else:
                 alert_note = (
-                    "未检测到 GITHUB_TOKEN / GH_TOKEN — 跳过 GitHub issue 匹配,"
-                    "以下仅按失败签名聚类(全部标记为未匹配)。"
+                    "GITHUB_TOKEN / GH_TOKEN not detected - GitHub issue matching skipped; "
+                    "the table below is a plain failure-signature clustering (all marked No match)."
                 )
         body_parts.append(_render_issue_alert_html(alert_groups, note=alert_note))
     body_parts.append(
