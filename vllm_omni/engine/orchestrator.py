@@ -73,10 +73,11 @@ from vllm_omni.metrics import definitions as metric_defs
 from vllm_omni.metrics.prometheus import OmniRequestCounter
 from vllm_omni.metrics.stat_logger import OmniPrometheusStatLogger
 from vllm_omni.metrics.utils import DIFFUSION_METRICS_ONLY_REQUEST_ID
-from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.outputs import OmniRequestOutput, StagePostWarmupMemoryStats
 
 if TYPE_CHECKING:
     from vllm_omni.engine import OmniEngineCoreOutput
+    from vllm_omni.engine.stage_client import StagePoolClient
 
 logger = init_logger(__name__)
 
@@ -504,10 +505,11 @@ class OrchestratorBase:
             async def cleanup_member_requests(ids: list[str]) -> None:
                 await self._cleanup_request_ids(ids, abort=True)
 
-            self._membership.install_unregister_handlers(
+            self._membership.install_membership_handlers(
                 output_queue=self.output_async_queue,
                 cleanup_callback=cleanup_member_requests,
-                replica_removed_callback=self._remove_stage_replica_waiting,
+                replica_removed_callback=self._remove_stage_replica_metrics,
+                replica_added_callback=self._publish_replica_post_warmup_memory,
             )
             membership_watcher = self._membership.start()
 
@@ -562,6 +564,67 @@ class OrchestratorBase:
                 task.cancel()
             if pending:
                 await asyncio.gather(*pending, return_exceptions=True)
+
+    async def publish_stage_post_warmup_memory(self) -> None:
+        if self._stat_logger is None:
+            return
+
+        await asyncio.gather(
+            *(
+                self._publish_replica_post_warmup_memory(pool.stage_id, replica_id, client)
+                for pool in self.stage_pools
+                for replica_id in pool.live_replica_ids()
+                if (client := pool.clients[replica_id]) is not None
+            )
+        )
+
+    async def _publish_replica_post_warmup_memory(
+        self, stage_id: int, replica_id: int, client: StagePoolClient
+    ) -> None:
+        pool = self.stage_pools[stage_id]
+        if (
+            self._stages_shutdown
+            or self._stat_logger is None
+            or pool.stage_vllm_config is None
+            or pool.clients[replica_id] is not client
+        ):
+            return
+        worker_results = await pool.collective_rpc(
+            replica_id=replica_id,
+            method="get_stage_post_warmup_memory_stats",
+        )
+        # A late reply after shutdown or detach must not recreate removed
+        # series or overwrite a replacement in the same replica slot.
+        if self._stages_shutdown or pool.clients[replica_id] is not client or not isinstance(worker_results, list):
+            return
+        snapshot = next(
+            (
+                result
+                for result in worker_results
+                if isinstance(result, dict)
+                and result.get("allocated_bytes") is not None
+                and result.get("reserved_bytes") is not None
+            ),
+            None,
+        )
+        if snapshot is None:
+            return
+        self._stat_logger.record_stage_post_warmup_memory(
+            StagePostWarmupMemoryStats(
+                allocated_bytes=snapshot["allocated_bytes"],
+                reserved_bytes=snapshot["reserved_bytes"],
+            ),
+            engine_idx=self._get_replica_engine_idx(stage_id, replica_id),
+        )
+
+    def _get_replica_engine_idx(self, stage_id: int, replica_id: int) -> int:
+        key = (stage_id, replica_id)
+        if key not in self._stage_replica_to_engine_idx:
+            engine_idx = len(self._stage_replica_to_engine_idx)
+            if self._stat_logger is not None:
+                self._stat_logger.register_replica(engine_idx, str(stage_id), str(replica_id))
+            self._stage_replica_to_engine_idx[key] = engine_idx
+        return self._stage_replica_to_engine_idx[key]
 
     # ---- Request handling ----
 
@@ -873,6 +936,9 @@ class OrchestratorBase:
         await self._handle_kv_ready_raw_outputs(stage_id, raw_outputs)
 
         for eco in raw_outputs.outputs:
+            mm_cache_miss_hashes = getattr(eco, "mm_cache_miss_hashes", None)
+            if mm_cache_miss_hashes and stage_id != 0:
+                await asyncio.to_thread(self._invalidate_stage_mm_cache, stage_id, mm_cache_miss_hashes)
             # Emit kv_wait_s before _handle_kv_ready_raw_outputs'
             # async_chunk early-return so it lands in all modes.
             kv_params = getattr(eco, "kv_transfer_params", None)
@@ -888,6 +954,18 @@ class OrchestratorBase:
             request_id = getattr(eco, "request_id", None)
             req_state = self.request_states.get(request_id) if request_id is not None else None
             if req_state is None:
+                # Stage 0's sender lives on the frontend. Deliver its cache
+                # feedback even after cancellation; consumers may drop the error
+                # only after the engine has invalidated those stale entries.
+                if mm_cache_miss_hashes and stage_id == 0:
+                    await self.output_async_queue.put(
+                        ErrorMessage(
+                            request_id=request_id,
+                            stage_id=stage_id,
+                            error="Multi-modal processor cache miss.",
+                            mm_cache_miss_hashes=mm_cache_miss_hashes,
+                        )
+                    )
                 continue
 
             segment_finished = bool(getattr(eco, "is_segment_finished", False))
@@ -899,7 +977,11 @@ class OrchestratorBase:
                 and not segment_finished
                 and not req_state.session_owned
             ):
-                reason = getattr(eco, "stop_reason", None)
+                reason = (
+                    "Multi-modal processor cache miss. Please retry the request."
+                    if mm_cache_miss_hashes
+                    else getattr(eco, "stop_reason", None)
+                )
                 await self._handle_stage_error(
                     stage_id,
                     eco,
@@ -943,20 +1025,10 @@ class OrchestratorBase:
         )
 
         if self._stat_logger is not None and (raw_outputs.scheduler_stats is not None or iteration_stats is not None):
-            key = (stage_id, replica_id)
-            if key not in self._stage_replica_to_engine_idx:
-                engine_idx = len(self._stage_replica_to_engine_idx)
-                self._stat_logger.register_replica(
-                    engine_idx,
-                    str(stage_id),
-                    str(replica_id),
-                )
-                self._stage_replica_to_engine_idx[key] = engine_idx
-
             self._stat_logger.record(
                 raw_outputs.scheduler_stats,
                 iteration_stats,
-                engine_idx=self._stage_replica_to_engine_idx[(stage_id, replica_id)],
+                engine_idx=self._get_replica_engine_idx(stage_id, replica_id),
             )
 
         _sched_stats = raw_outputs.scheduler_stats
@@ -1476,8 +1548,13 @@ class OrchestratorBase:
                 request_id=parent_id,
                 stage_id=stage_id,
                 error=error if error is not None else output.error,
-                status_code=getattr(output, "error_status_code", None),
-                error_type=getattr(output, "error_type", None),
+                status_code=503
+                if getattr(output, "mm_cache_miss_hashes", None)
+                else getattr(output, "error_status_code", None),
+                error_type="ServiceUnavailableError"
+                if getattr(output, "mm_cache_miss_hashes", None)
+                else getattr(output, "error_type", None),
+                mm_cache_miss_hashes=getattr(output, "mm_cache_miss_hashes", None),
             )
         )
         await self._cleanup_request_ids(
@@ -1497,6 +1574,12 @@ class OrchestratorBase:
         self._stage_replica_waiting.pop((stage_id, replica_id), None)
         self._set_stage_waiting_total(stage_id)
         self._sync_engines_waiting_counter()
+
+    def _remove_stage_replica_metrics(self, stage_id: int, replica_id: int) -> None:
+        self._remove_stage_replica_waiting(stage_id, replica_id)
+        engine_idx = self._stage_replica_to_engine_idx.get((stage_id, replica_id))
+        if self._stat_logger is not None and engine_idx is not None:
+            self._stat_logger.remove_stage_post_warmup_memory(engine_idx=engine_idx)
 
     def _sync_engines_waiting_counter(self) -> None:
         """Aggregate per-replica waiting into the counter shared with the
@@ -1540,7 +1623,7 @@ class OrchestratorBase:
             error,
         )
         pool.evict_replica(replica_id)
-        self._remove_stage_replica_waiting(stage_id, replica_id)
+        self._remove_stage_replica_metrics(stage_id, replica_id)
         if failed_request_id is not None:
             # A rejected submission can retain its binding when abort also
             # fails. Evict before cleanup so it cannot abort the dead engine
@@ -1920,6 +2003,7 @@ class OrchestratorBase:
                 fatal=False,
                 request_id=req_state.request_id,
                 stage_id=stage_id,
+                mm_cache_miss_hashes=getattr(eco, "mm_cache_miss_hashes", None),
             )
         )
 
@@ -2175,6 +2259,15 @@ class OrchestratorBase:
             processor = build_stage0_input_processor(self.stage_pools[stage_id].stage_vllm_config)
             self._stage_input_processors[stage_id] = processor
         return processor
+
+    def _invalidate_stage_mm_cache(self, stage_id: int, mm_hashes: list[str]) -> None:
+        # Multimodal preprocessing uses this same lock in a worker thread.
+        with self._prompt_processing_lock:
+            processor = self._stage_input_processors.get(stage_id)
+            cache = processor.renderer.mm_processor_cache if processor is not None else None
+            if cache is not None:
+                for mm_hash in mm_hashes:
+                    cache.invalidate(mm_hash)
 
     def _upgrade_processed_stage_request(self, request: Any, raw_prompt: Any) -> Any:
         prompt_embeds = getattr(request, "prompt_embeds", None)
@@ -3385,6 +3478,9 @@ class OrchestratorBase:
             return
 
         self._stages_shutdown = True
+        if self._stat_logger is not None:
+            for engine_idx in self._stage_replica_to_engine_idx.values():
+                self._stat_logger.remove_stage_post_warmup_memory(engine_idx=engine_idx)
         total = sum(pool.live_num_replicas for pool in self.stage_pools)
         logger.info("[Orchestrator] Shutting down all %d client(s)", total)
         for pool in self.stage_pools:

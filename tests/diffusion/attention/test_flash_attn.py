@@ -58,6 +58,164 @@ def test_versioned_flash_attention_selection_rejects_invalid_or_unavailable_vers
         fa._choose_vllm_flash_attn_version(9, "4", frozenset((2, 3)))
 
 
+@pytest.mark.cpu
+def test_vllm_varlen_version_kwargs_targets_only_vllm_dispatcher(monkeypatch):
+    def vllm_func(**_kwargs):
+        return None
+
+    def other_func(**_kwargs):
+        return None
+
+    monkeypatch.setattr(fa, "_is_vllm_flash_attn_varlen", lambda func: func is vllm_func)
+    monkeypatch.setattr(fa, "resolve_vllm_flash_attn_version", lambda requested=None: 3)
+
+    assert fa.vllm_varlen_version_kwargs(vllm_func) == {"fa_version": 3}
+    assert fa.vllm_varlen_version_kwargs(other_func) == {}
+    assert fa.vllm_varlen_version_kwargs(None) == {}
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize(
+    ("major", "expect_hopper"),
+    [
+        (8, False),
+        (9, True),
+        (10, False),
+    ],
+)
+def test_is_hopper_matches_flash_attn_3_hub_gate(monkeypatch, major, expect_hopper):
+    monkeypatch.setattr(
+        fa.current_omni_platform,
+        "get_device_capability",
+        lambda: SimpleNamespace(major=major, minor=0),
+    )
+    assert fa._is_hopper() is expect_hopper
+
+
+@pytest.mark.cpu
+def test_bind_optional_fa3_fwd_dense_sets_dense_on_hopper_when_package_present(monkeypatch):
+    dense = object()
+    fake_mod = SimpleNamespace(flash_attn_func=dense)
+    monkeypatch.setitem(sys.modules, "fa3_fwd_interface", fake_mod)
+    monkeypatch.setattr(fa, "_is_hopper", lambda: True)
+
+    assert fa._bind_optional_fa3_fwd_dense() is dense
+
+
+@pytest.mark.cpu
+def test_bind_optional_fa3_fwd_dense_skips_non_hopper_even_when_package_present(monkeypatch):
+    dense = object()
+    fake_mod = SimpleNamespace(flash_attn_func=dense)
+    monkeypatch.setitem(sys.modules, "fa3_fwd_interface", fake_mod)
+    monkeypatch.setattr(fa, "_is_hopper", lambda: False)
+
+    assert fa._bind_optional_fa3_fwd_dense() is None
+
+
+@pytest.mark.cpu
+def test_bind_optional_fa3_fwd_dense_absent_on_hopper(monkeypatch):
+    import builtins
+
+    monkeypatch.setattr(fa, "_is_hopper", lambda: True)
+    monkeypatch.delitem(sys.modules, "fa3_fwd_interface", raising=False)
+    real_import = builtins.__import__
+
+    def _block_fa3_fwd(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "fa3_fwd_interface":
+            raise ModuleNotFoundError(name)
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", _block_fa3_fwd)
+
+    assert fa._bind_optional_fa3_fwd_dense() is None
+
+
+@pytest.mark.cpu
+def test_dense_flash_attn_func_for_prefers_optional_except_fp16(monkeypatch):
+    optional = object()
+    generic = object()
+    monkeypatch.setattr(fa, "optional_fa3_fwd_dense_func", optional)
+    monkeypatch.setattr(fa, "flash_attn_func", generic)
+
+    assert fa.dense_flash_attn_func_for(torch.bfloat16) is optional
+    assert fa.dense_flash_attn_func_for(torch.float16) is generic
+
+
+@pytest.mark.cpu
+def test_dense_unmasked_fp16_skips_optional_fa3_fwd(monkeypatch):
+    captured: dict[str, Any] = {}
+
+    def fail_if_called(*_args, **_kwargs):
+        raise AssertionError("optional fa3-fwd dense must not run for FP16")
+
+    def fake_varlen(**kwargs):
+        captured.update(kwargs)
+        return kwargs["q"]
+
+    monkeypatch.setattr(fa, "optional_fa3_fwd_dense_func", fail_if_called)
+    monkeypatch.setattr(fa, "flash_attn_func", None)
+    monkeypatch.setattr(fa, "flash_attn_varlen_func", fake_varlen)
+    monkeypatch.setattr(fa, "HAS_FLASH_ATTN", True)
+    monkeypatch.setattr(fa, "IS_FLASH_ATTN_4", False)
+    monkeypatch.setattr(fa, "_is_vllm_flash_attn_varlen", lambda func: func is fake_varlen)
+    monkeypatch.setattr(fa, "resolve_vllm_flash_attn_version", lambda requested=None: 3)
+
+    impl = FlashAttentionImpl(num_heads=2, head_size=8, softmax_scale=0.5, causal=False)
+    query = torch.randn(1, 4, 2, 8, dtype=torch.float16)
+    key = torch.randn(1, 4, 2, 8, dtype=torch.float16)
+    value = torch.randn(1, 4, 2, 8, dtype=torch.float16)
+
+    out = impl.forward_cuda(query, key, value, attn_metadata=None)
+    assert out.shape == query.shape
+    assert "fa_version" in captured
+
+
+@pytest.mark.cpu
+def test_dense_cuda_varlen_fallback_passes_resolved_fa_version(monkeypatch):
+    captured: dict[str, Any] = {}
+
+    def fake_varlen(**kwargs):
+        captured.update(kwargs)
+        return kwargs["q"]
+
+    monkeypatch.setattr(fa, "optional_fa3_fwd_dense_func", None)
+    monkeypatch.setattr(fa, "flash_attn_func", None)
+    monkeypatch.setattr(fa, "flash_attn_varlen_func", fake_varlen)
+    monkeypatch.setattr(fa, "HAS_FLASH_ATTN", True)
+    monkeypatch.setattr(fa, "_is_vllm_flash_attn_varlen", lambda func: func is fake_varlen)
+    monkeypatch.setattr(fa, "resolve_vllm_flash_attn_version", lambda requested=None: 3)
+
+    impl = FlashAttentionImpl(num_heads=2, head_size=8, softmax_scale=0.5, causal=False)
+    query = torch.randn(1, 4, 2, 8)
+    output = impl.forward_cuda(query, query, query)
+
+    assert torch.equal(output, query)
+    assert captured["fa_version"] == 3
+    assert captured["causal"] is False
+    assert captured["softmax_scale"] == 0.5
+
+
+@pytest.mark.cpu
+def test_dense_cuda_varlen_fallback_omits_fa_version_for_other_backends(monkeypatch):
+    captured: dict[str, Any] = {}
+
+    def fake_varlen(**kwargs):
+        captured.update(kwargs)
+        return kwargs["q"]
+
+    monkeypatch.setattr(fa, "optional_fa3_fwd_dense_func", None)
+    monkeypatch.setattr(fa, "flash_attn_func", None)
+    monkeypatch.setattr(fa, "flash_attn_varlen_func", fake_varlen)
+    monkeypatch.setattr(fa, "HAS_FLASH_ATTN", True)
+    monkeypatch.setattr(fa, "_is_vllm_flash_attn_varlen", lambda _func: False)
+
+    impl = FlashAttentionImpl(num_heads=2, head_size=8, softmax_scale=0.5, causal=False)
+    query = torch.randn(1, 4, 2, 8)
+    impl.forward_cuda(query, query, query)
+
+    assert "fa_version" not in captured
+
+
 def test_vllm_dense_adapter_builds_varlen_metadata_and_restores_lse(monkeypatch):
     batch_size, seqlen_q, seqlen_k, num_heads, head_dim = 2, 3, 5, 4, 8
     query = torch.randn(batch_size, seqlen_q, num_heads, head_dim)
@@ -522,6 +680,7 @@ def test_published_noop_mask_uses_dense_path(monkeypatch):
 
     monkeypatch.setattr(fa, "HAS_FLASH_ATTN", True)
     monkeypatch.setattr(fa, "IS_FLASH_ATTN_4", False)
+    monkeypatch.setattr(fa, "optional_fa3_fwd_dense_func", None)
     monkeypatch.setattr(fa, "flash_attn_func", fake_dense_func)
     monkeypatch.setattr(fa, "flash_attn_varlen_func", fail_varlen)
 
@@ -567,6 +726,31 @@ def test_piecewise_flash_attn_uses_varlen_fallback(monkeypatch):
     assert calls[0]["max_seqlen_k"] == 3
     assert calls[0]["causal"] is False
     assert calls[0]["softmax_scale"] == 0.5
+
+
+@pytest.mark.cpu
+def test_xpu_piecewise_spans_ignore_4d_mask(monkeypatch):
+    """XPU must honor full_attn_spans instead of feeding a 4D mask to the 2D-only varlen-masked path."""
+    calls = []
+
+    def fake_varlen_func(q, k, v, **kwargs):
+        calls.append((kwargs["max_seqlen_q"], kwargs["max_seqlen_k"], kwargs["causal"]))
+        return q
+
+    monkeypatch.setattr(fa, "HAS_FLASH_ATTN", True)
+    monkeypatch.setattr(fa, "flash_attn_varlen_func", fake_varlen_func)
+
+    impl = FlashAttentionImpl(num_heads=2, head_size=4, softmax_scale=0.5, causal=False)
+    query = torch.randn(1, 6, 2, 4)
+    metadata = AttentionMetadata(
+        attn_mask=torch.ones((1, 1, 6, 6), dtype=torch.bool).tril(),
+        full_attn_spans=[[(2, 4)]],
+    )
+
+    output = impl.forward_xpu(query, query, query, metadata)
+
+    assert output.shape == query.shape
+    assert calls == [(2, 2, True), (2, 4, False), (2, 6, True)]
 
 
 @pytest.mark.cpu
@@ -773,6 +957,7 @@ def rocm_contract(monkeypatch, mocker):
     monkeypatch.setattr(fa, "IS_FLASH_ATTN_4", False)
     monkeypatch.setattr(fa, "IS_AITER", True)
     monkeypatch.setattr(fa, "HAS_FLASH_ATTN", True)
+    monkeypatch.setattr(fa, "optional_fa3_fwd_dense_func", None)
     monkeypatch.setattr(fa, "flash_attn_func", dense)
     monkeypatch.setattr(fa, "flash_attn_varlen_func", packed)
     monkeypatch.setattr(fa, "validate_fa4_head_dims", lambda *_args: pytest.fail("ROCm must not validate FA4"))
@@ -1186,6 +1371,138 @@ def test_prefix_kv_slice_no_scaling_without_factor(monkeypatch):
     torch.testing.assert_close(captured["query"], q)
     assert captured["scale"] == pytest.approx(0.5)
     torch.testing.assert_close(out, torch.ones(1, 8, 2, 4))
+
+
+# --- Test group E: NPU piecewise block-causal attention ----------------------
+#
+# ``forward_fa_npu`` must honour ``full_attn_spans`` the way ``forward_cuda``
+# does. Before this was wired up, span metadata was silently dropped and the
+# whole sequence ran bidirectional attention, which is wrong for block-causal
+# models (e.g. Qwen-Image-2.1 prefill) and poisoned the cached prefix K/V.
+
+
+def _npu_fusion_attention_reference(
+    query,
+    key,
+    value,
+    *,
+    atten_mask=None,
+    head_num,
+    input_layout="BSND",
+    scale=1.0,
+    keep_prob=1.0,
+    sparse_mode=0,
+    inner_precise=0,
+):
+    """Pure-torch stand-in for ``npu_fusion_attention`` (BSND, no dropout).
+
+    Implements the two sparse modes the piecewise path relies on: 0 (no mask,
+    full attention) and 3 (right-down causal, bottom-right aligned). The shared
+    compressed mask is validated for shape and convention, but the alignment
+    itself comes from ``sparse_mode`` -- exactly as the real kernel documents.
+    """
+    del inner_precise
+    assert input_layout == "BSND"
+    assert query.shape[2] == head_num == key.shape[2]
+    assert keep_prob == 1.0
+    query_length, key_length = query.shape[1], key.shape[1]
+    if sparse_mode == 0:
+        assert atten_mask is None, "full segments must not carry a mask"
+        keep = torch.ones(query_length, key_length, dtype=torch.bool)
+    elif sparse_mode == 3:
+        assert atten_mask is not None and atten_mask.shape == (2048, 2048)
+        assert atten_mask.dtype == torch.bool
+        # Ascend convention: True = masked out, so the mask is the strict
+        # upper triangle.
+        strict_upper = torch.triu(torch.ones(2048, 2048, dtype=torch.bool), diagonal=1)
+        assert torch.equal(atten_mask, strict_upper)
+        assert query_length <= key_length, "right-down causal requires Sq <= Skv"
+        query_positions = torch.arange(query_length).unsqueeze(1)
+        key_positions = torch.arange(key_length).unsqueeze(0)
+        keep = key_positions <= query_positions + (key_length - query_length)
+    else:
+        raise AssertionError(f"unexpected sparse_mode {sparse_mode}")
+
+    scores = torch.einsum("bqhd,bkhd->bhqk", query.float(), key.float()) * scale
+    scores = scores.masked_fill(~keep, float("-inf"))
+    out = torch.einsum("bhqk,bkhd->bqhd", torch.softmax(scores, dim=-1), value.float())
+    return out.to(query.dtype), None, None, None, 0, 0, 0
+
+
+def _block_causal_reference(query, key, value, image_ids, scale):
+    """Dense ``(q >= kv) or same_image_block`` reference for the joint sequence."""
+    seq_len = query.shape[1]
+    query_positions = torch.arange(seq_len).unsqueeze(1)
+    key_positions = torch.arange(seq_len).unsqueeze(0)
+    same_block = (image_ids.view(-1, 1) == image_ids.view(1, -1)) & (image_ids.view(-1, 1) >= 0)
+    keep = (query_positions >= key_positions) | same_block
+    scores = torch.einsum("bqhd,bkhd->bhqk", query.float(), key.float()) * scale
+    scores = scores.masked_fill(~keep, float("-inf"))
+    return torch.einsum("bhqk,bkhd->bqhd", torch.softmax(scores, dim=-1), value.float())
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("causal", [False, True])
+def test_npu_piecewise_reports_its_own_execution_path(npu_contract, causal):
+    _, query, _, _ = npu_contract
+    impl = _npu_impl(causal=causal)
+    metadata = AttentionMetadata(full_attn_spans=[[(3, 5)]])
+    _assert_platform_path(impl, "npu", query, metadata, "npu_piecewise")
+
+
+@pytest.mark.cpu
+def test_npu_causal_without_spans_stays_unverified(npu_contract):
+    _, query, _, _ = npu_contract
+    impl = _npu_impl(causal=True)
+    _assert_platform_path(impl, "npu", query, None, "npu_unverified")
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("causal", [False, True])
+def test_npu_piecewise_runs_one_fusion_attention_per_segment(monkeypatch, causal):
+    fusion_attention = Mock(side_effect=lambda q, k, v, **kwargs: (torch.zeros_like(q), None, None, None, 0, 0, 0))
+    fake_torch_npu = _fake_torch_npu(monkeypatch, npu_fusion_attention=fusion_attention)
+    impl = FlashAttentionImpl(num_heads=2, head_size=4, softmax_scale=0.5, causal=causal)
+    query = torch.randn(1, 5, 2, 4)
+    # Two text tokens, then one condition-image block covering [2, 5).
+    metadata = AttentionMetadata(full_attn_spans=[[(2, 5)]])
+
+    impl.forward_fa_npu(query, query, query, metadata)
+
+    assert fake_torch_npu.npu_fusion_attention.call_count == 2
+    causal_call, full_call = fake_torch_npu.npu_fusion_attention.call_args_list
+    # Causal text segment: K truncated to its own end, compressed mask, mode 3.
+    assert causal_call.args[0].shape == (1, 2, 2, 4)
+    assert causal_call.args[1].shape == (1, 2, 2, 4)
+    assert causal_call.kwargs["sparse_mode"] == 3
+    assert causal_call.kwargs["atten_mask"].shape == (2048, 2048)
+    # Full image segment: K spans the whole prefix, no mask materialized.
+    assert full_call.args[0].shape == (1, 3, 2, 4)
+    assert full_call.args[1].shape == (1, 5, 2, 4)
+    assert full_call.kwargs["sparse_mode"] == 0
+    assert full_call.kwargs["atten_mask"] is None
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("causal", [False, True])
+def test_npu_piecewise_matches_block_causal_reference(monkeypatch, causal):
+    """Segments reproduce the dense block-causal pattern end to end."""
+    torch.manual_seed(0)
+    _fake_torch_npu(monkeypatch, npu_fusion_attention=_npu_fusion_attention_reference)
+    impl = FlashAttentionImpl(num_heads=2, head_size=4, softmax_scale=0.5, causal=causal)
+    # text(0-1) | image A(2-4) | text(5) | image B(6-8)
+    image_ids = torch.tensor([-1, -1, 0, 0, 0, -1, 1, 1, 1])
+    metadata = AttentionMetadata(full_attn_spans=[[(2, 5), (6, 9)]])
+    seq_len = image_ids.shape[0]
+    query = torch.randn(1, seq_len, 2, 4)
+    key = torch.randn(1, seq_len, 2, 4)
+    value = torch.randn(1, seq_len, 2, 4)
+
+    out = impl.forward_fa_npu(query, key, value, metadata)
+    expected = _block_causal_reference(query, key, value, image_ids, impl.softmax_scale)
+
+    assert out.shape == query.shape
+    torch.testing.assert_close(out, expected, rtol=1e-5, atol=1e-6)
 
 
 if __name__ == "__main__":

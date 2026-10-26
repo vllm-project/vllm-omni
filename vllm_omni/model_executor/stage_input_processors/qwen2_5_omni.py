@@ -1,4 +1,8 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import logging
+from typing import Any
 
 import torch
 from vllm.inputs import TextPrompt
@@ -7,11 +11,14 @@ from vllm_omni.data_entry_keys import (
     EmbeddingsStruct,
     HiddenStatesStruct,
     IdsStruct,
-    OmniPayload,
     OmniPayloadStruct,
     to_dict,
 )
 from vllm_omni.inputs.data import OmniTokensPrompt
+from vllm_omni.model_executor.stage_input_processors.tts_utils import (
+    extract_speaker_from_prompt,
+    extract_speaker_from_request,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -65,17 +72,19 @@ def _strip_codec_boundaries(token_ids: list[int]) -> list[int]:
 
 def talker2code2wav_token_only(
     source_outputs,
-    _prompt: OmniTokensPrompt | TextPrompt = None,
+    prompt: OmniTokensPrompt | TextPrompt = None,
     _requires_multimodal_data: bool = False,
 ):
     """Sync-side placeholder for Stage-2 input (code2wav).
 
     Returns OmniTokensPrompt sized to the stripped codec token count.
     Actual codec ids are delivered via the worker connector payload built
-    by ``talker2code2wav_full_payload``.
+    by ``talker2code2wav_full_payload``. The requested speaker is copied
+    from the original prompt because Code2Wav selects the voice's
+    conditioning from it.
     """
     code2wav_inputs = []
-    for talker_output in source_outputs:
+    for i, talker_output in enumerate(source_outputs):
         output = talker_output.outputs[0]
         token_ids = _strip_codec_boundaries(list(output.cumulative_token_ids))
         if not token_ids:
@@ -83,7 +92,8 @@ def talker2code2wav_token_only(
         code2wav_inputs.append(
             OmniTokensPrompt(
                 prompt_token_ids=[0] * len(token_ids),
-                additional_information=None,
+                additional_information=to_dict(OmniPayloadStruct(speaker=extract_speaker_from_prompt(prompt, index=i)))
+                or None,
                 multi_modal_data=None,
                 mm_processor_kwargs=None,
             )
@@ -120,10 +130,14 @@ def talker2code2wav_full_payload(
             rid,
         )
         return None
-    return {
+    payload: dict[str, Any] = {
         "codes": {"audio": token_ids},
         "meta": {"finished": torch.tensor(True, dtype=torch.bool)},
     }
+    speaker = extract_speaker_from_request(request)
+    if speaker is not None:
+        payload["speaker"] = speaker
+    return payload
 
 
 # ============================================================================
@@ -153,6 +167,8 @@ def thinker2talker_token_only(
     payload (hidden_states / embed / ids) ships exclusively through
     ``thinker2talker_full_payload`` via the worker connector and lands
     in ``model_intermediate_buffer`` before the talker's forward() runs.
+    The requested speaker is copied from the original prompt so the
+    talker request carries it on to Code2Wav.
 
     Consumer-wait gating is driven by
     ``requires_full_payload_input=True`` in the pipeline topology
@@ -166,14 +182,15 @@ def thinker2talker_token_only(
         thinker_output.request_id: p.get("multi_modal_data", None) for thinker_output, p in zip(thinker_outputs, prompt)
     }
 
-    for thinker_output in thinker_outputs:
+    for i, thinker_output in enumerate(thinker_outputs):
         prompt_token_ids = thinker_output.prompt_token_ids
         talker_inputs.append(
             OmniTokensPrompt(
                 prompt_token_ids=[TALKER_CODEC_START_TOKEN_ID]
                 + [TALKER_CODEC_PAD_TOKEN_ID] * (len(prompt_token_ids))
                 + [TALKER_CODEC_END_TOKEN_ID],
-                additional_information=None,
+                additional_information=to_dict(OmniPayloadStruct(speaker=extract_speaker_from_prompt(prompt, index=i)))
+                or None,
                 multi_modal_data=(
                     multi_modal_data[thinker_output.request_id]
                     if requires_multimodal_data and multi_modal_data is not None
@@ -337,7 +354,7 @@ def thinker2talker_full_payload(
     prefill_hidden = h[:prompt_len]
     decode_hidden = h[prompt_len:]
 
-    payload: OmniPayload = to_dict(
+    payload = to_dict(
         OmniPayloadStruct(
             hidden_states=HiddenStatesStruct(
                 output=decode_hidden,
@@ -356,4 +373,7 @@ def thinker2talker_full_payload(
     # Intentionally omit payload["meta"]: the thinker->talker transition
     # carries no scheduler-relevant metadata (next_stage_prompt_len /
     # left_context_size are not set on this edge).
+    speaker = extract_speaker_from_request(request)
+    if speaker is not None:
+        payload["speaker"] = speaker
     return payload

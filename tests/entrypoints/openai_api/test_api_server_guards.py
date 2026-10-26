@@ -57,6 +57,9 @@ from fastapi.testclient import TestClient
 from starlette.datastructures import State
 from starlette.requests import Request
 from starlette.websockets import WebSocketDisconnect
+from vllm.entrypoints.serve.tokenize import api_router as tokenization_api_router
+from vllm.entrypoints.serve.tokenize.protocol import DetokenizeResponse, TokenizeResponse, TokenizerInfoResponse
+from vllm.exceptions import RetryableRequestError
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 
 from vllm_omni.entrypoints.openai import api_server
@@ -232,6 +235,7 @@ _MULTISTAGE_APP_STATE_KEYS = {
     "enable_server_load_tracking",
     "server_load_metrics",
 }
+# The OpenPI robot server is None unless the policy declares policy_server_config.
 _MULTISTAGE_MUST_BE_NONE = {
     "openai_serving_duplex",
     "openai_serving_realtime_robot",
@@ -558,6 +562,85 @@ async def test_api_server_assembly_replaces_upstream_routes_and_mounts_omni_rout
     assert "/v1/chat/completions" in openapi_paths
     assert "/v1/models" in openapi_paths
     assert "/health" in openapi_paths
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("has_tokenization", [False, True], ids=["diffusion", "autoregressive"])
+@pytest.mark.parametrize("tokenizer_info_enabled", [False, True], ids=["no-info", "info"])
+async def test_api_server_assembly_exposes_only_supported_tokenization_routes(
+    monkeypatch, mocker, has_tokenization: bool, tokenizer_info_enabled: bool
+) -> None:
+    """Use the inherited HTTP routes: diffusion returns 404; AR still delegates."""
+    captured: dict[str, FastAPI] = {}
+    handler = mocker.create_autospec(api_server.ServingTokenization, instance=True)
+    handler.create_tokenize.return_value = TokenizeResponse(count=1, max_model_len=1024, tokens=[42])
+    handler.create_detokenize.return_value = DetokenizeResponse(prompt="hello")
+    handler.get_tokenizer_info.return_value = TokenizerInfoResponse(tokenizer_class="TestTokenizer")
+
+    # attach_router conditionally adds /tokenizer_info to its module-level router.
+    # Isolate that registration so the opt-in cannot leak between test cases.
+    monkeypatch.setattr(
+        tokenization_api_router.router,
+        "routes",
+        [route for route in tokenization_api_router.router.routes if getattr(route, "path", None) != "/tokenizer_info"],
+    )
+
+    def build_app_with_native_tokenization(args, _supported_tasks):
+        app = FastAPI()
+        app.state.args = args
+        tokenization_api_router.attach_router(app)
+        captured["app"] = app
+        return app
+
+    @asynccontextmanager
+    async def build_engine(*_args, **_kwargs):
+        yield _FakeEngineClient()
+
+    async def init_app_state(engine_client, state, _args):
+        state.engine_client = engine_client
+        state.serving_tokenization = handler if has_tokenization else None
+
+    async def serve_http(_app, **_kwargs):
+        return asyncio.create_task(asyncio.sleep(0))
+
+    monkeypatch.setattr(api_server, "build_openai_app", build_app_with_native_tokenization)
+    monkeypatch.setattr(api_server, "build_async_omni", build_engine)
+    monkeypatch.setattr(api_server, "omni_init_app_state", init_app_state)
+    monkeypatch.setattr(api_server, "serve_http", serve_http)
+    monkeypatch.setattr(api_server.STORAGE_MANAGER, "start", lambda: asyncio.sleep(0))
+
+    await api_server.omni_run_server_worker(
+        "127.0.0.1:8000", _FakeSocket(), _minimal_args(enable_tokenizer_info_endpoint=tokenizer_info_enabled)
+    )
+
+    app = captured["app"]
+    with TestClient(app, raise_server_exceptions=False) as client:
+        tokenize_response = client.post("/tokenize", json={"model": "demo-model", "prompt": "hello"})
+        detokenize_response = client.post("/detokenize", json={"model": "demo-model", "tokens": [42]})
+        info_response = client.get("/tokenizer_info")
+
+    expected_status = 200 if has_tokenization else 404
+    assert tokenize_response.status_code == detokenize_response.status_code == expected_status
+    assert info_response.status_code == (200 if has_tokenization and tokenizer_info_enabled else 404)
+    openapi_paths = app.openapi()["paths"]
+    assert ("/tokenize" in openapi_paths) == has_tokenization
+    assert ("/detokenize" in openapi_paths) == has_tokenization
+    assert ("/tokenizer_info" in openapi_paths) == (has_tokenization and tokenizer_info_enabled)
+    if has_tokenization:
+        assert tokenize_response.json()["tokens"] == [42]
+        assert detokenize_response.json() == {"prompt": "hello"}
+        handler.create_tokenize.assert_awaited_once()
+        handler.create_detokenize.assert_awaited_once()
+        assert handler.create_tokenize.await_args.args[0].prompt == "hello"
+        assert handler.create_detokenize.await_args.args[0].tokens == [42]
+        assert handler.get_tokenizer_info.await_count == int(tokenizer_info_enabled)
+        if tokenizer_info_enabled:
+            assert info_response.json() == {"tokenizer_class": "TestTokenizer"}
+    else:
+        assert tokenize_response.json() == detokenize_response.json() == {"detail": "Not Found"}
+        handler.create_tokenize.assert_not_awaited()
+        handler.create_detokenize.assert_not_awaited()
+        handler.get_tokenizer_info.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -955,6 +1038,59 @@ def test_chat_completion_raw_body_guards_allow_null_defaults(raw_body) -> None:
     api_server._validate_chat_completion_raw_body(raw_body)
 
 
+@pytest.mark.parametrize("stream", [False, True], ids=["http", "sse"])
+def test_chat_cache_miss_preserves_native_retryable_error_at_http_boundary(mocker, stream):
+    from tests.helpers.serving_chat import build_serving_chat
+
+    serving_chat = build_serving_chat()
+
+    async def failed_generation():
+        raise RetryableRequestError("Multi-modal processor cache miss.")
+        yield  # pragma: no cover - async generator boundary
+
+    async def create_completion(request, _raw_request):
+        generator = (
+            serving_chat.chat_completion_stream_generator
+            if request.stream
+            else serving_chat.chat_completion_full_generator
+        )
+        result = generator(
+            request=request,
+            result_generator=failed_generation(),
+            request_id="cache-miss-request",
+            model_name="demo-model",
+            conversation=[],
+            tokenizer=mocker.Mock(),
+            request_metadata=mocker.Mock(),
+        )
+        return result if request.stream else await result
+
+    mocker.patch.object(serving_chat, "create_chat_completion", side_effect=create_completion)
+    app = FastAPI()
+    app.state.openai_serving_chat = serving_chat
+    app.add_api_route("/v1/chat/completions", api_server.create_chat_completion, methods=["POST"])
+    with TestClient(app, raise_server_exceptions=False) as client:
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "demo-model",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": stream,
+                "modalities": ["text"],
+            },
+        )
+
+    assert response.status_code == (200 if stream else 503)
+    if stream:
+        events = [json.loads(line.removeprefix("data: ")) for line in response.text.splitlines() if '"error"' in line]
+        error = events[0]["error"]
+        assert response.text.endswith("data: [DONE]\n\n")
+    else:
+        error = response.json()["error"]
+    assert error["type"] == "ServiceUnavailableError"
+    assert error["code"] == 503
+
+
 @pytest.mark.asyncio
 async def test_multi_api_allows_runtime_voice_upload_and_deletion() -> None:
     # The speaker directory is shared by every API process, so these routes
@@ -1149,13 +1285,18 @@ async def test_pure_diffusion_speech_forwards_media_access_args(monkeypatch, tmp
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("ming3", [False, True, "tts"])
 @pytest.mark.parametrize("supported_tasks", [("generate",), ("embed",)])
-async def test_multistage_app_state_key_snapshot(monkeypatch, mocker, tmp_path, supported_tasks) -> None:
+@pytest.mark.parametrize("policy_server", [False, True])
+async def test_multistage_app_state_key_snapshot(
+    monkeypatch, mocker, tmp_path, supported_tasks, ming3, policy_server
+) -> None:
     """Lock multi-stage ``app.state`` keys after init, including live vs None.
 
     Fails if chat/speech/video/realtime/tokenization keys disappear or are
     left as None after init refactors — classic “route still registered,
-    handler never wired” failure mode.
+    handler never wired” failure mode. A multi-stage robot policy (one that
+    declares ``policy_server_config``) also gets the OpenPI server.
     """
     engine = _FakeEngineClient(
         stage_configs=[object(), object()],
@@ -1180,6 +1321,9 @@ async def test_multistage_app_state_key_snapshot(monkeypatch, mocker, tmp_path, 
             self.kwargs = kwargs
             self.warmup_calls = 0
 
+        def _has_ming3_talker_stage(self):
+            return ming3 is True
+
         def warmup(self):
             self.warmup_calls += 1
 
@@ -1191,6 +1335,8 @@ async def test_multistage_app_state_key_snapshot(monkeypatch, mocker, tmp_path, 
     class _FakeSpeech(_FakeCtor):
         def __init__(self, *args, **kwargs):
             speech_kwargs.update(kwargs)
+
+        _tts_model_type = "ming3_audio_tts" if ming3 == "tts" else None
 
         async def warmup(self):
             return None
@@ -1217,23 +1363,44 @@ async def test_multistage_app_state_key_snapshot(monkeypatch, mocker, tmp_path, 
     monkeypatch.setattr(api_server, "OmniStreamingSpeechHandler", _FakeCtor)
     monkeypatch.setattr(api_server, "create_streaming_video_handler", lambda **_k: _marker("streaming_video"))
     monkeypatch.setattr(api_server, "OmniOpenAIServingVideo", _FakeCtor)
+    from unittest.mock import AsyncMock
+
+    register = AsyncMock()
+    monkeypatch.setattr("vllm_omni.entrypoints.openai.ming3_voices.register_model_voice_presets", register)
+    if policy_server:
+        monkeypatch.setattr(
+            api_server.ServingRealtimeRobotOpenPI,
+            "create_policy_server",
+            classmethod(lambda cls, *a, **k: _marker("openpi")),
+        )
 
     state = State()
     await api_server.omni_init_app_state(engine, state, _minimal_args(log_error_stack=True))
     assert speech_kwargs["speech_cache_config"].resolve_max_bytes == 1024
     assert speech_kwargs["speech_cache_config"].resolve_max_entries == 2048
     assert speech_kwargs["speech_cache_config"].speaker_max_bytes == 8
+    if (ming3 is True and "generate" in supported_tasks) or ming3 == "tts":
+        register.assert_awaited_once()
+        assert register.call_args.args[0] is state.openai_serving_speech
+        assert register.call_args.args[1] == _minimal_args().model
+        if ming3 is True:
+            assert state.openai_serving_chat._ming3_speech_service is state.openai_serving_speech
+        else:
+            assert not hasattr(state.openai_serving_chat, "_ming3_speech_service")
+    else:
+        register.assert_not_awaited()
 
     disabled = (
         set()
         if "generate" in supported_tasks
         else {"openai_serving_chat", "openai_serving_chat_batch", "openai_streaming_video"}
     )
+    robot = {"openai_serving_realtime_robot"} if policy_server else set()
     _assert_app_state_snapshot(
         state,
         expected_keys=_MULTISTAGE_APP_STATE_KEYS,
-        must_be_wired=_MULTISTAGE_MUST_BE_WIRED - disabled,
-        must_be_none=_MULTISTAGE_MUST_BE_NONE | disabled,
+        must_be_wired=(_MULTISTAGE_MUST_BE_WIRED | robot) - disabled,
+        must_be_none=(_MULTISTAGE_MUST_BE_NONE - robot) | disabled,
     )
     assert state.online_renderer.kwargs["log_error_stack"] is True
     assert state.online_renderer.warmup_calls == 1

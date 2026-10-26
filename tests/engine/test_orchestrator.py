@@ -12,6 +12,7 @@ import time
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock, Mock
 
 import janus
 import pytest
@@ -23,7 +24,7 @@ from vllm.v1.engine import EngineCoreOutput, EngineCoreOutputs, EngineCoreReques
 from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.metrics.stats import IterationStats
 
-from vllm_omni.engine import OmniEngineCoreOutput
+from vllm_omni.engine import OmniEngineCoreOutput, OmniEngineCoreOutputs
 from vllm_omni.engine.errors import NativeKVHandoffError
 from vllm_omni.engine.messages import (
     AbortRequestMessage,
@@ -47,7 +48,7 @@ from vllm_omni.engine.serialization import deserialize_additional_information, s
 from vllm_omni.engine.stage_pool import StagePool, StageUnavailableError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.metrics.stats import StageRequestStats, StageStats
-from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.outputs import OmniRequestOutput, StagePostWarmupMemoryStats
 from vllm_omni.outputs.output_processor import MultimodalOutputProcessor
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -151,7 +152,7 @@ class FakeStageClient:
         try:
             return self._engine_core_outputs.get_nowait()
         except queue.Empty:
-            return SimpleNamespace(outputs=[], scheduler_stats=None, finished_requests=None)
+            return OmniEngineCoreOutputs()
 
     def get_diffusion_output_nowait(self):
         try:
@@ -306,9 +307,13 @@ class RecordingOutputProcessor(FakeOutputProcessor):
 class RecordingStatLogger:
     def __init__(self) -> None:
         self.records: list[tuple[Any, Any, int]] = []
+        self.removed_memory_snapshots: list[int] = []
 
     def record(self, scheduler_stats, iteration_stats, *, engine_idx: int = 0) -> None:
         self.records.append((scheduler_stats, iteration_stats, engine_idx))
+
+    def remove_stage_post_warmup_memory(self, *, engine_idx: int) -> None:
+        self.removed_memory_snapshots.append(engine_idx)
 
 
 def _sampling_params(max_tokens: int = 4) -> SamplingParams:
@@ -3193,3 +3198,43 @@ async def test_interaction_backlog_is_bounded_without_blocking_dispatch() -> Non
     consumer = object.__new__(AsyncOmni)
     with pytest.raises(RuntimeError, match="Too many pending interactions"):
         consumer._handle_output_message(error)
+
+
+@pytest.mark.asyncio
+async def test_stage_pool_preserves_scheduler_stats_only_outputs():
+    pool = object.__new__(StagePool)
+    stats_outputs = OmniEngineCoreOutputs(scheduler_stats=SimpleNamespace())
+    client = SimpleNamespace(get_output_async=AsyncMock(return_value=stats_outputs))
+
+    assert await pool.read_llm_raw_output(client) is stats_outputs
+
+    client.get_output_async.return_value = OmniEngineCoreOutputs()
+    assert await pool.read_llm_raw_output(client) is None
+
+
+@pytest.mark.asyncio
+async def test_publish_stage_post_warmup_memory_records_initialized_replica():
+    logger = SimpleNamespace(record_stage_post_warmup_memory=Mock())
+    pool = SimpleNamespace(
+        stage_id=0,
+        stage_vllm_config=SimpleNamespace(),
+        clients=[SimpleNamespace()],
+        live_replica_ids=lambda: [0],
+        collective_rpc=AsyncMock(return_value=[None, {"allocated_bytes": 11, "reserved_bytes": 13}]),
+    )
+    orchestrator = object.__new__(Orchestrator)
+    orchestrator._stat_logger = logger
+    orchestrator.stage_pools = [pool]
+    orchestrator._stage_replica_to_engine_idx = {(0, 0): 4}
+    orchestrator._stages_shutdown = False
+
+    await orchestrator.publish_stage_post_warmup_memory()
+
+    pool.collective_rpc.assert_awaited_once_with(
+        replica_id=0,
+        method="get_stage_post_warmup_memory_stats",
+    )
+    logger.record_stage_post_warmup_memory.assert_called_once_with(
+        StagePostWarmupMemoryStats(allocated_bytes=11, reserved_bytes=13),
+        engine_idx=4,
+    )

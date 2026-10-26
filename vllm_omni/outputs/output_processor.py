@@ -3,11 +3,11 @@
 
 from collections.abc import Iterable
 from dataclasses import fields as dataclass_fields
-from typing import Any
+from typing import Any, cast
 
 import torch
 from vllm.logger import init_logger
-from vllm.outputs import CompletionOutput, PoolingRequestOutput, RequestOutput
+from vllm.outputs import CompletionOutput, PoolingOutput, PoolingRequestOutput, RequestError, RequestOutput
 from vllm.sampling_params import RequestOutputKind
 from vllm.tokenizers import TokenizerLike
 from vllm.v1.engine import EngineCoreOutput, EngineCoreRequest, FinishReason
@@ -81,8 +81,8 @@ def _accumulate_segment_tpot(record: dict[str, object], *, elapsed_ms: float, ne
     """Weight one decode step by its token count. ITL stays one sample per step."""
     if new_tokens <= 0:
         return
-    total_elapsed_ms = float(record.get(_TPOT_ELAPSED_MS) or 0.0) + elapsed_ms
-    total_intervals = int(record.get(_TPOT_INTERVALS) or 0) + new_tokens
+    total_elapsed_ms = float(cast(float, record.get(_TPOT_ELAPSED_MS) or 0.0)) + elapsed_ms
+    total_intervals = int(cast(int, record.get(_TPOT_INTERVALS) or 0)) + new_tokens
     record[_TPOT_ELAPSED_MS] = total_elapsed_ms
     record[_TPOT_INTERVALS] = total_intervals
     record["vllm_tpot_ms"] = total_elapsed_ms / float(total_intervals)
@@ -122,6 +122,8 @@ class OmniRequestState(RequestState):
     are produced incrementally during generation.
     """
 
+    sent_tokens_offset: int
+
     def __init__(
         self,
         *args,
@@ -133,6 +135,7 @@ class OmniRequestState(RequestState):
         # releases, making args[12] fragile.
         arrival_time = kwargs.get("arrival_time")
         super().__init__(*args, **kwargs)
+        self.is_pooling_request = False
         self.native_text_stats = RequestStateStats(arrival_time=float(arrival_time or 0.0))
         # Omni-specific: multimodal output accumulation
         # TODO: mm_type is per-request, not per-key. If a model ever produces
@@ -190,8 +193,8 @@ class OmniRequestState(RequestState):
         except (RuntimeError, TypeError, KeyError):
             logger.exception("Error consolidating multimodal tensors")
 
-    # Override: do not route to pooling-only path; always create completion
-    # outputs, and attach pooling_result into the CompletionOutput.
+    # Preserve native pooling outputs and attach multimodal generation data
+    # to completion outputs.
     def make_request_output(
         self,
         new_token_ids: list[int],
@@ -202,6 +205,7 @@ class OmniRequestState(RequestState):
         ec_transfer_params: dict[str, Any] | None = None,
         *,
         routed_experts: Any = None,
+        error: RequestError | None = None,
     ) -> OmniRequestOutput | PoolingRequestOutput | None:
         """Create a request output from generation results.
 
@@ -236,6 +240,7 @@ class OmniRequestState(RequestState):
                 stop_reason,
                 kv_transfer_params,
                 ec_transfer_params,
+                error=error,
             )
 
         is_delta = self.output_kind == RequestOutputKind.DELTA
@@ -370,21 +375,24 @@ class OmniRequestState(RequestState):
         finished: bool,
         kv_transfer_params: dict[str, Any] | None = None,
         ec_transfer_params: dict[str, Any] | None = None,
+        error: RequestError | None = None,
     ) -> RequestOutput | PoolingRequestOutput:
         """Create request output, handling no-detokenizer generation stages.
 
         Upstream asserts ``self.logprobs_processor is not None`` which fails
         for generation stages (talker, code2wav) that have no tokenizer.
-        When the logprobs processor is absent we build the RequestOutput
-        directly with ``prompt_logprobs=None``.
+        Pooling outputs use upstream construction, including request errors.
+        Completion outputs without a logprobs processor are built directly
+        with ``prompt_logprobs=None``.
         """
-        if self.logprobs_processor is not None:
+        if self.logprobs_processor is not None or isinstance(outputs[0], PoolingOutput):
             return super()._new_request_output(
                 external_req_id,
                 outputs,
                 finished,
                 kv_transfer_params,
                 ec_transfer_params,
+                error=error,
             )
 
         # No-detokenizer path: build RequestOutput directly.
@@ -672,6 +680,7 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
             log_stats=self.log_stats,
             stream_interval=self.stream_interval,
         )
+        cast(OmniRequestState, req_state).is_pooling_request = request.pooling_params is not None
         self.request_states[request_id] = req_state
         if parent_req:
             self.parent_requests[parent_req.request_id] = parent_req
@@ -730,9 +739,17 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
                     req_state.add_multimodal_tensor(eco.pooling_output, mm_type)
                     eco.pooling_output = None
 
-            # Route: if no detokenizer and no pooling output, handle locally
-            # to avoid upstream's assert on detokenizer.
-            if req_state.detokenizer is None and eco.pooling_output is None:
+            # Native pooling cache-miss errors carry no tensor. Upstream
+            # synthesizes their empty pooling output and structured error.
+            pooling_cache_miss = (
+                isinstance(req_state, OmniRequestState)
+                and req_state.is_pooling_request
+                and eco.finish_reason == FinishReason.ERROR
+                and bool(eco.mm_cache_miss_hashes)
+            )
+            # Other outputs without a detokenizer or pooling tensor must stay
+            # local to avoid upstream's assert on detokenizer.
+            if req_state.detokenizer is None and eco.pooling_output is None and not pooling_cache_miss:
                 mm_only_outputs.append(eco)
             else:
                 upstream_outputs.append(eco)
@@ -909,6 +926,13 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
         native_stats = req_state.native_text_stats if isinstance(req_state, OmniRequestState) else None
         if iteration_stats is None or native_stats is None or finish_reason is None:
             return
+
+        # Upstream records watermark status on the per-request stats. Native
+        # text stats track segment timing separately and reset on streaming
+        # updates, so restore the request flags before counting completions.
+        if req_state.stats is not None:
+            native_stats.is_watermarked = req_state.stats.is_watermarked
+            native_stats.is_watermark_skipped = req_state.stats.is_watermark_skipped
 
         iteration_stats.update_from_finished_request(
             finish_reason=finish_reason,

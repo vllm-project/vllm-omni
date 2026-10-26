@@ -146,3 +146,48 @@ def test_rejects_unsupported_text_values(key, value):
 def test_rejects_dense_backbone_layer():
     with pytest.raises(ValueError, match="every backbone layer must be MoE"):
         _config(mlp_layer_types=["moe"] * 39 + ["dense"])
+
+
+def test_npu_fused_qk_rope_is_rejected_after_construction():
+    import vllm_omni.platforms.npu.models.fish_omni as fish_model
+
+    class _Eager:
+        use_fused_qk_norm_rope_gate = False
+
+    class _Fused:
+        use_fused_qk_norm_rope_gate = True
+
+    class _Root:
+        def __init__(self, children: list[object]) -> None:
+            self._children = children
+
+        def modules(self) -> list[object]:
+            return self._children
+
+    fish_model._require_npu_eager_qk_rope(_Root([_Eager()]))
+    with pytest.raises(RuntimeError, match="fused QK-norm RoPE"):
+        fish_model._require_npu_eager_qk_rope(_Root([_Eager(), _Fused()]))
+    for children in ([], [object()]):
+        with pytest.raises(RuntimeError, match="no attention modules expose use_fused_qk_norm_rope_gate"):
+            fish_model._require_npu_eager_qk_rope(_Root(children))
+
+
+def test_tensor_parallel_is_allowed_on_npu_only(monkeypatch):
+    from types import SimpleNamespace
+
+    import vllm_omni.model_executor.models.fish_omni.fish_omni_model as fish_model
+
+    parallel = SimpleNamespace(pipeline_parallel_size=1, prefill_context_parallel_size=1, tensor_parallel_size=2)
+    monkeypatch.setattr(fish_model, "current_platform", SimpleNamespace(device_type="npu"))
+    fish_model._reject_unsupported_fish_parallel(parallel)
+    monkeypatch.setattr(fish_model, "current_platform", SimpleNamespace(device_type="cuda"))
+    with pytest.raises(NotImplementedError, match="tensor parallel"):
+        fish_model._reject_unsupported_fish_parallel(parallel)
+    with pytest.raises(NotImplementedError, match="one pipeline rank"):
+        fish_model._reject_unsupported_fish_parallel(
+            SimpleNamespace(pipeline_parallel_size=2, prefill_context_parallel_size=1)
+        )
+    with pytest.raises(NotImplementedError, match="prefill context"):
+        fish_model._reject_unsupported_fish_parallel(
+            SimpleNamespace(pipeline_parallel_size=1, prefill_context_parallel_size=2)
+        )
