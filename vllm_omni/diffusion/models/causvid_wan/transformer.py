@@ -103,8 +103,8 @@ class StageWanTransformer(nn.Module):
         self.layer_groups = max(1, int(layer_groups))
         self.pp_rank = int(pp_rank)
         self.group = 0 if self.layer_groups == 1 else self.pp_rank % self.layer_groups
-        self.is_stage_first = self.group == 0
-        self.is_stage_last = self.group == self.layer_groups - 1
+        self.is_layer_group_first = self.group == 0
+        self.is_layer_group_last = self.group == self.layer_groups - 1
         self.patch_size = tuple(patch_size)
         self.in_features = in_channels * math.prod(self.patch_size)
         self._wan: nn.Module | None = None
@@ -370,7 +370,7 @@ class StageWanTransformer(nn.Module):
         layer_ids = [only_block] if only_block is not None else list(range(self.start_layer, self.end_layer))
         first_local = layer_ids[0] == self.start_layer
         last_local = layer_ids[-1] == self.end_layer - 1
-        if first_local and self.is_stage_first:
+        if first_local and self.is_layer_group_first:
             hidden = self.embed(latent)
         else:
             if intermediate_tensors is None:
@@ -381,7 +381,7 @@ class StageWanTransformer(nn.Module):
             if kv_contexts is not None:
                 ctx = kv_contexts[0] if len(kv_contexts) == 1 else kv_contexts[idx - self.start_layer]
             hidden = self.block(idx, hidden, chunk=chunk, step=step, latent=latent, timestep=timestep, kv_ctx=ctx)
-        if not (last_local and self.is_stage_last):
+        if not (last_local and self.is_layer_group_last):
             return IntermediateTensors({"hidden_states": hidden})
         return self.unembed(hidden, chunk=chunk, step=step, latent=latent, timestep=timestep)
 

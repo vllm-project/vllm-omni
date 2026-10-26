@@ -17,8 +17,10 @@ from unittest.mock import AsyncMock
 
 import janus
 import pytest
+from vllm.config.multimodal import MultiModalConfig
 from vllm.exceptions import VLLMValidationError
 from vllm.multimodal.cache import LruKeyReplicatedSenderCache
+from vllm.multimodal.processing import InputProcessingContext
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.serial_utils import MsgpackEncoder
@@ -1171,11 +1173,12 @@ async def test_bad_video_sampling_options_keep_orchestrator_alive(orchestrator_f
     stage1 = FakeStageClient(final_output=True)
     output_processor = FakeOutputProcessor(request_outputs=[_build_request_output("valid-video")])
     fixture = orchestrator_factory([stage0, stage1], output_processors=[FakeOutputProcessor(), output_processor])
+    ctx = InputProcessingContext(SimpleNamespace(get_multimodal_config=lambda: MultiModalConfig()), tokenizer=None)
     info = SimpleNamespace(
-        ctx=SimpleNamespace(
-            get_merged_mm_kwargs=lambda kw, **_: kw,
-            get_mm_config=lambda: SimpleNamespace(get_video_pruning_spec=lambda: None),
+        _merge_and_resolve_mm_processor_kwargs=lambda kw: ctx.get_merged_mm_kwargs(
+            kw, supported_mm_processor_kwargs={"videos_kwargs": {"size", "fps", "num_frames"}}
         ),
+        ctx=ctx,
         get_hf_config=lambda: SimpleNamespace(
             vision_config=SimpleNamespace(spatial_merge_size=2),
             vision_start_token_id=1,

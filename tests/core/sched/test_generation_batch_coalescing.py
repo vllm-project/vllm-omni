@@ -10,7 +10,7 @@ from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.request import RequestStatus
 
 from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler
-from vllm_omni.outputs import OmniConnectorOutput
+from vllm_omni.outputs import OmniConnectorOutput, SchedulingMetadataUpdate
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -101,8 +101,11 @@ def scheduler(monkeypatch, initial=(), delayed=()):
     return s, clock
 
 
-def test_arrivals_form_target_batch_in_order(monkeypatch):
+@pytest.mark.parametrize("terminal_metadata", [False, True])
+def test_arrivals_form_target_batch_in_order(monkeypatch, terminal_metadata):
     events = [notification("0"), notification("1", "2"), notification("3")]
+    if terminal_metadata:
+        events[-1] = OmniConnectorOutput(request_metadata={"3": SchedulingMetadataUpdate(input_terminal=True)})
     s, clock = scheduler(monkeypatch, events[:1], [(0.002, events[1]), (0.003, events[2])])
     assert s._drain_omni_connector_outputs() == events
     assert clock[0] == pytest.approx(10.005)
@@ -167,7 +170,10 @@ def test_deadline_is_new_for_each_batch_not_extended_by_arrivals(monkeypatch):
 
 def test_cancelled_notification_is_filtered_before_coordinator(monkeypatch, mocker):
     event = notification("0", "cancelled")
-    event.request_metadata = {"0": {"code_predictor_codes": [7]}, "cancelled": {"code_predictor_codes": [9]}}
+    event.request_metadata = {
+        "0": SchedulingMetadataUpdate(prompt_token_ids=(7,)),
+        "cancelled": SchedulingMetadataUpdate(prompt_token_ids=(9,)),
+    }
     s, _ = scheduler(monkeypatch, [event])
     s._generation_max_wait_s = 0
     s.waiting = []
@@ -177,7 +183,7 @@ def test_cancelled_notification_is_filtered_before_coordinator(monkeypatch, mock
     s.input_coordinator.process_pending_chunks = mocker.Mock()
     s._consume_pending_connector_output("generation")
     s.input_coordinator.update_request_metadata.assert_called_once_with(
-        s.requests, {"0": {"code_predictor_codes": [7]}}, model_mode="generation"
+        s.requests, {"0": SchedulingMetadataUpdate(prompt_token_ids=(7,))}
     )
     s.input_coordinator.process_pending_chunks.assert_called_once()
     waiting, running, ready, finished = s.input_coordinator.process_pending_chunks.call_args.args

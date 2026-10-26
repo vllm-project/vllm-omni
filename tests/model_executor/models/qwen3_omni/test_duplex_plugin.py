@@ -21,7 +21,10 @@ from tests.engine.duplex.test_session_runner import (
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
 from vllm_omni.engine.duplex.commands import (
     AckPlayback,
+    AppendAudio,
+    BargeIn,
     CancelResponse,
+    ClearInput,
     ClearOutputAudio,
     CloseSession,
     Commit,
@@ -94,7 +97,12 @@ def test_capabilities_advertise_image_items_not_append_frames():
 
 
 async def open_qwen(
-    *, calibrate=None, calibration_timeout_ms=1000, history_max_bytes=8 * 1024 * 1024, requires_audio=True
+    *,
+    calibrate=None,
+    calibration_timeout_ms=1000,
+    history_max_bytes=8 * 1024 * 1024,
+    requires_audio=True,
+    **config_overrides: Any,
 ):
     plugin = Qwen3OmniDuplexPlugin(lambda audio, *args: "AAAA")
     if calibrate is not None:
@@ -117,6 +125,8 @@ async def open_qwen(
         model_config=None,
     )
     config = DuplexSessionConfig(model="qwen", modalities=["text", "audio"], overlap_policy="barge_in_on_speech")
+    for key, value in config_overrides.items():
+        setattr(config, key, value)
     await manager.handle(
         OpenDuplexSessionMessage(
             control_id="open", session_id=SESSION_ID, session_config=config, output_buffer=output_buffer
@@ -295,6 +305,245 @@ async def test_note_published_failure_closes_the_unpublished_call():
 
 
 @pytest.mark.asyncio
+async def test_session_voice_is_forwarded_to_the_talker_speaker_field():
+    """session.update voice must reach the Talker as additional_information.speaker.
+
+    The chat-completions path puts the requested voice into
+    ``prompt["additional_information"]["speaker"]`` and the thinker→talker
+    stage processor forwards it; the duplex plan is the only other prompt
+    producer, so it must set the same field (#8815). Re-targeting is only
+    legal while no audio output has started; the harness never plays audio,
+    which is exactly the pre-audio window these assertions cover.
+    """
+    h = await open_qwen()
+    try:
+        await h.run(UpdateSession(patch={"voice": " Chelsie "}))
+        await h.run(append_audio())
+        await h.run(Commit(final=True, create_response=True))
+        prompt = h.port.submissions[-1].prompt
+        assert prompt["additional_information"]["speaker"] == ["chelsie"]
+
+        # Still before any audio output: re-targeting the following turns is legal.
+        await h.run(UpdateSession(patch={"voice": "Ethan"}))
+        await h.run(append_audio())
+        await h.run(Commit(final=True, create_response=True))
+        prompt = h.port.submissions[-1].prompt
+        assert prompt["additional_information"]["speaker"] == ["ethan"]
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_open_session_voice_is_forwarded_to_the_talker_speaker_field():
+    h = await open_qwen(voice="Aiden")
+    try:
+        await h.run(append_audio())
+        await h.run(Commit(final=True, create_response=True))
+        prompt = h.port.submissions[-1].prompt
+        assert prompt["additional_information"]["speaker"] == ["aiden"]
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_nested_session_voice_is_forwarded_to_the_talker_speaker_field():
+    """GA-shaped clients carry the voice under ``audio.output.voice``."""
+    h = await open_qwen()
+    try:
+        await h.run(UpdateSession(patch={"audio": {"output": {"voice": " Chelsie "}}}))
+        await h.run(append_audio())
+        await h.run(Commit(final=True, create_response=True))
+        prompt = h.port.submissions[-1].prompt
+        assert prompt["additional_information"]["speaker"] == ["chelsie"]
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_unsupported_session_voice_is_rejected_and_keeps_the_previous_one():
+    h = await open_qwen(voice="chelsie")
+    h.manager.plugin._supported_speakers = {"chelsie", "ethan"}
+    try:
+        await h.run(append_audio())
+        await h.run(Commit(final=True, create_response=True))
+        assert h.port.submissions[-1].prompt["additional_information"]["speaker"] == ["chelsie"]
+
+        events = await h.run(UpdateSession(patch={"voice": "nova"}))
+        errors = [e.to_realtime() for e in events if e.to_realtime().get("type") == "error"]
+        assert errors, events
+        assert "Invalid speaker" in str(errors[0])
+        assert h.session.config.voice == "chelsie"
+
+        await h.run(append_audio())
+        await h.run(Commit(final=True, create_response=True))
+        assert h.port.submissions[-1].prompt["additional_information"]["speaker"] == ["chelsie"]
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_clearing_session_voice_drops_the_speaker_field():
+    h = await open_qwen(voice="chelsie")
+    try:
+        await h.run(append_audio())
+        await h.run(Commit(final=True, create_response=True))
+        assert h.port.submissions[-1].prompt["additional_information"]["speaker"] == ["chelsie"]
+
+        # Clearing is a voice change like any other; before audio output it is
+        # legal and simply falls back to the Talker default. After playback the
+        # guard rejects it — see the companion test below.
+        await h.run(UpdateSession(patch={"voice": None}))
+        await h.run(append_audio())
+        await h.run(Commit(final=True, create_response=True))
+        assert "additional_information" not in h.port.submissions[-1].prompt
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_voice_update_after_audio_output_is_rejected_and_keeps_the_speaker():
+    """Once audio has played, setting or clearing the voice must be rejected.
+
+    The harness passes updates with ``audio_started=False`` elsewhere; this
+    test plays and acknowledges an answer first, so the config guard is on
+    the production path and the session keeps its original speaker.
+    """
+    h = await open_qwen(voice="chelsie")
+    try:
+        await h.run(append_audio())
+        await h.run(Commit(final=True, create_response=True))
+        request_id = h.port.submissions[-1].context.request_id
+        response_id = h.session.active_response_id
+        await h.deliver_and_settle(tts_output(request_id, finished=True), stage_id=2)
+        await h.run(AckPlayback(response_id=response_id, played_ms=1000))
+        assert h.session.playback.sent_ms > 0
+
+        for patch in ({"voice": "Ethan"}, {"voice": None}):
+            events = await h.run(UpdateSession(patch=patch))
+            errors = [e.to_realtime() for e in events if e.to_realtime().get("type") == "error"]
+            assert errors, events
+            assert "voice" in str(errors[0])
+        assert h.session.config.voice == "chelsie"
+
+        await h.run(append_audio())
+        await h.run(Commit(final=True, create_response=True))
+        prompt = h.port.submissions[-1].prompt
+        assert prompt["additional_information"]["speaker"] == ["chelsie"]
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_round_trip_voice_update_after_playback_is_a_no_op():
+    """Realtime clients resend the whole session object, voice field included.
+
+    A voice-less session echoes ``"voice": null``, so after playback every
+    later update — temperature, turn detection — must still go through
+    instead of being rejected as a voice change. The next turn keeps the
+    Talker default (no speaker field).
+    """
+    h = await open_qwen()
+    try:
+        await h.run(append_audio())
+        await h.run(Commit(final=True, create_response=True))
+        request_id = h.port.submissions[-1].context.request_id
+        response_id = h.session.active_response_id
+        await h.deliver_and_settle(tts_output(request_id, finished=True), stage_id=2)
+        await h.run(AckPlayback(response_id=response_id, played_ms=1000))
+        assert h.session.playback.sent_ms > 0
+
+        events = await h.run(UpdateSession(patch={"voice": None, "temperature": 0.5}))
+        assert not any(e.to_realtime().get("type") == "error" for e in events)
+        assert h.session.config.voice is None
+        assert h.session.config.temperature == 0.5
+
+        await h.run(append_audio())
+        await h.run(Commit(final=True, create_response=True))
+        assert "additional_information" not in h.port.submissions[-1].prompt
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_resending_the_current_voice_after_playback_is_a_no_op():
+    h = await open_qwen(voice="chelsie")
+    try:
+        await h.run(append_audio())
+        await h.run(Commit(final=True, create_response=True))
+        request_id = h.port.submissions[-1].context.request_id
+        response_id = h.session.active_response_id
+        await h.deliver_and_settle(tts_output(request_id, finished=True), stage_id=2)
+        await h.run(AckPlayback(response_id=response_id, played_ms=1000))
+        assert h.session.playback.sent_ms > 0
+
+        # Same voice, different spelling: an echo, not a change — and the
+        # stored spelling is preserved for plugins that compare it exactly.
+        events = await h.run(UpdateSession(patch={"voice": " Chelsie "}))
+        assert not any(e.to_realtime().get("type") == "error" for e in events)
+        assert h.session.config.voice == "chelsie"
+
+        await h.run(append_audio())
+        await h.run(Commit(final=True, create_response=True))
+        prompt = h.port.submissions[-1].prompt
+        assert prompt["additional_information"]["speaker"] == ["chelsie"]
+    finally:
+        await h.manager.shutdown()
+
+
+def test_supported_speakers_come_from_the_talker_config():
+    plugin = Qwen3OmniDuplexPlugin(lambda *args: None)
+    model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(talker_config=SimpleNamespace(speaker_id={"Chelsie": 1, "Ethan": 2}))
+    )
+    plugin._load_supported_speakers(model_config)
+    assert plugin._supported_speakers == {"chelsie", "ethan"}
+    # A config without a speaker mapping leaves validation off, not empty-named.
+    plugin2 = Qwen3OmniDuplexPlugin(lambda *args: None)
+    plugin2._load_supported_speakers(SimpleNamespace(hf_config=SimpleNamespace(talker_config=SimpleNamespace())))
+    assert plugin2._supported_speakers == set()
+    plugin2.runtime_config_for_update(DuplexSessionConfig(voice="Nova"), {})
+    # A missing model config defers the load; names stay unvalidated.
+    plugin3 = Qwen3OmniDuplexPlugin(lambda *args: None)
+    plugin3._load_supported_speakers(None)
+    assert plugin3._supported_speakers is None
+    assert plugin3.runtime_config_for_update(DuplexSessionConfig(voice="Nova"), {})["voice"] == "nova"
+
+
+def test_runtime_config_voice_validation_rejects_unknown_names():
+    plugin = Qwen3OmniDuplexPlugin(lambda *args: None)
+    plugin._supported_speakers = {"chelsie"}
+    assert plugin.runtime_config_for_update(DuplexSessionConfig(voice=" CHELSIE "), {})["voice"] == "chelsie"
+    assert plugin.runtime_config_for_update(DuplexSessionConfig(voice=None), {})["voice"] is None
+    assert plugin.runtime_config_for_update(DuplexSessionConfig(voice="  "), {})["voice"] is None
+    with pytest.raises(DuplexRuntimeConfigError, match="Invalid speaker 'Nova'") as exc_info:
+        plugin.runtime_config_for_update(DuplexSessionConfig(voice="Nova"), {})
+    assert exc_info.value.code == "invalid_speaker"
+
+
+@pytest.mark.asyncio
+async def test_prepare_runtime_config_rejects_an_unknown_voice_at_open():
+    """The open path loads the checkpoint speakers and validates the session voice."""
+    plugin = Qwen3OmniDuplexPlugin(lambda *args: None)
+    # ``prepare_runtime_config`` only loads a processor when this is unset.
+    plugin.processor = SimpleNamespace()
+    model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(talker_config=SimpleNamespace(speaker_id={"Chelsie": 1})),
+        model="qwen",
+        trust_remote_code=True,
+    )
+
+    with pytest.raises(DuplexRuntimeConfigError, match="Invalid speaker 'nova'") as exc_info:
+        await plugin.prepare_runtime_config(DuplexSessionConfig(model="qwen", voice="nova"), model_config=model_config)
+    assert exc_info.value.code == "invalid_speaker"
+    assert plugin._supported_speakers == {"chelsie"}
+
+    runtime_config = await plugin.prepare_runtime_config(
+        DuplexSessionConfig(model="qwen", voice=" CHELSIE "), model_config=model_config
+    )
+    assert runtime_config["voice"] == "chelsie"
+
+
+@pytest.mark.asyncio
 async def test_two_committed_turns_stream_text_and_audio_and_release_requests():
     h = await open_qwen()
     try:
@@ -390,6 +639,54 @@ async def test_clear_completed_qwen_playback_allows_next_manual_turn(played_ms):
         terminals = [event for event in h.events if event.type == "response.done" and event.response_id == response_id]
         assert len(terminals) == 1 and terminals[0].status == "completed"
         assert not any(event.to_realtime().get("type") == "error" for event in h.events)
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel_command", [None, CancelResponse, ClearOutputAudio, BargeIn])
+@pytest.mark.parametrize("next_input", [False, True])
+@pytest.mark.parametrize("delete_before_ack", [False, True])
+async def test_audio_without_transcript_accepts_playback_ack(cancel_command, next_input, delete_before_ack):
+    h = await open_qwen()
+    try:
+        await h.run(append_audio())
+        await h.run(Commit(final=True, create_response=True))
+        request_id = h.port.submissions[-1].context.request_id
+        response_id = h.session.active_response_id
+        await h.deliver_and_settle(tts_output(request_id, samples=0, text="", finished=True), stage_id=0)
+        audio = await h.deliver_and_settle(tts_output(request_id, text="", finished=cancel_command is None), stage_id=2)
+        assert any(event.type == "response.output_audio.delta" for event in audio)
+        if cancel_command is not None:
+            await h.run(cancel_command())
+            assert h.session.playback.sent_ms == 0
+            assert h.session.playback_for_response(response_id).sent_ms == 1000
+        assert h.session.active_response_id is None
+        assert all(message["role"] == "user" for message in h.session.history)
+        if next_input:
+            await h.run(append_audio())
+            await h.run(Commit(final=True, create_response=True))
+        current_response = h.session.active_response_id
+        history = h.session.history
+        if delete_before_ack:
+            assert h.session.delete_history_item(f"item_{response_id}") is True
+            ack = await h.run(AckPlayback(response_id=response_id, played_ms=1000))
+            assert ack[0].to_realtime()["error"]["code"] == "playback_item_not_found"
+            assert response_id not in h.session._playback.by_response
+            assert h.session.history == history
+            return
+        for played_ms in (500, 1000):
+            ack = await h.run(AckPlayback(response_id=response_id, played_ms=played_ms))
+            assert [event.type for event in ack] == ["playback.acknowledged"], [event.to_realtime() for event in ack]
+            assert ack[0].details["history_committed"] is False
+            assert ack[0].details["playback"]["played_ms"] == played_ms
+            expected_history = history if next_input else (*history, {"role": "assistant", "content": ""})
+            assert h.session.history == expected_history
+            assert h.session.active_response_id == current_response
+        # Fully played audio must not leave response bookkeeping behind.
+        assert response_id not in h.session._playback.by_response
+        assert not h.session.has_audio_only_response(response_id)
+        assert f"item_{response_id}" not in h.session.pending_history_item_ids
     finally:
         await h.manager.shutdown()
 
@@ -618,6 +915,282 @@ async def test_late_playback_ack_keeps_answer_before_new_user_input():
         assert [m["role"] for m in h.session.history] == ["user", "assistant", "user"]
         assert h.session.history[1]["content"] == "first answer"
         assert h.session.active_response_id == current_response
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.fixture
+def scripted_turn_detectors(monkeypatch):
+    from vllm_omni.engine.duplex.turn_detection import SemanticTurnDetector, TurnDetectionConfig
+
+    def build_detector(config, backend_provider=None, semantic_backend_provider=None):
+        detector = (
+            SemanticTurnDetector(config, turn_scorer=lambda _: 0.1)
+            if config.type == "semantic_vad"
+            else original_build(config, backend_provider, semantic_backend_provider)
+        )
+        detector.vad._frame_scorer = lambda frame: 0.95 if np.abs(frame).max() > 0.1 else 0.02
+        return detector
+
+    original_build = TurnDetectionConfig.build_detector
+    monkeypatch.setattr(TurnDetectionConfig, "build_detector", build_detector)
+
+
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize("mode", ["semantic_vad", "server_vad"])
+@pytest.mark.parametrize("paused", [False, True])
+@pytest.mark.asyncio
+async def test_identical_vad_update_preserves_pending_audio(scripted_turn_detectors, nested, mode, paused):
+    h = await open_qwen()
+    try:
+        await h.run(UpdateSession(patch={"turn_detection": {"type": mode}}))
+        detector = h.runner.control._detector
+        events = await h.run(append_audio(value=0.2, is_speech=None))
+        if paused:
+            pause_samples = 16000 if mode == "semantic_vad" else 3200
+            events += await h.run(append_audio(samples=pause_samples, value=0.0, is_speech=None))
+        assert h.runner.model_state.audio_buffer.has_pending()
+        assert not h.port.submissions
+        # Re-send the normalized public echo, including defaults, through either spelling.
+        turn_detection = dict(h.session.as_public_dict()["turn_detection"])
+        patch = (
+            {"audio": {"input": {"turn_detection": turn_detection}}} if nested else {"turn_detection": turn_detection}
+        )
+        updated = await h.run(UpdateSession(patch=patch))
+        assert [event.type for event in updated] == ["session.updated"]
+        for _ in range(10):
+            events += await h.run(append_audio(value=0.0, is_speech=None))
+        assert sum(event.type == "input_audio_buffer.committed" for event in events) == 1
+        assert sum(event.type == "input_audio_buffer.speech_started" for event in events) == 1
+        assert sum(event.type == "input_audio_buffer.speech_stopped" for event in events) == 1
+        assert h.runner.control._detector is detector
+        assert len(h.port.submissions) == 1
+        audio, rate = h.port.submissions[0].prompt["multi_modal_data"]["audio"][-1]
+        assert rate == 16000
+        assert np.count_nonzero(audio == np.float32(0.2)) == 16000
+        expected_end_ms = 5024 if mode == "semantic_vad" else 1536
+        assert audio.size == expected_end_ms * 16, "the update must not restart the silence deadline"
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.parametrize(
+    "turn_detection",
+    [
+        {"type": "semantic_vad", "eagerness": "high"},
+        {"type": "semantic_vad", "create_response": False},
+        {"type": "server_vad"},
+        None,
+    ],
+)
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.asyncio
+async def test_vad_changes_reject_pending_input_atomically(scripted_turn_detectors, turn_detection, nested):
+    h = await open_qwen()
+    try:
+        await h.run(UpdateSession(patch={"turn_detection": {"type": "semantic_vad"}}))
+        await h.run(append_audio(value=0.2, is_speech=None))
+        await h.run(append_audio(value=0.0, is_speech=None))
+        detector = h.runner.control._detector
+        config, runtime = h.session.config, dict(h.session.runtime_config)
+        generation = h.session.config_generation
+        pending_bytes = h.runner.model_state.audio_buffer.pending_byte_count
+
+        def update():
+            patch = (
+                {"audio": {"input": {"turn_detection": turn_detection}}}
+                if nested
+                else {"turn_detection": turn_detection}
+            )
+            return UpdateSession(patch={**patch, "temperature": 0.3}, event_id="vad-update")
+
+        rejected = await h.run(update())
+        assert [event.type for event in rejected] == ["error"]
+        assert rejected[0].code == "unsupported_turn_detection"
+        assert rejected[0].related_event_id == "vad-update"
+        assert "commit or clear" in rejected[0].message
+        assert h.session.config is config and h.session.runtime_config == runtime
+        assert h.session.config_generation == generation
+        assert h.runner.control._detector is detector
+        assert h.runner.model_state.audio_buffer.pending_byte_count == pending_bytes
+
+        events = []
+        for _ in range(10):
+            events += await h.run(append_audio(value=0.0, is_speech=None))
+        assert sum(event.type == "input_audio_buffer.committed" for event in events) == 1
+        assert len(h.port.submissions) == 1
+        audio, _ = h.port.submissions[0].prompt["multi_modal_data"]["audio"][-1]
+        assert audio.size == 5024 * 16
+        assert np.count_nonzero(audio == np.float32(0.2)) == 16000
+
+        # Once the old input is committed, the same requested change can succeed.
+        accepted = await h.run(update())
+        assert [event.type for event in accepted] == ["session.updated"]
+        assert h.session.config.temperature == 0.3
+        assert h.runner.control._detector is not detector
+        if turn_detection is None:
+            assert h.runner.control._detector is None
+        else:
+            for key, value in turn_detection.items():
+                assert accepted[0].session["turn_detection"][key] == value
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_enabling_vad_requires_pending_manual_input_to_be_cleared(scripted_turn_detectors):
+    h = await open_qwen()
+    try:
+        await h.run(UpdateSession(patch={"turn_detection": None}))
+        await h.run(append_audio(value=0.2))
+        pending_bytes = h.runner.model_state.audio_buffer.pending_byte_count
+        rejected = await h.run(UpdateSession(patch={"turn_detection": {"type": "semantic_vad"}}))
+        assert [event.type for event in rejected] == ["error"]
+        assert rejected[0].code == "unsupported_turn_detection"
+        assert h.runner.control._detector is None
+        assert h.runner.model_state.audio_buffer.pending_byte_count == pending_bytes
+
+        await h.run(ClearInput())
+        accepted = await h.run(UpdateSession(patch={"turn_detection": {"type": "semantic_vad"}}))
+        assert [event.type for event in accepted] == ["session.updated"]
+        events = await h.run(append_audio(value=0.4, is_speech=None))
+        for _ in range(6):
+            events += await h.run(append_audio(value=0.0, is_speech=None))
+        assert sum(event.type == "input_audio_buffer.committed" for event in events) == 1
+        audio, _ = h.port.submissions[0].prompt["multi_modal_data"]["audio"][-1]
+        assert np.count_nonzero(audio == np.float32(0.4)) == 16000
+        assert not np.any(audio == np.float32(0.2))
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.parametrize("mode", ["server_vad", "semantic_vad"])
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize("recovery", ["clear", "commit"])
+@pytest.mark.asyncio
+async def test_same_config_recovery_requires_finishing_buffered_input(monkeypatch, mode, nested, recovery):
+    from vllm_omni.engine.duplex.smart_turn import SemanticVADUnavailableError
+    from vllm_omni.engine.duplex.vad import ServerVADUnavailableError
+
+    h = await open_qwen()
+    try:
+        windows = []
+
+        class Silero:
+            def new_state(self):
+                return object()
+
+            def infer(self, frame, state):
+                return (0.95 if np.abs(frame).max() > 0.1 else 0.02), state
+
+        class SmartTurn:
+            def predict(self, audio):
+                windows.append(audio.copy())
+                return 0.9
+
+        failed = False
+
+        def fail_once():
+            nonlocal failed
+            if not failed:
+                failed = True
+                error = SemanticVADUnavailableError if mode == "semantic_vad" else ServerVADUnavailableError
+                raise error("one-time initialization failure")
+            return SmartTurn() if mode == "semantic_vad" else Silero()
+
+        monkeypatch.setattr(h.manager.vad_backend_provider, "get", fail_once if mode == "server_vad" else Silero)
+        monkeypatch.setattr(
+            h.manager.semantic_vad_backend_provider, "get", fail_once if mode == "semantic_vad" else SmartTurn
+        )
+        await h.run(UpdateSession(patch={"turn_detection": {"type": mode}}))
+        events = await h.run(append_audio(value=0.2, is_speech=None))
+        assert any(getattr(event, "code", None) == f"{mode}_unavailable" for event in events)
+        assert h.runner.control._detector is None
+        pending_bytes = h.runner.model_state.audio_buffer.pending_byte_count
+        assert pending_bytes > 0
+        config, runtime = h.session.config, dict(h.session.runtime_config)
+        generation = h.session.config_generation
+        turn_detection = dict(h.session.as_public_dict()["turn_detection"])
+        patch = (
+            {"audio": {"input": {"turn_detection": turn_detection}}} if nested else {"turn_detection": turn_detection}
+        )
+        rejected = await h.run(UpdateSession(patch={**patch, "temperature": 0.3}, event_id="retry-vad"))
+        assert [event.type for event in rejected] == ["error"]
+        assert rejected[0].code == "unsupported_turn_detection"
+        assert rejected[0].related_event_id == "retry-vad"
+        assert h.runner.control._detector is None
+        assert h.session.config is config and h.session.runtime_config == runtime
+        assert h.session.config_generation == generation
+        assert h.runner.model_state.audio_buffer.pending_byte_count == pending_bytes
+
+        finished = await h.run(ClearInput() if recovery == "clear" else Commit(final=True, create_response=False))
+        assert not h.runner.model_state.audio_buffer.has_pending()
+        if recovery == "commit":
+            assert sum(event.type == "input_audio_buffer.committed" for event in finished) == 1
+        accepted = await h.run(UpdateSession(patch=patch))
+        assert [event.type for event in accepted] == ["session.updated"]
+        events = await h.run(append_audio(value=0.4, is_speech=None))
+        for _ in range(6):
+            events += await h.run(append_audio(value=0.0, is_speech=None))
+        assert sum(event.type == "input_audio_buffer.committed" for event in events) == 1
+        assert len(h.port.submissions) == 1
+        audio, _ = h.port.submissions[0].prompt["multi_modal_data"]["audio"][-1]
+        assert np.count_nonzero(audio == np.float32(0.4)) == 16000
+        # An explicit manual commit preserves A as earlier user context. Clear
+        # discards it. In either case the recovered detector's new turn is B.
+        assert np.count_nonzero(audio == np.float32(0.2)) == (16000 if recovery == "commit" else 0)
+        if mode == "semantic_vad":
+            assert len(windows) == 1
+            assert np.count_nonzero(windows[0] == np.float32(0.4)) == 16000
+            assert not np.any(windows[0] == np.float32(0.2))
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.parametrize("mode", ["server_vad", "semantic_vad"])
+@pytest.mark.parametrize("overlap_policy", ["listen_only", "barge_in_on_speech"])
+@pytest.mark.parametrize("queued_appends", [False, True])
+@pytest.mark.asyncio
+async def test_large_vad_append_submits_separate_audio_turns(mode, overlap_policy, queued_appends):
+    from vllm_omni.engine.duplex.turn_detection import SemanticTurnDetector, TurnDetectionConfig
+
+    h = await open_qwen()
+    try:
+        await h.run(UpdateSession(patch={"overlap_policy": overlap_policy}))
+        config = TurnDetectionConfig(type=mode)
+        detector = (
+            SemanticTurnDetector(config, turn_scorer=lambda _: 0.1)
+            if mode == "semantic_vad"
+            else config.build_detector()
+        )
+        detector.vad._frame_scorer = lambda frame: 0.95 if np.abs(frame).max() > 0.1 else 0.02
+        h.runner.control._detector = detector
+        audio = np.concatenate([np.full(16000, 0.2), np.zeros(80000), np.full(16000, 0.4), np.zeros(80000)])
+        for chunk in np.split(audio, 2) if queued_appends else [audio]:
+            h.submit(AppendAudio(audio=chunk.astype("<f4").tobytes(), format="pcm_f32le", sample_rate_hz=16000))
+        events = await h.settle()
+        assert sum(event.type == "input_audio_buffer.committed" for event in events) == 2
+        assert not any(event.type == "error" for event in events)
+        if overlap_policy == "listen_only":
+            assert len(h.port.submissions) == 1
+            first, _ = h.port.submissions[0].prompt["multi_modal_data"]["audio"][-1]
+            assert np.count_nonzero(first == np.float32(0.2)) == 16000
+            assert not np.any(first == np.float32(0.4))
+            request_id = h.port.submissions[0].context.request_id
+            await h.deliver_and_settle(tts_output(request_id, samples=0, text="first", finished=True), stage_id=0)
+            await h.deliver_and_settle(tts_output(request_id, samples=0, finished=True), stage_id=2)
+            assert len(h.port.submissions) == 2
+        else:
+            assert len(h.port.submissions) in (1, 2)
+            if len(h.port.submissions) == 2:
+                first, _ = h.port.submissions[0].prompt["multi_modal_data"]["audio"][-1]
+                assert np.count_nonzero(first == np.float32(0.2)) == 16000
+                assert not np.any(first == np.float32(0.4))
+        # With barge-in, the second turn can cancel the first before its
+        # background submission runs. Its audio must still be a separate turn.
+        second, _ = h.port.submissions[-1].prompt["multi_modal_data"]["audio"][-1]
+        assert np.count_nonzero(second == np.float32(0.4)) == 16000
+        assert not np.any(second == np.float32(0.2))
     finally:
         await h.manager.shutdown()
 
@@ -1149,7 +1722,8 @@ async def test_visual_capture_records_submitted_pixels_and_request(tmp_path, mon
 
 
 @pytest.mark.asyncio
-async def test_response_create_after_function_call_output_opens_one_follow_up():
+@pytest.mark.parametrize("audio_only", [False, True])
+async def test_response_create_after_function_call_output_opens_one_follow_up(audio_only):
     h = await open_qwen()
     try:
         h.session.append_history_message({"role": "user", "content": "what is the weather in Paris"})
@@ -1172,13 +1746,32 @@ async def test_response_create_after_function_call_output_opens_one_follow_up():
         assert "18C" in prompt
         assert not h.runner.plugin.has_pending_tool_followup(h.session.runtime_config)
         request_id = h.port.submissions[-1].context.request_id
-        await h.deliver_and_settle(tts_output(request_id, samples=0, text="18C", finished=True), stage_id=0)
-        await h.deliver_and_settle(tts_output(request_id, samples=0, finished=True), stage_id=2)
-        # ACK-only playback and no audio samples store no assistant text.
+        response_id = h.session.active_response_id
+        await h.deliver_and_settle(
+            tts_output(request_id, samples=0, text="" if audio_only else "18C", finished=True), stage_id=0
+        )
+        await h.deliver_and_settle(
+            tts_output(request_id, samples=24000 if audio_only else 0, finished=True), stage_id=2
+        )
+        if audio_only:
+            inflight = h.session.runtime_config.get("qwen_tool_turns_inflight")
+            assert inflight
+            ack = await h.run(AckPlayback(response_id=response_id, played_ms=1000))
+            assert ack[0].type == "playback.acknowledged"
+            assert ack[0].details["history_committed"] is False
+            assert not h.session.has_audio_only_response(response_id)
+            assert h.session.runtime_config.get("qwen_tool_turns_inflight") == inflight
+        # Neither unplayed text nor audio without a transcript stores answer text.
         # The tool pair is not in history, so it stays available.
         assert not any(message.get("content") for message in h.session.history if message.get("role") == "assistant")
-        assert h.runner.plugin.has_pending_tool_followup(h.session.runtime_config)
-        continued = await h.run(CreateResponse())
+        if audio_only:
+            # An audible response retains its tool pair until the next input;
+            # an empty text boundary must not count as a committed tool answer.
+            await h.run(append_audio())
+            continued = await h.run(Commit(final=True, create_response=True))
+        else:
+            assert h.runner.plugin.has_pending_tool_followup(h.session.runtime_config)
+            continued = await h.run(CreateResponse())
         assert not any(getattr(event, "code", None) == "response_create_without_input" for event in continued)
         prompt = h.port.submissions[-1].prompt["prompt"]
         assert "18C" in prompt

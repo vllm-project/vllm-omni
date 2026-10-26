@@ -20,7 +20,7 @@ steps:
         source_file_dependencies: omni_qwen3_omni_reliability
         commands:
           - >-
-            pytest -s -v tests/dfx/reliability/test_reliability_qwen3_omni.py
+            pytest -s -v tests/dfx/reliability/test_qwen3_omni.py
             -m "slow and rocm and MI325 and cards_2"
 
       - label: "Reliability Test · wan22"
@@ -32,7 +32,7 @@ steps:
         source_file_dependencies: diffusion_wan22_reliability
         commands:
           - >-
-            pytest -s -v tests/dfx/reliability/test_reliability_wan22.py
+            pytest -s -v tests/dfx/reliability/test_wan22.py
             -m "slow and rocm and MI325 and cards_1"
 
       - label: "Reliability Test · hunyuan-image"
@@ -44,7 +44,7 @@ steps:
         source_file_dependencies: diffusion_hunyuan_image3_reliability
         commands:
           - >-
-            pytest -s -v tests/dfx/reliability/test_reliability_hunyuan_image.py
+            pytest -s -v tests/dfx/reliability/test_hunyuan_image.py
             -m "slow and rocm and MI325 and cards_4"
 
       - label: "Reliability Test · Invalid parameters · MI300 · 2-GPU"

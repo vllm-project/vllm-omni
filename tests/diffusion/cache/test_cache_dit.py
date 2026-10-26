@@ -6,6 +6,7 @@ Model specific tests for CacheDiT enablement.
 """
 
 import ast
+import logging
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -19,12 +20,16 @@ from vllm.distributed import parallel_state
 import vllm_omni.diffusion.cache.cachedit as cd_backend
 import vllm_omni.diffusion.cache.cachedit.model_specific as cd_model_specific
 from vllm_omni.diffusion.cache.cachedit import CacheDiTAdapterConfig, CacheDiTBackend, cache_summary
+from vllm_omni.diffusion.cache.cachedit.config import (
+    VALIDATED_TAYLORSEER_MAX_CONTINUOUS_CACHED_STEPS,
+)
 from vllm_omni.diffusion.config import set_current_diffusion_config
 from vllm_omni.diffusion.data import AttentionConfig, DiffusionCacheConfig
 from vllm_omni.diffusion.models.cosmos3.transformer_cosmos3 import Cosmos3VFMTransformer
 from vllm_omni.diffusion.models.helios.helios_transformer import HeliosTransformer3DModel
 from vllm_omni.diffusion.models.longcat_image.longcat_image_transformer import LongCatImageTransformer2DModel
 from vllm_omni.diffusion.models.ltx2.ltx2_transformer import LTX2VideoTransformer3DModel
+from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import build_wan_scheduler
 from vllm_omni.platforms import current_omni_platform
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -229,6 +234,109 @@ def test_separate_wan22_custom_enabler_has_separate_cfg(mock_cache_dit, mock_blo
     assert adapter_kwargs["has_separate_cfg"] is True
 
 
+@contextmanager
+def _cfg_parallel(world_size: int | None):
+    """Pretend the CFG-parallel group has ``world_size`` ranks (``None``: parallel state not initialized)."""
+    with (
+        patch(
+            "vllm_omni.diffusion.distributed.parallel_state.model_parallel_is_initialized",
+            return_value=world_size is not None,
+        ),
+        patch(
+            "vllm_omni.diffusion.distributed.parallel_state.get_classifier_free_guidance_world_size",
+            return_value=world_size or 1,
+        ),
+    ):
+        yield
+
+
+@pytest.mark.parametrize(
+    ("declared", "cfg_world_size", "expected"),
+    [
+        (True, None, True),  # no parallel state (single process): keep the declared value
+        (True, 1, True),  # both CFG branches run on this rank
+        (True, 2, False),  # CFG parallel: one branch, so one transformer call, per rank and step
+        (False, 1, False),
+        (False, 2, False),
+    ],
+)
+def test_resolve_has_separate_cfg(declared, cfg_world_size, expected):
+    with _cfg_parallel(cfg_world_size):
+        assert cd_backend.backend.resolve_has_separate_cfg(declared) is expected
+
+
+@pytest.mark.parametrize("has_transformer_2", [False, True])
+@patch("vllm_omni.diffusion.cache.cachedit.model_specific.BlockAdapter")
+@patch("vllm_omni.diffusion.cache.cachedit.model_specific.cache_dit")
+def test_wan22_custom_enabler_drops_separate_cfg_under_cfg_parallel(
+    mock_cache_dit,
+    mock_block_adapter,
+    has_transformer_2,
+):
+    """Under CFG parallel each rank calls the transformer once per step, so Wan2.2 must not pair calls."""
+    mock_pipeline = Mock()
+    if not has_transformer_2:
+        mock_pipeline.transformer_2 = None
+    with _cfg_parallel(2):
+        cd_model_specific.enable_cache_for_wan22(mock_pipeline, SAMPLE_CACHE_CONFIG)
+
+    mock_cache_dit.enable_cache.assert_called_once()
+    assert mock_block_adapter.call_args.kwargs["has_separate_cfg"] is False
+
+
+@patch("vllm_omni.diffusion.cache.cachedit.backend.cache_dit")
+def test_enable_cache_for_dit_drops_separate_cfg_under_cfg_parallel(mock_cache_dit):
+    """The generic path (model-declared adapters, Krea2, MammothModa2, Cosmos3) resolves the flag too."""
+    block_adapter = SimpleNamespace(has_separate_cfg=True)
+    with _cfg_parallel(2):
+        cd_backend.enable_cache_for_dit(
+            Mock(),
+            SAMPLE_CACHE_CONFIG,
+            block_adapter=block_adapter,
+            get_pipeline_transformer=lambda pipeline: Mock(),
+        )
+
+    assert block_adapter.has_separate_cfg is False
+    assert mock_cache_dit.enable_cache.call_args.args[0] is block_adapter
+
+
+@pytest.mark.parametrize(("cfg_world_size", "expected"), [(None, None), (1, None), (2, False)])
+@patch("vllm_omni.diffusion.cache.cachedit.backend.cache_dit")
+def test_enable_cache_for_dit_builtin_adapter_drops_separate_cfg_under_cfg_parallel(
+    mock_cache_dit,
+    cfg_world_size,
+    expected,
+):
+    """Without a declared adapter, Cache-DiT's registry adapter (e.g. QwenImage) would pair calls."""
+    transformer = Mock()
+    with _cfg_parallel(cfg_world_size):
+        cd_backend.enable_cache_for_dit(
+            Mock(), SAMPLE_CACHE_CONFIG, get_pipeline_transformer=lambda pipeline: transformer
+        )
+
+    assert mock_cache_dit.enable_cache.call_args.args[0] is transformer
+    assert mock_cache_dit.enable_cache.call_args.kwargs["cache_config"].enable_separate_cfg is expected
+
+
+@pytest.mark.parametrize(("cfg_world_size", "expected"), [(None, False), (1, False), (2, True)])
+@patch("vllm_omni.diffusion.cache.cachedit.backend.cache_dit")
+def test_backend_marks_pipeline_one_call_per_cfg_rank(mock_cache_dit, cfg_world_size, expected):
+    """CFGParallelMixin reads the marker to reject multi-branch topologies with two calls on one rank."""
+    pipeline_cls = type("FakeCfgParallelPipeline", (), {})
+    pipeline = pipeline_cls()
+    pipeline.transformer = Mock()
+    backend = CacheDiTBackend(DiffusionCacheConfig())
+    with (
+        patch.dict(cd_backend.backend.CUSTOM_DIT_ENABLERS, {pipeline_cls.__name__: lambda *_: Mock()}),
+        _cfg_parallel(cfg_world_size),
+    ):
+        backend.enable(pipeline)
+    assert pipeline._cache_dit_one_call_per_cfg_rank is expected
+
+    backend.disable(pipeline)
+    assert pipeline._cache_dit_one_call_per_cfg_rank is False
+
+
 @pytest.mark.parametrize("has_transformer_2", [False, True])
 @patch("vllm_omni.diffusion.cache.cachedit.model_specific.BlockAdapter")
 @patch("vllm_omni.diffusion.cache.cachedit.model_specific.cache_dit")
@@ -255,6 +363,82 @@ def test_wan22_custom_enabler_passes_taylorseer_calibrator(
     adapter_kwargs = mock_block_adapter.call_args.kwargs
     for modifier in adapter_kwargs["params_modifiers"]:
         assert modifier._context_kwargs["calibrator_config"] is calibrator_config
+
+
+@patch("vllm_omni.diffusion.cache.cachedit.backend.cache_dit")
+@patch("vllm_omni.diffusion.cache.cachedit.model_specific.BlockAdapter")
+@patch("vllm_omni.diffusion.cache.cachedit.model_specific.cache_dit")
+def test_wan22_custom_enabler_low_noise_expert_only(mock_cache_dit, mock_block_adapter, mock_backend_cache_dit):
+    """boundary_ratio=1.0 loads only transformer_2; cache and refresh must target it."""
+    transformer_2 = Mock()
+    transformer_2.blocks = [Mock()]
+    pipeline = SimpleNamespace(transformer=None, transformer_2=transformer_2)
+
+    refresh = cd_model_specific.enable_cache_for_wan22(pipeline, SAMPLE_CACHE_CONFIG)
+
+    mock_cache_dit.enable_cache.assert_called_once()
+    adapter_kwargs = mock_block_adapter.call_args.kwargs
+    assert adapter_kwargs["transformer"] is transformer_2
+    assert adapter_kwargs["blocks"] == [transformer_2.blocks]
+
+    refresh(pipeline, 40, False)
+    mock_backend_cache_dit.refresh_context.assert_called_once()
+    assert mock_backend_cache_dit.refresh_context.call_args.args[0] is transformer_2
+    assert mock_backend_cache_dit.refresh_context.call_args.kwargs["num_inference_steps"] == 40
+
+    # forward()'s per-schedule refresh must hit the same expert.
+    mock_backend_cache_dit.refresh_context.reset_mock()
+    pipeline._cache_dit_refresh_for_schedule(pipeline, torch.arange(30), None, False)
+    mock_backend_cache_dit.refresh_context.assert_called_once()
+    assert mock_backend_cache_dit.refresh_context.call_args.args[0] is transformer_2
+    assert mock_backend_cache_dit.refresh_context.call_args.kwargs["num_inference_steps"] == 30
+
+
+def test_wan22_custom_enabler_without_any_transformer_raises():
+    pipeline = SimpleNamespace(transformer=None, transformer_2=None)
+
+    with pytest.raises(ValueError, match="no loaded transformer"):
+        cd_model_specific.enable_cache_for_wan22(pipeline, SAMPLE_CACHE_CONFIG)
+
+
+@pytest.mark.parametrize(
+    ("engine_boundary", "request_boundary", "expected_boundary"),
+    [
+        (None, None, 0.875),  # omitted everywhere: default 0.875
+        (None, 0.9, 0.9),  # request override when the engine has none
+        (0.875, 0.9, 0.875),  # engine override wins over the request
+    ],
+)
+def test_resolve_wan_boundary_ratio(engine_boundary, request_boundary, expected_boundary):
+    from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import resolve_wan_boundary_ratio
+
+    sampling_params = SimpleNamespace(boundary_ratio=request_boundary)
+    assert resolve_wan_boundary_ratio(engine_boundary, sampling_params) == expected_boundary
+
+
+@pytest.mark.parametrize("boundary_ratio", [None, 0.875])
+def test_wan22_step_split_matches_shifted_denoise_schedule(boundary_ratio):
+    """The per-expert Cache-DiT step counts must follow the schedule forward() runs.
+
+    forward() applies the flow shift in set_timesteps and falls back to boundary
+    0.875 when the server pins none; an unshifted probe or a missing fallback
+    sizes the experts' contexts for the wrong number of steps.
+    """
+    pipeline = SimpleNamespace(
+        boundary_ratio=boundary_ratio,
+        scheduler=build_wan_scheduler("unipc", 5.0),
+        transformer=torch.nn.Linear(1, 1),
+        _sample_solver="unipc",
+        _flow_shift=5.0,
+    )
+
+    num_high_noise_steps, num_low_noise_steps = cd_model_specific._split_wan22_inference_steps(pipeline, 40)
+
+    reference = build_wan_scheduler("unipc", 5.0)
+    reference.set_timesteps(40, device="cpu", shift=5.0)
+    expected_high_noise_steps = int((reference.timesteps >= 0.875 * 1000).sum())
+    assert (num_high_noise_steps, num_low_noise_steps) == (expected_high_noise_steps, 40 - expected_high_noise_steps)
+    assert num_low_noise_steps > 0
 
 
 @patch("vllm_omni.diffusion.cache.cachedit.backend.BlockAdapter")
@@ -451,3 +635,58 @@ def test_mammothmoda2_cache_dit_runs_end_to_end_on_tiny_model(init_fake_tp_group
 
     assert latents.shape == (1, 4, 8, 8)
     assert torch.isfinite(latents).all()
+
+
+def _taylorseer_warning_logged(caplog) -> bool:
+    return any(
+        "validated cache window" in record.getMessage()
+        for record in caplog.records
+        if record.levelno >= logging.WARNING
+    )
+
+
+def test_taylorseer_order_two_long_window_warns(caplog):
+    config = cd_backend.CacheDiTConfig(
+        enable_taylorseer=True,
+        taylorseer_order=2,
+        max_continuous_cached_steps=VALIDATED_TAYLORSEER_MAX_CONTINUOUS_CACHED_STEPS + 2,
+    )
+    with caplog.at_level("WARNING"):
+        calibrator = config.to_calibrator_config()
+
+    assert calibrator is not None
+    assert _taylorseer_warning_logged(caplog)
+
+
+def test_taylorseer_order_two_validated_window_does_not_warn(caplog):
+    config = cd_backend.CacheDiTConfig(
+        enable_taylorseer=True,
+        taylorseer_order=2,
+        max_continuous_cached_steps=VALIDATED_TAYLORSEER_MAX_CONTINUOUS_CACHED_STEPS,
+    )
+    with caplog.at_level("WARNING"):
+        calibrator = config.to_calibrator_config()
+
+    assert calibrator is not None
+    assert not _taylorseer_warning_logged(caplog)
+
+
+def test_taylorseer_order_above_two_warns_without_validated_window(caplog):
+    config = cd_backend.CacheDiTConfig(
+        enable_taylorseer=True,
+        taylorseer_order=3,
+        max_continuous_cached_steps=VALIDATED_TAYLORSEER_MAX_CONTINUOUS_CACHED_STEPS,
+    )
+    with caplog.at_level("WARNING"):
+        calibrator = config.to_calibrator_config()
+
+    assert calibrator is not None
+    assert _taylorseer_warning_logged(caplog)
+
+
+def test_taylorseer_order_one_does_not_warn(caplog):
+    config = cd_backend.CacheDiTConfig(enable_taylorseer=True, taylorseer_order=1)
+    with caplog.at_level("WARNING"):
+        config.to_calibrator_config()
+
+    assert not _taylorseer_warning_logged(caplog)

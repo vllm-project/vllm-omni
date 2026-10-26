@@ -372,7 +372,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             outer_max_bsz = int(vllm_config.scheduler_config.max_num_seqs)
             outer_buckets = {
                 int(size)
-                for size in vllm_config.compilation_config.cudagraph_capture_sizes
+                for size in (vllm_config.compilation_config.cudagraph_capture_sizes or [])
                 if 0 < int(size) <= outer_max_bsz
             }
             outer_buckets.update({1, outer_max_bsz})  # eager fallback rows

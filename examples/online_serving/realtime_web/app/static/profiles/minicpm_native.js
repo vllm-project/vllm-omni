@@ -8,6 +8,8 @@
     waiting: 'Listening', camera: true, playbackAck: true, clientCommit: false,
     halfDuplex: false, closeSession: true, reconnectEachTurn: false,
     readyEvent: 'session.updated', instructions: true, sendIntervalMs: 200,
+    // One 1 s model unit at 16 kHz; mute pads the open unit to this boundary.
+    inputUnitSamples: 16000, cameraJpegQuality: 0.95,
     presets: {
       omni: 'Streaming Omni Conversation.',
       chinese_call: '扮演一个具有以上声音特征的助手。请认真、高质量地回复用户的问题。'
@@ -36,6 +38,9 @@
       const event = { type: 'input_audio_buffer.append', audio, format: 'pcm16', sample_rate_hz: 16000 };
       if (frame) event.video_frames = [frame];
       return event;
+    },
+    videoOnlyMessages(frame) {
+      return [{ type: 'input_audio_buffer.append', video_frames: [frame] }];
     },
     commitMessages: () => [],
     ack(responseId, playedMs) {

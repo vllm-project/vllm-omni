@@ -366,6 +366,46 @@ def test_move_moe_lora_buffers_keeps_all_stacks_and_views_on_device():
     ]
 
 
+def test_lora_manager_homes_lora_buffers_to_compute_device_without_dlo(monkeypatch):
+    # Non-DLO deployments used to leave `_resident_lora_device` unset, so
+    # buffers created while the base weights were offloaded stayed on CPU
+    # after wake, and rank-growth reinit re-stranded them (#8817).
+    import vllm_omni.diffusion.lora.manager as manager_mod
+
+    class _LoRALayer(DummyBaseLayerWithLoRA):
+        lora_buffer_device = None
+
+        def _set_diffusion_lora_buffer_device(self, device):
+            self.lora_buffer_device = device
+            self._diffusion_lora_buffer_device = device
+
+    monkeypatch.setattr(manager_mod, "BaseLayerWithLoRA", _LoRALayer)
+    monkeypatch.setattr(
+        manager_mod,
+        "from_layer_diffusion",
+        lambda *, layer, **_kwargs: _LoRALayer(layer),
+    )
+
+    pipeline = torch.nn.Module()
+    pipeline.transformer = torch.nn.Module()
+    pipeline.transformer.foo = _FakeLinearBase()
+    compute = torch.device("meta")
+    manager = DiffusionLoRAManager(
+        pipeline=pipeline,
+        device=compute,
+        dtype=torch.bfloat16,
+    )
+
+    manager._replace_layers_with_lora(type("_PH", (), {"r": 1})())
+
+    layer = pipeline.transformer.foo
+    assert layer.lora_buffer_device == compute
+    # The recorded device is what create_lora_weights consults when a later
+    # rank increase re-allocates the buffers, so the second exposure from
+    # #8817 is pinned by this attribute as well.
+    assert layer._diffusion_lora_buffer_device == compute
+
+
 def test_lora_manager_replaces_packed_layer_when_targeting_sublayers(monkeypatch):
     import vllm_omni.diffusion.lora.manager as manager_mod
 
