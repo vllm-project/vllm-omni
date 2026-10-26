@@ -31,10 +31,11 @@ complete ``[seq, 5120]`` hidden state.
 from __future__ import annotations
 
 import itertools
+import os
 import re
 from collections.abc import Iterable
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn as nn
@@ -48,6 +49,9 @@ from vllm_omni.diffusion.offloader.module_residency import (
     BoundedAllocatorCache,
     PinnedModuleStager,
 )
+
+if TYPE_CHECKING:
+    from .vision_parallel import VisionAllToAll
 
 MINIMAX_H3_QWEN3VL_SELECTED_LM_LAYER = 50
 MINIMAX_H3_QWEN3VL_HIDDEN_DIM = 5120
@@ -629,14 +633,20 @@ class MiniMaxH3Qwen3VLVisionBlock(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        cu_seqlens: torch.Tensor,
+        cu_seqlens: torch.Tensor | None,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        sequence_parallel: VisionAllToAll | None = None,
     ) -> torch.Tensor:
-        hidden_states = hidden_states + self.attn(
-            self.norm1(hidden_states),
-            cu_seqlens=cu_seqlens,
-            position_embeddings=position_embeddings,
-        )
+        normalized = self.norm1(hidden_states)
+        if sequence_parallel is None:
+            output = self.attn(normalized, cu_seqlens=cu_seqlens, position_embeddings=position_embeddings)
+        else:
+            from .vision_sp import attention_sp8
+
+            output = attention_sp8(
+                self.attn, normalized, position_embeddings, sequence_parallel, _apply_rotary_pos_emb_vision
+            )
+        hidden_states = hidden_states + output
         hidden_states = hidden_states + self.mlp(self.norm2(hidden_states))
         return hidden_states
 
@@ -753,6 +763,11 @@ class MiniMaxH3Qwen3VLVisionModel(nn.Module):
         hidden_states: torch.Tensor,
         grid_thw: torch.Tensor,
     ) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        group = getattr(self, "sequence_parallel_group", None)
+        if group is not None:
+            from .vision_sp import forward_sp8
+
+            return forward_sp8(self, hidden_states, grid_thw, group=group)
         hidden_states = self.patch_embed(hidden_states)
         pos_embeds = self.fast_pos_embed_interpolate(grid_thw)
         hidden_states = hidden_states + pos_embeds
@@ -1184,6 +1199,11 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
         _validate_encoder_quant_config(quant_config)
         dtype = torch.bfloat16
         self.vision = MiniMaxH3Qwen3VLVisionModel(config.vision_config)
+        from .vision_parallel import resolve_vision_sp_group
+
+        self.vision.sequence_parallel_group = resolve_vision_sp_group(
+            os.environ.get("VLLM_OMNI_H3_VISION_SP_SIZE", "0"), encoder_group
+        )
         self.vision.to(dtype=dtype)
         self.text_model = MiniMaxH3Qwen3VLTextModel(
             encoder_group,
@@ -1195,9 +1215,10 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
         if not isinstance(quant_config, FastH3NVFP4Config):
             self.text_model.to(dtype=dtype)
         logger.info(
-            "MiniMax H3 Qwen3-VL encoder: %d retained decoder layers, text_encoder_tp_size=%d, vision replicated",
+            "MiniMax H3 Qwen3-VL encoder: %d retained decoder layers, text_encoder_tp_size=%d, vision_sp=%s",
             MINIMAX_H3_QWEN3VL_SELECTED_LM_LAYER,
             self._tp_size,
+            os.environ.get("VLLM_OMNI_H3_VISION_SP_SIZE", "0"),
         )
 
     @property
