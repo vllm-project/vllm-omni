@@ -1828,9 +1828,13 @@ class DiffusionEngine:
 
     def _dummy_run(self):
         """A dummy run to warm up the model."""
+        # A backend compiled at static shapes serves the size it warmed up at; the stage's
+        # ``additional_config`` names that size (``diffusion_warmup_height`` / ``_width``), the
+        # historical 512x512 otherwise.
+        additional_config = getattr(self.od_config, "additional_config", {}) or {}
         req = self._make_dummy_request(
-            height=512,
-            width=512,
+            height=int(additional_config.get("diffusion_warmup_height", 512)),
+            width=int(additional_config.get("diffusion_warmup_width", 512)),
             guidance_scale=0.0,
             # Dummy warmup must exercise at least one denoising iteration in
             # every execution mode. Some pipelines (for example BAGEL) perform
