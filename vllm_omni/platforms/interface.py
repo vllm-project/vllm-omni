@@ -185,6 +185,14 @@ class OmniPlatform(Platform):
         raise NotImplementedError
 
     @classmethod
+    def get_torch_compile_kwargs(cls, od_config: Any) -> dict[str, Any]:
+        """Keyword arguments the platform adds to ``torch.compile`` for diffusion transformers:
+        its ``backend`` (a registered name or a backend object) and, for a backend that compiles
+        static shapes, ``dynamic``. The default is inductor at the configured dynamism, i.e. nothing
+        added; a user's ``diffusion_compile_backend`` overrides the platform's backend."""
+        return {}
+
+    @classmethod
     def supports_talker_mtp_graph_capture(cls) -> bool:
         """Whether a model may capture its dedicated talker MTP graph."""
         return True

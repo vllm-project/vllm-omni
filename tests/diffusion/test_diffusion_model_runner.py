@@ -312,15 +312,53 @@ def _make_compile_runner(
     compile_granularity: str = "regional",
     compile_dynamic: bool = True,
     use_hsdp: bool = False,
+    compile_backend: str | None = None,
 ):
     runner = object.__new__(DiffusionModelRunner)
     runner.pipeline = SimpleNamespace(transformer=model or SimpleNamespace())
     runner.od_config = SimpleNamespace(
         diffusion_compile_granularity=compile_granularity,
         diffusion_compile_dynamic=compile_dynamic,
+        diffusion_compile_backend=compile_backend,
         parallel_config=SimpleNamespace(use_hsdp=use_hsdp),
     )
     return runner
+
+
+class _PlatformWithCompileBackend:
+    """An out-of-tree platform whose transformers compile with its own static-shape backend."""
+
+    backend = object()
+
+    @classmethod
+    def get_torch_compile_kwargs(cls, od_config):
+        return {"backend": cls.backend, "dynamic": False}
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_compile_transformer_takes_the_platforms_backend_and_dynamism(monkeypatch):
+    runner = _make_compile_runner(compile_granularity="full")
+    compile_calls = []
+    runner.pipeline.transformer = SimpleNamespace(compile=lambda **kwargs: compile_calls.append(kwargs))
+    monkeypatch.setattr(model_runner_module, "current_omni_platform", _PlatformWithCompileBackend)
+
+    DiffusionModelRunner._compile_transformer(runner, "transformer")
+
+    assert compile_calls == [{"dynamic": False, "backend": _PlatformWithCompileBackend.backend}]
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_compile_transformer_lets_the_config_name_the_backend(monkeypatch):
+    runner = _make_compile_runner(compile_granularity="full", compile_backend="inductor")
+    compile_calls = []
+    runner.pipeline.transformer = SimpleNamespace(compile=lambda **kwargs: compile_calls.append(kwargs))
+    monkeypatch.setattr(model_runner_module, "current_omni_platform", _PlatformWithCompileBackend)
+
+    DiffusionModelRunner._compile_transformer(runner, "transformer")
+
+    assert compile_calls == [{"dynamic": False, "backend": "inductor"}]
 
 
 class _EnabledCacheBackend:

@@ -1026,6 +1026,10 @@ class OmniDiffusionConfig:
     # provide its own setup_compile() implementation.
     diffusion_compile_granularity: str = "regional"
     diffusion_compile_dynamic: bool = True
+    # The torch.compile backend for the diffusion transformers: a registered backend name
+    # ("inductor", or a name a plugin registered). None lets the platform choose (inductor, or an
+    # out-of-tree platform's own backend; see OmniPlatform.get_torch_compile_kwargs).
+    diffusion_compile_backend: str | None = None
 
     # Parallel weight loading (for faster diffusion model startup)
     enable_multithread_weight_load: bool = True
@@ -1287,6 +1291,10 @@ class OmniDiffusionConfig:
             )
         if not isinstance(self.diffusion_compile_dynamic, bool):
             raise TypeError(f"diffusion_compile_dynamic must be a bool, got {type(self.diffusion_compile_dynamic)!r}")
+        if self.diffusion_compile_backend is not None and (
+            not isinstance(self.diffusion_compile_backend, str) or not self.diffusion_compile_backend
+        ):
+            raise TypeError("diffusion_compile_backend must be None or a non-empty backend name")
         self.diffusion_kv_mode = parse_diffusion_kv_cache_mode(self.diffusion_kv_mode)
         if not isinstance(self.enable_prefix_caching, bool):
             raise TypeError("enable_prefix_caching must be a bool")

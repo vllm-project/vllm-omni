@@ -267,6 +267,11 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
             return
 
         compile_kwargs: dict[str, Any] = {"dynamic": self.od_config.diffusion_compile_dynamic}
+        # The platform's backend and dynamism (an out-of-tree platform compiles with its own
+        # backend; inductor adds nothing), then the user's explicit backend name on top.
+        compile_kwargs.update(current_omni_platform.get_torch_compile_kwargs(self.od_config))
+        if self.od_config.diffusion_compile_backend is not None:
+            compile_kwargs["backend"] = self.od_config.diffusion_compile_backend
         if getattr(model, "enable_cuda_graph_decode", False):
             # Decode-graph models still compile their blocks: graph capture
             # records the compiled (fused) kernels. Scope inductor cudagraphs
