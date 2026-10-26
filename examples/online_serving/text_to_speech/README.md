@@ -777,6 +777,8 @@ python speech_client.py --text "Hello, how are you?" --seed 42
 
 The client supports `--api-base`, `--model`, `--text`, `--response-format`, `--language`, `--voice`, `--ref-audio`, `--ref-text`, `--instructions`, `--seed`, and `--output`.
 
+CUDA graph capture is on and TF32 matmuls are off by default. Set `enable_cuda_graph` or `enable_tf32` in `additional_config.omnivoice_runtime` to change them, for example `--stage-overrides '{"0": {"additional_config": {"omnivoice_runtime": {"enable_cuda_graph": false}}}}'`. The `OMNIVOICE_CUDA_GRAPH` and `OMNIVOICE_TF32` environment variables still work but are deprecated.
+
 ### Reference audio and output processing
 
 The explicit `--ref-text` path avoids Whisper. With the default config, missing `ref_text` loads `openai/whisper-large-v3-turbo` on the worker device during the first request that needs transcription. Set `load_asr_on_startup: true` in `additional_config.omnivoice_asr` to move that load to worker startup. Set `asr_device` in the same block to choose another GPU or the CPU.

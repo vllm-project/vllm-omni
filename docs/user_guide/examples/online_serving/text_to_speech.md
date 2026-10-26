@@ -487,6 +487,10 @@ The client supports `--api-base`, `--model`, `--text`, `--response-format`,
   `openai/whisper-large-v3-turbo` on the worker device, which adds latency and
   device memory use. Set `additional_config.omnivoice_asr.load_asr_on_startup` to
   `true` to move that load to worker startup. Generated audio is mono at 24 kHz.
+- CUDA graph capture is on and TF32 matmuls are off by default. Set
+  `enable_cuda_graph` or `enable_tf32` in `additional_config.omnivoice_runtime`
+  to change them. The `OMNIVOICE_CUDA_GRAPH` and `OMNIVOICE_TF32` environment
+  variables still work but are deprecated.
 
 ### Reference audio and output processing
 

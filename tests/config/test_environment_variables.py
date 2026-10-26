@@ -178,11 +178,11 @@ def test_inventory_matches_reviewed_snapshot_counts():
         if item.category is EnvironmentVariableCategory.MODEL_SPECIFIC
     )
     assert {disposition: disposition_counts[disposition] for disposition in ModelEnvironmentVariableDisposition} == {
-        ModelEnvironmentVariableDisposition.PROMOTE: 69,
+        ModelEnvironmentVariableDisposition.PROMOTE: 67,
         ModelEnvironmentVariableDisposition.REQUEST_SCOPE: 5,
         ModelEnvironmentVariableDisposition.EXTERNAL: 0,
         ModelEnvironmentVariableDisposition.INTERNALIZE: 16,
-        ModelEnvironmentVariableDisposition.DEPRECATE_REMOVE: 7,
+        ModelEnvironmentVariableDisposition.DEPRECATE_REMOVE: 9,
     }
 
 
