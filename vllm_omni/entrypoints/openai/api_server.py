@@ -151,7 +151,7 @@ from vllm_omni.entrypoints.openai.images.helpers import (
     _supports_segmentation,
     _update_if_not_none,
 )
-from vllm_omni.entrypoints.openai.lora import _get_lora_from_json_str, _parse_lora_request
+from vllm_omni.entrypoints.openai.lora import _get_lora_from_json_str, _lora_form_dict, _parse_lora_request
 from vllm_omni.entrypoints.openai.models import serving as openai_models_serving
 from vllm_omni.entrypoints.openai.protocol.audio import (
     BatchSpeechRequest,
@@ -2527,7 +2527,8 @@ async def edit_images(
     seed: int | None = Form(None),
     generator_device: str | None = Form(None),
     # vllm-omni extension for per-request LoRA.
-    lora: str | None = Form(None),  # Json string
+    lora: str | None = Form(None),  # Json string, or the name of a preloaded adapter
+    lora_strength: float | None = Form(None),  # the adapter's scale
     # vllm-omni extension for layered models (e.g., Qwen-Image-Layered)
     layers: int | None = Form(None),
     resolution: int | None = Form(None),  # See SUPPORTED_LAYERED_RESOLUTIONS
@@ -2633,8 +2634,8 @@ async def edit_images(
         )
         _update_if_not_none(gen_params, "num_outputs_per_prompt", n)
         # 3.1 Parse per-request LoRA (compatible with chat's extra_body.lora shape).
-        lora_dict = _get_lora_from_json_str(lora)
-        lora_request, lora_scale = _parse_lora_request(lora_dict)
+        lora_dict = _lora_form_dict(lora, lora_strength)
+        lora_request, lora_scale = _parse_lora_request(lora_dict) if lora_dict is not None else (None, None)
         _update_if_not_none(gen_params, "lora_request", lora_request)
         _update_if_not_none(gen_params, "lora_scale", lora_scale)
         # 3.2 Validate resolution if provided
@@ -2769,9 +2770,9 @@ async def edit_images(
                 extra_body["layers"] = layers
             if resolution is not None:
                 extra_body["resolution"] = resolution
-            if lora is not None:
+            lora_dict = _lora_form_dict(lora, lora_strength)
+            if lora_dict is not None:
                 # Validate LoRA, then pass through.
-                lora_dict = _get_lora_from_json_str(lora)
                 _parse_lora_request(lora_dict)
                 extra_body["lora"] = lora_dict
             if bot_task is not None:

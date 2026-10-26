@@ -112,11 +112,13 @@ def parse_lora_request(lora_body: Any) -> tuple[LoRARequest | None, float | None
     lora_int_id = lora_body.get("int_id")
     if lora_int_id is None:
         lora_int_id = lora_body.get("lora_int_id")
-    if lora_int_id is None and lora_path:
+    if not lora_name:
+        raise ValueError("Invalid lora object: a name is required.")
+    if not lora_path:
+        # An adapter the server preloaded is named without a path; the name stands for it.
+        lora_path = lora_name
+    if lora_int_id is None:
         lora_int_id = stable_lora_int_id(str(lora_path))
-
-    if not lora_name or not lora_path:
-        raise ValueError("Invalid lora object: both name and path are required.")
 
     scale = float(lora_scale) if lora_scale is not None else None
     return LoRARequest(str(lora_name), int(lora_int_id), str(lora_path)), scale
