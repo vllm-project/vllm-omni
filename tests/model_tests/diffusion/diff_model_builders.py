@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import json
 from functools import partial
 from pathlib import Path
@@ -48,6 +51,18 @@ def tiny_flux2_klein_builder() -> str:
 def tiny_ltx2_builder() -> str:
     """Build a tiny LTX2 model from vendored configs."""
     return build_tiny_from_configs("LTX2Pipeline", "Lightricks/LTX-2", TINY_CONFIGS_DIR / "LTX2Pipeline")
+
+
+def tiny_ltx2_audio_builder() -> str:
+    """Build the shared tiny LTX checkpoint used by the audio-only runtime."""
+    model_dir = build_tiny_from_configs(
+        "LTX2TextToAudioPipeline", "Lightricks/LTX-2", TINY_CONFIGS_DIR / "LTX2Pipeline"
+    )
+    index_path = Path(model_dir) / "model_index.json"
+    index = json.loads(index_path.read_text())
+    index["_class_name"] = "LTX2TextToAudioPipeline"
+    index_path.write_text(json.dumps(index, indent=2))
+    return model_dir
 
 
 def _build_tiny_sana_video(pipeline_name: str) -> str:

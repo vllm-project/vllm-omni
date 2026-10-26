@@ -11,6 +11,7 @@ import os
 import time
 from collections import deque
 from collections.abc import Callable
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
@@ -22,7 +23,17 @@ from vllm_omni.distributed.omni_connectors.model_runner.omni_connector_runtime i
     logger,
     should_accumulate_full_payload_output,
 )
-from vllm_omni.outputs import OmniConnectorOutput
+from vllm_omni.outputs import OmniConnectorOutput, SchedulingMetadataUpdate
+from vllm_omni.worker.scheduling_metadata_adapter import DefaultSchedulingMetadataAdapter
+
+
+def _is_full_payload_row_tensor(key: str, value: Any) -> bool:
+    # MiniCPM's validity mask has one entry per codec row. Unlike scalar
+    # status metadata, it must grow with codes.audio, including invalid/EOS
+    # rows, so the consumer can filter the accumulated utterance correctly.
+    return isinstance(value, torch.Tensor) and (
+        value.dim() >= 2 or (key == "meta.codec_frame_valid" and value.dim() == 1)
+    )
 
 
 # No-progress recheck for connectors without a change notification (SHM polls).
@@ -68,47 +79,29 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         """Remove and return a stage payload (consume after use)."""
         return cast(OmniPayload | None, self._local_stage_payload_cache.pop(req_id, None))
 
-    def put_local_request_metadata(self, req_id: str, metadata: dict[str, Any]) -> None:
-        """Store lightweight scheduling metadata for a request."""
-        self._local_request_metadata[req_id] = metadata
-
-    def get_local_request_metadata(self, req_id: str) -> dict[str, Any] | None:
-        """Retrieve scheduling metadata for a request."""
+    def get_local_request_metadata(self, req_id: str) -> SchedulingMetadataUpdate | None:
+        """Retrieve the pending scheduler-visible update for a request."""
         return self._local_request_metadata.get(req_id)
+
+    def _extract_scheduling_metadata_update(
+        self, payload: dict[str, Any] | OmniPayload
+    ) -> SchedulingMetadataUpdate | None:
+        # Native async receive keeps the built-in interpretation. Configured
+        # adapters remain scoped to the full-payload receive transaction.
+        adapter = DefaultSchedulingMetadataAdapter() if self._async_chunk else self._scheduling_metadata_adapter
+        update = adapter.extract(cast(OmniPayload, payload), model_mode=self._model_mode)
+        if update is not None and not isinstance(update, SchedulingMetadataUpdate):
+            raise TypeError(
+                "scheduling_metadata_adapter.extract must return None or "
+                f"SchedulingMetadataUpdate, got {type(update).__name__}"
+            )
+        if self._payload_finished(payload):
+            update = replace(update or SchedulingMetadataUpdate(), input_terminal=True)
+        return update
 
     # ------------------------------------------------------------------ #
     #  Scheduling metadata extraction
     # ------------------------------------------------------------------ #
-
-    @classmethod
-    def _extract_scheduling_metadata(cls, payload: dict[str, Any] | OmniPayload) -> dict[str, Any]:
-        """Extract only the fields the scheduler needs from a full payload."""
-        extracted: dict[str, Any] = {}
-        meta = payload.get("meta") if isinstance(payload, dict) else None
-        meta = meta if isinstance(meta, dict) else {}
-        if "next_stage_prompt_len" in meta:
-            extracted["next_stage_prompt_len"] = meta["next_stage_prompt_len"]
-        else:
-            legacy_prompt_len = cast(dict[str, Any], payload).get("next_stage_prompt_len")
-            if legacy_prompt_len is not None:
-                logger.warning_once(
-                    "legacy flat 'next_stage_prompt_len' key in payload; expected 'meta.next_stage_prompt_len'"
-                )
-                extracted["next_stage_prompt_len"] = legacy_prompt_len
-
-        audio_codes = cls._payload_audio_codes(payload)
-        if audio_codes is not None:
-            extracted["code_predictor_codes"] = audio_codes
-
-        if "left_context_size" in meta:
-            extracted["left_context_size"] = meta["left_context_size"]
-        elif "left_context_size" in payload:
-            logger.warning_once("legacy flat 'left_context_size' key in payload; expected 'meta.left_context_size'")
-
-        if cls._payload_finished(payload):
-            extracted["input_terminal"] = True
-
-        return extracted
 
     _NON_CONSUMABLE_PAYLOAD_KEYS: set[tuple[str, str]] = {
         ("meta", "finished"),
@@ -344,7 +337,7 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         for req_id, payload in staged_payloads.items():
             self._local_stage_payload_cache[req_id] = self._snapshot_payload(payload)
 
-    def _collect_full_payload_results_locked(self) -> dict[str, Any] | None:
+    def _snapshot_full_payload_results_locked(self) -> dict[str, Any] | None:
         if not self._full_payload_pending_broadcast_req_ids:
             return None
         results: dict[str, Any] = {}
@@ -355,10 +348,11 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
                 missing_req_ids.append(req_id)
                 continue
             results[req_id] = self._snapshot_payload(payload)
-            self._full_payload_pending_broadcast_req_ids.discard(req_id)
+            # The caller clears this marker only after metadata extraction
+            # validates, so an adapter failure leaves the receive retryable.
         if missing_req_ids:
             logger.warning(
-                "[Stage-%s] _collect_full_payload_results_locked: "
+                "[Stage-%s] _snapshot_full_payload_results_locked: "
                 "pending full-payload reqs missing from local cache: %s",
                 self._stage_id,
                 missing_req_ids,
@@ -503,18 +497,28 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
             tp_group is None or getattr(tp_group, "world_size", 1) <= 1
         ) and not self._full_payload_pending_broadcast_req_ids:
             return None
+        is_data_transfer_rank = self.is_data_transfer_rank()
         with self._lock:
-            results = self._collect_full_payload_results_locked() if self.is_data_transfer_rank() else None
+            results = self._snapshot_full_payload_results_locked() if is_data_transfer_rank else None
         results = self._broadcast_tp_payload_packet(results)
         if not results:
             return None
+
+        # Validate every update before committing any one-shot readiness state.
+        request_metadata: dict[str, SchedulingMetadataUpdate] = {}
+        for req_id, payload in results.items():
+            update = self._extract_scheduling_metadata_update(payload)
+            if update is not None:
+                request_metadata[req_id] = update
+
         with self._lock:
-            self._stage_recv_req_ids.update(results.keys())
+            self._apply_staged_payloads_locked(results)
+            self._local_request_metadata.update(request_metadata)
+            self._stage_recv_req_ids.update(results)
+            if is_data_transfer_rank:
+                self._full_payload_pending_broadcast_req_ids.difference_update(results)
             for req_id in results:
                 self._pending_load_reqs.pop(req_id, None)
-            self._apply_staged_payloads_locked(results)
-            for req_id, payload in results.items():
-                self._local_request_metadata[req_id] = self._extract_scheduling_metadata(payload)
         logger.debug(
             "[Stage-%s] recv_full_payload_inputs: consumed %s reqs: %s, stage_recv_req_ids now=%s",
             self._stage_id,
@@ -578,7 +582,7 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         latest: dict[str, Any] = {}
         rows: dict[str, int] = {}
         for k, v in output.items():
-            if isinstance(v, torch.Tensor) and v.dim() >= 2:
+            if _is_full_payload_row_tensor(k, v):
                 chunks[k] = [v]
                 rows[k] = int(v.shape[0])
             else:
@@ -656,9 +660,9 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
     ) -> None:
         """Accumulate pooler_output for a request across steps (full_payload_mode).
 
-        Per-token tensors (2-D+, matching trailing dims) are concatenated
-        along dim-0.  Scalar / global tensors (1-D or 0-D) are replaced
-        with the latest value.
+        Per-token tensors (2-D+, matching trailing dims) and the 1-D codec
+        validity mask are concatenated along dim-0. Scalar / global tensors
+        are replaced with the latest value.
 
         Note: codec rows are NOT filtered for zero placeholders here. The
         downstream consumer ``_extract_qwen3_full_payload_codec_rows`` crops
@@ -691,7 +695,7 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
                 # prior chunks (e.g. `model_outputs` carries the full result
                 # so far, not an appendable per-step delta).
                 latest.pop(k, None)
-                if isinstance(v, torch.Tensor) and v.dim() >= 2:
+                if _is_full_payload_row_tensor(k, v):
                     chunks[k] = [v]
                     rows[k] = int(v.shape[0])
                 else:
@@ -699,7 +703,7 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
                     rows.pop(k, None)
                     latest[k] = v
                 continue
-            if isinstance(v, torch.Tensor) and v.dim() >= 2:
+            if _is_full_payload_row_tensor(k, v):
                 if k in chunks and chunks[k] and v.shape[1:] == chunks[k][0].shape[1:]:
                     chunks[k].append(v)
                     rows[k] += int(v.shape[0])
@@ -1185,15 +1189,11 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
                 if not self._payload_value_has_content(new_ids) and not is_finished:
                     return False
                 payload_consumable = self._payload_is_consumable(payload_data)
-                first_chunk_hook = getattr(self, "_first_chunk_hook", None)
-                if first_chunk_hook is not None and chunk_id == 0 and not is_finished and payload_consumable:
-                    first_chunk_hook(req_id, request, payload_data)
 
             with self._lock:
                 if request is not None and req_id not in self._pending_load_reqs:
-                    # The first-chunk hook may have overlapped cancellation.
-                    # Its slot cleanup is ordered by the model; this payload
-                    # must not republish readiness after receive teardown.
+                    # Receive may overlap cancellation; do not republish
+                    # readiness after the request was torn down.
                     return False
                 if self._model_mode == "ar":
                     # Accumulation, staging, and model-side consume/ack share
@@ -1213,9 +1213,10 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
                     existing.update(payload_data)
                 else:
                     self._local_stage_payload_cache[req_id] = payload_data
-                staged_payload = self._local_stage_payload_cache[req_id]
                 self._async_chunk_updated_req_ids.add(req_id)
-                self.put_local_request_metadata(req_id, self._extract_scheduling_metadata(staged_payload))
+                update = self._extract_scheduling_metadata_update(self._local_stage_payload_cache[req_id])
+                if update is not None:
+                    self._local_request_metadata[req_id] = update
                 # A finish-only sentinel still needs one terminal wake-up so
                 # the downstream stage can sync the merged local payload and
                 # flush/finish even when the last recv carries no new
@@ -1431,6 +1432,7 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
                 self._put_req_chunk.pop(cleanup_req_id, None)
                 self._send_side_request_payload.pop(cleanup_req_id, None)
                 self._code_prompt_token_ids.pop(cleanup_req_id, None)
+                getattr(self, "_ming3_chunk_state", {}).pop(cleanup_req_id, None)
                 getattr(self, "_qwen3_tts_emitted_frames", {}).pop(cleanup_req_id, None)
                 self._cached_ic.pop(cleanup_req_id, None)
                 self._ramp_chunk_count.pop(cleanup_req_id, None)
@@ -1736,7 +1738,3 @@ class _OmniConnectorPayloadTransportMixin(_OmniConnectorRuntimeMixin):
         sink: Callable[[OmniConnectorOutput], None] | None,
     ) -> None:
         self._omni_connector_output_sink = sink
-
-    def set_first_chunk_hook(self, hook: Callable[[str, Any, OmniPayload], bool]) -> None:
-        """Claim eligible first chunks before publishing them to the model loop."""
-        self._first_chunk_hook = hook

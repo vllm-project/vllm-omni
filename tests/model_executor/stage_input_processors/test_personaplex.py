@@ -85,7 +85,8 @@ def test_async_chunk_keeps_delay_tail_across_resumable_segments() -> None:
 
 def test_post_sample_talker_mtp_uses_current_temporal_state() -> None:
     received: dict[str, torch.Tensor] = {}
-    recorded: list[tuple[str, torch.Tensor, torch.Tensor]] = []
+    forcing_requests: list[list[str]] = []
+    recorded: list[tuple[list[str], torch.Tensor, torch.Tensor]] = []
 
     def depformer(
         text_token: torch.Tensor,
@@ -100,17 +101,21 @@ def test_post_sample_talker_mtp_uses_current_temporal_state() -> None:
         received["audio_tokens"] = audio_tokens
         received["audio_provided"] = audio_provided
         received["num_steps"] = num_steps
-        return 100 + torch.arange(num_steps or 16, dtype=torch.long).reshape(1, -1)
+        return torch.arange(2 * (num_steps or 16), dtype=torch.long).reshape(2, -1)
+
+    def depformer_teacher_forcing(request_ids: list[str]) -> tuple[torch.Tensor, torch.Tensor]:
+        forcing_requests.append(list(request_ids))
+        tokens = torch.arange(32).reshape(2, 16)
+        return tokens, tokens > 0
 
     model = SimpleNamespace(
         _dtype=torch.float32,
         num_active_codebooks=8,
         depformer=depformer,
-        _depformer_teacher_forcing=PersonaPlexTalkerForConditionalGeneration._depformer_teacher_forcing,
         _duplex_stage0_runtime=lambda: SimpleNamespace(
-            prepared_depformer_state=lambda _request_id: None,
-            record_sample=lambda *, request_id, text_token, effective_codes: recorded.append(
-                (request_id, text_token.clone(), effective_codes.clone())
+            depformer_teacher_forcing=depformer_teacher_forcing,
+            record_samples=lambda *, request_ids, text_tokens, agent_codes: recorded.append(
+                (list(request_ids), text_tokens.clone(), agent_codes.clone())
             ),
         ),
     )
@@ -119,26 +124,20 @@ def test_post_sample_talker_mtp_uses_current_temporal_state() -> None:
 
     codes = method(
         model,
-        input_ids=torch.tensor([101]),
-        hidden_states=torch.arange(4, dtype=torch.float32).reshape(1, 4),
-        req_ids=["r1"],
-        req_infos=[
-            {
-                "duplex": {"data_plane": True},
-                "pplex_depformer_audio_tokens": torch.arange(16),
-                "pplex_depformer_audio_provided": torch.arange(16) > 0,
-            }
-        ],
+        input_ids=torch.tensor([101, 102]),
+        hidden_states=torch.arange(8, dtype=torch.float32).reshape(2, 4),
+        req_ids=["r1", "r2"],
+        req_infos=[{"duplex": {"data_plane": True}}, {"duplex": {"data_plane": True}}],
     )
 
     # Only the vocoded agent codebooks are drawn on the duplex path.
     assert received["num_steps"] == 8
-    assert codes.shape == (1, 8)
-    assert received["text_token"].tolist() == [101]
-    assert received["hidden"].shape == (1, 1, 4)
-    assert torch.equal(received["audio_tokens"], torch.arange(16).reshape(1, 16))
-    assert torch.equal(received["audio_provided"], (torch.arange(16) > 0).reshape(1, 16))
-    assert [(row[0], row[1].item()) for row in recorded] == [("r1", 101)]
-    # Teacher-forced agent codebooks (1..7 here) replace the sampled ones.
-    assert codes[0].tolist() == list(range(100, 108))
-    assert recorded[0][2].tolist() == [100, 1, 2, 3, 4, 5, 6, 7]
+    assert codes.shape == (2, 8)
+    assert received["text_token"].tolist() == [101, 102]
+    assert received["hidden"].shape == (2, 1, 4)
+    assert forcing_requests == [["r1", "r2"]]
+    assert torch.equal(received["audio_tokens"], torch.arange(32).reshape(2, 16))
+    assert torch.equal(received["audio_provided"], torch.arange(32).reshape(2, 16) > 0)
+    assert recorded[0][0] == ["r1", "r2"]
+    assert recorded[0][1].tolist() == [101, 102]
+    assert torch.equal(recorded[0][2], codes)

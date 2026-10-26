@@ -69,7 +69,11 @@ class TestPipelineWiring:
         # in ``from_config`` is out of scope for these cases.
         vae_cls = _gen_vae_class()
         monkeypatch.setattr(vae_cls, "from_config", classmethod(lambda cls, config: cls(**config)))
-        monkeypatch.setattr(pipeline_mod.Transformer2DModel, "from_config", staticmethod(lambda cfg: fake_transformer))
+        monkeypatch.setattr(
+            pipeline_mod.Transformer2DModel,
+            "from_config",
+            staticmethod(lambda cfg, **_kwargs: fake_transformer),
+        )
         monkeypatch.setattr(MammothModa2DiTPipeline, "_reinit_caption_embedder", lambda self, in_features: None)
         monkeypatch.setattr(
             pipeline_mod.RotaryPosEmbedReal, "get_freqs_real", staticmethod(lambda *args, **kwargs: None)

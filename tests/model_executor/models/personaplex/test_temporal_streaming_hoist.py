@@ -4,8 +4,8 @@
 position tables out of the per-layer loop.
 
 The frozen oracle below is a verbatim copy of the per-row (``[B]`` offsets,
-``active`` row mask) ``_apply_rope`` / ``_RingKV.complete`` / layer ``forward``
-/ stack ``step`` from ``main`` at commit 3bc3f1a7d, i.e. after #7670 and
+``active`` row mask) ``_apply_rope`` / ``_RingKV.complete`` / Mimi layer
+``forward`` / stack ``step`` from ``main`` at commit 3bc3f1a7d, i.e. after #7670 and
 #8192 and before the hoist. It is compared against the live module every
 run -- never against a pre-saved fixture, since ``cos``/``sin`` are not
 bit-portable across torch versions or hardware -- and must NOT be updated when
@@ -24,10 +24,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from vllm_omni.model_executor.models.personaplex.personaplex_depformer import _rms_norm_f32
 from vllm_omni.model_executor.models.personaplex.personaplex_mimi import _MimiStreamingTransformer
 from vllm_omni.model_executor.models.personaplex.personaplex_temporal import (
-    PersonaPlexTemporalStreaming,
     _apply_rope,
     _RingKV,
     _ringkv_positions,
@@ -77,15 +75,9 @@ class _LegacyRingKV:
         self.end_offset = torch.zeros(batch_size, device=device, dtype=torch.long)
         self.start_offset = torch.zeros(batch_size, device=device, dtype=torch.long)
 
-    def reset_slot(self, b: int) -> None:
-        self.start_offset[b] = self.end_offset[b]
-
     def reset_row(self, b: int) -> None:
         self.end_offset[b] = 0
         self.start_offset[b] = 0
-
-    def bump_slot_start(self, b: int) -> None:
-        self.start_offset[b] += 1
 
     def complete(self, k: torch.Tensor, v: torch.Tensor, active: torch.Tensor):
         B, H, T, D = k.shape
@@ -113,31 +105,6 @@ class _LegacyRingKV:
         below = positions < self.start_offset.view(-1, 1)
         positions = torch.where(below, torch.full_like(positions, -1), positions)
         return self.cache[0], self.cache[1], positions
-
-
-def _legacy_temporal_layer_forward(layer, x, kv: _LegacyRingKV, offset, context: int, active):
-    """Frozen ``_TemporalLayer.forward``, run on a REAL layer's weights so legacy
-    and new only ever differ by the hoist."""
-    B, T, _ = x.shape
-    h = _rms_norm_f32(x, layer.norm1_alpha, 1e-8)
-    qkv = F.linear(h, layer.in_proj_weight)
-    qkv = qkv.view(B, T, 3, layer.num_heads, layer.head_dim).permute(2, 0, 3, 1, 4)
-    q, k, v = qkv[0], qkv[1], qkv[2]
-    q, k = _legacy_apply_rope(q, k, offset)
-
-    keys, values, pos_k = kv.complete(k, v, active)
-    pos_k = pos_k.view(pos_k.shape[0], 1, pos_k.shape[1])
-    pos_q = offset.view(-1, 1, 1) + torch.arange(T, device=q.device, dtype=torch.long).view(1, -1, 1)
-    delta = pos_q - pos_k
-    attn_bias = (pos_k >= 0) & (delta >= 0) & (delta < context)
-    attn_bias = attn_bias.unsqueeze(1)
-    attn = F.scaled_dot_product_attention(q, keys, values, attn_bias, dropout_p=0.0)
-    attn = attn.transpose(1, 2).reshape(B, T, layer.dim)
-    x = x + F.linear(attn, layer.out_proj_weight)
-
-    h = _rms_norm_f32(x, layer.norm2_alpha, 1e-8)
-    a, b = F.linear(h, layer.gating_in).chunk(2, dim=-1)
-    return x + F.linear(F.silu(a) * b, layer.gating_out)
 
 
 def _legacy_mimi_layer_forward(layer, x, kv: _LegacyRingKV, offset, context: int, active):
@@ -221,7 +188,7 @@ def test_rope_tables_reused_across_layers_within_step():
 
 
 # ===========================================================================
-# 2. RingKV bit-exactness across ring wraps, with active masks and recycle
+# 2. RingKV bit-exactness across ring wraps, with active masks and row restart
 # ===========================================================================
 
 
@@ -263,14 +230,6 @@ def test_ringkv_complete_matches_legacy_across_wrap(t, capacity):
             assert torch.equal(a, b), f"step {step}: hoisted {name} mismatch"
             assert torch.equal(a, c), f"step {step}: standalone {name} mismatch"
 
-        if step % 37 == 0:
-            row = step % B
-            for ring in (legacy, hoisted, standalone):
-                ring.reset_slot(row)
-        if step % 53 == 0:
-            row = (step + 1) % B
-            for ring in (legacy, hoisted, standalone):
-                ring.bump_slot_start(row)
         if step % 211 == 0:
             row = (step + 2) % B
             for ring in (legacy, hoisted, standalone):
@@ -285,65 +244,7 @@ def test_ringkv_complete_matches_legacy_across_wrap(t, capacity):
 
 
 # ===========================================================================
-# 3. End-to-end step(): Helium temporal stack
-# ===========================================================================
-
-
-def test_temporal_streaming_step_matches_legacy_end_to_end():
-    dim, num_heads, hidden, num_layers, context, text_card = 32, 4, 64, 3, 16, 17
-    B = 3
-
-    real_stack = PersonaPlexTemporalStreaming(
-        dim=dim,
-        num_layers=num_layers,
-        num_heads=num_heads,
-        hidden=hidden,
-        context=context,
-        text_card=text_card,
-    )
-    _init_deterministic(real_stack, torch.Generator().manual_seed(3))
-    real_stack.eval()
-    real_stack.streaming_init(batch_size=B)
-
-    legacy_kvs = [_LegacyRingKV(B, num_heads, dim // num_heads, context, CPU, torch.float32) for _ in range(num_layers)]
-    legacy_offset = torch.zeros(B, dtype=torch.long)
-
-    gen = torch.Generator().manual_seed(4)
-    for step_idx in range(2000):  # context=16 -> >100 wraps per row
-        frame = torch.randn(B, 1, dim, generator=gen)
-        active = _random_active(B, gen)
-
-        x = frame.clone()
-        for layer, kv in zip(real_stack.layers, legacy_kvs):
-            x = _legacy_temporal_layer_forward(layer, x, kv, legacy_offset, context, active)
-        legacy_offset.add_(x.shape[1] * active.to(legacy_offset.dtype))
-        legacy_out = _rms_norm_f32(x, real_stack.out_norm_alpha, 1e-8)
-        legacy_text_logits = F.linear(legacy_out, real_stack.text_linear)[:, None]
-
-        new_out, new_text_logits = real_stack.step(frame.clone(), active)
-
-        assert torch.equal(legacy_out, new_out), f"step {step_idx}: transformer_out mismatch"
-        assert torch.equal(legacy_text_logits, new_text_logits), f"step {step_idx}: text_logits mismatch"
-
-        if step_idx % 71 == 0:
-            row = step_idx % B
-            for kv in legacy_kvs:
-                kv.reset_slot(row)
-            real_stack.reset_slot(row)
-        if step_idx % 97 == 0:
-            row = (step_idx + 1) % B
-            for kv in legacy_kvs:
-                kv.bump_slot_start(row)
-            real_stack.bump_slot_start(row)
-
-    assert torch.equal(legacy_offset, real_stack._offset)
-    for legacy_kv, real_kv in zip(legacy_kvs, real_stack._kv):
-        assert torch.equal(legacy_kv.end_offset, real_kv.end_offset)
-        assert torch.equal(legacy_kv.start_offset, real_kv.start_offset)
-
-
-# ===========================================================================
-# 4. End-to-end step(): Mimi encoder/decoder transformer
+# 3. End-to-end step(): Mimi encoder/decoder transformer
 # ===========================================================================
 
 

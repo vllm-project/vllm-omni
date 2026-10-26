@@ -41,7 +41,7 @@ from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 from vllm.v1.worker.utils import sanity_check_mm_encoder_outputs
 
 from vllm_omni.outputs import OmniModelRunnerOutput
-from vllm_omni.utils.mm_outputs import partition_payload_list
+from vllm_omni.utils.mm_outputs import partition_payload_list, split_mapping_outputs
 from vllm_omni.worker.gpu_ar_model_runner import (
     ExecuteModelState,
     _AsyncCPUPayloadSnapshot,
@@ -153,6 +153,11 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._async_chunk = getattr(self.model_config, "async_chunk", False)
+        # Whether the previous execute_model call scheduled no tokens; gates
+        # the idle prefetch in execute_model.
+        self._prev_step_idle = False
+        # Optional model hooks that have failed; each is warned about once.
+        self._failed_optional_model_hooks: set[str] = set()
         if needs_omni_connector(self.model_config):
             self.init_omni_connectors(
                 model_config=self.model_config,
@@ -184,6 +189,23 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
             # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
             if self.uses_mrope:
                 self._init_mrope_positions(req_state)
+
+    def _call_optional_model_hook(self, name: str, *args: object) -> None:
+        """Call an optional model hook that must never fail the step.
+
+        An exception escaping execute_model kills the EngineCore, and these
+        hooks only warm caches, so a failure is logged and the step goes on.
+        """
+        hook = getattr(self.model, name, None)
+        if not callable(hook):
+            return
+        try:
+            hook(*args)
+        except Exception:
+            # run_idle_prefetch runs on every idle step (~1 kHz): warn once per hook.
+            log = logger.debug if name in self._failed_optional_model_hooks else logger.warning
+            self._failed_optional_model_hooks.add(name)
+            log("Optional model hook %s failed; continuing without it.", name, exc_info=True)
 
     @torch.inference_mode()
     def execute_model(
@@ -222,6 +244,9 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
                 get_kv_transfer_group().handle_preemptions(kv_connector_metadata)
 
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+        # Recorded before any return below, so every path updates it.
+        prev_step_idle = self._prev_step_idle
+        self._prev_step_idle = num_scheduled_tokens <= 0
         with (
             record_function_or_nullcontext("gpu_model_runner: preprocess"),
             self.synchronize_input_prep(),
@@ -235,6 +260,10 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
             # concern and does not depend on the inter-stage transfer mode.
             if scheduler_output.finished_req_ids and hasattr(self.model, "on_requests_finished"):
                 self.model.on_requests_finished(scheduler_output.finished_req_ids)
+            # After finished: an id freed and re-added within one step keeps
+            # the new request's prewarm.
+            if prewarms := getattr(scheduler_output, "pending_request_prewarms", None):
+                self._call_optional_model_hook("on_requests_added", prewarms)
 
             if has_ec_transfer() and not get_ec_transfer().is_consumer:
                 with self.maybe_get_ec_connector_output(
@@ -245,7 +274,8 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
                     return self.attach_omni_connector_output(make_empty_encoder_model_runner_output(scheduler_output))
 
             # OMNI: keep this block in lock-step with the same block in
-            # GPUARModelRunner.execute_model.
+            # GPUARModelRunner.execute_model, except for the generation-only
+            # run_idle_prefetch hook below.
             # `<= 0`: upstream can schedule a negative span, which is truthy (#5196).
             if num_scheduled_tokens <= 0:
                 if (
@@ -259,6 +289,16 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
                     # dummy run to ensure coordinate_batch_across_dp
                     # is called into to avoid out of sync issues.
                     self._dummy_run(1)
+                # Idle step (e.g. a placeholder waiting for chunk 0): let the
+                # model run deferred per-request warmup. Numerics match the
+                # forward below: it adds no autocast or default dtype
+                # (set_forward_context is batch metadata only), and this call
+                # shares its inference_mode, thread, device and stream.
+                # Skipped on the first idle step after a busy one: under async
+                # scheduling that step's output may still be in flight, and a
+                # warmup phase can take ~100 ms. The cost is one ~1 ms idle step.
+                if prev_step_idle:
+                    self._call_optional_model_hook("run_idle_prefetch")
                 if not has_kv_transfer_group():
                     # Return empty ModelRunnerOutput if no work to do.
                     return self.attach_omni_connector_output(EMPTY_MODEL_RUNNER_OUTPUT)
@@ -283,16 +323,6 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
                 scheduler_output, num_scheduled_tokens_np
             )
 
-            cascade_attn_prefix_lens = None
-            # Disable cascade attention when using microbatching (DBO)
-            if self.cascade_attn_enabled and not self.parallel_config.use_ubatching:
-                # Pre-compute cascade attention prefix lengths
-                cascade_attn_prefix_lens = self._compute_cascade_attn_prefix_lens(
-                    num_scheduled_tokens_np,
-                    self.input_batch.num_computed_tokens_cpu[:num_reqs],
-                    scheduler_output.num_common_prefix_blocks,
-                )
-
             (
                 cudagraph_mode,
                 batch_desc,
@@ -304,7 +334,7 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
                 num_reqs=num_reqs,
                 num_scheduled_tokens_np=num_scheduled_tokens_np,
                 max_num_scheduled_tokens=max_num_scheduled_tokens,
-                use_cascade_attn=cascade_attn_prefix_lens is not None,
+                use_cascade_attn=False,
                 num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
             )
 
@@ -367,7 +397,6 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
                 max_num_sampled_tokens=max_num_sampled_tokens,
                 use_spec_decode=use_spec_decode,
                 num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
-                cascade_attn_prefix_lens=cascade_attn_prefix_lens,
                 slot_mappings=slot_mappings_by_group,
             )
             self._maybe_attach_attention_metadata_extensions(
@@ -498,7 +527,7 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
 
         # Build per-request multimodal_outputs list (dedicated channel).
         # pooler_output is no longer used for multimodal data.
-        per_req_payloads: list[dict[str, object]] = []
+        per_req_payloads: list[Mapping[str, object]] = []
         pin_memory = is_pin_memory_available()
         accumulate_full_payload = self._should_accumulate_full_payload_output()
         use_async_output = (
@@ -535,22 +564,10 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
             for out in multimodal_outputs_raw:
                 per_req_payloads.append({"model_outputs": copy_tensor(out) if out is not None else None})
         elif isinstance(multimodal_outputs_raw, Mapping):
-            num_reqs = self.input_batch.num_reqs
-            for i in range(num_reqs):
-                mm_payload = {}
-                for key, out in multimodal_outputs_raw.items():
-                    if isinstance(out, list):
-                        if len(out) != num_reqs:
-                            raise ValueError(
-                                f"Multimodal output list for key '{key}' has length {len(out)} "
-                                f"but expected {num_reqs} (one entry per request)."
-                            )
-                        mm_payload[key] = copy_tensor(out[i])
-                    elif isinstance(out, torch.Tensor):
-                        mm_payload[key] = copy_tensor(out)
-                    else:
-                        logger.warning(f"Unsupported multimodal output type for key '{key}': {type(out)}")
-                per_req_payloads.append(_ensure_tensor_values(mm_payload))
+            per_req_payloads = [
+                _ensure_tensor_values(payload)
+                for payload in split_mapping_outputs(multimodal_outputs_raw, self.input_batch.num_reqs, copy_tensor)
+            ]
         else:
             raise RuntimeError("Unsupported diffusion output type")
         snapshot = None
@@ -617,6 +634,12 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
             ec_connector_output=ec_connector_output if self.supports_mm_inputs else None,
         )
         output.omni_connector_output = self.get_omni_connector_output()
+
+        model = getattr(self, "model", None)
+        if model is not None and hasattr(model, "get_pending_generation_request_ids"):
+            output.pending_generation_req_ids = set(req_ids_output_copy).intersection(
+                model.get_pending_generation_request_ids()
+            )
 
         if snapshot is not None:
             return _AsyncGenerationOutput(output, snapshot)

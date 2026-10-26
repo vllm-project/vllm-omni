@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -9,10 +9,12 @@ from typing import Any
 import numpy as np
 import pytest
 
+from tests.helpers.mark import hardware_marks
+
 pytestmark = [
     pytest.mark.advanced_model,
     pytest.mark.diffusion,
-    pytest.mark.gpu,
+    *hardware_marks(res={"cuda": "L4"}, num_cards=1),
 ]
 
 
