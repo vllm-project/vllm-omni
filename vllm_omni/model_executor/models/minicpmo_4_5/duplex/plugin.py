@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 from numpy.typing import NDArray
+from vllm.multimodal.image import open_image
 from vllm.multimodal.media import MediaConnector
 from vllm.sampling_params import SamplingParams
 
@@ -145,7 +146,7 @@ def _duplex_base_frame_blocks(frame: str, tile_pixels: int | None) -> int:
 
     try:
         raw = b64decode(frame, validate=True)
-        with Image.open(BytesIO(raw)) as image:
+        with open_image(BytesIO(raw)) as image:
             width, height = image.size
     except (BinasciiError, ValueError, OSError, Image.DecompressionBombError):
         return _DUPLEX_HD_SLICES_PER_BASE_FRAME

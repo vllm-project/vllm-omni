@@ -29,6 +29,7 @@ from diffusers.models.autoencoders.autoencoder_kl_wan import (
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.layers import vae_norm_epilogue as rn
+from vllm_omni.diffusion.layers.vae_norm_epilogue import KERNEL_DEVICE_TYPES
 
 from . import forwards
 
@@ -214,7 +215,7 @@ def _install_bindings(
     component_name = "encoder" if encoder else "decoder"
     device = next((p.device for p in component.parameters()), torch.device("cpu"))
     fused_silu_dtypes: frozenset[torch.dtype] = frozenset()
-    if device.type == "cuda":
+    if device.type in KERNEL_DEVICE_TYPES:
         fused_silu_dtypes = frozenset(
             dtype for dtype in (torch.bfloat16, torch.float16) if rn.silu_epilogue_is_exact(device, dtype)
         )

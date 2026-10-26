@@ -483,6 +483,7 @@ class OmniEngineBase:
                 collect_stage_metrics=self._collect_stage_metrics,
                 enable_orch_monitor=self._enable_orch_monitor,
             )
+            await orchestrator.publish_stage_post_warmup_memory()
             if not startup_future.done():
                 startup_future.set_result(asyncio.get_running_loop())
             await orchestrator.run()
@@ -994,12 +995,12 @@ class OmniEngineBase:
         # and lets the destructor/free path handle asleep entries correctly
         # (returns a null handle so the C extension skips unmap/release).
         try:
-            from vllm.device_allocator.cumem import CuMemAllocator, cumem_available
+            from vllm.device_allocator import get_mem_allocator_instance
 
-            if cumem_available:
-                allocator = CuMemAllocator.get_instance()
-                allocator.release_pools()
-                logger.debug("[OmniEngine] Released CuMem memory pool during shutdown")
+            # Raises on platforms/builds without a sleep-mode allocator.
+            allocator = get_mem_allocator_instance()
+            allocator.release_pools()
+            logger.debug("[OmniEngine] Released sleep-mode memory pool during shutdown")
         except Exception:
             pass
 

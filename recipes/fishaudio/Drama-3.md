@@ -163,7 +163,9 @@ Throughput is seconds of audio generated per wall-clock second.
 
 #### Known limitations
 
-- One tensor and pipeline rank only.
+- Pipeline parallel is not supported. The CUDA deploy uses one tensor rank.
+  The Ascend profile shards the backbone across two cards and the routed
+  experts with them (see NPU below).
 - Prefix caching is off: prompt rows carry ten codes per audio row that
   token-id hashing does not see.
 - Some takes stop speaking after the first word or event and emit silence
@@ -171,3 +173,34 @@ Throughput is seconds of audio generated per wall-clock second.
   that start with a filler word or a tag, and with pause-heavy references.
 - `previous_takes` (editing as continuation) and long-text chunking are not
   exposed by the speech API yet.
+
+## NPU
+
+### 2x Ascend 910B 64GB
+
+Stage 0 (backbone + codebook tower) uses Model Runner V2 on both cards:
+tensor parallel 2 and expert parallel, replaying piecewise ACL graphs
+(`enforce_eager: false`, `cudagraph_mode: PIECEWISE`). The NPU AR runner builds
+Ascend input state (`AscendInputBatch` with `attn_state` and `seq_lens_np`)
+and the model state builds Ascend attention metadata. Gated-delta-net stays on
+the Ascend implementation. The codebook tower uses the eager norm and sampling
+path. Stage 1 (DAC) shares the second card and stays eager, without ACL graphs
+or MPS.
+Sampling noise is broadcast from tensor-parallel rank 0 so both ranks draw
+the same frame.
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=0,1 vllm serve fishaudio/drama-3 --omni --port 8091
+```
+
+`vllm_omni/deploy/fish_omni.yaml` applies this `npu` profile automatically
+(`tensor_parallel_size: 2`, `enable_expert_parallel: true`, `max_num_seqs: 64`,
+stage 0 `enforce_eager: false`).
+Stage 0 reserves 0.72 of each card and stage 1 reserves 0.10 of the second
+card. The speech request is the same as the GPU section.
+
+vLLM-Ascend on 910B still expands this checkpoint's block-FP8 experts to
+bfloat16 (64.4 GiB for all 256 routed experts). One card cannot hold that
+expansion. Expert parallel places 128 experts on each card, about 32 GiB,
+plus the sharded backbone. The codec then fits in the headroom on the second
+card. This profile has not been scored for WER or RTF.

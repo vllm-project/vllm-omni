@@ -136,6 +136,12 @@ filter_test_specs_by_skip_ci() {
 }
 
 upload_pipeline() {
+    local combined_test_yaml=""
+    local filtered_test_yaml=""
+    local has_nightly_suite=0
+    local suite_spec
+    local -a filter_args=()
+
     echo "Uploading pipeline..."
     # Install minijinja
     ls .buildkite || buildkite-agent annotate --style error 'Please merge upstream main branch for buildkite CI'
@@ -182,9 +188,36 @@ upload_pipeline() {
         TEST_YAML="${TEST_SPECS[0]#*:}"
     else
         TEST_YAML=$(mktemp "${TMPDIR:-/tmp}/amd-selected-tests.XXXXXX.yml")
+        combined_test_yaml="$TEST_YAML"
         python3 scripts/combine_test_suites.py "$TEST_YAML" "${TEST_SPECS[@]}"
     fi
     echo "AMD test suites: ${TEST_SPECS[*]}"
+
+    for suite_spec in "${TEST_SPECS[@]}"; do
+        if [[ "$suite_spec" == NIGHTLY_TESTS:* ]]; then
+            has_nightly_suite=1
+            break
+        fi
+    done
+    if [[ $has_nightly_suite -eq 1 ]]; then
+        filtered_test_yaml=$(mktemp "${TMPDIR:-/tmp}/amd-filtered-tests.XXXXXX.yml")
+        filter_args=(
+            python3 scripts/filter_test_suite.py
+            "$TEST_YAML"
+            "$filtered_test_yaml"
+            --changed-files "$file_diff"
+            --pipeline-path test-amd-nightly.yml
+            --pull-request "${BUILDKITE_PULL_REQUEST:-false}"
+            --debug-test-yaml "${DEBUG_TEST_YAML:-}"
+            --scheduled-nightly "$NIGHTLY"
+        )
+        if [[ ${#TEST_SPECS[@]} -gt 1 ]]; then
+            filter_args+=(--group-name NIGHTLY_TESTS)
+        fi
+        "${filter_args[@]}"
+        TEST_YAML="$filtered_test_yaml"
+        echo "Prepared AMD nightly jobs using PR/scheduled source-filter policy."
+    fi
 
     (
         set -x
@@ -205,8 +238,11 @@ upload_pipeline() {
             > pipeline.yaml
     )
     cat pipeline.yaml
-    if [[ "$TEST_YAML" == "${TMPDIR:-/tmp}/amd-selected-tests."*.yml ]]; then
-        rm -f -- "$TEST_YAML"
+    if [[ -n "$filtered_test_yaml" ]]; then
+        rm -f -- "$filtered_test_yaml"
+    fi
+    if [[ -n "$combined_test_yaml" ]]; then
+        rm -f -- "$combined_test_yaml"
     fi
     buildkite-agent artifact upload pipeline.yaml
     buildkite-agent pipeline upload pipeline.yaml

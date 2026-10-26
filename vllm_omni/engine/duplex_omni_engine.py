@@ -47,6 +47,12 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 _DEFAULT_CONTROL_TIMEOUT_S = 10.0
+# Opening a session also initializes per-session runner state (session runner,
+# talker admission, first stage reservation), so the first open on a cold engine
+# can take tens of seconds while later opens are fast. Keep the short control
+# budget for control ops on a live session and give open its own budget, or a
+# cold start fails the first open with a spurious timeout (#9072).
+_DEFAULT_OPEN_TIMEOUT_S = 60.0
 _COMMAND_PUT_TIMEOUT_S = 30.0
 
 
@@ -173,7 +179,7 @@ class DuplexOmniEngine(AsyncOmniEngine):
         session_config: DuplexSessionConfig,
         *,
         output_buffer: DuplexOutputBuffer,
-        timeout: float | None = _DEFAULT_CONTROL_TIMEOUT_S,
+        timeout: float | None = _DEFAULT_OPEN_TIMEOUT_S,
     ) -> DuplexControlResultMessage:
         control_id = uuid.uuid4().hex
         return self._execute_control(
@@ -195,7 +201,7 @@ class DuplexOmniEngine(AsyncOmniEngine):
         session_config: DuplexSessionConfig,
         *,
         output_buffer: DuplexOutputBuffer,
-        timeout: float | None = _DEFAULT_CONTROL_TIMEOUT_S,
+        timeout: float | None = _DEFAULT_OPEN_TIMEOUT_S,
     ) -> DuplexControlResultMessage:
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(

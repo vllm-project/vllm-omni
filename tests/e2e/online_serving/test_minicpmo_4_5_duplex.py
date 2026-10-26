@@ -24,7 +24,6 @@ from tests.e2e.online_serving.helpers.minicpmo_4_5_duplex import (
     validated_input_wav,
 )
 from tests.e2e.online_serving.helpers.minicpmo_realtime_duplex_scenarios import (
-    _pcm16_active_slice,
     _read_wav_pcm16,
     _ref_audio_data_url,
     _send_pcm16,
@@ -443,8 +442,8 @@ async def _run_video_only_then_audio(
     """VISION units with no PCM, then one speech turn on the same session.
 
     Each frame is its own append and must settle (listen, or a speak response
-    that finishes) before the next input. The speech turn then has to produce
-    audio on that same session.
+    that finishes) before the next input. The committed speech turn then has to
+    produce audio on that same session.
     """
     events: list[dict[str, object]] = []
     speech_at = 0
@@ -495,6 +494,7 @@ async def _run_video_only_then_audio(
                 realtime_delay=True,
                 hints={"transcript": "duplex CI speech"},
             )
+            await ws.send(json.dumps({"type": "input_audio_buffer.commit", "final": True}))
             await _wait_for_events(
                 events,
                 lambda: (
@@ -532,12 +532,13 @@ def test_duplex_video_only_units_then_audio_input(omni_server, tmp_path: Path) -
     """Frame-only VISION units, then the speech turn the audio duplex test uses.
 
     A muted camera and a clip with no soundtrack send frames without PCM. The
-    following speech turn is the same 1400 ms window as
+    following speech turn is the same committed full utterance as
     ``test_duplex_single_session_response_required``, so a session that accepted
-    video still has to answer audio.
+    video still has to answer audio. A cropped window can legitimately leave the
+    native model listening.
     """
     frames = duplex_camera_frames(seconds=2, cache_dir=tmp_path / "camera")
-    speech = _pcm16_active_slice(_read_wav_pcm16(validated_input_wav()), 1400)
+    speech = _read_wav_pcm16(validated_input_wav())
     result = asyncio.run(
         _run_video_only_then_audio(
             url=realtime_url(omni_server),

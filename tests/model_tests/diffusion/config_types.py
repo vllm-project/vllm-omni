@@ -82,6 +82,10 @@ class DiffusionModelTestOpts(NamedTuple):
     # Example: https://github.com/vllm-project/vllm/blob/v0.23.0/tests/models/multimodal/generation/test_common.py#L131
     marks: list[MarkDecorator] | None = None
 
+    # Whether multi-device groups should receive native ROCm hardware marks.
+    # Keep this False for models whose runtime path is not yet qualified on ROCm.
+    rocm_multigpu: bool = True
+
     # When True (default), online tests only run the base case (no accelerations).
     # When False, online tests run all test_groups, same as offline. This should be
     # True unless there is a good reason for it not to be, because the execution of

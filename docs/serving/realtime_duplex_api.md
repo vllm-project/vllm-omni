@@ -41,6 +41,24 @@ Grouping and pruning affect only the model-input view. They do not merge or
 delete the source conversation items exposed to clients, and do not change
 playback acknowledgement or interruption handling.
 
+### Qwen3-Omni voice selection
+
+The duplex session forwards the configured voice to the Talker as the
+checkpoint speaker. Accepted values are the names in the checkpoint's
+`talker_config.speaker_id` mapping (for example `chelsie`, `ethan`,
+`aiden`), matched case-insensitively. When the checkpoint exposes that
+mapping, an unknown name is rejected with error code `invalid_speaker`,
+leaving the previous voice in effect; a checkpoint without a mapping leaves
+voice names unvalidated and the Talker uses its default. The voice can be set
+when the session is opened and changed through `session.update` until audio
+output has started. Once audio output has started, a change to `voice` is
+rejected with `voice_update_after_audio_unsupported`; resending the current
+value — in any case or spacing, or as an echoing `null` — is a no-op, so
+clients may round-trip the whole session object. Clearing the voice before
+any audio output is allowed and makes the Talker fall back to the checkpoint's
+default speaker; a blank value is treated the same as `null`. Reference-voice
+audio (`ref_audio`) is not supported on this model.
+
 ### Optional history calibration for interrupted Qwen3-Omni replies
 
 By default, Qwen3-Omni audio replies under `ack_only` retain their full text
@@ -298,6 +316,42 @@ set `session_mode: turn` in a deploy configuration derived from the model's
 profile. This selects `AsyncOmni` and the ordinary API initialization instead
 of the duplex handler. See [Full Duplex](full_duplex_api.md#enable-full-duplex)
 for the command and configuration requirements.
+
+#### Compare MiniCPM-o attention backends
+
+The MiniCPM-o profiles leave CUDA Thinker attention selection to vLLM. To
+compare a specific backend, use a deployment overlay that changes only stage 0.
+For example, save the following as `minicpmo_thinker_triton.yaml`, replacing the
+base path with your checkout:
+
+```yaml
+base_config: /path/to/vllm-omni/vllm_omni/deploy/minicpmo_4_5.yaml
+platforms:
+  cuda:
+    stages:
+      - stage_id: 0
+        attention_backend: TRITON_ATTN
+```
+
+Pass `--deploy-config minicpmo_thinker_triton.yaml` to the server command above.
+The overlay preserves the Talker's backend selection and the profile's graph
+settings. A server-wide `--attention-backend` override also affects the Talker,
+so it is a different experiment. Check each stage's startup log for the actual
+backend and graph mode. The turn-mode profile inherits the base deployment too;
+changing the base profile affects both serving modes.
+
+For a quality comparison, keep the source and model revisions, reference audio,
+input audio/video, frame rate, pacing, window settings and sampling parameters
+the same. Compare several matched seeds and repeat sessions after a fresh server
+start. Evaluate replies against the scene and question timestamps: a later
+answer can describe a scene that changed while the model was responding.
+
+A changed sampled transcript alone does not establish an attention-backend
+defect or a general quality improvement. Validate graph-enabled serving
+separately from eager serving, and record the topology actually tested.
+Successful `response.done` events establish protocol completion, not correct
+recognition or complete sentences. This overlay is a comparison tool, not a
+confirmed fix for recognition errors or post-commit drain timeouts.
 
 ### Multiple Frontends
 

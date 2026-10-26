@@ -49,7 +49,7 @@ from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapt
 from vllm_omni.distributed.omni_connectors.utils.config import stage_receives_chunks
 from vllm_omni.engine import AdditionalInformationPayload, OmniEngineCoreOutput
 from vllm_omni.engine.serialization import serialize_additional_information
-from vllm_omni.outputs import OmniConnectorOutput
+from vllm_omni.outputs import OmniConnectorOutput, SchedulingMetadataUpdate
 
 logger = init_logger(__name__)
 
@@ -197,6 +197,10 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
         # (deploy ``model_runner``, optionally per stage).
         model_config = self.vllm_config.model_config
         self.use_v2_model_runner = bool(getattr(model_config, "use_v2_model_runner", False))
+        # Native-AR stages whose decode step feeds more than the sampled token
+        # into the model declare "fail": a recompute preemption replays the
+        # prompt from the token stream, which cannot rebuild that state.
+        self.recompute_preemption_fails = getattr(model_config, "recompute_preemption", "allow") == "fail"
         self._native_data_plane = uses_native_mrv2_data_plane(
             model_config,
             use_v2_model_runner=self.use_v2_model_runner,
@@ -412,7 +416,7 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
         input_coordinator = getattr(self, "input_coordinator", None)
         if input_coordinator is None:
             return
-        request_metadata: dict[str, dict[str, Any]] = {}
+        request_metadata: dict[str, SchedulingMetadataUpdate] = {}
         chunk_ready_req_ids: set[str] = set()
         chunk_finished_req_ids: set[str] = set()
         stage_recv_req_ids: set[str] = set()
@@ -432,7 +436,6 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
             input_coordinator.update_request_metadata(
                 self.requests,
                 request_metadata,
-                model_mode=model_mode,
             )
         if input_coordinator._async_chunk:
             input_coordinator.process_pending_chunks(
@@ -551,6 +554,70 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
                 ),
             )
         self.finish_requests(request_ids, RequestStatus.FINISHED_ERROR)
+
+    def reset_prefix_cache(self, reset_running_requests: bool = False, reset_connector: bool = False) -> bool:
+        # Upstream uses drop_stale_output for both reset and KV-delivery
+        # capacity preemption. Only the explicit reset operation may resume.
+        self._resetting_prefix_cache = True
+        try:
+            return super().reset_prefix_cache(reset_running_requests, reset_connector)
+        finally:
+            self._resetting_prefix_cache = False
+
+    def _preempt_request(
+        self,
+        request: Request,
+        timestamp: float,
+        drop_stale_output: bool = False,
+    ) -> None:
+        """Reclaim a preempted request instead of replaying it when the stage cannot.
+
+        Upstream's only preemption mode is recompute: free the KV, zero
+        ``num_computed_tokens`` and replay the prompt. That replay is lossy for
+        a stage whose decode step feeds more than the sampled token into the
+        model -- side-channel codes, per-request hidden state, vocoder progress
+        -- because none of it is in the token stream. Requeueing such a request
+        would restart it at frame 0 and splice two unrelated halves together.
+
+        Under ``recompute_preemption="fail"`` the request is finished here with
+        one terminal error instead, so the caller learns the output is
+        truncated rather than receiving audio that silently restarts.
+        """
+        if not getattr(self, "recompute_preemption_fails", False) or getattr(self, "_resetting_prefix_cache", False):
+            return super()._preempt_request(request, timestamp, drop_stale_output=drop_stale_output)
+        if request.is_finished():
+            return
+        reason = (
+            "Request was preempted and this stage cannot replay its decode state; "
+            "the output generated so far is truncated. Raise the stage's "
+            "gpu_memory_utilization or lower max_num_seqs to avoid preemption."
+        )
+        logger.warning(
+            "Preempting request %s after %d computed token(s): %s",
+            request.request_id,
+            request.num_computed_tokens,
+            reason,
+        )
+        pending = getattr(self, "_pending_input_timeout_outputs", None)
+        if pending is None:
+            pending = self._pending_input_timeout_outputs = {}
+        pending[request.request_id] = (
+            request.client_index,
+            OmniEngineCoreOutput(
+                request_id=request.request_id,
+                new_token_ids=[],
+                finish_reason=FinishReason.ERROR,
+                stop_reason=reason,
+            ),
+        )
+        request.stop_reason = reason
+        # Preserve upstream preemption's auxiliary-output lifecycle: finish_requests
+        # removes the request before this step builds connector metadata.
+        if self.aux_output_connector is not None:
+            self.aux_output_connector.request_finished(request)
+        # The caller already popped this request from ``running``; freeing here
+        # is what upstream's requeue path would otherwise do later.
+        self.finish_requests([request.request_id], RequestStatus.FINISHED_ERROR)
 
     def _log_failed_chunk_sends(self) -> None:
         """Surface chunks the sender gave up on (R1.2 of #4855).
@@ -717,10 +784,18 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
         scheduler_output: SchedulerOutput,
         *,
         include_cached_payloads: bool = False,
+        consume_chunks: bool = True,
     ) -> None:
         """Enrich new requests and apply async-chunk output bookkeeping."""
         self._rewrap_scheduled_new_reqs(scheduler_output)
         if not self.chunk_transfer_adapter:
+            return
+        if not consume_chunks:
+            self.chunk_transfer_adapter.postprocess_scheduler_output(
+                scheduler_output,
+                self.requests if include_cached_payloads else None,
+                consume_chunks=False,
+            )
             return
         if include_cached_payloads:
             self.chunk_transfer_adapter.postprocess_scheduler_output(

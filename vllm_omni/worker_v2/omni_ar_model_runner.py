@@ -535,9 +535,10 @@ def _async_copy_tensor(
         pin_memory = PIN_MEMORY
     cpu = torch.empty_like(x, device="cpu", pin_memory=pin_memory)
     cpu.copy_(x, non_blocking=pin_memory)
-    if copy_stream is None:
-        copy_stream = torch.cuda.current_stream()
-    x.record_stream(copy_stream)
+    if pin_memory:
+        if copy_stream is None:
+            copy_stream = torch.cuda.current_stream()
+        x.record_stream(copy_stream)
     return cpu
 
 

@@ -1412,6 +1412,91 @@ def test_summarize_session_request_metrics_averages_audio_turns():
     }
 
 
+def test_summarize_session_request_metrics_includes_client_append_fields():
+    summary = summarize_session_request_metrics(
+        [
+            {"client_ttfp_ms": 100.0, "client_rtf": 0.5},
+            {"client_ttfp_ms": 300.0, "client_rtf": 0.7},
+        ],
+        session_id="sess-1",
+    )
+    assert summary["client_ttfp_ms"] == {"count": 2, "mean": 200.0, "p50": 100.0, "p99": 300.0}
+    assert summary["client_rtf"] == {"count": 2, "mean": 0.6, "p50": 0.5, "p99": 0.7}
+
+
+def _audio_delta(response_id: str, *, duration_ms: int) -> dict[str, object]:
+    return {
+        "type": "response.output_audio.delta",
+        "response_id": response_id,
+        "delta": base64.b64encode(b"audio").decode("ascii"),
+        "sample_rate_hz": 16_000,
+        "metadata": {"audio_duration_ms": duration_ms},
+    }
+
+
+def test_event_collector_adds_client_append_metrics_from_last_in_window():
+    collector = EventCollector()
+    collector.note_client_append({"sent_at_s": 9.4, "event_id": "append-early"})
+    collector.note_client_append({"sent_at_s": 9.7, "event_id": "append-last"})
+    collector.add({"type": "response.created", "response": {"id": "resp-a"}}, received_at_s=10.0)
+    collector.add(_audio_delta("resp-a", duration_ms=80), received_at_s=10.2)
+    collector.add(_audio_delta("resp-a", duration_ms=240), received_at_s=10.36)
+
+    timing = collector.timing_summary(after_s=9.0, response_id="resp-a")
+    metrics = timing["request_metrics"]
+    assert isinstance(metrics, dict)
+    assert metrics["ttfp_ms"] == 200.0
+    assert metrics["audio_generation_ms"] == 360.0
+    assert metrics["client_ttfp_ms"] == 500.0
+    assert metrics["client_audio_generation_ms"] == 660.0
+    assert metrics["client_measurement_origin"]["ttfp"].startswith("last input_audio_buffer.append")
+    assert "client_rtf" not in metrics
+
+
+def test_event_collector_client_origin_uses_previous_created_or_after_s():
+    collector = EventCollector()
+    collector.note_client_append({"sent_at_s": 8.8, "event_id": "before-window"})
+    collector.note_client_append({"sent_at_s": 9.5, "event_id": "first-turn"})
+    collector.add({"type": "response.created", "response": {"id": "resp-a"}}, received_at_s=10.0)
+    collector.add(_audio_delta("resp-a", duration_ms=80), received_at_s=10.2)
+    collector.note_client_append({"sent_at_s": 10.4, "event_id": "second-turn"})
+    collector.note_client_append({"sent_at_s": 11.1, "event_id": "after-second-created"})
+    collector.add({"type": "response.created", "response": {"id": "resp-b"}}, received_at_s=11.0)
+    collector.add(_audio_delta("resp-b", duration_ms=100), received_at_s=11.3)
+
+    first = collector.timing_summary(after_s=9.0, response_id="resp-a")["request_metrics"]
+    second = collector.timing_summary(after_s=9.0, response_id="resp-b")["request_metrics"]
+    assert isinstance(first, dict)
+    assert isinstance(second, dict)
+    assert first["client_ttfp_ms"] == 700.0
+    assert second["client_ttfp_ms"] == 900.0
+    assert "client_ttfp_ms" not in collector.timing_summary(after_s=9.6, response_id="resp-a")["request_metrics"]
+
+
+@pytest.mark.asyncio
+async def test_send_stamps_append_on_attached_collector():
+    sock = FakeSocket()
+    sock.feed(SESSION_CREATED)
+    client, _ = make_client(sock)
+    collector = EventCollector()
+    async with client:
+        client.attach_event_collector(collector)
+        event_id = await client.send(
+            {
+                "type": "input_audio_buffer.append",
+                "audio": "",
+                "is_speech": True,
+                "video_frames": ["frame"],
+            }
+        )
+        await client.send({"type": "input_audio_buffer.commit"})
+        sock.feed(SESSION_CLOSED)
+
+    assert [record["event_id"] for record in collector.client_appends] == [event_id]
+    assert collector.client_appends[0].keys() == {"sent_at_s", "event_id"}
+    assert collector.client_appends[0]["sent_at_s"] > 0.0
+
+
 def test_event_collector_reports_all_engine_stages():
     collector = EventCollector()
     collector.add({"type": "response.created", "response": {"id": "resp-a"}}, received_at_s=10.0)

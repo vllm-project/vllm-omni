@@ -548,11 +548,10 @@ class ModelChannel:
         try:
             next_fence = session.sync_fence()
             if next_fence.epoch > cancelled_fence.epoch:
-                stale_request_ids = session.cancel_fence(cancelled_fence, next_fence)
-            else:
-                stale_request_ids = []
-            if stale_request_ids:
-                await self._ctx.stage_port.cleanup(list(stale_request_ids), abort=True)
+                stale_request_ids = session.prepare_cancel_fence(cancelled_fence, next_fence)
+                if stale_request_ids:
+                    await self._ctx.stage_port.cleanup(list(stale_request_ids), abort=True)
+                session.release_fence(cancelled_fence)
             session.touch_lease(DuplexLeaseActivity.SIGNAL)
         except asyncio.CancelledError:
             raise
@@ -1772,3 +1771,12 @@ class ModelChannel:
         if scheduled and not self._ctx.run.closing:
             model_state.continuation_owner_id = owner_id
             model_state.continuation_units = count + 1
+            return
+        if not response_owned and session.active_response_id is not None:
+            # The unit was planned for the model turn, and the answer opened while it
+            # waited: it is stale against its old owner, and the answer's own segment
+            # end only arrives after one more unit is processed. Re-aim the unit at the
+            # answer instead of dropping it, which would leave the answer half spoken
+            # for a client that has stopped sending audio. The re-aimed call re-checks
+            # the session state, so a closed session or a newer epoch still drops it.
+            await self.maybe_continue_response(expected_epoch=expected_epoch)

@@ -24,6 +24,7 @@ from vllm.v1.worker.gpu.sample.sampler import Sampler
 
 from vllm_omni.model_executor.output_snapshot import PackedOutputSnapshot, RequestOutputSnapshot
 from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
+from vllm_omni.worker_v2.warmup import is_warmup_request
 
 logger = init_logger(__name__)
 
@@ -382,7 +383,7 @@ class MossLocalModelState(OmniModelState):
         for row in range(input_batch.num_reqs):
             slot = int(input_batch.idx_mapping_np[row])
             buf = self.intermediate_buffer.buffers[slot]
-            if not buf or str(buf.get("req_id", "")).startswith("_warmup_"):
+            if not buf or is_warmup_request(buf.get("req_id", "")):
                 continue
             start = int(input_batch.query_start_loc_np[row])
             count = int(input_batch.num_scheduled_tokens[row])
