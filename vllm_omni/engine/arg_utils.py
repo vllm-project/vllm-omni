@@ -7,7 +7,7 @@ import os
 import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass, field, fields
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 from vllm.engine.arg_utils import AsyncEngineArgs, EngineArgs
 from vllm.logger import init_logger
@@ -303,6 +303,7 @@ class OmniEngineArgs(EngineArgs):
     retains_state_across_chunks: bool = False
     supports_pending_generation: bool = False
     supports_running_prefix_cache_reset: bool = True
+    recompute_preemption: Literal["allow", "fail"] = "allow"
     use_v2_model_runner: bool = False
     supports_native_mrv2_data_plane: bool = False
     # WS-A: Stage-1 active stream slots. 0 = legacy preempt-everything.
@@ -543,6 +544,7 @@ class OmniEngineArgs(EngineArgs):
             retains_state_across_chunks=self.retains_state_across_chunks,
             supports_pending_generation=self.supports_pending_generation,
             supports_running_prefix_cache_reset=self.supports_running_prefix_cache_reset,
+            recompute_preemption=self.recompute_preemption,
             use_v2_model_runner=self.use_v2_model_runner,
             supports_native_mrv2_data_plane=self.supports_native_mrv2_data_plane,
             active_stream_window=self.active_stream_window,

@@ -310,6 +310,7 @@ def test_speech_extra_params_reach_model_sampler_as_sampling_metadata(monkeypatc
     runner._omni_cache_policy = ModelCachePolicy(needs_full_hidden_states=True)
     runner._pooler_payload_include_hidden_flag = True
     runner.input_batch = input_batch
+    runner.requests = {}
 
     runner.model = SimpleNamespace(
         prefer_model_sampler=True,
@@ -953,6 +954,7 @@ def test_runner_assisted_full_attention_metadata_refresh_pads_buffers():
 @pytest.mark.parametrize("query_start_loc_attr", ["method", "tensor_attr"])
 def test_sample_tokens_tail_only_prefix_cache_uses_staged_cpu_hidden_states(monkeypatch, query_start_loc_attr):
     runner = object.__new__(GPUARModelRunner)
+    runner.model = SimpleNamespace()
     runner._omni_cache_policy = ModelCachePolicy(needs_full_hidden_states=True)
     runner._pooler_payload_include_hidden_flag = True
     runner.execute_model_state = ExecuteModelState(
@@ -1927,6 +1929,7 @@ class TestPreferModelSamplerNoneFallback:
 
     def _runner(self, model_sample_result, default_result):
         runner = object.__new__(GPUARModelRunner)
+        runner.requests = {}
         runner.input_batch = SimpleNamespace(
             sampling_metadata="smd",
             update_async_output_token_ids=lambda: None,

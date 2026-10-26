@@ -535,14 +535,29 @@ async def test_failed_sessions_are_not_judge_inputs(tmp_path, prepared, monkeypa
             raise ConnectionError("socket closed")
         if failure == "timeout":
             await asyncio.sleep(10)
-        return replace(_result(sample), error="session failed", metadata={"response_done": failure != "drain"})
+        return replace(
+            _result(sample),
+            error="session failed",
+            metadata={"response_done": failure != "drain"},
+            diagnostics={"drain_timeout_state": {"committed_observed": True}},
+        )
 
     monkeypatch.setattr(runner, "generate_sample", generate)
     monkeypatch.setattr(patch, "_omni_request_timeout_s", lambda: 0.01)
     output = await patch.async_request_openai_realtime_duplex(_request(sample), session=None)
     assert not output.success and output.error
-    assert adapter.finalize_duplex_eval([sample], [output])["published"] == 0
+    summary = adapter.finalize_duplex_eval([sample], [output])
+    assert summary["published"] == 0
     assert not _result(sample).output.exists()
+    diagnostic = sample.response_root / "failed_sessions" / sample.sample.split / f"{sample.sample.id}.json"
+    if failure in {"protocol", "drain"}:
+        assert summary["failed_diagnostics"] == 1
+        assert json.loads(diagnostic.read_text())["diagnostics"] == {
+            "drain_timeout_state": {"committed_observed": True}
+        }
+    else:
+        assert summary["failed_diagnostics"] == 0
+        assert not diagnostic.exists()
 
 
 @pytest.mark.asyncio

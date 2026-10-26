@@ -252,11 +252,15 @@ class StubCosmos3Transformer(nn.Module):
         self.cached_freqs_gen: Any | None = None
         self.calls: list[dict[str, Any]] = []
         self.reset_calls = 0
+        self.pp_reset_calls = 0
 
     def reset_cache(self) -> None:
         self.reset_calls += 1
         self.cached_kv = None
         self.cached_freqs_gen = None
+
+    def reset_pp_step(self) -> None:
+        self.pp_reset_calls += 1
 
     def forward(
         self,
@@ -3271,6 +3275,196 @@ class TestForwardRouting:
             pipeline.forward(make_request_batch(prompt, sampling_params))
 
 
+def _make_pp_pipeline(make_cosmos3_pipeline, monkeypatch: pytest.MonkeyPatch, *, first: bool, last: bool):
+    """Build a stub pipeline that pretends pipeline parallelism is active."""
+    from vllm_omni.diffusion.models.cosmos3 import pipeline_cosmos3 as pipeline_module
+
+    pipeline = make_cosmos3_pipeline()
+    pipeline.transformer = pipeline.transformer.__class__(
+        latent_channel_size=2, action_gen=True, action_dim=4, sound_gen=True, sound_dim=3
+    )
+    monkeypatch.setattr(pipeline, "_pp_parallel_active", lambda: True)
+    monkeypatch.setattr(pipeline_module, "is_pipeline_first_stage", lambda: first)
+    monkeypatch.setattr(pipeline_module, "is_pipeline_last_stage", lambda: last)
+    monkeypatch.setattr(
+        pipeline,
+        "predict_noise_maybe_with_cfg",
+        lambda *args, **kwargs: None,  # PP driver returns None off the last rank
+    )
+    return pipeline
+
+
+def test_diffuse_pp_none_branch_unpacks_joint_on_first_rank(
+    make_cosmos3_pipeline, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pipeline = _make_pp_pipeline(make_cosmos3_pipeline, monkeypatch, first=True, last=False)
+
+    # What the last PP rank sends back to rank 0 after its scheduler step:
+    # the packed [video | action | sound] joint tensor, flattened per batch row.
+    video = torch.full((1, 2, 1, 1, 1), 11.0)
+    action = torch.full((1, 3, 4), 22.0)
+    sound = torch.full((1, 3, 2), 33.0)
+    packed = torch.cat([video.reshape(1, -1), action.reshape(1, -1), sound.reshape(1, -1)], dim=1)
+
+    def fake_recv(noise_pred, t, latents, do_true_cfg, per_request_scheduler=None, generator=None):
+        assert noise_pred is None
+        return packed.clone()
+
+    monkeypatch.setattr(pipeline, "scheduler_step_maybe_with_cfg", fake_recv)
+
+    video_out, action_out, sound_out = pipeline.diffuse(
+        latents=torch.zeros(1, 2, 1, 1, 1),
+        action_latents=torch.zeros(1, 3, 4),
+        sound_latents=torch.zeros(1, 3, 2),
+        timesteps=torch.tensor([9, 3]),
+        cond_ids=_ids(2),
+        cond_mask=_mask(),
+        uncond_ids=_ids(1),
+        uncond_mask=_mask(),
+        guidance_scale=1.0,
+        shared_kwargs={"video_shape": (1, 1, 1), "fps": 24.0},
+    )
+    torch.testing.assert_close(video_out, video)
+    torch.testing.assert_close(action_out, action)
+    torch.testing.assert_close(sound_out, sound)
+    assert pipeline.transformer.pp_reset_calls == 1
+
+
+def test_diffuse_pp_none_branch_keeps_local_latents_on_middle_rank(
+    make_cosmos3_pipeline, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pipeline = _make_pp_pipeline(make_cosmos3_pipeline, monkeypatch, first=False, last=False)
+
+    latents = torch.full((1, 2, 1, 1, 1), 5.0)
+    action = torch.full((1, 3, 4), 6.0)
+    sound = torch.full((1, 3, 2), 7.0)
+
+    def fake_recv(noise_pred, t, latents, do_true_cfg, per_request_scheduler=None, generator=None):
+        # Middle ranks do not receive the packed result; the handshake leaves
+        # the local latents untouched.
+        return latents
+
+    monkeypatch.setattr(pipeline, "scheduler_step_maybe_with_cfg", fake_recv)
+
+    video_out, action_out, sound_out = pipeline.diffuse(
+        latents=latents,
+        action_latents=action,
+        sound_latents=sound,
+        timesteps=torch.tensor([9, 3]),
+        cond_ids=_ids(2),
+        cond_mask=_mask(),
+        uncond_ids=_ids(1),
+        uncond_mask=_mask(),
+        guidance_scale=1.0,
+        shared_kwargs={"video_shape": (1, 1, 1), "fps": 24.0},
+    )
+    torch.testing.assert_close(video_out, latents)
+    torch.testing.assert_close(action_out, action)
+    torch.testing.assert_close(sound_out, sound)
+
+
+def test_diffuse_pp_none_branch_video_only_returns_tensor(
+    make_cosmos3_pipeline, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pipeline = _make_pp_pipeline(make_cosmos3_pipeline, monkeypatch, first=True, last=False)
+
+    received = torch.full((1, 2, 1, 1, 1), 9.0)
+
+    def fake_recv(noise_pred, t, latents, do_true_cfg, per_request_scheduler=None, generator=None):
+        assert noise_pred is None
+        return received.clone()
+
+    monkeypatch.setattr(pipeline, "scheduler_step_maybe_with_cfg", fake_recv)
+
+    result = pipeline.diffuse(
+        latents=torch.zeros(1, 2, 1, 1, 1),
+        timesteps=torch.tensor([9, 3]),
+        cond_ids=_ids(2),
+        cond_mask=_mask(),
+        uncond_ids=_ids(1),
+        uncond_mask=_mask(),
+        guidance_scale=1.0,
+        shared_kwargs={"video_shape": (1, 1, 1), "fps": 24.0},
+    )
+    assert isinstance(result, torch.Tensor)
+    torch.testing.assert_close(result, received)
+
+
+def test_diffuse_pp_sequential_cfg_skips_local_combine_off_last_rank(
+    make_cosmos3_pipeline, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pipeline = _make_pp_pipeline(make_cosmos3_pipeline, monkeypatch, first=True, last=False)
+    combines: list[Any] = []
+    real_combine = pipeline.combine_cfg_noise
+
+    def recording_combine(*args, **kwargs):
+        combines.append(args)
+        return real_combine(*args, **kwargs)
+
+    monkeypatch.setattr(pipeline, "combine_cfg_noise", recording_combine)
+    # Off the last rank the driver returns None, so _step must take the
+    # None-branch instead of combining locally.
+    monkeypatch.setattr(pipeline, "predict_noise_maybe_with_cfg", lambda *args, **kwargs: None)
+
+    def fake_recv(noise_pred, t, latents, do_true_cfg, per_request_scheduler=None, generator=None):
+        return torch.zeros_like(latents)
+
+    monkeypatch.setattr(pipeline, "scheduler_step_maybe_with_cfg", fake_recv)
+
+    result = pipeline.diffuse(
+        latents=torch.zeros(1, 2, 1, 1, 1),
+        timesteps=torch.tensor([9]),
+        cond_ids=_ids(2),
+        cond_mask=_mask(),
+        uncond_ids=_ids(1),
+        uncond_mask=_mask(),
+        guidance_scale=3.0,
+        shared_kwargs={"video_shape": (1, 1, 1), "fps": 24.0},
+    )
+    assert combines == []
+    assert isinstance(result, torch.Tensor)
+
+
+def test_predict_noise_passes_intermediate_tensors_through(make_cosmos3_pipeline) -> None:
+    """Non-last PP ranks: the transformer returns IntermediateTensors and
+    predict_noise must forward them untouched (no dtype conversion)."""
+    from vllm.sequence import IntermediateTensors
+
+    pipeline = make_cosmos3_pipeline()
+
+    class PPStubTransformer(StubCosmos3Transformer):
+        def forward(self, **kwargs: Any) -> IntermediateTensors:
+            return IntermediateTensors({"hidden_gen": torch.zeros(1, 4, 8)})
+
+    pipeline.transformer = PPStubTransformer(latent_channel_size=2)
+
+    out = pipeline.predict_noise(
+        _cache_context="cond",
+        hidden_states=torch.zeros(1, 2, 1, 1, 1),
+        timestep=torch.tensor([1.0]),
+        text_ids=_ids(2),
+        text_mask=_mask(),
+        intermediate_tensors=None,
+    )
+    assert isinstance(out, IntermediateTensors)
+    assert torch.equal(out["hidden_gen"], torch.zeros(1, 4, 8))
+
+
+def test_forward_transfer_rejects_pipeline_parallel(make_cosmos3_pipeline, monkeypatch: pytest.MonkeyPatch) -> None:
+    pipeline = make_cosmos3_pipeline()
+    monkeypatch.setattr(pipeline, "_pp_parallel_active", lambda: True)
+
+    with pytest.raises(NotImplementedError, match="pipeline parallelism"):
+        pipeline._forward_transfer(
+            prompt="transfer",
+            negative_prompt="",
+            sp=make_sampling_params(),
+            transfer_config=SimpleNamespace(),
+            transfer_video_tensor=None,
+            transfer_input_fps=None,
+        )
+
+
 @pytest.mark.parametrize(
     ("text_cfg_below_one", "expected_calls"),
     [
@@ -3430,3 +3624,98 @@ def test_diffuse_transfer_interval_bounds_and_cfg_normalization(
         open_guidance_interval=open_interval,
     )
     assert cfg_calls == [True] * (1 if open_interval else 3)
+
+
+@pytest.mark.parametrize(
+    ("pp_size", "cache_backend", "should_raise"),
+    [
+        (2, "sea_cache", True),
+        (2, "tea_cache", True),
+        (2, "cache_dit", True),
+        (2, "none", False),
+        (2, None, False),
+        (1, "sea_cache", False),
+    ],
+)
+def test_pipeline_parallel_rejects_cache_backends(pp_size, cache_backend, should_raise) -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import _validate_cosmos3_pp_cache_backend
+
+    od_config = SimpleNamespace(
+        cache_backend=cache_backend,
+        parallel_config=SimpleNamespace(pipeline_parallel_size=pp_size),
+    )
+    if should_raise:
+        with pytest.raises(ValueError, match="pipeline parallelism"):
+            _validate_cosmos3_pp_cache_backend(od_config)
+    else:
+        _validate_cosmos3_pp_cache_backend(od_config)
+
+
+def test_pipeline_init_rejects_cache_backend_under_pp_before_loading(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm_omni.diffusion.models.cosmos3 import pipeline_cosmos3
+
+    monkeypatch.setattr(
+        pipeline_cosmos3.FlowUniPCMultistepScheduler,
+        "load_config",
+        lambda *args, **kwargs: pytest.fail("component loading must not start for PP + cache backend"),
+    )
+    od_config = SimpleNamespace(
+        model="/nonexistent/model/path",
+        cache_backend="sea_cache",
+        parallel_config=SimpleNamespace(pipeline_parallel_size=2, cfg_parallel_size=1, ulysses_degree=1),
+    )
+    with pytest.raises(ValueError, match="cache_backend='sea_cache'"):
+        pipeline_cosmos3.Cosmos3OmniDiffusersPipeline(od_config=od_config)
+
+
+def test_cosmos3_cache_extractor_rejects_pipeline_parallel_inputs() -> None:
+    from vllm_omni.diffusion.cache.teacache.extractors import extract_cosmos3_context
+
+    with pytest.raises(NotImplementedError, match="pipeline parallelism"):
+        extract_cosmos3_context(
+            nn.Module(),
+            hidden_states=torch.zeros(1),
+            timestep=torch.zeros(1),
+            text_ids=torch.zeros(1, dtype=torch.long),
+            text_mask=torch.ones(1, dtype=torch.long),
+            video_shape=(1, 1, 1),
+            intermediate_tensors=None,
+        )
+
+
+@pytest.mark.parametrize(
+    ("pp_size", "enable_cpu_offload", "should_raise"),
+    [
+        (2, True, True),
+        (2, False, False),
+        (1, True, False),
+    ],
+)
+def test_pipeline_parallel_rejects_model_level_cpu_offload(pp_size, enable_cpu_offload, should_raise) -> None:
+    from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import _validate_cosmos3_pp_model_offload
+    from vllm_omni.diffusion.offloader.config import resolve_offload
+
+    od_config = _make_od_config(sound_gen=False)
+    od_config.enable_cpu_offload = enable_cpu_offload
+    od_config.parallel_config.pipeline_parallel_size = pp_size
+    strategy = resolve_offload(od_config).strategy
+    if should_raise:
+        with pytest.raises(ValueError, match="model-level CPU offload"):
+            _validate_cosmos3_pp_model_offload(od_config, strategy)
+    else:
+        _validate_cosmos3_pp_model_offload(od_config, strategy)
+
+
+def test_pipeline_init_rejects_model_cpu_offload_under_pp_before_loading(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vllm_omni.diffusion.models.cosmos3 import pipeline_cosmos3
+
+    monkeypatch.setattr(
+        pipeline_cosmos3.FlowUniPCMultistepScheduler,
+        "load_config",
+        lambda *args, **kwargs: pytest.fail("component loading must not start for PP + model CPU offload"),
+    )
+    od_config = _make_od_config(sound_gen=False)
+    od_config.enable_cpu_offload = True
+    od_config.parallel_config.pipeline_parallel_size = 2
+    with pytest.raises(ValueError, match="model-level CPU offload"):
+        pipeline_cosmos3.Cosmos3OmniDiffusersPipeline(od_config=od_config)

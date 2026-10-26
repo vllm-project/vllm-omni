@@ -63,7 +63,7 @@ for RTX 4090, RTX 5090, DGX Spark, and RTX PRO 6000 Blackwell.
 | [`FastVideo/FastH3-V2.md`](./FastVideo/FastH3-V2.md) | FastH3 V2 eight-step T2VA checkpoint | CUDA with FastVideo tile64 or FlashInfer on SM120/SM121; full-model qualification pending |
 | [`FastVideo/FastH3-Omni.md`](./FastVideo/FastH3-Omni.md) | FastH3 Omni eight-step Ref2VA, multi-GPU serving | Shared eight-GPU profile; PRO 5000 baseline in recipe |
 | [FastH3 RefOmni Single Card](<./FastVideo/FastH3 RefOmni Single Card.md>) | Single-card installation, serving, and generation guide | RTX 4090 / 5090 / DGX Spark / RTX PRO 6000 Blackwell |
-| [`fishaudio/Drama-3.md`](./fishaudio/Drama-3.md) | Online serving for TTS | 1x H100 80GB |
+| [`fishaudio/Drama-3.md`](./fishaudio/Drama-3.md) | Online serving for TTS | 1x H200 141GB / 2x Ascend 910B 64GB |
 | [`fishaudio/Fish-Speech-S2-Pro.md`](./fishaudio/Fish-Speech-S2-Pro.md) | Online serving for TTS | 1x A800 80GB |
 | [`Helios/Helios.md`](./Helios/Helios.md) | Text-to-video, image-to-video, and video-to-video generation | 1x NVIDIA H20 |
 | [`HiDream-ai/HiDream-O1-Image.md`](./HiDream-ai/HiDream-O1-Image.md) | Text-to-image with shared offline example | 1x or 2x H100 80GB |
@@ -118,7 +118,7 @@ for RTX 4090, RTX 5090, DGX Spark, and RTX PRO 6000 Blackwell.
 | [`Tencent/Covo-Audio-Chat.md`](./Tencent/Covo-Audio-Chat.md) | Online serving for audio chat | 1x A100 80GB |
 | [`Tencent/HunyuanImage-3.0-Instruct.md`](./Tencent/HunyuanImage-3.0-Instruct.md) | DiT-only text-to-image serving and benchmark, including ModelOpt mixed FP8/NVFP4 | 4x H100/H800 80GB / 2x B200 |
 | [`Tencent/HunyuanVideo-1.5.md`](./Tencent/HunyuanVideo-1.5.md) | Offline text-to-video (HunyuanVideo-1.5 Diffusers) | 1x Intel Arc Pro B70 32GB |
-| [`Tongyi-MAI/Z-Image-Turbo.md`](./Tongyi-MAI/Z-Image-Turbo.md) | Offline few-step text-to-image (Z-Image-Turbo) | 1x Intel Arc Pro B70 32GB |
+| [`Tongyi-MAI/Z-Image-Turbo.md`](./Tongyi-MAI/Z-Image-Turbo.md) | Offline few-step text-to-image; online text-to-image and image-editing serving | 1x Intel Arc Pro B70 32GB / 1x RTX 5880 48GB |
 | [`Wan-AI/Wan2.2-T2V.md`](./Wan-AI/Wan2.2-T2V.md) | Text-to-video serving (Wan2.2 14B) with Skip-Softmax sparse attention | 8x H20/H100/A100 / 1x datacenter Blackwell (B200/B300) / 1x Intel Arc Pro B70 32GB |
 | [`Wan-AI/Wan2.2-TI2V-5B-A100.md`](./Wan-AI/Wan2.2-TI2V-5B-A100.md) | Unified 720p text-to-video and image-to-video serving (Wan2.2 5B) | 1x A100-SXM4-80GB |
 | [`Wan-AI/Wan2.2-I2V.md`](./Wan-AI/Wan2.2-I2V.md) | Image-to-video serving (Wan2.2 14B) | 8x Ascend NPU (A2/A3) |

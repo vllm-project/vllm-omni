@@ -103,6 +103,7 @@ from vllm.entrypoints.serve.utils.api_utils import should_include_usage
 from vllm.entrypoints.serve.utils.tool_calls_utils import maybe_filter_parallel_tool_calls
 from vllm.inputs import PromptType
 from vllm.logger import init_logger
+from vllm.multimodal.image import open_image
 from vllm.multimodal.media.connector import MediaConnector
 from vllm.outputs import RequestOutput
 from vllm.parser.mistral import MistralToolCall
@@ -832,7 +833,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     # Best-effort decode first reference image for i2i.
                     try:
                         img_bytes = base64.b64decode(reference_images[0])
-                        img = Image.open(BytesIO(img_bytes))
+                        img = open_image(BytesIO(img_bytes))
                         engine_prompt_image = {"img2img": img}
                     except Exception:
                         engine_prompt_image = None
@@ -899,7 +900,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 if reference_images:
                     try:
                         img_bytes = base64.b64decode(reference_images[0])
-                        img = Image.open(BytesIO(img_bytes))
+                        img = open_image(BytesIO(img_bytes))
                         text_prompt["multi_modal_data"] = {"image": img}
                         text_prompt["multi_modal_uuids"] = {"image": [f"{request_id}-image-0"]}
                     except Exception:
@@ -3625,7 +3626,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         for img_b64 in reference_images:
             try:
                 img_bytes = base64.b64decode(img_b64)
-                pil_images.append(Image.open(BytesIO(img_bytes)))
+                pil_images.append(open_image(BytesIO(img_bytes)))
             except Exception as e:
                 logger.warning("Failed to decode reference image: %s", e)
 
@@ -4015,7 +4016,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             for img_b64 in reference_images:
                 try:
                     img_bytes = base64.b64decode(img_b64)
-                    pil_images.append(Image.open(BytesIO(img_bytes)))
+                    pil_images.append(open_image(BytesIO(img_bytes)))
                 except Exception as e:
                     logger.warning("Failed to decode reference image: %s", e)
 

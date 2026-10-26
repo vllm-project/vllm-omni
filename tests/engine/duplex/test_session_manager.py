@@ -2308,6 +2308,31 @@ async def test_detach_is_refused_for_a_lease_the_caller_no_longer_holds() -> Non
 # --------------------------------------------------------------------------- #
 
 
+@pytest.mark.parametrize("response_bound", [False, True])
+async def test_completed_append_does_not_hold_response_gate(response_bound: bool) -> None:
+    tasks = DuplexSessionTasks()
+
+    async def append() -> bool:
+        return True
+
+    task = asyncio.create_task(append())
+    tasks.track_append_task(task, epoch=0, final=True, response_bound=response_bound)
+    tasks.append_tail = task
+    try:
+        assert tasks.has_response_bound_append_tasks() is response_bound
+        # The append runs before this coroutine resumes, but its done callback
+        # is queued for the following loop iteration. Barge-in can see this
+        # same window when prompt preparation finishes alongside VAD scoring.
+        await asyncio.sleep(0)
+        assert task.done()
+        assert task in tasks.append_tasks
+        assert not tasks.has_response_bound_append_tasks()
+        await tasks.cancel_append_tasks()
+        assert not tasks.has_response_bound_append_tasks()
+    finally:
+        await asyncio.gather(task, return_exceptions=True)
+
+
 async def test_cancel_append_tasks_absorbs_a_task_that_outlives_the_wait() -> None:
     """The wait after cancelling is allowed to time out; that is not an error.
 

@@ -382,6 +382,9 @@ or heard in the clip, such as the word-repetition prompts in
 instruction alone. The standalone `generate` command accepts the same choice as `--mix`.
 The MiniCPM-o Omni-DuplexEval nightly (`tests/dfx/perf/tests/test_minicpmo_4_5_omni_duplex_eval.json`)
 runs with `soundtrack`; the Qwen3-Omni `server_vad` nightly keeps `question`.
+Its DFX config uses `duplex_eval_score_floor_hardware` to enforce calibrated
+quality floors on H100, B200 and A3 while ROCm burn-in still requires complete
+generation, publication and judging but records scores without a quality floor.
 
 Each session decodes its media in a
 worker thread after acquiring a concurrency slot, and releases the decoded input
@@ -407,6 +410,10 @@ response without failing the sample; its collected text remains available to the
 judge. The runner drains active responses before closing the session. Responses
 created during close are recorded in `unfinished_response_ids` in the metadata;
 server errors, failed responses, and drain/close timeouts still fail the sample.
+Failed measured sessions write a compact control-state trace under
+`failed_sessions/<split>/<id>.json`. These files record the committed event,
+response IDs and statuses, listen metadata, open responses, and quiet-window
+timing, but are never passed to the judge.
 
 `--duplex-eval-response-root` is a **parent directory** and may already exist.
 Each invocation creates an exclusive `run-*` subdirectory, so repeated runs and
@@ -494,9 +501,13 @@ that commit has finished. A reply already open when the clip ends does not
 decide the session: completing it normally is what starts the residual unit, and
 that unit can still open a response. A cancelled reply does not decide the
 session either: barge-in cancels that turn, and the residual response can still
-open afterwards. A failed reply does end the wait. The server does not promote
-another unit after a failure, and a failed response created after the commit is
-itself the residual. The listening outcome is
+open afterwards. If the full drain timeout expires with every created response
+finished, no completion activity during the same 2-second quiet window, and no
+later response open, the runner accepts the settled terminal silence after the
+in-flight reply completes or is cancelled instead of reporting a drain timeout.
+It never takes this fallback during the normal wait. A failed reply does end the
+wait. The server does not promote another unit after a failure, and a failed
+response created after the commit is itself the residual. The listening outcome is
 a session in which the model never spoke; it publishes empty judge input and
 scores 0 instead of failing on the drain timeout. The runner withholds the last
 PCM sample when the clip ends on a model-unit boundary, so the commit always
@@ -745,7 +756,11 @@ It differs from the MiniCPM-o configuration in three ways:
 ### Seed-TTS reference speech as real audio input
 
 By default the Seed-TTS dataset sends its reference clip as voice-cloning metadata: `ref_audio` / `ref_text` ride the
-request body and the model is asked to synthesize the target text in that voice.
+request body. Voice cloning requires a model and endpoint that support those fields; sending them to Qwen3-Omni chat
+does not enable voice cloning. The default chat system prompt asks the model to read the target text verbatim,
+including questions and instructions, without answering or following them. Override it with `--seed-tts-system-prompt`.
+Use `--seed-tts-wer-save-items` to retain each target, ASR transcript, and WER in the result JSON when investigating
+content errors. WER compares the synthesized speech with the dataset target, not with the model's generated reply.
 
 `--seed-tts-reference-as-input` changes the request shape instead of the request contents. The reference clip becomes an
 ordinary **user audio turn**, `ref_audio` / `ref_text` are dropped entirely, and the system prompt asks the model to read

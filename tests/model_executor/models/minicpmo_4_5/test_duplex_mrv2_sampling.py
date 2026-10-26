@@ -47,7 +47,7 @@ def test_mrv2_thinker_payload_uses_output_channel_contract():
     assert output.finalize_multimodal(payload, [1]) is payload
 
 
-@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("partial_prefill", [True, False])
 def test_mrv2_sampler_preserves_history_seed_counts_and_prefill_eligibility(mocker, partial_prefill):

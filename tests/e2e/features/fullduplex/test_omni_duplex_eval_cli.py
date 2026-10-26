@@ -8,6 +8,7 @@ import asyncio
 import base64
 import json
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -569,6 +570,7 @@ def test_residual_unit_decision_follows_the_committed_event():
 
     assert runner._residual_unit_decided([created, done, committed], 0) is False
     assert runner._residual_unit_decided([created, committed, done], 0) is False
+    assert runner._residual_unit_decided([created, committed, done], 0, settled_silence_is_terminal=True) is True
     assert runner._residual_unit_decided([created, committed, listen, done], 0) is False
     assert runner._residual_unit_decided([created, committed, done, listen], 0) is True
     assert runner._residual_unit_decided([created, committed, late_created, late_done, done], 0) is True
@@ -580,11 +582,101 @@ def test_residual_unit_decision_follows_the_committed_event():
     late_failed = {"type": "response.done", "response": {"id": "r2", "status": "failed"}}
     # Barge-in can cancel the open reply and still open the residual afterwards.
     assert runner._residual_unit_decided([created, committed, cancelled], 0) is False
+    assert runner._residual_unit_decided([created, committed, cancelled], 0, settled_silence_is_terminal=True) is True
     assert runner._residual_unit_decided([created, committed, cancelled, late_created, late_done], 0) is True
     assert runner._residual_unit_decided([committed, late_created, late_cancelled], 0) is False
+    assert (
+        runner._residual_unit_decided([committed, late_created, late_cancelled], 0, settled_silence_is_terminal=True)
+        is True
+    )
     # A failed reply is terminal: nothing is promoted after it.
     assert runner._residual_unit_decided([created, committed, failed], 0) is True
     assert runner._residual_unit_decided([committed, late_created, late_failed], 0) is True
+    state = runner._completion_diagnostics(
+        [created, committed, cancelled],
+        0,
+        response_ids=["r1"],
+        stable_since=time.monotonic() - runner._COMPLETION_SETTLE_S - 1,
+    )
+    assert state["committed_observed"] is True
+    assert state["open_response_ids_at_commit"] == ["r1"]
+    assert state["unfinished_response_ids"] == []
+    assert state["quiet_window_satisfied"] is True
+    assert state["normal_terminal_decision"] is False
+    assert state["settled_silence_terminal_decision"] is True
+    assert state["completion_state_events"][-1] == {
+        "type": "response.done",
+        "response_id": "r1",
+        "response_status": "cancelled",
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["completed", "cancelled"])
+async def test_generate_accepts_settled_terminal_silence_only_after_the_drain_timeout(
+    tmp_path: Path, monkeypatch, status: str
+):
+    import websockets
+
+    timeout_observed = False
+
+    async def full_timeout(predicate, *, timeout_s: float, label: str):
+        nonlocal timeout_observed
+        assert timeout_s >= 20.0 and label == "response.done"
+        await asyncio.sleep(0.02)
+        assert predicate() is False
+        await asyncio.sleep(0.1)
+        assert predicate() is False
+        timeout_observed = True
+        raise TimeoutError(f"Timed out waiting for {label}")
+
+    async def handler(websocket):
+        opened = False
+        async for raw in websocket:
+            event = json.loads(raw)
+            if event["type"] == "session.update":
+                await websocket.send(json.dumps({"type": "session.created"}))
+            elif event["type"] == "input_audio_buffer.append" and not opened:
+                opened = True
+                await websocket.send(json.dumps({"type": "response.created", "response": {"id": "r1"}}))
+                await websocket.send(
+                    json.dumps({"type": "response.output_text.delta", "response_id": "r1", "delta": "Interrupted."})
+                )
+            elif event["type"] == "input_audio_buffer.commit":
+                await websocket.send(json.dumps({"type": "input_audio_buffer.committed"}))
+                await websocket.send(json.dumps({"type": "response.done", "response": {"id": "r1", "status": status}}))
+            elif event["type"] == "session.close":
+                await websocket.send(json.dumps({"type": "session.closed"}))
+                return
+
+    monkeypatch.setattr(runner, "wait_for", full_timeout)
+    monkeypatch.setattr(runner, "_COMPLETION_SETTLE_S", 0.05)
+    monkeypatch.setattr(runner, "read_audio_pcm16", lambda path: b"\1\0" * 16_000)
+    monkeypatch.setattr(runner, "video_duration", lambda path: 1.0)
+    monkeypatch.setattr(runner, "iter_jpegs", lambda *args, **kwargs: iter([(0.0, b"jpeg")]))
+    audio = tmp_path / "question.wav"
+    video = tmp_path / "video.mp4"
+    for path in (audio, video):
+        path.write_bytes(b"data")
+    sample = DuplexSample("sample", "PR_post_event_reminder", "pr", "post_event_reminder", video, audio)
+
+    async with websockets.serve(handler, "127.0.0.1", 0) as server:
+        port = server.sockets[0].getsockname()[1]
+        result = await runner.generate_sample(
+            sample,
+            url=f"ws://127.0.0.1:{port}/v1/realtime?duplex=1",
+            model="mock",
+            ref_audio=None,
+            output_root=tmp_path / "responses",
+            pace="as-fast-as-possible",
+        )
+
+    assert timeout_observed
+    assert result.error == ""
+    assert result.metadata["response_done"] is True
+    assert result.metadata["drain_timeout"] is None
+    assert result.metadata["unfinished_response_ids"] == []
+    assert [row["sentence"] for row in result.timed_sentences] == ["Interrupted."]
 
 
 @pytest.mark.asyncio

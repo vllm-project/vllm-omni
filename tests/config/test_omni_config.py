@@ -971,10 +971,37 @@ stages:
     assert all(stage.model_config.use_v2_model_runner is expect_v2 for stage in structured.stage_configs)
 
 
-@pytest.mark.parametrize("platform", ["npu", "xpu"])
-def test_mrv2_fails_fast_on_platforms_without_native_workers(platform: str):
+def test_mrv2_fails_fast_on_xpu():
     with pytest.raises(NotImplementedError, match="Model Runner V2"):
-        _apply_platform_overrides(DeployConfig(model_runner="v2"), platform=platform)
+        _apply_platform_overrides(DeployConfig(model_runner="v2"), platform="xpu")
+
+
+@pytest.mark.parametrize("stage_override", [False, True])
+def test_mrv2_config_is_allowed_on_npu(stage_override):
+    deploy = (
+        DeployConfig(stages=[StageDeployConfig(stage_id=0, model_runner="v2")])
+        if stage_override
+        else DeployConfig(model_runner="v2")
+    )
+    deploy = _apply_platform_overrides(deploy, platform="npu")
+    if stage_override:
+        assert deploy.stages[0].model_runner == "v2"
+    else:
+        assert deploy.model_runner == "v2"
+
+
+def test_fish_omni_npu_profile_is_mrv2_tp_ep():
+    deploy = _apply_platform_overrides(load_deploy_config(_DEPLOY_DIR / "fish_omni.yaml"), platform="npu")
+    stage0, stage1 = deploy.stages
+    assert stage0.model_runner == "v2"
+    assert stage0.tensor_parallel_size == 2
+    assert stage0.enable_expert_parallel is True
+    assert stage0.enforce_eager is False
+    assert stage0.gpu_memory_utilization == 0.72
+    assert stage0.devices == "0,1"
+    assert stage1.model_runner == "v1"
+    assert stage1.gpu_memory_utilization == 0.1
+    assert stage1.devices == "1"
 
 
 def _qwen3_omni_pipeline() -> PipelineConfig:
@@ -1179,6 +1206,7 @@ def test_sub_config_fields_match_structured_scopes():
         "final_output",
         "supports_running_prefix_cache_reset",
         "supports_pending_generation",
+        "recompute_preemption",
         "active_stream_window",
         "session_mode",
         "duplex_max_sessions",
@@ -2538,3 +2566,28 @@ def test_mrv2_duplex_session_validation():
     ps_no_duplex = replace(ps, supports_duplex_mrv2=False)
     with pytest.raises(ValueError, match="supports session_mode 'turn' only"):
         validate_native_mrv2_session(deploy_duplex, ps_no_duplex, "v2")
+
+
+@pytest.mark.parametrize("execution_type", list(StageExecutionType))
+@pytest.mark.parametrize("mode", ["allow", "fail"])
+def test_recompute_preemption_projection_is_ar_only(execution_type, mode):
+    pipeline = PipelineConfig(
+        model_type="test_preemption",
+        stages=(
+            StagePipelineConfig(
+                stage_id=0,
+                model_stage="test",
+                execution_type=execution_type,
+                recompute_preemption=mode,
+                final_output=True,
+            ),
+        ),
+    )
+    deploy = DeployConfig(stages=[StageDeployConfig(stage_id=0)])
+    legacy = merge_pipeline_deploy(pipeline, deploy)[0]
+    structured = VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=deploy).stage_by_id(0)
+    expected = mode if execution_type is StageExecutionType.LLM_AR else "allow"
+    assert legacy.yaml_engine_args.get("recompute_preemption", "allow") == expected
+    assert structured.model_config.recompute_preemption == expected
+    if execution_type is not StageExecutionType.LLM_AR:
+        assert "recompute_preemption" not in legacy.yaml_engine_args

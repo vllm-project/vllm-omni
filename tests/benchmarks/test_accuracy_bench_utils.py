@@ -253,6 +253,39 @@ def test_seed_tts_floor_rejects_incomplete_sim_and_utmos_coverage():
     assert not any("seed_tts_utmos_mean=3.350000" in err for err in errs)
 
 
+@pytest.mark.parametrize(
+    ("timed_out_requests", "cancelled_after_timeout_requests"),
+    [(1, 0), (0, 3)],
+)
+def test_validate_seed_tts_rejects_high_scoring_partial_timeout_result(
+    timed_out_requests: int,
+    cancelled_after_timeout_requests: int,
+) -> None:
+    partial = {
+        "seed_tts_content_evaluated": 1,
+        "seed_tts_content_error_mean": 0.01,
+        "seed_tts_turn_count": 1,
+        "seed_tts_request_failed": 0,
+        "seed_tts_no_pcm": 0,
+        "seed_tts_sim_mean": 0.95,
+        "seed_tts_sim_evaluated": 1,
+        "seed_tts_sim_failed": 0,
+        "seed_tts_utmos_mean": 4.5,
+        "seed_tts_utmos_evaluated": 1,
+        "seed_tts_utmos_failed": 0,
+        "timed_out_requests": timed_out_requests,
+        "cancelled_after_timeout_requests": cancelled_after_timeout_requests,
+    }
+
+    errs = _validate_seed_tts(partial, max_mean_wer=0.05, min_mean_sim=0.80, min_mean_utmos=3.10)
+
+    assert any(
+        f"timed_out_requests={timed_out_requests}" in err
+        and f"cancelled_after_timeout_requests={cancelled_after_timeout_requests}" in err
+        for err in errs
+    )
+
+
 def test_seed_tts_floor_coverage_excludes_rows_the_scorer_never_sees():
     """ASR failures skip SIM, empty audio skips UTMOS; neither is a coverage gap."""
     result = {

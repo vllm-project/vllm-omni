@@ -647,6 +647,8 @@ def test_pipeline_source_file_dependency_keys_are_registered() -> None:
         | _pipeline_dep_keys(Path(".buildkite/cuda/test-merge.yml"))
         | _pipeline_dep_keys(Path(".buildkite/cuda/test-nightly.yml"))
         | _pipeline_dep_keys(Path(".buildkite/cuda/test-weekly.yml"))
+        | _pipeline_dep_keys(Path(".buildkite/amd/test-amd-nightly.yml"))
+        | _pipeline_dep_keys(Path(".buildkite/amd/test-amd-weekly.yml"))
         | _pipeline_dep_keys(Path(".buildkite/npu/test-npu-nightly.yml"))
     )
     missing = used - set(registry)

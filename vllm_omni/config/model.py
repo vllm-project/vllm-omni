@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from dataclasses import MISSING, field
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import ConfigDict, TypeAdapter
 from transformers import PretrainedConfig
@@ -132,6 +132,7 @@ class OmniModelConfig(ModelConfig):
     retains_state_across_chunks: bool = False
     supports_pending_generation: bool = False
     supports_running_prefix_cache_reset: bool = True
+    recompute_preemption: Literal["allow", "fail"] = "allow"
     use_v2_model_runner: bool = False
     supports_native_mrv2_data_plane: bool = False
     # Stage-1 active stream slots; 0 keeps legacy chunk-level round-robin.

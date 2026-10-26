@@ -94,6 +94,23 @@ class OmniGPUWorkerBase(GPUWorker):
             gc.collect()
             return res
 
+    def get_stage_post_warmup_memory_stats(self) -> dict[str, int] | None:
+        if self.rank != 0:
+            return None
+        model = self.model_runner.get_model()
+        get_stats = getattr(model, "get_stage_post_warmup_memory_stats", None)
+        if get_stats is None:
+            return None
+
+        stats = get_stats()
+        if stats is None:
+            return None
+
+        return {
+            "allocated_bytes": stats.allocated_bytes,
+            "reserved_bytes": stats.reserved_bytes,
+        }
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
@@ -329,9 +346,9 @@ class OmniGPUWorkerBase(GPUWorker):
         if is_sleep_enabled:
             current_omni_platform.synchronize()
             gc.collect()
-            from vllm.device_allocator.cumem import CuMemAllocator
+            from vllm.device_allocator import get_mem_allocator_instance
 
-            allocator = CuMemAllocator.get_instance()
+            allocator = get_mem_allocator_instance()
             logger.info(f"[LLM Worker {self.rank}] Sleep Mode ENABLED. Activating CuMem pool for tag: {tag}")
             return allocator.use_memory_pool(tag=tag)
         else:
@@ -344,7 +361,7 @@ class OmniGPUWorkerBase(GPUWorker):
         Args:
             level: 1 (Offload weights to CPU), level: 2 (Total Discard).
         """
-        from vllm.device_allocator.cumem import CuMemAllocator
+        from vllm.device_allocator import get_mem_allocator_instance
 
         # Drain in-flight kernels before CuMem unmap. Abort/decode can still
         # have GPU work after the scheduler reports idle; unmapping then
@@ -354,7 +371,7 @@ class OmniGPUWorkerBase(GPUWorker):
 
         mem_before = current_omni_platform.get_current_memory_usage(self.device)
         offload_tags = ("weights",) if level == 1 else tuple()
-        allocator = CuMemAllocator.get_instance()
+        allocator = get_mem_allocator_instance()
         allocator.sleep(offload_tags=offload_tags)
         # allocator.sleep already gc.collects and empty_cache()s. A second
         # empty_cache on the pluggable allocator is a known CUDA invalid
@@ -372,9 +389,9 @@ class OmniGPUWorkerBase(GPUWorker):
 
     def wake_up(self, tags: list[str] | None = None) -> bool:
         "Physical video memory reloading logic"
-        from vllm.device_allocator.cumem import CuMemAllocator
+        from vllm.device_allocator import get_mem_allocator_instance
 
-        allocator = CuMemAllocator.get_instance()
+        allocator = get_mem_allocator_instance()
         allocator.wake_up(tags)
         current_omni_platform.synchronize()
         logger.info(f"[LLM Worker {self.rank}] Wake-up complete.")

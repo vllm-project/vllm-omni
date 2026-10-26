@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import json
+import re
 from importlib.util import find_spec, module_from_spec, spec_from_file_location
 from pathlib import Path
 from shlex import split
@@ -15,6 +17,7 @@ AMD_NIGHTLY_PIPELINE = Path(".buildkite/amd/test-amd-nightly.yml")
 AMD_WEEKLY_PIPELINE = Path(".buildkite/amd/test-amd-weekly.yml")
 AMD_READY_PIPELINE = Path(".buildkite/amd/test-amd-ready.yml")
 AMD_BOOTSTRAP = Path(".buildkite/amd/scripts/bootstrap-amd-omni.sh")
+AMD_COLLECTION_GUARD = Path(".buildkite/amd/scripts/assert-pytest-collection.sh")
 AMD_SUITE_COMBINER = Path(__file__).resolve().parents[2] / ".buildkite/amd/scripts/combine_test_suites.py"
 AMD_RUNNER = Path(".buildkite/amd/scripts/run-amd-test.sh")
 AMD_TEMPLATE = Path(".buildkite/amd/test-template-amd-omni.j2")
@@ -58,6 +61,23 @@ OMNI_PROCESSOR_TEST = "tests/model_executor/models/test_omni_processing.py"
 OMNI_PROCESSOR_TIMING_ENV = "VLLM_OMNI_AMD_PROCESSOR_TIMING"
 QWEN_IMAGE_SMOKE_LABEL = "Qwen-Image Official-Weight Smoke"
 QWEN_IMAGE_SMOKE_NODE = "tests/e2e/online_serving/test_qwen_image.py::test_text_to_image_001[default]"
+TINY_DIFFUSION_PATH = "tests/model_tests/diffusion/test_common_offline.py"
+TINY_DIFFUSION_JOBS = (
+    (
+        "ROCm · Tiny Diffusion Multi-GPU · 2-GPU",
+        "mi300_2",
+        12,
+        "full_model and diffusion and rocm and MI325 and cards_2 and not nvidia_only",
+        "artifacts/rocm-tiny-diffusion-2gpu/**/*",
+    ),
+    (
+        "ROCm · Tiny Diffusion Multi-GPU · 4-GPU",
+        "mi300_4",
+        11,
+        "full_model and diffusion and rocm and MI325 and cards_4 and not nvidia_only",
+        "artifacts/rocm-tiny-diffusion-4gpu/**/*",
+    ),
+)
 
 COMBINER_SPEC = spec_from_file_location("combine_test_suites", AMD_SUITE_COMBINER)
 assert COMBINER_SPEC is not None and COMBINER_SPEC.loader is not None
@@ -92,6 +112,23 @@ def _walk_steps(steps: list[dict]):
     for step in steps:
         yield step
         yield from _walk_steps(step.get("steps", []))
+
+
+_MARK_EXPRESSION = re.compile(r"(?:^|\s)-m\s+(['\"])(.*?)\1", re.DOTALL)
+
+
+def _marker_expressions(step: dict) -> list[str]:
+    return [match.group(2) for command in step.get("commands", []) for match in _MARK_EXPRESSION.finditer(command)]
+
+
+def _amd_marker_selector_inventory(marker: str) -> set[tuple[Path, str, str]]:
+    return {
+        (pipeline_path, step["label"], expression)
+        for pipeline_path in (AMD_READY_PIPELINE, AMD_MERGE_PIPELINE)
+        for step in _walk_steps(yaml.safe_load(pipeline_path.read_text(encoding="utf-8"))["steps"])
+        for expression in _marker_expressions(step)
+        if re.search(rf"\b{re.escape(marker)}\b", expression)
+    }
 
 
 def _steps_selecting_node(pipeline_path: Path, node: str) -> list[dict]:
@@ -565,9 +602,167 @@ def test_joy_gpu_suite_remains_selected_by_cuda_model_lane() -> None:
     assert "pytest.mark.cpu" not in Path(JOY_GPU_PATH).read_text(encoding="utf-8")
 
 
+# These jobs previously selected CUDA-marked items on AMD. Each migrated lane
+# now selects its qualified ROCm variants and verifies the exact collection
+# before running the GPU workload.
+_ROCM_MIGRATED_AMD_GPU_JOBS = (
+    (
+        "Diffusion · Model Test",
+        AMD_READY_PIPELINE,
+        "Blocking",
+        117,
+        "core_model and rocm and MI325 and not nvidia_only and not "
+        "(cards_2 or cards_3 or cards_4 or cards_5 or cards_6 or cards_7 or cards_8)",
+    ),
+    (
+        "ROCm · Model Executor GPU Coverage (R2-01) · Shard %N/%t",
+        AMD_READY_PIPELINE,
+        "NonBlocking",
+        1416,
+        "core_model and rocm and MI325 and not nvidia_only and not "
+        "(cards_2 or cards_3 or cards_4 or cards_5 or cards_6 or cards_7 or cards_8)",
+    ),
+    (
+        "ROCm · Entrypoints GPU Coverage (R2-02)",
+        AMD_READY_PIPELINE,
+        "NonBlocking",
+        3,
+        "core_model and rocm and MI325 and not nvidia_only and not "
+        "(cards_2 or cards_3 or cards_4 or cards_5 or cards_6 or cards_7 or cards_8)",
+    ),
+    (
+        "Diffusion · LoRA Test",
+        AMD_MERGE_PIPELINE,
+        "Blocking",
+        1,
+        "advanced_model and rocm and MI325 and cards_1 and not nvidia_only",
+    ),
+    (
+        "Diffusion · Wan22 Offline Test",
+        AMD_MERGE_PIPELINE,
+        "Blocking",
+        2,
+        "advanced_model and rocm and MI325 and cards_1 and diffusion and not nvidia_only",
+    ),
+    (
+        "Diffusion · Wan22 Online Test",
+        AMD_MERGE_PIPELINE,
+        "Blocking",
+        1,
+        "advanced_model and rocm and MI325 and cards_1 and diffusion and not nvidia_only",
+    ),
+    (
+        "Omni Model Test Qwen3-Omni",
+        AMD_MERGE_PIPELINE,
+        "Blocking",
+        16,
+        "advanced_model and rocm and MI325 and not nvidia_only",
+    ),
+    (
+        "Qwen3-TTS Base E2E Test",
+        AMD_MERGE_PIPELINE,
+        "Blocking",
+        3,
+        "advanced_model and rocm and MI325 and cards_1 and not nvidia_only",
+    ),
+)
+
+
+def test_ready_and_merge_pipelines_have_no_cuda_marker_selectors() -> None:
+    assert _amd_marker_selector_inventory("cuda") == set()
+
+
+def test_migrated_amd_gpu_jobs_select_exact_rocm_collections() -> None:
+    for label, pipeline_path, grade, expected_count, marker_expression in _ROCM_MIGRATED_AMD_GPU_JOBS:
+        step = _find_step(label, pipeline_path)
+        assert step.get("grade") == grade
+
+        collect_commands = [command for command in step["commands"] if AMD_COLLECTION_GUARD.name in command]
+        run_commands = [
+            command
+            for command in step["commands"]
+            if AMD_COLLECTION_GUARD.name not in command
+            and marker_expression in _marker_expressions({"commands": [command]})
+        ]
+        assert len(collect_commands) == 1
+        assert len(run_commands) == 1
+        assert _marker_expressions({"commands": collect_commands}) == [marker_expression]
+        assert _marker_expressions({"commands": run_commands}) == [marker_expression]
+
+        collect_argv = split(collect_commands[0])
+        assert collect_argv[:2] == ["bash", str(AMD_COLLECTION_GUARD)]
+        assert collect_argv[2] == str(expected_count)
+
+
+def test_amd_collection_guard_rejects_empty_and_changed_collections() -> None:
+    guard = AMD_COLLECTION_GUARD.read_text(encoding="utf-8")
+    assert "set -euo pipefail" in guard
+    assert 'pytest --collect-only -q "$@"' in guard
+    assert "^tests\\/.*::" in guard
+    assert '"${actual_count}" != "${expected_count}"' in guard
+
+
+@pytest.mark.parametrize(("label", "agent_pool", "expected_count", "markers", "artifacts"), TINY_DIFFUSION_JOBS)
+def test_tiny_diffusion_multigpu_nightly_uses_native_rocm_collection(
+    label: str,
+    agent_pool: str,
+    expected_count: int,
+    markers: str,
+    artifacts: str,
+) -> None:
+    step = _find_step(label, AMD_NIGHTLY_PIPELINE)
+
+    assert step["agent_pool"] == agent_pool
+    assert step["mirror_hardwares"] == ["amdproduction"]
+    assert step["grade"] == "NonBlocking"
+    assert step["timeout_in_minutes"] == 40
+    assert step["artifact_paths"] == [artifacts]
+    assert "retry" not in step
+
+    commands = step["commands"]
+    collect_commands = [command for command in commands if AMD_COLLECTION_GUARD.name in command]
+    run_commands = [command for command in commands if "pytest -s" in command]
+    assert len(collect_commands) == 1
+    assert len(run_commands) == 1
+
+    collect_command = collect_commands[0]
+    run_command = run_commands[0]
+    collect_argv = split(collect_command)
+    run_argv = split(run_command)
+    assert collect_argv[:2] == ["bash", str(AMD_COLLECTION_GUARD)]
+    assert collect_argv[2] == str(expected_count)
+
+    for command, argv in ((collect_command, collect_argv), (run_command, run_argv)):
+        assert TINY_DIFFUSION_PATH in argv
+        assert _marker_expressions({"commands": [command]}) == [markers]
+        assert argv[argv.index("--run-level") + 1] == "core_model"
+
+    for cuda_marker in ("cuda", "L4", "H100", "B200"):
+        assert re.search(rf"\b{cuda_marker}\b", markers) is None
+
+    all_commands = "\n".join(commands)
+    assert "collection.txt" in all_commands
+    assert "pytest.xml" in all_commands
+    assert "pytest.log" in all_commands
+    assert "pytest-summary.txt" in all_commands
+
+
+def test_wan_sdpa_alignment_cpu_case_stays_shared_and_cuda_kernel_stays_nvidia() -> None:
+    cpu_case = Path("tests/diffusion/distributed/test_wan_attention_sdpa_alignment.py").read_text(encoding="utf-8")
+    cuda_case = Path("tests/diffusion/distributed/test_wan_attention_sdpa_alignment_cuda.py").read_text(
+        encoding="utf-8"
+    )
+    assert "pytest.mark.cpu" in cpu_case
+    assert "rocm" not in cpu_case
+    assert 'res={"cuda": "L4"}' in cuda_case
+    assert "rocm" not in cuda_case
+
+
 def test_joy_gpu_suite_is_not_duplicated_in_amd_model_lane() -> None:
     step = _find_step("Diffusion · Model Test", AMD_READY_PIPELINE)
-    argv = split(next(command for command in step["commands"] if "tests/diffusion/models/" in split(command)))
+    argv = split(
+        next(command for command in step["commands"] if split(command)[:4] == ["timeout", "15m", "pytest", "-sv"])
+    )
 
     assert step["grade"] == "Blocking"
     assert step["agent_pool"] == "mi300_1"
@@ -576,7 +771,8 @@ def test_joy_gpu_suite_is_not_duplicated_in_amd_model_lane() -> None:
     assert "--ignore=tests/diffusion/models/auk/test_auk_vae_fastpath.py" in argv
     assert "--ignore=tests/diffusion/models/mammoth_moda2/test_dit_attention_cuda.py" in argv
     assert argv[argv.index("-m") + 1] == (
-        "core_model and cuda and not (cards_2 or cards_3 or cards_4 or cards_5 or cards_6 or cards_7 or cards_8)"
+        "core_model and rocm and MI325 and not nvidia_only and not "
+        "(cards_2 or cards_3 or cards_4 or cards_5 or cards_6 or cards_7 or cards_8)"
     )
     assert argv[argv.index("--run-level") + 1] == "core_model"
 
@@ -652,12 +848,12 @@ def test_qwen3_tts_base_preserves_advanced_model_arguments() -> None:
     commands = step["commands"]
 
     assert all("bash -c" not in command for command in commands)
-    pytest_command = next(command for command in commands if "pytest" in command)
+    pytest_command = next(command for command in commands if "pytest" in split(command))
     argv = split(pytest_command)
 
     marker_index = argv.index("-m")
     run_level_index = argv.index("--run-level")
-    assert argv[marker_index + 1] == "advanced_model and cuda"
+    assert argv[marker_index + 1] == "advanced_model and rocm and MI325 and cards_1 and not nvidia_only"
     assert argv[run_level_index + 1] == "advanced_model"
 
 
@@ -808,7 +1004,6 @@ def test_z_image_merge_timeout_covers_cold_aiter_compile() -> None:
 @pytest.mark.parametrize(
     ("label", "pytest_marker"),
     [
-        ("ROCm · FlashAttention/AITER GPU Coverage", "tests/diffusion/attention/"),
         ("Custom Pipeline Test", "tests/e2e/features/custom_pipeline/"),
         ("Diffusion · Batch Test", "tests/diffusion/batching"),
     ],
@@ -823,17 +1018,22 @@ def test_ready_jobs_restore_bf16_aiter_module_without_publishing(label: str, pyt
     assert all("VLLM_ROCM_USE_AITER=0" not in command for command in step["commands"])
 
 
-def test_ready_flashattention_keeps_one_worker_and_mammoth_reuse() -> None:
+def test_ready_flashattention_publishes_bf16_aiter_module_on_success() -> None:
     step = _find_step("ROCm · FlashAttention/AITER GPU Coverage", AMD_READY_PIPELINE)
     pytest_commands = [command for command in step["commands"] if "pytest" in command]
 
+    assert step["agent_pool"] == "mi300_1"
+    assert step["depends_on"] == "amd-build"
+    assert step["mirror_hardwares"] == ["amdproduction"]
     assert step["grade"] == "NonBlocking"
     assert step["timeout_in_minutes"] == 60
     assert "export VLLM_ROCM_USE_AITER=1" in step["commands"]
+    _assert_build_scoped_aiter_mha_cache(step, "tests/diffusion/attention/", publishes=True)
     assert len(pytest_commands) == 2
     assert all("-n 1" in command for command in pytest_commands)
     assert "tests/diffusion/models/mammoth_moda2/test_dit_attention_cuda.py" in pytest_commands[1]
     assert "core_model and rocm and MI325 and cards_1" in pytest_commands[0]
+    assert AITER_MHA_CACHE_PUBLISH not in pytest_commands[1]
 
 
 def test_stable_audio_layerwise_reuses_the_bf16_aiter_module_cache() -> None:
@@ -1008,6 +1208,99 @@ def test_amd_runner_preserves_piped_failures_and_empty_collection() -> None:
     assert template.count("soft_fail: true") == 2
 
 
+def test_qwen_image_diffusers_accuracy_is_one_nonblocking_nightly_job() -> None:
+    step = _find_step("Qwen-Image Diffusers Accuracy", AMD_NIGHTLY_PIPELINE)
+    assert step["grade"] == "NonBlocking"
+    assert step["agent_pool"] == "mi300_1"
+    assert step["mirror_hardwares"] == ["amdproduction"]
+    assert step["timeout_in_minutes"] == 180
+    commands = "\n".join(step["commands"])
+    assert "full_model and diffusion and rocm and MI325 and cards_1" in commands
+    assert "--run-level full_model" in commands
+    assert "--collect-only" in commands
+    nodes = (
+        "tests/e2e/accuracy/test_qwen_image.py::test_qwen_image_matches_diffusers",
+        "tests/e2e/accuracy/test_qwen_image.py::test_qwen_image_matches_diffusers_pixelwise",
+    )
+    pytest_command = commands[commands.index("pytest -s -v") :]
+    offsets = [pytest_command.index(node) for node in nodes]
+    assert offsets == sorted(offsets)
+    assert all(commands.count(f'"{node}"') == 2 for node in nodes)
+    assert "Expected exactly two Qwen-Image accuracy nodes" in commands
+    assert "exit 5" in commands
+    assert "pytest.xml" in commands
+    assert step["env"]["DIFFUSION_ATTENTION_BACKEND"] == "TORCH_SDPA"
+    assert "tests/e2e/accuracy/test_qwen_image.py" in commands
+    assert "test_diffusers_backend_similarity.py" not in commands
+    for pipeline_path in (AMD_READY_PIPELINE, AMD_MERGE_PIPELINE):
+        text = pipeline_path.read_text(encoding="utf-8")
+        assert "Qwen-Image Diffusers Accuracy" not in text
+
+
+WAN22_SIMILARITY = "tests/e2e/accuracy/wan22_i2v/test_wan22_i2v_video_similarity.py"
+WAN22_2GPU_NODES = (
+    f"{WAN22_SIMILARITY}::test_wan22_i2v_diffusers_offline_generates_video",
+    f"{WAN22_SIMILARITY}::test_wan22_i2v_online_serving_generates_video",
+    f"{WAN22_SIMILARITY}::test_wan22_i2v_serving_matches_diffusers_video_similarity",
+)
+
+
+def test_wan22_accuracy_has_one_nonblocking_comparison_job() -> None:
+    two = _find_step("Wan2.2 I2V Accuracy 2 GPU", AMD_NIGHTLY_PIPELINE)
+    group = _find_group(":full_moon: Wan2.2 Accuracy MI300 Nightly", AMD_NIGHTLY_PIPELINE)
+    assert [step["label"] for step in group["steps"]] == ["Wan2.2 I2V Accuracy 2 GPU"]
+    assert two["agent_pool"] == "mi300_2"
+    two_commands = "\n".join(two["commands"])
+    assert two["grade"] == "NonBlocking"
+    assert two["timeout_in_minutes"] == 180
+    assert two["env"]["DIFFUSION_ATTENTION_BACKEND"] == "TORCH_SDPA"
+    two_marker = "full_model and diffusion and rocm and MI325 and (cards_1 or cards_2)"
+    assert two_marker in two_commands
+    assert 'and cards_2"' not in two_commands
+    pytest_command = two_commands[two_commands.index("pytest -s -v") :]
+    offsets = [pytest_command.index(node) for node in WAN22_2GPU_NODES]
+    assert offsets == sorted(offsets)
+    assert two_commands.count(WAN22_2GPU_NODES[0]) == 2
+    assert "tests/e2e/accuracy/wan22_i2v/result" in two_commands
+    assert "test_diffusers_backend_similarity.py" not in two_commands
+    assert "--collect-only" in two_commands
+    assert "Expected exactly three Wan2.2 accuracy nodes" in two_commands
+    assert "exit 5" in two_commands
+    similarity = Path(WAN22_SIMILARITY).read_text(encoding="utf-8")
+    assert "require_similarity_artifacts" in similarity
+    assert "similarity.json" in similarity
+    assert "Missing offline artifacts" not in similarity
+    for pipeline_path in (AMD_READY_PIPELINE, AMD_MERGE_PIPELINE):
+        text = pipeline_path.read_text(encoding="utf-8")
+        assert "Wan2.2 I2V Accuracy" not in text
+
+
+def test_wan22_similarity_fails_when_offline_baseline_is_removed(tmp_path: Path) -> None:
+    from tests.e2e.accuracy.wan22_i2v.prerequisite import require_similarity_artifacts
+
+    online = tmp_path / "online.mp4"
+    online.write_bytes(b"online")
+    with pytest.raises(AssertionError, match="offline.mp4"):
+        require_similarity_artifacts(
+            [
+                online,
+                tmp_path / "offline.mp4",
+                tmp_path / "offline_metadata.json",
+            ]
+        )
+
+
+def test_wan22_similarity_accepts_complete_artifacts(tmp_path: Path) -> None:
+    from tests.e2e.accuracy.wan22_i2v.prerequisite import require_similarity_artifacts
+
+    paths = []
+    for name in ("online.mp4", "offline.mp4", "offline_metadata.json"):
+        path = tmp_path / name
+        path.write_bytes(b"x")
+        paths.append(path)
+    require_similarity_artifacts(paths)
+
+
 def test_hunyuan_image3_lora_accuracy_is_one_nonblocking_nightly_job() -> None:
     step = _find_step("HunyuanImage3 LoRA Accuracy", AMD_NIGHTLY_PIPELINE)
     assert step["grade"] == "NonBlocking"
@@ -1061,3 +1354,151 @@ def test_hunyuanvideo15_accuracy_is_one_nonblocking_nightly_job() -> None:
     for pipeline_path in (AMD_READY_PIPELINE, AMD_MERGE_PIPELINE):
         text = pipeline_path.read_text(encoding="utf-8")
         assert "HunyuanVideo-1.5 Video Similarity" not in text
+
+
+def test_minimax_h3_accuracy_has_two_nonblocking_nightly_jobs() -> None:
+    timeline = _find_step("MiniMax-H3 Timeline Guide Accuracy", AMD_NIGHTLY_PIPELINE)
+    i2va = _find_step("MiniMax-H3 I2VA Ref2VA Accuracy", AMD_NIGHTLY_PIPELINE)
+    assert timeline["agent_pool"] == "mi300_2"
+    assert i2va["agent_pool"] == "mi300_4"
+    pairs = (
+        (
+            timeline,
+            "full_model and diffusion and rocm and MI325 and cards_2",
+            "tests/e2e/accuracy/minimax_h3/test_minimax_h3_timeline_guides.py",
+        ),
+        (
+            i2va,
+            "full_model and diffusion and rocm and MI325 and cards_4",
+            "tests/e2e/accuracy/minimax_h3/test_minimax_h3_i2va_ref2va_similarity.py",
+        ),
+    )
+    for step, marker, path in pairs:
+        assert step["grade"] == "NonBlocking"
+        assert step["timeout_in_minutes"] == 180
+        assert step["env"]["DIFFUSION_ATTENTION_BACKEND"] == "TORCH_SDPA"
+        commands = "\n".join(step["commands"])
+        assert marker in commands
+        assert path in commands
+        assert "--collect-only" in commands
+        assert "exit 5" in commands
+    timeline_commands = "\n".join(timeline["commands"])
+    assert "test_minimax_h3_timeline_guides_condition_frames_and_audio" in timeline_commands
+    assert "Expected exactly one MiniMax-H3 timeline accuracy node" in timeline_commands
+    i2va_commands = "\n".join(i2va["commands"])
+    assert "test_minimax_h3_i2va_matches_official_reference" in i2va_commands
+    assert "test_minimax_h3_ref2va_matches_official_reference" in i2va_commands
+    assert "Expected exactly $${#nodes[@]} MiniMax-H3 I2VA/Ref2VA nodes" in i2va_commands
+    for pipeline_path in (AMD_READY_PIPELINE, AMD_MERGE_PIPELINE):
+        text = pipeline_path.read_text(encoding="utf-8")
+        assert "MiniMax-H3 Timeline Guide Accuracy" not in text
+        assert "MiniMax-H3 I2VA Ref2VA Accuracy" not in text
+
+
+def test_minicpmo_accuracy_is_one_nonblocking_nightly_job() -> None:
+    step = _find_step("MiniCPM-o 4.5 Accuracy", AMD_NIGHTLY_PIPELINE)
+    assert step["grade"] == "NonBlocking"
+    assert step["agent_pool"] == "mi300_1"
+    assert step["mirror_hardwares"] == ["amdproduction"]
+    assert step["timeout_in_minutes"] == 180
+    commands = "\n".join(step["commands"])
+    assert "full_model and omni and rocm and MI325 and cards_1" in commands
+    assert "--run-level full_model" in commands
+    assert "--collect-only" in commands
+    assert "exit 5" in commands
+    assert "pytest.xml" in commands
+    assert step["env"]["SEED_TTS_WER_EVAL"] == "1"
+    assert step["env"]["SEED_TTS_SIM_EVAL"] == "1"
+    assert "SEED_TTS_EVAL_DEVICE" not in commands
+    assert "SEED_TTS_UTMOS_EVAL" not in commands
+    assert "Expected exactly $${#nodes[@]} MiniCPM-o 4.5 accuracy nodes" in commands
+    for node in (
+        "test_minicpmo_4_5_daily_omni_accuracy_bench",
+        "test_minicpmo_4_5_seed_tts_wer_bench",
+    ):
+        assert node in commands
+    for pipeline_path in (AMD_READY_PIPELINE, AMD_MERGE_PIPELINE):
+        text = pipeline_path.read_text(encoding="utf-8")
+        assert "MiniCPM-o 4.5 Accuracy" not in text
+
+
+def test_qwen_image_21_accuracy_is_one_nonblocking_nightly_job() -> None:
+    step = _find_step("Qwen-Image 2.1 Accuracy", AMD_NIGHTLY_PIPELINE)
+    assert step["grade"] == "NonBlocking"
+    assert step["agent_pool"] == "mi300_1"
+    assert step["mirror_hardwares"] == ["amdproduction"]
+    assert step["timeout_in_minutes"] == 180
+    commands = "\n".join(step["commands"])
+    assert "full_model and diffusion and rocm and MI325 and cards_1" in commands
+    assert "--run-level full_model" in commands
+    assert "--collect-only" in commands
+    assert "exit 5" in commands
+    assert "pytest.xml" in commands
+    assert step["env"]["QWEN_IMAGE_21_CALIBRATE"] == "0"
+    assert step["env"]["DIFFUSION_ATTENTION_BACKEND"] == "TORCH_SDPA"
+    assert "setup_reference.sh" in commands
+    assert "test_qwen_image_21_matches_reference[it2i]" in commands
+    assert "test_qwen_image_21_matches_reference[t2i]" in commands
+    assert "Expected exactly $${#nodes[@]} Qwen-Image 2.1 accuracy nodes" in commands
+    accuracy_test = Path("tests/e2e/accuracy/qwen_image_21/test_qwen_image_21.py").read_text(encoding="utf-8")
+    assert 'os.environ.get("BUILDKITE_COMMIT")' in accuracy_test
+    for pipeline_path in (AMD_READY_PIPELINE, AMD_MERGE_PIPELINE):
+        text = pipeline_path.read_text(encoding="utf-8")
+        assert "Qwen-Image 2.1 Accuracy" not in text
+
+
+def test_qwen3_omni_seed_tts_realtime_perf_is_one_nonblocking_nightly_job() -> None:
+    step = _find_step("Qwen3-Omni Seed-TTS Realtime Perf", AMD_NIGHTLY_PIPELINE)
+    assert step["grade"] == "NonBlocking"
+    assert step["agent_pool"] == "mi300_2"
+    assert step["depends_on"] == "amd-build"
+    assert step["mirror_hardwares"] == ["amdproduction"]
+    assert step["timeout_in_minutes"] == 180
+    assert step["env"]["BENCHMARK_DIR"] == (
+        "$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-qwen3-omni-seed-tts-perf/benchmark-results"
+    )
+    assert step["artifact_paths"] == ["artifacts/rocm-qwen3-omni-seed-tts-perf/**/*"]
+    commands = "\n".join(step["commands"])
+    assert "full_model and omni and rocm and MI325 and cards_2" in commands
+    assert "--run-level full_model" in commands
+    assert "--collect-only" in commands
+    assert "tests/dfx/perf/tests/test_qwen3_omni_seed_tts.json" in commands
+    assert "hf_hub_download" in commands
+    assert "SILERO_VAD_REVISION" in commands
+    assert "SileroVADBackendProvider().get()" in commands
+    assert "test_qwen3_omni_seed_tts_realtime-explicit" in commands
+    assert "test_qwen3_omni_seed_tts_realtime-vad" in commands
+    assert "Expected exactly $${#nodes[@]} Qwen3-Omni Seed-TTS realtime nodes" in commands
+    assert "timeout --signal=TERM --kill-after=2m 165m" in commands
+    assert "Expected exactly 2 Qwen3-Omni Seed-TTS result JSON files" in commands
+    assert "Expected exactly one Qwen3-Omni Seed-TTS $$name result JSON" in commands
+    config = json.loads(Path("tests/dfx/perf/tests/test_qwen3_omni_seed_tts.json").read_text(encoding="utf-8"))
+    assert config[0]["mark"][0]["hardware_marks"]["res"]["rocm"] == "MI325"
+    benchmark_params = config[0]["benchmark_params"]
+    assert len(benchmark_params) == 2
+    assert {params["name"] for params in benchmark_params} == {"explicit", "vad"}
+    assert all("baseline" not in params for params in benchmark_params)
+    for pipeline_path in (AMD_READY_PIPELINE, AMD_MERGE_PIPELINE):
+        text = pipeline_path.read_text(encoding="utf-8")
+        assert "Qwen3-Omni Seed-TTS Realtime Perf" not in text
+
+
+def test_omni_duplex_eval_is_one_nonblocking_nightly_job() -> None:
+    step = _find_step("MiniCPM-o Omni-DuplexEval CI Guard", AMD_NIGHTLY_PIPELINE)
+    assert step["grade"] == "NonBlocking"
+    assert step["agent_pool"] == "mi300_2"
+    assert step["mirror_hardwares"] == ["amdproduction"]
+    assert step["timeout_in_minutes"] == 240
+    commands = "\n".join(step["commands"])
+    assert "full_model and omni and rocm and MI325 and cards_2" in commands
+    assert "--run-level full_model" in commands
+    assert "--collect-only" in commands
+    assert "exit 5" in commands
+    assert "pytest.xml" in commands
+    assert step["env"]["BENCHMARK_DIR"] == "tests/dfx/perf/results"
+    assert step["env"]["ACC_BENCH_RESULT_DIR"] == "tests/e2e/accuracy/omni_duplex_eval/results"
+    assert "test_minicpmo_4_5_omni_duplex_eval.json" in commands
+    assert "Expected exactly one MiniCPM-o Omni-DuplexEval node" in commands
+    for pipeline_path in (AMD_READY_PIPELINE, AMD_MERGE_PIPELINE):
+        text = pipeline_path.read_text(encoding="utf-8")
+        assert "MiniCPM-o Omni-DuplexEval CI Guard" not in text

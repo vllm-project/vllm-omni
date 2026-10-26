@@ -29,8 +29,8 @@ def startup_server(request, tmp_path, monkeypatch):
     config.write_text("stages:\n  - stage_id: 0\n  - stage_id: 1\n")
     server = runtime.OmniServerStageCli("fake-model", str(config), [])
 
-    def launch(stage_id, *, headless, replica_id=0):
-        server.stage_procs[(stage_id, replica_id)] = proc
+    def launch(stage_id, *, headless):
+        server.stage_procs[stage_id] = proc
 
     monkeypatch.setattr(server, "_launch_stage", launch)
     return server

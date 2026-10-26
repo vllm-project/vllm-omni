@@ -494,6 +494,7 @@ class OmniStageModelConfig(_TrackExplicitConfigFields):
     final_output: bool = False
     supports_running_prefix_cache_reset: bool = True
     supports_pending_generation: bool = False
+    recompute_preemption: Literal["allow", "fail"] = "allow"
     active_stream_window: int = Field(default=0, ge=0)
     session_mode: str = "turn"
     duplex_max_sessions: int = Field(default=1, ge=1)
@@ -1400,6 +1401,7 @@ _DIFFUSION_STAGE_METADATA_FIELDS = frozenset(
         "retains_state_across_chunks",
         "supports_pending_generation",
         "supports_running_prefix_cache_reset",
+        "recompute_preemption",
         "scheduler_cls",
         "stage_connector_spec",
         "worker_type",
@@ -2070,6 +2072,10 @@ def _build_model_config(
     kwargs["supports_pending_generation"] = topology.supports_pending_generation
     if not topology.supports_running_prefix_cache_reset:
         kwargs["supports_running_prefix_cache_reset"] = False
+    # AR-only capability: diffusion stages have no KV-recompute preemption and
+    # reject unknown config fields.
+    if topology.execution_type is StageExecutionType.LLM_AR and topology.recompute_preemption != "allow":
+        kwargs["recompute_preemption"] = topology.recompute_preemption
     if "custom_voice_dir" not in kwargs and deploy.custom_voice_dir is not None:
         kwargs["custom_voice_dir"] = _copy_value(deploy.custom_voice_dir)
     stage_runner = resolve_stage_model_runner(deploy, stage_deploy)
