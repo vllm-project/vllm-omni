@@ -130,6 +130,7 @@ def _resolve_speaker_embeddings(
     ):
         audio_key = audio_keys[0]
         if isinstance(audio_key, str) and audio_key.strip():
+            # Keep the configured model string: path/ID aliases do not prove identical CAM++ weights.
             cache_key = cache.make_cache_key(
                 audio_key, model_type=f"ming_tts.reference:{wrapper.vllm_config.model_config.model}"
             )

@@ -92,7 +92,8 @@ async def test_inline_reference_artifact_key_survives_wire_roundtrip():
     info = await _build_and_roundtrip(adapter, _request())
 
     assert lookups == ["locator:reference-a"]
-    assert info["speaker_audio_keys"] == ["content-a"]
+    assert info["ming_speaker_audio_keys"] == ["content-a"]
+    assert "speaker_audio_keys" not in info
     assert "voice_name" not in info
     assert KEY_PROMPT_LATENTS not in info
     torch.testing.assert_close(info[KEY_SPEAKER_WAVEFORM], torch.tensor([[0.25, 0.5]]))
@@ -232,7 +233,7 @@ def test_zero_speaker_embedding_bypasses_reference_cache_and_extractor():
         wrapper,
         {
             "use_zero_spk_emb": True,
-            "speaker_audio_keys": ["content-a"],
+            "ming_speaker_audio_keys": ["content-a"],
             KEY_SPEAKER_WAVEFORM: torch.ones((1, 2)),
         },
     )
@@ -253,9 +254,9 @@ async def test_uploaded_voice_retains_versioned_cache_without_duplicate_artifact
 
     info = await _build_and_roundtrip(adapter, _request(ref_audio=None, voice="Uploaded"))
     assert not lookups
-    assert "speaker_audio_keys" not in info
+    assert "ming_speaker_audio_keys" not in info
     # Named voice identity must take precedence even if both forms arrive.
-    info["speaker_audio_keys"] = ["content-a"]
+    info["ming_speaker_audio_keys"] = ["content-a"]
     _resolve_speaker_embeddings(wrapper, info)
     _resolve_speaker_embeddings(wrapper, info)
     assert wrapper._speaker_extractor.call_count == 1
