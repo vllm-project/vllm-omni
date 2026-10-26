@@ -4850,11 +4850,12 @@ _ISSUE_ALERT_REPO = "vllm-project/vllm-omni"
 _ISSUE_ALERT_SEARCH_URL = "https://api.github.com/search/issues"
 _ISSUE_ALERT_MAX_GROUPS = 40
 _ISSUE_ALERT_SEARCH_PAUSE = 2.2  # search API: 30 req/min authenticated
-_ISSUE_ALERT_DUP_SIG_THRESHOLD = 3  # sig agreement required when the test key matches
+_ISSUE_ALERT_DUP_SIG_THRESHOLD = 3  # sig agreement when the test key hits the title
+_ISSUE_ALERT_DUP_SIG_BODYKEY = 4  # sig agreement when the key only hits the body
 _ISSUE_ALERT_DUP_SIG_ALONE = 5  # sig agreement that qualifies as dup without the key
 _ISSUE_ALERT_RELATED_THRESHOLD = 3
 _GENERIC_TEST_FILE_STEMS = frozenset({"run_benchmark", "run_diffusion_benchmark"})
-_HF_LOCK_ENV_RE = re.compile(r"PermissionError\s+at\s+\S*\.locks\S*", re.I)
+_HF_LOCK_ENV_RE = re.compile(r"PermissionError[^\n]{0,120}?\.locks", re.I)
 _EXC_CLASS_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_.]{3,}(?:Error|Exception))\b")
 _ISSUE_ALERT_STOPWORDS = frozenset(
     w.strip() for w in """
@@ -5035,51 +5036,64 @@ def _issue_alert_has(needle: str, hay: str) -> bool:
     return re.search(rf"(?<![A-Za-z0-9_]){re.escape(needle)}(?![A-Za-z0-9_])", hay, re.I) is not None
 
 
-def _issue_alert_match_score(issue: dict[str, Any], group: _IssueAlertGroup) -> tuple[int, bool, int]:
+def _issue_alert_match_score(issue: dict[str, Any], group: _IssueAlertGroup) -> tuple[int, int, int, int]:
     """Score how well an issue duplicates a failure group.
 
-    Returns ``(total, key_match, sig_score)``:
+    Returns ``(total, key_strength, sig_score, title_sig)``:
     - ``total`` ranks issues (node-id agreement + signature agreement).
-    - ``key_match`` — the test-file search key appears in title/body.
-    - ``sig_score`` — exception-class + signature-token agreement alone.
+    - ``key_strength`` — 2 when the test-file key is in the issue title,
+      1 when only in the body (pasted log), 0 when absent (a search hit
+      can also come from issue *comments*, which never count here).
+    - ``sig_score`` — exception-class + signature-token agreement (title
+      and body hits).
+    - ``title_sig`` — the title-driven share of the signature alone.
 
     A duplicate requires key agreement *and* signature agreement (a bare
     node-id match with a different error is NOT a dup — same test failing
-    for a new reason is a new issue), or an overwhelming signature match
-    (some tickets describe the failure precisely without naming the test).
+    for a new reason is a new issue). Body-only key matches need a
+    stronger signature (cross-test log-dump noise), and issues that never
+    mention the test at all need a strong TITLE-driven signature —
+    body-only signals there are log-dump noise (e.g. a generic
+    ``InternalServerError`` in the title plus two incidental token hits in
+    a pasted NPU log produced a false "recurred" verdict that way).
     """
     title = issue.get("title") or ""
     body = issue.get("body") or ""
-    key_match = False
+    key_strength = 0
     score = 0
     if _issue_alert_has(group.search_key, title):
         score += 4
-        key_match = True
+        key_strength = 2
     elif _issue_alert_has(group.search_key, body):
         score += 3
-        key_match = True
+        key_strength = 1
     if group.func and _issue_alert_has(group.func, title):
         score += 4
     sig = 0
+    title_sig = 0
     if group.exc_class:
         if _issue_alert_has(group.exc_class, title):
             sig += 3
+            title_sig += 3
         elif _issue_alert_has(group.exc_class, body):
             sig += 1
     title_hits = sum(1 for t in group.sig_tokens if _issue_alert_has(t, title))
     body_hits = sum(1 for t in group.sig_tokens if _issue_alert_has(t, body))
     sig += min(4, title_hits * 2)
     sig += min(2, body_hits)
-    return score + sig, key_match, sig
+    title_sig += min(4, title_hits * 2)
+    return score + sig, key_strength, sig, title_sig
 
 
-def _issue_alert_is_dup(key_match: bool, sig_score: int) -> bool:
-    """Dup gate: node-id agreement plus signature agreement, or an
-    overwhelming signature match alone (issue describes the exact failure
-    without ever naming the test file)."""
-    return sig_score >= _ISSUE_ALERT_DUP_SIG_ALONE or (
-        key_match and sig_score >= _ISSUE_ALERT_DUP_SIG_THRESHOLD
-    )
+def _issue_alert_is_dup(key_strength: int, sig_score: int, title_sig: int) -> bool:
+    """Dup gate: node-id agreement plus signature agreement, or a strong
+    TITLE-driven signature alone (issue describes the exact failure without
+    ever naming the test). Body-only signals never carry a keyless match."""
+    if key_strength >= 2:
+        return sig_score >= _ISSUE_ALERT_DUP_SIG_THRESHOLD
+    if key_strength == 1:
+        return sig_score >= _ISSUE_ALERT_DUP_SIG_BODYKEY
+    return title_sig >= _ISSUE_ALERT_DUP_SIG_ALONE
 
 
 def _issue_alert_token_query(group: _IssueAlertGroup) -> str | None:
@@ -5111,7 +5125,7 @@ def _collect_issue_alert_groups(
 ) -> list[_IssueAlertGroup]:
     groups: dict[tuple[str, str, str], _IssueAlertGroup] = {}
 
-    def _add(source: str, step: str, node: str, reason: str, excerpt: str) -> None:
+    def _add(source: str, step: str, node: str, reason: str, excerpt: str, env_text: str = "") -> None:
         stem, func, _param = _issue_alert_node_parts(node)
         if not stem:
             return
@@ -5126,7 +5140,7 @@ def _collect_issue_alert_groups(
                 func=func,
                 search_key=_issue_alert_search_key(node),
                 primary_reason=reason,
-                signature_text=f"{reason}\n{excerpt_head}",
+                signature_text=f"{reason}\n{excerpt_head}\n{env_text[:500_000]}",
                 exc_class=exc,
                 sig_tokens=_issue_alert_signature_tokens(reason, exc),
             )
@@ -5140,7 +5154,7 @@ def _collect_issue_alert_groups(
         if reason and reason not in g.reasons:
             g.reasons.append(reason)
 
-    def _add_info(source: str, step: str, info: dict[str, Any] | None) -> None:
+    def _add_info(source: str, step: str, info: dict[str, Any] | None, env_text: str = "") -> None:
         if not info:
             return
         for node in info.get("failed_nodes") or []:
@@ -5150,6 +5164,7 @@ def _collect_issue_alert_groups(
                 node,
                 (info.get("failed_reasons") or {}).get(node, ""),
                 (info.get("failure_excerpts") or {}).get(node, ""),
+                env_text,
             )
         for node in info.get("error_nodes") or []:
             _add(
@@ -5158,6 +5173,7 @@ def _collect_issue_alert_groups(
                 node,
                 (info.get("error_reasons") or {}).get(node, ""),
                 (info.get("error_excerpts") or {}).get(node, ""),
+                env_text,
             )
 
     for target in ALL_BK_TARGETS:
@@ -5178,10 +5194,20 @@ def _collect_issue_alert_groups(
             if rec.get("log_error"):
                 continue
             _add_info(source, str(rec.get("name") or ""), rec.get("info"))
-    for job_name, _paths, info in job_rows or []:
+    for job_name, paths, info in job_rows or []:
         if _job_is_clean(info):
             continue
-        _add_info(f"Local nightly_jobs · {job_name}", job_name, info)
+        # Local parsers can reduce an environment failure to an
+        # uninformative reason ("ERROR <node>" / "could not extract") with
+        # an empty excerpt — the env signature only lives in the raw log.
+        # Feed the full log text to the env-local check for these rows.
+        env_text = ""
+        for p in paths[:2]:
+            try:
+                env_text += p.read_text(encoding="utf-8", errors="replace")[:500_000]
+            except OSError:
+                pass
+        _add_info(f"Local nightly_jobs · {job_name}", job_name, info, env_text=env_text)
 
     return sorted(groups.values(), key=lambda g: (g.stem, g.exc_class))
 
@@ -5209,7 +5235,9 @@ def _analyze_issue_alert_groups(groups: list[_IssueAlertGroup], token: str) -> N
             ((_issue_alert_match_score(it, g), it) for it in issues),
             key=lambda p: -p[0][0],
         )
-        dup_pass = [(sc, it) for sc, it in scored if _issue_alert_is_dup(sc[1], sc[2])]
+        dup_pass = [
+            (sc, it) for sc, it in scored if _issue_alert_is_dup(sc[1], sc[2], sc[3])
+        ]
         if not dup_pass:
             # Signature-token fallback: search by the failure's most
             # distinctive identifiers (some tickets never name the test).
@@ -5226,7 +5254,7 @@ def _analyze_issue_alert_groups(groups: list[_IssueAlertGroup], token: str) -> N
                         continue
                     sc = _issue_alert_match_score(it, g)
                     scored.append((sc, it))
-                    if _issue_alert_is_dup(sc[1], sc[2]):
+                    if _issue_alert_is_dup(sc[1], sc[2], sc[3]):
                         dup_pass.append((sc, it))
                 scored.sort(key=lambda p: -p[0][0])
         if dup_pass:
