@@ -360,7 +360,7 @@ def _cameras(frames: int):
     from vllm_omni.diffusion.layers.prope import PRoPECameras
     from vllm_omni.diffusion.models.minwm.camera import trajectory_cameras
 
-    viewmats, intrinsics = trajectory_cameras(f"w*{frames - 1}")
+    viewmats, intrinsics = trajectory_cameras(f"w*{frames - 1}", num_latent_frames=frames)
     return PRoPECameras.from_views(viewmats.cuda(), intrinsics.cuda(), dtype=torch.bfloat16)
 
 
