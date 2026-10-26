@@ -110,6 +110,65 @@ def step_state(request_id, params, prompt="positive"):
     return StepRequestState(request_id=request_id, sampling=req.sampling_params, prompt=prompt)
 
 
+def execute(model, stepwise, **sampling_kwargs):
+    """Run one fresh request through full-forward or step execution.
+
+    Params are built per call: the request layer mutates them in
+    ``__post_init__``, so reusing an object across runs would turn a later
+    omit-shaped run into an explicit-value run.
+    """
+    if not stepwise:
+        return model(DiffusionRequestBatch([request(sampling(**sampling_kwargs))])).output
+    state = step_state("req", sampling(**sampling_kwargs))
+    model.prepare_encode(state)
+    batch = None
+    while state.step_index < len(state.timesteps):
+        batch = InputBatch.make_batch([state], cached_batch=batch)
+        model.step_scheduler(state, model.denoise_step(batch, states=[state]))
+    return model.post_decode(state).output
+
+
+@pytest.mark.parametrize("stepwise", [False, True])
+@torch.no_grad()
+def test_omitted_guidance_scale_matches_explicit_default(stepwise):
+    model = pipeline()
+    omitted = sampling(cfg=None)
+    probe = request(copy.deepcopy(omitted))
+    # The request layer autofills the omitted value, but leaves provided unset:
+    # the pipeline must fall back to _DEFAULT_GUIDANCE_SCALE, not to 1.0.
+    assert not probe.sampling_params.guidance_scale_provided
+    assert probe.sampling_params.guidance_scale == 1.0
+    torch.testing.assert_close(
+        execute(model, stepwise, cfg=None), execute(pipeline(), stepwise, cfg=4.0), atol=0, rtol=0
+    )
+    assert not torch.equal(execute(model, stepwise, cfg=None), execute(pipeline(), stepwise, cfg=1.0))
+
+
+@torch.no_grad()
+def test_explicit_zero_guidance_scale_is_preserved():
+    model = pipeline()
+    zero = sampling(cfg=0.0)
+    probe = request(copy.deepcopy(zero))
+    assert probe.sampling_params.guidance_scale_provided and probe.sampling_params.guidance_scale == 0.0
+    state = step_state("req", copy.deepcopy(zero))
+    model.prepare_encode(state)
+    # A pipeline-internal fallback must not rewrite the caller's explicit 0.0.
+    assert state.sampling.true_cfg_scale == 0.0
+
+
+@pytest.mark.parametrize("stepwise", [False, True])
+@pytest.mark.parametrize("bad", [-1.0, float("nan"), float("inf")])
+def test_invalid_guidance_scale_is_rejected(bad, stepwise):
+    model = pipeline()
+    if stepwise:
+        state = step_state("req", sampling(cfg=bad))
+        with pytest.raises(ValueError, match="Invalid guidance scale"):
+            model.prepare_encode(state)
+    else:
+        with pytest.raises(ValueError, match="Invalid guidance scale"):
+            model(DiffusionRequestBatch([request(sampling(cfg=bad))]))
+
+
 @pytest.mark.parametrize("cfg", [1.0, 4.0])
 @pytest.mark.parametrize("rescale", [0.0, 0.7])
 @pytest.mark.parametrize("outputs", [1, 2])
