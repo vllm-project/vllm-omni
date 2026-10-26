@@ -132,16 +132,34 @@ def _text_request(model: str) -> dict[str, Any]:
     return {"model": model, "messages": messages, "stream": False, "modalities": ["text"]}
 
 
+_MULTIMODAL_REQUESTS: dict[str, dict[str, Any]] = {}
+
+
 def _multimodal_request(model: str) -> dict[str, Any]:
-    image_data_url = f"data:image/jpeg;base64,{generate_synthetic_image(224, 224)['base64']}"
-    audio_data_url = f"data:audio/wav;base64,{generate_synthetic_audio(5, 1)['base64']}"
-    messages = dummy_messages_from_mix_data(
-        system_prompt=_system_prompt(),
-        image_data_url=image_data_url,
-        audio_data_url=audio_data_url,
-        content_text="Describe the image and the audio in one short sentence.",
-    )
-    return {"model": model, "messages": messages, "stream": False, "modalities": ["text", "audio"]}
+    """Return one shared multimodal body per model.
+
+    Process-kill submits this from a thread pool. Building it again would call
+    pyttsx3 from those workers. espeak is process-global, and overlapping
+    engines segfault the pytest process.
+    """
+    cached = _MULTIMODAL_REQUESTS.get(model)
+    if cached is None:
+        image_data_url = f"data:image/jpeg;base64,{generate_synthetic_image(224, 224)['base64']}"
+        audio_data_url = f"data:audio/wav;base64,{generate_synthetic_audio(5, 1)['base64']}"
+        messages = dummy_messages_from_mix_data(
+            system_prompt=_system_prompt(),
+            image_data_url=image_data_url,
+            audio_data_url=audio_data_url,
+            content_text="Describe the image and the audio in one short sentence.",
+        )
+        cached = {"model": model, "messages": messages, "stream": False, "modalities": ["text", "audio"]}
+        _MULTIMODAL_REQUESTS[model] = cached
+    return {
+        "model": cached["model"],
+        "messages": cached["messages"],
+        "stream": False,
+        "modalities": list(cached["modalities"]),
+    }
 
 
 def _heavy_messages() -> list[dict[str, Any]]:

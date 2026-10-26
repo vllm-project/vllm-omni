@@ -393,3 +393,68 @@ def test_cleanup_whisper_allowance_maps_logical_gpu(monkeypatch):
 def test_whisper_has_no_size_table():
     assert not hasattr(media, "_WHISPER_VRAM_GIB")
     assert not hasattr(media, "_WHISPER_VRAM_GIB_DEFAULT")
+
+
+def test_concurrent_synthetic_audio_uses_one_tts_engine(monkeypatch, tmp_path):
+    """Overlapping pyttsx3 engines segfault espeak. One engine, one synth at a time."""
+    import threading
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+
+    state = {"init": 0, "runs": 0, "depth": 0, "max_depth": 0}
+    depth_lock = threading.Lock()
+
+    class FakeEngine:
+        def __init__(self):
+            self.path: str | None = None
+
+        def setProperty(self, _name, _value):
+            return None
+
+        def getProperty(self, name):
+            return [] if name == "voices" else None
+
+        def save_to_file(self, _text, filename):
+            self.path = filename
+
+        def runAndWait(self):
+            with depth_lock:
+                state["depth"] += 1
+                state["max_depth"] = max(state["max_depth"], state["depth"])
+                state["runs"] += 1
+            try:
+                time.sleep(0.05)
+                assert self.path is not None
+                sf.write(self.path, np.full((1600, 1), 0.2, dtype=np.float32), 16000)
+            finally:
+                with depth_lock:
+                    state["depth"] -= 1
+
+        def stop(self):
+            return None
+
+    def fake_init(*_args, **_kwargs):
+        state["init"] += 1
+        return FakeEngine()
+
+    monkeypatch.setitem(sys.modules, "pyttsx3", SimpleNamespace(init=fake_init))
+    media._synthetic_audio_engine = None
+    try:
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            list(executor.map(lambda _i: media.generate_synthetic_audio(1, 1, cache_dir=tmp_path), range(8)))
+        assert state["init"] == 1
+        assert state["runs"] == 1
+        assert state["max_depth"] == 1
+
+        media.generate_synthetic_audio(2, 1, cache_dir=tmp_path)
+        assert state["init"] == 1
+        assert state["runs"] == 2
+
+        media.generate_synthetic_audio(1, 1, cache_dir=tmp_path)
+        assert state["runs"] == 2
+
+        media.generate_synthetic_audio(1, 1, cache_dir=tmp_path, force_regenerate=True)
+        assert state["init"] == 1
+        assert state["runs"] == 3
+    finally:
+        media._synthetic_audio_engine = None

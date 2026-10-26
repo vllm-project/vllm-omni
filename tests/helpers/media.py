@@ -36,6 +36,10 @@ _MIN_FREE_VRAM = 16 * 1024**3
 
 
 _synthetic_media_fallback_dir: Path | None = None
+# espeak keeps one process-global synth callback and a fixed 350-entry voice
+# table. A second live pyttsx3 engine overflows that table and segfaults.
+_synthetic_audio_tts_lock = threading.Lock()
+_synthetic_audio_engine: Any = None
 
 
 def _resolve_synthetic_media_cache_dir(cache_dir: Path | str | None) -> Path:
@@ -89,6 +93,127 @@ def _np_array_from_mp4_bytes(video_bytes: bytes) -> np.ndarray:
             pass
 
 
+def _read_cached_synthetic_audio(cache_path: Path) -> dict[str, Any] | None:
+    if not cache_path.is_file():
+        return None
+    try:
+        data, _sr = sf.read(str(cache_path), dtype="float32", always_2d=True)
+        audio_bytes = cache_path.read_bytes()
+    except (OSError, RuntimeError, sf.LibsndfileError):
+        return None
+    if len(data) == 0 or not audio_bytes:
+        return None
+    return {
+        "np_array": np.asarray(data, dtype=np.float32),
+        "base64": base64.b64encode(audio_bytes).decode("utf-8"),
+        "file_path": str(cache_path.resolve()),
+    }
+
+
+def _pick_tts_voice(engine: Any) -> str | None:
+    voices = engine.getProperty("voices")
+    if not voices:
+        return None
+
+    preferred_tokens = (
+        "natural",
+        "jenny",
+        "sonia",
+        "susan",
+        "zira",
+        "aria",
+        "hazel",
+        "samantha",
+        "ava",
+        "allison",
+        "female",
+        "woman",
+        "english-us",
+        "en-us",
+        "english",
+    )
+    discouraged_tokens = (
+        "espeak",
+        "robot",
+        "mbrola",
+        "microsoft david",
+        "male",
+        "man",
+    )
+
+    best_voice = voices[0]
+    best_score = float("-inf")
+    for voice in voices:
+        voice_text = f"{getattr(voice, 'id', '')} {getattr(voice, 'name', '')}".lower()
+        voice_languages = " ".join(
+            lang.decode(errors="ignore") if isinstance(lang, bytes) else str(lang)
+            for lang in getattr(voice, "languages", [])
+        ).lower()
+        combined_text = f"{voice_text} {voice_languages}"
+        score = 0
+        for idx, token in enumerate(preferred_tokens):
+            if token in combined_text:
+                score += 20 - idx
+        for token in discouraged_tokens:
+            if token in combined_text:
+                score -= 10
+        if "english" in combined_text or "en_" in combined_text or "en-" in combined_text:
+            score += 4
+        if "en-us" in combined_text or "english-us" in combined_text:
+            score += 4
+        if score > best_score:
+            best_score = score
+            best_voice = voice
+
+    return best_voice.id
+
+
+def _synthesize_phrase_wav(phrase_text: str) -> tuple[np.ndarray, int]:
+    """Speak ``phrase_text`` on the process-wide engine.
+
+    The caller must hold ``_synthetic_audio_tts_lock``. espeak initializes once
+    per process; creating another engine replaces the synth callback and races
+    ``runAndWait`` with ``stop``.
+    """
+    global _synthetic_audio_engine
+    import pyttsx3
+
+    engine = _synthetic_audio_engine
+    if engine is None:
+        engine = pyttsx3.init()
+        engine.setProperty("rate", 112)
+        engine.setProperty("volume", 1.0)
+        selected_voice = _pick_tts_voice(engine)
+        if selected_voice is not None:
+            engine.setProperty("voice", selected_voice)
+        _synthetic_audio_engine = engine
+
+    temp_wav = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+    temp_wav.close()
+    try:
+        engine.save_to_file(phrase_text, temp_wav.name)
+        engine.runAndWait()
+        engine.stop()
+
+        ready = False
+        for _ in range(50):
+            if os.path.exists(temp_wav.name) and os.path.getsize(temp_wav.name) > 44:
+                ready = True
+                break
+            time.sleep(0.1)
+        if not ready:
+            raise RuntimeError("pyttsx3 did not produce a WAV file in time.")
+
+        tts_audio, tts_sr = sf.read(temp_wav.name, dtype="float32", always_2d=True)
+    finally:
+        if os.path.exists(temp_wav.name):
+            os.unlink(temp_wav.name)
+
+    if len(tts_audio) == 0:
+        raise RuntimeError("pyttsx3 produced an empty WAV file.")
+    return np.asarray(tts_audio, dtype=np.float32), int(tts_sr)
+
+
 def generate_synthetic_audio(
     duration: int,
     num_channels: int,
@@ -108,79 +233,20 @@ def generate_synthetic_audio(
 
     The cache filename includes a SHA-256 digest of ``phrase_text`` so different
     phrases never share a WAV cache entry.
+
+    Uncached synthesis takes ``_synthetic_audio_tts_lock`` and reuses one
+    pyttsx3 engine. Concurrent callers otherwise overflow espeak's voice table
+    and segfault the interpreter.
     """
     root = _resolve_synthetic_media_cache_dir(cache_dir)
     root.mkdir(parents=True, exist_ok=True)
     phrase_key = hashlib.sha256(phrase_text.encode("utf-8")).hexdigest()
     cache_path = root / f"synth_audio_d{duration}_ch{num_channels}_sr{sample_rate}_pt{phrase_key}.wav"
 
-    if not force_regenerate and cache_path.is_file():
-        data, _sr = sf.read(str(cache_path), dtype="float32", always_2d=True)
-        audio_bytes = cache_path.read_bytes()
-        return {
-            "np_array": np.asarray(data, dtype=np.float32),
-            "base64": base64.b64encode(audio_bytes).decode("utf-8"),
-            "file_path": str(cache_path.resolve()),
-        }
-
-    import pyttsx3
-
-    def _pick_voice(engine: pyttsx3.Engine) -> str | None:
-        voices = engine.getProperty("voices")
-        if not voices:
-            return None
-
-        preferred_tokens = (
-            "natural",
-            "jenny",
-            "sonia",
-            "susan",
-            "zira",
-            "aria",
-            "hazel",
-            "samantha",
-            "ava",
-            "allison",
-            "female",
-            "woman",
-            "english-us",
-            "en-us",
-            "english",
-        )
-        discouraged_tokens = (
-            "espeak",
-            "robot",
-            "mbrola",
-            "microsoft david",
-            "male",
-            "man",
-        )
-
-        best_voice = voices[0]
-        best_score = float("-inf")
-        for voice in voices:
-            voice_text = f"{getattr(voice, 'id', '')} {getattr(voice, 'name', '')}".lower()
-            voice_languages = " ".join(
-                lang.decode(errors="ignore") if isinstance(lang, bytes) else str(lang)
-                for lang in getattr(voice, "languages", [])
-            ).lower()
-            combined_text = f"{voice_text} {voice_languages}"
-            score = 0
-            for idx, token in enumerate(preferred_tokens):
-                if token in combined_text:
-                    score += 20 - idx
-            for token in discouraged_tokens:
-                if token in combined_text:
-                    score -= 10
-            if "english" in combined_text or "en_" in combined_text or "en-" in combined_text:
-                score += 4
-            if "en-us" in combined_text or "english-us" in combined_text:
-                score += 4
-            if score > best_score:
-                best_score = score
-                best_voice = voice
-
-        return best_voice.id
+    if not force_regenerate:
+        cached = _read_cached_synthetic_audio(cache_path)
+        if cached is not None:
+            return cached
 
     def _resample_audio(audio: np.ndarray, src_sr: int, dst_sr: int) -> np.ndarray:
         if src_sr == dst_sr or len(audio) == 0:
@@ -238,65 +304,47 @@ def generate_synthetic_audio(
         return enhanced.astype(np.float32)
 
     num_samples = int(sample_rate * max(1, duration))
-    audio_data = np.zeros((num_samples, num_channels), dtype=np.float32)
 
-    engine = pyttsx3.init()
-    engine.setProperty("rate", 112)
-    engine.setProperty("volume", 1.0)
-    selected_voice = _pick_voice(engine)
-    if selected_voice is not None:
-        engine.setProperty("voice", selected_voice)
+    with _synthetic_audio_tts_lock:
+        if not force_regenerate:
+            cached = _read_cached_synthetic_audio(cache_path)
+            if cached is not None:
+                return cached
 
-    temp_wav = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-    temp_wav.close()
-    try:
-        engine.save_to_file(phrase_text, temp_wav.name)
-        engine.runAndWait()
-        engine.stop()
+        tts_audio, tts_sr = _synthesize_phrase_wav(phrase_text)
+        audio_data = np.zeros((num_samples, num_channels), dtype=np.float32)
+        tts_audio = _resample_audio(tts_audio, tts_sr, sample_rate)
+        tts_audio = _match_channels(tts_audio, num_channels)
+        tts_audio = _trim_silence(tts_audio, threshold=0.012)
+        tts_audio = _enhance_speech(tts_audio)
 
-        ready = False
-        for _ in range(50):
-            if os.path.exists(temp_wav.name) and os.path.getsize(temp_wav.name) > 44:
-                ready = True
-                break
-            time.sleep(0.1)
-        if not ready:
-            raise RuntimeError("pyttsx3 did not produce a WAV file in time.")
+        lead_silence = min(int(sample_rate * 0.02), num_samples // 8)
+        pause_samples = int(sample_rate * 0.18)
+        start = lead_silence
+        phrase_len = tts_audio.shape[0]
+        while start < num_samples:
+            take = min(phrase_len, num_samples - start)
+            audio_data[start : start + take] = tts_audio[:take]
+            start += phrase_len + pause_samples
 
-        tts_audio, tts_sr = sf.read(temp_wav.name, dtype="float32", always_2d=True)
-    finally:
-        if os.path.exists(temp_wav.name):
-            os.unlink(temp_wav.name)
+        max_amp = float(np.max(np.abs(audio_data)))
+        if max_amp > 0:
+            audio_data = audio_data / max_amp * 0.95
 
-    if len(tts_audio) == 0:
-        raise RuntimeError("pyttsx3 produced an empty WAV file.")
+        partial_path = cache_path.with_suffix(".partial")
+        try:
+            sf.write(str(partial_path), audio_data, sample_rate, format="WAV", subtype="PCM_16")
+            os.replace(partial_path, cache_path)
+        except (OSError, RuntimeError, sf.LibsndfileError):
+            partial_path.unlink(missing_ok=True)
+            raise
+        audio_bytes = cache_path.read_bytes()
 
-    tts_audio = _resample_audio(tts_audio, tts_sr, sample_rate)
-    tts_audio = _match_channels(tts_audio, num_channels)
-    tts_audio = _trim_silence(tts_audio, threshold=0.012)
-    tts_audio = _enhance_speech(tts_audio)
-
-    lead_silence = min(int(sample_rate * 0.02), num_samples // 8)
-    pause_samples = int(sample_rate * 0.18)
-    start = lead_silence
-    phrase_len = tts_audio.shape[0]
-    while start < num_samples:
-        take = min(phrase_len, num_samples - start)
-        audio_data[start : start + take] = tts_audio[:take]
-        start += phrase_len + pause_samples
-
-    max_amp = float(np.max(np.abs(audio_data)))
-    if max_amp > 0:
-        audio_data = audio_data / max_amp * 0.95
-
-    sf.write(str(cache_path), audio_data, sample_rate, format="WAV", subtype="PCM_16")
-    audio_bytes = cache_path.read_bytes()
-
-    return {
-        "np_array": audio_data.copy(),
-        "base64": base64.b64encode(audio_bytes).decode("utf-8"),
-        "file_path": str(cache_path.resolve()),
-    }
+        return {
+            "np_array": audio_data.copy(),
+            "base64": base64.b64encode(audio_bytes).decode("utf-8"),
+            "file_path": str(cache_path.resolve()),
+        }
 
 
 def _mux_mp4_bytes_with_synthetic_audio(
