@@ -17,6 +17,7 @@ import re
 import ssl
 import subprocess
 import sys
+import time
 import urllib.parse
 import urllib.request
 from collections import defaultdict
@@ -4833,6 +4834,544 @@ def _render_buildkite_note_html(note: str, target: BkTarget | None = None) -> st
     )
 
 
+# ---------------------------------------------------------------------------
+# Issue-dedup alert chapter (告警: 失败去重与 issue 建议)
+#
+# Groups every failed/errored test node from all report sources (Buildkite
+# nightly + weekly chapters, local nightly jobs) by (test file, exception
+# class, normalized reason signature), searches the repo's GitHub issues
+# read-only for each group, and classifies it as tracked (open dup) /
+# recurred (closed dup) / new (no dup — suggest filing an issue) /
+# env-local (local environment signature). Purely advisory: no issue
+# writes ever happen here.
+# ---------------------------------------------------------------------------
+
+_ISSUE_ALERT_REPO = "vllm-project/vllm-omni"
+_ISSUE_ALERT_SEARCH_URL = "https://api.github.com/search/issues"
+_ISSUE_ALERT_MAX_GROUPS = 40
+_ISSUE_ALERT_SEARCH_PAUSE = 2.2  # search API: 30 req/min authenticated
+_ISSUE_ALERT_DUP_SIG_THRESHOLD = 3  # sig agreement required when the test key matches
+_ISSUE_ALERT_DUP_SIG_ALONE = 5  # sig agreement that qualifies as dup without the key
+_ISSUE_ALERT_RELATED_THRESHOLD = 3
+_GENERIC_TEST_FILE_STEMS = frozenset({"run_benchmark", "run_diffusion_benchmark"})
+_HF_LOCK_ENV_RE = re.compile(r"PermissionError\s+at\s+\S*\.locks\S*", re.I)
+_EXC_CLASS_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_.]{3,}(?:Error|Exception))\b")
+_ISSUE_ALERT_STOPWORDS = frozenset(
+    w.strip() for w in """
+    error errors failed failure failures exception traceback assert assertion assertionerror
+    runtime timeout timed memory process processes request requests server client
+    expected actual missing initialization initialize initialise orchestrator tried
+    allocate allocation capacity total free python pytest tests test while during
+    before after should would could please check found exists exist about below above
+    with without when where localhost 127.0.0.1 http https code message stack
+    frame raise raised exited becoming ready port ports keyword argument
+    unexpected called return raised closed connection refused openai internal
+    duration samples seconds similarity transcript received generated contains
+    """.split()
+)
+
+
+@dataclass
+class _IssueAlertGroup:
+    stem: str
+    func: str
+    search_key: str
+    primary_reason: str
+    signature_text: str
+    exc_class: str
+    sig_tokens: list[str]
+    sources: list[str] = field(default_factory=list)
+    steps: list[str] = field(default_factory=list)
+    nodes: list[str] = field(default_factory=list)
+    reasons: list[str] = field(default_factory=list)
+    best_issue: dict[str, Any] | None = None
+    best_score: int = 0
+    related: list[tuple[int, dict[str, Any]]] = field(default_factory=list)
+    verdict: str = "unknown"  # tracked / recurred / new / env-local / unknown
+
+
+_ISSUE_ALERT_VERDICTS: dict[str, tuple[str, str, str]] = {
+    "tracked": ("已跟踪", "issue-alert-badge--tracked", "已有 open issue 跟踪,无需新增"),
+    "recurred": ("疑似复发", "issue-alert-badge--recurred", "匹配到已关闭 issue — 建议核实后 reopen 或补充新 issue"),
+    "new": ("建议新增", "issue-alert-badge--new", "未找到重复 issue — 建议新增"),
+    "env-local": ("本地环境", "issue-alert-badge--env", "本地环境签名(如 HF 缓存锁权限)— 通常无需建仓内 issue"),
+    "unknown": ("未匹配", "issue-alert-badge--unknown", "issue 搜索失败 — 需人工判断"),
+}
+_ISSUE_ALERT_VERDICT_ORDER = {"new": 0, "recurred": 1, "env-local": 2, "unknown": 3, "tracked": 4}
+
+_ISSUE_ALERT_CSS = """
+/* issue-dedup alert chapter */
+.issue-alert-root { margin: 0 0 1rem; }
+.issue-alert-chips { display: flex; flex-wrap: wrap; gap: 0.5rem; margin: 0.75rem 0 1rem; }
+.issue-alert-chip {
+  background: var(--dashboard-card-tint, #f6f8fa);
+  border: 1px solid var(--omni-divider, #e5e7eb);
+  border-radius: 999px;
+  padding: 0.2rem 0.75rem;
+  font-size: 0.8rem;
+}
+.issue-alert-chip strong { font-variant-numeric: tabular-nums; }
+.issue-alert-badge {
+  display: inline-block;
+  border-radius: 6px;
+  padding: 0.15rem 0.5rem;
+  font-size: 0.78rem;
+  font-weight: 650;
+  white-space: nowrap;
+}
+.issue-alert-badge--tracked { background: rgba(16, 185, 129, 0.16); color: #047857; }
+.issue-alert-badge--recurred { background: rgba(245, 158, 11, 0.18); color: #b45309; }
+.issue-alert-badge--new { background: rgba(239, 68, 68, 0.15); color: #b91c1c; }
+.issue-alert-badge--env { background: rgba(59, 130, 246, 0.15); color: #1d4ed8; }
+.issue-alert-badge--unknown { background: var(--dashboard-badge-bg, #edf3f8); color: var(--dashboard-badge-text, #435466); }
+.issue-alert-hint { display: block; margin-top: 0.2rem; font-size: 0.75rem; color: var(--dashboard-soft-text, #64748b); }
+.issue-alert-nodes { color: var(--dashboard-soft-text, #64748b); font-size: 0.78rem; }
+.issue-alert-related { margin-top: 0.2rem; font-size: 0.78rem; color: var(--dashboard-soft-text, #64748b); }
+table.fail-table tr.row-alert-new td { background: rgba(239, 68, 68, 0.045); }
+table.fail-table tr.row-alert-recurred td { background: rgba(245, 158, 11, 0.05); }
+"""
+
+
+def _issue_alert_node_parts(node: str) -> tuple[str, str, str]:
+    """Split a pytest node id into (file stem, function, param)."""
+    path_part, _, rest = node.partition("::")
+    stem = Path(path_part).stem
+    func, _, param = rest.partition("[")
+    return stem, func.strip(), param.rstrip("]").strip()
+
+
+def _issue_alert_search_key(node: str) -> str:
+    """Most distinctive search term for a node id.
+
+    ``run_benchmark`` / ``run_diffusion_benchmark`` host many unrelated
+    parameterized benchmarks, so the param id is the distinctive part;
+    for normal test files the file stem is.
+    """
+    stem, func, param = _issue_alert_node_parts(node)
+    if stem in _GENERIC_TEST_FILE_STEMS:
+        return param or func
+    return stem
+
+
+def _issue_alert_exc_class(*texts: str) -> str:
+    for text in texts:
+        m = _EXC_CLASS_RE.search(text or "")
+        if m:
+            return m.group(1).rsplit(".", 1)[-1]
+    return ""
+
+
+def _issue_alert_reason_sig(reason: str) -> str:
+    """Normalize a reason line so param/request-id noise collapses."""
+    s = re.sub(r"Request ID:[^)]*", "", reason or "", flags=re.I)
+    s = re.sub(r"https?://\S+", "URL", s)
+    s = re.sub(r"\b[0-9a-f]{8,}\b", "HEX", s, flags=re.I)
+    s = re.sub(r"\b\d+(\.\d+)?\b", "N", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s[:80].lower()
+
+
+def _issue_alert_signature_tokens(reason: str, exc_class: str) -> list[str]:
+    """Distinctive tokens (URLs + their segments + identifiers) from a reason line."""
+    chunk = (reason or "")[:240]
+    toks: list[str] = re.findall(r"https?://\S+", chunk)
+    url_blob = " ".join(toks).lower()
+    # Split each URL into >=5-char segments so variant-specific parts
+    # (480p vs 720p, t2i vs i2v) drop out while the shared asset path
+    # (omni-assets / sana-video / manifest.json) survives as a token.
+    seg_seen: set[str] = set()
+    for u in list(toks):
+        for seg in re.split(r"[/\?&#=:]+", u):
+            seg = seg.strip(".-_")
+            sl = seg.lower()
+            if (
+                len(seg) >= 5
+                and sl not in ("https", "http", "www")
+                and sl not in seg_seen
+                and sl not in _ISSUE_ALERT_STOPWORDS
+                and not re.fullmatch(r"[\d\.]+", seg)
+            ):
+                seg_seen.add(sl)
+                toks.append(seg)
+            if len(toks) >= 12:
+                break
+        if len(toks) >= 12:
+            break
+    exc_lc = (exc_class or "").lower()
+    for w in re.findall(r"[A-Za-z0-9_\-/\.]{5,}", chunk):
+        wl = w.lower()
+        if wl in _ISSUE_ALERT_STOPWORDS or w in toks or wl in url_blob:
+            continue
+        if exc_lc and exc_lc in wl:
+            continue
+        if re.fullmatch(r"[\d\.]+", w):
+            continue
+        toks.append(w)
+        if len(toks) >= 10:
+            break
+    return toks
+
+
+def _gh_issue_search(key: str, token: str) -> list[dict[str, Any]]:
+    """Read-only GitHub issue search (raises on network/API failure)."""
+    q = f"repo:{_ISSUE_ALERT_REPO} is:issue {key}"
+    url = _ISSUE_ALERT_SEARCH_URL + "?" + urllib.parse.urlencode({"q": q, "per_page": 6})
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Accept": "application/vnd.github+json",
+            "Authorization": f"Bearer {token}",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        data = json.loads(resp.read().decode("utf-8", errors="replace"))
+    return list(data.get("items") or [])
+
+
+def _issue_alert_has(needle: str, hay: str) -> bool:
+    """Word-boundary substring check (case-insensitive)."""
+    if not needle:
+        return False
+    return re.search(rf"(?<![A-Za-z0-9_]){re.escape(needle)}(?![A-Za-z0-9_])", hay, re.I) is not None
+
+
+def _issue_alert_match_score(issue: dict[str, Any], group: _IssueAlertGroup) -> tuple[int, bool, int]:
+    """Score how well an issue duplicates a failure group.
+
+    Returns ``(total, key_match, sig_score)``:
+    - ``total`` ranks issues (node-id agreement + signature agreement).
+    - ``key_match`` — the test-file search key appears in title/body.
+    - ``sig_score`` — exception-class + signature-token agreement alone.
+
+    A duplicate requires key agreement *and* signature agreement (a bare
+    node-id match with a different error is NOT a dup — same test failing
+    for a new reason is a new issue), or an overwhelming signature match
+    (some tickets describe the failure precisely without naming the test).
+    """
+    title = issue.get("title") or ""
+    body = issue.get("body") or ""
+    key_match = False
+    score = 0
+    if _issue_alert_has(group.search_key, title):
+        score += 4
+        key_match = True
+    elif _issue_alert_has(group.search_key, body):
+        score += 3
+        key_match = True
+    if group.func and _issue_alert_has(group.func, title):
+        score += 4
+    sig = 0
+    if group.exc_class:
+        if _issue_alert_has(group.exc_class, title):
+            sig += 3
+        elif _issue_alert_has(group.exc_class, body):
+            sig += 1
+    title_hits = sum(1 for t in group.sig_tokens if _issue_alert_has(t, title))
+    body_hits = sum(1 for t in group.sig_tokens if _issue_alert_has(t, body))
+    sig += min(4, title_hits * 2)
+    sig += min(2, body_hits)
+    return score + sig, key_match, sig
+
+
+def _issue_alert_is_dup(key_match: bool, sig_score: int) -> bool:
+    """Dup gate: node-id agreement plus signature agreement, or an
+    overwhelming signature match alone (issue describes the exact failure
+    without ever naming the test file)."""
+    return sig_score >= _ISSUE_ALERT_DUP_SIG_ALONE or (
+        key_match and sig_score >= _ISSUE_ALERT_DUP_SIG_THRESHOLD
+    )
+
+
+def _issue_alert_token_query(group: _IssueAlertGroup) -> str | None:
+    """Fallback search query from the most identifier-like signature tokens.
+
+    Used when no issue mentioning the test file passes the dup gate: some
+    tickets describe the failure (e.g. "Failed to enable Cache-DiT for
+    pipeline SenseNovaU1Pipeline") without ever naming the test. Up to two
+    identifier-ish tokens (CamelCase / dashed / underscored), shortest
+    first — GitHub search ANDs terms, so both must appear in the ticket.
+    """
+    idish = [
+        t
+        for t in group.sig_tokens
+        if len(t) >= 7
+        and not t.startswith("http")
+        and (any(c.isupper() for c in t) or "-" in t or "_" in t or "/" in t or "." in t)
+    ]
+    if not idish:
+        return None
+    idish.sort(key=len)
+    return " ".join(idish[:2])
+
+
+def _collect_issue_alert_groups(
+    bk_results: dict[Any, tuple[dict[str, Any] | None, list[dict[str, Any]] | None, Any]] | None,
+    weekly_results: dict[str, tuple[dict[str, Any] | None, list[dict[str, Any]] | None, Any]] | None,
+    job_rows: list[tuple[str, list[Path], dict[str, Any]]] | None,
+) -> list[_IssueAlertGroup]:
+    groups: dict[tuple[str, str, str], _IssueAlertGroup] = {}
+
+    def _add(source: str, step: str, node: str, reason: str, excerpt: str) -> None:
+        stem, func, _param = _issue_alert_node_parts(node)
+        if not stem:
+            return
+        reason = (reason or "").strip()
+        excerpt_head = (excerpt or "")[:1500]
+        exc = _issue_alert_exc_class(reason, excerpt_head[:600])
+        key = (stem, exc, _issue_alert_reason_sig(reason))
+        g = groups.get(key)
+        if g is None:
+            g = _IssueAlertGroup(
+                stem=stem,
+                func=func,
+                search_key=_issue_alert_search_key(node),
+                primary_reason=reason,
+                signature_text=f"{reason}\n{excerpt_head}",
+                exc_class=exc,
+                sig_tokens=_issue_alert_signature_tokens(reason, exc),
+            )
+            groups[key] = g
+        if source not in g.sources:
+            g.sources.append(source)
+        if step and step not in g.steps:
+            g.steps.append(step)
+        if node not in g.nodes:
+            g.nodes.append(node)
+        if reason and reason not in g.reasons:
+            g.reasons.append(reason)
+
+    def _add_info(source: str, step: str, info: dict[str, Any] | None) -> None:
+        if not info:
+            return
+        for node in info.get("failed_nodes") or []:
+            _add(
+                source,
+                step,
+                node,
+                (info.get("failed_reasons") or {}).get(node, ""),
+                (info.get("failure_excerpts") or {}).get(node, ""),
+            )
+        for node in info.get("error_nodes") or []:
+            _add(
+                source,
+                step,
+                node,
+                (info.get("error_reasons") or {}).get(node, ""),
+                (info.get("error_excerpts") or {}).get(node, ""),
+            )
+
+    for target in ALL_BK_TARGETS:
+        build, jobs, _note = (bk_results or {}).get(target) or (None, None, None)
+        if not build or not jobs:
+            continue
+        source = f"Buildkite ({target.label}) nightly · #{build.get('number')}"
+        for rec in jobs:
+            if rec.get("log_error"):
+                continue
+            _add_info(source, str(rec.get("name") or ""), rec.get("info"))
+    for kind, wk_label, _pattern in WEEKLY_BUILD_KINDS:
+        build, jobs, _note = (weekly_results or {}).get(kind) or (None, None, None)
+        if not build or not jobs:
+            continue
+        source = f"Buildkite (CUDA) {wk_label} · #{build.get('number')}"
+        for rec in jobs:
+            if rec.get("log_error"):
+                continue
+            _add_info(source, str(rec.get("name") or ""), rec.get("info"))
+    for job_name, _paths, info in job_rows or []:
+        if _job_is_clean(info):
+            continue
+        _add_info(f"Local nightly_jobs · {job_name}", job_name, info)
+
+    return sorted(groups.values(), key=lambda g: (g.stem, g.exc_class))
+
+
+def _analyze_issue_alert_groups(groups: list[_IssueAlertGroup], token: str) -> None:
+    for g in groups[:_ISSUE_ALERT_MAX_GROUPS]:
+        if _HF_LOCK_ENV_RE.search(g.signature_text):
+            g.verdict = "env-local"
+            continue
+        try:
+            issues = _gh_issue_search(g.search_key, token)
+        except Exception:
+            g.verdict = "unknown"
+            time.sleep(_ISSUE_ALERT_SEARCH_PAUSE)
+            continue
+        time.sleep(_ISSUE_ALERT_SEARCH_PAUSE)
+        if not issues and g.func and g.func != g.search_key:
+            try:
+                issues = _gh_issue_search(g.func, token)
+            except Exception:
+                g.verdict = "unknown"
+                continue
+            time.sleep(_ISSUE_ALERT_SEARCH_PAUSE)
+        scored = sorted(
+            ((_issue_alert_match_score(it, g), it) for it in issues),
+            key=lambda p: -p[0][0],
+        )
+        dup_pass = [(sc, it) for sc, it in scored if _issue_alert_is_dup(sc[1], sc[2])]
+        if not dup_pass:
+            # Signature-token fallback: search by the failure's most
+            # distinctive identifiers (some tickets never name the test).
+            tok_q = _issue_alert_token_query(g)
+            if tok_q:
+                try:
+                    extra = _gh_issue_search(tok_q, token)
+                except Exception:
+                    extra = []
+                time.sleep(_ISSUE_ALERT_SEARCH_PAUSE)
+                seen = {it.get("number") for _s, it in scored}
+                for it in extra:
+                    if it.get("number") in seen:
+                        continue
+                    sc = _issue_alert_match_score(it, g)
+                    scored.append((sc, it))
+                    if _issue_alert_is_dup(sc[1], sc[2]):
+                        dup_pass.append((sc, it))
+                scored.sort(key=lambda p: -p[0][0])
+        if dup_pass:
+            # Prefer an open ticket over a closed twin at equal strength so
+            # the verdict reads "tracked" (live issue) rather than "recurred".
+            dup_pass.sort(key=lambda p: (p[1].get("state") != "open", -p[0][0]))
+            g.best_score, g.best_issue = dup_pass[0][0][0], dup_pass[0][1]
+            g.verdict = "tracked" if dup_pass[0][1].get("state") == "open" else "recurred"
+            best_num = dup_pass[0][1].get("number")
+            g.related = [
+                (sc[0], it)
+                for sc, it in scored
+                if it.get("number") != best_num and sc[0] >= _ISSUE_ALERT_RELATED_THRESHOLD
+            ][:3]
+        else:
+            g.verdict = "new"
+            g.related = [(sc[0], it) for sc, it in scored if sc[0] >= _ISSUE_ALERT_RELATED_THRESHOLD][:3]
+            top = scored[0] if scored else None
+            if top and top[0][0] >= _ISSUE_ALERT_RELATED_THRESHOLD:
+                g.best_score, g.best_issue = top[0][0], top[1]
+            else:
+                g.best_score, g.best_issue = 0, None
+            if g.best_issue is not None:
+                best_num = g.best_issue.get("number")
+                g.related = [(s, it) for s, it in g.related if it.get("number") != best_num]
+
+
+def _issue_alert_issue_link(issue: dict[str, Any], *, with_state: bool = True) -> str:
+    num = issue.get("number")
+    url = issue.get("html_url") or f"https://github.com/{_ISSUE_ALERT_REPO}/issues/{num}"
+    state = issue.get("state") or ""
+    label = f"#{num}"
+    if with_state:
+        label += f" [{state}]"
+    title = html.escape((issue.get("title") or "")[:160], quote=True)
+    return f'<a href="{html.escape(url, quote=True)}" title="{title}">{html.escape(label)}</a>'
+
+
+def _render_issue_alert_html(groups: list[_IssueAlertGroup], *, note: str | None = None) -> str:
+    counts: dict[str, int] = {}
+    for g in groups:
+        counts[g.verdict] = counts.get(g.verdict, 0) + 1
+    chips: list[str] = [f'<span class="issue-alert-chip"><strong>{len(groups)}</strong> 失败组</span>']
+    for verdict in ("new", "recurred", "tracked", "env-local", "unknown"):
+        if counts.get(verdict):
+            label = _ISSUE_ALERT_VERDICTS[verdict][0]
+            chips.append(
+                f'<span class="issue-alert-chip"><strong>{counts[verdict]}</strong> {html.escape(label)}</span>'
+            )
+    chip_row = '<div class="issue-alert-chips">' + "".join(chips) + "</div>"
+
+    if not groups:
+        body = '<p class="note">No failed/errored test nodes in this report — nothing to dedup. ✅</p>'
+    else:
+        head: list[str] = [
+            '<table class="fail-table">',
+            "<thead><tr>",
+            '<th><span class="th-lbl">Source</span></th>',
+            '<th><span class="th-lbl">Failing tests</span></th>',
+            '<th><span class="th-lbl">First error</span></th>',
+            '<th><span class="th-lbl">Matched issue</span></th>',
+            '<th><span class="th-lbl">结论</span></th>',
+            "</tr></thead>",
+            "<tbody>",
+        ]
+        ordered = sorted(
+            groups,
+            key=lambda g: (
+                _ISSUE_ALERT_VERDICT_ORDER.get(g.verdict, 9),
+                g.sources[0] if g.sources else "",
+                g.stem,
+            ),
+        )
+        for g in ordered:
+            badge_label, badge_cls, hint = _ISSUE_ALERT_VERDICTS[g.verdict]
+            src = "<br>".join(html.escape(s) for s in g.sources[:2])
+            if len(g.sources) > 2:
+                src += html.escape(f" (+{len(g.sources) - 2} more)")
+            nodes_title = html.escape("\n".join(g.nodes[:12]), quote=True)
+            node_head = g.nodes[0] if g.nodes else ""
+            node_short = re.sub(r"^[^:]*::", "", node_head)[:80]
+            tests_cell = (
+                f'<span class="mono">{html.escape(g.stem)}</span>'
+                f'<br><span class="issue-alert-nodes" title="{nodes_title}">'
+                f"{len(g.nodes)} node(s) · {html.escape(node_short)}</span>"
+            )
+            reason = g.primary_reason or "(no reason extracted)"
+            reason_full = html.escape("\n".join(g.reasons[:4]), quote=True)
+            reason_cell = (
+                f'<td class="reason"><span title="{reason_full}">{html.escape(reason[:200])}</span></td>'
+            )
+            if g.best_issue:
+                issue_cell = _issue_alert_issue_link(g.best_issue)
+                issue_cell += (
+                    f'<br><span class="issue-alert-nodes">{html.escape((g.best_issue.get("title") or "")[:110])}</span>'
+                )
+            else:
+                issue_cell = '<span class="issue-alert-nodes">—</span>'
+            if g.related:
+                rel = " ".join(_issue_alert_issue_link(it, with_state=False) for _s, it in g.related)
+                issue_cell += f'<br><span class="issue-alert-related">可能相关: {rel}</span>'
+            head.extend(
+                [
+                    f'<tr class="row-alert-{g.verdict}">',
+                    f"<td>{src}</td>",
+                    f"<td>{tests_cell}</td>",
+                    reason_cell,
+                    f"<td>{issue_cell}</td>",
+                    f'<td><span class="issue-alert-badge {badge_cls}">{html.escape(badge_label)}</span>'
+                    f'<span class="issue-alert-hint">{html.escape(hint)}</span></td>',
+                    "</tr>",
+                ]
+            )
+        head.append("</tbody></table>")
+        body = _table_wrap("\n".join(head))
+
+    notes_html = ""
+    if note:
+        notes_html = f'<p class="note">{html.escape(note)}</p>'
+    intro = (
+        '<p class="hint">每个失败组按「测试文件 + 异常类型 + 签名」聚合,并与 '
+        f"{_ISSUE_ALERT_REPO} 的 issue(含已关闭)只读搜索比对:"
+        "节点 ID / 异常类 / 签名 token 命中达到阈值判为重复。"
+        "自动匹配仅供参考,新增/ reopened 判断以人工为准。</p>"
+    )
+    return "\n".join(
+        [
+            '<section class="panel nightly-root nightly-root--issue-alert">',
+            _heading_html(
+                "h2",
+                _SVG_ALERT,
+                html.escape("Issue Alert · 失败去重与 issue 建议"),
+                sub=html.escape("哪些失败仓里已有 issue 跟踪 · 哪些建议新增 issue"),
+            ),
+            '<div class="issue-alert-root">',
+            intro,
+            notes_html,
+            chip_row,
+            body,
+            "</div>",
+            "</section>",
+        ]
+    )
+
+
 def emit_report_html(
     *,
     title: str,
@@ -4842,6 +5381,7 @@ def emit_report_html(
     bk_results: dict[BkTarget, tuple[dict[str, Any] | None, list[dict[str, Any]] | None, str | None]] | None = None,
     kanban_cfg: KanbanAssetsConfig | None = None,
     weekly_results: dict[str, tuple[dict[str, Any] | None, list[dict[str, Any]] | None, str | None]] | None = None,
+    issue_alert: bool = True,
 ) -> None:
     # Manifest-driven job list: ``timing_summary.log`` is the source of truth
     # for the job list + status; ``.log`` files are only parsed for FAILED
@@ -4922,6 +5462,7 @@ def emit_report_html(
         + "  background: var(--dashboard-link, #1d4ed8);\n"
         + "  color: #fff;\n"
         + "}\n"
+        + _ISSUE_ALERT_CSS
     )
 
     body_parts: list[str] = [
@@ -4956,6 +5497,25 @@ def emit_report_html(
         )
     )
 
+    # 🚨 Issue-dedup alert chapter: group all failures across Buildkite
+    # nightly/weekly chapters + local jobs, match each group against the
+    # repo's GitHub issues (read-only search), and classify tracked /
+    # recurred / new / env-local. Skipped with --no-issue-alert or when
+    # no GITHUB_TOKEN is available (chapter then renders as a plain
+    # failure-grouping view with an explanatory note).
+    if issue_alert:
+        alert_groups = _collect_issue_alert_groups(bk_results, weekly_results, job_rows)
+        alert_note = None
+        gh_token = _resolve_github_token()
+        if alert_groups:
+            if gh_token:
+                _analyze_issue_alert_groups(alert_groups, gh_token)
+            else:
+                alert_note = (
+                    "未检测到 GITHUB_TOKEN / GH_TOKEN — 跳过 GitHub issue 匹配,"
+                    "以下仅按失败签名聚类(全部标记为未匹配)。"
+                )
+        body_parts.append(_render_issue_alert_html(alert_groups, note=alert_note))
     body_parts.append(
         '<details class="bk-section panel nightly-root nightly-root--buildkite"><summary class="bk-section-summary">'
     )
@@ -5352,6 +5912,11 @@ def main() -> None:
         default=None,
         help="Report title (default: Nightly Buildkite report - <report-date>).",
     )
+    parser.add_argument(
+        "--no-issue-alert",
+        action="store_true",
+        help="Skip the issue-dedup alert chapter (GitHub issue search for failure groups).",
+    )
     args = parser.parse_args()
 
     if args.stdout and args.html_report:
@@ -5404,6 +5969,7 @@ def main() -> None:
                 bk_results=bk_results,
                 kanban_cfg=kanban_cfg,
                 weekly_results=weekly_results,
+                issue_alert=not args.no_issue_alert,
             )
         print(f"Wrote {out}")
     else:
@@ -5415,6 +5981,7 @@ def main() -> None:
             bk_results=bk_results,
             kanban_cfg=kanban_cfg,
             weekly_results=weekly_results,
+            issue_alert=not args.no_issue_alert,
         )
 
 

@@ -232,6 +232,16 @@ By default the script also pulls **main** latest **scheduled nightly** from Buil
 
 **CUDA weekly-build chapters (2026-10-25):** The script additionally resolves the latest **`Scheduled weekly build`** and **`Scheduled Non-Critical weekly build`** on the CUDA pipeline (anchored message regex — variants like `Scheduled weekly build(Release)` are excluded) inside the same 50-build daily scan window used for the nightly lookup, and renders each as its own collapsible **Buildkite (CUDA) · <label> build** chapter (per-job Summary + Failure analysis, **no** perf sub-card) between the CUDA nightly and NPU chapters. **Conditional display rule:** a weekly kind with no matching build in the scan window is **hidden entirely** (no placeholder chapter, no note) — the chapter appears only on days whose build window contains that weekly build. Weekly jobs never feed the Daily focus cards. The NPU pipeline has no weekly builds. `--buildkite-build N` pins the nightly builds only; weekly resolution is always latest-in-window.
 
+**Issue Alert chapter · 失败去重与 issue 建议 (2026-10-26):** Every nightly HTML embeds an **`Issue Alert · 失败去重与 issue 建议`** panel between Daily focus and the first Buildkite details chapter. It clusters all failed/errored test nodes from **every** failure source the report covers (CUDA nightly + both weekly kinds + local `nightly_jobs`) by `(test-file stem, exception class, normalized reason signature)`, then runs a **read-only** GitHub issue search per group (`repo:vllm-project/vllm-omni is:issue <key>`, ≤40 groups, ~2.2 s pacing) and classifies each group:
+
+- **已跟踪 (tracked)** — open issue matches: test-key agreement **and** error-signature agreement (exception class in title, or ≥2 distinctive signature tokens — URLs, URL path segments like `omni-assets/sana-video/manifest.json`, identifiers — in the issue title/body).
+- **疑似复发 (recurred)** — same match against a **closed** issue (a closed ticket failing again).
+- **建议新增 (new)** — nothing passes the dup gate; **可能相关** links show near misses. A bare node-id match with a **different error** (same test, new failure mode) is deliberately classified `new`, not `recurred`.
+- **本地环境 (env-local)** — local-only failures with environment signatures (HF `.locks` PermissionError) — never file repo issues for these.
+- **未匹配 (unknown)** — GitHub search itself failed (network/API).
+
+When the primary search finds no dup, one **fallback search** by the group's two most identifier-like signature tokens (e.g. `Cache-DiT SenseNovaU1Pipeline`) catches tickets that describe the failure without naming the test file. Matching requires `GITHUB_TOKEN` / `GH_TOKEN` (same `_resolve_github_token()` as the DI card); without it the chapter still renders the clustering but marks everything 未匹配. **Read-only** — the chapter recommends issues, it never creates/comments (write-ban in [CI constraints](#constraints)). Disable with **`--no-issue-alert`**.
+
 **Buildkite performance baseline comparison (kanban assets):** Nightly report reads precomputed history from `docs/assets/charts/*_history.json`. Refresh via [kanban-pre-report-prep.md](references/kanban-pre-report-prep.md) **`prepare_kanban_before_report.py`** before rendering. Daily report commands should use `--kanban-repo-root <vllm-omni-kanban>` (resolved to `<repo>/docs/assets/charts`).
 Optional source checks:
 - `--kanban-expected-remote` / `--kanban-expected-branch` add warnings when current/upstream config differs.
@@ -261,7 +271,7 @@ python scripts/nightly_local_log_report.py \
   --no-buildkite
 ```
 
-Other flags: `--title`, `--buildkite-build`, `--kanban-repo-root`, `--kanban-assets-dir` (required for the perf baseline tables — see Nightly Quick Path), `--kanban-raw-root`, `--kanban-refresh-from-raw`, `--kanban-expected-remote`, `--kanban-expected-branch`. **Markdown** (only if the user explicitly asks): `--markdown-report`, `--to-stdout markdown`. See `python scripts/nightly_local_log_report.py --help`.
+Other flags: `--title`, `--buildkite-build`, `--kanban-repo-root`, `--kanban-assets-dir` (required for the perf baseline tables — see Nightly Quick Path), `--kanban-raw-root`, `--kanban-refresh-from-raw`, `--kanban-expected-remote`, `--kanban-expected-branch`, `--no-issue-alert` (drop the Issue Alert chapter). **Markdown** (only if the user explicitly asks): `--markdown-report`, `--to-stdout markdown`. See `python scripts/nightly_local_log_report.py --help`.
 
 **Daily focus DI card (SLO-escalating model):** The nightly Daily focus HTML grid now includes an **`Outstanding DI`** card as the 5th focus tile, using a **time-based** SLO-escalation formula. The calculation lives in `nightly_local_log_report.py::_compute_outstanding_di(gh_token)` and is fully decoupled from the development-snapshot implementation in `compose_full_report.py`.
 
