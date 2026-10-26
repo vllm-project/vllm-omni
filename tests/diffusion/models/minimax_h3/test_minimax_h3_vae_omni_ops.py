@@ -148,13 +148,73 @@ def test_affine_norm_retains_checkpoint_and_module_properties(dtype, training):
 
 @pytest.mark.parametrize(
     "norm",
-    [nn.RMSNorm(8, eps=1e-5, elementwise_affine=False), nn.LayerNorm(8), nn.RMSNorm(8, eps=None)],
+    [nn.LayerNorm(8), nn.RMSNorm(8, eps=None), nn.RMSNorm(8, eps=None, elementwise_affine=False)],
 )
 def test_unsupported_norm_semantics_retain_original_object(norm):
     owner = nn.Module()
     owner.norm = norm
     assert not vae_ops._replace_rms_norm(owner, "norm")
     assert owner.norm is norm
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("training", [True, False])
+@pytest.mark.parametrize("eps", [1e-5, 3e-4])
+def test_non_affine_norm_preserves_semantics_and_checkpoint(dtype, training, eps):
+    owner = nn.Module()
+    owner.norm = nn.RMSNorm(8, eps=eps, elementwise_affine=False).train(training)
+    reference = deepcopy(owner.norm)
+    state = deepcopy(owner.state_dict())
+    assert vae_ops._replace_rms_norm(owner, "norm")
+    norm = owner.norm
+    assert isinstance(norm, nn.RMSNorm)
+    assert norm.weight is None and not norm.elementwise_affine
+    assert norm.normalized_shape == (8,) and norm.eps == eps
+    assert norm.training == training
+    assert not list(norm.parameters())
+    assert owner.state_dict().keys() == state.keys()
+    owner.load_state_dict(state, strict=True)
+    gamma = dict(norm.named_buffers())["_unit_weight"]
+    assert gamma.shape == (8,) and gamma.dtype == torch.float32
+    assert not gamma.requires_grad
+    torch.testing.assert_close(gamma, torch.ones(8), rtol=0, atol=0)
+    assert not vae_ops._replace_rms_norm(owner, "norm")
+    assert owner.norm is norm
+    # Per-head Q/K chunks are strided; normalization must stay on the last axis.
+    value = torch.randn(2, 3, 2, 24, dtype=dtype).chunk(3, dim=-1)[1]
+    assert not value.is_contiguous()
+    torch.testing.assert_close(norm(value), reference(value), rtol=0, atol=0)
+    owner.to(dtype=dtype)
+    assert norm._unit_weight.dtype == dtype
+    assert not owner.state_dict()
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_non_affine_attention_preserves_fp32_norm_and_qk_output_dtype(dtype):
+    attn = Attention().to(dtype=dtype)
+    reference = deepcopy(attn)
+    model = nn.Module()
+    model.decoder = nn.Module()
+    block = Block()
+    block.attn = attn
+    model.decoder.transformer_blocks = nn.ModuleList([block])
+    vae_ops.patch_minimax_h3_video_vae(model)
+    inputs, outputs = [], []
+    for norm in (attn.norm_q, attn.norm_k):
+        norm.register_forward_pre_hook(lambda _module, args: inputs.append(args[0].dtype))
+        norm.register_forward_hook(lambda _module, _args, result: outputs.append(result.dtype))
+    qk_dtypes = []
+
+    def record_qk_dtype(q, k, v, pack):
+        qk_dtypes.append((q.dtype, k.dtype))
+        return q
+
+    attn.perform_attention = record_qk_dtype
+    reference.perform_attention = lambda q, k, v, pack: q
+    value = torch.randn(1, 3, 16, dtype=dtype)
+    torch.testing.assert_close(attn(value), reference(value), rtol=0, atol=0)
+    assert inputs == outputs == [torch.float32, torch.float32]
+    assert qk_dtypes == [(dtype, dtype)]
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
@@ -208,6 +268,83 @@ class _NPUTensor(torch.Tensor):
     @property
     def device(self):
         return _NPU_DEVICE
+
+
+@pytest.mark.parametrize("buffer_dtype", [torch.float32, torch.float16])
+def test_non_affine_norm_dispatches_to_npu_and_reuses_registered_gamma(monkeypatch, buffer_dtype):
+    monkeypatch.setattr(vae_ops.current_omni_platform, "is_npu", lambda: True)
+    owner = nn.Module()
+    owner.norm = nn.RMSNorm(64, eps=3e-5, elementwise_affine=False)
+    assert vae_ops._replace_rms_norm(owner, "norm")
+    norm = owner.norm
+    # Only the device tag and kernel are doubles; run the real adapter forward.
+    norm._unit_weight = norm._unit_weight.to(dtype=buffer_dtype).as_subclass(_NPUTensor)
+    gamma = norm._unit_weight
+    value = torch.randn(1, 7, 32, 192).chunk(3, dim=-1)[1].as_subclass(_NPUTensor)
+    expected = F.rms_norm(value.as_subclass(torch.Tensor), (64,), None, 3e-5)
+    calls = []
+
+    def npu_rms_norm(actual_value, *, gamma, epsilon):
+        calls.append((actual_value, gamma, epsilon))
+        assert actual_value.is_contiguous()
+        assert actual_value.shape == value.shape
+        assert gamma.dtype == actual_value.dtype == torch.float32
+        torch.testing.assert_close(actual_value.as_subclass(torch.Tensor), value.as_subclass(torch.Tensor))
+        torch.testing.assert_close(gamma.as_subclass(torch.Tensor), torch.ones(64))
+        return F.rms_norm(actual_value.as_subclass(torch.Tensor), (64,), None, epsilon), None
+
+    monkeypatch.setitem(sys.modules, "torch_npu", SimpleNamespace(npu_rms_norm=npu_rms_norm))
+    for _ in range(2):
+        torch.testing.assert_close(norm(value), expected, rtol=0, atol=0)
+    assert len(calls) == 2
+    assert all(call[2] == 3e-5 for call in calls)
+    if buffer_dtype == torch.float32:
+        assert all(call[1] is gamma for call in calls)
+    assert norm._unit_weight is gamma
+    assert gamma.dtype == buffer_dtype
+    assert not owner.state_dict()
+
+
+@pytest.mark.parametrize(
+    "npu_platform,npu_tensor,dtype,sequence",
+    [
+        (True, False, torch.float32, 3),
+        (False, True, torch.float32, 3),
+        (True, True, torch.float64, 3),
+        (True, True, torch.float32, 0),
+    ],
+)
+def test_non_affine_norm_uses_native_outside_npu_scope(monkeypatch, npu_platform, npu_tensor, dtype, sequence):
+    monkeypatch.setattr(vae_ops.current_omni_platform, "is_npu", lambda: npu_platform)
+    owner = nn.Module()
+    owner.norm = nn.RMSNorm(8, eps=1e-5, elementwise_affine=False)
+    reference = deepcopy(owner.norm)
+    assert vae_ops._replace_rms_norm(owner, "norm")
+    value = torch.randn(1, sequence, 2, 8, dtype=dtype)
+    expected = reference(value)
+    if npu_tensor:
+        value = value.as_subclass(_NPUTensor)
+
+    def unexpected_kernel(*args, **kwargs):
+        raise AssertionError("NPU RMSNorm must not run outside its supported scope")
+
+    monkeypatch.setitem(sys.modules, "torch_npu", SimpleNamespace(npu_rms_norm=unexpected_kernel))
+    torch.testing.assert_close(owner.norm(value).as_subclass(torch.Tensor), expected, rtol=0, atol=0)
+
+
+def test_selected_non_affine_npu_kernel_failure_propagates(monkeypatch):
+    monkeypatch.setattr(vae_ops.current_omni_platform, "is_npu", lambda: True)
+    owner = nn.Module()
+    owner.norm = nn.RMSNorm(8, eps=1e-5, elementwise_affine=False)
+    assert vae_ops._replace_rms_norm(owner, "norm")
+    owner.norm._unit_weight = owner.norm._unit_weight.as_subclass(_NPUTensor)
+
+    def failing_kernel(*args, **kwargs):
+        raise RuntimeError("NPU RMSNorm execution failed")
+
+    monkeypatch.setitem(sys.modules, "torch_npu", SimpleNamespace(npu_rms_norm=failing_kernel))
+    with pytest.raises(RuntimeError, match="NPU RMSNorm execution failed"):
+        owner.norm(torch.ones(1, 3, 2, 8).as_subclass(_NPUTensor))
 
 
 def test_replaced_rms_norm_dispatches_to_real_npu_forward(monkeypatch):
@@ -416,9 +553,11 @@ def test_full_block_matches_remote_reference_and_patch_is_idempotent(with_rope):
     keys = set(actual.state_dict())
     vae_ops.patch_minimax_h3_video_vae(actual)
     norm = actual.decoder.transformer_blocks[0].norm1
+    q_norm = actual.decoder.transformer_blocks[0].attn.norm_q
     forward = actual.decoder.transformer_blocks[0].attn.forward
     vae_ops.patch_minimax_h3_video_vae(actual)
     assert actual.decoder.transformer_blocks[0].norm1 is norm
+    assert actual.decoder.transformer_blocks[0].attn.norm_q is q_norm
     assert actual.decoder.transformer_blocks[0].attn.forward is forward
     assert set(actual.state_dict()) == keys
     for expected_block, actual_block in zip(reference.decoder.transformer_blocks, actual.decoder.transformer_blocks):
@@ -448,7 +587,17 @@ def test_preflight_rejects_compiled_modules_before_any_mutation(owner):
 
 
 @pytest.mark.parametrize(
-    "broken", ["attention", "norm", "head_dim", "norm_shape", "all_to_all_4D", "get_parallel_state", "_vit_norm_input"]
+    "broken",
+    [
+        "attention",
+        "norm",
+        "head_dim",
+        "norm_shape",
+        "non_affine_shape",
+        "all_to_all_4D",
+        "get_parallel_state",
+        "_vit_norm_input",
+    ],
 )
 def test_preflight_checks_all_blocks_and_helpers_before_mutation(monkeypatch, broken):
     model = _model(2)
@@ -461,6 +610,8 @@ def test_preflight_checks_all_blocks_and_helpers_before_mutation(monkeypatch, br
         last.attn.dim_head = 0
     elif broken == "norm_shape":
         last.norm2 = nn.RMSNorm((2, 8), eps=1e-5)
+    elif broken == "non_affine_shape":
+        last.attn.norm_q = nn.RMSNorm((2, 8), eps=1e-5, elementwise_affine=False)
     else:
         monkeypatch.setitem(Attention.forward.__globals__, broken, None)
     old_norm, old_forward = first.norm1, first.attn.forward.__func__

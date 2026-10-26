@@ -21,6 +21,37 @@ from vllm_omni.platforms import current_omni_platform
 logger = init_logger(__name__)
 
 
+class _NonAffineRMSNorm(nn.RMSNorm):
+    """Use the NPU RMS primitive without adding a checkpoint parameter."""
+
+    _unit_weight: torch.Tensor
+
+    def __init__(self, hidden_size: int, eps: float, device: torch.device) -> None:
+        super().__init__(hidden_size, eps=eps, elementwise_affine=False)
+        # Install before residency snapshots, which retain buffer references.
+        # Never replace this buffer during forward or add it to state_dict.
+        self.register_buffer(
+            "_unit_weight", torch.ones(hidden_size, device=device, dtype=torch.float32), persistent=False
+        )
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        if (
+            input.device.type != "npu"
+            or not current_omni_platform.is_npu()
+            or input.dtype not in (torch.float16, torch.bfloat16, torch.float32)
+            or input.numel() == 0
+            or input.shape[-1:] != self.normalized_shape
+        ):
+            return super().forward(input)
+        import torch_npu
+
+        # Tensor.to reuses matching FP32 gamma without rebinding the buffer.
+        gamma = self._unit_weight.to(input)
+        # Q/K views can be non-dense. Keep the original FP32 normalization
+        # input; the Attention caller restores the Q/K dtype after this op.
+        return torch_npu.npu_rms_norm(input.contiguous(), gamma=gamma, epsilon=self.eps)[0]
+
+
 def _check_uncompiled(module: nn.Module, path: str) -> None:
     if (
         hasattr(module, "_orig_mod")
@@ -32,7 +63,11 @@ def _check_uncompiled(module: nn.Module, path: str) -> None:
 
 
 def _check_rms_norm(module: nn.Module | None, path: str) -> None:
-    if not isinstance(module, nn.RMSNorm) or module.weight is None or module.eps is None:
+    if not isinstance(module, nn.RMSNorm) or module.eps is None:
+        return
+    if module.weight is None:
+        if len(module.normalized_shape) != 1 or module.normalized_shape[0] <= 0:
+            raise ValueError(f"{path}: H3 VAE Omni ops require a positive 1D RMSNorm shape")
         return
     if (
         module.weight.ndim != 1
@@ -44,11 +79,22 @@ def _check_rms_norm(module: nn.Module | None, path: str) -> None:
 
 
 def _replace_rms_norm(parent: nn.Module, name: str) -> bool:
-    """Keep the checkpoint key and preserve non-affine/dynamic-epsilon norms."""
+    """Preserve checkpoint keys and leave dynamic-epsilon norms unchanged."""
     old = getattr(parent, name, None)
-    _check_rms_norm(old, name)
-    if not isinstance(old, nn.RMSNorm) or old.weight is None or old.eps is None:
+    if isinstance(old, _NonAffineRMSNorm):
         return False
+    _check_rms_norm(old, name)
+    if not isinstance(old, nn.RMSNorm) or old.eps is None:
+        return False
+    if old.weight is None:
+        # A non-affine norm has no device-bearing state of its own. Follow
+        # its owner's weights, including CPU checkpoint/offload placement.
+        reference = next(parent.parameters(), None)
+        device = reference.device if reference is not None else torch.device("cpu")
+        new_norm = _NonAffineRMSNorm(old.normalized_shape[0], eps=float(old.eps), device=device)
+        new_norm.train(old.training)
+        setattr(parent, name, new_norm)
+        return True
     with torch.device(old.weight.device):
         new = RMSNorm(old.weight.numel(), eps=float(old.eps), dtype=old.weight.dtype)
     with torch.no_grad():
