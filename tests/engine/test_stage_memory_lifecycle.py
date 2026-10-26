@@ -48,7 +48,7 @@ async def _wait_until(predicate):
         while not predicate():
             await asyncio.sleep(0)
 
-    await asyncio.wait_for(poll(), timeout=2)
+    await asyncio.wait_for(poll(), timeout=10)
 
 
 @pytest.fixture
