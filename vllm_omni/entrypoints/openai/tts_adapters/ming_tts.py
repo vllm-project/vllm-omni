@@ -214,7 +214,7 @@ class MingTTSAdapter(ARTTSAdapter):
             voice_created_at=uploaded_audio_created_at,
         )
         tts_params = prompt.get("additional_information", {})
-        if speaker_audio_key:
+        if speaker_audio_key is not None and speaker_audio_key.strip():
             tts_params[KEY_SPEAKER_AUDIO_KEYS] = [speaker_audio_key]
         return PreparedRequest(prompt=prompt, tts_params=tts_params, model_type="ming_tts")
 

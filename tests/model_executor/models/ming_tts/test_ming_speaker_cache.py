@@ -198,12 +198,15 @@ async def test_evicted_reference_is_extracted_again():
 
 
 @pytest.mark.asyncio
-async def test_inline_reference_without_artifact_key_stays_uncached():
-    adapter, _, _ = _adapter({"reference-a": ([0.25, 0.5], 16000, None)})
+@pytest.mark.parametrize("artifact_key", [None, "", " \t\n"], ids=["missing", "empty", "blank"])
+async def test_inline_reference_without_artifact_key_stays_uncached(artifact_key):
+    adapter, _, _ = _adapter({"reference-a": ([0.25, 0.5], 16000, artifact_key)})
     wrapper = _wrapper()
 
     for _ in range(2):
-        embeddings = _resolve_speaker_embeddings(wrapper, await _build_and_roundtrip(adapter, _request()))
+        info = await _build_and_roundtrip(adapter, _request())
+        assert "ming_speaker_audio_keys" not in info
+        embeddings = _resolve_speaker_embeddings(wrapper, info)
         assert embeddings[0].shape == (SPEAKER_EMBEDDING_DIM,)
 
     assert wrapper._speaker_extractor.call_count == 2
