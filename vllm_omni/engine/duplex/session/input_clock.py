@@ -298,6 +298,9 @@ class InputClock:
         self._settled_turns: dict[str, InputClockUnit] = {}
         #: Later-stage progress that arrived before any unit of its epoch was speaking (``_hold``).
         self._held: deque[StageProgress] = deque()
+        #: Final-stage segment ends whose unit is not known yet: the oldest speaking unit without one
+        #: may still leave the pipeline through an upstream decision (``_credit_final_ends``).
+        self._uncredited_final_ends: deque[StageProgress] = deque()
         #: Epochs whose hold overflowed: their later-stage progress is no longer held (``_hold``).
         self._hold_overflowed: set[int] = set()
         self._closed = False
@@ -539,6 +542,9 @@ class InputClock:
             self._plugin_state = {}
         self._live_epoch = max(self._live_epoch, before_epoch)
         self._held = deque(progress for progress in self._held if progress.epoch >= before_epoch)
+        self._uncredited_final_ends = deque(
+            progress for progress in self._uncredited_final_ends if progress.epoch >= before_epoch
+        )
         self._hold_overflowed = {epoch for epoch in self._hold_overflowed if epoch >= before_epoch}
         for unit in list(self._units):
             if not unit.placeholder and unit.epoch < before_epoch:
@@ -569,6 +575,7 @@ class InputClock:
         self._closed = True
         self._settled_turns.clear()
         self._held.clear()
+        self._uncredited_final_ends.clear()
         self._in_submission.clear()
         self._undecided.clear()
         self._speaking.clear()
@@ -610,16 +617,40 @@ class InputClock:
             self._hold(progress)
             return
         if progress.segment_finished:
-            # The final stage's segment ends follow its units in order: this one belongs to the oldest
-            # speaking unit without one. That unit need not be the oldest speaking unit, which may
-            # still wait for its upstream segment end after its own final segment end arrived.
-            owner = next((unit for unit in self._speaking if not unit.final_segment_finished), None)
-            if owner is None:
+            if all(unit.final_segment_finished for unit in self._speaking):
                 # Every speaking unit has its final segment end: this one is of a unit not speaking yet.
                 self._hold(progress)
                 return
-            owner.final_segment_finished = True
+            self._uncredited_final_ends.append(progress)
+            self._credit_final_ends()
         self._advance_speaking(progress.final_stage_id, progress.output, progress.context)
+
+    def _credit_final_ends(self) -> None:
+        """Give each uncredited final-stage segment end to its unit, in order, as far as that unit is known.
+
+        The final stage's segment ends follow, in order, the speaking units
+        that reach the final stage: the next one belongs to the oldest
+        speaking unit without one, unless that unit leaves the pipeline at
+        the stage before the final stage through a decision that ends it.
+        The orchestrator delivers different stages' outputs in either order,
+        so that decision can arrive after the final segment end it would
+        otherwise take. A segment end is therefore credited only to a unit
+        whose upstream segment end arrived; it waits here until then. That
+        unit need not be the oldest speaking unit, which may still wait for
+        its upstream segment end after its own final segment end arrived.
+        """
+        while self._uncredited_final_ends:
+            owner = next((unit for unit in self._speaking if not unit.final_segment_finished), None)
+            if owner is None:
+                # The units they waited for left upstream: these are of units not speaking yet.
+                pending, self._uncredited_final_ends = self._uncredited_final_ends, deque()
+                for progress in pending:
+                    self._hold(progress)
+                return
+            if not owner.upstream_segment_finished:
+                return
+            owner.final_segment_finished = True
+            self._uncredited_final_ends.popleft()
 
     def _hold(self, progress: StageProgress) -> None:
         """Keep a later stage's progress that no speaking unit can take yet, for the next unit that speaks.
@@ -738,6 +769,7 @@ class InputClock:
             target.upstream_segment_finished = True
         else:
             return
+        self._credit_final_ends()
         self._advance_speaking(progress.final_stage_id, None, None)
 
     def unit_decision(
