@@ -237,7 +237,7 @@ class TestDeployTopology:
         # deploy is the only one that rounds batches up to a capture bucket, so
         # 32 entries cover its shape space; the multi-card variants leave the
         # buckets unset.
-        expected_graph_config = {
+        expected_graph_config: dict[str, object] = {
             "code2wav_enable_npu_graph": True,
             "code2wav_max_npu_graphs": 32,
         }

@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import functools
+import math
 import re
 import warnings
 from collections.abc import Callable, Mapping
@@ -353,8 +354,18 @@ class StagePipelineConfig:
     # The model keeps per-request execution state while awaiting the next
     # async chunk, so the parked request continues to consume model capacity.
     retains_state_across_chunks: bool = False
+    # The model may yield output before completing the current input unit.
+    supports_pending_generation: bool = False
     # Some stateful audio stages cannot roll back already consumed frames.
     supports_running_prefix_cache_reset: bool = True
+    # Recompute preemption (upstream's only mode) frees KV and replays the
+    # prompt. A native-AR stage whose decode step feeds more than the sampled
+    # token into the model -- side-channel codes, per-request hidden state,
+    # vocoder progress -- cannot rebuild that KV from the token stream. Under
+    # ``"fail"`` the scheduler reclaims the request's resources and emits one
+    # terminal error instead of requeuing it, so the caller never receives the
+    # spliced audio the replay would produce.
+    recompute_preemption: Literal["allow", "fail"] = "allow"
     sampling_constraints: dict[str, Any] = field(default_factory=dict)
     custom_process_input_func: str | None = None
     custom_process_next_stage_input_func: str | None = None
@@ -624,7 +635,6 @@ class StageDeployConfig:
     diffusion_kv_cache_dtype: str | None = None
     diffusion_kv_cache_skip_steps: str | None = None
     diffusion_kv_cache_skip_layers: str | None = None
-    auxiliary_text_encoder: str | None = None
 
     # Runtime optimizations used by diffusion loading/execution.
     hsdp_weight_load_strategy: str | None = None
@@ -632,6 +642,7 @@ class StageDeployConfig:
     enable_broadcast_weight_load: bool | None = None
     num_weight_load_threads: int | None = None
     diffusion_offload_config: dict[str, Any] | None = None
+    kv_offload_config: dict[str, Any] | None = None
     # Compatibility aliases for existing callers and model-specific stage
     # lifecycles that are broader than the compact dit/text_encoder selector.
     enable_cpu_offload: bool | None = None
@@ -689,6 +700,18 @@ class DuplexSessionRuntimeConfig:
     # parse, and goes away with the PR that ports the last of them.
     completed_append_cache_size: int = 256
     server_vad_model_path: str | None = None
+    # Local Smart Turn v3.2 ONNX artifact for ``turn_detection: semantic_vad``;
+    # null resolves the pinned file from the Hugging Face cache.
+    semantic_vad_model_path: str | None = None
+    # Experimental Qwen heard-text calibration. Server-owned URL; never accept
+    # a transcription endpoint from a client session.update.
+    history_asr_url: str | None = None
+    history_asr_model: str | None = None
+    history_asr_max_concurrency: int = 4
+    # Opt-in token-rate estimate; fallback ms/token when audio generation is incomplete.
+    history_ms_per_token: float | None = None
+    history_calibration_timeout_ms: int = 1000
+    history_audio_max_bytes_per_session: int = 8 * 1024 * 1024
     # Startup warmup, before real ``/v1/realtime`` clients are admitted.
     # Audio-primary models run this many silent frames; 0 disables that path.
     # Video-required models (AURA) still run one short non-silent audio chunk
@@ -732,13 +755,44 @@ class DuplexSessionRuntimeConfig:
             "max_sessions": self.max_sessions,
             "max_tool_calls_per_session": self.max_tool_calls_per_session,
             "completed_append_cache_size": self.completed_append_cache_size,
+            "history_calibration_timeout_ms": self.history_calibration_timeout_ms,
+            "history_audio_max_bytes_per_session": self.history_audio_max_bytes_per_session,
+            "history_asr_max_concurrency": self.history_asr_max_concurrency,
         }
         if self.idle_ttl_s is not None and self.idle_ttl_s <= 0:
             raise ValueError("duplex_session.idle_ttl_s must be positive or null")
+        if self.history_asr_url is not None:
+            from urllib.parse import urlsplit
+
+            if not isinstance(self.history_asr_url, str):
+                raise ValueError("duplex_session.history_asr_url must be a string")
+            parsed = urlsplit(self.history_asr_url)
+            if parsed.scheme not in {"http", "https"} or not parsed.netloc or parsed.username or parsed.password:
+                raise ValueError("duplex_session.history_asr_url requires an HTTP(S) URL without credentials")
+            if not isinstance(self.history_asr_model, str) or not self.history_asr_model.strip():
+                raise ValueError("duplex_session.history_asr_model is required with history_asr_url")
+        if self.history_ms_per_token is not None:
+            rate = self.history_ms_per_token
+            if isinstance(rate, bool) or not isinstance(rate, (int, float)) or not math.isfinite(rate) or rate <= 0:
+                raise ValueError("duplex_session.history_ms_per_token must be finite and positive")
+            if self.history_asr_url is not None:
+                raise ValueError("Choose history_asr_url or history_ms_per_token, not both")
+        for name in (
+            "history_calibration_timeout_ms",
+            "history_audio_max_bytes_per_session",
+            "history_asr_max_concurrency",
+        ):
+            value = getattr(self, name)
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise ValueError(f"duplex_session.{name} must be a positive integer")
         if self.server_vad_model_path is not None and (
             not isinstance(self.server_vad_model_path, str) or not self.server_vad_model_path.strip()
         ):
             raise ValueError("duplex_session.server_vad_model_path must be a non-empty string or null")
+        if self.semantic_vad_model_path is not None and (
+            not isinstance(self.semantic_vad_model_path, str) or not self.semantic_vad_model_path.strip()
+        ):
+            raise ValueError("duplex_session.semantic_vad_model_path must be a non-empty string or null")
         for name, value in positive.items():
             if value <= 0:
                 raise ValueError(f"duplex_session.{name} must be positive")
@@ -1086,6 +1140,14 @@ def _extract_platform_overrides(ps: dict[str, Any]) -> PlatformOverrides:
     return PlatformOverrides(overrides, ps.get("devices"), ps.get("env"))
 
 
+# Why a platform still rejects Model Runner V2. CUDA API aliases alone do not
+# adapt a platform worker, so an entry is removed only with the real integration.
+# NPU AR stages use the Ascend V2 runner (attention metadata and input state).
+_MRV2_UNSUPPORTED_PLATFORMS = {
+    "xpu": "the platform worker still uses the legacy chunk-transfer data plane",
+}
+
+
 def _apply_platform_overrides(
     deploy: DeployConfig,
     platform: str | None = None,
@@ -1162,11 +1224,10 @@ def _apply_platform_overrides(
         if stage.model_runner is not None and stage.model_runner not in ("v1", "v2"):
             raise ValueError(f"stage {stage.stage_id}: model_runner must be 'v1' or 'v2', got {stage.model_runner!r}")
     uses_v2 = deploy.model_runner == "v2" or any(stage.model_runner == "v2" for stage in deploy.stages)
-    if uses_v2 and platform in {"npu", "xpu"}:
-        raise NotImplementedError(
-            f"Model Runner V2 is not supported on {platform.upper()}: "
-            "the platform worker still uses the legacy chunk-transfer data plane."
-        )
+    if uses_v2 and platform is not None:
+        reason = _MRV2_UNSUPPORTED_PLATFORMS.get(platform)
+        if reason is not None:
+            raise NotImplementedError(f"Model Runner V2 is not supported on {platform.upper()}: {reason}.")
 
     return deploy
 
@@ -1246,6 +1307,8 @@ def _build_engine_args(
     """
     engine_args: dict[str, Any] = {"model_arch": ps.model_arch or pipeline.model_arch or None}
     engine_args["retains_state_across_chunks"] = ps.retains_state_across_chunks
+    if ps.supports_pending_generation:
+        engine_args["supports_pending_generation"] = True
     if ps.execution_type == StageExecutionType.DIFFUSION and ps.model_arch:
         engine_args.setdefault("model_class_name", ps.model_arch)
     if ps.engine_output_type is not None:
@@ -1317,6 +1380,8 @@ def _build_engine_args(
     engine_args["requires_full_payload_input"] = ps.requires_full_payload_input
     if not ps.supports_running_prefix_cache_reset:
         engine_args["supports_running_prefix_cache_reset"] = False
+    if ps.execution_type is StageExecutionType.LLM_AR and ps.recompute_preemption != "allow":
+        engine_args["recompute_preemption"] = ps.recompute_preemption
     return engine_args
 
 

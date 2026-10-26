@@ -157,7 +157,7 @@ steps:
       depends_on: amd-build
       mirror_hardwares: [amdproduction]
       grade: Blocking
-      timeout_in_minutes: 20
+      timeout_in_minutes: 25
       commands:
         - export VLLM_ROCM_USE_AITER=1
         - export VLLM_OMNI_AR_FA_REQUIRED=1
@@ -168,6 +168,11 @@ steps:
           timeout --signal=TERM --kill-after=2m 15m
           pytest -sv tests/diffusion/ar_diffusion/test_paged_attention.py
           -m 'core_model and rocm and MI325 and cards_1' --run-level core_model
+        # Keep the pinned-ring device contract blocking without making the
+        # cold, experimental AITER coverage lane a required check.
+        - >-
+          timeout --signal=TERM --kill-after=1m 5m pytest -sv tests/diffusion/utils/test_chunked_transfer.py
+          -m 'core_model and rocm and MI325 and cards_1' --run-level core_model
 
     - label: "Diffusion · LoRA Test"
       agent_pool: mi300_1
@@ -177,7 +182,15 @@ steps:
       artifact_paths:
         - lora-server.log
       commands:
-        - pytest -sv tests/diffusion/lora/ -m 'advanced_model and cuda' --run-level "advanced_model" 2>&1 | tee lora-server.log
+        - >-
+          bash .buildkite/amd/scripts/assert-pytest-collection.sh 1
+          tests/diffusion/lora/
+          -m 'advanced_model and rocm and MI325 and cards_1 and not nvidia_only'
+          --run-level "advanced_model"
+        - >-
+          pytest -sv tests/diffusion/lora/
+          -m 'advanced_model and rocm and MI325 and cards_1 and not nvidia_only'
+          --run-level "advanced_model" 2>&1 | tee lora-server.log
 
     - label: "Diffusion Model CPU offloading Test"
       agent_pool: mi300_1
@@ -231,6 +244,23 @@ steps:
         - export VLLM_WORKER_MULTIPROC_METHOD=spawn
         - pytest -s -v tests/diffusion/distributed/test_ulysses_uaa_perf.py
 
+    # Four-GPU jobs remain merge-only because mi300_4 capacity is scarce.
+    # The blocking two-GPU ready lane covers two-rank UAA/SP variants.
+    - label: "ROCm · Ulysses UAA Attention · 4-GPU"
+      agent_pool: mi300_4
+      depends_on: amd-build
+      mirror_hardwares: [amdproduction]
+      grade: Blocking
+      timeout_in_minutes: 25
+      commands:
+        - export VLLM_WORKER_MULTIPROC_METHOD=spawn
+        - >-
+          timeout --signal=TERM --kill-after=2m 20m pytest -s -v
+          tests/diffusion/attention/test_ulysses_uaa.py
+          tests/diffusion/attention/test_attention_sp.py
+          -m 'core_model and rocm and MI325 and cards_4'
+          --run-level "core_model" --durations=20
+
     # merge-only tests
     - label: "Diffusion Tensor Parallelism Test"
       agent_pool: mi300_2
@@ -280,10 +310,15 @@ steps:
       mirror_hardwares: [amdproduction]
       grade: Blocking
       commands:
+        - >-
+          bash .buildkite/amd/scripts/assert-pytest-collection.sh 2
+          tests/e2e/offline_inference/test_wan22_t2v.py
+          -m 'advanced_model and rocm and MI325 and cards_1 and diffusion and not nvidia_only'
+          --run-level 'advanced_model'
         - |
           timeout 40m bash -c "
             export VLLM_IMAGE_FETCH_TIMEOUT=60
-            pytest -s -v tests/e2e/offline_inference/test_wan22_t2v.py -m 'advanced_model and cuda and diffusion' --run-level 'advanced_model'
+            pytest -s -v tests/e2e/offline_inference/test_wan22_t2v.py -m 'advanced_model and rocm and MI325 and cards_1 and diffusion and not nvidia_only' --run-level 'advanced_model'
           "
 
     - label: "Diffusion · Wan22 Online Test"
@@ -292,10 +327,15 @@ steps:
       mirror_hardwares: [amdproduction]
       grade: Blocking
       commands:
+        - >-
+          bash .buildkite/amd/scripts/assert-pytest-collection.sh 1
+          tests/e2e/online_serving/test_wan22_t2v.py
+          -m 'advanced_model and rocm and MI325 and cards_1 and diffusion and not nvidia_only'
+          --run-level 'advanced_model'
         - |
           timeout 40m bash -c "
             export VLLM_IMAGE_FETCH_TIMEOUT=60
-            pytest -s -v tests/e2e/online_serving/test_wan22_t2v.py -m 'advanced_model and cuda and diffusion' --run-level 'advanced_model'
+            pytest -s -v tests/e2e/online_serving/test_wan22_t2v.py -m 'advanced_model and rocm and MI325 and cards_1 and diffusion and not nvidia_only' --run-level 'advanced_model'
           "
 
 ## ISSUE depends on `diffusers` package: https://github.com/huggingface/diffusers/issues/13274
@@ -340,7 +380,20 @@ steps:
       grade: Blocking
       commands:
         - export VLLM_WORKER_MULTIPROC_METHOD=spawn
-        - pytest -s -v tests/e2e/offline_inference/test_qwen3_omni.py tests/e2e/online_serving/test_qwen3_omni.py tests/e2e/offline_inference/test_qwen3_omni_colocate_async.py -m 'advanced_model and cuda' --run-level 'advanced_model'
+        - >-
+          bash .buildkite/amd/scripts/assert-pytest-collection.sh 16
+          tests/e2e/offline_inference/test_qwen3_omni.py
+          tests/e2e/online_serving/test_qwen3_omni.py
+          tests/e2e/offline_inference/test_qwen3_omni_colocate_async.py
+          -m 'advanced_model and rocm and MI325 and not nvidia_only'
+          --run-level 'advanced_model'
+        - >-
+          pytest -s -v
+          tests/e2e/offline_inference/test_qwen3_omni.py
+          tests/e2e/online_serving/test_qwen3_omni.py
+          tests/e2e/offline_inference/test_qwen3_omni_colocate_async.py
+          -m 'advanced_model and rocm and MI325 and not nvidia_only'
+          --run-level 'advanced_model'
 
     - label: "Qwen3-TTS CustomVoice E2E Test · Shard %N/%t"
       agent_pool: mi300_1
@@ -391,7 +444,18 @@ steps:
         - export VLLM_LOGGING_LEVEL=DEBUG
         - export VLLM_WORKER_MULTIPROC_METHOD=spawn
         - export VLLM_ALLOW_LONG_MAX_MODEL_LEN="1"
-        - timeout 40m pytest -s -v tests/e2e/online_serving/test_qwen3_tts_base.py tests/e2e/offline_inference/test_qwen3_tts_base.py -m "advanced_model and cuda" --run-level "advanced_model"
+        - >-
+          bash .buildkite/amd/scripts/assert-pytest-collection.sh 3
+          tests/e2e/online_serving/test_qwen3_tts_base.py
+          tests/e2e/offline_inference/test_qwen3_tts_base.py
+          -m 'advanced_model and rocm and MI325 and cards_1 and not nvidia_only'
+          --run-level "advanced_model"
+        - >-
+          timeout 40m pytest -s -v
+          tests/e2e/online_serving/test_qwen3_tts_base.py
+          tests/e2e/offline_inference/test_qwen3_tts_base.py
+          -m 'advanced_model and rocm and MI325 and cards_1 and not nvidia_only'
+          --run-level "advanced_model"
 
 # TODO: Bagel test on ROCm is very unstable. @tjtanaa
 # Need to debug before reneable numerical changes across large PRs

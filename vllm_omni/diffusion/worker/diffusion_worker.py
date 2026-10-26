@@ -81,7 +81,7 @@ from vllm_omni.diffusion.sched.interface import (
     NewRequestData,
     validate_new_request_data_identity,
 )
-from vllm_omni.diffusion.vllm_config import create_diffusion_vllm_config
+from vllm_omni.diffusion.vllm_config import create_diffusion_vllm_config, resolve_diffusion_moe_lora_token_capacity
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 from vllm_omni.diffusion.worker.utils import BaseRunnerOutput, BatchRunnerOutput
 from vllm_omni.engine.stage_init_utils import set_death_signal
@@ -94,7 +94,6 @@ from vllm_omni.worker.gpu_memory_utils import get_process_gpu_memory
 if TYPE_CHECKING:
     from multiprocessing.synchronize import Event
 
-    from vllm.device_allocator.cumem import CuMemAllocator
     from vllm.distributed.weight_transfer.base import WeightTransferEngine
 
 logger = init_logger(__name__)
@@ -236,10 +235,10 @@ def _force_cutlass_fp8_linear_kernel(quant_config: object | None) -> Iterator[No
     yield
 
 
-def _get_cumem_allocator_class() -> type[CuMemAllocator]:
-    from vllm.device_allocator.cumem import CuMemAllocator
+def _get_mem_allocator_instance() -> Any:
+    from vllm.device_allocator import get_mem_allocator_instance
 
-    return CuMemAllocator
+    return get_mem_allocator_instance()
 
 
 def _resolve_ir_op_priority(od_config: OmniDiffusionConfig, vllm_config: VllmConfig) -> Any:
@@ -475,6 +474,7 @@ class DiffusionWorker:
                 memory_pool_context_fn=self._maybe_get_memory_pool_context,
                 load_format=load_format,
                 custom_pipeline_name=custom_pipeline_name,
+                initialize_lora=self.init_lora_manager,
             )
             current_omni_platform.synchronize()
             gc.collect()
@@ -617,6 +617,11 @@ class DiffusionWorker:
         pipeline = self.model_runner.pipeline
         if pipeline is None:
             return
+        if self.lora_manager is not None:
+            if self.lora_manager.pipeline is pipeline:
+                return
+            self.lora_manager.close()
+            self.lora_manager = None
 
         # A release whose weights cannot be expressed as switchable LoRA layers
         # is fused into the checkpoint while the pipeline loads. There is then
@@ -631,7 +636,7 @@ class DiffusionWorker:
             lora_path = lora_path[0]
 
         lora_backend = self.od_config.lora_backend
-        if lora_backend == LoRABackend.PEFT:
+        if lora_backend == LoRABackend.PEFT or getattr(pipeline, "diffusion_lora_fixed_adapter", False) is True:
             lora_scale = self.od_config.lora_scale
             if isinstance(lora_scale, list) and len(lora_scale) == 1:
                 lora_scale = lora_scale[0]
@@ -639,6 +644,13 @@ class DiffusionWorker:
                 raise ValueError("Dynamic PEFT LoRA requires a single adapter path and scale")
             max_cpu_loras = self.od_config.max_cpu_loras
             assert max_cpu_loras is not None, "max_cpu_loras must be resolved before worker initialization"
+            max_num_batched_tokens = None
+            if getattr(self.od_config, "is_moe", False) is True:
+                assert self.vllm_config is not None
+                max_num_batched_tokens = resolve_diffusion_moe_lora_token_capacity(
+                    self.od_config,
+                    self.vllm_config,
+                )
             self.lora_manager = DiffusionLoRAManager(
                 pipeline=pipeline,
                 device=self.device,
@@ -646,6 +658,7 @@ class DiffusionWorker:
                 max_cached_adapters=max_cpu_loras,
                 lora_path=lora_path,
                 lora_scale=lora_scale,
+                max_num_batched_tokens=max_num_batched_tokens,
             )
         elif lora_backend == LoRABackend.DISTILL:
             if hasattr(pipeline, "load_lora_weights"):
@@ -659,12 +672,21 @@ class DiffusionWorker:
         else:
             raise ValueError(f"Unknown LoRA backend: {lora_backend}. Available choices: {LoRABackend.__members__}")
 
-    def profile(self, is_start: bool = True, profile_prefix: str | None = None) -> None:
+    def profile(
+        self,
+        is_start: bool = True,
+        profile_prefix: str | None = None,
+        *,
+        delay_iterations: int | None = None,
+        max_iterations: int | None = None,
+    ) -> None:
         """Start or stop profiling for this GPU worker.
 
         Args:
             is_start: True to start profiling, False to stop.
             profile_prefix: Optional prefix for trace filename.
+            delay_iterations: Per-session worker steps before profiling starts.
+            max_iterations: Per-session limit on profiled worker steps.
         """
         profiler = self._get_profiler()
         if profiler is None:
@@ -676,7 +698,12 @@ class DiffusionWorker:
 
                 filename = profile_prefix or f"diffusion_rank{self.rank}_{int(time.time())}"
                 profiler.set_trace_filename(filename)
-            profiler.start()
+            kwargs: dict[str, int] = {}
+            if delay_iterations is not None:
+                kwargs["delay_iterations"] = delay_iterations
+            if max_iterations is not None:
+                kwargs["max_iterations"] = max_iterations
+            profiler.start(**kwargs)
         else:
             profiler.stop()
 
@@ -793,7 +820,7 @@ class DiffusionWorker:
 
         if self.lora_manager is not None:
             try:
-                self.lora_manager.set_active_adapter(
+                self.lora_manager.set_request_adapter(
                     request.sampling_params.lora_request, request.sampling_params.lora_scale
                 )
             except Exception as exc:
@@ -828,7 +855,7 @@ class DiffusionWorker:
         if self.lora_manager is not None and scheduler_output.scheduled_new_reqs:
             sp = scheduler_output.scheduled_new_reqs[0].req.sampling_params
             try:
-                self.lora_manager.set_active_adapter(sp.lora_request, sp.lora_scale)
+                self.lora_manager.set_request_adapter(sp.lora_request, sp.lora_scale)
             except Exception as exc:
                 if sp.lora_request is not None:
                     raise
@@ -902,7 +929,7 @@ class DiffusionWorker:
                 break
 
         try:
-            self.lora_manager.set_active_adapter(lora_request, lora_scale)
+            self.lora_manager.set_request_adapter(lora_request, lora_scale)
         except Exception as exc:
             if lora_request is not None:
                 raise
@@ -958,8 +985,7 @@ class DiffusionWorker:
             and getattr(self.od_config, "kv_transfer_config", None) is not None
         ):
             raise ValueError("Cannot sleep while native KV connector memory is registered")
-        CuMemAllocator = _get_cumem_allocator_class()
-        allocator = CuMemAllocator.get_instance()
+        allocator = _get_mem_allocator_instance()
 
         usage_before = allocator.get_current_usage()
 
@@ -1010,8 +1036,7 @@ class DiffusionWorker:
             tags: List of memory pool tags to re-activate (e.g., ["weights"]
                   to match Level 1 sleep). If None, all pools are re-activated.
         """
-        CuMemAllocator = _get_cumem_allocator_class()
-        allocator = CuMemAllocator.get_instance()
+        allocator = _get_mem_allocator_instance()
         allocator.wake_up(tags)
         current_omni_platform.synchronize()
         if self.model_runner is not None and (tags is None or "kv_cache" in tags):
@@ -1150,8 +1175,7 @@ class DiffusionWorker:
         if is_sleep_enabled:
             current_omni_platform.synchronize()
             gc.collect()
-            CuMemAllocator = _get_cumem_allocator_class()
-            allocator = CuMemAllocator.get_instance()
+            allocator = _get_mem_allocator_instance()
             if tag == "weights":
                 assert allocator.get_current_usage() == 0, "Sleep mode can only be used for one instance per process."
                 self._owns_sleep_pool = True
@@ -1170,6 +1194,12 @@ class DiffusionWorker:
         # wrapper becoming unreachable is not sufficient for deterministic
         # teardown between sequential engine instances.
         model_runner = getattr(self, "model_runner", None)
+        lora_manager = getattr(self, "lora_manager", None)
+        if lora_manager is not None:
+            lora_manager.close()
+        # The manager still references its pipeline after close. Drop this
+        # local before cleanup tracebacks or CuMem pool release can retain it.
+        del lora_manager
         self.model_runner = None
         self.lora_manager = None
         self.profiler = None
@@ -1238,10 +1268,18 @@ class DiffusionWorker:
             logger.exception("Failed to collect diffusion model resources during shutdown")
         if owns_sleep_pool:
             try:
-                CuMemAllocator = _get_cumem_allocator_class()
-                allocator = CuMemAllocator.get_instance()
+                allocator = _get_mem_allocator_instance()
                 if allocator.get_current_usage():
                     gc.collect()
+                if current_omni_platform.is_cuda() or current_omni_platform.is_rocm():
+                    from vllm_omni.patch import release_cumem_allocations_for_shutdown
+
+                    retired_bytes = release_cumem_allocations_for_shutdown(allocator)
+                    if retired_bytes:
+                        logger.info(
+                            "Diffusion shutdown retired %.2f GiB of remaining CuMem allocations",
+                            retired_bytes / GiB_bytes,
+                        )
                 allocator.release_pools()
                 self._owns_sleep_pool = False
                 # Re-collect after dropping the pool references so their

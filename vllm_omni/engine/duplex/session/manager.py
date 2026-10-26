@@ -58,7 +58,7 @@ from vllm_omni.engine.duplex.messages import (
 from vllm_omni.engine.duplex.plugin import DuplexModelPlugin, DuplexRuntimeConfigError, validate_duplex_plugin_sampling
 from vllm_omni.engine.duplex.session.engine_session import DuplexEngineSession, DuplexFenceMismatchError
 from vllm_omni.engine.duplex.session.lease import DuplexLeaseActivity, DuplexLeaseConfig, DuplexLeaseState
-from vllm_omni.engine.duplex.turn_detection import SileroVADBackendProvider
+from vllm_omni.engine.duplex.turn_detection import SileroVADBackendProvider, SmartTurnBackendProvider
 
 if TYPE_CHECKING:
     import janus
@@ -141,6 +141,10 @@ class DuplexSessionManager:
         #: on the first session that actually turns server VAD on.
         self.vad_backend_provider = SileroVADBackendProvider(
             model_path=getattr(runtime_config, "server_vad_model_path", None)
+        )
+        #: Likewise one Smart Turn classifier for every ``semantic_vad`` session.
+        self.semantic_vad_backend_provider = SmartTurnBackendProvider(
+            model_path=getattr(runtime_config, "semantic_vad_model_path", None)
         )
         self.runners: dict[str, DuplexSessionRunner] = {}
         self._outputs: dict[str, DuplexOutputBuffer] = {}
@@ -277,10 +281,9 @@ class DuplexSessionManager:
 
         Backpressure contract shared with the runner: a ``Commit`` that passes
         admission holds one pending-turn reservation and an ``AppendAudio``
-        holds its wire-size byte reservation until the runner dequeues the
-        command (the runner then re-reserves the decoded size around its PCM
-        reservation), so the mailbox never holds more bytes than the session
-        limit even while the worker is busy.
+        holds its admitted byte reservation through decoding and VAD. The
+        runner then replaces it with the decoded PCM reservation without an
+        intervening await, keeping pending audio charged while it is busy.
         """
         runner = self.runners.get(message.session_id)
         command = message.command
@@ -319,7 +322,7 @@ class DuplexSessionManager:
                 return
             limit = int(self.runtime_config.max_pending_input_bytes_per_session)
             pending_bytes = len(command.audio) + sum(len(frame) for frame in command.video_frames)
-            if not session.reserve_input_bytes(pending_bytes, limit=limit):
+            if not session.reserve_input_bytes(pending_bytes, limit=limit, queued=True):
                 self.emit(
                     session,
                     [

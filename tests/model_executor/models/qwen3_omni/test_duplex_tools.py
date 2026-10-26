@@ -109,12 +109,18 @@ def test_data_plane_holds_markup_and_emits_one_call():
     assert audio and audio[0]["audio_data"] == "AAAA"
 
 
-def test_stage2_keeps_audio_after_a_stage0_tool_call():
+@pytest.mark.parametrize("retain_history_audio", [False, True])
+def test_stage2_keeps_audio_after_a_stage0_tool_call(retain_history_audio):
     plane = QwenDataPlane(lambda *args: "AAAA")
+    plane.retain_history_audio = retain_history_audio
     context = {"modalities": ("text", "audio"), "response_format": "pcm16", "turn_id": 1}
-    list(plane.project(_output(_CALL, audio=True), context=context))
+    tool_events = list(plane.project(_output(_CALL, audio=True), context=context))
+    assert tool_events and all(event["history_audio_pcm"] is None for event in tool_events)
     audio = list(plane.project(_output("", stage_id=2, audio=True), context=context))
     assert audio and audio[0]["audio_data"] == "AAAA"
+    expected_pcm = np.ones(16, dtype="<f4").tobytes() if retain_history_audio else None
+    assert audio[0]["history_audio_pcm"] == expected_pcm
+    assert audio[0]["history_audio_supported"] is True
 
 
 def test_plain_text_still_passes_through():

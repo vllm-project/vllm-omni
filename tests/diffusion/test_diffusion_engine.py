@@ -75,6 +75,9 @@ class MockScheduler:
     def has_requests(self):
         return len(self._waiting_queue) > 0
 
+    def get_execution_wait_timeout(self, now):
+        return 0.0
+
     def pending_finished_request_ids(self):
         return set()
 

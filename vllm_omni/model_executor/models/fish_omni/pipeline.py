@@ -33,6 +33,8 @@ FISH_OMNI_PIPELINE = PipelineConfig(
                 # Drama 3 end of speech (config eos_token_id).
                 "stop_token_ids": [248046],
             },
+            # MRv2 saves generated codebooks on preemption and restores the full
+            # frame rows on resume, so retain the default recompute policy.
         ),
         StagePipelineConfig(
             stage_id=1,

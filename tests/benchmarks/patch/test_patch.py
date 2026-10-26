@@ -32,6 +32,7 @@ from vllm_omni.benchmarks.patch.patch import (
     _attach_seed_tts_to_request_func_input,
     _build_benchmark_session,
     _extract_stage_durations_from_payload,
+    _gather_request_outputs,
     _iter_image_reference_inputs,
     _iter_video_reference_inputs,
     _omni_request_timeout_s,
@@ -437,6 +438,149 @@ async def test_bundled_first_text_chunk_uses_stage0_token_timings(mocker: Mocker
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("status", [200, 503], ids=["sse", "http"])
+async def test_retryable_cache_error_retries_before_output(mocker: MockerFixture, status):
+    request_input = RequestFuncInput(
+        model="test-model", prompt="test", api_url="http://test.com/v1/chat/completions", prompt_len=1, output_len=4
+    )
+    error = {"error": {"message": "Multi-modal processor cache miss.", "type": "ServiceUnavailableError", "code": 503}}
+    failed = MockResponse(
+        status,
+        [
+            create_sse_chunk({"modality": "text", "choices": [{"delta": {"role": "assistant", "content": ""}}]}),
+            create_sse_chunk(error),
+            b"data: [DONE]\n\n",
+        ],
+    )
+    mocker.patch.object(failed, "json", new=mocker.AsyncMock(return_value=error), create=True)
+    success = MockResponse(
+        200,
+        [
+            create_sse_chunk({"modality": "text", "choices": [{"delta": {"content": "recovered"}}]}),
+            b"data: [DONE]\n\n",
+        ],
+    )
+    session = mocker.Mock()
+    session.post.side_effect = [failed, success]
+    sleep = mocker.patch.object(patch.asyncio, "sleep", new_callable=mocker.AsyncMock)
+    mocker.patch.object(patch.time, "perf_counter", side_effect=[1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+
+    output = await async_request_openai_chat_omni_completions(request_input, session)
+
+    assert output.success is True
+    assert output.generated_text == "recovered"
+    assert session.post.call_count == 2
+    assert session.post.call_args_list[0] == session.post.call_args_list[1]
+    sleep.assert_awaited_once_with(0.1)
+    assert output.start_time == 1.0
+    assert output.ttft >= 2.0  # Includes the failed attempt rather than resetting its clock.
+
+
+@pytest.mark.asyncio
+async def test_retryable_cache_errors_exhaust_bounded_retry_budget(mocker: MockerFixture):
+    request_input = RequestFuncInput(
+        model="test-model", prompt="test", api_url="http://test.com/v1/chat/completions", prompt_len=1, output_len=4
+    )
+    error = {"error": {"message": "cache miss", "type": "ServiceUnavailableError", "code": 503}}
+    response = MockResponse(200, [create_sse_chunk(error), b"data: [DONE]\n\n"])
+    session = mocker.Mock()
+    session.post.return_value = response
+    sleep = mocker.patch.object(patch.asyncio, "sleep", new_callable=mocker.AsyncMock)
+
+    output = await async_request_openai_chat_omni_completions(request_input, session)
+
+    assert output.success is False
+    assert output.error == "cache miss"
+    assert session.post.call_count == 4
+    assert sleep.await_count == 3
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("choice_index", [0, 1])
+@pytest.mark.parametrize(
+    "delta, modality",
+    [
+        ({"content": "partial"}, "text"),
+        ({"reasoning_content": "reasoning"}, "text"),
+        ({"tool_calls": [{"index": 0, "function": {"arguments": "{"}}]}, "text"),
+        ({"audio": {"data": "AAAA"}}, "audio"),
+        ({"content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}]}, "image"),
+    ],
+)
+async def test_retryable_cache_error_never_replays_partial_output(mocker: MockerFixture, delta, modality, choice_index):
+    request_input = RequestFuncInput(
+        model="test-model", prompt="test", api_url="http://test.com/v1/chat/completions", prompt_len=1, output_len=4
+    )
+    response = MockResponse(
+        200,
+        [
+            create_sse_chunk({"modality": modality, "choices": [{"delta": {}}] * choice_index + [{"delta": delta}]}),
+            create_sse_chunk({"error": {"message": "cache miss", "type": "ServiceUnavailableError", "code": 503}}),
+            b"data: [DONE]\n\n",
+        ],
+    )
+    session = mocker.Mock()
+    session.post.return_value = response
+
+    output = await async_request_openai_chat_omni_completions(request_input, session)
+
+    assert output.success is False
+    assert session.post.call_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("partial_output", [False, True])
+async def test_chat_transport_retry_never_replays_partial_output(mocker: MockerFixture, partial_output):
+    request_input = RequestFuncInput(
+        model="test-model", prompt="test", api_url="http://test.com/v1/chat/completions", prompt_len=1, output_len=4
+    )
+
+    async def interrupted_stream():
+        if partial_output:
+            yield create_sse_chunk({"modality": "text", "choices": [{"delta": {"content": "partial"}}]})
+        raise patch.aiohttp.ClientPayloadError("connection dropped")
+
+    failed = MockResponse(200, [])
+    mocker.patch.object(failed, "iter_any", new=interrupted_stream)
+    recovered = MockResponse(
+        200,
+        [create_sse_chunk({"modality": "text", "choices": [{"delta": {"content": "complete"}}]})],
+    )
+    session = mocker.Mock()
+    session.post.side_effect = [failed, recovered]
+    mocker.patch.object(patch.asyncio, "sleep", new_callable=mocker.AsyncMock)
+
+    output = await async_request_openai_chat_omni_completions(request_input, session)
+
+    assert output.success is not partial_output
+    assert session.post.call_count == (1 if partial_output else 2)
+    assert output.latency > 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error",
+    [
+        {"type": "InternalServerError", "code": 503},
+        {"type": "ServiceUnavailableError", "code": 500},
+        {"type": "ServiceUnavailableError", "code": "503"},
+        "Unknown failure",
+    ],
+)
+async def test_chat_unknown_error_is_not_retryable(mocker: MockerFixture, error):
+    request_input = RequestFuncInput(
+        model="test-model", prompt="test", api_url="http://test.com/v1/chat/completions", prompt_len=1, output_len=4
+    )
+    session = mocker.Mock()
+    session.post.return_value = MockResponse(200, [create_sse_chunk({"error": error})])
+
+    output = await async_request_openai_chat_omni_completions(request_input, session)
+
+    assert output.success is False
+    assert session.post.call_count == 1
+
+
+@pytest.mark.asyncio
 async def test_streaming_error_chunk_marks_request_failed(mocker: MockerFixture):
     """HTTP 200 streams can still terminate with an OpenAI error event."""
     request_input = RequestFuncInput(
@@ -507,7 +651,7 @@ async def test_audio_speech_stream_uses_server_pcm_format(
     )
     # 1 s of 48 kHz stereo s16le = 192000 bytes.
     mock_response = MockResponse(200, [b"\x00" * 96000, b"\x00" * 96000])
-    mock_response.headers = headers
+    mocker.patch.object(mock_response, "headers", new=headers, create=True)
     mock_session = mocker.AsyncMock()
     mock_session.post = mocker.MagicMock(return_value=mock_response)
 
@@ -1368,11 +1512,88 @@ class TestOmniRequestTimeout:
             request_input.api_url = f"http://127.0.0.1:{port}/v1/chat/completions"
             output = await async_request_openai_chat_omni_completions(request_input, session)
             assert output.success is False
+            assert output.timed_out is True
             assert output.error
         finally:
             await session.close()
             server.close()
             await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_chat_timeout_is_structurally_marked(mocker: MockerFixture) -> None:
+    session = mocker.Mock()
+    session.post.side_effect = TimeoutError("request deadline expired")
+
+    output = await async_request_openai_chat_omni_completions(_seed_tts_request_func_input(), session)
+
+    assert output.success is False
+    assert output.timed_out is True
+    assert output.cancelled_after_timeout is False
+    assert "TimeoutError" in output.error
+
+
+@pytest.mark.asyncio
+async def test_chat_aiohttp_server_timeout_is_structurally_marked(mocker: MockerFixture) -> None:
+    session = mocker.Mock()
+    session.post.side_effect = patch.aiohttp.ServerTimeoutError("request deadline expired")
+
+    output = await async_request_openai_chat_omni_completions(_seed_tts_request_func_input(), session)
+
+    assert output.success is False
+    assert output.timed_out is True
+    assert output.cancelled_after_timeout is False
+    assert "ServerTimeoutError" in output.error
+
+
+@pytest.mark.asyncio
+async def test_timeout_gather_cancels_pending_tasks_and_retains_order(mocker: MockerFixture) -> None:
+    pending_started = [asyncio.Event(), asyncio.Event()]
+    cancellation_finished = [asyncio.Event(), asyncio.Event()]
+    completed_output = MixRequestFuncOutput(success=True, prompt_len=22)
+    timeout_output = MixRequestFuncOutput(success=False, prompt_len=33, timed_out=True, error="timed out")
+
+    async def pending(index: int) -> MixRequestFuncOutput:
+        pending_started[index].set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            await asyncio.sleep(0)
+            cancellation_finished[index].set()
+
+    async def completed() -> MixRequestFuncOutput:
+        return completed_output
+
+    async def timed_out() -> MixRequestFuncOutput:
+        await pending_started[0].wait()
+        await pending_started[1].wait()
+        await asyncio.sleep(0)
+        return timeout_output
+
+    request_inputs = []
+    for prompt_len in (11, 22, 33, 44):
+        request = _seed_tts_request_func_input()
+        request.prompt_len = prompt_len
+        request_inputs.append(request)
+    tasks = [
+        asyncio.create_task(pending(0)),
+        asyncio.create_task(completed()),
+        asyncio.create_task(timed_out()),
+        asyncio.create_task(pending(1)),
+    ]
+    pbar = mocker.Mock()
+
+    outputs = await _gather_request_outputs(tasks, request_inputs, pbar=pbar)
+
+    assert outputs[0].cancelled_after_timeout is True
+    assert outputs[0].prompt_len == 11
+    assert outputs[1] is completed_output
+    assert outputs[2] is timeout_output
+    assert outputs[3].cancelled_after_timeout is True
+    assert outputs[3].prompt_len == 44
+    assert all(event.is_set() for event in cancellation_finished)
+    assert all(task.done() for task in tasks)
+    assert pbar.update.call_count == 2
 
 
 def test_video_rtf_prefers_generation_time_over_poll_latency():

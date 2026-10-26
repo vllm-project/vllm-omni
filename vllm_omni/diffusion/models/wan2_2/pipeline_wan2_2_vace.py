@@ -28,6 +28,8 @@ from vllm_omni.diffusion.models.interface import SupportImageInput
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
     Wan22Pipeline,
     load_wan_weights_with_optional_gate,
+    refresh_cache_for_denoise_schedule,
+    resolve_wan_boundary_ratio,
     resolve_wan_transformer_quant_config,
     retrieve_latents,
 )
@@ -193,6 +195,9 @@ class Wan22VACEPipeline(Wan22Pipeline, SupportImageInput):
     Extends Wan22Pipeline with VACE-specific context creation and weight loading.
     All VACE modes (T2V, R2V, V2V, MV2V) are handled by varying the inputs.
     """
+
+    # VACE's forward() defaults to 50 steps, not the base pipeline's 40.
+    default_num_inference_steps: int = 50
 
     def __init__(
         self,
@@ -504,7 +509,7 @@ class Wan22VACEPipeline(Wan22Pipeline, SupportImageInput):
         negative_prompt: str | None = None,
         height: int = 480,
         width: int = 832,
-        num_inference_steps: int = 50,
+        num_inference_steps: int | None = None,
         guidance_scale: float = 5.0,
         frame_num: int = 81,
         output_type: str | None = "np",
@@ -573,7 +578,7 @@ class Wan22VACEPipeline(Wan22Pipeline, SupportImageInput):
         height = common.height or height
         width = common.width or width
         num_frames = common.num_frames or frame_num
-        num_inference_steps = common.num_inference_steps or num_inference_steps
+        num_inference_steps = common.num_inference_steps or num_inference_steps or self.default_num_inference_steps
         num_outputs_per_prompt = common.num_outputs_per_prompt or 1
         generator = req.collate_request_generators(num_outputs_per_prompt, None)
         request_latents = req.collate_request_tensors("latents", None)
@@ -709,11 +714,9 @@ class Wan22VACEPipeline(Wan22Pipeline, SupportImageInput):
         # stays None and diffuse() uses the same transformer for every step.
         boundary_timestep = None
         if self.transformer_2 is not None:
-            boundary_ratio = self.boundary_ratio if self.boundary_ratio is not None else common.boundary_ratio
-            if boundary_ratio is None:
-                boundary_ratio = 0.875
-                logger.warning_once("boundary_ratio is required for Wan2.2 VACE generation. using default value 0.875")
+            boundary_ratio = resolve_wan_boundary_ratio(self.boundary_ratio, common, warn_context="Wan2.2 VACE")
             boundary_timestep = boundary_ratio * self.scheduler.config.num_train_timesteps
+        refresh_cache_for_denoise_schedule(self, timesteps, boundary_timestep)
 
         latents = self.diffuse(
             latents=latents,

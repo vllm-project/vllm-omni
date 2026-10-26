@@ -11,6 +11,7 @@ covered in L1 (CPU) CI.
 import pytest
 import torch
 from vllm import _custom_ops as ops
+from vllm.model_executor.layers.quantization import input_quant_fp8
 from vllm.model_executor.layers.quantization.input_quant_fp8 import QuantFP8
 from vllm.model_executor.layers.quantization.utils.quant_utils import GroupShape
 
@@ -40,11 +41,28 @@ def _reference_hadamard(x: torch.Tensor) -> torch.Tensor:
     return (x.float() @ (matrix / dim**0.5)).to(x.dtype)
 
 
+def _use_cuda_e4m3fn_quant_constants(monkeypatch) -> None:
+    """Pin QuantFP8.forward_native to NVIDIA E4M3FN ranges.
+
+    The reference reads vLLM's platform FP8 constants. On ROCm those are
+    E4M3FNUZ, whose max is 224. This CUDA numerical fixture and its fake
+    FA3 kernel follow E4M3FN instead.
+    """
+
+    dtype = torch.float8_e4m3fn
+    finfo = torch.finfo(dtype)
+    monkeypatch.setattr(input_quant_fp8, "_FP8_DTYPE", dtype)
+    monkeypatch.setattr(input_quant_fp8, "_FP8_MIN", finfo.min)
+    monkeypatch.setattr(input_quant_fp8, "_FP8_MAX", finfo.max)
+    monkeypatch.setattr(input_quant_fp8, "_FP8_MIN_SCALING_FACTOR", 1.0 / (finfo.max * 512.0))
+
+
 @pytest.fixture
 def cpu_fp8_quant(monkeypatch, mocker):
     # The production path uses vLLM's CUDA custom op. CPU tests substitute
     # its upstream reference implementation, returning the scale actually
     # used for quantization rather than calculating a separate test scale.
+    _use_cuda_e4m3fn_quant_constants(monkeypatch)
     quantizer = QuantFP8(static=False, group_shape=GroupShape.PER_TENSOR, compile_native=False)
     quantize = mocker.Mock(wraps=quantizer.forward_native)
     monkeypatch.setattr(ops, "scaled_fp8_quant", quantize)
@@ -56,6 +74,22 @@ def cpu_fp8_quant(monkeypatch, mocker):
 
     monkeypatch.setattr(ops, "hadacore_transform", hadacore)
     return quantize
+
+
+def test_quant_constants_follow_cuda_e4m3fn_not_rocm_fnuz(monkeypatch):
+    monkeypatch.setattr(input_quant_fp8, "_FP8_DTYPE", torch.float8_e4m3fnuz)
+    monkeypatch.setattr(input_quant_fp8, "_FP8_MIN", -224.0)
+    monkeypatch.setattr(input_quant_fp8, "_FP8_MAX", 224.0)
+    monkeypatch.setattr(input_quant_fp8, "_FP8_MIN_SCALING_FACTOR", 1.0 / (224.0 * 512.0))
+    _use_cuda_e4m3fn_quant_constants(monkeypatch)
+
+    quantizer = QuantFP8(static=False, group_shape=GroupShape.PER_TENSOR, compile_native=False)
+    values = torch.tensor([[1.0, -8.0, 3.5]])
+    quantized, scale = quantizer.forward_native(values)
+
+    assert quantized.dtype == torch.float8_e4m3fn
+    expected_scale = values.abs().amax() / torch.finfo(torch.float8_e4m3fn).max
+    torch.testing.assert_close(scale.reshape(()), expected_scale)
 
 
 @pytest.fixture(params=["dense", "vllm_varlen"])

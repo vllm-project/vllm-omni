@@ -579,15 +579,29 @@ def test_chunk_boundary_defers_only_when_playback_feedback_is_enabled(monkeypatc
     monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
     request = _make_step_request(4)
     request.sampling_params.streaming_buffer_seconds = buffer_seconds
-    runner.execute_stepwise(_make_scheduler_output(request))
+    first_wave = _make_scheduler_output(request)
+    if buffer_seconds is not None:
+        from vllm_omni.diffusion.interaction.types import InteractionBoundaryContext
+
+        first_wave.interaction_boundaries["req-1"] = InteractionBoundaryContext(boundary_at=0.0)
+    runner.execute_stepwise(first_wave)
     output = runner.execute_stepwise(_make_cached_scheduler_output()).get_request_output("req-1")
     assert output.result is not None and not output.finished
+    if buffer_seconds is not None:
+        assert output.streaming_next_media_duration == 1.0
 
     # The transport/RPC loop can receive a key only after execute returns.
     pending.append("key-release")
-    runner.execute_stepwise(_make_cached_scheduler_output(step_id=2))
+    next_wave = _make_cached_scheduler_output(step_id=2)
+    if buffer_seconds is not None:
+        next_wave.interaction_boundaries["req-1"] = InteractionBoundaryContext(
+            boundary_at=1.0, window_opened_at=0.0, window_end_at=1.0
+        )
+    runner.execute_stepwise(next_wave)
     assert applied == (["key-release"] if buffer_seconds is not None else [])
     assert runner.input_batch.latents.item() == (1.0 if buffer_seconds is not None else 0.0)
+    if buffer_seconds is not None:
+        assert runner.input_batch.states[0].interaction_boundary == next_wave.interaction_boundaries["req-1"]
 
 
 @pytest.mark.cpu
@@ -1288,7 +1302,7 @@ class _RecordingLoRAManager:
     def __init__(self) -> None:
         self.calls: list[tuple[object | None, float]] = []
 
-    def set_active_adapter(self, adapter, scale: float = 1.0) -> None:
+    def set_request_adapter(self, adapter, scale: float = 1.0) -> None:
         self.calls.append((adapter, scale))
 
 

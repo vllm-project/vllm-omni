@@ -33,6 +33,71 @@ turn-based stack free of duplex code, and exposes the same session to three
 consumers: the OpenAI Realtime WebSocket route, the in-process Python API and
 the model plugins.
 
+## Playback completion ownership
+
+`DuplexEngineSession` owns response snapshots and playback cursors. Output
+completion and a client's full `playback.ack` can arrive in either order.
+`finalize_response_playback` is the shared check used by ACK processing,
+normal response completion, draining response completion, and cancellation.
+It retains state while that response is active, any of its requests are still
+draining, or playback is partial without an explicit hard truncate. A hard
+truncate means playback has stopped; once output ends, no further ACK is needed.
+At that point, detach the stopped response from the current playback gate even
+if calibration keeps its response-scoped cursor. Detach by cursor identity so
+an older stop or delayed ACK cannot unblock or overwrite a newer response.
+A final output
+can add transcript or completion metadata after the ACK, so history is reconciled
+against the retained cursor before releasing the snapshot and pending item state.
+Deleted history is never reconstructed. Natural drain completion establishes
+`audio_complete`; cancellation does not. A later response's cursor and history
+position remain independent. Without calibration, aligned history keeps its
+timing marks after a hard stop so a later explicit truncate can shorten the
+stored prefix. Marks retain their original character offsets; repeated truncation
+does not rescale them to the remaining text. Unaligned stops and retired
+calibration evidence keep only the stored prefix and cutoff. Delayed progress
+ACKs cannot change finalized history or restore unheard text. Plugin runtime
+settlement follows all history writes, including cancellation writeback into a
+reserved older turn; it must observe the final committed result.
+
+Audio truncation is valid only for an item whose response produced audio.
+The session checks its live cursor or retained audio provenance before any
+history or playback mutation. Cursor cleanup preserves that provenance only
+for stored history items; deleting or replacing finalized context removes it.
+This distinguishes a retired audio reply from imported context or a reply that never emitted audio
+without retaining its recording or full response snapshot. Realtime commands,
+native truncate signals, and hard playback ACKs reject a no-audio target.
+An ACK's implicit target is resolved before validation or mutation. Pending and
+stored-item fallbacks must match `last_response_id`, which `begin_response`
+updates together with the current playback cursor. A retained older reply cannot
+consume the current reply's ACK, even when it is the only remaining history item.
+Resolution looks up that current item directly in pending or stored history;
+unrelated older or imported items do not make its identity ambiguous. This must
+continue working when a partial ACK moves it from pending to stored history.
+The stored-item fallback also requires the item's live or retained audio
+provenance, including for audio-only replies, then passes the same ownership
+and late-ACK validation as an explicit target. Imported context without audio
+provenance is not selected, even if its ID starts with `item_`. Without an
+identifiable target, ordinary ACKs
+update only the current playback cursor and hard ACKs fail before any history or
+cursor mutation.
+The typed `AckPlayback` command preserves the wire `truncate` flag through
+translation and mailbox delivery, so hard stops reach the same handler as
+internal playback controls.
+
+History edits pass the item's own timing marks and playback cursor explicitly;
+the text-prefix calculation never reads the active response implicitly. If both
+marks and duration of a known audio reply have been released, a new explicit
+truncate cannot establish a heard prefix and clears the text conservatively.
+Truncation preserves the empty assistant turn so the command's following playback ACK remains valid;
+only deletion removes that turn. Ignored ACKs for finalized history report
+`history_committed: false` and do not settle plugin runtime again, including
+when calibration evidence has been retired.
+
+Opt-in history calibration is a separate retention owner: incomplete or
+hard-capped replies remain in its bounded cache for prefix correction. Every
+completion path preserves that evidence until calibration retires it. Sessions
+without calibration release stopped output immediately.
+
 ## Architecture
 
 ```text
@@ -330,6 +395,17 @@ for queue updates and the final validity check before delivery.
   turn_id)` when it starts and re-checks them before the stage submit and
   before committing ledgers; a task that finds the epoch advanced rolls back
   its PCM reservation and exits.
+- **Buffered commit prefixes.** A model buffer may reserve non-terminal units
+  before its terminal commit payload. The runner submits these in wire order
+  with `force_listen=True` and waits for append acceptance before acknowledging
+  the commit. A commit that must wait for an active response holds those
+  prefixes and submits them, still in wire order, when that response ends,
+  before the retained terminal payload. Reservations keep their normal rollback
+  ownership. MiniCPM uses this path to preserve separate buffered VISION units
+  and a following speech tail in manual commit/response sessions. Native
+  resumable responses also defer video-only commits. If response creation is
+  disabled on the commit, a later explicit `response.create` must drain the
+  held prefixes before submitting the terminal payload.
 - **Cancel is atomic at the session.** `CancelResponse` / `BargeIn` advance
   the epoch, cancel tracked append tasks, abort the owned stage bindings
   through the stage port and emit the cancelled terminal events before
@@ -383,6 +459,22 @@ for queue updates and the final validity check before delivery.
   accumulates the snapshot into the active response, so
   `ResponseDone.stage_metrics` and `metadata.vllm_omni.stage_metrics` on the
   wire keep their meaning.
+
+### Semantic turn decisions
+
+`SessionControl` owns a detector per session and offloads its ordered audio
+processing to the manager's executor. `SemanticTurnDetector` loads the shared
+Smart Turn backend on the first audio chunk; the backend constructor warms the
+CPU ONNX session. Silero's candidate pauses trigger subsequent scoring. Each
+detector retains the current pause's semantic decision until speech resumes or
+the turn resets. At commit, session-correlated logs distinguish a complete
+semantic decision from the silence timeout, including whether the preceding
+score was incomplete or inference failed. These diagnostics do not change the
+wire protocol or the endpoint decision.
+
+Only unfinished response-bound append tasks keep the response gate closed.
+A completed task awaiting its cleanup callback does not block a new turn after
+barge-in. Active responses and unplayed output retain their own gates.
 
 ### Experimental output limits
 
@@ -589,8 +681,25 @@ support alone is not Qwen tool-call end-to-end support. Accepted results use
 their prepared candidate, while effective epoch cancellation uses
 `retire_pending_function_output` for queued work according to model policy.
 
-Nemotron's function-channel wire output is request-aligned. In runtime batches,
-the worker-provided spans select each request's last scheduled hidden row rather
+JoyAI-VL-Interaction uses the same call book for a different decision shape. Its
+model emits an action token (`</response> <note> </delegation> <question>`), so
+`parse_function_call` reads a call the plugin itself projected, not a native tool
+schema, and the declared function is one opt-in `delegate` entry. A recognised
+call short-circuits the rest of that stage output, so the plugin projects the call
+alone and the spoken note on its own ordinary path; the note therefore still
+reaches the audio stage while the call is published. An accepted result never
+enters `session.history`. It becomes a `[Delegated Results]` block in later JoyAI
+prompts, and `has_pending_tool_followup` reports whether one is still waiting.
+JoyAI's interaction is chunk based: a result is carried by observations until a
+stored reply answers it, reused once inside the chunk that answered it, and
+expired when the turn that asked it is cancelled. The chunk id and the
+"a reply of it stored text" flag live in the session runtime config rather than on
+the plugin, because one plugin instance serves every session of a deployment.
+Every hook that the session installs returns the complete runtime, not just its
+own keys: the session replaces the whole config, so a partial return would drop
+the model's TTS and prompt settings.
+
+Nemotron's function-channel wire output is request-aligned. In runtime batches,the worker-provided spans select each request's last scheduled hidden row rather
 than CUDA-graph padding; the worker's payload split preserves that mapping for
 the session data plane. Intermediate prefill chunks expose no function token
 and keep empty slots in mixed batches. The final prefill chunk and decode frames
@@ -622,6 +731,98 @@ newer turn.
 
 See [supported models and deployments](../serving/full_duplex_api.md#enable-full-duplex)
 for the current plugin integrations and deployment configurations.
+
+## Heard-text history calibration
+
+With `ack_only`, the client reports how much output audio it played. Some
+models have no text-to-audio alignment for an interrupted reply, so the
+existing history policy may retain an empty assistant turn. Optional
+calibration estimates a prefix of that reply's original text before the next
+prompt is built. It remains experimental and disabled by default; configuration
+and strategy limitations are described in the
+[serving guide](../serving/realtime_duplex_api.md#optional-history-calibration-for-interrupted-qwen3-omni-replies).
+
+### Ownership and callback contract
+
+`DuplexModelPlugin.history_calibrator(runtime_config)` returns either `None`
+or a `HistoryCalibrationPolicy`. The plugin selects the strategy and declares
+whether it needs retained audio through `requires_audio`. The runner creates
+one `HistoryCalibration` controller per session on its own asyncio loop. The
+controller owns recordings, task deadlines and result versions;
+`DuplexEngineSession` owns the authoritative conversation and validates every
+writeback. The callback must yield during slow work and must not mutate session
+history.
+
+The async callback receives an immutable `HeardTextSnapshot`: response ID,
+original text, client-confirmed playback cutoff in milliseconds, and mono
+float32 PCM from the reply's start with its sample rate. A text-only policy
+receives empty PCM and a zero sample rate. `complete_audio_duration_ms` is
+present only after the final audio stage finishes; an interrupted generation's
+partial audio duration cannot estimate the rate of its complete text. The
+callback returns an exclusive character offset into the original text (`0`
+means an accepted empty prefix), or `None` to keep the existing policy. It
+never supplies replacement history text or an ASR transcript to insert.
+
+### Runtime sequence and guarded writeback
+
+1. `ModelChannel` records projected output in the controller. Under `ack_only`,
+   cancellation of a response or input, output-audio clearing, barge-in,
+   truncation and a final playback acknowledgement can trigger `request_ready()`.
+   Each prompt build also calls it through `before_prompt()`, re-evaluating
+   eligibility on every append. Only ended replies with a positive, partially
+   played cutoff are eligible; active replies and replies whose TTS still drains
+   wait.
+2. The controller captures the original text and cutoff, starts the callback
+   with `asyncio.wait_for`, and identifies the task's evidence by
+   `(text, cutoff, retained_audio_bytes)`. Changed evidence replaces the task;
+   unchanged evidence is not retried after failure. Callback failure, refusal
+   or timeout preserves the existing conservative history policy.
+3. Before freezing the stage request's runtime and preparing its conversation,
+   `ModelChannel._append_via_data_plane` awaits `before_prompt()`. This has one
+   `history_calibration_timeout_ms` budget (default 1000 ms) for all eligible
+   tasks, including replacements; replacement work does not extend it. At the
+   deadline, the controller revokes task ownership and cancels pending work.
+   The append then checks the session epoch and open state before continuing,
+   so cancellation or close during the wait cannot submit a stale prompt.
+   History and tool runtime are captured after the wait, so a calibration that
+   consumes a tool pair cannot leave that pair beside its stored answer in
+   the submitted prompt.
+4. A result may write back only while its controller is open, its task still
+   owns that response and its evidence version still matches. The session
+   additionally checks that the original response snapshot and conversation
+   item exist, the original text is unchanged, the offset is in range, and
+   the result's audio cutoff does not exceed the current permanent cutoff.
+   Accepted results replace text at the original assistant item's position in
+   history.
+   Deletion, replacement, stricter truncation and close therefore reject stale
+   results even if cancellation of an async callback arrives late.
+5. After an accepted writeback, the controller notifies the runner. If the
+   stored assistant item has nonempty text, the runner settles that response's
+   runtime as committed, just as a playback ACK does. Qwen then consumes its
+   tool pair without requiring another ACK. An empty prefix keeps the pair
+   available for a retry, including late ACKs after its evidence is retired.
+   Settlement runs outside the calibration-failure handler. A plugin failure
+   while settling a stored answer emits `tool_call_settlement_failed` and closes
+   that session; it cannot continue with history and tool runtime out of sync.
+
+### Evidence lifetime and limits
+
+The controller retains at most four replies and bounds retained PCM by
+`history_audio_max_bytes_per_session` (default 8 MiB). It drops whole replies
+rather than retaining a suffix that could be mistaken for audio starting at
+zero. Text-only calibration retains no PCM. The byte limit excludes temporary
+callback copies and does not bound the conversation's stored text.
+
+Eviction and item deletion discard recordings and revoke pending tasks. For an
+ended reply, `retire_history_calibration` also releases its original response
+snapshot, playback cursor and pending reconciliation state. A still-generating
+or draining reply defers retirement until its output no longer needs that
+state. The stored prefix and compact cutoff metadata remain with an undeleted
+conversation item. Late ACKs cannot expand a retired prefix; a later, stricter
+explicit truncation clears it conservatively because its alignment evidence
+has expired. Finishing calibration alone does not retire evidence that a
+stricter truncation may still need. Session close closes the controller,
+cancels its tasks and releases its recordings.
 
 ## Serving
 
@@ -663,6 +864,12 @@ for the current plugin integrations and deployment configurations.
   `tests/clients/**`, `tests/engine/test_duplex_import_boundary.py`,
   `tests/model_executor/models/minicpmo_4_5/duplex/**`,
   `tests/worker/test_native_duplex_hooks.py`.
+- Calibration CPU suites: `tests/engine/duplex/test_history_calibration.py`
+  covers cache eviction, live-suffix rejection and deferred retirement.
+  `tests/model_executor/models/qwen3_omni/test_history_integration.py` covers
+  task ownership, cancellation, prompt deadlines, failed-snapshot deduplication
+  and the calibrated history in the next submitted prompt. The remaining Qwen
+  `test_history_*.py` files cover prefix matching and token-rate estimates.
 - GPU: `examples/online_serving/minicpmo/realtime_duplex_demo.py` (one turn
   over the websocket), `examples/online_serving/barge_in_client.py` (cancel
   during playback; `--inline` drives the same scenario through

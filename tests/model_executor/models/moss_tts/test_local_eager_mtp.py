@@ -20,7 +20,7 @@ pytestmark = pytest.mark.core_model
 @pytest.fixture(
     params=[
         pytest.param("cpu", marks=pytest.mark.cpu),
-        pytest.param("cuda", marks=hardware_marks(res={"cuda": "L4"}, num_cards=1)),
+        pytest.param("cuda", marks=hardware_marks(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)),
     ]
 )
 def device(request):

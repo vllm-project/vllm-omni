@@ -313,6 +313,8 @@ def _axis_from_sqrt_area(dim: int, patch: int, sqrt_area: float) -> torch.Tensor
 
 
 def _video_t_grid(n: int, origin: float) -> torch.Tensor:
+    if not n:
+        return torch.empty(0, dtype=torch.float64)
     spans = torch.tensor(
         [_FRAME_RESCALE * _FRAME_PER_TOKEN[k % _T_GROUP] for k in range(n)],
         dtype=torch.float64,
@@ -374,6 +376,8 @@ def minimax_h3_packed_sequence_ref2va_blocks(
     fixed prefix of each modality's rows. Output length/row admission limits
     must be checked by the caller before materializing this layout.
 
+    ``latent_t=0`` packs an audio-only document without visual references.
+
     ``temporal_offset`` is the window origin in 40-Hz RoPE units. It shifts
     target AV, reference AV, timeline guides and latent guides together,
     leaving text, static images, padding and all spatial coordinates unchanged.
@@ -387,7 +391,7 @@ def minimax_h3_packed_sequence_ref2va_blocks(
         audio_channel=audio_channel,
     )
     for key in dimensions:
-        _positive_int(dimensions, key, "target", allow_zero=key == "text_len")
+        _positive_int(dimensions, key, "target", allow_zero=key in ("text_len", "latent_t"))
     if latent_h % _PATCH_H or latent_w % _PATCH_W:
         raise ValueError("target latent_h and latent_w must be divisible by the spatial patch size (2)")
     if seq_len is not None:
@@ -465,6 +469,8 @@ def minimax_h3_packed_sequence_ref2va_blocks(
         if is_guide:
             item["frame_index"] = frame_index
         parsed.append(item)
+    if not latent_t and ref_visual_rows:
+        raise ValueError("audio-only documents cannot include visual reference or guide blocks")
 
     # Preserve reference accumulation order (including fp64 rounding), independent
     # of physical row offsets and guide spans.
@@ -523,6 +529,15 @@ def minimax_h3_packed_sequence_ref2va_blocks(
     video_sl = slice(audio_sl.stop, audio_sl.stop + video_rows)
     pad_sl = slice(video_sl.stop, seq_len)
 
+    # Keep each reference (and each AV component) separate for VSA pooling.
+    # Modality tags alone cannot distinguish adjacent references of one kind.
+    prefix_slices = [text_sl]
+    for item in block_slices:
+        slices = [item[key] for key in ("audio_sl", "visual_sl") if key in item]
+        prefix_slices.extend(sorted(slices, key=lambda span: span.start))
+    prefix_slices.append(audio_sl)
+    prefix_segments = tuple(span.stop - span.start for span in prefix_slices if span.stop > span.start)
+
     # This is deliberately tensor-free metadata. It is constructed once by
     # the denoise branch and consumed by every attention layer without a
     # device-to-host synchronization.
@@ -542,13 +557,14 @@ def minimax_h3_packed_sequence_ref2va_blocks(
                     "role": "reference",
                 }
             )
-    video_spans.append(
-        {
-            "start": video_sl.start,
-            "latent_grid": (latent_t, ph, pw),
-            "role": "target",
-        }
-    )
+    if latent_t:
+        video_spans.append(
+            {
+                "start": video_sl.start,
+                "latent_grid": (latent_t, ph, pw),
+                "role": "target",
+            }
+        )
 
     input_ids = torch.full((seq_len,), MINIMAX_H3_PAD_ID, dtype=torch.int64)
     input_ids[text_sl] = MINIMAX_H3_TEXT_ID
@@ -650,8 +666,9 @@ def minimax_h3_packed_sequence_ref2va_blocks(
     input_ids[audio_sl] = MINIMAX_H3_AUDIO_ID
     input_ids[audio_sl.start] = MINIMAX_H3_AUDIO_FIRST_ID
     input_ids[video_sl] = MINIMAX_H3_VIDEO_ID
-    input_ids[video_sl.start] = MINIMAX_H3_VIDEO_FIRST_ID
-    input_ids[video_sl.stop - 1] = MINIMAX_H3_VIDEO_LAST_ID
+    if latent_t:
+        input_ids[video_sl.start] = MINIMAX_H3_VIDEO_FIRST_ID
+        input_ids[video_sl.stop - 1] = MINIMAX_H3_VIDEO_LAST_ID
     audio_mask[audio_sl] = True
     image_mask[video_sl] = True
 
@@ -715,6 +732,7 @@ def minimax_h3_packed_sequence_ref2va_blocks(
         "latent_grid": torch.tensor([latent_t, ph, pw], dtype=torch.int64),
         "video_row_start": torch.tensor(video_sl.start, dtype=torch.int64),
         "video_spans": tuple(video_spans),
+        "vsa_prefix_segments": prefix_segments,
     }
 
 

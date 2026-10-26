@@ -11,6 +11,7 @@ Original source at https://github.com/dougbtv/comfyui-vllm-omni, distributed und
 
 import asyncio
 import json
+from io import BytesIO
 from typing import Any
 
 import aiohttp
@@ -24,6 +25,7 @@ from .format import (
     base64_to_audio,
     base64_to_image_tensor,
     bytes_to_audio,
+    bytes_to_restored_video,
     bytes_to_video,
     image_tensor_to_base64,
     image_tensor_to_png_bytes,
@@ -37,11 +39,127 @@ from .types import (
     MAX_REFERENCE_AUDIOS,
     MAX_REFERENCE_IMAGES,
     MAX_REFERENCE_VIDEOS,
+    MAX_TIMELINE_GUIDE_BYTES,
+    MAX_TIMELINE_GUIDES,
     MAX_TOTAL_REFERENCES,
+    TIMELINE_GUIDE_FPS,
     AudioFormat,
 )
 
 logger = get_logger(__name__)
+
+# (extension, MIME type) of each guide upload; the server dispatches on the suffix.
+_TIMELINE_GUIDE_FORMATS = {
+    "image": ("png", "image/png"),
+    "video": ("mp4", "video/mp4"),
+    "audio": ("flac", "audio/flac"),
+}
+
+
+def validate_timeline_guide(guide: object, where: str) -> None:
+    """Check one timeline guide entry; ``where`` names it in error messages.
+
+    Everything that can be decided without encoding media is checked here, so
+    an invalid graph fails before any upload is built.
+    """
+    if not isinstance(guide, dict):
+        raise ValueError(f"{where} must be a guide from a MiniMax H3 Add Guide node, got {type(guide).__name__}.")
+    frame_index = guide.get("frame_index")
+    if not isinstance(frame_index, int) or isinstance(frame_index, bool):
+        raise ValueError(f"{where}.frame_index must be an integer, got {frame_index!r}.")
+
+    image, video, audio = (guide.get(kind) for kind in ("image", "video", "audio"))
+    if image is None and video is None and audio is None:
+        raise ValueError(f"{where} needs an image, video, or audio input.")
+    if image is not None and video is not None:
+        raise ValueError(f"{where} cannot combine image and video; use one visual input per guide.")
+
+    if image is not None:
+        if not isinstance(image, torch.Tensor) or image.ndim != 4 or image.shape[-1] not in (3, 4):
+            shape = tuple(image.shape) if isinstance(image, torch.Tensor) else type(image).__name__
+            raise ValueError(f"{where}.image must be an IMAGE shaped (1, H, W, C), got {shape}.")
+        if image.shape[0] != 1:
+            raise ValueError(
+                f"{where}.image is a batch of {image.shape[0]} images, but an image guide is one frame. "
+                f"To guide with several frames, turn them into a clip with Create Video at {TIMELINE_GUIDE_FPS} FPS "
+                "and connect it to video instead."
+            )
+        if image.shape[1] == 0 or image.shape[2] == 0:
+            raise ValueError(f"{where}.image is empty.")
+
+    if video is not None and not isinstance(video, VideoInput):
+        raise ValueError(f"{where}.video must be a ComfyUI VIDEO, got {type(video).__name__}.")
+
+    if audio is not None:
+        waveform = audio.get("waveform") if isinstance(audio, dict) else None
+        if not isinstance(waveform, torch.Tensor) or waveform.ndim != 3:
+            raise ValueError(f"{where}.audio must be a ComfyUI AUDIO with a (batch, channels, samples) waveform.")
+        batch, channels, samples = waveform.shape
+        if batch != 1:
+            raise ValueError(f"{where}.audio is a batch of {batch} clips; connect a single clip.")
+        if channels not in (1, 2):
+            raise ValueError(f"{where}.audio has {channels} channels; audio guides accept mono or stereo.")
+        if samples == 0:
+            raise ValueError(f"{where}.audio is empty.")
+        sample_rate = audio.get("sample_rate")
+        if not isinstance(sample_rate, int) or isinstance(sample_rate, bool) or sample_rate <= 0:
+            raise ValueError(f"{where}.audio needs a positive integer sample_rate, got {sample_rate!r}.")
+        if not bool(torch.isfinite(waveform).all()):
+            raise ValueError(f"{where}.audio contains NaN or infinite samples.")
+
+
+def validate_timeline_guides(timeline_guides: object) -> None:
+    if not isinstance(timeline_guides, list):
+        raise ValueError(
+            f"timeline_guides must be the output of a MiniMax H3 Add Guide node, got {type(timeline_guides).__name__}."
+        )
+    if not timeline_guides:
+        raise ValueError("timeline_guides is empty; connect at least one MiniMax H3 Add Guide node.")
+    if len(timeline_guides) > MAX_TIMELINE_GUIDES:
+        raise ValueError(
+            f"timeline_guides holds {len(timeline_guides)} guides; the server accepts at most {MAX_TIMELINE_GUIDES}."
+        )
+    for index, guide in enumerate(timeline_guides):
+        validate_timeline_guide(guide, f"timeline_guides[{index}]")
+
+
+def _encode_timeline_guides(timeline_guides: list[dict]) -> tuple[str, list[tuple[str, str, BytesIO]]]:
+    """Encode guides into the ``timeline_guides`` manifest and ordered ``guide_files`` uploads.
+
+    Upload indices follow chain order, visual input before audio. Media are not
+    deduplicated: every guide owns its uploads.
+    """
+    manifest: list[dict[str, Any]] = []
+    uploads: list[tuple[str, str, BytesIO]] = []
+    for position, guide in enumerate(timeline_guides):
+        entry: dict[str, Any] = {"frame_index": guide["frame_index"]}
+        for kind in ("image", "video", "audio"):
+            media = guide.get(kind)
+            if media is None:
+                continue
+            index = len(uploads)
+            extension, content_type = _TIMELINE_GUIDE_FORMATS[kind]
+            filename = f"guide_{index}_{kind}.{extension}"
+            if kind == "image":
+                buffer = image_tensor_to_png_bytes(media, filename)
+            elif kind == "video":
+                # The server accepts MP4/MOV only; force MP4 so MKV/WebM sources are remuxed or transcoded.
+                buffer = video_to_bytes(media, filename, format="mp4")
+            else:
+                # Encode from a detached CPU float32 copy; the caller's AUDIO is left untouched.
+                waveform = media["waveform"].detach().to(device="cpu", dtype=torch.float32)
+                buffer = audio_to_bytes({"waveform": waveform, "sample_rate": media["sample_rate"]}, filename)
+            size, limit = buffer.getbuffer().nbytes, MAX_TIMELINE_GUIDE_BYTES[kind]
+            if size > limit:
+                raise ValueError(
+                    f"timeline_guides[{position}].{kind} is {size / 2**20:.2f} MiB ({size} bytes) after encoding, "
+                    f"above the server's {limit // 2**20} MiB limit."
+                )
+            buffer.seek(0)
+            uploads.append((filename, content_type, buffer))
+            entry[kind] = {"upload_index": index}
+        manifest.append(entry)
+    return json.dumps(manifest), uploads
 
 
 async def url_json(session: aiohttp.ClientSession, url: str, verb: str = "get", **kwargs) -> dict[str, Any]:
@@ -285,6 +403,7 @@ class VLLMOmniClient:
         model_params: dict | None = None,
         lora: dict | None = None,
         latent_edit: dict | None = None,
+        timeline_guides: list[dict] | None = None,
         spec_model: str | None = None,
         **extra_params,
     ) -> VideoInput:
@@ -293,6 +412,10 @@ class VLLMOmniClient:
         ``spec_model`` names the model whose payload spec builds the request, for
         deployments that serve a known model under a different ``model`` alias. It
         never reaches the wire; defaults to ``model``.
+
+        ``timeline_guides`` (MiniMax-H3 only) is sent as the ``timeline_guides``
+        manifest plus repeated ``guide_files`` uploads; it does not change the
+        routed task.
         """
         if frame is not None and references is not None:
             raise ValueError("Provide only one of frame or references, not both.")
@@ -302,10 +425,31 @@ class VLLMOmniClient:
             raise ValueError("Provide either first_frame/last_frame or references, not both.")
 
         spec, matched_pattern = lookup_model_spec(spec_model or model)
-        if (first_frame is not None or last_frame is not None) and (
-            matched_pattern is None or "MiniMax-H3" not in matched_pattern
-        ):
+        is_minimax_h3 = matched_pattern is not None and "MiniMax-H3" in matched_pattern
+        if (first_frame is not None or last_frame is not None) and not is_minimax_h3:
             raise ValueError("first_frame and last_frame are supported only for MiniMax-H3; use frame for this model.")
+
+        # === timeline guides: reject everything decidable before encoding any media ===
+        if timeline_guides is not None:
+            if not is_minimax_h3:
+                raise ValueError(f"timeline_guides are supported only for MiniMax-H3, not {model}.")
+            validate_timeline_guides(timeline_guides)
+            if fps != TIMELINE_GUIDE_FPS:
+                raise ValueError(
+                    f"timeline_guides are placed on a {TIMELINE_GUIDE_FPS} FPS timeline; "
+                    f"set fps to {TIMELINE_GUIDE_FPS} (got {fps})."
+                )
+            if latent_edit is not None:
+                raise ValueError("timeline_guides cannot be combined with latent_edit; disconnect one of them.")
+            # The server treats a missing scale as active and a zero scale as inactive.
+            if lora is not None and (lora.get("scale") is None or float(lora["scale"]) != 0.0):
+                raise ValueError(
+                    "timeline_guides require base MiniMax-H3 weights; disconnect the request-level LoRA "
+                    "(or set its scale to 0)."
+                )
+            quality = (sampling_params or {}).get("quality", "lossless")
+            if quality != "lossless":
+                raise ValueError(f"timeline_guides require quality=lossless (got {quality!r}).")
 
         # === regular payload fields ===
         form = aiohttp.FormData()
@@ -320,6 +464,9 @@ class VLLMOmniClient:
         if sampling_params is not None:
             for k, v in sampling_params.items():
                 form.add_field(k, str(v))
+        if timeline_guides is not None and "quality" not in (sampling_params or {}):
+            # Guides need cache-free execution; only guided requests carry this field.
+            form.add_field("quality", "lossless")
         if lora is not None:
             form.add_field("lora", json.dumps(lora, ensure_ascii=False))
 
@@ -439,6 +586,13 @@ class VLLMOmniClient:
                     content_type="application/json",
                 )
 
+        # === MiniMax-H3 timeline guides ===
+        if timeline_guides is not None:
+            manifest, uploads = _encode_timeline_guides(timeline_guides)
+            form.add_field("timeline_guides", manifest)
+            for filename, content_type, buffer in uploads:
+                form.add_field("guide_files", buffer, filename=filename, content_type=content_type)
+
         # === model specific params. Either use a specialized builder, or add flattened fields as-is ===
         if model_params is not None:
             model_params = dict(model_params)
@@ -461,41 +615,83 @@ class VLLMOmniClient:
             if extra_params:
                 form.add_field("extra_params", json.dumps(extra_params, ensure_ascii=False))
 
+        return bytes_to_video(await self._submit_video_job(form))
+
+    async def restore_video(
+        self,
+        *,
+        model: str,
+        video: VideoInput,
+        width: int,
+        height: int,
+        seed: int,
+    ) -> VideoInput:
+        """Restore a whole clip through a served SeedVR2 instance."""
+        if video is None:
+            raise ValueError("SeedVR2 restoration requires a VIDEO input; connect Load Video or Generate Video.")
+        if not model.strip():
+            raise ValueError("Model must not be empty.")
+        if width <= 0 or height <= 0 or width % 16 or height % 16:
+            raise ValueError("SeedVR2 output width and height must be positive multiples of 16.")
+
+        frame_rate = video.get_frame_rate()
+        form = aiohttp.FormData()
+        for name, value in {
+            "model": model,
+            "prompt": " ",
+            "size": f"{width}x{height}",
+            "num_inference_steps": "1",
+            "guidance_scale": "1",
+            "seed": str(seed),
+        }.items():
+            form.add_field(name, value)
+        # Leave fps and num_frames unset: the server reads both from the source.
+        form.add_field(
+            "input_references",
+            video_to_bytes(video, "source.mp4", format="mp4"),
+            filename="source.mp4",
+            content_type="video/mp4",
+        )
+        # The MP4 response encoder can round fractional FPS. The source VIDEO
+        # remains authoritative for restoration timing.
+        return bytes_to_restored_video(await self._submit_video_job(form), frame_rate)
+
+    async def _submit_video_job(self, form: aiohttp.FormData) -> bytes:
         async with aiohttp.ClientSession(timeout=self.timeout) as session:
             # Start the video generation job
             url = f"{self.base_url}/videos"
-            data = await url_json(session, url, "post", data=form)
+            try:
+                data = await url_json(session, url, "post", data=form)
+            except asyncio.TimeoutError as exc:
+                raise RuntimeError("Timed out submitting video job to vLLM-Omni") from exc
             if (job_id := data.get("id", None)) is None:
                 raise RuntimeError("API response missing job 'id' field - expected OpenAI compliant format")
-            if (job_status := data.get("status", None)) is None:
-                raise RuntimeError("API response missing job 'status' field - expected OpenAI compliant format")
-
-            # Poll for video generation job completion
-            deadline = asyncio.get_running_loop().time() + self.max_poll_duration
             url = f"{self.base_url}/videos/{job_id}"
-            while job_status not in {"completed", "failed"}:
-                await asyncio.sleep(self.poll_interval)
-
-                data = await url_json(session, url)
-                if (job_status := data.get("status", None)) is None:
-                    raise RuntimeError("API response missing job 'status' field - expected OpenAI compliant format")
-                if asyncio.get_running_loop().time() >= deadline:
-                    raise RuntimeError(f"Timed out waiting for video job {job_id} to complete")
-
-            if job_status == "failed":
-                raise RuntimeError(f"Video job failed: {data}")
-
-            # Retrieve completed content
-            video_bytes = await url_bytes(session, f"{url}/content")
-
-            # Decode video and make a best effort at cleaning up server resources
             try:
-                return bytes_to_video(video_bytes)
+                return await asyncio.wait_for(
+                    self._video_job_content(session, url, data), timeout=self.max_poll_duration
+                )
+            except asyncio.TimeoutError as exc:
+                raise RuntimeError(f"Timed out waiting for video job {job_id} to complete") from exc
             finally:
                 try:
-                    await url_json(session, url, "delete")
+                    # Cleanup must not turn a timeout/cancellation into an
+                    # unbounded wait when the server is unavailable.
+                    cleanup_timeout = aiohttp.ClientTimeout(total=min(10, self.timeout.total or 10))
+                    await url_json(session, url, "delete", timeout=cleanup_timeout)
                 except Exception as exc:
                     logger.warning("Failed to clean up video job %s: %s", job_id, exc)
+
+    async def _video_job_content(self, session: aiohttp.ClientSession, url: str, data: dict) -> bytes:
+        while True:
+            if (status := data.get("status")) is None:
+                raise RuntimeError("API response missing job 'status' field - expected OpenAI compliant format")
+            if status == "completed":
+                return await url_bytes(session, f"{url}/content")
+            if status == "failed":
+                raise RuntimeError(f"Video job failed: {data}")
+            await asyncio.sleep(self.poll_interval)
+            data = await url_json(session, url)
 
     async def generate_understanding_chat_completion(
         self,

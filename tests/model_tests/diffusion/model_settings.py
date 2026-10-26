@@ -62,6 +62,10 @@ DIFFUSION_TEST_SETTINGS = {
             [DiffusionAccs.SEQUENCE_PARALLEL, DiffusionAccs.CACHE_DIT, DiffusionAccs.LAYERWISE_OFFLOAD],
             [DiffusionAccs.CFG_PARALLEL, DiffusionAccs.TENSOR_PARALLEL, DiffusionAccs.CPU_OFFLOAD],
         ],
+        # The LTX2 audio vocoder currently has no usable MIOpen conv1d
+        # algorithm on MI325. Keep these groups on CUDA until that runtime
+        # path is qualified separately.
+        rocm_multigpu=False,
     ),
     "LTX2TextToAudioPipeline": DiffusionModelTestOpts(
         model="Lightricks/LTX-2",

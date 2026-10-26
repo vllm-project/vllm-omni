@@ -261,7 +261,7 @@ def test_playback_ack_is_scoped_per_response():
 
 def test_history_commit_uses_audio_text_alignment_marks():
     session = _session()
-    session.begin_response()
+    response_id = session.begin_response()
 
     session.append_assistant_text("hello ")
     session.mark_audio_sent(duration_ms=1_000, text_chars=6)
@@ -277,7 +277,7 @@ def test_history_commit_uses_audio_text_alignment_marks():
 
     assert committed == {"role": "assistant", "content": "hello w"}
     assert session.history[-1] == committed
-    assert session.last_assistant_full_message == {"role": "assistant", "content": "hello world"}
+    assert session.assistant_transcript(response_id) == "hello world"
 
 
 def test_history_commit_with_ack_only_policy_defers_unacknowledged_text():
@@ -380,6 +380,38 @@ def test_sent_audio_without_text_can_still_be_acknowledged():
     assert session.playback.sent_ms == session.playback.committed_ms == 696
     # The reserved slot stays as an empty turn. There is no transcript to store.
     assert session.history == (user.message, {"role": "assistant", "content": ""})
+    assert not session.has_audio_only_response(response_id)
+    assert response_id not in session._playback.by_response
+    assert f"item_{response_id}" not in session.pending_history_item_ids
+
+
+@pytest.mark.parametrize("ack_before_next_input", [False, True])
+def test_audio_only_ack_after_next_input_preserves_history(ack_before_next_input):
+    session = _session(config=DuplexSessionConfig(playback_commit_policy="ack_only"))
+    first = session.commit_audio_input(transcript="first question")
+    response_id = session.begin_response()
+    session.reserve_history_item(f"item_{response_id}")
+    session.mark_audio_sent(duration_ms=696, text_requires_complete_audio=True, audio_complete=True)
+    session.end_response()
+    if ack_before_next_input:
+        ack = apply_playback_ack(session, {"response_id": response_id, "played_ms": 300})
+        assert ack[0].type == "playback.acknowledged"
+        assert session.history == (first.message, {"role": "assistant", "content": ""})
+
+    session.commit_audio_input(transcript="next question")
+    next_response = session.begin_response()
+    history = session.history
+    ack = apply_playback_ack(session, {"response_id": response_id, "played_ms": 696})
+
+    assert ack[0].type == "playback.acknowledged"
+    assert ack[0].details["playback"]["committed_ms"] == 696
+    assert ack[0].details["history_committed"] is False
+    assert session.history == history
+    assert session.active_response_id == next_response
+    assert session.playback.sent_ms == session.playback.committed_ms == 0
+    assert not session.has_audio_only_response(response_id)
+    assert response_id not in session._playback.by_response
+    assert f"item_{response_id}" not in session.pending_history_item_ids
 
 
 def test_response_with_no_audio_and_no_text_is_not_ackable():
@@ -394,7 +426,7 @@ def test_response_with_no_audio_and_no_text_is_not_ackable():
 
 
 @pytest.mark.parametrize("operation", ["delete", "truncate"])
-def test_removing_one_empty_assistant_preserves_the_other_turn_boundary(operation):
+def test_delete_and_truncate_preserve_other_empty_turn_boundaries(operation):
     session = _session(config=DuplexSessionConfig(playback_commit_policy="ack_only"))
     user_inputs = []
     response_ids = []
@@ -411,15 +443,22 @@ def test_removing_one_empty_assistant_preserves_the_other_turn_boundary(operatio
     if operation == "delete":
         assert session.delete_history_item(item_id) is True
     else:
-        # A full ACK releases the pending snapshot. Truncation then edits the
-        # stored message into another empty dict before removing that item.
+        # A full ACK releases the pending snapshot. A subsequent truncate
+        # clears text but preserves this turn and the target of delayed ACKs.
         ack = apply_playback_ack(session, {"response_id": response_ids[1], "played_ms": 10_000})
         assert ack[0].to_realtime()["event"]["history_committed"] is True
         assert session.truncate_history_item(item_id, audio_end_ms=0, hard=True) is True
-    assert session.history == (user_inputs[0], {"role": "assistant", "content": ""}, user_inputs[1])
+    expected: tuple[dict[str, object], ...] = (user_inputs[0], {"role": "assistant", "content": ""}, user_inputs[1])
+    if operation == "truncate":
+        expected += ({"role": "assistant", "content": ""},)
+    assert session.history == expected
     ack = apply_playback_ack(session, {"response_id": response_ids[1], "played_ms": 10_000})
-    assert ack[0].to_realtime()["error"]["code"] == "playback_item_not_found"
-    assert session.history == (user_inputs[0], {"role": "assistant", "content": ""}, user_inputs[1])
+    if operation == "delete":
+        assert ack[0].to_realtime()["error"]["code"] == "playback_item_not_found"
+    else:
+        assert ack[0].type == "playback.acknowledged"
+        assert ack[0].details["history_committed"] is False
+    assert session.history == expected
 
 
 def test_truncate_history_item_uses_response_alignment_marks():
@@ -441,6 +480,21 @@ def test_truncate_history_item_uses_response_alignment_marks():
     assert session.history_item_ids[item_id] == {"role": "assistant", "content": "hello"}
     assert session.delete_history_item(item_id) is True
     assert session.history == ()
+
+
+@pytest.mark.parametrize("response_ended", [False, True])
+def test_registered_history_item_cannot_inherit_another_responses_marks(response_ended):
+    session = _session()
+    response = session.begin_response()
+    session.append_assistant_text("a different answer")
+    session.mark_audio_sent(1000, text_chars=18)
+    if response_ended:
+        session.register_history_item(f"item_{response}", session.end_response())
+    # conversation.item.create also registers messages without a response snapshot.
+    session.register_history_item("item_imported", {"role": "assistant", "content": "hello"})
+    assert not session.truncate_history_item("item_imported", audio_end_ms=200, hard=True)
+    assert session.history_item_ids["item_imported"]["content"] == "hello"
+    assert "item_imported" not in session._conversation.item_audio_text_marks
 
 
 # ---- turn signals / model turns ----
@@ -585,7 +639,7 @@ def test_commit_append_rejects_stale_reservation():
         session.prepare_append(DuplexFence("sid-other", epoch=0, turn_id=0))
 
 
-def test_cancel_fence_releases_stage_requests_and_advances_identity():
+def test_prepare_cancel_fence_retains_stage_requests_until_release():
     session = _session("sid-cancel")
     cancelled = session.fence
     session.reserve_stage_request(0, "req-a", fence=cancelled)
@@ -594,16 +648,20 @@ def test_cancel_fence_releases_stage_requests_and_advances_identity():
     assert session.stage_request_submitted(0, "req-a") is False
     next_fence = DuplexFence("sid-cancel", epoch=1, turn_id=0)
 
-    stale = session.cancel_fence(cancelled, next_fence)
+    stale = session.prepare_cancel_fence(cancelled, next_fence)
 
     assert stale == ["req-a", "req-b"]
-    assert session.resource_request_ids() == []
+    assert session.resource_request_ids() == ["req-a", "req-b"]
     assert session.accepted_fence == next_fence
 
+    # Stage cleanup succeeds before the caller releases its resource records.
+    session.release_fence(cancelled)
+    assert session.resource_request_ids() == []
+
     with pytest.raises(DuplexFenceMismatchError):
-        session.cancel_fence(next_fence, DuplexFence("sid-cancel", epoch=1, turn_id=1))
+        session.prepare_cancel_fence(next_fence, DuplexFence("sid-cancel", epoch=1, turn_id=1))
     with pytest.raises(DuplexFenceMismatchError):
-        session.cancel_fence(DuplexFence("sid-other", epoch=1, turn_id=0), DuplexFence("sid-cancel", epoch=2))
+        session.prepare_cancel_fence(DuplexFence("sid-other", epoch=1, turn_id=0), DuplexFence("sid-cancel", epoch=2))
 
 
 def test_request_resource_keys_are_stage_id_and_request_id():
@@ -671,7 +729,7 @@ def test_from_realtime_rejects_unsupported_audio_formats():
 
 def test_from_realtime_validates_turn_detection():
     with pytest.raises(DuplexConfigError) as excinfo:
-        DuplexSessionConfig.from_realtime({"turn_detection": {"type": "semantic_vad"}})
+        DuplexSessionConfig.from_realtime({"turn_detection": {"type": "foo_vad"}})
     assert excinfo.value.code == "unsupported_turn_detection"
     assert excinfo.value.param == "turn_detection"
 
@@ -784,8 +842,64 @@ def test_apply_realtime_update_rejects_voice_change_after_audio_started():
 
     config.apply_realtime_update({"voice": "verse"}, audio_started=False)
     assert config.voice == "verse"
+    # The echo check is playback-independent: a variant spelling must not
+    # overwrite the stored value before playback either.
+    config.apply_realtime_update({"voice": " VERSE "}, audio_started=False)
+    assert config.voice == "verse"
+    config.apply_realtime_update({"audio": {"output": {"voice": " verse "}}}, audio_started=False)
+    assert config.voice == "verse"
+    # Only a real change is a change: realtime clients resend the whole
+    # session object, so a round-tripped voice (same value, any case or
+    # spacing) and a null matching a voice-less config must pass the guard.
+    # An echo also keeps the stored spelling: shared plugins may compare the
+    # stored voice exactly.
+    config.apply_realtime_update({"voice": "verse"}, audio_started=True)
+    assert config.voice == "verse"
+    config.apply_realtime_update({"voice": " VERSE "}, audio_started=True)
+    assert config.voice == "verse"
+    config.apply_realtime_update({"audio": {"output": {"voice": " verse "}}}, audio_started=True)
+    assert config.voice == "verse"
+    config.apply_realtime_update({"voice": None}, audio_started=False)
+    assert config.voice is None
+    config.apply_realtime_update({"voice": None}, audio_started=True)
+    assert config.voice is None
+    for patch in ({"voice": "alloy"}, {"audio": {"output": {"voice": "alloy"}}}):
+        with pytest.raises(DuplexConfigError) as excinfo:
+            config.apply_realtime_update(patch, audio_started=True)
+        assert excinfo.value.code == "voice_update_after_audio_unsupported"
+        assert config.voice is None
+
+    # A nested null is a clear request: honored before audio output (GA
+    # clients carry the voice under audio.output), rejected after.
+    config = DuplexSessionConfig(model="m", voice="alloy")
+    config.apply_realtime_update({"audio": {"output": {"voice": None}}}, audio_started=False)
+    assert config.voice is None
+    config = DuplexSessionConfig(model="m", voice="alloy")
     with pytest.raises(DuplexConfigError) as excinfo:
-        config.apply_realtime_update({"audio": {"output": {"voice": "alloy"}}}, audio_started=True)
+        config.apply_realtime_update({"audio": {"output": {"voice": None}}}, audio_started=True)
+    assert excinfo.value.code == "voice_update_after_audio_unsupported"
+
+
+def test_apply_realtime_update_treats_blank_and_null_as_the_same_voice():
+    # A blank value and null both mean "no voice": switching between them
+    # after playback is an echo, not a change, so it must not be rejected.
+    config = DuplexSessionConfig(model="m", voice="")
+    config.apply_realtime_update({"voice": None}, audio_started=True)
+    assert config.voice is None
+
+    config = DuplexSessionConfig(model="m")
+    config.apply_realtime_update({"voice": "   "}, audio_started=True)
+    assert config.voice is None
+
+    # Before playback a blank clear is stored as null, matching the docs.
+    config = DuplexSessionConfig(model="m", voice="verse")
+    config.apply_realtime_update({"voice": "   "}, audio_started=False)
+    assert config.voice is None
+
+    # Clearing a set voice with a blank value is still a real change.
+    config = DuplexSessionConfig(model="m", voice="verse")
+    with pytest.raises(DuplexConfigError) as excinfo:
+        config.apply_realtime_update({"voice": "   "}, audio_started=True)
     assert excinfo.value.code == "voice_update_after_audio_unsupported"
     assert config.voice == "verse"
 
@@ -1045,11 +1159,11 @@ def test_end_response_logs_pending_and_active_stage_request_stats(monkeypatch: p
 def test_end_response_prints_one_column_per_stage(monkeypatch: pytest.MonkeyPatch):
     logged: list[OrchestratorAggregator] = []
 
-    def _record_summary(self):
-        logged.append(self)
+    def record_summary(aggregator: OrchestratorAggregator) -> dict[str, object]:
+        logged.append(aggregator)
         return {}
 
-    monkeypatch.setattr(OrchestratorAggregator, "build_and_log_summary", _record_summary)
+    monkeypatch.setattr(OrchestratorAggregator, "build_and_log_summary", record_summary)
     session = _session(num_stages=3, log_stats=True)
     session.observe_stage_request_stats(0, _stage_stats(stage_id=0, num_tokens_out=3, vllm_ttft_ms=40.0))
     response_id = session.begin_response()
@@ -1218,11 +1332,11 @@ def test_logged_e2e_includes_wait_before_first_output(monkeypatch: pytest.Monkey
     monkeypatch.setattr(time, "time", lambda: wall["t"])
     logged: list[OrchestratorAggregator] = []
 
-    def _record_summary(self):
-        logged.append(self)
+    def record_summary(aggregator: OrchestratorAggregator) -> dict[str, object]:
+        logged.append(aggregator)
         return {}
 
-    monkeypatch.setattr(OrchestratorAggregator, "build_and_log_summary", _record_summary)
+    monkeypatch.setattr(OrchestratorAggregator, "build_and_log_summary", record_summary)
     session = _session(log_stats=True, clock=lambda: mono["t"])
     session.mark_model_turn_request_started(0, 100.0)
 
@@ -1243,11 +1357,11 @@ def test_logged_e2e_includes_wait_before_first_output(monkeypatch: pytest.Monkey
 def test_logged_tpot_matches_client_weighted_aggregation(monkeypatch: pytest.MonkeyPatch) -> None:
     logged: list[OrchestratorAggregator] = []
 
-    def _record_summary(self):
-        logged.append(self)
+    def record_summary(aggregator: OrchestratorAggregator) -> dict[str, object]:
+        logged.append(aggregator)
         return {}
 
-    monkeypatch.setattr(OrchestratorAggregator, "build_and_log_summary", _record_summary)
+    monkeypatch.setattr(OrchestratorAggregator, "build_and_log_summary", record_summary)
     session = _session(log_stats=True)
     response_id = session.begin_response()
     session.observe_stage_request_stats(0, _stage_stats(stage_id=0, num_tokens_out=11, vllm_tpot_ms=10.0))
@@ -1289,16 +1403,68 @@ def test_draining_response_stays_ack_admissible_after_next_begin_response() -> N
     assert session.playback.sent_ms == 0
 
 
-def test_finished_drain_keeps_sent_audio_ackable() -> None:
+@pytest.mark.parametrize("initial_text", ["", "Hello"])
+@pytest.mark.parametrize("aligned_audio", [False, True])
+def test_caught_up_ack_preserves_draining_text_and_playback(initial_text, aligned_audio):
+    session = _session(config=DuplexSessionConfig(playback_commit_policy="ack_only"))
+    first_user = session.commit_audio_input(transcript="first question")
+    first = session.begin_response(turn_id=1)
+    session.append_assistant_text(initial_text)
+    session.mark_audio_sent(
+        400,
+        text_chars=len(initial_text) if aligned_audio else None,
+        text_requires_complete_audio=not aligned_audio,
+    )
+    session.bind_draining_request("first-tts", first)
+    session.snapshot_active_response_for_drain()
+    second_user = session.commit_audio_input(transcript="next question")
+    second = session.begin_response(turn_id=2)
+    session.mark_audio_sent(200)
+    second_playback = session.playback
+
+    ack = apply_playback_ack(session, {"response_id": first, "played_ms": 400})
+    assert ack[0].type == "playback.acknowledged"
+    assert first in session._conversation.assistant_response_snapshots
+    assert first in session._playback.by_response
+    assert not session.has_audio_only_response(first)
+    assert session.playback_for_response(first).committed_ms == 400
+
+    session.append_draining_assistant_text(first, " world")
+    text = initial_text + " world"
+    session.mark_audio_sent(
+        900,
+        text_chars=len(text) if aligned_audio else None,
+        response_id=first,
+        audio_complete=True,
+    )
+    assert session.assistant_transcript(first) == text
+    assert session.playback_for_response(first).committed_ms == 400
+    assert session.pop_draining_request("first-tts") == first
+    session.release_finished_drain_response(first)
+    ack = apply_playback_ack(session, {"response_id": first, "played_ms": 900})
+    assert ack[0].type == "playback.acknowledged"
+    assert ack[0].details["history_committed"] is True
+    assert session.history == (first_user.message, {"role": "assistant", "content": text}, second_user.message)
+    assert first not in session._conversation.assistant_response_snapshots
+    assert first not in session._playback.by_response
+    assert f"item_{first}" not in session.pending_history_item_ids
+    assert session.active_response_id == second
+    assert session.playback == second_playback
+
+
+@pytest.mark.parametrize("text", ["hello", ""])
+def test_finished_drain_keeps_sent_audio_ackable(text) -> None:
     from vllm_omni.engine.duplex.events import ErrorEvent
     from vllm_omni.engine.duplex.session.playback_ledger import apply_playback_ack
 
     session = _session()
     first = session.begin_response(turn_id=1)
-    session.append_assistant_text("hello")
-    session.mark_audio_sent(400, text_chars=5)
+    session.append_assistant_text(text)
+    session.mark_audio_sent(400, text_chars=len(text))
+    session.bind_draining_request("first-tts", first)
     session.snapshot_active_response_for_drain()
     second = session.begin_response(turn_id=2)
+    assert session.pop_draining_request("first-tts") == first
     session.release_finished_drain_response(first)
     assert first in session._conversation.assistant_response_snapshots
     assert f"item_{first}" in session._conversation.history_item_placeholders
@@ -1314,6 +1480,9 @@ def test_finished_drain_keeps_sent_audio_ackable() -> None:
     )
     assert not any(isinstance(event, ErrorEvent) for event in events)
     assert session.active_response_id == second
+    assert session.history == ({"role": "assistant", "content": text},)
+    assert first not in session._conversation.assistant_response_snapshots
+    assert first not in session._playback.by_response
 
     silent = session.begin_response(turn_id=3)
     session.snapshot_active_response_for_drain()
@@ -1321,3 +1490,43 @@ def test_finished_drain_keeps_sent_audio_ackable() -> None:
     session.release_finished_drain_response(silent)
     assert silent not in session._conversation.assistant_response_snapshots
     assert f"item_{silent}" not in session._conversation.history_item_placeholders
+
+
+@pytest.mark.parametrize("draining", [False, True])
+def test_deleting_a_live_item_preserves_its_output_playback_cursor(draining):
+    from vllm_omni.engine.duplex.events import ErrorEvent
+
+    session = _session(config=DuplexSessionConfig(playback_commit_policy="ack_only"))
+    response_id = session.begin_response()
+    item_id = f"item_{response_id}"
+    session.reserve_history_item(item_id)
+    session.append_assistant_text("still generating")
+    session.mark_audio_sent(duration_ms=1000)
+    if draining:
+        session.snapshot_active_response_for_drain()
+        session.bind_draining_request("drain", response_id)
+        session.begin_response()
+    session.delete_history_item(item_id)
+    # Item deletion does not cancel an in-flight model request. Its next audio
+    # chunk still needs the previous duration for response-local offsets.
+    assert session.playback_for_response(response_id).sent_ms == 1000
+    if draining:
+        active_response_id = session.active_response_id
+        session.mark_audio_sent(duration_ms=250)
+        assert session.pop_draining_request("drain") == response_id
+        session.release_finished_drain_response(response_id)
+        assert response_id not in session._playback.by_response
+        assert session.active_response_id == active_response_id
+        assert session.playback.sent_ms == 250
+        events = apply_playback_ack(
+            session,
+            {
+                "type": "playback.ack",
+                "response_id": response_id,
+                "item_id": item_id,
+                "played_ms": 1000,
+                "committed_ms": 1000,
+            },
+        )
+        assert any(isinstance(event, ErrorEvent) and event.code == "playback_item_not_found" for event in events)
+        assert response_id not in session._playback.by_response

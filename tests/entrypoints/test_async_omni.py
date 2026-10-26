@@ -851,7 +851,7 @@ _DIFFUSION_REQ_IDS = ["my-req-1", "img_gen-abc123", "chatcmpl-xyz"]
 _OMNI_REQ_IDS = ["my-req-1", "img_gen-abc123", "chatcmpl-xyz"]
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.omni
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
@@ -879,7 +879,7 @@ async def test_diffusion_generate_request_id(async_omni_runner_function):
         assert output.request_id != ""
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.omni
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
