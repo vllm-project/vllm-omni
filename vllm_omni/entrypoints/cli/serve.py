@@ -1001,6 +1001,17 @@ class OmniServeCommand(CLISubcommand):
             help="Compatibility option; use layer_options.dit.resident_layers in new configurations.",
         )
         omni_config_group.add_argument(
+            "--dlo-order-allgather-after-attn-a2a",
+            action="store_true",
+            default=False,
+            help=(
+                "Hold each DiT block's weight AllGather until that block's QKV AllToAll "
+                "has been enqueued, so the background gather does not take the collective "
+                "links ahead of the critical-path all-to-all. Requires distributed "
+                "layerwise offload with AllGather."
+            ),
+        )
+        omni_config_group.add_argument(
             "--host-weight-runtime-mode",
             choices=("disabled", "preferred", "required"),
             default="disabled",

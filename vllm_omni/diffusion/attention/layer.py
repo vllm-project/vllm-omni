@@ -9,7 +9,7 @@
 
 from collections.abc import Mapping
 from dataclasses import replace
-from typing import cast
+from typing import Any, cast
 
 import torch
 import torch.nn as nn
@@ -333,6 +333,11 @@ class Attention(nn.Module):
         # Local strategy when SP is intentionally inactive outside sharded regions.
         self._no_parallel_strategy = NoParallelAttention()
 
+        # Optional cross-module rendezvous (see distributed/collective_gate.py).
+        # Installed by the DLO backend when it must keep its background weight
+        # AllGather from taking the links ahead of this layer's QKV AllToAll.
+        self._collective_gate: Any | None = None
+
         self.layer_idx: int | None = _try_extract_layer_index(prefix)
 
         self._kv_cache_dtype: str | None = None
@@ -506,10 +511,12 @@ class Attention(nn.Module):
             reason = self._cross_backend_limitation(attn_metadata)
             if reason is not None:
                 blocked = self._cross_fallback_blocker(attn_metadata)
-                result = self.sdpa_fallback.resolve_execution_path(resolved_context, query, key, value, attn_metadata)
+                result = cast(SDPAImpl, self.sdpa_fallback).resolve_execution_path(
+                    resolved_context, query, key, value, attn_metadata
+                )
                 return replace(
                     result,
-                    backend=self.attn_backend.get_name() if blocked else "SDPA",
+                    backend=cast(type[AttentionBackend], self.attn_backend).get_name() if blocked else "SDPA",
                     path="cross_unsupported" if blocked else "cross_sdpa_fallback",
                     support=CapabilityResult.unsupported(blocked) if blocked else CapabilityResult.unmigrated(reason),
                 )
@@ -590,6 +597,12 @@ class Attention(nn.Module):
         # For Ulysses: AllToAll Q/K/V; Slicing joint_q/k/v
         # For Ring: Concat joint_q
         query, key, value, attn_metadata, ctx = strategy.pre_attention(query, key, value, attn_metadata)
+
+        # The QKV AllToAll is now enqueued on this stream. Release any gather
+        # that was deferred to give this collective the links first.
+        gate = self._collective_gate
+        if gate is not None:
+            gate.signal()
 
         # MiniMax-H3 Tier2 stores reference K/V in the balanced layout produced
         # by Ulysses. Keeping this hook at the generic post-parallel boundary
@@ -760,7 +773,7 @@ class Attention(nn.Module):
     def _cross_fallback_blocker(self, attn_metadata: AttentionMetadata | None) -> str | None:
         if self.backend_explicit:
             return (
-                f"Explicit backend {self.attn_backend.get_name()} does not support "
+                f"Explicit backend {cast(type[AttentionBackend], self.attn_backend).get_name()} does not support "
                 f"{self._cross_backend_limitation(attn_metadata)}"
             )
         if attn_metadata is not None and attn_metadata.extra.get("kv_cache_dtype") not in (None, "float"):
@@ -793,7 +806,7 @@ class Attention(nn.Module):
                 blocked = self._cross_fallback_blocker(attn_metadata)
                 if blocked is not None:
                     raise NotImplementedError(blocked)
-                return self.sdpa_fallback.forward(query, key, value, attn_metadata)
+                return cast(SDPAImpl, self.sdpa_fallback).forward(query, key, value, attn_metadata)
         dense_mask = attn_metadata.attn_mask if attn_metadata is not None else None
         # Piecewise backends honor full_attn_spans ahead of attn_mask and never read the
         # dense mask (e.g. HunyuanImage3, which sends both), so there is nothing to divert.

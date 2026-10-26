@@ -959,6 +959,10 @@ class OmniDiffusionConfig:
     dlo_use_allgather: bool = True
     # Leading main-DiT blocks kept resident by distributed layerwise offload.
     dlo_resident_layers: int = 0
+    # Hold each DiT block's weight AllGather until that block's QKV AllToAll has
+    # been enqueued, so the background collective does not take the links ahead
+    # of the critical-path all-to-all.
+    dlo_order_allgather_after_attn_a2a: bool = False
     # Final-layout Host Weight Runtime policy. The loader only activates this
     # for eligible no-AllGather DLO; all other configurations preserve their
     # existing loader/storage path.

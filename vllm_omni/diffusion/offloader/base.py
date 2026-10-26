@@ -70,6 +70,10 @@ class OffloadConfig:
     # blocks from the loader-selected host backing with H2D only.
     dlo_use_allgather: bool = True
     dlo_resident_layers: int = 0  # leading DiT layers kept on device
+    # Hold each DiT block's weight AllGather until that block's QKV AllToAll has
+    # been enqueued, so the background collective does not take the links ahead
+    # of the critical-path all-to-all. See ``collective_gate.py``.
+    dlo_order_allgather_after_attn_a2a: bool = False
     # Optional per-worker ceiling for registering an HWR mmap. Zero means no
     # additional ceiling; pin_cpu_memory controls whether registration is tried.
     dlo_host_registration_limit_gib: float = 0.0
@@ -209,6 +213,7 @@ class OffloadConfig:
             dp_size=dp_size,
             dlo_use_allgather=dit_uses_allgather,
             dlo_resident_layers=dlo_resident_layers,
+            dlo_order_allgather_after_attn_a2a=bool(getattr(od_config, "dlo_order_allgather_after_attn_a2a", False)),
             dlo_host_registration_limit_gib=dlo_host_registration_limit_gib,
             components=components,
             dlo_transfers=dlo_transfers,
