@@ -697,37 +697,6 @@ class MiMoAudioToken2WavForConditionalGenerationVLLM(nn.Module):
             )
         raise TypeError(f"Unexpected model output type: {type(model_output)}")
 
-    def _get_full_code_sequence(
-        self,
-        code_tensor: torch.Tensor | None,
-        kwargs: dict,
-    ) -> torch.Tensor | None:
-        """Gather the full prompt token ids (code sequence) if available."""
-        if code_tensor is not None and code_tensor.numel() > 1:
-            return code_tensor
-
-        sampling_metadata = kwargs.get("sampling_metadata")
-        prompt_token_ids = getattr(sampling_metadata, "prompt_token_ids", None) if sampling_metadata else None
-
-        if prompt_token_ids is None:
-            return code_tensor
-
-        if isinstance(prompt_token_ids, torch.Tensor):
-            return prompt_token_ids.detach().to(torch.long).view(-1)
-
-        if isinstance(prompt_token_ids, list):
-            if len(prompt_token_ids) == 0:
-                return code_tensor
-            if isinstance(prompt_token_ids[0], list):
-                flat = prompt_token_ids[0]
-            else:
-                flat = prompt_token_ids
-            if len(flat) == 0:
-                return code_tensor
-            return torch.tensor(flat, dtype=torch.long)
-
-        return code_tensor
-
     @torch.inference_mode()
     def _batch_decode_waveforms(
         self,

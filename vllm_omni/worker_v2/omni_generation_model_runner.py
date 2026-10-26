@@ -14,6 +14,7 @@ from __future__ import annotations
 from dataclasses import replace
 from typing import Any
 
+import numpy as np
 import torch
 from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import set_forward_context
@@ -123,10 +124,12 @@ class OmniGenerationAsyncOutput(AsyncModelRunnerOutput):
         copy_stream: torch.cuda.Stream,
         finalize_output: Any | None = None,
         check_ep_fault: bool = False,
+        pending_aux_output: Any | None = None,
     ) -> None:
         self.model_runner_output = model_runner_output
         self.num_reqs = num_reqs
         self.finalize_output = finalize_output
+        self.pending_aux_output = pending_aux_output
         self.copy_event = torch.cuda.Event(blocking=True)
         self._has_fault: torch.Tensor | None = None
 
@@ -138,6 +141,10 @@ class OmniGenerationAsyncOutput(AsyncModelRunnerOutput):
                 copy_stream=copy_stream,
                 pin_memory=PIN_MEMORY,
             )
+            if pending_aux_output is not None:
+                # Generation stages emit no sampled/rejected token IDs.
+                counts = np.zeros(num_reqs, dtype=np.int32)
+                pending_aux_output.enqueue_cpu_copy(num_sampled=counts, num_rejected=counts)
             if check_ep_fault:
                 has_fault = get_ep_all2all_manager().query_fault()
                 self._has_fault = has_fault.to("cpu", non_blocking=True)
@@ -145,6 +152,8 @@ class OmniGenerationAsyncOutput(AsyncModelRunnerOutput):
 
     def get_output(self) -> OmniModelRunnerOutput:
         self.copy_event.synchronize()
+        if self.pending_aux_output is not None:
+            self.model_runner_output.aux_output_connector_output = self.pending_aux_output.process_output()
         if self._has_fault is not None and self._has_fault.item():
             mask = get_ep_all2all_manager().query_active_mask()
             raise RuntimeError(
@@ -178,6 +187,7 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
         # Placeholder for ExecuteModelState.hidden_states — allocated
         # once and reused every step to avoid per-forward allocation.
         self._dummy_hidden = torch.zeros(1, dtype=self.dtype, device=self.device)
+        self._retains_state_across_chunks = bool(getattr(self.model_config, "retains_state_across_chunks", False))
 
     # ------------------------------------------------------------------
     # Async-chunk support: replace prompt_token_ids for cached requests
@@ -221,31 +231,36 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
             if new_ids is None:
                 continue
 
+            block_ids = cached.new_block_ids[i]
+            chunk_data = OmniNewRequestData(
+                req_id=req_id,
+                prompt_token_ids=new_ids,
+                mm_features=[],
+                sampling_params=None,
+                pooling_params=None,
+                block_ids=block_ids if block_ids is not None else tuple(),
+                num_computed_tokens=0,
+                lora_request=None,
+                prompt_embeds=None,
+                prefill_token_ids=new_ids,
+                additional_information=cached.additional_information.get(req_id),
+            )
             req_idx = self.req_states.req_id_to_index.get(req_id)
             if req_idx is None:
-                block_ids = cached.new_block_ids[i]
-                released_chunks.append(
-                    OmniNewRequestData(
-                        req_id=req_id,
-                        prompt_token_ids=new_ids,
-                        mm_features=[],
-                        sampling_params=None,
-                        pooling_params=None,
-                        block_ids=block_ids if block_ids is not None else tuple(),
-                        num_computed_tokens=0,
-                        lora_request=None,
-                        prompt_embeds=None,
-                        prefill_token_ids=new_ids,
-                        additional_information=cached.additional_information.get(req_id),
-                    )
-                )
+                released_chunks.append(chunk_data)
                 continue
 
+            # Reset chunk-local model inputs using the same initialization as
+            # re-adding a released chunk, without recycling the runner slot.
             self.model_state.remove_request(req_idx)
+            self.model_state.add_request(req_idx, chunk_data)
 
             # In-place update token state — same slot, no remove/re-add.
             # .np[] = direct write (no GPU buffer); stage_write = GPU-synced.
             n = len(new_ids)
+            # Match add_request's max_tokens=1 fallback for chunk_data above.
+            self.req_states.max_seq_len[req_idx] = n + 1
+            self.req_states.draft_tokens[req_idx].zero_()
             self.req_states.prompt_len.np[req_idx] = n
             self.req_states.prefill_len.np[req_idx] = n
             self.req_states.total_len.stage_write_elem(req_idx, n)
@@ -263,27 +278,24 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
                 )
             )
         if updated:
-            self.req_states.apply_staged_writes()
+            # Match add_requests: collect request and model-state writes, then
+            # flush them together before subsequent input preparation.
+            with self._staged_writes.deferred():
+                self.req_states.apply_staged_writes()
+                self.model_state.apply_staged_writes()
 
     def _release_generation_slots(self, input_batch: Any) -> None:
         if not getattr(self.model_config, "async_chunk", False):
             return
-        model_state = getattr(self, "model_state", None)
-        remove_request = getattr(self, "_remove_request", None)
-        if model_state is None or remove_request is None:
-            return
-        for i in range(input_batch.num_reqs):
-            req_id = input_batch.req_ids[i]
-            req_idx = int(input_batch.idx_mapping_np[i])
-            model_state.remove_request(req_idx)
-            remove_request(req_id)
+        for req_id in input_batch.req_ids:
+            self._remove_request(req_id)
 
     # ------------------------------------------------------------------
     # profile / warmup — skip sampler since there are no logits
     # ------------------------------------------------------------------
 
     @torch.inference_mode()
-    def profile_run(self) -> None:
+    def profile_run(self, randomize_inputs: bool = False) -> None:
         """Generation models have no KV cache — skip profiling.
 
         Code2Wav shares GPU memory with the Talker stage (same device);
@@ -308,6 +320,7 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
         is_profile: bool = False,
         context_len: int = 0,
         valid_dummy_state_slots: bool = False,
+        randomize_inputs: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
         if not dummy_run:
             self._prepare_native_data_plane(scheduler_output)
@@ -321,6 +334,8 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
                 # Registration/terminal/abort work has been applied above.
                 # There is no new or cached request state to add or update.
                 self._apply_block_table_staged_writes_if_available()
+                if self.aux_output_connector is not None:
+                    self.aux_output_connector.begin_step(scheduler_output.aux_output_connector_metadata)
                 empty_output = self.kv_connector.no_forward(scheduler_output)
                 return self._attach_native_data_plane_signals(
                     self._merge_ec_connector_no_forward(scheduler_output, empty_output)
@@ -333,6 +348,8 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
             self.update_requests(scheduler_output)
             self._sync_native_data_plane_payloads(scheduler_output)
             self._apply_block_table_staged_writes_if_available()
+            if self.aux_output_connector is not None:
+                self.aux_output_connector.begin_step(scheduler_output.aux_output_connector_metadata)
             if scheduler_output.total_num_scheduled_tokens == 0:
                 empty_output = self.kv_connector.no_forward(scheduler_output)
                 return self._attach_native_data_plane_signals(
@@ -366,7 +383,7 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
 
         if not dummy_run:
             assert batch_req_state is not None
-            input_batch = self.prepare_inputs(scheduler_output, batch_req_state, batch_desc)
+            input_batch = self.prepare_inputs(scheduler_output, batch_req_state, batch_desc, 0)
         else:
             from vllm.v1.worker.gpu.input_batch import InputBatch
 
@@ -375,7 +392,10 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
                 batch_desc.num_tokens,
                 self.input_buffers,
                 max_query_len=batch_desc.max_query_len,
+                is_padding=not is_profile,
             )
+            # Codec IDs have model-specific bounds; keep valid dummy tokens
+            # even when upstream requests randomized language-model inputs.
 
         attn_metadata = None
         slot_mappings_by_layer = None
@@ -448,11 +468,11 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
             slot_mappings_by_layer=None,
             hidden_states=self._dummy_hidden,
             aux_hidden_states=None,
+            dp_sync_state=dp_sync,
             finished_req_ids=scheduler_output.finished_req_ids,
-            dp_sync=dp_sync,
             ec_connector_output=ec_connector_output,
-            routed_experts=None,
             cudagraph_stats=None,
+            num_spec_tokens_to_schedule=scheduler_output.num_spec_tokens_to_schedule,
         )
         return None
 
@@ -476,6 +496,9 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
             return None
 
         num_reqs = input_batch.num_reqs
+        pending_aux_output = None
+        if self.aux_output_connector is not None:
+            pending_aux_output = self.aux_output_connector.prepare_output(input_batch)
 
         # Mark all scheduled tokens as computed so the scheduler does
         # not re-schedule them.  Unlike AR stages we do NOT call
@@ -517,7 +540,7 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
 
         raw_multimodal_outputs = model_output.multimodal_outputs
         can_copy_async = getattr(getattr(self, "device", None), "type", "cpu") == "cuda" and (
-            self.check_ep_fault or _contains_cuda_tensor(raw_multimodal_outputs)
+            self.check_ep_fault or pending_aux_output is not None or _contains_cuda_tensor(raw_multimodal_outputs)
         )
         if can_copy_async:
             async_output = OmniGenerationAsyncOutput(
@@ -528,9 +551,11 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
                 copy_stream=self.output_copy_stream,
                 finalize_output=self._finalize_native_data_plane_output,
                 check_ep_fault=self.check_ep_fault,
+                pending_aux_output=pending_aux_output,
             )
             self._reserve_native_data_plane_outputs(list(req_ids))
-            self._release_generation_slots(input_batch)
+            if not self._retains_state_across_chunks:
+                self._release_generation_slots(input_batch)
             return async_output
 
         # CPU execution keeps the synchronous materialization path. Final
@@ -541,7 +566,8 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
         output.multimodal_outputs = [
             _ensure_tensor_values(payload) if payload else {} for payload in multimodal_outputs
         ]
-        self._release_generation_slots(input_batch)
+        if not self._retains_state_across_chunks:
+            self._release_generation_slots(input_batch)
         return self._finalize_native_data_plane_output(output)
 
     # ------------------------------------------------------------------

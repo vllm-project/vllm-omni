@@ -174,7 +174,9 @@ async def test_real_producer_deltas_reach_video_client(
         produced.append(OmniRequestOutput.from_stage_output(result, final_output_type="audio"))
 
     class Engine:
-        async def generate(self, *, prompt, request_id, output_modalities, sampling_params_list=None):
+        async def generate(self, *, prompt, request_id, output_modalities, sampling_params_list=None, submitted=None):
+            if submitted is not None and not submitted.done():
+                submitted.set_result(None)
             if explicit_sampling:
                 assert sampling_params_list is not None
                 assert sampling_params_list[0].output_kind == RequestOutputKind.DELTA

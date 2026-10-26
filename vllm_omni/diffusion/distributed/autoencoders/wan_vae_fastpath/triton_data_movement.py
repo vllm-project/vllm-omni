@@ -22,7 +22,7 @@ from __future__ import annotations
 import torch
 from vllm.triton_utils import HAS_TRITON, tl, triton
 
-from ._utils import _pick_block_width
+from ._utils import _pick_block_width, on_kernel_device, suggests_channels_last
 
 _MAX_INT32 = 2**31 - 1
 _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
@@ -527,10 +527,6 @@ if HAS_TRITON:
         tl.store(out_ptr + offsets, (x + h).to(dtype), mask=mask)
 
 
-def _uses_channels_last_3d(tensor: torch.Tensor) -> bool:
-    return tensor.shape[1] > 1 and tensor.stride(1) == 1
-
-
 def _next_power_of_2(value: int) -> int:
     return 1 << max(0, value - 1).bit_length()
 
@@ -563,12 +559,15 @@ def cat_pad_5d(
         return None
     if pad_width_left != pad_width_right or pad_height_top != pad_height_bottom or pad_back != 0:
         return None
-    if x.dim() != 5 or not x.is_cuda or x.dtype not in _SUPPORTED_DTYPES:
+    if x.dim() != 5 or not on_kernel_device(x) or x.dtype not in _SUPPORTED_DTYPES:
         return None
     if keep_cache_frames < 0:
         return None
 
-    channels_inner = _uses_channels_last_3d(x)
+    # Upstream's ``torch.cat`` + ``F.pad`` allocate channels_last_3d only when
+    # every input suggests it; a stride(1) == 1 test would also match contiguous
+    # tensors whose only non-unit dimension is C.
+    channels_inner = suggests_channels_last(x) and (cache_x is None or suggests_channels_last(cache_x))
     out_channels_inner = channels_inner or channels_last_output
     cache_frames = 0
     if cache_x is not None:
@@ -713,14 +712,15 @@ def cat_time_5d(
 ) -> tuple[torch.Tensor, torch.Tensor] | torch.Tensor | None:
     """Assemble ``[zeros(pad_front - Tc) | cache | x]`` along time, without spatial padding.
 
-    Returns the assembled tensor (same memory format as ``x``) and, with
-    ``keep_cache_frames > 0``, its last frames as the next feature-cache entry.
+    Returns the assembled tensor (in the memory format upstream's ``torch.cat``
+    would allocate) and, with ``keep_cache_frames > 0``, its last frames as the
+    next feature-cache entry.
     Because only whole aligned planes move, this runs at memory bandwidth in
     both layouts; the spatial zero padding is left to the convolution
     (``padding=(0, ph, pw)``), whose bitwise agreement with a pre-padded input
     the caller verifies. Unsupported inputs return ``None``.
     """
-    if not HAS_TRITON or x.dim() != 5 or not x.is_cuda or x.dtype not in _SUPPORTED_DTYPES:
+    if not HAS_TRITON or x.dim() != 5 or not on_kernel_device(x) or x.dtype not in _SUPPORTED_DTYPES:
         return None
     if pad_front < 0 or keep_cache_frames < 0:
         return None
@@ -746,6 +746,9 @@ def cat_time_5d(
             return None
         cache_frames = cache_x.shape[2]
         cache_strides = (cache_x.stride(0), cache_layout[2], cache_x.stride(2))
+    # The output layout must be the one upstream's ``torch.cat`` would allocate.
+    if channels_last != (suggests_channels_last(x) and (cache_x is None or suggests_channels_last(cache_x))):
+        return None
     zero_front_frames = pad_front - cache_frames
     if zero_front_frames < 0:
         return None
@@ -837,7 +840,7 @@ def dup_up3d_add(
         return None
     if factor_temporal & (factor_temporal - 1) or repeats & (repeats - 1) or repeats < factor_spatial:
         return None
-    if not main.is_cuda or not source.is_cuda:
+    if not on_kernel_device(main) or not on_kernel_device(source):
         return None
     if main.dtype != source.dtype or main.dtype not in _SUPPORTED_DTYPES or main.device != source.device:
         return None
@@ -955,7 +958,7 @@ def add_bias_residual(
     or both channels-last); either bias may be ``None`` when that operand
     already carries its bias.
     """
-    if not HAS_TRITON or not x.is_cuda or x.dim() not in (4, 5) or x.dtype not in _SUPPORTED_DTYPES:
+    if not HAS_TRITON or not on_kernel_device(x) or x.dim() not in (4, 5) or x.dtype not in _SUPPORTED_DTYPES:
         return None
     if h.shape != x.shape or h.dtype != x.dtype or h.device != x.device:
         return None

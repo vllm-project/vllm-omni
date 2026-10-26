@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import os
 from typing import Any
@@ -25,12 +25,8 @@ class DataCollectionHook(ModelHook):
     def __init__(self, transformer_type: str):
         super().__init__()
         self.transformer_type = transformer_type
-        self.extractor_fn = None
+        self.extractor_fn = get_extractor(transformer_type)
         self.current_trajectory: list[tuple[np.ndarray, np.ndarray]] = []
-
-    def initialize_hook(self, module: torch.nn.Module) -> torch.nn.Module:
-        self.extractor_fn = get_extractor(self.transformer_type)
-        return module
 
     def new_forward(self, module: torch.nn.Module, *args: Any, **kwargs: Any) -> Any:
         ctx = self.extractor_fn(module, *args, **kwargs)
@@ -56,7 +52,7 @@ class DataCollectionHook(ModelHook):
 class DefaultAdapter:
     """Default adapter for standard diffusers pipelines."""
 
-    model_class_name = None
+    model_class_name: str | None = None
     uses_tf_config = True
 
     @classmethod
@@ -132,11 +128,18 @@ class StableAudioAdapter(DefaultAdapter):
     model_class_name = "StableAudioPipeline"
 
 
-_MODEL_ADAPTERS: dict[str, type] = {
+class ZImageAdapter(DefaultAdapter):
+    """Adapter for Z-Image coefficient estimation."""
+
+    model_class_name = "ZImagePipeline"
+
+
+_MODEL_ADAPTERS: dict[str, type[DefaultAdapter]] = {
     "Bagel": BagelAdapter,
     "StableAudio": StableAudioAdapter,
     "Flux2": Flux2Adapter,
     "LongCat": LongCatAdapter,
+    "ZImage": ZImageAdapter,
 }
 
 _EPSILON = 1e-6

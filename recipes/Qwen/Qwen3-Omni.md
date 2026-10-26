@@ -73,7 +73,19 @@ vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
     "1": {"max_num_seqs": 4},
     "2": {"max_num_seqs": 4}
   }'
+
+# Replay the thinker's image encoder from CUDA graphs (images only)
+vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
+  --stage-overrides '{"0": {"compilation_config": {"cudagraph_mm_encoder": true}}}'
 ```
+
+With the encoder graphs on, the thinker captures one graph per token budget
+(64 to 256 image tokens and up to 4 images per replay by default). A step's
+images replay together when one captured graph holds them all; otherwise they
+run through the eager encoder in one call. Set `encoder_cudagraph_token_budgets`
+and `encoder_cudagraph_max_vision_items_per_batch` in the same
+`compilation_config` to change them; each captured budget adds graph memory on
+the thinker's GPU.
 
 ### Stage-based launch (one stage per process)
 

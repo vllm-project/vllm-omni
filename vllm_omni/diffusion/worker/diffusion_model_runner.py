@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import copy
 import gc
+import math
 import time
 from collections.abc import Callable, Sequence
 from contextlib import AbstractContextManager, nullcontext
@@ -21,7 +22,7 @@ import torch
 from torch.profiler import record_function
 from vllm.config import LoadConfig, VllmConfig
 from vllm.logger import init_logger
-from vllm.utils.mem_utils import DeviceMemoryProfiler, GiB_bytes
+from vllm.utils.mem_utils import DeviceMemoryProfiler, GiB_bytes, format_gib
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 
 from vllm_omni.diffusion.attention.layer import Attention
@@ -84,6 +85,7 @@ from vllm_omni.diffusion.worker.utils import (
     merge_stage_durations,
 )
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
+from vllm_omni.errors import OmniClientError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.platforms import current_omni_platform
 
@@ -206,7 +208,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         self.kv_transfer_manager = (
             payload_transfer_manager if getattr(od_config, "kv_transfer_config", None) is None else None
         )
-        self.init_omni_connectors(od_config, payload_transfer_manager, synchronous=True)
+        self.init_omni_connectors(od_config, payload_transfer_manager, synchronous=True)  # type: ignore[arg-type]
         self._kv_connector = None
         from vllm_omni.diffusion.diffusion_kv.kv_connector import KVReceiveProgress, native_prefetch_enabled
 
@@ -250,14 +252,25 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         if model is None:
             return
 
+        compile_kwargs: dict[str, Any] = {"dynamic": self.od_config.diffusion_compile_dynamic}
+        if getattr(model, "enable_cuda_graph_decode", False):
+            # Decode-graph models still compile their blocks: graph capture
+            # records the compiled (fused) kernels. Scope inductor cudagraphs
+            # to this compile so the two graph layers never stack, without
+            # changing torch.compile for every other model in the process.
+            compile_kwargs["options"] = {
+                "triton.cudagraphs": False,
+                "triton.cudagraph_trees": False,
+            }
+            logger.info("Model runner: %s combines CUDA graph decode with torch.compile.", attr_name)
+
         compile_granularity = self.od_config.diffusion_compile_granularity
-        compile_dynamic = self.od_config.diffusion_compile_dynamic
         try:
             if compile_granularity == "full":
-                model.compile(dynamic=compile_dynamic)
+                model.compile(**compile_kwargs)
                 compiled_model = model
             else:
-                compiled_model = regionally_compile(model, dynamic=compile_dynamic)
+                compiled_model = regionally_compile(model, **compile_kwargs)
             setattr(self.pipeline, attr_name, compiled_model)
         except Exception as e:
             logger.warning(
@@ -275,7 +288,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
             "compilation errors may surface on the first request.",
             attr_name,
             compile_granularity,
-            compile_dynamic,
+            compile_kwargs["dynamic"],
         )
 
     def load_model(
@@ -283,6 +296,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         memory_pool_context_fn: Callable[[str], AbstractContextManager[Any]] | None = None,
         load_format: str = "default",
         custom_pipeline_name: str | None = None,
+        initialize_lora: Callable[[], None] | None = None,
     ) -> None:
         """
         Launch the diffusion pipeline, applying compilation, offloading, and caching.
@@ -347,6 +361,8 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                     custom_pipeline_name=custom_pipeline_name,
                     device=self.device,
                 )
+                if initialize_lora is not None and getattr(self.pipeline, "requires_early_lora_init", False) is True:
+                    initialize_lora()
         time_after_load = time.perf_counter()
 
         logger.info(
@@ -602,7 +618,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         return self.prompt_embed_cache.stats()
 
     def _sample_peak_memory_mb(self) -> float:
-        """Return peak GPU memory for the current forward pass in MB.
+        """Return peak reserved GPU memory for the current forward pass in MiB.
 
         Must be called immediately after the measured forward/step work, with
         reset_peak_memory_stats() called just before it, so the measurement
@@ -612,21 +628,22 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         Uses max_memory_reserved (CUDA memory pool high-water mark) rather than
         max_memory_allocated so that allocator fragmentation is also visible.
         See: https://docs.pytorch.org/docs/stable/generated/torch.cuda.memory.max_memory_reserved.html
+
+        Named ``_mb`` to match the public ``peak_memory_mb`` field.
         """
         peak_reserved_bytes = current_omni_platform.max_memory_reserved()
         peak_allocated_bytes = current_omni_platform.max_memory_allocated()
 
+        pool_overhead_bytes = peak_reserved_bytes - peak_allocated_bytes
+
         peak_memory_mb = peak_reserved_bytes / (1024**2)
-        peak_reserved_gb = peak_reserved_bytes / (1024**3)
-        peak_allocated_gb = peak_allocated_bytes / (1024**3)
-        pool_overhead_gb = peak_reserved_gb - peak_allocated_gb
 
         logger.debug(
-            "Peak GPU memory (this request): %.2f GB reserved, %.2f GB allocated, %.2f GB pool overhead (%.1f%%)",
-            peak_reserved_gb,
-            peak_allocated_gb,
-            pool_overhead_gb,
-            pool_overhead_gb / peak_reserved_gb * 100 if peak_reserved_gb > 0 else 0.0,
+            "Peak GPU memory (this request): %s GiB reserved, %s GiB allocated, %s GiB pool overhead (%.1f%%)",
+            format_gib(peak_reserved_bytes),
+            format_gib(peak_allocated_bytes),
+            format_gib(pool_overhead_bytes),
+            pool_overhead_bytes / peak_reserved_bytes * 100 if peak_reserved_bytes > 0 else 0.0,
         )
         return peak_memory_mb
 
@@ -862,7 +879,11 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 with record_function(record_name):
                     try:
                         check_request_cancellation()
-                        raw_outputs = self.pipeline.forward(batch)
+                        run_stage = getattr(self.pipeline, "run_stage", None)
+                        if callable(run_stage):
+                            raw_outputs = run_stage(batch)
+                        else:
+                            raw_outputs = self.pipeline.forward(batch)
                         outputs = _normalize_pipeline_outputs(
                             raw_outputs,
                             expected_count=len(reqs),
@@ -923,6 +944,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
             output.started_event_ids = list(meta.started_event_ids)
             output.active_event_ids = list(meta.active_event_ids)
             output.completed_event_ids = list(meta.completed_event_ids)
+            output.coalesced_event_ids = list(meta.coalesced_event_ids)
 
     def execute_model(
         self,
@@ -966,6 +988,9 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
             output = runner_output.runner_outputs[0].result
             assert output is not None
             return output
+        except OmniClientError as exc:
+            # Preserve request errors before the worker RPC serializes them.
+            return DiffusionOutput.from_exception(exc)
         finally:
             if installed_request:
                 self.remove_diffusion_kv_requests([req.request_id])
@@ -1043,12 +1068,12 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 metadata=new_req.diffusion_kv_metadata,
             )
         installed_request_ids: list[str] = []
+        reqs = [nr.req for nr in scheduler_output.scheduled_new_reqs]
         try:
             for new_req in scheduler_output.scheduled_new_reqs:
                 if new_req.diffusion_kv_metadata is not None:
                     self.install_diffusion_kv_metadata(new_req.diffusion_kv_metadata)
                     installed_request_ids.append(new_req.request_id)
-            reqs = [nr.req for nr in scheduler_output.scheduled_new_reqs]
             return self._execute_request_list(
                 reqs,
                 od_config=od_config,
@@ -1062,6 +1087,8 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 ]
                 or None,
             )
+        except OmniClientError as exc:
+            return self._runner_output_from_outputs(reqs, [DiffusionOutput.from_exception(exc) for _ in reqs])
         finally:
             if installed_request_ids:
                 self.remove_diffusion_kv_requests(installed_request_ids)
@@ -1074,11 +1101,26 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         """Return whether current pipeline supports step execution."""
         return self.pipeline is not None and supports_step_execution(self.pipeline)
 
+    def release_step_requests(self, request_ids: Sequence[str]) -> None:
+        """Drop request-owned state after execution/output preparation has returned.
+
+        The cached batch also owns states, including model-private tensors in
+        ``extra``. Invalidate it when its composition contains a retired request;
+        surviving requests retain their own state and are repacked on the next step.
+        """
+        for request_id in request_ids:
+            state = self.state_cache.pop(request_id, None)
+            release = getattr(getattr(self, "pipeline", None), "release_step_request", None)
+            if state is not None and callable(release):
+                release(state)
+        batch = getattr(self, "input_batch", None)
+        if batch is not None and any(request_id in batch.request_ids for request_id in request_ids):
+            self.input_batch = None
+
     def _cleanup_finished_step_requests(self, scheduler_output: DiffusionSchedulerOutput) -> None:
         """Retire state and paged-KV rows released by the scheduler wave."""
         finished_req_ids = scheduler_output.finished_req_ids
-        for request_id in finished_req_ids:
-            self.state_cache.pop(request_id, None)
+        self.release_step_requests(list(finished_req_ids))
 
         if (
             getattr(self.od_config, "diffusion_kv_mode", DiffusionKVCacheMode.DENSE_LEGACY)
@@ -1132,6 +1174,10 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 if state is None:
                     raise ValueError(f"Missing cached state for request {request_id}.")
                 resolved.append(state)
+            for state in resolved:
+                context = scheduler_output.interaction_boundaries.get(state.request_id)
+                if context is not None:
+                    state.interaction_boundary = context
         except Exception:
             for request_id in new_request_ids:
                 self.state_cache.pop(request_id, None)
@@ -1150,7 +1196,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         prepared_states: list[StepRequestState] = []
         error_outputs: list[RunnerOutput] = []
         for state in states:
-            if state.request_id in new_request_ids:
+            if state.request_id in new_request_ids or state.pending_chunk_boundary:
                 # Everything that requires rank-synchronization must be called
                 # inside a try, record the exception and handle with `_dit_any_rank_failed`.
                 # Reason (example): An exception in ``_initialize_generator`` or
@@ -1180,9 +1226,14 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
 
                 per_req_exc: BaseException | None = None
                 try:
-                    self._initialize_generator(state.sampling)
                     clear_pipeline_stage_durations(pipeline)
-                    pipeline.prepare_encode(state)
+                    if state.request_id in new_request_ids:
+                        if getattr(
+                            state.sampling, "streaming_buffer_seconds", None
+                        ) is not None and not supports_interaction_apply(pipeline):
+                            raise ValueError("playback feedback requires an interactive chunked pipeline")
+                        self._initialize_generator(state.sampling)
+                        pipeline.prepare_encode(state)
                 except Exception as exc:
                     per_req_exc = exc
                 # Pipelines that do rank-0-only work (e.g. MiniMax H3
@@ -1197,13 +1248,24 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 # If the pipeline supports interaction, the interaction session initialization also needs to call
                 # synchronized_monotonic_time(). Wrap in another try-block to not block on prepare_encode failures.
                 try:
-                    if supports_interaction_apply(pipeline) and state.chunk_index == 0:
+                    if supports_interaction_apply(pipeline):
                         pipe = cast(SupportsInteractionApply, pipeline)
-                        assert self._interaction_coordinator is not None, "Model not loaded. Call load_model() first."
-                        state.interaction_chunk_metadata = self._interaction_coordinator.maybe_prepare_initial_session(
-                            state, pipe
-                        )
+                        if state.pending_chunk_boundary:
+                            # The engine drains control RPCs (and waits for
+                            # playback, when enabled) before this next call.
+                            pipe.apply_interaction_at_chunk_boundary(state)
+                            state.pending_chunk_boundary = False
+                        elif state.chunk_index == 0:
+                            assert self._interaction_coordinator is not None, (
+                                "Model not loaded. Call load_model() first."
+                            )
+                            state.interaction_chunk_metadata = (
+                                self._interaction_coordinator.maybe_prepare_initial_session(state, pipe)
+                            )
                         pipe.prepare_next_chunk(state)
+                        buffer_seconds = getattr(state.sampling, "streaming_buffer_seconds", None)
+                        if buffer_seconds is not None and pipe.peek_chunk_media(state).duration_s > buffer_seconds:
+                            raise ValueError("streaming_buffer_seconds must fit a complete media chunk")
                     merge_stage_durations(
                         state,
                         consume_pipeline_stage_durations(pipeline),
@@ -1244,9 +1306,14 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         self.input_batch = input_batch
         scatter_latents(states, input_batch)
 
-        for state in states:
-            if interrupted or state.request_denoise_completed:
-                self.state_cache.pop(state.request_id, None)
+        # Include per-request errors, whose cache entries were already removed.
+        self.release_step_requests(
+            [
+                state.request_id
+                for state in states
+                if interrupted or state.request_denoise_completed or state.request_id not in self.state_cache
+            ]
+        )
 
     def execute_stepwise(self, scheduler_output: DiffusionSchedulerOutput) -> BatchRunnerOutput:
         """Execute one step for one scheduled request and return runner output."""
@@ -1275,7 +1342,8 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                     new_req.request_id,
                     exc_info=True,
                 )
-                result = DiffusionOutput(error=str(exc))
+                # Keep client-error metadata, matching the stepwise path below.
+                result = DiffusionOutput.from_exception(exc)
 
             step_index = getattr(new_req.req.sampling_params, "step_index", None)
             runner_outputs.append(
@@ -1303,6 +1371,8 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         # admits a full-forward fallback request. Do this before dispatch so
         # the fallback does not bypass normal state/KV retirement.
         self._cleanup_finished_step_requests(scheduler_output)
+        if not scheduler_output.scheduled_request_ids:
+            return BatchRunnerOutput.from_list([])
         for new_req in scheduler_output.scheduled_new_reqs:
             validate_new_request_data_identity(new_req)
         non_step_requests = [
@@ -1350,6 +1420,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 in_diffusion_kv_memory_profile=in_diffusion_kv_memory_profile,
             )
         except Exception:
+            self.release_step_requests(scheduler_output.scheduled_request_ids)
             if installed_request_ids:
                 self.remove_diffusion_kv_requests(installed_request_ids)
             raise
@@ -1429,7 +1500,13 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                             else:
                                 should_decode = req.denoise_completed
 
+                            streaming_media_duration = 0.0
+                            streaming_next_media_duration = 0.0
                             if should_decode:
+                                if getattr(req.sampling, "streaming_buffer_seconds", None) is not None:
+                                    streaming_media_duration = (
+                                        cast(SupportsInteractionApply, pipeline).peek_chunk_media(req).duration_s
+                                    )
                                 clear_pipeline_stage_durations(pipeline)
                                 result = pipeline.post_decode(req)
                                 if result is not None:
@@ -1438,12 +1515,15 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                                         req,
                                         result,
                                     )
-                                    # After consuming this chunk's interaction metadata, apply pending interactions and
-                                    # prepare the next chunk (prepare_next_chunk may be a no-op---depending on pipeline)
                                     if supports_interaction_apply(pipeline) and not req.request_denoise_completed:
-                                        pipe = cast(SupportsInteractionApply, pipeline)
-                                        pipe.apply_interaction_at_chunk_boundary(req)
-                                        pipe.prepare_next_chunk(req)
+                                        if getattr(req.sampling, "streaming_buffer_seconds", None) is not None:
+                                            req.pending_chunk_boundary = True
+                                            pipe = cast(SupportsInteractionApply, pipeline)
+                                            streaming_next_media_duration = pipe.peek_chunk_media(req).duration_s
+                                        else:
+                                            pipe = cast(SupportsInteractionApply, pipeline)
+                                            pipe.apply_interaction_at_chunk_boundary(req)
+                                            pipe.prepare_next_chunk(req)
                             else:
                                 result = None
                             # finished should be computed after post_decode() advanced chunk_index
@@ -1453,13 +1533,15 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                                 else req.denoise_completed
                             )
                             if finished and result is not None:
-                                self._maybe_send_stage_payload([req], [result])
+                                self._maybe_send_stage_payload([req], [result])  # type: ignore[list-item]
                             runner_output_list.append(
                                 RunnerOutput(
                                     request_id=req.request_id,
                                     step_index=req.step_index,
                                     finished=finished,
                                     result=result,
+                                    streaming_media_duration=streaming_media_duration,
+                                    streaming_next_media_duration=streaming_next_media_duration,
                                 )
                             )
                             offset = offset + row_num
@@ -1545,10 +1627,18 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 (str(modality), cast(InteractionPayload, payload)) for modality, payload in multi_modal_data.items()
             )
 
+        received_at = interaction.get("received_at", time.monotonic())
+        if (
+            isinstance(received_at, bool)
+            or not isinstance(received_at, (int, float))
+            or not math.isfinite(received_at)
+            or received_at < 0
+        ):
+            raise ValueError("interaction received_at must be finite and non-negative")
         self._interaction_coordinator.enqueue_parts(
             state,
             parts=parts,
             event_id=interaction["event_id"],
-            received_at=time.monotonic(),
+            received_at=float(received_at),
             transition_chunks=interaction.get("transition_chunks"),
         )

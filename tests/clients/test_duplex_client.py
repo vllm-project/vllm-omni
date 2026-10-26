@@ -15,7 +15,7 @@ import base64
 import json
 import struct
 import wave
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
@@ -324,6 +324,47 @@ async def test_session_expired_raises_from_event_stream(make_rig):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("headers", [None, {}, {"Authorization": "Bearer test-token", "X-Test": "duplex"}])
+async def test_websocket_handshake_forwards_extra_headers(headers):
+    import websockets
+
+    received: list[Mapping[str, str]] = []
+
+    def authenticate(connection, request):
+        received.append(request.headers)
+        if headers and request.headers.get("Authorization") != headers["Authorization"]:
+            return connection.respond(401, "Unauthorized")
+        return None
+
+    async def serve_session(websocket):
+        update = json.loads(await websocket.recv())
+        assert update["type"] == "session.update"
+        await websocket.send(json.dumps(SESSION_CREATED))
+        async for raw in websocket:
+            if json.loads(raw)["type"] == "session.close":
+                await websocket.send(json.dumps(SESSION_CLOSED))
+                break
+
+    async with websockets.serve(serve_session, "127.0.0.1", 0, process_request=authenticate) as server:
+        port = server.sockets[0].getsockname()[1]
+        async with DuplexClient(
+            f"ws://127.0.0.1:{port}",
+            model="test-model",
+            extra_headers=headers,
+            reconnect=None,
+            heartbeat_interval_s=None,
+            handshake_timeout_s=5.0,
+        ) as client:
+            assert client.session_id == SESSION_ID
+
+    assert len(received) == 1
+    for name, value in (headers or {}).items():
+        assert received[0][name] == value
+    if not headers:
+        assert "Authorization" not in received[0]
+
+
+@pytest.mark.asyncio
 async def test_websocket_handshake_sends_session_update_and_acks_sequenced_events():
     sock = FakeSocket()
     sock.feed(SESSION_CREATED)
@@ -333,8 +374,10 @@ async def test_websocket_handshake_sends_session_update_and_acks_sequenced_event
         assert client.resume_token == "tok-1"
         assert calls == ["ws://test-host:8099/v1/realtime?duplex=1&model=test-model&autostart=0"]
         assert sock.sent[0]["type"] == "session.update"
-        assert sock.sent[0]["session"]["model"] == "test-model"
-        assert "session_id" not in sock.sent[0]["session"]
+        session = sock.sent[0]["session"]
+        assert isinstance(session, dict)
+        assert session["model"] == "test-model"
+        assert "session_id" not in session
         # session.created is unjournaled (no seq): nothing to ack yet.
         assert _acks(sock) == []
         sock.feed({"type": "response.listen", "server_event_seq": 1})
@@ -388,7 +431,9 @@ async def test_append_audio_tracks_cumulative_end_ms():
         assert appends[0]["duration_ms"] == 100
         assert "is_speech" not in appends[0]
         assert appends[1]["is_speech"] is True
-        assert base64.b64decode(appends[0]["audio"]) == pcm
+        encoded_audio = appends[0]["audio"]
+        assert isinstance(encoded_audio, str)
+        assert base64.b64decode(encoded_audio) == pcm
         sock.feed(SESSION_CLOSED)
 
 
@@ -417,6 +462,30 @@ async def test_stream_pcm_chunking():
         appends = [event for event in sock.sent if event.get("type") == "input_audio_buffer.append"]
         assert [a["duration_ms"] for a in appends] == [100, 100, 50]
         sock.feed(SESSION_CLOSED)
+
+
+@pytest.mark.asyncio
+async def test_stream_pcm_pacing_accounts_for_send_overhead(monkeypatch):
+    import vllm_omni.clients.duplex as duplex
+
+    client, _ = make_client(FakeSocket())
+    clock = [0.0]
+    send_starts = []
+
+    async def append(pcm, **kwargs):
+        send_starts.append(clock[0])
+        clock[0] += 0.03
+
+    async def sleep(delay):
+        assert delay >= 0
+        clock[0] += delay
+
+    monkeypatch.setattr(client, "append_audio", append)
+    monkeypatch.setattr(duplex.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(duplex.asyncio, "sleep", sleep)
+    await client.stream_pcm(bytes(9600), chunk_ms=100)
+    assert send_starts == pytest.approx([0.0, 0.1, 0.2])
+    assert clock[0] == pytest.approx(0.3)
 
 
 @pytest.mark.asyncio
@@ -622,7 +691,8 @@ async def test_slow_audio_consumer_drops_oldest_instead_of_stalling():
 
 
 @pytest.mark.asyncio
-async def test_resume_after_transport_drop():
+@pytest.mark.parametrize("use_default_connect", [False, True])
+async def test_resume_after_transport_drop(monkeypatch, use_default_connect):
     first = FakeSocket()
     first.feed(SESSION_CREATED)
     second = FakeSocket()
@@ -638,11 +708,30 @@ async def test_resume_after_transport_drop():
             "resume_token": "tok-2",
         }
     )
-    client, calls = make_client(
-        first,
-        second,
-        reconnect=ReconnectPolicy(max_attempts=2, backoff_s=(0.0, 0.0)),
-    )
+    policy = ReconnectPolicy(max_attempts=2, backoff_s=(0.0, 0.0))
+    if use_default_connect:
+        import websockets
+
+        calls = []
+        sockets = iter([first, second])
+        headers = {"Authorization": "Bearer test-token"}
+
+        async def connect(url, *, additional_headers, max_size):
+            assert additional_headers == headers
+            calls.append(url)
+            return next(sockets)
+
+        monkeypatch.setattr(websockets, "connect", connect)
+        client = DuplexClient(
+            "ws://test-host:8099",
+            model="test-model",
+            extra_headers=headers,
+            reconnect=policy,
+            heartbeat_interval_s=None,
+            handshake_timeout_s=5.0,
+        )
+    else:
+        client, calls = make_client(first, second, reconnect=policy)
     async with client:
         stream = client.events()
 
@@ -1323,6 +1412,91 @@ def test_summarize_session_request_metrics_averages_audio_turns():
     }
 
 
+def test_summarize_session_request_metrics_includes_client_append_fields():
+    summary = summarize_session_request_metrics(
+        [
+            {"client_ttfp_ms": 100.0, "client_rtf": 0.5},
+            {"client_ttfp_ms": 300.0, "client_rtf": 0.7},
+        ],
+        session_id="sess-1",
+    )
+    assert summary["client_ttfp_ms"] == {"count": 2, "mean": 200.0, "p50": 100.0, "p99": 300.0}
+    assert summary["client_rtf"] == {"count": 2, "mean": 0.6, "p50": 0.5, "p99": 0.7}
+
+
+def _audio_delta(response_id: str, *, duration_ms: int) -> dict[str, object]:
+    return {
+        "type": "response.output_audio.delta",
+        "response_id": response_id,
+        "delta": base64.b64encode(b"audio").decode("ascii"),
+        "sample_rate_hz": 16_000,
+        "metadata": {"audio_duration_ms": duration_ms},
+    }
+
+
+def test_event_collector_adds_client_append_metrics_from_last_in_window():
+    collector = EventCollector()
+    collector.note_client_append({"sent_at_s": 9.4, "event_id": "append-early"})
+    collector.note_client_append({"sent_at_s": 9.7, "event_id": "append-last"})
+    collector.add({"type": "response.created", "response": {"id": "resp-a"}}, received_at_s=10.0)
+    collector.add(_audio_delta("resp-a", duration_ms=80), received_at_s=10.2)
+    collector.add(_audio_delta("resp-a", duration_ms=240), received_at_s=10.36)
+
+    timing = collector.timing_summary(after_s=9.0, response_id="resp-a")
+    metrics = timing["request_metrics"]
+    assert isinstance(metrics, dict)
+    assert metrics["ttfp_ms"] == 200.0
+    assert metrics["audio_generation_ms"] == 360.0
+    assert metrics["client_ttfp_ms"] == 500.0
+    assert metrics["client_audio_generation_ms"] == 660.0
+    assert metrics["client_measurement_origin"]["ttfp"].startswith("last input_audio_buffer.append")
+    assert "client_rtf" not in metrics
+
+
+def test_event_collector_client_origin_uses_previous_created_or_after_s():
+    collector = EventCollector()
+    collector.note_client_append({"sent_at_s": 8.8, "event_id": "before-window"})
+    collector.note_client_append({"sent_at_s": 9.5, "event_id": "first-turn"})
+    collector.add({"type": "response.created", "response": {"id": "resp-a"}}, received_at_s=10.0)
+    collector.add(_audio_delta("resp-a", duration_ms=80), received_at_s=10.2)
+    collector.note_client_append({"sent_at_s": 10.4, "event_id": "second-turn"})
+    collector.note_client_append({"sent_at_s": 11.1, "event_id": "after-second-created"})
+    collector.add({"type": "response.created", "response": {"id": "resp-b"}}, received_at_s=11.0)
+    collector.add(_audio_delta("resp-b", duration_ms=100), received_at_s=11.3)
+
+    first = collector.timing_summary(after_s=9.0, response_id="resp-a")["request_metrics"]
+    second = collector.timing_summary(after_s=9.0, response_id="resp-b")["request_metrics"]
+    assert isinstance(first, dict)
+    assert isinstance(second, dict)
+    assert first["client_ttfp_ms"] == 700.0
+    assert second["client_ttfp_ms"] == 900.0
+    assert "client_ttfp_ms" not in collector.timing_summary(after_s=9.6, response_id="resp-a")["request_metrics"]
+
+
+@pytest.mark.asyncio
+async def test_send_stamps_append_on_attached_collector():
+    sock = FakeSocket()
+    sock.feed(SESSION_CREATED)
+    client, _ = make_client(sock)
+    collector = EventCollector()
+    async with client:
+        client.attach_event_collector(collector)
+        event_id = await client.send(
+            {
+                "type": "input_audio_buffer.append",
+                "audio": "",
+                "is_speech": True,
+                "video_frames": ["frame"],
+            }
+        )
+        await client.send({"type": "input_audio_buffer.commit"})
+        sock.feed(SESSION_CLOSED)
+
+    assert [record["event_id"] for record in collector.client_appends] == [event_id]
+    assert collector.client_appends[0].keys() == {"sent_at_s", "event_id"}
+    assert collector.client_appends[0]["sent_at_s"] > 0.0
+
+
 def test_event_collector_reports_all_engine_stages():
     collector = EventCollector()
     collector.add({"type": "response.created", "response": {"id": "resp-a"}}, received_at_s=10.0)
@@ -1519,6 +1693,35 @@ async def test_stream_pcm_sends_each_units_composite_beside_its_base_frame():
         ]
         assert [event["audio_end_ms"] for event in appends if "video_frames" in event] == [1000, 2000, 3000]
         assert frames_sent == 3
+        sock.feed(SESSION_CLOSED)
+
+
+@pytest.mark.asyncio
+async def test_stream_pcm_tail_stays_on_the_clip_media_timeline():
+    """1.4 s of audio plus 1 s of tail: the append that closes 2.0 s keeps the last frame."""
+    sock = FakeSocket()
+    sock.feed(SESSION_CREATED)
+    client, _ = make_client(sock)
+    frames = ["f0", "f1"]
+    async with client:
+        frames_sent = await client.stream_pcm(
+            b"\x01\x00" * int(16_000 * 1.4),
+            chunk_ms=200,
+            realtime=False,
+            video_frames=frames,
+        )
+        assert frames_sent == 1
+        await client.stream_pcm(
+            b"\x00\x00" * 16_000,
+            chunk_ms=200,
+            realtime=False,
+            video_frames=frames,
+            media_origin_ms=1400,
+            unit_index=frames_sent,
+        )
+        appends = [event for event in sock.sent if event.get("type") == "input_audio_buffer.append"]
+        framed = [(event["audio_end_ms"], event["video_frames"]) for event in appends if "video_frames" in event]
+        assert framed == [(1000, ["f0"]), (2000, ["f1"])]
         sock.feed(SESSION_CLOSED)
 
 

@@ -20,7 +20,11 @@ import pytest
 from omegaconf import OmegaConf
 from pydantic import ValidationError
 from transformers import PretrainedConfig, Qwen3OmniMoeConfig
+from vllm.config import VllmConfig
 from vllm.engine.arg_utils import EngineArgs
+from vllm.exceptions import VLLMValidationError
+from vllm.v1.engine.input_processor import InputProcessor
+from vllm.v1.worker.gpu.sample.logit_bias import LogitBiasState
 
 from tests.helpers.mock import patch_hf_snapshot_download
 from vllm_omni.config.model import OmniModelConfig
@@ -30,6 +34,36 @@ from vllm_omni.platforms import current_omni_platform
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+@pytest.mark.parametrize("use_v2", [False, True])
+def test_stage_runner_selects_matching_input_processor_validator(monkeypatch, use_v2):
+    from vllm.sampling_params import SamplingParams
+
+    from vllm_omni.model_executor.models.audex.cfg import AudexCFGLogitsProcessor
+
+    # Upstream's process-wide preference must not override a stage's deploy choice.
+    monkeypatch.setattr("vllm.envs.VLLM_USE_V2_MODEL_RUNNER", not use_v2)
+    config = VllmConfig()
+    model_config = object.__new__(OmniModelConfig)
+    model_config.use_v2_model_runner = use_v2
+    model_config.runner_type = "generate"
+    model_config.logits_processors = [LogitBiasState if use_v2 else AudexCFGLogitsProcessor]
+    config.model_config = model_config
+    assert config.use_v2_model_runner is use_v2
+    processor = object.__new__(InputProcessor)
+    processor.vllm_config, processor.model_config = config, model_config
+    validator = processor._build_logits_processors_params_validator()
+    validator(SamplingParams(extra_args={"cfg_role": "cond", "cfg_scale": 1.5}))
+    if not use_v2:
+        with pytest.raises(VLLMValidationError, match="cfg_role"):
+            validator(SamplingParams(extra_args={"cfg_role": "invalid"}))
+
+
+@pytest.mark.parametrize("use_v2", [False, True])
+def test_plain_vllm_config_retains_upstream_runner_preference(monkeypatch, use_v2):
+    monkeypatch.setattr("vllm.envs.VLLM_USE_V2_MODEL_RUNNER", use_v2)
+    assert VllmConfig().use_v2_model_runner is use_v2
 
 
 def test_sync_config_is_omni():
@@ -55,8 +89,8 @@ def test_default_stage_id_is_concrete_int():
     assert cfg.stage_id == 0
 
 
-def test_full_payload_capability_reaches_omni_model_config(monkeypatch):
-    """Keep the pipeline capability intact through the engine adapter."""
+def test_topology_owned_model_fields_reach_omni_model_config(monkeypatch):
+    """Keep pipeline-owned model fields intact through the engine adapter."""
     captured: dict[str, object] = {}
     baseline_config = Mock()
     worker_module = types.ModuleType("test_connector_worker")
@@ -87,10 +121,12 @@ def test_full_payload_capability_reaches_omni_model_config(monkeypatch):
     OmniEngineArgs(
         stage_id=1,
         requires_full_payload_input=True,
+        scheduling_metadata_adapter="pipeline.Adapter",
         worker_cls="test_connector_worker.ConnectorWorker",
     ).create_model_config()
 
     assert captured["requires_full_payload_input"] is True
+    assert captured["scheduling_metadata_adapter"] == "pipeline.Adapter"
 
 
 def test_stage_without_connector_configuration_accepts_plain_runner(monkeypatch):
@@ -581,3 +617,60 @@ def test_text_encoder_tp_size_reaches_default_diffusion_parallel_config():
 
     parallel_config = stage_cfg["engine_args"]["parallel_config"]
     assert parallel_config["text_encoder_tp_size"] == 2
+
+
+def test_native_mrv2_worker_provides_connector_without_legacy_mixin():
+    from vllm_omni.worker.omni_connector_validation import validate_worker_omni_connector
+    from vllm_omni.worker_v2.omni_ar_model_runner import OmniARModelRunner
+
+    class Worker:
+        model_runner_cls = OmniARModelRunner
+
+    validate_worker_omni_connector(Worker, required=True)
+
+
+# For https://github.com/vllm-project/vllm-omni/issues/8037
+# The diffusion parallel knobs the serve CLI registers and the engine must keep
+# when engine args come from parsed CLI args. Values are not the
+# DiffusionParallelConfig defaults, so a silently reset knob fails the check.
+DIFFUSION_PARALLEL_KNBS = [
+    ("ulysses_degree", 4),
+    ("ulysses_mode", "advanced_uaa"),
+    ("ulysses_a2a_permute", True),
+    ("ring_degree", 2),
+    ("allgather_degree", 8),
+    ("use_hsdp", True),
+    ("hsdp_shard_size", 2048),
+    ("hsdp_replicate_size", 2),
+    ("cfg_parallel_size", 2),
+    ("vae_patch_parallel_size", 2),
+    ("vae_parallel_mode", "spatial_shard_height"),
+]
+
+
+# For https://github.com/vllm-project/vllm-omni/issues/8037
+def test_from_cli_args_applies_diffusion_parallel_knobs():
+    """Every CLI-registered diffusion parallel knob must survive and be applied.
+
+    ``OmniEngineArgs.from_cli_args`` keeps only dataclass fields, so a knob
+    that ``OmniEngineArgs`` does not declare was silently reset to its
+    ``DiffusionParallelConfig`` default (#7652 covered
+    ``text_encoder_tp_size`` alone). Every value in the table differs from that
+    default, so an ignored knob fails the second assertion too.
+    """
+    from vllm_omni.config.config_factory import StageConfigFactory
+
+    for knob, value in DIFFUSION_PARALLEL_KNBS:
+        engine_args = OmniEngineArgs.from_cli_args(SimpleNamespace(**{knob: value}))
+        assert getattr(engine_args, knob) == value, f"{knob} was dropped"
+
+        # Forward the preserved value rather than the table literal, so the
+        # second assertion fails if ``from_cli_args`` dropped the knob.
+        factory_kwargs = {knob: getattr(engine_args, knob)}
+        if knob == "use_hsdp":
+            # Standalone HSDP (all other parallelism at 1) cannot
+            # auto-calculate its shard size; pass one explicitly.
+            factory_kwargs["hsdp_shard_size"] = 2048
+        stage_cfg = StageConfigFactory.create_default_diffusion(factory_kwargs)[0]
+        parallel_config = stage_cfg["engine_args"]["parallel_config"]
+        assert parallel_config[knob] == value, f"{knob} did not reach parallel_config"

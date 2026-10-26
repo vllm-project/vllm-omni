@@ -200,7 +200,9 @@ class SharedMemoryConnector(OmniConnectorBase):
         data: Any,
     ) -> tuple[bool, int, dict[str, Any] | None]:
         try:
-            self.reap_consumed()
+            # Keep per-send housekeeping small when unread chunks accumulate.
+            # Explicit sweeps retain a larger budget to drain stale records.
+            self.reap_consumed(max_keys=4)
             payload = self.serialize_obj(data)
             size = len(payload)
 
@@ -234,9 +236,9 @@ class SharedMemoryConnector(OmniConnectorBase):
                 consumed = True
                 fcntl.flock(lockf, fcntl.LOCK_UN)
             obj = self.deserialize_obj(data_bytes)
-            result = (obj, int(shm_handle.get("size", 0)))
+            result = (obj, len(data_bytes))
             return result
-        except BlockingIOError:
+        except (BlockingIOError, FileNotFoundError):
             return None
         except Exception as e:
             logger.error(f"SharedMemoryConnector shm get failed for req : {e}")
@@ -250,34 +252,13 @@ class SharedMemoryConnector(OmniConnectorBase):
 
     def _get_by_key(self, get_key: str) -> tuple[Any, int] | None:
         """Read a SHM segment addressed purely by *get_key*."""
-        shm = None
-        try:
-            shm = shm_pkg.SharedMemory(name=get_key)
-            if shm is None or shm.size == 0:
-                return None
-            lock_file = f"/dev/shm/shm_{get_key}_lockfile.lock"
-            shm_handle = {"name": get_key, "size": shm.size}
-            result = self._get_data_with_lock(lock_file, shm_handle)
-            if result is not None:
-                with self._pending_keys_lock:
-                    self._pending_keys.pop(get_key, None)
-            return result
-        except FileNotFoundError:
-            return None
-        except ValueError as e:
-            # A receiver can observe a newly-created POSIX SHM object before
-            # the writer has finished sizing it. Treat that as "not ready yet"
-            # so async polling can retry without a traceback.
-            if "empty file" in str(e):
-                return None
-            logger.debug("_get_by_key: unexpected error reading SHM segment %s", get_key, exc_info=True)
-            return None
-        except Exception:
-            logger.debug("_get_by_key: unexpected error reading SHM segment %s", get_key, exc_info=True)
-            return None
-        finally:
-            if shm:
-                shm.close()
+        # Take the publication lock before opening a possibly unsized segment.
+        lock_file = f"/dev/shm/shm_{get_key}_lockfile.lock"
+        result = self._get_data_with_lock(lock_file, {"name": get_key})
+        if result is not None:
+            with self._pending_keys_lock:
+                self._pending_keys.pop(get_key, None)
+        return result
 
     def get(
         self,
@@ -307,9 +288,13 @@ class SharedMemoryConnector(OmniConnectorBase):
             self._metrics["gets"] += 1
         return result
 
-    def cleanup(self, request_id: str) -> None:
-        """Unlink the exact key passed to ``put()``, never a request-id prefix."""
+    def cleanup(self, request_id: str) -> bool:
+        """Unlink the exact key passed to ``put()``, never a request-id prefix.
+
+        Returns True when an unconsumed segment was actually unlinked.
+        """
         key = request_id
+        unlinked = False
         with self._pending_keys_lock:
             self._pending_keys.pop(key, None)
             try:
@@ -317,6 +302,7 @@ class SharedMemoryConnector(OmniConnectorBase):
                 seg.close()
                 seg.unlink()
                 logger.debug("cleanup: unlinked unconsumed SHM segment %s", key)
+                unlinked = True
             except FileNotFoundError:
                 pass
             except Exception as e:
@@ -327,6 +313,18 @@ class SharedMemoryConnector(OmniConnectorBase):
                     os.remove(lock_file)
                 except OSError:
                     pass
+        return unlinked
+
+    def cleanup_prefix(self, key_prefix: str) -> int:
+        """Unlink every tracked key of the form ``{key_prefix}{chunk_id}``.
+
+        Only keys still in ``_pending_keys`` are considered, and the suffix
+        must be a bare integer chunk id, so another request whose id merely
+        shares the prefix is never matched. Returns the unlinked count.
+        """
+        with self._pending_keys_lock:
+            keys = [k for k in self._pending_keys if k.startswith(key_prefix) and k[len(key_prefix) :].isdigit()]
+        return sum(self.cleanup(key) for key in keys)
 
     def close(self) -> None:
         """Unlink all remaining tracked SHM segments."""
@@ -336,10 +334,10 @@ class SharedMemoryConnector(OmniConnectorBase):
             self.cleanup(key)
         self._close_wakeups()
 
-    def reap_consumed(self) -> None:
+    def reap_consumed(self, *, max_keys: int = 64) -> None:
         """Bounded round-robin sweep; receivers unlink SHM in another process."""
         with self._pending_keys_lock:
-            for _ in range(min(64, len(self._pending_keys))):
+            for _ in range(min(max_keys, len(self._pending_keys))):
                 key, _ = self._pending_keys.popitem(last=False)
                 if os.path.exists(f"/dev/shm/{key}"):
                     self._pending_keys[key] = None

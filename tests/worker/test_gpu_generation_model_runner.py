@@ -2,7 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import contextlib
+import inspect
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -20,6 +22,23 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 class _StopExecutionError(Exception):
     """Halts execute_model at the model boundary."""
+
+
+@pytest.mark.parametrize("randomize_inputs", [False, True])
+def test_generation_profile_accepts_upstream_randomize_inputs(randomize_inputs):
+    """Release workers can pass the profiling flag to codec-stage runners."""
+    runner = object.__new__(GPUGenerationModelRunner)
+    runner.supports_mm_inputs = False
+    runner.max_num_tokens = 128
+    runner.encoder_cache = {"temporary": object()}
+    runner._dummy_run = Mock(return_value=(torch.zeros(1), None))
+    runner._sync_device = Mock()
+
+    runner.profile_run(randomize_inputs=randomize_inputs)
+
+    runner._dummy_run.assert_called_once_with(128, is_profile=True, randomize_inputs=randomize_inputs)
+    runner._sync_device.assert_called_once_with()
+    assert runner.encoder_cache == {}
 
 
 class _DummyInputBatch:
@@ -99,6 +118,13 @@ def test_sample_tokens_dict_output():
     assert output.multimodal_outputs[0]["audio"].shape == (1, 4)
 
 
+def test_host_copy_still_makes_other_outputs_contiguous_host_tensors():
+    for tensor in (torch.randn(4, 2).t(), torch.randn(3, requires_grad=True)):
+        host = gen_runner_module._HostCopyBatch(pin_memory=False).copy(tensor)
+        assert host.device.type == "cpu" and host.is_contiguous() and not host.requires_grad
+        assert torch.equal(host, tensor.detach())
+
+
 class _StubSchedulerOutput:
     def __init__(self, total_num_scheduled_tokens):
         self.total_num_scheduled_tokens = total_num_scheduled_tokens
@@ -114,6 +140,9 @@ def _make_guard_runner():
     # Stubbed far enough that a span escaping the guard reaches the real
     # `_prepare_inputs`, i.e. fails the way the reported crash does.
     runner = object.__new__(GPUGenerationModelRunner)
+    # Set by __init__, which object.__new__ skips.
+    runner._prev_step_idle = False
+    runner._failed_optional_model_hooks = set()
     runner.execute_model_state = None
     runner.routed_experts_initialized = False
     runner.speculative_config = None
@@ -174,11 +203,13 @@ def test_execute_model_zero_tokens_kv_connector_no_forward(monkeypatch):
     monkeypatch.setattr(gen_runner_module, "has_kv_transfer_group", lambda: True)
     runner = _make_guard_runner()
     sentinel = object()
-    calls = []
-    runner.kv_connector_no_forward = lambda scheduler_output, vllm_config: (
-        calls.append(scheduler_output),
-        sentinel,
-    )[1]
+    calls: list[object] = []
+
+    def _no_forward(scheduler_output, vllm_config):
+        calls.append(scheduler_output)
+        return sentinel
+
+    runner.kv_connector_no_forward = _no_forward
     runner.vllm_config = object()
 
     output = GPUGenerationModelRunner.execute_model(runner, _StubSchedulerOutput(0))
@@ -266,7 +297,6 @@ def test_exact_shape_models_receive_unpadded_input_ids(monkeypatch, exact_shape,
         requires_request_ids=False,
         requires_exact_input_shape=exact_shape,
     )
-    runner.cascade_attn_enabled = False
     runner.num_prompt_logprobs = None
     runner.vllm_config = None
     runner.parallel_config = SimpleNamespace(
@@ -289,7 +319,15 @@ def test_exact_shape_models_receive_unpadded_input_ids(monkeypatch, exact_shape,
         ),
     )
     monkeypatch.setattr(GPUGenerationModelRunner, "_get_slot_mappings", lambda self, **kw: (None, None))
-    monkeypatch.setattr(GPUGenerationModelRunner, "_build_attention_metadata", lambda self, **kw: (None, None))
+    # Use the installed upstream contract: a permissive **kwargs stub would
+    # hide removed runner arguments such as cascade_attn_prefix_lens.
+    metadata_signature = inspect.signature(GPUGenerationModelRunner._build_attention_metadata)
+
+    def _build_attention_metadata(self, **kwargs):
+        metadata_signature.bind(self, **kwargs)
+        return None, None
+
+    monkeypatch.setattr(GPUGenerationModelRunner, "_build_attention_metadata", _build_attention_metadata)
     monkeypatch.setattr(
         GPUGenerationModelRunner,
         "_maybe_attach_attention_metadata_extensions",

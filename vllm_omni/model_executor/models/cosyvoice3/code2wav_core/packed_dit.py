@@ -170,7 +170,7 @@ class PackedDiT:
             t,
             rows,
             attention,
-            max_seqlen_q=attention.page_table.shape[1],
+            max_seqlen_q=attention.max_seqlen_q,
             block_modulation=block_modulation,
             final_modulation=final_modulation,
             rope=rope,
@@ -771,7 +771,9 @@ class FlowGraphRunner:
         attention.heads, attention.head_dim = self.heads, self.head_dim
         attention.cache_seqlens, attention.cu_seqlens_q = state.cache_seqlens, state.cu_seqlens_q
         attention.page_table = state.page_table
-        attention.max_seqlen_q = state.page_table.shape[1]
+        # Streaming queries cover one training chunk, even when their KV
+        # prefix and the packed graph allocation contain thousands of frames.
+        attention.max_seqlen_q = estimator.dit.static_chunk_size if key[0] else state.page_table.shape[1]
         mark_packed_compile_metadata(rows, attention)
         mu_cfg = torch.cat((state.mu, torch.zeros_like(state.mu)), dim=1)
         cond_cfg = torch.cat((state.cond, torch.zeros_like(state.cond)), dim=1)

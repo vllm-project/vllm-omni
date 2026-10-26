@@ -12,7 +12,8 @@ import pytest
 import torch
 
 from tests.helpers.mark import hardware_test
-from vllm_omni.diffusion.models.auk.auk_vae import AuKVAE, LowPass, SnakeBeta, Upsample
+from vllm_omni.diffusion.models.auk import auk_vae
+from vllm_omni.diffusion.models.auk.auk_vae import AliasFreeActivation, AuKVAE, LowPass, SnakeBeta, Upsample
 from vllm_omni.diffusion.models.auk.vae_cudagraph import AuKVAEDecodeGraph, plan_tiles
 from vllm_omni.platforms import current_omni_platform
 
@@ -244,6 +245,72 @@ def test_tiled_decode_matches_the_whole_decode() -> None:
     assert AuKVAEDecodeGraph(vae, tile_frames=0).tile_frames == 0
     with pytest.raises(ValueError, match="must exceed"):
         AuKVAEDecodeGraph(vae, tile_frames=60)
+
+
+@pytest.mark.cpu
+@torch.inference_mode()
+def test_fused_activation_is_skipped_off_cuda() -> None:
+    activation = AliasFreeActivation(SnakeBeta(4, alpha_logscale=True))
+    x = torch.randn(1, 4, 16)
+    assert not activation._fused_eligible(x)
+    assert activation(x).shape == (1, 4, 16)
+
+
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="The fused activation kernels require CUDA")
+@torch.inference_mode()
+def test_fused_activation_is_skipped_without_triton(monkeypatch: pytest.MonkeyPatch) -> None:
+    activation = AliasFreeActivation(SnakeBeta(4, alpha_logscale=True)).to("cuda")
+    x = torch.randn(1, 4, 16, device="cuda")
+    assert activation._fused_eligible(x)
+    monkeypatch.setattr(auk_vae, "HAS_TRITON", False)
+    assert not activation._fused_eligible(x)
+    assert activation(x).shape == (1, 4, 16)
+
+
+def _activation_input(layout: str, length: int) -> torch.Tensor:
+    """A ``[2, 6, length]`` input, contiguous or as a strided view of a larger buffer."""
+    if layout == "contiguous":
+        x = torch.randn(2, 6, length, device="cuda")
+    elif layout == "transposed":
+        x = torch.randn(2, length, 6, device="cuda").transpose(1, 2)
+    elif layout == "sliced":
+        x = torch.randn(2, 8, 2 * length, device="cuda")[:, 1:7, ::2]
+    else:
+        raise ValueError(layout)
+    assert x.shape == (2, 6, length)
+    if length > 1:  # contiguity of a single-sample view depends on the layout
+        assert x.is_contiguous() == (layout == "contiguous")
+    return x * 3
+
+
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="The fused activation kernels require CUDA")
+@pytest.mark.parametrize("layout", ["contiguous", "transposed", "sliced"])
+@pytest.mark.parametrize("causal", [False, True])
+# The kernels tile the output in blocks of 1024 samples: the 2x oversampled
+# signal crosses a block boundary at 512 input samples and the decimated one at
+# 1024, so both sides of each boundary are covered, plus short and odd lengths.
+@pytest.mark.parametrize("length", [1, 7, 511, 512, 513, 1000, 1023, 1024, 1025])
+@torch.inference_mode()
+def test_fused_activation_matches_the_eager_modules(layout: str, causal: bool, length: int) -> None:
+    torch.manual_seed(0)
+    activation = AliasFreeActivation(SnakeBeta(6, alpha_logscale=True), causal=causal).to("cuda")
+    with torch.no_grad():
+        activation.act.alpha.normal_(0.0, 0.3)
+        activation.act.beta.normal_(0.0, 0.3)
+    x = _activation_input(layout, length)
+    original = x.clone()
+
+    eager = activation.downsample(activation.act(activation.upsample(x)))
+    assert activation._fused_eligible(x)
+    fused = activation(x)
+
+    # Same fp32 arithmetic, only the order in which the taps are summed differs.
+    assert fused.shape == eager.shape
+    torch.testing.assert_close(fused, eager, atol=1e-5, rtol=1e-5)
+    # Neither path writes into its (possibly strided) input.
+    torch.testing.assert_close(x, original, atol=0, rtol=0)
 
 
 @hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)

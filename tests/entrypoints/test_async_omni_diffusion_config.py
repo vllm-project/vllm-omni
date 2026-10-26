@@ -11,6 +11,7 @@ from pydantic import ValidationError
 from vllm_omni.config.config_factory import StageConfigFactory
 from vllm_omni.config.omni_config import VllmOmniDiffusionStageConfig, extract_diffusion_stage_config_kwargs
 from vllm_omni.config.resolver import OmniConfigResolution, resolve_omni_config
+from vllm_omni.config.stage_config import build_stage_runtime_overrides
 from vllm_omni.diffusion.data import AttentionConfig, OmniDiffusionConfig
 from vllm_omni.engine import stage_init_utils
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
@@ -68,37 +69,6 @@ def test_default_stage_config_preserves_model_extras():
     stage_cfg = StageConfigFactory.create_default_diffusion({"extras": {"ltx2_use_conv_vae": True}})[0]
 
     assert stage_cfg["engine_args"]["extras"]["ltx2_use_conv_vae"] is True
-
-
-def test_default_stage_config_preserves_and_overrides_promoted_extras():
-    stage_cfg = StageConfigFactory.create_default_diffusion(
-        {
-            "extras": {
-                "auxiliary_text_encoder": "/models/extras-llama",
-                "default_llama_model_id": "extras/default-llama",
-            },
-            "auxiliary_text_encoder": None,
-        }
-    )[0]
-
-    extras = stage_cfg["engine_args"]["extras"]
-    assert extras["auxiliary_text_encoder"] == "/models/extras-llama"
-    assert extras["default_llama_model_id"] == "extras/default-llama"
-
-    stage_cfg = StageConfigFactory.create_default_diffusion(
-        {
-            "extras": {
-                "auxiliary_text_encoder": "/models/extras-llama",
-                "default_llama_model_id": "extras/default-llama",
-            },
-            "auxiliary_text_encoder": "/models/top-level-llama",
-            "default_llama_model_id": "top-level/default-llama",
-        }
-    )[0]
-
-    extras = stage_cfg["engine_args"]["extras"]
-    assert extras["auxiliary_text_encoder"] == "/models/top-level-llama"
-    assert extras["default_llama_model_id"] == "top-level/default-llama"
 
 
 @pytest.mark.parametrize(
@@ -945,3 +915,85 @@ def test_generic_diffusion_structured_stage_reaches_standard_startup(mocker):
     assert launched["model"] == "generic-diffusion"
     assert launched["stage_id"] == 0
     assert runtime.stage_pools[0].clients == [client]
+
+
+@pytest.mark.parametrize(
+    "overrides,ulysses,tp,devices,max_seqs",
+    [
+        ({}, 2, 1, "2,3", 4),
+        ({"ulysses_degree": 1, "devices": "0", "max_num_seqs": 9}, 1, 1, "0", 9),
+        ({"parallel_config": {"tensor_parallel_size": 2}, "devices": "0,1,2,3"}, 2, 2, "0,1,2,3", 4),
+    ],
+)
+def test_generic_diffusion_deploy_survives_typed_resolution(
+    mocker, tmp_path, overrides, ulysses, tp, devices, max_seqs
+):
+    mocker.patch("vllm_omni.config.resolver.StageConfigFactory.create_from_model", return_value=None)
+    mocker.patch(
+        "vllm_omni.config.resolver._resolve_generic_diffusion_model_class",
+        return_value=(True, "MOSSImagePipeline"),
+    )
+    deploy_path = tmp_path / "mossimage.yaml"
+    deploy_path.write_text(
+        "stages:\n"
+        "  - stage_id: 0\n"
+        "    devices: '2,3'\n"
+        "    num_replicas: 2\n"
+        "    env: {MOSSIMAGE_TEST: '1'}\n"
+        "    ulysses_degree: 2\n"
+        "    max_num_seqs: 4\n"
+        "    step_execution: true\n"
+        "    flow_shift: 5.0\n"
+        "    default_sampling_params: {guidance_scale: 4.0}\n"
+    )
+    resolved = resolve_omni_config(
+        "generic-diffusion",
+        trust_remote_code=False,
+        deploy_config_path=str(deploy_path),
+        cli_overrides=overrides,
+        stage_overrides=None,
+        strategy_config_path=None,
+    )
+    stage = resolved.stage_configs[0]
+    assert isinstance(stage, VllmOmniDiffusionStageConfig)
+    assert stage.parallel_config.ulysses_degree == ulysses
+    assert stage.parallel_config.tensor_parallel_size == tp
+    assert stage.parallel_config.sequence_parallel_size == ulysses
+    assert stage.parallel_config.world_size == ulysses * tp
+    assert stage.runtime_config.devices == devices
+    assert stage.runtime_config.num_replicas == 2
+    assert stage.runtime_config.env == {"MOSSIMAGE_TEST": "1"}
+    assert stage.scheduler_config.max_num_seqs == max_seqs
+    assert stage.diffusion_config.step_execution is True
+    assert stage.diffusion_config.flow_shift == 5.0
+    assert stage.model_config.default_sampling_params == {"guidance_scale": 4.0}
+
+
+def test_default_stage_config_preserves_pre_sharded_hsdp_weight_load() -> None:
+    stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg({"hsdp_weight_load_strategy": "pre_sharded"})[0]
+
+    assert stage_cfg["engine_args"]["hsdp_weight_load_strategy"] == "pre_sharded"
+
+
+@pytest.mark.parametrize("prefix", ["", "stage_0_"])
+def test_pre_sharded_hsdp_weight_load_survives_stage_overrides(prefix: str) -> None:
+    overrides = build_stage_runtime_overrides(0, {f"{prefix}hsdp_weight_load_strategy": "pre_sharded"})
+
+    assert overrides["hsdp_weight_load_strategy"] == "pre_sharded"
+
+
+@pytest.mark.parametrize("strategy", ["full", "pre_sharded"])
+def test_typed_default_stage_preserves_hsdp_weight_load_strategy(strategy: str) -> None:
+    config = StageConfigFactory.create_typed_default_diffusion(
+        "generic-diffusion", {"hsdp_weight_load_strategy": strategy}
+    )
+
+    assert config.stage_configs[0].diffusion_config.hsdp_weight_load_strategy == strategy
+
+
+@pytest.mark.parametrize("strategy", ["memory_limited", "invalid"])
+def test_removed_hsdp_loading_strategies_are_rejected(strategy):
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
+
+    with pytest.raises(ValueError, match="hsdp_weight_load_strategy"):
+        OmniDiffusionConfig(hsdp_weight_load_strategy=strategy)

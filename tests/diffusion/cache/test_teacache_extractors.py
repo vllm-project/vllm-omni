@@ -26,19 +26,32 @@ from unittest.mock import MagicMock, Mock, patch
 import pytest
 import torch
 import torch.nn as nn
+from vllm.model_executor.layers.linear import LinearBase
 
 from tests.helpers.mark import hardware_test
+from vllm_omni.diffusion.cache.teacache.backend import TeaCacheBackend
+from vllm_omni.diffusion.cache.teacache.config import TeaCacheConfig
 from vllm_omni.diffusion.cache.teacache.extractors import (
     extract_flux2_context,
     extract_flux2_klein_context,
     extract_flux_context,
+    extract_mammoth_moda2_context,
+    extract_ming_image_context,
     extract_minimax_h3_context,
     extract_zimage_context,
 )
+from vllm_omni.diffusion.cache.teacache.hook import apply_teacache_hook
+from vllm_omni.diffusion.config import set_current_diffusion_config
+from vllm_omni.diffusion.data import AttentionConfig, DiffusionCacheConfig
 from vllm_omni.diffusion.models.flux.flux_transformer import FluxTransformer2DModel
 from vllm_omni.diffusion.models.flux2_klein.flux2_klein_transformer import (
     Flux2Transformer2DModel,
 )
+from vllm_omni.diffusion.models.mammoth_moda2.mammothmoda2_dit_model import (
+    Transformer2DModel as MammothModa2Transformer2DModel,
+)
+from vllm_omni.diffusion.models.mammoth_moda2.pipeline_mammothmoda2_dit import MammothModa2DiTPipeline
+from vllm_omni.diffusion.models.mammoth_moda2.rope_real import RotaryPosEmbedReal
 
 pytestmark = [pytest.mark.core_model]
 
@@ -50,6 +63,7 @@ def setup_tp_group():
         with patch("vllm.distributed.parallel_state.get_tp_group") as mock_get_tp_group:
             mock_tp_group = MagicMock()
             mock_tp_group.world_size = 1
+            mock_tp_group.rank_in_group = 0
             mock_get_tp_group.return_value = mock_tp_group
             yield
 
@@ -110,6 +124,106 @@ def test_zimage_extractor_accepts_extended_patchify_output():
     assert context.modulated_input.shape == (1, 64, 4)
 
 
+@pytest.mark.cpu
+@pytest.mark.parametrize("alignment_mode, has_reference", [("zero_masked", False), ("learned", True)])
+def test_ming_extractor_preserves_conditioning_and_generated_frames(alignment_mode, has_reference):
+    class _Block(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.attention_norm1 = nn.Identity()
+
+        def adaLN_modulation(self, value):
+            return value.new_zeros((value.shape[0], 16))
+
+        def forward(self, hidden, *_args):
+            return hidden + 1
+
+    class _FinalLayer(nn.Module):
+        def forward(self, hidden, _timestep):
+            return hidden
+
+    class _Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.alignment_padding_mode = alignment_mode
+            self.layers = nn.ModuleList([_Block()])
+            self.noise_refiner = nn.ModuleList()
+            self.context_refiner = nn.ModuleList()
+            self.all_x_embedder = nn.ModuleDict({"2-1": nn.Identity()})
+            self.all_final_layer = nn.ModuleDict({"2-1": _FinalLayer()})
+            self.cap_embedder = nn.Identity()
+            self.x_pad_token = nn.Parameter(torch.zeros((1, 4)))
+            self.cap_pad_token = nn.Parameter(torch.zeros((1, 4)))
+            self.t_scale = 1.0
+            self.received_ref = None
+            self.received_direct = None
+
+        @staticmethod
+        def t_embedder(timestep):
+            return timestep.new_ones((timestep.shape[0], 4))
+
+        @staticmethod
+        def rope_embedder(position_ids):
+            rope = torch.zeros((position_ids.shape[0], 2))
+            return rope, rope
+
+        def patchify_and_embed(self, _x, _cap, _patch, _f_patch, ref_x, cap_feats_2):
+            self.received_ref = ref_x
+            self.received_direct = cap_feats_2
+            positions = [torch.zeros((32, 3), dtype=torch.int32)]
+            return (
+                [torch.ones((32, 4))],
+                [torch.zeros((32, 4))],
+                [(2, 1, 1)],
+                positions,
+                [torch.zeros((64, 3), dtype=torch.int32)],
+                [torch.zeros(32, dtype=torch.bool)],
+                [torch.zeros(64, dtype=torch.bool)],
+                [torch.full((32, 4), 2.0)],
+            )
+
+        @staticmethod
+        def unified_prepare(x, x_cos, x_sin, cap, cap_cos, cap_sin, *_args):
+            hidden = torch.cat([x, cap], dim=1)
+            cos = torch.cat([x_cos, cap_cos], dim=1)
+            sin = torch.cat([x_sin, cap_sin], dim=1)
+            mask = torch.ones(hidden.shape[:2], dtype=torch.bool)
+            return hidden, cos, sin, mask
+
+        @staticmethod
+        def unpatchify(hidden, _sizes, _patch, _f_patch):
+            return [torch.stack([hidden[0][0, 0], hidden[0][-1, 0]]).reshape(1, 2, 1, 1)]
+
+    model = _Model()
+    reference = torch.ones((1, 1, 1, 1, 1)) if has_reference else None
+    forward_context = SimpleNamespace(ref_latent=reference, direct_condition=torch.ones((1, 1, 4)))
+    with (
+        patch("vllm_omni.diffusion.cache.teacache.extractors.is_forward_context_available", return_value=True),
+        patch("vllm_omni.diffusion.cache.teacache.extractors.get_forward_context", return_value=forward_context),
+    ):
+        context = extract_ming_image_context(
+            model,
+            x=[torch.zeros((1, 1, 1, 1))],
+            t=torch.zeros(1),
+            cap_feats=[torch.zeros((1, 4))],
+        )
+
+    received_ref = model.received_ref
+    assert (received_ref is not None) == has_reference
+    if has_reference:
+        assert received_ref is not None
+        assert reference is not None
+        assert torch.equal(received_ref[0], reference[0])
+    received_direct = model.received_direct
+    assert received_direct is not None
+    assert torch.equal(received_direct[0], forward_context.direct_condition[0])
+    assert context.hidden_states.shape == (1, 96, 4)
+    output, metadata = context.postprocess(context.run_transformer_blocks()[0])
+    assert output[0].shape == (1, 1, 1, 1)
+    assert output[0].item() == 2.0
+    assert metadata == {}
+
+
 class BaseExtractorTest(ABC):
     """Base class for testing TeaCache extractors.
 
@@ -133,6 +247,172 @@ class BaseExtractorTest(ABC):
     def get_sample_inputs(self, sample_inputs, /):
         """Return sample inputs for model."""
         pass
+
+
+@pytest.mark.cpu
+class TestMammothModa2Extractor(BaseExtractorTest):
+    """Test extract_mammoth_moda2_context function."""
+
+    def get_extractor(self):
+        return extract_mammoth_moda2_context
+
+    @pytest.fixture
+    def mammoth_module(self):
+        # These tests run on CPU even when the host has CUDA available.
+        od_config = SimpleNamespace(
+            diffusion_attention_config=AttentionConfig(default="TORCH_SDPA"),
+            parallel_config=SimpleNamespace(ring_degree=1),
+        )
+        with set_current_diffusion_config(od_config):
+            model = MammothModa2Transformer2DModel(
+                patch_size=2,
+                in_channels=4,
+                hidden_size=16,
+                num_layers=2,
+                num_refiner_layers=1,
+                num_attention_heads=2,
+                num_kv_heads=1,
+                axes_dim_rope=(2, 2, 4),
+                axes_lens=(16, 16, 16),
+                text_feat_dim=8,
+            )
+            # Unlike nn.Linear, vLLM linear layers leave their weights
+            # uninitialized for the checkpoint loader to populate. This tiny
+            # test model is constructed directly, so initialize those weights
+            # before exercising numerical cache behavior.
+            for submodule in model.modules():
+                if isinstance(submodule, LinearBase):
+                    nn.init.normal_(submodule.weight, std=0.02)
+            yield model
+
+    def get_module(self, mammoth_module):
+        return mammoth_module
+
+    @pytest.fixture
+    def sample_inputs(self):
+        return {
+            "hidden_states": torch.randn(1, 4, 4, 4),
+            "timestep": torch.tensor([500.0]),
+            "text_hidden_states": torch.randn(1, 3, 8),
+            "text_attention_mask": torch.ones(1, 3, dtype=torch.bool),
+            "freqs_cis": RotaryPosEmbedReal.get_freqs_real((2, 2, 4), (16, 16, 16), theta=10000),
+        }
+
+    def get_sample_inputs(self, sample_inputs):
+        return sample_inputs
+
+    def test_context_shapes_and_postprocess(self, mammoth_module, sample_inputs):
+        context = extract_mammoth_moda2_context(mammoth_module, **sample_inputs)
+
+        assert context.modulated_input.shape == context.hidden_states.shape
+        assert context.encoder_hidden_states is None
+        assert context.temb.shape[0] == 1
+
+        outputs = context.run_transformer_blocks()
+        assert len(outputs) == 1
+        assert outputs[0].shape == context.hidden_states.shape
+
+        output = context.postprocess(context.hidden_states)
+        assert output.shape == sample_inputs["hidden_states"].shape
+
+    def test_branch_hint_is_preserved(self, mammoth_module, sample_inputs):
+        context = extract_mammoth_moda2_context(
+            mammoth_module,
+            **sample_inputs,
+            teacache_branch="positive",
+        )
+
+        assert context.extra_states is not None
+        assert context.extra_states["teacache_branch"] == "positive"
+
+    def test_hook_keeps_positive_and_negative_branch_state_separate(self, mammoth_module, sample_inputs, monkeypatch):
+        config = TeaCacheConfig(
+            transformer_type="MammothModa2Transformer2DModel",
+            coefficients=[0, 0, 0, 0, 0],
+            rel_l1_thresh=999.0,
+        )
+        apply_teacache_hook(mammoth_module, config)
+
+        original_apply_layers = mammoth_module._apply_transformer_layers
+        apply_layers_mock = Mock(wraps=original_apply_layers)
+        monkeypatch.setattr(mammoth_module, "_apply_transformer_layers", apply_layers_mock)
+
+        mammoth_module(**sample_inputs, teacache_branch="positive")
+        assert apply_layers_mock.call_count == 1
+
+        mammoth_module(**sample_inputs, teacache_branch="positive")
+        assert apply_layers_mock.call_count == 1
+
+        mammoth_module(**sample_inputs, teacache_branch="negative")
+        assert apply_layers_mock.call_count == 2
+
+    def test_hook_rejects_invalid_branch_hint(self, mammoth_module, sample_inputs):
+        config = TeaCacheConfig(
+            transformer_type="MammothModa2Transformer2DModel",
+            coefficients=[0, 0, 0, 0, 0],
+            rel_l1_thresh=999.0,
+        )
+        apply_teacache_hook(mammoth_module, config)
+
+        with pytest.raises(ValueError, match="teacache_branch"):
+            mammoth_module(**sample_inputs, teacache_branch="bad")
+
+    @pytest.mark.parametrize("change_shape", [False, True], ids=["same_shape", "different_shape"])
+    @torch.no_grad()
+    def test_backend_refresh_clears_both_branches(self, mammoth_module, sample_inputs, monkeypatch, change_shape):
+        pipeline = MammothModa2DiTPipeline.__new__(MammothModa2DiTPipeline)
+        nn.Module.__init__(pipeline)
+        pipeline.gen_transformer = mammoth_module
+        # Zero coefficients guarantee cache hits after each branch's first call.
+        backend = TeaCacheBackend(DiffusionCacheConfig(coefficients=[0, 0, 0, 0, 0]))
+        backend.enable(pipeline)
+        apply_layers = Mock(wraps=mammoth_module._apply_transformer_layers)
+        monkeypatch.setattr(mammoth_module, "_apply_transformer_layers", apply_layers)
+
+        for branch in ("positive", "negative"):
+            mammoth_module(**sample_inputs, teacache_branch=branch)
+            mammoth_module(**sample_inputs, teacache_branch=branch)
+        assert apply_layers.call_count == 2
+
+        next_inputs = dict(sample_inputs)
+        next_inputs["hidden_states"] = torch.randn(1, 4, 4, 6 if change_shape else 4)
+        text_length = 5 if change_shape else 3
+        next_inputs["text_hidden_states"] = torch.randn(1, text_length, 8)
+        next_inputs["text_attention_mask"] = torch.ones(1, text_length, dtype=torch.bool)
+        # Compute an uncached reference through the original model forward.
+        expected = MammothModa2Transformer2DModel.forward(mammoth_module, **next_inputs)
+        apply_layers.reset_mock()
+
+        backend.refresh(pipeline, num_inference_steps=4)
+
+        for count, branch in enumerate(("positive", "negative"), start=1):
+            actual = mammoth_module(**next_inputs, teacache_branch=branch)
+            assert apply_layers.call_count == count
+            torch.testing.assert_close(actual, expected)
+            # Refresh must preserve caching for subsequent steps of request B.
+            cached = mammoth_module(**next_inputs, teacache_branch=branch)
+            assert apply_layers.call_count == count
+            torch.testing.assert_close(cached, expected)
+
+    def test_forced_full_compute_matches_original_forward(self, mammoth_module, sample_inputs, monkeypatch):
+        with torch.no_grad():
+            expected = mammoth_module(**sample_inputs, teacache_branch="positive")
+
+        config = TeaCacheConfig(
+            transformer_type="MammothModa2Transformer2DModel",
+            coefficients=[0, 0, 0, 0, 0],
+            rel_l1_thresh=0.1,
+        )
+        apply_teacache_hook(mammoth_module, config)
+        hook = mammoth_module._hook_registry.get_hook("teacache")
+        should_compute_full = Mock(return_value=True)
+        monkeypatch.setattr(hook, "_should_compute_full_transformer", should_compute_full)
+
+        with torch.no_grad():
+            actual = mammoth_module(**sample_inputs, teacache_branch="positive")
+
+        should_compute_full.assert_called_once()
+        torch.testing.assert_close(actual, expected)
 
 
 class TestFlux2KleinExtractor(BaseExtractorTest):

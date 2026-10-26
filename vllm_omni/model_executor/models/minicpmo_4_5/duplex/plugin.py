@@ -18,10 +18,12 @@ from base64 import b64decode
 from binascii import Error as BinasciiError
 from collections.abc import Mapping
 from copy import deepcopy
+from functools import lru_cache
 from typing import TYPE_CHECKING
 
 import numpy as np
 from numpy.typing import NDArray
+from vllm.multimodal.image import open_image
 from vllm.multimodal.media import MediaConnector
 from vllm.sampling_params import SamplingParams
 
@@ -40,6 +42,7 @@ from vllm_omni.engine.duplex.plugin import (
     reject_changed_runtime_value,
     reject_private_runtime_keys,
 )
+from vllm_omni.model_executor.common.duplex.payload import payload_audio
 from vllm_omni.model_executor.common.duplex.payload import payload_sample_count as _duplex_pcm_sample_count
 from vllm_omni.model_executor.common.request_outputs import coerce_int as _coerce_int
 from vllm_omni.model_executor.common.request_outputs import coerce_int_list as _coerce_int_list
@@ -58,6 +61,9 @@ from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import (
 )
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.session import (
     MiniCPMO45ServingSessionState,
+)
+from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_code2wav import (
+    load_default_prompt_audio,
 )
 
 if TYPE_CHECKING:
@@ -140,7 +146,7 @@ def _duplex_base_frame_blocks(frame: str, tile_pixels: int | None) -> int:
 
     try:
         raw = b64decode(frame, validate=True)
-        with Image.open(BytesIO(raw)) as image:
+        with open_image(BytesIO(raw)) as image:
             width, height = image.size
     except (BinasciiError, ValueError, OSError, Image.DecompressionBombError):
         return _DUPLEX_HD_SLICES_PER_BASE_FRAME
@@ -179,6 +185,10 @@ def duplex_payload_is_exact_chunks(payload: object) -> bool:
     return sample_count is not None and sample_count != 0 and sample_count % _DUPLEX_CHUNK_SAMPLES == 0
 
 
+def _duplex_payload_is_vision_only(payload: object) -> bool:
+    return bool(_duplex_frames(payload)) and payload_audio(payload) is None
+
+
 def duplex_first_append_unit_count(payload: object) -> int | None:
     sample_count = _duplex_pcm_sample_count(payload)
     if not sample_count or sample_count % _DUPLEX_CHUNK_SAMPLES != 0:
@@ -186,16 +196,21 @@ def duplex_first_append_unit_count(payload: object) -> int | None:
     return max(1, sample_count // _DUPLEX_CHUNK_SAMPLES - 1)
 
 
-def duplex_scheduler_token_budget(payload: object, *, default: int = 64, tile_pixels: int | None = None) -> int:
-    vision_tokens = _duplex_vision_tokens(payload, tile_pixels=tile_pixels)
+def _duplex_audio_token_budget(payload: object, *, default: int = 64) -> int:
     sample_count = _duplex_pcm_sample_count(payload)
     if sample_count is None:
-        return max(1, int(default)) + vision_tokens
+        return max(1, int(default))
     sample_count = max(1, sample_count)
     if sample_count % _DUPLEX_CHUNK_SAMPLES == 0:
         units = sample_count // _DUPLEX_CHUNK_SAMPLES
-        return units * (2 + _DUPLEX_CHUNK_SAMPLES // _DUPLEX_SAMPLES_PER_AUDIO_TOKEN) + vision_tokens
-    return max(16, min(768, sample_count // _DUPLEX_SAMPLES_PER_AUDIO_TOKEN + 8)) + vision_tokens
+        return units * (2 + _DUPLEX_CHUNK_SAMPLES // _DUPLEX_SAMPLES_PER_AUDIO_TOKEN)
+    return max(16, min(768, sample_count // _DUPLEX_SAMPLES_PER_AUDIO_TOKEN + 8))
+
+
+def duplex_scheduler_token_budget(payload: object, *, default: int = 64, tile_pixels: int | None = None) -> int:
+    return _duplex_audio_token_budget(payload, default=default) + _duplex_vision_tokens(
+        payload, tile_pixels=tile_pixels
+    )
 
 
 def duplex_first_append_context_reserve(runtime_config: object) -> int:
@@ -235,16 +250,33 @@ def build_duplex_data_plane_prompt(
     payload: object,
     final: bool,
 ) -> dict[str, object]:
-    tile_pixels = _duplex_vision_tile_pixels(runtime_config)
-    token_budget = duplex_scheduler_token_budget(payload, tile_pixels=tile_pixels)
-    if seq <= 1:
-        context_reserve = duplex_first_append_context_reserve(runtime_config)
-        token_budget += context_reserve
+    # Computed once: with a known tile this decodes the stacked pair's first frame.
+    # The buffer marks the first payload that actually carries PCM. A VISION
+    # unit advances the append sequence without opening the mel window, so
+    # ``seq`` alone cannot tell that the following speech is still the first
+    # audio window.
+    first_audio_window = isinstance(payload, dict) and payload.get("first_audio_window") is True
+    if first_audio_window:
+        payload = {key: value for key, value in payload.items() if key != "first_audio_window"}
+    vision_tokens = _duplex_vision_tokens(payload, tile_pixels=_duplex_vision_tile_pixels(runtime_config))
+    token_budget = _duplex_audio_token_budget(payload) + vision_tokens
+    if _duplex_payload_is_vision_only(payload):
+        # Surplus slots are filled with </unit> pad embeddings that stay in the KV.
+        # A VISION unit is <unit> + frame blocks; later units first close the
+        # previous one with its sampled terminator + </unit>.
+        lead_tokens = duplex_first_append_context_reserve(runtime_config) if seq <= 1 else 2
+        token_budget = lead_tokens + 1 + vision_tokens
+    elif seq <= 1 or first_audio_window:
+        # After a VISION unit the session context is already in the KV. The
+        # first audio window still closes that unit (terminator + </unit>)
+        # and then builds fewer units than one per buffered second.
+        lead_tokens = 2 if seq > 1 else duplex_first_append_context_reserve(runtime_config)
         first_units = duplex_first_append_unit_count(payload)
         if first_units is not None:
-            vision_tokens = _duplex_vision_tokens(payload, tile_pixels=tile_pixels)
-            token_budget = context_reserve + first_units * 12 - 1 + vision_tokens
-    if seq > 1 and duplex_payload_is_exact_chunks(payload):
+            token_budget = lead_tokens + first_units * 12 - 1 + vision_tokens
+        else:
+            token_budget += lead_tokens
+    if seq > 1 and not first_audio_window and duplex_payload_is_exact_chunks(payload):
         token_budget += 1
         # Serving already pads the final residual audio. Stage0 does not
         # append another silent unit, so final must not reserve extra slots.
@@ -421,6 +453,45 @@ async def resolve_ref_audio(ref_audio: str, *, model_config: ModelConfig | None)
     return np.asarray(wav_np, dtype=np.float32), int(sr)
 
 
+class _DefaultRefAudioMissingError(Exception):
+    """Signal an absent bundle asset without caching the miss."""
+
+
+@lru_cache(maxsize=8)
+def _load_default_ref_audio(model_ref: str, revision: str | None = None) -> tuple[NDArray[np.float32], int]:
+    """Load the prompt WAV shipped in the MiniCPM-o model snapshot.
+
+    Code2Wav already resolves the model reference and uses the same bundled
+    ``assets/HT_ref_audio.wav`` as its fallback prompt. Reuse those helpers so
+    native duplex and Code2Wav condition on the same model-owned asset. Cache
+    successful loads for each model revision so sessions reuse the same prompt
+    audio. Raise on a missing asset because lru_cache also stores ``None``.
+    """
+    loaded = load_default_prompt_audio(model_ref, revision=revision)
+    if loaded is None:
+        raise _DefaultRefAudioMissingError
+    waveform, sample_rate = loaded
+    wav_np = np.asarray(waveform, dtype=np.float32)
+    if wav_np.ndim > 1:
+        # Code2Wav's WAV reader returns (channels, samples); native duplex
+        # normalizes request references as samples-first audio.
+        wav_np = wav_np.mean(axis=0)
+    return wav_np, int(sample_rate)
+
+
+async def resolve_default_ref_audio(model_config: ModelConfig | None) -> tuple[NDArray[np.float32], int] | None:
+    """Resolve the model-bundled prompt without blocking the session loop."""
+    model_ref = getattr(model_config, "model", None)
+    if not isinstance(model_ref, str) or not model_ref:
+        return None
+    raw_revision = getattr(model_config, "revision", None)
+    revision = raw_revision if isinstance(raw_revision, str) else None
+    try:
+        return await asyncio.to_thread(_load_default_ref_audio, model_ref, revision)
+    except (_DefaultRefAudioMissingError, OSError):
+        return None
+
+
 def normalize_ref_audio(wav_np: NDArray[np.float32], sample_rate: int, *, target_sr: int) -> NDArray[np.float32]:
     wav_np = np.asarray(wav_np, dtype=np.float32)
     if wav_np.ndim > 1:
@@ -479,23 +550,31 @@ def _apply_first_append_context_tokens(
 
 
 def _model_vision_tile_pixels(model_config: ModelConfig | None) -> int | None:
-    """Area of one normalization tile, from the checkpoint that will do the slicing.
+    """Area of one normalization tile, as the processor that does the slicing sees it.
 
-    ``MiniCPMVImageProcessor`` is built with ``scale_resolution=config.image_size``
-    and Stage0 loads the checkpoint's own processor, so this is per-checkpoint
-    configuration. ``None`` when it cannot be read, which keeps the reservation
-    at the sliced count.
+    Stage0 slices with the checkpoint's own processor
+    (``MiniCPMO45Stage0DuplexRuntime._load_processor_from_path``), whose
+    ``MiniCPMVImageProcessor`` takes ``scale_resolution`` from the checkpoint's
+    image-processor config: a nested ``image_processor`` entry in
+    ``processor_config.json`` if there is one, else ``preprocessor_config.json``.
+    ``get_image_processor_dict`` is that lookup. ``hf_config`` has its own
+    ``slice_config.scale_resolution`` and ``image_size``; they agree on the
+    released checkpoint, but reading them here would under-reserve as soon as
+    one side changes alone (``--hf-overrides`` reaches only ``hf_config``).
+    Local files only, like ``_load_tokenizer``. ``None`` when it cannot be
+    read, which keeps the reservation at the sliced count.
     """
-    hf_config = getattr(model_config, "hf_config", None)
-    if hf_config is None:
+    model_path = getattr(model_config, "model", None)
+    if not isinstance(model_path, str) or not model_path:
         return None
-    slice_config = getattr(hf_config, "slice_config", None)
-    side = getattr(slice_config, "scale_resolution", None)
-    if not isinstance(side, int):
-        side = slice_config.get("scale_resolution") if isinstance(slice_config, dict) else None
-    if not isinstance(side, int):
-        side = getattr(hf_config, "image_size", None)
-    if not isinstance(side, int) or side <= 0:
+    try:
+        from transformers.image_processing_base import ImageProcessingMixin
+
+        processor_dict, _ = ImageProcessingMixin.get_image_processor_dict(model_path, local_files_only=True)
+        side = processor_dict.get("scale_resolution")
+    except Exception:
+        return None
+    if not isinstance(side, int) or isinstance(side, bool) or side <= 0:
         return None
     return side * side
 
@@ -712,10 +791,15 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
             extra_body.pop("tts_ref_audio")
             ref_audio = extra_tts_ref_audio
 
-        if ref_audio is None:
-            if any(str(modality).lower() == "audio" for modality in config.modalities):
+        requests_audio = any(str(modality).lower() == "audio" for modality in config.modalities)
+        default_ref_audio = None
+        if ref_audio is None and requests_audio:
+            default_ref_audio = await resolve_default_ref_audio(model_config)
+
+        if ref_audio is None and default_ref_audio is None:
+            if requests_audio:
                 raise MiniCPMO45ClientRuntimeConfigError(
-                    "MiniCPM-o duplex audio output requires ref_audio",
+                    "MiniCPM-o duplex audio output requires ref_audio or the model-bundled assets/HT_ref_audio.wav",
                     code="ref_audio_required",
                 )
             _apply_first_append_context_tokens(
@@ -728,7 +812,10 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
             config.extra_body = extra_body
             return runtime_config
 
-        wav_np, sr = await resolve_ref_audio(ref_audio, model_config=model_config)
+        if default_ref_audio is None:
+            wav_np, sr = await resolve_ref_audio(ref_audio, model_config=model_config)
+        else:
+            wav_np, sr = default_ref_audio
         # torchaudio resampling is CPU work: keep it off the orchestrator loop.
         wav_np = await asyncio.to_thread(normalize_ref_audio, wav_np, int(sr), target_sr=16000)
         # Trim to a whole number of pooled audio embeddings (100 ms frames) so

@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import math
 from typing import Any
 
 import torch
+import torch.distributed as dist
 from diffusers.models.autoencoders import AutoencoderKL as Diffusers_AutoencoderKL
+from diffusers.models.autoencoders.vae import DecoderOutput
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor import (
@@ -13,6 +15,11 @@ from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor impor
     DistributedVaeMixin,
     GridSpec,
     TileTask,
+)
+from vllm_omni.diffusion.distributed.parallel_state import (
+    get_classifier_free_guidance_world_size,
+    get_data_parallel_world_size,
+    get_pipeline_parallel_world_size,
 )
 
 # from vllm_omni.diffusion.models.nextstep_1_1.modeling_flux_vae import AutoencoderKL as Next_Step_AutoencoderKL
@@ -33,6 +40,49 @@ class DistributedAutoencoderKL_base(DistributedVaeMixin):
         model = super().from_config(*args, **kwargs)
         model.init_distributed()
         return model
+
+    def batch_split(self, z: torch.Tensor) -> tuple[list[TileTask], GridSpec]:
+        executor = self.distributed_executor
+        num_chunks = min(z.shape[0], executor.parallel_size, executor.world_size)
+        tasks = [
+            TileTask(index, (index,), chunk, workload=chunk.shape[0])
+            for index, chunk in enumerate(z.tensor_split(num_chunks, dim=0))
+        ]
+        # The concrete diffusers base supplies dtype through the mixin MRO.
+        output_dtype = (
+            torch.get_autocast_dtype(z.device.type) if torch.is_autocast_enabled(z.device.type) else self.dtype  # type: ignore[attr-defined]
+        )
+        return tasks, GridSpec(split_dims=(0,), grid_shape=(num_chunks,), output_dtype=output_dtype)
+
+    def batch_merge(self, coord_tensor_map: dict[tuple[int, ...], torch.Tensor], grid_spec: GridSpec) -> torch.Tensor:
+        return torch.cat([coord_tensor_map[(index,)] for index in range(grid_spec.grid_shape[0])], dim=0)
+
+    def _batch_parallel_decode(self, z: torch.Tensor, return_dict: bool = True, *args: Any, **kwargs: Any):
+        # Resolve the native decoder before defining the task callback. Calling
+        # self.decode here would recursively enter the distributed path. The
+        # concrete diffusers base supplies decode through the mixin MRO.
+        native_decode = super().decode  # type: ignore[misc]
+        executor = self.distributed_executor
+        if z.shape[0] <= 1 or min(executor.parallel_size, executor.world_size) <= 1 or not dist.is_initialized():
+            return native_decode(z, return_dict, *args, **kwargs)
+        if (
+            get_data_parallel_world_size() > 1
+            or get_pipeline_parallel_world_size() > 1
+            or get_classifier_free_guidance_world_size() > 1
+        ):
+            raise ValueError("VAE batch parallel decode requires DP, PP, and CFG parallel sizes to be 1")
+
+        def decode_chunk(task: TileTask) -> torch.Tensor:
+            # Keep native slicing/tiling and decoder arguments for each complete
+            # image chunk; only the batch dimension is distributed.
+            return native_decode(task.tensor, False, *args, **kwargs)[0]
+
+        result = executor.execute(
+            z,
+            DistributedOperator(split=self.batch_split, exec=decode_chunk, merge=self.batch_merge),
+            broadcast_result=True,
+        )
+        return DecoderOutput(sample=result) if return_dict else (result,)
 
     def tile_split(self, z: torch.Tensor) -> tuple[list[TileTask], GridSpec]:
         # mostly copy from AutoencoderKL
@@ -185,6 +235,8 @@ class DistributedAutoencoderKL_base(DistributedVaeMixin):
     # Normally, we should override tiled_decode. However, since we also need to
     # support the patch split strategy, we override decode instead.
     def decode(self, z: torch.Tensor, return_dict: bool = True, *args: Any, **kwargs: Any):
+        if self.distributed_executor.parallel_mode == "batch":
+            return self._batch_parallel_decode(z, return_dict, *args, **kwargs)
         if not self.is_distributed_enabled():
             return super().decode(z, return_dict=return_dict, *args, **kwargs)
 

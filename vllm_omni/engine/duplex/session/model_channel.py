@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import json
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
@@ -46,12 +47,14 @@ from vllm_omni.engine.duplex.plugin import (
     DuplexRuntimeConfigError,
     coerce_int,
     payload_turn_id,
+    settle_response_runtime,
 )
 from vllm_omni.engine.duplex.session import helpers
-from vllm_omni.engine.duplex.session.context import DuplexSessionContext, StageOutput
+from vllm_omni.engine.duplex.session.context import CommittedInputContinuation, DuplexSessionContext, StageOutput
 from vllm_omni.engine.duplex.session.emitter import SessionEmitter
 from vllm_omni.engine.duplex.session.engine_session import DuplexEngineSession, DuplexFenceMismatchError
 from vllm_omni.engine.duplex.session.lease import DuplexLeaseActivity
+from vllm_omni.engine.duplex.session.tool_calls import ToolCallOrigin, ToolCallRegistrationError
 from vllm_omni.metrics.stats import OrchestratorAggregator, StageRequestStats
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.outputs.duplex import attach_duplex_output_decision
@@ -60,6 +63,84 @@ if TYPE_CHECKING:
     from vllm.outputs import RequestOutput
 
 logger = init_logger(__name__)
+
+
+def _response_awaits_playback_ack(session, response_id, *, should_commit: bool, committed_message) -> bool:
+    """True when this response produced audio whose text a later ACK can store."""
+    if committed_message is not None or not should_commit or not isinstance(response_id, str):
+        return False
+    playback = session.playback_for_response(response_id)
+    return max(playback.sent_ms, playback.generated_ms) > 0
+
+
+_INVALID_FUNCTION_CALL = object()
+_MISSING_CALL_ID = "A recognized function call requires call_id and name"
+_ARGUMENTS_MUST_BE_JSON = "Function call arguments must be a JSON string"
+
+
+def _coerce_function_call(raw: object) -> dict[str, str] | None:
+    if not isinstance(raw, Mapping):
+        return None
+    call_id = raw.get("call_id")
+    name = raw.get("name")
+    arguments = raw.get("arguments", "")
+    if not isinstance(call_id, str) or not call_id or not isinstance(name, str) or not name:
+        return None
+    if not isinstance(arguments, str):
+        try:
+            arguments = json.dumps(arguments, ensure_ascii=False, allow_nan=False)
+        except (TypeError, ValueError):
+            return None
+    return {"call_id": call_id, "name": name, "arguments": arguments}
+
+
+def _legacy_function_call(model_result: Mapping[str, object]) -> dict[str, str] | object | None:
+    """The pre-parse ``function_call`` flag, or None when it is not set.
+
+    A set flag that lacks ``call_id`` and ``name`` is invalid. There is no
+    second coerce at the caller.
+    """
+    if model_result.get("function_call") is not True:
+        return None
+    call = _coerce_function_call(
+        {
+            "call_id": model_result.get("call_id"),
+            "name": model_result.get("name"),
+            "arguments": model_result.get("arguments", ""),
+        }
+    )
+    return call if call is not None else _INVALID_FUNCTION_CALL
+
+
+def _recognized_function_call(plugin: object, model_result: Mapping[str, object]) -> dict[str, str] | object | None:
+    """Plugin parse first; otherwise the legacy ``function_call`` flag.
+
+    A plugin dict that is not a call is ``_INVALID_FUNCTION_CALL``. Plugins
+    without ``parse_function_call`` are no call unless the legacy flag is set.
+    """
+    parse = getattr(plugin, "parse_function_call", None)
+    if not callable(parse):
+        return _legacy_function_call(model_result)
+    parsed = parse(model_result)
+    if parsed is None:
+        return _legacy_function_call(model_result)
+    call = _coerce_function_call(parsed)
+    return call if call is not None else _INVALID_FUNCTION_CALL
+
+
+def _invalid_function_call_message(plugin: object, model_result: Mapping[str, object]) -> str:
+    """Why a recognized call was refused, for the client error text."""
+    parse = getattr(plugin, "parse_function_call", None)
+    candidate = parse(model_result) if callable(parse) else model_result
+    if candidate is None:
+        candidate = model_result
+    if not isinstance(candidate, Mapping):
+        return _MISSING_CALL_ID
+    call_id = candidate.get("call_id")
+    name = candidate.get("name")
+    if not isinstance(call_id, str) or not call_id or not isinstance(name, str) or not name:
+        return _MISSING_CALL_ID
+    return _ARGUMENTS_MUST_BE_JSON
 
 
 class SilenceContinuationScheduler(Protocol):
@@ -99,6 +180,10 @@ class ModelChannel:
         self._close_from_runtime = close_from_runtime
         self._schedule_silence_continuation = schedule_silence_continuation
         self._abort_request = abort_request
+        self._input_transcriptions: dict[str, CommittedInputContinuation] = {}
+
+    def is_input_transcription(self, request_id: str) -> bool:
+        return request_id in self._input_transcriptions
 
     def _draining_stage_ids(self) -> frozenset[int]:
         """Stages the plugin keeps across a concurrent turn. Empty if undeclared."""
@@ -164,6 +249,8 @@ class ModelChannel:
         operation_id: str | None = None,
         final: bool,
         expected_epoch: int | None = None,
+        input_audio_part: dict[str, object] | None = None,
+        input_audio_parts: dict[str, dict[str, object] | None] | None = None,
         on_append_accepted: Callable[[float], None] | None = None,
     ) -> tuple[bool, bool]:
         session = self._ctx.session
@@ -175,11 +262,21 @@ class ModelChannel:
         # commits timing state only if the append actually submitted.
         submit_time = time.monotonic()
         try:
+            payload, remaining_input = self._ctx.plugin.split_transcription_input(payload)
+            if input_audio_parts is not None:
+                item_id = payload.get("realtime_item_id") if isinstance(payload, Mapping) else None
+                input_audio_part = input_audio_parts.get(item_id) if isinstance(item_id, str) else None
             result = await self._append_via_data_plane(
                 payload,
                 final=final,
                 operation_id=operation_id,
                 expected_epoch=expected_epoch,
+                input_audio_part=input_audio_part,
+                remaining_transcription_input=(
+                    CommittedInputContinuation(remaining_input, input_audio_parts or {})
+                    if remaining_input is not None
+                    else None
+                ),
             )
         except asyncio.CancelledError:
             raise
@@ -225,6 +322,8 @@ class ModelChannel:
         final: bool,
         operation_id: str | None,
         expected_epoch: int | None,
+        input_audio_part: dict[str, object] | None,
+        remaining_transcription_input: CommittedInputContinuation | None = None,
     ) -> dict[str, object] | None:
         """Submit one planned append to the stage port and bind the resulting stage request."""
         session = self._ctx.session
@@ -233,7 +332,7 @@ class ModelChannel:
         fence = helpers.append_fence(session, payload)
         lease_operation_id = f"append:{operation_id or uuid.uuid4().hex}"
         operation_started = False
-        stage_id = 0
+        stage_id = self._ctx.plugin.input_stage_id(payload)
         resumable = session.capabilities.supports_core_resumable_request
         request_id = self._ctx.manager.stage_request_id(fence, stage_id=stage_id, resumable=resumable)
         # Ephemeral turn-commit cannot submit_update on a finished stage0 id.
@@ -288,21 +387,41 @@ class ModelChannel:
         try:
             session.begin_lease_operation(fence, lease_operation_id)
             operation_started = True
+            if self._ctx.history_calibration is not None:
+                await self._ctx.history_calibration.before_prompt()
+                if session.epoch != fence.epoch or session.state != DuplexSessionState.OPEN:
+                    raise DuplexFenceMismatchError(session.fence, fence)
+            # Calibration can change history and response-owned runtime together.
+            # Freeze the request only after that wait and its close/epoch fence.
             reservation = session.prepare_append(fence)
             already_submitted = False if not resumable else session.stage_request_submitted(stage_id, request_id)
-            request_context = self._ctx.manager.ensure_stage_request(session, stage_id=stage_id, fence=fence)
+            request_context = self._ctx.manager.ensure_stage_request(
+                session,
+                stage_id=stage_id,
+                fence=fence,
+                final_stage_id=stage_id if remaining_transcription_input is not None else None,
+            )
             if request_context is None:
                 raise RuntimeError("duplex_data_plane_has_no_stage")
             if request_context.request_id != request_id:
                 request_id = request_context.request_id
+            if not already_submitted:
+                session.request_resources[(stage_id, request_id)].input_audio_part = input_audio_part
             prompt_payload: dict[str, object] = (
                 {str(key): value for key, value in payload.items()} if isinstance(payload, Mapping) else {}
             )
+            prompt_session = {
+                **request_context.session_config,
+                "conversation": list(session.history),
+                "modalities": list(session.response_config.modalities),
+            }
+            prompt_session.update(self._ctx.plugin.extra_prompt_config(request_context.runtime_config))
+            prompt_session["stage_sampling_params"] = request_context.sampling_params
             append_plan = await self._ctx.plugin.prepare_append_plan(
                 request_id=request_id,
                 fence=fence,
                 session_config=self._ctx.plugin.prepare_prompt_config(
-                    {**request_context.session_config, "conversation": list(session.history)},
+                    prompt_session,
                     state=self._ctx.model_state,
                     payload=prompt_payload,
                 ),
@@ -319,23 +438,46 @@ class ModelChannel:
                 raise DuplexFenceMismatchError(session.fence, fence)
             if not isinstance(append_plan, DuplexAppendPlan):
                 raise TypeError("duplex plugin plan_append() must return DuplexAppendPlan")
+            prompt = dict(append_plan.prompt)
+            runtime_patch = self._ctx.plugin.runtime_patch_for_submitted_prompt(prompt)
             submission = DuplexStageSubmission(
                 context=request_context,
-                prompt=append_plan.prompt,
+                prompt=prompt,
                 already_submitted=already_submitted,
                 resumable=resumable,
             )
+            if remaining_transcription_input is not None:
+                self._input_transcriptions[request_id] = remaining_transcription_input
             submission_result = await self._ctx.stage_port.submit(submission)
             try:
                 if submission_result.request_id != request_id or submission_result.stage_id != stage_id:
                     raise RuntimeError("duplex stage adapter returned a mismatched submission result")
                 if expected_epoch is not None and session.epoch != expected_epoch:
                     raise DuplexFenceMismatchError(session.fence, fence)
+                if runtime_patch:
+                    current_runtime = session.runtime_config
+                    updated_runtime = dict(current_runtime)
+                    updated_runtime.update(runtime_patch)
+                    # Preparation ran off the loop, so an ACK may already have
+                    # dropped a pair this patch still carries. The hook is
+                    # optional; without it the patch is applied as before.
+                    reconcile = getattr(self._ctx.plugin, "reconcile_submitted_runtime", None)
+                    if callable(reconcile):
+                        reconciled = reconcile(current_runtime, updated_runtime)
+                        if reconciled is not None:
+                            updated_runtime = reconciled
+                    session.replace_runtime_config(updated_runtime)
+                    bind = getattr(self._ctx.plugin, "bind_inflight_response", None)
+                    if callable(bind):
+                        bound = bind(session.runtime_config, response_id=session.active_response_id)
+                        if bound is not None:
+                            session.replace_runtime_config(bound)
                 update = session.commit_append(reservation)
                 session.bind_stage_request(stage_id, request_id, fence=fence)
+                self._ctx.plugin.commit_append_plan(request_id)
             except BaseException:
                 try:
-                    await self._ctx.stage_port.cleanup([request_id])
+                    await self._ctx.stage_port.cleanup([request_id], abort=True)
                 except Exception as cleanup_exc:
                     logger.warning(
                         "duplex append compensation remains pending for session %s: %s",
@@ -370,6 +512,11 @@ class ModelChannel:
                     }
                 ],
             }
+        except BaseException:
+            self._input_transcriptions.pop(request_id, None)
+            if not resumable:
+                self._ctx.plugin.data_plane.close_stream(request_id)
+            raise
         finally:
             if operation_started and lease_operation_id in session.lease.active_operations:
                 try:
@@ -391,6 +538,7 @@ class ModelChannel:
 
     def cancel_data_plane_stream(self) -> bool:
         had_stream = self._ctx.run.stream_request_id is not None
+        self._input_transcriptions.clear()
         self._ctx.run.stream_request_id = None
         return had_stream
 
@@ -400,11 +548,10 @@ class ModelChannel:
         try:
             next_fence = session.sync_fence()
             if next_fence.epoch > cancelled_fence.epoch:
-                stale_request_ids = session.cancel_fence(cancelled_fence, next_fence)
-            else:
-                stale_request_ids = []
-            if stale_request_ids:
-                await self._ctx.stage_port.cleanup(list(stale_request_ids), abort=True)
+                stale_request_ids = session.prepare_cancel_fence(cancelled_fence, next_fence)
+                if stale_request_ids:
+                    await self._ctx.stage_port.cleanup(list(stale_request_ids), abort=True)
+                session.release_fence(cancelled_fence)
             session.touch_lease(DuplexLeaseActivity.SIGNAL)
         except asyncio.CancelledError:
             raise
@@ -502,7 +649,10 @@ class ModelChannel:
 
     def _build_stage_output(self, item: StageOutput) -> OmniRequestOutput:
         output = item.output
-        finished = bool(getattr(output, "finished", False)) or item.context.segment_finished
+        # A streaming segment boundary is not duplex turn EOS. context.segment_finished
+        # stays true for plugins; the projector object keeps the source finished flag.
+        # Promoting segment_finished here undoes a segment-stop clear of RequestOutput.finished.
+        source_finished = bool(getattr(output, "finished", False))
         if item.decision is not None:
             engine_output = OmniRequestOutput.from_stage_output(
                 output,
@@ -521,17 +671,19 @@ class ModelChannel:
             engine_output = attach_duplex_output_decision(engine_output, item.decision)
         elif isinstance(output, OmniRequestOutput):
             engine_output = copy.copy(output)
-            if finished:
-                engine_output.finished = True
+            engine_output.finished = source_finished
         else:
             final_output_type = getattr(output, "final_output_type", None)
             engine_output = OmniRequestOutput.from_stage_output(
                 output,
                 request_id=item.request_id,
-                finished=finished,
+                finished=source_finished,
                 stage_id=item.stage_id,
                 final_output_type=final_output_type if isinstance(final_output_type, str) else "audio",
             )
+            # from_stage_output copies source.finished last. Lock the projector
+            # flag to that value so a segment boundary cannot reopen turn EOS.
+            engine_output.finished = source_finished
         engine_output.stage_id = item.stage_id
         if self._ctx.plugin.projects_intermediate_outputs and item.stage_id < item.context.final_stage_id:
             engine_output.finished = False
@@ -545,19 +697,19 @@ class ModelChannel:
             engine_output.metrics = {**existing, "stage_metrics": merged_stage_metrics}
         return engine_output
 
-    async def on_stage_output_item(self, item: StageOutput) -> None:
+    async def on_stage_output_item(self, item: StageOutput) -> CommittedInputContinuation | None:
         session = self._ctx.session
         if session.state == DuplexSessionState.CLOSED or self._ctx.run.closing:
-            return
+            return None
         expected_epoch = item.context.identity.fence.epoch
         if session.epoch != expected_epoch:
-            return
+            return None
         if session.lease.terminal_reason is not None:
             # Lease already closed/expired: the output belongs to a dead session.
-            return
+            return None
         session.touch_lease(DuplexLeaseActivity.MODEL_OUTPUT)
         if self._ctx.plugin.data_plane.is_terminal(item.request_id):
-            return
+            return None
         if self._out.auto_responds():
             active_request_id = session.active_request_id
             if active_request_id is not None and active_request_id != item.request_id:
@@ -565,7 +717,33 @@ class ModelChannel:
                     session.capabilities.supports_concurrent_turn_requests
                     and session.is_draining_request(item.request_id)
                 ):
-                    return
+                    return None
+        if item.input_transcript:
+            # This runs on the same mailbox as conversation edits and cancel,
+            # after the request's fence has been checked above.
+            resource = session.request_resources.get((item.stage_id, item.request_id))
+            if item.input_item_id is None or session.update_input_transcript(
+                item.input_item_id,
+                item.input_transcript,
+                audio_part=resource.input_audio_part if resource is not None else None,
+            ):
+                transcript_event: dict[str, object] = {
+                    "type": "input.transcribed",
+                    "transcript": item.input_transcript,
+                    "epoch": expected_epoch,
+                }
+                if item.input_item_id is not None:
+                    transcript_event["realtime_item_id"] = item.input_item_id
+                self._out.emit(transcript_event)
+        pending_transcription = self._input_transcriptions.get(item.request_id)
+        if pending_transcription is not None:
+            if not item.context.segment_finished:
+                return None
+            return await self.finish_input_transcription(item)
+        if not item.project_output:
+            # Pass-through ASR belongs to the user, not the assistant output
+            # projector. Its metrics and transcript still use this mailbox.
+            return None
         engine_output = self._build_stage_output(item)
         runtime_config = self._ctx.plugin.runtime_config_after_model_output(
             dict(session.runtime_config),
@@ -577,28 +755,53 @@ class ModelChannel:
         close_reason, emitted_response = await self._send_model_output_events(
             drain_result, expected_epoch=expected_epoch
         )
+        if self._ctx.run.closing:
+            return None
         if close_reason is not None:
             await self._close_from_runtime(close_reason)
-            return
+            return None
         finished = self._data_plane_outputs_finished(drain_result)
         # Intermediate-stage projection finishing means text is done, not the duplex turn.
         # Closing the stream here drops later Code2Wav chunks / next-turn bind.
-        if (
-            finished
-            and emitted_response
-            and not self._out.auto_responds()
-            and item.stage_id >= item.context.final_stage_id
-        ):
-            # A finished, emitted response releases the per-request projector
-            # cursor on its way out and offers the model another
-            # silence unit.
+        # Clear the stream on the real final even when the projector emitted
+        # nothing (e.g. a fast tool result already cleared active_request_id).
+        if finished and not self._out.auto_responds() and item.stage_id >= item.context.final_stage_id:
             self._ctx.plugin.data_plane.close_stream(item.request_id)
             if self._ctx.run.stream_request_id == item.request_id:
                 self._ctx.run.stream_request_id = None
-            self._ctx.services.spawn(
-                self.maybe_continue_response(expected_epoch=expected_epoch),
-                name="duplex-continue",
-            )
+            # A silent final must not end the response. A continuation for a
+            # response that has already been replaced must not close the newer one.
+            response_id = session.active_response_id
+            if emitted_response and response_id is not None:
+                self._ctx.services.spawn(
+                    self.maybe_continue_response(expected_epoch=expected_epoch, expected_response_id=response_id),
+                    name="duplex-continue",
+                )
+        return None
+
+    async def finish_input_transcription(
+        self, item: StageOutput, *, abandon: bool = False
+    ) -> CommittedInputContinuation | None:
+        session = self._ctx.session
+        pending = self._input_transcriptions.pop(item.request_id, None)
+        self._ctx.plugin.data_plane.close_stream(item.request_id)
+        # Local bindings can be pruned independently of the stage request.
+        # Cleanup is idempotent, including after submission compensation.
+        await self._ctx.stage_port.cleanup([item.request_id], abort=abandon and not item.context.segment_finished)
+        if (
+            session.epoch != item.context.identity.fence.epoch
+            or session.state != DuplexSessionState.OPEN
+            or self._ctx.run.closing
+        ):
+            return None
+        session.request_resources.pop((item.stage_id, item.request_id), None)
+        session.clear_request(item.request_id)
+        session.complete_model_turn(item.context.identity.fence.turn_id)
+        if self._ctx.run.stream_request_id == item.request_id:
+            self._ctx.run.stream_request_id = None
+        if abandon or pending is None:
+            return None
+        return replace(pending, payload={**pending.payload, "duplex_turn_id": session.turn_id})
 
     async def _send_model_output_events(
         self,
@@ -607,7 +810,7 @@ class ModelChannel:
         expected_epoch: int | None = None,
     ) -> tuple[str | None, bool]:
         session = self._ctx.session
-        if expected_epoch is not None and session.epoch != expected_epoch:
+        if self._ctx.run.closing or (expected_epoch is not None and session.epoch != expected_epoch):
             return None, False
         close_reason: str | None = None
         emitted_response = False
@@ -624,7 +827,7 @@ class ModelChannel:
             )
             emitted_response = emitted_response or did_emit
             close_reason = close_reason or close_reason_for_result
-            if expected_epoch is not None and session.epoch != expected_epoch:
+            if self._ctx.run.closing or (expected_epoch is not None and session.epoch != expected_epoch):
                 return None, emitted_response
         return close_reason, emitted_response
 
@@ -636,9 +839,10 @@ class ModelChannel:
             str(model_result.get("error_code")),
             str(model_result.get("error") or "Duplex native data-plane error"),
         )
-        if response_id is None:
+        if self._ctx.run.closing or response_id is None:
             return
         session.end_response(commit_text=False)
+        settle_response_runtime(self._ctx.plugin, session, committed=False, response_id=response_id, release_owner=True)
         self._out.emit(
             {
                 "type": "response.done",
@@ -711,6 +915,8 @@ class ModelChannel:
                 if candidate not in release_ids and not session.is_draining_request(candidate):
                     release_ids.append(candidate)
         session.release_resources_for_request_ids(release_ids)
+        if self._ctx.run.stream_request_id in release_ids:
+            self._ctx.run.stream_request_id = None
         await self._ctx.stage_port.cleanup(release_ids)
 
     async def _on_model_listen(
@@ -734,6 +940,8 @@ class ModelChannel:
         close_reason: str | None = None
         emitted_response = False
         self._end_active_response_before_future_model_turn(model_turn_id=model_turn_id)
+        if self._ctx.run.closing:
+            return close_reason, emitted_response
         if (
             session.active_response_id is not None
             and model_turn_id is not None
@@ -776,10 +984,14 @@ class ModelChannel:
             payload["response_id"] = response_id
         self._attach_runtime_metadata(payload, model_result)
         self._out.emit(payload)
+        if self._ctx.run.closing:
+            return close_reason, emitted_response
         if model_result.get("abort_data_plane_request") is True and isinstance(data_plane_request_id, str):
             # stage_port.abort_requests expects a list of ids; a bare str is
             # iterated as characters and never matches the prewarmed binding.
             await self._abort_request([data_plane_request_id], notify=False)
+            if self._ctx.run.closing:
+                return close_reason, emitted_response
         if response_id is not None:
             if not auto_response and self.response_continuations_remaining(response_id):
                 self._ctx.services.spawn(
@@ -799,6 +1011,7 @@ class ModelChannel:
                     if completed_turn_id is not None:
                         session.complete_model_turn(completed_turn_id)
             session.end_response(commit_text=False, preserve_request=auto_response)
+            settle_response_runtime(self._ctx.plugin, session, committed=False, response_id=response_id)
             self._out.emit(
                 {
                     "type": "response.done",
@@ -812,6 +1025,72 @@ class ModelChannel:
         await self._release_ephemeral_request(data_plane_request_id, whole_turn=True)
         return close_reason, emitted_response
 
+    async def _expose_function_call(self, function_call: Mapping[str, object]) -> None:
+        """Register a recognized call before publishing it.
+
+        Parsing stays in the model plugin. The session ledger is the admission
+        book. After the origin is stored, a plugin that splices the result into
+        history can record where the call sat.
+        """
+        session = self._ctx.session
+        call_id, name = function_call.get("call_id"), function_call.get("name")
+        if not isinstance(call_id, str) or not call_id or not isinstance(name, str) or not name:
+            self._out.emit_error("invalid_function_call", _MISSING_CALL_ID)
+            return
+        arguments = function_call.get("arguments", "")
+        if not isinstance(arguments, str):
+            self._out.emit_error("invalid_function_call", _ARGUMENTS_MUST_BE_JSON)
+            return
+        item_id = f"item_{uuid.uuid4().hex}"
+        response_id = f"resp_{uuid.uuid4().hex}"
+        try:
+            self._ctx.tool_calls.register(
+                ToolCallOrigin(
+                    call_id=call_id,
+                    epoch=session.epoch,
+                    turn_id=session.turn_id,
+                    response_id=response_id,
+                    item_id=item_id,
+                    name=name,
+                    arguments=arguments,
+                )
+            )
+        except ToolCallRegistrationError as exc:
+            self._out.emit_error(exc.code, str(exc))
+            if exc.code != "resource_exhausted":
+                await self._close_from_runtime("tool_call_lifecycle")
+            return
+        try:
+            updated_runtime = self._ctx.plugin.note_published_function_call(
+                session.runtime_config,
+                call_id=call_id,
+                history_len=len(session.history),
+            )
+        except Exception:
+            # The call is already in the ledger and the client has not seen it.
+            # Leaving it pending would time out a call that was never published.
+            logger.exception("Failed to record a published function call")
+            self._out.emit_error(
+                "tool_call_registration_failed",
+                "the session could not record a published function call",
+            )
+            await self._close_from_runtime("tool_call_lifecycle")
+            return
+        if updated_runtime is not None:
+            session.replace_runtime_config(updated_runtime)
+        self._out.emit(
+            {
+                "type": "function_call.done",
+                "session_id": session.session_id,
+                "epoch": session.epoch,
+                "call_id": call_id,
+                "name": name,
+                "arguments": arguments,
+                "item_id": item_id,
+                "response_id": response_id,
+            }
+        )
+
     async def _send_one_model_output_event(
         self,
         model_result: dict[str, object],
@@ -822,7 +1101,7 @@ class ModelChannel:
         data_plane = self._ctx.plugin.data_plane
         close_reason: str | None = None
         emitted_response = False
-        if expected_epoch is not None and session.epoch != expected_epoch:
+        if self._ctx.run.closing or (expected_epoch is not None and session.epoch != expected_epoch):
             return close_reason, emitted_response
         data_plane_request_id = model_result.get("data_plane_request_id")
         if isinstance(data_plane_request_id, str) and data_plane.is_terminal(data_plane_request_id):
@@ -831,25 +1110,35 @@ class ModelChannel:
         draining = session.is_draining_request(
             data_plane_request_id if isinstance(data_plane_request_id, str) else None
         )
-        active_request_matches = session.active_request_id == data_plane_request_id or (
-            auto_response and session.active_request_id is None
+        stream_request_id = getattr(self._ctx.run, "stream_request_id", None)
+        active_request_matches = (
+            session.active_request_id == data_plane_request_id
+            or stream_request_id == data_plane_request_id
+            or (auto_response and session.active_request_id is None)
         )
         if isinstance(data_plane_request_id, str) and not active_request_matches and not draining:
             return close_reason, emitted_response
         if isinstance(model_result.get("error_code"), str):
             self._fail_response_from_model_error(model_result)
+            if model_result.get("end_of_turn") is True and not session.capabilities.supports_core_resumable_request:
+                # A failed ephemeral turn owns the same stage resources as a
+                # successful one. Release them before accepting another turn.
+                self._complete_model_turn_without_output(
+                    model_result,
+                    model_turn_id=coerce_int(model_result.get("model_turn_id")),
+                    data_plane_request_id=data_plane_request_id,
+                )
+                await self._release_ephemeral_request(data_plane_request_id, whole_turn=True)
             return close_reason, True
-        if model_result.get("function_call") is True:
-            self._out.emit(
-                {
-                    "type": "function_call.done",
-                    "session_id": session.session_id,
-                    "epoch": session.epoch,
-                    "call_id": model_result.get("call_id"),
-                    "name": model_result.get("name"),
-                    "arguments": model_result.get("arguments", ""),
-                }
+        function_call = _recognized_function_call(self._ctx.plugin, model_result)
+        if function_call is _INVALID_FUNCTION_CALL:
+            self._out.emit_error(
+                "invalid_function_call",
+                _invalid_function_call_message(self._ctx.plugin, model_result),
             )
+            return close_reason, True
+        if isinstance(function_call, dict):
+            await self._expose_function_call(function_call)
             return close_reason, True
         if model_result.get("requires_stage_handoff") is True or model_result.get("requires_tts_stage") is True:
             # Reserve the protocol response only when Stage1 emits text/audio.
@@ -898,8 +1187,18 @@ class ModelChannel:
                 and auto_response
                 and (model_turn_id is not None or session.active_response_id is not None)
             ):
+                request_key = data_plane_request_id if isinstance(data_plane_request_id, str) else None
+                draining_response_id = (
+                    session.response_id_for_request(request_key) if session.is_draining_request(request_key) else None
+                )
                 self._ctx.services.spawn(
-                    self.maybe_continue_response(expected_epoch=expected_epoch, expected_model_turn_id=model_turn_id),
+                    self.maybe_continue_response(
+                        expected_epoch=expected_epoch,
+                        expected_model_turn_id=model_turn_id,
+                        expected_response_id=draining_response_id or session.active_response_id,
+                        finished_segment=True,
+                        finished_request_id=request_key,
+                    ),
                     name="duplex-continue",
                 )
             return close_reason, emitted_response
@@ -932,6 +1231,8 @@ class ModelChannel:
             return close_reason, emitted_response
         if draining_response_id is None:
             self._end_active_response_before_future_model_turn(model_turn_id=model_turn_id)
+        if self._ctx.run.closing:
+            return close_reason, emitted_response
         if (
             draining_response_id is None
             and session.active_response_id is not None
@@ -955,6 +1256,8 @@ class ModelChannel:
             if response_request_metrics:
                 created_payload["response_request_metrics"] = response_request_metrics
             self._out.emit(created_payload)
+            if self._ctx.run.closing:
+                return close_reason, emitted_response
         stage_metrics = model_result.get("stage_metrics")
         response_stage_metrics = session.accumulate_response_stage_metrics(
             stage_metrics if isinstance(stage_metrics, Mapping) else None
@@ -976,6 +1279,8 @@ class ModelChannel:
                 response_request_metrics=response_request_metrics,
             )
             self._out.emit(speak_payload)
+            if self._ctx.run.closing:
+                return close_reason, emitted_response
         target_id = draining_response_id if draining_response_id not in (None, session.active_response_id) else None
         previous_sent_ms = session.playback_for_response(target_id).sent_ms
         text_chars_before_append = len(session.assistant_transcript(target_id))
@@ -1018,6 +1323,8 @@ class ModelChannel:
             audio_complete=model_result.get("audio_complete") is True,
             response_id=target_id,
         )
+        if self._ctx.history_calibration is not None and response_id is not None:
+            self._ctx.history_calibration.record(target_id or response_id, model_result)
         payload = {
             "type": "response.output_audio.delta",
             "session_id": session.session_id,
@@ -1052,6 +1359,8 @@ class ModelChannel:
             response_request_metrics=response_request_metrics,
         )
         self._out.emit(payload)
+        if self._ctx.run.closing:
+            return close_reason, emitted_response
         if (
             not end_of_turn
             and model_result.get("stage_role") == "tts"
@@ -1059,7 +1368,13 @@ class ModelChannel:
             and auto_response
         ):
             self._ctx.services.spawn(
-                self.maybe_continue_response(expected_epoch=expected_epoch), name="duplex-continue"
+                self.maybe_continue_response(
+                    expected_epoch=expected_epoch,
+                    expected_response_id=response_id if isinstance(response_id, str) else None,
+                    finished_segment=True,
+                    finished_request_id=(data_plane_request_id if isinstance(data_plane_request_id, str) else None),
+                ),
+                name="duplex-continue",
             )
         if end_of_turn:
             data_plane_request_id = model_result.get("data_plane_request_id")
@@ -1078,14 +1393,20 @@ class ModelChannel:
                 await self._release_ephemeral_request(data_plane_request_id, whole_turn=True)
                 if drained_response_id is not None:
                     playback = session.playback_for_response(drained_response_id).as_dict()
-                    session.release_finished_drain_response(drained_response_id)
+                    committed = session.release_finished_drain_response(
+                        drained_response_id, require_audio_complete=self._ctx.history_calibration is not None
+                    )
+                    if committed:
+                        settle_response_runtime(
+                            self._ctx.plugin, session, committed=True, response_id=drained_response_id
+                        )
                     self._out.emit(
                         {
                             "type": "response.done",
                             "session_id": session.session_id,
                             "response_id": drained_response_id,
                             "epoch": session.epoch,
-                            "committed": False,
+                            "committed": committed,
                             "status": "completed",
                             "playback": playback,
                         }
@@ -1093,6 +1414,8 @@ class ModelChannel:
                 return close_reason, emitted_response
             if isinstance(data_plane_request_id, str) and not auto_response:
                 data_plane.close_stream(data_plane_request_id)
+                if self._ctx.run.stream_request_id == data_plane_request_id:
+                    self._ctx.run.stream_request_id = None
             if isinstance(data_plane_request_id, str):
                 if not auto_response and data_plane_request_id == session.active_request_id:
                     session.clear_request()
@@ -1100,23 +1423,51 @@ class ModelChannel:
                     data_plane.mark_terminal(data_plane_request_id)
             should_commit = self.should_commit_response_to_history(session, response_id)
             committed_message = session.end_response(commit_text=should_commit, preserve_request=auto_response)
+            committed = self._settle_finished_response(
+                session,
+                response_id,
+                should_commit=should_commit,
+                committed_message=committed_message,
+            )
             model_turn_id = coerce_int(model_result.get("model_turn_id"))
             if model_turn_id is not None:
                 session.complete_model_turn(model_turn_id)
-            if should_commit:
-                session.register_history_item(f"item_{response_id}", committed_message)
             self._out.emit(
                 {
                     "type": "response.done",
                     "session_id": session.session_id,
                     "response_id": response_id,
                     "epoch": session.epoch,
-                    "committed": committed_message is not None,
+                    "committed": committed,
                     "playback": session.playback.as_dict(),
                 }
             )
             await self._release_ephemeral_request(data_plane_request_id, whole_turn=True)
         return close_reason, emitted_response
+
+    def _settle_finished_response(self, session, response_id, *, should_commit: bool, committed_message) -> bool:
+        """Store the final history before reconciling an ACK received earlier."""
+        committed = committed_message is not None
+        # Inspect the cursor before finalization releases response-owned state.
+        awaiting_playback = _response_awaits_playback_ack(
+            session, response_id, should_commit=should_commit, committed_message=committed_message
+        )
+        if should_commit:
+            session.register_history_item(f"item_{response_id}", committed_message)
+            committed = (
+                session.finalize_response_playback(
+                    response_id, require_audio_complete=self._ctx.history_calibration is not None
+                )
+                or committed
+            )
+        settle_response_runtime(
+            self._ctx.plugin,
+            session,
+            committed=committed,
+            awaiting_playback=awaiting_playback and not committed,
+            response_id=response_id if isinstance(response_id, str) else None,
+        )
+        return committed
 
     def _end_active_response_before_future_model_turn(self, *, model_turn_id: int | None) -> None:
         session = self._ctx.session
@@ -1131,15 +1482,19 @@ class ModelChannel:
         session.complete_model_turn(int(model_turn_id) - 1)
         should_commit = self.should_commit_response_to_history(session, response_id)
         committed_message = session.end_response(commit_text=should_commit, preserve_request=True)
-        if should_commit:
-            session.register_history_item(f"item_{response_id}", committed_message)
+        committed = self._settle_finished_response(
+            session,
+            response_id,
+            should_commit=should_commit,
+            committed_message=committed_message,
+        )
         self._out.emit(
             {
                 "type": "response.done",
                 "session_id": session.session_id,
                 "response_id": response_id,
                 "epoch": session.epoch,
-                "committed": committed_message is not None,
+                "committed": committed,
                 "playback": session.playback.as_dict(),
             }
         )
@@ -1233,7 +1588,7 @@ class ModelChannel:
         response_id = session.active_response_id
         response_epoch = session.epoch
         response_turn_id = model_turn_id if model_turn_id is not None else session.active_response_turn_id
-        if expected_epoch is not None and response_epoch != expected_epoch:
+        if self._ctx.run.closing or (expected_epoch is not None and response_epoch != expected_epoch):
             return
         model_state.clear_continuation()
         payload: dict[str, object] = {
@@ -1246,6 +1601,8 @@ class ModelChannel:
         if response_id is not None:
             payload["response_id"] = response_id
         self._out.emit(payload)
+        if self._ctx.run.closing:
+            return
         if response_id is None:
             if session.epoch == response_epoch and response_turn_id is not None:
                 session.complete_model_turn(response_turn_id)
@@ -1255,6 +1612,7 @@ class ModelChannel:
         if response_turn_id is not None:
             session.complete_model_turn(response_turn_id)
         session.end_response(commit_text=False, preserve_request=True)
+        settle_response_runtime(self._ctx.plugin, session, committed=False, response_id=response_id, release_owner=True)
         self._out.emit(
             {
                 "type": "response.done",
@@ -1277,7 +1635,8 @@ class ModelChannel:
     ) -> bool:
         session = self._ctx.session
         stale_common_owner = (
-            session.state == DuplexSessionState.CLOSED
+            self._ctx.run.closing
+            or session.state == DuplexSessionState.CLOSED
             or session.active_request_id != request_id
             or (expected_epoch is not None and session.epoch != expected_epoch)
         )
@@ -1292,10 +1651,19 @@ class ModelChannel:
         *,
         expected_epoch: int | None,
         expected_model_turn_id: int | None = None,
+        expected_response_id: str | None = None,
+        finished_segment: bool = False,
+        finished_request_id: str | None = None,
     ) -> None:
         session = self._ctx.session
         model_state = self._ctx.model_state
         response_id = session.active_response_id
+        if expected_response_id is not None and response_id != expected_response_id:
+            return
+        # This segment did not own a response. A response opened while the
+        # spawned task waited belongs to someone else.
+        if finished_segment and expected_response_id is None and response_id is not None:
+            return
         auto_response = self._out.auto_responds()
         if session.state == DuplexSessionState.CLOSED or self._ctx.run.closing:
             model_state.clear_continuation()
@@ -1307,19 +1675,47 @@ class ModelChannel:
         # A continue for a response that still has draining TTS must not emit
         # response.done here; that finish owns the done event.
         if not session.capabilities.supports_core_resumable_request:
+            # While stage0 is still producing, closing here clears
+            # active_request_id and the later final cannot own the stream.
+            # A finished segment may close only when that same request is still
+            # the active one. expected_response_id already drops a segment whose
+            # response was replaced before this spawned task ran.
+            request_id = getattr(session, "active_request_id", None)
+            data_plane = getattr(self._ctx.plugin, "data_plane", None)
+            # A segment from another request has nothing of its own to close,
+            # including when the active request is already terminal or unbound.
+            if finished_segment and isinstance(finished_request_id, str) and finished_request_id != request_id:
+                model_state.clear_continuation()
+                return
+            segment_owns_active_request = (
+                finished_segment and isinstance(finished_request_id, str) and finished_request_id == request_id
+            )
+            if (
+                not segment_owns_active_request
+                and isinstance(request_id, str)
+                and data_plane is not None
+                and callable(getattr(data_plane, "is_terminal", None))
+                and not data_plane.is_terminal(request_id)
+            ):
+                model_state.clear_continuation()
+                return
             model_state.clear_continuation()
             if response_id is not None and not session.response_has_draining_request(response_id):
                 should_commit = self.should_commit_response_to_history(session, response_id)
                 committed_message = session.end_response(commit_text=should_commit, preserve_request=auto_response)
-                if should_commit and committed_message is not None:
-                    session.register_history_item(f"item_{response_id}", committed_message)
+                committed = self._settle_finished_response(
+                    session,
+                    response_id,
+                    should_commit=should_commit,
+                    committed_message=committed_message,
+                )
                 self._out.emit(
                     {
                         "type": "response.done",
                         "session_id": session.session_id,
                         "response_id": response_id,
                         "epoch": session.epoch,
-                        "committed": committed_message is not None if should_commit else False,
+                        "committed": committed,
                         "playback": session.playback.as_dict(),
                     }
                 )
@@ -1372,6 +1768,15 @@ class ModelChannel:
         except Exception as exc:
             logger.exception("Failed to schedule duplex native response continuation: %s", exc)
             scheduled = False
-        if scheduled:
+        if scheduled and not self._ctx.run.closing:
             model_state.continuation_owner_id = owner_id
             model_state.continuation_units = count + 1
+            return
+        if not response_owned and session.active_response_id is not None:
+            # The unit was planned for the model turn, and the answer opened while it
+            # waited: it is stale against its old owner, and the answer's own segment
+            # end only arrives after one more unit is processed. Re-aim the unit at the
+            # answer instead of dropping it, which would leave the answer half spoken
+            # for a client that has stopped sending audio. The re-aimed call re-checks
+            # the session state, so a closed session or a newer epoch still drops it.
+            await self.maybe_continue_response(expected_epoch=expected_epoch)

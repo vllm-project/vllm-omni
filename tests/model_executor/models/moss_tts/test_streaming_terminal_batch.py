@@ -54,8 +54,19 @@ def test_terminal_padding_preserves_audio_live_state_and_reused_slots():
     assert [resumed[i].item() for i in (0, 1)] == [2, 36]
 
 
-@pytest.mark.parametrize("graph_capacity, expected_calls", [(None, 5), (4, 5), (8, 3)])
-def test_only_existing_compatible_graph_buckets_are_coalesced(mocker, graph_capacity, expected_calls):
+@pytest.mark.parametrize(
+    "graph_capacity,expected_groups",
+    [
+        # No graph, or graphs that do not cover the state capacity: exact tails.
+        (None, {3: [0], 7: [1], 8: [2], 1: [3], 15: [4]}),
+        (4, {3: [0], 7: [1], 8: [2], 1: [3], 15: [4]}),
+        # Full graph coverage: finished tails (3, 7) join the padded 8-frame
+        # bucket with the live 8-frame row; the finished 1-frame row keeps the
+        # exact 1-frame graph and the live 15-frame row stays alone.
+        (8, {8: [0, 1, 2], 1: [3], 15: [4]}),
+    ],
+)
+def test_terminal_tails_coalesce_into_padded_frame_buckets(mocker, graph_capacity, expected_groups):
     s = session()
     s._cudagraph_wrapper = (
         None
@@ -81,9 +92,16 @@ def test_only_existing_compatible_graph_buckets_are_coalesced(mocker, graph_capa
             for i, (length, done) in enumerate(zip(lengths, finished, strict=True))
         ]
     )
-    assert step.call_count == expected_calls
+    # Slots are leased in request order, so slot == row here.
+    groups = {}
+    for call in step.call_args_list:
+        plan = call.args[0]
+        groups[max(int(codes.shape[1]) for codes in plan.values())] = sorted(plan)
+        terminal = call.kwargs["terminal_slots"] or set()
+        assert terminal == {slot for slot in plan if finished[slot]}
+    assert groups == expected_groups
+    assert step.call_count == len(expected_groups)
+    # Output is always cropped to the exact frame count, padded or not.
     assert [result[i].shape[-1] for i in range(5)] == lengths
-    if graph_capacity == 8:
-        assert list(step.call_args_list[0].args[0]) == [0, 1, 2]
-        assert step.call_args_list[0].kwargs["terminal_slots"] == {0, 1}
-        assert list(step.call_args_list[1].args[0]) == [3]  # Preserve the exact one-frame graph.
+    # Finished rows released their slots; live rows keep theirs.
+    assert set(decoder._stream_req_slots) == {"2", "4"}
