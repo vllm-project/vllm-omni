@@ -1828,29 +1828,44 @@ class DiffusionEngine:
 
     def _dummy_run(self):
         """A dummy run to warm up the model."""
-        # A backend compiled at static shapes serves the size it warmed up at; the stage's
-        # ``additional_config`` names that size (``diffusion_warmup_height`` / ``_width``), the
-        # historical 512x512 otherwise.
+        # A backend compiled at static shapes serves the sizes it warmed up at; the stage's
+        # ``additional_config`` names them: ``diffusion_warmup_sizes`` (a list of ``[height,
+        # width]``, one dummy run each, in order: every geometry's program is compiled or loaded
+        # before the server is ready), else ``diffusion_warmup_height`` / ``_width``, else the
+        # historical 512x512.
         additional_config = getattr(self.od_config, "additional_config", {}) or {}
-        req = self._make_dummy_request(
-            height=int(additional_config.get("diffusion_warmup_height", 512)),
-            width=int(additional_config.get("diffusion_warmup_width", 512)),
-            # the guidance scale decides the transformer's inputs for a guidance-embedded model:
-            # warm up at the scale the requests will use (``diffusion_warmup_guidance_scale``)
-            guidance_scale=float(additional_config.get("diffusion_warmup_guidance_scale", 0.0)),
-            # Dummy warmup must exercise at least one denoising iteration in
-            # every execution mode. Some pipelines (for example BAGEL) perform
-            # ``num_inference_steps - 1`` scheduler updates and reject an empty
-            # one-step schedule.
-            num_inference_steps=2,
-        )
-        if req is None:
-            logger.info("Skipping dummy warmup run (num_frames=0)")
-            return
-        logger.info("dummy run to warm up the model")
-        output = self.add_req_and_wait_for_response(req)
-        if output.error:
-            raise RuntimeError(f"Dummy run failed: {output.error}")
+        sizes = additional_config.get("diffusion_warmup_sizes")
+        if sizes:
+            sizes = [(int(h), int(w)) for h, w in sizes]
+        else:
+            sizes = [
+                (
+                    int(additional_config.get("diffusion_warmup_height", 512)),
+                    int(additional_config.get("diffusion_warmup_width", 512)),
+                )
+            ]
+        for index, (height, width) in enumerate(sizes):
+            req = self._make_dummy_request(
+                height=height,
+                width=width,
+                # the guidance scale decides the transformer's inputs for a guidance-embedded model:
+                # warm up at the scale the requests will use (``diffusion_warmup_guidance_scale``)
+                guidance_scale=float(additional_config.get("diffusion_warmup_guidance_scale", 0.0)),
+                # Dummy warmup must exercise at least one denoising iteration in
+                # every execution mode. Some pipelines (for example BAGEL) perform
+                # ``num_inference_steps - 1`` scheduler updates and reject an empty
+                # one-step schedule.
+                num_inference_steps=2,
+            )
+            if req is None:
+                logger.info("Skipping dummy warmup run (num_frames=0)")
+                return
+            if index:
+                req.request_id = f"{req.request_id}/{index}"
+            logger.info("dummy run to warm up the model at %dx%d (%d of %d)", width, height, index + 1, len(sizes))
+            output = self.add_req_and_wait_for_response(req)
+            if output.error:
+                raise RuntimeError(f"Dummy run failed at {width}x{height}: {output.error}")
 
     def _submit_rpc(
         self,

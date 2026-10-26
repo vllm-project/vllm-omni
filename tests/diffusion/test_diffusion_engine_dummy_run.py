@@ -69,6 +69,46 @@ def test_dummy_run_uses_enough_steps_for_execution_mode(
     assert captured_requests[0].sampling_params.num_inference_steps == 2
 
 
+def test_dummy_run_warms_up_every_listed_size(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``diffusion_warmup_sizes``: one dummy run per [height, width], in order (a static-shape
+    backend compiles or loads one program per size before the server is ready)."""
+    engine = DiffusionEngine.__new__(DiffusionEngine)
+    engine.od_config = type(
+        "Config",
+        (),
+        {
+            "model_class_name": "mock_model",
+            "diffusion_load_format": "default",
+            "additional_config": {"diffusion_warmup_sizes": [[1152, 1728], [1728, 1152]]},
+        },
+    )()
+    engine.step_execution = False
+    engine.pre_process_func = None
+    captured_requests = []
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.diffusion_engine.supports_multimodal_input",
+        lambda od_config: (False, False),
+    )
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.diffusion_engine.get_dummy_run_num_frames",
+        lambda model_class_name, supports_audio_input: 1,
+    )
+
+    def run_request(request):
+        captured_requests.append(request)
+        return type("Output", (), {"error": None})()
+
+    engine.add_req_and_wait_for_response = run_request
+    engine._dummy_run()
+
+    assert [(r.sampling_params.height, r.sampling_params.width) for r in captured_requests] == [
+        (1152, 1728),
+        (1728, 1152),
+    ]
+    assert len({r.request_id for r in captured_requests}) == 2
+    assert all(r.is_dummy_run() for r in captured_requests)
+
+
 def test_allgather_startup_runs_broadcast_dummy_request() -> None:
     engine = object.__new__(DiffusionEngine)
     engine.od_config = SimpleNamespace(
