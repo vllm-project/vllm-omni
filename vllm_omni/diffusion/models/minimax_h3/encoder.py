@@ -707,7 +707,14 @@ class MiniMaxH3Qwen3VLVisionModel(nn.Module):
         embeddings = embeddings.flatten(1)
         return embeddings
 
-    def fast_pos_embed_interpolate(self, grid_thw: torch.Tensor) -> torch.Tensor:
+    def fast_pos_embed_interpolate(
+        self, grid_thw: torch.Tensor, *, token_indices: tuple[int, ...] | None = None
+    ) -> torch.Tensor:
+        """Interpolate all positions, or selected rows in final merger order.
+
+        Selection moves only the lookup before interpolation: coordinates, weight
+        conversion and the original four-term addition order remain unchanged.
+        """
         grid_thw_list = grid_thw.tolist()
         grid_ts = [row[0] for row in grid_thw_list]
         grid_hs = [row[1] for row in grid_thw_list]
@@ -741,10 +748,33 @@ class MiniMaxH3Qwen3VLVisionModel(nn.Module):
             for i in range(4):
                 idx_list[i].extend(indices[i].tolist())
                 weight_list[i].extend(weights[i].tolist())
+        if token_indices is not None:
+            # Undo frame repetition and spatial merger ordering using CPU metadata.
+            # Keep the original scalar weights, including their dtype conversion.
+            spatial_rows = []
+            merge = self.spatial_merge_size
+            for token in token_indices:
+                full_start = spatial_start = 0
+                for t, h, w in grid_thw_list:
+                    if full_start <= token < full_start + t * h * w:
+                        row = (token - full_start) % (h * w)
+                        block, inner = divmod(row, merge * merge)
+                        block_y, block_x = divmod(block, w // merge)
+                        inner_y, inner_x = divmod(inner, merge)
+                        spatial_rows.append(spatial_start + (block_y * merge + inner_y) * w + block_x * merge + inner_x)
+                        break
+                    full_start += t * h * w
+                    spatial_start += h * w
+                else:
+                    raise ValueError(f"vision position token index out of range: {token}")
+            idx_list = [[values[row] for row in spatial_rows] for values in idx_list]
+            weight_list = [[values[row] for row in spatial_rows] for values in weight_list]
         idx_tensor = torch.tensor(idx_list, dtype=torch.long, device=device)
         weight_tensor = torch.tensor(weight_list, dtype=self.pos_embed.weight.dtype, device=device)
         pos_embeds = self.pos_embed(idx_tensor).to(device) * weight_tensor[:, :, None]
         patch_pos_embeds = pos_embeds[0] + pos_embeds[1] + pos_embeds[2] + pos_embeds[3]
+        if token_indices is not None:
+            return patch_pos_embeds
         patch_pos_embeds = patch_pos_embeds.split([h * w for h, w in zip(grid_hs, grid_ws)])
         patch_pos_embeds_permute = []
         merge_size = self.spatial_merge_size
