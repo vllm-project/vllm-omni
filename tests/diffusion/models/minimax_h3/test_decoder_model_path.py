@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from importlib import import_module
-from types import SimpleNamespace
 
 import pytest
 import torch
@@ -55,16 +54,17 @@ def test_decoder_resolver_rejects_an_unknown_task(tmp_path):
 def test_decoder_constructor_routes_vae_quantization_and_legacy_residency(
     monkeypatch, quantized, offload_mode, expected_device
 ):
+    from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig
     from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3_decoder as pipeline_module
     from vllm_omni.quantization.component_config import ComponentQuantizationConfig
     from vllm_omni.quantization.int8_config import DiffusionInt8Config
 
     quant_config = DiffusionInt8Config() if quantized else None
-    od_config = SimpleNamespace(
+    od_config = OmniDiffusionConfig(
         model="unused",
         revision=None,
         task_type=None,
-        parallel_config=SimpleNamespace(),
+        parallel_config=DiffusionParallelConfig(),
         quantization_config=ComponentQuantizationConfig({"video_vae": quant_config}),
         diffusion_offload_config={"mode": "layer", "components": ["dit"]} if offload_mode == "compact" else None,
         enable_cpu_offload=False,
