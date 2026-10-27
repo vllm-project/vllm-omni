@@ -485,18 +485,14 @@ it.
 
 ## Optional LiteVAE video decoder
 
-Add the following to an existing H3 serving command to select the standard,
-non-INT8 Lite decoder checkpoint:
+Add the following to select the standard non-INT8 Lite decoder:
 
 ```bash
 --additional-config '{"lightvae_decoder_path":"/weights/lightvae-lite-h3-decoder.safetensors"}'
 ```
 
-Keep the file accessible to all decoding processes. Merge this key into any
-existing `--additional-config` JSON object and omit `video_vae_decoder`.
-Restart without the LiteVAE key to restore the existing decoder selection.
-See the [LiteVAE guide](../../docs/user_guide/diffusion/light_vae.md)
-for compatibility rules, measurement boundaries, and quality review.
+See the [LiteVAE guide](../../docs/user_guide/diffusion/light_vae.md) for
+checkpoint requirements and decoder selection rules.
 
 ### LiteVAE measurements: 8 Ascend 910B4 NPUs
 
@@ -518,15 +514,8 @@ select the dense backend), and keep the pipeline profiler disabled:
 --diffusion-attention-config '{"default":{"backend":"RAINFUSION_ATTN","block_sparse":{"sparsity":0.8,"start_step":0}}}'
 ```
 
-The requests use the following prompts with the same seed:
-
-| Prompt | Text |
-| --- | --- |
-| `cat_brass` | At night, while their owner sleeps in a bedroom, three cats march in loudly playing tiny brass instruments, then abruptly file out. |
-| `face_freckles` | A young woman with freckles smiles and turns her head slowly in soft window light, close-up portrait. |
-| `balloons` | Two red balloons float up past a brick building at dawn. |
-| `bookshop_titles` | A camera pans slowly across a wooden bookshelf where gold-embossed titles on the book spines catch the light. |
-| `piano_hands` | Close-up of a pianist's fingers walking across the keys of a grand piano in a dim concert hall. |
+Five prompts cover cats playing brass instruments, a freckled portrait,
+floating balloons, embossed book titles, and piano hands.
 
 Each prompt/resolution/configuration combination includes one warmup and three
 measured requests. For each configuration, average the five per-prompt hot-run
@@ -542,12 +531,11 @@ medians, then divide the main latency by the LiteVAE latency for speedup.
 Video VAE timing uses current-stream NPU Events around `decode_latent()` and
 takes the maximum duration across eight ranks as a stage critical-path
 estimate. It excludes DiT denoising, audio decode, MP4 encoding, and HTTP
-delivery. It is distinct from the single-card floating-point decoder benchmark.
+delivery. Current-stream Events do not independently measure unrelated streams.
 
 The main, PR-off, and PR-on matrix completed 240 requests including warmups.
 PR-off MP4 hashes match main for all 20 prompt/resolution combinations;
-LiteVAE-on visual quality remains pending human review. These are measured
-examples rather than a hardware-independent performance guarantee.
+LiteVAE-on visual quality remains pending human review.
 
 ## CPU MP4 response encoding (Atlas A2)
 
