@@ -1,16 +1,20 @@
 # Higgs-audio v3 deploy: Stage 0 (talker) -> Stage 1 (code2wav) via shared memory.
 #
-# Auto-discovered default for model_type=higgs_multimodal_qwen3. This file is
-# the high-throughput profile and intentionally keeps Stage 0 enforce_eager=true
-# so the Higgs-specific local MLP CUDA graph path remains active. For low
-# concurrency latency-sensitive serving, use
-# higgs_multimodal_qwen3_low_latency.yaml explicitly.
+# Auto-discovered default for model_type=higgs_multimodal_qwen3. This file runs
+# Model Runner V2 (model_runner: v2) by default; the MRV2 feature switches
+# self-enable from the runner selection (HiggsAudioV3Config.resolve_mrv2_defaults),
+# so no audio_mrv2_* hf_overrides are needed here. For a V1 opt-out use
+# higgs_multimodal_qwen3_high_throughput.yaml / _low_latency.yaml, or copy this
+# file and set model_runner: v1. Non-CUDA platforms fall back to V1 via the
+# platforms section below (#9387 Phase 3 owns their MRV2 qualification).
+# The H200-tuned profile lives in higgs_multimodal_qwen3_mrv2_h200.yaml.
 #
 # Plain TTS only (no voice cloning). async_chunk streams codec chunks from
 # Stage 0 to Stage 1 as they are produced (TTFA approaches one AR loop's
 # worth of work). Stage 1 honors meta.left_context_size + meta.right_holdback_size
 # so the per-chunk codec windows stitch into a coherent PCM stream.
 async_chunk: true
+model_runner: v2
 
 connectors:
   connector_of_shared_memory:
@@ -24,10 +28,14 @@ connectors:
       #   codec_right_holdback_frames trailing frames held back so the codec
       #                              has future context for emit-region tail samples
       #   initial_codec_chunk_frames smaller first chunk to minimize TTFA
+      # Geometry matches the validated MRV2 shape (H200 profile): codec CUDA
+      # graph windows are exact at 25 + 8 left context = 33 frames, and the
+      # first chunk is one 8-frame graph window (~320 ms). Clients see an
+      # 8-frame first chunk where V1 shipped a 1-frame one.
       codec_chunk_frames: 25
-      codec_left_context_frames: 25
-      codec_right_holdback_frames: 4
-      initial_codec_chunk_frames: 1
+      codec_left_context_frames: 8
+      codec_right_holdback_frames: 0
+      initial_codec_chunk_frames: 8
       connector_get_sleep_s: 0.01
       connector_get_max_wait_first_chunk: 5000
       connector_get_max_wait: 500
@@ -36,21 +44,30 @@ stages:
   - stage_id: 0
     max_num_seqs: 16
     gpu_memory_utilization: 0.6
-    enforce_eager: true
-    attention_backend: FLASHINFER
-    # Eight codebooks share one attention row, so decode remains BF16 q_len=1
-    # per request. vLLM's SM90 XQA capability gate does not benchmark this
-    # shape; keep the faster native path (README_higgs_audio_v3.md, #5584).
-    attention_config:
-      use_trtllm_attention: false
+    # MRV2 owns the decode step; graphs follow the validated V2 shape
+    # (external decode CUDA graph + FULL capture) instead of the V1
+    # eager + local MLP graph profile kept by the _high_throughput /
+    # _low_latency opt-out files.
+    enforce_eager: false
+    attention_backend: FLASH_ATTN
     trust_remote_code: true
-    # Stage-0 prefix caching is on by default. The talker's HS opt-out and
-    # deferred ``codes.audio`` mm-output write (see higgs_audio_v3_talker.py)
-    # keep per-step bookkeeping negligible; any shared text prefix across
-    # concurrent requests is a net throughput win. Stage 1 (codec decoder)
-    # has no KV cache and stays disabled.
-    enable_prefix_caching: true
-    async_scheduling: false
+    # MRV2 requires async scheduling on the talker stage (validated shape;
+    # HiggsModelState's async payload path is structural under v2).
+    async_scheduling: true
+    # Prefix caching is off in the validated V2 shape; the V1 opt-out files
+    # keep it on for their eager profiles.
+    enable_prefix_caching: false
+    compilation_config:
+      cudagraph_capture_sizes:
+      - 1
+      - 2
+      - 4
+      - 8
+      - 16
+      cudagraph_mode: FULL
+      cudagraph_num_of_warmups: 1
+      max_cudagraph_capture_size: 16
+      cudagraph_copy_inputs: true
     max_num_batched_tokens: 4096
     max_model_len: 8192
     devices: "0"
@@ -76,6 +93,28 @@ stages:
     devices: "0"
     input_connectors:
       from_stage_0: connector_of_shared_memory
+    hf_overrides:
+      # Codec CUDA graph windows follow the connector geometry (self-enabled
+      # under v2 by codec_cuda_graph): 25 steady frames + 8 left context.
+      # Batch buckets scaled to this profile's max_num_seqs=16.
+      codec_graph_single_max_frames: 33
+      codec_graph_batch_sizes:
+      - 1
+      - 2
+      - 3
+      - 4
+      - 5
+      - 6
+      - 7
+      - 8
+      - 9
+      - 10
+      - 11
+      - 12
+      - 13
+      - 14
+      - 15
+      - 16
     default_sampling_params:
       temperature: 0.0
       top_p: 1.0
@@ -85,16 +124,45 @@ stages:
       repetition_penalty: 1.0
 
 platforms:
+  # MRV2 is CUDA-only for now (#9387 Phase 3 owns the non-CUDA platforms),
+  # so every other platform falls back to the V1 runner. The stage-0
+  # restores keep the fallback on the shipped V1 shape (eager + local MLP
+  # CUDA graph, no async scheduling, prefix caching).
   rocm:
+    model_runner: v1
     stages:
       - stage_id: 0
         # FlashInfer is not supported on ROCm.
         attention_backend: TRITON_ATTN
+        enforce_eager: true
+        async_scheduling: false
+        enable_prefix_caching: true
+  npu:
+    # Stage 1 (code2wav) is a generation stage; NPU generation workers
+    # reject model_runner v2 at init. Both stages run V1.
+    model_runner: v1
+    stages:
+      - stage_id: 0
+        enforce_eager: true
+        async_scheduling: false
+        enable_prefix_caching: true
   xpu:
+    # XPU rejects any v2 stage at deploy load.
+    model_runner: v1
     stages:
       - stage_id: 0
         # FlashInfer is not supported on XPU. Both stages share one 32 GiB card.
         attention_backend: FLASH_ATTN
         gpu_memory_utilization: 0.4
+        enforce_eager: true
+        async_scheduling: false
+        enable_prefix_caching: true
       - stage_id: 1
         gpu_memory_utilization: 0.15
+  musa:
+    model_runner: v1
+    stages:
+      - stage_id: 0
+        enforce_eager: true
+        async_scheduling: false
+        enable_prefix_caching: true

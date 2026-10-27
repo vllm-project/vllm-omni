@@ -3289,6 +3289,7 @@ class TestPlatformOverrides:
             ("minicpmo_4_5_turn.yaml", "minicpmo_4_5", "v2", (1,)),
             ("minicpmo_4_5_duplex_h200.yaml", "minicpmo_4_5", "v1", (0, 1, 2)),
             ("minicpmo_4_5_turn_mrv2.yaml", "minicpmo_4_5", "v2", ()),
+            ("higgs_multimodal_qwen3.yaml", "higgs_multimodal_qwen3", "v2", ()),
         ],
     )
     @pytest.mark.parametrize("platform", ["cuda", "npu", "xpu", "rocm", "musa"])
