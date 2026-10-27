@@ -223,8 +223,14 @@ class OmniOpenAIServingVideo:
         """Resolve defaults owned by the active diffusion pipeline."""
         od_config = self._resolve_diffusion_od_config()
         model_class_name = None if od_config is None else getattr(od_config, "model_class_name", None)
+        requested = request.resolve_video_params(default_fps=None)
+        requested_size = (requested.width, requested.height) if requested.width and requested.height else None
         try:
-            return get_video_generation_defaults(model_class_name, request.extra_params)
+            return get_video_generation_defaults(
+                model_class_name,
+                request.extra_params,
+                requested_size=requested_size,
+            )
         except (TypeError, ValueError) as exc:
             raise HTTPException(
                 status_code=HTTPStatus.BAD_REQUEST.value,

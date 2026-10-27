@@ -1059,6 +1059,67 @@ def test_magi2_serving_applies_native_defaults_and_rejects_explicit_frame_mismat
             )
         )
 
+    refined = {"resolution": "1080p"}
+    asyncio.run(
+        handler._run_and_extract(
+            VideoGenerationRequest(prompt="A fox walks through snow", extra_params=refined),
+            "refined-defaults",
+        )
+    )
+    captured = engine.captured_sampling_params_list
+    assert captured is not None
+    sampling = captured[-1]
+    assert (sampling.width, sampling.height) == (1920, 1088)
+    assert sampling.num_frames == 249
+    assert sampling.fps == sampling.frame_rate == 25.0
+    assert sampling.num_inference_steps == 100
+    assert (sampling.extra_args or {}).get("resolution") == "1080p"
+
+    with pytest.raises(HTTPException, match="requires 249 frames"):
+        asyncio.run(
+            handler._run_and_extract(
+                VideoGenerationRequest(prompt="A fox walks through snow", num_frames=125, extra_params=refined),
+                "bad-refined-frames",
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    ("request_fields", "expected"),
+    [
+        ({"size": "1920x1088"}, (1920, 1088, 249, 25.0)),
+        ({"width": 1920, "height": 1088}, (1920, 1088, 249, 25.0)),
+        ({"video_params": {"width": 1920, "height": 1088}}, (1920, 1088, 249, 25.0)),
+        ({"size": "1920x1088", "num_frames": 249, "fps": 25}, (1920, 1088, 249, 25.0)),
+        ({"size": "448x256"}, (448, 256, 125, 12.5)),
+        # Other sizes keep the 540p contract; the pipeline rejects the size itself.
+        ({"size": "1280x720"}, (1280, 720, 125, 12.5)),
+        # An explicit resolution wins; the pipeline rejects the conflicting size.
+        ({"size": "1920x1088", "extra_params": {"resolution": "540p"}}, (1920, 1088, 125, 12.5)),
+    ],
+)
+def test_magi2_serving_takes_the_preset_of_an_unlabelled_requested_size(request_fields, expected):
+    engine = FakeAsyncOmni()
+    engine.model_class_name = "Magi2Pipeline"
+    handler = OmniOpenAIServingVideo.for_diffusion(
+        diffusion_engine=engine,
+        model_name="sand-ai/MAGI-2-preview",
+    )
+
+    asyncio.run(
+        handler._run_and_extract(
+            VideoGenerationRequest(prompt="A fox walks through snow", **request_fields),
+            "sized",
+        )
+    )
+
+    captured = engine.captured_sampling_params_list
+    assert captured is not None
+    sampling = captured[-1]
+    assert (sampling.width, sampling.height, sampling.num_frames, sampling.fps) == expected
+    assert sampling.frame_rate == expected[3]
+    assert sampling.num_inference_steps == 100
+
 
 def test_kandinsky6_serving_applies_defaults_but_allows_explicit_frame_count():
     """Kandinsky 6 publishes Pro-geometry defaults (480x864, 125 frames, 50
