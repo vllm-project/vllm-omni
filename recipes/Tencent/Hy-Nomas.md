@@ -115,6 +115,43 @@ pass `--custom-pipeline-args '{"text_encoder":"/path/to/Qwen2.5-VL-7B-Instruct"}
 to the server, or `custom_pipeline_args={"text_encoder": "/path/to/Qwen2.5-VL-7B-Instruct"}`
 to the Python API.
 
+## Native decoder (experimental)
+
+Select the complete native decoder with
+`--custom-pipeline-args '{"decoder_backend":"native"}'`, or set
+`custom_pipeline_args={"decoder_backend": "native"}` in the Python API.
+Merge this key into existing custom arguments when specifying a text encoder or
+AR capacity. Omitting the key keeps the reference decoder. The DiT remains the
+reference implementation.
+
+The native decoder includes the network, temporal/spatial blending and streaming
+session; it does not import the upstream decoder. Full and local attention use
+shared GQA, retaining 8 KV heads alongside 32 query heads through spatial-neighbor
+collection. The backend owns any required equal-head fallback. FP32 QK/RoPE
+intermediates are processed in bounded token chunks, and temporal windows are
+blended incrementally into a preallocated output buffer. Checkpoint names,
+absolute-frame noise, stable-prefix streaming, per-push frame trimming and final
+tail flush are preserved. There is no separate upstream GQA adapter or
+`decoder_attention_backend` option.
+
+The decoder remains registered as the `vae` component for model CPU offload.
+Layerwise offload and decoder parallelism remain unsupported. The upstream
+package is still required for the reference DiT, text/camera processing and scheduler.
+
+CPU tests compare small random-weight models against the pinned reference for
+one/two-step decoding, overlapping spatial tiles, local-attention visibility,
+each streaming push and final flush. They do not establish real-weight BF16 CUDA
+accuracy or performance. The native decoder remains opt-in pending GPU validation.
+With the reference dependencies and checkpoints installed, run:
+
+```bash
+HY_NOMAS_DECODER_BACKEND=native python -m pytest \
+  tests/e2e/accuracy/test_hy_nomas.py --run-level local_model -v
+```
+
+The existing accuracy thresholds are unchanged. The suite covers ordinary
+generation, segments, camera conditions and persistent turns, with and without CPU offload.
+
 ## Offline generation
 
 Run commands from the vLLM-Omni repository:

@@ -81,9 +81,10 @@ def pipelines(model_cleanup):
         dtype=torch.bfloat16,
         distributed_executor_backend="mp",
         enforce_eager=True,
-        custom_pipeline_args={"text_encoder": os.environ["HY_NOMAS_TEXT_ENCODER"]}
-        if "HY_NOMAS_TEXT_ENCODER" in os.environ
-        else {},
+        custom_pipeline_args={
+            "decoder_backend": os.environ.get("HY_NOMAS_DECODER_BACKEND", "reference"),
+            **({"text_encoder": os.environ["HY_NOMAS_TEXT_ENCODER"]} if "HY_NOMAS_TEXT_ENCODER" in os.environ else {}),
+        },
     )
     reference = candidate = None
     try:

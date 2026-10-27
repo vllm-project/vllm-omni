@@ -113,7 +113,13 @@ def read_component_config(root: Path, component: str, filename: str, class_name:
     return config
 
 
-def build_decoder(config: dict[str, Any], device: torch.device) -> nn.Module:
+def build_decoder(config: dict[str, Any], device: torch.device, *, backend: str = "reference") -> nn.Module:
+    if backend == "native":
+        from vllm_omni.diffusion.models.hy_nomas.decoder import PixelUMMDecoder
+
+        with set_default_torch_dtype(torch.bfloat16), torch.device(device):
+            vae = PixelUMMDecoder(**{name: value for name, value in config.items() if not name.startswith("_")})
+        return vae.eval().requires_grad_(False)
     from hymm.models.vae.pixelumm_decoder.autoencoder import PixelUMMDCAELatentDecoder
     from hymm.models.vae.pixelumm_decoder.model import DCAEVPixelUMMDecoder, GenExpertArch
 
@@ -172,7 +178,7 @@ def validate_config(config: OmniDiffusionConfig) -> None:
     if resolve_offload_strategy(config) not in (OffloadStrategy.NONE, OffloadStrategy.MODEL_LEVEL):
         raise ValueError("Hy-Nomas supports module CPU offload; layer offload is not supported.")
     custom = config.custom_pipeline_args or {}
-    allowed = {"text_encoder", *(f"ar_{name}" for name in HyNomasARConfig.__dataclass_fields__)}
+    allowed = {"text_encoder", "decoder_backend", *(f"ar_{name}" for name in HyNomasARConfig.__dataclass_fields__)}
     if custom.keys() - allowed:
         raise ValueError(f"Unsupported Hy-Nomas custom_pipeline_args: {sorted(custom.keys() - allowed)}")
     HyNomasARConfig.from_args(custom)
@@ -183,6 +189,8 @@ def validate_config(config: OmniDiffusionConfig) -> None:
         "vllm_omni.experimental.ar_diffusion.engine.ARDiffusionEngine",
     ):
         raise ValueError("Hy-Nomas step execution requires the ARDiffusionEngine backend.")
+    if custom.get("decoder_backend", "reference") not in ("reference", "native"):
+        raise ValueError("Hy-Nomas decoder_backend must be reference or native.")
     text_encoder = custom.get("text_encoder")
     if "text_encoder" in custom and (not isinstance(text_encoder, str) or not text_encoder.strip()):
         raise ValueError("Hy-Nomas text_encoder must be a nonempty model ID or local path.")
@@ -306,7 +314,11 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
             .eval()
             .requires_grad_(False)
         )
-        self.vae = build_decoder(decoder_config, self.device)
+        self.vae = build_decoder(
+            decoder_config,
+            self.device,
+            backend=(od_config.custom_pipeline_args or {}).get("decoder_backend", "reference"),
+        )
         self.s_ratio = self.vae.spatial_compression_ratio
         self.patch_size = self.transformer.patch_size
         self.in_channels = self.transformer.config.in_channels
