@@ -319,6 +319,8 @@ source_file_dependencies:
 
   omni_qwen3_omni_function:
     - *qwen3_omni
+    - .buildkite/amd/scripts/assert-pytest-collection.sh
+    - .buildkite/amd/scripts/run-qwen3-omni-rocm-nightly.sh
     - tests/e2e/offline_inference/test_qwen3_omni.py
     - tests/e2e/offline_inference/test_qwen3_omni_colocate_async.py
     - tests/e2e/offline_inference/test_qwen3_omni_autoround_w4a16_expansion.py
@@ -346,6 +348,8 @@ source_file_dependencies:
 
   omni_qwen3_omni_perf:
     - *qwen3_omni
+    - .buildkite/amd/scripts/assert-pytest-collection.sh
+    - .buildkite/amd/scripts/run-qwen3-omni-rocm-nightly.sh
     - tests/dfx/perf/scripts/run_benchmark.py
     - tests/dfx/perf/tests/test_qwen3_omni_vllm_text.json
     - tests/dfx/perf/tests/test_qwen3_omni_async_chunk.json

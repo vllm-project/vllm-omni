@@ -305,6 +305,11 @@ class OmniEngineBase:
         # it (the orchestrator loop), so cross-thread use stays correct.
         self.request_queue: janus.Queue[EngineQueueMessage] = janus.Queue(maxsize=_REQUEST_QUEUE_MAXSIZE)
         self.output_queue: janus.Queue[EngineQueueMessage] = janus.Queue()
+        # The orchestrator thread's event loop, captured once startup finishes.
+        # janus's async_q binds to the first loop that awaits it (the
+        # orchestrator loop here), so frontend submissions must route puts
+        # through this loop instead of awaiting async_q from their own loop.
+        self.orchestrator_loop: asyncio.AbstractEventLoop | None = None
         self._output_sink = OutputQueueSink(self.output_queue.sync_q)
         self.rpc_output_queue: janus.Queue[EngineQueueMessage] = janus.Queue()
         self._shutdown_called = False
@@ -547,9 +552,7 @@ class OmniEngineBase:
                 self._try_shutdown("[OmniEngine] Failed to cleanup after orchestrator startup timeout")
                 raise TimeoutError(f"Orchestrator did not become ready within {startup_timeout}s")
             try:
-                startup_future.result(
-                    timeout=min(remaining, _STARTUP_POLL_INTERVAL_S),
-                )
+                self.orchestrator_loop = startup_future.result(timeout=min(remaining, _STARTUP_POLL_INTERVAL_S))
                 break
             except concurrent.futures.TimeoutError:
                 if not self.orchestrator_thread.is_alive():

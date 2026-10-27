@@ -54,6 +54,7 @@ nav:
       - Execution Modes and Streaming: user_guide/diffusion/execution_modes.md
       - Prefill-Decode Disaggregation (experimental): features/pd_disaggregation.md
       - Sleep Mode: features/sleep_mode.md
+      - HF Numerics for RL Rollouts: features/hf_numerics.md
     - Quantization:
       - Overview: user_guide/quantization/overview.md
       - Online Quantization: user_guide/quantization/online.md

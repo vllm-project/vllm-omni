@@ -65,6 +65,15 @@ async def fake_process_results(request_id, metrics, final_stage_id_for_e2e, req_
     )
 
 
+async def _wait_until(predicate, *, max_ticks: int = 100) -> None:
+    """Yield to the loop until ``predicate()`` holds (bounded, no wall clock)."""
+    for _ in range(max_ticks):
+        if predicate():
+            return
+        await asyncio.sleep(0)
+    raise AssertionError("condition not reached")
+
+
 def get_async_omni_instance(fake_add_request=_noop, fake_abort_request=_noop) -> AsyncOmni:
     omni = object.__new__(AsyncOmni)
     omni._pause_cond = asyncio.Condition()
@@ -489,7 +498,9 @@ def test_generate_accepts_request_after_repeated_cancellations():
 
         for idx in range(3):
             task = asyncio.create_task(collect_outputs(f"cancel-{idx}"))
-            await asyncio.sleep(0)
+            # The submit runs as its own tracked task; cancel once it has
+            # reached the engine so this exercises cancel-after-submit.
+            await _wait_until(lambda: len(submitted_request_ids) == idx + 2)
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await task
@@ -625,7 +636,7 @@ def test_generate_cancellation_converges_after_engine_shutdown_starts(mocker):
                 pass
 
         task = asyncio.create_task(collect_outputs())
-        await asyncio.sleep(0)
+        await _wait_until(lambda: len(submitted_request_ids) == 1)
         task.cancel()
 
         with pytest.raises(asyncio.CancelledError):
