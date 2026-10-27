@@ -2529,6 +2529,8 @@ async def edit_images(
     # vllm-omni extension for per-request LoRA.
     lora: str | None = Form(None),  # Json string, or the name of a preloaded adapter
     lora_strength: float | None = Form(None),  # the adapter's scale
+    # step skipping (e.g. TaylorSeer none|regular|high|full), passed to the pipeline as extra_args["acceleration"]
+    acceleration: str | None = Form(None),
     # vllm-omni extension for layered models (e.g., Qwen-Image-Layered)
     layers: int | None = Form(None),
     resolution: int | None = Form(None),  # See SUPPORTED_LAYERED_RESOLUTIONS
@@ -2638,6 +2640,8 @@ async def edit_images(
         lora_request, lora_scale = _parse_lora_request(lora_dict) if lora_dict is not None else (None, None)
         _update_if_not_none(gen_params, "lora_request", lora_request)
         _update_if_not_none(gen_params, "lora_scale", lora_scale)
+        if acceleration is not None:
+            gen_params.extra_args = {**(gen_params.extra_args or {}), "acceleration": acceleration}
         # 3.2 Validate resolution if provided
         if resolution is not None and resolution not in SUPPORTED_LAYERED_RESOLUTIONS:
             raise HTTPException(
