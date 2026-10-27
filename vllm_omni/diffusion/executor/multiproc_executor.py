@@ -14,6 +14,7 @@ import time
 import weakref
 from collections import OrderedDict
 from collections.abc import Callable
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from multiprocessing.synchronize import Event
 from typing import TYPE_CHECKING, Any, cast
@@ -27,6 +28,10 @@ from vllm.v1.executor.multiproc_executor import set_multiprocessing_worker_envs
 from vllm_omni.diffusion.data import SHUTDOWN_MESSAGE, AsyncDiffusionOutput, AsyncOutputKind, DiffusionOutput
 from vllm_omni.diffusion.executor.abstract import DiffusionExecutor
 from vllm_omni.diffusion.ipc import DIFFUSION_RPC_RESULT_ENVELOPE, unpack_diffusion_output_shm
+from vllm_omni.diffusion.model_loader.prewarm import (
+    WeightsPrewarmHandoff,
+    parent_weights_prewarm,
+)
 from vllm_omni.diffusion.offloader.config import (
     TEXT_ENCODER_COMPONENT,
     any_selected_component_uses_allgather,
@@ -371,13 +376,48 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         od_config = self.od_config
         logger.info("Starting server...")
 
-        num_gpus = cast(int, od_config.num_gpus)
         # Without this, every worker inherits one Torch thread per core, so an
         # N-GPU run oversubscribes the host by N x core_count. Honours a
         # user-provided OMP_NUM_THREADS.
+        user_omp = "OMP_NUM_THREADS" in os.environ
         set_multiprocessing_worker_envs()
+        # Diffusion weight loading casts fp32 checkpoints to bf16 on the CPU
+        # during pageable H2D copies; with vllm's default OMP_NUM_THREADS=1
+        # that cast is single-threaded and measured 3x slower on g7e.12xlarge
+        # (18.8s vs 5.8s resident, Wan TP=2). Restore one thread pool per
+        # worker sized to the host: workers x threads ~= core count, so the
+        # cap still bounds contention without serializing the casts.
+        workers = max(1, int(getattr(od_config, "num_gpus", 1) or 1))
+        if not user_omp:
+            os.environ["OMP_NUM_THREADS"] = str(max(2, (os.cpu_count() or 8) // workers))
         mp.set_start_method("spawn", force=True)
-        processes = []
+
+        model_ref = getattr(od_config, "model", None)
+        load_format = getattr(od_config, "diffusion_load_format", "default")
+        prewarm_context = (
+            parent_weights_prewarm(
+                str(model_ref),
+                revision=getattr(od_config, "revision", None),
+            )
+            if model_ref and load_format != "dummy"
+            else nullcontext(None)
+        )
+        with prewarm_context as prewarm_handoff:
+            return self._launch_worker_processes(
+                broadcast_handle,
+                wake_events,
+                prewarm_handoff,
+            )
+
+    def _launch_worker_processes(
+        self,
+        broadcast_handle: Handle,
+        wake_events: list[Event],
+        prewarm_handoff: WeightsPrewarmHandoff | None,
+    ) -> tuple[list[mp.Process], list[Handle]]:
+        od_config = self.od_config
+        num_gpus = cast(int, od_config.num_gpus)
+        processes: list[mp.Process] = []
 
         # Extract worker_extension_cls and custom_pipeline_args from od_config
         worker_extension_cls = od_config.worker_extension_cls
@@ -400,6 +440,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                     wake_events[i],
                     worker_extension_cls,
                     custom_pipeline_args,
+                    prewarm_handoff,
                 ),
                 name=f"DiffusionWorker-{i}",
                 daemon=True,

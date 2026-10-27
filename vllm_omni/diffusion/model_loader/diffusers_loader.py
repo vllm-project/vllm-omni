@@ -28,6 +28,7 @@ from vllm.model_executor.model_loader.weight_utils import (
     safetensors_weights_iterator,
 )
 from vllm.utils.import_utils import resolve_obj_by_qualname
+from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.utils.torch_utils import set_default_torch_dtype
 
 from vllm_omni.diffusion.config import set_current_diffusion_config
@@ -44,6 +45,10 @@ from vllm_omni.diffusion.lora.manager import LoRABackend
 from vllm_omni.diffusion.model_loader.checkpoint_adapters import (
     get_checkpoint_adapter,
 )
+from vllm_omni.diffusion.model_loader.cooperative_staging import (
+    cooperative_staging_weights_iterator,
+    prepare_cooperative_staging,
+)
 from vllm_omni.diffusion.model_loader.host_weight_loader import HWRLoaderMixin, _HWRCommitError
 from vllm_omni.diffusion.model_loader.host_weight_plan import (
     HostWeightPlan,
@@ -51,6 +56,15 @@ from vllm_omni.diffusion.model_loader.host_weight_plan import (
     build_checkpoint_binding_plan,
     build_checkpoint_mmap_plan,
     has_online_quantization,
+)
+from vllm_omni.diffusion.model_loader.prewarm import (
+    checkpoint_fully_resident,
+    pause_parent_prewarm_copy,
+    resume_parent_prewarm_copy,
+    should_pause_for_demand,
+    start_weights_prewarm,
+    stop_weights_prewarm,
+    yield_parent_prewarm_file,
 )
 from vllm_omni.diffusion.model_loader.weight_reload import prepare_model_for_weight_reload
 from vllm_omni.diffusion.models.diffusers_adapter.pipeline_diffusers_adapter import DiffusersAdapterPipeline
@@ -66,6 +80,7 @@ from vllm_omni.diffusion.offloader.offload_plan import get_offload_plan
 from vllm_omni.diffusion.registry import initialize_model
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 from vllm_omni.transformers_utils.repo_utils import hf_api
+from vllm_omni.utils.startup_timing import startup_span
 
 
 # download_gguf was removed from upstream vLLM (commit 6635279d8).
@@ -374,6 +389,91 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
 
         return hf_folder, hf_weights_files, use_safetensors
 
+    def _stop_weights_prewarm(self) -> None:
+        """Hand page-cache ownership from speculative prewarm to the loader."""
+        handle = getattr(self, "_weights_prewarm_handle", None)
+        if handle is not None:
+            stop_weights_prewarm(handle)
+            self._weights_prewarm_handle = None
+
+    def _resident_cast_gate_across_tp(self, files: list[str], local_eligible: bool) -> bool:
+        """Group-agreed residency gate for the fast path.
+
+        A fully page-cache-resident checkpoint has no disk pressure left, so
+        cooperation's only remaining win is halving H2D bytes - and the
+        per-rank local multithread iterator is faster than a bucket schedule
+        once the pages are warm: the pinned pool plus one broadcast per bucket
+        buys nothing when the H2D it removes is ~1.3 s per component. Measured
+        on g7e.12xlarge (vLLM 0.32, TP=2, hot cache): HunyuanImage-3.0 BF16
+        15.2 s cooperative vs 13.7 s local, MiniMax-H3 BF16 19.2 s vs 10.9 s.
+
+        Every rank of the TP group must enter this vote. ``local_eligible`` is
+        per rank (CUDA visibility, pinned-memory availability under Ray), so it
+        is folded into the voted value rather than guarding the call: a
+        rank-local guard would send one rank into this collective while a peer
+        enters the preflight collective instead, and the two would never meet.
+        The MIN-reduce is what makes the branch safe."""
+        if not files:
+            return False
+        local = 1 if (local_eligible and checkpoint_fully_resident(files)) else 0
+        try:
+            import torch.distributed as dist
+
+            if not (dist.is_available() and dist.is_initialized()):
+                return bool(local)
+            from vllm.distributed.parallel_state import get_tp_group
+
+            group = get_tp_group()
+            if group.world_size <= 1:
+                return bool(local)
+            device = (
+                torch.device("cuda", torch.accelerator.current_device_index())
+                if torch.cuda.is_available()
+                else torch.device("cpu")
+            )
+            flag = torch.tensor([local], dtype=torch.int32, device=device)
+            dist.all_reduce(flag, op=dist.ReduceOp.MIN, group=group.device_group)
+            return bool(flag.item())
+        except (ImportError, AttributeError, AssertionError, RuntimeError, ValueError):
+            return False
+
+    def _yield_prewarm_file(self, path: str) -> None:
+        yield_parent_prewarm_file(path)
+        handle = getattr(self, "_weights_prewarm_handle", None)
+        if handle is not None:
+            handle.yield_file(path)
+
+    def _pause_prewarm_copy(self) -> None:
+        pause_parent_prewarm_copy()
+        handle = getattr(self, "_weights_prewarm_handle", None)
+        if handle is not None:
+            handle.pause_copy()
+
+    def _resume_prewarm_copy(self) -> None:
+        resume_parent_prewarm_copy()
+        handle = getattr(self, "_weights_prewarm_handle", None)
+        if handle is not None:
+            handle.resume_copy()
+
+    def _iter_safetensors(self, files: list[str], *, use_tqdm: bool, strategy: str):
+        """Yield tensors file-by-file; pause remaining copies only while this
+        component's staging actually needs the disk."""
+        paused_here = False
+        try:
+            for index, path in enumerate(files):
+                self._yield_prewarm_file(path)
+                if index == 0 and should_pause_for_demand(path):
+                    self._pause_prewarm_copy()
+                    paused_here = True
+                yield from safetensors_weights_iterator(
+                    [path],
+                    use_tqdm and index == 0,
+                    strategy,
+                )
+        finally:
+            if paused_here:
+                self._resume_prewarm_copy()
+
     def _get_weights_iterator(
         self,
         source: "ComponentSource",
@@ -388,11 +488,60 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
             source.allow_patterns_overrides,
         )
         quant_config = self._get_source_quant_config(source)
+        # Executors without a parent handoff may use local prewarm during
+        # pipeline construction. Stop those broad readers before demand
+        # loading so they cannot compete with targeted staging faults.
+        self._stop_weights_prewarm()
+
+        # Decide the static gate before choosing the source iterator. Excluded
+        # paths must retain their existing multi-thread loader rather than pay
+        # the deterministic-order cost for cooperation they will never enter.
+        hsdp_cpu_load = self.parallel_config.use_hsdp and self.quant_config is None
+        use_pinned_staging = (
+            use_safetensors
+            and self.load_config.safetensors_load_strategy != "torchao"
+            and not getattr(self.od_config, "enable_cpu_offload", False)
+            and not getattr(self.od_config, "enable_layerwise_offload", False)
+            and not getattr(self.od_config, "enable_distributed_layerwise_offload", False)
+            and not hsdp_cpu_load
+        )
+        local_eligible = use_pinned_staging and torch.cuda.is_available() and is_pin_memory_available()
+
+        # Cooperative TP staging plans byte buckets from the tensor stream and
+        # runs one collective per bucket, assuming every rank sees the SAME
+        # stream in the SAME order. The multi-thread iterator yields shards in
+        # completion order — nondeterministic, so two ranks would compute
+        # different bucket plans and their collectives would be malformed
+        # (observed as a NCCL watchdog timeout, not an error). Force the
+        # deterministic single-thread order whenever cooperation can engage.
+        tp_cooperative = False
+        try:
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                from vllm.distributed.parallel_state import get_tensor_model_parallel_world_size
+
+                tp_cooperative = get_tensor_model_parallel_world_size() > 1
+        except (ImportError, AttributeError, AssertionError, RuntimeError, ValueError):
+            tp_cooperative = False
+
+        cooperative_context = None
+        if use_pinned_staging and tp_cooperative:
+            if self._resident_cast_gate_across_tp(hf_weights_files, local_eligible):
+                # Fully page-cache resident: skip the cooperative group AND the
+                # pinned-staging wrapper, loading per rank through the
+                # multithread iterator exactly like the pre-staging loader (the
+                # executor restores OMP threads so any fp32->bf16 cast the
+                # consumer still does is parallel). Nothing is left for
+                # cooperation to win once the pages are warm.
+                use_pinned_staging = False
+            else:
+                cooperative_context = prepare_cooperative_staging(local_eligible)
+        cooperation_enabled = cooperative_context is not None and cooperative_context.comm is not None
         use_multithread = (
             use_safetensors
             and source.weight_name_patterns is None
             and getattr(self.od_config, "enable_multithread_weight_load", False)
             and self.load_config.safetensors_load_strategy != "torchao"
+            and not cooperation_enabled
         )
         use_torchao = (
             not use_safetensors
@@ -403,13 +552,28 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         )
         if use_multithread:
             num_threads = getattr(self.od_config, "num_weight_load_threads", 4)
-            # Keep deterministic shard order before passing to vLLM helper.
+            # Concurrent opens cannot yield per file; stop those shards first.
             sorted_hf_weights_files = sorted(hf_weights_files, key=_natural_sort_key)
-            weights_iterator = multi_thread_safetensors_weights_iterator(
-                sorted_hf_weights_files,
-                self.load_config.use_tqdm_on_load,
-                max_workers=num_threads,
-            )
+            for path in sorted_hf_weights_files:
+                self._yield_prewarm_file(path)
+
+            def _multithread_iter():
+                # Concurrent opens cannot yield per file; pause remaining
+                # copies only if these shards still need the disk.
+                paused_here = not checkpoint_fully_resident(sorted_hf_weights_files)
+                if paused_here:
+                    self._pause_prewarm_copy()
+                try:
+                    yield from multi_thread_safetensors_weights_iterator(
+                        sorted_hf_weights_files,
+                        self.load_config.use_tqdm_on_load,
+                        max_workers=num_threads,
+                    )
+                finally:
+                    if paused_here:
+                        self._resume_prewarm_copy()
+
+            weights_iterator = _multithread_iter()
         elif use_torchao:
             sorted_hf_weights_files = sorted(hf_weights_files, key=_natural_sort_key)
             weights_iterator = pt_weights_iterator(
@@ -434,21 +598,71 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
 
             weights_iterator = filtered_safetensors_iterator()
         else:
-            weights_iterator = safetensors_weights_iterator(
-                hf_weights_files,
-                self.load_config.use_tqdm_on_load,
-                self.load_config.safetensors_load_strategy,
-            )
+            if use_safetensors and tp_cooperative:
+                # Glob order is not contractual; the cooperative plan needs
+                # an identical file order on every rank.
+                hf_weights_files = sorted(hf_weights_files, key=_natural_sort_key)
+            if use_safetensors:
+                weights_iterator = self._iter_safetensors(
+                    hf_weights_files,
+                    use_tqdm=self.load_config.use_tqdm_on_load,
+                    strategy=self.load_config.safetensors_load_strategy,
+                )
+            else:
+                weights_iterator = safetensors_weights_iterator(
+                    hf_weights_files,
+                    self.load_config.use_tqdm_on_load,
+                    self.load_config.safetensors_load_strategy,
+                )
 
         if self.counter_before_loading_weights == 0.0:
             self.counter_before_loading_weights = time.perf_counter()
         # Apply the prefix.
-        prefixed_weights_iterator = ((source.prefix + name, tensor) for (name, tensor) in weights_iterator)
+        result_iterator = ((source.prefix + name, tensor) for (name, tensor) in weights_iterator)
         if model is not None:
             checkpoint_adapter = self._get_checkpoint_adapter(model, source, use_safetensors)
             if checkpoint_adapter is not None:
-                return checkpoint_adapter.adapt(prefixed_weights_iterator)
-        return prefixed_weights_iterator
+                result_iterator = checkpoint_adapter.adapt(result_iterator)
+
+        # Stage the final tensors (post-adapter) through pooled pinned memory so the
+        # consumer's H2D copies take the DMA fast path. Staging must sit after any
+        # checkpoint adapter: adapters may hold tensors across iterations (e.g.
+        # deferred dequantization), which would violate the recycling contract.
+        # Non-quantized HSDP builds the model on CPU (hsdp_defer_to_cpu) and
+        # loads weights there: no H2D copy exists for pinned DMA to speed up,
+        # so staging would be pure overhead. Runtime eligibility still travels
+        # into the cooperative vote so every TP rank reaches the same decision.
+        if use_pinned_staging:
+            # Destination dtypes so mismatched checkpoints (fp32 ckpt -> bf16
+            # params) are cast while staging: a dtype-converting H2D copy_
+            # falls off the pinned fast path, so without the fused cast staging
+            # gains nothing for such checkpoints. Exact param-name matches win
+            # (protecting intentionally-fp32 params); names the map misses
+            # (renamed/fused weights, q/k/v -> qkv) are cast to default_dtype.
+            target_dtypes = None
+            default_dtype = None
+            if model is not None and local_eligible:
+                target_dtypes = {n: p.dtype for n, p in model.named_parameters()}
+                target_dtypes.update({n: b.dtype for n, b in model.named_buffers()})
+                # The blanket fallback is unsafe for quantized sources: their
+                # fp32 scale tensors travel under pre-fusion checkpoint names
+                # (q_proj.weight_scale -> qkv_proj.weight_scale only inside
+                # load_weights), so the map misses them and a default cast
+                # would corrupt dequantization. Quantized sources cast only on
+                # exact matches; everything else passes through unchanged.
+                if self._get_source_quant_config(source) is None:
+                    default_dtype = getattr(self.od_config, "dtype", None)
+            # Under TP the iterator splits staging across the group and
+            # broadcasts GPU buckets (each rank stages ~1/N); single-GPU and
+            # non-distributed runs degrade to plain per-rank pinned staging.
+            result_iterator = cooperative_staging_weights_iterator(
+                result_iterator,
+                target_dtypes=target_dtypes,
+                default_dtype=default_dtype,
+                local_eligible=local_eligible,
+                context=cooperative_context,
+            )
+        return result_iterator
 
     def _get_source_quant_config(self, source: "ComponentSource") -> object | None:
         quant_config = self.quant_config
@@ -739,6 +953,31 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         }
         if load_format is None:
             load_format = "default"
+        # Executors without a parent startup handoff prewarm the exact
+        # checkpoint while the pipeline is built. Demand loading owns the same
+        # revision/cache, and finally cancels speculative I/O on every exit.
+        model_ref = getattr(self.od_config, "model", None)
+        self._weights_prewarm_handle = (
+            start_weights_prewarm(
+                str(model_ref),
+                revision=getattr(self.od_config, "revision", None),
+                cache_dir=self.load_config.download_dir,
+            )
+            if model_ref
+            else None
+        )
+        try:
+            return self._load_model(load_device, load_format, custom_pipeline_name, device)
+        finally:
+            self._stop_weights_prewarm()
+
+    def _load_model(
+        self,
+        load_device: str,
+        load_format: str,
+        custom_pipeline_name: str | type[nn.Module] | None,
+        device: torch.device | None,
+    ) -> nn.Module:
         # CPU offload + quantization: for offline-quantized models (e.g., AutoRound MXFP8),
         # weights are already quantized in the checkpoint — load directly on CPU.
         # For online quantization, load on device so quantization can run on accelerator,
@@ -760,14 +999,16 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                 logger.info("Offline-quantized model with CPU offload, loading weights directly on CPU")
 
         target_device = torch.device(load_device)
+        timing_labels = {"device": target_device.type, "load_format": load_format}
         with set_default_torch_dtype(self.od_config.dtype):
             if self.parallel_config.use_hsdp:
-                model = self._load_model_with_hsdp(
-                    target_device=device,
-                    load_format=load_format,
-                    custom_pipeline_name=custom_pipeline_name,
-                    offload_after_quant=offload_after_quant,
-                )
+                with startup_span(logger, "model.hsdp_load", **timing_labels):
+                    model = self._load_model_with_hsdp(
+                        target_device=device,
+                        load_format=load_format,
+                        custom_pipeline_name=custom_pipeline_name,
+                        offload_after_quant=offload_after_quant,
+                    )
             else:
                 # The model is headed back to host memory right after online
                 # quantization, so over-wide NPU-unquantizable fallback weights
@@ -776,7 +1017,7 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                 from vllm_omni.quantization.int8_config import load_unquantizable_fallback_on_cpu
 
                 fallback_ctx = load_unquantizable_fallback_on_cpu() if offload_after_quant else contextlib.nullcontext()
-                with fallback_ctx:
+                with fallback_ctx, startup_span(logger, "model.pipeline_construct", **timing_labels):
                     model = self._init_from_load_format(load_format, target_device, custom_pipeline_name, is_hsdp=False)
 
                 resolved_offload = resolve_offload(self.od_config)
@@ -902,23 +1143,41 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                             "DLO direct checkpoint mmap unavailable; using ordinary loader: %s",
                             plan_result.fallback_reason,
                         )
-                    logger.debug("Loading weights on %s ...", load_device)
-                    if offload_after_quant:
-                        marked = self._request_offload_after_quant(model)
-                        if marked:
-                            logger.info(
-                                "Online quantization will return each of %d layers to CPU as it is quantized",
-                                marked,
-                            )
-                    if load_format == "diffusers":
-                        cast(DiffusersAdapterPipeline, model).load_weights()
-                    else:
+                    with startup_span(logger, "model.weights_apply", **timing_labels):
+                        logger.debug("Loading weights on %s ...", load_device)
                         if offload_after_quant:
-                            self.load_weights(model, stream_online_quant_to_cpu=True)
+                            marked = self._request_offload_after_quant(model)
+                            if marked:
+                                logger.info(
+                                    "Online quantization will return each of %d layers to CPU as it is quantized",
+                                    marked,
+                                )
+                        if load_format == "diffusers":
+                            # from_pretrained bypasses _get_weights_iterator();
+                            # yield every local shard so parent prewarm can
+                            # skip them without a global stop.
+                            model_ref = getattr(self.od_config, "model", None)
+                            adapter_files: list[str] = []
+                            if model_ref and os.path.isdir(str(model_ref)):
+                                for root, _, names in os.walk(str(model_ref)):
+                                    for name in names:
+                                        if name.endswith(".safetensors"):
+                                            adapter_files.append(os.path.join(root, name))
+                                for adapter_path in adapter_files:
+                                    self._yield_prewarm_file(adapter_path)
+                                if not checkpoint_fully_resident(adapter_files):
+                                    self._pause_prewarm_copy()
+                            else:
+                                self._stop_weights_prewarm()
+                            cast(DiffusersAdapterPipeline, model).load_weights()
                         else:
-                            self.load_weights(model)
+                            if offload_after_quant:
+                                self.load_weights(model, stream_online_quant_to_cpu=True)
+                            else:
+                                self.load_weights(model)
                     self._maybe_fuse_distilled_lora(model)
-                    self._process_weights_after_loading(model, target_device)
+                    with startup_span(logger, "model.post_load_processing", **timing_labels):
+                        self._process_weights_after_loading(model, target_device)
 
                 # A warm final-layout hit has already completed all
                 # byte-changing work through the restorer.  Shared runtime
@@ -927,7 +1186,8 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                 # materialization/finalization pipeline.
 
             if offload_after_quant:
-                model.to("cpu")
+                with startup_span(logger, "model.quantization_offload", **timing_labels):
+                    model.to("cpu")
                 logger.info("Quantization complete, offloaded model back to CPU")
 
         try:
@@ -1171,10 +1431,13 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         planned_weights: Iterable[str] = (),
     ) -> None:
         weights_to_load = self._get_expected_parameter_names(model)
+        # closing(): if load_weights raises, the suspended staging generator
+        # (and its pinned pool) must not be kept alive by the traceback.
         weights = self.get_all_weights(model) if sources is None else self.get_all_weights(model, sources=sources)
         if stream_online_quant_to_cpu:
             weights = self._stream_online_quant_weights_to_cpu(model, weights)
-        loaded_weights = model.load_weights(weights)
+        with contextlib.closing(weights) as all_weights:
+            loaded_weights = model.load_weights(all_weights)
         if stream_online_quant_to_cpu:
             self._finalize_online_quant_weights_to_cpu(model)
         if loaded_weights is not None:

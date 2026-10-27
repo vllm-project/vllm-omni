@@ -88,6 +88,7 @@ from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTran
 from vllm_omni.errors import OmniClientError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.platforms import current_omni_platform
+from vllm_omni.utils.startup_timing import log_startup_duration
 
 if TYPE_CHECKING:
     from vllm_omni.inputs.data import OmniInteractionPrompt
@@ -372,6 +373,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         )
         self.model_memory_usage = int(m.consumed_memory)
         logger.info("Model runner: Model loaded successfully.")
+        runtime_setup_started = time.perf_counter()
 
         if self.od_config.streaming_output and not getattr(self.od_config, "step_execution", False):
             logger.warning("streaming_output=True requires step_execution=True; enabling step execution.")
@@ -462,6 +464,12 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         if hasattr(self.pipeline, "_interaction_coordinator"):
             self.pipeline._interaction_coordinator = self._interaction_coordinator
 
+        log_startup_duration(
+            logger,
+            "model.runtime_setup",
+            time.perf_counter() - runtime_setup_started,
+            model=self.od_config.model_class_name,
+        )
         logger.info("Model runner: Initialization complete.")
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
