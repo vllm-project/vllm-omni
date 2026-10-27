@@ -200,6 +200,37 @@ def _merge_step_for(device: torch.device) -> Callable[..., tuple[torch.Tensor, t
     return _compiled_merge_step
 
 
+def _merge_pass(
+    acc: torch.Tensor,
+    acc_lse: torch.Tensor,
+    out: torch.Tensor,
+    lse: torch.Tensor,
+    q_index: torch.Tensor,
+    identity_q: bool,
+    first_pass: bool,
+    result: torch.Tensor | None = None,
+) -> None:
+    """Fuse one pass's FP32 recurrence and indexed writes, in plan order."""
+    if first_pass:
+        merged, merged_lse = out.float(), lse.float()
+    elif identity_q:
+        merged, merged_lse = merge_step(acc, acc_lse, out, lse)
+    else:
+        merged, merged_lse = merge_step(acc.index_select(0, q_index), acc_lse.index_select(0, q_index), out, lse)
+    if identity_q:
+        acc.copy_(merged)
+        acc_lse.copy_(merged_lse)
+    else:
+        acc.index_copy_(0, q_index, merged)
+        acc_lse.index_copy_(0, q_index, merged_lse)
+    if result is not None:
+        # Partial final passes must preserve rows last touched by earlier passes.
+        result.copy_(acc)
+
+
+_compiled_merge_pass = torch.compile(_merge_pass, fullgraph=True, dynamic=True)
+
+
 def _maskless_attention_impl(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -230,6 +261,7 @@ def _maskless_attention_impl(
     heads, head_dim = q.shape[2], q.shape[3]
     kernel = get_pass_kernel(kernel_name)
     same_view_kernel = get_pass_kernel("fa3_single_split") if kernel_name == "fa3" else kernel
+    fused_merge = kernel_name == "fa3" and q.device.type == "cuda"
     merge = _merge_step_for(q.device)
     # Preserve the caller's tensor mode: HSDP/offload use no_grad() and need
     # outputs with version counters.  Only the passes and the accumulators are
@@ -274,6 +306,20 @@ def _maskless_attention_impl(
                 # The same-view pass covers every row and seeds the accumulators.
                 acc = torch.empty((planned_tokens, heads, head_dim), dtype=torch.float32, device=q.device)
                 acc_lse = torch.empty((planned_tokens, heads), dtype=torch.float32, device=q.device)
+            if fused_merge:
+                _compiled_merge_pass(
+                    acc,
+                    acc_lse,
+                    out,
+                    lse,
+                    q_index,
+                    identity_q,
+                    index == 0,
+                    result[0] if index == num_passes - 1 else None,
+                )
+                del out, lse
+                continue
+            if index == 0:
                 for start in range(0, rows, MERGE_CHUNK_SIZE):
                     chunk = slice(start, start + MERGE_CHUNK_SIZE)
                     if identity_q:
@@ -298,9 +344,10 @@ def _maskless_attention_impl(
                         acc_lse.index_copy_(0, gather, merged_lse)
             del out, lse
         assert acc is not None
-        for start in range(0, planned_tokens, MERGE_CHUNK_SIZE):
-            chunk = slice(start, start + MERGE_CHUNK_SIZE)
-            result[0, chunk].copy_(acc[chunk])
+        if not fused_merge:
+            for start in range(0, planned_tokens, MERGE_CHUNK_SIZE):
+                chunk = slice(start, start + MERGE_CHUNK_SIZE)
+                result[0, chunk].copy_(acc[chunk])
     return result
 
 
