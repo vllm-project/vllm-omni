@@ -1083,6 +1083,7 @@ class Flux2Transformer2DModel(nn.Module):
             *concat_rotary_emb,
             hidden_states.shape[0],
             dtype=hidden_states.dtype,
+            head_dim=self.config.attention_head_dim,
             sequence_parallel_size=sp_size,
             cuda_rms_norm=True,
         )
