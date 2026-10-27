@@ -29,6 +29,7 @@ class WanCell(CellAdapter):
         device: torch.device,
         dtype: torch.dtype,
         on_finished: Callable[[int, torch.Tensor], None] | None = None,
+        req_id: str = "",
     ) -> None:
         self.transformer = transformer
         self.sampler = sampler
@@ -38,10 +39,13 @@ class WanCell(CellAdapter):
         self.device = device
         self.dtype = dtype
         self.on_finished = on_finished
+        self.req_id = req_id
         self.num_denoise_steps = len(sampler.timesteps)
         self.finished: dict[str, dict[int, torch.Tensor]] = {}
         self._live: dict[str, dict[int, torch.Tensor]] = {}
         self._stash: dict[tuple[str, int, int], dict[str, torch.Tensor]] = {}
+        # Optional completion tickets (CUDA Event or Work list) for async act recv.
+        self._stash_ready: dict[tuple[str, int, int], list] = {}
         self._last_meta: tuple[str, int, int] | None = None
         self._timesteps = [torch.tensor(float(t), dtype=torch.float32) for t in sampler.timesteps]
         self._timestep_clean = torch.zeros((), dtype=torch.float32)
@@ -63,15 +67,36 @@ class WanCell(CellAdapter):
         handles: list | None = None,
         meta: tuple[str, int, int] | None = None,
     ) -> None:
-        del handles
         tensors = {k: v for k, v in payload.items() if isinstance(v, torch.Tensor) and k not in ("chunk", "step")}
         key = meta or self._last_meta
         if key is None:
             raise RuntimeError("stash_activation needs meta")
         self._stash[key] = tensors
+        if handles:
+            self._stash_ready[key] = list(handles)
+
+    def _wait_stash_ready(self, key: tuple[str, int, int]) -> None:
+        ready = self._stash_ready.pop(key, None)
+        if not ready:
+            return
+        for handle in ready:
+            if handle is None:
+                continue
+            if isinstance(handle, torch.cuda.Event):
+                if self.device.type == "cuda":
+                    torch.cuda.current_stream(self.device).wait_event(handle)
+                else:
+                    handle.synchronize()
+            else:
+                handle.wait()
 
     def take_stashed_activation(self, req: str, chunk: int, step: int):
-        return self._stash.pop((req, chunk, step), None) or self._stash.pop(("", chunk, step), None)
+        for key in ((req, chunk, step), ("", chunk, step)):
+            tensors = self._stash.pop(key, None)
+            if tensors is not None:
+                self._wait_stash_ready(key)
+                return tensors
+        return None
 
     def _resolve_latent_hidden(
         self, *, req: str, chunk: int, step: int, index: int, n_tasks: int, hidden: Any, live: dict[int, torch.Tensor]

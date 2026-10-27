@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import socket
+import time
 from datetime import timedelta
 
 import pytest
@@ -139,5 +140,97 @@ def test_unused_inbound_kv_finishes_before_page_reuse() -> None:
     torch.multiprocessing.spawn(
         _transfer_worker,
         args=(4, f"tcp://127.0.0.1:{get_open_port()}", "cpu", "discard"),
+        nprocs=2,
+    )
+
+
+def _cpu_gloo_slot_reuse_worker(rank: int, init_method: str) -> None:
+    """Delayed receiver + source reuse: CPU must host-wait Works before freeing the slot.
+
+    Mirrors the review repro: post the send, keep the receiver late, then reuse the
+    source pool slot only after the returned Works complete. Received payload must
+    stay the original 1.0 pattern, not the poisoned 9.0 rewrite.
+    """
+    torch.distributed.init_process_group(
+        backend="gloo", init_method=init_method, rank=rank, world_size=2, timeout=timedelta(seconds=60)
+    )
+    pp_group = GroupCoordinator([[0, 1]], local_rank=rank, torch_distributed_backend="gloo")
+    device = torch.device("cpu")
+    chunk_tokens = 4
+    spec = ARDiffusionNoisyKVSpec(
+        num_layers=2, num_kv_heads=2, head_size=4, block_size=4, max_chunk_tokens=12, max_history_chunks=2
+    )
+    cache = NoisyKVCache(spec, dtype=torch.float32, device=device, layer_groups=1, max_batch_size=1)
+    state = NoisyKVState(cache)
+    state.bind_rank(rank, pp_group)
+    assert not cache.transport.uses_comm_stream
+    plan = build_cell_plan(
+        CellSchedule(
+            chunks=3,
+            num_denoise_steps=1,
+            step_replicas=2,
+            layer_groups=1,
+            ordering=Ordering.LATEST_KV,
+            kv_history_chunks=2,
+        )
+    )
+    state.begin_request("A", plan, chunk_tokens=chunk_tokens)
+    state.set_inflight((Inflight(req="A", t0=0, plan=plan),))
+    transfers = [(slot, xfer) for slot in range(plan.num_slots) for xfer in plan.transfers(slot)]
+    assert len(transfers) == 1
+    slot, xfer = transfers[0]
+    key = ("A", *xfer.version)
+    pool = cache.pool
+    shape = (chunk_tokens, spec.num_kv_heads, spec.head_size)
+    layer = key[3] % spec.num_layers
+    expected = torch.ones(shape, dtype=torch.float32)
+
+    if rank == xfer.dst:
+        # Keep the receiver late so the source posts first (review repro shape).
+        time.sleep(0.05)
+        for li in range(spec.num_layers):
+            pool.k_pools[li].fill_(-1)
+            pool.v_pools[li].fill_(-1)
+
+    if rank == xfer.src:
+        source_slot = pool.alloc(key)
+        start = source_slot * spec.max_chunk_tokens
+        pool.k_pools[layer][start : start + chunk_tokens] = expected
+        pool.v_pools[layer][start : start + chunk_tokens] = expected
+
+    handles = state.exchange(slot)
+    if rank == xfer.src:
+        assert handles, "CPU/Gloo exchange must return send Works for host wait"
+    for handle in handles:
+        handle.wait()
+
+    if rank == xfer.src:
+        # Safe only after host wait: poison and free the same physical slot.
+        pool.k_pools[layer][start : start + chunk_tokens] = 9.0
+        pool.v_pools[layer][start : start + chunk_tokens] = 9.0
+        pool.release(key)
+        reused = pool.alloc(("B", 0, 0, 0))
+        assert reused == source_slot
+        pool.k_pools[layer][
+            reused * spec.max_chunk_tokens : reused * spec.max_chunk_tokens + chunk_tokens
+        ] = 9.0
+    else:
+        assert cache.transport.await_ready(frozenset({key})) == 0
+        received_slot = pool.slot_of(key)
+        start = received_slot * spec.max_chunk_tokens
+        torch.testing.assert_close(pool.k_pools[layer][start : start + chunk_tokens], expected)
+        torch.testing.assert_close(pool.v_pools[layer][start : start + chunk_tokens], expected)
+        assert not torch.any(pool.k_pools[layer][start : start + chunk_tokens] == 9.0)
+
+    torch.distributed.barrier()
+    state.end_request("A")
+    pp_group.destroy()
+    torch.distributed.destroy_process_group()
+
+
+def test_cpu_gloo_delayed_receiver_survives_source_slot_reuse() -> None:
+    torch.multiprocessing.spawn(
+        _cpu_gloo_slot_reuse_worker,
+        args=(f"tcp://127.0.0.1:{get_open_port()}",),
         nprocs=2,
     )

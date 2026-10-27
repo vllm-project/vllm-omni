@@ -69,4 +69,7 @@ def test_local_sidepath_does_not_decode_inside_on_finished():
     video = job.join()
     assert video is not None
     assert decoder.chunks == 2
-    assert video.shape[1] == 3
+    # LingBot-aligned host layout: contiguous uint8 BTHWC.
+    assert video.dtype == torch.uint8
+    assert video.shape[0] == 1 and video.shape[-1] == 3
+    assert video.shape[1] == 4  # two chunks × latent T=2

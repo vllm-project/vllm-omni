@@ -580,10 +580,11 @@ def can_admit(
     *,
     max_batch_size: int,
 ) -> bool:
-    """Admit when every stage-0 rank still has a free microbatch lane."""
+    """Admit when every PP rank still has a free request lane (``R``)."""
     if max_batch_size < 1:
         return False
-    for rank in range(plan.schedule.layer_groups):
+    world = plan.schedule.step_replicas * plan.schedule.layer_groups
+    for rank in range(world):
         if len(rank_work(inflight, slot, rank)) >= max_batch_size:
             return False
     return True

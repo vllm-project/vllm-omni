@@ -73,13 +73,25 @@ out = omni.generate(
             "cell_schedule": "self_forcing",
             "shift": 8.0,
             "reset": True,
+            # Optional: overlap VAE with DiT; still returns one uint8 BTHWC clip.
+            # "stream_decode": True,
         },
     ),
 )
+# `out` pixels are LingBot-aligned uint8 BTHWC `(B,T,H,W,3)`.
 ```
 
 For Latest-KV, load `causvid_wan_latest_kv.yaml` instead (4 GPUs) and keep
 `cell_schedule: "latest_kv"` as in that file.
+
+## Output modes (LingBot-aligned pixels)
+
+| Mode | How | Pixel form |
+| --- | --- | --- |
+| **Offline** | One `Omni.generate` / request-mode cell pipeline | Contiguous **uint8 BTHWC** `(B,T,H,W,3)` (same host layout LingBot muxes) |
+| **Streaming decode** | `extra_args.stream_decode=True` | VAE runs **per chunk** off the DiT critical path; `join()` still returns one uint8 BTHWC clip for the request |
+
+True WS stepwise (one AR block → one streamed chunk like LingBot-World `streaming_output`) is not wired for CausVid yet; use offline / `stream_decode` above. Long rollouts must stay on uint8 (not float BCTHW) so worker→engine SHM packing fits `/dev/shm`.
 
 ## Notes
 

@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+from collections import deque
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any, ClassVar
@@ -226,8 +227,8 @@ def _wait_handles(handles: list[Any] | None) -> None:
 
 
 def kv_comm_stream_enabled() -> bool:
-    """Dedicated CUDA stream + deferred send wait (disabled; default transport only)."""
-    return False
+    """Dedicated CUDA stream + deferred send wait (KV P2P overlaps compute)."""
+    return True
 
 
 def kv_use_tensor_dict() -> bool:
@@ -244,25 +245,53 @@ def _global_rank(pp_group: Any, group_rank: int) -> int:
 
 
 class NoisyKVTransport:
+    # NCCL P2P matching is FIFO per (group, peer) in post order: c10d's
+    # ProcessGroupNCCL::send/recv ignore the ``tag`` argument (NCCL has none),
+    # so a tag cannot isolate KV from activation traffic on the shared
+    # device_group. Correctness relies on ordering discipline instead: every
+    # rank fully waits its activation batch before posting KV ops, and all
+    # ranks derive identical edge/transfer lists per tick.
+
     def __init__(self, pool: VersionPool) -> None:
         self.pool = pool
-        self._pending_recv: dict[VersionKey, tuple[list[Any], dict[str, torch.Tensor] | None, int]] = {}
+        # key -> (works, staging payload, nbytes, recv-event). The event is recorded
+        # on the comm stream after waiting for the batch Work and is the completion
+        # ticket consumers use; ``None`` on the CPU/gloo path (host waits instead).
+        self._pending_recv: dict[VersionKey, tuple[list[Any], dict[str, torch.Tensor] | None, int, Any | None]] = {}
         self._send_handles: list[Any] = []
         self._send_keepalives: list[torch.Tensor] = []
+        # Retire queue for deferred sends: (batch event, works, keepalives, keys).
+        # The event follows the coalesced Work dependency on the auxiliary stream,
+        # so it covers both sends and receives in the batch. Retired in FIFO order —
+        # events on one stream complete in order, so a completed entry retires its
+        # whole prefix. Hot path polls; only drain/end_request host-waits.
+        self._send_retire: deque[tuple[Any, list[Any], list[torch.Tensor], list[VersionKey]]] = deque()
+        self._send_outstanding: dict[VersionKey, Any] = {}
         self._comm_stream: torch.cuda.Stream | None = None
         self.bytes_sent = 0
         self.bytes_received = 0
 
     @property
     def uses_comm_stream(self) -> bool:
-        return kv_comm_stream_enabled() and not kv_use_tensor_dict()
+        # Deferred send retirement needs a real CUDA completion ticket. CPU/Gloo
+        # pools keep the synchronous Work path so the caller host-waits before
+        # slot reuse (otherwise evict can free a live send buffer).
+        return (
+            kv_comm_stream_enabled()
+            and not kv_use_tensor_dict()
+            and self.pool.device.type == "cuda"
+        )
 
     def _ensure_comm_stream(self) -> torch.cuda.Stream | None:
-        if not self.uses_comm_stream or self.pool.device.type != "cuda":
+        if not self.uses_comm_stream:
             return None
         if self._comm_stream is None:
             self._comm_stream = torch.cuda.Stream(device=self.pool.device)
         return self._comm_stream
+
+    def ensure_comm_stream(self) -> torch.cuda.Stream | None:
+        """Public accessor so activation P2P can share the KV NCCL stream."""
+        return self._ensure_comm_stream()
 
     def exchange(
         self,
@@ -272,7 +301,7 @@ class NoisyKVTransport:
         pp_group: Any | None,
         chunk_tokens_by_request: dict[str, int],
     ) -> list[Any]:
-        """Post transfers. Returns send handles, or ``[]`` when deferred to ``wait_sends``."""
+        """Post transfers. Returns send handles, or ``[]`` when deferred to the retire queue."""
         self._send_handles = []
         self._send_keepalives = []
         if pp_group is None or getattr(pp_group, "world_size", 1) <= 1:
@@ -281,15 +310,16 @@ class NoisyKVTransport:
             return self._exchange_tensor_dict(
                 transfers, rank=rank, pp_group=pp_group, chunk_tokens_by_request=chunk_tokens_by_request
             )
-        defer = self.uses_comm_stream
+        # Only defer when a CUDA stream ticket can actually be recorded.
+        stream = self._ensure_comm_stream()
         self._exchange_fixed_nccl(
             transfers,
             rank=rank,
             pp_group=pp_group,
             chunk_tokens_by_request=chunk_tokens_by_request,
-            use_stream=defer,
+            use_stream=stream is not None,
         )
-        if defer:
+        if stream is not None:
             return []
         # Caller owns waiting these handles (cell_executor / tests). Clear so
         # wait_sends/end_request do not wait again — gloo double-wait hangs.
@@ -318,9 +348,9 @@ class NoisyKVTransport:
                 self.pool.alloc(key)
                 payload, recv_handles, _ = pp_group.irecv_tensor_dict(src=xfer.src)
                 nbytes = _payload_bytes(payload)
-                merged = list(self._pending_recv.get(key, ([], None, 0))[0] or [])
+                merged = list(self._pending_recv.get(key, ([], None, 0, None))[0] or [])
                 merged.extend(recv_handles)
-                self._pending_recv[key] = (merged, payload, nbytes)
+                self._pending_recv[key] = (merged, payload, nbytes, None)
                 n_recv += 1
         handles = list(self._send_handles)
         self._send_handles = []
@@ -335,13 +365,21 @@ class NoisyKVTransport:
         chunk_tokens_by_request: dict[str, int],
         use_stream: bool,
     ) -> None:
-        """Fixed-shape K/V P2P via one ``batch_isend_irecv``."""
+        """Post K/V P2P together and bridge real completion to a batch event.
+
+        NCCL runs on an internal stream and can return one Work for the whole
+        batch. Wait those Works on the auxiliary stream before recording its
+        event; recording immediately after submission would not cover NCCL.
+        With default asynchronous NCCL waits this inserts device dependencies,
+        rather than host synchronization. Keep sends and receives together so
+        matching peers can progress without separate send-only launch rounds.
+        """
         stream = self._ensure_comm_stream() if use_stream else None
-        n_send = n_recv = 0
         if stream is not None:
             stream.wait_stream(torch.cuda.current_stream(self.pool.device))
 
         ops: list[dist.P2POp] = []
+        send_keys: list[VersionKey] = []
         send_kept: list[torch.Tensor] = []
         recv_jobs: list[tuple[VersionKey, dict[str, torch.Tensor] | None, int]] = []
 
@@ -361,7 +399,7 @@ class NoisyKVTransport:
                     if tensor.is_cuda:
                         tensor.record_stream(stream or torch.cuda.current_stream(tensor.device))
                     send_kept.append(tensor)
-                n_send += 1
+                send_keys.append(key)
             elif xfer.dst == rank:
                 self.pool.alloc(key)
                 k_view, v_view = self.pool.kv_block_views(key, num_blocks)
@@ -383,24 +421,54 @@ class NoisyKVTransport:
                     if tensor.is_cuda and stream is not None:
                         tensor.record_stream(stream)
                 recv_jobs.append((key, staging, nbytes))
-                n_recv += 1
 
         ctx = torch.cuda.stream(stream) if stream is not None else nullcontext()
         with ctx:
             works = list(dist.batch_isend_irecv(ops)) if ops else []
-        if n_send:
-            self._send_handles.extend(works)
-            self._send_keepalives.extend(send_kept)
-        for key, staging, nbytes in recv_jobs:
-            merged = list(self._pending_recv.get(key, ([], None, 0))[0] or [])
-            if not merged:
-                merged = list(works)
+            batch_event: torch.cuda.Event | None = None
+            if ops and stream is not None:
+                _wait_handles(works)
+                batch_event = torch.cuda.Event()
+                batch_event.record(stream)
+        if send_keys:
+            if batch_event is not None:
+                self._send_retire.append((batch_event, works, send_kept, send_keys))
+                for key in send_keys:
+                    self._send_outstanding[key] = batch_event
             else:
-                merged.extend(works)
-            self._pending_recv[key] = (merged, staging, nbytes)
+                self._send_handles.extend(works)
+                self._send_keepalives.extend(send_kept)
+        for key, staging, nbytes in recv_jobs:
+            merged = list(self._pending_recv.get(key, ([], None, 0, None))[0] or [])
+            merged.extend(works)
+            self._pending_recv[key] = (merged, staging, nbytes, batch_event)
+
+    def poll_sends(self) -> None:
+        """Retire the completed prefix of the send queue. Never blocks the host."""
+        while self._send_retire:
+            event, _works, _kept, keys = self._send_retire[0]
+            if not event.query():
+                break
+            self._send_retire.popleft()  # drops keepalive references
+            for key in keys:
+                self._send_outstanding.pop(key, None)
+
+    def send_retired(self, key: VersionKey) -> bool:
+        """True when no outbound send of ``key`` is still in flight."""
+        return key not in self._send_outstanding
+
+    def force_send_complete(self, key: VersionKey) -> None:
+        """Bounded-deferral fallback: host-sync one overdue send ticket."""
+        event = self._send_outstanding.pop(key, None)
+        if event is not None:
+            event.synchronize()
 
     def wait_sends(self) -> None:
-        """Host-wait deferred outbound KV (comm-stream mode)."""
+        """Hard-wait every outbound send. Drain/end-of-request only; the hot path polls."""
+        for event, _works, _kept, _keys in self._send_retire:
+            event.synchronize()
+        self._send_retire.clear()
+        self._send_outstanding.clear()
         if self._send_handles:
             _wait_handles(self._send_handles)
         self._send_handles = []
@@ -410,20 +478,27 @@ class NoisyKVTransport:
         if not self._pending_recv:
             return 0
         ready = [key for key in self._pending_recv if key in wanted]
+        device = self.pool.device
+        cur = torch.cuda.current_stream(device) if device.type == "cuda" else None
         for key in ready:
-            handles, payload, nbytes = self._pending_recv.pop(key)
-            _wait_handles(handles)
+            handles, payload, nbytes, event = self._pending_recv.pop(key)
+            if event is not None and cur is not None:
+                # Device-visible ordering only: the compute stream waits for the
+                # recv batch that carries ``key``; the host keeps running.
+                cur.wait_event(event)
+            else:
+                _wait_handles(handles)
+                if self._comm_stream is not None and cur is not None:
+                    cur.wait_stream(self._comm_stream)
             self.bytes_received += nbytes
             if payload is not None:
                 self.pool.copy_into(key, payload)
-            if self._comm_stream is not None and self.pool.device.type == "cuda":
-                torch.cuda.current_stream(self.pool.device).wait_stream(self._comm_stream)
         return len(self._pending_recv)
 
     def drain_all(self) -> None:
         self.wait_sends()
         for key in list(self._pending_recv):
-            handles, payload, nbytes = self._pending_recv.pop(key)
+            handles, payload, nbytes, _event = self._pending_recv.pop(key)
             _wait_handles(handles)
             self.bytes_received += nbytes
             if payload is not None:
@@ -433,11 +508,17 @@ class NoisyKVTransport:
 
     def discard(self, key: VersionKey) -> None:
         pending = self._pending_recv.pop(key, None)
-        if pending is not None:
-            handles, payload, nbytes = pending
+        if pending is None:
+            return
+        handles, payload, nbytes, event = pending
+        if event is not None and self.pool.device.type == "cuda":
+            # Order later reuse of the pool slot after the in-flight receive;
+            # the data itself is never read, so the host does not wait.
+            torch.cuda.current_stream(self.pool.device).wait_event(event)
+        else:
             _wait_handles(handles)
-            self.bytes_received += nbytes
-            del payload
+        self.bytes_received += nbytes
+        del payload
 
 
 class NoisyKVCache:
@@ -507,6 +588,11 @@ class NoisyKVCache:
         self.reserved_bytes = self.capacity * bytes_all_layers
 
 
+#: Slots an eviction may be deferred while its send is in flight before the
+#: fallback host-syncs the ticket. Pool capacity has +2 slack, so 2 fits.
+_EVICT_DEFER_LIMIT = 2
+
+
 class NoisyKVState:
     """Per-request bridge used by the chunk executor."""
 
@@ -523,9 +609,13 @@ class NoisyKVState:
         self._pp_group: Any | None = None
         self._write_slots_cache: dict[tuple[int, int], torch.Tensor] = {}
         self._query_start_cache: dict[int, torch.Tensor] = {}
-        self._block_table_dev: torch.Tensor | None = None
-        self._block_table_cpu: torch.Tensor | None = None
-        self._block_table_h2d_event: Any | None = None
+        # key -> slot when eviction was deferred because its send is in flight
+        self._deferred_evict: dict[VersionKey, int] = {}
+        # Ring of (pinned CPU, device, H2D event) block-table buffers: writing
+        # slot i only has to wait for the H2D issued RING slots earlier, which
+        # has long finished in steady state — no per-tick host synchronize.
+        self._bt_ring: list[list[Any]] = []
+        self._bt_ring_idx = 0
         self._seq_lens_dev: torch.Tensor | None = None
         self._prepare_buf_width: int = -1
 
@@ -536,6 +626,10 @@ class NoisyKVState:
     @property
     def uses_comm_stream(self) -> bool:
         return self.cache.transport.uses_comm_stream
+
+    def ensure_comm_stream(self) -> torch.cuda.Stream | None:
+        """Shared CUDA stream for KV and activation P2P (NCCL peer FIFO order)."""
+        return self.cache.transport.ensure_comm_stream()
 
     def bind_rank(self, rank: int, pp_group: Any | None) -> None:
         self._rank = rank
@@ -561,6 +655,7 @@ class NoisyKVState:
         self.cache.transport.wait_sends()
         drop = [key for key in self.cache.pool.keys if key[0] == req]
         for key in drop:
+            self._deferred_evict.pop(key, None)
             self.cache.transport.discard(key)
         for key in drop:
             self.cache.pool.release(key)
@@ -578,47 +673,35 @@ class NoisyKVState:
         self._plans.clear()
         self._chunk_tokens.clear()
         self._last_use_global.clear()
+        self._deferred_evict.clear()
         self._inflight = ()
         self._clear_prepare_caches()
 
     def _clear_prepare_caches(self) -> None:
         self._write_slots_cache.clear()
         self._query_start_cache.clear()
-        self._block_table_dev = None
-        self._block_table_cpu = None
-        self._block_table_h2d_event = None
+        self._bt_ring = []
+        self._bt_ring_idx = 0
         self._seq_lens_dev = None
         self._prepare_buf_width = -1
 
     def _ensure_prepare_bufs(self, width: int, device: torch.device) -> None:
-        if (
-            self._block_table_dev is not None
-            and self._prepare_buf_width == width
-            and self._block_table_dev.device == device
-        ):
+        if self._bt_ring and self._prepare_buf_width == width and self._bt_ring[0][1].device == device:
             return
         pin = device.type == "cuda"
-        self._block_table_cpu = torch.zeros(1, width, dtype=torch.int32, pin_memory=pin)
-        self._block_table_dev = torch.zeros(1, width, dtype=torch.int32, device=device)
+        self._bt_ring = [
+            [
+                torch.zeros(1, width, dtype=torch.int32, pin_memory=pin),
+                torch.zeros(1, width, dtype=torch.int32, device=device),
+                torch.cuda.Event() if pin else None,
+            ]
+            for _ in range(2)
+        ]
+        self._bt_ring_idx = 0
         self._seq_lens_dev = torch.zeros(1, dtype=torch.int32, device=device)
         self._prepare_buf_width = width
-        self._block_table_h2d_event = None
         self._write_slots_cache.clear()
         self._query_start_cache.clear()
-
-    def _wait_block_table_h2d(self) -> None:
-        """Keep pinned ``_block_table_cpu`` live until the prior async H2D finishes."""
-        event = self._block_table_h2d_event
-        if event is not None:
-            event.synchronize()
-
-    def _record_block_table_h2d(self, device: torch.device) -> None:
-        if device.type != "cuda":
-            self._block_table_h2d_event = None
-            return
-        if self._block_table_h2d_event is None:
-            self._block_table_h2d_event = torch.cuda.Event()
-        self._block_table_h2d_event.record()
 
     def _cached_query_start(self, chunk_tokens: int, device: torch.device) -> torch.Tensor:
         hit = self._query_start_cache.get(chunk_tokens)
@@ -651,8 +734,7 @@ class NoisyKVState:
         batch: list[list[NoisyLayerContext]] = []
         device = pool.k_pools[0].device
         self._ensure_prepare_bufs(width, device)
-        assert self._block_table_cpu is not None and self._block_table_dev is not None
-        assert self._seq_lens_dev is not None
+        assert self._bt_ring and self._seq_lens_dev is not None
         share_bufs = len(tasks) <= 1
         for req, task in tasks:
             chunk_tokens = self._chunk_tokens[req]
@@ -671,18 +753,22 @@ class NoisyKVState:
             blocks.extend(write_blocks)
             if len(blocks) > width:
                 raise RuntimeError(f"block_table width {width} too small for {len(blocks)} blocks")
-            # Do not overwrite pinned CPU source while a prior non_blocking H2D is in flight.
-            self._wait_block_table_h2d()
-            self._block_table_cpu[0, : len(blocks)] = torch.as_tensor(blocks, dtype=torch.int32)
+            cpu_buf, dev_buf, h2d_event = self._bt_ring[self._bt_ring_idx]
+            if h2d_event is not None and not h2d_event.query():
+                # Ring wrapped before the prior async H2D drained; only then block.
+                h2d_event.synchronize()
+            cpu_buf[0, : len(blocks)] = torch.as_tensor(blocks, dtype=torch.int32)
             if len(blocks) < width:
-                self._block_table_cpu[0, len(blocks) :].zero_()
+                cpu_buf[0, len(blocks) :].zero_()
             seq_len = (len(srcs) + 1) * chunk_tokens
-            self._block_table_dev.copy_(self._block_table_cpu, non_blocking=device.type == "cuda")
-            self._record_block_table_h2d(device)
+            dev_buf.copy_(cpu_buf, non_blocking=device.type == "cuda")
+            if h2d_event is not None:
+                h2d_event.record()
             self._seq_lens_dev.fill_(seq_len)
             query_start_loc = self._cached_query_start(chunk_tokens, device)
-            block_table = self._block_table_dev if share_bufs else self._block_table_dev.clone()
+            block_table = dev_buf if share_bufs else dev_buf.clone()
             seq_lens = self._seq_lens_dev if share_bufs else self._seq_lens_dev.clone()
+            self._bt_ring_idx = (self._bt_ring_idx + 1) % len(self._bt_ring)
             video_slots = self._cached_write_slots(write_slot, chunk_tokens, device)
             local_layer = pool.local_layer(write_key)
             batch.append(
@@ -709,10 +795,10 @@ class NoisyKVState:
         del tasks
 
     def exchange(self, slot: int) -> list[Any]:
-        transfers = union_transfers(self._inflight, slot)
+        transfers = list(union_transfers(self._inflight, slot))
         self.transfers_deduped = len(transfers)
         handles = self.cache.transport.exchange(
-            transfers, rank=self._rank, pp_group=self._pp_group, chunk_tokens_by_request=self._chunk_tokens
+            tuple(transfers), rank=self._rank, pp_group=self._pp_group, chunk_tokens_by_request=self._chunk_tokens
         )
         self.bytes_sent = self.cache.transport.bytes_sent
         self.bytes_received = self.cache.transport.bytes_received
@@ -720,16 +806,33 @@ class NoisyKVState:
 
     def evict(self, slot: int) -> None:
         if self.uses_comm_stream:
-            self.cache.transport.wait_sends()
+            self.cache.transport.poll_sends()
         drop: list[VersionKey] = []
         for req, used in self._last_use_global.items():
             for version, last in used.items():
                 if last == slot:
                     drop.append(_version_key(req, version))
         for key in drop:
-            self.cache.transport.discard(key)
-            self.cache.pool.release(key)
+            if self.uses_comm_stream and not self.cache.transport.send_retired(key):
+                # Outbound send still in flight: keep the slot pinned (keepalives
+                # stay referenced) and retry next tick instead of host-waiting.
+                self._deferred_evict.setdefault(key, slot)
+                continue
+            self._finish_evict(key)
+        for key, since in list(self._deferred_evict.items()):
+            if self.cache.transport.send_retired(key):
+                self._finish_evict(key)
+            elif slot - since >= _EVICT_DEFER_LIMIT:
+                # Bounded deferral: a stuck peer degrades to one host sync here,
+                # never to an unbounded pool leak.
+                self.cache.transport.force_send_complete(key)
+                self._finish_evict(key)
         self.cache.resident_peak = max(self.cache.resident_peak, self.resident_versions)
+
+    def _finish_evict(self, key: VersionKey) -> None:
+        self._deferred_evict.pop(key, None)
+        self.cache.transport.discard(key)
+        self.cache.pool.release(key)
 
     def await_ready(self, slot: int) -> int:
         wanted = {_version_key(req, version) for req, version in union_wait_ready(self._inflight, slot, self._rank)}
@@ -755,4 +858,6 @@ class NoisyKVState:
 
     def drain(self) -> None:
         self.cache.transport.drain_all()
+        for key in list(self._deferred_evict):
+            self._finish_evict(key)
         self.bytes_received = self.cache.transport.bytes_received

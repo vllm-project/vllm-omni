@@ -40,7 +40,7 @@ Noisy KV is the same-request multi-chunk path on Omni's existing **layer PP**.
 | `has_clean` | derived | Clean@0 at step `D` — Self-Forcing / Latest-KV always, Same-Step never (ordering property, independent of `H`) |
 | Cell `(c,s,b)` | — | Schedule task + KV version (+ `req` when batched) |
 | Tick | — | One cell on one rank (one block forward) |
-| `R` | `max_batch_size` | Max micro-batch requests per rank per tick |
+| `R` | `max_batch_size` | Max concurrent request lanes per rank per tick (`R=1` for CausVid today) |
 
 ### What is a cell?
 
@@ -167,13 +167,18 @@ Implemented in `experimental/ar_diffusion/cell_executor.py`.
 
 Per tick on each rank:
 
-1. Wait transfers required by this cell's `sources` (same `b`).
-2. Forward one block via `CellAdapter`; **publish KV immediately**.
-3. Post planned KV `isend` (do not wait for remote recv).
-4. Wait posted handles; `evict` versions past last-use once sends complete.
+1. Wait transfers required by this cell's `sources` (same `b`) — device
+   `wait_event` on the KV completion ticket when the comm stream is on.
+2. Forward one block via `CellAdapter` (activation stash take waits its recv
+   ticket); **publish KV immediately**.
+3. Post activation then KV P2P on the **shared** CUDA comm stream (preserves
+   NCCL peer FIFO); record one completion Event per batch; host does not wait.
+4. Poll send retire / `evict` versions past last-use once their send ticket
+   completes.
 
-Received versions are readable only on a later tick. Same-tick producer /
-consumer of the same version is forbidden.
+Received versions (and activations) are readable only on a later tick after
+the consumer stream waits the ticket. Same-tick producer / consumer of the
+same version is forbidden.
 
 `run_cell_pipeline()` owns admit / drop / fail-closed cleanup so a mid-request
 exception does not leak `VersionPool` slots. Rank topology is described by
@@ -199,7 +204,7 @@ remote source. Mitigations: post-on-produce, dedupe `(version, dst)`, larger `G`
 | --- | --- | --- |
 | `parallel_config` | `pipeline_parallel_size` | `S·G` |
 | `ar_diffusion_stage_config` | `step_replicas` | `S` |
-| | `max_batch_size` | `R` |
+| | `max_batch_size` | `R` (concurrent request lanes; CausVid ships `R=1`) |
 | | `max_history_chunks` | Cap for `H` |
 | Request `extra_args` | `cell_schedule` | `self_forcing` \| `latest_kv` \| `same_step` (schedule primitive; CausVidWan rejects `same_step`) |
 | | `num_chunks`, `num_denoise_steps`, `kv_history_chunks` | `N`, `D`, `H` (`has_clean` is derived and rejected as a key) |
@@ -251,9 +256,9 @@ GPU (record config): `S=1` Self-Forcing; `S=D` Same-Step; `S=D+1` Latest-KV
 
 - Paged session vs NoisyKV still separate prealloc; no TP × Noisy KV yet.
 - Noisy KV not wired to session.
-- Micro-batch packing (`R`): varlen vs pad.
-- Cell schedule with `K>1` multiplies ticks; activation inbox is keyed by
-  `(chunk, step)` (R=1 friendly).
+- Micro-batch packing (`R>1` Stream-Batch): pad-only / homogeneous shapes; tracked separately.
+- Cell schedule with `K>1` multiplies ticks; mixed boundary schemas in one
+  microbatch are rejected.
 
 ## Related
 

@@ -4,6 +4,9 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -12,6 +15,7 @@ from vllm_omni.experimental.ar_diffusion.cell_schedule import (
     CellSchedule,
     Inflight,
     Ordering,
+    RequestKVTransfer,
     build_cell_plan,
     union_wait_ready,
 )
@@ -19,6 +23,7 @@ from vllm_omni.experimental.ar_diffusion.kv_cache.noisy import (
     ARDiffusionNoisyKVSpec,
     NoisyKVCache,
     NoisyKVState,
+    NoisyKVTransport,
 )
 from vllm_omni.experimental.ar_diffusion.kv_cache.paged import compute_slot_mapping
 from vllm_omni.experimental.ar_diffusion.kv_cache.paged_attention import paged_write_attn
@@ -45,9 +50,122 @@ def _cache(**kwargs) -> NoisyKVCache:
     )
 
 
+@pytest.mark.parametrize("direction", ["send", "recv", "mixed"])
+def test_nccl_completion_ticket_waits_for_coalesced_work(monkeypatch, direction):
+    """A ticket must cover NCCL completion, not just auxiliary-stream progress."""
+    compute_stream = SimpleNamespace(wait_event=lambda event: consumer_waits.append(event))
+    comm_stream = SimpleNamespace(dependencies=[], wait_stream=lambda stream: None)
+    active_stream = [compute_stream]
+    consumer_waits = []
+    submitted_batches = []
+
+    class Work:
+        completed = False
+        wait_count = 0
+
+        def wait(self):
+            assert active_stream[0] is comm_stream
+            comm_stream.dependencies.append(self)
+            self.wait_count += 1
+
+    work = Work()
+
+    class Event:
+        def record(self, stream):
+            self.dependencies = tuple(stream.dependencies)
+
+        def query(self):
+            return all(dependency.completed for dependency in self.dependencies)
+
+    @contextmanager
+    def stream_context(stream):
+        previous = active_stream[0]
+        active_stream[0] = stream
+        try:
+            yield
+        finally:
+            active_stream[0] = previous
+
+    def submit(ops):
+        assert active_stream[0] is comm_stream
+        submitted_batches.append(ops)
+        return [work]  # NCCL can return one Work for multiple P2P ops.
+
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda device: active_stream[0])
+    monkeypatch.setattr(torch.cuda, "stream", stream_context)
+    monkeypatch.setattr(torch.cuda, "Event", Event)
+    monkeypatch.setattr(torch.distributed, "batch_isend_irecv", submit)
+    monkeypatch.setattr(torch.distributed, "P2POp", lambda op, tensor, peer, group: (op, peer))
+    cache = _cache()
+    cache.pool.device = SimpleNamespace(type="cuda")
+    transport = NoisyKVTransport(cache.pool)
+    monkeypatch.setattr(transport, "_ensure_comm_stream", lambda: comm_stream)
+    send = RequestKVTransfer(req="A", version=(0, 1, 0), src=1, dst=0)
+    recv = RequestKVTransfer(req="A", version=(1, 2, 1), src=2, dst=1)
+    transfers = (send, recv) if direction == "mixed" else (send,) if direction == "send" else (recv,)
+    send_key = ("A", *send.version)
+    recv_key = ("A", *recv.version)
+    if direction != "recv":
+        cache.pool.alloc(send_key)
+    transport.exchange(
+        transfers,
+        rank=1,
+        pp_group=SimpleNamespace(world_size=3, ranks=(0, 1, 2), cpu_group=object()),
+        chunk_tokens_by_request={"A": 4},
+    )
+    assert len(submitted_batches) == 1
+    assert len(submitted_batches[0]) == 2 * len(transfers)
+    assert work.wait_count == 1
+    if direction != "recv":
+        transport.poll_sends()
+        assert not transport.send_retired(send_key)
+        assert len(transport._send_retire) == 1
+    if direction != "send":
+        event = transport._pending_recv[recv_key][3]
+        assert not event.query()
+        transport.await_ready(frozenset({recv_key}))
+        assert consumer_waits == [event]
+    work.completed = True
+    if direction != "recv":
+        transport.poll_sends()
+        assert transport.send_retired(send_key)
+        assert not transport._send_retire
+    if direction != "send":
+        assert consumer_waits[0].query()
+
+
+def test_cpu_transport_does_not_defer_send_retirement(monkeypatch):
+    """CPU/Gloo has no CUDA ticket; exchange must return Works for host wait."""
+    cache = _cache()
+    transport = NoisyKVTransport(cache.pool)
+    assert cache.pool.device.type == "cpu"
+    assert not transport.uses_comm_stream
+    send = RequestKVTransfer(req="A", version=(0, 0, 0), src=0, dst=1)
+    key = ("A", *send.version)
+    cache.pool.alloc(key)
+    posted = []
+
+    def submit(ops):
+        posted.extend(ops)
+        return [SimpleNamespace(wait=lambda: None)]
+
+    monkeypatch.setattr(torch.distributed, "batch_isend_irecv", submit)
+    monkeypatch.setattr(torch.distributed, "P2POp", lambda op, tensor, peer, group: (op, peer))
+    handles = transport.exchange(
+        (send,),
+        rank=0,
+        pp_group=SimpleNamespace(world_size=2, ranks=(0, 1), cpu_group=object()),
+        chunk_tokens_by_request={"A": 4},
+    )
+    assert posted
+    assert handles, "CPU exchange must return send Works so the caller host-waits before slot reuse"
+    assert transport.send_retired(key)
+    assert not transport._send_retire
+
+
 def test_capacity_uses_k1():
     cache = _cache(layer_groups=2, max_batch_size=2)
-    # R * (H + 2 + G) = 2 * (6 + 2 + 2) = 20
+    # R * (H + 2 + G) = 2 * (6 + 2 + 2) = 20.
     assert cache.capacity == 20
 
 
@@ -60,7 +178,7 @@ def test_capacity_covers_latest_stage_frontier():
 def test_capacity_rejects_undersized_memory_budget():
     cache = _cache(layer_groups=2, max_batch_size=2)
     bytes_per_slot = cache.bytes_per_version * cache.spec.num_layers
-    with pytest.raises(RuntimeError, match="budget fits 1 versions.*requires 20"):
+    with pytest.raises(RuntimeError, match=r"budget fits 1 versions.*requires 20"):
         NoisyKVCache(
             cache.spec,
             dtype=torch.float32,

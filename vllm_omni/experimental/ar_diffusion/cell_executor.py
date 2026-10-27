@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+from collections import deque
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -36,22 +37,85 @@ def _pp_global_rank(pp_group: Any, group_rank: int) -> int:
     return int(pp_group.ranks[group_rank])
 
 
+def _consumer_stash_meta_one(
+    req: str,
+    cell: Cell,
+    *,
+    topology: CellTopology,
+    src: int,
+) -> tuple[str, int, int]:
+    """Stash key for one task: consumer ``(req, chunk, step)``.
+
+    Across step replicas the consumer step is ``producer_step + 1`` when leaving
+    a layer-group; same-step mid-group boundaries keep the step. ``req`` is
+    required when ``R>1`` so concurrent streams do not collide.
+    """
+    chunk, step, _block = cell
+    if topology.is_layer_group_last(src):
+        step = int(step) + 1
+    return (str(req), int(chunk), int(step))
+
+
+def _consumer_stash_metas(
+    src_tasks: tuple[tuple[str, Cell], ...],
+    *,
+    topology: CellTopology,
+    src: int,
+) -> list[tuple[str, int, int]]:
+    return [_consumer_stash_meta_one(req, cell, topology=topology, src=src) for req, cell in src_tasks]
+
+
 def _consumer_stash_meta(
     src_tasks: tuple[tuple[str, Cell], ...],
     *,
     topology: CellTopology,
     src: int,
 ) -> tuple[str, int, int]:
-    """Stash under the consumer's ``(chunk, step)`` (what ``take_stashed_activation`` looks up).
+    """Backward-compatible single-meta helper (first task)."""
+    metas = _consumer_stash_metas(src_tasks, topology=topology, src=src)
+    if not metas:
+        raise ValueError("src_tasks must be non-empty")
+    return metas[0]
 
-    Producer schedule meta alone is wrong across step replicas: consumer step is
-    ``producer_step + 1``. Same-step layer-group boundaries keep the step.
-    """
-    _req, cell = src_tasks[0]
-    chunk, step, _block = cell
-    if topology.is_layer_group_last(src):
-        step = int(step) + 1
-    return ("", int(chunk), int(step))
+
+def _stash_activation_batch(
+    adapter: CellAdapter,
+    payload: dict[str, Any],
+    metas: list[tuple[str, int, int]],
+    *,
+    handles: list[Any] | None = None,
+) -> None:
+    """Split a micro-batch activation dict into per-request stash entries."""
+    if not metas:
+        return
+    tensors = {k: v for k, v in payload.items() if isinstance(v, torch.Tensor)}
+    if not tensors:
+        return
+    n = len(metas)
+    for i, meta in enumerate(metas):
+        if n == 1:
+            sliced = {k: v for k, v in tensors.items()}
+        else:
+            sliced = {}
+            for key, tensor in tensors.items():
+                if tensor.shape[0] != n:
+                    raise RuntimeError(
+                        f"activation {key} batch {tensor.shape[0]} != microbatch {n} (R>1 pad required)"
+                    )
+                sliced[key] = tensor[i : i + 1]
+        adapter.stash_activation(sliced, handles=handles, meta=meta)
+
+
+def _stash_local_hidden(
+    adapter: CellAdapter,
+    tasks: tuple[tuple[str, Cell], ...],
+    output: Any,
+) -> None:
+    """Keep mid-group activations on-rank for the next block (no P2P)."""
+    if output is None or not tasks:
+        return
+    metas = [(req, int(cell[0]), int(cell[1])) for req, cell in tasks]
+    _stash_activation_batch(adapter, adapter.pack_activation(output), metas)
 
 
 def _activation_edges(
@@ -102,11 +166,21 @@ def _post_activations_ws(
     adapter: CellAdapter,
     topology: CellTopology,
     device: torch.device,
-) -> None:
-    """Fixed-shape activation P2P: one ``batch_isend_irecv``, wait before return."""
+    comm_stream: torch.cuda.Stream | None = None,
+) -> tuple[Any, list[torch.Tensor]] | None:
+    """Fixed-shape activation P2P on one ``batch_isend_irecv``.
+
+    With ``comm_stream`` (shared with KV), posts on that stream, waits Works
+    there, records a completion Event, and stashes recv buffers with the Event
+    as the consume-time ticket — host does not block. Returns ``(event,
+    send_keepalives)`` for the producer to poll-retire; ``None`` when sync or
+    there were no sends.
+    """
     ops: list[dist.P2POp] = []
-    recv_jobs: list[tuple[dict[str, torch.Tensor], tuple[str, int, int]]] = []
+    recv_jobs: list[tuple[dict[str, torch.Tensor], list[tuple[str, int, int]]]] = []
+    send_kept: list[torch.Tensor] = []
     group = pp_group.device_group
+    use_stream = comm_stream is not None and device.type == "cuda"
 
     for src, dst, src_tasks in edges:
         batch = max(1, len(src_tasks))
@@ -122,18 +196,43 @@ def _post_activations_ws(
                 tensor = packed[key]
                 if not tensor.is_contiguous():
                     tensor = tensor.contiguous()
+                if tensor.shape[0] != batch:
+                    raise RuntimeError(
+                        f"activation send {key} batch {tensor.shape[0]} != edge microbatch {batch}"
+                    )
                 ops.append(dist.P2POp(dist.isend, tensor, peer, group))
+                if tensor.is_cuda:
+                    tensor.record_stream(comm_stream or torch.cuda.current_stream(device))
+                send_kept.append(tensor)
         elif rank == dst:
             peer = _pp_global_rank(pp_group, src)
             payload = {key: torch.empty(shape, dtype=dtype, device=device) for key, shape, dtype in spec_list}
             for key, _shape, _dtype in spec_list:
-                ops.append(dist.P2POp(dist.irecv, payload[key], peer, group))
-            recv_jobs.append((payload, _consumer_stash_meta(src_tasks, topology=topology, src=src)))
+                tensor = payload[key]
+                ops.append(dist.P2POp(dist.irecv, tensor, peer, group))
+                if tensor.is_cuda and use_stream:
+                    tensor.record_stream(comm_stream)
+            recv_jobs.append((payload, _consumer_stash_metas(src_tasks, topology=topology, src=src)))
 
-    if ops:
-        _wait(list(dist.batch_isend_irecv(ops)))
-    for payload, meta in recv_jobs:
-        adapter.stash_activation(payload, meta=meta)
+    if not ops:
+        return None
+
+    if use_stream:
+        assert comm_stream is not None
+        comm_stream.wait_stream(torch.cuda.current_stream(device))
+        with torch.cuda.stream(comm_stream):
+            works = list(dist.batch_isend_irecv(ops))
+            _wait(works)
+            event = torch.cuda.Event()
+            event.record(comm_stream)
+        for payload, metas in recv_jobs:
+            _stash_activation_batch(adapter, payload, metas, handles=[event])
+        return (event, send_kept) if send_kept else None
+
+    _wait(list(dist.batch_isend_irecv(ops)))
+    for payload, metas in recv_jobs:
+        _stash_activation_batch(adapter, payload, metas)
+    return None
 
 
 def resolve_pp_rank_and_group() -> tuple[int, Any | None]:
@@ -218,6 +317,7 @@ class ARDiffusionCellContext:
         self.kv.set_inflight(tuple(self.inflight))
 
     def admit_pending(self, slot: int) -> None:
+        """Admit as many pending requests as ``max_batch_size`` lanes allow."""
         still: list[PendingAdmit] = []
         for item in self.pending:
             if still:
@@ -261,7 +361,11 @@ class CellAdapter:
         handles: list[Any] | None = None,
         meta: tuple[str, int, int] | None = None,
     ) -> None:
-        """Buffer peer activation until the matching cell runs (recv already waited)."""
+        """Buffer peer activation until the matching cell runs.
+
+        ``handles`` may hold a CUDA Event completion ticket (async path) or
+        Work objects; ``take_stashed_activation`` waits them before use.
+        """
         del payload, handles, meta
 
     def take_stashed_activation(self, req: str, chunk: int, step: int) -> Any | None:
@@ -291,6 +395,21 @@ def _tasks_need_activation_send(
     return any(is_group_boundary(cell, schedule) for _req, cell in tasks)
 
 
+def _poll_act_send_retire(retire: deque[tuple[Any, list[torch.Tensor]]]) -> None:
+    """Drop keepalive refs for activation sends whose ticket has completed."""
+    while retire:
+        event, _kept = retire[0]
+        if not event.query():
+            break
+        retire.popleft()
+
+
+def _drain_act_send_retire(retire: deque[tuple[Any, list[torch.Tensor]]]) -> None:
+    for event, _kept in retire:
+        event.synchronize()
+    retire.clear()
+
+
 def run_cell_pipeline(
     *,
     ctx: ARDiffusionCellContext,
@@ -299,8 +418,9 @@ def run_cell_pipeline(
 ) -> None:
     """Run inflight plans on this rank (one cell per tick).
 
-    Per tick: prepare → forward → publish → post act/KV → wait outbound.
-    Mid-group cells keep ``hidden`` locally; group-boundary cells P2P.
+    Per tick: prepare → forward → publish → post act/KV (async tickets when
+    comm stream is on) → poll outbound. Mid-group cells keep ``hidden``
+    locally; group-boundary cells P2P.
     """
     spec = ctx.spec
     kv = ctx.kv
@@ -316,7 +436,7 @@ def run_cell_pipeline(
     )
     slot = 0
     limit = max_slots if max_slots is not None else 10**9
-    pending_hidden: Any | None = None
+    act_send_retire: deque[tuple[Any, list[torch.Tensor]]] = deque()
     try:
         kv_stream = kv.uses_comm_stream
         prev_slot_for_evict: int | None = None
@@ -347,16 +467,16 @@ def run_cell_pipeline(
                 # Consume-time wait: covers prefetch that landed many ticks earlier.
                 kv.await_task_sources(tasks)
                 contexts = kv.prepare(tasks)
-                output = adapter.forward(tasks, contexts, hidden=pending_hidden)
+                # Activation comes from per-req stash (local mid-group or P2P).
+                output = adapter.forward(tasks, contexts, hidden=None)
                 kv.publish(tasks)
                 if schedule is not None and not _tasks_need_activation_send(tasks, schedule):
-                    pending_hidden = output
-                else:
-                    pending_hidden = None
+                    _stash_local_hidden(adapter, tasks, output)
             if kv_stream and prev_slot_for_evict is not None:
-                kv.wait_sends()
+                # Poll-based retire inside evict; the hot path never host-waits sends.
                 kv.evict(prev_slot_for_evict)
                 prev_slot_for_evict = None
+            _poll_act_send_retire(act_send_retire)
             comm_handles: list[Any] = []
             if pp is not None and spec.topology.world > 1 and schedule is not None:
                 edges = _activation_edges(
@@ -373,12 +493,15 @@ def run_cell_pipeline(
                         elif spec.rank == dst:
                             recv, recv_handles, _ = pp.irecv_tensor_dict(src=src)
                             comm_handles.extend(recv_handles)
-                            adapter.stash_activation(
+                            _stash_activation_batch(
+                                adapter,
                                 recv,
-                                meta=_consumer_stash_meta(src_tasks, topology=spec.topology, src=src),
+                                _consumer_stash_metas(src_tasks, topology=spec.topology, src=src),
                             )
                 elif edges:
-                    _post_activations_ws(
+                    # Share KV's comm stream so act+KV keep NCCL peer FIFO order.
+                    comm_stream = kv.ensure_comm_stream() if kv_stream else None
+                    retire = _post_activations_ws(
                         pp,
                         edges,
                         rank=spec.rank,
@@ -386,11 +509,14 @@ def run_cell_pipeline(
                         adapter=adapter,
                         topology=spec.topology,
                         device=act_device,
+                        comm_stream=comm_stream,
                     )
+                    if retire is not None:
+                        act_send_retire.append(retire)
             kv_handles = kv.exchange(slot)
             if not kv_stream:
                 comm_handles.extend(kv_handles)
-            # Outbound KV (+ legacy act). Fixed-shape act already waited in _post_activations_ws.
+            # Legacy act / sync KV only. Async act+KV use device tickets.
             _wait(comm_handles)
             still = []
             for item in ctx.inflight:
@@ -409,10 +535,11 @@ def run_cell_pipeline(
                 kv.evict(slot)
             slot += 1
         if kv_stream and prev_slot_for_evict is not None:
-            kv.wait_sends()
             kv.evict(prev_slot_for_evict)
+        _drain_act_send_retire(act_send_retire)
         kv.drain()
     except Exception:
+        _drain_act_send_retire(act_send_retire)
         for req in {item.req for item in ctx.inflight} | {item.req for item in ctx.pending}:
             ctx.drop(req)
         raise

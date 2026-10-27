@@ -13,6 +13,7 @@ from vllm_omni.experimental.ar_diffusion.cell_executor import (
     CellRunSpec,
     CellTopology,
     _consumer_stash_meta,
+    _consumer_stash_metas,
     run_cell_pipeline,
 )
 from vllm_omni.experimental.ar_diffusion.cell_schedule import CellSchedule, Ordering, build_cell_plan
@@ -46,12 +47,12 @@ def test_consumer_stash_meta_cross_stage_vs_same_stage():
     topo = CellTopology(step_replicas=2, layer_groups=2)
     src_tasks = (("r", (3, 0, 1)),)  # chunk=3, step=0, last block of group
     # Mid-stage: rank 0 → 1, keep step.
-    assert _consumer_stash_meta(src_tasks, topology=topo, src=0) == ("", 3, 0)
+    assert _consumer_stash_meta(src_tasks, topology=topo, src=0) == ("r", 3, 0)
     # Cross stage: rank 1 (stage-last) → 2, consumer runs step+1.
-    assert _consumer_stash_meta(src_tasks, topology=topo, src=1) == ("", 3, 1)
+    assert _consumer_stash_meta(src_tasks, topology=topo, src=1) == ("r", 3, 1)
     # S=1 wrap last→0 also stage-last → next denoise step.
     topo_s1 = CellTopology(step_replicas=1, layer_groups=3)
-    assert _consumer_stash_meta(src_tasks, topology=topo_s1, src=2) == ("", 3, 1)
+    assert _consumer_stash_meta(src_tasks, topology=topo_s1, src=2) == ("r", 3, 1)
 
 
 def test_executor_runs_all_slots_r1():
@@ -162,6 +163,12 @@ def test_continuous_batch_two_requests_same_tokens():
     assert reqs_seen == {"A", "B"}
     assert not ctx.inflight
     assert not ctx.pending
+
+
+def test_consumer_stash_metas_keeps_per_request_keys():
+    topo = CellTopology(step_replicas=2, layer_groups=1)
+    src_tasks = (("A", (0, 0, 0)), ("B", (1, 0, 0)))
+    assert _consumer_stash_metas(src_tasks, topology=topo, src=0) == [("A", 0, 1), ("B", 1, 1)]
 
 
 def test_executor_releases_versions_when_forward_raises():

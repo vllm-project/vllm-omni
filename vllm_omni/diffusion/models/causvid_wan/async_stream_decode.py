@@ -18,6 +18,7 @@ from typing import Any
 import torch
 import torch.distributed as dist
 
+from vllm_omni.diffusion.models.causvid_wan.pixels import float_bcthw_to_uint8_bthwc
 from vllm_omni.experimental.ar_diffusion.streaming_decode import WanStreamingDecoder
 
 
@@ -78,8 +79,8 @@ def start_async_stream_decode(
     * Producer ``on_finished``: async D2H + queue; a send thread waits the copy
       then ``isend`` (or local queue for S=1 single-rank layer PP, G=1).
     * Consumer thread: ``irecv``/queue → rescale → ``decode_chunk``.
-    * ``join()`` waits side threads and returns concatenated pixels on owner,
-      else ``None``.
+    * ``join()`` waits side threads and returns concatenated **uint8 BTHWC**
+      pixels on the owner (LingBot host layout), else ``None``.
     """
     if source_rank is None:
         return _start_local(vae=vae, decoder=decoder, session_id=session_id)
@@ -140,7 +141,9 @@ def start_async_stream_decode(
                 for buf, work in zip(buffers, recv_works):
                     work.wait()
                     scaled = _rescale_latents(vae, buf)
-                    pixels_out.append(decoder.decode_chunk(scaled, state).clamp(-1, 1))
+                    # uint8 BTHWC per chunk (LingBot host layout) — avoid float join.
+                    frame = decoder.decode_chunk(scaled, state).clamp(-1, 1)
+                    pixels_out.append(float_bcthw_to_uint8_bthwc(frame))
             except BaseException as exc:  # noqa: BLE001
                 error.append(exc)
                 decoder.release(state)
@@ -156,7 +159,7 @@ def start_async_stream_decode(
                 raise error[0]
             if not pixels_out:
                 return None
-            return torch.cat(pixels_out, dim=2)
+            return torch.cat(pixels_out, dim=1)
 
         return AsyncStreamDecodeJob(on_finished=None, join=join, _send_works=send_works)
 
@@ -195,7 +198,8 @@ def _start_local(
                 if event is not None:
                     event.synchronize()
                 scaled = _rescale_latents(vae, host)
-                pixels_out.append(decoder.decode_chunk(scaled, state).clamp(-1, 1))
+                frame = decoder.decode_chunk(scaled, state).clamp(-1, 1)
+                pixels_out.append(float_bcthw_to_uint8_bthwc(frame))
         except BaseException as exc:  # noqa: BLE001
             error.append(exc)
             decoder.release(state)
@@ -216,6 +220,6 @@ def _start_local(
             raise error[0]
         if not pixels_out:
             return None
-        return torch.cat(pixels_out, dim=2)
+        return torch.cat(pixels_out, dim=1)
 
     return AsyncStreamDecodeJob(on_finished=on_finished, join=join)
