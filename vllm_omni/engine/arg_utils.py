@@ -840,6 +840,7 @@ class OrchestratorArgs:
     default_sampling_params: str | None = None
     max_generated_image_size: int | None = None
     tts_max_instructions_length: int | None = None
+    tts_streaming_idle_timeout: int | None = None
     enable_diffusion_pipeline_profiler: bool = False
     enable_ar_profiler: bool = False
     enable_mixfusion: bool = False

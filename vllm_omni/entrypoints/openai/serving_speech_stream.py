@@ -220,7 +220,9 @@ class OmniStreamingSpeechHandler:
                     if config is None:
                         await self._send_error(websocket, "Timeout waiting for session.config")
                     else:
-                        await self._send_error(websocket, "Idle timeout: no message received")
+                        await self._send_error(
+                            websocket, f"Idle timeout: no message received for the last {self._idle_timeout} seconds"
+                        )
                     return
 
                 msg = await self._parse_message(websocket, raw)
