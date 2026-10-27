@@ -24,11 +24,11 @@ from tests.e2e.accuracy.helpers import (
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniServerParams
 from vllm_omni.platforms import current_omni_platform
+from vllm_omni.transformers_utils.repo_utils import hf_api
 
 pytestmark = [pytest.mark.diffusion, pytest.mark.full_model]
 
 MODEL_NAME = "hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_i2v"
-IMAGE_URL = "https://huggingface.co/datasets/YiYiXu/testing-images/resolve/main/wan_i2v_input.JPG"
 PROMPT = (
     "Summer beach vacation style, a white cat wearing sunglasses sits on a surfboard. "
     "The fluffy-furred feline gazes directly at the camera with a relaxed expression. "
@@ -98,7 +98,11 @@ def _resolve_image_source(configured: str | None) -> str:
         if candidate.exists():
             return str(candidate.resolve())
         return configured
-    return IMAGE_URL
+    return hf_api().hf_hub_download(
+        repo_id="YiYiXu/testing-images",
+        filename="wan_i2v_input.JPG",
+        repo_type="dataset",
+    )
 
 
 def _artifact_paths(image_source: str) -> tuple[Path, Path]:
