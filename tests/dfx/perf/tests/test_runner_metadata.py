@@ -147,12 +147,12 @@ def test_get_runtime_resource_label(monkeypatch):
     from tests.dfx.conftest import get_runtime_resource_label
 
     monkeypatch.setattr(
-        "tests.dfx.conftest._read_runtime_device_name",
+        "tests.helpers.hardware._read_runtime_device_name",
         lambda *, device_id=0: "NVIDIA H100 80GB HBM3",
     )
     assert get_runtime_resource_label(refresh=True) == "H100"
     monkeypatch.setattr(
-        "tests.dfx.conftest._read_runtime_device_name",
+        "tests.helpers.hardware._read_runtime_device_name",
         lambda *, device_id=0: "Ascend910B2",
     )
     assert get_runtime_resource_label(refresh=True) == "910B"
@@ -233,6 +233,53 @@ def test_is_diffusion_perf_config():
         "benchmark_params": [{"dataset": "custom", "task": "ti2i"}],
     }
     assert is_diffusion_perf_config(custom_edits_cfg)
+
+
+def test_buildkite_perf_steps_use_matching_runner_schema():
+    """Every Buildkite step must run a perf JSON with the runner matching its schema.
+
+    Regression for #8074: the NPU nightly HunyuanVideo-1.5 step kept invoking
+    ``run_diffusion_benchmark.py`` after the JSON was migrated to the omni-bench
+    schema (#7737). The runner skipped every case as omni-bench, pytest selected
+    0 tests and the step failed with exit 5.
+    """
+    import json
+    import re
+    from pathlib import Path
+
+    from tests.dfx.conftest import is_diffusion_perf_config
+
+    repo_root = Path(__file__).resolve().parents[4]
+    step_re = re.compile(
+        r"tests/dfx/perf/scripts/(?P<runner>run_diffusion_benchmark|run_benchmark)\.py"
+        r".*?--test-config-file(?:=|\s+)(?P<file>\S+\.json)"
+    )
+    pipelines = sorted(repo_root.glob(".buildkite/**/*.yml")) + sorted(repo_root.glob(".buildkite/**/*.yaml"))
+    assert pipelines, "no Buildkite pipelines found"
+
+    invocations = 0
+    for pipeline in pipelines:
+        for match in step_re.finditer(pipeline.read_text(encoding="utf-8")):
+            invocations += 1
+            config_rel = match.group("file")
+            config_path = repo_root / config_rel
+            assert config_path.exists(), f"{pipeline}: perf config not found: {config_rel}"
+            runner_is_diffusion = match.group("runner") == "run_diffusion_benchmark"
+            cases = json.loads(config_path.read_text(encoding="utf-8"))
+            mismatched = [cfg["test_name"] for cfg in cases if is_diffusion_perf_config(cfg) != runner_is_diffusion]
+            assert not mismatched, (
+                f"{pipeline}: {match.group('runner')} runs {config_rel}, but case(s) {mismatched} "
+                f"are not {'diffusion' if runner_is_diffusion else 'omni-bench'}-schema; the runner "
+                "would skip them and pytest may select 0 tests (exit 5), see issue #8074"
+            )
+
+    assert invocations, "no perf runner invocations found; the scan regex or pipeline layout changed"
+
+    # Pin the issue #8074 scenario itself: the migrated HunyuanVideo-1.5 t2v JSON
+    # is omni-bench schema and must never go back to run_diffusion_benchmark.py.
+    t2v_json = repo_root / "tests" / "dfx" / "perf" / "tests" / "test_hunyuanvideo15_t2v_vllm_omni.json"
+    t2v_cases = json.loads(t2v_json.read_text(encoding="utf-8"))
+    assert t2v_cases and all(not is_diffusion_perf_config(cfg) for cfg in t2v_cases)
 
 
 def test_merge_omni_default_server_args_respects_json():
@@ -454,10 +501,8 @@ def test_run_benchmark_persists_distinct_benchmark_params_name(tmp_path, monkeyp
 
 
 def test_is_hardware_nested_baseline():
-    from tests.dfx.conftest import (
-        _RUNTIME_DEVICE_ALIASES,
-        is_hardware_nested_baseline,
-    )
+    from tests.dfx.conftest import is_hardware_nested_baseline
+    from tests.helpers.hardware import _RUNTIME_DEVICE_ALIASES
     from tests.helpers.mark import get_hardware_mark_list
 
     hardware_marks = get_hardware_mark_list()
@@ -678,6 +723,207 @@ def test_omniinteract_result_accepts_complete_artifacts():
         {"dataset_name": "omniinteract"},
         4,
     )
+
+
+def _duplex_eval_result():
+    return {
+        "completed": 1,
+        "duplex_session_metrics": [
+            {"client_ttft_ms": {"count": 1, "mean": 100.0}, "client_ttfp_ms": {"count": 1, "mean": 200.0}}
+        ],
+        "omni_duplex_eval": {
+            "published": 1,
+            "published_with_unfinished_responses": 0,
+            "artifact_errors": [],
+            "accuracy": {"status": "completed", "total": 1, "evaluated": 1, "failed": 0, "skipped": 0},
+        },
+    }
+
+
+@pytest.mark.parametrize("evaluate", [False, True])
+def test_duplex_eval_result_accepts_complete_measurements(evaluate):
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    result = _duplex_eval_result()
+    if not evaluate:
+        del result["omni_duplex_eval"]["accuracy"]
+    assert_result(result, {"dataset_name": "omni-duplex-eval", "duplex_eval_evaluate": evaluate}, 1)
+
+
+@pytest.mark.parametrize(
+    "field,value,match",
+    [
+        ("published", 0, "artifacts are incomplete"),
+        ("artifact_errors", ["disk full"], "publication failed"),
+        ("published_with_unfinished_responses", 1, "responses are unfinished"),
+        ("accuracy", None, "accuracy is missing"),
+        ("accuracy", {"status": "partial"}, "accuracy did not complete"),
+        ("accuracy", {"status": "completed", "total": 1, "evaluated": 0, "failed": 0, "skipped": 1}, "coverage"),
+    ],
+)
+def test_duplex_eval_result_rejects_incomplete_artifacts_or_judging(field, value, match):
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    result = _duplex_eval_result()
+    result["omni_duplex_eval"][field] = value
+    with pytest.raises(AssertionError, match=match):
+        assert_result(result, {"dataset_name": "omni-duplex-eval", "duplex_eval_evaluate": True}, 1)
+
+
+@pytest.mark.parametrize(("hardware", "enforce_score_floors"), [("H100", True), ("MI300", False)])
+def test_duplex_eval_score_floor_hardware_controls_enforcement(monkeypatch, hardware, enforce_score_floors):
+    from tests.dfx.perf.scripts import run_benchmark
+    from tests.e2e.accuracy.omni_duplex_eval import validation
+
+    observed = []
+    monkeypatch.setattr(validation, "load_accuracy_config", lambda *args: {"baseline": {}})
+    monkeypatch.setattr(
+        validation,
+        "assert_accuracy_result",
+        lambda *args, **kwargs: observed.append(kwargs["enforce_score_floors"]),
+    )
+    result = _duplex_eval_result()
+    result["Hardware"] = hardware
+    run_benchmark.assert_result(
+        result,
+        {
+            "dataset_name": "omni-duplex-eval",
+            "duplex_eval_accuracy_config": "config.json",
+            "duplex_eval_score_floor_hardware": ["H100", "B200", "A3"],
+        },
+        1,
+    )
+    assert observed == [enforce_score_floors]
+
+
+@pytest.mark.parametrize("field", ["client_ttft_ms", "client_ttfp_ms"])
+@pytest.mark.parametrize("metric", [{}, {"count": 0, "mean": 0.0}, {"count": 1, "mean": float("nan")}])
+def test_duplex_eval_result_rejects_missing_measurements(field, metric):
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    result = _duplex_eval_result()
+    result["duplex_session_metrics"][0][field] = metric
+    with pytest.raises(AssertionError, match=f"no measured {field}"):
+        assert_result(result, {"dataset_name": "omni-duplex-eval"}, 1)
+
+
+@pytest.mark.parametrize("prefix", ["omniinteract", "duplex_eval"])
+@pytest.mark.parametrize("judge_url", [None, "http://127.0.0.1:8001"])
+def test_dataset_judging_uses_launched_judge(monkeypatch, prefix, judge_url):
+    from tests.dfx.perf.scripts import run_benchmark
+
+    monkeypatch.setattr(run_benchmark, "BENCHMARK_CONFIGS", [])
+    monkeypatch.setattr(run_benchmark, "get_runtime_resource_label", lambda: "H100")
+    calls = []
+
+    def benchmark(**kwargs):
+        calls.append(kwargs)
+        return {"completed": 1}
+
+    monkeypatch.setattr(run_benchmark, "run_benchmark", benchmark)
+    # The result contract is covered above; exercise actual CLI assembly here.
+    monkeypatch.setattr(run_benchmark, "assert_result", lambda *args: None)
+    server = SimpleNamespace(host="localhost", port=8000, model="model", judge_base_url=judge_url)
+    case = {
+        "test_name": "test_duplex",
+        "params": {f"{prefix}_evaluate": True, "num_prompts": [1], "max_concurrency": [1]},
+    }
+    if judge_url is None:
+        with pytest.raises(ValueError, match="requires top-level judge_server_params"):
+            run_benchmark.test_performance_benchmark(server, case)
+        assert not calls
+    else:
+        run_benchmark.test_performance_benchmark(server, case)
+        args = calls[0]["args"]
+        assert args[args.index(f"--{prefix.replace('_', '-')}-judge-base-url") + 1] == judge_url
+
+
+@pytest.mark.parametrize(("hardware", "enforce_score_floors"), [("H100", True), ("MI300", False)])
+def test_minicpmo_duplex_eval_config_replays_accuracy_ids_at_c8(monkeypatch, hardware, enforce_score_floors):
+    from dataclasses import dataclass
+    from pathlib import Path
+
+    from tests.dfx.perf.scripts import run_benchmark
+    from vllm_omni.entrypoints.cli.benchmark.serve import OmniBenchmarkServingSubcommand
+    from vllm_omni.utils.tracking_parser import TrackingArgumentParser
+
+    test_root = Path(__file__).resolve().parents[3]
+    config = json.loads((Path(__file__).parent / "test_minicpmo_4_5_omni_duplex_eval.json").read_text())[0]
+    accuracy = json.loads((test_root / "e2e/accuracy/omni_duplex_eval/omni_duplex_eval_ci_config.json").read_text())
+    ids = {str(sample_id) for values in accuracy["sample_ids_per_split"].values() for sample_id in values}
+    params = config["benchmark_params"][0]
+    assert len(params["duplex_eval_ids"]) == len(ids) == 66
+    assert set(params["duplex_eval_ids"]) == ids
+    assert config["judge_server_params"]["model"] == params["duplex_eval_judge_model"]
+    assert params["duplex_eval_evaluate"]
+    assert params["duplex_eval_score_floor_hardware"] == ["H100", "B200", "A3"]
+
+    @dataclass
+    class ServerEndpoint:
+        host: str = "localhost"
+        port: int = 8000
+        model: str = "openbmb/MiniCPM-o-4_5"
+        judge_base_url: str = "http://localhost:8001"
+
+    calls = []
+    monkeypatch.setattr(run_benchmark, "BENCHMARK_CONFIGS", [config])
+    monkeypatch.setattr(run_benchmark, "get_runtime_resource_label", lambda: hardware)
+
+    def benchmark(**kwargs):
+        calls.append(kwargs)
+        return {"completed": 66}
+
+    monkeypatch.setattr(run_benchmark, "run_benchmark", benchmark)
+    monkeypatch.setattr(run_benchmark, "assert_result", lambda *args: None)
+    run_benchmark.test_performance_benchmark(ServerEndpoint(), {"test_name": config["test_name"], "params": params})
+    assert len(calls) == 1
+    call = calls[0]
+    parser = TrackingArgumentParser()
+    OmniBenchmarkServingSubcommand.add_cli_args(parser)
+    args = parser.parse_args(call["args"])
+    assert args.duplex_eval_ids == params["duplex_eval_ids"]
+    assert args.num_prompts == 66
+    assert args.max_concurrency == 8
+    assert args.save_detailed
+    assert args.duplex_eval_split == "all"
+    assert args.disable_shuffle
+    assert call["num_warmups"] == 0
+    assert args.ready_check_timeout_sec == 0
+    assert args.trust_remote_code
+    assert args.duplex_eval_evaluate
+    assert args.duplex_eval_judge_base_url == "http://localhost:8001"
+    assert "--duplex-eval-accuracy-config" not in call["args"]
+    assert "--duplex-eval-score-floor-hardware" not in call["args"]
+    assert call["accuracy_baseline"] == (accuracy["baseline"] if enforce_score_floors else {})
+
+
+@pytest.mark.parametrize("device_env", ["CUDA_VISIBLE_DEVICES", "ASCEND_RT_VISIBLE_DEVICES"])
+def test_judge_uses_allocated_second_device(monkeypatch, device_env):
+    from tests.dfx.perf.scripts import run_benchmark as runner
+    from vllm_omni.platforms import current_omni_platform
+
+    monkeypatch.setenv(device_env, "4,7")
+    monkeypatch.setattr(current_omni_platform, "device_control_env_var", device_env)
+    seen = []
+
+    @contextmanager
+    def server(model, args, **kwargs):
+        seen.append(kwargs["env_dict"])
+
+        class Endpoint:
+            host = "localhost"
+            port = 8001
+
+        yield Endpoint()
+
+    monkeypatch.setattr(runner, "OmniServer", server)
+    with runner._start_judge_server({"model": "judge", "device_index": "1"}):
+        pass
+    assert seen == [{device_env: "7"}]
+    assert runner._resolve_judge_visible_devices("0", device_env) == "4"
+    assert __import__("os").environ[device_env] == "4,7"
+    with pytest.raises(ValueError, match="outside"):
+        runner._resolve_judge_visible_devices("2", device_env)
 
 
 def test_omniinteract_result_rejects_incomplete_artifacts():
@@ -932,3 +1178,58 @@ def test_omni_tpot_baseline_rejects_missing_or_nonfinite_sample(num_tpot_samples
             {"baseline": {"H100": {"mean_tpot_ms": 20.0}}},
             1,
         )
+
+
+# Mirrors the Thinker/Talker lengths in test_qwen3_omni_no_async_chunk.json.
+_FIXED_SAMPLING = {
+    "sampling_params_list": [{"min_tokens": 900, "max_tokens": 900}, {"min_tokens": 1536, "max_tokens": 1536}]
+}
+_FIXED_OK = {"0": {"num_tokens_out": 900}, "1": {"num_tokens_out": 1536}}
+
+
+@pytest.mark.parametrize("extra_body_key", ["extra_body", "extra-body"])
+def test_fixed_stage_workload_accepts_exact_lengths(extra_body_key, capsys):
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    assert_result(
+        {"completed": 2, "failed": 0, "request_stage_metrics": [_FIXED_OK, _FIXED_OK]},
+        {extra_body_key: _FIXED_SAMPLING},
+        2,
+    )
+    assert "Fixed stage workload OK: 2 requests, num_tokens_out stage 0=900, stage 1=1536" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    "snapshots",
+    [
+        None,
+        [],
+        [_FIXED_OK],
+        [_FIXED_OK, None],
+        [_FIXED_OK, {}],
+        [_FIXED_OK, {"0": {"num_tokens_out": 900}, "1": {}}],
+        [_FIXED_OK, {"0": {"num_tokens_out": 900}, "1": {"num_tokens_out": 486}}],
+        [_FIXED_OK, {"0": {"num_tokens_out": 900}, "1": {"num_tokens_out": 1537}}],
+        [_FIXED_OK, {"1": {"num_tokens_out": 1536}}],
+        [_FIXED_OK, {"0": {"num_tokens_out": 512}, "1": {"num_tokens_out": 1536}}],
+    ],
+)
+def test_fixed_stage_workload_rejects_missing_or_wrong_lengths(snapshots):
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    with pytest.raises(AssertionError, match="Fixed stage workload"):
+        assert_result({"completed": 2, "request_stage_metrics": snapshots}, {"extra_body": _FIXED_SAMPLING}, 2)
+
+
+def test_fixed_stage_workload_rejects_request_failures():
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    with pytest.raises(AssertionError, match="Request failures"):
+        assert_result({"completed": 1, "failed": 1}, {}, 2)
+
+
+@pytest.mark.parametrize("extra_body", [{}, {"sampling_params_list": [{"max_tokens": 900}]}])
+def test_variable_stage_workload_does_not_require_stage_metrics(extra_body):
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    assert_result({"completed": 2}, {"extra_body": extra_body}, 2)

@@ -41,6 +41,11 @@ logger = init_logger(__name__)
 # still wakes the producer.
 _SLOT_POLL_SECONDS = 0.05
 
+# Bound queued/in-flight uint8 video independently of resolution and chunk
+# length. A single larger chunk is still admitted when the ring is empty so a
+# legal native VAE chunk can never deadlock the producer.
+_DEFAULT_MAX_PENDING_BYTES = 256 * 1024**2
+
 _COPY_STREAMS: dict[tuple[str, int], torch.Stream] = {}
 _COPY_STREAM_LOCK = threading.Lock()
 
@@ -120,8 +125,11 @@ class _HostSlot:
         self._buffer: torch.Tensor | None = None
         self.held_bytes = 0
 
+    @torch.inference_mode(False)
     def reserve(self, frames: torch.Tensor) -> torch.Tensor:
         """Return a host view shaped like ``frames``, growing the buffer if needed."""
+        # VAE callbacks may run in inference mode while the final flush does
+        # not. Reusable host slots must remain mutable across that boundary.
         needed = frames.numel()
         if self._buffer is None or self._buffer.numel() < needed:
             try:
@@ -211,15 +219,24 @@ class PinnedChunkRing:
     """Fixed-depth pool of reusable host slots for chunk transfers.
 
     A slot walks ``free -> copying -> ready -> encoding -> free`` and holds
-    exactly one chunk for that whole trip, so pending transfer bytes are
-    bounded by the depth times the largest chunk of the request. Waiting for a
-    free slot is where encoder backpressure reaches the producer.
+    exactly one chunk for that whole trip. Admission is bounded by both slot
+    count and pending bytes; reaching either limit is where encoder
+    backpressure reaches the producer.
     """
 
-    def __init__(self, *, depth: int, device: torch.device) -> None:
+    def __init__(
+        self,
+        *,
+        depth: int,
+        device: torch.device,
+        max_pending_bytes: int | None = _DEFAULT_MAX_PENDING_BYTES,
+    ) -> None:
         if depth <= 0:
             raise ValueError("transfer ring depth must be positive")
+        if max_pending_bytes is not None and (type(max_pending_bytes) is not int or max_pending_bytes <= 0):
+            raise ValueError("max_pending_bytes must be a positive integer or None")
         self.depth = depth
+        self.max_pending_bytes = max_pending_bytes
         self.stats = ChunkTransferStats()
         self._on_device = device.type != "cpu"
         self._stream = _copy_stream(device) if self._on_device else None
@@ -235,15 +252,26 @@ class PinnedChunkRing:
         with self._lock:
             return self.depth - len(self._free)
 
+    @property
+    def pending_bytes(self) -> int:
+        """Bytes held by chunks currently copying, ready, or encoding."""
+        with self._lock:
+            return self._pending_bytes
+
+    def would_block(self, chunk_bytes: int) -> bool:
+        """Whether admitting ``chunk_bytes`` now would exceed either bound."""
+        with self._lock:
+            return not self._free or not self._bytes_available(chunk_bytes)
+
     def transfer(self, frames: torch.Tensor, *, readers: int) -> ChunkLease:
         """Start one non-blocking copy of ``frames`` into a free slot."""
         if readers <= 0:
             raise ValueError("a transferred chunk needs at least one reader")
-        slot = self._acquire()
+        chunk_bytes = frames.numel() * frames.element_size()
+        slot = self._acquire(chunk_bytes)
         try:
             host = slot.reserve(frames)
             with self._lock:
-                self._pending_bytes += slot.held_bytes
                 self.stats.transfers += 1
                 self.stats.peak_pending_bytes = max(self.stats.peak_pending_bytes, self._pending_bytes)
             landed = self._issue_copy(host, frames)
@@ -282,10 +310,17 @@ class PinnedChunkRing:
             landed.record(self._stream)
         return landed
 
-    def _acquire(self) -> _HostSlot:
+    def _bytes_available(self, chunk_bytes: int) -> bool:
+        return (
+            self.max_pending_bytes is None
+            or self._pending_bytes == 0
+            or self._pending_bytes + chunk_bytes <= self.max_pending_bytes
+        )
+
+    def _acquire(self, chunk_bytes: int) -> _HostSlot:
         started = time.perf_counter()
         with self._slot_freed:
-            while not self._free and self._failure is None:
+            while (not self._free or not self._bytes_available(chunk_bytes)) and self._failure is None:
                 # ponytail: no request deadline yet, only an abort escape. A
                 # unified deadline across producer, slot, queue and encoder
                 # waits is RFC #6872 R4.
@@ -293,6 +328,11 @@ class PinnedChunkRing:
             if self._failure is not None:
                 raise self._failure
             slot = self._free.pop()
+            # Reserve before dropping the lock so concurrent producers cannot
+            # both pass the byte budget. Setting held_bytes here also makes a
+            # failed host allocation reclaim the complete reservation.
+            slot.held_bytes = chunk_bytes
+            self._pending_bytes += chunk_bytes
             in_use = self.depth - len(self._free)
             self.stats.peak_slots_in_use = max(self.stats.peak_slots_in_use, in_use)
         self.stats.slot_wait_seconds += time.perf_counter() - started
@@ -311,7 +351,8 @@ class ChunkedVideoMP4Session:
     request's waveform across its entries. ``batch_frames`` coalesces transfers
     for producers that publish finer than a transfer is worth; ``crop`` trims
     the decoder's padding to the requested output size. ``transfer_slots`` sets
-    how many chunks may be in flight to the host at once.
+    how many chunks may be in flight to the host at once, while
+    ``max_pending_bytes`` bounds their combined uint8 payload size.
     """
 
     def __init__(
@@ -326,9 +367,12 @@ class ChunkedVideoMP4Session:
         video_codec_options: dict[str, str] | None = None,
         crop: tuple[int, int] | None = None,
         transfer_slots: int = 2,
+        max_pending_bytes: int | None = _DEFAULT_MAX_PENDING_BYTES,
     ) -> None:
         if batch_frames <= 0:
             raise ValueError("batch_frames must be positive")
+        if max_pending_bytes is not None and (type(max_pending_bytes) is not int or max_pending_bytes <= 0):
+            raise ValueError("max_pending_bytes must be a positive integer or None")
         self._value_range = value_range
         self._fps = fps
         self._audio_waveforms = audio_waveforms
@@ -338,12 +382,41 @@ class ChunkedVideoMP4Session:
         self._video_codec_options = video_codec_options
         self._crop = crop
         self._transfer_slots = transfer_slots
+        self._max_pending_bytes = max_pending_bytes
         self._encoders: list[ChunkedMP4Encoder] = []
+        self._output_shape: tuple[int, int, int] | None = None
         self._pending: list[torch.Tensor] = []
         self._pending_frames = 0
         self._ring: PinnedChunkRing | None = None
         self._ring_resolved = False
         self._inflight: deque[ChunkLease] = deque()
+
+    def start(self, *, width: int, height: int, batch_size: int) -> None:
+        """Start muxing ready audio before the first video chunk arrives."""
+        if min(width, height, batch_size) <= 0:
+            raise ValueError("output dimensions and batch_size must be positive")
+        if self._encoders:
+            if self._output_shape != (batch_size, height, width):
+                raise ValueError("output dimensions or batch size changed after encoder start")
+            return
+        waveforms = [self._waveform_for(index, batch_size) for index in range(batch_size)]
+        try:
+            for waveform in waveforms:
+                self._encoders.append(
+                    ChunkedMP4Encoder(
+                        width=width,
+                        height=height,
+                        fps=self._fps,
+                        audio_waveform=waveform,
+                        audio_sample_rate=self._audio_sample_rate,
+                        max_pending=self._max_pending,
+                        video_codec_options=self._video_codec_options,
+                    )
+                )
+        except BaseException:
+            self.abort()
+            raise
+        self._output_shape = (batch_size, height, width)
 
     def push(self, chunk: torch.Tensor) -> None:
         """Queue one committed ``BCTHW`` chunk."""
@@ -375,6 +448,11 @@ class ChunkedVideoMP4Session:
         return None if self._ring is None else self._ring.stats
 
     @property
+    def frame_counts(self) -> list[int]:
+        """Actual frame counts, complete after a successful finish()."""
+        return [encoder.frame_count for encoder in self._encoders]
+
+    @property
     def ring(self) -> PinnedChunkRing | None:
         """The transfer ring this session settled on, once a chunk has flushed."""
         return self._ring
@@ -392,7 +470,8 @@ class ChunkedVideoMP4Session:
             return
         # Free a slot before asking for one, so the ring's own wait is only
         # ever for the encoder to catch up rather than for this loop.
-        while len(self._inflight) >= ring.depth:
+        chunk_bytes = frames.numel() * frames.element_size()
+        while self._inflight and ring.would_block(chunk_bytes):
             self._feed_lease(self._inflight.popleft())
         self._inflight.append(ring.transfer(frames, readers=len(self._encoders)))
         while self._inflight and self._inflight[0].ready():
@@ -418,20 +497,7 @@ class ChunkedVideoMP4Session:
                 raise
 
     def _ensure_encoders(self, frames: torch.Tensor) -> None:
-        if self._encoders:
-            return
-        self._encoders = [
-            ChunkedMP4Encoder(
-                width=int(frames.shape[3]),
-                height=int(frames.shape[2]),
-                fps=self._fps,
-                audio_waveform=self._waveform_for(index, int(frames.shape[0])),
-                audio_sample_rate=self._audio_sample_rate,
-                max_pending=self._max_pending,
-                video_codec_options=self._video_codec_options,
-            )
-            for index in range(int(frames.shape[0]))
-        ]
+        self.start(width=int(frames.shape[3]), height=int(frames.shape[2]), batch_size=int(frames.shape[0]))
 
     def _resolve_ring(self, device: torch.device) -> PinnedChunkRing | None:
         if self._ring_resolved:
@@ -440,7 +506,11 @@ class ChunkedVideoMP4Session:
         if self._transfer_slots <= 0:
             return None
         try:
-            self._ring = PinnedChunkRing(depth=self._transfer_slots, device=device)
+            self._ring = PinnedChunkRing(
+                depth=self._transfer_slots,
+                device=device,
+                max_pending_bytes=self._max_pending_bytes,
+            )
         except Exception:
             logger.warning(
                 "Pinned chunk transfers unavailable on %s; falling back to blocking copies",
@@ -460,7 +530,14 @@ class ChunkedVideoMP4Session:
         return self._audio_waveforms[index]
 
 
-def decode_to_mp4(vae: Any, z: torch.Tensor, **session_kwargs: Any) -> list[bytes]:
+def decode_to_mp4(
+    vae: Any,
+    z: torch.Tensor,
+    *,
+    frame_counts: list[int] | None = None,
+    session: ChunkedVideoMP4Session | None = None,
+    **session_kwargs: Any,
+) -> list[bytes]:
     """Decode ``z`` straight into one progressive MP4 per batch entry.
 
     Drives a VAE that declares :class:`SupportsChunkedVAEDecode`, so host
@@ -472,10 +549,15 @@ def decode_to_mp4(vae: Any, z: torch.Tensor, **session_kwargs: Any) -> list[byte
     if not supports_chunked_vae_decode(vae):
         raise TypeError(f"{type(vae).__name__} does not expose the chunked VAE decode capability")
 
-    session = ChunkedVideoMP4Session(value_range=vae.chunk_value_range, **session_kwargs)
+    if session is not None and session_kwargs:
+        raise ValueError("session options cannot accompany an existing session")
+    if session is None:
+        session = ChunkedVideoMP4Session(value_range=vae.chunk_value_range, **session_kwargs)
     try:
         vae.decode_with_chunks(z, on_chunk=session.push)
         videos = session.finish()
+        if frame_counts is not None:
+            frame_counts.extend(session.frame_counts)
     except BaseException:
         session.abort()
         raise

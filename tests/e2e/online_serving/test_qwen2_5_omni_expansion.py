@@ -21,7 +21,14 @@ models = ["Qwen/Qwen2.5-Omni-7B"]
 
 # Single CI deploy YAML; rocm/xpu deltas are picked automatically via the
 # platforms: section in vllm_omni/deploy/ci/qwen2_5_omni.yaml.
-stage_configs = [modify_stage_config(get_deploy_config_path("ci/qwen2_5_omni.yaml"))]
+stage_configs = [
+    modify_stage_config(
+        get_deploy_config_path("ci/qwen2_5_omni.yaml"),
+        # This suite requests two cards. Share the Talker's card with
+        # Code2Wav and leave room for its whole-sequence DiT workspace.
+        updates={"stages": {1: {"gpu_memory_utilization": 0.3}, 2: {"devices": "1"}}},
+    )
+]
 
 # Create parameter combinations for model and stage config
 test_params = [
@@ -144,3 +151,30 @@ def test_text_to_text_001(omni_server, online_client) -> None:
     }
 
     online_client.send_omni_request(request_config, request_num=get_max_batch_size())
+
+
+@pytest.mark.slow
+@pytest.mark.omni
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=2)
+@pytest.mark.parametrize("omni_server", test_params, indirect=True)
+@pytest.mark.parametrize("speaker", ["Chelsie", "ETHAN"])
+def test_speaker_001(omni_server, online_client, speaker: str) -> None:
+    """
+    Test per-request speaker selection for audio output via OpenAI API.
+    Deploy Setting: default yaml
+    Input Modal: text
+    Output Modal: text + audio using a case-insensitive preset speaker name
+    Datasets: single request
+    """
+    messages = dummy_messages_from_mix_data(system_prompt=get_system_prompt(), content_text=get_prompt())
+    request_config = {
+        "model": omni_server.model,
+        "messages": messages,
+        "stream": False,
+        "speaker": speaker,
+        "key_words": {"text": ["beijing"]},
+    }
+
+    # core_model loads dummy weights; the preset voice is checked only at
+    # advanced_model / full_model, which load the real checkpoint.
+    online_client.send_omni_request(request_config)

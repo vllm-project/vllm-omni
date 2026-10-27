@@ -29,6 +29,7 @@ encode of the input WAV (built in ``preprocess``); live duplex is Phase 2.
 
 from __future__ import annotations
 
+import copy
 from collections.abc import Iterable
 from typing import Any
 
@@ -36,6 +37,7 @@ import torch
 from torch import nn
 from vllm.config import VllmConfig
 from vllm.distributed import get_pp_group
+from vllm.logger import init_logger
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
@@ -45,16 +47,39 @@ from vllm.sequence import IntermediateTensors
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.model_executor.models.personaplex.configuration_personaplex import (
     PersonaPlexConfig,
+    PersonaPlexDepformerConfig,
 )
 from vllm_omni.model_executor.models.personaplex.modeling_helium import HeliumModel
 from vllm_omni.model_executor.models.personaplex.personaplex_depformer import (
     PersonaPlexDepformer,
 )
+from vllm_omni.model_executor.models.personaplex.personaplex_depformer_graph import (
+    PersonaPlexDepformerGraphs,
+    depformer_graph_buckets,
+)
 from vllm_omni.model_executor.models.personaplex.personaplex_embeddings import (
     PersonaPlexInputEmbeddings,
 )
+from vllm_omni.utils.device_copy import index_to_device
 
-__all__ = ["PersonaPlexTalkerForConditionalGeneration"]
+__all__ = ["PersonaPlexTalkerForConditionalGeneration", "serving_depformer_config"]
+
+logger = init_logger(__name__)
+
+
+def serving_depformer_config(config: PersonaPlexDepformerConfig, session_mode: str) -> PersonaPlexDepformerConfig:
+    """The depformer config a talker serving ``session_mode`` builds.
+
+    Duplex draws only the vocoded agent codebooks (``num_active_codebooks``
+    steps), and the depformer is causal over its steps, so the weight sets of
+    the later steps (the user-codebook steps, about 1.3 GB in bf16) are never
+    read there and are not built.
+    """
+    if session_mode != "duplex" or config.dep_q <= config.num_active_codebooks:
+        return config
+    config = copy.deepcopy(config)
+    config.dep_q = config.num_active_codebooks
+    return config
 
 
 class PersonaPlexTalkerForConditionalGeneration(nn.Module):
@@ -75,6 +100,11 @@ class PersonaPlexTalkerForConditionalGeneration(nn.Module):
         self.temporal_config = config.temporal_config
         hidden = self.temporal_config.hidden_size
         self._dtype = getattr(vllm_config.model_config, "dtype", torch.bfloat16)
+        if bool(getattr(vllm_config.model_config, "use_v2_model_runner", False)):
+            raise ValueError(
+                "PersonaPlex Stage 0 (Talker) requires model_runner: v1 "
+                "for lockstep post-sample depformer execution and batched appends"
+            )
 
         # Temporal backbone on vLLM paged attention (consumes inputs_embeds).
         self.model = HeliumModel(
@@ -94,11 +124,12 @@ class PersonaPlexTalkerForConditionalGeneration(nn.Module):
             self.lm_head = PPMissingLayer()
         self.logits_processor = LogitsProcessor(config.text_vocab_size)
         self.make_empty_intermediate_tensors = self.model.make_empty_intermediate_tensors
+        session_mode = getattr(vllm_config.model_config, "session_mode", "turn")
 
         # Verified custom components: embed_codes + depformer.
         self.input_embeddings = PersonaPlexInputEmbeddings(config)
         self.depformer = PersonaPlexDepformer(
-            config.depformer_config,
+            serving_depformer_config(config.depformer_config, session_mode),
             temporal_hidden_size=hidden,
             text_card=config.text_vocab_size,
         )
@@ -106,15 +137,31 @@ class PersonaPlexTalkerForConditionalGeneration(nn.Module):
         # Omni AR runner contract.
         self.have_multimodal_outputs = True
         self.has_preprocess = True
-        self.has_postprocess = True  # capture each frame's hidden for the next depformer step
+        # preprocess_batch writes the live duplex rows itself (one indexed copy).
+        self.preprocess_batch_fills_rows = True
+        # Capture each frame's hidden for the next decode step's depformer. A
+        # duplex frame runs its depformer post-sample from the current hidden
+        # (post_sample_talker_mtp) and never reads the captured one.
+        self.has_postprocess = session_mode != "duplex"
+        # Code2Wav only reads the codes: no per-step host copy of the hidden.
+        self.omni_pooler_payload_include_hidden = False
+        # The post-sample depformer rows are the non-discarded rows, known
+        # before the sampled values: launch it ahead of the bookkeeping sync.
+        self.post_sample_talker_mtp_before_bookkeeping = True
+        # A duplex session's prompt only grows by one frame slot per step:
+        # resume its batch row in place instead of re-copying the prompt.
+        self.resume_streaming_rows_in_place = session_mode == "duplex"
         self.requires_full_prefix_cached_hidden_states = False
         # Keep the per-frame "last" hidden on GPU (avoids a CPU round-trip each step).
         self.gpu_resident_buffer_keys: set[tuple[str, str]] = {("hidden_states", "last")}
         self.mtp_hidden_size = hidden
         self.talker_mtp_output_key = ("codes", "audio")
         # dep_q audio codebooks per frame; only cb 0..num_active are vocoded.
-        self.dep_q = config.depformer_config.dep_q
+        self.dep_q = self.depformer.dep_q
         self.num_active_codebooks = config.depformer_config.num_active_codebooks
+        # Duplex post-sample depformer steps, replayed from CUDA graphs when
+        # ``depformer_cuda_graphs`` is set (built in load_weights).
+        self._depformer_graphs: PersonaPlexDepformerGraphs | None = None
 
     # ------------------------------------------------------------------
     # Core forward / logits
@@ -173,7 +220,9 @@ class PersonaPlexTalkerForConditionalGeneration(nn.Module):
         if not audio_codes_list:
             return OmniOutput(text_hidden_states=hidden, multimodal_outputs={})
         audio_codes = torch.cat(audio_codes_list, dim=0)
-        hidden = hidden[: int(audio_codes.shape[0])]
+        # Keep every token row: the runner indexes this tensor with token-space
+        # logits indices, and a step can mix a new session's multi-row prefill
+        # with one-row live appends, so the audio row count is not the token count.
         return OmniOutput(text_hidden_states=hidden, multimodal_outputs={"codes": {"audio": audio_codes}})
 
     # ------------------------------------------------------------------
@@ -193,7 +242,6 @@ class PersonaPlexTalkerForConditionalGeneration(nn.Module):
         self,
         text_token: torch.Tensor,
         last_agent: torch.Tensor | None,
-        prev_agent: torch.Tensor | None,
         device: torch.device,
         user_d0: torch.Tensor | None = None,
         user_d1: torch.Tensor | None = None,
@@ -227,6 +275,33 @@ class PersonaPlexTalkerForConditionalGeneration(nn.Module):
             stack[0, user_base + 1 : user_base + n_user, 0] = user_d1.reshape(-1)[1:n_user].to(device)
         return self.input_embeddings(stack).reshape(1, -1)  # [1, hidden]
 
+    def _build_frame_embeds(
+        self,
+        text_tokens: torch.Tensor,
+        last_agent: torch.Tensor,
+        *,
+        user_d0: torch.Tensor,
+        user_d1: torch.Tensor,
+    ) -> torch.Tensor:
+        """``_build_frame_embed`` for ``B`` live duplex rows with every stream present.
+
+        ``text_tokens`` is ``[B]``; ``last_agent``, ``user_d0`` and ``user_d1`` are
+        ``[B, 8]``. Row ``i`` equals ``_build_frame_embed(text_tokens[i],
+        last_agent[i], last_agent[i], user_d0=user_d0[i], user_d1=user_d1[i])``
+        bit for bit: the table lookups and their sum are elementwise per row.
+        """
+        n_user = self.config.num_audio_codebooks // 2
+        stack = torch.cat(
+            [
+                text_tokens.reshape(-1, 1),
+                last_agent[:, :n_user],
+                user_d0[:, :1],
+                user_d1[:, 1:n_user],
+            ],
+            dim=1,
+        )
+        return self.input_embeddings(stack.unsqueeze(-1)).reshape(stack.shape[0], -1)  # [B, hidden]
+
     def _build_prefill_embed(
         self,
         prefill_text: torch.Tensor,
@@ -254,19 +329,16 @@ class PersonaPlexTalkerForConditionalGeneration(nn.Module):
             if isinstance(user_sine, torch.Tensor) and user_sine.numel() >= n_user
             else sil
         )
-        total = int(prefill_text.numel())
-        rows = []
-        for i in range(span):
-            pos = offset + i
-            text_tok = int(prefill_text[pos].item()) if pos < total else zero_text
-            stack = torch.zeros((1, 1 + n_q, 1), dtype=torch.long, device=device)
-            stack[:, 0] = text_tok
-            if sil is not None:
-                stack[0, 1 : 1 + n_user, 0] = sil[:n_user]  # agent rows = encoded silence
-            if user is not None:
-                stack[0, 1 + n_user : 1 + 2 * n_user, 0] = user[:n_user]
-            rows.append(self.input_embeddings(stack).reshape(1, -1))
-        return torch.cat(rows, dim=0)  # [span, hidden]
+
+        stack = torch.zeros((1, 1 + n_q, span), dtype=torch.long, device=device)
+        stack[:, 0] = zero_text
+        text = prefill_text[offset : offset + span]
+        stack[0, 0, : text.numel()] = text.to(device)
+        if sil is not None:
+            stack[0, 1 : 1 + n_user] = sil[:n_user, None]
+        if user is not None:
+            stack[0, 1 + n_user : 1 + 2 * n_user] = user[:n_user, None]
+        return self.input_embeddings(stack).reshape(span, -1)  # [span, hidden]
 
     @staticmethod
     def _user_frame(info: dict[str, Any], frame_idx: int) -> torch.Tensor | None:
@@ -323,11 +395,18 @@ class PersonaPlexTalkerForConditionalGeneration(nn.Module):
                 prompt_len = int(prompt_len_raw)
             except (TypeError, ValueError):
                 prompt_len = span
-            prepared = self._duplex_stage0_runtime().prepare_append(
-                duplex,
-                prompt_len=prompt_len,
-                request_id=(str(info_dict["request_id"]) if isinstance(info_dict.get("request_id"), str) else None),
+            from vllm_omni.model_executor.models.personaplex.duplex.stage0 import (
+                PersonaPlexStage0StaleEpochError,
             )
+
+            try:
+                prepared = self._duplex_stage0_runtime().prepare_append(
+                    duplex,
+                    prompt_len=prompt_len,
+                    request_id=(str(info_dict["request_id"]) if isinstance(info_dict.get("request_id"), str) else None),
+                )
+            except PersonaPlexStage0StaleEpochError:
+                return self._stale_append_passthrough(input_ids, span)
             offset_raw = info_dict.get("duplex_token_offset", 0)
             try:
                 offset = max(0, int(offset_raw))
@@ -382,9 +461,6 @@ class PersonaPlexTalkerForConditionalGeneration(nn.Module):
         # Agent acoustic delay: cb0 (delay 0) = gen[t-1] = the last stored codes;
         # cb1..7 (delay 1) = gen[t-2] = the codes carried from the previous frame.
         last_agent = self._last_agent_codes(info_dict)
-        prev_agent = info_dict.get("pplex_prev_agent")
-        if prev_agent is not None and not isinstance(prev_agent, torch.Tensor):
-            prev_agent = torch.as_tensor(prev_agent, dtype=torch.long)
         # Real user stream (Phase-1 turn-based): user cb0 delay-0, cb1..7 delay-1.
         # Index into the user stream relative to the first decode frame (after the
         # persona prefill), so the user audio aligns with the agent's response.
@@ -396,7 +472,7 @@ class PersonaPlexTalkerForConditionalGeneration(nn.Module):
         decode_frame = max(0, int(meta.get("pplex_frame", 0)) - prefill_len)
         user_d0 = self._user_frame(info_dict, decode_frame - 1)
         user_d1 = self._user_frame(info_dict, decode_frame - 2)
-        base = self._build_frame_embed(text_token, last_agent, prev_agent, device, user_d0, user_d1)
+        base = self._build_frame_embed(text_token, last_agent, device, user_d0, user_d1)
         text_step = self.input_embeddings.text_emb(text_token.reshape(1, 1)).reshape(1, -1)
         # The previous frame's temporal hidden (written by postprocess into
         # hidden_states["last"]) conditions this frame's depformer. Falls back to
@@ -411,9 +487,6 @@ class PersonaPlexTalkerForConditionalGeneration(nn.Module):
             "meta": {"pplex_frame": int(meta.get("pplex_frame", 0)) + 1},
             "mtp_inputs": (last_hidden, text_step),
         }
-        # Carry this frame's gen[t-1] forward; next frame reads it as gen[t-2] (cb1..7).
-        if last_agent is not None:
-            info_update["pplex_prev_agent"] = last_agent.detach().to(torch.long).cpu()
         return input_ids, base, info_update
 
     def _duplex_stage0_runtime(self):
@@ -431,9 +504,93 @@ class PersonaPlexTalkerForConditionalGeneration(nn.Module):
             model_path=model_path,
             device=device,
             max_sessions=int(getattr(self.vllm_config.model_config, "duplex_max_sessions", 1)),
+            codec_cuda_graphs=bool(getattr(self.config, "mimi_cuda_graphs", False)),
         )
         self._personaplex_duplex_stage0_runtime = runtime
         return runtime
+
+    def _stale_append_passthrough(
+        self, input_ids: torch.Tensor, span: int
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
+        """Neutral inputs for a request of a superseded epoch that is still in this step.
+
+        The engine already aborted it and discards its output; it only has to keep
+        the batch shapes valid without touching the live session's encoder row.
+        Its depformer row gets neutral teacher forcing from the stage 0 runtime.
+        """
+        embeds = torch.zeros((span, self.mtp_hidden_size), device=input_ids.device, dtype=self._dtype)
+        return input_ids, embeds, {"duplex": {"stage0_stale": True}}
+
+    def preprocess_batch(
+        self,
+        *,
+        req_ids: list[str],
+        model_intermediate_buffer: dict[str, dict[str, Any]],
+        device: torch.device,
+        input_ids: torch.Tensor | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        token_offsets: list[int] | None = None,
+        num_scheduled_tokens: list[int] | None = None,
+        num_computed_tokens: list[int] | None = None,
+        prompt_lens: list[int | None] | None = None,
+    ) -> set[str]:
+        """Encode every live duplex append of this step in one shared-encoder call.
+
+        With the step's buffers (``preprocess_batch_fills_rows``), the live
+        one-frame appends are also prepared here and their rows written with
+        one indexed copy; the returned request ids skip the per-request
+        ``preprocess``. First appends (the prefill), stale epochs and anything
+        unusual still go through ``preprocess``.
+        """
+        del device
+        appends: list[dict[str, Any]] = []
+        live: list[tuple[int, str, dict[str, Any]]] = []
+        for index, req_id in enumerate(req_ids):
+            info = model_intermediate_buffer.get(req_id)
+            if not isinstance(info, dict):
+                continue
+            duplex = info.get("duplex")
+            if not isinstance(duplex, dict):
+                additional = info.get("additional_information")
+                duplex = additional.get("duplex") if isinstance(additional, dict) else None
+            if isinstance(duplex, dict) and duplex.get("data_plane") is True:
+                appends.append(duplex)
+                live.append((index, req_id, duplex))
+        if not appends:
+            return set()
+        runtime = self._duplex_stage0_runtime()
+        runtime.encode_appends(appends)
+        if (
+            input_ids is None
+            or inputs_embeds is None
+            or token_offsets is None
+            or num_scheduled_tokens is None
+            or num_computed_tokens is None
+            or prompt_lens is None
+        ):
+            return set()
+        # A live append schedules exactly its one new prompt slot.
+        candidates = [
+            (index, req_id, duplex)
+            for index, req_id, duplex in live
+            if num_scheduled_tokens[index] == 1
+            and prompt_lens[index] is not None
+            and num_computed_tokens[index] == prompt_lens[index] - 1
+        ]
+        if not candidates:
+            return set()
+        handled, embeds = runtime.prepare_live_appends(
+            [(req_id, duplex, int(prompt_lens[index])) for index, req_id, duplex in candidates]
+        )
+        if not handled:
+            return set()
+        rows = [token_offsets[candidates[position][0]] for position in handled]
+        dst = index_to_device(rows, inputs_embeds.device)
+        # The same casts as the per-request path: the model dtype, then the buffer's.
+        inputs_embeds.index_copy_(0, dst, embeds.to(dtype=self._dtype).to(dtype=inputs_embeds.dtype))
+        # The per-request path copies the prepared zero placeholder ids.
+        input_ids.index_fill_(0, dst, 0)
+        return {candidates[position][1] for position in handled}
 
     def on_requests_finished(self, finished_req_ids: set[str] | list[str]) -> None:
         runtime = getattr(self, "_personaplex_duplex_stage0_runtime", None)
@@ -497,43 +654,28 @@ class PersonaPlexTalkerForConditionalGeneration(nn.Module):
             raise ValueError(
                 f"PersonaPlex depformer request information does not match batch: {len(req_infos)} != {bsz}"
             )
+        if len(req_ids) != bsz:
+            raise ValueError(f"PersonaPlex depformer request ids do not match batch: {len(req_ids)} != {bsz}")
         text_token = input_ids.reshape(bsz).to(torch.long)
         hidden = hidden_states.reshape(bsz, 1, -1).to(self._dtype)
-        audio_tokens: list[torch.Tensor] = []
-        audio_provided: list[torch.Tensor] = []
-        for info in req_infos:
-            tokens = info.get("pplex_depformer_audio_tokens")
-            provided = info.get("pplex_depformer_audio_provided")
-            if not isinstance(tokens, torch.Tensor) or not isinstance(provided, torch.Tensor):
-                raise ValueError("PersonaPlex duplex depformer teacher-forcing state is missing")
-            tokens = tokens.reshape(-1)
-            provided = provided.reshape(-1)
-            if tokens.shape != provided.shape:
-                raise ValueError(
-                    "PersonaPlex depformer teacher-forcing token/mask shapes differ: "
-                    f"{tuple(tokens.shape)} != {tuple(provided.shape)}"
-                )
-            audio_tokens.append(tokens)
-            audio_provided.append(provided)
+        graphs = getattr(self, "_depformer_graphs", None)
+        if graphs is not None:
+            # Teacher-forcing gather, depformer and frame-state commit in one
+            # replay.
+            return graphs.run(req_ids, text_token, hidden)
+        runtime = self._duplex_stage0_runtime()
+        audio_tokens, audio_provided = runtime.depformer_teacher_forcing(req_ids)
         codes = self.depformer(
             text_token,
             hidden,
-            audio_tokens=torch.stack(audio_tokens).to(
-                device=hidden.device,
-                dtype=torch.long,
-            ),
-            audio_provided=torch.stack(audio_provided).to(
-                device=hidden.device,
-                dtype=torch.bool,
-            ),
+            audio_tokens=audio_tokens.to(device=hidden.device),
+            audio_provided=audio_provided.to(device=hidden.device),
+            num_steps=self.num_active_codebooks,
         ).to(torch.long)
-        runtime = self._duplex_stage0_runtime()
-        for row, request_id in enumerate(req_ids):
-            runtime.record_sample(
-                request_id=request_id,
-                text_token=text_token[row],
-                agent_codes=codes[row],
-            )
+        runtime.record_samples(request_ids=req_ids, text_tokens=text_token, agent_codes=codes)
+        # The codes stay on the device: the runner moves the whole batch to the
+        # host with one non-blocking copy and waits for it only where it reads
+        # them.
         return codes
 
     # ------------------------------------------------------------------
@@ -543,10 +685,13 @@ class PersonaPlexTalkerForConditionalGeneration(nn.Module):
         """Route the Moshi checkpoint into the three components.
 
         * ``transformer.*`` / ``out_norm.alpha`` -> the Helium temporal backbone
-          (same q/k-split + gate/up-split + alpha-squeeze map as HeliumForCausalLM).
+          (q/k-split + gate/up-split + alpha-squeeze map).
         * ``text_linear.weight`` -> ``lm_head``.
         * ``emb.*`` / ``text_emb.weight`` -> input embeddings.
         * ``depformer*`` / ``linears.*`` -> depformer.
+
+        A duplex deploy also builds the Stage 0 streaming Mimi encoder here and,
+        with ``depformer_cuda_graphs``, captures the depformer step graphs.
         """
         weights = list(weights)
         params = dict(self.named_parameters(remove_duplicate=False))
@@ -569,7 +714,46 @@ class PersonaPlexTalkerForConditionalGeneration(nn.Module):
             module = getattr(self, sub)
             for tgt in module.load_weights(sub_w):
                 loaded.add(f"{sub}.{tgt}")
+        if getattr(self.vllm_config.model_config, "session_mode", "turn") == "duplex":
+            runtime = self._duplex_stage0_runtime()
+            runtime.load_encoder(cuda_graph=bool(getattr(self.config, "mimi_cuda_graphs", False)))
+            self._warm_duplex_prefill()
+            if getattr(self.config, "depformer_cuda_graphs", False):
+                self._depformer_graphs = self._build_depformer_graphs(runtime)
         return loaded
+
+    def _warm_duplex_prefill(self) -> None:
+        """Build the default voice + persona first-append prefill once the embedding tables are loaded.
+
+        Otherwise the first such session builds it on the step thread. Best
+        effort: a checkpoint without the default voice builds prefills on use.
+        """
+        try:
+            self._duplex_stage0_runtime().warm_prefill()
+        except (FileNotFoundError, ValueError):
+            logger.warning(
+                "PersonaPlex could not warm the default voice prefill; it is built on first use", exc_info=True
+            )
+
+    def _build_depformer_graphs(self, runtime: Any) -> PersonaPlexDepformerGraphs:
+        """Capture the duplex depformer step at vLLM's padded batch sizes."""
+        scheduler_config = self.vllm_config.scheduler_config
+        compilation_config = self.vllm_config.compilation_config
+        buckets = depformer_graph_buckets(
+            getattr(compilation_config, "cudagraph_capture_sizes", None),
+            int(scheduler_config.max_num_seqs),
+        )
+        graphs = PersonaPlexDepformerGraphs(
+            self.depformer,
+            runtime,
+            buckets=buckets,
+            num_steps=self.num_active_codebooks,
+            hidden_size=self.mtp_hidden_size,
+            dtype=self._dtype,
+            device=next(self.parameters()).device,
+        )
+        graphs.capture()
+        return graphs
 
     def _load_temporal(
         self,

@@ -20,9 +20,10 @@ from typing import Any
 
 import torch
 import torch.nn as nn
+from einops import rearrange
 from vllm.logger import init_logger
 
-from vllm_omni.diffusion.forward_context import get_forward_context
+from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
 from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
@@ -579,6 +580,139 @@ def extract_zimage_context(
     )
 
 
+def extract_ming_image_context(
+    module: nn.Module,
+    x: list[torch.Tensor],
+    t: torch.Tensor,
+    cap_feats: list[torch.Tensor],
+    patch_size: int = 2,
+    f_patch_size: int = 1,
+) -> CacheContext:
+    """Mirror Ming's forward around the cacheable main stack.
+
+    Ming adds reference latents, direct conditioning, variant-specific padding,
+    and generated-frame cropping to Z-Image, so its extractor cannot reuse the
+    Z-Image extractor without changing the dense forward contract.
+    """
+    from torch.nn.utils.rnn import pad_sequence
+
+    generated_frames = [item.shape[1] for item in x]
+    device = x[0].device
+    ref_x = None
+    cap_feats_2 = None
+    if is_forward_context_available():
+        context = get_forward_context()
+        if context.ref_latent is not None:
+            ref_x = [item.to(device=device, dtype=x[0].dtype) for item in context.ref_latent.unbind(dim=0)]
+        if context.direct_condition is not None:
+            cap_feats_2 = [item.to(device=device, dtype=x[0].dtype) for item in context.direct_condition.unbind(dim=0)]
+
+    bsz = len(x)
+    adaln_input = module.t_embedder(t * module.t_scale)
+    (
+        x_patches,
+        cap_feats_processed,
+        x_size,
+        x_pos_ids,
+        cap_pos_ids,
+        x_inner_pad_mask,
+        cap_inner_pad_mask,
+        cap_feats_2_processed,
+    ) = module.patchify_and_embed(x, cap_feats, patch_size, f_patch_size, ref_x, cap_feats_2)
+
+    x_item_seqlens = [len(item) for item in x_patches]
+    x_embedded = module.all_x_embedder[f"{patch_size}-{f_patch_size}"](torch.cat(x_patches, dim=0))
+    adaln_input = adaln_input.type_as(x_embedded)
+    x_pad_mask = torch.cat(x_inner_pad_mask)
+    x_padding = (
+        module.x_pad_token.expand(x_embedded.shape[0], -1)
+        if module.alignment_padding_mode == "learned"
+        else torch.zeros_like(x_embedded)
+    )
+    x_embedded = torch.where(x_pad_mask.unsqueeze(1).expand_as(x_embedded), x_padding, x_embedded)
+    x_items = list(x_embedded.split(x_item_seqlens, dim=0))
+    x_cos, x_sin = module.rope_embedder(torch.cat(x_pos_ids, dim=0))
+    x_cos = list(x_cos.split(x_item_seqlens, dim=0))
+    x_sin = list(x_sin.split(x_item_seqlens, dim=0))
+    x_batched = pad_sequence(x_items, batch_first=True, padding_value=0.0)
+    x_cos_batched = pad_sequence(x_cos, batch_first=True, padding_value=0.0)
+    x_sin_batched = pad_sequence(x_sin, batch_first=True, padding_value=0.0)
+    x_attn_mask = torch.zeros((bsz, max(x_item_seqlens)), dtype=torch.bool, device=device)
+    for i, seq_len in enumerate(x_item_seqlens):
+        x_attn_mask[i, :seq_len] = 1
+        if module.alignment_padding_mode == "zero_masked":
+            x_attn_mask[i, :seq_len].masked_fill_(x_inner_pad_mask[i], False)
+    for layer in module.noise_refiner:
+        x_batched = layer(x_batched, x_attn_mask, x_cos_batched, x_sin_batched, adaln_input)
+
+    cap_item_seqlens = [len(item) for item in cap_feats_processed]
+    cap_embedded = module.cap_embedder(torch.cat(cap_feats_processed, dim=0))
+    if cap_feats_2_processed:
+        cap_items = list(cap_embedded.split(cap_item_seqlens, dim=0))
+        if len(cap_items) != len(cap_feats_2_processed):
+            raise ValueError("Primary and direct caption conditions must have equal batch size.")
+        cap_items = [torch.cat([primary, direct], dim=0) for primary, direct in zip(cap_items, cap_feats_2_processed)]
+        cap_item_seqlens = [len(item) for item in cap_items]
+        cap_embedded = torch.cat(cap_items, dim=0)
+    cap_pad_mask = torch.cat(cap_inner_pad_mask)
+    cap_padding = (
+        module.cap_pad_token.expand(cap_embedded.shape[0], -1)
+        if module.alignment_padding_mode == "learned"
+        else torch.zeros_like(cap_embedded)
+    )
+    cap_embedded = torch.where(cap_pad_mask.unsqueeze(1).expand_as(cap_embedded), cap_padding, cap_embedded)
+    cap_items = list(cap_embedded.split(cap_item_seqlens, dim=0))
+    cap_cos, cap_sin = module.rope_embedder(torch.cat(cap_pos_ids, dim=0))
+    cap_cos = list(cap_cos.split(cap_item_seqlens, dim=0))
+    cap_sin = list(cap_sin.split(cap_item_seqlens, dim=0))
+    cap_batched = pad_sequence(cap_items, batch_first=True, padding_value=0.0)
+    cap_cos_batched = pad_sequence(cap_cos, batch_first=True, padding_value=0.0)
+    cap_sin_batched = pad_sequence(cap_sin, batch_first=True, padding_value=0.0)
+    cap_attn_mask = torch.zeros((bsz, max(cap_item_seqlens)), dtype=torch.bool, device=device)
+    for i, seq_len in enumerate(cap_item_seqlens):
+        cap_attn_mask[i, :seq_len] = 1
+        if module.alignment_padding_mode == "zero_masked":
+            cap_attn_mask[i, :seq_len].masked_fill_(cap_inner_pad_mask[i], False)
+    for layer in module.context_refiner:
+        cap_batched = layer(cap_batched, cap_attn_mask, cap_cos_batched, cap_sin_batched)
+
+    unified, unified_cos, unified_sin, unified_attn_mask = module.unified_prepare(
+        x_batched,
+        x_cos_batched,
+        x_sin_batched,
+        cap_batched,
+        cap_cos_batched,
+        cap_sin_batched,
+        x_item_seqlens,
+        cap_item_seqlens,
+        x_attn_mask,
+        cap_attn_mask,
+    )
+    block = module.layers[0]
+    scale_msa = 1.0 + block.adaLN_modulation(adaln_input).unsqueeze(1).chunk(4, dim=2)[0]
+    modulated_input = block.attention_norm1(unified) * scale_msa
+
+    def run_transformer_blocks() -> tuple[torch.Tensor]:
+        hidden = unified
+        for layer in module.layers:
+            hidden = layer(hidden, unified_attn_mask, unified_cos, unified_sin, adaln_input)
+        return (hidden,)
+
+    def postprocess(hidden: torch.Tensor) -> tuple[list[torch.Tensor], dict]:
+        hidden = module.all_final_layer[f"{patch_size}-{f_patch_size}"](hidden, adaln_input)
+        output = module.unpatchify(list(hidden.unbind(dim=0)), x_size, patch_size, f_patch_size)
+        return [item[:, :frames] for item, frames in zip(output, generated_frames)], {}
+
+    return CacheContext(
+        modulated_input=modulated_input,
+        hidden_states=unified,
+        encoder_hidden_states=None,
+        temb=adaln_input,
+        run_transformer_blocks=run_transformer_blocks,
+        postprocess=postprocess,
+    )
+
+
 def extract_flux2_klein_context(
     module: nn.Module,
     hidden_states: torch.Tensor,
@@ -820,6 +954,114 @@ def extract_longcat_context(
         temb=temb,
         run_transformer_blocks=run_transformer_blocks,
         postprocess=postprocess,
+    )
+
+
+def extract_mammoth_moda2_context(
+    module: nn.Module,
+    hidden_states: torch.Tensor,
+    timestep: torch.Tensor,
+    text_hidden_states: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    text_attention_mask: torch.Tensor,
+    ref_image_hidden_states: list[list[torch.Tensor]] | None = None,
+    ar_image_hidden_states: torch.Tensor | None = None,
+    ar_image_attention_mask: torch.Tensor | None = None,
+    return_dict: bool = False,
+    teacache_branch: str | None = None,
+) -> CacheContext:
+    """Extract cache context for MammothModa2's Lumina-style DiT."""
+    if not hasattr(module, "layers") or len(module.layers) == 0:
+        raise ValueError("Module must have layers")
+
+    batch_size, height, width = module._validate_inputs(
+        hidden_states,
+        text_hidden_states,
+        text_attention_mask,
+        ref_image_hidden_states,
+        return_dict,
+    )
+
+    (
+        temb,
+        text_hidden_states,
+        text_attention_mask,
+        img_tokens,
+        img_mask,
+        img_len,
+        context_rotary_emb,
+        noise_rotary_emb,
+        rotary_emb,
+        encoder_seq_lengths,
+        seq_lengths,
+    ) = module._prepare_embeddings(
+        hidden_states,
+        timestep,
+        text_hidden_states,
+        text_attention_mask,
+        freqs_cis,
+        batch_size,
+        height,
+        width,
+        ar_image_hidden_states,
+        ar_image_attention_mask,
+    )
+
+    text_hidden_states, img_tokens = module._apply_refiners(
+        text_hidden_states,
+        text_attention_mask,
+        context_rotary_emb,
+        img_tokens,
+        img_mask,
+        noise_rotary_emb,
+        temb,
+    )
+
+    max_seq_len = max(seq_lengths)
+    attention_mask = img_tokens.new_zeros(batch_size, max_seq_len, dtype=torch.bool)
+    joint_hidden_states = img_tokens.new_zeros(batch_size, max_seq_len, module.config.hidden_size)
+    for i, (encoder_seq_len, seq_len) in enumerate(zip(encoder_seq_lengths, seq_lengths)):
+        attention_mask[i, :seq_len] = True
+        joint_hidden_states[i, :encoder_seq_len] = text_hidden_states[i, :encoder_seq_len]
+        joint_hidden_states[i, encoder_seq_len : encoder_seq_len + img_len] = img_tokens[i, :img_len]
+
+    modulated_input = module.layers[0].norm1(joint_hidden_states, temb)[0]
+
+    def run_transformer_blocks() -> tuple[torch.Tensor]:
+        h = module._apply_transformer_layers(joint_hidden_states, attention_mask, rotary_emb, temb)
+        return (h,)
+
+    def postprocess(h: torch.Tensor) -> torch.Tensor:
+        h = module.norm_out(h, temb)
+        p = module.config.patch_size
+        img_hidden_states = torch.stack(
+            [
+                h[i, encoder_seq_len : encoder_seq_len + img_len]
+                for i, encoder_seq_len in enumerate(encoder_seq_lengths)
+            ],
+            dim=0,
+        )
+        return rearrange(
+            img_hidden_states,
+            "b (h w) (p1 p2 c) -> b c (h p1) (w p2)",
+            h=height // p,
+            w=width // p,
+            p1=p,
+            p2=p,
+        )
+
+    extra_states = {}
+    if teacache_branch is not None:
+        extra_states["teacache_branch"] = teacache_branch
+
+    return CacheContext(
+        modulated_input=modulated_input,
+        hidden_states=joint_hidden_states,
+        encoder_hidden_states=None,
+        temb=temb,
+        run_transformer_blocks=run_transformer_blocks,
+        postprocess=postprocess,
+        extra_states=extra_states,
     )
 
 
@@ -1201,6 +1443,8 @@ def extract_sensenova_u1_context(
     use_cache: bool | None = None,
     embed_only: bool = False,
     compute_logits: bool = True,
+    exist_und: bool | None = None,
+    exist_gen: bool | None = None,
     **kwargs: Any,
 ) -> CacheContext:
     """Extract cache context for SenseNovaU1ForCausalLM denoising forwards."""
@@ -1211,15 +1455,22 @@ def extract_sensenova_u1_context(
     layer_kwargs = dict(kwargs)
     layer_kwargs.pop("cache_dit_skip", None)
     image_gen_indicators = layer_kwargs.pop("image_gen_indicators", None)
-    exist_und = (~image_gen_indicators).any().item()
-    exist_gen = image_gen_indicators.any().item()
+    if exist_und is None or exist_gen is None:
+        exist_und = (~image_gen_indicators).any().item()
+        exist_gen = image_gen_indicators.any().item()
     causal_mask_mapping = attention_mask
 
     first_layer = module.model.layers[0]
     modulated_input = first_layer.input_layernorm_mot_gen(inputs_embeds)
 
     def run_transformer_blocks():
+        assert indexes is not None
         h = inputs_embeds
+        position_embeddings = (
+            module.model.rotary_emb(h, indexes[0].unsqueeze(0)),
+            module.model.rotary_emb_hw(h, indexes[1].unsqueeze(0)),
+            module.model.rotary_emb_hw(h, indexes[2].unsqueeze(0)),
+        )
         for layer in module.model.layers:
             h = layer(
                 h,
@@ -1227,6 +1478,7 @@ def extract_sensenova_u1_context(
                 exist_und=exist_und,
                 exist_gen=exist_gen,
                 indexes=indexes,
+                position_embeddings=position_embeddings,
                 attention_mask=causal_mask_mapping,
                 past_key_values=past_key_values,
                 **layer_kwargs,
@@ -1490,6 +1742,12 @@ def extract_cosmos3_context(
     **kwargs: Any,
 ) -> CacheContext:
     """Build the shared cache execution context for Cosmos3's GEN pathway."""
+    if "intermediate_tensors" in kwargs:
+        # Only the pipeline-parallel driver passes this; the pipeline rejects
+        # cache backends under PP at init, so this is a defensive backstop.
+        raise NotImplementedError(
+            "Cosmos3 TeaCache/SeaCache is not supported together with pipeline parallelism; disable one of them."
+        )
     if kwargs:
         raise TypeError(f"Unexpected Cosmos3 transformer kwargs: {sorted(kwargs)}")
 
@@ -1511,6 +1769,9 @@ def extract_cosmos3_context(
         control_weights=control_weights,
         transfer_share_vision_temporal_positions=transfer_share_vision_temporal_positions,
     )
+    # Cache residuals stay rank-local: shard before the context and its
+    # closures retain prep; postprocess gathers on both misses and hits.
+    prep = module._shard_gen_prep(prep, defer_gather=True)
 
     def run_transformer_blocks() -> tuple[torch.Tensor, ...]:
         return (module._run_gen_stack(prep),)
@@ -1552,10 +1813,12 @@ EXTRACTOR_REGISTRY: dict[str, Callable] = {
     "Cosmos3EdgeVFMTransformer": extract_cosmos3_context,
     "Cosmos3VFMTransformer": extract_cosmos3_context,
     "ZImageTransformer2DModel": extract_zimage_context,
+    "MingImageTransformer2DModel": extract_ming_image_context,
     "Flux2Klein": extract_flux2_klein_context,
     "StableAudioDiTModel": extract_stable_audio_context,
     "Flux2Transformer2DModel": extract_flux2_context,
     "LongCatImageTransformer2DModel": extract_longcat_context,
+    "MammothModa2Transformer2DModel": extract_mammoth_moda2_context,
     "FluxTransformer2DModel": extract_flux_context,
     "SenseNovaU1ForCausalLM": extract_sensenova_u1_context,
     "MiniMaxH3DiTModel": extract_minimax_h3_context,

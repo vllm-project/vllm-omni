@@ -3,9 +3,9 @@
 # Adapted from Helios (https://github.com/BestWishYsh/Helios)
 
 import math
+import weakref
 from collections import OrderedDict
 from collections.abc import Iterable
-from functools import lru_cache
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -28,6 +28,11 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.cache.cachedit import CacheDiTAdapterConfig
 from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelOutput
+from vllm_omni.diffusion.models.helios.conditioning_cache import (
+    HeliosConditioningCache,
+    active_conditioning_cache,
+    tensor_version,
+)
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import (
@@ -159,6 +164,9 @@ class HeliosFeedForward(nn.Module):
         return hidden_states
 
 
+_SPATIAL_MESHGRID_CACHE_SIZE = 32
+
+
 class HeliosRotaryPosEmbed(nn.Module):
     """Helios-style 3D rotary position embeddings using explicit frame indices."""
 
@@ -169,6 +177,9 @@ class HeliosRotaryPosEmbed(nn.Module):
         self.register_buffer("freqs_base_t", self._get_freqs_base(self.DT), persistent=False)
         self.register_buffer("freqs_base_y", self._get_freqs_base(self.DY), persistent=False)
         self.register_buffer("freqs_base_x", self._get_freqs_base(self.DX), persistent=False)
+        self._spatial_meshgrid_cache: OrderedDict[tuple[int, int, str], tuple[torch.Tensor, torch.Tensor]] = (
+            OrderedDict()
+        )
 
     def _get_freqs_base(self, dim):
         return 1.0 / (self.theta ** (torch.arange(0, dim, 2, dtype=torch.float32)[: (dim // 2)] / dim))
@@ -180,13 +191,21 @@ class HeliosRotaryPosEmbed(nn.Module):
         return freqs.cos(), freqs.sin()
 
     @torch.no_grad()
-    @lru_cache(maxsize=32)
-    def _get_spatial_meshgrid(self, height, width, device_str):
+    def _get_spatial_meshgrid(self, height: int, width: int, device_str: str) -> tuple[torch.Tensor, torch.Tensor]:
+        key = (height, width, device_str)
+        grids = self._spatial_meshgrid_cache.get(key)
+        if grids is not None:
+            self._spatial_meshgrid_cache.move_to_end(key)
+            return grids
+
         device = torch.device(device_str)
         grid_y_coords = torch.arange(height, device=device, dtype=torch.float32)
         grid_x_coords = torch.arange(width, device=device, dtype=torch.float32)
-        grid_y, grid_x = torch.meshgrid(grid_y_coords, grid_x_coords, indexing="ij")
-        return grid_y, grid_x
+        grids = torch.meshgrid(grid_y_coords, grid_x_coords, indexing="ij")
+        self._spatial_meshgrid_cache[key] = grids
+        if len(self._spatial_meshgrid_cache) > _SPATIAL_MESHGRID_CACHE_SIZE:
+            self._spatial_meshgrid_cache.popitem(last=False)
+        return grids
 
     @torch.no_grad()
     def forward(self, frame_indices, height, width, device):
@@ -445,6 +464,9 @@ class HeliosCrossAttention(nn.Module):
             num_kv_heads=self.num_heads,
             softmax_scale=1.0 / (head_dim**0.5),
             causal=False,
+            computation="cross",
+            cross_parallel_layout="local_q_replicated_kv",
+            qkv_layout="BSND",
             # Text K/V is replicated on every SP rank, so Ulysses must not be
             # used here: its all-to-all would treat the per-rank replicas as
             # sequence shards and ws-fold duplicate the keys. Sharded Q over
@@ -790,79 +812,62 @@ class HeliosTransformer3DModel(nn.Module):
         # 5. Output norm & projection
         self.norm_out = HeliosOutputNorm(inner_dim, eps)
         self.proj_out = nn.Linear(inner_dim, out_channels * math.prod(patch_size))
-        self._projected_encoder_cache: OrderedDict[tuple, torch.Tensor] = OrderedDict()
-        self._cross_attn_kv_cache: OrderedDict[tuple, list[tuple[torch.Tensor, torch.Tensor]]] = OrderedDict()
-        self._cross_attn_cache_size = 2
+        self._conditioning_owner = object()
+        self._conditioning_revision = 0
+        self._conditioning_dependencies = ()
+        self._conditioning_versions = ()
 
     @property
     def dtype(self) -> torch.dtype:
         return next(self.parameters()).dtype
 
-    @staticmethod
-    def _tensor_cache_key(tensor: torch.Tensor) -> tuple:
-        try:
-            version = tensor._version
-        except RuntimeError:
-            version = None
-
-        return (
-            tensor.data_ptr(),
-            tuple(tensor.shape),
-            tuple(tensor.stride()),
-            tensor.dtype,
-            tensor.device.type,
-            tensor.device.index,
-            version,
-        )
-
-    @staticmethod
-    def _get_from_lru(cache: OrderedDict, key: tuple):
-        value = cache.get(key)
-        if value is not None:
-            cache.move_to_end(key)
-        return value
-
-    def _put_lru(self, cache: OrderedDict, key: tuple, value) -> None:
-        cache[key] = value
-        cache.move_to_end(key)
-        while len(cache) > self._cross_attn_cache_size:
-            cache.popitem(last=False)
-
     def clear_cross_attention_cache(self) -> None:
-        self._projected_encoder_cache.clear()
-        self._cross_attn_kv_cache.clear()
+        """Invalidate active request projections before the next lookup.
+
+        Call after non-tensor adapter/configuration changes as well as weight
+        loading. Request owners release storage on completion or cancellation.
+        """
+        self._conditioning_revision += 1
 
     def _cache_enabled(self) -> bool:
         return not self.training and not torch.is_grad_enabled() and not torch.compiler.is_compiling()
 
-    def _project_encoder_hidden_states(self, encoder_hidden_states: torch.Tensor) -> torch.Tensor:
-        if not self._cache_enabled():
-            return self.condition_embedder.text_embedder(encoder_hidden_states)
-
-        cache_key = self._tensor_cache_key(encoder_hidden_states)
-        cached = self._get_from_lru(self._projected_encoder_cache, cache_key)
-        if cached is not None:
-            return cached
-
-        projected = self.condition_embedder.text_embedder(encoder_hidden_states)
-        self._put_lru(self._projected_encoder_cache, cache_key, projected)
-        return projected
-
-    def _get_cross_attn_key_values(
-        self,
-        encoder_hidden_states: torch.Tensor,
-    ) -> list[tuple[torch.Tensor, torch.Tensor]] | None:
-        if not self._cache_enabled():
+    def _conditioning_projection_revision(self):
+        # Track all projection parameters, including norm/quantization/adapter
+        # parameters registered in these modules. Inference-mode parameters lack
+        # a reliable counter, so disable reuse for that case.
+        modules = [self.condition_embedder.text_embedder, *(block.attn2 for block in self.blocks)]
+        dependencies = tuple(t for module in modules for t in (*module.parameters(), *module.buffers()))
+        versions = tuple((tensor_version(t), t.dtype, t.device) for t in dependencies)
+        if any(version is None for version, _, _ in versions):
             return None
+        same_objects = len(dependencies) == len(self._conditioning_dependencies) and all(
+            current is previous() for current, previous in zip(dependencies, self._conditioning_dependencies)
+        )
+        if not same_objects or versions != self._conditioning_versions:
+            self._conditioning_revision += 1
+            self._conditioning_dependencies = tuple(weakref.ref(t) for t in dependencies)
+            self._conditioning_versions = versions
+        device_type = next(self.parameters()).device.type
+        autocast = (torch.is_autocast_enabled(device_type), torch.get_autocast_dtype(device_type))
+        return self._conditioning_owner, self._conditioning_revision, autocast
 
-        cache_key = self._tensor_cache_key(encoder_hidden_states)
-        cached = self._get_from_lru(self._cross_attn_kv_cache, cache_key)
-        if cached is not None:
-            return cached
+    def _prepare_conditioning(self, source, cache, branch):
+        if cache is None or not self._cache_enabled():
+            projected = self.condition_embedder.text_embedder(source)
+            return projected, None
+        revision = self._conditioning_projection_revision()
+        if revision is None:
+            # Drop any prior value before using unversioned weights.
+            cache.invalidate()
+            projected = self.condition_embedder.text_embedder(source)
+            return projected, None
 
-        key_values = [block.attn2.project_kv(encoder_hidden_states) for block in self.blocks]
-        self._put_lru(self._cross_attn_kv_cache, cache_key, key_values)
-        return key_values
+        def build(value):
+            projected = self.condition_embedder.text_embedder(value)
+            return projected, [block.attn2.project_kv(projected) for block in self.blocks]
+
+        return cache.prepare(source, branch=branch, projection_revision=revision, build=build)
 
     def forward(
         self,
@@ -878,6 +883,8 @@ class HeliosTransformer3DModel(nn.Module):
         latents_history_long: torch.Tensor | None = None,
         return_dict: bool = True,
         attention_kwargs: dict[str, Any] | None = None,
+        conditioning_cache: HeliosConditioningCache | None = None,
+        conditioning_branch: str = "positive",
     ) -> torch.Tensor | Transformer2DModelOutput:
         batch_size = hidden_states.shape[0]
         p_t, p_h, p_w = self.config.patch_size
@@ -989,7 +996,11 @@ class HeliosTransformer3DModel(nn.Module):
             encoder_hidden_states,
             is_return_encoder_hidden_states=False,
         )
-        encoder_hidden_states = self._project_encoder_hidden_states(encoder_hidden_states)
+        if conditioning_cache is None and self._cache_enabled():
+            conditioning_cache = active_conditioning_cache()
+        encoder_hidden_states, cross_attn_key_values = self._prepare_conditioning(
+            encoder_hidden_states, conditioning_cache, conditioning_branch
+        )
         timestep_proj = timestep_proj.unflatten(-1, (6, -1))
 
         if indices_hidden_states is not None and not self.zero_history_timestep:
@@ -1022,7 +1033,6 @@ class HeliosTransformer3DModel(nn.Module):
         hidden_states = hidden_states.contiguous()
         encoder_hidden_states = encoder_hidden_states.contiguous()
         rotary_emb = rotary_emb.contiguous()
-        cross_attn_key_values = self._get_cross_attn_key_values(encoder_hidden_states)
 
         for block_idx, block in enumerate(self.blocks):
             cross_attn_key_value = None if cross_attn_key_values is None else cross_attn_key_values[block_idx]
@@ -1058,6 +1068,7 @@ class HeliosTransformer3DModel(nn.Module):
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load weights with QKV fusion, FFN remapping, and TP norm sharding."""
+        self.clear_cross_attention_cache()
         tp_rank = get_tensor_model_parallel_rank()
         tp_size = get_tensor_model_parallel_world_size()
 

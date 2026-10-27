@@ -340,3 +340,14 @@ def test_disabled_ban_skips_derivation_entirely() -> None:
     talker = _make_init_talker(codes=RuntimeError("must not be called"), ban_frames=0)
     talker._init_silence_mask()
     assert talker._silence_ban_frames == 0
+
+
+def test_codec_mask_is_preserved_for_prompt_logprobs_with_fused_sampling():
+    talker = _make_talker(ban_frames=0, logits=torch.zeros((2, _VOCAB)))
+    talker._codec_disallowed_mask[3] = True
+    # A stale marker from a registered fused sampler must not change this
+    # shared compute_logits contract used by MRv2 prompt logprobs.
+    talker._codec_mask_in_sampler = True
+    logits = talker.compute_logits(torch.zeros((2, 4)))
+    assert torch.isneginf(logits[:, 3]).all()
+    assert torch.isfinite(logits[:, 2]).all()

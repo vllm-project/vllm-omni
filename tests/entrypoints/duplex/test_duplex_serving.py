@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from typing import Any
 
@@ -17,7 +18,15 @@ from fastapi import WebSocketDisconnect
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
 from vllm_omni.engine.duplex import commands
 from vllm_omni.engine.duplex.config import DuplexCapabilities
-from vllm_omni.engine.duplex.events import AudioDelta, DuplexEvent, SessionClosed, SessionCreated
+from vllm_omni.engine.duplex.delivery import DuplexOutputBuffer
+from vllm_omni.engine.duplex.events import (
+    AudioDelta,
+    DuplexEvent,
+    ErrorEvent,
+    SessionClosed,
+    SessionCreated,
+    SessionUpdated,
+)
 from vllm_omni.engine.duplex.messages import DuplexSessionError
 from vllm_omni.entrypoints.duplex.realtime_input import RealtimeEnvelope, parse_resume_request
 from vllm_omni.entrypoints.duplex.serving import OmniDuplexSessionHandler
@@ -93,10 +102,34 @@ class FakeHandle:
         self.closed = False
         self.close_reasons: list[str] = []
         self.commands: list[commands.DuplexCommand] = []
-        self._outbox: asyncio.Queue[DuplexEvent] = asyncio.Queue()
+        self._outbox = DuplexOutputBuffer(max_bytes=2 * 1024 * 1024, max_events=512)
+        #: When set, ``events()`` waits before the first yield so a test can
+        #: disconnect the reader before ``session.created`` is pumped.
+        self.hold_events: asyncio.Event | None = None
 
     def deliver(self, event: DuplexEvent) -> None:
-        self._outbox.put_nowait(event)
+        self._outbox.put(event)
+
+    def output_guard(self, event: DuplexEvent):
+        return self._outbox.guard(event)
+
+    def _latest_accepted_session(self) -> tuple[int, dict[str, object] | None]:
+        return self._outbox.latest_accepted_session()
+
+    def _observation_seq(self) -> int:
+        return self._outbox.observation_seq()
+
+    async def _wait_for_observation(self, seen: int) -> bool:
+        return await self._outbox.wait_for_observation(seen)
+
+    def _arm_observation_retention(self, after_seq: int, event_id: str) -> None:
+        self._outbox.arm_observation_retention(after_seq, event_id)
+
+    def _disarm_observation_retention(self) -> None:
+        self._outbox.disarm_observation_retention()
+
+    def _retained_observations_after(self, seq: int) -> tuple[DuplexEvent, ...]:
+        return self._outbox.retained_observations_after(seq)
 
     async def submit(self, command: commands.DuplexCommand) -> None:
         if self.closed:
@@ -104,8 +137,15 @@ class FakeHandle:
         self.commands.append(command)
 
     async def events(self):
+        if self.hold_events is not None:
+            await self.hold_events.wait()
+            self.hold_events = None
         while True:
             event = await self._outbox.get()
+            if event is None:
+                return
+            if not self._outbox.is_valid(event):
+                continue
             yield event
             if event.is_terminal:
                 return
@@ -131,7 +171,16 @@ class FakeOmni:
         self.handles: dict[str, FakeHandle] = {}
         self.resumed: list[tuple[str, int]] = []
         self.detached: list[str] = []
+        #: Detaches the engine refused because the caller's lease generation was stale.
+        self.detach_refused: list[tuple[str, int]] = []
         self.open_error: DuplexSessionError | None = None
+        self.hold_events: asyncio.Event | None = None
+        #: When set, ``resume_session`` parks on it once the engine applied the
+        #: resume: the lease generation is bumped, the result is still in flight.
+        self.resume_gate: asyncio.Event | None = None
+        self.resume_started = asyncio.Event()
+        #: Settlements of resumes whose caller was cancelled mid-RPC (DuplexOmni's contract).
+        self.compensations: list[asyncio.Task[None]] = []
 
     async def open_session(self, config: Any) -> FakeHandle:
         self.opened.append(dict(config))
@@ -139,6 +188,7 @@ class FakeOmni:
             raise self.open_error
         session_id = f"duplex-{len(self.handles) + 1:032x}"
         handle = FakeHandle(session_id, self.capabilities, idle_timeout_s=self.idle_timeout_s)
+        handle.hold_events = self.hold_events
         self.handles[session_id] = handle
         handle.deliver(SessionCreated(session_id=session_id, session={"id": session_id, "model": config.get("model")}))
         return handle
@@ -146,13 +196,46 @@ class FakeOmni:
     def get_session(self, session_id: str) -> FakeHandle | None:
         return self.handles.get(session_id)
 
-    async def resume_session(self, session_id: str, *, expected_lease_generation: int) -> FakeHandle:
+    async def resume_session(
+        self,
+        session_id: str,
+        *,
+        expected_lease_generation: int,
+        on_abandoned: Callable[[int], Awaitable[None]] | None = None,
+    ) -> FakeHandle:
         self.resumed.append((session_id, expected_lease_generation))
         handle = self.handles[session_id]
-        handle.lease_generation = expected_lease_generation + 1
+        lease_generation = expected_lease_generation + 1
+        handle.lease_generation = lease_generation
+        if self.resume_gate is not None:
+            self.resume_started.set()
+            gate = self.resume_gate
+            try:
+                await gate.wait()
+            except asyncio.CancelledError:
+                # DuplexOmni's contract: the engine applied the resume; once
+                # its answer arrives the landed generation is settled off the
+                # cancelled task, through the caller's callback if it gave one.
+                async def settle() -> None:
+                    await gate.wait()
+                    if on_abandoned is not None:
+                        await on_abandoned(lease_generation)
+                    else:
+                        with suppress(DuplexSessionError):
+                            await self.detach_session(session_id, expected_lease_generation=lease_generation)
+
+                self.compensations.append(asyncio.create_task(settle()))
+                raise
         return handle
 
-    async def detach_session(self, session_id: str) -> None:
+    async def detach_session(self, session_id: str, *, expected_lease_generation: int | None = None) -> None:
+        handle = self.handles[session_id]
+        if expected_lease_generation is not None and expected_lease_generation != handle.lease_generation:
+            # The engine's fence: a detach of a lease the caller no longer holds is refused.
+            self.detach_refused.append((session_id, expected_lease_generation))
+            raise DuplexSessionError(
+                "duplex lease generation mismatch", code="session_resume_conflict", session_id=session_id
+            )
         self.detached.append(session_id)
 
 
@@ -260,16 +343,39 @@ async def test_envelope_errors_are_answered_locally_without_touching_the_session
 
 
 @pytest.mark.asyncio
-async def test_open_rejection_is_reported_and_the_socket_ends() -> None:
+@pytest.mark.parametrize(
+    ("code", "retryable", "error_type"),
+    [("resource_exhausted", True, "rate_limit_error"), ("invalid_session_config", False, "invalid_request_error")],
+)
+async def test_open_rejection_reports_retryability_and_handler_returns(
+    code: str, retryable: bool, error_type: str
+) -> None:
     omni = FakeOmni()
-    omni.open_error = DuplexSessionError("no room", code="resource_exhausted", retryable=True)
+    omni.open_error = DuplexSessionError("open rejected", code=code, retryable=retryable)
     handler = _handler(omni)
     ws = FakeWebSocket({"duplex": "1"})
     task = asyncio.create_task(handler.handle_realtime_session(ws))
     ws.feed(_session_update())
     await asyncio.wait_for(task, timeout=2.0)
     assert ws.types() == ["error"]
-    assert ws.sent[0]["error"]["code"] == "resource_exhausted"
+    assert ws.sent[0]["error"] == {
+        "type": error_type,
+        "code": code,
+        "message": "open rejected",
+        "retryable": retryable,
+    }
+
+
+def test_transport_error_without_retryable_preserves_existing_fields() -> None:
+    payload = RealtimeEnvelope.error_payload("bad_event", "invalid input", event_id="client-event", param="audio")
+    assert payload["type"] == "error"
+    assert payload["error"] == {
+        "type": "invalid_request_error",
+        "code": "bad_event",
+        "message": "invalid input",
+        "event_id": "client-event",
+        "param": "audio",
+    }
 
 
 @pytest.mark.asyncio
@@ -341,6 +447,77 @@ async def test_transport_send_failure_detaches_the_session_instead_of_closing_it
     handle.deliver(SessionClosed(session_id=handle.session_id, reason="client_close"))
     await asyncio.sleep(0.05)
     assert handle.session_id not in handler._pumps
+
+
+@pytest.mark.asyncio
+async def test_session_created_send_failure_closes_instead_of_detaching() -> None:
+    """If ``session.created`` never reaches the client, serving must close (#7636 #9).
+
+    Covers the serving branch only (close vs detach). Production admission is
+    released when ``handle.close()`` waits for ``session.closed`` after cleanup.
+    """
+    omni = FakeOmni()
+    handler = _handler(omni)
+    ws = FakeWebSocket({"duplex": "1", "autostart": "0"})
+    # Fail every wire send before ``session.created`` is pumped out.
+    ws.break_sends()
+    task = asyncio.create_task(handler.handle_realtime_session(ws))
+    ws.feed(_session_update())
+    await asyncio.wait_for(task, timeout=2.0)
+
+    assert len(omni.handles) == 1
+    handle = next(iter(omni.handles.values()))
+    assert handle.closed
+    assert handle.close_reasons == ["session_created_undelivered"]
+    assert omni.detached == []
+    assert "session.created" not in ws.types()
+
+
+async def _wait_until(predicate, *, timeout_s: float = 2.0) -> None:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_s
+    while loop.time() < deadline:
+        if predicate():
+            return
+        await asyncio.sleep(0.005)
+    raise AssertionError("timed out waiting for condition")
+
+
+@pytest.mark.asyncio
+async def test_disconnect_before_session_created_closes_instead_of_staying_detached() -> None:
+    """Reader drop before the pump sends ``session.created`` must close (#7636 #9).
+
+    ``send_event`` does not raise when the attachment is already gone and the
+    event is unjournaled. Delivery is the transport callback, not a journal write.
+    """
+    release = asyncio.Event()
+    omni = FakeOmni()
+    omni.hold_events = release
+    handler = _handler(omni)
+    ws = FakeWebSocket({"duplex": "1", "autostart": "0"})
+    task = asyncio.create_task(handler.handle_realtime_session(ws))
+    ws.feed(_session_update())
+    await _wait_until(lambda: bool(omni.handles) and bool(handler._pumps))
+    await asyncio.sleep(0.05)
+    assert "session.created" not in ws.types()
+
+    ws.disconnect()
+    await _wait_until(lambda: bool(omni.detached))
+    handle = next(iter(omni.handles.values()))
+    # Detach alone would keep the admission slot. The pump has not run yet.
+    assert handle.close_reasons == []
+    assert not handle.closed
+
+    release.set()
+    # The websocket task ends on disconnect. The session pump is separate and
+    # only then emits ``session.created`` into a detached registry.
+    await _wait_until(lambda: handle.closed)
+    if not task.done():
+        await asyncio.wait_for(task, timeout=2.0)
+    assert handle.closed
+    assert handle.close_reasons == ["session_created_undelivered"]
+    assert omni.detached == [handle.session_id]
+    assert "session.created" not in ws.types()
 
 
 @pytest.mark.asyncio
@@ -556,6 +733,369 @@ def test_realtime_envelope_first_message_classification() -> None:
     assert autostarted.pending_command_payload == {"type": "input_audio_buffer.commit"}
 
 
+def test_session_update_does_not_mutate_defaults_until_accepted() -> None:
+    """#7636 Issue 10: rejected session.update must not change append decode defaults."""
+    envelope = RealtimeEnvelope.from_query_params({"model": "m"})
+    assert envelope.defaults.input_audio_format == "pcm16"
+
+    envelope.translate(
+        {
+            "type": "session.update",
+            "session": {"model": "another-model", "input_audio_format": "pcm_f32le"},
+        }
+    )
+    # Engine would reject the model change; wire defaults stay pcm16 until session.updated.
+    assert envelope.defaults.input_audio_format == "pcm16"
+
+    envelope.apply_accepted_session({"input_audio_format": "pcm_f32le"})
+    assert envelope.defaults.input_audio_format == "pcm_f32le"
+
+
+def _append(audio: bytes) -> dict[str, object]:
+    return {"type": "input_audio_buffer.append", "audio": base64.b64encode(audio).decode("ascii")}
+
+
+def _decoded_audio_nbytes(command: commands.DuplexCommand) -> int:
+    audio = command.audio
+    if isinstance(audio, str):
+        return len(base64.b64decode(audio))
+    return len(audio)
+
+
+@pytest.mark.asyncio
+async def test_queued_session_updated_applies_before_next_append_while_send_is_delayed() -> None:
+    """#7996 review: a blocked outbound send must not leave the next append on the old format.
+
+    The engine has already queued ``session.updated``. The pump is still
+    delivering an earlier event, so it has not applied the new defaults yet.
+    """
+    omni = FakeOmni()
+    handler = _handler(omni)
+    ws, handle, task = await _open(handler, omni)
+    release = asyncio.Event()
+    sending = asyncio.Event()
+    original_send = ws.send_json
+
+    async def blocked_send(payload: dict[str, Any]) -> None:
+        sending.set()
+        await release.wait()
+        await original_send(payload)
+
+    ws.send_json = blocked_send  # type: ignore[method-assign]
+    try:
+        handle.deliver(AudioDelta(session_id=handle.session_id, response_id="r1", delta="aGk="))
+        await asyncio.wait_for(sending.wait(), timeout=2.0)
+
+        handle.deliver(SessionUpdated(session={"input_audio_format": "pcm_f32le"}))
+        assert "session.updated" not in ws.types()
+        ws.feed(_append(b"\x00" * 8))
+        accepted = await _next_append(handle)
+        # The queued session.updated is applied before this translate, so the
+        # 8 float32 bytes are kept instead of being read as pcm16.
+        assert accepted.format == "pcm_f32le"
+        assert _decoded_audio_nbytes(accepted) == 8
+    finally:
+        release.set()
+        task.cancel()
+        with suppress(asyncio.CancelledError, Exception):
+            await task
+
+
+@pytest.mark.asyncio
+async def test_append_waits_for_engine_session_update_before_translate() -> None:
+    """A pipelined append waits until the engine accepts or rejects the update.
+
+    ``submit`` only enqueues. Until ``session.updated`` or the matching error
+    is enqueued, 8 bytes must not already have been decoded as pcm16.
+    """
+    omni = FakeOmni()
+    handler = _handler(omni)
+    ws, handle, task = await _open(handler, omni)
+    try:
+        rejected_update = _session_update(input_audio_format="pcm_f32le")
+        rejected_update["event_id"] = "upd-reject"
+        ws.feed(rejected_update)
+        ws.feed(_append(b"\x00" * 8))
+        await _next_command(handle, commands.UpdateSession)
+        await asyncio.sleep(0.05)
+        assert not any(isinstance(command, commands.AppendAudio) for command in handle.commands)
+
+        handle.deliver(ErrorEvent(code="model_update_unsupported", message="rejected", related_event_id="upd-reject"))
+        rejected = await _next_append(handle)
+        # pcm16 turns 8 bytes into 4 int16 samples, then 16 bytes of float32.
+        assert _decoded_audio_nbytes(rejected) == 16
+
+        accepted_update = _session_update(input_audio_format="pcm_f32le")
+        accepted_update["event_id"] = "upd-ok"
+        ws.feed(accepted_update)
+        ws.feed(_append(b"\x00" * 8))
+        await _next_command(handle, commands.UpdateSession, after=1)
+        await asyncio.sleep(0.05)
+        assert len([command for command in handle.commands if isinstance(command, commands.AppendAudio)]) == 1
+
+        handle.deliver(SessionUpdated(session={"input_audio_format": "pcm_f32le"}))
+        accepted = await _next_append(handle, after=1)
+        assert accepted.format == "pcm_f32le"
+        assert _decoded_audio_nbytes(accepted) == 8
+    finally:
+        task.cancel()
+        with suppress(asyncio.CancelledError, Exception):
+            await task
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("alias", ["turn.signal", "signal_turn"])
+async def test_session_update_alias_waits_for_the_in_flight_update(alias: str) -> None:
+    """A ``turn.signal`` session update must not skip an in-flight ``session.update``.
+
+    U1 stays pending. U2 arrives as an alias. U1's acceptance must not release
+    an append that is waiting for U2, or eight float32 bytes are decoded as pcm16.
+    """
+    omni = FakeOmni()
+    handler = _handler(omni)
+    ws, handle, task = await _open(handler, omni)
+    try:
+        u1 = _session_update(input_audio_format="pcm16")
+        u1["event_id"] = "u1"
+        ws.feed(u1)
+        await _next_command(handle, commands.UpdateSession)
+        await asyncio.sleep(0.05)
+
+        ws.feed(
+            {
+                "type": alias,
+                "event": "session.update",
+                "event_id": "u2",
+                "payload": {"input_audio_format": "pcm_f32le"},
+            }
+        )
+        ws.feed(_append(b"\x00" * 8))
+        await asyncio.sleep(0.05)
+        assert len([command for command in handle.commands if isinstance(command, commands.UpdateSession)]) == 1
+        assert not any(isinstance(command, commands.AppendAudio) for command in handle.commands)
+
+        handle.deliver(SessionUpdated(session={"input_audio_format": "pcm16"}))
+        u2 = await _next_command(handle, commands.UpdateSession, after=1)
+        assert u2.event_id == "u2"
+        await asyncio.sleep(0.05)
+        assert not any(isinstance(command, commands.AppendAudio) for command in handle.commands)
+
+        handle.deliver(SessionUpdated(session={"input_audio_format": "pcm_f32le"}))
+        accepted = await _next_append(handle)
+        assert accepted.format == "pcm_f32le"
+        assert _decoded_audio_nbytes(accepted) == 8
+    finally:
+        task.cancel()
+        with suppress(asyncio.CancelledError, Exception):
+            await task
+
+
+@pytest.mark.asyncio
+async def test_unrelated_error_does_not_release_an_update_that_omitted_event_id() -> None:
+    """An earlier error with no related id must not settle a session.update that also omitted one.
+
+    The server stamps an id before submit. Only the error that echoes that id,
+    or ``session.updated``, releases the following append.
+    """
+    omni = FakeOmni()
+    handler = _handler(omni)
+    ws, handle, task = await _open(handler, omni)
+    try:
+        ws.feed(_session_update(input_audio_format="pcm_f32le"))
+        ws.feed(_append(b"\x00" * 8))
+        update = await _next_command(handle, commands.UpdateSession)
+        assert isinstance(update.event_id, str) and update.event_id
+        await asyncio.sleep(0.05)
+        assert not any(isinstance(command, commands.AppendAudio) for command in handle.commands)
+
+        handle.deliver(ErrorEvent(code="append_failed", message="earlier append", related_event_id=None))
+        handle.deliver(ErrorEvent(code="other", message="unrelated", related_event_id="not-this-update"))
+        await asyncio.sleep(0.05)
+        assert not any(isinstance(command, commands.AppendAudio) for command in handle.commands)
+
+        handle.deliver(
+            ErrorEvent(code="model_update_unsupported", message="rejected", related_event_id=update.event_id)
+        )
+        rejected = await _next_append(handle)
+        assert _decoded_audio_nbytes(rejected) == 16
+    finally:
+        task.cancel()
+        with suppress(asyncio.CancelledError, Exception):
+            await task
+
+
+@pytest.mark.asyncio
+async def test_internal_error_for_this_update_releases_the_following_append() -> None:
+    """An uncaught update failure is an ``internal_error`` stamped with that update's id.
+
+    The format change was not accepted, so the following append still uses pcm16.
+    """
+    omni = FakeOmni()
+    handler = _handler(omni)
+    ws, handle, task = await _open(handler, omni)
+    try:
+        ws.feed(_session_update(input_audio_format="pcm_f32le"))
+        ws.feed(_append(b"\x00" * 8))
+        update = await _next_command(handle, commands.UpdateSession)
+        await asyncio.sleep(0.05)
+        assert not any(isinstance(command, commands.AppendAudio) for command in handle.commands)
+
+        handle.deliver(ErrorEvent(code="internal_error", message="update exploded", related_event_id=update.event_id))
+        rejected = await _next_append(handle)
+        assert _decoded_audio_nbytes(rejected) == 16
+    finally:
+        task.cancel()
+        with suppress(asyncio.CancelledError, Exception):
+            await task
+
+
+@pytest.mark.asyncio
+async def test_takeover_during_session_update_does_not_submit_the_replaced_append() -> None:
+    """A reader that resumes the session while this one waits must not submit the old append.
+
+    The accepted defaults land on the new connection's envelope. The replaced
+    socket already has the audio bytes, but it no longer owns the attachment.
+    """
+    omni = FakeOmni()
+    handler = _handler(omni)
+    ws, handle, task = await _open(handler, omni)
+    token = ws.sent[0]["resume_token"]
+    opened_generation = ws.sent[0]["attachment_generation"]
+    ws2: FakeWebSocket | None = None
+    task2: asyncio.Task | None = None
+    try:
+        update = _session_update(input_audio_format="pcm_f32le")
+        update["event_id"] = "upd-takeover"
+        ws.feed(update)
+        ws.feed(_append(b"\x00" * 8))
+        await _next_command(handle, commands.UpdateSession)
+        await asyncio.sleep(0.05)
+        assert not any(isinstance(command, commands.AppendAudio) for command in handle.commands)
+
+        ws2, task2 = await _resume(handler, handle.session_id, token)
+        await ws2.wait_for("session.resumed")
+        assert not await handler._attachment_registry.is_current_attachment(handle.session_id, opened_generation)
+
+        handle.deliver(SessionUpdated(session={"input_audio_format": "pcm_f32le"}))
+        await asyncio.sleep(0.05)
+        assert not any(isinstance(command, commands.AppendAudio) for command in handle.commands)
+
+        ws2.feed(_append(b"\x00" * 8))
+        accepted = await _next_append(handle)
+        assert accepted.format == "pcm_f32le"
+        assert _decoded_audio_nbytes(accepted) == 8
+        assert len([command for command in handle.commands if isinstance(command, commands.AppendAudio)]) == 1
+    finally:
+        task.cancel()
+        if task2 is not None:
+            task2.cancel()
+        for pending in (task, task2):
+            if pending is not None:
+                with suppress(asyncio.CancelledError, Exception):
+                    await pending
+
+
+@pytest.mark.asyncio
+async def test_an_older_queued_session_updated_does_not_overwrite_a_newer_acceptance() -> None:
+    """After A then B are accepted, dequeuing A must not put the wire defaults back on A.
+
+    The reader applies B from the outbox's latest generation before the next
+    append. The pump still has A's ``session.updated`` to send; applying that
+    dequeued payload alone would revert pcm_f32le to pcm16.
+    """
+    omni = FakeOmni()
+    handler = _handler(omni)
+    ws, handle, task = await _open(handler, omni)
+    release = asyncio.Event()
+    sending = asyncio.Event()
+    original_send = ws.send_json
+
+    async def blocked_send(payload: dict[str, Any]) -> None:
+        sending.set()
+        await release.wait()
+        await original_send(payload)
+
+    ws.send_json = blocked_send  # type: ignore[method-assign]
+    try:
+        handle.deliver(AudioDelta(session_id=handle.session_id, response_id="r1", delta="aGk="))
+        await asyncio.wait_for(sending.wait(), timeout=2.0)
+
+        handle.deliver(SessionUpdated(session={"input_audio_format": "pcm16", "temperature": 0.2}))
+        handle.deliver(SessionUpdated(session={"input_audio_format": "pcm_f32le", "temperature": 0.3}))
+        ws.feed(_append(b"\x00" * 8))
+        accepted = await _next_append(handle)
+        assert accepted.format == "pcm_f32le"
+        assert _decoded_audio_nbytes(accepted) == 8
+
+        # Let the pump drain A then B. Defaults must stay on B.
+        release.set()
+        await asyncio.sleep(0.05)
+        ws.feed(_append(b"\x00" * 8))
+        second = await _next_append(handle, after=1)
+        assert second.format == "pcm_f32le"
+        assert _decoded_audio_nbytes(second) == 8
+    finally:
+        release.set()
+        task.cancel()
+        with suppress(asyncio.CancelledError, Exception):
+            await task
+
+
+@pytest.mark.asyncio
+async def test_session_update_outcome_survives_a_burst_of_later_errors() -> None:
+    """Only the settling event is retained. Unrelated errors do not grow that list.
+
+    The acceptance has to outlive a burst of later errors, or the next append
+    waits for an outcome the pump may already have delivered.
+    """
+    omni = FakeOmni()
+    handler = _handler(omni)
+    ws, handle, task = await _open(handler, omni)
+    try:
+        update = _session_update(input_audio_format="pcm_f32le")
+        update["event_id"] = "upd-evict"
+        ws.feed(update)
+        await _next_command(handle, commands.UpdateSession)
+
+        for index in range(8):
+            handle.deliver(ErrorEvent(code="unrelated", message=f"before-{index}", related_event_id="other"))
+        assert handle._outbox._retained == []
+
+        handle.deliver(SessionUpdated(session={"input_audio_format": "pcm_f32le"}))
+        for index in range(8):
+            handle.deliver(ErrorEvent(code="unrelated", message=f"after-{index}", related_event_id="other"))
+        assert len(handle._outbox._retained) == 1
+
+        ws.feed(_append(b"\x00" * 8))
+        accepted = await _next_append(handle)
+        assert accepted.format == "pcm_f32le"
+        assert _decoded_audio_nbytes(accepted) == 8
+    finally:
+        task.cancel()
+        with suppress(asyncio.CancelledError, Exception):
+            await task
+
+
+async def _next_command(handle: FakeHandle, command_type: type, *, after: int = 0) -> commands.DuplexCommand:
+    deadline = asyncio.get_running_loop().time() + 2.0
+    while asyncio.get_running_loop().time() < deadline:
+        matched = [command for command in handle.commands if isinstance(command, command_type)]
+        if len(matched) > after:
+            return matched[after]
+        await asyncio.sleep(0.01)
+    raise AssertionError(f"timed out waiting for {command_type.__name__}; commands={handle.commands!r}")
+
+
+async def _next_append(handle: FakeHandle, *, after: int = 0) -> commands.AppendAudio:
+    deadline = asyncio.get_running_loop().time() + 2.0
+    while asyncio.get_running_loop().time() < deadline:
+        appends = [command for command in handle.commands if isinstance(command, commands.AppendAudio)]
+        if len(appends) > after:
+            return appends[after]
+        await asyncio.sleep(0.01)
+    raise AssertionError(f"timed out waiting for append; commands={handle.commands!r}")
+
+
 def test_parse_resume_request_requires_the_three_fields_only() -> None:
     request = parse_resume_request({"session_id": "s", "resume_token": "t", "last_received_server_event_seq": 3})
     assert request is not None
@@ -607,3 +1147,380 @@ async def test_a_resume_that_fails_to_activate_does_not_detach_the_live_attachme
                 pending.cancel()
                 with suppress(asyncio.CancelledError, Exception):
                     await pending
+
+
+# --------------------------------------------------------------------------- #
+# Cancelled resume and the engine disconnect grace (#7636 Issue 3)            #
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_a_resume_cancelled_during_activation_puts_the_engine_lease_back_into_grace() -> None:
+    """``_resume`` resumes the engine lease first; a cancel mid-activation must detach it again.
+
+    The rollback used to catch ``Exception`` only. A handler task cancelled
+    while sending ``session.resumed`` or a replay entry left the engine with
+    ``detached_at=None`` and the outer handler with no attachment to clean up:
+    the reaper reclaimed nothing after the grace, and with one slot the next
+    open was refused with ``resource_exhausted``.
+    """
+    omni = FakeOmni()
+    handler = _handler(omni)
+    ws, handle, task = await _open(handler, omni)
+    token = ws.sent[0]["resume_token"]
+    ws.disconnect()
+    await asyncio.wait_for(task, timeout=2.0)
+    assert omni.detached == [handle.session_id]
+    registry = handler._attachment_registry
+
+    activating = asyncio.Event()
+
+    async def parked_resume(*args, **kwargs):
+        activating.set()
+        await asyncio.Event().wait()
+
+    original_resume = registry.resume
+    registry.resume = parked_resume  # type: ignore[method-assign]
+    try:
+        ws2, task2 = await _resume(handler, handle.session_id, token)
+        await asyncio.wait_for(activating.wait(), timeout=2.0)
+        assert omni.resumed == [(handle.session_id, 0)], "the engine lease was resumed before activation"
+
+        task2.cancel()
+        with suppress(asyncio.CancelledError):
+            await task2
+    finally:
+        registry.resume = original_resume  # type: ignore[method-assign]
+
+    # The lease is detached again, so the disconnect grace runs for it.
+    assert omni.detached == [handle.session_id, handle.session_id]
+    assert not await registry.has_attachment(handle.session_id)
+    assert handle.close_reasons == []
+    # And the session is still resumable with the token the cancelled attempt presented.
+    ws3, task3 = await _resume(handler, handle.session_id, token)
+    resumed = await ws3.wait_for("session.resumed")
+    assert resumed["session_id"] == handle.session_id
+    ws3.disconnect()
+    await asyncio.wait_for(task3, timeout=2.0)
+
+
+@pytest.mark.asyncio
+async def test_a_resume_cancelled_after_activation_detaches_the_attachment_it_made() -> None:
+    """A cancel after the registry activated the new attachment must undo that attachment too.
+
+    Otherwise the session stays attached to a socket nobody serves, with the
+    engine lease resumed: no grace, no expiry, until the idle TTL.
+    """
+    omni = FakeOmni()
+    handler = _handler(omni)
+    ws, handle, task = await _open(handler, omni)
+    token = ws.sent[0]["resume_token"]
+    registry = handler._attachment_registry
+
+    # The takeover notifies the replaced socket after activation; park there.
+    notifying = asyncio.Event()
+
+    async def parked_send(payload: dict[str, Any]) -> None:
+        notifying.set()
+        await asyncio.Event().wait()
+
+    ws.send_json = parked_send  # type: ignore[method-assign]
+    ws2, task2 = await _resume(handler, handle.session_id, token)
+    await asyncio.wait_for(notifying.wait(), timeout=2.0)
+    assert await registry.is_current_attachment(handle.session_id, 2), "the new socket is attached"
+
+    task2.cancel()
+    with suppress(asyncio.CancelledError):
+        await task2
+
+    assert not await registry.has_attachment(handle.session_id)
+    assert omni.detached == [handle.session_id]
+    assert handle.close_reasons == []
+
+    task.cancel()
+    with suppress(asyncio.CancelledError, Exception):
+        await task
+
+
+@pytest.mark.asyncio
+async def test_an_abandoned_resume_never_detaches_the_lease_a_later_resume_owns() -> None:
+    """Two connections resuming the same session: the loser's rollback must not touch the winner's lease.
+
+    Interleaving: A has activated and is notifying the socket it replaced; B,
+    holding A's rotated token, has completed its engine resume but its RPC
+    result has not reached the handler yet, so nothing is attached for B.
+    Cancelling A detaches A's registry generation, which used to make the
+    engine detach unconditional: it landed on the lease B had just resumed,
+    and the reaper expired B after the grace even though it heartbeats. The
+    engine now refuses a detach fenced on a generation it has moved past.
+    """
+    omni = FakeOmni()
+    handler = _handler(omni)
+    ws, handle, task = await _open(handler, omni)
+    token = ws.sent[0]["resume_token"]
+    registry = handler._attachment_registry
+
+    # A takes over and parks while notifying the replaced socket (after activation).
+    notifying = asyncio.Event()
+
+    async def parked_send(payload: dict[str, Any]) -> None:
+        notifying.set()
+        await asyncio.Event().wait()
+
+    ws.send_json = parked_send  # type: ignore[method-assign]
+    ws_a, task_a = await _resume(handler, handle.session_id, token)
+    await asyncio.wait_for(notifying.wait(), timeout=2.0)
+    resumed_a = await ws_a.wait_for("session.resumed")
+    assert handle.lease_generation == 1
+
+    # B resumes with A's rotated token: the engine applies it, the result is still in flight.
+    omni.resume_gate = asyncio.Event()
+    ws_b, task_b = await _resume(handler, handle.session_id, resumed_a["resume_token"])
+    await asyncio.wait_for(omni.resume_started.wait(), timeout=2.0)
+    assert handle.lease_generation == 2
+
+    task_a.cancel()
+    with suppress(asyncio.CancelledError):
+        await task_a
+    assert omni.detached == [], "A's rollback must not detach the lease B resumed"
+    assert omni.detach_refused == [(handle.session_id, 1)]
+    assert not await registry.has_attachment(handle.session_id), "A's attachment is gone"
+
+    omni.resume_gate.set()
+    resumed_b = await ws_b.wait_for("session.resumed")
+    assert resumed_b["attachment_generation"] == 3
+    assert await registry.is_current_attachment(handle.session_id, 3)
+    assert omni.detached == []
+
+    # B's own disconnect detaches the lease B holds.
+    ws_b.disconnect()
+    await asyncio.wait_for(task_b, timeout=2.0)
+    assert omni.detached == [handle.session_id]
+    assert omni.detach_refused == [(handle.session_id, 1)]
+    task.cancel()
+    with suppress(asyncio.CancelledError, Exception):
+        await task
+
+
+@pytest.mark.asyncio
+async def test_an_abandoned_takeover_leaves_the_live_connection_serving_and_owning_the_lease() -> None:
+    """A takeover cancelled mid-RPC must not put the connection it never replaced into disconnect grace.
+
+    A is attached at generation 0. B's engine resume lands generation 1 and B
+    is cancelled before it reaches the registry, so A stays the current
+    attachment. Settling B's generation must hand it to A rather than detach
+    it: A keeps serving, and A's own disconnect later detaches generation 1,
+    which is the lease the engine actually holds.
+    """
+    omni = FakeOmni()
+    handler = _handler(omni)
+    ws, handle, task = await _open(handler, omni)
+    token = ws.sent[0]["resume_token"]
+    registry = handler._attachment_registry
+
+    omni.resume_gate = asyncio.Event()
+    ws_b, task_b = await _resume(handler, handle.session_id, token)
+    await asyncio.wait_for(omni.resume_started.wait(), timeout=2.0)
+    assert handle.lease_generation == 1
+
+    task_b.cancel()
+    with suppress(asyncio.CancelledError):
+        await task_b
+    omni.resume_gate.set()
+    await asyncio.gather(*omni.compensations)
+
+    assert omni.detached == [], "A is still serving: its lease must not enter disconnect grace"
+    assert omni.detach_refused == []
+    assert await registry.is_current_attachment(handle.session_id, 1), "A is still the attachment"
+    handle.deliver(AudioDelta(session_id=handle.session_id, response_id="r1", delta="aGk="))
+    await ws.wait_for("response.output_audio.delta")
+
+    # A now owns generation 1: its disconnect detaches the lease the engine holds.
+    ws.disconnect()
+    await asyncio.wait_for(task, timeout=2.0)
+    assert omni.detached == [handle.session_id]
+    assert omni.detach_refused == []
+
+
+@pytest.mark.asyncio
+async def test_a_send_failure_detaches_the_failed_sockets_own_lease_not_a_pending_resumes() -> None:
+    """The pump's detach is fenced on the lease of the socket whose send failed, captured with it.
+
+    The pump holds the registry's outbound lock while sending to A. B's
+    engine resume lands generation 1 meanwhile and B waits for that lock to
+    activate. When A's send fails, the pump drops A and must detach A's
+    generation 0, which the engine refuses, not B's generation 1, which would
+    put B into disconnect grace the moment it activates.
+    """
+    omni = FakeOmni()
+    handler = _handler(omni)
+    ws, handle, task = await _open(handler, omni)
+    token = ws.sent[0]["resume_token"]
+    registry = handler._attachment_registry
+
+    sending = asyncio.Event()
+    fail_send = asyncio.Event()
+
+    async def parked_failing_send(payload: dict[str, Any]) -> None:
+        sending.set()
+        await fail_send.wait()
+        raise RuntimeError("socket closed")
+
+    ws.send_json = parked_failing_send  # type: ignore[method-assign]
+    handle.deliver(AudioDelta(session_id=handle.session_id, response_id="r1", delta="aGk="))
+    await asyncio.wait_for(sending.wait(), timeout=2.0)
+
+    # B: the engine resume lands; activation waits for the outbound lock the pump holds.
+    ws_b, task_b = await _resume(handler, handle.session_id, token)
+    await asyncio.sleep(0.05)
+    assert omni.resumed == [(handle.session_id, 0)]
+    assert handle.lease_generation == 1
+    assert await registry.is_current_attachment(handle.session_id, 1), "B has not activated yet"
+
+    fail_send.set()
+    resumed_b = await ws_b.wait_for("session.resumed")
+    assert resumed_b["attachment_generation"] == 2
+    assert omni.detached == [], "A's lease (generation 0) is refused, B's lease is untouched"
+    assert omni.detach_refused == [(handle.session_id, 0)]
+    assert await registry.is_current_attachment(handle.session_id, 2)
+
+    # B serves; its own disconnect detaches the lease it resumed.
+    ws_b.disconnect()
+    await asyncio.wait_for(task_b, timeout=2.0)
+    assert omni.detached == [handle.session_id]
+    ws.disconnect()
+    with suppress(asyncio.CancelledError, Exception):
+        await asyncio.wait_for(task, timeout=2.0)
+
+
+@pytest.mark.asyncio
+async def test_an_abandoned_resume_goes_to_the_resume_waiting_to_activate_not_the_socket_it_replaces() -> None:
+    """Three connections: A sending, B resumed and waiting for the outbound lock, C abandoned mid-RPC.
+
+    C's generation 2 must be parked for B's activation. If it were handed to
+    A instead, A's send failure would detach generation 2 (accepted by the
+    engine), and B would then activate on a lease already in disconnect grace
+    and expire despite heartbeating.
+    """
+    omni = FakeOmni()
+    handler = _handler(omni)
+    ws, handle, task = await _open(handler, omni)
+    token = ws.sent[0]["resume_token"]
+    registry = handler._attachment_registry
+
+    sending = asyncio.Event()
+    fail_send = asyncio.Event()
+
+    async def parked_failing_send(payload: dict[str, Any]) -> None:
+        sending.set()
+        await fail_send.wait()
+        raise RuntimeError("socket closed")
+
+    ws.send_json = parked_failing_send  # type: ignore[method-assign]
+    handle.deliver(AudioDelta(session_id=handle.session_id, response_id="r1", delta="aGk="))
+    await asyncio.wait_for(sending.wait(), timeout=2.0)
+
+    # B: engine resume lands generation 1; activation waits for the lock the pump holds.
+    ws_b, task_b = await _resume(handler, handle.session_id, token)
+    await asyncio.sleep(0.05)
+    assert handle.lease_generation == 1
+
+    # C: same unrotated token, engine resume lands generation 2, cancelled mid-RPC.
+    omni.resume_gate = asyncio.Event()
+    ws_c, task_c = await _resume(handler, handle.session_id, token)
+    await asyncio.wait_for(omni.resume_started.wait(), timeout=2.0)
+    assert handle.lease_generation == 2
+    task_c.cancel()
+    with suppress(asyncio.CancelledError):
+        await task_c
+    omni.resume_gate.set()
+    await asyncio.gather(*omni.compensations)
+    assert omni.detached == [] and omni.detach_refused == [], "generation 2 is parked for B"
+
+    # A's send fails: the pump drops A and detaches A's own generation 0, refused.
+    fail_send.set()
+    resumed_b = await ws_b.wait_for("session.resumed")
+    assert resumed_b["attachment_generation"] == 2
+    assert omni.detach_refused == [(handle.session_id, 0)]
+    assert omni.detached == [], "the lease B serves is untouched"
+    assert await registry.is_current_attachment(handle.session_id, 2)
+
+    # B serves generation 2 (inherited from C): its disconnect detaches that lease.
+    ws_b.disconnect()
+    await asyncio.wait_for(task_b, timeout=2.0)
+    assert omni.detached == [handle.session_id]
+    assert omni.detach_refused == [(handle.session_id, 0)]
+    ws.disconnect()
+    with suppress(asyncio.CancelledError, Exception):
+        await asyncio.wait_for(task, timeout=2.0)
+
+
+@pytest.mark.asyncio
+async def test_a_resume_cancelled_during_replay_settles_the_newer_lease_it_was_handed() -> None:
+    """Activation rollback must give back the lease the provisional attachment actually owned.
+
+    A resumed generation 1, delivered ``session.resumed`` and is blocked
+    replaying events. B, with A's rotated token, resumed generation 2 and was
+    cancelled mid-RPC; its settlement handed 2 to A. When A is then cancelled
+    during replay, the registry rolls A back; detaching A's own generation 1
+    would be refused and generation 2 would never enter disconnect grace.
+    """
+    omni = FakeOmni()
+    handler = _handler(omni)
+    ws, handle, task = await _open(handler, omni)
+    token = ws.sent[0]["resume_token"]
+    registry = handler._attachment_registry
+    ws.disconnect()
+    await asyncio.wait_for(task, timeout=2.0)
+    assert omni.detached == [handle.session_id]
+    # Journaled while detached: A's activation has something to replay.
+    handle.deliver(AudioDelta(session_id=handle.session_id, response_id="r1", delta="one"))
+    await asyncio.sleep(0.05)
+
+    # A: session.resumed goes out, the replay entry parks.
+    ws_a = FakeWebSocket({"duplex": "1", "resume": "1"})
+    replaying = asyncio.Event()
+    sends = 0
+    original_send = ws_a.send_json
+
+    async def send_parking_on_replay(payload: dict[str, Any]) -> None:
+        nonlocal sends
+        sends += 1
+        if sends == 2:
+            replaying.set()
+            await asyncio.Event().wait()
+        await original_send(payload)
+
+    ws_a.send_json = send_parking_on_replay  # type: ignore[method-assign]
+    task_a = asyncio.create_task(handler.handle_realtime_session(ws_a))
+    ws_a.feed(
+        {
+            "type": "session.resume",
+            "session_id": handle.session_id,
+            "resume_token": token,
+            "last_received_server_event_seq": 0,
+        }
+    )
+    await asyncio.wait_for(replaying.wait(), timeout=2.0)
+    resumed_a = await ws_a.wait_for("session.resumed")
+    assert handle.lease_generation == 1
+
+    # B: A's rotated token, engine resume lands generation 2, cancelled mid-RPC.
+    omni.resume_gate = asyncio.Event()
+    ws_b, task_b = await _resume(handler, handle.session_id, resumed_a["resume_token"])
+    await asyncio.wait_for(omni.resume_started.wait(), timeout=2.0)
+    assert handle.lease_generation == 2
+    task_b.cancel()
+    with suppress(asyncio.CancelledError):
+        await task_b
+    omni.resume_gate.set()
+    await asyncio.gather(*omni.compensations)
+    assert omni.detached == [handle.session_id], "generation 2 went to A's pending activation"
+
+    # A is cancelled during replay: its rollback settles generation 2, the lease A owned.
+    task_a.cancel()
+    with suppress(asyncio.CancelledError):
+        await task_a
+    assert not await registry.has_attachment(handle.session_id)
+    assert omni.detached == [handle.session_id, handle.session_id]
+    assert omni.detach_refused == [], "generation 1 was never detached: the engine would refuse it"

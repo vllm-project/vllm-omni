@@ -4,6 +4,7 @@
 import numpy as np
 import pytest
 
+from vllm_omni.config.speech_cache import SpeechCacheConfig
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -12,7 +13,9 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 @pytest.fixture
 def server(monkeypatch, tmp_path):
     monkeypatch.setenv("SPEAKER_SAMPLES_DIR", str(tmp_path))
-    return OmniOpenAIServingSpeech.__new__(OmniOpenAIServingSpeech)
+    instance = OmniOpenAIServingSpeech.__new__(OmniOpenAIServingSpeech)
+    instance.speech_cache_config = SpeechCacheConfig()
+    return instance
 
 
 @pytest.mark.parametrize("stereo", [False, True])
@@ -103,3 +106,86 @@ def test_numeric_waveform_cache_limits(server, entries, budget):
     server._put_resolved_ref_audio("b", np.ones(2, dtype=np.float32), 24000, "artifact-b")
     assert list(server._ref_audio_resolve_cache) == ["b"]
     assert server._ref_audio_resolve_cache_bytes == 8
+
+
+@pytest.mark.asyncio
+async def test_cosyvoice_array_prompt_owns_buffer_without_list_roundtrip(mocker, monkeypatch):
+    from types import SimpleNamespace
+
+    from vllm_omni.entrypoints.openai.tts_adapters.base import SpeechServingContext
+    from vllm_omni.entrypoints.openai.tts_adapters.cosyvoice3 import CosyVoice3Adapter
+
+    monkeypatch.setenv("COSYVOICE3_REFERENCE_PREFETCH", "0")
+    waveform = np.linspace(-1, 1, 24000, dtype=np.float32)
+    server = mocker.Mock()
+    server._resolve_ref_audio_array = mocker.AsyncMock(return_value=(waveform, 24000, "key"))
+    server._resolve_ref_audio = mocker.AsyncMock(side_effect=AssertionError("unnecessary list conversion"))
+    adapter = CosyVoice3Adapter(SpeechServingContext(server=server))
+    request = SimpleNamespace(input="Target text.", ref_audio="reference", ref_text="Reference text.", voice=None)
+    prompt = await adapter._build_prompt(request)
+    actual, rate = prompt["multi_modal_data"]["audio"]
+    np.testing.assert_array_equal(actual, waveform)
+    assert rate == 24000 and actual.dtype == np.float32
+    assert not np.shares_memory(actual, waveform)
+    actual[0] = 100
+    assert waveform[0] == -1
+    assert prompt["prompt"] == request.input
+    assert prompt["mm_processor_kwargs"]["prompt_text"].endswith("<|endofprompt|>Reference text.")
+    server._resolve_ref_audio.assert_not_awaited()
+    server._resolve_ref_audio_array.assert_awaited_once_with("reference")
+
+
+@pytest.mark.asyncio
+async def test_cosyvoice_reference_prefetch_resamples_and_warms_conditioning(mocker):
+    from types import SimpleNamespace
+
+    import vllm_omni.model_executor.models.cosyvoice3.cosyvoice3 as cosyvoice3
+    from vllm_omni.entrypoints.openai.tts_adapters.base import SpeechServingContext
+    from vllm_omni.entrypoints.openai.tts_adapters.cosyvoice3 import CosyVoice3Adapter
+
+    waveform = np.linspace(-1, 1, 24000, dtype=np.float32)
+    server = mocker.Mock()
+    server._resolve_ref_audio_array = mocker.AsyncMock(return_value=(waveform, 24000, "key"))
+    server.model_config.hf_config = SimpleNamespace(target_sr=16000)
+    server.model_config.model = "model-dir"
+    warm = mocker.patch.object(cosyvoice3, "prefetch_reference_conditioning")
+    adapter = CosyVoice3Adapter(SpeechServingContext(server=server))
+    request = SimpleNamespace(input="Target text.", ref_audio="reference", ref_text="Reference text.", voice=None)
+    prompt = await adapter._build_prompt(request)
+    audio, rate = prompt["multi_modal_data"]["audio"]
+    # The processor receives samples at its own rate, so its resampling is a
+    # no-op and its content-addressed cache lookup hits the warmed entry.
+    assert rate == 16000 and prompt["mm_processor_kwargs"]["sample_rate"] == 16000
+    assert audio.shape == (16000,) and audio.dtype == np.float32
+    warm.assert_called_once()
+    model_dir, config, (warmed, warmed_rate) = warm.call_args.args
+    assert model_dir == "model-dir" and config is server.model_config.hf_config
+    assert warmed is audio and warmed_rate == 16000
+    assert waveform[0] == -1
+
+
+@pytest.mark.parametrize("mode", ["ras", "standard"])
+def test_cosyvoice_sampling_mode_sets_control_stops_without_mutating_defaults(mocker, mode):
+    from vllm.sampling_params import SamplingParams
+
+    from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
+    from vllm_omni.entrypoints.openai.tts_adapters.base import SpeechServingContext
+    from vllm_omni.entrypoints.openai.tts_adapters.cosyvoice3 import CosyVoice3Adapter
+    from vllm_omni.transformers_utils.configs.cosyvoice3 import CosyVoice3Config
+
+    config = CosyVoice3Config()
+    config.cosyvoice3_sampling_mode = mode
+    serving = mocker.Mock(spec=OmniOpenAIServingSpeech)
+    serving.model_config = mocker.Mock(hf_config=config)
+    adapter = CosyVoice3Adapter(SpeechServingContext(server=serving))
+    adapter._tokenizer = mocker.Mock()
+    mocker.patch("vllm_omni.model_executor.models.cosyvoice3.utils.extract_text_token", return_value=(None, 9))
+    defaults = [SamplingParams(stop_token_ids=[6562])]
+    request = OpenAICreateSpeechRequest(input="Example text.", max_new_tokens=2048)
+    result = adapter.apply_sampling_overrides(defaults, request)
+    assert defaults[0].stop_token_ids == [6562]
+    assert result[0].min_tokens == 18
+    assert result[0].max_tokens == 2048
+    expected = set(range(6561, 6761)) if mode == "standard" else {6562}
+    assert set(result[0].stop_token_ids) == expected
+    assert expected <= result[0].all_stop_token_ids

@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -88,7 +89,40 @@ class MingImageDummyInputsBuilder(MingFlashOmniThinkerDummyInputsBuilder):
 
 
 class MingImageMultiModalProcessor(MingFlashOmniThinkerMultiModalProcessor):
-    pass
+    def apply(self, inputs, timing_ctx):
+        modalities = list(inputs.hf_processor_mm_kwargs.get("modalities") or [])
+        is_image_generation = "image" in modalities or "img2img" in modalities
+        if is_image_generation:
+            tokenizer = self.info.get_tokenizer()
+            if isinstance(inputs.prompt, str):
+                prompt_text = inputs.prompt
+            else:
+                prompt_text = tokenizer.decode(
+                    inputs.prompt,
+                    skip_special_tokens=False,
+                )
+
+            processor = self.info.get_hf_processor()
+            # expects to place <IMAGE> inside the HUMAN message.
+            formatted_prompt = processor._apply_image_generation_template(
+                prompt_text,
+                has_reference_image="img2img" in modalities,
+            )
+            prompt_ids = tokenizer.encode(
+                formatted_prompt,
+                add_special_tokens=False,
+            )
+
+            # Normalize img2img so the shared parent processor does't prepend a second placeholder outside that message
+            processor_kwargs = dict(inputs.hf_processor_mm_kwargs)
+            processor_kwargs["modalities"] = ["image" if modality == "img2img" else modality for modality in modalities]
+            inputs = replace(
+                inputs,
+                prompt=prompt_ids,
+                hf_processor_mm_kwargs=processor_kwargs,
+            )
+
+        return super().apply(inputs, timing_ctx)
 
 
 @MULTIMODAL_REGISTRY.register_processor(

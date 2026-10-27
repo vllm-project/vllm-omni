@@ -31,6 +31,41 @@ with the model license before downloading or using the weights.
 | `LTX2DistilledOneStagePipeline` | Distilled one-stage | 960x544 | 8 steps |
 | `LTX2DistilledTwoStagePipeline` | Distilled two-stage | 1920x1088 | 8 + 3 steps |
 
+For text-to-audio, select `LTX2TextToAudioPipeline`. It emits stereo audio at
+48 kHz and is available through both the offline API and `/v1/audio/generate`.
+The audio pipeline does not require a video output or a `--task-type` flag.
+
+```bash
+python examples/offline_inference/text_to_audio/text_to_audio.py \
+  --model Lightricks/LTX-2.5-Diffusers \
+  --model-class-name LTX2TextToAudioPipeline \
+  --prompt "A close-up recording of a concert grand piano" \
+  --audio-length 2 \
+  --num-inference-steps 30 \
+  --sample-rate 48000 \
+  --output ltx25_audio.wav
+```
+
+To use the registered pipeline through the OpenAI-compatible endpoint:
+
+```bash
+vllm serve Lightricks/LTX-2.5-Diffusers \
+  --omni \
+  --model-class-name LTX2TextToAudioPipeline \
+  --port 8098
+
+curl http://localhost:8098/v1/audio/generate \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "Lightricks/LTX-2.5-Diffusers",
+    "input": "A close-up recording of a concert grand piano",
+    "audio_length": 2,
+    "num_inference_steps": 30,
+    "response_format": "wav"
+  }' \
+  --output ltx25_audio_api.wav
+```
+
 Both two-stage pipelines generate at half resolution, apply the official x2
 latent upsampler, and run a three-step refinement stage. Select the class with
 `--model-class-name`; no `--task-type` flag is required. Supplying one initial
@@ -89,6 +124,7 @@ Install matching vLLM and vLLM-Omni versions, and ensure `ffmpeg` and
 | NVIDIA B200 or H200 | Capacity-based recommendation; not yet verified | All four canonical pipelines |
 | NVIDIA GB200 or GB300 | Capacity-based recommendation; not yet verified | All four canonical pipelines |
 | NVIDIA H100 80 GB | FP8 recipe | Distilled one-stage at 960x544 |
+| Intel Arc Pro B70 32 GB | Verified | Offline Full/SFT one-stage T2V at 768x512 |
 
 The 1920x1088 two-stage examples require about 114 GB of peak GPU memory.
 80 GB GPUs do not have enough safety margin for the canonical two-stage
@@ -132,6 +168,33 @@ Strict Ulysses only: `((F - 1) / 8 + 1) * (H / 32) * (W / 32)` and TP-local
 SP attention head counts must be divisible by `ulysses_degree`. Use each
 phase's `H, W` (half/full resolution for two-stage); non-divisible shapes fail.
 Each GPU must still fit the resident weights. Warm up with the production shape.
+
+### 1x Intel Arc Pro B70 32 GB (XPU)
+
+Offline Full/SFT one-stage T2V at 768x512, 17 frames. Select the legacy
+convolutional VAE with `ltx2_use_conv_vae`; the default DiffVAE decoder loads a
+NATTEN kernel, which has no XPU build. FP8 with layerwise offload streams both
+the transformer and the Gemma-4 text encoder.
+
+Environment: torch 2.14.0+xpu, vLLM 0.29.0, vLLM-Omni `main` at `d8d162d8`.
+
+```bash
+python examples/offline_inference/text_to_video/text_to_video.py \
+  --model Lightricks/LTX-2.5-Diffusers \
+  --model-class-name LTX2Pipeline \
+  --stage-overrides '{"0":{"extras":{"ltx2_use_conv_vae":true}}}' \
+  --prompt "A serene lakeside sunrise with mist over the water." \
+  --num-frames 17 \
+  --quantization fp8 \
+  --enable-layerwise-offload \
+  --vae-use-tiling \
+  --vae-use-slicing \
+  --enforce-eager \
+  --output ltx25_output.mp4
+```
+
+Peaks at 16.3 GiB in 163 s. Two-stage, distilled, and I2V paths were not
+exercised on this hardware.
 
 ## Offline inference
 

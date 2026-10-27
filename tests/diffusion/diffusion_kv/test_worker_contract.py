@@ -69,7 +69,7 @@ def make_executor() -> tuple[MultiprocDiffusionExecutor, list[tuple]]:
     executor._ensure_open = lambda: None
     calls: list[tuple] = []
 
-    def collective_rpc(method, *, args, unique_reply_rank, exec_all_ranks):
+    def collective_rpc(method, *, args, unique_reply_rank, exec_all_ranks, timeout=None):
         calls.append((method, args, unique_reply_rank, exec_all_ranks))
         return DiffusionOutput(output=None)
 

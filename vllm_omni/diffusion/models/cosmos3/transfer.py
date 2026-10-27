@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Cosmos3 transfer inference helpers.
 
 The reference Cosmos Framework transfer path accepts one or more control hints
@@ -24,6 +24,8 @@ import numpy as np
 import PIL.Image
 import torch
 import torch.nn.functional as F
+
+from vllm_omni.diffusion.utils.video_decode import decode_path_video_frames
 
 TRANSFER_HINT_KEYS: tuple[str, ...] = ("edge", "blur", "depth", "seg", "wsm")
 _TRANSFER_HINT_COMMON_FIELDS = frozenset({"control_path", "control", "control_weight"})
@@ -523,9 +525,14 @@ def resize_center_crop_uint8_cthw(frames: torch.Tensor, height: int, width: int)
     resize_h = int(np.ceil(scale * orig_h))
     resize_w = int(np.ceil(scale * orig_w))
     frames_tchw = frames.permute(1, 0, 2, 3).to(dtype=torch.float32)
-    resized = F.interpolate(frames_tchw, size=(resize_h, resize_w), mode="bilinear", align_corners=False)
-    top = (resize_h - height) // 2
-    left = (resize_w - width) // 2
+    # Match torchvision resize + center_crop, which the reference and training
+    # use: antialiased bilinear (plain bilinear aliases large downscales such
+    # as 1080p WSM to 480p) and offsets rounded half to even.
+    resized = F.interpolate(
+        frames_tchw, size=(resize_h, resize_w), mode="bilinear", align_corners=False, antialias=True
+    )
+    top = int(round((resize_h - height) / 2.0))
+    left = int(round((resize_w - width) / 2.0))
     cropped = resized[:, :, top : top + height, left : left + width]
     return cropped.round().clamp(0, 255).to(torch.uint8).permute(1, 0, 2, 3).contiguous()
 
@@ -538,23 +545,9 @@ def _path_media_to_uint8_cthw(path: str | Path, max_frames: int | None) -> torch
         array = _pil_to_uint8_rgb(media_path)
         return torch.from_numpy(array).permute(2, 0, 1).unsqueeze(1).contiguous()
 
-    try:
-        import imageio.v3 as iio
-    except ImportError as exc:
-        raise ImportError(
-            "Cosmos3 transfer video control_path loading requires imageio. "
-            "Install imageio[ffmpeg] or provide decoded control frames."
-        ) from exc
-
-    frames: list[torch.Tensor] = []
-    limit = max_frames if max_frames is not None else None
-    for frame in iio.imiter(media_path):
-        frames.append(torch.from_numpy(_pil_to_uint8_rgb(frame)).permute(2, 0, 1))
-        if limit is not None and len(frames) >= int(limit):
-            break
-    if not frames:
-        raise ValueError(f"Cosmos3 transfer control_path produced no frames: {media_path}")
-    return torch.stack(frames, dim=1).contiguous()
+    rgb_frames = decode_path_video_frames(media_path, max_frames=max_frames, keep="first")
+    stacked = [torch.from_numpy(frame).permute(2, 0, 1) for frame in rgb_frames]
+    return torch.stack(stacked, dim=1).contiguous()
 
 
 def media_to_uint8_cthw(value: Any, *, height: int, width: int, max_frames: int | None = None) -> torch.Tensor:

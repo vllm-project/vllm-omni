@@ -27,7 +27,7 @@ For Design-Layer, the first returned image is the reconstructed composite and th
 - Python: 3.10+
 - CUDA: 13.0
 - vLLM version: 0.29.0
-- vLLM-Omni version or commit: 59db6a428
+- vLLM-Omni version or commit: 6daf5b30f
 - 2x H100 80GB (1xH100 to be validated)
 
 ### Commands
@@ -52,7 +52,7 @@ curl -s http://127.0.0.1:8091/v1/chat/completions \
     "modalities": ["image"],
     "extra_body": {
       "height": 1024, "width": 1024,
-      "steps": 12, "cfg": 1.0, "seed": 42
+      "num_inference_steps": 12, "guidance_scale": 1.0, "seed": 42
     }
   }' \
   | jq -r '.choices[0].message.content[0].image_url.url | split(",")[1]' \
@@ -79,7 +79,7 @@ jq -n \
     modalities: ["image"],
     extra_body: {
       height: 1024, width: 1024,
-      steps: 12, cfg: 1.0, seed: 42
+      num_inference_steps: 12, guidance_scale: 1.0, seed: 42
     }
   }' |
 curl -sS http://127.0.0.1:8091/v1/chat/completions \
@@ -97,7 +97,7 @@ Note that the prompt should better depict each layer to be decomposed, we will r
 ```bash
 MODEL=inclusionAI/Ming-Image-0.1-Design-Layer
 INPUT_IMAGE=/path/to/input.png
-PROMPT="Decompose this design into editable visual layers"
+PROMPT="Decompose this image into 6 layers with the following specifications: Number of layers: 6 \nLayer 1: Central text ... Layer 2: ... Layer 6: ..."
 
 jq -n \
   --arg model "$MODEL" \
@@ -113,7 +113,7 @@ jq -n \
     extra_body: {
       num_layers: 6,
       height: 1024, width: 1024,
-      steps: 12, cfg: 2.0, seed: 42
+      num_inference_steps: 12, guidance_scale: 2.0, seed: 42
     }
   }' |
 curl -sS http://127.0.0.1:8091/v1/chat/completions \
@@ -139,3 +139,61 @@ jq -r '.choices[0].message.content[].image_url.url | split(",")[1]' response.jso
 - A non-empty `negative_prompt` is rejected; Ming-Image uses zero negative conditioning.
 - Height and width must be divisible by 16.
 - Returned images retain the checkpoint's four RGBA channels.
+
+## Step caching
+
+Step caching is disabled by default. To enable it for serving, pass the cache backend and its JSON threshold configuration on the command line. The step cache runs in the diffusion stage.
+
+```bash
+# Design: TeaCache 0.30
+vllm serve inclusionAI/Ming-Image-0.1-Design --omni \
+  --deploy-config vllm_omni/deploy/ming_image.yaml \
+  --cache-backend tea_cache \
+  --cache-config '{"rel_l1_thresh":0.3}' \
+  --port 8091
+
+# Design: Cache-DiT 0.16
+vllm serve inclusionAI/Ming-Image-0.1-Design --omni \
+  --deploy-config vllm_omni/deploy/ming_image.yaml \
+  --cache-backend cache_dit \
+  --cache-config '{"residual_diff_threshold":0.16}' \
+  --port 8091
+
+# Design-Layer: TeaCache 0.13
+vllm serve inclusionAI/Ming-Image-0.1-Design-Layer --omni \
+  --deploy-config vllm_omni/deploy/ming_image.yaml \
+  --cache-backend tea_cache \
+  --cache-config '{"rel_l1_thresh":0.13}' \
+  --port 8091
+
+# Design-Layer: Cache-DiT 0.16
+vllm serve inclusionAI/Ming-Image-0.1-Design-Layer --omni \
+  --deploy-config vllm_omni/deploy/ming_image.yaml \
+  --cache-backend cache_dit \
+  --cache-config '{"residual_diff_threshold":0.16}' \
+  --port 8091
+```
+
+In these measured runs, Design TeaCache 0.30 reduced E2E latency by 6.8%, Design Cache-DiT 0.16 by 23.5%, Design-Layer TeaCache 0.13 by 18.7%, and Design-Layer Cache-DiT 0.16 by 23.3% versus no cache.
+
+Representative online runs on 2×H100 80 GB (vLLM 0.30.0, 1024×1024, 12 steps, concurrency 1):
+
+For Design, all profiles use one shared no-cache control: the same 1024×1024 botanical-poster prompt, CFG 1.0, 12 steps, and seed 42.
+
+### Design
+
+| Profile | E2E s | Stage 1 ms | req/s | SSIM / PSNR dB / LPIPS |
+| --- | ---: | ---: | ---: | ---: |
+| No cache | 2.219 | 1,596 | 0.451 | — |
+| TeaCache 0.30 | 2.068 | 1,465 | 0.484 | 0.948 / 24.51 / 0.021 |
+| Cache-DiT 0.16 | 1.698 | 1,289 | 0.589 | 0.853 / 19.11 / 0.095 |
+
+### Design-Layer
+
+One fixed reference image and prompt, CFG 2.0, one warmup and three measured runs per profile, sharing one no-cache control.
+
+| Profile | E2E s | Stage 1 ms | req/s | SSIM / PSNR dB / LPIPS |
+| --- | ---: | ---: | ---: | ---: |
+| No cache | 12.723 | 10,813 | 0.079 | — |
+| TeaCache 0.13 | 10.343 | 8,547 | 0.097 | 0.988 / 22.06 / 0.011 |
+| Cache-DiT 0.16 | 9.764 | 7,986 | 0.102 | 0.991 / 28.06 / 0.007 |

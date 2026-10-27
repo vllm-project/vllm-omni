@@ -1,0 +1,19 @@
+base_config: wan2_2_egd.yaml
+
+connectors:
+  wan_encode_connector:
+    name: NixlConnector
+    extra:
+      host: "auto"
+      zmq_port: 50091
+      backends: ["UCX"]
+      lease_seconds: 300
+      transfer_timeout_s: 300
+  wan_latent_connector:
+    name: NixlConnector
+    extra:
+      host: "auto"
+      zmq_port: 50092
+      backends: ["UCX"]
+      lease_seconds: 300
+      transfer_timeout_s: 300

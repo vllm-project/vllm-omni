@@ -39,7 +39,15 @@ class DiffusionTasks(str, Enum):
     IMAGE_TO_IMAGE = "image_to_image"
     TEXT_TO_VIDEO = "text_to_video"
     IMAGE_TO_VIDEO = "image_to_video"
-    # Text to audio, etc should be added here as needed
+    TEXT_TO_AUDIO = "text_to_audio"
+
+
+class ModelTypeMarker(str, Enum):
+    """Model type markers for pytest parametrization."""
+
+    DIFFUSION = "diffusion"
+    OMNI = "omni"
+    TTS = "tts"
 
 
 class DiffusionModelTestOpts(NamedTuple):
@@ -59,6 +67,10 @@ class DiffusionModelTestOpts(NamedTuple):
     # Actual tasks which controls the tests actually run
     supported_tasks: list[DiffusionTasks]
 
+    # Function module marker applied per-test-case via parametrization.
+    # Set to ModelTypeMarker.OMNI or ModelTypeMarker.TTS for non-diffusion models.
+    model_type_marker: ModelTypeMarker
+
     # Additional acceleration groups to run beyond the base case (no acceleration).
     # The base case is always run for every model in the test settings. None means
     # we only run the base case.
@@ -69,6 +81,10 @@ class DiffusionModelTestOpts(NamedTuple):
     # as core models to always run in the CI.
     # Example: https://github.com/vllm-project/vllm/blob/v0.23.0/tests/models/multimodal/generation/test_common.py#L131
     marks: list[MarkDecorator] | None = None
+
+    # Whether multi-device groups should receive native ROCm hardware marks.
+    # Keep this False for models whose runtime path is not yet qualified on ROCm.
+    rocm_multigpu: bool = True
 
     # When True (default), online tests only run the base case (no accelerations).
     # When False, online tests run all test_groups, same as offline. This should be

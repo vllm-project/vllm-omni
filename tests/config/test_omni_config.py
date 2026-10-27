@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import logging
 import warnings
 from dataclasses import fields, replace
 from inspect import Parameter, signature
@@ -46,6 +47,7 @@ from vllm_omni.config.stage_config import (
     _STAGE_DEPLOY_FIELDS,
     PIPELINE_WIDE_ENGINE_FIELDS,
     DeployConfig,
+    DuplexSessionRuntimeConfig,
     PipelineConfig,
     StageDeployConfig,
     StageExecutionType,
@@ -54,7 +56,9 @@ from vllm_omni.config.stage_config import (
     load_deploy_config,
     merge_pipeline_deploy,
     resolve_deploy_yaml,
+    update_deploy_config_async_chunk_enabled,
 )
+from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.engine.stage_engine_startup import _serialize_stage_config
 from vllm_omni.engine.stage_init_utils import build_legacy_engine_args_dict
@@ -64,22 +68,27 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 _DEPLOY_DIR = Path(__file__).parents[2] / "vllm_omni" / "deploy"
 
 
-@pytest.mark.parametrize("async_chunk", [False, True])
-def test_native_kv_transfer_requires_completed_ar_stage(async_chunk):
-    from types import SimpleNamespace
-
-    pipeline = SimpleNamespace(stages=(), model_type="test")
+@pytest.mark.parametrize("async_chunk", [None, False, True])
+def test_native_kv_transfer_disables_async_chunk(async_chunk):
+    """Ensure that a multistage pipeline that supports async chunk disables it if we have a kv transfer config."""
+    pipeline = PipelineConfig(
+        model_type="test",
+        stages=(
+            # async_chunk_process_next_stage_input_func doesn't matter, it just needs to exist for this test.
+            StagePipelineConfig(stage_id=0, model_stage="ar", async_chunk_process_next_stage_input_func="foo.bar"),
+            StagePipelineConfig(stage_id=1, model_stage="dit", input_sources=(0,), final_output=True),
+        ),
+    )
+    kv_transfer_config = {"kv_connector": "MooncakeConnector"}
     deploy = DeployConfig(
         async_chunk=async_chunk,
         stages=[
-            StageDeployConfig(stage_id=0, engine_extras={"kv_transfer_config": {"kv_connector": "MooncakeConnector"}})
+            StageDeployConfig(stage_id=0, engine_extras={"kv_transfer_config": kv_transfer_config}),
+            StageDeployConfig(stage_id=1, engine_extras={"kv_transfer_config": kv_transfer_config}),
         ],
     )
-    if async_chunk:
-        with pytest.raises(ValueError, match="requires async_chunk=False"):
-            omni_config_module._validate_async_chunk_support(pipeline, deploy)
-    else:
-        omni_config_module._validate_async_chunk_support(pipeline, deploy)
+    update_deploy_config_async_chunk_enabled(pipeline, deploy)
+    assert not deploy.async_chunk
 
 
 @pytest.fixture(autouse=True)
@@ -117,6 +126,32 @@ def _from_pipeline_key(
     )
 
 
+@pytest.mark.parametrize("pending", [False, True])
+def test_pending_generation_capability_reaches_both_engine_config_paths(pending, tmp_path):
+    from vllm_omni.engine.arg_utils import OmniEngineArgs
+    from vllm_omni.engine.stage_init_utils import build_engine_args_dict_from_omni_stage_config
+    from vllm_omni.entrypoints.utils import filter_dataclass_kwargs
+
+    pipeline = PipelineConfig(
+        model_type="test_pending_generation",
+        stages=(
+            StagePipelineConfig(
+                stage_id=0,
+                model_stage="codec",
+                execution_type=StageExecutionType.LLM_GENERATION,
+                supports_pending_generation=pending,
+                final_output=True,
+            ),
+        ),
+    )
+    deploy = DeployConfig(stages=[StageDeployConfig(stage_id=0)])
+    legacy = merge_pipeline_deploy(pipeline, deploy)[0]
+    assert legacy.yaml_engine_args.get("supports_pending_generation", False) is pending
+    structured = VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=deploy)
+    args = build_engine_args_dict_from_omni_stage_config(structured.stage_by_id(0), model=str(tmp_path))
+    assert OmniEngineArgs(**filter_dataclass_kwargs(OmniEngineArgs, args)).supports_pending_generation is pending
+
+
 def test_mammothmoda2_diffusion_stage_projects_native_backend_config() -> None:
     config = _from_pipeline_key(
         "mammoth_moda2",
@@ -127,7 +162,7 @@ def test_mammothmoda2_diffusion_stage_projects_native_backend_config() -> None:
     assert stage.diffusion_config.model_class_name == "MammothModa2DiTPipeline"
     assert stage.diffusion_config.model == "/models/MammothModa2-Preview"
     assert stage.diffusion_config.step_execution is False
-    assert stage.scheduler_config.max_num_seqs == 1
+    assert stage.scheduler_config.max_num_seqs == 8
     assert stage.connector_config.omni_kv_config == {"need_recv_cache": False}
 
 
@@ -150,6 +185,49 @@ def test_duplex_session_capacity_propagates_to_every_structured_stage() -> None:
     assert [stage.model_config.session_mode for stage in omni_config.stage_configs] == ["duplex", "duplex"]
 
 
+@pytest.mark.parametrize(
+    ("session_mode", "placement", "expected"),
+    [
+        ("duplex", {}, 11),
+        ("duplex", {"replica_policy": "legacy"}, 11),
+        ("duplex", {"replica_policy": "legacy", "max_sessions_per_replica": 3}, 11),
+        ("duplex", {"replica_policy": "least_sessions", "max_sessions_per_replica": 3}, 3),
+        ("turn", {}, 1),
+    ],
+)
+def test_duplex_worker_capacity_matches_both_config_build_paths(session_mode, placement, expected) -> None:
+    pipeline = PipelineConfig(
+        model_type="test-duplex-replica-capacity",
+        stages=(
+            StagePipelineConfig(stage_id=0, model_stage="ar"),
+            StagePipelineConfig(
+                stage_id=1,
+                model_stage="codec",
+                execution_type=StageExecutionType.LLM_GENERATION,
+                input_sources=(0,),
+                final_output=True,
+            ),
+        ),
+    )
+    deploy = DeployConfig(
+        session_mode=session_mode,
+        duplex_session=DuplexSessionRuntimeConfig(max_sessions=11, **placement),
+        stages=[StageDeployConfig(stage_id=stage, num_replicas=2) for stage in (0, 1)],
+    )
+
+    # The legacy merge returns StageConfig; engine_args is exposed by its
+    # config-only projection, which does not resolve or initialize workers.
+    legacy_stages = [stage.to_omegaconf() for stage in merge_pipeline_deploy(pipeline, deploy)]
+    structured = VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=deploy)
+
+    assert [stage.engine_args.get("duplex_max_sessions", 1) for stage in legacy_stages] == [expected, expected]
+    assert [stage.engine_args.session_mode for stage in legacy_stages] == [session_mode, session_mode]
+    assert [stage.model_config.duplex_max_sessions for stage in structured.stage_configs] == [expected, expected]
+    assert [stage.model_config.session_mode for stage in structured.stage_configs] == [session_mode, session_mode]
+    # Placement does not reinterpret the global frontend admission limit.
+    assert deploy.duplex_session.max_sessions == 11
+
+
 def test_non_duplex_deploy_keeps_model_session_capacity_at_one(tmp_path: Path) -> None:
     deploy_path = tmp_path / "personaplex-turn.yaml"
     deploy_path.write_text("session_mode: turn\n", encoding="utf-8")
@@ -170,6 +248,42 @@ def test_nested_stage_override_deep_merges_structured_model_config() -> None:
     model_config = config.stage_by_id(0).diffusion_config.model_config
     assert model_config["guardrails"] is False
     assert model_config["policy_server_config"]["action_space"] == "joint_position"
+
+
+def test_global_model_config_override_deep_merges_structured_model_config() -> None:
+    pipeline = _resolve_pipeline_or_skip("cosmos3_omni_deploy")
+    # cosmos3_omni.yaml already ships ``guardrails: false``; flip it back to True
+    # (plus a nested key) so the CLI override is observable.
+    deploy = load_deploy_config(_DEPLOY_DIR / "cosmos3_omni.yaml")
+    deploy.stages[0].engine_extras["model_config"] = {
+        "guardrails": True,
+        "inference_overrides": {"history_mode": "full"},
+    }
+
+    baseline = VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=deploy)
+    assert baseline.stage_by_id(0).diffusion_config.model_config["guardrails"] is True
+
+    # --no-guardrails emits a global (not stage-scoped) model_config override.
+    config = VllmOmniConfig.from_pipeline_config(
+        pipeline,
+        user_deploy_config=deploy,
+        cli_overrides={"model_config": {"guardrails": False}},
+    )
+
+    model_config = config.stage_by_id(0).diffusion_config.model_config
+    assert model_config["guardrails"] is False
+    assert model_config["inference_overrides"]["history_mode"] == "full"
+
+
+def test_global_model_config_override_skips_llm_stages() -> None:
+    overrides = {"model_config": {"guardrails": False}}
+
+    assert "model_config" not in omni_config_module._stage_cli_overrides(
+        0, overrides, execution_type=StageExecutionType.LLM_AR
+    )
+    assert omni_config_module._stage_cli_overrides(0, overrides, execution_type=StageExecutionType.DIFFUSION)[
+        "model_config"
+    ] == {"guardrails": False}
 
 
 def _build_single_diffusion_config(
@@ -446,7 +560,11 @@ def test_minicpmo_npu_additional_config_reaches_engine_args(monkeypatch, deploy_
     monkeypatch.setattr(current_omni_platform, "device_name", "npu")
     monkeypatch.setattr(stage_init_utils, "resolve_worker_cls", lambda engine_args: None)
     stage = _from_pipeline_key("minicpmo_4_5", deploy_config_path=deploy_name).stage_by_id(2)
-    expected = {"code2wav_enable_npu_graph": True, "code2wav_max_npu_graphs": 32}
+    expected: dict[str, object] = {"code2wav_enable_npu_graph": True, "code2wav_max_npu_graphs": 32}
+    if deploy_name == "minicpmo_4_5":
+        # Single-card deploy: batch sizes round up to a capture bucket so the
+        # 32-entry pool covers the shape space.
+        expected["cfm_graph_batch_buckets"] = [1, 2, 4, 8]
     assert stage.runtime_config.additional_config == expected
     engine_args = build_engine_args_dict_from_omni_stage_config(stage, model="test-model")
     assert engine_args["additional_config"] == expected
@@ -780,6 +898,33 @@ def test_from_pipeline_config_dispatches_async_chunk_processors_without_mutating
     assert pipeline.get_stage(1).custom_process_input_func is None
 
 
+def test_from_pipeline_config_async_chunk_none_preserves_yaml_default():
+    """Ensure passing None for async chunk in when creating from pipeline keeps yaml defaults."""
+    config = _from_pipeline_key("qwen3_tts", cli_overrides={"async_chunk": None})
+    talker_cfg = config.stage_by_id(0)
+    custom_proc = talker_cfg.custom_process_next_stage_input_func
+    assert custom_proc is not None
+    assert custom_proc.endswith("talker2code2wav_async_chunk")
+
+
+def test_from_pipeline_config_warns_when_single_stage_async_chunk_enabled(caplog: pytest.LogCaptureFixture):
+    """Ensure that we get a warning indicating async chunk is disabled if requested for single stage models."""
+    pipeline = PipelineConfig(
+        model_type="single_stage",
+        stages=(StagePipelineConfig(stage_id=0, model_stage="stage", final_output=True),),
+    )
+
+    with caplog.at_level(logging.WARNING, logger="vllm_omni.config.stage_config"):
+        config = VllmOmniConfig.from_pipeline_config(pipeline, cli_overrides={"async_chunk": True})
+
+    assert config.stage_by_id(0).connector_config.async_chunk is False
+    assert any(
+        record.levelno == logging.WARNING
+        and "async chunk is inapplicable to single stage models" in record.getMessage()
+        for record in caplog.records
+    )
+
+
 def test_joyai_code2wav_waits_for_full_payload():
     config = _from_pipeline_key("joyai_vl_interaction")
     talker = config.stage_by_id(1)
@@ -789,6 +934,17 @@ def test_joyai_code2wav_waits_for_full_payload():
     assert code2wav.custom_process_input_func.endswith("talker2code2wav_token_only")
     assert code2wav.connector_config.async_chunk is False
     assert code2wav.model_config.requires_full_payload_input is True
+
+
+def test_joyai_asr_profile_topology():
+    config = _from_pipeline_key("joyai_vl_interaction_asr")
+    asr, joyai, talker, _ = (config.stage_by_id(i) for i in range(4))
+
+    assert [stage.model_stage for stage in config.stage_configs] == ["asr", "joyvl", "qwen3_tts", "code2wav"]
+    assert asr.bypass_without_modalities == ("audio",)
+    assert joyai.model_config.model_arch == "Qwen3VLForConditionalGeneration"
+    assert joyai.custom_process_input_func.endswith("joyai_vl_interaction.asr_to_joyai")
+    assert talker.custom_process_input_func.endswith("joyai_vl_interaction.joyai_action_to_tts")
 
 
 @pytest.mark.parametrize("model_runner", ["v1", "v2"])
@@ -816,10 +972,98 @@ stages:
     assert all(stage.model_config.use_v2_model_runner is expect_v2 for stage in structured.stage_configs)
 
 
-@pytest.mark.parametrize("platform", ["npu", "xpu"])
-def test_mrv2_fails_fast_on_platforms_without_native_workers(platform: str):
+def test_mrv2_fails_fast_on_xpu():
     with pytest.raises(NotImplementedError, match="Model Runner V2"):
-        _apply_platform_overrides(DeployConfig(model_runner="v2"), platform=platform)
+        _apply_platform_overrides(DeployConfig(model_runner="v2"), platform="xpu")
+
+
+@pytest.mark.parametrize("stage_override", [False, True])
+def test_mrv2_config_is_allowed_on_npu(stage_override):
+    deploy = (
+        DeployConfig(stages=[StageDeployConfig(stage_id=0, model_runner="v2")])
+        if stage_override
+        else DeployConfig(model_runner="v2")
+    )
+    deploy = _apply_platform_overrides(deploy, platform="npu")
+    if stage_override:
+        assert deploy.stages[0].model_runner == "v2"
+    else:
+        assert deploy.model_runner == "v2"
+
+
+def test_fish_omni_npu_profile_is_mrv2_tp_ep():
+    deploy = _apply_platform_overrides(load_deploy_config(_DEPLOY_DIR / "fish_omni.yaml"), platform="npu")
+    stage0, stage1 = deploy.stages
+    assert stage0.model_runner == "v2"
+    assert stage0.tensor_parallel_size == 2
+    assert stage0.enable_expert_parallel is True
+    assert stage0.enforce_eager is False
+    assert stage0.gpu_memory_utilization == 0.72
+    assert stage0.devices == "0,1"
+    assert stage1.model_runner == "v1"
+    assert stage1.gpu_memory_utilization == 0.1
+    assert stage1.devices == "1"
+
+
+def _qwen3_omni_pipeline() -> PipelineConfig:
+    from dataclasses import replace
+
+    pipeline = _resolve_pipeline_or_skip("qwen3_omni_moe", Qwen3OmniMoeConfig())
+    return replace(pipeline, stages=tuple(replace(s, supports_native_mrv2_data_plane=True) for s in pipeline.stages))
+
+
+def test_stage_model_runner_overrides_deploy_runner(tmp_path: Path):
+    deploy_path = tmp_path / "qwen3_omni_mixed_runner.yaml"
+    deploy_path.write_text(
+        """\
+model_runner: v1
+async_chunk: true
+stages:
+  - stage_id: 0
+  - stage_id: 1
+    model_runner: v2
+  - stage_id: 2
+    model_runner: v2
+"""
+    )
+    deploy = load_deploy_config(deploy_path)
+    assert [stage.model_runner for stage in deploy.stages] == [None, "v2", "v2"]
+
+    pipeline = _qwen3_omni_pipeline()
+    legacy = merge_pipeline_deploy(pipeline, deploy)
+    assert [stage.yaml_engine_args["use_v2_model_runner"] for stage in legacy] == [False, True, True]
+    # The test pipeline declares native support; only v2 stages use it.
+    assert [stage.yaml_engine_args["supports_native_mrv2_data_plane"] for stage in legacy] == [True, True, True]
+
+    structured = VllmOmniConfig.from_pipeline_config(pipeline, deploy_config_path=str(deploy_path))
+    assert [stage.model_config.use_v2_model_runner for stage in structured.stage_configs] == [False, True, True]
+
+
+def test_platform_v1_fallback_overrides_stage_v2():
+    deploy = DeployConfig(
+        stages=[StageDeployConfig(stage_id=0), StageDeployConfig(stage_id=1, model_runner="v2")],
+        platforms={"rocm": {"model_runner": "v1"}},
+    )
+    deploy = _apply_platform_overrides(deploy, platform="rocm")
+    assert deploy.model_runner == "v1"
+    assert deploy.stages[1].model_runner is None
+
+
+def test_qwen3_omni_downstream_mrv2_accepts_duplex_sessions():
+    stages = [
+        StageDeployConfig(stage_id=0),
+        StageDeployConfig(stage_id=1, model_runner="v2"),
+        StageDeployConfig(stage_id=2, model_runner="v2"),
+    ]
+    merged = merge_pipeline_deploy(_qwen3_omni_pipeline(), DeployConfig(stages=stages, session_mode="duplex"))
+    assert [stage.yaml_engine_args["use_v2_model_runner"] for stage in merged] == [False, True, True]
+    assert [stage.yaml_engine_args["session_mode"] for stage in merged] == ["duplex", "duplex", "duplex"]
+
+
+def test_v1_downstream_stage_keeps_duplex_sessions():
+    deploy = DeployConfig(stages=[StageDeployConfig(stage_id=0)], session_mode="duplex")
+    stages = merge_pipeline_deploy(_qwen3_omni_pipeline(), deploy)
+    assert not any(stage.yaml_engine_args["use_v2_model_runner"] for stage in stages)
 
 
 def test_qwen3_tts_high_concurrency_mrv2_profile_is_explicit_opt_in():
@@ -877,6 +1121,10 @@ def test_vllm_omni_stage_config_public_fields_use_typed_stage_realizations():
         "compilation_config",
         "profiler_config",
         "quantization_config",
+        # Stage-level speculative_config is passed straight through to the
+        # engine: the Talker K-step block is read by the engine, not unpacked
+        # structurally like the other stage configs.
+        "speculative_config",
     }
     assert "diffusion_config" not in public_fields
     assert {f.name for f in fields(VllmOmniDiffusionStageConfig)} == public_fields | {"diffusion_config"}
@@ -886,6 +1134,7 @@ def test_vllm_omni_stage_config_public_fields_use_typed_stage_realizations():
 
 def test_runtime_config_fields_match_structured_runtime_scope():
     assert {f.name for f in fields(OmniStageRuntimeConfig)} == {
+        "cuda_mps",
         "additional_config",
         "distributed_executor_backend",
         "worker_cls",
@@ -950,11 +1199,15 @@ def test_sub_config_fields_match_structured_scopes():
         "attention_backend",
         "attention_config",
         "moe_backend",
+        "linear_backend",
         "hf_overrides",
         "limit_mm_per_prompt",
         "interleave_mm_strings",
         "media_io_kwargs",
         "final_output",
+        "supports_running_prefix_cache_reset",
+        "supports_pending_generation",
+        "recompute_preemption",
         "active_stream_window",
         "session_mode",
         "duplex_max_sessions",
@@ -993,6 +1246,7 @@ def test_sub_config_fields_match_structured_scopes():
         "generation_config",
         "override_generation_config",
         "enable_prompt_embeds",
+        "scheduling_metadata_adapter",
     }
     vllm_load_fields = {f.name for f in fields(VllmLoadConfig)}
     assert issubclass(OmniStageLoadConfig, VllmLoadConfig)
@@ -1272,9 +1526,24 @@ def test_diffusion_parallel_config_accepts_four_way_guidance_parallelism():
     assert cfg.world_size == 4
 
 
-def test_diffusion_parallel_config_rejects_allgather_with_ulysses_or_ring():
-    with pytest.raises(ValidationError):
-        OmniStageDiffusionParallelConfig(allgather_degree=2, ulysses_degree=2)
+def test_diffusion_parallel_config_accepts_ulysses_allgather_composition():
+    cfg = OmniStageDiffusionParallelConfig(allgather_degree=2, ulysses_degree=2)
+
+    assert cfg.sequence_parallel_size == 4
+    assert cfg.world_size == 4
+
+
+def test_diffusion_parallel_config_rejects_allgather_composed_with_ring():
+    with pytest.raises(ValidationError, match="cannot be composed with ring_degree"):
+        OmniStageDiffusionParallelConfig(allgather_degree=2, ring_degree=2)
+
+
+def test_diffusion_parallel_config_derives_sequence_parallel_size_from_all_three_degrees():
+    cfg = OmniStageDiffusionParallelConfig(ulysses_degree=2, ring_degree=2, allgather_degree=1)
+    assert cfg.sequence_parallel_size == 4
+
+    cfg = OmniStageDiffusionParallelConfig(ulysses_degree=2, allgather_degree=4)
+    assert cfg.sequence_parallel_size == 8
 
 
 def test_stage_realizations_use_stage_specific_parallel_config_types():
@@ -1795,16 +2064,18 @@ def test_from_pipeline_config_rejects_reserved_diffusion_kv_mode(tmp_path):
 
 @pytest.mark.parametrize("source", ["default", "topology", "deploy", "stage-cli"])
 @pytest.mark.parametrize("key_container", [list, tuple])
-def test_diffusion_stage_payload_keys_roundtrip(source, key_container):
+def test_diffusion_stage_payload_keys_roundtrip(source, key_container, tmp_path):
     from vllm_omni.diffusion.data import OmniDiffusionConfig
     from vllm_omni.engine.stage_init_utils import build_engine_args_dict_from_omni_stage_config
 
     topology_keys = {
         "stage_input_payload_keys": ("conditioning", "metadata"),
+        "stage_input_optional_payload_keys": ("metadata",),
         "stage_output_payload_keys": ("latents",),
     }
     override_keys = {
         "stage_input_payload_keys": (),
+        "stage_input_optional_payload_keys": (),
         "stage_output_payload_keys": ("audio", "video"),
     }
     pipeline = _resolve_pipeline_or_skip("dreamzero")
@@ -1828,7 +2099,7 @@ def test_diffusion_stage_payload_keys_roundtrip(source, key_container):
     legacy_stage = merge_pipeline_deploy(pipeline, deploy)[0]
     legacy_args = {**legacy_stage.yaml_engine_args, **(override_keys if source == "stage-cli" else {})}
     restored_stage = ForkingPickler.loads(ForkingPickler.dumps(stage))
-    engine_args = build_engine_args_dict_from_omni_stage_config(restored_stage, model="test-model")
+    engine_args = build_engine_args_dict_from_omni_stage_config(restored_stage, model=str(tmp_path))
     diffusion_kwargs = omni_config_module.extract_diffusion_stage_config_kwargs(
         engine_args, stage_id=restored_stage.stage_id, include_engine_adapter_metadata=True
     )
@@ -1845,6 +2116,25 @@ def test_diffusion_stage_payload_keys_roundtrip(source, key_container):
         assert getattr(topology, name) == (() if source == "default" else topology_keys[name])
 
 
+@pytest.mark.parametrize("pipeline_key", ["wan2_2_eg", "wan2_2_egd"])
+def test_wan_stage_roles_survive_structured_runtime_projection(pipeline_key, tmp_path):
+    from vllm_omni.diffusion.data import OmniDiffusionConfig
+    from vllm_omni.engine.stage_init_utils import build_engine_args_dict_from_omni_stage_config
+
+    pipeline = _resolve_pipeline_or_skip(pipeline_key)
+    config = VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=_load_default_deploy(pipeline))
+    for topology in pipeline.stages:
+        stage = ForkingPickler.loads(ForkingPickler.dumps(config.stage_by_id(topology.stage_id)))
+        assert stage.diffusion_config.stage_role == topology.stage_role.value
+        engine_args = build_engine_args_dict_from_omni_stage_config(stage, model=str(tmp_path))
+        kwargs = omni_config_module.extract_diffusion_stage_config_kwargs(
+            engine_args, stage_id=stage.stage_id, include_engine_adapter_metadata=True
+        )
+        runtime = OmniDiffusionConfig.from_kwargs(**kwargs)
+        assert runtime.stage_role == topology.stage_role.value
+        assert runtime.stage_input_optional_payload_keys == topology.stage_input_optional_payload_keys
+
+
 def test_diffusion_config_field_classification_covers_current_fields():
     from vllm_omni.diffusion.data import OmniDiffusionConfig
 
@@ -1856,7 +2146,9 @@ def test_diffusion_config_field_classification_covers_current_fields():
 
     assert classified_fields == {f.name for f in fields(omni_config_module._DiffusionConfigProjection)}
     assert {f.name for f in fields(OmniDiffusionConfig)} <= (
-        classified_fields | omni_config_module._DIFFUSION_MOVED_SHARED_FIELDS
+        classified_fields
+        | omni_config_module._DIFFUSION_MOVED_SHARED_FIELDS
+        | omni_config_module._DIFFUSION_INTERNAL_FIELDS
     )
     assert {
         "enable_prompt_embed_cache",
@@ -2017,6 +2309,46 @@ def test_compact_offload_config_is_validated_during_projection():
         )
 
 
+def test_dlo_chunk_size_survives_cli_and_deploy_into_structured_config():
+    cli_config = _from_pipeline_key("hunyuan_image3_dit", cli_overrides={"dlo_chunk_size_mb": 32})
+    assert cli_config.stage_by_id(0).diffusion_config.dlo_chunk_size_mb == 32
+
+    pipeline = _resolve_pipeline_or_skip("hunyuan_image3_dit")
+    deploy = DeployConfig(stages=[StageDeployConfig(stage_id=0, dlo_chunk_size_mb=128)])
+    deploy_config = VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=deploy)
+    assert deploy_config.stage_by_id(0).diffusion_config.dlo_chunk_size_mb == 128
+
+
+@pytest.mark.parametrize("chunk_size_mb", [0, -1])
+def test_dlo_chunk_size_rejects_non_positive_values(chunk_size_mb):
+    with pytest.raises(ValidationError):
+        omni_config_module._DiffusionConfigProjection(dlo_chunk_size_mb=chunk_size_mb)
+    with pytest.raises(ValueError, match="dlo_chunk_size_mb must be a positive integer"):
+        OmniDiffusionConfig(dlo_chunk_size_mb=chunk_size_mb)
+
+
+def test_dlo_chunk_size_accepts_reference_kv_config():
+    config = OmniDiffusionConfig(dlo_chunk_size_mb=32, kv_offload_config={"mode": "on"})
+
+    assert config.dlo_chunk_size_mb == 32
+    assert config.kv_offload_config == {"mode": "on"}
+
+
+@pytest.mark.parametrize(
+    "chunk_size_mb,kv_config,error",
+    [
+        (0, {"mode": "on"}, "dlo_chunk_size_mb must be a positive integer"),
+        (True, {"mode": "on"}, "dlo_chunk_size_mb must be a positive integer"),
+        (32, {"mode": "off"}, "kv_offload_config.mode must be on"),
+        (32, {"mode": "on", "kv_refresh_interval": -1}, "kv_refresh_interval must be an integer"),
+        (32, {"mode": "on", "kv_host_quantization": "unknown"}, "kv_host_quantization must be"),
+    ],
+)
+def test_dlo_and_reference_kv_config_reject_invalid_settings(chunk_size_mb, kv_config, error):
+    with pytest.raises(ValueError, match=error):
+        OmniDiffusionConfig(dlo_chunk_size_mb=chunk_size_mb, kv_offload_config=kv_config)
+
+
 @pytest.mark.parametrize("pipeline_async", [True, False])
 @pytest.mark.parametrize("stage_async", [None, False, True])
 def test_stage_async_chunk_opt_out_matches_legacy_config(pipeline_async, stage_async):
@@ -2045,6 +2377,28 @@ def test_async_chunk_rejects_mismatched_connector_edge(disabled_stage, builder):
         stages=[StageDeployConfig(stage_id=disabled_stage, async_chunk=False)],
     )
     with pytest.raises(ValueError, match="incompatible async_chunk settings on connector edge 0 -> 1"):
+        if builder is merge_pipeline_deploy:
+            builder(pipeline, deploy)
+        else:
+            builder(pipeline, user_deploy_config=deploy)
+
+
+@pytest.mark.parametrize("scope", ["pipeline", "stage"])
+@pytest.mark.parametrize("from_yaml", [False, True])
+@pytest.mark.parametrize("builder", [merge_pipeline_deploy, VllmOmniConfig.from_pipeline_config])
+def test_async_chunk_rejects_quoted_false_before_selecting_processors(tmp_path, scope, from_yaml, builder):
+    pipeline = _resolve_pipeline_or_skip("qwen3_tts")
+    if from_yaml:
+        path = tmp_path / "quoted_false.yaml"
+        path.write_text(
+            'async_chunk: "false"\n' if scope == "pipeline" else 'stages:\n  - stage_id: 0\n    async_chunk: "false"\n'
+        )
+        deploy = load_deploy_config(path)
+    elif scope == "pipeline":
+        deploy = DeployConfig(async_chunk="false")
+    else:
+        deploy = DeployConfig(stages=[StageDeployConfig(stage_id=0, async_chunk="false")])
+    with pytest.raises(ValueError, match="async_chunk must be a boolean"):
         if builder is merge_pipeline_deploy:
             builder(pipeline, deploy)
         else:
@@ -2169,3 +2523,113 @@ def test_structured_diffusion_stage_keeps_shared_globals_outside_diffusion():
 def test_structured_diffusion_stage_rejects_explicit_shared_engine_field(field_name, config_kwargs):
     with pytest.raises(ValueError, match=rf"stage 0.*{field_name}"):
         _build_single_diffusion_config(**config_kwargs)
+
+
+def test_mps_is_explicit_only_in_experimental_single_gpu_profile():
+    assert not load_deploy_config(_DEPLOY_DIR / "qwen3_tts.yaml").cuda_mps
+    deploy = load_deploy_config(_DEPLOY_DIR / "qwen3_tts_high_concurrency_mrv2_single_gpu.yaml")
+    assert deploy.cuda_mps
+    pipeline = _resolve_pipeline_or_skip("qwen3_tts")
+    stages = merge_pipeline_deploy(pipeline, deploy)
+    assert all(stage.yaml_runtime["cuda_mps"] is True for stage in stages)
+
+
+def test_mps_config_rejects_string_boolean(tmp_path):
+    path = tmp_path / "deploy.yaml"
+    path.write_text('cuda_mps: "false"\n')
+    with pytest.raises(ValueError, match="cuda_mps must be a boolean"):
+        load_deploy_config(path)
+
+
+def test_mps_stays_in_runtime_instead_of_engine_arguments():
+    from vllm_omni.engine.stage_init_utils import build_engine_args_dict_from_omni_stage_config
+
+    config = _from_pipeline_key(
+        "qwen3_tts", deploy_config_path=str(_DEPLOY_DIR / "qwen3_tts_high_concurrency_mrv2_single_gpu.yaml")
+    )
+    for stage in config.stage_configs:
+        assert stage.runtime_config.cuda_mps
+        args = build_engine_args_dict_from_omni_stage_config(stage, model="test-model")
+        assert "cuda_mps" not in args
+
+
+def test_platform_stage_overlay_rejects_invalid_model_runner():
+    deploy = DeployConfig(
+        stages=[StageDeployConfig(stage_id=0)],
+        platforms={"cuda": {"stages": [{"stage_id": 0, "model_runner": "v3"}]}},
+    )
+    with pytest.raises(ValueError, match="model_runner must be 'v1' or 'v2'"):
+        _apply_platform_overrides(deploy, platform="cuda")
+
+
+def test_async_chunk_auto_disabled_without_processor():
+    """Ensure a multi-stage model that doesn't support async chunk turns it off by default."""
+    pipeline = PipelineConfig(
+        model_type="test_no_async",
+        model_arch="TestNoAsync",
+        stages=(
+            StagePipelineConfig(
+                stage_id=0,
+                model_stage="ar",
+                execution_type=StageExecutionType.LLM_AR,
+                final_output=True,
+            ),
+            StagePipelineConfig(
+                stage_id=1,
+                model_stage="generation",
+                execution_type=StageExecutionType.LLM_GENERATION,
+                input_sources=(0,),
+            ),
+        ),
+    )
+
+    deploy = DeployConfig()
+    # async chunk should not try to default to True in this case,
+    # since doing so will just raise a ValueError in validation.
+    merge_pipeline_deploy(pipeline, deploy)
+    assert not deploy.async_chunk
+
+
+def test_mrv2_duplex_session_validation():
+    from vllm_omni.config.stage_config import validate_native_mrv2_session
+
+    ps = StagePipelineConfig(
+        stage_id=1,
+        model_stage="tts",
+        input_sources=(0,),
+        supports_native_mrv2_data_plane=True,
+        supports_duplex_mrv2=True,
+    )
+    # Allowed when supports_duplex_mrv2 is True
+    deploy_duplex = DeployConfig(session_mode="duplex")
+    validate_native_mrv2_session(deploy_duplex, ps, "v2")
+
+    # Rejected when supports_duplex_mrv2 is False
+    ps_no_duplex = replace(ps, supports_duplex_mrv2=False)
+    with pytest.raises(ValueError, match="supports session_mode 'turn' only"):
+        validate_native_mrv2_session(deploy_duplex, ps_no_duplex, "v2")
+
+
+@pytest.mark.parametrize("execution_type", list(StageExecutionType))
+@pytest.mark.parametrize("mode", ["allow", "fail"])
+def test_recompute_preemption_projection_is_ar_only(execution_type, mode):
+    pipeline = PipelineConfig(
+        model_type="test_preemption",
+        stages=(
+            StagePipelineConfig(
+                stage_id=0,
+                model_stage="test",
+                execution_type=execution_type,
+                recompute_preemption=mode,
+                final_output=True,
+            ),
+        ),
+    )
+    deploy = DeployConfig(stages=[StageDeployConfig(stage_id=0)])
+    legacy = merge_pipeline_deploy(pipeline, deploy)[0]
+    structured = VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=deploy).stage_by_id(0)
+    expected = mode if execution_type is StageExecutionType.LLM_AR else "allow"
+    assert legacy.yaml_engine_args.get("recompute_preemption", "allow") == expected
+    assert structured.model_config.recompute_preemption == expected
+    if execution_type is not StageExecutionType.LLM_AR:
+        assert "recompute_preemption" not in legacy.yaml_engine_args

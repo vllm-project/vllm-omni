@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """MingFlashOmniTTS serving adapter."""
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from vllm.inputs import tokens_input
 from vllm.logger import init_logger
@@ -77,7 +77,7 @@ class MingFlashOmniTTSAdapter(ARTTSAdapter):
         has_spk_emb = request.speaker_embedding is not None
         # Standalone TTS uses the Ming ``instruct`` task. ``voice_name`` lets
         # the talker resolve registered presets such as DB30.
-        info = {
+        info: dict[str, Any] = {
             "ming_task": "instruct",
             "prompt": DEFAULT_PROMPT,
             "text": request.input,
@@ -89,13 +89,13 @@ class MingFlashOmniTTSAdapter(ARTTSAdapter):
             "sigma": 0.25,
             "temperature": 0.0,
         }
-        if has_spk_emb:
+        if request.speaker_embedding is not None:
             # Keep embeddings as plain floats for EngineCore serialization.
             info["spk_emb"] = list(request.speaker_embedding)
         prompt = tokens_input(prompt_token_ids=[0])
         prompt["additional_information"] = info
         return PreparedRequest(prompt=prompt, tts_params={}, model_type="ming_flash_omni_tts")
 
-    def _load_supported_speakers(self) -> set[str]:
+    def _load_supported_speakers(self) -> list[str]:
         # Speaker selection is driven by caption JSON rather than a static table.
-        return set()
+        return []

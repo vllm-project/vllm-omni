@@ -31,6 +31,23 @@ last_reviewed: 2026-07-16
 The AR runtime extends vLLM scheduling and worker execution for omni-stage
 inputs and outputs while preserving vLLM scheduling and cache semantics.
 
+## Full-payload input scheduling
+
+For a downstream, non-async stage with `requires_full_payload_input`,
+`OmniSchedulingCoordinator` parks requests until the Model Runner receives the
+complete upstream payload. `OmniConnectorModelRunnerMixin` keeps that payload
+in its local cache and uses `SchedulingMetadataAdapter` to translate
+model-specific fields into `SchedulingMetadataUpdate`. The Scheduler consumes
+only the typed update and readiness signal; it does not inspect payload fields.
+
+The receive flow is
+`process_pending_full_payload_inputs()` -> `register_chunk_recv()` ->
+`recv_full_payload_inputs()` -> `SchedulingMetadataAdapter.extract()` ->
+`OmniConnectorOutput` -> `update_request_metadata()`. Native MRV2 async
+receive also uses this coordinator and typed updates, with the built-in
+metadata adapter. Other async-chunk paths retain `OmniChunkTransferAdapter`
+ownership of chunk transfer and request updates.
+
 ## Candidate invariants
 
 ### AR-INV-001: vLLM owns base scheduling semantics
@@ -46,6 +63,29 @@ adapter, not injected through unrelated scheduler state.
 ### AR-INV-003: Workers execute assigned work
 
 **Rule:** Workers and model runners MUST NOT implement cross-stage routing.
+
+## Token-only output payloads
+
+An AR stage whose downstream decoder consumes sampled tokens rather than
+hidden states can set `omni_pooler_payload_include_hidden = False`. Hidden
+states remain available for logits and sampling; prefill conditioning and
+other required multimodal outputs still cross the stage boundary.
+
+A chunk processor that needs IDs on steps without a tensor payload declares
+`requires_token_updates = True`. The scheduler then enqueues nonempty sampled
+IDs while preserving final-stage exclusions and the processor's EOF handling.
+Processors without this declaration retain their tensor-payload trigger.
+
+When hidden and multimodal payloads are absent, the shared runner skips empty
+per-request payload construction. Prefix-cache merges and pending model
+postprocess retain the normal path. This policy is independent of whether
+output materialization runs inline or in the background.
+
+Inline construction consumes query offsets, scheduled-token counts and
+scheduler metadata before the next execution can reuse them. Background
+construction snapshots those inputs. Both paths reuse the request IDs already
+copied by upstream bookkeeping; connector collection stays on the main thread
+because it can run a tensor-parallel collective.
 
 ## Safe-change guide
 

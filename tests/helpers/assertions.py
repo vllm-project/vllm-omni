@@ -4,9 +4,11 @@
 """Assertion and response validation helpers for tests."""
 
 import base64
+import hashlib
 import io
 import json
 import math
+import os
 import tempfile
 import threading
 import wave
@@ -364,6 +366,25 @@ def assert_video_first_frame_matches(
     mean_absolute_error = float(np.abs(first_frame.astype(np.float32) - expected).mean() / 255.0)
     assert mean_absolute_error < max_mean_absolute_error, (
         f"Expected first-frame MAE < {max_mean_absolute_error}, got {mean_absolute_error:.6f}."
+    )
+
+
+def assert_video_first_frames_differ(
+    video: bytes,
+    reference: bytes,
+    *,
+    min_mean_absolute_error: float,
+) -> None:
+    """Compare decoded pixels, ignoring differences in MP4 encoding metadata."""
+    with av.open(BytesIO(video)) as container:
+        actual = next(container.decode(video=0)).to_ndarray(format="rgb24")
+    with av.open(BytesIO(reference)) as container:
+        expected = next(container.decode(video=0)).to_ndarray(format="rgb24")
+
+    assert actual.shape == expected.shape
+    mean_absolute_error = float(np.abs(actual.astype(np.float32) - expected).mean() / 255.0)
+    assert mean_absolute_error > min_mean_absolute_error, (
+        f"Expected first-frame MAE > {min_mean_absolute_error}, got {mean_absolute_error:.6f}."
     )
 
 
@@ -980,6 +1001,31 @@ def _assert_transcript_matches(
     )
 
 
+def _retain_failed_speech_audio(
+    audio_bytes: bytes | None, transcript: str, expected_text: Any, error: AssertionError
+) -> None:
+    """Retain the exact ASR input when a CI speech-content assertion fails."""
+    directory = os.environ.get("VLLM_OMNI_FAILED_SPEECH_AUDIO_DIR")
+    if not directory or not audio_bytes:
+        return
+    stem = f"failed_speech_{hashlib.sha256(audio_bytes).hexdigest()[:16]}"
+    root = Path(directory)
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        (root / f"{stem}.wav").write_bytes(audio_bytes)
+        (root / f"{stem}.json").write_text(
+            json.dumps(
+                {"transcript": transcript, "expected_text": str(expected_text), "assertion": str(error)},
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        print(f"Retained failed speech ASR input: {root / f'{stem}.wav'}")
+    except OSError as exc:
+        # Diagnostic I/O must never replace or suppress the content failure.
+        print(f"Could not retain failed speech ASR input: {exc}")
+
+
 def assert_audio_speech_response(response: Any, request_config: dict[str, Any], run_level: str | None = None) -> None:
     """Validate speech API results from :class:`~tests.helpers.client.OmniResponse`.
 
@@ -1044,14 +1090,21 @@ def assert_audio_speech_response(response: Any, request_config: dict[str, Any], 
             if expected_text:
                 print(f"audio content is: {transcript}")
                 print(f"input text is: {expected_text}")
-                _assert_transcript_matches(
-                    transcript,
-                    _speech_audio_for_transcription(getattr(response, "audio_bytes", None), request_config),
-                    expected_text,
-                    threshold=0.9,
-                    escalation_model=request_config.get("transcript_escalation_model"),
-                    language=request_config.get("transcript_language"),
+                transcription_audio = _speech_audio_for_transcription(
+                    getattr(response, "audio_bytes", None), request_config
                 )
+                try:
+                    _assert_transcript_matches(
+                        transcript,
+                        transcription_audio,
+                        expected_text,
+                        threshold=0.9,
+                        escalation_model=request_config.get("transcript_escalation_model"),
+                        language=request_config.get("transcript_language"),
+                    )
+                except AssertionError as exc:
+                    _retain_failed_speech_audio(transcription_audio, transcript, expected_text, exc)
+                    raise
         _assert_preset_voice_gender_from_audio(
             response.audio_bytes,
             request_config.get("voice"),
@@ -1092,6 +1145,29 @@ def _http_response_body_materialize(resp: Any) -> tuple[bytes, dict[str, Any] | 
     except json.JSONDecodeError:
         return raw, None
     return raw, parsed if isinstance(parsed, dict) else None
+
+
+def _response_error_code(payload: dict[str, Any] | None) -> int | str | None:
+    """Return OpenAI-style ``error.code`` when the body carries one.
+
+    Numeric strings are returned as ``int``. ``bool`` is ignored because it is a subclass of ``int``.
+    """
+    if not isinstance(payload, dict):
+        return None
+    error = payload.get("error")
+    if not isinstance(error, dict):
+        return None
+    code = error.get("code")
+    if isinstance(code, bool) or code is None:
+        return None
+    if isinstance(code, int):
+        return code
+    if isinstance(code, str):
+        stripped = code.strip()
+        if stripped.isdigit():
+            return int(stripped)
+        return stripped or None
+    return None
 
 
 def assert_err_message_in_text(
@@ -1136,6 +1212,8 @@ def assert_http_error(
     Tuple/list ``err_message`` then uses **any** substring match; HTTP mode still requires **all** pieces.
 
     - ``err_code``: exact HTTP ``int``, or membership if a non-string sequence (e.g. ``(400, 422)``).
+      When the HTTP status is 200 and the JSON body has ``error.code``, that value is checked instead of
+      the status. Sync errors still match on the HTTP status, which is set from the same code.
       When ``err_code`` is set and the actual status is a client error in ``400..499`` other than ``404``,
       the JSON body must include FastAPI ``detail`` and/or OpenAI-style ``error`` (2xx skips this).
     - ``err_message``: substring match (case-insensitive) against serialized ``json_body`` and ``error_message``.
@@ -1162,14 +1240,19 @@ def assert_http_error(
     actual = getattr(resp, "status_code", None)
     assert actual is not None, "response missing status_code"
 
+    body_bytes, payload = _http_response_body_materialize(resp)
+
     if err_code is not None:
+        code_to_check: int | str = actual
+        if actual == 200:
+            body_code = _response_error_code(payload)
+            if body_code is not None:
+                code_to_check = body_code
         if isinstance(err_code, int):
-            assert actual == err_code, (resp, err_code)
+            assert code_to_check == err_code, (resp, err_code)
         else:
             allowed = tuple(err_code)
-            assert actual in allowed, (resp, allowed)
-
-    body_bytes, payload = _http_response_body_materialize(resp)
+            assert code_to_check in allowed, (resp, allowed)
 
     if err_code is not None and actual is not None and 400 <= actual < 500 and actual != 404:
         assert payload is not None, getattr(resp, "error_message", resp)

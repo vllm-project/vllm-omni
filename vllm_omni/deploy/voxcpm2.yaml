@@ -1,4 +1,6 @@
 # VoxCPM2 deploy: single-stage AR pipeline with per-request state batching.
+# MRV2 is opt-in: use a local deploy overlay with base_config: voxcpm2.yaml
+# and model_runner: v2. The same runtime_config works for both runners.
 # Runs on large (H20 141GB) and small (24GB L4) cards alike: the KV cache is
 # pinned to a right-sized budget instead of ballooning to fill the card.
 #
@@ -31,6 +33,12 @@ stages:
     engine_extras:
       hf_overrides:
         voxcpm2_runtime_config:
+          # LocDiT generation settings affect synthesis quality. Keep the defaults
+          # unless alternative values have been validated for your workload.
+          inference_timesteps: 10
+          cfg_value: 2.0
+          cfg_cutoff_ratio: 1.0
+
           audio_emit_every: 1
           vae_decode_every: 3
           enable_batched_cfm: true
@@ -43,6 +51,8 @@ stages:
           enable_loc_dit_reduce_overhead_no_cg: true
           enable_unified_decode_graph: true
           unified_decode_graph_max_batch_size: 8
+          enable_batched_fsq_fusion: true
+          enable_batched_prefill_tail: true
     default_sampling_params:
       temperature: 0.0
       top_p: 1.0

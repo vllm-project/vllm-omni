@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Static regression checks for VoxCPM2 runner-assisted unified graph hooks.
 
 These tests intentionally avoid importing torch/vLLM so they can run in a
@@ -154,7 +154,8 @@ def test_voxcpm2_batch_unified_graph_requires_runner_metadata_marker():
     forward_source = source[source.index("def _forward_unified_decode") :]
     forward_source = forward_source[: forward_source.index("# -------------------- vllm hooks")]
     assert "graph_size = self._select_unified_graph_bucket_size(num_reqs)" in forward_source
-    assert "self._unified_graphs[graph_size]" in forward_source
+    assert "self._unified_graphs if mixed_token_capacity is None else self._mixed_graphs" in forward_source
+    assert "graph_cache[graph_key] = g" in forward_source
     assert "g.input_embeds[num_reqs:graph_size].zero_()" not in forward_source
     assert "padded rows as valid duplicates" in forward_source
     assert "g.input_embeds[last : last + 1].expand" in forward_source
@@ -192,9 +193,10 @@ def test_voxcpm2_scheduler_policy_stays_model_local():
     assert "def _should_defer_waiting_admission(self) -> bool:" in common_source
 
     assert "class VoxCPM2OmniARAsyncScheduler(OmniARAsyncScheduler)" in voxcpm2_scheduler_source
+    assert "import vllm_omni.platforms as omni_platform" in voxcpm2_scheduler_source
     assert "from .runtime_config import _VoxCPM2RuntimeConfig" in voxcpm2_scheduler_source
     assert "_VoxCPM2RuntimeConfig.from_vllm_config(self.vllm_config)" in voxcpm2_scheduler_source
-    assert "unified_decode_graph_available(use_cuda_graph=current_omni_platform.is_cuda())" in voxcpm2_scheduler_source
+    assert "use_cuda_graph=omni_platform.current_omni_platform.is_cuda()" in voxcpm2_scheduler_source
     assert "_should_defer_waiting_for_unified_decode_graph" in voxcpm2_scheduler_source
     assert "def schedule(" not in voxcpm2_scheduler_source
     assert "create_request_queue" not in voxcpm2_scheduler_source

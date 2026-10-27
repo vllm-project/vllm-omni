@@ -55,6 +55,7 @@ from vllm_omni.diffusion.offloader.offload_plan import (
 )
 from vllm_omni.diffusion.offloader.plan_resolver import ResolvedComponent, resolve_offload_plan
 from vllm_omni.diffusion.offloader.startup import OffloadStartupState, attach_offload_startup_state
+from vllm_omni.diffusion.worker.diffusion_worker import DiffusionWorker
 from vllm_omni.host_weight_runtime import MappedHostRegion
 from vllm_omni.platforms import current_omni_platform
 
@@ -297,6 +298,72 @@ class TestDistributedLayerwiseOffloadHook:
             atol=0,
         )
         torch.testing.assert_close(rank0_block.weight_scale, expected_scale)
+
+    def test_allgather_reconstructs_scalar_fp8_weight_scale(
+        self,
+        patched_offload_runtime,
+        monkeypatch,
+    ):
+        """Zero-dim FP8 scales must survive packing, offload, and a second prefetch."""
+
+        class ScalarScaleBlock(nn.Module):
+            def __init__(self):
+                super().__init__()
+                logical_weight = torch.arange(1.0, 13.0).reshape(3, 4).to(torch.float8_e4m3fn)
+                self.weight = nn.Parameter(logical_weight.t(), requires_grad=False)
+                self.weight_scale = nn.Parameter(torch.tensor(0.25), requires_grad=False)
+                self.register_buffer("input_scale", torch.tensor(0.5))
+
+        current_block = ScalarScaleBlock()
+        rank0_block = ScalarScaleBlock()
+        rank1_block = ScalarScaleBlock()
+        expected = {name: tensor.detach().clone() for name, tensor in rank0_block.named_parameters()}
+        expected.update({name: tensor.detach().clone() for name, tensor in rank0_block.named_buffers()})
+        expected_strides = {name: tensor.stride() for name, tensor in rank0_block.named_parameters()}
+        expected_strides.update({name: tensor.stride() for name, tensor in rank0_block.named_buffers()})
+
+        def make_hook(block: ScalarScaleBlock, rank: int) -> DistributedLayerwiseOffloadHook:
+            return DistributedLayerwiseOffloadHook(
+                next_block=block,
+                device=torch.device("cpu"),
+                dp_group=object(),
+                dp_size=2,
+                rank=rank,
+                copy_stream=DummyStream(),
+                comm_stream=DummyStream(),
+                pin_memory=False,
+                chunk_size_bytes=32,
+            )
+
+        rank0_hook = make_hook(rank0_block, 0)
+        rank1_hook = make_hook(rank1_block, 1)
+        rank0_hook.initialize_hook(current_block)
+        rank1_hook.initialize_hook(ScalarScaleBlock())
+        rank0_hook.gpu_shard_buffers = [
+            {dtype: torch.empty_like(shard) for dtype, shard in rank0_hook.cpu_shards.items()} for _ in range(2)
+        ]
+
+        def fake_allgather(output, local_shard, *, group):
+            del group
+            remote_shard = rank1_hook.cpu_shards[local_shard.dtype]
+            shard_size = local_shard.numel()
+            output[:shard_size].copy_(local_shard)
+            output[shard_size : 2 * shard_size].copy_(remote_shard)
+
+        monkeypatch.setattr(torch.distributed, "all_gather_into_tensor", fake_allgather)
+
+        def assert_restored() -> None:
+            assert rank0_block.weight_scale.ndim == 0
+            assert rank0_block.input_scale.ndim == 0
+            for name, tensor in list(rank0_block.named_parameters()) + list(rank0_block.named_buffers()):
+                assert tensor.stride() == expected_strides[name]
+                torch.testing.assert_close(tensor.float(), expected[name].float(), rtol=0, atol=0)
+
+        rank0_hook.prefetch_layer(slot=0, non_blocking=False)
+        assert_restored()
+        rank0_hook.offload_layer()
+        rank0_hook.prefetch_layer(slot=1, non_blocking=False)
+        assert_restored()
 
     def test_allgather_reconstructs_online_int8_weight_and_scale(
         self,
@@ -2339,6 +2406,7 @@ class TestConfigValidation:
                 enable_layerwise_offload=False,
                 enable_distributed_layerwise_offload=True,
                 dlo_use_allgather=use_allgather,
+                dlo_chunk_size_mb=64,
                 dlo_resident_layers=0,
                 pin_cpu_memory=False,
                 parallel_config=SimpleNamespace(
@@ -2362,6 +2430,7 @@ class TestConfigValidation:
             enable_layerwise_offload=False,
             enable_distributed_layerwise_offload=True,
             dlo_use_allgather=False,
+            dlo_chunk_size_mb=64,
             dlo_resident_layers=0,
             pin_cpu_memory=False,
             model="unused",
@@ -2458,6 +2527,7 @@ class TestConfigValidation:
             enable_layerwise_offload = False
             enable_distributed_layerwise_offload = True
             dlo_use_allgather = True
+            dlo_chunk_size_mb = 64
             pin_cpu_memory = True
             parallel_config = FakePC()
             model = "/fake/path"
@@ -2489,6 +2559,7 @@ class TestConfigValidation:
             enable_distributed_layerwise_offload = True
             dlo_use_allgather = False  # no AllGather → should be allowed
             dlo_resident_layers = 20
+            dlo_chunk_size_mb = 64
             pin_cpu_memory = True
             parallel_config = FakePC()
             model = "/fake/path"
@@ -2509,12 +2580,66 @@ class TestConfigValidation:
             enable_distributed_layerwise_offload = True
             dlo_use_allgather = True
             dlo_resident_layers = 20
+            dlo_chunk_size_mb = 64
             pin_cpu_memory = True
             parallel_config = FakePC()
             model = "/fake/path"
 
         with pytest.raises(ValueError, match="requires the DiT DLO transfer to be rank-local"):
             OffloadConfig.from_od_config(FakeODConfig())
+
+    @pytest.mark.parametrize("chunk_size_mb", [32, 128])
+    def test_nondefault_dlo_chunk_size_reaches_offload_config(self, chunk_size_mb):
+        config = OffloadConfig.from_od_config(
+            SimpleNamespace(
+                enable_cpu_offload=False,
+                enable_layerwise_offload=False,
+                enable_distributed_layerwise_offload=True,
+                dlo_use_allgather=True,
+                dlo_chunk_size_mb=chunk_size_mb,
+                dlo_resident_layers=0,
+                pin_cpu_memory=False,
+                parallel_config=SimpleNamespace(
+                    data_parallel_size=2,
+                    use_hsdp=False,
+                    hsdp_shard_size=-1,
+                    hsdp_replicate_size=1,
+                    sequence_parallel_size=1,
+                    tensor_parallel_size=1,
+                ),
+            )
+        )
+        assert config.chunk_size_bytes == chunk_size_mb * 1024 * 1024
+
+    @pytest.mark.parametrize("chunk_size_mb", [0, -1, 32.0, True])
+    def test_invalid_dlo_chunk_size_is_rejected(self, chunk_size_mb):
+        with pytest.raises(ValueError, match="dlo_chunk_size_mb must be a positive integer"):
+            OffloadConfig.from_od_config(
+                SimpleNamespace(
+                    enable_cpu_offload=False,
+                    enable_layerwise_offload=False,
+                    enable_distributed_layerwise_offload=True,
+                    dlo_use_allgather=True,
+                    dlo_chunk_size_mb=chunk_size_mb,
+                    dlo_resident_layers=0,
+                    pin_cpu_memory=False,
+                    parallel_config=SimpleNamespace(data_parallel_size=1, use_hsdp=False, sequence_parallel_size=1),
+                )
+            )
+
+    def test_missing_dlo_chunk_size_is_not_silently_defaulted(self):
+        with pytest.raises(AttributeError):
+            OffloadConfig.from_od_config(
+                SimpleNamespace(
+                    enable_cpu_offload=False,
+                    enable_layerwise_offload=False,
+                    enable_distributed_layerwise_offload=True,
+                    dlo_use_allgather=True,
+                    dlo_resident_layers=0,
+                    pin_cpu_memory=False,
+                    parallel_config=SimpleNamespace(data_parallel_size=1, use_hsdp=False, sequence_parallel_size=1),
+                )
+            )
 
 
 class TestDynamicSlotTracking:
@@ -2865,6 +2990,34 @@ class TestDistributedComponentSelection:
 
         with pytest.raises(RuntimeError, match="recreate the backend and reload the pipeline"):
             backend.enable(nn.Module())
+
+    def test_worker_shutdown_skips_allgather_restore(self, patched_offload_runtime, mocker):
+        # Restoring AllGather blocks rebuilds the full DiT on every rank's host,
+        # which outlived the executor's shutdown grace period (issue 8081).
+        backend = DistributedLayerwiseOffloadBackend(
+            OffloadConfig(
+                strategy=OffloadStrategy.DISTRIBUTED_LAYER_WISE,
+                pin_cpu_memory=False,
+                dp_size=2,
+                components=frozenset({"dit", "text_encoder"}),
+                dlo_transfers={"dit": "allgather", "text_encoder": "rank-local"},
+            ),
+            torch.device("cpu"),
+        )
+        allgather_hook = Mock(dp_size=2, next_block=nn.Linear(1, 1))
+        rank_local_hook = Mock(dp_size=1, next_block=nn.Linear(1, 1))
+        backend._all_hook_groups = [[allgather_hook], [rank_local_hook]]
+        backend.enabled = True
+        mocker.patch("vllm_omni.diffusion.worker.diffusion_worker.destroy_distributed_env")
+        worker = DiffusionWorker.__new__(DiffusionWorker)
+        worker.model_runner = SimpleNamespace(offload_backend=backend, kv_transfer_manager=None)
+
+        worker.shutdown()
+
+        allgather_hook.restore_next_block_to_cpu.assert_not_called()
+        rank_local_hook.restore_next_block_to_cpu.assert_called_once_with()
+        assert not backend.enabled
+        assert not backend._all_hook_groups
 
     def test_disable_runs_collectives_before_best_effort_local_cleanup(
         self,

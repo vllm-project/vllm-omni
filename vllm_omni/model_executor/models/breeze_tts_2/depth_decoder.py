@@ -16,6 +16,14 @@ from vllm.platforms import current_platform
 from vllm_omni.platforms import current_omni_platform
 
 
+def _depth_layer_compile_options() -> dict[str, bool]:
+    """Keep ROCm away from the unstable Triton GEMM autotune path."""
+    return {
+        "epilogue_fusion": False,
+        "max_autotune": not current_platform.is_rocm(),
+    }
+
+
 def sample_logits(
     logits: torch.Tensor,
     temperature: float,
@@ -283,7 +291,7 @@ class BreezeDepthDecoder(nn.Module):
                     BreezeDepthLayer.forward,
                     fullgraph=True,
                     dynamic=True,
-                    options={"epilogue_fusion": False, "max_autotune": True},
+                    options=_depth_layer_compile_options(),
                 )
                 self._compiled_sampler = torch.compile(sample_graph_logits, fullgraph=True, dynamic=False)
             entry = BreezeDepthGraph(
@@ -325,7 +333,7 @@ class BreezeDepthDecoder(nn.Module):
                 # request's RNG stream even when requests are batched.
                 for codebook in range(self.num_codebooks - 1):
                     entry.noise[row, codebook].exponential_(generator=generator)
-        entry.graph.replay()
+        entry.replay()
         if entry.noise_generators is not None:
             # Replay advances host offsets without synchronizing the device.
             # Padded rows have no request state to update.
@@ -365,7 +373,9 @@ class BreezeDepthGraph:
         # Captured kernels retain addresses, not the Python tensors allocated
         # before capture. Keep every KV allocation alive with its graph.
         self.caches = model._allocate_cache(hidden)
+        self._model = model
         generator = torch.Generator(device=hidden.device)
+        self._generator = generator
         for _ in range(3):
             model._generate_frame(
                 self.hidden,
@@ -379,26 +389,29 @@ class BreezeDepthGraph:
                 greedy=self.greedy,
             )
         current_omni_platform.synchronize()
-        self.graph = torch.cuda.CUDAGraph()
+        self.output: torch.Tensor | None = None
+        self.graph = current_omni_platform.capture_graph(self._capture, self.noise_generators or ())
+
+    def _capture(self) -> None:
         if self.noise_generators is not None:
-            for generator in self.noise_generators:
-                self.graph.register_generator_state(generator)
-        with torch.cuda.graph(
-            self.graph, pool=current_platform.get_global_graph_pool(), capture_error_mode="thread_local"
-        ):
-            if self.noise_generators is not None:
-                self._fill_noise()
-            self.output = model._generate_frame(
-                self.hidden,
-                self.first,
-                self.caches,
-                *parameters,
-                generator,
-                self.noise,
-                self.guidance_scale,
-                self.parameters,
-                greedy=self.greedy,
-            )
+            self._fill_noise()
+        self._run()
+
+    def _run(self) -> None:
+        self.output = self._model._generate_frame(
+            self.hidden,
+            self.first,
+            self.caches,
+            *self.parameter_values,
+            self._generator,
+            self.noise,
+            self.guidance_scale,
+            self.parameters,
+            greedy=self.greedy,
+        )
+
+    def replay(self) -> None:
+        current_omni_platform.replay_graph(self.graph, self._run)
 
     def _fill_noise(self) -> None:
         assert self.noise is not None and self.noise_generators is not None

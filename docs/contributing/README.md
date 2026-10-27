@@ -19,7 +19,7 @@ source .venv/bin/activate
 vLLM-Omni is quickly evolving, please see the [installation guide](../getting_started/installation/README.md) for details. It's recommended to build from source to provide the latest development environment.
 
 !!! tip
-    vLLM-Omni is compatible with Python versions 3.10 to 3.12. However, we recommend developing with Python 3.12 to minimize the chance of your local environment clashing with our CI environment.
+    This source checkout requires Python 3.11 to 3.13, matching the Python floor of vLLM 0.32. We recommend developing with Python 3.12 to match our CI environment.
 
 ### Adding a new model to vLLM-Omni
 
@@ -223,6 +223,12 @@ Please refer to the [test instructions](./ci/test_execution_guide.md) for detail
 
 ### Using repository skills with coding agents
 
+Before implementing a contribution, complete the human
+[contributor intent gate](https://github.com/vllm-project/vllm-omni/blob/main/.claude/skills/precheck-pr/SKILL.md#contributor-intent-gate).
+Reuse explicit human answers already provided; ask for missing answers and wait.
+The gate also checks whether the outcome needs a PR and requires actual failure
+evidence for bug fixes. It does not gate independent PR reviews.
+
 vLLM-Omni maintains [repository-scale skills](https://github.com/vllm-project/vllm-omni/tree/main/.claude/skills) for common coding, testing, performance, and review workflows. These skills capture repository-specific structure, validation requirements, and evidence standards that a general coding agent may not know.
 
 If your coding agent discovers repository skills automatically, ask it to use the relevant skill by name. Otherwise, point it to the linked `SKILL.md` and ask it to read the file before changing code. Skills can be combined: use a domain skill for the implementation, `vllm-omni-test` for test and CI decisions, and `precheck-pr` before opening the pull request.
@@ -293,7 +299,13 @@ If you encounter a bug or have a feature request, please search existing issues 
 
 ## Pull Requests & Code Reviews
 
+For maintainer triage, merge gates, and post-merge quality watch, see the [PR merge loop](./ci/pr_merge_loop.md).
+
 Thank you for your contribution to vLLM-Omni! Before submitting the pull request, please ensure the PR meets the following criteria. This helps vLLM-Omni maintain the code quality and improve the efficiency of the review process.
+
+### Pull Request Limit
+
+To avoid agent spam, vLLM-Omni uses GitHub's [pull request limit](https://github.blog/open-source/maintainers/how-pull-request-limits-are-cutting-down-the-noise/) for contributors without write access. The current cap is 5 open PRs. If this blocks well-intentioned critical work, contact a committer to request bypass list access.
 
 ### DCO and Signed-off-by
 

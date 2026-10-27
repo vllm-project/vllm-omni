@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import base64
 from dataclasses import fields
 from pathlib import Path
 from typing import Any
@@ -16,15 +17,19 @@ from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig, PipelineCo
 from vllm_omni.engine.duplex.config import DuplexCapabilities, DuplexSessionConfig
 from vllm_omni.engine.duplex.contracts import DuplexAppendPlan
 from vllm_omni.engine.duplex.plugin import (
+    DefaultDuplexModelSessionState,
     DuplexDataPlane,
+    DuplexDataPlaneContext,
     DuplexModelPlugin,
     DuplexModelSessionState,
     DuplexRuntimeConfigError,
+    PcmAppendBuffer,
     coerce_int,
     load_duplex_plugin,
     payload_turn_id,
     reject_changed_runtime_value,
     validate_duplex_plugin_sampling,
+    validate_duplex_replica_policy,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -141,6 +146,11 @@ def test_load_duplex_plugin_instantiates_the_class_at_the_dotted_path() -> None:
     assert plugin.private_runtime_config_keys == frozenset()
     assert plugin.silence_continuation_samples == 16000
     assert plugin.runtime_config_for_function_output(DuplexSessionConfig(), {}, {"name": "tool"}) is None
+    assert plugin.note_published_function_call({}, call_id="call_1", history_len=1) is None
+    assert plugin.has_pending_tool_followup({}) is False
+    assert plugin.extra_prompt_config({}) == {}
+    assert plugin.runtime_patch_for_submitted_prompt({}) is None
+    assert plugin.runtime_config_after_response({}, committed=False) is None
 
 
 def test_load_duplex_plugin_rejects_a_non_plugin_class() -> None:
@@ -224,6 +234,44 @@ def test_validate_duplex_plugin_sampling_rejects_non_tuple_results() -> None:
 
     with pytest.raises(TypeError, match="as a tuple"):
         validate_duplex_plugin_sampling(ListSamplingPlugin(_encode_audio), sampling_defaults=(SamplingParams(),))
+
+
+# --------------------------------------------------------------------------- #
+# validate_duplex_replica_policy                                               #
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize(
+    ("policy", "cap", "distributed", "sharing", "error"),
+    [
+        ("legacy", None, True, False, None),
+        ("legacy", 2, False, False, None),
+        ("least_sessions", 1, False, False, None),
+        ("least_sessions", 2, False, True, None),
+        ("least_sessions", 2, False, False, "set max_sessions_per_replica to 1"),
+        ("least_sessions", 1, True, False, "does not support distributed hub/LB mode"),
+        ("least_sessions", 2, True, False, "does not support distributed hub/LB mode"),
+    ],
+)
+def test_validate_duplex_replica_policy(policy, cap, distributed, sharing, error) -> None:
+    capability_calls: list[int] = []
+
+    class CapabilityPlugin(FakePlugin):
+        def capabilities(self, *, max_sessions: int) -> DuplexCapabilities:
+            capability_calls.append(max_sessions)
+            return DuplexCapabilities(supports_multi_session_same_replica=sharing)
+
+    plugin = CapabilityPlugin(_encode_audio)
+    config = DuplexSessionRuntimeConfig(max_sessions=11, replica_policy=policy, max_sessions_per_replica=cap)
+    if error is not None:
+        with pytest.raises(ValueError, match=error):
+            validate_duplex_replica_policy(plugin, config, distributed=distributed)
+    else:
+        validate_duplex_replica_policy(plugin, config, distributed=distributed)
+    # Distributed rejection precedes plugin access. Legacy and one-session
+    # replicas do not need a capability that permits sharing.
+    expected = [cap] if policy == "least_sessions" and not distributed and cap > 1 else []
+    assert capability_calls == expected
 
 
 # --------------------------------------------------------------------------- #
@@ -322,3 +370,179 @@ def test_pipeline_config_binds_one_duplex_plugin_path() -> None:
         for source in framework_sources
         if "completed_append_cache_size" in source.read_text(encoding="utf-8")
     ] == []
+
+
+# --------------------------------------------------------------------------- #
+# Plugin defaults shared by every model                                       #
+# --------------------------------------------------------------------------- #
+
+
+def test_default_silence_unit_is_16k_zeros_and_follows_the_plugin_attributes() -> None:
+    plugin = FakePlugin(_encode_audio)
+
+    unit = plugin.silence_unit_payload()
+
+    assert unit["type"] == "audio"
+    assert unit["format"] == "pcm_f32le"
+    assert unit["sample_rate_hz"] == 16000
+    assert base64.b64decode(unit["audio"]) == bytes(16000 * 4)
+
+    class FramePlugin(FakePlugin):
+        silence_continuation_samples = 1920
+        silence_continuation_sample_rate_hz = 24000
+
+    frame_unit = FramePlugin(_encode_audio).silence_unit_payload()
+    assert frame_unit["sample_rate_hz"] == 24000
+    assert len(base64.b64decode(frame_unit["audio"])) == 1920 * 4
+
+
+def test_default_extra_body_validation_rejects_the_private_keys_naming_the_plugin() -> None:
+    class PrivateKeysPlugin(FakePlugin):
+        plugin_id = "keyed"
+        private_runtime_config_keys = frozenset({"secret_a", "secret_b"})
+
+        def validate_client_extra_body(self, extra_body: object) -> None:
+            DuplexModelPlugin.validate_client_extra_body(self, extra_body)
+
+    plugin = PrivateKeysPlugin(_encode_audio)
+    plugin.validate_client_extra_body(None)
+    plugin.validate_client_extra_body({"auto_response": True})
+    with pytest.raises(
+        DuplexRuntimeConfigError, match="keyed runtime configuration is server-owned: secret_a, secret_b"
+    ):
+        plugin.validate_client_extra_body({"secret_b": 1, "secret_a": 2})
+
+
+def test_default_data_plane_context_is_the_framework_dataclass() -> None:
+    class DefaultContextPlugin(FakePlugin):
+        def data_plane_context(self, **kwargs):
+            return DuplexModelPlugin.data_plane_context(self, **kwargs)
+
+    context = DefaultContextPlugin(_encode_audio).data_plane_context(
+        epoch=2,
+        turn_id=3,
+        active_response_turn_id=1,
+        active_response_id="resp",
+        auto_responds=True,
+        response_format="pcm16",
+        speed=1.5,
+        modalities=("audio",),
+    )
+
+    assert isinstance(context, DuplexDataPlaneContext)
+    assert context == DuplexDataPlaneContext(
+        epoch=2,
+        turn_id=3,
+        active_response_turn_id=1,
+        active_response_id="resp",
+        auto_responds=True,
+        response_format="pcm16",
+        speed=1.5,
+        modalities=("audio",),
+    )
+
+
+def test_default_session_state_implements_the_shared_transitions() -> None:
+    class Buffer(PcmAppendBuffer):
+        pending_byte_count = 0
+
+        def clear(self) -> None: ...
+
+        def clear_force_listen(self) -> None: ...
+
+        def has_pending(self) -> bool:
+            return False
+
+        def has_reserved(self) -> bool:
+            return False
+
+        def prepare_append(self, payload, *, operation_id, chunk_period_ms, allow_emit):
+            return None
+
+        def prepare_commit(self, *, operation_id, chunk_period_ms):
+            raise NotImplementedError
+
+        def flush(self, *, chunk_period_ms):
+            return None
+
+    state = DefaultDuplexModelSessionState(audio_buffer=Buffer())
+
+    assert isinstance(state, DuplexModelSessionState)
+    assert state.committed_audio_reserved_bytes == 0 and state.continuation_units == 0
+    state.retain_committed_audio({"audio": "a"}, operation_id="op-1", reserved_bytes=10)
+    state.retain_committed_audio({"audio": "b"}, operation_id="op-2", reserved_bytes=5)
+    state.deferred_response_create = True
+    assert state.committed_audio_payload == {"audio": "b"}
+    assert state.committed_audio_operation_id == "op-2"
+    assert state.clear_committed_audio() == 15
+    assert state.committed_audio_payload is None
+    assert state.committed_audio_operation_id is None
+    assert state.deferred_response_create is False
+
+    state.continuation_owner_id = "response:r"
+    state.continuation_units = 3
+    state.pending_silence_owner_id = "response:r"
+    state.clear_continuation()
+    assert state.continuation_owner_id is None
+    assert state.continuation_units == 0
+    assert state.pending_silence_task is None and state.pending_silence_owner_id is None
+
+
+def test_mergeable_committed_audio_stops_after_consume_starts() -> None:
+    """Once an append starts consuming retained PCM, the next commit must not merge it."""
+
+    class Buffer(PcmAppendBuffer):
+        pending_byte_count = 0
+
+        def clear(self) -> None: ...
+
+        def clear_force_listen(self) -> None: ...
+
+        def has_pending(self) -> bool:
+            return False
+
+        def has_reserved(self) -> bool:
+            return False
+
+        def prepare_append(self, payload, *, operation_id, chunk_period_ms, allow_emit):
+            return None
+
+        def prepare_commit(self, *, operation_id, chunk_period_ms):
+            raise NotImplementedError
+
+        def flush(self, *, chunk_period_ms):
+            return None
+
+    state = DefaultDuplexModelSessionState(audio_buffer=Buffer())
+    first = {"format": "pcm_f32le", "audio": "YQ==", "sample_rate_hz": 16000, "is_speech": True}
+    state.retain_committed_audio(first, operation_id="op1", reserved_bytes=8)
+    assert state.mergeable_committed_audio() is first
+    state.mark_committed_audio_consume_started()
+    assert state.mergeable_committed_audio() is None
+    assert state.committed_audio_payload is first
+    state.clear_committed_audio()
+    assert state.committed_audio_payload is None
+    assert state.committed_audio_consume_started is False
+
+
+def test_slots_session_states_track_committed_audio_consume() -> None:
+    """AURA and Qwen override retain/clear on slots dataclasses.
+
+    mergeable_committed_audio() reads committed_audio_consume_started. Without
+    the field on those states, the first commit raises AttributeError.
+    """
+    from vllm_omni.model_executor.models.aura_omni.duplex.session import AuraServingSessionState
+    from vllm_omni.model_executor.models.qwen3_omni.duplex.session import QwenDuplexSessionState
+
+    for state in (AuraServingSessionState(), QwenDuplexSessionState()):
+        first = {"audio": "YQ=="}
+        state.retain_committed_audio(first, operation_id="op1", reserved_bytes=4)
+        assert state.mergeable_committed_audio() is first
+        state.mark_committed_audio_consume_started()
+        assert state.mergeable_committed_audio() is None
+        state.retain_committed_audio({"audio": "Yg=="}, operation_id="op2", reserved_bytes=4)
+        assert state.committed_audio_consume_started is False
+        assert state.mergeable_committed_audio() == {"audio": "Yg=="}
+        state.clear_committed_audio()
+        assert state.committed_audio_payload is None
+        assert state.committed_audio_consume_started is False

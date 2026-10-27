@@ -22,7 +22,11 @@ from vllm_omni.distributed.omni_connectors.utils.config import (
 )
 from vllm_omni.distributed.omni_connectors.utils.initialization import resolve_connector_spec
 from vllm_omni.distributed.omni_connectors.utils.kv_utils import get_local_tp_rank, get_omni_replica_id
-from vllm_omni.outputs import OmniConnectorOutput
+from vllm_omni.outputs import OmniConnectorOutput, SchedulingMetadataUpdate
+from vllm_omni.worker.scheduling_metadata_adapter import (
+    SchedulingMetadataAdapter,
+    resolve_scheduling_metadata_adapter,
+)
 
 logger = init_logger("vllm_omni.worker.omni_connector_model_runner_mixin")
 
@@ -103,10 +107,15 @@ class _SendCompletion:
 class _OmniConnectorRuntimeMixin:
     """Own connector lifecycle, shared state, and KV transfer delegation."""
 
+    if TYPE_CHECKING:
+
+        def _stage_payload_broadcast_groups(self) -> tuple[Any, ...]: ...
+
     _omni_connector: Any
     _kv_transfer_manager: Any
     _async_chunk: bool
     _model_mode: str
+    _scheduling_metadata_adapter: SchedulingMetadataAdapter
     _stage_id: int
     _next_stage_id: int
     _from_tp: int
@@ -134,7 +143,7 @@ class _OmniConnectorRuntimeMixin:
     _full_payload_pending_broadcast_req_ids: set[str]
     _async_chunk_updated_req_ids: set[str]
     _local_stage_payload_cache: dict[str, dict[str, Any]]
-    _local_request_metadata: dict[str, dict[str, Any]]
+    _local_request_metadata: dict[str, SchedulingMetadataUpdate]
     _chunk_stream_completed: set[str]
     _pending_full_payload_send: dict[str, tuple[Any, ...]]
     _kv_sent_req_ids: list[str]
@@ -145,6 +154,7 @@ class _OmniConnectorRuntimeMixin:
     _lock: Any
     _stop_event: Any
     _work_available: Any
+    _save_work_available: Any
     _recv_thread: Any
     _save_thread: Any
     _omni_connector_initialized: bool
@@ -192,6 +202,9 @@ class _OmniConnectorRuntimeMixin:
 
         self._async_chunk: bool = getattr(model_config, "async_chunk", False)
         self._model_mode: str = getattr(model_config, "worker_type", "ar")
+        self._scheduling_metadata_adapter = resolve_scheduling_metadata_adapter(
+            getattr(model_config, "scheduling_metadata_adapter", None)
+        )
         stage_id = getattr(model_config, "stage_id", 0)
         if isinstance(stage_id, str):
             stage_id = int(stage_id)
@@ -283,7 +296,7 @@ class _OmniConnectorRuntimeMixin:
         # ownership.
         self._local_stage_payload_cache: dict[str, dict[str, Any]] = {}
         # Lightweight scheduling metadata pending delivery to the Scheduler.
-        self._local_request_metadata: dict[str, dict[str, Any]] = {}
+        self._local_request_metadata: dict[str, SchedulingMetadataUpdate] = {}
         # Optional same-process control-plane fast path. Payload tensors remain
         # runner-owned; only OmniConnectorOutput readiness is published.
         self._omni_connector_output_sink: Callable[[OmniConnectorOutput], None] | None = None
@@ -313,6 +326,10 @@ class _OmniConnectorRuntimeMixin:
         self._omni_connector_output_drain_lock = threading.Lock()
         self._stop_event = threading.Event()
         self._work_available = threading.Event()
+        # The save loop has its own event: both loops clear theirs after a
+        # wait, so a shared event let the receiver swallow a send wakeup and
+        # left the payload waiting for the saver's 10 ms timeout.
+        self._save_work_available = threading.Event()
 
         # Start background threads only when there's a connector
         self._recv_thread: threading.Thread | None = None
@@ -343,6 +360,8 @@ class _OmniConnectorRuntimeMixin:
         if getattr(self, "_synchronous_payload_transport", False):
             return
         self._stop_event.set()
+        self._work_available.set()
+        self._save_work_available.set()
         if self._recv_thread is not None:
             self._recv_thread.join(timeout=5)
         if self._save_thread is not None:

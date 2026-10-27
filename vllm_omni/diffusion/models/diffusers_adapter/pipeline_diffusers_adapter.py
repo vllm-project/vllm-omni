@@ -33,6 +33,10 @@ from vllm_omni.diffusion.models.diffusers_adapter.quantization_utils import (
     convert_diffusers_quantization_config,
     ensure_supported_diffusers_quantization,
 )
+from vllm_omni.diffusion.offloader.config import (
+    OffloadStrategy,
+    resolve_offload_strategy,
+)
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.inputs.data import OmniPromptType, OmniTextPrompt
@@ -148,9 +152,10 @@ class DiffusersAdapterPipeline(nn.Module, DiffusionPipelineProfilerMixin):
         self._accept_call_kwargs = set(inspect.signature(self._pipeline.__call__).parameters.keys())
 
         # CPU offloading
-        if self.od_config.enable_layerwise_offload:
+        strategy = resolve_offload_strategy(self.od_config)
+        if strategy is OffloadStrategy.LAYER_WISE:
             self._pipeline.enable_sequential_cpu_offload()
-        elif self.od_config.enable_cpu_offload:
+        elif strategy is OffloadStrategy.MODEL_LEVEL:
             self._pipeline.enable_model_cpu_offload()
 
         # VAE slicing and tiling: try-catch because not all models have VAE
@@ -383,7 +388,7 @@ class DiffusersAdapterPipeline(nn.Module, DiffusionPipelineProfilerMixin):
                 attention_backend_attempts.append("_native_npu")
             case "TORCH_SDPA":
                 attention_backend_attempts.append("native")
-            case "CUDNN_ATTN" | "FLASHINFER_ATTN" | "TRTLLM_ATTN":
+            case "CUDNN_ATTN" | "FLASHINFER_ATTN" | "TRTLLM_ATTN" | "SPARGE_ATTN":
                 raise ValueError(
                     f"{attention_backend_config} was explicitly selected, but Diffusers adapters do not "
                     "provide a binding for this vLLM-Omni backend. Select TORCH_SDPA or a Diffusers-native backend."

@@ -24,7 +24,7 @@ from vllm.utils import random_uuid
 from vllm.v1.engine.exceptions import EngineDeadError
 
 from vllm_omni.diffusion.data import OmniACK
-from vllm_omni.engine.messages import ErrorMessage, OutputMessage
+from vllm_omni.engine.messages import EngineQueueMessage, ErrorMessage, OutputMessage
 from vllm_omni.entrypoints.omni_base import (
     OmniBase,
     OmniEngineDeadError,
@@ -33,12 +33,11 @@ from vllm_omni.metrics.stats import OrchestratorAggregator as OrchestratorMetric
 from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
-_FINAL_OUTPUT_IDLE_SLEEP_S = 0.001
-# Blocking-wait interval for the event-driven final-output drain
-# (explicit env value or the engine pipeline default): a message wakes the drain immediately via
-# the janus queue's condition variable; this timeout only bounds how often the
-# orchestrator liveness check runs while the pipeline is idle.
-_FINAL_OUTPUT_BLOCKING_WAIT_S = 1.0
+# A queued output wakes the final-output loop immediately; this wait only
+# bounds how often the orchestrator liveness check runs while idle.
+_FINAL_OUTPUT_WAIT_S = 1.0
+# Longest the final-output loop dispatches a batch before yielding the loop.
+_FINAL_OUTPUT_YIELD_INTERVAL_S = 0.001
 # Shared DELETE / generate() cleanup abort bound. Env is the documented knob.
 ABORT_TIMEOUT_S = float(os.environ.get("VLLM_OMNI_ABORT_TIMEOUT", 2.0))
 
@@ -66,7 +65,7 @@ class AsyncEventResolver:
         }
         return fut
 
-    async def resolve(self, ack: OmniACK):
+    async def resolve(self, ack: OmniACK | dict[str, Any]):
         tid = getattr(ack, "task_id", None)
 
         if tid is None and isinstance(ack, dict):
@@ -174,6 +173,17 @@ class AsyncOmniBase(OmniBase):
         if self.input_processor is None:
             return None
         return self.input_processor.renderer
+
+    def resolve_entry_stage_id(self, input_modalities: Iterable[str]) -> int:
+        """Return the stage a request with ``input_modalities`` enters at: 1 when stage 0 declares
+        ``bypass_without_modalities`` and the request carries none of them, else 0."""
+        stage_configs = self.engine.stage_configs
+        bypass_without = set(getattr(stage_configs[0], "bypass_without_modalities", ())) if stage_configs else set()
+        return 1 if bypass_without and bypass_without.isdisjoint(input_modalities) else 0
+
+    def get_stage_renderer(self, stage_id: int):
+        """Return the renderer for chat requests that bypass stage 0 and enter at ``stage_id``."""
+        return self.engine.get_stage_renderer(stage_id)
 
     @property
     def vllm_config(self):
@@ -314,82 +324,74 @@ class AsyncOmniBase(OmniBase):
 
         engine = self.engine
 
-        # Event-driven drain (explicit env value or the engine pipeline default): block on the
-        # queue's condition variable in a dedicated thread instead of the
-        # get_nowait + 1 ms sleep cadence. Same flag as the orchestrator-side
-        # event-driven loop (vllm_omni/engine/orchestrator.py).
-        from vllm_omni.engine.orchestrator import _event_driven_orch_enabled
-
-        event_driven_drain = _event_driven_orch_enabled(
-            default=bool(getattr(engine, "_event_driven_orch_default", False))
-        ) and hasattr(engine, "get_output_blocking_async")
-
         async def _final_output_loop():
             """Background coroutine that dispatches final outputs to request queues."""
             try:
+                last_yield = time.monotonic()
                 while True:
-                    if event_driven_drain:
-                        msg = await engine.get_output_blocking_async(timeout=_FINAL_OUTPUT_BLOCKING_WAIT_S)
-                        if msg is None:
-                            # Timed out with the orchestrator alive; loop for
-                            # the periodic liveness check.
-                            continue
-                    else:
-                        msg = await engine.try_get_output_async()
-                        if msg is None:
-                            await asyncio.sleep(_FINAL_OUTPUT_IDLE_SLEEP_S)
-                            continue
-
-                    if self._route_engine_message(msg):
+                    msgs: list[EngineQueueMessage] = await engine.get_outputs_async(timeout=_FINAL_OUTPUT_WAIT_S)
+                    if not msgs:
+                        # Timed out with the orchestrator alive; loop for the
+                        # periodic liveness check.
                         continue
 
-                    if isinstance(msg, dict) and msg.get("type") == "ack":
-                        ack_data = msg.get("ack")
-                        tid = getattr(ack_data, "task_id", "unknown")
-                        logger.info(f"[{self._name}] Intercepted wrapped ACK for task {tid}")
-                        await self.event_resolver.resolve(ack_data)
-                        continue
-                    if isinstance(msg, OmniACK):
-                        logger.info(f"[{self._name}] Intercepted raw ACK object: {msg.task_id}")
-                        await self.event_resolver.resolve(msg)
-                        continue
-                    if hasattr(msg, "task_id"):
-                        tid = getattr(msg, "task_id")
-                        logger.info(f"[{self._name}] Intercepted task-ID object: {tid}")
-                        await self.event_resolver.resolve(msg)
-                        continue
-
-                    if isinstance(msg, ErrorMessage):
-                        # Route request-scoped errors to that request's queue and
-                        # keep the loop alive. A request whose stage replica died
-                        # and was evicted gets a fatal error delivered here; only
-                        # that request fails (its consumer raises), the server
-                        # stays up for other stages/requests (#4285). A fatal
-                        # error without a request_id is a genuine engine-wide
-                        # death and falls through to the except handler below.
-                        if msg.request_id is not None:
-                            req_state = self.request_states.get(msg.request_id)
-                            if req_state is not None:
-                                await req_state.queue.put(msg)
-                            else:
-                                logger.warning(
-                                    "[%s] dropping error for unknown req %s",
-                                    self._name,
-                                    msg.request_id,
-                                )
-                            continue
-                        if not msg.fatal:
+                    for msg in msgs:
+                        if time.monotonic() - last_yield >= _FINAL_OUTPUT_YIELD_INTERVAL_S:
+                            await asyncio.sleep(0)
+                            last_yield = time.monotonic()
+                        if self._route_engine_message(msg):
                             continue
 
-                    should_continue, _, stage_id, req_state = self._handle_output_message(msg)
-                    if should_continue:
-                        continue
+                        if isinstance(msg, dict) and msg.get("type") == "ack":
+                            ack_data = msg.get("ack")
+                            tid = getattr(ack_data, "task_id", "unknown")
+                            logger.info(f"[{self._name}] Intercepted wrapped ACK for task {tid}")
+                            await self.event_resolver.resolve(ack_data)
+                            continue
+                        if isinstance(msg, OmniACK):
+                            logger.info(f"[{self._name}] Intercepted raw ACK object: {msg.task_id}")
+                            await self.event_resolver.resolve(msg)
+                            continue
+                        if hasattr(msg, "task_id"):
+                            tid = getattr(msg, "task_id")
+                            logger.info(f"[{self._name}] Intercepted task-ID object: {tid}")
+                            await self.event_resolver.resolve(msg)
+                            continue
 
-                    assert req_state is not None
-                    req_state.stage_id = stage_id
+                        if isinstance(msg, ErrorMessage):
+                            # Route request-scoped errors to that request's queue and
+                            # keep the loop alive. A request whose stage replica died
+                            # and was evicted gets a fatal error delivered here; only
+                            # that request fails (its consumer raises), the server
+                            # stays up for other stages/requests (#4285). A fatal
+                            # error without a request_id is a genuine engine-wide
+                            # death and falls through to the except handler below.
+                            if msg.request_id is not None:
+                                req_state = self.request_states.get(msg.request_id)
+                                if req_state is not None:
+                                    await req_state.queue.put(msg)
+                                else:
+                                    logger.warning(
+                                        "[%s] dropping error for unknown req %s",
+                                        self._name,
+                                        msg.request_id,
+                                    )
+                                continue
+                            if not msg.fatal:
+                                continue
 
-                    # Route to the per-request queue
-                    await req_state.queue.put(msg)
+                        should_continue, _, stage_id, req_state = self._handle_output_message(msg)
+                        if should_continue:
+                            continue
+
+                        assert req_state is not None
+                        req_state.stage_id = stage_id
+
+                        # Route to the per-request queue
+                        await req_state.queue.put(msg)
+
+                    await asyncio.sleep(0)
+                    last_yield = time.monotonic()
 
             except asyncio.CancelledError:
                 raise
@@ -428,6 +430,23 @@ class AsyncOmniBase(OmniBase):
         self.final_output_task = asyncio.create_task(_final_output_loop())
         logger.debug("[AsyncOmni] Final output handler started")
 
+    async def _settle_pending_submits(self, request_ids: list[str]) -> None:
+        """Cancel and drain queue-parked submits for the given internal ids.
+
+        A request suspended on a full request queue is not yet known to the
+        Orchestrator, so its abort cannot be delegated: cancelling the submit
+        task unwinds the queue put before the item is admitted, and draining
+        the task guarantees no insertion lands after abort() returns.
+        Already-admitted requests keep their Orchestrator-side abort path.
+        """
+        pending = getattr(self, "_pending_submits", None)
+        if not pending:
+            return
+        tasks = [pending.pop(rid) for rid in request_ids if rid in pending]
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
     async def _abort_internal_requests(
         self,
         request_id: str | Iterable[str],
@@ -440,6 +459,9 @@ class AsyncOmniBase(OmniBase):
         request_ids = [request_id] if isinstance(request_id, str) else list(request_id)
         # Request IDs are already internal, so we just need to get the matching states.
         internal_req_ids = [rid for rid in request_ids if rid in self.request_states]
+        # A submit parked on a full request queue would be admitted after this
+        # abort returned; revoke it before delegating to the Orchestrator.
+        await self._settle_pending_submits(internal_req_ids)
         try:
             # Unbind generate() if abort_async blocks in the executor.
             await asyncio.wait_for(self._abort(internal_req_ids, timeout=timeout), timeout=timeout)
@@ -452,6 +474,35 @@ class AsyncOmniBase(OmniBase):
             )
         except Exception:
             logger.exception("[AsyncOmni] Cleanup abort failed for %s", ",".join(internal_req_ids))
+
+    async def _enqueue_synthetic_abort(self, request_id: str) -> None:
+        """Enqueue a finished abort output so generate() can end cleanly.
+
+        Used when the Orchestrator returned no abort output for a request
+        (OP not registered yet, unbound replica, orchestrator id drop, or the
+        request was revoked before admission) — without it generate() would
+        hang on ``queue.get``.
+        """
+        state = self.request_states.get(request_id)
+        queue = getattr(state, "queue", None)
+        if queue is None:
+            return
+        final_stage_id = getattr(state, "final_stage_id", None)
+        if final_stage_id is None:
+            final_stage_id = 0
+        stage_metadata = getattr(self, "_stage_meta_list", ())
+        final_output_type = (
+            getattr(stage_metadata[final_stage_id], "final_output_type", None)
+            if final_stage_id < len(stage_metadata)
+            else None
+        ) or "text"
+        await queue.put(
+            self._synthetic_abort_output_message(
+                request_id,
+                stage_id=final_stage_id,
+                final_output_type=final_output_type,
+            )
+        )
 
     async def _abort(self, request_ids: list[str], *, timeout: float | None = None) -> None:
         """Abort request IDs via the engine and enqueue terminal abort outputs.
@@ -481,25 +532,8 @@ class AsyncOmniBase(OmniBase):
         for rid in request_ids:
             state = self.request_states.get(rid)
             if state is not None and rid not in delivered:
-                queue = getattr(state, "queue", None)
-                if queue is not None:
-                    final_stage_id = getattr(state, "final_stage_id", None)
-                    if final_stage_id is None:
-                        final_stage_id = 0
-                    stage_metadata = getattr(self, "_stage_meta_list", ())
-                    final_output_type = (
-                        getattr(stage_metadata[final_stage_id], "final_output_type", None)
-                        if final_stage_id < len(stage_metadata)
-                        else None
-                    ) or "text"
-                    await state.queue.put(
-                        self._synthetic_abort_output_message(
-                            rid,
-                            stage_id=final_stage_id,
-                            final_output_type=final_output_type,
-                        )
-                    )
-                    delivered.add(rid)
+                await self._enqueue_synthetic_abort(rid)
+                delivered.add(rid)
         for rid in request_ids:
             self._record_request_failure_once(rid, reason="client_abort")
             state = self.request_states.get(rid)
