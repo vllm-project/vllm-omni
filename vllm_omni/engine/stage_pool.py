@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 from vllm.logger import init_logger
 from vllm.v1.engine import EngineCoreOutputs
+from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.metrics.stats import IterationStats
 
 from vllm_omni.data_entry_keys import flatten_payload
@@ -44,6 +45,8 @@ from vllm_omni.metrics.utils import (
 )
 
 if TYPE_CHECKING:
+    from vllm_omni.diffusion.sched.dispatch.config import CentralSchedulingConfig
+    from vllm_omni.diffusion.sched.dispatch.controller import CentralScheduler
     from vllm_omni.engine.orchestrator import OrchestratorRequestState
 
 logger = init_logger(__name__)
@@ -173,6 +176,36 @@ class StagePool:
         # Kept separate from the legacy ``_request_bindings`` so the two
         # binding shapes do not collide.
         self._affinity: dict[str, str] = {}
+        self._central_scheduler: CentralScheduler | None = None
+        self._central_scheduling_submitted: set[str] = set()
+        self.admission_waiting_count = 0
+        self.on_admission_waiting_changed: Callable[[], None] | None = None
+
+    @property
+    def central_scheduling_enabled(self) -> bool:
+        return self._central_scheduler is not None
+
+    @property
+    def central_scheduling_admission_limit(self) -> int:
+        if self._central_scheduler is None:
+            return 0
+        # Admission tasks include requests already submitting to a replica.
+        return self._central_scheduler.config.max_pending_requests + len(self.available_replica_ids())
+
+    def configure_central_scheduling(self, config: CentralSchedulingConfig) -> None:
+        """Attach one admission controller to an already validated local pool."""
+        from vllm_omni.diffusion.sched.dispatch.controller import CentralScheduler
+
+        if self.stage_type != "diffusion" or self.is_distributed:
+            raise ValueError("Central scheduling requires a local diffusion pool")
+        if not config.enabled:
+            return
+        self._central_scheduler = CentralScheduler(self.available_replica_ids(), config)
+
+    def close_central_scheduling(self) -> None:
+        if self._central_scheduler is not None:
+            self._central_scheduler.close()
+        self._central_scheduling_submitted.clear()
 
     # ---- Stage-level properties ----
 
@@ -561,6 +594,11 @@ class StagePool:
 
     def release_binding(self, request_id: str) -> None:
         """Drop the route binding for *request_id* in this stage."""
+        if self._central_scheduler is not None and request_id not in self._central_scheduling_submitted:
+            # Terminal output already completed successful requests. Cleanup
+            # releases only work that has not reached the worker. An abort send
+            # does not acknowledge execution stopping; poll handles that later.
+            self._central_scheduler.cancel(request_id)
         self._request_bindings.pop(request_id, None)
         self._affinity.pop(request_id, None)
         self._output_timestamps_by_request.pop(str(request_id), None)
@@ -595,6 +633,8 @@ class StagePool:
         if 0 <= replica_id < self.num_replicas:
             self._unavailable_replicas.add(replica_id)
             self._notify_membership_changed()
+        if self._central_scheduler is not None:
+            self._central_scheduling_submitted.difference_update(self._central_scheduler.remove_replica(replica_id))
         return self.release_replica_bindings(replica_id)
 
     def is_replica_available(self, replica_id: int) -> bool:
@@ -1062,6 +1102,8 @@ class StagePool:
             payload_sender_info = getattr(request, "payload_sender_info", None)
             if payload_sender_info is not None:
                 submit_kwargs.setdefault("payload_sender_info", payload_sender_info)
+            if self._central_scheduler is not None:
+                return await self._submit_central_scheduling(request_id, req_state, request, params, submit_kwargs)
             if pinned_replica_id is not None:
                 replica_id = self.bind_request_to_replica(request_id, pinned_replica_id)
             else:
@@ -1133,6 +1175,60 @@ class StagePool:
                         )
             raise
         return replica_id
+
+    async def _submit_central_scheduling(
+        self,
+        request_id: str,
+        req_state: OrchestratorRequestState,
+        request: Any,
+        params: Any,
+        submit_kwargs: dict[str, Any],
+    ) -> int:
+        controller = self._central_scheduler
+        assert controller is not None
+        client = None
+        try:
+            admission_start = _time.perf_counter()
+            self.admission_waiting_count += 1
+            if self.on_admission_waiting_changed is not None:
+                self.on_admission_waiting_changed()
+            try:
+                decision = await controller.acquire(request_id)
+            finally:
+                self.admission_waiting_count -= 1
+                if self.on_admission_waiting_changed is not None:
+                    self.on_admission_waiting_changed()
+            req_state.pipeline_timings["queue_wait_ms"] = (
+                _time.perf_counter() - (req_state.enqueue_ts or admission_start)
+            ) * 1000.0
+            req_state.stage_submit_ts[self.stage_id] = _time.time()
+            replica_id = decision.replica_id
+            if not self.is_replica_available(replica_id):
+                raise StageUnavailableError(f"stage {self.stage_id} replica {replica_id} is unavailable")
+            self._request_bindings[request_id] = replica_id
+            client = self._diffusion_client(replica_id)
+            self._central_scheduling_submitted.add(request_id)
+            await client.add_request_async(request_id, request, params, **submit_kwargs)
+            return replica_id
+        except EngineDeadError:
+            # Exclude the dead slot before any cleanup can yield and drain
+            # waiters. Keep the binding for orchestrator failure attribution.
+            self._unavailable_replicas.add(replica_id)
+            controller.remove_replica(replica_id)
+            self._central_scheduling_submitted.discard(request_id)
+            raise
+        except BaseException as exc:
+            # Submission may have reached the worker before cancellation.
+            # Keep capacity reserved until the worker reports a terminal output.
+            if client is not None:
+                try:
+                    await asyncio.shield(client.abort_requests_async([request_id]))
+                except Exception:
+                    logger.warning("Failed to abort interrupted diffusion submission %s", request_id, exc_info=True)
+            if not isinstance(exc, asyncio.CancelledError):
+                self._central_scheduling_submitted.discard(request_id)
+            self.release_binding(request_id)
+            raise
 
     async def submit_update(
         self,
@@ -1332,7 +1428,11 @@ class StagePool:
         raw_client = self.clients[replica_id]
         if raw_client is None:
             return None
-        return cast(StagePoolDiffusionClient, raw_client).get_diffusion_output_nowait()
+        output = cast(StagePoolDiffusionClient, raw_client).get_diffusion_output_nowait()
+        if output is not None and self._central_scheduler is not None and output.finished:
+            self._central_scheduling_submitted.discard(output.request_id)
+            self._central_scheduler.complete(output.request_id)
+        return output
 
     # ---- Stage-local control plane ----
 
@@ -1517,6 +1617,8 @@ class StagePool:
 
     def shutdown_replica(self, replica_id: int) -> None:
         """Shutdown one backend handle in this stage pool."""
+        if self._central_scheduler is not None:
+            self._central_scheduling_submitted.difference_update(self._central_scheduler.remove_replica(replica_id))
         if replica_id >= len(self.clients):
             return
         client = self.clients[replica_id]

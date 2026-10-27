@@ -652,8 +652,8 @@ class StageConfigFactory:
     def _normalize_default_diffusion(
         cls,
         kwargs: dict[str, Any],
-    ) -> tuple[dict[str, Any], DiffusionParallelConfig, dict[str, Any], str]:
-        """Normalize inputs shared by typed and compatibility diffusion builders."""
+    ) -> tuple[dict[str, Any], dict[str, Any], str]:
+        """Normalize explicit inputs; defer defaults and parallelism until merging."""
         kwargs = normalize_and_validate_diffusion_engine_ingress_kwargs(kwargs, stage_id=0)
         raw_sampling_params = kwargs.get("default_sampling_params")
         if isinstance(raw_sampling_params, str):
@@ -666,6 +666,24 @@ class StageConfigFactory:
             raw_sampling_params = None
         default_sampling_params = dict(raw_sampling_params.get("0", {})) if raw_sampling_params else {}
 
+        model_class_name = kwargs.get("model_class_name")
+        final_output_type = get_diffusion_output_type(model_class_name)
+        logger.info(
+            "Resolved generic diffusion final_output_type=%r for model_class_name=%r.",
+            final_output_type,
+            model_class_name,
+        )
+        return kwargs, default_sampling_params, final_output_type
+
+    @classmethod
+    def create_default_diffusion(cls, kwargs: dict[str, Any]) -> list[dict[str, Any]]:
+        """Build the temporary runtime ABI for a generic diffusion stage.
+
+        The terminal diffusion config owns engine defaults and normalization;
+        this compatibility builder only adds Omni stage topology, request
+        defaults, and device placement.
+        """
+        kwargs, default_sampling_params, final_output_type = cls._normalize_default_diffusion(kwargs)
         parallel_config = DiffusionParallelConfig.from_stage_overrides(kwargs)
         if kwargs.get("num_gpus") is not None:
             parallel_config.resolve_data_parallel_size(int(kwargs["num_gpus"]))
@@ -679,26 +697,6 @@ class StageConfigFactory:
             {name: value for name, value in kwargs.items() if name in diffusion_config_fields}
         )
 
-        model_class_name = engine_args.get("model_class_name")
-        final_output_type = get_diffusion_output_type(model_class_name)
-        logger.info(
-            "Resolved generic diffusion final_output_type=%r for model_class_name=%r.",
-            final_output_type,
-            model_class_name,
-        )
-        return engine_args, parallel_config, default_sampling_params, final_output_type
-
-    @classmethod
-    def create_default_diffusion(cls, kwargs: dict[str, Any]) -> list[dict[str, Any]]:
-        """Build the temporary runtime ABI for a generic diffusion stage.
-
-        The terminal diffusion config owns engine defaults and normalization;
-        this compatibility builder only adds Omni stage topology, request
-        defaults, and device placement.
-        """
-        engine_args, parallel_config, default_sampling_params, final_output_type = cls._normalize_default_diffusion(
-            kwargs
-        )
         engine_args["parallel_config"] = asdict(parallel_config)
         engine_args["model_stage"] = "diffusion"
 
@@ -726,41 +724,23 @@ class StageConfigFactory:
         deploy_config_path: str | None = None,
     ) -> VllmOmniConfig:
         """Build generic diffusion directly into the structured runtime config."""
-        deploy = cls._load_user_deploy_config(deploy_config_path) or DeployConfig()
-        stage_deploy = next((stage for stage in deploy.stages if stage.stage_id == 0), None)
-        if stage_deploy is None:
-            stage_deploy = StageDeployConfig(stage_id=0)
-            deploy.stages.append(stage_deploy)
-
-        # Resolve deploy parallel degrees before inserting defaults. Otherwise
-        # the CLI-default degrees would overwrite YAML and leave SP/world size
-        # inconsistent with the requested device layout.
-        parallel_fields = {item.name for item in fields(DiffusionParallelConfig) if item.init}
-        deploy_parallel = {
-            name: value
-            for source in (deploy, stage_deploy)
-            for name in parallel_fields
-            if (value := getattr(source, name, None)) is not None
+        runtime_overrides = {
+            name: kwargs[name] for name in ("devices", "num_replicas", "env") if kwargs.get(name) is not None
         }
-        if deploy_parallel:
-            cli_parallel = {name: kwargs[name] for name in parallel_fields if kwargs.get(name) is not None}
-            nested_parallel = kwargs.get("parallel_config")
-            if isinstance(nested_parallel, Mapping):
-                cli_parallel.update({name: value for name, value in nested_parallel.items() if value is not None})
-            elif nested_parallel is not None:
-                cli_parallel.update(asdict(DiffusionParallelConfig.from_stage_overrides(kwargs)))
-            merged_parallel = {**deploy_parallel, **cli_parallel}
-            if any(name in cli_parallel for name in ("ulysses_degree", "ring_degree", "allgather_degree")):
-                if "sequence_parallel_size" not in cli_parallel:
-                    merged_parallel.pop("sequence_parallel_size", None)
-            merged_parallel.pop("world_size", None)
-            kwargs = {**kwargs, "parallel_config": merged_parallel}
-
-        engine_overrides, parallel_config, default_sampling_params, final_output_type = (
-            cls._normalize_default_diffusion(kwargs)
-        )
-        engine_overrides.update(asdict(parallel_config))
-        model_class_name = engine_overrides.get("model_class_name")
+        if kwargs.get("stage_0_devices") is not None:
+            runtime_overrides["devices"] = kwargs["stage_0_devices"]
+        engine_kwargs = {
+            name: value for name, value in kwargs.items() if name not in runtime_overrides and name != "stage_0_devices"
+        }
+        stage_values, default_sampling_params, final_output_type = cls._normalize_default_diffusion(engine_kwargs)
+        # Admission/routing is orchestrator-owned. Preserve these global inputs
+        # across the generic diffusion fallback; they never become worker fields.
+        scheduling_overrides = {
+            name: kwargs[name]
+            for name in ("enable_central_scheduling", "central_scheduling_config")
+            if kwargs.get(name) is not None
+        }
+        model_class_name = stage_values.get("model_class_name")
         pipeline = PipelineConfig(
             model_type="generic_diffusion",
             model_arch=str(model_class_name or ""),
@@ -775,34 +755,47 @@ class StageConfigFactory:
             ),
         )
 
-        # These values have already been normalized for this diffusion stage.
-        # Scope them explicitly so diffusion-only fields such as engine_backend
-        # and extras are not filtered by the global LLM CLI argument surface.
-        stage_overrides = {
-            f"stage_0_{key}": value for key, value in engine_overrides.items() if key not in {"model", "stage_id"}
-        }
-        stage_overrides["stage_0_devices"] = (
-            kwargs.get("stage_0_devices")
-            or kwargs.get("devices")
-            or stage_deploy.devices
-            or ",".join(str(i) for i in range(parallel_config.world_size))
-        )
-        for name in ("num_replicas", "env"):
-            if kwargs.get(name) is not None:
-                stage_overrides[f"stage_0_{name}"] = kwargs[name]
         # Caller defaults belong to deployment, not immutable pipeline constraints:
         # explicit request sampling parameters must still be able to override them.
-        if default_sampling_params:
-            stage_deploy.default_sampling_params = {
-                **(stage_deploy.default_sampling_params or {}),
-                **default_sampling_params,
-            }
-        return VllmOmniConfig.from_pipeline_config(
+        deploy = cls._load_user_deploy_config(deploy_config_path)
+        if deploy is None:
+            deploy = DeployConfig(
+                stages=[StageDeployConfig(stage_id=0, default_sampling_params=default_sampling_params)]
+            )
+        else:
+            if any(stage.stage_id != 0 for stage in deploy.stages):
+                raise ValueError("A generic diffusion deployment has only stage 0")
+            if kwargs.get("default_sampling_params") is not None:
+                stage_zero = next((stage for stage in deploy.stages if stage.stage_id == 0), None)
+                if stage_zero is None:
+                    deploy.stages.append(StageDeployConfig(stage_id=0, default_sampling_params=default_sampling_params))
+                else:
+                    stage_zero.default_sampling_params = {
+                        **(stage_zero.default_sampling_params or {}),
+                        **default_sampling_params,
+                    }
+        replica_counts = [stage.num_replicas for stage in deploy.stages]
+        replica_counts.append(runtime_overrides.get("num_replicas", 1))
+        for replicas in replica_counts:
+            if isinstance(replicas, bool) or not isinstance(replicas, int) or replicas < 1:
+                raise ValueError("num_replicas must be a positive integer")
+        # Scope diffusion-only inputs once; runtime placement stays out of engine ingress.
+        stage_overrides = {
+            f"stage_0_{name}": value
+            for name, value in {**stage_values, **runtime_overrides}.items()
+            if name not in {"model", "stage_id", "default_sampling_params"}
+        }
+        config = VllmOmniConfig.from_pipeline_config(
             pipeline,
             user_deploy_config=deploy,
             deploy_config_path=deploy_config_path,
-            cli_overrides={"model": model, **stage_overrides},
+            cli_overrides={"model": model, **stage_overrides, **scheduling_overrides},
         )
+        stage = config.stage_configs[0]
+        if stage.runtime_config.devices is None:
+            # Use effective YAML/platform/CLI parallelism, preserving the per-replica template.
+            stage.runtime_config.devices = ",".join(str(i) for i in range(stage.parallel_config.world_size))
+        return config
 
     @classmethod
     def _merge_cli_overrides(

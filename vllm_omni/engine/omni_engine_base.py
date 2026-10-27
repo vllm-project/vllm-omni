@@ -31,6 +31,7 @@ from vllm_omni.config.stage_config import (
     PipelineConfig,
     load_deploy_config,
 )
+from vllm_omni.diffusion.sched.dispatch.config import CentralSchedulingConfig
 from vllm_omni.engine.arg_utils import is_frontend_only
 from vllm_omni.engine.async_engine_utils import (
     SHUTDOWN_ENQUEUE_TIMEOUT_S,
@@ -125,6 +126,8 @@ class OmniEngineBase:
     _enable_orch_monitor: bool = False
     _client_config: OmniClientConfig | None = None
     _output_sink: OutputQueueSink | None = None
+    _central_scheduling_config: CentralSchedulingConfig = CentralSchedulingConfig()
+    _central_scheduling_enabled: bool = False
 
     def __init__(
         self,
@@ -289,6 +292,16 @@ class OmniEngineBase:
             )
             for stage in self.stage_configs
         )
+        from vllm_omni.engine.central_scheduling_runtime import prepare_central_scheduling_stages
+
+        self._central_scheduling_enabled = prepare_central_scheduling_stages(
+            self.stage_configs,
+            self._central_scheduling_config,
+            distributed=self.single_stage_mode or self._omni_master_address is not None,
+            async_chunk=self.async_chunk,
+            session_mode=getattr(self.deploy_config, "session_mode", "turn"),
+            api_client_count=int((self._client_config or {}).get("client_count", 1)),
+        )
         self.stage_pools: list[StagePool] = []
         self.stage_clients: list[StageClient] = []  # logical-stage view for external readers
         self.input_processor: InputProcessor | None = None
@@ -413,6 +426,10 @@ class OmniEngineBase:
 
         self.num_stages = len(self.stage_configs)
         self.stage_pools = self._runtime.stage_pools
+        if self._central_scheduling_enabled:
+            self.stage_pools[0].configure_central_scheduling(
+                self._central_scheduling_config,
+            )
         self.stage_clients = [
             cast(StageClient, pool.stage_client) for pool in self.stage_pools if pool.stage_client is not None
         ]
@@ -690,6 +707,7 @@ class OmniEngineBase:
         )
         if isinstance(resolution, OmniConfigResolution):
             self._config_resolution = resolution
+            self._central_scheduling_config = resolution.central_scheduling_config
             config_path = resolution.config_path
             stage_configs = list(resolution.stage_configs)
             strategy_lb_policy = resolution.omni_lb_policy

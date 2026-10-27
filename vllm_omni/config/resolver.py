@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass, fields, is_dataclass
+from dataclasses import dataclass, field, fields, is_dataclass
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +17,7 @@ from vllm_omni.config.omni_config import VllmOmniConfig
 from vllm_omni.config.stage_config import PipelineConfig
 from vllm_omni.diffusion.data import resolve_model_class_name
 from vllm_omni.diffusion.registry import DiffusionModelRegistry, resolve_native_single_file
+from vllm_omni.diffusion.sched.dispatch.config import CentralSchedulingConfig
 from vllm_omni.diffusion.utils.hf_utils import is_diffusion_model
 
 logger = init_logger(__name__)
@@ -30,6 +31,7 @@ class OmniConfigResolution:
     stage_configs: tuple[Any, ...]
     pipeline_config: PipelineConfig | None = None
     omni_lb_policy: str | None = None
+    central_scheduling_config: CentralSchedulingConfig = field(default_factory=CentralSchedulingConfig)
 
     @property
     def endpoint_restrictions(self) -> tuple[EndpointRestriction, ...]:
@@ -174,6 +176,7 @@ def _build_registered_resolution(
         stage_configs=tuple(structured_config.stage_configs),
         pipeline_config=structured_config.pipeline_config,
         omni_lb_policy=getattr(structured_config, "strategy_omni_lb_policy", None),
+        central_scheduling_config=structured_config.orchestrator_config.central_scheduling_config,
     )
 
 
@@ -242,6 +245,7 @@ def resolve_omni_config(
         config_path=deploy_config_path,
         stage_configs=tuple(default_config.stage_configs),
         pipeline_config=default_config.pipeline_config,
+        central_scheduling_config=default_config.orchestrator_config.central_scheduling_config,
     )
 
 

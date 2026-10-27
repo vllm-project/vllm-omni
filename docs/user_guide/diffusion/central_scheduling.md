@@ -1,0 +1,30 @@
+# Centralized Diffusion Scheduling
+
+Enable centralized, non-preemptive admission through the existing server:
+
+```bash
+vllm serve Qwen/Qwen-Image --omni --no-async-chunk \
+  --enable-central-scheduling \
+  --central-scheduling-config '{"max_pending_requests":1024}'
+```
+
+Requests wait in a central FIFO queue. An idle replica takes the oldest request;
+each replica executes one request at a time. Queued cancellations release their
+reservations immediately. Submitted work holds its slot until the worker reports
+termination or completion; replica failure removes the slot from admission.
+Running requests are never preempted.
+
+`max_pending_requests` defaults to 1024; admission overflow returns HTTP 429.
+To use multiple local replicas, set stage 0's `num_replicas` and `devices` in
+`--deploy-config`. Each replica receives one request at a time; worker-side
+request batching does not combine centrally queued requests.
+
+The equivalent top-level YAML keys are `enable_central_scheduling` and
+`central_scheduling_config`. Explicit CLI values override YAML values;
+`--no-enable-central-scheduling` overrides an enabled deployment. Generic diffusion
+deployments merge these explicit inputs with YAML before deriving effective
+parallelism from `--num-gpus`.
+
+Supported scope: one API process, one local non-streaming diffusion stage and
+static replicas. Disable `async_chunk`; multi-stage, distributed and duplex
+execution are unsupported. FIFO admission requires no hardware calibration.
