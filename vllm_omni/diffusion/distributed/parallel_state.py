@@ -385,10 +385,12 @@ def is_dp_last_group():
 def get_text_encoder_tp_group(tp_size: int) -> GroupCoordinator:
     """Return the text-encoder tensor-parallel group, creating it on first use.
 
-    The groups tile the diffusion world into consecutive blocks of ``tp_size``
-    ranks (``[0..n-1], [n..2n-1], ...``), so every rank belongs to exactly one
-    group and gets the full encoder output without a broadcast.  Creation is a
-    collective: every world rank must call this with the same ``tp_size``.
+    The groups tile each data-parallel replica into consecutive blocks of
+    ``tp_size`` ranks (``[0..n-1], [n..2n-1], ...``), so every rank belongs to
+    exactly one group and gets the full encoder output without a broadcast.
+    Groups never span replicas: different DP replicas encode different
+    requests, and a shared all-reduce would mix their activations.  Creation
+    is a collective: every world rank must call this with the same ``tp_size``.
     """
     global _TEXT_ENCODER_TP
     if _TEXT_ENCODER_TP is not None:
@@ -398,10 +400,22 @@ def get_text_encoder_tp_group(tp_size: int) -> GroupCoordinator:
             )
         return _TEXT_ENCODER_TP
     world = get_world_group()
-    if tp_size < 1 or world.world_size % tp_size != 0:
+    dp_size = _DP.world_size if _DP is not None else 1
+    replica_size = world.world_size // dp_size
+    if tp_size < 1 or replica_size % tp_size != 0:
         raise ValueError(
-            f"text_encoder_tp_size ({tp_size}) must evenly divide the diffusion world size ({world.world_size})"
+            f"text_encoder_tp_size ({tp_size}) must evenly divide the ranks of one data-parallel replica "
+            f"({replica_size} = world size {world.world_size} / data_parallel_size {dp_size})"
         )
+    # DP is the outermost rank dimension ("tp-sp-pp-cfg-dp"), so replica r owns
+    # world ranks [r * replica_size, (r + 1) * replica_size) and tiles of a
+    # divisor of replica_size stay inside one replica.  Check that layout.
+    if _DP is not None and dp_size > 1:
+        expected_dp_ranks = world.ranks[world.rank_in_group % replica_size :: replica_size]
+        if list(_DP.ranks) != expected_dp_ranks:
+            raise RuntimeError(
+                f"text encoder TP expects DP-outermost rank layout; DP group {_DP.ranks} != {expected_dp_ranks}"
+            )
     group_ranks = [world.ranks[i : i + tp_size] for i in range(0, world.world_size, tp_size)]
     _TEXT_ENCODER_TP = init_model_parallel_group(
         group_ranks=group_ranks,

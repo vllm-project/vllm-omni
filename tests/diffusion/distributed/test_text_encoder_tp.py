@@ -135,25 +135,42 @@ def test_maybe_shard_is_noop_for_tp1(monkeypatch):
     assert maybe_shard_text_encoder(model, od_config) is model
 
 
-@pytest.mark.parametrize(
-    ("world_size", "tp_size", "expected"),
-    [(4, 4, [[0, 1, 2, 3]]), (4, 2, [[0, 1], [2, 3]]), (2, 1, [[0], [1]])],
-)
-def test_text_encoder_tp_groups_tile_world(monkeypatch, world_size, tp_size, expected):
+def _fake_parallel_state(monkeypatch, world_size: int, dp_ranks: list[int] | None, rank: int = 0) -> dict[str, Any]:
+    """Patch parallel_state with a fake world (and optional DP group) for group construction."""
     from vllm_omni.diffusion.distributed import parallel_state
 
-    world = SimpleNamespace(world_size=world_size, ranks=list(range(world_size)), local_rank=0, device_group=None)
+    world = SimpleNamespace(
+        world_size=world_size, ranks=list(range(world_size)), rank_in_group=rank, local_rank=0, device_group=None
+    )
+    dp = None if dp_ranks is None else SimpleNamespace(world_size=len(dp_ranks), ranks=dp_ranks)
     captured: dict[str, Any] = {}
 
     def fake_init(group_ranks, local_rank, backend, parallel_mode):
         captured.update(group_ranks=group_ranks, parallel_mode=parallel_mode)
-        return SimpleNamespace(world_size=tp_size)
+        return SimpleNamespace(world_size=len(group_ranks[0]))
 
     monkeypatch.setattr(parallel_state, "_TEXT_ENCODER_TP", None)
+    monkeypatch.setattr(parallel_state, "_DP", dp)
     monkeypatch.setattr(parallel_state, "get_world_group", lambda: world)
     monkeypatch.setattr(parallel_state, "init_model_parallel_group", fake_init)
     monkeypatch.setattr(parallel_state.torch.distributed, "get_backend", lambda _group: "gloo")
+    return captured
 
+
+@pytest.mark.parametrize(
+    ("world_size", "dp_ranks", "tp_size", "expected"),
+    [
+        (4, None, 4, [[0, 1, 2, 3]]),
+        (4, None, 2, [[0, 1], [2, 3]]),
+        (2, None, 1, [[0], [1]]),
+        # DP=2 x 2 ranks per replica: groups stay inside each replica.
+        (4, [0, 2], 2, [[0, 1], [2, 3]]),
+    ],
+)
+def test_text_encoder_tp_groups_tile_replicas(monkeypatch, world_size, dp_ranks, tp_size, expected):
+    from vllm_omni.diffusion.distributed import parallel_state
+
+    captured = _fake_parallel_state(monkeypatch, world_size, dp_ranks)
     group = parallel_state.get_text_encoder_tp_group(tp_size)
     assert captured == {"group_ranks": expected, "parallel_mode": "tensor"}
     # Cached on reuse; a different size is rejected.
@@ -165,8 +182,77 @@ def test_text_encoder_tp_groups_tile_world(monkeypatch, world_size, tp_size, exp
 def test_text_encoder_tp_size_must_divide_world(monkeypatch):
     from vllm_omni.diffusion.distributed import parallel_state
 
-    world = SimpleNamespace(world_size=4, ranks=[0, 1, 2, 3], local_rank=0, device_group=None)
-    monkeypatch.setattr(parallel_state, "_TEXT_ENCODER_TP", None)
-    monkeypatch.setattr(parallel_state, "get_world_group", lambda: world)
+    _fake_parallel_state(monkeypatch, 4, None)
     with pytest.raises(ValueError, match="evenly divide"):
         parallel_state.get_text_encoder_tp_group(3)
+
+
+def test_text_encoder_tp_group_cannot_span_dp_replicas(monkeypatch):
+    """DP=2, TP=2: an encoder group of 4 would all-reduce two different requests."""
+    from vllm_omni.diffusion.distributed import parallel_state
+
+    captured = _fake_parallel_state(monkeypatch, 4, [0, 2])
+    with pytest.raises(ValueError, match="data-parallel replica"):
+        parallel_state.get_text_encoder_tp_group(4)
+    assert captured == {}
+
+
+def test_text_encoder_tp_rejects_unexpected_dp_layout(monkeypatch):
+    from vllm_omni.diffusion.distributed import parallel_state
+
+    _fake_parallel_state(monkeypatch, 4, [0, 1])  # DP-innermost layout is not supported
+    with pytest.raises(RuntimeError, match="DP-outermost"):
+        parallel_state.get_text_encoder_tp_group(2)
+
+
+def _gloo_worker(rank: int, world_size: int, dp_size: int, tp_size: int, init_file: str) -> None:
+    from datetime import timedelta
+
+    import torch.distributed as dist
+
+    from vllm_omni.diffusion.distributed import parallel_state
+
+    dist.init_process_group(
+        "gloo", init_method=f"file://{init_file}", rank=rank, world_size=world_size, timeout=timedelta(seconds=60)
+    )
+    try:
+        parallel_state._WORLD = parallel_state.init_world_group(list(range(world_size)), 0, "gloo")
+        replica_size = world_size // dp_size
+        if dp_size > 1:
+            dp_groups = [list(range(i, world_size, replica_size)) for i in range(replica_size)]
+            parallel_state._DP = parallel_state.init_model_parallel_group(dp_groups, 0, "gloo", parallel_mode="data")
+        group = parallel_state.get_text_encoder_tp_group(tp_size)
+        assert group.ranks == list(range(rank // tp_size * tp_size, (rank // tp_size + 1) * tp_size))
+
+        model = _tiny_qwen25_vl()
+        # Each DP replica serves a different request (different tokens and length).
+        replica = rank // replica_size
+        generator = torch.Generator().manual_seed(100 + replica)
+        input_ids = torch.randint(0, 128, (2, 7 + 3 * replica), generator=generator)
+        expected = _last_hidden(model, input_ids)
+
+        shard_text_encoder(model, group)
+        assert isinstance(model.model.language_model.layers[0].self_attn.o_proj, RowShardedLinear)
+        torch.testing.assert_close(_last_hidden(model, input_ids), expected, rtol=1e-4, atol=1e-4)
+    finally:
+        parallel_state.destroy_model_parallel()
+        parallel_state._WORLD = None
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize(
+    ("world_size", "dp_size", "tp_size"),
+    [
+        (2, 1, 2),  # encoder TP over the whole world
+        (4, 1, 2),  # two encoder groups tiling one replica
+        (4, 2, 2),  # one encoder group per DP replica, different requests per replica
+    ],
+)
+def test_text_encoder_tp_real_process_groups(tmp_path, world_size, dp_size, tp_size):
+    """Real gloo process groups and collectives, one process per rank."""
+    torch.multiprocessing.spawn(
+        _gloo_worker,
+        args=(world_size, dp_size, tp_size, str(tmp_path / "rendezvous")),
+        nprocs=world_size,
+        join=True,
+    )

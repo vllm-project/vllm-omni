@@ -97,8 +97,8 @@ vllm serve Qwen/Qwen-Image --omni --tensor-parallel-size 4 --text-encoder-tp-siz
 
 Constraints:
 
-- `N` must divide the DiT world size and the encoder's attention and KV head counts (Qwen2.5-VL-7B: 28 heads, 4 KV heads, so `N` ∈ {1, 2, 4}).
-- The groups tile the DiT ranks (`[0..N-1], [N..2N-1], ...`) and every rank gets the full encoder output, so no broadcast is needed.
+- `N` must divide the number of ranks in one data-parallel replica (world size / `data_parallel_size`) and the encoder's attention and KV head counts (Qwen2.5-VL-7B: 28 heads, 4 KV heads, so `N` ∈ {1, 2, 4}).
+- The groups tile each data-parallel replica (`[0..N-1], [N..2N-1], ...`) and never span replicas. Every rank gets the full encoder output, so no broadcast is needed.
 - MiniMax-H3 uses its own sharded Qwen3-VL encoder for this option; other pipelines ignore it.
 
 ---
