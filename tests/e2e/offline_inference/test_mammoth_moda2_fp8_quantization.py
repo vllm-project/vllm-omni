@@ -354,44 +354,58 @@ def _assert_finite_image_payload(payload, context: str) -> None:
             _assert_finite_image_payload(item, f"{context}[{index}]")
 
 
-def _check_raw_image_tensors(outputs) -> None:
-    """Inspect the image-bearing fields handled by the official image helper."""
-    from collections.abc import Mapping
-
-    def check_multimodal(value, context: str) -> None:
-        if hasattr(value, "to_dict") and callable(value.to_dict):
-            value = value.to_dict()
-        if isinstance(value, Mapping):
-            for key in ("image", "images", "model_outputs"):
-                if key in value:
-                    _assert_finite_image_payload(value[key], f"{context}.{key}")
-
-    for index, output in enumerate(outputs):
-        # OmniRequestOutput.images is the first source used by the helper.
-        _assert_finite_image_payload(getattr(output, "images", None), f"outputs[{index}].images")
-        check_multimodal(
-            getattr(output, "multimodal_output", None),
-            f"outputs[{index}].multimodal_output",
-        )
-        for completion_index, completion in enumerate(getattr(output, "outputs", None) or []):
-            check_multimodal(
-                getattr(completion, "multimodal_output", None),
-                f"outputs[{index}].outputs[{completion_index}].multimodal_output",
-            )
-
-
 def _extract_image_tensor(outputs, expected_size: tuple[int, int] = _T2I_IMAGE_SIZE) -> torch.Tensor:
     """Validate one RGB image of requested size and return CHW floats in [0, 1].
 
-    Validate raw tensor finiteness *before* the official helper converts image
-    tensors to uint8 PIL images (which could otherwise mask NaN/Inf values).
+    Count all requests and completions, deduplicating field aliases within each
+    output. Repeated batch positions or separate completions still count twice.
+    Check raw tensor finiteness before conversion to uint8 can mask NaN/Inf.
     """
     import numpy as np
 
-    from vllm_omni.diffusion.utils.image_output import extract_images_from_outputs
+    from vllm_omni.diffusion.utils.image_output import _coerce_images, _image_values_from_mapping_like
 
-    _check_raw_image_tensors(outputs)
-    images = extract_images_from_outputs(outputs)
+    images = []
+    for index, output in enumerate(outputs):
+        completion_payload_ids: set[int] = set()
+
+        def collect(payload, seen: set[int], context: str) -> set[int]:
+            _assert_finite_image_payload(payload, context)
+            # Only deduplicate earlier fields, not positions in the same batch.
+            previous = seen.copy()
+            found: set[int] = set()
+
+            def visit(value) -> None:
+                if isinstance(value, (list, tuple)):
+                    for item in value:
+                        visit(item)
+                elif value is not None:
+                    found.add(id(value))
+                    if id(value) not in previous:
+                        decoded = _coerce_images(value)
+                        assert decoded, f"unsupported image payload in {context}: {type(value).__name__}"
+                        images.extend(decoded)
+
+            visit(payload)
+            seen.update(found)
+            return found
+
+        for completion_index, completion in enumerate(getattr(output, "outputs", None) or []):
+            seen: set[int] = set()
+            for payload in _image_values_from_mapping_like(getattr(completion, "multimodal_output", None)):
+                completion_payload_ids.update(
+                    collect(payload, seen, f"outputs[{index}].outputs[{completion_index}].multimodal_output")
+                )
+
+        # The public property can hide the stored mapping behind a completion.
+        root_mapping = getattr(output, "_multimodal_output", None)
+        if root_mapping is None:
+            root_mapping = getattr(output, "multimodal_output", None)
+        root_seen = completion_payload_ids.copy()
+        collect(getattr(output, "images", None), root_seen, f"outputs[{index}].images")
+        for payload in _image_values_from_mapping_like(root_mapping):
+            collect(payload, root_seen, f"outputs[{index}].multimodal_output")
+
     assert len(images) == _T2I_IMAGE_COUNT, f"expected {_T2I_IMAGE_COUNT} generated image(s), got {len(images)}"
 
     image = images[0]
@@ -401,6 +415,79 @@ def _extract_image_tensor(outputs, expected_size: tuple[int, int] = _T2I_IMAGE_S
     arr = np.asarray(image, dtype=np.float32) / 255.0  # (H, W, C)
     assert np.isfinite(arr).all(), "decoded image contains NaN/Inf"
     return torch.from_numpy(arr).permute(2, 0, 1)  # (C, H, W)
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("location", ["output", "completion", "batch"])
+@pytest.mark.parametrize("same_image", [False, True], ids=["distinct_images", "repeated_image"])
+def test_image_output_contract_rejects_extra_images(location: str, same_image: bool):
+    from PIL import Image
+    from vllm.outputs import CompletionOutput
+
+    from vllm_omni.outputs import OmniRequestOutput
+
+    image = Image.new("RGB", _T2I_IMAGE_SIZE)
+    extra = image if same_image else image.copy()
+
+    if location == "output":
+        outputs = [OmniRequestOutput(images=[image]), OmniRequestOutput(images=[extra])]
+    elif location == "completion":
+        completions = []
+        for index, value in enumerate((image, extra)):
+            completion = CompletionOutput(index=index, text="", token_ids=[], cumulative_logprob=None, logprobs=None)
+            setattr(completion, "multimodal_output", {"image": value})
+            completions.append(completion)
+        outputs = [OmniRequestOutput(outputs=completions)]
+    else:
+        outputs = [OmniRequestOutput(images=[image, extra])]
+
+    with pytest.raises(AssertionError, match=r"expected 1 generated image\(s\), got 2"):
+        _extract_image_tensor(outputs)
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("payload_type", ["pil", "tensor"])
+def test_image_output_contract_counts_aliases_once(payload_type: str):
+    from PIL import Image
+    from vllm.outputs import CompletionOutput
+
+    from vllm_omni.outputs import OmniRequestOutput
+
+    image = Image.new("RGB", _T2I_IMAGE_SIZE) if payload_type == "pil" else torch.zeros(3, 256, 256)
+    payload = {"image": image, "images": [image], "model_outputs": (image,)}
+    completion = CompletionOutput(index=0, text="", token_ids=[], cumulative_logprob=None, logprobs=None)
+    setattr(completion, "multimodal_output", payload)
+    output = OmniRequestOutput(outputs=[completion], _multimodal_output=payload)
+    if isinstance(image, Image.Image):
+        output.images = [image]
+
+    tensor = _extract_image_tensor([output])
+    assert tensor.shape == (3, 256, 256)
+    assert torch.equal(tensor, torch.zeros_like(tensor))
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("invalid", ["extra_image", "nan", "inf"])
+def test_image_output_contract_checks_hidden_request_payload(invalid: str):
+    from PIL import Image
+    from vllm.outputs import CompletionOutput
+
+    from vllm_omni.outputs import OmniRequestOutput
+
+    image = Image.new("RGB", _T2I_IMAGE_SIZE)
+    completion = CompletionOutput(index=0, text="", token_ids=[], cumulative_logprob=None, logprobs=None)
+    setattr(completion, "multimodal_output", {"image": image})
+    extra: Image.Image | torch.Tensor
+    if invalid == "extra_image":
+        extra = image.copy()
+        message = r"expected 1 generated image\(s\), got 2"
+    else:
+        extra = torch.full((3, 256, 256), float(invalid))
+        message = "non-finite values"
+    output = OmniRequestOutput(outputs=[completion], _multimodal_output={"image": extra})
+
+    with pytest.raises(AssertionError, match=message):
+        _extract_image_tensor([output])
 
 
 def _image_rel_l2(a: torch.Tensor, b: torch.Tensor) -> float:

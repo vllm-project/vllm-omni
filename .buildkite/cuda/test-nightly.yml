@@ -35,7 +35,7 @@ steps:
         source_file_dependencies: omni_mammoth_moda2_fp8
         timeout_in_minutes: 120
         commands:
-          - pytest -s -v tests/e2e/offline_inference/test_mammoth_moda2_fp8_quantization.py -m "full_model and cuda and H100 and cards_1" --run-level "full_model"
+          - pytest -s -v tests/e2e/offline_inference/test_mammoth_moda2_fp8_quantization.py -m "full_model and (cpu or (cuda and H100 and cards_1))" --run-level "full_model"
         mirror_hardwares: h100_1
 
       - label: ":full_moon: Omni · MiniCPM-o 4.5 Duplex Test"
