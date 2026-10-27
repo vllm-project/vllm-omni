@@ -27,6 +27,8 @@ depends_on:
   - ../input_output_modality_contracts.md
   - diffusion_model_integration.md
 validation_paths:
+  - tests/diffusion/sched/dispatch/**
+  - tests/diffusion/sched/test_dispatch_imports.py
   - tests/diffusion/test_diffusion_engine.py
   - tests/diffusion/test_diffusion_engine_cleanup.py
   - tests/diffusion/test_diffusion_engine_dummy_run.py
@@ -83,6 +85,14 @@ define a model's denoising algorithm:
   [Stage runtime](../stage_runtime.md); and
 - model-specific work belongs to
   [Diffusion model integration](diffusion_model_integration.md).
+
+The `sched/dispatch/` subpackage contains optional cross-replica admission
+and dispatch. Its controller runs on the Orchestrator event loop, holds
+requests until a replica slot is free, and returns a replica selection to
+`StagePool`, which owns client submission and execution feedback. The existing
+`BaseScheduler`, `RequestScheduler`, and `StepScheduler` continue to manage
+requests inside each diffusion backend. Sharing the `sched` namespace does
+not change which process owns either decision or the replica lifecycle.
 
 ## Runtime at a glance
 

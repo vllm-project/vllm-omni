@@ -486,16 +486,19 @@ class StageDiffusionProc:
                     request_id,
                     str(e),
                 )
-                metrics = diffusion_exception_metrics(e)
-                if metrics:
-                    await response_socket.send(
-                        encoder.encode(
-                            {
-                                "type": "metrics",
-                                "metrics": metrics,
-                            }
-                        )
+                await response_socket.send(
+                    encoder.encode(
+                        {
+                            "type": "result",
+                            "output": OmniRequestOutput(
+                                request_id=request_id,
+                                finished=True,
+                                aborted=True,
+                                metrics=diffusion_exception_metrics(e),
+                            ),
+                        }
                     )
+                )
             except Exception as e:
                 logger.exception("Diffusion request %s failed: %s", request_id, e)
                 status_code, error_type = client_error_metadata(e)
