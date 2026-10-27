@@ -247,19 +247,18 @@ def test_model_load_weights_reorders_serialized_svd_qkv_tensors():
     model.blocks = nn.ModuleList([nn.Module()])
     model.blocks[0].attn = nn.Module()
     model.blocks[0].attn.qkv_proj = _MultiWeightTarget(
-        {name: capture(name) for name in ("qweight", "wscales", "proj_up", "bias", "wcscales")}
+        {name: capture(name) for name in ("qweight", "wscales", "proj_up", "wcscales")}
     )
 
     qweight = torch.arange(12, dtype=torch.int8).reshape(6, 2)
     wscales = torch.arange(18, dtype=torch.uint8).reshape(3, 6)
     proj_up = torch.arange(6, dtype=torch.bfloat16).reshape(6, 1)
-    bias = torch.arange(6, dtype=torch.bfloat16)
     wcscales = torch.arange(6, dtype=torch.bfloat16)
-    names = ("qweight", "wscales", "proj_up", "bias", "wcscales")
+    names = ("qweight", "wscales", "proj_up", "wcscales")
     loaded = model.load_weights(
         [
             (f"blocks.0.attn.qkv_proj.{name}", tensor)
-            for name, tensor in zip(names, (qweight, wscales, proj_up, bias, wcscales))
+            for name, tensor in zip(names, (qweight, wscales, proj_up, wcscales))
         ]
     )
 
@@ -267,7 +266,6 @@ def test_model_load_weights_reorders_serialized_svd_qkv_tensors():
     expected_rows = [0, 3, 1, 4, 2, 5]
     assert calls["qweight"][:, 0].tolist() == [row * qweight.shape[1] for row in expected_rows]
     assert calls["proj_up"][:, 0].tolist() == expected_rows
-    assert calls["bias"].tolist() == expected_rows
     assert calls["wcscales"].tolist() == expected_rows
     assert calls["wscales"][0, :].tolist() == expected_rows
 

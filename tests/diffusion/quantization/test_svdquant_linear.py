@@ -69,6 +69,17 @@ def test_mxfp4_supports_blackwell_sm100_and_sm103() -> None:
     assert not svdquant._supports_capability(None, svdquant._MXFP4_CAPABILITIES)
 
 
+def test_mxfp4_accepts_xpu_while_nvfp4_remains_cuda_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    platform = SimpleNamespace(is_xpu=lambda: True, is_cuda=lambda: False)
+    monkeypatch.setattr(svdquant, "current_platform", platform)
+
+    svdquant._assert_supported("mxfp4")
+    with pytest.raises(RuntimeError, match="requires a CUDA device"):
+        svdquant._assert_supported("nvfp4")
+
+
 def test_rejects_nvfp4_backend_with_incompatible_layer_contract(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -219,10 +230,53 @@ def test_mxfp4_preserves_logical_bias_when_kernel_repacks_it(
 
     method.process_weights_after_loading(layer)
     assert layer.bias.shape == (4,)
+    assert "_svdquant_bias" in dict(layer.named_buffers())
+    assert "_svdquant_bias" not in layer.state_dict()
+    assert layer._svdquant_bias is not layer.bias
+    torch.testing.assert_close(
+        layer._svdquant_bias,
+        torch.tensor([1.0, 2.0, 3.0], dtype=torch.bfloat16),
+    )
 
     x = torch.tensor([[2.0, 4.0]], dtype=torch.bfloat16)
     actual = method.apply(layer, x, layer.bias)
     expected = torch.mm(x, base_weight) + torch.tensor([1.0, 2.0, 3.0], dtype=torch.bfloat16)
+
+    torch.testing.assert_close(actual, expected)
+
+    layer.to(dtype=torch.float32)
+    assert layer._svdquant_bias.dtype == torch.float32
+
+
+def test_mxfp4_does_not_duplicate_bias_when_kernel_leaves_it_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base_weight = torch.tensor(
+        [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]],
+        dtype=torch.bfloat16,
+    )
+    kernel = _FakeNvfp4Kernel(base_weight)
+    monkeypatch.setattr(svdquant, "_assert_supported", lambda precision: None)
+    monkeypatch.setattr(svdquant, "_mxfp4_kernel", lambda: kernel)
+    method = svdquant.DiffusionSVDQuantLinearMethod(svdquant.DiffusionSVDQuantConfig(precision="mxfp4"))
+
+    layer = torch.nn.Module()
+    _register_parameter(layer, "qweight", torch.zeros((3, 1), dtype=torch.int8))
+    _register_parameter(layer, "wscales", torch.zeros((2, 3), dtype=torch.uint8))
+    _register_parameter(layer, "bias", torch.tensor([1.0, 2.0, 3.0], dtype=torch.bfloat16))
+    original_bias = layer.bias
+    layer.smooth_factor = torch.ones(2, dtype=torch.bfloat16)
+    layer.proj_down = torch.zeros((2, 1), dtype=torch.bfloat16)
+    layer.proj_up = torch.zeros((3, 1), dtype=torch.bfloat16)
+    layer.output_size_per_partition = 3
+
+    method.process_weights_after_loading(layer)
+    assert layer.bias is original_bias
+    assert not hasattr(layer, "_svdquant_bias")
+
+    x = torch.tensor([[2.0, 4.0]], dtype=torch.bfloat16)
+    actual = method.apply(layer, x, layer.bias)
+    expected = torch.mm(x, base_weight) + original_bias
 
     torch.testing.assert_close(actual, expected)
 

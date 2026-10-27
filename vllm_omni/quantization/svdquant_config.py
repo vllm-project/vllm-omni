@@ -81,6 +81,8 @@ def _supports_capability(capability: DeviceCapability | None, supported: set[tup
 
 
 def _assert_supported(precision: str) -> None:
+    if precision == "mxfp4" and current_platform.is_xpu():
+        return
     supported = _MXFP4_CAPABILITIES if precision == "mxfp4" else _NVFP4_CAPABILITIES
     if not current_platform.is_cuda():
         raise RuntimeError(f"SVDQuant {precision} requires a CUDA device")
@@ -352,13 +354,19 @@ class DiffusionSVDQuantLinearMethod(LinearMethodBase):
         )
 
         if precision == "mxfp4":
-            # Marlin replaces layer.bias with a padded and permuted Parameter.
-            # Keep the logical bias for the post-GEMM add in apply().
-            bias = getattr(layer, "bias", None)
-            if bias is not None:
-                layer._svdquant_bias = bias.detach().clone()
+            bias_before = getattr(layer, "bias", None)
+            bias_snapshot = None if bias_before is None else bias_before.detach().clone()
             kernel = _mxfp4_kernel()
             kernel.process_weights_after_loading(layer)
+            bias_after = getattr(layer, "bias", None)
+            bias_replaced = bias_after is not bias_before
+            if bias_after is not None and bias_before is not None:
+                bias_replaced = bias_replaced or bias_after.shape != bias_before.shape
+            if bias_snapshot is not None and bias_replaced:
+                # Marlin replaces and permutes layer.bias. Keep the logical bias
+                # as a non-persistent buffer so module moves and offload hooks
+                # handle it, while FlashInfer/XPU retain the original parameter.
+                layer.register_buffer("_svdquant_bias", bias_snapshot, persistent=False)
             logger.info_once(
                 "SVDQuant MXFP4 is using %s; the rank correction is not fused into the GEMM.",
                 type(kernel).__name__,
@@ -434,7 +442,7 @@ class DiffusionSVDQuantLinearMethod(LinearMethodBase):
             correction_input,
             layer.proj_up.transpose(0, 1),
         )
-        bias_to_add = getattr(layer, "_svdquant_bias", bias) if bias is not None else None
+        bias_to_add = getattr(layer, "_svdquant_bias", bias)
         if bias_to_add is not None:
             out.add_(bias_to_add)
         return out.reshape(

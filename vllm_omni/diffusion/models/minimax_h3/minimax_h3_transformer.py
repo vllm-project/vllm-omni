@@ -1790,7 +1790,6 @@ class MiniMaxH3DiTModel(nn.Module):
                 (
                     ".attn.qkv_proj.qweight",
                     ".attn.qkv_proj.proj_up",
-                    ".attn.qkv_proj.bias",
                     ".attn.qkv_proj.wcscales",
                 )
             ):
