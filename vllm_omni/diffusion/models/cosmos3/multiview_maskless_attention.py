@@ -262,6 +262,11 @@ def _maskless_attention_impl(
     kernel = get_pass_kernel(kernel_name)
     same_view_kernel = get_pass_kernel("fa3_single_split") if kernel_name == "fa3" else kernel
     fused_merge = kernel_name == "fa3" and q.device.type == "cuda"
+    direct_merge = None
+    if fused_merge:
+        from .multiview_lse_store import direct_store
+
+        direct_merge = direct_store
     trimmed_queries = plan[0].numel() < planned_tokens
     if trimmed_queries and not (fused_merge and head_dim == 128 and q.dtype == torch.bfloat16):
         raise ValueError("Trimmed same-view queries require BF16 FA3 with head_dim=128 on CUDA.")
@@ -313,6 +318,19 @@ def _maskless_attention_impl(
                     # Dead terminal control rows need finite seeds for later passes.
                     acc.zero_()
                     acc_lse.zero_()
+            assert acc_lse is not None
+            if direct_merge is not None and direct_merge(
+                acc,
+                acc_lse,
+                out,
+                lse,
+                q_index,
+                start=0 if identity_q else -1,
+                seed=index == 0,
+                result=result[0] if index == num_passes - 1 else None,
+            ):
+                del out, lse
+                continue
             if fused_merge:
                 _compiled_merge_pass(
                     acc,

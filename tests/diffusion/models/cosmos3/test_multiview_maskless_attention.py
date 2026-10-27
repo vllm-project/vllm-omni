@@ -448,3 +448,74 @@ def test_cuda_maskless_matches_dense_and_sparse(fa_version: int, dtype: torch.dt
         torch.testing.assert_close(maskless.double(), dense_reference(spec, *qkv), atol=tolerance, rtol=tolerance)
         triton = padded_multiview_flex_attention(*qkv, MultiviewAttentionContext(replace(spec, backend="triton"), {}))
         torch.testing.assert_close(maskless, triton, atol=tolerance, rtol=tolerance)
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("views,lidar,heads", [(1, False, 2), (3, False, 4), (2, True, 8)])
+def test_automatic_optimizations_keep_cpu_fallback(monkeypatch, views, lidar, heads):
+    spec = layout(views=views, lidar=lidar)
+    context = prepared_context(spec, sum(spec.caption_lengths))
+    args = tensors(spec, sum(spec.caption_lengths), heads=heads)
+    expected = m.maskless_multiview_attention(*args, context)
+    assert m.prepare_long_first_same_view_context(context, head_dim=128, dtype=torch.bfloat16) is context
+    assert m.prepare_last_layer_same_view_context(context, head_dim=128, dtype=torch.bfloat16) is None
+    calls = []
+
+    def get_kernel(name):
+        def kernel(*args, **kwargs):
+            calls.append(name)
+            return m.torch_reference_pass_kernel(*args, **kwargs)
+
+        return kernel
+
+    # Simulate FA3 dispatch with CPU math: only pass zero selects one split,
+    # while the CUDA-only merge paths must stay unused.
+    monkeypatch.setattr(m, "get_pass_kernel", get_kernel)
+    actual = m.maskless_multiview_attention(*args, replace(context, maskless=replace(context.maskless, kernel="fa3")))
+    assert calls == ["fa3_single_split"] + ["fa3"] * (context.maskless.num_passes - 1)
+    assert torch.equal(expected.contiguous().view(torch.uint8), actual.contiguous().view(torch.uint8))
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_fused_merge_preserves_partial_final_rows(dtype):
+    generator = torch.Generator().manual_seed(81)
+    outputs = [torch.randn(n, 2, 8, generator=generator).to(dtype) for n in (7, 3, 2)]
+    lses = [torch.randn(n, 2, generator=generator) for n in (7, 3, 2)]
+    indices = [torch.arange(7), torch.tensor([6, 1, 4]), torch.tensor([4, 0])]
+    expected, expected_lse = outputs[0].float(), lses[0].clone()
+    acc, acc_lse = torch.empty_like(expected), torch.empty_like(expected_lse)
+    result = torch.empty_like(outputs[0])
+    for i, (out, lse, index) in enumerate(zip(outputs, lses, indices, strict=True)):
+        if i:
+            merged, merged_lse = m.merge_step(expected[index], expected_lse[index], out, lse)
+            expected[index], expected_lse[index] = merged, merged_lse
+        m._merge_pass(acc, acc_lse, out, lse, index, i == 0, i == 0, result if i == 2 else None)
+    assert torch.equal(acc, expected) and torch.equal(acc_lse, expected_lse)
+    assert torch.equal(result.view(torch.uint8), expected.to(dtype).view(torch.uint8))
+
+
+@pytest.mark.cpu
+def test_same_view_planning_preserves_targets_and_kv_order():
+    # A mixed boundary tile, a longer view, and a control-only view.
+    items = (
+        MaskItem((257, 1, 1), 1, is_control=True),
+        MaskItem((140, 1, 1), 1),
+        MaskItem((513, 1, 1), 1, view_offset=1),
+        MaskItem((129, 1, 1), 1, view_offset=2, is_control=True),
+    )
+    spec = MultiviewLayout(items, 0.4, caption_lengths=(2, 3, 1), backend="maskless")
+    runtime = prepared_context(spec, 6).maskless
+    ordered = m._sort_same_view_sequences(runtime)
+    assert ordered.plan[3].diff().tolist() == [513, 397, 129]
+    old_k = runtime.plan[1].split(runtime.plan[3].diff().tolist())
+    new_k = ordered.plan[1].split(ordered.plan[3].diff().tolist())
+    assert all(torch.equal(a, b) for a, b in zip(new_k, (old_k[1], old_k[0], old_k[2]), strict=True))
+    trimmed = m._trim_same_view_queries(ordered, spec)
+    assert trimmed.plan[0].numel() == spec.gen_tokens - 256
+    assert trimmed.plan[2].diff().tolist() == [513, 141, 129]
+    assert torch.equal(trimmed.plan[1], ordered.plan[1])
+    assert torch.equal(trimmed.plan[3], ordered.plan[3])
+    assert all(a is b for a, b in zip(trimmed.plan[5:], runtime.plan[5:], strict=True))
+    assert not trimmed.plan[4][META_IDENTITY_Q]
+    assert torch.unique(trimmed.plan[0]).numel() == trimmed.plan[0].numel()
