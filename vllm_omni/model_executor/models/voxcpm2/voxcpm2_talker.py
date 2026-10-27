@@ -510,10 +510,12 @@ class _PerfTimer:
             except RuntimeError as error:
                 # An event recorded during accelerator graph capture may not
                 # own a runtime recorder. Profiling must not fail inference.
+                # warning_once caches its arguments; pass a string so the cache
+                # does not retain the traceback frame holding the profiler.
                 logger.warning_once(
                     "VoxCPM2 profiler discarded invalid event pair %r: %s",
                     name,
-                    error,
+                    str(error),
                 )
                 continue
             self._timers[name] = self._timers.get(name, 0.0) + elapsed_ms

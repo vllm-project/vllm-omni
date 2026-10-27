@@ -655,7 +655,7 @@ _ROCM_MIGRATED_AMD_GPU_JOBS = (
         "Omni Model Test Qwen3-Omni",
         AMD_MERGE_PIPELINE,
         "Blocking",
-        16,
+        17,
         "advanced_model and rocm and MI325 and not nvidia_only",
     ),
     (
@@ -690,8 +690,11 @@ def test_migrated_amd_gpu_jobs_select_exact_rocm_collections() -> None:
         assert _marker_expressions({"commands": run_commands}) == [marker_expression]
 
         collect_argv = split(collect_commands[0])
-        assert collect_argv[:2] == ["bash", str(AMD_COLLECTION_GUARD)]
-        assert collect_argv[2] == str(expected_count)
+        bash_at = collect_argv.index("bash")
+        assert collect_argv[bash_at : bash_at + 2] == ["bash", str(AMD_COLLECTION_GUARD)]
+        assert collect_argv[bash_at + 2] == str(expected_count)
+        if "Shard %N/%t" in label:
+            assert '$${BUILDKITE_PARALLEL_JOB:-0}" == "0"' in collect_commands[0]
 
 
 def test_amd_collection_guard_rejects_empty_and_changed_collections() -> None:
@@ -1012,7 +1015,8 @@ def test_ready_jobs_restore_bf16_aiter_module_without_publishing(label: str, pyt
     step = _find_step(label, AMD_READY_PIPELINE)
 
     assert step["agent_pool"] == "mi300_1"
-    assert step["depends_on"] == "amd-build"
+    assert step["depends_on"] == "amd-fa-aiter"
+    assert step["env"] == {"VLLM_OMNI_AITER_MHA_SAME_BUILD_STEP": "amd-fa-aiter"}
     assert step["mirror_hardwares"] == ["amdproduction"]
     _assert_build_scoped_aiter_mha_cache(step, pytest_marker, publishes=False)
     assert all("VLLM_ROCM_USE_AITER=0" not in command for command in step["commands"])
@@ -1023,7 +1027,9 @@ def test_ready_flashattention_publishes_bf16_aiter_module_on_success() -> None:
     pytest_commands = [command for command in step["commands"] if "pytest" in command]
 
     assert step["agent_pool"] == "mi300_1"
+    assert step["key"] == "amd-fa-aiter"
     assert step["depends_on"] == "amd-build"
+    assert "VLLM_OMNI_AITER_MHA_SAME_BUILD_STEP" not in step.get("env", {})
     assert step["mirror_hardwares"] == ["amdproduction"]
     assert step["grade"] == "NonBlocking"
     assert step["timeout_in_minutes"] == 60
