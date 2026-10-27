@@ -3,7 +3,7 @@
 
 import contextlib
 import inspect
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, cast
 
@@ -15,7 +15,7 @@ from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.models.interfaces import supports_mrope
 from vllm.model_executor.models.interfaces_base import VllmModelForPooling
-from vllm.sampling_params import SamplingType
+from vllm.sampling_params import SamplingParams, SamplingType
 from vllm.sequence import IntermediateTensors
 from vllm.tracing import instrument
 from vllm.utils.import_utils import LazyLoader
@@ -87,6 +87,7 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.model_intermediate_buffer: dict[str, dict[str, Any]] = {}
+        self._tts_local_generators: dict[str, torch.Generator] = {}
         self._omni_num_scheduled_tokens_np: np.ndarray | None = None
         self._omni_last_model_output: object | None = None
         # Omni prefix cache (hidden / per-token mm tensors reused on prefix
@@ -399,6 +400,46 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
             return sampling_metadata
         return replace(sampling_metadata, output_token_ids=output_token_ids)
 
+    def _create_request_generator(self, sampling_params: SamplingParams | None) -> torch.Generator | None:
+        """Preserve native vLLM request-seeded token sampling behavior."""
+        if (
+            sampling_params is None
+            or sampling_params.sampling_type != SamplingType.RANDOM_SEED
+            or sampling_params.seed is None
+        ):
+            return None
+
+        return torch.Generator(device=self.device).manual_seed(sampling_params.seed)
+
+    def _get_tts_local_generators(self) -> dict[int, torch.Generator]:
+        """Map active rows to acoustic RNGs, never shared with token sampling.
+
+        Cache by request ID rather than batch row so paused/reordered requests
+        resume their acoustic stream. Finished requests are removed in _update_states.
+        """
+        cache: dict[str, torch.Generator] = getattr(self, "_tts_local_generators", {})
+
+        def request_generator(req_id: str) -> torch.Generator | None:
+            sampling_params = self.requests[req_id].sampling_params
+            extra_args = getattr(sampling_params, "extra_args", None)
+            seed = extra_args.get("tts_local_seed") if isinstance(extra_args, Mapping) else None
+            if seed is None:
+                return None
+            if req_id in cache:
+                return cache[req_id]
+            return torch.Generator(device=self.device).manual_seed(int(seed))
+
+        row_generators = {
+            row_idx: generator
+            for row_idx, req_id in enumerate(self.input_batch.req_ids)
+            if (generator := request_generator(req_id)) is not None
+        }
+        self._tts_local_generators = {
+            **cache,
+            **{self.input_batch.req_ids[row_idx]: generator for row_idx, generator in row_generators.items()},
+        }
+        return row_generators
+
     def _init_mrope_positions(self, req_state: CachedRequestState):
         """Initialize M-RoPE positions for multimodal inputs.
 
@@ -562,6 +603,12 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
             if getattr(self, "_omni_connector_initialized", False)
             else None
         )
+        if scheduler_output.finished_req_ids:
+            self._tts_local_generators = {
+                req_id: generator
+                for req_id, generator in getattr(self, "_tts_local_generators", {}).items()
+                if req_id not in scheduler_output.finished_req_ids
+            }
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
             self.model_intermediate_buffer.pop(req_id, None)
@@ -635,11 +682,7 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
             sampling_params = new_req_data.sampling_params
             pooling_params = new_req_data.pooling_params
 
-            if sampling_params and sampling_params.sampling_type == SamplingType.RANDOM_SEED:
-                generator = torch.Generator(device=self.device)
-                generator.manual_seed(sampling_params.seed)
-            else:
-                generator = None
+            generator = self._create_request_generator(sampling_params)
 
             if self.is_pooling_model:
                 assert pooling_params is not None
@@ -2265,6 +2308,11 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
         ):
             model_output = OmniOutput(*model_output)
         if not isinstance(model_output, (OmniOutput, IntermediateTensors)) and hasattr(self.model, "make_omni_output"):
+            if getattr(self.model, "requires_tts_local_generator", False):
+                model_kwargs_extra = {
+                    **model_kwargs_extra,
+                    "tts_local_generators": self._get_tts_local_generators(),
+                }
             model_output = self.model.make_omni_output(model_output, **model_kwargs, **model_kwargs_extra)
         # Cache model output so later sample_tokens can consume multimodal results.
         self._omni_last_model_output = model_output
