@@ -281,6 +281,8 @@ source_file_dependencies:
 
   omni_qwen3_omni_function:
     - *qwen3_omni
+    - .buildkite/amd/scripts/assert-pytest-collection.sh
+    - .buildkite/amd/scripts/run-qwen3-omni-rocm-nightly.sh
     - tests/e2e/offline_inference/test_qwen3_omni.py
     - tests/e2e/offline_inference/test_qwen3_omni_colocate_async.py
     - tests/e2e/offline_inference/test_qwen3_omni_autoround_w4a16_expansion.py
@@ -308,6 +310,8 @@ source_file_dependencies:
 
   omni_qwen3_omni_perf:
     - *qwen3_omni
+    - .buildkite/amd/scripts/assert-pytest-collection.sh
+    - .buildkite/amd/scripts/run-qwen3-omni-rocm-nightly.sh
     - tests/dfx/perf/scripts/run_benchmark.py
     - tests/dfx/perf/tests/test_qwen3_omni_vllm_text.json
     - tests/dfx/perf/tests/test_qwen3_omni_async_chunk.json
@@ -424,6 +428,10 @@ source_file_dependencies:
     - tests/e2e/online_serving/test_minicpmo_4_5_duplex_expansion.py
     - tests/e2e/online_serving/test_minicpmo_4_5_window.py
     - tests/e2e/online_serving/helpers/minicpmo_window_e2e.py
+    - tests/e2e/online_serving/test_minicpmo_4_5_duplex_recognition.py
+    - tests/e2e/online_serving/test_minicpmo_duplex_recognition_contract.py
+    - tests/e2e/online_serving/helpers/minicpmo_duplex_recognition.py
+    - examples/online_serving/minicpmo/realtime_duplex_demo.py
     - tests/e2e/online_serving/test_duplex_client_live.py
     - tests/e2e/online_serving/test_minicpmo_realtime_duplex_drivers.py
     - tests/e2e/online_serving/helpers/minicpmo_realtime_duplex_scenarios.py

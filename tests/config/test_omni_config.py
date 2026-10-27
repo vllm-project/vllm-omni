@@ -126,7 +126,7 @@ def _from_pipeline_key(
 
 
 @pytest.mark.parametrize("pending", [False, True])
-def test_pending_generation_capability_reaches_both_engine_config_paths(pending):
+def test_pending_generation_capability_reaches_both_engine_config_paths(pending, tmp_path):
     from vllm_omni.engine.arg_utils import OmniEngineArgs
     from vllm_omni.engine.stage_init_utils import build_engine_args_dict_from_omni_stage_config
     from vllm_omni.entrypoints.utils import filter_dataclass_kwargs
@@ -147,7 +147,7 @@ def test_pending_generation_capability_reaches_both_engine_config_paths(pending)
     legacy = merge_pipeline_deploy(pipeline, deploy)[0]
     assert legacy.yaml_engine_args.get("supports_pending_generation", False) is pending
     structured = VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=deploy)
-    args = build_engine_args_dict_from_omni_stage_config(structured.stage_by_id(0), model="test-model")
+    args = build_engine_args_dict_from_omni_stage_config(structured.stage_by_id(0), model=str(tmp_path))
     assert OmniEngineArgs(**filter_dataclass_kwargs(OmniEngineArgs, args)).supports_pending_generation is pending
 
 
@@ -1245,6 +1245,7 @@ def test_sub_config_fields_match_structured_scopes():
         "generation_config",
         "override_generation_config",
         "enable_prompt_embeds",
+        "scheduling_metadata_adapter",
     }
     vllm_load_fields = {f.name for f in fields(VllmLoadConfig)}
     assert issubclass(OmniStageLoadConfig, VllmLoadConfig)

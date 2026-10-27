@@ -510,8 +510,8 @@ class OmniBase(PDDisaggregationMixin):
                     msg.error,
                     error_stage_id=msg.stage_id,
                 )
-            if msg.mm_cache_miss_hashes and msg.request_id is not None and msg.request_id not in self.request_states:
-                # The engine has applied cache feedback for a cancelled request.
+            if msg.request_id is not None and msg.request_id not in self.request_states:
+                # Ignore queued errors from completed or cancelled requests.
                 return True, None, None, None
             self._raise_nonfatal_error_message(msg)
 

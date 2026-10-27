@@ -46,6 +46,7 @@ from vllm_omni.engine.orchestrator import (
 )
 from vllm_omni.engine.serialization import deserialize_additional_information, serialize_additional_information
 from vllm_omni.engine.stage_pool import StagePool, StageUnavailableError
+from vllm_omni.entrypoints.client_request_state import ClientRequestState
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.metrics.stats import StageRequestStats, StageStats
 from vllm_omni.outputs import OmniRequestOutput, StagePostWarmupMemoryStats
@@ -3188,6 +3189,7 @@ async def test_interaction_backlog_is_bounded_without_blocking_dispatch() -> Non
             InteractionMessage(request_id="video", interaction={"event_id": str(index), "event": {}})
         )
     error = errors.get_nowait()
+    assert error.request_id == "video"
     assert error.event_id == "64"
     assert error.fatal is False
     assert error.error == "Too many pending interactions"
@@ -3196,6 +3198,7 @@ async def test_interaction_backlog_is_bounded_without_blocking_dispatch() -> Non
     from vllm_omni.entrypoints.async_omni import AsyncOmni
 
     consumer = object.__new__(AsyncOmni)
+    consumer.request_states = {"video": ClientRequestState("video")}
     with pytest.raises(RuntimeError, match="Too many pending interactions"):
         consumer._handle_output_message(error)
 

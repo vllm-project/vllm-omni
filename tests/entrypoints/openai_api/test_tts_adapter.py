@@ -646,8 +646,11 @@ def _moss_adapter_with_stage_configs(stage_configs, mocker):
 
 
 def _moss_cuda_available(mocker, device_count=8):
-    mocker.patch("torch.cuda.is_available", return_value=True)
-    mocker.patch("torch.accelerator.device_count", return_value=device_count)
+    platform = mocker.patch("vllm_omni.platforms.current_omni_platform")
+    platform.is_npu.return_value = False
+    platform.get_device_count.return_value = device_count
+    platform.device_type = "cuda"
+    platform.get_torch_device.side_effect = lambda index: torch.device("cuda", index)
 
 
 @pytest.mark.parametrize(
@@ -705,7 +708,7 @@ def test_moss_ref_encoder_device_accepts_dict_runtime(mocker):
 def test_moss_ref_encoder_device_cpu_when_cuda_unavailable(mocker):
     import torch
 
-    mocker.patch("torch.cuda.is_available", return_value=False)
+    _moss_cuda_available(mocker, device_count=0)
     adapter = _moss_adapter_with_stage_configs(
         [SimpleNamespace(model_stage="moss_tts_local_codec", runtime_config=SimpleNamespace(devices="3"))],
         mocker,

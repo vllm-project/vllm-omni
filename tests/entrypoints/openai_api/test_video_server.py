@@ -259,6 +259,54 @@ def test_preencoded_video_bytes_preserve_metadata(mocker: MockerFixture):
         handler.shutdown()
 
 
+@pytest.mark.parametrize("frame_counts", [[7], (7,)])
+def test_preencoded_worker_frame_counts_avoid_reopening_mp4(mocker: MockerFixture, frame_counts):
+    handler = OmniOpenAIServingVideo.for_diffusion(FakeAsyncOmni(), model_name="test-model")
+    result = MockVideoResult(
+        [b"already-encoded"],
+        multimodal_output={
+            "video": [b"already-encoded"],
+            "metadata": {"video": {"fps": 24.0, "frame_counts": frame_counts}},
+        },
+    )
+    mocker.patch.object(handler, "_run_generation", return_value=result)
+    mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video.count_mp4_frames",
+        side_effect=AssertionError("worker frame counts must avoid opening the container"),
+    )
+    try:
+        output = asyncio.run(
+            handler.generate_video_bytes(VideoGenerationRequest(prompt="test", num_frames=99), "known-count")
+        )
+        assert output[0] == b"already-encoded"
+        assert output[4] == {"fps": 24.0, "num_frames": 7, "duration_s": 7 / 24.0}
+    finally:
+        handler.shutdown()
+
+
+@pytest.mark.parametrize("frame_counts", [None, [], [7, 9], [0], [-1], [True], ["7"], 7])
+def test_invalid_worker_frame_counts_fall_back_without_losing_video(mocker: MockerFixture, frame_counts):
+    handler = OmniOpenAIServingVideo.for_diffusion(FakeAsyncOmni(), model_name="test-model")
+    result = MockVideoResult(
+        [b"already-encoded"],
+        multimodal_output={
+            "video": [b"already-encoded"],
+            "metadata": {"video": {"fps": 24.0, "frame_counts": frame_counts}},
+        },
+    )
+    mocker.patch.object(handler, "_run_generation", return_value=result)
+    count_frames = mocker.patch("vllm_omni.entrypoints.openai.serving_video.count_mp4_frames", return_value=7)
+    try:
+        output = asyncio.run(
+            handler.generate_video_bytes(VideoGenerationRequest(prompt="test", num_frames=99), "fallback-count")
+        )
+        assert output[0] == b"already-encoded"
+        assert output[4] == {"fps": 24.0, "num_frames": 7, "duration_s": 7 / 24.0}
+        count_frames.assert_called_once_with(b"already-encoded")
+    finally:
+        handler.shutdown()
+
+
 def test_resolve_diffusion_od_config_falls_back_to_attribute():
     od_config = SimpleNamespace(model_class_name="WanPipeline")
     handler = OmniOpenAIServingVideo.for_diffusion(
@@ -286,7 +334,7 @@ def test_resolve_diffusion_od_config_prefers_getter_over_attribute():
 class BlockingVideoHandler:
     supports_mixed_reference_inputs = False
     supports_latent_mask_editing = False
-    supported_control_upload_types = frozenset()
+    supported_control_upload_types: frozenset[str] = frozenset()
 
     def __init__(self):
         self.model_name = "Wan-AI/Wan2.2-T2V-A14B-Diffusers"
@@ -977,6 +1025,7 @@ def test_magi2_serving_applies_native_defaults_and_rejects_explicit_frame_mismat
 
     asyncio.run(handler._run_and_extract(VideoGenerationRequest(prompt="A fox walks through snow"), "defaults"))
 
+    assert engine.captured_sampling_params_list is not None
     sampling = engine.captured_sampling_params_list[0]
     assert (sampling.width, sampling.height) == (896, 512)
     assert sampling.num_frames == 125
@@ -1023,6 +1072,7 @@ def test_kandinsky6_serving_applies_defaults_but_allows_explicit_frame_count():
     )
 
     asyncio.run(handler._run_and_extract(VideoGenerationRequest(prompt="A dog runs on a beach"), "defaults"))
+    assert engine.captured_sampling_params_list is not None
     sampling = engine.captured_sampling_params_list[0]
     assert (sampling.width, sampling.height) == (864, 480)
     assert sampling.num_frames == 125
