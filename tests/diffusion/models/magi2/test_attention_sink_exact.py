@@ -11,6 +11,7 @@ import pytest
 import torch
 import torch.nn as nn
 
+from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.models.magi2 import attention
 from vllm_omni.diffusion.models.magi2.attention import VarlenHandler
@@ -444,7 +445,7 @@ def _musa_available():
     return hasattr(torch, "musa") and torch.musa.is_available()
 
 
-@pytest.mark.musa
+@hardware_test(res={"musa": "S5000"}, num_cards=1)
 @pytest.mark.parametrize("tokens,heads,num_sink", [(29616, 3, 1), (14601, 6, 1), (4099, 3, 2), (1, 3, 1)])
 def test_real_musa_correction_is_bitwise_unchanged(tokens, heads, num_sink):
     if not _musa_available():
@@ -465,7 +466,7 @@ def test_real_musa_correction_is_bitwise_unchanged(tokens, heads, num_sink):
             _assert_bitwise_equal(actual_lse.cpu(), expected_lse.cpu())
 
 
-@pytest.mark.musa
+@hardware_test(res={"musa": "S5000"}, num_cards=1)
 def test_real_musa_fa3_output_correction_is_bitwise_unchanged():
     if not _musa_available():
         pytest.skip("requires a MUSA device")
@@ -499,7 +500,7 @@ def test_real_musa_fa3_output_correction_is_bitwise_unchanged():
             _assert_bitwise_equal(corrected.to(q.dtype).cpu(), expected.cpu())
 
 
-@pytest.mark.musa
+@hardware_test(res={"musa": "S5000"}, num_cards=1)
 def test_real_musa_cache_follows_the_sink_device():
     if not _musa_available():
         pytest.skip("requires a MUSA device")
