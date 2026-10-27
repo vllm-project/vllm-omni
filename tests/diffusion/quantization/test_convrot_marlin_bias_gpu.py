@@ -25,7 +25,7 @@ from vllm.utils.torch_utils import set_default_torch_dtype
 
 import vllm_omni.quantization.convrot_config as convrot_config
 from tests.helpers.mark import hardware_test
-from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.data import OmniDiffusionConfig, TransformerConfig
 from vllm_omni.diffusion.vllm_config import create_diffusion_vllm_config
 from vllm_omni.quantization import build_quant_config
 
@@ -73,7 +73,14 @@ def test_marlin_does_not_finalize_before_bias(
         pytest.skip("Marlin fallback is unavailable")
 
     config = build_quant_config(quant_method)
-    od_config = OmniDiffusionConfig(model="test", dtype=torch.bfloat16, quantization_config=config)
+    # This regression only needs the native config container, not a checkpoint.
+    # Avoid a Hub lookup so the test remains self-contained with HF_HUB_OFFLINE=1.
+    od_config = OmniDiffusionConfig(
+        model=None,
+        dtype=torch.bfloat16,
+        tf_model_config=TransformerConfig.from_dict({}),
+        quantization_config=config,
+    )
     vllm_config = create_diffusion_vllm_config(torch.device("cuda:0"), od_config)
 
     try:
