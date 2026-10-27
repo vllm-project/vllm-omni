@@ -13,6 +13,7 @@ from tests.diffusion.models.magi2.test_native_packing import (
     _tiny_model,
     _tiny_sampler,
 )
+from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.models.magi2.common_layers import ModalityDispatcher
 from vllm_omni.diffusion.models.magi2.modeling_magi2 import Magi2PreviewTransformer, Modality
 from vllm_omni.diffusion.models.magi2.parallel import Magi2SequenceDispatcher, balanced_split_sizes
@@ -318,7 +319,7 @@ def test_invalid_coordinates_are_rejected_on_every_call() -> None:
     assert not model._sequence_layouts
 
 
-@pytest.mark.musa
+@hardware_test(res={"musa": "S5000"}, num_cards=1)
 def test_musa_device_sequence_layout_matches_rebuilding() -> None:
     if not hasattr(torch, "musa") or not torch.musa.is_available():
         pytest.skip("requires a MUSA device")
