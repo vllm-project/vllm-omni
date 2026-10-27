@@ -77,7 +77,7 @@ def normalize_varlen_lse(lse: torch.Tensor, tokens: int, query_heads: int) -> to
     return lse.transpose(0, 1).float().contiguous()
 
 
-def _make_vllm_flash_attn_kernel(fa_version: int) -> PassKernel:
+def _make_vllm_flash_attn_kernel(fa_version: int, num_splits: int = 0) -> PassKernel:
     def kernel(
         q: torch.Tensor,
         k: torch.Tensor,
@@ -102,6 +102,7 @@ def _make_vllm_flash_attn_kernel(fa_version: int) -> PassKernel:
             softmax_scale=softmax_scale,
             causal=False,
             fa_version=fa_version,
+            num_splits=num_splits,
         )
         return out, normalize_varlen_lse(lse, q.shape[0], q.shape[1])
 
@@ -140,6 +141,7 @@ def torch_reference_pass_kernel(
 for _version in (2, 3, 4):
     register_pass_kernel(f"fa{_version}", lambda version=_version: _make_vllm_flash_attn_kernel(version))
 register_pass_kernel("torch", lambda: torch_reference_pass_kernel)
+register_pass_kernel("fa3_single_split", lambda: _make_vllm_flash_attn_kernel(3, num_splits=1))
 
 
 @cache
@@ -227,6 +229,7 @@ def _maskless_attention_impl(
         raise ValueError("Maskless attention requires an integral GQA ratio.")
     heads, head_dim = q.shape[2], q.shape[3]
     kernel = get_pass_kernel(kernel_name)
+    same_view_kernel = get_pass_kernel("fa3_single_split") if kernel_name == "fa3" else kernel
     merge = _merge_step_for(q.device)
     # Preserve the caller's tensor mode: HSDP/offload use no_grad() and need
     # outputs with version counters.  Only the passes and the accumulators are
@@ -250,7 +253,8 @@ def _maskless_attention_impl(
             queries = q[0] if identity_q else q[0].index_select(0, q_index)
             if not identity_k:
                 keys, values = keys.index_select(0, k_index), values.index_select(0, k_index)
-            out, lse = kernel(
+            pass_kernel = same_view_kernel if index == 0 else kernel
+            out, lse = pass_kernel(
                 queries,
                 keys,
                 values,
