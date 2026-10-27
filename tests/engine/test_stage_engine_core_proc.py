@@ -32,6 +32,19 @@ def test_ordered_abort_supports_scheduler_without_overflow_fences(mocker):
     engine.scheduler.finish_requests.assert_called_once_with(["request"], RequestStatus.FINISHED_ABORTED)
 
 
+def test_legacy_release_stays_on_scheduler_adapter(mocker):
+    engine = StageEngineCoreProc.__new__(StageEngineCoreProc)
+    engine.scheduler = mocker.Mock(spec=Scheduler)
+    engine.scheduler._native_data_plane = False
+    engine.scheduler.chunk_transfer_adapter = mocker.Mock()
+    engine.model_executor = mocker.Mock(spec=UniProcExecutor)
+
+    engine.omni_release_request_resources(["request"])
+
+    engine.scheduler.chunk_transfer_adapter.release_shm_resources.assert_called_once_with("request")
+    engine.model_executor.collective_rpc.assert_not_called()
+
+
 class WrappedUniProcExecutor(UniProcExecutor):
     pass
 

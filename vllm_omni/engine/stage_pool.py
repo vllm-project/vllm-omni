@@ -9,12 +9,14 @@ import asyncio
 import time as _time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, cast
 
 from vllm.logger import init_logger
 from vllm.v1.engine import EngineCoreOutputs
 from vllm.v1.metrics.stats import IterationStats
 
+from vllm_omni.core.sched.omni_scheduling_coordinator import uses_native_mrv2_data_plane
 from vllm_omni.data_entry_keys import flatten_payload
 from vllm_omni.distributed.omni_coordinator import (
     LoadBalancer,
@@ -29,6 +31,7 @@ from vllm_omni.engine.stage_client import (
     StagePoolDiffusionClient,
     StagePoolLLMClient,
 )
+from vllm_omni.errors import OmniClientError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniInteractionPrompt
 from vllm_omni.metrics import (
     count_audio_frames,
@@ -139,12 +142,15 @@ class StagePool:
         self._output_processor = output_processor
         self._stage_vllm_config = stage_vllm_config
         self.collect_stage_metrics = True
+        model_config = getattr(stage_vllm_config, "model_config", None)
         self._has_chunk_transfer_adapter = bool(
-            getattr(getattr(stage_vllm_config, "model_config", None), "async_chunk", False)
+            getattr(model_config, "async_chunk", False)
+        ) or uses_native_mrv2_data_plane(
+            model_config, use_v2_model_runner=bool(getattr(model_config, "use_v2_model_runner", False))
         )
-        # Per-replica release batching: ids waiting for the replica's next RPC
-        # and the task sending them (also the strong reference keeping it alive).
-        self._pending_releases: dict[int, dict[str, None]] = {}
+        # Keep IDs fenced until release succeeds. False means queued; True
+        # means attempted (in flight or outcome unknown), so it must not retry.
+        self._pending_releases: dict[int, dict[str, bool]] = {}
         self._release_flushers: dict[int, asyncio.Task[None]] = {}
         self._next_replica_id = 0
         self._request_bindings: dict[str, int] = {}
@@ -1048,6 +1054,11 @@ class StagePool:
         expected_replica_id: int | None = None,
     ) -> int:
         """Submit a stage-entry request into this pool."""
+        if any(request_id in pending for pending in self._pending_releases.values()):
+            raise OmniClientError(
+                f"stage {self.stage_id} prior transport release for {request_id} is pending or its outcome is unknown",
+                status_code=HTTPStatus.CONFLICT.value,
+            )
         params = params_override if params_override is not None else req_state.sampling_params_list[self.stage_id]
         # Direct engine callers may provide plain vLLM SamplingParams.
         if self.stage_type == "diffusion":
@@ -1424,18 +1435,22 @@ class StagePool:
             return
         for replica_id in self.live_replica_ids():
             pending = self._pending_releases.setdefault(replica_id, {})
-            pending.update(dict.fromkeys(request_ids))
-            if replica_id not in self._release_flushers:
+            for request_id in request_ids:
+                pending.setdefault(request_id, False)
+            if replica_id not in self._release_flushers and not all(pending.values()):
                 self._release_flushers[replica_id] = loop.create_task(self._flush_replica_releases(replica_id))
 
     async def _flush_replica_releases(self, replica_id: int) -> None:
         pending = self._pending_releases[replica_id]
         try:
-            while pending:
+            while True:
                 # Let completions handled in this loop pass join the batch.
                 await asyncio.sleep(0)
-                ids = list(pending)
-                pending.clear()
+                ids = [request_id for request_id, attempted in pending.items() if not attempted]
+                if not ids:
+                    return
+                for request_id in ids:
+                    pending[request_id] = True
                 # Resolve the client per RPC: the replica may have been removed or replaced.
                 client = self.clients[replica_id] if replica_id < len(self.clients) else None
                 call = getattr(client, "call_utility_async", None)
@@ -1452,10 +1467,14 @@ class StagePool:
                         replica_id,
                         e,
                     )
+                else:
+                    for request_id in ids:
+                        del pending[request_id]
         finally:
             # No await from here on, so a concurrent schedule cannot slip in
             # between: the next one starts a fresh batch and sender.
-            del self._pending_releases[replica_id]
+            if not pending:
+                del self._pending_releases[replica_id]
             del self._release_flushers[replica_id]
 
     async def collective_rpc(

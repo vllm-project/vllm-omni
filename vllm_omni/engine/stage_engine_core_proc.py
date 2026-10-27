@@ -161,6 +161,9 @@ class StageEngineCoreProc(EngineCoreProc):
         Invoked over the UTILITY channel by the orchestrator once every stage
         has finished with the request. Idempotent and safe for unknown ids.
         """
+        if getattr(self.scheduler, "_native_data_plane", False):
+            self.model_executor.collective_rpc("release_request_resources", args=(request_ids,))
+            return
         adapter = getattr(getattr(self, "scheduler", None), "chunk_transfer_adapter", None)
         if adapter is None:
             return

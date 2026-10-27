@@ -36,6 +36,7 @@ from vllm_omni.engine.messages import (
 from vllm_omni.engine.orchestrator import (
     Orchestrator,
     OrchestratorRequestState,
+    build_engine_core_request_from_tokens,
     cleanup_request_artifact_dirs,
 )
 from vllm_omni.engine.stage_pool import StageUnavailableError
@@ -586,6 +587,68 @@ def _register_request(orchestrator: Orchestrator, request_id: str, *, submitted_
     if submitted_stage is not None:
         state.stage_submit_ts[submitted_stage] = time.time()
     orchestrator.request_states[request_id] = state
+
+
+@pytest.mark.asyncio
+async def test_pending_release_rejects_reuse_without_failing_the_stage(mocker):
+    gate = asyncio.Event()
+    started = asyncio.Event()
+
+    class GatedReleaseStage(FakeStageClient):
+        async def call_utility_async(self, method, request_ids):
+            assert method == "omni_release_request_resources"
+            started.set()
+            await gate.wait()
+
+    stage = GatedReleaseStage(final_output=True)
+    config = mocker.Mock(model_config=mocker.Mock(async_chunk=True, max_model_len=64))
+    pools = _build_stage_pools([[stage]], stage_vllm_configs=[config])
+    orchestrator, queues = _build_bare_orchestrator(pools)
+    pool = pools[0]
+
+    async def submit(request_id):
+        params = _sampling_params()
+        prompt = {"prompt_token_ids": [1, 2]}
+        await orchestrator._handle_add_request(
+            StageSubmissionMessage(
+                type="add_request",
+                request_id=request_id,
+                prompt=build_engine_core_request_from_tokens(request_id, prompt, params),
+                original_prompt=prompt,
+                output_prompt_text=None,
+                sampling_params_list=[params],
+                final_stage_id=0,
+                preprocess_ms=0,
+                request_timestamp=0,
+                enqueue_ts=0,
+            )
+        )
+
+    pool.schedule_release_request_resources(["reused"])
+    await asyncio.wait_for(started.wait(), timeout=2)
+    try:
+        await submit("reused")
+        error = queues[1].sync_q.get_nowait()
+        assert isinstance(error, ErrorMessage)
+        assert error.status_code == 409 and not error.fatal
+        assert "release" in error.error
+        assert "reused" not in orchestrator.request_states
+        assert not stage.add_request_calls
+        assert pool.is_replica_available(0)
+        await submit("independent")
+        assert len(stage.add_request_calls) == 1
+        gate.set()
+        await asyncio.wait_for(asyncio.gather(*pool._release_flushers.values()), timeout=2)
+        await submit("reused")
+        assert len(stage.add_request_calls) == 2
+        assert set(orchestrator.request_states) == {"reused", "independent"}
+    finally:
+        gate.set()
+        await orchestrator._cleanup_request_ids(list(orchestrator.request_states), abort=True)
+        await asyncio.wait_for(asyncio.gather(*pool._release_flushers.values()), timeout=2)
+        for q in queues:
+            q.close()
+            await q.wait_closed()
 
 
 @pytest.mark.asyncio
