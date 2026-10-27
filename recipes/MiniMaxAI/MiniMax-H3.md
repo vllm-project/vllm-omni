@@ -31,6 +31,30 @@ reference media is still encoded locally.
 
 The generated MP4 contains H.264 video and synchronized stereo audio.
 
+## Optional LiteVAE video decoder
+
+MiniMax-H3 can load a standard LiteVAE checkpoint in place of its video
+decoder. Add this setting to an existing serving command:
+
+```bash
+--additional-config '{"lightvae_decoder_path":"/weights/lightvae-lite-h3-decoder.safetensors"}'
+```
+
+Use the standard non-INT8 H3 Lite decoder checkpoint and make the file
+available to every decoding process. Merge the key into any existing
+`--additional-config` object. This is a service-startup setting, not a request
+parameter. Omit `video_vae_decoder` when selecting LiteVAE; explicit selection
+of both decoders is rejected. Removing the LiteVAE key restores the existing
+decoder selection after restart.
+
+The original video encoder and audio VAE remain unchanged. LiteVAE changes the
+video decoder model and can change generated pixels. See the
+[LiteVAE guide](../../docs/user_guide/diffusion/h3_lightvae_poc.md) for loading,
+measurement, and quality-review details, and the
+[NPU recipe](MiniMax-H3-NPU.md#litevae-measurements-8-ascend-910b4-npus)
+for measured T2VA results on Ascend 910B4. These measurements do not establish
+performance or quality on the GPU profiles in this recipe.
+
 ## Prerequisites
 
 The checkpoint requires Hugging Face access approval. Authenticate once;

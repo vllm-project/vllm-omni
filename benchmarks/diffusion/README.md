@@ -165,6 +165,21 @@ batch may still pay compile or CUDA-graph capture cost.
 For a Qwen-Image continuous-batching replay example, see
 [`performance_dashboard/qwen_image_serving_performance.md`](./performance_dashboard/qwen_image_serving_performance.md).
 
+## MiniMax-H3 LiteVAE decoder comparison
+
+Use [`bench_minimax_h3_vae.py`](bench_minimax_h3_vae.py) for isolated
+original/Lite decoder measurements on the same saved latent and comparison
+with the official Lite reference. It records raw timing samples, input and
+weight hashes, and unquantized output metrics. See the
+[LiteVAE guide](../../docs/user_guide/diffusion/h3_lightvae_poc.md#run-an-isolated-decoder-measurement)
+for commands, checkpoint requirements, and comparison gates.
+
+Keep single-device decoder benchmark results separate from serving video VAE
+stage timings and client-observed E2E latency. The
+[NPU recipe](../../recipes/MiniMaxAI/MiniMax-H3-NPU.md#litevae-measurements-8-ascend-910b4-npus)
+records an eight-rank T2VA example with both serving measurements. Neither
+speedup alone establishes original-versus-Lite visual quality.
+
 ## HunyuanImage3 reference-prefix reuse
 
 The prefix-cache benchmark uses the unified `vllm bench serve --omni` runner,

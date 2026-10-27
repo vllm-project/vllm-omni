@@ -32,6 +32,15 @@ Cache methods trade minimal quality for significant speedup. Quality loss is typ
 | **[TeaCache](diffusion/cache_acceleration/teacache.md)** | Adaptive caching using modulated inputs | Quick setup, balanced quality/speed on single GPU |
 | **[Cache-DiT](diffusion/cache_acceleration/cache_dit.md)** | Multiple caching techniques: DBCache, TaylorSeer, SCM | Fine-grained control, tunable quality-speed tradeoff |
 
+#### MiniMax-H3 LiteVAE Decoder
+
+[LiteVAE](diffusion/h3_lightvae_poc.md) is an optional MiniMax-H3 video
+decoder with reduced Transformer depth. It trades changes in generated pixels
+for lower decode latency while preserving the video encoder and audio VAE.
+Enable it through the deployment-level `additional_config.lightvae_decoder_path`
+setting. See the guide for checkpoint requirements, decoder selection rules,
+and separate decoder-stage and E2E measurement boundaries.
+
 #### Diffusion KV Prefix Caching
 
 [KV prefix caching](../design/feature/prefix_caching.md#diffusion-kv-prefix-caching)
