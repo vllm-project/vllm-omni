@@ -53,6 +53,7 @@ from vllm_omni.utils.speaker_cache import get_speaker_cache
 from .codebook_tower import TowerLayer, TowerRotary
 from .configuration_fish_omni import FishOmniConfig
 from .prompt import Reference, build_prompt_frames, prompt_length
+from .reference_sampling import ReferenceFrameSampler, reference_sampling_enabled, reference_sampling_fallback
 from .sampling import EMPTY_RAS_SLOT, RAS_TOP_K, RAS_WINDOW_FRAMES, FusedFrameSampler
 
 logger = init_logger(__name__)
@@ -155,6 +156,8 @@ class FishOmniBuffers:
         self.slot_temperature = torch.ones(max_num_seqs + 1, dtype=torch.float32, device=device)
         self.slot_top_k = torch.ones(max_num_seqs + 1, **long)
         self.slot_top_p = torch.ones(max_num_seqs + 1, dtype=torch.float32, device=device)
+        # Read only by reference sampling (hf_overrides fish_omni_reference_sampling).
+        self.slot_epsilon_cutoff = torch.zeros(max_num_seqs + 1, dtype=torch.float32, device=device)
         # Codes of each generated frame (int16: codes < 4096) and their count;
         # read back only when a request is preempted.
         self.slot_history = torch.zeros(
@@ -286,12 +289,21 @@ class FishOmniForConditionalGeneration(nn.Module, HasInnerState, IsHybrid):
             device=device,
         )
         self.max_top_k = max_top_k(config, self.codebook_size)
-        self.sampler = FusedFrameSampler(
-            max_top_k=self.max_top_k,
-            num_codebooks=self.num_codebooks,
-            max_rows=scheduler_config.max_num_seqs,
-            device=device,
-        )
+        self.reference_sampling = reference_sampling_enabled(config)
+        self.sampler: FusedFrameSampler | ReferenceFrameSampler
+        if self.reference_sampling:
+            self.sampler = ReferenceFrameSampler(
+                fallback=reference_sampling_fallback(config),
+                num_codebooks=self.num_codebooks,
+                width=max(len(candidate_ids), self.codebook_size),
+            )
+        else:
+            self.sampler = FusedFrameSampler(
+                max_top_k=self.max_top_k,
+                num_codebooks=self.num_codebooks,
+                max_rows=scheduler_config.max_num_seqs,
+                device=device,
+            )
         self.buffers.noise = self.sampler.noise(scheduler_config.max_num_seqs, device)
         # Requests of the step, set by the model state (None: dummy runs).
         self.num_sample_rows: int | None = None
@@ -467,17 +479,31 @@ class FishOmniForConditionalGeneration(nn.Module, HasInnerState, IsHybrid):
 
         sampler = self.sampler
         noise = buffers.noise[:num_samples]
-        main_tokens, code_zero = sampler.main_tokens(
-            hidden_states[sample_rows] @ self.lm_head.t(),
-            self.candidate_ids,
-            ras_window,
-            temperature,
-            top_k,
-            top_p,
-            noise,
-            self.semantic_begin_id,
-            self.codebook_size,
-        )
+        if isinstance(sampler, ReferenceFrameSampler):
+            main_tokens, code_zero = sampler.main_tokens(
+                hidden_states[sample_rows] @ self.lm_head.t(),
+                self.candidate_ids,
+                ras_window,
+                temperature,
+                top_k,
+                top_p,
+                buffers.slot_epsilon_cutoff[slots],
+                noise,
+                self.semantic_begin_id,
+                self.codebook_size,
+            )
+        else:
+            main_tokens, code_zero = sampler.main_tokens(
+                hidden_states[sample_rows] @ self.lm_head.t(),
+                self.candidate_ids,
+                ras_window,
+                temperature,
+                top_k,
+                top_p,
+                noise,
+                self.semantic_begin_id,
+                self.codebook_size,
+            )
 
         # Codes injected per token row: this step's draws on sampling rows
         # (gathered from the row's sample row), else the next prompt frame's.

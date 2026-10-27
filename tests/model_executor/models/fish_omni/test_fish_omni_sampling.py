@@ -16,6 +16,7 @@ import pytest
 import torch
 
 from tests.helpers.mark import hardware_marks
+from vllm_omni.model_executor.models.fish_omni.reference_sampling import ReferenceFrameSampler
 from vllm_omni.model_executor.models.fish_omni.sampling import EMPTY_RAS_SLOT, RAS_WINDOW_FRAMES, FusedFrameSampler
 
 pytestmark = [
@@ -140,3 +141,40 @@ def test_end_of_speech_is_never_redrawn():
 def test_repeat_outside_window_keeps_first_draw():
     tokens, _ = _sample(_logits(ARGMAX, OTHER_A), history=[ARGMAX] + [OTHER_B] * RAS_WINDOW_FRAMES)
     assert bool((tokens == ARGMAX).all())
+
+
+def test_reference_sampling_compiles_and_replays_as_it_runs_eagerly():
+    """The model compiles the sampler into its forward and replays decode steps as FULL CUDA
+    graphs; with the same noise, both must draw every code the eager step draws."""
+    rows = 8
+    generator = torch.Generator().manual_seed(13)
+    sampler = ReferenceFrameSampler(fallback="ras", num_codebooks=10, width=4096)
+    candidate_ids = torch.arange(1000, 1000 + 4096, device="cuda")
+    main_logits = (torch.randn(rows, 4096, generator=generator) * 2.0).cuda()
+    head_logits = (torch.randn(rows, 4096, generator=generator) * 2.0).cuda()
+    window = torch.full((rows, RAS_WINDOW_FRAMES), EMPTY_RAS_SLOT, device="cuda")
+    window[::2, 3] = candidate_ids[main_logits[::2].argmax(dim=-1)]
+    temperature, top_k, top_p = _rows(1.0, rows=rows), _rows(-1, torch.long, rows), _rows(1.0, rows=rows)
+    epsilon_cutoff = _rows(1e-3, rows=rows)
+    noise = sampler.noise(rows, torch.device("cuda"))
+
+    def step():
+        main_tokens, code_zero = sampler.main_tokens(
+            main_logits, candidate_ids, window, temperature, top_k, top_p, epsilon_cutoff, noise, 1001, 4096
+        )
+        codes = [sampler.code(head_logits, temperature, top_k, top_p, noise, index) for index in range(9)]
+        return torch.stack([main_tokens, code_zero, *codes])
+
+    eager = step()
+    assert torch.equal(torch.compile(step, fullgraph=True)(), eager)
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        step()
+    torch.cuda.current_stream().wait_stream(side)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = step()
+    noise.uniform_(generator=None)
+    graph.replay()
+    assert torch.equal(captured, step())
