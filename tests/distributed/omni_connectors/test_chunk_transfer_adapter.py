@@ -2845,6 +2845,7 @@ def test_generation_scheduler_calls_cleanup_on_finished(monkeypatch, mocker: Moc
     scheduler.structured_output_manager = mocker.MagicMock()
     scheduler.structured_output_manager.accept_tokens.return_value = True
     scheduler.finished_req_ids_dict = {}
+    scheduler.finished_req_ids = set()
     scheduler.kv_cache_manager.take_events.return_value = None
     scheduler.kv_cache_manager.estimate_cached_tokens.return_value = 0
     scheduler.kv_event_publisher = mocker.MagicMock()
@@ -2883,6 +2884,7 @@ def test_generation_scheduler_calls_cleanup_on_finished(monkeypatch, mocker: Moc
         num_scheduled_tokens={"req-s1": 10},
         scheduled_spec_decode_tokens={},
         num_invalid_spec_tokens=0,
+        finished_req_ids=set(),
     )
     model_runner_output = SimpleNamespace(
         sampled_token_ids=None,
@@ -3436,6 +3438,7 @@ def _build_deferred_finish_scheduler(mocker, *, running, pending_finish_reqs):
     scheduler.structured_output_manager = mocker.MagicMock()
     scheduler.structured_output_manager.accept_tokens.return_value = True
     scheduler.finished_req_ids_dict = {}
+    scheduler.finished_req_ids = set()
     scheduler.kv_cache_manager.take_events.return_value = None
     scheduler.kv_cache_manager.estimate_cached_tokens.return_value = 0
     scheduler.kv_event_publisher = mocker.MagicMock()
@@ -3454,6 +3457,7 @@ def _build_deferred_finish_scheduler(mocker, *, running, pending_finish_reqs):
         num_scheduled_tokens={},
         scheduled_spec_decode_tokens={},
         num_invalid_spec_tokens=0,
+        finished_req_ids=set(),
     )
     model_runner_output = SimpleNamespace(
         sampled_token_ids=None,

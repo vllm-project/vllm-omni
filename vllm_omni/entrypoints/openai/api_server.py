@@ -969,6 +969,7 @@ async def omni_init_app_state(
         state.openai_serving_speech = OmniOpenAIServingSpeech.for_diffusion(
             diffusion_engine=engine_client,
             model_name=model_name,
+            served_model_names=served_model_names,
             stage_configs=diffusion_stage_configs,
             speech_cache_config=speech_cache_config,
             allowed_local_media_path=getattr(args, "allowed_local_media_path", ""),

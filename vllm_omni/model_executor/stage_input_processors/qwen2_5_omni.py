@@ -229,13 +229,14 @@ def thinker2talker_full_payload(
     consumes the same payload layout from either path.
 
     Like ``qwen3_omni.thinker2talker_full_payload``, we apply a
-    finish-reason-aware stop-row trim: vLLM v1 appends the sampled
-    token to ``output_token_ids`` before ``check_stop``, so a request
-    that finished via ``FINISHED_STOPPED`` has one extra accumulated
-    hidden-state row that the talker must not consume.  Max-token
-    finishes need no drop.  Status is read from the request when
-    available; otherwise we fall back to a last-token-in-stop-set
-    heuristic.
+    finish-reason-aware stop-token trim.  The sampled token that closes
+    generation has no subsequent decode forward, so it has no matching
+    hidden-state row.  For ``FINISHED_STOPPED`` that token is the stop token
+    and is removed explicitly.  For a length cap it may be a normal text
+    token, so the final alignment step below trims any trailing token ids that
+    have no captured decode row.  This matches the Hugging Face generation
+    output contract, which conditions the talker only on represented rows and
+    then appends text EOS and pad embeddings.
     """
     del transfer_manager
     rid = getattr(request, "request_id", "?")
@@ -276,7 +277,7 @@ def thinker2talker_full_payload(
 
     # Length-aware trim of accumulated thinker output, finish-reason-aware.
     # Mirror qwen3_omni.thinker2talker_full_payload's logic so a stop-finish
-    # does not leak an extra hidden-state row to the talker.
+    # does not leak a terminal token id without a matching hidden-state row.
     status = getattr(request, "status", None)
     status_name = getattr(status, "name", None) or ""
     if not status_name and status is not None:
@@ -310,10 +311,10 @@ def thinker2talker_full_payload(
                 stop_emission_drop = 1
 
     # Trim accumulated thinker output based on stop_emission_drop computed
-    # above.  Mirror qwen3_omni.thinker2talker_full_payload's contract:
-    #   target_rows = len(all_token_ids) - stop_emission_drop
-    # which excludes the stop-emission row for FINISHED_STOPPED but keeps
-    # all rows for FINISHED_LENGTH_CAPPED (max_tokens) finishes.
+    # above.  This excludes the stop token for FINISHED_STOPPED.  A
+    # FINISHED_LENGTH_CAPPED request is reconciled against the actually
+    # captured decode rows below because its final sampled token has no later
+    # forward pass.
     if stop_emission_drop > 0 and len(output_token_ids) >= stop_emission_drop:
         output_token_ids = output_token_ids[:-stop_emission_drop]
     h = hidden.detach().cpu().to(torch.float32)
@@ -351,8 +352,24 @@ def thinker2talker_full_payload(
         )
         return None
 
+    decode_rows = int(h.shape[0]) - prompt_len
+    if len(output_token_ids) > decode_rows:
+        missing_rows = len(output_token_ids) - decode_rows
+        log_level = logging.DEBUG if status_name == "FINISHED_LENGTH_CAPPED" and missing_rows == 1 else logging.WARNING
+        logger.log(
+            log_level,
+            "qwen2_5_omni.thinker2talker_full_payload: output token ids exceed "
+            "captured decode rows (tokens=%d, rows=%d, status=%s) for req=%s; "
+            "trimming trailing unrepresented token ids",
+            len(output_token_ids),
+            decode_rows,
+            status_name or "unknown",
+            getattr(request, "request_id", "?"),
+        )
+        output_token_ids = output_token_ids[:decode_rows]
+
     prefill_hidden = h[:prompt_len]
-    decode_hidden = h[prompt_len:]
+    decode_hidden = h[prompt_len : prompt_len + len(output_token_ids)]
 
     payload = to_dict(
         OmniPayloadStruct(

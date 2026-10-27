@@ -1,7 +1,7 @@
 [
   {
     "test_name": "test_minicpmo_4_5",
-    "description": "Chat C1/C4/C8 baselines incorporate non-regressing equal-weight nightly means for 2026-10-08 through 2026-10-14 (H100: 7 days; A3: 6 days; no added margin); A3 C4 mean_ttft_ms uses the window mean with an explicitly approved regression; other regressing A3 values are retained. C16/C32 references use H100 Buildkite build 17017 (commit c5e0bd7c2c3dd297adfbf36a40f3b7a19bf94d24) and A3 vllm-omni-npu-ci build 8873 (commit 26237d470651a841534abbddfb70301580a0227d): request_throughput is measured x 0.90, latency and audio RTF are measured x 1.10, rounded to 4 decimals. These historical runs are reference measurements, not validation of the current revision. B200 remains without a baseline pending measurements.",
+    "description": "Chat C1/C4/C8 baselines incorporate non-regressing equal-weight nightly means for 2026-10-08 through 2026-10-14 (H100: 7 days; A3: 6 days; no added margin); A3 C4 mean_ttft_ms uses the window mean with an explicitly approved regression; other regressing A3 values are retained. C16/C32 references use H100 Buildkite build 17017 (commit c5e0bd7c2c3dd297adfbf36a40f3b7a19bf94d24) and A3 vllm-omni-npu-ci build 8873 (commit 26237d470651a841534abbddfb70301580a0227d): request_throughput is measured x 0.90, latency and audio RTF are measured x 1.10, rounded to 4 decimals. These historical runs are reference measurements, not validation of the current revision. A3 C8 mean_ttft_ms supersedes the window reference with 624.6985 ms: issue #9095 reports 567.9077 ms on 2026-10-18 at commit 72a665bbe8b4fb035baf56516d643b7fd1f6b039, multiplied by 1.10 and rounded to 4 decimals. B200 remains without a baseline pending measurements.",
     "mark": [
       {
         "hardware_marks": {
@@ -107,7 +107,7 @@
             "mean_ttft_ms": [
               324.7352,
               623.6599,
-              506.3193,
+              624.6985,
               644.0404,
               719.7749
             ],

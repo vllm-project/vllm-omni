@@ -61,6 +61,23 @@ OMNI_PROCESSOR_TEST = "tests/model_executor/models/test_omni_processing.py"
 OMNI_PROCESSOR_TIMING_ENV = "VLLM_OMNI_AMD_PROCESSOR_TIMING"
 QWEN_IMAGE_SMOKE_LABEL = "Qwen-Image Official-Weight Smoke"
 QWEN_IMAGE_SMOKE_NODE = "tests/e2e/online_serving/test_qwen_image.py::test_text_to_image_001[default]"
+TINY_DIFFUSION_PATH = "tests/model_tests/diffusion/test_common_offline.py"
+TINY_DIFFUSION_JOBS = (
+    (
+        "ROCm · Tiny Diffusion Multi-GPU · 2-GPU",
+        "mi300_2",
+        12,
+        "full_model and diffusion and rocm and MI325 and cards_2 and not nvidia_only",
+        "artifacts/rocm-tiny-diffusion-2gpu/**/*",
+    ),
+    (
+        "ROCm · Tiny Diffusion Multi-GPU · 4-GPU",
+        "mi300_4",
+        11,
+        "full_model and diffusion and rocm and MI325 and cards_4 and not nvidia_only",
+        "artifacts/rocm-tiny-diffusion-4gpu/**/*",
+    ),
+)
 
 COMBINER_SPEC = spec_from_file_location("combine_test_suites", AMD_SUITE_COMBINER)
 assert COMBINER_SPEC is not None and COMBINER_SPEC.loader is not None
@@ -683,6 +700,51 @@ def test_amd_collection_guard_rejects_empty_and_changed_collections() -> None:
     assert 'pytest --collect-only -q "$@"' in guard
     assert "^tests\\/.*::" in guard
     assert '"${actual_count}" != "${expected_count}"' in guard
+
+
+@pytest.mark.parametrize(("label", "agent_pool", "expected_count", "markers", "artifacts"), TINY_DIFFUSION_JOBS)
+def test_tiny_diffusion_multigpu_nightly_uses_native_rocm_collection(
+    label: str,
+    agent_pool: str,
+    expected_count: int,
+    markers: str,
+    artifacts: str,
+) -> None:
+    step = _find_step(label, AMD_NIGHTLY_PIPELINE)
+
+    assert step["agent_pool"] == agent_pool
+    assert step["mirror_hardwares"] == ["amdproduction"]
+    assert step["grade"] == "NonBlocking"
+    assert step["timeout_in_minutes"] == 40
+    assert step["artifact_paths"] == [artifacts]
+    assert "retry" not in step
+
+    commands = step["commands"]
+    collect_commands = [command for command in commands if AMD_COLLECTION_GUARD.name in command]
+    run_commands = [command for command in commands if "pytest -s" in command]
+    assert len(collect_commands) == 1
+    assert len(run_commands) == 1
+
+    collect_command = collect_commands[0]
+    run_command = run_commands[0]
+    collect_argv = split(collect_command)
+    run_argv = split(run_command)
+    assert collect_argv[:2] == ["bash", str(AMD_COLLECTION_GUARD)]
+    assert collect_argv[2] == str(expected_count)
+
+    for command, argv in ((collect_command, collect_argv), (run_command, run_argv)):
+        assert TINY_DIFFUSION_PATH in argv
+        assert _marker_expressions({"commands": [command]}) == [markers]
+        assert argv[argv.index("--run-level") + 1] == "core_model"
+
+    for cuda_marker in ("cuda", "L4", "H100", "B200"):
+        assert re.search(rf"\b{cuda_marker}\b", markers) is None
+
+    all_commands = "\n".join(commands)
+    assert "collection.txt" in all_commands
+    assert "pytest.xml" in all_commands
+    assert "pytest.log" in all_commands
+    assert "pytest-summary.txt" in all_commands
 
 
 def test_wan_sdpa_alignment_cpu_case_stays_shared_and_cuda_kernel_stays_nvidia() -> None:
@@ -1419,3 +1481,24 @@ def test_qwen3_omni_seed_tts_realtime_perf_is_one_nonblocking_nightly_job() -> N
     for pipeline_path in (AMD_READY_PIPELINE, AMD_MERGE_PIPELINE):
         text = pipeline_path.read_text(encoding="utf-8")
         assert "Qwen3-Omni Seed-TTS Realtime Perf" not in text
+
+
+def test_omni_duplex_eval_is_one_nonblocking_nightly_job() -> None:
+    step = _find_step("MiniCPM-o Omni-DuplexEval CI Guard", AMD_NIGHTLY_PIPELINE)
+    assert step["grade"] == "NonBlocking"
+    assert step["agent_pool"] == "mi300_2"
+    assert step["mirror_hardwares"] == ["amdproduction"]
+    assert step["timeout_in_minutes"] == 240
+    commands = "\n".join(step["commands"])
+    assert "full_model and omni and rocm and MI325 and cards_2" in commands
+    assert "--run-level full_model" in commands
+    assert "--collect-only" in commands
+    assert "exit 5" in commands
+    assert "pytest.xml" in commands
+    assert step["env"]["BENCHMARK_DIR"] == "tests/dfx/perf/results"
+    assert step["env"]["ACC_BENCH_RESULT_DIR"] == "tests/e2e/accuracy/omni_duplex_eval/results"
+    assert "test_minicpmo_4_5_omni_duplex_eval.json" in commands
+    assert "Expected exactly one MiniCPM-o Omni-DuplexEval node" in commands
+    for pipeline_path in (AMD_READY_PIPELINE, AMD_MERGE_PIPELINE):
+        text = pipeline_path.read_text(encoding="utf-8")
+        assert "MiniCPM-o Omni-DuplexEval CI Guard" not in text

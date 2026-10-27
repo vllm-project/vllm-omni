@@ -31,6 +31,21 @@ _DEPLOY_DIR = Path(__file__).resolve().parent.parent / "deploy"
 
 _STAGE_OVERRIDE_PATTERN = re.compile(r"^stage_(\d+)_(.+)$")
 
+_RUNTIME_ONLY_OVERRIDE_FIELDS = frozenset(
+    {
+        "devices",
+        "max_batch_size",
+        "num_replicas",
+    }
+)
+
+_TOPOLOGY_OWNED_ENGINE_FIELDS = frozenset(
+    {
+        "requires_full_payload_input",
+        "scheduling_metadata_adapter",
+    }
+)
+
 
 def _normalize_stage_backend_fields(stage: StageDeployConfig) -> None:
     """Normalize promoted backends and enforce their precedence over extras."""
@@ -417,6 +432,9 @@ class StagePipelineConfig:
     # skips this stage and enters at stage 1 (e.g. Qwen3-ASR runs only for
     # requests with audio). Empty means every request runs it.
     bypass_without_modalities: tuple[str, ...] = ()
+    # Optional model-owned adapter for runner payload metadata that affects
+    # scheduling. The scheduler only receives its typed effects.
+    scheduling_metadata_adapter: str | None = None
     extras: dict[str, Any] = field(default_factory=dict)
 
 
@@ -1382,6 +1400,7 @@ def _build_engine_args(
         engine_args["supports_running_prefix_cache_reset"] = False
     if ps.execution_type is StageExecutionType.LLM_AR and ps.recompute_preemption != "allow":
         engine_args["recompute_preemption"] = ps.recompute_preemption
+    engine_args["scheduling_metadata_adapter"] = ps.scheduling_metadata_adapter
     return engine_args
 
 
@@ -1625,15 +1644,23 @@ class StageConfig:
         # rationale as the platform-overlay deep-merge. Legacy atomic mappings
         # are handled explicitly below.
         for key, value in runtime_overrides.items():
-            if value is not None and key not in ("devices", "max_batch_size", "num_replicas"):
-                existing = engine_args.get(key)
-                # ``omni_kv_config`` is an atomic legacy override: callers use
-                # a partial mapping to replace the topology-provided transfer
-                # role, rather than to add fields to it.
-                if key != "omni_kv_config" and isinstance(existing, dict) and isinstance(value, dict):
-                    engine_args[key] = _get_recursively_merged_dict(existing, value)
-                else:
-                    engine_args[key] = value
+            if value is None or key in _RUNTIME_ONLY_OVERRIDE_FIELDS:
+                continue
+            if key in _TOPOLOGY_OWNED_ENGINE_FIELDS:
+                logger.warning(
+                    "Stage %s: ignoring runtime override for topology-owned field '%s'; keeping the pipeline value.",
+                    self.stage_id,
+                    key,
+                )
+                continue
+            existing = engine_args.get(key)
+            # ``omni_kv_config`` is an atomic legacy override: callers use
+            # a partial mapping to replace the topology-provided transfer
+            # role, rather than to add fields to it.
+            if key != "omni_kv_config" and isinstance(existing, dict) and isinstance(value, dict):
+                engine_args[key] = _get_recursively_merged_dict(existing, value)
+            else:
+                engine_args[key] = value
 
         # Terminal-stage ownership comes from topology, not engine overrides.
         engine_args["final_output"] = self.final_output
