@@ -15,6 +15,7 @@ from vllm_omni.diffusion.sched.interface import (
     SchedulerRequestState,
     _AdmissionWaitDecision,
 )
+from vllm_omni.lora.utils import build_lora_batch_key
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.worker.utils import BaseRunnerOutput
@@ -23,7 +24,7 @@ if TYPE_CHECKING:
 # on sampling params, so it must be resolved separately from the bulk lookup.
 _REQUEST_BATCH_SAMPLING_PARAMS_KEY_FIELD_NAMES = frozenset(
     field.name for field in fields(RequestBatchSamplingParamsKey)
-) - {"condition_key", "flow_shift", "lora_int_id", "sample_solver"}
+) - {"condition_key", "flow_shift", "lora_key", "sample_solver"}
 
 
 def _normalize_explicit_sample_solver(value: object | None) -> str | None:
@@ -53,7 +54,7 @@ def build_request_batch_sampling_params_key(request: OmniDiffusionRequest) -> Re
     key_kwargs["sample_solver"] = _normalize_explicit_sample_solver(extra_args.get("sample_solver"))
     key_kwargs["flow_shift"] = _normalize_explicit_flow_shift(extra_args.get("flow_shift"))
     key_kwargs["condition_key"] = getattr(request, "batch_compatibility_key", None)
-    key_kwargs["lora_int_id"] = lora_request.lora_int_id if lora_request is not None else None
+    key_kwargs["lora_key"] = build_lora_batch_key(lora_request, getattr(sampling, "lora_scale", None))
     return RequestBatchSamplingParamsKey(**key_kwargs)
 
 

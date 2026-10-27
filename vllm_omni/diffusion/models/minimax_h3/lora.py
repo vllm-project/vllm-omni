@@ -1,14 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-"""Loader for the LightX2V Turbo MiniMax-H3 LoRA family.
-
-The published artifacts differ in task family, step count, training resolution
-and LoRA alpha, so :class:`TurboSpec` carries the contract of the file actually
-loaded and the pipeline validates each request against it. Only the
-Diffusers-PEFT exports are served. The native FlashGen contract lives in
-``.npu.lora``.
-"""
+"""Load MiniMax-H3 Turbo and native H3 LoRA adapters."""
 
 from __future__ import annotations
 
@@ -20,14 +13,17 @@ import regex as re
 import torch
 from safetensors import safe_open
 from vllm.logger import init_logger
+from vllm.lora.layers import BaseLayerWithLoRA
 from vllm.lora.lora_model import LoRAModel
-from vllm.lora.lora_weights import PackedLoRALayerWeights
+from vllm.lora.lora_weights import LoRALayerWeights, PackedLoRALayerWeights
 from vllm.lora.peft_helper import PEFTHelper
+from vllm.model_executor.layers.linear import LinearBase, MergedColumnParallelLinear, QKVParallelLinear
 from vllm.model_executor.models.utils import WeightsMapper
 
 from vllm_omni.lora.request import LoRARequest
 
 logger = init_logger(__name__)
+
 
 _TURBO_RANK = 128
 _TURBO_HIDDEN_SIZE = 5376
@@ -328,3 +324,105 @@ def load_minimax_h3_turbo_lora(
         spec.audio_shift,
     )
     return lora_model, peft_helper, spec
+
+
+_NATIVE_LORA_KEY = re.compile(
+    r"^(?P<module>.+)\.(?P<kind>lora_A|lora_B|lora_down|lora_up|alpha)"
+    r"(?:\.default)?(?:\.weight)?$"
+)
+
+
+def load_minimax_h3_native_adapter(
+    *,
+    transformer: torch.nn.Module,
+    lora_request: LoRARequest,
+    lora_path: str | Path,
+    dtype: torch.dtype,
+    unsupported_offload_mode: str | None = None,
+) -> tuple[LoRAModel, PEFTHelper] | None:
+    """Load native H3 single-file LoRAs with ComfyUI scaling semantics."""
+    path = Path(lora_path)
+    if path.is_dir():
+        if (path / "adapter_config.json").is_file():
+            return None
+        candidates = sorted(path.glob("*.safetensors"))
+        if not candidates:
+            return None
+        if len(candidates) != 1:
+            raise ValueError("Multiple H3 LoRA files found; select one .safetensors file.")
+        path = candidates[0]
+    if path.suffix != ".safetensors" or not path.is_file():
+        return None
+
+    targets: dict[str, tuple[int, tuple[int, ...]]] = {}
+    for name, module in transformer.named_modules():
+        if name.endswith(".base_layer"):
+            continue
+        if isinstance(module, BaseLayerWithLoRA):
+            module = module.base_layer
+        if isinstance(module, LinearBase):
+            output_sizes = (
+                tuple(module.output_sizes)
+                if isinstance(module, (QKVParallelLinear, MergedColumnParallelLinear))
+                else (module.output_size,)
+            )
+            targets[name] = (module.input_size, output_sizes)
+
+    grouped: dict[str, dict[str, torch.Tensor]] = {}
+    with safe_open(path, framework="pt", device="cpu") as checkpoint:
+        keys = list(checkpoint.keys())
+        if not any(_NATIVE_LORA_KEY.fullmatch(key) for key in keys):
+            return None
+        if unsupported_offload_mode is not None:
+            raise ValueError(f"MiniMax-H3 native LoRA does not support {unsupported_offload_mode}")
+        for key in keys:
+            match = _NATIVE_LORA_KEY.fullmatch(key)
+            if match is None:
+                raise ValueError(f"Unsupported H3 LoRA tensor: {key}")
+            name = match["module"]
+            for prefix in ("base_model.model.", "model.diffusion_model.", "diffusion_model.", "transformer."):
+                name = name.removeprefix(prefix)
+            if name not in targets:
+                raise ValueError(f"H3 LoRA target does not exist in the model: {key}")
+            kind = {"lora_A": "A", "lora_down": "A", "lora_B": "B", "lora_up": "B", "alpha": "alpha"}[match["kind"]]
+            parts = grouped.setdefault(name, {})
+            if kind in parts:
+                raise ValueError(f"Duplicate H3 LoRA weight: {key}")
+            parts[kind] = checkpoint.get_tensor(key)
+
+    loras: dict[str, LoRALayerWeights] = {}
+    for name, parts in grouped.items():
+        if "A" not in parts or "B" not in parts:
+            raise ValueError(f"H3 LoRA requires both A and B weights for {name}")
+        a, b = parts["A"], parts["B"]
+        input_size, output_sizes = targets[name]
+        if (
+            a.ndim != 2
+            or b.ndim != 2
+            or a.shape[0] < 1
+            or b.shape != (sum(output_sizes), a.shape[0])
+            or a.shape[1] != input_size
+        ):
+            raise ValueError(f"H3 LoRA shape mismatch for {name}: A={tuple(a.shape)}, B={tuple(b.shape)}")
+        rank = a.shape[0]
+        alpha_tensor = parts.get("alpha")
+        if alpha_tensor is not None and alpha_tensor.numel() != 1:
+            raise ValueError(f"H3 LoRA alpha must be scalar for {name}")
+        alpha = rank if alpha_tensor is None else float(alpha_tensor.item())
+        if not math.isfinite(alpha):
+            raise ValueError(f"H3 LoRA alpha must be finite for {name}")
+        a, b = a.to(dtype=dtype), b.to(dtype=dtype)
+        if len(output_sizes) == 1:
+            loras[name] = LoRALayerWeights(name, rank, alpha, a, b, scaling=alpha / rank)
+        else:
+            loras[name] = PackedLoRALayerWeights(
+                module_name=name,
+                rank=rank,
+                lora_alphas=[alpha] * len(output_sizes),
+                lora_a=[a] * len(output_sizes),
+                lora_b=[part.contiguous() for part in b.split(output_sizes, dim=0)],
+                scaling=[alpha / rank] * len(output_sizes),
+            )
+    rank = max(weights.rank for weights in loras.values())
+    helper = PEFTHelper.from_dict({"r": rank, "lora_alpha": rank, "target_modules": list(loras)})
+    return LoRAModel(lora_request.lora_int_id, rank, loras), helper

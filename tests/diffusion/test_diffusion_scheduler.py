@@ -337,6 +337,57 @@ class TestGetStepBatchSamplingParamsKey:
 
         assert scheduler._build_sampling_params_key(a) != scheduler._build_sampling_params_key(b)
 
+    @staticmethod
+    def _make_stacked(
+        lora_int_ids: list[int],
+        lora_scales: list[float],
+    ) -> OmniDiffusionRequest:
+        from vllm_omni.lora.request import LoRARequest
+
+        sp = OmniDiffusionSamplingParams(num_inference_steps=2)
+        sp.lora_request = [
+            LoRARequest(
+                lora_name=f"adapter-{lora_int_id}",
+                lora_int_id=lora_int_id,
+                lora_path=f"/tmp/lora-{lora_int_id}",
+            )
+            for lora_int_id in lora_int_ids
+        ]
+        sp.lora_scale = lora_scales
+        return OmniDiffusionRequest(
+            prompt="prompt",
+            sampling_params=sp,
+            request_id=f"req-stacked-{'-'.join(map(str, lora_int_ids))}",
+        )
+
+    def test_stacked_lora_list_order_invariant(self) -> None:
+        """The same adapter combination in different list order batches together."""
+        scheduler = _ConcreteScheduler()
+        a = scheduler._build_sampling_params_key(self._make_stacked([1, 2], [0.5, 1.0]))
+        b = scheduler._build_sampling_params_key(self._make_stacked([2, 1], [1.0, 0.5]))
+        assert a == b
+
+    def test_stacked_lora_matches_equivalent_single(self) -> None:
+        """A single-element LoRA list batches together with the scalar form."""
+        scheduler = _ConcreteScheduler()
+        a = scheduler._build_sampling_params_key(self._make(lora_int_id=1, lora_scale=0.5))
+        b = scheduler._build_sampling_params_key(self._make_stacked([1], [0.5]))
+        assert a == b
+
+    def test_stacked_lora_distinguishes_combination_and_scale(self) -> None:
+        scheduler = _ConcreteScheduler()
+        base = scheduler._build_sampling_params_key(self._make_stacked([1, 2], [0.5, 1.0]))
+        assert base != scheduler._build_sampling_params_key(self._make_stacked([1, 3], [0.5, 1.0]))
+        assert base != scheduler._build_sampling_params_key(self._make_stacked([1, 2], [0.6, 1.0]))
+        assert base != scheduler._build_sampling_params_key(self._make(lora_int_id=1, lora_scale=0.5))
+
+    def test_stacked_lora_scale_rounding(self) -> None:
+        """Scales are rounded to 4 decimals before grouping."""
+        scheduler = _ConcreteScheduler()
+        a = scheduler._build_sampling_params_key(self._make_stacked([1], [0.50001]))
+        b = scheduler._build_sampling_params_key(self._make_stacked([1], [0.50002]))
+        assert a == b
+
 
 class TestGetRequestBatchSamplingParamsKey:
     """Tests for the request-batch compatibility key builder on RequestScheduler."""
@@ -2248,6 +2299,33 @@ class TestStepScheduler:
         admitted = _new_ids(sched_output)
         assert admitted == [req_with]
         assert req_without not in admitted
+        assert sched_output.num_waiting_reqs == 1
+
+    def test_step_batch_co_schedules_requests_sharing_lora_stack(self) -> None:
+        """Requests with the same stacked LoRA combination co-batch, regardless of list order."""
+        from vllm_omni.lora.request import LoRARequest
+
+        scheduler = StepScheduler()
+        scheduler.initialize(SimpleNamespace(max_num_seqs=3))
+
+        lora_a = LoRARequest(lora_name="adapter-A", lora_int_id=1, lora_path="/tmp/lora-a")
+        lora_b = LoRARequest(lora_name="adapter-B", lora_int_id=2, lora_path="/tmp/lora-b")
+
+        def _with_loras(req_id: str, loras: list, scales: list[float]) -> OmniDiffusionRequest:
+            sp = OmniDiffusionSamplingParams(num_inference_steps=4)
+            sp.lora_request = loras
+            sp.lora_scale = scales
+            return _make_step_request(req_id, sampling_params=sp)
+
+        req_ab = scheduler.add_request(_with_loras("ab", [lora_a, lora_b], [0.5, 1.0]))
+        req_ba = scheduler.add_request(_with_loras("ba", [lora_b, lora_a], [1.0, 0.5]))
+        req_a = scheduler.add_request(_with_loras("a-only", [lora_a], [0.5]))
+
+        sched_output = scheduler.schedule()
+
+        admitted = _new_ids(sched_output)
+        assert admitted == [req_ab, req_ba]
+        assert req_a not in admitted
         assert sched_output.num_waiting_reqs == 1
 
     def test_preempt_request_preserves_step_index(self) -> None:
