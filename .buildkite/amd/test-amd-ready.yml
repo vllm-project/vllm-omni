@@ -150,7 +150,11 @@ steps:
 
 - label: "Custom Pipeline Test"
   agent_pool: mi300_1
-  depends_on: amd-build
+  # FlashAttention stays soft-failed, so this step still runs when that job
+  # misses. prepare restores its artifact only after the publisher exits 0.
+  depends_on: amd-fa-aiter
+  env:
+    VLLM_OMNI_AITER_MHA_SAME_BUILD_STEP: amd-fa-aiter
   mirror_hardwares: [amdproduction]
   grade: Blocking
   commands:
@@ -175,6 +179,7 @@ steps:
     # A miss, and the varlen module, still compile there. One pytest worker
     # lets Mammoth reuse that directory instead of compiling again.
     - label: "ROCm · FlashAttention/AITER GPU Coverage"
+      key: amd-fa-aiter
       agent_pool: mi300_1
       depends_on: amd-build
       mirror_hardwares: [amdproduction]
@@ -235,7 +240,11 @@ steps:
 
     - label: "Diffusion · Batch Test"
       agent_pool: mi300_1
-      depends_on: amd-build
+      # Same soft-fail dependency as Custom Pipeline. The same-build restore
+      # is limited to the publisher job that exited 0.
+      depends_on: amd-fa-aiter
+      env:
+        VLLM_OMNI_AITER_MHA_SAME_BUILD_STEP: amd-fa-aiter
       mirror_hardwares: [amdproduction]
       grade: Blocking
       commands:
@@ -373,13 +382,12 @@ steps:
 
 - label: "ROCm · Model Executor GPU Coverage (R2-01) · Shard %N/%t"
   agent_pool: mi300_1
-  parallelism: 2
+  parallelism: 3
   depends_on: amd-build
   mirror_hardwares: [amdproduction]
   grade: NonBlocking
-  # Build 14388 at 798fef99 selected 1811 cases and completed pytest in
-  # 34m21s. A pytest-shard 0.1.2 replay projects 20.10m/13.92m of timed work;
-  # actual per-shard GPU and end-to-end timings remain to be measured.
+  # Two shards measured median 22.7 minutes and max 30.8 from October 19-26.
+  # A third shard is the next cut. Re-read --durations=0 before adding a fourth.
   # The command timeout leaves five minutes for the summary artifact.
   timeout_in_minutes: 50
   artifact_paths:
@@ -393,14 +401,15 @@ steps:
     # do not duplicate its model startup in this time-bounded coverage lane.
     # The CUDA ready job also covers tests/worker/test_batched_omni_output.py.
     # Keep the initial ROCm burn-in scoped to tests/model_executor/.
-    # The preflight prevents marker drift; verbose output and JUnit retain the
-    # nodes that actually ran on each shard.
-    - >-
-      bash .buildkite/amd/scripts/assert-pytest-collection.sh 1416
-      tests/model_executor/
-      -m 'core_model and rocm and MI325 and not nvidia_only and not
-      (cards_2 or cards_3 or cards_4 or cards_5 or cards_6 or cards_7 or cards_8)'
-      --run-level "core_model"
+    # Shard 0 checks the full 1416-node set. The other shards skip that
+    # collection and run their pytest slice immediately.
+    - |
+      if [[ "$${BUILDKITE_PARALLEL_JOB:-0}" == "0" ]]; then
+        bash .buildkite/amd/scripts/assert-pytest-collection.sh 1416 \
+          tests/model_executor/ \
+          -m 'core_model and rocm and MI325 and not nvidia_only and not (cards_2 or cards_3 or cards_4 or cards_5 or cards_6 or cards_7 or cards_8)' \
+          --run-level "core_model"
+      fi
     - >-
       timeout --signal=TERM --kill-after=2m 45m
       pytest -s -v -ra

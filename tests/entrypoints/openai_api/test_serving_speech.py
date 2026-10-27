@@ -44,6 +44,8 @@ from vllm_omni.entrypoints.openai import serving_speech as serving_speech_module
 from vllm_omni.entrypoints.openai.audio_utils_mixin import AudioMixin
 from vllm_omni.entrypoints.openai.errors import InvalidPresetVoiceReferenceError, InvalidVoiceReferenceError
 from vllm_omni.entrypoints.openai.protocol.audio import (
+    AudioChunkMetadata,
+    AudioResponse,
     BatchSpeechRequest,
     CreateAudio,
     OpenAICreateAudioGenerateRequest,
@@ -55,6 +57,8 @@ from vllm_omni.entrypoints.openai.protocol.audio import (
 )
 from vllm_omni.entrypoints.openai.serving_speech import (
     OmniOpenAIServingSpeech,
+    _audio_duration_seconds,
+    _audio_format_headers,
     _create_wav_header,
 )
 from vllm_omni.entrypoints.openai.tts_adapters.base import (
@@ -467,6 +471,62 @@ class TestSpeechAPI:
         assert response.headers["x-vllm-omni-total-tokens"] == "7"
         assert response.headers["x-vllm-omni-input-text-tokens"] == "2"
         assert response.headers["x-vllm-omni-input-audio-tokens"] == "0"
+
+    def test_create_speech_includes_audio_duration_header(self, client):
+        payload = {
+            "input": "Hello world",
+            "model": "tts-model",
+            "voice": "alloy",
+            "response_format": "wav",
+        }
+        response = client.post("/v1/audio/speech", json=payload)
+        assert response.status_code == 200
+        # create_mock_audio_output_for_test emits 24000 samples at 24 kHz.
+        assert response.headers["x-audio-duration-seconds"] == "1.000"
+        exposed = {h.strip().lower() for h in response.headers["access-control-expose-headers"].split(",")}
+        assert "x-audio-duration-seconds" in exposed
+
+    def test_audio_format_headers_expose_duration_alongside_format(self):
+        headers = _audio_format_headers({"sample_rate": 24000, "channels": 1}, 1.5)
+        assert headers["X-Audio-Duration-Seconds"] == "1.500"
+        exposed = {h.strip() for h in headers["Access-Control-Expose-Headers"].split(",")}
+        assert exposed == {"X-Audio-Sample-Rate", "X-Audio-Channels", "X-Audio-Duration-Seconds"}
+
+    def test_audio_format_headers_omit_absent_duration(self):
+        headers = _audio_format_headers({"sample_rate": 24000, "channels": 1})
+        assert "X-Audio-Duration-Seconds" not in headers
+        assert headers["Access-Control-Expose-Headers"] == "X-Audio-Sample-Rate, X-Audio-Channels"
+
+    def test_audio_format_headers_report_zero_duration(self):
+        headers = _audio_format_headers({"sample_rate": 24000, "channels": 1}, 0.0)
+        assert headers["X-Audio-Duration-Seconds"] == "0.000"
+
+    def test_audio_duration_seconds_uses_encoder_frame_count(self):
+        response = AudioResponse(
+            audio_data=b"",
+            media_type="audio/wav",
+            audio_metadata=AudioChunkMetadata(format="wav", sample_rate_hz=24000, frame_count=36000, channels=1),
+        )
+        assert _audio_duration_seconds(response) == pytest.approx(1.5)
+
+    def test_audio_duration_seconds_follows_speed_and_resampling(self, mocker: MockerFixture):
+        # 1 s at 24 kHz, sped up 2x and resampled to 16 kHz, is 0.5 s of audio.
+        # This is why the duration comes from the encoder metadata rather than
+        # from the pre-encode waveform.
+        mocker.patch("soundfile.write")
+        audio_obj = CreateAudio(
+            audio_tensor=np.random.rand(24000).astype(np.float32),
+            sample_rate=24000,
+            output_sample_rate=16000,
+            response_format="wav",
+            speed=2.0,
+            base64_encode=False,
+        )
+        response = AudioMixin().create_audio(audio_obj)
+        assert _audio_duration_seconds(response) == pytest.approx(0.5, abs=1e-3)
+
+    def test_audio_duration_seconds_without_metadata_is_unknown(self):
+        assert _audio_duration_seconds(AudioResponse(audio_data=b"", media_type="audio/wav")) is None
 
     def test_build_speech_usage_headers_uses_usage_and_detail_field_names(self):
         usage = SpeechTokenUsage(
@@ -976,6 +1036,28 @@ class TestSpeechAPI:
 
         assert response.status_code == 400
         assert b"Invalid voice" in response.body
+
+    @pytest.mark.asyncio
+    async def test_diffusion_speech_reports_audio_format_and_duration(self, mocker: MockerFixture):
+        """Diffusion servers report the same audio headers as the AR path."""
+        mock_engine = mocker.MagicMock()
+        mock_engine.default_sampling_params_list = [OmniDiffusionSamplingParams(extra_args={})]
+
+        async def mock_generate(*args, **kwargs):
+            yield create_mock_audio_output_for_test()
+
+        mock_engine.generate = mocker.MagicMock(side_effect=mock_generate)
+        server = OmniOpenAIServingSpeech.for_diffusion(diffusion_engine=mock_engine, model_name="test-model")
+
+        response = await server.create_speech(OpenAICreateSpeechRequest(input="Hello", response_format="pcm"))
+
+        assert response.status_code == 200
+        # create_mock_audio_output_for_test emits 24000 samples at 24 kHz.
+        assert response.headers["x-audio-sample-rate"] == "24000"
+        assert response.headers["x-audio-channels"] == "1"
+        assert response.headers["x-audio-duration-seconds"] == "1.000"
+        exposed = {h.strip().lower() for h in response.headers["access-control-expose-headers"].split(",")}
+        assert exposed == {"x-audio-sample-rate", "x-audio-channels", "x-audio-duration-seconds"}
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -6293,6 +6375,31 @@ class TestTTSAsyncOffloading:
         assert payload["usage"]["output_tokens"] == 191
         assert payload["usage"]["input_tokens"] == 2
         assert payload["usage"]["total_tokens"] == 193
+
+    @pytest.mark.asyncio
+    async def test_qwen3_tts_base_sse_done_reports_emitted_audio_duration(
+        self, qwen3_tts_server, qwen3_stage_output, mocker: MockerFixture
+    ):
+        async def generator():
+            yield qwen3_stage_output("req-base-sse-duration", "stop")
+
+        mocker.patch.object(qwen3_tts_server, "_count_usage_text_tokens", return_value=2)
+        events = [
+            event
+            async for event in qwen3_tts_server._generate_audio_sse_events(
+                generator(),
+                "req-base-sse-duration",
+                request=OpenAICreateSpeechRequest(input="Hello", task_type="Base"),
+                tts_params={"task_type": ["Base"], "_qwen3_tts_effective_max_tokens": [192]},
+            )
+        ]
+
+        assert any("event: speech.audio.delta" in event for event in events)
+        assert not any("event: speech.audio.error" in event for event in events)
+        done_event = next(event for event in events if "event: speech.audio.done" in event)
+        payload = json.loads(next(line for line in done_event.splitlines() if line.startswith("data: "))[6:])
+        # create_mock_audio_output_for_test emits 24000 samples at 24 kHz.
+        assert payload["duration"] == 1.0
 
     @pytest.mark.asyncio
     async def test_sse_error_before_audio_is_not_marked_partial(self, qwen3_tts_server):
