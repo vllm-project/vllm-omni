@@ -24,7 +24,7 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
-from .multiview_flex_attention import MultiviewAttentionContext
+from .multiview_flex_attention import MultiviewAttentionContext, MultiviewLayout
 from .multiview_maskless_plan import (
     META_GEN_TOKENS,
     META_IDENTITY_K,
@@ -247,7 +247,7 @@ def _maskless_attention_impl(
         raise ValueError(f"Maskless plan carries {len(plan)} tensors for {num_passes} passes.")
     first_meta = plan[TENSORS_PER_PASS - 1]
     planned_tokens = int(first_meta[META_GEN_TOKENS])
-    if q.shape[1] != planned_tokens or plan[0].numel() != planned_tokens:
+    if q.shape[1] != planned_tokens or plan[0].numel() > planned_tokens:
         raise ValueError(
             "Cosmos3 maskless packed GEN length does not match the request plan: "
             f"attention={q.shape[1]}, plan={planned_tokens}."
@@ -262,6 +262,9 @@ def _maskless_attention_impl(
     kernel = get_pass_kernel(kernel_name)
     same_view_kernel = get_pass_kernel("fa3_single_split") if kernel_name == "fa3" else kernel
     fused_merge = kernel_name == "fa3" and q.device.type == "cuda"
+    trimmed_queries = plan[0].numel() < planned_tokens
+    if trimmed_queries and not (fused_merge and head_dim == 128 and q.dtype == torch.bfloat16):
+        raise ValueError("Trimmed same-view queries require BF16 FA3 with head_dim=128 on CUDA.")
     merge = _merge_step_for(q.device)
     # Preserve the caller's tensor mode: HSDP/offload use no_grad() and need
     # outputs with version counters.  Only the passes and the accumulators are
@@ -303,9 +306,13 @@ def _maskless_attention_impl(
                     f"for {rows} rows × {heads} heads × {head_dim}."
                 )
             if acc is None:
-                # The same-view pass covers every row and seeds the accumulators.
+                # The same-view pass seeds all live rows.
                 acc = torch.empty((planned_tokens, heads, head_dim), dtype=torch.float32, device=q.device)
                 acc_lse = torch.empty((planned_tokens, heads), dtype=torch.float32, device=q.device)
+                if trimmed_queries:
+                    # Dead terminal control rows need finite seeds for later passes.
+                    acc.zero_()
+                    acc_lse.zero_()
             if fused_merge:
                 _compiled_merge_pass(
                     acc,
@@ -409,6 +416,62 @@ def prepare_maskless_context(
     plan = get_maskless_plan(context, num_und_tokens=num_und_tokens, device=device)
     runtime = MasklessRuntime(plan.flatten(), len(plan.passes), kernel or resolve_maskless_kernel())
     return replace(context, maskless=runtime)
+
+
+def prepare_last_layer_same_view_context(
+    context: MultiviewAttentionContext, *, head_dim: int, dtype: torch.dtype
+) -> MultiviewAttentionContext | None:
+    """Omit whole control query tiles only in the terminal GEN layer.
+
+    The 128-row alignment preserves FA3 d128 query MMA positions, including
+    mixed boundary tiles. K/V and subsequent pass ordering stay unchanged.
+    """
+    runtime = context.maskless
+    if runtime is None or runtime.kernel != "fa3" or head_dim != 128 or dtype != torch.bfloat16:
+        return None
+    if runtime.plan[0].device.type != "cuda":
+        return None
+    key = ("last_layer_same_view_trim", context.layout, runtime.plan[0].data_ptr())
+    cached = context.mask_cache.get(key)
+    if cached is None:
+        cached = _trim_same_view_queries(runtime, context.layout)
+        context.mask_cache[key] = cached
+    return replace(context, maskless=cached)
+
+
+def _trim_same_view_queries(runtime: MasklessRuntime, layout: MultiviewLayout) -> MasklessRuntime:
+    """Host planner; its CPU form also validates arbitrary layout geometry."""
+    device = runtime.plan[0].device
+    target = torch.empty(layout.gen_tokens, dtype=torch.bool)
+    start = 0
+    for item in layout.items:
+        target[start : start + item.num_tokens] = not item.is_control
+        start += item.num_tokens
+    q_index = runtime.plan[0].cpu()
+    offsets = runtime.plan[2].cpu().tolist()
+    selected, lengths = [], []
+    for lo, hi in zip(offsets, offsets[1:]):
+        segment = q_index[lo:hi]
+        keep = []
+        for begin in range(0, hi - lo, 128):
+            tile = segment[begin : begin + 128]
+            if target[tile].any():
+                keep.append(tile)
+        # Control-only view: preserve it to keep the varlen KV pairing valid.
+        retained = torch.cat(keep) if keep else segment
+        selected.append(retained)
+        lengths.append(retained.numel())
+    if sum(lengths) == q_index.numel() or max(lengths) <= 64:
+        return runtime
+    plan = list(runtime.plan)
+    selected_index = torch.cat(selected)
+    plan[0] = selected_index.to(device)
+    plan[2] = torch.tensor([0, *torch.tensor(lengths).cumsum(0).tolist()], dtype=torch.int32, device=device)
+    plan[4] = plan[4].clone()
+    plan[4][META_MAX_SEQLEN_Q] = max(lengths)
+    plan[4][META_IDENTITY_Q] = 0
+    cached = MasklessRuntime(plan, runtime.num_passes, runtime.kernel)
+    return cached
 
 
 def maskless_multiview_attention(
