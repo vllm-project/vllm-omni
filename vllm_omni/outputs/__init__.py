@@ -209,6 +209,8 @@ class OmniRequestOutput(RequestOutput):
     error: str | None = None
     error_status_code: int | None = None
     error_type: str | None = None
+    # Terminal cancellation acknowledgement, distinct from successful output.
+    aborted: bool = False
 
     def _copy_content_from(self, source: RequestOutput) -> None:
         """Copy generation content from a stage output into this object.

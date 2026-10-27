@@ -736,6 +736,10 @@ class OrchestratorArgs:
     # === Mode Switches (orchestrator reads, DeployConfig redistributes) ===
     async_chunk: bool | None = None
 
+    # Unified admission/routing policy; only the orchestrator enables it.
+    enable_central_scheduling: bool | None = None
+    central_scheduling_config: dict[str, Any] | None = None
+
     # === Forced aligner (orchestrator injects a pooling stage; never a per-stage knob) ===
     forced_aligner: str | None = None
     forced_aligner_config: str | None = None

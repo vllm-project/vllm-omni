@@ -63,6 +63,7 @@ from vllm_omni.config.stage_config import (
     validate_native_mrv2_session,
 )
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
+from vllm_omni.diffusion.sched.dispatch.config import CentralSchedulingConfig
 
 logger = init_logger(__name__)
 
@@ -1673,7 +1674,7 @@ def _orchestrator_cli_overrides(cli_overrides: Mapping[str, Any]) -> dict[str, A
     overrides: dict[str, Any] = {}
     for config_field in fields(cast(Any, VllmOmniOrchestratorConfig)):
         name = config_field.name
-        if name == "deploy_config_path":
+        if name in {"deploy_config_path", "central_scheduling_config"}:
             continue
         if cli_overrides.get(name) is not None:
             overrides[name] = _copy_value(cli_overrides[name])
@@ -1685,6 +1686,7 @@ class VllmOmniOrchestratorConfig:
     """Configuration consumed by the orchestrator process only."""
 
     stage_init_timeout: int = Field(default=300, ge=1)
+    central_scheduling_config: CentralSchedulingConfig = field(default_factory=CentralSchedulingConfig)
     init_timeout: int = Field(default=600, ge=1)
     worker_backend: str = "multi_process"
     ray_address: str | None = None
@@ -1854,7 +1856,9 @@ def _build_common_stage_config_kwargs(
 ) -> tuple[dict[str, Any], str | None, str | None]:
     input_proc, next_stage_proc = _select_processor_funcs(topology, resolve_stage_async_chunk(deploy, stage_deploy))
     quantization_config = _build_quantization_config(deploy, engine.quantization)
-    parallel_config = _build_parallel_config(deploy, engine.parallel, parallel_config_cls)
+    parallel_config = _build_parallel_config(
+        deploy, engine.parallel, parallel_config_cls, num_gpus=engine.runtime.get("num_gpus")
+    )
 
     return (
         {
@@ -2234,6 +2238,8 @@ def _build_parallel_config(
     deploy: DeployConfig,
     engine: _ParallelEngineOverrides,
     config_cls: type[OmniStageParallelConfig] = OmniStageParallelConfig,
+    *,
+    num_gpus: int | None = None,
 ) -> OmniStageParallelConfig:
     parallel_config = _mapping_or_empty(engine.get("parallel_config"))
     config_fields = frozenset(signature(config_cls).parameters)
@@ -2255,6 +2261,12 @@ def _build_parallel_config(
         kwargs["pipeline_parallel_size"] = _copy_value(deploy.pipeline_parallel_size)
     if "data_parallel_size" not in kwargs and deploy.data_parallel_size is not None:
         kwargs["data_parallel_size"] = _copy_value(deploy.data_parallel_size)
+    if is_diffusion and num_gpus is not None:
+        from vllm_omni.diffusion.data import DiffusionParallelConfig
+
+        # Infer WORLD-derived DP only after YAML and CLI axes have been merged.
+        effective = DiffusionParallelConfig.from_stage_overrides(kwargs)
+        kwargs["data_parallel_size"] = effective.resolve_data_parallel_size(num_gpus)
     return config_cls(**kwargs)
 
 
@@ -2445,9 +2457,24 @@ class VllmOmniConfig:
                     role=stage.model_stage,
                 )
 
+        # Deployment values first; explicit CLI values take precedence.
+        scheduling_values: dict[str, Any] = {}
+        for settings, enabled in (
+            (deploy.central_scheduling_config, deploy.enable_central_scheduling),
+            (cli_overrides.get("central_scheduling_config"), cli_overrides.get("enable_central_scheduling")),
+        ):
+            if settings is not None:
+                if not isinstance(settings, Mapping):
+                    raise ValueError("central_scheduling_config must be an object")
+                scheduling_values.update(settings)
+            if enabled is not None:
+                scheduling_values["enabled"] = enabled
+        scheduling_config = CentralSchedulingConfig.from_dict(scheduling_values)
+        orchestrator_overrides = _orchestrator_cli_overrides(cli_overrides)
+        orchestrator_overrides["central_scheduling_config"] = scheduling_config
         orchestrator_config = cast(Any, VllmOmniOrchestratorConfig)(
             deploy_config_path=loaded_deploy_config_path,
-            **_orchestrator_cli_overrides(cli_overrides),
+            **orchestrator_overrides,
         )
         return cast(Any, cls)(
             pipeline_config=pipeline_cfg,

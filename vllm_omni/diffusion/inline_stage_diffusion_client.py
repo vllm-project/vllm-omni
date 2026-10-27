@@ -30,7 +30,7 @@ from vllm_omni.engine.stage_client import StageClientBase
 from vllm_omni.engine.stage_init_utils import StageMetadata
 from vllm_omni.errors import client_error_metadata
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniInteractionPrompt
-from vllm_omni.metrics.utils import DIFFUSION_METRICS_ONLY_REQUEST_ID, diffusion_exception_metrics
+from vllm_omni.metrics.utils import diffusion_exception_metrics
 from vllm_omni.outputs import OmniRequestOutput
 
 if TYPE_CHECKING:
@@ -180,15 +180,14 @@ class InlineStageDiffusionClient(StageClientBase):
                 self._output_queue.put_nowait(result)
         except DiffusionRequestAbortedError as e:
             logger.info("request_id: %s aborted: %s", request_id, str(e))
-            metrics = diffusion_exception_metrics(e)
-            if metrics:
-                self._output_queue.put_nowait(
-                    OmniRequestOutput(
-                        request_id=DIFFUSION_METRICS_ONLY_REQUEST_ID,
-                        finished=True,
-                        metrics=metrics,
-                    )
+            self._output_queue.put_nowait(
+                OmniRequestOutput(
+                    request_id=request_id,
+                    finished=True,
+                    aborted=True,
+                    metrics=diffusion_exception_metrics(e),
                 )
+            )
         except Exception as e:
             logger.exception("Diffusion request %s failed: %s", request_id, e)
             status_code, error_type = client_error_metadata(e)
