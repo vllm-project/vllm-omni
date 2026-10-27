@@ -6,7 +6,7 @@ Generated pixels can differ from the original decoder.
 
 ## Usage
 
-Add the following to an existing [H3 serving command](../../../recipes/MiniMaxAI/MiniMax-H3.md):
+Add the following to an existing [H3 serving command](gh-file:recipes/MiniMaxAI/MiniMax-H3.md):
 
 ```bash
 --additional-config '{"lightvae_decoder_path":"/weights/lightvae-lite-h3-decoder.safetensors"}'
@@ -43,7 +43,7 @@ then strictly loads weights on CPU before device placement and offload setup.
 
 ## Performance and quality
 
-See the [NPU recipe](../../../recipes/MiniMaxAI/MiniMax-H3-NPU.md#litevae-measurements-8-ascend-910b4-npus)
+See the [NPU recipe](gh-file:recipes/MiniMaxAI/MiniMax-H3-NPU.md#litevae-measurements-8-ascend-910b4-npus)
 for configuration and measured results. Keep E2E request latency separate from
 video VAE decoding time; improving one stage does not yield the same E2E speedup.
 
