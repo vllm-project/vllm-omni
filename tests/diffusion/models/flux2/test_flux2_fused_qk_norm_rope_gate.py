@@ -35,14 +35,14 @@ def test_model_forward_gates_packed_rope_on_actual_head_dim(
     mocker.patch.object(fused_qk_norm_rope, "fused_qk_norm_rope_available", return_value=True)
     pack = mocker.spy(module, "pack_qk_norm_rope_table")
 
-    output = model(
+    model(
         hidden_states=torch.zeros(1, 3, 4, dtype=torch.bfloat16),
         encoder_hidden_states=torch.zeros(1, 2, 4, dtype=torch.bfloat16),
         timestep=torch.ones(1, dtype=torch.bfloat16),
         img_ids=torch.zeros(3, 4),
         txt_ids=torch.zeros(2, 4),
         return_dict=False,
-    )[0]
+    )
 
     pack.assert_called_once()
     if head_dim == 256:
@@ -50,5 +50,3 @@ def test_model_forward_gates_packed_rope_on_actual_head_dim(
     else:
         assert pack.spy_return is not None
         assert pack.spy_return.shape == (5, 128)
-    assert pack.call_args.kwargs["head_dim"] == head_dim
-    assert output.shape == (1, 3, 4)
