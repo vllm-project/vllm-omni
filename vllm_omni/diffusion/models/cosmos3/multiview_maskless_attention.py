@@ -418,6 +418,46 @@ def prepare_maskless_context(
     return replace(context, maskless=runtime)
 
 
+def prepare_long_first_same_view_context(
+    context: MultiviewAttentionContext, *, head_dim: int, dtype: torch.dtype
+) -> MultiviewAttentionContext:
+    """Schedule longer independent same-view sequences first, preserving KV order."""
+    runtime = context.maskless
+    if runtime is None or runtime.kernel != "fa3" or head_dim != 128 or dtype != torch.bfloat16:
+        return context
+    if runtime.plan[0].device.type != "cuda":
+        return context
+    key = ("same_view_long_first", context.layout, runtime.plan[0].data_ptr())
+    cached = context.mask_cache.get(key)
+    if cached is None:
+        cached = _sort_same_view_sequences(runtime)
+        context.mask_cache[key] = cached
+    return replace(context, maskless=cached)
+
+
+def _sort_same_view_sequences(runtime: MasklessRuntime) -> MasklessRuntime:
+    """Reorder complete descriptors; never reorder a sequence's key/value rows."""
+    q_index, k_index = (tensor.cpu() for tensor in runtime.plan[:2])
+    cu_q, cu_k = (tensor.cpu().tolist() for tensor in runtime.plan[2:4])
+    order = sorted(range(len(cu_k) - 1), key=lambda i: cu_k[i + 1] - cu_k[i], reverse=True)
+    if order == list(range(len(order))):
+        return runtime
+    device = runtime.plan[0].device
+    plan = list(runtime.plan)
+    for slot, indices, offsets, identity_meta in (
+        (0, q_index, cu_q, META_IDENTITY_Q),
+        (1, k_index, cu_k, META_IDENTITY_K),
+    ):
+        selected = torch.cat([indices[offsets[i] : offsets[i + 1]] for i in order])
+        lengths = [offsets[i + 1] - offsets[i] for i in order]
+        plan[slot] = selected.to(device)
+        plan[slot + 2] = torch.tensor([0, *torch.tensor(lengths).cumsum(0).tolist()], dtype=torch.int32, device=device)
+        if slot == 0:
+            plan[4] = plan[4].clone()
+        plan[4][identity_meta] = int(torch.equal(selected, torch.arange(selected.numel())))
+    return MasklessRuntime(plan, runtime.num_passes, runtime.kernel)
+
+
 def prepare_last_layer_same_view_context(
     context: MultiviewAttentionContext, *, head_dim: int, dtype: torch.dtype
 ) -> MultiviewAttentionContext | None:
