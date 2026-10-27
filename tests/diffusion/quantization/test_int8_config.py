@@ -21,7 +21,7 @@ from vllm_omni.platforms import current_omni_platform
 from vllm_omni.quantization import build_quant_config
 from vllm_omni.quantization.factory import SUPPORTED_QUANTIZATION_METHODS
 
-pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
 
 npu_available = pytest.mark.skipif(not current_omni_platform.is_npu(), reason="NPU platform not available.")
 
@@ -115,6 +115,7 @@ def _distributed_accelerator_int8_quant_worker(rank: int, init_method: str) -> N
         dist.destroy_process_group()
 
 
+@pytest.mark.cpu
 def test_int8_config_creation():
     """Test that Int8 config can be created."""
     config = build_quant_config("int8")
@@ -122,18 +123,21 @@ def test_int8_config_creation():
     assert config.get_name() == "int8"
 
 
+@pytest.mark.cpu
 def test_none_quantization():
     """Test that None quantization returns None config."""
     config = build_quant_config(None)
     assert config is None
 
 
+@pytest.mark.cpu
 def test_invalid_quantization():
     """Test that invalid quantization method raises error."""
     with pytest.raises(ValueError, match="Unknown quantization method"):
         build_quant_config("invalid_method")
 
 
+@pytest.mark.cpu
 def test_int8_config_with_custom_params():
     """Test Int8 config with custom parameters."""
     config = build_quant_config(
@@ -146,11 +150,13 @@ def test_int8_config_with_custom_params():
     assert "proj_out" in config.ignored_layers
 
 
+@pytest.mark.cpu
 def test_supported_methods():
     """Test that supported methods list is correct."""
     assert "int8" in SUPPORTED_QUANTIZATION_METHODS
 
 
+@pytest.mark.cpu
 def test_quantization_integration():
     """Test end-to-end quantization flow through OmniDiffusionConfig."""
     from vllm_omni.diffusion.data import OmniDiffusionConfig
@@ -170,6 +176,7 @@ def test_quantization_integration():
     assert config2.quantization_config.activation_scheme == "dynamic"
 
 
+@pytest.mark.cpu
 def test_quantization_dict_not_mutated():
     """Test that passing a dict to quantization_config doesn't mutate it."""
     from vllm_omni.diffusion.data import OmniDiffusionConfig
@@ -183,6 +190,7 @@ def test_quantization_dict_not_mutated():
     assert original_dict == dict_copy
 
 
+@pytest.mark.cpu
 def test_quantization_config_string_and_dict_equivalent():
     """Test that string and dict forms produce equivalent configs."""
     from vllm_omni.diffusion.data import OmniDiffusionConfig
@@ -196,6 +204,7 @@ def test_quantization_config_string_and_dict_equivalent():
     assert config_str.quantization_config.activation_scheme == config_dict.quantization_config.activation_scheme
 
 
+@pytest.mark.cpu
 @pytest.mark.parametrize("platform", ["cuda", "rocm"])
 @pytest.mark.parametrize("serialized", [False, True])
 def test_get_quant_method(mocker: MockerFixture, monkeypatch: pytest.MonkeyPatch, platform, serialized):
@@ -229,6 +238,7 @@ def test_get_quant_method(mocker: MockerFixture, monkeypatch: pytest.MonkeyPatch
     assert isinstance(method, UnquantizedLinearMethod)
 
 
+@pytest.mark.cpu
 def test_get_npu_quant_method(mocker: MockerFixture, monkeypatch: pytest.MonkeyPatch):
     """Test for get_quant_method method for NPU"""
     from vllm_omni.quantization.int8_config import NPUInt8OnlineLinearMethod
@@ -251,6 +261,7 @@ def test_get_npu_quant_method(mocker: MockerFixture, monkeypatch: pytest.MonkeyP
     assert isinstance(method, UnquantizedLinearMethod)
 
 
+@pytest.mark.cpu
 def test_fused_layer_can_be_ignored_by_its_prefix(monkeypatch: pytest.MonkeyPatch, mocker: MockerFixture):
     """A layer opts out of quantization under the prefix its module was built with.
 
@@ -270,6 +281,7 @@ def test_fused_layer_can_be_ignored_by_its_prefix(monkeypatch: pytest.MonkeyPatc
     assert isinstance(config.get_quant_method(layer, "blocks.0.mlp.fc1"), NPUInt8OnlineLinearMethod)
 
 
+@pytest.mark.cpu
 class TestNPUQuantMatmulShapeFallback:
     """npu_quant_matmul rejects wide outputs, so those layers stay unquantized.
 
@@ -353,6 +365,7 @@ class TestNPUQuantMatmulShapeFallback:
         assert layer.quant_method is method
 
 
+@pytest.mark.cpu
 class TestHostFallbackLoading:
     """Over-wide fallback layers load straight into host memory when the loader
     will offload the model back to CPU after online quantization (DLO).
@@ -471,6 +484,7 @@ class TestHostFallbackLoading:
         assert type(layer.quant_method) is UnquantizedLinearMethod
 
 
+@pytest.mark.cpu
 class TestOffloadAfterQuant:
     def test_only_methods_advertising_the_capability_are_asked(self):
         from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
@@ -494,6 +508,7 @@ class TestOffloadAfterQuant:
         assert lazy_int8._offload_after_quant
 
 
+@pytest.mark.cpu
 class TestInt8LinearMethod:
     @pytest.fixture
     def mock_quant_config(self, mocker):
@@ -566,6 +581,7 @@ class TestInt8LinearMethod:
         patch_deps.apply_weights.assert_called_once()
 
 
+@pytest.mark.cpu
 class TestInt8OnlineLinearMethod:
     @pytest.fixture
     def mock_quant_config(self, mocker):
@@ -788,6 +804,7 @@ def test_shared_quantizer_matches_native_kernel_on_two_gpus(tmp_path):
 
 
 @npu_available
+@hardware_test(res={"npu": "A2"})
 class TestNPUInt8LinearMethod:
     qweight_mock = torch.randn((128, 64)).to(dtype=torch.int8)
     scale_mock = torch.randn(128)
@@ -858,6 +875,7 @@ def quant_config():
 
 
 @npu_available
+@hardware_test(res={"npu": "A2"})
 class TestNPUInt8Smoke:
     """Smoke tests using real torch_npu, only run on NPU."""
 
