@@ -1260,3 +1260,80 @@ steps:
             fi
 
             exit "$$status"
+
+  - group: ":full_moon: Qwen-Image Backend Similarity MI300 Nightly"
+    steps:
+      - label: "Qwen-Image Diffusers Backend Similarity"
+        agent_pool: mi300_1
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 180
+        source_file_dependencies: diffusion_qwen_image_accuracy
+        env:
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+        artifact_paths:
+          - artifacts/rocm-qwen-image-backend-similarity/**/*
+        commands:
+          - export ROCM_QWEN_IMAGE_BACKEND_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-qwen-image-backend-similarity"
+          - mkdir -p "$$ROCM_QWEN_IMAGE_BACKEND_ARTIFACT_DIR"
+          - |
+            pytest --collect-only -q tests/e2e/accuracy/test_diffusers_backend_similarity.py \
+              -k "2i_matches_diffusers" \
+              -m "full_model and diffusion and rocm and MI325 and cards_1" --run-level full_model \
+              > "$$ROCM_QWEN_IMAGE_BACKEND_ARTIFACT_DIR/collection.txt"
+            count=$$(awk '/::/ { n++ } END { print n + 0 }' \
+              "$$ROCM_QWEN_IMAGE_BACKEND_ARTIFACT_DIR/collection.txt")
+            if [[ "$$count" != 1 ]]; then
+              echo "Expected exactly one Qwen-Image backend similarity node, found $$count." >&2
+              cat "$$ROCM_QWEN_IMAGE_BACKEND_ARTIFACT_DIR/collection.txt" >&2
+              exit 5
+            fi
+            if ! grep -Fq "test_diffusers_backend_t2i_matches_diffusers" \
+              "$$ROCM_QWEN_IMAGE_BACKEND_ARTIFACT_DIR/collection.txt"; then
+              echo "Qwen-Image backend similarity node was not collected." >&2
+              cat "$$ROCM_QWEN_IMAGE_BACKEND_ARTIFACT_DIR/collection.txt" >&2
+              exit 5
+            fi
+          - |
+            if (
+              trap - ERR
+              set +e
+              timeout --signal=TERM --kill-after=2m 165m \
+                pytest -s -v -ra tests/e2e/accuracy/test_diffusers_backend_similarity.py \
+                -k "2i_matches_diffusers" \
+                -m "full_model and diffusion and rocm and MI325 and cards_1" --run-level full_model \
+                --junitxml="$$ROCM_QWEN_IMAGE_BACKEND_ARTIFACT_DIR/pytest.xml" \
+                2>&1 | tee "$$ROCM_QWEN_IMAGE_BACKEND_ARTIFACT_DIR/pytest.log"
+              exit "$${PIPESTATUS[0]}"
+            ); then
+              status=0
+            else
+              status=$$?
+            fi
+            if [[ -d tests/e2e/accuracy/artifacts ]]; then
+              mkdir -p "$$ROCM_QWEN_IMAGE_BACKEND_ARTIFACT_DIR/accuracy"
+              cp -a tests/e2e/accuracy/artifacts/. "$$ROCM_QWEN_IMAGE_BACKEND_ARTIFACT_DIR/accuracy/"
+            fi
+            tail -n 100 "$$ROCM_QWEN_IMAGE_BACKEND_ARTIFACT_DIR/pytest.log" > \
+              "$$ROCM_QWEN_IMAGE_BACKEND_ARTIFACT_DIR/pytest-summary.txt"
+            if [[ "$$status" -eq 0 ]]; then
+              if python -c 'import sys, xml.etree.ElementTree as ET
+            root = ET.parse(sys.argv[1]).getroot()
+            suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
+            tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites)
+            skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites)
+            if tests != 1 or skipped != 0:
+                print(
+                    f"Expected exactly one executed Qwen-Image backend similarity test; "
+                    f"reported tests={tests}, skipped={skipped}.",
+                    file=sys.stderr,
+                )
+                raise SystemExit(5)
+            ' "$$ROCM_QWEN_IMAGE_BACKEND_ARTIFACT_DIR/pytest.xml"
+              then
+                status=0
+              else
+                status=$$?
+              fi
+            fi
+            (exit "$$status")

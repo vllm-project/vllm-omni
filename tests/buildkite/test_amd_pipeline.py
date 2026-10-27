@@ -2,7 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import json
+import os
 import re
+import subprocess
+import sys
 from importlib.util import find_spec, module_from_spec, spec_from_file_location
 from pathlib import Path
 from shlex import split
@@ -655,7 +658,7 @@ _ROCM_MIGRATED_AMD_GPU_JOBS = (
         "Omni Model Test Qwen3-Omni",
         AMD_MERGE_PIPELINE,
         "Blocking",
-        16,
+        17,
         "advanced_model and rocm and MI325 and not nvidia_only",
     ),
     (
@@ -690,8 +693,11 @@ def test_migrated_amd_gpu_jobs_select_exact_rocm_collections() -> None:
         assert _marker_expressions({"commands": run_commands}) == [marker_expression]
 
         collect_argv = split(collect_commands[0])
-        assert collect_argv[:2] == ["bash", str(AMD_COLLECTION_GUARD)]
-        assert collect_argv[2] == str(expected_count)
+        bash_at = collect_argv.index("bash")
+        assert collect_argv[bash_at : bash_at + 2] == ["bash", str(AMD_COLLECTION_GUARD)]
+        assert collect_argv[bash_at + 2] == str(expected_count)
+        if "Shard %N/%t" in label:
+            assert '$${BUILDKITE_PARALLEL_JOB:-0}" == "0"' in collect_commands[0]
 
 
 def test_amd_collection_guard_rejects_empty_and_changed_collections() -> None:
@@ -1012,7 +1018,8 @@ def test_ready_jobs_restore_bf16_aiter_module_without_publishing(label: str, pyt
     step = _find_step(label, AMD_READY_PIPELINE)
 
     assert step["agent_pool"] == "mi300_1"
-    assert step["depends_on"] == "amd-build"
+    assert step["depends_on"] == "amd-fa-aiter"
+    assert step["env"] == {"VLLM_OMNI_AITER_MHA_SAME_BUILD_STEP": "amd-fa-aiter"}
     assert step["mirror_hardwares"] == ["amdproduction"]
     _assert_build_scoped_aiter_mha_cache(step, pytest_marker, publishes=False)
     assert all("VLLM_ROCM_USE_AITER=0" not in command for command in step["commands"])
@@ -1023,7 +1030,9 @@ def test_ready_flashattention_publishes_bf16_aiter_module_on_success() -> None:
     pytest_commands = [command for command in step["commands"] if "pytest" in command]
 
     assert step["agent_pool"] == "mi300_1"
+    assert step["key"] == "amd-fa-aiter"
     assert step["depends_on"] == "amd-build"
+    assert "VLLM_OMNI_AITER_MHA_SAME_BUILD_STEP" not in step.get("env", {})
     assert step["mirror_hardwares"] == ["amdproduction"]
     assert step["grade"] == "NonBlocking"
     assert step["timeout_in_minutes"] == 60
@@ -1502,3 +1511,114 @@ def test_omni_duplex_eval_is_one_nonblocking_nightly_job() -> None:
     for pipeline_path in (AMD_READY_PIPELINE, AMD_MERGE_PIPELINE):
         text = pipeline_path.read_text(encoding="utf-8")
         assert "MiniCPM-o Omni-DuplexEval CI Guard" not in text
+
+
+def test_qwen_image_backend_similarity_is_one_nonblocking_nightly_job() -> None:
+    step = _find_step("Qwen-Image Diffusers Backend Similarity", AMD_NIGHTLY_PIPELINE)
+    assert step["grade"] == "NonBlocking"
+    assert step["agent_pool"] == "mi300_1"
+    assert step["mirror_hardwares"] == ["amdproduction"]
+    assert step["timeout_in_minutes"] == 180
+    assert step["source_file_dependencies"] == "diffusion_qwen_image_accuracy"
+    assert step["env"]["DIFFUSION_ATTENTION_BACKEND"] == "TORCH_SDPA"
+    assert step["artifact_paths"] == ["artifacts/rocm-qwen-image-backend-similarity/**/*"]
+    commands = "\n".join(step["commands"])
+    assert "full_model and diffusion and rocm and MI325 and cards_1" in commands
+    assert '-k "2i_matches_diffusers"' in commands
+    assert "test_diffusers_backend_t2i_matches_diffusers" in commands
+    assert "Expected exactly one Qwen-Image backend similarity node" in commands
+    assert "--collect-only" in commands
+    assert "exit 5" in commands
+    assert "pytest.xml" in commands
+    assert "Expected exactly one executed Qwen-Image backend similarity test" in commands
+    accuracy_test = Path("tests/e2e/accuracy/test_diffusers_backend_similarity.py").read_text(encoding="utf-8")
+    assert "torch.version.hip is not None" in accuracy_test
+    for pipeline_path in (AMD_READY_PIPELINE, AMD_MERGE_PIPELINE):
+        text = pipeline_path.read_text(encoding="utf-8")
+        assert "Qwen-Image Diffusers Backend Similarity" not in text
+
+
+@pytest.mark.parametrize(
+    ("pytest_status", "tests", "skipped", "timeout_status", "expected_status"),
+    [
+        (0, 1, 0, None, 0),
+        (0, 1, 1, None, 5),
+        (0, 0, 0, None, 5),
+        (1, 1, 0, None, 1),
+        (0, 1, 0, 124, 124),
+    ],
+    ids=("pass", "skipped", "zero-tests", "pytest-failure", "timeout"),
+)
+def test_qwen_image_backend_similarity_executes_junit_guard_before_exit(
+    tmp_path: Path,
+    pytest_status: int,
+    tests: int,
+    skipped: int,
+    timeout_status: int | None,
+    expected_status: int,
+) -> None:
+    step = _find_step("Qwen-Image Diffusers Backend Similarity", AMD_NIGHTLY_PIPELINE)
+    run_command = next(command for command in step["commands"] if "pytest -s -v -ra" in command)
+    assert "Expected exactly one executed Qwen-Image backend similarity test" in run_command
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+
+    def write_executable(name: str, body: str) -> None:
+        path = fake_bin / name
+        path.write_text(f"#!/bin/bash\nset -euo pipefail\n{body}", encoding="utf-8")
+        path.chmod(0o755)
+
+    write_executable("rocminfo", "exit 0\n")
+    write_executable(
+        "python3",
+        'if [[ "${1:-}" == "-" ]]; then cat >/dev/null; exit 0; fi\nexec "$REAL_PYTHON" "$@"\n',
+    )
+    write_executable("python", 'exec "$REAL_PYTHON" "$@"\n')
+    write_executable(
+        "timeout",
+        'if [[ -n "${FAKE_TIMEOUT_STATUS:-}" ]]; then exit "$FAKE_TIMEOUT_STATUS"; fi\n'
+        'while [[ "$1" != "pytest" ]]; do shift; done\nexec "$@"\n',
+    )
+    write_executable(
+        "pytest",
+        'xml_path=""\n'
+        'for arg in "$@"; do\n'
+        '  case "$arg" in --junitxml=*) xml_path="${arg#*=}" ;; esac\n'
+        "done\n"
+        'mkdir -p "$(dirname "$xml_path")"\n'
+        'printf \'<testsuite tests="%s" skipped="%s" failures="0" errors="0"/>\\n\' \\\n'
+        '  "$FAKE_JUNIT_TESTS" "$FAKE_JUNIT_SKIPPED" > "$xml_path"\n'
+        'echo "fake pytest status=$FAKE_PYTEST_STATUS"\n'
+        'exit "$FAKE_PYTEST_STATUS"\n',
+    )
+
+    artifact_dir = tmp_path / "artifacts"
+    artifact_dir.mkdir()
+    env = os.environ.copy()
+    env.update(
+        {
+            "PATH": f"{fake_bin}{os.pathsep}{env['PATH']}",
+            "REAL_PYTHON": sys.executable,
+            "VLLM_CI_DOCKER_DISABLED": "1",
+            "VLLM_CI_REQUIRE_PERSISTENT_HF_CACHE": "0",
+            "BUILDKITE_JOB_ID": f"qwen-image-guard-{tmp_path.name}",
+            "HF_HOME": str(tmp_path / "hf"),
+            "ROCM_QWEN_IMAGE_BACKEND_ARTIFACT_DIR": str(artifact_dir),
+            "FAKE_PYTEST_STATUS": str(pytest_status),
+            "FAKE_JUNIT_TESTS": str(tests),
+            "FAKE_JUNIT_SKIPPED": str(skipped),
+            "FAKE_TIMEOUT_STATUS": "" if timeout_status is None else str(timeout_status),
+            "TEST_COMMANDS": run_command.replace("$$", "$"),
+        }
+    )
+
+    result = subprocess.run(
+        ["bash", str(AMD_RUNNER)],
+        cwd=Path.cwd(),
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == expected_status, result.stdout + result.stderr
