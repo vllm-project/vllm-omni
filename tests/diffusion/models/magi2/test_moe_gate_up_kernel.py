@@ -17,6 +17,7 @@ import torch
 
 import vllm_omni.diffusion.models.magi2.layers.cuda.fused_moe_kernels as kernels
 import vllm_omni.diffusion.models.magi2.layers.cuda.mh_moe as moe
+from tests.helpers.mark import hardware_marks
 from vllm_omni.platforms import current_omni_platform
 
 pytestmark = [pytest.mark.diffusion, pytest.mark.core_model]
@@ -556,8 +557,8 @@ def _gpu_device(device_type: str) -> torch.device:
 
 
 _DEVICE_PARAMS = [
-    pytest.param("cuda", marks=[pytest.mark.cuda, pytest.mark.gpu]),
-    pytest.param("musa", marks=[pytest.mark.musa, pytest.mark.gpu]),
+    pytest.param("cuda", marks=hardware_marks(res={"cuda": "L4"}, num_cards=1)),
+    pytest.param("musa", marks=hardware_marks(res={"musa": "S5000"}, num_cards=1)),
 ]
 _DEVICE_CONFIGS = [
     _config(block_m=128, block_n=128, block_k=64),
