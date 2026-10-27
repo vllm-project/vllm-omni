@@ -6,6 +6,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm_omni.transformers_utils.configs.higgs_audio_v3 import HiggsMrv2Options
+
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
@@ -17,7 +19,16 @@ def test_model_metadata_reset(enabled):
 
     t = C.__new__(C)
     torch.nn.Module.__init__(t)
-    t.config = SimpleNamespace(audio_async_prompt_mode=enabled)
+    t.mrv2_options = HiggsMrv2Options(
+        audio_async_prompt_mode=enabled,
+        audio_async_payload=enabled,
+        audio_mrv2_static_inputs=False,
+        audio_mrv2_slot_parameters=False,
+        audio_mrv2_direct_payload=False,
+        audio_mrv2_sample_graph_buckets=False,
+        audio_mrv2_async_state_indices=False,
+        audio_mrv2_fused_state=False,
+    )
     t._set_last_step_query_start_loc = lambda x: None
     t._sync_decode_state_with_batch = lambda x: None
     t.update_decode_step_metadata(audio_prompt_mode_rows=2)
@@ -45,6 +56,16 @@ def test_actual_state_guard_and_eos(bad_state):
         mod.HiggsAudioV3TalkerForConditionalGeneration._restore_terminal_audio_rows.__get__(t)
     )
     t.config = SimpleNamespace(audio_async_prompt_mode=True, audio_full_sample_graph=False)
+    t.mrv2_options = HiggsMrv2Options(
+        audio_async_prompt_mode=True,
+        audio_async_payload=True,
+        audio_mrv2_static_inputs=False,
+        audio_mrv2_slot_parameters=False,
+        audio_mrv2_direct_payload=False,
+        audio_mrv2_sample_graph_buckets=False,
+        audio_mrv2_async_state_indices=False,
+        audio_mrv2_fused_state=False,
+    )
     t._resolve_token_ids = lambda: None
     t._audio_continuation_id = 99999
     t._eos_token_id = 151671

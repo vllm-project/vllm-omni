@@ -22,20 +22,22 @@ logger = init_logger(__name__)
 class HiggsModelState(OmniModelState):
     def __init__(self, vllm_config, model, encoder_cache, device):
         super().__init__(vllm_config, model, encoder_cache, device)
-        model._use_external_decode_cudagraph = True
         # Fix decode-state addresses before any sampling graph can capture them.
+        # (The external-decode-graph decision itself lives in the talker's
+        # __init__, keyed off use_v2_model_runner, so eager/v2 combos hit the
+        # MLP-graph disarm and the mutual-exclusion assert there.)
         model._ensure_decode_state_capacity(max(self.max_num_tokens, 128), device)
         logger.info("Higgs MRV2 custom sampler and owned audio snapshots enabled")
-        if getattr(model.config, "audio_mrv2_static_inputs", False):
+        if model.mrv2_options.audio_mrv2_static_inputs:
             self._static_inputs_embeds = torch.zeros(
                 (self.max_num_tokens, model.model.embed_tokens.weight.shape[1]),
                 dtype=self.dtype,
                 device=device,
             )
-        self.direct_payload = bool(getattr(model.config, "audio_mrv2_direct_payload", False))
+        self.direct_payload = model.mrv2_options.audio_mrv2_direct_payload
         self.sampling_slots = None
         self.request_slots = {}
-        if getattr(model.config, "audio_mrv2_slot_parameters", False):
+        if model.mrv2_options.audio_mrv2_slot_parameters:
             capacity = self.scheduler_config.max_num_seqs
             self.sampling_slots = {
                 "temperature": torch.zeros(capacity, device=device),
@@ -55,8 +57,6 @@ class HiggsModelState(OmniModelState):
             self.sampling_slots is not None,
             self.direct_payload,
         )
-        if not model.use_async_omni_output:
-            raise ValueError("Higgs MRV2 requires audio_async_payload; use higgs_multimodal_qwen3_mrv2_h200.yaml")
 
     def _ensure_slot_capacity(self, slots):
         """Per-slot prompt facts for vectorized step classification."""
@@ -86,7 +86,13 @@ class HiggsModelState(OmniModelState):
             or params.logit_bias
             or params.min_p != 0
         ):
-            raise ValueError("Higgs MRV2 currently supports temperature/top-k/top-p sampling without text penalties")
+            raise ValueError(
+                "Higgs Audio v3 model_runner: v2 supports temperature/top-k/top-p/seed sampling only; "
+                f"request {new_req_data.req_id} set a text-generation sampling parameter "
+                "(frequency/presence/repetition penalty, logprobs, min_tokens, min_p, "
+                "allowed/bad token ids, or logit_bias). "
+                "Remove it or run this stage with model_runner: v1"
+            )
         super().add_request(req_index, new_req_data)
         self.requests[new_req_data.req_id] = new_req_data
         self.request_slots[new_req_data.req_id] = req_index
