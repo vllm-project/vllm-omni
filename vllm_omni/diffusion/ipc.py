@@ -216,7 +216,7 @@ def _tensor_to_shm(
     The shared memory segment remains alive after this call (the local fd is
     closed, but the segment persists until ``_tensor_from_shm`` unlinks it).
 
-    If *d2h_stream* is provided, the D2H copy uses ``copy_()`` with
+    If *d2h_stream* is provided for an accelerator tensor, the D2H copy uses ``copy_()`` with
     ``pin_memory=True`` on that stream instead of the synchronous ``.cpu()``
     path.  The caller must synchronize *d2h_stream* after all tensors are
     packed.
@@ -233,7 +233,27 @@ def _tensor_to_shm(
         if created is not None:
             created.append(handle)
         return handle
-    if d2h_stream is not None:
+    if tensor.device.type == "cpu" and original_dtype == torch.bfloat16:
+        # NumPy has no BF16 dtype. Convert directly into the FP32 wire
+        # destination so the caller's BF16 video does not coexist with both
+        # a full widened staging tensor and the shared-memory destination.
+        shm, shm_array, handle = _new_shm_array(tuple(tensor.shape), np.dtype(np.float32))
+        try:
+            torch.from_numpy(shm_array).copy_(tensor.detach())
+        except BaseException:
+            shm.unlink()
+            raise
+        finally:
+            del shm_array
+            shm.close()
+        handle.update({"__tensor_shm__": True, "torch_dtype": str(original_dtype)})
+        if created is not None:
+            created.append(handle)
+        return handle
+
+    # CPU outputs already reside on the host; a second pinned copy only
+    # duplicates the complete video without performing a device transfer.
+    if d2h_stream is not None and tensor.device.type != "cpu":
         # Non-blocking D2H: copy on side stream to pinned CPU memory.
         old_stream = torch.accelerator.current_stream()
         torch.accelerator.set_stream(d2h_stream)

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 Unit tests for the OpenAI video storage managers.
 """
@@ -34,6 +34,16 @@ def test_local_storage_open_returns_none_for_missing_key(tmp_path):
     handle = asyncio.run(storage.open("missing-video"))
 
     assert handle is None
+
+
+@pytest.mark.parametrize("key", ["../outside", "../storage-sibling/file", "/etc/passwd", "", "."])
+def test_local_storage_rejects_keys_outside_storage_dir(tmp_path, key):
+    storage = LocalStorageManager(storage_path=str(tmp_path / "storage"))
+
+    with pytest.raises(ValueError, match="Illegal storage key"):
+        storage.get_full_file_path(key)
+    with pytest.raises(ValueError, match="Illegal storage key"):
+        asyncio.run(storage.open(key))
 
 
 def test_local_storage_ttl_save_sets_expiration_metadata(tmp_path, monkeypatch):
