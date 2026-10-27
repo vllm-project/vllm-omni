@@ -1832,6 +1832,15 @@ class DiffusionEngine:
         output = self.add_req_and_wait_for_response(req)
         if output.error:
             raise RuntimeError(f"Dummy run failed: {output.error}")
+        # Drain work still queued from the warmup before serving real
+        # requests: CANN compiles some ops at dequeue time on the runtime
+        # thread, so leftover warmup work would otherwise collide with the
+        # first request and stall it (seconds on first-generation runs).
+        # Mirrors the diffusion pipeline profiler's synchronize idiom.
+        from vllm_omni.platforms import current_omni_platform
+
+        if current_omni_platform.is_available():
+            current_omni_platform.synchronize()
 
     def _submit_rpc(
         self,
