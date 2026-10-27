@@ -30,6 +30,8 @@ def test_flow_graph_replay_matches_eager_solve(monkeypatch, streaming, backend):
     monkeypatch.setenv("COSYVOICE3_FULL_RESPONSE_OPTIMIZATIONS", "0" if streaming else "1")
     monkeypatch.setenv("COSYVOICE3_PACKED_STREAMING", "1" if streaming else "0")
     monkeypatch.setattr(module, "CausalHiFTGenerator", MelOutput)
+    # Random weights and inputs: seed them so a failure reproduces.
+    torch.manual_seed(0)
     config = CosyVoice3Config()
     config.flow["pre_lookahead_layer"]["channels"] = 32
     # 256 channels in 16 conv groups keep the packed convolution (and graphs).
@@ -60,10 +62,11 @@ def test_flow_graph_replay_matches_eager_solve(monkeypatch, streaming, backend):
     extra = dict(token_offset_tokens=2, finalize=False, cache_state=None) if streaming else {}
     # The second batch reuses the first one's padded layout with new lengths.
     batches = [_items([(7, 60), (13, 41), (3, 97)], **extra), _items([(5, 71), (9, 30), (11, 88)], **extra)]
-    # FlashInfer picks its query tile from the planned layout, so the graph's
-    # padded layout may reduce in another order than the eager solve; CFG
-    # amplifies that rounding on a few elements. A misread KV row is O(1).
-    tolerance = 5e-2 if backend == "flashinfer" else 1e-2
+    # The graph pads the packed length to a multiple of 128, so Inductor runs
+    # kernels specialized for 16-divisible sizes that the eager layout does not
+    # hit; their reductions round a few elements one bf16 ULP apart, and CFG
+    # amplifies that over the Euler steps to ~3e-2. A misread KV row is O(1).
+    tolerance = 5e-2
     run(batches[0], graph=False)  # compile
     for items in batches:
         actual = run(items, graph=True)
