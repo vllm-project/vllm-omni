@@ -4,9 +4,11 @@
 
 from __future__ import annotations
 
+import logging
 from os.path import commonprefix
 from typing import TYPE_CHECKING, Any
 
+import regex as re
 import torch
 from vllm.model_executor.layers.quantization.inc import INCConfig
 from vllm.model_executor.layers.quantization.inc.inc_linear import INCLinearMethod
@@ -18,6 +20,7 @@ if TYPE_CHECKING:
     )
 
 _REGEX_SPECIAL_CHARS = frozenset(r"*+?^$()[]{}|\\")
+logger = logging.getLogger(__name__)
 
 
 def _stage_prefix(prefix_map: dict[str, str | None]) -> str:
@@ -60,15 +63,30 @@ def _remap_name(name: str, prefix_map: dict[str, str]) -> str:
     return name
 
 
+def _is_regex_key(key: str) -> bool:
+    return any(char in _REGEX_SPECIAL_CHARS for char in key)
+
+
+def _remap_regex_key(key: str, prefix_map: dict[str, str]) -> str:
+    """Remap a checkpoint prefix in a regex key in either dot style."""
+    for source in sorted(prefix_map, key=len, reverse=True):
+        target = prefix_map[source]
+        for source_form, target_form in (
+            (source, target),
+            (re.escape(source), re.escape(target)),
+        ):
+            if source_form != target_form and source_form in key:
+                return key.replace(source_form, target_form, 1)
+    return key
+
+
 def _remap_extra_config_key(key: str, prefix_map: dict[str, str]) -> str:
     """Remap an ``extra_config`` key, preserving regex patterns."""
-    if any(char in _REGEX_SPECIAL_CHARS for char in key):
-        for source in sorted(prefix_map, key=len, reverse=True):
-            escaped_source = source.replace(".", r"\.")
-            if escaped_source in key:
-                escaped_target = prefix_map[source].replace(".", r"\.")
-                return key.replace(escaped_source, escaped_target, 1)
-        return key
+    if _is_regex_key(key):
+        new_key = _remap_regex_key(key, prefix_map)
+        if new_key == key:
+            logger.debug("extra_config regex key did not match any prefix: %s", key)
+        return new_key
     return _remap_name(key, prefix_map)
 
 
@@ -131,26 +149,11 @@ class OmniINCConfig(INCConfig):
             new_extra: dict[str, Any] = {}
             sorted_keys = sorted(prefix_map, key=len, reverse=True)
 
-            # Build escaped-dot map for regex pattern keys
-            escaped_map: dict[str, str] = {}
-            for orig, new in prefix_map.items():
-                escaped_map[orig.replace(".", r"\.")] = (new or "").replace(".", r"\.")
-            escaped_sorted = sorted(escaped_map, key=len, reverse=True)
-
             for key, val in extra_config.items():
-                is_regex = any(c in _REGEX_SPECIAL_CHARS for c in key)
+                is_regex = _is_regex_key(key)
                 if is_regex:
-                    # Regex keys: escaped-dot substring replacement.
-                    # re.search matches anywhere so no stage prefix needed.
-                    new_key = key
-                    for esc_orig in escaped_sorted:
-                        if esc_orig in new_key:
-                            new_key = new_key.replace(
-                                esc_orig,
-                                escaped_map[esc_orig],
-                                1,
-                            )
-                            break
+                    # re.search matches anywhere, so no stage prefix is needed.
+                    new_key = _remap_extra_config_key(key, prefix_map)
                 else:
                     # Plain keys: prefix replacement + stage prefix.
                     new_key = key

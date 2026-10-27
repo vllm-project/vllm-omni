@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import os
 from types import SimpleNamespace
 
 import pytest
@@ -12,6 +11,7 @@ import torch
 import torch.nn as nn
 from transformers import Qwen3VLConfig, Qwen3VLTextConfig, Qwen3VLVisionConfig
 from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+from vllm.utils.network_utils import get_open_port
 
 from vllm_omni.diffusion.models.minimax_h3 import encoder as encoder_module
 from vllm_omni.diffusion.models.minimax_h3.encoder import MiniMaxH3Qwen3VLEncoder
@@ -20,25 +20,39 @@ pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
 
 @pytest.fixture(autouse=True)
-def _init_distributed():
+def _init_distributed(monkeypatch: pytest.MonkeyPatch):
     """Minimal world_size=1 TP group required by vLLM weight parameters."""
     from vllm.distributed.parallel_state import (
-        cleanup_dist_env_and_memory,
+        destroy_distributed_environment,
+        destroy_model_parallel,
         init_distributed_environment,
         initialize_model_parallel,
     )
 
-    os.environ.setdefault("MASTER_ADDR", "localhost")
-    os.environ.setdefault("MASTER_PORT", "29511")
-    init_distributed_environment(
-        world_size=1,
-        rank=0,
-        local_rank=0,
-        distributed_init_method="env://",
+    monkeypatch.setenv("MASTER_ADDR", "127.0.0.1")
+    monkeypatch.setenv("MASTER_PORT", str(get_open_port()))
+    try:
+        init_distributed_environment(
+            world_size=1,
+            rank=0,
+            local_rank=0,
+            distributed_init_method="env://",
+            backend="gloo",
+        )
+        initialize_model_parallel()
+        yield
+    finally:
+        destroy_model_parallel()
+        destroy_distributed_environment()
+
+
+@pytest.fixture(autouse=True)
+def _stub_mxfp4_kernel(monkeypatch: pytest.MonkeyPatch):
+    """The loader tests do not dispatch MXFP4 kernels on the CPU lane."""
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.quantization.inc.schemes.inc_mxfp4_linear.init_mxfp4_linear_kernel",
+        lambda **kwargs: None,
     )
-    initialize_model_parallel()
-    yield
-    cleanup_dist_env_and_memory()
 
 
 _HIDDEN = 64
@@ -225,13 +239,9 @@ def test_mixed_precision_encoder_loads_bf16_exception_and_mxfp4_layers(monkeypat
     )
 
 
-def test_row_parallel_slices_packed_and_scale_against_stored_width(monkeypatch):
+def test_row_parallel_slices_packed_and_scale_against_stored_width():
     from vllm_omni.quantization.inc_config import OmniINCConfig
 
-    monkeypatch.setattr(
-        "vllm.model_executor.layers.quantization.inc.schemes.inc_mxfp4_linear.init_mxfp4_linear_kernel",
-        lambda **kwargs: None,
-    )
     quant_config = OmniINCConfig.from_config(_mx_quant_config())
     quant_config.apply_prefix_map({"model.language_model.": "text_encoder.text_model."})
     packed = (
