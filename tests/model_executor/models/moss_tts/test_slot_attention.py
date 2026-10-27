@@ -516,6 +516,65 @@ def test_packed_block_entries_list_each_segment_block_in_order():
     assert blk[6:].tolist() == [9, 9, 9]
 
 
+@pytest.mark.parametrize("factor,block_m", [(1, 16), (2, 32), (4, 64), (8, 64), (16, 64), (32, 64)])
+@pytest.mark.parametrize("segments", [3, 129, 257])
+def test_packed_stage_metadata_matches_eager_construction(factor, block_m, segments):
+    """One launch reproduces the eager packed-stage metadata, RoPE table and offset commit bitwise."""
+    import math
+
+    from vllm_omni.model_executor.models.moss_tts.audio_tokenizer_v2 import (
+        commit_packed_offsets,
+        packed_stage_metadata,
+        rope_angles_at,
+    )
+    from vllm_omni.model_executor.models.moss_tts.slot_attention import packed_block_entries
+
+    gen = torch.Generator(device="cuda").manual_seed(factor * 1000 + segments)
+    capacity = 300
+    live = min(segments - 1, 40)
+    frames = torch.zeros(segments, dtype=torch.long, device="cuda")
+    frames[:live] = torch.randint(0, 16, (live,), device="cuda", generator=gen)
+    frames[live] = 7  # padding segment covering the bucket tail
+    slots = torch.randperm(capacity, device="cuda", generator=gen)[:segments]
+    valid = torch.zeros(segments, dtype=torch.bool, device="cuda")
+    valid[:live] = True
+    bounds = F.pad(torch.cumsum(frames, 0), (1, 0))
+    n = int(bounds[-1])
+    frame_segments = torch.searchsorted(bounds[1:], torch.arange(n, device="cuda"), right=True).clamp_(max=segments - 1)
+    state_offsets = torch.randint(0, 100_000, (capacity,), device="cuda", generator=gen)
+    head_dim, max_period = 64, 10000.0
+    ds = torch.arange(head_dim // 2, device="cuda", dtype=torch.float32)
+    freqs = torch.exp(ds * (-math.log(max_period) * 2 / head_dim))
+
+    offsets = state_offsets.index_select(0, slots)
+    lengths = frames * factor
+    tok_starts = bounds[:-1] * factor
+    tokens = torch.arange(n * factor, device="cuda")
+    segment = frame_segments[tokens // factor]
+    positions = offsets[segment] + (tokens - tok_starts[segment])
+    cos, sin = rope_angles_at(positions, head_dim, max_period)
+    entries = n * factor // block_m + min(segments, n)
+    entry_seg, entry_blk = packed_block_entries(lengths, block_m, entries)
+    assert int(((lengths + block_m - 1) // block_m).sum()) <= entries
+
+    actual = packed_stage_metadata(
+        state_offsets, slots, frames, bounds[:-1], frame_segments, freqs, n * factor, factor, block_m
+    )
+    for got, expected in zip(actual, (offsets, lengths, tok_starts, (cos, sin), entry_seg, entry_blk), strict=True):
+        if isinstance(expected, tuple):
+            for g, e in zip(got, expected, strict=True):
+                assert torch.equal(g, e)
+        else:
+            assert got.dtype == expected.dtype and torch.equal(got, expected)
+
+    block = torch.randint(0, 9, (25, capacity), device="cuda", generator=gen)
+    expected_block = block.clone()
+    next_offsets = torch.where(valid, offsets + lengths, offsets)
+    expected_block.index_copy_(1, slots, next_offsets.unsqueeze(0).expand(block.shape[0], -1))
+    commit_packed_offsets(block, slots, offsets, lengths, valid)
+    assert torch.equal(block, expected_block)
+
+
 @pytest.mark.parametrize("block_m", [16, 64])
 @pytest.mark.parametrize("capacity,context", [(125, 125), (140, 125), (400, 400)])
 def test_packed_flash_attention_matches_per_segment_launches_exactly(block_m, capacity, context):
