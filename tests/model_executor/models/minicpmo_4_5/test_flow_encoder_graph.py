@@ -123,7 +123,7 @@ def test_other_shapes_and_layouts_run_eager(fake_capture, monkeypatch: pytest.Mo
     assert graphs.replays == 1
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for graph capture")
 def test_captured_graphs_match_eager_bit_exactly_on_cuda() -> None:
     graphs, encode = _graphs("cuda")
@@ -169,7 +169,7 @@ def test_shared_capture_failure_blocks_subsequent_calls(fake_capture, monkeypatc
         graphs(tokens, last_chunk=False, cnn_cache=cnn[0], att_cache=att[0])
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_shared_arena_rejects_other_stream_and_autocast():
     graphs, _ = _graphs("cuda")
@@ -270,7 +270,7 @@ def test_exact_precapture_failure_blocks_retry(monkeypatch):
         graph(tokens, last_chunk=False, cnn_cache=None, att_cache=None)
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("amp", [False, True])
 @torch.inference_mode()

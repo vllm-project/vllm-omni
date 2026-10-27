@@ -57,6 +57,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         model_config = self.vllm_config.model_config
         self._init_omni_io_scheduling_state()
         self._retains_state_across_chunks = bool(getattr(model_config, "retains_state_across_chunks", False))
+        self._supports_pending_generation = bool(getattr(model_config, "supports_pending_generation", False))
         self._pending_finish_reqs: list[Request] = []
         self._pending_chunk_error_outputs: list[tuple[int, EngineCoreOutput]] = []
         connector_config = getattr(model_config, "stage_connector_config", None)
@@ -465,6 +466,9 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         self._resync_streaming_input_counter()
         async_chunk_transport = self._async_chunk_transport_enabled()
         native_chunks = bool(getattr(self, "_native_data_plane", False) and async_chunk_transport)
+        serialize_inputs = native_chunks or (
+            async_chunk_transport and getattr(self, "_supports_pending_generation", False)
+        )
         # Parking releases an execution slot, but stateful codecs retain their
         # request-owned state until completion or abort, in either runner.
         reserved_running_slots = (
@@ -508,7 +512,9 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                 req_index += 1
                 continue
 
-            if native_chunks and request.num_in_flight_tokens > 0:
+            if request.num_in_flight_tokens > 0 and (
+                serialize_inputs or request.num_computed_tokens >= len(request.prompt_token_ids)
+            ):
                 # Overlap different streams, never two stateful chunks from
                 # the same stream. Readiness remains pending for the next step.
                 req_index += 1
@@ -586,7 +592,9 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                 self.deferred_waiting.add(request)
                 skipped_requests.add_request(request)
                 continue
-            if native_chunks and request.num_in_flight_tokens > 0:
+            if request.num_in_flight_tokens > 0 and (
+                serialize_inputs or request.num_computed_tokens >= len(request.prompt_token_ids)
+            ):
                 # A restored waiting entry can still own an outstanding batch.
                 # Do not let it block other ready streams or execute it twice.
                 request_queue.pop_request()
@@ -762,7 +770,10 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         self._update_after_schedule(scheduler_output)
 
         try:
-            self._postprocess_omni_schedule_output(scheduler_output)
+            # Streaming generation may need several executions of this input.
+            self._postprocess_omni_schedule_output(
+                scheduler_output, consume_chunks=not getattr(self, "_supports_pending_generation", False)
+            )
         finally:
             self._restore_omni_wait_queues()
 
@@ -983,15 +994,24 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
 
             # One-shot generation request: finish after its current input unit
             # has been fully processed.
+            generation_pending = req_id in getattr(model_runner_output, "pending_generation_req_ids", set())
+            if generation_pending:
+                # The model owns its AR/KV state and yielded an output chunk.
+                # Re-schedule this input unit without inventing output tokens.
+                request.num_computed_tokens -= num_tokens_scheduled
+            elif self.chunk_transfer_adapter is not None and getattr(self, "_supports_pending_generation", False):
+                self.chunk_transfer_adapter.mark_chunk_consumed(req_id)
             if (
                 request.status == RequestStatus.FINISHED_ERROR
                 or request.status == RequestStatus.FINISHED_STOPPED
                 or (
                     not self._async_chunk_transport_enabled()
+                    and not generation_pending
                     and request.num_computed_tokens >= request.num_prompt_tokens
                 )
                 or (
                     self._async_chunk_transport_enabled()
+                    and not generation_pending
                     and self._input_execution_is_terminal(
                         request.request_id,
                         scheduler_output,

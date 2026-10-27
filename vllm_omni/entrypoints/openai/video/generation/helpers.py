@@ -40,6 +40,7 @@ from pydantic import TypeAdapter, ValidationError
 from vllm.entrypoints.launchers.launcher import terminate_if_errored
 from vllm.entrypoints.serve import create_error_response
 from vllm.logger import init_logger
+from vllm.multimodal.image import open_image
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 
 from vllm_omni.diffusion.models.interface import ReferenceVideoDecodeSpec
@@ -87,7 +88,7 @@ MINIMAX_H3_MAX_REFERENCE_AUDIO_BYTES = 15 * 1024 * 1024
 
 MINIMAX_H3_MAX_REFERENCE_COUNT = 12
 
-MINIMAX_H3_REFERENCE_IMAGE_FORMATS = frozenset({"jpeg", "png", "webp", "heic", "heif"})
+MINIMAX_H3_REFERENCE_IMAGE_FORMATS = frozenset({"jpeg", "png", "webp"})
 
 MINIMAX_H3_REFERENCE_VIDEO_SUFFIXES = frozenset({".mp4", ".mov"})
 
@@ -729,6 +730,8 @@ def _uploaded_media_kind(upload: UploadFile) -> str:
     if content_type.startswith("audio/"):
         return "audio"
     suffix = Path(upload.filename or "").suffix.lower()
+    # HEIC/HEIF are classified as images so they take the image validation path;
+    # the decoder allowlist below does not accept those formats.
     if suffix in {".png", ".jpg", ".jpeg", ".webp", ".heic", ".heif"}:
         return "image"
     if suffix in {".wav", ".mp3", ".m4a", ".aac", ".flac", ".ogg"}:
@@ -781,7 +784,7 @@ def _validate_minimax_h3_image_payload(
 ) -> None:
     """Validate a H3 image before converting it to a format-less PIL image."""
     try:
-        with Image.open(io.BytesIO(payload)) as image:
+        with open_image(io.BytesIO(payload)) as image:
             image_format = str(image.format or "").lower()
             if image_format in MINIMAX_H3_REFERENCE_IMAGE_FORMATS:
                 _validate_image_pixel_limit(image)
@@ -795,15 +798,15 @@ def _validate_minimax_h3_image_payload(
     except (OSError, ValueError) as exc:
         if allow_non_image:
             return
-        raise HTTPException(400, detail=f"Invalid uploaded image reference: {filename}") from exc
+        raise HTTPException(
+            HTTPStatus.BAD_REQUEST.value,
+            detail=(f"Invalid uploaded image reference: {filename}. Expected a JPG, JPEG, PNG, or WEBP image."),
+        ) from exc
 
     if image_format not in MINIMAX_H3_REFERENCE_IMAGE_FORMATS:
         raise HTTPException(
             status_code=HTTPStatus.BAD_REQUEST.value,
-            detail=(
-                "MiniMax H3 reference images must use JPG, JPEG, PNG, WEBP, HEIC, or HEIF; "
-                f"got {image_format or 'unknown'}."
-            ),
+            detail=(f"MiniMax H3 reference images must use JPG, JPEG, PNG, or WEBP; got {image_format or 'unknown'}."),
         )
 
 
@@ -1087,6 +1090,8 @@ async def _parse_video_form(
             ),
         )
 
+    if model == "auto":
+        model = None
     request_data: dict[str, Any] = {
         "prompt": prompt,
         "model": model,

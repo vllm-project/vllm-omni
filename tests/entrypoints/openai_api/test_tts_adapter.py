@@ -6,6 +6,8 @@ Pure-Python registry/resolution logic; no model or GPU resources are loaded.
 """
 
 import asyncio
+import base64
+import json
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
@@ -33,6 +35,7 @@ from vllm_omni.entrypoints.openai.tts_adapters import (
     detect_tts_model_type,
     resolve_adapter,
 )
+from vllm_omni.entrypoints.openai.tts_adapters import ming3_tts as ming3_tts_module
 from vllm_omni.entrypoints.openai.tts_adapters.auk import AuKAdapter
 from vllm_omni.entrypoints.openai.tts_adapters.base import TTSCapabilities, resolve_stage_model_path
 from vllm_omni.entrypoints.openai.tts_adapters.covo_audio import CovoAudioAdapter
@@ -42,10 +45,13 @@ from vllm_omni.entrypoints.openai.tts_adapters.indextts2 import (
     IndexTTS25Adapter,
     indextts2_conditioning_cache_salt,
 )
+from vllm_omni.entrypoints.openai.tts_adapters.ming3_audio_tts import Ming3AudioTTSAdapter
+from vllm_omni.entrypoints.openai.tts_adapters.ming3_tts import Ming3TTSAdapter
 from vllm_omni.entrypoints.openai.tts_adapters.ming_flash_omni_tts import MingFlashOmniTTSAdapter
 from vllm_omni.entrypoints.openai.tts_adapters.moss_tts import (
     MossTTSAdapter,
     MossTTSNanoAdapter,
+    _code_grid_cache_salt,
 )
 from vllm_omni.entrypoints.openai.tts_adapters.qwen3_tts import (
     QWEN3_TTS_AUTO_BUDGET_KEY,
@@ -60,6 +66,7 @@ from vllm_omni.model_executor.models.indextts2 import prompt_utils
 from vllm_omni.model_executor.models.indextts2.tokenizer_v2_5 import (
     INDEXTTS25_TOKENIZER_FILE,
 )
+from vllm_omni.model_executor.models.ming_flash_omni.reference_audio import unpack_reference_audio
 from vllm_omni.model_executor.stage_input_processors.auk import encoder2dit
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -76,6 +83,7 @@ EXPECTED_MODEL_TYPES = {
     "omnivoice",
     "covo_audio",
     "ming_tts",
+    "ming3_tts",
     "moss_tts_nano",
     "moss_tts",
     "higgs_audio_v2",
@@ -583,6 +591,51 @@ def test_moss_reference_transcript_mode(variant, ref_text, mode, mocker):
     assert request.input == "Target."
 
 
+def test_moss_code_grid_cache_salt():
+    import torch
+
+    pad = torch.full((1, 12), 1024)
+    reference = torch.arange(36).reshape(3, 12)
+
+    def grid(lead, tail, ref=reference):
+        return torch.cat([pad.expand(lead, -1), ref, pad.expand(tail, -1)])
+
+    salt = _code_grid_cache_salt(grid(12, 40))
+    # Trailing padding follows the text length.
+    assert _code_grid_cache_salt(grid(12, 7)) == salt
+    # The reference codes and their rows are Talker inputs.
+    assert _code_grid_cache_salt(grid(13, 40)) != salt
+    assert _code_grid_cache_salt(grid(12, 40, reference + 1)) != salt
+
+
+def test_moss_salt_shares_reference_across_texts(mocker):
+    import torch
+
+    def process(*, conversations, mode):
+        message = conversations[0][0]
+        tail = len(message["text"]) + len(message.get("language", ""))
+        codes = torch.cat([torch.full((2, 12), 1024), message["reference"][0], torch.full((tail, 12), 1024)])
+        return {"input_ids": [torch.cat([torch.zeros((len(codes), 1), dtype=torch.int64), codes], dim=1)]}
+
+    processor = mocker.Mock(side_effect=process)
+    processor.build_user_message.side_effect = lambda **kwargs: kwargs
+    adapter = MossTTSAdapter(SpeechServingContext(server=mocker.Mock()))
+    adapter._moss_variant = "local"
+    mocker.patch.object(adapter, "_get_moss_processor", return_value=processor)
+
+    def salt(reference, **fields):
+        mocker.patch.object(
+            adapter, "_encode_moss_references", new=mocker.AsyncMock(return_value=([reference], {0: "key"}))
+        )
+        request = OpenAICreateSpeechRequest(ref_audio="file:///reference.wav", **fields)
+        return asyncio.run(adapter.build(request, [], has_inline_ref_audio=True)).prompt["cache_salt"]
+
+    voice = torch.ones((3, 12), dtype=torch.int64)
+    hello = salt(voice, input="Hello.")
+    assert salt(voice, input="A longer target.", language="English") == hello
+    assert salt(voice + 1, input="Hello.") != hello
+
+
 def _moss_adapter_with_stage_configs(stage_configs, mocker):
     engine_client = SimpleNamespace(
         model_config=SimpleNamespace(model="OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5"),
@@ -779,10 +832,12 @@ def test_covo_audio_build_constructs_tokenized_prompt():
     assert prepared.model_type == "covo_audio"
 
 
-def test_ming_flash_omni_build_constructs_prepared_request():
+@pytest.mark.parametrize("voice", [None, "DB30"])
+def test_ming_flash_omni_build_constructs_prepared_request(voice):
     server = SimpleNamespace(uploaded_speakers={})
     adapter = MingFlashOmniTTSAdapter(SimpleNamespace(server=server, engine_client=SimpleNamespace()))
-    request = OpenAICreateSpeechRequest(input="hello", voice="test")
+    request = OpenAICreateSpeechRequest(input="hello", voice=voice)
+    assert adapter.validate(request) is None
 
     prepared = asyncio.run(adapter.build(request, [], False))
 
@@ -790,8 +845,75 @@ def test_ming_flash_omni_build_constructs_prepared_request():
     info = prepared.prompt["additional_information"]
     assert info["ming_task"] == "instruct"
     assert info["text"] == "hello"
-    assert info["voice_name"] == "test"
+    assert info["voice_name"] == voice
+    assert json.loads(info["instruction"])["audio_sequence"][0]["IP"] is None
+    assert "speaker_conditioning" not in info
+    assert "prompt_audio_mode" not in info
     assert prepared.model_type == "ming_flash_omni_tts"
+
+
+def test_ming3_build_passes_base64_reference_audio():
+    class FakeServer:
+        uploaded_speakers = {}
+
+        async def _resolve_ref_audio_array(self, uri):
+            self.uri = uri
+            return [0.1, -0.1], 16000, "cache-key"
+
+    server = FakeServer()
+    adapter = Ming3AudioTTSAdapter(SimpleNamespace(server=server, engine_client=SimpleNamespace()))
+    encoded = base64.b64encode(b"RIFFfakeWAVE").decode()
+    request = OpenAICreateSpeechRequest(input="hello", ref_audio=encoded)
+
+    assert adapter.validate(request) is None
+    prepared = asyncio.run(adapter.build(request, [], True))
+
+    assert server.uri == f"data:audio/wav;base64,{encoded}"
+    info = prepared.prompt["additional_information"]
+    reference = unpack_reference_audio(info)[0]
+    assert reference["sample_rate"] == 16000
+    assert reference["samples"].tolist() == pytest.approx([0.1, -0.1])
+    assert info["speaker_conditioning"] == "prompt"
+    assert info["prompt_audio_mode"] == "speaker_only"
+    assert info["instruction"] is None
+
+
+@pytest.mark.parametrize(
+    "count,samples,fetches", [(17, [0.1], 0), (2, [float("nan")], 1)], ids=["too-many-clips", "invalid-first-clip"]
+)
+def test_ming3_build_rejects_invalid_references_before_further_io(mocker, count, samples, fetches):
+    resolve = mocker.AsyncMock(return_value=(samples, 16000, "cache-key"))
+    adapter = Ming3AudioTTSAdapter(SpeechServingContext(server=SimpleNamespace(_resolve_ref_audio_array=resolve)))
+    request = OpenAICreateSpeechRequest(input="hello", ref_audio=["AA=="] * count)
+
+    with pytest.raises(ValueError, match="Reference audio"):
+        asyncio.run(adapter.build(request, [], True))
+
+    assert resolve.await_count == fetches
+
+
+def test_ming3_rejects_mixed_ip_and_reference():
+    adapter = Ming3AudioTTSAdapter(SimpleNamespace(server=SimpleNamespace(), engine_client=SimpleNamespace()))
+    request = OpenAICreateSpeechRequest(input="hello", voice="灵小柔", ref_audio="data:audio/wav;base64,AA==")
+    assert "either" in adapter.validate(request)
+
+
+def test_ming2_rejects_new_reference_api():
+    adapter = MingFlashOmniTTSAdapter(SpeechServingContext(server=SimpleNamespace()))
+    request = OpenAICreateSpeechRequest(input="hello", ref_audio="data:audio/wav;base64,AA==")
+    assert "not yet supported" in adapter.validate(request)
+
+
+def test_ming3_tts_does_not_reinterpret_ip_voice_as_ming2_preset():
+    adapter = Ming3AudioTTSAdapter(SpeechServingContext(server=SimpleNamespace(uploaded_speakers={})))
+    request = OpenAICreateSpeechRequest(input="hello", voice="TEST_VOICE_A")
+    assert adapter.validate(request) is None
+    prepared = asyncio.run(adapter.build(request, [], False))
+    info = prepared.prompt["additional_information"]
+    assert info["voice_name"] is None
+    assert json.loads(info["instruction"])["audio_sequence"][0]["IP"] == "TEST_VOICE_A"
+    assert info["speaker_conditioning"] == "mute"
+    assert prepared.model_type == "ming3_audio_tts"
 
 
 def test_step_audio2_build_constructs_open_assistant_turn():
@@ -989,6 +1111,91 @@ def test_qwen3_tts_rejects_only_length_finished_base_audio(mocker):
     # engine terminal reason still makes this an unambiguous limit failure.
     with pytest.raises(Qwen3TTSCodecLimitError, match="191/192"):
         adapter.validate_generation(params, stage0_finish_reason="length", output_tokens=191)
+
+
+@pytest.mark.parametrize("architecture", ["Ming3TTSForConditionalGeneration", "LingV3TTSForConditionalGeneration"])
+def test_detects_ming3_by_architecture(architecture):
+    assert detect_tts_model_type("llm", architecture) == "ming3_tts"
+
+
+def test_ming3_build_accepts_resolver_cache_key(mocker):
+    server = SimpleNamespace(_tts_tokenizer=object())
+    server._resolve_ref_audio = mocker.AsyncMock(return_value=([0.1], 24000, "cache-key"))
+    server._get_resolved_ref_audio_artifact_key = mocker.Mock(return_value="artifact-key")
+    mocker.patch.object(
+        ming3_tts_module,
+        "build_ming3_prompt",
+        return_value={
+            "prompt_token_ids": [1],
+            "prompt": "prompt",
+            "text": "hello",
+            "additional_information": {},
+        },
+    )
+    request = OpenAICreateSpeechRequest(
+        input="hello",
+        ref_audio="file:///reference.wav",
+        ref_text=None,
+        max_new_tokens=200,
+    )
+
+    prepared = asyncio.run(Ming3TTSAdapter(SpeechServingContext(server=server)).build(request, [], False))
+
+    server._resolve_ref_audio.assert_awaited_once_with(request.ref_audio)
+    server._get_resolved_ref_audio_artifact_key.assert_called_once_with("cache-key")
+    assert prepared.prompt["additional_information"]["speaker_audio_keys"] == ["artifact-key"]
+    assert prepared.model_type == "ming3_tts"
+
+
+def test_ming3_sampling_overrides_attach_request_rng_state(mocker):
+    server = mocker.Mock()
+    server.engine_client.model_config.hf_config.tts_config = {}
+    adapter = Ming3TTSAdapter(SpeechServingContext(server=server))
+    defaults = [SamplingParams(max_tokens=801)]
+    prompt: dict[str, Any] = {"additional_information": {}}
+    request = OpenAICreateSpeechRequest(input="hello", max_new_tokens=200, seed=1234)
+
+    overridden = adapter.apply_sampling_overrides(defaults, request, prompt, "request-1")
+
+    assert overridden[0].max_tokens == 201
+    assert prompt["additional_information"] == {
+        "ming3_request_id": "request-1",
+        "tts_local_seed": 1234,
+    }
+
+
+def test_ming3_rejects_transcript_without_reference_audio():
+    request = OpenAICreateSpeechRequest(input="hello", ref_text="Reference transcript.")
+    server = SimpleNamespace(_apply_uploaded_speaker=lambda request: None)
+    adapter = Ming3TTSAdapter(SpeechServingContext(server=server))
+
+    assert adapter.validate(request) == "'ref_text' requires reference audio"
+
+
+def test_ming3_accepts_audio_backed_uploaded_voice(mocker):
+    def resolve_uploaded_voice(request):
+        request.ref_audio = "data:audio/wav;base64,AA=="
+        request.ref_text = "Reference transcript."
+        return None
+
+    server = SimpleNamespace(
+        _apply_uploaded_speaker=mocker.Mock(side_effect=resolve_uploaded_voice),
+        _validate_ref_audio_format=lambda ref_audio: None,
+    )
+    request = OpenAICreateSpeechRequest(
+        input="hello",
+        voice="alice",
+        ref_audio=None,
+        ref_text=None,
+        instructions=None,
+        speaker_embedding=None,
+        max_new_tokens=None,
+    )
+
+    assert Ming3TTSAdapter(SpeechServingContext(server=server)).validate(request) is None
+    server._apply_uploaded_speaker.assert_called_once_with(request)
+    assert request.ref_audio == "data:audio/wav;base64,AA=="
+    assert request.ref_text == "Reference transcript."
 
 
 def test_indextts_adapters_are_versioned():
@@ -1313,3 +1520,16 @@ def test_registered_voice_salt_preserves_resolved_conditioning(key):
     first = conditioning_cache_salt(request, {key: "a"}, registered_voice=("speaker", 123))
     second = conditioning_cache_salt(request, {key: "b"}, registered_voice=("speaker", 123))
     assert first != second
+
+
+def test_ming3_tts_defaults_to_ip_voice_without_reference():
+    adapter = Ming3AudioTTSAdapter(SpeechServingContext(server=SimpleNamespace(uploaded_speakers={})))
+    request = OpenAICreateSpeechRequest(input="hello")
+    assert adapter.validate(request) is None
+    assert request.voice == "灵小柔"
+    prepared = asyncio.run(adapter.build(request, [], False))
+    info = prepared.prompt["additional_information"]
+    assert json.loads(info["instruction"])["audio_sequence"][0]["IP"] == "灵小柔"
+    assert info["prompt_audio_mode"] == "none"
+    assert info["speaker_conditioning"] == "mute"
+    assert "reference_audio" not in info

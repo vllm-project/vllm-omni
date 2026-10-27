@@ -86,6 +86,16 @@ interpretation, connector transport mechanics, scheduling policy, or semantic
 error classification. The `ErrorMessage` schema belongs here; the meaning and
 public rendering of its error fields belong to `error_contracts.md`.
 
+## Current audio decoding compatibility
+
+Omni retains soundfile-first automatic audio decoding when using vLLM 0.32.
+Decoder rounding can affect BF16 model inputs and generated responses.
+Missing soundfile dependencies and unsupported formats fall back to upstream
+decoders; explicit backend selections keep upstream behavior. Encoded-size,
+duration and decoded-memory limits remain enforced by upstream media helpers,
+and recognized-format corruption errors propagate. Tests in
+`tests/inputs/test_audio_decode.py` cover these compatibility boundaries.
+
 ## Candidate invariants
 
 These identifiers are proposals while the document is `draft`.

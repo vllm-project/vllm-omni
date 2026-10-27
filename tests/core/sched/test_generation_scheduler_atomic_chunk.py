@@ -81,8 +81,8 @@ class FakeAdapter:
     """Minimal chunk-receiving adapter honoring the ready-chunk contract.
 
     ``postprocess_scheduler_output`` mirrors the real adapter's
-    ``_clear_chunk_ready``: only request ids actually scheduled in this step
-    lose their ready marker; deferred chunks stay ready for the next step.
+    completion-owned input lifetime: generation scheduling retains ready
+    markers until an input finishes; deferred chunks remain ready as well.
     """
 
     def __init__(self, receives_chunks: bool = True):
@@ -119,9 +119,13 @@ class FakeAdapter:
         self.finish_calls.append((set(request_ids), finished_status))
         self.finish_calls_unresolved = [req_id for req_id in request_ids if req_id not in requests]
 
-    def postprocess_scheduler_output(self, scheduler_output):
-        for req_id in getattr(scheduler_output, "num_scheduled_tokens", {}):
-            self.requests_with_ready_chunks.discard(req_id)
+    def postprocess_scheduler_output(self, scheduler_output, requests=None, *, consume_chunks=True):
+        if consume_chunks:
+            for req_id in getattr(scheduler_output, "num_scheduled_tokens", {}):
+                self.mark_chunk_consumed(req_id)
+
+    def mark_chunk_consumed(self, request_id):
+        self.requests_with_ready_chunks.discard(request_id)
 
 
 def _make_scheduler(
@@ -239,6 +243,36 @@ def _stage_running_chunk(sched, request: Request) -> None:
     sched.chunk_transfer_adapter.requests_with_ready_chunks.add(request.request_id)
 
 
+@pytest.mark.parametrize("queue_name", ["running", "waiting"])
+@pytest.mark.parametrize("native,pending", [(False, False), (False, True), (True, False)])
+def test_in_flight_guard_preserves_stateless_legacy_overlap(queue_name, native, pending):
+    sched = _make_scheduler(budget=32)
+    sched._native_data_plane = native
+    sched._supports_pending_generation = pending
+    sched.async_scheduling = True
+    sched.scheduler_config.async_scheduling = True
+    request = _make_request("overlap", 8)
+    request.num_computed_tokens = 4
+    request.num_in_flight_tokens = 1
+    if queue_name == "running":
+        _stage_running_chunk(sched, request)
+    else:
+        _stage_waiting_chunk(sched, request)
+    output = sched.schedule()
+    assert (request.request_id in output.num_scheduled_tokens) == (not native and not pending)
+
+
+@pytest.mark.parametrize("pending", [False, True])
+def test_only_pending_generation_retains_ready_input_after_schedule(pending):
+    sched = _make_scheduler(budget=32)
+    sched._supports_pending_generation = pending
+    request = _make_request("ready", 8)
+    _stage_waiting_chunk(sched, request)
+    output = sched.schedule()
+    assert output.num_scheduled_tokens[request.request_id] == 8
+    assert (request.request_id in sched.chunk_transfer_adapter.requests_with_ready_chunks) == pending
+
+
 def _make_runner_output():
     return SimpleNamespace(
         sampled_token_ids=None,
@@ -279,17 +313,19 @@ class TestWaitingDefersWholeChunk:
         assert getattr(sched, queue_name).peek_request() is deferred
         assert deferred.request_id in sched.chunk_transfer_adapter.requests_with_ready_chunks
         assert len(sched.running) == 56
-        # Only the scheduled chunks lose their ready marker (clear-on-schedule).
+        # One-shot inputs release readiness on admission; deferred input stays ready.
         assert sched.chunk_transfer_adapter.requests_with_ready_chunks == {deferred.request_id}
 
         # Complete the admitted chunks; the deferred chunk must remain usable
         # and be admitted whole on the next step from either waiting queue.
         for request in requests[:56]:
             request.num_computed_tokens = FIRST_CHUNK_TOKENS
+            request.num_in_flight_tokens = 0
+            sched.chunk_transfer_adapter.mark_chunk_consumed(request.request_id)
         next_output = sched.schedule()
         assert next_output.num_scheduled_tokens == {deferred.request_id: FIRST_CHUNK_TOKENS}
         assert not getattr(sched, queue_name)
-        assert deferred.request_id not in sched.chunk_transfer_adapter.requests_with_ready_chunks
+        assert not sched.chunk_transfer_adapter.requests_with_ready_chunks
 
     def test_exact_fit_chunk_is_scheduled_whole(self):
         sched = _make_scheduler(budget=FIRST_CHUNK_TOKENS)

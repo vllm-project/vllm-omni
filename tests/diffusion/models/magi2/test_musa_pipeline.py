@@ -60,11 +60,11 @@ def test_constructor_uses_selected_device(monkeypatch, device_type):
 
 
 @pytest.mark.cpu
-@pytest.mark.parametrize("device_type,available", [("cuda", False), ("musa", False), ("cpu", True), ("xpu", True)])
+@pytest.mark.parametrize("device_type,available", [("cuda", False), ("musa", False), ("cpu", True)])
 def test_constructor_rejects_unsupported_or_unavailable(monkeypatch, device_type, available):
     monkeypatch.setattr(pipeline, "current_omni_platform", fake_platform(device_type, available))
     resolver = stop_before_weights(monkeypatch)
-    with pytest.raises(RuntimeError, match="available CUDA or MUSA"):
+    with pytest.raises(RuntimeError, match="requires an accelerator"):
         pipeline.Magi2Pipeline(od_config=config())
     resolver.assert_not_called()
 

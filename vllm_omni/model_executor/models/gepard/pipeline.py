@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Gepard-1.0 pipeline topology.
 
 Single-stage AR TTS. The Qwen3.5 backbone runs under paged attention, the 32
@@ -40,6 +40,11 @@ GEPARD_PIPELINE = PipelineConfig(
                 "detokenize": False,
                 "stop_token_ids": [_GEPARD_STOP_TOKEN_ID],
             },
+            # A frame's 31 side-channel FSQ codes never enter the token stream,
+            # so a replay cannot rebuild the KV behind audio already delivered
+            # (#6179; the preemption warning at gepard_talker.py only reports
+            # the damage after it happens).
+            recompute_preemption="fail",
         ),
     ),
 )

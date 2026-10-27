@@ -16,7 +16,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.diffusion]
     "device",
     [
         pytest.param("cpu", marks=pytest.mark.cpu),
-        pytest.param("cuda", marks=hardware_marks(res={"cuda": "L4"}, num_cards=1)),
+        pytest.param("cuda", marks=hardware_marks(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)),
     ],
 )
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
@@ -39,7 +39,7 @@ def test_qk_norm_matches_diffusers_rounding(monkeypatch, device, dtype):
     "device",
     [
         pytest.param("meta", marks=pytest.mark.cpu),
-        pytest.param("cuda", marks=hardware_marks(res={"cuda": "L4"}, num_cards=1)),
+        pytest.param("cuda", marks=hardware_marks(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)),
     ],
 )
 def test_rope_frequencies_do_not_depend_on_loader_device(device):
@@ -51,7 +51,7 @@ def test_rope_frequencies_do_not_depend_on_loader_device(device):
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 def test_scheduler_matches_diffusers_on_latent_device():
     import numpy as np
     from diffusers import FlowMatchEulerDiscreteScheduler
@@ -76,7 +76,7 @@ def test_scheduler_matches_diffusers_on_latent_device():
     assert timesteps.device == sample.device
 
 
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@hardware_test(res={"cuda": "L4", "rocm": "MI325"}, num_cards=1)
 def test_timestep_frequencies_match_cpu_initialization():
     reference = transformer.QwenImage21TemporalTimesteps(timestep_dim=256)
     with torch.device("cuda"):
