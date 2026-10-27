@@ -11,10 +11,11 @@ import torch
 from torch._inductor.utils import run_and_get_code
 from torch.fx.experimental.symbolic_shapes import is_concrete_int
 
+from tests.helpers.mark import hardware_test
 from vllm_omni.diffusion.models.magi2 import attention, modeling_magi2, parallel
 from vllm_omni.diffusion.models.magi2.attention import VarlenHandler
+from vllm_omni.diffusion.models.magi2.common_layers import ModalityDispatcher
 from vllm_omni.diffusion.models.magi2.configuration_magi2 import Magi2MoEConfig, Magi2PreviewConfig
-from vllm_omni.diffusion.models.magi2.layers import ModalityDispatcher
 from vllm_omni.diffusion.models.magi2.modeling_magi2 import Magi2Attention, Magi2TransformerLayer
 from vllm_omni.diffusion.models.magi2.parallel import Magi2ParallelGroup, balanced_split_sizes
 
@@ -523,7 +524,7 @@ def _real_musa_output_inputs(tokens, num_modality):
     return module, attended, gates, dispatcher
 
 
-@pytest.mark.musa
+@hardware_test(res={"musa": "S5000"}, num_cards=1)
 @pytest.mark.parametrize("dynamic", [False, True])
 @pytest.mark.parametrize("tokens,world_size", [(3702, 8), (3651, 4), (14, 8)])
 @pytest.mark.parametrize("num_modality", [1, 3])
@@ -553,7 +554,7 @@ def _compiled_triton_kernels(fn, *args, dynamic):
     return result, kernels
 
 
-@pytest.mark.musa
+@hardware_test(res={"musa": "S5000"}, num_cards=1)
 @pytest.mark.parametrize("world_size", [8, 4])
 @pytest.mark.parametrize("num_modality", [1, 3])
 def test_real_musa_dynamic_compile_indexes_head_shards_without_runtime_division(world_size, num_modality):
@@ -622,7 +623,7 @@ def _dense_layer(num_modality):
     return _initialized(Magi2TransformerLayer(config, 0 if num_modality == 3 else 1), 29).to("musa")
 
 
-@pytest.mark.musa
+@hardware_test(res={"musa": "S5000"}, num_cards=1)
 @pytest.mark.parametrize("tokens,world_size", [(3702, 8), (3651, 4), (14, 8)])
 @pytest.mark.parametrize("num_modality", [1, 3])
 def test_real_musa_compiled_attention_input_head_shards_are_bitwise_unchanged(tokens, world_size, num_modality):
