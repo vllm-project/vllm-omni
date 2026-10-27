@@ -940,6 +940,7 @@ class OmniDiffusionConfig:
     # serialize it across processes; __post_init__ validates it once and caches
     # the internal typed resolution used at runtime.
     diffusion_offload_config: dict[str, Any] | None = None
+    kv_offload_config: dict[str, Any] | None = None
     # Compatibility aliases. Some model-specific legacy stage lifecycles are
     # intentionally broader than the compact dit/text_encoder selector.
     # When enabled, DiT and encoders swap GPU access (mutual exclusion):
@@ -1236,6 +1237,9 @@ class OmniDiffusionConfig:
         )
 
     def __post_init__(self):
+        from vllm_omni.diffusion.kv_offload_config import parse_reference_kv_config
+
+        parse_reference_kv_config(self.kv_offload_config)
         if self.hsdp_weight_load_strategy not in {"full", "pre_sharded"}:
             raise ValueError(
                 f"hsdp_weight_load_strategy must be 'full' or 'pre_sharded', got {self.hsdp_weight_load_strategy!r}"
@@ -2086,6 +2090,45 @@ class AttnQuantSpec:
         return self.dtype_qk is not None or self.dtype_vo is not None or self.flashinfer_backend is not None
 
 
+@dataclass
+class SpargeAttnSpec:
+    """Typed controls for SPARGE INT8 sparse attention on XPU.
+
+    ``topk`` is the fraction of logical K blocks retained per query block.
+    ``q_block_tokens``, ``k_block_tokens``, and ``q_tile_override`` tune the
+    sparse routing and prefill tiling. ``None`` keeps the backend's
+    head-dimension-specific default.
+    """
+
+    topk: float = 0.5
+    q_block_tokens: int | None = None
+    k_block_tokens: int | None = None
+    q_tile_override: int | None = None
+
+    _VALID_Q_BLOCK_TOKENS = frozenset({64, 256})
+    _VALID_Q_TILE_OVERRIDES = frozenset({0, 64, 128, 256})
+
+    def __post_init__(self) -> None:
+        topk = _in_range(self.topk, "sparge.topk", 0.0, 1.0)
+        if topk is None:
+            raise ValueError("sparge.topk must be greater than 0 and at most 1.")
+        self.topk = topk
+        if self.topk <= 0.0:
+            raise ValueError("sparge.topk must be greater than 0 and at most 1.")
+        if self.q_block_tokens is not None and self.q_block_tokens not in self._VALID_Q_BLOCK_TOKENS:
+            raise ValueError(
+                f"sparge.q_block_tokens={self.q_block_tokens!r} unsupported; "
+                f"use one of {sorted(self._VALID_Q_BLOCK_TOKENS)}."
+            )
+        if self.k_block_tokens is not None and self.k_block_tokens != 64:
+            raise ValueError("sparge.k_block_tokens must be 64 when set.")
+        if self.q_tile_override is not None and self.q_tile_override not in self._VALID_Q_TILE_OVERRIDES:
+            raise ValueError(
+                f"sparge.q_tile_override={self.q_tile_override!r} unsupported; "
+                f"use one of {sorted(self._VALID_Q_TILE_OVERRIDES)}."
+            )
+
+
 # Backends that select key blocks instead of attending densely, and so accept
 # a ``block_sparse`` spec. Each maps the same knobs onto its own kernel.
 BLOCK_SPARSE_BACKENDS = frozenset({"RAINFUSION_ATTN"})
@@ -2147,6 +2190,7 @@ class AttentionSpec:
     fastvideo_vsa_topk: int | None = None
     fastvideo_vsa_provider: str = "auto"
     fastvideo_vsa_precision: str = "bf16"
+    sparge: SpargeAttnSpec | None = None
     block_sparse: BlockSparseSpec | None = None
     skip_calibration: dict | None = field(default=None, repr=False)
 
@@ -2155,6 +2199,7 @@ class AttentionSpec:
             raise TypeError(f"Expected str for AttentionSpec.backend, got {type(self.backend)!r}")
         self.skip_softmax = self._coerce(self.skip_softmax, SkipSoftmaxSpec, "skip_softmax")
         self.quant = self._coerce(self.quant, AttnQuantSpec, "quant")
+        self.sparge = self._coerce(self.sparge, SpargeAttnSpec, "sparge")
         self.block_sparse = self._coerce(self.block_sparse, BlockSparseSpec, "block_sparse")
         if self.skip_softmax is not None and self.backend.upper() != "TRTLLM_ATTN":
             raise ValueError(
@@ -2181,6 +2226,11 @@ class AttentionSpec:
                 raise ValueError("fastvideo_vsa_topk is only supported by the FASTVIDEO_VSA backend.")
             if self.fastvideo_vsa_topk <= 0:
                 raise ValueError("fastvideo_vsa_topk must be positive.")
+        if self.sparge is not None and self.backend.upper() != "SPARGE_ATTN":
+            raise ValueError(
+                f"sparge is only supported by the SPARGE_ATTN backend, but backend={self.backend!r}. "
+                "Remove sparge or set backend to SPARGE_ATTN."
+            )
         if self.backend.upper() in BLOCK_SPARSE_BACKENDS:
             # Selecting the backend is the opt-in; without an explicit block the
             # defaults apply rather than silently running dense.
@@ -2229,6 +2279,15 @@ class AttentionSpec:
                 kw["quant"] = quant_kw
         if self.fastvideo_vsa_topk is not None:
             kw["topk"] = self.fastvideo_vsa_topk
+        if self.sparge is not None:
+            sp = self.sparge
+            kw["sparge_topk"] = sp.topk
+            if sp.q_block_tokens is not None:
+                kw["sparge_q_block_tokens"] = sp.q_block_tokens
+            if sp.k_block_tokens is not None:
+                kw["sparge_k_block_tokens"] = sp.k_block_tokens
+            if sp.q_tile_override is not None:
+                kw["sparge_q_tile_override"] = sp.q_tile_override
         if self.block_sparse is not None:
             bs = self.block_sparse
             kw["sparsity"] = bs.sparsity
@@ -2314,6 +2373,7 @@ class AttentionConfig:
             "fastvideo_vsa_topk",
             "fastvideo_vsa_provider",
             "fastvideo_vsa_precision",
+            "sparge",
             "block_sparse",
         }
         node_dict = dict(node)

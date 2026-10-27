@@ -334,6 +334,9 @@ def _maybe_to_cpu(v):
 
 class QwenImagePipelineWithLogProbForTest(QwenImagePipeline):
     supports_request_batch = False
+    # Consumes OmniCustomPrompt.prompt_ids verbatim in forward(); declaring it
+    # keeps engine admission explicit for this RL-rollout style pipeline.
+    supports_pre_tokenized_prompt_ids = True
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = ""):
         super().__init__(od_config=od_config, prefix=prefix)

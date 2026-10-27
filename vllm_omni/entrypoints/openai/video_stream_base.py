@@ -42,9 +42,9 @@ from typing import Any, Final, Protocol, TypeAlias, TypeGuard, runtime_checkable
 
 import torch
 from fastapi import WebSocket, WebSocketDisconnect
-from PIL import Image
 from pydantic import BaseModel, Field, ValidationError
 from vllm.logger import init_logger
+from vllm.multimodal.image import open_image
 
 from vllm_omni.entrypoints.openai import video_stream_envs
 from vllm_omni.entrypoints.openai.video_frame_filter import FrameSimilarityFilter
@@ -74,7 +74,7 @@ PrewarmedFrame: TypeAlias = tuple[Any, str] | _FrameStatus
 
 
 def _decode_frame_bytes(raw_bytes: bytes) -> Any:
-    return Image.open(io.BytesIO(raw_bytes)).convert("RGB")
+    return open_image(io.BytesIO(raw_bytes)).convert("RGB")
 
 
 def _usable_prewarmed_frame(cached: PrewarmedFrame | None) -> TypeGuard[tuple[Any, str]]:
@@ -696,7 +696,7 @@ class OmniStreamingVideoHandler:
                             dropped_frame_id=dropped_frame_id,
                         )
                         # Prewarm: decode PIL off the event loop so query-time chat_template
-                        # can skip base64+Image.open. uuid=md5 lets mm_cache dedupe identical frames.
+                        # can skip base64+open_image. uuid=md5 lets mm_cache dedupe identical frames.
                         if frame_data not in frame_pil_cache and frame_data not in frame_ready:
                             mm_uuid = hashlib.md5(raw_bytes, usedforsecurity=False).hexdigest()
                             frame_ready[frame_data] = asyncio.Event()

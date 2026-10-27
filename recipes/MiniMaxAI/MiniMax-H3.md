@@ -821,7 +821,7 @@ longer than the generated clip. Use `start_time_seconds` to select a
 synchronized segment; for multiple typed video references, pass one value per
 video in `extra_params.start_time_seconds`.
 
-Reference images accept JPG/JPEG, PNG, WEBP, HEIC, or HEIF up to 30 MiB. Standalone
+Reference images accept JPG/JPEG, PNG, or WEBP up to 30 MiB. Standalone
 audio references accept WAV or MP3 up to 15 MiB, with 2–15 seconds per file and
 at most 15 seconds combined.
 
@@ -889,6 +889,9 @@ curl --fail-with-body -sS -X POST "${API_URL}" \
 full decoded long video in the API process. It does not reduce the denoiser's
 sequence length. For Turbo adapters, use the matching adapter's step count
 and flow shift from the Turbo table below.
+
+H3 also starts AAC encoding of the decoded audio early, overlapping it with video
+VAE decoding.
 
 The [RunningHub workflow](https://www.runninghub.cn/post/2100530217365364737/)
 uses T8's `MiniMaxH3AudioConditioningT8`, a full-length latent, and
@@ -1061,6 +1064,42 @@ balanced switch order.
 > workload. The values above apply to this deployment and are not universal
 > guarantees. `lossless` remains the exact reference path.
 
+## Cache-DiT and TaylorSeer
+
+A server-level Cache-DiT profile is selected with `--cache-backend cache_dit`
+plus `--cache-config '{...}'`. The optional TaylorSeer calibrator extrapolates
+the steps Cache-DiT skips; its state grows with the extrapolation order and
+with the number of consecutive cached steps.
+
+The validated profile is `taylorseer_order=2` with
+`max_continuous_cached_steps=4` (the MiniMax-H3-NPU recipe's cache config):
+an independent controlled run on 910B3 (v0.30.0) kept it clean at 5/10/15 s
+outputs (SSIM 0.848/0.861/0.781), while raising `max_continuous_cached_steps`
+to 6 with the same order produced the artifact (SSIM 0.798), and a probe of
+the same calibrator measured order-2 extrapolation error growing
+quadratically with consecutive cached steps
+([comment](https://github.com/vllm-project/vllm-omni/issues/8805#issuecomment-6340466984)).
+On Ref2VA videos of 10 s and longer this combination shows up as a localized
+translucent dark artifact on the subject (same seed, prompt, references, and
+dense attention; `main@9778e52bd`, 910C): with
+`Fn_compute_blocks=1, Bn_compute_blocks=0, max_warmup_steps=4,
+residual_diff_threshold=0.4, max_continuous_cached_steps=6`, the order-2 run
+showed a dark shoulder-region smear and a second-half mean-luminance drop
+(78.1 → 73.2), while the identical run with `enable_taylorseer=false` stayed
+clean and brightened (78.8 → 81.5). The server logs a warning when a profile
+leaves this envelope — order 2 with `max_continuous_cached_steps` above 4, or
+any order above 2, which has no validated window; for such profiles disable
+`enable_taylorseer`. The same report measured no
+meaningful end-to-end speedup from TaylorSeer on H3 (122.0 s vs 121.9 s per
+video), so treat it as optional. See #8805 for the reproduction data.
+
+On 64 GB-class NPU dies with distributed layerwise offload, Cache-DiT and DLO
+together leave under 1 GiB of device headroom (the offload weight pool holds
+the full model at sequence-parallel `tp=1`), so cached requests can fail with
+an NPU OOM at an arbitrary step. Prefer the uncached path on such
+deployments, or reduce `max_continuous_cached_steps`, and track #7618 for the
+request-boundary memory release work.
+
 ## Exact AdaLN reuse
 
 H3 enables exact AdaLN projection reuse by default, independently of the task,
@@ -1169,6 +1208,39 @@ not the correctness of an untrusted generator.
 Caching and sidecars alone save repeated projection work; GPU residency changes
 with weight offload, which is enabled by default on supported SM120 configurations. Gains depend on the workload,
 offload behavior, embedding fingerprint cost, and TP coordination overhead.
+
+## Ref2VA dialogue prompts
+
+Ref2VA generates speech from the prompt text. The audio branch follows the
+official H3 prompt contract
+([h3-prompt-writing skill](https://github.com/MiniMax-AI/MiniMax-H3/tree/main/skills/h3-prompt-writing))
+rather than a serving-layer parser: `vllm_omni` passes the raw prompt to the
+H3 text encoder with no `<d>`-mark preprocessing, and the official Ref2VA
+processor contains no dialogue parsing either. Prompts that deviate from the
+contract surface as audio artifacts (#8905): narrative text outside `<d>`
+spoken verbatim, dialogue lines repeated, and filler syllables around the
+clip. #8905 reports these artifacts on NPU across the attention and cache
+variants it tried, and a separate GPU report shows a bare English prompt
+spoken as well; `vllm_omni` forwards the raw prompt to the text encoder
+unchanged on every stack, so rewrite the prompt into the official format
+first, before changing serve flags.
+
+The contract rules that matter for Ref2VA dialogue:
+
+- Write the description sections in English; keep only dialogue and lyrics in
+  their original language, wrapped as `<d>[Language] ...</d>`. Narration in
+  other languages outside `<d>` can be spoken aloud.
+- Dialogue appears only inside `<d>`. Do not repeat the spoken lines in other
+  sections; text outside `<d>` is stage direction the audio branch may
+  vocalize.
+- Assign one stable speaker ID per vocal source and write
+  `<Subject N> (Sx) says, <d>[Language] ...</d>`; do not pack multiple
+  speakers into one `<d>` span.
+- Keep dialogue punctuation simple (`,`, `.`, `?`, `!`); drop tildes, emoji,
+  bullets, and decorative punctuation.
+
+The official skills directory provides rewrite agents that convert free-form
+storyboard prompts into this six-section format.
 
 ## LoRA
 

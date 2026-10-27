@@ -731,20 +731,32 @@ class MossReferenceEncoder:
         # ``prepared`` clips come from _encoder_input, at ``_clip_rate()``.
         graphs = graphs or self._reference_graphs()
         if graphs is None:
-            with torch.no_grad():
-                return self._processor.encode_audios_from_wav(
-                    prepared, sampling_rate=self._clip_rate(), n_vq=self._n_vq
-                )
+            return self._encode_eager(prepared)
         codes = graphs.encode([self._finish_prepare(wav) for wav in prepared])
         missing = [i for i, c in enumerate(codes) if c is None]
         if missing:
-            with torch.no_grad():
-                eager = self._processor.encode_audios_from_wav(
-                    [prepared[i] for i in missing], sampling_rate=self._clip_rate(), n_vq=self._n_vq
-                )
+            eager = self._encode_eager([prepared[i] for i in missing])
             for i, c in zip(missing, eager):
                 codes[i] = c
         return codes
+
+    def _encode_eager(self, prepared: list[torch.Tensor]) -> list[torch.Tensor]:
+        tokenizer = getattr(self._processor, "audio_tokenizer", None)
+        param = next(tokenizer.parameters(), None) if isinstance(tokenizer, torch.nn.Module) else None
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(torch.no_grad())
+            if param is not None and param.device.type != "cpu":
+                device = param.device
+                # Both asyncio's pool and the shared host encode on fresh threads.
+                stack.enter_context(torch.get_device_module(device.type).device(device))
+                dtype = getattr(tokenizer, "compute_dtype", None)
+                if dtype in (torch.float16, torch.bfloat16):
+                    from vllm_omni.platforms import current_omni_platform
+
+                    stack.enter_context(
+                        current_omni_platform.create_autocast_context(device_type=device.type, dtype=dtype)
+                    )
+            return self._processor.encode_audios_from_wav(prepared, sampling_rate=self._clip_rate(), n_vq=self._n_vq)
 
     def _graph_capable(self) -> bool:
         """True when the tokenizer can run graphs; installs windowed attention once."""

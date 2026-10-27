@@ -47,6 +47,7 @@ from vllm_omni.outputs.output_metadata import (
     DiffusionMetadataMapping,
     DiffusionMultimodalOutput,
     DiffusionPayloadValue,
+    valid_frame_counts,
 )
 
 logger = init_logger(__name__)
@@ -135,6 +136,7 @@ class VideoGenerationArtifacts:
     stage_durations: dict[str, float]
     peak_memory_mb: float
     metrics: dict[str, object] | None = None
+    video_frame_counts: list[int] | None = None
 
 
 def _video_metadata_from_artifacts(artifacts: VideoGenerationArtifacts) -> dict[str, object]:
@@ -148,7 +150,8 @@ def _video_metadata_from_artifacts(artifacts: VideoGenerationArtifacts) -> dict[
     video = artifacts.videos[0]
     # Pre-encoded outputs arrive as MP4 bytes, which carry no tensor shape.
     if isinstance(video, (bytes, bytearray, memoryview)):
-        num_frames = count_mp4_frames(bytes(video))
+        counts = artifacts.video_frame_counts
+        num_frames = counts[0] if counts else count_mp4_frames(bytes(video))
     else:
         num_frames = count_video_frames(video)
     if num_frames is not None and num_frames > 0:
@@ -545,6 +548,10 @@ class OmniOpenAIServingVideo:
         output_fps = output_fps_base * self._resolve_video_fps_multiplier(result)
         raw_metrics = getattr(result, "metrics", None) if request.return_stage_metrics else None
         metrics = {str(key): value for key, value in raw_metrics.items()} if isinstance(raw_metrics, Mapping) else None
+        video_metadata = metadata.get("video") if isinstance(metadata, Mapping) else None
+        frame_counts = video_metadata.get("frame_counts") if isinstance(video_metadata, Mapping) else None
+        if not valid_frame_counts(frame_counts, len(cast(list[DiffusionPayloadValue], videos))):
+            frame_counts = None
         return VideoGenerationArtifacts(
             videos=videos,
             audios=audios,
@@ -554,6 +561,7 @@ class OmniOpenAIServingVideo:
             stage_durations=self._extract_stage_durations(result),
             peak_memory_mb=self._extract_peak_memory_mb(result),
             metrics=metrics,
+            video_frame_counts=list(frame_counts) if frame_counts is not None else None,
         )
 
     async def generate_videos(

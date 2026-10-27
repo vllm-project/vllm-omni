@@ -478,6 +478,22 @@ def _maybe_assert_aggregate_ia_qtf1(params: dict[str, object], acc_summary: dict
     assert ia_qtf1 >= float(min_ia_qtf1), f"OmniInteract aggregate All Global IA-QTF1 {ia_qtf1} is below {min_ia_qtf1}"
 
 
+def _duplex_eval_score_floors_enforced(params: dict, hardware: object) -> bool:
+    calibrated = params.get("duplex_eval_score_floor_hardware")
+    if calibrated is None:
+        return True
+    if (
+        not isinstance(calibrated, list)
+        or not calibrated
+        or not all(isinstance(item, str) and item for item in calibrated)
+        or len(set(calibrated)) != len(calibrated)
+    ):
+        raise ValueError("duplex_eval_score_floor_hardware must be a non-empty list of unique hardware labels")
+    if not isinstance(hardware, str) or not hardware:
+        raise ValueError("duplex_eval_score_floor_hardware requires a runtime hardware label")
+    return hardware in calibrated
+
+
 def _assert_duplex_eval_result(result: dict, params: dict, num_prompt: int) -> None:
     summary = result.get("omni_duplex_eval")
     assert isinstance(summary, dict), "Omni-DuplexEval summary is missing"
@@ -491,7 +507,11 @@ def _assert_duplex_eval_result(result: dict, params: dict, num_prompt: int) -> N
         # The accuracy suite scores collected output, including silence and
         # close-boundary responses. Preserve its eligibility policy; missing
         # client measurements and unfinished counts remain visible in artifacts.
-        assert_accuracy_result(result, load_accuracy_config(path, params))
+        assert_accuracy_result(
+            result,
+            load_accuracy_config(path, params),
+            enforce_score_floors=_duplex_eval_score_floors_enforced(params, result.get("Hardware")),
+        )
         # Allow individual silent sessions, but fail a batch-wide audio outage
         # even when the text-only RTD/PR judge accepts the responses.
         audio_metrics = (session.get("client_ttfp_ms", {}) for session in sessions)
@@ -584,11 +604,15 @@ def test_performance_benchmark(omni_server, benchmark_params):
     test_name = benchmark_params["test_name"]
     params = dict(benchmark_params["params"])
     dataset_name = params.get("dataset_name", "")
+    resource_label = get_runtime_resource_label()
     accuracy_baseline = None
     if path := params.get("duplex_eval_accuracy_config"):
         from tests.e2e.accuracy.omni_duplex_eval.validation import load_accuracy_config
 
-        accuracy_baseline = load_accuracy_config(path, params)["baseline"]
+        accuracy_config = load_accuracy_config(path, params)
+        accuracy_baseline = (
+            accuracy_config["baseline"] if _duplex_eval_score_floors_enforced(params, resource_label) else {}
+        )
     for dataset_prefix in ("omniinteract", "duplex_eval"):
         if params.get(f"{dataset_prefix}_evaluate"):
             judge_base_url = getattr(omni_server, "judge_base_url", None)
@@ -602,8 +626,6 @@ def test_performance_benchmark(omni_server, benchmark_params):
 
     print(f"Running benchmark for model: {model}")
     print(f"Benchmark parameters: {benchmark_params}")
-
-    resource_label = get_runtime_resource_label()
 
     def to_list(value, default=None):
         if value is None:
@@ -644,6 +666,7 @@ def test_performance_benchmark(omni_server, benchmark_params):
         _OMNIINTERACT_AGGREGATE_GROUP,
         "judge_server_params",
         "duplex_eval_accuracy_config",
+        "duplex_eval_score_floor_hardware",
         "name",
         "enable_negative_prompt",
         "random_request_config",

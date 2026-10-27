@@ -19,6 +19,14 @@ class NPUGenerationWorker(OmniWorkerMixin, OmniNPUWorkerBase):
     model_runner_cls = NPUGenerationModelRunner
 
     def init_device(self):
+        # vLLM 0.32 treats an unset VLLM_USE_V2_MODEL_RUNNER as V2. The stage
+        # deploy field is stored on the Omni model config, so read that instead
+        # of the platform-wide property.
+        if bool(getattr(self.vllm_config.model_config, "use_v2_model_runner", False)):
+            raise NotImplementedError(
+                "NPU generation stages do not support model_runner v2; set model_runner: v1 for this stage"
+            )
+
         self.device = self._init_device()
         num_ubatches = 1
         init_workspace_manager(self.device, num_ubatches)

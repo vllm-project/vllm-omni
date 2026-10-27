@@ -317,6 +317,44 @@ profile. This selects `AsyncOmni` and the ordinary API initialization instead
 of the duplex handler. See [Full Duplex](full_duplex_api.md#enable-full-duplex)
 for the command and configuration requirements.
 
+#### Compare MiniCPM-o attention backends
+
+The default `minicpmo_4_5.yaml` selects Triton attention for the CUDA Thinker
+(stage 0). The Talker's backend selection and graph settings are unchanged.
+The vision tower defaults to SDPA on all platforms; explicit engine or
+vision overrides still win. The turn-mode profile inherits this CUDA default
+from the base deployment too. NPU backend selection is unchanged.
+
+To compare vLLM's automatic Thinker backend selection, save the following as
+`minicpmo_thinker_auto.yaml`, replacing the base path with your checkout:
+
+```yaml
+base_config: /path/to/vllm-omni/vllm_omni/deploy/minicpmo_4_5.yaml
+platforms:
+  cuda:
+    stages:
+      - stage_id: 0
+        attention_backend: null
+```
+
+Pass `--deploy-config minicpmo_thinker_auto.yaml` to the server command above.
+A server-wide `--attention-backend` override also affects the Talker, so it is
+a different experiment. Check each stage's startup log for the actual backend
+and graph mode.
+
+For a quality comparison, keep the source and model revisions, reference audio,
+input audio/video, frame rate, pacing, window settings and sampling parameters
+the same. Compare several matched seeds and repeat sessions after a fresh server
+start. Evaluate replies against the scene and question timestamps: a later
+answer can describe a scene that changed while the model was responding.
+
+A changed sampled transcript alone does not establish an attention-backend
+defect or a general quality improvement. Validate graph-enabled serving
+separately from eager serving, and record the topology actually tested.
+Successful `response.done` events establish protocol completion, not correct
+recognition or complete sentences. This overlay is a comparison tool, not a
+confirmed fix for recognition errors or post-commit drain timeouts.
+
 ### Multiple Frontends
 
 For a local multi-replica deployment, `--api-server-count K` distributes duplex

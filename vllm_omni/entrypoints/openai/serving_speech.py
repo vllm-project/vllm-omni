@@ -4,6 +4,7 @@
 import asyncio
 import base64
 import contextlib
+import copy
 import hashlib
 import io
 import json
@@ -585,6 +586,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         allowed_media_domains: list[str] | None = None,
         speech_cache_config: SpeechCacheConfig | None = None,
         request_logger: RequestLogger | None = None,
+        served_model_names: list[str] | None = None,
     ) -> "OmniOpenAIServingSpeech":
         """Create a speech serving instance for pure diffusion TTS models.
 
@@ -596,6 +598,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         instance.speech_cache_config = speech_cache_config or SpeechCacheConfig()
         instance._diffusion_mode = True
         instance._diffusion_engine = diffusion_engine
+        instance._diffusion_model_names = frozenset(served_model_names or [model_name])
         instance._allowed_local_media_path = allowed_local_media_path
         instance._media_connector = MediaConnector(
             allowed_local_media_path=allowed_local_media_path,
@@ -2586,8 +2589,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             # to allow tests to catch invalid voices generally
             request.voice = self._get_normalized_voice(request.voice)
 
-            # Assume that this will follow the same adapter pattern
-            # once all RFC is implemented
+            assert self._adapter is not None
             validation_error = validate_tts_request(self._adapter, request)
             if validation_error is not None:
                 raise ValueError(validation_error)
@@ -2618,16 +2620,19 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             if request.extra_params is not None and not isinstance(request.extra_params, dict):
                 raise ValueError("extra_params must be a JSON object/dict.")
             extra = dict(request.extra_params or {})
+            seed = extra.pop("seed", None)
             if request.seed is not None:
-                extra["seed"] = request.seed
+                seed = request.seed
             # Apply extra_params from the request to sampling params
             sampling_params_list = self._diffusion_engine.default_sampling_params_list
-            if extra:
-                import copy
-
+            if extra or seed is not None:
                 sampling_params_list = copy.deepcopy(sampling_params_list)
+                if seed is not None:
+                    sampling_params_list[0].seed = seed
                 if sampling_params_list[0].extra_args is None:
                     sampling_params_list[0].extra_args = {}
+                if seed is not None and "seed" in sampling_params_list[0].extra_args:
+                    sampling_params_list[0].extra_args["seed"] = seed
                 sampling_params_list[0].extra_args.update(extra)
 
                 sampling = sampling_params_list[0]
@@ -2638,17 +2643,25 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     value = extra["num_inference_steps"]
                     try:
                         sampling.num_inference_steps = int(value)
-                    except (TypeError, ValueError) as exc:
+                    except (TypeError, ValueError, OverflowError) as exc:
                         raise ValueError("num_inference_steps must be an integer") from exc
+                    if (
+                        isinstance(value, bool)
+                        or sampling.num_inference_steps <= 0
+                        or (isinstance(value, float) and value != sampling.num_inference_steps)
+                    ):
+                        raise ValueError("num_inference_steps must be a positive integer")
 
                 if "guidance_scale" in extra:
                     value = extra["guidance_scale"]
                     try:
                         sampling.guidance_scale = float(value)
-                    except (TypeError, ValueError) as exc:
+                    except (TypeError, ValueError, OverflowError) as exc:
                         raise ValueError("guidance_scale must be a number") from exc
+                    if isinstance(value, bool) or not math.isfinite(sampling.guidance_scale):
+                        raise ValueError("guidance_scale must be a finite number")
 
-                logger.info("Applied extra_params to diffusion: %s", extra)
+                logger.info("Applied diffusion speech params: seed=%s extra_params=%s", seed, extra)
 
             generator = self._diffusion_engine.generate(
                 prompt=prompt,
@@ -2713,7 +2726,10 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 client-input validation failures so the response semantics match
                 the OpenAI-compatible behavior used by ``create_speech``.
         """
-        err_type = "BadRequestError" if 400 <= status_code < 500 else "server_error"
+        if status_code == 404:
+            err_type = "NotFoundError"
+        else:
+            err_type = "BadRequestError" if 400 <= status_code < 500 else "server_error"
         error_body = json.dumps({"error": {"message": message, "type": err_type, "param": None, "code": status_code}})
         return Response(content=error_body, media_type="application/json", status_code=status_code)
 
@@ -2773,6 +2789,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             return self.create_error_response(sample_rate_error)
 
         if self._diffusion_mode:
+            if request.model is not None and request.model not in self._diffusion_model_names:
+                return self._diffusion_error_response(f"The model `{request.model}` does not exist.", status_code=404)
             return await self._create_diffusion_speech(request)
 
         error_check_ret = await self._check_model(request)

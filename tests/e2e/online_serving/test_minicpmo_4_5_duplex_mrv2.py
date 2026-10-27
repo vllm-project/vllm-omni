@@ -3,6 +3,7 @@
 """Real-weight MRv2 duplex concurrency guard, additional to the V1 CI jobs."""
 
 import asyncio
+import json
 from pathlib import Path
 
 import pytest
@@ -46,17 +47,24 @@ def test_mrv2_duplex_overlapping_turns(omni_server, tmp_path: Path, sessions: in
     # Keep the complete response-required utterance. The 1.4 s active slice
     # can end mid-utterance, so the native policy may legitimately keep listening.
     args.turn_duration_ms = [0] * args.turns
+    # Native model turns need not map one-to-one to physical input commits.
+    # Still require a completed text/audio answer for each input, and drain
+    # and acknowledge any additional model responses before the next input.
+    args.allow_extra_responses = True
     args.synchronized_start = True
     args.disconnect_session_index = None
     args.takeover_session_index = None
     result = asyncio.run(run_multi_session(args))
-    assert result["ok"] is True, result
+    assert result["ok"] is True, json.dumps(result, ensure_ascii=False, indent=2)
     assert result["session_count"] == sessions
     assert result["identity_isolation_ok"] is True
     assert not result["failures"]
-    for session in result["sessions"]:
+    session_results = result["sessions"]
+    assert isinstance(session_results, list), result
+    for session in session_results:
         assert session["audio_delta_count"] > 0, session
-        assert session["done_count"] == args.turns, session
+        assert session["done_count"] >= args.turns, session
+        assert session["turn_outcomes"] == ["speak"] * args.turns, session
         assert session["error_count"] == 0, session
 
 

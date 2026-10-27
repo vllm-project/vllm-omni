@@ -11,11 +11,14 @@ from types import SimpleNamespace
 import pytest
 from fastapi import WebSocketDisconnect
 from openai.types import realtime as types
-from openai.types.realtime.realtime_audio_input_turn_detection import ServerVad
+from openai.types.realtime.realtime_audio_input_turn_detection import SemanticVad, ServerVad
 
 from vllm_omni.engine.duplex.turn_detection import (
+    SemanticTurnDetector,
+    SemanticVADUnavailableError,
     ServerTurnDetector,
     ServerVADUnavailableError,
+    SmartTurnBackendProvider,
     TurnDetectionConfig,
     TurnDetectionResult,
 )
@@ -84,6 +87,31 @@ class _FakeTurnDetector(ServerTurnDetector):
         super().reset()
 
 
+class _FakeSemanticTurnDetector(SemanticTurnDetector):
+    def __init__(
+        self,
+        results: list[TurnDetectionResult],
+        *,
+        config: TurnDetectionConfig | None = None,
+    ) -> None:
+        super().__init__(
+            config or TurnDetectionConfig(type="semantic_vad"),
+            turn_scorer=lambda _audio: 0.9,
+            frame_scorer=lambda _frame: 0.9,
+        )
+        self.results = results
+
+    def process(
+        self,
+        base64_audio: str,
+        *,
+        fmt: str,
+        sample_rate_hz: int | None,
+        audio_end_ms: int | None = None,
+    ) -> TurnDetectionResult:
+        return self.results.pop(0)
+
+
 class _UnavailableTurnDetector(ServerTurnDetector):
     def process(
         self,
@@ -96,6 +124,18 @@ class _UnavailableTurnDetector(ServerTurnDetector):
         raise ServerVADUnavailableError("fake VAD backend is unavailable")
 
 
+class _UnavailableSemanticTurnDetector(SemanticTurnDetector):
+    def process(
+        self,
+        base64_audio: str,
+        *,
+        fmt: str,
+        sample_rate_hz: int | None,
+        audio_end_ms: int | None = None,
+    ) -> TurnDetectionResult:
+        raise SemanticVADUnavailableError("fake Smart Turn backend is unavailable")
+
+
 class _ResponseRecordingConnection(OpenAIFullDuplexConnection):
     response_creates: list[types.ResponseCreateEvent]
 
@@ -103,7 +143,11 @@ class _ResponseRecordingConnection(OpenAIFullDuplexConnection):
         self.response_creates.append(event)
 
 
-def _make_connection(websocket: _FakeWebSocket) -> _ResponseRecordingConnection:
+def _make_connection(
+    websocket: _FakeWebSocket,
+    *,
+    semantic_vad_backend_provider: SmartTurnBackendProvider | None = None,
+) -> _ResponseRecordingConnection:
     engine = SimpleNamespace(model_config=SimpleNamespace(max_model_len=100))
     chat_handler = SimpleNamespace(renderer=SimpleNamespace(get_tokenizer=lambda: object()))
     connection = _ResponseRecordingConnection(
@@ -111,6 +155,7 @@ def _make_connection(websocket: _FakeWebSocket) -> _ResponseRecordingConnection:
         engine=engine,
         model_name="test-model",
         chat_handler=chat_handler,
+        semantic_vad_backend_provider=semantic_vad_backend_provider,
     )
     connection.response_creates = []
     return connection
@@ -176,6 +221,43 @@ async def test_server_vad_session_update_creates_turn_detector() -> None:
     assert events[-1]["type"] == "session.updated"
     assert isinstance(connection.session.config.audio.input.turn_detection, ServerVad)
     assert connection._turn_detector is not None
+
+
+@pytest.mark.asyncio
+async def test_semantic_vad_session_update_creates_turn_detector() -> None:
+    websocket = _FakeWebSocket()
+    provider = SmartTurnBackendProvider()
+    connection = _make_connection(websocket, semantic_vad_backend_provider=provider)
+
+    await connection._handle_session_update(_session_update_event({"type": "semantic_vad", "eagerness": "high"}))
+
+    events = [json.loads(message) for message in websocket.messages]
+    assert events[-1]["type"] == "session.updated"
+    assert isinstance(connection.session.config.audio.input.turn_detection, SemanticVad)
+    assert isinstance(connection._turn_detector, SemanticTurnDetector)
+    assert connection._turn_detector.config.type == "semantic_vad"
+    assert connection._turn_detector.config.eagerness == "high"
+
+
+@pytest.mark.asyncio
+async def test_semantic_vad_build_detector_receives_smart_turn_provider(monkeypatch) -> None:
+    websocket = _FakeWebSocket()
+    provider = SmartTurnBackendProvider()
+    connection = _make_connection(websocket, semantic_vad_backend_provider=provider)
+    captured: list[tuple[object, object]] = []
+
+    def build_detector(
+        self,
+        backend_provider=None,
+        semantic_backend_provider=None,
+    ):
+        captured.append((backend_provider, semantic_backend_provider))
+        return _FakeTurnDetector([], config=self)
+
+    monkeypatch.setattr(TurnDetectionConfig, "build_detector", build_detector)
+    await connection._handle_session_update(_session_update_event({"type": "semantic_vad", "eagerness": "high"}))
+
+    assert captured == [(None, provider)]
 
 
 @pytest.mark.asyncio
@@ -364,7 +446,7 @@ async def test_server_vad_disable_resets_state_and_commits_pending_audio_with_ne
 
 
 @pytest.mark.asyncio
-async def test_unsupported_turn_detection_rejects_update_without_mutating_state() -> None:
+async def test_semantic_vad_without_interrupt_response_is_rejected_without_mutating_state() -> None:
     websocket = _FakeWebSocket()
     connection = _make_connection(websocket)
     detector = _FakeTurnDetector([])
@@ -373,7 +455,9 @@ async def test_unsupported_turn_detection_rejects_update_without_mutating_state(
     connection._turn_detector = detector
     connection._speech_item_id = "item_existing"
 
-    await connection._handle_session_update(_session_update_event({"type": "semantic_vad", "eagerness": "high"}))
+    await connection._handle_session_update(
+        _session_update_event({"type": "semantic_vad", "eagerness": "high", "interrupt_response": False})
+    )
 
     events = [json.loads(message) for message in websocket.messages]
     assert events[-1]["type"] == "error"
@@ -382,6 +466,32 @@ async def test_unsupported_turn_detection_rejects_update_without_mutating_state(
     assert connection._turn_detector is detector
     assert connection._speech_item_id == "item_existing"
     assert detector.reset_count == 0
+
+
+@pytest.mark.asyncio
+async def test_server_and_semantic_detectors_share_the_realtime_append_path() -> None:
+    result = _speech_started_result()
+    detectors = [
+        _FakeTurnDetector([result], config=TurnDetectionConfig(create_response=False)),
+        _FakeSemanticTurnDetector([result], config=TurnDetectionConfig(type="semantic_vad", create_response=False)),
+    ]
+    event_batches = []
+
+    for detector in detectors:
+        websocket = _FakeWebSocket()
+        connection = _make_connection(websocket)
+        connection._turn_detector = detector
+
+        await connection._handle_audio_append(_audio_event(b"\x00\x00"))
+
+        event_batches.append([json.loads(message) for message in websocket.messages])
+
+    normalized_batches = [
+        [{key: value for key, value in event.items() if key not in {"event_id", "item_id"}} for event in events]
+        for events in event_batches
+    ]
+    assert normalized_batches[0] == normalized_batches[1]
+    assert all([event["type"] for event in events] == ["input_audio_buffer.speech_started"] for events in event_batches)
 
 
 @pytest.mark.asyncio
@@ -400,6 +510,28 @@ async def test_server_vad_unavailable_clears_detector_and_rejects_append() -> No
         "type": "invalid_request_error",
         "code": "server_vad_unavailable",
         "message": "fake VAD backend is unavailable",
+    }
+    assert connection._turn_detector is None
+    assert connection._speech_item_id is None
+    assert connection.session.input_audio_buffer == bytearray()
+
+
+@pytest.mark.asyncio
+async def test_semantic_vad_unavailable_clears_detector_and_rejects_append() -> None:
+    websocket = _FakeWebSocket()
+    connection = _make_connection(websocket)
+    connection._turn_detector = _UnavailableSemanticTurnDetector(TurnDetectionConfig(type="semantic_vad"))
+    connection._speech_item_id = "item_existing"
+
+    await connection._handle_audio_append(_audio_event(b"\x00\x00"))
+
+    events = [json.loads(message) for message in websocket.messages]
+    assert len(events) == 1
+    assert events[0]["type"] == "error"
+    assert events[0]["error"] == {
+        "type": "invalid_request_error",
+        "code": "semantic_vad_unavailable",
+        "message": "fake Smart Turn backend is unavailable",
     }
     assert connection._turn_detector is None
     assert connection._speech_item_id is None

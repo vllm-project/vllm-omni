@@ -15,7 +15,7 @@ from tests.helpers.mark import hardware_marks
 pytestmark = [
     pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
     pytest.mark.core_model,
-    *hardware_marks(res={"cuda": "L4"}),
+    *hardware_marks(res={"cuda": "L4", "rocm": "MI325"}),
 ]
 
 DTYPE = torch.bfloat16

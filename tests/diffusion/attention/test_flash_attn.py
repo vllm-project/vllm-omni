@@ -729,6 +729,31 @@ def test_piecewise_flash_attn_uses_varlen_fallback(monkeypatch):
 
 
 @pytest.mark.cpu
+def test_xpu_piecewise_spans_ignore_4d_mask(monkeypatch):
+    """XPU must honor full_attn_spans instead of feeding a 4D mask to the 2D-only varlen-masked path."""
+    calls = []
+
+    def fake_varlen_func(q, k, v, **kwargs):
+        calls.append((kwargs["max_seqlen_q"], kwargs["max_seqlen_k"], kwargs["causal"]))
+        return q
+
+    monkeypatch.setattr(fa, "HAS_FLASH_ATTN", True)
+    monkeypatch.setattr(fa, "flash_attn_varlen_func", fake_varlen_func)
+
+    impl = FlashAttentionImpl(num_heads=2, head_size=4, softmax_scale=0.5, causal=False)
+    query = torch.randn(1, 6, 2, 4)
+    metadata = AttentionMetadata(
+        attn_mask=torch.ones((1, 1, 6, 6), dtype=torch.bool).tril(),
+        full_attn_spans=[[(2, 4)]],
+    )
+
+    output = impl.forward_xpu(query, query, query, metadata)
+
+    assert output.shape == query.shape
+    assert calls == [(2, 2, True), (2, 4, False), (2, 6, True)]
+
+
+@pytest.mark.cpu
 def test_packed_varlen_metadata_bypasses_mask_unpadding(monkeypatch):
     calls = []
 
@@ -1346,6 +1371,138 @@ def test_prefix_kv_slice_no_scaling_without_factor(monkeypatch):
     torch.testing.assert_close(captured["query"], q)
     assert captured["scale"] == pytest.approx(0.5)
     torch.testing.assert_close(out, torch.ones(1, 8, 2, 4))
+
+
+# --- Test group E: NPU piecewise block-causal attention ----------------------
+#
+# ``forward_fa_npu`` must honour ``full_attn_spans`` the way ``forward_cuda``
+# does. Before this was wired up, span metadata was silently dropped and the
+# whole sequence ran bidirectional attention, which is wrong for block-causal
+# models (e.g. Qwen-Image-2.1 prefill) and poisoned the cached prefix K/V.
+
+
+def _npu_fusion_attention_reference(
+    query,
+    key,
+    value,
+    *,
+    atten_mask=None,
+    head_num,
+    input_layout="BSND",
+    scale=1.0,
+    keep_prob=1.0,
+    sparse_mode=0,
+    inner_precise=0,
+):
+    """Pure-torch stand-in for ``npu_fusion_attention`` (BSND, no dropout).
+
+    Implements the two sparse modes the piecewise path relies on: 0 (no mask,
+    full attention) and 3 (right-down causal, bottom-right aligned). The shared
+    compressed mask is validated for shape and convention, but the alignment
+    itself comes from ``sparse_mode`` -- exactly as the real kernel documents.
+    """
+    del inner_precise
+    assert input_layout == "BSND"
+    assert query.shape[2] == head_num == key.shape[2]
+    assert keep_prob == 1.0
+    query_length, key_length = query.shape[1], key.shape[1]
+    if sparse_mode == 0:
+        assert atten_mask is None, "full segments must not carry a mask"
+        keep = torch.ones(query_length, key_length, dtype=torch.bool)
+    elif sparse_mode == 3:
+        assert atten_mask is not None and atten_mask.shape == (2048, 2048)
+        assert atten_mask.dtype == torch.bool
+        # Ascend convention: True = masked out, so the mask is the strict
+        # upper triangle.
+        strict_upper = torch.triu(torch.ones(2048, 2048, dtype=torch.bool), diagonal=1)
+        assert torch.equal(atten_mask, strict_upper)
+        assert query_length <= key_length, "right-down causal requires Sq <= Skv"
+        query_positions = torch.arange(query_length).unsqueeze(1)
+        key_positions = torch.arange(key_length).unsqueeze(0)
+        keep = key_positions <= query_positions + (key_length - query_length)
+    else:
+        raise AssertionError(f"unexpected sparse_mode {sparse_mode}")
+
+    scores = torch.einsum("bqhd,bkhd->bhqk", query.float(), key.float()) * scale
+    scores = scores.masked_fill(~keep, float("-inf"))
+    out = torch.einsum("bhqk,bkhd->bqhd", torch.softmax(scores, dim=-1), value.float())
+    return out.to(query.dtype), None, None, None, 0, 0, 0
+
+
+def _block_causal_reference(query, key, value, image_ids, scale):
+    """Dense ``(q >= kv) or same_image_block`` reference for the joint sequence."""
+    seq_len = query.shape[1]
+    query_positions = torch.arange(seq_len).unsqueeze(1)
+    key_positions = torch.arange(seq_len).unsqueeze(0)
+    same_block = (image_ids.view(-1, 1) == image_ids.view(1, -1)) & (image_ids.view(-1, 1) >= 0)
+    keep = (query_positions >= key_positions) | same_block
+    scores = torch.einsum("bqhd,bkhd->bhqk", query.float(), key.float()) * scale
+    scores = scores.masked_fill(~keep, float("-inf"))
+    return torch.einsum("bhqk,bkhd->bqhd", torch.softmax(scores, dim=-1), value.float())
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("causal", [False, True])
+def test_npu_piecewise_reports_its_own_execution_path(npu_contract, causal):
+    _, query, _, _ = npu_contract
+    impl = _npu_impl(causal=causal)
+    metadata = AttentionMetadata(full_attn_spans=[[(3, 5)]])
+    _assert_platform_path(impl, "npu", query, metadata, "npu_piecewise")
+
+
+@pytest.mark.cpu
+def test_npu_causal_without_spans_stays_unverified(npu_contract):
+    _, query, _, _ = npu_contract
+    impl = _npu_impl(causal=True)
+    _assert_platform_path(impl, "npu", query, None, "npu_unverified")
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("causal", [False, True])
+def test_npu_piecewise_runs_one_fusion_attention_per_segment(monkeypatch, causal):
+    fusion_attention = Mock(side_effect=lambda q, k, v, **kwargs: (torch.zeros_like(q), None, None, None, 0, 0, 0))
+    fake_torch_npu = _fake_torch_npu(monkeypatch, npu_fusion_attention=fusion_attention)
+    impl = FlashAttentionImpl(num_heads=2, head_size=4, softmax_scale=0.5, causal=causal)
+    query = torch.randn(1, 5, 2, 4)
+    # Two text tokens, then one condition-image block covering [2, 5).
+    metadata = AttentionMetadata(full_attn_spans=[[(2, 5)]])
+
+    impl.forward_fa_npu(query, query, query, metadata)
+
+    assert fake_torch_npu.npu_fusion_attention.call_count == 2
+    causal_call, full_call = fake_torch_npu.npu_fusion_attention.call_args_list
+    # Causal text segment: K truncated to its own end, compressed mask, mode 3.
+    assert causal_call.args[0].shape == (1, 2, 2, 4)
+    assert causal_call.args[1].shape == (1, 2, 2, 4)
+    assert causal_call.kwargs["sparse_mode"] == 3
+    assert causal_call.kwargs["atten_mask"].shape == (2048, 2048)
+    # Full image segment: K spans the whole prefix, no mask materialized.
+    assert full_call.args[0].shape == (1, 3, 2, 4)
+    assert full_call.args[1].shape == (1, 5, 2, 4)
+    assert full_call.kwargs["sparse_mode"] == 0
+    assert full_call.kwargs["atten_mask"] is None
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("causal", [False, True])
+def test_npu_piecewise_matches_block_causal_reference(monkeypatch, causal):
+    """Segments reproduce the dense block-causal pattern end to end."""
+    torch.manual_seed(0)
+    _fake_torch_npu(monkeypatch, npu_fusion_attention=_npu_fusion_attention_reference)
+    impl = FlashAttentionImpl(num_heads=2, head_size=4, softmax_scale=0.5, causal=causal)
+    # text(0-1) | image A(2-4) | text(5) | image B(6-8)
+    image_ids = torch.tensor([-1, -1, 0, 0, 0, -1, 1, 1, 1])
+    metadata = AttentionMetadata(full_attn_spans=[[(2, 5), (6, 9)]])
+    seq_len = image_ids.shape[0]
+    query = torch.randn(1, seq_len, 2, 4)
+    key = torch.randn(1, seq_len, 2, 4)
+    value = torch.randn(1, seq_len, 2, 4)
+
+    out = impl.forward_fa_npu(query, key, value, metadata)
+    expected = _block_causal_reference(query, key, value, image_ids, impl.softmax_scale)
+
+    assert out.shape == query.shape
+    torch.testing.assert_close(out, expected, rtol=1e-5, atol=1e-6)
 
 
 if __name__ == "__main__":

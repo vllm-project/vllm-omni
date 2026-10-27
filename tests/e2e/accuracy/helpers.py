@@ -238,6 +238,14 @@ def _validate_seed_tts(
     if setup:
         errs.append(f"Seed-TTS eval setup failed: {setup}")
         return errs
+    timed_out = int(result.get("timed_out_requests", 0) or 0)
+    cancelled = int(result.get("cancelled_after_timeout_requests", 0) or 0)
+    if timed_out or cancelled:
+        errs.append(
+            "Seed-TTS benchmark coverage is incomplete: "
+            f"timed_out_requests={timed_out}, cancelled_after_timeout_requests={cancelled}; "
+            "accuracy metrics exclude unsuccessful outputs."
+        )
     n = int(result.get("seed_tts_content_evaluated", 0) or 0)
     if n <= 0:
         errs.append("seed_tts_content_evaluated is 0 (enable --seed-tts-wer-eval and check PCM capture).")
@@ -538,6 +546,8 @@ def run_seed_tts(ns: argparse.Namespace, vllm: str) -> Path:
         argv.append("--seed-tts-wer-save-items")
     if ns.seed_tts_file_ref_audio:
         argv.append("--seed-tts-file-ref-audio")
+    if getattr(ns, "omni_fail_fast_on_timeout", False):
+        argv.append("--omni-fail-fast-on-timeout")
     extra_env = seed_tts_eval_env(ns)
     print("\n$", vllm, *argv, "\n", flush=True)
     _omni_acc_bench_core().run_vllm_bench_subprocess(vllm, argv, extra_env=extra_env)
@@ -572,6 +582,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="If set, forwarded to ``vllm bench serve`` (probe first request until success). "
         "Omit to use upstream default (typically skip).",
+    )
+    p.add_argument(
+        "--omni-fail-fast-on-timeout",
+        action="store_true",
+        help="Forward the benchmark timeout circuit breaker to Seed-TTS runs.",
     )
     p.add_argument(
         "--trust-remote-code",

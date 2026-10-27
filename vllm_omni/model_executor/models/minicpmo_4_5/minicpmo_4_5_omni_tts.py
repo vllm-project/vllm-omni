@@ -41,6 +41,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5 import (
 from vllm_omni.model_executor.models.minicpmo_4_5.config_flags import (
     parse_bool_flag as _bool_flag,
 )
+from vllm_omni.model_executor.models.minicpmo_4_5.handoff import unpack_handoff_tensor
 from vllm_omni.model_executor.models.minicpmo_4_5.talker_codec_sample import (
     HISTORY_WINDOW,
     TalkerCodecDeviceState,
@@ -1085,6 +1086,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
 
         if is_prefill or first_call:
             token_ids, hidden_states = get_tts_handoff(info_dict)
+            hidden_states = unpack_handoff_tensor(hidden_states)
             # Cross-process stage transport serializes CPU tensors as lists.
             # Normalize both local tensor handoffs and transported payloads
             # before validating/building the Talker condition.

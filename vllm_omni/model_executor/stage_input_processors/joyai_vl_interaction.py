@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Build JoyAI inputs from Qwen3-ASR transcripts and Qwen3-TTS Talker inputs from JoyAI actions."""
 
+from collections.abc import Sequence
 from typing import Any
 
 from vllm.outputs import RequestOutput
@@ -55,11 +56,19 @@ def render_joyai_session_prompt(
     images: list[Any],
     image_token_counts: list[int],
     budget: int,
+    context_blocks: Sequence[str] = (),
 ) -> tuple[str, list[Any]]:
-    """Fit the actual query, keeping system policy and the latest observation."""
+    """Fit the actual query, keeping system policy and the latest observation.
+
+    ``context_blocks`` are model-specific context sections (today: accepted
+    delegated results). They are not history and are never evicted, so they are
+    validated against the budget before this call keeps trimming history.
+    """
+    blocks = [block for block in context_blocks if block]
     history, images, image_token_counts = list(history), list(images), list(image_token_counts)
     while True:
         content = [{"type": "image"} for _ in images]
+        content.extend({"type": "text", "text": block} for block in blocks)
         content.append(
             {
                 "type": "text",
@@ -100,6 +109,9 @@ def asr_to_joyai(
         request_prompt = request_prompt if isinstance(request_prompt, dict) else {}
         additional_info = request_prompt.get("additional_information") or {}
         system_prompt = str(first_value(additional_info.get("joyai_system_prompt"), DEFAULT_SYSTEM_PROMPT))
+        delegation_context = additional_info.get("joyai_delegation_context")
+        if delegation_context is not None and not isinstance(delegation_context, str):
+            raise OmniClientError("joyai_delegation_context must be a string")
         transcript = _clean_qwen3_asr_transcript(_extract_completed_action_text(asr_output))
         deferred = additional_info.get("deferred_multi_modal_data") or {}
         visual_inputs = {modality: deferred[modality] for modality in ("image", "video") if deferred.get(modality)}
@@ -153,6 +165,7 @@ def asr_to_joyai(
                 images=images,
                 image_token_counts=image_token_counts,
                 budget=budget,
+                context_blocks=(delegation_context,) if delegation_context else (),
             )
             visual_inputs = {"image": images} if images else {}
         if requires_multimodal_data and visual_inputs:

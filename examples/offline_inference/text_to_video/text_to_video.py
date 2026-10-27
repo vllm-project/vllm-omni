@@ -310,6 +310,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Enable cache-dit summary logging after diffusion forward passes.",
     )
+    parser.add_argument(
+        "--diffusion-attention-config",
+        type=json.loads,
+        default=None,
+        help="Per-role diffusion attention backend configuration as a JSON object.",
+    )
     parser.add_argument("--output", type=str, default=None, help="Output path (mp4). Default: model-specific.")
     parser.add_argument("--fps", type=float, default=None, help="Frames per second for the output video.")
     parser.add_argument(
@@ -595,6 +601,8 @@ def main():
         omni_kwargs["quantization"] = args.quantization
     if args.quantization_config is not None:
         omni_kwargs["quantization_config"] = args.quantization_config
+    if args.diffusion_attention_config is not None:
+        omni_kwargs["diffusion_attention_config"] = args.diffusion_attention_config
     if args.cache_backend is not None:
         omni_kwargs["cache_backend"] = args.cache_backend
         omni_kwargs["cache_config"] = cache_config

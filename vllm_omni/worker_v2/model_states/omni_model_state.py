@@ -44,6 +44,7 @@ from vllm_omni.worker_v2.model_states.intermediate_buffer import (
     OmniIntermediateBuffer,
 )
 from vllm_omni.worker_v2.streaming_audio import StreamingAudioOutput
+from vllm_omni.worker_v2.warmup import is_warmup_request
 
 logger = init_logger(__name__)
 
@@ -419,7 +420,7 @@ class OmniModelState(DefaultModelState):
 
     def _initialize_upstream_warmup_buffer(self, req_index: int, req_id: str) -> None:
         """Satisfy model-declared output contracts for vLLM warmup requests."""
-        if not str(req_id).startswith("_warmup_"):
+        if not is_warmup_request(req_id):
             return
 
         validity_key = getattr(self.model, "mtp_validity_key", None)
@@ -796,7 +797,7 @@ class OmniModelState(DefaultModelState):
             if settled is not None and n_tok == 1 and settled[req_idx] == buf["req_id"]:
                 settled_rows.append((i, req_idx, start, buf["req_id"]))
                 continue
-            if str(buf["req_id"]).startswith("_warmup_"):
+            if is_warmup_request(buf["req_id"]):
                 continue
 
             info = {key: value for key, value in buf.items() if isinstance(key, str)}
@@ -1506,7 +1507,7 @@ class OmniModelState(DefaultModelState):
         if callable(batch_postprocess) and input_batch.num_reqs:
             req_indices = [int(input_batch.idx_mapping_np[i]) for i in range(input_batch.num_reqs)]
             buffers = [self.intermediate_buffer.buffers[req_idx] for req_idx in req_indices]
-            if all(buf and "req_id" in buf and not str(buf["req_id"]).startswith("_warmup_") for buf in buffers):
+            if all(buf and "req_id" in buf and not is_warmup_request(buf["req_id"]) for buf in buffers):
                 query_start_loc = getattr(input_batch, "query_start_loc", None)
                 if (
                     isinstance(query_start_loc, torch.Tensor)
@@ -1563,7 +1564,7 @@ class OmniModelState(DefaultModelState):
             buf = self.intermediate_buffer.buffers[req_idx]
             if not buf or "req_id" not in buf:
                 continue
-            if str(buf["req_id"]).startswith("_warmup_"):
+            if is_warmup_request(buf["req_id"]):
                 continue
             start = int(input_batch.query_start_loc_np[i])
             n_tok = int(input_batch.num_scheduled_tokens[i])

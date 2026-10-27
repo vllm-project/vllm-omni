@@ -33,6 +33,7 @@ from .batched_token2wav import (
     row_offset_signature,
     state_shape_signature,
 )
+from .code2wav_watchdog import Code2WavWatchdog
 from .config_flags import read_bool_flag
 from .cuda_graph_wrapper import ResidentAttCache, _format_memory_delta, _memory_snapshot
 
@@ -235,6 +236,30 @@ def _normalize_reference(
     return waveform, _REF_TARGET_SAMPLE_RATE
 
 
+def reference_campplus_fbank_frames(max_seconds: float) -> int:
+    """16 kHz CAM++ fbank length of one normalized reference window.
+
+    Prompt preparation resamples the fixed 24 kHz window to 16 kHz and runs
+    Kaldi fbank with a 25 ms window, a 10 ms shift, and ``snip_edges``. The
+    CPU-reference TensorRT profile must cover this length before serving.
+    """
+    import torchaudio.compliance.kaldi as kaldi
+    from vllm.multimodal.audio import AudioResampler
+
+    samples_24k = max(1, int(max_seconds * _REF_TARGET_SAMPLE_RATE))
+    waveform_16k = AudioResampler(target_sr=16000).resample(
+        torch.zeros(samples_24k, dtype=torch.float32).numpy(),
+        orig_sr=_REF_TARGET_SAMPLE_RATE,
+    )
+    features = kaldi.fbank(
+        torch.from_numpy(waveform_16k).unsqueeze(0),
+        num_mel_bins=80,
+        dither=0,
+        sample_frequency=16000,
+    )
+    return int(features.shape[0])
+
+
 def _codec_tensor(value: Any, fallback: torch.Tensor) -> torch.Tensor:
     # Codec ids arrive from the connector as host data. A pageable host copy
     # would block the host once per request per step; stage them pinned.
@@ -371,6 +396,7 @@ class MiniCPMO45Code2Wav(nn.Module):
         self.model_path = str(vllm_config.model_config.model)
         self._model_revision = getattr(vllm_config.model_config, "revision", None)
         self.backend: BatchedToken2Wav | None = None
+        self._watchdog = Code2WavWatchdog.from_environment()
         self._states: dict[str, _RequestState] = {}
         self._runtime_prompts: OrderedDict[str, _RuntimePrompt] = OrderedDict()
         self._request_prompt_keys: dict[str, str] = {}
@@ -886,11 +912,29 @@ class MiniCPMO45Code2Wav(nn.Module):
         for row, item in enumerate(items):
             key = (item.prompt_cache_id, item.prompt_wav)
             if key not in prompts:
+                self._watchdog.phase(
+                    "prepare/prompt",
+                    {
+                        "request_ids": [
+                            candidate.request_id
+                            for candidate in items
+                            if (candidate.prompt_cache_id, candidate.prompt_wav) == key
+                        ],
+                        "batch_size": len(items),
+                    },
+                )
                 prompts[key] = self.backend.prepare_prompt(*key)
             features.append(prompts[key])
             if states[row] is None:
                 fresh.setdefault(key, []).append(row)
         for key, rows in fresh.items():
+            self._watchdog.phase(
+                "setup/cfm",
+                {
+                    "request_ids": [items[row].request_id for row in rows],
+                    "batch_size": len(rows),
+                },
+            )
             for row, state in zip(rows, self.backend.setup_batch(prompts[key], len(rows)), strict=True):
                 states[row] = state
         if any(state is None for state in states):
@@ -1011,7 +1055,8 @@ class MiniCPMO45Code2Wav(nn.Module):
         runtime_additional_information: list[dict[str, Any]] | None = None,
         **kwargs: Any,
     ) -> OmniOutput:
-        with _stage_matmul_policy(self._tf32_mode):
+        details = {"batch_size": len(runtime_additional_information or ())}
+        with self._watchdog.watch("forward/start", details), _stage_matmul_policy(self._tf32_mode):
             return self._forward_impl(
                 input_ids,
                 positions,
@@ -1032,6 +1077,7 @@ class MiniCPMO45Code2Wav(nn.Module):
         **kwargs: Any,
     ) -> OmniOutput:
         del positions, intermediate_tensors, inputs_embeds
+        self._watchdog.phase("forward/input_preparation")
         if getattr(self, "_precapture_pending", False) and self.backend is not None:
             try:
                 self._precapture_default_prompt()
@@ -1068,6 +1114,7 @@ class MiniCPMO45Code2Wav(nn.Module):
                 "(load_format=%s); loading Token2wav assets now.",
                 getattr(getattr(self.vllm_config, "load_config", None), "load_format", "unknown"),
             )
+            self._watchdog.phase("forward/backend_build")
             with torch.inference_mode(False), torch.no_grad():
                 self._build_backend()
 
@@ -1107,6 +1154,14 @@ class MiniCPMO45Code2Wav(nn.Module):
             self._trim_runtime_prompts()
             raise _batch_error("duplicate_request_in_forward", request_ids=state_ids)
         outputs = [empty for _ in segments]
+        self._watchdog.phase(
+            "forward/bucket_preparation",
+            {
+                "request_ids": [item.request_id for item in items],
+                "batch_size": len(items),
+                "codec_frames": [int(item.tokens.numel()) for item in items],
+            },
+        )
         sentinels = [item for item in items if item.last_chunk and item.tokens.numel() == 0]
         segment_markers = [
             item for item in items if not item.last_chunk and item.tts_is_last_chunk and item.tokens.numel() == 0
@@ -1179,9 +1234,23 @@ class MiniCPMO45Code2Wav(nn.Module):
             maximum=self._initial_batch_size,
         ):
             try:
+                self._watchdog.phase(
+                    "prepare/prompt",
+                    {
+                        "request_ids": [item.request_id for item in bucket],
+                        "batch_size": len(bucket),
+                    },
+                )
                 features = self.backend.prepare_prompt(
                     bucket[0].prompt_cache_id,
                     bucket[0].prompt_wav,
+                )
+                self._watchdog.phase(
+                    "setup/cfm",
+                    {
+                        "request_ids": [item.request_id for item in bucket],
+                        "batch_size": len(bucket),
+                    },
                 )
                 states = self.backend.setup_batch(features, len(bucket))
             except Exception as exc:
@@ -1227,6 +1296,14 @@ class MiniCPMO45Code2Wav(nn.Module):
         for bucket in self._iter_decode_batches(decode_buckets):
             batch_size = len(bucket)
             try:
+                self._watchdog.phase(
+                    "decode/dispatch",
+                    {
+                        "request_ids": [item.request_id for item in bucket],
+                        "batch_size": batch_size,
+                        "codec_frames": [int(item.tokens.numel()) for item in bucket],
+                    },
+                )
                 states, features = self._prepare_decode_batch(bucket)
                 fresh = [item for item in bucket if item.previous is None]
                 onset_mix = self._onset_merge and 0 < len(fresh) < batch_size
@@ -1291,6 +1368,14 @@ class MiniCPMO45Code2Wav(nn.Module):
                     )
                 )
 
+        self._watchdog.phase(
+            "forward/output_materialization",
+            {
+                "request_ids": [item.request_id for item in items],
+                "batch_size": len(items),
+                "audio_samples": [int(output.numel()) for output in outputs],
+            },
+        )
         self._commit_runtime_prompt_owners(items)
         # Only after the request committed its own reference can the prefetch
         # pin go; placeholder steps carry no reference and keep it.
@@ -1412,7 +1497,13 @@ class MiniCPMO45Code2Wav(nn.Module):
         if len(self._prefetch_queue) > self._ref_prefetch_max_waiters:
             return False
         state_id, record = next(iter(self._prefetch_queue.items()))
-        with _stage_matmul_policy(self._tf32_mode):
+        with (
+            self._watchdog.watch(
+                "prefetch/start",
+                {"request_ids": [state_id], "sample_rate": record.sample_rate},
+            ),
+            _stage_matmul_policy(self._tf32_mode),
+        ):
             return self._run_prefetch_phase(state_id, record)
 
     def _run_prefetch_phase(self, state_id: str, record: _RefPrefetch) -> bool:
@@ -1428,10 +1519,12 @@ class MiniCPMO45Code2Wav(nn.Module):
                     return False
                 # Phase A. The pin keeps the entry (and with it the backend's
                 # prompt features) alive until chunk 0 or finish releases it.
+                self._watchdog.phase("prefetch/materialize_reference")
                 cache_key, entry = self._materialize_runtime_prompt(record.ref_audio, record.sample_rate)
                 entry.pins.add(state_id)
                 self._prefetch_pins[state_id] = cache_key
                 self._trim_runtime_prompts()
+                self._watchdog.phase("prefetch/prepare_prompt")
                 self.backend.prepare_prompt(entry.cache_id, entry.path)
                 record.entry = entry
                 if not self._ref_prefetch_setup:
@@ -1447,7 +1540,9 @@ class MiniCPMO45Code2Wav(nn.Module):
             self._release_evicted_setup_holder()
             if self._setup_cache_size <= 0 or self._prefetch_setup_holder is not None:
                 return False
+            self._watchdog.phase("prefetch/prepare_prompt")
             features = self.backend.prepare_prompt(entry.cache_id, entry.path)
+            self._watchdog.phase("prefetch/setup_cfm")
             self.backend.setup_batch(features, 1)
             self._prefetch_setup_holder = state_id
             self._prefetch_setup_features = features
@@ -1565,6 +1660,34 @@ class MiniCPMO45Code2Wav(nn.Module):
         # consumed (CUDA for TensorRT, NPU for the device speaker embedding).
         device_spk = read_bool_flag(extra, "token2wav_device_spk", True)
         use_trt = read_bool_flag(extra, "token2wav_trt", False) or (os.environ.get("MINICPMO_TOKEN2WAV_TRT", "") == "1")
+        cpu_reference_spk = read_bool_flag(extra, "token2wav_spk_cpu_reference", False)
+        # The flag selects a CUDA speaker-only engine. Keep the previous path
+        # when it cannot apply, including explicit overrides that predate it:
+        # full DiT TensorRT and the CPU onnxruntime accuracy fallback.
+        if cpu_reference_spk and not current_omni_platform.is_cuda():
+            logger.info("MiniCPM-o Code2Wav: ignoring token2wav_spk_cpu_reference off CUDA")
+            cpu_reference_spk = False
+        elif cpu_reference_spk and use_trt:
+            logger.info(
+                "MiniCPM-o Code2Wav: ignoring token2wav_spk_cpu_reference because "
+                "token2wav_trt or MINICPMO_TOKEN2WAV_TRT selects full DiT TensorRT"
+            )
+            cpu_reference_spk = False
+        elif cpu_reference_spk and not device_spk:
+            logger.info(
+                "MiniCPM-o Code2Wav: ignoring token2wav_spk_cpu_reference because "
+                "token2wav_device_spk=false selects the CPU onnxruntime fallback"
+            )
+            cpu_reference_spk = False
+        elif cpu_reference_spk:
+            try:
+                import tensorrt  # noqa: F401
+            except ImportError:
+                logger.warning(
+                    "MiniCPM-o Code2Wav: ignoring token2wav_spk_cpu_reference because "
+                    "tensorrt is not installed; using the Torch speaker"
+                )
+                cpu_reference_spk = False
         # TensorRT is CUDA-only; other platforms ignore the toggle.
         if use_trt and current_omni_platform.is_cuda():
             from vllm_omni.model_executor.models.step_audio2.step_audio2_dit_trt import build_dit_trt_stepper
@@ -1584,6 +1707,18 @@ class MiniCPMO45Code2Wav(nn.Module):
             logger.info("MiniCPM-o Code2Wav: DiT estimator running on TensorRT (%s)", dtype_name)
             token2wav.enable_trt_spk_embedding()
             logger.info("MiniCPM-o Code2Wav: campplus speaker embedding running on TensorRT")
+        elif cpu_reference_spk:
+            from vllm_omni.model_executor.models.cosyvoice3.speaker_embedding_trt import _MAX_T, _MIN_T
+
+            frames = reference_campplus_fbank_frames(self._ref_max_seconds)
+            if frames < _MIN_T or frames > _MAX_T:
+                raise ValueError(
+                    "token2wav_spk_cpu_reference supports CAM++ TensorRT profiles of "
+                    f"{_MIN_T}..{_MAX_T} fbank frames; ref_audio_max_seconds="
+                    f"{self._ref_max_seconds} produces {frames} frames"
+                )
+            token2wav.enable_trt_spk_embedding(cpu_reference=True)
+            logger.info("MiniCPM-o Code2Wav: CPU-reference campplus speaker embedding on TensorRT")
         elif current_omni_platform.is_cuda() or current_omni_platform.is_npu():
             # CAM++ speaker embedding on device via torch (weights loaded from
             # the same campplus.onnx) — replaces the per-request CPU
@@ -1598,6 +1733,9 @@ class MiniCPMO45Code2Wav(nn.Module):
                     "MiniCPM-o Code2Wav: campplus speaker embedding falling back to CPU onnxruntime "
                     "(token2wav_device_spk=false)"
                 )
+        if read_bool_flag(extra, "token2wav_spk_cuda_graph", False):
+            token2wav.enable_speaker_cuda_graph(self.vllm_config)
+            logger.info("MiniCPM-o Code2Wav: exact-shape Torch speaker CUDA graphs enabled")
         self.backend = BatchedToken2Wav(
             token2wav,
             trt_stepper=trt_stepper,
@@ -1609,6 +1747,8 @@ class MiniCPMO45Code2Wav(nn.Module):
             setup_cache_size=self._setup_cache_size,
             cfm_tf32=tf32_mode != "off",
             encoder_graph_config=self._encoder_graph_config,
+            cfm_float16=read_bool_flag(extra, "cfm_float16", False),
+            watchdog=self._watchdog,
         )
         # Captured by the first forward (the warmup run): under vLLM's weight load a graph held GiBs.
         self._precapture_pending = read_bool_flag(extra, "cfm_graph_precapture", True)

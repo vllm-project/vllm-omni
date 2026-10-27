@@ -272,7 +272,7 @@ async def _run_server_vad_audio_roundtrips(
     host: str,
     port: int,
     model: str,
-    pcm16: bytes,
+    pcm16_24k: bytes,
     *,
     chunk_ms: int = 100,
     turns: int = 2,
@@ -280,7 +280,7 @@ async def _run_server_vad_audio_roundtrips(
     silence_ms: int = 1500,
     duplex: bool = False,
 ) -> list[list[dict]]:
-    chunk_bytes = max(16_000 * 2 // 1000 * chunk_ms, 2)
+    chunk_bytes = max(24_000 * 2 // 1000 * chunk_ms, 2)
     turn_events: list[list[dict]] = []
 
     query = "?duplex=1" if duplex else ""
@@ -295,7 +295,7 @@ async def _run_server_vad_audio_roundtrips(
                             "model": model,
                             "audio": {
                                 "input": {
-                                    "format": {"type": "audio/pcm", "rate": 16_000},
+                                    "format": {"type": "audio/pcm", "rate": 24_000},
                                     "turn_detection": turn_detection or {"type": "server_vad"},
                                 }
                             },
@@ -304,9 +304,9 @@ async def _run_server_vad_audio_roundtrips(
                 )
             )
 
-            silence = bytes(16_000 * 2 * silence_ms // 1000)
+            silence = bytes(24_000 * 2 * silence_ms // 1000)
             for _ in range(turns):
-                await _append_pcm16_chunks(ws, pcm16, chunk_bytes)
+                await _append_pcm16_chunks(ws, pcm16_24k, chunk_bytes)
                 await _append_pcm16_chunks(ws, silence, chunk_bytes)
                 turn_events.append(await _receive_server_vad_turn(ws))
         finally:
@@ -326,7 +326,7 @@ async def _run_server_vad_audio_roundtrips(
 
 
 def _assert_auto_committed_turns(turns: list[list[dict]]) -> None:
-    """Each turn: one speech start/stop, one commit and one completed audio response, in order."""
+    """Each turn: one speech start/stop, one commit and one terminal audio response, in order."""
     required_sequence = [
         "input_audio_buffer.speech_started",
         "input_audio_buffer.speech_stopped",
@@ -372,7 +372,11 @@ def _assert_auto_committed_turns(turns: list[list[dict]]) -> None:
         )
         assert output_pcm
         assert created["id"] == done["id"]
-        assert done["status"] == "completed"
+        # CI caps stage-0 text generation at 150 tokens, so a valid VAD turn can
+        # finish with an incomplete response and reason=max_output_tokens.
+        assert done["status"] in {"completed", "incomplete"}, done
+        if done["status"] == "incomplete":
+            assert done["status_details"]["reason"] == "max_output_tokens", done
         input_item_ids.append(input_item_id)
         response_ids.append(created["id"])
 
@@ -508,11 +512,6 @@ def _synthetic_pcm16_input(
     return _pcm16_mono_from_wav_bytes(wav_bytes, sample_rate_hz=24000)
 
 
-def _server_vad_pcm16_input() -> bytes:
-    """Load the fixed single-turn speech fixture used by the Server VAD E2E."""
-    return _pcm16_mono_from_wav_bytes(validated_input_wav().read_bytes())
-
-
 def _assert_realtime_smoke(result: dict) -> None:
     out_pcm = result["output_pcm"]
     assert result["audio_done"], "No response.output_audio.done event"
@@ -560,6 +559,36 @@ def _assert_realtime_accuracy(
         f"threshold={threshold}): "
         f"whisper={whisper_text!r}, model_text={final_text!r}"
     )
+
+
+async def _conformance_recv_until(ws, predicate, collected=None, *, timeout_s=120):
+    events = collected if collected is not None else []
+
+    async def _loop():
+        while not predicate(events):
+            raw = await ws.recv()
+            if isinstance(raw, bytes):
+                continue
+            event = json.loads(raw)
+            events.append(event)
+            if event.get("type") == "error":
+                err = event.get("error", event)
+                if err.get("type") == "server_error":
+                    raise AssertionError(f"Server error: {event}")
+
+    await asyncio.wait_for(_loop(), timeout=timeout_s)
+    return events
+
+
+def _conformance_events_of_type(events, t):
+    return [e for e in events if e.get("type") == t]
+
+
+async def _conformance_open_session(host, port, model):
+    ws = await websockets.connect(f"ws://{host}:{port}/v1/realtime", max_size=64 * 1024 * 1024)
+    await ws.send(json.dumps({"type": "session.update", "session": {"type": "realtime", "model": model}}))
+    events = await _conformance_recv_until(ws, lambda evts: any(e["type"] == "session.updated" for e in evts))
+    return ws, events
 
 
 class TestQwen3OmniRealtimeWebSocket:
@@ -656,16 +685,24 @@ class TestQwen3OmniRealtimeWebSocket:
         assert deploy.session_mode == "turn"
         assert deploy.async_chunk is True
         assert deploy.duplex_session.server_vad_model_path == SERVER_VAD_MODEL_PATH
-        pcm16 = _server_vad_pcm16_input()
+        pcm16_24k = _duplex_fixture_pcm(validated_input_wav())
 
         turns = asyncio.run(
             _run_server_vad_audio_roundtrips(
                 omni_server.host,
                 omni_server.port,
                 omni_server.model,
-                pcm16,
+                pcm16_24k,
                 chunk_ms=100,
                 turns=2,
+                turn_detection={
+                    "type": "server_vad",
+                    "threshold": 0.5,
+                    "prefix_padding_ms": 300,
+                    "silence_duration_ms": 500,
+                    "create_response": True,
+                    "interrupt_response": True,
+                },
             )
         )
 
@@ -673,9 +710,11 @@ class TestQwen3OmniRealtimeWebSocket:
         updated_session = next(event["session"] for event in turns[0] if event["type"] == "session.updated")
         effective_turn_detection = updated_session["audio"]["input"]["turn_detection"]
         assert effective_turn_detection["type"] == "server_vad"
+        assert effective_turn_detection["threshold"] == 0.5
+        assert effective_turn_detection["prefix_padding_ms"] == 300
         assert effective_turn_detection["silence_duration_ms"] == 500
         assert effective_turn_detection["create_response"] is True
-        assert effective_turn_detection["interrupt_response"] is False
+        assert effective_turn_detection["interrupt_response"] is True
         _assert_auto_committed_turns(turns)
 
     @pytest.mark.advanced_model
@@ -699,6 +738,49 @@ class TestQwen3OmniRealtimeWebSocket:
 
         _assert_realtime_smoke(result)
         _assert_realtime_accuracy(result)
+
+    # -- Protocol conformance --------------------------------------------- #
+
+    @pytest.mark.advanced_model
+    @pytest.mark.omni
+    @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+    @pytest.mark.parametrize("omni_server", realtime_async_chunk_server_params, indirect=True)
+    def test_session_lifecycle_events(self, omni_server) -> None:
+        """session.created must precede session.updated; both appear exactly once."""
+
+        async def _run():
+            ws, events = await _conformance_open_session(omni_server.host, omni_server.port, omni_server.model)
+            async with ws:
+                created = _conformance_events_of_type(events, "session.created")
+                updated = _conformance_events_of_type(events, "session.updated")
+                assert len(created) == 1
+                assert len(updated) == 1
+                ci = next(i for i, e in enumerate(events) if e["type"] == "session.created")
+                ui = next(i for i, e in enumerate(events) if e["type"] == "session.updated")
+                assert ci < ui, "session.created must precede session.updated"
+                assert "id" in created[0].get("session", {})
+
+        asyncio.run(_run())
+
+    @pytest.mark.advanced_model
+    @pytest.mark.omni
+    @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+    @pytest.mark.parametrize("omni_server", realtime_async_chunk_server_params, indirect=True)
+    def test_empty_commit_returns_error(self, omni_server) -> None:
+        """Committing an empty audio buffer must return an error event."""
+
+        async def _run():
+            ws, _ = await _conformance_open_session(omni_server.host, omni_server.port, omni_server.model)
+            async with ws:
+                await ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
+                events = await _conformance_recv_until(
+                    ws, lambda evts: any(e["type"] == "error" for e in evts), timeout_s=30
+                )
+                errors = _conformance_events_of_type(events, "error")
+                assert errors
+                assert "empty" in json.dumps(errors[0]).lower()
+
+        asyncio.run(_run())
 
 
 # These regressions use the engine-owned Qwen duplex plugin. The older class
@@ -1223,7 +1305,7 @@ class TestQwen3OmniDuplexPlayback:
                 server.host,
                 server.port,
                 server.model,
-                _server_vad_pcm16_input(),
+                _duplex_fixture_pcm(validated_input_wav()),
                 chunk_ms=100,
                 turns=2,
                 turn_detection={"type": "semantic_vad", "eagerness": "auto"},
