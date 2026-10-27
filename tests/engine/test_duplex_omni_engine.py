@@ -52,13 +52,10 @@ class _FakeSyncQueue:
         self.items: list[Any] = []
         self.full = full
 
-    def put(self, item: Any, timeout: float | None = None) -> None:
+    def put(self, item: Any, block: bool = True, timeout: float | None = None) -> None:
         if self.full:
             raise queue.Full
         self.items.append(item)
-
-    def put_nowait(self, item: Any) -> None:
-        self.put(item)
 
 
 def _engine(result: Any, *, alive: bool = True, full: bool = False) -> DuplexOmniEngine:
@@ -197,10 +194,13 @@ async def test_full_command_queue_offloads_wait_and_preserves_sequential_order(m
     loop = asyncio.get_running_loop()
     waiting = asyncio.Event()
     original_submit = engine._submit_command
+    attempts: list[tuple[DuplexSessionCommandMessage, bool]] = []
 
-    def submit_after_full(session_id, command):
-        loop.call_soon_threadsafe(waiting.set)
-        original_submit(session_id, command)
+    def submit_after_full(message: DuplexSessionCommandMessage, *, block: bool = True) -> None:
+        attempts.append((message, block))
+        if block:
+            loop.call_soon_threadsafe(waiting.set)
+        original_submit(message, block=block)
 
     monkeypatch.setattr(engine, "_submit_command", submit_after_full)
     first, second = Heartbeat(event_id="first"), Heartbeat(event_id="second")
@@ -221,6 +221,9 @@ async def test_full_command_queue_offloads_wait_and_preserves_sequential_order(m
     try:
         await asyncio.wait_for(waiting.wait(), timeout=2)
         assert not task.done()
+        assert len(attempts) == 2
+        assert attempts[0][1] is False and attempts[1][1] is True
+        assert attempts[0][0] is attempts[1][0]
         assert sync_q.get_nowait() is occupied
         for _ in range(2):
             message = await asyncio.wait_for(receive(), timeout=2)
