@@ -771,6 +771,7 @@ class TestInt8OnlineTensorParallelScales:
         )
 
 
+@gpu_available
 @hardware_test(
     res={"cuda": "L4", "rocm": "MI325"},
     num_cards=2,
