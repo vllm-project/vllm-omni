@@ -20,7 +20,6 @@ from vllm.multimodal.cache import ShmObjectStoreSenderCache
 from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.kv_hints import KvHintsEnvelope
 
-from vllm_omni.config.stage_config import STREAMING_UPDATE_TRANSFORM_ATTR
 from vllm_omni.data_entry_keys import REQUEST_ARTIFACT_DIRS_KEY, TRANSFORM_OWNED_META_KEYS
 from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.engine.async_engine_utils import (
@@ -34,14 +33,12 @@ from vllm_omni.engine.messages import (
     AddCompanionRequestMessage,
     EngineQueueMessage,
     InteractionMessage,
-    NextStageInputMessage,
     StageSubmissionMessage,
 )
 from vllm_omni.engine.omni_engine_base import OmniEngineBase, StageRuntimeInfo
 from vllm_omni.engine.orchestrator import Orchestrator, OrchestratorBase
 from vllm_omni.engine.serialization import deserialize_additional_information
-from vllm_omni.inputs.data import OmniInteractionPrompt, OmniSamplingParams, disable_watermarking
-from vllm_omni.tracing import capture_trace_headers
+from vllm_omni.inputs.data import OmniInteractionPrompt, OmniSamplingParams
 
 logger = init_logger(__name__)
 
@@ -159,40 +156,27 @@ class AsyncOmniEngine(OmniEngineBase):
         self,
         request_id: str,
         prompt: Any,
-        *,
-        requested_replica_id: int | None = None,
     ) -> tuple[int | None, Any]:
-        """Return the stage-0 replica used to scope the prompt before processing.
+        """Return the preselected stage-0 replica and the prompt to process.
 
         The returned prompt is a scoped copy when scoping applies, else
-        ``prompt`` itself. An explicit replica is already part of the request,
-        so use it directly instead of publishing routing state from the caller
-        thread. Automatic routing still preselects a replica as before.
+        ``prompt`` itself.
         """
         stage_pools = getattr(self, "stage_pools", None)
         if isinstance(prompt, EngineCoreRequest) or not stage_pools:
             return None, prompt
 
         stage0_pool = stage_pools[0]
-        prompts = prompt if isinstance(prompt, list) else [prompt]
-        if not any(isinstance(p, dict) and p.get("multi_modal_data") for p in prompts):
-            return None, prompt
-
-        if requested_replica_id is not None:
-            # Read-only frontend preflight: do not populate sender-cache entries
-            # for a route that is already invalid. The orchestrator remains the
-            # owner of routing state and revalidates at admission to close the
-            # membership-change race after enqueue.
-            stage0_pool.validate_requested_replica(requested_replica_id)
-
         # TODO: Currently only supports the ar -> dit process.
         # Future scenarios (e.g., dit -> ar) need to be added, which will require modifications here.
         if stage0_pool.stage_type == "diffusion" or self._stage_pool_replica_count(stage0_pool) <= 1:
             return None, prompt
 
-        if requested_replica_id is not None:
-            replica_id = requested_replica_id
-        elif self._stage_pool_is_distributed(stage0_pool):
+        prompts = prompt if isinstance(prompt, list) else [prompt]
+        if not any(isinstance(p, dict) and p.get("multi_modal_data") for p in prompts):
+            return None, prompt
+
+        if self._stage_pool_is_distributed(stage0_pool):
             preselect_replica_id = getattr(stage0_pool, "preselect_replica_id", None)
             if not callable(preselect_replica_id):
                 logger.debug(
@@ -240,12 +224,9 @@ class AsyncOmniEngine(OmniEngineBase):
         kv_hints: KvHintsEnvelope | None = None,
         resumable: bool = False,
         message_type: Literal["add_request", "streaming_update"] = "add_request",
-        yield_stage_id: int | None = None,
         entry_stage_id: int = 0,
-        requested_replica_id: int | None = None,
     ) -> StageSubmissionMessage:
         """Build an add_request message after stage-0 preprocessing."""
-        trace_headers = capture_trace_headers(trace_headers)
         request_timestamp = float(arrival_time) if arrival_time is not None else time.time()
         effective_sampling_params_list: list[OmniSamplingParams] = (
             list(cast(Sequence[OmniSamplingParams], sampling_params_list))
@@ -256,15 +237,6 @@ class AsyncOmniEngine(OmniEngineBase):
             raise ValueError(
                 f"Missing sampling params for stage 0. Got {len(effective_sampling_params_list)} stage params."
             )
-
-        # Opting out on any stage opts the whole request out; pooling stages never watermark
-        if any(
-            params.watermarking is False
-            for params in effective_sampling_params_list
-            if isinstance(params, OmniSamplingParams)
-        ):
-            effective_sampling_params_list = disable_watermarking(effective_sampling_params_list)
-
         params = effective_sampling_params_list[0]
 
         # Keep the original prompt for downstream stages (they need the raw
@@ -311,16 +283,11 @@ class AsyncOmniEngine(OmniEngineBase):
                     inject_global_id(item, request_id)
 
             prompt_transform_func = getattr(self, "prompt_transform_func", None)
-            if message_type == "streaming_update":
-                prompt_transform_func = getattr(
-                    prompt_transform_func, STREAMING_UPDATE_TRANSFORM_ATTR, prompt_transform_func
-                )
             if prompt_transform_func is not None:
                 prompt = prompt_transform_func(
                     copy.copy(prompt),
                     effective_sampling_params_list,
                 )
-                params = effective_sampling_params_list[0]
                 if isinstance(prompt, dict):
                     raw_dirs = prompt.pop(REQUEST_ARTIFACT_DIRS_KEY, None)
                     if isinstance(raw_dirs, list) and all(isinstance(path, str) for path in raw_dirs):
@@ -337,18 +304,16 @@ class AsyncOmniEngine(OmniEngineBase):
             preselected_stage0_replica, prompt = self._scope_stage0_multimodal_cache_to_replica(
                 request_id,
                 prompt,
-                requested_replica_id=requested_replica_id,
             )
 
             # Full input processing (tokenization, multimodal, etc.)
             assert self.input_processor is not None
 
             def _release_failed_preprocess() -> None:
-                """Undo a failed stage-0 preprocess: free an automatic-route
-                preselection and drop artifacts the transform already wrote.
-                Explicit routing creates no frontend binding. Reads only
-                server-tracked state — never the client prompt."""
-                if preselected_stage0_replica is not None and requested_replica_id is None and self.stage_pools:
+                """Undo a failed stage-0 preprocess: free the reserved replica
+                binding and drop artifacts the transform already wrote. Reads
+                only server-tracked state — never the client prompt."""
+                if preselected_stage0_replica is not None and self.stage_pools:
                     self.stage_pools[0].release_binding(request_id)
                 for artifact_dir in request_artifact_dirs:
                     shutil.rmtree(artifact_dir, ignore_errors=True)
@@ -392,16 +357,14 @@ class AsyncOmniEngine(OmniEngineBase):
                 if reasoning_ended is not None:
                     request.reasoning_ended = reasoning_ended
 
-                # process_inputs() leaves external_req_id unset, so we need to set it to the
-                # orchestrator request_id to find the correct req_state in Orchestrator.request_states.
+                # Restore external_req_id to the original user-facing request_id.
+                # InputProcessor.process_inputs() renames request_id to an internal
+                # UUID (saving the original in external_req_id), but then overwrites
+                # external_req_id with the new internal ID. We need external_req_id
+                # to match the key used in Orchestrator.request_states so that
+                # output routing (output.request_id lookup) can find the req_state.
                 request.external_req_id = request_id
-                # A run request's yielded stage returns its payload when the next stage takes a full payload.
-                return_stage_payload = (
-                    yield_stage_id is not None and self.stage_pools[yield_stage_id + 1].takes_full_payload_input
-                )
-                request = apply_omni_final_stage_metadata(
-                    request, final_stage_id, return_stage_payload=return_stage_payload
-                )
+                request = apply_omni_final_stage_metadata(request, final_stage_id)
 
                 # Registration with stage 0's output processor is deferred to the
                 # orchestrator thread (see Orchestrator._handle_add_request), which
@@ -429,11 +392,8 @@ class AsyncOmniEngine(OmniEngineBase):
             request_timestamp=request_timestamp,
             enqueue_ts=time.perf_counter(),
             request_artifact_dirs=request_artifact_dirs or None,
-            trace_headers=trace_headers,
-            yield_stage_id=yield_stage_id,
             entry_stage_id=entry_stage_id,
             lora_request=lora_request,
-            requested_replica_id=requested_replica_id,
         )
 
     def _build_cfg_companions(
@@ -553,9 +513,7 @@ class AsyncOmniEngine(OmniEngineBase):
         *,
         kv_hints: KvHintsEnvelope | None = None,
         resumable: bool = False,
-        yield_stage_id: int | None = None,
         entry_stage_id: int = 0,
-        requested_replica_id: int | None = None,
     ) -> None:
         """Process stage-0 input locally, then send to the Orchestrator.
 
@@ -579,9 +537,7 @@ class AsyncOmniEngine(OmniEngineBase):
             data_parallel_rank=data_parallel_rank,
             reasoning_ended=reasoning_ended,
             resumable=resumable,
-            yield_stage_id=yield_stage_id,
             entry_stage_id=entry_stage_id,
-            requested_replica_id=requested_replica_id,
             kv_hints=kv_hints,
         )
         try:
@@ -620,9 +576,7 @@ class AsyncOmniEngine(OmniEngineBase):
         *,
         kv_hints: KvHintsEnvelope | None = None,
         resumable: bool = False,
-        yield_stage_id: int | None = None,
         entry_stage_id: int = 0,
-        requested_replica_id: int | None = None,
     ) -> tuple[StageSubmissionMessage, list[AddCompanionRequestMessage]]:
         """Build the ADD message plus CFG companions without enqueueing."""
         # Client requests must never bring the server-reserved artifact-dirs
@@ -649,9 +603,7 @@ class AsyncOmniEngine(OmniEngineBase):
                 data_parallel_rank=data_parallel_rank,
                 reasoning_ended=reasoning_ended,
                 resumable=resumable,
-                yield_stage_id=yield_stage_id,
                 entry_stage_id=entry_stage_id,
-                requested_replica_id=requested_replica_id,
                 **({"kv_hints": kv_hints} if kv_hints is not None else {}),
             )
             # CFG companions are built before the parent is admitted, so the group
@@ -668,7 +620,6 @@ class AsyncOmniEngine(OmniEngineBase):
                     companions = self._build_cfg_companions(
                         request_id, msg.original_prompt, stage0_params, effective_spl
                     )
-            msg.cfg_companion_ids = {companion.role: companion.companion_id for companion in companions} or None
         except BaseException:
             # Companion construction runs under this guard too: a failure after
             # the ADD message exists must still release its preprocessed
@@ -884,9 +835,7 @@ class AsyncOmniEngine(OmniEngineBase):
         *,
         kv_hints: KvHintsEnvelope | None = None,
         resumable: bool = False,
-        yield_stage_id: int | None = None,
         entry_stage_id: int = 0,
-        requested_replica_id: int | None = None,
     ) -> None:
         """Async add_request API.
 
@@ -911,9 +860,7 @@ class AsyncOmniEngine(OmniEngineBase):
             data_parallel_rank=data_parallel_rank,
             reasoning_ended=reasoning_ended,
             resumable=resumable,
-            yield_stage_id=yield_stage_id,
             entry_stage_id=entry_stage_id,
-            requested_replica_id=requested_replica_id,
             **({"kv_hints": kv_hints} if kv_hints is not None else {}),
         )
         outcome: dict[str, bool] = {"parent_enqueued": False}
@@ -943,10 +890,6 @@ class AsyncOmniEngine(OmniEngineBase):
                 len(companions),
             )
 
-    async def add_next_stage_input_async(self, msg: NextStageInputMessage) -> None:
-        """Send a next stage input returned by an earlier request to the Orchestrator."""
-        self.request_queue.sync_q.put(msg)
-
     def add_streaming_update(
         self,
         request_id: str,
@@ -959,7 +902,6 @@ class AsyncOmniEngine(OmniEngineBase):
         lora_request: Any = None,
         *,
         resumable: bool = True,
-        trace_headers: Mapping[str, str] | None = None,
     ) -> None:
         """Send an incremental streaming update for an existing request."""
         msg = self._build_add_request_message(
@@ -972,7 +914,6 @@ class AsyncOmniEngine(OmniEngineBase):
             arrival_time=arrival_time,
             lora_request=lora_request,
             resumable=resumable,
-            trace_headers=trace_headers,
             message_type="streaming_update",
         )
         self.request_queue.sync_q.put(msg)
@@ -989,7 +930,6 @@ class AsyncOmniEngine(OmniEngineBase):
         lora_request: Any = None,
         *,
         resumable: bool = True,
-        trace_headers: Mapping[str, str] | None = None,
     ) -> None:
         """Async wrapper for add_streaming_update().
 
@@ -1009,7 +949,6 @@ class AsyncOmniEngine(OmniEngineBase):
             arrival_time=arrival_time,
             lora_request=lora_request,
             resumable=resumable,
-            trace_headers=trace_headers,
             message_type="streaming_update",
         )
         await self._put_request_queue(msg)

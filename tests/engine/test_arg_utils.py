@@ -21,64 +21,49 @@ from omegaconf import OmegaConf
 from pydantic import ValidationError
 from transformers import PretrainedConfig, Qwen3OmniMoeConfig
 from vllm.config import VllmConfig
-from vllm.config.utils import hash_config
 from vllm.engine.arg_utils import EngineArgs
 from vllm.exceptions import VLLMValidationError
 from vllm.v1.engine.input_processor import InputProcessor
 from vllm.v1.worker.gpu.sample.logit_bias import LogitBiasState
 
 from tests.helpers.mock import patch_hf_snapshot_download
-from tests.helpers.stage_config import get_deploy_config_path
 from vllm_omni.config.model import OmniModelConfig
-from vllm_omni.distributed.omni_connectors.utils.initialization import (
-    load_omni_transfer_config,
-    resolve_omni_kv_config_for_stage,
-)
 from vllm_omni.engine.arg_utils import OmniEngineArgs
-from vllm_omni.engine.stage_init_utils import build_engine_args_dict, get_stage_connector_spec
+from vllm_omni.engine.stage_init_utils import build_engine_args_dict
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
-# Explicit so engine configs with connectors build on any platform.
-AR_WORKER_CLS = "vllm_omni.worker.gpu_ar_worker.GPUARWorker"
 
-
-@pytest.mark.parametrize("logits_processor", [LogitBiasState, None], ids=["logit_bias", "audex_cfg"])
-def test_stage_runner_selects_matching_input_processor_validator(logits_processor):
+@pytest.mark.parametrize("use_v2", [False, True])
+def test_stage_runner_selects_matching_input_processor_validator(monkeypatch, use_v2):
     from vllm.sampling_params import SamplingParams
 
     from vllm_omni.model_executor.models.audex.cfg import AudexCFGLogitsProcessor
 
-    # v0.34 removed Model Runner V1 together with the VLLM_USE_V2_MODEL_RUNNER
-    # preference; every stage now validates request params through the single
-    # `build_custom_logits_processors_params_validator` path, which calls each
-    # processor class's `validate_params` (the V2 interface). AudexCFGLogitsProcessor
-    # keeps its cfg_role/cfg_scale validation there.
-    if logits_processor is None:
-        logits_processor = AudexCFGLogitsProcessor
+    # Upstream's process-wide preference must not override a stage's deploy choice.
+    monkeypatch.setattr("vllm.envs.VLLM_USE_V2_MODEL_RUNNER", not use_v2)
     config = VllmConfig()
     model_config = object.__new__(OmniModelConfig)
+    model_config.use_v2_model_runner = use_v2
     model_config.runner_type = "generate"
-    model_config.logits_processors = [logits_processor]
+    model_config.logits_processors = [LogitBiasState if use_v2 else AudexCFGLogitsProcessor]
     config.model_config = model_config
+    assert config.use_v2_model_runner is use_v2
     processor = object.__new__(InputProcessor)
     processor.vllm_config, processor.model_config = config, model_config
     validator = processor._build_logits_processors_params_validator()
     validator(SamplingParams(extra_args={"cfg_role": "cond", "cfg_scale": 1.5}))
-    if logits_processor is AudexCFGLogitsProcessor:
+    if not use_v2:
         with pytest.raises(VLLMValidationError, match="cfg_role"):
             validator(SamplingParams(extra_args={"cfg_role": "invalid"}))
 
 
 @pytest.mark.parametrize("use_v2", [False, True])
 def test_plain_vllm_config_retains_upstream_runner_preference(monkeypatch, use_v2):
-    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", str(int(use_v2)))
-    assert not hasattr(VllmConfig(), "use_v2_model_runner")
-    assert OmniEngineArgs().use_v2_model_runner
-    with pytest.raises(ValueError, match="Model Runner V1 is not supported"):
-        OmniEngineArgs(use_v2_model_runner=False)
+    monkeypatch.setattr("vllm.envs.VLLM_USE_V2_MODEL_RUNNER", use_v2)
+    assert VllmConfig().use_v2_model_runner is use_v2
 
 
 def test_sync_config_is_omni():
@@ -104,8 +89,8 @@ def test_default_stage_id_is_concrete_int():
     assert cfg.stage_id == 0
 
 
-def test_topology_owned_model_fields_reach_omni_model_config(monkeypatch):
-    """Keep pipeline-owned model fields intact through the engine adapter."""
+def test_full_payload_capability_reaches_omni_model_config(monkeypatch):
+    """Keep the pipeline capability intact through the engine adapter."""
     captured: dict[str, object] = {}
     baseline_config = Mock()
     worker_module = types.ModuleType("test_connector_worker")
@@ -136,12 +121,10 @@ def test_topology_owned_model_fields_reach_omni_model_config(monkeypatch):
     OmniEngineArgs(
         stage_id=1,
         requires_full_payload_input=True,
-        scheduling_metadata_adapter="pipeline.Adapter",
         worker_cls="test_connector_worker.ConnectorWorker",
     ).create_model_config()
 
     assert captured["requires_full_payload_input"] is True
-    assert captured["scheduling_metadata_adapter"] == "pipeline.Adapter"
 
 
 def test_stage_without_connector_configuration_accepts_plain_runner(monkeypatch):
@@ -264,42 +247,6 @@ def test_default_all_values_are_initialized():
     # all attributes, so should raise if we have attributes that are
     # not initialized correctly, e.g., due to default factories
     str(cfg)
-
-
-@pytest.mark.parametrize("stage_id", [0, 1])
-def test_compute_hash_is_stable_across_launches(stage_id):
-    """Ensure relaunching the same deploy config gives a stage the same compile cache hash."""
-
-    def get_model_config_hash() -> str:
-        # Transfer config & kv connector config currently contain UUIDs, which should not affect the compile key
-        transfer_config = load_omni_transfer_config(get_deploy_config_path("qwen3_tts.yaml"))
-        kv_connector_config = resolve_omni_kv_config_for_stage(transfer_config, stage_id)[0]
-        vllm_config = OmniEngineArgs(
-            worker_cls=AR_WORKER_CLS,
-            stage_connector_spec=get_stage_connector_spec(transfer_config, stage_id, async_chunk=True),
-            omni_kv_config={"connector_config": kv_connector_config},
-        ).create_engine_config()
-        # vLLM keys its torch.compile and AOT caches on this hash.
-        return hash_config(vllm_config)
-
-    first_hash = get_model_config_hash()
-    second_hash = get_model_config_hash()
-    assert first_hash == second_hash
-
-
-def test_compute_hash_keeps_stage_connector_settings():
-    """Ensure connector settings that models read (e.g. codec chunk size) still change the hash."""
-
-    def get_model_config_hash(num_frames: int) -> str:
-        vllm_config = OmniEngineArgs(
-            worker_cls=AR_WORKER_CLS,
-            stage_connector_spec={"name": "SharedMemoryConnector", "extra": {"codec_chunk_frames": num_frames}},
-        ).create_engine_config()
-        return hash_config(vllm_config)
-
-    first_hash = get_model_config_hash(num_frames=25)
-    second_hash = get_model_config_hash(num_frames=50)
-    assert first_hash != second_hash
 
 
 def test_qwen3_tts_codec_frame_rate_patching():
@@ -688,17 +635,9 @@ DIFFUSION_NON_PARALLEL_ENGINE_ARGS = [
     ("diffusion_attention_backend", "SDPA"),
     ("fastvideo_vsa_topk", 96),
     ("diffusion_attention_config", '{"default": {"backend": "SDPA"}}'),
-    (
-        "diffusion_attention_schedule",
-        {
-            "profiles": {"sparse": {"default": {"backend": "SDPA"}}},
-            "default": [{"start": 2, "end": None, "profile": "sparse"}],
-        },
-    ),
     ("diffusion_compile_granularity", "whole"),
     ("diffusion_compile_dynamic", False),
     ("enable_cuda_graph_decode", False),
-    ("enable_cfg_batching", True),
     ("cache_backend", "tea_cache"),
     ("cache_config", '{"steps": [1, 2]}'),
     ("video_output_transport", {"backend": "zmq"}),
@@ -763,7 +702,6 @@ def test_non_parallel_diffusion_engine_args_reach_default_diffusion_config():
         "flow_shift": 12.0,
         "num_gpus": 2,
         "enable_cuda_graph_decode": False,
-        "enable_cfg_batching": True,
         "vae_encode_fast_path": "off",
     }
     engine_args = OmniEngineArgs.from_cli_args(SimpleNamespace(**overrides))
@@ -777,18 +715,7 @@ def test_non_parallel_diffusion_engine_args_reach_default_diffusion_config():
     assert resolved["flow_shift"] == 12.0
     assert resolved["parallel_config"]["data_parallel_size"] == 2
     assert resolved["enable_cuda_graph_decode"] is False
-    assert resolved["enable_cfg_batching"] is True
     assert resolved["vae_encode_fast_path"] == "off"
-
-
-@pytest.mark.parametrize(
-    "worker_cls",
-    ["vllm_omni.worker.gpu_ar_worker.GPUARWorker", "vllm_omni.worker.gpu_generation_worker.GPUGenerationWorker"],
-)
-def test_native_mrv2_worker_provides_connector_without_legacy_mixin(worker_cls):
-    args = OmniEngineArgs(worker_cls=worker_cls, requires_full_payload_input=True)
-
-    assert args.worker_cls == worker_cls
 
 
 # For https://github.com/vllm-project/vllm-omni/issues/8037

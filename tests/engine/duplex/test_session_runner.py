@@ -1413,6 +1413,63 @@ async def test_cancel_cleanup_failure_retains_requests_for_close_retry() -> None
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("ended", [False, True])
+@pytest.mark.parametrize("native_signal", [False, True])
+async def test_audio_truncation_preserves_retrieved_and_terminal_transcript(ended, native_signal) -> None:
+    h = await open_harness()
+    try:
+        session = h.session
+        response = session.begin_response()
+        item_id = f"item_{response}"
+        h.runner.emit(h.runner.model.response_created_payload(response, epoch=session.epoch))
+        session.append_assistant_text("abcdefghij")
+        session.mark_audio_sent(10_000, text_chars=10, audio_complete=True)
+        h.runner.emit(
+            {
+                "type": "response.output_audio.delta",
+                "response_id": response,
+                "audio": "AAA=",
+                "text": "abcdefghij",
+                "audio_duration_ms": 10_000,
+                "audio_text_marks": [{"text_chars": 10, "audio_end_ms": 10_000}],
+            }
+        )
+        if ended:
+            session.register_history_item(item_id, session.end_response())
+            h.runner.emit({"type": "response.done", "response_id": response})
+        await h.settle()
+
+        if native_signal:
+            command = commands.SignalTurn(
+                event="conversation.item.truncate", signal_payload={"item_id": item_id, "audio_end_ms": 4_000}
+            )
+        else:
+            command = commands.TruncateItem(item_id=item_id, audio_end_ms=4_000)
+        events = await h.run(command)
+        assert "error" not in types(events)
+        assert find(events, "conversation.item.truncated").audio_end_ms == 4_000
+        for _ in range(2):
+            events = await h.run(
+                commands.SignalTurn(event="conversation.item.retrieve", signal_payload={"item_id": item_id})
+            )
+            assert find(events, "conversation.item.retrieved").item["content"][0]["transcript"] == "abcd"
+
+        if not ended:
+            session.register_history_item(item_id, session.end_response())
+            h.runner.emit({"type": "response.done", "response_id": response})
+            events = await h.settle()
+            done = find(events, "response.done")
+            assert done.response["output"][0]["content"][0]["transcript"] == "abcd"
+            events = await h.run(
+                commands.SignalTurn(event="conversation.item.retrieve", signal_payload={"item_id": item_id})
+            )
+            assert find(events, "conversation.item.retrieved").item["content"][0]["transcript"] == "abcd"
+        assert session.history_item_ids[item_id]["content"] == "abcd"
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
 async def test_cancel_response_without_active_response_is_rejected() -> None:
     h = await open_harness()
     try:

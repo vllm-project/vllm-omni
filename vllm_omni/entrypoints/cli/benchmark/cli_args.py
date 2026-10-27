@@ -579,6 +579,13 @@ def update_omni_help(parser: argparse.ArgumentParser) -> None:
                 "can be provided, separated by spaces, and a request must satisfy every SLO to count toward "
                 'goodput. Allowed metric names are "ttft", "tpot", "e2el", and "audio_ttfp".'
             )
+        if action.dest == "goodput":
+            action.help = (
+                'Specify service level objectives for goodput as "KEY:VALUE" pairs, where the key is a '
+                'request-level metric name and the value is in milliseconds. Multiple "KEY:VALUE" pairs '
+                "can be provided, separated by spaces, and a request must satisfy every SLO to count toward "
+                'goodput. Allowed metric names are "ttft", "tpot", "e2el", and "audio_ttfp".'
+            )
         if action.dest == "random_mm_limit_mm_per_prompt":
             action.help = (
                 "Per-modality hard caps for items attached per request, e.g. "
