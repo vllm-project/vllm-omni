@@ -28,6 +28,7 @@ from vllm_omni.engine.duplex.plugin import DuplexRuntimeConfigError
 from vllm_omni.engine.duplex.session import helpers
 from vllm_omni.engine.duplex.session.context import DuplexSessionContext
 from vllm_omni.engine.duplex.session.emitter import SessionEmitter, session_auto_responds
+from vllm_omni.engine.duplex.session.input_clock import check_input_clock_supported, check_input_clock_unchanged
 from vllm_omni.engine.duplex.session.lease import DuplexLeaseActivity
 from vllm_omni.engine.duplex.session.model_channel import ModelChannel
 from vllm_omni.engine.duplex.session.tool_calls import ToolCallRejection, ToolCallState
@@ -327,6 +328,14 @@ class SessionControl:
         )
         if unsupported is not None:
             self._out.emit_error("unsupported_turn_detection", unsupported, event_id=realtime_event_id)
+            return
+        try:
+            check_input_clock_supported(self._ctx.plugin, candidate_config.extra_body)
+            # The clock mode and its timeouts are fixed at creation, like the
+            # acknowledgements they decide.
+            check_input_clock_unchanged(session.config.extra_body, candidate_config.extra_body)
+        except DuplexRuntimeConfigError as exc:
+            self._out.emit_error(exc.code, str(exc), event_id=realtime_event_id)
             return
         if candidate_config.instructions != session.config.instructions and model_state.context_locked:
             self._out.emit_error(

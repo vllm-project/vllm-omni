@@ -21,7 +21,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import time
-from collections.abc import Awaitable, Callable, Iterable
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
@@ -57,6 +57,7 @@ from vllm_omni.engine.duplex.messages import (
 )
 from vllm_omni.engine.duplex.plugin import DuplexModelPlugin, DuplexRuntimeConfigError, validate_duplex_plugin_sampling
 from vllm_omni.engine.duplex.session.engine_session import DuplexEngineSession, DuplexFenceMismatchError
+from vllm_omni.engine.duplex.session.input_clock import check_input_clock_supported
 from vllm_omni.engine.duplex.session.lease import DuplexLeaseActivity, DuplexLeaseConfig, DuplexLeaseState
 from vllm_omni.engine.duplex.turn_detection import SileroVADBackendProvider, SmartTurnBackendProvider
 
@@ -284,6 +285,11 @@ class DuplexSessionManager:
         holds its admitted byte reservation through decoding and VAD. The
         runner then replaces it with the decoded PCM reservation without an
         intervening await, keeping pending audio charged while it is busy.
+
+        A command refused here is answered with an ``error``. The modality and
+        backpressure refusals also call ``runner.input_refused``, which gives
+        an input-clocked session's refused input its acknowledgement in input
+        order; a refusal because the session is closing does not.
         """
         runner = self.runners.get(message.session_id)
         command = message.command
@@ -309,6 +315,9 @@ class DuplexSessionManager:
                     )
                 ],
             )
+            # Not ``input_refused``: an input-clocked session acknowledges only
+            # inputs that arrived before it began closing (its teardown
+            # acknowledgement covers them).
             return
         if isinstance(command, AppendAudio):
             has_audio = bool(command.audio)
@@ -319,6 +328,7 @@ class DuplexSessionManager:
                     session,
                     [self._error_event("invalid_input_modality", modality_error, command=command)],
                 )
+                runner.input_refused(command, "invalid_input_modality")
                 return
             limit = int(self.runtime_config.max_pending_input_bytes_per_session)
             pending_bytes = len(command.audio) + sum(len(frame) for frame in command.video_frames)
@@ -333,6 +343,7 @@ class DuplexSessionManager:
                         )
                     ],
                 )
+                runner.input_refused(command, "input_backpressure")
                 return
         elif isinstance(command, Commit):
             if not session.reserve_pending_turn(limit=int(self.runtime_config.max_pending_turns_per_session)):
@@ -346,6 +357,7 @@ class DuplexSessionManager:
                         )
                     ],
                 )
+                runner.input_refused(command, "input_backpressure")
                 return
         runner.submit(command)
 
@@ -438,6 +450,7 @@ class DuplexSessionManager:
         ok: bool,
         session: DuplexEngineSession | None = None,
         error: BaseException | None = None,
+        public_extra: Mapping[str, object] | None = None,
     ) -> None:
         error_code, error_message, error_retryable = (
             self._control_error(error) if error is not None else (None, None, False)
@@ -449,7 +462,9 @@ class DuplexSessionManager:
             ok=ok,
             lease_generation=session.lease_generation if session is not None else None,
             capabilities=session.capabilities if session is not None and ok else None,
-            public_session=session.as_public_dict() if session is not None and ok else None,
+            public_session=(
+                {**session.as_public_dict(), **(public_extra or {})} if session is not None and ok else None
+            ),
             error_code=error_code,
             error_message=error_message,
             error_retryable=error_retryable,
@@ -573,6 +588,7 @@ class DuplexSessionManager:
             holds_replica_reservation = True
             config = message.session_config
             self.plugin.validate_client_extra_body(config.extra_body)
+            check_input_clock_supported(self.plugin, config.extra_body)
             try:
                 runtime_config = await self.plugin.prepare_runtime_config(config, model_config=self.model_config)
             except DuplexRuntimeConfigError:
@@ -844,7 +860,17 @@ class DuplexSessionManager:
                 )
             except ValueError as exc:
                 raise DuplexSessionError(str(exc), code="session_resume_conflict") from exc
-            await self._put_result(message, operation="resume", ok=True, session=session)
+            # An input-clocked client learns how many of its inputs reached the
+            # session (``input_index`` of the latest), so it can resend exactly
+            # those lost with the old connection.
+            admitted = runner.admitted_inputs
+            await self._put_result(
+                message,
+                operation="resume",
+                ok=True,
+                session=session,
+                public_extra={"input_index": admitted} if admitted is not None else None,
+            )
         except Exception as exc:
             logger.exception("resume_duplex_session failed: %s", exc)
             await self._put_result(message, operation="resume", ok=False, session=session, error=exc)
