@@ -346,7 +346,10 @@ def _generate_t2i_image(model: str, quantization: str | None) -> torch.Tensor:
 
 
 def _assert_finite_image_payload(payload, context: str) -> None:
-    """Reject non-finite raw image tensors before PIL conversion can mask them."""
+    """Reject NaN/Inf in tensor payloads supplied directly or in lists/tuples.
+
+    PIL payloads contain no raw tensor values for this helper to inspect.
+    """
     if isinstance(payload, torch.Tensor):
         assert bool(torch.isfinite(payload).all()), f"non-finite values (NaN/Inf) in {context}"
     elif isinstance(payload, (list, tuple)):
@@ -359,7 +362,9 @@ def _extract_image_tensor(outputs, expected_size: tuple[int, int] = _T2I_IMAGE_S
 
     Count all requests and completions, deduplicating field aliases within each
     output. Repeated batch positions or separate completions still count twice.
-    Check raw tensor finiteness before conversion to uint8 can mask NaN/Inf.
+    Check finiteness of tensor payloads before this helper converts them to PIL.
+    MammothModa2 T2I already returns PIL images, so this check cannot inspect
+    the raw DiT output before its upstream PIL conversion.
     """
     import numpy as np
 
