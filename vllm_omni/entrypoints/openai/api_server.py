@@ -1368,9 +1368,16 @@ async def omni_init_app_state(
         engine_client, state.openai_serving_models, request_logger=request_logger, model_name=model_name
     )
 
-    state.openai_streaming_speech = OmniStreamingSpeechHandler(
-        speech_service=state.openai_serving_speech,
-    )
+    idle_timeout = getattr(engine_client, "tts_streaming_idle_timeout", None)
+    if idle_timeout is not None:
+        state.openai_streaming_speech = OmniStreamingSpeechHandler(
+            speech_service=state.openai_serving_speech, idle_timeout=idle_timeout
+        )
+    else:
+        state.openai_streaming_speech = OmniStreamingSpeechHandler(
+            speech_service=state.openai_serving_speech,
+        )
+
     state.openai_streaming_video = (
         create_streaming_video_handler(
             chat_service=state.openai_serving_chat,
