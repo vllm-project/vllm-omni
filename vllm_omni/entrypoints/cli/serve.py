@@ -836,7 +836,7 @@ class OmniServeCommand(CLISubcommand):
             default="none",
             help=(
                 "Cache backend for diffusion models, options: 'tea_cache', "
-                "'cache_dit', 'mag_cache', 'sea_cache', 'step_cache'"
+                "'cache_dit', 'mag_cache', 'sea_cache', 'step_cache', 'align_cache'"
             ),
         )
         omni_config_group.add_argument(
@@ -844,6 +844,7 @@ class OmniServeCommand(CLISubcommand):
             type=str,
             default=None,
             help="JSON string of cache configuration. "
+            'AlignCache: \'{"align_cache":{"profile":"wan21_reference_v1","mode":"accelerate"}}\'. '
             "TeaCache: '{\"rel_l1_thresh\": 0.2}'. "
             'MagCache: \'{"mag_threshold": 0.24, "mag_max_skip_steps": 5, "mag_retention_ratio": 0.1}\'. '
             "Calibration mode: add '\"mag_calibrate\": true'",

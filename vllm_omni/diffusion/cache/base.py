@@ -23,6 +23,7 @@ All backends implement the same interface:
 """
 
 from abc import ABC, abstractmethod
+from contextlib import nullcontext
 from typing import Any
 
 import torch.nn as nn
@@ -90,6 +91,10 @@ class CacheBackend(ABC):
             verbose: Whether to log refresh operations (default: True)
         """
         raise NotImplementedError("Subclasses must implement refresh()")
+
+    def request_context(self, pipeline: Any, req: Any):
+        """Optional request scope; existing backends retain their lifecycle."""
+        return nullcontext()
 
     def is_enabled(self) -> bool:
         """

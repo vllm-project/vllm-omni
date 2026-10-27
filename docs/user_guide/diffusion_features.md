@@ -31,6 +31,7 @@ Cache methods trade minimal quality for significant speedup. Quality loss is typ
 |--------|-------------|----------|
 | **[TeaCache](diffusion/cache_acceleration/teacache.md)** | Adaptive caching using modulated inputs | Quick setup, balanced quality/speed on single GPU |
 | **[Cache-DiT](diffusion/cache_acceleration/cache_dit.md)** | Multiple caching techniques: DBCache, TaylorSeer, SCM | Fine-grained control, tunable quality-speed tradeoff |
+| **[AlignCache](diffusion/cache_acceleration/aligncache.md)** | Predicts selected model outputs while keeping native scheduler steps | Single-GPU Wan2.1 T2V, Wan2.2 T2V-A14B, I2V-A14B and TI2V-5B, Qwen-Image-2.1 T2I and MiniMax-H3 T2VA; see the guide for admission limits |
 
 #### Diffusion KV Prefix Caching
 

@@ -334,6 +334,7 @@ def minimax_h3_denoise_loop(
     on_step: Callable[[int, torch.Tensor, torch.Tensor], None] | None = None,
     step_profiler: Callable[[int], AbstractContextManager] | None = None,
     sampler: str = "euler",
+    aligncache_runtime: Any | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run the full denoise loop; returns final (video_rows, audio_rows).
 
@@ -369,6 +370,19 @@ def minimax_h3_denoise_loop(
     video_solver = create_h3_sample_solver(sampler, sigmas_video)
     audio_solver = create_h3_sample_solver(sampler, sigmas_audio)
     num_steps = len(sigmas_video) - 1
+    if aligncache_runtime is not None:
+        if (
+            sampler != "euler"
+            or positive.locked_audio_rows is not None
+            or keyframe_cond_rows is not None
+            or audio_ref_rows is not None
+            or video_edit is not None
+            or audio_edit is not None
+            or not bool(update.all())
+            or not bool(audio_update.all())
+        ):
+            raise ValueError("align_cache: MiniMax-H3 currently requires pure T2VA Euler without reference/edit rows")
+        aligncache_runtime.bind([sigmas_video, sigmas_audio], (id(model), id(positive)))
     reference_kv_state = None
     create_reference_kv_state = getattr(model, "create_reference_kv_state", None)
     if callable(create_reference_kv_state):
@@ -427,7 +441,17 @@ def minimax_h3_denoise_loop(
                 if getattr(getattr(model, "arch", None), "pdd_steps", None) is not None:
                     fk["pdd_step"] = step
                 with torch.inference_mode():
-                    v_video, v_audio = model(**fk)
+                    if aligncache_runtime is None:
+                        v_video, v_audio = model(**fk)
+                    else:
+
+                        def exact(count):
+                            count()
+                            return model(**fk)
+
+                        v_video, v_audio = aligncache_runtime.evaluate(
+                            step, [model_video_rows, model_audio_rows], (id(model), id(positive)), exact
+                        )
                 if reference_kv_state is not None:
                     reference_kv_state.end_step()
                 mv_video_t = v_video.float()[update]

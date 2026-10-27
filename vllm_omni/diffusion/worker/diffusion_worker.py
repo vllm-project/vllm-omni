@@ -21,7 +21,7 @@ import traceback
 import uuid
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager, nullcontext
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Protocol, TypedDict, cast
 
 import torch
 import torch.distributed as dist
@@ -85,6 +85,7 @@ from vllm_omni.diffusion.vllm_config import create_diffusion_vllm_config, resolv
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 from vllm_omni.diffusion.worker.utils import BaseRunnerOutput, BatchRunnerOutput
 from vllm_omni.engine.stage_init_utils import set_death_signal
+from vllm_omni.errors import OmniClientError
 from vllm_omni.inputs.data import OmniInteractionPrompt
 from vllm_omni.lora.request import LoRARequest
 from vllm_omni.platforms import current_omni_platform
@@ -249,6 +250,11 @@ def _resolve_ir_op_priority(od_config: OmniDiffusionConfig, vllm_config: VllmCon
     return ir_op_priority
 
 
+class DPDiffusionOutput(TypedDict):
+    dp_rank: int
+    output: DiffusionOutput
+
+
 class DiffusionWorker:
     """
     A worker that manages GPU infrastructure and delegates to the model runner.
@@ -358,7 +364,7 @@ class DiffusionWorker:
     def init_device(self) -> None:
         """Initialize the device and distributed environment."""
         world_size = self.od_config.num_gpus
-        assert world_size is not None, "num_gpus must be resolved before worker initialization"
+        assert world_size is not None, "Diffusion device count must be resolved before worker initialization"
         rank = self.rank
 
         # Set environment variables for local distributed initialization.
@@ -604,11 +610,14 @@ class DiffusionWorker:
         return self.model_runner.remove_diffusion_kv_requests(request_ids)
 
     def prepare_kv_for_forward(self, scheduler_output: DiffusionSchedulerOutput):
-        runner = self.model_runner
-        assert runner is not None, "Model runner not initialized"
+        def prepare():
+            runner = self.model_runner
+            assert runner is not None, "Model runner not initialized"
+            return runner.prepare_kv_for_forward(scheduler_output)
+
         return _run_and_gather_rank_values(
             "Diffusion KV receive",
-            lambda: runner.prepare_kv_for_forward(scheduler_output),
+            prepare,
         )
 
     def init_lora_manager(self) -> None:
@@ -787,7 +796,7 @@ class DiffusionWorker:
         od_config: OmniDiffusionConfig,
         kv_prefetch_job: KVPrefetchJob | None = None,
         diffusion_kv_metadata: DiffusionKVMetadata | None = None,
-    ) -> DiffusionOutput | dict[str, int | DiffusionOutput]:
+    ) -> DiffusionOutput | DPDiffusionOutput:
         """Execute a forward pass by delegating to the model runner.
 
         If *req* is a list (DP multi-concurrency), each rank picks one complete
@@ -818,6 +827,8 @@ class DiffusionWorker:
         else:
             request = req
 
+        if od_config.cache_backend == "align_cache" and request.sampling_params.lora_request is not None:
+            raise OmniClientError("align_cache: request LoRA is unsupported; weights were not modified")
         if self.lora_manager is not None:
             try:
                 self.lora_manager.set_request_adapter(
@@ -851,6 +862,11 @@ class DiffusionWorker:
     ) -> BatchRunnerOutput:
         """Batch forward: LoRA activate once, delegate to model runner."""
         assert self.model_runner is not None, "Model runner not initialized"
+        if od_config.cache_backend == "align_cache":
+            if len(scheduler_output.scheduled_new_reqs) > 1 or scheduler_output.scheduled_cached_reqs.request_ids:
+                raise OmniClientError("align_cache: one new request required; cached/stepwise requests are unsupported")
+            if any(item.req.sampling_params.lora_request is not None for item in scheduler_output.scheduled_new_reqs):
+                raise OmniClientError("align_cache: request LoRA is unsupported; weights were not modified")
         # LoRA: same adapter/scale within batch guaranteed by RequestBatchSamplingParamsKey.
         if self.lora_manager is not None and scheduler_output.scheduled_new_reqs:
             sp = scheduler_output.scheduled_new_reqs[0].req.sampling_params
@@ -990,10 +1006,10 @@ class DiffusionWorker:
         usage_before = allocator.get_current_usage()
 
         if level == 2 and self.model_runner is not None:
+            model = self.model_runner.pipeline
+            assert model is not None, "Model not loaded"
             self.model_runner.release_captured_graphs()
             logger.info(f"[Worker {self.rank}] CUDA Graphs cleared.")
-            model = self.model_runner.pipeline
-            assert model is not None, "Pipeline not initialized"
             self._sleep_saved_buffers = {name: buffer.cpu().clone() for name, buffer in model.named_buffers()}
 
         free_mem_before = current_omni_platform.get_free_memory()
@@ -1043,7 +1059,7 @@ class DiffusionWorker:
             self.model_runner.refresh_diffusion_kv_block_table_layout()
         if len(self._sleep_saved_buffers) and self.model_runner is not None:
             model = self.model_runner.pipeline
-            assert model is not None, "Pipeline not initialized"
+            assert model is not None, "Model not loaded"
             for name, buffer in model.named_buffers():
                 if name in self._sleep_saved_buffers:
                     buffer.data.copy_(self._sleep_saved_buffers[name].data)
@@ -1068,7 +1084,7 @@ class DiffusionWorker:
     def handle_sleep_task(self, task: OmniSleepTask | dict) -> OmniACK | None:
         from vllm_omni.platforms import current_omni_platform
 
-        task_id = task.get("task_id", "unknown") if isinstance(task, dict) else task.task_id
+        task_id = task.get("task_id", "local") if isinstance(task, dict) else task.task_id
         try:
             if isinstance(task, dict):
                 task = OmniSleepTask(**task)
@@ -1126,7 +1142,7 @@ class DiffusionWorker:
     def handle_wake_task(self, task: OmniWakeTask | dict) -> OmniACK | None:
         from vllm_omni.platforms import current_omni_platform
 
-        task_id = task.get("task_id", "unknown") if isinstance(task, dict) else task.task_id
+        task_id = task.get("task_id", "local") if isinstance(task, dict) else task.task_id
         try:
             if isinstance(task, dict):
                 task = OmniWakeTask(**task)
@@ -1296,8 +1312,16 @@ class DiffusionWorker:
                 logger.exception("Failed to release diffusion CuMem pools during shutdown")
 
 
+class _CustomPipelineWorker(Protocol):
+    model_runner: DiffusionModelRunner | None
+
+    def load_model(self, load_format: str = "default", custom_pipeline_name: str | None = None) -> None: ...
+
+    def init_lora_manager(self) -> None: ...
+
+
 class CustomPipelineWorkerExtension:
-    def re_init_pipeline(self, custom_pipeline_args: dict[str, Any]) -> None:
+    def re_init_pipeline(self: _CustomPipelineWorker, custom_pipeline_args: dict[str, Any]) -> None:
         """
         Re-initialize the pipeline with custom arguments.
 
@@ -1316,7 +1340,7 @@ class CustomPipelineWorkerExtension:
         # Clean up old pipeline
         model_runner = cast(DiffusionModelRunner, worker.model_runner)
         if model_runner.pipeline is not None:
-            del model_runner.pipeline
+            model_runner.pipeline = None
             gc.collect()
             torch.accelerator.empty_cache()
 
@@ -1341,7 +1365,7 @@ class WorkerProc:
         gpu_id: int,
         broadcast_handle,
         wake_event: Event,
-        worker_extension_cls: str | None = None,
+        worker_extension_cls: str | type | None = None,
         custom_pipeline_args: dict[str, Any] | None = None,
     ):
         self.od_config = od_config
@@ -1396,7 +1420,7 @@ class WorkerProc:
         self,
         gpu_id: int,
         od_config: OmniDiffusionConfig,
-        worker_extension_cls: str | None,
+        worker_extension_cls: str | type | None,
         custom_pipeline_args: dict[str, Any] | None = None,
     ) -> WorkerWrapperBase:
         """Create a worker instance. Override in subclasses for different worker types."""
@@ -1427,6 +1451,7 @@ class WorkerProc:
 
         # Async path: enqueue compute_done immediately, bg thread does D2H+SHM.
         if not self.od_config.step_execution and isinstance(output, (DiffusionOutput, BatchRunnerOutput)):
+            assert self._async_output_queue is not None, "Async output queue not initialized"
             async_output_id = WorkerProc._generate_async_output_id()
             gpu_event = current_omni_platform.record_device_event()
             with self._async_output_done:
@@ -1463,6 +1488,8 @@ class WorkerProc:
         Uses a side stream so the D2H transfer does not block the default
         stream where the next forward runs.
         """
+        output_queue = self._async_output_queue
+        assert output_queue is not None, "Async output queue not initialized"
         device = torch.device(torch.accelerator.current_accelerator().type, self.gpu_id)
         d2h_stream = torch.Stream(device=device)
         transport_options = {}
@@ -1702,14 +1729,14 @@ class WorkerProc:
             if msg is None:
                 continue
 
-            if msg is None or len(msg) == 0:
+            if isinstance(msg, (dict, list)) and not msg:
                 logger.warning("Worker %s: Received empty payload, ignoring", self.gpu_id)
                 continue
 
             if isinstance(msg, dict) and msg.get("type") == "sleep":
                 self.drain_async_outputs()
-                task = OmniSleepTask(level=msg.get("level", 2), task_id=msg.get("task_id", "local"))
-                ack = self.worker.handle_sleep_task(task)
+                sleep_task = OmniSleepTask(level=msg.get("level", 2), task_id=msg.get("task_id", "local"))
+                ack = self.worker.handle_sleep_task(sleep_task)
                 self._return_result(ack)
             elif isinstance(msg, dict) and msg.get("type") == "wake_up":
                 wake_task = OmniWakeTask(tags=msg.get("tags"), task_id=msg.get("task_id", "local"))
@@ -1783,7 +1810,9 @@ class WorkerProc:
                 # Handle direct generation requests.
                 try:
                     if not isinstance(msg, (OmniDiffusionRequest, list)):
-                        raise TypeError(f"Unsupported generation request type: {type(msg).__name__}")
+                        raise TypeError("Expected OmniDiffusionRequest or a list of NewRequestData")
+                    if isinstance(msg, list) and any(not isinstance(item, NewRequestData) for item in msg):
+                        raise TypeError("Direct request batches must contain NewRequestData")
                     output = self.worker.execute_model(msg, self.od_config)
                 except Exception as e:
                     logger.error(
@@ -1808,7 +1837,7 @@ class WorkerProc:
         pipe_writer: mp.connection.Connection,
         broadcast_handle,
         wake_event: Event,
-        worker_extension_cls: str | None = None,
+        worker_extension_cls: str | type | None = None,
         custom_pipeline_args: dict[str, Any] | None = None,
     ) -> None:
         """Worker initialization and execution loops."""
@@ -1882,7 +1911,7 @@ class WorkerWrapperBase:
         od_config: OmniDiffusionConfig,
         base_worker_class: type = DiffusionWorker,
         wake_event: Event | None = None,
-        worker_extension_cls: str | None = None,
+        worker_extension_cls: str | type | None = None,
         custom_pipeline_args: dict[str, Any] | None = None,
         rank: int | None = None,
         distributed_init_method: str | None = None,
@@ -2000,7 +2029,7 @@ class WorkerWrapperBase:
         od_config: OmniDiffusionConfig,
         kv_prefetch_job: KVPrefetchJob | None = None,
         diffusion_kv_metadata: DiffusionKVMetadata | None = None,
-    ) -> DiffusionOutput | dict[str, int | DiffusionOutput]:
+    ) -> DiffusionOutput | DPDiffusionOutput:
         """
         Execute a forward pass.
 

@@ -10,7 +10,7 @@ import torch
 
 import vllm_omni.diffusion.worker.diffusion_model_runner as model_runner_module
 from tests.helpers.mark import hardware_test
-from vllm_omni.diffusion.data import DiffusionOutput, VideoOutputTransportConfig
+from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig, VideoOutputTransportConfig
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.diffusion_kv.model_runner_backend import DiffusionKVModelRunnerBackend
 from vllm_omni.diffusion.media import (
@@ -331,6 +331,9 @@ class _EnabledCacheBackend:
 
     def refresh(self, pipeline, num_inference_steps, verbose=True):
         self.refresh_calls.append((pipeline, num_inference_steps, verbose))
+
+    def request_context(self, pipeline, req):
+        return _noop_forward_context()
 
 
 @pytest.mark.core_model
@@ -1570,3 +1573,232 @@ def test_request_runner_preserves_client_error_before_rpc(monkeypatch, batch_siz
 
     runner.pipeline = _DummyPipeline(output=DiffusionOutput(output="next request"))
     assert runner.execute_model(_make_request()).output == "next request"
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+@pytest.mark.parametrize("steps", [None, 4])
+def test_aligncache_refreshes_repeated_requests_with_default_or_same_steps(steps):
+    backend = _EnabledCacheBackend()
+    runner = _make_runner(cache_backend=backend, cache_backend_name="align_cache")
+    req = _make_request()
+    req.sampling_params.num_inference_steps = steps
+    for _ in range(2):
+        runner._refresh_cache_for_requests([req], od_config=runner.od_config)
+    assert [call[1] for call in backend.refresh_calls] == [steps or 0] * 2
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+@pytest.mark.parametrize("skip_refresh,batch_size", [(True, 1), (False, 2)])
+def test_aligncache_rejects_unsupported_request_before_refresh(skip_refresh, batch_size):
+    backend = _EnabledCacheBackend()
+    runner = _make_runner(cache_backend=backend, cache_backend_name="align_cache")
+    requests = [_make_request() for _ in range(batch_size)]
+    requests[0].skip_cache_refresh = skip_refresh
+    with pytest.raises(ValueError, match="one request|skip_cache_refresh"):
+        runner._refresh_cache_for_requests(requests, od_config=runner.od_config)
+    assert backend.refresh_calls == []
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+@pytest.mark.parametrize("failure", [None, "forward", "transport"])
+def test_cache_scope_covers_native_forward_and_output_exit(monkeypatch, failure):
+    events = []
+    error = RuntimeError("injected cache scope failure")
+
+    class ScopedBackend(_EnabledCacheBackend):
+        @contextmanager
+        def request_context(self, pipeline, req):
+            events.append("enter")
+            try:
+                yield
+            finally:
+                events.append("exit")
+
+    runner = _make_runner(cache_backend=ScopedBackend(), cache_backend_name="align_cache")
+    monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+    monkeypatch.setattr(model_runner_module.current_omni_platform, "reset_peak_memory_stats", lambda: None)
+    monkeypatch.setattr(runner, "_sample_peak_memory_mb", lambda: 0)
+    original_forward = runner.pipeline.forward
+    original_transport = runner._prepare_output_for_transport
+
+    def forward(req):
+        assert events == ["enter"]
+        if failure == "forward":
+            raise error
+        return original_forward(req)
+
+    def transport(output, sampling):
+        assert events == ["enter"]
+        if failure == "transport":
+            raise error
+        return original_transport(output, sampling)
+
+    monkeypatch.setattr(runner.pipeline, "forward", forward)
+    monkeypatch.setattr(runner, "_prepare_output_for_transport", transport)
+    if failure:
+        with pytest.raises(RuntimeError) as caught:
+            runner.execute_model(_make_request())
+        assert caught.value is error
+    else:
+        assert runner.execute_model(_make_request()).output == "ok"
+    assert events == ["enter", "exit"]
+
+
+@pytest.fixture
+def aligncache_runner(monkeypatch, mocker):
+    from vllm_omni.diffusion.cache.aligncache.backend import AlignCacheBackend
+
+    backend = AlignCacheBackend({"align_cache": {"mode": "force_exact"}})
+    runner = _make_runner(cache_backend=backend, cache_backend_name="align_cache")
+    runner.od_config = OmniDiffusionConfig(cache_backend="align_cache", enforce_eager=True, dtype=torch.bfloat16)
+    runner.pipeline.od_config = runner.od_config
+    runner.pipeline.transformer = torch.nn.Identity()
+    # The CPU toy pipeline exercises runner ownership, not GPU model admission.
+    mocker.patch.object(backend, "_validate_pipeline")
+    backend.enable(runner.pipeline)
+    monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+    monkeypatch.setattr(model_runner_module.current_omni_platform, "reset_peak_memory_stats", lambda: None)
+    monkeypatch.setattr(model_runner_module.current_omni_platform, "synchronize", lambda: None)
+    monkeypatch.setattr(runner, "_sample_peak_memory_mb", lambda: 0)
+    yield runner
+    backend.disable(runner.pipeline)
+
+
+def _bind_aligncache_toy_step(runner):
+    from vllm_omni.diffusion.cache.aligncache.state import GenerationSignature, SchedulePlan, StepContext
+
+    # Wan2.1 profiles run one controller for the single transformer.
+    runtime = runner.cache_backend.runtime.components["transformer"]
+    x = torch.ones(1, 1, 1, 1, 32)
+    runtime.bind_schedule(
+        SchedulePlan((2.0, 1.0), "toy", "{}"),
+        GenerationSignature(
+            runtime.epoch, id(runner.pipeline.transformer), (2, 3), 5.0, tuple(x.shape), x.dtype, x.device
+        ),
+    )
+    return runtime, x, StepContext(0, 2.0, id(runner.pipeline.transformer), 5.0)
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+@pytest.mark.parametrize("failure", ["cond", "uncond", "post_pair"])
+def test_aligncache_runner_failure_releases_state_and_preserves_original_error(aligncache_runner, monkeypatch, failure):
+    import weakref
+
+    from vllm_omni.diffusion.cache.aligncache import runtime as runtime_module
+
+    runner = aligncache_runner
+    backend = runner.cache_backend
+    error = RuntimeError(failure)
+    calls = []
+    anchors = []
+
+    def forward(batch):
+        runtime, x, context = _bind_aligncache_toy_step(runner)
+
+        def exact(branch):
+            calls.append(branch)
+            if failure == branch:
+                raise error
+            return x + (1 if branch == "cond" else 2)
+
+        runtime.predict_pair(context, x, (2, 3), exact)
+        anchors.append(weakref.ref(runtime.state.anchor.cond))
+        # Exercise a forward failure after the pair has committed owned anchors.
+        raise error
+
+    def failed_diagnostics(*args, **kwargs):
+        raise RuntimeError("diagnostics failed during cleanup")
+
+    monkeypatch.setattr(runtime_module.logger, "info", failed_diagnostics)
+    monkeypatch.setattr(runner.pipeline, "forward", forward)
+    with pytest.raises(RuntimeError) as caught:
+        runner.execute_model(_make_request())
+    assert caught.value is error
+    assert calls == (["cond"] if failure == "cond" else ["cond", "uncond"])
+    assert not backend.runtime.active
+    assert backend.runtime.components["transformer"].state is None
+    assert backend.runtime.components["transformer"].plan is None
+    assert backend.runtime.last_summary["status"] == "failed"
+    assert backend.runtime.last_summary["model_forward_calls"] == len(calls)
+    assert all(anchor() is None for anchor in anchors)
+    monkeypatch.setattr(runner.pipeline, "forward", lambda batch: [DiffusionOutput(output="recovered")])
+    assert runner.execute_model(_make_request()).output == "recovered"
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_aligncache_runner_model_replacement_requires_reinstall(aligncache_runner):
+    runner = aligncache_runner
+    backend = runner.cache_backend
+    old_runtime = backend.runtime
+    runner.pipeline.transformer = torch.nn.Identity()
+    with pytest.raises(RuntimeError, match="ownership"):
+        runner.execute_model(_make_request())
+    assert runner.pipeline.forward_calls == 0
+    assert old_runtime.components["transformer"].state is None
+    backend.disable(runner.pipeline)
+    backend.enable(runner.pipeline)
+    assert backend.runtime is not old_runtime
+    assert runner.execute_model(_make_request()).output == "ok"
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_aligncache_cancellation_exits_forward_and_releases_state(aligncache_runner, monkeypatch):
+    import weakref
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+    from time import monotonic
+
+    from vllm_omni.diffusion.cancellation import RequestCancellationRegistry, check_request_cancellation
+    from vllm_omni.diffusion.request import OmniDiffusionRequest
+
+    runner = aligncache_runner
+    entered, proceed = Event(), Event()
+    times = {}
+    anchors = []
+    runner.pipeline.supports_request_cancellation = True
+
+    def forward(batch):
+        runtime, x, context = _bind_aligncache_toy_step(runner)
+        runtime.predict_pair(context, x, (2, 3), lambda branch: x + 1)
+        anchors.append(weakref.ref(runtime.state.anchor.cond))
+        entered.set()
+        assert proceed.wait(10), "cancellation test did not release forward"
+        try:
+            check_request_cancellation()
+        finally:
+            times["forward_exit"] = monotonic()
+        pytest.fail("cancelled forward must not reach decode")
+
+    monkeypatch.setattr(runner.pipeline, "forward", forward)
+    registry = RequestCancellationRegistry()
+    try:
+        request = OmniDiffusionRequest(
+            request_id="aligncache-cancel", prompt="test", sampling_params=OmniDiffusionSamplingParams()
+        )
+        request.cancellation_signal = registry.create(request.request_id)
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            result = executor.submit(runner.execute_model, request)
+            try:
+                assert entered.wait(10), "forward did not reach the controlled checkpoint"
+                times["cancel"] = monotonic()
+                registry.cancel([request.request_id])
+            finally:
+                proceed.set()
+            output = result.result(timeout=10)
+            times["released"] = monotonic()
+        assert output.aborted
+        assert times["cancel"] <= times["forward_exit"] <= times["released"]
+        assert not runner.cache_backend.runtime.active
+        assert runner.cache_backend.runtime.components["transformer"].state is None
+        assert all(anchor() is None for anchor in anchors)
+        registry.finish(request.request_id)
+        monkeypatch.setattr(runner.pipeline, "forward", lambda batch: [DiffusionOutput(output="recovered")])
+        assert runner.execute_model(_make_request()).output == "recovered"
+    finally:
+        registry.close()

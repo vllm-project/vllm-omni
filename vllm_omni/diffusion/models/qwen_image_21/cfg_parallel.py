@@ -136,6 +136,19 @@ class QwenImage21CFGParallelMixin(CFGParallelMixin, ProgressBarMixin):
             self.transformer.do_true_cfg = do_true_cfg
             additional_transformer_kwargs = additional_transformer_kwargs or {}
 
+            align_runtime = getattr(self, "_aligncache_runtime", None)
+            if align_runtime is not None:
+                align_runtime.bind_qwen(
+                    self,
+                    latents,
+                    timesteps,
+                    prompt_embeds,
+                    negative_prompt_embeds,
+                    do_true_cfg,
+                    true_cfg_scale,
+                    image_latents,
+                    additional_transformer_kwargs,
+                )
             with self.progress_bar(total=len(timesteps)) as pbar:
                 for i, t in enumerate(timesteps):
                     if self.interrupt:
@@ -181,14 +194,20 @@ class QwenImage21CFGParallelMixin(CFGParallelMixin, ProgressBarMixin):
                     # Prefill (first step) returns the full joint sequence and
                     # caches the prefix; decode steps return target tokens only.
                     # Slicing the target tail is correct for both.
-                    noise_pred = self.predict_noise_maybe_with_cfg(
-                        do_true_cfg,
-                        true_cfg_scale,
-                        positive_kwargs,
-                        negative_kwargs,
-                        cfg_normalize=False,
-                        output_slice=latents.size(1),
-                    )
+                    if align_runtime is None:
+                        noise_pred = self.predict_noise_maybe_with_cfg(
+                            do_true_cfg,
+                            true_cfg_scale,
+                            positive_kwargs,
+                            negative_kwargs,
+                            cfg_normalize=False,
+                            output_slice=latents.size(1),
+                        )
+
+                    else:
+                        noise_pred = align_runtime.predict_qwen(
+                            self, i, latents, positive_kwargs, negative_kwargs, do_true_cfg, true_cfg_scale
+                        )
 
                     latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg)
 

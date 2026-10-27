@@ -147,14 +147,14 @@ def test_default_diffusion_factory_rejects_unowned_field(field_name, value):
         StageConfigFactory.create_default_diffusion({field_name: value})
 
 
-def test_legacy_default_stage_build_accepts_engine_adapter_metadata(monkeypatch):
+def test_legacy_default_stage_build_accepts_engine_adapter_metadata(monkeypatch, tmp_path):
     from vllm_omni.config.config_factory import StageConfigFactory
     from vllm_omni.config.yaml_util import create_config
     from vllm_omni.engine import stage_init_utils
 
     stage_dict = StageConfigFactory.create_default_diffusion(
         {
-            "model": "unused",
+            "model": str(tmp_path),
             "api_key": "frontend-owned",
         }
     )[0]
@@ -163,9 +163,9 @@ def test_legacy_default_stage_build_accepts_engine_adapter_metadata(monkeypatch)
     metadata = SimpleNamespace(stage_id=0, cfg_kv_collect_func=None, default_sampling_params=None)
     monkeypatch.setattr(stage_init_utils.current_omni_platform, "get_device_count", lambda: 1)
 
-    config = stage_init_utils.build_diffusion_config("unused", stage_cfg, metadata)
+    config = stage_init_utils.build_diffusion_config(str(tmp_path), stage_cfg, metadata)
 
-    assert config.model == "unused"
+    assert config.model == str(tmp_path)
 
 
 def test_default_cache_config_used_when_missing():
@@ -797,13 +797,13 @@ def test_default_stage_config_includes_quantization_config():
 
 
 @pytest.mark.parametrize("typed", [False, True], ids=["legacy", "typed"])
-def test_default_diffusion_factory_preserves_engine_quantization(typed, monkeypatch):
+def test_default_diffusion_factory_preserves_engine_quantization(typed, monkeypatch, tmp_path):
     monkeypatch.setattr(OmniDiffusionConfig, "_resolve_master_port", lambda _self: 29500)
     monkeypatch.setattr(OmniDiffusionConfig, "enrich_config", lambda _self: None)
     kwargs = {"quantization": "fp8"}
 
     if typed:
-        stage = StageConfigFactory.create_typed_default_diffusion("generic-diffusion", kwargs).stage_configs[0]
+        stage = StageConfigFactory.create_typed_default_diffusion(str(tmp_path), kwargs).stage_configs[0]
         config = stage.diffusion_config
         config.enrich_config()
     else:
@@ -970,7 +970,7 @@ def test_generic_diffusion_deploy_survives_typed_resolution(
 
 
 def test_default_stage_config_preserves_pre_sharded_hsdp_weight_load() -> None:
-    stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg({"hsdp_weight_load_strategy": "pre_sharded"})[0]
+    stage_cfg = StageConfigFactory.create_default_diffusion({"hsdp_weight_load_strategy": "pre_sharded"})[0]
 
     assert stage_cfg["engine_args"]["hsdp_weight_load_strategy"] == "pre_sharded"
 
@@ -997,3 +997,33 @@ def test_removed_hsdp_loading_strategies_are_rejected(strategy):
 
     with pytest.raises(ValueError, match="hsdp_weight_load_strategy"):
         OmniDiffusionConfig(hsdp_weight_load_strategy=strategy)
+
+
+@pytest.mark.parametrize(
+    "profile",
+    [
+        "wan21_reference_v1",
+        "wan22_t2v_reference_v1",
+        "wan22_i2v_reference_v1",
+        "wan22_ti2v_reference_v1",
+        "qwen21_reference_v1",
+        "minimax_h3_reference_v1",
+    ],
+)
+def test_aligncache_namespace_survives_default_diffusion_stage(profile):
+    from vllm_omni.diffusion.cache.aligncache.config import AlignCacheConfig
+
+    namespace = {"align_cache": {"profile": profile, "mode": "trace", "warmup_steps": 3}}
+    stage = StageConfigFactory.create_default_diffusion({"cache_backend": "align_cache", "cache_config": namespace})[0]
+    terminal = _terminal_config(stage)
+    resolved = AlignCacheConfig.parse(terminal.cache_config)
+    assert terminal.cache_backend == "align_cache"
+    assert resolved.profile == profile
+    assert resolved.mode == "trace"
+    assert resolved.warmup_steps == 3
+
+
+@pytest.mark.parametrize("value", ["{", "[]", "true", '"nested"'])
+def test_aligncache_engine_does_not_downgrade_invalid_json(value):
+    with pytest.raises(ValueError, match="cache_config"):
+        StageConfigFactory.create_default_diffusion({"cache_backend": "align_cache", "cache_config": value})

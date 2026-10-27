@@ -120,6 +120,7 @@ def test_standalone_hsdp_elects_one_payload_consumer(monkeypatch, shard_size, re
 @pytest.mark.parametrize("shard_size,replicate_size", [(4, 1), (1, 4), (2, 2)])
 @pytest.mark.parametrize("delivered", [True, False])
 def test_standalone_hsdp_payload_fanout(monkeypatch, shard_size, replicate_size, delivered):
+    import sys
     from uuid import uuid4
 
     from vllm_omni.diffusion.distributed import parallel_state
@@ -142,6 +143,9 @@ def test_standalone_hsdp_payload_fanout(monkeypatch, shard_size, replicate_size,
             if self.rank_in_group == src:
                 packets[self.key, "payload"] = value
             return packets[self.key, "payload"]
+
+    if delivered and sys.platform != "linux":
+        pytest.skip("Key-based SharedMemoryConnector reads require Linux /dev/shm sizing and lock paths")
 
     connector = SharedMemoryConnector({})
     request_id = f"hsdp-{uuid4().hex}"

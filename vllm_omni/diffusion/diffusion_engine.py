@@ -1000,11 +1000,12 @@ class DiffusionEngine:
                     fut.set_exception(TimeoutError(f"RPC call to {task.method} timed out before execution."))
                 return
 
+        result: object = None
         try:
             if task.method == "pause_scheduler":
-                result = self._run_pause_barrier(remaining)
+                self._run_pause_barrier(remaining)
             elif task.method == "resume_scheduler":
-                result = self._open_scheduling_gate()
+                self._open_scheduling_gate()
             else:
                 result = self.executor.collective_rpc(
                     method=task.method,
@@ -1818,7 +1819,8 @@ class DiffusionEngine:
         req = self._make_dummy_request(
             height=512,
             width=512,
-            guidance_scale=0.0,
+            # AlignCache Wan adapters need the serial CFG pair during warmup.
+            guidance_scale=5.0 if getattr(self.od_config, "cache_backend", "none") == "align_cache" else 0.0,
             # Dummy warmup must exercise at least one denoising iteration in
             # every execution mode. Some pipelines (for example BAGEL) perform
             # ``num_inference_steps - 1`` scheduler updates and reject an empty
