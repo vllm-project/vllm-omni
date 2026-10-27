@@ -49,7 +49,7 @@ decoder selection after restart.
 
 The original video encoder and audio VAE remain unchanged. LiteVAE changes the
 video decoder model and can change generated pixels. See the
-[LiteVAE guide](../../docs/user_guide/diffusion/h3_lightvae_poc.md) for loading,
+[LiteVAE guide](../../docs/user_guide/diffusion/light_vae.md) for loading,
 measurement, and quality-review details, and the
 [NPU recipe](MiniMax-H3-NPU.md#litevae-measurements-8-ascend-910b4-npus)
 for measured T2VA results on Ascend 910B4. These measurements do not establish

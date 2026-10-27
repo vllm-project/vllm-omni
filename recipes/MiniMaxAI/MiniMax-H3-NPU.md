@@ -495,7 +495,7 @@ non-INT8 Lite decoder checkpoint:
 Keep the file accessible to all decoding processes. Merge this key into any
 existing `--additional-config` JSON object and omit `video_vae_decoder`.
 Restart without the LiteVAE key to restore the existing decoder selection.
-See the [LiteVAE guide](../../docs/user_guide/diffusion/h3_lightvae_poc.md)
+See the [LiteVAE guide](../../docs/user_guide/diffusion/light_vae.md)
 for compatibility rules, measurement boundaries, and quality review.
 
 ### LiteVAE measurements: 8 Ascend 910B4 NPUs

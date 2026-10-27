@@ -34,7 +34,7 @@ Cache methods trade minimal quality for significant speedup. Quality loss is typ
 
 #### MiniMax-H3 LiteVAE Decoder
 
-[LiteVAE](diffusion/h3_lightvae_poc.md) is an optional MiniMax-H3 video
+[LiteVAE](diffusion/light_vae.md) is an optional MiniMax-H3 video
 decoder with reduced Transformer depth. It trades changes in generated pixels
 for lower decode latency while preserving the video encoder and audio VAE.
 Enable it through the deployment-level `additional_config.lightvae_decoder_path`

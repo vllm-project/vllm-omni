@@ -171,7 +171,7 @@ Use [`bench_minimax_h3_vae.py`](bench_minimax_h3_vae.py) for isolated
 original/Lite decoder measurements on the same saved latent and comparison
 with the official Lite reference. It records raw timing samples, input and
 weight hashes, and unquantized output metrics. See the
-[LiteVAE guide](../../docs/user_guide/diffusion/h3_lightvae_poc.md#run-an-isolated-decoder-measurement)
+[LiteVAE guide](../../docs/user_guide/diffusion/light_vae.md#run-an-isolated-decoder-measurement)
 for commands, checkpoint requirements, and comparison gates.
 
 Keep single-device decoder benchmark results separate from serving video VAE
