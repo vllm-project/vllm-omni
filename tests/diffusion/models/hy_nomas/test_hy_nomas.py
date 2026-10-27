@@ -34,6 +34,7 @@ from vllm_omni.diffusion.models.hy_nomas.pipeline_hy_nomas import (
     validate_config,
 )
 from vllm_omni.diffusion.models.hy_nomas.processing_hy_nomas import action_conditioning, normalize_request
+from vllm_omni.diffusion.offloader import sequential_backend
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.utils.hf_utils import (
     is_diffusion_model,
@@ -326,6 +327,26 @@ def test_invalid_prompt(prompt):
         normalize_request(prompt, OmniDiffusionSamplingParams(num_frames=121))
 
 
+@pytest.mark.parametrize("negative_prompt", [None, ""])
+def test_empty_negative_prompt_is_accepted(negative_prompt):
+    request = normalize_request(
+        {"prompt": "A forest", "negative_prompt": negative_prompt}, OmniDiffusionSamplingParams()
+    )
+    assert request.prompts == ["A forest"]
+
+
+@pytest.mark.parametrize("negative_prompt", ["blur", " "])
+def test_nonempty_negative_prompt_is_rejected(negative_prompt):
+    with pytest.raises(OmniClientError, match="does not support negative_prompt"):
+        normalize_request({"prompt": "A forest", "negative_prompt": negative_prompt}, OmniDiffusionSamplingParams())
+
+
+@pytest.mark.parametrize("negative_prompt", [False, 1, [], {}])
+def test_negative_prompt_requires_string(negative_prompt):
+    with pytest.raises(OmniClientError, match="negative_prompt must be a string"):
+        normalize_request({"prompt": "A forest", "negative_prompt": negative_prompt}, OmniDiffusionSamplingParams())
+
+
 @pytest.fixture
 def pipeline(monkeypatch):
     from tests.diffusion.models.hy_nomas.test_ar import PipelineWithCPUComponents
@@ -410,32 +431,65 @@ def test_reference_sdpa_policy_is_scoped_to_inference(pipeline, fails, monkeypat
         assert not torch.backends.cuda.cudnn_sdp_enabled()
 
 
-@pytest.mark.parametrize("components", [None, frozenset({"dit"}), frozenset({"text_encoder"})])
-def test_module_offload_selects_components_and_removes_hooks(monkeypatch, components):
+@pytest.mark.parametrize(
+    "components,expected_cpu_moves",
+    [
+        (None, (("transformer", "text_encoder"), ("text_encoder", "vae", "transformer"), ("transformer", "vae"))),
+        (frozenset({"dit"}), (("transformer",), ("transformer",), ("transformer",))),
+        (frozenset({"text_encoder"}), (("text_encoder",), ("text_encoder",), ())),
+        (
+            frozenset({"dit", "text_encoder"}),
+            (("transformer", "text_encoder"), ("text_encoder", "transformer"), ("transformer",)),
+        ),
+    ],
+)
+def test_module_offload_selects_components_and_removes_hooks(monkeypatch, components, expected_cpu_moves):
     pipeline = HyNomasPipeline.__new__(HyNomasPipeline)
     nn.Module.__init__(pipeline)
     pipeline.transformer = nn.Linear(2, 2)
     pipeline.text_encoder = nn.Linear(2, 2)
     pipeline.vae = nn.Linear(2, 2)
     pipeline._cpu_offload = False
-    enable = Mock()
-    disable = Mock()
-    monkeypatch.setattr(pipeline_hy_nomas, "apply_sequential_offload", enable)
-    monkeypatch.setattr(pipeline_hy_nomas, "remove_sequential_offload", disable)
-    pipeline.enable_omni_model_cpu_offload(device=torch.device("cuda:0"), offload_components=components)
-    selected = enable.call_args.kwargs
-    assert selected["offload_dit_modules"] == (
-        [pipeline.transformer] if components is None or "dit" in components else []
+    pipeline._resident_component_id = None
+    names = {id(getattr(pipeline, name)): name for name in ("transformer", "text_encoder", "vae")}
+    moves = []
+
+    def move_params(module, target_device, **kwargs):
+        moves.append((names[id(module)], target_device.type))
+        return False
+
+    monkeypatch.setattr(sequential_backend.SequentialOffloadHook, "_move_params", staticmethod(move_params))
+    monkeypatch.setattr(sequential_backend.current_omni_platform, "synchronize", lambda: None)
+    monkeypatch.setattr(sequential_backend.current_omni_platform, "get_free_memory", lambda: 0)
+    pipeline.enable_omni_model_cpu_offload(
+        device=torch.device("cuda:0"), pin_memory=False, offload_components=components
     )
-    expected_stages = (
-        [pipeline.text_encoder, pipeline.vae]
-        if components is None
-        else ([pipeline.text_encoder] if "text_encoder" in components else [])
-    )
-    assert selected["offload_encoder_modules"] == expected_stages
     assert pipeline._cpu_offload
+    for name, expected in zip(("text_encoder", "transformer", "vae"), expected_cpu_moves):
+        moves.clear()
+        with pipeline._component_context(getattr(pipeline, name)):
+            assert pipeline._resident_component_id == id(getattr(pipeline, name))
+        assert [module for module, device in moves if device == "cpu"] == list(expected)
+        assert [module for module, device in moves if device == "cuda"] == [name]
+        assert pipeline._resident_component_id is None
     pipeline.disable_omni_model_cpu_offload()
-    disable.assert_called_once_with([pipeline.transformer, pipeline.text_encoder, pipeline.vae])
+    assert not pipeline._cpu_offload
+    for module in (pipeline.transformer, pipeline.text_encoder, pipeline.vae):
+        assert module._hook_registry.get_hook("sequential_offload") is None
+
+
+@pytest.mark.parametrize("components", [frozenset(), frozenset({"vae"}), frozenset({"dit", "vae"})])
+def test_module_offload_rejects_unsupported_components(components, mocker):
+    pipeline = HyNomasPipeline.__new__(HyNomasPipeline)
+    nn.Module.__init__(pipeline)
+    pipeline.transformer = nn.Linear(2, 2)
+    pipeline.text_encoder = nn.Linear(2, 2)
+    pipeline.vae = nn.Linear(2, 2)
+    pipeline._cpu_offload = False
+    enable = mocker.patch.object(pipeline_hy_nomas, "apply_sequential_offload")
+    with pytest.raises(ValueError, match="offload components must not be empty|Unknown diffusion offload component"):
+        pipeline.enable_omni_model_cpu_offload(device=torch.device("cuda:0"), offload_components=components)
+    enable.assert_not_called()
     assert not pipeline._cpu_offload
 
 

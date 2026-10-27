@@ -32,6 +32,7 @@ The author's Diffusers fork is not needed for this integration.
 | Frame count | `num_frames=4*n+1`, with `n >= 1`; default 121 |
 | Frame rate | 24 fps |
 | Sampling | 4, 6, or 8 steps; default 8; guidance scale 1 and flow shift 5 |
+| Negative prompt | Omit or leave empty; nonempty values are rejected because the distilled checkpoint uses CFG=1 |
 | Segment boundaries | Pixel-frame indices starting at 0 and ending at `num_frames`; internal boundaries divisible by 4 |
 | Camera | Reference generator name, such as `pan_left`, or a worker-accessible JSON/NPZ trajectory file |
 | Persistent turn | At most 61 frames with the default 16-latent chunk; height, width, and seed remain fixed within a session |
@@ -68,6 +69,10 @@ token count per latent frame. Real-model validation covers degrees one and two.
 Device interconnect, peak memory, and host memory were not measured in these checks.
 CPU offload requires sufficient GPU memory for initial component loading and host
 memory for the staged weights.
+The legacy `--enable-cpu-offload` flag swaps the DiT, text encoder, and PixelUMM
+decoder. Explicit `diffusion_offload_config.components` accepts `dit` and
+`text_encoder`; unselected components, including the decoder, remain resident.
+Selecting `vae` is unsupported and raises an error.
 
 ## Software and checkpoints
 

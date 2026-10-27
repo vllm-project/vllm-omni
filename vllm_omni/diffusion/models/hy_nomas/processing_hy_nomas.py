@@ -22,7 +22,6 @@ class HyNomasRequest:
     width: int
     steps: int
     seed: int
-    negative_prompt: str
     camera_trajectory: str | None
     segment_has_camera: list[bool] | None
 
@@ -122,7 +121,9 @@ def normalize_request(prompt: OmniPromptType, params: OmniDiffusionSamplingParam
         negative = ""
     if not isinstance(negative, str):
         raise OmniClientError("negative_prompt must be a string.")
-    return HyNomasRequest(prompts, list(boundaries), frames, height, width, steps, seed, negative, camera, camera_flags)
+    if negative:
+        raise OmniClientError("The distilled Hy-Nomas checkpoint does not support negative_prompt (guidance_scale=1).")
+    return HyNomasRequest(prompts, list(boundaries), frames, height, width, steps, seed, camera, camera_flags)
 
 
 @dataclass(frozen=True)

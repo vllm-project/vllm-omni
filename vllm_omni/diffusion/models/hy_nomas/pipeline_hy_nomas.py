@@ -57,6 +57,7 @@ from vllm_omni.diffusion.offloader.config import (
     DIT_COMPONENT,
     TEXT_ENCODER_COMPONENT,
     OffloadStrategy,
+    parse_offload_components,
     resolve_offload_strategy,
 )
 from vllm_omni.diffusion.offloader.sequential_backend import (
@@ -372,6 +373,8 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
     ) -> None:
         if use_hsdp:
             raise ValueError("Hy-Nomas does not support HSDP.")
+        if offload_components is not None:
+            offload_components = parse_offload_components(offload_components)
         if self._cpu_offload:
             return
         dits = [self.transformer] if offload_components is None or DIT_COMPONENT in offload_components else []
@@ -381,6 +384,7 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
             if offload_components is None
             else ([self.text_encoder] if TEXT_ENCODER_COMPONENT in offload_components else [])
         )
+        # 未选中的组件保持驻留，仍需安装 hook，以便在执行前移走选中的 DiT。
         apply_sequential_offload(
             dit_modules=[self.transformer],
             encoder_modules=stages,
