@@ -4912,6 +4912,12 @@ _ISSUE_ALERT_CSS = """
   font-size: 0.8rem;
 }
 .issue-alert-chip strong { font-variant-numeric: tabular-nums; }
+button.issue-alert-chip { cursor: pointer; font-family: inherit; color: inherit; }
+button.issue-alert-chip[data-verdict-filter]:hover { border-color: rgba(59, 130, 246, 0.55); }
+.issue-alert-chip--active {
+  background: rgba(59, 130, 246, 0.12);
+  border-color: rgba(59, 130, 246, 0.45);
+}
 .issue-alert-badge {
   display: inline-block;
   border-radius: 6px;
@@ -4927,6 +4933,7 @@ _ISSUE_ALERT_CSS = """
 .issue-alert-badge--unknown { background: var(--dashboard-badge-bg, #edf3f8); color: var(--dashboard-badge-text, #435466); }
 .issue-alert-hint { display: block; margin-top: 0.2rem; font-size: 0.75rem; color: var(--dashboard-soft-text, #64748b); }
 .issue-alert-nodes { color: var(--dashboard-soft-text, #64748b); font-size: 0.78rem; }
+.issue-alert-jobs { color: var(--dashboard-soft-text, #64748b); font-size: 0.78rem; }
 .issue-alert-related { margin-top: 0.2rem; font-size: 0.78rem; color: var(--dashboard-soft-text, #64748b); }
 table.fail-table tr.row-alert-new td { background: rgba(239, 68, 68, 0.045); }
 table.fail-table tr.row-alert-recurred td { background: rgba(245, 158, 11, 0.05); }
@@ -5309,12 +5316,18 @@ def _render_issue_alert_html(groups: list[_IssueAlertGroup], *, note: str | None
     counts: dict[str, int] = {}
     for g in groups:
         counts[g.verdict] = counts.get(g.verdict, 0) + 1
-    chips: list[str] = [f'<span class="issue-alert-chip"><strong>{len(groups)}</strong> failure groups</span>']
+    chips: list[str] = [
+        '<button type="button" class="issue-alert-chip issue-alert-chip--active" '
+        'data-verdict-filter="all" title="Show all failure groups">'
+        f"<strong>{len(groups)}</strong> failure groups</button>"
+    ]
     for verdict in ("new", "recurred", "tracked", "env-local", "unknown"):
         if counts.get(verdict):
             label = _ISSUE_ALERT_VERDICTS[verdict][0]
             chips.append(
-                f'<span class="issue-alert-chip"><strong>{counts[verdict]}</strong> {html.escape(label)}</span>'
+                '<button type="button" class="issue-alert-chip" '
+                f'data-verdict-filter="{verdict}" title="Show only {html.escape(label, quote=True)} groups">'
+                f"<strong>{counts[verdict]}</strong> {html.escape(label)}</button>"
             )
     chip_row = '<div class="issue-alert-chips">' + "".join(chips) + "</div>"
 
@@ -5325,6 +5338,7 @@ def _render_issue_alert_html(groups: list[_IssueAlertGroup], *, note: str | None
             '<table class="fail-table">',
             "<thead><tr>",
             '<th><span class="th-lbl">Source</span></th>',
+            '<th><span class="th-lbl">Job</span></th>',
             '<th><span class="th-lbl">Failing tests</span></th>',
             '<th><span class="th-lbl">First error</span></th>',
             '<th><span class="th-lbl">Matched issue</span></th>',
@@ -5345,6 +5359,13 @@ def _render_issue_alert_html(groups: list[_IssueAlertGroup], *, note: str | None
             src = "<br>".join(html.escape(s) for s in g.sources[:2])
             if len(g.sources) > 2:
                 src += html.escape(f" (+{len(g.sources) - 2} more)")
+            steps_title = html.escape("\n".join(g.steps[:12]), quote=True)
+            jobs_html = "<br>".join(html.escape(s) for s in g.steps[:2])
+            if len(g.steps) > 2:
+                jobs_html += html.escape(f" (+{len(g.steps) - 2} more)")
+            if not g.steps:
+                jobs_html = "—"
+            jobs_cell = f'<td><span class="issue-alert-jobs" title="{steps_title}">{jobs_html}</span></td>'
             nodes_title = html.escape("\n".join(g.nodes[:12]), quote=True)
             node_head = g.nodes[0] if g.nodes else ""
             node_short = re.sub(r"^[^:]*::", "", node_head)[:80]
@@ -5374,6 +5395,7 @@ def _render_issue_alert_html(groups: list[_IssueAlertGroup], *, note: str | None
                     f'<tr class="row-alert-{g.verdict}" data-alert-nodes="{nodes_attr}"'
                     ' title="Click to jump to the Submit-issue button row">',
                     f"<td>{src}</td>",
+                    jobs_cell,
                     f"<td>{tests_cell}</td>",
                     reason_cell,
                     f"<td>{issue_cell}</td>",
@@ -5393,7 +5415,8 @@ def _render_issue_alert_html(groups: list[_IssueAlertGroup], *, note: str | None
         "&middot; signature) and matched, read-only, against "
         f"{_ISSUE_ALERT_REPO} issues (closed ones included): a duplicate requires node-id / "
         "exception-class / signature-token agreement above the thresholds. Automatic matching "
-        "is advisory &mdash; the file-vs-reopen call stays manual. Click a row to jump to its "
+        "is advisory &mdash; the file-vs-reopen call stays manual. Use the verdict chips above "
+        "the table to filter rows by verdict; click a row to jump to its "
         "Submit-issue button in the failure tables below.</p>"
     )
     jump_script = """
@@ -5445,6 +5468,21 @@ def _render_issue_alert_html(groups: list[_IssueAlertGroup], *, note: str | None
     target.classList.remove("issue-alert-flash");
     void target.offsetWidth;
     target.classList.add("issue-alert-flash");
+  });
+})();
+(function () {
+  document.addEventListener("click", function (ev) {
+    var btn = ev.target.closest && ev.target.closest("button.issue-alert-chip[data-verdict-filter]");
+    if (!btn) return;
+    var want = btn.getAttribute("data-verdict-filter") || "all";
+    var chips = document.querySelectorAll("button.issue-alert-chip[data-verdict-filter]");
+    for (var i = 0; i < chips.length; i++) {
+      chips[i].classList.toggle("issue-alert-chip--active", chips[i] === btn);
+    }
+    var rows = document.querySelectorAll("tr[data-alert-nodes]");
+    for (var j = 0; j < rows.length; j++) {
+      rows[j].style.display = (want === "all" || rows[j].classList.contains("row-alert-" + want)) ? "" : "none";
+    }
   });
 })();
 </script>
