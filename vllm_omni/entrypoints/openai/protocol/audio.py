@@ -229,6 +229,10 @@ class OpenAICreateSpeechRequest(BaseModel):
             "/v1/audio/speech/stream path."
         ),
     )
+    watermarking: bool = Field(
+        default=True,
+        description="Whether the server's configured watermarking applies to this request.",
+    )
 
     @field_validator("ref_audio", mode="before")
     @classmethod
@@ -475,6 +479,10 @@ class OpenAICreateAudioGenerateRequest(BaseModel):
         le=_INT64_MAX,
         description="Random seed for reproducibility",
     )
+    watermarking: bool = Field(
+        default=True,
+        description="Whether the server's configured watermarking applies to this request.",
+    )
 
     @field_validator("stream_format")
     @classmethod
@@ -535,6 +543,7 @@ class SpeechBatchItem(BaseModel):
     max_new_tokens: int | None = Field(default=None, ge=1, le=_INT64_MAX)
     initial_codec_chunk_frames: int | None = Field(default=None, ge=0, le=_INT64_MAX)
     non_streaming_mode: bool | None = None
+    watermarking: bool | None = None
 
 
 class BatchSpeechRequest(BaseModel):
@@ -556,6 +565,7 @@ class BatchSpeechRequest(BaseModel):
     max_new_tokens: int | None = Field(default=None, ge=1, le=_INT64_MAX)
     initial_codec_chunk_frames: int | None = Field(default=None, ge=0, le=_INT64_MAX)
     non_streaming_mode: bool | None = None
+    watermarking: bool = True
 
 
 class SpeechInputTokenDetails(BaseModel):
@@ -683,6 +693,10 @@ class StreamingSpeechSessionConfig(BaseModel):
         ge=_INT64_MIN,
         le=_INT64_MAX,
         description="Random seed forwarded to /v1/audio/speech for this session.",
+    )
+    watermarking: bool = Field(
+        default=True,
+        description="Whether the server's configured watermarking applies to this session's audio.",
     )
     split_granularity: Literal["none", "sentence", "clause"] = Field(
         default="none",

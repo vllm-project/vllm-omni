@@ -137,10 +137,15 @@ def make_inputs(torch, tokens, args):
 
 
 def check_and_capture(torch, moe, kernels, data, args):
+    from vllm_omni.diffusion.models.magi2.layers.cuda.mh_moe import (
+        _allocate_bf16_route_buffers,
+        _pack_bf16_w13,
+    )
+
     x, probabilities, indices, gate, up, down = data
     gather, weights, offsets = moe.global_sort_routes(probabilities, indices, args.experts)
     sorted_routes, launches = [], []
-    scatter, invoke = kernels._deterministic_scatter, moe.invoke_fused_moe_bf16
+    scatter, invoke = kernels._deterministic_scatter, kernels.invoke_fused_moe_bf16
 
     def capture_scatter(routes, *params):
         sorted_routes.append(routes.detach().clone())
@@ -152,15 +157,17 @@ def check_and_capture(torch, moe, kernels, data, args):
 
     with patch.object(kernels, "_deterministic_scatter", capture_scatter):
         moe.triton_mh_moe_forward(x, gather, weights, offsets, gate, up, down, deterministic=True)
-    packed_w13 = moe._pack_bf16_w13(gate, up)
-    route_buffers = moe._allocate_bf16_route_buffers(
+    packed_w13 = _pack_bf16_w13(gate, up)
+    route_buffers = _allocate_bf16_route_buffers(
         x.shape[0] * args.heads * args.top_k,
         args.heads * args.experts,
         128,
         x.device,
     )
-    with patch.object(moe, "invoke_fused_moe_bf16", capture_launch):
-        actual = moe._bf16_fused_moe_forward(x, probabilities, indices, packed_w13, down, route_buffers)
+    with patch("vllm_omni.diffusion.models.magi2.layers.cuda.mh_moe.invoke_fused_moe_bf16", capture_launch):
+        actual = moe._bf16_fused_moe_forward(
+            x, probabilities, indices, packed_w13, down, route_buffers, config=moe._BF16_MOE_CONFIG
+        )
     if len(sorted_routes) != 1 or len(launches) != 2:
         raise RuntimeError("Unexpected kernel dispatch: benchmark contract needs updating")
     # The fused path stores its routes token-major.
@@ -189,12 +196,17 @@ def check_and_capture(torch, moe, kernels, data, args):
 
 
 def benchmark(torch, moe, kernels, tokens, args):
+    from vllm_omni.diffusion.models.magi2.layers.cuda.mh_moe import (
+        _allocate_bf16_route_buffers,
+        _pack_bf16_w13,
+    )
+
     data = make_inputs(torch, tokens, args)
     x, probabilities, indices, gate, up, down = data
     launches, errors = check_and_capture(torch, moe, kernels, data, args)
-    packed_w13 = moe._pack_bf16_w13(gate, up)
+    packed_w13 = _pack_bf16_w13(gate, up)
     route_count = tokens * args.heads * args.top_k
-    route_buffers = moe._allocate_bf16_route_buffers(route_count, args.heads * args.experts, 128, x.device)
+    route_buffers = _allocate_bf16_route_buffers(route_count, args.heads * args.experts, 128, x.device)
 
     def reference():
         gather, weights, offsets = moe.global_sort_routes(probabilities, indices, args.experts)
@@ -203,13 +215,13 @@ def benchmark(torch, moe, kernels, tokens, args):
     calls = {
         "reference_deterministic_routed": reference,
         "candidate_routed": lambda: moe._bf16_fused_moe_forward(
-            x, probabilities, indices, packed_w13, down, route_buffers
+            x, probabilities, indices, packed_w13, down, route_buffers, config=moe._BF16_MOE_CONFIG
         ),
     }
     if args.mode == "dispatch":
-        config = moe.Magi2MultiHeadMoEConfig(
-            args.heads * 256, args.heads, args.experts, args.top_k, 1280, torch.bfloat16
-        )
+        from vllm_omni.diffusion.models.magi2.layers.native.mh_moe import Magi2MultiHeadMoEConfig
+
+        config = Magi2MultiHeadMoEConfig(args.heads * 256, args.heads, args.experts, args.top_k, 1280, torch.bfloat16)
         layer = moe.Magi2MultiHeadMoE(config).to(x.device)
         for parameter, value in ((layer.W_gate, gate), (layer.W_up, up), (layer.W_down, down)):
             parameter.copy_(value)
@@ -241,19 +253,21 @@ def benchmark(torch, moe, kernels, tokens, args):
         timings[names[0]]["synchronized_wall"]["p50_us"] / timings[names[1]]["synchronized_wall"]["p50_us"]
     )
     if args.stages:
+        from vllm_omni.diffusion.models.magi2.layers.cuda.mh_moe import _align_bf16_routes
+
         route_ids = (indices.int() + torch.arange(args.heads, device=x.device)[:, None, None] * args.experts).reshape(
             -1, args.top_k
         )
 
         def gems():
             for params, kwargs in launches:
-                moe.invoke_fused_moe_bf16(*params, **kwargs)
+                kernels.invoke_fused_moe_bf16(*params, **kwargs)
 
         result["standalone_stages_not_additive"] = measure(
             torch,
             {
                 "reference_sort": lambda: moe.global_sort_routes(probabilities, indices, args.experts),
-                "candidate_align": lambda: moe._align_bf16_routes(route_ids, args.heads * args.experts, 128),
+                "candidate_align": lambda: _align_bf16_routes(route_ids, args.heads * args.experts, 128),
                 "candidate_pack_w13": lambda: torch.stack((gate.transpose(1, 2), up.transpose(1, 2)), dim=2).reshape(
                     args.heads * args.experts, 2560, 256
                 ),
@@ -278,7 +292,10 @@ def main():
         print(json.dumps({"status": "skip", "reason": "No visible CUDA/MUSA device"}))
         return
     import vllm_omni.diffusion.models.magi2.fused_moe_kernels as kernels
-    import vllm_omni.diffusion.models.magi2.mh_moe as moe
+    from vllm_omni.platforms import current_omni_platform
+
+    platform = "musa" if current_omni_platform.is_musa() else "cuda"
+    moe = importlib.import_module(f"vllm_omni.diffusion.models.magi2.layers.{platform}.mh_moe")
 
     root = Path(__file__).resolve().parents[2]
     try:

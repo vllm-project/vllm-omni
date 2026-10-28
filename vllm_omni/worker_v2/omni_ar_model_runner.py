@@ -218,9 +218,9 @@ class OmniARModelRunner(OmniGPUModelRunner):
         num_sampled, num_rejected = sampling_output.num_sampled, sampling_output.num_rejected
         if sampling_output.multimodal_outputs is not None:
             multimodal_outputs = sampling_output.multimodal_outputs
-        run_eager_mtp = getattr(self.model_state, "run_eager_mtp", None)
-        if multimodal_outputs and run_eager_mtp is not None:
-            run_eager_mtp(
+        post_sample = getattr(self.model_state, "post_sample", None)
+        if post_sample is not None:
+            post_sample(
                 input_batch,
                 text_hidden,
                 sampler_output.sampled_token_ids,

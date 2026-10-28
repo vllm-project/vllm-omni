@@ -3284,7 +3284,6 @@ class TestPlatformOverrides:
         if is_cuda:
             args = stages[0].yaml_engine_args
             assert args["enable_prefix_caching"] is True
-            assert args["hf_overrides"]["mrv2_gpu_slot_state"] is True
             assert args["hf_overrides"]["mrv2_batch_prefill"] is True
             assert args["hf_overrides"]["mrv2_direct_tokens"] is True
             assert "local_compile_audio_sampler" not in args["hf_overrides"]
@@ -3307,7 +3306,6 @@ class TestPlatformOverrides:
         assert args["max_num_seqs"] == 128
         assert args["max_num_batched_tokens"] == 512
         assert args["hf_overrides"] == {
-            "mrv2_gpu_slot_state": True,
             "mrv2_batch_prefill": True,
             "mrv2_direct_tokens": True,
             "mrv2_eager_mtp": True,

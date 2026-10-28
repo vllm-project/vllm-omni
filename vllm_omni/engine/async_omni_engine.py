@@ -38,7 +38,7 @@ from vllm_omni.engine.messages import (
 from vllm_omni.engine.omni_engine_base import OmniEngineBase, StageRuntimeInfo
 from vllm_omni.engine.orchestrator import Orchestrator, OrchestratorBase
 from vllm_omni.engine.serialization import deserialize_additional_information
-from vllm_omni.inputs.data import OmniInteractionPrompt, OmniSamplingParams
+from vllm_omni.inputs.data import OmniInteractionPrompt, OmniSamplingParams, disable_watermarking
 
 logger = init_logger(__name__)
 
@@ -237,6 +237,15 @@ class AsyncOmniEngine(OmniEngineBase):
             raise ValueError(
                 f"Missing sampling params for stage 0. Got {len(effective_sampling_params_list)} stage params."
             )
+
+        # Opting out on any stage opts the whole request out; pooling stages never watermark
+        if any(
+            params.watermarking is False
+            for params in effective_sampling_params_list
+            if isinstance(params, OmniSamplingParams)
+        ):
+            effective_sampling_params_list = disable_watermarking(effective_sampling_params_list)
+
         params = effective_sampling_params_list[0]
 
         # Keep the original prompt for downstream stages (they need the raw
@@ -357,12 +366,8 @@ class AsyncOmniEngine(OmniEngineBase):
                 if reasoning_ended is not None:
                     request.reasoning_ended = reasoning_ended
 
-                # Restore external_req_id to the original user-facing request_id.
-                # InputProcessor.process_inputs() renames request_id to an internal
-                # UUID (saving the original in external_req_id), but then overwrites
-                # external_req_id with the new internal ID. We need external_req_id
-                # to match the key used in Orchestrator.request_states so that
-                # output routing (output.request_id lookup) can find the req_state.
+                # process_inputs() leaves external_req_id unset, so we need to set it to the
+                # orchestrator request_id to find the correct req_state in Orchestrator.request_states.
                 request.external_req_id = request_id
                 request = apply_omni_final_stage_metadata(request, final_stage_id)
 

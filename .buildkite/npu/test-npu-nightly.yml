@@ -378,6 +378,40 @@ steps:
       build.env("NIGHTLY") == "1" ||
       build.pull_request.labels includes "nightly-test"
     steps:
+      - label: ":full_moon: Diffusion X2V · MiniMax-H3 DLO Perf Test"
+        key: nightly-diffusion-x2v-performance-minimax-h3
+        source_file_dependencies: diffusion_minimax_h3_perf
+        timeout_in_minutes: 90
+        mirror_hardwares: a3_npu_4
+        env:
+          VLLM_WORKER_MULTIPROC_METHOD: spawn
+          HF_HUB_OFFLINE: "1"
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+          PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
+        artifact_paths:
+          - "tests/dfx/perf/results/*.json"
+        commands:
+          - |
+            [ -d "$${VLLM_TEST_MINIMAX_H3_FL2VA_MODEL:-}/FL2VA" ] && export VLLM_TEST_MINIMAX_H3_FL2VA_MODEL="$$VLLM_TEST_MINIMAX_H3_FL2VA_MODEL/FL2VA" || true
+            [ -z "$${VLLM_TEST_MINIMAX_H3_FL2VA_MODEL:-}" ] && [ -d "$${VLLM_TEST_MINIMAX_H3_MODEL:-}/FL2VA" ] && export VLLM_TEST_MINIMAX_H3_FL2VA_MODEL="$$VLLM_TEST_MINIMAX_H3_MODEL/FL2VA" || true
+            export BENCHMARK_DIR=tests/dfx/perf/results
+            set +e
+            pytest -s -v tests/dfx/perf/scripts/run_benchmark.py -m "full_model and npu and A3 and diffusion and cards_4" --test-config-file tests/dfx/perf/tests/test_minimax_h3_vllm_omni.json
+            exit $$?
+      - label: ":full_moon: Diffusion X2V · MiniMax-H3 Timeline Guide Accuracy Test"
+        key: nightly-diffusion-x2v-timeline-minimax-h3
+        source_file_dependencies: diffusion_minimax_h3_accuracy
+        timeout_in_minutes: 180
+        mirror_hardwares: a3_npu_2
+        env:
+          VLLM_WORKER_MULTIPROC_METHOD: spawn
+          HF_HUB_OFFLINE: "1"
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+        commands:
+          - |
+            [ -d "$${VLLM_TEST_MINIMAX_H3_FL2VA_MODEL:-}/FL2VA" ] && export VLLM_TEST_MINIMAX_H3_FL2VA_MODEL="$$VLLM_TEST_MINIMAX_H3_FL2VA_MODEL/FL2VA" || true
+            [ -z "$${VLLM_TEST_MINIMAX_H3_FL2VA_MODEL:-}" ] && [ -d "$${VLLM_TEST_MINIMAX_H3_MODEL:-}/FL2VA" ] && export VLLM_TEST_MINIMAX_H3_FL2VA_MODEL="$$VLLM_TEST_MINIMAX_H3_MODEL/FL2VA" || true
+            pytest -s -v tests/e2e/accuracy/minimax_h3/test_minimax_h3_timeline_guides.py -m "full_model and npu and A3 and diffusion and cards_2" --run-level full_model
       - label: ":full_moon: Diffusion X2V · HunyuanVideo-1.5 Function Test"
         source_file_dependencies: diffusion_hunyuan_video_function
         timeout_in_minutes: 180
@@ -389,6 +423,19 @@ steps:
           HF_HUB_OFFLINE: "1"
         commands:
           - pytest -s -v tests/e2e/online_serving/test_hunyuan_video_15_expansion.py -m "npu and A2" --run-level "full_model"
+      - label: ":full_moon: Diffusion X2V · HunyuanVideo-1.5 Accuracy Test"
+        source_file_dependencies: diffusion_hunyuan_video_accuracy
+        timeout_in_minutes: 180
+        mirror_hardwares: a3_npu_2
+        env:
+          VLLM_WORKER_MULTIPROC_METHOD: spawn
+          HF_TOKEN: "${HF_TOKEN}"
+          HF_HUB_OFFLINE: "1"
+        artifact_paths:
+          - tests/e2e/accuracy/**/*
+        commands:
+          - pytest -s -v tests/e2e/accuracy/hunyuanvideo15_t2v/test_hunyuanvideo15_t2v_video_similarity.py -m "full_model and diffusion and npu and A3 and cards_1" --run-level full_model
+          - pytest -s -v tests/e2e/accuracy/hunyuanvideo15_i2v/test_hunyuanvideo15_i2v_video_similarity.py -m "full_model and diffusion and npu and A3 and cards_1" --run-level full_model
       - label: ":full_moon: Diffusion X2V · HunyuanVideo-1.5 Perf Test"
         source_file_dependencies: diffusion_hunyuan_video_perf
         key: nightly-diffusion-x2v-performance-hunyuanvideo15

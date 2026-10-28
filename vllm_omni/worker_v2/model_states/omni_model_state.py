@@ -26,7 +26,6 @@ import torch.nn as nn
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.logger import init_logger
-from vllm.model_executor.offloader.base import get_offloader
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.input_batch import InputBatch
@@ -37,12 +36,11 @@ from vllm.v1.worker.gpu.states import RequestState
 from vllm.v1.worker.utils import AttentionGroup
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput, OwnedBatchTensor
-from vllm_omni.platforms import current_omni_platform
-from vllm_omni.utils.device_copy import DeviceStager, index_to_device
-from vllm_omni.worker_v2.model_states.eager_mtp import EagerMTPState, FrameBatch
+from vllm_omni.utils.device_copy import index_to_device
 from vllm_omni.worker_v2.model_states.intermediate_buffer import (
     OmniIntermediateBuffer,
 )
+from vllm_omni.worker_v2.model_states.mtp_model_state import FrameBatch, MTPState
 from vllm_omni.worker_v2.streaming_audio import StreamingAudioOutput
 from vllm_omni.worker_v2.warmup import is_warmup_request
 
@@ -94,9 +92,6 @@ def _make_safe_get_rope(orig_get_rope):
     return _safe_get_rope
 
 
-_NO_SEED = object()
-
-
 class OmniModelState(DefaultModelState):
     """Generic Omni ``ModelState`` — works for **all** Omni model stages.
 
@@ -105,9 +100,9 @@ class OmniModelState(DefaultModelState):
 
     # Eager-frame defaults for states built without __init__ (tests, adapters).
     _decode_preprocess_is_identity = False
-    _eager_mtp = False
-    _eager_fastpath = False
+    _has_mtp = False
     preprocess_keeps_mm_inputs = False
+    _supports_prefill_token_mask = False
 
     def __init__(
         self,
@@ -153,10 +148,9 @@ class OmniModelState(DefaultModelState):
         self.has_preprocess: bool = getattr(model, "has_preprocess", False)
         self.has_postprocess: bool = getattr(model, "has_postprocess", False)
         self.have_multimodal_outputs: bool = getattr(model, "have_multimodal_outputs", False)
+        self._supports_prefill_token_mask = bool(getattr(model, "supports_prefill_token_mask", False))
         self._decode_preprocess = self._resolve_decode_preprocess(model)
         self._decode_preprocess_is_identity = bool(getattr(model, "mrv2_decode_preprocess_is_identity", False))
-        self._mtp_generators: dict[str, torch.Generator | None] = {}
-        self._mtp_seeded: set[str] = set()  # requests whose generator is seeded
         # Talker's codec_embedding dim may differ from hf_text_config.hidden_size; probe real dim.
         self._embed_dim = self._get_embed_dim(model, device) if self.has_preprocess else 0
 
@@ -184,77 +178,51 @@ class OmniModelState(DefaultModelState):
                 device=device,
             )
 
-        # Static MTP buffers so _run_batched_mtp uses .copy_() instead of torch.cat().
-        self._mtp_input_ids: torch.Tensor | None = None
-        self._mtp_input_embeds: torch.Tensor | None = None
-        self._mtp_hidden: torch.Tensor | None = None
-        self._mtp_text_step: torch.Tensor | None = None
-        self._mtp_offsets: torch.Tensor | None = None
-        self._stage_offsets = DeviceStager()  # per-step MTP row offsets, read in place by the GPU
-        self._mtp_sample_uniforms: torch.Tensor | None = None
-        self._mtp_runner: Any | None = None
-        # Captured whole-MTP graph entry per batch size, once a replay through
-        # the wrapper has resolved it: (padded rows, entry).
-        self._mtp_replays: dict[int, tuple[int, Any]] = {}
-        if self._embed_dim > 0 and hasattr(model, "mtp"):
-            max_bs = max_num_reqs
-            self._mtp_input_ids = torch.zeros(max_bs, dtype=torch.long, device=device)
-            self._mtp_input_embeds = torch.zeros((max_bs, self._embed_dim), dtype=self.dtype, device=device)
-            self._mtp_hidden = torch.zeros((max_bs, self._embed_dim), dtype=self.dtype, device=device)
-            self._mtp_text_step = torch.zeros((max_bs, self._embed_dim), dtype=self.dtype, device=device)
-            self._mtp_offsets = torch.zeros(max_bs, dtype=torch.long, device=device)
-            sample_steps = int(getattr(model, "mtp_sample_steps", 0))
-            sample_vocab_size = int(getattr(model, "mtp_sample_vocab_size", 0))
-            if bool(getattr(model, "mtp_sample_uniforms", False)) and sample_steps > 0 and sample_vocab_size > 0:
-                self._mtp_sample_uniforms = torch.empty(
-                    (max_bs, sample_steps, sample_vocab_size),
-                    dtype=torch.float32,
-                    device=device,
-                )
-            self._mtp_runner = self._init_mtp_runner(model)
-        # Eager frames: finish MTP in the step that sampled CB0 (see
-        # run_eager_mtp). The next step only adds its text-step embedding.
-        self._eager_mtp = self._mtp_input_ids is not None and bool(getattr(model, "mtp_eager_frames", False))
-        self._eager_state = EagerMTPState(self)
-        self._eager_fastpath = self._eager_mtp
-        if self._eager_mtp:
-            self._eager_state.embeds = torch.zeros((max_num_reqs, self._embed_dim), dtype=self.dtype, device=device)
+        self._mtp_state = MTPState(self)
+        # Capability flag, not an eager/deferred timing choice. Built-in MTP
+        # completes frames in post_sample; preprocess consumes cached inputs.
+        self._has_mtp = self._mtp_state._mtp_input_ids is not None and bool(getattr(model, "has_talker_mtp", False))
+        if self._has_mtp:
             # The model then leaves frame codes/validity and the decode MTP
-            # inputs to run_eager_mtp instead of building them per row.
+            # inputs to post_sample instead of building them per row.
             model.eager_frames_active = True
             logger.info("Eager Talker-MTP frames enabled")
 
     def set_first_audio_sink(self, sink: Any) -> None:
-        self._eager_state.set_first_audio_sink(sink)
+        self._mtp_state.set_first_audio_sink(sink)
 
     def close_first_audio_sender(self) -> None:
-        sender = self._eager_state.first_audio_sender
+        sender = self._mtp_state.first_audio_sender
         if sender is not None:
             sender.close()
 
-    def run_eager_mtp(
+    def post_sample(
         self,
         input_batch: InputBatch,
         text_hidden: torch.Tensor,
         sampled_token_ids: torch.Tensor,
-        multimodal_outputs: dict[str, Any],
+        multimodal_outputs: dict[str, Any] | None,
         mtp_batch_descriptor_dispatcher: Callable[[int], Any] | None = None,
     ) -> None:
-        if self._eager_mtp:
-            self._eager_state.run_eager_mtp(
-                input_batch, text_hidden, sampled_token_ids, multimodal_outputs, mtp_batch_descriptor_dispatcher
+        if self._has_mtp and multimodal_outputs:
+            self._mtp_state.post_sample(
+                input_batch,
+                text_hidden,
+                sampled_token_ids,
+                multimodal_outputs,
+                mtp_batch_descriptor_dispatcher,
             )
 
     def prepare_streaming_audio_output(
         self, input_batch: InputBatch, req_states: RequestState, outputs: dict[str, Any]
     ) -> StreamingAudioOutput | None:
-        return self._eager_state.prepare_audio_output(input_batch, req_states, outputs)
+        return self._mtp_state.prepare_audio_output(input_batch, req_states, outputs)
 
     def on_requests_finished(self, req_ids: set[str]) -> None:
-        self._eager_state.finish_audio(req_ids)
+        self._mtp_state.finish_audio(req_ids)
 
     def on_request_preempted(self, req_id: str, req_index: int) -> None:
-        self._eager_state.suspend_audio(req_id, req_index)
+        self._mtp_state.suspend_audio(req_id, req_index)
 
     def custom_sampler(self, sampler: Any) -> tuple[Any, Any] | None:
         """Let the model replace or wrap the MRv2 sampler (``mrv2_custom_sampler``)."""
@@ -285,118 +253,14 @@ class OmniModelState(DefaultModelState):
 
         return decode_preprocess
 
-    def _init_mtp_runner(self, model: nn.Module) -> Any:
-        mtp = getattr(model, "mtp", None)
-        if mtp is None:
-            return None
-        output_key = getattr(model, "mtp_output_key", None)
-        if not (isinstance(output_key, str) or (isinstance(output_key, tuple) and len(output_key) == 2)):
-            raise TypeError("Models with an mtp hook must declare mtp_output_key as a string or 2-tuple")
-
-        compilation_config = self.vllm_config.compilation_config
-        cudagraph_mode = getattr(compilation_config, "cudagraph_mode", CUDAGraphMode.NONE)
-        if bool(getattr(model, "mtp_disable_graph", False)):
-            logger.info("Skipping mtp graph wrapper because the model marks it graph-unsafe.")
-            return mtp
-        graph_safe = bool(getattr(model, "mtp_graph_safe", False))
-        if cudagraph_mode is not None and cudagraph_mode.has_full_cudagraphs() and graph_safe:
-            graph_wrapper_cls = current_omni_platform.get_graph_wrapper_cls()
-            return graph_wrapper_cls(mtp, self.vllm_config, runtime_mode=CUDAGraphMode.FULL)
-        return mtp
-
     def _is_mtp_graph_runner(self) -> bool:
-        runner = getattr(self, "_mtp_runner", None)
-        if runner is None:
-            return False
-        graph_wrapper_cls = current_omni_platform.get_graph_wrapper_cls()
-        return isinstance(runner, graph_wrapper_cls)
-
-    def capture_mtp_graphs(
-        self, dispatch_batch_descriptor: Callable[[int], Any], *, restore_capturing: bool = False
-    ) -> None:
-        if not self._is_mtp_graph_runner():
-            return
-        if (
-            self._mtp_input_ids is None
-            or self._mtp_input_embeds is None
-            or self._mtp_hidden is None
-            or self._mtp_text_step is None
-        ):
-            return
-        if getattr(self.model, "mtp_accepts_req_infos", False):
-            logger.warning("Skipping mtp graph capture because this model requires per-request req_infos.")
-            return
-
-        from vllm.compilation import monitor
-        from vllm.distributed.parallel_state import graph_capture
-        from vllm.forward_context import set_forward_context
-
-        compilation_config = self.vllm_config.compilation_config
-        capture_sizes = self._get_mtp_capture_sizes()
-        num_warmups = compilation_config.cudagraph_num_of_warmups
-        capture_kwargs = self._get_mtp_base_sampling_kwargs()
-        logger.info("Capturing MRv2 mtp graphs for sizes %s", capture_sizes)
-
-        # The profiling pass runs this before the decoder's real capture, which
-        # needs capturing to stay enabled, so it restores what was set.
-        capturing_enabled = monitor.cudagraph_capturing_enabled and restore_capturing
-        monitor.set_cudagraph_capturing_enabled(True)
-        try:
-            with torch.inference_mode(), graph_capture(device=self.device):
-                for bsz in capture_sizes:
-                    batch_descriptor = dispatch_batch_descriptor(int(bsz))
-                    num_tokens = int(getattr(batch_descriptor, "num_tokens", bsz))
-                    ids = self._mtp_input_ids[:num_tokens]
-                    emb = self._mtp_input_embeds[:num_tokens]
-                    hidden = self._mtp_hidden[:num_tokens]
-                    text_step = self._mtp_text_step[:num_tokens]
-
-                    for _ in range(num_warmups):
-                        with set_forward_context(
-                            None,
-                            self.vllm_config,
-                            cudagraph_runtime_mode=CUDAGraphMode.NONE,
-                            batch_descriptor=batch_descriptor,
-                        ):
-                            self._call_mtp_runner(ids, emb, hidden, text_step, **capture_kwargs)
-
-                    with set_forward_context(
-                        None,
-                        self.vllm_config,
-                        cudagraph_runtime_mode=CUDAGraphMode.FULL,
-                        batch_descriptor=batch_descriptor,
-                    ):
-                        sample_uniforms = None
-                        if self._mtp_sample_uniforms is not None:
-                            sample_uniforms = self._mtp_sample_uniforms[:num_tokens]
-                            sample_uniforms.fill_(0.5)
-                        self._call_mtp_runner(
-                            ids,
-                            emb,
-                            hidden,
-                            text_step,
-                            sample_uniforms=sample_uniforms,
-                            **capture_kwargs,
-                        )
-                    torch.accelerator.synchronize()
-
-            logger.info("Captured MRv2 mtp graphs for %d sizes", len(capture_sizes))
-        except RuntimeError as e:
-            raise RuntimeError(f"MRv2 mtp graph capture failed: {e}") from e
-        finally:
-            monitor.set_cudagraph_capturing_enabled(capturing_enabled)
+        return self._mtp_state._is_mtp_graph_runner()
 
     def _get_mtp_capture_sizes(self) -> list[int]:
-        """Return graph buckets that a request-batched Talker can reach."""
-        max_num_reqs = int(self.scheduler_config.max_num_seqs)
-        return sorted(
-            {
-                int(size)
-                for size in self.vllm_config.compilation_config.cudagraph_capture_sizes
-                if 0 < int(size) <= max_num_reqs
-            },
-            reverse=True,
-        )
+        return self._mtp_state._get_mtp_capture_sizes()
+
+    def capture_mtp_graphs(self, dispatch_batch_descriptor, *, restore_capturing=False) -> None:
+        self._mtp_state.capture_mtp_graphs(dispatch_batch_descriptor, restore_capturing=restore_capturing)
 
     @staticmethod
     def _get_embed_dim(model: nn.Module, device: torch.device) -> int:
@@ -415,7 +279,7 @@ class OmniModelState(DefaultModelState):
     def add_request(self, req_index: int, new_req_data: NewRequestData) -> None:
         super().add_request(req_index, new_req_data)
         self.intermediate_buffer.add_request(req_index, new_req_data)
-        self._eager_state.resume_audio(new_req_data.req_id, req_index)
+        self._mtp_state.resume_audio(new_req_data.req_id, req_index)
         self._initialize_upstream_warmup_buffer(req_index, new_req_data.req_id)
 
     def _initialize_upstream_warmup_buffer(self, req_index: int, req_id: str) -> None:
@@ -450,9 +314,7 @@ class OmniModelState(DefaultModelState):
             return
         req_id = self.intermediate_buffer.buffers[req_index].get("req_id")
         if req_id is not None:
-            getattr(self, "_mtp_generators", {}).pop(req_id, None)
-            getattr(self, "_mtp_seeded", set()).discard(req_id)
-            self._eager_state.release_request(req_id, req_index)
+            self._mtp_state.release_request(req_id, req_index)
         self.intermediate_buffer.remove_request(req_index)
 
     # ------------------------------------------------------------------
@@ -497,6 +359,38 @@ class OmniModelState(DefaultModelState):
             model_specific_attn_metadata=model_specific_attn_metadata,
         )
 
+    @staticmethod
+    def _build_prefill_token_mask(input_batch: InputBatch) -> bool | torch.Tensor:
+        """Use CPU phase metadata, including one-token and resumed prefills.
+
+        Query boundaries describe the actual flattened tokens, unlike scheduled
+        counts which can be upper bounds under adaptive verification. Tokens
+        within each row must be contiguous; sparse scheduling needs an explicit
+        token-position-aligned mask instead.
+        """
+        if not input_batch.has_prefill:
+            return False
+        # These CPU arrays are already reordered into batch order. prefill_len
+        # also includes safe codec output tokens replayed after preemption.
+        starts = input_batch.query_start_loc_np[: input_batch.num_reqs + 1]
+        counts = np.diff(starts)
+        num_prefill = np.minimum(
+            np.maximum(
+                input_batch.prefill_len_np[: input_batch.num_reqs]
+                - input_batch.num_computed_prefill_tokens_np[: input_batch.num_reqs],
+                0,
+            ),
+            counts,
+        )
+        if not np.any(num_prefill):
+            return False
+        if np.array_equal(num_prefill, counts):
+            return True
+        mask = np.zeros(input_batch.num_tokens, dtype=np.bool_)
+        for start, count in zip(starts[:-1], num_prefill):
+            mask[start : start + count] = True
+        return torch.from_numpy(mask).to(device=input_batch.input_ids.device)
+
     def prepare_inputs_embeds(
         self,
         scheduled_encoder_inputs: dict[str, list[int]],
@@ -514,6 +408,8 @@ class OmniModelState(DefaultModelState):
         self.execute_mm_encoder(scheduled_encoder_inputs)
         mm_embeds, is_mm_embed = self.gather_mm_embeddings(input_batch)
         kwargs: dict[str, Any] = {"multimodal_embeddings": mm_embeds, "is_multimodal": is_mm_embed}
+        if self._supports_prefill_token_mask:
+            kwargs["prefill_token_mask"] = self._build_prefill_token_mask(input_batch)
         if mm_embeds:
             kwargs["query_start_loc"] = input_batch.query_start_loc_np[: input_batch.num_reqs + 1].tolist()
         embeds = self.model.embed_input_ids(input_batch.input_ids[: input_batch.num_tokens], **kwargs)
@@ -722,11 +618,11 @@ class OmniModelState(DefaultModelState):
         req_states: RequestState | None = None,
         mtp_batch_descriptor_dispatcher: Callable[[int], Any] | None = None,
     ) -> None:
-        """Per-request preprocess + MTP before model forward.
+        """Prepare backbone inputs and record rows for current-step MTP.
 
         Modifies ``model_inputs["input_ids"]`` and ``model_inputs["inputs_embeds"]``
-        in-place.  Collects decode-step MTP inputs and runs a single batched MTP
-        forward at the end.
+        in-place. Decode rows consume cached frame embeddings; MTP itself runs
+        after token sampling through post_sample.
         """
         if not self.has_preprocess:
             return
@@ -753,21 +649,21 @@ class OmniModelState(DefaultModelState):
             embeds[:num_active_tokens].copy_(token_embeds)
 
         gpu_keys: set[str] = getattr(self.model, "gpu_resident_buffer_keys", set())
-        mtp_batches: list[tuple[int, int, tuple[torch.Tensor, torch.Tensor]]] = []
-        prepacked_mtp_inputs: tuple[torch.Tensor, torch.Tensor] | None = None
+        decode_mtp_rows: list[tuple[int, int]] = []
+        text_step_batches: list[torch.Tensor] = []
 
         req_indices = np.asarray(input_batch.idx_mapping_np[: input_batch.num_reqs]).tolist()
         self._stage_batched_preprocess_inputs(req_indices, embeds.device)
 
         preprocess_entries: list[tuple[int, int, int, int, dict[str, Any], bool]] = []
-        settled = self._eager_state.settled if self._eager_fastpath else None
+        settled = self._mtp_state.settled if self._has_mtp else None
         settled_rows: list[tuple[int, int, int, str]] = []
         replay_rows: list[tuple[int, int, str, bool]] = []
         # Declared identity decode has no per-row updates or hook work.
-        skip_decode_rows = self._decode_preprocess_is_identity and not self._eager_mtp
+        skip_decode_rows = self._decode_preprocess_is_identity and not self._has_mtp
         is_prefilling_np = getattr(input_batch, "is_prefilling_np", None) if skip_decode_rows else None
         rows: Iterable[tuple[int, int]] = enumerate(req_indices)
-        if settled is not None and is_prefilling_np is None and not self._eager_state.has_pending_replay():
+        if settled is not None and is_prefilling_np is None and not self._mtp_state.has_pending_replay():
             split = self._split_settled_rows(input_batch, req_indices, settled)
             if split is not None:
                 settled_rows, rows = split
@@ -780,10 +676,10 @@ class OmniModelState(DefaultModelState):
             start = int(input_batch.query_start_loc_np[i])
             n_tok = int(input_batch.num_scheduled_tokens[i])
             if (
-                self._eager_mtp
+                self._has_mtp
                 # Only the Qwen3-TTS Talker has an in-Talker streaming codec.
                 and getattr(self.model, "stream_decoder", None) is not None
-                and self._eager_state.replay_inputs(
+                and self._mtp_state.replay_inputs(
                     buf["req_id"],
                     req_idx,
                     int(input_batch.num_computed_tokens_np[i]),
@@ -830,9 +726,9 @@ class OmniModelState(DefaultModelState):
             )
             preprocess_entries.append((i, req_idx, start, n_tok, info, is_prefill))
 
-        if self._eager_mtp:
+        if self._has_mtp:
             # Rows whose sample is kept this step: decode, or the final prefill chunk.
-            self._eager_state.recorded = (
+            self._mtp_state.recorded = (
                 input_batch,
                 FrameBatch(
                     [
@@ -935,20 +831,12 @@ class OmniModelState(DefaultModelState):
                 updates_by_req,
                 gpu_keys,
             )
-            for row, (entry, updates) in enumerate(zip(decode_entries, updates_by_req, strict=True)):
-                i, req_idx, start, _n_tok, _info, _is_prefill = entry
-                # Eager frames read the packed text steps; skip per-row views.
-                row_inputs = (
-                    (batch_hidden, batch_text_step)
-                    if self._eager_mtp
-                    else (batch_hidden[row : row + 1], batch_text_step[row : row + 1])
-                )
-                mtp_batches.append((i, start, row_inputs))
+            for entry, updates in zip(decode_entries, updates_by_req, strict=True):
+                i, req_idx, start, _, _, _ = entry
+                decode_mtp_rows.append((i, start))
                 batched_indices.add(i)
-            state_updates = [(entry[1], updates) for entry, updates in zip(decode_entries, updates_by_req, strict=True)]
-            for req_idx, updates in state_updates:
                 self.intermediate_buffer.update(req_idx, updates, gpu_keys)
-            prepacked_mtp_inputs = batch_hidden, batch_text_step
+            text_step_batches.append(batch_text_step.reshape(batch_size, -1))
 
         for i, req_idx, start, n_tok, info, _is_prefill in preprocess_entries:
             if i in batched_indices:
@@ -965,48 +853,36 @@ class OmniModelState(DefaultModelState):
             if self._preprocess_result_needs_writeback(emb_slice, new_emb):
                 embeds[start : start + seg] = new_emb[:seg]
 
-            # Collect MTP inputs for decode steps (n_tok == 1 with mtp_inputs)
+            # Existing model hooks return (past hidden, text contribution).
+            # Current-step MTP only needs the text contribution here.
             mtp_inputs = updates.pop("mtp_inputs", None)
             if mtp_inputs is not None and n_tok == 1:
-                mtp_batches.append((i, start, mtp_inputs))
+                decode_mtp_rows.append((i, start))
+                text_step_batches.append(mtp_inputs[1].reshape(1, -1))
 
             # A model declaring fresh prefill outputs skips the per-request snapshot copies.
             self.intermediate_buffer.update(req_idx, updates, gpu_keys, owned=_is_prefill and prefill_updates_owned)
 
-        if self._eager_mtp:
+        if self._has_mtp:
             settled_check = getattr(self.model, "eager_decode_settled", None)
-            if self._eager_fastpath and callable(settled_check):
+            if callable(settled_check):
                 for _i, req_idx, _start, n_tok, info, is_prefill in preprocess_entries:
                     buf = self.intermediate_buffer.buffers[req_idx]
                     if not is_prefill and n_tok == 1 and settled_check(buf):
-                        self._eager_state.mark_settled(req_idx, buf["req_id"])
+                        self._mtp_state.mark_settled(req_idx, buf["req_id"])
             if settled_rows:
-                self._eager_state._apply_settled_frames(settled_rows, embeds)
-        if mtp_batches and self._eager_mtp:
-            self._eager_state._apply_eager_frames(mtp_batches, embeds, input_batch, prepacked_mtp_inputs)
-        elif mtp_batches and hasattr(self.model, "mtp"):
-            if prepacked_mtp_inputs is None:
-                self._run_batched_mtp(
-                    mtp_batches,
-                    input_ids,
-                    embeds,
-                    input_batch,
-                    gpu_keys,
-                    mtp_batch_descriptor_dispatcher,
-                )
-            else:
-                self._run_batched_mtp(
-                    mtp_batches,
-                    input_ids,
-                    embeds,
-                    input_batch,
-                    gpu_keys,
-                    mtp_batch_descriptor_dispatcher,
-                    prepacked_mtp_inputs=prepacked_mtp_inputs,
-                )
+                self._mtp_state._apply_settled_frames(settled_rows, embeds)
+        if decode_mtp_rows and self._has_mtp:
+            text_steps = text_step_batches[0] if len(text_step_batches) == 1 else torch.cat(text_step_batches, dim=0)
+            self._mtp_state.apply_frame_embeddings(decode_mtp_rows, embeds, input_batch, text_steps)
+        elif decode_mtp_rows:
+            raise RuntimeError(
+                "Deferred MTP is not supported by OmniModelState; declare has_talker_mtp "
+                "for current-step MTP or implement model-specific input preparation."
+            )
 
-        if self._eager_mtp:
-            self._eager_state.record_inputs(input_batch, embeds)
+        if self._has_mtp:
+            self._mtp_state.record_inputs(input_batch, embeds)
 
     def publish_sampled_embeddings(
         self, input_batch: InputBatch, sampled_token_ids: torch.Tensor
@@ -1046,447 +922,6 @@ class OmniModelState(DefaultModelState):
         extra: dict[str, Any] = {"embed": {"sampled": sampled}}
         return extra, done
 
-    def _pack_mtp_batch(
-        self,
-        mtp_batches: list[tuple[int, int, tuple[torch.Tensor, torch.Tensor]]],
-        input_ids: torch.Tensor,
-        embeds: torch.Tensor,
-        offsets: torch.Tensor | None = None,
-        prepacked_mtp_inputs: tuple[torch.Tensor, torch.Tensor] | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Pack per-request Talker state with a bounded number of GPU ops."""
-        bsz = len(mtp_batches)
-        if offsets is None:
-            offsets = torch.as_tensor(
-                [start for _i, start, _mtp in mtp_batches], device=input_ids.device, dtype=torch.long
-            )
-        if prepacked_mtp_inputs is None:
-            hidden_rows = [past_hidden.reshape(1, -1) for _i, _start, (past_hidden, _step) in mtp_batches]
-            text_step_rows = [text_step.reshape(1, -1) for _i, _start, (_hidden, text_step) in mtp_batches]
-            packed_hidden = None
-            packed_text_step = None
-        else:
-            packed_hidden, packed_text_step = prepacked_mtp_inputs
-            packed_hidden = packed_hidden.reshape(bsz, -1)
-            packed_text_step = packed_text_step.reshape(bsz, -1)
-
-        if self._mtp_input_ids is not None and bsz <= self._mtp_input_ids.shape[0]:
-            assert self._mtp_input_embeds is not None
-            assert self._mtp_hidden is not None
-            assert self._mtp_text_step is not None
-            batch_ids = self._mtp_input_ids[:bsz]
-            batch_embeds = self._mtp_input_embeds[:bsz]
-            batch_hidden = self._mtp_hidden[:bsz]
-            batch_text_step = self._mtp_text_step[:bsz]
-            if input_ids.dtype == batch_ids.dtype:
-                torch.index_select(input_ids, 0, offsets, out=batch_ids)
-            else:
-                batch_ids.copy_(input_ids.index_select(0, offsets))
-            torch.index_select(embeds, 0, offsets, out=batch_embeds)
-            if prepacked_mtp_inputs is None:
-                torch.cat(hidden_rows, dim=0, out=batch_hidden)
-                torch.cat(text_step_rows, dim=0, out=batch_text_step)
-            else:
-                batch_hidden.copy_(packed_hidden)
-                batch_text_step.copy_(packed_text_step)
-            return batch_ids, batch_embeds, batch_hidden, batch_text_step, offsets
-
-        if prepacked_mtp_inputs is None:
-            packed_hidden = torch.cat(hidden_rows, dim=0)
-            packed_text_step = torch.cat(text_step_rows, dim=0)
-        return (
-            input_ids.index_select(0, offsets),
-            embeds.index_select(0, offsets),
-            packed_hidden,
-            packed_text_step,
-            offsets,
-        )
-
-    def _mtp_batch_offsets(
-        self,
-        mtp_batches: list[tuple[int, int, tuple[torch.Tensor, torch.Tensor]]],
-        input_batch: InputBatch,
-        device: torch.device,
-    ) -> torch.Tensor:
-        """Reuse MRv2's device query offsets for a contiguous decode prefix.
-
-        The steady-state Talker batch contains one decode token from every
-        scheduled request, in scheduler order. ``InputBatch.query_start_loc``
-        already contains the exact device-side gather offsets for that shape;
-        rebuilding it from a Python list creates a small synchronous H2D
-        transfer on every decode step.
-        """
-        bsz = len(mtp_batches)
-        query_start_loc = getattr(input_batch, "query_start_loc", None)
-        static_offsets = self._mtp_offsets
-        if (
-            isinstance(query_start_loc, torch.Tensor)
-            and query_start_loc.device == device
-            and isinstance(static_offsets, torch.Tensor)
-            and static_offsets.device == device
-            and bsz <= static_offsets.shape[0]
-            and all(batch_index == expected for expected, (batch_index, _start, _mtp) in enumerate(mtp_batches))
-        ):
-            offsets = static_offsets[:bsz]
-            offsets.copy_(query_start_loc[:bsz], non_blocking=True)
-            return offsets
-
-        return self._stage_offsets([start for _i, start, _mtp in mtp_batches], device)
-
-    def _run_batched_mtp(
-        self,
-        mtp_batches: list[tuple[int, int, tuple[torch.Tensor, torch.Tensor]]],
-        input_ids: torch.Tensor,
-        embeds: torch.Tensor,
-        input_batch: InputBatch,
-        gpu_keys: set[str],
-        mtp_batch_descriptor_dispatcher: Callable[[int], Any] | None = None,
-        prepacked_mtp_inputs: tuple[torch.Tensor, torch.Tensor] | None = None,
-    ) -> None:
-        """Batch MTP forward for all decode-step requests.
-
-        Uses pre-allocated static buffers to avoid per-step torch.cat
-        memory allocations.
-        """
-        bsz = len(mtp_batches)
-        batch_offsets = self._mtp_batch_offsets(
-            mtp_batches,
-            input_batch,
-            input_ids.device,
-        )
-        batch_ids, batch_emb, batch_hidden, batch_step, batch_offsets = self._pack_mtp_batch(
-            mtp_batches,
-            input_ids,
-            embeds,
-            batch_offsets,
-            prepacked_mtp_inputs,
-        )
-
-        req_indices = [int(input_batch.idx_mapping_np[i]) for i, _start, _mtp in mtp_batches]
-        new_emb, codes = self._mtp_forward(
-            req_indices,
-            batch_ids,
-            batch_emb,
-            batch_hidden,
-            batch_step,
-            mtp_batch_descriptor_dispatcher,
-        )
-
-        embeds.index_copy_(0, batch_offsets, new_emb[:bsz].reshape(bsz, -1))
-        audio_key = getattr(self.model, "mtp_output_key", None)
-        validity_key = getattr(self.model, "mtp_validity_key", None)
-        valid_rows = None
-        if codes is not None and validity_key is not None:
-            valid_rows = torch.ones((bsz,), dtype=torch.bool, device=codes.device)
-        if codes is not None and audio_key in gpu_keys:
-            self.intermediate_buffer.update_gpu_tensor_rows(
-                req_indices,
-                audio_key,
-                codes[:bsz],
-            )
-            if valid_rows is not None:
-                self.intermediate_buffer.update_gpu_tensor_rows(
-                    req_indices,
-                    validity_key,
-                    valid_rows,
-                    keepdim=False,
-                )
-            return
-        for j, (i, _start, _) in enumerate(mtp_batches):
-            if codes is None:
-                continue
-            req_idx = int(input_batch.idx_mapping_np[i])
-            if isinstance(audio_key, tuple) and len(audio_key) == 2:
-                updates = {audio_key[0]: {audio_key[1]: codes[j : j + 1]}}
-            elif isinstance(audio_key, str):
-                updates = {audio_key: codes[j : j + 1]}
-            else:
-                raise TypeError(
-                    f"mtp_output_key must be a string or 2-tuple, got {type(audio_key).__name__}: {audio_key!r}"
-                )
-            if valid_rows is not None:
-                if isinstance(validity_key, tuple) and len(validity_key) == 2:
-                    updates.setdefault(validity_key[0], {})[validity_key[1]] = valid_rows[j]
-                elif isinstance(validity_key, str):
-                    updates[validity_key] = valid_rows[j]
-                else:
-                    raise TypeError(
-                        "mtp_validity_key must be a string or 2-tuple, "
-                        f"got {type(validity_key).__name__}: {validity_key!r}"
-                    )
-            self.intermediate_buffer.update(req_idx, updates, gpu_keys)
-
-    def _mtp_forward(
-        self,
-        req_indices: list[int],
-        batch_ids: torch.Tensor,
-        batch_emb: torch.Tensor,
-        batch_hidden: torch.Tensor,
-        batch_step: torch.Tensor,
-        mtp_batch_descriptor_dispatcher: Callable[[int], Any] | None = None,
-        req_ids: list[str] | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Run the residual-codebook predictor on packed rows; returns graph-owned outputs.
-
-        A caller that already holds each row's request id (the buffers'
-        ``req_id``) passes ``req_ids``; that also lets a steady batch replay
-        its resolved graph directly.
-        """
-        from vllm.forward_context import set_forward_context
-
-        bsz = len(req_indices)
-        cache = self._mtp_generators
-        seeded = self._mtp_seeded
-        all_buffers = self.intermediate_buffer.buffers
-        device = batch_ids.device
-        replay = self._mtp_replays.get(bsz) if mtp_batch_descriptor_dispatcher is not None else None
-        if replay is not None and req_ids is not None:
-            for req_id, req_idx in zip(req_ids, req_indices):
-                if req_id not in cache:
-                    # Rows new this step resolve their generator (usually "no seed") once.
-                    self._get_mtp_generator(req_id, all_buffers[req_idx].get("sampling_params"), device)
-            if seeded.isdisjoint(req_ids):
-                # Steady batch of unseeded rows at a size whose graph is resolved:
-                # what the wrapper path below does, minus its per-call Python.
-                num_tokens, entry = replay
-                assert self._mtp_sample_uniforms is not None
-                self._mtp_sample_uniforms[:num_tokens].uniform_(1e-20, 1.0 - 1e-20)
-                get_offloader().sync_prev_onload()
-                entry.cudagraph.replay()
-                return entry.output
-        buffers = [all_buffers[req_idx] for req_idx in req_indices]
-        if req_ids is None:
-            req_ids = [str(buffer.get("req_id")) for buffer in buffers]
-        if cache.keys() >= set(req_ids) and seeded.isdisjoint(req_ids):
-            # Steady batch of resolved, unseeded requests: no per-row lookups.
-            generators = [None] * bsz
-        else:
-            generators = [
-                self._get_mtp_generator(req_id, buffer.get("sampling_params"), device)
-                for req_id, buffer in zip(req_ids, buffers, strict=True)
-            ]
-
-        use_graph_runner = self._is_mtp_graph_runner()
-        has_explicit_generator = any(generator is not None for generator in generators)
-        sample_uniform_buffer = getattr(self, "_mtp_sample_uniforms", None)
-        can_use_graph = use_graph_runner and (not has_explicit_generator or sample_uniform_buffer is not None)
-        sample_uniforms = None
-        batch_descriptor = None
-        cudagraph_mode = CUDAGraphMode.NONE
-        num_tokens = bsz
-        if can_use_graph and mtp_batch_descriptor_dispatcher is not None:
-            batch_descriptor = mtp_batch_descriptor_dispatcher(bsz)
-            cudagraph_mode = getattr(batch_descriptor, "cg_mode", CUDAGraphMode.FULL)
-            num_tokens = int(getattr(batch_descriptor, "num_tokens", bsz))
-            assert self._mtp_input_ids is not None
-            assert self._mtp_input_embeds is not None
-            assert self._mtp_hidden is not None
-            assert self._mtp_text_step is not None
-            batch_ids = self._mtp_input_ids[:num_tokens]
-            batch_emb = self._mtp_input_embeds[:num_tokens]
-            batch_hidden = self._mtp_hidden[:num_tokens]
-            batch_step = self._mtp_text_step[:num_tokens]
-            if sample_uniform_buffer is not None:
-                sample_uniforms = self._prepare_mtp_sample_uniforms(generators, num_tokens)
-        elif can_use_graph:
-            cudagraph_mode = CUDAGraphMode.FULL
-            if sample_uniform_buffer is not None:
-                sample_uniforms = self._prepare_mtp_sample_uniforms(generators, bsz)
-        with set_forward_context(
-            None,
-            self.vllm_config,
-            num_tokens=num_tokens,
-            cudagraph_runtime_mode=cudagraph_mode,
-            batch_descriptor=batch_descriptor,
-        ):
-            new_emb, codes = self._call_mtp_with_sampling(
-                batch_ids,
-                batch_emb,
-                batch_hidden,
-                batch_step,
-                buffers=buffers,
-                req_ids=req_ids,
-                generators=generators,
-                sample_uniforms=sample_uniforms,
-            )
-        if batch_descriptor is not None and cudagraph_mode == CUDAGraphMode.FULL and sample_uniforms is not None:
-            self._remember_mtp_replay(bsz, num_tokens, batch_descriptor, has_explicit_generator)
-        return new_emb, codes
-
-    def _remember_mtp_replay(self, bsz: int, num_tokens: int, batch_descriptor: Any, seeded: bool) -> None:
-        """Record the captured graph entry the wrapper replayed for ``bsz`` unseeded rows."""
-        runner = self._mtp_runner
-        entries = getattr(runner, "concrete_cudagraph_entries", None)
-        if seeded or not isinstance(entries, dict) or getattr(runner, "is_debugging_mode", True):
-            return
-        entry = entries.get(batch_descriptor)
-        if getattr(entry, "cudagraph", None) is not None and getattr(entry, "output", None) is not None:
-            self._mtp_replays[bsz] = (num_tokens, entry)
-
-    def _get_mtp_base_sampling_kwargs(self) -> dict[str, Any]:
-        sampling_params = getattr(self.model, "mtp_sampling_params", None)
-        if not isinstance(sampling_params, dict):
-            sampling_params = {}
-        return {
-            "do_sample": sampling_params.get("do_sample"),
-            "temperature": sampling_params.get("temperature"),
-            "top_k": sampling_params.get("top_k"),
-            "top_p": sampling_params.get("top_p"),
-        }
-
-    def _get_mtp_sampling_kwargs(
-        self,
-        buffers: list[dict[str, Any]],
-        req_ids: list[str],
-        generators: list[torch.Generator | None],
-    ) -> dict[str, Any]:
-        kwargs = self._get_mtp_base_sampling_kwargs()
-
-        if len(generators) == 1:
-            if generators[0] is not None:
-                kwargs["generator"] = generators[0]
-        elif any(generator is not None for generator in generators):
-            kwargs["generators"] = generators
-
-        if getattr(self.model, "mtp_accepts_req_infos", False):
-            kwargs["req_ids"] = req_ids
-            kwargs["req_infos"] = buffers
-
-        return kwargs
-
-    def _get_mtp_generator(
-        self,
-        req_id: str,
-        sampling_params: Any,
-        device: torch.device,
-    ) -> torch.Generator | None:
-        cache = getattr(self, "_mtp_generators", None)
-        if cache is None:
-            cache = {}
-            self._mtp_generators = cache
-        generator = cache.get(req_id, _NO_SEED)
-        if generator is None:
-            # Resolved earlier: this request has no seed.
-            return None
-        if generator is not _NO_SEED and generator.device == device:
-            return generator
-        resolve_seed = getattr(self.model, "get_mtp_seed", None)
-        seed = resolve_seed(sampling_params) if resolve_seed is not None else None
-        if seed is None:
-            cache[req_id] = None
-            return None
-        generator = cache.get(req_id)
-        if generator is None or generator.device != device:
-            generator = torch.Generator(device=device)
-            generator.manual_seed(seed)
-            cache[req_id] = generator
-        self._mtp_seeded.add(req_id)
-        return generator
-
-    def _prepare_mtp_sample_uniforms(
-        self,
-        generators: list[torch.Generator | None],
-        num_tokens: int,
-    ) -> torch.Tensor | None:
-        sample_uniforms = self._mtp_sample_uniforms
-        if sample_uniforms is None:
-            return None
-        bsz = len(generators)
-        if not 0 < bsz <= num_tokens <= sample_uniforms.shape[0]:
-            raise ValueError(
-                f"invalid Talker-MTP sampling buffer shape: bsz={bsz} num_tokens={num_tokens} "
-                f"capacity={sample_uniforms.shape[0]}"
-            )
-
-        active = sample_uniforms[:bsz]
-        if any(generator is not None for generator in generators):
-            # Consume one request-local stream for the whole residual span so the
-            # outer MTP graph can treat sampling noise as a stable tensor input.
-            # The draw granularity differs from the legacy per-step path, but
-            # request-local determinism and batch-order independence are kept.
-            for row, generator in enumerate(generators):
-                active[row : row + 1].uniform_(1e-20, 1.0 - 1e-20, generator=generator)
-            if num_tokens > bsz:
-                sample_uniforms[bsz:num_tokens].uniform_(1e-20, 1.0 - 1e-20)
-        else:
-            # Active and graph-padding rows in one draw.
-            sample_uniforms[:num_tokens].uniform_(1e-20, 1.0 - 1e-20)
-        return sample_uniforms[:num_tokens]
-
-    def _call_mtp_with_sampling(
-        self,
-        batch_ids: torch.Tensor,
-        batch_emb: torch.Tensor,
-        batch_hidden: torch.Tensor,
-        batch_step: torch.Tensor,
-        *,
-        buffers: list[dict[str, Any]],
-        req_ids: list[str],
-        generators: list[torch.Generator | None],
-        sample_uniforms: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        if sample_uniforms is None:
-            kwargs = self._get_mtp_sampling_kwargs(buffers, req_ids, generators)
-        else:
-            kwargs = self._get_mtp_base_sampling_kwargs()
-            kwargs["sample_uniforms"] = sample_uniforms
-            if getattr(self.model, "mtp_accepts_req_infos", False):
-                kwargs["req_ids"] = req_ids
-                kwargs["req_infos"] = buffers
-
-        if (
-            len(req_ids) > 1
-            and "generators" in kwargs
-            and "sample_uniforms" not in kwargs
-            and not getattr(self.model, "mtp_accepts_per_row_generators", False)
-        ):
-            emb_chunks = []
-            code_chunks = []
-            for row, (req_id, buffer, generator) in enumerate(zip(req_ids, buffers, generators, strict=True)):
-                row_kwargs = self._get_mtp_sampling_kwargs(
-                    [buffer],
-                    [req_id],
-                    [generator],
-                )
-                row_emb, row_codes = self._call_mtp_runner(
-                    batch_ids[row : row + 1],
-                    batch_emb[row : row + 1],
-                    batch_hidden[row : row + 1],
-                    batch_step[row : row + 1],
-                    **row_kwargs,
-                )
-                emb_chunks.append(row_emb)
-                if row_codes is not None:
-                    code_chunks.append(row_codes)
-            new_emb = torch.cat(emb_chunks)
-            codes = torch.cat(code_chunks) if code_chunks else None
-            return new_emb, codes
-
-        return self._call_mtp_runner(
-            batch_ids,
-            batch_emb,
-            batch_hidden,
-            batch_step,
-            **kwargs,
-        )
-
-    def _call_mtp_runner(
-        self,
-        input_ids: torch.Tensor,
-        input_embeds: torch.Tensor,
-        last_hidden: torch.Tensor,
-        text_step: torch.Tensor,
-        **kwargs: Any,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        # Explicit generators are request state, while the outer whole-MTP
-        # graph owns one captured RNG stream. Keep the transformer/code-
-        # predictor graphs, but call the raw MTP function so per-row streams
-        # remain deterministic and independent of scheduler batch makeup.
-        has_explicit_generator = kwargs.get("generator") is not None or kwargs.get("generators") is not None
-        runner = self.model.mtp if has_explicit_generator else getattr(self, "_mtp_runner", None)
-        runner = runner or self.model.mtp
-        return runner(input_ids, input_embeds, last_hidden, text_step, **kwargs)
-
     # ------------------------------------------------------------------
     # Post-forward: per-request postprocess
     # ------------------------------------------------------------------
@@ -1499,7 +934,7 @@ class OmniModelState(DefaultModelState):
         """
         if not self.has_postprocess:
             return
-        if self._eager_fastpath and not getattr(self.model, "eager_frames_need_postprocess", True):
+        if self._has_mtp and not getattr(self.model, "eager_frames_need_postprocess", True):
             # The last hidden it stores only fed the deferred decode MTP.
             return
         gpu_keys: set[str] = getattr(self.model, "gpu_resident_buffer_keys", set())

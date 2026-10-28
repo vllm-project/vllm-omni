@@ -22,6 +22,7 @@ from vllm.logger import init_logger
 from vllm.renderers import BaseRenderer
 from vllm.v1.engine.input_processor import InputProcessor
 
+from vllm_omni.config import WatermarkConfig
 from vllm_omni.config.config_factory import StageConfigFactory, with_trust_remote_code_override
 from vllm_omni.config.omni_config import StageConfigType
 from vllm_omni.config.resolver import OmniConfigResolution, resolve_omni_config
@@ -125,6 +126,7 @@ class OmniEngineBase:
     _enable_orch_monitor: bool = False
     _client_config: OmniClientConfig | None = None
     _output_sink: OutputQueueSink | None = None
+    _watermark_config: WatermarkConfig | None = None
 
     def __init__(
         self,
@@ -136,6 +138,7 @@ class OmniEngineBase:
         prom_metrics: Any = None,
         log_stats: bool = False,
         collect_stage_metrics: bool = True,
+        watermark_config: WatermarkConfig | None = None,
         tokenizer: str | None = None,
         trust_remote_code: bool | None = None,
         client_config: OmniClientConfig | None = None,
@@ -158,6 +161,7 @@ class OmniEngineBase:
         # --log-stats CLI flag set by the user via OmniBase.
         self._log_stats = log_stats
         self._collect_stage_metrics = collect_stage_metrics
+        self._watermark_config = watermark_config
         self._enable_orch_monitor = bool(kwargs.pop("enable_orch_monitor", False))
         self._client_config = client_config
 
@@ -408,6 +412,7 @@ class OmniEngineBase:
             request_queue=self.request_queue,
             log_stats=self._log_stats,
             client_config=self._client_config,
+            watermark_config=self._watermark_config,
         )
         self._runtime.initialize()
 

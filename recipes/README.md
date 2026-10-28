@@ -92,6 +92,7 @@ for RTX 4090, RTX 5090, DGX Spark, and RTX PRO 6000 Blackwell.
 | [`mistralai/Voxtral-TTS.md`](./mistralai/Voxtral-TTS.md) | Online serving for TTS | 1x RTX 4090 24GB |
 | [`Robbyant/LingBot-Video.md`](./Robbyant/LingBot-Video.md) | Native dense and MoE text-to-video serving | Dense: 1x L20X; MoE: 1x L20X (~67.7 GiB peak) |
 | [`SandAI/MAGI-2-preview-L20X.md`](./SandAI/MAGI-2-preview-L20X.md) | Native Preview-stage text/image-to-video-and-audio generation | 1x/4x NVIDIA L20X 140 GiB qualified |
+| [`SandAI/MAGI-2-preview-NPU.md`](./SandAI/MAGI-2-preview-NPU.md) | Online Preview-stage T2VA at 272p | 4x NPU, 112 GiB each; TP1/SP4 eager |
 | [`Robbyant/LingBot-World-2.0.md`](./Robbyant/LingBot-World-2.0.md) | Offline and experimental realtime interactive world generation | 1x H200/B200 or 2x B200 for TP=2 |
 | [`TaoLiveAIGC/TaoMate-H3.md`](./TaoLiveAIGC/TaoMate-H3.md) | Realtime streaming presenter: MiniMax-H3 + TaoMate LoRA on the AR-Diffusion runtime | 2x H200-class FP8 (USP2) or 4x BF16 (USP4) |
 | [`cosmos3/Cosmos3-Nano.md`](./cosmos3/Cosmos3-Nano.md) | Text-to-image, text-to-video, image-to-video, video-to-video generation, text to video with sound, action policy | 1x H200 141GB / B300 |
