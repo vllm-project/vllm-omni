@@ -110,37 +110,30 @@ Startup also captures the encoder graphs once for profiling and again for
 serving. Check the startup log for the graph reserve and available KV cache;
 explicit KV cache sizing bypasses this automatic reserve.
 
-The following reference measurements used 4×A100-SXM4-80GB with TP=4,
-vLLM 0.31.0,
-PyTorch 2.13.0, CUDA 13.0, Instruct revision `2ec2c78`,
-`gpu_memory_utilization: 0.75`, and `max_num_batched_tokens: 32768` for a
-single-concurrency image-to-text workload. These measurements predate the
-vLLM 0.32 update.
+Reference measurements used 4×A100-SXM4-80GB, TP=4, DP=1, BF16, vLLM 0.32.0,
+Instruct revision `2ec2c78`, and Omni base `ee37ec0` with this patch applied.
+Communication used the defaults, with encoder TP mode `weights`, one
+concurrent request, prefix caching disabled,
+`gpu_memory_utilization: 0.75`, and `max_num_batched_tokens: 32768`.
 
-| Encoder graph configuration | Encoder graphs | Total graph reserve per GPU | Available KV cache per GPU | Startup |
-| --- | ---: | ---: | ---: | ---: |
-| Disabled | 0 | 0.07 GiB | 13.00 GiB | 258 s |
-| SigLIP2 only | 2 | 0.17 GiB | 12.90 GiB | 249 s |
+With these settings, SigLIP2 graphs saved about 8.5 ms in median single image
+encoding time in both runs (rank 0, including eager VAE). Two image inputs
+showed no consistent benefit, and a repeatable end-to-end speedup was not
+established.
 
-The reserve is the graph memory estimate used for automatic KV cache sizing;
-it includes decoder graphs and is not total process memory. SigLIP2-only adds
-102 MiB per GPU over disabled. Startup was measured once per configuration
-with fresh compilation caches, excluding setup and model download.
+| Encoder graph configuration | Encoder graphs | Total graph reserve per GPU | Available KV cache per GPU |
+| --- | ---: | ---: | ---: |
+| Disabled | 0 | 70 MiB | 13.00 GiB |
+| SigLIP2 only | 2 | 172 MiB | 12.90 GiB |
 
-Median whole-request latency, in milliseconds:
+The extra graph reserve is 102 MiB per GPU. The total reserve includes decoder
+graphs and is used for automatic KV cache sizing; it is not peak process
+memory. Each startup captured the encoder graphs twice, taking about 0.07 s
+per pass on rank 0 in this setup.
 
-| Input | Disabled | SigLIP2 only |
-| --- | ---: | ---: |
-| One image | 1007.50 | 1000.16 |
-| Two images, same dimensions | 2058.56 | 2043.81 |
-| Two images, different dimensions | 2056.93 | 2041.98 |
-
-Each case used three rounds of two warmups and ten measured requests, with
-one output token per request and prefix caching disabled. HTTP timing was
-separate from synchronized encoder diagnostics. SigLIP2-only request medians
-were about 0.7% lower than disabled. Configurations ran sequentially, so small
-differences can include run-to-run variation. Benchmark your workload before
-enabling encoder graphs.
+Full measurements and validation limits are in
+[#8437](https://github.com/vllm-project/vllm-omni/pull/8437).
+Benchmark your workload before enabling encoder graphs.
 
 ### Shared T2I/IT2I offline examples
 
