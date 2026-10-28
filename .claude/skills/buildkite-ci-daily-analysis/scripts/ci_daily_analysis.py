@@ -1666,7 +1666,7 @@ def collect_latest_jobs(
 # ── HTML rendering ───────────────────────────────────────────────────────
 
 
-def _summary_cards(records: list[JobRecord]) -> list[dict]:
+def _summary_cards(records: list[JobRecord], date_str: str) -> list[dict]:
     n = len(records)
     passed = sum(1 for r in records if r.bucket == STATE_PASSED)
     failed = sum(1 for r in records if r.bucket == STATE_FAILED)
@@ -1677,7 +1677,7 @@ def _summary_cards(records: list[JobRecord]) -> list[dict]:
     sr_str = f"{sr:.1f}%" if sr is not None else "N/A"
     avg_dur_str = format_duration(avg_dur) if avg_dur is not None else "N/A"
     return [
-        {"title": "Total Jobs", "value": str(n), "detail": "all pipelines · today CST", "icon": ICON_JOBS},
+        {"title": "Total Jobs", "value": str(n), "detail": f"all pipelines · {date_str} CST", "icon": ICON_JOBS},
         {
             "title": "Passed",
             "value": str(passed),
@@ -2222,7 +2222,7 @@ def render_html(
                      Per-Pipeline Aggregate, prominently showing the
                      duration of the most recent matching build.
     """
-    cards = _summary_cards(records)
+    cards = _summary_cards(records, date_str)
     pipelines_listed = sorted(pipelines)
     branches_listed = sorted({r.branch for r in records})
     # Counts for the filter dropdowns — server-side so the dropdowns are
@@ -2523,7 +2523,7 @@ def render_markdown(records: list[JobRecord], date_str: str) -> str:
     lines: list[str] = []
     lines.append(f"# Buildkite Daily Job Analysis ({date_str} CST, UTC+8)")
     lines.append("")
-    cards = _summary_cards(records)
+    cards = _summary_cards(records, date_str)
     for c in cards:
         lines.append(f"- **{c['title']}**: {c['value']} ({c['detail']})")
     lines.append("")
