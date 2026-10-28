@@ -451,6 +451,12 @@ class OmniServeCommand(CLISubcommand):
             help="Path to a deploy config YAML (new format with stages/engine_args).",
         )
         omni_config_group.add_argument(
+            "--duplex-engine-backend",
+            choices=["thread", "process"],
+            default="thread",
+            help="Duplex runtime placement. Process isolates the frontend GIL and serves sessions only.",
+        )
+        omni_config_group.add_argument(
             "--strategy-config",
             type=str,
             default=None,

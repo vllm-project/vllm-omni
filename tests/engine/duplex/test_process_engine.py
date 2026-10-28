@@ -19,7 +19,12 @@ from vllm_omni.engine.duplex.config import DuplexCapabilities, DuplexSessionConf
 from vllm_omni.engine.duplex.delivery import DuplexOutputBuffer
 from vllm_omni.engine.duplex.events import AudioDelta, OutputAudioCleared, SessionClosed, SessionCreated
 from vllm_omni.engine.duplex.messages import DuplexControlResultMessage, DuplexSessionError, DuplexSessionEventMessage
-from vllm_omni.engine.duplex.process_engine import _QUEUE_BYTES, ProcessDuplexEngineClient, _BatchedSocket
+from vllm_omni.engine.duplex.process_engine import (
+    _QUEUE_BYTES,
+    ProcessDuplexEngineClient,
+    ProcessDuplexStageMetadata,
+    _BatchedSocket,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -30,6 +35,8 @@ class FakeEngine:
             max_pending_output_events_per_session=2 if small_buffers else 512,
         )
         self.duplex_capabilities = DuplexCapabilities(supports_chat_completions=True, supports_session_resume=True)
+        self.stage_configs = [ProcessDuplexStageMetadata(i, "llm", {"max_model_len": 2048}) for i in range(4)]
+        self.stage_vllm_configs = [None] * 4
         self.num_stages = 4  # Not restricted to Moshi's two/three-stage deployments.
         self.config_path = None
         self.endpoint_restrictions = ()
