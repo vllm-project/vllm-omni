@@ -150,6 +150,67 @@ def test_setup_compile_hook_is_class_private() -> None:
     assert "setup_compile" not in vars(Wan22Pipeline)
 
 
+@pytest.mark.cpu
+def test_setup_compile_hook_attaches_only_with_the_opt_in(monkeypatch, tmp_path) -> None:
+    """Instance-level attachment: the hook exists only when the cache is enabled.
+
+    Goes through the real ``__init__`` with stubbed components (same recipe as
+    the stage-runtime constructor test), so the runner's attribute-presence
+    dispatch keeps the ordinary torch.compile on the default path.
+    """
+    import json
+    from types import SimpleNamespace
+
+    from vllm_omni.config.stage_config import DiffusionStageRole as Role
+    from vllm_omni.diffusion.models.wan2_2 import pipeline_wan2_2 as wan_module
+    from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import Wan22Pipeline
+
+    (tmp_path / "model_index.json").write_text(json.dumps({"expand_timesteps": False}))
+    (tmp_path / "transformer").mkdir()
+    (tmp_path / "transformer" / "config.json").write_text(json.dumps({"patch_size": [1, 2, 2]}))
+
+    class VAE(torch.nn.Module):
+        retain_stage_components = wan_module.DistributedAutoencoderKLWan.retain_stage_components
+
+        def clear_cache(self):
+            pass
+
+    def load(_loader, _model, **kwargs):
+        return VAE() if kwargs["subfolder"] == "vae" else torch.nn.Linear(1, 1)
+
+    def transformer(self, config, *, component):
+        module = torch.nn.Linear(1, 1)
+        module.config = SimpleNamespace(patch_size=(1, 2, 2))
+        return module
+
+    monkeypatch.setattr(wan_module, "get_local_device", lambda: torch.device("cpu"))
+    monkeypatch.setattr(wan_module, "prefetch_subfolders", lambda *args, **kwargs: None)
+    monkeypatch.setattr(wan_module, "from_pretrained_with_prefetch", load)
+    monkeypatch.setattr(wan_module, "load_wan_vae_scale_factors", lambda *args: (4, 8))
+    monkeypatch.setattr(Wan22Pipeline, "_create_transformer", transformer)
+    monkeypatch.setattr(Wan22Pipeline, "setup_diffusion_pipeline_profiler", lambda *args, **kwargs: None)
+
+    def make(model_config):
+        return Wan22Pipeline(
+            od_config=SimpleNamespace(
+                model=str(tmp_path),
+                stage_role=Role.FULL,
+                dtype=torch.float32,
+                boundary_ratio=None,
+                flow_shift=None,
+                enable_diffusion_pipeline_profiler=False,
+                enforce_eager=False,
+                model_config=model_config,
+            )
+        )
+
+    assert not hasattr(make({}), "setup_compile")
+    assert not hasattr(make({"wan22_dit_cudagraph": False}), "setup_compile")
+    enabled = make({"wan22_dit_cudagraph": True})
+    assert hasattr(enabled, "setup_compile")
+    assert callable(enabled.setup_compile)
+
+
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph replay requires CUDA")
 def test_graph_replay_matches_eager_with_fp32_timestep() -> None:
