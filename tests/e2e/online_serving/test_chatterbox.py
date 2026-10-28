@@ -61,6 +61,10 @@ def test_streaming_concurrent_audio(omni_server, online_client, response_format)
             # so it sits below each range. PCM content is checked separately.
             "min_hnr_db": -3.0 if omni_server.model == "ResembleAI/chatterbox" else -1.0,
             "transcript_pcm_sample_rate": 24000,
+            # whisper-small heard "perfect" as "Herfit" in one of these streams
+            # (similarity 0.888) where large-v3 transcribes the same clip
+            # exactly; re-verify a failed match before failing.
+            "transcript_escalation_model": "large-v3",
             "timeout": 300.0,
         },
         request_num=4,
