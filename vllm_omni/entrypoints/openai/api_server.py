@@ -22,7 +22,6 @@ from argparse import Namespace
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
 from http import HTTPStatus
-from pathlib import Path
 from typing import Annotated, Any, Literal
 
 import torch
@@ -613,7 +612,11 @@ async def build_async_omni(
 def _should_serve_duplex(model: str, kwargs: dict[str, Any]) -> bool:
     """Select the serving engine without changing the model's duplex capability."""
     from vllm_omni.config.config_factory import StageConfigFactory
-    from vllm_omni.config.stage_config import _DEPLOY_DIR, resolve_deploy_yaml
+    from vllm_omni.config.stage_config import (
+        get_default_deploy_config_path,
+        resolve_deploy_config_path,
+        resolve_deploy_yaml,
+    )
 
     pipeline_config = StageConfigFactory.get_pipeline_config(
         model=model,
@@ -627,11 +630,9 @@ def _should_serve_duplex(model: str, kwargs: dict[str, Any]) -> bool:
     if deploy_path is None:
         if pipeline_config.default_deploy_config_name is None:
             raise ValueError("A duplex-capable model requires a deploy config with session_mode: turn or duplex")
-        deploy_path = _DEPLOY_DIR / pipeline_config.default_deploy_config_name
+        deploy_path = get_default_deploy_config_path(pipeline_config.default_deploy_config_name)
     else:
-        deploy_path = Path(deploy_path)
-        if not deploy_path.exists() and deploy_path.parent == Path("."):
-            deploy_path = _DEPLOY_DIR / deploy_path
+        deploy_path = resolve_deploy_config_path(deploy_path)
 
     # Resolve base_config too, so the API and stage workers use the same mode.
     session_mode = resolve_deploy_yaml(deploy_path).get(

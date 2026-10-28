@@ -8,7 +8,6 @@ import functools
 import json
 from collections.abc import Iterable, Mapping
 from dataclasses import asdict, dataclass, fields
-from pathlib import Path
 from typing import Any
 
 from transformers import PretrainedConfig
@@ -24,7 +23,6 @@ from vllm_omni.config.omni_config import (
 )
 from vllm_omni.config.pipeline_registry import OMNI_PIPELINES, resolve_pipeline_config
 from vllm_omni.config.stage_config import (
-    _DEPLOY_DIR,
     DeployConfig,
     PipelineConfig,
     StageConfig,
@@ -33,9 +31,11 @@ from vllm_omni.config.stage_config import (
     StagePipelineConfig,
     StageType,
     build_stage_runtime_overrides,
+    get_default_deploy_config_path,
     load_deploy_config,
     merge_pipeline_deploy,
     normalize_pipeline_cli_overrides,
+    resolve_deploy_config_path,
 )
 from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig
 from vllm_omni.diffusion.io_support import get_diffusion_output_type
@@ -368,11 +368,7 @@ class StageConfigFactory:
         """Load an explicit deploy YAML once for resolution and construction."""
         if deploy_config_path is None:
             return None
-        deploy_path = Path(deploy_config_path)
-        if not deploy_path.exists() and deploy_path.parent == Path("."):
-            candidate = _DEPLOY_DIR / deploy_path
-            if candidate.exists():
-                deploy_path = candidate
+        deploy_path = resolve_deploy_config_path(deploy_config_path)
         if not deploy_path.exists():
             raise FileNotFoundError(f"Deploy config not found: {deploy_path}")
         return load_deploy_config(deploy_path)
@@ -406,7 +402,7 @@ class StageConfigFactory:
         # either representation is built.
         if user_deploy_config is None:
             if pipeline_cfg.default_deploy_config_name is not None:
-                default_deploy_path = _DEPLOY_DIR / pipeline_cfg.default_deploy_config_name
+                default_deploy_path = get_default_deploy_config_path(pipeline_cfg.default_deploy_config_name)
                 user_deploy_config = load_deploy_config(default_deploy_path)
                 deploy_config_path = str(default_deploy_path)
             else:
@@ -505,7 +501,7 @@ class StageConfigFactory:
             deploy_cfg = cls._load_user_deploy_config(deploy_config_path)
             assert deploy_cfg is not None
         elif pipeline_cfg.default_deploy_config_name is not None:
-            deploy_cfg = load_deploy_config(_DEPLOY_DIR / pipeline_cfg.default_deploy_config_name)
+            deploy_cfg = load_deploy_config(get_default_deploy_config_path(pipeline_cfg.default_deploy_config_name))
             assert deploy_cfg is not None
         else:
             deploy_cfg = DeployConfig()

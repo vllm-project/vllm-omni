@@ -73,6 +73,11 @@ class OmniPlatform(Platform):
 
     @classmethod
     def get_default_stage_config_path(cls) -> str:
+        """Directory searched before bundled deploy profiles for config names.
+
+        Return an absolute path for plugins installed outside the package.
+        Missing profiles fall back to the bundled deploy directory.
+        """
         raise NotImplementedError
 
     @classmethod

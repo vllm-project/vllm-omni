@@ -27,10 +27,11 @@ from vllm_omni.config.config_factory import StageConfigFactory, with_trust_remot
 from vllm_omni.config.omni_config import StageConfigType
 from vllm_omni.config.resolver import OmniConfigResolution, resolve_omni_config
 from vllm_omni.config.stage_config import (
-    _DEPLOY_DIR,
     DuplexSessionRuntimeConfig,
     PipelineConfig,
+    get_default_deploy_config_path,
     load_deploy_config,
+    resolve_deploy_config_path,
 )
 from vllm_omni.engine.arg_utils import is_frontend_only
 from vllm_omni.engine.async_engine_utils import (
@@ -234,11 +235,9 @@ class OmniEngineBase:
         if deploy_config_source is None and pipeline_config is not None:
             default_name = getattr(pipeline_config, "default_deploy_config_name", None)
             if default_name:
-                deploy_config_source = _DEPLOY_DIR / default_name
-        elif isinstance(deploy_config_source, str) and not Path(deploy_config_source).exists():
-            candidate = _DEPLOY_DIR / deploy_config_source
-            if candidate.exists():
-                deploy_config_source = candidate
+                deploy_config_source = get_default_deploy_config_path(default_name)
+        elif deploy_config_source is not None:
+            deploy_config_source = resolve_deploy_config_path(deploy_config_source)
         if deploy_config_source is not None:
             try:
                 self.deploy_config = load_deploy_config(deploy_config_source)

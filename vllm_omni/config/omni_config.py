@@ -36,7 +36,6 @@ from vllm.model_executor.layers.quantization.base_config import QuantizationConf
 from vllm.pooling_params import PoolingParams
 
 from vllm_omni.config.stage_config import (
-    _DEPLOY_DIR,
     _STAGE_DEPLOY_FIELDS,
     PIPELINE_WIDE_ENGINE_FIELDS,
     DeployConfig,
@@ -52,6 +51,7 @@ from vllm_omni.config.stage_config import (
     _scheduler_path,
     _select_processor_funcs,
     build_stage_runtime_overrides,
+    get_default_deploy_config_path,
     load_deploy_config,
     merge_pipeline_deploy,
     merge_sampling_constraints,
@@ -440,7 +440,7 @@ def _resolve_deploy_path(deploy_config_path: str) -> Path:
         bare_name = deploy_path.name
         if not bare_name.endswith(".yaml"):
             bare_name = f"{bare_name}.yaml"
-        candidate = _DEPLOY_DIR / bare_name
+        candidate = get_default_deploy_config_path(bare_name)
         if candidate.exists():
             return candidate
     return deploy_path
@@ -463,7 +463,7 @@ def _get_deploy_config(
         return load_deploy_config(resolved_path), str(resolved_path)
 
     if pipeline_cfg.default_deploy_config_name is not None:
-        default_path = _DEPLOY_DIR / pipeline_cfg.default_deploy_config_name
+        default_path = get_default_deploy_config_path(pipeline_cfg.default_deploy_config_name)
         return load_deploy_config(default_path), str(default_path)
 
     return DeployConfig(), None
