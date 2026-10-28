@@ -26,11 +26,18 @@ from vllm_omni.model_executor.models.minimax_h3.conditioning import (
 )
 from vllm_omni.model_executor.models.minimax_h3.long_video import max_output_seconds, resolve_long_video_mode
 from vllm_omni.model_executor.models.minimax_h3.preprocessing import (
+    MINIMAX_H3_FPS,
+    MINIMAX_H3_MIN_OUTPUT_SHORT_EDGE,
     MINIMAX_H3_OUTPUT_SHORT_EDGE,
+    MINIMAX_H3_UNLOCK_FPS_ENV,
     load_minimax_h3_images,
+    minimax_h3_fps_unlocked,
     resolve_minimax_h3_aspect_ratio,
     resolve_minimax_h3_output_canvas,
     resolve_minimax_h3_reference_image_shape,
+)
+from vllm_omni.model_executor.models.minimax_h3.reference_video import (
+    MINIMAX_H3_FPS as MINIMAX_H3_REFERENCE_FPS,
 )
 from vllm_omni.model_executor.models.minimax_h3.reference_video import (
     MINIMAX_H3_QWEN_VIDEO_SAMPLE_FPS,
@@ -48,9 +55,10 @@ from vllm_omni.model_executor.models.minimax_h3.timeline_guides import (
     prepare_timeline_guides,
 )
 
-MINIMAX_H3_FPS = 24
 MINIMAX_H3_MIN_OUTPUT_SECONDS = 4.0
 MINIMAX_H3_MAX_OUTPUT_SECONDS = 15.0
+MINIMAX_H3_MIN_OUTPUT_FPS = 1
+MINIMAX_H3_MAX_OUTPUT_FPS = 240
 
 
 def _items(value: Any) -> list[Any]:
@@ -148,6 +156,29 @@ def _validate_reference_image(image: Image.Image) -> None:
     resolve_minimax_h3_reference_image_shape(image)
 
 
+def resolve_minimax_h3_fps(sampling: Any) -> int:
+    """Resolve the request's output frame rate.
+
+    The stock contract pins H3 to 24 fps; ``VLLM_OMNI_MINIMAX_H3_UNLOCK_FPS``
+    lifts that to any integral rate in ``[1, 240]``. Callers that need the
+    generated wall-clock duration must use this rather than the constant.
+    """
+    fps = int(getattr(sampling, "fps", None) or MINIMAX_H3_FPS)
+    if fps == MINIMAX_H3_FPS:
+        return fps
+    if not minimax_h3_fps_unlocked():
+        raise OmniClientError(
+            f"MiniMax H3 output fps is fixed at {MINIMAX_H3_FPS}, got {fps} "
+            f"(set {MINIMAX_H3_UNLOCK_FPS_ENV}=1 to accept "
+            f"[{MINIMAX_H3_MIN_OUTPUT_FPS}, {MINIMAX_H3_MAX_OUTPUT_FPS}])"
+        )
+    if not MINIMAX_H3_MIN_OUTPUT_FPS <= fps <= MINIMAX_H3_MAX_OUTPUT_FPS:
+        raise OmniClientError(
+            f"MiniMax H3 output fps must be in [{MINIMAX_H3_MIN_OUTPUT_FPS}, {MINIMAX_H3_MAX_OUTPUT_FPS}], got {fps}"
+        )
+    return fps
+
+
 def resolve_minimax_h3_shape(
     task: str,
     sampling: Any,
@@ -159,9 +190,7 @@ def resolve_minimax_h3_shape(
         minimax_h3_align_frame_count,
     )
 
-    fps = int(getattr(sampling, "fps", None) or MINIMAX_H3_FPS)
-    if fps != MINIMAX_H3_FPS:
-        raise OmniClientError(f"MiniMax H3 output fps is fixed at {MINIMAX_H3_FPS}")
+    fps = resolve_minimax_h3_fps(sampling)
     extra = sampling.extra_args or {}
     target = extra.get("target")
     if target is not None and not isinstance(target, Mapping):
@@ -203,7 +232,9 @@ def resolve_minimax_h3_shape(
     raw_short_edge = target.get("short_edge", extra.get("short_edge", MINIMAX_H3_OUTPUT_SHORT_EDGE))
     if isinstance(raw_short_edge, bool) or not isinstance(raw_short_edge, (int, np.integer)):
         raise OmniClientError(
-            f"MiniMax H3 target.short_edge must be {MINIMAX_H3_OUTPUT_SHORT_EDGE}, got {raw_short_edge!r}"
+            f"MiniMax H3 target.short_edge must be an integer of "
+            f"{MINIMAX_H3_MIN_OUTPUT_SHORT_EDGE}..{MINIMAX_H3_OUTPUT_SHORT_EDGE} pixels at most, "
+            f"got {raw_short_edge!r}"
         )
     if height is None or width is None:
         height, width = resolve_minimax_h3_output_canvas(aspect_ratio, int(raw_short_edge))
@@ -527,11 +558,16 @@ def prepare_encoder_inputs(
     else:
         raise OmniClientError(f"unsupported MiniMax H3 task {task!r}")
 
+    fps = resolve_minimax_h3_fps(diffusion_sampling_params)
     height, width, num_frames, latent_t, audio_t = resolve_minimax_h3_shape(
         task,
         diffusion_sampling_params,
         raw_images[0] if raw_images else None,
     )
+    # Reference videos live on the fixed 24 fps H3 timeline whatever the output
+    # rate is, so the frame budget that covers the generated wall-clock span is
+    # ``num_frames`` rescaled onto that timeline. At 24 fps this is a no-op.
+    reference_frame_budget = int(round(num_frames * MINIMAX_H3_REFERENCE_FPS / fps))
     source_video = multi_modal_data.get("source_video")
     source_audio = multi_modal_data.get("source_audio")
     raw_video_edit_mask = multi_modal_data.get("video_noise_mask")
@@ -609,7 +645,7 @@ def prepare_encoder_inputs(
                 if prepared_videos is None:
                     prepared_videos = prepare_reference_videos(
                         videos,
-                        target_frame_count=num_frames,
+                        target_frame_count=reference_frame_budget,
                         workdir=workdir,
                         start_time_seconds=extra_args.get("start_time_seconds"),
                     )
@@ -699,13 +735,13 @@ def prepare_encoder_inputs(
             try:
                 waveform, sample_rate = load_video_audio(
                     str(source_video),
-                    duration_seconds=float(num_frames) / MINIMAX_H3_FPS,
+                    duration_seconds=float(num_frames) / fps,
                 )
             except subprocess.CalledProcessError as exc:
                 raise OmniClientError("MiniMax H3 could not decode source_video audio for editing") from exc
         if waveform.ndim not in (1, 2) or int(sample_rate) <= 0:
             raise OmniClientError("MiniMax H3 edit audio requires a waveform and positive sample rate")
-        max_samples = max(1, int(round(float(num_frames) / MINIMAX_H3_FPS * int(sample_rate))))
+        max_samples = max(1, int(round(float(num_frames) / fps * int(sample_rate))))
         waveform = waveform[..., :max_samples].float().contiguous()
         if waveform.shape[-1] == 0:
             raise OmniClientError("MiniMax H3 edit audio must not be empty")
@@ -738,11 +774,12 @@ def prepare_encoder_inputs(
         audio_edit=audio_edit,
         audio_edit_mask=audio_edit_mask,
         timeline_guides=timeline_guides,
+        fps=fps,
     )
     audio_inputs = _effective_audio_inputs(
         media_input.video_audios,
         media_input.audios,
-        max_standalone_seconds=float(media_input.num_frames) / MINIMAX_H3_FPS,
+        max_standalone_seconds=float(media_input.num_frames) / media_input.fps,
     )
     embedded_audio_count = sum(item is not None for item in media_input.video_audios)
     # Video soundtracks and standalone references have separate 15-second budgets.
@@ -845,7 +882,7 @@ def encode_media(
     audio_inputs = _effective_audio_inputs(
         media.video_audios,
         media.audios,
-        max_standalone_seconds=float(media.num_frames) / MINIMAX_H3_FPS,
+        max_standalone_seconds=float(media.num_frames) / media.fps,
     )
     embedded_audio_count = sum(item is not None for item in media.video_audios)
     validate_reference_audio_waveforms([item for item in media.video_audios if item is not None])

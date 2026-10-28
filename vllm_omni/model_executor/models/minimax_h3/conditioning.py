@@ -11,6 +11,8 @@ from typing import Any
 
 import torch
 
+from vllm_omni.model_executor.models.minimax_h3.preprocessing import MINIMAX_H3_FPS
+
 MINIMAX_H3_TEXT_CONDITIONING_SCHEMA = "minimax_h3.text_conditioning/v1"
 MINIMAX_H3_TEXT_HIDDEN_SIZE = 5120
 MINIMAX_H3_PRESENTATION_TASK_KEY = "_minimax_h3_presentation_task"
@@ -405,6 +407,10 @@ class MiniMaxH3EncoderMediaInput:
     audio_edit: tuple[torch.Tensor, int] | None = None
     audio_edit_mask: torch.Tensor | None = None
     timeline_guides: tuple[MiniMaxH3TimelineGuide, ...] = ()
+    # Output frame rate the request was planned at. The encoder stage needs it
+    # to bound reference audio by the generated wall-clock duration, which is
+    # ``num_frames / fps`` rather than ``num_frames / 24``.
+    fps: int = MINIMAX_H3_FPS
 
     @classmethod
     def from_mm_tensors(
@@ -558,6 +564,7 @@ class MiniMaxH3EncoderMediaInput:
             audio_edit=audio_edit,
             audio_edit_mask=audio_edit_mask,
             timeline_guides=tuple(timeline_guides),
+            fps=int(metadata.get("fps", MINIMAX_H3_FPS)),
         )
 
     def to_mm_tensors(self) -> list[torch.Tensor]:
@@ -639,6 +646,7 @@ class MiniMaxH3EncoderMediaInput:
             "video_audio_sample_rates": [item[1] if item is not None else 0 for item in self.video_audios],
             "audio_sample_rates": [sample_rate for _waveform, sample_rate in self.audios],
             "keyframe_frame_indices": list(self.keyframe_frame_indices),
+            "fps": int(self.fps),
         }
         if self.video_edit is not None:
             metadata["has_video_edit"] = True

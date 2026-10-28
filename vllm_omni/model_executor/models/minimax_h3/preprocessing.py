@@ -34,7 +34,9 @@ VIDEO_PAD = "<|video_pad|>"
 _TEXT_TAG = 1
 _VIDEO_TAG = 0
 
+MINIMAX_H3_FPS = 24
 MINIMAX_H3_OUTPUT_SHORT_EDGE = 768
+MINIMAX_H3_MIN_OUTPUT_SHORT_EDGE = 256
 MINIMAX_H3_OUTPUT_MAX_PIXELS = 768 * 1344
 MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE = 32
 MINIMAX_H3_SUPPORTED_ASPECT_RATIOS = {
@@ -48,9 +50,32 @@ MINIMAX_H3_SUPPORTED_ASPECT_RATIOS = {
 MINIMAX_H3_MAX_REFERENCE_IMAGE_BYTES = 30 * 1024 * 1024
 MINIMAX_H3_REFERENCE_IMAGE_FORMATS = frozenset({"jpeg", "png", "webp"})
 
+# Escape hatches for the two output-geometry values the stock H3 contract
+# pins. Both default off, so an untouched server keeps rejecting every short
+# edge but 768 and every frame rate but 24.
+MINIMAX_H3_UNLOCK_SHORT_EDGE_ENV = "VLLM_OMNI_MINIMAX_H3_UNLOCK_SHORT_EDGE"
+MINIMAX_H3_UNLOCK_FPS_ENV = "VLLM_OMNI_MINIMAX_H3_UNLOCK_FPS"
+
 
 def _align_multiple(value: float, multiple: int = 32) -> int:
     return max(multiple, int(round(float(value) / multiple)) * multiple)
+
+
+def _unlock_enabled(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def minimax_h3_short_edge_unlocked() -> bool:
+    """Whether ``target.short_edge`` may leave the fixed 768.
+
+    Off by default: the stock contract still accepts exactly one short edge.
+    """
+    return _unlock_enabled(MINIMAX_H3_UNLOCK_SHORT_EDGE_ENV)
+
+
+def minimax_h3_fps_unlocked() -> bool:
+    """Whether the output frame rate may leave the fixed 24."""
+    return _unlock_enabled(MINIMAX_H3_UNLOCK_FPS_ENV)
 
 
 def load_minimax_h3_images(value: Any) -> list[Image.Image]:
@@ -160,11 +185,26 @@ def resolve_minimax_h3_reference_image_shape(
 
 
 def resolve_minimax_h3_output_canvas(aspect_ratio: float, short_edge: int) -> tuple[int, int]:
-    """Resolve the official H3 ratio/area policy to a 32-pixel canvas."""
+    """Resolve the official H3 ratio/area policy to a 32-pixel canvas.
+
+    The result always lands on the 32-pixel grid the DiT packing requires, so
+    a short edge that is not a multiple of 32 (720, for instance) snaps to the
+    nearest grid line rather than being honoured exactly.
+    """
     if not math.isfinite(float(aspect_ratio)) or float(aspect_ratio) <= 0:
         raise OmniClientError(f"MiniMax H3 canvas aspect ratio must be positive, got {aspect_ratio!r}")
     if short_edge != MINIMAX_H3_OUTPUT_SHORT_EDGE:
-        raise OmniClientError(f"MiniMax H3 target.short_edge must be {MINIMAX_H3_OUTPUT_SHORT_EDGE}, got {short_edge}")
+        if not minimax_h3_short_edge_unlocked():
+            raise OmniClientError(
+                f"MiniMax H3 target.short_edge must be {MINIMAX_H3_OUTPUT_SHORT_EDGE}, got {short_edge} "
+                f"(set {MINIMAX_H3_UNLOCK_SHORT_EDGE_ENV}=1 to accept "
+                f"[{MINIMAX_H3_MIN_OUTPUT_SHORT_EDGE}, {MINIMAX_H3_OUTPUT_SHORT_EDGE}])"
+            )
+        if not MINIMAX_H3_MIN_OUTPUT_SHORT_EDGE <= short_edge <= MINIMAX_H3_OUTPUT_SHORT_EDGE:
+            raise OmniClientError(
+                f"MiniMax H3 target.short_edge must be in "
+                f"[{MINIMAX_H3_MIN_OUTPUT_SHORT_EDGE}, {MINIMAX_H3_OUTPUT_SHORT_EDGE}], got {short_edge}"
+            )
     if aspect_ratio >= 1.0:
         width = float(short_edge) * aspect_ratio
         height = float(short_edge)
@@ -487,15 +527,21 @@ def build_minimax_h3_presentation(
 
 __all__ = [
     "IMAGE_PAD",
+    "MINIMAX_H3_FPS",
+    "MINIMAX_H3_MIN_OUTPUT_SHORT_EDGE",
     "MINIMAX_H3_OUTPUT_SHORT_EDGE",
+    "MINIMAX_H3_UNLOCK_FPS_ENV",
+    "MINIMAX_H3_UNLOCK_SHORT_EDGE_ENV",
     "VIDEO_PAD",
     "VISION_END",
     "VISION_START",
     "build_minimax_h3_presentation",
     "load_minimax_h3_images",
+    "minimax_h3_fps_unlocked",
     "minimax_h3_multi_image_presentation",
     "minimax_h3_ref2va_presentation",
     "minimax_h3_ref2va_video_presentation",
+    "minimax_h3_short_edge_unlocked",
     "minimax_h3_text_only_ids",
     "resolve_minimax_h3_aspect_ratio",
     "resolve_minimax_h3_output_canvas",

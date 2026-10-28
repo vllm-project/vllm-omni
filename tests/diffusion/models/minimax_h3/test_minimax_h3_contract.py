@@ -1721,6 +1721,53 @@ def test_reference_image_resize_rejects_invalid_input():
         resolve_minimax_h3_reference_image_shape(Image.new("RGB", (128, 128)))
 
 
+def test_short_edge_unlock_contract(monkeypatch):
+    from vllm_omni.errors import OmniClientError
+    from vllm_omni.model_executor.models.minimax_h3.preprocessing import (
+        MINIMAX_H3_UNLOCK_SHORT_EDGE_ENV,
+        resolve_minimax_h3_output_canvas,
+    )
+
+    monkeypatch.delenv(MINIMAX_H3_UNLOCK_SHORT_EDGE_ENV, raising=False)
+    with pytest.raises(OmniClientError, match="target.short_edge must be 768"):
+        resolve_minimax_h3_output_canvas(16 / 9, 720)
+    assert resolve_minimax_h3_output_canvas(16 / 9, 768) == (768, 1344)
+
+    monkeypatch.setenv(MINIMAX_H3_UNLOCK_SHORT_EDGE_ENV, "1")
+    # 720 snaps to the 32-pixel grid the DiT packing requires.
+    assert resolve_minimax_h3_output_canvas(16 / 9, 720) == (704, 1280)
+    assert resolve_minimax_h3_output_canvas(4 / 3, 640) == (640, 864)
+    with pytest.raises(OmniClientError, match=r"must be in \[256, 768\]"):
+        resolve_minimax_h3_output_canvas(16 / 9, 1280)
+    with pytest.raises(OmniClientError, match=r"must be in \[256, 768\]"):
+        resolve_minimax_h3_output_canvas(16 / 9, 255)
+
+
+def test_fps_unlock_contract(monkeypatch):
+    from vllm_omni.errors import OmniClientError
+    from vllm_omni.model_executor.models.minimax_h3.encoder_processing import (
+        resolve_minimax_h3_fps,
+    )
+    from vllm_omni.model_executor.models.minimax_h3.preprocessing import (
+        MINIMAX_H3_UNLOCK_FPS_ENV,
+    )
+
+    monkeypatch.delenv(MINIMAX_H3_UNLOCK_FPS_ENV, raising=False)
+    assert resolve_minimax_h3_fps(SimpleNamespace(fps=24)) == 24
+    assert resolve_minimax_h3_fps(SimpleNamespace(fps=None)) == 24
+    with pytest.raises(OmniClientError, match="output fps is fixed at 24"):
+        resolve_minimax_h3_fps(SimpleNamespace(fps=15))
+
+    monkeypatch.setenv(MINIMAX_H3_UNLOCK_FPS_ENV, "1")
+    assert resolve_minimax_h3_fps(SimpleNamespace(fps=15)) == 15
+    # 0 is the unset sentinel carried by some callers, so it keeps the default.
+    assert resolve_minimax_h3_fps(SimpleNamespace(fps=0)) == 24
+    with pytest.raises(OmniClientError, match=r"must be in \[1, 240\]"):
+        resolve_minimax_h3_fps(SimpleNamespace(fps=-1))
+    with pytest.raises(OmniClientError, match=r"must be in \[1, 240\]"):
+        resolve_minimax_h3_fps(SimpleNamespace(fps=241))
+
+
 def test_fl2va_supports_first_last_and_explicit_frame_index_contracts():
     from vllm_omni.model_executor.models.minimax_h3.encoder_processing import (
         _resolve_fl2va_keyframe_indices,

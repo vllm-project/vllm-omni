@@ -140,6 +140,17 @@ settings.
 Omni-owned variable, even though vLLM-Omni supplies a persistent default when
 it is unset.
 
+### MiniMax-H3 output geometry
+
+The stock H3 contract pins `target.short_edge` to 768 and the output frame rate
+to 24. These escape hatches lift those two limits; both are off by default, so
+an untouched server keeps rejecting every other short edge and frame rate.
+
+| Name | Type and default | Applies to and read time | Precedence and invalid values | Lifecycle |
+| --- | --- | --- | --- | --- |
+| `VLLM_OMNI_MINIMAX_H3_UNLOCK_SHORT_EDGE` | Boolean truthy spellings: `1`, `true`, `yes`, `on`; default false | MiniMax-H3 target canvas; read when the request's output canvas is resolved | Environment-only. Any other value means false. When enabled, `target.short_edge` must be in `[256, 768]`; the canvas still snaps to the 32-pixel grid the DiT packing requires, so a 720 short edge resolves to 1280x704. Out-of-range values raise `OmniClientError`. | Experimental |
+| `VLLM_OMNI_MINIMAX_H3_UNLOCK_FPS` | Boolean truthy spellings: `1`, `true`, `yes`, `on`; default false | MiniMax-H3 output frame rate and every consumer of the generated wall-clock duration (reference audio trimming, reference-video frame budget, muxer rate); read when sampling parameters are resolved | Environment-only. Any other value means false. When enabled, the request fps must be an integer in `[1, 240]`; frames stay on the 17n+5 grid, so 5 s at 15 fps emits 90 frames (6.0 s). Invalid rates raise `OmniClientError`. | Experimental |
+
 ### Torch compilation
 
 | Name | Type and default | Applies to and read time | Precedence and invalid values | Lifecycle |

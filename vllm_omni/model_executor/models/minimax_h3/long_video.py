@@ -30,10 +30,19 @@ def max_output_seconds(extra: Mapping[str, Any], task: str) -> float:
     return MINIMAX_H3_MAX_CONTINUATION_SECONDS if mode == "continuation" else MINIMAX_H3_MAX_FULL_SECONDS
 
 
-def validate_encoded_frame_limit(extra: Mapping[str, Any], task: str, num_frames: int) -> None:
-    """Apply the same cap to externally encoded requests, allowing grid rounding."""
+def validate_encoded_frame_limit(
+    extra: Mapping[str, Any],
+    task: str,
+    num_frames: int,
+    fps: int = 24,
+) -> None:
+    """Apply the same cap to externally encoded requests, allowing grid rounding.
+
+    ``fps`` is the request's output frame rate: the cap is a duration, so the
+    frame budget it implies grows with the rate.
+    """
     seconds = max_output_seconds(extra, task)
-    requested_max = int(seconds * 24)
+    requested_max = int(seconds * fps)
     aligned_max = ((requested_max - 5 + 16) // 17) * 17 + 5
     if num_frames > aligned_max:
         raise OmniClientError(
