@@ -207,6 +207,16 @@ def test_integration_autodetect_from_transformer_config():
     assert od_config.quantization_config.weight_bits == 4
 
 
+def test_remap_regex_key_handles_none_prefix_target():
+    """Regex remapping should tolerate checkpoint prefixes dropped by the mapper."""
+    from vllm_omni.quantization.inc_config import _remap_regex_key
+
+    prefix_map = {"gen_vae.": None, "model.": "language_model."}
+    key = r"model\.layers\.\d+"
+
+    assert _remap_regex_key(key, prefix_map) == r"language_model\.layers\.\d+"
+
+
 def test_mxfp_flattened_finalize_runs_once():
     from torch import nn
 

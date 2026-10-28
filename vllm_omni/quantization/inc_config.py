@@ -70,7 +70,7 @@ def _is_regex_key(key: str) -> bool:
 def _remap_regex_key(key: str, prefix_map: dict[str, str]) -> str:
     """Remap a checkpoint prefix in a regex key in either dot style."""
     for source in sorted(prefix_map, key=len, reverse=True):
-        target = prefix_map[source]
+        target = prefix_map[source] or ""
         for source_form, target_form in (
             (source, target),
             (re.escape(source), re.escape(target)),
