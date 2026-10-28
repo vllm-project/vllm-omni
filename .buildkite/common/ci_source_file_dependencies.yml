@@ -265,6 +265,19 @@ source_file_dependencies:
 
   # --- models ---
   # --- omni / tts jobs ---
+  omni_mammoth_moda2_int8:
+    - tests/e2e/offline_inference/test_mammoth_moda2_int8_quantization.py
+    - tests/model_executor/models/mammoth_moda2/
+    - vllm_omni/model_executor/models/mammoth_moda2/
+    - vllm_omni/model_executor/stage_input_processors/mammoth_moda2.py
+    - vllm_omni/diffusion/models/mammoth_moda2/
+    - vllm_omni/diffusion/utils/image_output.py
+    - vllm_omni/model_extras/mammothmodal2_preview.py
+    - vllm_omni/tokenizers/mammoth_moda2_tokenizer.py
+    - vllm_omni/transformers_utils/configs/mammoth_moda2.py
+    - vllm_omni/deploy/mammoth_moda2.yaml
+    - vllm_omni/deploy/mammoth_moda2_ar.yaml
+
   entrypoints_function:
     - tests/entrypoints/
     - vllm_omni/entrypoints/

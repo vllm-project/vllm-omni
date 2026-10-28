@@ -494,6 +494,39 @@ def _iter_steps(doc: dict):
 
 
 @pytest.mark.parametrize(
+    "changed_file,selected",
+    [
+        ("tests/e2e/offline_inference/test_mammoth_moda2_int8_quantization.py", True),
+        ("vllm_omni/model_executor/models/mammoth_moda2/mammoth_moda2.py", True),
+        ("vllm_omni/model_executor/stage_input_processors/mammoth_moda2.py", True),
+        ("vllm_omni/diffusion/models/mammoth_moda2/mammothmoda2_dit_model.py", True),
+        ("vllm_omni/deploy/mammoth_moda2.yaml", True),
+        ("vllm_omni/deploy/mammoth_moda2_ar.yaml", True),
+        ("vllm_omni/model_executor/models/qwen3_tts/qwen3_tts.py", False),
+        ("vllm_omni/diffusion/models/wan2_2/wan2_2.py", False),
+        (None, True),
+    ],
+)
+def test_mammoth_moda2_int8_weekly_pipeline_selection(
+    monkeypatch: pytest.MonkeyPatch,
+    changed_file: str | None,
+    selected: bool,
+) -> None:
+    """Scope PR-label runs to MammothModa2 while preserving full weekly runs."""
+    monkeypatch.setattr("upload_pipeline._get_mirror_hw_selector", lambda: "")
+    _load_source_file_dependencies.cache_clear()
+    pipeline_path = Path(".buildkite/cuda/test-weekly.yml")
+    doc = yaml.safe_load(pipeline_path.read_text(encoding="utf-8"))
+    rendered = _render_test_pipeline(
+        doc,
+        changed_files=[changed_file] if changed_file is not None else None,
+        pipeline_path=pipeline_path,
+    )
+    keys = {step.get("key") for step in _iter_steps(rendered)}
+    assert ("weekly-mammoth-moda2-int8" in keys) is selected
+
+
+@pytest.mark.parametrize(
     "pipeline_path,legacy_keys,seed_tts_key",
     [
         (
