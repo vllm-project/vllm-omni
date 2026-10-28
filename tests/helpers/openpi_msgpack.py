@@ -3,8 +3,9 @@
 """OpenPI client NumPy msgpack codec.
 
 Standalone copy of the wire format in Physical-Intelligence/openpi
-``packages/openpi-client/src/openpi_client/msgpack_numpy.py``. PyPI
-``openpi-client`` pins ``numpy<2``, so weekly CI cannot install that package.
+``packages/openpi-client/src/openpi_client/msgpack_numpy.py`` at
+``231a1cf7caddaae1d0ed1b4956a55de332feb27e``. PyPI ``openpi-client`` pins
+``numpy<2``, so weekly CI cannot install that package.
 
 This module must stay independent of
 ``vllm_omni.entrypoints.openpi.connection`` ``_pack`` / ``_unpack``. Calling
