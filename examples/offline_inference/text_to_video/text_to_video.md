@@ -10,6 +10,7 @@ A unified script for text-to-video generation. Supports multiple models with mod
 | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | 720x1280 | 81 | 40 | 4.0 | ~60 GiB |
 | `robbyant/lingbot-video-dense-1.3b` / `robbyant/lingbot-video-moe-30b-a3b` | 192x320 | 9 | 2 | 3.0 | ~68 GiB (MoE smoke) |
 | `Lightricks/LTX-2` | 512x768 | 121 | 40 | video 3.0 / audio 7.0 | Model-dependent |
+| `IFM/PAN2` | 704x1248 | 313 | 50 | 2.5 | ~100 GiB (1 GPU); 32 GB GPUs with offload |
 | `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_t2v` | 480x832 | 121 | 50 | 6.0 | 1×A100 80GB |
 | `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-720p_t2v` | 720x1280 | 121 | 50 | 6.0 | FP8 + VAE tiling required |
 | `nvidia/Cosmos3-Nano` | 720x1280 | 189 | 35 | 6.0 | ~46 GiB (peak, 720p) |
@@ -103,6 +104,18 @@ python text_to_video.py \
 
 See the [LTX-2 recipe](../../../recipes/LTX/LTX-2.md) for all checkpoints,
 pipeline selection, I2V, defaults, and advanced options.
+
+### PAN 2
+
+```bash
+python text_to_video.py \
+  --model IFM/PAN2 \
+  --prompt "A red fox trots through fresh snow in a quiet pine forest at dawn, steam rising from its breath." \
+  --output pan2_output.mp4
+```
+
+PAN 2 needs a structured prompt; the plain prompt above only shows the command.
+See the [PAN 2 recipe](../../../recipes/IFM/PAN2.md) for details.
 
 ### HunyuanVideo-1.5 (480p)
 

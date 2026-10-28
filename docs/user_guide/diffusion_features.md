@@ -204,6 +204,7 @@ The following tables show which models support each feature:
 | **Cosmos3**                  |     ❌     |     ✅      |           ✅           |       ✅        |         ✅         |     ✅     |   ✅    |             ✅             |  ✅ (encode/decode)   |       ✅        |        ❌         |
 | **LongCat-Video-Avatar-1.5** |     ❌     |     ❌      |           ❌           |       ❌        |         ❌         |         ❌         |   ❌    |             ❌             |          ❌           |       ❌        |        ❌         |
 | **MiniMax-H3** ([FastH3 single-card guide](https://github.com/vllm-project/vllm-omni/blob/main/recipes/FastVideo/FastH3%20RefOmni%20Single%20Card.md)) | ✅ (FL2VA) | ✅ | ✅ | ❌ | ✅ (DiT/TE) | ❌ | ✅ | ✅ | ✅ (tile) | ✅ (DiT) | ❌ |
+| **PAN 2 T2V I2V**            |     ❌     |     ✅      | ✅ (Ulysses only)<sup>6</sup> |       ✅        |         ✅         |         ❌         |   ✅    |             ✅             |      ✅ (decode)      |       ❓        |        ❌         |
 | **MAGI-2 Preview**           |     ❌     |     ✅      |      ✅ (Ulysses)       |    ✅ (2-way)   |         ✅         |         ❌         |   ✅    | ✅ (1-GPU/LW; DLO DP-AG/SP no-AG) |       ✅ (tile)       |       ❌        |        ❌         |
 | **SANA-WM**                  |     ❌     |     ❌      |          ❌<sup>5</sup> |       ✅        |         ✅         |         ❌         |   ❌    |             ❌             |          ❌           |       ❌        |        ❌         |
 
@@ -213,6 +214,11 @@ The following tables show which models support each feature:
 > the token sequence in isolation. Doing so would need a distributed scan or
 > an all-gather before every GDN block. The remaining ❌ columns are simply
 > unvalidated on this model, not known-broken.
+> 6. PAN 2 rejects ring and all-gather sequence parallelism at startup: its padded
+> joint video/text sequence needs an attention mask those modes do not carry. Use
+> Ulysses (`--usp`), CFG-Parallel, and Tensor-Parallel, alone or combined. Layerwise and
+> distributed layerwise offload combine with all three; HSDP does not reduce memory
+> together with distributed layerwise offload, so use one or the other.
 
 > **Step execution note:** Helios supports single-request step execution only;
 > use `max_num_seqs=1`.

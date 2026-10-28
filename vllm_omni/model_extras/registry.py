@@ -93,6 +93,7 @@ from vllm_omni.model_extras.ming_image import (
     build_text_to_image_prompt as build_ming_image_text_to_image_prompt,
 )
 from vllm_omni.model_extras.minimax_h3 import minimax_h3_transformer_subfolder
+from vllm_omni.model_extras.pan2 import get_pan2_video_generation_defaults
 from vllm_omni.model_extras.qwen_image_21 import (
     QWEN_IMAGE_21_EXTRA_BODY_PARAMS,
 )
@@ -280,6 +281,11 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
             "MiniMaxH3Pipeline",
             "MiniMaxH3ModularPipeline",
         )
+    },
+    # PAN 2 scales and center crops the first frame to the requested size itself.
+    "PAN2ModularPipeline": {
+        "reference_image_size_resolver": _always_preserve_reference_image_size,
+        "video_generation_defaults_builder": get_pan2_video_generation_defaults,
     },
     **{
         model_class_name: {

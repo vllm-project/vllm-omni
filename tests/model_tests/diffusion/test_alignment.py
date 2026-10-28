@@ -116,6 +116,9 @@ EXCLUDED_MODELS = [
     # covered by tests/diffusion/models/auk (CPU pipeline tests, parity) and
     # the real-checkpoint E2E test instead of a tiny model.
     "AuKPipeline",
+    # Modular Diffusers checkpoint; covered by tests/e2e/offline_inference/test_pan2.py
+    # (real-checkpoint E2E) instead of a tiny model.
+    "PAN2ModularPipeline",
 ]
 
 
