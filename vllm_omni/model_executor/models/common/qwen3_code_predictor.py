@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-"""Qwen3 Code Predictor -- optimized re-prefill, no KV cache.
+"""Qwen3 Code Predictor -- optimized re-prefill / incremental KV-cache decode.
 
 Shared by Qwen3-Omni and Qwen3-TTS talker models.
 
@@ -719,8 +719,11 @@ class CodePredictorWrapper(nn.Module):
       5. Inline sampling (top-k + top-p) -- no custom op overhead.
       6. Optional manual CUDA graph capture per batch-size bucket.
 
-    ``code_predictor_kv_cache`` (CUDA, opt-in) switches to incremental K/V
-    decoding: at large batches the re-prefill FLOPs are not negligible.
+    ``code_predictor_kv_cache`` (opt-in) switches to incremental K/V decoding:
+    at large batches the re-prefill FLOPs are not negligible.  On CUDA the
+    cached forward runs under torch.compile; on Ascend NPU it runs eagerly and
+    the whole autoregressive loop is captured as one NPU graph per batch
+    bucket, so a codec frame costs a single graph replay.
     """
 
     _kv_cache_enabled: bool = False
@@ -805,11 +808,15 @@ class CodePredictorWrapper(nn.Module):
             prefix_graph_cfg.get("code_predictor_prefix_graph_seq_lens")
         )
         self._prefix_reprefill_seq_lens = tuple(self._prefix_seq_lens(self._num_groups + 1))
-        # Incremental decoding (opt-in, CUDA): each AR step runs only its new
+        # Incremental decoding (opt-in): each AR step runs only its new
         # position against a static K/V buffer instead of re-prefilling the
         # whole prefix (at batch 64 the re-prefill runs 17x the positions).
+        # CUDA runs the torch.compile'd cached forward; Ascend NPU runs the
+        # cached forward eagerly and captures the whole AR loop as one NPU
+        # graph per batch bucket (one replay per codec frame).
         self._kv_cache_enabled = (
-            self._parse_bool_config(prefix_graph_cfg.get("code_predictor_kv_cache")) and current_omni_platform.is_cuda()
+            self._parse_bool_config(prefix_graph_cfg.get("code_predictor_kv_cache"))
+            and (current_omni_platform.is_cuda() or current_omni_platform.is_npu())
         )
         self._short_kv_requested = self._parse_bool_config(prefix_graph_cfg.get("code_predictor_short_kv"))
         self._short_kv_enabled = False
@@ -817,16 +824,25 @@ class CodePredictorWrapper(nn.Module):
         self._compiled_kv_fwd = None
         # Per AR step: (new positions [n], key mask [1, 1, n, max_seq]).
         self._kv_steps: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        # NPU whole-AR-loop graphs: bucket -> (graph, static_out, u, c0_buf).
+        self._cp_ar_graphs: dict[int, tuple] = {}
+        self._kv_recapture_pending = False
 
     def get_input_embeddings(self) -> nn.ModuleList:
         return self.model.get_input_embeddings()
 
     def set_sampling_params(self, top_k: int = 50, top_p: float = 0.8, do_sample: bool = True) -> None:
         """Configure "stored"-mode sampling; ``do_sample=False`` selects greedy argmax."""
+        changed = (top_k, top_p, do_sample) != (self._top_k, self._top_p, self._do_sample)
         self._top_k = top_k
         self._top_p = top_p
         self._do_sample = do_sample
         logger.debug("Sampling parameters updated: top_k=%d, top_p=%.2f, do_sample=%s", top_k, top_p, do_sample)
+        if changed and self._cp_ar_graphs:
+            # The whole-AR-loop NPU graphs bake these constants in at capture
+            # time; drop them and recapture on the next forward.
+            self._cp_ar_graphs.clear()
+            self._kv_recapture_pending = True
 
     # ------------------------------------------------------------------
     #  Lazy-init helpers
@@ -884,8 +900,12 @@ class CodePredictorWrapper(nn.Module):
         self._model_dtype = next(self.model.parameters()).dtype
         self._lm_heads_list = list(self.lm_head)
         self._codec_embeds_list = list(self.model.codec_embedding)
-        if self._model_dtype == torch.float16 or not current_omni_platform.supports_torch_inductor():
+        if self._model_dtype == torch.float16 or (
+            not current_omni_platform.supports_torch_inductor() and not self._kv_cache_enabled
+        ):
             # The fp16 body runs in fp32 under autocast; keep re-prefill there.
+            # Platforms without Inductor also keep re-prefill unless the NPU
+            # KV-cache path (eager cached forward, no Inductor needed) is on.
             self._kv_cache_enabled = False
 
         # Torch 2.13 XPU Dynamo can double-register built-in handlers when
@@ -897,9 +917,18 @@ class CodePredictorWrapper(nn.Module):
 
             if current_omni_platform.is_npu() and self._wrapper_config.use_cuda_graphs:
                 # For NPU, use eager + NPU graphs (no torch.compile)
+                if self._kv_cache_enabled:
+                    # KV-cache decode: eager cached forward, and one NPU graph
+                    # per bucket running the whole AR loop (one replay per
+                    # codec frame instead of one re-prefill replay per step).
+                    self._compiled_kv_fwd = self.model.forward_cached
                 self._warmup_buckets()
-                self._capture_npu_graphs()
-                logger.info("code_predictor: eager mode + NPU graphs")
+                if self._kv_cache_enabled:
+                    self._capture_npu_cp_ar_graphs()
+                    logger.info("code_predictor: eager mode + NPU KV-cache AR graphs")
+                else:
+                    self._capture_npu_graphs()
+                    logger.info("code_predictor: eager mode + NPU graphs")
             else:
                 logger.warning_once("code_predictor: torch.compile disabled")
             return
@@ -1257,6 +1286,103 @@ class CodePredictorWrapper(nn.Module):
 
         logger.info("code_predictor: captured NPU graphs for buckets %s", self._bucket_sizes)
 
+    def _kv_ar_loop_graphed(
+        self,
+        proj_view: torch.Tensor,
+        u: torch.Tensor,
+        c0_buf: torch.Tensor,
+        kv_caches: list[tuple[torch.Tensor, torch.Tensor]],
+    ) -> torch.Tensor:
+        """KV-cache AR loop over static buffers (NPU graph body).
+
+        Same computation as the cached branch of ``forward()``, but with the
+        Gumbel noise taken from the static input ``u`` [B, G-1, vocab]
+        (refreshed outside the graph before each replay) and the layer-0 code
+        from ``c0_buf`` [B, 1], so no RNG op is captured.  The top-k/top-p
+        masks use ``torch.where`` instead of boolean ``masked_fill``: the
+        latter lowers to ``aclnnNonzeroV2`` on NPU and fails during graph
+        capture.
+        """
+        bsz = proj_view.shape[0]
+        num_groups = self._num_groups
+        base_model = self.model
+        lm_heads = self._lm_heads_list
+        codec_embeds = self._codec_embeds_list
+        projection = self.small_to_mtp_projection
+
+        all_codes = torch.empty(bsz, num_groups, 1, dtype=torch.int64, device=proj_view.device)
+        all_codes[:, 0] = c0_buf
+        stored_mode = self._wrapper_config.sampling_mode == "stored"
+        s_top_k = self._top_k
+        s_top_p = self._top_p
+        for step in range(1, num_groups):
+            positions, key_mask = self._kv_steps[step]
+            lo = 0 if step == 1 else step
+            hidden = base_model.forward_cached(
+                proj_view[:bsz, lo : step + 1, :],
+                positions.unsqueeze(0).expand(bsz, -1),
+                kv_caches,
+                positions,
+                key_mask,
+            )
+            logits = lm_heads[step - 1](hidden[:bsz, -1, :])
+            if stored_mode and not self._do_sample:
+                code = logits.argmax(dim=-1, keepdim=True)
+            elif stored_mode:
+                if s_top_k > 0:
+                    topk_vals, _ = logits.topk(s_top_k, dim=-1)
+                    logits = torch.where(
+                        logits < topk_vals[:, -1:], torch.full_like(logits, float("-inf")), logits
+                    )
+                if s_top_p < 1.0:
+                    sorted_logits, sorted_idx = logits.sort(dim=-1, descending=True)
+                    sorted_probs = F.softmax(sorted_logits, dim=-1, dtype=torch.float32)
+                    cumulative_probs = sorted_probs.cumsum(dim=-1)
+                    remove_mask = (cumulative_probs - sorted_probs) >= s_top_p
+                    sorted_logits = torch.where(
+                        remove_mask, torch.full_like(sorted_logits, float("-inf")), sorted_logits
+                    )
+                    logits = sorted_logits.scatter(1, sorted_idx, sorted_logits)
+                code = (logits.float() - torch.log(-torch.log(u[:, step - 1, :]))).argmax(dim=-1, keepdim=True)
+            else:
+                code = logits.argmax(dim=-1, keepdim=True)
+            all_codes[:, step] = code
+            if step < num_groups - 1:
+                new_embed = codec_embeds[step - 1](code)
+                proj_view[:bsz, step + 1, :] = projection(new_embed.reshape(bsz, 1, -1)).reshape(bsz, -1)
+        return all_codes
+
+    def _capture_npu_cp_ar_graphs(self) -> None:
+        """Capture one NPU graph per batch bucket running the whole KV-cache AR loop.
+
+        One replay per codec frame instead of one re-prefill graph replay per
+        AR step.  The Gumbel noise buffer ``u`` is a static graph input and is
+        refreshed outside the graph before every replay.
+        """
+        vocab = int(self.config.vocab_size)
+        num_steps = self._num_groups - 1
+        device = next(self.model.parameters()).device
+        pool = torch.npu.graph_pool_handle()
+        proj_buf = self._proj_buf
+
+        with torch.inference_mode():
+            for bsz in self._bucket_sizes:
+                kv_caches = self._kv_views(bsz)
+                u = torch.empty(bsz, num_steps, vocab, dtype=torch.float32, device=device)
+                u.uniform_(_UNIFORM_EPS, 1.0 - _UNIFORM_EPS)
+                c0 = torch.zeros(bsz, 1, dtype=torch.int64, device=device)
+                for _ in range(2):
+                    self._kv_ar_loop_graphed(proj_buf[:bsz], u, c0, kv_caches)
+                g = torch.npu.NPUGraph()
+                with torch.npu.graph(g, pool=pool):
+                    out = self._kv_ar_loop_graphed(proj_buf[:bsz], u, c0, kv_caches)
+                self._cp_ar_graphs[bsz] = (g, out, u, c0)
+
+        logger.info(
+            "code_predictor: captured NPU KV-cache AR graphs (buckets %s, 1 replay/frame)",
+            self._bucket_sizes,
+        )
+
     # ------------------------------------------------------------------
     #  Forward -- re-prefill + inline sampling
     # ------------------------------------------------------------------
@@ -1426,6 +1552,42 @@ class CodePredictorWrapper(nn.Module):
             if not self._short_kv_enabled:
                 self._kv_buf[:, :, :padded_bsz].zero_()
             kv_caches = self._kv_views(padded_bsz)
+
+        # NPU whole-AR-loop graph: one replay per codec frame.  Skipped while
+        # an outer graph is being captured (the eager loop body is recorded
+        # there), when per-row generators are given, or when precomputed
+        # sampling uniforms are (the eager loop honors both).
+        if self._kv_cache_enabled and self._kv_recapture_pending and not is_npu_capturing:
+            self._capture_npu_cp_ar_graphs()
+            self._kv_recapture_pending = False
+        kv_ar_graph = self._cp_ar_graphs.get(padded_bsz) if self._kv_cache_enabled else None
+        if (
+            kv_ar_graph is not None
+            and self._wrapper_config.sampling_mode == "stored"
+            and not is_npu_capturing
+            and sample_uniforms is None
+            and not isinstance(sample_generator, list)
+        ):
+            g, out_codes, u, c0_buf = kv_ar_graph
+            c0_buf[:bsz] = layer0_code.reshape(bsz, -1)[:, :1]
+            gen = sample_generator if isinstance(sample_generator, torch.Generator) else None
+            gen_cpu = gen if gen is not None and gen.device.type == "cpu" else None
+            # Draw the Gumbel noise on CPU and copy_ it into the static graph
+            # input: in-place random fills of static buffers have been
+            # observed stale by NPU graph replays on Ascend 910B, and NPU
+            # ``uniform_`` only accepts an NPU-device generator, so the draw
+            # happens on a fresh CPU tensor (honoring CPU generators and the
+            # global RNG alike).
+            u_cpu = torch.empty(u.shape, dtype=torch.float32).uniform_(
+                _UNIFORM_EPS, 1.0 - _UNIFORM_EPS, generator=gen_cpu
+            )
+            u.copy_(u_cpu)
+            # No device syncs: input writes and the static-output read below
+            # are stream-ordered, the same contract the re-prefill path uses.
+            g.replay()
+            if self._wrapper_config.return_proj_buf:
+                return out_codes[:bsz].clone(), proj_buf[:bsz].clone()
+            return out_codes[:bsz].reshape(bsz, num_groups).clone()
         # Autoregressive loop: predict layers 1..G-1
         for step in range(1, num_groups):
             if kv_caches is not None:
