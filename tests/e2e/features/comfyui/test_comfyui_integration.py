@@ -701,11 +701,21 @@ def api_server(server_case: ServerCase, mock_async_omni, tmp_path):
         except Exception:
             traceback.print_exc()
 
-    server_process = multiprocessing.Process(target=run_server)
+    # The mocks live in this process, so the server must be forked, not spawned.
+    # xdist workers may already have switched the global start method to spawn.
+    # Shrink the parent thread pools first so the fork does not inherit a live OpenMP pool.
+    import os
+
+    os.environ["OMP_NUM_THREADS"] = "1"
+    os.environ["MKL_NUM_THREADS"] = "1"
+    torch.set_num_threads(1)
+    if "fork" not in multiprocessing.get_all_start_methods():
+        pytest.skip("API server fixture forks so the child inherits the mocked engine")
+    server_process = multiprocessing.get_context("fork").Process(target=run_server)
     server_process.start()
 
     # Wait for the server to be ready by polling the health endpoint.
-    wait_time = 30
+    wait_time = 60
     wait_poll_interval = 1
     for _ in range(wait_time // wait_poll_interval):
         try:

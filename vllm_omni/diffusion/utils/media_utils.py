@@ -452,6 +452,10 @@ def mux_av_video_audio_bytes(
     """Mux MP4 bytes, optionally encoding ready audio before waiting for video."""
     buf = io.BytesIO()
     with cast(Any, av.open(buf, mode="w", format="mp4")) as container:
+        # The MP4 muxer otherwise stamps the wall clock into mvhd. Two identical
+        # encodes then differ by one second when they straddle that boundary.
+        # Assign the mapping; item assignment on the returned view does not stick.
+        container.metadata = {**container.metadata, "creation_time": "1970-01-01T00:00:00.000000Z"}
         v_stream = cast(
             av.VideoStream,
             container.add_stream(video_codec, rate=Fraction(fps).limit_denominator(10000)),

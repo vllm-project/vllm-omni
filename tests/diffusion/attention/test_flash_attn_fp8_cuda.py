@@ -160,8 +160,10 @@ class TestForwardCudaQuantDispatch:
 
         monkeypatch.setattr(FlashAttentionImpl, "forward_fa_quant_cuda", _fail)
         monkeypatch.setattr(FlashAttentionImpl, "_forward_varlen_dense", lambda self, q, k, v: q)
-        # flash_attn_func may or may not exist on CPU; force the varlen-dense fallback.
+        # dense_flash_attn_func_for prefers optional_fa3_fwd_dense_func for bf16
+        # before flash_attn_func. Clear both so forward_cuda stays on the mocked fallback.
         monkeypatch.setattr(fa_utils, "HAS_FLASH_ATTN", True)
+        monkeypatch.setattr(fa_utils, "optional_fa3_fwd_dense_func", None)
         monkeypatch.setattr(fa_utils, "flash_attn_func", None)
         extra = {} if dtype_value is None else {"kv_cache_dtype": dtype_value}
         metadata = AttentionMetadata(extra=extra)
