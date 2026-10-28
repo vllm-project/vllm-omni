@@ -81,7 +81,8 @@ def test_mxfp4_replicated_linear_loads_with_forced_marlin(mocker):
                 param.weight_loader(param, value)
 
             layer.quant_method.process_weights_after_loading(layer)
-            assert layer.bias.shape == (128,)
+            assert layer.bias.shape == (96,)
+            torch.testing.assert_close(layer.bias, bias)
 
             actual = layer(inputs)[0]
             expected = F.linear(inputs, torch.ones((96, 128), device="cuda", dtype=torch.bfloat16), bias)

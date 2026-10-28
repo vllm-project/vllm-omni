@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from vllm.model_executor.layers.linear import RowParallelLinear
 
 from vllm_omni.quantization import svdquant_config as svdquant
 
@@ -52,6 +53,37 @@ def _register_parameter(
         name,
         torch.nn.Parameter(value, requires_grad=False),
     )
+
+
+def _make_mxfp4_row_parallel(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    tp_rank: int,
+    skip_bias_add: bool = False,
+) -> RowParallelLinear:
+    monkeypatch.setattr(svdquant, "_assert_supported", lambda precision: None)
+    method = svdquant.DiffusionSVDQuantLinearMethod(svdquant.DiffusionSVDQuantConfig(precision="mxfp4"))
+
+    layer = object.__new__(RowParallelLinear)
+    torch.nn.Module.__init__(layer)
+    layer.tp_rank = tp_rank
+    layer.tp_size = 2
+    layer.input_is_parallel = True
+    layer.reduce_results = True
+    layer.skip_bias_add = skip_bias_add
+    layer.return_bias = True
+    layer.output_size_per_partition = 3
+    layer.quant_method = method
+
+    _register_parameter(layer, "qweight", torch.zeros((3, 1), dtype=torch.int8))
+    _register_parameter(layer, "wscales", torch.zeros((2, 3), dtype=torch.uint8))
+    _register_parameter(layer, "bias", torch.tensor([1.0, 2.0, 3.0], dtype=torch.bfloat16))
+    layer.smooth_factor = torch.ones(2, dtype=torch.bfloat16)
+    layer.proj_down = torch.zeros((2, 1), dtype=torch.bfloat16)
+    layer.proj_up = torch.zeros((3, 1), dtype=torch.bfloat16)
+
+    method.process_weights_after_loading(layer)
+    return layer
 
 
 def test_supports_only_validated_datacenter_blackwell() -> None:
@@ -207,7 +239,7 @@ def test_mxfp4_compatibility_path_applies_rank_correction(
     torch.testing.assert_close(kernel.last_input, smoothed)
 
 
-def test_mxfp4_preserves_logical_bias_when_kernel_repacks_it(
+def test_mxfp4_restores_logical_bias_when_kernel_repacks_it(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     base_weight = torch.tensor(
@@ -229,23 +261,58 @@ def test_mxfp4_preserves_logical_bias_when_kernel_repacks_it(
     layer.output_size_per_partition = 3
 
     method.process_weights_after_loading(layer)
-    assert layer.bias.shape == (4,)
-    assert "_svdquant_bias" in dict(layer.named_buffers())
-    assert "_svdquant_bias" not in layer.state_dict()
-    assert layer._svdquant_bias is not layer.bias
-    torch.testing.assert_close(
-        layer._svdquant_bias,
-        torch.tensor([1.0, 2.0, 3.0], dtype=torch.bfloat16),
-    )
+    logical_bias = torch.tensor([1.0, 2.0, 3.0], dtype=torch.bfloat16)
+    assert layer.bias.shape == logical_bias.shape
+    assert not hasattr(layer, "_svdquant_bias")
+    torch.testing.assert_close(layer.bias, logical_bias)
 
     x = torch.tensor([[2.0, 4.0]], dtype=torch.bfloat16)
-    actual = method.apply(layer, x, layer.bias)
-    expected = torch.mm(x, base_weight) + torch.tensor([1.0, 2.0, 3.0], dtype=torch.bfloat16)
+    actual_without_bias = method.apply(layer, x, None)
+    torch.testing.assert_close(actual_without_bias, torch.mm(x, base_weight))
 
+    actual = method.apply(layer, x, layer.bias)
+    expected = torch.mm(x, base_weight) + logical_bias
     torch.testing.assert_close(actual, expected)
 
     layer.to(dtype=torch.float32)
-    assert layer._svdquant_bias.dtype == torch.float32
+    assert layer.bias.dtype == torch.float32
+
+
+def test_mxfp4_row_parallel_tp2_adds_bias_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base_weight = torch.zeros((2, 3), dtype=torch.bfloat16)
+    kernel = _FakeMarlinBiasKernel(base_weight)
+    monkeypatch.setattr(svdquant, "_mxfp4_kernel", lambda: kernel)
+    monkeypatch.setattr("vllm.model_executor.layers.linear.tensor_model_parallel_all_reduce", lambda value: value)
+
+    rank0 = _make_mxfp4_row_parallel(monkeypatch, tp_rank=0)
+    rank1 = _make_mxfp4_row_parallel(monkeypatch, tp_rank=1)
+    x = torch.tensor([[2.0, 4.0]], dtype=torch.bfloat16)
+
+    output_rank0, _ = rank0(x)
+    output_rank1, _ = rank1(x)
+    combined = output_rank0 + output_rank1
+    expected = torch.tensor([[1.0, 2.0, 3.0]], dtype=torch.bfloat16)
+
+    torch.testing.assert_close(combined, expected)
+
+
+def test_mxfp4_row_parallel_skip_bias_add_returns_logical_bias(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base_weight = torch.zeros((2, 3), dtype=torch.bfloat16)
+    kernel = _FakeMarlinBiasKernel(base_weight)
+    monkeypatch.setattr(svdquant, "_mxfp4_kernel", lambda: kernel)
+    monkeypatch.setattr("vllm.model_executor.layers.linear.tensor_model_parallel_all_reduce", lambda value: value)
+
+    layer = _make_mxfp4_row_parallel(monkeypatch, tp_rank=0, skip_bias_add=True)
+    x = torch.tensor([[2.0, 4.0]], dtype=torch.bfloat16)
+    output, output_bias = layer(x)
+
+    torch.testing.assert_close(output, torch.zeros_like(output))
+    assert output_bias is not None
+    torch.testing.assert_close(output_bias, torch.tensor([1.0, 2.0, 3.0], dtype=torch.bfloat16))
 
 
 def test_mxfp4_does_not_duplicate_bias_when_kernel_leaves_it_unchanged(

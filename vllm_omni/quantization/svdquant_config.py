@@ -358,15 +358,13 @@ class DiffusionSVDQuantLinearMethod(LinearMethodBase):
             bias_snapshot = None if bias_before is None else bias_before.detach().clone()
             kernel = _mxfp4_kernel()
             kernel.process_weights_after_loading(layer)
-            bias_after = getattr(layer, "bias", None)
-            bias_replaced = bias_after is not bias_before
-            if bias_after is not None and bias_before is not None:
-                bias_replaced = bias_replaced or bias_after.shape != bias_before.shape
-            if bias_snapshot is not None and bias_replaced:
-                # Marlin replaces and permutes layer.bias. Keep the logical bias
-                # as a non-persistent buffer so module moves and offload hooks
-                # handle it, while FlashInfer/XPU retain the original parameter.
-                layer.register_buffer("_svdquant_bias", bias_snapshot, persistent=False)
+            if bias_before is not None and bias_snapshot is not None:
+                # MXFP4 kernels may pad or permute layer.bias for their internal
+                # GEMM layout, but apply() always passes bias=None to the kernel.
+                # Restore the checkpoint bias so callers retain control over
+                # whether it is added and skip_bias_add returns the logical tensor.
+                bias_before.data = bias_snapshot
+                layer.bias = bias_before
             logger.info_once(
                 "SVDQuant MXFP4 is using %s; the rank correction is not fused into the GEMM.",
                 type(kernel).__name__,
@@ -442,9 +440,8 @@ class DiffusionSVDQuantLinearMethod(LinearMethodBase):
             correction_input,
             layer.proj_up.transpose(0, 1),
         )
-        bias_to_add = getattr(layer, "_svdquant_bias", bias)
-        if bias_to_add is not None:
-            out.add_(bias_to_add)
+        if bias is not None:
+            out.add_(bias)
         return out.reshape(
             *original_shape[:-1],
             layer.output_size_per_partition,
