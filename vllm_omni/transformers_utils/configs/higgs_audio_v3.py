@@ -43,8 +43,7 @@ class HiggsMrv2Options:
 
 # Tri-state config fields resolved by ``resolve_mrv2_defaults``.
 _MRV2_FLAG_FIELDS = tuple(HiggsMrv2Options.__dataclass_fields__)
-# Structural requirements of the v2 runner: an explicit False under v2 raises
-# instead of silently degrading the sampler.
+# explicit False under v2 raises instead of silently degrading the sampler.
 _MRV2_STRUCTURAL_FLAGS = frozenset({"audio_async_payload", "audio_async_prompt_mode"})
 
 

@@ -48,10 +48,8 @@ HIGGS_AUDIO_V3_PIPELINE = PipelineConfig(
                 "detokenize": False,
                 "stop_token_ids": [151643, 151671],
             },
-            # The v2 path's self-owned sampler (HiggsModelState) captures
-            # tensor-valued temperature/top-k/top-p only; text-generation
-            # sampling machinery is not wired into it. Startup fails fast on
-            # non-neutral defaults; per-request use raises in add_request.
+            # The v2 path's self-owned sampler captures tensor-valued temperature/
+            # top-k/top-p only; text-generation sampling machinery is not wired into it.
             mrv2_unsupported_sampling_params=(
                 "frequency_penalty",
                 "presence_penalty",
