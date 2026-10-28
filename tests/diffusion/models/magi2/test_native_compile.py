@@ -13,7 +13,7 @@ from tests.diffusion.models.magi2.test_native_packing import (
     _tiny_model,
     _tiny_sampler,
 )
-from vllm_omni.diffusion.models.magi2.layers import ModalityDispatcher
+from vllm_omni.diffusion.models.magi2.common_layers import ModalityDispatcher
 from vllm_omni.diffusion.models.magi2.sampler_magi2 import CFGConfig
 
 pytestmark = [pytest.mark.diffusion, pytest.mark.cpu, pytest.mark.core_model]

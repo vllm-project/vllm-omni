@@ -1431,7 +1431,12 @@ class FaultModel:
     oom_large_fail_message: str = "expected request failure during GPU OOM injection"
     oom_concurrent_fail_message: str = "expected concurrent request failure under OOM injection"
 
-    def servers(self, server_set: str) -> list[tuple[str, OmniServerParams]]:
+    def scenarios_for_server_set(self, server_set: str) -> list[dict[str, Any]]:
+        """Return deploy scenarios for one fault server set.
+
+        The ``oom`` set forces ``enforce_eager`` on ``eager_oom_stage_ids``
+        under HIP. Models that do not declare those stages keep their deploy.
+        """
         scenarios = list(self.scenarios)
         if server_set == "lifecycle":
             if self.lifecycle_scenario is not None:
@@ -1446,6 +1451,10 @@ class FaultModel:
             )
         elif server_set not in ("default", "oom"):
             raise ValueError(f"unknown server set {server_set!r} for {self.model_id}")
+        return scenarios
+
+    def servers(self, server_set: str) -> list[tuple[str, OmniServerParams]]:
+        scenarios = self.scenarios_for_server_set(server_set)
         from tests.dfx.conftest import create_reliability_omni_server_params
 
         params = create_reliability_omni_server_params(scenarios, self.deploy_dir)

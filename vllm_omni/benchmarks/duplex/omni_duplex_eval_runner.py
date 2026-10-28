@@ -94,6 +94,7 @@ class GenerateSampleResult:
     timed_sentences: list[dict[str, object]] = field(default_factory=list)
     timed_chunks: list[dict[str, object]] = field(default_factory=list)
     metadata: dict[str, object] = field(default_factory=dict)
+    diagnostics: dict[str, object] = field(default_factory=dict)
     output_tokens: int = 0
     audio_bytes: int = 0
     audio_sample_rate: int = 24_000
@@ -204,6 +205,27 @@ def write_sample_result(result: GenerateSampleResult) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def write_failed_sample_diagnostics(result: GenerateSampleResult) -> Path:
+    """Publish a failed session's control-state trace outside judge input paths."""
+    output = result.output
+    diagnostics = output.parent.parent / "failed_sessions" / output.parent.name / f"{output.stem}.json"
+    diagnostics.parent.mkdir(parents=True, exist_ok=True)
+    temporary = diagnostics.with_suffix(".json.part")
+    try:
+        payload = {
+            "error": result.error,
+            "metadata": result.metadata,
+            "diagnostics": result.diagnostics,
+            "timed_sentence_count": len(result.timed_sentences),
+            "timed_chunk_count": len(result.timed_chunks),
+        }
+        temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        temporary.replace(diagnostics)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return diagnostics
+
+
 def _event_collector_from_realtime(source: RealtimeEventCollector) -> EventCollector:
     """Replay experimental collector events onto the public EventCollector."""
     from vllm_omni.clients.duplex import EventCollector
@@ -262,7 +284,86 @@ def _completion_activity(events: list[dict[str, object]], start: int) -> int:
     return sum(event.get("type") in _COMPLETION_ACTIVITY for event in events[start:])
 
 
-def _residual_unit_decided(events: list[dict[str, object]], start: int) -> bool:
+def _completion_diagnostics(
+    events: list[dict[str, object]],
+    start: int,
+    *,
+    response_ids: list[str],
+    stable_since: float,
+) -> dict[str, object]:
+    """Return a compact state trace for a drain timeout."""
+    committed_at = next(
+        (index for index in range(start, len(events)) if events[index].get("type") == "input_audio_buffer.committed"),
+        None,
+    )
+    created_before: set[str] = set()
+    finished_before: set[str] = set()
+    finished: set[str] = set()
+    created_after: set[str] = set()
+    state_events: list[dict[str, object]] = []
+    event_type_counts: dict[str, int] = {}
+    for index, event in enumerate(events):
+        event_type = event.get("type")
+        response_id = _event_response_id(event)
+        if event_type == "response.done" and response_id is not None:
+            finished.add(response_id)
+        if committed_at is not None and index < committed_at:
+            if event_type == "response.created" and response_id is not None:
+                created_before.add(response_id)
+            elif event_type == "response.done" and response_id is not None:
+                finished_before.add(response_id)
+        elif (
+            committed_at is not None
+            and index > committed_at
+            and event_type == "response.created"
+            and response_id is not None
+        ):
+            created_after.add(response_id)
+        if index < start or not isinstance(event_type, str):
+            continue
+        if event_type in _COMPLETION_ACTIVITY:
+            event_type_counts[event_type] = event_type_counts.get(event_type, 0) + 1
+        if event_type not in {
+            "input_audio_buffer.committed",
+            "response.created",
+            "response.done",
+            "response.listen",
+        }:
+            continue
+        row: dict[str, object] = {"type": event_type}
+        if response_id is not None:
+            row["response_id"] = response_id
+        status = _response_status(event)
+        if status is not None:
+            row["response_status"] = status
+        if event_type == "response.listen":
+            response = event.get("response")
+            metadata = response.get("metadata") if isinstance(response, dict) else event.get("metadata")
+            if isinstance(metadata, dict):
+                row["model_listen"] = metadata.get("model_listen")
+                row["buffering"] = metadata.get("buffering")
+        state_events.append(row)
+    known_response_ids = sorted(set(response_ids))
+    quiet_for_s = max(0.0, time.monotonic() - stable_since)
+    return {
+        "committed_observed": committed_at is not None,
+        "open_response_ids_at_commit": sorted(created_before - finished_before),
+        "created_response_ids_after_commit": sorted(created_after),
+        "response_ids": known_response_ids,
+        "unfinished_response_ids": sorted(set(known_response_ids) - finished),
+        "quiet_for_s": quiet_for_s,
+        "settle_required_s": _COMPLETION_SETTLE_S,
+        "quiet_window_satisfied": quiet_for_s >= _COMPLETION_SETTLE_S,
+        "normal_terminal_decision": _residual_unit_decided(events, start),
+        "settled_silence_terminal_decision": _residual_unit_decided(events, start, settled_silence_is_terminal=True),
+        "completion_event_type_counts": event_type_counts,
+        "completion_state_events": state_events,
+    }
+
+
+def _residual_unit_decided(
+    events: list[dict[str, object]], start: int, *, settled_silence_is_terminal: bool = False
+) -> bool:
     """Whether the unit flushed by the commit has decided.
 
     A response created before ``input_audio_buffer.committed`` is the in-flight
@@ -270,9 +371,11 @@ def _residual_unit_decided(events: list[dict[str, object]], start: int) -> bool:
     is not the decision; the residual then emits ``response.listen`` or opens a
     new response. A ``cancelled`` ending is not a decision either: MiniCPM-o
     barge-in cancels the open turn and the same input can still open the residual
-    response after the quiet window. A ``failed`` ending is. The server does not
-    promote another unit after a failure, and a failed response created after the
-    commit is itself the residual; the sample is already unsuccessful.
+    response after the quiet window. Only the full drain-timeout fallback may
+    opt into treating a finished in-flight response followed by settled silence
+    as terminal. A ``failed`` ending is terminal immediately. The server does
+    not promote another unit after a failure, and a failed response created
+    after the commit is itself the residual; the sample is already unsuccessful.
     """
     committed_at = next(
         (index for index in range(start, len(events)) if events[index].get("type") == "input_audio_buffer.committed"),
@@ -295,6 +398,7 @@ def _residual_unit_decided(events: list[dict[str, object]], start: int) -> bool:
     created_after: set[str] = set()
     finished_open: set[str] = set()
     cancelled_open = False
+    cancelled_after: set[str] = set()
     failed_open = False
     promotes_residual = False
     for event in events[committed_at + 1 :]:
@@ -319,10 +423,18 @@ def _residual_unit_decided(events: list[dict[str, object]], start: int) -> bool:
                 continue
             # The residual response itself failed. A cancellation can still be
             # followed by the response the barge-in opens.
-            if response_id in created_after and status != "cancelled":
-                return True
+            if response_id in created_after:
+                if status == "cancelled":
+                    cancelled_after.add(response_id)
+                else:
+                    return True
             continue
         if event_type == "response.listen" and finished_open >= open_at_commit and _is_model_listen_decision(event):
+            return True
+    if settled_silence_is_terminal:
+        if created_after and cancelled_after >= created_after:
+            return True
+        if bool(open_at_commit) and finished_open >= open_at_commit and not created_after:
             return True
     return (
         bool(open_at_commit)
@@ -424,6 +536,8 @@ async def generate_sample(
     )
     response_done = False
     drain_timeout = None
+    drain_timeout_state: dict[str, object] | None = None
+    drain_timeout_event_count = 0
     close_timeout = None
     stream_start: float | None = None
     async with client:
@@ -462,7 +576,7 @@ async def generate_sample(
             seen_activity = 0
             stable_since = time.monotonic()
 
-            def responses_finished() -> bool:
+            def responses_finished(*, settled_silence_is_terminal: bool = False) -> bool:
                 # The residual unit decides after input_audio_buffer.committed.
                 # A reply that was already open only promotes that unit when it
                 # completes, and Stage1 can still open a response afterwards.
@@ -477,7 +591,11 @@ async def generate_sample(
                     return False
                 if time.monotonic() - stable_since < _COMPLETION_SETTLE_S:
                     return False
-                return _residual_unit_decided(events, commit_from)
+                return _residual_unit_decided(
+                    events,
+                    commit_from,
+                    settled_silence_is_terminal=settled_silence_is_terminal,
+                )
 
             try:
                 if server_turns:
@@ -492,7 +610,22 @@ async def generate_sample(
                     )
                     response_done = True
             except TimeoutError as exc:
-                drain_timeout = str(exc)
+                # Finishing the in-flight reply can promote another response,
+                # so it cannot end the normal wait. Once the entire drain
+                # window has elapsed, accept settled terminal silence only when
+                # every created response is done and the usual quiet window
+                # still holds.
+                if not server_turns and responses_finished(settled_silence_is_terminal=True):
+                    response_done = True
+                else:
+                    drain_timeout = str(exc)
+                    drain_timeout_state = _completion_diagnostics(
+                        client.events.events,
+                        commit_from,
+                        response_ids=client.events.response_ids,
+                        stable_since=stable_since,
+                    )
+                    drain_timeout_event_count = len(client.events.events)
         finally:
             ack_task.cancel()
             try:
@@ -506,6 +639,13 @@ async def generate_sample(
             close_timeout = str(exc)
         events = list(client.events.events)
         collector = _event_collector_from_realtime(client.events)
+    if drain_timeout_state is not None:
+        drain_timeout_state["completion_state_events_after_timeout"] = _completion_diagnostics(
+            events,
+            drain_timeout_event_count,
+            response_ids=client.events.response_ids,
+            stable_since=time.monotonic(),
+        )["completion_state_events"]
     timed = [sentence.as_dict() for sentence in extract_timed_sentences(events, clock=clock)]
     chunks = [chunk.as_dict() for chunk in extract_timed_chunks(events, clock=clock)]
     meta = {
@@ -561,6 +701,7 @@ async def generate_sample(
         timed_sentences=timed,
         timed_chunks=chunks,
         metadata=meta,
+        diagnostics={"drain_timeout_state": drain_timeout_state} if drain_timeout_state is not None else {},
         output_tokens=bundle.output_tokens,
         audio_bytes=len(client.events.audio_bytes()),
         audio_sample_rate=client.events.output_sample_rate_hz,

@@ -176,6 +176,11 @@ def duplex_ephemeral_stage_request_id(fence: DuplexFence, *, stage_id: int) -> s
     return duplex_resource_request_id(fence, f"stage{stage_id}-turn{fence.turn_id}")
 
 
+def duplex_is_auxiliary_request(request_id: str | None) -> bool:
+    fields = _duplex_resource_request_fields(request_id)
+    return fields is not None and fields[2].startswith("auxiliary-")
+
+
 _EPHEMERAL_TURN_IN_REQUEST_ID = re.compile(r"\.r\.stage\d+-turn(\d+)$")
 
 

@@ -32,6 +32,7 @@ from vllm_omni.benchmarks.patch.patch import (
     _attach_seed_tts_to_request_func_input,
     _build_benchmark_session,
     _extract_stage_durations_from_payload,
+    _gather_request_outputs,
     _iter_image_reference_inputs,
     _iter_video_reference_inputs,
     _omni_request_timeout_s,
@@ -1511,11 +1512,88 @@ class TestOmniRequestTimeout:
             request_input.api_url = f"http://127.0.0.1:{port}/v1/chat/completions"
             output = await async_request_openai_chat_omni_completions(request_input, session)
             assert output.success is False
+            assert output.timed_out is True
             assert output.error
         finally:
             await session.close()
             server.close()
             await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_chat_timeout_is_structurally_marked(mocker: MockerFixture) -> None:
+    session = mocker.Mock()
+    session.post.side_effect = TimeoutError("request deadline expired")
+
+    output = await async_request_openai_chat_omni_completions(_seed_tts_request_func_input(), session)
+
+    assert output.success is False
+    assert output.timed_out is True
+    assert output.cancelled_after_timeout is False
+    assert "TimeoutError" in output.error
+
+
+@pytest.mark.asyncio
+async def test_chat_aiohttp_server_timeout_is_structurally_marked(mocker: MockerFixture) -> None:
+    session = mocker.Mock()
+    session.post.side_effect = patch.aiohttp.ServerTimeoutError("request deadline expired")
+
+    output = await async_request_openai_chat_omni_completions(_seed_tts_request_func_input(), session)
+
+    assert output.success is False
+    assert output.timed_out is True
+    assert output.cancelled_after_timeout is False
+    assert "ServerTimeoutError" in output.error
+
+
+@pytest.mark.asyncio
+async def test_timeout_gather_cancels_pending_tasks_and_retains_order(mocker: MockerFixture) -> None:
+    pending_started = [asyncio.Event(), asyncio.Event()]
+    cancellation_finished = [asyncio.Event(), asyncio.Event()]
+    completed_output = MixRequestFuncOutput(success=True, prompt_len=22)
+    timeout_output = MixRequestFuncOutput(success=False, prompt_len=33, timed_out=True, error="timed out")
+
+    async def pending(index: int) -> MixRequestFuncOutput:
+        pending_started[index].set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            await asyncio.sleep(0)
+            cancellation_finished[index].set()
+
+    async def completed() -> MixRequestFuncOutput:
+        return completed_output
+
+    async def timed_out() -> MixRequestFuncOutput:
+        await pending_started[0].wait()
+        await pending_started[1].wait()
+        await asyncio.sleep(0)
+        return timeout_output
+
+    request_inputs = []
+    for prompt_len in (11, 22, 33, 44):
+        request = _seed_tts_request_func_input()
+        request.prompt_len = prompt_len
+        request_inputs.append(request)
+    tasks = [
+        asyncio.create_task(pending(0)),
+        asyncio.create_task(completed()),
+        asyncio.create_task(timed_out()),
+        asyncio.create_task(pending(1)),
+    ]
+    pbar = mocker.Mock()
+
+    outputs = await _gather_request_outputs(tasks, request_inputs, pbar=pbar)
+
+    assert outputs[0].cancelled_after_timeout is True
+    assert outputs[0].prompt_len == 11
+    assert outputs[1] is completed_output
+    assert outputs[2] is timeout_output
+    assert outputs[3].cancelled_after_timeout is True
+    assert outputs[3].prompt_len == 44
+    assert all(event.is_set() for event in cancellation_finished)
+    assert all(task.done() for task in tasks)
+    assert pbar.update.call_count == 2
 
 
 def test_video_rtf_prefers_generation_time_over_poll_latency():

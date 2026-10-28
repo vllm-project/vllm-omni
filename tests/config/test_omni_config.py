@@ -58,6 +58,7 @@ from vllm_omni.config.stage_config import (
     resolve_deploy_yaml,
     update_deploy_config_async_chunk_enabled,
 )
+from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.engine.stage_engine_startup import _serialize_stage_config
 from vllm_omni.engine.stage_init_utils import build_legacy_engine_args_dict
@@ -126,7 +127,7 @@ def _from_pipeline_key(
 
 
 @pytest.mark.parametrize("pending", [False, True])
-def test_pending_generation_capability_reaches_both_engine_config_paths(pending):
+def test_pending_generation_capability_reaches_both_engine_config_paths(pending, tmp_path):
     from vllm_omni.engine.arg_utils import OmniEngineArgs
     from vllm_omni.engine.stage_init_utils import build_engine_args_dict_from_omni_stage_config
     from vllm_omni.entrypoints.utils import filter_dataclass_kwargs
@@ -147,7 +148,7 @@ def test_pending_generation_capability_reaches_both_engine_config_paths(pending)
     legacy = merge_pipeline_deploy(pipeline, deploy)[0]
     assert legacy.yaml_engine_args.get("supports_pending_generation", False) is pending
     structured = VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=deploy)
-    args = build_engine_args_dict_from_omni_stage_config(structured.stage_by_id(0), model="test-model")
+    args = build_engine_args_dict_from_omni_stage_config(structured.stage_by_id(0), model=str(tmp_path))
     assert OmniEngineArgs(**filter_dataclass_kwargs(OmniEngineArgs, args)).supports_pending_generation is pending
 
 
@@ -1245,6 +1246,7 @@ def test_sub_config_fields_match_structured_scopes():
         "generation_config",
         "override_generation_config",
         "enable_prompt_embeds",
+        "scheduling_metadata_adapter",
     }
     vllm_load_fields = {f.name for f in fields(VllmLoadConfig)}
     assert issubclass(OmniStageLoadConfig, VllmLoadConfig)
@@ -2305,6 +2307,46 @@ def test_compact_offload_config_is_validated_during_projection():
                 "components": ["dit"],
             }
         )
+
+
+def test_dlo_chunk_size_survives_cli_and_deploy_into_structured_config():
+    cli_config = _from_pipeline_key("hunyuan_image3_dit", cli_overrides={"dlo_chunk_size_mb": 32})
+    assert cli_config.stage_by_id(0).diffusion_config.dlo_chunk_size_mb == 32
+
+    pipeline = _resolve_pipeline_or_skip("hunyuan_image3_dit")
+    deploy = DeployConfig(stages=[StageDeployConfig(stage_id=0, dlo_chunk_size_mb=128)])
+    deploy_config = VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=deploy)
+    assert deploy_config.stage_by_id(0).diffusion_config.dlo_chunk_size_mb == 128
+
+
+@pytest.mark.parametrize("chunk_size_mb", [0, -1])
+def test_dlo_chunk_size_rejects_non_positive_values(chunk_size_mb):
+    with pytest.raises(ValidationError):
+        omni_config_module._DiffusionConfigProjection(dlo_chunk_size_mb=chunk_size_mb)
+    with pytest.raises(ValueError, match="dlo_chunk_size_mb must be a positive integer"):
+        OmniDiffusionConfig(dlo_chunk_size_mb=chunk_size_mb)
+
+
+def test_dlo_chunk_size_accepts_reference_kv_config():
+    config = OmniDiffusionConfig(dlo_chunk_size_mb=32, kv_offload_config={"mode": "on"})
+
+    assert config.dlo_chunk_size_mb == 32
+    assert config.kv_offload_config == {"mode": "on"}
+
+
+@pytest.mark.parametrize(
+    "chunk_size_mb,kv_config,error",
+    [
+        (0, {"mode": "on"}, "dlo_chunk_size_mb must be a positive integer"),
+        (True, {"mode": "on"}, "dlo_chunk_size_mb must be a positive integer"),
+        (32, {"mode": "off"}, "kv_offload_config.mode must be on"),
+        (32, {"mode": "on", "kv_refresh_interval": -1}, "kv_refresh_interval must be an integer"),
+        (32, {"mode": "on", "kv_host_quantization": "unknown"}, "kv_host_quantization must be"),
+    ],
+)
+def test_dlo_and_reference_kv_config_reject_invalid_settings(chunk_size_mb, kv_config, error):
+    with pytest.raises(ValueError, match=error):
+        OmniDiffusionConfig(dlo_chunk_size_mb=chunk_size_mb, kv_offload_config=kv_config)
 
 
 @pytest.mark.parametrize("pipeline_async", [True, False])

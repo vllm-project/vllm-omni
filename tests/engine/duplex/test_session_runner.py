@@ -1293,6 +1293,35 @@ async def test_stale_epoch_output_is_dropped_after_barge_in() -> None:
         await close_harness(h)
 
 
+@pytest.mark.parametrize("fail_cleanup", [False, True])
+async def test_barge_in_releases_only_successfully_cleaned_request_ids(
+    fail_cleanup: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    h = await open_harness()
+    original_cleanup = h.port.cleanup
+    try:
+        await h.run(append_audio())
+        request_id = h.stage0_request_id()
+
+        async def cleanup_with_new_resource(request_ids: list[str], *, abort: bool = False) -> None:
+            assert h.session.resource_request_ids(submitted=True) == [request_id]
+            await original_cleanup(request_ids, abort=abort)
+            h.session.bind_stage_request(0, "next-epoch-request", fence=h.session.fence)
+            if fail_cleanup:
+                raise RuntimeError("synthetic abort failure")
+
+        monkeypatch.setattr(h.port, "cleanup", cleanup_with_new_resource)
+        events = await h.run(commands.BargeIn())
+        assert h.session.epoch == 1
+        assert h.port.cleanups == [([request_id], True)]
+        assert "next-epoch-request" in h.session.resource_request_ids(submitted=True)
+        assert (request_id in h.session.resource_request_ids(submitted=True)) is fail_cleanup
+        assert any(getattr(event, "code", None) == "runtime_signal_failed" for event in events) is fail_cleanup
+    finally:
+        monkeypatch.setattr(h.port, "cleanup", original_cleanup)
+        await close_harness(h)
+
+
 async def test_barge_in_aborts_draining_tts_as_well_as_the_active_request() -> None:
     h = await open_harness()
     release_abort = asyncio.Event()
@@ -1408,6 +1437,63 @@ async def test_cancel_cleanup_failure_retains_requests_for_close_retry() -> None
         assert result.ok and result.operation == "close"
         assert h.port.cleanups == [([request_id], True), ([request_id], True)]
         assert h.session.resource_request_ids() == []
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ended", [False, True])
+@pytest.mark.parametrize("native_signal", [False, True])
+async def test_audio_truncation_preserves_retrieved_and_terminal_transcript(ended, native_signal) -> None:
+    h = await open_harness()
+    try:
+        session = h.session
+        response = session.begin_response()
+        item_id = f"item_{response}"
+        h.runner.emit(h.runner.model.response_created_payload(response, epoch=session.epoch))
+        session.append_assistant_text("abcdefghij")
+        session.mark_audio_sent(10_000, text_chars=10, audio_complete=True)
+        h.runner.emit(
+            {
+                "type": "response.output_audio.delta",
+                "response_id": response,
+                "audio": "AAA=",
+                "text": "abcdefghij",
+                "audio_duration_ms": 10_000,
+                "audio_text_marks": [{"text_chars": 10, "audio_end_ms": 10_000}],
+            }
+        )
+        if ended:
+            session.register_history_item(item_id, session.end_response())
+            h.runner.emit({"type": "response.done", "response_id": response})
+        await h.settle()
+
+        if native_signal:
+            command = commands.SignalTurn(
+                event="conversation.item.truncate", signal_payload={"item_id": item_id, "audio_end_ms": 4_000}
+            )
+        else:
+            command = commands.TruncateItem(item_id=item_id, audio_end_ms=4_000)
+        events = await h.run(command)
+        assert "error" not in types(events)
+        assert find(events, "conversation.item.truncated").audio_end_ms == 4_000
+        for _ in range(2):
+            events = await h.run(
+                commands.SignalTurn(event="conversation.item.retrieve", signal_payload={"item_id": item_id})
+            )
+            assert find(events, "conversation.item.retrieved").item["content"][0]["transcript"] == "abcd"
+
+        if not ended:
+            session.register_history_item(item_id, session.end_response())
+            h.runner.emit({"type": "response.done", "response_id": response})
+            events = await h.settle()
+            done = find(events, "response.done")
+            assert done.response["output"][0]["content"][0]["transcript"] == "abcd"
+            events = await h.run(
+                commands.SignalTurn(event="conversation.item.retrieve", signal_payload={"item_id": item_id})
+            )
+            assert find(events, "conversation.item.retrieved").item["content"][0]["transcript"] == "abcd"
+        assert session.history_item_ids[item_id]["content"] == "abcd"
     finally:
         await close_harness(h)
 

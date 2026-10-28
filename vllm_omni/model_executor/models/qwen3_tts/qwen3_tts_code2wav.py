@@ -20,6 +20,7 @@ from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
 from vllm_omni.data_entry_keys import FIRST_AUDIO_REQUIRED_KEY
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.model_executor.stage_input_processors.chunk_size_utils import parse_chunk_ramp
+from vllm_omni.outputs import StagePostWarmupMemoryStats
 
 from .tokenizer_12hz.configuration_qwen3_tts_tokenizer_v2 import (
     Qwen3TTSTokenizerV2Config,
@@ -396,6 +397,14 @@ class Qwen3TTSCode2Wav(nn.Module):
         self._batch_stats_padded_frames += sum(bucket_frames - frames for frames in actual_frames)
         self._batch_stats_actual_frames.update(actual_frames)
         self._batch_stats_bucket_groups[(group_size, bucket_frames)] += 1
+
+    def get_stage_post_warmup_memory_stats(self) -> StagePostWarmupMemoryStats | None:
+        """Return the allocator snapshot retained after decoder warmup."""
+        wrapper = getattr(self.decoder, "_cudagraph_wrapper", None)
+        memory_stats = getattr(wrapper, "post_warmup_memory_stats", None)
+        if memory_stats is None:
+            return None
+        return StagePostWarmupMemoryStats(*memory_stats)
 
     def on_requests_finished(self, finished_req_ids: set[str] | list[str]) -> None:
         for req_id in finished_req_ids:

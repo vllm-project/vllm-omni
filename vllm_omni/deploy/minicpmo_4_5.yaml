@@ -155,6 +155,10 @@ platforms:
     # in an overlay to disable it explicitly.
     cuda_mps: true
     stages:
+      - stage_id: 0
+        # Match the CUDA Thinker backend used for Transformers accuracy validation.
+        # Keep this scoped to stage 0; Talker retains its own backend selection.
+        attention_backend: TRITON_ATTN
       - stage_id: 1
         # Full-attention occupancy is bounded by max_num_seqs * max_model_len
         # (16 * 4096 = 65536 tokens). Keep the reported CUDA KV token capacity
