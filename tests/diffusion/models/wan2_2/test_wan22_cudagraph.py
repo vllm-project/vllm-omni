@@ -213,37 +213,38 @@ def test_setup_compile_hook_attaches_only_with_the_opt_in(monkeypatch, tmp_path)
 
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph replay requires CUDA")
-def test_graph_replay_matches_eager_with_fp32_timestep() -> None:
-    """Warmup-to-replay parity: a BF16 model must serve the scheduler's FP32 timesteps.
+def test_graph_replay_matches_eager_with_scheduler_timestep_dtypes() -> None:
+    """Warmup-to-replay parity: a BF16 model must serve the scheduler's timesteps.
 
-    The graph key carries dtypes, so the FP32 timesteps of the denoise loop
-    never reuse a buffer captured in the model dtype, and a replay matches
-    the eager forward including the sinusoidal timestep embedding.
+    The graph key carries dtypes, so the scheduler's timesteps (int64 for
+    the default UniPC, FP32 for the Euler variant) never reuse a buffer
+    captured in another dtype, and a replay matches the eager forward
+    including the sinusoidal timestep embedding.
     """
     model, wrapper = _make_gpu_wrapper(max_graphs=4)
     inputs = _inputs("cuda", torch.bfloat16)
-    fp32_t = inputs["timestep"].float()
+    int64_t = inputs["timestep"].long()
 
     with torch.no_grad():
         eager = model(
             inputs["hidden_states"],
-            timestep=fp32_t,
+            timestep=int64_t,
             encoder_hidden_states=inputs["encoder_hidden_states"],
             return_dict=False,
         )[0]
         replayed = wrapper(
             inputs["hidden_states"],
-            timestep=fp32_t,
+            timestep=int64_t,
             encoder_hidden_states=inputs["encoder_hidden_states"],
             return_dict=False,
         )
     torch.testing.assert_close(replayed, eager)
-    # The FP32 and BF16 timesteps land in separate cache buckets.
+    # Int64 (UniPC) and FP32 (Euler) timesteps land in separate cache buckets.
     assert len(wrapper._cache) == 1
     with torch.no_grad():
         wrapper(
             inputs["hidden_states"],
-            timestep=inputs["timestep"],
+            timestep=inputs["timestep"].float(),
             encoder_hidden_states=inputs["encoder_hidden_states"],
             return_dict=False,
         )

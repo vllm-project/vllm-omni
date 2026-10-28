@@ -1635,14 +1635,18 @@ class Wan22Pipeline(
                     device=device,
                     dtype=dtype,
                 )
-                # The denoising loop expands the scheduler's FP32 timesteps;
-                # warm up with the same dtype so the captured buffer never
-                # rounds real values through a model-dtype copy.
-                timestep = torch.zeros(1, device=device, dtype=torch.float32)
                 encoder_hidden_states = torch.zeros(1, 512, text_dim, device=device, dtype=dtype)
-                wrapper(
-                    hidden_states, timestep=timestep, encoder_hidden_states=encoder_hidden_states, return_dict=False
-                )
+                # The denoise loop expands the scheduler's timesteps, whose
+                # dtype depends on the solver: int64 for the default UniPC,
+                # FP32 for the Euler variant. Warm both buckets so a request
+                # hits a captured graph either way, and never rounds real
+                # values through a model-dtype buffer (dtypes are part of the
+                # graph key).
+                for timestep_dtype in (torch.int64, torch.float32):
+                    timestep = torch.zeros(1, device=device, dtype=timestep_dtype)
+                    wrapper(
+                        hidden_states, timestep=timestep, encoder_hidden_states=encoder_hidden_states, return_dict=False
+                    )
         logger.info(
             "Wan2.2 DiT startup graph warm-up captured %d shape(s) in %.1fs",
             len(shapes),
