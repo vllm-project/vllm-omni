@@ -270,6 +270,8 @@ playback pacing. For the default 16-latent chunks, 512 MiB
 (`536870912` bytes) covers decoded RGB chunks including the final held tail.
 The shared 64 MiB default can reject a decoded chunk before a playback idle
 timeout is reached. The limit applies to decoded payloads and encoded bytes.
+The playback window must also admit a complete chunk; the tested request uses
+`max_lead_ms=10000`. Send `session.playback` progress while playing.
 
 For a 120-second request, start the recent deployment and use the shared client
 above with `--num-frames 2881`. The default remains eight steps; four steps are
@@ -311,6 +313,21 @@ MP4 incrementally instead of retaining all decoded frames in host memory.
 | [Other acceleration](../../docs/user_guide/diffusion_features.md) | Quantization, LoRA, and Cache-DiT are unsupported. Use eager execution; full-transformer compilation is rejected and generic regional compilation leaves the cached reference forward unchanged. FlexAttention retains its own kernel compilation. |
 
 ## Verification
+
+### Section A implementation
+
+Implementation `209771901` passed 234 related CPU checks, all applicable local
+hooks, and four isolated 704×1280 reference cases. Four/eight steps cover three
+49-frame turns and a 129-frame request; resident/offload outputs preserve exact
+complete latents and uint8 pixels under the reference's actual chunk sequence.
+The pinned PixelUMM revision passed 34 CPU checks against the legacy decoder.
+
+Post-correction SP2 runs for history budgets 18 and 36 delivered 2,881 frames
+with 20 prompt/camera controls. The remaining sustained matrix and measurement
+summaries are still being collected. Long-session perceptual quality requires
+separate qualification; duration and resource checks do not establish it.
+
+### Baseline integration evidence
 
 For a quick check, change the offline command to one prompt, 256×256, nine frames,
 and four steps. Verify that the output has nine frames at 24 fps. This checks
