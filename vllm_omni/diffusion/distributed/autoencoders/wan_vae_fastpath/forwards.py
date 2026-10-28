@@ -42,7 +42,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from diffusers.models.autoencoders.autoencoder_kl_wan import (
     CACHE_T,
-    DupUp3D,
     WanCausalConv3d,
     WanDecoder3d,
     WanResample,
@@ -55,6 +54,7 @@ from vllm.logger import init_logger
 from vllm_omni.diffusion.layers.vae_rms_norm import kernels_allowed as _kernels_allowed
 from vllm_omni.diffusion.layers.vae_rms_norm import rms_norm_fastpath as shared_rms_norm_fastpath
 
+from . import families as fam
 from . import triton_data_movement as dm
 from . import triton_norm_cache as nc
 from . import triton_rms_norm_cl as cl
@@ -79,21 +79,26 @@ class FastPathConfig:
     exact_bf16_norm: bool = False
     # Lossless paths and the decoder output projection retain bitwise probes.
     verify_spatial_padding: bool = True
+    # The decoder passes ``first_chunk`` to its up blocks (Wan); Qwen-Image's up blocks take no such argument.
+    up_blocks_take_first_chunk: bool = True
+    # Single-frame ``Conv2d`` causal convs under channels_last: keep the output channels-last for the next consumer
+    # (decoder), or return it contiguous (encoder, whose strided downsample convs are slower on channels-last input).
+    keep_channels_last: bool = True
 
 
 def is_diffusers_rms_norm(module: Any) -> bool:
-    """True for a diffusers ``WanRMS_norm`` instance.
+    """True for a diffusers ``WanRMS_norm`` instance or a registered family's RMS norm with the same numerics.
 
-    Identified by name because the Wan 2.2 NPU patch rebinds ``WanRMS_norm``
-    to ``RMSNormVAE`` in diffusers' module namespace; instances created before
-    that patch keep the original class.
+    ``WanRMS_norm`` is identified by name because the Wan 2.2 NPU patch rebinds
+    ``WanRMS_norm`` to ``RMSNormVAE`` in diffusers' module namespace; instances
+    created before that patch keep the original class.
     ``RMSNormVAE`` has different numerics (eps 1e-6, no fp32 upcast) and is
-    deliberately not matched.
+    deliberately not matched. Other families' norms (``families.WanVaeFamily.rms_norm``)
+    match by exact type.
     """
     cls = type(module)
     return (
-        cls.__name__ == "WanRMS_norm"
-        and cls.__module__.startswith("diffusers.")
+        ((cls.__name__ == "WanRMS_norm" and cls.__module__.startswith("diffusers.")) or cls in fam.rms_norm_types())
         and isinstance(getattr(module, "gamma", None), torch.Tensor)
         and hasattr(module, "scale")
         and hasattr(module, "channel_first")
@@ -212,7 +217,8 @@ def causal_conv_forward(self: WanCausalConv3d, x: torch.Tensor, cache_x: torch.T
         assembled = dm.cat_pad_5d(x, history, padding)
         if assembled is not None:
             return nn.Conv3d.forward(self, assembled)
-    return WanCausalConv3d.forward(self, x, cache_x)
+    # Bound only to exact family types, so this is the module's own reference forward.
+    return type(self).forward(self, x, cache_x)
 
 
 def _conv_without_bias(conv: nn.Conv3d, x: torch.Tensor) -> torch.Tensor:
@@ -453,7 +459,7 @@ def _run_cached_causal_conv(
     is_repeat_marker = isinstance(cache, str)
     payload = cache if isinstance(cache, torch.Tensor) else None
     if (
-        type(conv) is WanCausalConv3d
+        fam.is_role(conv, "causal_conv3d")
         and not _has_forward_hooks(conv)
         and _kernels_allowed(x)
         and x.dim() == 5
@@ -547,7 +553,7 @@ def _run_norm_act_cached_conv(
         and type(act) is nn.SiLU
         and not act.inplace
         and (x.dtype in cfg.fused_silu_dtypes or cfg.channels_last)
-        and type(conv) is WanCausalConv3d
+        and fam.is_role(conv, "causal_conv3d")
         and not _has_forward_hooks(norm, act, conv)
         and _can_bypass_dropout(after_norm)
         and conv._padding[0] == conv._padding[1]
@@ -610,7 +616,7 @@ def _run_conv_out_channels_last(
     cache = cache_list[index]
     payload = cache if isinstance(cache, torch.Tensor) else None
     if (
-        type(conv) is not WanCausalConv3d
+        not fam.is_role(conv, "causal_conv3d")
         or _has_forward_hooks(conv)
         or not _kernels_allowed(x)
         or x.dim() != 5
@@ -829,7 +835,7 @@ def upsample_forward(self: WanUpsample, x: torch.Tensor) -> torch.Tensor:
             if out is not None:
                 return out
         return nn.Upsample.forward(self, x)
-    return WanUpsample.forward(self, x)
+    return type(self).forward(self, x)
 
 
 # --------------------------------------------------------------------------- #
@@ -848,7 +854,7 @@ def residual_block_forward(
     shortcut = self.conv_shortcut
     residual_bias = None
     if (
-        type(shortcut) is WanCausalConv3d
+        fam.is_role(shortcut, "causal_conv3d")
         and shortcut.bias is not None
         and not any(shortcut._padding)
         and not _has_forward_hooks(shortcut)
@@ -928,7 +934,7 @@ def residual_up_block_forward(
     # The upsampler's Conv2d output feeds only ``x + DupUp3D(...)``, so its bias
     # is folded into that kernel (exact: rounded like ATen's ``add_`` first).
     fuse_shortcut = (
-        type(shortcut) is DupUp3D
+        fam.is_role(shortcut, "dup_up")
         and not _has_forward_hooks(shortcut)
         and _kernels_allowed(x)
         and x.dtype == shortcut_source.dtype
@@ -939,7 +945,7 @@ def residual_up_block_forward(
             x = self.upsampler(x)
         elif (
             fuse_shortcut
-            and type(self.upsampler) is WanResample
+            and fam.is_role(self.upsampler, "resample")
             and hasattr(self.upsampler, CFG_ATTR)
             and not _has_forward_hooks(self.upsampler)
         ):
@@ -983,8 +989,10 @@ def decoder_forward(
         x = self.conv_in(x)
 
     x = self.mid_block(x, feat_cache=feat_cache, feat_idx=feat_idx)
+    cfg = getattr(self, CFG_ATTR, None)
+    chunk_kwargs = {} if cfg is not None and not cfg.up_blocks_take_first_chunk else {"first_chunk": first_chunk}
     for up_block in self.up_blocks:
-        x = up_block(x, feat_cache=feat_cache, feat_idx=feat_idx, first_chunk=first_chunk)
+        x = up_block(x, feat_cache=feat_cache, feat_idx=feat_idx, **chunk_kwargs)
 
     x = _norm_act(self.norm_out, self.nonlinearity, x)
     if feat_cache is not None:
@@ -1001,10 +1009,124 @@ def decoder_forward(
     return x
 
 
+# --------------------------------------------------------------------------- #
+# Single-frame Conv2d causal convs (families.WanVaeFamily.causal_conv_kind == "conv2d_single_frame")
+# --------------------------------------------------------------------------- #
+
+
+def _conv2d_with_padding(conv: nn.Conv2d, frame: torch.Tensor, pad: tuple[int, int], *, verify: bool) -> torch.Tensor:
+    """``conv(F.pad(frame))`` with the zero padding inside the convolution.
+
+    With ``verify``, the first call per (conv, shape) compares both formulations
+    on seeded random operands (see :func:`_equal_on_random_operands`) and keeps
+    the pre-padded input for shapes where the backend's bits differ.
+    """
+    top, left = pad
+
+    def candidate(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+        return F.conv2d(x, weight, conv.bias, conv.stride, (top, left), conv.dilation, conv.groups)
+
+    def pre_pad(x: torch.Tensor) -> torch.Tensor:
+        return F.pad(x, (left, left, top, top))
+
+    def padded(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+        return F.conv2d(x, weight, conv.bias, conv.stride, 0, conv.dilation, conv.groups)
+
+    if not verify:
+        return candidate(frame, conv.weight)
+    verdicts = _SPATIAL_PAD_VERDICTS.setdefault(conv, {})
+    key = _conv_verdict_key(conv, frame, 0)
+    verdict = verdicts.get(key)
+    if verdict is None:
+        verdict = _equal_on_random_operands(frame, conv.weight, candidate, padded, pre_pad)
+        _record_verdict(verdicts, key, verdict)
+        if not verdict:
+            logger.info(
+                "Conv2d spatial padding is not bitwise identical to pre-padded input for %s %s; "
+                "using the pre-padded path for this shape",
+                type(conv).__name__,
+                tuple(frame.shape),
+            )
+    return candidate(frame, conv.weight) if verdict else padded(pre_pad(frame), conv.weight)
+
+
+def single_frame_conv_forward(self: nn.Conv2d, x: torch.Tensor, cache_x: torch.Tensor | None = None) -> torch.Tensor:
+    """A causal conv that is a ``Conv2d`` on the squeezed frame (``[B, C, 1, H, W]`` in and out), never cached.
+
+    The reference pads the frame with ``F.pad`` and convolves with ``padding=0``; here the zero padding moves into
+    the convolution (probed bit-exact per shape at the lossless level), and all-zero paddings skip ``F.pad``.
+    """
+    left, right, top, bottom = self._padding
+    if cache_x is not None or not _kernels_allowed(x) or self.padding_mode != "zeros" or x.dim() != 5:
+        return type(self).forward(self, x, cache_x)
+    cfg = getattr(self, CFG_ATTR, None)
+    channels_last = cfg is not None and cfg.channels_last
+    frame = x.squeeze(2)
+    if channels_last:
+        frame = frame.contiguous(memory_format=torch.channels_last)
+    if not (left or right or top or bottom):
+        # ``F.pad`` with all-zero padding only copies.
+        out = F.conv2d(frame, self.weight, self.bias, self.stride, 0, self.dilation, self.groups)
+    elif left == right and top == bottom:
+        verify = cfg is None or cfg.verify_spatial_padding
+        out = _conv2d_with_padding(self, frame, (top, left), verify=verify)
+    else:
+        return type(self).forward(self, x, cache_x)
+    if channels_last and cfg is not None and not cfg.keep_channels_last:
+        out = out.contiguous()
+    return out.unsqueeze(2)
+
+
+# --------------------------------------------------------------------------- #
+# Single-head attention block (channels_last level, families with chunked_attention)
+# --------------------------------------------------------------------------- #
+
+# Query rows per chunk: a 2048 x 16384 fp32 score block is 128 MiB.
+ATTENTION_CHUNK_ROWS = 2048
+
+
+def _chunked_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, rows: int) -> torch.Tensor:
+    """Single-head attention as low-precision matmuls (fp32 accumulation) with an fp32 softmax, ``rows`` at a time."""
+    scale = q.shape[-1] ** -0.5
+    out = torch.empty_like(q)
+    kt = k.transpose(-1, -2)
+    for i in range(0, q.shape[-2], rows):
+        scores = torch.matmul(q[..., i : i + rows, :], kt).float().mul_(scale)
+        out[..., i : i + rows, :] = torch.matmul(scores.softmax(dim=-1).to(q.dtype), v)
+    return out
+
+
+def attention_block_forward(self: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    """The VAE's single-head attention block without SDPA.
+
+    Its head dim is the channel count (384-1152), which no fused SDPA kernel
+    takes, so SDPA falls back to fp32 math. Bound at the channels_last level
+    only (not bit-exact).
+    """
+    if (
+        not _kernels_allowed(x)
+        or x.dtype not in (torch.float16, torch.bfloat16)
+        or _has_forward_hooks(self.norm, self.to_qkv, self.proj)
+    ):
+        return type(self).forward(self, x)
+    identity = x
+    batch, channels, frames, height, width = x.size()
+    x = self.norm(x.permute(0, 2, 1, 3, 4).reshape(batch * frames, channels, height, width))
+    qkv = self.to_qkv(x).reshape(batch * frames, 1, channels * 3, -1).permute(0, 1, 3, 2).contiguous()
+    q, k, v = qkv.chunk(3, dim=-1)
+    x = _chunked_attention(q, k, v, ATTENTION_CHUNK_ROWS)
+    x = x.squeeze(1).permute(0, 2, 1).reshape(batch * frames, channels, height, width)
+    x = self.proj(x)
+    x = x.view(batch, frames, channels, height, width).permute(0, 2, 1, 3, 4)
+    return x + identity
+
+
 __all__ = [
     "CFG_ATTR",
     "FastPathConfig",
+    "attention_block_forward",
     "causal_conv_forward",
+    "single_frame_conv_forward",
     "decoder_forward",
     "is_diffusers_rms_norm",
     "resample_forward",
