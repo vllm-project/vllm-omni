@@ -2152,6 +2152,17 @@ class RainFusionPrecision(str, Enum):
     MIX = "mix"
 
 
+class RainFusionExecKernel(str, Enum):
+    """Kernel that executes the rf_v2 sparse pattern.
+
+    The mask, spatial reorder, and inverse reorder are the same either way;
+    this selects performance, not output semantics.
+    """
+
+    RAINFUSION = "rainfusion"
+    EAGLE_BSA = "eagle_bsa"
+
+
 @dataclass
 class BlockSparseSpec:
     """User-facing controls shared by block-sparse attention backends.
@@ -2161,12 +2172,15 @@ class BlockSparseSpec:
     index selector such as "0-3,38") exempts individual DiT blocks. Those two are
     the accuracy knobs to trade back quality at a fixed ``sparsity``.
     ``precision`` selects the kernel precision mode (see ``RainFusionPrecision``).
+    ``exec_kernel`` selects which kernel executes the rf_v2 pattern; unset lets
+    MindIE-SD decide (see ``RainFusionExecKernel``).
     """
 
     sparsity: float = 0.8
     start_step: int = 0
     end_step: int = 0
     precision: str = RainFusionPrecision.BF16.value
+    exec_kernel: str | None = None
     skip_layers: str | list[int] | None = None
     skip_layer_indices: set[int] | None = field(default=None, repr=False)
 
@@ -2181,6 +2195,14 @@ class BlockSparseSpec:
         if precision not in valid:
             raise ValueError(f"block_sparse.precision must be one of {sorted(valid)}; got {self.precision!r}.")
         self.precision = precision
+        if self.exec_kernel is not None:
+            kernel = self.exec_kernel.value if isinstance(self.exec_kernel, RainFusionExecKernel) else self.exec_kernel
+            valid_kernels = {member.value for member in RainFusionExecKernel}
+            if kernel not in valid_kernels:
+                raise ValueError(
+                    f"block_sparse.exec_kernel must be one of {sorted(valid_kernels)}; got {self.exec_kernel!r}."
+                )
+            self.exec_kernel = kernel
         self.skip_layer_indices = parse_kv_cache_skip_selector(self.skip_layers)
 
 
@@ -2298,6 +2320,8 @@ class AttentionSpec:
             kw["start_step"] = bs.start_step
             kw["end_step"] = bs.end_step
             kw["precision"] = bs.precision
+            if bs.exec_kernel is not None:
+                kw["exec_kernel"] = bs.exec_kernel
             if bs.skip_layer_indices:
                 kw["skip_layers"] = sorted(bs.skip_layer_indices)
 

@@ -210,7 +210,13 @@ class TestAttentionSpec:
 
     @pytest.mark.parametrize(
         "block_sparse",
-        [{"sparsity": 1.5}, {"start_step": -1}, {"end_step": -1}, {"precision": "bogus"}],
+        [
+            {"sparsity": 1.5},
+            {"start_step": -1},
+            {"end_step": -1},
+            {"precision": "bogus"},
+            {"exec_kernel": "bogus"},
+        ],
     )
     def test_block_sparse_invalid_values(self, block_sparse):
         with pytest.raises(ValueError):
@@ -247,6 +253,37 @@ class TestAttentionSpec:
         cfg = RainFusionConfig.from_backend_kwargs(kwargs)
         assert cfg.precision == "mix"
         assert type(cfg.precision) is str
+
+    def test_block_sparse_exec_kernel_unset_by_default(self):
+        """Unset must stay absent from the kwargs: MindIE-SD decides the executor."""
+        from vllm_omni.diffusion.attention.backends.rainfusion_attn import RainFusionConfig
+
+        spec = AttentionSpec(backend="RAINFUSION_ATTN")
+        assert spec.block_sparse.exec_kernel is None
+        assert "exec_kernel" not in spec.backend_kwargs()
+        assert RainFusionConfig.from_backend_kwargs(spec.backend_kwargs()).exec_kernel is None
+
+    @pytest.mark.parametrize("exec_kernel", ["rainfusion", "eagle_bsa"])
+    def test_block_sparse_exec_kernel_forwarded(self, exec_kernel):
+        from vllm_omni.diffusion.attention.backends.rainfusion_attn import RainFusionConfig
+
+        spec = AttentionSpec(
+            backend="RAINFUSION_ATTN",
+            block_sparse={"sparsity": 0.8, "exec_kernel": exec_kernel},
+        )
+        kwargs = spec.backend_kwargs()
+        assert kwargs["exec_kernel"] == exec_kernel
+        assert RainFusionConfig.from_backend_kwargs(kwargs).exec_kernel == exec_kernel
+
+    def test_block_sparse_exec_kernel_enum_input_normalized(self):
+        from vllm_omni.diffusion.data import RainFusionExecKernel
+
+        spec = AttentionSpec(
+            backend="RAINFUSION_ATTN",
+            block_sparse={"sparsity": 0.8, "exec_kernel": RainFusionExecKernel.EAGLE_BSA},
+        )
+        assert spec.block_sparse.exec_kernel == "eagle_bsa"
+        assert spec.backend_kwargs()["exec_kernel"] == "eagle_bsa"
 
 
 class TestAttentionConfig:

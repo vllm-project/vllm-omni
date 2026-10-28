@@ -91,6 +91,22 @@ def _supports_video_spans(sparse_attention: Any) -> bool:
         return False
 
 
+@functools.cache
+def _mindiesd_supports_exec_kernel() -> bool:
+    """Whether the installed MindIE-SD accepts exec_kernel=.
+
+    An older release swallows it through ``**kwargs`` and runs its default
+    operator anyway, which would silently measure the wrong kernel. The answer
+    cannot change within a process, so the probe is cached.
+    """
+    try:
+        from mindiesd import sparse_attention
+
+        return "exec_kernel" in inspect.signature(sparse_attention).parameters
+    except (ImportError, TypeError, ValueError):
+        return False
+
+
 @dataclass(frozen=True)
 class RainFusionConfig:
     """Resolved RainFusion controls for one attention layer.
@@ -105,6 +121,7 @@ class RainFusionConfig:
     start_step: int = 0
     end_step: int = 0
     precision: str = "bf16"
+    exec_kernel: str | None = None
     skip_layers: frozenset[int] = frozenset()
 
     @classmethod
@@ -115,6 +132,7 @@ class RainFusionConfig:
             start_step=int(bk.get("start_step", 0)),
             end_step=int(bk.get("end_step", 0)),
             precision=str(bk.get("precision", "bf16")),
+            exec_kernel=bk.get("exec_kernel"),
             skip_layers=frozenset(bk.get("skip_layers") or ()),
         )
 
@@ -274,6 +292,8 @@ class RainFusionAttentionImpl(AttentionImpl):
             int(attn_metadata.extra.get("minimax_h3_compact_reference_rows", 0)) if attn_metadata is not None else 0
         )
         if reference_rows:
+            # reference_rows is only nonzero when attn_metadata was present.
+            assert attn_metadata is not None
             if self.qkv_layout != _INPUT_LAYOUT:
                 raise ValueError("RainFusion reference-KV reuse requires BSND layout")
             if key.shape != value.shape or key.shape[1] != query.shape[1] + reference_rows:
@@ -357,6 +377,11 @@ class RainFusionAttentionImpl(AttentionImpl):
         return not is_a5_device()
 
     def _forward_hybrid_npu(self, query, key, value, metadata, sparse_plan, reference_rows, *, q_spans):
+        if self.rainfusion.exec_kernel is not None:
+            raise ValueError(
+                "block_sparse.exec_kernel does not apply to the hybrid reference-KV path: "
+                "that path runs hybrid_attention, not the rf_v2 executor."
+            )
         from vllm_omni.diffusion.attention.ops.rainfusion_hybrid import get_hybrid_plan, hybrid_attention
 
         used_q = int(metadata.extra["max_seqlen_q"])
@@ -633,6 +658,14 @@ class RainFusionAttentionImpl(AttentionImpl):
             raise ImportError(_MISSING_MINDIESD)
         if plan.video_spans is not None and not _supports_video_spans(sparse_attention):
             raise ValueError(_INCOMPATIBLE_MINDIESD)
+        exec_kernel = self.rainfusion.exec_kernel
+        if exec_kernel is not None and not _mindiesd_supports_exec_kernel():
+            raise ValueError(
+                f"block_sparse.exec_kernel={exec_kernel!r} was requested, but the installed MindIE-SD "
+                "sparse_attention does not accept exec_kernel=. It would run its default operator anyway, "
+                "so the request is refused rather than silently measuring the wrong kernel. "
+                "Upgrade MindIE-SD or unset exec_kernel."
+            )
         extra = attn_metadata.extra if attn_metadata else {}
         requested = extra.get("kv_cache_dtype", self.rainfusion.precision)
         reason = None
@@ -657,7 +690,17 @@ class RainFusionAttentionImpl(AttentionImpl):
                 "MindIE-SD, or disable attention quantization. Automatic precision fallback is not performed."
             )
 
-        logger.info_once("RainFusion uses MindIE-SD sparse attention, precision=%s.", precision)
+        if exec_kernel is not None and precision != "bf16":
+            raise ValueError(
+                f"block_sparse.exec_kernel={exec_kernel!r} only applies to the rf_v2 (bf16) path; "
+                f"precision={precision!r} selects rf_v3, which ignores the executor. "
+                "Unset exec_kernel or keep block_sparse.precision at bf16."
+            )
+        logger.info_once(
+            "RainFusion uses MindIE-SD sparse attention, precision=%s, exec_kernel=%s.",
+            precision,
+            exec_kernel or "default",
+        )
         used = plan.used_len
         # Split query once: the valid prefix drives the kernel, the padding
         # tail is reused verbatim as the output padding below. All views,
@@ -676,6 +719,8 @@ class RainFusionAttentionImpl(AttentionImpl):
             "sparsity": self.rainfusion.sparsity,
             "precision": precision,
         }
+        if exec_kernel is not None:
+            common_kwargs["exec_kernel"] = exec_kernel
         if plan.video_spans is not None:
             out = sparse_attention(
                 q,

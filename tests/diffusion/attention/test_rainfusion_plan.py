@@ -342,3 +342,58 @@ def test_precision_non_bf16_passes_gate_when_supported():
             # The gate must pass; the fake mindiesd returns None so no crash.
             out = impl._forward_sparse_npu(q, q, q, plan)
             assert out is None
+
+
+# exec_kernel capability gate: an older mindiesd would swallow the request and
+# run its default operator, so an explicit kernel choice must fail fast.
+
+
+def _recording_exec_kernel_mindiesd_module():
+    """Install a stand-in whose sparse_attention records the executor."""
+    import types
+
+    calls: list[dict] = []
+
+    def sparse_attention(q, k, v, *, exec_kernel=None, **kwargs):
+        calls.append({"exec_kernel": exec_kernel, **kwargs})
+        return q
+
+    fake = types.ModuleType("mindiesd")
+    setattr(fake, "sparse_attention", sparse_attention)
+    return fake, calls
+
+
+def test_exec_kernel_requires_mindiesd_support():
+    impl = make_impl(exec_kernel="eagle_bsa")
+    plan = RainFusionPlan(prefix_len=0, used_len=8, latent_shape=[2, 2, 2])
+    fake, _ = _recording_exec_kernel_mindiesd_module()
+    with mock.patch.dict(sys.modules, {"mindiesd": fake}):
+        with mock.patch.object(rainfusion_attn, "_mindiesd_supports_exec_kernel", return_value=False):
+            with pytest.raises(ValueError, match="exec_kernel"):
+                impl._forward_sparse_npu(torch.randn(1, 8, 4, 128), None, None, plan)
+
+
+def test_exec_kernel_is_forwarded_to_sparse_attention():
+    impl = make_impl(exec_kernel="eagle_bsa")
+    q = torch.randn(1, 8, 4, 128)
+    plan = RainFusionPlan(prefix_len=0, used_len=8, latent_shape=[2, 2, 2])
+    fake, calls = _recording_exec_kernel_mindiesd_module()
+    with mock.patch.dict(sys.modules, {"mindiesd": fake}):
+        with mock.patch.object(rainfusion_attn, "_mindiesd_supports_exec_kernel", return_value=True):
+            impl._forward_sparse_npu(q, q, q, plan)
+
+    assert calls[0]["exec_kernel"] == "eagle_bsa"
+
+
+def test_exec_kernel_rejected_on_rf_v3():
+    """The executor knob only describes rf_v2; rf_v3 would ignore it."""
+    impl = make_impl(precision="mix", exec_kernel="eagle_bsa")
+    plan = RainFusionPlan(prefix_len=0, used_len=8, latent_shape=[2, 2, 2])
+    fake, _ = _recording_exec_kernel_mindiesd_module()
+    with mock.patch.dict(sys.modules, {"mindiesd": fake}):
+        with (
+            mock.patch.object(rainfusion_attn, "_mindiesd_supports_exec_kernel", return_value=True),
+            mock.patch.object(rainfusion_attn, "_mindiesd_supports_precision", return_value=True),
+        ):
+            with pytest.raises(ValueError, match="rf_v3"):
+                impl._forward_sparse_npu(torch.randn(1, 8, 4, 128), None, None, plan)
