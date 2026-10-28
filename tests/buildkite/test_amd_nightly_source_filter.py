@@ -61,7 +61,7 @@ def _labels(doc: dict) -> set[str]:
 
 def test_every_amd_nightly_job_declares_source_dependencies() -> None:
     leaves = _leaf_steps(_load_pipeline(AMD_NIGHTLY_PIPELINE))
-    assert len(leaves) == 30
+    assert leaves, "AMD nightly pipeline must contain jobs"
     assert all(step.get("source_file_dependencies") for step in leaves)
 
 

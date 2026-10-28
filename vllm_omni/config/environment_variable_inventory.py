@@ -142,6 +142,7 @@ _PLATFORM_EXTERNAL = (
     "RAY_RAYLET_PID",
     "RDMA_DEVICE_NAME",
     "SAGE_ATTN_TENSOR_LAYOUT",
+    "TORCHINDUCTOR_CACHE_DIR",
     "VLLM_LOCAL_RANK",
     "WORLD_SIZE",
     "XDG_CACHE_HOME",
@@ -294,6 +295,9 @@ _INTERNAL = (
     "VLLM_OMNI_DLO_DP_WAVE_TIMEOUT",
     "VLLM_OMNI_GROUP_NORM_SPLIT_WAVES",
     "VLLM_OMNI_REPLICA_ID",
+    # Removed in vLLM v0.16.0. Omni reads it only to emit a migration warning;
+    # it does not enable profiling or register /start_profile.
+    "VLLM_TORCH_PROFILER_DIR",
 )
 
 _REDACTED = frozenset(

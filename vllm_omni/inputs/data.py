@@ -4,8 +4,9 @@
 import copy
 import math
 import pprint
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass, field
-from typing import Any, TypeAlias
+from typing import Any, TypeAlias, TypeVar, cast
 
 import torch
 from typing_extensions import NotRequired, TypedDict
@@ -137,6 +138,12 @@ class OmniCustomPrompt(TypedDict, total=False):
     Allows users to pass pre-tokenized prompt IDs, attention masks, and extra
     arguments directly, bypassing the tokenization stage in the pipeline.
 
+    ``prompt_ids`` / ``negative_prompt_ids`` are honored only by pipelines that
+    declare ``supports_pre_tokenized_prompt_ids = True``. The diffusion engine
+    rejects a request that sets them for any other in-tree pipeline (HTTP 400)
+    instead of silently generating from an empty or text-only condition. A
+    user-supplied custom pipeline is not checked unless it declares the flag.
+
     Attributes:
         prompt_ids: Pre-tokenized prompt token IDs (single or batched)
         negative_prompt_ids: Pre-tokenized negative prompt token IDs
@@ -211,6 +218,9 @@ class OmniDiffusionSamplingParams:
     execution, allowing methods to update specific components without needing
     to manage numerous individual parameters.
     """
+
+    # Whether final outputs should be watermarked (when configured).
+    watermarking: bool | None = None
 
     # Additional text-related parameters
     max_sequence_length: int | None = None
@@ -444,6 +454,7 @@ class OmniDiffusionSamplingParams:
             seed = getattr(params, "seed", None)
             if seed is not None:
                 mapped.setdefault("seed", seed)
+            mapped["watermarking"] = params.watermarking
             return cls(**mapped)
         raise TypeError(
             "Diffusion stage requires OmniDiffusionSamplingParams or vllm.SamplingParams, "
@@ -452,3 +463,19 @@ class OmniDiffusionSamplingParams:
 
 
 OmniSamplingParams: TypeAlias = SamplingParams | OmniDiffusionSamplingParams
+
+StageParamsT = TypeVar("StageParamsT")
+
+
+def disable_watermarking(params_list: Sequence[StageParamsT]) -> list[StageParamsT]:
+    """Copy each stage's sampling params with watermarking disabled."""
+    disabled_params_list: list[StageParamsT] = []
+    for params in params_list:
+        if isinstance(params, OmniSamplingParams):
+            disabled = copy.copy(params)
+            disabled.watermarking = False
+            # copy.copy preserves the concrete type, which mypy loses through the isinstance narrowing
+            disabled_params_list.append(cast(StageParamsT, disabled))
+        else:
+            disabled_params_list.append(params)
+    return disabled_params_list

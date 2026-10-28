@@ -729,8 +729,11 @@ def test_mrv2_duplex_turn_end_keeps_live_code2wav_stream_open(request_terminal: 
     assert payload.meta.turn_end is True
     assert payload.meta.is_segment_finished.item() is True
     assert payload.meta.finished.item() is request_terminal
-    metadata = OmniConnectorPayloadTransport._extract_scheduling_metadata({"meta": {"finished": payload.meta.finished}})
-    assert metadata.get("input_terminal", False) is request_terminal
+    transport = OmniConnectorPayloadTransport.__new__(OmniConnectorPayloadTransport)
+    transport._async_chunk = True
+    transport._model_mode = "generation"
+    update = transport._extract_scheduling_metadata_update({"meta": {"finished": payload.meta.finished}})
+    assert (update.input_terminal if update is not None else False) is request_terminal
 
 
 @pytest.mark.parametrize("last_valid", [False, True])

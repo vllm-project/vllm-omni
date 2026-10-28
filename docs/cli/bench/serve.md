@@ -77,6 +77,12 @@ You can use `vllm bench serve --omni --help=all` to get descriptions of all para
                     'Allowed metric names are "ttft", "tpot", "itl", "ttfc", "tpoc", "icl", '
                     '"tpop", "e2el", "audio_ttfp", "audio_rtf", "audio_duration". '
 
+- `--goodput`
+  Specify request-level service objectives as space-separated `KEY:VALUE` pairs, with values in milliseconds.
+  Supported metrics are `ttft`, `tpot`, `e2el`, and `audio_ttfp`. When multiple objectives are supplied, a
+  request contributes to goodput only when it satisfies every objective, for example
+  `--goodput ttft:500 audio_ttfp:1000`.
+
 - `--print-stage`
 Print per-stage benchmark metrics for --omni serving when stage metrics are returned by the server. Disabled by default.
 
@@ -452,6 +458,18 @@ sessions, and judge errors. Partial coverage is marked `partial`; no evaluated
 sessions is `failed`, not a zero-error accuracy result. Scores are conditional on
 the evaluated subset, not an accuracy score for all attempted sessions. Warmups
 are never scored. Judge failures do not discard completed performance measurements.
+Judge replies must finish with `finish_reason="stop"` and contain the required
+scores: `temporal_score` (integer 0–3) and `is_relevant` (0 or 1) for temporal
+judging, `content_score` (finite number 0–3) for content judging, or `success_score`
+(0 or 1) for PR. A missing or null `finish_reason` fails evaluation even when the
+score JSON is valid: a parseable score does not establish that generation finished.
+Missing or invalid scores also fail evaluation; a valid zero from a completed
+reply still counts as an evaluated sample. Raw judge replies are saved beside each score in
+`<sample>.judge.jsonl`. Retrying evaluation archives an existing score as
+`<sample>.json.<unique-id>.previous`, which summaries exclude, and resets the
+reply trace. A failed retry leaves no active score; a new score is published only
+after all required judge calls succeed.
+
 The saved `omni_duplex_eval.published_with_unfinished_responses` counts published
 samples with non-empty `unfinished_response_ids` in their metadata. A nonzero count
 also emits a warning. These samples remain eligible for scoring using their collected

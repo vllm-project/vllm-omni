@@ -1209,6 +1209,39 @@ Caching and sidecars alone save repeated projection work; GPU residency changes
 with weight offload, which is enabled by default on supported SM120 configurations. Gains depend on the workload,
 offload behavior, embedding fingerprint cost, and TP coordination overhead.
 
+## Ref2VA dialogue prompts
+
+Ref2VA generates speech from the prompt text. The audio branch follows the
+official H3 prompt contract
+([h3-prompt-writing skill](https://github.com/MiniMax-AI/MiniMax-H3/tree/main/skills/h3-prompt-writing))
+rather than a serving-layer parser: `vllm_omni` passes the raw prompt to the
+H3 text encoder with no `<d>`-mark preprocessing, and the official Ref2VA
+processor contains no dialogue parsing either. Prompts that deviate from the
+contract surface as audio artifacts (#8905): narrative text outside `<d>`
+spoken verbatim, dialogue lines repeated, and filler syllables around the
+clip. #8905 reports these artifacts on NPU across the attention and cache
+variants it tried, and a separate GPU report shows a bare English prompt
+spoken as well; `vllm_omni` forwards the raw prompt to the text encoder
+unchanged on every stack, so rewrite the prompt into the official format
+first, before changing serve flags.
+
+The contract rules that matter for Ref2VA dialogue:
+
+- Write the description sections in English; keep only dialogue and lyrics in
+  their original language, wrapped as `<d>[Language] ...</d>`. Narration in
+  other languages outside `<d>` can be spoken aloud.
+- Dialogue appears only inside `<d>`. Do not repeat the spoken lines in other
+  sections; text outside `<d>` is stage direction the audio branch may
+  vocalize.
+- Assign one stable speaker ID per vocal source and write
+  `<Subject N> (Sx) says, <d>[Language] ...</d>`; do not pack multiple
+  speakers into one `<d>` span.
+- Keep dialogue punctuation simple (`,`, `.`, `?`, `!`); drop tildes, emoji,
+  bullets, and decorative punctuation.
+
+The official skills directory provides rewrite agents that convert free-form
+storyboard prompts into this six-section format.
+
 ## LoRA
 
 ### Turbo LoRA
