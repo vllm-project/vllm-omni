@@ -405,6 +405,84 @@ def test_publish_moe_lora_context_uses_no_lora_mapping_until_adapter_is_active(m
     assert wrapper.mappings == [punica]
 
 
+def _make_detachable_moe_manager(monkeypatch):
+    """Manager holding one MoE wrapper whose runner can detach the context."""
+    import vllm.lora.layers.fused_moe as fused_moe
+    import vllm.lora.punica_wrapper as punica_module
+
+    class _FakePunica:
+        def __init__(self):
+            self.update_calls = []
+
+        def update_metadata(self, mapping, lora_index_to_id, max_loras, vocab_size):
+            self.update_calls.append((mapping, lora_index_to_id, max_loras, vocab_size))
+
+    class _DetachableMoELoRA(fused_moe.FusedMoEWithLoRA):
+        def __init__(self):
+            torch.nn.Module.__init__(self)
+            self.mappings = []
+            self.idle_calls = 0
+            self.base_layer = torch.nn.Module()
+
+        def set_mapping(self, punica_wrapper):
+            self.mappings.append(punica_wrapper)
+
+        def _set_diffusion_moe_lora_idle(self):
+            self.idle_calls += 1
+
+        def set_lora(self, index, lora_a, lora_b):
+            raise AssertionError("MoE layer has no adapter weights in this test")
+
+        def reset_lora(self, index):
+            pass
+
+    punica = _FakePunica()
+    monkeypatch.setattr(punica_module, "get_punica_wrapper", lambda *args, **kwargs: punica)
+
+    manager = object.__new__(DiffusionLoRAManager)
+    manager._moe_punica_wrapper = None
+    manager._max_lora_rank = 8
+    manager.max_cached_adapters = 1
+    manager.dtype = torch.bfloat16
+    manager.device = torch.device("cpu")
+    manager._max_num_batched_tokens = 4
+    manager._active_adapter_id = None
+    wrapper = _DetachableMoELoRA()
+    manager._lora_modules = {"transformer.experts": wrapper}
+    return manager, wrapper, punica
+
+
+def test_publish_moe_lora_context_detaches_while_no_adapter_is_active(monkeypatch):
+    """Runners that branch on context presence must see no context when idle.
+
+    Ascend's unquantized MoE path runs index recovery, an extra all_to_all and
+    bgmv shrink/expand whenever a context is published, even for a zero delta,
+    so publishing the slot-0 mapping there costs a baseline forward ~65%.
+    """
+    manager, wrapper, punica = _make_detachable_moe_manager(monkeypatch)
+
+    manager._publish_moe_lora_context()
+
+    assert wrapper.idle_calls == 1
+    assert wrapper.mappings == []
+    assert punica.update_calls == []
+    assert manager._moe_punica_wrapper is None
+
+
+def test_publish_moe_lora_context_publishes_to_detachable_runner_when_active(monkeypatch):
+    """An active adapter still gets a real context on a detachable runner."""
+    manager, wrapper, punica = _make_detachable_moe_manager(monkeypatch)
+    manager._active_adapter_id = 7
+
+    manager._publish_moe_lora_context()
+
+    assert wrapper.idle_calls == 0
+    assert wrapper.mappings == [punica]
+    mapping, lora_index_to_id, _, _ = punica.update_calls[-1]
+    assert mapping.index_mapping == (1,) * 4
+    assert lora_index_to_id == [1]
+
+
 def test_activation_republishes_moe_mapping_after_committing_the_adapter(monkeypatch):
     """The mapping is derived from ``_active_adapter_id``; activating an
     adapter must republish it, otherwise the MoE kernels keep taking the

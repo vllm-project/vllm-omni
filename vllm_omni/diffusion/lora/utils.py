@@ -201,6 +201,22 @@ def from_layer_diffusion(
 
         instance.suspend_lora = _suspend_lora  # type: ignore[method-assign]
         instance.resume_lora = _resume_lora  # type: ignore[method-assign]
+
+        # Ascend's MoE runner takes the LoRA data path whenever a context is
+        # published, regardless of whether any token selects an adapter: index
+        # recovery, an extra all_to_all of the LoRA indices and bgmv
+        # shrink/expand launches run per layer per step (the -1 sentinel only
+        # skips rows inside the kernel). Expose an idle hook so the manager can
+        # detach the context while no adapter is active. GPU wrappers have no
+        # such entry point and keep the published no-adapter mapping, which
+        # TRTLLM / Triton LoRA experts assert on (issue #9232).
+        publish_to_runner = getattr(layer, "set_lora_context", None)
+        if callable(publish_to_runner):
+
+            def _set_diffusion_moe_lora_idle() -> None:
+                publish_to_runner(None)
+
+            instance._set_diffusion_moe_lora_idle = _set_diffusion_moe_lora_idle  # type: ignore[method-assign]
         return instance
 
     diffusion_lora_classes = [

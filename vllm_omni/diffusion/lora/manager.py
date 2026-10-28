@@ -1153,13 +1153,27 @@ class DiffusionLoRAManager:
 
         Republish after buffer reallocation so kernels reference the current tensors.
         Refresh the punica token mapping so baseline (no adapter) and adapted
-        forwards select the matching TRTLLM path.
+        forwards select the matching TRTLLM path, or detach the context entirely
+        while idle on runners that treat its presence as the LoRA switch.
         """
         from vllm.lora.layers.fused_moe import FusedMoEWithLoRA
 
         moe_wrappers = [ll for ll in self._lora_modules.values() if isinstance(ll, FusedMoEWithLoRA)]
         if not moe_wrappers:
             return
+        if self._active_adapter_id is None:
+            # Backends whose MoE data path branches on "a context is published"
+            # rather than on the punica no-adapter flag (Ascend) must have the
+            # context detached while idle, or every baseline step pays the full
+            # LoRA path for a zero delta. Wrappers expose the hook only when
+            # their runner supports detaching; the rest keep the slot-0
+            # mapping below.
+            idle_hooks = [getattr(ll, "_set_diffusion_moe_lora_idle", None) for ll in moe_wrappers]
+            if all(callable(hook) for hook in idle_hooks):
+                for hook in idle_hooks:
+                    hook()
+                logger.debug("Detached idle MoE LoRA context on %d wrapper(s)", len(moe_wrappers))
+                return
         punica = self._get_moe_punica_wrapper()
         mapping, lora_index_to_id = self._moe_token_lora_mapping()
         punica.update_metadata(mapping, lora_index_to_id, 1, 0)
