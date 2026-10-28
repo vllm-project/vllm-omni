@@ -112,7 +112,10 @@ fault-tolerant, elastic-EP, Ray, and runtime-LoRA combinations before startup.
 as `--duplex-engine-backend process`. This selects session-only serving without
 changing model capabilities. The entrypoint retains session handles and delegates
 process/IPC ownership to `ProcessDuplexEngineClient`; it does not initialize
-frontend generation processors or the chat service. Model listing, health, and
+frontend generation processors or the chat service. Both backends share output
+bookkeeping, the async output pump, and engine-death fan-out. The shared async
+base accepts engine-provided frontend config and async health hooks, falling
+back to the existing local-stage behavior when those hooks are absent. Model listing, health, and
 warmup use the process client's startup facts and control interface. The normal
 thread backend retains mixed chat/session serving. Runtime ownership and the
 cross-process invalidation boundary are specified in [Full Duplex](../fullduplex.md#runtime-process-placement).

@@ -28,6 +28,7 @@ import uvloop
 from vllm.logger import init_logger
 from vllm.v1.engine.exceptions import EngineDeadError
 
+from vllm_omni.config.endpoint_policy import EndpointRestriction, OmniServingCapability
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
 from vllm_omni.engine.duplex import commands, events
 from vllm_omni.engine.duplex.config import DuplexCapabilities, DuplexSessionConfig
@@ -349,6 +350,9 @@ class ProcessDuplexEngineClient:
     revoke a frontend send already committed before the notification arrives.
     """
 
+    supported_tasks: tuple[str, ...] = ()
+    input_processor = None
+
     def __init__(self, model: str, options: dict[str, Any], *, factory: EngineFactory) -> None:
         from vllm.v1.metrics.prometheus import setup_multiprocess_prometheus
 
@@ -394,6 +398,28 @@ class ProcessDuplexEngineClient:
             child.close()
             self.shutdown()
             raise
+
+    @property
+    def config_path(self) -> str | None:
+        return self.metadata.config_path
+
+    @property
+    def stage_configs(self) -> list[ProcessDuplexStageMetadata]:
+        return self.metadata.stage_configs
+
+    @property
+    def endpoint_restrictions(self) -> tuple[EndpointRestriction, ...]:
+        return tuple(
+            EndpointRestriction(OmniServingCapability[name], reason)
+            for name, reason in self.metadata.endpoint_restrictions
+        )
+
+    def get_frontend_vllm_config(self) -> None:
+        """The worker owns stage configurations and generation processors."""
+        return None
+
+    def get_frontend_diffusion_od_config(self) -> None:
+        return None
 
     def _read_exactly(self, size: int) -> bytes:
         result = bytearray()
@@ -534,7 +560,7 @@ class ProcessDuplexEngineClient:
     async def submit_command_async(self, session_id: str, command: commands.DuplexCommand) -> None:
         await self._send((None, "submit_command_async", (session_id, type(command).__name__, command), {}))
 
-    async def check_health(self) -> None:
+    async def check_health_async(self) -> None:
         if not self.is_alive():
             raise EngineDeadError(self._failure or "Duplex engine process is not alive")
         try:

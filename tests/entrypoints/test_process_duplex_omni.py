@@ -10,6 +10,7 @@ import asyncio
 import httpx
 import pytest
 from fastapi import FastAPI
+from vllm.v1.engine.exceptions import EngineDeadError
 
 from tests.engine.duplex.test_process_engine import fake_factory
 from vllm_omni.config.endpoint_policy import shutdown_unsupported_routes
@@ -194,3 +195,16 @@ def test_websocket_audio_uses_spawned_runtime(monkeypatch):
         event = websocket.receive_json()
         assert event["type"] == "response.output_audio.delta"
         assert event["delta"] == "AAAA"
+
+
+@pytest.mark.asyncio
+async def test_shared_frontend_checks_worker_health_not_just_process_liveness(monkeypatch):
+    monkeypatch.setattr("vllm_omni.entrypoints.duplex_omni._ProcessWorkerRuntime", fake_factory)
+    omni = DuplexOmni("fake", duplex_engine_backend="process", init_timeout=30, health_error=True)
+    try:
+        assert omni.engine.is_alive()
+        with pytest.raises(EngineDeadError, match="Stage-2"):
+            await omni.check_health()
+        assert omni.engine.is_alive()
+    finally:
+        await omni.aclose()

@@ -33,8 +33,6 @@ from typing import Any, Literal
 from uuid import uuid4
 
 from vllm.logger import init_logger
-from vllm.tasks import SupportedTask
-from vllm.v1.engine.exceptions import EngineDeadError
 
 from vllm_omni.config.endpoint_policy import EndpointRestriction, OmniServingCapability
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
@@ -367,13 +365,9 @@ class DuplexOmni(AsyncOmni):
                 raise TypeError("The process duplex backend accepts keyword engine options only")
             self.engine = ProcessDuplexEngineClient(model, kwargs, factory=_ProcessWorkerRuntime)
             self.model = self.engine.metadata.model
-            self.config_path = self.engine.metadata.config_path
-            self.input_processor = None
-            self.final_output_task: asyncio.Task[None] | None = None
-            self.endpoint_restrictions = tuple(
-                EndpointRestriction(OmniServingCapability[name], reason)
-                for name, reason in self.engine.metadata.endpoint_restrictions
-            ) + tuple(
+            self._initialize_output_state()
+            self._initialize_async_frontend()
+            self.endpoint_restrictions += tuple(
                 EndpointRestriction(capability, "The process duplex backend serves sessions only")
                 for capability in OmniServingCapability
             )
@@ -387,53 +381,11 @@ class DuplexOmni(AsyncOmni):
         #: whose answers keep timing out.
         self._resume_replay_backoff_s: tuple[float, float] = (0.5, 5.0)
 
-    @property
-    def stage_configs(self) -> list:
-        if isinstance(self.engine, ProcessDuplexEngineClient):
-            return self.engine.metadata.stage_configs
-        return super().stage_configs
-
-    @property
-    def vllm_config(self) -> Any:
-        return None if self.session_only else super().vllm_config
-
-    async def get_vllm_config(self) -> Any:
-        return None if self.session_only else await super().get_vllm_config()
-
-    def get_diffusion_od_config(self) -> Any:
-        return None if self.session_only else super().get_diffusion_od_config()
-
-    async def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
-        return () if self.session_only else await super().get_supported_tasks()
-
     async def generate(self, *args: Any, **kwargs: Any) -> AsyncGenerator[OmniRequestOutput, None]:
         if self.session_only:
             raise NotImplementedError("The process duplex backend serves sessions only; use open_session()")
         async for output in super().generate(*args, **kwargs):
             yield output
-
-    async def check_health(self) -> None:  # type: ignore[override]
-        if isinstance(self.engine, ProcessDuplexEngineClient):
-            await self.engine.check_health()
-        else:
-            await super().check_health()
-
-    def _final_output_handler(self) -> None:
-        if not isinstance(self.engine, ProcessDuplexEngineClient):
-            super()._final_output_handler()
-            return
-        if self.final_output_task is not None:
-            return
-
-        async def pump() -> None:
-            try:
-                while True:
-                    for message in await self.engine.get_outputs_async():
-                        self._route_engine_message(message)
-            except EngineDeadError as exc:
-                self._on_engine_dead(str(exc))
-
-        self.final_output_task = asyncio.create_task(pump())
 
     async def aclose(self) -> None:
         """Release sessions and flush the process shutdown before joining it."""

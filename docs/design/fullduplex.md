@@ -41,7 +41,12 @@ backend selects a session-only deployment. `DuplexOmni` retains the handle
 registry, session configuration normalization, and abandoned-open/resume
 compensation; `ProcessDuplexEngineClient` owns spawning, IPC correlation, local
 output buffers, invalidation delivery, health checks, and child teardown.
-The process client does not subclass the public entrypoint.
+The process client does not subclass the public entrypoint. Both backends use
+`AsyncOmniBase`'s output pump and engine-death fan-out. Shared frontend
+initializers attach output bookkeeping and engine metadata independently of
+generation processor setup. The process client exposes its metadata directly
+and supplies optional frontend-config and asynchronous health hooks; it does
+not require backend-specific config accessors or an output pump in `DuplexOmni`.
 
 A module-level, entrypoint-owned worker factory loads normal general plugins
 and creates the native runtime in the child, including its orchestrator thread
