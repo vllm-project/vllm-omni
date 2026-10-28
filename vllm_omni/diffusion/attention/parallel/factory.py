@@ -19,6 +19,7 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     get_sp_group,
 )
 from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
+from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
 
@@ -46,6 +47,11 @@ def build_parallel_attention_strategy(
     ring_degree = getattr(p, "ring_degree", 1)
     allgather_degree = getattr(p, "allgather_degree", 1)
     ulysses_a2a_permute = getattr(p, "ulysses_a2a_permute", False)
+    if ulysses_a2a_permute and current_omni_platform.is_npu():
+        if not cfg.enforce_eager:
+            raise ValueError("NPU ulysses_a2a_permute currently requires enforce_eager=True (--enforce-eager)")
+        if getattr(p, "ulysses_mode", "strict") != "strict" or ulysses_degree <= 1 or ring_degree != 1:
+            raise ValueError("NPU ulysses_a2a_permute requires strict, pure Ulysses with ulysses_degree > 1")
 
     sp_configured = ulysses_degree > 1 or ring_degree > 1 or allgather_degree > 1
     if not sp_configured:

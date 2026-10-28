@@ -1047,6 +1047,7 @@ def test_from_pipeline_config_preserves_deployed_ulysses_a2a_permute() -> None:
         stages=[
             StageDeployConfig(
                 stage_id=0,
+                ulysses_degree=2,
                 ulysses_a2a_permute=True,
             )
         ]

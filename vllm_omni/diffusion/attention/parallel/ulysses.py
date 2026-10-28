@@ -19,6 +19,7 @@ from vllm_omni.diffusion.forward_context import (
     get_ulysses_mode,
     is_forward_context_available,
 )
+from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
 
@@ -254,6 +255,14 @@ class UlyssesParallelAttention:
         self._gather_idx = gather_idx
         self._use_sync = use_sync
         self._ulysses_a2a_permute = ulysses_a2a_permute
+        if (
+            ulysses_a2a_permute
+            and current_omni_platform.is_npu()
+            and (
+                sp_group.ring_world_size != 1 or sp_group.ulysses_world_size <= 1 or (scatter_idx, gather_idx) != (2, 1)
+            )
+        ):
+            raise ValueError("NPU ulysses_a2a_permute requires pure Ulysses with scatter_idx=2, gather_idx=1")
         if _a2a_permute_enabled(
             ulysses_a2a_permute,
             scatter_idx,
@@ -280,6 +289,8 @@ class UlyssesParallelAttention:
         attn_metadata: AttentionMetadata | None,
     ):
         mode = get_ulysses_mode(default="strict")
+        if self._ulysses_a2a_permute and current_omni_platform.is_npu() and mode != "strict":
+            raise ValueError("NPU SHMEM Ulysses currently supports only ulysses_mode='strict'")
         ulysses_world_size = self._sp_group.ulysses_world_size
         gate_compress = None
         if attn_metadata is not None:
@@ -526,14 +537,14 @@ class UlyssesParallelAttention:
                 self._gather_idx,
                 ulysses_world_size,
             ):
-                from vllm_omni.diffusion.distributed.a2a_permute import ulysses_qkv_fwd
+                from vllm_omni.diffusion.distributed.a2a_permute import ulysses_qkv_fwd, ulysses_qkv_fwd_group
 
                 group_name = self._ulysses_pg.group_name
-                query = ulysses_qkv_fwd(query, group_name, ulysses_world_size)
-                key = ulysses_qkv_fwd(key, group_name, ulysses_world_size)
-                value = ulysses_qkv_fwd(value, group_name, ulysses_world_size)
+                query, key, value = ulysses_qkv_fwd_group(query, key, value, group_name, ulysses_world_size)
                 if gate_compress is not None:
                     gate_compress = ulysses_qkv_fwd(gate_compress, group_name, ulysses_world_size)
+                if self._use_sync:
+                    current_omni_platform.synchronize()
             else:
                 query = SeqAllToAll4D.apply(
                     self._ulysses_pg, query, self._scatter_idx, self._gather_idx, self._use_sync
@@ -673,6 +684,8 @@ class UlyssesParallelAttention:
                     ctx.ulysses_pg.group_name,
                     dist.get_world_size(ctx.ulysses_pg),
                 )
+                if ctx.use_sync:
+                    current_omni_platform.synchronize()
             else:
                 output_img = SeqAllToAll4D.apply(
                     ctx.ulysses_pg, output_img, ctx.gather_idx, ctx.scatter_idx, ctx.use_sync
@@ -713,9 +726,12 @@ class UlyssesParallelAttention:
         ):
             from vllm_omni.diffusion.distributed.a2a_permute import ulysses_o_rev
 
-            return ulysses_o_rev(
+            output = ulysses_o_rev(
                 attn_output,
                 ctx.ulysses_pg.group_name,
                 dist.get_world_size(ctx.ulysses_pg),
             )
+            if ctx.use_sync:
+                current_omni_platform.synchronize()
+            return output
         return SeqAllToAll4D.apply(ctx.ulysses_pg, attn_output, ctx.gather_idx, ctx.scatter_idx, ctx.use_sync)

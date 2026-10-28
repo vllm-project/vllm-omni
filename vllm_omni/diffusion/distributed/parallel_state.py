@@ -30,6 +30,7 @@ If you only need to use the distributed environment without model parallelism,
 """
 
 import inspect
+import sys
 from math import prod
 
 import torch
@@ -1020,6 +1021,13 @@ def initialize_model_parallel(
 def destroy_model_parallel():
     """Set the groups to none and destroy them."""
     global _DP, _CFG, _SP, _PP, _FS, _HSDP_REPLICATE, _EXPERT_PARALLEL_GROUP_RANKS
+
+    # The optional fused transport owns collective symmetric allocations.
+    # Release them while all process groups are still alive, without importing
+    # NPU/Triton dependencies for other backends.
+    a2a_permute = sys.modules.get("vllm_omni.diffusion.distributed.a2a_permute")
+    if a2a_permute is not None:
+        a2a_permute.clear_a2a_permute_workspaces()
 
     if vllm_parallel_state._DP and vllm_parallel_state._DP is not _DP:
         vllm_parallel_state._DP.destroy()
