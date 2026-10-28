@@ -402,6 +402,36 @@ class OmniGPUModelRunner(GPUModelRunner):
             self.supports_mm_inputs = False
             self.encoder_cache = None
 
+        self._publish_shared_backbone_if_configured()
+
+    def _publish_shared_backbone_if_configured(self) -> None:
+        """Publish finalized AR backbone weights when this rank is a provider.
+
+        The startup layer attaches a ``SharedWeightGroupConfig`` to
+        ``self.vllm_config`` as ``weight_sharing`` before model load.  This hook
+        runs after the model and all post-load transforms are complete and keeps
+        both the backend and the ``ExportSession`` alive for step-3 lifecycle.
+        """
+        group = getattr(self.vllm_config, "weight_sharing", None)
+        if group is None or getattr(group, "role", None) != "provider":
+            return
+        publish = getattr(self.model, "publish_shared_backbone", None)
+        if publish is None:
+            logger.warning(
+                "weight sharing requested for a provider rank, but %s has no publish_shared_backbone hook",
+                type(self.model).__name__,
+            )
+            return
+        from vllm_omni.distributed.weight_sharing import TorchCudaIpcBackend
+
+        device = getattr(self, "device", None)
+        index = getattr(device, "index", None)
+        device_index = 0 if index is None else int(index)
+        backend = TorchCudaIpcBackend()
+        self._weight_share_backend = backend
+        self._weight_share_session = publish(backend, group, device_index)
+        logger.info("Published shared backbone weights for sharing group %s", getattr(group, "group_id", None))
+
     def _adopt_model_logits_vocab(self, model: Any) -> None:
         vocab = getattr(model, "logits_vocab_size", None)
         if not isinstance(vocab, int) or vocab <= 0 or vocab == self.vocab_size:

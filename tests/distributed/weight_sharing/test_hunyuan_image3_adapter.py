@@ -1,0 +1,271 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+"""CPU unit tests for the HunyuanImage 3.0 shared-layout adapter.
+
+The adapter is pure layout logic: shared-boundary filtering, checkpoint-name
+filtering, weight-spec construction and view attachment.  These tests exercise
+that contract with synthetic ``torch`` tensors on CPU, using the same
+private-namespace import as the backend suite so the enclosing ``vllm_omni``
+package is never initialized.
+"""
+
+import importlib
+
+import pytest
+import torch
+from torch import nn
+
+from tests.distributed.weight_sharing.helpers import load_weight_sharing
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+DIM = 8
+
+
+class _Norm(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        # RMSNorm-style: weight only, no bias.
+        self.weight = nn.Parameter(torch.randn(DIM))
+
+
+class _Proj(nn.Module):
+    def __init__(self, out: int, inp: int) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.randn(out, inp))
+        self.bias = nn.Parameter(torch.randn(out))
+
+
+class _Gate(nn.Module):
+    def __init__(self, out: int, inp: int) -> None:
+        super().__init__()
+        # The shared router is float32 on both stages.
+        self.weight = nn.Parameter(torch.randn(out, inp, dtype=torch.float32))
+
+
+class _Experts(nn.Module):
+    def __init__(self, dim: int) -> None:
+        super().__init__()
+        self.routed_experts = nn.Module()
+        self.routed_experts.register_parameter("w13_weight", nn.Parameter(torch.randn(2 * dim, dim)))
+        self.routed_experts.register_parameter("w2_weight", nn.Parameter(torch.randn(dim, dim)))
+
+
+class _Attn(nn.Module):
+    def __init__(self, dim: int) -> None:
+        super().__init__()
+        self.qkv_proj = _Proj(3 * dim, dim)
+        self.o_proj = _Proj(dim, dim)
+
+
+class _MLP(nn.Module):
+    def __init__(self, dim: int) -> None:
+        super().__init__()
+        self.gate = _Gate(dim, dim)
+        self.experts = _Experts(dim)
+
+
+class _Layer(nn.Module):
+    def __init__(self, dim: int) -> None:
+        super().__init__()
+        self.input_layernorm = _Norm()
+        self.post_attention_layernorm = _Norm()
+        self.self_attn = _Attn(dim)
+        self.mlp = _MLP(dim)
+
+
+class _Backbone(nn.Module):
+    def __init__(self, num_layers: int = 2) -> None:
+        super().__init__()
+        self.embed_tokens = nn.Embedding(16, DIM)
+        self.layers = nn.ModuleList(_Layer(DIM) for _ in range(num_layers))
+        self.norm = _Norm()
+
+
+def _expected_shared_names(num_layers: int = 2) -> set[str]:
+    names = {"embed_tokens.weight", "norm.weight"}
+    for i in range(num_layers):
+        names.update(
+            {
+                f"layers.{i}.input_layernorm.weight",
+                f"layers.{i}.post_attention_layernorm.weight",
+                f"layers.{i}.self_attn.qkv_proj.weight",
+                f"layers.{i}.self_attn.qkv_proj.bias",
+                f"layers.{i}.self_attn.o_proj.weight",
+                f"layers.{i}.self_attn.o_proj.bias",
+                f"layers.{i}.mlp.gate.weight",
+                f"layers.{i}.mlp.experts.routed_experts.w13_weight",
+                f"layers.{i}.mlp.experts.routed_experts.w2_weight",
+            }
+        )
+    return names
+
+
+@pytest.fixture(scope="module")
+def adapter():
+    ws = load_weight_sharing()
+    return importlib.import_module(f"{ws.__name__}.adapters.hunyuan_image3")
+
+
+@pytest.fixture(scope="module")
+def session_module():
+    ws = load_weight_sharing()
+    return importlib.import_module(f"{ws.__name__}.session")
+
+
+@pytest.fixture(scope="module")
+def backbone() -> _Backbone:
+    return _Backbone()
+
+
+def test_is_shared_param_filters_runtime_paths(adapter):
+    for name in _expected_shared_names():
+        assert adapter.is_shared_param(name), name
+    for name in (
+        "lm_head.weight",
+        "vae.decoder.weight",
+        "layers.0.self_attn.attn.k_scale",
+        "layers.0.mlp.experts.routed_experts.w13_weight_scale",
+        "layers.0.self_attn.image_attn.something",
+    ):
+        assert not adapter.is_shared_param(name), name
+
+
+def test_shared_backbone_names_matches_module(adapter, backbone):
+    assert set(adapter.shared_backbone_names(backbone)) == _expected_shared_names()
+
+
+def test_collect_shared_bindings(adapter, backbone):
+    bindings = adapter.collect_shared_bindings(backbone)
+    assert set(bindings) == _expected_shared_names()
+    assert all(isinstance(value, torch.Tensor) for value in bindings.values())
+    # The router must be float32 per the fusion contract.
+    assert bindings["layers.0.mlp.gate.weight"].dtype == torch.float32
+
+
+def test_build_weight_spec(adapter, backbone):
+    spec = adapter.build_weight_spec("model-id", "revision", backbone)
+    assert spec.model_id == "model-id"
+    assert spec.checkpoint_revision == "revision"
+    assert spec.layout == adapter.LAYOUT_ID
+    assert {tensor.name for tensor in spec.tensors} == _expected_shared_names()
+    params = dict(backbone.named_parameters())
+    for tensor in spec.tensors:
+        param = params[tensor.name]
+        assert tensor.shape == tuple(param.shape)
+        assert tensor.stride == tuple(param.stride())
+        assert tensor.dtype == str(param.dtype).removeprefix("torch.")
+
+
+def test_is_shared_checkpoint_name(adapter):
+    shared = (
+        "model.embed_tokens.weight",
+        "model.norm.weight",
+        "model.layers.0.input_layernorm.weight",
+        "model.layers.0.post_attention_layernorm.weight",
+        "model.layers.0.self_attn.q_proj.weight",
+        "model.layers.0.self_attn.k_proj.bias",
+        "model.layers.0.self_attn.o_proj.weight",
+        "model.layers.0.self_attn.query_layernorm.weight",
+        "model.layers.0.mlp.gate.weight",
+        "model.layers.0.mlp.gate.wg.weight",
+        "model.layers.0.mlp.gate_proj.weight",
+        "model.layers.0.mlp.gate_and_up_proj.weight",
+        "model.layers.0.mlp.up_proj.weight",
+        "model.layers.0.mlp.down_proj.bias",
+        "model.layers.0.mlp.shared_mlp.gate_proj.weight",
+        "model.layers.0.mlp.experts.0.gate_proj.weight",
+        "model.layers.0.mlp.experts.3.down_proj.weight",
+        "model.layers.0.mlp.gate_proj_bias",
+    )
+    for name in shared:
+        assert adapter.is_shared_checkpoint_name(name), name
+
+    private = (
+        "lm_head.weight",
+        "vae.decoder.conv_out.weight",
+        "vision_model.embeddings.weight",
+        "model.vision_aligner.weight",
+        "model.layers.0.self_attn.attn.k_scale",
+        "model.final_layer.weight",
+        "model.patch_embed.weight",
+    )
+    for name in private:
+        assert not adapter.is_shared_checkpoint_name(name), name
+
+
+def test_attach_imported_weights_shares_storage(adapter, backbone):
+    bindings = adapter.collect_shared_bindings(backbone)
+    data_ptrs = {name: tensor.data_ptr() for name, tensor in bindings.items()}
+
+    # Pass the same tensors back as the "imported" views and verify the module
+    # parameters are replaced with Parameters that share the same storage.
+    adapter.attach_imported_weights(backbone, dict(bindings))
+
+    for name, ptr in data_ptrs.items():
+        param = backbone.get_parameter(name)
+        assert isinstance(param, nn.Parameter), name
+        assert param.requires_grad is False, name
+        assert param.data_ptr() == ptr, name
+
+
+def test_attach_imported_weights_rejects_mismatch(adapter, backbone):
+    bindings = adapter.collect_shared_bindings(backbone)
+    missing = dict(bindings)
+    missing.pop(next(iter(missing)))
+    with pytest.raises(adapter.CompatibilityError):
+        adapter.attach_imported_weights(backbone, missing)
+
+    extra = dict(bindings)
+    extra["layers.0.self_attn.not_shared.weight"] = torch.randn(DIM, DIM)
+    with pytest.raises(adapter.CompatibilityError):
+        adapter.attach_imported_weights(backbone, extra)
+
+
+def test_validate_supported_layout(adapter):
+    class _Config:
+        pass
+
+    ok = _Config()
+    ok.use_cla = False
+    ok.num_experts = 32
+    adapter.validate_supported_layout(ok)
+
+    cla = _Config()
+    cla.use_cla = True
+    cla.num_experts = 32
+    with pytest.raises(adapter.CompatibilityError):
+        adapter.validate_supported_layout(cla)
+
+    per_layer = _Config()
+    per_layer.use_cla = False
+    per_layer.num_experts = [8, 8]
+    with pytest.raises(adapter.CompatibilityError):
+        adapter.validate_supported_layout(per_layer)
+
+
+def test_session_builders(session_module):
+    group = session_module.SharedWeightGroupConfig(
+        group_id="group",
+        generation=0,
+        session_id="session",
+        provider_id="provider",
+        consumer_id="consumer",
+        role="provider",
+        rank=1,
+        tp_size=4,
+        device_uuid="GPU-00000000-0000-0000-0000-000000000000",
+        model_id="model",
+        checkpoint_revision="revision",
+    )
+    assert group.payload is None
+
+    identity = session_module.build_identity(group)
+    assert identity.group_id == "group"
+    assert identity.rank == 1
+    assert identity.tp_size == 4
+    assert identity.protocol_version == 1
+
+    context = session_module.build_session_context(group, 3)
+    assert context.device_index == 3
+    assert context.identity == identity

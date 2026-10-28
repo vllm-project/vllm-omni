@@ -10,7 +10,7 @@ import re
 import time
 from collections.abc import Callable, Generator, Iterable, Sequence
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import huggingface_hub
 import torch
@@ -760,6 +760,11 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                 logger.info("Offline-quantized model with CPU offload, loading weights directly on CPU")
 
         target_device = torch.device(load_device)
+
+        shared_group = self._get_shared_weight_group()
+        if shared_group is not None:
+            return self._load_model_with_shared_backbone(shared_group, load_format, custom_pipeline_name, target_device)
+
         with set_default_torch_dtype(self.od_config.dtype):
             if self.parallel_config.use_hsdp:
                 model = self._load_model_with_hsdp(
@@ -1169,9 +1174,12 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         stream_online_quant_to_cpu: bool = False,
         sources: Sequence["ComponentSource"] | None = None,
         planned_weights: Iterable[str] = (),
+        weight_name_filter: Callable[[str], bool] | None = None,
     ) -> None:
         weights_to_load = self._get_expected_parameter_names(model)
         weights = self.get_all_weights(model) if sources is None else self.get_all_weights(model, sources=sources)
+        if weight_name_filter is not None:
+            weights = ((name, tensor) for name, tensor in weights if not weight_name_filter(name))
         if stream_online_quant_to_cpu:
             weights = self._stream_online_quant_weights_to_cpu(model, weights)
         loaded_weights = model.load_weights(weights)
@@ -1270,6 +1278,7 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         target_device: torch.device,
         custom_pipeline_name: str | type[nn.Module] | None = None,
         is_hsdp: bool = False,
+        backbone_meta: bool = False,
     ) -> nn.Module:
         """Initialize the model from a specified load format."""
         if load_format == "custom_pipeline":
@@ -1301,12 +1310,86 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
             device_ctx = contextlib.nullcontext() if hsdp_defer_to_cpu else target_device
             with device_ctx:
                 if load_format == "default":
-                    model = initialize_model(self.od_config)
+                    model = initialize_model(self.od_config, model_init_kwargs={"backbone_meta": backbone_meta})
                 elif load_format == "diffusers":
                     model = DiffusersAdapterPipeline(od_config=self.od_config, device=target_device)
                 else:
                     raise ValueError(f"Unknown load_format: {load_format}")
         prepare_model_for_weight_reload(model, self.od_config, target_device)
+        return model
+
+    def _get_shared_weight_group(self) -> Any | None:
+        """Return the startup layer's shared-group config, if one is attached."""
+        return getattr(self.od_config, "weight_sharing", None)
+
+    def _load_model_with_shared_backbone(
+        self,
+        shared_group: Any,
+        load_format: str | None,
+        custom_pipeline_name: str | type[nn.Module] | None,
+        target_device: torch.device,
+    ) -> nn.Module:
+        """Build a consumer pipeline with a meta backbone and bind the provider.
+
+        This is the step-2 consumer branch: construct the shared backbone on
+        ``meta`` (private components stay on the target device), import the AR
+        final weights through CUDA IPC, bind the views, then load only the
+        stage-private weights from disk.  It intentionally bypasses the
+        ordinary (whole-backbone) load path to avoid a second backbone peak.
+        """
+        from vllm_omni.distributed.weight_sharing import TorchCudaIpcBackend
+        from vllm_omni.distributed.weight_sharing.adapters.hunyuan_image3 import (
+            is_shared_checkpoint_name,
+            shared_param_full_names,
+        )
+
+        if getattr(shared_group, "role", None) != "consumer":
+            raise ValueError("diffusion weight sharing requires role='consumer'")
+        if self.quant_config is not None:
+            raise ValueError("shared-backbone loading does not support quantization in v1")
+        if self.parallel_config.use_hsdp:
+            raise ValueError("shared-backbone loading does not support HSDP in v1")
+
+        with set_default_torch_dtype(self.od_config.dtype):
+            model = self._init_from_load_format(
+                "default",
+                target_device,
+                custom_pipeline_name,
+                is_hsdp=False,
+                backbone_meta=True,
+            )
+
+        attach = getattr(model, "attach_shared_backbone", None)
+        if attach is None:
+            raise ValueError(f"consumer model {type(model).__name__} has no attach_shared_backbone hook")
+
+        index = getattr(target_device, "index", None)
+        device_index = 0 if index is None else int(index)
+        payload = getattr(shared_group, "payload", None)
+        if payload is None:
+            raise ValueError("consumer weight sharing requires the provider's claimed payload")
+        backend = TorchCudaIpcBackend()
+        imported = attach(backend, payload, shared_group, device_index)
+
+        # The shared params are externally bound; report them as planned so the
+        # strict unloaded-weight check still passes for the filtered load.
+        self.load_weights(
+            model,
+            planned_weights=shared_param_full_names(model),
+            weight_name_filter=is_shared_checkpoint_name,
+        )
+        self._process_weights_after_loading(model, target_device)
+
+        params_by_name = dict(model.named_parameters())
+        meta_left = [name for name in shared_param_full_names(model) if params_by_name[name].device.type == "meta"]
+        if meta_left:
+            raise ValueError(f"shared backbone parameters remain on meta after attach: {meta_left[:16]}")
+
+        model = model.eval()
+        # Retain the backend and import handle for step-3 lifecycle teardown.
+        model._weight_share_backend = backend
+        model._weight_share_import = imported
+        self._attach_offload_startup_state(model)
         return model
 
     def _load_model_with_pre_sharded_hsdp(

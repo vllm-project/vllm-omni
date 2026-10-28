@@ -373,7 +373,7 @@ class HunyuanImage3Pipeline(
         "final_layer.forward",
     ]
 
-    def __init__(self, od_config: OmniDiffusionConfig) -> None:
+    def __init__(self, od_config: OmniDiffusionConfig, backbone_meta: bool = False) -> None:
         self.hf_config = get_config(od_config.model, trust_remote_code=True)
         self.hf_config.cfg_distilled = _config_flag(self.hf_config, "cfg_distilled")
         self.hf_config.use_meanflow = _config_flag(self.hf_config, "use_meanflow")
@@ -391,7 +391,16 @@ class HunyuanImage3Pipeline(
             )
         ]
         quant_config = od_config.quantization_config
-        self.model = HunyuanImage3Model(self.hf_config, quant_config=quant_config)
+        if backbone_meta:
+            from vllm_omni.distributed.weight_sharing.adapters.hunyuan_image3 import validate_supported_layout
+
+            validate_supported_layout(self.hf_config)
+            # Only the shared backbone is constructed on meta; private
+            # components below are built on the worker's target device.
+            with torch.device("meta"):
+                self.model = HunyuanImage3Model(self.hf_config, quant_config=quant_config)
+        else:
+            self.model = HunyuanImage3Model(self.hf_config, quant_config=quant_config)
         self.transformer = self.model
         # Lazy import to break circular dependency:
         # autoencoder_kl_hunyuan -> hunyuan_image3/__init__ -> pipeline_hunyuan_image3 -> autoencoder_kl_hunyuan
@@ -503,6 +512,18 @@ class HunyuanImage3Pipeline(
         return loader.load_weights(
             weights, mapper=WeightsMapper(orig_to_new_prefix={name: None for name in (skip_prefixes or ())})
         )
+
+    def attach_shared_backbone(self, backend: Any, payload: bytes, group: Any, device_index: int) -> Any:
+        """Import and bind the AR stage's finalized backbone into this DiT model."""
+        from vllm_omni.distributed.weight_sharing.adapters.hunyuan_image3 import open_backbone_import
+
+        return open_backbone_import(backend, self, payload=payload, group=group, device_index=device_index)
+
+    def shared_backbone_param_names(self) -> list[str]:
+        """Full parameter paths of the shared backbone, for external-load bookkeeping."""
+        from vllm_omni.distributed.weight_sharing.adapters.hunyuan_image3 import shared_param_full_names
+
+        return shared_param_full_names(self)
 
     def prepare_seed(self, seed=None, batch_size=1):
         # random seed
