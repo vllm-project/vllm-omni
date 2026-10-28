@@ -428,7 +428,6 @@ def test_v1_runner_hands_each_request_its_guidance_pair(runners: Callable[[str],
         device=torch.device("cuda"),
         vocab_size=vocab,
         block_sizes=[config.cache_config.block_size],
-        kernel_block_sizes=[config.cache_config.block_size],
         max_num_blocks_per_req=[BLOCKS_PER_REQUEST],
     )
     requests = {}
