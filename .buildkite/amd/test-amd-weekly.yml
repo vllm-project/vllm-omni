@@ -1,5 +1,7 @@
 # AMD MI300 weekly reliability. Nightly owns functional and accuracy smokes.
 # This file owns fault injection and invalid-parameter contracts.
+# HunyuanImage process-kill coverage uses a generated ROCm expert-parallel-off config.
+# One separate job keeps full-model expert-parallel startup and health visible.
 # main + WEEKLY=1 selects it. A PR weekly-test label selects it.
 # NIGHTLY=1 and NON_CRITICAL=1 do not.
 
@@ -42,10 +44,65 @@ steps:
         grade: NonBlocking
         timeout_in_minutes: 180
         source_file_dependencies: diffusion_hunyuan_image3_reliability
+        env:
+          VLLM_ROCM_USE_AITER: "0"
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+        artifact_paths:
+          - artifacts/rocm-hunyuan-image-reliability/**/*
         commands:
-          - >-
-            pytest -s -v tests/dfx/reliability/test_hunyuan_image.py
-            -m "slow and rocm and MI325 and cards_4"
+          - export ROCM_HUNYUAN_RELIABILITY_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-hunyuan-image-reliability"
+          - mkdir -p "$$ROCM_HUNYUAN_RELIABILITY_ARTIFACT_DIR"
+          - |
+            pytest --collect-only -q tests/dfx/reliability/test_hunyuan_image.py \
+              --shard-id=0 --num-shards=1 \
+              -m "slow and rocm and MI325 and cards_4" \
+              > "$$ROCM_HUNYUAN_RELIABILITY_ARTIFACT_DIR/collection.txt"
+            count=$$(awk '/^tests\/.*::/ { n++ } END { print n + 0 }' \
+              "$$ROCM_HUNYUAN_RELIABILITY_ARTIFACT_DIR/collection.txt")
+            if [[ "$$count" != 16 ]]; then
+              echo "Expected exactly 16 HunyuanImage reliability nodes, found $$count." >&2
+              cat "$$ROCM_HUNYUAN_RELIABILITY_ARTIFACT_DIR/collection.txt" >&2
+              exit 5
+            fi
+          - |
+            if (
+              trap - ERR
+              set +e
+              timeout --signal=TERM --kill-after=2m 165m \
+                pytest -s -v -ra tests/dfx/reliability/test_hunyuan_image.py \
+                --shard-id=0 --num-shards=1 \
+                -m "slow and rocm and MI325 and cards_4" \
+                --junitxml="$$ROCM_HUNYUAN_RELIABILITY_ARTIFACT_DIR/pytest.xml" \
+                2>&1 | tee "$$ROCM_HUNYUAN_RELIABILITY_ARTIFACT_DIR/pytest.log"
+              exit "$${PIPESTATUS[0]}"
+            ); then
+              status=0
+            else
+              status=$$?
+            fi
+            tail -n 100 "$$ROCM_HUNYUAN_RELIABILITY_ARTIFACT_DIR/pytest.log" > \
+              "$$ROCM_HUNYUAN_RELIABILITY_ARTIFACT_DIR/pytest-summary.txt"
+            if [[ "$$status" -eq 0 ]]; then
+              if python -c 'import sys, xml.etree.ElementTree as ET
+            root = ET.parse(sys.argv[1]).getroot()
+            suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
+            tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites)
+            skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites)
+            if tests != 16 or skipped != 0:
+                print(
+                    f"Expected exactly 16 executed HunyuanImage reliability tests; "
+                    f"reported tests={tests}, skipped={skipped}.",
+                    file=sys.stderr,
+                )
+                raise SystemExit(5)
+            ' "$$ROCM_HUNYUAN_RELIABILITY_ARTIFACT_DIR/pytest.xml"
+              then
+                status=0
+              else
+                status=$$?
+              fi
+            fi
+            (exit "$$status")
 
       - label: "Reliability Test · Invalid parameters · MI300 · 2-GPU"
         agent_pool: mi300_2
@@ -59,3 +116,77 @@ steps:
             pytest -s -v
             tests/dfx/reliability/invalid_param_test/test_invalid_omni_chat.py
             -m "slow and rocm and MI325 and cards_2"
+
+  - group: "HunyuanImage Expert Parallel"
+    steps:
+      - label: "HunyuanImage Expert Parallel Startup"
+        agent_pool: mi300_4
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 45
+        source_file_dependencies: diffusion_hunyuan_image3_reliability
+        artifact_paths:
+          - artifacts/rocm-hunyuan-image-ep-startup/**/*
+        commands:
+          - |
+            export ROCM_HUNYUAN_EP_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-hunyuan-image-ep-startup"
+            mkdir -p "$$ROCM_HUNYUAN_EP_ARTIFACT_DIR"
+            pytest --collect-only -q \
+              tests/dfx/reliability/test_hunyuan_image_ep_startup.py::test_hunyuan_image_rocm_ep_startup \
+              --shard-id=0 --num-shards=1 \
+              -m "full_model and slow and diffusion and rocm and MI325 and cards_4" \
+              > "$$ROCM_HUNYUAN_EP_ARTIFACT_DIR/collection.txt"
+            count=$$(awk '/^tests\/.*::/ { n++ } END { print n + 0 }' \
+              "$$ROCM_HUNYUAN_EP_ARTIFACT_DIR/collection.txt")
+            if [[ "$$count" != 1 ]]; then
+              echo "Expected exactly one HunyuanImage expert-parallel startup node, found $$count." >&2
+              cat "$$ROCM_HUNYUAN_EP_ARTIFACT_DIR/collection.txt" >&2
+              exit 5
+            fi
+            if ! grep -Fq "test_hunyuan_image_rocm_ep_startup" \
+              "$$ROCM_HUNYUAN_EP_ARTIFACT_DIR/collection.txt"; then
+              echo "HunyuanImage expert-parallel startup node was not collected." >&2
+              cat "$$ROCM_HUNYUAN_EP_ARTIFACT_DIR/collection.txt" >&2
+              exit 5
+            fi
+          - |
+            if (
+              trap - ERR
+              set +e
+              timeout --signal=TERM --kill-after=2m 30m \
+                pytest -s -v -ra \
+                tests/dfx/reliability/test_hunyuan_image_ep_startup.py::test_hunyuan_image_rocm_ep_startup \
+                --shard-id=0 --num-shards=1 \
+                -m "full_model and slow and diffusion and rocm and MI325 and cards_4" \
+                --junitxml="$$ROCM_HUNYUAN_EP_ARTIFACT_DIR/pytest.xml" \
+                2>&1 | tee "$$ROCM_HUNYUAN_EP_ARTIFACT_DIR/pytest.log"
+              exit "$${PIPESTATUS[0]}"
+            ); then
+              status=0
+            else
+              status=$$?
+            fi
+            tail -n 100 "$$ROCM_HUNYUAN_EP_ARTIFACT_DIR/pytest.log" > \
+              "$$ROCM_HUNYUAN_EP_ARTIFACT_DIR/pytest-summary.txt"
+            if [[ "$$status" -eq 0 ]]; then
+              if python -c 'import sys, xml.etree.ElementTree as ET
+            root = ET.parse(sys.argv[1]).getroot()
+            suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
+            tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites)
+            skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites)
+            if tests != 1 or skipped != 0:
+                print(
+                    f"Expected exactly one executed HunyuanImage expert-parallel startup test; "
+                    f"reported tests={tests}, skipped={skipped}.",
+                    file=sys.stderr,
+                )
+                raise SystemExit(5)
+            ' "$$ROCM_HUNYUAN_EP_ARTIFACT_DIR/pytest.xml"
+              then
+                status=0
+              else
+                status=$$?
+              fi
+            fi
+            (exit "$$status")

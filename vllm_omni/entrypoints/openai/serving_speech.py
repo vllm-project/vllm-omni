@@ -2382,6 +2382,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             sampling_params_list=sampling_params_list,
             output_modalities=output_modalities,
             arrival_time=arrival_time,
+            watermarking=request.watermarking,
         )
         # Only the non-streaming path consumes output policies (in
         # `_generate_audio_bytes`); streaming never reads them. Store late —
@@ -2727,6 +2728,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 request_id=request_id,
                 sampling_params_list=sampling_params_list,
                 output_modalities=["audio"],
+                watermarking=request.watermarking,
             )
 
             final_output: OmniRequestOutput | None = None
@@ -3105,6 +3107,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             max_new_tokens=_pick("max_new_tokens"),
             initial_codec_chunk_frames=_pick("initial_codec_chunk_frames"),
             non_streaming_mode=_pick("non_streaming_mode"),
+            watermarking=_pick("watermarking"),
         )
 
     async def create_speech_batch(

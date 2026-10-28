@@ -510,16 +510,85 @@ steps:
         "$$R2_02_ARTIFACT_DIR/processes-after.txt" \
         2>&1 | tee "$$R2_02_ARTIFACT_DIR/process-cleanup.txt"
 
-# - label: "Omni Model Test Qwen3-Omni"
-#   agent_pool: mi300_2
-#   depends_on: amd-build
-#   mirror_hardwares: [amdproduction]
-#   grade: Blocking
-#   commands:
-#     - export VLLM_LOGGING_LEVEL=DEBUG
-#     - export VLLM_WORKER_MULTIPROC_METHOD=spawn
-#     - timeout 10m pytest -s -v tests/e2e/offline_inference/test_qwen3_omni.py
-#     - timeout 20m pytest -s -v tests/e2e/online_serving/test_qwen3_omni.py -m "core_model" --run-level "core_model"
+- label: "Omni Model Test Qwen3-Omni"
+  agent_pool: mi300_2
+  depends_on: amd-build
+  mirror_hardwares: [amdproduction]
+  grade: NonBlocking
+  timeout_in_minutes: 25
+  artifact_paths:
+    - artifacts/rocm-qwen3-omni-ready/**/*
+  commands:
+    - export VLLM_WORKER_MULTIPROC_METHOD=spawn
+    - export ROCM_QWEN3_OMNI_READY_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-qwen3-omni-ready"
+    - mkdir -p "$$ROCM_QWEN3_OMNI_READY_ARTIFACT_DIR"
+    - |
+      set -euo pipefail
+      nodes=(
+        "tests/e2e/online_serving/test_qwen3_omni.py::test_mix_to_text_audio_001[default-rocm]"
+        "tests/e2e/online_serving/test_qwen3_omni.py::test_text_to_text_001[default-rocm]"
+        "tests/e2e/online_serving/test_qwen3_omni.py::test_thinker_prefix_caching_text_output[default]"
+        "tests/e2e/online_serving/test_qwen3_omni.py::test_thinker_prefix_caching_audio_output[default]"
+        "tests/e2e/online_serving/test_qwen3_omni.py::test_thinker_prefix_caching_async_chunk_identical[prefix_cache_async_chunk]"
+        "tests/e2e/online_serving/test_qwen3_omni.py::test_thinker_prefix_caching_async_chunk_shared_image_prefix[prefix_cache_async_chunk]"
+        "tests/e2e/online_serving/test_qwen3_omni.py::test_completions_rejected_for_thinker_talker[default-rocm]"
+        "tests/e2e/online_serving/test_qwen3_omni.py::test_batched_completions_text[default-rocm]"
+        "tests/e2e/online_serving/test_qwen3_omni.py::test_batched_completions_audio_out[default-rocm]"
+        "tests/e2e/online_serving/test_qwen3_omni.py::test_batched_completions_with_bad_values[sad_opts0-default-rocm]"
+        "tests/e2e/online_serving/test_qwen3_omni.py::test_batched_completions_with_bad_values[sad_opts1-default-rocm]"
+      )
+      printf '%s\n' "$${nodes[@]}" | sort > /tmp/qwen3-omni-ready-expected.txt
+      pytest -q tests/e2e/online_serving/test_qwen3_omni.py \
+        -m "core_model and rocm and MI325 and cards_2 and not nvidia_only" \
+        --run-level "core_model" \
+        --shard-id=0 --num-shards=1 \
+        --collect-only \
+        | sed -n 's/^\(tests\/.*::.*\)/\1/p' \
+        | sort > /tmp/qwen3-omni-ready-collected.txt
+      if ! diff -u /tmp/qwen3-omni-ready-expected.txt /tmp/qwen3-omni-ready-collected.txt; then
+        echo "Qwen3-Omni READY collection drifted from the 11 core_model nodes" >&2
+        exit 1
+      fi
+    - |
+      if (
+        trap - ERR
+        set +e
+        timeout --signal=TERM --kill-after=2m 20m \
+          pytest -s -v -ra tests/e2e/online_serving/test_qwen3_omni.py \
+          -m 'core_model and rocm and MI325 and cards_2 and not nvidia_only' \
+          --run-level 'core_model' \
+          --shard-id=0 --num-shards=1 \
+          --junitxml="$$ROCM_QWEN3_OMNI_READY_ARTIFACT_DIR/pytest.xml" \
+          2>&1 | tee "$$ROCM_QWEN3_OMNI_READY_ARTIFACT_DIR/pytest.log"
+        exit "$${PIPESTATUS[0]}"
+      ); then
+        status=0
+      else
+        status=$$?
+      fi
+      tail -n 100 "$$ROCM_QWEN3_OMNI_READY_ARTIFACT_DIR/pytest.log" > \
+        "$$ROCM_QWEN3_OMNI_READY_ARTIFACT_DIR/pytest-summary.txt"
+      if [[ "$$status" -eq 0 ]]; then
+        if python -c 'import sys, xml.etree.ElementTree as ET
+      root = ET.parse(sys.argv[1]).getroot()
+      suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
+      tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites)
+      skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites)
+      if tests != 11 or skipped != 0:
+          print(
+              f"Expected exactly 11 executed Qwen3-Omni READY tests; "
+              f"reported tests={tests}, skipped={skipped}.",
+              file=sys.stderr,
+          )
+          raise SystemExit(5)
+      ' "$$ROCM_QWEN3_OMNI_READY_ARTIFACT_DIR/pytest.xml"
+        then
+          status=0
+        else
+          status=$$?
+        fi
+      fi
+      (exit "$$status")
 
 - group: ":card_index_dividers: E2E Test"
   steps:

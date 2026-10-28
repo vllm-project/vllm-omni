@@ -38,7 +38,7 @@ nav:
       - Image-To-Video: user_guide/examples/online_serving/image_to_video.md
       - Speech-To-Video: user_guide/examples/online_serving/speech_to_video.md
       - Text-To-Image: user_guide/examples/online_serving/text_to_image.md
-      - Text-To-Speech: user_guide/examples/online_serving/text_to_speech.md
+      - Text-To-Speech (Online Serving): user_guide/examples/online_serving/text_to_speech.md
       - Text-To-Video: user_guide/examples/online_serving/text_to_video.md
   - General:
     - usage/*
@@ -55,6 +55,7 @@ nav:
       - Prefill-Decode Disaggregation (experimental): features/pd_disaggregation.md
       - Sleep Mode: features/sleep_mode.md
       - HF Numerics for RL Rollouts: features/hf_numerics.md
+    - Watermarking: features/watermarking.md
     - Quantization:
       - Overview: user_guide/quantization/overview.md
       - Online Quantization: user_guide/quantization/online.md

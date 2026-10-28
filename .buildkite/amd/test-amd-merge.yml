@@ -395,6 +395,65 @@ steps:
           -m 'advanced_model and rocm and MI325 and not nvidia_only'
           --run-level 'advanced_model'
 
+    - label: "Qwen3-Omni SHM Leak Test"
+      agent_pool: mi300_2
+      depends_on: amd-build
+      mirror_hardwares: [amdproduction]
+      grade: NonBlocking
+      timeout_in_minutes: 50
+      artifact_paths:
+        - artifacts/rocm-qwen3-omni-shm-leak/**/*
+      commands:
+        - export VLLM_WORKER_MULTIPROC_METHOD=spawn
+        - export ROCM_QWEN3_OMNI_SHM_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-qwen3-omni-shm-leak"
+        - mkdir -p "$$ROCM_QWEN3_OMNI_SHM_ARTIFACT_DIR"
+        - >-
+          bash .buildkite/amd/scripts/assert-pytest-collection.sh 1
+          tests/e2e/online_serving/test_qwen3_omni_shm_leak.py
+          -m 'advanced_model and rocm and MI325 and cards_2 and not nvidia_only'
+          --run-level 'advanced_model'
+          --shard-id=0 --num-shards=1
+        - |
+          if (
+            trap - ERR
+            set +e
+            timeout --signal=TERM --kill-after=2m 45m \
+              pytest -s -v -ra tests/e2e/online_serving/test_qwen3_omni_shm_leak.py \
+              -m 'advanced_model and rocm and MI325 and cards_2 and not nvidia_only' \
+              --run-level 'advanced_model' \
+              --shard-id=0 --num-shards=1 \
+              --junitxml="$$ROCM_QWEN3_OMNI_SHM_ARTIFACT_DIR/pytest.xml" \
+              2>&1 | tee "$$ROCM_QWEN3_OMNI_SHM_ARTIFACT_DIR/pytest.log"
+            exit "$${PIPESTATUS[0]}"
+          ); then
+            status=0
+          else
+            status=$$?
+          fi
+          tail -n 100 "$$ROCM_QWEN3_OMNI_SHM_ARTIFACT_DIR/pytest.log" > \
+            "$$ROCM_QWEN3_OMNI_SHM_ARTIFACT_DIR/pytest-summary.txt"
+          if [[ "$$status" -eq 0 ]]; then
+            if python -c 'import sys, xml.etree.ElementTree as ET
+          root = ET.parse(sys.argv[1]).getroot()
+          suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
+          tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites)
+          skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites)
+          if tests != 1 or skipped != 0:
+              print(
+                  f"Expected exactly one executed Qwen3-Omni SHM leak test; "
+                  f"reported tests={tests}, skipped={skipped}.",
+                  file=sys.stderr,
+              )
+              raise SystemExit(5)
+          ' "$$ROCM_QWEN3_OMNI_SHM_ARTIFACT_DIR/pytest.xml"
+            then
+              status=0
+            else
+              status=$$?
+            fi
+          fi
+          (exit "$$status")
+
     - label: "Qwen3-TTS CustomVoice E2E Test · Shard %N/%t"
       agent_pool: mi300_1
       parallelism: 3

@@ -653,6 +653,13 @@ class TestSpeechAPI:
         assert response.headers["content-type"] == "audio/wav"
         assert len(response.content) > 0
 
+    def test_create_speech_forwards_watermarking_opt_out(self, client):
+        payload = {"input": "Hello world", "model": "tts-model", "voice": "alloy", "watermarking": False}
+        response = client.post("/v1/audio/speech", json=payload)
+        assert response.status_code == 200
+        generate = client.app.state.openai_serving_speech.engine_client.generate
+        assert generate.call_args.kwargs["watermarking"] is False
+
     def test_create_speech_includes_token_usage_and_detail_headers(self, client):
         payload = {
             "input": "Hello world",
@@ -1234,7 +1241,7 @@ class TestSpeechAPI:
         assert b"Invalid voice" in response.body
 
     @pytest.mark.asyncio
-    async def test_diffusion_speech_reports_audio_format_and_duration(self, mocker: MockerFixture):
+    async def test_diffusion_speech_reports_audio_format_and_duration_na(self, mocker: MockerFixture):
         """Diffusion servers report the same audio headers as the AR path."""
         mock_engine = mocker.MagicMock()
         mock_engine.default_sampling_params_list = [OmniDiffusionSamplingParams(extra_args={})]
@@ -1255,7 +1262,19 @@ class TestSpeechAPI:
         exposed = {h.strip().lower() for h in response.headers["access-control-expose-headers"].split(",")}
         assert exposed == {"x-audio-sample-rate", "x-audio-channels", "x-audio-duration-seconds"}
 
-    @pytest.mark.asyncio
+    async def test_create_diffusion_speech_forwards_watermarking_opt_out(self, mocker: MockerFixture):
+        """Ensure that diffusion speech forward watermark opt out correctly."""
+        mock_engine = mocker.MagicMock()
+        mock_engine.default_sampling_params_list = [OmniDiffusionSamplingParams()]
+
+        async def mock_generate(*args, **kwargs):
+            yield create_mock_audio_output_for_test()
+
+        mock_engine.generate = mocker.MagicMock(side_effect=mock_generate)
+        server = OmniOpenAIServingSpeech.for_diffusion(diffusion_engine=mock_engine, model_name="test-model")
+        await server.create_speech(OpenAICreateSpeechRequest(input="Hello", watermarking=False))
+        assert mock_engine.generate.call_args.kwargs["watermarking"] is False
+
     @pytest.mark.parametrize(
         ("request_seed", "extra_seed", "expected_seed"),
         [
@@ -4524,6 +4543,15 @@ class TestMergeBatchItem:
         )
         merged = OmniOpenAIServingSpeech._merge_batch_item(batch, batch.items[0])
         assert merged.response_format == "mp3"
+
+    def test_watermarking_merge(self):
+        """Per-item watermarking should override the batch default only when set."""
+        batch = BatchSpeechRequest(
+            items=[SpeechBatchItem(input="hi", watermarking=True), SpeechBatchItem(input="bye")],
+            watermarking=False,
+        )
+        merged = [OmniOpenAIServingSpeech._merge_batch_item(batch, item) for item in batch.items]
+        assert [request.watermarking for request in merged] == [True, False]
 
     def test_stream_always_false(self):
         """Merged requests should always have stream=False."""
