@@ -354,6 +354,13 @@ class _InterruptingStepPipeline(_StepPipeline):
         raise AssertionError("post_decode should not run after interrupt")
 
 
+class _DenoiseFailingStepPipeline(_StepPipeline):
+    def denoise_step(self, state, **kwargs):
+        del state, kwargs
+        self.denoise_calls += 1
+        raise RuntimeError("denoise boom")
+
+
 class _FakePeakMemoryPlatform:
     def __init__(self, reserved_mb: list[float]):
         self._reserved_mb = reserved_mb
@@ -1397,6 +1404,50 @@ class TestRunner:
         assert runner.pipeline.denoise_calls == 1
         assert runner.pipeline.scheduler_calls == 0
         assert runner.pipeline.decode_calls == 0
+
+    @pytest.mark.parametrize(
+        ("diffusion_kv_mode", "should_cleanup"),
+        [
+            (DiffusionKVCacheMode.DENSE_LEGACY, False),
+            (DiffusionKVCacheMode.PAGED_SCHEDULER, True),
+        ],
+    )
+    def test_denoise_error_marks_request_finished_and_clears_state(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        mocker: MockerFixture,
+        diffusion_kv_mode: DiffusionKVCacheMode,
+        should_cleanup: bool,
+    ):
+        runner = _make_runner(diffusion_kv_mode)
+        runner.pipeline = _DenoiseFailingStepPipeline()
+        cleanup = mocker.patch.object(runner, "remove_diffusion_kv_requests")
+        mocker.patch.object(runner, "install_diffusion_kv_metadata")
+        monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+        req = _make_step_request()
+        scheduler_output = _make_scheduler_output(req, step_id=0)
+        if should_cleanup:
+            scheduler_output.scheduled_new_reqs[0].diffusion_kv_metadata = DiffusionKVMetadata(
+                request_id=req.request_id,
+                allocation_generation=1,
+                sequences=(),
+            )
+
+        result = DiffusionModelRunner.execute_stepwise(runner, scheduler_output)
+        output = result.get_request_output("req-1")
+
+        assert output.finished is True
+        assert output.result is not None
+        assert "denoise boom" in (output.result.error or "")
+        assert runner.state_cache == {}
+        assert runner.pipeline.prepare_calls == 1
+        assert runner.pipeline.denoise_calls == 1
+        assert runner.pipeline.scheduler_calls == 0
+        assert runner.pipeline.decode_calls == 0
+        if should_cleanup:
+            cleanup.assert_called_once_with(["req-1"])
+        else:
+            cleanup.assert_not_called()
 
     def test_load_model_rejects_unsupported_step_execution(self, monkeypatch):
         class _RequestOnlyPipeline:

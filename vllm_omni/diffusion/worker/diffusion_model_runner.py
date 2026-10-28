@@ -1045,7 +1045,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
             current_omni_platform.synchronize()
         finally:
             for request_id in request_ids:
-                self.state_cache.pop(request_id, None)
+                self.release_step_requests([request_id])
             self.input_batch = None
             del runner_output
             gc.collect()
@@ -1179,8 +1179,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 if context is not None:
                     state.interaction_boundary = context
         except Exception:
-            for request_id in new_request_ids:
-                self.state_cache.pop(request_id, None)
+            self.release_step_requests(new_request_ids)
             raise
 
         return resolved, new_request_ids
@@ -1204,7 +1203,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 # all-reduce here while every peer proceeds into it, and the
                 # peers then hang on the NCCL collective until timeout.
                 def _abort_prep_failure(per_req_exc: BaseException | None) -> None:
-                    self.state_cache.pop(state.request_id, None)
+                    self.release_step_requests([state.request_id])
                     if per_req_exc is None:
                         per_req_exc = RuntimeError(
                             f"Stepwise preparation failed on another DiT rank for {state.request_id}"
@@ -1464,28 +1463,51 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 paged_kv_runtime=paged_kv_runtime,
                 in_diffusion_kv_memory_profile=in_diffusion_kv_memory_profile,
             ):
-                clear_pipeline_stage_durations(pipeline)
-                noise_pred = pipeline.denoise_step(input_batch, states=states)
-                denoise_stage_durations = consume_pipeline_stage_durations(pipeline)
-                for state in states:
-                    merge_stage_durations(
-                        state,
-                        denoise_stage_durations,
-                    )
+                denoise_exception: Exception | None = None
+                try:
+                    clear_pipeline_stage_durations(pipeline)
+                    noise_pred = pipeline.denoise_step(input_batch, states=states)
+                except Exception as exc:
+                    denoise_exception = exc
+                    noise_pred = None
+                    logger.error("Stepwise denoise failed: %s", exc, exc_info=True)
 
-                pipeline_interrupted = getattr(pipeline, "interrupt", False)
-                if noise_pred is None and pipeline_interrupted:
+                denoise_failed = _dit_any_rank_failed(denoise_exception is not None)
+                pipeline_interrupted = False
+                if denoise_failed:
+                    if denoise_exception is None:
+                        denoise_exception = RuntimeError("Stepwise denoise failed on another DiT rank")
+                        logger.error("%s", denoise_exception)
                     for state in states:
                         runner_output_list.append(
                             RunnerOutput(
                                 request_id=state.request_id,
                                 step_index=state.step_index,
                                 finished=True,
-                                result=DiffusionOutput(error="stepwise denoise interrupted"),
+                                result=DiffusionOutput.from_exception(denoise_exception),
                             )
                         )
-
                 else:
+                    denoise_stage_durations = consume_pipeline_stage_durations(pipeline)
+                    for state in states:
+                        merge_stage_durations(
+                            state,
+                            denoise_stage_durations,
+                        )
+
+                    pipeline_interrupted = getattr(pipeline, "interrupt", False)
+                    if noise_pred is None and pipeline_interrupted:
+                        for state in states:
+                            runner_output_list.append(
+                                RunnerOutput(
+                                    request_id=state.request_id,
+                                    step_index=state.step_index,
+                                    finished=True,
+                                    result=DiffusionOutput(error="stepwise denoise interrupted"),
+                                )
+                            )
+
+                if not denoise_failed and not (noise_pred is None and pipeline_interrupted):
                     offset = 0
                     for req in states:
                         if req.latents is None:
@@ -1547,7 +1569,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                             offset = offset + row_num
                         except Exception as per_req_exc:
                             offset = offset + row_num
-                            self.state_cache.pop(req.request_id, None)
+                            self.release_step_requests([req.request_id])
                             logger.error(
                                 "Stepwise per-request error for %s: %s",
                                 req.request_id,
@@ -1588,7 +1610,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 terminal_request_ids = [
                     runner_output.request_id for runner_output in runner_output_list if runner_output.finished
                 ]
-                self._update_states_after(states, input_batch, pipeline_interrupted)
+                self._update_states_after(states, input_batch, pipeline_interrupted or denoise_failed)
                 if (
                     getattr(self.od_config, "diffusion_kv_mode", DiffusionKVCacheMode.DENSE_LEGACY)
                     is DiffusionKVCacheMode.PAGED_SCHEDULER
