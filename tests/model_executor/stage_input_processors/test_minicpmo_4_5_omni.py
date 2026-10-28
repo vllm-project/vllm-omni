@@ -67,7 +67,8 @@ def test_plain_chat_handoff_owns_talker_prompt_contract() -> None:
     assert info["meta"]["next_stage_prompt_len"] == 4
 
 
-def test_llm2tts_carries_request_ref_audio() -> None:
+@pytest.mark.parametrize("with_deferred_audio", [False, True])
+def test_llm2tts_carries_request_ref_audio(with_deferred_audio: bool) -> None:
     latent = torch.arange(20, dtype=torch.float32).reshape(5, 4)
     source = _output(
         prompt_ids=[101, 9001],
@@ -81,10 +82,15 @@ def test_llm2tts_carries_request_ref_audio() -> None:
         },
     )
     ref_waveform = torch.tensor([0.1, 0.2, 0.3])
+    request_prompt = {"multi_modal_data": {"image": object(), "audio": (ref_waveform, 22050)}}
+    if with_deferred_audio:
+        request_prompt["additional_information"] = {
+            "deferred_multi_modal_data": {"audio": ([0.9, 0.8], 16000)},
+        }
 
     converted = llm2tts(
         [source],
-        prompt=[{"multi_modal_data": {"audio": (ref_waveform, 22050)}}],
+        prompt=[request_prompt],
     )[0]
 
     info = converted["model_intermediate_buffer"]
@@ -93,7 +99,19 @@ def test_llm2tts_carries_request_ref_audio() -> None:
     assert info["ids"]["tts"] == [11, 12]
 
 
-def test_llm2tts_carries_deferred_multimodal_ref_audio() -> None:
+@pytest.mark.parametrize(
+    "multi_modal_data",
+    [
+        None,
+        {},
+        {"image": object()},
+        {"video": object()},
+        {"image": object(), "audio": None},
+        {"image": object(), "audio": []},
+    ],
+    ids=["missing", "empty", "image", "video", "image-null-audio", "image-empty-audio"],
+)
+def test_llm2tts_carries_deferred_multimodal_ref_audio(multi_modal_data: dict | None) -> None:
     latent = torch.arange(20, dtype=torch.float32).reshape(5, 4)
     source = _output(
         prompt_ids=[101, 9001],
@@ -107,21 +125,28 @@ def test_llm2tts_carries_deferred_multimodal_ref_audio() -> None:
         },
     )
     ref_waveform = torch.tensor([0.4, 0.5, 0.6])
+    request_prompt = {
+        "additional_information": {
+            "deferred_multi_modal_data": {"audio": (ref_waveform, 16000)},
+        }
+    }
+    if multi_modal_data is not None:
+        request_prompt["multi_modal_data"] = multi_modal_data
+    original_mm_data = dict(multi_modal_data) if multi_modal_data is not None else None
 
     converted = llm2tts(
         [source],
-        prompt=[
-            {
-                "additional_information": {
-                    "deferred_multi_modal_data": {"audio": (ref_waveform, 16000)},
-                }
-            }
-        ],
+        prompt=[request_prompt],
     )[0]
 
     info = converted["model_intermediate_buffer"]
     assert info["codes"]["ref"] == ref_waveform.tolist()
     assert info["meta"]["ref_audio_sr"] == 16000
+    assert info["ids"]["tts"] == [11, 12]
+    if multi_modal_data is None:
+        assert "multi_modal_data" not in request_prompt
+    else:
+        assert multi_modal_data == original_mm_data
 
 
 def test_native_duplex_speak_segment_reaches_split_talker() -> None:

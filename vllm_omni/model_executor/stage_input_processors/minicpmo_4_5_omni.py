@@ -721,15 +721,19 @@ def llm2tts(
     for llm_output, p in zip(llm_outputs, prompt):
         if isinstance(p, dict):
             request_mm_data = p.get("multi_modal_data")
-            if not request_mm_data:
+            request_audio = request_mm_data.get("audio") if isinstance(request_mm_data, Mapping) else None
+            if request_audio is None or (isinstance(request_audio, (list, tuple)) and not request_audio):
                 additional_information = p.get("additional_information")
                 deferred_mm_data = (
                     additional_information.get("deferred_multi_modal_data")
                     if isinstance(additional_information, Mapping)
                     else None
                 )
-                if isinstance(deferred_mm_data, Mapping):
-                    request_mm_data = dict(deferred_mm_data)
+                if isinstance(deferred_mm_data, Mapping) and "audio" in deferred_mm_data:
+                    # Rendered images/videos must not hide deferred audio.
+                    # Copy the map so the caller's multimodal prompt stays intact.
+                    request_mm_data = dict(request_mm_data or {})
+                    request_mm_data["audio"] = deferred_mm_data["audio"]
             multi_modal_data[llm_output.request_id] = request_mm_data
         else:
             multi_modal_data[llm_output.request_id] = getattr(p, "multi_modal_data", None)
