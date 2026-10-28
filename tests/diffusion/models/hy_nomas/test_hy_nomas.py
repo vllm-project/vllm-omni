@@ -105,6 +105,24 @@ def checkpoint(tmp_path):
     return tmp_path
 
 
+def test_old_reference_decoder_fails_before_component_loading(checkpoint, monkeypatch, mocker):
+    class LegacySession:
+        def __init__(self, model, *, to_cpu=True, retain_history=True):
+            pass
+
+    reference = ModuleType("hymm.models.vae.pixelumm_decoder.streaming")
+    monkeypatch.setattr(reference, "WindowStreamingDecodeSession", LegacySession, raising=False)
+    monkeypatch.setitem(sys.modules, reference.__name__, reference)
+    monkeypatch.setattr(pipeline_hy_nomas, "get_local_device", lambda: torch.device("cuda"))
+    download = mocker.patch.object(pipeline_hy_nomas, "download_weights_from_hf_specific")
+    config = OmniDiffusionConfig(
+        model=str(checkpoint), dtype=torch.bfloat16, distributed_executor_backend="mp", enforce_eager=True
+    )
+    with pytest.raises(RuntimeError, match="pinned rolling PixelUMM revision"):
+        pipeline_hy_nomas.HyNomasPipeline(od_config=config)
+    download.assert_not_called()
+
+
 def test_discovery_from_modular_index(checkpoint, monkeypatch):
     assert resolve_model_class_name(str(checkpoint)) == "HyNomasModularPipeline"
     assert is_diffusion_model(str(checkpoint))
@@ -160,6 +178,13 @@ def test_public_defaults(architecture):
 
 @pytest.mark.parametrize("text_encoder_override", [None, "local-text-encoder"])
 def test_pipeline_loads_diffusers_components(checkpoint, monkeypatch, text_encoder_override):
+    class RollingSession:
+        def __init__(self, model, *, to_cpu=True, retain_history=True, rolling=False):
+            pass
+
+    streaming = ModuleType("hymm.models.vae.pixelumm_decoder.streaming")
+    monkeypatch.setattr(streaming, "WindowStreamingDecodeSession", RollingSession, raising=False)
+    monkeypatch.setitem(sys.modules, streaming.__name__, streaming)
     download = Mock(return_value=str(checkpoint))
     transformer = nn.Linear(2, 2, bias=False)
     transformer.patch_size = (1, 1, 1)

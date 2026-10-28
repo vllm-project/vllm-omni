@@ -7,6 +7,7 @@ import json
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
+from inspect import signature
 from itertools import groupby
 from pathlib import Path
 from typing import Any, ClassVar
@@ -37,6 +38,7 @@ from vllm_omni.diffusion.models.hy_nomas.configuration_hy_nomas import (
     REQUIRED_FILES,
     HyNomasARConfig,
 )
+from vllm_omni.diffusion.models.hy_nomas.history import HyNomasHistoryFrame, action_tails, recent_history
 from vllm_omni.diffusion.models.hy_nomas.hy_nomas_transformer import (
     build_transformer,
     commit_cache,
@@ -205,6 +207,8 @@ class HyNomasSession:
     # Original masks are retained separately from per-forward visibility masks.
     action_tails: list[tuple[int, int, int]] = field(default_factory=list)
     offline_cache: list[dict[str, torch.Tensor]] | None = None
+    noise_generator: torch.Generator | None = None
+    history_frames: list[HyNomasHistoryFrame] = field(default_factory=list)
 
 
 class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
@@ -223,6 +227,12 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
         self.device = get_local_device()
         if self.device.type != "cuda":
             raise ValueError("Hy-Nomas requires CUDA.")
+        from hymm.models.vae.pixelumm_decoder.streaming import WindowStreamingDecodeSession
+
+        if "rolling" not in signature(WindowStreamingDecodeSession).parameters:
+            raise RuntimeError(
+                "Hy-Nomas requires the pinned rolling PixelUMM revision; see recipes/Tencent/Hy-Nomas.md."
+            )
         self.initialize_ar(od_config.custom_pipeline_args or {})
         self.sp_size = od_config.parallel_config.ulysses_degree
         self.target_dtype = torch.bfloat16
@@ -384,7 +394,7 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
             if offload_components is None
             else ([self.text_encoder] if TEXT_ENCODER_COMPONENT in offload_components else [])
         )
-        # 未选中的组件保持驻留，仍需安装 hook，以便在执行前移走选中的 DiT。
+        # Resident components still need hooks to offload selected DiTs before they run.
         apply_sequential_offload(
             dit_modules=[self.transformer],
             encoder_modules=stages,
@@ -438,12 +448,28 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
             config.width // self.s_ratio // self.patch_size[2]
         )
         text_tokens = int(self.args.text_len)
-        retained = config.max_latent_frames * frame_tokens + config.max_segments * text_tokens
-        pending = config.chunk_latent_frames * frame_tokens + text_tokens
-        latent_elements = config.max_latent_frames * (config.height // self.s_ratio) * (config.width // self.s_ratio)
-        # Fixed noise, the decoder's latent timeline, pending pixels and text.
-        model_bytes = latent_elements * (self.in_channels + self.transformer.config.out_channels) * 2
-        model_bytes += config.height * config.width * 3 * 4 * 40 + config.max_segments * text_tokens * 3584 * 2
+        recent = config.history_mode == "recent"
+        retained = (
+            config.history_latent_frames * frame_tokens
+            if recent
+            else config.max_latent_frames * frame_tokens + config.max_segments * text_tokens
+        )
+        pending_frames = min(
+            config.max_chunk_latent_frames,
+            config.max_total_latent_frames if recent else config.max_latent_frames,
+        )
+        pending = pending_frames * frame_tokens + text_tokens
+        window = int(self.vae.temporal_window_latents)
+        decoder_frames = 3 * window + pending_frames
+        spatial = (config.height // self.s_ratio) * (config.width // self.s_ratio)
+        noise_frames = pending_frames if recent else config.max_latent_frames
+        model_bytes = (
+            spatial * (noise_frames * self.in_channels + decoder_frames * self.transformer.config.out_channels) * 2
+        )
+        model_bytes += config.height * config.width * 3 * 4 * (4 * decoder_frames)
+        model_bytes += (
+            text_tokens * 3584 * 2 + (config.max_total_latent_frames if recent else config.max_latent_frames) * 512
+        )
         return ARDiffusionKVCacheSpec(
             num_layers=self.num_double_blocks,
             num_kv_heads=self.heads_num // self.sp_size,
@@ -456,9 +482,9 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
             segmented=ARDiffusionSegmentedKVSpec(
                 block_size=256,
                 max_retained_tokens=retained,
-                max_retained_segments=config.max_latent_frames,
+                max_retained_segments=config.history_latent_frames if recent else config.max_latent_frames,
                 max_pending_tokens=pending,
-                max_pending_segments=1,
+                max_pending_segments=pending_frames if recent else 1,
                 initial_staging_tokens=retained + pending,
             ),
             model_owned_state_bytes_per_session=model_bytes,
@@ -506,8 +532,10 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
         if frame_tokens % self.sp_size:
             raise OmniClientError("Hy-Nomas spatial tokens per frame must be divisible by ulysses_degree.")
         frames = (request.num_frames - 1) // 4 + 1
-        if bound is not None and frames > config.max_latent_frames:
-            raise OmniClientError("Hy-Nomas request exceeds ar_max_latent_frames.")
+        recent = bound is not None and config.history_mode == "recent"
+        total_limit = config.max_total_latent_frames if recent else config.max_latent_frames
+        if bound is not None and frames > total_limit:
+            raise OmniClientError("Hy-Nomas request exceeds the deployed total latent-frame limit.")
         # Ordinary generation preserves the reference's one denoising block per prompt segment.
         chunks = plan_chunks(request, config.chunk_latent_frames if bound is not None else frames)
         if tick is not None and len(chunks) != 1:
@@ -531,7 +559,7 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
                 (
                     1,
                     self.in_channels,
-                    config.max_latent_frames if bound is not None else frames,
+                    0 if recent else (config.max_latent_frames if bound is not None else frames),
                     request.height // self.s_ratio,
                     request.width // self.s_ratio,
                 ),
@@ -544,11 +572,14 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
                 request.seed,
                 noise,
                 generator,
-                self.vae.create_streaming_decode_session(to_cpu=True, retain_history=False)
+                self.vae.create_streaming_decode_session(to_cpu=True, retain_history=False, rolling=True)
                 if bound is not None
                 else None,
                 torch.empty((1, 0), dtype=torch.bool, device=self.device),
             )
+            if recent:
+                session.noise_generator = torch.Generator(device="cpu").manual_seed(request.seed)
+                session.generator = torch.Generator(device="cpu").manual_seed(request.seed ^ 0x4E4F4D4153)
             if bound is not None:
                 self._ar_sessions[bound.session_id] = session
             else:
@@ -561,8 +592,8 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
                 self._offline_session = session
         if (session.height, session.width, session.seed) != (request.height, request.width, request.seed):
             raise OmniClientError("A Hy-Nomas continuation must keep its height, width and seed; reset to change them.")
-        if bound is not None and session.latent_frames + frames > config.max_latent_frames:
-            raise OmniClientError("Hy-Nomas session exceeds ar_max_latent_frames; close or reset the session.")
+        if bound is not None and session.latent_frames + frames > total_limit:
+            raise OmniClientError("Hy-Nomas session exceeds its total latent-frame limit; close or reset the session.")
         if tick is not None and (
             bound is None or tick.session_id != bound.session_id or tick.chunk_index != session.tick_index
         ):
@@ -600,8 +631,13 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
         segment_key = (chunk.segment, state.extra.get("hy_nomas_prompt_version", 0))
         first = segment_key != state.extra["hy_nomas_segment_key"]
         if first:
-            if self._ar_state is not None and session.segments >= self.ar_config.max_segments:
-                raise OmniClientError("Hy-Nomas session exceeds ar_max_segments; close or reset the session.")
+            segment_limit = (
+                self.ar_config.max_total_segments
+                if self.ar_config.history_mode == "recent"
+                else self.ar_config.max_segments
+            )
+            if self._ar_state is not None and session.segments >= segment_limit:
+                raise OmniClientError("Hy-Nomas session exceeds its total segment limit; close or reset the session.")
             encoded = self._encode_prompt(text)
             state.prompt_embeds = encoded["text_states"]
             # The reference owns padding and action-token coordinates. The
@@ -630,10 +666,27 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
             state.extra["hy_nomas_action_start"] = action_start
         state.extra["hy_nomas_intra_offsets"] = [offsets] if offsets is not None and windows is not None else None
         state.extra["hy_nomas_intra_windows"] = windows
-        state.extra["hy_nomas_cache_text"] = first
+        state.extra["hy_nomas_cache_text"] = first or (
+            session.noise_generator is not None
+            and not any(frame.text_tokens and frame.segment == session.segments for frame in session.history_frames)
+        )
         start = state.extra["hy_nomas_request_latent_start"] + chunk.start
         end = start + chunk.end - chunk.start
-        state.latents = session.noise[:, : self.transformer.config.out_channels, start:end].clone()
+        if session.noise_generator is None:
+            state.latents = session.noise[:, : self.transformer.config.out_channels, start:end].clone()
+        else:
+            noise = torch.cat(
+                [
+                    torch.randn(
+                        (1, self.in_channels, 1, request.height // self.s_ratio, request.width // self.s_ratio),
+                        generator=session.noise_generator,
+                        dtype=self.target_dtype,
+                    )
+                    for _ in range(end - start)
+                ],
+                dim=2,
+            )
+            state.latents = noise[:, : self.transformer.config.out_channels].to(self.device)
         state.scheduler = self._new_scheduler(request.steps)
         state.timesteps = state.scheduler.timesteps
         state.step_index = state.step_in_chunk = 0
@@ -710,7 +763,25 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
                 ),
                 1,
             )
-        pending = cache.begin_commit((current_tokens,)) if commit and cache is not None else ()
+        pending = ()
+        error = None
+        recent = cache is not None and self.ar_config.history_mode == "recent"
+        if commit and cache is not None:
+            lengths = (
+                [image_tokens // latents.shape[2]] * (latents.shape[2] - 1)
+                + [image_tokens // latents.shape[2] + (state.prompt_embeds.shape[1] if first else 0)]
+                if recent
+                else [current_tokens]
+            )
+            try:
+                pending = cache.begin_commit(lengths)
+            except Exception as exc:
+                error = exc
+            try:
+                self._check_sp_error(error, "KV allocation")
+            except BaseException:
+                cache.rollback()
+                raise
         try:
             with (
                 self._component_context(self.transformer),
@@ -737,14 +808,53 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
                     camera_rope_time_offset=0,
                 )
             if commit:
-                if written != current_tokens:
-                    raise RuntimeError("Hy-Nomas clean forward wrote an unexpected KV token count.")
                 if cache is not None:
-                    commit_cache(cache, views)
-                    cache.commit(retain=(*cache.handles, *pending))
-                session.history_mask = torch.cat((session.history_mask, mask[:, history:].clone()), 1)
+                    error = None
+                    retained = (*cache.handles, *pending)
+                    frames = session.history_frames
+                    cut = 0
+                    try:
+                        if written != current_tokens:
+                            raise RuntimeError("Hy-Nomas clean forward wrote an unexpected KV token count.")
+                        if recent:
+                            text_tokens = state.prompt_embeds.shape[1] if first else 0
+                            frames = [
+                                *frames,
+                                *[
+                                    HyNomasHistoryFrame(
+                                        handle,
+                                        session.latent_frames + index,
+                                        state.extra["hy_nomas_segment_id"],
+                                        text_tokens if index == len(pending) - 1 else 0,
+                                        state.extra["hy_nomas_action_start"] if index == len(pending) - 1 else -1,
+                                    )
+                                    for index, handle in enumerate(pending)
+                                ],
+                            ]
+                            budget = self.ar_config.history_latent_frames * (image_tokens // latents.shape[2])
+                            frames, cut = recent_history(frames, budget)
+                            retained = tuple(frame.handle for frame in frames)
+                        commit_cache(cache, views)
+                        cache.validate_commit(retain=retained)
+                    except Exception as exc:
+                        error = exc
+                    self._check_sp_error(error, "KV staging")
+                    cache.commit(retain=retained)
+                    if recent:
+                        session.history_frames = frames
+                        session.history_mask = torch.cat((session.history_mask, mask[:, history:]), 1)[:, cut:].clone()
+                        session.action_tails = action_tails(frames)
+                elif written != current_tokens:
+                    raise RuntimeError("Hy-Nomas clean forward wrote an unexpected KV token count.")
+                if not recent:
+                    session.history_mask = torch.cat((session.history_mask, mask[:, history:].clone()), 1)
                 action_start = state.extra["hy_nomas_action_start"]
-                if first and action_start is not None and 0 <= action_start < state.prompt_embeds.shape[1]:
+                if (
+                    not recent
+                    and first
+                    and action_start is not None
+                    and 0 <= action_start < state.prompt_embeds.shape[1]
+                ):
                     session.action_tails.append(
                         (
                             state.extra["hy_nomas_segment_id"],
@@ -757,6 +867,14 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
             if commit and cache is not None:
                 cache.rollback()
             raise
+
+    def _check_sp_error(self, error: Exception | None, operation: str) -> None:
+        if self.sp_size > 1:
+            failed = torch.tensor([error is not None], dtype=torch.int32, device=self.device)
+            if get_sp_group().all_reduce(failed).item() and error is None:
+                error = RuntimeError(f"Hy-Nomas {operation} failed on another SP rank.")
+        if error is not None:
+            raise error
 
     @torch.no_grad()
     def denoise_step(
@@ -868,11 +986,22 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
                 "metadata": {
                     "video": {"fps": 24.0},
                     "ar_diffusion": identity.to_dict(),
+                    "stream": {
+                        "frame_start": frame_start,
+                        "generated_raw_frames": session.latent_frames * 4,
+                        "generated_frames": session.decoder.available_pixel_frames,
+                        "withheld_frames": session.decoder.available_pixel_frames - session.emitted_frames,
+                    },
                     "hy_nomas": {
                         "frame_start": frame_start,
                         "num_frames": len(video),
                         "generated_frames": session.decoder.available_pixel_frames,
                         "withheld_frames": session.decoder.available_pixel_frames - session.emitted_frames,
+                        "latent_position": session.latent_frames,
+                        "segments": session.segments,
+                        "history_tokens": session.history_mask.shape[1],
+                        "history_mode": self.ar_config.history_mode,
+                        "sampling_version": "incremental_v1" if session.noise_generator is not None else "legacy_v1",
                     },
                 },
             },
@@ -905,6 +1034,7 @@ class HyNomasPipeline(nn.Module, InteractionMixin, SupportsComponentDiscovery):
                 output.output["metadata"]["hy_nomas"].update(
                     frame_start=frame_start, num_frames=len(output.output["payload"]["video"])
                 )
+                output.output["metadata"]["stream"]["frame_start"] = frame_start
                 return output
             inputs = state.extra["hy_nomas_request"]
             with self._component_context(self.vae):

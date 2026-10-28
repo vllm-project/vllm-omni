@@ -135,12 +135,18 @@ class HyNomasChunk:
 
 
 def plan_chunks(request: HyNomasRequest, chunk_latents: int) -> list[HyNomasChunk]:
+    if type(chunk_latents) is not int or chunk_latents <= 0:
+        raise ValueError("Hy-Nomas chunk_latents must be a positive integer.")
     boundaries = [value // 4 for value in request.boundaries[:-1]] + [(request.num_frames - 1) // 4 + 1]
     chunks = []
     for segment, (start, end) in enumerate(zip(boundaries, boundaries[1:])):
-        for left in range(start, end, chunk_latents):
+        left = start
+        while left < end:
             right = min(left + chunk_latents, end)
+            if 0 < end - right < chunk_latents // 2:
+                right = end
             chunks.append(HyNomasChunk(segment, left, right, min(request.num_frames, 4 * right) - 4 * left))
+            left = right
     return chunks
 
 

@@ -101,8 +101,9 @@ def pipelines(model_cleanup):
 
 @pytest.mark.parametrize("offload", [False, True], ids=["resident", "cpu_offload"])
 @pytest.mark.parametrize("scenario", ["text", "segments", "camera"])
+@pytest.mark.parametrize("steps", [4, 8])
 @torch.no_grad()
-def test_reference_decoded_video(pipelines, scenario, offload):
+def test_reference_decoded_video(pipelines, scenario, offload, steps):
     reference, candidate, device = pipelines
     prompts = ["A forest beside a clear river, photorealistic, daylight."]
     boundaries = [0, 49]
@@ -121,7 +122,7 @@ def test_reference_decoded_video(pipelines, scenario, offload):
             height=384,
             width=640,
             guidance_scale=1.0,
-            num_inference_steps=8,
+            num_inference_steps=steps,
             flow_shift=5.0,
             seed=42,
             segment_frame_boundaries=boundaries,
@@ -133,7 +134,7 @@ def test_reference_decoded_video(pipelines, scenario, offload):
         num_frames=49,
         height=384,
         width=640,
-        num_inference_steps=8,
+        num_inference_steps=steps,
         guidance_scale=1.0,
         seed=42,
         extra_args={

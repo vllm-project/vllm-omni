@@ -29,19 +29,22 @@ The author's Diffusers fork is not needed for this integration.
 | Parameter | Contract |
 | --- | --- |
 | Geometry | Height and width divisible by 32; default 704×1280 |
-| Frame count | `num_frames=4*n+1`, with `n >= 1`; default 121 |
+| Frame count | Current API validation accepts `num_frames=4*n+1`, with `n >= 1`; default 121 |
 | Frame rate | 24 fps |
 | Sampling | 4, 6, or 8 steps; default 8; guidance scale 1 and flow shift 5 |
 | Negative prompt | Omit or leave empty; nonempty values are rejected because the distilled checkpoint uses CFG=1 |
 | Segment boundaries | Pixel-frame indices starting at 0 and ending at `num_frames`; internal boundaries divisible by 4 |
 | Camera | Reference generator name, such as `pan_left`, or a worker-accessible JSON/NPZ trajectory file |
-| Persistent turn | At most 61 frames with the default 16-latent chunk; height, width, and seed remain fixed within a session |
+| Persistent turn | At most 89 frames with the default nominal 16-latent chunk and short-tail merging; height, width, and seed remain fixed within a session |
 | Default AR capacity | 120 latent frames, 16 prompt segments, one active session, 704×1280 spatial limits |
+| Explicit recent mode | Shared video/text history budget; independent total frame/segment limits; incremental-v1 sampling |
 
 Each `|||`-separated text describes one segment. Supply prepared reference segment
 JSON as its text when using structured prompts. Prompt enhancement with Nomas-PE
 and the reference dataset prompt-file loader are separate upstream tools.
 Input images, audio generation, and latent output are unsupported.
+PixelUMM decodes four video frames per latent frame and crops to the requested
+length. The `4*n+1` restriction is enforced by this API's current validator.
 
 The reference's 720-pixel height is reduced to 704 by its latent grid; this API
 requires the actual output height. To specify duration, omit `num_frames` and pass
@@ -58,6 +61,7 @@ instead of the video endpoint's top-level `seconds` field.
 | Sequence parallel generation | 2 H200 | `hy_nomas.yaml` plus `--ulysses-degree 2` | Offline and video API, resident and CPU offload |
 | Realtime streaming | 2 H200 | `hy_nomas_ar.yaml`, Ulysses degree 2 | Prompt/camera updates, cancellation, and a subsequent request |
 | Multi-turn continuation | 2 H200 | Session example, Ulysses degree 2 | Successive turns with a final decoder flush |
+| Bounded recent history | 2 H200 | `hy_nomas_ar_recent.yaml`, Ulysses degree 2 | Explicit recent window and long-session limits; qualification described below |
 
 The converted checkpoint was qualified on one and two H200s at vLLM-Omni commit
 `81620d2d69dc661d694fdc66ae737be0c7d8993d`. See [Verification](#verification)
@@ -84,13 +88,17 @@ Install vLLM-Omni first, then install the pinned reference checkout without
 replacing the environment's existing dependency versions:
 
 ```bash
-git clone https://github.com/Tencent-Hunyuan/Hy-Nomas.git
-git -C Hy-Nomas checkout --detach 911cea6458a89c2663513ff7099561ec190dd491
+git clone https://github.com/wtz2333/Hy-Nomas.git
+git -C Hy-Nomas checkout --detach 16a4c228fd6f4770ed4a111b360031f7686c4a19
 python -m pip install --no-deps -e ./Hy-Nomas
 python -m pip install hydra-core==1.3.2 omegaconf==2.3.0 loguru einops
 ```
 
 Keep the editable checkout: the integration reads its configuration files.
+This fork adds opt-in rolling PixelUMM decoding to reference revision
+`911cea6458a89c2663513ff7099561ec190dd491`. The default reference decoder is
+unchanged. AR sessions use stable-prefix rolling decoding without retained
+output history, replace-tail preview, or rollback.
 Install FlashAttention 2 for the environment's PyTorch/CUDA versions using the
 [reference installation instructions](https://github.com/Tencent-Hunyuan/Hy-Nomas/tree/911cea6458a89c2663513ff7099561ec190dd491).
 Verify imports before loading weights:
@@ -220,6 +228,55 @@ Requests must fit the configured limits; increasing capacity requires more memor
 Keep `ar_max_latent_frames` fixed when comparing seeds because it determines the
 noise timeline.
 
+### Bounded recent history
+
+Use `vllm_omni/deploy/hy_nomas_ar_recent.yaml` for explicit `recent` history.
+The default `full` deployment retains its fixed noise timeline and limits.
+
+| Custom pipeline argument | Recent-mode meaning |
+| --- | --- |
+| `ar_history_mode` | `full` by default; set `recent` explicitly |
+| `ar_history_latent_frames` | Shared video/text token budget in latent-frame equivalents; the recent profile uses 36 |
+| `ar_max_total_latent_frames` | Absolute generation limit, default 4096, independent of resident history |
+| `ar_max_total_segments` | Cumulative prompt-segment limit, default 1024 |
+| `ar_chunk_latent_frames` | Nominal chunk size, default 16; it must fit the recent budget |
+
+The retained budget includes text. Eviction removes the smallest complete-frame
+prefix that satisfies it, dropping a frame's trailing text together with that
+frame. It preserves absolute RoPE/frame progress. Publication waits for every
+layer and SP rank before releasing old KV. Pending pages, per-segment page
+rounding, and contiguous attention staging are reserved separately.
+The reference merges a tail shorter than half a nominal chunk into its
+preceding chunk, within the same prompt segment. With a nominal size of 16,
+pending allocation therefore covers up to 23 latents. A 33-latent request uses
+16+17; it does not generate a separate one-latent tail.
+
+`recent` uses sampling version `incremental_v1`: a CPU generator draws one
+latent frame at a time, and a separately seeded CPU generator supplies KV-commit
+perturbations. Decoder noise uses the reference's seed plus absolute frame
+index. Changing only the history budget does not change the generation-noise
+sequence. This explicit mode has a different noise sequence from legacy
+`full`; windowing also changes conditioning and requires its own quality check.
+
+PixelUMM keeps only latents and active mappings needed for future windows.
+Normal completion marks the final segment and flushes the tail. Cancellation
+discards withheld pixels. Every public chunk, including empty stable output,
+can carry `frame_start`, `generated_raw_frames`, `generated_frames`, and
+`withheld_frames`; these distinguish raw decoder positions from visible output.
+Reaching a total limit fails the session explicitly and releases its state.
+
+At 1280×704, set `streaming_pacing.max_output_bytes` explicitly when enabling
+playback pacing. For the default 16-latent chunks, 512 MiB
+(`536870912` bytes) covers decoded RGB chunks including the final held tail.
+The shared 64 MiB default can reject a decoded chunk before a playback idle
+timeout is reached. The limit applies to decoded payloads and encoded bytes.
+
+For a 120-second request, start the recent deployment and use the shared client
+above with `--num-frames 2881`. The default remains eight steps; four steps are
+an explicit option. Recent history is functional qualification work, not a
+real-time performance guarantee. GPU qualification status must be read with
+the revision and workloads in [Verification](#verification).
+
 ## Multi-turn continuation
 
 ```bash
@@ -240,6 +297,9 @@ Typed camera controls use `track="camera"`, `schema="hy_nomas.camera.v1"`, and
 `data={"camera_trajectory":"pan_left"}`. A turn can include frames withheld from
 the previous turn; concatenate returned chunks in `metadata.hy_nomas.frame_start`
 order. `metadata.ar_diffusion` preserves tick identity and applied event IDs.
+Pass `--history-mode recent --history-latent-frames 36` to the session example
+for cumulative continuation beyond the legacy limits. It writes the combined
+MP4 incrementally instead of retaining all decoded frames in host memory.
 
 ## Supported features
 

@@ -10,6 +10,7 @@ from pathlib import Path
 import numpy as np
 from diffusers.utils import export_to_video
 
+from vllm_omni.diffusion.utils.media_utils import FragmentedMP4Muxer
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.experimental.ar_diffusion.consumer import ARDiffusionOmniTickConsumer
 from vllm_omni.experimental.ar_diffusion.session import ARDiffusionWorkerLifecycle
@@ -25,18 +26,31 @@ async def main():
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--height", type=int, default=704)
     parser.add_argument("--width", type=int, default=1280)
-    parser.add_argument("--num-frames", type=int, default=49, help="Frames per turn, at most 61 for a 16-latent chunk.")
+    parser.add_argument(
+        "--num-frames", type=int, default=49, help="Frames per turn, at most 89 after short-tail merging."
+    )
     parser.add_argument("--num-inference-steps", type=int, choices=(4, 6, 8), default=8)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--ulysses-degree", type=int, default=2)
     parser.add_argument("--text-encoder", help="Override the checkpoint's bundled text encoder and tokenizer.")
+    parser.add_argument("--history-mode", choices=("full", "recent"), default="full")
+    parser.add_argument(
+        "--history-latent-frames",
+        type=int,
+        default=36,
+        help="Recent video/text token budget in latent-frame equivalents.",
+    )
     args = parser.parse_args()
-    if args.num_frames < 5 or (args.num_frames - 1) % 4 or args.num_frames > 61:
-        parser.error("--num-frames must be 4*n+1 in [5, 61].")
-    if len(args.prompts) * ((args.num_frames - 1) // 4 + 1) > 120 or len(args.prompts) > 16:
-        parser.error("The example session must fit 120 latent frames and 16 prompt segments.")
+    if args.num_frames < 5 or (args.num_frames - 1) % 4 or args.num_frames > 89:
+        parser.error("--num-frames must be 4*n+1 in [5, 89].")
+    total_frames = len(args.prompts) * ((args.num_frames - 1) // 4 + 1)
+    frame_limit, segment_limit = (4096, 1024) if args.history_mode == "recent" else (120, 16)
+    if total_frames > frame_limit or len(args.prompts) > segment_limit:
+        parser.error(f"The example session must fit {frame_limit} latent frames and {segment_limit} prompt segments.")
     args.output_dir.mkdir(parents=True, exist_ok=True)
     pipeline_args: dict[str, int | str] = {"ar_height": args.height, "ar_width": args.width}
+    if args.history_mode == "recent":
+        pipeline_args.update(ar_history_mode="recent", ar_history_latent_frames=args.history_latent_frames)
     if args.text_encoder is not None:
         pipeline_args["text_encoder"] = args.text_encoder
     engine = AsyncOmni(
@@ -53,8 +67,12 @@ async def main():
     )
     lifecycle = ARDiffusionWorkerLifecycle(engine, stage_ids=[0], timeout=180)
     session_id = "hy-nomas-example"
-    frames, records = [], []
+    records = []
+    muxer = None
+    stream = None
     try:
+        stream = (args.output_dir / "session.mp4").open("wb")
+        muxer = FragmentedMP4Muxer(width=args.width, height=args.height, fps=24)
         consumer = ARDiffusionOmniTickConsumer(
             engine,
             prompt_provider=lambda tick: tick.prompt,
@@ -102,14 +120,19 @@ async def main():
             print(json.dumps(record), flush=True)
             if len(video):
                 export_to_video(video.astype(np.float32) / 255, str(args.output_dir / f"chunk_{index:03d}.mp4"), fps=24)
-                frames.append(video)
-        export_to_video(np.concatenate(frames).astype(np.float32) / 255, str(args.output_dir / "session.mp4"), fps=24)
+                stream.write(muxer.mux_video_frames(video))
         (args.output_dir / "chunks.json").write_text(json.dumps(records, indent=2) + "\n")
     finally:
         try:
-            await lifecycle.close_session(session_id)
+            if muxer is not None:
+                stream.write(muxer.close())
         finally:
-            engine.shutdown()
+            if stream is not None:
+                stream.close()
+            try:
+                await lifecycle.close_session(session_id)
+            finally:
+                engine.shutdown()
 
 
 if __name__ == "__main__":

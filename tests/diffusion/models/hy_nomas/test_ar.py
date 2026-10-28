@@ -3,6 +3,7 @@
 
 import json
 from contextlib import nullcontext
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -89,7 +90,11 @@ class PipelineWithCPUComponents(HyNomasPipeline):
             camera_injection_mode="extrinsics_attn",
             forward_with_cache=self.transformer_forward,
         )
-        self.vae = SimpleNamespace(create_streaming_decode_session=lambda **kwargs: DecoderStub(), decode=self.decode)
+        self.vae = SimpleNamespace(
+            temporal_window_latents=8,
+            create_streaming_decode_session=lambda **kwargs: DecoderStub(),
+            decode=self.decode,
+        )
         self.text_encoder = SimpleNamespace()
         self.calls = []
         self.encoded = []
@@ -177,6 +182,15 @@ def runner(pipeline, monkeypatch):
     return make_runner(pipeline)
 
 
+@pytest.fixture
+def recent_runner(pipeline, monkeypatch):
+    pipeline.ar_config = replace(pipeline.ar_config, history_mode="recent", history_latent_frames=18)
+    monkeypatch.setattr(
+        "vllm_omni.experimental.ar_diffusion.runner.current_omni_platform", SimpleNamespace(synchronize=lambda: None)
+    )
+    return make_runner(pipeline)
+
+
 def sampling(*, frames=9, seed=7, extra=None):
     return OmniDiffusionSamplingParams(
         num_frames=frames,
@@ -235,6 +249,10 @@ def test_capabilities_and_real_kv_geometry(pipeline):
         ("ar_max_segments", 0),
         ("ar_session_capacity", 1.5),
         ("ar_chunk_latent_frames", 121),
+        ("ar_history_mode", "uniform"),
+        ("ar_history_latent_frames", 0),
+        ("ar_max_total_latent_frames", False),
+        ("ar_max_total_segments", -1),
     ],
 )
 def test_invalid_ar_capacity_fails_before_loading(name, value):
@@ -251,6 +269,48 @@ def test_chunk_plan_preserves_all_pixels_and_segment_boundaries():
         (1, 5, 7, 5),
     ]
     assert sum(chunk.pixel_frames for chunk in chunks) == 25
+
+
+@pytest.mark.parametrize(
+    "latent_frames,lengths",
+    [(17, [17]), (23, [23]), (24, [16, 8]), (31, [16, 15]), (33, [16, 17]), (39, [16, 23]), (40, [16, 16, 8])],
+)
+def test_chunk_plan_matches_reference_short_tail_merge(latent_frames, lengths):
+    request = normalize_request("forest", sampling(frames=latent_frames * 4 - 3))
+    chunks = plan_chunks(request, 16)
+    assert [chunk.end - chunk.start for chunk in chunks] == lengths
+    assert sum(chunk.pixel_frames for chunk in chunks) == request.num_frames
+
+
+def test_short_tail_merge_preserves_prompt_boundaries():
+    request = normalize_request("first|||second", sampling(frames=69, extra={"segment_frame_boundaries": [0, 68, 69]}))
+    assert [(chunk.segment, chunk.start, chunk.end) for chunk in plan_chunks(request, 16)] == [(0, 0, 17), (1, 17, 18)]
+
+
+@pytest.mark.parametrize("size", [0, -1, True, 1.5])
+def test_invalid_chunk_size_fails_before_planning(size):
+    with pytest.raises(ValueError, match="positive integer"):
+        plan_chunks(normalize_request("forest", sampling()), size)
+
+
+@pytest.mark.parametrize("mode", ["full", "recent"])
+def test_merged_tail_is_in_pending_budget_and_executes(pipeline, monkeypatch, mode):
+    pipeline.ar_config = replace(pipeline.ar_config, chunk_latent_frames=4, history_mode=mode)
+    spec = pipeline.ar_diffusion_kv_cache_spec()
+    assert pipeline.ar_config.max_chunk_latent_frames == 5
+    assert spec.segmented.max_pending_tokens == 5 + 8
+    assert spec.segmented.max_pending_segments == (5 if mode == "recent" else 1)
+    monkeypatch.setattr(
+        "vllm_omni.experimental.ar_diffusion.runner.current_omni_platform", SimpleNamespace(synchronize=lambda: None)
+    )
+    runner = make_runner(pipeline)
+    request = DiffusionRequestBatch(
+        requests=[OmniDiffusionRequest(prompt="forest", sampling_params=sampling(frames=33), request_id="merged")]
+    )
+    output = execute(runner, request)
+    assert len(output.output["payload"]["video"]) == 33
+    assert [call["position"] for call in pipeline.calls if call["commit"]] == [0, 4]
+    runner.close_session("s")
 
 
 def test_continuation_keeps_real_kv_noise_and_decoder_timeline(runner):
@@ -407,6 +467,16 @@ def test_independent_request_reuses_default_session_without_old_state(runner):
     assert runner.pipeline._ar_sessions["default"].latent_frames == 3
 
 
+def test_aggregated_ar_request_reports_the_first_visible_frame(runner):
+    request = DiffusionRequestBatch(
+        requests=[OmniDiffusionRequest(request_id="ordinary", prompt="forest", sampling_params=sampling(frames=21))]
+    )
+    output = execute(runner, request, "default")
+    assert len(output.output["payload"]["video"]) == 21
+    assert output.output["metadata"]["hy_nomas"]["frame_start"] == 0
+    assert output.output["metadata"]["stream"]["frame_start"] == 0
+
+
 def test_cancel_releases_step_session_without_another_execution_wave(runner):
     free = runner.kv_cache.manager.block_pool.get_num_free_blocks()
     execute(runner, batch(session="live"), "live")
@@ -439,6 +509,9 @@ def test_empty_decoder_chunk_preserves_tick_metadata(runner):
     assert len(formatted.images) == 1
     assert formatted.images[0].shape == (0, 32, 32, 3)
     assert formatted.multimodal_output["metadata"]["ar_diffusion"]["chunk_index"] == 0
+    stream = formatted.multimodal_output["metadata"]["stream"]
+    assert stream["frame_start"] == 0 and stream["generated_raw_frames"] == 12
+    assert stream["generated_frames"] == stream["withheld_frames"] == 9
     assert len(execute(runner, batch(index=1, close=True)).output["payload"]["video"]) == 18
 
 
@@ -493,7 +566,7 @@ def test_decode_failure_is_propagated_to_every_sp_rank(runner, monkeypatch, loca
 
     def reduce_status(value):
         flags.append(value.item())
-        return torch.ones_like(value)
+        return value if len(flags) < 3 else torch.ones_like(value)
 
     def fail_decode(*args, **kwargs):
         raise RuntimeError("injected decode failure")
@@ -515,7 +588,7 @@ def test_decode_failure_is_propagated_to_every_sp_rank(runner, monkeypatch, loca
             monkeypatch.setattr(pipeline._session().decoder, "push", fail_decode)
         pipeline.sp_size = 2
         pipeline.post_decode(state)
-    assert flags == [int(local_failure)]
+    assert flags == [0, 0, int(local_failure)]
     assert not runner._sessions and not runner.pipeline._ar_sessions
     assert runner.kv_cache.manager.block_pool.get_num_free_blocks() == free
 
@@ -525,3 +598,125 @@ def test_cache_commit_timestep_keeps_reference_precision(runner):
         execute(runner, batch())
     assert runner.pipeline.calls[-1]["commit"]
     assert runner.pipeline.calls[-1]["timestep_dtype"] == torch.float32
+
+
+def test_recent_crosses_legacy_limits_with_bounded_exact_history(recent_runner):
+    runner = recent_runner
+    free = runner.kv_cache.manager.block_pool.get_num_free_blocks()
+    positions = []
+    for index in range(45):
+        output = execute(runner, batch(index=index, close=index == 44))
+        metadata = output.output["metadata"]["hy_nomas"]
+        session = runner.pipeline._ar_sessions["s"]
+        cache = runner._sessions["s"].segmented("cond")
+        assert metadata["sampling_version"] == "incremental_v1"
+        assert metadata["latent_position"] == (index + 1) * 3
+        assert session.segments == index + 1
+        assert cache.history_tokens == session.history_mask.shape[1] <= 18
+        assert len(session.history_frames) <= 18
+        assert cache.handles == tuple(frame.handle for frame in session.history_frames)
+        assert session.noise.numel() == 0
+        positions.append(runner.pipeline.calls[-1]["position"])
+        # A frame carrying text is indivisible; evict it together when the
+        # budget cannot keep any video from that record.
+        if index >= 2:
+            assert [frame.position for frame in session.history_frames] == list(range((index - 1) * 3, (index + 1) * 3))
+            assert cache.history_tokens == 14
+            assert session.action_tails == [(index, 5, 7), (index + 1, 12, 14)]
+    assert positions == list(range(0, 135, 3))
+    assert metadata["withheld_frames"] == 0 and session.emitted_frames == 405
+    runner.close_session("s")
+    assert runner.kv_cache.manager.block_pool.get_num_free_blocks() == free
+    assert not runner._sessions and not runner.pipeline._ar_sessions
+
+
+def test_recent_recaches_current_text_after_its_history_is_evicted(recent_runner):
+    pipeline = recent_runner.pipeline
+    state = StepRequestState(request_id="live", sampling=sampling(frames=105), prompt="forest")
+    cached = None
+    cached_text = []
+    with recent_runner._bound_ar_session("live", description="test"):
+        pipeline.prepare_encode(state)
+        while not state.request_denoise_completed:
+            output, cached = step_chunk(pipeline, state, cached)
+            cached_text.append(pipeline.calls[-5]["cache_txt"])
+        assert cached_text == [True, False, False, False, False, False, True, False, False]
+        assert pipeline.encoded == ["forest"]
+        assert pipeline._session().segments == 1 and pipeline._session().emitted_frames == 105
+        assert output.output["metadata"]["hy_nomas"]["withheld_frames"] == 0
+
+
+def test_recent_noise_is_independent_of_storage_budget_and_sessions(recent_runner):
+    runner = recent_runner
+    first = execute(runner, batch()).output["payload"]["video"]
+    session = runner.pipeline._ar_sessions["s"]
+    noise_state = session.noise_generator.get_state().clone()
+    commit_state = session.generator.get_state().clone()
+    execute(runner, batch(session="other", seed=19), "other")
+    second = execute(runner, batch(index=1, close=True)).output["payload"]["video"]
+    runner.reset_session("s")
+    runner.pipeline.ar_config = replace(runner.pipeline.ar_config, history_latent_frames=9)
+    replay = execute(runner, batch()).output["payload"]["video"]
+    np.testing.assert_array_equal(replay, first)
+    torch.testing.assert_close(runner.pipeline._ar_sessions["s"].noise_generator.get_state(), noise_state)
+    torch.testing.assert_close(runner.pipeline._ar_sessions["s"].generator.get_state(), commit_state)
+    np.testing.assert_array_equal(execute(runner, batch(index=1, close=True)).output["payload"]["video"], second)
+
+
+@pytest.mark.parametrize("limit", ["max_total_latent_frames", "max_total_segments"])
+def test_recent_total_limits_fail_closed_and_allow_fresh_generation(recent_runner, limit):
+    runner = recent_runner
+    runner.pipeline.ar_config = replace(runner.pipeline.ar_config, **{limit: 3 if limit.endswith("frames") else 1})
+    free = runner.kv_cache.manager.block_pool.get_num_free_blocks()
+    expected = execute(runner, batch()).output["payload"]["video"]
+    with pytest.raises(OmniClientError, match="total.*limit"):
+        execute(runner, batch(index=1))
+    assert not runner._sessions and not runner.pipeline._ar_sessions
+    assert runner.kv_cache.manager.block_pool.get_num_free_blocks() == free
+    np.testing.assert_array_equal(execute(runner, batch()).output["payload"]["video"], expected)
+    runner.close_session("s")
+
+
+@pytest.mark.parametrize("phase", ["allocation", "stage", "peer_stage"])
+def test_recent_failed_commit_preserves_published_history(recent_runner, monkeypatch, phase):
+    runner = recent_runner
+    execute(runner, batch())
+    cache = runner._sessions["s"].segmented("cond")
+    handles = cache.handles
+    masks = runner.pipeline._ar_sessions["s"].history_mask.clone()
+    free = runner.kv_cache.manager.block_pool.get_num_free_blocks()
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("injected commit failure")
+
+    if phase == "allocation":
+        monkeypatch.setattr(cache, "begin_commit", fail)
+    elif phase == "stage":
+        original = cache.stage
+
+        def stage(layer):
+            if layer == 1:
+                fail()
+            original(layer)
+
+        monkeypatch.setattr(cache, "stage", stage)
+    else:
+        monkeypatch.setattr(
+            "vllm_omni.diffusion.models.hy_nomas.pipeline_hy_nomas.get_sp_group",
+            lambda: SimpleNamespace(all_reduce=lambda value: torch.ones_like(value)),
+        )
+        original = runner.pipeline._check_sp_error
+
+        def peer_error(error, operation):
+            if operation == "KV staging":
+                runner.pipeline.sp_size = 2
+            original(error, operation)
+
+        monkeypatch.setattr(runner.pipeline, "_check_sp_error", peer_error)
+    with runner._bound_ar_session("s", description="test"):
+        with pytest.raises(RuntimeError, match="commit failure|another SP rank"):
+            runner.pipeline.forward(batch(index=1))
+        assert cache.handles == handles and not cache.commit_active
+        torch.testing.assert_close(runner.pipeline._ar_sessions["s"].history_mask, masks)
+        assert runner.kv_cache.manager.block_pool.get_num_free_blocks() == free
+    runner.close_session("s")
