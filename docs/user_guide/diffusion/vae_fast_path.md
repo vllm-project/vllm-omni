@@ -10,6 +10,10 @@ installs a fast path on every loaded Wan VAE that fuses this data movement into
 a handful of Triton kernels. The opt-in `channels_last` level also specializes
 first-frame convolutions that have no history.
 
+The same fast path also covers image models whose VAE is a Wan VAE under other
+class names: Qwen-Image (and Edit, Anima, Krea2), Qwen-Image-Layered and
+Qwen-Image-2.1. See [Wan-family VAEs](#wan-family-vaes).
+
 ## Decoder levels
 
 The fast path is controlled by `--vae-fast-path` (engine argument
@@ -212,6 +216,82 @@ Validate on both H100 and GB200, using 256x256, 640x384 and 1280x720 inputs with
 videos, and investigate latency or peak-memory regressions above 5%. The new
 encoder kernel launch sizes are conservative defaults; architecture-specific
 tuning and the numerical gates require validation on those GPUs.
+
+## Wan-family VAEs
+
+The installer finds which registered *family* a VAE belongs to and binds the
+same replacement forwards to that family's classes
+(`vllm_omni/diffusion/distributed/autoencoders/wan_vae_fastpath/families.py`).
+`--vae-fast-path` (decoder) and `--vae-encode-fast-path` (encoder) apply to all
+of them:
+
+| Family | VAE class | Pipelines | Notes |
+| --- | --- | --- | --- |
+| `wan` | diffusers `AutoencoderKLWan` | Wan2.1/2.2, Cosmos3, LingBot, Helios, ... | Everything above; the Cosmos3 encoder path is Wan-only. |
+| `qwen_image` | diffusers `AutoencoderKLQwenImage` | Qwen-Image, Qwen-Image-Edit, Anima, Krea2 | The decoder's up blocks take no `first_chunk`. |
+| `qwen_image_layered` | vLLM-Omni `AutoencoderKLQwenImage` (`models/qwen_image/`) | Qwen-Image-Layered | Its RMS norm skips the fp32 upcast, so it keeps its own forward. |
+| `qwen_image_21` | vLLM-Omni `AutoencoderKLQwenImage21` | Qwen-Image-2.1 | Causal convs are `Conv2d` on a single frame; `channels_last` also replaces the fp32-math SDPA in the mid-block attention with chunked bf16 matmuls. |
+
+For the non-Wan families the encoder fast path binds the causal convolutions,
+residual blocks and RMS norms; the Cosmos3-specific encoder forwards are not
+used. A single-frame `Conv2d` convolution moves its zero padding into the
+convolution only for shapes where a first-use probe shows identical bits
+(otherwise it keeps `F.pad`), like the Conv3d paths.
+
+Another Wan-style VAE gets the fast path by registering its classes, without
+copying any forward:
+
+```python
+from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath import WanVaeFamily, register_family
+
+register_family(
+    WanVaeFamily(
+        name="my_vae",
+        vaes=(MyAutoencoder,),
+        decoder=MyDecoder3d,
+        encoder=MyEncoder3d,
+        causal_conv=MyCausalConv3d,
+        rms_norm=MyRMSNorm,  # None if its numerics differ from WanRMS_norm
+        resample=MyResample,
+        upsample=MyUpsample,
+        residual_block=MyResidualBlock,
+        residual_up_block=MyResidualUpBlock,  # residual VAEs only
+        dup_up=MyDupUp3D,
+        attention_block=MyAttentionBlock,
+    )
+)
+```
+
+Module types are matched exactly, and a family's classes must have the Wan
+forwards' behavior up to names: add a bitwise `lossless` test, as
+`tests/diffusion/distributed/test_wan_vae_fastpath_families.py` does for the
+built-in families.
+
+Measured on one Intel Arc Pro B70 (bf16, real weights, a natural image encoded
+at each size and its latent decoded; median of 5 after warmup;
+`benchmarks/diffusion/bench_wan_family_vae.py`), in ms:
+
+| VAE | Size | Decode `off` | `lossless` | `channels_last` | Encode `off` | `lossless` | `channels_last` |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Qwen-Image | 1024x1024 | 251.8 | 170.7 | 81.0 (43.6 dB) | 153.0 | 105.3 | 148.5 |
+| Qwen-Image | 1328x1328 | 468.8 | 311.6 | 152.5 | 289.4 | 199.4 | 270.7 |
+| Qwen-Image-2.1 | 1024x1024 | 308.7 | 233.4 | 237.2 (63.5 dB) | 77.4 | 59.9 | 87.8 |
+| Qwen-Image-2.1 | 1328x1328 | 571.0 | 460.4 | 467.1 (64.0 dB) | 142.3 | 117.6 | 161.4 |
+| Qwen-Image-2.1 | 2048x2048 | 1286.0 | 986.5 | 942.9 (65.0 dB) | 333.9 | 280.6 | 394.5 |
+
+`lossless` is bitwise identical to `off` at 1024x1024 and for Qwen-Image-2.1 at
+every size. At 1328x1328 on this XPU stack (torch 2.14.0+xpu), the reference
+decode of the Wan 2.1-structured VAEs (Wan and Qwen-Image alike) is itself
+wrong: inside a full decode, the upsampler's fp32 round trip
+(`F.interpolate(x.float(), ...)` at 664x664 -> 1328x1328) writes wrong values
+into the first 524288 output elements, while the fast path's bf16 upsample
+matches ground truth (`repeat_interleave`). The same call in isolation is
+correct, so this is a state-dependent XPU issue outside the fast path.
+
+`channels_last` decode reaches only 43.6 dB for Qwen-Image (58.7 dB for the Wan
+2.1 VAE on the same image and card; the cause is not investigated), so prefer
+`lossless` for Qwen-Image where fidelity matters. On this card `channels_last`
+gives Qwen-Image-2.1 no decode gain and a slower encode.
 
 ## Measured decoder performance
 
