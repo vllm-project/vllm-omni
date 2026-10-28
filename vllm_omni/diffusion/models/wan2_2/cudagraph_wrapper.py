@@ -104,6 +104,7 @@ class Wan22DiTCUDAGraphWrapper:
         capturable = (
             self.enabled
             and timestep is not None
+            and timestep.ndim == 1
             and encoder_hidden_states is not None
             and set(kwargs) <= _CAPTURABLE_KWARGS
             and hidden_states.device.type == "cuda"

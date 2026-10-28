@@ -138,6 +138,27 @@ def test_graph_capture_failure_is_propagated(mocker) -> None:
 
 
 @pytest.mark.cpu
+def test_per_patch_timesteps_stay_eager() -> None:
+    """I2V-style per-patch timesteps ([batch, tokens]) bypass the cache.
+
+    Only the flat per-request timesteps of the text-to-video path are
+    verified for replay; the image-conditioned path keeps eager execution.
+    """
+    dit = _StubDiT()
+    wrapper = Wan22DiTCUDAGraphWrapper(dit)
+    inputs = _inputs()
+    per_patch = inputs["timestep"].unsqueeze(-1).expand(2, 9)
+
+    flat = dict(inputs)
+    flat.pop("timestep")
+    out = wrapper(**flat, timestep=per_patch, attention_kwargs=None)
+
+    torch.testing.assert_close(out, inputs["hidden_states"] * 2.0)
+    assert len(dit.calls) == 1
+    assert not wrapper._cache
+
+
+@pytest.mark.cpu
 def test_setup_compile_hook_is_class_private() -> None:
     """The runner dispatches on attribute presence, so the class must not define it.
 
