@@ -42,13 +42,13 @@ _QUEUE_BYTES = 8 * 1024 * 1024
 _MAX_FRAME_BYTES = 64 * 1024 * 1024
 _BATCH_BYTES = 1024 * 1024
 _COMMAND_TYPES = {
-    name: value
-    for name, value in vars(commands).items()
+    value.__name__: value
+    for value in vars(commands).values()
     if isinstance(value, type) and issubclass(value, commands.DuplexCommand)
 }
 _EVENT_TYPES = {
-    name: value
-    for name, value in vars(events).items()
+    value.__name__: value
+    for value in vars(events).values()
     if isinstance(value, type) and issubclass(value, events.DuplexEvent)
 }
 _CONTROLS = frozenset({"open_session_async", "close_session_async", "resume_session_async", "touch_session_async"})
@@ -70,9 +70,19 @@ EngineFactory = Callable[[str, dict[str, Any]], WorkerRuntime]
 
 
 @dataclass(frozen=True)
+class ProcessDuplexStageMetadata:
+    """Small deployment snapshot; stage clients and processors stay in the worker."""
+
+    stage_id: int
+    stage_type: str
+    engine_args: dict[str, int | None]
+
+
+@dataclass(frozen=True)
 class ProcessDuplexMetadata:
     model: str
     num_stages: int
+    stage_configs: list[ProcessDuplexStageMetadata]
     config_path: str | None
     duplex_session_config: DuplexSessionRuntimeConfig
     duplex_capabilities: DuplexCapabilities
@@ -165,9 +175,25 @@ async def _serve_worker(sock: socket.socket, model: str, options: dict[str, Any]
     try:
         runtime = factory(model, options)
         engine = runtime.engine
+        stages = []
+        for stage, vllm_config in zip(engine.stage_configs, engine.stage_vllm_configs):
+            model_config = getattr(vllm_config, "model_config", None)
+            max_model_len = getattr(model_config, "max_model_len", None)
+            stages.append(
+                ProcessDuplexStageMetadata(
+                    stage_id=stage.stage_id,
+                    stage_type=getattr(stage.stage_type, "value", stage.stage_type),
+                    engine_args={
+                        "max_model_len": max_model_len
+                        if max_model_len is not None
+                        else stage.engine_args.get("max_model_len")
+                    },
+                )
+            )
         metadata = ProcessDuplexMetadata(
             model=runtime.model,
             num_stages=engine.num_stages,
+            stage_configs=stages,
             config_path=engine.config_path,
             duplex_session_config=engine.duplex_session_config,
             duplex_capabilities=engine.duplex_capabilities,
@@ -278,7 +304,7 @@ async def _serve_worker(sock: socket.socket, model: str, options: dict[str, Any]
                         return
                     if operation == "submit_command_async":
                         session_id, name, data = args
-                        command = msgspec.convert(data, type=_COMMAND_TYPES[name])
+                        command: commands.DuplexCommand = msgspec.convert(data, type=_COMMAND_TYPES[name])
                         try:
                             await engine.submit_command_async(session_id, command)
                         except Exception as exc:
@@ -548,7 +574,7 @@ class ProcessDuplexEngineClient:
                         buffer.invalidate(response_id, epoch)
                 elif kind == "event":
                     session_id, name, data = body
-                    event = msgspec.convert(data, type=_EVENT_TYPES[name])
+                    event: events.DuplexEvent = msgspec.convert(data, type=_EVENT_TYPES[name])
                     buffer = self._buffers.get(session_id)
                     if isinstance(event, AudioDelta) and event.epoch is not None:
                         if event.epoch <= self._invalidated.get(session_id, {}).get(event.response_id, -1):
@@ -619,7 +645,9 @@ class ProcessDuplexEngineClient:
             task.cancel()
         if self._channel is not None:
             logger.debug("Duplex IPC: %d messages / %d batches", self._channel.messages_sent, self._channel.frames_sent)
-            self._channel.writer.close()
+            # Synchronous finalization can run after the caller closed its loop.
+            with suppress(RuntimeError):
+                self._channel.writer.close()
         self._socket.close()
         if self._process.pid is not None:
             self._process.join(timeout=5 if timeout is None else timeout)
