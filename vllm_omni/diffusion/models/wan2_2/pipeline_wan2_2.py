@@ -616,6 +616,12 @@ class Wan22Pipeline(
         # active, inductor cudagraphs must stay off so the two graph layers
         # (torch.compile's and this wrapper's) never stack.
         self.enable_cuda_graph_decode = self.dit_cudagraph_wrapper is not None and self.dit_cudagraph_wrapper.enabled
+        # The runner selects ``setup_compile`` by attribute presence and then
+        # never compiles the transformers itself, so the hook must only exist
+        # while the opt-in graph cache is actually active; otherwise the
+        # default Wan2.2 path would silently lose the ordinary torch.compile.
+        if self.enable_cuda_graph_decode:
+            self.setup_compile = self._setup_compile_graphs
 
         # Store the active transformer config
         if load_transformer:
@@ -1590,7 +1596,7 @@ class Wan22Pipeline(
         result = current_model(**kwargs)
         return result if isinstance(result, IntermediateTensors) else result[0]
 
-    def setup_compile(self) -> None:
+    def _setup_compile_graphs(self) -> None:
         """Capture the configured DiT CUDA graph shapes at startup.
 
         ``model_config.wan22_dit_warmup_shapes`` lists ``(width, height,
@@ -1629,7 +1635,10 @@ class Wan22Pipeline(
                     device=device,
                     dtype=dtype,
                 )
-                timestep = torch.zeros(1, device=device, dtype=dtype)
+                # The denoising loop expands the scheduler's FP32 timesteps;
+                # warm up with the same dtype so the captured buffer never
+                # rounds real values through a model-dtype copy.
+                timestep = torch.zeros(1, device=device, dtype=torch.float32)
                 encoder_hidden_states = torch.zeros(1, 512, text_dim, device=device, dtype=dtype)
                 wrapper(
                     hidden_states, timestep=timestep, encoder_hidden_states=encoder_hidden_states, return_dict=False

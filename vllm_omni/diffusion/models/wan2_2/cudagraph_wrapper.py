@@ -61,7 +61,18 @@ class Wan22DiTCUDAGraphWrapper:
 
     @staticmethod
     def _key(hidden_states: torch.Tensor, timestep: torch.Tensor, encoder_hidden_states: torch.Tensor) -> tuple:
-        return (tuple(hidden_states.shape), tuple(timestep.shape), tuple(encoder_hidden_states.shape))
+        # dtypes and device are part of the key: the denoising loop passes the
+        # scheduler's FP32 timesteps into a BF16 model, and a graph captured
+        # for one dtype must never silently serve ``copy_`` from another.
+        return (
+            tuple(hidden_states.shape),
+            tuple(timestep.shape),
+            tuple(encoder_hidden_states.shape),
+            hidden_states.dtype,
+            timestep.dtype,
+            encoder_hidden_states.dtype,
+            hidden_states.device.type,
+        )
 
     def _retire_graph_generation_if_full(self) -> None:
         """Retire all graphs together so none outlive shared workspaces."""

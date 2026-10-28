@@ -55,7 +55,10 @@ def test_key_uses_exact_shapes() -> None:
     wrapper = Wan22DiTCUDAGraphWrapper(_StubDiT())
     inputs = _inputs()
     key = wrapper._key(inputs["hidden_states"], inputs["timestep"], inputs["encoder_hidden_states"])
-    assert key == ((2, 48, 21, 60, 104), (2,), (2, 512, 4096))
+    assert key[:3] == ((2, 48, 21, 60, 104), (2,), (2, 512, 4096))
+    assert key[3:] == (torch.float32, torch.float32, torch.float32, "cpu")
+    bf16 = {k: v.bfloat16() for k, v in inputs.items()}
+    assert wrapper._key(bf16["hidden_states"], bf16["timestep"], bf16["encoder_hidden_states"]) != key
 
 
 @pytest.mark.cpu
@@ -132,6 +135,58 @@ def test_graph_capture_failure_is_propagated(mocker) -> None:
         out = wrapper(**inputs, return_dict=False)
     assert out.shape == inputs["hidden_states"].shape
     assert torch.isfinite(out).all()
+
+
+@pytest.mark.cpu
+def test_setup_compile_hook_is_class_private() -> None:
+    """The runner dispatches on attribute presence, so the class must not define it.
+
+    ``Wan22Pipeline.__init__`` attaches ``setup_compile`` only while the
+    opt-in graph cache is active; without the opt-in the attribute is absent
+    and the model runner falls back to its ordinary torch.compile loop.
+    """
+    from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import Wan22Pipeline
+
+    assert "setup_compile" not in vars(Wan22Pipeline)
+
+
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph replay requires CUDA")
+def test_graph_replay_matches_eager_with_fp32_timestep() -> None:
+    """Warmup-to-replay parity: a BF16 model must serve the scheduler's FP32 timesteps.
+
+    The graph key carries dtypes, so the FP32 timesteps of the denoise loop
+    never reuse a buffer captured in the model dtype, and a replay matches
+    the eager forward including the sinusoidal timestep embedding.
+    """
+    model, wrapper = _make_gpu_wrapper(max_graphs=4)
+    inputs = _inputs("cuda", torch.bfloat16)
+    fp32_t = inputs["timestep"].float()
+
+    with torch.no_grad():
+        eager = model(
+            inputs["hidden_states"],
+            timestep=fp32_t,
+            encoder_hidden_states=inputs["encoder_hidden_states"],
+            return_dict=False,
+        )[0]
+        replayed = wrapper(
+            inputs["hidden_states"],
+            timestep=fp32_t,
+            encoder_hidden_states=inputs["encoder_hidden_states"],
+            return_dict=False,
+        )
+    torch.testing.assert_close(replayed, eager)
+    # The FP32 and BF16 timesteps land in separate cache buckets.
+    assert len(wrapper._cache) == 1
+    with torch.no_grad():
+        wrapper(
+            inputs["hidden_states"],
+            timestep=inputs["timestep"],
+            encoder_hidden_states=inputs["encoder_hidden_states"],
+            return_dict=False,
+        )
+    assert len(wrapper._cache) == 2
 
 
 def _make_gpu_wrapper(max_graphs: int = 8):
