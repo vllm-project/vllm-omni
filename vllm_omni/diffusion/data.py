@@ -257,7 +257,12 @@ class DiffusionParallelConfig:
     """
 
     ulysses_a2a_permute: bool = False
-    """Use fused permute-free all-to-all for eligible strict Ulysses exchanges."""
+    """Use fused permute-free all-to-all for eligible strict Ulysses exchanges.
+
+    Uses NCCL symmetric memory on CUDA and SHMEM on NPU. NPU currently requires
+    eager inference and pure Ulysses over WORLD in one HCCS domain, with
+    TorchNPU's NPUSHMEM allocator, Triton-Ascend and libshmem.so installed.
+    """
 
     cfg_parallel_size: int = 1
     """Number of ranks used to execute guidance passes in parallel."""
