@@ -1117,6 +1117,16 @@ class OmniServeCommand(CLISubcommand):
             "Equivalent to setting DiffusionParallelConfig.vae_patch_parallel_size.",
         )
         omni_config_group.add_argument(
+            "--vae-encode-parallel-size",
+            type=int,
+            default=1,
+            help="Image-level data-parallel degree for MiniMax-H3 reference image VAE encoding. "
+            "Uses up to N DiT ranks to encode different reference images concurrently. "
+            "Only applies when a request has at least two reference images; empty ranks are allowed. "
+            "Independent of --vae-patch-parallel-size. "
+            "Equivalent to setting DiffusionParallelConfig.vae_encode_parallel_size.",
+        )
+        omni_config_group.add_argument(
             "--text-encoder-tp-size",
             type=int,
             default=None,
