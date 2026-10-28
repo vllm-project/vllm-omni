@@ -16,13 +16,13 @@ import multiprocessing
 import os
 import signal
 import socket
-import struct
 import traceback
 from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+import msgpack
 import msgspec
 import uvloop
 from vllm.logger import init_logger
@@ -37,11 +37,10 @@ from vllm_omni.engine.duplex.events import AudioDelta, ResponseDone, SessionClos
 from vllm_omni.engine.duplex.messages import DuplexControlResultMessage, DuplexSessionError, DuplexSessionEventMessage
 
 logger = init_logger(__name__)
-_HEADER = struct.Struct("!I")
 _QUEUE_SIZE = 1024
 _QUEUE_BYTES = 8 * 1024 * 1024
-_MAX_FRAME_BYTES = 64 * 1024 * 1024
-_BATCH_BYTES = 1024 * 1024
+_MAX_MESSAGE_BYTES = 64 * 1024 * 1024
+_READ_BYTES = 64 * 1024
 _COMMAND_TYPES = {
     value.__name__: value
     for value in vars(commands).values()
@@ -93,33 +92,38 @@ class ProcessDuplexMetadata:
     endpoint_restrictions: list[tuple[str, str]]
 
 
-class _BatchedSocket:
-    """Bounded FIFO with one writer; serialize once and batch without a timer."""
+class _MessageSocket:
+    """Bounded FIFO with one async writer and a streaming MessagePack reader."""
 
-    def __init__(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    def __init__(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        unpacker: msgpack.Unpacker | None = None,
+    ) -> None:
         self.reader, self.writer = reader, writer
-        self.queue: asyncio.Queue[tuple[msgspec.Raw, int]] = asyncio.Queue(_QUEUE_SIZE)
+        self.unpacker = unpacker if unpacker is not None else _new_unpacker()
+        self.queue: asyncio.Queue[bytes] = asyncio.Queue(_QUEUE_SIZE)
         self.pending_bytes = 0
         self._space = asyncio.Event()
-        self.frames_sent = self.messages_sent = 0
 
     @staticmethod
-    def entry(message: tuple[Any, ...]) -> tuple[msgspec.Raw, int]:
+    def entry(message: tuple[Any, ...]) -> bytes:
         payload = msgspec.msgpack.encode(message)
         if len(payload) > _QUEUE_BYTES:
             raise ValueError("Duplex IPC message exceeds the 8 MiB queue budget")
-        return msgspec.Raw(payload), len(payload)
+        return payload
 
-    def put_nowait(self, entry: tuple[msgspec.Raw, int]) -> None:
-        if self.pending_bytes + entry[1] > _QUEUE_BYTES:
+    def put_nowait(self, entry: bytes) -> None:
+        if self.pending_bytes + len(entry) > _QUEUE_BYTES:
             raise asyncio.QueueFull
         self.queue.put_nowait(entry)
-        self.pending_bytes += entry[1]
+        self.pending_bytes += len(entry)
 
     async def send(self, message: tuple[Any, ...]) -> None:
         await self.send_entry(self.entry(message))
 
-    async def send_entry(self, entry: tuple[msgspec.Raw, int]) -> None:
+    async def send_entry(self, entry: bytes) -> None:
         while True:
             try:
                 self.put_nowait(entry)
@@ -130,28 +134,24 @@ class _BatchedSocket:
 
     async def write(self) -> None:
         while True:
-            item, size = await self.queue.get()
-            batch = [item]
-            while size < _BATCH_BYTES and not self.queue.empty():
-                item, weight = self.queue.get_nowait()
-                batch.append(item)
-                size += weight
-            self.pending_bytes -= size
+            payload = await self.queue.get()
+            self.pending_bytes -= len(payload)
             self._space.set()
-            payload = msgspec.msgpack.encode(batch)
-            self.writer.write(_HEADER.pack(len(payload)) + payload)
+            self.writer.write(payload)
             await self.writer.drain()
-            self.frames_sent += 1
-            self.messages_sent += len(batch)
 
-    async def receive(self) -> list[Any]:
-        size = _HEADER.unpack(await self.reader.readexactly(_HEADER.size))[0]
-        if size > _MAX_FRAME_BYTES:
-            raise ValueError("Duplex IPC frame exceeds limit")
-        messages = msgspec.msgpack.decode(await self.reader.readexactly(size))
-        if not isinstance(messages, list):
-            raise ValueError("Expected a duplex IPC batch")
-        return messages
+    async def receive(self) -> Any:
+        while True:
+            for message in self.unpacker:
+                return message
+            chunk = await self.reader.read(_READ_BYTES)
+            if not chunk:
+                raise EOFError("Duplex IPC connection closed")
+            self.unpacker.feed(chunk)
+
+
+def _new_unpacker() -> msgpack.Unpacker:
+    return msgpack.Unpacker(raw=False, strict_map_key=False, timestamp=3, max_buffer_size=_MAX_MESSAGE_BYTES)
 
 
 def _error(exc: Exception) -> dict[str, Any]:
@@ -204,13 +204,13 @@ async def _serve_worker(sock: socket.socket, model: str, options: dict[str, Any]
             endpoint_restrictions=[(r.capability.name, r.reason) for r in engine.endpoint_restrictions],
         )
         payload = msgspec.msgpack.encode((True, metadata))
-        if len(payload) > _MAX_FRAME_BYTES:
+        if len(payload) > _MAX_MESSAGE_BYTES:
             raise ValueError("Oversized duplex startup metadata")
-        sock.sendall(_HEADER.pack(len(payload)) + payload)
+        sock.sendall(payload)
         ready = True
         sock.setblocking(False)
         reader, writer = await asyncio.open_connection(sock=sock)
-        channel = _BatchedSocket(reader, writer)
+        channel = _MessageSocket(reader, writer)
         loop = asyncio.get_running_loop()
         fatal: asyncio.Future[None] = loop.create_future()
         buffers: dict[str, DuplexOutputBuffer] = {}
@@ -300,20 +300,20 @@ async def _serve_worker(sock: socket.socket, model: str, options: dict[str, Any]
 
         async def read_requests() -> None:
             while True:
-                for request_id, operation, args, kwargs in await channel.receive():
-                    if operation == "shutdown":
-                        return
-                    if operation == "submit_command_async":
-                        session_id, name, data = args
-                        command: commands.DuplexCommand = msgspec.convert(data, type=_COMMAND_TYPES[name])
-                        try:
-                            await engine.submit_command_async(session_id, command)
-                        except Exception as exc:
-                            await send_event(session_id, error_event(getattr(exc, "code", "engine_error"), str(exc)))
-                    elif operation in _CONTROLS or operation == "check_health":
-                        track(control(request_id, operation, args, kwargs))
-                    else:
-                        raise ValueError(f"Unsupported duplex IPC operation: {operation}")
+                request_id, operation, args, kwargs = await channel.receive()
+                if operation == "shutdown":
+                    return
+                if operation == "submit_command_async":
+                    session_id, name, data = args
+                    command: commands.DuplexCommand = msgspec.convert(data, type=_COMMAND_TYPES[name])
+                    try:
+                        await engine.submit_command_async(session_id, command)
+                    except Exception as exc:
+                        await send_event(session_id, error_event(getattr(exc, "code", "engine_error"), str(exc)))
+                elif operation in _CONTROLS or operation == "check_health":
+                    track(control(request_id, operation, args, kwargs))
+                else:
+                    raise ValueError(f"Unsupported duplex IPC operation: {operation}")
 
         track(channel.write())
         track(pump_engine())
@@ -328,7 +328,7 @@ async def _serve_worker(sock: socket.socket, model: str, options: dict[str, Any]
         if not ready:
             with suppress(OSError):
                 payload = msgspec.msgpack.encode((False, traceback.format_exc()))
-                sock.sendall(_HEADER.pack(len(payload)) + payload)
+                sock.sendall(payload)
     finally:
         pending = list(tasks)
         for task in pending:
@@ -367,11 +367,12 @@ class ProcessDuplexEngineClient:
         self._outputs: asyncio.Queue[DuplexSessionEventMessage] = asyncio.Queue(_QUEUE_SIZE)
         self._failure: str | None = None
         self._transport_failed: asyncio.Future[None] | None = None
-        self._channel: _BatchedSocket | None = None
+        self._channel: _MessageSocket | None = None
         self._start_task: asyncio.Task[None] | None = None
         self._tasks: list[asyncio.Task[None]] = []
         self._cleanup_tasks: set[asyncio.Task[Any]] = set()
         self._closed = False
+        self._unpacker = _new_unpacker()
         self._socket, child = socket.socketpair()
         self._socket.settimeout(float(options.get("init_timeout", 600)) + 30)
         self._process = multiprocessing.get_context("spawn").Process(
@@ -380,13 +381,16 @@ class ProcessDuplexEngineClient:
         try:
             self._process.start()
             child.close()
-            size = _HEADER.unpack(self._read_exactly(_HEADER.size))[0]
-            if size > _MAX_FRAME_BYTES:
-                raise RuntimeError("Oversized duplex startup reply")
-            ok, facts = msgspec.msgpack.decode(self._read_exactly(size))
+            ok, facts = self._read_startup()
             if not ok:
                 raise RuntimeError(f"Duplex engine process startup failed:\n{facts}")
             self.metadata = msgspec.convert(facts, type=ProcessDuplexMetadata)
+            self.config_path = self.metadata.config_path
+            self.stage_configs = self.metadata.stage_configs
+            self.endpoint_restrictions = tuple(
+                EndpointRestriction(OmniServingCapability[name], reason)
+                for name, reason in self.metadata.endpoint_restrictions
+            )
             self.duplex_session_config = self.metadata.duplex_session_config
             self.duplex_capabilities = self.metadata.duplex_capabilities
             self.num_stages = self.metadata.num_stages
@@ -399,21 +403,6 @@ class ProcessDuplexEngineClient:
             self.shutdown()
             raise
 
-    @property
-    def config_path(self) -> str | None:
-        return self.metadata.config_path
-
-    @property
-    def stage_configs(self) -> list[ProcessDuplexStageMetadata]:
-        return self.metadata.stage_configs
-
-    @property
-    def endpoint_restrictions(self) -> tuple[EndpointRestriction, ...]:
-        return tuple(
-            EndpointRestriction(OmniServingCapability[name], reason)
-            for name, reason in self.metadata.endpoint_restrictions
-        )
-
     def get_frontend_vllm_config(self) -> None:
         """The worker owns stage configurations and generation processors."""
         return None
@@ -421,14 +410,14 @@ class ProcessDuplexEngineClient:
     def get_frontend_diffusion_od_config(self) -> None:
         return None
 
-    def _read_exactly(self, size: int) -> bytes:
-        result = bytearray()
-        while len(result) < size:
-            chunk = self._socket.recv(size - len(result))
+    def _read_startup(self) -> Any:
+        while True:
+            for message in self._unpacker:
+                return message
+            chunk = self._socket.recv(_READ_BYTES)
             if not chunk:
                 raise RuntimeError("Duplex engine process exited during startup")
-            result.extend(chunk)
-        return bytes(result)
+            self._unpacker.feed(chunk)
 
     def start(self) -> None:
         if self._start_task is None:
@@ -436,7 +425,7 @@ class ProcessDuplexEngineClient:
 
     async def _connect(self) -> None:
         reader, writer = await asyncio.open_connection(sock=self._socket)
-        self._channel = _BatchedSocket(reader, writer)
+        self._channel = _MessageSocket(reader, writer, self._unpacker)
         self._transport_failed = asyncio.get_running_loop().create_future()
         self._tasks = [asyncio.create_task(self._channel.write()), asyncio.create_task(self._read())]
         for task in self._tasks:
@@ -585,52 +574,45 @@ class ProcessDuplexEngineClient:
     async def _read(self) -> None:
         assert self._channel is not None
         while True:
-            for message in await self._channel.receive():
-                kind, *body = message
-                if kind == "result":
-                    request_id, ok, value = body
-                    future = self._pending.get(request_id)
-                    if future is not None and not future.done():
-                        if not ok:
-                            future.set_exception(DuplexSessionError(value.pop("message"), **value))
-                        else:
-                            if value is not None:
-                                # The envelope keeps annotation-only imports for its
-                                # in-process buffer fields. Decode the nested value
-                                # explicitly instead of resolving its whole graph.
-                                if value["capabilities"] is not None:
-                                    value["capabilities"] = msgspec.convert(
-                                        value["capabilities"], type=DuplexCapabilities
-                                    )
-                                value = DuplexControlResultMessage(**value)
-                            future.set_result(value)
-                elif kind == "invalidate":
-                    session_id, response_id, epoch = body
-                    if (buffer := self._buffers.get(session_id)) is not None:
-                        epochs = self._invalidated.setdefault(session_id, {})
-                        epochs[response_id] = max(epoch, epochs.get(response_id, -1))
-                        buffer.invalidate(response_id, epoch)
-                elif kind == "event":
-                    session_id, name, data = body
-                    event: events.DuplexEvent = msgspec.convert(data, type=_EVENT_TYPES[name])
-                    buffer = self._buffers.get(session_id)
-                    if isinstance(event, AudioDelta) and event.epoch is not None and event.response_id is not None:
-                        if event.epoch <= self._invalidated.get(session_id, {}).get(event.response_id, -1):
-                            continue
-                    if isinstance(event, SessionClosed):
-                        self._buffers.pop(session_id, None)
-                        self._invalidated.pop(session_id, None)
-                        if buffer is not None:
-                            self._outputs.put_nowait(DuplexSessionEventMessage(session_id=session_id, event=event))
-                    elif buffer is not None:
-                        try:
-                            buffer.put(event)
-                        except DuplexOutputOverflowError:
-                            self._overflow_session(session_id, buffer)
-                        if isinstance(event, ResponseDone) and event.response_id is not None:
-                            self._invalidated.get(session_id, {}).pop(event.response_id, None)
-                else:
-                    raise RuntimeError(f"Unknown duplex IPC message: {kind}")
+            message = await self._channel.receive()
+            kind, *body = message
+            if kind == "result":
+                request_id, ok, value = body
+                future = self._pending.get(request_id)
+                if future is not None and not future.done():
+                    if not ok:
+                        future.set_exception(DuplexSessionError(value.pop("message"), **value))
+                    else:
+                        if value is not None:
+                            value = msgspec.convert(value, type=DuplexControlResultMessage)
+                        future.set_result(value)
+            elif kind == "invalidate":
+                session_id, response_id, epoch = body
+                if (buffer := self._buffers.get(session_id)) is not None:
+                    epochs = self._invalidated.setdefault(session_id, {})
+                    epochs[response_id] = max(epoch, epochs.get(response_id, -1))
+                    buffer.invalidate(response_id, epoch)
+            elif kind == "event":
+                session_id, name, data = body
+                event: events.DuplexEvent = msgspec.convert(data, type=_EVENT_TYPES[name])
+                buffer = self._buffers.get(session_id)
+                if isinstance(event, AudioDelta) and event.epoch is not None and event.response_id is not None:
+                    if event.epoch <= self._invalidated.get(session_id, {}).get(event.response_id, -1):
+                        continue
+                if isinstance(event, SessionClosed):
+                    self._buffers.pop(session_id, None)
+                    self._invalidated.pop(session_id, None)
+                    if buffer is not None:
+                        self._outputs.put_nowait(DuplexSessionEventMessage(session_id=session_id, event=event))
+                elif buffer is not None:
+                    try:
+                        buffer.put(event)
+                    except DuplexOutputOverflowError:
+                        self._overflow_session(session_id, buffer)
+                    if isinstance(event, ResponseDone) and event.response_id is not None:
+                        self._invalidated.get(session_id, {}).pop(event.response_id, None)
+            else:
+                raise RuntimeError(f"Unknown duplex IPC message: {kind}")
 
     def _overflow_session(self, session_id: str, buffer: DuplexOutputBuffer) -> None:
         self._buffers.pop(session_id, None)
@@ -682,7 +664,6 @@ class ProcessDuplexEngineClient:
         for task in self._cleanup_tasks:
             task.cancel()
         if self._channel is not None:
-            logger.debug("Duplex IPC: %d messages / %d batches", self._channel.messages_sent, self._channel.frames_sent)
             # Synchronous finalization can run after the caller closed its loop.
             with suppress(RuntimeError):
                 self._channel.writer.close()
