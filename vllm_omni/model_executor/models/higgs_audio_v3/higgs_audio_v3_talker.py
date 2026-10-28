@@ -156,10 +156,10 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
         compilation_config = getattr(vllm_config, "compilation_config", None)
         cudagraph_mode = getattr(compilation_config, "cudagraph_mode", None)
         mode_name = getattr(cudagraph_mode, "name", str(cudagraph_mode)).upper()
-        # v2 owns the decode step (state plumbing + fused kernels) regardless
-        # of eager mode; on v1 the external decode CUDA graph follows the
-        # capture config. Deciding here — before the MRV2 state exists — keeps
-        # the MLP-graph disarm and the mutual-exclusion assert in one place.
+        # v2 owns the decode step regardless of eager mode; on v1 the
+        # external decode CUDA graph follows the capture config. Decide
+        # before the MRV2 state exists, keep the MLP-graph disarm and
+        # the mutual-exclusion assert in one place.
         self._use_external_decode_cudagraph = use_v2_runner or (
             not bool(getattr(model_config, "enforce_eager", True))
             and cudagraph_mode is not None
