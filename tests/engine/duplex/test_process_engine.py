@@ -43,7 +43,7 @@ class FakeEngine:
         self.duplex_frontend_group_count = 2
         self.duplex_frontend_max_sessions = 8
         self.buffers = {}
-        self.output = asyncio.Queue()
+        self.output: asyncio.Queue[DuplexSessionEventMessage] = asyncio.Queue()
         self.lease = {}
 
     def result(self, session_id, operation):

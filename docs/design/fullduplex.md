@@ -33,6 +33,44 @@ turn-based stack free of duplex code, and exposes the same session to three
 consumers: the OpenAI Realtime WebSocket route, the in-process Python API and
 the model plugins.
 
+## Runtime process placement
+
+`DuplexOmni(duplex_engine_backend="thread")` keeps the existing shared-memory
+runtime and supports the model's ordinary chat surface. The optional `process`
+backend selects a session-only deployment. `DuplexOmni` retains the handle
+registry, session configuration normalization, and abandoned-open/resume
+compensation; `ProcessDuplexEngineClient` owns spawning, IPC correlation, local
+output buffers, invalidation delivery, health checks, and child teardown.
+The process client does not subclass the public entrypoint.
+
+A module-level, entrypoint-owned worker factory loads normal general plugins
+and creates the native runtime in the child, including its orchestrator thread
+and stage clients. The engine transport has no model or entrypoint imports.
+The startup handshake exports typed session configuration, unchanged model
+capabilities, stage/deployment facts, frontend admission ownership, endpoint
+restrictions, and model-specific warmup audio. It exports no renderers,
+processors, stage clients, or callable plugin instances. The standard server
+uses a lightweight model listing and the exported warmup facts.
+
+Only an inherited private socketpair connects the two processes. Commands,
+control results, events, and invalidations use typed MessagePack data.
+A single writer per direction coalesces queued messages without a timer.
+Queues are bounded by message count and encoded bytes. Worker-side session
+buffers enforce native output limits; frontend overflow closes the affected
+session and requests engine cleanup. Worker or transport failure fails pending
+controls and closes handles. Graceful asynchronous shutdown flushes a shutdown
+request; synchronous shutdown provides bounded process-group termination.
+
+Cross-process invalidation has a different delivery boundary from the default
+shared-memory buffer: the frontend guard is atomic with receipt of an
+invalidation, not with its generation in the child. An event already committed
+while that notification was in transit cannot be recalled. The frontend filters
+stale epochs until that response's terminal event and retires the response's
+invalidation history at completion. Session-close retires all remaining state.
+This backend does not add remote session ownership or cross-frontend resume.
+
+See [process backend usage and limits](../serving/full_duplex_api.md#run-the-duplex-runtime-in-a-separate-process).
+
 ## Playback completion ownership
 
 `DuplexEngineSession` owns response snapshots and playback cursors. Output
