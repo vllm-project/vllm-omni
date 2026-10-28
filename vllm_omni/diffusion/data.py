@@ -29,7 +29,7 @@ from vllm.transformers_utils.repo_utils import get_model_path
 
 from vllm_omni.diffusion.diffusion_kv.config import (
     DiffusionKVCacheMode,
-    parse_diffusion_kv_cache_mode,
+    resolve_diffusion_kv_cache_mode,
 )
 from vllm_omni.diffusion.lora.manager import LoRABackend
 from vllm_omni.diffusion.media import DiffusionMediaOutput
@@ -903,8 +903,13 @@ class OmniDiffusionConfig:
     # the string form only).
     engine_backend: str | type = "default"
 
-    # Local Diffusion KV ownership and cache-layout mode.
-    diffusion_kv_mode: DiffusionKVCacheMode = DiffusionKVCacheMode.DENSE_LEGACY
+    # Local Diffusion KV ownership and cache-layout mode. ``None`` means "not
+    # specified": ``__post_init__`` resolves it to ``paged_scheduler`` for a
+    # model with paged-KV integration when the runtime configuration supports
+    # it, and to ``dense_legacy`` otherwise. An explicit value is always
+    # honored, and an explicit ``paged_scheduler`` selection is validated
+    # strictly instead of silently degrading to dense.
+    diffusion_kv_mode: DiffusionKVCacheMode | None = None
     # Reuse block-aligned, immutable diffusion prefixes across requests when
     # Scheduler-owned paged KV is active.
     enable_prefix_caching: bool = False
@@ -1273,9 +1278,43 @@ class OmniDiffusionConfig:
             )
         if not isinstance(self.diffusion_compile_dynamic, bool):
             raise TypeError(f"diffusion_compile_dynamic must be a bool, got {type(self.diffusion_compile_dynamic)!r}")
-        self.diffusion_kv_mode = parse_diffusion_kv_cache_mode(self.diffusion_kv_mode)
         if not isinstance(self.enable_prefix_caching, bool):
             raise TypeError("enable_prefix_caching must be a bool")
+        if self.diffusion_kv_max_rows_per_request is not None and (
+            type(self.diffusion_kv_max_rows_per_request) is not int or self.diffusion_kv_max_rows_per_request <= 0
+        ):
+            raise ValueError("diffusion_kv_max_rows_per_request must be a positive integer when set")
+
+        if self.omni_kv_config is None:
+            self.omni_kv_config = {}
+        elif isinstance(self.omni_kv_config, Mapping):
+            self.omni_kv_config = dict(self.omni_kv_config)
+        else:
+            raise TypeError("omni_kv_config must be a mapping")
+
+        # Resolve the KV ownership mode before any mode-dependent validation so
+        # an omitted diffusion_kv_mode can select paged execution, and so both
+        # config classes validate the effective mode rather than the raw input.
+        metadata = get_diffusion_model_metadata(self.model_class_name)
+        kv_resolution = resolve_diffusion_kv_cache_mode(
+            self.diffusion_kv_mode,
+            model_supports_paged_kv=metadata.supports_paged_kv,
+            max_rows_per_request=self.diffusion_kv_max_rows_per_request,
+            model_default_max_rows=metadata.paged_kv_max_rows_per_request,
+            step_execution=bool(self.step_execution),
+            offload_enabled=self._has_diffusion_offload_enabled(),
+            legacy_imported_kv=bool(self.omni_kv_config.get("need_recv_cache", False)),
+            attention_backend=self._explicit_attention_backend(),
+        )
+        self.diffusion_kv_mode = kv_resolution.mode
+        self.diffusion_kv_max_rows_per_request = kv_resolution.max_rows_per_request
+        logger.debug(
+            "Diffusion KV mode resolved to %s for model %r: %s",
+            self.diffusion_kv_mode.value,
+            self.model_class_name,
+            kv_resolution.reason,
+        )
+
         if self.enable_prefix_caching and self.diffusion_kv_mode is not DiffusionKVCacheMode.PAGED_SCHEDULER:
             raise ValueError(
                 "enable_prefix_caching=True requires diffusion_kv_mode='paged_scheduler'; "
@@ -1287,15 +1326,6 @@ class OmniDiffusionConfig:
                 "sleep discards KV pages without invalidating cached prefixes; "
                 "disable enable_prefix_caching or enable_sleep_mode"
             )
-        if self.diffusion_kv_max_rows_per_request is not None and (
-            type(self.diffusion_kv_max_rows_per_request) is not int or self.diffusion_kv_max_rows_per_request <= 0
-        ):
-            raise ValueError("diffusion_kv_max_rows_per_request must be a positive integer when set")
-        if (
-            self.diffusion_kv_mode is DiffusionKVCacheMode.PAGED_SCHEDULER
-            and self.diffusion_kv_max_rows_per_request is None
-        ):
-            raise ValueError("paged_scheduler requires diffusion_kv_max_rows_per_request to be set")
         if self.kv_cache_memory_bytes is not None and self.kv_cache_memory_bytes < 0:
             raise ValueError("kv_cache_memory_bytes must be non-negative")
         if not 0.0 < self.gpu_memory_utilization <= 1.0:
@@ -1304,20 +1334,6 @@ class OmniDiffusionConfig:
             raise ValueError("max_num_batched_tokens must be positive")
         if self.max_model_len is not None and self.max_model_len != -1 and self.max_model_len <= 0:
             raise ValueError("max_model_len must be positive or -1")
-
-        if self.omni_kv_config is None:
-            self.omni_kv_config = {}
-        elif isinstance(self.omni_kv_config, Mapping):
-            self.omni_kv_config = dict(self.omni_kv_config)
-        else:
-            raise TypeError("omni_kv_config must be a mapping")
-        if self.diffusion_kv_mode is DiffusionKVCacheMode.PAGED_SCHEDULER and self.omni_kv_config.get(
-            "need_recv_cache", False
-        ):
-            raise ValueError(
-                "paged_scheduler Diffusion KV does not support imported AR KV; "
-                "disable need_recv_cache until connector-aware import is implemented"
-            )
 
         if self.kv_transfer_config is not None:
             from vllm_omni.diffusion.diffusion_kv.kv_connector import parse_kv_transfer_config
@@ -1495,6 +1511,48 @@ class OmniDiffusionConfig:
     @property
     def is_single_file(self) -> bool:
         return isinstance(self.model, str) and os.path.isfile(self.model)
+
+    def _has_diffusion_offload_enabled(self) -> bool:
+        """Return whether any weight-offload path is configured.
+
+        The paged KV path has not been validated together with CPU, layerwise,
+        or distributed layerwise offload, so an implicit KV-mode resolution must
+        not select it for those deployments.
+        """
+
+        return bool(
+            self.enable_cpu_offload
+            or self.enable_layerwise_offload
+            or self.enable_distributed_layerwise_offload
+            or self.diffusion_offload_config
+        )
+
+    def _explicit_attention_backend(self) -> str | None:
+        """Return the explicitly selected diffusion attention backend, if any.
+
+        Only the global default role is considered: it carries the dense and
+        paged attention dispatch for the pipeline's self-attention layers. A
+        backend without a paged implementation cannot serve a paged request, so
+        an implicit resolution stays on the dense path for it.
+        """
+
+        attention_config = self.diffusion_attention_config
+        if isinstance(attention_config, Mapping):
+            # The runtime config may still hold the raw mapping here: it is
+            # normalised into AttentionConfig later in __post_init__.
+            default_spec = attention_config.get("default")
+        else:
+            default_spec = getattr(attention_config, "default", None)
+        if isinstance(default_spec, Mapping):
+            backend = default_spec.get("backend")
+        else:
+            backend = getattr(default_spec, "backend", None)
+        if backend is None:
+            return None
+        if isinstance(backend, str):
+            return backend
+        # Accept the enum form (``DiffusionAttentionBackendEnum.FLASH_ATTN``).
+        return getattr(backend, "name", None)
 
     def _propagate_quantization_from_tf_config(self, tf_config: "TransformerConfig") -> None:
         if tf_config.quant_config is None:

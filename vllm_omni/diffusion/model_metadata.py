@@ -16,6 +16,15 @@ class DiffusionModelMetadata:
     # persisted upload through ``extra_args[control_type]["control_path"]``.
     supported_control_upload_types: tuple[str, ...] = ()
     attention_mask_free: bool = False
+    # Whether the pipeline can run Scheduler-owned paged diffusion KV. Paged
+    # execution becomes the default for these models when no
+    # ``diffusion_kv_mode`` is requested and the runtime configuration is
+    # compatible; ``dense_legacy`` stays available as an explicit opt-out until
+    # the model's dense path is removed.
+    supports_paged_kv: bool = False
+    # BlockTable row capacity one public request needs on the paged path. For a
+    # CFG pipeline this is the number of conditional/unconditional branches.
+    paged_kv_max_rows_per_request: int | None = None
     final_output_type: str | None = None
     # Whether ``/v1/videos`` accepts source media plus per-token video/audio
     # noise masks for latent initialization. Unknown pipelines must remain
@@ -57,6 +66,11 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
     "HunyuanImage3Pipeline": DiffusionModelMetadata(
         supports_multimodal_inputs=True,
         max_multimodal_image_inputs=HUNYUAN_IMAGE3_MAX_INPUT_IMAGES,
+        # Reference paged integration (request mode, CUDA and Ascend). One row
+        # per CFG branch: guidance on produces the conditional and
+        # unconditional rows.
+        supports_paged_kv=True,
+        paged_kv_max_rows_per_request=2,
     ),
     # Shared by the Base (text-to-image) and Edit (TI2I) checkpoints, which use
     # the same ``BooguImagePipeline`` class. Text-to-image requests simply carry
