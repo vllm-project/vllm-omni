@@ -12,6 +12,7 @@ from dataclasses import dataclass
 
 import msgspec
 import pytest
+from vllm.v1.engine.exceptions import EngineDeadError
 
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig
 from vllm_omni.engine.duplex.commands import AppendAudio, AppendText, ClearOutputAudio
@@ -113,9 +114,11 @@ class FakeRuntime:
     model: str
     engine: FakeEngine
     process_warmup_audio: dict[str, object]
+    health_error: bool = False
 
     async def check_health(self):
-        pass
+        if self.health_error:
+            raise EngineDeadError("Stage-2 has no live replica")
 
     def shutdown(self):
         pass
@@ -126,6 +129,7 @@ def fake_factory(model, options):
         model,
         FakeEngine(options.get("small_buffers", False)),
         {"audio": "AAAAAA==", "format": "pcm_f32le", "sample_rate_hz": 24000},
+        health_error=options.get("health_error", False),
     )
 
 
@@ -184,7 +188,7 @@ def test_spawned_client_streams_audio_controls_and_invalidations():
             assert client.num_stages == 4
             assert client.metadata.warmup_audio["sample_rate_hz"] == 24000
             assert client.duplex_capabilities.supports_chat_completions  # Model facts are unchanged.
-            await client.check_health()
+            await client.check_health_async()
             buffer = DuplexOutputBuffer(max_bytes=1024 * 1024, max_events=512)
             result = await client.open_session_async("s", DuplexSessionConfig(), output_buffer=buffer)
             assert result.public_session["worker_pid"] != os.getpid()
