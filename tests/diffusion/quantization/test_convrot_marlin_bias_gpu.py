@@ -58,6 +58,7 @@ def _make_marlin_kernel(quant_method):
     ],
 )
 @pytest.mark.parametrize("bias_first", [False, True])
+@pytest.mark.parametrize("offload_after_quant", [False, True])
 @hardware_test(res={"cuda": ["H100", "H200", "B200"]}, num_cards=1)
 def test_marlin_does_not_finalize_before_bias(
     mocker,
@@ -67,6 +68,7 @@ def test_marlin_does_not_finalize_before_bias(
     is_supported,
     max_error,
     bias_first,
+    offload_after_quant,
 ):
     """A cached bias reference must remain valid through checkpoint load."""
     if not is_supported():
@@ -104,6 +106,8 @@ def test_marlin_does_not_finalize_before_bias(
                 prefix=f"test.{quant_method}",
                 disable_tp=True,
             )
+            if offload_after_quant:
+                layer.quant_method.enable_offload_after_quant()
 
             generator = torch.Generator(device="cuda").manual_seed(0)
             inputs = torch.randn(4, 1024, generator=generator, dtype=torch.bfloat16)
@@ -125,6 +129,11 @@ def test_marlin_does_not_finalize_before_bias(
             # Bias-first cannot be proven complete by the weight loader, so the
             # normal post-load sweep must finish it.
             layer.quant_method.process_weights_after_loading(layer)
+
+            expected_device = "cpu" if offload_after_quant else "cuda"
+            assert all(parameter.device.type == expected_device for parameter in layer.parameters())
+            if offload_after_quant:
+                layer.to("cuda:0")
 
             assert isinstance(layer.quant_method.kernel, kernel_cls)
             actual = layer(inputs)[0]

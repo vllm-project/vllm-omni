@@ -388,7 +388,7 @@ class ConvRotInt4OnlineLinearMethod(LazyWeightMixin, BaseInt8LinearMethod):
         qweight, scale = quantize_int4(_rotated_weight(layer, self.rotation_group_size))
         replace_parameter(layer, "weight", torch.nn.Parameter(pack_int4(qweight), requires_grad=False))
         replace_parameter(layer, "weight_scale", torch.nn.Parameter(scale.t().contiguous(), requires_grad=False))
-        layer._already_called_process_weights_after_loading = True
+        self._finish_weight_processing(layer)
 
     def apply(self, layer: torch.nn.Module, x: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
         if layer.convrot_hadamard is not None:
@@ -431,7 +431,7 @@ class ConvRotMxfp4OnlineLinearMethod(LazyWeightMixin, BaseInt8LinearMethod):
         replace_parameter(layer, "weight", torch.nn.Parameter(qweight, requires_grad=False))
         replace_parameter(layer, "weight_scale", torch.nn.Parameter(weight_scale, requires_grad=False))
         kernel.process_weights_after_loading(layer)
-        layer._already_called_process_weights_after_loading = True
+        self._finish_weight_processing(layer)
 
     def apply(self, layer: torch.nn.Module, x: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
         kernel = self.kernel
@@ -469,7 +469,7 @@ class ConvRotMxfp8OnlineLinearMethod(LazyWeightMixin, BaseInt8LinearMethod):
         replace_parameter(layer, "weight", torch.nn.Parameter(qweight, requires_grad=False))
         replace_parameter(layer, "weight_scale", torch.nn.Parameter(weight_scale, requires_grad=False))
         kernel.process_weights_after_loading(layer)
-        layer._already_called_process_weights_after_loading = True
+        self._finish_weight_processing(layer)
 
     def apply(self, layer: torch.nn.Module, x: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
         kernel = self.kernel

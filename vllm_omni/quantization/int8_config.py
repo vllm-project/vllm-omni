@@ -341,6 +341,12 @@ class LazyWeightMixin:
         """
         return torch.get_default_device()
 
+    def _finish_weight_processing(self, layer: torch.nn.Module) -> None:
+        """Mark processing complete and return the layer to host when requested."""
+        layer._already_called_process_weights_after_loading = True
+        if self._offload_after_quant:
+            layer.to("cpu")
+
     def _finalize_if_ready(self, layer: torch.nn.Module) -> None:
         """Quantize and offload only after every transformed parameter is loaded."""
         if getattr(layer, "_already_called_process_weights_after_loading", False):
@@ -355,15 +361,6 @@ class LazyWeightMixin:
             return
 
         self.process_weights_after_loading(layer)  # type: ignore[attr-defined]
-
-        # Prevent the usual `process_weights_after_loading` call from doing
-        # anything.
-        layer._already_called_process_weights_after_loading = True
-
-        # This layer's parameters are final, so nothing needs them on the
-        # accelerator until inference.
-        if self._offload_after_quant:
-            layer.to("cpu")
 
     def _install_bias_load_tracking(self, layer: torch.nn.Module) -> None:
         """Track bias loading so a weight-first checkpoint cannot finalize early."""
@@ -500,10 +497,10 @@ class UnquantizedHostLinearMethod(LazyWeightMixin, UnquantizedLinearMethod):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Unquantized weights need no post-load transform.
 
-        The mixin calls this when the weight is fully loaded, right before it
-        flags the layer — and the flag is what keeps the loader's post-load
-        sweep from bouncing the host tensor to the accelerator and back.
+        The completion flag keeps the loader's post-load sweep from bouncing
+        the host tensor to the accelerator and back.
         """
+        self._finish_weight_processing(layer)
 
 
 class Int8LinearMethod(BaseInt8LinearMethod):
@@ -614,8 +611,7 @@ class Int8OnlineLinearMethod(LazyWeightMixin, Int8LinearMethod):
         setattr(layer, i_zp_name, None)
         setattr(layer, azp_adj_name, None)
 
-        # Prevent duplicate processing (e.g., during weight reload)
-        layer._already_called_process_weights_after_loading = True
+        self._finish_weight_processing(layer)
 
 
 class NPUInt8OnlineLinearMethod(LazyWeightMixin, NPUInt8LinearMethod):
@@ -655,5 +651,4 @@ class NPUInt8OnlineLinearMethod(LazyWeightMixin, NPUInt8LinearMethod):
         replace_parameter(layer, "weight", qweight)
         replace_parameter(layer, "weight_scale", weight_scale)
 
-        # Prevent duplicate processing (e.g., during weight reload)
-        layer._already_called_process_weights_after_loading = True
+        self._finish_weight_processing(layer)
