@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Cross-mode full-model parity tests for OmniVoice."""
 
+import json
 import os
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
@@ -32,9 +33,12 @@ payload = {
 def _generate_without_graph(server_args: list[str]) -> bytes:
     with OmniServer(
         MODEL,
-        server_args,
+        [
+            *server_args,
+            "--stage-overrides",
+            json.dumps({"0": {"additional_config": {"omnivoice_runtime": {"enable_cuda_graph": False}}}}),
+        ],
         use_omni=True,
-        env_dict={"OMNIVOICE_CUDA_GRAPH": "0"},
     ) as server:
         response = requests.post(
             f"http://{server.host}:{server.port}/v1/audio/speech",
