@@ -292,6 +292,37 @@ source_file_dependencies:
     - tests/e2e/online_serving/test_qwen3_omni_multi_replicas.py
     - tests/e2e/online_serving/test_qwen3_omni_thinking.py
 
+  omni_qwen3_omni_duplex_playback_function:
+    - *qwen3_omni
+    - *duplex
+    - .buildkite/amd/scripts/assert-pytest-collection.sh
+    - tests/entrypoints/openai_api/test_qwen3_omni_realtime_websocket.py
+    - tests/e2e/online_serving/helpers/minicpmo_4_5_duplex.py
+    - tests/assets/minicpmo_4_5/
+    - tests/assets/semantic_vad/
+    - tests/helpers/runtime.py
+    - tests/helpers/stage_config.py
+    - vllm_omni/deploy/qwen3_omni_duplex.yaml
+
+  omni_bagel_sleep_function:
+    - .buildkite/amd/scripts/assert-pytest-collection.sh
+    - tests/entrypoints/test_omni_sleep_mode.py
+    - tests/helpers/stage_config.py
+    - vllm_omni/config/stage_config.py
+    - vllm_omni/deploy/bagel.yaml
+    - vllm_omni/deploy/bagel_single_stage.yaml
+    - vllm_omni/diffusion/models/bagel/
+    - vllm_omni/diffusion/worker/diffusion_worker.py
+    - vllm_omni/engine/async_omni_engine.py
+    - vllm_omni/engine/orchestrator.py
+    - vllm_omni/engine/stage_engine_core_proc.py
+    - vllm_omni/engine/stage_pool.py
+    - vllm_omni/entrypoints/async_omni.py
+    - vllm_omni/model_executor/models/bagel/
+    - vllm_omni/model_executor/stage_input_processors/bagel.py
+    - vllm_omni/model_extras/bagel.py
+    - vllm_omni/worker/base.py
+
   omni_qwen3_omni_shm_leak_function:
     - *qwen3_omni
     - tests/e2e/online_serving/test_qwen3_omni_shm_leak.py

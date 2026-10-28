@@ -243,7 +243,7 @@
     ],
     "description": "MiniMax-H3 T2VA with 4-card distributed layerwise offload (DLO), 8 denoise steps (USP4 + HSDP4, encoder-TP4, VAE-PP4 tile)",
     "server_params": {
-      "model": "MiniMaxAI/MiniMax-H3",
+      "model": "MiniMaxAI/MiniMax-H3/FL2VA",
       "serve_args": {
         "trust-remote-code": true,
         "task-type": "fl2va",
@@ -293,6 +293,67 @@
             "mean_e2el_ms": 38208.9,
             "mean_peak_memory_mb": 29538.6667
           }
+        }
+      }
+    ]
+  },
+  {
+    "test_name": "test_minimax_h3_t2v_dlo_4gpu_npu",
+    "mark": [
+      {
+        "hardware_marks": {
+          "res": {
+            "npu": "A3"
+          },
+          "num_cards": 4
+        }
+      },
+      "full_model",
+      "diffusion"
+    ],
+    "description": "MiniMax-H3 T2VA with 4-card distributed layerwise offload (DLO), 8 denoise steps (USP4, encoder-TP4, VAE-PP4 tile) on Ascend A3",
+    "server_params": {
+      "model": "MiniMaxAI/MiniMax-H3/FL2VA",
+      "serve_args": {
+        "trust-remote-code": true,
+        "task-type": "fl2va",
+        "num-gpus": 4,
+        "usp": 4,
+        "ring": 1,
+        "text-encoder-tp-size": 4,
+        "vae-patch-parallel-size": 4,
+        "vae-parallel-mode": "tile",
+        "vae-use-tiling": true,
+        "stage-init-timeout": 1800,
+        "init-timeout": 1800,
+        "enable-diffusion-pipeline-profiler": true,
+        "enable-distributed-layerwise-offload": true,
+        "dlo-no-use-allgather": true,
+        "dlo-resident-layers": 8,
+        "enforce-eager": true
+      }
+    },
+    "benchmark_params": [
+      {
+        "name": "1344x768_frames209_steps8",
+        "dataset_name": "random",
+        "tokenizer": "gpt2",
+        "endpoint": "/v1/videos",
+        "num_prompts": 3,
+        "max_concurrency": 1,
+        "num_warmups": 1,
+        "random_input_len": 8,
+        "random_output_len": 1,
+        "percentile_metrics": "e2el",
+        "extra_body": {
+          "width": 1344,
+          "height": 768,
+          "num_inference_steps": 8,
+          "num_frames": 209,
+          "fps": 24,
+          "seed": 42,
+          "flow_shift": 12.0,
+          "extra_params": "{\"task\":\"t2va\",\"duration\":8.7,\"aspect_ratio\":\"16:9\",\"audio_flow_shift\":3.0}"
         }
       }
     ]

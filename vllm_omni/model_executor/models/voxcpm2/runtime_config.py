@@ -12,6 +12,29 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 
+def reject_outer_full_cudagraph(vllm_config: Any) -> None:
+    """Refuse vLLM's outer full CUDA graph capture on the MRV1 runner.
+
+    The talker walks its pending requests and keeps its own CUDA graphs. A full
+    outer graph replays the model over a padded batch, which breaks that
+    per-request bookkeeping, so the engine dies on the first request. The
+    shipped eager default and PIECEWISE are unaffected. The check covers only
+    the default MRV1 runner, where the failure was reported.
+    """
+    if getattr(vllm_config.model_config, "use_v2_model_runner", False):
+        return
+    compilation_config = getattr(vllm_config, "compilation_config", None)
+    mode = getattr(compilation_config, "cudagraph_mode", None)
+    if mode is None or not mode.has_full_cudagraphs():
+        return
+    raise ValueError(
+        f"VoxCPM2 does not support cudagraph_mode={mode.name}. The talker owns its own CUDA graphs "
+        "and cannot also run inside vLLM's outer full-graph capture. Use "
+        '--compilation-config \'{"cudagraph_mode": "PIECEWISE"}\', or drop --no-enforce-eager to use '
+        "the shipped default, which is the fastest configuration for this model."
+    )
+
+
 @dataclasses.dataclass(frozen=True)
 class _VoxCPM2RuntimeConfig:
     startup_lora_path: str | None = None

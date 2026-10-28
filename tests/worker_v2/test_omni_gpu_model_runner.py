@@ -81,7 +81,7 @@ def test_shutdown_closes_model_owned_first_audio_and_other_resources(moss, sende
     sender = MagicMock()
     if sender_fails:
         sender.close.side_effect = RuntimeError("sender failed")
-    state._eager_state = SimpleNamespace(first_audio_sender=None if moss else sender)
+    state._mtp_state = SimpleNamespace(first_audio_sender=None if moss else sender)
     if moss:
         state._early_first_audio = object()
         state._first_audio_sender = sender

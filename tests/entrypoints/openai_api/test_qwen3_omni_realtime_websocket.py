@@ -1284,6 +1284,7 @@ class TestQwen3OmniDuplexPlayback:
         )
 
     @pytest.mark.full_model
+    @hardware_test(res={"rocm": "MI325"}, num_cards=2)
     @pytest.mark.parametrize("generation_finished", [False, True], ids=["generating", "queued-playback"])
     @pytest.mark.parametrize("repetition", range(_DUPLEX_REPEATS_FULL))
     def test_speech_interrupts_playback_full(

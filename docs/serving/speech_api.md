@@ -184,7 +184,8 @@ response headers:
 | `x-vllm-omni-input-audio-tokens` | Reference-audio codec frames, non-zero only for in-context voice cloning. |
 
 Diffusion-mode speech servers route through a separate response path and do not
-emit these headers.
+emit these usage headers. They do report the audio format headers described
+below.
 
 **Raw audio stream** (`stream_format="audio"`). Streams raw audio bytes (PCM or
 WAV) as they are decoded.
@@ -198,6 +199,7 @@ response headers:
 | --- | --- |
 | `x-audio-sample-rate` | Sample rate of the returned audio in Hz (after any `sample_rate` resampling). |
 | `x-audio-channels` | Channel count of the returned audio. |
+| `x-audio-duration-seconds` | Duration of the returned audio in seconds, to three decimals. Non-streaming responses only: a raw stream sends its headers before the audio is generated, so it cannot report a duration. A clip that encoded to zero frames reports `0.000`; the header is omitted only when no duration is known. |
 
 Both streaming modes (`stream_format="audio"` and `"sse"`) require
 `response_format="pcm"` or `"wav"`, and `speed` must be `1.0` (or omitted).
@@ -216,11 +218,13 @@ Each event has an `event:` line and a JSON `data:` line:
     `sample_rate` and `channels` extend the OpenAI event and describe the
     decoded chunk.
 
-- `speech.audio.done` — terminal event, carrying token `usage`:
+- `speech.audio.done` — terminal event, carrying the generated audio `duration`
+  and token `usage`:
 
     ```json
     {
         "type": "speech.audio.done",
+        "duration": 3.2,
         "usage": {
             "input_tokens": 119,
             "output_tokens": 77,
@@ -229,6 +233,13 @@ Each event has an `event:` line and a JSON `data:` line:
         }
     }
     ```
+
+    `duration` extends the OpenAI event: it is the total length in seconds of
+    the audio already sent as `speech.audio.delta` events. Non-streaming
+    responses report the same value in the `x-audio-duration-seconds` header.
+    Like that header, it is `0.0` when the encoder reports zero frames and is
+    absent when no duration is known: empty chunks are skipped before encoding,
+    so a stream with no audio reports no duration rather than `0.0`.
 
 - `speech.audio.error` — emitted instead of `speech.audio.done` if generation fails:
 

@@ -336,11 +336,20 @@ class VoxCPM2ModelState(OmniModelState):
         self._fallback_pcm[slot] = pcm
         self._fallback_valid[slot] = valid
 
-    def run_eager_mtp(
-        self, input_batch, text_hidden, sampled_token_ids, multimodal_outputs, mtp_batch_descriptor_dispatcher=None
-    ):
-        super().run_eager_mtp(
-            input_batch, text_hidden, sampled_token_ids, multimodal_outputs, mtp_batch_descriptor_dispatcher
+    def post_sample(
+        self,
+        input_batch,
+        text_hidden,
+        sampled_token_ids,
+        multimodal_outputs,
+        mtp_batch_descriptor_dispatcher=None,
+    ) -> None:
+        super().post_sample(
+            input_batch,
+            text_hidden,
+            sampled_token_ids,
+            multimodal_outputs,
+            mtp_batch_descriptor_dispatcher,
         )
         if not self.per_patch_audio:
             return
