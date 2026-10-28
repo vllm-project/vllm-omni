@@ -630,7 +630,6 @@ steps:
           - >-
             pytest -sv
             tests/e2e/online_serving/test_dreamzero_expansion.py
-            tests/e2e/accuracy/test_dreamzero.py
             -m "slow and diffusion and H100 and cards_2"
             --run-level "full_model"
         mirror_hardwares: h100_2

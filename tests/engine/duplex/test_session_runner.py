@@ -3350,6 +3350,67 @@ async def test_cancelling_output_keeps_the_pending_semantic_turn(command) -> Non
 
 
 @pytest.mark.asyncio
+async def test_response_cancel_keeps_a_commit_deferred_behind_the_active_response() -> None:
+    """Cancelling the answer in flight must not discard the next turn's audio.
+
+    A commit that arrives while a response is still generating is retained
+    with the response it should start. ``response.cancel`` then tears down only
+    the in-flight answer; the client's already-committed turn has to survive so
+    the ``response.create`` that follows can answer it.
+    """
+    h = await open_harness(auto_response=False)
+    try:
+        await h.run(append_audio())
+        await h.run(commands.Commit(create_response=True))
+        await h.deliver_and_settle(tts_output(h.stage0_request_id(), samples=24000, text="hello", finished=False))
+        assert h.runner.model_state.committed_audio_payload is None
+
+        await h.run(append_audio(samples=8000, value=0.07))
+        await h.run(commands.Commit(create_response=True))
+        model_state = h.runner.model_state
+        assert model_state.committed_audio_payload is not None
+        assert model_state.deferred_response_create is True
+
+        await h.run(commands.CancelResponse())
+        assert model_state.committed_audio_payload is not None, "the committed turn was discarded"
+        assert model_state.deferred_response_create is True
+        assert h.session.pending_input_bytes > 0
+
+        events = await h.run(commands.CreateResponse())
+        assert "error" not in types(events), types(events)
+        assert find(events, "response.created")
+        assert model_state.committed_audio_payload is None
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_response_cancel_releases_audio_retained_for_the_cancelled_answer() -> None:
+    """A retain that belongs to the cancelled answer is still released."""
+    h = await open_harness(auto_response=False)
+    try:
+        await h.run(append_audio())
+        await h.run(commands.Commit(create_response=True))
+        request_id = h.stage0_request_id()
+        await h.deliver_and_settle(tts_output(request_id, samples=24000, text="hello", finished=False))
+        # Speech arriving mid-answer, committed without asking for a response:
+        # the retain belongs to the answer being generated, so
+        # ``deferred_response_create`` stays False and no new turn owns it.
+        await h.run(append_audio(samples=8000, value=0.07))
+        await h.run(commands.Commit(create_response=False))
+        model_state = h.runner.model_state
+        assert model_state.committed_audio_payload is not None
+        assert model_state.deferred_response_create is False
+
+        await h.run(commands.CancelResponse())
+
+        assert model_state.committed_audio_payload is None
+        assert h.session.pending_input_bytes == 0
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
 async def test_auto_commit_does_not_reset_later_speech_in_the_same_append() -> None:
     h = await open_harness(auto_response=False)
     try:

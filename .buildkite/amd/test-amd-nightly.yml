@@ -1062,6 +1062,248 @@ steps:
 
             exit "$$status"
 
+  - group: ":full_moon: Voxtral TTS Perf MI300 Nightly"
+    steps:
+      - label: "Voxtral TTS Perf"
+        agent_pool: mi300_1
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 180
+        source_file_dependencies: tts_voxtral_tts_perf
+        env:
+          VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
+          BENCHMARK_DIR: "$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-voxtral-tts-perf/benchmark-results"
+        artifact_paths:
+          - artifacts/rocm-voxtral-tts-perf/**/*
+        commands:
+          - export ROCM_VOXTRAL_TTS_PERF_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-voxtral-tts-perf"
+          - |
+            rm -rf "$$ROCM_VOXTRAL_TTS_PERF_ARTIFACT_DIR"
+            mkdir -p "$$ROCM_VOXTRAL_TTS_PERF_ARTIFACT_DIR/benchmark-results"
+          # Latency, throughput, and stress. No MI325 numeric baseline yet.
+          - |
+            nodes=(
+              "tests/dfx/perf/scripts/run_benchmark.py::test_performance_benchmark[test_voxtral_tts-default_voice_latency_seed-tts-text]"
+              "tests/dfx/perf/scripts/run_benchmark.py::test_performance_benchmark[test_voxtral_tts-default_voice_throughput_seed-tts-text]"
+              "tests/dfx/perf/scripts/run_benchmark.py::test_performance_benchmark[test_voxtral_tts-default_voice_stress_seed-tts-text]"
+            )
+            pytest --collect-only -q "$${nodes[@]}" \
+              --test-config-file tests/dfx/perf/tests/test_tts.json \
+              --shard-id=0 --num-shards=1 \
+              -m "full_model and tts and rocm and MI325 and cards_1" --run-level full_model \
+              > "$$ROCM_VOXTRAL_TTS_PERF_ARTIFACT_DIR/collection.txt"
+            count=$$(awk '/::/ { n++ } END { print n + 0 }' \
+              "$$ROCM_VOXTRAL_TTS_PERF_ARTIFACT_DIR/collection.txt")
+            if [[ "$$count" != "$${#nodes[@]}" ]]; then
+              echo "Expected exactly $${#nodes[@]} Voxtral TTS perf nodes, found $$count." >&2
+              cat "$$ROCM_VOXTRAL_TTS_PERF_ARTIFACT_DIR/collection.txt" >&2
+              exit 5
+            fi
+            for node in "$${nodes[@]}"; do
+              if ! grep -Fq "$$node" "$$ROCM_VOXTRAL_TTS_PERF_ARTIFACT_DIR/collection.txt"; then
+                echo "Voxtral TTS perf node was not collected: $$node" >&2
+                cat "$$ROCM_VOXTRAL_TTS_PERF_ARTIFACT_DIR/collection.txt" >&2
+                exit 5
+              fi
+            done
+          - |
+            if (
+              trap - ERR
+              set +e
+              nodes=(
+                "tests/dfx/perf/scripts/run_benchmark.py::test_performance_benchmark[test_voxtral_tts-default_voice_latency_seed-tts-text]"
+                "tests/dfx/perf/scripts/run_benchmark.py::test_performance_benchmark[test_voxtral_tts-default_voice_throughput_seed-tts-text]"
+                "tests/dfx/perf/scripts/run_benchmark.py::test_performance_benchmark[test_voxtral_tts-default_voice_stress_seed-tts-text]"
+              )
+              timeout --signal=TERM --kill-after=2m 165m \
+                pytest -s -v -ra "$${nodes[@]}" \
+                --test-config-file tests/dfx/perf/tests/test_tts.json \
+                --shard-id=0 --num-shards=1 \
+                -m "full_model and tts and rocm and MI325 and cards_1" --run-level full_model \
+                --junitxml="$$ROCM_VOXTRAL_TTS_PERF_ARTIFACT_DIR/pytest.xml" \
+                2>&1 | tee "$$ROCM_VOXTRAL_TTS_PERF_ARTIFACT_DIR/pytest.log"
+              exit "$${PIPESTATUS[0]}"
+            ); then
+              status=0
+            else
+              status=$$?
+            fi
+            tail -n 100 "$$ROCM_VOXTRAL_TTS_PERF_ARTIFACT_DIR/pytest.log" > \
+              "$$ROCM_VOXTRAL_TTS_PERF_ARTIFACT_DIR/pytest-summary.txt"
+            if [[ "$$status" -eq 0 ]]; then
+              if python3 -c 'import sys, xml.etree.ElementTree as ET
+            root = ET.parse(sys.argv[1]).getroot()
+            suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
+            tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites)
+            skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites)
+            if tests != 3 or skipped != 0:
+                print(
+                    f"Expected exactly three executed Voxtral TTS perf tests; "
+                    f"reported tests={tests}, skipped={skipped}.",
+                    file=sys.stderr,
+                )
+                raise SystemExit(5)
+            ' "$$ROCM_VOXTRAL_TTS_PERF_ARTIFACT_DIR/pytest.xml"
+              then
+                status=0
+              else
+                status=$$?
+              fi
+            fi
+            find "$$BENCHMARK_DIR" -maxdepth 1 -type f \
+              -name 'result_test_voxtral_tts_*.json' -print | sort > \
+              "$$ROCM_VOXTRAL_TTS_PERF_ARTIFACT_DIR/result-files.txt"
+            if [[ "$$status" -eq 0 ]]; then
+              result_count=$$(wc -l < "$$ROCM_VOXTRAL_TTS_PERF_ARTIFACT_DIR/result-files.txt" | tr -d '[:space:]')
+              if [[ "$$result_count" != 3 ]]; then
+                echo "Expected exactly 3 Voxtral TTS result JSON files, found $$result_count." >&2
+                cat "$$ROCM_VOXTRAL_TTS_PERF_ARTIFACT_DIR/result-files.txt" >&2
+                status=5
+              fi
+            fi
+            (exit "$$status")
+
+  - group: ":full_moon: Qwen3-TTS Perf MI300 Nightly"
+    steps:
+      - label: "Qwen3-TTS Perf"
+        agent_pool: mi300_2
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 180
+        source_file_dependencies: tts_qwen3_tts_perf
+        env:
+          VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
+          BENCHMARK_DIR: "$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-qwen3-tts-perf/benchmark-results"
+        artifact_paths:
+          - artifacts/rocm-qwen3-tts-perf/**/*
+        commands:
+          - export ROCM_QWEN3_TTS_PERF_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-qwen3-tts-perf"
+          - |
+            rm -rf "$$ROCM_QWEN3_TTS_PERF_ARTIFACT_DIR"
+            mkdir -p "$$ROCM_QWEN3_TTS_PERF_ARTIFACT_DIR/benchmark-results"
+          # Latency, throughput sweeps, and stress. No MI325 numeric baseline yet.
+          - |
+            nodes=(
+              "tests/dfx/perf/scripts/run_benchmark.py::test_performance_benchmark[test_qwen3_tts_base-voice_clone_latency_seed-tts]"
+              "tests/dfx/perf/scripts/run_benchmark.py::test_performance_benchmark[test_qwen3_tts_base-voice_clone_throughput_seed-tts]"
+              "tests/dfx/perf/scripts/run_benchmark.py::test_performance_benchmark[test_qwen3_tts_customvoice-default_voice_latency_seed-tts-text]"
+              "tests/dfx/perf/scripts/run_benchmark.py::test_performance_benchmark[test_qwen3_tts_customvoice-default_voice_throughput_seed-tts-text]"
+              "tests/dfx/perf/scripts/run_benchmark.py::test_performance_benchmark[test_qwen3_tts_customvoice-default_voice_stress_seed-tts-text]"
+              "tests/dfx/perf/scripts/run_benchmark.py::test_performance_benchmark[test_qwen3_tts_voicedesign-voice_design_latency_seed-tts-design]"
+              "tests/dfx/perf/scripts/run_benchmark.py::test_performance_benchmark[test_qwen3_tts_voicedesign-voice_design_throughput_seed-tts-design]"
+              "tests/dfx/perf/scripts/run_benchmark.py::test_performance_benchmark[test_qwen3_tts_voicedesign-voice_design_stress_seed-tts-design]"
+            )
+            pytest --collect-only -q "$${nodes[@]}" \
+              --test-config-file tests/dfx/perf/tests/test_tts.json \
+              --shard-id=0 --num-shards=1 \
+              -m "full_model and tts and rocm and MI325 and cards_2" --run-level full_model \
+              > "$$ROCM_QWEN3_TTS_PERF_ARTIFACT_DIR/collection.txt"
+            count=$$(awk '/::/ { n++ } END { print n + 0 }' \
+              "$$ROCM_QWEN3_TTS_PERF_ARTIFACT_DIR/collection.txt")
+            if [[ "$$count" != "$${#nodes[@]}" ]]; then
+              echo "Expected exactly $${#nodes[@]} Qwen3-TTS perf nodes, found $$count." >&2
+              cat "$$ROCM_QWEN3_TTS_PERF_ARTIFACT_DIR/collection.txt" >&2
+              exit 5
+            fi
+            for node in "$${nodes[@]}"; do
+              if ! grep -Fq "$$node" "$$ROCM_QWEN3_TTS_PERF_ARTIFACT_DIR/collection.txt"; then
+                echo "Qwen3-TTS perf node was not collected: $$node" >&2
+                cat "$$ROCM_QWEN3_TTS_PERF_ARTIFACT_DIR/collection.txt" >&2
+                exit 5
+              fi
+            done
+          - |
+            if (
+              trap - ERR
+              set +e
+              nodes=(
+                "tests/dfx/perf/scripts/run_benchmark.py::test_performance_benchmark[test_qwen3_tts_base-voice_clone_latency_seed-tts]"
+                "tests/dfx/perf/scripts/run_benchmark.py::test_performance_benchmark[test_qwen3_tts_base-voice_clone_throughput_seed-tts]"
+                "tests/dfx/perf/scripts/run_benchmark.py::test_performance_benchmark[test_qwen3_tts_customvoice-default_voice_latency_seed-tts-text]"
+                "tests/dfx/perf/scripts/run_benchmark.py::test_performance_benchmark[test_qwen3_tts_customvoice-default_voice_throughput_seed-tts-text]"
+                "tests/dfx/perf/scripts/run_benchmark.py::test_performance_benchmark[test_qwen3_tts_customvoice-default_voice_stress_seed-tts-text]"
+                "tests/dfx/perf/scripts/run_benchmark.py::test_performance_benchmark[test_qwen3_tts_voicedesign-voice_design_latency_seed-tts-design]"
+                "tests/dfx/perf/scripts/run_benchmark.py::test_performance_benchmark[test_qwen3_tts_voicedesign-voice_design_throughput_seed-tts-design]"
+                "tests/dfx/perf/scripts/run_benchmark.py::test_performance_benchmark[test_qwen3_tts_voicedesign-voice_design_stress_seed-tts-design]"
+              )
+              timeout --signal=TERM --kill-after=2m 165m \
+                pytest -s -v -ra "$${nodes[@]}" \
+                --test-config-file tests/dfx/perf/tests/test_tts.json \
+                --shard-id=0 --num-shards=1 \
+                -m "full_model and tts and rocm and MI325 and cards_2" --run-level full_model \
+                --junitxml="$$ROCM_QWEN3_TTS_PERF_ARTIFACT_DIR/pytest.xml" \
+                2>&1 | tee "$$ROCM_QWEN3_TTS_PERF_ARTIFACT_DIR/pytest.log"
+              exit "$${PIPESTATUS[0]}"
+            ); then
+              status=0
+            else
+              status=$$?
+            fi
+            tail -n 100 "$$ROCM_QWEN3_TTS_PERF_ARTIFACT_DIR/pytest.log" > \
+              "$$ROCM_QWEN3_TTS_PERF_ARTIFACT_DIR/pytest-summary.txt"
+            if [[ "$$status" -eq 0 ]]; then
+              if python3 -c 'import sys, xml.etree.ElementTree as ET
+            root = ET.parse(sys.argv[1]).getroot()
+            suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
+            tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites)
+            skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites)
+            if tests != 8 or skipped != 0:
+                print(
+                    f"Expected exactly eight executed Qwen3-TTS perf tests; "
+                    f"reported tests={tests}, skipped={skipped}.",
+                    file=sys.stderr,
+                )
+                raise SystemExit(5)
+            ' "$$ROCM_QWEN3_TTS_PERF_ARTIFACT_DIR/pytest.xml"
+              then
+                status=0
+              else
+                status=$$?
+              fi
+            fi
+            find "$$BENCHMARK_DIR" -maxdepth 1 -type f \
+              -name 'result_test_qwen3_tts_*.json' -print | sort > \
+              "$$ROCM_QWEN3_TTS_PERF_ARTIFACT_DIR/result-files.txt"
+            if [[ "$$status" -eq 0 ]]; then
+              if python3 -c 'import json, sys
+            from pathlib import Path
+
+            manifest = Path(sys.argv[1])
+            paths = [Path(line) for line in manifest.read_text(encoding="utf-8").splitlines() if line]
+            expected = {
+                "test_qwen3_tts_base": 4,
+                "test_qwen3_tts_customvoice": 5,
+                "test_qwen3_tts_voicedesign": 5,
+            }
+            counts = {name: 0 for name in expected}
+            if len(paths) != 14:
+                print(f"Expected exactly 14 Qwen3-TTS result JSON files, found {len(paths)}.", file=sys.stderr)
+                raise SystemExit(5)
+            for path in paths:
+                try:
+                    json.loads(path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError) as exc:
+                    print(f"Unreadable Qwen3-TTS result JSON {path}: {exc}", file=sys.stderr)
+                    raise SystemExit(5) from exc
+                matches = [name for name in expected if path.name.startswith(f"result_{name}_")]
+                if len(matches) != 1:
+                    print(f"Unexpected Qwen3-TTS result filename: {path.name}", file=sys.stderr)
+                    raise SystemExit(5)
+                counts[matches[0]] += 1
+            if counts != expected:
+                print(f"Expected Qwen3-TTS result split {expected}, found {counts}.", file=sys.stderr)
+                raise SystemExit(5)
+            ' "$$ROCM_QWEN3_TTS_PERF_ARTIFACT_DIR/result-files.txt"
+              then
+                status=0
+              else
+                status=$$?
+              fi
+            fi
+            (exit "$$status")
+
   - group: ":microscope: Tiny Diffusion Multi-GPU MI300 Nightly"
     steps:
       - label: "ROCm · Tiny Diffusion Multi-GPU · 2-GPU"
@@ -1208,6 +1450,114 @@ steps:
               done
             fi
             exit "$$status"
+
+  - group: ":full_moon: MiniCPM-o 4.5 Perf MI300 Nightly"
+    steps:
+      - label: "MiniCPM-o 4.5 Perf"
+        agent_pool: mi300_1
+        depends_on: amd-build
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 180
+        source_file_dependencies: omni_minicpmo_4_5_perf
+        env:
+          BENCHMARK_DIR: "$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-minicpmo-4-5-perf/benchmark-results"
+        artifact_paths:
+          - artifacts/rocm-minicpmo-4-5-perf/**/*
+        commands:
+          - export ROCM_MINICPMO_PERF_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-minicpmo-4-5-perf"
+          - |
+            rm -rf "$$ROCM_MINICPMO_PERF_ARTIFACT_DIR"
+            mkdir -p "$$ROCM_MINICPMO_PERF_ARTIFACT_DIR/benchmark-results"
+          # One pytest node. Its five concurrency points stay inside the test.
+          # No MI300 baseline yet, so do not pass --assert-baseline.
+          - |
+            node="tests/dfx/perf/scripts/run_benchmark.py::test_performance_benchmark[test_minicpmo_4_5-seed-tts]"
+            pytest --collect-only -q "$$node" \
+              --test-config-file tests/dfx/perf/tests/test_minicpmo_4_5.json \
+              --shard-id=0 --num-shards=1 \
+              -m "full_model and omni and rocm and MI325 and cards_1" --run-level full_model \
+              > "$$ROCM_MINICPMO_PERF_ARTIFACT_DIR/collection.txt"
+            count=$$(awk '/::/ { n++ } END { print n + 0 }' \
+              "$$ROCM_MINICPMO_PERF_ARTIFACT_DIR/collection.txt")
+            if [[ "$$count" != 1 ]]; then
+              echo "Expected exactly one MiniCPM-o 4.5 perf node, found $$count." >&2
+              cat "$$ROCM_MINICPMO_PERF_ARTIFACT_DIR/collection.txt" >&2
+              exit 5
+            fi
+            if grep -q "test_minicpmo_4_5_a2" "$$ROCM_MINICPMO_PERF_ARTIFACT_DIR/collection.txt"; then
+              echo "A2 MiniCPM-o perf node must not run on this MI300 job." >&2
+              exit 5
+            fi
+          - |
+            if (
+              trap - ERR
+              set +e
+              node="tests/dfx/perf/scripts/run_benchmark.py::test_performance_benchmark[test_minicpmo_4_5-seed-tts]"
+              timeout --signal=TERM --kill-after=2m 165m \
+                pytest -s -v -ra "$$node" \
+                --test-config-file tests/dfx/perf/tests/test_minicpmo_4_5.json \
+                --shard-id=0 --num-shards=1 \
+                -m "full_model and omni and rocm and MI325 and cards_1" --run-level full_model \
+                --junitxml="$$ROCM_MINICPMO_PERF_ARTIFACT_DIR/pytest.xml" \
+                2>&1 | tee "$$ROCM_MINICPMO_PERF_ARTIFACT_DIR/pytest.log"
+              exit "$${PIPESTATUS[0]}"
+            ); then
+              status=0
+            else
+              status=$$?
+            fi
+            tail -n 100 "$$ROCM_MINICPMO_PERF_ARTIFACT_DIR/pytest.log" > \
+              "$$ROCM_MINICPMO_PERF_ARTIFACT_DIR/pytest-summary.txt"
+            if [[ "$$status" -eq 0 ]]; then
+              if python3 -c 'import sys, xml.etree.ElementTree as ET
+            root = ET.parse(sys.argv[1]).getroot()
+            suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
+            tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites)
+            skipped = sum(int(suite.attrib.get("skipped", "0")) for suite in suites)
+            if tests != 1 or skipped != 0:
+                print(
+                    f"Expected exactly one executed MiniCPM-o 4.5 perf test; "
+                    f"reported tests={tests}, skipped={skipped}.",
+                    file=sys.stderr,
+                )
+                raise SystemExit(5)
+            ' "$$ROCM_MINICPMO_PERF_ARTIFACT_DIR/pytest.xml"
+              then
+                status=0
+              else
+                status=$$?
+              fi
+            fi
+            find "$$BENCHMARK_DIR" -maxdepth 1 -type f \
+              -name 'result_test_minicpmo_4_5_*.json' -print | sort > \
+              "$$ROCM_MINICPMO_PERF_ARTIFACT_DIR/result-files.txt"
+            if [[ "$$status" -eq 0 ]]; then
+              if python3 -c 'import json, sys
+            from pathlib import Path
+
+            manifest = Path(sys.argv[1])
+            paths = [Path(line) for line in manifest.read_text(encoding="utf-8").splitlines() if line]
+            if len(paths) != 5:
+                print(f"Expected exactly 5 MiniCPM-o 4.5 result JSON files, found {len(paths)}.", file=sys.stderr)
+                raise SystemExit(5)
+            for path in paths:
+                if path.name.startswith("result_test_minicpmo_4_5_a2_"):
+                    print(f"A2 MiniCPM-o result must not be produced by this MI300 job: {path.name}", file=sys.stderr)
+                    raise SystemExit(5)
+                try:
+                    json.loads(path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError) as exc:
+                    print(f"Unreadable MiniCPM-o 4.5 result JSON {path}: {exc}", file=sys.stderr)
+                    raise SystemExit(5) from exc
+            ' "$$ROCM_MINICPMO_PERF_ARTIFACT_DIR/result-files.txt"
+              then
+                status=0
+              else
+                status=$$?
+              fi
+            fi
+            (exit "$$status")
 
   - group: ":full_moon: Omni-DuplexEval MI300 Nightly"
     steps:

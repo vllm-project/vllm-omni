@@ -827,9 +827,15 @@ class OmniOpenAIServingVideo:
 
     def _extract_video_outputs(self, result: object) -> list[DiffusionPayloadValue]:
         videos = None
-        if hasattr(result, "images") and result.images:
+        custom_output = getattr(result, "custom_output", None)
+        if isinstance(custom_output, Mapping) and "video_frames" in custom_output:
+            videos = custom_output["video_frames"]
+            has_custom_video = True
+        else:
+            has_custom_video = False
+        if not has_custom_video and hasattr(result, "images") and result.images:
             videos = result.images
-        if videos is None:
+        if videos is None and not has_custom_video:
             multimodal_output = getattr(result, "multimodal_output", None)
             if isinstance(multimodal_output, Mapping):
                 videos = multimodal_output.get("video")

@@ -77,6 +77,8 @@ class FastPathConfig:
     fuse_norm_cache: bool = False
     # Keep the reference BF16 roundings in the channels-last norm (encoder only).
     exact_bf16_norm: bool = False
+    # Lossless paths and the decoder output projection retain bitwise probes.
+    verify_spatial_padding: bool = True
 
 
 def is_diffusers_rms_norm(module: Any) -> bool:
@@ -320,10 +322,11 @@ def _conv_with_spatial_padding(
     Upstream pads the input tensor explicitly and convolves with ``padding=0``.
     Handing the spatial padding to cuDNN avoids materializing the padded copy,
     but is only bit-identical if cuDNN selects the same kernel for both
-    formulations, so the first call for each (conv, shape) compares both on
-    seeded random operands (see :func:`_equal_on_random_operands`) before
-    running the real convolution once with the selected formulation; later
-    calls reuse the verdict until it is evicted.
+    formulations. Exact paths compare both on seeded random operands for each
+    (conv, shape) before running the selected formulation; later calls reuse
+    the verdict until it is evicted (see :func:`_equal_on_random_operands`).
+    Internal channels-last decoder convolutions skip this bitwise check under
+    their tolerance-based contract.
     """
     pad_height, pad_width = conv._padding[2], conv._padding[0]
     pads = (pad_width, pad_width, pad_height, pad_height, 0, 0)
@@ -336,6 +339,13 @@ def _conv_with_spatial_padding(
 
     def padded(x_padded: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
         return F.conv3d(x_padded, weight, bias, conv.stride, 0, conv.dilation, conv.groups)
+
+    cfg = getattr(conv, CFG_ATTR, None)
+    if cfg is not None and cfg.channels_last and not cfg.verify_spatial_padding:
+        # Internal channels-last decoder convolutions already allow rounding
+        # differences. Avoid allocating full-size random inputs and outputs
+        # for an unnecessary bitwise probe while decode caches are live.
+        return candidate(assembled, conv.weight)
 
     verdict = verdicts.get(key)
     if verdict is None:
@@ -463,20 +473,25 @@ def _run_cached_causal_conv(
                 out, cache_list[index] = first_frame
                 return with_bias(out)
 
-        # Preferred: temporal concat only (aligned plane copies) + cuDNN spatial
-        # padding, once verified bitwise for this (conv, shape).
+        # Prefer temporal concat with cuDNN spatial padding. Exact paths verify
+        # this formulation for each (conv, shape); channels-last hidden layers
+        # use the tolerance-based policy in _conv_with_spatial_padding.
         verdicts = _SPATIAL_PAD_VERDICTS.setdefault(conv, {})
         key = _conv_verdict_key(conv, x, 0 if payload is None else payload.shape[2])
         if verdicts.get(key, True):
             pair = dm.cat_time_5d(x, payload, conv._padding[4], keep_cache_frames=CACHE_T)
             if pair is not None:
                 assembled, cache_list[index] = pair
+                # Assembly has consumed the old cache on the current stream.
+                # Keep only its replacement alive during the convolution.
+                del cache, payload
                 out = _conv_with_spatial_padding(conv, assembled, bias, verdicts, key)
                 return with_bias(out)
 
         pair = dm.cat_pad_5d(x, payload, conv._padding, keep_cache_frames=CACHE_T)
         if pair is not None:
             conv_input, cache_list[index] = pair
+            del cache, payload
             out = F.conv3d(conv_input, conv.weight, bias, conv.stride, conv.padding, conv.dilation, conv.groups)
             return with_bias(out)
 
@@ -557,11 +572,16 @@ def _run_norm_act_cached_conv(
                 )
                 if pair is not None:
                     assembled, cache_list[index] = pair
+                    del cache, payload
                     fold_bias = return_bias and _may_defer_conv_bias(norm, x)
                     out = _conv_with_spatial_padding(conv, assembled, None if fold_bias else conv.bias, verdicts, key)
                     if not return_bias:
                         return out
                     return out, _deferred_conv_bias(conv, out) if fold_bias else None
+
+        # A declined fused assembly falls through to the ordinary cache path;
+        # do not retain the old history while that helper replaces its slot.
+        del cache, payload
 
     x = _norm_act(norm, act, x, pending_bias=pending_bias)
     if after_norm is not None:
@@ -607,6 +627,7 @@ def _run_conv_out_channels_last(
     if pair is None:
         return None
     assembled, cache_list[index] = pair
+    del cache, payload
 
     def candidate(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
         return F.conv3d(x, weight, conv.bias, conv.stride, conv.padding, conv.dilation, conv.groups).contiguous()

@@ -62,6 +62,7 @@ class MockVideoResult:
         stage_durations=None,
         peak_memory_mb=0.0,
         custom_output=None,
+        images: list[Image.Image] | None = None,
     ):
         self.multimodal_output = dict(multimodal_output or {"video": videos})
         if audios is not None:
@@ -71,6 +72,7 @@ class MockVideoResult:
         self.stage_durations = stage_durations or {}
         self.peak_memory_mb = peak_memory_mb
         self.custom_output = custom_output or {}
+        self.images = images
 
 
 class FakeAsyncOmni:
@@ -714,6 +716,65 @@ def test_async_video_generation_bypasses_base64(test_client, mocker: MockerFixtu
     # Wait for completion. If it used base64, the RuntimeError would fail the task
     _wait_for_status(test_client, video_id, VideoGenerationStatus.COMPLETED.value)
     mock_base64.assert_not_called()
+
+
+@pytest.mark.parametrize("endpoint", ["/v1/videos", "/v1/videos/sync"])
+def test_lance_custom_video_frames_override_placeholder_images(endpoint, test_client, mocker: MockerFixture):
+    """Both video endpoints must encode the generated frames, not the placeholder image."""
+    frames = [Image.new("RGB", (16, 16), color=(i, 0, 0)) for i in range(25)]
+    placeholder = Image.new("RGB", (16, 16), color="white")
+    result = MockVideoResult([], custom_output={"video_frames": frames}, images=[placeholder])
+
+    engine = test_client.app.state.openai_serving_video._engine_client
+    engine.model_class_name = "LancePipeline"
+
+    async def _generate(prompt, request_id, sampling_params_list):
+        yield result
+
+    engine.generate = _generate
+    encoder = mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
+        return_value=b"encoded-video",
+    )
+
+    response = test_client.post(
+        endpoint,
+        data={"prompt": "A cat walking", "num_frames": "25", "fps": "8"},
+    )
+    assert response.status_code == 200, response.text
+    if endpoint == "/v1/videos":
+        _wait_for_status(test_client, response.json()["id"], VideoGenerationStatus.COMPLETED.value)
+    else:
+        assert response.content == b"encoded-video"
+
+    encoder.assert_called_once()
+    encoded_frames = encoder.call_args.args[0]
+    assert encoded_frames is frames
+    assert len(encoded_frames) == 25
+    assert all(frame is not placeholder for frame in encoded_frames)
+    assert encoder.call_args.kwargs["fps"] == 8
+
+
+def test_custom_video_frames_numpy_array_overrides_placeholder_images():
+    frames: np.ndarray = np.zeros((25, 16, 16, 3), dtype=np.uint8)
+    result = MockVideoResult([], custom_output={"video_frames": frames}, images=[Image.new("RGB", (16, 16))])
+    handler = OmniOpenAIServingVideo.for_diffusion(FakeAsyncOmni(), model_name="test-model")
+    try:
+        assert handler._extract_video_outputs(result)[0] is frames
+    finally:
+        handler.shutdown()
+
+
+def test_empty_custom_video_frames_do_not_fall_back_to_placeholder_images():
+    result = MockVideoResult([], custom_output={"video_frames": []}, images=[Image.new("RGB", (16, 16))])
+    handler = OmniOpenAIServingVideo.for_diffusion(FakeAsyncOmni(), model_name="test-model")
+    try:
+        with pytest.raises(HTTPException) as exc_info:
+            handler._extract_video_outputs(result)
+        assert exc_info.value.status_code == 500
+        assert exc_info.value.detail == "No video outputs found in generation result."
+    finally:
+        handler.shutdown()
 
 
 def test_async_video_generation_with_audio_bypasses_base64(test_client, mocker: MockerFixture):
