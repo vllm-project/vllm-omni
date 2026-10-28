@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
-Online serving L2 smoke tests for ``nvidia/Cosmos3-Nano``.
+Online serving L2 smoke tests for ``nvidia/Cosmos3-Nano`` and
+``nvidia/Cosmos3-Nano-Transfer-Auto``.
 
 These keep Cosmos3 in the regular ``core_model`` diffusion lane while the
 broader image/video similarity checks stay in ``tests/e2e/accuracy``.
 """
 
+import json
 import os
 from typing import Any
 
@@ -41,6 +43,17 @@ SERVER_ARGS = [
     "--no-guardrails",
 ]
 SINGLE_CARD_MARKS = hardware_marks(res={"cuda": "H100", "rocm": "MI325"})
+
+TRANSFER_AUTO_MODEL = "nvidia/Cosmos3-Nano-Transfer-Auto"
+TRANSFER_AUTO_SERVER_ARGS = [
+    "--model-class-name",
+    "Cosmos3MultiviewPipeline",
+    "--no-guardrails",
+    # The pipeline skips engine warmup, so compilation would otherwise run inside the first request.
+    "--enforce-eager",
+]
+# Multiview attention is CUDA-only.
+TRANSFER_AUTO_MARKS = hardware_marks(res={"cuda": "H100"})
 
 
 def _get_diffusion_feature_cases(model: str):
@@ -124,3 +137,52 @@ def test_video_generation_modes_001(omni_server: OmniServer, online_client: Onli
             **case,
         }
         online_client.send_video_diffusion_request(request_config)
+
+
+@pytest.mark.core_model
+@pytest.mark.diffusion
+@pytest.mark.parametrize(
+    "omni_server",
+    [
+        pytest.param(
+            OmniServerParams(model=TRANSFER_AUTO_MODEL, server_args=TRANSFER_AUTO_SERVER_ARGS),
+            id="transfer_auto",
+            marks=TRANSFER_AUTO_MARKS,
+        ),
+    ],
+    indirect=True,
+)
+def test_transfer_auto_uploaded_control_001(omni_server: OmniServer, online_client: OnlineOmniClient) -> None:
+    """Single-camera Transfer-Auto WSM transfer through ``/v1/videos``, with the control uploaded by index.
+
+    A 16:9 control selects the 480p 832x480 bucket. One camera keeps the camera-major MP4 at ``num_frames``.
+    """
+    control_reference = f"data:video/mp4;base64,{generate_synthetic_video(832, 480, 5)['base64']}"
+    extra_params = {
+        "multiview": {
+            "views": [
+                {
+                    "camera_key": "camera_front_wide_120fov",
+                    "prompt": "A car drives along a tree-lined suburban street.",
+                    "control_reference_index": 0,
+                }
+            ]
+        },
+        "wsm": {},
+    }
+    online_client.send_video_diffusion_request(
+        {
+            "model": omni_server.model,
+            "form_data": {
+                "prompt": "Driving through a suburban street.",
+                "width": 832,
+                "height": 480,
+                "num_frames": 5,
+                "fps": 30,
+                "num_inference_steps": 2,
+                "seed": 42,
+                "extra_params": json.dumps(extra_params),
+            },
+            "input_references": [control_reference],
+        }
+    )

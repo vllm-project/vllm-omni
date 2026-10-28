@@ -164,6 +164,7 @@ x-cosmos3: &cosmos3
   - vllm_omni/diffusion/distributed/autoencoders/autoencoder_kl_wan.py
   - vllm_omni/experimental/world_models/
   - vllm_omni/model_extras/cosmos3.py
+  - vllm_omni/model_extras/cosmos3_lidar.py
 
 x-qwen-image: &qwen_image
   - vllm_omni/diffusion/models/qwen_image/
