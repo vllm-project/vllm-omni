@@ -59,7 +59,10 @@ uses a lightweight model listing and the exported warmup facts.
 
 Only an inherited private socketpair connects the two processes. Commands,
 control results, events, and invalidations use typed MessagePack data.
-A single writer per direction coalesces queued messages without a timer.
+A single asynchronous writer per direction sends individual MessagePack values.
+An incremental MessagePack decoder handles partial reads and consecutive values
+without explicit length prefixes or batch envelopes. Socket buffering is left to
+asyncio and the operating system.
 Queues are bounded by message count and encoded bytes. Worker-side session
 buffers enforce native output limits; frontend overflow closes the affected
 session and requests engine cleanup. Worker or transport failure fails pending

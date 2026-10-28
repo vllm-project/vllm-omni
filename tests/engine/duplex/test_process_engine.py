@@ -24,7 +24,7 @@ from vllm_omni.engine.duplex.process_engine import (
     _QUEUE_BYTES,
     ProcessDuplexEngineClient,
     ProcessDuplexStageMetadata,
-    _BatchedSocket,
+    _MessageSocket,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -141,22 +141,21 @@ def make_client(**options):
     return ProcessDuplexEngineClient("fake", {"init_timeout": 30, **options}, factory=fake_factory)
 
 
-def test_transport_batches_both_directions():
+def test_transport_streams_both_directions():
     async def run():
         a, b = socket.socketpair()
         a.setblocking(False)
         b.setblocking(False)
         ar, aw = await asyncio.open_connection(sock=a)
         br, bw = await asyncio.open_connection(sock=b)
-        left, right = _BatchedSocket(ar, aw), _BatchedSocket(br, bw)
+        left, right = _MessageSocket(ar, aw), _MessageSocket(br, bw)
         for i in range(64):
             await left.send(("command", i, b"pcm"))
             await right.send(("event", i, b"audio"))
         tasks = [asyncio.create_task(left.write()), asyncio.create_task(right.write())]
         try:
-            assert await right.receive() == [["command", i, b"pcm"] for i in range(64)]
-            assert await left.receive() == [["event", i, b"audio"] for i in range(64)]
-            assert left.frames_sent == right.frames_sent == 1
+            assert [await right.receive() for _ in range(64)] == [["command", i, b"pcm"] for i in range(64)]
+            assert [await left.receive() for _ in range(64)] == [["event", i, b"audio"] for i in range(64)]
             assert left.pending_bytes == right.pending_bytes == 0
         finally:
             for task in tasks:
@@ -169,9 +168,50 @@ def test_transport_batches_both_directions():
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("partial_eof", [False, True])
+def test_transport_handles_partial_and_consecutive_messages(partial_eof):
+    async def run():
+        a, b = socket.socketpair()
+        a.setblocking(False)
+        b.setblocking(False)
+        ar, aw = await asyncio.open_connection(sock=a)
+        br, bw = await asyncio.open_connection(sock=b)
+        receiver = _MessageSocket(br, bw)
+        # A value larger than the read chunk must survive multiple feed() calls.
+        first = ("event", b"audio" * 20000)
+        payload = msgspec.msgpack.encode(first)
+        receive = asyncio.create_task(receiver.receive())
+        try:
+            aw.write(payload[:-1])
+            await aw.drain()
+            await asyncio.sleep(0)
+            assert not receive.done()
+            if partial_eof:
+                aw.close()
+                with pytest.raises(EOFError):
+                    await asyncio.wait_for(receive, 5)
+            else:
+                # Finish the partial value and append another in the same write.
+                aw.write(payload[-1:] + msgspec.msgpack.encode(("result", 1, True, None)))
+                await aw.drain()
+                assert await asyncio.wait_for(receive, 5) == list(first)
+                assert await asyncio.wait_for(receiver.receive(), 5) == ["result", 1, True, None]
+                aw.close()
+                with pytest.raises(EOFError):
+                    await asyncio.wait_for(receiver.receive(), 5)
+        finally:
+            receive.cancel()
+            await asyncio.gather(receive, return_exceptions=True)
+            aw.close()
+            bw.close()
+            await asyncio.gather(aw.wait_closed(), bw.wait_closed())
+
+    asyncio.run(run())
+
+
 def test_transport_rejects_oversized_message():
     with pytest.raises(ValueError, match="queue budget"):
-        _BatchedSocket.entry(("command", b"x" * _QUEUE_BYTES))
+        _MessageSocket.entry(("command", b"x" * _QUEUE_BYTES))
 
 
 def test_native_values_survive_msgpack():
@@ -179,6 +219,12 @@ def test_native_values_survive_msgpack():
     assert msgspec.msgpack.decode(msgspec.msgpack.encode(command), type=AppendAudio) == command
     config = DuplexSessionConfig(model="fake", extra_body={"custom": {"value": [1, 2]}}).normalized()
     assert msgspec.msgpack.decode(msgspec.msgpack.encode(config), type=DuplexSessionConfig) == config
+    for capabilities in (None, DuplexCapabilities(supports_session_resume=True)):
+        result = DuplexControlResultMessage(
+            control_id="test", operation="open", session_id="s", ok=True, capabilities=capabilities
+        )
+        decoded = msgspec.msgpack.decode(msgspec.msgpack.encode(result))
+        assert msgspec.convert(decoded, type=DuplexControlResultMessage) == result
 
 
 def test_spawned_client_streams_audio_controls_and_invalidations():
