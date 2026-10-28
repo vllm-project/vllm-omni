@@ -4,9 +4,11 @@
 import json
 import math
 import os
+import tempfile
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextlib import AbstractContextManager, ExitStack, contextmanager
+from datetime import datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any, TypeGuard
@@ -377,6 +379,7 @@ def _is_finite_number(value: object) -> TypeGuard[int | float]:
 _OMNIINTERACT_AGGREGATE_MIN_IA_QTF1 = "omniinteract_aggregate_min_ia_qtf1"
 _OMNIINTERACT_AGGREGATE_SUBSETS = "omniinteract_aggregate_subsets"
 _OMNIINTERACT_AGGREGATE_GROUP = "omniinteract_aggregate_group"
+_OMNIINTERACT_PERSIST_ARTIFACTS = "omniinteract_persist_artifacts"
 _OMNIINTERACT_AGGREGATE_COUNTS: dict[tuple[str, str], tuple[float, float, float]] = {}
 _OMNIINTERACT_MIN_EVALUATED_CASES = 1
 
@@ -469,19 +472,106 @@ def _maybe_assert_aggregate_ia_qtf1(params: dict[str, object], acc_summary: dict
     fp = _finite_accuracy_count(acc_summary.get("Global_FP"), "Global_FP")
     fn = _finite_accuracy_count(acc_summary.get("Global_FN"), "Global_FN")
     _OMNIINTERACT_AGGREGATE_COUNTS[(group, subset)] = (tp, fp, fn)
-    recorded = [_OMNIINTERACT_AGGREGATE_COUNTS.get((group, name)) for name in subsets]
-    present = [counts for counts in recorded if counts is not None]
-    if len(present) != len(subsets):
+    pooled = _pooled_omniinteract_aggregate(params)
+    if pooled is None:
         return
-    total_tp = sum(counts[0] for counts in present)
-    total_fp = sum(counts[1] for counts in present)
-    total_fn = sum(counts[2] for counts in present)
-    ia_qtf1 = _ia_qtf1_from_counts(total_tp, total_fp, total_fn)
+    total_tp, total_fp, total_fn, ia_qtf1 = pooled
     print(
         f"OmniInteract aggregate All Global IA-QTF1: {ia_qtf1:.6f} "
         f"(TP={total_tp:.6f} / FP={total_fp:.6f} / FN={total_fn:.6f})"
     )
     assert ia_qtf1 >= float(min_ia_qtf1), f"OmniInteract aggregate All Global IA-QTF1 {ia_qtf1} is below {min_ia_qtf1}"
+
+
+def _pooled_omniinteract_aggregate(params: Mapping[str, object]) -> tuple[float, float, float, float] | None:
+    subsets = params.get(_OMNIINTERACT_AGGREGATE_SUBSETS)
+    group = params.get(_OMNIINTERACT_AGGREGATE_GROUP)
+    if not isinstance(subsets, list | tuple) or not subsets or not isinstance(group, str) or not group:
+        return None
+    recorded = [_OMNIINTERACT_AGGREGATE_COUNTS.get((group, name)) for name in subsets]
+    if any(counts is None for counts in recorded):
+        return None
+    present = [counts for counts in recorded if counts is not None]
+    total_tp = sum(counts[0] for counts in present)
+    total_fp = sum(counts[1] for counts in present)
+    total_fn = sum(counts[2] for counts in present)
+    return total_tp, total_fp, total_fn, _ia_qtf1_from_counts(total_tp, total_fp, total_fn)
+
+
+def _omniinteract_accuracy_baseline(params: Mapping[str, object], test_name: str) -> dict[str, object]:
+    baseline: dict[str, object] = {}
+    min_ia_qtf1 = params.get("omniinteract_min_ia_qtf1")
+    if min_ia_qtf1 is not None:
+        baseline["omniinteract_min_ia_qtf1"] = min_ia_qtf1
+    aggregate = _aggregate_accuracy_params_for_test(test_name)
+    aggregate_floor = aggregate.get(_OMNIINTERACT_AGGREGATE_MIN_IA_QTF1)
+    if aggregate_floor is not None:
+        baseline[_OMNIINTERACT_AGGREGATE_MIN_IA_QTF1] = aggregate_floor
+    return baseline
+
+
+def _maybe_write_omniinteract_aggregate_accuracy_result(
+    result: Mapping[str, object],
+    params: Mapping[str, object],
+) -> Path | None:
+    if not params.get("omniinteract_evaluate"):
+        return None
+    pooled = _pooled_omniinteract_aggregate(params)
+    if pooled is None:
+        return None
+    from tests.e2e.accuracy.helpers import (
+        _OMNIINTERACT_AGGREGATE_SUITE,
+        _OMNIINTERACT_DATASET,
+        _acc_result_filename,
+        omniinteract_accuracy_result_dir,
+        write_dfx_accuracy_result,
+    )
+
+    total_tp, total_fp, total_fn, ia_qtf1 = pooled
+    model_id = result.get("model_id") or "model"
+    when = datetime.now()
+    accuracy_path = omniinteract_accuracy_result_dir() / _acc_result_filename(
+        str(model_id),
+        _OMNIINTERACT_AGGREGATE_SUITE,
+        when=when,
+    )
+    subsets = params.get(_OMNIINTERACT_AGGREGATE_SUBSETS)
+    write_dfx_accuracy_result(
+        accuracy_path,
+        test_name=str(result.get("test_name") or params.get(_OMNIINTERACT_AGGREGATE_GROUP) or ""),
+        name="aggregate",
+        model_id=str(model_id),
+        dataset=_OMNIINTERACT_DATASET,
+        dataset_path=str(params.get("dataset_path") or _OMNIINTERACT_DATASET),
+        date=str(result.get("date") or when.strftime("%Y%m%d-%H%M%S")),
+        hardware=str(result.get("Hardware") or ""),
+        baseline={
+            key: value
+            for key, value in (
+                ("omniinteract_min_ia_qtf1", params.get("omniinteract_min_ia_qtf1")),
+                (_OMNIINTERACT_AGGREGATE_MIN_IA_QTF1, params.get(_OMNIINTERACT_AGGREGATE_MIN_IA_QTF1)),
+            )
+            if value is not None
+        },
+        branch=str(result.get("branch") or os.environ.get("BUILDKITE_BRANCH", "")),
+        num_prompts=int(result["num_prompts"]) if isinstance(result.get("num_prompts"), int) else 0,
+        max_concurrency=int(result["max_concurrency"]) if isinstance(result.get("max_concurrency"), int) else None,
+        benchmark_exit_code=0,
+        generation={
+            "completed": result.get("completed", 0),
+            "failed": result.get("failed", 0),
+            "subsets": list(subsets) if isinstance(subsets, list | tuple) else [],
+        },
+        accuracy={
+            "status": "ok",
+            "IA_QTF1": ia_qtf1,
+            "Global_TP": total_tp,
+            "Global_FP": total_fp,
+            "Global_FN": total_fn,
+        },
+    )
+    print(f"Accuracy result saved to {accuracy_path}")
+    return accuracy_path
 
 
 def _duplex_eval_score_floors_enforced(params: dict, hardware: object) -> bool:
@@ -619,12 +709,18 @@ def test_performance_benchmark(omni_server, benchmark_params):
         accuracy_baseline = (
             accuracy_config["baseline"] if _duplex_eval_score_floors_enforced(params, resource_label) else {}
         )
+    elif params.get("omniinteract_evaluate"):
+        accuracy_baseline = _omniinteract_accuracy_baseline(params, test_name)
     for dataset_prefix in ("omniinteract", "duplex_eval"):
         if params.get(f"{dataset_prefix}_evaluate"):
             judge_base_url = getattr(omni_server, "judge_base_url", None)
             if not isinstance(judge_base_url, str) or not judge_base_url:
                 raise ValueError(f"{dataset_prefix}_evaluate requires top-level judge_server_params to start a judge")
             params[f"{dataset_prefix}_judge_base_url"] = judge_base_url
+    artifact_root: tempfile.TemporaryDirectory[str] | None = None
+    if dataset_name == "omniinteract" and not params.get(_OMNIINTERACT_PERSIST_ARTIFACTS, True):
+        artifact_root = tempfile.TemporaryDirectory(prefix="omniinteract-artifacts-")
+        params["omniinteract_output_dir"] = artifact_root.name
 
     host = omni_server.host
     port = omni_server.port
@@ -670,6 +766,7 @@ def test_performance_benchmark(omni_server, benchmark_params):
         _OMNIINTERACT_AGGREGATE_MIN_IA_QTF1,
         _OMNIINTERACT_AGGREGATE_SUBSETS,
         _OMNIINTERACT_AGGREGATE_GROUP,
+        _OMNIINTERACT_PERSIST_ARTIFACTS,
         "judge_server_params",
         "duplex_eval_accuracy_config",
         "duplex_eval_score_floor_hardware",
@@ -712,42 +809,61 @@ def test_performance_benchmark(omni_server, benchmark_params):
             args.append("--trust-remote-code")
         break
 
-    # QPS / request-rate sweep
-    for sweep_index, (qps, num_prompt) in enumerate(zip(qps_list, num_prompt_list)):
-        args = args + ["--request-rate", str(qps), "--num-prompts", str(num_prompt)]
-        result = run_benchmark(
-            args=args,
-            test_name=test_name,
-            flow=qps,
-            dataset_name=dataset_name,
-            num_prompt=num_prompt,
-            baseline_config=params.get("baseline"),
-            sweep_index=sweep_index,
-            random_input_len=params.get("random_input_len"),
-            random_output_len=params.get("random_output_len"),
-            resource_label=resource_label,
-            num_warmups=_resolve_num_warmups(params, default=2),
-            benchmark_params_name=params.get("name") if isinstance(params.get("name"), str) else None,
-            accuracy_baseline=accuracy_baseline,
-        )
-        assert_result(result, {**params, **_aggregate_accuracy_params_for_test(test_name)}, num_prompt)
+    try:
+        # QPS / request-rate sweep
+        for sweep_index, (qps, num_prompt) in enumerate(zip(qps_list, num_prompt_list)):
+            args = args + ["--request-rate", str(qps), "--num-prompts", str(num_prompt)]
+            result = run_benchmark(
+                args=args,
+                test_name=test_name,
+                flow=qps,
+                dataset_name=dataset_name,
+                num_prompt=num_prompt,
+                baseline_config=params.get("baseline"),
+                sweep_index=sweep_index,
+                random_input_len=params.get("random_input_len"),
+                random_output_len=params.get("random_output_len"),
+                resource_label=resource_label,
+                num_warmups=_resolve_num_warmups(params, default=2),
+                benchmark_params_name=params.get("name") if isinstance(params.get("name"), str) else None,
+                accuracy_baseline=accuracy_baseline,
+            )
+            assert_params = {**params, **_aggregate_accuracy_params_for_test(test_name)}
+            try:
+                assert_result(result, assert_params, num_prompt)
+            finally:
+                _maybe_write_omniinteract_aggregate_accuracy_result(result, assert_params)
 
-    # concurrency test
-    for sweep_index, (concurrency, num_prompt) in enumerate(zip(max_concurrency_list, num_prompt_list)):
-        args = args + ["--max-concurrency", str(concurrency), "--num-prompts", str(num_prompt), "--request-rate", "inf"]
-        result = run_benchmark(
-            args=args,
-            test_name=test_name,
-            flow=concurrency,
-            dataset_name=dataset_name,
-            num_prompt=num_prompt,
-            baseline_config=params.get("baseline"),
-            sweep_index=sweep_index,
-            random_input_len=params.get("random_input_len"),
-            random_output_len=params.get("random_output_len"),
-            resource_label=resource_label,
-            num_warmups=_resolve_num_warmups(params, default=max(2, int(concurrency))),
-            benchmark_params_name=params.get("name") if isinstance(params.get("name"), str) else None,
-            accuracy_baseline=accuracy_baseline,
-        )
-        assert_result(result, {**params, **_aggregate_accuracy_params_for_test(test_name)}, num_prompt)
+        # concurrency test
+        for sweep_index, (concurrency, num_prompt) in enumerate(zip(max_concurrency_list, num_prompt_list)):
+            args = args + [
+                "--max-concurrency",
+                str(concurrency),
+                "--num-prompts",
+                str(num_prompt),
+                "--request-rate",
+                "inf",
+            ]
+            result = run_benchmark(
+                args=args,
+                test_name=test_name,
+                flow=concurrency,
+                dataset_name=dataset_name,
+                num_prompt=num_prompt,
+                baseline_config=params.get("baseline"),
+                sweep_index=sweep_index,
+                random_input_len=params.get("random_input_len"),
+                random_output_len=params.get("random_output_len"),
+                resource_label=resource_label,
+                num_warmups=_resolve_num_warmups(params, default=max(2, int(concurrency))),
+                benchmark_params_name=params.get("name") if isinstance(params.get("name"), str) else None,
+                accuracy_baseline=accuracy_baseline,
+            )
+            assert_params = {**params, **_aggregate_accuracy_params_for_test(test_name)}
+            try:
+                assert_result(result, assert_params, num_prompt)
+            finally:
+                _maybe_write_omniinteract_aggregate_accuracy_result(result, assert_params)
+    finally:
+        if artifact_root is not None:
+            artifact_root.cleanup()

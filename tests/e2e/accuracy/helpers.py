@@ -428,6 +428,86 @@ def _acc_result_filename(model: str, suite: str, when: datetime | None = None) -
     return f"result_acc_{_acc_model_name(model)}_{suite}_{when.strftime('%Y%m%d')}_{when.strftime('%H%M%S')}.json"
 
 
+_OMNIINTERACT_DATASET = "omniinteract"
+_OMNIINTERACT_AGGREGATE_SUITE = "omniinteract_aggregate"
+_OMNIINTERACT_DEFAULT_ACC_DIR = Path("tests/e2e/accuracy/omniinteract/results")
+_OMNIINTERACT_DASHBOARD_METRICS = (
+    "IA_QTF1",
+    "Precision",
+    "Recall",
+    "Global_TP",
+    "Global_FP",
+    "Global_FN",
+)
+
+
+def omniinteract_accuracy_result_dir() -> Path:
+    """Directory for OmniInteract ``result_acc_*.json`` dashboard files.
+
+    Prefer ``ACC_BENCH_RESULT_DIR`` (same channel as Daily-Omni / DuplexEval).
+    Otherwise reuse ``BENCHMARK_DIR`` so local/CI collectors that already scrape
+    performance JSON also pick up accuracy. Fall back to the suite default.
+    """
+    explicit = os.environ.get("ACC_BENCH_RESULT_DIR")
+    if explicit:
+        return Path(explicit)
+    fallback = os.environ.get("BENCHMARK_DIR")
+    if fallback:
+        return Path(fallback)
+    return _OMNIINTERACT_DEFAULT_ACC_DIR
+
+
+def flatten_omniinteract_accuracy_metrics(accuracy: Mapping[str, object]) -> dict[str, object]:
+    """Copy judge output and lift All Global scores onto ``accuracy`` for dashboards."""
+    payload = dict(accuracy)
+    summary = accuracy.get("summary")
+    if isinstance(summary, Mapping):
+        for key in _OMNIINTERACT_DASHBOARD_METRICS:
+            if key in summary and key not in payload:
+                payload[key] = summary[key]
+    return payload
+
+
+def write_dfx_accuracy_result(
+    path: Path,
+    *,
+    test_name: str,
+    name: str | None,
+    model_id: str,
+    dataset: str,
+    dataset_path: str,
+    date: str,
+    hardware: str,
+    baseline: Mapping[str, object],
+    branch: str,
+    num_prompts: int,
+    max_concurrency: int | None,
+    benchmark_exit_code: int,
+    generation: Mapping[str, object],
+    accuracy: Mapping[str, object],
+) -> Path:
+    """Write the shared DFX accuracy envelope used by the dashboard."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    record = {
+        "test_name": test_name,
+        "name": name,
+        "model_id": model_id,
+        "dataset": dataset,
+        "dataset_path": dataset_path,
+        "date": date,
+        "Hardware": hardware,
+        "baseline": {key: value for key, value in baseline.items() if value is not None},
+        "branch": branch,
+        "num_prompts": num_prompts,
+        "max_concurrency": max_concurrency,
+        "benchmark_exit_code": benchmark_exit_code,
+        "generation": dict(generation),
+        "accuracy": dict(accuracy),
+    }
+    path.write_text(json.dumps(record, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return path
+
+
 def _build_common_args(
     ns: argparse.Namespace,
     *,
