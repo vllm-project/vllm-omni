@@ -534,8 +534,10 @@ estimate. It excludes DiT denoising, audio decode, MP4 encoding, and HTTP
 delivery. Current-stream Events do not independently measure unrelated streams.
 
 The main, PR-off, and PR-on matrix completed 240 requests including warmups.
-PR-off MP4 hashes match main for all 20 prompt/resolution combinations;
-LiteVAE-on visual quality remains pending human review.
+PR-off MP4 hashes match main for all 20 prompt/resolution combinations.
+Manual visual review found some visually noticeable quality degradation with
+LiteVAE enabled compared with the original decoder. The speedup comes with a
+visual-quality trade-off.
 
 ## CPU MP4 response encoding (Atlas A2)
 

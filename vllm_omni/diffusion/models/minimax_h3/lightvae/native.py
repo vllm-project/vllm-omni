@@ -11,7 +11,7 @@ from typing import cast
 import torch
 from torch import nn
 
-from .lightvae import H3LiteDecoderCheckpoint, convert_h3_lite_decoder_state_dict
+from .checkpoint import H3LiteDecoderCheckpoint, convert_h3_lite_decoder_state_dict
 
 
 def install_h3_lite_decoder(

@@ -374,8 +374,7 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
             if self.decode_only:
                 _remove_modules(self.remote.model, ("encoder", "quant_conv"))
             if lightvae_decoder_path is not None:
-                from .lightvae import read_h3_lite_decoder_checkpoint
-                from .lightvae_native import install_h3_lite_decoder
+                from .lightvae import install_h3_lite_decoder, read_h3_lite_decoder_checkpoint
 
                 checkpoint = read_h3_lite_decoder_checkpoint(lightvae_decoder_path)
                 install_h3_lite_decoder(self.remote.model, checkpoint, native_config=self.config_dict)

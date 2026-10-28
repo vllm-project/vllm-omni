@@ -15,10 +15,10 @@ from safetensors.torch import save_file
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
 
-def _api(component="lightvae"):
+def _api(component="checkpoint"):
     package = "h3_lightvae_checkpoint_test_target"
     root = Path(__file__).resolve().parents[4]
-    directory = root / "vllm_omni/diffusion/models/minimax_h3"
+    directory = root / "vllm_omni/diffusion/models/minimax_h3/lightvae"
     if package not in sys.modules:
         namespace = types.ModuleType(package)
         namespace.__path__ = [str(directory)]
@@ -118,7 +118,7 @@ def test_native_install_loads_all_lite_weights_without_changing_encoder(default_
     # Pipeline construction may set an accelerator default device while the
     # native VAE and checkpoint are deliberately still loaded on the CPU.
     with torch.device(default_device):
-        _api("lightvae_native").install_h3_lite_decoder(model, checkpoint, native_config=checkpoint.config)
+        _api("native").install_h3_lite_decoder(model, checkpoint, native_config=checkpoint.config)
     assert len(model.decoder.transformer_blocks) == 2
     actual = model.state_dict()
     for key, value in expected.items():
@@ -132,7 +132,7 @@ def test_native_install_rejects_incompatible_normalization():
     model, checkpoint, _ = _native_checkpoint()
     config = dict(checkpoint.config, latents_mean=[1.0, 1.0])
     with pytest.raises(ValueError, match="latents_mean"):
-        _api("lightvae_native").install_h3_lite_decoder(model, checkpoint, native_config=config)
+        _api("native").install_h3_lite_decoder(model, checkpoint, native_config=config)
     assert len(model.decoder.transformer_blocks) == 4
 
 
@@ -144,7 +144,7 @@ def test_native_install_validates_runtime_when_native_config_omits_decoder_field
         for key, value in checkpoint.config.items()
         if key not in ("decoder_norm_eps", "decoder_rope_theta", "decoder_rope_dim_ratio")
     }
-    _api("lightvae_native").install_h3_lite_decoder(model, checkpoint, native_config=config)
+    _api("native").install_h3_lite_decoder(model, checkpoint, native_config=config)
     assert len(model.decoder.transformer_blocks) == 2
     for key, value in expected.items():
         assert torch.equal(model.state_dict()[key], value), key
@@ -154,7 +154,7 @@ def test_native_install_rejects_missing_weights():
     model, checkpoint, _ = _native_checkpoint()
     checkpoint.state_dict.pop("decoder.proj_in.weight")
     with pytest.raises(ValueError, match="x_embedder.weight"):
-        _api("lightvae_native").install_h3_lite_decoder(model, checkpoint, native_config=checkpoint.config)
+        _api("native").install_h3_lite_decoder(model, checkpoint, native_config=checkpoint.config)
 
 
 @pytest.mark.parametrize("target", ["norm_out", "norm1", "norm2", "norm_q", "norm_k"])
@@ -173,7 +173,7 @@ def test_native_install_rejects_runtime_norm_epsilon_before_mutation(target, omi
         config.pop("decoder_norm_eps")
     before = model.decoder.x_embedder.weight.detach().clone()
     with pytest.raises(ValueError, match="norm_eps"):
-        _api("lightvae_native").install_h3_lite_decoder(model, checkpoint, native_config=config)
+        _api("native").install_h3_lite_decoder(model, checkpoint, native_config=config)
     assert len(model.decoder.transformer_blocks) == 4
     assert torch.equal(before, model.decoder.x_embedder.weight)
 
@@ -195,7 +195,7 @@ def test_native_install_rejects_incompatible_rope(failure):
     else:
         del model.decoder.pos_embed
     with pytest.raises(ValueError, match="rope"):
-        _api("lightvae_native").install_h3_lite_decoder(model, checkpoint, native_config=config)
+        _api("native").install_h3_lite_decoder(model, checkpoint, native_config=config)
     assert len(model.decoder.transformer_blocks) == 4
 
 
@@ -203,11 +203,11 @@ def test_native_install_requires_cpu_and_supported_structure():
     model, checkpoint, _ = _native_checkpoint()
     model.decoder = torch.nn.Linear(4, 4)
     with pytest.raises(ValueError, match="structure"):
-        _api("lightvae_native").install_h3_lite_decoder(model, checkpoint, native_config=checkpoint.config)
+        _api("native").install_h3_lite_decoder(model, checkpoint, native_config=checkpoint.config)
     model, checkpoint, _ = _native_checkpoint()
     model.to("meta")
     with pytest.raises(ValueError, match="CPU"):
-        _api("lightvae_native").install_h3_lite_decoder(model, checkpoint, native_config=checkpoint.config)
+        _api("native").install_h3_lite_decoder(model, checkpoint, native_config=checkpoint.config)
 
 
 @pytest.fixture
