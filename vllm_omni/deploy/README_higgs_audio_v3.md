@@ -32,7 +32,8 @@ For a tuned large-card V2 profile see `higgs_multimodal_qwen3_mrv2_h200.yaml`
 
 Use `higgs_multimodal_qwen3_high_throughput.yaml` for medium/high concurrency
 serving. This profile keeps Stage 0 `enforce_eager: true`, which preserves the
-Higgs-specific local MLP CUDA graph path.
+Higgs-specific local MLP CUDA graph path. It is the throughput-oriented
+production profile.
 
 ```bash
 vllm-omni serve bosonai/higgs-audio-v3-tts-4b \
