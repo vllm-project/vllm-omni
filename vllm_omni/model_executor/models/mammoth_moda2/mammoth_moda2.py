@@ -100,6 +100,64 @@ def moe_enable(moe_type, layer_type, layer_idx) -> bool:
     return layer_type in moe_type and start <= layer_idx < end
 
 
+def _is_graph_capturing(device: torch.device) -> bool:
+    """Return True when the current stream on `device` is capturing a device graph.
+
+    CUDA/XPU/NPU graph capture bakes host-side control flow (`.any()`/`.all()`,
+    `.item()`) into the recorded graph. During capture the dummy inputs are all
+    zeros, so a branch taken on those values would replay the wrong path for
+    real inputs. Callers switch to a graph-safe `torch.where` path here instead.
+    """
+    dev_type = device.type
+    if dev_type == "cuda":
+        if not torch.cuda.is_available():
+            return False
+        return bool(torch.cuda.is_current_stream_capturing())
+    if dev_type == "npu":
+        is_capturing = getattr(getattr(torch, "npu", None), "is_current_stream_capturing", None)
+        return bool(is_capturing()) if callable(is_capturing) else False
+    if dev_type == "xpu":
+        is_capturing = getattr(getattr(torch, "xpu", None), "is_current_stream_capturing", None)
+        return bool(is_capturing()) if callable(is_capturing) else False
+    return False
+
+
+def _moe_blend(
+    hidden_states: torch.Tensor,
+    und_expert: Callable[[torch.Tensor], torch.Tensor],
+    gen_expert: Callable[[torch.Tensor], torch.Tensor],
+    gen_token_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Graph-safe MoE routing: run both experts and select per token via `torch.where`.
+
+    Unlike the eager path, this never reads the mask on the host and emits no
+    data-dependent control flow, so the emitted kernels can be captured into a
+    device graph and replayed with any mask value.
+    """
+    if hidden_states.ndim == 3:
+        b, seq_len = hidden_states.shape[0], hidden_states.shape[1]
+        flat_hid = hidden_states.reshape(-1, hidden_states.shape[-1])
+    elif hidden_states.ndim == 2:
+        flat_hid = hidden_states
+    else:
+        raise ValueError(f"Unexpected hidden_states shape: {tuple(hidden_states.shape)}")
+
+    if gen_token_mask.numel() != flat_hid.shape[0]:
+        raise ValueError(
+            "gen_token_mask shape mismatch: "
+            f"mask={tuple(gen_token_mask.shape)}, hidden_states={tuple(hidden_states.shape)}"
+        )
+
+    und_out = und_expert(flat_hid)
+    gen_out = gen_expert(flat_hid)
+    # bool mask [total_tokens, 1] broadcasts against [total_tokens, D_out].
+    sel = gen_token_mask.reshape(-1).unsqueeze(-1)
+    merged = torch.where(sel, gen_out, und_out)
+    if hidden_states.ndim == 3:
+        return merged.view(b, seq_len, merged.shape[-1])
+    return merged
+
+
 def moe_forward(
     hidden_states: torch.Tensor,
     und_expert: Callable[[torch.Tensor], torch.Tensor],
@@ -136,6 +194,9 @@ def moe_forward(
     """
     if gen_expert is None:
         return und_expert(hidden_states)
+
+    if gen_token_mask is not None and gen_token_mask.numel() > 0 and _is_graph_capturing(hidden_states.device):
+        return _moe_blend(hidden_states, und_expert, gen_expert, gen_token_mask)
 
     if gen_token_mask is None or not gen_token_mask.any():
         return und_expert(hidden_states)
@@ -424,6 +485,16 @@ class MammothModa2Qwen2ForCausalLM(nn.Module, SupportsPP):
             return self.embed_tokens(input_ids)
 
         gen_mask = input_ids >= int(self.gen_vocab_start_index)
+        if _is_graph_capturing(input_ids.device):
+            # Graph-safe blend: compute both embeddings and select per token.
+            # Clamp both lookups so the out-of-range side (gen ids for the base
+            # table, base ids for the gen table) maps to index 0 instead of an
+            # out-of-range index; those rows are discarded by where().
+            base_ids = input_ids.clamp(max=self.base_vocab_size - 1)
+            base_emb = self.embed_tokens(base_ids)
+            gen_ids = (input_ids - int(self.gen_vocab_start_index)).clamp(min=0)
+            gen_emb = self.gen_embed_tokens(gen_ids)
+            return torch.where(gen_mask.unsqueeze(-1), gen_emb, base_emb)
         if not gen_mask.any():
             return self.embed_tokens(input_ids)
         if gen_mask.all():
