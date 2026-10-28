@@ -108,6 +108,15 @@ stage-client channel configuration and does not launch or retire backend
 processes. CLI validation rejects unsupported distributed, diffusion,
 fault-tolerant, elastic-EP, Ray, and runtime-LoRA combinations before startup.
 
+`DuplexOmni` also accepts `duplex_engine_backend="process"`, exposed by serve
+as `--duplex-engine-backend process`. This selects session-only serving without
+changing model capabilities. The entrypoint retains session handles and delegates
+process/IPC ownership to `ProcessDuplexEngineClient`; it does not initialize
+frontend generation processors or the chat service. Model listing, health, and
+warmup use the process client's startup facts and control interface. The normal
+thread backend retains mixed chat/session serving. Runtime ownership and the
+cross-process invalidation boundary are specified in [Full Duplex](../fullduplex.md#runtime-process-placement).
+
 It does not own configuration precedence, cross-stage routing, stage
 placement, payload implementation, or semantic error classification.
 `entrypoints/openai/errors.py` is an explicit primary-path exception owned by

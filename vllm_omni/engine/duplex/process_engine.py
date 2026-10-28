@@ -352,6 +352,8 @@ class ProcessDuplexEngineClient:
     def __init__(self, model: str, options: dict[str, Any], *, factory: EngineFactory) -> None:
         from vllm.v1.metrics.prometheus import setup_multiprocess_prometheus
 
+        if os.name != "posix":
+            raise ValueError("The process duplex backend requires a POSIX host")
         if "PROMETHEUS_MULTIPROC_DIR" not in os.environ:
             setup_multiprocess_prometheus()
         self._pending: dict[int, asyncio.Future[Any]] = {}
@@ -453,7 +455,9 @@ class ProcessDuplexEngineClient:
         put = asyncio.create_task(self._channel.send_entry(entry))
         try:
             assert self._transport_failed is not None
-            done, _ = await asyncio.wait((put, self._transport_failed), return_when=asyncio.FIRST_COMPLETED)
+            done, _ = await asyncio.wait((put, self._transport_failed), timeout=30, return_when=asyncio.FIRST_COMPLETED)
+            if not done:
+                raise DuplexSessionError("Duplex IPC queue is full", code="engine_backpressure", retryable=True)
             if put not in done or self._failure:
                 raise DuplexSessionError(self._failure or "engine transport stopped", code="engine_dead")
             put.result()
@@ -469,7 +473,7 @@ class ProcessDuplexEngineClient:
             await self._send((request_id, operation, args, kwargs))
             try:
                 return await asyncio.wait_for(future, kwargs.get("timeout", 10))
-            except TimeoutError as exc:
+            except (TimeoutError, asyncio.TimeoutError) as exc:
                 raise DuplexSessionError(f"{operation} IPC timeout", code="timeout", retryable=True) from exc
         finally:
             self._pending.pop(request_id, None)
@@ -491,6 +495,7 @@ class ProcessDuplexEngineClient:
             return await self._rpc("open_session_async", (session_id, config), {"timeout": timeout})
         except BaseException:
             self._buffers.pop(session_id, None)
+            self._invalidated.pop(session_id, None)
             raise
 
     async def close_session_async(
@@ -548,7 +553,7 @@ class ProcessDuplexEngineClient:
             raise EngineDeadError(self._failure or "Duplex engine process exited")
         try:
             return [await asyncio.wait_for(self._outputs.get(), timeout)]
-        except TimeoutError:
+        except (TimeoutError, asyncio.TimeoutError):
             return []
 
     async def _read(self) -> None:
@@ -563,9 +568,16 @@ class ProcessDuplexEngineClient:
                         if not ok:
                             future.set_exception(DuplexSessionError(value.pop("message"), **value))
                         else:
-                            future.set_result(
-                                None if value is None else msgspec.convert(value, type=DuplexControlResultMessage)
-                            )
+                            if value is not None:
+                                # The envelope keeps annotation-only imports for its
+                                # in-process buffer fields. Decode the nested value
+                                # explicitly instead of resolving its whole graph.
+                                if value["capabilities"] is not None:
+                                    value["capabilities"] = msgspec.convert(
+                                        value["capabilities"], type=DuplexCapabilities
+                                    )
+                                value = DuplexControlResultMessage(**value)
+                            future.set_result(value)
                 elif kind == "invalidate":
                     session_id, response_id, epoch = body
                     if (buffer := self._buffers.get(session_id)) is not None:
@@ -576,7 +588,7 @@ class ProcessDuplexEngineClient:
                     session_id, name, data = body
                     event: events.DuplexEvent = msgspec.convert(data, type=_EVENT_TYPES[name])
                     buffer = self._buffers.get(session_id)
-                    if isinstance(event, AudioDelta) and event.epoch is not None:
+                    if isinstance(event, AudioDelta) and event.epoch is not None and event.response_id is not None:
                         if event.epoch <= self._invalidated.get(session_id, {}).get(event.response_id, -1):
                             continue
                     if isinstance(event, SessionClosed):
@@ -589,7 +601,7 @@ class ProcessDuplexEngineClient:
                             buffer.put(event)
                         except DuplexOutputOverflowError:
                             self._overflow_session(session_id, buffer)
-                        if isinstance(event, ResponseDone):
+                        if isinstance(event, ResponseDone) and event.response_id is not None:
                             self._invalidated.get(session_id, {}).pop(event.response_id, None)
                 else:
                     raise RuntimeError(f"Unknown duplex IPC message: {kind}")
@@ -627,7 +639,7 @@ class ProcessDuplexEngineClient:
                 await asyncio.sleep(0.02)
 
         try:
-            with suppress(TimeoutError, DuplexSessionError):
+            with suppress(TimeoutError, asyncio.TimeoutError, DuplexSessionError):
                 await asyncio.wait_for(graceful(), 30)
         finally:
             self.shutdown(timeout=0)

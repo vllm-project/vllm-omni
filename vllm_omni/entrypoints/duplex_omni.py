@@ -27,12 +27,13 @@ from __future__ import annotations
 
 import asyncio
 import weakref
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import AbstractContextManager, suppress
 from typing import Any, Literal
 from uuid import uuid4
 
 from vllm.logger import init_logger
+from vllm.tasks import SupportedTask
 from vllm.v1.engine.exceptions import EngineDeadError
 
 from vllm_omni.config.endpoint_policy import EndpointRestriction, OmniServingCapability
@@ -402,16 +403,16 @@ class DuplexOmni(AsyncOmni):
     def get_diffusion_od_config(self) -> Any:
         return None if self.session_only else super().get_diffusion_od_config()
 
-    async def get_supported_tasks(self) -> tuple:
+    async def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         return () if self.session_only else await super().get_supported_tasks()
 
-    async def generate(self, *args: Any, **kwargs: Any) -> AsyncIterator[OmniRequestOutput]:
+    async def generate(self, *args: Any, **kwargs: Any) -> AsyncGenerator[OmniRequestOutput, None]:
         if self.session_only:
             raise NotImplementedError("The process duplex backend serves sessions only; use open_session()")
         async for output in super().generate(*args, **kwargs):
             yield output
 
-    async def check_health(self) -> None:
+    async def check_health(self) -> None:  # type: ignore[override]
         if isinstance(self.engine, ProcessDuplexEngineClient):
             await self.engine.check_health()
         else:
