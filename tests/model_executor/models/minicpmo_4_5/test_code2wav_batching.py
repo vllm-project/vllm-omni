@@ -304,6 +304,23 @@ def test_estimator_cache_stack_split_round_trip_preserves_cfg_rows():
         )
 
 
+def test_singleton_cache_fast_path_keeps_request_owned_storage():
+    token2wav = _FakeToken2Wav()
+    adapter = BatchedToken2Wav(token2wav)
+    prompt = adapter.prepare_prompt("shared", "/fake/prompt.wav")
+    states = adapter.setup_batch(prompt, 1)
+
+    stacked = adapter._stack_flow_cache(states)
+    for name, value in states[0].flow_cache.items():
+        assert stacked[name].data_ptr() == value.data_ptr()
+
+    split = adapter._split_flow_cache(stacked, 1)[0]
+    assert split["conformer_cnn_cache"].data_ptr() == stacked["conformer_cnn_cache"].data_ptr()
+    assert split["conformer_att_cache"].data_ptr() == stacked["conformer_att_cache"].data_ptr()
+    assert split["estimator_cnn_cache"].data_ptr() == stacked["estimator_cnn_cache"].data_ptr()
+    assert split["estimator_att_cache"].data_ptr() == stacked["estimator_att_cache"].data_ptr()
+
+
 def test_model_preserves_output_slots_and_prefers_runtime_codes():
     model, token2wav = _model()
     output = _forward(
