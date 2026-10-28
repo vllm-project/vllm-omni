@@ -57,6 +57,16 @@ steps:
             -m 'core_model and npu and 310P'
             --run-level 'core_model'
 
+      - label: "Platforms Test - 310P"
+        key: ready-platforms-test-310p
+        mirror_hardwares: 310p_npu_1
+        commands:
+          - >-
+            pytest -s -v
+            tests/platforms/npu/test_310p_real_device.py
+            -m 'core_model and npu and 310P and omni'
+            --run-level 'core_model'
+
   - group: ":card_index_dividers: E2E Test"
     key: ready-e2e-group
     depends_on: upload-ready-pipeline
