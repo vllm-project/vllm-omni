@@ -6,6 +6,7 @@
 ############################
 
 from collections.abc import Iterable
+from typing import Any
 
 import numpy as np
 import torch
@@ -599,6 +600,8 @@ class Qwen2_5OmniToken2WavBigVGANModel(Qwen2_5OmniPreTrainedModel):
 
 
 class RungeKutta4ODESolver:
+    EVALS_PER_INTERVAL = 4
+
     def __init__(self, function, initial_value):
         self.function = function
         self.initial_value = initial_value
@@ -678,6 +681,90 @@ class RungeKutta4ODESolver:
             current_value = next_value
 
         return solution
+
+
+class EulerODESolver:
+    """First-order explicit Euler integrator (1 function eval per interval).
+
+    Same ``integrate(time_points)`` contract as :class:`RungeKutta4ODESolver`.
+    The trajectory is only recorded at the grid points; there is no
+    mid-interval interpolation because ``sample()`` reads ``solution[-1]``.
+    """
+
+    EVALS_PER_INTERVAL = 1
+
+    def __init__(self, function, initial_value):
+        self.function = function
+        self.initial_value = initial_value
+
+    def integrate(self, time_points):
+        solution = torch.empty(
+            len(time_points),
+            *self.initial_value.shape,
+            dtype=self.initial_value.dtype,
+            device=self.initial_value.device,
+        )
+        solution[0] = self.initial_value
+
+        current_value = self.initial_value
+        for idx, (time_start, time_end) in enumerate(zip(time_points[:-1], time_points[1:])):
+            time_step = time_end - time_start
+            current_value = current_value + self.function(time_start, current_value) * time_step
+            solution[idx + 1] = current_value
+
+        return solution
+
+
+class MidpointODESolver:
+    """Second-order explicit midpoint integrator (2 function evals per interval).
+
+    Same ``integrate(time_points)`` contract as :class:`RungeKutta4ODESolver`;
+    like :class:`EulerODESolver`, only grid-point values are recorded.
+    """
+
+    EVALS_PER_INTERVAL = 2
+
+    def __init__(self, function, initial_value):
+        self.function = function
+        self.initial_value = initial_value
+
+    def integrate(self, time_points):
+        solution = torch.empty(
+            len(time_points),
+            *self.initial_value.shape,
+            dtype=self.initial_value.dtype,
+            device=self.initial_value.device,
+        )
+        solution[0] = self.initial_value
+
+        current_value = self.initial_value
+        for idx, (time_start, time_end) in enumerate(zip(time_points[:-1], time_points[1:])):
+            time_step = time_end - time_start
+            k1 = self.function(time_start, current_value)
+            k2 = self.function(time_start + time_step * 0.5, current_value + k1 * time_step * 0.5)
+            current_value = current_value + k2 * time_step
+            solution[idx + 1] = current_value
+
+        return solution
+
+
+#: Solvers selectable through the ``dit_integrator`` knob. ``"rk4"`` is the
+#: released recipe and must keep resolving to the untouched
+#: :class:`RungeKutta4ODESolver` so the default path stays bit-exact.
+_ODE_SOLVERS: dict[str, Any] = {
+    "rk4": RungeKutta4ODESolver,
+    "midpoint": MidpointODESolver,
+    "euler": EulerODESolver,
+}
+
+
+def _build_ode_solver(integrator: str, function, initial_value):
+    """Build the ODE solver named by ``integrator`` (default ``"rk4"``)."""
+    solver_cls = _ODE_SOLVERS.get(integrator)
+    if solver_cls is None:
+        names = ", ".join(sorted(_ODE_SOLVERS))
+        raise ValueError(f"Unknown dit_integrator {integrator!r}; expected one of {names}")
+    return solver_cls(function=function, initial_value=initial_value)
 
 
 @auto_docstring(
@@ -774,6 +861,7 @@ class Qwen2_5OmniToken2WavDiTModel(Qwen2_5OmniPreTrainedModel):
         num_steps=10,
         guidance_scale=0.5,
         sway_coefficient=-1.0,
+        integrator: str = "rk4",
         max_mel_frames: int | None = None,
     ):
         max_mel_frames = resolve_max_mel_frames(max_mel_frames, default=30000)
@@ -833,7 +921,7 @@ class Qwen2_5OmniToken2WavDiTModel(Qwen2_5OmniPreTrainedModel):
         if sway_coefficient is not None:
             time_embedding += sway_coefficient * (torch.cos(torch.pi / 2 * time_embedding) - 1 + time_embedding)
 
-        ode_solver = RungeKutta4ODESolver(function=ode_function, initial_value=initial_state)
+        ode_solver = _build_ode_solver(integrator, function=ode_function, initial_value=initial_state)
         solution_trajectory = ode_solver.integrate(time_embedding)
 
         generated_waveform = solution_trajectory[-1]
@@ -849,6 +937,7 @@ class Qwen2_5OmniToken2WavDiTModel(Qwen2_5OmniPreTrainedModel):
         num_steps: int = 10,
         guidance_scale: float = 0.5,
         sway_coefficient: float | None = -1.0,
+        integrator: str = "rk4",
     ) -> torch.Tensor:
         """
         Block-wise ODE sampling starting from provided initial state y0.
@@ -904,7 +993,7 @@ class Qwen2_5OmniToken2WavDiTModel(Qwen2_5OmniPreTrainedModel):
         if sway_coefficient is not None:
             time_embedding += sway_coefficient * (torch.cos(torch.pi / 2 * time_embedding) - 1 + time_embedding)
 
-        ode_solver = RungeKutta4ODESolver(function=ode_function, initial_value=initial_state)
+        ode_solver = _build_ode_solver(integrator, function=ode_function, initial_value=initial_state)
         solution_trajectory = ode_solver.integrate(time_embedding)
 
         generated_waveform = solution_trajectory[-1]
@@ -1014,6 +1103,7 @@ class Qwen2_5OmniToken2WavModel(Qwen2_5OmniPreTrainedModel):
         num_steps=10,
         guidance_scale=0.5,
         sway_coefficient=-1.0,
+        integrator: str = "rk4",
         max_mel_frames: int | None = None,
         **kwargs,
     ):
@@ -1026,6 +1116,7 @@ class Qwen2_5OmniToken2WavModel(Qwen2_5OmniPreTrainedModel):
             num_steps=num_steps,
             guidance_scale=guidance_scale,
             sway_coefficient=sway_coefficient,
+            integrator=integrator,
             max_mel_frames=max_mel_frames,
         ).to(self.code2wav_bigvgan_model.dtype)
 
@@ -1042,6 +1133,7 @@ class Qwen2_5OmniToken2WavModel(Qwen2_5OmniPreTrainedModel):
         code: torch.Tensor,
         y0: torch.Tensor,
         steps: int,
+        integrator: str = "rk4",
     ) -> torch.Tensor:
         """
         Block-wise DiT: generate mel from initial state y0 for the given code slice.
@@ -1056,6 +1148,7 @@ class Qwen2_5OmniToken2WavModel(Qwen2_5OmniPreTrainedModel):
             quantized_code=code,
             y0=y0,
             num_steps=steps,
+            integrator=integrator,
         )
         return mel.to(self.code2wav_bigvgan_model.dtype)
 
@@ -1075,6 +1168,7 @@ class Qwen2_5OmniToken2WavModel(Qwen2_5OmniPreTrainedModel):
         steps: int,
         prev_generated: torch.Tensor,
         finished: bool = False,
+        integrator: str = "rk4",
     ) -> tuple[torch.Tensor | None, torch.Tensor]:
         """Streaming per small chunk: returns (mel_or_None, audio_slice)."""
         start_index = max(i * self.chunk_size - self.past_cache_size, 0)
@@ -1093,6 +1187,7 @@ class Qwen2_5OmniToken2WavModel(Qwen2_5OmniPreTrainedModel):
             code=codec,
             y0=y0,
             steps=steps,
+            integrator=integrator,
         )
 
         # splice and vocode with 50Hz-style rules
@@ -1116,6 +1211,7 @@ class Qwen2_5OmniToken2WavModel(Qwen2_5OmniPreTrainedModel):
         steps: int,
         prev_generated: torch.Tensor | list[torch.Tensor],
         finished: bool = False,
+        integrator: str = "rk4",
     ) -> tuple[torch.Tensor | list[torch.Tensor], torch.Tensor]:
         """High-level chunk API aligning to qwen2_code2wav_dit signature."""
         if not isinstance(prev_generated, torch.Tensor):
@@ -1129,6 +1225,7 @@ class Qwen2_5OmniToken2WavModel(Qwen2_5OmniPreTrainedModel):
             steps=steps,
             prev_generated=prev_generated,
             finished=finished,
+            integrator=integrator,
         )
         return _mel if _mel is not None else prev_generated, audio
 
@@ -1179,6 +1276,66 @@ class Qwen2_5OmniToken2WavModel(Qwen2_5OmniPreTrainedModel):
 # ================= vLLM-style wrapper for Token2Wav =================
 
 
+# ---------------------------------------------------------------------------
+# ODE solver knobs (deploy YAML: stage-2 ``hf_overrides``)
+# ---------------------------------------------------------------------------
+
+#: Sentinel distinguishing "argument not passed" from an explicit value, so
+#: per-request arguments can still override the stage-level config.
+_UNSET: Any = object()
+
+_DEFAULT_DIT_NUM_STEPS = 10
+_DEFAULT_DIT_GUIDANCE_SCALE = 0.5
+_DEFAULT_DIT_SWAY_COEFFICIENT = -1.0
+_DEFAULT_DIT_INTEGRATOR = "rk4"
+
+
+def _resolve_dit_solver_knobs(hf_config: Any) -> dict[str, Any]:
+    """Resolve the DiT ODE-solver knobs from the stage's HF config.
+
+    The knobs arrive through the deploy YAML's per-stage ``hf_overrides``
+    block. Absent keys keep the released recipe (RK4 over a 10-point grid,
+    CFG 0.5, sway -1.0) so the default serving path stays bit-exact with
+    upstream. ``dit_num_steps`` counts grid points: N points = N-1 solver
+    intervals, and each interval costs 4 DiT evals on ``rk4``, 2 on
+    ``midpoint`` and 1 on ``euler``. ``dit_sway_coefficient: null`` disables
+    sway sampling.
+    """
+    num_steps = getattr(hf_config, "dit_num_steps", None)
+    if num_steps is None:
+        num_steps = _DEFAULT_DIT_NUM_STEPS
+    elif not isinstance(num_steps, int) or isinstance(num_steps, bool) or num_steps < 2:
+        raise ValueError(f"dit_num_steps must be an int >= 2, got {num_steps!r}")
+
+    guidance = getattr(hf_config, "dit_guidance_scale", None)
+    if guidance is None:
+        guidance = _DEFAULT_DIT_GUIDANCE_SCALE
+    elif not isinstance(guidance, (int, float)) or isinstance(guidance, bool) or guidance < 0:
+        raise ValueError(f"dit_guidance_scale must be a number >= 0, got {guidance!r}")
+    else:
+        guidance = float(guidance)
+
+    if "dit_sway_coefficient" in getattr(hf_config, "__dict__", {}):
+        sway = hf_config.dit_sway_coefficient
+        if sway is not None:
+            if not isinstance(sway, (int, float)) or isinstance(sway, bool):
+                raise ValueError(f"dit_sway_coefficient must be a number or null, got {sway!r}")
+            sway = float(sway)
+    else:
+        sway = _DEFAULT_DIT_SWAY_COEFFICIENT
+
+    integrator = getattr(hf_config, "dit_integrator", None) or _DEFAULT_DIT_INTEGRATOR
+    if not isinstance(integrator, str) or integrator not in _ODE_SOLVERS:
+        raise ValueError(f"dit_integrator must be one of {sorted(_ODE_SOLVERS)}, got {integrator!r}")
+
+    return {
+        "num_steps": num_steps,
+        "guidance_scale": guidance,
+        "sway_coefficient": sway,
+        "integrator": integrator,
+    }
+
+
 class Qwen2_5OmniToken2WavForConditionalGenerationVLLM(nn.Module, SupportsPP):
     logger = init_logger(__name__)
 
@@ -1194,6 +1351,31 @@ class Qwen2_5OmniToken2WavForConditionalGenerationVLLM(nn.Module, SupportsPP):
         super().__init__()
         # Expect hf_config to be Token2Wav config
         self.config = vllm_config.model_config.hf_config
+
+        # ODE solver knobs from the stage's hf_overrides block. Defaults keep
+        # the released recipe bit-identical: RK4, 10 grid points, CFG 0.5,
+        # sway -1.0.
+        knobs = _resolve_dit_solver_knobs(self.config)
+        self.dit_num_steps: int = knobs["num_steps"]
+        self.dit_guidance_scale: float = knobs["guidance_scale"]
+        self.dit_sway_coefficient: float | None = knobs["sway_coefficient"]
+        self.dit_integrator: str = knobs["integrator"]
+        if knobs != {
+            "num_steps": _DEFAULT_DIT_NUM_STEPS,
+            "guidance_scale": _DEFAULT_DIT_GUIDANCE_SCALE,
+            "sway_coefficient": _DEFAULT_DIT_SWAY_COEFFICIENT,
+            "integrator": _DEFAULT_DIT_INTEGRATOR,
+        }:
+            evals = (self.dit_num_steps - 1) * _ODE_SOLVERS[self.dit_integrator].EVALS_PER_INTERVAL
+            self.logger.info(
+                "Qwen2.5-Omni code2wav ODE solver overrides: num_steps=%d integrator=%s "
+                "guidance_scale=%s sway_coefficient=%s (%d DiT evals per solve)",
+                self.dit_num_steps,
+                self.dit_integrator,
+                self.dit_guidance_scale,
+                self.dit_sway_coefficient,
+                evals,
+            )
 
         # Initialize underlying HF Token2Wav model via registry
         self.token2wav = _vllm_init_vllm_registered_model(
@@ -1222,12 +1404,24 @@ class Qwen2_5OmniToken2WavForConditionalGenerationVLLM(nn.Module, SupportsPP):
         code: torch.Tensor,
         conditioning: torch.Tensor,
         reference_mel: torch.Tensor,
-        num_steps: int = 10,
-        guidance_scale: float = 0.5,
-        sway_coefficient: float = -1.0,
+        num_steps: Any = _UNSET,
+        guidance_scale: Any = _UNSET,
+        sway_coefficient: Any = _UNSET,
+        integrator: Any = _UNSET,
         intermediate_tensors: IntermediateTensors | None = None,
         **kwargs,
     ) -> torch.Tensor:
+        # Unset solver arguments fall back to the stage-level hf_overrides
+        # knobs (released defaults when no config is present); explicit
+        # per-request arguments still win.
+        if num_steps is _UNSET:
+            num_steps = self.dit_num_steps
+        if guidance_scale is _UNSET:
+            guidance_scale = self.dit_guidance_scale
+        if sway_coefficient is _UNSET:
+            sway_coefficient = self.dit_sway_coefficient
+        if integrator is _UNSET:
+            integrator = self.dit_integrator
         # Delegate to HF token2wav model
         return self.token2wav(
             code=code,
@@ -1236,6 +1430,7 @@ class Qwen2_5OmniToken2WavForConditionalGenerationVLLM(nn.Module, SupportsPP):
             num_steps=num_steps,
             guidance_scale=guidance_scale,
             sway_coefficient=sway_coefficient,
+            integrator=integrator,
             **kwargs,
         )
 
@@ -1326,13 +1521,16 @@ class Qwen2_5OmniToken2WavForConditionalGenerationVLLM(nn.Module, SupportsPP):
         reference_mel: torch.Tensor,
         code: torch.Tensor,
         y0: torch.Tensor,
-        steps: int,
+        steps: int | None = None,
     ) -> torch.Tensor:
         return self.token2wav(
             code=code,
             conditioning=conditioning,
             reference_mel=reference_mel,
-            num_steps=steps,
+            num_steps=self.dit_num_steps if steps is None else steps,
+            guidance_scale=self.dit_guidance_scale,
+            sway_coefficient=self.dit_sway_coefficient,
+            integrator=self.dit_integrator,
         )
 
     @torch.inference_mode()
@@ -1357,6 +1555,9 @@ class Qwen2_5OmniToken2WavForConditionalGenerationVLLM(nn.Module, SupportsPP):
             conditioning=conditioning,
             reference_mel=reference_mel,
             num_steps=steps,
+            guidance_scale=self.dit_guidance_scale,
+            sway_coefficient=self.dit_sway_coefficient,
+            integrator=self.dit_integrator,
         )
         return None, mel
 

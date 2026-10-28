@@ -66,6 +66,22 @@ stages:
     enable_flashinfer_autotune: false
     async_scheduling: false
     devices: "0"
+    # ODE solver knobs for the code2wav flow-matching DiT. All commented =
+    # released recipe (RK4 over a 10-point grid = 36 DiT evals per solve,
+    # CFG 0.5, sway -1.0), bit-exact with upstream. The knobs must be nested
+    # under token2wav_config: vLLM applies hf_overrides to the stage's
+    # top-level config, and the DiT reads the nested token2wav config.
+    # dit_num_steps counts grid points: N points = N-1 intervals, each
+    # costing 4 DiT evals on rk4, 2 on midpoint, 1 on euler. Reduced-step
+    # values change the output audio and must pass quality validation
+    # (WER / speaker-SIM / UTMOS) before serving — see the ode-step-reduction
+    # plan.
+    #hf_overrides:
+    #  token2wav_config:
+    #    dit_num_steps: 7        # 6 intervals x 4 evals = 24 evals/solve (1.50x)
+    #    dit_integrator: rk4     # rk4 | midpoint | euler
+    #    dit_guidance_scale: 0.5
+    #    dit_sway_coefficient: -1.0  # null disables sway sampling
     default_sampling_params:
       temperature: 0.0
       top_p: 1.0
