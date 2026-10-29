@@ -43,6 +43,7 @@ from vllm_omni.diffusion.offloader.config import OffloadStrategy, resolve_offloa
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+from vllm_omni.errors import OmniClientError
 from vllm_omni.experimental.ar_diffusion.capability import (
     ARDiffusionCrossAttentionKVSpec,
     ARDiffusionKVBranchSpec,
@@ -243,6 +244,13 @@ class SelfForcingPipeline(
         spatial = self.vae_scale_factor_spatial
         latent_height = self._ar_height // spatial
         latent_width = self._ar_width // spatial
+        # Step execution serves this one geometry, so a tiling VAE is refused here, at startup, rather than
+        # decoding each chunk without the temporal cache and leaving seams between streamed blocks.
+        if self._vae_would_tile(latent_height, latent_width):
+            raise ValueError(
+                "Self-Forcing step execution decodes each chunk through the streaming VAE, which does not tile; "
+                "serve it without --vae-use-tiling."
+            )
         config = self.transformer.config
         return ARDiffusionKVCacheSpec(
             num_layers=config.num_layers,
@@ -293,53 +301,60 @@ class SelfForcingPipeline(
             raise ValueError("Self-Forcing supports a single prompt request, not request batching.")
         sampling = req.sampling_params
         if int(sampling.num_outputs_per_prompt or 1) != 1:
-            raise ValueError("Self-Forcing requires num_outputs_per_prompt=1.")
+            raise OmniClientError("Self-Forcing requires num_outputs_per_prompt=1.")
         generator = getattr(sampling, "generator", None)
         if not isinstance(generator, torch.Generator):
             raise ValueError("Self-Forcing requires one runner-provided torch.Generator.")
         if getattr(sampling, "latents", None) is not None:
-            raise ValueError("Self-Forcing does not support caller-provided latents.")
+            raise OmniClientError("Self-Forcing does not support caller-provided latents.")
         if (sampling.guidance_scale or 0.0) > 1.0:
-            raise ValueError("Self-Forcing is a distilled DMD generator without classifier-free guidance.")
+            raise OmniClientError("Self-Forcing is a distilled DMD generator without classifier-free guidance.")
 
         prompt_value = req.prompts[0]
         if isinstance(prompt_value, dict):
             if prompt_value.get("multi_modal_data"):
-                raise ValueError("Self-Forcing is text-to-video and accepts no multi_modal_data.")
+                raise OmniClientError("Self-Forcing is text-to-video and accepts no multi_modal_data.")
             if prompt_value.get("negative_prompt"):
-                raise ValueError("Self-Forcing does not use a negative prompt.")
+                raise OmniClientError("Self-Forcing does not use a negative prompt.")
             prompt_value = prompt_value.get("prompt")
         if not isinstance(prompt_value, str) or not prompt_value.strip():
-            raise ValueError("prompt must contain non-empty text.")
+            raise OmniClientError("prompt must contain non-empty text.")
 
         num_inference_steps = getattr(sampling, "num_inference_steps", None)
         if num_inference_steps not in (None, len(SELF_FORCING_DMD_TIMESTEPS)):
-            raise ValueError(
+            raise OmniClientError(
                 f"num_inference_steps must be {len(SELF_FORCING_DMD_TIMESTEPS)} for the Self-Forcing DMD "
                 f"timesteps {list(SELF_FORCING_DMD_TIMESTEPS)}, got {num_inference_steps}."
             )
         max_sequence_length = getattr(sampling, "max_sequence_length", None)
         if max_sequence_length not in (None, _MAX_SEQUENCE_LENGTH):
-            raise ValueError(f"max_sequence_length must be {_MAX_SEQUENCE_LENGTH}.")
+            raise OmniClientError(f"max_sequence_length must be {_MAX_SEQUENCE_LENGTH}.")
 
         height = getattr(sampling, "height", None) or SELF_FORCING_DEFAULT_HEIGHT
         width = getattr(sampling, "width", None) or SELF_FORCING_DEFAULT_WIDTH
         divisor = self.vae_scale_factor_spatial * self.transformer.config.patch_size[1]
         if height % divisor or width % divisor:
-            raise ValueError(f"height and width must be multiples of {divisor}, got {height}x{width}.")
+            raise OmniClientError(f"height and width must be multiples of {divisor}, got {height}x{width}.")
         if height * width > _MAX_PIXEL_AREA:
-            raise ValueError("height * width must not exceed the trained 480 * 832 pixel area.")
+            raise OmniClientError("height * width must not exceed the trained 480 * 832 pixel area.")
 
         num_frames = getattr(sampling, "num_frames", None)
         if num_frames in (None, 1):
+            # 1 is the generic sampling default, so it stands for "unset"; one frame is not an AR block anyway.
+            if num_frames == 1:
+                logger.warning_once(
+                    "Self-Forcing treats num_frames=1, the generic sampling default, as unset and generates its "
+                    "%d-frame default; pass num_frames to choose the clip length.",
+                    SELF_FORCING_DEFAULT_NUM_FRAMES,
+                )
             num_frames = SELF_FORCING_DEFAULT_NUM_FRAMES
         temporal = self.vae_scale_factor_temporal
         if isinstance(num_frames, bool) or not isinstance(num_frames, int) or (num_frames - 1) % temporal:
-            raise ValueError(f"num_frames must satisfy (num_frames - 1) % {temporal} == 0, got {num_frames!r}.")
+            raise OmniClientError(f"num_frames must satisfy (num_frames - 1) % {temporal} == 0, got {num_frames!r}.")
         num_latent_frames = (num_frames - 1) // temporal + 1
         block_frames = self.transformer.config.num_frames_per_block
         if num_latent_frames % block_frames:
-            raise ValueError(
+            raise OmniClientError(
                 f"num_frames={num_frames} maps to {num_latent_frames} latent frames, which is not a whole number "
                 f"of {block_frames}-frame AR blocks."
             )
@@ -616,13 +631,13 @@ class SelfForcingPipeline(
             )
         return self._streaming_decoder_instance
 
-    def _vae_would_tile(self, latents: torch.Tensor) -> bool:
+    def _vae_would_tile(self, latent_height: int, latent_width: int) -> bool:
         if not bool(getattr(self.vae, "use_tiling", False)):
             return False
         compression = int(getattr(self.vae, "spatial_compression_ratio", None) or self.vae_scale_factor_spatial)
         min_height = int(getattr(self.vae, "tile_sample_min_height", None) or 0) // compression
         min_width = int(getattr(self.vae, "tile_sample_min_width", None) or 0) // compression
-        return bool(latents.shape[-2] > min_height or latents.shape[-1] > min_width)
+        return latent_height > min_height or latent_width > min_width
 
     def _release_streaming_decode_state(self, session_id: str) -> None:
         state = self._streaming_decode_states.pop(session_id, None)
@@ -632,8 +647,6 @@ class SelfForcingPipeline(
     def _decode_chunk_to_pixels(self, latents: torch.Tensor, *, session_id: str) -> np.ndarray:
         """Decode one block through the session's temporal cache so chunks join seamlessly."""
         vae_latents = self._denormalize_latents(latents)
-        if self._vae_would_tile(vae_latents):
-            return _uint8_frames(self.vae.decode(vae_latents, return_dict=False)[0])
         decoder = self._streaming_decoder()
         state = self._streaming_decode_states.get(session_id)
         if state is None:
@@ -658,9 +671,9 @@ class SelfForcingPipeline(
         )
         inputs = self._parse_request(req)
         if ARDiffusionTickRequest.from_extra_args(state.sampling.extra_args) is not None:
-            raise ValueError("Self-Forcing step execution does not accept AR-Diffusion ticks.")
+            raise OmniClientError("Self-Forcing step execution does not accept AR-Diffusion ticks.")
         if (inputs.height, inputs.width) != (self._ar_height, self._ar_width):
-            raise ValueError(
+            raise OmniClientError(
                 f"Self-Forcing step execution resolution must match the cache geometry "
                 f"{self._ar_height}x{self._ar_width}."
             )
@@ -755,8 +768,12 @@ class SelfForcingPipeline(
             ar=self._step_block_context(state),
             start_frame=int(state.extra["start_frame"]),
         )
-        inputs: _SelfForcingRequestInputs = state.extra["inputs"]
+        # The counters move with the commit, so the session's K/V and its chunk indices never disagree; a
+        # decode failure below finishes the request, and the runner then releases the session.
         completed_chunk_index = state.chunk_index
+        self._ar_sessions[state.request_id].next_chunk_index += 1
+        state.chunk_index += 1
+        inputs: _SelfForcingRequestInputs = state.extra["inputs"]
         if inputs.output_type == "latent":
             payload: dict[str, Any] = {"latents": state.latents}
         else:
@@ -766,8 +783,6 @@ class SelfForcingPipeline(
             request_id=state.request_id,
             chunk_index=completed_chunk_index,
         )
-        self._ar_sessions[state.request_id].next_chunk_index += 1
-        state.chunk_index += 1
         return DiffusionOutput(
             output={"payload": payload, "metadata": {"ar_diffusion": metadata.to_dict()}},
             stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,

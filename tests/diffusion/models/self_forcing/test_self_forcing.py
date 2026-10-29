@@ -245,6 +245,20 @@ def test_kv_cache_spec_describes_the_transformer_and_its_decoder_state() -> None
 
 
 @pytest.mark.cpu
+@pytest.mark.usefixtures("native_ops")
+def test_step_execution_refuses_a_vae_that_would_tile_its_geometry() -> None:
+    """Chunks decoded without the streaming VAE's temporal cache would leave seams between blocks."""
+    pipeline = _pipeline()
+    pipeline.vae.use_tiling = True
+    # Wan's default 256-pixel tile is 32 latents, so 832x480 tiles as soon as tiling is on.
+    with pytest.raises(ValueError, match="--vae-use-tiling"):
+        pipeline.ar_diffusion_kv_cache_spec()
+    # A tile that holds the whole frame never splits it, so step execution stays available.
+    pipeline.vae.tile_sample_min_height, pipeline.vae.tile_sample_min_width = 480, 832
+    assert pipeline.ar_diffusion_kv_cache_spec().frames_per_block == 3
+
+
+@pytest.mark.cpu
 def test_stepwise_deploy_streams_the_default_geometry_on_the_ar_diffusion_engine() -> None:
     """Without the AR-Diffusion engine no session is bound and every streamed request fails."""
     from tests.helpers.stage_config import get_deploy_config_path
@@ -298,6 +312,9 @@ def test_request_defaults_to_the_distilled_81_frame_clip() -> None:
     ],
 )
 def test_request_rejects_settings_the_dmd_generator_cannot_honor(overrides, message) -> None:
+    """Client errors, so the worker's rejection reaches the caller as a 400 rather than a 500."""
+    from vllm_omni.errors import OmniClientError
+
     pipeline = _pipeline()
-    with pytest.raises(ValueError, match=message):
+    with pytest.raises(OmniClientError, match=message):
         pipeline._parse_request(_request(**overrides))

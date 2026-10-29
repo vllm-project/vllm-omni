@@ -1025,6 +1025,28 @@ def _run(tmp_path: Path, sp, tp, mode, dtype, batch):
 
 
 @pytest.mark.parallel
+# 832x480 latents give 1560 tokens per frame, so a three-frame chunk is 4680 tokens: not a multiple of 16 and
+# hence not a legal FA2 page. The direct path then pages at 16 tokens and pads the tail past ``seq_lens``.
+@hardware_test(res={"cuda": "L4"})
+@pytest.mark.parametrize("visible_chunks", [1, 3], ids=["first-chunk", "with-history"])
+def test_direct_path_attends_a_chunk_that_is_not_a_legal_page(visible_chunks: int) -> None:
+    from vllm_omni.diffusion.models.lingbot_world.transformer import _paged_direct_attention
+
+    torch.manual_seed(42)
+    heads, head_dim, chunk = 4, 64, 3 * 1560
+    query = torch.randn(1, chunk, heads, head_dim, device="cuda", dtype=torch.bfloat16)
+    key, value = (
+        torch.randn(1, visible_chunks * chunk, heads, head_dim, device="cuda", dtype=torch.bfloat16) for _ in range(2)
+    )
+
+    output = _paged_direct_attention(query, key, value, chunk_tokens=chunk, softmax_scale=head_dim**-0.5)
+
+    expected = torch.nn.functional.scaled_dot_product_attention(*(t.transpose(1, 2) for t in (query, key, value)))
+    expected = expected.transpose(1, 2).float()
+    error = (output.float() - expected).norm() / expected.norm()
+    assert error <= 1e-2, f"relative L2 {error.item():.3g}"
+
+
 @hardware_test(res={"cuda": "L4"}, num_cards=2)
 def test_sp2_direct_matches_sp1_fp32(tmp_path):
     _run(tmp_path, 2, 1, "direct", torch.float32, 2)
