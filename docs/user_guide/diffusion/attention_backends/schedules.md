@@ -55,7 +55,11 @@ Each S2V clip and each H3 seed/continuation window restarts at step 0.
 Prompt encoding and decoding run with the base configuration.
 HunyuanImage-3.0 computes the prompt K/V inside the step-0 DiT forward with the
 step-0 profile and reuses it on later steps; only the AR KV-reuse prefill runs
-with the base configuration.
+with the base configuration. Deeper layers' prompt K/V also depend on earlier
+layers' step-0 attention outputs, so on this model the step-0 profile affects
+every step, not only step 0. A range that starts at step 0 with an approximate
+profile therefore also changes the later steps; the server logs this at startup
+when its default schedule does so.
 
 ## Server configuration
 

@@ -797,3 +797,24 @@ def test_image_attention_mask_check_rejects_candidates_without_mask_support():
     assert check(masked) is None
     reason = check(plain)
     assert reason is not None and "4D attention mask" in reason
+
+
+@pytest.mark.parametrize(
+    ("default", "logged"),
+    [
+        ((AttentionScheduleRange(start=0, end=2, profile="approx"),), True),
+        ((AttentionScheduleRange(start=2, end=None, profile="approx"),), False),
+        ((), False),
+    ],
+    ids=["covers-step-0", "starts-later", "empty"],
+)
+def test_startup_notes_a_default_schedule_that_covers_step_0(default, logged, caplog, monkeypatch):
+    # vllm loggers do not propagate to the root logger that caplog listens on.
+    monkeypatch.setattr(hy3_module.logger, "handlers", [*hy3_module.logger.handlers, caplog.handler])
+    schedule = SimpleNamespace(default=default)
+    with caplog.at_level("INFO", logger=hy3_module.logger.name):
+        hy3_module._log_step0_profile_reuse(SimpleNamespace(diffusion_attention_schedule=schedule))
+        hy3_module._log_step0_profile_reuse(SimpleNamespace(diffusion_attention_schedule=None))
+    messages = [record.getMessage() for record in caplog.records if "step-0 prompt K/V" in record.getMessage()]
+    assert len(messages) == (1 if logged else 0)
+    assert all("profile 'approx'" in message for message in messages)
