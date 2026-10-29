@@ -380,6 +380,8 @@ def clear_scheduled_denoise_step_on_exit(total_steps: int | None):
     ``total_steps`` is the result of ``begin_scheduled_denoise``. Work after the loop, such as VAE
     decode, runs outside the denoise schedule, and a forward that raises mid-loop leaves no step
     published either. Without a schedule (None) the context is left as the loop left it.
+    Unlike HunyuanImage-3.0's ``_clear_denoise_progress_on_exit``, which restores the timestep and
+    total on every run, this keeps unscheduled Wan2.2 runs unchanged; do not merge the two.
     """
     try:
         yield
