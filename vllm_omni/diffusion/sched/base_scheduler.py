@@ -55,6 +55,7 @@ BatchSamplingParamsKey = StepBatchSamplingParamsKey | RequestBatchSamplingParams
 # they must be resolved separately from the bulk lookup.
 _STEP_BATCH_SAMPLING_PARAMS_KEY_FIELD_NAMES = frozenset(field.name for field in fields(StepBatchSamplingParamsKey)) - {
     "attention_schedule",
+    "attention_schedule_explicit",
     "condition_key",
     "lora_int_id",
     "use_step_execution",
@@ -774,6 +775,7 @@ class BaseScheduler(ABC):
             attention_schedule=resolve_request_attention_schedule(
                 sampling, getattr(self.od_config, "diffusion_attention_schedule", None)
             ),
+            attention_schedule_explicit=sampling.attention_schedule is not None,
             condition_key=getattr(request, "batch_compatibility_key", None),
             lora_int_id=lora_request.lora_int_id if lora_request is not None else None,
             use_step_execution=getattr(request, "use_step_execution", True),

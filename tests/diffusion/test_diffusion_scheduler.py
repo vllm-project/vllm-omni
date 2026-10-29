@@ -312,8 +312,9 @@ def _make_scheduled_request(req_id: str, schedule: object) -> OmniDiffusionReque
 
 # Two request schedules, and whether their requests may share a batch. None
 # inherits the service default ([0, 1) -> sparse) and [] disables it, so those
-# two stay apart, while an inherited default and the same ranges sent
-# explicitly resolve to one schedule and share a batch.
+# two stay apart. An inherited default and the same ranges sent explicitly
+# resolve to one schedule but stay apart too: only an explicit schedule is
+# checked against the step count. Equal explicit ranges share a batch.
 _ATTENTION_SCHEDULE_KEY_CASES = [
     pytest.param(
         [{"start": 0, "end": 2, "profile": "sparse"}],
@@ -329,7 +330,13 @@ _ATTENTION_SCHEDULE_KEY_CASES = [
     ),
     pytest.param(None, [], False, id="inherit-and-disable"),
     pytest.param(None, None, True, id="both-inherit"),
-    pytest.param(None, [{"start": 0, "end": 1, "profile": "sparse"}], True, id="inherit-and-explicit-default"),
+    pytest.param(None, [{"start": 0, "end": 1, "profile": "sparse"}], False, id="inherit-and-explicit-default"),
+    pytest.param(
+        [{"start": 0, "end": 1, "profile": "sparse"}],
+        [{"start": 0, "end": 1, "profile": "sparse"}],
+        True,
+        id="both-explicit-equal",
+    ),
 ]
 
 
