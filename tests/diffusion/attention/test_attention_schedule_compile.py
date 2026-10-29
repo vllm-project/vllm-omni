@@ -513,6 +513,20 @@ def test_autograd_keeps_the_eager_boundary(compile_env):
     _require_attention_outside_graphs(pipeline.counter, graphs=4)
 
 
+def test_scheduler_paged_kv_keeps_the_eager_boundary(compile_env):
+    # The op declares no mutation, so a layer that writes the Scheduler's paged cache stays eager.
+    pipeline = _pipeline(AttentionScheduleConfig(profiles={"approx": _trtllm(0.5)}), compiled=False)
+    attn = pipeline.model.blocks[0].attn
+    query = torch.randn(1, _SEQ, _HEADS, _HEAD_SIZE)
+    assert attn._schedule_op_eligible(query, query, query)
+
+    attn._scheduler_paged_kv = True
+    attn.paged_kv_cache_role = "primary"
+    assert not attn._schedule_op_eligible(query, query, query)
+    attn.paged_kv_cache_role = None
+    assert attn._schedule_op_eligible(query, query, query)
+
+
 def test_repeated_blocks_share_one_graph_under_dynamic_shapes(compile_env):
     pipeline = _pipeline(AttentionScheduleConfig(profiles={"approx": _trtllm(0.5)}), dynamic=True, blocks=6)
 
