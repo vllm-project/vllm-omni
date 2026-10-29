@@ -3887,8 +3887,12 @@ class MiniMaxH3Pipeline(
         # Under a schedule, a packed forward selects one profile from the progress published above,
         # so it may only carry requests that all select that profile: one schedule, one progress.
         # _packed_batch_supported() then checks the selected profile's backends, not the baseline.
+        # Sigma windows split like step ranges. The resolved windows are in the step batch key, so
+        # differing windows cannot reach one batch; the check mirrors the step-range one.
         schedule_splits_batch = scheduled and (
-            not uniform_progress or len({state.attention_schedule for state in batch_states}) > 1
+            not uniform_progress
+            or len({state.attention_schedule for state in batch_states}) > 1
+            or len({state.attention_sigma_schedule for state in batch_states}) > 1
         )
 
         pdd = isinstance(self._fasth3_checkpoint, FastH3OmniCheckpointSpec)

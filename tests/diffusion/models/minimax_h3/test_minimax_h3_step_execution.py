@@ -1053,6 +1053,35 @@ def test_packed_gate_sees_the_profile_selected_for_the_published_step(schedule, 
     assert [(entry[3], entry[-1]) for entry in model.progress] == ([(profile, 2)] if packed else [(profile, 1)] * 2)
 
 
+@pytest.mark.parametrize("same_step", [True, False], ids=["one-progress", "mixed-progress"])
+def test_sigma_scheduled_step_batch_packs_only_at_one_step_and_sigma(same_step):
+    """Under sigma windows, requests at one step and sigma select one profile and share a packed forward;
+    requests at different steps fall back to one forward each under their own sigma."""
+    windows = parse_attention_sigma_schedule([{"low": 0.0, "high": 1.0, "profile": "sparse"}])
+    seen_sigmas = []
+
+    class _SigmaModel(_ProgressRecordingModel):
+        def __call__(self, **kwargs):
+            seen_sigmas.append(get_forward_context().denoise_sigma)
+            return super().__call__(**kwargs)
+
+    model = _SigmaModel()
+    states = _same_progress_states(model, [(), ()])
+    for state in states:
+        state.attention_sigma_schedule = windows
+    if not same_step:
+        states[1].step_index = 2
+    with set_forward_context(), bind_attention_schedule(None, windows):
+        _step_pipeline(model).denoise_step(InputBatch.make_batch(states), states=states)
+
+    sigmas = states[0].extra[pipeline_minimax_h3._STEP_SIGMAS_VIDEO]
+    if same_step:
+        assert [(entry[0], entry[3], entry[-1]) for entry in model.progress] == [(1, "sparse", 2)]
+    else:
+        assert [(entry[0], entry[3], entry[-1]) for entry in model.progress] == [(1, "sparse", 1), (2, "sparse", 1)]
+        assert seen_sigmas == pytest.approx([float(sigmas[1]), float(sigmas[2])])
+
+
 def test_locked_driving_audio_is_clean_and_unchanged_during_denoising():
     from vllm_omni.diffusion.models.minimax_h3.denoise_loop import minimax_h3_denoise_loop
 
