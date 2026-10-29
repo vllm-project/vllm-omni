@@ -32,9 +32,6 @@ from vllm_omni.core.sched.omni_scheduling_coordinator import OmniSchedulingCoord
 from vllm_omni.core.sched.output import OmniNewRequestData
 from vllm_omni.data_entry_keys import OmniPayloadStruct, to_dict, to_struct
 from vllm_omni.distributed.omni_connectors.connectors.shm_connector import SharedMemoryConnector
-from vllm_omni.distributed.omni_connectors.model_runner.omni_connector_payload_transport import (
-    _OmniConnectorPayloadTransportMixin as Transport,
-)
 from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import OmniChunkTransferAdapter
 from vllm_omni.engine.serialization import serialize_additional_information
 from vllm_omni.model_executor.models.chatterbox.chatterbox_s3gen import SAMPLES_PER_FRAME, S3GenDecoder
@@ -432,14 +429,17 @@ def test_an_utterance_ending_on_a_chunk_boundary_decodes_to_its_own_length(
     assert decoder.streams == {}
 
 
-def receive_on_the_runner_side(terminal: OmniPayloadStruct, stage1_request: OmniRequest) -> None:
-    """Model Runner V2's native data plane: its transport's metadata extraction and the scheduler's update."""
+def receive_on_the_runner_side(terminal: OmniPayloadStruct, stage1_request: OmniRequest, stage_configs: list) -> None:
+    """Model Runner V2's native data plane: stage 1's metadata extraction and the scheduler's update."""
     payload = to_dict(terminal)
-    assert not Transport._payload_is_consumable(payload)
+    plane = OmniRunnerDataPlane(vllm_config=stage_configs[1], model_config=stage_configs[1].model_config)
+    try:
+        assert not plane._payload_is_consumable(payload)
+        update = plane._extract_scheduling_metadata_update(payload)
+    finally:
+        plane.close()
     coordinator = OmniSchedulingCoordinator(stage_id=1)
-    coordinator.update_request_metadata(
-        {"r": stage1_request}, {"r": Transport._extract_scheduling_metadata(payload)}, model_mode="generation"
-    )
+    coordinator.update_request_metadata({"r": stage1_request}, {"r": update})
     assert "r" in coordinator.input_terminal_req_ids
 
 
@@ -486,7 +486,7 @@ def test_an_utterance_with_no_speech_tokens_ends_with_explicit_empty_codes(
     )
 
     if receiving_side == "runner-side":
-        receive_on_the_runner_side(terminal, stage1_request)
+        receive_on_the_runner_side(terminal, stage1_request, stage_configs)
     else:
         receive_on_the_scheduler_side(terminal, stage1_request, stage_configs, receiver)
 
