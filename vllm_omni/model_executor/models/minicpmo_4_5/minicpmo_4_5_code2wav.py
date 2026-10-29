@@ -533,6 +533,12 @@ class MiniCPMO45Code2Wav(nn.Module):
         self._onset_merge = read_bool_flag(extra, "cfm_onset_merge", False)
         self._cross_turn_buckets = read_bool_flag(extra, "cfm_cross_turn_buckets", False)
         self._npu_cross_reference_batching = read_bool_flag(extra, "cfm_npu_cross_reference_batching", False)
+        if self._npu_cross_reference_batching and self._min_batch_size != 1:
+            logger.warning(
+                "cfm_npu_cross_reference_batching requires code2wav_min_batch_size=1, but got %d; "
+                "NPU cross-reference batching will remain inactive and existing dispatch will be used",
+                self._min_batch_size,
+            )
         self._row_offset_merge = self._cfm_graph_config["row_offset_merge"]
         self._precapture_empty_cache = read_bool_flag(extra, "cfm_precapture_empty_cache", False)
 

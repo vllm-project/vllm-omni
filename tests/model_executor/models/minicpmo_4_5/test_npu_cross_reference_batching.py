@@ -83,6 +83,27 @@ def test_invalid_config_fails_at_construction():
         MiniCPMO45Code2Wav(vllm_config=config)
 
 
+@pytest.mark.parametrize("enabled,minimum", [(False, 1), (False, 2), (True, 1), (True, 2)])
+def test_minimum_batch_conflict_warns_at_construction(enabled, minimum, monkeypatch):
+    warning = Mock()
+    monkeypatch.setattr("vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_code2wav.logger.warning", warning)
+    config = _config(minimum=minimum)
+    config.model_config.stage_connector_config["extra"]["cfm_npu_cross_reference_batching"] = enabled
+    model = MiniCPMO45Code2Wav(vllm_config=config)
+    assert model._min_batch_size == minimum
+    assert model._npu_cross_reference_batching is enabled
+    if enabled and minimum != 1:
+        warning.assert_called_once()
+        message, value = warning.call_args.args
+        assert "requires code2wav_min_batch_size=1" in message
+        assert "will remain inactive" in message
+        assert value == minimum
+        model.backend = SimpleNamespace()
+        assert not model._npu_cross_reference_active()
+    else:
+        warning.assert_not_called()
+
+
 @pytest.mark.parametrize("enabled", [False, True])
 def test_single_request_keeps_original_dispatch_without_npu_metadata(enabled, monkeypatch):
     model, _, _ = _candidate(enabled)
@@ -441,10 +462,14 @@ def test_authoritative_shape_group_rejects_incompatible_rows(change):
     assert MiniCPMO45Code2Wav._npu_same_shape_groups(items, states, features, cross_turn=False) == [[0], [1]]
 
 
-def test_direct_uniform_dispatch_rejects_mismatch_before_backend_call():
+@pytest.mark.parametrize("mismatch", ["tokens", "last_chunk"])
+def test_direct_uniform_dispatch_rejects_mismatch_before_backend_call(mismatch):
     model, _, _ = _candidate()
     items, states, features = _prepared_rows()
-    items[1] = replace(items[1], tokens=torch.tensor([1, 2, 3]))
+    if mismatch == "tokens":
+        items[1] = replace(items[1], tokens=torch.tensor([1, 2, 3]))
+    else:
+        items[1] = replace(items[1], last_chunk=not items[0].last_chunk)
     model.backend.decode_batch = Mock(side_effect=AssertionError("must not run"))
     with pytest.raises(RuntimeError, match="npu_cross_reference_shape_mismatch"):
         model._decode_rows(items, states, features, ragged=False)
