@@ -44,8 +44,8 @@ validated variant. The original FastWAM LIBERO checkpoint (`yuanty/fastwam`,
 
 | Profile | Deploy config | Status |
 | --- | --- | --- |
-| Eager, bfloat16 | `cae_fastwam_libero.yaml` | TODO(validation): qualify on MI355X |
-| Regional `torch.compile`, bfloat16 | `cae_fastwam_libero.yaml` with `enforce_eager: false`, `diffusion_compile_dynamic: false` | Configuration-only until qualified on MI355X (TODO(validation)) |
+| Eager, bfloat16 | `cae_fastwam_libero.yaml` | Qualified on MI355X: LIBERO 97.40 % (10 steps), 97.45 % (4 steps) |
+| Regional `torch.compile`, bfloat16 | `cae_fastwam_libero.yaml` with `enforce_eager: false`, `diffusion_compile_granularity: regional`, `diffusion_compile_dynamic: false` | Qualified on MI355X: LIBERO 97.20 % (10 steps); 128 ms vs 240 ms eager per chunk |
 | Original FastWAM checkpoint | `fastwam_libero.yaml` | Configuration-only |
 
 ## Weights
@@ -79,15 +79,15 @@ output head in `policy.pt` is not loaded (action-only inference never uses it).
 - Accelerator: AMD Instinct MI355X, 288 GB HBM3E
 - Number of devices: 1
 - Interconnect: not used (single device)
-- Qualification scope: TODO(validation)
+- Qualification scope: one MI355X (gfx950), batch 1, bfloat16, eager and regional `torch.compile`, 10 and 4 denoising steps
 
 ## Software environment
 
-- OS: TODO(validation)
-- Python: TODO(validation)
-- Driver / runtime: TODO(validation) (ROCm version)
-- vLLM version: TODO(validation)
-- vLLM-Omni version or commit: TODO(validation)
+- OS: Ubuntu 22.04.5 (`vllm/vllm-openai-rocm:v0.32.0` image), host kernel 6.8.0
+- Python: 3.12.15
+- Driver / runtime: amdgpu 6.14.14, ROCm 7.2.3 (HIP 7.2.53211), PyTorch 2.13.0
+- vLLM version: 0.32.0
+- vLLM-Omni version or commit: `cbf35fb` plus this change
 
 ## Command
 
@@ -132,10 +132,13 @@ values in `{-1.0, 1.0}`.
 | Check | Result |
 | --- | --- |
 | Parity vs the reference eager path (CPU, bfloat16, seed 42, 10 steps) | Bitwise equal at every stage: VAE latents, umT5 context, all 10 velocity predictions, action chunk |
-| Parity vs the reference eager path on MI355X | TODO(validation) |
-| LIBERO success rate (4 suites x 10 tasks x 50 trials, seed 42, 10 steps), eager | TODO(validation) (published GEAK-kernel result: 97.28 ± 0.20 %) |
-| Latency, B=1, 10 / 4 steps, eager and regional compile | TODO(validation) |
-| Peak device memory | TODO(validation) |
+| Parity vs the reference eager path on MI355X (same PyTorch build, 4 suites x 4 observations x {10, 4} steps) | Bitwise equal (32/32 chunks) with `torch.use_deterministic_algorithms(True)`. With default kernels 17/32 are bitwise and the rest differ by up to 3.1e-2 (env units), because one Wan VAE encoder convolution is not run-to-run deterministic on ROCm; the reference implementation varies the same way |
+| LIBERO success rate (4 suites x 10 tasks x 50 trials, seed 42, served over OpenPI, CPU MuJoCo), eager, 10 steps | 97.40 % (1948/2000): spatial 96.4, object 99.6, goal 96.2, libero_10 97.4 (published GEAK-kernel result: 97.28 ± 0.20 %) |
+| Same, eager, 4 steps | 97.45 % (1949/2000): spatial 96.6, object 99.8, goal 97.0, libero_10 96.4 (published GEAK: 97.33 ± 0.26 %) |
+| Same, regional `torch.compile`, 10 steps | 97.20 % (1944/2000): spatial 97.0, object 99.4, goal 95.8, libero_10 96.6 |
+| Latency, B=1, `infer_action` with cached prompt context, median of 7 interleaved rounds x 20 calls | Eager 240 ms (10 steps) / 113 ms (4 steps); regional `torch.compile` 128 ms / 61 ms; reference eager 271 ms / 128 ms |
+| OpenPI round trip, one client, idle server (256x256 frames) | Eager 263 ms (10 steps) / 136 ms (4 steps); regional `torch.compile` 148 ms / 82 ms |
+| Peak device memory (allocated, one policy incl. umT5) | 20.4 GiB |
 
 ## Notes
 
@@ -151,7 +154,7 @@ values in `{-1.0, 1.0}`.
 | Feature | Status |
 | --- | --- |
 | Eager execution | ✅︎ (default) |
-| Regional `torch.compile` | Configuration-only: wired up (opt-in, see Command) but not yet verified on any device |
+| Regional `torch.compile` | ✅︎ (opt-in, see Command); qualified on MI355X |
 | Request batching | ✗ (`max_num_seqs: 1`) |
 | Cache acceleration (cache-dit / TeaCache) | ✗ (not applicable to the action loop) |
 | Tensor / sequence / CFG parallelism | ✗ |

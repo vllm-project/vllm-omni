@@ -36,7 +36,7 @@ th {
 | `Praxis1Pipeline` | Praxis-1 DROID / YAM (native robot policy) | `runwayml/praxis-1-droid`, `runwayml/praxis-1-yam` (local checkpoint directory) | ✅︎ | | | | [Recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/Runway/Praxis-1.md) · [Model guide](praxis1.md) |
 | `Alpamayo2SuperPolicy` + `Alpamayo2SuperPipeline` | Alpamayo 2 Super | `nvidia/Alpamayo2-Super` | ✅︎ | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/NVIDIA/Alpamayo2-Super-H200.md) |
 | `Gr00tN1d7Pipeline` | GR00T N1.7 | `nvidia/GR00T-N1.7-3B` | ✅︎ | | | ✅︎ | — |
-| `FastWAMPipeline` | FastWAM family (CAE-FastWAM; original FastWAM checkpoints not yet validated) | `amd/CAE-FastWAM` | | | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/AMD/CAE-FastWAM-MI355X.md) |
+| `FastWAMPipeline` | FastWAM family (CAE-FastWAM; original FastWAM checkpoints not yet validated) | `amd/CAE-FastWAM` | | ✅︎ | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/AMD/CAE-FastWAM-MI355X.md) |
 | `HunyuanImage3ForCausalMM` | HunyuanImage3.0 (DiT-only) | `tencent/HunyuanImage-3.0`, `tencent/HunyuanImage-3.0-Instruct` | ✅︎ | ✅︎ | ✅︎ | ✅︎ | — |
 | `QwenImagePipeline` | Qwen-Image | `Qwen/Qwen-Image` | ✅︎ | | | ✅︎ | [Published](https://recipes.vllm.ai/Qwen/Qwen-Image) |
 | `MiniMaxH3ImagePipeline` | MiniMax-H3-Image (text-to-image and editing, MI325X and MI350X) | `MiniMaxAI/MiniMax-H3-Image` | | ✅︎ | | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/MiniMaxAI/MiniMax-H3-Image-AMD.md) |
