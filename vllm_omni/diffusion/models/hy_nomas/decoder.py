@@ -15,7 +15,6 @@
 # limitations under the License.
 
 import math
-from collections.abc import Iterable
 from contextlib import nullcontext
 from dataclasses import dataclass
 
@@ -23,7 +22,6 @@ import torch
 from diffusers.models.autoencoders.vae import DecoderOutput
 from torch import nn
 from torch.nn import functional as F
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.attention.layer import Attention
 
@@ -542,21 +540,6 @@ class PixelUMMDecoder(nn.Module):
     @property
     def dtype(self) -> torch.dtype:
         return self.decoder.embed.weight.dtype
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        parameters = dict(self.named_parameters())
-        loaded = set()
-        for name, value in weights:
-            if name not in parameters:
-                raise ValueError(f"Unexpected PixelUMM checkpoint tensor: {name}")
-            if name in loaded:
-                raise ValueError(f"Duplicate PixelUMM checkpoint tensor: {name}")
-            default_weight_loader(parameters[name], value)
-            loaded.add(name)
-        missing = parameters.keys() - loaded
-        if missing:
-            raise ValueError(f"Missing PixelUMM checkpoint tensors: {sorted(missing)}")
-        return loaded
 
     def forward(
         self, latent: torch.Tensor, sample: torch.Tensor, return_dict: bool = True
