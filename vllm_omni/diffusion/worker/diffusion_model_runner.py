@@ -943,7 +943,9 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                     [getattr(req, "cancellation_signal", None) for req in reqs],
                     enabled=getattr(self.pipeline, "supports_request_cancellation", False) is True,
                 ),
-                # Batch keys keep omitted and explicit schedules apart, so the batch shares one source.
+                # Batch keys carry whether each request sent its own schedule, so every request in a batch
+                # shares one source and any() equals all(). Only a request's own ranges are checked
+                # against the sequence; an inherited default is not.
                 _attention_schedule_scope(
                     attention_schedule,
                     from_request=any(req.sampling_params.attention_schedule is not None for req in reqs),
