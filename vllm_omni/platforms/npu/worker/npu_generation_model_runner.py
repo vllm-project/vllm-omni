@@ -28,6 +28,13 @@ from vllm.v1.utils import record_function_or_nullcontext
 from vllm.v1.worker.gpu_model_runner import PerLayerAttnMetadata
 from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 from vllm.v1.worker.utils import sanity_check_mm_encoder_outputs
+
+import os as _os
+
+# Optimization B gate: pure-idle steps skip the prepare-input event pair.
+# Default on; set VLLM_OMNI_IDLE_FASTPATH=0 to restore the unconditional
+# event pair (used for A/B arms).
+_IDLE_FASTPATH_ENABLED = _os.environ.get("VLLM_OMNI_IDLE_FASTPATH", "1") == "1"
 from vllm_ascend.ascend_forward_context import set_ascend_forward_context
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.utils import using_paged_attention
@@ -212,6 +219,39 @@ class NPUGenerationModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin
         # Recorded before any return below, so every path updates it.
         prev_step_idle = self._prev_step_idle
         self._prev_step_idle = num_scheduled_tokens <= 0
+        #  -------------------------------------- Omni-new -------------------------------------------------
+        # Optimization B: pure-idle steps (nothing scheduled, no finished
+        # cleanup, no prewarms, not an EC producer) touch no reused input
+        # buffer, so the prepare-input event pair below is pure host
+        # latency (~0.4 ms per step, the overwhelming majority of steps).
+        # State maintenance still runs: with nothing scheduled,
+        # _update_states performs no H2D into the buffers the event pair
+        # guards. Not recording here is also correct for the next busy
+        # step: its synchronize() then waits on the last record, which is
+        # the last step that actually reused the buffers. Every idle
+        # contract below (DP dummy, idle prefetch, KV transfer) is kept.
+        if (
+            _IDLE_FASTPATH_ENABLED
+            and num_scheduled_tokens <= 0
+            and not scheduler_output.finished_req_ids
+            and not getattr(scheduler_output, "pending_request_prewarms", None)
+            and not (has_ec_transfer() and get_ec_transfer().is_producer)
+        ):
+            self._update_states(scheduler_output)
+            if (
+                self.parallel_config.distributed_executor_backend == "external_launcher"
+                and self.parallel_config.data_parallel_size > 1
+            ):
+                # Keep the DP-coordination contract: a dummy run so
+                # coordinate_batch_across_dp is called into on idle steps.
+                self._dummy_run(1, skip_gdn_state_update=True)
+            if prev_step_idle:
+                self._call_optional_model_hook("run_idle_prefetch")
+            if not has_kv_transfer_group():
+                return self.attach_omni_connector_output(EMPTY_MODEL_RUNNER_OUTPUT)
+            return self.attach_omni_connector_output(
+                self.kv_connector_no_forward(scheduler_output, self.vllm_config)
+            )
         #  -------------------------------------- Omni-new -------------------------------------------------
         with record_function_or_nullcontext("prepare input"):
             #  -------------------------------------- Omni-new -------------------------------------------------
