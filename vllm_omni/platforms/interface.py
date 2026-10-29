@@ -383,6 +383,17 @@ class OmniPlatform(Platform):
 
         return CUDAGraphWrapper
 
+    @classmethod
+    def get_graphed_forward_cls(cls) -> type:
+        """Return the capture-and-replay class for keyword-only module forwards.
+
+        Defaults to the CUDA ``GraphedForward``, which stays eager off CUDA; XPU
+        overrides with ``XPUGraphedForward``.
+        """
+        from vllm_omni.diffusion.models.taomate_h3.cuda_graph import GraphedForward
+
+        return GraphedForward
+
     def capture_graph(
         self, capture: Callable[[], None], generators: Sequence[torch.Generator] = ()
     ) -> torch.cuda.CUDAGraph | None:

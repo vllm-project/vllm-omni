@@ -123,6 +123,12 @@ class XPUOmniPlatform(OmniPlatform, XPUPlatform):
         return graph
 
     @classmethod
+    def get_graphed_forward_cls(cls) -> type:
+        from vllm_omni.diffusion.xpu_graph import XPUGraphedForward
+
+        return XPUGraphedForward
+
+    @classmethod
     def record_device_event(cls) -> torch.Event | None:
         """Record an XPU event on the current stream to mark tensor readiness.
 
