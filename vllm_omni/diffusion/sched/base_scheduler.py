@@ -18,8 +18,8 @@ from vllm.v1.request import RequestStatus
 from vllm_omni.config.stage_config import resolve_diffusion_stage_role
 from vllm_omni.diffusion.attention.schedule import (
     InvalidAttentionScheduleError,
-    parse_attention_sigma_schedule,
     resolve_request_attention_schedule,
+    resolve_request_attention_sigma_schedule,
     stage_runs_denoising,
     validate_request_attention_schedules,
 )
@@ -787,7 +787,9 @@ class BaseScheduler(ABC):
                 sampling, getattr(self.od_config, "diffusion_attention_schedule", None)
             ),
             attention_schedule_explicit=sampling.attention_schedule is not None,
-            attention_sigma_schedule=parse_attention_sigma_schedule(sampling.attention_sigma_schedule),
+            attention_sigma_schedule=resolve_request_attention_sigma_schedule(
+                sampling, getattr(self.od_config, "diffusion_attention_schedule", None)
+            ),
             condition_key=getattr(request, "batch_compatibility_key", None),
             lora_int_id=lora_request.lora_int_id if lora_request is not None else None,
             use_step_execution=getattr(request, "use_step_execution", True),
