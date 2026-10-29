@@ -37,6 +37,7 @@ from vllm_omni.diffusion.forward_context import (
     bind_attention_schedule,
     set_forward_context,
 )
+from vllm_omni.diffusion.layers.custom_op import CustomOp
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
@@ -67,6 +68,9 @@ def wan_env(monkeypatch):
     monkeypatch.setattr(layer_mod, "get_attn_backend_for_role", _resolve)
     monkeypatch.setattr(layer_mod, "build_parallel_attention_strategy", lambda **kwargs: NoParallelAttention())
     monkeypatch.setattr(SDPAImpl, "forward", _recording_sdpa)
+    # The model runs on CPU tensors, but custom ops dispatch on the detected platform: on a CUDA
+    # host, Wan's rotary embedding would launch its Triton kernel on CPU tensors under Inductor.
+    monkeypatch.setattr(CustomOp, "dispatch_forward", lambda self: self.forward_native)
     # Multi-threaded CPU GEMMs and reductions are not bit-reproducible from run to run, even
     # without a schedule; one thread makes bitwise comparisons meaningful.
     threads = torch.get_num_threads()
