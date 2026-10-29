@@ -1828,6 +1828,20 @@ RELEASE_MARKDOWN_DOC_CSS = """
 .release-doc .release-section-card--skip-monitor .release-section-h2-ico svg {
   color: var(--section-ico-color);
 }
+.release-doc .release-section-card--version {
+  --section-accent: #0284c7;
+  --section-ico-bg: rgba(2, 132, 199, 0.12);
+  --section-ico-color: #0369a1;
+  border-top: 4px solid var(--section-accent);
+  background: linear-gradient(
+    180deg,
+    color-mix(in srgb, var(--section-ico-bg) 75%, var(--dashboard-panel-bg)) 0%,
+    var(--dashboard-panel-bg) 46%
+  );
+}
+.release-doc .release-section-card--version .release-section-h2-ico svg {
+  color: var(--section-ico-color);
+}
 .release-doc .release-section-card--data {
   --section-accent: #64748b;
   --section-ico-bg: rgba(148, 163, 184, 0.18);

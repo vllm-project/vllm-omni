@@ -102,6 +102,10 @@ _RELEASE_SVG_SHIELD = (
     '<path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>'
     '<polyline points="9 12 11 14 15 10"/>'
 )
+_RELEASE_SVG_TAG = (
+    '<path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.83z"/>'
+    '<line x1="7" y1="7" x2="7.01" y2="7"/>'
+)
 
 
 def _release_inline_svg(paths: str, *, size: int = 22, extra_class: str = "") -> str:
@@ -124,6 +128,8 @@ def _release_section_theme(title_plain: str) -> tuple[str, str]:
     """
     t = title_plain.strip()
     low = t.lower()
+    if "version info" in low:
+        return "version", _RELEASE_SVG_TAG
     if "test conclusion" in low:
         return "conclusion", _RELEASE_SVG_CHECK
     if "metrics" in low:

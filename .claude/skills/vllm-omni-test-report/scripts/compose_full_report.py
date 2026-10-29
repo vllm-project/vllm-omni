@@ -217,6 +217,22 @@ def _issue_created_date_utc(issue: dict) -> str | None:
     return None
 
 
+def _issue_milestone_matches(issue: dict, version: str) -> bool:
+    """True if the issue's GitHub milestone title equals ``version`` (tolerant compare).
+
+    Comparison ignores case, surrounding whitespace, and an optional leading ``v``/``V``
+    on either side, so milestone ``v0.9.0`` matches ``--release-version 0.9.0`` and
+    vice versa. Issues with no milestone never match.
+    """
+    m = issue.get("milestone") or {}
+    title = (m.get("title") or "").strip() if isinstance(m, dict) else ""
+    if not title:
+        return False
+    a = title.lower().lstrip("v")
+    b = version.strip().lower().lstrip("v")
+    return a == b
+
+
 def _github_fetch_open_issues_with_labels(gh_token: str | None, *labels: str) -> list[dict]:
     """Paginate **open** issues that carry **all** of the given GitHub labels (AND filter; PR entries excluded).
 
@@ -897,6 +913,7 @@ def github_open_bug_rows_in_range(
     *,
     now: datetime | None = None,
     priority_filter: frozenset[str] | None = None,
+    milestone_filter: str | None = None,
 ) -> tuple[int, int, str, list[dict]]:
     """
     Paginate **open** issues with label ``bug`` (PR entries excluded).
@@ -915,10 +932,34 @@ def github_open_bug_rows_in_range(
     narrow the table to ``critical`` / ``high priority`` /
     ``medium priority`` issues; the conclusion-row total (computed by
     :func:`slo_open_bug_di_total`) is intentionally **not** narrowed.
+
+    When ``milestone_filter`` is supplied (release variant with
+    ``--release-version``), it **replaces** the ``created_at`` window filter:
+    rows are the open ``label:bug`` issues whose milestone title matches the
+    given release version (via :func:`_issue_milestone_matches`, tolerant of a
+    leading ``v`` and case), still narrowed by ``priority_filter``. A
+    zero-match result prints the distinct milestone titles seen among open
+    bugs to stderr so the operator can recalibrate the version spelling.
     """
     all_items = _github_fetch_open_bug_issues(gh_token)
 
-    in_range = [i for i in all_items if (d := _issue_created_date_utc(i)) is not None and date_from <= d <= date_to]
+    if milestone_filter is not None:
+        in_range = [i for i in all_items if _issue_milestone_matches(i, milestone_filter)]
+        if not in_range:
+            seen = sorted(
+                {
+                    (i.get("milestone") or {}).get("title", "")
+                    for i in all_items
+                    if isinstance(i.get("milestone"), dict) and (i.get("milestone") or {}).get("title")
+                }
+            )
+            print(
+                f"[open-issues] 0 open bug issues match milestone '{milestone_filter}'; "
+                f"milestone titles present on open bugs: {seen}",
+                file=sys.stderr,
+            )
+    else:
+        in_range = [i for i in all_items if (d := _issue_created_date_utc(i)) is not None and date_from <= d <= date_to]
     if priority_filter is not None:
         in_range = [i for i in in_range if _bug_di_priority_label(i) in priority_filter]
     in_range.sort(key=lambda x: x["created_at"], reverse=True)
@@ -999,6 +1040,7 @@ def render_open_issues_section_with_di(
     all_open: bool = False,
     now: datetime | None = None,
     priority_filter: frozenset[str] | None = None,
+    milestone_filter: str | None = None,
 ) -> tuple[str, bool | None, str]:
     """Markdown for ``## Open issues`` plus DI conclusion data when GitHub fetch succeeds.
 
@@ -1028,6 +1070,7 @@ def render_open_issues_section_with_di(
             open_total, open_range_n, issue_rows, issues_in_range = github_open_bug_rows_in_range(
                 gh_token, stats_from, stats_to, now=now,
                 priority_filter=priority_filter,
+                milestone_filter=milestone_filter,
             )
         di_row_ok, di_row_detail = slo_open_bug_di_conclusion(issues_in_range, now=now)
     except Exception as exc:
@@ -1063,6 +1106,17 @@ def render_open_issues_section_with_di(
             f"labels: `critical` = 10, `high priority` = 3, `medium priority` = 1, `low priority` = 0.1, "
             f"`invalid` = 0.{github_open_note}"
         )
+    elif milestone_filter:
+        heading = f"## Open issues (milestone: {milestone_filter})"
+        body_intro = (
+            f"Open issues labeled **bug**, state **open**, excluding PRs, with GitHub "
+            f"milestone **{milestone_filter}** (release version), filtered to issues whose "
+            f"highest-priority label is `critical` / `high priority` / `medium priority` "
+            f"(drops `low priority`, `invalid`, and unlabelled-priority bugs): "
+            f"**{open_range_n}** (total open `bug` issues when fetched: "
+            f"**{open_total}**). DI uses priority labels: `critical` = 10, `high priority` = 3, "
+            f"`medium priority` = 1, `low priority` = 0.1, `invalid` = 0.{github_open_note}"
+        )
     else:
         heading = "## Open issues (stats window)"
         body_intro = (
@@ -1087,13 +1141,37 @@ def render_open_issues_section(
     all_open: bool = False,
     now: datetime | None = None,
     priority_filter: frozenset[str] | None = None,
+    milestone_filter: str | None = None,
 ) -> str:
     """Markdown for ``## Open issues`` block (GitHub REST, open ``label:bug`` only)."""
     section, _, _ = render_open_issues_section_with_di(
         stats_from, stats_to, gh_token,
         all_open=all_open, now=now, priority_filter=priority_filter,
+        milestone_filter=milestone_filter,
     )
     return section
+
+
+def render_version_info_section(release_version: str | None, release_commit: str | None) -> str:
+    """Markdown for ``## Version Info`` — operator-supplied release version + commit id.
+
+    Rendered at the top of the **release** report (right under the H1 title, before
+    Test conclusion) when ``--release-version`` / ``--release-commit`` are supplied.
+    Both empty → empty string, keeping the legacy layout byte-for-byte.
+    The commit id is linked to its GitHub commit URL (GitHub resolves short SHAs).
+    """
+    version = (release_version or "").strip()
+    commit = (release_commit or "").strip()
+    if not version and not commit:
+        return ""
+    lines = ["## Version Info", ""]
+    if version:
+        lines.append(f"- **Release version:** {version}")
+    if commit:
+        lines.append(
+            f"- **Commit:** [`{commit}`](https://github.com/vllm-project/vllm-omni/commit/{commit})"
+        )
+    return "\n".join(lines) + "\n\n"
 
 
 def _gpu_log_placeholder(gpu_flag: str) -> str:
@@ -2457,6 +2535,8 @@ def preview_report_markdown(
     stats_from: str,
     stats_to: str,
     build_no: int = PREVIEW_BUILD_NO,
+    release_version: str | None = None,
+    release_commit: str | None = None,
 ) -> str:
     """
     Same section layout as the live **release** report (minus any hand-only sections), but **no network**
@@ -2601,13 +2681,26 @@ def preview_report_markdown(
         include_b200=True,
     )
 
+    if release_version:
+        open_issues_heading_intro = (
+            f"## Open issues (milestone: {release_version})\n\n"
+            f"Open issues labeled **bug**, state **open**, excluding PRs, with GitHub "
+            f"milestone **{release_version}** (release version), filtered to issues whose "
+            f"highest-priority label is `critical` / `high priority` / `medium priority` "
+            f"(drops `low priority`, `invalid`, and unlabelled-priority bugs). "
+            "*Preview placeholder data; live report uses paginated GitHub results.*\n\n"
+        )
+    else:
+        open_issues_heading_intro = (
+            "## Open issues (stats window)\n\n"
+            f"Open issues labeled **bug**, state **open**, excluding PRs, with `created_at` "
+            f"(UTC date) in **{stats_from}** … **{stats_to}**, filtered to issues whose highest-priority "
+            f"label is `critical` / `high priority` / `medium priority` (drops `low priority`, `invalid`, "
+            f"and unlabelled-priority bugs). "
+            "*Preview placeholder data; live report uses paginated GitHub results.*\n\n"
+        )
     open_issues_block = (
-        "## Open issues (stats window)\n\n"
-        f"Open issues labeled **bug**, state **open**, excluding PRs, with `created_at` "
-        f"(UTC date) in **{stats_from}** … **{stats_to}**, filtered to issues whose highest-priority "
-        f"label is `critical` / `high priority` / `medium priority` (drops `low priority`, `invalid`, "
-        f"and unlabelled-priority bugs). "
-        "*Preview placeholder data; live report uses paginated GitHub results.*\n\n"
+        open_issues_heading_intro
         + render_markdown_table(
             OPEN_ISSUES_HEADERS,
             [
@@ -2661,9 +2754,11 @@ def preview_report_markdown(
 
     metric_analysis_section = render_metric_analysis_section()
 
+    version_info_block = render_version_info_section(release_version, release_commit)
+
     return f"""# vLLM-Omni Test Report - Scheduled Nightly
 
-{conclusion}{ci_md}
+{version_info_block}{conclusion}{ci_md}
 
 {metric_analysis_section}
 
@@ -2676,6 +2771,8 @@ def preview_report_markdown(
 {next_steps_block}
 ## Data source
 
+- **Version Info:** operator-supplied via `--release-version` / `--release-commit` (shown
+  only when provided; drives the Open issues milestone filter and the default filename tag).
 - **Mode:** `compose_full_report.py --preview` (sample tables only)
 - **Test Result:** Common stack from `references/local-test-matrix.md`; H200/H800/A100 via
   `--log-dir-*`; H100 is Buildkite block
@@ -2740,12 +2837,36 @@ def main() -> None:
         "Never derived from --log-dir-h* or nightly_jobs_* suffixes.",
     )
     parser.add_argument(
+        "--release-version",
+        default=None,
+        help=(
+            "Release variant only. Release version number (e.g. ``v0.9.0``) supplied by "
+            "the operator before each release-report generation. Renders the "
+            "``## Version Info`` chapter (with --release-commit), retargets the Open "
+            "issues section to the milestone whose title matches this version "
+            "(open + label:bug + critical/high/medium priority + milestone == version, "
+            "replacing the created_at stats-window filter), and tags the default "
+            "--out filename (vllm-omni-release-test-report-v<version>-<commit>-<date>.html). "
+            "Ignored by --kind development."
+        ),
+    )
+    parser.add_argument(
+        "--release-commit",
+        default=None,
+        help=(
+            "Release variant only. Release commit id (short or full SHA) shown in the "
+            "``## Version Info`` chapter and included (first 12 chars) in the default "
+            "--out filename tag alongside --release-version. Ignored by --kind development."
+        ),
+    )
+    parser.add_argument(
         "--out",
         type=Path,
         default=None,
         help=(
             "Output path. Default: <skill-dir>/vllm-omni-test-report-YYYY-MM-DD.html "
-            "(or vllm-omni-test-report-development-YYYY-MM-DD.html for --kind development)."
+            "(or vllm-omni-test-report-development-YYYY-MM-DD.html for --kind development). "
+            "With --release-version: vllm-omni-release-test-report-v<version>-<commit>-YYYY-MM-DD.html."
         ),
     )
     parser.add_argument(
@@ -2879,6 +3000,24 @@ def main() -> None:
     stats_to = args.stats_to or today_utc
     stats_from = args.stats_from or datetime.strptime(today_utc, "%Y-%m-%d").date().replace(day=1).isoformat()
 
+    # Sanitized filename tag from --release-version / --release-commit (release
+    # variant only), e.g. ("v0.9.0", "abc123def456789...") -> "v0.9.0-abc123def456".
+    def _release_version_tag() -> str | None:
+        if args.kind != "release":
+            return None
+        parts: list[str] = []
+        if args.release_version:
+            v = re.sub(r"[^A-Za-z0-9._-]+", "-", args.release_version.strip()).strip("-")
+            if v and not v.lower().startswith("v"):
+                v = f"v{v}"
+            if v:
+                parts.append(v)
+        if args.release_commit:
+            c = re.sub(r"[^A-Za-z0-9._-]+", "-", args.release_commit.strip()).strip("-")[:12]
+            if c:
+                parts.append(c)
+        return "-".join(parts) if parts else None
+
     # Resolve default output filename based on kind.
     def _default_output_path() -> Path:
         if args.kind == "development":
@@ -2888,8 +3027,11 @@ def main() -> None:
                 else development_report_basename(report_date)
             )
         else:
+            tag = _release_version_tag()
             base = (
-                release_report_preview_basename(report_date) if args.preview else release_report_basename(report_date)
+                release_report_preview_basename(report_date, version_tag=tag)
+                if args.preview
+                else release_report_basename(report_date, version_tag=tag)
             )
         return skill_dir / base
 
@@ -2903,7 +3045,13 @@ def main() -> None:
                 stats_to=stats_to,
             )
         else:
-            md = preview_report_markdown(skill_dir, stats_from=stats_from, stats_to=stats_to)
+            md = preview_report_markdown(
+                skill_dir,
+                stats_from=stats_from,
+                stats_to=stats_to,
+                release_version=args.release_version,
+                release_commit=args.release_commit,
+            )
         out_path.write_text(
             convert_release_report_markdown(
                 md,
@@ -3277,7 +3425,12 @@ def main() -> None:
         all_open=False,
         now=report_now,
         priority_filter=OPEN_ISSUES_RELEASE_PRIORITIES,
+        # With --release-version the Open issues section retargets from the
+        # created_at stats window to the milestone matching the release version
+        # (open + label:bug + critical/high/medium priority + milestone == version).
+        milestone_filter=args.release_version,
     )
+    version_info_block = render_version_info_section(args.release_version, args.release_commit)
 
     # Next Steps (Outstanding Items): manual-entry action table, identical
     # to the Development variant. ``release_md_to_html`` already injects
@@ -3301,6 +3454,19 @@ def main() -> None:
     # ``oi-followup`` / ``ns-outstanding`` / ``fail-status``).
     quality_defense_block = render_quality_defense_section()
     metric_analysis_section = render_metric_analysis_section()
+    if args.release_version:
+        open_issues_source_note = (
+            f"REST `label:bug`, state `open`, milestone matching release version "
+            f"`{args.release_version}` (created_at stats window **not** applied), "
+            f"filtered to issues whose highest-priority label is `critical` / `high priority` / "
+            f"`medium priority` (drops `low priority`, `invalid`, and unlabelled-priority bugs)."
+        )
+    else:
+        open_issues_source_note = (
+            f"REST `label:bug`, `created_at` UTC date in `{stats_from}`..`{stats_to}`, "
+            f"filtered to issues whose highest-priority label is `critical` / `high priority` / "
+            f"`medium priority` (drops `low priority`, `invalid`, and unlabelled-priority bugs)."
+        )
     # "Remaining DI < 30" is a **manual** user-selectable Pass/Fail row (like
     # the NPU row) — the operator judges it against the SLO-escalating
     # Outstanding DI (sum of per-issue SLO DI across open `label:bug` whose
@@ -3314,7 +3480,7 @@ def main() -> None:
 
     md = f"""# vLLM-Omni Test Report - Scheduled Nightly
 
-{conclusion}{ci_md}
+{version_info_block}{conclusion}{ci_md}
 
 {metric_analysis_section}
 
@@ -3347,9 +3513,9 @@ def main() -> None:
 - **Failure Analysis:** Per-GPU failure detail (H200/H800/A100 from local nightly logs; H100 from
   Buildkite `failed` steps — `broken` is treated as a transient state, not a failure).
   Interactive **Status** column (Filed / Not an issue) backed by `localStorage`.
-- **Open issues:** REST `label:bug`, `created_at` UTC date in `{stats_from}`..`{stats_to}`,
-  filtered to issues whose highest-priority label is `critical` / `high priority` /
-  `medium priority` (drops `low priority`, `invalid`, and unlabelled-priority bugs).
+- **Version Info:** operator-supplied via `--release-version` / `--release-commit`
+  (rendered only when provided).
+- **Open issues:** {open_issues_source_note}
 - **Next Steps (Outstanding Items):** manual-entry action table (Item / Assignee /
   Status) with ``Add Item`` button; cells editable in HTML, persisted via
   `localStorage` (same implementation as the Development variant). H2 appears between

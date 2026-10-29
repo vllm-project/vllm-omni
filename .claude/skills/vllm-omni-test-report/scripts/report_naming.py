@@ -25,12 +25,27 @@ def nightly_report_basename(date_iso: str | None = None) -> str:
     return f"nightly-report-buildkite-latest-{resolve_report_date_iso(date_iso)}.html"
 
 
-def release_report_basename(date_iso: str | None = None) -> str:
-    return f"vllm-omni-test-report-{resolve_report_date_iso(date_iso)}.html"
+def release_report_basename(date_iso: str | None = None, version_tag: str | None = None) -> str:
+    """Filename for the **release** report.
+
+    ``version_tag`` (optional, e.g. ``v0.9.0-abc123def456``) is inserted before the
+    date when the operator supplies release version + commit via
+    ``compose_full_report.py --release-version / --release-commit``. Tagged reports
+    use the ``vllm-omni-release-test-report-*`` prefix (matching the archive dest
+    naming under ``data/release_test_report/``); untagged runs keep the legacy
+    ``vllm-omni-test-report-*`` default for backward compatibility.
+    """
+    date = resolve_report_date_iso(date_iso)
+    if version_tag:
+        return f"vllm-omni-release-test-report-{version_tag}-{date}.html"
+    return f"vllm-omni-test-report-{date}.html"
 
 
-def release_report_preview_basename(date_iso: str | None = None) -> str:
-    return f"vllm-omni-test-report-preview-{resolve_report_date_iso(date_iso)}.html"
+def release_report_preview_basename(date_iso: str | None = None, version_tag: str | None = None) -> str:
+    date = resolve_report_date_iso(date_iso)
+    if version_tag:
+        return f"vllm-omni-release-test-report-{version_tag}-preview-{date}.html"
+    return f"vllm-omni-test-report-preview-{date}.html"
 
 
 def development_report_basename(date_iso: str | None = None) -> str:
