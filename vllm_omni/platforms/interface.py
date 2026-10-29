@@ -390,7 +390,7 @@ class OmniPlatform(Platform):
         Defaults to the CUDA ``GraphedForward``, which stays eager off CUDA; XPU
         overrides with ``XPUGraphedForward``.
         """
-        from vllm_omni.diffusion.models.taomate_h3.cuda_graph import GraphedForward
+        from vllm_omni.diffusion.cuda_graph import GraphedForward
 
         return GraphedForward
 

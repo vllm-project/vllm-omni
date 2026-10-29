@@ -8,7 +8,7 @@ unchanged; real XPU graphs are covered by ``test_graphed_forward_device.py``.
 
 from __future__ import annotations
 
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -16,7 +16,7 @@ import torch
 import torch.nn as nn
 
 import vllm_omni.diffusion.xpu_graph as xpu_graph_mod
-from vllm_omni.diffusion.models.taomate_h3.cuda_graph import GraphedForward
+from vllm_omni.diffusion.cuda_graph import GraphedForward
 from vllm_omni.diffusion.xpu_graph import XPUGraphedForward
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
@@ -92,3 +92,19 @@ def test_xpu_platform_returns_the_xpu_graphed_forward() -> None:
     from vllm_omni.platforms.xpu.platform import XPUOmniPlatform
 
     assert XPUOmniPlatform.get_graphed_forward_cls() is XPUGraphedForward
+
+
+def test_capture_context_wraps_the_capture_forwards(platform) -> None:
+    entered = []
+
+    @contextmanager
+    def context():
+        entered.append(True)
+        yield
+
+    graph = XPUGraphedForward(_Doubler(), device=torch.device("cpu"), warmup_iters=1, capture_context=context)
+    graph.enabled = True
+    graph(x=torch.ones(2))
+    graph(x=torch.ones(2))  # replay: no capture, no context
+
+    assert entered == [True] and platform.captures == 1

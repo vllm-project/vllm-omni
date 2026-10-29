@@ -1,15 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""CUDA-graph replay of fixed-shape TaoMate-H3 DiT forwards.
+"""CUDA-graph replay of fixed-shape keyword-only forwards.
 
-TaoMate's audio teacher runs nine short forwards per five-second request over
-a few hundred packed rows. At that size the DiT is launch-bound: the GPU
-finishes each block long before the Python launch path of the next one, so
-the nine forwards cost about 85 ms each in eager mode although the device
-work is a fraction of that. Replaying a captured graph removes the launch
-path entirely.
+Written for TaoMate-H3's audio teacher, which runs nine short, launch-bound
+DiT forwards per five-second request; replaying a captured graph removes the
+Python launch path. ``XPUGraphedForward`` (``xpu_graph.py``) derives from this
+class and overrides only the device hooks below; pick the class for the
+current platform with ``current_omni_platform.get_graphed_forward_cls()``.
 
-``GraphedForward`` wraps the DiT's keyword-only ``forward``. Calls are keyed
+``GraphedForward`` wraps a keyword-only ``forward``. Calls are keyed
 by the *structure* of their kwargs (tensor shapes/dtypes and every non-tensor
 value); the first call of a key captures a graph on static copies of the
 tensors and later calls copy the live tensors into those buffers and replay.
@@ -19,10 +18,9 @@ a new document *shape* does (a prompt with another token count, the first
 request's longer audio, a reference tail present or not).
 
 Graph capture forbids host synchronization inside the captured region, so the
-wrapper (a) bypasses the exact AdaLN projection cache during capture (its
-key is a host-side digest of the timestep embedding; the graph then contains
-the projections themselves, which are cheap for the three teacher timestep
-rows), and (b) validates the very first capture with
+wrapper (a) enters the caller's ``capture_context`` around the capture
+forwards (TaoMate uses it to bypass its host-keyed AdaLN projection cache),
+and (b) validates the very first capture with
 ``torch.cuda.set_sync_debug_mode("error")`` before capturing, so a
 synchronizing operator fails loudly on every rank at the same program point
 instead of leaving peers waiting in a collective. Any failure disables the
@@ -35,8 +33,8 @@ from __future__ import annotations
 import dataclasses
 import traceback
 from collections import OrderedDict
-from collections.abc import Iterator
-from contextlib import contextmanager
+from collections.abc import Callable, Iterator
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import Any
 
@@ -152,23 +150,19 @@ def _sync_debug_mode(mode: str) -> Iterator[None]:
         torch.cuda.set_sync_debug_mode(previous)
 
 
-@contextmanager
-def _adaln_cache_bypassed(module: nn.Module) -> Iterator[None]:
-    """Turn the host-keyed AdaLN projection cache off for the duration."""
-    cache = getattr(module, "adaln_cache", None)
-    if cache is None or not hasattr(cache, "max_bytes"):
-        yield
-        return
-    previous = cache.max_bytes
-    cache.max_bytes = 0
-    try:
-        yield
-    finally:
-        cache.max_bytes = previous
-
-
 class GraphedForward:
-    """Capture-and-replay wrapper around a keyword-only ``nn.Module`` forward."""
+    """Capture-and-replay wrapper around a keyword-only ``nn.Module`` forward.
+
+    The device-specific steps are the hooks ``_graphs_supported``,
+    ``_warmup_stream`` and ``_capture_graph`` (plus ``_sync_probe``); a
+    platform subclass overrides those and inherits keying, static buffers,
+    replay, LRU eviction and rank agreement.
+    """
+
+    # Used in log messages.
+    graph_kind = "CUDA"
+    # Validate the first capture with torch.cuda.set_sync_debug_mode("error").
+    _sync_probe = True
 
     def __init__(
         self,
@@ -180,6 +174,7 @@ class GraphedForward:
         group: torch.distributed.ProcessGroup | None = None,
         name: str = "taomate_h3",
         enabled: bool = True,
+        capture_context: Callable[[], AbstractContextManager] | None = None,
     ) -> None:
         if max_entries < 1:
             raise ValueError("max_entries must be at least 1")
@@ -189,10 +184,12 @@ class GraphedForward:
         self.warmup_iters = int(warmup_iters)
         self.group = group
         self.name = name
-        self.enabled = bool(enabled) and self.device.type == "cuda"
+        # Entered around the probe, warm-up and capture forwards.
+        self.capture_context = capture_context or nullcontext
+        self.enabled = bool(enabled) and self._graphs_supported()
         self._entries: OrderedDict[Any, _Entry] = OrderedDict()
         self._pool: Any = None
-        self._probe_pending = True
+        self._probe_pending = self._sync_probe
         self._pinned_overflow_warned = False
         self.captures = 0
         self.replays = 0
@@ -251,7 +248,7 @@ class GraphedForward:
 
     def disable(self, reason: str) -> None:
         if self.enabled:
-            logger.warning("%s CUDA graphs disabled: %s", self.name, reason)
+            logger.warning("%s %s graphs disabled: %s", self.name, self.graph_kind, reason)
         self.enabled = False
         self.clear()
 
@@ -272,30 +269,23 @@ class GraphedForward:
         outputs: Any = None
         try:
             static = clone_static(kwargs)
-            with _adaln_cache_bypassed(self.module):
+            with self.capture_context():
                 if self._probe_pending:
                     # A synchronizing operator raises here on every rank at
                     # the same point, before any capture starts.
                     with _sync_debug_mode("error"):
                         self.module(**static)
                     self._probe_pending = False
-                side = torch.cuda.Stream(device=self.device)
-                side.wait_stream(torch.cuda.current_stream(self.device))
                 # The first capture warms lazy kernel/library state for the
                 # whole process; later shapes need a single warm forward.
                 warmups = self.warmup_iters if self.captures == 0 else min(self.warmup_iters, 1)
-                with torch.cuda.stream(side):
+                with self._warmup_stream():
                     for _ in range(warmups):
                         self.module(**static)
-                torch.cuda.current_stream(self.device).wait_stream(side)
-                graph = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(graph, pool=self._pool):
-                    outputs = self.module(**static)
-                if self._pool is None:
-                    self._pool = graph.pool()
+                graph, outputs = self._capture_graph(lambda: self.module(**static))
         except Exception as exc:  # noqa: BLE001 - any capture failure means eager from now on
             failure = f"{type(exc).__name__}: {exc}"
-            logger.warning("%s CUDA graph capture failed:\n%s", self.name, traceback.format_exc())
+            logger.warning("%s %s graph capture failed:\n%s", self.name, self.graph_kind, traceback.format_exc())
         ok = self._agree(failure is None)
         if not ok:
             del graph, outputs, static
@@ -307,9 +297,10 @@ class GraphedForward:
                 if not self._pinned_overflow_warned:
                     self._pinned_overflow_warned = True
                     logger.warning(
-                        "%s: all %d resident CUDA graphs are pinned; growing past max_entries",
+                        "%s: all %d resident %s graphs are pinned; growing past max_entries",
                         self.name,
                         len(self._entries),
+                        self.graph_kind,
                     )
             else:
                 del self._entries[victim]
@@ -317,8 +308,33 @@ class GraphedForward:
         entry = _Entry(graph=graph, static_kwargs=static, outputs=outputs, keep_alive=tuple(keep_alive), pinned=pin)
         self._entries[key] = entry
         self.captures += 1
-        logger.info("%s CUDA graph captured for %s (%d resident)", self.name, variant, len(self._entries))
+        logger.info(
+            "%s %s graph captured for %s (%d resident)", self.name, self.graph_kind, variant, len(self._entries)
+        )
         return entry
+
+    # -- device hooks --------------------------------------------------------
+
+    def _graphs_supported(self) -> bool:
+        return self.device.type == "cuda"
+
+    @contextmanager
+    def _warmup_stream(self) -> Iterator[None]:
+        """Run the warm-up forwards on a side stream, ordered after the current work."""
+        side = torch.cuda.Stream(device=self.device)
+        side.wait_stream(torch.cuda.current_stream(self.device))
+        with torch.cuda.stream(side):
+            yield
+        torch.cuda.current_stream(self.device).wait_stream(side)
+
+    def _capture_graph(self, body: Callable[[], Any]) -> tuple[Any, Any]:
+        """Capture ``body`` into a graph; return the graph and the outputs it writes."""
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, pool=self._pool):
+            outputs = body()
+        if self._pool is None:
+            self._pool = graph.pool()
+        return graph, outputs
 
     def _agree(self, ok: bool) -> bool:
         group = self.group
