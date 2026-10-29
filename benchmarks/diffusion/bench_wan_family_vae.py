@@ -45,6 +45,21 @@ def _vae_class(name: str):
     return getattr(diffusers, name)
 
 
+def _vae_class_name(model: str) -> str:
+    """``_class_name`` of the checkpoint's ``vae/config.json``, for a local directory or a Hub repo id."""
+    if os.path.isdir(model):
+        config_path = os.path.join(model, "vae", "config.json")
+    else:
+        from huggingface_hub import hf_hub_download
+
+        config_path = hf_hub_download(model, "config.json", subfolder="vae")  # only the config, not the weights
+    with open(config_path) as f:
+        name = json.load(f).get("_class_name")
+    if not name:
+        raise ValueError(f"{config_path} has no _class_name; cannot tell which VAE class to load")
+    return name
+
+
 def _timed(fn, device: torch.device, warmup: int, iters: int) -> tuple[torch.Tensor, list[float]]:
     out = None
     for _ in range(warmup):
@@ -107,8 +122,7 @@ def main() -> None:
         levels.insert(0, "off")  # the reference every other level is compared with; repeat it to check repeatability
     dtype = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[args.dtype]
     device = torch.device(current_omni_platform.device_type, 0)
-    config_path = os.path.join(args.model, "vae", "config.json")
-    class_name = json.load(open(config_path))["_class_name"] if os.path.exists(config_path) else "AutoencoderKLWan"
+    class_name = _vae_class_name(args.model)
     vae = _vae_class(class_name).from_pretrained(args.model, subfolder="vae", torch_dtype=dtype).to(device).eval()
     family = find_family(vae)
     config = vae.config
