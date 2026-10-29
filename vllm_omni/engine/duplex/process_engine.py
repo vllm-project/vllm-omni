@@ -40,8 +40,8 @@ from vllm_omni.engine.duplex.events import AudioDelta, ResponseDone, SessionClos
 from vllm_omni.engine.duplex.messages import DuplexControlResultMessage, DuplexSessionError, DuplexSessionEventMessage
 
 logger = init_logger(__name__)
-_QUEUE_SIZE = 1024
-_QUEUE_BYTES = 8 * 1024 * 1024
+_QUEUE_SIZE = 2048
+_QUEUE_BYTES = 16 * 1024 * 1024
 _MAX_MESSAGE_BYTES = 64 * 1024 * 1024
 _READ_BYTES = 64 * 1024
 _COMMAND_TYPES = {
@@ -150,7 +150,7 @@ class _MessageSocket:
         """Encode one message and reject payloads exceeding the queue byte budget."""
         payload = msgspec.msgpack.encode(message)
         if len(payload) > _QUEUE_BYTES:
-            raise ValueError("Duplex IPC message exceeds the 8 MiB queue budget")
+            raise ValueError("Duplex IPC message exceeds the 16 MiB queue budget")
         return payload
 
     def put_nowait(self, entry: bytes) -> None:

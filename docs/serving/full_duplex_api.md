@@ -78,7 +78,7 @@ writer threads. Both backends share the frontend output pump and engine-death
 handling.
 
 Each process keeps bounded per-session output buffers. Each IPC direction
-admits at most 1024 queued messages and 8 MiB of encoded queued data; larger
+admits at most 2048 queued messages and 16 MiB of encoded queued data; larger
 individual messages are rejected. The active write and socket buffers are
 additional to this budget. Frontend output overflow closes the affected session;
 worker or transport failure fails pending controls and closes local buffers.
