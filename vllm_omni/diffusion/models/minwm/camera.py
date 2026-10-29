@@ -15,7 +15,8 @@ import numpy as np
 import regex as re
 import torch
 
-from vllm_omni.diffusion.layers.prope import _invert_rigid
+from vllm_omni.diffusion.layers.prope import invert_rigid
+from vllm_omni.errors import OmniClientError
 
 _TRANSLATION_STEP = 0.08
 _ROTATION_STEP = float(np.radians(3.0))
@@ -36,16 +37,25 @@ _SEGMENT = re.compile(r"([a-z]+)\*(\d+)")
 _INTRINSICS = np.array([[0.5, 0.0, 0.5], [0.0, 0.5, 0.5], [0.0, 0.0, 1.0]], dtype=np.float32)
 
 
-def parse_trajectory(trajectory: str) -> list[tuple[str, int]]:
-    """Split a trajectory string into ``(direction, steps)`` segments without expanding them."""
+def parse_trajectory(trajectory: object) -> list[tuple[str, int]]:
+    """Split a trajectory string into ``(direction, steps)`` segments without expanding them.
+
+    Every rejection here is the caller's input, so it is an ``OmniClientError`` and surfaces as a 400.
+    """
+    if not isinstance(trajectory, str) or not trajectory.strip():
+        raise OmniClientError("extra_params.trajectory must be a non-empty string such as 'a*4,w*8,s*7'.")
     segments: list[tuple[str, int]] = []
     for segment in trajectory.strip().split(","):
         match = _SEGMENT.fullmatch(segment.strip())
         if match is None:
-            raise ValueError(f"Cannot parse trajectory segment {segment.strip()!r}; expected e.g. 'w*8'.")
-        token, count = match.group(1), int(match.group(2))
+            raise OmniClientError(f"Cannot parse trajectory segment {segment.strip()!r}; expected e.g. 'w*8'.")
+        token = match.group(1)
         if token not in _MOTIONS:
-            raise ValueError(f"Unknown trajectory direction {token!r}; valid: {sorted(_MOTIONS)}.")
+            raise OmniClientError(f"Unknown trajectory direction {token!r}; valid: {sorted(_MOTIONS)}.")
+        try:
+            count = int(match.group(2))
+        except ValueError as exc:  # more digits than int() will convert
+            raise OmniClientError(f"Trajectory segment {segment.strip()!r} has too many digits.") from exc
         segments.append((token, count))
     return segments
 
@@ -56,7 +66,7 @@ def trajectory_viewmats(trajectory: str, *, num_latent_frames: int) -> np.ndarra
     # Summed before the counts are repeated, so an oversized request builds no poses.
     steps = sum(count for _, count in segments)
     if steps + 1 != num_latent_frames:
-        raise ValueError(
+        raise OmniClientError(
             f"trajectory {trajectory!r} describes {steps + 1} latent frames (its steps plus the starting "
             f"pose), but the request generates {num_latent_frames}."
         )
@@ -79,7 +89,9 @@ def trajectory_viewmats(trajectory: str, *, num_latent_frames: int) -> np.ndarra
         else:
             camera_to_world[:3, 3] += rotation @ np.array([0.0, -amount, 0.0])
         poses.append(camera_to_world.copy())
-    return _invert_rigid(torch.from_numpy(np.stack(poses))).numpy().astype(np.float32)
+    # Every pose is a product of exact rotations and translations, so it is rigid by construction and the
+    # closed-form inverse is exact up to float64 rounding.
+    return invert_rigid(torch.from_numpy(np.stack(poses))).numpy().astype(np.float32)
 
 
 def trajectory_cameras(trajectory: str, *, num_latent_frames: int) -> tuple[torch.Tensor, torch.Tensor]:

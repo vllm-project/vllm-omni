@@ -25,8 +25,6 @@ def get_minwm_video_generation_defaults(
     """
     trajectory = (extra_body or {}).get("trajectory")
     if trajectory is not None:
-        if not isinstance(trajectory, str) or not trajectory.strip():
-            raise ValueError("extra_params.trajectory must be a non-empty string such as 'a*4,w*8,s*7'.")
         from vllm_omni.diffusion.models.minwm.camera import parse_trajectory
 
         parse_trajectory(trajectory)

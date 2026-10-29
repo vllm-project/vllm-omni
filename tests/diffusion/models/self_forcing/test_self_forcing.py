@@ -351,6 +351,22 @@ def test_minwm_without_a_trajectory_renders_without_the_camera_branch() -> None:
 
 @pytest.mark.cpu
 @pytest.mark.usefixtures("native_ops")
+def test_minwm_keeps_a_camera_failure_past_validation_a_server_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Only the trajectory checks are client errors; anything that fails after them stays a 500."""
+    from vllm_omni.diffusion.models.minwm import camera
+    from vllm_omni.errors import OmniClientError
+
+    def broken(*args: object, **kwargs: object) -> None:
+        raise ValueError("not the caller's fault")
+
+    monkeypatch.setattr(camera, "invert_rigid", broken)
+    with pytest.raises(ValueError, match="not the caller's fault") as exc:
+        _minwm_pipeline()._parse_request(_request(extra_args={"trajectory": "a*4,w*8,s*7"}))
+    assert not isinstance(exc.value, OmniClientError)
+
+
+@pytest.mark.cpu
+@pytest.mark.usefixtures("native_ops")
 def test_minwm_rejects_a_trajectory_of_another_length() -> None:
     """A client error, so the rejection reaches the caller as a 400 rather than a 500."""
     from vllm_omni.errors import OmniClientError
