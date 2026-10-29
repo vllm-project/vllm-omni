@@ -820,6 +820,7 @@ class OpenAIFullDuplexConnection:
         try:
             await self._run_response_inner(response_id, response, s, active, engine_input)
             completed = True
+            outcome = "completed"
         except asyncio.CancelledError:
             outcome = "cancelled"
             if self._response_cancel_event.is_set():

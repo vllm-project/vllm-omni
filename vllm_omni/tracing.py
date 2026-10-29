@@ -3,15 +3,20 @@
 
 """Request and stage lifetimes observed by the Omni orchestrator."""
 
+from __future__ import annotations
+
 from collections.abc import Mapping
+from typing import TYPE_CHECKING
 
 from opentelemetry import context as otel_context
 from opentelemetry import trace
 from opentelemetry.baggage.propagation import W3CBaggagePropagator
 from opentelemetry.propagators.composite import CompositePropagator
-from opentelemetry.sdk import trace as sdk_trace
 from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
 from starlette.types import ASGIApp, Receive, Scope, Send
+
+if TYPE_CHECKING:
+    from opentelemetry.sdk import trace as sdk_trace
 
 _PROPAGATOR = CompositePropagator([TraceContextTextMapPropagator(), W3CBaggagePropagator()])
 
@@ -33,6 +38,7 @@ def create_tracer_provider(endpoint: str | None) -> sdk_trace.TracerProvider | N
         return None
     import os
 
+    from opentelemetry.sdk import trace as sdk_trace
     from opentelemetry.sdk.resources import Resource
     from opentelemetry.sdk.trace.export import BatchSpanProcessor
 

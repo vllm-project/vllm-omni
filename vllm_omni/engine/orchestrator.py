@@ -1479,6 +1479,7 @@ class OrchestratorBase:
             [parent_id, *self._cfg_tracker.cleanup_parent(parent_id)],
             abort=True,
             release_owners=True,
+            trace_error=getattr(output, "error_type", None) or "stage_error",
         )
 
     def _update_stage_replica_waiting(self, stage_id: int, replica_id: int, n_waiting: int) -> None:
@@ -1561,6 +1562,7 @@ class OrchestratorBase:
                 # frontend request_states entry to land in. No-op for
                 # turn-based requests, which have no owner.
                 release_owners=True,
+                trace_error="engine_dead",
             )
 
     async def _fail_request_dead_stage(self, req_id: str, stage_id: int) -> None:
@@ -1589,6 +1591,7 @@ class OrchestratorBase:
             [req_id, *self._cfg_tracker.cleanup_parent(req_id)],
             abort=True,
             release_owners=True,
+            trace_error="engine_dead",
         )
 
     async def _fail_request_client_error(
@@ -1607,9 +1610,6 @@ class OrchestratorBase:
         client-error ErrorMessage (default `fatal=False`) so the engine keeps
         serving, then releases the request's state across every stage pool.
         """
-        req_state = self.request_states.get(req_id)
-        if req_state is not None and req_state.trace is not None:
-            req_state.trace.fail(error_type)
         await self.output_async_queue.put(
             ErrorMessage(
                 error=error,
@@ -1623,6 +1623,7 @@ class OrchestratorBase:
             [req_id, *self._cfg_tracker.cleanup_parent(req_id)],
             abort=True,
             release_owners=release_owners,
+            trace_error=error_type,
         )
 
     async def _dispatch_or_fail_request(
@@ -1815,7 +1816,7 @@ class OrchestratorBase:
                         req_state.trace.span.set_attribute(f"omni.pipeline.{name}", duration)
                     if trace_error is not None:
                         req_state.trace.fail(trace_error)
-                    req_state.trace.end("error" if release_owners else "cancelled" if abort else "success")
+                    req_state.trace.end("cancelled" if abort else "success")
                 cleanup_request_artifact_dirs(getattr(req_state, "request_artifact_dirs", set()))
             if req_state is not None and req_state.running_counter_registered and self._running_counter is not None:
                 self._running_counter.decrement()
@@ -2013,7 +2014,9 @@ class OrchestratorBase:
         submit_ts = req_state.stage_submit_ts.get(stage_id)
         segment_finished = req_state.streaming.enabled and req_state.streaming.segment(stage_id).finished
         if req_state.trace is not None:
-            if self.stage_pools[stage_id].has_non_empty_output(output):
+            if stage_id not in req_state.trace.first_outputs and self.stage_pools[stage_id].has_non_empty_output(
+                output
+            ):
                 req_state.trace.output(stage_id)
             if finished and not segment_finished:
                 req_state.trace.finish_stage(stage_id)

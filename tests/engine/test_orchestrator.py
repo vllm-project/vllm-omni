@@ -2651,7 +2651,7 @@ async def test_raw_stage_error_reaches_caller_before_normal_terminal_routing(moc
     assert isinstance(error, ErrorMessage)
     assert (error.request_id, error.stage_id, error.error) == ("stuck", stage_id, expected_error)
     assert error.fatal is False
-    cleanup.assert_awaited_once_with(["stuck"], abort=True, release_owners=True)
+    cleanup.assert_awaited_once_with(["stuck"], abort=True, release_owners=True, trace_error="stage_error")
     normal_terminal.assert_not_awaited()
     assert not terminal_request_ids
     assert output_queue.empty()

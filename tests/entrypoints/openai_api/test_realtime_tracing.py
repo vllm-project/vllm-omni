@@ -21,8 +21,11 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("outcome", ["completed", "failed", "cancelled"])
-async def test_realtime_session_turn_parent_and_cleanup(mocker, monkeypatch, outcome):
+@pytest.mark.parametrize(
+    ("outcome", "send_done"),
+    [("completed", True), ("completed", False), ("incomplete", True), ("failed", True), ("cancelled", True)],
+)
+async def test_realtime_session_turn_parent_and_cleanup(mocker, monkeypatch, outcome, send_done):
     provider = TracerProvider()
     exporter = InMemorySpanExporter()
     provider.add_span_processor(SimpleSpanProcessor(exporter))
@@ -56,13 +59,14 @@ async def test_realtime_session_turn_parent_and_cleanup(mocker, monkeypatch, out
         if outcome == "cancelled":
             connection._response_cancel_event.set()
             raise asyncio.CancelledError
-        await connection._send_event(
-            types.ResponseDoneEvent(
-                event_id=response_id,
-                type="response.done",
-                response=connection._response_object(response_id, resolved, "completed"),
+        if send_done:
+            await connection._send_event(
+                types.ResponseDoneEvent(
+                    event_id=response_id,
+                    type="response.done",
+                    response=connection._response_object(response_id, resolved, outcome),
+                )
             )
-        )
 
     monkeypatch.setattr(connection, "_dispatch_event", dispatch)
     monkeypatch.setattr(connection, "_run_response_inner", generate)
@@ -77,6 +81,7 @@ async def test_realtime_session_turn_parent_and_cleanup(mocker, monkeypatch, out
         assert len(turns) == len(pipelines) == 2
         assert all(turn.parent.span_id == session.context.span_id for turn in turns)
         assert all(turn.attributes["omni.turn.outcome"] == outcome for turn in turns)
+        assert all((turn.status.status_code == trace.StatusCode.ERROR) == (outcome == "failed") for turn in turns)
         assert {pipeline.parent.span_id for pipeline in pipelines} == {turn.context.span_id for turn in turns}
         assert connection.session.active_response is None
         assert not trace.get_current_span().get_span_context().is_valid

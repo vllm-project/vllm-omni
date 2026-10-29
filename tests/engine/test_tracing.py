@@ -2,8 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import asyncio
+import runpy
 import socket
+import sys
 import time
+from pathlib import Path
 
 import anyio
 import httpx
@@ -18,6 +21,7 @@ from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
 from vllm.v1.engine import EngineCoreOutputs, FinishReason
+from vllm.v1.engine.exceptions import EngineDeadError
 
 from tests.engine.test_orchestrator import (
     FakeOutputProcessor,
@@ -52,6 +56,13 @@ def recording():
     provider.shutdown()
 
 
+def test_tracing_disabled_does_not_require_sdk(monkeypatch):
+    monkeypatch.setitem(sys.modules, "opentelemetry.sdk", None)
+    tracing = runpy.run_path(str(Path(__file__).parents[2] / "vllm_omni" / "tracing.py"))
+    assert tracing["create_tracer_provider"](None) is None
+    assert tracing["capture_trace_headers"](HEADERS) == HEADERS
+
+
 def test_context_preserves_unsampled_and_vendor_state(recording):
     tracer, exporter = recording
     headers = dict(HEADERS, traceparent=HEADERS["traceparent"][:-2] + "00")
@@ -80,7 +91,7 @@ def test_inbound_headers_do_not_skip_active_http_span(recording):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("outcome", ["success", "cancelled", "error"])
+@pytest.mark.parametrize("outcome", ["success", "cancelled", "error", "dead_replica"])
 async def test_orchestrator_closes_diffusion_request_and_stage(recording, outcome):
     tracer, exporter = recording
     client = FakeStageClient(stage_type="diffusion", final_output=True, final_output_type="image")
@@ -123,19 +134,73 @@ async def test_orchestrator_closes_diffusion_request_and_stage(recording, outcom
     elif outcome == "error":
         for index in range(2):
             await orch._fail_request_dead_stage(f"req-{index}", 0)
+    elif outcome == "dead_replica":
+        await orch._handle_dead_replica(0, 0, EngineDeadError())
     else:
         await orch._cleanup_request_ids(["req-0", "req-1"], abort=True)
     spans = exporter.get_finished_spans()
     assert len(spans) == 4
     pipelines = [s for s in spans if s.name == "omni.pipeline"]
     stages = [s for s in spans if s.name == "omni.stage"]
+    expected_outcome = "error" if outcome == "dead_replica" else outcome
     for pipeline in pipelines:
         assert pipeline.context.trace_id == int("12345678901234567890123456789012", 16)
-        assert pipeline.attributes["omni.request.outcome"] == outcome
-        assert pipeline.status.is_ok == (outcome != "error")
+        assert pipeline.attributes["omni.request.outcome"] == expected_outcome
+        assert pipeline.status.is_ok == (expected_outcome != "error")
         assert len([s for s in stages if s.parent.span_id == pipeline.context.span_id]) == 1
+    if expected_outcome == "error":
+        assert all(s.attributes["error.type"] == "engine_dead" for s in spans)
     assert not orch.request_states
     assert all("private" not in str(s.attributes) for s in spans)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error_type", ["invalid_request_error", None])
+async def test_stage_error_preserves_trace_error_type(recording, error_type):
+    tracer, exporter = recording
+    orch = Orchestrator(
+        request_async_queue=asyncio.Queue(),
+        output_async_queue=asyncio.Queue(),
+        rpc_async_queue=asyncio.Queue(),
+        stage_pools=_build_stage_pools([[FakeStageClient(final_output=True)]]),
+        tracer=tracer,
+    )
+    request_trace = RequestTrace(tracer, "failed", HEADERS)
+    request_trace.start_stage(0, 0, "llm")
+    orch.request_states["failed"] = OrchestratorRequestState(
+        request_id="failed", final_stage_id=0, sampling_params_list=[_sampling_params()], trace=request_trace
+    )
+    await orch._handle_stage_error(0, OmniRequestOutput.from_error("failed", "private error", error_type=error_type))
+    spans = exporter.get_finished_spans()
+    assert len(spans) == 2
+    assert all(span.attributes["error.type"] == (error_type or "stage_error") for span in spans)
+    assert all(span.status.status_code == trace.StatusCode.ERROR for span in spans)
+    assert not orch.request_states
+
+
+@pytest.mark.asyncio
+async def test_first_output_check_stops_after_nonempty_output(recording, mocker):
+    tracer, exporter = recording
+    pool = _build_stage_pools([[FakeStageClient(final_output=True, final_output_type="text")]])[0]
+    check_output = mocker.spy(pool, "has_non_empty_output")
+    orch = Orchestrator(
+        request_async_queue=asyncio.Queue(),
+        output_async_queue=asyncio.Queue(),
+        rpc_async_queue=asyncio.Queue(),
+        stage_pools=[pool],
+        tracer=tracer,
+    )
+    request_trace = RequestTrace(tracer, "stream", HEADERS)
+    request_trace.start_stage(0, 0, "llm")
+    req_state = OrchestratorRequestState(
+        request_id="stream", final_stage_id=0, sampling_params_list=[_sampling_params()], trace=request_trace
+    )
+    for text in ("", "first", "second"):
+        await orch._route_output(0, 0, _build_request_output("stream", text=text, finished=False), req_state, None)
+    request_trace.end()
+    stage = next(span for span in exporter.get_finished_spans() if span.name == "omni.stage")
+    assert [event.name for event in stage.events] == ["omni.stage.first_output"]
+    assert check_output.call_count == 2
 
 
 @pytest.mark.asyncio
