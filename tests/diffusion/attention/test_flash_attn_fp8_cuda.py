@@ -160,11 +160,13 @@ class TestForwardCudaQuantDispatch:
 
         monkeypatch.setattr(FlashAttentionImpl, "forward_fa_quant_cuda", _fail)
         monkeypatch.setattr(FlashAttentionImpl, "_forward_varlen_dense", lambda self, q, k, v: q)
-        # dense_flash_attn_func_for prefers optional_fa3_fwd_dense_func for bf16
-        # before flash_attn_func. Clear both so forward_cuda stays on the mocked fallback.
+        # forward_cuda imports these names at call time. bf16 prefers the optional
+        # fa3-fwd binding, and FA4 then ignores that callable and runs the real op.
         monkeypatch.setattr(fa_utils, "HAS_FLASH_ATTN", True)
+        monkeypatch.setattr(fa_utils, "IS_FLASH_ATTN_4", False)
         monkeypatch.setattr(fa_utils, "optional_fa3_fwd_dense_func", None)
         monkeypatch.setattr(fa_utils, "flash_attn_func", None)
+        monkeypatch.setattr(fa_utils, "dense_flash_attn_func_for", lambda _dtype: None)
         extra = {} if dtype_value is None else {"kv_cache_dtype": dtype_value}
         metadata = AttentionMetadata(extra=extra)
         impl.forward_cuda(_randn_bshd(1, 8), _randn_bshd(1, 8), _randn_bshd(1, 8), metadata)
