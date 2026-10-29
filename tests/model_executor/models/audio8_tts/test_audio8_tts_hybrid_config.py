@@ -183,8 +183,34 @@ class TestAudio8PipelineResolver:
         assert resolve_audio8_pipeline(None) is None
 
     def test_serialized_config_round_trips_to_the_hybrid_class(self):
-        """Regression guard: ``sub_configs`` must not drag a 0.1b config back to dense."""
-        restored = Audio8TTSConfig.from_dict(Audio8TTSConfig(**CONFIG_0P1B).to_dict())
+        """Neither the class nor any dimension may change across to_dict()/from_dict().
+
+        ``sub_configs`` routes a serialized ``text_config`` back to the dense class,
+        and the flat geometry is only preserved because ``Audio8TTSConfig`` stores it
+        as attributes -- assert the values, not just the class, or a silent fallback
+        to the 0.6b defaults would pass.
+        """
+        original = Audio8TTSConfig(**CONFIG_0P1B)
+        restored = Audio8TTSConfig.from_dict(original.to_dict())
+
+        assert restored.slow_backbone == "falcon_h1"
+        assert isinstance(restored.get_text_config(), Audio8TTSHybridSlowARConfig)
+
+        before, after = original.get_text_config(), restored.get_text_config()
+        for field in (
+            "hidden_size",
+            "num_hidden_layers",
+            "intermediate_size",
+            "vocab_size",
+            "mamba_d_ssm",
+            "mamba_n_heads",
+            "mamba_d_state",
+            "mamba_d_conv",
+            "semantic_begin_id",
+            "semantic_end_id",
+        ):
+            assert getattr(after, field) == getattr(before, field), field
+        assert restored.fast_ar_config.vocab_size == original.fast_ar_config.vocab_size
 
         assert restored.slow_backbone == "falcon_h1"
         assert isinstance(restored.get_text_config(), Audio8TTSHybridSlowARConfig)

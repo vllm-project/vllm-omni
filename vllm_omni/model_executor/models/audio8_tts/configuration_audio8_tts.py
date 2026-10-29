@@ -215,8 +215,11 @@ class Audio8TTSFastARConfig(PretrainedConfig):
 
         # ``to_dict()`` serializes ``vocab_size``, so a round-tripped sub-config
         # would otherwise pass it twice.
-        kwargs.pop("vocab_size", None)
-        super().__init__(vocab_size=int(codebook_size), **kwargs)
+        # ``to_dict()`` serializes ``vocab_size``; it is the only record of a
+        # non-default codebook size, so use it as the fallback.
+        codebook_size = int(kwargs.pop("vocab_size", codebook_size))
+        self.codebook_size = codebook_size
+        super().__init__(vocab_size=codebook_size, **kwargs)
 
 
 class Audio8TTSConfig(PretrainedConfig):
@@ -355,6 +358,18 @@ class Audio8TTSConfig(PretrainedConfig):
         )
 
         # Fields the stages read directly off the top-level config.
+        # Geometry: these are __init__ parameters, not inherited attributes, so
+        # without storing them ``to_dict()`` drops them and ``from_dict()`` falls
+        # back to the 0.6b defaults when the hybrid text config is rebuilt.
+        self.dim = int(dim)
+        self.n_head = int(n_head)
+        self.n_local_heads = int(n_local_heads)
+        self.head_dim = int(head_dim)
+        self.n_layer = int(n_layer)
+        self.intermediate_size = int(intermediate_size)
+        self.max_seq_len = int(max_seq_len)
+        self.rope_base = float(rope_base)
+        self.norm_eps = float(norm_eps)
         self.slow_backbone = str(slow_backbone) if slow_backbone is not None else None
         self.codebook_size = int(codebook_size)
         self.num_codebooks = int(num_codebooks)
