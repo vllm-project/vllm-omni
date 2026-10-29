@@ -51,6 +51,9 @@ not require backend-specific config accessors or an output pump in `DuplexOmni`.
 A module-level, entrypoint-owned worker factory loads normal general plugins
 and creates the native runtime in the child, including its orchestrator thread
 and stage clients. The engine transport has no model or entrypoint imports.
+`_DuplexProcessWorker` owns child-side control dispatch, session forwarding, and
+invalidation callbacks. Startup metadata is constructed by its typed snapshot,
+independently of the worker task lifecycle.
 The startup handshake exports typed session configuration, unchanged model
 capabilities, stage/deployment facts, frontend admission ownership, endpoint
 restrictions, and model-specific warmup audio. It exports no renderers,
@@ -65,8 +68,7 @@ without explicit length prefixes or batch envelopes. Socket buffering is left to
 asyncio and the operating system.
 The channel owns send admission, capacity-wait timeouts, and closure; closing it
 wakes blocked senders. Queues are bounded by message count and encoded bytes.
-Worker-side session
-buffers enforce native output limits; frontend overflow closes the affected
+Worker-side session buffers enforce native output limits; frontend overflow closes the affected
 session and requests engine cleanup. Worker or transport failure fails pending
 controls and closes handles. Graceful asynchronous shutdown flushes a shutdown
 request; synchronous shutdown provides bounded process-group termination.
