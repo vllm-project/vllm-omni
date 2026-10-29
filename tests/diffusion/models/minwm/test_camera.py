@@ -5,6 +5,7 @@
 import numpy as np
 import pytest
 
+from vllm_omni.diffusion.models.minwm import camera
 from vllm_omni.diffusion.models.minwm.camera import trajectory_cameras, trajectory_viewmats
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
@@ -22,6 +23,20 @@ def test_moves_follow_the_heading_after_a_yaw() -> None:
     camera_to_world = np.linalg.inv(trajectory_viewmats("l*1,w*1", num_latent_frames=3)[-1])
     theta = np.radians(3.0)
     np.testing.assert_allclose(camera_to_world[:3, 3], 0.08 * np.array([np.sin(theta), 0.0, np.cos(theta)]), atol=1e-6)
+
+
+def test_mixed_pitch_and_yaw_match_the_minwm_reference() -> None:
+    # Final pose of "i*5,l*5,w*4" from minWM's minwm/processors/camera.py:parse_trajectory, which yaws
+    # about the camera's own pitched Y axis; yawing about world up would land 0.067 away from this.
+    expected = np.array(
+        [
+            [0.9659258, 0.0669873, -0.25, 0.0],
+            [0.0, 0.9659258, 0.25881904, 0.0],
+            [0.25881904, -0.25, 0.9330127, -0.32],
+            [0.0, 0.0, 0.0, 1.0],
+        ]
+    )
+    np.testing.assert_allclose(trajectory_viewmats("i*5,l*5,w*4", num_latent_frames=15)[-1], expected, atol=1e-6)
 
 
 def test_cameras_carry_one_normalized_intrinsic_per_frame() -> None:
@@ -46,6 +61,6 @@ def test_step_counts_past_the_requested_frames_are_rejected_before_a_pose_is_bui
     def unreachable(*args: object, **kwargs: object) -> None:
         raise AssertionError("poses were built before the step count was validated")
 
-    monkeypatch.setattr(np.linalg, "inv", unreachable)
+    monkeypatch.setattr(camera, "_invert_rigid", unreachable)
     with pytest.raises(ValueError, match="latent frames"):
         trajectory_viewmats(trajectory, num_latent_frames=20)

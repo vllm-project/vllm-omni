@@ -162,12 +162,16 @@ a Self-Forcing three-frame block.
 
 ## Notes
 
-- Memory usage: 31.6 GiB peak reserved for a 77-frame request.
+- Memory usage: 31.6 GiB peak reserved for a 77-frame request. With
+  `use_prope` set, the paged KV cache reserves the `prope` branch for every
+  request, with or without a trajectory, which doubles the self-attention KV
+  pages per request; size the KV pool for that.
 - Key flags: `--enforce-eager` is the validated path.
 - Known limitations: one GPU only (no TP, SP, CFG parallelism or HSDP); PRoPE
-  rejects Ulysses sequence parallelism; no Cache-DiT or TeaCache, since the
-  four DMD steps are all distinct; no live camera control; streaming decode
-  requires the untiled VAE path.
+  self-attention rejects Ulysses sequence parallelism when the model loads, so
+  `--usp` above 1 fails at startup even for requests without a trajectory; no
+  Cache-DiT or TeaCache, since the four DMD steps are all distinct; no live
+  camera control; streaming decode requires the untiled VAE path.
 
 ## Supported features
 

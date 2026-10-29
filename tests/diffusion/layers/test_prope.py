@@ -23,7 +23,10 @@ def _rigid(frames: int, seed: int) -> torch.Tensor:
 
 
 def _intrinsics(frames: int) -> torch.Tensor:
-    return torch.tensor([[0.5, 0.0, 0.5], [0.0, 0.5, 0.5], [0.0, 0.0, 1.0]], dtype=torch.float64).repeat(frames, 1, 1)
+    # A focal length float32 cannot represent, so a float32 detour in the float64 math shows up.
+    focal = 969.6969696969696 / 1920.0
+    intrinsics = torch.tensor([[focal, 0.0, 0.5], [0.0, focal, 0.5], [0.0, 0.0, 1.0]], dtype=torch.float64)
+    return intrinsics.repeat(frames, 1, 1)
 
 
 def _features(seed: int) -> torch.Tensor:
@@ -48,4 +51,4 @@ def test_logits_are_invariant_to_a_shared_change_of_world_frame() -> None:
 def test_output_transform_undoes_the_value_transform_of_the_same_camera() -> None:
     cameras = PRoPECameras.from_views(_rigid(_FRAMES, seed=5), _intrinsics(_FRAMES), dtype=torch.float64)
     value = _features(6)
-    torch.testing.assert_close(apply_prope(apply_prope(value, cameras.key), cameras.output), value)
+    torch.testing.assert_close(apply_prope(apply_prope(value, cameras.key), cameras.output), value, rtol=0, atol=1e-12)
