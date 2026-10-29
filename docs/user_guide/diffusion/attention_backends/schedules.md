@@ -165,9 +165,10 @@ these errors on the job record rather than the creation response.
 ## Compatibility limits
 
 - Full compile scope and configured cache backends are rejected with profiles,
-  even with empty default ranges. Under regional compilation each attention
-  call is one opaque op inside the block graph, on every request including
-  `[]`; the op picks the profile when it runs, so the block stays one graph.
+  even with empty default ranges. Under regional compilation each Wan2.2
+  attention call is one opaque op inside the block graph, on every request
+  including `[]`; the op picks the profile when it runs, so the block stays one
+  graph. H3 selects outside the compiled graph (below).
   The op carries `attn_mask`, a `video_layout` without video spans and `extra`
   entries holding None, bools, ints or int tuples (a video grid). Other metadata
   (tensors, floats or strings in `extra`, video spans, and any other metadata
