@@ -392,6 +392,14 @@ class LingBotSelfAttention(nn.Module):
             sink_tokens=sink_tokens,
             update_cache=update_cache,
         )
+        if self.ulysses_world_size > 1:
+            # A leased projection fuses the head->sequence exchange with ``o``, so its result is already projected.
+            if _projection_lease is not None:
+                destination = _projection_lease.projection_input.unflatten(2, (40, 128))
+                all_to_all_4D(output, 1, 2, self.ulysses_group, _output_destination=destination)
+                _projection_lease.mark_projection_written()
+                return _projection_lease.finish()[0]
+            output = SeqAllToAll4D.apply(self.ulysses_group, output, 1, 2, False)
         return self.o(output.flatten(2, 3))
 
     def project_qkv(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -417,7 +425,11 @@ class LingBotSelfAttention(nn.Module):
         sink_tokens: int,
         update_cache: bool,
     ) -> torch.Tensor:
-        """Attend position-encoded TP-local q/k/v over ``cache``; returns TP-local heads before ``o``."""
+        """Attend position-encoded TP-local q/k/v over ``cache``, before ``o``.
+
+        Under Ulysses the q/k/v arrive sequence-sharded and are exchanged to head shards here, before the cache
+        sees them; the output is returned head-sharded, and ``forward`` exchanges it back alongside ``o``.
+        """
         if self.ulysses_world_size > 1:
             # One fused sequence->head all-to-all for q/k/v instead of three:
             # (B, S/N, 3, H, D) -> (B, S, 3, H/N, D). Same head-group assignment
@@ -462,13 +474,6 @@ class LingBotSelfAttention(nn.Module):
                 )
             else:
                 output = self.attn(query, visible_key, visible_value)
-        if self.ulysses_world_size > 1:
-            if _projection_lease is not None:
-                destination = _projection_lease.projection_input.unflatten(2, (40, 128))
-                all_to_all_4D(output, 1, 2, self.ulysses_group, _output_destination=destination)
-                _projection_lease.mark_projection_written()
-                return _projection_lease.finish()[0]
-            output = SeqAllToAll4D.apply(self.ulysses_group, output, 1, 2, False)
         return output
 
 
