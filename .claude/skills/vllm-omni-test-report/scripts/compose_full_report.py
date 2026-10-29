@@ -218,20 +218,33 @@ def _issue_created_date_utc(issue: dict) -> str | None:
     return None
 
 
+def _normalize_release_version(version: str) -> str:
+    """Normalize a version identifier for milestone matching.
+
+    Strips whitespace, lowercases, drops a leading ``release/`` prefix (the repo cuts
+    release branches as ``release/v0.32.0``) and a leading ``v``/``V``, so
+    ``release/v0.32.0`` / ``v0.32.0`` / ``0.32.0`` all normalize to ``0.32.0`` —
+    matching the GitHub milestone titled ``v0.32.0``.
+    """
+    v = version.strip().lower()
+    if v.startswith("release/"):
+        v = v[len("release/"):]
+    return v.lstrip("v")
+
+
 def _issue_milestone_matches(issue: dict, version: str) -> bool:
     """True if the issue's GitHub milestone title equals ``version`` (tolerant compare).
 
-    Comparison ignores case, surrounding whitespace, and an optional leading ``v``/``V``
-    on either side, so milestone ``v0.9.0`` matches ``--release-version 0.9.0`` and
-    vice versa. Issues with no milestone never match.
+    Comparison ignores case, surrounding whitespace, an optional leading ``v``/``V``,
+    and an optional ``release/`` branch prefix on either side, so milestone ``v0.9.0``
+    matches ``--release-version 0.9.0`` / ``release/v0.9.0`` and vice versa. Issues
+    with no milestone never match.
     """
     m = issue.get("milestone") or {}
     title = (m.get("title") or "").strip() if isinstance(m, dict) else ""
     if not title:
         return False
-    a = title.lower().lstrip("v")
-    b = version.strip().lower().lstrip("v")
-    return a == b
+    return _normalize_release_version(title) == _normalize_release_version(version)
 
 
 def _gh_ref_commit_sha(gh_token: str | None, ref: str) -> str | None:
@@ -301,17 +314,22 @@ def _gh_version_tags(gh_token: str | None) -> list[str]:
 def _resolve_release_commit_ref(gh_token: str | None, version: str) -> tuple[str, str]:
     """Release commit for ``version`` from the repo ref of the same name (tag or branch).
 
-    This repo has **no** per-version branches — releases are tagged (``v0.32.0``,
-    ``v0.30.0``, …), so the ref is normally the release tag; the shared
-    ``GET /commits/{ref}`` endpoint resolves tags and branches alike and peels
-    annotated tags down to the commit. Returns ``(full_sha, ref_used)``. Raises
-    ``RuntimeError`` listing the available version tags when nothing matches
-    (typo'd version / tag not pushed yet) — the caller should surface that
-    error instead of silently rendering a commit-less Version Info chapter.
+    The repo cuts release branches as ``release/v0.32.0`` **and** tags releases
+    (``v0.32.0``, ``v0.30.0``, …); the shared ``GET /commits/{ref}`` endpoint
+    resolves tags and branches alike and peels annotated tags down to the commit.
+    Candidate refs, in order: the version as given (so ``release/v0.32.0`` probes
+    the branch first and a bare ``v0.32.0`` probes the tag first), then the
+    ``release/``-prefixed / -stripped and ``v``-normalized cross-forms. Returns
+    ``(full_sha, ref_used)``. Raises ``RuntimeError`` listing the available
+    version tags when nothing matches (typo'd version / tag not pushed yet) —
+    the caller should surface that error instead of silently rendering a
+    commit-less Version Info chapter.
     """
     v = version.strip()
+    base = v[len("release/"):] if v.lower().startswith("release/") else v
+    stem = base.lstrip("vV") or base
     candidates: list[str] = []
-    for c in (v, f"v{v.lstrip('vV')}"):
+    for c in (v, base, f"release/{base}", f"v{stem}", f"release/v{stem}"):
         if c and c not in candidates:
             candidates.append(c)
     for ref in candidates:
@@ -2942,8 +2960,9 @@ def main() -> None:
         "--release-version",
         default=None,
         help=(
-            "Release variant only. Release version number (e.g. ``v0.9.0``) supplied by "
-            "the operator before each release-report generation. Renders the "
+            "Release variant only. Release version identifier (e.g. ``v0.9.0`` or the "
+            "release-branch form ``release/v0.32.0``) supplied by the operator before "
+            "each release-report generation. Renders the "
             "``## Version Info`` chapter (with --release-commit), retargets the Open "
             "issues section to the milestone whose title matches this version "
             "(open + label:bug + critical/high/medium priority + milestone == version, "
@@ -3136,7 +3155,9 @@ def main() -> None:
         parts: list[str] = []
         if args.release_version:
             v = re.sub(r"[^A-Za-z0-9._-]+", "-", args.release_version.strip()).strip("-")
-            if v and not v.lower().startswith("v"):
+            # Prepend "v" only for digit-leading versions ("0.9.0" -> "v0.9.0");
+            # "release-v0.32.0" already carries its prefix and must stay as-is.
+            if v and v[0].isdigit():
                 v = f"v{v}"
             if v:
                 parts.append(v)
