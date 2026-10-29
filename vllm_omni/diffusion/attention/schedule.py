@@ -4,6 +4,7 @@
 """Immutable step and normalized-noise schedules, independent of torch backends."""
 
 import math
+import numbers
 from collections.abc import Collection, Iterable, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, TypeAlias
@@ -245,12 +246,14 @@ _SIGMA_FIELDS = frozenset({"low", "high", "profile"})
 _SIGMA_ROUNDING_TOLERANCE = 1e-6
 
 
-def _validate_sigma(value: float, name: str) -> None:
-    if isinstance(value, bool) or type(value) not in (int, float):
+def _validate_sigma(value: float, name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, numbers.Real):
         raise TypeError(f"attention_sigma_schedule {name} must be a number, got {value!r}")
     # Compare without float(): an int too large for a float would raise OverflowError, not a client error.
     if not 0 <= value <= 1:  # also rejects NaN and infinities
         raise ValueError(f"attention_sigma_schedule {name} must be in [0, 1], got {value!r}")
+    # Store other reals, such as numpy scalars, as float, so windows compare and serialize like parsed JSON.
+    return value if type(value) in (int, float) else float(value)
 
 
 @dataclass(frozen=True)
@@ -262,8 +265,8 @@ class AttentionSigmaWindow:
     profile: str
 
     def __post_init__(self) -> None:
-        _validate_sigma(self.low, "low")
-        _validate_sigma(self.high, "high")
+        object.__setattr__(self, "low", _validate_sigma(self.low, "low"))
+        object.__setattr__(self, "high", _validate_sigma(self.high, "high"))
         if self.high <= self.low:
             raise ValueError("attention_sigma_schedule high must be greater than low")
         validate_attention_profile_name(self.profile)
