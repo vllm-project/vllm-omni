@@ -697,10 +697,26 @@ through stride-5 pooling. Reference audio must not be cropped to a 100 ms
 boundary to simplify budgeting: the remaining samples can change the
 embeddings even when they do not add a pooled token.
 
-The MiniCPM-o SigLIP vision tower defaults to SDPA on all platforms. An
-explicit engine or vision attention setting still overrides the default.
-Eager attention remains available for checkpoint arithmetic comparisons;
-SDPA and eager can produce different BF16 embeddings.
+The MiniCPM-o SigLIP vision tower defaults to reference attention for CUDA BF16 duplex
+sessions. SDPA and eager produce different BF16 embeddings, which can change
+scene descriptions during long video sessions. Turn-mode and non-CUDA vision
+retain SDPA by default. An explicit engine or vision attention setting still
+overrides the default.
+
+The reference vision path fuses scaling and softmax for unmasked CUDA BF16
+inputs, preserving BF16 score/probability rounding and FP32 accumulation.
+Encoder CUDA graphs remain enabled. This avoids the full FP32 probability
+buffer used by eager attention, but still materializes attention scores and
+can reduce vision throughput compared with SDPA at larger image batches.
+An explicit `vision_config._attn_implementation="sdpa"` keeps the SDPA path.
+
+With reference vision attention, `vision_fused_layers: true` does not enable
+fused encoder layers: `supports_fused_layers()` excludes this attention backend.
+This also applies to the `minicpmo_4_5_duplex_h200.yaml` profile. Packed encoding,
+vision CUDA graphs and the fused scaled softmax remain enabled in that profile.
+Selecting SDPA explicitly allows fused encoder layers, but can change BF16 vision
+outputs and requires rechecking long-video recognition for the workload.
+
 MiniCPM-o deployments select `TRITON_ATTN` for CUDA stage 0, including the
 standalone 2-GPU, 3-GPU and 8x4090 layouts and inherited replica and turn-mode
 profiles. Talker and NPU attention settings are unchanged. This aligns the

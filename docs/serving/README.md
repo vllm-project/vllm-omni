@@ -55,6 +55,7 @@ the default wrapper for every generation task.
 | Text-to-image | `POST /v1/images/generations` | JSON | Base64 JSON or an image file | [Image Generation](image_generation_api.md) |
 | Image editing | `POST /v1/images/edits` | Multipart form | Base64 JSON or SSE | [Image Edit](image_edit_api.md) |
 | Promptable image segmentation | `POST /v1/images/segmentations` | Multipart form | Instance masks, boxes, scores (JSON) | [Image Segmentation](image_segmentation_api.md) |
+| Video concept segmentation and tracking | `POST /v1/videos/segmentations` | Multipart form | Per-frame tracked instance masks, boxes, scores (JSON); optional mask videos | [Video Segmentation](video_segmentation_api.md) |
 | Video generation (recommended) | `POST /v1/videos` | Multipart form | Asynchronous job JSON | [Videos](videos_api.md) |
 | Video generation (blocking) | `POST /v1/videos/sync` | Multipart form | Video bytes | [Videos](videos_api.md#synchronous-response) |
 

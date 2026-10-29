@@ -202,7 +202,7 @@ def test_request_encodes_only_window_prompts_and_prepares_references_once(monkey
     monkeypatch.setattr(module, "prepare_encoder_inputs", prepare_once)
     pipeline.encode_prompt = encode_text
     pipeline._encode_local_media = encode_media
-    pipeline._prepare_encoder_conditioning_inputs = lambda conditioning, sampling: {
+    pipeline._prepare_encoder_conditioning_inputs = lambda conditioning, sampling, **_: {
         "text_embeddings": conditioning.hidden_states,
         "continuation": (277, 22),
         "num_frames": conditioning.num_frames,

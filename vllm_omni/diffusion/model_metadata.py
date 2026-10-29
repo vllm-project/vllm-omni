@@ -27,6 +27,9 @@ class DiffusionModelMetadata:
     # Whether ``/v1/images/segmentations`` may serve this model: it takes one
     # image plus text/box prompts and returns a ``segmentation`` payload.
     supports_segmentation: bool = False
+    # Whether ``/v1/videos/segmentations`` may serve this model: it takes one
+    # video path plus text prompts and returns a ``video_segmentation`` payload.
+    supports_video_segmentation: bool = False
 
 
 # FLUX.2 Klein supports up to four reference images.
@@ -47,6 +50,7 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
         supports_multimodal_inputs=True,
         max_multimodal_image_inputs=1,
         supports_segmentation=True,
+        supports_video_segmentation=True,
     ),
     "Flux2KleinPipeline": DiffusionModelMetadata(
         supports_multimodal_inputs=True,
@@ -81,6 +85,7 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
         supports_multimodal_inputs=True,
         max_multimodal_image_inputs=9,
         supports_mixed_reference_inputs=True,
+        supported_control_upload_types=("canny", "depth", "hed", "mlsd", "pose", "inpaint"),
         supports_latent_mask_editing=True,
         supports_timeline_guides=True,
         final_output_type="video",
@@ -97,6 +102,7 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
         supports_multimodal_inputs=True,
         max_multimodal_image_inputs=9,
         supports_mixed_reference_inputs=True,
+        supported_control_upload_types=("canny", "depth", "hed", "mlsd", "pose", "inpaint"),
         supports_latent_mask_editing=True,
         supports_timeline_guides=True,
         final_output_type="video",
