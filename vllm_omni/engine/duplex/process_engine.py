@@ -106,6 +106,7 @@ class _MessageSocket:
         self.queue: asyncio.Queue[bytes] = asyncio.Queue(_QUEUE_SIZE)
         self.pending_bytes = 0
         self._space = asyncio.Event()
+        self._failure: str | None = None
 
     @staticmethod
     def entry(message: tuple[Any, ...]) -> bytes:
@@ -115,13 +116,24 @@ class _MessageSocket:
         return payload
 
     def put_nowait(self, entry: bytes) -> None:
+        if self._failure is not None:
+            raise DuplexSessionError(self._failure, code="engine_dead")
         if self.pending_bytes + len(entry) > _QUEUE_BYTES:
             raise asyncio.QueueFull
         self.queue.put_nowait(entry)
         self.pending_bytes += len(entry)
 
-    async def send(self, message: tuple[Any, ...]) -> None:
-        await self.send_entry(self.entry(message))
+    async def send(self, message: tuple[Any, ...], *, timeout: float | None = None) -> None:
+        entry = self.entry(message)
+        try:
+            self.put_nowait(entry)
+        except asyncio.QueueFull:
+            try:
+                await asyncio.wait_for(self.send_entry(entry), timeout)
+            except (TimeoutError, asyncio.TimeoutError) as exc:
+                raise DuplexSessionError(
+                    "Duplex IPC queue is full", code="engine_backpressure", retryable=True
+                ) from exc
 
     async def send_entry(self, entry: bytes) -> None:
         while True:
@@ -148,6 +160,11 @@ class _MessageSocket:
             if not chunk:
                 raise EOFError("Duplex IPC connection closed")
             self.unpacker.feed(chunk)
+
+    def close(self, detail: str = "Duplex IPC connection closed") -> None:
+        self._failure = self._failure or detail
+        self._space.set()
+        self.writer.close()
 
 
 def _new_unpacker() -> msgpack.Unpacker:
@@ -236,6 +253,8 @@ async def _serve_worker(sock: socket.socket, model: str, options: dict[str, Any]
             def enqueue() -> None:
                 try:
                     channel.put_nowait(entry)
+                except DuplexSessionError:
+                    return  # The channel closed before this callback ran.
                 except asyncio.QueueFull:
                     if not fatal.done():
                         fatal.set_exception(RuntimeError("Duplex IPC invalidation queue overflow"))
@@ -337,7 +356,7 @@ async def _serve_worker(sock: socket.socket, model: str, options: dict[str, Any]
         if runtime is not None:
             runtime.shutdown()
         if channel is not None:
-            channel.writer.close()
+            channel.close()
             with suppress(ConnectionError):
                 await channel.writer.wait_closed()
         sock.close()
@@ -366,7 +385,6 @@ class ProcessDuplexEngineClient:
         self._invalidated: dict[str, dict[str, int]] = {}
         self._outputs: asyncio.Queue[DuplexSessionEventMessage] = asyncio.Queue(_QUEUE_SIZE)
         self._failure: str | None = None
-        self._transport_failed: asyncio.Future[None] | None = None
         self._channel: _MessageSocket | None = None
         self._start_task: asyncio.Task[None] | None = None
         self._tasks: list[asyncio.Task[None]] = []
@@ -426,7 +444,6 @@ class ProcessDuplexEngineClient:
     async def _connect(self) -> None:
         reader, writer = await asyncio.open_connection(sock=self._socket)
         self._channel = _MessageSocket(reader, writer, self._unpacker)
-        self._transport_failed = asyncio.get_running_loop().create_future()
         self._tasks = [asyncio.create_task(self._channel.write()), asyncio.create_task(self._read())]
         for task in self._tasks:
             task.add_done_callback(self._transport_done)
@@ -442,8 +459,9 @@ class ProcessDuplexEngineClient:
 
     def _fail(self, detail: str) -> None:
         self._failure = detail
-        if self._transport_failed is not None and not self._transport_failed.done():
-            self._transport_failed.set_result(None)
+        if self._channel is not None:
+            with suppress(RuntimeError):
+                self._channel.close(detail)
         for future in self._pending.values():
             if not future.done():
                 future.set_exception(DuplexSessionError(detail, code="engine_dead"))
@@ -458,27 +476,8 @@ class ProcessDuplexEngineClient:
         self.start()
         assert self._start_task is not None
         await self._start_task
-        if self._closed or self._failure:
-            raise DuplexSessionError(self._failure or "engine closed", code="engine_dead")
         assert self._channel is not None
-        entry = self._channel.entry(message)
-        try:
-            self._channel.put_nowait(entry)
-            return
-        except asyncio.QueueFull:
-            pass
-        put = asyncio.create_task(self._channel.send_entry(entry))
-        try:
-            assert self._transport_failed is not None
-            done, _ = await asyncio.wait((put, self._transport_failed), timeout=30, return_when=asyncio.FIRST_COMPLETED)
-            if not done:
-                raise DuplexSessionError("Duplex IPC queue is full", code="engine_backpressure", retryable=True)
-            if put not in done or self._failure:
-                raise DuplexSessionError(self._failure or "engine transport stopped", code="engine_dead")
-            put.result()
-        finally:
-            if not put.done():
-                put.cancel()
+        await self._channel.send(message, timeout=30)
 
     async def _rpc(self, operation: str, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
         request_id = next(self._ids)
@@ -663,10 +662,6 @@ class ProcessDuplexEngineClient:
             self._start_task.cancel()
         for task in self._cleanup_tasks:
             task.cancel()
-        if self._channel is not None:
-            # Synchronous finalization can run after the caller closed its loop.
-            with suppress(RuntimeError):
-                self._channel.writer.close()
         self._socket.close()
         if self._process.pid is not None:
             self._process.join(timeout=5 if timeout is None else timeout)

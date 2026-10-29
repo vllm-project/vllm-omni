@@ -9,6 +9,7 @@ import asyncio
 import os
 import socket
 from dataclasses import dataclass
+from unittest.mock import AsyncMock, Mock
 
 import msgspec
 import pytest
@@ -205,6 +206,66 @@ def test_transport_handles_partial_and_consecutive_messages(partial_eof):
             aw.close()
             bw.close()
             await asyncio.gather(aw.wait_closed(), bw.wait_closed())
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("limit", ["messages", "bytes"])
+def test_transport_close_wakes_blocked_senders(monkeypatch, limit):
+    async def run():
+        import vllm_omni.engine.duplex.process_engine as transport
+
+        message = ("command", b"pcm")
+        monkeypatch.setattr(transport, "_QUEUE_SIZE", 1 if limit == "messages" else 1024)
+        if limit == "bytes":
+            monkeypatch.setattr(transport, "_QUEUE_BYTES", len(msgspec.msgpack.encode(message)))
+        channel = _MessageSocket(asyncio.StreamReader(), Mock())
+        await channel.send(message)
+        blocked = [asyncio.create_task(channel.send(message)) for _ in range(2)]
+        await asyncio.sleep(0)
+        assert all(not task.done() for task in blocked)
+        channel.close("worker exited")
+        for task in blocked:
+            with pytest.raises(DuplexSessionError, match="worker exited") as failed:
+                await asyncio.wait_for(task, 1)
+            assert failed.value.code == "engine_dead"
+        with pytest.raises(DuplexSessionError):
+            await channel.send(message)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("cancel", [False, True], ids=["timeout", "cancellation"])
+def test_transport_abandoned_send_is_not_delivered(monkeypatch, cancel):
+    async def run():
+        monkeypatch.setattr("vllm_omni.engine.duplex.process_engine._QUEUE_SIZE", 1)
+        writer = Mock(drain=AsyncMock())
+        channel = _MessageSocket(asyncio.StreamReader(), writer)
+        await channel.send(("first",))
+        blocked = asyncio.create_task(channel.send(("abandoned",), timeout=1 if cancel else 0.01))
+        if cancel:
+            await asyncio.sleep(0)
+            blocked.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await blocked
+        else:
+            with pytest.raises(DuplexSessionError) as failed:
+                await blocked
+            assert failed.value.code == "engine_backpressure"
+            assert failed.value.retryable
+        pump = asyncio.create_task(channel.write())
+        try:
+            await asyncio.sleep(0)
+            await channel.send(("last",))
+            await asyncio.sleep(0)
+            assert [msgspec.msgpack.decode(call.args[0]) for call in writer.write.call_args_list] == [
+                ["first"],
+                ["last"],
+            ]
+        finally:
+            pump.cancel()
+            await asyncio.gather(pump, return_exceptions=True)
+            channel.close()
 
     asyncio.run(run())
 
