@@ -33,7 +33,6 @@ from vllm_omni.model_executor.models.chatterbox.chatterbox_s3gen import (
     StreamState,
     fade_in_out,
     flow_mels,
-    window,
 )
 from vllm_omni.transformers_utils.configs.chatterbox import ChatterboxConfig
 
@@ -67,6 +66,7 @@ def stream_payload(ref: Reference | None, finished: bool, offset: int) -> dict:
             "finished": torch.tensor(finished),
             "stream_finished": torch.tensor(finished),
             "left_context_size": offset,
+            "num_processed_tokens": 0,
         },
         "generated_len": 0,
         "req_id": "scheduler-id",
@@ -86,7 +86,7 @@ def stream_payload(ref: Reference | None, finished: bool, offset: int) -> dict:
 def decoder() -> S3GenDecoder:
     """A float32 flow: the value-level checks below compare float32 computations."""
     torch.manual_seed(0)
-    return S3GenDecoder(ChatterboxConfig(flow_dtype="float32"), CONTEXT, LEFT_CONTEXT, SEED).eval()
+    return S3GenDecoder(ChatterboxConfig(flow_dtype="float32"), CONTEXT, SEED).eval()
 
 
 @pytest.fixture(scope="module")
@@ -115,7 +115,7 @@ def test_bfloat16_flow_keeps_vocoder_and_audio_in_float32(decoder: S3GenDecoder)
     The decoder is built from the default config, whose flow runs in
     bfloat16, with the float32 decoder's weights.
     """
-    bf16 = S3GenDecoder(ChatterboxConfig(), CONTEXT, LEFT_CONTEXT, SEED).eval()
+    bf16 = S3GenDecoder(ChatterboxConfig(), CONTEXT, SEED).eval()
     bf16.load_state_dict(decoder.state_dict())
     flow_dtypes, vocoder_dtypes = [], []
 
@@ -142,16 +142,6 @@ def test_bfloat16_flow_keeps_vocoder_and_audio_in_float32(decoder: S3GenDecoder)
     assert torch.isfinite(audio).all()
     assert state is None
     assert next(bf16.flow.parameters()).dtype == torch.float32
-
-
-def test_window_keeps_the_left_context_and_rebases_the_offset() -> None:
-    tokens = torch.arange(200)
-    kept, offset = window(tokens, 120, LEFT_CONTEXT)
-    assert torch.equal(kept, tokens[120 - LEFT_CONTEXT :])
-    assert offset == LEFT_CONTEXT
-    kept, offset = window(tokens, 10, LEFT_CONTEXT)
-    assert torch.equal(kept, tokens)
-    assert offset == 10
 
 
 def test_batch_rows_match_single_rows_with_different_references(
@@ -540,12 +530,12 @@ def test_a_row_does_not_depend_on_its_batch(decoder: S3GenDecoder, references: l
 def test_noise_is_taken_by_position_for_every_prompt_length(decoder: S3GenDecoder, references: list[Reference]) -> None:
     """A row is the prompt region from frame 0, then the tokens' own frames."""
     tokens = torch.randint(0, 6561, (113,))
-    # Seventy tokens played: the window keeps tokens[20:], fifty of them context.
+    # Seventy tokens played: the chunk processor sends tokens[20:], fifty of them context.
     kept = tokens[20:]
     start = decoder.prompt_noise_frames + 2 * 20
     for ref in references:
         prompt = 2 * ref.prompt_token.shape[1]
-        (mel,) = decoder.chunk_mels([Chunk(tokens, 70, ref, None, False)])
+        (mel,) = decoder.chunk_mels([Chunk(kept, LEFT_CONTEXT, ref, None, False, start=20)])
 
         def decoded_from(utterance_start: int) -> torch.Tensor:
             noise = torch.cat(
@@ -611,8 +601,8 @@ def test_a_longer_context_keeps_the_noise_of_the_default_cap():
     it has always been.
     """
     config = ChatterboxConfig()
-    capped = S3GenDecoder(config, config.max_new_tokens, LEFT_CONTEXT, SEED).flow_noise
-    longer = S3GenDecoder(config, CONTEXT, LEFT_CONTEXT, SEED).flow_noise
+    capped = S3GenDecoder(config, config.max_new_tokens, SEED).flow_noise
+    longer = S3GenDecoder(config, CONTEXT, SEED).flow_noise
 
     frames = 2 * (250 + config.max_new_tokens + config.n_silence_tokens)
     assert capped.shape == (1, 80, frames)
@@ -620,7 +610,7 @@ def test_a_longer_context_keeps_the_noise_of_the_default_cap():
     assert longer.shape == (1, 80, 2 * (250 + CONTEXT + config.n_silence_tokens))
     assert torch.equal(longer[:, :, :frames], capped)
     # A context under the cap still gets the capped buffer.
-    assert torch.equal(S3GenDecoder(config, 300, LEFT_CONTEXT, SEED).flow_noise, capped)
+    assert torch.equal(S3GenDecoder(config, 300, SEED).flow_noise, capped)
 
 
 def test_an_utterance_at_the_context_limit_has_noise_for_its_last_frame(
@@ -637,7 +627,8 @@ def test_an_utterance_at_the_context_limit_has_noise_for_its_last_frame(
     start = decoder.prompt_noise_frames + 2 * (CONTEXT - 48 - LEFT_CONTEXT)
     assert start + 2 * kept.numel() == decoder.flow_noise.shape[2]
 
-    (mel,) = decoder.chunk_mels([Chunk(tokens, CONTEXT - 48, references[0], None, True)])
+    first = CONTEXT - 48 - LEFT_CONTEXT
+    (mel,) = decoder.chunk_mels([Chunk(tokens[first:], LEFT_CONTEXT, references[0], None, True, start=first)])
 
     noise = torch.cat([decoder.flow_noise[:, :, :prompt], decoder.flow_noise[:, :, start:]], dim=2)
     (whole,) = flow_mels(decoder.flow, [kept], [references[0]], [True], 2, True, noise)
@@ -811,22 +802,6 @@ def test_the_deploy_files_stage_loads_its_own_weights_and_draws_the_shared_noise
     assert torch.equal(stage.flow_noise, decoder.flow_noise)
 
 
-def test_the_stage_takes_its_left_context_from_the_deploy_files_connector(model_dir: str) -> None:
-    """``codec_left_context_frames`` is the connector's, like the chunk processor's schedule; it has no default."""
-    deploy = modify_stage_config(
-        get_deploy_config_path(DEPLOY["turbo"]),
-        updates={"connectors.connector_of_shared_memory.extra.codec_left_context_frames": 7},
-    )
-    assert build_stage(stage_vllm_config(model_dir, deploy, 1), "cpu").left_context_tokens == 7
-
-    deploy = modify_stage_config(
-        get_deploy_config_path(DEPLOY["turbo"]),
-        deletes={"connectors.connector_of_shared_memory.extra.codec_left_context_frames": None},
-    )
-    with pytest.raises(KeyError, match="codec_left_context_frames"):
-        build_stage(stage_vllm_config(model_dir, deploy, 1), "cpu")
-
-
 def test_a_largest_chunk_below_the_first_is_refused_at_startup(model_dir: str) -> None:
     """The schedule grows from codec_chunk_frames to codec_max_chunk_frames; a cap below the start is a typo."""
     deploy = modify_stage_config(
@@ -842,7 +817,7 @@ def test_the_stage_seeds_its_flow_noise_with_its_own_seed(model_dir: str) -> Non
     config = stage_vllm_config(model_dir, DEPLOY["turbo"], 1, seed=7)
     stage = build_stage(config, "cpu")
 
-    expected = S3GenDecoder(config.model_config.hf_config, config.model_config.max_model_len, LEFT_CONTEXT, 7)
+    expected = S3GenDecoder(config.model_config.hf_config, config.model_config.max_model_len, 7)
     assert torch.equal(stage.flow_noise, expected.flow_noise)
 
 

@@ -100,7 +100,7 @@ def test_payload_is_one_final_chunk_in_the_requests_own_voice() -> None:
     payload = to_struct(stage_input["additional_information"])
 
     assert bool(payload.meta.stream_finished) is True
-    assert payload.meta.left_context_size == 0
+    assert payload.meta.left_context_size == 0 and payload.meta.num_processed_tokens == 0
     reference = prompt["additional_information"]["embed"]
     assert payload.embed.speech_token is reference["speech_token"]
     assert payload.embed.speech_feat is reference["speech_feat"]
@@ -135,7 +135,7 @@ def stage_configs(tmp_path_factory: pytest.TempPathFactory) -> list:
 
 @pytest.fixture(scope="module")
 def decoder() -> S3GenDecoder:
-    return S3GenDecoder(ChatterboxConfig(), 2048, LEFT_CONTEXT, SEED).eval()
+    return S3GenDecoder(ChatterboxConfig(), 2048, SEED).eval()
 
 
 @pytest.fixture
@@ -281,6 +281,7 @@ def chunk_sequence(payloads: list[OmniPayloadStruct]) -> list[tuple]:
         (
             payload.codes.audio.tolist(),
             payload.meta.left_context_size,
+            payload.meta.num_processed_tokens,
             bool(payload.meta.finished),
             None if payload.meta.stream_finished is None else bool(payload.meta.stream_finished),
             sorted(to_dict(payload).get("embed", {})),
@@ -315,17 +316,24 @@ def test_streamed_chunks_decode_to_the_whole_utterance(
     decoder: S3GenDecoder,
 ) -> None:
     """The processor chunks as the deploy file says and emits payloads stage 1 accepts."""
-    tokens = torch.randint(0, 6561, (60,)).tolist()
+    tokens = torch.randint(0, 6561, (120,)).tolist()
 
     payloads = streamed_payloads(side, adapter, plane, receiver, request_prompt(250), tokens)
 
-    # First hop 15 plus 5 to align the 250-token reference, then 30; every
-    # chunk but the last waits for the 3-token lookahead.
+    # First hop 15 plus 5 to align the 250-token reference, then 30, then 60;
+    # every chunk but the last waits for the 3-token lookahead. Once more
+    # than LEFT_CONTEXT (50) tokens are played, the earlier ones are not
+    # sent: the last chunk starts at token 60, 50 before the 110 played.
     assert [
-        (payload.codes.audio.numel(), payload.meta.left_context_size, bool(payload.meta.stream_finished))
+        (
+            payload.codes.audio.numel(),
+            payload.meta.left_context_size,
+            payload.meta.num_processed_tokens,
+            bool(payload.meta.stream_finished),
+        )
         for payload in payloads
-    ] == [(23, 0, False), (53, 20, False), (60, 50, True)]
-    assert decoded_samples(side, decoder, payloads) == 2 * (60 + 3) * SAMPLES_PER_FRAME
+    ] == [(23, 0, 0, False), (53, 20, 0, False), (113, 50, 0, False), (60, LEFT_CONTEXT, 60, True)]
+    assert decoded_samples(side, decoder, payloads) == 2 * (120 + 3) * SAMPLES_PER_FRAME
     assert decoder.streams == {}
 
 
@@ -378,33 +386,42 @@ def test_every_utterance_length_is_sent_once_and_finished_once(
             payloads = streamed_payloads(side, adapter, plane, receiver, prompt, tokens[:length], capped)
             sequences.append(chunk_sequence(payloads))
             codes = [payload.codes.audio.tolist() for payload in payloads]
-            offsets = [payload.meta.left_context_size for payload in payloads]
+            starts = [payload.meta.num_processed_tokens for payload in payloads]
+            ends = [start + len(sent) for start, sent in zip(starts, codes, strict=True)]
+            # Tokens already played, counted from the start of the utterance.
+            played = [start + payload.meta.left_context_size for start, payload in zip(starts, payloads, strict=True)]
 
             # One final payload, the last, holding the whole utterance; nothing after it.
             finals = [bool(payload.meta.stream_finished) for payload in payloads]
             assert finals == [bool(payload.meta.finished) for payload in payloads], (side, length)
             assert finals == [False] * (len(payloads) - 1) + [True], (side, length)
-            assert codes[-1] == tokens[:length], (side, length)
-            # Each payload is a prefix with something past its offset to decode.
-            assert all(sent == tokens[: len(sent)] for sent in codes), (side, length)
-            assert all(len(sent) > offset for sent, offset in zip(codes, offsets, strict=True)), (side, length)
+            assert ends[-1] == length, (side, length)
+            # Each payload is the utterance's tokens from its start, with
+            # something past the played ones to decode, and at most
+            # LEFT_CONTEXT played tokens of context.
+            assert all(sent == tokens[start:end] for sent, start, end in zip(codes, starts, ends, strict=True)), (
+                side,
+                length,
+            )
+            assert all(end > done for end, done in zip(ends, played, strict=True)), (side, length)
+            assert starts == [max(0, done - LEFT_CONTEXT) for done in played], (side, length)
             # The cursor starts at 0 and moves by the hops. A chunk that is not
-            # the last ends exactly the lookahead past the next one's offset: the
+            # the last ends exactly the lookahead past the next one's cursor: the
             # next chunk decodes from where this one stopped, no token twice.
-            assert offsets == [sum(hops[:sent]) for sent in range(len(payloads))], (side, length)
-            assert [len(sent) - lookahead for sent in codes[:-1]] == offsets[1:], (side, length)
+            assert played == [sum(hops[:sent]) for sent in range(len(payloads))], (side, length)
+            assert [end - lookahead for end in ends[:-1]] == played[1:], (side, length)
             # The reference travels once.
             assert [payload.embed is not None for payload in payloads] == [True] + [False] * (len(payloads) - 1), (
                 side,
                 length,
             )
 
-            if len(payloads) > 1 and codes[-1] == codes[-2]:
+            if len(payloads) > 1 and ends[-1] == ends[-2]:
                 ended_on_a_boundary[side].append(length)
         assert (sequences[0] == sequences[1]) != (capped and length in boundaries), length
 
-    # After an end on a boundary the last payload repeats the codes with a
-    # new offset, and only the lookahead is left to decode.
+    # After an end on a boundary the last payload ends where the one before
+    # did, with a new cursor, and only the lookahead is left to decode.
     assert ended_on_a_boundary == {"scheduler-side": [] if capped else boundaries, "runner-side": boundaries}
 
 
@@ -424,7 +441,9 @@ def test_an_utterance_ending_on_a_chunk_boundary_decodes_to_its_own_length(
 
     payloads = streamed_payloads(side, adapter, plane, receiver, request_prompt(prompt_tokens), tokens)
 
-    assert payloads[-1].codes.audio.tolist() == payloads[-2].codes.audio.tolist() == tokens
+    # Both of the last two payloads run to the utterance's end, each from its own start.
+    for payload in payloads[-2:]:
+        assert payload.codes.audio.tolist() == tokens[payload.meta.num_processed_tokens :]
     assert decoded_samples(side, decoder, payloads) == 2 * (length + 3) * SAMPLES_PER_FRAME
     assert decoder.streams == {}
 
@@ -518,8 +537,8 @@ def test_a_stream_aborted_between_chunks_is_flushed_and_freed(
     plane.abort_requests({"internal-id"})
 
     assert chunk_sequence(received(receiver, external_id, 0)) == [
-        (tokens[:23], 0, False, False, ["embedding", "speech_feat", "speech_token"]),
-        (tokens, 20, True, True, []),
+        (tokens[:23], 0, 0, False, False, ["embedding", "speech_feat", "speech_token"]),
+        (tokens, 20, 0, True, True, []),
     ]
     assert plane.request_payload == {} and plane.code_prompt_token_ids == {}
 
@@ -578,7 +597,9 @@ def test_tokens_sampled_but_never_shown_are_an_error(plane: OmniRunnerDataPlane)
         call([14, 15], history=False)
 
 
-@pytest.mark.parametrize("key", ["codec_chunk_frames", "codec_max_chunk_frames", "codec_stream_scale_factor"])
+@pytest.mark.parametrize(
+    "key", ["codec_chunk_frames", "codec_max_chunk_frames", "codec_stream_scale_factor", "codec_left_context_frames"]
+)
 def test_a_deploy_file_without_a_chunk_setting_is_an_error(stage_configs: list, key: str) -> None:
     """The schedule is the deploy file's; no setting has a default to fall back on.
 
@@ -645,7 +666,9 @@ def test_two_requests_interleaved_keep_their_own_schedule_and_voice(
         (40, 23),
     ]
     for name, payloads in sent.items():
-        assert all(payload.codes.audio.tolist() == tokens[name][: len(payload.codes.audio)] for payload in payloads)
+        for payload in payloads:
+            start = payload.meta.num_processed_tokens
+            assert payload.codes.audio.tolist() == tokens[name][start : start + len(payload.codes.audio)]
         reference = prompts[name]["additional_information"]["embed"]
         assert torch.equal(payloads[0].embed.speech_token, reference["speech_token"])
         assert torch.equal(payloads[0].embed.embedding, reference["embedding"])

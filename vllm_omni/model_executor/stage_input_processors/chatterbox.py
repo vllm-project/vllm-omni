@@ -82,8 +82,11 @@ def t3_to_s3gen_async_chunk(
     each later chunk is ``codec_stream_scale_factor`` times the one before up
     to ``codec_max_chunk_frames``, and a chunk that is not the last waits for
     the flow's lookahead (``PRE_LOOKAHEAD`` tokens beyond its own, which the
-    flow reads ahead and stage 1 does not play). A chunk is sent as the whole
-    utterance so far through that lookahead, with the offset of its new part.
+    flow reads ahead and stage 1 does not play). A chunk is sent as its
+    tokens through that lookahead, preceded by the last
+    ``codec_left_context_frames`` played tokens the flow decodes it with,
+    with the offset of its new part and the utterance index of its first
+    token; earlier tokens are never sent again.
 
     Tokens come from the request snapshot, never from ``multimodal_output``.
     The scheduler-side transport hands over the full output history on every
@@ -97,7 +100,7 @@ def t3_to_s3gen_async_chunk(
 
     Args:
         transfer_manager: The stage's transport, one of two classes with no
-            common type. Its connector's config holds the three ``codec_*``
+            common type. Its connector's config holds the four ``codec_*``
             settings of the deploy file.
         multimodal_output: The step's payload for the request, unused.
         request: The transport's snapshot of the request, a different type
@@ -117,7 +120,9 @@ def t3_to_s3gen_async_chunk(
         KeyError: If the deploy file's connector lacks one of the settings.
         RuntimeError: If the request has sampled more tokens than were taken
             and the snapshot no longer has them: the audio would be missing
-            them with no other symptom.
+            them with no other symptom. Also if a finished request with
+            played tokens has none past them: its stream would never be
+            finalized.
     """
     request_id = request.external_req_id
     if request_id.endswith(CFG_UNCOND_SUFFIX):
@@ -126,6 +131,7 @@ def t3_to_s3gen_async_chunk(
     settings = transfer_manager.connector.config
     chunk, largest = settings["codec_chunk_frames"], settings["codec_max_chunk_frames"]
     growth = settings["codec_stream_scale_factor"]
+    left_context = settings["codec_left_context_frames"]
 
     state = transfer_manager.request_payload.get(request_id)
     if state is None:
@@ -170,10 +176,16 @@ def t3_to_s3gen_async_chunk(
     sent, hop = state["sent"], state["hop"]
     if is_finished:
         state["terminal_sent"] = True
+        end = len(tokens)
         # Every chunk leaves its lookahead unsent, so only an utterance with
         # no speech tokens ends with nothing past the cursor; its empty codes
-        # clear stage 1's placeholder prompt.
-        end = len(tokens)
+        # clear stage 1's placeholder prompt. A stream already playing must
+        # end with tokens, or stage 1 never finalizes it.
+        if sent and end <= sent:
+            raise RuntimeError(
+                f"Chatterbox request {request_id} finished with nothing past its {sent} played tokens: "
+                f"its chunks left no lookahead (PRE_LOOKAHEAD={PRE_LOOKAHEAD}) to end the stream with"
+            )
     else:
         end = sent + hop + PRE_LOOKAHEAD
         if len(tokens) < end:
@@ -181,12 +193,16 @@ def t3_to_s3gen_async_chunk(
         state["sent"] = sent + hop
         state["chunks"] += 1
         state["hop"] = min(largest, chunk * growth ** state["chunks"])
+    start = max(0, sent - left_context)
     return OmniPayloadStruct(
-        codes=CodesStruct(audio=torch.tensor(tokens[:end], dtype=torch.long)),
+        codes=CodesStruct(audio=torch.tensor(tokens[start:end], dtype=torch.long)),
         meta=MetaStruct(
             finished=torch.tensor(is_finished),
             stream_finished=torch.tensor(is_finished),
-            left_context_size=sent,
+            left_context_size=sent - start,
+            # The utterance index of codes.audio[0]: stage 1 takes the flow's
+            # noise by position in the utterance.
+            num_processed_tokens=start,
         ),
         embed=state.pop("reference", None),
     )
@@ -238,7 +254,7 @@ def t3_to_s3gen(
                         "speech_feat": reference["speech_feat"],
                         "embedding": reference["embedding"],
                     },
-                    "meta": {"stream_finished": torch.tensor(True), "left_context_size": 0},
+                    "meta": {"stream_finished": torch.tensor(True), "left_context_size": 0, "num_processed_tokens": 0},
                 },
                 multi_modal_data=None,
                 mm_processor_kwargs=None,

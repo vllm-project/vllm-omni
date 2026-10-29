@@ -118,7 +118,10 @@ def test_forward_passes_runner_keywords_through(built_stage: BuiltStage) -> None
         "speech_feat": torch.randn(1, 40, 80),
         "embedding": torch.randn(1, 192),
     }
-    payload = {"meta": {"stream_finished": torch.tensor(True), "left_context_size": 0}, "embed": voice}
+    payload = {
+        "meta": {"stream_finished": torch.tensor(True), "left_context_size": 0, "num_processed_tokens": 0},
+        "embed": voice,
+    }
     tokens = torch.randint(0, 6561, (23,))
 
     def decode(module: nn.Module, request_id: str) -> dict:

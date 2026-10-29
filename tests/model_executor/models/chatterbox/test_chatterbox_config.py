@@ -4,7 +4,7 @@
 
 import pytest
 
-from tests.model_executor.models.chatterbox.helpers import LEFT_CONTEXT, SEED
+from tests.model_executor.models.chatterbox.helpers import SEED
 from vllm_omni.config.model import OmniModelArchConfigConvertor
 from vllm_omni.model_executor.models.chatterbox.chatterbox_s3gen import SAMPLES_PER_FRAME, S3GenDecoder
 from vllm_omni.transformers_utils.configs.chatterbox import VARIANT_FIELDS, ChatterboxConfig
@@ -86,4 +86,4 @@ def test_the_decoder_refuses_a_flow_precision_it_cannot_run() -> None:
     config = ChatterboxConfig()
     config.update({"flow_dtype": "float16"})
     with pytest.raises(ValueError, match="flow_dtype"):
-        S3GenDecoder(config, config.max_new_tokens, LEFT_CONTEXT, SEED)
+        S3GenDecoder(config, config.max_new_tokens, SEED)

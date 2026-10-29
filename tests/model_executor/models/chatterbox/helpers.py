@@ -203,7 +203,7 @@ def write_s3gen_checkpoint(model_dir: str, config: ChatterboxConfig, seed: int) 
     from s3tokenizer.model_v2 import S3TokenizerV2
 
     torch.manual_seed(seed)
-    decoder = S3GenDecoder(config, config.max_new_tokens, LEFT_CONTEXT, SEED).state_dict()
+    decoder = S3GenDecoder(config, config.max_new_tokens, SEED).state_dict()
     tokenizer = S3TokenizerV2(config.s3_tokenizer_name).state_dict()
     speaker_encoder = CAMPPlus(feat_dim=80, embedding_size=192, memory_efficient=False).state_dict()
     buffers = dict(zip(TOKENIZER_BUFFERS, (torch.zeros(128, 201), torch.hann_window(400)), strict=True))
