@@ -45,6 +45,7 @@ import re
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime
@@ -231,6 +232,99 @@ def _issue_milestone_matches(issue: dict, version: str) -> bool:
     a = title.lower().lstrip("v")
     b = version.strip().lower().lstrip("v")
     return a == b
+
+
+def _gh_ref_commit_sha(gh_token: str | None, ref: str) -> str | None:
+    """SHA of the commit GitHub resolves ``ref`` to, or ``None`` on 404 (no such ref).
+
+    Single attempt, no retry loop — unlike :func:`http_get_json`, a 404 here is an
+    expected negative probe (ref does not exist), not a transient failure worth
+    12 rounds of backoff. GitHub also answers **422** for refs it cannot resolve
+    (e.g. ``0.32.0`` without the leading ``v``) — treated the same as not-found
+    so the caller falls through to the next candidate ref.
+    """
+    url = (
+        "https://api.github.com/repos/vllm-project/vllm-omni/commits/"
+        + urllib.parse.quote(ref, safe="")
+    )
+    headers: dict[str, str] = {
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "vllm-omni-compose-report",
+    }
+    if gh_token:
+        headers["Authorization"] = f"Bearer {gh_token}"
+    try:
+        import requests
+    except ImportError:
+        requests = None
+    if requests is not None:
+        r = requests.get(url, headers=headers, timeout=60, verify=_github_tls_verify())
+        if r.status_code in (404, 422):
+            return None
+        r.raise_for_status()
+        return r.json()["sha"]
+    try:
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            return json.loads(resp.read().decode("utf-8", errors="replace"))["sha"]
+    except urllib.error.HTTPError as e:
+        if e.code in (404, 422):
+            return None
+        raise
+
+
+def _gh_version_tags(gh_token: str | None) -> list[str]:
+    """Version-like tag names in the repo (``v0.32.0`` style), oldest → newest."""
+    headers: dict[str, str] = {
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "vllm-omni-compose-report",
+    }
+    if gh_token:
+        headers["Authorization"] = f"Bearer {gh_token}"
+    names: list[str] = []
+    page = 1
+    while True:
+        batch = http_get_json(
+            f"https://api.github.com/repos/vllm-project/vllm-omni/tags?per_page=100&page={page}",
+            headers=headers,
+            timeout=60,
+        )
+        if not isinstance(batch, list) or not batch:
+            break
+        names += [t.get("name") or "" for t in batch]
+        if len(batch) < 100:
+            break
+        page += 1
+    return [t for t in names if re.fullmatch(r"v?\d+\.\d+(\.\d+)?", t.strip())]
+
+
+def _resolve_release_commit_ref(gh_token: str | None, version: str) -> tuple[str, str]:
+    """Release commit for ``version`` from the repo ref of the same name (tag or branch).
+
+    This repo has **no** per-version branches — releases are tagged (``v0.32.0``,
+    ``v0.30.0``, …), so the ref is normally the release tag; the shared
+    ``GET /commits/{ref}`` endpoint resolves tags and branches alike and peels
+    annotated tags down to the commit. Returns ``(full_sha, ref_used)``. Raises
+    ``RuntimeError`` listing the available version tags when nothing matches
+    (typo'd version / tag not pushed yet) — the caller should surface that
+    error instead of silently rendering a commit-less Version Info chapter.
+    """
+    v = version.strip()
+    candidates: list[str] = []
+    for c in (v, f"v{v.lstrip('vV')}"):
+        if c and c not in candidates:
+            candidates.append(c)
+    for ref in candidates:
+        sha = _gh_ref_commit_sha(gh_token, ref)
+        if sha:
+            return sha, ref
+    avail = _gh_version_tags(gh_token)
+    raise RuntimeError(
+        f"could not auto-resolve a commit for release version '{version}': no tag or "
+        f"branch named {candidates} exists in vllm-project/vllm-omni. Pass "
+        f"--release-commit explicitly, or use one of the available version tags: "
+        f"{avail[-12:]}"
+    )
 
 
 def _github_fetch_open_issues_with_labels(gh_token: str | None, *labels: str) -> list[dict]:
@@ -1152,13 +1246,20 @@ def render_open_issues_section(
     return section
 
 
-def render_version_info_section(release_version: str | None, release_commit: str | None) -> str:
-    """Markdown for ``## Version Info`` — operator-supplied release version + commit id.
+def render_version_info_section(
+    release_version: str | None,
+    release_commit: str | None,
+    *,
+    auto_ref: str = "",
+) -> str:
+    """Markdown for ``## Version Info`` — release version + commit id.
 
     Rendered at the top of the **release** report (right under the H1 title, before
     Test conclusion) when ``--release-version`` / ``--release-commit`` are supplied.
     Both empty → empty string, keeping the legacy layout byte-for-byte.
     The commit id is linked to its GitHub commit URL (GitHub resolves short SHAs).
+    ``auto_ref`` marks the commit as auto-resolved from the version ref (release
+    tag / same-named branch) instead of operator-supplied.
     """
     version = (release_version or "").strip()
     commit = (release_commit or "").strip()
@@ -1168,8 +1269,9 @@ def render_version_info_section(release_version: str | None, release_commit: str
     if version:
         lines.append(f"- **Release version:** {version}")
     if commit:
+        auto_note = f" *(auto: ref `{auto_ref}`)*" if auto_ref else ""
         lines.append(
-            f"- **Commit:** [`{commit}`](https://github.com/vllm-project/vllm-omni/commit/{commit})"
+            f"- **Commit:** [`{commit}`](https://github.com/vllm-project/vllm-omni/commit/{commit}){auto_note}"
         )
     return "\n".join(lines) + "\n\n"
 
@@ -2856,7 +2958,11 @@ def main() -> None:
         help=(
             "Release variant only. Release commit id (short or full SHA) shown in the "
             "``## Version Info`` chapter and included (first 12 chars) in the default "
-            "--out filename tag alongside --release-version. Ignored by --kind development."
+            "--out filename tag alongside --release-version. When omitted while "
+            "--release-version is set (live runs), it is auto-resolved from the "
+            "version ref — the release tag (e.g. v0.32.0) or a same-named branch — "
+            "and the chapter marks the commit as auto-resolved. Preview stays "
+            "offline and renders the version only. Ignored by --kind development."
         ),
     )
     parser.add_argument(
@@ -2984,6 +3090,28 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    # Auto-resolve the release commit from the version ref when --release-commit
+    # is omitted: this repo tags releases (v0.32.0, v0.30.0, …) rather than
+    # cutting per-version branches, so the ref is normally the release tag
+    # (GET /commits/{ref} resolves tags and branches alike, peeling annotated
+    # tags to the commit). Live release runs only — preview stays offline and
+    # renders the version without a commit line.
+    release_commit_resolved: str | None = args.release_commit
+    release_commit_auto_ref = ""
+    if args.kind == "release" and not args.preview and args.release_version and not args.release_commit:
+        _gh_tok = (os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN") or "").strip() or None
+        try:
+            release_commit_resolved, release_commit_auto_ref = _resolve_release_commit_ref(
+                _gh_tok, args.release_version
+            )
+        except RuntimeError as e:
+            sys.exit(f"error: {e}")
+        print(
+            f"[version-info] auto-resolved release commit for {args.release_version}: "
+            f"{release_commit_resolved[:12]} (ref '{release_commit_auto_ref}')",
+            file=sys.stderr,
+        )
+
     skill_dir = Path(__file__).resolve().parent.parent
     scripts_dir = skill_dir / "scripts"
     report_date = resolve_report_date_iso(args.report_date)
@@ -3012,8 +3140,8 @@ def main() -> None:
                 v = f"v{v}"
             if v:
                 parts.append(v)
-        if args.release_commit:
-            c = re.sub(r"[^A-Za-z0-9._-]+", "-", args.release_commit.strip()).strip("-")[:12]
+        if release_commit_resolved:
+            c = re.sub(r"[^A-Za-z0-9._-]+", "-", release_commit_resolved.strip()).strip("-")[:12]
             if c:
                 parts.append(c)
         return "-".join(parts) if parts else None
@@ -3430,7 +3558,9 @@ def main() -> None:
         # (open + label:bug + critical/high/medium priority + milestone == version).
         milestone_filter=args.release_version,
     )
-    version_info_block = render_version_info_section(args.release_version, args.release_commit)
+    version_info_block = render_version_info_section(
+        args.release_version, release_commit_resolved, auto_ref=release_commit_auto_ref
+    )
 
     # Next Steps (Outstanding Items): manual-entry action table, identical
     # to the Development variant. ``release_md_to_html`` already injects
