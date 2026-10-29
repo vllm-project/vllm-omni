@@ -34,6 +34,7 @@ from vllm_omni.diffusion.forward_context import (
 )
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComponentDiscovery
+from vllm_omni.diffusion.models.progress_bar import _is_rank_zero
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import (
     DiffusionPipelineProfilerMixin,
 )
@@ -94,11 +95,12 @@ def _log_step0_profile_reuse(od_config: OmniDiffusionConfig) -> None:
 
     Later steps reuse the prompt K/V computed in the step-0 forward, and deeper layers' prompt K/V
     depend on earlier layers' attention outputs. Ranges are ordered, so only the first can cover
-    step 0. A request's own schedule is not known at startup.
+    step 0. A request's own schedule is not known at startup. Every TP/SP rank builds the pipeline,
+    so only rank 0 logs.
     """
     schedule_config = getattr(od_config, "diffusion_attention_schedule", None)
     default = schedule_config.default if schedule_config is not None else ()
-    if default and default[0].start == 0:
+    if default and default[0].start == 0 and _is_rank_zero():
         logger.info(
             "HunyuanImage-3.0 reuses the step-0 prompt K/V on every later step, so profile %r, which the "
             "default attention schedule selects at step 0, also affects the steps it does not cover.",
