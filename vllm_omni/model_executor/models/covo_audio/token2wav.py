@@ -357,6 +357,7 @@ class MultiHeadAttention(nn.Module):
         self.o_proj = Linear(hidden_size, hidden_size)
         self.o_dropout = Dropout(dropout)
 
+        # SDPA backends allowed in forward() when the inputs are on CUDA; unused on other devices.
         self.cuda_backends = [SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH, SDPBackend.CUDNN_ATTENTION]
         if current_omni_platform.is_cuda():
             device_properties = torch.cuda.get_device_properties(torch.accelerator.current_device_index())
