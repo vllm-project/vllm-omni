@@ -1729,20 +1729,23 @@ class MiniMaxH3Pipeline(
         input_ids: torch.Tensor,
         vision_kwargs: dict[str, torch.Tensor],
     ) -> torch.Tensor:
+        encode_kwargs: dict[str, Any] = vision_kwargs
+        if os.environ.get("VLLM_OMNI_H3_HIDDEN_DEVICE", "0") == "1":
+            encode_kwargs = {**vision_kwargs, "return_on_device": True}
         if getattr(self, "_model_cpu_offload_modules", None):
             # Invoke nn.Module.__call__ so the generic model-level offloader
             # swaps the resident DiT and encoder.
-            return self.text_encoder(input_ids, **vision_kwargs)
+            return self.text_encoder(input_ids, **encode_kwargs)
 
         if self._uses_manual_component_offload(self.text_encoder):
             if isinstance(self.text_encoder, MiniMaxH3Qwen3VLEncoder):
                 self.text_encoder.prepare_packed_offload()
             with self._component_on_device(self.text_encoder):
-                return self.text_encoder.encode_ids(input_ids, **vision_kwargs)
+                return self.text_encoder.encode_ids(input_ids, **encode_kwargs)
 
         # Keep Qwen resident when it is not selected for layerwise offload.
         self.text_encoder.load_to_device()
-        return self.text_encoder.encode_ids(input_ids, **vision_kwargs)
+        return self.text_encoder.encode_ids(input_ids, **encode_kwargs)
 
     def _uses_manual_component_offload(self, component: nn.Module) -> bool:
         od_config = getattr(self, "od_config", None)

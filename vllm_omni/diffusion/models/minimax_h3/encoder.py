@@ -1493,6 +1493,7 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
         image_grid_thw: torch.Tensor | None = None,
         pixel_values_videos: torch.Tensor | None = None,
         video_grid_thw: torch.Tensor | None = None,
+        return_on_device: bool = False,
     ) -> torch.Tensor:
         if not self.is_loaded:
             raise RuntimeError("MiniMax H3 text encoder is only loaded on the encoder TP ranks")
@@ -1515,7 +1516,9 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
                 pixel_values_videos=pixel_values_videos,
                 video_grid_thw=video_grid_thw,
             )
-            return hidden.cpu()
+            # The pipeline can broadcast directly from the activation device.
+            # Keep the standalone encoder's CPU-return contract by default.
+            return hidden if return_on_device else hidden.cpu()
         finally:
             torch.backends.cuda.enable_cudnn_sdp(cudnn_sdp_enabled)
 
@@ -1527,9 +1530,10 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
         image_grid_thw: torch.Tensor | None = None,
         pixel_values_videos: torch.Tensor | None = None,
         video_grid_thw: torch.Tensor | None = None,
+        return_on_device: bool = False,
     ) -> torch.Tensor:
         """Hook-compatible entry point for model-level CPU offloading."""
-        kwargs = {
+        kwargs: dict[str, Any] = {
             "pixel_values": pixel_values,
             "image_grid_thw": image_grid_thw,
         }
@@ -1538,6 +1542,8 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
                 pixel_values_videos=pixel_values_videos,
                 video_grid_thw=video_grid_thw,
             )
+        if return_on_device:
+            kwargs["return_on_device"] = True
         return self.encode_ids(input_ids, **kwargs)
 
 
