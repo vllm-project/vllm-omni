@@ -343,6 +343,7 @@ class DuplexOmni(AsyncOmni):
     """
 
     session_only: bool = False
+    final_output_task: asyncio.Task[None] | None
     engine: DuplexOmniEngine | ProcessDuplexEngineClient  # type: ignore[assignment]
 
     def _create_engine(self, **engine_kwargs: Any) -> DuplexOmniEngine:
