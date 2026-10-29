@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import itertools
+import math
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -9,6 +12,50 @@ from vllm_omni.diffusion.models.hy_nomas import decoder as decoder_module
 from vllm_omni.diffusion.models.hy_nomas.decoder import PixelUMMDecoder
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
+
+
+@pytest.mark.parametrize(
+    "config,message",
+    [({"head_dim": dim}, "head_dim must be a positive multiple of 8") for dim in (0, -8, 12)]
+    + [
+        ({"num_heads": 0}, "must be positive"),
+        ({"num_kv_heads": 0}, "must be positive"),
+        ({"num_heads": -2}, "must be positive"),
+        ({"num_kv_heads": -1}, "must be positive"),
+        ({"num_heads": 3, "num_kv_heads": 2}, "must be divisible"),
+    ],
+)
+def test_native_architecture_rejects_invalid_head_geometry(config, message):
+    with pytest.raises(ValueError, match=message):
+        decoder_module.PixelUMMArchitecture(**config)
+
+
+@pytest.mark.parametrize("head_dim", [8, 16, 128])
+def test_native_mrope_matches_axis_rotation(head_dim):
+    arch = decoder_module.PixelUMMArchitecture(head_dim=head_dim)
+    grid = (2, 3, 4)
+    sections = arch.rope_sections
+    assert sum(sections) == head_dim and all(width % 2 == 0 for width in sections)
+    cos, sin = decoder_module.mrope_tables(arch, grid, torch.device("cpu"))
+    assert cos.shape == sin.shape == (1, math.prod(grid), 1, head_dim)
+    values = torch.randn(1, math.prod(grid), 2, head_dim, generator=torch.Generator().manual_seed(42))
+    expected = torch.empty_like(values)
+    # Independent scalar rotation pairs check axis order, frequencies and pairing.
+    for token, position in enumerate(itertools.product(*(range(size) for size in grid))):
+        offset = 0
+        for coordinate, width, theta in zip(
+            position, sections, (arch.rope_theta_t, arch.rope_theta_hw, arch.rope_theta_hw)
+        ):
+            half = width // 2
+            for pair in range(half):
+                angle = coordinate * theta ** (-2 * pair / width)
+                first = values[:, token, :, offset + pair]
+                second = values[:, token, :, offset + half + pair]
+                expected[:, token, :, offset + pair] = first * math.cos(angle) - second * math.sin(angle)
+                expected[:, token, :, offset + half + pair] = second * math.cos(angle) + first * math.sin(angle)
+            offset += width
+    actual = decoder_module.apply_mrope(values, cos, sin, sections)
+    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
 
 
 class _SDPA(torch.nn.Module):

@@ -51,13 +51,24 @@ class PixelUMMArchitecture:
     rope_theta_t: float = 1_000_000.0
     rope_theta_hw: float = 10_000.0
 
-    def __post_init__(self):
-        if self.head_dim % 4 or self.num_heads % self.num_kv_heads:
-            raise ValueError("head_dim must be divisible by 4 and heads by kv heads")
+    def __post_init__(self) -> None:
+        """Validate the rotation-pair and grouped-query head geometry."""
+        if self.head_dim <= 0 or self.head_dim % 8:
+            raise ValueError(f"head_dim must be a positive multiple of 8 for T/H/W RoPE, got {self.head_dim}")
+        if self.num_heads <= 0 or self.num_kv_heads <= 0:
+            raise ValueError(
+                f"num_heads and num_kv_heads must be positive, got {self.num_heads} and {self.num_kv_heads}"
+            )
+        if self.num_heads % self.num_kv_heads:
+            raise ValueError(f"num_heads ({self.num_heads}) must be divisible by num_kv_heads ({self.num_kv_heads})")
 
     @property
     def rope_sections(self) -> tuple[int, int, int]:
-        """Head-dim slices rotated by the T, H and W position respectively."""
+        """Split T/H/W dimensions in a 2:1:1 ratio.
+
+        Each axis contains rotation pairs and needs an even width, requiring
+        head_dim to be divisible by eight.
+        """
         return self.head_dim // 2, self.head_dim // 4, self.head_dim // 4
 
 
