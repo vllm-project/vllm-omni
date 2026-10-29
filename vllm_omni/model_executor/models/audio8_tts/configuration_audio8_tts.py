@@ -213,6 +213,9 @@ class Audio8TTSFastARConfig(PretrainedConfig):
         self.rope_theta = float(rope_base)
         self.num_codebooks = int(num_codebooks)
 
+        # ``to_dict()`` serializes ``vocab_size``, so a round-tripped sub-config
+        # would otherwise pass it twice.
+        kwargs.pop("vocab_size", None)
         super().__init__(vocab_size=int(codebook_size), **kwargs)
 
 
@@ -276,7 +279,15 @@ class Audio8TTSConfig(PretrainedConfig):
         **kwargs: Any,
     ) -> None:
         if isinstance(text_config, dict):
-            text_config = Audio8TTSSlowARConfig(**text_config)
+            # ``sub_configs`` routes a serialized ``text_config`` back to the dense
+            # class, so pick by ``slow_backbone`` instead: a round-tripped 0.1b
+            # config must not come back on the dense class.
+            text_cls = Audio8TTSHybridSlowARConfig if slow_backbone == "falcon_h1" else Audio8TTSSlowARConfig
+            text_config = text_cls(**text_config)
+        if slow_backbone == "falcon_h1" and not isinstance(text_config, Audio8TTSHybridSlowARConfig):
+            # A nested dict was already materialized as the dense class by
+            # ``sub_configs``; rebuild from the flat fields below instead.
+            text_config = None
         if isinstance(fast_ar_config, dict):
             fast_ar_config = Audio8TTSFastARConfig(**fast_ar_config)
 
@@ -370,7 +381,7 @@ class Audio8TTSConfig(PretrainedConfig):
             **kwargs,
         )
 
-    def get_text_config(self, *args: Any, **kwargs: Any) -> Audio8TTSSlowARConfig:
+    def get_text_config(self, *args: Any, **kwargs: Any) -> Audio8TTSSlowARConfig | Audio8TTSHybridSlowARConfig:
         return self.text_config
 
 

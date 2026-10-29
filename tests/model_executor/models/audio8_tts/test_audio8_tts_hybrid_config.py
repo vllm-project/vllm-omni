@@ -161,3 +161,30 @@ def test_0p6b_backbone_fields_still_select_the_dense_path():
     assert cfg.slow_backbone is None
     assert text_config.hidden_size == 896
     assert text_config.rope_parameters["rope_theta"] == pytest.approx(1e6)
+
+
+class TestAudio8PipelineResolver:
+    def test_routes_by_slow_backbone(self):
+        from vllm_omni.model_executor.models.audio8_tts.pipeline import (
+            AUDIO8_TTS_HYBRID_PIPELINE,
+            AUDIO8_TTS_PIPELINE,
+            resolve_audio8_pipeline,
+        )
+
+        assert resolve_audio8_pipeline(Audio8TTSConfig(**CONFIG_0P1B)) is AUDIO8_TTS_HYBRID_PIPELINE
+        assert resolve_audio8_pipeline(Audio8TTSConfig(**CONFIG_0P6B_BACKBONE_FIELDS)) is AUDIO8_TTS_PIPELINE
+
+    def test_rejects_foreign_and_missing_config(self):
+        from transformers import PretrainedConfig
+
+        from vllm_omni.model_executor.models.audio8_tts.pipeline import resolve_audio8_pipeline
+
+        assert resolve_audio8_pipeline(PretrainedConfig()) is None
+        assert resolve_audio8_pipeline(None) is None
+
+    def test_serialized_config_round_trips_to_the_hybrid_class(self):
+        """Regression guard: ``sub_configs`` must not drag a 0.1b config back to dense."""
+        restored = Audio8TTSConfig.from_dict(Audio8TTSConfig(**CONFIG_0P1B).to_dict())
+
+        assert restored.slow_backbone == "falcon_h1"
+        assert isinstance(restored.get_text_config(), Audio8TTSHybridSlowARConfig)

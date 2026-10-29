@@ -75,6 +75,9 @@ class Audio8TTSHybridSlowARForConditionalGeneration(nn.Module, HasInnerState, Is
         Mirrors vLLM's own body with the config swapped for the text config.
         """
         from vllm.model_executor.layers.mamba.mamba_utils import MambaStateShapeCalculator
+        # Copied from vLLM 0.32.0 FalconH1ForCausalLM (only the config source
+        # differs), so re-check this body when the mamba2_state_shape
+        # signature changes on a vLLM bump.
 
         hf_config = vllm_config.model_config.hf_config.get_text_config()
         intermediate_size = (
