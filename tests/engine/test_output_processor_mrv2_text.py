@@ -111,6 +111,21 @@ def test_text_tokens_are_detokenized_when_mrv2_ar_output_has_pooling_payload():
     assert not state.mm_accumulated.is_empty
 
 
+def test_mrv2_payload_mirrored_on_both_channels_is_accumulated_once():
+    # The MRv2 AR full-payload fallback publishes one payload as both
+    # pooling_output and multimodal_output; each row must reach the next stage once.
+    processor, _ = _make_processor(OutputModality.LATENT, _Detokenizer())
+    hidden = torch.arange(12.0).reshape(3, 4)
+    ids = torch.tensor([[11], [12], [13]])
+    output = _rehydrated_output(pooling_output={"latent": hidden, "latent_input_ids": ids})
+    output.multimodal_output = {"latent": hidden, "latent_input_ids": ids}
+
+    payload = processor.process_outputs([output]).request_outputs[0].outputs[0].multimodal_output
+
+    torch.testing.assert_close(payload["latent"], hidden)
+    torch.testing.assert_close(payload["latent_input_ids"], ids)
+
+
 def test_fixed_token_scores_survive_output_processing_and_stage_wrapping():
     processor, state = _make_processor(OutputModality.TEXT, _Detokenizer())
     request = EngineCoreRequest(

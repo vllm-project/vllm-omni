@@ -20,7 +20,7 @@ from vllm.v1.engine.output_processor import (
 from vllm.v1.engine.parallel_sampling import ParentRequest
 from vllm.v1.metrics.stats import IterationStats, RequestStateStats
 
-from vllm_omni.data_entry_keys import unflatten_payload
+from vllm_omni.data_entry_keys import flatten_payload, unflatten_payload
 from vllm_omni.metrics import definitions as defs
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.outputs.mm_outputs import MultimodalCompletionOutput, MultimodalPayload
@@ -112,6 +112,20 @@ def _native_phase_metrics(stats: RequestStateStats) -> dict[str, float | int]:
         # was observed.
         metrics[defs.VLLM_NUM_PREEMPTIONS] = int(stats.num_preemptions)
     return metrics
+
+
+def _pooling_keys_not_in(pooling_output: Any, mm_output: Any) -> Any:
+    """Drop pooling-payload entries already carried by ``mm_output``.
+
+    The MR v2 AR runner's full-payload fallback publishes one per-request
+    payload on both channels; accumulating both concatenates every tensor
+    with itself. V1 never sets both, so this only trims the V2 mirror.
+    """
+    if not isinstance(pooling_output, dict) or not isinstance(mm_output, dict):
+        return pooling_output
+    present = flatten_payload(mm_output).keys()
+    rest = {k: v for k, v in flatten_payload(pooling_output).items() if k not in present}
+    return rest or None
 
 
 class OmniRequestState(RequestState):
@@ -736,7 +750,7 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
                 # pooling_output. Preserve the payload, then clear the field so
                 # upstream still runs the normal detokenization path.
                 if eco.pooling_output is not None and req_state.detokenizer is not None:
-                    req_state.add_multimodal_tensor(eco.pooling_output, mm_type)
+                    req_state.add_multimodal_tensor(_pooling_keys_not_in(eco.pooling_output, mm_output), mm_type)
                     eco.pooling_output = None
 
             # Native pooling cache-miss errors carry no tensor. Upstream
