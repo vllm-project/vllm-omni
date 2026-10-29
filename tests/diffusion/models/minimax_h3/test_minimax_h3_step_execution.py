@@ -37,6 +37,7 @@ from vllm_omni.diffusion.models.minimax_h3 import minimax_h3_blocks as blocks
 from vllm_omni.diffusion.models.minimax_h3 import minimax_h3_transformer as h3
 from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3
 from vllm_omni.diffusion.models.minimax_h3.denoise_loop import minimax_h3_denoise_loop
+from vllm_omni.diffusion.models.minimax_h3.latent_upscaler import MiniMaxH3LatentRefineSpec
 from vllm_omni.diffusion.worker.input_batch import InputBatch
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
