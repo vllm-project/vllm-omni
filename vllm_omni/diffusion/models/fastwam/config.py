@@ -22,6 +22,7 @@ the preset at load time (:meth:`FastWAMConfig.check_policy_state_dict`).
 
 from __future__ import annotations
 
+import os
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from typing import Any
@@ -94,7 +95,6 @@ class FastWAMConfig:
     video_hidden_dim: int = 3072
     video_ffn_dim: int = 14336
     video_in_dim: int = 48
-    video_out_dim: int = 48
     patch_size: tuple[int, int, int] = (1, 2, 2)
     # Shared by both experts (mixed attention needs equal heads and depth).
     num_layers: int = 30
@@ -203,6 +203,9 @@ PRESETS: dict[str, FastWAMConfig] = {
     ),
 }
 DEFAULT_VARIANT = "cae_fastwam_libero"
+# Deploy config shipped for each preset, and the preset of each known Hub checkpoint.
+DEPLOY_CONFIGS = {"cae_fastwam_libero": "cae_fastwam_libero.yaml", "fastwam_libero_uncond": "fastwam_libero.yaml"}
+_HUB_PRESETS = {"amd/cae-fastwam": "cae_fastwam_libero", "yuanty/fastwam": "fastwam_libero_uncond"}
 
 # Keys of ``model_config`` that may override a preset's asset paths.
 _ASSET_OVERRIDES = ("policy_checkpoint", "action_codec_checkpoint", "stats_path")
@@ -215,3 +218,30 @@ def resolve_config(model_config: Mapping[str, Any]) -> FastWAMConfig:
         raise ValueError(f"Unknown fastwam_variant {variant!r}; choose one of {sorted(PRESETS)}.")
     overrides = {key: model_config[key] for key in _ASSET_OVERRIDES if model_config.get(key) is not None}
     return replace(PRESETS[variant], **overrides)
+
+
+def check_checkpoint_matches_preset(model: str, cfg: FastWAMConfig) -> None:
+    """Fail with the right deploy config when ``model`` is a known checkpoint of another preset.
+
+    ``vllm serve <checkpoint> --omni`` without ``--deploy-config`` always picks the
+    CAE-FastWAM deploy config; without this check an original FastWAM checkpoint
+    would fail later with a missing-file error about CAE assets.
+    """
+    expected: str | None = None
+    if os.path.isdir(model):
+        if not os.path.isfile(os.path.join(model, cfg.policy_checkpoint)):
+            expected = next(
+                (
+                    name
+                    for name, preset in PRESETS.items()
+                    if os.path.isfile(os.path.join(model, preset.policy_checkpoint))
+                ),
+                None,
+            )
+    else:
+        expected = _HUB_PRESETS.get(model.rstrip("/").lower())
+    if expected is not None and expected != cfg.variant:
+        raise ValueError(
+            f"{model} is a {expected!r} checkpoint, but the {cfg.variant!r} preset is selected. Serve it with "
+            f"--deploy-config vllm_omni/deploy/{DEPLOY_CONFIGS[expected]} (model_config.fastwam_variant: {expected})."
+        )

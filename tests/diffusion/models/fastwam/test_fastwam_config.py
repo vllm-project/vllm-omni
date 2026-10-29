@@ -11,6 +11,7 @@ from vllm_omni.diffusion.models.fastwam.config import (
     DEFAULT_VARIANT,
     PRESETS,
     ActionCodecConfig,
+    check_checkpoint_matches_preset,
     resolve_config,
 )
 
@@ -90,3 +91,19 @@ def test_codec_config_from_checkpoint_and_validation():
         ActionCodecConfig.from_checkpoint_config({**CAE_ACTION_VAE_CONFIG, "video_cond_dim": 12288})
     with pytest.raises(ValueError, match="divisible"):
         ActionCodecConfig.from_checkpoint_config({**CAE_ACTION_VAE_CONFIG, "num_tokens": 5})
+
+
+def test_original_fastwam_checkpoint_with_cae_preset_names_the_right_deploy_config(tmp_path):
+    cae, uncond = PRESETS["cae_fastwam_libero"], PRESETS["fastwam_libero_uncond"]
+    with pytest.raises(ValueError, match="fastwam_libero.yaml"):
+        check_checkpoint_matches_preset("yuanty/fastwam", cae)
+    with pytest.raises(ValueError, match="cae_fastwam_libero.yaml"):
+        check_checkpoint_matches_preset("amd/CAE-FastWAM", uncond)
+    (tmp_path / uncond.policy_checkpoint).touch()
+    with pytest.raises(ValueError, match="fastwam_libero.yaml"):
+        check_checkpoint_matches_preset(str(tmp_path), cae)
+    # Matching or unknown checkpoints pass.
+    check_checkpoint_matches_preset("yuanty/fastwam", uncond)
+    check_checkpoint_matches_preset("amd/CAE-FastWAM", cae)
+    check_checkpoint_matches_preset("someone/finetuned-cae", cae)
+    check_checkpoint_matches_preset(str(tmp_path), uncond)

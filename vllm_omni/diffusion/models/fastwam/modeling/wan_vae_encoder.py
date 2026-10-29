@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 The FastWAM Authors
+# SPDX-FileCopyrightText: Copyright 2024-2025 The Wan Team and Alibaba Group
+# SPDX-FileCopyrightText: Copyright (c) ModelScope DiffSynth-Studio contributors
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Single-frame Wan2.2 VAE encoder, as FastWAM uses it to embed the current camera frame.
 
@@ -13,6 +15,11 @@ reproduces the reference first-frame latents bitwise, while the Diffusers
 the encoder is vendored rather than reused.
 """
 
+# Wan2.2 provenance: the Wan2.2 modules in FastWAM's wan22/ package come from
+# Wan-Video/Wan2.2 (https://github.com/Wan-Video/Wan2.2, Apache-2.0, Copyright 2024-2025
+# The Wan Team / Alibaba) via DiffSynth-Studio (https://github.com/modelscope/DiffSynth-Studio,
+# Apache-2.0). Those portions remain under the Apache License 2.0.
+#
 # Adapted from FastWAM (https://github.com/yuantianyuan01/FastWAM @7faa711,
 # src/fastwam/models/wan22/wan_video_vae.py). The original portions carry the following MIT license:
 # Copyright (c) 2026 The FastWAM Authors

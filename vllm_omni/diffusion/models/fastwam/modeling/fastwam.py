@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 The FastWAM Authors
+# SPDX-FileCopyrightText: Copyright (c) 2026 Advanced Micro Devices, Inc.
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """FastWAM-family action inference (``FastWAM.infer_action``, ``first_frame`` mode).
 
@@ -16,6 +17,10 @@ cast, and the action codec runs in float32 with its output rounded to the model
 dtype before it is returned as float32.
 """
 
+# CAE-FastWAM logic (latent action tokens decoded by the suite-conditioned action
+# codec) is adapted from AMD-AGI/faster-action-models (https://github.com/AMD-AGI/faster-action-models,
+# src/cae-fastwam, Apache-2.0, Copyright (c) 2026 Advanced Micro Devices, Inc.).
+#
 # Adapted from FastWAM (https://github.com/yuantianyuan01/FastWAM @7faa711,
 # src/fastwam/models/wan22/fastwam.py, mot.py). The original portions carry the following MIT license:
 # Copyright (c) 2026 The FastWAM Authors
@@ -85,23 +90,18 @@ def build_mot_attention_masks(
 class FastWAMModel(nn.Module):
     """All neural components of a FastWAM-family policy."""
 
-    # Unit of vLLM-Omni's regional torch.compile (``enforce_eager: false``): each
-    # transformer layer of both experts is compiled as one region.
-    _repeated_blocks = ["FastWAMBlock"]
-
     def __init__(
         self,
         cfg: FastWAMConfig,
         *,
-        vae_encoder: WanVAEFirstFrameEncoder | None = None,
-        text_encoder: WanUMT5Encoder | None = None,
+        vae_encoder: WanVAEFirstFrameEncoder,
+        text_encoder: WanUMT5Encoder,
     ) -> None:
         super().__init__()
         self.cfg = cfg
         video = VideoExpert(
             hidden_dim=cfg.video_hidden_dim,
             in_dim=cfg.video_in_dim,
-            out_dim=cfg.video_out_dim,
             ffn_dim=cfg.video_ffn_dim,
             text_dim=cfg.text_dim,
             freq_dim=cfg.freq_dim,
@@ -125,8 +125,10 @@ class FastWAMModel(nn.Module):
         self.mot = FastWAMMoT(video, action)
         self.proprio_encoder = nn.Linear(cfg.proprio_dim, cfg.text_dim)
         self.action_codec = ActionLatentDecoder(cfg.action_codec) if cfg.action_codec is not None else None
-        self.vae_encoder = vae_encoder if vae_encoder is not None else WanVAEFirstFrameEncoder()
-        self.text_encoder = text_encoder if text_encoder is not None else WanUMT5Encoder()
+        # Built by the caller from the base model's configs (the full-size defaults
+        # would allocate ~23 GB in float32).
+        self.vae_encoder = vae_encoder
+        self.text_encoder = text_encoder
 
     @property
     def device(self) -> torch.device:

@@ -30,9 +30,11 @@ stages:
       fastwam_variant: cae_fastwam_libero
       # Wan2.2 VAE encoder, umT5 text encoder and tokenizer.
       base_model: Wan-AI/Wan2.2-TI2V-5B-Diffusers
-      # Default task suite: selects stats/<suite>.json and the action codec's
-      # suite embedding. A request may override it with robot_obs["task_suite"].
-      task_suite: libero_spatial
+      # Task suite: selects stats/<suite>.json and the action codec's suite
+      # embedding. Unset, every request must send robot_obs["task_suite"] (no
+      # silent default: the wrong suite gives wrong actions). Pin one suite here
+      # to serve the stock OpenPI LIBERO client, which does not send it:
+      #   task_suite: libero_spatial
       num_inference_steps: 10
       # De-normalised actions with LIBERO's gripper convention (+1 close, -1 open).
       action_postprocess: libero

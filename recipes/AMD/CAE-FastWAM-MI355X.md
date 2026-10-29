@@ -33,7 +33,8 @@ validated variant. The original FastWAM LIBERO checkpoint (`yuanty/fastwam`,
 | Item | Value |
 | --- | --- |
 | Inputs | `observation/image` and `observation/wrist_image`: uint8 `HxWx3`, upright (the OpenPI LIBERO client rotates LIBERO frames by 180°); `observation/state`: 8 floats (eef position, eef axis-angle, gripper qpos); `prompt`: task instruction |
-| Optional inputs | `task_suite` (`libero_spatial`, `libero_object`, `libero_goal`, `libero_10`; selects the suite's normalisation statistics and action-codec embedding, default from the deploy config); `seed`; `sampling_params.num_inference_steps` |
+| Suite | `task_suite` (`libero_spatial`, `libero_object`, `libero_goal`, `libero_10`) selects the suite's normalisation statistics and action-codec embedding. Required on every request unless `model_config.task_suite` in the deploy config pins one suite (needed for the stock OpenPI LIBERO client, which does not send it); requests without either are rejected |
+| Optional inputs | `seed` (deploy default 42, so unseeded requests are deterministic); `sampling_params.num_inference_steps` |
 | Image processing | Each camera scaled to cover 224x224 (bilinear) and centre-cropped; cameras concatenated side by side |
 | Output | float32 `[32, 7]`, de-normalised; gripper binarised to LIBERO's convention (+1 close, -1 open) |
 | Steps | 10 by default (CAE-FastWAM was also published at 4) |
@@ -44,7 +45,7 @@ validated variant. The original FastWAM LIBERO checkpoint (`yuanty/fastwam`,
 | Profile | Deploy config | Status |
 | --- | --- | --- |
 | Eager, bfloat16 | `cae_fastwam_libero.yaml` | TODO(validation): qualify on MI355X |
-| Regional `torch.compile`, bfloat16 | `cae_fastwam_libero.yaml` with `enforce_eager: false`, `diffusion_compile_dynamic: false` | TODO(validation): qualify on MI355X |
+| Regional `torch.compile`, bfloat16 | `cae_fastwam_libero.yaml` with `enforce_eager: false`, `diffusion_compile_dynamic: false` | Configuration-only until qualified on MI355X (TODO(validation)) |
 | Original FastWAM checkpoint | `fastwam_libero.yaml` | Configuration-only |
 
 ## Weights
@@ -58,7 +59,9 @@ validated variant. The original FastWAM LIBERO checkpoint (`yuanty/fastwam`,
 | Wan2.2 VAE encoder, umT5-XXL encoder, tokenizer | 5.7 B (umT5) | `Wan-AI/Wan2.2-TI2V-5B-Diffusers` (`vae/`, `text_encoder/`, `tokenizer/`) |
 
 The `.pt` files are read with `torch.load(weights_only=True)`. Prompt contexts
-are cached per unique instruction, so the umT5 encoder runs once per task.
+are cached per unique instruction, so the umT5 encoder runs once per task; it
+still stays resident on the device (about 11 GB in bfloat16). The Wan2.2 video
+output head in `policy.pt` is not loaded (action-only inference never uses it).
 
 ## References
 
@@ -148,7 +151,7 @@ values in `{-1.0, 1.0}`.
 | Feature | Status |
 | --- | --- |
 | Eager execution | ✅︎ (default) |
-| Regional `torch.compile` | ✅︎ (opt-in, see Command) |
+| Regional `torch.compile` | Configuration-only: wired up (opt-in, see Command) but not yet verified on any device |
 | Request batching | ✗ (`max_num_seqs: 1`) |
 | Cache acceleration (cache-dit / TeaCache) | ✗ (not applicable to the action loop) |
 | Tensor / sequence / CFG parallelism | ✗ |

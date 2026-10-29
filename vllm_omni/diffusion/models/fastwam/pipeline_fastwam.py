@@ -11,8 +11,9 @@ pipeline predicts one action chunk per request, and returns it as a float32
 FastWAM keeps no state between requests, so ``reset`` and ``session_id`` are
 accepted and ignored. The request ``seed`` seeds a CPU generator for the initial
 action noise, as the reference evaluator does, so the same seed and observation
-give the same chunk on any device. Without a seed (the engine then assigns a
-random one) the noise differs per request.
+give the same chunk on any device. Unseeded OpenPI requests get the deploy
+config's ``default_sampling_params.seed`` (42 in the FastWAM deploy configs, the
+reference evaluator's seed), so they are deterministic too.
 """
 
 from __future__ import annotations
@@ -27,7 +28,12 @@ from vllm.logger import init_logger
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
-from vllm_omni.diffusion.models.fastwam.config import FastWAMConfig, resolve_config
+from vllm_omni.diffusion.models.fastwam.config import (
+    FastWAMConfig,
+    check_checkpoint_matches_preset,
+    resolve_config,
+)
+from vllm_omni.diffusion.models.fastwam.modeling.fastwam import FastWAMModel
 from vllm_omni.diffusion.models.fastwam.policy import (
     _BASE_MODEL_PATTERNS,
     DEFAULT_BASE_MODEL,
@@ -75,6 +81,9 @@ def _noise_generator(sampling_params: OmniDiffusionSamplingParams) -> torch.Gene
     """
     if sampling_params.seed is not None:
         return torch.Generator(device="cpu").manual_seed(int(sampling_params.seed))
+    # Served requests always carry a seed (deploy default, or one assigned by
+    # OmniDiffusionRequest); this branch only serves offline callers that pass a
+    # CPU generator and no seed.
     generator = sampling_params.generator
     if isinstance(generator, list) and len(generator) == 1:
         generator = generator[0]
@@ -90,9 +99,14 @@ class FastWAMPipeline(nn.Module):
     ``model_config.fastwam_variant`` (default ``cae_fastwam_libero``).
     """
 
-    # ``enforce_eager: false`` compiles every transformer layer of both experts
-    # (``FastWAMModel._repeated_blocks``) with vLLM-Omni's regional torch.compile.
-    _dit_modules = ("model",)
+    # Component roles for the runner (compile, offload, sequence-parallel hooks).
+    # ``enforce_eager: false`` regionally compiles every transformer layer of both
+    # experts (``FastWAMMoT._repeated_blocks``); the umT5 and VAE encoders stay eager.
+    # The umT5 encoder stays resident on the device (~11 GB in bfloat16) although its
+    # output is cached per prompt.
+    _dit_modules = ["mot"]
+    _encoder_modules = ["text_encoder"]
+    _vae_modules = ["vae_encoder"]
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = "") -> None:
         super().__init__()
@@ -117,6 +131,7 @@ class FastWAMPipeline(nn.Module):
 
         if not od_config.model:
             raise ValueError("FastWAMPipeline needs od_config.model (a FastWAM checkpoint directory or Hub ID).")
+        check_checkpoint_matches_preset(od_config.model, cfg)
         model_dir = resolve_local_dir(od_config.model, checkpoint_patterns(cfg), od_config.revision)
         base_model_dir = resolve_local_dir(
             str(model_config.get("base_model") or DEFAULT_BASE_MODEL), _BASE_MODEL_PATTERNS
@@ -130,9 +145,20 @@ class FastWAMPipeline(nn.Module):
             action_postprocess=action_postprocess,
             default_suite=model_config.get("task_suite"),
         )
-        # Registered as a child so the runner sees the parameters and can compile it.
-        self.model = self.policy.model
+        # Registered as children by role so the runner sees every parameter and
+        # compiles only the experts.
+        model = self.policy.model
+        self.mot = model.mot
+        self.text_encoder = model.text_encoder
+        self.vae_encoder = model.vae_encoder
+        self.proprio_encoder = model.proprio_encoder
+        self.action_codec = model.action_codec
         self._validate_policy_server_config(model_config.get("policy_server_config"))
+
+    @property
+    def model(self) -> FastWAMModel:
+        """The whole FastWAM model (its components are registered on the pipeline by role)."""
+        return self.policy.model
 
     @property
     def cfg(self) -> FastWAMConfig:
@@ -181,7 +207,8 @@ class FastWAMPipeline(nn.Module):
             images=(image,) * self.cfg.num_cameras,
             state=np.zeros((self.cfg.proprio_dim,), dtype=np.float32),
             task=WARMUP_TASK,
-            suite=self.policy.default_suite,
+            # Warm-up output is discarded, so any known suite will do.
+            suite=self.policy.default_suite or self.cfg.task_suites[0],
         )
 
     def _dummy_output(self) -> DiffusionOutput:
@@ -215,15 +242,12 @@ class FastWAMPipeline(nn.Module):
                 num_cameras=self.cfg.num_cameras,
                 default_suite=self.policy.default_suite,
             )
+            self.policy.check_suite(obs.suite)
             num_steps = req.sampling_params.num_inference_steps
             num_steps = (
                 self.num_inference_steps if num_steps is None else _positive_int(num_steps, "num_inference_steps")
             )
         except ValueError as exc:
             return DiffusionOutput(error=f"Invalid FastWAM request: {exc}")
-        if obs.suite not in self.cfg.suite_ids and self.cfg.suite_conditioned_stats:
-            return DiffusionOutput(
-                error=f"Unknown task_suite {obs.suite!r}; expected one of {sorted(self.cfg.suite_ids)}."
-            )
         actions = self.policy.infer(obs, num_steps=num_steps, generator=_noise_generator(req.sampling_params))
         return DiffusionOutput(output={"actions": actions})

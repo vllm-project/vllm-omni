@@ -15,6 +15,8 @@ from tests.helpers.stage_config import get_deploy_config_path
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 MODEL = "amd/CAE-FastWAM"
+# Hardware: MI325 is the closest ROCm selection label (no MI355X mark exists);
+# the qualification target is MI355X. No CUDA SKU until someone runs it there.
 
 pytest.importorskip("websockets")
 pytest.importorskip("openpi_client.msgpack_numpy")
@@ -46,7 +48,7 @@ def _session(openai_client, observation: dict) -> OpenPIWebSocketResponse:
 
 @pytest.mark.slow
 @pytest.mark.diffusion
-@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=1)
+@hardware_test(res={"rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_cae_fastwam_openpi_online(omni_server, openai_client) -> None:
     response = _session(openai_client, ref.build_libero_reference_observation(seed=None))
@@ -64,7 +66,7 @@ def test_cae_fastwam_openpi_online(omni_server, openai_client) -> None:
 
 @pytest.mark.slow
 @pytest.mark.diffusion
-@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=1)
+@hardware_test(res={"rocm": "MI325"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_cae_fastwam_openpi_precision(omni_server, openai_client) -> None:
     """Actions match the original CAE-FastWAM eager path (request seed=42)."""

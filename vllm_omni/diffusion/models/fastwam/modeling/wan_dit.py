@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 The FastWAM Authors
+# SPDX-FileCopyrightText: Copyright 2024-2025 The Wan Team and Alibaba Group
+# SPDX-FileCopyrightText: Copyright (c) ModelScope DiffSynth-Studio contributors
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Wan2.2 DiT blocks and the two FastWAM experts (video and action).
 
@@ -11,6 +13,11 @@ RoPE runs in complex128, sinusoidal embeddings in float64, and attention is
 passes (they are all-True at inference, but they select the same SDPA backend).
 """
 
+# Wan2.2 provenance: the Wan2.2 modules in FastWAM's wan22/ package come from
+# Wan-Video/Wan2.2 (https://github.com/Wan-Video/Wan2.2, Apache-2.0, Copyright 2024-2025
+# The Wan Team / Alibaba) via DiffSynth-Studio (https://github.com/modelscope/DiffSynth-Studio,
+# Apache-2.0). Those portions remain under the Apache License 2.0.
+#
 # Adapted from FastWAM (https://github.com/yuantianyuan01/FastWAM @7faa711,
 # src/fastwam/models/wan22/). The original portions carry the following MIT license:
 # Copyright (c) 2026 The FastWAM Authors
@@ -34,8 +41,6 @@ passes (they are all-True at inference, but they select the same SDPA backend).
 # SOFTWARE.
 
 from __future__ import annotations
-
-import math
 
 import torch
 import torch.nn.functional as F
@@ -191,25 +196,19 @@ class FastWAMBlock(nn.Module):
         return x, k, v
 
 
-class VideoHead(nn.Module):
-    """Wan2.2 output head. Kept so the checkpoint loads strictly; action-only
-    inference never predicts future video, so it is never called."""
-
-    def __init__(self, dim: int, out_dim: int, patch_size: tuple[int, int, int]) -> None:
-        super().__init__()
-        self.head = nn.Linear(dim, out_dim * math.prod(patch_size))
-        self.modulation = nn.Parameter(torch.randn(1, 2, dim) / dim**0.5)
-
-
 class VideoExpert(nn.Module):
-    """Wan2.2-TI2V-5B DiT used as FastWAM's video expert (first-frame prefill only)."""
+    """Wan2.2-TI2V-5B DiT used as FastWAM's video expert (first-frame prefill only).
+
+    The Wan2.2 output head is not built: action-only inference never predicts
+    future video. Its checkpoint keys (``mixtures.video.head.*``) are dropped by
+    the loader as expected-unused.
+    """
 
     def __init__(
         self,
         *,
         hidden_dim: int,
         in_dim: int,
-        out_dim: int,
         ffn_dim: int,
         text_dim: int,
         freq_dim: int,
@@ -234,7 +233,6 @@ class VideoExpert(nn.Module):
         self.blocks = nn.ModuleList(
             [FastWAMBlock(hidden_dim, attn_head_dim, num_heads, ffn_dim, eps) for _ in range(num_layers)]
         )
-        self.head = VideoHead(hidden_dim, out_dim, self.patch_size)
         self.freqs: tuple[torch.Tensor, ...] = precompute_freqs_cis_3d(attn_head_dim)
 
     def _apply(self, fn, recurse=True):  # type: ignore[override]
@@ -336,6 +334,10 @@ class ActionExpert(nn.Module):
 
 class FastWAMMoT(nn.Module):
     """Mixture of the video and action experts (state-dict prefix ``mixtures.``)."""
+
+    # Unit of vLLM-Omni's regional torch.compile (``enforce_eager: false``): each
+    # transformer layer of both experts is compiled as one region.
+    _repeated_blocks = ["FastWAMBlock"]
 
     def __init__(self, video: VideoExpert, action: ActionExpert) -> None:
         super().__init__()

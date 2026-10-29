@@ -210,3 +210,30 @@ def test_rejects_unsupported_dtype_and_postprocess(tiny_assets):
         FastWAMPipeline(od_config=od_config)
     with pytest.raises(ValueError, match="action_postprocess"):
         _pipeline(tiny_assets, action_postprocess="bogus")
+
+
+def test_suite_conditioned_checkpoint_requires_a_suite(tiny_assets):
+    # No deploy default: a request without task_suite is rejected, never served
+    # with another suite's statistics.
+    pipeline = _pipeline(tiny_assets, task_suite=None)
+    output = pipeline.forward(_request(_robot_obs()))
+    assert output.output is None and "task_suite is required" in output.error
+    ok = pipeline.forward(_request(_robot_obs(task_suite="suite_b")))
+    assert ok.error is None
+    # Warm-up still runs without a deploy suite.
+    warm = pipeline.forward(_request(None, request_id=DUMMY_DIFFUSION_REQUEST_ID))
+    assert warm.error is None
+    # A pinned deploy suite serves clients that do not send one.
+    pinned = _pipeline(tiny_assets, task_suite="suite_b")
+    np.testing.assert_array_equal(pinned.forward(_request(_robot_obs())).output["actions"], ok.output["actions"])
+
+
+def test_components_are_declared_by_role(tiny_assets):
+    pipeline = _pipeline(tiny_assets)
+    model = pipeline.model
+    assert pipeline.mot is model.mot and pipeline._dit_modules == ["mot"]
+    assert pipeline.text_encoder is model.text_encoder and pipeline._encoder_modules == ["text_encoder"]
+    assert pipeline.vae_encoder is model.vae_encoder and pipeline._vae_modules == ["vae_encoder"]
+    assert pipeline.mot._repeated_blocks == ["FastWAMBlock"]
+    # The unused Wan2.2 video head is dropped, not built.
+    assert not any(name.startswith("mixtures.video.head.") for name, _ in pipeline.mot.named_parameters())

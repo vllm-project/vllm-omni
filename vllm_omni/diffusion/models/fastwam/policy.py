@@ -12,7 +12,9 @@ Assets:
   include them).
 
 The ``.pt`` files are read with ``torch.load(weights_only=True)``: they contain
-only tensors, strings and numbers. Every component is loaded strictly.
+only tensors, strings and numbers. Every component is loaded strictly; the only
+checkpoint keys skipped are the Wan2.2 video output head (``VIDEO_HEAD_PREFIX``),
+which action-only inference never uses.
 """
 
 from __future__ import annotations
@@ -49,6 +51,9 @@ logger = init_logger(__name__)
 DEFAULT_BASE_MODEL = "Wan-AI/Wan2.2-TI2V-5B-Diffusers"
 _BASE_MODEL_PATTERNS = ["vae/*", "text_encoder/*", "tokenizer/*"]
 _PROMPT_CACHE_SIZE = 256
+# Wan2.2 video output head: present in every FastWAM policy checkpoint, never used by
+# action-only inference, so it is not built and its keys are dropped as expected-unused.
+VIDEO_HEAD_PREFIX = "mixtures.video.head."
 
 
 def resolve_local_dir(model: str, allow_patterns: list[str], revision: str | None = None) -> str:
@@ -149,8 +154,11 @@ class FastWAMPolicy:
         else:
             codec_payload = None
         self.cfg = cfg
-        self.default_suite = default_suite or cfg.task_suites[0]
-        self._check_suite(self.default_suite)
+        # No silent fallback: a suite-conditioned checkpoint run on the wrong suite's
+        # statistics and codec embedding gives wrong actions without any error.
+        self.default_suite = default_suite or None
+        if self.default_suite is not None:
+            self.check_suite(self.default_suite)
 
         policy_payload = _load_pt(os.path.join(model_dir, cfg.policy_checkpoint), mmap=True)
         cfg.check_policy_state_dict(policy_payload["mot"])
@@ -170,7 +178,8 @@ class FastWAMPolicy:
         if text_encoder.dim != cfg.text_dim:
             raise ValueError(f"Text encoder width {text_encoder.dim} != FastWAM text_dim {cfg.text_dim}.")
         _load_strict(model.text_encoder, load_text_encoder_state(text_encoder_dir), "umT5 text encoder")
-        _load_strict(model.mot, policy_payload["mot"], f"{cfg.policy_checkpoint} mot")
+        mot_state = {k: v for k, v in policy_payload["mot"].items() if not k.startswith(VIDEO_HEAD_PREFIX)}
+        _load_strict(model.mot, mot_state, f"{cfg.policy_checkpoint} mot")
         _load_strict(model.proprio_encoder, policy_payload["proprio_encoder"], f"{cfg.policy_checkpoint} proprio")
         if model.action_codec is not None and codec_payload is not None:
             _load_strict(
@@ -208,14 +217,25 @@ class FastWAMPolicy:
             dtype,
         )
 
-    def _check_suite(self, suite: str) -> None:
-        if self.cfg.suite_conditioned_stats and suite not in self.cfg.suite_ids:
+    def check_suite(self, suite: str | None) -> None:
+        """Raise ``ValueError`` unless ``suite`` is usable with this checkpoint."""
+        if not self.cfg.suite_conditioned_stats:
+            return
+        if suite is None:
+            raise ValueError(
+                f"task_suite is required: {self.cfg.variant} normalises and conditions its actions per task suite. "
+                f"Send robot_obs['task_suite'] (one of {sorted(self.cfg.suite_ids)}) or pin one suite with "
+                "model_config.task_suite in the deploy config."
+            )
+        if suite not in self.cfg.suite_ids:
             raise ValueError(f"Unknown task_suite {suite!r}; this checkpoint knows {sorted(self.cfg.suite_ids)}.")
 
-    def stats(self, suite: str) -> FastWAMStats:
-        key = suite if self.cfg.suite_conditioned_stats else ""
+    def stats(self, suite: str | None) -> FastWAMStats:
+        self.check_suite(suite)
+        # Pooled-statistics checkpoints share one file whatever the suite.
+        key = (suite or "") if self.cfg.suite_conditioned_stats else ""
         if key not in self._stats:
-            path = os.path.join(self.model_dir, self.cfg.stats_file(suite))
+            path = os.path.join(self.model_dir, self.cfg.stats_file(key))
             self._stats[key] = load_stats(path, action_dim=self.cfg.action_dim, proprio_dim=self.cfg.proprio_dim)
         return self._stats[key]
 
@@ -243,12 +263,16 @@ class FastWAMPolicy:
     def infer(self, obs: FastWAMObservation, *, num_steps: int, generator: torch.Generator | None) -> np.ndarray:
         """One action chunk [action_horizon, action_dim] (float32) for one observation."""
         cfg = self.cfg
-        self._check_suite(obs.suite)
+        self.check_suite(obs.suite)
         stats = self.stats(obs.suite)
         image = build_image(obs.images, cfg.camera_size)
         proprio = stats.state.normalize(torch.as_tensor(obs.state, dtype=torch.float32).unsqueeze(0))
         context, context_mask = self.encode_prompt(obs.task)
-        suite_id = cfg.suite_ids[obs.suite] if cfg.action_codec is not None and cfg.action_codec.num_suites else None
+        suite_id = None
+        if cfg.action_codec is not None and cfg.action_codec.num_suites:
+            if obs.suite is None:
+                raise ValueError("A suite-conditioned action codec needs a task_suite.")
+            suite_id = cfg.suite_ids[obs.suite]
         actions = self.model.infer_action(
             image,
             context,

@@ -39,6 +39,8 @@ def test_parse_observation_reads_openpi_libero_keys():
     assert obs.state.dtype == np.float32 and obs.state.tolist() == list(range(8))
     assert len(obs.images) == 2
     assert parse_observation(_obs(), proprio_dim=8, num_cameras=2, default_suite="d").suite == "d"
+    # No silent default: the policy decides whether a missing suite is an error.
+    assert parse_observation(_obs(), proprio_dim=8, num_cameras=2, default_suite=None).suite is None
 
 
 @pytest.mark.parametrize(

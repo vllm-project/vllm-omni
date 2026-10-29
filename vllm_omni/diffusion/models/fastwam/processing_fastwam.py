@@ -10,9 +10,11 @@ and, for LIBERO, the gripper is mapped from the dataset convention (0 close, 1
 open) to the simulator's (+1 close, -1 open) and binarised.
 
 Observation keys follow the OpenPI LIBERO client: ``observation/image`` (third
-person), ``observation/wrist_image``, ``observation/state`` and ``prompt``, plus an
-optional ``task_suite`` that selects the per-suite statistics and action-codec
-conditioning of CAE-FastWAM. Images are HWC uint8 and must already be upright
+person), ``observation/wrist_image``, ``observation/state`` and ``prompt``, plus
+``task_suite``, which selects the per-suite statistics and action-codec conditioning
+of CAE-FastWAM. CAE-FastWAM needs it on every request unless the deploy config pins
+one suite (the stock OpenPI LIBERO client does not send it); checkpoints with pooled
+statistics ignore it. Images are HWC uint8 and must already be upright
 (the OpenPI LIBERO client rotates LIBERO's frames by 180 degrees before sending).
 """
 
@@ -39,11 +41,12 @@ class FastWAMObservation:
     images: tuple[np.ndarray, ...]
     state: np.ndarray
     task: str
-    suite: str
+    # None when neither the request nor the deploy config names a suite.
+    suite: str | None
 
 
 def parse_observation(
-    robot_obs: Mapping[str, Any], *, proprio_dim: int, num_cameras: int, default_suite: str
+    robot_obs: Mapping[str, Any], *, proprio_dim: int, num_cameras: int, default_suite: str | None
 ) -> FastWAMObservation:
     """Validate an OpenPI observation dict and pull out the FastWAM inputs."""
     image_keys = IMAGE_KEYS[:num_cameras]
@@ -65,7 +68,7 @@ def parse_observation(
     if not isinstance(task, str) or not task.strip():
         raise ValueError("robot_obs['prompt'] must be a non-empty task instruction string.")
     suite = robot_obs.get(SUITE_KEY) or default_suite
-    if not isinstance(suite, str):
+    if suite is not None and not isinstance(suite, str):
         raise ValueError(f"robot_obs[{SUITE_KEY!r}] must be a string, got {type(suite).__name__}.")
     return FastWAMObservation(images=tuple(images), state=state, task=task, suite=suite)
 

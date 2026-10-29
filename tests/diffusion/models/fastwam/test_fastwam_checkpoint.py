@@ -30,6 +30,8 @@ from vllm_omni.diffusion.models.fastwam.processing_fastwam import parse_observat
 from vllm_omni.platforms import current_omni_platform
 
 pytestmark = [pytest.mark.advanced_model, pytest.mark.diffusion]
+# Hardware: MI325 is the closest ROCm selection label (no MI355X mark exists);
+# the qualification target is MI355X. No CUDA SKU until someone runs it there.
 
 MODEL = os.environ.get("FASTWAM_MODEL", "amd/CAE-FastWAM")
 BASE_MODEL = os.environ.get("FASTWAM_BASE_MODEL", DEFAULT_BASE_MODEL)
@@ -53,7 +55,7 @@ def _infer(policy, seed: int, **overrides) -> np.ndarray:
     return policy.infer(obs, num_steps=10, generator=torch.Generator(device="cpu").manual_seed(seed))
 
 
-@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=1)
+@hardware_test(res={"rocm": "MI325"}, num_cards=1)
 def test_chunk_matches_reference(policy):
     actions = _infer(policy, ref.SEED)
     assert actions.shape == (32, 7) and actions.dtype == np.float32
@@ -62,7 +64,7 @@ def test_chunk_matches_reference(policy):
     np.testing.assert_array_equal(rows[:, 6], ref.REFERENCE_CHUNK_ROWS[:, 6])
 
 
-@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=1)
+@hardware_test(res={"rocm": "MI325"}, num_cards=1)
 def test_seed_determinism_and_suite_conditioning(policy):
     first = _infer(policy, 3)
     np.testing.assert_array_equal(first, _infer(policy, 3))

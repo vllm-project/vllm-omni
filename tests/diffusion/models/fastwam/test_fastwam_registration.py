@@ -66,5 +66,6 @@ def test_deploy_configs(name):
     assert handshake["action_horizon"] == preset.action_horizon
     assert handshake["action_dim"] == preset.action_dim
     assert handshake["image_resolution"] == list(preset.camera_size)
-    if preset.suite_conditioned_stats:
-        assert model_config["task_suite"] in preset.suite_ids
+    # No silent suite default: suite-conditioned requests must name their suite
+    # unless an operator pins one deliberately.
+    assert "task_suite" not in model_config

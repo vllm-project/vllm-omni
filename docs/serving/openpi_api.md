@@ -99,8 +99,12 @@ vllm serve amd/CAE-FastWAM --omni --port 8091 \
 ```
 
 The handshake advertises two 224x224 cameras and a `[32, 7]` action chunk.
-Observations use the OpenPI LIBERO client keys, plus an optional `task_suite`
-that selects CAE-FastWAM's per-suite statistics:
+Observations use the OpenPI LIBERO client keys plus `task_suite`, which selects
+CAE-FastWAM's per-suite normalisation statistics and action-codec embedding.
+CAE-FastWAM rejects a request without `task_suite`, because the stock OpenPI
+LIBERO client does not send it and the wrong suite gives wrong actions without
+any error. To serve one suite to an unmodified client, pin it with
+`model_config.task_suite` in the deploy config:
 
 ```python
 import numpy as np
@@ -114,8 +118,8 @@ actions = policy.infer({
     "observation/wrist_image": wrist,        # uint8 HxWx3, rotated upright
     "observation/state": state,              # float32 [8]: eef pos, axis-angle, gripper qpos
     "prompt": "put the bowl on the plate",
-    "task_suite": "libero_goal",             # optional; deploy default otherwise
-    "seed": 42,                              # optional
+    "task_suite": "libero_goal",             # required unless the deploy config pins a suite
+    "seed": 42,                              # optional; deploy default 42
 })  # float32 [32, 7]; LIBERO gripper convention (+1 close, -1 open)
 ```
 
@@ -162,8 +166,11 @@ frames are not observation messages.
 - An optional integer `seed` in an inference message becomes the engine
   request's `sampling_params.seed`. A policy whose sampling consumes the
   request generator or seed (GR00T-N1.7, FastWAM) returns the same action chunk for the same
-  observation and seed. If omitted, the engine assigns a random per-request
-  seed, so unseeded inferences are independent of each other. The API layer
+  observation and seed. If omitted, the stage's deploy
+  `default_sampling_params.seed` applies; without one, the engine assigns a
+  random per-request seed. The FastWAM deploy configs set `seed: 42` (the
+  reference LIBERO evaluator's seed), so unseeded FastWAM requests are
+  deterministic. The API layer
   consumes `seed`; it is not forwarded inside the observation.
 
 ## Limits and Errors

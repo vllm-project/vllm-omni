@@ -138,11 +138,11 @@ def test_infer_action_rejects_bad_image():
 def test_regional_compile_targets_every_expert_layer():
     cfg = tiny.tiny_cae_config()
     model = tiny.build_tiny_model(cfg)
+    # The pipeline's DiT module is the MoT; its regions are both experts' layers.
     blocks = [
         name
-        for name, module in model.named_modules()
-        if _matches_repeated_block(name, module, model._repeated_blocks, [])
+        for name, module in model.mot.named_modules()
+        if _matches_repeated_block(name, module, model.mot._repeated_blocks, [])
     ]
-    # Both experts' layers and nothing else (the text encoder and VAE stay eager).
     assert len(blocks) == 2 * cfg.num_layers
-    assert all(name.startswith("mot.mixtures.") for name in blocks)
+    assert all(name.startswith("mixtures.") for name in blocks)

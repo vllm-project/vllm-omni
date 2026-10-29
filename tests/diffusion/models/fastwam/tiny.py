@@ -31,7 +31,6 @@ _TINY_SHAPES = dict(
     video_hidden_dim=16,
     video_ffn_dim=32,
     video_in_dim=48,
-    video_out_dim=48,
     num_layers=2,
     num_heads=2,
     attn_head_dim=8,
@@ -70,20 +69,47 @@ def tiny_fastwam_config() -> FastWAMConfig:
     )
 
 
-def fill_deterministic(module: nn.Module, seed: int) -> None:
+def fill_deterministic(
+    module: nn.Module, seed: int, skipped: dict[str, tuple[int, ...]] | None = None
+) -> dict[str, torch.Tensor]:
+    """Fill every parameter from one seeded stream, in sorted-name order.
+
+    ``skipped`` names parameters that the reference model has but ``module`` does
+    not build; their values are drawn in order (so the stream, and the goldens
+    generated with them, stay the same) and returned instead of assigned.
+    """
     generator = torch.Generator(device="cpu").manual_seed(seed)
+    params = dict(module.named_parameters())
+    drawn: dict[str, torch.Tensor] = {}
     with torch.no_grad():
-        for name, param in sorted(module.named_parameters()):
-            noise = torch.randn(param.shape, generator=generator, dtype=torch.float32)
+        for name in sorted([*params, *(skipped or {})]):
+            shape = params[name].shape if name in params else (skipped or {})[name]
+            noise = torch.randn(shape, generator=generator, dtype=torch.float32)
             value = 1.0 + 0.1 * noise if ("norm" in name or name.endswith("gamma")) else 0.2 * noise
-            param.copy_(value.to(param.dtype))
+            if name in params:
+                params[name].copy_(value.to(params[name].dtype))
+            else:
+                drawn[name] = value
+    return drawn
+
+
+def _video_head_shapes(cfg: FastWAMConfig) -> dict[str, tuple[int, ...]]:
+    """The Wan2.2 video output head: in every real checkpoint, never built by the port."""
+    dim, out = cfg.video_hidden_dim, cfg.video_in_dim * cfg.patch_size[0] * cfg.patch_size[1] * cfg.patch_size[2]
+    return {
+        "mixtures.video.head.head.weight": (out, dim),
+        "mixtures.video.head.head.bias": (out,),
+        "mixtures.video.head.modulation": (1, 2, dim),
+    }
 
 
 def build_tiny_model(cfg: FastWAMConfig, seed: int = 0) -> FastWAMModel:
     model = FastWAMModel(
         cfg, vae_encoder=WanVAEFirstFrameEncoder(**TINY_VAE), text_encoder=WanUMT5Encoder(**TINY_T5)
     ).to(torch.float32)
-    fill_deterministic(model, seed)
+    # The goldens in test_fastwam_model.py come from the reference model, which
+    # has the video head; drawing it keeps the same weights for everything else.
+    fill_deterministic(model, seed, {f"mot.{k}": v for k, v in _video_head_shapes(cfg).items()})
     return model.eval()
 
 
@@ -141,7 +167,8 @@ def write_tiny_assets(root, cfg: FastWAMConfig, model: FastWAMModel) -> tuple[st
 
     torch.save(
         {
-            "mot": model.mot.state_dict(),
+            # The real checkpoints also hold the unused Wan2.2 video output head.
+            "mot": {**model.mot.state_dict(), **{k: torch.zeros(v) for k, v in _video_head_shapes(cfg).items()}},
             "proprio_encoder": model.proprio_encoder.state_dict(),
             "step": 1,
             "torch_dtype": "torch.float32",
