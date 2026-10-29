@@ -29,7 +29,7 @@ import asyncio
 import weakref
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import AbstractContextManager, suppress
-from typing import Any, Literal
+from typing import Any
 from uuid import uuid4
 
 from vllm.logger import init_logger
@@ -337,9 +337,9 @@ class DuplexOmni(AsyncOmni):
 
     Construct it like ``AsyncOmni``. The pipeline must declare
     ``duplex_plugin`` and the deploy config ``session_mode: duplex``; the
-    engine raises at startup otherwise. ``duplex_engine_backend="process"``
+    engine raises at startup otherwise. ``duplex_engine_backend_as_process=True``
     isolates the runtime from the frontend GIL and restricts this deployment
-    to sessions. The default ``"thread"`` also permits model-supported chat.
+    to sessions. The default ``False`` also permits model-supported chat.
     """
 
     session_only: bool = False
@@ -354,12 +354,10 @@ class DuplexOmni(AsyncOmni):
         self,
         model: str = "",
         *args: Any,
-        duplex_engine_backend: Literal["thread", "process"] = "thread",
+        duplex_engine_backend_as_process: bool = False,
         **kwargs: Any,
     ) -> None:
-        if duplex_engine_backend not in {"thread", "process"}:
-            raise ValueError("duplex_engine_backend must be 'thread' or 'process'")
-        self.session_only = duplex_engine_backend == "process"
+        self.session_only = duplex_engine_backend_as_process
         if self.session_only:
             if args:
                 raise TypeError("The process duplex backend accepts keyword engine options only")

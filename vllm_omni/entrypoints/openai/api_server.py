@@ -756,14 +756,14 @@ async def build_async_omni_from_stage_config(
             kwargs.setdefault("log_stats", True)
         if client_config is not None:
             kwargs["client_config"] = client_config
-        backend = kwargs.pop("duplex_engine_backend", "thread")
+        backend_as_process = kwargs.pop("duplex_engine_backend_as_process", False)
         if _should_serve_duplex(model, kwargs):
-            if backend != "thread":
-                kwargs["duplex_engine_backend"] = backend
+            if backend_as_process:
+                kwargs["duplex_engine_backend_as_process"] = True
             async_omni = DuplexOmni(model=model, **kwargs)
         else:
-            if backend != "thread":
-                raise ValueError("--duplex-engine-backend=process requires a session_mode: duplex deployment")
+            if backend_as_process:
+                raise ValueError("--duplex-engine-backend-as-process requires a session_mode: duplex deployment")
             async_omni = AsyncOmni(model=model, **kwargs)
 
         # # Don't keep the dummy data in memory
@@ -772,7 +772,7 @@ async def build_async_omni_from_stage_config(
         yield async_omni
     finally:
         if async_omni:
-            if isinstance(async_omni, DuplexOmni) and backend == "process":
+            if isinstance(async_omni, DuplexOmni) and backend_as_process:
                 await async_omni.aclose()
             else:
                 async_omni.shutdown()

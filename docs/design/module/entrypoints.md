@@ -108,8 +108,8 @@ stage-client channel configuration and does not launch or retire backend
 processes. CLI validation rejects unsupported distributed, diffusion,
 fault-tolerant, elastic-EP, Ray, and runtime-LoRA combinations before startup.
 
-`DuplexOmni` also accepts `duplex_engine_backend="process"`, exposed by serve
-as `--duplex-engine-backend process`. This selects session-only serving without
+`DuplexOmni` also accepts `duplex_engine_backend_as_process=True`, exposed by serve
+as `--duplex-engine-backend-as-process`. This selects session-only serving without
 changing model capabilities. The entrypoint retains session handles and delegates
 process/IPC ownership to `ProcessDuplexEngineClient`; it does not initialize
 frontend generation processors or the chat service. Both backends share output

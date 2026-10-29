@@ -14,26 +14,26 @@ capability gates, see the [Realtime Duplex API guide](realtime_duplex_api.md).
 ## Run the duplex runtime in a separate process
 
 The default `DuplexOmni` backend runs the orchestrator on a background thread
-in the frontend process. Use `--duplex-engine-backend process` to give the
+in the frontend process. Use `--duplex-engine-backend-as-process` to give the
 native runtime its own Python process and GIL:
 
 ```bash
 vllm serve "$MODEL" --omni \
   --deploy-config "$DEPLOY_CONFIG" \
-  --duplex-engine-backend process
+  --duplex-engine-backend-as-process
 ```
 
 Set `MODEL` to the checkpoint and `DEPLOY_CONFIG` to its deployment YAML.
 The deployment must resolve to `session_mode: duplex`. The option is independent
 of the model plugin, stage count, and stage worker backend.
 
-Selecting `process` makes this deployment **session-only**, including when the
+Enabling this option makes the deployment **session-only**, including when the
 model also supports chat. It serves the duplex WebSocket routes, `/v1/models`,
 `/health`, and metrics. Chat and other generation routes are unavailable.
 The model's reported `DuplexCapabilities` remain unchanged. Keep the default
-`thread` backend to serve chat alongside sessions.
+`duplex_engine_backend_as_process=False` to serve chat alongside sessions.
 
-For embedded Python use, pass `duplex_engine_backend="process"` to
+For embedded Python use, pass `duplex_engine_backend_as_process=True` to
 `DuplexOmni`. Protect the program entrypoint for Python's `spawn` start method:
 
 ```python
@@ -47,7 +47,7 @@ async def main():
     omni = DuplexOmni(
         model=os.environ["MODEL"],
         deploy_config=os.environ["DEPLOY_CONFIG"],
-        duplex_engine_backend="process",
+        duplex_engine_backend_as_process=True,
     )
     try:
         async with await omni.open_session() as session:
