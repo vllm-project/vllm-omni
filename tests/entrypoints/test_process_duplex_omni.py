@@ -25,15 +25,9 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 @pytest.fixture
 def process_omni(monkeypatch):
     monkeypatch.setattr("vllm_omni.entrypoints.duplex_omni._ProcessWorkerRuntime", fake_factory)
-    omni = DuplexOmni("fake", duplex_engine_backend="process", init_timeout=30)
+    omni = DuplexOmni("fake", duplex_engine_backend_as_process=True, init_timeout=30)
     yield omni
     omni.shutdown()
-
-
-@pytest.mark.parametrize("backend", ["invalid", "", None])
-def test_invalid_backend_fails_before_startup(backend):
-    with pytest.raises(ValueError, match="duplex_engine_backend"):
-        DuplexOmni("fake", duplex_engine_backend=backend)
 
 
 @pytest.mark.asyncio
@@ -100,7 +94,7 @@ async def test_server_models_health_and_chat_restriction(process_omni):
 @pytest.mark.asyncio
 async def test_slow_frontend_session_does_not_kill_healthy_session(monkeypatch):
     monkeypatch.setattr("vllm_omni.entrypoints.duplex_omni._ProcessWorkerRuntime", fake_factory)
-    omni = DuplexOmni("fake", duplex_engine_backend="process", init_timeout=30, small_buffers=True)
+    omni = DuplexOmni("fake", duplex_engine_backend_as_process=True, init_timeout=30, small_buffers=True)
     try:
         slow = await omni.open_session()
         for _ in range(10):
@@ -134,12 +128,15 @@ async def test_cli_backend_selection_and_turn_rejection(monkeypatch):
     from tests.entrypoints.test_serve import _parse_serve_args
     from vllm_omni.utils.tracking_parser import TrackingNamespace
 
-    args = _parse_serve_args(["serve", "fake", "--omni", "--duplex-engine-backend", "process"])
-    assert args.get_explicit_kwargs_dict()["duplex_engine_backend"] == "process"
+    default_args = _parse_serve_args(["serve", "fake", "--omni"])
+    assert default_args.duplex_engine_backend_as_process is False
+    assert "duplex_engine_backend_as_process" not in default_args.get_explicit_kwargs_dict()
+    args = _parse_serve_args(["serve", "fake", "--omni", "--duplex-engine-backend-as-process"])
+    assert args.get_explicit_kwargs_dict()["duplex_engine_backend_as_process"] is True
     monkeypatch.setattr(api_server, "_should_serve_duplex", lambda *_: False)
     args = TrackingNamespace(
-        Namespace(model="fake", disable_log_stats=True, duplex_engine_backend="process"),
-        frozenset({"model", "duplex_engine_backend"}),
+        Namespace(model="fake", disable_log_stats=True, duplex_engine_backend_as_process=True),
+        frozenset({"model", "duplex_engine_backend_as_process"}),
     )
     with pytest.raises(ValueError, match="session_mode: duplex"):
         async with api_server.build_async_omni_from_stage_config(args):
@@ -155,8 +152,8 @@ async def test_serving_context_selects_process_and_closes_it(monkeypatch):
     monkeypatch.setattr("vllm_omni.entrypoints.duplex_omni._ProcessWorkerRuntime", fake_factory)
     monkeypatch.setattr(api_server, "_should_serve_duplex", lambda *_: True)
     args = TrackingNamespace(
-        Namespace(model="fake", disable_log_stats=True, duplex_engine_backend="process"),
-        frozenset({"model", "duplex_engine_backend"}),
+        Namespace(model="fake", disable_log_stats=True, duplex_engine_backend_as_process=True),
+        frozenset({"model", "duplex_engine_backend_as_process"}),
     )
     async with api_server.build_async_omni_from_stage_config(args) as omni:
         assert omni.session_only
@@ -179,7 +176,7 @@ def test_websocket_audio_uses_spawned_runtime(monkeypatch):
 
     @asynccontextmanager
     async def lifespan(app):
-        omni = DuplexOmni("fake", duplex_engine_backend="process", init_timeout=30)
+        omni = DuplexOmni("fake", duplex_engine_backend_as_process=True, init_timeout=30)
         try:
             await api_server.omni_init_app_state(omni, app.state, _minimal_args(model="fake"))
             app.state.api_server_count = 1
@@ -200,7 +197,7 @@ def test_websocket_audio_uses_spawned_runtime(monkeypatch):
 @pytest.mark.asyncio
 async def test_shared_frontend_checks_worker_health_not_just_process_liveness(monkeypatch):
     monkeypatch.setattr("vllm_omni.entrypoints.duplex_omni._ProcessWorkerRuntime", fake_factory)
-    omni = DuplexOmni("fake", duplex_engine_backend="process", init_timeout=30, health_error=True)
+    omni = DuplexOmni("fake", duplex_engine_backend_as_process=True, init_timeout=30, health_error=True)
     try:
         assert omni.engine.is_alive()
         with pytest.raises(EngineDeadError, match="Stage-2"):

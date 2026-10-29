@@ -35,11 +35,11 @@ the model plugins.
 
 ## Runtime process placement
 
-`DuplexOmni(duplex_engine_backend="thread")` keeps the existing shared-memory
-runtime and supports the model's ordinary chat surface. The optional `process`
-backend selects a session-only deployment. `DuplexOmni` retains the handle
-registry, session configuration normalization, and abandoned-open/resume
-compensation; `ProcessDuplexEngineClient` owns spawning, IPC correlation, local
+`DuplexOmni(duplex_engine_backend_as_process=False)` keeps the existing shared-memory
+runtime and supports the model's ordinary chat surface. Setting
+`duplex_engine_backend_as_process=True` selects a session-only deployment.
+`DuplexOmni` retains the handle registry, session configuration normalization,
+and abandoned-open/resume compensation; `ProcessDuplexEngineClient` owns spawning, IPC correlation, local
 output buffers, invalidation delivery, health checks, and child teardown.
 The process client does not subclass the public entrypoint. Both backends use
 `AsyncOmniBase`'s output pump and engine-death fan-out. Shared frontend
