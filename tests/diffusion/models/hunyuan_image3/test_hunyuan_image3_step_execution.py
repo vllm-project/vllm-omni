@@ -799,6 +799,13 @@ def test_image_attention_mask_check_rejects_candidates_without_mask_support():
     assert reason is not None and "4D attention mask" in reason
 
 
+def _capture_hy3_log(caplog, monkeypatch):
+    # Whether vllm loggers reach the root logger that caplog listens on depends on the vllm
+    # version, so attach caplog's handler directly and stop propagation: each record is seen once.
+    monkeypatch.setattr(hy3_module.logger, "handlers", [*hy3_module.logger.handlers, caplog.handler])
+    monkeypatch.setattr(hy3_module.logger, "propagate", False)
+
+
 @pytest.mark.parametrize(
     ("default", "logged"),
     [
@@ -809,8 +816,7 @@ def test_image_attention_mask_check_rejects_candidates_without_mask_support():
     ids=["covers-step-0", "starts-later", "empty"],
 )
 def test_startup_notes_a_default_schedule_that_covers_step_0(default, logged, caplog, monkeypatch):
-    # vllm loggers do not propagate to the root logger that caplog listens on.
-    monkeypatch.setattr(hy3_module.logger, "handlers", [*hy3_module.logger.handlers, caplog.handler])
+    _capture_hy3_log(caplog, monkeypatch)
     schedule = SimpleNamespace(default=default)
     with caplog.at_level("INFO", logger=hy3_module.logger.name):
         hy3_module._log_step0_profile_reuse(SimpleNamespace(diffusion_attention_schedule=schedule))
@@ -821,7 +827,7 @@ def test_startup_notes_a_default_schedule_that_covers_step_0(default, logged, ca
 
 
 def test_startup_step_0_note_logs_only_on_rank_0(caplog, monkeypatch):
-    monkeypatch.setattr(hy3_module.logger, "handlers", [*hy3_module.logger.handlers, caplog.handler])
+    _capture_hy3_log(caplog, monkeypatch)
     monkeypatch.setattr(hy3_module, "_is_rank_zero", lambda: False)
     schedule = SimpleNamespace(default=(AttentionScheduleRange(start=0, end=2, profile="approx"),))
     with caplog.at_level("INFO", logger=hy3_module.logger.name):
