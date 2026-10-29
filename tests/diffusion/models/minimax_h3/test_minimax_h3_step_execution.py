@@ -820,8 +820,12 @@ def _fake_attention_module(
     use_ring: bool,
     backend: str = "FLASH_ATTN",
     supports_multi_doc: bool = True,
+    candidate: SimpleNamespace | None = None,
 ):
     """Build a bare MiniMaxH3Attention with the attributes ``_packed_batch_supported`` reads.
+
+    ``candidate`` stands for the backend a scheduled step selects; without it the
+    layer runs its baseline.
 
     ``supports_multi_doc`` models the platform-dependent capability probe on
     ``AttentionBackend`` (e.g. FLASH_ATTN returns True on CUDA/ROCm/MUSA and
@@ -830,14 +834,18 @@ def _fake_attention_module(
     from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import MiniMaxH3Attention
 
     attn = object.__new__(MiniMaxH3Attention)
+    attn_backend = _fake_packed_backend(backend, supports_multi_doc)
+    selected = attn_backend if candidate is None else candidate
     attn.attention = SimpleNamespace(
-        attn_backend=SimpleNamespace(
-            get_name=lambda: backend,
-            supports_multi_doc_packed_varlen=lambda: supports_multi_doc,
-        ),
+        attn_backend=attn_backend,
+        effective_attention=lambda: (None, selected, None),
         use_ring=use_ring,
     )
     return attn
+
+
+def _fake_packed_backend(name: str, supports_multi_doc: bool) -> SimpleNamespace:
+    return SimpleNamespace(get_name=lambda: name, supports_multi_doc_packed_varlen=lambda: supports_multi_doc)
 
 
 class _FakeTransformer:
@@ -862,6 +870,76 @@ def test_packed_batch_rejects_backends_that_cannot_isolate_requests(attention):
     from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import MiniMaxH3Pipeline
 
     assert MiniMaxH3Pipeline._packed_batch_supported(_FakeTransformer([attention])) is False
+
+
+def test_packed_batch_checks_the_backend_the_step_selects():
+    """A scheduled step is packed only when the candidate it runs isolates requests, whatever the baseline."""
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import MiniMaxH3Pipeline
+
+    isolating = _fake_packed_backend("FLASH_ATTN", True)
+    leaking = _fake_packed_backend("XFORMERS", False)
+    supported = MiniMaxH3Pipeline._packed_batch_supported
+
+    leaking_step = _fake_attention_module(use_ring=False, candidate=leaking)
+    isolating_step = _fake_attention_module(
+        use_ring=False, backend="XFORMERS", supports_multi_doc=False, candidate=isolating
+    )
+
+    assert supported(_FakeTransformer([leaking_step])) is False
+    assert supported(_FakeTransformer([isolating_step])) is True
+
+
+def _same_progress_states(model, schedules):
+    """Two requests at the same step of equal-length sequences, each carrying its own resolved schedule."""
+    states = []
+    for index, schedule in enumerate(schedules):
+        branch, video, audio = _make_branch(
+            text_len=9 - 4 * index, latent_t=2 + index, latent_h=4, latent_w=6, audio_t=3, seed=31 + index
+        )
+        state = _make_state(f"req-{index}", model, branch, video, audio, _sigmas(4, 12.0), _sigmas(4, 3.0))
+        state.step_index = 1
+        state.attention_schedule = schedule
+        states.append(state)
+    return states
+
+
+def test_scheduled_step_batch_at_one_progress_is_packed():
+    """Requests with one schedule at one progress select one profile, so they share a packed forward."""
+    model = _ProgressRecordingModel()
+    states = _same_progress_states(model, [_sparse_schedule(), _sparse_schedule()])
+    pipeline = _step_pipeline(model)
+    with set_forward_context(), bind_attention_schedule(_sparse_schedule()):
+        packed_velocity = pipeline.denoise_step(InputBatch.make_batch(states), states=states)
+
+    sigmas = states[0].extra[pipeline_minimax_h3._STEP_SIGMAS_VIDEO]
+    assert model.progress == [(1, float(sigmas[1]), 4, "sparse", 2)]
+
+    model.progress.clear()
+    with set_forward_context(), bind_attention_schedule(_sparse_schedule()):
+        serial_velocity = _step_pipeline(model, packed_batch_supported=False).denoise_step(
+            InputBatch.make_batch(states), states=states
+        )
+    torch.testing.assert_close(serial_velocity, packed_velocity)
+
+
+@pytest.mark.parametrize(
+    ("schedules", "packed_batch_supported"),
+    [
+        # Same progress, but the requests carry different schedules, so they can select different profiles.
+        ([_sparse_schedule(), (AttentionScheduleRange(0, None, "dense"),)], True),
+        # One profile, but its backend does not isolate packed requests.
+        ([_sparse_schedule(), _sparse_schedule()], False),
+    ],
+)
+def test_scheduled_step_batch_runs_serially_unless_one_packable_profile(schedules, packed_batch_supported):
+    model = _ProgressRecordingModel()
+    states = _same_progress_states(model, schedules)
+    with set_forward_context(), bind_attention_schedule(_sparse_schedule()):
+        _step_pipeline(model, packed_batch_supported=packed_batch_supported).denoise_step(
+            InputBatch.make_batch(states), states=states
+        )
+
+    assert [entry[-1] for entry in model.progress] == [1, 1]
 
 
 def test_locked_driving_audio_is_clean_and_unchanged_during_denoising():
