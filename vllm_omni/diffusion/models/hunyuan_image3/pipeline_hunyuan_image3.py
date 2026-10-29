@@ -21,12 +21,16 @@ from vllm.config.vllm import get_current_vllm_config
 from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
 from vllm.transformers_utils.config import get_config
 
-from vllm_omni.diffusion.attention.schedule import require_request_attention_schedule_fits
+from vllm_omni.diffusion.attention.schedule import (
+    require_request_attention_schedule_fits,
+    resolve_request_attention_sigma_schedule,
+)
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.forward_context import (
     DenoiseProgressMixin,
+    check_scheduler_sigmas,
     get_forward_context,
     is_forward_context_available,
     request_denoise_progress,
@@ -2106,6 +2110,17 @@ class HunyuanImage3Pipeline(
         # AR-reuse prefill below. The runner has not opened the forward context yet.
         require_request_attention_schedule_fits(
             state.sampling, getattr(self.od_config, "diffusion_attention_schedule", None), len(timesteps)
+        )
+        # The scheduler sigmas the request's sigma windows read are checked here too, so unusable ones fail
+        # this request's prepare_encode rather than a denoise_step it shares with other requests.
+        check_scheduler_sigmas(
+            self.scheduler,
+            len(timesteps),
+            sigma_scheduled=bool(
+                resolve_request_attention_sigma_schedule(
+                    state.sampling, getattr(self.od_config, "diffusion_attention_schedule", None)
+                )
+            ),
         )
         pipe._num_timesteps = len(timesteps)
         req_scheduler = copy.deepcopy(self.scheduler)
