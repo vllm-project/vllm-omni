@@ -81,7 +81,9 @@ sigma. The two agree only for a run that starts at full noise, which every
 supported Wan2.2 and HunyuanImage-3.0 path does: none takes a `strength` or
 custom sigmas, or starts part-way down the schedule. Request `latents` replace
 the initial noise, not the schedule. The first sigma is 1.0, except under Wan's
-UniPC solver, whose ladder starts within 0.001 of 1.0. The MiniMax-H3
+UniPC solver, whose ladder starts at the shifted top of its training range:
+0.999 at `flow_shift` 1, closer to 1.0 above it (0.9998 at 5), and lower below it
+(0.998 at 0.5). The MiniMax-H3
 `latent_refine` pass does start below full noise and selects by the absolute
 sigma of its own steps.
 
@@ -221,7 +223,7 @@ fails before denoising and retains the client error through
 the runner and multiprocess executor.
 Under sigma windows, Wan2.2 and HunyuanImage-3.0 check each step's scheduler
 sigma once, right after building the timesteps. Sigmas that cannot be normalized
-into `[0, 1]`, for example from a NaN Wan2.2 `flow_shift`, raise the same
+into `[0, 1]`, for example from an infinite Wan2.2 `flow_shift`, raise the same
 `invalid_attention_schedule` client error as the other checks here, before any
 denoise forward. In step mode the request fails during its own preparation,
 not in a step shared with other requests. MiniMax-H3 solvers reject such sigmas
