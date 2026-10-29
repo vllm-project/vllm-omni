@@ -2112,3 +2112,22 @@ def test_full_payload_replace_overrides_codec_validity_accumulation(legacy_entry
         output, actual_request = host._materialize_full_payload_entry(host._pending_full_payload_send["r"])
         assert output["meta.codec_frame_valid"].tolist() == valid
         assert actual_request is request
+
+
+def test_full_payload_resume_replaces_a_dropped_tail():
+    from vllm_omni.distributed.omni_connectors.model_runner.omni_connector_payload_transport import (
+        _OmniConnectorPayloadTransportMixin,
+    )
+
+    runner = _OmniConnectorPayloadTransportMixin.__new__(_OmniConnectorPayloadTransportMixin)
+    runner._pending_full_payload_send = {}
+    runner._full_payload_token_ends = {}
+    runner._full_payload_replace_keys_cached = frozenset()
+    request = SimpleNamespace(request_id="a")
+    runner.accumulate_full_payload_output("a", {"hidden": torch.arange(8).reshape(-1, 1)}, request, token_range=(0, 8))
+    runner.accumulate_full_payload_output("a", {"hidden": torch.tensor([[99]])}, request, token_range=(8, 9))
+    assert runner.resume_full_payload_output("a", 8) == 8
+    runner.accumulate_full_payload_output("a", {"hidden": torch.tensor([[8]])}, request, token_range=(8, 9))
+    payload, _ = runner._materialize_full_payload_entry(runner._pending_full_payload_send["a"])
+    assert payload["hidden"].flatten().tolist() == list(range(9))
+    assert runner.resume_full_payload_output("empty", 0) == 0

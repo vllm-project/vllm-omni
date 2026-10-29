@@ -106,6 +106,8 @@ class _CacheStub:
     def __init__(self):
         self.save_calls = []
         self.materialize_calls = []
+        self.discard_calls = []
+        self.step_calls = []
         self.outs = StageCacheOutputs(hidden_states=None, mm_outputs={})
 
     def save_outputs(self, hidden, mm, *, num_tokens_unpadded, num_tokens_padded, write_layout):
@@ -115,6 +117,12 @@ class _CacheStub:
     def materialize(self, step_id, req_ids):
         self.materialize_calls.append((step_id, req_ids))
         return self.outs
+
+    def discard_step(self, step_id):
+        self.discard_calls.append(step_id)
+
+    def new_step_starts(self, step):
+        self.step_calls.append(step)
 
 
 def test_step_begin_builds_once_and_registers_snapshot_policy(monkeypatch):
@@ -188,7 +196,7 @@ def test_save_step_gates_and_passthrough(monkeypatch):
     assert save() is None  # cache off
     r.omni_prefix_cache = stub
     r._prefix_cache_adapter = SimpleNamespace(
-        build_write_layout=lambda view, *, num_scheduled_tokens: PrefixCacheWriteLayout((), 0)
+        build_write_layout=lambda view, *, num_scheduled_tokens, token_ranges: PrefixCacheWriteLayout((), 0)
     )
     r._prefix_cache_group_view = SimpleNamespace()
     r._prefix_cache_step = PrefixCacheStep((), ())
@@ -206,11 +214,13 @@ def test_materialize_requires_explicit_step_and_snapshot_req_ids():
     r = _Runner()
     stub = _CacheStub()
     r.omni_prefix_cache = stub
-    assert r._prefix_cache_materialize(None, ["a"]) == (None, None)
+    assert r._prefix_cache_materialize(None, ["a"]) is None
     assert stub.materialize_calls == []  # step_id None: nothing to consume
     hidden = {"a": torch.zeros(1, 2)}
     stub.outs = StageCacheOutputs(hidden_states=hidden, mm_outputs={})
-    assert r._prefix_cache_materialize(7, ["a"]) == (hidden, None)  # empty mm -> None
+    result = r._prefix_cache_materialize(7, ["a"])
+    assert result is stub.outs
+    assert result.mm_outputs == {}
     assert stub.materialize_calls == [(7, ["a"])]
 
 
@@ -225,6 +235,7 @@ def test_step_begin_and_save_keep_the_translated_snapshot(monkeypatch):
     runner._prefix_cache_adapter = PrefixCacheSchedulerAdapter()
     runner._prefix_cache_group_view = SimpleNamespace(
         batch_req_ids=lambda: ["r"],
+        token_range=lambda req_id, count: (0, count),
         step_slots_cpu=lambda req_ids, counts: torch.arange(counts["r"], dtype=torch.long),
     )
     arrival = SimpleNamespace(
@@ -406,7 +417,8 @@ class _DecodeRunner(PrefixCacheRunnerMixin):
         hidden = self.output_buffer[:n]
         torch.stack([_decode_row(r, p) for r, (_, s, n) in reqs.items() for p in range(s, s + n)], out=hidden)
         step_id = self._prefix_cache_save_step(hidden, mm, num_tokens_unpadded=n, num_tokens_padded=n)
-        out = self._prefix_cache_materialize(step_id, list(reqs)) if step_id is not None else (None, None)
+        outputs = self._prefix_cache_materialize(step_id, list(reqs))
+        out = (outputs.hidden_states, outputs.mm_outputs) if outputs is not None else (None, None)
         return step_id, out
 
 
@@ -448,6 +460,19 @@ def test_decode_batching_limits_and_prefix_hits(decode_runners, config, expected
     assert torch.equal(hidden["b"], _expect_decode_hit("a", range(8), ("b", 8)))
     step_id, _ = r.step({"b": ([0, 1, 5], 9, 1), "z": (Z_BLOCKS, 8, 1)})
     assert step_id is None
+
+
+def test_decode_flush_preserves_absolute_ranges(decode_runners):
+    r = decode_runners()
+    r.step({"a": (A_BLOCKS, 0, 4), "z": (Z_BLOCKS, 0, 8)}, new=["a", "z"])
+    for offset in range(4):
+        r.step({"a": (A_BLOCKS, 4 + offset, 1), "z": (Z_BLOCKS, 8 + offset, 1)})
+    assert r.save_sizes == [12, 8]
+    writes = r.save.call_args.kwargs["write_layout"].writes
+    assert [(w.req_id, w.row_start, w.row_end, w.token_start, w.token_end) for w in writes] == [
+        ("a", 0, 4, 4, 8),
+        ("z", 4, 8, 8, 12),
+    ]
 
 
 def test_decode_buffer_charges_its_batch_to_the_gpu_budget(decode_runners):

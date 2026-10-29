@@ -372,7 +372,7 @@ class _OmniConnectorRuntimeMixin:
             except Exception:
                 pass
 
-    def cleanup_finished_request(self, req_id: str) -> None:
+    def cleanup_finished_request(self, req_id: str, *, discard_payload: bool = False) -> None:
         """Clean up per-request state after a request is fully finished.
 
         Call this when a request is freed from the model runner to prevent
@@ -387,15 +387,9 @@ class _OmniConnectorRuntimeMixin:
         saves is added to ``_deferred_send_cleanup`` so the bg save's
         decrement path drains it without leaving orphans.
         """
-        # Force-flush any pending full-payload accumulator entry before
-        # cleanup proceeds.  Without this, finished requests with no
-        # downstream consumer (e.g. text-only on multi-modal arch) leave
-        # the entry orphaned in _pending_full_payload_send across requests,
-        # which empirically destabilises subsequent thinker forwards by
-        # making prefix-cache reuse observe stale accumulator state.  The
-        # flush is idempotent when the entry has already been flushed by the
-        # scheduler-driven path, but this cleanup path runs for every request,
-        # so skip it entirely when the request never accumulated a payload.
+        # Failed requests must never publish partial payloads as completed output.
+        if discard_payload:
+            self._pending_full_payload_send.pop(req_id, None)
         if req_id in self._pending_full_payload_send:
             try:
                 self.flush_full_payload_outputs({req_id})

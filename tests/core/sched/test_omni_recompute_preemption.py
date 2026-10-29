@@ -11,7 +11,7 @@ from unittest.mock import Mock
 
 import pytest
 import torch
-from vllm.config import CacheConfig, SchedulerConfig, VllmConfig
+from vllm.config import CacheConfig, DeviceConfig, SchedulerConfig, VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorBase_V1
 from vllm.sampling_params import SamplingParams
 from vllm.v1.core.single_type_kv_cache_manager import register_all_kvcache_specs
@@ -27,7 +27,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def _scheduler(mode="fail", requires_kv_delivery=False, auxiliary=False, block_size=16, num_blocks=2):
-    config = VllmConfig()
+    config = VllmConfig(device_config=DeviceConfig(device="cpu"))
     # Avoid downloading model weights/config; all scheduler/cache objects are real.
     config.model_config = SimpleNamespace(
         multimodal_config=None,

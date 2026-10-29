@@ -20,6 +20,7 @@ Two layers of protection, both pure CPU:
 """
 
 import ast
+import copy
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -27,8 +28,10 @@ import pytest
 import torch
 
 from vllm_omni.core.prefix_cache.adapter import PrefixCacheSchedulerAdapter
-from vllm_omni.core.prefix_cache.interface import PrefixCacheConfig
+from vllm_omni.core.prefix_cache.interface import PrefixCacheConfig, StageCacheOutputs
 from vllm_omni.core.prefix_cache.manager import OmniPrefixCacheManager
+from vllm_omni.data_entry_keys import flatten_payload
+from vllm_omni.utils.mm_outputs import slice_token_payload
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -80,6 +83,98 @@ def test_execute_model_state_keeps_prefix_cache_sid_last():
     assert gpu_fields[-1] == "prefix_cache_step_id"
 
 
+def _run_npu_pooler_loop(scope):
+    tree = ast.parse(_NPU_RUNNER.read_text())
+    sample = next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == "sample_tokens")
+    loop = next(
+        node
+        for node in ast.walk(sample)
+        if isinstance(node, ast.For)
+        and isinstance(node.target, ast.Name)
+        and node.target.id == "rid"
+        and any(isinstance(stmt, ast.Name) and stmt.id == "payload" for stmt in ast.walk(node))
+    )
+    resolver = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "_resolve_req_hidden_states"
+    )
+    resolver = copy.deepcopy(resolver)
+    resolver.decorator_list = []
+    namespace = {"torch": torch}
+    resolver_code = compile(
+        ast.fix_missing_locations(ast.Module(body=[resolver], type_ignores=[])), str(_NPU_RUNNER), "exec"
+    )
+    exec(resolver_code, namespace)
+    scope.update(
+        self=SimpleNamespace(
+            _resolve_req_hidden_states=namespace["_resolve_req_hidden_states"],
+            _is_full_payload_token_key=lambda key: key == "hidden",
+            _resolve_full_payload_replace_keys=frozenset,
+        ),
+        flatten_payload=flatten_payload,
+        slice_token_payload=slice_token_payload,
+        pooler_output=[],
+        audio_sparse_output=False,
+        combined_multimodal_outputs=None,
+        mm_cpu=None,
+    )
+    code = compile(
+        ast.fix_missing_locations(ast.Module(body=[copy.deepcopy(loop)], type_ignores=[])), str(_NPU_RUNNER), "exec"
+    )
+    exec(code, scope)
+    return scope["pooler_output"]
+
+
+def test_npu_output_builder_uses_delivery_snapshot_without_advancing_it():
+    raw = StageCacheOutputs(
+        hidden_states={"r1": torch.arange(4, 10).reshape(-1, 1)},
+        mm_outputs={},
+        token_ranges={"r1": (4, 10)},
+    )
+    scheduler_output = SimpleNamespace(delivered_upto={"r1": 8})
+    scope = {
+        "cache_outputs": raw,
+        "scheduler_output": scheduler_output,
+        "scheduled_token_ranges": {"r1": (6, 10)},
+        "req_ids_output_copy": ["r1"],
+        "req_id_to_index_output_copy": {"r1": 0},
+        "downstream_req_id_set": {"r1"},
+        "query_start_loc_cpu": [0],
+        "num_scheduled_tokens_np": [4],
+        "req_hidden_states_cpu": None,
+        "combined_hidden_states": raw.hidden_states,
+        "hidden_states_cpu": None,
+    }
+    payloads = _run_npu_pooler_loop(scope)
+    assert payloads[0]["hidden"].flatten().tolist() == [8, 9]
+    assert scheduler_output.delivered_upto == {"r1": 8}
+    assert raw.hidden_states["r1"].flatten().tolist() == list(range(4, 10))
+
+
+def test_npu_partial_downstream_hidden_uses_only_unseen_scheduled_rows():
+    scope = {
+        "req_hidden_states_cpu": {"r1": torch.tensor([[40.0], [50.0]])},
+        "scheduler_output": SimpleNamespace(delivered_upto={"r1": 5}),
+        "scheduled_token_ranges": {"r1": (4, 6)},
+        "cache_outputs": None,
+        "req_ids_output_copy": ["r0", "r1"],
+        "req_id_to_index_output_copy": {"r0": 0, "r1": 1},
+        "downstream_req_id_set": {"r1"},
+        "query_start_loc_cpu": [0, 1],
+        "num_scheduled_tokens_np": [1, 2],
+        "combined_hidden_states": None,
+    }
+    payloads = _run_npu_pooler_loop(scope)
+    assert payloads[0] == {}
+    assert payloads[1]["hidden"].flatten().tolist() == [50.0]
+    assert scope["req_hidden_states_cpu"]["r1"].flatten().tolist() == [40.0, 50.0]
+
+    scope["scheduler_output"].delivered_upto = {}
+    payloads = _run_npu_pooler_loop(scope)
+    assert payloads[1]["hidden"].flatten().tolist() == [40.0, 50.0]
+
+
 class _FakeView:
     """Minimal group-view double (mirrors tests/core/test_prefix_cache)."""
 
@@ -99,6 +194,10 @@ class _FakeView:
 
     def batch_req_ids(self) -> list[str]:
         return list(self.order)
+
+    def token_range(self, req_id, count):
+        start = self.computed.get(req_id, 0)
+        return start, start + count
 
     def step_slots_cpu(self, req_ids, num_scheduled) -> torch.Tensor:
         parts = []

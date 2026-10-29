@@ -1000,6 +1000,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 # this output must not be appended or emitted.
                 continue
 
+            token_range = getattr(scheduler_output, "scheduled_token_ranges", {}).get(req_id)
+            num_delivery_tokens = num_tokens_scheduled
             status_before_stop = request.status
             sampling_validation_failed = False
             if req_id in getattr(model_runner_output, "invalid_logits_req_ids", ()):
@@ -1022,6 +1024,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             ):
                 new_token_ids, stopped = self._update_request_with_output(request, generated_token_ids)
                 if not stopped:
+                    if token_range is not None:
+                        request.delivered_upto = max(getattr(request, "delivered_upto", 0), token_range[1])
                     prefill_stats = request.take_prefill_stats()
                     if prefill_stats is not None:
                         prefill_stats.finalize(self.kv_cache_manager.estimate_cached_tokens(request))
@@ -1070,6 +1074,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 num_draft_tokens = len(scheduled_spec_token_ids)
                 num_accepted = len(generated_token_ids) - 1
                 num_rejected = num_draft_tokens - num_accepted
+                num_delivery_tokens -= num_rejected
                 # num_computed_tokens represents the number of tokens
                 # processed in the current step, considering scheduled
                 # tokens and rejections. If some tokens are rejected,
@@ -1136,6 +1141,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     _prompt_len,
                     _rollback,
                 )
+                num_delivery_tokens -= _rollback
                 if request.num_computed_tokens >= _rollback:
                     request.num_computed_tokens -= _rollback
                 if request.num_output_placeholders >= _rollback:
@@ -1212,6 +1218,15 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
             if OmniSchedulerMixin._reject_invalid_grammar_tokens(self, request, new_token_ids):
                 stopped = True
+
+            if (
+                token_range is not None
+                and not sampling_validation_failed
+                and request.status != RequestStatus.FINISHED_ERROR
+            ):
+                request.delivered_upto = max(
+                    getattr(request, "delivered_upto", 0), token_range[0] + num_delivery_tokens
+                )
 
             # Finalize prefill stats BEFORE stop handling (upstream v0.28
             # order): _free_request below releases the KV blocks, after which
@@ -1390,6 +1405,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     or finished
                 )
             ):
+                if output_is_stale:
+                    # Preemption reset the live counter; use this frame's scheduled end.
+                    confirmed_num_computed_tokens = scheduler_output.scheduled_token_ranges[req_id][1]
                 save_kwargs = {
                     "new_token_ids": new_token_ids,
                     "confirmed_num_computed_tokens": confirmed_num_computed_tokens,
@@ -2103,6 +2121,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         self.encoder_cache_manager.free(request)
         request_id = request.request_id
         self.finished_req_ids.add(request_id)
+        self._record_full_payload_discard(request)
         self._new_prompt_len_snapshot.pop(request_id, None)
         if self.finished_req_ids_dict is not None:
             self.finished_req_ids_dict[request.client_index].add(request_id)

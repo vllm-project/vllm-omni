@@ -835,6 +835,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         if getattr(self, "_first_chunk_express", False):
             self._chunk_started.discard(request.request_id)
             getattr(self, "_stream_audio", {}).pop(request.request_id, None)
+        self._record_full_payload_discard(request)
         if self.input_coordinator is None:
             return super()._free_request(request, delay_free_blocks)
 
