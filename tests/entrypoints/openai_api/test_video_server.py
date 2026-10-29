@@ -1121,6 +1121,24 @@ def test_magi2_serving_applies_native_defaults_and_rejects_explicit_frame_mismat
         )
 
 
+@pytest.mark.parametrize("num_frames", [None, 9, 193])
+def test_sana_video2_serving_preserves_variable_frame_count(num_frames):
+    engine = FakeAsyncOmni()
+    engine.model_class_name = "SanaVideo2Pipeline"
+    handler = OmniOpenAIServingVideo.for_diffusion(
+        diffusion_engine=engine,
+        model_name="Efficient-Large-Model/SANA-Video_2.0_5B_720p",
+    )
+    request = VideoGenerationRequest(prompt="A red boat", num_frames=num_frames)
+    asyncio.run(handler._run_and_extract(request, "sana2-frames"))
+    assert engine.captured_sampling_params_list is not None
+    sampling = engine.captured_sampling_params_list[0]
+    assert sampling.num_frames == (193 if num_frames is None else num_frames)
+    assert (sampling.height, sampling.width) == (736, 1280)
+    assert sampling.fps == sampling.frame_rate == 24
+    assert sampling.num_inference_steps == 50
+
+
 def test_kandinsky6_serving_applies_defaults_but_allows_explicit_frame_count():
     """Kandinsky 6 publishes Pro-geometry defaults (480x864, 125 frames, 50
     steps) but is not a fixed-duration model: an explicit ``num_frames``
@@ -1148,6 +1166,7 @@ def test_kandinsky6_serving_applies_defaults_but_allows_explicit_frame_count():
             "explicit",
         )
     )
+    assert engine.captured_sampling_params_list is not None
     sampling = engine.captured_sampling_params_list[-1]
     assert (sampling.width, sampling.height) == (512, 320)
     assert sampling.num_frames == 25

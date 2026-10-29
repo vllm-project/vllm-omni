@@ -71,9 +71,34 @@ def _looks_like_magi2(model_name: str) -> bool:
     )
 
 
+def _looks_like_sana_video2(model_name: str) -> bool:
+    """Recognize the official 5B release without importing model code."""
+    normalized = str(model_name).strip().rstrip("/")
+    if normalized.lower() == "efficient-large-model/sana-video_2.0_5b_720p":
+        return True
+    config_path = os.path.join(normalized, "config.yaml")
+    checkpoint_path = os.path.join(normalized, "checkpoints", "SANA_Video_2.0_5B_720p.pth")
+    if not (os.path.isfile(config_path) and os.path.isfile(checkpoint_path)):
+        return False
+    import yaml
+
+    try:
+        with open(config_path) as source:
+            config = yaml.safe_load(source)
+        return (
+            isinstance(config, Mapping)
+            and isinstance(config.get("model"), Mapping)
+            and (config["model"].get("model") == "SanaVideo2_5B")
+        )
+    except (OSError, yaml.YAMLError):
+        return False
+
+
 def resolve_native_diffusion_model_class(model_name: str) -> str | None:
     """Resolve native checkpoints that have no root HF or Diffusers config."""
 
+    if _looks_like_sana_video2(model_name):
+        return "SanaVideo2Pipeline"
     return "Magi2Pipeline" if _looks_like_magi2(model_name) else None
 
 
