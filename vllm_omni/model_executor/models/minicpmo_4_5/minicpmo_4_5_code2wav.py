@@ -1750,7 +1750,9 @@ class MiniCPMO45Code2Wav(nn.Module):
             cfm_float16=read_bool_flag(extra, "cfm_float16", False),
             watchdog=self._watchdog,
         )
-        # Captured by the first forward (the warmup run): under vLLM's weight load a graph held GiBs.
+        # Deferred until the worker warmup hook (capture_auxiliary_graphs) or, on
+        # runners without that hook, the first chunk that needs a graph. Capturing
+        # under vLLM's weight load held GiBs, so the sweep must not run here.
         self._precapture_pending = read_bool_flag(extra, "cfm_graph_precapture", True)
 
     def capture_auxiliary_graphs(self) -> None:

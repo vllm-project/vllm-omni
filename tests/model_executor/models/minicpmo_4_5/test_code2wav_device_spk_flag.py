@@ -549,7 +549,11 @@ def test_precapture_cache_release_uses_the_npu_allocator(tmp_path, monkeypatch):
 
     class _FakeNpu:
         @staticmethod
-        def synchronize(device) -> None:
+        def current_device() -> int:
+            return 0
+
+        @staticmethod
+        def synchronize(device=None) -> None:
             calls.append("synchronize")
 
         @staticmethod
@@ -573,3 +577,31 @@ def test_precapture_cache_release_uses_the_npu_allocator(tmp_path, monkeypatch):
     model._release_precapture_cache()
 
     assert calls == ["synchronize", "empty_cache"]
+
+
+def test_npu_worker_warmup_hook_reaches_the_model(monkeypatch):
+    """The NPU worker must forward its warmup hook to the model's capture hook.
+
+    ``_capture_auxiliary_graphs`` resolves ``capture_auxiliary_graphs`` through
+    ``getattr(self.model_runner.model, ...)``, which depends on any graph wrapper
+    forwarding attribute access. If a future wrapper stops forwarding, the hook
+    would silently become a no-op and the sweep would fall back to the first
+    request again — the exact failure this PR removes. Pin the forwarding.
+    """
+
+    class _FakeModel:
+        calls = 0
+
+        def capture_auxiliary_graphs(self) -> None:
+            _FakeModel.calls += 1
+
+    worker_module = pytest.importorskip("vllm_omni.platforms.npu.worker.base")
+    worker = object.__new__(worker_module.OmniNPUWorkerBase)
+
+    worker.model_runner = SimpleNamespace(model=_FakeModel())
+    worker._capture_auxiliary_graphs()
+    assert _FakeModel.calls == 1
+
+    # Models without the hook stay a no-op instead of failing startup.
+    worker.model_runner = SimpleNamespace(model=SimpleNamespace())
+    worker._capture_auxiliary_graphs()
