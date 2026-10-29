@@ -636,6 +636,16 @@ def test_an_utterance_at_the_context_limit_has_noise_for_its_last_frame(
     assert torch.equal(mel, whole[:, :, 2 * LEFT_CONTEXT :])
 
 
+def test_a_chunk_past_the_context_has_no_noise_and_is_an_error(
+    decoder: S3GenDecoder, references: list[Reference]
+) -> None:
+    """One token later than the last chunk of the longest utterance, the noise slice would come back short."""
+    first = CONTEXT - 48 - LEFT_CONTEXT
+    tokens = torch.randint(0, 6561, (48 + LEFT_CONTEXT,))
+    with pytest.raises(RuntimeError, match=f"utterance position {first + 1}, past the"):
+        decoder.chunk_mels([Chunk(tokens, LEFT_CONTEXT, references[0], None, True, start=first + 1)])
+
+
 @pytest.mark.parametrize("length", [1, 2, 3])
 def test_an_utterance_of_a_few_tokens_decodes_as_one_final_chunk(
     decoder: S3GenDecoder, references: list[Reference], length: int

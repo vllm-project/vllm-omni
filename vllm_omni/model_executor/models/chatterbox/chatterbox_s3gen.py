@@ -17,10 +17,10 @@ mask built from its own cropped length.
 Seams follow CosyVoice 2's ``token2wav``. A chunk is decoded from the last
 ``codec_left_context_frames`` played tokens (the deploy file's connector
 setting; the chunk processor sends only those) plus its own tokens, the
-frames before the offset are dropped, the
-previous chunk's last eight mel frames are vocoded again, and the overlap is
-cross-faded with a Hamming window. Bounding the context keeps a chunk's cost
-constant instead of growing with the sentence.
+frames before the offset are dropped, the previous chunk's last eight mel
+frames are vocoded again, and the overlap is cross-faded with a Hamming
+window. Bounding the context keeps a chunk's cost constant instead of
+growing with the sentence.
 
 The flow attends over its whole input, so a frame's mel depends on the
 tokens decoded with it and on the noise the flow starts from. Upstream draws
@@ -392,6 +392,13 @@ class S3GenDecoder(nn.Module):
             prompt_frames = chunk.reference.prompt_token.shape[1] * ratio
             start = self.prompt_noise_frames + chunk.start * ratio
             end = start + row.numel() * ratio
+            # Sliced past its end the buffer comes back short, and the row
+            # would be padded with zeros instead of its own noise.
+            if end > self.flow_noise.shape[2]:
+                raise RuntimeError(
+                    f"chatterbox_s3gen got a chunk of {row.numel()} tokens at utterance position {chunk.start}, "
+                    f"past the {self.flow_noise.shape[2] - self.prompt_noise_frames} noise frames of its context"
+                )
             rows.append(row)
             offsets.append(chunk.token_offset)
             # (F_i, 80), the layout pad_sequence pads.

@@ -25,8 +25,12 @@ from vllm_omni.transformers_utils.configs.chatterbox import CFG_UNCOND_SUFFIX, C
 SPEECH_TOKEN_LIMIT = ChatterboxConfig().speech_token_limit
 # Tokens the flow reads ahead of a chunk that is not the last. Stage 1 does
 # not play their frames, so a chunk must be sent with exactly this many
-# tokens beyond its own: the decoder's number, not a setting.
+# tokens beyond its own: the decoder's number, not a setting. Because every
+# chunk but the last leaves them unsent, a finished stream always has tokens
+# past its cursor, and its last chunk finalizes it in stage 1.
 PRE_LOOKAHEAD = ChatterboxConfig().pre_lookahead_len
+if PRE_LOOKAHEAD < 1:
+    raise ValueError(f"Chatterbox chunking needs a flow lookahead of at least one token, got {PRE_LOOKAHEAD}")
 
 
 def prepare_original_prompt(prompt: dict, sampling_params_list: list[SamplingParams]) -> dict:
@@ -120,9 +124,7 @@ def t3_to_s3gen_async_chunk(
         KeyError: If the deploy file's connector lacks one of the settings.
         RuntimeError: If the request has sampled more tokens than were taken
             and the snapshot no longer has them: the audio would be missing
-            them with no other symptom. Also if a finished request with
-            played tokens has none past them: its stream would never be
-            finalized.
+            them with no other symptom.
     """
     request_id = request.external_req_id
     if request_id.endswith(CFG_UNCOND_SUFFIX):
@@ -176,16 +178,10 @@ def t3_to_s3gen_async_chunk(
     sent, hop = state["sent"], state["hop"]
     if is_finished:
         state["terminal_sent"] = True
-        end = len(tokens)
         # Every chunk leaves its lookahead unsent, so only an utterance with
         # no speech tokens ends with nothing past the cursor; its empty codes
-        # clear stage 1's placeholder prompt. A stream already playing must
-        # end with tokens, or stage 1 never finalizes it.
-        if sent and end <= sent:
-            raise RuntimeError(
-                f"Chatterbox request {request_id} finished with nothing past its {sent} played tokens: "
-                f"its chunks left no lookahead (PRE_LOOKAHEAD={PRE_LOOKAHEAD}) to end the stream with"
-            )
+        # clear stage 1's placeholder prompt.
+        end = len(tokens)
     else:
         end = sent + hop + PRE_LOOKAHEAD
         if len(tokens) < end:

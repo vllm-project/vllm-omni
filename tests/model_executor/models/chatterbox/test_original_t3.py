@@ -162,11 +162,12 @@ def test_only_a_guided_original_prompt_is_expanded_with_an_unconditional_compani
         pair_key, role, cfg_weight = params.extra_args["chatterbox_cfg"]
         assert (pair_key, role, cfg_weight) == ("external-request", "cond", weight)
         assert companion_params.extra_args["chatterbox_cfg"] == (pair_key, "uncond", weight)
-        # The companion differs from the conditional request in extra_args alone.
+        # The companion differs from the conditional request in extra_args alone. Private
+        # fields are vLLM's derived caches, which a clone may rebuild differently.
         differing = [
             field
             for field in SamplingParams.__struct_fields__
-            if getattr(companion_params, field) != getattr(params, field)
+            if not field.startswith("_") and getattr(companion_params, field) != getattr(params, field)
         ]
         assert differing == ["extra_args"]
         assert expanded[0].request_id_suffix == "__cfg_uncond"
