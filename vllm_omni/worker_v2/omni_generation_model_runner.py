@@ -284,11 +284,23 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
                 self.req_states.apply_staged_writes()
                 self.model_state.apply_staged_writes()
 
-    def _release_generation_slots(self, input_batch: Any) -> None:
+    def _release_generation_slots(self, input_batch: Any, keep: set[str] | frozenset[str] = frozenset()) -> None:
         if not getattr(self.model_config, "async_chunk", False):
             return
         for req_id in input_batch.req_ids:
-            self._remove_request(req_id)
+            if req_id not in keep:
+                self._remove_request(req_id)
+
+    def _pending_generation_req_ids(self, req_ids: list[str]) -> set[str]:
+        """Requests whose model-owned generation continues past this step.
+
+        As in the V1 generation runner, the scheduler re-runs their current
+        input unit instead of finishing it.
+        """
+        get_pending = getattr(getattr(self, "model", None), "get_pending_generation_request_ids", None)
+        if get_pending is None:
+            return set()
+        return set(req_ids).intersection(get_pending())
 
     # ------------------------------------------------------------------
     # profile / warmup — skip sampler since there are no logits
@@ -500,22 +512,26 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
         if self.aux_output_connector is not None:
             pending_aux_output = self.aux_output_connector.prepare_output(input_batch)
 
+        # Async finalization can run after the input batch is reused for the
+        # next scheduler step, so output metadata must not alias the batch.
+        req_ids = list(input_batch.req_ids)
+        pending = self._pending_generation_req_ids(req_ids)
+
         # Mark all scheduled tokens as computed so the scheduler does
         # not re-schedule them.  Unlike AR stages we do NOT call
         # self.postprocess() — that kernel advances num_computed_tokens
         # by 1 and emits sampled tokens, which would cause check_stop
         # to fire.  Instead, set num_computed_tokens = prompt_len
-        # directly, matching V1's behavior.
+        # directly, matching V1's behavior.  Pending generations keep
+        # their count: the scheduler rolls it back to re-run the unit.
         for i in range(num_reqs):
+            if req_ids[i] in pending:
+                continue
             req_idx = int(input_batch.idx_mapping_np[i])
             prompt_len = int(self.req_states.prompt_len.np[req_idx])
             self.req_states.num_computed_tokens.stage_write_elem(req_idx, prompt_len)
         self.req_states.num_computed_tokens.apply_write()
         kv_connector_output = self.kv_connector.post_forward(execute_model_state.finished_req_ids)
-
-        # Async finalization can run after the input batch is reused for the
-        # next scheduler step, so output metadata must not alias the batch.
-        req_ids = list(input_batch.req_ids)
 
         # Generation models don't do token sampling.  Return one empty
         # list per request so the scheduler does NOT trigger check_stop
@@ -537,6 +553,7 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
             ec_connector_output=execute_model_state.ec_connector_output,
             sampled_token_ids_materialized=True,
         )
+        output.pending_generation_req_ids = pending
 
         raw_multimodal_outputs = model_output.multimodal_outputs
         can_copy_async = getattr(getattr(self, "device", None), "type", "cpu") == "cuda" and (
@@ -555,7 +572,7 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
             )
             self._reserve_native_data_plane_outputs(list(req_ids))
             if not self._retains_state_across_chunks:
-                self._release_generation_slots(input_batch)
+                self._release_generation_slots(input_batch, keep=pending)
             return async_output
 
         # CPU execution keeps the synchronous materialization path. Final
@@ -567,7 +584,7 @@ class OmniGenerationModelRunner(OmniGPUModelRunner):
             _ensure_tensor_values(payload) if payload else {} for payload in multimodal_outputs
         ]
         if not self._retains_state_across_chunks:
-            self._release_generation_slots(input_batch)
+            self._release_generation_slots(input_batch, keep=pending)
         return self._finalize_native_data_plane_output(output)
 
     # ------------------------------------------------------------------

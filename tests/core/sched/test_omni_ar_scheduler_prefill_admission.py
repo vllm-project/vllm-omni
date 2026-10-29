@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Prefill admission batching of OmniARScheduler (stage connector extra knobs)."""
+"""Prefill admission batching of OmniARScheduler (stage connector extra or additional_config knobs)."""
 
 import time
 from types import SimpleNamespace
@@ -50,3 +50,24 @@ def test_a_batch_size_needs_a_wait_bound():
     scheduler = SimpleNamespace(vllm_config=config)
     with pytest.raises(ValueError, match="max_wait_ms"):
         OmniARScheduler._init_prefill_admission_policy(scheduler)
+
+
+def test_a_stage_without_connector_knobs_reads_additional_config():
+    knobs = {
+        "ar_prefill_admission_min_batch": 8,
+        "ar_prefill_admission_max_wait_ms": 100,
+        "ar_prefill_admission_min_running": 4,
+    }
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(stage_connector_config={"extra": {"stage_id": 0}}),
+        additional_config=knobs,
+    )
+    scheduler = SimpleNamespace(vllm_config=config)
+    OmniARScheduler._init_prefill_admission_policy(scheduler)
+    assert scheduler._prefill_admission_min_batch == 8
+    assert scheduler._prefill_admission_max_wait_s == pytest.approx(0.1)
+    assert scheduler._prefill_admission_min_running == 4
+
+    config.model_config.stage_connector_config["extra"]["ar_prefill_admission_min_batch"] = 6
+    OmniARScheduler._init_prefill_admission_policy(scheduler)
+    assert scheduler._prefill_admission_min_batch == 6

@@ -272,7 +272,7 @@ async def _run_server_vad_audio_roundtrips(
     host: str,
     port: int,
     model: str,
-    pcm16: bytes,
+    pcm16_24k: bytes,
     *,
     chunk_ms: int = 100,
     turns: int = 2,
@@ -280,7 +280,7 @@ async def _run_server_vad_audio_roundtrips(
     silence_ms: int = 1500,
     duplex: bool = False,
 ) -> list[list[dict]]:
-    chunk_bytes = max(16_000 * 2 // 1000 * chunk_ms, 2)
+    chunk_bytes = max(24_000 * 2 // 1000 * chunk_ms, 2)
     turn_events: list[list[dict]] = []
 
     query = "?duplex=1" if duplex else ""
@@ -295,7 +295,7 @@ async def _run_server_vad_audio_roundtrips(
                             "model": model,
                             "audio": {
                                 "input": {
-                                    "format": {"type": "audio/pcm", "rate": 16_000},
+                                    "format": {"type": "audio/pcm", "rate": 24_000},
                                     "turn_detection": turn_detection or {"type": "server_vad"},
                                 }
                             },
@@ -304,9 +304,9 @@ async def _run_server_vad_audio_roundtrips(
                 )
             )
 
-            silence = bytes(16_000 * 2 * silence_ms // 1000)
+            silence = bytes(24_000 * 2 * silence_ms // 1000)
             for _ in range(turns):
-                await _append_pcm16_chunks(ws, pcm16, chunk_bytes)
+                await _append_pcm16_chunks(ws, pcm16_24k, chunk_bytes)
                 await _append_pcm16_chunks(ws, silence, chunk_bytes)
                 turn_events.append(await _receive_server_vad_turn(ws))
         finally:
@@ -326,7 +326,7 @@ async def _run_server_vad_audio_roundtrips(
 
 
 def _assert_auto_committed_turns(turns: list[list[dict]]) -> None:
-    """Each turn: one speech start/stop, one commit and one completed audio response, in order."""
+    """Each turn: one speech start/stop, one commit and one terminal audio response, in order."""
     required_sequence = [
         "input_audio_buffer.speech_started",
         "input_audio_buffer.speech_stopped",
@@ -372,7 +372,11 @@ def _assert_auto_committed_turns(turns: list[list[dict]]) -> None:
         )
         assert output_pcm
         assert created["id"] == done["id"]
-        assert done["status"] == "completed"
+        # CI caps stage-0 text generation at 150 tokens, so a valid VAD turn can
+        # finish with an incomplete response and reason=max_output_tokens.
+        assert done["status"] in {"completed", "incomplete"}, done
+        if done["status"] == "incomplete":
+            assert done["status_details"]["reason"] == "max_output_tokens", done
         input_item_ids.append(input_item_id)
         response_ids.append(created["id"])
 
@@ -397,8 +401,20 @@ async def _run_client_vad_replay(
     replay_path: Path,
     *,
     wait_s: float = 10.0,
+    answer_timeout_s: float = 60.0,
 ) -> list[str]:
-    """Replay a captured LiveKit client-VAD session at its original speed."""
+    """Replay a captured LiveKit client-VAD session at its original speed.
+
+    The capture ends with the recorder's own teardown: two ``response.cancel``
+    events sent 5.93 s after its last ``response.create``. Replayed at their
+    captured offsets they are not part of the conversation but a wall-clock
+    deadline for the last turn -- a reply that is merely slower than the
+    recording is cancelled before its first transcript delta and comes back as
+    an empty answer (issue #9069). They are held back and replayed once the
+    answers are collected, so the checks below compare model output rather than
+    the recording's teardown. The cancels that precede a ``response.create`` are
+    part of the interaction and still go out on time.
+    """
     with replay_path.open() as replay_file:
         records = [json.loads(line) for line in replay_file]
     assert records
@@ -406,7 +422,30 @@ async def _run_client_vad_replay(
     answers_by_response_id: dict[str, str] = {}
     response_order: list[str] = []
     completed_answers: dict[str, str] = {}
+    pending_responses: dict[str, asyncio.Future] = {}
     errors: list[dict] = []
+
+    last_create = max(
+        (index for index, record in enumerate(records) if record["data"].get("type") == "response.create"),
+        default=-1,
+    )
+    trailing_cancels = [
+        record["data"]
+        for index, record in enumerate(records)
+        if index > last_create and record["data"].get("type") == "response.cancel"
+    ]
+
+    async def _await_last_turn() -> None:
+        """Wait for the last started response to finish, without cancelling it."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + answer_timeout_s
+        while not response_order and loop.time() < deadline:
+            await asyncio.sleep(0.01)
+        if not response_order:
+            return
+        pending = pending_responses[response_order[-1]]
+        with suppress(TimeoutError):
+            await asyncio.wait_for(asyncio.shield(pending), timeout=max(deadline - loop.time(), 0.0))
 
     async with websockets.connect(
         f"ws://{host}:{port}/v1/realtime?model={model}",
@@ -425,6 +464,7 @@ async def _run_client_vad_replay(
                     response_id = event["response"]["id"]
                     response_order.append(response_id)
                     answers_by_response_id[response_id] = ""
+                    pending_responses[response_id] = asyncio.get_running_loop().create_future()
                 elif event_type in {
                     "response.audio_transcript.delta",
                     "response.output_audio_transcript.delta",
@@ -439,13 +479,16 @@ async def _run_client_vad_replay(
                     response_id = response["id"]
                     text = answers_by_response_id.get(response_id, "")
                     completed_answers[response_id] = text or _output_text(response)
+                    future = pending_responses.get(response_id)
+                    if future is not None and not future.done():
+                        future.set_result(None)
 
         receiver = asyncio.create_task(receive_responses())
         capture_start = records[0]["ts"]
         replay_start = asyncio.get_running_loop().time()
 
         try:
-            for record in records:
+            for index, record in enumerate(records):
                 target = replay_start + (record["ts"] - capture_start)
                 delay = target - asyncio.get_running_loop().time()
                 if delay > 0:
@@ -456,8 +499,14 @@ async def _run_client_vad_replay(
                 # replay client uploads its optional reference-audio asset.
                 if "__VOICE__" in json.dumps(message):
                     continue
+                if index > last_create and message.get("type") == "response.cancel":
+                    continue
                 await ws.send(json.dumps(message))
 
+            await _await_last_turn()
+            # Replay the recorded teardown now that every answer is in.
+            for message in trailing_cancels:
+                await ws.send(json.dumps(message))
             await asyncio.sleep(wait_s)
         finally:
             receiver.cancel()
@@ -506,11 +555,6 @@ def _synthetic_pcm16_input(
     )
     wav_bytes = base64.b64decode(syn["base64"])
     return _pcm16_mono_from_wav_bytes(wav_bytes, sample_rate_hz=24000)
-
-
-def _server_vad_pcm16_input() -> bytes:
-    """Load the fixed single-turn speech fixture used by the Server VAD E2E."""
-    return _pcm16_mono_from_wav_bytes(validated_input_wav().read_bytes())
 
 
 def _assert_realtime_smoke(result: dict) -> None:
@@ -686,16 +730,24 @@ class TestQwen3OmniRealtimeWebSocket:
         assert deploy.session_mode == "turn"
         assert deploy.async_chunk is True
         assert deploy.duplex_session.server_vad_model_path == SERVER_VAD_MODEL_PATH
-        pcm16 = _server_vad_pcm16_input()
+        pcm16_24k = _duplex_fixture_pcm(validated_input_wav())
 
         turns = asyncio.run(
             _run_server_vad_audio_roundtrips(
                 omni_server.host,
                 omni_server.port,
                 omni_server.model,
-                pcm16,
+                pcm16_24k,
                 chunk_ms=100,
                 turns=2,
+                turn_detection={
+                    "type": "server_vad",
+                    "threshold": 0.5,
+                    "prefix_padding_ms": 300,
+                    "silence_duration_ms": 500,
+                    "create_response": True,
+                    "interrupt_response": True,
+                },
             )
         )
 
@@ -703,9 +755,11 @@ class TestQwen3OmniRealtimeWebSocket:
         updated_session = next(event["session"] for event in turns[0] if event["type"] == "session.updated")
         effective_turn_detection = updated_session["audio"]["input"]["turn_detection"]
         assert effective_turn_detection["type"] == "server_vad"
+        assert effective_turn_detection["threshold"] == 0.5
+        assert effective_turn_detection["prefix_padding_ms"] == 300
         assert effective_turn_detection["silence_duration_ms"] == 500
         assert effective_turn_detection["create_response"] is True
-        assert effective_turn_detection["interrupt_response"] is False
+        assert effective_turn_detection["interrupt_response"] is True
         _assert_auto_committed_turns(turns)
 
     @pytest.mark.advanced_model
@@ -1275,6 +1329,7 @@ class TestQwen3OmniDuplexPlayback:
         )
 
     @pytest.mark.full_model
+    @hardware_test(res={"rocm": "MI325"}, num_cards=2)
     @pytest.mark.parametrize("generation_finished", [False, True], ids=["generating", "queued-playback"])
     @pytest.mark.parametrize("repetition", range(_DUPLEX_REPEATS_FULL))
     def test_speech_interrupts_playback_full(
@@ -1296,7 +1351,7 @@ class TestQwen3OmniDuplexPlayback:
                 server.host,
                 server.port,
                 server.model,
-                _server_vad_pcm16_input(),
+                _duplex_fixture_pcm(validated_input_wav()),
                 chunk_ms=100,
                 turns=2,
                 turn_detection={"type": "semantic_vad", "eagerness": "auto"},

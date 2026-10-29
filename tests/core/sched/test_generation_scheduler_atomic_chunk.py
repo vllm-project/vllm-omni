@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-"""Atomic scheduling of connector-delivered async chunks (generation stage).
+"""Atomic scheduling of legacy and native async chunks (generation stage).
 
 Regression coverage for the ICL first-chunk clipping crash: the waiting fast
 path scheduled ``min(required_tokens, token_budget)``, splitting a stateful
@@ -37,6 +37,7 @@ from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_qu
 from vllm.v1.engine import FinishReason
 from vllm.v1.request import Request, RequestStatus
 from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler
+from vllm_omni.core.sched.omni_scheduling_coordinator import OmniSchedulingCoordinator
 # isort: on
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -130,6 +131,7 @@ class FakeAdapter:
 
 def _make_scheduler(
     *,
+    receive_path: str = "legacy",
     budget: int = BUDGET,
     max_num_seqs: int = 128,
     enable_chunked_prefill: bool = False,
@@ -137,7 +139,8 @@ def _make_scheduler(
     fail_allocation: bool = False,
 ):
     sched = OmniGenerationScheduler.__new__(OmniGenerationScheduler)
-    sched.chunk_transfer_adapter = FakeAdapter(receives_chunks=receives_chunks)
+    native = receive_path == "native"
+    sched.chunk_transfer_adapter = None if native else FakeAdapter(receives_chunks=receives_chunks)
     sched.scheduler_config = SimpleNamespace(enable_chunked_prefill=enable_chunked_prefill, async_scheduling=False)
     sched.use_pp = False
     sched.max_num_scheduled_tokens = budget
@@ -175,12 +178,16 @@ def _make_scheduler(
     sched._pending_finish_reqs = []
     sched._pending_chunk_error_outputs = []
     sched._latest_omni_connector_output = None
-    sched._native_data_plane = False
-    sched.input_coordinator = None
-    sched.use_v2_model_runner = False
+    sched._native_data_plane = native
+    sched.input_coordinator = (
+        OmniSchedulingCoordinator(stage_id=1, scheduler_max_num_seqs=max_num_seqs, async_chunk=True) if native else None
+    )
+    sched.use_v2_model_runner = native
     sched.async_scheduling = False
     sched.prev_step_scheduled_req_ids = set()
     sched._last_stats_time = time.monotonic()  # make_stats() short-circuits
+    sched.finish_calls = []
+    sched.finish_calls_unresolved = []
 
     def _finish_requests(request_ids, finished_status):
         # Minimal stand-in for the mixin/vLLM finish path, aligned with the
@@ -190,9 +197,15 @@ def _make_scheduler(
         # 2. the base path then skips already-finished requests and removes
         #    the rest from the queues/registry;
         # 3. finished IDs are recorded under each request's own client index.
-        # Resource release (KV/deferred free) is out of scope here; the real
-        # cleanup path is covered by test_omni_scheduler_finish_requests_purge.
-        sched.chunk_transfer_adapter.finish_requests(request_ids, finished_status, sched.requests)
+        # This is a scheduling/output fixture, not proof of the production
+        # finish chain or KV/deferred-free cleanup. Those need separate
+        # integration coverage using the real finish_requests implementation.
+        sched.finish_calls.append((set(request_ids), finished_status))
+        sched.finish_calls_unresolved = [req_id for req_id in request_ids if req_id not in sched.requests]
+        if sched.chunk_transfer_adapter is not None:
+            sched.chunk_transfer_adapter.finish_requests(request_ids, finished_status, sched.requests)
+            assert sched.chunk_transfer_adapter.finish_calls == sched.finish_calls
+            assert sched.chunk_transfer_adapter.finish_calls_unresolved == sched.finish_calls_unresolved
         finished = []
         for req_id in set(request_ids):
             request = sched.requests.get(req_id)
@@ -207,13 +220,26 @@ def _make_scheduler(
             sched.waiting.remove_requests([request])
             sched.kv_holding_waiting.remove_requests([request])
             sched.deferred_waiting.discard(request)
-            sched.chunk_transfer_adapter.requests_with_ready_chunks.discard(req_id)
+            if sched.input_coordinator is not None:
+                sched.input_coordinator.free_finished_request(req_id)
+            else:
+                _ready_chunk_ids(sched).discard(req_id)
             finished.append(request)
         return finished
 
     sched.finish_requests = _finish_requests
     sched._update_after_schedule = lambda scheduler_output: None
     return sched
+
+
+@pytest.fixture(params=["legacy", "native"])
+def receive_path(request):
+    return request.param
+
+
+def _ready_chunk_ids(sched) -> set[str]:
+    owner = sched.input_coordinator if sched._native_data_plane else sched.chunk_transfer_adapter
+    return owner.requests_with_ready_chunks
 
 
 def _make_request(request_id: str, num_tokens: int) -> Request:
@@ -231,23 +257,27 @@ def _make_request(request_id: str, num_tokens: int) -> Request:
 
 
 def _stage_waiting_chunk(sched, request: Request, queue_name: str = "waiting") -> None:
-    """Register a request whose full chunk has been committed by the adapter."""
+    """Register a request whose full chunk has reached its receive path."""
     sched.requests[request.request_id] = request
     getattr(sched, queue_name).add_request(request)
-    sched.chunk_transfer_adapter.requests_with_ready_chunks.add(request.request_id)
+    _ready_chunk_ids(sched).add(request.request_id)
 
 
 def _stage_running_chunk(sched, request: Request) -> None:
+    # Stateful codecs retain their running slots between native chunks. Without
+    # this, native schedule() requeues the request before the running loop and
+    # a purported running regression would only exercise waiting admission.
+    sched._retains_state_across_chunks = True
+    request.status = RequestStatus.RUNNING
     sched.requests[request.request_id] = request
     sched.running.append(request)
-    sched.chunk_transfer_adapter.requests_with_ready_chunks.add(request.request_id)
+    _ready_chunk_ids(sched).add(request.request_id)
 
 
 @pytest.mark.parametrize("queue_name", ["running", "waiting"])
 @pytest.mark.parametrize("native,pending", [(False, False), (False, True), (True, False)])
 def test_in_flight_guard_preserves_stateless_legacy_overlap(queue_name, native, pending):
-    sched = _make_scheduler(budget=32)
-    sched._native_data_plane = native
+    sched = _make_scheduler(receive_path="native" if native else "legacy", budget=32)
     sched._supports_pending_generation = pending
     sched.async_scheduling = True
     sched.scheduler_config.async_scheduling = True
@@ -291,9 +321,13 @@ def _make_runner_output():
 class TestWaitingDefersWholeChunk:
     @pytest.mark.parametrize("enable_chunked_prefill", [False, True])
     @pytest.mark.parametrize("queue_name", ["waiting", "kv_holding_waiting"])
-    def test_57th_first_chunk_deferred_intact(self, enable_chunked_prefill, queue_name):
-        sched = _make_scheduler(enable_chunked_prefill=enable_chunked_prefill)
+    def test_57th_first_chunk_deferred_intact(self, receive_path, enable_chunked_prefill, queue_name):
+        sched = _make_scheduler(receive_path=receive_path, enable_chunked_prefill=enable_chunked_prefill)
         requests = [_make_request(f"speech-{i}", FIRST_CHUNK_TOKENS) for i in range(57)]
+        deferred = requests[-1]
+        expected_codes = list(deferred.prompt_token_ids)
+        expected_metadata = {"left_context_size": 72, "is_first_chunk": True}
+        deferred.additional_information = dict(expected_metadata)
         for request in requests:
             _stage_waiting_chunk(sched, request, queue_name)
 
@@ -305,56 +339,74 @@ class TestWaitingDefersWholeChunk:
         assert output.total_num_scheduled_tokens == 56 * FIRST_CHUNK_TOKENS
         assert 128 not in output.num_scheduled_tokens.values()
 
-        deferred = requests[56]
         assert deferred.request_id not in output.num_scheduled_tokens
         # Intact data, still queued, still ready, still tracked.
-        assert len(deferred.prompt_token_ids) == FIRST_CHUNK_TOKENS
+        assert deferred.prompt_token_ids == expected_codes
+        assert deferred.additional_information == expected_metadata
         assert deferred.request_id in sched.requests
         assert getattr(sched, queue_name).peek_request() is deferred
-        assert deferred.request_id in sched.chunk_transfer_adapter.requests_with_ready_chunks
+        assert deferred.request_id in _ready_chunk_ids(sched)
         assert len(sched.running) == 56
         # One-shot inputs release readiness on admission; deferred input stays ready.
-        assert sched.chunk_transfer_adapter.requests_with_ready_chunks == {deferred.request_id}
+        assert _ready_chunk_ids(sched) == {deferred.request_id}
 
         # Complete the admitted chunks; the deferred chunk must remain usable
         # and be admitted whole on the next step from either waiting queue.
         for request in requests[:56]:
             request.num_computed_tokens = FIRST_CHUNK_TOKENS
             request.num_in_flight_tokens = 0
-            sched.chunk_transfer_adapter.mark_chunk_consumed(request.request_id)
+            if sched.chunk_transfer_adapter is not None:
+                sched.chunk_transfer_adapter.mark_chunk_consumed(request.request_id)
         next_output = sched.schedule()
         assert next_output.num_scheduled_tokens == {deferred.request_id: FIRST_CHUNK_TOKENS}
-        assert not getattr(sched, queue_name)
-        assert not sched.chunk_transfer_adapter.requests_with_ready_chunks
+        assert deferred.prompt_token_ids == expected_codes
+        assert deferred.additional_information == expected_metadata
+        assert deferred not in getattr(sched, queue_name)
+        # Native chunks whose outputs completed are requeued while awaiting
+        # their next payload; they must not be accidentally executed again.
+        assert all(request.num_computed_tokens == FIRST_CHUNK_TOKENS for request in getattr(sched, queue_name))
+        assert not _ready_chunk_ids(sched)
 
-    def test_exact_fit_chunk_is_scheduled_whole(self):
-        sched = _make_scheduler(budget=FIRST_CHUNK_TOKENS)
+    @pytest.mark.parametrize("queue_name", ["waiting", "kv_holding_waiting"])
+    def test_exact_fit_chunk_is_scheduled_whole(self, receive_path, queue_name):
+        sched = _make_scheduler(receive_path=receive_path, budget=FIRST_CHUNK_TOKENS)
         request = _make_request("fit-1", FIRST_CHUNK_TOKENS)
-        _stage_waiting_chunk(sched, request)
+        _stage_waiting_chunk(sched, request, queue_name)
 
         output = sched.schedule()
 
         assert output.num_scheduled_tokens == {request.request_id: FIRST_CHUNK_TOKENS}
 
-    def test_allocate_failure_defers_and_does_not_fall_back(self):
-        sched = _make_scheduler(fail_allocation=True)
+    def test_allocate_failure_defers_and_does_not_fall_back(self, receive_path, mocker):
+        sched = _make_scheduler(receive_path=receive_path, fail_allocation=True)
+        base_schedule = mocker.patch(
+            "vllm_omni.core.sched.omni_generation_scheduler.VLLMScheduler.schedule",
+            side_effect=AssertionError("Async-chunk allocation failure must not fall back to the base scheduler"),
+        )
+        owner = sched.input_coordinator if sched._native_data_plane else sched.chunk_transfer_adapter
+        restore = mocker.spy(owner, "restore_queues")
         request = _make_request("alloc-fail", FIRST_CHUNK_TOKENS)
         _stage_waiting_chunk(sched, request)
 
         output = sched.schedule()
 
         # No fallback to the base scheduler (it does not know the chunk
-        # protocol); an empty adapter-path output is produced instead.
+        # protocol); an empty async-chunk-path output is produced instead.
         assert output.num_scheduled_tokens == {}
-        assert sched.chunk_transfer_adapter.restore_called
+        base_schedule.assert_not_called()
+        # Empty async-chunk steps restore here and in the final cleanup. The
+        # contract is restored queues, not a fixed number of restore calls.
+        restore.assert_called()
         assert request.request_id in sched.requests
-        assert request.request_id in sched.chunk_transfer_adapter.requests_with_ready_chunks
+        assert request in sched.waiting
+        assert request.request_id in _ready_chunk_ids(sched)
 
-    def test_empty_prompt_request_is_parked_not_rejected(self):
+    @pytest.mark.parametrize("num_tokens", [0, OVERSIZED_TOKENS])
+    def test_unready_prompt_request_is_parked_not_rejected(self, receive_path, num_tokens):
         # A huge stale prompt that is NOT ready must never be rejected by the
         # oversized pre-check; an empty prompt is parked awaiting its chunk.
-        sched = _make_scheduler()
-        stale = _make_request("stale-huge", OVERSIZED_TOKENS)
+        sched = _make_scheduler(receive_path=receive_path)
+        stale = _make_request("unready", num_tokens)
         sched.requests[stale.request_id] = stale
         sched.waiting.add_request(stale)  # not in requests_with_ready_chunks
 
@@ -367,14 +419,17 @@ class TestWaitingDefersWholeChunk:
 
 class TestRunningDefersWholeChunk:
     @pytest.mark.parametrize("enable_chunked_prefill", [True, False])
-    def test_followup_chunk_deferred_when_budget_insufficient(self, enable_chunked_prefill):
+    def test_followup_chunk_deferred_when_budget_insufficient(self, receive_path, enable_chunked_prefill):
         # Full budget 1000 fits each chunk whole, but after the filler request
         # consumes 800 only 200 remain. With chunked prefill enabled the old
         # guard would split the follow-up (min(400, 200)); the atomic rule
         # must defer it intact instead.
-        sched = _make_scheduler(budget=1000, enable_chunked_prefill=enable_chunked_prefill)
+        sched = _make_scheduler(receive_path=receive_path, budget=1000, enable_chunked_prefill=enable_chunked_prefill)
         filler = _make_request("filler-1", 800)
         followup = _make_request("followup-1", FOLLOWUP_TOKENS)
+        expected_codes = list(followup.prompt_token_ids)
+        expected_metadata = {"left_context_size": 0, "is_first_chunk": False}
+        followup.additional_information = dict(expected_metadata)
         _stage_running_chunk(sched, filler)
         _stage_running_chunk(sched, followup)
 
@@ -382,12 +437,37 @@ class TestRunningDefersWholeChunk:
 
         assert output.num_scheduled_tokens == {filler.request_id: 800}
         assert 200 not in output.num_scheduled_tokens.values()
-        assert len(followup.prompt_token_ids) == FOLLOWUP_TOKENS
+        assert followup.prompt_token_ids == expected_codes
+        assert followup.additional_information == expected_metadata
         assert followup.num_computed_tokens == 0
-        assert followup.request_id in sched.chunk_transfer_adapter.requests_with_ready_chunks
+        assert followup in sched.running
+        assert followup not in sched.waiting
+        assert followup.request_id in _ready_chunk_ids(sched)
 
-    def test_consumed_running_chunk_not_rescheduled(self):
-        sched = _make_scheduler()
+        filler.num_computed_tokens = 800
+        next_output = sched.schedule()
+        assert next_output.num_scheduled_tokens == {followup.request_id: FOLLOWUP_TOKENS}
+        assert followup.prompt_token_ids == expected_codes
+        assert followup.additional_information == expected_metadata
+        assert followup.request_id not in _ready_chunk_ids(sched)
+
+    @pytest.mark.parametrize("enable_chunked_prefill", [True, False])
+    def test_exact_fit_running_chunk_is_scheduled_whole(self, receive_path, enable_chunked_prefill):
+        sched = _make_scheduler(
+            receive_path=receive_path, budget=FOLLOWUP_TOKENS, enable_chunked_prefill=enable_chunked_prefill
+        )
+        request = _make_request("running-fit", FOLLOWUP_TOKENS)
+        _stage_running_chunk(sched, request)
+
+        output = sched.schedule()
+
+        assert output.num_scheduled_tokens == {request.request_id: FOLLOWUP_TOKENS}
+        assert request in sched.running
+        assert not sched.waiting
+        assert not _ready_chunk_ids(sched)
+
+    def test_consumed_running_chunk_not_rescheduled(self, receive_path):
+        sched = _make_scheduler(receive_path=receive_path)
         request = _make_request("consumed-1", FOLLOWUP_TOKENS)
         request.num_computed_tokens = FOLLOWUP_TOKENS  # fully consumed
         _stage_running_chunk(sched, request)
@@ -399,18 +479,23 @@ class TestRunningDefersWholeChunk:
 
 
 class TestOversizedRejected:
-    def test_oversized_rejected_normal_request_continues(self):
-        sched = _make_scheduler()
+    @pytest.mark.parametrize("queue_name", ["waiting", "kv_holding_waiting", "running"])
+    def test_oversized_rejected_normal_request_continues(self, receive_path, queue_name):
+        sched = _make_scheduler(receive_path=receive_path)
         oversized = _make_request("oversized-1", OVERSIZED_TOKENS)
         oversized.resumable = True  # B2 must clear this on terminal failure
         normal = _make_request("normal-1", FIRST_CHUNK_TOKENS)
-        _stage_waiting_chunk(sched, oversized)
+        if queue_name == "running":
+            _stage_running_chunk(sched, oversized)
+        else:
+            _stage_waiting_chunk(sched, oversized, queue_name)
         _stage_waiting_chunk(sched, normal)
 
         output = sched.schedule()
 
-        # The oversized chunk failed through the standard finish path with an
-        # explicit ERROR output queued; the normal chunk ran whole.
+        # The oversized chunk invoked finish_requests with an explicit ERROR
+        # output queued; the normal chunk ran whole. Finish is stubbed here;
+        # the real cleanup chain is covered separately.
         assert output.num_scheduled_tokens == {normal.request_id: FIRST_CHUNK_TOKENS}
         assert oversized.request_id not in sched.requests
         assert oversized.request_id in sched.finished_req_ids
@@ -418,8 +503,10 @@ class TestOversizedRejected:
         assert oversized.resumable is False
         # Exactly one batched finish call targeting only the oversized id,
         # issued while the request was still registered.
-        assert sched.chunk_transfer_adapter.finish_calls == [({oversized.request_id}, RequestStatus.FINISHED_ERROR)]
-        assert sched.chunk_transfer_adapter.finish_calls_unresolved == []
+        assert sched.finish_calls == [({oversized.request_id}, RequestStatus.FINISHED_ERROR)]
+        assert sched.finish_calls_unresolved == []
+        assert oversized not in getattr(sched, queue_name)
+        assert oversized.request_id not in _ready_chunk_ids(sched)
         # The queued terminal output carries the full error contract.
         assert len(sched._pending_chunk_error_outputs) == 1
         client_index, error_output = sched._pending_chunk_error_outputs[0]
@@ -430,8 +517,8 @@ class TestOversizedRejected:
         assert error_output.is_segment_finished is False
         assert "65552" in error_output.stop_reason
 
-    def test_two_oversized_rejected_in_single_batched_finish_call(self):
-        sched = _make_scheduler()
+    def test_two_oversized_rejected_in_single_batched_finish_call(self, receive_path):
+        sched = _make_scheduler(receive_path=receive_path)
         oversized_a = _make_request("oversized-a", OVERSIZED_TOKENS)
         oversized_b = _make_request("oversized-b", OVERSIZED_TOKENS + 32)
         normal = _make_request("normal-1", FIRST_CHUNK_TOKENS)
@@ -442,22 +529,25 @@ class TestOversizedRejected:
 
         # One batched finish call covering exactly the two oversized ids.
         assert output.num_scheduled_tokens == {normal.request_id: FIRST_CHUNK_TOKENS}
-        assert len(sched.chunk_transfer_adapter.finish_calls) == 1
-        assert sched.chunk_transfer_adapter.finish_calls[0] == (
+        assert len(sched.finish_calls) == 1
+        assert sched.finish_calls[0] == (
             {oversized_a.request_id, oversized_b.request_id},
             RequestStatus.FINISHED_ERROR,
         )
-        assert sched.chunk_transfer_adapter.finish_calls_unresolved == []
+        assert sched.finish_calls_unresolved == []
         assert len(sched._pending_chunk_error_outputs) == 2
         errored_ids = {error_output.request_id for _, error_output in sched._pending_chunk_error_outputs}
         assert errored_ids == {oversized_a.request_id, oversized_b.request_id}
 
-    @pytest.mark.parametrize("queue_name", ["waiting", "kv_holding_waiting"])
-    def test_nonzero_client_index_routing(self, queue_name):
-        sched = _make_scheduler()
+    @pytest.mark.parametrize("queue_name", ["waiting", "kv_holding_waiting", "running"])
+    def test_nonzero_client_index_routing(self, receive_path, queue_name):
+        sched = _make_scheduler(receive_path=receive_path)
         oversized = _make_request("client-2-oversized", OVERSIZED_TOKENS)
         oversized.client_index = 2
-        _stage_waiting_chunk(sched, oversized, queue_name)
+        if queue_name == "running":
+            _stage_running_chunk(sched, oversized)
+        else:
+            _stage_waiting_chunk(sched, oversized, queue_name)
 
         output = sched.schedule()
 
@@ -466,7 +556,7 @@ class TestOversizedRejected:
         assert sched.finished_req_ids_dict == {2: {oversized.request_id}}
         assert oversized.request_id not in sched.requests
         assert oversized not in getattr(sched, queue_name)
-        assert oversized.request_id not in sched.chunk_transfer_adapter.requests_with_ready_chunks
+        assert oversized.request_id not in _ready_chunk_ids(sched)
         client_index, error_output = sched._pending_chunk_error_outputs[0]
         assert client_index == 2
         result = sched.update_from_output(output, _make_runner_output())
@@ -482,11 +572,11 @@ class TestOversizedRejected:
         assert not next_output.num_scheduled_tokens
         result_again = sched.update_from_output(next_output, _make_runner_output())
         assert not result_again.get(2) or result_again[2].outputs == []
-        assert len(sched.chunk_transfer_adapter.finish_calls) == 1
+        assert len(sched.finish_calls) == 1
 
     @pytest.mark.parametrize("budget,chunk_tokens", [(1152, FIRST_CHUNK_TOKENS), (1000, FIRST_CHUNK_TOKENS)])
-    def test_boundary_budgets_reject_never_slice(self, budget, chunk_tokens):
-        sched = _make_scheduler(budget=budget)
+    def test_boundary_budgets_reject_never_slice(self, receive_path, budget, chunk_tokens):
+        sched = _make_scheduler(receive_path=receive_path, budget=budget)
         request = _make_request("boundary-1", chunk_tokens)
         _stage_waiting_chunk(sched, request)
 
@@ -498,12 +588,12 @@ class TestOversizedRejected:
         assert request.request_id not in sched.requests
         assert len(sched._pending_chunk_error_outputs) == 1
 
-    def test_zero_token_step_emits_error_output(self):
+    def test_zero_token_step_emits_error_output(self, receive_path):
         # Scope note: update_from_output() is invoked manually here, which
         # proves the scheduler emits the queued error when the step output is
         # processed -- it does not by itself prove the engine loop always
         # reaches this call (that is exercised by engine-level e2e runs).
-        sched = _make_scheduler()
+        sched = _make_scheduler(receive_path=receive_path)
         oversized = _make_request("lone-oversized", OVERSIZED_TOKENS)
         _stage_waiting_chunk(sched, oversized)
 
@@ -523,12 +613,12 @@ class TestOversizedRejected:
         # Queued errors are drained exactly once.
         assert sched._pending_chunk_error_outputs == []
 
-    def test_error_emitted_exactly_once_across_two_schedules(self):
+    def test_error_emitted_exactly_once_across_two_schedules(self, receive_path):
         # Scope note: both steps here are zero-token; this checks the
         # error-drain discipline of the queued-output list, not real
         # in-flight batch cleanup (the real finish path is covered by
         # test_omni_scheduler_finish_requests_purge).
-        sched = _make_scheduler()
+        sched = _make_scheduler(receive_path=receive_path)
         oversized = _make_request("once-1", OVERSIZED_TOKENS)
         _stage_waiting_chunk(sched, oversized)
 
@@ -547,6 +637,80 @@ class TestOversizedRejected:
         # The drained error is not re-emitted; an empty result may not even
         # carry an entry for the client.
         assert not result_again.get(0) or result_again[0].outputs == []
+
+
+class TestNativeInFlightFence:
+    @pytest.mark.parametrize("queue_name", ["waiting", "kv_holding_waiting", "running"])
+    def test_oversized_chunk_waits_for_in_flight_execution_without_blocking_other_stream(self, queue_name):
+        sched = _make_scheduler(receive_path="native", budget=FOLLOWUP_TOKENS, enable_chunked_prefill=True)
+        oversized = _make_request("in-flight-oversized", FOLLOWUP_TOKENS + 16)
+        oversized.num_in_flight_tokens = FOLLOWUP_TOKENS
+        oversized.additional_information = {"is_first_chunk": False}
+        expected_codes = list(oversized.prompt_token_ids)
+        ready = _make_request("other-stream", FOLLOWUP_TOKENS)
+        for request in (oversized, ready):
+            if queue_name == "running":
+                _stage_running_chunk(sched, request)
+            else:
+                _stage_waiting_chunk(sched, request, queue_name)
+
+        output = sched.schedule()
+
+        assert output.num_scheduled_tokens == {ready.request_id: FOLLOWUP_TOKENS}
+        assert sched.requests[oversized.request_id] is oversized
+        assert oversized in getattr(sched, queue_name)
+        assert oversized.request_id in _ready_chunk_ids(sched)
+        assert oversized.prompt_token_ids == expected_codes
+        assert oversized.additional_information == {"is_first_chunk": False}
+        assert oversized.num_in_flight_tokens == FOLLOWUP_TOKENS
+        assert oversized.stop_reason is None
+        assert sched.finish_calls == []
+        assert sched._pending_chunk_error_outputs == []
+
+        # Keep deferring while the previous execution owns the request.
+        ready.num_computed_tokens = FOLLOWUP_TOKENS
+        assert sched.schedule().num_scheduled_tokens == {}
+        assert oversized.request_id in _ready_chunk_ids(sched)
+        assert sched.finish_calls == []
+
+        # Actual output retirement is covered by the real-cleanup regression;
+        # here isolate admission after the native fence has cleared.
+        oversized.num_in_flight_tokens = 0
+        assert sched.schedule().num_scheduled_tokens == {}
+        assert oversized.request_id not in sched.requests
+        assert oversized.request_id not in _ready_chunk_ids(sched)
+        assert sched.finish_calls == [({oversized.request_id}, RequestStatus.FINISHED_ERROR)]
+        assert len(sched._pending_chunk_error_outputs) == 1
+
+    @pytest.mark.parametrize("queue_name", ["waiting", "kv_holding_waiting", "running"])
+    def test_in_flight_chunk_keeps_ready_without_blocking_other_stream(self, queue_name):
+        sched = _make_scheduler(receive_path="native", budget=FOLLOWUP_TOKENS, enable_chunked_prefill=True)
+        in_flight = _make_request("in-flight", FOLLOWUP_TOKENS)
+        in_flight.num_in_flight_tokens = FOLLOWUP_TOKENS
+        ready = _make_request("other-stream", FOLLOWUP_TOKENS)
+        for request in (in_flight, ready):
+            if queue_name == "running":
+                _stage_running_chunk(sched, request)
+            else:
+                _stage_waiting_chunk(sched, request, queue_name)
+
+        output = sched.schedule()
+
+        assert output.num_scheduled_tokens == {ready.request_id: FOLLOWUP_TOKENS}
+        assert in_flight.request_id in _ready_chunk_ids(sched)
+        assert in_flight in getattr(sched, queue_name)
+        assert len(in_flight.prompt_token_ids) == FOLLOWUP_TOKENS
+        assert in_flight.num_computed_tokens == 0
+        assert in_flight.num_in_flight_tokens == FOLLOWUP_TOKENS
+        assert sched._pending_chunk_error_outputs == []
+
+        # Once the outstanding batch retires, the deferred payload remains
+        # available and is admitted in full, not lost or submitted twice.
+        in_flight.num_in_flight_tokens = 0
+        ready.num_computed_tokens = FOLLOWUP_TOKENS
+        next_output = sched.schedule()
+        assert next_output.num_scheduled_tokens == {in_flight.request_id: FOLLOWUP_TOKENS}
+        assert in_flight.request_id not in _ready_chunk_ids(sched)
 
 
 class TestNonChunkBehaviorUnchanged:
