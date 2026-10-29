@@ -12,7 +12,7 @@ import itertools
 import json
 import weakref
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, replace
+from dataclasses import MISSING, dataclass, fields, replace
 from typing import TYPE_CHECKING, Any, TypeGuard, cast
 
 import torch
@@ -163,22 +163,49 @@ def _select_impl_cls(
 _SCHEDULED_ATTENTION_LAYERS: "weakref.WeakValueDictionary[int, Attention]" = weakref.WeakValueDictionary()
 _SCHEDULED_ATTENTION_IDS = itertools.count()
 
-# AttentionMetadata fields that must hold their default (None) for a compiled call to use the
-# scheduled-attention op. The op carries attn_mask, plain-integer video_layout and plain-scalar extra
-# entries (see _encode_scheduled_op_metadata); any other metadata keeps the eager boundary.
-_SCHEDULED_OP_NONE_FIELDS = (
-    "joint_attn_mask",
-    "joint_query",
-    "joint_key",
-    "joint_value",
-    "full_attn_spans",
-    "query_ranges",
-    "packed_padding",
-    "cross_query_mask",
-)
-# Cross-attention mask validation flags that must hold their default (False). The op does not carry
-# them, so a call with a prepared cross mask keeps the eager boundary instead of losing them.
-_SCHEDULED_OP_FALSE_FIELDS = ("cross_kv_rows_validated", "cross_pair_mask_validated")
+# AttentionMetadata fields the scheduled-attention op carries (see _encode_scheduled_op_metadata).
+_SCHEDULED_OP_CARRIED_FIELDS = frozenset({"attn_mask", "extra", "video_layout"})
+# A field without a declared default never matches, so it keeps the eager boundary.
+_NO_FIELD_DEFAULT = object()
+
+
+def _scheduled_op_field_defaults() -> tuple[tuple[str, object], ...]:
+    """Every other AttentionMetadata field with its declared default.
+
+    Derived from the dataclass, so a field added later keeps the eager boundary until the op carries
+    it, instead of being dropped by ``_decode_scheduled_op_metadata``.
+    """
+    defaults = []
+    for metadata_field in fields(AttentionMetadata):
+        if metadata_field.name in _SCHEDULED_OP_CARRIED_FIELDS:
+            continue
+        if metadata_field.default is not MISSING:
+            default = metadata_field.default
+        elif metadata_field.default_factory is not MISSING:
+            default = metadata_field.default_factory()
+        else:
+            default = _NO_FIELD_DEFAULT
+        defaults.append((metadata_field.name, default))
+    return tuple(defaults)
+
+
+# Uncarried fields that must hold their default for a compiled call to use the scheduled-attention
+# op; any other value keeps the eager boundary.
+_SCHEDULED_OP_FIELD_DEFAULTS = _scheduled_op_field_defaults()
+
+
+def _holds_field_default(value: object, default: object) -> bool:
+    if value is default:
+        return True
+    # A tensor never compares equal to a default; the type check also keeps bool apart from int.
+    return (
+        default is not _NO_FIELD_DEFAULT
+        and type(value) is type(default)
+        and not isinstance(value, torch.Tensor)
+        and value == default
+    )
+
+
 # Spec of a call without metadata; any other spec starts with "M".
 _NO_METADATA_SPEC = "-"
 
@@ -201,18 +228,15 @@ def _encode_scheduled_op_metadata(
     Carried: ``video_layout`` with plain ``prefix_len``/``latent_grid``/``used_len`` and no
     ``video_spans``, and ``extra`` entries whose values are None, a bool, an int or a tuple/list of
     ints. Returns None for anything else (tensors, floats or strings in ``extra``, video spans, joint
-    tensors, packed padding, ranges, cross-attention mask metadata, a non-default ``joint_strategy``, a
-    metadata subclass), which keeps the eager boundary.
+    tensors, packed padding, ranges, cross-attention mask metadata, a non-default ``joint_strategy``, any
+    other field off its declared default, a metadata subclass), which keeps the eager boundary.
     """
     if attn_metadata is None:
         return _NO_METADATA_SPEC, []
-    if type(attn_metadata) is not AttentionMetadata or attn_metadata.joint_strategy != "front":
+    if type(attn_metadata) is not AttentionMetadata:
         return None
-    for name in _SCHEDULED_OP_NONE_FIELDS:
-        if getattr(attn_metadata, name) is not None:
-            return None
-    for name in _SCHEDULED_OP_FALSE_FIELDS:
-        if getattr(attn_metadata, name):
+    for name, default in _SCHEDULED_OP_FIELD_DEFAULTS:
+        if not _holds_field_default(getattr(attn_metadata, name), default):
             return None
     spec = "M"
     ints: list[int | torch.SymInt] = []
