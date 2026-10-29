@@ -240,6 +240,16 @@ def test_chunked_attention_matches_sdpa() -> None:
     )
 
 
+def test_chunked_attention_fp16_scores_do_not_overflow() -> None:
+    # Unscaled, every score is 384 * 20 * 20 = 153600, beyond the fp16 maximum of 65504.
+    q = torch.full((1, 1, 16, 384), 20.0)
+    k = q.clone()
+    v = torch.randn(1, 1, 16, 384)
+    out = fp._chunked_attention(q.half(), k.half(), v.half(), rows=8)
+    assert torch.isfinite(out).all()
+    torch.testing.assert_close(out.float(), nn.functional.scaled_dot_product_attention(q, k, v), atol=1e-2, rtol=1e-2)
+
+
 @pytest.mark.parametrize("name", sorted(BUILDERS))
 def test_uninstall_restores_forwards_and_layouts(name: str) -> None:
     _, candidate = _build_pair(name, torch.float32)

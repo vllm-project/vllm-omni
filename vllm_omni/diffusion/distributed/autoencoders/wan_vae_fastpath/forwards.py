@@ -1086,12 +1086,16 @@ ATTENTION_CHUNK_ROWS = 2048
 
 
 def _chunked_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, rows: int) -> torch.Tensor:
-    """Single-head attention as low-precision matmuls (fp32 accumulation) with an fp32 softmax, ``rows`` at a time."""
-    scale = q.shape[-1] ** -0.5
+    """Single-head attention as low-precision matmuls (fp32 accumulation) with an fp32 softmax, ``rows`` at a time.
+
+    ``q`` is scaled before the score matmul, as SDPA's math path does: the matmul writes its output in ``q.dtype``,
+    and unscaled fp16 scores overflow for a head dim of 384+ (e.g. 384 * 20 * 20 > 65504).
+    """
+    q = q * q.shape[-1] ** -0.5
     out = torch.empty_like(q)
     kt = k.transpose(-1, -2)
     for i in range(0, q.shape[-2], rows):
-        scores = torch.matmul(q[..., i : i + rows, :], kt).float().mul_(scale)
+        scores = torch.matmul(q[..., i : i + rows, :], kt).float()
         out[..., i : i + rows, :] = torch.matmul(scores.softmax(dim=-1).to(q.dtype), v)
     return out
 
