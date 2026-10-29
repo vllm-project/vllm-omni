@@ -1623,7 +1623,7 @@ class OrchestratorBase:
             [req_id, *self._cfg_tracker.cleanup_parent(req_id)],
             abort=True,
             release_owners=release_owners,
-            trace_error=error_type,
+            trace_error=error_type or DEFAULT_CLIENT_ERROR_TYPE,
         )
 
     async def _dispatch_or_fail_request(

@@ -35,6 +35,7 @@ from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 from vllm_omni.engine.messages import StageSubmissionMessage
 from vllm_omni.engine.orchestrator import Orchestrator, OrchestratorRequestState
 from vllm_omni.engine.stage_runtime import StageRuntimeInfo
+from vllm_omni.errors import DEFAULT_CLIENT_ERROR_TYPE
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.tracing import RequestTrace, TraceContextMiddleware, capture_trace_headers, create_tracer_provider
@@ -61,6 +62,23 @@ def test_tracing_disabled_does_not_require_sdk(monkeypatch):
     tracing = runpy.run_path(str(Path(__file__).parents[2] / "vllm_omni" / "tracing.py"))
     assert tracing["create_tracer_provider"](None) is None
     assert tracing["capture_trace_headers"](HEADERS) == HEADERS
+
+
+@pytest.mark.parametrize(
+    ("protocol", "missing_module"),
+    [
+        ("grpc", "opentelemetry.sdk"),
+        ("grpc", "opentelemetry.exporter.otlp.proto.grpc.trace_exporter"),
+        ("http/protobuf", "opentelemetry.exporter.otlp.proto.http.trace_exporter"),
+    ],
+)
+def test_tracing_missing_dependency_has_install_hint(monkeypatch, protocol, missing_module):
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_TRACES_PROTOCOL", protocol)
+    monkeypatch.setitem(sys.modules, missing_module, None)
+    with pytest.raises(ImportError, match=r"pip install 'vllm-omni\[tracing\]'") as exc_info:
+        create_tracer_provider("http://localhost:4317")
+    assert isinstance(exc_info.value.__cause__, ModuleNotFoundError)
+    assert exc_info.value.__cause__.name == missing_module
 
 
 def test_context_preserves_unsampled_and_vendor_state(recording):
@@ -174,6 +192,34 @@ async def test_stage_error_preserves_trace_error_type(recording, error_type):
     spans = exporter.get_finished_spans()
     assert len(spans) == 2
     assert all(span.attributes["error.type"] == (error_type or "stage_error") for span in spans)
+    assert all(span.status.status_code == trace.StatusCode.ERROR for span in spans)
+    assert not orch.request_states
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error_type", ["validation_error", None, ""])
+@pytest.mark.parametrize("release_owners", [False, True])
+async def test_client_error_trace_uses_default_for_missing_type(recording, error_type, release_owners):
+    tracer, exporter = recording
+    orch = Orchestrator(
+        request_async_queue=asyncio.Queue(),
+        output_async_queue=asyncio.Queue(),
+        rpc_async_queue=asyncio.Queue(),
+        stage_pools=_build_stage_pools([[FakeStageClient(final_output=True)]]),
+        tracer=tracer,
+    )
+    request_trace = RequestTrace(tracer, "failed", HEADERS)
+    request_trace.start_stage(0, 0, "llm")
+    orch.request_states["failed"] = OrchestratorRequestState(
+        request_id="failed", final_stage_id=0, sampling_params_list=[_sampling_params()], trace=request_trace
+    )
+    await orch._fail_request_client_error(
+        "failed", 0, "invalid input", error_type=error_type, release_owners=release_owners
+    )
+    spans = exporter.get_finished_spans()
+    assert len(spans) == 2
+    assert all(span.attributes["error.type"] == (error_type or DEFAULT_CLIENT_ERROR_TYPE) for span in spans)
+    assert all(span.attributes["omni.request.outcome"] == "error" for span in spans)
     assert all(span.status.status_code == trace.StatusCode.ERROR for span in spans)
     assert not orch.request_states
 

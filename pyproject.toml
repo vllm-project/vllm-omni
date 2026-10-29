@@ -42,6 +42,7 @@ tracing = [
 ]
 
 dev = [
+    "opentelemetry-sdk>=1.28.0",
     "opentelemetry-instrumentation-fastapi>=0.49b0",
     "pytest==9.1.1",
     "pytest-asyncio==1.4.0",

@@ -38,19 +38,25 @@ def create_tracer_provider(endpoint: str | None) -> sdk_trace.TracerProvider | N
         return None
     import os
 
-    from opentelemetry.sdk import trace as sdk_trace
-    from opentelemetry.sdk.resources import Resource
-    from opentelemetry.sdk.trace.export import BatchSpanProcessor
-
     protocol = os.environ.get(
         "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL", os.environ.get("OTEL_EXPORTER_OTLP_PROTOCOL", "grpc")
     )
-    if protocol == "grpc":
-        from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
-    elif protocol == "http/protobuf":
-        from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
-    else:
-        raise ValueError(f"Unsupported OTLP traces protocol: {protocol}")
+    try:
+        from opentelemetry.sdk import trace as sdk_trace
+        from opentelemetry.sdk.resources import Resource
+        from opentelemetry.sdk.trace.export import BatchSpanProcessor
+
+        if protocol == "grpc":
+            from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+        elif protocol == "http/protobuf":
+            from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+        else:
+            raise ValueError(f"Unsupported OTLP traces protocol: {protocol}")
+    except ImportError as exc:
+        raise ImportError(
+            "OpenTelemetry tracing requires additional dependencies. Install them with "
+            "`pip install 'vllm-omni[tracing]'`."
+        ) from exc
     provider = sdk_trace.TracerProvider(
         resource=Resource.create({"service.name": os.environ.get("OTEL_SERVICE_NAME", "vllm-omni")})
     )
