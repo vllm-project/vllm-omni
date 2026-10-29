@@ -17,6 +17,7 @@ Only ``test_dense_request_matches_a_service_without_a_schedule_bit_for_bit`` com
 on CPU. Compilation for the target GPU attention backend is not covered here.
 """
 
+import copy
 from dataclasses import dataclass, fields, replace
 from types import SimpleNamespace
 from typing import Any
@@ -552,6 +553,27 @@ def test_scheduled_op_id_is_a_cpu_attribute_outside_the_state_dict(compile_env):
     assert len(ids) == len(model.blocks)
     assert not any("schedule_op_id" in name for name in model.state_dict())
     assert _pipeline(None, compiled=False).model.blocks[0].attn._schedule_op_id is None
+
+
+def test_copied_layers_register_their_own_scheduled_op_id(compile_env, monkeypatch):
+    pipeline = _pipeline(AttentionScheduleConfig(profiles={"approx": _trtllm(0.5)}), compiled=False)
+    original = pipeline.model
+    clone = copy.deepcopy(original)
+    shallow = copy.copy(original.blocks[0].attn)
+    layers = [block.attn for block in original.blocks] + [block.attn for block in clone.blocks] + [shallow]
+    ids = [int(layer._schedule_op_id) for layer in layers]
+    assert len(set(ids)) == len(layers)
+    for layer, op_id in zip(layers, ids):
+        assert layer_mod._SCHEDULED_ATTENTION_LAYERS[op_id] is layer
+
+    # The op on a copy runs that copy's _forward_impl, never the original's.
+    query = torch.randn(1, _SEQ, _HEADS, _HEAD_SIZE)
+    for index, layer in enumerate(layers):
+        monkeypatch.setattr(layer, "_forward_impl", lambda q, k, v, md=None, index=index: q + index)
+    for index, layer in enumerate(layers):
+        out = layer_mod._scheduled_attention_op(query, query, query, None, layer._schedule_op_id, "-", [])
+        assert torch.equal(out, query + index)
+    assert copy.deepcopy(_pipeline(None, compiled=False).model).blocks[0].attn._schedule_op_id is None
 
 
 def test_scheduled_op_returns_a_fresh_contiguous_tensor_and_rejects_a_wrong_shape(compile_env, monkeypatch):
