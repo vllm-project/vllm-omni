@@ -20,7 +20,6 @@ from __future__ import annotations
 import math
 import os
 from collections.abc import Iterable
-from contextlib import contextmanager
 from dataclasses import replace
 from typing import Any, ClassVar
 
@@ -31,7 +30,6 @@ import torch.nn as nn
 from diffusers.image_processor import VaeImageProcessor
 from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
 from transformers import AutoConfig, AutoProcessor
-from vllm.config.vllm import get_current_vllm_config
 from vllm.logger import init_logger
 from vllm.lora.lora_model import LoRAModel
 from vllm.lora.peft_helper import PEFTHelper
@@ -153,21 +151,6 @@ def _flux3_image_rope_scale(package_config: dict[str, Any] | None) -> float:
 def _flux3_image_vae_file(package_config: dict[str, Any] | None) -> str:
     vae_cfg = (package_config or {}).get("vae") or {}
     return vae_cfg.get("path") or _F3_PACKAGE_VAE_NAME
-
-
-@contextmanager
-def _enable_native_fp8_quant_for_flux3():
-    """Select vLLM's native FP8 quantizer while building Flux3."""
-    custom_ops = get_current_vllm_config().compilation_config.custom_ops
-    marker = "+quant_fp8"
-    added = marker not in custom_ops
-    if added:
-        custom_ops.append(marker)
-    try:
-        yield
-    finally:
-        if added:
-            custom_ops.remove(marker)
 
 
 def get_flux3_pre_process_func(od_config: OmniDiffusionConfig):
@@ -463,12 +446,11 @@ class Flux3Pipeline(
 
         transformer_kwargs = _flux3_transformer_config_kwargs(package_config)
         transformer_kwargs.update(get_transformer_config_kwargs(od_config.tf_model_config, Flux3Transformer2DModel))
-        with _enable_native_fp8_quant_for_flux3():
-            self.transformer = Flux3Transformer2DModel(
-                quant_config=od_config.quantization_config,
-                od_config=od_config,
-                **transformer_kwargs,
-            )
+        self.transformer = Flux3Transformer2DModel(
+            quant_config=od_config.quantization_config,
+            od_config=od_config,
+            **transformer_kwargs,
+        )
         cache_dit_adapter = getattr(self.transformer, "_cache_dit_adapter_config", None)
         if isinstance(cache_dit_adapter, CacheDiTAdapterConfig):
             # Cache-DiT counts one forward per step for fused B=2 CFG and two

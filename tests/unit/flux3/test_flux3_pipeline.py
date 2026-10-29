@@ -77,23 +77,6 @@ requires_cuda = pytest.mark.skipif(
 )
 
 
-@pytest.mark.parametrize("initial_ops", [["none"], ["none", "+quant_fp8"]])
-def test_flux3_enables_native_fp8_only_during_construction(
-    monkeypatch: pytest.MonkeyPatch,
-    initial_ops: list[str],
-) -> None:
-    from vllm_omni.diffusion.models.flux3 import pipeline_flux3
-
-    compilation_config = SimpleNamespace(custom_ops=list(initial_ops))
-    vllm_config = SimpleNamespace(compilation_config=compilation_config)
-    monkeypatch.setattr(pipeline_flux3, "get_current_vllm_config", lambda: vllm_config)
-
-    with pipeline_flux3._enable_native_fp8_quant_for_flux3():
-        assert "+quant_fp8" in compilation_config.custom_ops
-
-    assert compilation_config.custom_ops == initial_ops
-
-
 def test_postprocess_labels_flux3_image_output(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Flux3 image requests retain their image modality."""
     from vllm_omni.diffusion.models.flux3.pipeline_flux3 import (
@@ -199,22 +182,6 @@ class _LoadingComponent(torch.nn.Module):
 
     def to(self, *args: Any, **kwargs: Any) -> "_LoadingComponent":
         return self
-
-
-class _FakeQuantConfig:
-    def __init__(
-        self,
-        name: str,
-        *,
-        checkpoint_fp8: bool = False,
-        checkpoint_nvfp4: bool = False,
-    ) -> None:
-        self._name = name
-        self.is_checkpoint_fp8_serialized = checkpoint_fp8
-        self.is_checkpoint_nvfp4_serialized = checkpoint_nvfp4
-
-    def get_name(self) -> str:
-        return self._name
 
 
 class TestLoading:
@@ -464,88 +431,6 @@ class TestLoading:
         assert pipe._default_size == (1024, 1024)
         assert pipe._image_rope_scale == 0.5
 
-    @pytest.mark.parametrize(
-        ("requested", "variant", "quantization", "quant_algo", "method", "runtime_name"),
-        [
-            ("fp8r", "fp8r", "fp8r", "FP8_PER_CHANNEL_PER_TOKEN", "modelopt", "modelopt"),
-            ("nvfp4", "nvfp4", "nvfp4", "NVFP4", "modelopt", "modelopt_fp4"),
-        ],
-    )
-    def test_quantized_package_variant_drives_transformer_source_and_quant_config(
-        self,
-        tmp_path: Path,
-        monkeypatch: pytest.MonkeyPatch,
-        requested: str,
-        variant: str,
-        quantization: str,
-        quant_algo: str,
-        method: str,
-        runtime_name: str,
-    ) -> None:
-        model_root = tmp_path / "flux3"
-        self._write_f3_package_config(model_root)
-        variant_dir = model_root / "variants" / variant
-        self._write_f3_package_config(variant_dir, quantization=quantization)
-        hf_quant_config = {
-            "producer": {"name": "flux3"},
-            "quantization": {
-                "quant_algo": quant_algo,
-                "exclude_modules": [
-                    "txt_in",
-                    "txt_mode_blocks.0.q_proj",
-                    "txt_mode_blocks.0.k_proj",
-                    "txt_mode_blocks.0.v_proj",
-                    "final_layer.image.adaLN_modulation.1",
-                ],
-            },
-        }
-        (variant_dir / "hf_quant_config.json").write_text(json.dumps(hf_quant_config))
-        built_quant_configs: list[dict[str, Any]] = []
-
-        def fake_build_quant_config(spec: dict[str, Any]) -> _FakeQuantConfig:
-            built_quant_configs.append(spec)
-            return _FakeQuantConfig(runtime_name)
-
-        monkeypatch.setattr("vllm_omni.diffusion.data.build_quant_config", fake_build_quant_config)
-        config = self._make_config(model_root, monkeypatch)
-        config.additional_config["variant"] = requested
-
-        config.enrich_config()
-        from vllm.config.load import LoadConfig
-
-        from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
-
-        loader = DiffusersPipelineLoader(LoadConfig(), config)
-        assert loader.quant_config is config.quantization_config
-        assert loader.quant_config.get_name() == runtime_name
-        # Pipeline construction must neither rediscover nor replace quantization.
-        monkeypatch.setattr(config, "enrich_config", lambda: None)
-        (variant_dir / "hf_quant_config.json").unlink()
-        pipe, mocks = self._make_pipeline(config, monkeypatch)
-
-        assert [
-            (source.model_or_path, source.subfolder, source.allow_patterns_overrides, source.prefix)
-            for source in pipe.weights_sources
-        ] == [
-            (str(variant_dir), None, ["model.safetensors"], "transformer."),
-            (str(model_root), None, ["ae.safetensors"], "vae._model."),
-            (str(model_root), "text_encoder", None, "text_encoder.text_encoder."),
-        ]
-        expected_quant_config = {"quant_method": method, **hf_quant_config}
-        if quantization == "nvfp4":
-            expected_quant_config = {
-                **expected_quant_config,
-                "quantization": {
-                    **hf_quant_config["quantization"],  # type: ignore[dict-item]
-                    "kv_cache_quant_algo": "FP8",
-                },
-            }
-        assert built_quant_configs == [expected_quant_config]
-        assert config.quantization_config.get_name() == runtime_name
-        assert config.additional_config["auto_detected_quant_method"] == quantization
-        assert config.tf_model_config.params["quantization_config"] == expected_quant_config
-        assert mocks["transformer"].call_args.kwargs["quant_config"] is config.quantization_config
-
     def test_sd_variant_enables_flow_map_and_uses_variant_assets(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         model_root = tmp_path / "flux3"
         self._write_f3_package_config(model_root)
@@ -569,101 +454,10 @@ class TestLoading:
         assert mocks["transformer"].call_args.kwargs["flow_map"] is True
         mocks["processor"].assert_called_once_with(str(model_root), subfolder="text_encoder", local_files_only=True)
 
-    @pytest.mark.parametrize(
-        ("variant", "quantization", "quant_algo", "runtime_name", "checkpoint_fp8", "checkpoint_nvfp4"),
-        [
-            ("sd-fp8r", "fp8r", "FP8_PER_CHANNEL_PER_TOKEN", "modelopt", True, False),
-            ("sd-nvfp4", "nvfp4", "NVFP4", "modelopt_fp4", False, True),
-        ],
-    )
-    @pytest.mark.parametrize("has_diffusers_index", [False, True])
-    def test_sd_quantized_variant_enables_flow_map_and_quantization(
-        self,
-        tmp_path: Path,
-        monkeypatch: pytest.MonkeyPatch,
-        variant: str,
-        quantization: str,
-        quant_algo: str,
-        runtime_name: str,
-        checkpoint_fp8: bool,
-        checkpoint_nvfp4: bool,
-        has_diffusers_index: bool,
-    ) -> None:
-        model_root = tmp_path / "flux3"
-        self._write_f3_package_config(model_root)
-        if has_diffusers_index:
-            (model_root / "modular_model_index.json").write_text(
-                json.dumps({"_class_name": "Flux3DistilledModularPipeline"})
-            )
-            transformer_dir = model_root / "transformer"
-            transformer_dir.mkdir()
-            (transformer_dir / "config.json").write_text(json.dumps({"flow_map": True}))
-        variant_dir = model_root / "variants" / variant
-        variant_config = self._f3_package_config(quantization=quantization)
-        variant_config["dit"]["flow_map"] = True
-        variant_config["text_encoder"]["tokenizer"] = "text_encoder"
-        variant_config["sampler"].update(steps=16, guidance=None)
-        variant_dir.mkdir(parents=True)
-        (variant_dir / "config.json").write_text(json.dumps(variant_config))
-        (variant_dir / "hf_quant_config.json").write_text(
-            json.dumps({"quantization": {"quant_algo": quant_algo, "exclude_modules": ["txt_in"]}})
-        )
-
-        monkeypatch.setattr(
-            "vllm_omni.diffusion.data.build_quant_config",
-            lambda _spec: _FakeQuantConfig(
-                runtime_name, checkpoint_fp8=checkpoint_fp8, checkpoint_nvfp4=checkpoint_nvfp4
-            ),
-        )
-        config = self._make_config(model_root, monkeypatch)
-        config.additional_config["variant"] = variant
-        config.enrich_config()
-        pipe, mocks = self._make_pipeline(config, monkeypatch)
-
-        assert pipe._flow_map is True
-        assert pipe._default_num_inference_steps == 16
-        assert pipe._default_guidance_scale is None
-        assert config.quantization_config.get_name() == runtime_name
-        assert pipe.weights_sources[0].model_or_path == str(variant_dir)
-        assert mocks["transformer"].call_args.kwargs["flow_map"] is True
-        mocks["processor"].assert_called_once_with(str(model_root), subfolder="text_encoder", local_files_only=True)
-
     def test_sampler_config_accepts_absent_guidance(self):
         from vllm_omni.diffusion.models.flux3.pipeline_flux3 import _flux3_sampler_config
 
         assert _flux3_sampler_config({"sampler": {"guidance": None}})["guidance"] is None
-
-    def test_quantized_package_uses_embedded_quantization_config_without_sidecar(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        model_root = tmp_path / "flux3"
-        self._write_f3_package_config(model_root)
-        variant_dir = model_root / "variants" / "fp8r"
-        embedded_quant_config = {
-            "producer": {"name": "flux3"},
-            "quantization": {"quant_algo": "FP8_PER_CHANNEL_PER_TOKEN", "exclude_modules": ["txt_in"]},
-        }
-        expected_quant_config = {"quant_method": "modelopt", **embedded_quant_config}
-        self._write_f3_package_config(
-            variant_dir,
-            quantization="fp8r",
-            quantization_config=embedded_quant_config,
-        )
-        built_quant_configs: list[dict[str, Any]] = []
-
-        def fake_build_quant_config(spec: dict[str, Any]) -> _FakeQuantConfig:
-            built_quant_configs.append(spec)
-            return _FakeQuantConfig("modelopt")
-
-        monkeypatch.setattr("vllm_omni.diffusion.data.build_quant_config", fake_build_quant_config)
-        config = self._make_config(model_root, monkeypatch)
-        config.additional_config["variant"] = "fp8r"
-
-        self._make_pipeline(config, monkeypatch)
-
-        assert built_quant_configs == [expected_quant_config]
-        assert config.tf_model_config.params["quantization_config"] == expected_quant_config
-        assert config.quantization_config.get_name() == "modelopt"
 
     def test_direct_quantized_package_path_is_rejected(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         model_root = tmp_path / "flux3"
@@ -674,71 +468,6 @@ class TestLoading:
 
         with pytest.raises(ValueError, match="shared package root"):
             self._make_pipeline(config, monkeypatch)
-
-    @pytest.mark.parametrize(
-        ("variant", "quantization", "quant_algo", "runtime_name"),
-        [
-            ("fp8r", "fp8", "FP8_PER_CHANNEL_PER_TOKEN", "modelopt"),
-            ("nvfp4", "nvfp4", "NVFP4", "modelopt_fp4"),
-        ],
-    )
-    def test_quantized_package_uses_variant_config_to_resolve_generic_quantization(
-        self,
-        tmp_path: Path,
-        monkeypatch: pytest.MonkeyPatch,
-        variant: str,
-        quantization: str,
-        quant_algo: str,
-        runtime_name: str,
-    ) -> None:
-        model_root = tmp_path / "flux3"
-        self._write_f3_package_config(model_root)
-        variant_dir = model_root / "variants" / variant
-        self._write_f3_package_config(variant_dir, quantization=variant)
-        (variant_dir / "hf_quant_config.json").write_text(
-            json.dumps(
-                {
-                    "producer": {"name": "flux3"},
-                    "quantization": {"quant_algo": quant_algo, "exclude_modules": ["txt_in"]},
-                }
-            )
-        )
-
-        monkeypatch.setattr(
-            "vllm_omni.diffusion.data.build_quant_config",
-            lambda spec: _FakeQuantConfig(
-                runtime_name, checkpoint_fp8=variant == "fp8r", checkpoint_nvfp4=variant == "nvfp4"
-            ),
-        )
-        config = self._make_config(model_root, monkeypatch)
-        config.additional_config["variant"] = variant
-        config.quantization_config = quantization
-
-        self._make_pipeline(config, monkeypatch)
-
-        assert config.quantization_config.get_name() == runtime_name  # type: ignore[attr-defined]
-
-    def test_variant_enrichment_preserves_explicit_quantization_override(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        self._write_f3_package_config(tmp_path)
-        self._write_f3_package_config(
-            tmp_path / "variants" / "fp8r",
-            quantization="fp8r",
-            quantization_config={"quantization": {"quant_algo": "FP8_PER_CHANNEL_PER_TOKEN"}},
-        )
-        monkeypatch.setattr(
-            "vllm_omni.diffusion.data.build_quant_config",
-            lambda spec: _FakeQuantConfig("modelopt", checkpoint_fp8=True),
-        )
-        config = self._make_config(tmp_path, monkeypatch)
-        config.additional_config["variant"] = "fp8r"
-        override = _FakeQuantConfig("explicit_override")
-        config.quantization_config = override
-
-        config.enrich_config()
-
-        assert config.quantization_config is override
 
     def test_missing_flux3_variant_reports_available_variants(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -760,6 +489,18 @@ class TestLoading:
         config.additional_config["variant"] = "bf16"
 
         with pytest.raises(ValueError, match="available variants: fp8r"):
+            self._make_pipeline(config, monkeypatch)
+
+    def test_quantized_variant_is_rejected_by_base_pipeline(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        model_root = tmp_path / "flux3"
+        self._write_f3_package_config(model_root)
+        self._write_f3_package_config(model_root / "variants" / "fp8r", quantization="fp8r")
+        config = self._make_config(model_root, monkeypatch)
+        config.additional_config["variant"] = "fp8r"
+
+        with pytest.raises(ValueError, match="not supported by the BF16 base pipeline"):
             self._make_pipeline(config, monkeypatch)
 
     @pytest.mark.parametrize(

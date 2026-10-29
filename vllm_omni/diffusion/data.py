@@ -1792,20 +1792,17 @@ class OmniDiffusionConfig:
                     self.set_tf_model_config(TransformerConfig())
                     self.update_multimodal_support()
                 elif is_flux3:
-                    from vllm_omni.diffusion.utils.flux3_package import (
-                        _inject_flux3_quantization_config,
-                        _resolve_flux3_package_selection,
-                    )
+                    from vllm_omni.diffusion.utils.flux3_package import _resolve_flux3_package_selection
 
                     self.model_class_name = "Flux3Pipeline"
                     # Resolve variant metadata before the loader snapshots quantization.
                     selection = _resolve_flux3_package_selection(self.model, self.additional_config)
-                    package_config = _inject_flux3_quantization_config(
-                        selection.package_config, selection.transformer_root, selection.quantization
-                    )
-                    self.set_tf_model_config(TransformerConfig.from_dict(package_config))
                     if selection.quantization is not None:
-                        self.additional_config.setdefault("auto_detected_quant_method", selection.quantization)
+                        raise ValueError(
+                            f"Flux3 quantized variant {selection.quantization!r} is not supported by the "
+                            "BF16 base pipeline"
+                        )
+                    self.set_tf_model_config(TransformerConfig.from_dict(selection.package_config))
                     self.update_multimodal_support()
                 elif model_type == "bagel" or "BagelForConditionalGeneration" in architectures:
                     self.model_class_name = "BagelPipeline"

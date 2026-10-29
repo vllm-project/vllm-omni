@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Flux3 package paths and quantization metadata, without model imports."""
+"""Flux3 package paths and package configuration, without model imports."""
 
 from __future__ import annotations
 
@@ -9,8 +9,6 @@ import os
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
-
-_F3_SUPPORTED_QUANTIZED_VARIANTS = {"fp8r", "nvfp4"}
 
 
 def _resolve_flux3_component_path(shared_root: str, path: str) -> tuple[str, str]:
@@ -84,72 +82,6 @@ def _available_flux3_variants(model_path: str) -> list[str]:
     return sorted(
         name for name in os.listdir(variants_dir) if os.path.isfile(os.path.join(variants_dir, name, "config.json"))
     )
-
-
-def _normalize_flux3_quantization_config(
-    raw_quant_config: dict[str, Any],
-    quantization: str,
-) -> dict[str, Any]:
-    """Normalize Flux3 sidecar quant metadata into vLLM-Omni's quant config shape."""
-    if quantization not in _F3_SUPPORTED_QUANTIZED_VARIANTS:
-        raise ValueError(
-            f"Flux3 package declares unsupported quantization {quantization!r}; "
-            "supported quantizations are 'fp8r' and 'nvfp4'"
-        )
-    normalized = dict(raw_quant_config)
-    if quantization == "nvfp4":
-        quant_section = normalized.get("quantization")
-        if isinstance(quant_section, dict):
-            quant_section = dict(quant_section)
-            # vLLM's ModelOpt NVFP4 config requires this field even though
-            # Flux3 does not use an autoregressive KV cache.
-            quant_section.setdefault("kv_cache_quant_algo", "FP8")
-            normalized["quantization"] = quant_section
-    if "quant_method" not in normalized and "method" not in normalized:
-        normalized["quant_method"] = "modelopt"
-    return normalized
-
-
-def _read_flux3_sidecar_quantization_config(transformer_root: str, quantization: str) -> dict[str, Any]:
-    """Read the variant-local hf_quant_config.json used by ModelOpt exports."""
-    quant_path = os.path.join(transformer_root, "hf_quant_config.json")
-    if not os.path.isfile(quant_path):
-        raise ValueError(
-            f"Flux3 package at {transformer_root!r} declares quantization {quantization!r} "
-            "but has neither config.json quantization_config nor hf_quant_config.json"
-        )
-    with open(quant_path) as f:
-        raw_quant_config = json.load(f)
-    if not isinstance(raw_quant_config, dict):
-        raise ValueError(f"Flux3 quantization config at {quant_path!r} must be a JSON object")
-
-    return _normalize_flux3_quantization_config(raw_quant_config, quantization)
-
-
-def _inject_flux3_quantization_config(
-    package_config: dict[str, Any],
-    transformer_root: str,
-    quantization: str | None,
-) -> dict[str, Any]:
-    """Attach variant quant metadata to config.json before TransformerConfig parsing."""
-    if quantization is None:
-        return package_config
-    quantization_config = package_config.get("quantization_config")
-    if quantization_config is not None:
-        if not isinstance(quantization_config, dict):
-            raise ValueError("Flux3 config.json quantization_config must be a JSON object")
-        package_config = dict(package_config)
-        package_config["quantization_config"] = _normalize_flux3_quantization_config(
-            quantization_config,
-            quantization,
-        )
-        return package_config
-    package_config = dict(package_config)
-    package_config["quantization_config"] = _read_flux3_sidecar_quantization_config(
-        transformer_root,
-        quantization,
-    )
-    return package_config
 
 
 def _resolve_flux3_package_selection(
